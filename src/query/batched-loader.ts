@@ -54,9 +54,9 @@
  * @module
  */
 
-import type pg from 'pg';
 import type { PartitionLimitInput } from '../dialect.js';
 import { CircularRelationError, RelationError, UnsupportedFeatureError, ValidationError } from '../errors.js';
+import type { PgCompatQueryResult } from '../pg-types.js';
 import { normalizeKeyColumns, type RelationDef, type SchemaMetadata, type TableMetadata } from '../schema.js';
 import type { ReselectExecutor } from './builder.js';
 import { dedupeOrderEntries, isOrderBySpec, isRelationPickOrderBy, orderByEntries, sortedEntries } from './filters.js';
@@ -90,7 +90,7 @@ interface Deferred {
   sql: string;
   params: unknown[];
   preparedName?: string;
-  transform: (result: pg.QueryResult) => unknown;
+  transform: (result: PgCompatQueryResult) => unknown;
 }
 
 /**
@@ -914,7 +914,7 @@ function boundedChildQuery(
  * matters: object key order is observable output here (callers stringify
  * results into HTTP bodies, ETags and cache keys).
  */
-function stripRankColumn(result: pg.QueryResult): void {
+function stripRankColumn(result: PgCompatQueryResult): void {
   for (const row of result.rows as Record<string, unknown>[]) delete row[PARTITION_RANK_COLUMN];
 }
 

@@ -356,9 +356,128 @@ jobs:
           npx tsc --noEmit -p tsconfig.json
           echo "CJS consumer typecheck OK (nodenext + node16)"
 
+  # The `@types/pg` gate, and the permanent guard on the v0.28.1 regression:
+  # mirrors ci.yml's consumer-types job. It has to exist HERE and not only
+  # there, because ci.yml does not gate a release: this workflow runs on a
+  # pushed tag or a workflow_dispatch, and `publish` waits on the jobs in its
+  # own `needs:` list. Without this job a tag push would publish the exact
+  # regression the pg-free declaration surface exists to prevent, and
+  # `package-types` would not have caught it: that job compiles with
+  # `skipLibCheck: true`, so tsc never reads the library's own declarations,
+  # and its fixture never touches `db.pool` or `transaction()`.
+  #
+  # `package-types` asks "do the declarations RESOLVE from CJS". This asks
+  # "do the declarations require a types package we no longer ship a dependency
+  # on". Different questions, and neither answer implies the other.
+  consumer-types:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      # The same script prepublishOnly and ci.yml run. One source of truth, so
+      # the publish path cannot drift from the branch path.
+      - name: Tripwire, no pg type references in the published declarations
+        run: npm run check:package-types
+      - name: Assert the packed manifest declares exactly one runtime dependency
+        run: |
+          TARBALL="$GITHUB_WORKSPACE/$(npm pack --silent | tail -1)"
+          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
+          DEPS=$(tar -xzOf "$TARBALL" package/package.json | jq -r '(.dependencies // {}) | keys | join(",")')
+          if [ "$DEPS" != "pg" ]; then
+            echo "::error file=package.json::Published dependencies must be exactly [pg], found [$DEPS]."
+            exit 1
+          fi
+          echo "Packed manifest dependencies = [$DEPS] OK"
+      # The end-to-end proof: the REAL tarball installed into a clean project
+      # that has `pg` but NOT `@types/pg`. `skipLibCheck: false` is load-bearing
+      # and not a stylistic choice: with it true, tsc never reads the library's
+      # own declarations, so a pg reference there is suppressed and the gate
+      # passes vacuously. The `-d node_modules/@types/pg` assertion exists for
+      # the same reason, so the gate cannot pass merely because something pulled
+      # @types/pg in transitively and satisfied the reference.
+      - name: Typecheck a consumer that has pg but NOT @types/pg
+        run: |
+          CONSUMER=$(mktemp -d)
+          cd "$CONSUMER"
+          cat > package.json <<'JSON'
+          { "name": "types-consumer", "version": "1.0.0", "private": true, "type": "module" }
+          JSON
+          cat > tsconfig.json <<'JSON'
+          {
+            "compilerOptions": {
+              "module": "nodenext",
+              "moduleResolution": "nodenext",
+              "target": "ES2022",
+              "strict": true,
+              "noEmit": true,
+              "skipLibCheck": false
+            },
+            "include": ["consumer.ts"]
+          }
+          JSON
+          cat > consumer.ts <<'TS'
+          import {
+            type PgCompatPool,
+            type PgCompatPoolClient,
+            type PgCompatQueryResult,
+            type SchemaMetadata,
+            TurbineClient,
+          } from 'turbine-orm';
+          import { turbineHttp } from 'turbine-orm/serverless';
+
+          const schema: SchemaMetadata = { tables: {}, enums: {} };
+          const db = new TurbineClient({ connectionString: 'postgres://u:p@localhost:5432/d' }, schema);
+
+          // The pool accessor is typed by Turbine's own contract, not by @types/pg.
+          export async function readOne(): Promise<number | null> {
+            const result: PgCompatQueryResult<{ n: number }> = await db.pool.query<{ n: number }>('SELECT 1 AS n');
+            const client: PgCompatPoolClient = await db.pool.connect();
+            try {
+              return result.rows[0]?.n ?? null;
+            } finally {
+              client.release();
+            }
+          }
+
+          // The transaction callback's parameter is the same contract.
+          export async function inTransaction(): Promise<number> {
+            return db.transaction(async (tx: PgCompatPoolClient) => {
+              const r = await tx.query<{ n: number }>('SELECT 2 AS n', []);
+              return r.rows[0]?.n ?? 0;
+            });
+          }
+
+          // The external-pool seam: a hand-written driver, no pg types anywhere.
+          const externalPool: PgCompatPool = {
+            query: async () => ({ rows: [], rowCount: 0 }),
+            connect: async () => {
+              throw new Error('not reached at typecheck time');
+            },
+            end: async () => {},
+          };
+          export const edge = turbineHttp(externalPool, schema);
+          TS
+          # `pg` explicitly, to mirror a real consumer. @types/pg is never named
+          # here and nothing in the tree may pull it in.
+          npm install "$TARBALL" pg --no-audit --no-fund
+          npm install --no-save typescript @types/node --no-audit --no-fund
+          if [ -d node_modules/@types/pg ]; then
+            echo "::error file=package.json::@types/pg is present in the consumer tree, so this gate would pass vacuously. Something declares it as a runtime dependency."
+            exit 1
+          fi
+          echo "@types/pg is absent from the consumer tree OK"
+          npx tsc --noEmit -p tsconfig.json
+          echo "Consumer typecheck OK (strict + NodeNext + skipLibCheck:false, no @types/pg)"
+
   publish:
     timeout-minutes: 30
-    needs: [test, integration-postgres, pack-smoke, package-types, coverage, error-codes]
+    needs: [test, integration-postgres, pack-smoke, package-types, consumer-types, coverage, error-codes]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

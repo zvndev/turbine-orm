@@ -4,7 +4,9 @@ import { dirname, resolve } from 'node:path';
 import type { Readable, Writable } from 'node:stream';
 import pg from 'pg';
 import { findMissingRelationIndexes } from '../index-advisor.js';
-import { deriveCatalogRelations, type ForeignKeyEntry } from '../introspect.js';
+import { formatBytes, type TableStats } from '../index-stats.js';
+import { deriveCatalogRelations, type ForeignKeyEntry, indexKeyColumn, parseIndexKeyEntries } from '../introspect.js';
+import type { PgCompatPool, PgCompatPoolClient } from '../pg-types.js';
 import type { FindManyArgs } from '../query/index.js';
 import { QueryInterface, quoteIdent } from '../query/index.js';
 import { ownLookup, registerUtcTemporalParsers } from '../query/utils.js';
@@ -19,6 +21,7 @@ import {
   snakeToCamel,
   type TableMetadata,
 } from '../schema.js';
+import { CATALOGUED_ERROR_CODES, explainErrorCode } from './error-catalog.js';
 import { listMigrationFiles } from './migrate.js';
 import { assertNoPiiPredicates as assertNoPiiPredicatesShared } from './pii-predicate-guard.js';
 import { applyPiiTags, loadPiiTags } from './pii-tags.js';
@@ -82,7 +85,7 @@ export interface McpTransport {
    * reason Studio exports `handleRequest`). Production never sets it: the
    * server builds its own pool from `options.url`.
    */
-  pool?: pg.Pool;
+  pool?: PgCompatPool;
 }
 
 export interface McpServerHandle {
@@ -106,7 +109,7 @@ type JsonObject = Record<string, unknown>;
 
 interface McpContext {
   options: McpServerOptions;
-  pool: pg.Pool;
+  pool: PgCompatPool;
 }
 
 /**
@@ -262,6 +265,72 @@ const TOOLS: ToolDefinition[] = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'relation_graph',
+    description:
+      'The relation graph Turbine derived for the schema: for every table, each relation name with its cardinality (hasMany / hasOne / belongsTo / manyToMany), target table, join keys, and the junction table for many-to-many. These are the EXACT names a `with` clause accepts, so read them here instead of guessing from column names. Pass `table` to get only that table and what is reachable from it, and `depth` to bound the hops. No row values are read or returned. Column NAMES are returned in full, including the name of a PII-tagged or secret-named join key: a name is schema shape, and table_detail returns the same names. Row VALUES on such a column are protected where values are served, by sample_rows and explain_query.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: {
+          type: 'string',
+          description: 'Optional: return only this table and the tables reachable from it within `depth` hops.',
+        },
+        depth: {
+          type: 'number',
+          minimum: 1,
+          maximum: 10,
+          description: 'Max hops from `table` (default 2). Ignored when `table` is omitted.',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'find_join_path',
+    description:
+      'Shortest relation chain from one table to another, WITH the nested `with` clause to write, as code. Returns every equal-shortest path when there is more than one (two foreign keys to the same table produce two). A many-to-many hop counts as one hop and needs no junction table in the query. Returns cleanly with `found: false` when no chain exists; it does not throw.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        from: { type: 'string', description: 'The table the query starts at (the one you call findMany on).' },
+        to: { type: 'string', description: 'The table you need to reach.' },
+        maxDepth: { type: 'number', minimum: 1, maximum: 10, description: 'Max hops to search (default 6).' },
+        maxPaths: {
+          type: 'number',
+          minimum: 1,
+          maximum: 25,
+          description: 'Max equal-length paths to return (default 5).',
+        },
+      },
+      required: ['from', 'to'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'table_stats',
+    description:
+      "Size and index shape for one table: the planner's row ESTIMATE (pg_class.reltuples, which is maintained by ANALYZE and is NOT an exact count, never present it as one), the page count, on-disk bytes, and every index with its columns. Returns no row values. Index definitions ARE stripped of literal values, because a partial index predicate embeds real stored data. Column NAMES are returned in full, PII-tagged and secret-named ones included: a name is schema shape, and table_detail returns the same names.",
+    inputSchema: {
+      type: 'object',
+      properties: { table: { type: 'string' } },
+      required: ['table'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'explain_error',
+    description:
+      'Explain a Turbine error code: the class name, when it is thrown, the likely causes, how to fix it, the extra properties the error carries, and its docs URL. Accepts `TURBINE_E003`, `E003`, or `3`. Needs no database and reads none.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        code: { type: 'string', description: 'A Turbine error code, e.g. "TURBINE_E003", "E003", or "3".' },
+      },
+      required: ['code'],
+      additionalProperties: false,
+    },
+  },
 ];
 
 export function startMcpServer(options: McpServerOptions, transport: McpTransport = {}): McpServerHandle {
@@ -284,7 +353,9 @@ export function startMcpServer(options: McpServerOptions, transport: McpTranspor
   // the JSON-RPC framing channel and one stray line desynchronizes the client.
   // The message is redacted because pg echoes the connection string into some
   // connection failures, and this text is written where a user can see it.
-  ctx.pool.on('error', (err: Error) => {
+  // Optional call: `on` is a pg-family capability, and the perimeter tests hand
+  // in a minimal `PgCompatPool` fake that has no event surface at all.
+  ctx.pool.on?.('error', (err: Error) => {
     process.stderr.write(`[turbine] mcp pool error: ${redactUrl(err.message)}\n`);
   });
 
@@ -435,6 +506,19 @@ async function callTool(params: unknown, ctx: McpContext): Promise<unknown> {
     case 'sample_rows':
       result = await sampleRows(ctx, requiredString(args, 'table'), optionalLimit(args.limit));
       break;
+    case 'relation_graph':
+      result = await relationGraph(ctx, args);
+      break;
+    case 'find_join_path':
+      result = await findJoinPath(ctx, args);
+      break;
+    case 'table_stats':
+      result = await tableStats(ctx, requiredString(args, 'table'));
+      break;
+    case 'explain_error':
+      // No database read at all: the catalog is a pure lookup over errors.ts.
+      result = explainError(requiredString(args, 'code'));
+      break;
     default:
       throw jsonRpcError(-32602, `Unknown tool: ${params.name}`);
   }
@@ -447,12 +531,12 @@ async function callTool(params: unknown, ctx: McpContext): Promise<unknown> {
 async function schemaOverview(ctx: McpContext): Promise<unknown> {
   return withReadOnly(ctx, async (client) => {
     const { metadata } = await loadSchemaMetadata(client, ctx.options);
-    const rowCounts = await estimateRows(client, ctx.options.schema);
+    const rowCounts = await collectTableStats(client, ctx.options.schema);
     return {
       schema: ctx.options.schema,
       tables: Object.values(metadata.tables).map((table) => ({
         name: table.name,
-        estimatedRows: rowCounts.get(table.name) ?? 0,
+        estimatedRows: estimatedRowCount(rowCounts.get(table.name)),
         columns: table.columns.length,
         primaryKey: table.primaryKey,
         indexes: table.indexes.length,
@@ -556,11 +640,32 @@ function sanitizeIndex(index: IndexMetadata): Record<string, unknown> {
   // IS the literal. Only entries that are a bare identifier survive, and only
   // on the expression path, so an ordinary index (including one with a quoted
   // identifier holding a space) is untouched.
-  const columns = keysHoldLiteral ? index.columns.filter((column) => PLAIN_IDENTIFIER.test(column)) : index.columns;
+  //
+  // PARTITIONED IN ONE PASS, and the flag is read off the partition rather than
+  // recomputed. `columnsWithheld` used to be a LENGTH COMPARISON against
+  // `index.columns`, which is only true of the list as it stands at this exact
+  // line: a later same-length transform of `columns` (the column-NAME masking
+  // this file used to apply on top) left the flag reading `false` while the
+  // reply displayed a withholding marker. A derived flag cannot drift from the
+  // list it describes.
+  //
+  // SEEDED from `keys === null`, i.e. an UNPARSABLE definition, because that is
+  // the one input where the loop below cannot speak for the answer: the column
+  // list was derived from the same definition, so it arrives empty and every
+  // per-column test passes vacuously. `columns: [], columnsWithheld: false`
+  // reads as the FACT "this index has no columns", which no unreadable
+  // definition supports. Not knowing is a withholding like any other here, and
+  // it is labelled like one.
+  const columns: string[] = [];
+  let columnsWithheld = keys === null;
+  for (const column of index.columns) {
+    if (keysHoldLiteral && !PLAIN_IDENTIFIER.test(column)) columnsWithheld = true;
+    else columns.push(column);
+  }
   return {
     name: index.name,
     columns,
-    columnsWithheld: columns.length !== index.columns.length,
+    columnsWithheld,
     unique: index.unique,
     partial,
     // Withholding is LABELLED, never expressed by dropping the field:
@@ -669,16 +774,16 @@ async function migrationStatus(ctx: McpContext): Promise<unknown> {
 async function doctorReport(ctx: McpContext): Promise<unknown> {
   return withReadOnly(ctx, async (client) => {
     const { metadata } = await loadSchemaMetadata(client, ctx.options);
-    const rowCounts = await estimateRows(client, ctx.options.schema);
+    const rowCounts = await collectTableStats(client, ctx.options.schema);
     const missing = findMissingRelationIndexes(metadata).sort(
-      (a, b) => (rowCounts.get(b.table) ?? 0) - (rowCounts.get(a.table) ?? 0),
+      (a, b) => estimatedRowCount(rowCounts.get(b.table)) - estimatedRowCount(rowCounts.get(a.table)),
     );
     return {
       schema: ctx.options.schema,
       ok: missing.length === 0,
       missingRelationIndexes: missing.map((entry) => ({
         table: entry.table,
-        estimatedRows: rowCounts.get(entry.table) ?? 0,
+        estimatedRows: estimatedRowCount(rowCounts.get(entry.table)),
         columns: entry.columns,
         probes: entry.probes,
         suggestedIndexName: entry.indexName,
@@ -951,7 +1056,552 @@ async function sampleRows(ctx: McpContext, tableName: string, limit: number): Pr
   });
 }
 
-async function withReadOnly<T>(ctx: McpContext, fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+// ---------------------------------------------------------------------------
+// Agent-facing graph / stats / error tools
+// ---------------------------------------------------------------------------
+
+/**
+ * COLUMN NAMES ARE NOT WITHHELD BY THE GRAPH AND STATS TOOLS, and this comment
+ * is where that decision is recorded, because an earlier cut of these tools did
+ * withhold them.
+ *
+ * A column NAME is not an oracle for the VALUE stored in it. It discloses schema
+ * SHAPE, which an agent must have to write a query at all, and which
+ * `table_detail`, `schema_overview` and `sample_rows` already publish in full
+ * (they redact VALUES and label the column redacted, they do not hide the name).
+ * Masking the same name inside a relation edge or an index key list therefore
+ * protected nothing: the identical name came back in the same reply through the
+ * index `definition`, through the index `name`, through the `redactedColumns`
+ * list that reported the masking, and through the relation NAME itself, since
+ * Turbine derives `session` from `session_id`. `primaryKey` was never masked at
+ * all.
+ *
+ * What the masking DID do is make two tool descriptions promise a protection the
+ * server did not have, which is worse than not having it. So it is gone, and
+ * every VALUE protection is untouched:
+ *
+ *   - `sample_rows` never FETCHES a hidden column (SQL-level projection).
+ *   - `explain_query` refuses a where/orderBy on a hidden column, because a row
+ *     estimate is an extraction oracle (`assertNoPiiPredicates`).
+ *   - `sanitizeIndex` strips literal values out of an index definition, since a
+ *     partial index's predicate embeds real stored data.
+ *
+ * All three fail CLOSED when the PII tag scan fails. That is the boundary; the
+ * name masking never was one.
+ */
+
+/**
+ * A table's relations in a stable, name-sorted order (catalog order is not one).
+ *
+ * MEMOIZED PER SCHEMA OBJECT, because the path enumeration below re-sorts a
+ * table's relations on EVERY visit and a table on many equal-length paths is
+ * visited many times. A WeakMap keyed on the metadata object (not a module-level
+ * cache keyed on the table name) so a re-introspection after a schema change
+ * cannot be served a stale list, and so nothing is retained once the reply is
+ * built.
+ *
+ * `metadata` is REQUIRED, and that is the whole guard. It was optional, with an
+ * unmemoized fallback when omitted, and two of the four call sites then simply
+ * did not pass it: the cache was declared and half bypassed, silently, because
+ * omitting an optional argument is not an error. Every caller has the metadata
+ * object in scope, so nothing needed the fallback and only the bypass survived
+ * it.
+ */
+const relationOrderCache = new WeakMap<SchemaMetadata, Map<string, RelationDef[]>>();
+
+function sortedRelations(table: TableMetadata, metadata: SchemaMetadata): RelationDef[] {
+  const sort = () => Object.values(table.relations).sort((a, b) => a.name.localeCompare(b.name));
+  let byTable = relationOrderCache.get(metadata);
+  if (!byTable) {
+    byTable = new Map();
+    relationOrderCache.set(metadata, byTable);
+  }
+  const cached = byTable.get(table.name);
+  if (cached) return cached;
+  const sorted = sort();
+  byTable.set(table.name, sorted);
+  return sorted;
+}
+
+/** One relation edge, as both graph tools report it. Join keys are schema shape, not values. */
+function describeEdge(relation: RelationDef): Record<string, unknown> {
+  return {
+    name: relation.name,
+    type: relation.type,
+    from: relation.from,
+    to: relation.to,
+    foreignKey: relation.foreignKey,
+    referenceKey: relation.referenceKey,
+    through: relation.through
+      ? {
+          table: relation.through.table,
+          sourceKey: relation.through.sourceKey,
+          targetKey: relation.through.targetKey,
+        }
+      : null,
+    selfRelation: relation.from === relation.to,
+    onDelete: relation.onDelete ?? null,
+    onUpdate: relation.onUpdate ?? null,
+  };
+}
+
+/** Tables reachable from `root` within `maxHops`, with their hop distance. */
+function bfsDistances(metadata: SchemaMetadata, root: string, maxHops: number): Map<string, number> {
+  const dist = new Map<string, number>([[root, 0]]);
+  let frontier = [root];
+  for (let hop = 0; hop < maxHops && frontier.length > 0; hop++) {
+    const next: string[] = [];
+    for (const name of frontier) {
+      const table = ownLookup(metadata.tables, name);
+      if (!table) continue;
+      for (const relation of sortedRelations(table, metadata)) {
+        // A relation whose target was filtered out by --include/--exclude is not
+        // traversable from this server's view of the schema.
+        if (!ownLookup(metadata.tables, relation.to)) continue;
+        if (dist.has(relation.to)) continue;
+        dist.set(relation.to, hop + 1);
+        next.push(relation.to);
+      }
+    }
+    frontier = next;
+  }
+  return dist;
+}
+
+/**
+ * The relation graph, whole or rooted at one table.
+ *
+ * This is the single biggest token sink an agent hits on an unfamiliar schema:
+ * without it, the only way to learn that `with: { author: true }` is spelled
+ * `author` and not `users` or `user_id` is to call `table_detail` per table.
+ * Relation NAMES are what a `with` clause accepts, and Turbine derives them
+ * (Id-stripping, unique-FK singularization, auto-m2m), so they are not
+ * guessable from the catalog.
+ */
+async function relationGraph(ctx: McpContext, args: JsonObject): Promise<unknown> {
+  const root = optionalString(args, 'table');
+  const depth = optionalInteger(args.depth, 'depth', 1, 10) ?? 2;
+
+  return withReadOnly(ctx, async (client) => {
+    const { metadata } = await loadSchemaMetadata(client, ctx.options);
+
+    let included: string[];
+    let hops: Map<string, number> | null = null;
+    let rootName: string | null = null;
+    if (root === undefined) {
+      included = Object.keys(metadata.tables).sort();
+    } else {
+      const rootTable = requireTable(metadata, root);
+      rootName = rootTable.name;
+      const distances = bfsDistances(metadata, rootTable.name, depth);
+      hops = distances;
+      included = [...distances.keys()].sort(
+        (a, b) => (distances.get(a) ?? 0) - (distances.get(b) ?? 0) || a.localeCompare(b),
+      );
+    }
+
+    // Targets one hop past the cap: named, not silently absent, so the agent can
+    // tell "nothing there" from "not expanded".
+    const omitted = new Set<string>();
+    let relationCount = 0;
+    const tables = included.map((name) => {
+      const table = requireTable(metadata, name);
+      const relations = sortedRelations(table, metadata);
+      relationCount += relations.length;
+      for (const relation of relations) {
+        if (hops && ownLookup(metadata.tables, relation.to) && !hops.has(relation.to)) omitted.add(relation.to);
+      }
+      return {
+        table: table.name,
+        hops: hops?.get(name) ?? null,
+        primaryKey: table.primaryKey,
+        relationCount: relations.length,
+        relations: relations.map(describeEdge),
+      };
+    });
+
+    return {
+      schema: ctx.options.schema,
+      root: rootName,
+      depth: rootName === null ? null : depth,
+      tableCount: tables.length,
+      relationCount,
+      tables,
+      omittedBeyondDepth: [...omitted].sort(),
+      note:
+        'A relation `name` is what a `with` clause accepts; `type` is its cardinality (hasMany / manyToMany return arrays, ' +
+        'hasOne / belongsTo return one object or null). A manyToMany relation is written as one `with` entry: the junction ' +
+        'table in `through` is joined for you and must NOT appear in the query. Call find_join_path for the clause to write.',
+      valueNote:
+        'This tool reads no row values and returns none. Column names ARE returned: they are schema shape, and ' +
+        'table_detail publishes the same names. Row values on a PII-tagged or secret-named column are protected ' +
+        'where values are actually served, by sample_rows and explain_query.',
+    };
+  });
+}
+
+/**
+ * Whether a table name can be written as a `db.<name>` property.
+ *
+ * `TurbineClient` defines an accessor per table under the camelCase form of the
+ * table name (`post_tags` -> `postTags`), and falls back to `db.table('name')`
+ * for anything that is not a plain identifier. The emitted code has to make the
+ * same choice, or it does not run.
+ */
+function clientAccessor(table: string): string {
+  const camel = table.replace(/_([a-z])/g, (_, char: string) => char.toUpperCase());
+  return PLAIN_IDENTIFIER.test(camel) ? `db.${camel}` : `db.table(${JSON.stringify(table)})`;
+}
+
+/**
+ * Render a chain of relation names as a nested `with` object literal.
+ *
+ * The innermost hop is `{ name: true }` and every outer hop wraps it in
+ * `{ name: { with: … } }`, which is exactly the shape `FindManyArgs` takes. It
+ * is emitted as CODE rather than described in prose because a description is
+ * something the agent then has to compile, and compiling it is where the
+ * spelling errors come from.
+ */
+function renderWithObject(names: string[], indent: string): string {
+  const [head, ...rest] = names;
+  if (head === undefined) return '{}';
+  if (rest.length === 0) return `{ ${head}: true }`;
+  const inner = renderWithObject(rest, `${indent}    `);
+  return `{\n${indent}  ${head}: {\n${indent}    with: ${inner},\n${indent}  },\n${indent}}`;
+}
+
+/** The full `findMany` call for a path, ready to paste. */
+function renderJoinCode(from: string, names: string[]): string {
+  return `await ${clientAccessor(from)}.findMany({\n  with: ${renderWithObject(names, '  ')},\n});`;
+}
+
+/** `comments[].post.user.org`: where the joined rows land on the result. */
+function renderResultShape(from: string, path: RelationDef[]): string {
+  let shape = `${from}[]`;
+  for (const relation of path) {
+    shape += `.${relation.name}`;
+    if (relation.type === 'hasMany' || relation.type === 'manyToMany') shape += '[]';
+  }
+  return shape;
+}
+
+/** Serialize one path into the reply, code included. */
+function describePath(from: string, path: RelationDef[]): unknown {
+  const names = path.map((relation) => relation.name);
+  return {
+    hops: path.length,
+    relations: path.map(describeEdge),
+    relationNames: names,
+    withClause: renderWithObject(names, '  '),
+    code: renderJoinCode(from, names),
+    resultShape: renderResultShape(from, path),
+    crossesManyToMany: path.some((relation) => relation.type === 'manyToMany'),
+    returnsArray: path.some((relation) => relation.type === 'hasMany' || relation.type === 'manyToMany'),
+  };
+}
+
+/**
+ * Every SHORTEST relation chain from `from` to `to`, in deterministic order.
+ *
+ * Enumerated over BFS distances rather than by depth-first search with a visited
+ * set: only edges that advance the distance by exactly one are followed, so
+ * every chain returned is the same (minimum) length and no chain revisits a
+ * table. Two foreign keys to the same table therefore come back as two paths of
+ * equal length, which is the case the caller most needs to see, because picking
+ * one arbitrarily is how you silently join through `editor` when you meant
+ * `author`.
+ */
+export function shortestJoinPaths(
+  metadata: SchemaMetadata,
+  from: string,
+  to: string,
+  maxDepth: number,
+  maxPaths: number,
+  // @internal, and injectable for ONE reason: the production budget is sized so
+  // no real schema reaches it, which would leave the branch that stops the walk
+  // permanently untested. A test passes a small budget instead of constructing a
+  // 200,000-node fixture to reach the real one.
+  nodeBudget: number = JOIN_PATH_NODE_BUDGET,
+): { paths: RelationDef[][]; truncated: boolean; exhausted: boolean } {
+  const dist = bfsDistances(metadata, from, maxDepth);
+  const target = dist.get(to);
+  if (target === undefined || target === 0) return { paths: [], truncated: false, exhausted: false };
+
+  const cap = maxPaths + 1;
+  const found: RelationDef[][] = [];
+  const acc: RelationDef[] = [];
+  // A NODE BUDGET on top of the path cap, because the two bound different
+  // things. `maxPaths` stops once enough COMPLETE chains exist; it does not
+  // bound the search that fails to complete them, and a dense schema at
+  // `maxDepth: 10` can expand a large number of distance-advancing prefixes that
+  // dead-end before reaching the target. This runs inside an open
+  // `BEGIN READ ONLY` on a max:2 pool with an agent on the other end, so the
+  // walk holding a connection is the cost, not the CPU. Measured at 7ms on a
+  // 35-table / 150-FK schema, so this is a ceiling nothing normal approaches;
+  // exhausting it is reported, never silently returned as "no path".
+  let budget = nodeBudget;
+  let exhausted = false;
+
+  const walk = (current: string): void => {
+    if (found.length >= cap || exhausted) return;
+    if (budget-- <= 0) {
+      exhausted = true;
+      return;
+    }
+    if (current === to) {
+      found.push([...acc]);
+      return;
+    }
+    const here = dist.get(current);
+    const table = ownLookup(metadata.tables, current);
+    if (here === undefined || !table) return;
+    for (const relation of sortedRelations(table, metadata)) {
+      if (!ownLookup(metadata.tables, relation.to)) continue;
+      if (dist.get(relation.to) !== here + 1) continue;
+      acc.push(relation);
+      walk(relation.to);
+      acc.pop();
+      if (found.length >= cap || exhausted) return;
+    }
+  };
+  walk(from);
+
+  return { paths: found.slice(0, maxPaths), truncated: found.length > maxPaths || exhausted, exhausted };
+}
+
+/**
+ * Nodes {@link shortestJoinPaths} may visit before it stops enumerating.
+ *
+ * Sized so no real schema meets it: the search only follows edges that advance
+ * the BFS distance by exactly one, so it is already far cheaper than a general
+ * path enumeration, and 200k visits is orders of magnitude past the ~1k a dense
+ * 35-table schema needs at depth 10.
+ */
+const JOIN_PATH_NODE_BUDGET = 200_000;
+
+/**
+ * The shortest relation chain between two tables, and the code that walks it.
+ *
+ * NEVER THROWS FOR "no path": an agent asking whether two tables are connected
+ * gets `found: false` and a reason, because "there is no path" is an ANSWER,
+ * and turning it into an error makes the agent retry the same question with
+ * different spellings. Only a table name that does not exist is an error, and
+ * that one lists the tables that do.
+ */
+async function findJoinPath(ctx: McpContext, args: JsonObject): Promise<unknown> {
+  const from = requiredString(args, 'from');
+  const to = requiredString(args, 'to');
+  const maxDepth = optionalInteger(args.maxDepth, 'maxDepth', 1, 10) ?? 6;
+  const maxPaths = optionalInteger(args.maxPaths, 'maxPaths', 1, 25) ?? 5;
+
+  return withReadOnly(ctx, async (client) => {
+    const { metadata } = await loadSchemaMetadata(client, ctx.options);
+    const fromTable = requireTable(metadata, from);
+    const toTable = requireTable(metadata, to);
+
+    const base = {
+      from: fromTable.name,
+      to: toTable.name,
+      searchedDepth: maxDepth,
+    };
+
+    // Same table: a join is not what is wanted, and pretending a 0-hop path is a
+    // path would emit `with: {}`. The useful answer is the table's SELF-relations
+    // (`manager`, `parent`), which are the only way to join a table to itself.
+    if (fromTable.name === toTable.name) {
+      const selfRelations = sortedRelations(fromTable, metadata).filter((relation) => relation.to === fromTable.name);
+      const paths = selfRelations.map((relation) => describePath(fromTable.name, [relation]));
+      return {
+        ...base,
+        found: true,
+        sameTable: true,
+        hops: paths.length > 0 ? 1 : 0,
+        pathCount: paths.length,
+        paths,
+        pathsTruncated: false,
+        notes: [
+          `"${fromTable.name}" is both ends of this query, so no join is needed to read its own columns.`,
+          paths.length > 0
+            ? 'The paths below are its SELF-relations: a relation whose target is the same table, which is the only way to join it to itself.'
+            : 'It declares no self-relation, so there is nothing to join it to itself through.',
+        ],
+      };
+    }
+
+    const { paths, truncated, exhausted } = shortestJoinPaths(
+      metadata,
+      fromTable.name,
+      toTable.name,
+      maxDepth,
+      maxPaths,
+    );
+    if (paths.length === 0) {
+      // A budget exhaustion is NOT "these tables are not connected", and saying
+      // so would send the agent off to change its schema. Reported as its own
+      // answer, with the knob that makes the search finish.
+      return {
+        ...base,
+        found: false,
+        sameTable: false,
+        hops: null,
+        pathCount: 0,
+        paths: [],
+        pathsTruncated: false,
+        searchExhausted: exhausted,
+        reason: exhausted
+          ? `The search for a chain from "${fromTable.name}" to "${toTable.name}" hit this tool's node budget before ` +
+            `it finished, so this is NOT an answer that they are unconnected. Lower maxDepth (it is ${maxDepth}) to ` +
+            `bound the search, or call relation_graph on "${fromTable.name}" and walk it a hop at a time.`
+          : `No relation chain connects "${fromTable.name}" to "${toTable.name}" within ${maxDepth} hop(s). Either the ` +
+            `schema declares no foreign key path between them, or the path is longer than the search depth. Raise ` +
+            `maxDepth, or call relation_graph on "${fromTable.name}" to see what it does reach.`,
+        notes: exhausted
+          ? ['The search did not complete. Do not report these tables as unconnected on the strength of this reply.']
+          : [
+              'This is an answer, not a failure: the tables are not connected by declared foreign keys as far as this search went.',
+            ],
+      };
+    }
+
+    const described = paths.map((path) => describePath(fromTable.name, path));
+    const notes: string[] = [];
+    if (described.length > 1) {
+      notes.push(
+        `${described.length} chains of equal length connect these tables. They are different joins, not duplicates: ` +
+          `pick by relation name (two foreign keys to the same table, e.g. author and editor, both appear here).`,
+      );
+    }
+    if (paths.some((path) => path.some((relation) => relation.type === 'manyToMany'))) {
+      notes.push(
+        'A manyToMany hop is ONE hop in the `with` clause. The junction table is joined for you and must not appear in the query.',
+      );
+    }
+    if (exhausted) {
+      notes.push(
+        `The search hit this tool's node budget and stopped early, so the chains below are the ones found before ` +
+          `that, not necessarily every equal-length chain. Lower maxDepth (it is ${maxDepth}) to bound the search.`,
+      );
+    } else if (truncated) {
+      notes.push(`More equal-length chains exist; ${maxPaths} were returned. Raise maxPaths to see the rest.`);
+    }
+    notes.push('A to-one relation (belongsTo / hasOne) is `T | null` when its foreign key is nullable.');
+
+    return {
+      ...base,
+      found: true,
+      sameTable: false,
+      hops: paths[0]?.length ?? null,
+      pathCount: described.length,
+      paths: described,
+      pathsTruncated: truncated,
+      searchExhausted: exhausted,
+      notes,
+    };
+  });
+}
+
+/**
+ * Size and index shape for one table.
+ *
+ * NOT collected through `collectStatsSnapshot` in ../index-stats.ts, and the
+ * reason is worth stating because that IS the natural reuse. That collector
+ * opens its own `pg.Pool` from a connection string and issues a SESSION-level
+ * `SET statement_timeout`; through a transaction-pooling proxy (PgBouncer,
+ * Neon's `-pooler` endpoint) a bare `SET` attaches to a shared server backend
+ * that is handed back out to other callers. `turbine doctor` runs once and
+ * exits; this server is long-lived and agent-driven, so it reads through the
+ * connection it already holds, inside the same `BEGIN READ ONLY` as every other
+ * tool. What IS reused is the pure half: {@link TableStats} as the row type and
+ * {@link formatBytes} for the human sizes.
+ *
+ * `reltuples` is labelled an ESTIMATE in three places (the tool description, the
+ * field name, and a note on the value) because an agent that reports it as a row
+ * count is worse than one that reports nothing: it is maintained by
+ * ANALYZE/autovacuum, and is -1 (never analyzed) or arbitrarily stale otherwise.
+ */
+async function tableStats(ctx: McpContext, tableName: string): Promise<unknown> {
+  return withReadOnly(ctx, async (client) => {
+    const { metadata } = await loadSchemaMetadata(client, ctx.options);
+    const table = requireTable(metadata, tableName);
+    const stats = (await collectTableStats(client, ctx.options.schema)).get(table.name);
+
+    // reltuples is -1 for a table that has never been analyzed on PG >= 14, and
+    // 0 on older ones. Neither is a row count, so both report as unknown rather
+    // than as "empty table", which is the wrong claim an agent would act on.
+    const reltuples = stats?.reltuples;
+    const analyzed = reltuples !== undefined && reltuples > 0;
+
+    return {
+      table: table.name,
+      schema: ctx.options.schema,
+      rowEstimate: {
+        estimatedRows: analyzed ? Math.round(reltuples) : null,
+        analyzed,
+        source: 'pg_class.reltuples',
+        note: analyzed
+          ? 'ESTIMATE, not a count. pg_class.reltuples is maintained by ANALYZE and autovacuum and can be arbitrarily stale. Do not report it as a row count; run an explicit count if an exact number matters.'
+          : 'Unknown: this table has never been ANALYZEd (reltuples is 0 or -1), so the planner has no row estimate for it. This is NOT the same as an empty table. Run ANALYZE, then ask again.',
+      },
+      storage: {
+        relpages: stats?.relpages ?? null,
+        relpagesNote:
+          'Planner page count for the heap, refreshed by ANALYZE/VACUUM. Paired with reltuples it is what plan cost is computed from.',
+        heapBytes: stats?.tableSizeBytes ?? null,
+        heapSize: formatBytes(stats?.tableSizeBytes),
+        totalBytes: stats?.totalSizeBytes ?? null,
+        totalSize: formatBytes(stats?.totalSizeBytes),
+        totalNote: 'Total is pg_total_relation_size: heap plus every index plus TOAST.',
+      },
+      indexCount: stats?.existingIndexCount ?? table.indexes.length,
+      primaryKey: table.primaryKey,
+      indexes: table.indexes.map(sanitizeIndex),
+      note:
+        'No row values are read by this tool. Index definitions are stripped of literal values before they are ' +
+        'returned, because a partial index predicate embeds real stored data. Column NAMES are returned in full: ' +
+        'they are schema shape, and table_detail publishes the same names.',
+    };
+  });
+}
+
+/**
+ * Explain one Turbine error code. Reads no database and opens no transaction:
+ * the catalog is a pure lookup over `errors.ts`, so this answers with the pool
+ * unreachable, which is frequently the situation an agent is in when it is
+ * holding a `TURBINE_E004`.
+ */
+function explainError(input: string): unknown {
+  const explanation = explainErrorCode(input);
+  if (!explanation) {
+    throw jsonRpcError(
+      -32602,
+      `"${input}" is not a Turbine error code. Known codes: ${CATALOGUED_ERROR_CODES.join(', ')}. ` +
+        `Any of "TURBINE_E003", "E003" or "3" is accepted.`,
+    );
+  }
+  const propertyLines = explanation.properties.map((property) => `    // err.${property}`).join('\n');
+  return {
+    ...explanation,
+    catchExample: [
+      `import { ${explanation.className} } from 'turbine-orm';`,
+      '',
+      'try {',
+      '  // the call that threw',
+      '} catch (err) {',
+      `  if (err instanceof ${explanation.className}) {`,
+      `    // err.code === '${explanation.code}'`,
+      `    // err.docsUrl === '${explanation.docsUrl}'`,
+      ...(propertyLines ? [propertyLines] : []),
+      '  }',
+      '  throw err;',
+      '}',
+    ].join('\n'),
+    note:
+      'Branch on `err.code` or `instanceof`, never on the message text: message wording is explicitly not part of the ' +
+      'stability contract, while the code and docsUrl are.',
+  };
+}
+
+async function withReadOnly<T>(ctx: McpContext, fn: (client: PgCompatPoolClient) => Promise<T>): Promise<T> {
   const client = await ctx.pool.connect();
   try {
     await client.query('BEGIN READ ONLY');
@@ -971,7 +1621,7 @@ async function withReadOnly<T>(ctx: McpContext, fn: (client: pg.PoolClient) => P
   }
 }
 
-async function loadSchemaMetadata(client: pg.PoolClient, options: McpServerOptions): Promise<LoadedSchema> {
+async function loadSchemaMetadata(client: PgCompatPoolClient, options: McpServerOptions): Promise<LoadedSchema> {
   const [tablesResult, columnsResult, pkResult, fkResult, uniqueResult, indexResult, enumResult] = await Promise.all([
     client.query<{ table_name: string }>(
       `SELECT table_name
@@ -1349,17 +1999,69 @@ export function buildRelations(
   });
 }
 
-async function estimateRows(client: pg.PoolClient, schema: string): Promise<Map<string, number>> {
-  const result = await client.query<{ relname: string; reltuples: string }>(
-    `SELECT c.relname, c.reltuples::bigint::text AS reltuples
+/**
+ * Per-table planner statistics and on-disk size, for every table in the schema.
+ *
+ * ONE query, and it is the same pg_class shape `collectStatsSnapshot` in
+ * ../index-stats.ts reads (down to the `::bigint::text` casts, which keep a
+ * count past 2^53 out of a lossy JS number on the way in), typed with that
+ * module's {@link TableStats}. It is issued here rather than by calling that
+ * collector because the collector opens its own pool and sets a session-level
+ * `SET statement_timeout`; see the note on {@link tableStats}.
+ *
+ * Every column past `relname` is read defensively: a role without permission to
+ * call `pg_total_relation_size`, or a wire-compatible engine that does not have
+ * it, leaves the field absent rather than turning `Number(undefined)` into a
+ * `NaN` that serializes as `null` with no explanation.
+ */
+async function collectTableStats(client: PgCompatPoolClient, schema: string): Promise<Map<string, TableStats>> {
+  const result = await client.query<{
+    relname: string;
+    reltuples: string | null;
+    relpages: string | null;
+    total_size: string | null;
+    table_size: string | null;
+    index_count: string | null;
+  }>(
+    `SELECT c.relname,
+            c.reltuples::bigint::text AS reltuples,
+            c.relpages::bigint::text AS relpages,
+            pg_total_relation_size(c.oid)::text AS total_size,
+            pg_relation_size(c.oid)::text AS table_size,
+            (SELECT count(*) FROM pg_index i WHERE i.indrelid = c.oid)::text AS index_count
      FROM pg_class c
      JOIN pg_namespace n ON n.oid = c.relnamespace
-     WHERE n.nspname = $1 AND c.relkind = 'r'`,
+     WHERE n.nspname = $1 AND c.relkind = 'r'
+     ORDER BY c.relname`,
     [schema],
   );
-  const counts = new Map<string, number>();
-  for (const row of result.rows) counts.set(row.relname, Math.max(0, Number(row.reltuples)));
-  return counts;
+  const num = (value: string | null | undefined): number | undefined => {
+    if (value === null || value === undefined) return undefined;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  };
+  const stats = new Map<string, TableStats>();
+  for (const row of result.rows) {
+    stats.set(row.relname, {
+      table: row.relname,
+      reltuples: num(row.reltuples) ?? 0,
+      relpages: num(row.relpages),
+      totalSizeBytes: num(row.total_size),
+      tableSizeBytes: num(row.table_size),
+      existingIndexCount: num(row.index_count),
+    });
+  }
+  return stats;
+}
+
+/**
+ * The row estimate the schema tools print: `reltuples` floored at 0, because a
+ * never-analyzed table reports -1 and "-1 rows" is not a thing to show anyone.
+ * `table_stats` deliberately does NOT go through this: it reports the unknown
+ * as unknown rather than as zero.
+ */
+function estimatedRowCount(stats: TableStats | undefined): number {
+  return Math.max(0, stats?.reltuples ?? 0);
 }
 
 function requireTable(metadata: SchemaMetadata, tableName: string): TableMetadata {
@@ -1371,15 +2073,30 @@ function requireTable(metadata: SchemaMetadata, tableName: string): TableMetadat
   return table;
 }
 
+/**
+ * The key-list entries of an index definition, for this server's copy of the
+ * catalog.
+ *
+ * ONE PARSER, SHARED WITH `turbine generate`. This used to be a second,
+ * independently written implementation, and it drifted from
+ * {@link parseIndexKeyEntries} in ways that mattered: on
+ * `USING btree (id) INCLUDE (email)` it answered `['id) INCLUDE (email']` where
+ * introspection answered `['id']`, and the same for `WITH (fillfactor=…)`. Those
+ * columns are handed to {@link deriveCatalogRelations}, which decides
+ * hasOne-vs-hasMany and auto-m2m from unique-index coverage, so a UNIQUE index
+ * with INCLUDE columns was visible to `turbine generate` and invisible here, and
+ * `relation_graph` / `find_join_path` omitted a relation the ORM accepts.
+ * Duplication is also what produced the predicate leak this function's history
+ * records (`name) WHERE (email = 'ceo@example.com'`, verbatim, in `columns`).
+ *
+ * The one thing this caller wants differently is an EXPRESSION entry.
+ * `parseIndexColumns` drops it, since generated metadata has nowhere to say a
+ * key was not a column; here it is KEPT verbatim so {@link sanitizeIndex} can
+ * report `columnsWithheld: true` rather than silently returning a shorter list.
+ * That difference is now one `??` rather than a second implementation.
+ */
 function extractIndexColumns(indexdef: string): string[] {
-  const match = indexdef.match(/\((.+)\)/);
-  if (!match) return [];
-  return match[1]!.split(',').map((column) =>
-    column
-      .trim()
-      .replace(/ (ASC|DESC)$/i, '')
-      .replace(/^"|"$/g, ''),
-  );
+  return parseIndexKeyEntries(indexdef).map((entry) => indexKeyColumn(entry) ?? entry);
 }
 
 function optionalLimit(value: unknown): number {
@@ -1394,6 +2111,29 @@ function requiredString(args: JsonObject, key: string): string {
   const value = args[key];
   if (typeof value !== 'string' || value.trim() === '') {
     throw jsonRpcError(-32602, `${key} is required`);
+  }
+  return value;
+}
+
+/**
+ * An optional string argument. An EMPTY string is refused rather than treated as
+ * absent: `{ table: '' }` is a caller that meant to pass a table and computed
+ * nothing, and silently answering the whole-schema question instead hides that.
+ */
+function optionalString(args: JsonObject, key: string): string | undefined {
+  const value = args[key];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw jsonRpcError(-32602, `${key} must be a non-empty string when provided`);
+  }
+  return value;
+}
+
+/** An optional bounded integer argument, refused (never clamped) when out of range. */
+function optionalInteger(value: unknown, key: string, min: number, max: number): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < min || value > max) {
+    throw jsonRpcError(-32602, `${key} must be an integer between ${min} and ${max}`);
   }
   return value;
 }

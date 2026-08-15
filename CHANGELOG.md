@@ -1,5 +1,177 @@
 # Changelog
 
+## 0.70.0 (2026-08-15)
+
+An agent-first release. Turbine's MCP server grows from six read-only tools to
+ten, aimed at the thing an agent actually struggles with on an unfamiliar
+schema: working out how two tables connect. `dependencies` becomes literally one
+entry. And the index-definition parser that feeds `turbine generate` was rebuilt
+after it turned out to be silently dropping whole classes of index.
+
+Two of those are breaking, and both are type-level or generation-level rather
+than runtime. Nothing about how a query executes changes in this release.
+
+### Breaking
+
+- **`@types/pg` is no longer a dependency, and `db.pool` is typed by Turbine's
+  own driver contract instead of by `pg.Pool`.** Root `dependencies` is now
+  exactly `{ pg }`, one entry, which is what "one dependency" has always meant
+  here and what it now also literally says.
+
+  The types package could not simply be moved. It sat in `dependencies` because
+  the published declarations named `pg.Pool` / `pg.PoolClient` /
+  `pg.QueryResult`, and `pg` ships no declarations of its own, so those names
+  made a types-only package a hard requirement for everyone compiling under
+  `strict`. Moving it without clearing the surface first IS the v0.28.1
+  regression, which passed every gate in this repo and broke strangers anyway,
+  because this repo typechecks against its own `devDependencies` and they do
+  not. The order is one-way: clear the declaration surface, then move the
+  dependency. `src/pg-types.ts` is the cleared surface, a zero-import leaf
+  declaring the `PgCompat*` interfaces natively.
+
+  Those interfaces are not new. `PgCompatPool` / `PgCompatPoolClient` /
+  `PgCompatQueryResult` have backed the external-pool seam since the serverless
+  binding shipped, and were already exported from the package root. What changed
+  is that `TurbineClient.pool` now says so. It was declared `pg.Pool` and
+  assigned `config.pool as unknown as pg.Pool`, a cast that was simply false
+  whenever an external pool (Neon, Vercel, Cloudflare Hyperdrive) or a
+  non-Postgres engine was behind it: the property claimed members the object did
+  not have, and the compiler had been told not to look. The new type is the
+  truth, and the truth is narrower, so five call shapes that used to compile no
+  longer do.
+
+  | What breaks | Why | One-line fix |
+  |---|---|---|
+  | `db.pool.on('error', h)` | `on?` is optional; an HTTP driver has no event emitter | `db.pool.on?.('error', h)` |
+  | `db.pool.totalCount` | now `number \| undefined`; HTTP pools expose no stats | `db.pool.totalCount ?? 0` |
+  | `result.fields[0].name` | `fields?` is optional; only describing drivers report it | `result.fields?.[0]?.name` |
+  | `result.command` | now `string \| undefined`; it is a pg-family command tag | `result.command ?? ''` |
+  | `pool.query({ text, values })` | the object form is not on the contract | `pool.query(text, values)` |
+
+  The same narrowing applies to the `transaction()` callback parameter, so
+  `copyFrom` / `copyTo`, cursors, `escapeIdentifier` / `escapeLiteral` and
+  `setTypeParser` / `getTypeParser` are no longer on it. If you genuinely hold a
+  real `pg.Pool` and want all of it back, assert once where you take it rather
+  than at each use:
+
+  ```ts
+  import type { Pool } from 'pg';
+  const pool = db.pool as unknown as Pool;
+  pool.on('error', handler);
+  ```
+
+  That assertion is now yours to make, which is the point: it is only sound when
+  you know the pool is a real `pg.Pool`, and Turbine cannot know that. An
+  application that never touches `db.pool` and never reads `.fields` or
+  `.command` off a raw result compiles unchanged. `pg` remains a real runtime
+  dependency; this is the type surface only, and `dist/pg-types.js` is
+  `export {};` so no emitted JavaScript changed.
+
+  Guarded so it cannot regress: `check:package-types` scans every published
+  `.d.ts` for a reference to the whole `pg` family (including deep specifiers
+  like `pg/lib/result` and `pg-protocol`), self-tests its own matcher before
+  scanning, and refuses to pass on a zero-file scan. It runs in
+  `prepublishOnly`, in CI, and in the release workflow, alongside a job that
+  installs the real tarball into a project with `pg` but without `@types/pg` and
+  typechecks it under `strict` with `skipLibCheck: false`.
+
+- **A junction table whose only two-column UNIQUE index is PARTIAL no longer
+  produces an automatic `manyToMany`.** `UNIQUE (post_id, tag_id) WHERE
+  deleted_at IS NULL` constrains the rows matching the predicate and nothing
+  else, so the pair can repeat freely across the table, and a relation derived
+  from it can return the same child twice. The hasOne path already refused
+  partial indexes for exactly this reason; the junction path was the one place
+  that did not read the flag, so the two cardinality paths disagreed about
+  whether the same index proved anything.
+
+  If you relied on such a relation, declare it explicitly in a code-first schema
+  (`defineSchema`), which is the supported way to describe a junction Turbine
+  cannot verify for itself. A junction with a real primary key, a table-wide
+  unique constraint, or a full unique index is unaffected.
+
+### Added
+
+- **Four new read-only MCP tools**, taking `npx turbine mcp` from six to ten.
+  Every one of them runs inside the same `BEGIN READ ONLY` transaction as the
+  rest, so an agent still cannot mutate anything through this server, and
+  PII-tagged values are still redacted before they reach a model.
+  - `relation_graph` returns the whole relation graph, or one table's subtree,
+    with cardinality, keys, and the junction table for many-to-many. Tables past
+    the depth limit are named in `omittedBeyondDepth`, so "not expanded" cannot
+    be misread as "nothing there".
+  - `find_join_path` answers "how do I get from `comments` to `orgs`" with the
+    relation chain **and the `with` clause to write**. It returns every
+    equal-shortest path rather than picking one, treats a many-to-many as a
+    single hop with the junction reported but never in the emitted query, and
+    answers `found: false` instead of throwing when there is no path.
+  - `table_stats` returns the planner's row estimate, on-disk size, and indexes.
+    A never-analyzed table reports `estimatedRows: null` with
+    `analyzed: false`, never `0`, because "unknown" and "empty" are different
+    facts and an agent acts differently on each.
+  - `explain_error` maps a Turbine error code to its cause, fix, and docs link.
+    It opens no connection at all, so it still answers while the database is
+    unreachable, which is the usual situation for a `TURBINE_E004`.
+
+### Fixed
+
+- **`turbine mcp` could disclose a stored value through an index's reported
+  columns.** The column extractor used a greedy match that ran from the key
+  list's opening parenthesis to the last closing one in the definition, so on a
+  partial index it swallowed the predicate: `CREATE INDEX ... (name) WHERE
+  (email = '...')` reported a "column" containing the literal. The definition
+  itself was already being withheld, so this was the one field carrying the
+  value past the redaction. Reported columns are now cut at the key list, and a
+  definition the parser cannot read is withheld rather than passed through.
+
+- **The MCP server and `turbine generate` disagreed about which relations a
+  schema has.** `cli/mcp.ts` carried its own weaker copy of the index-key
+  parser: on `USING btree (id) INCLUDE (email)` the copy answered
+  `['id) INCLUDE (email']` where introspection answered `['id']`. Those columns
+  feed junction detection, so an index could be visible to one surface and
+  invisible to the other, and an agent reading the schema over MCP was told
+  about a different set of relations than the generated client has. Both callers
+  now use one parser.
+
+- **Index keys carrying a modifier were dropped entirely.** A `pg_indexes` key
+  entry is `{ column | (expression) } [COLLATE c] [opclass] [ASC|DESC]
+  [NULLS FIRST|LAST]`, and the old parser stripped exactly one of those, a
+  trailing `ASC` or `DESC`. Everything else was kept, so
+  `email COLLATE "C" text_pattern_ops`, `email text_pattern_ops` and
+  `id NULLS FIRST` were all returned verbatim as column names. No table has a
+  column called that, so the index was silently invisible to every consumer of
+  index metadata. The parser is now a scanner rather than a regex, tracking
+  paren depth, quoted identifiers and string literals, so a comma inside
+  `coalesce(a, b)` is not a key boundary and an apostrophe inside a column named
+  `"it's"` does not swallow the rest of the definition. An unterminated key list
+  returns nothing rather than everything: the one input it cannot read must not
+  be the one it forwards.
+
+  This does not change relation cardinality. hasOne-vs-hasMany is decided by a
+  separate function that this release does not touch, and its output was
+  verified unchanged across every index shape. What can change is where the
+  newly-visible index was previously missing: `turbine doctor` retires a
+  missing-index finding for a column an opclass'd index already covers (and
+  `--fix` stops proposing a duplicate), and a compound-unique selector that
+  previously came out with spaces in its name, unusable by any caller, now comes
+  out correct.
+
+### Internal
+
+- `npm run lint` now fails on warnings rather than exiting 0 with them.
+- `TURBINE_REQUIRE_ENGINE` makes an engine test suite's skip gate throw instead
+  of skip, and is set on each engine's CI job. A container that came up but
+  rejected credentials, or a mistyped `MYSQL_URL`, previously left the job green
+  with the entire suite silently skipped. `check:skip-gates` fails the build if
+  a skip reason matches no known engine pattern, so rewording one cannot quietly
+  disarm the guard.
+- `check-private-terms` gained an `--all` mode and now runs in CI. It read the
+  staged diff, so in a CI checkout it would have scanned zero files and passed
+  vacuously. Both it and `check-no-pg-types` now refuse to pass on a zero-file
+  scan.
+- Studio's embedded UI had an unused `html` property on its DOM helper that
+  assigned `innerHTML`. No caller used it; it is gone rather than left as the
+  one unescaped path in a UI that renders database contents.
+
 ## 0.67.0 (2026-08-10)
 
 A streaming and row-decoding release, plus the benchmark suite that found the

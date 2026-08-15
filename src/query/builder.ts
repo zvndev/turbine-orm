@@ -11,7 +11,6 @@
  * metadata, nothing is hardcoded.
  */
 
-import type pg from 'pg';
 import type { Dialect, StreamableConnection } from '../dialect.js';
 import { postgresDialect } from '../dialect.js';
 import { NotFoundError, TimeoutError, UnsupportedFeatureError, ValidationError, wrapPgError } from '../errors.js';
@@ -22,6 +21,7 @@ import {
   hasRelationFields,
   type NestedWriteContext,
 } from '../nested-write.js';
+import type { PgCompatPool, PgCompatPoolClient, PgCompatQueryConfig, PgCompatQueryResult } from '../pg-types.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { normalizeKeyColumns, snakeToCamel } from '../schema.js';
 import * as aggMod from './aggregates.js';
@@ -742,7 +742,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private readonly ctx: BuilderCtx;
 
   constructor(
-    private readonly pool: pg.Pool,
+    private readonly pool: PgCompatPool,
     private readonly table: string,
     private readonly schema: SchemaMetadata,
     middlewares?: MiddlewareFn[],
@@ -2175,14 +2175,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
     params: unknown[],
     timeout?: number,
     preparedName?: string,
-  ): Promise<pg.QueryResult> {
+  ): Promise<PgCompatQueryResult> {
     const start = performance.now();
     const action = this.currentAction;
     // Build the query argument, use object form with `name` for prepared
     // statements, or the plain (text, values) form otherwise.
+    //
+    // The object form is not part of the PgCompatPool contract (the engine
+    // pool shims only speak `(text, values)`), so it is reached through a
+    // cast. Guarded at runtime by `preparedStatementsEnabled`, which only the
+    // drivers that accept it turn on.
     const usePrepared = preparedName && this.preparedStatementsEnabled;
     const exec = usePrepared
-      ? this.pool.query({ name: preparedName, text: sql, values: params } as pg.QueryConfig)
+      ? (this.pool as unknown as { query(config: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query({
+          name: preparedName,
+          text: sql,
+          values: params,
+        })
       : this.pool.query(sql, params);
 
     if (!timeout) {
@@ -2288,7 +2297,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * result for `'reselect'` engines (e.g. mysql2's `insertId`). Returns
    * `undefined` when the driver exposes no such field.
    */
-  private mutationInsertId(result: pg.QueryResult): unknown {
+  private mutationInsertId(result: PgCompatQueryResult): unknown {
     const r = result as unknown as { insertId?: unknown; lastID?: unknown };
     return r.insertId ?? r.lastID;
   }
@@ -3579,7 +3588,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * itself and rejects with the connect error, which the query boundary
    * already wraps.
    */
-  private async acquireConnection(): Promise<pg.PoolClient> {
+  private async acquireConnection(): Promise<PgCompatPoolClient> {
     try {
       return await this.pool.connect();
     } catch (err) {

@@ -4,8 +4,8 @@
  * Split from builder.ts so the class file focuses on SQL assembly / execution.
  */
 
-import type pg from 'pg';
 import type { Dialect } from '../dialect.js';
+import type { PgCompatPool, PgCompatQueryResult } from '../pg-types.js';
 import type { SchemaMetadata } from '../schema.js';
 // Forward-declared to avoid a runtime cycle with builder.ts. Type-only.
 import type { QueryInterface } from './builder.js';
@@ -16,15 +16,15 @@ import type { GlobalFilters, RelationLoadStrategy } from './types.js';
  * {@link DeferredQuery.reselect} plan so it can run the write and the follow-up
  * SELECT through the same timeout/instrumentation path as the primary query.
  */
-export type ReselectExecutor = (sql: string, params: unknown[], preparedName?: string) => Promise<pg.QueryResult>;
+export type ReselectExecutor = (sql: string, params: unknown[], preparedName?: string) => Promise<PgCompatQueryResult>;
 
 export interface DeferredQuery<T> {
   /** SQL text with $1, $2 placeholders */
   sql: string;
   /** Bound parameter values */
   params: unknown[];
-  /** How to transform the raw pg.QueryResult into the final value */
-  transform: (result: pg.QueryResult) => T;
+  /** How to transform the raw driver result into the final value */
+  transform: (result: PgCompatQueryResult) => T;
   /** Tag for debugging / logging */
   tag: string;
   /** Prepared statement name (t_<16hex>). Set when SQL cache is enabled. */
@@ -37,7 +37,7 @@ export interface DeferredQuery<T> {
    * Absent for `'returning'`/`'output'` dialects (the statement returns its own
    * rows), so the PostgreSQL path never allocates or consults it.
    */
-  reselect?: (exec: ReselectExecutor) => Promise<pg.QueryResult>;
+  reselect?: (exec: ReselectExecutor) => Promise<PgCompatQueryResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -278,7 +278,7 @@ export interface QueryInterfaceOptions {
    * `table()` behavior is byte-identical.
    */
   queryInterfaceFactory?: (
-    pool: pg.Pool,
+    pool: PgCompatPool,
     table: string,
     schema: SchemaMetadata,
     middlewares: MiddlewareFn[],

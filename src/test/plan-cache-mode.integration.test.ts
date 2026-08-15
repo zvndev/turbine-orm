@@ -107,11 +107,16 @@ async function series(planCacheMode: PlanCacheMode | undefined, tenantId: number
   const db = new TurbineClient({ connectionString: DATABASE_URL, poolSize: 1, planCacheMode }, schema);
   try {
     const client = await db.pool.connect();
+    // `db.pool` is typed as the driver-neutral PgCompatPool, whose `query` is
+    // the two-argument form every driver has. This probe needs the pg-only
+    // object form, since a NAMED prepared statement is the whole subject of the
+    // test, so it goes through the documented cast to the pg surface.
+    const pgClient = client as unknown as pg.PoolClient;
     try {
       const ms: number[] = [];
       for (let i = 0; i < 9; i++) {
         const started = process.hrtime.bigint();
-        await client.query({ name: 'turbine_pcm_probe', text: STATEMENT, values: [tenantId] });
+        await pgClient.query({ name: 'turbine_pcm_probe', text: STATEMENT, values: [tenantId] });
         ms.push(Number(process.hrtime.bigint() - started) / 1e6);
       }
       const counters = await client.query<{ generic_plans: string; custom_plans: string }>(

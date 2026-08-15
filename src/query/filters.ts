@@ -86,24 +86,24 @@ export const COLUMN_REF_OPERATORS = new Set<string>(['equals', 'not', 'gt', 'gte
  * dependency is fixed: `cli/` and the prisma-compat shim may import from the
  * query path, and the query path may never import from `cli/`
  * (`scripts/check-import-cycles.mjs`).
+ *
+ * ## STATUS: a landing spot, not yet a deduplication. Read this before trusting it.
+ *
+ * NOTHING IMPORTS THIS YET. The three copies listed above are all still in
+ * place and still hand-synced; declaring the canonical home did not by itself
+ * move any of them onto it. It is kept, rather than deleted as unused, because
+ * `cli/pii-predicate-guard.ts` names this module as where its own copy wants to
+ * go, and deleting the destination is the one change that makes converging
+ * harder. Wiring the copies up is a separate change: each one sits on a
+ * different walk, so each has to be re-tested on its own.
+ *
+ * So do not read this constant as evidence that the walkers agree. The comment
+ * on each copy is still the only thing holding them in step.
  */
 export const RELATION_FILTER_WRAPPERS = ['some', 'none', 'every', 'is', 'isNot'] as const;
 
 /** {@link RELATION_FILTER_WRAPPERS} as a membership set, for the walkers. */
 export const RELATION_FILTER_WRAPPER_SET: ReadonlySet<string> = new Set<string>(RELATION_FILTER_WRAPPERS);
-
-/**
- * True when a normalized relation-filter body carries at least one cardinality
- * wrapper. THE predicate the SQL compiler branches on: a key that names a
- * relation but whose value is not one of these falls through to the scalar
- * path.
- */
-export function hasRelationFilterWrapper(filterObj: Record<string, unknown>): boolean {
-  for (const wrapper of RELATION_FILTER_WRAPPERS) {
-    if (wrapper in filterObj) return true;
-  }
-  return false;
-}
 
 /**
  * Check if an operator value is a column reference: a plain object whose ONLY

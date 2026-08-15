@@ -57,7 +57,7 @@ Common mistakes to avoid when generating Turbine code:
 - [Turbine + Neon](https://turbineorm.dev/neon): Neon-specific setup over HTTP and WebSocket drivers.
 - [Turbine + BataDB](https://turbineorm.dev/batadb): Setup notes for BataDB.
 - [Studio](https://turbineorm.dev/studio): The local database UI (npx turbine studio), its security model, and --demo mode.
-- [MCP Server](https://turbineorm.dev/mcp): A read-only Model Context Protocol server (npx turbine mcp) that exposes schema, migrations, doctor, EXPLAIN, and sample rows to agents.
+- [MCP Server](https://turbineorm.dev/mcp): A read-only Model Context Protocol server (npx turbine mcp) exposing ten tools to agents: schema, table detail, relation graph, join paths (returns the with clause to write), migrations, doctor, EXPLAIN, table stats, sample rows, and error lookup.
 - [Observability](https://turbineorm.dev/observability): Query lifecycle events and built-in metrics aggregation.
 - [The PowDB Module](https://turbineorm.dev/powdb): The turbine-orm/powdb subpath in full: transports, capability gating, PowQL helpers, schema DDL, introspection, and error mapping.
 - [Writing a Custom Dialect](https://turbineorm.dev/dialects): The exported Dialect contract: capability flags, resultStrategy, required primitives, and the additive override hooks.

@@ -20,6 +20,7 @@ import type { DatabaseAdapter } from '../adapters/index.js';
 import { postgresql } from '../adapters/index.js';
 import { type Dialect, postgresDialect } from '../dialect.js';
 import { MigrationError } from '../errors.js';
+import type { PgCompatQueryResult } from '../pg-types.js';
 import { DESTRUCTIVE_KIND_LABEL, type DestructiveStatement, scanDestructiveSql } from './destructive.js';
 import { splitSqlStatements, tokenizeSql } from './sql-statements.js';
 
@@ -199,7 +200,7 @@ function quotedTrackingTable(dialect: Dialect): string {
  */
 const TABLE_ALREADY_EXISTS_CODES = new Set(['23505', '42P07']);
 
-async function ensureTrackingTable(client: pg.Client, dialect: Dialect = postgresDialect): Promise<void> {
+async function ensureTrackingTable(client: MigrationQueryClient, dialect: Dialect = postgresDialect): Promise<void> {
   const sql = dialect.buildMigrationTrackingTable(quotedTrackingTable(dialect));
   try {
     await client.query(sql);
@@ -213,7 +214,7 @@ async function ensureTrackingTable(client: pg.Client, dialect: Dialect = postgre
 }
 
 async function getAppliedMigrations(
-  client: pg.Client,
+  client: MigrationQueryClient,
   dialect: Dialect = postgresDialect,
 ): Promise<AppliedMigration[]> {
   await ensureTrackingTable(client, dialect);
@@ -847,6 +848,24 @@ export interface MigrationLockClient {
   end(): Promise<void>;
 }
 
+/**
+ * The ROW-RETURNING query surface the runner needs, for the paths that read the
+ * tracking table back rather than just issuing a statement.
+ *
+ * Deliberately not `PgCompatPoolClient`: this connection is a `pg.Client`,
+ * which has no `release()`, so the pooled-client interface does not fit. Naming
+ * the driver type itself would put a pg module import back into the published
+ * declarations, which is what `src/pg-types.ts` exists to prevent, and it is
+ * also why this comment does not spell that import form out: the `consumer-types`
+ * CI job greps the built `.d.ts` files for it and cannot tell prose from code.
+ * `pg.Client` satisfies this structurally; tests supply a fake.
+ *
+ * @internal
+ */
+export interface MigrationQueryClient {
+  query<R = Record<string, unknown>>(sql: string, params?: unknown[]): Promise<PgCompatQueryResult<R>>;
+}
+
 /** A held (or refused) migration lock, and whatever must be released with it. */
 export interface MigrationLock {
   /** False when another migration already holds the lock. */
@@ -999,7 +1018,7 @@ export interface MigrationDeployPlan {
  * @internal exported for tests; not part of the CLI's public surface.
  */
 export async function validateChecksums(
-  client: pg.Client,
+  client: MigrationQueryClient,
   migrationsDir: string,
   dialect: Dialect = postgresDialect,
 ): Promise<ChecksumMismatch[]> {

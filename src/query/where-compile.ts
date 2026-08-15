@@ -42,7 +42,6 @@ import {
   fingerprintArrayFilterShape,
   fingerprintJsonFilterShape,
   fingerprintOperatorShape,
-  hasRelationFilterWrapper,
   isArrayFilter,
   isJsonFilter,
   isTextSearchFilter,

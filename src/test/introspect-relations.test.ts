@@ -22,6 +22,7 @@ import { describe, it } from 'node:test';
 import {
   addAutoManyToManyRelations,
   buildRelationsFromForeignKeys,
+  deriveCatalogRelations,
   type ForeignKeyEntry,
   relationNameFromColumn,
 } from '../introspect.js';
@@ -619,5 +620,114 @@ describe('addAutoManyToManyRelations, column-shadow handling', () => {
     // The pre-existing hasMany won, untouched, no Rel-suffixed sibling.
     assert.equal(relationsByTable.get('posts')!.tags!.type, 'hasMany');
     assert.equal(relationsByTable.get('posts')!.tagsRel, undefined);
+  });
+});
+
+describe('deriveCatalogRelations, junction keys from a UNIQUE index', () => {
+  /**
+   * The unique-index fallback that makes a PK-less Prisma implicit junction
+   * work reads `IndexMetadata.columns`, which is the key list with EXPRESSION
+   * keys ALREADY DROPPED. So `columns.length` is not the index's arity, and a
+   * length of 2 does not mean the database enforces uniqueness on that pair:
+   * `UNIQUE (a, lower(b), c)` reports `['a', 'c']` while `(a, c)` is free to
+   * repeat. A junction accepted on that basis emits a `manyToMany` whose
+   * correlation can match a parent to the same child twice.
+   *
+   * REACHABILITY, since the answer is not obvious and decides whether this gate
+   * is real. A junction must have exactly two columns (the payload guard), so
+   * any expression key is over those two columns, and an index expression must
+   * be IMMUTABLE, i.e. a function of them. Uniqueness of `(a, f(b), b)`
+   * therefore normally implies uniqueness of `(a, b)`, which is why the shape
+   * looks harmless. It stops implying it as soon as the expression can be NULL
+   * for a non-NULL input: under the default NULLS DISTINCT, `(1, NULL, 5)` is
+   * exempt from the index entirely, so `nullif(b, 5)` lets `(1, 5)` be stored
+   * twice while a real `UNIQUE (a, b)` would have refused the second row.
+   *
+   * The gate is therefore arity agreement, not a guess about which expressions
+   * are safe: an index whose raw key count differs from its plain-column count
+   * is one this cannot vouch for, and a junction it cannot vouch for is not a
+   * junction.
+   */
+  const FKS: ForeignKeyEntry[] = [
+    fk('j', ['a'], 'posts', ['id'], 'j_a_fkey'),
+    fk('j', ['b'], 'tags', ['id'], 'j_b_fkey'),
+  ];
+
+  function deriveWithJunctionIndex(definition: string, columns = ['a', 'b'], partial?: boolean) {
+    const cols = (names: string[]) => names.map((n) => ({ name: n, field: n, tsType: 'number', pgType: 'int8' }));
+    return deriveCatalogRelations({
+      tableNames: ['posts', 'tags', 'j'],
+      foreignKeys: FKS,
+      // PK-less junction: the unique-index fallback is the only way in.
+      pkByTable: new Map([
+        ['posts', ['id']],
+        ['tags', ['id']],
+      ]),
+      columnsByTable: new Map([
+        ['posts', cols(['id'])],
+        ['tags', cols(['id'])],
+        ['j', cols(['a', 'b'])],
+      ]),
+      uniqueByTable: new Map(),
+      indexesByTable: new Map([['j', [{ name: 'u', columns, unique: true, definition, partial }]]]),
+      enums: {},
+    });
+  }
+
+  it('accepts an all-plain two-column UNIQUE index (baseline)', () => {
+    const relations = deriveWithJunctionIndex('CREATE UNIQUE INDEX u ON public.j USING btree (a, b)');
+    assert.equal(relations.get('posts')!.tags!.type, 'manyToMany');
+    assert.equal(relations.get('tags')!.posts!.type, 'manyToMany');
+    assert.deepEqual(relations.get('posts')!.tags!.through, { table: 'j', sourceKey: 'a', targetKey: 'b' });
+  });
+
+  it('REFUSES an index that reports two columns but has a third, expression, key', () => {
+    // `columns` is ['a','b'] here exactly as in the baseline; the only
+    // difference is in the raw definition, which is why reading arity off
+    // `columns` could not tell the two apart.
+    const relations = deriveWithJunctionIndex('CREATE UNIQUE INDEX u ON public.j USING btree (a, nullif(b, 5), b)');
+    assert.equal(relations.get('posts')?.tags, undefined);
+    assert.equal(relations.get('tags')?.posts, undefined);
+  });
+
+  it('REFUSES a PARTIAL two-column UNIQUE index (the soft-delete junction)', () => {
+    // Same all-plain key list as the baseline, same arity: the ONLY difference
+    // is the predicate. `UNIQUE (a, b) WHERE deleted_at IS NULL` constrains the
+    // matching rows and nothing else, so the pair repeats freely across the
+    // table and a derived manyToMany returns the same child twice. This is the
+    // MAINSTREAM instance of the class, not the exotic one: soft-deleting a
+    // junction row is an ordinary thing to do.
+    const relations = deriveWithJunctionIndex(
+      'CREATE UNIQUE INDEX u ON public.j USING btree (a, b) WHERE (deleted_at IS NULL)',
+      ['a', 'b'],
+      true,
+    );
+    assert.equal(relations.get('posts')?.tags, undefined);
+    assert.equal(relations.get('tags')?.posts, undefined);
+  });
+
+  it('honours `partial` even when the definition text is not consulted', () => {
+    // The gate reads the metadata FLAG, not the SQL. Introspection sets that
+    // flag, and a code-first schema can set it too, so a caller that supplies
+    // `partial: true` with a predicate-free definition string must still be
+    // refused. Pinning this stops a later refactor from "simplifying" the check
+    // into a regex over `definition` and silently re-opening the hole for every
+    // non-introspected caller.
+    const relations = deriveWithJunctionIndex('CREATE UNIQUE INDEX u ON public.j USING btree (a, b)', ['a', 'b'], true);
+    assert.equal(relations.get('posts')?.tags, undefined);
+  });
+
+  it('REFUSES it for a quoted expression key too (the Prisma "A"/"B" spelling)', () => {
+    const relations = deriveWithJunctionIndex('CREATE UNIQUE INDEX u ON public.j USING btree (a, lower(b::text), b)');
+    assert.equal(relations.get('posts')?.tags, undefined);
+  });
+
+  it('still accepts an index carrying non-key clauses, which do not change the arity', () => {
+    // INCLUDE payload and storage parameters sit OUTSIDE the key list, so the
+    // scanner never counted them and the gate must not start rejecting them.
+    const relations = deriveWithJunctionIndex(
+      "CREATE UNIQUE INDEX u ON public.j USING btree (a, b) INCLUDE (a) WITH (fillfactor='70')",
+    );
+    assert.equal(relations.get('posts')!.tags!.type, 'manyToMany');
   });
 });

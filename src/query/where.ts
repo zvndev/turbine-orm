@@ -11,9 +11,9 @@
  * primitives this module needs. See builder.ts for the thin delegating methods.
  */
 
-import type pg from 'pg';
 import type { Dialect } from '../dialect.js';
 import { getErrorMessageMode, UnsupportedFeatureError, ValidationError } from '../errors.js';
+import type { PgCompatQueryResult } from '../pg-types.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { camelToSnake, normalizeKeyColumns } from '../schema.js';
 import type { TemporalInfinityReading } from './deferred.js';
@@ -181,7 +181,7 @@ export interface BuilderCtx {
   ): string;
   // Shared primitives reached by the write module (writes.ts).
   toSqlColumn(field: string): string;
-  mutationInsertId(result: pg.QueryResult): unknown;
+  mutationInsertId(result: PgCompatQueryResult): unknown;
   acquireSql(cacheKey: string, build: (params: unknown[]) => string): SqlCacheEntry;
   crossCheckCache(
     op: string,

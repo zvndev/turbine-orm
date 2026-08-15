@@ -59,8 +59,12 @@ import type { SchemaMetadata, TableMetadata } from '../schema.js';
  * Copy 2 belongs to the SQL compiler and cannot import this one (a query-path
  * module must not depend on `cli/`), so the deduplication has to go the other
  * way: the list wants to live in `query/filters.ts` and be imported here, the
- * way {@link COLUMN_REF_OPERATORS} above now is. Until that export exists this
- * comment is the only thing holding the three in step.
+ * way {@link COLUMN_REF_OPERATORS} above now is.
+ *
+ * That destination now EXISTS (`RELATION_FILTER_WRAPPERS` in `query/filters.ts`)
+ * and nothing imports it, including this file, so it is a fourth copy rather
+ * than a deduplication and this comment is still the only thing holding them in
+ * step. Moving each walk onto it is a change per walk, each with its own tests.
  */
 export const RELATION_FILTER_WRAPPERS = ['some', 'none', 'every', 'is', 'isNot'] as const;
 

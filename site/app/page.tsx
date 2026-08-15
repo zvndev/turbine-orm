@@ -144,7 +144,7 @@ const capabilities = [
   {
     title: 'One dependency. No WASM.',
     description:
-      'Turbine ships pg and nothing else, no WASM at all. Prisma 7 dropped its Rust engine but its client still bundles a TS/WASM query compiler (~1.6 MB) plus a required driver adapter. The main entry is held under 85 KB brotli as an import graph with pg external, under 68 KB on the edge, enforced by size-limit in CI rather than quoted from a past measurement. That is the client footprint your bundler sees, not the size of the dual ESM+CJS build on disk, which is larger.',
+      'Turbine declares pg and nothing else, no WASM at all. Prisma 7 dropped its Rust engine but its client still bundles a TS/WASM query compiler (~1.6 MB) plus a required driver adapter. The main entry is held under 85 KB brotli as an import graph with pg external, under 68 KB on the edge, enforced by size-limit in CI rather than quoted from a past measurement. That is the client footprint your bundler sees, not the size of the dual ESM+CJS build on disk, which is larger.',
     href: '/benchmarks',
     cta: 'Benchmarks',
   },

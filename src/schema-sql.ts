@@ -457,6 +457,24 @@ function declaredIndexName(tableName: string, idx: ColumnIndexDef): string {
  * column list), or null when the definitions agree. Expression/partial indexes
  * in the DB never structurally match a plain column list, which is the
  * intended outcome: the operator gets a warning rather than a silent skip.
+ *
+ * ## Parser 3 of 3, and what it is safe for
+ *
+ * THREE indexdef parsers coexist in this repo, catalogued on
+ * `parseIndexKeyEntries` in introspect.ts: that character-by-character scanner
+ * (the one to prefer for new callers), `parsePlainUniqueIndexColumns` in the
+ * same file, and this one. The two in introspect.ts do NOT feed this function
+ * and a fix to either does not reach it.
+ *
+ * This still uses the `USING \w+ \(([^)]*)\)` regex the scanner was written to
+ * replace, so it inherits the same weaknesses: it stops at the FIRST `)`, and it
+ * splits on every comma, which misreads an expression key (`lower(email)`), a
+ * quoted identifier containing a comma or a paren, and an opclass'd key. Safe
+ * here because every outcome of a misread is the SAME outcome as a genuine
+ * mismatch: a string describing the difference, which the caller turns into a
+ * warning for a human to read. It never drops or alters an index, and it is
+ * never consulted about whether a column set is unique. Do not reuse it
+ * anywhere those two properties stop holding.
  */
 export function describeIndexDefMismatch(idx: ColumnIndexDef, indexdef: string): string | null {
   const dbUnique = /^\s*CREATE\s+UNIQUE\s+INDEX\b/i.test(indexdef);

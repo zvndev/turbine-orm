@@ -100,6 +100,7 @@ describe('turbine mcp protocol', () => {
       result: {
         tools: Array<{
           name: string;
+          description: string;
           inputSchema: {
             type: string;
             required?: string[];
@@ -114,9 +115,44 @@ describe('turbine mcp protocol', () => {
 
     assert.deepEqual(
       response.result.tools.map((tool) => tool.name),
-      ['schema_overview', 'table_detail', 'migrate_status', 'doctor_report', 'explain_query', 'sample_rows'],
+      [
+        'schema_overview',
+        'table_detail',
+        'migrate_status',
+        'doctor_report',
+        'explain_query',
+        'sample_rows',
+        'relation_graph',
+        'find_join_path',
+        'table_stats',
+        'explain_error',
+      ],
     );
     assert.equal(response.result.tools[0]?.inputSchema.type, 'object');
+
+    // The graph tools carry the arguments an agent needs to scope them.
+    const graph = response.result.tools.find((tool) => tool.name === 'relation_graph');
+    assert.ok(graph);
+    assert.equal(graph.inputSchema.required, undefined, 'relation_graph must work with no arguments');
+    assert.ok(graph.inputSchema.properties?.table);
+    assert.ok(graph.inputSchema.properties?.depth);
+    assert.equal(graph.inputSchema.additionalProperties, false);
+
+    const joinPath = response.result.tools.find((tool) => tool.name === 'find_join_path');
+    assert.ok(joinPath);
+    assert.deepEqual(joinPath.inputSchema.required, ['from', 'to']);
+    assert.equal(joinPath.inputSchema.additionalProperties, false);
+
+    const errorTool = response.result.tools.find((tool) => tool.name === 'explain_error');
+    assert.ok(errorTool);
+    assert.deepEqual(errorTool.inputSchema.required, ['code']);
+
+    // The row-estimate caveat lives in the DESCRIPTION, which is the only part
+    // of a tool an agent reads before deciding how to report the number.
+    const stats = response.result.tools.find((tool) => tool.name === 'table_stats');
+    assert.ok(stats);
+    assert.match(stats.description, /ESTIMATE/);
+    assert.match(stats.description, /not an exact count/i);
 
     const explain = response.result.tools.find((tool) => tool.name === 'explain_query');
     assert.ok(explain);

@@ -785,44 +785,191 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
 }
 
 /**
- * Parse the indexed column names out of a `pg_indexes.indexdef` string.
+ * The index-definition key-list SCANNER, and the only one that reads an
+ * `indexdef` character by character.
  *
- * `indexdef` always reads `CREATE [UNIQUE] INDEX name ON tbl USING method
- * (col, ...) [WHERE predicate]`. We anchor on the `USING` clause's parenthesised
- * column list (the same precedent as `describeIndexDefMismatch` in
- * schema-sql.ts) so a PARTIAL index's trailing `WHERE (...)` parentheses are
- * never mistaken for the column list. The older greedy `/\((.+)\)/` swallowed
- * `) WHERE (` and spliced a raw predicate fragment into the column names, which
- * then leaked into generated compound-unique selector names.
+ * `pg_indexes.indexdef` always reads `CREATE [UNIQUE] INDEX name ON tbl USING
+ * method (key, ...) [INCLUDE (col, ...)] [WITH (...)] [TABLESPACE ts]
+ * [WHERE predicate]`. This returns the raw entries of the KEY LIST only, one per
+ * top-level comma, expression entries included and verbatim.
  *
- * Each column is de-quoted (Postgres quotes non-lowercase identifiers such as a
- * Prisma implicit m2m junction's `"A"` / `"B"`), so the names match the
- * unquoted column names carried elsewhere in the metadata. Expression columns
- * (anything containing a parenthesis) are dropped conservatively: a functional
- * index does not name a plain column.
+ * ## THREE indexdef parsers coexist in this repo. This is one of them.
+ *
+ * An earlier version of this comment said there was exactly one. There is not,
+ * and pretending otherwise is how hand-synced parsers drift here, so each of the
+ * three names the other two:
+ *
+ *   1. THIS scanner (with {@link indexKeyColumn} / {@link parseIndexColumns}).
+ *      Safe for any `indexdef` pg emits, including expression keys, quoted
+ *      identifiers holding commas or parens, string literals, INCLUDE lists and
+ *      partial predicates. Feeds generated metadata, compound-unique selectors,
+ *      the FK-index advisor and m2m detection, plus `cli/mcp.ts`.
+ *   2. {@link parsePlainUniqueIndexColumns}, below. Still the old
+ *      `USING \w+ \(([^)]*)\)` regex. It answers a NARROWER question ("is this a
+ *      plain, whole-table unique index over these exact columns") and returns
+ *      `null` on everything it cannot read, so its regex's known weaknesses cost
+ *      a missed hasOne flip rather than a wrong answer.
+ *   3. `describeIndexDefMismatch` in `schema-sql.ts`. Same old regex, same
+ *      fail-toward-a-warning posture.
+ *
+ * Unifying them is a separate change with its own risk: (2) and (3) both treat
+ * "cannot read this" as a safe refusal, and swapping in a parser that reads MORE
+ * turns some of those refusals into answers. Until then, prefer this scanner for
+ * any new caller, and do not assume a fix here reaches the other two.
+ *
+ * ## Why the mcp.ts copy is gone
+ *
+ * `cli/mcp.ts` kept its own weaker copy of this, and the two drifted: on
+ * `USING btree (id) INCLUDE (email)` the copy answered `['id) INCLUDE (email']`
+ * while this one answered `['id']`. Those columns feed `deriveCatalogRelations`,
+ * which decides hasOne-vs-hasMany and auto-m2m, so a UNIQUE index with INCLUDE
+ * columns was visible to `turbine generate` and invisible to the MCP server, and
+ * the two surfaces disagreed about which relations the schema has. The
+ * duplication is also what produced the predicate leak that
+ * {@link parseIndexColumns}'s own history records. So mcp.ts consumes this
+ * function now, and the split between the two callers is expressed as the two
+ * exports below rather than as two implementations.
+ *
+ * ## Why a scanner rather than a regex
+ *
+ * The regex this replaces (`/USING\s+\w+\s*\(([^)]*)\)/`) stops at the FIRST
+ * `)`, which is the wrong paren for any expression key (`lower(email)`), and a
+ * plain `.split(',')` cuts `coalesce(a, b)` in half. The scan tracks paren depth
+ * and single-quoted literals, so a comma or a paren inside an expression or a
+ * literal is not a boundary.
+ *
+ * The anchor requires `USING <method> (`, which no predicate, INCLUDE list, WITH
+ * list or literal can spell, so the key list is found positionally rather than
+ * by hoping the first paren is the right one. When the anchor is absent (not a
+ * shape pg emits) it falls back to the first parenthesised group, matching the
+ * previous behaviour.
  */
-export function parseIndexColumns(indexdef: string): string[] {
-  const m = indexdef.match(/USING\s+\w+\s*\(([^)]*)\)/i) ?? indexdef.match(/\(([^)]*)\)/);
-  if (!m) return [];
-  return m[1]!
-    .split(',')
-    .map((c) =>
-      unquoteIndexIdent(
-        c
-          .trim()
-          .replace(/\s+(ASC|DESC)$/i, '')
-          .trim(),
-      ),
-    )
-    .filter((c) => c.length > 0 && !c.includes('(') && !c.includes(')'));
+export function parseIndexKeyEntries(indexdef: string): string[] {
+  const anchor = /USING\s+\w+\s*\(/i.exec(indexdef);
+  const open = anchor ? anchor.index + anchor[0].length : indexdef.indexOf('(') + 1;
+  if (open === 0) return [];
+
+  const entries: string[] = [];
+  let depth = 0;
+  let inLiteral = false;
+  let inQuotedIdent = false;
+  let start = open;
+  for (let i = open; i < indexdef.length; i++) {
+    const char = indexdef[i];
+    // A doubled quote inside a literal (or a quoted identifier) toggles twice,
+    // which is the same as not toggling, so pg's `''` / `""` escapes need no
+    // special case. Identifier quoting is tracked as well as literal quoting: a
+    // column named `it's` renders as `"it's"`, and reading its apostrophe as the
+    // start of a literal swallows the rest of the definition.
+    if (char === "'" && !inQuotedIdent) {
+      inLiteral = !inLiteral;
+      continue;
+    }
+    if (char === '"' && !inLiteral) {
+      inQuotedIdent = !inQuotedIdent;
+      continue;
+    }
+    if (inLiteral || inQuotedIdent) continue;
+    if (char === '(') depth++;
+    else if (char === ')') {
+      if (depth === 0) {
+        entries.push(indexdef.slice(start, i));
+        return entries.map((entry) => entry.trim()).filter((entry) => entry.length > 0);
+      }
+      depth--;
+    } else if (char === ',' && depth === 0) {
+      entries.push(indexdef.slice(start, i));
+      start = i + 1;
+    }
+  }
+  // Unterminated key list: the definition does not parse, so it names no
+  // columns. Never "all of it" - the one input this cannot read must not be the
+  // one it forwards.
+  return [];
 }
 
-/** Strip one pair of surrounding double quotes and unescape doubled `""`. */
-function unquoteIndexIdent(col: string): string {
-  if (col.length >= 2 && col.startsWith('"') && col.endsWith('"')) {
-    return col.slice(1, -1).replace(/""/g, '"');
+/**
+ * The plain COLUMN NAME an index key entry indexes, or `null` when the entry is
+ * an expression rather than a column.
+ *
+ * A key entry is `{ column | (expression) } [COLLATE c] [opclass [(params)]]
+ * [ASC|DESC] [NULLS FIRST|LAST]`, so the column is the LEADING token and
+ * everything after it is a modifier. Reading it that way is what makes
+ * `email COLLATE "C" text_pattern_ops` resolve to `email`; the previous
+ * suffix-stripping (`ASC`/`DESC` only) returned the whole entry verbatim as a
+ * "column name", which matches no real column.
+ *
+ * SCOPE OF THAT FIX, stated exactly because an earlier version of this comment
+ * overstated it: what changes is what {@link parseIndexColumns} reports, and so
+ * what its consumers see. Those are the generated `metadata.ts` index lists,
+ * the compound-unique selector derivation, the FK-index advisor's leading-column
+ * check, and m2m junction detection. Relation CARDINALITY is NOT among them: the
+ * `hasMany`/`hasOne` flip reads {@link parsePlainUniqueIndexColumns}, a separate
+ * parser this does not feed, and that one still answers `null` for an opclass'd
+ * UNIQUE index exactly as it did before.
+ *
+ * The name is de-quoted (Postgres quotes non-lowercase identifiers such as a
+ * Prisma implicit m2m junction's `"A"` / `"B"`) so it matches the unquoted names
+ * carried elsewhere in the metadata.
+ */
+export function indexKeyColumn(entry: string): string | null {
+  const trimmed = entry.trim();
+  if (trimmed.length === 0) return null;
+  if (trimmed.startsWith('"')) {
+    // A quoted identifier ends at the first unpaired `"`; anything after it is a
+    // modifier. `""` inside is one escaped quote and does not end it.
+    let i = 1;
+    let name = '';
+    while (i < trimmed.length) {
+      if (trimmed[i] === '"') {
+        if (trimmed[i + 1] === '"') {
+          name += '"';
+          i += 2;
+          continue;
+        }
+        // The SAME trailing-modifier rule the unquoted branch applies below,
+        // and for the same reason: what follows the name must be whitespace
+        // (a COLLATE clause, an opclass, ASC/DESC/NULLS) or nothing. Returning
+        // at the closing quote without asking read `"MyFunc"(email)` as a
+        // column named `MyFunc`, synthesizing a column that does not exist and
+        // handing it to generated metadata, the FK-advisor lead-column check,
+        // compound-unique selectors and m2m junction detection alike.
+        const rest = trimmed.slice(i + 1);
+        if (rest.length > 0 && !/^\s/.test(rest)) return null;
+        return name;
+      }
+      name += trimmed[i];
+      i++;
+    }
+    return null; // unterminated quote: not a name this can vouch for
   }
-  return col;
+  // An expression key is anything that is not a bare leading identifier, which
+  // includes every parenthesised or operator-bearing form pg renders.
+  // Non-ASCII letters are identifier characters to Postgres and are left
+  // unquoted in `indexdef`, so the class has to admit them or a `café` column
+  // reads as an expression and disappears.
+  const leading = /^[A-Za-z_\u0080-\uFFFF][A-Za-z0-9_$\u0080-\uFFFF]*/.exec(trimmed);
+  if (!leading) return null;
+  const rest = trimmed.slice(leading[0].length);
+  // The rest must be modifiers (whitespace-separated words / quoted collation /
+  // opclass parameters), never a continuation of an expression: `lower(email)`
+  // has a leading identifier too, and it is not a column.
+  if (rest.length > 0 && !/^\s/.test(rest)) return null;
+  return leading[0];
+}
+
+/**
+ * Parse the indexed COLUMN names out of a `pg_indexes.indexdef` string.
+ *
+ * Expression keys are dropped, conservatively: a functional index does not name
+ * a plain column, and generated metadata has nowhere to say "there was a key
+ * here that is not a column". {@link parseIndexKeyEntries} is the variant that
+ * keeps them, for the one caller (`cli/mcp.ts`) that reports their presence.
+ */
+export function parseIndexColumns(indexdef: string): string[] {
+  return parseIndexKeyEntries(indexdef)
+    .map(indexKeyColumn)
+    .filter((column): column is string => column !== null);
 }
 
 /**
@@ -928,10 +1075,29 @@ function columnSetsEqual(a: string[], b: string[]): boolean {
  *     expression, not the raw FK column set.
  *
  * Anchors on the `USING <method> (` clause the same way
- * {@link describeIndexDefMismatch} does, so a partial index's `WHERE (...)`
- * parentheses are never mistaken for the column list. Every column token must be
- * a bare or double-quoted identifier; anything else (a function call, an
- * operator expression) fails the check and yields `null`.
+ * `describeIndexDefMismatch` (schema-sql.ts) does, so a partial index's
+ * `WHERE (...)` parentheses are never mistaken for the column list. Every column
+ * token must be a bare or double-quoted identifier; anything else (a function
+ * call, an operator expression) fails the check and yields `null`.
+ *
+ * ## Parser 2 of 3, and what it is safe for
+ *
+ * This is the second of the three indexdef parsers catalogued on
+ * {@link parseIndexKeyEntries}; the third is `describeIndexDefMismatch` in
+ * schema-sql.ts. It is still the `USING \w+ \(([^)]*)\)` regex that the scanner
+ * up there was written to replace, so it inherits that regex's weaknesses: it
+ * stops at the FIRST `)`, and it splits on every comma. On an expression key
+ * (`lower(email)`), on a quoted identifier containing a comma or a paren, and on
+ * an opclass'd key (`email text_pattern_ops`) it therefore reads a token that is
+ * not a bare identifier and returns `null`.
+ *
+ * That is SAFE HERE and only here, because `null` is this function's "I cannot
+ * vouch for this index" answer and its single consumer
+ * ({@link detectUniqueForeignKeySets}) treats it as "this index does not prove
+ * uniqueness". The cost of every misread is a relation left as `hasMany` that
+ * could have been `hasOne`, never a uniqueness claim the database does not back.
+ * Do NOT reuse it anywhere a wrong-but-plausible column list would be acted on;
+ * use the scanner for that.
  */
 export function parsePlainUniqueIndexColumns(indexdef: string): string[] | null {
   // Partial index: uniqueness is scoped to the WHERE predicate.
@@ -1413,9 +1579,31 @@ export function deriveCatalogRelations(inputs: CatalogRelationInputs): Map<strin
   // Prisma's implicit m2m junctions have no primary key (just a two-column
   // UNIQUE index over the FK columns), so pass the introspected two-column
   // unique indexes as the fallback junction-key source.
+  //
+  // `idx.columns` is the key list with EXPRESSION keys already dropped, so its
+  // length is not the index's arity and cannot stand in for it. On
+  // `UNIQUE (a, lower(b), c)` it reads `['a', 'c']`, which looks exactly like a
+  // two-column junction key while the pair `(a, c)` is not unique at all, only
+  // `(a, lower(b), c)` is. A manyToMany derived from it returns DUPLICATE ROWS.
+  // So the arity is re-read from the raw definition and the two must agree:
+  // an index with any expression key is not a junction key this can vouch for.
+  // A PARTIAL unique index is refused for the same reason and is the MAINSTREAM
+  // shape of it: `UNIQUE (post_id, tag_id) WHERE deleted_at IS NULL` on a
+  // soft-deleted junction guarantees uniqueness only over the rows matching the
+  // predicate, so the pair can repeat across the whole table and the derived
+  // manyToMany returns duplicate rows. `IndexMetadata.partial` already exists and
+  // already documents this, and the hasOne path already honours it (see
+  // parsePlainUniqueIndexColumns, which refuses a definition carrying a WHERE).
+  // This filter was simply the one place that did not read it, so the two
+  // cardinality paths disagreed about whether the same index proved uniqueness.
   const uniqueIndexColsByTable = new Map<string, string[][]>();
   for (const [tbl, idxs] of indexesByTable) {
-    const twoColUniques = idxs.filter((idx) => idx.unique && idx.columns.length === 2).map((idx) => idx.columns);
+    const twoColUniques = idxs
+      .filter(
+        (idx) =>
+          idx.unique && !idx.partial && idx.columns.length === 2 && parseIndexKeyEntries(idx.definition).length === 2,
+      )
+      .map((idx) => idx.columns);
     if (twoColUniques.length > 0) uniqueIndexColsByTable.set(tbl, twoColUniques);
   }
 

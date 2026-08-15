@@ -77,7 +77,17 @@ describe('turbine migrate-from-prisma - parse-only (--no-db)', () => {
 // ---------------------------------------------------------------------------
 
 const url = process.env.DATABASE_URL;
-const gate = skipGate(!url || !haveTsx, 'no DATABASE_URL (or tsx) - skipping DB-backed migrate-from-prisma');
+// TWO preconditions, and the reason names WHICHEVER ONE is unmet rather than
+// both. A single reason mentioning DATABASE_URL claimed this gate for the
+// `postgres` token in TURBINE_REQUIRE_ENGINE, so a missing tsx failed the CI job
+// with a message blaming the database, which is the wrong thing to go and check.
+// tsx is a devDependency and this suite runs UNDER it, so `!haveTsx` is
+// unreachable in practice; the accurate wording costs nothing and the misleading
+// one costs a debugging session.
+const gate = skipGate(
+  !url || !haveTsx,
+  !url ? 'DATABASE_URL not set' : 'tsx is not installed in node_modules (run npm ci)',
+);
 const FIXTURE_TABLES = ['"_ProductToTag"', 'order_items', 'orders', 'products', 'tags', 'shop_users'];
 
 describe('turbine migrate-from-prisma - resolved against DB', () => {

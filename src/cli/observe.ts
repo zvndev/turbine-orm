@@ -9,6 +9,7 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import pg from 'pg';
+import type { PgCompatPool } from '../pg-types.js';
 import { OBSERVE_HTML } from './observe-ui.js';
 import { callerKey, checkRateLimit } from './rate-limit.js';
 
@@ -88,7 +89,7 @@ export async function startObserve(options: ObserveOptions): Promise<ObserveServ
 export async function handleRequest(
   req: IncomingMessage,
   res: ServerResponse,
-  pool: pg.Pool,
+  pool: PgCompatPool,
   options: ObserveOptions,
   authToken: string,
   rateLimiter: Map<string, { count: number; resetAt: number }>,
@@ -197,7 +198,7 @@ function rangeToInterval(range: string): string {
   }
 }
 
-async function apiLatency(res: ServerResponse, pool: pg.Pool, params: URLSearchParams): Promise<void> {
+async function apiLatency(res: ServerResponse, pool: PgCompatPool, params: URLSearchParams): Promise<void> {
   const range = params.get('range') ?? '1h';
   const interval = rangeToInterval(range);
 
@@ -221,14 +222,23 @@ async function apiLatency(res: ServerResponse, pool: pg.Pool, params: URLSearchP
   } catch (err) {
     try {
       await client.query('ROLLBACK');
-    } catch {}
+    } catch {
+      // Deliberately swallowed, and only this one. `err` above is the failure
+      // worth reporting and it is what the 500 below carries; a ROLLBACK that
+      // also fails means the connection is already gone, which node-postgres
+      // handles by discarding the client on the release() in `finally`.
+      // Surfacing it instead would replace a real diagnosis ("statement
+      // timeout", "relation does not exist") with "connection terminated", and
+      // this server writes no log of its own, so the HTTP response is the only
+      // channel either error could reach. Same shape as cli/studio.ts.
+    }
     sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
   } finally {
     client.release();
   }
 }
 
-async function apiModels(res: ServerResponse, pool: pg.Pool, params: URLSearchParams): Promise<void> {
+async function apiModels(res: ServerResponse, pool: PgCompatPool, params: URLSearchParams): Promise<void> {
   const range = params.get('range') ?? '1h';
   const interval = rangeToInterval(range);
 
@@ -255,7 +265,16 @@ async function apiModels(res: ServerResponse, pool: pg.Pool, params: URLSearchPa
   } catch (err) {
     try {
       await client.query('ROLLBACK');
-    } catch {}
+    } catch {
+      // Deliberately swallowed, and only this one. `err` above is the failure
+      // worth reporting and it is what the 500 below carries; a ROLLBACK that
+      // also fails means the connection is already gone, which node-postgres
+      // handles by discarding the client on the release() in `finally`.
+      // Surfacing it instead would replace a real diagnosis ("statement
+      // timeout", "relation does not exist") with "connection terminated", and
+      // this server writes no log of its own, so the HTTP response is the only
+      // channel either error could reach. Same shape as cli/studio.ts.
+    }
     sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
   } finally {
     client.release();

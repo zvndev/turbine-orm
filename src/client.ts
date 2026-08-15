@@ -37,6 +37,7 @@ import {
   wrapPgError,
 } from './errors.js';
 import { type ObserveConfig, ObserveEngine, type ObserveHandle } from './observe.js';
+import type { PgCompatPool, PgCompatPoolClient, PgCompatQueryResult } from './pg-types.js';
 import { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
 import {
   type DeferredQuery,
@@ -108,74 +109,18 @@ export async function withRetry<T>(fn: () => Promise<T>, options?: RetryOptions)
 // ---------------------------------------------------------------------------
 
 /**
- * Minimal pg-compatible query result.
- * `pg.Pool`, `@neondatabase/serverless` Pool, `@vercel/postgres` Pool and
- * any driver speaking the node-postgres API all satisfy this shape.
+ * The pg-compatible driver contract. Declared in `pg-types.ts` (a leaf module
+ * with no imports) rather than here, so `query/` can name the same interfaces
+ * without an import edge back to the client, and so no `@types/pg` name
+ * reaches the published declarations. Re-exported so every existing
+ * `from './client.js'` import path keeps working.
  */
-export interface PgCompatQueryResult<R = Record<string, unknown>> {
-  rows: R[];
-  rowCount: number | null;
-  fields?: Array<{ name: string; dataTypeID: number }>;
-}
-
-/**
- * Minimal pg-compatible client used by TurbineClient for transactions.
- * `pg.PoolClient` satisfies this; so do Neon and Vercel's equivalents.
- */
-export interface PgCompatPoolClient {
-  query<R = Record<string, unknown>>(text: string, values?: unknown[]): Promise<PgCompatQueryResult<R>>;
-  release(err?: Error | boolean): void;
-  /**
-   * Optional driver capability: `true` when `query()` may be called again on
-   * this connection while earlier calls are still in flight, with replies
-   * delivered to callers in FIFO submission order. Drivers that set this let
-   * the batch `$transaction([...])` overload dispatch every statement in one
-   * write burst (~1 network round trip plus server time) instead of awaiting
-   * each reply before sending the next (N round trips). Leave unset for
-   * drivers (node-postgres included) whose batch path must stay strictly
-   * sequential.
-   */
-  readonly supportsPipelining?: boolean;
-  /**
-   * Optional engine seam: scope a transaction's user callback to its own
-   * async subtree. When present, `TurbineClient.transaction` / `$transaction`
-   * invoke the callback as `wrapTransactionCallback(() => fn(tx))` instead of
-   * `fn(tx)` directly. Single-writer engines (PowDB) implement it with
-   * `AsyncLocalStorage.run()` to plant their re-entrancy marker so that it
-   * exists ONLY inside the callback's async subtree: a transaction opened
-   * from inside the callback is detected as re-entrant (typed E017), while
-   * the CALLER's context stays unmarked, so same-tick sibling transactions
-   * queue FIFO instead of being falsely flagged. Absent on pg and every other
-   * engine, in which case the callback runs unwrapped (zero behavior change).
-   */
-  wrapTransactionCallback?<R>(fn: () => Promise<R>): Promise<R>;
-}
-
-/**
- * Minimal pg-compatible pool. Pass any driver that satisfies this interface
- * via `TurbineConfig.pool`, lets Turbine run on Neon HTTP, Vercel Postgres,
- * Cloudflare Hyperdrive, or any other serverless Postgres driver.
- *
- * @example
- * ```ts
- * import { Pool } from '@neondatabase/serverless';
- * import { TurbineClient } from 'turbine-orm';
- *
- * const neonPool = new Pool({ connectionString: process.env.DATABASE_URL });
- * const db = new TurbineClient({ pool: neonPool }, schema);
- * ```
- */
-export interface PgCompatPool {
-  query<R = Record<string, unknown>>(text: string, values?: unknown[]): Promise<PgCompatQueryResult<R>>;
-  connect(): Promise<PgCompatPoolClient>;
-  end(): Promise<void>;
-  /** Optional, pools that expose stats (pg.Pool does; Neon HTTP does not) */
-  readonly totalCount?: number;
-  readonly idleCount?: number;
-  readonly waitingCount?: number;
-  /** Optional, pg.Pool supports 'error' event; HTTP drivers typically do not */
-  on?(event: 'error', listener: (err: Error) => void): this;
-}
+export type {
+  PgCompatPool,
+  PgCompatPoolClient,
+  PgCompatQueryConfig,
+  PgCompatQueryResult,
+} from './pg-types.js';
 
 /**
  * Driver-neutral seam. Bundles a pg-compatible connection pool with the SQL
@@ -1011,7 +956,7 @@ const ISOLATION_LEVELS: Record<string, string> = Object.assign(Object.create(nul
  * Query paths need no equivalent: `pool.query()` opens the connection itself
  * and rejects with the connect error, which the query boundary already wraps.
  */
-async function acquireConnection(pool: pg.Pool): Promise<pg.PoolClient> {
+async function acquireConnection(pool: PgCompatPool): Promise<PgCompatPoolClient> {
   try {
     return await pool.connect();
   } catch (err) {
@@ -1092,7 +1037,7 @@ export class TransactionClient {
   private readonly dialect: Dialect;
 
   constructor(
-    private readonly client: pg.PoolClient,
+    private readonly client: PgCompatPoolClient,
     readonly schema: SchemaMetadata,
     private readonly middlewares: Middleware[],
     private readonly queryOptions?: QueryInterfaceOptions,
@@ -1223,7 +1168,7 @@ export class TransactionClient {
    * errors via wrapPgError so transaction-scoped queries surface the same
    * typed errors as pool-scoped queries.
    */
-  private createTxPool(): pg.Pool {
+  private createTxPool(): PgCompatPool {
     const client = this.client;
     // Return a minimal pool-compatible object that routes queries
     // through the transaction client
@@ -1234,9 +1179,11 @@ export class TransactionClient {
             return await client.query(textOrConfig, values);
           }
           // Object form for prepared statements: { name, text, values }
-          // pg.PoolClient.query accepts QueryConfig but the overloads make TS
-          // unhappy with the union, so we cast through unknown.
-          return await (client as unknown as { query(config: unknown): Promise<pg.QueryResult> }).query(textOrConfig);
+          // A driver client accepts it, but the two-argument `query` in the
+          // PgCompatPoolClient contract does not describe it, so we cast.
+          return await (client as unknown as { query(config: unknown): Promise<PgCompatQueryResult> }).query(
+            textOrConfig,
+          );
         } catch (err) {
           throw wrapPgError(err);
         }
@@ -1248,7 +1195,7 @@ export class TransactionClient {
     // outside the transaction (a plain pg pool has neither, so nothing changes).
     if (this.sourcePool?.readonly !== undefined) txPool.readonly = this.sourcePool.readonly;
     if (this.sourcePool?.capabilities !== undefined) txPool.capabilities = this.sourcePool.capabilities;
-    return txPool as unknown as pg.Pool;
+    return txPool as unknown as PgCompatPool;
   }
 }
 
@@ -1257,8 +1204,19 @@ export class TransactionClient {
 // ---------------------------------------------------------------------------
 
 export class TurbineClient {
-  /** The underlying pg.Pool, exposed for escape hatches */
-  readonly pool: pg.Pool;
+  /**
+   * The underlying connection pool, exposed for escape hatches.
+   *
+   * Typed as the driver-neutral {@link PgCompatPool} rather than `pg.Pool`,
+   * because it is only a `pg.Pool` when Turbine opened it: supply
+   * {@link TurbineConfig.pool} and this is whatever driver you passed (Neon,
+   * Vercel Postgres, Hyperdrive), and on the non-Postgres engines it is that
+   * engine's pool shim. `query` / `connect` / `end` are the members every
+   * driver has. For the pg-only surface (cursors, `copyFrom`/`copyTo`, pool
+   * events), import `Pool` from the pg package and cast:
+   * `db.pool as unknown as Pool`.
+   */
+  readonly pool: PgCompatPool;
 
   /** The schema metadata this client was built from */
   readonly schema: SchemaMetadata;
@@ -1574,7 +1532,7 @@ export class TurbineClient {
 
     if (config.pool) {
       // External pool, use directly. Turbine doesn't manage its lifecycle.
-      this.pool = config.pool as unknown as pg.Pool;
+      this.pool = config.pool;
       this.ownsPool = false;
       if (this.logging) {
         console.log(`[turbine] Using external pool, ${Object.keys(schema.tables).length} tables`);
@@ -1617,12 +1575,15 @@ export class TurbineClient {
         poolConfig.ssl = config.ssl;
       }
 
-      this.pool = new pg.Pool(TurbineClient.withPlanCacheMode(poolConfig, this.planCacheMode));
-      this.ownsPool = true;
-
-      this.pool.on('error', (err) => {
+      // Held as a `pg.Pool` for the length of this block: `PgCompatPool.on` is
+      // optional (HTTP drivers have no pool events), and here we know we own a
+      // real pg pool that has one. Same shape as the replica loop below.
+      const ownPool = new pg.Pool(TurbineClient.withPlanCacheMode(poolConfig, this.planCacheMode));
+      ownPool.on('error', (err) => {
         console.error('[turbine] Unexpected pool error:', err.message);
       });
+      this.pool = ownPool;
+      this.ownsPool = true;
 
       if (this.logging) {
         console.log(
@@ -1653,8 +1614,8 @@ export class TurbineClient {
         replicaPool.on('error', (err) => {
           console.error('[turbine] Unexpected replica pool error:', err.message);
         });
-        this.replicaPools.push(replicaPool as unknown as PgCompatPool);
-        this.ownedReplicaPools.push(replicaPool as unknown as PgCompatPool);
+        this.replicaPools.push(replicaPool);
+        this.ownedReplicaPools.push(replicaPool);
       } else {
         this.replicaPools.push(replica);
       }
@@ -2119,10 +2080,9 @@ export class TurbineClient {
 
   /** Construct a QueryInterface bound to `pool` (honoring any injected factory). */
   private buildTableQI(pool: PgCompatPool, name: string): QueryInterface<object> {
-    const asPgPool = pool as unknown as pg.Pool;
     return this.queryOptions?.queryInterfaceFactory
-      ? this.queryOptions.queryInterfaceFactory(asPgPool, name, this.schema, this.middlewares, this.queryOptions)
-      : new QueryInterface<object>(asPgPool, name, this.schema, this.middlewares, this.queryOptions);
+      ? this.queryOptions.queryInterfaceFactory(pool, name, this.schema, this.middlewares, this.queryOptions)
+      : new QueryInterface<object>(pool, name, this.schema, this.middlewares, this.queryOptions);
   }
 
   /**
@@ -2331,8 +2291,14 @@ export class TurbineClient {
   // -------------------------------------------------------------------------
 
   /**
-   * Execute a function within a database transaction (raw pg.PoolClient).
-   * For the typed API, use `$transaction()` instead.
+   * Execute a function within a database transaction on the raw driver
+   * connection. For the typed API, use `$transaction()` instead.
+   *
+   * The client is typed as {@link PgCompatPoolClient}, the driver-neutral
+   * contract: `query(text, values)` plus `release()`, which is all any
+   * supported driver guarantees. For the pg-only surface (cursors, COPY
+   * streams, the `QueryConfig` object form), import `PoolClient` from the pg
+   * package and cast: `client as unknown as PoolClient`.
    *
    * @example
    * ```ts
@@ -2341,7 +2307,7 @@ export class TurbineClient {
    * });
    * ```
    */
-  async transaction<T>(fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
+  async transaction<T>(fn: (client: PgCompatPoolClient) => Promise<T>): Promise<T> {
     const client = await acquireConnection(this.pool);
     /**
      * Only true once BEGIN has actually succeeded. If BEGIN itself throws
@@ -2652,7 +2618,7 @@ export class TurbineClient {
 
       const results: unknown[] = [];
       for (const dq of queries) {
-        let raw: pg.QueryResult;
+        let raw: PgCompatQueryResult;
         try {
           // Non-RETURNING engines (resultStrategy 'reselect', e.g. MySQL)
           // attach a reselect plan that runs the write plus a follow-up SELECT;
@@ -2741,7 +2707,7 @@ export class TurbineClient {
       console.log(`[turbine] LISTEN ${quoted}`);
     }
 
-    const sub = await createSubscription(this.pool as unknown as PgCompatPool, channel, quoted, handler, (closed) => {
+    const sub = await createSubscription(this.pool, channel, quoted, handler, (closed) => {
       this.activeSubscriptions.delete(closed);
     });
     this.activeSubscriptions.add(sub);

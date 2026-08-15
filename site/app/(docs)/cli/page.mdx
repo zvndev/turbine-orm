@@ -664,7 +664,7 @@ Start a read-only [Model Context Protocol](https://modelcontextprotocol.io) serv
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine mcp
 ```
 
-Six tools: `schema_overview`, `table_detail`, `migrate_status`, `doctor_report`, `explain_query` (schema-validated findMany-style args only, no free-form SQL), and `sample_rows` (≤ 50 rows). Every database access runs inside `BEGIN READ ONLY`. `--include` / `--exclude` scope which tables are exposed.
+Ten tools: `schema_overview`, `table_detail`, `relation_graph`, `find_join_path` (returns the `with` clause to write), `migrate_status`, `doctor_report`, `explain_query` (schema-validated findMany-style args only, no free-form SQL), `table_stats`, `sample_rows` (≤ 50 rows), and `explain_error` (needs no database, so it answers when the pool is unreachable). Every database access runs inside `BEGIN READ ONLY`. `--include` / `--exclude` scope which tables are exposed.
 
 Full setup, tool reference, and Claude Code / Cursor config: **[MCP Server](/mcp)**.
 

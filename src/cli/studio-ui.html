@@ -2582,8 +2582,11 @@
           if (isSvg) node.setAttribute('class', v);
           else node.className = v;
         }
+        // NOTE: there is deliberately no `html` prop here. `el()` renders database
+        // contents, so an innerHTML sink in it is one careless call site away from
+        // executing whatever a row happens to hold. Everything text-shaped goes
+        // through `text` (textContent); structure is built by nesting el() calls.
         else if (k === 'text') node.textContent = v;
-        else if (k === 'html') node.innerHTML = v;
         else if (k.startsWith('on') && typeof v === 'function') {
           node.addEventListener(k.slice(2).toLowerCase(), v);
         } else if (k === 'style' && typeof v === 'object') {

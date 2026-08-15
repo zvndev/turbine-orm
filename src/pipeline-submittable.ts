@@ -18,10 +18,10 @@
  */
 
 import type { EventEmitter } from 'node:events';
-import type pg from 'pg';
 import Result from 'pg/lib/result';
 import { prepareValue } from 'pg/lib/utils';
 import { PipelineError, wrapPgError } from './errors.js';
+import type { PgCompatQueryResult } from './pg-types.js';
 import type { DeferredQuery } from './query/index.js';
 
 // ---------------------------------------------------------------------------
@@ -270,7 +270,7 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
           } else {
             try {
               const q = queries[i]!;
-              partialResults.push({ status: 'ok', value: q.transform(results[i]! as unknown as pg.QueryResult) });
+              partialResults.push({ status: 'ok', value: q.transform(results[i]! as unknown as PgCompatQueryResult) });
             } catch (transformErr) {
               partialResults.push({ status: 'error', error: transformErr as Error });
             }
@@ -301,7 +301,7 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
         const transformed: unknown[] = [];
         for (let i = 0; i < queries.length; i++) {
           const q = queries[i]!;
-          transformed.push(q.transform(results[i]! as unknown as pg.QueryResult));
+          transformed.push(q.transform(results[i]! as unknown as PgCompatQueryResult));
         }
         resolve(transformed);
       } catch (err) {

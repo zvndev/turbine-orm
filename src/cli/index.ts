@@ -4901,8 +4901,9 @@ function showMcpHelp(): void {
   console.log(`  ${bold('Usage:')}`);
   console.log(`    npx turbine mcp ${dim('[options]')}`);
   newline();
-  console.log(`  Speaks newline-delimited JSON-RPC 2.0 on stdin/stdout and exposes`);
-  console.log(`  schema, migration status, doctor, EXPLAIN, and sample-row tools.`);
+  console.log(`  Speaks newline-delimited JSON-RPC 2.0 on stdin/stdout and exposes ten`);
+  console.log(`  read-only tools: schema, relation graph, join paths, migration status,`);
+  console.log(`  doctor, EXPLAIN, table stats, sample rows, and error lookup.`);
   newline();
   console.log(`  ${bold('Options:')}`);
   console.log(`    ${cyan('--url, -u')} ${dim('<url>')}       Postgres connection string`);

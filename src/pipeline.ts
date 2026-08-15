@@ -19,8 +19,8 @@
  * Hyperdrive), mock pools in tests, and any pool that doesn't expose pg internals.
  */
 
-import type pg from 'pg';
 import { PipelineError, type PipelineResultSlot, wrapPgError } from './errors.js';
+import type { PgCompatPool, PgCompatPoolClient, PgCompatQueryResult } from './pg-types.js';
 import { type PipelineRunOptions, runPipelined, supportsExtendedPipeline } from './pipeline-submittable.js';
 import type { DeferredQuery } from './query/index.js';
 
@@ -49,9 +49,9 @@ export interface PipelineOptions {
 // Sequential fallback (for HTTP drivers, mocks, etc.)
 // ---------------------------------------------------------------------------
 
-/** Minimal client interface for sequential execution (avoids importing pg.PoolClient) */
+/** Minimal client interface for sequential execution */
 interface SequentialClient {
-  query(text: string, values?: unknown[]): Promise<pg.QueryResult>;
+  query(text: string, values?: unknown[]): Promise<PgCompatQueryResult>;
   release(err?: Error | boolean): void;
 }
 
@@ -87,7 +87,7 @@ async function runSequential<T extends readonly DeferredQuery<unknown>[]>(
 
     const results: unknown[] = [];
     for (const q of queries) {
-      let raw: pg.QueryResult;
+      let raw: PgCompatQueryResult;
       try {
         raw = await client.query(q.sql, q.params);
       } catch (err) {
@@ -146,7 +146,7 @@ async function runIndependent<T extends readonly DeferredQuery<unknown>[]>(
 
   for (let i = 0; i < queries.length; i++) {
     const q = queries[i]!;
-    let raw: pg.QueryResult;
+    let raw: PgCompatQueryResult;
     try {
       raw = await client.query(q.sql, q.params);
     } catch (err) {
@@ -193,7 +193,7 @@ async function runIndependent<T extends readonly DeferredQuery<unknown>[]>(
  * ```
  */
 export async function executePipeline<T extends readonly DeferredQuery<unknown>[]>(
-  pool: pg.Pool,
+  pool: PgCompatPool,
   queries: T,
   options?: PipelineOptions,
 ): Promise<PipelineResults<T>> {
@@ -209,7 +209,7 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
   // so a caller switching on `.code` silently receives a value from a foreign
   // namespace. The transaction and nested-write checkouts were wrapped for this
   // reason; this was the last sibling still bare.
-  let client: pg.PoolClient;
+  let client: PgCompatPoolClient;
   try {
     client = await pool.connect();
   } catch (err) {
@@ -240,8 +240,8 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
  *
  * Note: This acquires and immediately releases a connection to inspect it.
  */
-export async function pipelineSupported(pool: pg.Pool): Promise<boolean> {
-  let client: pg.PoolClient | undefined;
+export async function pipelineSupported(pool: PgCompatPool): Promise<boolean> {
+  let client: PgCompatPoolClient | undefined;
   try {
     client = await pool.connect();
     return supportsExtendedPipeline(client);

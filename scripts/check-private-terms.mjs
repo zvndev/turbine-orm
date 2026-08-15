@@ -1,19 +1,31 @@
 #!/usr/bin/env node
 /**
- * Pre-commit guard against private material reaching a public repo.
+ * Guard against private material reaching a public repo.
  *
- * Two independent rulesets, because they have different secrecy needs:
+ * ## Two modes
+ *
+ * - No flag (the `.husky/pre-commit` hook): scan STAGED content, via
+ *   `git show :<file>`, so the check sees exactly what the commit will contain
+ *   rather than whatever the working tree happens to hold.
+ * - `--all` (CI, `npm run check:private-terms`): scan every TRACKED file in the
+ *   checkout. A hook is advisory, `git commit --no-verify` skips it outright,
+ *   and until this mode existed nothing downstream re-asked the question, so a
+ *   bypassed commit reached npm unchallenged. Running the whole tree rather
+ *   than a diff also needs no merge base, which CI's shallow checkout lacks.
+ *
+ * ## Two independent rulesets, because they have different secrecy needs
  *
  * 1. BUILTIN_PATTERNS, below. Provenance framing: wording that attributes a
  *    change to who reported it or to whose system it was measured on. The
  *    patterns are not themselves sensitive, so they live in this tracked file
- *    and therefore run in CI and in every clone, not just on the machine that
- *    happens to hold a blocklist.
+ *    and are therefore enforced in CI and in every clone, not just on the
+ *    machine that happens to hold a blocklist.
  *
  * 2. `.private-terms`, a repo-local, gitignored list of literal names (one per
  *    line, `#` comments allowed). Names ARE sensitive, so the blocklist never
  *    ships. No terms file means that half is skipped, which keeps clones and CI
- *    working.
+ *    working: CI enforces the builtin half only, and the name half stays a
+ *    local pre-commit check on the machines that hold the list.
  *
  * ## Why the builtin half exists
  *
@@ -59,22 +71,42 @@ const terms = existsSync(TERMS_FILE)
       .filter((l) => l && !l.startsWith('#'))
   : [];
 
-const staged = execSync('git diff --cached --name-only --diff-filter=ACMR', { encoding: 'utf8' })
-  .split('\n')
+const ALL = process.argv.slice(2).includes('--all');
+
+const listCmd = ALL
+  ? 'git ls-files -z'
+  : 'git diff --cached --name-only -z --diff-filter=ACMR';
+
+const files = execSync(listCmd, { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 })
+  .split('\0')
   .filter(Boolean)
   .filter((f) => f !== TERMS_FILE)
   // The changelog's generated mirror is derived from CHANGELOG.md; flagging both
   // reports every hit twice and points at a file nobody edits by hand.
   .filter((f) => !f.endsWith('changelog.generated.ts'));
 
-const hits = [];
-for (const file of staged) {
-  let content;
+/**
+ * `--all` reads the working tree, which in a CI checkout IS the commit under
+ * test; the hook reads the index, because the working tree may hold edits that
+ * are not being committed. Either way a file that cannot be decoded as text
+ * (or contains a NUL, i.e. is binary) is skipped rather than scanned as mojibake.
+ */
+function readContent(file) {
   try {
-    content = execSync(`git show :"${file}"`, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    const raw = ALL
+      ? readFileSync(file)
+      : execSync(`git show :"${file}"`, { maxBuffer: 64 * 1024 * 1024 });
+    if (raw.includes(0)) return undefined;
+    return raw.toString('utf8');
   } catch {
-    continue; // binary or unreadable, skip
+    return undefined;
   }
+}
+
+const hits = [];
+for (const file of files) {
+  const content = readContent(file);
+  if (content === undefined) continue; // binary, missing or unreadable
 
   // This script necessarily contains the patterns it looks for.
   if (file !== 'scripts/check-private-terms.mjs') {
@@ -93,11 +125,34 @@ for (const file of staged) {
 }
 
 if (hits.length) {
-  console.error('\ncommit blocked, staged content contains private material:\n');
+  console.error(
+    ALL
+      ? `\ncheck failed, tracked content contains private material (${files.length} files scanned):\n`
+      : '\ncommit blocked, staged content contains private material:\n',
+  );
   for (const h of hits) console.error(`  ${h}`);
   console.error(
     '\nDescribe what the software does and what was measured, never who reported it\n' +
       'or whose system it was measured on. Rename borrowed identifiers to synthetic ones.\n',
   );
   process.exit(1);
+}
+
+if (ALL) {
+  // A zero-file scan is not a clean scan. `--all` is the CI half of this guard
+  // and its file list comes from `git ls-files`, which answers empty for a
+  // checkout that is not a repository, for a `--filter=blob:none` clone whose
+  // index has not been populated, and for a working directory that is not the
+  // repo root. Every one of those exits 0 with "0 tracked files scanned", which
+  // is a green publish gate over nothing. The count was already printed; it just
+  // was not asserted. Mirrors the refusal in scripts/check-skip-gate-reasons.ts.
+  // Not applied to the hook path: a staged diff of zero files is an ordinary
+  // thing for a commit to be, and the hook is not a release gate.
+  if (files.length === 0) {
+    console.error(
+      'check-private-terms: scanned zero tracked files; `git ls-files` returned nothing, so this check would pass vacuously. Refusing to pass.',
+    );
+    process.exit(1);
+  }
+  console.log(`check-private-terms: ${files.length} tracked files scanned, no private material found`);
 }

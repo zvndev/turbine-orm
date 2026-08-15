@@ -10,6 +10,16 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege for the whole workflow. Nothing in this file writes to the
+# repository: no `gh` calls, no GITHUB_TOKEN use, no artifact upload, no release
+# step, no package publish. Every job only needs to check the code out and run
+# npm. Declaring it here also overrides whatever the org/repo default happens to
+# be, so a permissive default (the historical `write-all`) cannot silently hand
+# a token with push rights to jobs that run third-party npm lifecycle scripts.
+# Publishing lives in release.yml, which declares its own permissions.
+permissions:
+  contents: read
+
 jobs:
   lint:
     timeout-minutes: 15
@@ -33,6 +43,21 @@ jobs:
       # CLAUDE.md prose, and a violation typechecks fine while executing a
       # half-initialized module at runtime.
       - run: npm run check:cycles
+      # TURBINE_REQUIRE_ENGINE coupling. That variable is what stops an engine
+      # job reporting green over a suite that entirely skipped, and it works by
+      # matching a REGEX against a human-readable skipGate reason string. So a
+      # reason reworded in a cleanup disarms the guard with nothing failing, and
+      # a token no workflow sets guards nothing at all. Both are build failures
+      # now: this ran red on four real PowDB version gates and one inert `sqlite`
+      # token the first time it was pointed at the repo.
+      - run: npm run check:skip-gates
+      # Private-material guard over every TRACKED file (`--all`), not the staged
+      # diff the pre-commit hook scans. This repo is public, and the hook was the
+      # only enforcement point: `git commit --no-verify` skipped it with nothing
+      # downstream re-asking, so a bypassed commit reached npm unchallenged.
+      # `.private-terms` is gitignored, so CI enforces the builtin provenance
+      # patterns only; the name blocklist stays a local pre-commit check.
+      - run: npm run check:private-terms
 
   typecheck:
     timeout-minutes: 15
@@ -101,6 +126,19 @@ jobs:
       - run: npm run test:coverage
         env:
           DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
+          # Every DB-backed suite self-skips when its env var is absent, and a
+          # fully-skipped run is indistinguishable from a passing one. This makes
+          # a Postgres gate that WOULD skip throw instead, so a renamed or
+          # mistyped DATABASE_URL fails the job rather than quietly measuring
+          # coverage over SQL generation alone. Non-Postgres gates still skip.
+          #
+          # `sqlite` rides along here rather than getting a job of its own: the
+          # engine needs no container and no env var, only Node >= 22.5, which
+          # this job pins. It was a defined-but-unset token, so the create-many
+          # sqlite suites were free to skip on a runner where node:sqlite plainly
+          # exists. The node-version matrix in unit-tests deliberately does NOT
+          # set it: Node 20 has no node:sqlite and skipping there is correct.
+          TURBINE_REQUIRE_ENGINE: postgres,sqlite
 
   # Coverage gate for the three highest-consequence CLI files: cli/studio.ts
   # (WRITE MODE executes mutations, plus the PII redaction path), cli/migrate.ts
@@ -177,6 +215,12 @@ jobs:
       - run: npm test
         env:
           DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
+          # See the coverage job: without this, a DATABASE_URL that never reaches
+          # the process skips every Postgres suite across all four PG majors and
+          # the whole matrix reports green. `sqlite` for the same reason it is set
+          # there: this job runs the whole suite on Node 22, so node:sqlite is
+          # present and its gates have no business skipping.
+          TURBINE_REQUIRE_ENGINE: postgres,sqlite
 
   # Real CockroachDB job. The CRDB/Yugabyte adapters were only ever unit-tested
   # with mocked clients, so a bug in the adapter's statementTimeout set_config()
@@ -300,6 +344,12 @@ jobs:
         run: npm run test:unit
         env:
           MYSQL_URL: mysql://root:root@127.0.0.1:3306/turbine_test
+          # Assert the MySQL suites actually RAN. `test:unit` blanks DATABASE_URL,
+          # so this job's green has always been mostly build-only tests; if
+          # MYSQL_URL were misnamed here the engine half would skip and nothing
+          # would say so. Only mysql is required: the Postgres gates in this same
+          # run are expected to skip and still do.
+          TURBINE_REQUIRE_ENGINE: mysql
 
   # Real SQL Server 2022 job for the turbine-orm/mssql engine (Phase 3, multi-dialect).
   # The FOR JSON PATH nested-relation generator, the OUTPUT/MERGE result strategy, the
@@ -369,6 +419,9 @@ jobs:
         run: npm run test:unit
         env:
           MSSQL_URL: mssql://sa:Turbine_Passw0rd!@127.0.0.1:1433/turbine_test
+          # Same reasoning as the MySQL job: prove the MSSQL-gated suites ran
+          # rather than skipped. Postgres and MySQL gates still skip here.
+          TURBINE_REQUIRE_ENGINE: mssql
 
   # Real PowDB job for the turbine-orm/powdb engine, runs the embedded napi
   # addon (@zvndev/powdb-embedded) IN-PROCESS, so there is NO service container
@@ -393,6 +446,24 @@ jobs:
       - run: npm ci
       - name: Run turbine-orm/powdb integration tests against the embedded engine
         run: npx tsx --test src/test/powdb.integration.test.ts
+        env:
+          # This job's gate is a loadable prebuilt binary, not an env var, and its
+          # skip path is the one documented above ("on a platform without a
+          # prebuilt binary the suite's skipGate fires"). That is correct on a Mac
+          # and wrong here: Linux-glibc-x64 is a supported target, so an addon
+          # that fails to load means the devDependency is broken, not absent, and
+          # this job must go red instead of skipping 70 tests silently. The
+          # networked POWDB_URL suite has a different reason string and still
+          # skips, since there is no PowDB server in CI.
+          #
+          # The `powdb` pattern covers the addon-VERSION gates too (nested
+          # projections, entity links, link paths, the datetime fix). Those say
+          # `requires @zvndev/powdb-embedded >= X`, and devDependencies pin the
+          # addon, so a version gate skipping HERE means the pin is wrong or the
+          # package resolved to something else, not that the feature is
+          # legitimately unavailable. They used to be unmatched, so four real
+          # gates skipped under this green job.
+          TURBINE_REQUIRE_ENGINE: powdb
 
   # NOTE: the YugabyteDB integration job used to live here, but its container
   # never initialized successfully on GitHub runners and burned ~6 minutes of
@@ -496,6 +567,130 @@ jobs:
           sed -i 's/"module": "nodenext"/"module": "node16"/; s/"moduleResolution": "nodenext"/"moduleResolution": "node16"/' tsconfig.json
           npx tsc --noEmit -p tsconfig.json
           echo "CJS consumer typecheck OK (nodenext + node16)"
+
+  # The `@types/pg` gate, and the permanent guard on the v0.28.1 regression.
+  #
+  # `pg` ships no declarations of its own, so any `@types/pg` name that reaches an
+  # EXPORTED declaration makes tsc emit a pg module import into the published
+  # .d.ts. That turns a runtime-free types package into a hard requirement for
+  # every consumer compiling under strict, which is why `@types/pg` sat in
+  # `dependencies` for so long. v0.28.1 moved it to devDependencies while the
+  # declaration surface still named pg types, and consumer builds broke. The
+  # order is one-way: clear the surface FIRST (src/pg-types.ts), then move the
+  # dependency. This job is what keeps the surface clear afterwards.
+  #
+  # Two checks, and NEITHER is redundant:
+  #   1. A text tripwire over dist/**/*.d.ts (scripts/check-no-pg-types.mjs).
+  #      Cheap, names the offending file and line, and fires on the CJS mirrors
+  #      too. It is a SCRIPT rather than an inline grep because this job is not
+  #      on the publish path: the same script is wired into prepublishOnly and
+  #      into release.yml's own consumer-types job, so a tag push and a local
+  #      `npm publish` ask the same question this job does.
+  #   2. The end-to-end proof: the REAL tarball installed into a clean project
+  #      that has `pg` but NOT `@types/pg`, then a consumer compiled under
+  #      strict + NodeNext. `skipLibCheck: false` is load-bearing and not a
+  #      stylistic choice: with it true, tsc never reads the library's own
+  #      declarations, so a pg reference there is suppressed and the gate passes
+  #      vacuously (measured both ways, the identical probe is TS7016 with the
+  #      flag false and silent with it true). The `test ! -d` assertion exists
+  #      for the same reason, so the gate cannot pass merely because something
+  #      pulled @types/pg in transitively and satisfied the reference.
+  consumer-types:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Tripwire, no pg type references in the published declarations
+        run: npm run check:package-types
+      - name: Assert the packed manifest declares exactly one runtime dependency
+        run: |
+          TARBALL="$GITHUB_WORKSPACE/$(npm pack --silent | tail -1)"
+          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
+          DEPS=$(tar -xzOf "$TARBALL" package/package.json | jq -r '(.dependencies // {}) | keys | join(",")')
+          if [ "$DEPS" != "pg" ]; then
+            echo "::error file=package.json::Published dependencies must be exactly [pg], found [$DEPS]."
+            exit 1
+          fi
+          echo "Packed manifest dependencies = [$DEPS] OK"
+      - name: Typecheck a consumer that has pg but NOT @types/pg
+        run: |
+          CONSUMER=$(mktemp -d)
+          cd "$CONSUMER"
+          cat > package.json <<'JSON'
+          { "name": "types-consumer", "version": "1.0.0", "private": true, "type": "module" }
+          JSON
+          cat > tsconfig.json <<'JSON'
+          {
+            "compilerOptions": {
+              "module": "nodenext",
+              "moduleResolution": "nodenext",
+              "target": "ES2022",
+              "strict": true,
+              "noEmit": true,
+              "skipLibCheck": false
+            },
+            "include": ["consumer.ts"]
+          }
+          JSON
+          cat > consumer.ts <<'TS'
+          import {
+            type PgCompatPool,
+            type PgCompatPoolClient,
+            type PgCompatQueryResult,
+            type SchemaMetadata,
+            TurbineClient,
+          } from 'turbine-orm';
+          import { turbineHttp } from 'turbine-orm/serverless';
+
+          const schema: SchemaMetadata = { tables: {}, enums: {} };
+          const db = new TurbineClient({ connectionString: 'postgres://u:p@localhost:5432/d' }, schema);
+
+          // The pool accessor is typed by Turbine's own contract, not by @types/pg.
+          export async function readOne(): Promise<number | null> {
+            const result: PgCompatQueryResult<{ n: number }> = await db.pool.query<{ n: number }>('SELECT 1 AS n');
+            const client: PgCompatPoolClient = await db.pool.connect();
+            try {
+              return result.rows[0]?.n ?? null;
+            } finally {
+              client.release();
+            }
+          }
+
+          // The transaction callback's parameter is the same contract.
+          export async function inTransaction(): Promise<number> {
+            return db.transaction(async (tx: PgCompatPoolClient) => {
+              const r = await tx.query<{ n: number }>('SELECT 2 AS n', []);
+              return r.rows[0]?.n ?? 0;
+            });
+          }
+
+          // The external-pool seam: a hand-written driver, no pg types anywhere.
+          const externalPool: PgCompatPool = {
+            query: async () => ({ rows: [], rowCount: 0 }),
+            connect: async () => {
+              throw new Error('not reached at typecheck time');
+            },
+            end: async () => {},
+          };
+          export const edge = turbineHttp(externalPool, schema);
+          TS
+          # `pg` explicitly, to mirror a real consumer. @types/pg is never named
+          # here and nothing in the tree may pull it in.
+          npm install "$TARBALL" pg --no-audit --no-fund
+          npm install --no-save typescript @types/node --no-audit --no-fund
+          if [ -d node_modules/@types/pg ]; then
+            echo "::error file=package.json::@types/pg is present in the consumer tree, so this gate would pass vacuously. Something declares it as a runtime dependency."
+            exit 1
+          fi
+          echo "@types/pg is absent from the consumer tree OK"
+          npx tsc --noEmit -p tsconfig.json
+          echo "Consumer typecheck OK (strict + NodeNext + skipLibCheck:false, no @types/pg)"
 
   # Installs the real npm tarball (npm pack) into a clean temp project and
   # verifies the published package surface end-to-end: ESM import, CJS require,
@@ -652,8 +847,9 @@ jobs:
           cache: npm
       - run: npm ci
       # Hard gate: any HIGH or CRITICAL vulnerability in the PRODUCTION
-      # dependency tree fails CI. (The prod tree is `pg` + `@types/pg`;
-      # currently 0 vulns, so this passes, and stays meaningful.)
+      # dependency tree fails CI. (The prod tree is `pg` alone since @types/pg
+      # became a devDependency, see the consumer-types job; currently 0 vulns,
+      # so this passes, and stays meaningful.)
       - name: Audit production dependencies (blocking)
         run: npm audit --omit=dev --audit-level=high
       # Full-tree audit (dev deps included) for visibility only, never blocks.
