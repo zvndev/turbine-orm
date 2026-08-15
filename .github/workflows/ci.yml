@@ -524,6 +524,11 @@ jobs:
         run: npm run check:package
       - name: Pack tarball
         run: echo "TARBALL=$GITHUB_WORKSPACE/$(npm pack --silent | tail -1)" >> "$GITHUB_ENV"
+      # `"types": ["node"]` is EXPLICIT since 0.70.0; see the longer note on the
+      # same step in release.yml. Short version: this fixture uses `require`, a
+      # global from @types/node, which used to arrive by accident because
+      # @types/pg (then a RUNTIME dependency) depends on it. Keep the two
+      # fixtures in step. This one runs on every PR; release.yml's gates publish.
       - name: Typecheck a CommonJS consumer against the packed tarball
         run: |
           CONSUMER=$(mktemp -d)
@@ -539,7 +544,8 @@ jobs:
               "target": "ES2022",
               "strict": true,
               "noEmit": true,
-              "skipLibCheck": true
+              "skipLibCheck": true,
+              "types": ["node"]
             },
             "include": ["consumer.cts"]
           }

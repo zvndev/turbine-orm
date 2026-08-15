@@ -315,6 +315,16 @@ jobs:
         run: npm run check:package
       - name: Pack tarball
         run: echo "TARBALL=$GITHUB_WORKSPACE/$(npm pack --silent | tail -1)" >> "$GITHUB_ENV"
+      # `"types": ["node"]` is EXPLICIT since 0.70.0, and a tsconfig cannot carry a
+      # comment key (tsc rejects an unknown compilerOption with TS5023), so the
+      # reason lives here. The fixture uses `require`, a global from @types/node,
+      # and it used to arrive by ACCIDENT: @types/pg depends on @types/node, so
+      # while @types/pg was a RUNTIME dependency of turbine-orm, installing the
+      # tarball populated the consumer's @types directory as a side effect.
+      # Moving @types/pg to devDependencies removed that prop and TypeScript's
+      # automatic @types inclusion did not cover it, so this job failed on the
+      # first real tag push, before publishing. A consumer declaring what it uses
+      # is the correct shape; leaning on a dependency's dependency was the bug.
       - name: Typecheck a CommonJS consumer against the packed tarball
         run: |
           CONSUMER=$(mktemp -d)
@@ -330,7 +340,8 @@ jobs:
               "target": "ES2022",
               "strict": true,
               "noEmit": true,
-              "skipLibCheck": true
+              "skipLibCheck": true,
+              "types": ["node"]
             },
             "include": ["consumer.cts"]
           }

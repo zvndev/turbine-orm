@@ -67,6 +67,15 @@ than runtime. Nothing about how a query executes changes in this release.
   dependency; this is the type surface only, and `dist/pg-types.js` is
   `export {};` so no emitted JavaScript changed.
 
+  One second-order effect worth naming, because it is invisible until it bites:
+  `@types/pg` depends on `@types/node`, so while it was a runtime dependency,
+  installing Turbine put `@types/node` into your `node_modules/@types` as a side
+  effect. That no longer happens. Any TypeScript project already declares
+  `@types/node` itself, so in practice this changes nothing, but if you were
+  leaning on the accident, add it as a devDependency. Our own CJS consumer
+  fixture was leaning on it, which is how we found out: it failed on the first
+  real tag push, before publishing.
+
   Guarded so it cannot regress: `check:package-types` scans every published
   `.d.ts` for a reference to the whole `pg` family (including deep specifiers
   like `pg/lib/result` and `pg-protocol`), self-tests its own matcher before
