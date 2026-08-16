@@ -220,6 +220,49 @@ For the record, the same correction applied to the object-encoding suite gives
 1.13x against its as-recorded 1.05x, so the caveat is not new and not specific
 to positional. It was simply invisible while Turbine and the control agreed.
 
+### The harness has since been fixed, and future runs need no adjustment
+
+The derived figure above was a one-release workaround, and it is no longer
+needed. `bench-interleaved.ts` now picks its raw L2 statement from the encoding
+it reads back out of Turbine's own compiled SQL, so the control is matched in
+the shipping-default configuration AND in the `TURBINE_JSON=object` control run,
+and no future encoding change can silently unmatch it again. The two spellings
+are asserted to return the same rows and the same child count before anything is
+timed, so a mismatched control now fails loudly instead of quietly flattering the
+result. `bench-extended.ts` carried the identical defect in its to-one raw
+control (a to-one relation goes through the same `buildJsonRow`) and was fixed
+the same way.
+
+Re-measured with the encoding-matched control, three gated runs on the same
+fixture:
+
+| overhead above hand-written `pg`, geometric mean over the 8 raw-controlled scenarios | value |
+|---|---|
+| 0.71.0 as recorded, mismatched control | 1.00x |
+| 0.71.0 published, derived by dividing the raw L2 by 1.83 | **1.08x** |
+| re-measured, encoding-matched control (runs: 1.138x / 1.066x / 1.072x) | **1.079x** |
+
+**The derived figure and the directly measured one agree to three decimals**, so
+the adjustment published above was the right call and the number it produced was
+correct. Raw L2 moved from 1.847 ms to 1.080 ms, a 1.71x shift against the 1.83x
+measured for the encoding alone, and Turbine's L2 overhead moved from a
+non-supportable 0.90x to 1.59x.
+
+One caveat on that re-measurement, recorded because it is the same discipline
+the rest of this file applies. The machine control drifted hard across the
+re-run: the 50K keyset drain went from 42.35 ms before to 68.45 ms after, and
+run 3's absolute L2 values are inflated accordingly. The **ratio** survived it,
+because Turbine and its raw control are measured in the same interleaved
+rotation and drift lands on both: L2 Turbine/Raw came out 1.589x, 1.534x and
+1.555x across the three runs while the absolute values moved about 18%. Ratios
+within a run remain the only quotable quantity, which is exactly what the
+"absolute numbers must not be compared across dates" rule already says.
+
+`machine-control.ts` was deliberately NOT changed. It still spells its L2 probe
+with `json_build_object`, and it should: it contains none of Turbine's code and
+its entire value is being a fixed yardstick for machine drift across dates.
+Changing its statement would reset that baseline for no gain.
+
 Note also that four scenarios sit below 1.00x against the control on their own
 (findUnique 0.97x, count 0.93x, pipeline 0.93x, hot findUnique 0.87x). Two
 mechanisms are involved and only one is real: Turbine names its prepared

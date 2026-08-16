@@ -62,8 +62,10 @@ import type { ReselectExecutor } from './builder.js';
 import { dedupeOrderEntries, isOrderBySpec, isRelationPickOrderBy, orderByEntries, sortedEntries } from './filters.js';
 import type { SkipGlobalFilters, Unsafe, WithClause, WithCount, WithOptions } from './types.js';
 import {
+  type ColumnNameSource,
   markInternalCombinator,
   ownLookup,
+  resolveColumnName,
   selectNamesNothingMessage,
   selectOmitExclusiveMessage,
   sqlToPreparedName,
@@ -249,8 +251,12 @@ function partitionOrderBy(
   if (entries.length === 0) return null;
   const out: { column: string; direction: 'ASC' | 'DESC'; nulls?: 'FIRST' | 'LAST' }[] = [];
   for (const [key, value] of entries) {
-    const column = ownLookup(meta.columnMap, key);
-    if (!column || !meta.allColumns.includes(column)) return null;
+    // The one key-resolution rule. A bare `columnMap` read knows only the
+    // FIELD spelling, so a snake-spelled orderBy declined the partition
+    // pushdown and silently fell back to fetching every child row and slicing
+    // client-side: two strategies, different bytes over the wire, one query.
+    const column = resolveColumnName(meta, key);
+    if (column === undefined) return null;
     let sort: unknown;
     let nulls: 'FIRST' | 'LAST' | undefined;
     if (isOrderBySpec(value)) {
@@ -363,6 +369,17 @@ export function assertProjectionShape(
 }
 
 export function includeKeysForBatching(
+  /**
+   * The table the projection is compiled against. `select` / `omit` keys are
+   * the CALLER's, and a column has two legal spellings there, so matching by
+   * raw key made "is the correlation key already projected?" depend on which
+   * was used: `select: { user_id: true }` with a `userId` key looked
+   * unprojected, so the key was force-added AND marked stitch-only and
+   * `stripFields` deleted the very column the caller asked for, while
+   * `omit: { user_id: true }` failed to un-omit and tripped
+   * `assertCorrelationKeyProjected`'s "bug in turbine" path on a legal query.
+   */
+  meta: ColumnNameSource,
   select: Record<string, boolean> | undefined,
   omit: Record<string, boolean> | undefined,
   fields: string[],
@@ -380,23 +397,41 @@ export function includeKeysForBatching(
   defaultProjection?: { hidden: ReadonlySet<string>; visible: string[] },
 ): { select?: Record<string, boolean>; omit?: Record<string, boolean>; strip: string[] } {
   const unique = [...new Set(fields)];
+  /**
+   * The caller's projection keys indexed by the column each resolves to, so a
+   * correlation key is recognized under either spelling. A key resolving to no
+   * column is left out: the projection build raises E003, where it belongs.
+   */
+  const keyByColumn = (projection: Record<string, boolean>): Map<string, string> => {
+    const byColumn = new Map<string, string>();
+    for (const key of Object.keys(projection)) {
+      const column = resolveColumnName(meta, key);
+      if (column !== undefined) byColumn.set(column, key);
+    }
+    return byColumn;
+  };
+  /** `fields` are canonical field names, but resolve them anyway rather than assume. */
+  const columnOf = (field: string): string => resolveColumnName(meta, field) ?? field;
   if (select) {
     const next = { ...select };
     const strip: string[] = [];
+    const selected = keyByColumn(select);
     for (const f of unique) {
-      if (!next[f]) {
-        next[f] = true;
-        strip.push(f); // not requested by the caller, added only to stitch
-      }
+      const existing = selected.get(columnOf(f));
+      if (existing !== undefined && next[existing]) continue; // already projected, under either spelling
+      next[f] = true;
+      strip.push(f); // not requested by the caller, added only to stitch
     }
     return { select: next, omit, strip };
   }
   if (omit) {
     const next = { ...omit };
     const strip: string[] = [];
+    const omitted = keyByColumn(omit);
     for (const f of unique) {
-      if (next[f]) {
-        delete next[f]; // un-omit so the key is present; the caller wanted it gone
+      const existing = omitted.get(columnOf(f));
+      if (existing !== undefined && next[existing]) {
+        delete next[existing]; // un-omit so the key is present; the caller wanted it gone
         strip.push(f);
       }
     }
@@ -760,6 +795,7 @@ async function loadToOneOrMany(
     ? (windowOrder ?? []).map((o) => targetMeta.reverseColumnMap[o.column] ?? o.column)
     : [];
   const proj = includeKeysForBatching(
+    targetMeta,
     options.select,
     options.omit,
     [childKeyField, ...orderFields, ...neededParentKeyFields(targetMeta, (options.with ?? {}) as WithClause)],
@@ -1001,6 +1037,7 @@ async function loadManyToMany(
   // recursion below will ask these rows for.
   assertProjectionShape(targetMeta.name, options.select, options.omit);
   const proj = includeKeysForBatching(
+    targetMeta,
     options.select,
     options.omit,
     [targetPkField, ...neededParentKeyFields(targetMeta, (options.with ?? {}) as WithClause)],

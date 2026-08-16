@@ -75,7 +75,7 @@ import { TurbineClient } from '../client.js';
 import { TurbineError } from '../errors.js';
 import { introspect } from '../introspect.js';
 import { JSON_WIRE_COERCION_OIDS } from '../query/utils.js';
-import type { SchemaMetadata } from '../schema.js';
+import { camelToSnake, type SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, turbineSqlite } from '../sqlite.js';
 import { skipGate } from './helpers.js';
 
@@ -207,6 +207,34 @@ function chance(rng: () => number, p: number): boolean {
   return rng() < p;
 }
 
+/**
+ * A THIRD AXIS, and the same "two paths must agree" shape as the other two: a
+ * column has TWO legal spellings on every caller-facing argument, the camelCase
+ * FIELD name and the snake_case COLUMN name the DDL declares. `resolveColumnName`
+ * accepts both (`camelToSnake` is idempotent on an already-snake string), so
+ * `userId` and `user_id` name one column and must produce one query.
+ *
+ * The class this closes: several sites tested `key in meta.columnMap`, which
+ * knows only the FIELD spelling, and were therefore reachable-but-divergent
+ * rather than simply wrong. The batched loader's per-parent limit pushdown
+ * DECLINED on a snake-spelled orderBy (silently falling back to fetching every
+ * child and slicing client-side), and its correlation-key projection matched
+ * the caller's `select` / `omit` keys by raw string, which force-added and then
+ * DELETED a column the caller had asked for. Both are invisible to a suite that
+ * only ever writes the camelCase spelling, and both are exactly what the
+ * acceptance-agreement and row-equality assertions below detect.
+ *
+ * The generator therefore spells each field name it emits either way, at
+ * random. `camelToSnake` leaves single-word fields (`id`, `email`, `title`)
+ * untouched, so the axis genuinely varies only on the multi-word ones
+ * (`orgId`, `userId`, `viewCount`, `postId`, `avatarUrl`) - which are also the
+ * relation correlation keys, i.e. precisely the columns the loader machinery
+ * matches by name.
+ */
+function spell(rng: () => number, field: string): string {
+  return chance(rng, 0.35) ? camelToSnake(field) : field;
+}
+
 type FieldKind = 'int' | 'string' | 'nullableString';
 
 interface TableModel {
@@ -277,7 +305,7 @@ function randomWhere(rng: () => number, model: TableModel, depth: number): Recor
   const n = 1 + Math.floor(rng() * 2);
   for (let i = 0; i < n; i++) {
     const field = pick(rng, fields);
-    where[field] = randomFieldFilter(rng, model.fields[field]!);
+    where[spell(rng, field)] = randomFieldFilter(rng, model.fields[field]!);
   }
   if (depth < 2 && chance(rng, 0.25)) {
     const combinator = pick(rng, ['OR', 'AND', 'NOT'] as const);
@@ -300,7 +328,9 @@ function randomWhere(rng: () => number, model: TableModel, depth: number): Recor
 /** Always totally ordered: a random key first, the PK as final tiebreaker. */
 function randomOrderBy(rng: () => number, model: TableModel): Array<Record<string, 'asc' | 'desc'>> {
   const orderBy: Array<Record<string, 'asc' | 'desc'>> = [];
-  if (chance(rng, 0.7)) orderBy.push({ [pick(rng, Object.keys(model.fields))]: pick(rng, ['asc', 'desc'] as const) });
+  if (chance(rng, 0.7)) {
+    orderBy.push({ [spell(rng, pick(rng, Object.keys(model.fields)))]: pick(rng, ['asc', 'desc'] as const) });
+  }
   orderBy.push({ id: 'asc' });
   return orderBy;
 }
@@ -332,10 +362,10 @@ function randomProjection(
   if (chance(rng, 0.3)) {
     const keep = fields.filter(() => chance(rng, 0.5));
     if (keep.length === 0) keep.push('id');
-    return { projection: { select: Object.fromEntries(keep.map((f) => [f, true])) }, refused: false };
+    return { projection: { select: Object.fromEntries(keep.map((f) => [spell(rng, f), true])) }, refused: false };
   }
   if (chance(rng, 0.2)) {
-    return { projection: { omit: { [pick(rng, fields)]: true } }, refused: false };
+    return { projection: { omit: { [spell(rng, pick(rng, fields))]: true } }, refused: false };
   }
   return { projection: {}, refused: false };
 }

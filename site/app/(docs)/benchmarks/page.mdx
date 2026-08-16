@@ -15,13 +15,38 @@ Three-way head-to-head against **Prisma 7.9** (`@prisma/adapter-pg`, `relationJo
 >
 > **Noise floor:** every sub-0.15 ms figure carries roughly one third uncertainty in its absolute value; the orderings are stable across runs. Per-scenario spreads are in [the drift floor](#the-drift-floor-read-this-before-the-table).
 
-> **TL;DR.** Over a local socket there is no network round-trip, so per-query overhead is the entire signal and most numbers are sub-millisecond. The single most useful figure on this page: **Turbine runs at 1.08x hand-written `pg`, where Drizzle runs at 1.47x and Prisma at 1.81x** (geometric mean over the eight scenarios with a raw control). Across all ten scenarios Turbine is **2.02x faster than Prisma 7.9** and **1.46x faster than Drizzle 0.45** by geometric mean. Turbine takes nine scenarios, Drizzle takes one (**streaming, which Drizzle wins outright by 22%**), and Prisma takes none. Three of the ten are contested and are claimed by neither side.
+> **TL;DR.** Over a local socket there is no network round-trip, so per-query overhead is the entire signal and most numbers are sub-millisecond. The single most useful figure on this page: **Turbine runs at 1.08x hand-written `pg`, where Drizzle runs at 1.47x and Prisma at 1.81x** (geometric mean over the eight scenarios with a raw control). Across all ten scenarios Turbine is **2.02x faster than Prisma 7.9** and **1.46x faster than Drizzle 0.45** by geometric mean. Turbine took nine of the ten here and Prisma took none; the one Drizzle took was **streaming**, and [0.72.0 closes it](#the-one-we-lost-and-how-it-was-closed) in a targeted re-measurement. Three of the ten are contested and are claimed by neither side.
 >
 > The [extended suite](#beyond-the-headline-ten) widens the set to **24** shapes; Turbine leads **17**. The additions found a loss the ten could not see (**deep pagination**, where a named prepared statement hits PostgreSQL's generic-plan cliff) and overturned a recommendation they would have produced (`relationLoadStrategy: 'batched'` is fastest on a socket and **slower by 1 ms of round-trip time**). Read [Latency](#latency-the-axis-a-socket-cannot-show) before acting on any single number here.
 
-## The one we lose, stated plainly
+## The one we lost, and how it was closed
 
-**Drizzle beats Turbine on streaming by 22%: 39.49 ms against Turbine's 50.39 ms** to drain 50,000 comments in batches of 1,000. This reproduced in every run across both harnesses, so it is not noise.
+**On 0.71.0, Drizzle beat Turbine on streaming by 22%: 39.49 ms against Turbine's 50.39 ms** to drain 50,000 comments in batches of 1,000. That reproduced in every run across both harnesses, so it was not noise. The rest of this section is how it was tracked down, kept because the diagnosis took three releases and the wrong answer was obvious twice.
+
+<Callout type="note" title="Closed in 0.72.0">
+  The remaining gap was **temporal decoding**, not the cursor and not the row
+  parser. `pg` decodes a `timestamptz` cell by regex and assembles it through
+  `setUTCFullYear`, and on a 50K drain that is the single largest per-row cost.
+  0.72.0 puts a direct scan in front of it for the canonical ISO wire shape, and
+  **declines** anything else (a five-digit year, ` BC`, `infinity`, a colon-less
+  offset) back to the parser it replaced, so no value changes meaning.
+
+  | 50K drain | before | after |
+  |---|---|---|
+  | `findManyStream` (yields rows) | 52.44 ms | **37.06 ms** (+28.6%) |
+  | `findManyStreamBatches` (yields `T[]`) | 47.43 ms | **31.65 ms** (+34.9%) |
+  | Drizzle 0.45.2, same rotation | | 42.09 ms |
+
+  **Read the scope before quoting it.** This is a targeted re-measurement of one
+  scenario, not a re-run of the ten below, so the table further down still shows
+  0.71.0's figures and its absolute values are not comparable to these. Both
+  versions ran in one process on one build with the arms rotating inside every
+  round (the change lives entirely in `pg.types` and can be swapped between two
+  calls), and Drizzle was re-measured in that same rotation rather than read off
+  the older file. A negative control, the same profile timed twice under two
+  names, landed 1.9% apart, which is what makes the paired deltas reportable.
+  Method and controls: [`benchmarks/RESULTS-0.72.0.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-0.72.0.md).
+</Callout>
 
 The control arm locates the gap. Hand-written keyset pagination in raw `pg` drains the same table in 42.33 ms, and Drizzle sits directly on top of it, which is where a thin query builder doing a keyset loop should sit. **Turbine's cursor carries roughly 19% overhead above hand-written keyset pagination on a full-table drain, and Drizzle's carries approximately none.**
 
@@ -148,6 +173,8 @@ Median wall-clock ms per operation (lower is better). Bold = fastest ORM. The `r
 | hot findUnique | **1.00x** | 2.28x | 2.68x |
 
 **Scenario wins: Turbine nine, Drizzle one, Prisma none.** Prisma is slower than Turbine on all ten.
+
+Both tables are 0.71.0 data, as measured on 2026-08-15. The **stream** row is the one since superseded: 0.72.0 takes it, and the figures are [above](#the-one-we-lost-and-how-it-was-closed). It is left standing here rather than patched in because that would mix two harnesses on two dates in one table, and the rest of these rows have not been re-run.
 
 **Three of the ten are contested and should not be read as leads by either side.** The interleaved harness gives Turbine **L2 nested** (1.670 vs 1.711) and **L3 nested** (1.082 vs 1.166), but the contiguous harness will not confirm either: run twice on the identical configuration it reversed itself on both, giving L2 to Drizzle once (2.18 vs 1.63) and to Turbine once (1.54 vs 1.61). **Atomic increment** is the third, a tie under both designs (interleaved: Turbine 0.067 vs Drizzle 0.073; contiguous: 0.09 vs 0.09). The tables above report the interleaved harness because it rotates arm order every round, sharing drift across arms instead of letting it land on one. Streaming is **not** contested: Drizzle wins it by 22% in every run of both harnesses.
 

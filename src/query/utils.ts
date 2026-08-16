@@ -5,7 +5,7 @@
  */
 
 import pg from 'pg';
-import { camelToSnake, localDateTimeKind, timeOfDayKind } from '../schema.js';
+import { camelToSnake, localDateTimeKind, snakeToCamel, timeOfDayKind } from '../schema.js';
 import { shouldWarnOnce, WARN_NS } from './warn-registry.js';
 
 // ---------------------------------------------------------------------------
@@ -81,6 +81,55 @@ export function resolveColumnName(meta: ColumnNameSource, key: string): string |
   if (meta.reverseColumnMap && ownLookup(meta.reverseColumnMap, snake)) return snake;
   if (meta.allColumns?.includes(snake)) return snake;
   return undefined;
+}
+
+/**
+ * Resolve a user-supplied key to a relation's CANONICAL name and definition, or
+ * `undefined` when the key names no relation on the table.
+ *
+ * The relation-name half of the rule {@link resolveColumnName} states for
+ * columns, and deliberately the same shape: the declared name first, else
+ * `snakeToCamel(key)` accepted ONLY when that names a real relation.
+ * `snakeToCamel` is idempotent on an already-camel string, so a canonical key
+ * takes the first branch and this is a no-op for every existing caller.
+ *
+ * WHY IT EXISTS. A relation has one declared name, `ripeningChecks`, while the
+ * DDL anyone reads has only the TABLE name, `ripening_checks`. Writing back
+ * what the schema shows therefore failed with E005 in `with`, E003 in a
+ * relation filter, and E005 in `orderBy`, on names the error text was already
+ * computing correctly ("Did you mean ...?"). A system that can name the
+ * intended relation can accept it.
+ *
+ * NOT A GUESS, for the same reason the column rule is not: the transformed name
+ * is accepted only when it is a real declared relation, so an unknown key still
+ * fails and a typo is still a typo. Exact match wins first, so a schema that
+ * literally declares `ripening_checks` keeps it, even alongside a
+ * `ripeningChecks`.
+ *
+ * The RESULT KEY is the canonical name, not the caller's spelling, matching the
+ * column side (`select: { ledger_handle: true }` already returns
+ * `{ ledgerHandle }`). Resolving here rather than normalizing the args up front
+ * also means both spellings share one SQL-cache entry instead of minting two
+ * templates for one query.
+ *
+ * Prototype-safe via {@link ownLookup}, so `__proto__` cannot name a relation.
+ */
+export function resolveRelation<R>(relations: Record<string, R>, key: string): { name: string; def: R } | undefined {
+  const direct = ownLookup(relations, key);
+  if (direct !== undefined) return { name: key, def: direct };
+  const camel = snakeToCamel(key);
+  if (camel === key) return undefined;
+  const mapped = ownLookup(relations, camel);
+  return mapped === undefined ? undefined : { name: camel, def: mapped };
+}
+
+/**
+ * {@link resolveRelation} when only the definition is wanted: a drop-in for the
+ * `ownLookup(meta.relations, key)` it replaces, with the same signature and the
+ * same `undefined` on a miss.
+ */
+export function resolveRelationDef<R>(relations: Record<string, R>, key: string): R | undefined {
+  return resolveRelation(relations, key)?.def;
 }
 
 // ---------------------------------------------------------------------------
@@ -589,6 +638,201 @@ export function isTemporalInfinity(value: unknown): boolean {
 // Driver type parsers for the zone-less temporal OIDs
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// The fast temporal scan
+//
+// Every temporal parser below is a two-stage function: a hand-written
+// character scan that claims the ONE wire shape a busy application actually
+// produces, and behind it the general parser, which is where every other shape
+// (and every shape a future server adds) still goes.
+//
+// WHY IT EXISTS, stated as a measurement rather than an intuition. Draining
+// 50,000 rows of the benchmark `comments` fixture spends ~23.5 ms in
+// client-side type decoding, and `timestamptz` alone is 20.7 ms of it (88%).
+// The remaining types are not worth touching: `text`, `numeric`, `uuid` and
+// `bool` cost nothing at all, because pg registers no parser for them. Two
+// hard bounds were verified in node-postgres' source before any of this was
+// written, and they say what a decoder rewrite can and cannot reach: every
+// cell is materialised as a JS string by `reader.string(len)` before any
+// parser is consulted, so the `utf8Slice` half is unreachable; and the binary
+// protocol is not an escape hatch, the parser constructor throws
+// `Binary mode not supported yet`. The type-PARSING half is the whole budget,
+// and this is a claim on it.
+//
+// THE RULE, and it is the only thing that makes a fast path acceptable here:
+// **the scan must return exactly what the parser it replaces returned, or
+// return `null` and not claim the value at all.** It never guesses, never
+// "handles" a shape approximately, and never widens what it accepts to cover
+// one more case. Every refusal costs a few charCode compares and is repaid by
+// the general parser being correct.
+//
+// Two traps are baked into the refusals rather than into corrections, because
+// a throwaway version of this decoder wrote during the ceiling measurement got
+// 3 of 15 edge values wrong while believing it had delegated the hard ones:
+//
+//   1. `Date.UTC` maps years 0-99 onto 1900-1999, so `0044-03-15` decodes as
+//      1944 and `0001-01-01` as 1901. The obvious repair, build the Date then
+//      `setUTCFullYear`, is ALSO wrong: year 0 is a leap year in the proleptic
+//      Gregorian calendar and 1900 is not, so `0000-02-29` built that way
+//      lands on March 1st. The scan refuses `year < 100` and lets the general
+//      parser's `new Date(0)` + `setUTCFullYear(y, m, d)` assembly (which sets
+//      all three fields against the right year's calendar) answer it.
+//   2. An offset parse that runs to end-of-string silently EATS a trailing
+//      ` BC`: `4713-01-01 00:00:00+00 BC` decodes as AD 4713, off by 9,424
+//      years with no error. The scan requires end-of-string after the offset.
+//
+// Differential coverage: src/test/fast-temporal-decode.test.ts compares the
+// scan against the parser it replaces value for value, and
+// src/test/fast-temporal-decode.integration.test.ts does the same against a
+// live server with `DateStyle` and `TimeZone` varied, because the wire shape
+// is a server setting and a decoder tuned to one `DateStyle` is a latent
+// corruption bug.
+// ---------------------------------------------------------------------------
+
+// Wire shape the scan is reading. Plain module constants rather than an enum:
+// this repo's lint config rejects `const enum` (it does not survive
+// `isolatedModules`), and a plain `enum` emits a runtime object, so every
+// `Shape.Date` in the scan below would become a property load in the hottest
+// loop in the library. These are values, never serialized, never persisted.
+/** `YYYY-MM-DD` (OID 1082). */
+const SHAPE_DATE = 0;
+/** `YYYY-MM-DD[ T]HH:MM:SS[.f…]` (OID 1114), never an offset. */
+const SHAPE_TIMESTAMP = 1;
+/** `YYYY-MM-DD HH:MM:SS[.f…](Z|±HH[:MM[:SS]])` (OID 1184), offset REQUIRED. */
+const SHAPE_TIMESTAMPTZ = 2;
+
+const CH_HYPHEN = 45;
+const CH_COLON = 58;
+const CH_DOT = 46;
+const CH_SPACE = 32;
+const CH_T = 84;
+const CH_Z = 90;
+const CH_PLUS = 43;
+/** Same code point as {@link CH_HYPHEN}; named separately because the two read
+ * as different things (a date separator, an offset sign) at their use sites. */
+const CH_MINUS = 45;
+
+/**
+ * Two ASCII digits at `i` as a number, or `-1` if either character is not a
+ * digit. `charCodeAt` past the end returns `NaN`, and `NaN - 48` is `NaN`,
+ * which fails both range tests, so this needs no separate length check.
+ */
+function twoDigitsAt(text: string, i: number): number {
+  const hi = text.charCodeAt(i) - 48;
+  const lo = text.charCodeAt(i + 1) - 48;
+  return hi >= 0 && hi <= 9 && lo >= 0 && lo <= 9 ? hi * 10 + lo : -1;
+}
+
+/**
+ * Decode `text` if it is exactly the canonical ISO wire shape for `shape`, or
+ * return `null` to say "not mine" (see the rule in the block comment above).
+ *
+ * Deliberately NOT accepted, each because the parser it replaces would answer
+ * differently:
+ *
+ *   - a year that is not exactly four digits. A 5-digit year is a real
+ *     PostgreSQL output and the general parser handles it; a fast path that
+ *     matched a variable-width year would have to re-find every later field.
+ *   - a year below 100 (trap 1 above).
+ *   - a `T` separator for `SHAPE_TIMESTAMPTZ`. `postgres-date`'s
+ *     own date-time regex requires a literal SPACE, so it returns `null` for
+ *     `2024-01-01T00:00:00+00`; a scan that accepted `T` there would invent a
+ *     Date where the driver hands back null. `timestamp` (1114) does accept it
+ *     because the general parser it replaces does.
+ *   - a missing offset for `SHAPE_TIMESTAMPTZ`. `postgres-date` reads an
+ *     offset-less value in the process's LOCAL zone, which is not what this
+ *     scan computes.
+ *   - a colon-less offset (`+0530`), an alphabetic zone (` UTC`), or anything
+ *     at all after the offset, including ` BC` (trap 2 above).
+ *   - a bare `.` with no fractional digits.
+ *
+ * Field-value overflow (`2024-13-45`, `25:70:99`) IS accepted, because
+ * `Date.UTC` rolls those over exactly as the general parser's `setUTCFullYear`
+ * / `setUTCHours` do. PostgreSQL never emits them; agreeing on them is free.
+ */
+function scanIsoTemporal(text: string, shape: number): Date | null {
+  const len = text.length;
+  if (len < 10) return null;
+  if (text.charCodeAt(4) !== CH_HYPHEN || text.charCodeAt(7) !== CH_HYPHEN) return null;
+  const yearHi = twoDigitsAt(text, 0);
+  const yearLo = twoDigitsAt(text, 2);
+  if (yearHi < 0 || yearLo < 0) return null;
+  const year = yearHi * 100 + yearLo;
+  if (year < 100) return null;
+  const month = twoDigitsAt(text, 5);
+  const day = twoDigitsAt(text, 8);
+  if (month < 0 || day < 0) return null;
+
+  if (shape === SHAPE_DATE) {
+    return len === 10 ? new Date(Date.UTC(year, month - 1, day)) : null;
+  }
+
+  if (len < 19) return null;
+  const sep = text.charCodeAt(10);
+  if (shape === SHAPE_TIMESTAMP ? sep !== CH_SPACE && sep !== CH_T : sep !== CH_SPACE) return null;
+  if (text.charCodeAt(13) !== CH_COLON || text.charCodeAt(16) !== CH_COLON) return null;
+  const hour = twoDigitsAt(text, 11);
+  const minute = twoDigitsAt(text, 14);
+  const second = twoDigitsAt(text, 17);
+  if (hour < 0 || minute < 0 || second < 0) return null;
+
+  let i = 19;
+  let ms = 0;
+  if (text.charCodeAt(i) === CH_DOT) {
+    i++;
+    let digits = 0;
+    for (;;) {
+      const d = text.charCodeAt(i) - 48;
+      if (!(d >= 0 && d <= 9)) break;
+      // Only the first three digits survive: PostgreSQL emits up to six and a
+      // JS Date holds milliseconds. `postgres-date` gets the same answer by a
+      // different route (`1000 * parseFloat('.476603')`, truncated by
+      // `Date.UTC`), and the two agree on every 1-to-6-digit fraction.
+      if (digits < 3) ms = ms * 10 + d;
+      digits++;
+      i++;
+    }
+    if (digits === 0) return null;
+    if (digits === 1) ms *= 100;
+    else if (digits === 2) ms *= 10;
+  }
+
+  if (shape === SHAPE_TIMESTAMP) {
+    return i === len ? new Date(Date.UTC(year, month - 1, day, hour, minute, second, ms)) : null;
+  }
+
+  let offsetMs = 0;
+  const signCode = text.charCodeAt(i);
+  if (signCode === CH_Z) {
+    i++;
+  } else if (signCode === CH_PLUS || signCode === CH_MINUS) {
+    i++;
+    const offsetHours = twoDigitsAt(text, i);
+    if (offsetHours < 0) return null;
+    i += 2;
+    let offsetMinutes = 0;
+    let offsetSeconds = 0;
+    if (text.charCodeAt(i) === CH_COLON) {
+      offsetMinutes = twoDigitsAt(text, i + 1);
+      if (offsetMinutes < 0) return null;
+      i += 3;
+      // A zone whose historical LMT offset was not a whole minute emits
+      // seconds too (`1850-01-01 00:00:00+00:19:32`).
+      if (text.charCodeAt(i) === CH_COLON) {
+        offsetSeconds = twoDigitsAt(text, i + 1);
+        if (offsetSeconds < 0) return null;
+        i += 3;
+      }
+    }
+    offsetMs =
+      (offsetHours * 3_600_000 + offsetMinutes * 60_000 + offsetSeconds * 1000) * (signCode === CH_MINUS ? -1 : 1);
+  } else {
+    return null;
+  }
+  if (i !== len) return null;
+  return new Date(Date.UTC(year, month - 1, day, hour, minute, second, ms) - offsetMs);
+}
+
 /**
  * A Postgres `date` wire value: `YYYY-MM-DD`, optionally with more than four
  * year digits, optionally suffixed ` BC`. Anything else (`infinity`,
@@ -623,6 +867,23 @@ const PG_DATE_TEXT_RE = /^(\d{4,})-(\d{2})-(\d{2})( BC)?$/;
  * astronomical year (`0044 BC` → -43) the way the driver's own parser does.
  */
 export function createUtcDateParser(fallback: (text: string) => unknown): (text: string) => unknown {
+  const general = createUtcDateParserGeneral(fallback);
+  return (text: string): unknown => scanIsoTemporal(text, SHAPE_DATE) ?? general(text);
+}
+
+/**
+ * The `date` (OID 1082) parser WITHOUT the fast scan in front of it: the regex
+ * implementation described by {@link createUtcDateParser}, and the reference
+ * side of the differential test.
+ *
+ * Exported so "what the fast path must agree with" is the running code rather
+ * than a transcription of it in a test file. Two hand-synced copies of a
+ * parser is the drift class this repo has been bitten by before; there is one
+ * copy, and the fast path delegates to it.
+ *
+ * @internal
+ */
+export function createUtcDateParserGeneral(fallback: (text: string) => unknown): (text: string) => unknown {
   return (text: string): unknown => {
     const m = PG_DATE_TEXT_RE.exec(text);
     if (!m) return fallback(text);
@@ -663,6 +924,19 @@ const PG_TIMESTAMP_TEXT_RE = /^(\d{4,})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2
  * `Date`-string parsing did too.
  */
 export function createUtcTimestampParser(fallback: (text: string) => unknown): (text: string) => unknown {
+  const general = createUtcTimestampParserGeneral(fallback);
+  return (text: string): unknown => scanIsoTemporal(text, SHAPE_TIMESTAMP) ?? general(text);
+}
+
+/**
+ * The `timestamp` (OID 1114) parser WITHOUT the fast scan in front of it: the
+ * regex implementation described by {@link createUtcTimestampParser}, and the
+ * reference side of the differential test. Same reasoning as
+ * {@link createUtcDateParserGeneral}.
+ *
+ * @internal
+ */
+export function createUtcTimestampParserGeneral(fallback: (text: string) => unknown): (text: string) => unknown {
   return (text: string): unknown => {
     const m = PG_TIMESTAMP_TEXT_RE.exec(text);
     if (!m) return fallback(text);
@@ -673,6 +947,28 @@ export function createUtcTimestampParser(fallback: (text: string) => unknown): (
     date.setUTCHours(Number(m[4]), Number(m[5]), Number(m[6]), ms);
     return date;
   };
+}
+
+/**
+ * Build the driver parser for Postgres `timestamptz` (OID 1184): the ISO wire
+ * shape decoded by {@link scanIsoTemporal}, everything else handed straight to
+ * `fallback`.
+ *
+ * UNLIKE the `date` and `timestamp` parsers beside it, this one changes NO
+ * READING. A `timestamptz` arrives with an explicit offset, so its instant is
+ * unambiguous and both this and `postgres-date` produce the same `Date`; the
+ * only difference is how long it takes. That is also why it is not governed by
+ * a semantic decision the way `utcTimestamps` governs the zone-less types: there
+ * is no second interpretation to choose between.
+ *
+ * `fallback` must be captured with `pg.types.getTypeParser(1184, 'text')`
+ * BEFORE registration, for the same reason as the parsers above: reading it
+ * afterwards hands back this function and recurses forever. It is what keeps
+ * `infinity` / `-infinity`, ` BC`, wide and low years, and every non-ISO
+ * `DateStyle` on `postgres-date`, which already handles them.
+ */
+export function createFastTimestamptzParser(fallback: (text: string) => unknown): (text: string) => unknown {
+  return (text: string): unknown => scanIsoTemporal(text, SHAPE_TIMESTAMPTZ) ?? fallback(text);
 }
 
 /**
@@ -707,11 +1003,22 @@ type PgArrayParserModule = {
  * `pg.types.arrayParser` is a public member of the `pg` module (it is what the
  * driver's own `_text` / `_date` parsers are built from), so this adds no
  * dependency. NULL elements stay `null` and are never handed to `element`.
+ *
+ * The empty-string guard mirrors pg's own `parseDateArray`, which opens
+ * `if (!value) return null`. Turbine's copy did not, and answered `[]` where
+ * the driver answers `null` for the same input. No column produces it (a SQL
+ * NULL never reaches a parser, and an empty array is `{}`), so this is parity
+ * for its own sake rather than a bug report; it matters because these parsers
+ * are registered process-globally over pg's, and a shape where Turbine's
+ * answer differs from the driver's is a difference somebody eventually finds
+ * the hard way.
  */
-export function createPgArrayParser(element: (text: string) => unknown): (text: string) => unknown[] {
+export function createPgArrayParser(element: (text: string) => unknown): (text: string) => unknown[] | null {
   const arrayParser = pg.types.arrayParser as unknown as PgArrayParserModule;
-  return (text: string): unknown[] =>
-    arrayParser.create(text, (entry) => (entry === null || entry === undefined ? null : element(entry))).parse();
+  return (text: string): unknown[] | null =>
+    text
+      ? arrayParser.create(text, (entry) => (entry === null || entry === undefined ? null : element(entry))).parse()
+      : null;
 }
 
 /**
@@ -731,6 +1038,13 @@ const DEFAULT_PARSER_PROBES: Readonly<Record<number, { text: string; expected: (
   1114: { text: '2020-01-02 03:04:05', expected: () => new Date(2020, 0, 2, 3, 4, 5) },
   1115: { text: '{"2020-01-02 03:04:05"}', expected: () => [new Date(2020, 0, 2, 3, 4, 5)] },
   1182: { text: '{2020-01-02}', expected: () => [new Date(2020, 0, 2)] },
+  // The `timestamptz` pair carries an explicit offset, so unlike the four
+  // above its expectation is NOT computed from local components: pg's default
+  // and Turbine's fast scan produce the same instant in every zone. These two
+  // probes are consulted by {@link registerFastTemporalParserIfDefault}, which
+  // DECLINES to install rather than warning-and-overwriting.
+  1184: { text: '2020-01-02 03:04:05+00', expected: () => new Date(Date.UTC(2020, 0, 2, 3, 4, 5)) },
+  1185: { text: '{"2020-01-02 03:04:05+00"}', expected: () => [new Date(Date.UTC(2020, 0, 2, 3, 4, 5))] },
 };
 
 /**
@@ -742,8 +1056,15 @@ const DEFAULT_PARSER_PROBES: Readonly<Record<number, { text: string; expected: (
  */
 const TURBINE_PARSER = Symbol.for('turbine.typeParser');
 
-/** The OIDs the `utcTimestamps` flag governs, and so the ones it can opt out of. */
-const TEMPORAL_PARSER_OIDS: ReadonlySet<number> = new Set([1114, 1082, 1115, 1182]);
+/**
+ * The OIDs the `utcTimestamps` flag governs, and so the ones it can opt out of.
+ *
+ * 1184 / 1185 are in the set because the flag gates their registration too,
+ * but they are there for a different reason from the other four: those four
+ * change a READING (local zone to UTC), while the `timestamptz` pair changes
+ * only decode SPEED. See {@link registerUtcTemporalParsers}.
+ */
+const TEMPORAL_PARSER_OIDS: ReadonlySet<number> = new Set([1114, 1082, 1115, 1182, 1184, 1185]);
 
 /** Tag `parser` as Turbine's own and return it (see {@link TURBINE_PARSER}). */
 export function markTurbineParser<F extends (text: string) => unknown>(parser: F): F {
@@ -832,11 +1153,14 @@ export function warnParserOverwrite(oid: number, typeName: string): void {
   if ((current as unknown as Record<symbol, unknown>)[TURBINE_PARSER]) return;
   if (isDefaultTextParser(oid, current)) return;
   if (!shouldWarnOnce(WARN_NS.parserOverwrite, String(oid))) return;
-  // The `utcTimestamps: false` opt-out only governs the four TEMPORAL OIDs.
+  // The `utcTimestamps: false` opt-out only governs the six TEMPORAL OIDs.
   // Offering it as the remedy for int8 (20) would name a setting that does
   // nothing for the OID being warned about; that registration has no opt-out.
+  // (1184 / 1185 never reach this warning at all: they DECLINE over a
+  // non-default parser instead of overwriting it. They are named in the
+  // sentence because it describes what the flag leaves alone.)
   const remedy = TEMPORAL_PARSER_OIDS.has(oid)
-    ? ' `utcTimestamps: false` leaves the four temporal OIDs (1114, 1082, 1115, 1182) alone entirely.'
+    ? ' `utcTimestamps: false` leaves the six temporal OIDs (1114, 1082, 1115, 1182, 1184, 1185) alone entirely.'
     : ' There is no opt-out for this OID: Turbine registers it so bigint values come back as numbers.';
   console.warn(
     `[turbine] pg type parser for OID ${oid} (${typeName}) was already customized by something else in this ` +
@@ -850,8 +1174,21 @@ export function warnParserOverwrite(oid: number, typeName: string): void {
 }
 
 /**
- * Register the UTC readings of the four zone-less temporal OIDs on the pg
- * module: `timestamp` (1114), `date` (1082) and their array forms (1115, 1182).
+ * Register Turbine's temporal text parsers on the pg module. SIX OIDs, doing
+ * two different jobs:
+ *
+ *   1114 / 1082 / 1115 / 1182   the UTC READING of the zone-less types,
+ *                               `timestamp`, `date` and their array forms.
+ *                               This changes what a column means and is what
+ *                               `utcTimestamps` is named for.
+ *   1184 / 1185                 the fast decode path for `timestamptz` and
+ *                               `timestamptz[]`. This changes NOTHING about
+ *                               what a column means: an offset-carrying value
+ *                               has one instant and this reads the same one.
+ *                               It is here for speed, `timestamptz` being ~88%
+ *                               of the client-side decode cost of a wide row
+ *                               drain, and it DECLINES rather than overwrites
+ *                               (see the comment at the call site).
  *
  * ONE place, because `pg.types.setTypeParser` is process-global and the pairing
  * matters: registering a scalar without its array form, or a `date` without the
@@ -889,6 +1226,61 @@ export function registerUtcTemporalParsers(): void {
   // beside them returned UTC ones.
   setParser(1182, markTurbineParser(createPgArrayParser(parseDate)));
   setParser(1115, markTurbineParser(createPgArrayParser(parseTimestamp)));
+  // `timestamptz` (1184) and `timestamptz[]` (1185). SPEED ONLY: an offset-
+  // carrying value has exactly one instant, and this reads it as the same
+  // instant `postgres-date` does, so nothing here changes what a column means.
+  //
+  // Two things about it are deliberate and neither is obvious.
+  //
+  // It is gated behind `utcTimestamps` along with the other four, even though
+  // that flag is about a READING and this is not. The alternative was a second
+  // registration site outside this function, and one process-global parser
+  // table with two places that write to it is the exact shape the "ONE place"
+  // rule above exists to prevent. So the flag reads as "leave pg's temporal
+  // parser table alone", and `utcTimestamps: false` costs the optimisation as
+  // well as the UTC reading. That is a documented cost, not an oversight.
+  //
+  // And it DECLINES rather than overwrites (see
+  // {@link registerFastTemporalParserIfDefault}), which is the opposite of what
+  // the four above do. They MUST overwrite: they exist to replace a reading,
+  // and a process where half the temporal columns read local and half read UTC
+  // is broken. This one exists only to be faster, so a caller who installed
+  // their own `timestamptz` parser (to get strings, or Luxon objects, or a
+  // Temporal instant) keeps it. Overwriting them would trade their correctness
+  // for our speed, which is never the right trade, and Turbine has never
+  // touched 1184 before now, so declining is also what preserves that.
+  const parseTimestamptz = registerFastTemporalParserIfDefault(1184, createFastTimestamptzParser);
+  if (parseTimestamptz) {
+    registerFastTemporalParserIfDefault(1185, () => createPgArrayParser(parseTimestamptz));
+  }
+}
+
+/**
+ * Install a SPEED-ONLY parser for `oid`, but only over pg's own default (or
+ * over a parser Turbine itself installed earlier in this process).
+ *
+ * Returns the installed parser, or `undefined` when it declined, so a caller
+ * can hold a scalar and its array form to the same decision: registering the
+ * array half over a caller's customized scalar half would make the two
+ * disagree, which is worse than leaving both slow.
+ *
+ * `build` receives the parser being replaced, which becomes the fast path's
+ * fallback. That is only sound because the parser being replaced is known to
+ * be pg's default (or Turbine's own wrapper around it); the check below is
+ * what makes it so, and is not an optimisation of it.
+ */
+function registerFastTemporalParserIfDefault(
+  oid: number,
+  build: (fallback: (text: string) => unknown) => (text: string) => unknown,
+): ((text: string) => unknown) | undefined {
+  const getParser = pg.types.getTypeParser as unknown as (oid: number, format: 'text') => (value: string) => unknown;
+  const setParser = pg.types.setTypeParser as unknown as (oid: number, parse: (value: string) => unknown) => void;
+  const current = getParser(oid, 'text');
+  const isTurbines = (current as unknown as Record<symbol, unknown>)[TURBINE_PARSER] === true;
+  if (!isTurbines && !isDefaultTextParser(oid, current)) return undefined;
+  const parser = markTurbineParser(build(current));
+  setParser(oid, parser);
+  return parser;
 }
 
 // ---------------------------------------------------------------------------

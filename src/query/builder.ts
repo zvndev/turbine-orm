@@ -49,6 +49,7 @@ import {
   orderByEntries,
   sortedEntries,
 } from './filters.js';
+import { normalizeWithClause } from './relation-names.js';
 import * as relationsMod from './relations.js';
 import type {
   AggregateArgs,
@@ -88,6 +89,8 @@ import {
   ownLookup,
   parseDbDate,
   resolveColumnName,
+  resolveRelation,
+  resolveRelationDef,
   type SqlCacheEntry,
   sqlToPreparedName,
   unknownFieldMessage,
@@ -1227,6 +1230,24 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
+   * `args` with every `with` relation key replaced by the relation's DECLARED
+   * spelling, so a snake_case relation name resolves the way a snake_case
+   * column name already does.
+   *
+   * Returns `args` by reference when nothing needed rewriting, which is every
+   * query that already spells its relations the declared way. Runs before the
+   * stable-order pass and before `withFingerprint`, so the whole pipeline, and
+   * the SQL cache key with it, sees one spelling. The rule and the reason it is
+   * applied ONCE here rather than at each of the six `with` walkers are in
+   * query/relation-names.ts.
+   */
+  private withDeclaredRelationNames<A extends { with?: unknown } | undefined>(args: A): A {
+    if (!args?.with) return args;
+    const normalized = normalizeWithClause(this.schema, this.table, args.with as WithClause);
+    return normalized === args.with ? args : ({ ...args, with: normalized } as A);
+  }
+
+  /**
    * Fill a PK-ascending `orderBy` into every to-many `with` relation that has no
    * explicit one, recursing into nested `with`. Returns a CLONED clause (user
    * args are never mutated); when nothing needs filling it returns the input
@@ -1243,7 +1264,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     let out: WithClause | undefined;
     for (const [relName, spec] of Object.entries(withClause)) {
       if (relName === '_count' || !spec) continue; // `_count` is a count, not a row load
-      const rel = ownLookup(meta.relations, relName);
+      const rel = resolveRelationDef(meta.relations, relName);
       if (!rel) continue; // unknown relation, let the build path surface E005
       const options: WithOptions = spec === true ? {} : (spec as WithOptions);
 
@@ -1656,7 +1677,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }
         continue;
       }
-      const rel = ownLookup(this.tableMeta.relations, key);
+      const rel = resolveRelationDef(this.tableMeta.relations, key);
       if (!rel) {
         joinWith[key] = spec; // unknown relation, let the join path surface E005
         continue;
@@ -1783,6 +1804,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       args.omit as Record<string, boolean> | undefined,
     );
     const proj = includeKeysForBatching(
+      this.tableMeta,
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
       needed,
@@ -1947,6 +1969,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * from the returned rows, so the shape matches the join strategy exactly.
    */
   private async runFindManyBatched(args: FindManyArgs<T>): Promise<T[]> {
+    // Declared relation spellings first, exactly as the join path does in
+    // buildFindMany: the loader reads `args.with` itself, so without this the
+    // two strategies would disagree about which relation names are valid.
+    args = this.withDeclaredRelationNames(args);
     // Stable relation order (opt-in): the batched loader forwards each relation's
     // orderBy into its follow-up query, so filling the synthesized PK order here
     // makes the batched output deterministic exactly like the join path.
@@ -2000,6 +2026,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       args.omit as Record<string, boolean> | undefined,
     );
     const proj = includeKeysForBatching(
+      this.tableMeta,
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
       needed,
@@ -2452,6 +2479,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args: FindUniqueArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O> | null> {
+    // BEFORE the strategy branch, not only inside the builders, so the
+    // join-vs-batched decision and its dev warning see the same declared name
+    // every other stage does. `planAuto` splits `with` on the caller's keys and
+    // `runAutoSplit` carries them onward; each downstream consumer normalizes
+    // too, so this is not load-bearing for correctness (measured: removing it
+    // changes the warning text from the declared name back to the caller's and
+    // nothing else). It is here so the invariant holds at the seam rather than
+    // depending on every consumer to re-establish it.
+    args = this.withDeclaredRelationNames(args);
     return this.executeWithMiddleware('findUnique', args as unknown as Record<string, unknown>, async () => {
       if (args.with) {
         const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
@@ -2483,6 +2519,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * strategy's shape for the one row.
    */
   private async runFindUniqueBatched(args: FindUniqueArgs<T>): Promise<T | null> {
+    // Declared relation spellings first, see runFindManyBatched.
+    args = this.withDeclaredRelationNames(args);
     // Stable relation order (opt-in), see runFindManyBatched.
     const withClause = this.resolveStableOrder(args.stableRelationOrder)
       ? this.applyStableRelationOrder(args.with as WithClause, this.table)
@@ -2496,6 +2534,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       args.omit as Record<string, boolean> | undefined,
     );
     const proj = includeKeysForBatching(
+      this.tableMeta,
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
       needed,
@@ -2562,6 +2601,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
           'If you meant "any row matching an optional filter", use `findFirst`.',
       );
     }
+    // Declared relation spellings first, before stable-order and the
+    // fingerprint (see buildFindMany).
+    args = this.withDeclaredRelationNames(args);
     // Stable relation order (opt-in): fill PK-asc orderBy into unordered to-many
     // relations before fingerprinting (see buildFindMany).
     if (args.with && this.resolveStableOrder(args.stableRelationOrder)) {
@@ -2606,7 +2648,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       !whereObj.NOT &&
       whereKeys.every((k) => {
         const v = whereObj[k];
-        return v !== null && !isWhereOperator(v) && !ownLookup(this.tableMeta.relations, k);
+        // Resolved, not looked up: a relation filter spelled the snake_case
+        // way must not read as a plain equality and take the simple path.
+        return v !== null && !isWhereOperator(v) && !resolveRelationDef(this.tableMeta.relations, k);
       });
 
     // Simple path: plain equality, no operators/null/OR.
@@ -2728,6 +2772,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O>[]> {
+    // BEFORE the strategy branch, not only inside the builders, so the
+    // join-vs-batched decision and its dev warning see the same declared name
+    // every other stage does. `planAuto` splits `with` on the caller's keys and
+    // `runAutoSplit` carries them onward; each downstream consumer normalizes
+    // too, so this is not load-bearing for correctness (measured: removing it
+    // changes the warning text from the declared name back to the caller's and
+    // nothing else). It is here so the invariant holds at the seam rather than
+    // depending on every consumer to re-establish it.
+    args = this.withDeclaredRelationNames(args);
     this.maybeWarnUnlimited(args);
     this.maybeWarnUnorderedPage(args);
 
@@ -2901,8 +2954,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const isScalarEquality =
         value !== null && (typeof value !== 'object' || value instanceof Date) && typeof value !== 'function';
       if (!isScalarEquality) return false;
-      const column = ownLookup(this.tableMeta.columnMap, field);
-      if (!column) return false;
+      // The one key-resolution rule: a bare `columnMap` read knows only the
+      // FIELD spelling, so `where: { user_id: 1 }` on a unique column did not
+      // count as pinning it and drew a spurious unlimited-read warning the
+      // camelCase spelling of the same query did not.
+      const column = resolveColumnName(this.tableMeta, field);
+      if (column === undefined) return false;
       pinned.add(column);
     }
     if (pinned.size === 0) return false;
@@ -2936,6 +2993,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
     this.currentSkip = resolveSkipGlobalFilters(args?.skipGlobalFilters);
     // Pinned before the flatten plan and the cache key, both of which read it.
     const jsonEncoding = this.resolveJsonEncoding(args?.jsonEncoding);
+    // Relation names to their declared spelling FIRST, before the stable-order
+    // pass and the fingerprint below and before any of the six `with` walkers,
+    // so none of them needs to know a relation has two accepted spellings and
+    // both spellings share one cache entry. See query/relation-names.ts.
+    args = this.withDeclaredRelationNames(args);
     // Stable relation order (opt-in): fill PK-asc orderBy into unordered to-many
     // relations BEFORE fingerprinting, so the two orderings get distinct cache
     // entries and every downstream path (SQL build, collect, parser) inherits it.
@@ -3052,7 +3114,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // distinct key (correct, it emits a different ORDER BY).
     const orderFp = args?.orderBy
       ? orderByEntries(args.orderBy)
-          .map(([k, d]) => `${k}:${this.orderByEntryFingerprint(d, ownLookup(this.tableMeta.relations, k)?.to)}`)
+          // Keyed by the DECLARED relation name (falling back to the key
+          // itself for a column), so the two spellings of one orderBy share a
+          // cache entry instead of minting two templates for one query.
+          .map(([k, d]) => {
+            const rel = resolveRelation(this.tableMeta.relations, k);
+            return `${rel?.name ?? k}:${this.orderByEntryFingerprint(d, rel?.def.to)}`;
+          })
           .join(',')
       : '';
     const cursorFp = args?.cursor
@@ -3190,12 +3258,26 @@ export class QueryInterface<T extends object, R extends object = {}> {
           // Resolve the seek direction per cursor field from the flattened
           // orderBy entries (last wins, matching object-key semantics), so both
           // the object and array orderBy forms drive the cursor comparison.
-          const orderDirByKey = new Map(orderByEntries(args.orderBy));
+          //
+          // Indexed by the RESOLVED COLUMN, never the caller's key: both
+          // `cursor` and `orderBy` take either spelling, so a cursor written
+          // `{ created_at }` against `orderBy: { createdAt: 'desc' }` missed
+          // this lookup, defaulted to ascending, and emitted `created_at > $n`
+          // under `ORDER BY created_at DESC` — the wrong page, silently. Same
+          // failure the `{ sort, nulls }` normalization below prevents, reached
+          // through the spelling instead of the value shape. A relation /
+          // JSON-path / vector key resolves to no column and is skipped.
+          const orderDirByColumn = new Map<string, unknown>();
+          for (const [ok, od] of orderByEntries(args.orderBy)) {
+            const ocol = resolveColumnName(this.tableMeta, ok);
+            if (ocol !== undefined) orderDirByColumn.set(ocol, od);
+          }
           const cursorConditions = cursorEntries.map(([k, v]) => {
-            const col = this.toSqlColumn(k);
+            const rawCol = this.toColumn(k);
+            const col = this.q(rawCol);
             // orderBy values can be the { sort, nulls } spec form: normalize
             // before comparing, or a desc spec would seek the ascending side.
-            const dir = orderDirByKey.get(k);
+            const dir = orderDirByColumn.get(rawCol);
             const desc = isOrderBySpec(dir) ? dir.sort === 'desc' : dir === 'desc';
             const op = desc ? '<' : '>';
             freshParams.push(v);
@@ -3585,6 +3667,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O> | null> {
+    // BEFORE the strategy branch, not only inside the builders, so the
+    // join-vs-batched decision and its dev warning see the same declared name
+    // every other stage does. `planAuto` splits `with` on the caller's keys and
+    // `runAutoSplit` carries them onward; each downstream consumer normalizes
+    // too, so this is not load-bearing for correctness (measured: removing it
+    // changes the warning text from the declared name back to the caller's and
+    // nothing else). It is here so the invariant holds at the seam rather than
+    // depending on every consumer to re-establish it.
+    args = this.withDeclaredRelationNames(args);
     return this.executeWithMiddleware('findFirst', (args ?? {}) as Record<string, unknown>, async () => {
       if (args?.with) {
         const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
@@ -4361,9 +4452,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // pick.where / pick.orderBy paths). To-one relation orderBy carries the
       // target's global filter once per ordered column.
       if (this.isRelationOrderByValue(dir)) {
-        const relDef = ownLookup(this.tableMeta.relations, key);
+        // Mirrors the build path's resolution, so a cache HIT binds params for
+        // the same relation the cached SQL was built from.
+        const resolvedRel = resolveRelation(this.tableMeta.relations, key);
+        const relDef = resolvedRel?.def;
         if (relDef && isRelationPickOrderBy(dir)) {
-          this.collectRelationPickOrderParams(key, relDef, dir, params);
+          this.collectRelationPickOrderParams(resolvedRel.name, relDef, dir, params);
         } else if (relDef && (relDef.type === 'hasMany' || relDef.type === 'manyToMany')) {
           this.collectRelationCountParams(relDef, params);
         } else if (relDef) {

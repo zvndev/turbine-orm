@@ -349,7 +349,7 @@ Every row must also name the same fields; see [uniform rows](#createmany) below.
 
 ### Field names and column names resolve identically
 
-A key in `data`, `where`, `orderBy`, or `select` may be spelled as the **field** name (`lastRun`) or as the underlying **column** name (`last_run`). Both spellings compile to the same SQL and go through the same value processing, including the UTC rewrite on zone-less temporal columns:
+A key in `data`, `where`, `orderBy`, `select`, `distinct`, `cursor`, `groupBy`'s `by`, or an aggregate target may be spelled as the **field** name (`lastRun`) or as the underlying **column** name (`last_run`). Both spellings compile to the same SQL and go through the same value processing, including the UTC rewrite on zone-less temporal columns:
 
 ```ts
 // Identical statement, and identical bound value.
@@ -357,7 +357,25 @@ await db.jobs.update({ where: { id: 1 }, data: { lastRun: new Date() } });
 await db.jobs.update({ where: { id: 1 }, data: { last_run: new Date() } });
 ```
 
+A name that resolves to no column is still refused with `ValidationError` (TURBINE_E003), so a typo stays a typo.
+
 Upgrade note: before v0.53 the column spelling skipped the value pass, so a `Date` written through a `snake_case` key to a zone-less `date` / `timestamp` / `time` column stored local calendar fields; check columns written that way before upgrading.
+
+Second upgrade note: **before v0.72 this page overstated the rule.** `orderBy`, `groupBy`'s `by`, and the `_min` / `_max` / `_sum` / `_avg` targets tested only the field spelling and rejected the column spelling with E003, while `where`, `select`, `omit`, `distinct` and `cursor` accepted it. v0.72 routes every one of those through the same resolver. It also fixed four cases where the mismatch produced a wrong answer rather than an error, the most serious being a `cursor` whose field used the column spelling against an `orderBy` using the field spelling: the seek direction was resolved as ascending regardless, so a descending page silently returned the wrong rows. See the [changelog](/changelog).
+
+### Relation names resolve the same way
+
+A relation may be named by its **declared** name (`blogPosts`) or by the **table** spelling of that name (`blog_posts`), in `with`, `_count`, relation filters (`some` / `every` / `none` / `is` / `isNot`), and `orderBy`, at any nesting depth:
+
+```ts
+// Identical statement, identical rows.
+await db.authors.findMany({ with: { blogPosts: true } });
+await db.authors.findMany({ with: { blog_posts: true } });
+```
+
+The declared name always wins, so a schema that literally declares `blog_posts` keeps it. Relation keys in the returned rows use the declared name whichever spelling you queried with, matching how a column selected as `last_run` comes back as `lastRun`. A name that matches no relation is still refused (`RelationError`, TURBINE_E005).
+
+This landed in v0.72. Before it, reading a table name off the schema and using it as a relation name failed, even though the error text already named the relation you meant.
 
 ## createMany
 

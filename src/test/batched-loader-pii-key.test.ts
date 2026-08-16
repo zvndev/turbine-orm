@@ -117,11 +117,14 @@ describe('includeKeysForBatching + defaultProjectionFields', () => {
       { name: 'title', field: 'title', pgType: 'text' },
     ]);
     assert.equal(defaultProjectionFields(plain, undefined), undefined);
-    assert.deepEqual(includeKeysForBatching(undefined, undefined, ['id'], defaultProjectionFields(plain, undefined)), {
-      select: undefined,
-      omit: undefined,
-      strip: [],
-    });
+    assert.deepEqual(
+      includeKeysForBatching(plain, undefined, undefined, ['id'], defaultProjectionFields(plain, undefined)),
+      {
+        select: undefined,
+        omit: undefined,
+        strip: [],
+      },
+    );
   });
 
   it('includePii disables the whole mechanism (nothing is hidden)', () => {
@@ -129,14 +132,20 @@ describe('includeKeysForBatching + defaultProjectionFields', () => {
   });
 
   it('a hidden key becomes an explicit select of the visible columns plus that key', () => {
-    const proj = includeKeysForBatching(undefined, undefined, ['email'], defaultProjectionFields(meta, undefined));
+    const proj = includeKeysForBatching(
+      meta,
+      undefined,
+      undefined,
+      ['email'],
+      defaultProjectionFields(meta, undefined),
+    );
     assert.deepEqual(proj.select, { id: true, name: true, email: true });
     assert.equal(proj.omit, undefined);
     assert.deepEqual(proj.strip, ['email']);
   });
 
   it('a visible key still takes the fast path even on a tagged table', () => {
-    const proj = includeKeysForBatching(undefined, undefined, ['id'], defaultProjectionFields(meta, undefined));
+    const proj = includeKeysForBatching(meta, undefined, undefined, ['id'], defaultProjectionFields(meta, undefined));
     assert.equal(proj.select, undefined);
     assert.deepEqual(proj.strip, []);
   });

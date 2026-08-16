@@ -53,6 +53,7 @@ import {
   markInternalCombinator,
   OPERATOR_KEYS,
   ownLookup,
+  resolveColumnName,
   type SqlCacheEntry,
 } from './utils.js';
 import {
@@ -1085,8 +1086,8 @@ export function buildScopedScalarClause(
   clauses: string[],
 ): void {
   const meta = scope.meta;
-  const col = ownLookup(meta.columnMap, field) ?? camelToSnake(field);
-  if (!meta.allColumns.includes(col)) throw scope.unknownColumn(field);
+  const col = resolveColumnName(meta, field);
+  if (col === undefined) throw scope.unknownColumn(field);
   const qCol = `${scope.qualifier}${qi.q(col)}`;
 
   if (value === null) {
@@ -1186,7 +1187,11 @@ export function collectScopedScalarParams(
 ): void {
   if (value === null) return;
   const meta = scope.meta;
-  const col = ownLookup(meta.columnMap, field) ?? camelToSnake(field);
+  // Unvalidated on purpose: this is the cache-HIT mirror, and a key that does
+  // not resolve could never have produced the entry being served. It still
+  // goes through the one authority, so the column it binds against cannot
+  // differ from the one the build path emitted.
+  const col = resolveColumnName(meta, field) ?? camelToSnake(field);
 
   if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
     const colType = pgTypeForColumn(qi, meta, col);
@@ -1594,8 +1599,8 @@ export function resolveColumnRef(
         `for lower(a) = lower(b).`,
     );
   }
-  const col = ownLookup(ctx.meta.columnMap, ref.col) ?? camelToSnake(ref.col);
-  if (!ctx.meta.allColumns.includes(col)) {
+  const col = resolveColumnName(ctx.meta, ref.col);
+  if (col === undefined) {
     throw new ValidationError(
       `[turbine] Unknown field "${ref.col}" referenced by { col } in where on table "${ctx.table}". ` +
         `Known fields: ${Object.keys(ctx.meta.columnMap).join(', ') || '(none)'}.`,

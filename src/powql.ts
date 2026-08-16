@@ -63,6 +63,7 @@ import { assertAggregatePiiOptIn } from './query/aggregates.js';
 import { expandCompoundUniqueWhere } from './query/compound-unique.js';
 import { isJsonFilter, isRelationPickOrderBy, orderByEntries } from './query/filters.js';
 import type { MiddlewareFn, QueryEvent, QueryInterfaceOptions } from './query/index.js';
+import { normalizeWithClause } from './query/relation-names.js';
 import type {
   AggregateArgs,
   AggregateResult,
@@ -85,6 +86,7 @@ import type {
   UpdateManyArgs,
   UpsertArgs,
   WhereClause,
+  WithClause,
 } from './query/types.js';
 // The privilege sentinel and its resolver: `includePii` / `allowFullTableScan`
 // are unlocked ONLY by the UNSAFE symbol, on this engine exactly as on the SQL
@@ -94,6 +96,8 @@ import {
   escapeLike,
   ownLookup,
   relationInProjectionMessage,
+  resolveColumnName,
+  resolveRelationDef,
   selectNamesNothingMessage,
   selectOmitExclusiveMessage,
 } from './query/utils.js';
@@ -344,9 +348,20 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   // Column / value helpers
   // -------------------------------------------------------------------------
 
-  /** Resolve a camelCase field name (or raw snake) to its column metadata. */
+  /**
+   * Resolve a camelCase field name (or raw snake) to its column metadata.
+   *
+   * THE single key→column decision on this engine: every PowQL surface
+   * reaches a column through here, which is why PowDB never grew the
+   * per-argument asymmetry the SQL builders did. It resolves through the
+   * shared {@link resolveColumnName} so both engines answer alike; the direct
+   * name/field match stays as a fallback, since a PowDB schema may carry names
+   * outside the snake_case↔camelCase round trip and narrowing that would be a
+   * silent break rather than a fix.
+   */
   private column(field: string) {
-    const snake = this.meta.columnMap[field] ?? field;
+    const resolved = resolveColumnName(this.meta, field);
+    const snake = resolved ?? ownLookup(this.meta.columnMap, field) ?? field;
     const col = this.meta.columns.find((c) => c.name === snake || c.field === field);
     if (!col) {
       throw new ValidationError(
@@ -356,6 +371,40 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       );
     }
     return col;
+  }
+
+  /**
+   * {@link lookupGroupKey} for the `${aggKey}:${field}` composite the aggregate
+   * ordering registry is keyed by: only the FIELD half needs canonicalizing.
+   */
+  private aggOrderExpr(registry: Map<string, string>, aggKey: string, field: string): string | undefined {
+    try {
+      return registry.get(`${aggKey}:${this.column(field).field}`);
+    } catch {
+      return undefined; // not a column: the caller's own E003 is the right error
+    }
+  }
+
+  /**
+   * Read a caller-supplied groupBy result key out of a registry keyed by the
+   * canonical FIELD name.
+   *
+   * `by`, `orderBy` and `having` are three arguments of one call, each free to
+   * spell a column either way, so `by`'s choice must not decide what the others
+   * may name. Try the key as written (which is what carries a JSON group-key
+   * ALIAS, not a column), then its canonical field. Mirrors `lookupGroupKey` in
+   * query/aggregates.ts.
+   */
+  private lookupGroupKey<V>(registry: Map<string, V>, key: string): V | undefined {
+    const direct = registry.get(key);
+    if (direct !== undefined) return direct;
+    let field: string;
+    try {
+      field = this.column(key).field;
+    } catch {
+      return undefined; // not a column: the caller's own E003 below is the right error
+    }
+    return registry.get(field);
   }
 
   /**
@@ -477,6 +526,22 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * which is precisely the "reports a guarantee that was never made" failure the
    * option's refusal exists to prevent.
    */
+  /**
+   * `args` with every `with` relation key replaced by the relation's DECLARED
+   * spelling, so PowDB accepts a snake_case relation name exactly as the SQL
+   * engines do. Returns `args` by reference when nothing needed rewriting.
+   *
+   * PowqlInterface is a parallel implementation rather than a subclass, so
+   * nothing makes this happen here automatically: a rule adopted only on the
+   * SQL side becomes an engine that disagrees about which queries are valid,
+   * which is the divergence class the projection resolver already cost.
+   */
+  private withDeclaredRelationNames<A extends { with?: unknown }>(args: A): A {
+    if (!args?.with) return args;
+    const normalized = normalizeWithClause(this.schema, this.table, args.with as WithClause);
+    return normalized === args.with ? args : ({ ...args, with: normalized } as A);
+  }
+
   private assertNoForceCustomPlan(args: { forceCustomPlan?: boolean } | undefined): void {
     if (args?.forceCustomPlan !== true) return;
     throw new UnsupportedFeatureError(
@@ -963,9 +1028,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         );
       } else if (key === 'NOT') {
         scalar[key] = await this.resolveRelationFilters(value as WhereClause<T>, timeout);
-      } else if (this.meta.relations[key]) {
+      } else if (resolveRelationDef(this.meta.relations, key)) {
         relConds.push(
-          await this.resolveRelationCondition(this.meta.relations[key]!, value as Record<string, unknown>, timeout),
+          await this.resolveRelationCondition(
+            resolveRelationDef(this.meta.relations, key)!,
+            value as Record<string, unknown>,
+            timeout,
+          ),
         );
       } else {
         scalar[key] = value;
@@ -1117,7 +1186,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * for a misspelling that is not there. Same message as the SQL engines.
    */
   private projectionColumn(field: string, clause: 'select' | 'omit'): string {
-    if (ownLookup(this.meta.relations, field)) {
+    if (resolveRelationDef(this.meta.relations, field)) {
       throw new ValidationError(relationInProjectionMessage(this.table, field, clause));
     }
     return this.column(field).name;
@@ -1519,6 +1588,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async findMany(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T[]> {
     this.assertNoForceCustomPlan(args);
+    args = this.withDeclaredRelationNames(args);
     return this.withMiddleware('findMany', args as unknown as Record<string, unknown>, async () => {
       // `limit: 0` means "no rows" (SQL `LIMIT 0`), and answering it client-side
       // is correct on every engine version: PowDB's projection fast path returned
@@ -1631,6 +1701,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const nest = nestedPlans.length > 0 || linkPlans.length > 0;
     const alias = nest ? 't0' : undefined;
     const where = this.buildWhere(resolvedWhere, params, alias);
+    // PowQL's `distinct` is row-wide, so these names never reach the emitted
+    // statement. They are still caller-supplied names, and a name resolves or
+    // throws: reading the array for its LENGTH alone let `distinct: ['nope']`
+    // succeed here while every SQL engine refuses it. Validation only.
+    for (const key of args.distinct ?? []) this.column(key as string);
     const distinct = args.distinct?.length ? ' distinct' : '';
     const filter = where ? ` filter ${where}` : '';
     const order = this.buildOrder(args.orderBy, params, alias);
@@ -1707,6 +1782,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async findUnique(args: FindUniqueArgs<T>): Promise<T | null> {
     this.assertNoForceCustomPlan(args);
+    args = this.withDeclaredRelationNames(args);
     // Prisma compound-unique selector → column conjunction (engine parity with
     // the SQL findUnique family; pure metadata, so this is a one-line adoption).
     if (args.where) {
@@ -1738,6 +1814,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   async findFirst(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T | null> {
+    args = this.withDeclaredRelationNames(args);
     this.assertNoForceCustomPlan(args);
     return this.withMiddleware('findFirst', args as unknown as Record<string, unknown>, async () => {
       const { rows, native, nestedPlans, linkPlans, residualWith, forcedPk } = await this.runFind(
@@ -2768,7 +2845,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const out: { col: ColumnMetadata; value: unknown }[] = [];
     for (const [field, value] of Object.entries(data)) {
       if (value === undefined) continue;
-      if (this.meta.relations[field]) {
+      if (resolveRelationDef(this.meta.relations, field)) {
         throw new UnsupportedFeatureError(
           'nested writes',
           'PowDB',
@@ -2791,8 +2868,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     for (const pk of this.meta.primaryKey) {
       const field = this.meta.reverseColumnMap[pk] ?? pk;
       const col = this.meta.columns.find((c) => c.name === pk);
+      // "Supplied" means under EITHER spelling: `create` resolves both, so
+      // testing the camelCase field alone made `{ user_id: 'x' }` look absent,
+      // generated a UUID under `userId`, and wrote the column twice.
       if (
         out[field] == null &&
+        (field === pk || out[pk] == null) &&
         col?.hasDefault &&
         !col.isGenerated &&
         col.tsType.replace(/\s*\|\s*null$/, '').trim() === 'string'
@@ -2959,7 +3040,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const parts: string[] = [];
     for (const [field, value] of Object.entries(data)) {
       if (value === undefined) continue;
-      if (this.meta.relations[field]) {
+      if (resolveRelationDef(this.meta.relations, field)) {
         throw new UnsupportedFeatureError(
           'nested writes',
           'PowDB',
@@ -3141,7 +3222,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         'upsert',
       );
       const pkField = this.meta.reverseColumnMap[pkCol] ?? pkCol;
-      const row = await this.reselectByPk(createData[pkField], args.timeout);
+      // Either spelling, as `upsertComposite` already does below: reading the
+      // camelCase field alone reselected `undefined` for a snake-spelled PK and
+      // reported a write that had SUCCEEDED as a NotFoundError.
+      const row = await this.reselectByPk(createData[pkField] ?? createData[pkCol], args.timeout);
       if (!row) throw new NotFoundError({ table: this.table, where: createData });
       return row;
     });
@@ -3344,12 +3428,17 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
             'groupBy `by` key',
             resolveUnsafeFlag(args.includePii, 'includePii'),
           );
-          claim(entry, `column "${col.name}"`);
-          if (col.name !== entry) claim(col.name, `column "${col.name}"`);
+          // Keyed by the canonical FIELD, never by whichever of the column's
+          // two legal spellings the caller wrote (`column` accepts both), so
+          // neither the result shape nor the keys `orderBy` accepts depends on
+          // that choice; `lookupGroupKey` reconciles the other spelling. Same
+          // rule and same result shape as the SQL groupBy (query/aggregates.ts).
+          claim(col.field, `column "${col.name}"`);
+          if (col.name !== col.field) claim(col.name, `column "${col.name}"`);
           groupExprs.push(this.colRefName(col.name));
           proj.push(this.colRefName(col.name));
-          byOrderExprs.set(entry, this.colRefName(col.name));
-          byReaders.push({ kind: 'plain', resultKey: entry, rowKey: col.name, col });
+          byOrderExprs.set(col.field, this.colRefName(col.name));
+          byReaders.push({ kind: 'plain', resultKey: col.field, rowKey: col.name, col });
         } else {
           const col = this.column(entry.field);
           if (!isJsonColumn(col)) {
@@ -3426,9 +3515,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
             claim(`${fn}_${col.name}`, `${fn} of column "${col.name}"`);
             const inner = this.colRefName(col.name);
             proj.push(`${alias}: ${powfn}(${inner})`);
-            aggReaders.push({ alias, outKey: `${fn}:${key}`, numeric: true });
-            aggOrderExprs.set(`${fn}:${key}`, `.${alias}`);
-            aggInner.set(key, inner);
+            // Canonical field, so the result bucket and the keys `orderBy` /
+            // `having` accept are the same whichever spelling was requested.
+            aggReaders.push({ alias, outKey: `${fn}:${col.field}`, numeric: true });
+            aggOrderExprs.set(`${fn}:${col.field}`, `.${alias}`);
+            aggInner.set(col.field, inner);
           } else {
             const col = this.column(target.field);
             if (!isJsonColumn(col)) {
@@ -3576,7 +3667,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
                 `Supported: ${[...POWQL_HAVING_AGG_FNS.keys()].join(', ')}.`,
             );
           }
-          const inner = aggInner.get(key) ?? this.ref(key);
+          const inner = this.lookupGroupKey(aggInner, key) ?? this.ref(key);
           conds.push(cmp(`${fn}(${inner})`, filter));
         }
       }
@@ -3629,7 +3720,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         }
         for (const [field, dirSpec] of Object.entries(value as Record<string, unknown>)) {
           if (dirSpec === undefined) continue;
-          const expr = aggOrderExprs.get(`${key}:${field}`);
+          // `field` is the caller's spelling of the aggregate's target column;
+          // the registry is keyed by the canonical one.
+          const expr = aggOrderExprs.get(`${key}:${field}`) ?? this.aggOrderExpr(aggOrderExprs, key, field);
           if (!expr) {
             throw new ValidationError(
               `[turbine] Cannot order groupBy by "${key}.${field}" on table "${this.table}": ` +
@@ -3640,7 +3733,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         }
         continue;
       }
-      const expr = byOrderExprs.get(key);
+      const expr = this.lookupGroupKey(byOrderExprs, key);
       if (!expr) {
         throw new ValidationError(
           `[turbine] Unknown field "${key}" in groupBy orderBy on table "${this.table}". Orderable keys: ${validKeys()}.`,

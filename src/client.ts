@@ -23,6 +23,7 @@
  */
 
 import pg from 'pg';
+import { mergeConnectionStringOptions } from './connection-url.js';
 import { type Dialect, postgresDialect } from './dialect.js';
 import {
   ConnectionError,
@@ -1797,7 +1798,7 @@ export class TurbineClient {
     // cannot be a bind parameter.
     const setting = `-c plan_cache_mode=${mode}`;
     const merged = poolConfig.connectionString
-      ? TurbineClient.mergeConnectionStringOptions(poolConfig.connectionString, setting)
+      ? mergeConnectionStringOptions(poolConfig.connectionString, setting)
       : null;
     if (merged) return { ...poolConfig, connectionString: merged };
     // pg reads `config.options` when truthy and `process.env.PGOPTIONS`
@@ -1805,33 +1806,6 @@ export class TurbineClient {
     // rather than add to it.
     const existing = poolConfig.options || (typeof process !== 'undefined' ? process.env?.PGOPTIONS : undefined);
     return { ...poolConfig, options: existing ? `${existing} ${setting}` : setting };
-  }
-
-  /**
-   * `connectionString` with `setting` appended to its existing `options` query
-   * parameter, or `null` when it carries no `options` (in which case the caller
-   * should use the `options` pool field, which is not overridden).
-   *
-   * Only the query string is rewritten, never the userinfo or host, so a
-   * percent-encoded password cannot be mangled by a round trip through `URL`.
-   * The split is on the first `?`, which is also where pg's own parser puts the
-   * query-string boundary: a connection string with an unencoded `?` inside the
-   * password is not parseable by pg either, so there is no shape this handles
-   * differently from the driver.
-   *
-   * A twin of this lives in `src/connection-url.ts`, which `turbine doctor`
-   * uses for `statement_timeout`. Unifying them is the obvious refactor and it
-   * is deliberately NOT done; the reason (a c8 merge artifact that costs almost
-   * all of the coverage gate's headroom) is written up over there.
-   */
-  private static mergeConnectionStringOptions(connectionString: string, setting: string): string | null {
-    const q = connectionString.indexOf('?');
-    if (q === -1) return null;
-    const params = new URLSearchParams(connectionString.slice(q + 1));
-    const existing = params.get('options');
-    if (existing === null) return null;
-    params.set('options', `${existing} ${setting}`);
-    return connectionString.slice(0, q + 1) + params.toString();
   }
 
   /**

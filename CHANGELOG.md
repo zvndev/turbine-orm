@@ -1,5 +1,129 @@
 # Changelog
 
+## 0.72.0 (2026-08-16)
+
+A correctness release about one rule: **a column and a relation each have two
+legal spellings, and which argument the name appears in must not change the
+answer.**
+
+Turbine has always accepted the snake_case column name in `where`, `select`,
+`omit`, `distinct` and `cursor`, because `camelToSnake` is idempotent on an
+already-snake string. It rejected the same name in `orderBy`, `groupBy`'s `by`,
+and `_min` / `_max` / `_sum` / `_avg`, because those sites tested
+`key in meta.columnMap`, which knows only the field spelling. Same column, same
+table, same query: five positions accepted it and three refused it.
+
+That asymmetry was not only an error message. Chasing the rule to every site it
+should already have reached turned up **four wrong answers**, listed below. The
+worst returned the wrong page of a cursor-paginated query with no error at all.
+
+The relation half is the same rule one level up, and it was found by measurement
+rather than review. A relation carries one declared name (`blogPosts`) while the
+DDL anyone reads carries only the table name (`blog_posts`), so writing back what
+the schema shows failed, on names the error text was already computing correctly
+("Did you mean ...?"). A system that can name the intended relation can accept
+it.
+
+Both halves are widenings: every name that resolved before resolves to the same
+thing, an exact declared name always wins, and an unknown name is still refused.
+
+### Fixed
+
+- **A cursor whose field was spelled the other way silently returned the wrong
+  page.** `cursor: { created_at: … }` against `orderBy: { createdAt: 'desc' }`
+  failed to match up the two spellings, defaulted to ascending, and emitted
+  `"created_at" > $n` under `ORDER BY "created_at" DESC`. No error, plausible
+  rows, wrong ones. Cursor fields and orderBy entries are now matched by the
+  column they resolve to.
+
+- **The batched relation loader deleted a column the caller had explicitly
+  selected.** With `select: { user_id: true }` and a `userId` correlation key,
+  the key looked unprojected, so it was force-added *and* marked stitch-only,
+  and the strip pass removed the very column that was asked for. The mirror case
+  (`omit: { user_id: true }`) failed to un-omit and raised an internal
+  "bug in turbine" error on a legal query.
+
+- **`groupBy` returned `undefined` for every group** when a `by` key used the
+  column spelling. Rows are read through the field-named parser, so a result
+  bucket keyed by the caller's spelling never matched. Group keys are now
+  canonical, matching how `_count` / `_sum` / `_min` already mapped back.
+
+- **A compound-unique selector accepted its own name and then refused its
+  members.** The selector is registered under both spellings, so
+  `{ org_id_user_id: { org_id, user_id } }` matched the selector and was
+  rejected for its contents. Members are matched by resolved column now, and two
+  spellings of one member are refused rather than silently picking one.
+
+- **`orderBy` spelled the column way silently disabled the batched loader's
+  per-parent `LIMIT` pushdown**, so it fetched every matching child row and
+  sliced client-side: same rows, unbounded bytes over the wire.
+
+- **A unique column spelled the column way drew a spurious unlimited-read
+  warning**, because the "is this query pinned to one row?" check did not count
+  it as pinning.
+
+- **Relation names were rejected in their snake_case spelling** in `with`
+  (E005), relation filters (E003), `orderBy` (E005), `_count`, and nested `with`
+  at any depth. Accepted now on the SQL engines and on PowDB alike.
+
+### Behaviour changes
+
+Two of the fixes above change results for code that ran without error before, so
+they are called out separately:
+
+- A cursor-paginated query mixing the two spellings **returned the wrong page**
+  and now returns the right one.
+- `select` / `omit` naming a correlation key by its column spelling under
+  `relationLoadStrategy: 'batched'` **dropped that column from the rows** and now
+  returns it.
+
+Both are Stable-surface behaviour changes, so per [STABILITY.md](./STABILITY.md)
+the 1.0 Stable-surface freeze clock does not start with this release.
+
+### Performance
+
+**Streaming was Turbine's one remaining loss to Drizzle. It is now a win.**
+
+The zone-less and offset temporal read parsers gained a fast path for the
+canonical ISO wire shape, scanning it directly instead of running a regex and
+assembling through `setUTCFullYear`. Anything that is not exactly that shape,
+a five-digit year, a two-digit year, ` BC`, `infinity`, a colon-less offset, is
+**declined** and delegated to the parser it replaced, so no value changes
+meaning. That agreement is a differential test against the general parser as
+running code, not a transcription of it.
+
+Measured in one process on one build with the arms rotating inside every round,
+because the change lives entirely in `pg.types` and can be swapped between two
+calls. A negative control (the same profile measured twice under two names)
+landed 1.9% apart, which is what makes the paired deltas reportable. Full
+method and controls in `benchmarks/RESULTS-0.72.0.md`.
+
+| 50K-row drain | before | after |
+|---|---|---|
+| `findManyStream` (yields rows) | 52.44 ms | **37.06 ms** (+28.6%) |
+| `findManyStreamBatches` (yields `T[]`) | 47.43 ms | **31.65 ms** (+34.9%) |
+| Drizzle 0.45.2, same rotation | | 42.09 ms |
+
+Absolute numbers are not comparable to `RESULTS-0.71.0.md`, which is why the
+Drizzle arm is re-measured here rather than read off that file. No other
+scenario was re-run, so the rest of the 0.71.0 figures stand as published,
+caveats included.
+
+### Internal
+
+- **The coverage gate was measuring an artifact, and had been for a long time.**
+  c8 merges every test process's V8 coverage into one blob before converting to
+  istanbul, and that merge is not monotonic: adding a process's coverage can
+  lower the merged result. The proof is that a 448-test *subset* of this suite
+  reported `query/relations.ts` at 91.88% while the full 5,819-test superset
+  reported 41.78%, and a superset cannot cover less than its subset. Merging at
+  the istanbul level instead, where the merge is additive, real coverage is
+  **96.11% lines / 91.70% branches / 81.88% functions**, against floors that had
+  been set at 75/85/59. Floors re-baselined to 93/89/78 with the measurement and
+  the reason recorded in `.c8rc.json`. Every past note blaming
+  `relations.ts` / `builder.ts` / `where.ts` for low coverage was the artifact
+  talking; they read 95.84 / 97.29 / 98.37.
+
 ## 0.71.0 (2026-08-15)
 
 A performance release, and the honest version of that sentence is that the

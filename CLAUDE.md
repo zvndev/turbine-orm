@@ -257,6 +257,42 @@ src/
                       `where: { orgId_userId: {...} }` into flat column equality BEFORE
                       cache fingerprinting. Consumed by the findUnique family, nested-write
                       unique wheres (connect/connectOrCreate/etc.), and PowqlInterface.
+    relation-names.ts, THE relation-name rule (0.72), the twin of
+                      `resolveColumnName` one level up. A relation carries one DECLARED
+                      name (`blogPosts`) while the DDL anyone reads carries only the TABLE
+                      name (`blog_posts`), so writing back what the schema shows failed:
+                      E005 in `with`, E003 in a relation filter, E005 in `orderBy`, on
+                      names the error text was ALREADY computing correctly ("Did you mean
+                      ...?"). `resolveRelation` (query/utils.ts) accepts the declared name
+                      first, else `snakeToCamel(key)` ONLY when that names a real declared
+                      relation, so it is not a guess and an exact declared name always
+                      wins. THE KEY DESIGN POINT is where it is applied: the `with` tree is
+                      walked by SIX independent functions that each decide for themselves
+                      which keys are relations (withFingerprint, collectWithParams,
+                      buildRelationShapes, planFlattenWith, buildSelectWithRelations, the
+                      batched loader, plus the positional row parser), and the fingerprint
+                      IS the SQL-cache key, so a walker resolving differently from the
+                      builder would serve one query's template to another SILENTLY. So
+                      `normalizeWithClause` rewrites the whole tree ONCE, before any walker
+                      runs (the `compound-unique` precedent, and the same "before
+                      fingerprinting" slot `applyStableRelationOrder` uses), returning the
+                      input BY REFERENCE when nothing changed so the common path allocates
+                      nothing. An unresolvable key is left VERBATIM so the builder still
+                      raises E005 by name, in context. Argument positions where a relation
+                      key sits interleaved with column keys cannot be normalized that way
+                      and resolve at their branch point instead, each one a documented
+                      single authority: `where-compile.ts`'s walkWhere (the one branch
+                      authority all three where paths consume), the orderBy relation
+                      descents, the simple-where fast path, and the orderBy fingerprint +
+                      its cache-hit param mirror. PowDB adopts the same rule explicitly
+                      (`PowqlInterface.withDeclaredRelationNames`), because it is a
+                      parallel implementation and a rule adopted only on the SQL side is an
+                      engine that disagrees about which queries are VALID. Found by the
+                      agent eval, not by review: after the column fix landed it was 65% of
+                      remaining model failures. Regression net:
+                      src/test/relation-spelling-symmetry.test.ts, same four-questions
+                      shape as its column sibling (both spellings accepted, byte-identical
+                      SQL, unknown still refused), mutation-tested at 30 of 67 failing.
     warn-registry.ts, Process-wide once-only dev-warn registry (0.41) keyed on a
                       globalThis Symbol.for('turbine.warnOnce.registry') so multi-instance
                       and dual-package (ESM+CJS) setups never double-warn; WARN_ONCE_CAP=500.

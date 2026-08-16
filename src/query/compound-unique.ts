@@ -42,7 +42,7 @@
 import { ValidationError } from '../errors.js';
 import type { TableMetadata } from '../schema.js';
 import { isArrayFilter, isJsonFilter, isVectorFilter, isWhereOperator } from './filters.js';
-import { ownLookup } from './utils.js';
+import { ownLookup, resolveColumnName, resolveRelationDef } from './utils.js';
 
 const syntheticKeyCache = new WeakMap<TableMetadata, Map<string, string[]>>();
 
@@ -111,7 +111,9 @@ function isRealKey(meta: TableMetadata, key: string): boolean {
     ownLookup(meta.columnMap, key) !== undefined ||
     ownLookup(meta.reverseColumnMap, key) !== undefined ||
     meta.allColumns.includes(key) ||
-    ownLookup(meta.relations, key) !== undefined
+    // Resolved, so a relation named the snake_case way still reads as a real
+    // key here and is not mistaken for a compound-unique selector.
+    resolveRelationDef(meta.relations, key) !== undefined
   );
 }
 
@@ -161,8 +163,30 @@ export function expandCompoundUniqueWhere(
 
     const selector = value;
     const provided = Object.keys(selector).filter((k) => selector[k] !== undefined);
-    const expected = new Set(fields);
-    const exact = provided.length === expected.size && provided.every((k) => expected.has(k));
+    // Matched by the COLUMN each member name resolves to, not by the literal
+    // key. The selector's own NAME is registered under both spellings (see
+    // `register` above), so `{ org_id_user_id: { org_id, user_id } }` found the
+    // selector and was then refused for its members. Insertion order is
+    // `fields` order, keeping the expansion (and the SQL) stable.
+    const expected = new Map<string, string>();
+    for (const f of fields) expected.set(resolveColumnName(meta, f) ?? f, f);
+    /** column → the key the caller actually wrote for it. */
+    const providedByColumn = new Map<string, string>();
+    let ambiguous = false;
+    for (const k of provided) {
+      const column = resolveColumnName(meta, k);
+      // Unresolvable, or two spellings of one column: fall through to the
+      // same refusal an incomplete member set gets.
+      if (column === undefined || providedByColumn.has(column)) {
+        ambiguous = true;
+        break;
+      }
+      providedByColumn.set(column, k);
+    }
+    const exact =
+      !ambiguous &&
+      providedByColumn.size === expected.size &&
+      [...providedByColumn.keys()].every((c) => expected.has(c));
     if (!exact) {
       throw new ValidationError(
         `[turbine] Compound unique selector "${key}" on table "${meta.name}" must supply exactly ` +
@@ -172,8 +196,8 @@ export function expandCompoundUniqueWhere(
 
     result ??= { ...where };
     delete result[key];
-    for (const field of fields) {
-      const v = selector[field];
+    for (const [column, field] of expected) {
+      const v = selector[providedByColumn.get(column) as string];
       if (Object.hasOwn(result, field)) {
         // A member field is ALSO given directly in the outer where: wrap the
         // expansion in AND so neither value is clobbered.

@@ -17,7 +17,7 @@ import type { JsonWireRule } from '../dialect.js';
 import { CircularRelationError, RelationError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { missingIndexForRelation } from '../index-advisor.js';
 import type { RelationDef, TableMetadata } from '../schema.js';
-import { camelToSnake, normalizeKeyColumns, snakeToCamel } from '../schema.js';
+import { normalizeKeyColumns, snakeToCamel } from '../schema.js';
 import { resolveCountRelations } from './batched-loader.js';
 import {
   isJsonPathOrderBy,
@@ -45,6 +45,8 @@ import {
   ownLookup,
   relationInProjectionMessage,
   resolveColumnName,
+  resolveRelation,
+  resolveRelationDef,
   selectNamesNothingMessage,
   selectOmitExclusiveMessage,
   unknownFieldMessage,
@@ -87,7 +89,11 @@ function projectionColumn(table: string, meta: TableMetadata, field: string, cla
   // A relation named in a projection is a habit, not a typo, so it gets its own
   // message pointing at `with`. Checked BEFORE the generic throw because the
   // generic one degrades into "Did you mean <exactly what you typed>?".
-  if (ownLookup(meta.relations, field)) throw new ValidationError(relationInProjectionMessage(table, field, clause));
+  // Resolved, so `select: { ripening_checks: true }` gets the "that is a
+  // relation, use `with`" message rather than degrading to an unknown-field
+  // suggestion that names the relation back at the caller.
+  if (resolveRelationDef(meta.relations, field))
+    throw new ValidationError(relationInProjectionMessage(table, field, clause));
   throw new ValidationError(unknownFieldMessage(table, field, meta));
 }
 
@@ -570,12 +576,7 @@ export function buildOrderBy(
     .map(([key, value]) => {
       // Vector KNN ordering: { distance: { to, metric, direction? } }
       if (isVectorOrderBy(value)) {
-        if (meta && !(key in meta.columnMap)) {
-          throw new ValidationError(
-            `[turbine] Unknown field "${key}" in orderBy on table "${qi.table}". ` +
-              `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
-          );
-        }
+        if (meta) resolveOrderByColumn(qi, qi.table, meta, key);
         if (!params) {
           throw new ValidationError(
             `[turbine] Vector distance ordering on "${key}" is only supported in a top-level findMany orderBy.`,
@@ -611,12 +612,12 @@ export function buildOrderBy(
       }
 
       // Scalar column ordering, a plain direction or an OrderBySpec (nulls).
-      if (meta && !(key in meta.columnMap)) {
-        throw new ValidationError(
-          `[turbine] Unknown field "${key}" in orderBy on table "${qi.table}". ` +
-            `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
-        );
-      }
+      // Through `resolveOrderByColumn`, which is the same resolve-or-E003 the
+      // nested orderBy paths below already used and emits the same message
+      // this used to inline. It used to test `key in meta.columnMap`, which
+      // knows only the FIELD spelling, and so rejected the snake_case COLUMN
+      // name that `where` / `select` / `distinct` accept on the same table.
+      if (meta) resolveOrderByColumn(qi, qi.table, meta, key);
       // Refuse a direction that is neither asc nor desc. normalizeOrderBy is
       // `=== 'desc' ? DESC : ASC`, so without this every typo sorted ASCENDING
       // and returned a correct-looking page in the reverse order.
@@ -662,16 +663,21 @@ export function nullsSuffix(qi: BuilderCtx, nulls: 'first' | 'last' | undefined)
 }
 
 /**
- * Resolve an orderBy key to its snake_case column via the table's columnMap
- * (camelToSnake fallback), throwing the SAME unknown-field E003 the top-level
- * where path uses. Shared by top-level JSON-path ordering and every nested
- * relation orderBy path so nested orderBy accepts exactly what top-level
- * accepts (the 0.30.x bug: nested orderBy skipped the columnMap and rejected
- * camelCase-named DB columns like "sortOrder").
+ * Resolve an orderBy key to its snake_case column via {@link resolveColumnName},
+ * throwing the SAME unknown-field E003 the top-level where path uses. Shared by
+ * top-level JSON-path ordering and every nested relation orderBy path so nested
+ * orderBy accepts exactly what top-level accepts (the 0.30.x bug: nested orderBy
+ * skipped the columnMap and rejected camelCase-named DB columns like
+ * "sortOrder").
+ *
+ * The rule is REACHED here, never restated: this used to inline
+ * `columnMap ?? camelToSnake` + an `allColumns` check, which agreed with
+ * `resolveColumnName` while the top-level scalar path a few lines up disagreed
+ * with both.
  */
 export function resolveOrderByColumn(_qi: BuilderCtx, table: string, meta: TableMetadata, key: string): string {
-  const col = ownLookup(meta.columnMap, key) ?? camelToSnake(key);
-  if (!meta.allColumns.includes(col)) {
+  const col = resolveColumnName(meta, key);
+  if (col === undefined) {
     throw new ValidationError(
       `[turbine] Unknown field "${key}" in orderBy on table "${table}". ` +
         `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
@@ -839,15 +845,19 @@ function buildChainedToOneOrderBy(
       );
     }
     const [key, entryValue] = entries[0]!;
-    if (ownLookup(currentMeta.relations, key) && isRelationOrderByValue(qi, entryValue)) {
-      relName = key;
+    // Resolved, so a chained orderBy descends through the snake_case spelling
+    // of a relation exactly as `with` does; `relName` carries the DECLARED
+    // name onward so the path reported in errors is the canonical one.
+    const chained = resolveRelation(currentMeta.relations, key);
+    if (chained && isRelationOrderByValue(qi, entryValue)) {
+      relName = chained.name;
       value = entryValue as Record<string, unknown>;
       continue;
     }
 
     // Terminal: a column on the last table in the chain.
-    const snakeCol = ownLookup(currentMeta.columnMap, key) ?? camelToSnake(key);
-    if (!currentMeta.allColumns.includes(snakeCol)) {
+    const snakeCol = resolveColumnName(currentMeta, key);
+    if (snakeCol === undefined) {
       throw new ValidationError(
         `[turbine] Unknown column "${key}" in orderBy on relation "${path.join('.')}" (table "${currentMeta.name}").`,
       );
@@ -895,7 +905,11 @@ export function buildRelationOrderBy(
   const ownerMeta = ctx?.meta ?? qi.tableMeta;
   const ownerTable = ctx?.table ?? qi.table;
   const parentRef = ctx?.parentRef ?? qi.table;
-  const relDef = ownLookup(ownerMeta.relations, relName);
+  // Resolved, then `relName` is rebound to the declared spelling so the alias
+  // and every message below use one name.
+  const resolvedOwner = resolveRelation(ownerMeta.relations, relName);
+  if (resolvedOwner) relName = resolvedOwner.name;
+  const relDef = resolvedOwner?.def;
   if (!relDef) {
     // A table with no relations at all would otherwise render a dangling
     // "Available: " and read as a broken message; and the most likely cause of
@@ -903,7 +917,7 @@ export function buildRelationOrderBy(
     // scalar column, which deserves to be named rather than reported as a
     // missing relation.
     const known = Object.keys(ownerMeta.relations);
-    const isColumn = Object.hasOwn(ownerMeta.columnMap, relName) || ownerMeta.allColumns.includes(relName);
+    const isColumn = resolveColumnName(ownerMeta, relName) !== undefined;
     throw new RelationError(
       isColumn
         ? `[turbine] orderBy on "${ownerTable}.${relName}" got a relation-shaped value, but "${relName}" is a ` +
@@ -969,10 +983,10 @@ export function buildRelationOrderBy(
         );
       }
 
-      // columnMap-first resolution (camelToSnake fallback): mirrors the
-      // scalar orderBy path so camelCase-named DB columns resolve here too.
-      const snakeCol = ownLookup(targetMeta.columnMap, col) ?? camelToSnake(col);
-      if (!targetMeta.allColumns.includes(snakeCol)) {
+      // The ONE key-resolution rule ({@link resolveColumnName}), so a target
+      // column resolves here exactly as it does in the top-level orderBy.
+      const snakeCol = resolveColumnName(targetMeta, col);
+      if (snakeCol === undefined) {
         const relationHint = ownLookup(targetMeta.relations, col)
           ? ` "${col}" is a relation on "${relDef.to}": order by one of ITS columns, e.g. ` +
             `{ ${relName}: { ${col}: { <column>: 'asc' } } }.`

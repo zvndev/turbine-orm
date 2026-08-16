@@ -35,7 +35,7 @@ import type {
   WhereClause,
 } from './types.js';
 import { assertOrderDirection, resolveSkipGlobalFilters, resolveUnsafeFlag } from './types.js';
-import { isTemporalInfinity, ownLookup, parseDbDate, unknownFieldMessage, warnRedundantSortTerm } from './utils.js';
+import { isTemporalInfinity, ownLookup, parseDbDate, resolveColumnName, warnRedundantSortTerm } from './utils.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
 import { assertWhereDepth } from './where-compile.js';
@@ -82,12 +82,13 @@ export function buildGroupBy<T extends object>(
   args: GroupByArgs<T>,
 ): DeferredQuery<Record<string, unknown>[]> {
   const meta = qi.schema.tables[qi.table];
-  if (meta) {
-    for (const key of args.by) {
-      if (typeof key === 'string' && !(key in meta.columnMap)) {
-        throw new ValidationError(unknownFieldMessage(qi.table, key, meta));
-      }
-    }
+  // Up-front, so a bad `by` key is reported before anything else in the call,
+  // and through `qi.toColumn` (the ONE `resolveColumnName` rule) rather than
+  // `key in meta.columnMap`, which knows only the FIELD spelling and so
+  // rejected the snake_case COLUMN name that `where` / `select` / `distinct`
+  // accept and that an introspected schema's DDL declares.
+  for (const key of args.by) {
+    if (typeof key === 'string') qi.toColumn(key);
   }
   qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
   // Resolve the PII opt-in ONCE, here, so the sentinel check runs on every
@@ -147,17 +148,29 @@ export function buildGroupBy<T extends object>(
   for (const entry of args.by) {
     if (typeof entry === 'string') {
       const col = qi.toColumn(entry);
+      // The group key's identity is the COLUMN, so everything keyed off it
+      // uses the canonical FIELD name rather than whichever spelling the caller
+      // wrote. The result key above all: rows are read through `parseRow`,
+      // whose keys are field names, so `by: ['created_at']` keyed by the
+      // caller's spelling read `parsed['created_at']` and returned `undefined`
+      // for every group. `_count` / `_sum` / `_min` in the same transform
+      // already map their alias back through `reverseColumnMap`.
+      const field = qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
       assertAggregatePiiOptIn(qi.table, meta, entry, col, 'groupBy `by` key', includePii);
-      claimResultKey(entry, `column "${col}"`);
+      claimResultKey(field, `column "${col}"`);
       // The emitted output column is the snake_case name; claim it too (when
       // it differs from the result key) so a JSON alias like 'created_at'
       // cannot silently shadow the 'createdAt' group key on the wire.
-      if (col !== entry) claimResultKey(col, `column "${col}"`);
+      if (col !== field) claimResultKey(col, `column "${col}"`);
       groupExprs.push(qi.q(col));
       selectExprs.push(qi.q(col));
-      byReaders.push({ resultKey: entry, rowKey: col, raw: false });
-      byOrderExprs.set(entry, qi.q(col));
-      havingGroupKeys.set(entry, { kind: 'column', field: entry });
+      byReaders.push({ resultKey: field, rowKey: col, raw: false });
+      // Registered ONCE, under the canonical field: `orderBy` and `having`
+      // may spell the same group key the other way, and {@link lookupGroupKey}
+      // reconciles that at lookup time rather than doubling every
+      // "orderable keys" list.
+      byOrderExprs.set(field, qi.q(col));
+      havingGroupKeys.set(field, { kind: 'column', field });
     } else {
       const col = resolveJsonPathTarget(qi, 'group key', entry.field, entry.path);
       assertAggregatePiiOptIn(qi.table, meta, entry.field, col, 'groupBy JSON `by` key', includePii);
@@ -238,7 +251,9 @@ export function buildGroupBy<T extends object>(
         const inner = `${sqlFn}(${qi.q(col)})`;
         const expr = aggKey === '_avg' ? qi.castAgg(inner, 'float') : inner;
         selectExprs.push(`${expr} AS ${qi.q(`${aggKey}_${col}`)}`);
-        aggOrderExprs.set(`${aggKey}:${key}`, expr);
+        // Canonical field, matching the result bucket the transform fills;
+        // `orderBy` may spell it either way (see {@link lookupGroupKey}).
+        aggOrderExprs.set(`${aggKey}:${qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col)}`, expr);
         continue;
       }
       const col = resolveJsonPathTarget(qi, `${aggKey} target "${key}"`, target.field, target.path);
@@ -401,6 +416,37 @@ export function buildGroupBy<T extends object>(
  * no `$n` renumbering). An aggregate key that was not requested, or an unknown
  * by-key, throws {@link ValidationError} E003 listing the valid keys.
  */
+/**
+ * Read a caller-supplied groupBy result key out of a registry keyed by the
+ * CANONICAL name (the field for a `by` column / aggregate target, the alias
+ * for a JSON group key).
+ *
+ * `by`, `orderBy` and `having` are three arguments of one call, each free to
+ * spell a column either way, so `by`'s choice must not decide what the other
+ * two may name. Reconciled here rather than by registering both spellings,
+ * which would list every group key twice in the "orderable keys" text: try the
+ * key as written (which is what carries a JSON alias, not a column), then its
+ * canonical field.
+ */
+function lookupGroupKey<V>(qi: BuilderCtx, registry: Map<string, V>, key: string): V | undefined {
+  const direct = registry.get(key);
+  if (direct !== undefined) return direct;
+  const canonical = canonicalFieldName(qi, key);
+  return canonical === undefined ? undefined : registry.get(canonical);
+}
+
+/**
+ * The canonical FIELD name for a caller-supplied column name, or `undefined`
+ * when it names no column (a JSON group-key alias, a typo). One hop through
+ * {@link resolveColumnName} and back via `reverseColumnMap`, so both spellings
+ * land on one string.
+ */
+function canonicalFieldName(qi: BuilderCtx, key: string): string | undefined {
+  const column = resolveColumnName(qi.tableMeta, key);
+  if (column === undefined) return undefined;
+  return qi.tableMeta.reverseColumnMap[column] ?? snakeToCamel(column);
+}
+
 export function buildGroupByOrderBy(
   qi: BuilderCtx,
   orderBy: GroupByOrderBy | GroupByOrderBy[],
@@ -473,7 +519,12 @@ export function buildGroupByOrderBy(
       }
       for (const [field, dirSpec] of Object.entries(value as Record<string, OrderDirection | OrderBySpec>)) {
         if (dirSpec === undefined) continue;
-        const expr = aggOrderExprs.get(`${key}:${field}`);
+        // `field` is the caller's spelling of the aggregate's target column;
+        // the registry is keyed by the canonical one.
+        const canonical = canonicalFieldName(qi, field);
+        const expr =
+          aggOrderExprs.get(`${key}:${field}`) ??
+          (canonical === undefined ? undefined : aggOrderExprs.get(`${key}:${canonical}`));
         if (!expr) {
           throw new ValidationError(
             `[turbine] Cannot order groupBy by "${key}.${field}" on table "${qi.table}": ` +
@@ -487,7 +538,7 @@ export function buildGroupByOrderBy(
     }
 
     // Plain by-field name or JSON group-key alias.
-    const expr = byOrderExprs.get(key);
+    const expr = lookupGroupKey(qi, byOrderExprs, key);
     if (!expr) {
       throw new ValidationError(
         `[turbine] Unknown field "${key}" in groupBy orderBy on table "${qi.table}". ` +
@@ -823,7 +874,7 @@ function buildHavingScalarClauses(
   params: unknown[],
   groupKeys: Map<string, HavingGroupKey> | undefined,
 ): string[] {
-  const ref = groupKeys?.get(field);
+  const ref = groupKeys ? lookupGroupKey(qi, groupKeys, field) : undefined;
   if (!ref) {
     const known = groupKeys ? [...groupKeys.keys()] : [];
     throw new ValidationError(
@@ -987,24 +1038,20 @@ export function buildAggregate<T extends object>(
     : { sql: '', params: [] as unknown[] };
 
   const meta = qi.schema.tables[qi.table];
-  if (meta) {
-    for (const group of [args._sum, args._avg, args._min, args._max]) {
-      if (group && typeof group === 'object') {
-        for (const key of Object.keys(group)) {
-          if (!(key in meta.columnMap)) {
-            throw new ValidationError(unknownFieldMessage(qi.table, key, meta));
-          }
-        }
-      }
+  // Every target is validated up front, including one whose falsy value the
+  // builders below skip, and through `qi.toColumn` (the ONE
+  // `resolveColumnName` rule). `key in meta.columnMap` knows only the FIELD
+  // spelling, so the snake_case COLUMN name that `where` / `select` and even
+  // `groupBy`'s own `_min` accepted was rejected here.
+  for (const group of [args._sum, args._avg, args._min, args._max]) {
+    if (group && typeof group === 'object') {
+      for (const key of Object.keys(group)) qi.toColumn(key);
     }
-    if (args._count && typeof args._count === 'object') {
-      for (const key of Object.keys(args._count)) {
-        // `_all` is the reserved COUNT(*) selector, not a column.
-        if (key === '_all') continue;
-        if (!(key in meta.columnMap)) {
-          throw new ValidationError(unknownFieldMessage(qi.table, key, meta));
-        }
-      }
+  }
+  if (args._count && typeof args._count === 'object') {
+    for (const key of Object.keys(args._count)) {
+      // `_all` is the reserved COUNT(*) selector, not a column.
+      if (key !== '_all') qi.toColumn(key);
     }
   }
 

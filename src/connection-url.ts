@@ -336,27 +336,24 @@ export function withStatementTimeoutOption(
  * password is not parseable by pg either, so there is no shape this handles
  * differently from the driver.
  *
- * DELIBERATELY DUPLICATED with `TurbineClient.mergeConnectionStringOptions`,
- * which needs the identical merge for `plan_cache_mode`. Collapsing the two
- * onto this copy is the obviously correct refactor and it was tried; it is
- * reverted, and the reason is worth writing down because the next person will
- * try it too.
+ * Shared with `client.ts`, which needs the identical merge for
+ * `plan_cache_mode`. It was duplicated there until 2026-08-16, and the reason
+ * is worth keeping because it was wrong in an instructive way: importing it
+ * from `client.ts` adds an import edge from a module ~100 test processes load,
+ * and this file's merged coverage read 40% while measuring 100% in isolation,
+ * which moved the aggregate gate 75.48% -> 75.03% against a 75% floor. The
+ * conclusion drawn was that the refactor cost the gate's headroom.
  *
- * Exporting it and importing it from `client.ts` adds an import edge from a
- * module that ~100 test processes load. In each of those processes this file's
- * top level runs and its functions do not, so c8 merges ~100 top-level-only
- * entries against the one full entry from `pooler-guard.test.ts`, and the file
- * reports 40% in the merged report while measuring 100% in isolation. Real
- * coverage is unchanged either way, but the aggregate gate moved 75.48% ->
- * 75.03% against a 75% floor, i.e. the refactor spent almost all the headroom
- * on a reporting artifact.
+ * The 40% was a c8 merge defect, not an import cost: c8's V8-level merge is not
+ * monotonic, and once the report merges at the istanbul level instead this file
+ * reads 100% with the edge in place (see `//merge-bug` in .c8rc.json). So the
+ * duplication was paying for an artifact, and the two copies are now one.
  *
- * So: two copies, both small, both pure, neither reachable from the other. If
- * you unify them, re-measure `npm run test:coverage` as a whole and not just
- * this file, and raise the floor's headroom first. Keep this module
- * import-free regardless.
+ * Keep this module import-free regardless. That part was never about coverage:
+ * `query/` and `cli/` both reach it, and an edge back to `client.ts` would be
+ * the cycle `scripts/check-import-cycles.mjs` exists to refuse.
  */
-function mergeConnectionStringOptions(connectionString: string, setting: string): string | null {
+export function mergeConnectionStringOptions(connectionString: string, setting: string): string | null {
   const q = connectionString.indexOf('?');
   if (q === -1) return null;
   const params = new URLSearchParams(connectionString.slice(q + 1));

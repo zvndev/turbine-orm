@@ -52,7 +52,7 @@ import {
   VECTOR_DISTANCE_COMPARATORS,
 } from './filters.js';
 import type { ArrayFilter, JsonFilter, TextSearchFilter, VectorFilter } from './types.js';
-import { ownLookup } from './utils.js';
+import { resolveRelation } from './utils.js';
 
 /** A table-scoped WHERE object (or an `OR`/`AND`/`NOT` branch of one). */
 export type WhereRecord = Record<string, unknown>;
@@ -188,11 +188,16 @@ export function walkWhere(host: WhereHost, where: WhereRecord): WhereEvent[] {
       continue;
     }
 
-    const relDef = ownLookup(host.tableMeta.relations, key);
-    if (relDef && typeof value === 'object' && value !== null && !Array.isArray(value)) {
-      const filterObj = host.normalizeRelationFilter(relDef, value as WhereRecord);
+    // Resolved rather than looked up, so a relation filter accepts the
+    // snake_case spelling of the relation exactly as `with` does. This is the
+    // ONE branch authority (build, fingerprint and param-collect all consume
+    // these events), so resolving here cannot drift between them; the emitted
+    // event carries the DECLARED name, which is what reaches the fingerprint.
+    const resolvedRel = resolveRelation(host.tableMeta.relations, key);
+    if (resolvedRel && typeof value === 'object' && value !== null && !Array.isArray(value)) {
+      const filterObj = host.normalizeRelationFilter(resolvedRel.def, value as WhereRecord);
       if (isRelationFilterObj(filterObj)) {
-        events.push({ kind: 'relation', key, relDef, filterObj });
+        events.push({ kind: 'relation', key: resolvedRel.name, relDef: resolvedRel.def, filterObj });
         continue;
       }
     }

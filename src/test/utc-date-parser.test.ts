@@ -184,11 +184,16 @@ describe('date (OID 1082) read parser', () => {
     });
     assert.deepEqual(parse('{a,NULL,"b,c"}'), ['A', null, 'B,C']);
     assert.deepEqual(parse('{}'), []);
+    // An empty string is `null`, matching pg's own `parseDateArray`, which
+    // opens `if (!value) return null`. No column produces it, but a shape
+    // where Turbine's process-global parser answers differently from the
+    // driver's is a difference somebody eventually finds the hard way.
+    assert.equal(parse(''), null);
   });
 
   it('the scalar and array timestamp parsers agree', () => {
     const arr = createPgArrayParser(parseUtcTimestampText)('{"2026-07-21 09:30:00"}');
-    assert.equal((arr[0] as Date).toISOString(), parseUtcTimestampText('2026-07-21 09:30:00').toISOString());
+    assert.equal((arr?.[0] as Date).toISOString(), parseUtcTimestampText('2026-07-21 09:30:00').toISOString());
   });
 });
 

@@ -49,6 +49,25 @@ async function main(): Promise<void> {
 
   const turbine = new TurbineClient({ connectionString: DATABASE_URL, logging: false });
   await turbine.connect();
+
+  // Read the relation JSON encoding out of the EMITTED SQL, not out of what we
+  // believe we configured, for the same reason bench-interleaved.ts does: this
+  // arm resolves `turbine-orm` through a symlink to dist/, so an unbuilt tree
+  // silently benchmarks stale code and a harness that echoes its own input
+  // cannot tell. The raw controls below are matched against this.
+  const relationSql = (
+    turbine.posts.buildFindMany({ limit: 1, with: { user: true } }) as { sql: string }
+  ).sql;
+  const emitted = relationSql.includes('json_build_array')
+    ? 'positional'
+    : relationSql.includes('json_build_object')
+      ? 'object'
+      : 'unknown';
+  if (emitted === 'unknown') {
+    console.error('Could not determine the relation JSON encoding from the emitted SQL. Refusing to report numbers.');
+    process.exit(1);
+  }
+  console.log(`Turbine arm: jsonEncoding='${emitted}', verified from emitted SQL.`);
   const prismaPool = new pg.Pool({ connectionString: DATABASE_URL, max: 10 });
   const prisma = new PrismaClient({ adapter: new PrismaPg(prismaPool) });
   const drizzlePool = new pg.Pool({ connectionString: DATABASE_URL, max: 10 });
@@ -194,13 +213,27 @@ async function main(): Promise<void> {
   // counts, and relation filters.
   // -------------------------------------------------------------------------
   if (GROUPS.has('relations')) {
-    const toOneRaw = `
+    // ENCODING-MATCHED, same rule as the L2 control in bench-interleaved.ts.
+    // A to-one relation goes through the same `buildJsonRow` as a to-many
+    // (src/query/relations.ts), so positional encoding turns this subquery into
+    // `json_build_array` too. Left as `json_build_object`, this control would
+    // be doing strictly more work than the ORM it bounds and would understate
+    // Turbine's overhead, exactly as the L2 control did.
+    const toOneRawObject = `
       SELECT p.*, (
         SELECT json_build_object('id', u.id, 'orgId', u.org_id, 'email', u.email, 'name', u.name,
           'role', u.role, 'avatarUrl', u.avatar_url, 'lastLoginAt', u.last_login_at, 'createdAt', u.created_at)
         FROM users u WHERE u.id = p.user_id
       ) AS "user"
       FROM posts p LIMIT 500`;
+    const toOneRawArray = `
+      SELECT p.*, (
+        SELECT json_build_array(u.id, u.org_id, u.email, u.name,
+          u.role, u.avatar_url, u.last_login_at, u.created_at)
+        FROM users u WHERE u.id = p.user_id
+      ) AS "user"
+      FROM posts p LIMIT 500`;
+    const toOneRaw = emitted === 'positional' ? toOneRawArray : toOneRawObject;
     await bench.interleave('to-one, 500 posts + author', [
       { name: 'Turbine', fn: () => turbine.posts.findMany({ limit: 500, with: { user: true } }) },
       { name: 'Prisma 7', fn: () => prisma.post.findMany({ take: 500, include: { user: true } }) },

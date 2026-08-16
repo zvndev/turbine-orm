@@ -1,0 +1,4 @@
+# Scratch cwd for the headless `claude` runs. It exists so the CLI cannot
+# discover the repo's CLAUDE.md, which documents this entire ORM and would
+# make arm A anything but cold.
+.scratch/

@@ -219,13 +219,76 @@ async function main() {
   ], { name: 'Drizzle RC', fn: () => rcDb.query.users.findMany({ limit: 100 }) }));
 
   // 2. findMany L2
-  const rawL2 = `
+  //
+  // THE RAW CONTROL IS ENCODING-MATCHED TO THE TURBINE ARM, and it has to be.
+  //
+  // This arm exists to answer "what does Turbine cost above hand-written pg".
+  // It was written when Turbine emitted `json_build_object`, so it spelled the
+  // nested aggregate that way too. When positional encoding became the
+  // PostgreSQL default in 0.71.0, the control silently stopped matching the arm
+  // it controls for: measured directly on identical rows, the object spelling
+  // costs 1.83x the array spelling (`raw-l2-encoding.ts`). The control was
+  // therefore doing strictly more work than the ORM it bounds, and Turbine's L2
+  // "overhead" computed to 0.90x, i.e. faster than hand-written SQL. That
+  // reading is not supportable, and `RESULTS-0.71.0.md` had to publish a
+  // derived 1.08x instead of the recorded 1.00x to avoid quoting it.
+  //
+  // The fix is not to hard-code the array spelling, because then the
+  // `TURBINE_JSON=object` control run would be mismatched in the other
+  // direction. The statement follows `emitted`, which was read out of Turbine's
+  // own compiled SQL above, so the control is matched in BOTH configurations
+  // and no future encoding change can silently unmatch it again.
+  //
+  // Disclosed asymmetry: with the array spelling the raw arm receives nested
+  // ARRAYS, while Turbine decodes them back into objects. The control therefore
+  // does slightly LESS work than the ORM, which biases the overhead figure
+  // UPWARD for Turbine. That is the conservative direction, which is why it is
+  // acceptable; `raw-l2-encoding.ts` prices the decode separately.
+  const RAW_L2_OBJECT = `
     SELECT u.*, COALESCE((
       SELECT json_agg(json_build_object('id', p.id, 'userId', p.user_id, 'orgId', p.org_id,
         'title', p.title, 'content', p.content, 'published', p.published,
         'viewCount', p.view_count, 'createdAt', p.created_at, 'updatedAt', p.updated_at))
       FROM posts p WHERE p.user_id = u.id), '[]'::json) AS posts
     FROM users u LIMIT 50`;
+
+  const RAW_L2_ARRAY = `
+    SELECT u.*, COALESCE((
+      SELECT json_agg(json_build_array(p.id, p.user_id, p.org_id,
+        p.title, p.content, p.published,
+        p.view_count, p.created_at, p.updated_at))
+      FROM posts p WHERE p.user_id = u.id), '[]'::json) AS posts
+    FROM users u LIMIT 50`;
+
+  const rawL2 = emitted === 'positional' ? RAW_L2_ARRAY : RAW_L2_OBJECT;
+  console.log(
+    `Raw L2 control: ${emitted === 'positional' ? 'json_build_array' : 'json_build_object'}, ` +
+      `encoding-matched to the Turbine arm.`,
+  );
+
+  // The two spellings must return the same data, or the control is measuring a
+  // different query rather than a different encoding. Checked here, once,
+  // before anything is timed: same parent count, same total child count.
+  {
+    const [objRes, arrRes] = await Promise.all([
+      rawPool.query(RAW_L2_OBJECT),
+      rawPool.query(RAW_L2_ARRAY),
+    ]);
+    const childCount = (rows: any[], key: string) =>
+      rows.reduce((n, r) => n + (r[key] as unknown[]).length, 0);
+    const objChildren = childCount(objRes.rows, 'posts');
+    const arrChildren = childCount(arrRes.rows, 'posts');
+    if (objRes.rows.length !== arrRes.rows.length || objChildren !== arrChildren) {
+      console.error(
+        `Raw L2 encoding check FAILED: object ${objRes.rows.length} rows/${objChildren} children, ` +
+          `array ${arrRes.rows.length} rows/${arrChildren} children. Refusing to report numbers.`,
+      );
+      process.exit(1);
+    }
+    console.log(
+      `Raw L2 encoding check: both spellings return ${objRes.rows.length} rows / ${objChildren} children.`,
+    );
+  }
   await bench.interleave('findMany, 50 users + posts (L2)', withRc([
     { name: 'Turbine', fn: () => turbine.users.findMany({ limit: 50, with: { posts: true } }) },
     { name: 'Prisma 7', fn: () => prisma.user.findMany({ take: 50, include: { posts: true } }) },

@@ -92,16 +92,23 @@ describe('pg type parser overwrite detection', () => {
   });
 
   it('offers a remedy that applies to the OID it is warning about', () => {
-    // The message is shared, but `utcTimestamps: false` governs the four
-    // TEMPORAL OIDs only. Offering it for int8 would name a setting that does
-    // nothing for the OID in the warning.
+    // The message is shared, but `utcTimestamps: false` governs the TEMPORAL
+    // OIDs only. Offering it for int8 would name a setting that does nothing
+    // for the OID in the warning.
+    //
+    // Six, not four: the flag also gates the `timestamptz` pair (1184 / 1185),
+    // which carries no reading at all and is registered purely for decode
+    // speed. Those two DECLINE rather than overwrite, so they never reach this
+    // warning; they are named because the sentence describes what the flag
+    // leaves alone, and leaving them alone is what it does.
     resetWarnOnce(WARN_NS.parserOverwrite);
     setParser(1114, (text: string) => `custom:${text}`);
     setParser(20, (text: string) => `custom:${text}`);
 
     const temporal = captureWarnings(() => warnParserOverwrite(1114, 'timestamp'));
     assert.equal(temporal.length, 1);
-    assert.match(temporal[0]!, /`utcTimestamps: false` leaves the four temporal OIDs/);
+    assert.match(temporal[0]!, /`utcTimestamps: false` leaves the six temporal OIDs/);
+    assert.match(temporal[0]!, /1114, 1082, 1115, 1182, 1184, 1185/);
 
     const int8 = captureWarnings(() => warnParserOverwrite(20, 'int8'));
     assert.equal(int8.length, 1);

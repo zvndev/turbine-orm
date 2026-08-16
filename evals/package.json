@@ -1,0 +1,23 @@
+{
+  "name": "turbine-agent-evals",
+  "private": true,
+  "type": "module",
+  "description": "C6: cross-model agent eval harness. Measures whether turbine's docs, MCP tools and skill measurably raise a model's first-try pass rate.",
+  "scripts": {
+    "db:reset": "tsx src/seed.ts --reset",
+    "db:verify": "tsx src/verify-tasks.ts",
+    "run": "tsx src/run.ts",
+    "smoke": "tsx src/run.ts --smoke",
+    "full": "tsx src/run.ts --full",
+    "report": "tsx src/report.ts"
+  },
+  "dependencies": {
+    "pg": "8.22.0",
+    "tsx": "^4.19.0",
+    "turbine-orm": "file:.."
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.11"
+  }
+}
