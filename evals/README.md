@@ -8,7 +8,7 @@ schema the model has never seen, across four escalating levels of help.
 | A | the schema DDL and the task, nothing else |
 | B | + `site/public/llms.txt` |
 | C | + a live `turbine mcp` connection (11 read-only tools) |
-| D | + a candidate query-writing skill (`candidate-skill.md`) |
+| D | + the packaged query-writing skill (`skills/turbine-orm/SKILL.md`) |
 
 The arms are cumulative, so `A->B` prices the docs, `B->C` prices the MCP
 tools, and `C->D` prices the skill.
@@ -23,6 +23,7 @@ npm run db:verify     # check all 30 reference queries against independent SQL
 npm run smoke         # 8 tasks x 4 arms x 2 models
 npm run full          # 30 tasks x 4 arms x 6 models
 npx tsx src/report.ts results/*.jsonl
+npm run verify:skill  # execute every factual claim the skill makes
 ```
 
 Useful flags: `--tasks T01,T12`, `--models haiku-4-5,qwen3.5-4b`, `--arms A,C`,
@@ -65,7 +66,7 @@ away.
 
 ```
 schema.sql            held-out schema (cheese affinage ledger)
-candidate-skill.md    the arm-D skill under test
+src/verify-skill.ts   executes every claim the packaged skill makes
 src/config.ts         seeds, timeouts, the "only ever turbine_eval" guard
 src/seed.ts           deterministic seed
 src/tasks.ts          the 30 tasks, references, and sanity SQL

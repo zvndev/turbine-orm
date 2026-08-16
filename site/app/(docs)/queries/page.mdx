@@ -157,9 +157,13 @@ await db.users.aggregate({ _count: true, where: { email: { endsWith: '@acme.com'
 
 Writes enforce the same boundary at the SQL level: a write against a table with PII columns (`create`, `createMany`, `update`, `delete`, `upsert`, nested writes) returns an explicit non-PII projection instead of `RETURNING *` (`RETURNING "id", "name", ...` on Postgres and SQLite, a projected re-select on MySQL, per-column `OUTPUT` on SQL Server, a client-side strip on PowDB, whose `returning` takes no column list). PII values write and persist normally; they are just not returned. A PII-tagged primary key stays in the projection, and tables with no PII columns keep `RETURNING *` byte-for-byte.
 
-### Pagination, `limit` / `take`, `offset`, `cursor`
+### Pagination, `limit` / `take`, `offset` / `skip`, `cursor`
 
-Offset pagination uses `limit` + `offset`. `take` is a Prisma-compatible alias for `limit`; when both are passed, `take` wins (`take ?? limit`). `offset` also works alone, on every engine: SQLite and MySQL reject a bare `OFFSET` at the grammar level, so their dialects emit the engine's own offset-to-end idiom.
+Offset pagination uses `limit` + `offset`. `take` and `skip` are Prisma-compatible aliases for them, folded into `limit` / `offset` before anything reads the query, so the two spellings compile to the same SQL and share one cache entry. Passing both spellings of one bound with **different** values throws a `ValidationError` (TURBINE_E003) rather than picking one: there is no reading of `{ limit: 10, take: 5 }` that makes one of the numbers the intended answer. Equal values are accepted. `offset` also works alone, on every engine: SQLite and MySQL reject a bare `OFFSET` at the grammar level, so their dialects emit the engine's own offset-to-end idiom.
+
+<Callout type="warning">
+**Upgrade note (0.73.0).** Before this release `skip` was not a Turbine key at all while `take` was, so the Prisma pair `{ take: 20, skip: 40 }` type-checked, ran, and silently returned the FIRST page however far you thought you had paged. If you have code written that way, it is now paging correctly, which may change what it returns.
+</Callout>
 
 ```ts
 const page2 = await db.posts.findMany({
@@ -280,6 +284,8 @@ On a generated client, `orderBy: { nmae: 'asc' }` is a type error rather than a 
 
 Look up a row by a unique column (primary key or any `unique` constraint).
 
+The `where` must identify a **single row**: the primary key, a single-column unique, every column of a compound unique, or a compound-unique selector. Extra predicates alongside the key are fine, since they can only narrow a set that already holds at most one row. Anything else throws a `ValidationError` (TURBINE_E003) naming the keys that would have worked.
+
 ```ts
 const user = await db.users.findUnique({
   where: { id: 42 },
@@ -300,6 +306,12 @@ const row = await db.memberships.findUnique({
   where: { userId: 1, orgId: 2 },
 });
 ```
+
+<Callout type="warning">
+**Upgrade note (0.73.0).** A `findUnique` whose `where` did not name a unique key used to run as `... LIMIT 1` with no ordering, returning an arbitrary one of the rows that matched. It looked like a lookup and behaved like "give me any row", and the `null` branch callers wrote read as "no such row" when it meant "none matched this filter". Those calls now throw. Use `findFirst` (with an `orderBy` if which row matters), which is what they meant.
+
+A `null` value never satisfies the rule, even on a unique column: PostgreSQL permits any number of NULLs in a unique index, so `IS NULL` can match many rows.
+</Callout>
 
 ## findFirst / findFirstOrThrow
 

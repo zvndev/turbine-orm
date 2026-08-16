@@ -50,7 +50,7 @@ function boundValue(sql: string, params: unknown[], pattern: RegExp): unknown {
 }
 
 function buildSchema(): SchemaMetadata {
-  return {
+  const schema: SchemaMetadata = {
     enums: {},
     tables: {
       users: mockTable(
@@ -108,6 +108,11 @@ function buildSchema(): SchemaMetadata {
       ]),
     },
   };
+  // The findUnique cases below look a user up by (tenantId, name), so that pair
+  // is the composite unique. findUnique refuses a `where` that does not
+  // identify one row, and permuted KEY ORDER is what those tests are about.
+  schema.tables.users?.uniqueColumns.push(['tenant_id', 'name']);
+  return schema;
 }
 
 describe('where-key-order: cache fingerprint vs build/collect canonical order', () => {
@@ -332,8 +337,8 @@ describe('where-key-order: cache fingerprint vs build/collect canonical order', 
   it('findUnique general path (operator present): permuted key order stays aligned', () => {
     const q = makeQuery('users', buildSchema());
 
-    q.buildFindUnique({ where: { tenantId: 7, age: { gt: 1 } } } as never);
-    const second = q.buildFindUnique({ where: { age: { gt: 100 }, tenantId: 42 } } as never);
+    q.buildFindUnique({ where: { tenantId: 7, name: 'a', age: { gt: 1 } } } as never);
+    const second = q.buildFindUnique({ where: { age: { gt: 100 }, name: 'b', tenantId: 42 } } as never);
     assertParamsAligned(second.sql, second.params);
 
     assert.equal(boundValue(second.sql, second.params, /"tenant_id" = \$(\d+)/), 42);

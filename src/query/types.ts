@@ -905,8 +905,22 @@ export interface FindManyArgs<
   with?: W;
   /** Cursor-based pagination: start after this row */
   cursor?: Partial<T>;
-  /** Number of records to take (used with cursor) */
+  /**
+   * Prisma's spelling of {@link FindManyArgs.limit}. Folded into `limit` before
+   * anything reads it; passing both with different values is a
+   * `ValidationError`.
+   */
   take?: number;
+  /**
+   * Prisma's spelling of {@link FindManyArgs.offset}. Folded into `offset`
+   * before anything reads it; passing both with different values is a
+   * `ValidationError`.
+   *
+   * Accepted since 0.73.0. Before that `take` was recognized and `skip` was
+   * not, so the Prisma pair `{ take, skip }` silently returned the first page
+   * however far the caller thought they had paged.
+   */
+  skip?: number;
   /** De-duplicate results by specified fields */
   distinct?: (keyof T & string)[];
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */

@@ -1,5 +1,90 @@
 # Changelog
 
+## 0.73.0 (2026-08-16)
+
+The same rule as 0.72.0, one step further: **an argument the caller wrote must
+change the answer, or be refused.** 0.72.0 was about names. This one is about
+three arguments that were accepted and then did nothing, or did something other
+than what they said, and it ships the agent skill they were found by.
+
+All three produced a plausible result, which is why they lasted. A thrown error
+gets fixed the same day.
+
+### Breaking
+
+- **`findUnique` now requires a `where` that identifies a single row.** A
+  primary key, a single-column unique, or every column of a compound unique;
+  extra predicates alongside the key are still fine, since they can only narrow
+  a set that already holds at most one row. Anything else throws
+  `ValidationError` (TURBINE_E003) naming the keys that would have worked.
+
+  Before, `findUnique({ where: { status: 'active' } })` emitted
+  `WHERE status = $1 LIMIT 1` with no `ORDER BY` and returned an arbitrary one
+  of the rows that matched, differently between two calls with the same
+  argument. The caller who wrote `findUnique` asked for *the* row, and the
+  `null` branch they wrote reads as "no such row" when it meant "none matched
+  this filter". This extends the empty-`where` guard added in 0.61, which
+  already refused the degenerate case for exactly this reason.
+
+  `findFirst` is untouched: "the first row matching an optional filter" is its
+  whole contract. Give it an `orderBy` if which row matters. A `null` value
+  never satisfies the rule even on a unique column, because PostgreSQL permits
+  any number of NULLs in a unique index.
+
+- **`take` and `limit` (or `skip` and `offset`) with different values now
+  throw** instead of silently preferring `take`. Equal values are accepted.
+
+### Fixed
+
+- **`skip` did nothing.** `take` was a recognized alias for `limit` and `skip`
+  was not a Turbine key at all, so the Prisma pair `{ take: 20, skip: 40 }`
+  type-checked, ran, and returned the FIRST page however far the caller thought
+  they had paged. `skip` is now the alias for `offset` that `take` is for
+  `limit`. Half a recognized pair is worse than neither half: an unknown key is
+  inert on its own, but a half-recognized one changes the answer.
+
+  Both aliases are now folded ONCE, before anything reads them, so `limit` and
+  `offset` are the single authority below that line and the two spellings share
+  one SQL-cache entry. `take` used to be handled by six separate
+  `args?.take ?? args?.limit` reads, one of which is the cache FINGERPRINT;
+  adding `skip` the same way would have meant six more places to keep in step,
+  and a miss in a fingerprint is not a missing feature, it is two different
+  pages sharing one cached statement.
+
+### Added
+
+- **`npx turbine skill`** installs a query-writing skill into the project
+  (`.claude/skills/turbine-orm/SKILL.md` by default). `--print` writes it to
+  stdout, `--agents` prints a short instructions block for `AGENTS.md` /
+  `CLAUDE.md`, `--dir <path>` installs under a different skills root. The skill
+  ships in the package, so what an agent reads is what the repository tests:
+  every factual claim in it is executed against a live database before release,
+  by a checker that names the sentence to change when an answer moves.
+
+- **An unknown query option now warns** outside production, once per
+  `table.operation.key`, naming the key it thinks you meant. `include` gets its
+  own message pointing at `with`, because that is the single largest source of
+  confidently-wrong queries against Turbine: an unrecognized option is ignored,
+  so the query runs, returns rows, and the relation is absent from every one of
+  them. A warning rather than a refusal, deliberately, since
+  `findMany({ ...someOptionsBag })` is ordinary code and the option surface
+  grows between minors.
+
+  It is driven by the same `query/option-surface.ts` tables that already bind
+  the compiler in both directions, so a new option cannot be added without the
+  diagnostic learning about it.
+
+### Measured
+
+The skill was shipped against a number rather than a hope. On a held-out schema
+across 240 scored attempts (`evals/AGENT-EVAL-0.73.0.md`), the skill ALONE, with
+no docs and no MCP connection, took first-try pass rate from **73% to 97%** on
+`claude-sonnet-5` and **60% to 97%** on `claude-haiku-4-5`, against a measured
+run-to-run noise band of about 7 points. On both models it matched or beat a
+live `turbine mcp` connection. Twelve of the twenty cold failures were one
+mistake, a relation named inside `select`, which the skill's fourth section
+addresses and which drops to zero wherever the skill or the tools are present.
+
 ## 0.72.0 (2026-08-16)
 
 A correctness release about one rule: **a column and a relation each have two

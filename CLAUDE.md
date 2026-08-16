@@ -54,6 +54,19 @@ src/
                       becoming an Invalid Date; they assemble via setUTCFullYear so 2-3
                       digit and 5-digit years and ` BC` are not silently remapped.
                       `parseUtcTimestampText` stays for known-shape callers only.
+                      Also `normalizePagination` (0.73): Prisma's `take` / `skip` folded
+                      into `limit` / `offset` ONCE, at the same seams the relation-name pass
+                      uses (`QueryInterface.normalizeArgs`, `PowqlInterface.normalizeArgs`,
+                      plus `streamRaw`, whose speculative build spreads args and overrides
+                      `limit`). `skip` was not a Turbine key at all while `take` was, so
+                      `{ take, skip }` silently returned page one; half a recognized pair is
+                      worse than neither half, since an unknown key is inert on its own. Not
+                      read at each site, deliberately: `take` had SIX
+                      `args?.take ?? args?.limit` reads and one of them is the SQL-cache
+                      FINGERPRINT, where a miss is not a missing feature but two different
+                      pages sharing one cached statement. Below the fold `limit`/`offset`
+                      are the single authority and the aliases do not exist. Both spellings
+                      of one bound with DIFFERENT values throws rather than picking.
                       pg-types' shipped .d.ts omits array OIDs from its setTypeParser
                       enum and types arrayParser loosely, so both are retyped locally
                       (comment says so); no dependency added.
@@ -257,6 +270,22 @@ src/
                       `where: { orgId_userId: {...} }` into flat column equality BEFORE
                       cache fingerprinting. Consumed by the findUnique family, nested-write
                       unique wheres (connect/connectOrCreate/etc.), and PowqlInterface.
+                      0.73 adds the OTHER question about the same metadata:
+                      `assertWhereIdentifiesOneRow` (over `whereIdentifiesOneRow` /
+                      `uniqueKeyNames`), the findUnique refusal shared by EVERY engine,
+                      message included. `findUnique({ where: { status: 'active' } })` used
+                      to emit `LIMIT 1` with no ORDER BY and return an arbitrary one of the
+                      matching rows, the same hazard the 0.61 empty-`where` guard already
+                      refuses one step earlier and in the same words. The rule reads the TOP
+                      LEVEL of the USER's where only (a key inside an `OR` does not identify
+                      a row; a global filter is not an identity) and needs a plain equality
+                      or an explicit `{ equals }`: NULL never counts, because PostgreSQL
+                      permits any number of NULLs in a unique index. Extra predicates beside
+                      the key are fine, they can only narrow a set that already holds at
+                      most one row. SHARED rather than written twice because PowqlInterface
+                      is a parallel implementation, and two copies of a rule this specific
+                      is how two engines come to disagree about whether a query is VALID
+                      (the 0.64 projection-resolver class).
     relation-names.ts, THE relation-name rule (0.72), the twin of
                       `resolveColumnName` one level up. A relation carries one DECLARED
                       name (`blogPosts`) while the DDL anyone reads carries only the TABLE
@@ -319,7 +348,20 @@ src/
                       key that is not on the interface fails as an excess property. THE ONE
                       RULE: 'native' only when the value contains no field/relation/column/
                       model NAME (`optimisticLock.field` and `distinctOn.columns` do, so they
-                      are 'prisma' and hand-translated).
+                      are 'prisma' and hand-translated). 0.73 gives the same tables a SECOND
+                      consumer, `warnUnknownQueryOptions`, the core dev-mode warning for a
+                      key that is on no arg interface and is therefore doing nothing. It
+                      hangs at ONE seam per engine (`executeWithMiddleware` /
+                      PowqlInterface's `withMiddleware`), which every public operation
+                      already passes through carrying its own name, so a new operation
+                      cannot be added without the diagnostic covering it. Motivating case:
+                      `include`, which is Prisma's word for `with` and is simply ignored, so
+                      the query runs, returns rows, and the relation is absent from every
+                      one of them; it gets its own message rather than a nearest-name guess.
+                      A WARNING and never an error, because `findMany({ ...optionsBag })` is
+                      ordinary code and the surface grows between minors. This is the file's
+                      first runtime import (warn-registry + utils, both leaves that do not
+                      import it back), so everything above it stays type-only.
 
     index.ts       , Barrel re-export. All imports use `./query/index.js`.
 
@@ -1127,7 +1169,14 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 
 ## CLI Architecture
 
-The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.argv`. No commander/yargs. Commands: `init`, `generate`/`pull`, `push`, `migrate create|up|deploy|down|status` (`deploy` is `up` with no prompts, for CI), `seed`, `status`, `doctor` (missing-FK-index advisor → `index-advisor.ts`; `--fix` writes an add-index migration; cached-plan divergence section → `plan-divergence.ts`, finding-only, `--no-plan-divergence` skips it and its pg_stats read; since 0.57 an `unindexed-filter` finding renders as EVIDENCE on the missing-index finding for the same column (`attachDivergenceToMissingIndexes` / `renderDivergenceEvidence`) rather than as a second entry, and the remediation text names `forceCustomPlan` without assuming the reader holds the core client or prisma-compat), `migrate-from-prisma` (0.41: zero-dep schema.prisma subset parser in `cli/prisma-schema.ts`, live-metadata resolver in `cli/prisma-resolve.ts`, Markdown report via `cli/prisma-report.ts`, emits the typed PRISMA_MAP module `generate.ts` also regenerates; `--no-db` parse-only mode), `studio`, `mcp` (read-only MCP server over JSON-RPC stdio -> `cli/mcp.ts`; ELEVEN tools as of 0.71, the newest being `compile_query` -> `cli/compile-query.ts`, which compiles a read query to the exact SQL WITHOUT executing it. Zero pool interaction is guaranteed by construction via `SEALED_POOL`, a `PgCompatPool` whose `query`/`connect`/`end` all throw; the one database access is the catalog read that resolves names, since a column cannot be validated against a schema nobody has seen. It reports statement count, chosen relation strategy, whether the query is bounded or reads every row, and unindexed correlation probes. `auto` reports its statement count as `null` with a stated RANGE rather than duplicating `planAuto`'s decision in cli/, which is the drift class this repo keeps paying for. A failed compile is a SUCCESSFUL result carrying E003/E005 and the fix, because that is the most useful outcome for an agent. Read operations only: the server has no write surface and compiling one would be the first. Args go through the shared `cli/pii-predicate-guard.ts` exactly as `explain_query` does), `observe` (metrics dashboard, requires TURBINE_OBSERVE_URL -> `cli/observe.ts`).
+The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.argv`. No commander/yargs. Commands: `init`, `generate`/`pull`, `push`, `migrate create|up|deploy|down|status` (`deploy` is `up` with no prompts, for CI), `seed`, `status`, `doctor` (missing-FK-index advisor → `index-advisor.ts`; `--fix` writes an add-index migration; cached-plan divergence section → `plan-divergence.ts`, finding-only, `--no-plan-divergence` skips it and its pg_stats read; since 0.57 an `unindexed-filter` finding renders as EVIDENCE on the missing-index finding for the same column (`attachDivergenceToMissingIndexes` / `renderDivergenceEvidence`) rather than as a second entry, and the remediation text names `forceCustomPlan` without assuming the reader holds the core client or prisma-compat), `migrate-from-prisma` (0.41: zero-dep schema.prisma subset parser in `cli/prisma-schema.ts`, live-metadata resolver in `cli/prisma-resolve.ts`, Markdown report via `cli/prisma-report.ts`, emits the typed PRISMA_MAP module `generate.ts` also regenerates; `--no-db` parse-only mode), `studio`, `mcp` (read-only MCP server over JSON-RPC stdio -> `cli/mcp.ts`; ELEVEN tools as of 0.71, the newest being `compile_query` -> `cli/compile-query.ts`, which compiles a read query to the exact SQL WITHOUT executing it. Zero pool interaction is guaranteed by construction via `SEALED_POOL`, a `PgCompatPool` whose `query`/`connect`/`end` all throw; the one database access is the catalog read that resolves names, since a column cannot be validated against a schema nobody has seen. It reports statement count, chosen relation strategy, whether the query is bounded or reads every row, and unindexed correlation probes. `auto` reports its statement count as `null` with a stated RANGE rather than duplicating `planAuto`'s decision in cli/, which is the drift class this repo keeps paying for. A failed compile is a SUCCESSFUL result carrying E003/E005 and the fix, because that is the most useful outcome for an agent. Read operations only: the server has no write surface and compiling one would be the first. Args go through the shared `cli/pii-predicate-guard.ts` exactly as `explain_query` does), `observe` (metrics dashboard, requires TURBINE_OBSERVE_URL -> `cli/observe.ts`),
+`skill` (0.73: writes `skills/turbine-orm/SKILL.md` from the PACKAGE into
+`.claude/skills/` by default; `--print` to stdout, `--agents` for the AGENTS.md block,
+`--dir` for another skills root. The skill is a shipped FILE, not generated text, and
+`skills` is in package.json `files`; `evals/src/verify-skill.ts` executes every factual
+claim in it against a live database and names the sentence to change when one moves,
+which exists because the previous copy asserted a snake_case column name was rejected in
+`orderBy` and the next release made that false).
 
 **Config resolution** (`cli/config.ts`): Searches for `turbine.config.ts` / `.mts` / `.js` / `.mjs`, merges with `--url`/`--out`/`--schema` flags and `DATABASE_URL` env var.
 

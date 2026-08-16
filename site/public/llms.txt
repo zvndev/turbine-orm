@@ -2,7 +2,7 @@
 
 > Turbine is a Postgres-first TypeScript ORM with a Prisma-like API (findMany, findUnique, with, where), written from scratch with exactly one runtime dependency (pg): no query engine, no WASM. Nested relations resolve in one SQL statement. It ships an 11-tool read-only MCP server for coding agents, offline missing-index advice (turbine doctor), a read-only-by-default Studio, PII enforced in the emitted SQL, and consent-gated destructive migrations. Optional SQLite, MySQL, SQL Server, and PowDB engines expose the same typed API behind subpath exports. MIT.
 
-Turbine is designed to be legible to AI coding agents: a read-only MCP server (npx turbine mcp, eleven tools including a relation graph and a join-path finder that returns the `with` clause to write), a deterministic codegen flow (introspect the database, generate a typed client, query through it), fully typed query arguments that make invalid queries a compile error, and a stable typed error system (codes TURBINE_E001 through E018) that agents can branch on instead of parsing messages. Point an agent at this file and the docs below to teach it how to use Turbine correctly.
+Turbine is designed to be legible to AI coding agents: an installable query-writing skill (npx turbine skill, whose every factual claim is executed against a live database on each release), a read-only MCP server (npx turbine mcp, eleven tools including a relation graph and a join-path finder that returns the `with` clause to write), a deterministic codegen flow (introspect the database, generate a typed client, query through it), fully typed query arguments that make invalid queries a compile error, and a stable typed error system (codes TURBINE_E001 through E018) that agents can branch on instead of parsing messages. Point an agent at this file and the docs below to teach it how to use Turbine correctly.
 
 Key facts:
 - Postgres-first. PostgreSQL 14+ is the supported floor, which is what CI tests (14, 15, 16, 17). Node.js 20+ (the SQLite engine needs Node 22.5+).
@@ -20,6 +20,11 @@ Key facts:
 - Extras: transactions with SAVEPOINT nesting and isolation levels, real extended-query pipelining (N independent queries in one round-trip), server-side cursor streaming, typed raw SQL, pgvector KNN, LISTEN/NOTIFY realtime, and a read-only MCP server.
 
 Common mistakes to avoid when generating Turbine code:
+- Relations go in `with`, never Prisma's `include`. An unrecognized query option is ignored rather than refused, so an `include` runs and returns rows with the relation missing from every one of them. Turbine warns about an unknown option outside production, naming the key it thinks you meant.
+- `select` and `omit` name COLUMNS only. A relation named in `select` throws ValidationError (TURBINE_E003) pointing at `with`; relations carry their own nested `select`. `select` and `omit` together throw, and so does a `select` that names no field.
+- `findUnique` needs a `where` that identifies ONE row: a primary key, a single-column unique, or every column of a compound unique. Anything else throws E003 naming the keys that would work. For "any row matching a filter" use `findFirst`, with an `orderBy` if which row matters.
+- A column or relation may be written in the schema's snake_case or in the generated camelCase, in any argument position, and both compile to the same SQL. Results are always camelCase. Prefer camelCase: it is what the generated types autocomplete.
+- Pagination is `limit` / `offset`; Prisma's `take` / `skip` are accepted as aliases for them. Passing both spellings of one bound with DIFFERENT values throws rather than picking one.
 - `turbine` is NOT exported from the `turbine-orm` package. It is emitted into the generated client; import it from your output directory (e.g. `./generated/turbine`). From the package itself, use `TurbineClient`.
 - There is no `tx.pipeline`, `tx.sql`, `tx.$use`, or `tx.$listen`. A TransactionClient has only table accessors, `table()`, `$transaction()`, `raw()` and `schema`. Use `db.$transaction([...])` for an atomic batch.
 - `schema` in turbine.config.ts is the Postgres NAMESPACE (default `public`), not a file path. The schema-builder file goes in `schemaFile`.
@@ -29,7 +34,7 @@ Common mistakes to avoid when generating Turbine code:
 
 - [Quick Start](https://turbineorm.dev/quickstart): Install, set DATABASE_URL, generate the typed client, run your first query and nested `with`.
 - [Why Turbine](https://turbineorm.dev/why-turbine): The checkable comparison against Prisma, Drizzle and Kysely: what is genuinely different (operational safety), what is table stakes in 2026, and what Turbine is not.
-- [Turbine for AI agents](https://turbineorm.dev/ai-agents): How to point a coding agent at Turbine, the deterministic codegen flow, and a drop-in agent-instructions snippet.
+- [Turbine for AI agents](https://turbineorm.dev/ai-agents): How to point a coding agent at Turbine: the installable query skill (`npx turbine skill`), the MCP server, the deterministic codegen flow, and a drop-in agent-instructions snippet.
 - [API Reference](https://turbineorm.dev/queries): Every query method, WHERE operator, nested `with` option, the build* deferred builders, client configuration, and the escape hatches.
 - [Relations](https://turbineorm.dev/relations): hasMany / belongsTo / hasOne / manyToMany and how the json_agg nesting works.
 - [Global Filters](https://turbineorm.dev/global-filters): Soft-delete and multi-tenancy predicates AND-merged into every compiled WHERE.

@@ -67,6 +67,12 @@ import type {
   UpdateManyArgs,
   UpsertArgs,
 } from './types.js';
+// Runtime imports, and the only ones in this file: the unknown-key warning at
+// the bottom needs the once-per-process registry and the name suggester. Both
+// are leaves that do not import this module, so the type-only shape of
+// everything above is unaffected.
+import { suggestKey } from './utils.js';
+import { shouldWarnOnce, WARN_NS } from './warn-registry.js';
 
 /**
  * How a name-translating consumer (today: `turbine-orm/prisma-compat`) must
@@ -127,7 +133,13 @@ export const FIND_MANY_OPTIONS: OptionTable<FindManyArgs<Row>> = {
   omit: 'prisma',
   orderBy: 'prisma',
   cursor: 'prisma',
+  // `take` and `skip` are Prisma's own spellings and core accepts them as
+  // aliases, but they stay hand-translated because Prisma gives them meanings
+  // core does not have: a NEGATIVE `take` pages from the end, and `skip: 1`
+  // beside a `cursor` is the exclusive-pagination idiom. Forwarding either
+  // verbatim would hand core a number that means something else.
   take: 'prisma',
+  skip: 'prisma',
   distinct: 'prisma',
   relationLoadStrategy: 'prisma',
   with: 'nativeAlias',
@@ -288,4 +300,81 @@ export function applyNativeOptions(
 /** The keys of `table` with the given kind, as a set. */
 export function optionKeysOfKind(table: Readonly<Record<string, OptionKind>>, ...kinds: OptionKind[]): string[] {
   return Object.keys(table).filter((k) => kinds.includes(table[k] as OptionKind));
+}
+
+// ---------------------------------------------------------------------------
+// Unknown-key diagnostic
+// ---------------------------------------------------------------------------
+
+/**
+ * The operations a caller can invoke, mapped to the table that describes their
+ * legal keys. The `*OrThrow` and `findFirst` variants take the same args as the
+ * method they are built on, so they share its table rather than getting a copy
+ * that could drift from it.
+ */
+const OPERATION_TABLE: Readonly<Record<string, Readonly<Record<string, OptionKind>>>> = {
+  ...ALL_OPTION_TABLES,
+  findFirst: FIND_MANY_OPTIONS,
+  findFirstOrThrow: FIND_MANY_OPTIONS,
+  findUniqueOrThrow: FIND_UNIQUE_OPTIONS,
+  findManyStreamBatches: FIND_MANY_STREAM_OPTIONS,
+};
+
+/**
+ * Prisma spellings that name a real Turbine option under a different word.
+ *
+ * Only spellings whose Turbine equivalent EXISTS belong here: the message tells
+ * the caller what to write instead, so a key with no equivalent would produce
+ * advice that does not work. `take` / `skip` were once on this list and are now
+ * accepted outright.
+ */
+const PRISMA_SPELLING: Readonly<Record<string, string>> = {
+  include: 'with',
+};
+
+/**
+ * Dev-mode warning for a key that is not part of the operation's option
+ * surface, and is therefore doing nothing.
+ *
+ * The motivating case is `include`. It is Prisma's word for `with`, it is what
+ * a model or a developer coming from Prisma reaches for first, and an
+ * unrecognized key is simply ignored: the query runs, returns rows, and the
+ * relation the caller asked for is absent. No error, no empty array, just a
+ * missing key on every row. A cross-model eval measured this as the single
+ * largest source of confidently-wrong queries against Turbine, and every one of
+ * them looked like a success from inside the process.
+ *
+ * A WARNING and never an error, deliberately. Refusing an unknown key would
+ * break `findMany({ ...someOptionsBag })`, which is ordinary code, and the
+ * option surface grows: a caller pinned to an older minor would have their
+ * working query start throwing. A warning costs a correct program nothing and
+ * tells an incorrect one exactly what happened.
+ *
+ * Dev-only, once per `table.operation.key` per process, and total: the whole
+ * body is wrapped, because a diagnostic must never be the reason a query fails.
+ */
+export function warnUnknownQueryOptions(table: string, operation: string, args: unknown): void {
+  if (process.env.NODE_ENV === 'production') return;
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) return;
+  const known = OPERATION_TABLE[operation];
+  if (!known) return;
+  try {
+    for (const key of Object.keys(args as Record<string, unknown>)) {
+      // `{ ...maybeOptions }` routinely materializes keys with no value.
+      // Nothing is being ignored when the value is undefined.
+      if ((args as Record<string, unknown>)[key] === undefined) continue;
+      if (Object.hasOwn(known, key)) continue;
+      if (!shouldWarnOnce(WARN_NS.unknownQueryOption, `${table}.${operation}.${key}`)) continue;
+      const prismaSpelling = PRISMA_SPELLING[key];
+      const suggestion = prismaSpelling ?? suggestKey(key, Object.keys(known));
+      const because = prismaSpelling ? ` Turbine spells this "${prismaSpelling}".` : '';
+      console.warn(
+        `[turbine] unknown option "${key}" in ${table}.${operation}(), it is ignored.${because}` +
+          (!prismaSpelling && suggestion ? ` Did you mean "${suggestion}"?` : ''),
+      );
+    }
+  } catch {
+    // Key enumeration is the only thing that can fail here (a Proxy whose
+    // ownKeys throws), and it must not take the query with it.
+  }
 }

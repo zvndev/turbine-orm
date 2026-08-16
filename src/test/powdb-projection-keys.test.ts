@@ -181,7 +181,9 @@ describe('powdb projection keys: the internally-forced PK is stripped from the e
   it('findUnique and findFirst strip identically to findMany', async () => {
     for (const method of ['findUnique', 'findFirst'] as const) {
       const mock = mockPool({ post: [{ id: 'p1', title: 'hello' }] });
-      const row = await qi(mock, 'post')[method]({ where: { title: 'hello' }, select: { title: true } });
+      // Keyed on the PK: this is about the PROJECTION, and findUnique needs a
+      // where that identifies one row.
+      const row = await qi(mock, 'post')[method]({ where: { id: 'p1' }, select: { title: true } });
       assert.deepEqual(Object.keys(row), ['title'], method);
     }
   });

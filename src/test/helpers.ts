@@ -155,10 +155,17 @@ export function mockColumn(name: string, field: string, pgType = 'int8'): Column
   };
 }
 
-/** Build a minimal TableMetadata for testing */
+/**
+ * Build a minimal TableMetadata for testing.
+ *
+ * `unique: true` on a column adds it to `uniqueColumns`, which is what
+ * `findUnique` reads to decide whether a `where` identifies one row. Without it
+ * a mock table's only unique key is its `id`, so a fixture whose test looks up
+ * by email has to say so, exactly as a real schema would.
+ */
 export function mockTable(
   tableName: string,
-  columns: { name: string; field: string; pgType?: string }[],
+  columns: { name: string; field: string; pgType?: string; unique?: boolean }[],
   relations: Record<string, RelationDef> = {},
 ): TableMetadata {
   const cols = columns.map((c) => mockColumn(c.name, c.field, c.pgType ?? 'int8'));
@@ -182,7 +189,7 @@ export function mockTable(
     pgTypes: Object.fromEntries(cols.map((c) => [c.name, c.pgType])),
     allColumns,
     primaryKey: ['id'],
-    uniqueColumns: [['id']],
+    uniqueColumns: [['id'], ...columns.filter((c) => c.unique).map((c) => [c.name])],
     relations,
     indexes: [],
   };

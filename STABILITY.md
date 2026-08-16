@@ -85,7 +85,7 @@ We are **not at 1.0 yet**, and the gaps are specific. (This section is dated by 
 - Real-engine CI runs Postgres 14–17 on every PR, plus MySQL / SQL Server / CockroachDB / PowDB integration jobs as hard gates. Non-Postgres engines remain **Experimental** for the public API contract.
 - Multi-dialect engines (SQLite / MySQL / MSSQL / PowDB) ship as subpath exports but are not yet on the Stable tier, see Experimental surfaces.
 - Every release gets a git tag and a GitHub Release with notes from the CHANGELOG; the release workflow creates the GitHub Release automatically on a tag push.
-- The formal Stable-surface freeze has **not started**. The 0.49–0.64 run shipped several breaking changes to Stable surfaces, each under the security/correctness escape hatch above (silent-wrong-results fixes), each called out in the CHANGELOG. The freeze clock starts when a release ships with no such change, and resets when one does.
+- The formal Stable-surface freeze has **not started**. The 0.49–0.73 run shipped several breaking changes to Stable surfaces, each under the security/correctness escape hatch above (silent-wrong-results fixes), each called out in the CHANGELOG. The most recent is 0.73.0, where `findUnique` began refusing a `where` that does not identify a single row: it previously returned an arbitrary one of the matching rows, which is the same class. The freeze clock starts when a release ships with no such change, and resets when one does.
 
 When those are addressed, we'll cut 1.0, and not before. Until then, the safe way to adopt Turbine is to **pin a version** and read the CHANGELOG before upgrading. Stable surfaces should carry you across minors without code changes; Experimental surfaces may not.
 

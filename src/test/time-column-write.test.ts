@@ -42,12 +42,16 @@ const A_DATE_LITERAL = '2026-07-25';
 
 function buildSchema(): SchemaMetadata {
   const tables: Record<string, TableMetadata> = {};
+  // The temporal columns are declared UNIQUE so the findUnique fast-path suite
+  // below can look a row up BY them: findUnique refuses a `where` that does not
+  // identify one row, and what is under test here is how a Date BINDS on each
+  // column type, not which column a real schema would make unique.
   tables.report_schedules = mockTable('report_schedules', [
     { name: 'id', field: 'id' },
-    { name: 'time', field: 'time', pgType: 'time' },
+    { name: 'time', field: 'time', pgType: 'time', unique: true },
     { name: 'time_tz', field: 'timeTz', pgType: 'timetz' },
-    { name: 'created_at', field: 'createdAt', pgType: 'timestamp' },
-    { name: 'updated_at', field: 'updatedAt', pgType: 'timestamptz' },
+    { name: 'created_at', field: 'createdAt', pgType: 'timestamp', unique: true },
+    { name: 'updated_at', field: 'updatedAt', pgType: 'timestamptz', unique: true },
     { name: 'on_date', field: 'onDate', pgType: 'date' },
     { name: 'label', field: 'label', pgType: 'text' },
     { name: 'slots', field: 'slots', pgType: '_time' },

@@ -20,7 +20,7 @@ Six reasons, each with the mechanism that makes it true:
 2. **Written from scratch.** Turbine is not a layer over Knex or a query-builder library. Query compilation is plain string building with an FNV-1a shape fingerprint into a bounded LRU of SQL templates, so there is no plan cache to size and no compiler running on your event loop.
 3. **Nested relations in one statement.** A `with` clause compiles to correlated `json_agg` subqueries, so users with posts with comments is one round trip, typed end to end: `users[0].posts[0].comments[0].author.name` autocompletes with no annotation.
 4. **Close to raw SQL.** In the last published run, Turbine's overhead over a hand-written `pg` control was 1.08x by geometric mean. The table is below; the losses are stated with the wins.
-5. **Agents get typed tools, not a SQL prompt.** `npx turbine mcp` exposes eleven read-only MCP tools, including a relation graph and a join-path finder that returns the `with` clause to write. Every tool runs inside `BEGIN READ ONLY`, and PII-tagged columns are redacted before rows reach a model.
+5. **Agents get a skill and typed tools, not a SQL prompt.** `npx turbine skill` installs a query-writing skill whose every claim is executed against a live database before release; `npx turbine mcp` exposes eleven read-only MCP tools, including a relation graph and a join-path finder that returns the `with` clause to write. Every tool runs inside `BEGIN READ ONLY`, and PII-tagged columns are redacted before rows reach a model.
 6. **The dangerous operations ask first.** Destructive migration statements refuse to run without typed consent. `update`/`delete` with an empty `where` throws. Columns tagged `pii: true` are excluded from the emitted SQL's projections. `turbine doctor` reports missing FK indexes offline, no account, no telemetry.
 
 ## Benchmarks
@@ -216,11 +216,14 @@ Every error extends `TurbineError` with a stable code (`TURBINE_E001` through `E
 
 ## Built for agents
 
-An agent pointed at a database usually gets a connection string and guesses. Turbine gives it typed tools instead:
+An agent pointed at a database usually gets a connection string and guesses. Turbine gives it a skill and typed tools instead:
 
 ```bash
+npx turbine skill  # install the query-writing skill into the project
 npx turbine mcp    # read-only MCP server over JSON-RPC stdio, ships in the package
 ```
+
+The skill covers what an agent gets wrong on a schema it has not seen: `with` versus Prisma's `include`, how relation names are derived, what `select` may name, relation filters, the `having` shape, JSON paths, and which error each mistake produces. **Every factual claim in it is executed against a live database before release**, so it cannot drift from the ORM the way documentation usually does. `--agents` prints a short block for `AGENTS.md` instead.
 
 Eleven tools, every one inside `BEGIN READ ONLY` with a statement timeout, so an agent cannot mutate anything through this server:
 
@@ -238,7 +241,7 @@ Eleven tools, every one inside `BEGIN READ ONLY` with a statement timeout, so an
 | `migrate_status` | Applied vs pending migrations, without applying anything. |
 | `doctor_report` | Missing relation indexes, from the same advisor `turbine doctor` uses. |
 
-The rest of the agent story is structural: query args are fully typed, so a wrong query is a compile error the agent can read; errors carry stable codes it can branch on; and [llms.txt](https://turbineorm.dev/llms.txt) / [llms-full.txt](https://turbineorm.dev/llms-full.txt) give it the docs in fetchable form. Setup for Claude Code and Cursor, plus a drop-in instructions snippet: [turbineorm.dev/ai-agents](https://turbineorm.dev/ai-agents).
+The rest of the agent story is structural: query args are fully typed, so a wrong query is a compile error the agent can read; errors carry stable codes it can branch on; an unrecognized query option warns instead of being silently dropped; and [llms.txt](https://turbineorm.dev/llms.txt) / [llms-full.txt](https://turbineorm.dev/llms-full.txt) give it the docs in fetchable form. Setup for Claude Code and Cursor, plus a drop-in instructions snippet: [turbineorm.dev/ai-agents](https://turbineorm.dev/ai-agents).
 
 ## Safety tooling
 

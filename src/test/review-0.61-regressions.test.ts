@@ -30,7 +30,7 @@ describe('findUnique refuses a where with no predicate', () => {
     tables: {
       users: mockTable('users', [
         { name: 'id', field: 'id' },
-        { name: 'email', field: 'email', pgType: 'text' },
+        { name: 'email', field: 'email', pgType: 'text', unique: true },
       ]),
     },
     enums: {},
@@ -60,7 +60,23 @@ describe('findUnique refuses a where with no predicate', () => {
 
   it('still allows a real predicate, including one that is only a null check', () => {
     assert.match(q.buildFindUnique({ where: { id: 1 } }).sql, /WHERE/);
-    assert.match(q.buildFindUnique({ where: { email: null } as never }).sql, /IS NULL/);
+    // A null check is a predicate, and this guard is only about their ABSENCE.
+    // It has to sit beside a key now, because 0.73.0 added a second guard for a
+    // where that has predicates but identifies no row; that guard is asserted
+    // below, and this assertion is here to prove THIS one did not widen.
+    assert.match(q.buildFindUnique({ where: { id: 1, email: null } as never }).sql, /IS NULL/);
+  });
+
+  it('0.73.0: a predicate that identifies no single row is refused by its own guard', () => {
+    // `email` is unique, and Postgres permits any number of NULLs in a unique
+    // column, so `IS NULL` is not an identity however unique the column is.
+    assert.throws(
+      () => q.buildFindUnique({ where: { email: null } as never }),
+      (err: unknown) =>
+        err instanceof ValidationError &&
+        /does not identify a single row/.test((err as Error).message) &&
+        /findFirst/.test((err as Error).message),
+    );
   });
 
   it('leaves findFirst alone: an optional filter is its contract, and Prisma agrees', () => {

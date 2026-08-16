@@ -18,7 +18,7 @@ import { makeQuery, mockTable } from './helpers.js';
 const usersTable = mockTable('users', [
   { name: 'id', field: 'id' },
   { name: 'name', field: 'name', pgType: 'text' },
-  { name: 'email', field: 'email', pgType: 'text' },
+  { name: 'email', field: 'email', pgType: 'text', unique: true },
   { name: 'age', field: 'age' },
   { name: 'org_id', field: 'orgId' },
 ]);
@@ -584,16 +584,22 @@ describe('param order correctness', () => {
     const schema = makeSchema({ users: usersTable });
     const qi = makeQuery('users', schema);
 
-    const d = qi.buildFindUnique({ where: { age: { gt: 18, lte: 65 } } });
-    assert.deepEqual(d.params, [18, 65]);
+    // `id` pins the row (findUnique requires that); the operator pair beside it
+    // is what this asserts on, and it still binds both bounds in order.
+    const d = qi.buildFindUnique({ where: { id: 7, age: { gt: 18, lte: 65 } } });
+    // Keys bind in sorted order (`age` before `id`), which is what keeps the
+    // fingerprint and the param collection aligned.
+    assert.deepEqual(d.params, [18, 65, 7]);
   });
 
   it('findUnique with null where: no param for IS NULL', () => {
     const schema = makeSchema({ users: usersTable });
     const qi = makeQuery('users', schema);
 
-    const d = qi.buildFindUnique({ where: { email: null } });
-    assert.deepEqual(d.params, []);
+    // A null is not an identity (many rows may be null on a unique column), so
+    // the lookup key is `id` and `email: null` is the predicate under test.
+    const d = qi.buildFindUnique({ where: { id: 7, email: null } });
+    assert.deepEqual(d.params, [7]);
     assert.ok(d.sql.includes('IS NULL'));
   });
 });

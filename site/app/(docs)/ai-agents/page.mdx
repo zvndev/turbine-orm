@@ -1,13 +1,13 @@
 export const metadata = {
   title: 'Turbine for AI agents',
   description:
-    'How to point a coding agent at Turbine ORM: the llms.txt integration point, the deterministic introspect-generate-typed-client flow, why typed query args and coded errors suit agents, and a drop-in agent-instructions snippet.',
+    'How to point a coding agent at Turbine ORM: the installable query skill, the read-only MCP server, the llms.txt integration point, the deterministic introspect-generate-typed-client flow, and a drop-in agent-instructions snippet.',
   alternates: { canonical: '/ai-agents' },
 };
 
 # Turbine for AI agents
 
-Turbine is built to be legible to AI coding agents, not just to people. Four properties do the work: a **read-only [MCP server](/mcp)** with eleven tools that ground the agent in your live schema, a **deterministic codegen flow** it can run and re-run, **fully typed query arguments** that turn an invalid query into a compile error it can read, and **stable coded errors** it can branch on instead of parsing prose. This page shows how to point an agent at Turbine and gives you a snippet to drop into your project so the agent uses it correctly.
+Turbine is built to be legible to AI coding agents, not just to people. Five properties do the work: an **installable skill** (`npx turbine skill`) whose every claim is executed against a live database before release, a **read-only [MCP server](/mcp)** with eleven tools that ground the agent in your live schema, a **deterministic codegen flow** it can run and re-run, **fully typed query arguments** that turn an invalid query into a compile error it can read, and **stable coded errors** it can branch on instead of parsing prose. This page shows how to point an agent at Turbine and gives you a snippet to drop into your project so the agent uses it correctly.
 
 ## Point an agent at Turbine: `llms.txt`
 
@@ -19,6 +19,49 @@ Turbine publishes an [llms.txt](https://turbineorm.dev/llms.txt) at the site roo
 | `llms-full.txt` | [turbineorm.dev/llms-full.txt](https://turbineorm.dev/llms-full.txt) | Condensed API reference: reads, writes, WHERE operators, transactions, errors, engines. |
 
 To ground an agent, hand it one or both URLs, or paste them into your project's agent-instructions file (see the snippet below). Both are static text: fetch them, cache them, feed them into context.
+
+## The installable skill
+
+```bash
+npx turbine skill
+```
+
+writes a query-writing skill to `.claude/skills/turbine-orm/SKILL.md`. It covers
+the constructs an agent gets wrong on a schema it has not seen: `with` versus
+Prisma's `include`, how relation names are derived, what `select` may and may not
+name, the WHERE operator set, relation filters, per-relation options, `having`,
+JSON paths, and which errors each mistake produces.
+
+Two variants for other setups:
+
+| command | what it does |
+|---|---|
+| `npx turbine skill --print` | writes the skill to stdout, so you can pipe it anywhere |
+| `npx turbine skill --agents` | prints a short instructions block for `AGENTS.md` / `CLAUDE.md` |
+| `npx turbine skill --dir <path>` | installs under a different skills root |
+
+**Every factual claim in the skill is executed against a live database before
+release.** The repository's eval harness runs each sentence as a query and fails
+the build if the answer changed, so the file cannot drift from the ORM the way
+documentation usually does. That check exists because the previous version of
+this skill carried a table saying a snake_case column name was rejected in
+`orderBy`, which was true when it was written and false one release later.
+
+### What it is worth, measured
+
+On a held-out schema the models had never seen, across 240 scored attempts:
+
+| | cold, schema only | + the skill | + a live MCP connection |
+|---|---|---|---|
+| `claude-sonnet-5` | 73% | **97%** | 93% |
+| `claude-haiku-4-5` | 60% | **97%** | 90% |
+
+Run-to-run variance on this harness measures about 7 points, so the skill's
+contribution is well outside noise, and on both models it matched or beat the
+live tool connection. Twelve of the twenty cold failures were the same mistake,
+a relation named inside `select`, which is the fourth thing the skill says.
+Method, raw records and what the numbers do **not** show: `evals/` in the
+repository.
 
 ## The MCP server
 
@@ -105,16 +148,22 @@ Client
 
 Reads
 - `db.<table>.findMany({ where, with, orderBy, limit, offset, cursor, select, omit })`.
-- Nested relations go in `with`, never as N+1 loops or manual joins. `with` results
-  are fully typed at any depth.
+  `take`/`skip` are accepted as aliases for `limit`/`offset`.
+- Nested relations go in `with`, never Prisma's `include`, and never as N+1 loops or
+  manual joins. An unrecognized option is IGNORED, so an `include` returns rows with
+  the relation missing. `with` results are fully typed at any depth.
+- `select` and `omit` name columns only. A relation named in `select` throws (E003);
+  relations carry their own nested `select`.
 - Under `relationLoadStrategy: 'join'` the whole `with` tree resolves in ONE SQL
   statement (json_agg). The default is `'auto'`, which keeps that plan but may move
   an individual relation (or `_count`) to one flat follow-up statement when the join
   would be slower, e.g. an unindexed correlation column. The returned rows are
   identical either way, so do not assert on statement counts unless the query pins
   a strategy.
-- `findUnique` (by PK or unique column) returns `T | null`; `findUniqueOrThrow` throws
-  NotFoundError (E001). `findFirst` for non-unique first-match.
+- `findUnique` needs a `where` that identifies one row (PK, a unique column, or every
+  column of a compound unique) and returns `T | null`; anything else throws E003.
+  `findUniqueOrThrow` throws NotFoundError (E001) on a miss. Use `findFirst` for
+  "any row matching a filter", with an `orderBy` if which row matters.
 
 Writes
 - `create`, `createMany`, `update`, `updateMany`, `delete`, `deleteMany`, `upsert`.

@@ -212,3 +212,123 @@ export function expandCompoundUniqueWhere(
 
   return result ?? where;
 }
+
+/**
+ * Every column set that identifies AT MOST ONE ROW of this table.
+ *
+ * Same sources and the same partial-index rule as {@link syntheticKeyMap}, and
+ * in this module for that reason: "what identifies one row" is one question,
+ * and answering it in two places is how a compound selector comes to be
+ * accepted by the name and refused by its members (0.72.0 fixed exactly that).
+ * The difference is only the arity: a synthetic SELECTOR needs two or more
+ * columns to have a joined name, while a single-column unique identifies a row
+ * perfectly well.
+ */
+/**
+ * Throw unless `where` identifies a single row. The refusal for `findUnique` on
+ * EVERY engine, message included.
+ *
+ * Shared rather than written twice because `PowqlInterface` is a parallel
+ * implementation: two copies of a rule this specific (which sources count as
+ * unique, whether a null identifies, which keys the message lists) is how two
+ * engines come to disagree about whether a query is valid, which is the exact
+ * divergence 0.64.0 and 0.72.0 were both spent on.
+ *
+ * The message lists the keys that WOULD work, because the fix is almost always
+ * one of them and a caller cannot be expected to know which columns the
+ * database considers unique. A table with no unique key at all gets its own
+ * sentence: no `where` satisfies this, and "name a unique key" is advice that
+ * person cannot take.
+ */
+export function assertWhereIdentifiesOneRow(
+  meta: TableMetadata,
+  table: string,
+  where: Record<string, unknown> | undefined,
+): void {
+  if (whereIdentifiesOneRow(meta, where ?? {})) return;
+  const field = (c: string): string => meta.reverseColumnMap[c] ?? c;
+  const keys = uniqueKeyNames(meta).map((cols) =>
+    cols.length === 1 ? `\`${field(cols[0] as string)}\`` : `\`{ ${cols.map(field).join(', ')} }\``,
+  );
+  const advice =
+    keys.length > 0
+      ? `Name a unique key (${keys.join(', ')}), or use \`findFirst\` if you meant "any row matching a filter".`
+      : `Table "${table}" declares no primary key and no unique constraint, so no \`where\` can identify one row ` +
+        'here. Use `findFirst` (add an `orderBy` to make which row it is deterministic).';
+  throw new ValidationError(
+    `[turbine] findUnique on "${table}" refused: the \`where\` clause does not identify a single row, ` +
+      `so this would return an arbitrary one of the rows that match. ${advice}`,
+  );
+}
+
+export function uniqueKeyNames(meta: TableMetadata): string[][] {
+  return dedupeColumnSets(uniqueColumnSets(meta));
+}
+
+/** Distinct column sets, preserving first-seen order (a PK is often also a declared unique). */
+function dedupeColumnSets(sets: string[][]): string[][] {
+  const seen = new Set<string>();
+  const out: string[][] = [];
+  for (const cols of sets) {
+    const sig = cols.join('\u0000');
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    out.push(cols);
+  }
+  return out;
+}
+
+function uniqueColumnSets(meta: TableMetadata): string[][] {
+  const sets: string[][] = [];
+  if (meta.primaryKey.length > 0) sets.push(meta.primaryKey);
+  for (const uc of meta.uniqueColumns) if (uc.length > 0) sets.push(uc);
+  for (const idx of meta.indexes) {
+    if (idx.unique && !idx.docPath && !idx.partial && idx.columns.length > 0) sets.push(idx.columns);
+  }
+  return sets;
+}
+
+/**
+ * True when `where` pins every column of at least one unique key to a single
+ * value, so the row it names is the row it gets.
+ *
+ * Deliberately reads only the TOP LEVEL of the user's where. A unique key
+ * buried inside an `OR` does not identify a row (the other branch matches
+ * whatever it matches), and one inside an `AND` array is a shape nobody writes
+ * for a lookup by identity. Extra predicates alongside the key are fine: they
+ * can only narrow a set that already holds at most one row.
+ *
+ * A NULL is not an identity. `WHERE email IS NULL` matches every row whose
+ * email is null, which a UNIQUE constraint permits any number of, so a null
+ * value satisfies no key here even on a unique column.
+ */
+export function whereIdentifiesOneRow(meta: TableMetadata, where: Record<string, unknown>): boolean {
+  const pinned = new Set<string>();
+  for (const [key, value] of Object.entries(where)) {
+    if (!isPinnedToOneValue(value)) continue;
+    const column = resolveColumnName(meta, key);
+    if (column !== undefined) pinned.add(column);
+  }
+  if (pinned.size === 0) return false;
+  return uniqueColumnSets(meta).some((cols) => cols.every((c) => pinned.has(c)));
+}
+
+/** A bare value, or an operator object whose `equals` is a value. */
+function isPinnedToOneValue(value: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  if (isWhereOperator(value)) {
+    const eq = (value as { equals?: unknown }).equals;
+    return eq !== undefined && eq !== null;
+  }
+  // A JSON / array / vector filter narrows, it does not identify.
+  if (isJsonFilter(value) || isArrayFilter(value) || isVectorFilter(value)) return false;
+  // Anything else that is a plain object is a relation filter or a sub-where,
+  // neither of which pins a column. Dates, Buffers and primitives are values.
+  return !isPlainObject(value);
+}
+
+function isPlainObject(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}

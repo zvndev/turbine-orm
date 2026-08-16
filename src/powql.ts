@@ -60,9 +60,10 @@ import {
   rowToEntity,
 } from './powdb.js';
 import { assertAggregatePiiOptIn } from './query/aggregates.js';
-import { expandCompoundUniqueWhere } from './query/compound-unique.js';
+import { assertWhereIdentifiesOneRow, expandCompoundUniqueWhere } from './query/compound-unique.js';
 import { isJsonFilter, isRelationPickOrderBy, orderByEntries } from './query/filters.js';
 import type { MiddlewareFn, QueryEvent, QueryInterfaceOptions } from './query/index.js';
+import { warnUnknownQueryOptions } from './query/option-surface.js';
 import { normalizeWithClause } from './query/relation-names.js';
 import type {
   AggregateArgs,
@@ -94,6 +95,7 @@ import type {
 import { assertDirectionToken, resolveUnsafeFlag, UNSAFE } from './query/types.js';
 import {
   escapeLike,
+  normalizePagination,
   ownLookup,
   relationInProjectionMessage,
   resolveColumnName,
@@ -496,13 +498,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   /**
-   * The `limit` a query actually emits: the explicit `limit`, Prisma's `take`
-   * alias, then the client-level `defaultLimit`. Shared by {@link buildFind} and
-   * the {@link findMany} zero short-circuit so the two can never disagree about
-   * which limit is in force.
+   * The `limit` a query actually emits: the explicit `limit`, then the
+   * client-level `defaultLimit`. Prisma's `take` alias is already folded into
+   * `limit` by `normalizeArgs`, so there is one spelling by the time this runs.
+   * Shared by {@link buildFind} and the {@link findMany} zero short-circuit so
+   * the two can never disagree about which limit is in force.
    */
   private effectiveLimit(args: FindManyArgs<T>): number | undefined {
-    return args.limit ?? (args as { take?: number }).take ?? this.defaultLimit;
+    return args.limit ?? this.defaultLimit;
   }
 
   /**
@@ -542,6 +545,19 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return normalized === args.with ? args : ({ ...args, with: normalized } as A);
   }
 
+  /**
+   * Caller args in canonical form: declared relation spellings, and `take` /
+   * `skip` folded into `limit` / `offset`.
+   *
+   * Same composition as `QueryInterface.normalizeArgs` and here for the same
+   * reason the method above is here: nothing about a parallel implementation
+   * makes a core rule arrive on its own, and an engine that reads `take` but
+   * not `skip` pages differently from one that reads both.
+   */
+  private normalizeArgs<A extends { with?: unknown }>(args: A): A {
+    return normalizePagination(this.withDeclaredRelationNames(args));
+  }
+
   private assertNoForceCustomPlan(args: { forceCustomPlan?: boolean } | undefined): void {
     if (args?.forceCustomPlan !== true) return;
     throw new UnsupportedFeatureError(
@@ -550,6 +566,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       'Forcing a per-query custom plan means keeping the statement out of the PostgreSQL plan cache, and PowDB ' +
         'has no such cache to keep it out of. Remove the option, or set it only on PostgreSQL queries.',
     );
+  }
+
+  /** See query/compound-unique.ts: one rule and one message across engines. */
+  private assertIdentifiesOneRow(where: Record<string, unknown> | undefined): void {
+    assertWhereIdentifiesOneRow(this.meta, this.table, where);
   }
 
   private assertPagination(limit: number | undefined, offset: number | undefined, context: string): void {
@@ -1562,6 +1583,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     args: Record<string, unknown>,
     executor: () => Promise<R>,
   ): Promise<R> {
+    // The unknown-key diagnostic, at the same seam and for the same reason as
+    // `QueryInterface.executeWithMiddleware`. The option surface is the CORE
+    // one because these args ARE core's args; PowDB reads them, it does not
+    // define them.
+    warnUnknownQueryOptions(this.table, action, args);
     if (this.middlewares.length === 0) return executor();
     let index = 0;
     const next = async (p: { model: string; action: string; args: Record<string, unknown> }): Promise<unknown> => {
@@ -1588,7 +1614,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async findMany(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T[]> {
     this.assertNoForceCustomPlan(args);
-    args = this.withDeclaredRelationNames(args);
+    args = this.normalizeArgs(args);
     return this.withMiddleware('findMany', args as unknown as Record<string, unknown>, async () => {
       // `limit: 0` means "no rows" (SQL `LIMIT 0`), and answering it client-side
       // is correct on every engine version: PowDB's projection fast path returned
@@ -1769,6 +1795,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * too, so both engines agree.
    */
   async explain(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<string[]> {
+    // `explain` must compile the statement `findMany` would run, so it
+    // normalizes the same args the same way. Without this, explaining a query
+    // written with `take` / `skip` would report a plan for a DIFFERENT
+    // statement than the one that executes, which is the one thing a
+    // diagnostic must not do.
+    args = this.normalizeArgs(args);
     const params: unknown[] = [];
     const { powql } = await this.buildFind(args, params);
     const { rows } = await this.exec(`explain ${powql}`, params, args.timeout, 'explain');
@@ -1782,13 +1814,18 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async findUnique(args: FindUniqueArgs<T>): Promise<T | null> {
     this.assertNoForceCustomPlan(args);
-    args = this.withDeclaredRelationNames(args);
+    args = this.normalizeArgs(args);
     // Prisma compound-unique selector → column conjunction (engine parity with
     // the SQL findUnique family; pure metadata, so this is a one-line adoption).
     if (args.where) {
       const expanded = expandCompoundUniqueWhere(this.meta, args.where as Record<string, unknown>);
       if (expanded !== args.where) args = { ...args, where: expanded as FindUniqueArgs<T>['where'] };
     }
+    // AFTER the selector expansion, so a compound selector counts as the key it
+    // is. Same rule and same message as the SQL engines: a `where` that matches
+    // many rows plus `limit 1` returns an arbitrary one of them, and PowDB has
+    // no more of an ordering guarantee there than Postgres does.
+    this.assertIdentifiesOneRow(args.where as Record<string, unknown> | undefined);
     return this.withMiddleware('findUnique', args as unknown as Record<string, unknown>, async () => {
       const { rows, native, nestedPlans, linkPlans, residualWith, forcedPk } = await this.runFind(
         { ...args, limit: 1 } as FindManyArgs<T>,
@@ -1814,7 +1851,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   async findFirst(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T | null> {
-    args = this.withDeclaredRelationNames(args);
+    args = this.normalizeArgs(args);
     this.assertNoForceCustomPlan(args);
     return this.withMiddleware('findFirst', args as unknown as Record<string, unknown>, async () => {
       const { rows, native, nestedPlans, linkPlans, residualWith, forcedPk } = await this.runFind(
@@ -2193,7 +2230,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    *     one loader chunk (the loader limits per chunk, the join once globally).
    */
   private joinEligible(rel: RelationDef, opt: unknown, args: FindManyArgs<T>, parentCount: number): boolean {
-    const effLimit = args.limit ?? (args as { take?: number }).take ?? this.defaultLimit;
+    const effLimit = args.limit ?? this.defaultLimit;
     if (effLimit !== undefined || args.offset) return false;
     const options = (opt === true ? {} : opt) as FindManyArgs<object> & { with?: unknown };
     if (options.with) return false;

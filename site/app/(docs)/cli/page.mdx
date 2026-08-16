@@ -1,7 +1,7 @@
 export const metadata = {
   title: 'CLI',
   description:
-    'Every Turbine ORM CLI command: init, pull, push, migrate, seed, status, doctor, studio, mcp, observe. Flags and examples.',
+    'Every Turbine ORM CLI command: init, pull, push, migrate, seed, status, doctor, studio, mcp, observe, skill. Flags and examples.',
   alternates: { canonical: '/cli' },
 };
 
@@ -31,6 +31,7 @@ Commands:
   studio                   Launch local read-only Studio web UI
   mcp                      Start read-only MCP server over JSON-RPC stdio
   observe                  Launch local metrics dashboard
+  skill                    Install the agent query skill
 ```
 
 ## Global options
@@ -562,6 +563,22 @@ DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine mcp
 Eleven tools: `schema_overview`, `table_detail`, `relation_graph`, `find_join_path` (returns the `with` clause to write), `migrate_status`, `doctor_report`, `explain_query` (schema-validated findMany-style args only, no free-form SQL), `compile_query` (the exact SQL a read query would send, without running it), `table_stats`, `sample_rows` (≤ 50 rows), and `explain_error` (needs no database, so it answers when the pool is unreachable). Every database access runs inside `BEGIN READ ONLY`. `--include` / `--exclude` scope which tables are exposed.
 
 Full setup, tool reference, and Claude Code / Cursor config: **[MCP Server](/mcp)**.
+
+## `turbine skill`
+
+Install the query-writing skill an agent should read before writing Turbine queries.
+
+```bash
+npx turbine skill                  # -> .claude/skills/turbine-orm/SKILL.md
+npx turbine skill --print          # to stdout, pipe it anywhere
+npx turbine skill --agents         # a short block for AGENTS.md / CLAUDE.md
+npx turbine skill --dir .agent/skills
+```
+
+The skill ships inside the package rather than being generated, and every
+factual claim in it is executed against a live database before release, so it
+cannot drift from the ORM. Contents and the rest of the agent setup:
+**[Turbine for AI agents](/ai-agents)**.
 
 ## `turbine observe`
 

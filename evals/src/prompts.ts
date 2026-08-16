@@ -16,17 +16,18 @@
  */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { EVALS_DIR, REPO_ROOT } from './config.js';
+import { REPO_ROOT } from './config.js';
 import { ddlText } from './schema-meta.js';
 import type { Task } from './tasks.js';
 
-export type Arm = 'A' | 'B' | 'C' | 'D';
+export type Arm = 'A' | 'B' | 'C' | 'D' | 'E';
 
 export const ARM_LABEL: Record<Arm, string> = {
   A: 'cold (schema DDL only)',
   B: 'docs (+ llms.txt)',
   C: 'tools (+ live turbine mcp)',
-  D: 'skill (+ candidate skill)',
+  D: 'skill (+ packaged skill)',
+  E: 'skill only (schema DDL + packaged skill, no docs, no tools)',
 };
 
 export const BASE_SYSTEM = `You are answering database query tasks using Turbine, a TypeScript ORM for PostgreSQL.
@@ -49,8 +50,20 @@ export function docsText(): string {
   return readFileSync(resolve(REPO_ROOT, 'site', 'public', 'llms.txt'), 'utf8');
 }
 
+/**
+ * Arm D reads the PACKAGED skill, the file `npx turbine skill` installs, with
+ * its frontmatter stripped (that is metadata for a skill loader, not content
+ * for a model).
+ *
+ * It used to read a candidate copy under evals/, which meant the measured
+ * artifact and the shipped one could drift apart silently, and after 0.72.0
+ * they had: the candidate's table said a snake_case column name was REJECTED in
+ * `orderBy`, which the release had just made false. Measuring the file that
+ * ships is the only version of this that stays true.
+ */
 export function skillText(): string {
-  return readFileSync(resolve(EVALS_DIR, 'candidate-skill.md'), 'utf8');
+  const raw = readFileSync(resolve(REPO_ROOT, 'skills', 'turbine-orm', 'SKILL.md'), 'utf8');
+  return raw.replace(/^---\n[\s\S]*?\n---\n/, '').trim();
 }
 
 const TOOLS_NOTE = `You have MCP tools from a live \`turbine mcp\` server connected to the very database these tasks run against.
@@ -58,7 +71,17 @@ Use them. \`relation_graph\` and \`find_join_path\` report the exact relation na
 \`table_detail\` and \`schema_overview\` report columns and types, and \`compile_query\` validates a set of query
 args against the live schema before you commit to it. Reading a name is better than guessing one.`;
 
-/** The system prompt for an arm. Static across tasks, so it caches well. */
+/**
+ * The system prompt for an arm. Static across tasks, so it caches well.
+ *
+ * A-D are CUMULATIVE, which prices each layer against the one below it. **E is
+ * not part of that ladder**: it is A plus the skill and nothing else, and it
+ * exists because the cumulative design cannot answer the question the skill is
+ * actually shipped for. In arm D the MCP tools are already connected, and a
+ * model that can read the declared relation names does not need to be told how
+ * they are derived, so D measures the skill where it has the least left to say.
+ * Most people who install a skill do not also run an MCP server.
+ */
 export function systemFor(arm: Arm): string {
   const parts = [BASE_SYSTEM];
   if (arm === 'B' || arm === 'C' || arm === 'D') {
@@ -67,7 +90,7 @@ export function systemFor(arm: Arm): string {
   if (arm === 'C' || arm === 'D') {
     parts.push(`# Tools\n\n${TOOLS_NOTE}`);
   }
-  if (arm === 'D') {
+  if (arm === 'D' || arm === 'E') {
     parts.push(`# Query-writing guide\n\n${skillText()}`);
   }
   return parts.join('\n\n---\n\n');

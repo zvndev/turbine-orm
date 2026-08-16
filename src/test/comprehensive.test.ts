@@ -245,13 +245,23 @@ testFn('comprehensive integration tests', () => {
       }
     });
 
-    it('take overrides limit', async () => {
-      const results = await db.table('users').findMany({
-        orderBy: { id: 'asc' },
-        limit: 100,
-        take: 3,
-      });
-      assert.equal(results.length, 3);
+    it('take is limit, and skip is offset', async () => {
+      const aliased = await db.table('users').findMany({ orderBy: { id: 'asc' }, take: 3, skip: 2 });
+      const native = await db.table('users').findMany({ orderBy: { id: 'asc' }, limit: 3, offset: 2 });
+      assert.equal(aliased.length, 3);
+      assert.deepEqual(aliased, native);
+    });
+
+    it('take and limit disagreeing is refused, not silently resolved', async () => {
+      // Before 0.73.0 `take` won and the other number was dropped. There is no
+      // reading of two different bounds that makes one of them the answer.
+      await assert.rejects(
+        () => db.table('users').findMany({ orderBy: { id: 'asc' }, limit: 100, take: 3 }),
+        (err: unknown) => err instanceof ValidationError && /"take" and "limit"/.test((err as Error).message),
+      );
+      // Agreeing values have nothing to choose between, so they are accepted.
+      const both = await db.table('users').findMany({ orderBy: { id: 'asc' }, limit: 3, take: 3 });
+      assert.equal(both.length, 3);
     });
   });
 
@@ -1478,22 +1488,29 @@ testFn('comprehensive integration tests', () => {
       }
     });
 
-    it('findUnique with operator where (non-cached path)', async () => {
+    it('findUnique with an operator beside the key (non-cached path)', async () => {
+      // The key pins the row; the range beside it is an extra predicate, which
+      // can only narrow a set that already holds at most one row.
       const user = await db.table('users').findUnique({
-        where: { id: { gt: 0, lt: 2 } },
+        where: { id: 1, createdAt: { lt: new Date('2100-01-01') } },
       });
       if (user) {
         assert.equal((user as Record<string, unknown>).id, 1);
       }
     });
 
-    it('findUnique with OR (non-cached path)', async () => {
-      const user = await db.table('users').findUnique({
-        where: { OR: [{ id: 1 }, { id: 2 }] },
-      });
-      assert.ok(user);
-      const id = (user as Record<string, unknown>).id as number;
-      assert.ok(id === 1 || id === 2);
+    it('findUnique refuses a where that matches more than one row', async () => {
+      // Both of these used to run as `... LIMIT 1` with no ORDER BY and return
+      // one arbitrary row of the several that match (0.73.0).
+      for (const where of [{ id: { gt: 0, lt: 3 } }, { OR: [{ id: 1 }, { id: 2 }] }]) {
+        await assert.rejects(
+          () => db.table('users').findUnique({ where: where as never }),
+          (err: unknown) =>
+            err instanceof ValidationError &&
+            /does not identify a single row/.test((err as Error).message) &&
+            /findFirst/.test((err as Error).message),
+        );
+      }
     });
   });
 });

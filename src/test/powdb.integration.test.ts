@@ -163,6 +163,13 @@ const schema: SchemaMetadata = {
   },
 };
 
+// A user's email is unique, as it is in any real schema. Declared here because
+// several tests below look a user up BY it, and `findUnique` requires a `where`
+// that identifies one row (0.73.0): without the declaration, the lookup that
+// tests transaction commit or column round-tripping would be refused for a
+// reason that has nothing to do with what it is testing.
+schema.tables.app_user?.uniqueColumns.push(['email']);
+
 // ---------------------------------------------------------------------------
 // Per-test harness, fresh data dir + schema DDL, torn down after.
 // ---------------------------------------------------------------------------

@@ -42,7 +42,7 @@ await db.disconnect();
 ## Reads
 
 ### findMany(args)
-Returns an array. Supports `where`, `with`, `orderBy`, `limit`/`take`, `offset`, `cursor`, `distinct`, `select`, `omit`.
+Returns an array. Supports `where`, `with`, `orderBy`, `limit`/`take`, `offset`/`skip`, `cursor`, `distinct`, `select`, `omit`. An option that is none of these is IGNORED (with a dev-mode warning naming the key it thinks you meant), so relations must go in `with`: Prisma's `include` runs and returns rows with the relation missing.
 
 ```ts
 const users = await db.users.findMany({
@@ -53,13 +53,13 @@ const users = await db.users.findMany({
 ```
 
 - `select` / `omit`, pick or drop columns (one or the other, not both): `select: { id: true, email: true }`.
-- Pagination: `limit`/`take` + `offset`, or keyset `cursor` (pass the last row's ordered column values; the cursor row is excluded). `take` is a Prisma-compatible alias for `limit`; when both are present `take` wins.
+- Pagination: `limit`/`take` + `offset`/`skip`, or keyset `cursor` (pass the last row's ordered column values; the cursor row is excluded). `take` and `skip` are Prisma-compatible aliases folded into `limit` and `offset`; passing both spellings of one bound with different values throws E003.
 - `distinct: ['userId']`, DISTINCT ON; which row survives per group is governed by `orderBy`.
 - `orderBy`, `{ field: 'asc' | 'desc' }`, or a spec `{ field: { sort: 'desc', nulls: 'last' } }`. Order by a to-many relation's `_count` (`orderBy: { posts: { _count: 'desc' } }`) or a to-one relation's column (`orderBy: { author: { name: 'asc' } }`).
 - `warnOnUnlimited: false` silences the unlimited-query warning per call.
 
 ### findUnique / findUniqueOrThrow
-Look up by primary key or any unique column. `findUnique` returns `T | null`; the `OrThrow` form throws `NotFoundError` (E001). Composite PKs pass all key columns: `where: { userId: 1, orgId: 2 }`.
+Look up by primary key or any unique column. The `where` MUST identify one row (a PK, a single-column unique, or every column of a compound unique; extra predicates beside the key are fine, a null value never counts); anything else throws E003 naming the keys that would work, because it would otherwise return an arbitrary one of the matching rows. Use `findFirst` for "any row matching a filter". `findUnique` returns `T | null`; the `OrThrow` form throws `NotFoundError` (E001). Composite PKs pass all key columns: `where: { userId: 1, orgId: 2 }`.
 
 ### findFirst / findFirstOrThrow
 First matching row by `where` + `orderBy` (non-unique lookups).
@@ -220,5 +220,5 @@ Several flagship features stay Postgres-only (pgvector, LISTEN/NOTIFY, RLS sessi
 
 ## Agent integration point
 
-The canonical way to teach an agent about Turbine is to point it at https://turbineorm.dev/llms.txt (index) and this file (full reference), and to add a short instruction block to the project's CLAUDE.md / AGENTS.md, see https://turbineorm.dev/ai-agents for a copy-pasteable snippet. Turbine also ships a read-only MCP server (`npx turbine mcp`) exposing eleven tools to MCP clients like Claude Code and Cursor: schema overview, table detail, relation graph, join-path finder (returns the `with` clause to write), migration status, doctor report, EXPLAIN, query compilation (the exact SQL, without running it), table stats, sample rows, and error lookup. Every database access runs inside `BEGIN READ ONLY`, so an agent cannot mutate data through it, and PII-tagged values are redacted before they reach the model. `explain_error` needs no database, so it still answers when the pool is unreachable.
+The canonical way to teach an agent about Turbine is `npx turbine skill`, which installs a query-writing skill into the project (`--print` writes it to stdout, `--agents` prints an instruction block for CLAUDE.md / AGENTS.md). Every factual claim in that skill is executed against a live database on each release, so it cannot drift from the ORM. Beyond it, point the agent at https://turbineorm.dev/llms.txt (index) and this file (full reference); see https://turbineorm.dev/ai-agents. Turbine also ships a read-only MCP server (`npx turbine mcp`) exposing eleven tools to MCP clients like Claude Code and Cursor: schema overview, table detail, relation graph, join-path finder (returns the `with` clause to write), migration status, doctor report, EXPLAIN, query compilation (the exact SQL, without running it), table stats, sample rows, and error lookup. Every database access runs inside `BEGIN READ ONLY`, so an agent cannot mutate data through it, and PII-tagged values are redacted before they reach the model. `explain_error` needs no database, so it still answers when the pool is unreachable.
 </content>

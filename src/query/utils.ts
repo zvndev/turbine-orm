@@ -5,6 +5,7 @@
  */
 
 import pg from 'pg';
+import { ValidationError } from '../errors.js';
 import { camelToSnake, localDateTimeKind, snakeToCamel, timeOfDayKind } from '../schema.js';
 import { shouldWarnOnce, WARN_NS } from './warn-registry.js';
 
@@ -1580,5 +1581,62 @@ export function selectOmitExclusiveMessage(table: string): string {
   return (
     `[turbine] "select" and "omit" are mutually exclusive (on table "${table}"). ` +
     `A select already lists exactly the fields you want.`
+  );
+}
+
+/**
+ * The Prisma pagination aliases, folded into Turbine's own spelling ONCE,
+ * before anything reads them.
+ *
+ * Turbine's names are `limit` / `offset`; Prisma's are `take` / `skip`. `take`
+ * was accepted and `skip` was not, which is the worst of the three possible
+ * states: `{ take: 20, skip: 40 }` is what a Prisma habit writes, it looks
+ * accepted because half of it is, and the query silently returns page one
+ * forever. An unknown key is at least inert on its own; a HALF-recognized pair
+ * changes the answer.
+ *
+ * Folded here rather than read at each site deliberately. `take` used to be
+ * handled by six separate `args?.take ?? args?.limit` reads, one of which is
+ * the SQL-cache FINGERPRINT, so adding `skip` the same way would have meant
+ * teaching six places about it and a miss in the fingerprint is not a missing
+ * feature, it is two different pages sharing one cached statement. Normalizing
+ * up front leaves `limit` / `offset` as the single authority and the aliases
+ * cease to exist below this line.
+ *
+ * Returns the SAME object when neither alias is present, so the common path
+ * allocates nothing.
+ */
+export function normalizePagination<A extends object | undefined>(args: A): A {
+  if (!args) return args;
+  const a = args as { limit?: unknown; offset?: unknown; take?: unknown; skip?: unknown };
+  if (a.take === undefined && a.skip === undefined) return args;
+
+  const out = { ...(args as Record<string, unknown>) };
+  if (a.take !== undefined) {
+    assertAliasAgrees('take', a.take, 'limit', a.limit);
+    out.limit = a.take;
+    delete out.take;
+  }
+  if (a.skip !== undefined) {
+    assertAliasAgrees('skip', a.skip, 'offset', a.offset);
+    out.offset = a.skip;
+    delete out.skip;
+  }
+  return out as A;
+}
+
+/**
+ * Both spellings of one bound, disagreeing. Refused rather than resolved: the
+ * old `take ?? limit` silently preferred one of the two numbers the caller
+ * wrote, and there is no reading of `{ limit: 10, take: 5 }` that makes one of
+ * them the intended answer. Equal values are accepted, since there is nothing
+ * to choose between.
+ */
+function assertAliasAgrees(alias: string, aliasValue: unknown, native: string, nativeValue: unknown): void {
+  if (nativeValue === undefined || nativeValue === aliasValue) return;
+  throw new ValidationError(
+    `[turbine] "${alias}" and "${native}" are the same option and were given different values ` +
+      `(${alias}: ${String(aliasValue)}, ${native}: ${String(nativeValue)}). ` +
+      `"${alias}" is Prisma's spelling of "${native}"; pass one of them.`,
   );
 }

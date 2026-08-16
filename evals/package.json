@@ -9,7 +9,8 @@
     "run": "tsx src/run.ts",
     "smoke": "tsx src/run.ts --smoke",
     "full": "tsx src/run.ts --full",
-    "report": "tsx src/report.ts"
+    "report": "tsx src/report.ts",
+    "verify:skill": "tsx src/verify-skill.ts"
   },
   "dependencies": {
     "pg": "8.22.0",

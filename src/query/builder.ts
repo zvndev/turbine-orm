@@ -37,7 +37,7 @@ import {
   resolveCountRelations,
   stripFields,
 } from './batched-loader.js';
-import { expandCompoundUniqueWhere } from './compound-unique.js';
+import { assertWhereIdentifiesOneRow, expandCompoundUniqueWhere } from './compound-unique.js';
 import {
   dedupeColumnList,
   dedupeOrderEntries,
@@ -49,6 +49,7 @@ import {
   orderByEntries,
   sortedEntries,
 } from './filters.js';
+import { warnUnknownQueryOptions } from './option-surface.js';
 import { normalizeWithClause } from './relation-names.js';
 import * as relationsMod from './relations.js';
 import type {
@@ -86,6 +87,7 @@ import { resolveSkipGlobalFilters, resolveUnsafeFlag, UNSAFE, type Unsafe } from
 import {
   isTemporalInfinity,
   LRUCache,
+  normalizePagination,
   ownLookup,
   parseDbDate,
   resolveColumnName,
@@ -1248,6 +1250,30 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
+   * Caller args in canonical form: declared relation spellings, and the Prisma
+   * pagination aliases folded into `limit` / `offset`.
+   *
+   * ONE method rather than two calls at each seam, because the two
+   * normalizations have the same requirement and the same failure mode: both
+   * must happen before `withFingerprint` / the cache key, and a seam that
+   * applies one but not the other is a seam where the alias survives into a
+   * fingerprint. Both return their input by reference when there was nothing to
+   * change, so the common path still allocates nothing.
+   */
+  private normalizeArgs<A extends { with?: unknown } | undefined>(args: A): A {
+    return normalizePagination(this.withDeclaredRelationNames(args));
+  }
+
+  /**
+   * Refuse a `findUnique` whose `where` names no unique key. The rule and the
+   * message live in query/compound-unique.ts, beside the definition of what
+   * counts as unique and shared with the PowDB engine.
+   */
+  private assertFindUniqueKey(where: Record<string, unknown> | undefined): void {
+    assertWhereIdentifiesOneRow(this.tableMeta, this.table, where);
+  }
+
+  /**
    * Fill a PK-ascending `orderBy` into every to-many `with` relation that has no
    * explicit one, recursing into nested `with`. Returns a CLONED clause (user
    * args are never mutated); when nothing needs filling it returns the input
@@ -1378,7 +1404,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private isUnorderedPage(args?: {
     limit?: number;
-    take?: number;
     offset?: number;
     cursor?: unknown;
     orderBy?: unknown;
@@ -1387,7 +1412,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (!args) return false;
     if (args.distinct !== undefined) return false;
     if (!isEmptyOrderBy(args.orderBy)) return false;
-    if (args.limit !== undefined || args.take !== undefined || args.offset !== undefined) return true;
+    if (args.limit !== undefined || args.offset !== undefined) return true;
     return this.cursorFields(args.cursor).length > 0;
   }
 
@@ -1412,7 +1437,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private implicitPkOrderBy(args?: {
     limit?: number;
-    take?: number;
     offset?: number;
     cursor?: unknown;
     orderBy?: unknown;
@@ -1443,7 +1467,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private maybeWarnUnorderedPage(args?: {
     limit?: number;
-    take?: number;
     offset?: number;
     cursor?: unknown;
     orderBy?: unknown;
@@ -1460,7 +1483,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const shape = [
       cursorFields.length > 0 ? 'cursor' : '',
       args?.limit !== undefined ? 'limit' : '',
-      args?.take !== undefined ? 'take' : '',
       args?.offset !== undefined ? 'offset' : '',
     ]
       .filter(Boolean)
@@ -1587,7 +1609,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * an arbitrary number of parent rows; a small `limit` bounds it. `findUnique` /
    * `findFirst` pass `false` explicitly (their parent set is one row).
    */
-  private autoParentSetLarge(args?: { limit?: number; take?: number }): boolean {
+  private autoParentSetLarge(args?: { limit?: number }): boolean {
     const bound = this.autoParentBound(args);
     return bound === undefined || bound > this.autoToOneThreshold();
   }
@@ -1601,8 +1623,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * directly: their parent set is one row as a matter of the statement's shape,
    * not an estimate.
    */
-  private autoParentBound(args?: { limit?: number; take?: number }): number | undefined {
-    return args?.take ?? args?.limit ?? this.defaultLimit;
+  private autoParentBound(args?: { limit?: number }): number | undefined {
+    return args?.limit ?? this.defaultLimit;
   }
 
   /**
@@ -1972,7 +1994,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // Declared relation spellings first, exactly as the join path does in
     // buildFindMany: the loader reads `args.with` itself, so without this the
     // two strategies would disagree about which relation names are valid.
-    args = this.withDeclaredRelationNames(args);
+    args = this.normalizeArgs(args);
     // Stable relation order (opt-in): the batched loader forwards each relation's
     // orderBy into its follow-up query, so filling the synthesized PK order here
     // makes the batched output deterministic exactly like the join path.
@@ -2449,6 +2471,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     executor: () => Promise<R>,
   ): Promise<R> {
     this.currentAction = action;
+    // Every public operation passes through here with its own name and the
+    // caller's args, which makes this the one place the unknown-key diagnostic
+    // can be complete. Putting it in each method instead would mean fifteen
+    // sites and a new one every time an operation is added, which is precisely
+    // how the surface it checks came to need checking.
+    warnUnknownQueryOptions(this.table, action, args);
     if (this.middlewares.length === 0) {
       return executor();
     }
@@ -2487,7 +2515,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // changes the warning text from the declared name back to the caller's and
     // nothing else). It is here so the invariant holds at the seam rather than
     // depending on every consumer to re-establish it.
-    args = this.withDeclaredRelationNames(args);
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('findUnique', args as unknown as Record<string, unknown>, async () => {
       if (args.with) {
         const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
@@ -2520,7 +2548,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private async runFindUniqueBatched(args: FindUniqueArgs<T>): Promise<T | null> {
     // Declared relation spellings first, see runFindManyBatched.
-    args = this.withDeclaredRelationNames(args);
+    args = this.normalizeArgs(args);
     // Stable relation order (opt-in), see runFindManyBatched.
     const withClause = this.resolveStableOrder(args.stableRelationOrder)
       ? this.applyStableRelationOrder(args.with as WithClause, this.table)
@@ -2601,9 +2629,22 @@ export class QueryInterface<T extends object, R extends object = {}> {
           'If you meant "any row matching an optional filter", use `findFirst`.',
       );
     }
+    // ...and a where that HAS a predicate but does not name a unique key is the
+    // same hazard one step along (0.73.0). `findUnique({ where: { status:
+    // 'active' } })` used to emit `WHERE status = $1 LIMIT 1` with no ORDER BY:
+    // one row out of many, chosen by the engine, different between two calls
+    // with the same argument and between two plans for the same call. The
+    // caller who wrote `findUnique` asked for the row, not a row, and the
+    // `null` branch they wrote reads as "no such row" when it means "none
+    // matched this filter".
+    //
+    // Checked against the USER's where for the same reason as the guard above:
+    // a global filter is not an identity, and letting one satisfy this would
+    // hand back an arbitrary row from inside the tenant.
+    this.assertFindUniqueKey(args.where as Record<string, unknown>);
     // Declared relation spellings first, before stable-order and the
     // fingerprint (see buildFindMany).
-    args = this.withDeclaredRelationNames(args);
+    args = this.normalizeArgs(args);
     // Stable relation order (opt-in): fill PK-asc orderBy into unordered to-many
     // relations before fingerprinting (see buildFindMany).
     if (args.with && this.resolveStableOrder(args.stableRelationOrder)) {
@@ -2780,7 +2821,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // changes the warning text from the declared name back to the caller's and
     // nothing else). It is here so the invariant holds at the seam rather than
     // depending on every consumer to re-establish it.
-    args = this.withDeclaredRelationNames(args);
+    args = this.normalizeArgs(args);
     this.maybeWarnUnlimited(args);
     this.maybeWarnUnorderedPage(args);
 
@@ -2902,17 +2943,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * intentionally reads the full set; `true` forces the warning even when
    * disabled in config).
    */
-  private maybeWarnUnlimited(args?: {
-    limit?: number;
-    take?: number;
-    cursor?: unknown;
-    warnOnUnlimited?: boolean;
-  }): void {
+  private maybeWarnUnlimited(args?: { limit?: number; cursor?: unknown; warnOnUnlimited?: boolean }): void {
     const perCall = args?.warnOnUnlimited;
     if (perCall === false) return;
     if (perCall === undefined && !this.warnOnUnlimited) return;
     if (this.defaultLimit !== undefined) return;
-    const hasExplicitLimit = args?.limit !== undefined || args?.take !== undefined || args?.cursor !== undefined;
+    const hasExplicitLimit = args?.limit !== undefined || args?.cursor !== undefined;
     if (hasExplicitLimit) return;
     if (this.whereMatchesAtMostOneRow((args as { where?: unknown } | undefined)?.where)) return;
     if (this.warnedTables.has(this.table)) return;
@@ -2997,7 +3033,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // pass and the fingerprint below and before any of the six `with` walkers,
     // so none of them needs to know a relation has two accepted spellings and
     // both spellings share one cache entry. See query/relation-names.ts.
-    args = this.withDeclaredRelationNames(args);
+    args = this.normalizeArgs(args);
     // Stable relation order (opt-in): fill PK-asc orderBy into unordered to-many
     // relations BEFORE fingerprinting, so the two orderings get distinct cache
     // entries and every downstream path (SQL build, collect, parser) inherits it.
@@ -3133,7 +3169,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // the caller's column order, so a permuted array rebuilds different SQL and
     // must not collapse onto the same cache entry (would trip the cross-check).
     const distinctFp = args?.distinct ? args.distinct.join(',') : '';
-    const effectiveLimit = args?.take ?? args?.limit ?? this.defaultLimit;
+    const effectiveLimit = args?.limit ?? this.defaultLimit;
     // On engines that inline the literal LIMIT/OFFSET into the SQL text
     // (dialect.inlineLimitOffset, MySQL), the value is part of the SQL, not the
     // params, so it MUST be part of the fingerprint or two different limits share
@@ -3459,9 +3495,20 @@ export class QueryInterface<T extends object, R extends object = {}> {
     args: FindManyStreamArgs<T, R, W, S, O> | undefined,
     action: string,
   ): AsyncGenerator<Record<string, unknown>[], void, undefined> {
+    // Pagination aliases folded BEFORE the speculative build below, which
+    // spreads `args` and overrides `limit`. A surviving `take` would reach that
+    // spread alongside the override and be read as two different values for one
+    // bound. Relation names are left to `buildFindMany`, which both branches go
+    // through.
+    args = normalizePagination(args);
     const batchSize = Math.max(1, Math.floor(Number(args?.batchSize ?? 1000)));
 
     this.currentAction = action;
+    // The two streaming methods do NOT go through `executeWithMiddleware`, so
+    // the unknown-key diagnostic has to be hung here as well or a stream would
+    // be the one read that silently drops an `include`. Both public methods
+    // reach this, and each passes its own name.
+    warnUnknownQueryOptions(this.table, action, args);
     // Streaming is ALREADY immune to the generic-plan cliff: the speculative
     // fetch has never passed a prepared name, and the cursor path runs through
     // DECLARE, so neither statement enters the plan cache. `preparedNameFor` is
@@ -3675,7 +3722,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // changes the warning text from the declared name back to the caller's and
     // nothing else). It is here so the invariant holds at the seam rather than
     // depending on every consumer to re-establish it.
-    args = this.withDeclaredRelationNames(args);
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('findFirst', (args ?? {}) as Record<string, unknown>, async () => {
       if (args?.with) {
         const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);

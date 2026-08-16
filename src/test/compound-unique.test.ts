@@ -71,6 +71,8 @@ describe('compound-unique selector, findUnique', () => {
         t.columnMap.orgId_userId = 'org_user_key';
         t.reverseColumnMap.org_user_key = 'orgId_userId';
         t.allColumns.push('org_user_key');
+        // Unique in its own right, so findUnique can address the row by it.
+        t.uniqueColumns.push(['org_user_key']);
       }),
     );
     const { sql, params } = q.buildFindUnique({ where: { orgId_userId: 42 } } as never);

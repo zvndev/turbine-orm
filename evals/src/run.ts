@@ -21,6 +21,9 @@ import { runOllama, supportsTools } from './runners/ollama.js';
 import { evalSchema } from './schema-meta.js';
 import { SMOKE_TASK_IDS, selectTasks, TASKS, type Task } from './tasks.js';
 
+// The cumulative ladder. Arm E (skill WITHOUT tools) is deliberately not in the
+// default set: it is a side measurement rather than a rung, so it is opted into
+// with `--arms E` and never silently added to a full run's denominator.
 const ALL_ARMS: Arm[] = ['A', 'B', 'C', 'D'];
 
 export interface AttemptRecord {
@@ -35,6 +38,24 @@ export interface AttemptRecord {
   failure?: FailureClass;
   detail?: string;
   errorCode?: string;
+  /**
+   * The answer the model actually submitted, recorded on every attempt that
+   * parsed, pass or fail.
+   *
+   * The 0.72.0 round shipped without this and paid for it: one failure could
+   * not be reproduced afterwards because the record held the error the answer
+   * produced and not the answer that produced it, so there was nothing left to
+   * re-run. An error code names a class of mistake; only the args identify the
+   * mistake. Anything a failure needs to be reproduced belongs in the record at
+   * the moment it happens, because nothing regenerates it later.
+   */
+  answer?: { table: string; method: string; args: Record<string, unknown> };
+  /**
+   * The tail of the completion, kept only when parsing FAILED. That is the one
+   * case where there is no `answer` to record, and the raw text is the only
+   * evidence of what the model was trying to say.
+   */
+  rawTail?: string;
   toolCalls: string[];
   turns: number;
   ms: number;
@@ -108,13 +129,23 @@ async function attempt(
 
   const parsed = parseAnswer(res.text);
   if (!parsed.ok) {
-    return { ...base, status: 'fail', failure: 'no-parse', detail: parsed.reason };
+    return {
+      ...base,
+      status: 'fail',
+      failure: 'no-parse',
+      detail: parsed.reason,
+      rawTail: res.text.slice(-800),
+    };
   }
+
+  // From here on every record carries the answer, so any verdict below can be
+  // re-run by hand from the results file alone.
+  const answered = { ...base, answer: parsed.answer };
 
   const out = await executeAnswer(schema, parsed.answer);
   if (!out.ok) {
     return {
-      ...base,
+      ...answered,
       status: 'fail',
       failure: out.failure,
       errorCode: out.errorCode,
@@ -126,12 +157,12 @@ async function attempt(
   if (!refOut.ok) {
     // The reference itself broke. That is a harness fault and must not be
     // charged to the model.
-    return { ...base, status: 'unscored', detail: `reference failed: ${refOut.message ?? refOut.failure}` };
+    return { ...answered, status: 'unscored', detail: `reference failed: ${refOut.message ?? refOut.failure}` };
   }
 
   const cmp = compare(out.rows, refOut.rows, task.order);
-  if (cmp.equal) return { ...base, status: 'pass', failure: 'pass' };
-  return { ...base, status: 'fail', failure: 'wrong-rows', detail: cmp.detail };
+  if (cmp.equal) return { ...answered, status: 'pass', failure: 'pass' };
+  return { ...answered, status: 'fail', failure: 'wrong-rows', detail: cmp.detail };
 }
 
 async function main(): Promise<void> {

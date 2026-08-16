@@ -18,6 +18,7 @@
  *   turbine studio                : Launch local read-only web UI (--demo for a seeded sample DB)
  *   turbine mcp                  , Start read-only MCP server over JSON-RPC stdio
  *   turbine observe              , Launch metrics dashboard (requires TURBINE_OBSERVE_URL)
+ *   turbine skill                 - Install the agent query skill (--print, --agents, --dir <path>)
  *
  * Usage:
  *   DATABASE_URL=postgres://... npx turbine generate
@@ -250,6 +251,12 @@ export interface CliArgs {
    * not be turned into a failed install.
    */
   ifDb?: boolean;
+  /** `skill --print`: write the skill to stdout instead of installing it. */
+  print?: boolean;
+  /** `skill --agents`: print the AGENTS.md instructions block instead. */
+  agents?: boolean;
+  /** `skill --dir <path>`: the skills root to install into (default `.claude/skills`). */
+  dir?: string;
 }
 
 /**
@@ -377,6 +384,17 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         break;
       case '--allow-pooler':
         result.allowPooler = true;
+        break;
+      // `turbine skill`
+      case '--print':
+        result.print = true;
+        break;
+      case '--agents':
+        result.agents = true;
+        break;
+      case '--dir':
+        result.dir = next;
+        i++;
         break;
       case '--zod':
         result.zod = true;
@@ -4999,6 +5017,9 @@ function showHelp(): void {
   );
   console.log(`    ${cyan('mcp')}                Start read-only MCP server over stdio`);
   console.log(`    ${cyan('observe')}            Launch metrics dashboard ${dim('(requires TURBINE_OBSERVE_URL)')}`);
+  console.log(
+    `    ${cyan('skill')}              Install the agent query skill ${dim('(--print, --agents, --dir <path>)')}`,
+  );
   newline();
 
   console.log(`  ${bold('Options:')}`);
@@ -5068,6 +5089,107 @@ function showHelp(): void {
   console.log(`    ${dim('$')} npx turbine migrate up`);
   console.log(`    ${dim('$')} npx turbine migrate deploy --dry-run`);
   console.log(`    ${dim('$')} npx turbine push --dry-run`);
+  newline();
+}
+
+// ---------------------------------------------------------------------------
+// Agent skill
+// ---------------------------------------------------------------------------
+
+/**
+ * turbine-orm's own package root, found by walking up from the running script.
+ *
+ * `process.argv[1]` rather than `import.meta.url` so the same source compiles
+ * for both the ESM and CJS builds, and realpath first because `npx turbine`
+ * runs through a `node_modules/.bin` symlink whose dirname is the CONSUMER's
+ * tree, where this package.json does not exist.
+ */
+function ownPackageRoot(): string | undefined {
+  try {
+    let entry = process.argv[1] ?? '';
+    try {
+      entry = realpathSync(entry);
+    } catch {
+      // keep the raw path if realpath fails (e.g. deleted cwd)
+    }
+    let dir = dirname(entry);
+    for (let i = 0; i < 6; i++) {
+      const candidate = resolve(dir, 'package.json');
+      if (existsSync(candidate)) {
+        const pkg = JSON.parse(readFileSync(candidate, 'utf8')) as { name?: string };
+        if (pkg.name === 'turbine-orm') return dir;
+      }
+      const parent = dirname(dir);
+      if (parent === dir) break;
+      dir = parent;
+    }
+  } catch {
+    // fall through
+  }
+  return undefined;
+}
+
+/** The instructions block for a project's AGENTS.md / CLAUDE.md. */
+const AGENTS_SNIPPET = `## Database access (Turbine ORM)
+
+- Queries go through the generated client. Read \`generated/turbine/types.ts\` for
+  the entity and input types before writing one; the names there are the truth.
+- Relations are \`with\`, never Prisma's \`include\`. An unrecognized option is
+  ignored, so an \`include\` returns rows with the relation missing.
+- \`select\` and \`omit\` name columns only. A relation named in \`select\` throws.
+- \`findUnique\` needs a unique key. Use \`findFirst\` for "any row matching a
+  filter", with an \`orderBy\` if which row matters.
+- Re-run \`npx turbine generate\` after any schema change, then \`tsc --noEmit\`:
+  an invalid query is a type error, so the type checker is the fastest reviewer.
+- Never write \`includePii: true\`, \`skipGlobalFilters: true\` or
+  \`allowFullTableScan: true\`. Those options take an imported \`UNSAFE\` symbol and
+  nothing else; any other value throws.
+- Full query reference: https://turbineorm.dev/llms.txt
+`;
+
+/**
+ * Install the packaged query-writing skill into the project.
+ *
+ * The skill is a file in the published tarball rather than something generated
+ * here, so what an agent reads is exactly what the repository tests: every
+ * factual claim in it is executed against a live database by
+ * `evals/src/verify-skill.ts` on each release.
+ */
+function cmdSkill(args: CliArgs): void {
+  if (args.agents === true) {
+    console.log(AGENTS_SNIPPET);
+    return;
+  }
+
+  const root = ownPackageRoot();
+  const source = root ? resolve(root, 'skills', 'turbine-orm', 'SKILL.md') : undefined;
+  if (!source || !existsSync(source)) {
+    error('Could not find the packaged skill inside turbine-orm.');
+    newline();
+    console.log(`  ${dim('Read it online instead:')} ${cyan('https://turbineorm.dev/ai-agents')}`);
+    newline();
+    process.exit(1);
+  }
+  const body = readFileSync(source, 'utf8');
+
+  if (args.print === true) {
+    process.stdout.write(body);
+    return;
+  }
+
+  const skillsDir = args.dir ?? join('.claude', 'skills');
+  const target = resolve(process.cwd(), skillsDir, 'turbine-orm', 'SKILL.md');
+  const existed = existsSync(target);
+  mkdirSync(dirname(target), { recursive: true });
+  writeFileSync(target, body);
+
+  newline();
+  success(`${existed ? 'Updated' : 'Installed'} the Turbine query skill`);
+  console.log(`  ${dim(relative(process.cwd(), target))}`);
+  newline();
+  console.log(`  ${dim('Also worth doing:')}`);
+  console.log(`    ${dim('-')} connect the read-only MCP server: ${cyan('npx turbine mcp')}`);
+  console.log(`    ${dim('-')} add the instructions block to AGENTS.md: ${cyan('npx turbine skill --agents')}`);
   newline();
 }
 
@@ -5234,6 +5356,10 @@ async function main() {
 
       case 'observe':
         await cmdObserve(args);
+        break;
+
+      case 'skill':
+        cmdSkill(args);
         break;
 
       default:
