@@ -1,7 +1,7 @@
 export const metadata = {
   title: 'CLI',
   description:
-    'Every Turbine ORM CLI command, init, pull, push, migrate, seed, status, doctor, with flags and examples.',
+    'Every Turbine ORM CLI command: init, pull, push, migrate, seed, status, doctor, studio, mcp, observe. Flags and examples.',
   alternates: { canonical: '/cli' },
 };
 
@@ -15,34 +15,22 @@ The `turbine` CLI ships with the package. Use `npx turbine <command>` from the r
 npx turbine <command> [options]
 
 Commands:
-  init                           Initialize a Turbine project
-  generate | pull                Introspect database, generate TypeScript types + client
-  generate --zod                 Also emit zod.ts validation schemas
-  generate --include-views       Include views + materialized views as read-only entities
-  generate --no-timestamp        Omit the "Generated at:" header for byte-identical regens
-  push                           Apply defineSchema() output to the database
-  migrate create <name>            Create a new SQL migration file
-  migrate create <name> --auto     Auto-generate migration from schema diff
-  migrate create <name> --from-diff Like --auto, but flags destructive statements
-  migrate create <name> --recipe <r> Scaffold a sanctioned pattern (e.g. backfill)
-  migrate up                     Apply pending migrations
-  migrate deploy                 Apply pending migrations without prompts (CI)
-  migrate down [--step N]        Rollback the last applied migration (or last N)
-  migrate status                 Show applied vs pending migrations
-  seed                           Run the seed file (.ts / .js / .sql)
-  status                         Show connection info + schema summary
-  doctor                         Cost-aware triage of missing FK indexes
-  doctor --fix                   Write a CONCURRENTLY migration that adds them
-  doctor --json                  Machine-readable report (schemaVersion 1)
-  doctor --unused                Report never-scanned + redundant indexes (no auto-drop)
-  doctor --audit                 Unused report scoped to doctor's own suggestions
-  doctor --no-plan-divergence    Skip the cached-plan divergence section
-  migrate-from-prisma            Map a schema.prisma onto Turbine (report + typed name map)
-  migrate-from-prisma --no-db    Parse-only: write the report without resolving names
-  migrate-from-prisma --if-db    Regenerate the name map, skipping when no database resolves
-  studio                         Launch local read-only Studio web UI
-  mcp                            Start read-only MCP server over JSON-RPC stdio
-  observe                        Launch local metrics dashboard
+  init                     Initialize a Turbine project
+  generate | pull          Introspect database, generate TypeScript types + client
+  push                     Apply defineSchema() output to the database
+  migrate create <name>    Create a new SQL migration file (--auto | --from-diff | --recipe)
+  migrate up               Apply pending migrations
+  migrate deploy           Apply pending migrations without prompts (CI)
+  migrate down [--step N]  Rollback the last applied migration (or last N)
+  migrate status           Show applied vs pending migrations
+  seed                     Run the seed file (.ts / .js / .sql)
+  status                   Show connection info + schema summary
+  doctor                   Missing-FK-index triage + cached-plan divergence
+                           (--fix, --json, --unused, --audit, --no-plan-divergence)
+  migrate-from-prisma      Map a schema.prisma onto Turbine (report + typed name map)
+  studio                   Launch local read-only Studio web UI
+  mcp                      Start read-only MCP server over JSON-RPC stdio
+  observe                  Launch local metrics dashboard
 ```
 
 ## Global options
@@ -57,14 +45,14 @@ Commands:
 
 ## `turbine init`
 
-Bootstrap a Turbine project in the current directory. `init` is a sequenced flow that detects what already exists and runs only the missing steps: write `turbine.config.ts`, scaffold a starter `./turbine/schema.ts` and `./turbine/seed.ts` (if a root-level `./seed.ts` from an older `init` already exists, that one is kept instead, so a re-run never creates a second seed file), and (when a reachable database is configured) offer to push the schema, generate the typed client, and run the seed file.
+Bootstrap a Turbine project in the current directory. `init` detects what already exists and runs only the missing steps: write `turbine.config.ts`, scaffold a starter `./turbine/schema.ts` and `./turbine/seed.ts`, and, when a reachable database is configured, offer to push the schema, generate the typed client, and run the seed file. A root-level `./seed.ts` from an older `init` is kept, never duplicated.
 
 ```bash
 npx turbine init
 npx turbine init --url postgres://user:pass@localhost:5432/mydb
 ```
 
-Re-runs are safe: existing files are detected and their steps are skipped, so you can run `init` repeatedly. A destructive push keeps the usual typed confirmation.
+Re-runs are safe: existing files are detected and their steps skipped. A destructive push keeps the usual typed confirmation.
 
 ### Flags
 
@@ -76,7 +64,7 @@ Re-runs are safe: existing files are detected and their steps are skipped, so yo
 | `--skip-push` | Don't offer to push the schema to the database. |
 | `--skip-generate` | Don't offer to generate the typed client. |
 
-In an interactive terminal, `init` prompts for each step. Without a TTY it degrades gracefully: it scaffolds the files and generates the client (the previous behavior), skips push and seed, and prints a note pointing at `--yes` and the `--skip-*` flags.
+In a terminal, `init` prompts for each step. Without a TTY it scaffolds the files, generates the client, skips push and seed, and prints a note pointing at `--yes` and the `--skip-*` flags.
 
 ## `turbine pull` / `turbine generate`
 
@@ -116,13 +104,11 @@ Views get entity types and read accessors; write builders reject them (TURBINE_E
 
 ### `--no-timestamp`
 
-Every generated file carries a `Generated at: <ISO timestamp>` header, which changes on every run and shows up as noise in diffs. Pass `--no-timestamp` to omit it, so regenerating an unchanged schema produces byte-identical output.
+Omit the `Generated at: <ISO timestamp>` header so regenerating an unchanged schema produces byte-identical output. Useful when generated code is committed or checked in CI.
 
 ```bash
 npx turbine generate --no-timestamp
 ```
-
-Useful when generated code is committed to source control or checked in CI, a `generate` that changes nothing leaves the tree clean.
 
 ### `--import-ext <mode>`
 
@@ -134,28 +120,28 @@ npx turbine generate --import-ext none   # './types'     (bundler / classic reso
 npx turbine generate --import-ext auto   # detect from tsconfig (default)
 ```
 
-`auto` walks up from the output directory to the nearest `tsconfig.json` and picks the spelling that config's module resolution requires. Set it explicitly if your build resolves differently from what detection infers.
+`auto` walks up from the output directory to the nearest `tsconfig.json` and picks the spelling its module resolution requires. Set it explicitly if your build resolves differently.
 
 ### `--legacy-to-many-uniques`
 
-Since 0.41, a child table whose foreign-key columns are exactly covered by a unique constraint or unique index introspects as a **one-to-one** (`hasOne`) relation rather than `hasMany`, so the parent side is typed `Child | null` instead of `Child[]`. That is the correct shape, and it matches Prisma, but it is a breaking type change for clients generated before 0.41.
+A child table whose foreign-key columns are exactly covered by a unique constraint or unique index introspects as a **one-to-one** (`hasOne`) relation: the parent side is typed `Child | null` instead of `Child[]`. Clients generated before 0.41 got `hasMany` for that shape; this flag restores it while you port the affected call sites.
 
 ```bash
 npx turbine generate --legacy-to-many-uniques
 ```
 
-restores the pre-0.41 `hasMany` output while you port the affected call sites. It is also settable as `legacyToManyUniques: true` in `turbine.config.ts`, and it only affects what introspection emits, never runtime behavior.
+Also settable as `legacyToManyUniques: true` in `turbine.config.ts`. It only affects what introspection emits.
 
 ### Renaming derived relations, `relationNames`
 
-A database does not name its relationships, so introspection composes a name from the foreign key. Two foreign keys pointing at the same table produce names nobody would guess:
+Introspection composes relation names from foreign keys, and two foreign keys pointing at the same table produce names nobody would guess:
 
 ```
 messages.sender_id    -> people.msgsBySender
 messages.recipient_id -> people.msgsByRecipient
 ```
 
-A codebase migrating from another ORM already has names for these, chosen by different rules, so every call site would have to be hand-edited. Declare the mapping once instead (new in v0.51):
+Declare the names you want once, instead of hand-editing every call site:
 
 ```ts
 // turbine.config.ts
@@ -169,11 +155,9 @@ export default {
 };
 ```
 
-`turbine generate` then emits `sentMessages` / `receivedMessages` everywhere, in the metadata and the types alike, and they work in `where`, `with`, and `orderBy` like any other relation.
+`turbine generate` then emits `sentMessages` / `receivedMessages` in the metadata and the types alike, and they work in `where`, `with`, and `orderBy` like any other relation. A typo is an error, not a silent no-op: an unknown table, an unknown source relation, or a target name that would shadow a column fails the command with `TURBINE_E003`, listing the names that do exist.
 
-A typo is an **error, not a silent no-op**: an unknown table, an unknown source relation, or a target name that would shadow a column fails the command with `TURBINE_E003`, listing the names that do exist. Ignoring a bad mapping would break the very call sites it was written to fix, and it would break them at runtime rather than at `generate` time.
-
-> Not sure what a relation ended up called? Query it wrong once. The unknown-field error lists the table's relations alongside its columns and suggests the closest match.
+> Not sure what a relation ended up called? Query it wrong once: the unknown-field error lists the table's relations alongside its columns and suggests the closest match.
 
 ## `turbine push`
 
@@ -186,7 +170,7 @@ npx turbine push --dry-run    # Preview generated SQL without executing
 
 `push` diffs `turbine/schema.ts` against the live database and executes the difference as a single transaction. Safe to re-run: it is a no-op when the schema already matches. For production deploys, use migrations instead.
 
-`push` runs the same destructive scanner as `migrate up`. If the diff contains a data-destroying statement (a `DROP TABLE` / `DROP COLUMN`, a lossy `ALTER COLUMN … TYPE`, and similar), `push` refuses to run, prints an itemized report, and applies nothing. To proceed, confirm interactively (type `destroy my data`, then `yes`) or pass `--allow-destructive`:
+`push` runs the same destructive scanner as `migrate up`. If the diff contains a data-destroying statement (`DROP TABLE` / `DROP COLUMN`, a lossy `ALTER COLUMN … TYPE`, and similar), `push` refuses to run, prints an itemized report, and applies nothing. To proceed, confirm interactively (type `destroy my data`, then `yes`) or pass `--allow-destructive`:
 
 ```bash
 npx turbine push --allow-destructive   # apply data-destroying schema changes
@@ -211,13 +195,13 @@ Writes `turbine/migrations/<timestamp>_<name>.sql` with `-- UP` and `-- DOWN` se
 
 ### `--from-diff`
 
-Like `--auto`, `--from-diff` derives the forward statements into `-- UP` and the reverse statements into `-- DOWN` from the schema diff (an "irreversible, write manually" placeholder is written when no reverse can be derived). The difference is safety annotation: any data-destroying statement in either direction (a lossy `ALTER COLUMN … TYPE` in UP, a `DROP TABLE` / `DROP COLUMN` reverse in DOWN) is flagged inline with loud comments and a file-level banner, and left intact so `migrate up` still refuses it by default unless you confirm interactively or pass `--allow-destructive`. Diff warnings (e.g. enum value removals the diff won't apply automatically) are surfaced as `-- NOTE:` comments.
+Like `--auto`, `--from-diff` derives `-- UP` and `-- DOWN` from the schema diff (an "irreversible, write manually" placeholder when no reverse can be derived). The difference is safety annotation: any data-destroying statement in either direction is flagged inline and in a file-level banner, and left intact so `migrate up` still refuses it by default. Diff warnings (e.g. enum value removals the diff won't apply automatically) surface as `-- NOTE:` comments.
 
 `--from-diff` cannot be combined with `--auto` or `--recipe`.
 
 ### `--recipe <name>`
 
-Scaffold a sanctioned migration pattern instead of a blank or diff-derived file. The one recipe today is `backfill`, which lays out the two-phase expand/contract skeleton for changing a populated column's type (nullable add, batched `UPDATE` backfill, `SET NOT NULL`, atomic rename swap) with placeholders to fill in. `--recipe` without a name errors.
+Scaffold a sanctioned migration pattern. The one recipe today is `backfill`, the two-phase expand/contract skeleton for changing a populated column's type (nullable add, batched `UPDATE` backfill, `SET NOT NULL`, atomic rename swap) with placeholders to fill in. `--recipe` without a name errors.
 
 ```bash
 npx turbine migrate create widen_order_total --recipe backfill
@@ -245,21 +229,13 @@ npx turbine migrate up
 npx turbine migrate up --dry-run
 ```
 
-Checks for checksum mismatches before applying: if a previously-applied migration file has been edited, the command halts and reports the conflict. Pass `--allow-drift` to bypass that checksum validation when you are intentionally rewriting history. Use `--step N` to apply only the first `N` pending migrations instead of all of them.
+Checks for checksum mismatches before applying: if a previously-applied migration file has been edited, the command halts and reports the conflict. Pass `--allow-drift` to bypass that check when you are intentionally rewriting history. Use `--step N` to apply only the first `N` pending migrations.
 
 ### Destructive-migration guard
 
-`migrate up` and `migrate down` scan the SQL they are about to run for statements that
-destroy data (`DROP TABLE`, `DROP SCHEMA`, `DROP COLUMN`, `TRUNCATE`, `DELETE FROM`,
-`UPDATE` without a `WHERE`, `ALTER COLUMN … TYPE`). Comments and string literals are
-ignored, and structure-only drops (`DROP INDEX`, `DROP CONSTRAINT`, `DROP TRIGGER`) are
-not flagged.
+`migrate up` and `migrate down` scan the SQL they are about to run for statements that destroy data (`DROP TABLE`, `DROP SCHEMA`, `DROP COLUMN`, `TRUNCATE`, `DELETE FROM`, `UPDATE` without a `WHERE`, `ALTER COLUMN … TYPE`). Comments and string literals are ignored; structure-only drops (`DROP INDEX`, `DROP CONSTRAINT`, `DROP TRIGGER`) are not flagged.
 
-When a destructive statement is found, Turbine **refuses to run anything** and prints an
-itemized report. To proceed you must either confirm interactively, typing the literal
-phrase `destroy my data`, then `yes`, or pass `--allow-destructive` explicitly
-(required in CI and other non-interactive shells). Programmatic callers of
-`migrateUp`/`migrateDown` opt in with `allowDestructive: true`.
+On a hit, Turbine refuses to run anything and prints an itemized report. To proceed, confirm interactively (type the literal phrase `destroy my data`, then `yes`) or pass `--allow-destructive` (required in CI and other non-interactive shells). Programmatic callers of `migrateUp`/`migrateDown` opt in with `allowDestructive: true`.
 
 ## `turbine migrate deploy`
 
@@ -270,9 +246,9 @@ npx turbine migrate deploy
 npx turbine migrate deploy --dry-run   # list pending migrations without applying
 ```
 
-`deploy` applies every pending migration inside the same advisory-lock + per-migration-transaction machinery as `migrate up`, and reports `N applied`. It applies files **as written**: the destructive-migration guard runs when you *author* a migration (`create` / `up`), not at deploy time, so it assumes your migration history has already been reviewed. Before it applies anything destructive, `deploy` prints a one-line NOTICE listing the data-destroying statements it is about to run, then proceeds (it never prompts).
+`deploy` uses the same advisory-lock and per-migration-transaction machinery as `migrate up`. It applies files as written: the destructive guard runs when you author a migration, not at deploy time. Before applying anything destructive, it prints a one-line NOTICE listing the statements, then proceeds.
 
-It refuses to run (exit 1, clear message) on a **checksum mismatch** or a **missing migration file**: a drifted history fails the deploy instead of silently diverging. When you are intentionally deploying over a rewritten history, pass `--allow-drift` to bypass that check (the same escape hatch as `migrate up`). It never auto-generates, seeds, or pushes; it only applies pending migrations.
+It refuses to run (exit 1) on a checksum mismatch or a missing migration file, so a drifted history fails the deploy instead of silently diverging; pass `--allow-drift` to deploy over an intentionally rewritten history. It never auto-generates, seeds, or pushes.
 
 ```bash
 # Typical CI pipeline
@@ -289,7 +265,7 @@ npx turbine migrate down            # roll back the last migration
 npx turbine migrate down --step 2   # roll back the last 2 migrations
 ```
 
-Pass `--step N` (or `-n N`) to roll back the last `N` applied migrations instead of just one. A `-- DOWN` that drops a column is destructive and hits the same [destructive gate](#destructive-migration-guard) as `migrate up`.
+Pass `--step N` (or `-n N`) to roll back the last `N` applied migrations. A `-- DOWN` that drops a column is destructive and hits the same [destructive gate](#destructive-migration-guard) as `migrate up`.
 
 ## `turbine migrate status`
 
@@ -313,7 +289,7 @@ i 2 applied, 1 pending
   Run npx turbine migrate up to apply pending migrations.
 ```
 
-Each row carries a status marker: `v Applied`, `. Pending`, or `! Drifted`. An edited migration (its file no longer matches the checksum recorded when it was applied) shows as `! Drifted` and blocks `migrate up` until you reconcile it. An applied migration whose file was deleted from disk shows as `! Missing file`, so a drifted history is visible in `status`, not just at apply time.
+An edited migration (its file no longer matches the checksum recorded at apply time) shows as `! Drifted` and blocks `migrate up` until you reconcile it. An applied migration whose file was deleted shows as `! Missing file`.
 
 ## `turbine seed`
 
@@ -324,7 +300,7 @@ npx turbine seed
 npx turbine seed --verbose
 ```
 
-Turbine resolves the seed from the `seedFile` field in `turbine.config.ts` (the pre-0.50 spelling `seed` is still accepted as an alias), or the first default candidate found: `seed.ts`, `seed.js`, `seed.sql`, `turbine/seed.ts`, `turbine/seed.js`, then `turbine/seed.sql`. Each extension has its own runner:
+Turbine resolves the seed from the `seedFile` field in `turbine.config.ts` (`seed` is an accepted alias), or the first default candidate found: `seed.ts`, `seed.js`, `seed.sql`, `turbine/seed.ts`, `turbine/seed.js`, then `turbine/seed.sql`. Each extension has its own runner:
 
 - **`.ts`**, run with `npx tsx` (no build step). Export a `defineSeed(fn)` or run inserts directly.
 - **`.js`**, imported dynamically; a default-export function is called.
@@ -349,7 +325,7 @@ Show the current database connection, schema summary, and generated client locat
 npx turbine status
 ```
 
-Outputs the detected database name, host, Postgres version, table count, and the path to the generated client, handy for verifying CI environments.
+Outputs the detected database name, host, Postgres version, table count, and the path to the generated client.
 
 ## `turbine doctor`
 
@@ -361,34 +337,34 @@ npx turbine doctor --fix
 npx turbine doctor --json
 ```
 
-Turbine loads `with` relations as **correlated subqueries**: the child table is probed once per parent row (`child.fk = parent.pk`). When the probed column is indexed, that is an index seek per parent. When it is not, it is a full table scan *per parent*, which multiplies by the parent row count and can turn a fast query into a many-second one. Batched-loader ORMs pay a missing FK index only once (a single `WHERE fk IN (...)` scan), so schemas migrated from them routinely lack the FK indexes Turbine's strategy needs. `doctor` finds them before they hit production.
+Turbine loads `with` relations as correlated subqueries: the child table is probed once per parent row (`child.fk = parent.pk`). An unindexed probe column therefore costs a full table scan per parent. Schemas migrated from batched-loader ORMs routinely lack these indexes. `doctor` introspects the database, derives every column set relations will probe (hasMany/hasOne child FKs, belongsTo reference keys, many-to-many junction keys), and reads live Postgres statistics to score each finding.
 
-It introspects the database, derives every column set relations will probe (hasMany/hasOne child FKs, belongsTo reference keys, many-to-many junction keys), and then reads live Postgres statistics to score each finding into one of three tiers.
+`doctor` reads session-scoped statistics, so it refuses a transaction-pooler endpoint (a `pooler`/`pgbouncer` hostname or a known pooling port; exit 1). Point it at the direct endpoint, or pass `--allow-pooler` to override.
 
 ### Three-tier triage
 
-`doctor` never just lists missing indexes: an index is not free (it taxes every write, dilutes cache, and can disable heap-only-tuple updates), so it weighs the cost against the benefit and sorts findings into three buckets, each with the numbers behind the verdict:
+An index is not free: it taxes every write, dilutes cache, and can disable heap-only-tuple updates. `doctor` weighs that cost against the benefit and sorts findings into three tiers:
 
-- **Take freely**: a large table with a low write rate and few existing indexes. The index is almost pure upside.
-- **Take deliberately**: a real write rate (writes/day normalized by the stats-reset age), many existing indexes, or a table currently relying on HOT updates. Worth a second look before you add write cost.
-- **Scrutinize**: a tiny table (a sequential scan is already cheap), an append-only log shape (high inserts, near-zero reads), or a never-analyzed table where the stats cannot support a verdict.
+- **Take freely**: a large table with a low write rate and few existing indexes.
+- **Take deliberately**: a real write rate, many existing indexes, or a table currently relying on HOT updates.
+- **Scrutinize**: a tiny table, an append-only log shape, or a never-analyzed table where the stats cannot support a verdict.
 
-Every finding prints its size, writes/day since the last stats reset, existing index count, and probing relations, plus the exact `CREATE INDEX` statement. The thresholds behind the tiers are printed too, so you can see the precise number that drove a verdict and disagree with it.
+Every finding prints its size, writes/day since the last stats reset, existing index count, and probing relations, plus the exact `CREATE INDEX` statement and the thresholds behind the tiers.
 
 Two extra signals ride the same statistics:
 
-- **Partial indexes**: when a probed FK column is mostly NULL (null fraction at or above 90%), `doctor` suggests a partial `CREATE INDEX ... WHERE col IS NOT NULL`, which covers every relation probe (the correlation is `child.fk = parent.pk`, and NULL never equals anything) at a fraction of the size. It prints the caveat that a hand-written `where: { fk: null }` filter will not use it.
-- **HOT-update awareness**: a table with a high HOT-update ratio and real update volume gets a warning and is bumped to at least "take deliberately", because a new index can disqualify those heap-only-tuple updates and amplify write cost.
+- **Partial indexes**: when a probed FK column is mostly NULL (null fraction at or above 90%), `doctor` suggests a partial `CREATE INDEX ... WHERE col IS NOT NULL`, which covers every relation probe (NULL never equals anything) at a fraction of the size, with the caveat that a hand-written `where: { fk: null }` filter will not use it.
+- **HOT-update awareness**: a table with a high HOT-update ratio and real update volume is bumped to at least "take deliberately", because a new index can disqualify heap-only-tuple updates and amplify write cost.
 
-If Postgres statistics are unavailable, or too young or absent to trust (for example the stats have never been reset), `doctor` says so in one line and falls back to the size-sorted topology report instead of faking confidence. On non-Postgres engines the statistics layer is skipped and you get the same topology-only output.
+If statistics are unavailable or too young to trust, `doctor` says so in one line and falls back to the size-sorted topology report. Non-Postgres engines get the same topology-only output.
 
 ### Invalid indexes
 
-`doctor` also reports **invalid** indexes (`pg_index.indisvalid = false`). These are the artifact of a `CREATE INDEX CONCURRENTLY` that failed partway: the corpse is left behind, and `IF NOT EXISTS` then silently skips it on a rerun so the index never actually builds. `doctor` surfaces each one with a `DROP INDEX CONCURRENTLY` statement to clear it.
+`doctor` also reports **invalid** indexes (`pg_index.indisvalid = false`), the leftovers of a `CREATE INDEX CONCURRENTLY` that failed partway: `IF NOT EXISTS` silently skips the corpse on a rerun, so the index never actually builds. Each one is surfaced with a `DROP INDEX CONCURRENTLY` statement to clear it.
 
 ### `--fix` writes a CONCURRENTLY migration
 
-By default `--fix` writes a migration that adds the missing indexes with `CREATE INDEX CONCURRENTLY IF NOT EXISTS`. Because a concurrent build cannot run inside a transaction, the file carries a `-- turbine:no-transaction` directive in its header, and `turbine migrate up` runs it without wrapping it in BEGIN/COMMIT (one statement at a time). The generated file also documents the idempotency requirement, the invalid-index trap, and lock-timeout guidance.
+`--fix` writes a migration that adds the missing indexes with `CREATE INDEX CONCURRENTLY IF NOT EXISTS`. A concurrent build cannot run inside a transaction, so the file carries a `-- turbine:no-transaction` directive and `turbine migrate up` runs it without BEGIN/COMMIT, one statement at a time. The file documents the idempotency requirement, the invalid-index trap, and lock-timeout guidance.
 
 ```bash
 npx turbine doctor --fix
@@ -399,23 +375,21 @@ npx turbine migrate up
 # v Applied 1 migration(s)
 ```
 
-Pass `--no-concurrently` for a plain, in-transaction `CREATE INDEX` migration instead (handy for dev databases where the concurrent build is not worth the wait). Non-Postgres engines always get the plain form.
+Pass `--no-concurrently` for a plain, in-transaction `CREATE INDEX` migration instead. Non-Postgres engines always get the plain form.
 
 ### Workload-heat boost
 
-When a `_turbine_metrics` table exists (written by [`db.$observe()`](/observability#metrics--dbobserve) with its default Postgres sink), `doctor` maps per-model query heat onto physical tables and uses it as an extra benefit signal: a table your app hits hard is a table where a missing index hurts most. A hot finding is annotated (`hot in your workload: N queries/min, p95 X ms`) and sorted first. Heat is a *benefit* signal only, never a cost one, so it re-prioritizes and annotates but never downgrades a cost tier. Read metrics from a separate database with `--metrics-url`.
-
-When the metrics table is absent, or observe is configured with a non-Postgres sink, `doctor` prints one honesty line that heat boosting is unavailable and continues, exactly as it does when statistics are missing.
+When a `_turbine_metrics` table exists (written by [`db.$observe()`](/observability#metrics-dbobserve) with its default Postgres sink), `doctor` maps per-model query heat onto physical tables as an extra benefit signal. A hot finding is annotated (`hot in your workload: N queries/min, p95 X ms`) and sorted first; heat never downgrades a cost tier. Read metrics from a separate database with `--metrics-url`. When the table is absent, `doctor` prints one line and continues.
 
 ### `doctor --unused` (report-only)
 
-`doctor` also learns to subtract. `--unused` reports indexes that are candidates for removal, in three classes:
+`--unused` reports indexes that are candidates for removal, in three classes:
 
-- **Never scanned**: `idx_scan = 0` (or below `--min-scans N`) since the last statistics reset. Every finding prints the stats-reset age and the caveats: usage counters zero on a crash or a stats reset, and **a read replica's index scans never feed the primary's counters**, so an index only a replica uses looks dead here. Primary-key, unique-constraint, exclusion-constraint, and replica-identity indexes are excluded from day one.
+- **Never scanned**: `idx_scan = 0` (or below `--min-scans N`) since the last statistics reset. Counters zero on a crash or a stats reset, and a replica's index scans never feed the primary's counters, so an index only a replica uses looks dead here; each finding prints the stats-reset age. Primary-key, unique-constraint, exclusion-constraint, and replica-identity indexes are excluded.
 - **Redundant prefix duplicates**: a non-unique index whose columns are a leading prefix of a wider index that already serves the same lookups. A unique or primary-key prefix is never called redundant (dropping it would remove a constraint).
-- **Invalid indexes**: the failed-`CONCURRENTLY` corpses, now carrying the drop suggestion.
+- **Invalid indexes**: the failed-`CONCURRENTLY` corpses, with the drop suggestion.
 
-The output is `DROP INDEX CONCURRENTLY` statements with the size each reclaims. This is **printed only**: it is never written to a migration and never auto-applied. There is deliberately no `--fix` for drops, because whether an index is truly unused is a judgment the counters can only inform, not settle.
+The output is `DROP INDEX CONCURRENTLY` statements with the size each reclaims, printed only: never written to a migration, never auto-applied. There is deliberately no `--fix` for drops; whether an index is truly unused is a judgment the counters can only inform.
 
 ```bash
 npx turbine doctor --unused
@@ -425,100 +399,33 @@ npx turbine doctor --unused --json           # additive: adds unused/redundant/i
 
 ### `doctor --audit`
 
-`--audit` is the `--unused` never-scanned machinery scoped to doctor's own previously-suggested indexes (the `idx_<table>_<cols>` names `doctor --fix` emits). It frames the output as: *doctor previously suggested these indexes; N have never been scanned since the stats reset (age printed); consider dropping.* Because those names are truncated to Postgres's 63-byte identifier limit, the matcher compares truncated names and flags any post-truncation collision between different column sets as **ambiguous** rather than issuing a confident verdict.
+`--audit` is the never-scanned machinery scoped to doctor's own previously-suggested indexes (the `idx_<table>_<cols>` names `--fix` emits): *doctor suggested these; N have never been scanned since the stats reset; consider dropping.* Those names truncate at Postgres's 63-byte identifier limit, so the matcher compares truncated names and flags any post-truncation collision between different column sets as **ambiguous** rather than issuing a verdict.
 
 ### The cached-plan divergence check
 
-`doctor` also scores every column it already knows about (relation probe columns and leading index columns) for a distribution that can flip a **cached plan**, and prints a separate section for it. Skip it with `--no-plan-divergence`; it adds one `pg_stats` read.
+`doctor` also scores every column it already knows about (relation probe columns and leading index columns) for a value distribution that can flip a **cached plan**. Skip it with `--no-plan-divergence`; it adds one `pg_stats` read.
 
-The shape it models is narrow on purpose: a read shaped `WHERE col = $1 ORDER BY <other indexed column> LIMIT $n`, where `rows / n_distinct` (what a generic plan assumes `col = $1` matches) sits **above** the plan boundary while some real values sit far below it. For those values a promoted generic plan keeps the ordered index scan and has to walk a large fraction of the table before it accumulates one page of matches, where a custom plan takes a bitmap scan over the value's own rows. The boundary itself is `sqrt(limit x relpages)`, which is where an ordered scan's `limit / matching` share of the pages equals a bitmap scan's own; measured flip points track it within 13 to 26% across two orders of magnitude of limit. Both halves of that derivation assume the matching rows are **scattered** through the heap, so on a clustered column there is no flip at any limit and the crossover does not describe the table. That is the same blind spot as the rest of the check: treat a crossover as a reason to run the diagnostic block, never as a measurement.
+The modeled shape is narrow on purpose: a read shaped `WHERE col = $1 ORDER BY <other indexed column> LIMIT $n`, on a backend that has promoted the prepared statement to a value-blind generic plan. Findings come in two branches:
 
-Each finding prints the statistics behind it (rows, distinct values, the generic estimate, the rarest bucket, the crossover at limit 20 and at limit 1000, correlation, and the last ANALYZE) plus **how many pages the wrong plan walks** and what fraction of the table that is. It deliberately does **not** print an amplification multiplier: the check can see how many rows a value has, not where they physically sit in the heap, and the second half moves the real cost by an order of magnitude.
+- **`sparse-value`**: an index serves the equality, but the generic estimate `rows / n_distinct` sits above the plan boundary `sqrt(limit x relpages)` while some real values sit far below it. For those values the generic plan keeps the ordered index scan and walks a large fraction of the table; a custom plan takes a bitmap scan over the value's own rows.
+- **`unindexed-filter`**: no index serves the equality, so the good plan is a sequential scan plus a top-N sort, and the generic planner will not choose it. A promoted generic plan cannot see that the value is rare, keeps the ordered primary-key walk, and fetches nearly every tuple before it fills the `LIMIT`.
 
-#### The unindexed-filter mechanism (new in 0.57.0)
-
-The rule above is one mechanism. 0.57.0 adds a second, and it is genuinely a **third** direction rather than a variation: it is not the sparse-value direction described above, and it is not the dense-clustering direction that was written, measured and **removed** in 0.56.0 for predicting the wrong sign. Here the filter column has **no index at all**, so the good plan is a *sequential scan that the generic plan will not choose*.
-
-With nothing serving `col = $1`, the custom planner's alternative is a seq scan plus a top-N sort, bounded by the table's pages. A promoted generic plan cannot see that the value is rare, keeps the ordered primary-key walk, and fetches nearly every tuple before it fills the `LIMIT`. Before 0.57.0 those columns were dropped **before** the check counted them as considered, so they appeared neither in the findings nor in the "not scored" notices: they were silently outside the population.
-
-The fixture, printed so the numbers below are checkable rather than asserted (PostgreSQL 16, warm cache, `synchronize_seqscans`, `max_parallel_workers_per_gather` and `jit` off):
-
-```sql
-CREATE TABLE t (id int PRIMARY KEY, organization_id int NOT NULL, payload text NOT NULL);
-INSERT INTO t SELECT g, <bucket(g)>, repeat('p', 60)
-  FROM generate_series(1, 20000) g ORDER BY (g * 2654435761::bigint) % 1000003;
--- 247 relpages, buckets 10,000 / 6,000 / 3,998 / 2
--- read: WHERE organization_id = $1 ORDER BY id LIMIT $2, on the rarest value, limit 20
-```
+Measured on a 20,000-row, 247-page fixture (PostgreSQL 16, warm cache, value buckets 10,000 / 6,000 / 3,998 / 2, querying the rarest value with limit 20):
 
 | `plan_cache_mode` | plan | buffers |
 | --- | --- | --- |
 | `force_custom_plan` | Seq Scan | **250** |
 | `force_generic_plan` | Index Scan on the primary key | **20,074** |
 
-Under `auto`, seven executions of the rare value report `generic_plans 2, custom_plans 5`, so the promotion is real on that fixture and not a hypothetical.
+Each finding prints its statistics (rows, distinct values, generic estimate, rarest bucket, crossovers at limit 20 and limit 1000, correlation, last ANALYZE) and how many pages the wrong plan walks.
 
-**The remedy is different, so the report is too.** An unindexed column's flip is fixed by adding the index, not by a plan-cache override, so when the same run's index advisor already names the column, the divergence is rendered as **evidence on that missing-index finding** rather than as a second entry, and it never suggests `forceCustomPlan` there. The leftover case (a column served only by a partial or expression index, where the planner has no path for the bare predicate) keeps its own entry. Adding the index moves the divergence in both directions at once, so re-run `doctor` after adding it rather than assuming the finding is closed: the column is expected to reappear on the sparse-value rule, and on the measured fixture the index also stopped `auto` promoting at all.
+The cost of a flip depends on how closely the heap tracks the ordering column: on otherwise-identical fixtures it ranged from 1.2x (heap in exact `id` order, the normal state of an append-mostly `serial` table) to 80x (hash order). The cases sit one sampled fifth decimal of `pg_stats.correlation` apart, so nothing is filtered on that statistic; every finding instead carries the ordering column's correlation and a `heapNearlyOrdered` boolean.
 
-<Callout type="warning" title="The known false positive, and why it is disclosed rather than filtered">
-  How much this flip costs is decided by how closely the heap tracks the column
-  the generic plan walks, because the generic plan pays one heap fetch per index
-  entry: when consecutive entries land on the same already-pinned page the fetch
-  is free. Six fixtures identical except for INSERT ordering, custom plan 250
-  buffers in every one:
+A hash index is an equality path, so a column served by one is scored by the sparse-value rule rather than called unindexed. A column served only by `brin`, `gin` or `gist` is reported as **not scored**, with the reason.
 
-  | heap order | `pg_stats.correlation` on `id` | generic buffers | ratio |
-  | --- | --- | --- | --- |
-  | exact `id` order | 1.00000 | 303 | 1.2x |
-  | shuffled within ~1 page | 0.99998 | 783 | 3.1x |
-  | shuffled within ~2 pages | 0.99993 | 10,303 | 41x |
-  | shuffled within ~4 pages | 0.99974 | 15,148 | 61x |
-  | shuffled within ~20 pages | 0.99372 | 19,046 | 76x |
-  | hash order | -0.00065 | 20,074 | 80x |
+#### The unindexed-filter probe
 
-  The top row is a false positive worth naming, because it is not an exotic
-  table: `id serial PRIMARY KEY` inserted in order with a scattered tenant or
-  status column is the normal state of an append-mostly table. The plan flips in
-  all six; only the magnitude differs.
-
-  Nothing is suppressed on that statistic. The boundary sits between two adjacent
-  sampled values, so a gate would be fitted to the fifth decimal place of a
-  sample and would drop genuine 41x to 80x findings. Instead every finding
-  carries the **ordering column's** correlation and a `heapNearlyOrdered`
-  boolean, in the human report and in `--json`, and the printed text states the
-  condition next to the ratio rather than quoting one number for both cases.
-</Callout>
-
-**A hash index is an equality path**, so a column served by one is scored by the sparse-value rule rather than called unindexed (measured: with a hash index the custom plan is a 7-buffer Bitmap Heap Scan, not a 247-page seq scan). A column served only by `brin`, `gin` or `gist` is reported as **not scored**, with the reason, because neither rule describes what its custom plan does.
-
-
-Every finding ships a copy-pasteable diagnostic block, and its first step is not an `EXPLAIN`:
-
-```sql
-SELECT generic_plans, custom_plans FROM pg_prepared_statements WHERE name = 'turbine_divergence';
-```
-
-A finding describes **exposure, not an incident**. `auto` promotes only when the generic plan's *estimated* cost is not worse than the average custom cost, and on many of these shapes it is worse, so the backend never promotes at all and there is nothing to fix. While `generic_plans` is 0 you are already getting custom plans. Only when it is climbing do the two `EXPLAIN`s below it mean anything. The block ends by resetting `plan_cache_mode`, `synchronize_seqscans` and `max_parallel_workers_per_gather` so a paste does not leave your session pinned.
-
-There is no `--fix`. For a sparse-value finding the remedy is application code ([`forceCustomPlan`](/relations#a-per-query-lever-forcecustomplan) on the affected reads, available on the core client and, since 0.57.0, through `turbine-orm/prisma-compat`), and the index that looks like a fix is measured not to be one: a composite index on `(col, order_col)` makes the *good* plan better without stopping the generic plan from choosing the other one. For an unindexed-filter finding the first remedy is the index itself, and the report says so instead of suggesting the per-query lever.
-
-<Callout type="warning" title="What it cannot see">
-This check reads the value distribution, not the physical layout. It models two directions (a rare value that loses its bitmap plan, and an unindexed filter column whose good plan is a seq scan) and deliberately does not model a third (a physically clustered dominant value). A rule for that one was written, measured against live fixtures, and **removed**: whether that flip helps or hurts turns on where in the heap the dominant band sits, `pg_stats.correlation` is identical whether it sits at the head or the tail, and the rule predicted the wrong *sign* on real tables.
-
-Three further limits, stated because a quiet report is easy to read as a clean bill of health:
-
-- **The population is relation-probe columns and leading index columns.** A filter column that is neither an FK nor indexed (a `status`, a `deleted_at`, a tenant column with no FK constraint) is not scored in either branch. Feeding the index advisor's recommendations in does not change that: both derive from the same relation topology, and the advisor's only extra members are composite probes, which this check does not model. Closing it needs a workload source (`pg_stat_statements` or `_turbine_metrics`).
-- **The unindexed-filter branch's first gate is a constant** (the rarest value must hold fewer rows than the assumed limit), so it declines divergences whose absolute cost is larger than the ones it reports. Measured on the same fixture shape at 200,000 rows with a rarest bucket of 60: 2,473 buffers custom against 200,547 generic, an 81x flip and 198,074 extra buffer accesses, declined.
-- **A finding is exposure, not an incident**, and a clean report is not evidence of immunity.
-
-The report prints how many columns were scored, split by indexed and unindexed, rather than letting the finding count imply coverage.
-</Callout>
-
-#### The findings are checked against the planner (new in 0.58.0)
-
-Statistics can say how bad a flip would be. Only the planner can say whether it is **reachable**. In 0.57.0 the unindexed-filter branch reported on statistics alone, and a measured sample of 13 such findings held up only 6 times: every false positive had one signature, the generic plan keeping the same sequential scan the good plan chose, so there was nothing to diverge to.
-
-Each unindexed-filter finding now costs one `EXPLAIN` **without** `ANALYZE`, which plans and discards, executes nothing, and returns in microseconds:
+Statistics say how bad a flip would be; only the planner can say whether it is reachable. Each `unindexed-filter` finding therefore costs one `EXPLAIN` **without** `ANALYZE`, which plans and discards, executing nothing:
 
 ```sql
 PREPARE p AS SELECT * FROM t WHERE col = $1 ORDER BY ord LIMIT $2;
@@ -526,32 +433,42 @@ SET LOCAL plan_cache_mode = force_generic_plan;
 EXPLAIN (FORMAT JSON) EXECUTE p(NULL, 20);
 ```
 
-Only the generic plan is needed: the finding's claim is that a promoted plan performs an **ordered index walk**, so a generic plan that is not that walk refutes it whatever the custom plan does. Two independent grounds count as "not that walk": a `Sort` above the target table's scan (which bounds the cost by how many rows match rather than by how far the walk travels, whatever access feeds it), or a `Seq Scan` at the target itself. A `Sort` elsewhere in the plan, and an `Incremental Sort`, deliberately do not refute. That also removes the need for a representative rare value, which statistics do not carry. `--json` gains `planDivergenceScored.flipProbed` and `.flipRefuted`.
+The finding's claim is that the promoted plan performs an ordered index walk, so a generic plan that is not that walk refutes it. Two grounds count: a `Sort` above the target table's scan, or a `Seq Scan` at the target itself. An `Incremental Sort`, or a `Sort` elsewhere in the plan, does not refute. A probe that errors, times out, or returns an unparseable plan keeps its finding, with a notice, so an uncooperative database cannot silently delete findings. `--json` gains `planDivergenceScored.flipProbed` and `.flipRefuted`. The check asks the planner because a closed-form gate was tried and measured wrong: the plan choice is a cost comparison that moves with the table.
 
-**A probe that fails keeps its finding.** Errors, timeouts and unparseable plans leave the finding in place with a notice. A diagnostic that deletes findings when the database is uncooperative fails invisibly in exactly the environments where you are least able to check.
+#### Remedies and the diagnostic block
 
-<Callout type="note" title="Why a probe and not a formula">
-The natural gate is arithmetic: require the generic row estimate (`rows / n_distinct`) to exceed the assumed `LIMIT`, since Postgres discounts an ordered index walk by `min(1, limit / estimate)`. Measured, that rule is wrong. On a 247-page fixture the boundary sits between estimates **3 and 4**, not at 20:
+There is no `--fix`, because the remedy differs by branch:
 
-| generic estimate | 2 | 3 | 4 | 10 | 20 | 500 |
-| --- | --- | --- | --- | --- | --- | --- |
-| generic plan | seq | seq | index | index | index | index |
-| buffers | 250 | 250 | 20,074 | 20,074 | 19,071 | 765 |
+- A **sparse-value** finding is fixed in application code: [`forceCustomPlan`](/relations#a-per-query-lever-forcecustomplan) on the affected reads, on the core client and through `turbine-orm/prisma-compat`. A composite index on `(col, order_col)` is measured not to fix it: it makes the good plan better without stopping the generic plan from choosing the other one.
+- An **unindexed-filter** finding is fixed by adding the index. When the same run's index advisor already names the column, the divergence renders as evidence on that missing-index finding rather than as a second entry. Re-run `doctor` after adding the index: the column is expected to reappear under the sparse-value rule.
 
-Estimates 4 through 20 are full-table walks such a gate would discard. The real limit fraction for a bound limit is `ceil(0.1 x estimate) / estimate`, which pins to 0.1 at estimates of 10 or more and rises to `1/estimate` below that; the plan is then chosen by a cost comparison, so the boundary moves with the table rather than sitting at a fixed number. A closed-form gate was attempted, failed its own out-of-sample prediction, and was dropped in favour of asking the planner.
+Every finding ships a copy-pasteable diagnostic block, and its first step is not an `EXPLAIN`:
+
+```sql
+SELECT generic_plans, custom_plans FROM pg_prepared_statements WHERE name = 'turbine_divergence';
+```
+
+A finding describes **exposure, not an incident**: on many of these shapes the backend never promotes to the generic plan at all, and while `generic_plans` is 0 you are already getting custom plans. The block ends by resetting `plan_cache_mode`, `synchronize_seqscans` and `max_parallel_workers_per_gather` so a paste does not leave your session pinned.
+
+<Callout type="warning" title="What it cannot see">
+- **The scored population is relation-probe columns and leading index columns.** A filter column that is neither an FK nor indexed (a `status`, a tenant column with no FK constraint) is not scored in either branch.
+- **It does not model a physically clustered dominant value.** Whether that flip helps or hurts depends on where in the heap the value's rows sit, and no `pg_stats` input carries that.
+- **The unindexed-filter branch's first gate is a constant** (the rarest value must hold fewer rows than the assumed limit), so it declines some divergences whose absolute cost is larger than the ones it reports.
+
+The report prints how many columns were scored, split by indexed and unindexed, so "considered and clean" is distinguishable from "never looked".
 </Callout>
 
 ### `--json`
 
-`doctor --json` emits a stable, versioned report (`schemaVersion: 1`) covering every finding (tier, metrics, and the create/drop SQL), the invalid indexes, the thresholds, workload-heat availability, and any degradation notices. `planDivergence` and `planDivergenceNotices` are always present as arrays (empty when the check found nothing or was skipped), and `planDivergenceScored` reports how large the scored population was (`considered` / `indexed` / `unindexed`) so a consumer can tell "considered and clean" from "never looked". Each finding carries a `branch` (`'sparse-value'` or `'unindexed-filter'`), and since 0.57.0 the branch-shaped fields are **optional**: `crossoverRows`, `crossoverRowsWide`, `valuesBelowCrossover`, `walkPages`, `walkFraction` and `approxAmplification` are absent on an `unindexed-filter` finding rather than zero-filled, and `tuplesWalked`, `worstCaseAmplification`, `orderColumnCorrelation` and `heapNearlyOrdered` are present only there. Branch on `branch` rather than reading them unconditionally. The versioned envelope is a contract, so a consumer that parses it will not break when new fields are added. The `unused`, `redundant`, `audit`, and `invalid` arrays are ALWAYS present: they are empty when the corresponding scan did not run, and a `subtraction` object reports which scans ran (`unusedRan`, `auditRan`, `minScans`) so the key set never varies by flag. Each unused-index entry also carries a structured `shape` (`kinds`, `accessMethod`, `definition`) alongside the human-readable `caveat` string, so a consumer never has to parse prose.
+`doctor --json` emits a stable, versioned report (`schemaVersion: 1`): every finding with tier, metrics, and create/drop SQL, plus invalid indexes, thresholds, workload-heat availability, and degradation notices. New fields are added without breaking the envelope.
 
-### Where this fits
-
-Turbine's advantage here is that it knows which columns its correlated subqueries will probe *before any traffic exists*, so it can advise from schema topology alone, then sharpen that with local statistics. The advice is free, runs on your machine with no telemetry, and produces reviewed migrations with DBA-grade caveats. Prisma's Optimize is client-extension telemetry sent to its cloud rather than a local advisor, and Drizzle has nothing in this space; the tools that do read live index usage (pganalyze, Supabase's index_advisor, `pg_stat_statements` front-ends) work from the SQL your database has already run, not from the ORM's knowledge of what it is about to run.
+- `planDivergence` and `planDivergenceNotices` are always present as arrays (empty when the check found nothing or was skipped). `planDivergenceScored` reports the scored population (`considered` / `indexed` / `unindexed`).
+- Each divergence finding carries a `branch` (`'sparse-value'` or `'unindexed-filter'`), and branch-shaped fields are optional rather than zero-filled: `crossoverRows`, `crossoverRowsWide`, `valuesBelowCrossover`, `walkPages`, `walkFraction` and `approxAmplification` are absent on an `unindexed-filter` finding; `tuplesWalked`, `worstCaseAmplification`, `orderColumnCorrelation` and `heapNearlyOrdered` are present only there. Branch on `branch`.
+- The `unused`, `redundant`, `audit`, and `invalid` arrays are always present (empty when the scan did not run), and a `subtraction` object reports which scans ran (`unusedRan`, `auditRan`, `minScans`), so the key set never varies by flag. Each unused-index entry carries a structured `shape` (`kinds`, `accessMethod`, `definition`) alongside the `caveat` string.
 
 ### Dev-mode warning
 
-You don't have to remember to run `doctor`. In non-production (`NODE_ENV !== 'production'`), the first query that builds a relation subquery over an unindexed FK logs a one-time warning naming the relation, the table and columns, and the exact `CREATE INDEX` statement. The warning only fires when the schema metadata actually carries index information (introspected or generated clients), so `defineSchema`-only setups see no false positives.
+In non-production (`NODE_ENV !== 'production'`), the first query that builds a relation subquery over an unindexed FK logs a one-time warning naming the relation, the table and columns, and the exact `CREATE INDEX` statement. It only fires when the schema metadata carries index information (introspected or generated clients), so `defineSchema`-only setups see no false positives.
 
 ## `turbine migrate-from-prisma`
 
@@ -569,22 +486,13 @@ npx turbine migrate-from-prisma --if-db
 
 The parser is a zero-dependency subset parser: neither `prisma` nor `@prisma/client` needs to still be installed. Outputs land in the generate output directory (default `./generated/turbine`):
 
-- `prisma-migration-report.md`: per-model resolution, a **many-to-many audit list** pairing each Prisma field name with its Turbine relation name and junction table, junction tables detected for implicit many-to-many, enums, unresolved items, and parser notes
+- `prisma-migration-report.md`: per-model resolution, a many-to-many audit list (Prisma field name, Turbine relation name, junction table), detected implicit-m2m junction tables, enums, unresolved items, and parser notes
 - `prisma-map.ts`: the typed `PRISMA_MAP` consumed by the compat adapter
 - the standard generated client (`types.ts`, `metadata.ts`, `index.ts`)
 
 ### Connection string
 
-The command resolves the database URL in this order: `--url`, then `DATABASE_URL`, then `url` in `turbine.config.ts`, then the **`datasource` block of the schema you pointed it at**, including its `env("...")` indirection (`url` first, then `directUrl`). A literal `url = "postgres://..."` is read too.
-
-So a project whose schema says `url = env("DATABASE_URL_STAGING")` needs no flag, as long as that variable is exported:
-
-```bash
-export DATABASE_URL_STAGING=postgres://...
-npx turbine migrate-from-prisma --schema prisma/schema.prisma
-```
-
-The datasource is deliberately last: an explicit `--url` is never overridden by a value declared in a schema file. When the run does use it, the command says so. When nothing yields a URL, the "no database URL" error gains a fourth suggestion naming the exact variable the datasource asked for.
+The command resolves the database URL in this order: `--url`, then `DATABASE_URL`, then `url` in `turbine.config.ts`, then the `datasource` block of the schema you pointed it at, including its `env("...")` indirection (`url` first, then `directUrl`) or a literal `url = "postgres://..."`. So a schema that says `url = env("DATABASE_URL_STAGING")` needs no flag as long as that variable is exported. The datasource is deliberately last, so an explicit `--url` is never overridden by a schema file; when nothing yields a URL, the error names the exact variable the datasource asked for.
 
 ### Flags
 
@@ -598,11 +506,11 @@ The datasource is deliberately last: an explicit `--url` is never overridden by 
 | `--if-db` | Exit 0 without doing anything when no connection string resolves, instead of failing. Makes the command safe to run from `postinstall`. |
 | `--no-timestamp` | Omit the generated-at lines for byte-identical regeneration. |
 
-Unresolved items never block the generated client: it is built from live introspected metadata, so a partial run still produces a working `db`. See [Migrating from Prisma](/migrate-from-prisma#the-migration-toolkit) for the full workflow and the adapter's documented gaps.
+Unresolved items never block the generated client: it is built from live introspected metadata, so a partial run still produces a working `db`. Full workflow and the adapter's documented gaps: [Migrating from Prisma](/migrate-from-prisma#the-migration-toolkit).
 
 ### Keeping `prisma-map.ts` current
 
-Nothing re-runs this command for you, and a `prisma-map.ts` that has fallen behind your schema fails silently: the adapter goes on translating the names it has, so a newly added model is simply not on the compat client. Put the command where you already regenerate, next to `prisma generate`:
+A stale `prisma-map.ts` fails silently: the adapter goes on translating the names it has, so a newly added model is simply not on the compat client. Put the command where you already regenerate:
 
 ```json
 {
@@ -612,9 +520,9 @@ Nothing re-runs this command for you, and a `prisma-map.ts` that has fallen behi
 }
 ```
 
-`--if-db` is what makes that safe. An `npm ci` in a build image has no `DATABASE_URL`, and without the flag the missing database would fail the install; with it, the run prints one line saying nothing was regenerated and exits 0.
+`--if-db` is what makes that safe: an `npm ci` in a build image with no `DATABASE_URL` prints one line and exits 0 instead of failing the install.
 
-Since 0.60 the emitted map also records a fingerprint of the `schema.prisma` it was generated from, and `createPrismaCompatClient` warns once at startup, in development only, when the file on disk no longer matches. See [Keeping the map current](/migrate-from-prisma#keeping-the-map-current).
+The emitted map also records a fingerprint of the `schema.prisma` it was generated from, and `createPrismaCompatClient` warns once at startup, in development only, when the file on disk no longer matches. See [Keeping the map current](/migrate-from-prisma#keeping-the-map-current).
 
 ### The `--out` directory guard
 
@@ -626,24 +534,13 @@ Output directory must be within the project root. Got: /tmp/turbine-scratch
 # exit code 1
 ```
 
-Specifics worth knowing before you script it:
+"Project root" means the process's current working directory, not the directory holding `turbine.config.ts`; a relative `--out` that climbs out (`--out ../shared/generated`) is refused too. The guard is specific to `migrate-from-prisma`; `turbine generate --out` has no such restriction.
 
-- **"Project root" means the process's current working directory**, not the directory holding `turbine.config.ts`. The path is resolved against the cwd and must land on it or below it. A relative `--out` that climbs out (`--out ../shared/generated`) is refused for the same reason.
-- **The refusal comes after introspection.** The command has already connected and read your schema by the time it checks, so the failure costs a round trip and produces no files at all.
-- **This guard is specific to `migrate-from-prisma`.** `turbine generate --out` has no such restriction.
-
-If you are generating into a scratch directory, run the command from inside it and point `--schema` at the absolute path instead:
-
-```bash
-mkdir -p /tmp/turbine-scratch && cd /tmp/turbine-scratch
-DATABASE_URL=postgres://... npx turbine migrate-from-prisma \
-  --schema /path/to/app/prisma/schema.prisma \
-  --out ./generated
-```
+To generate into a scratch directory, run the command from inside it and point `--schema` at the absolute path of the Prisma file.
 
 ## `turbine studio`
 
-Launch a local, read-only web UI for exploring your database. In the default mode the write endpoints are not registered in the router at all (they 404), every read runs inside `BEGIN READ ONLY` so writes are impossible at the database level, there is no raw-SQL input surface, and PII-tagged columns are redacted server-side before the response is serialized. As of July 2026, no other TypeScript ORM ships a studio that is read-only by default or that redacts PII.
+Launch a local, read-only web UI for exploring your database: a visual `findMany` **Query** builder with a live Copy-TS preview, **Data** browsing, and **Schema** inspection. By default the write endpoints are not registered (they 404), every read runs inside `BEGIN READ ONLY`, there is no raw-SQL input surface, and PII-tagged columns are redacted server-side.
 
 ```bash
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine studio
@@ -652,9 +549,7 @@ npx turbine studio --port 5173 --no-open
 # npx turbine studio --host 0.0.0.0 --allow-remote
 ```
 
-Three tabs: a visual `findMany` **Query** builder with a live Copy-TS preview (no raw-SQL surface at all), **Data** browsing, and **Schema** inspection, all inside `BEGIN READ ONLY` with loopback binding and per-process token auth.
-
-Studio has its own page covering the builder, saved queries, every flag, and the full security model: **[Studio](/studio)**.
+The builder, saved queries, every flag, and the full security model: **[Studio](/studio)**.
 
 ## `turbine mcp`
 
@@ -664,7 +559,7 @@ Start a read-only [Model Context Protocol](https://modelcontextprotocol.io) serv
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine mcp
 ```
 
-Ten tools: `schema_overview`, `table_detail`, `relation_graph`, `find_join_path` (returns the `with` clause to write), `migrate_status`, `doctor_report`, `explain_query` (schema-validated findMany-style args only, no free-form SQL), `table_stats`, `sample_rows` (≤ 50 rows), and `explain_error` (needs no database, so it answers when the pool is unreachable). Every database access runs inside `BEGIN READ ONLY`. `--include` / `--exclude` scope which tables are exposed.
+Eleven tools: `schema_overview`, `table_detail`, `relation_graph`, `find_join_path` (returns the `with` clause to write), `migrate_status`, `doctor_report`, `explain_query` (schema-validated findMany-style args only, no free-form SQL), `compile_query` (the exact SQL a read query would send, without running it), `table_stats`, `sample_rows` (≤ 50 rows), and `explain_error` (needs no database, so it answers when the pool is unreachable). Every database access runs inside `BEGIN READ ONLY`. `--include` / `--exclude` scope which tables are exposed.
 
 Full setup, tool reference, and Claude Code / Cursor config: **[MCP Server](/mcp)**.
 
@@ -688,11 +583,9 @@ Turbine looks for configuration in this order, stopping at the first match:
 4. Built-in defaults
 
 <Callout type="warning" title="There is no turbine.config.json">
-  Those four filenames are the entire list. A `turbine.config.json` is not
-  looked for and not read, so a project that has one gets the built-in defaults
-  with no warning at all: `out` silently becomes `./generated/turbine` and any
-  `include` / `exclude` you wrote is ignored. Rename it to
-  `turbine.config.ts` and `export default`.
+  Those four filenames are the entire list. A `turbine.config.json` is never
+  read, so a project that has one silently gets the built-in defaults. Rename
+  it to `turbine.config.ts` and `export default`.
 </Callout>
 
 Example `turbine.config.ts`:

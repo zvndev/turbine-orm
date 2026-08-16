@@ -42,6 +42,7 @@ import { executePipeline, type PipelineOptions, type PipelineResults, pipelineSu
 import {
   type DeferredQuery,
   type GlobalFilters,
+  type JsonEncoding,
   type QueryEvent,
   type QueryEventListener,
   QueryInterface,
@@ -459,19 +460,31 @@ export interface TurbineConfig {
   /**
    * How nested-relation subqueries encode each row's JSON.
    *
-   *   - `'object'` (default), `json_agg(json_build_object('key', v, …))`. Every
-   *     key name is repeated in every nested object of every row.
+   *   - `'object'`, `json_agg(json_build_object('key', v, …))`. Every key name
+   *     is repeated in every nested object of every row.
    *   - `'positional'`, `json_agg(json_build_array(v, …))`. Turbine knows the
    *     column order at build time, so it emits a key-less array and maps
    *     positions back to keys client-side. Same information, a fraction of the
-   *     bytes on wide/deeply-nested `with` trees. Parsed output is byte-identical
-   *     to `'object'`.
+   *     bytes on wide/deeply-nested `with` trees. Parsed output is
+   *     byte-identical to `'object'`.
    *
-   * Postgres-only in v1: setting `'positional'` on a non-Postgres engine throws
-   * `UnsupportedFeatureError` (E017) when a `with` clause is present. Default:
-   * `'object'` (today's behavior, byte-unchanged).
+   * DEFAULTS BY ENGINE: `'positional'` on PostgreSQL, `'object'` on SQLite,
+   * MySQL, SQL Server and PowDB. Positional is PostgreSQL-only, and setting it
+   * on another engine throws `UnsupportedFeatureError` (E017) as soon as a
+   * `with` clause is present, so the default cannot be one value everywhere.
+   *
+   * Why positional is the PostgreSQL default. `json_build_object` makes the
+   * SERVER build the key names for every relation row, which is the whole
+   * nested-read cost: measured on a 50-parent / ~10-child-per-parent read
+   * against local PostgreSQL 17, server time 0.685 ms → 0.350 ms and 152 KB →
+   * 100 KB on the wire, for rows that compare byte-identical.
+   *
+   * Reasons to set `'object'` (per query via `findMany({ jsonEncoding })`, or
+   * here for a whole client): a readable statement in a query log, and
+   * `relationLoadStrategy: 'flatten'`, which is refused while positional is
+   * active because a flattened relation emits no JSON to encode.
    */
-  jsonEncoding?: 'object' | 'positional';
+  jsonEncoding?: JsonEncoding;
   /**
    * Controls how `NotFoundError` (and other where-aware errors) format their
    * messages.
@@ -997,7 +1010,19 @@ const GUC_NAME_REGEX = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/;
  * to a replica pool. Every other method (all writes, plus internals) stays on
  * the primary. Kept as a Set so the routing proxy's `get` trap is O(1).
  */
-const READ_OPERATIONS: ReadonlySet<string> = new Set([
+/**
+ * Operations that may be served by a read replica.
+ *
+ * This is a hand-maintained list of names, so it drifts the moment a read
+ * method is added to `QueryInterface` and not added here. The failure is
+ * SILENT and directional: the missing operation keeps working, it just runs on
+ * the PRIMARY, so no test fails and no user sees an error, only a busier
+ * primary. `findManyStreamBatches` was added and missed exactly this way.
+ * `src/test/read-operations-drift.test.ts` closes the loop mechanically.
+ *
+ * Exported for that test only.
+ */
+export const READ_OPERATIONS: ReadonlySet<string> = new Set([
   'findMany',
   'findFirst',
   'findUnique',
@@ -1007,6 +1032,7 @@ const READ_OPERATIONS: ReadonlySet<string> = new Set([
   'aggregate',
   'groupBy',
   'findManyStream',
+  'findManyStreamBatches',
 ]);
 
 /**
@@ -1792,6 +1818,11 @@ export class TurbineClient {
    * query-string boundary: a connection string with an unencoded `?` inside the
    * password is not parseable by pg either, so there is no shape this handles
    * differently from the driver.
+   *
+   * A twin of this lives in `src/connection-url.ts`, which `turbine doctor`
+   * uses for `statement_timeout`. Unifying them is the obvious refactor and it
+   * is deliberately NOT done; the reason (a c8 merge artifact that costs almost
+   * all of the coverage gate's headroom) is written up over there.
    */
   private static mergeConnectionStringOptions(connectionString: string, setting: string): string | null {
     const q = connectionString.indexOf('?');

@@ -37,6 +37,7 @@ import type {
   ArrayFilter,
   ColumnRef,
   GlobalFilters,
+  JsonEncoding,
   JsonFilter,
   JsonPathOrderBy,
   ResolvedSkipGlobalFilters,
@@ -191,7 +192,16 @@ export interface BuilderCtx {
     collectedParams: unknown[],
   ): void;
   // Shared primitives + state reached by the relation/orderBy module (relations.ts).
-  readonly jsonEncoding: 'object' | 'positional';
+  /**
+   * The relation JSON encoding of the query BEING BUILT: its own `jsonEncoding`
+   * arg, else the client's, which is `'positional'` on PostgreSQL and
+   * `'object'` on every other engine.
+   *
+   * A live getter on the concrete ctx (like `currentSkip`), not a value copied
+   * at construction, because it is now a per-query option. `readonly` here says
+   * the modules may not write it, not that it cannot change between builds.
+   */
+  readonly jsonEncoding: JsonEncoding;
   readonly camelDateFieldCache: Map<string, Set<string>>;
   /**
    * Per-table memo of `Object.entries(meta.relations)`. See

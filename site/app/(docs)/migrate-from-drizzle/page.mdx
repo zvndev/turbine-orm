@@ -7,7 +7,7 @@ export const metadata = {
 
 # Migrating from Drizzle
 
-Drizzle is a great TypeScript ORM with a SQL-like query builder, and both libraries resolve a nested read in a single statement: Drizzle's relational queries compile to `LEFT JOIN LATERAL` plus JSON aggregation, Turbine's `with` compiles to correlated `json_agg` subqueries. That is not the difference between them. What Turbine adds is a Prisma-inspired typed surface with schema-generated types (no `relations()` re-declaration), typed errors, a read-only-by-default Studio, PII enforced in the emitted SQL, and edge/serverless support with no config. If you want the ergonomics of `findMany({ with: { posts: true } })` and those defaults, Turbine is a natural step.
+Drizzle and Turbine both resolve a nested read in a single statement: Drizzle's relational queries compile to `LEFT JOIN LATERAL` plus JSON aggregation, Turbine's `with` compiles to correlated `json_agg` subqueries. The difference is the surface. Turbine is a Prisma-style typed API with schema-generated types (no `relations()` re-declaration), typed errors, a read-only-by-default Studio, PII enforced in the emitted SQL, and edge/serverless support with no config.
 
 ## API mapping
 
@@ -20,7 +20,7 @@ Drizzle is a great TypeScript ORM with a SQL-like query builder, and both librar
 | `db.insert(users).values([...]).onConflictDoNothing()` | `db.users.createMany({ data: [...], skipDuplicates: true })` | Bulk insert via UNNEST. |
 | `db.update(users).set({ ... }).where(eq(users.id, 1))` | `db.users.update({ where: { id: 1 }, data: { ... } })` | Supports atomic operators: `{ increment: 1 }`. |
 | `db.delete(users).where(eq(users.id, 1))` | `db.users.delete({ where: { id: 1 } })` | Returns deleted row. |
-| `db.query.users.findMany({ with: { posts: true } })` | `db.users.findMany({ with: { posts: true } })` | Nearly identical! |
+| `db.query.users.findMany({ with: { posts: true } })` | `db.users.findMany({ with: { posts: true } })` | Nearly identical. |
 | `db.transaction(async (tx) => { ... })` | `db.$transaction(async (tx) => { ... })` | SAVEPOINTs for nesting, isolation levels. |
 | `sql\`SELECT ...\`` | `db.raw\`SELECT ...\`` | Tagged template SQL with type inference. |
 
@@ -95,7 +95,7 @@ const users = await db.users.findMany({
 });
 ```
 
-Turbine's `with` generates a single SQL statement using `json_agg` subqueries. No N+1 and no separate query round-trips.
+Turbine's `with` generates a single SQL statement using `json_agg` subqueries. No N+1, no separate round-trips.
 
 ### Filtering with operators
 
@@ -178,7 +178,7 @@ await db.$transaction(async (tx) => {
 | Feature | Drizzle | Turbine |
 |---|---|---|
 | Single-query nested relations | Yes, relational queries (RQBv2) | Yes, via `json_agg`, typed and date-coerced at any depth |
-| Typed errors with codes | Generic Error (raw pg errors) | 16 error classes with SQLSTATE mapping |
+| Typed errors with codes | Generic Error (raw pg errors) | Typed error classes (`TURBINE_E001`-`E018`) with SQLSTATE mapping |
 | Optimistic locking | Manual | Built-in `optimisticLock: { field, expected }` |
 | Retry with backoff | Manual | `withRetry()` + `isRetryable` errors |
 | Full-text search | Raw SQL | `{ search: 'query' }` operator |
@@ -195,7 +195,7 @@ await db.$transaction(async (tx) => {
 ## What you'll lose
 
 - **SQL-like syntax.** If you prefer `select().from().where()` chaining, Turbine's object API is a style change.
-- **First-class multi-database support.** Drizzle treats MySQL, SQLite, and Postgres as peers. Turbine is **Postgres-first**: PostgreSQL (plus the wire-compatible CockroachDB and YugabyteDB) is the primary target, and SQLite, MySQL 8, SQL Server, and PowDB ship behind subpath exports (`turbine-orm/sqlite`, `/mysql`, `/mssql`, `/powdb`) sharing the same typed query API. What you give up on those engines is narrower than "no support": a handful of query features throw a typed `UnsupportedFeatureError` (pgvector, LISTEN/NOTIFY, RLS session context), and the schema tooling (`turbine generate` / `push` / `migrate`, `schemaPush` / `schemaDiff`, `doctor`) targets Postgres, so the other engines are code-first via `defineSchema`. See [What is actually Postgres-only](/engines#what-is-actually-postgres-only) for the exact line.
+- **First-class multi-database support.** Drizzle treats MySQL, SQLite, and Postgres as peers. Turbine is Postgres-first: SQLite, MySQL 8, SQL Server, and PowDB ship behind subpath exports (`turbine-orm/sqlite`, `/mysql`, `/mssql`, `/powdb`) with the same typed query API, but a handful of query features throw a typed `UnsupportedFeatureError` there (pgvector, LISTEN/NOTIFY, RLS session context), and the schema tooling (`turbine generate` / `push` / `migrate`, `doctor`) targets Postgres, so the other engines are code-first via `defineSchema`. See [What is actually Postgres-only](/engines#what-is-actually-postgres-only).
 - **`$inferSelect` / `$inferInsert`.** Turbine generates types from introspection instead of inferring from schema definitions. Run `npx turbine generate` after schema changes.
 
 ## Migration checklist
@@ -218,7 +218,7 @@ await db.$transaction(async (tx) => {
    - `db.insert(table).values(...)` → `db.table.create({ data: { ... } })`
    - `db.update(table).set(...).where(...)` → `db.table.update({ where: { ... }, data: { ... } })`
    - `db.delete(table).where(...)` → `db.table.delete({ where: { ... } })`
-   - `db.query.table.findMany({ with: ... })` → `db.table.findMany({ with: ... })` (nearly identical!)
+   - `db.query.table.findMany({ with: ... })` → `db.table.findMany({ with: ... })` (nearly identical)
 6. Remove operator imports (`eq`, `gt`, `like`, etc.), Turbine uses object keys.
 7. Replace raw SQL: `sql\`...\`` → `db.raw\`...\``.
 8. Add error handling for typed errors (optional, they still extend `Error`).

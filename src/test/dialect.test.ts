@@ -491,12 +491,19 @@ describe('Dialect conformance matrix (no Postgres leakage)', () => {
     assert.match(find.sql, /\$1/);
     assert.match(find.sql, /"users"/);
 
+    // PostgreSQL's DEFAULT row encoder is positional (`json_build_array`); the
+    // object form is still native and still reachable per query, so both are
+    // pinned here rather than only whichever one is currently the default.
     const withSql = q.buildFindMany({ with: { posts: { with: { author: true } } } }).sql;
     assert.match(withSql, /json_agg/);
-    assert.match(withSql, /json_build_object/);
-    // wrapJsonSubresult for PG is byte-identical to the historical COALESCE wrap.
-    assert.match(withSql, /COALESCE\(\(SELECT json_build_object/);
+    assert.match(withSql, /json_build_array/);
+    assert.doesNotMatch(withSql, /json_build_object/);
     assert.match(withSql, /'\[\]'::json/);
+
+    const objectSql = q.buildFindMany({ with: { posts: { with: { author: true } } }, jsonEncoding: 'object' }).sql;
+    assert.match(objectSql, /json_build_object/);
+    // wrapJsonSubresult for PG is byte-identical to the historical COALESCE wrap.
+    assert.match(objectSql, /COALESCE\(\(SELECT json_build_object/);
 
     assert.match(q.buildCreate({ data: { id: 1, name: 'Ada' } }).sql, /RETURNING \*/);
     assert.match(q.buildDelete({ where: { id: 1 } }).sql, /RETURNING \*/);

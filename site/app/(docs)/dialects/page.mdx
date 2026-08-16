@@ -1,13 +1,13 @@
 export const metadata = {
   title: 'Writing a custom dialect',
   description:
-    'The exported Dialect contract in turbine-orm: capability flags, resultStrategy, the required primitives, and the additive override hooks for teaching Turbine a new SQL engine.',
+    'The exported Dialect contract in turbine-orm: capability flags, resultStrategy, the required primitives, and the additive override hooks for adding an engine Turbine does not ship.',
   alternates: { canonical: '/dialects' },
 };
 
 # Writing a custom dialect
 
-Every piece of SQL text that varies between engines routes through a single contract: `Dialect`. Query generation, DML, DDL, migration-tracking SQL, transaction control, streaming and introspection all go through it, and the whole thing is exported, so you can teach Turbine an engine it does not ship.
+**This is how you add an engine Turbine does not ship.** Every piece of SQL text that varies between engines routes through a single exported contract, `Dialect`: query generation, DML, DDL, migration-tracking SQL, transaction control, streaming and introspection all go through it. Turbine is MIT-licensed, and the contract is the documented extension seam: you implement a dialect and bind a pool shim, instead of forking the core. The shipped SQLite, MySQL, and SQL Server engines are built on exactly this seam.
 
 ```ts
 import {
@@ -37,12 +37,12 @@ import {
   is for an engine with genuinely different SQL. And if the engine has no SQL at
   all, a dialect cannot express the queries: see [PowDB](/powdb), which keeps a
   `Dialect` for capability gating and transaction keywords but replaces query
-  generation entirely with a parallel PowQL generator.
+  generation with a parallel PowQL generator.
 </Callout>
 
 ## The shape of the job
 
-A dialect is a plain object. Turbine ships five: `postgresDialect` (the default and the reference implementation), the ones behind the `sqlite`, `mysql` and `mssql` subpaths, and `powdbDialect` behind the `powdb` subpath. The PowDB one is the odd member: it is a genuine `Dialect`, but only its capability flags and transaction keywords are consumed, because [PowQL query generation](/powdb) does not go through the SQL builders at all.
+A dialect is a plain object. Turbine ships five: `postgresDialect` (the default and the reference implementation), the ones behind the `sqlite`, `mysql` and `mssql` subpaths, and `powdbDialect` behind the `powdb` subpath (a genuine `Dialect`, but only its capability flags and transaction keywords are consumed).
 
 The fastest way to start is to spread the Postgres one and override what differs:
 
@@ -70,7 +70,7 @@ The pool shim satisfies `PgCompatPool`: `query(text, values)`, `connect()`, `end
 
 ## Capability flags: refuse, do not degrade
 
-The single most important design rule in the contract. When your engine cannot do something, say so with a flag. The builders and the client then throw `UnsupportedFeatureError` (`TURBINE_E017`) naming the feature and the engine, instead of emitting SQL that cannot possibly work.
+The most important design rule in the contract. When your engine cannot do something, say so with a flag. The builders and the client then throw `UnsupportedFeatureError` (`TURBINE_E017`) naming the feature and the engine, instead of emitting SQL that cannot work.
 
 | Flag | Required | Turning it off means |
 |---|:---:|---|
@@ -80,16 +80,18 @@ The single most important design rule in the contract. When your engine cannot d
 | `supportsListenNotify` | yes | `$listen` / `$notify` throw. |
 | `supportsRLS` | yes | A `sessionContext` on `$transaction` throws. |
 | `supportsAdvisoryLock` | yes | Migration locking must come from a `DatabaseAdapter` instead. |
+| `supportsJsonContains` | yes | The JSON `contains` filter throws; path filters (`{ path, equals }`) still work. SQLite sets it `false`. |
 | `aggSupportsInlineOrderBy` | yes | Your array aggregate takes no inline `ORDER BY`, so every ordered to-many relation is rewritten into an inner subquery. MySQL and SQLite both set this `false`. |
 | `jsonPathSupport` | yes | `'native' \| 'function' \| 'limited'`. |
-| `supportsUpsertUpdateWhere` | optional | Absent is `false`. Whether your `buildUpsertStatement` honors `input.updateWhere`, a predicate on the conflict-UPDATE branch. Global filters compile that predicate (and bind its parameters) **only** when this is `true`, so a dialect that reports `true` and then drops `updateWhere` leaves orphaned parameters bound to no placeholder. Postgres and SQLite are `true` (both take a trailing `WHERE` on `ON CONFLICT ... DO UPDATE`). MySQL is `false` (`ON DUPLICATE KEY UPDATE` has no predicate slot) and SQL Server is `false` (`MERGE` accepts `WHEN MATCHED AND <pred>`, but the predicate the builder supplies uses unqualified column references that are ambiguous between the `MERGE` target and source aliases). The rule for a new dialect: set it `true` only if your `buildUpsertStatement` actually emits `input.updateWhere`. |
-| `supportsFullTextSearch` | optional | Absent is `false`, so a `search` filter throws. MySQL's `MATCH ... AGAINST` and SQL Server's `CONTAINS` deliberately stay `false`: they are different surfaces with different index requirements, and quietly substituting them would change the semantics. |
+| `supportsUpsertUpdateWhere` | optional | Absent is `false`. Whether your `buildUpsertStatement` honors `input.updateWhere`, a predicate on the conflict-UPDATE branch. Global filters compile that predicate (and bind its parameters) **only** when this is `true`, so reporting `true` and then dropping `updateWhere` leaves parameters bound to no placeholder. Postgres and SQLite are `true`; MySQL is `false` (`ON DUPLICATE KEY UPDATE` has no predicate slot) and SQL Server is `false` (the predicate the builder supplies would be ambiguous between `MERGE` target and source aliases). Set it `true` only if your `buildUpsertStatement` actually emits `input.updateWhere`. |
+| `supportsFullTextSearch` | optional | Absent is `false`, so a `search` filter throws. MySQL's `MATCH ... AGAINST` and SQL Server's `CONTAINS` deliberately stay `false`: they are different surfaces with different index requirements, and substituting them would change the semantics. |
 | `supportsArrayColumns` | optional | Absent is `false`. `has` / `hasEvery` / `hasSome` / `isEmpty` throw. A JSON column is not an array column. |
 | `supportsLateralJoin` | optional | Absent is `false`. Gates the opt-in `plan: 'lateral'` pick-row ordering. |
+| `supportsPlanCacheMode` | optional | Absent is `false`. Gates the client-level `planCacheMode` option and the per-query `forceCustomPlan` read option, both properties of the PostgreSQL plan cache. Only `postgresDialect` sets it `true`. |
 | `inlineLimitOffset` | optional | Render `LIMIT` / `OFFSET` as integer literals instead of bound params. MySQL sets it because mysql2's binary protocol sends JS numbers as `DOUBLE`, which `LIMIT` rejects. The values are Turbine-validated non-negative integers, never user strings, so inlining stays injection-safe. |
 | `explainQuery` | optional | `{ prefix: string }`. Absent means `explain()` throws `TURBINE_E017` (SQL Server, whose SHOWPLAN needs a separate session toggle). |
 
-Every optional flag defaults to the behaviour that keeps existing dialects byte-identical, which is the reason new hooks can be added without touching the ones already shipped.
+Every optional flag defaults to the behaviour that keeps existing dialects byte-identical, which is why new hooks can be added without touching the ones already shipped.
 
 ## `resultStrategy`: how a write returns its rows
 
@@ -107,10 +109,10 @@ This is the branch the write executor takes, and it is the deepest structural di
 
 <Callout type="warning" title="'reselect' is not free and not identical">
   A reselect is a second statement, so it is a second chance for the row to have
-  changed underneath you, and it cannot see a row that the write deleted. It is
-  also why `createMany` on MySQL returns `[]` rather than the inserted rows: the
-  rows genuinely are inserted, there is simply no key set to reselect them by.
-  If you choose `'reselect'` for a new dialect, document the same caveat.
+  changed underneath you, and it cannot see a row the write deleted. It is also
+  why `createMany` on MySQL returns `[]` rather than the inserted rows: the rows
+  are inserted, there is simply no key set to reselect them by. If you choose
+  `'reselect'` for a new dialect, document the same caveat.
 </Callout>
 
 ## The required primitives
@@ -119,14 +121,14 @@ These have no default. A dialect must supply all of them.
 
 **Identifiers and values**
 
-- `paramPlaceholder(index)` for the 1-indexed Nth placeholder. Every shipped dialect returns a **numbered** placeholder: `$1` (Postgres), `:p1` (SQLite and MySQL), `@p1` (SQL Server). None returns a bare `?`, and yours should not either unless your driver has no other option: a positional `?` makes `params[n]` depend on the order the placeholder happens to appear in the assembled text, which the relation and pagination builders do not guarantee. A numbered placeholder keeps `:pN` (or `@pN`, or `$N`) bound to `params[N-1]` regardless of text order, exactly like Postgres.
+- `paramPlaceholder(index)` for the 1-indexed Nth placeholder. Every shipped dialect returns a **numbered** placeholder: `$1` (Postgres), `:p1` (SQLite and MySQL), `@p1` (SQL Server). None returns a bare `?`, and yours should not either unless your driver has no other option: a positional `?` makes `params[n]` depend on the order the placeholder appears in the assembled text, which the relation and pagination builders do not guarantee. A numbered placeholder keeps `:pN` bound to `params[N-1]` regardless of text order.
 - `quoteIdentifier(name)` and `escapeStringLiteral(value)`.
 
 **JSON nesting**, which is how `with` clauses become one statement:
 
 - `buildJsonObject(pairs)` from `[key, expr]` pairs.
 - `buildJsonArrayAgg(jsonObjectExpr, orderBy?)`.
-- `wrapJsonSubresult(subquery, fallback)`, which wraps a correlated subquery for embedding as a JSON value. Postgres emits `COALESCE((sub), fallback)`; SQLite overrides it to additionally `json(...)`-wrap the result, because `json_group_array` double-encodes nested objects. SQL Server does **not** override this hook: its `ISNULL((... FOR JSON PATH), '[]')` is emitted inside its own `buildRelationSubquery` override, which replaces the whole relation-subquery path (see the additive hooks below).
+- `wrapJsonSubresult(subquery, fallback)`, which wraps a correlated subquery for embedding as a JSON value. Postgres emits `COALESCE((sub), fallback)`; SQLite overrides it to additionally `json(...)`-wrap the result, because `json_group_array` double-encodes nested objects. SQL Server does **not** override this hook: its `ISNULL((... FOR JSON PATH), '[]')` is emitted inside its own `buildRelationSubquery` override (see the additive hooks below).
 - `emptyJsonArrayLiteral` and `nullJsonLiteral`, the fallbacks for an empty to-many and a missing to-one.
 - `buildJsonContains`, `buildJsonPathExtract`.
 - `buildJsonArray(exprs)` is optional, and only reached by the Postgres-only `jsonEncoding: 'positional'` mode.
@@ -141,7 +143,7 @@ These have no default. A dialect must supply all of them.
 
 **Streaming**: `openStream(connection, sql, params, batchSize)`, an async generator of row batches. Postgres runs a `DECLARE CURSOR` / `FETCH` / `CLOSE` loop inside a transaction and is the only shipped dialect with constant memory.
 
-**None of the other three bundled dialects streams.** SQLite, MySQL and SQL Server all run the statement once, hold the entire result set in memory, and yield `batchSize` slices of it, so `findManyStream` on them is `findMany` with a different iteration shape and the same peak memory. That is a property of the seam, not of the drivers: `StreamableConnection` exposes only `query()`, so mysql2's `.stream()` and the `mssql` `request.stream` event API are simply not reachable from a dialect. If your engine can do better and you can reach its cursor, `openStream` is where that goes. If it materializes, say so in the dialect's own docs: a caller who reads "streaming: supported" and drains a 50M-row table will run the process out of memory.
+**None of the other three bundled dialects streams.** SQLite, MySQL and SQL Server run the statement once, hold the entire result set in memory, and yield `batchSize` slices of it, so `findManyStream` on them is `findMany` with a different iteration shape and the same peak memory. That is a property of the seam: `StreamableConnection` exposes only `query()`, so mysql2's `.stream()` and the `mssql` `request.stream` event API are not reachable from a dialect. If your engine can do better and you can reach its cursor, `openStream` is where that goes. If it materializes, say so in your dialect's docs: a caller who reads "streaming: supported" and drains a 50M-row table will run the process out of memory.
 
 ## The additive hooks
 
@@ -150,11 +152,12 @@ Every hook here is optional, and omitting it falls back to the PostgreSQL behavi
 | Hook | Fallback when omitted | Who overrides it and why |
 |---|---|---|
 | `castAggregate(expr, target)` | Postgres postfix cast `expr::int` | SQLite, which has no `::` operator, emits `CAST(expr AS INTEGER)`. |
-| `buildInClause(expr, ref, negated)` + `inClauseParam(values)` | Postgres binds the whole list as one array param (`= ANY($n)` / `!= ALL($n)`) | Engines with no array parameters. SQLite pairs them to emit `expr IN (SELECT value FROM json_each(?))` and serialize the list to JSON. **Both must move together**, and the point of the pair is that the placeholder count stays independent of the list length, so the SQL cache stays valid. |
+| `buildInClause(expr, ref, negated)` + `inClauseParam(values)` | Postgres binds the whole list as one array param (`= ANY($n)` / `!= ALL($n)`) | Engines with no array parameters. SQLite pairs them to emit `expr IN (SELECT value FROM json_each(?))` and serialize the list to JSON. **Both must move together**: the point of the pair is that the placeholder count stays independent of the list length, so the SQL cache stays valid. |
+| `escapeLikePattern(value)` | The shared escaper for `\`, `%`, `_`, paired with the `ESCAPE '\'` clause the builders always emit | SQL Server, whose `LIKE` also treats `[` as opening a character class, so a bound `contains: '[draft]'` would silently match any one of its letters. Whatever you return must be escaped for the same `ESCAPE '\'` clause. |
 | `arrayType(baseType)` | none | Array-cast hook for bulk insert. |
 | `buildLimitOffset(input)` | `LIMIT <ph>` / `OFFSET <ph>` | SQL Server, which has no `LIMIT`, emits `OFFSET n ROWS FETCH NEXT n ROWS ONLY` (and a synthetic `ORDER BY (SELECT NULL)` when there is no sort). |
 | `buildUpdateStatement`, `buildDeleteStatement` | `UPDATE t SET ... WHERE ...` plus a trailing returning clause | SQL Server, which must inject `OUTPUT INSERTED.*` **mid-statement**, between the `SET` and the `WHERE`. |
-| `buildRelationSubquery(ctx)` | The native `json_agg(json_build_object(...))` path, composed from the JSON primitives above | SQL Server only. MySQL and SQLite merely swap the primitives and so produce correct output without ever defining this. Reach for it only when your JSON aggregate cannot be expressed through the primitives, as `FOR JSON PATH` cannot: it is expressed through the child SELECT's column aliases. |
+| `buildRelationSubquery(ctx)` | The native `json_agg(json_build_object(...))` path, composed from the JSON primitives above | SQL Server only. MySQL and SQLite merely swap the primitives and produce correct output without defining this. Reach for it only when your JSON aggregate cannot be expressed through the primitives, as `FOR JSON PATH` cannot: it is expressed through the child SELECT's column aliases. |
 | `typeToTypeScript(type, nullable)` | Postgres mapping | Code generation and introspection. |
 | `introspector` | `undefined` | A `DialectIntrospector` with a single `introspect(options)` method, so `introspect()` can route to your catalog SQL. |
 
@@ -173,7 +176,7 @@ Every hook here is optional, and omitting it falls back to the PostgreSQL behavi
 
 ## A checklist before you ship one
 
-1. Set every required capability flag honestly. A `true` you cannot back up becomes a broken query at runtime; a `false` becomes a clear `TURBINE_E017`.
+1. Set every required capability flag from measured behavior. A `true` you cannot back up becomes a broken query at runtime; a `false` becomes a clear `TURBINE_E017`.
 2. Pick the `resultStrategy` that matches reality, and document the consequences if it is not `'returning'`.
 3. Run the same query shapes the shipped engines are tested on: nested `with` at depth, an ordered to-many with a per-relation `limit`, a composite-key correlation, an empty to-many (it must be `[]`, never `null`), and a to-one that misses (it must be `null`).
 4. Check that identifiers with embedded quote characters survive `quoteIdentifier`.
@@ -181,7 +184,7 @@ Every hook here is optional, and omitting it falls back to the PostgreSQL behavi
 
 ## See also
 
-- **[Database Engines](/engines)**: the four engines Turbine ships and their capability matrix.
+- **[Database Engines](/engines)**: the engines Turbine ships and their capability matrix.
 - **[Database Compatibility](/compatibility)**: PG-wire-compatible databases, which need no dialect.
 - **[The `turbine-orm/powdb` module](/powdb)**: the engine that is deliberately not a dialect.
 - **[Typed Errors](/errors)**: `UnsupportedFeatureError` and the rest of the code table.

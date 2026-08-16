@@ -187,27 +187,44 @@ describe('pg-compat: SQL compatibility across PG-compatible databases', () => {
   });
 
   describe('json_agg nested relations', () => {
-    it('generates json_agg + json_build_object for hasMany', () => {
+    // BOTH row encoders, because a PG-compatible engine has to accept whichever
+    // one it is handed and `jsonEncoding` decides that per client or per query.
+    // `json_build_array` and `json_build_object` are both core PostgreSQL 9.4+
+    // builtins, so neither is an extension of the compatible surface; positional
+    // is simply the DEFAULT on this dialect, which is why the default arm below
+    // reads `json_build_array`.
+    for (const [jsonEncoding, encoder] of [
+      ['object', 'json_build_object'],
+      ['positional', 'json_build_array'],
+    ] as const) {
+      it(`generates json_agg + ${encoder} for hasMany (jsonEncoding: '${jsonEncoding}')`, () => {
+        const q = makeQuery('users', schema, { jsonEncoding });
+        const deferred = q.buildFindMany({ with: { posts: true } });
+
+        assertStandardPgSql(deferred.sql);
+        assert.ok(deferred.sql.includes('json_agg'), 'Should use json_agg for hasMany');
+        assert.ok(deferred.sql.includes(encoder), `Should use ${encoder} for row mapping`);
+        assert.ok(
+          deferred.sql.includes('COALESCE') && deferred.sql.includes("'[]'::json"),
+          'Should COALESCE null to empty array',
+        );
+      });
+
+      it(`generates correlated subquery for belongsTo (jsonEncoding: '${jsonEncoding}')`, () => {
+        const q = makeQuery('posts', schema, { jsonEncoding });
+        const deferred = q.buildFindMany({ with: { author: true } });
+
+        assertStandardPgSql(deferred.sql);
+        assert.ok(deferred.sql.includes(encoder));
+        // belongsTo = single row, no json_agg needed (uses subquery with LIMIT 1 or scalar)
+        assert.ok(deferred.sql.includes('"users"'), 'Should reference the related table');
+      });
+    }
+
+    it('the default on this dialect is the positional encoder', () => {
       const q = makeQuery('users', schema);
       const deferred = q.buildFindMany({ with: { posts: true } });
-
-      assertStandardPgSql(deferred.sql);
-      assert.ok(deferred.sql.includes('json_agg'), 'Should use json_agg for hasMany');
-      assert.ok(deferred.sql.includes('json_build_object'), 'Should use json_build_object for row mapping');
-      assert.ok(
-        deferred.sql.includes('COALESCE') && deferred.sql.includes("'[]'::json"),
-        'Should COALESCE null to empty array',
-      );
-    });
-
-    it('generates correlated subquery for belongsTo', () => {
-      const q = makeQuery('posts', schema);
-      const deferred = q.buildFindMany({ with: { author: true } });
-
-      assertStandardPgSql(deferred.sql);
-      assert.ok(deferred.sql.includes('json_build_object'));
-      // belongsTo = single row, no json_agg needed (uses subquery with LIMIT 1 or scalar)
-      assert.ok(deferred.sql.includes('"users"'), 'Should reference the related table');
+      assert.ok(deferred.sql.includes('json_build_array'), 'PostgreSQL defaults to jsonEncoding: positional');
     });
 
     it('supports deeply nested relations (posts -> comments -> author)', () => {

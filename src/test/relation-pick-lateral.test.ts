@@ -252,7 +252,7 @@ describe('pick-row lateral plan: SQL generation', () => {
     // The `with` subquery uses the t-namespace alias.
     assert.match(
       sql,
-      /\(SELECT json_build_object\('id', t0\."id"[^)]*\) FROM "owners" t0 WHERE t0\."id" = "instances"\."owner_id" LIMIT 1\) AS "owner"/,
+      /\(SELECT json_build_array\(t0\."id"[^)]*\) FROM "owners" t0 WHERE t0\."id" = "instances"\."owner_id" LIMIT 1\) AS "owner"/,
     );
     // The lateral uses the ord-namespace alias; disjoint from t0.
     assert.match(
@@ -323,14 +323,17 @@ describe('pick-row lateral plan: byte-identical default-plan SQL (buildSql restr
     {
       name: 'with-relations',
       // The `::text` casts on the int8 columns are the JSON-wire fidelity fix:
-      // json_build_object renders int8 as a JSON number, which loses precision
+      // the JSON renderer emits int8 as a JSON number, which loses precision
       // above 2^53 and disagrees with what every non-join read path returns.
+      // The row itself is a key-less `json_build_array` because `'positional'`
+      // is the PostgreSQL default for `jsonEncoding`; the expression ORDER is
+      // what the decoder maps back to field names, so the order is the contract
+      // this snapshot pins.
       args: { with: { versions: true } },
       sql:
-        'SELECT "instances"."id", "instances"."name", (SELECT COALESCE(json_agg(json_build_object(\'id\', ' +
-        't0."id"::text, \'instanceId\', t0."instance_id"::text, \'title\', t0."title", \'data\', t0."data", \'createdAt\', ' +
-        't0."created_at", \'isCurrent\', t0."is_current")), \'[]\'::json) FROM "versions" t0 WHERE t0."instance_id" ' +
-        '= "instances"."id") AS "versions" FROM "instances"',
+        'SELECT "instances"."id", "instances"."name", (SELECT COALESCE(json_agg(json_build_array(' +
+        't0."id"::text, t0."instance_id"::text, t0."title", t0."data", t0."created_at", t0."is_current")), ' +
+        '\'[]\'::json) FROM "versions" t0 WHERE t0."instance_id" = "instances"."id") AS "versions" FROM "instances"',
       params: [],
     },
     {

@@ -13,15 +13,16 @@
     "parity": "tsx parity/seed.ts && tsx parity/run.ts"
   },
   "dependencies": {
-    "turbine-orm": "file:..",
-    "pg": "8.22.0",
-    "@prisma/client": "7.9.0",
-    "@prisma/adapter-pg": "7.9.0",
+    "@prisma/adapter-pg": "7.9.1",
+    "@prisma/client": "7.9.1",
     "drizzle-orm": "0.45.2",
-    "tsx": "^4.19.0"
+    "drizzle-rc": "npm:drizzle-orm@1.0.0-rc.4",
+    "pg": "8.22.0",
+    "tsx": "^4.19.0",
+    "turbine-orm": "file:.."
   },
   "devDependencies": {
-    "prisma": "7.9.0",
-    "@types/pg": "^8.11.11"
+    "@types/pg": "^8.11.11",
+    "prisma": "7.9.1"
   }
 }

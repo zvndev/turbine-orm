@@ -9,7 +9,7 @@ export const metadata = {
 
 Optimistic locking lets concurrent writers detect a *lost update* without holding a row lock. You read a row (capturing its version), then write back asserting the version is unchanged. If someone else committed in between, your update matches zero rows and Turbine throws `OptimisticLockError`.
 
-It's "optimistic" because nothing is locked. You bet that conflicts are rare and pay only when one actually happens. That's the opposite of pessimistic `SELECT ... FOR UPDATE`, which serializes writers up front.
+It's "optimistic" because nothing is locked: you bet that conflicts are rare and pay only when one happens. Pessimistic `SELECT ... FOR UPDATE` is the opposite, serializing writers up front.
 
 ## The version column
 

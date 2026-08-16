@@ -1,7 +1,7 @@
 export const metadata = {
   title: 'Turbine + Neon in 60 Seconds',
   description:
-    'Get Turbine ORM running on Neon in under a minute. Node.js, serverless, edge, one API, zero bloat.',
+    'Get Turbine ORM running on Neon in under a minute. One typed API across Node.js, serverless, and edge.',
   alternates: { canonical: '/neon' },
 };
 
@@ -61,7 +61,7 @@ const users = await db.users.findMany({
 
 ## 5. Migrations
 
-SQL-first migrations with no shadow database and no proprietary schema DSL:
+SQL-first migrations, plain `.sql` files:
 
 ```bash
 # Create a migration
@@ -76,7 +76,7 @@ npx turbine migrate status
 
 ## Why Turbine on Neon?
 
-- **No WASM at all**: the edge entry is held under 68 kB brotli in CI, comfortably inside Cloudflare Workers' 1 MB limit (Prisma 7: ~1.6 MB TS/WASM query compiler)
+- **No WASM**: the edge entry is held under 68 kB brotli in CI (Prisma 7: ~1.6 MB TS/WASM query compiler)
 - **Single-query nested reads**, one SQL statement via `json_agg`, not N+1
 - **Pipeline batching**, N queries in 1 round-trip (critical for high-latency serverless)
 - **No adapter layer**, `turbineHttp(pool, SCHEMA)` with any pg-compatible driver

@@ -7,7 +7,7 @@ export const metadata = {
 
 # Observability
 
-Three layers, each opt-in: raw query events (`$on`), aggregated metrics persisted to Postgres (`$observe`), and a local dashboard over those metrics (`npx turbine observe`). All of it ships in the box, no agent, no SaaS, no extra dependency.
+Three layers, each opt-in: raw query events (`$on`), aggregated metrics persisted to Postgres (`$observe`), and a local dashboard over those metrics (`npx turbine observe`). No agent, no external service, no extra dependency.
 
 ## Query events, `db.$on('query')`
 
@@ -38,11 +38,11 @@ interface QueryEvent {
 
 A listener that throws never breaks the query; the error is swallowed (logged when `logging: true`).
 
-`$on` differs from [middleware](/queries#middleware): middleware wraps the call, it can observe args and transform results (it cannot change the query); `$on` is a passive tap that fires after execution with the final SQL, timing, and outcome.
+`$on` differs from [middleware](/queries#middleware): middleware wraps the call and can transform results; `$on` is a passive tap that fires after execution with the final SQL, timing, and outcome.
 
 ### Seeing the parameter values, `logQueryParams`
 
-**Params are redacted by default.** Every entry of `event.params` is replaced with `'[REDACTED]'` before any listener sees it, so you get the SQL shape and the timing without user data flowing into a log sink. This is a production-safety default, and it is deliberate: a query log is one of the easiest ways to leak email addresses, tokens, and anything else you bind into a `where`.
+**Params are redacted by default.** Every entry of `event.params` is replaced with `'[REDACTED]'` before any listener sees it, so a query log cannot leak the values you bind into a `where`.
 
 ```ts
 db.$on('query', (e) => console.log(e.sql, e.params));
@@ -51,7 +51,7 @@ await db.users.findUnique({ where: { email: 'alice@example.com' } });
 // SELECT * FROM "users" WHERE "email" = $1 LIMIT 1   [ '[REDACTED]' ]
 ```
 
-To see the real parameter values instead of `[REDACTED]`, opt in with `logQueryParams: true` on the client:
+Opt in to real values with `logQueryParams: true` on the client:
 
 ```ts
 const db = turbine({
@@ -62,12 +62,10 @@ const db = turbine({
 // SELECT * FROM "users" WHERE "email" = $1 LIMIT 1   [ 'alice@example.com' ]
 ```
 
-Only `event.params` changes. The SQL, timing, model, action, and row count are identical either way, so a listener written against redacted events keeps working.
+Only `event.params` changes; SQL, timing, model, action, and row count are identical either way.
 
 <Callout type="note" title="Relationship to `errorMessages`">
-Before this option existed the switch was [`errorMessages: 'verbose'`](/errors#safe-error-messages), which is not a name anyone searches for when they want to see query params. It still works, and it still reveals params, so nothing that relies on it breaks. `logQueryParams` is an alias resolved from a single value, not a second switch: when you set it, it decides; when you leave it unset, `errorMessages` decides exactly as before.
-
-The combination that was previously unreachable is `logQueryParams: true` with the default `errorMessages: 'safe'`: query events carry real values while `NotFoundError` messages stay redacted.
+[`errorMessages: 'verbose'`](/errors#safe-error-messages) also reveals params, and still works. The two resolve to a single value: when `logQueryParams` is set it decides; when unset, `errorMessages` decides. `logQueryParams: true` with the default `errorMessages: 'safe'` gives real values in query events while error messages stay redacted.
 </Callout>
 
 ## Metrics, `db.$observe()`
@@ -85,11 +83,11 @@ const handle = await db.$observe({
 await handle.stop(); // final flush, then closes the metrics pool
 ```
 
-What it does, exactly:
+What it does:
 
 - Buffers events in memory, keyed by `model:action` per minute bucket.
 - On each flush, computes **count, avg, p50, p95, p99, and error count** per key and upserts a row into `_turbine_metrics` (`ON CONFLICT` merges additively, so multiple app instances can flush into the same bucket).
-- Uses its own **1-connection pool** against the metrics database, metric writes never contend with your application pool.
+- Uses its own **1-connection pool** against the metrics database; metric writes never contend with your application pool.
 - **Fire-and-forget**: flush errors are swallowed, the flush timer is `unref()`ed so it never keeps the process alive, and a failing metrics database cannot fail a query.
 - Creates the table on init (`CREATE TABLE IF NOT EXISTS _turbine_metrics`) and prunes rows older than `retentionDays` on each flush.
 
@@ -115,7 +113,7 @@ Calling `$observe` again replaces the previous engine (the old one is stopped an
 
 ## Custom sinks: where the aggregates go
 
-By default `$observe` writes to `_turbine_metrics` in Postgres. The flush target is pluggable: pass a `sink` and the same per-minute aggregates flow wherever you point them. A sink is a small interface:
+The flush target is pluggable: pass a `sink` and the same per-minute aggregates flow wherever you point them.
 
 ```ts
 interface MetricsFlushBatch {
@@ -139,11 +137,11 @@ interface ObserveSink {
 }
 ```
 
-When you supply a `sink`, `connectionString` becomes optional (at least one of the two is required). The default Postgres sink is unchanged and byte-identical to the built-in writer when no sink is passed.
+With a `sink` supplied, `connectionString` becomes optional (at least one of the two is required). With no sink, the default Postgres writer is used.
 
 ### `HttpJsonSink`
 
-A generic sink that POSTs each batch as JSON, ready for Grafana, a self-hosted collector, or any HTTP endpoint:
+A generic sink that POSTs each batch as JSON, for Grafana, a self-hosted collector, or any HTTP endpoint:
 
 ```ts
 import { HttpJsonSink } from 'turbine-orm';
@@ -157,28 +155,28 @@ const handle = await db.$observe({
 });
 ```
 
-It is **fire-and-forget**: a failed request is swallowed and never throws, and there are no retries beyond the engine's next scheduled flush, so a down collector can never affect a query. The request body carries the aggregate batch and nothing else.
+It is fire-and-forget: a failed request is swallowed and never throws, and there are no retries beyond the engine's next scheduled flush, so a down collector can never affect a query. The request body carries the aggregate batch and nothing else.
 
 ### Privacy posture
 
-The aggregation boundary is deliberate and structural. A batch (to any sink, HTTP or Postgres) contains **only**:
+A batch (to any sink, HTTP or Postgres) contains **only**:
 
 - the model (table) name and the action (`findMany`, `create`, …);
 - the count of queries and the count of errors;
 - latency aggregates (avg, p50, p95, p99).
 
-It carries **no SQL text and no parameter values**, those never leave the app process. Observability is opt-in and off by default: nothing is collected until you call `$observe`.
+It carries **no SQL text and no parameter values**; those never leave the app process. Observability is off by default: nothing is collected until you call `$observe`.
 
 ## Dashboard, `npx turbine observe`
 
-A local, read-only dashboard over `_turbine_metrics`, latency over time and a per-`model.action` breakdown:
+A local, read-only dashboard over `_turbine_metrics`: latency over time and a per-`model.action` breakdown.
 
 ```bash
 TURBINE_OBSERVE_URL=postgres://... npx turbine observe
 npx turbine observe --port 5000 --no-open
 ```
 
-It binds `127.0.0.1:4984` by default and shares [Studio's security model](/studio#security-model): loopback by default, non-loopback refused without `--allow-remote`, a random per-process session token, and security headers on every response. It reads metrics only, it never connects to your application database.
+It binds `127.0.0.1:4984` by default and shares [Studio's security model](/studio#security-model): loopback by default, non-loopback refused without `--allow-remote`, a random per-process session token, and security headers on every response. It reads metrics only; it never connects to your application database.
 
 ## See also
 

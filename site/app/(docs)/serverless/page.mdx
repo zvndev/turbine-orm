@@ -107,7 +107,7 @@ export default {
 };
 ```
 
-Hyperdrive pools connections at the edge, so there's no per-request TLS handshake to your origin DB. Ideal for Workers deployments with a regular Postgres instance (AWS RDS, Supabase Postgres, self-hosted).
+Hyperdrive pools connections at the edge, so there's no per-request TLS handshake to your origin DB. Use it for Workers deployments backed by a regular Postgres instance (AWS RDS, Supabase Postgres, self-hosted).
 
 ## Supabase
 
@@ -127,7 +127,7 @@ Use Supabase's **connection pooler** URL (`...pooler.supabase.com:6543`) for ser
 
 ## postgres.js (node)
 
-For Node runtimes where you prefer `postgres.js` over `pg` (faster for simple loads, no type-parser registration):
+For Node runtimes where you prefer `postgres.js` over `pg`:
 
 ```ts
 import postgres from 'postgres';
@@ -142,7 +142,7 @@ See the `PgCompatPool` / `PgCompatPoolClient` / `PgCompatQueryResult` interfaces
 
 ## Keeping `findMany` sane on the edge
 
-Edge function memory is *tight*, Vercel Edge is 128 MB, Cloudflare Workers is 128 MB, Neon Functions is 256 MB. A nested `findMany` that materializes a big JSON payload in Postgres can blow through that budget fast.
+Edge function memory is tight: Vercel Edge and Cloudflare Workers both cap at 128 MB. A nested `findMany` that materializes a big JSON payload can blow through that budget fast.
 
 Two rules:
 

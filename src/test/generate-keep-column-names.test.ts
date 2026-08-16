@@ -166,11 +166,30 @@ describe('runtime under identity metadata', () => {
 
   it('with-subquery json_build_object keys use snake names', () => {
     const s = withDbFieldNames(schema());
-    const q = makeQuery('users', s);
+    // Pinned to the object encoding, because JSON KEYS are what this asserts and
+    // only that encoding emits any. PostgreSQL now defaults to `'positional'`,
+    // where the names live client-side in the decode shape instead; the test
+    // below is the same invariant on that path.
+    const q = makeQuery('users', s, { jsonEncoding: 'object' });
     const { sql } = q.buildFindMany({ with: { posts: true } } as never);
     assert.match(sql, /'user_id'/);
     assert.match(sql, /'title'/);
     assert.doesNotMatch(sql, /'userId'/);
+  });
+
+  it('positional decoding maps the same snake names back onto the row', () => {
+    const s = withDbFieldNames(schema());
+    const q = makeQuery('users', s, { jsonEncoding: 'positional' });
+    const d = q.buildFindMany({ with: { posts: true } } as never);
+    assert.doesNotMatch(d.sql, /'user_id'/, 'positional emits no key literals at all');
+    // posts columns in emitted order: id, user_id, title (see the fixture).
+    const rows = d.transform({
+      rows: [{ id: 1, full_name: 'Ada', posts: JSON.stringify([[10, 1, 'T']]) }],
+      // biome-ignore lint/suspicious/noExplicitAny: synthetic driver result
+    } as any) as Record<string, unknown>[];
+    const post = (rows[0]!.posts as Record<string, unknown>[])[0]!;
+    assert.deepEqual(Object.keys(post), ['id', 'user_id', 'title']);
+    assert.equal(post.user_id, 1);
   });
 
   it('excludes PII columns from the default projection', () => {

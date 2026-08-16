@@ -3,7 +3,7 @@ import { TURBINE_VERSION } from '../../../lib/version';
 export const metadata = {
   title: 'Benchmarks',
   description:
-    'Turbine ORM vs Prisma 7.9 vs Drizzle 0.45 vs hand-written pg on a local PostgreSQL 17 database. Honest numbers, with the measurement noise floor published alongside them.',
+    'Turbine ORM vs Prisma 7.9 vs Drizzle 0.45 vs hand-written pg on a local PostgreSQL 17 database, with the measurement noise floor published alongside the numbers.',
   alternates: { canonical: '/benchmarks' },
 };
 
@@ -11,36 +11,34 @@ export const metadata = {
 
 Three-way head-to-head against **Prisma 7.9** (`@prisma/adapter-pg`, `relationJoins` preview on) and **Drizzle 0.45** (node-postgres relational API) on a **local PostgreSQL 17.9** database reached over a Unix socket, plus a **hand-written `pg` control arm** so you can read ORM overhead directly instead of inferring it.
 
-> **The ten scenarios below were measured on 2026-08-09 against turbine-orm 0.66.0**; the [extended suite](#beyond-the-headline-ten) and the [latency sweep](#latency-the-axis-a-socket-cannot-show) were measured against 0.67.0. The current release is {TURBINE_VERSION}. Nothing below has been adjusted to match anything, because quoting a stale measurement is honest and inventing a fresh-looking one is not. Read the table as the *shape* of the result, who leads which scenario and by roughly how much, rather than as the latency you will see. Every arm ran once per round, the arm order rotated every round, and each figure is the median across 200 rounds, taken as the median of three full runs. See [Methodology](#methodology-and-why-the-harness-changed) for why that matters, and [Reproduce](#reproduce) to re-run it against the version you are actually installing.
-
-> **TL;DR.** Over a local socket there is no network round-trip, so per-query overhead is the entire signal and most numbers are sub-millisecond. The single most useful figure on this page: **Turbine runs at 1.09x hand-written `pg`, where Drizzle runs at 1.49x and Prisma at 1.86x** (geometric mean over the eight scenarios with a raw control). Across all ten scenarios Turbine is **1.82x faster than Prisma 7.9** and **1.32x faster than Drizzle 0.45** by geometric mean. Turbine takes seven scenarios, Drizzle takes three (L2 nested, L3 nested, and **streaming, which Drizzle wins outright by 24%**), and Prisma takes none. Two of the ten are contested between the two harnesses and are claimed by neither side.
+> **Measured 2026-08-15 against turbine-orm 0.71.0**; the [extended suite](#beyond-the-headline-ten) and the [latency sweep](#latency-the-axis-a-socket-cannot-show) were measured against 0.67.0, and the current release is {TURBINE_VERSION}. Environment: Apple M5 Max, macOS 26.5.1, Node v24.18.0, PostgreSQL 17.9 over a Unix socket, client and database on one host. Each figure is the median across 200 rounds with arm order rotated every round, taken as the median of three full runs ([Methodology](#methodology-and-why-the-harness-changed)). Full raw data: [`benchmarks/RESULTS-0.71.0.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-0.71.0.md). To measure the version you are installing, see [Reproduce](#reproduce).
 >
-> Those ten are also a narrow set, and [the extended suite](#beyond-the-headline-ten) says so: three of them are `findUnique`, the largest non-stream result is 100 rows, and nothing measures a write beyond one atomic increment. Across all **24** shapes Turbine leads **17**. The additions found a loss the ten could not see (**deep pagination**, where a named prepared statement hits PostgreSQL's generic-plan cliff) and overturned a recommendation they would have produced (`relationLoadStrategy: 'batched'` is fastest on a socket and **slower by 1 ms of round-trip time**). Read [Latency](#latency-the-axis-a-socket-cannot-show) before acting on any single number here.
+> **Noise floor:** every sub-0.15 ms figure carries roughly one third uncertainty in its absolute value; the orderings are stable across runs. Per-scenario spreads are in [the drift floor](#the-drift-floor-read-this-before-the-table).
+
+> **TL;DR.** Over a local socket there is no network round-trip, so per-query overhead is the entire signal and most numbers are sub-millisecond. The single most useful figure on this page: **Turbine runs at 1.08x hand-written `pg`, where Drizzle runs at 1.47x and Prisma at 1.81x** (geometric mean over the eight scenarios with a raw control). Across all ten scenarios Turbine is **2.02x faster than Prisma 7.9** and **1.46x faster than Drizzle 0.45** by geometric mean. Turbine takes nine scenarios, Drizzle takes one (**streaming, which Drizzle wins outright by 22%**), and Prisma takes none. Three of the ten are contested and are claimed by neither side.
+>
+> The [extended suite](#beyond-the-headline-ten) widens the set to **24** shapes; Turbine leads **17**. The additions found a loss the ten could not see (**deep pagination**, where a named prepared statement hits PostgreSQL's generic-plan cliff) and overturned a recommendation they would have produced (`relationLoadStrategy: 'batched'` is fastest on a socket and **slower by 1 ms of round-trip time**). Read [Latency](#latency-the-axis-a-socket-cannot-show) before acting on any single number here.
 
 ## The one we lose, stated plainly
 
-**Drizzle beats Turbine on streaming by 24%: 40.81 ms against Turbine's 54.01 ms** to drain 50,000 comments in batches of 1,000. This reproduced in every run across both harnesses, so it is not noise.
+**Drizzle beats Turbine on streaming by 22%: 39.49 ms against Turbine's 50.39 ms** to drain 50,000 comments in batches of 1,000. This reproduced in every run across both harnesses, so it is not noise.
 
-An earlier version of this page showed Turbine fastest at streaming (60.7 ms) and called the scenario a near-tie. That was wrong. It rested on a single Drizzle measurement of 65.8 ms which we have not been able to reproduce: Drizzle measured 38.9 to 48.3 ms across the runs here. The tell is the control arm. Hand-written keyset pagination in raw `pg` drains the same table in 42.77 ms, and Drizzle sits directly on top of it, which is where a thin query builder doing a keyset loop should sit. The old 65.8 ms figure was the outlier, and the near-tie label was an artifact of it.
-
-The honest reading is that **Turbine's cursor carries roughly 25% overhead above hand-written keyset pagination on a full-table drain, and Drizzle's carries approximately none.**
+The control arm locates the gap. Hand-written keyset pagination in raw `pg` drains the same table in 42.33 ms, and Drizzle sits directly on top of it, which is where a thin query builder doing a keyset loop should sit. **Turbine's cursor carries roughly 19% overhead above hand-written keyset pagination on a full-table drain, and Drizzle's carries approximately none.**
 
 <Callout type="note" title="Root-caused and partly fixed in 0.67.0">
-  The sentence that used to sit here said we had not root-caused the gap and
-  were not going to guess. It has since been measured apart, and the first thing
-  the measurement did was rule out the obvious suspect: **the cursor protocol is
-  free.** Over the same 50,000 rows a hand-written `DECLARE CURSOR` / `FETCH`
-  loop costs 44.75 ms against 44.18 ms for a hand-written keyset loop, so the
-  snapshot guarantee is not what you are paying for. Every millisecond of the
-  gap was our own per-row work, in three named parts: `parseRow` (~6 ms), the
-  per-row `async` yield the row-at-a-time API promises (~5 ms), and a **wasted
-  speculative fetch** (~1 ms at the default batch size, ~5.6 ms at 5,000).
+  The cursor protocol itself is free: over the same 50,000 rows a hand-written
+  `DECLARE CURSOR` / `FETCH` loop costs 44.75 ms against 44.18 ms for a
+  hand-written keyset loop, so the snapshot guarantee is not what you are
+  paying for. The gap was Turbine's own per-row work, in three named parts:
+  `parseRow` (~6 ms), the per-row `async` yield the row-at-a-time API promises
+  (~5 ms), and a wasted speculative fetch (~1 ms at the default batch size,
+  ~5.6 ms at 5,000).
 
-  Two of the three are fixed in 0.67.0. `parseRow` now resolves its column
-  mapping once per result set instead of once per row, and the speculative fetch
-  is bounded by `batchSize` rather than scaled by it, which also removes a
-  genuine defect: streaming was the only operation in the suite that got
-  **slower** as its batch size went up.
+  0.67.0 fixes two of the three. `parseRow` now resolves its column mapping
+  once per result set instead of once per row, and the speculative fetch is
+  bounded by `batchSize` rather than scaled by it, which also removes a genuine
+  defect: streaming was the only operation in the suite that got **slower** as
+  its batch size went up.
 
   | | 0.66.0 | 0.67.0 | raw cursor control |
   |---|---|---|---|
@@ -48,94 +46,110 @@ The honest reading is that **Turbine's cursor carries roughly 25% overhead above
   | 50K rows, `batchSize: 5000` | 59.55 ms | **50.25 ms** | 40.53 ms |
 
   That closes about a quarter of the gap. The rest is the per-row yield, which
-  is the API's own promise (constant-memory, one row at a time) rather than a
-  defect, and closing it means adding a batch-yielding variant rather than
-  tuning anything. **Turbine will not beat a keyset loop at row-at-a-time
-  iteration**, and the table above is measured on a socket where the extra round
-  trips a cursor spends are nearly free.
+  is the API's own contract (constant-memory, one row at a time), so closing it
+  means adding a batch-yielding variant rather than tuning anything.
+  **Turbine will not beat a keyset loop at row-at-a-time iteration**, and the
+  table above is measured on a socket where the extra round trips a cursor
+  spends are nearly free.
 </Callout>
 
-What a single number does not capture, and what you are buying for that 25%:
+<Callout type="note" title="0.71.0 adds the batch-yielding variant">
+  `findManyStreamBatches` yields a `T[]` per fetch instead of a row at a time,
+  which removes the per-row `async` yield the callout above named as the
+  remaining cost. It is an additive API: `findManyStream` is unchanged, so the
+  row-at-a-time number in the table above is unchanged too, and that is the
+  expected result rather than a disappointment.
+
+  | 50K rows, `batchSize: 1000` | median | vs the raw keyset control |
+  |---|---|---|
+  | `findManyStream` | 50.39 ms | 1.19x |
+  | `findManyStreamBatches` | **47.38 ms** | **1.06x** |
+
+  Paired on the same cursor with the arms rotating inside each round, the
+  difference is **4.51 ms over 50,000 rows, about 87 ns per row**. It takes
+  Turbine from 19% above a hand-written keyset loop to 6% above it and narrows
+  the loss to Drizzle from 1.28x to 1.16x. **It does not win the scenario.**
+</Callout>
+
+What the 19% buys:
 
 1. **Correctness without a monotonic key.** Keyset pagination requires `orderBy` on a unique column. Turbine's cursor works with any `orderBy`.
 2. **Clean early break.** `for await ... break` closes server-side state and releases the connection deterministically. This scenario drains the whole table, which is the case that flatters keyset most.
 3. **Nested `with` inside the stream.** Cursor batches resolve a full `with` clause per batch.
 
-Those are real, but they are tradeoffs, not a rebuttal. If you are draining a large table on a unique ascending key and nothing else, Drizzle is measurably faster at it today.
+If you are draining a large table on a unique ascending key and nothing else, Drizzle is measurably faster at it today, and `findManyStreamBatches` narrows that without reversing it.
 
 ## Methodology, and why the harness changed
 
-The previous numbers came from `bench.ts`, which measures each ORM in a contiguous block: 200 Turbine iterations, then 200 Prisma, then 200 Drizzle. Anything that drifts over the life of the process (JIT state, page cache, autovacuum, thermal headroom) gets charged to whichever arm happened to occupy that slice of wall clock, and there was no control arm to tell drift from signal.
+Earlier numbers came from `bench.ts`, which measured each ORM in a contiguous block: 200 Turbine iterations, then 200 Prisma, then 200 Drizzle. Anything that drifts over the life of the process (JIT state, page cache, autovacuum, thermal headroom) gets charged to whichever arm occupied that slice of wall clock, and there was no control arm to tell drift from signal.
 
-`bench-interleaved.ts` runs **every arm once per round**, **rotates the arm order every round**, reports the **median** across rounds, and adds a **hand-written raw `pg` control** to most scenarios. Both harnesses were run: the old one twice, because it is the only apples-to-apples way to diff against the earlier table, and the new one three times, because those are the numbers published here. The two harnesses agree on every winner except atomic increment, which is reported as the near-tie it is.
+`bench-interleaved.ts` runs **every arm once per round**, **rotates the arm order every round**, reports the **median** across rounds, and adds a **hand-written raw `pg` control** to most scenarios. Both harnesses were run: the contiguous one twice (the only apples-to-apples way to diff against the earlier table), the interleaved one three times (the numbers published here). The two designs disagree on three scenarios, L2 nested, L3 nested and atomic increment, reported below as contested.
 
 ### Setup
 
-- **Database.** Local PostgreSQL 17.9 (Homebrew), Unix-socket connection, no network hop, dedicated freshly seeded database. Deliberately not a container: Docker on macOS routes through a VM and a forwarded TCP port, which adds a latency floor.
+- **Database.** Local PostgreSQL 17.9 (Homebrew), Unix-socket connection, no network hop, dedicated freshly seeded database. Not a container: Docker on macOS routes through a VM and a forwarded TCP port, which adds a latency floor.
 - **Client.** Apple Silicon MacBook Pro (Apple M5 Max), macOS 26.5.1, Node v24.18.0. Client and database are the same host.
 - **Schema.** organizations / users / posts / comments.
 - **Data.** 5 orgs, 1,000 users, 10,000 posts, 50,000 comments, deterministic and identical for every ORM, `ANALYZE`d after load. Row counts are verified before any number is recorded and the harness refuses to report if they do not match.
-- **Versions.** turbine-orm **0.66.0**, `@prisma/client` 7.9.0 + `@prisma/adapter-pg` 7.9.0, `drizzle-orm` 0.45.2, `pg` 8.22.0. The competitor versions are deliberately unchanged from the 0.50.0 run, which is what makes the two comparable, but they are pinned rather than current: all three have shipped releases since they were last checked, so re-check before quoting these ratios anywhere that matters.
+- **Versions.** turbine-orm **0.71.0**, `@prisma/client` 7.9.1 + `@prisma/adapter-pg` 7.9.1, `drizzle-orm` 0.45.2, `pg` 8.22.0. Checked on the measurement date: Prisma and Drizzle had both shipped nothing newer. `pg` had moved to 8.23.0 and was deliberately left at 8.22.0, because it is the raw control and also underlies all three ORM arms, so bumping it would move every arm at once.
 - **Runs.** 200 rounds + 20 warmup per arm per scenario (streaming: 9 rounds + 1 warmup, each round drains 50K rows). Three full runs; the table is the median of the three medians.
 - **Pool.** Plain `pg.Pool` size 10 for Prisma, Drizzle and the raw control. Turbine uses its internal pool at default size.
-- **Relation strategy.** Turbine's default is `'auto'` (since 0.41). It does not engage anywhere in this suite: every scenario uses a limit of 50 or less, every relation used is to-many, and every FK in the fixture is indexed, so the plan is the byte-identical single-statement join on every scenario. Verified by statement counting.
+- **Relation strategy.** Turbine's default `'auto'` (since 0.41) does not engage anywhere in this suite: every scenario uses a limit of 50 or less, every relation used is to-many, and every FK in the fixture is indexed, so the plan is the byte-identical single-statement join on every scenario. Verified by statement counting.
 
 ## The drift floor: read this before the table
 
-The identical raw `pg` control arm was run inside every scenario that has one, in all three runs. Its spread across those runs is the floor below which nothing on this page is a measurement.
+The identical raw `pg` control arm ran inside every scenario that has one, in all three runs. Its spread across those runs is the floor below which nothing on this page is a measurement.
 
 | Scenario | raw control, 3 runs (ms) | spread |
 |---|---|---|
-| findMany flat | 0.210 / 0.207 / 0.212 | 2.4% |
-| findMany L2 | 1.939 / 1.958 / 1.953 | 1.0% |
-| findUnique PK | 0.053 / 0.060 / 0.064 | 20.8% |
-| count | 0.044 / 0.045 / 0.047 | 6.8% |
-| stream 50K | 46.59 / 50.97 / 53.22 | 14.2% |
-| atomic increment | 0.073 / 0.107 / 0.095 | 46.6% |
-| pipeline | 0.201 / 0.219 / 0.205 | 9.0% |
-| hot findUnique | 0.033 / 0.043 / 0.033 | 30.3% |
+| findMany flat | 0.165 / 0.164 / 0.150 | 9.5% |
+| findMany L2 | 1.843 / 1.847 / 1.965 | 6.6% |
+| findUnique PK | 0.034 / 0.036 / 0.037 | 9.0% |
+| count | 0.041 / 0.042 / 0.041 | 3.5% |
+| stream 50K | 43.41 / 42.33 / 41.87 | 3.7% |
+| atomic increment | 0.078 / 0.051 / 0.055 | 54.3% |
+| pipeline | 0.213 / 0.176 / 0.177 | 20.9% |
+| hot findUnique | 0.036 / 0.029 / 0.030 | 25.7% |
 
-Same SQL, same data, same process, no code change. On the multi-millisecond scenarios the floor is **1% to 14%**. On the sub-0.15 ms scenarios it is **21% to 47%**.
+Same SQL, same data, same process, no code change. On the multi-millisecond scenarios the floor is **4% to 7%**; on the sub-0.15 ms scenarios it reaches **54%**. So every sub-0.15 ms figure below (findUnique by PK, count, atomic increment, hot findUnique, the pipeline batch) carries roughly one third uncertainty in its absolute value. The orderings on those rows are stable across all runs; the millisecond values are not comparable to another run's at that resolution.
 
-**So every sub-0.15 ms figure below carries roughly one third uncertainty in its absolute value.** That covers findUnique by PK, count, atomic increment, hot findUnique and the pipeline batch. The *orderings* on those rows are stable across all five runs and can be relied on. The millisecond values cannot be compared to another run's millisecond values at that resolution, in either direction, and any "regression" or "improvement" smaller than a third on those rows is not real.
-
-## Raw results, measured 2026-08-09
+## Raw results, measured 2026-08-15
 
 Median wall-clock ms per operation (lower is better). Bold = fastest ORM. The `raw pg` column is the hand-written control.
 
-| Scenario | Turbine 0.66 | Prisma 7.9 | Drizzle 0.45 | raw pg |
+| Scenario | Turbine 0.71 | Prisma 7.9 | Drizzle 0.45 | raw pg |
 |---|---|---|---|---|
-| findMany, 100 users (flat) | **0.189 ms** | 0.254 ms | 0.248 ms | 0.164 ms |
-| findMany, 50 users + posts (L2) *(contested)* | 2.379 ms | 4.289 ms | **1.804 ms** | 1.779 ms |
-| findMany, 10 users → posts → comments (L3) | 1.436 ms | 3.990 ms | **1.223 ms** | n/a |
-| findUnique, single user by PK | **0.038 ms** | 0.083 ms | 0.085 ms | 0.037 ms |
-| findUnique, user + posts + comments (L3) | **0.197 ms** | 0.397 ms | 0.303 ms | n/a |
-| count, all users | **0.043 ms** | 0.076 ms | 0.058 ms | 0.044 ms |
-| stream, iterate 50K comments (batch 1000) | 54.01 ms | 57.93 ms | **40.81 ms** | 42.77 ms |
-| atomic increment, `view_count + 1` *(contested)* | **0.073 ms** | 0.114 ms | 0.079 ms | 0.060 ms |
-| pipeline, 5-query dashboard batch | **0.183 ms** | 0.386 ms | 0.366 ms | 0.194 ms |
-| hot findUnique, 500x same shape | **0.029 ms** | 0.064 ms | 0.073 ms | 0.033 ms |
+| findMany, 100 users (flat) | **0.181 ms** | 0.241 ms | 0.242 ms | 0.164 ms |
+| findMany, 50 users + posts (L2) *(contested)* | **1.670 ms** | 4.302 ms | 1.711 ms | 1.847 ms |
+| findMany, 10 users → posts → comments (L3) *(contested)* | **1.082 ms** | 4.204 ms | 1.166 ms | n/a |
+| findUnique, single user by PK | **0.035 ms** | 0.078 ms | 0.080 ms | 0.036 ms |
+| findUnique, user + posts + comments (L3) | **0.146 ms** | 0.374 ms | 0.285 ms | n/a |
+| count, all users | **0.038 ms** | 0.070 ms | 0.053 ms | 0.041 ms |
+| stream, iterate 50K comments (batch 1000) | 50.39 ms | 54.81 ms | **39.49 ms** | 42.33 ms |
+| atomic increment, `view_count + 1` *(contested)* | **0.067 ms** | 0.106 ms | 0.073 ms | 0.055 ms |
+| pipeline, 5-query dashboard batch | **0.165 ms** | 0.338 ms | 0.341 ms | 0.177 ms |
+| hot findUnique, 500x same shape | **0.026 ms** | 0.059 ms | 0.069 ms | 0.030 ms |
 
 ## Ratio vs fastest
 
 `1.00x` = fastest ORM on that scenario. Higher = slower.
 
-| Scenario | Turbine 0.66 | Prisma 7.9 | Drizzle 0.45 |
+| Scenario | Turbine 0.71 | Prisma 7.9 | Drizzle 0.45 |
 |---|---|---|---|
-| findMany, flat | **1.00x** | 1.34x | 1.31x |
-| findMany, L2 *(contested)* | 1.32x | 2.38x | **1.00x** |
-| findMany, L3 | 1.17x | 3.26x | **1.00x** |
-| findUnique, PK | **1.00x** | 2.18x | 2.24x |
-| findUnique, L3 | **1.00x** | 2.02x | 1.54x |
-| count | **1.00x** | 1.77x | 1.35x |
-| stream, 50K | 1.32x | 1.42x | **1.00x** |
-| atomic increment *(contested)* | **1.00x** | 1.56x | 1.08x |
-| pipeline, 5-query batch | **1.00x** | 2.11x | 2.00x |
-| hot findUnique | **1.00x** | 2.21x | 2.52x |
+| findMany, flat | **1.00x** | 1.34x | 1.34x |
+| findMany, L2 *(contested)* | **1.00x** | 2.58x | 1.02x |
+| findMany, L3 *(contested)* | **1.00x** | 3.88x | 1.08x |
+| findUnique, PK | **1.00x** | 2.25x | 2.30x |
+| findUnique, L3 | **1.00x** | 2.56x | 1.95x |
+| count | **1.00x** | 1.84x | 1.41x |
+| stream, 50K | 1.28x | 1.39x | **1.00x** |
+| atomic increment *(contested)* | **1.00x** | 1.60x | 1.10x |
+| pipeline, 5-query batch | **1.00x** | 2.04x | 2.07x |
+| hot findUnique | **1.00x** | 2.28x | 2.68x |
 
-**Scenario wins: Turbine seven, Drizzle three, Prisma none.** Prisma is slower than Turbine on all ten.
+**Scenario wins: Turbine nine, Drizzle one, Prisma none.** Prisma is slower than Turbine on all ten.
 
-**Two of the ten are contested and should not be read as leads by either side.** This run used two independent harnesses and they disagree about **L2 nested** (interleaved: Drizzle 1.804 vs Turbine 2.379; contiguous: Turbine 1.34 vs Drizzle 2.03) and **atomic increment** (interleaved: Turbine 0.073 vs Drizzle 0.079; contiguous: Drizzle fastest, Turbine 1.50x). The tables above report the interleaved harness because it rotates arm order every round and so shares drift across arms instead of letting it land on one. Where the two designs disagree, the scenario is close enough that the design decides it, and the honest answer is a tie. The 0.50.0 run recorded this for one scenario; it is now two. Streaming is **not** one of them: Drizzle wins it by 24% in every run of both harnesses.
+**Three of the ten are contested and should not be read as leads by either side.** The interleaved harness gives Turbine **L2 nested** (1.670 vs 1.711) and **L3 nested** (1.082 vs 1.166), but the contiguous harness will not confirm either: run twice on the identical configuration it reversed itself on both, giving L2 to Drizzle once (2.18 vs 1.63) and to Turbine once (1.54 vs 1.61). **Atomic increment** is the third, a tie under both designs (interleaved: Turbine 0.067 vs Drizzle 0.073; contiguous: 0.09 vs 0.09). The tables above report the interleaved harness because it rotates arm order every round, sharing drift across arms instead of letting it land on one. Streaming is **not** contested: Drizzle wins it by 22% in every run of both harnesses.
 
 ## Overhead above hand-written `pg`
 
@@ -143,49 +157,47 @@ Geometric mean over the eight scenarios with a raw control:
 
 | | overhead vs raw `pg` |
 |---|---|
-| **Turbine 0.66** | **1.09x** |
-| Drizzle 0.45 | 1.49x |
-| Prisma 7.9 | 1.86x |
+| **Turbine 0.71** | **1.08x** |
+| Drizzle 0.45 | 1.47x |
+| Prisma 7.9 | 1.81x |
 
-This is the most defensible number on the page, and the one worth quoting. The control is measured in the same rounds as the ORMs, so it cancels most of the drift; it has an absolute floor (nothing can beat 1.00x); and unlike a competitor ratio it does not move when a competitor ships a release. Read it as: on these shapes, choosing Turbine over writing the SQL yourself costs about 9% of the query time.
+This is the number to quote. The control runs in the same rounds as the ORMs, so it cancels most of the drift, and it does not move when a competitor ships a release. Read it as: on these shapes, choosing Turbine over writing the SQL yourself costs about 8% of the query time.
 
-Across all ten scenarios, geometric mean: Turbine is **1.82x faster than Prisma 7.9** and **1.32x faster than Drizzle 0.45**.
+**One adjustment is baked into that 1.08x, and it goes against Turbine.** The raw control's hand-written L2 statement builds its nested rows with `json_build_object`, which is what Turbine emitted when the control was written; Turbine now emits `json_build_array`. Measured on identical rows, that one difference is worth **1.83x** (0.801 ms against 0.437 ms), so the control is doing more work than the ORM it is meant to bound and the unadjusted figure comes out at **1.00x**, i.e. apparently faster than hand-written SQL. That reading is not supportable, so the table above prices L2 against an encoding-matched control instead. The recorded control arm is deliberately left alone, because rewriting it would break comparability with every earlier published run.
+
+Across all ten scenarios, geometric mean: Turbine is **2.02x faster than Prisma 7.9** and **1.46x faster than Drizzle 0.45**.
 
 ## What the numbers actually mean
 
 ### 1. On a local socket, the ORM layer is the whole story
 
-With the network removed, the fastest single SELECT (`findUnique` by primary key) runs in ~0.05 ms, and the gap between ORMs is the gap in their JavaScript per-query work rather than measurement noise. A pooled remote database compresses all of this back toward the network floor.
-
-**Conclusion.** A socket-local benchmark measures which layer is leanest. A pooled-remote benchmark measures whether that matters in production (usually only a little). Read both, and read them separately.
+With the network removed, the fastest single SELECT (`findUnique` by primary key) runs in ~0.035 ms, and the gap between ORMs is the gap in their JavaScript per-query work. A pooled remote database compresses all of this back toward the network floor. A socket-local benchmark measures which layer is leanest; a pooled-remote benchmark measures whether that matters in production (usually only a little). Read both, separately.
 
 ### 2. Turbine leads the simple and repeated-shape reads
 
-Flat `findMany`, both `findUnique` shapes, `count`, the 5-query pipeline and the hot 500x-same-shape loop all go to Turbine. Shape-keyed SQL template caching means a repeated query skips SQL generation entirely, and prepared statements let Postgres reuse the plan. On the hot path Turbine runs at **~34,500 ops/sec versus ~15,400 for Prisma and ~13,300 for Drizzle**.
+Flat `findMany`, both `findUnique` shapes, `count`, the 5-query pipeline and the hot 500x-same-shape loop all go to Turbine. Shape-keyed SQL template caching means a repeated query skips SQL generation entirely, and prepared statements let Postgres reuse the plan. On the hot path Turbine runs at **~38,500 ops/sec versus ~16,900 for Prisma and ~14,500 for Drizzle**.
 
-### 3. Drizzle leads both nested reads and streaming
+### 3. The nested reads stopped being losses, narrowly
 
-Drizzle's relational query builder leads L2 on the primary harness (1.804 ms vs Turbine's 2.379 ms) and leads L3 (1.223 ms vs 1.436 ms). L2 is contested: the contiguous harness reverses it, so neither side owns that scenario (see [above](#ratio-vs-fastest)). Drizzle also wins streaming outright, by 24% (see [above](#the-one-we-lose-stated-plainly)). Turbine's `json_agg` nesting sits behind Drizzle and **1.8x to 2.8x ahead of Prisma** on the nested shapes (1.80x on L2, 2.78x on L3, 2.02x on the nested `findUnique`).
+Both nested `findMany` shapes were Drizzle's in the previous run and are Turbine's here: L2 **1.670 ms against 1.711**, L3 **1.082 against 1.166**. Turbine leads Prisma on the nested shapes by **2.6x on L2, 3.9x on L3 and 2.6x on the nested `findUnique`**. Drizzle still wins streaming outright, by 22% (see [above](#the-one-we-lose-stated-plainly)).
 
-**The gap itself has since been root-caused, and it is one default.** Splitting the L2 wall time into server, wire and client shows the plan shape is a wash: with the JSON encoding held equal, server time is 0.424 ms for Turbine's correlated subquery against 0.363 ms for Drizzle's `LEFT JOIN LATERAL`, and our client-side decode is *faster* than Drizzle's while decoding more bytes. The whole difference is that `json_build_object` writes every key name into every nested object of every row: **34% of the L2 payload is key strings**, 153.8 KB against 102.1 KB.
+**Both are marked contested, and the mark is doing real work.** L2's margin is 2.5%, which is inside what this page tells you not to quote, and the contiguous cross-check harness cannot arbitrate: two runs of the identical configuration reversed each other on both scenarios (L2 gave 2.18 ms against Drizzle's 1.63 in one run and 1.54 against 1.61 in the next). Read L2 and L3 as ties that Turbine now enters level, not as leads.
 
-Turbine already ships the encoding that removes them. `jsonEncoding: 'positional'` emits the same `json_build_array` shape Drizzle uses, and with it turned on Turbine wins both nested scenarios: **1.615 ms against Drizzle's 1.690 on L2, and 0.506 against 0.629 on L3**. It is not yet the default, and deliberately so: positional decoding maps array positions back to field names from a build-time shape, which turns any drift into a silent wrong-field bug rather than a loud error, so it wants the differential fuzz treatment before it becomes what everyone gets. That is the planned path rather than a promise of a date.
+**What changed is one default.** `json_build_object` writes every key name into every nested object of every row, which costs PostgreSQL CPU to emit and 55% more bytes to ship. `jsonEncoding: 'positional'` emits `json_build_array` instead, and it is the PostgreSQL default as of 0.71. Forcing the old encoding on the same tree, on the same machine, reproduces the previous run almost exactly: **1.079x geometric mean and 7 of 10 scenarios**, against 1.078x and 7 of 10 then. Turning it on takes those to **1.025x and 9 of 10**. The improvement shows up on the contiguous harness too, at the same magnitude (L2 2.38 ms to 1.54 ms), which is why the direction is not in doubt even though the winner is.
 
-**One thing remains genuinely unexplained**, and it is narrower than the sentence that used to sit here: the *widening between runs*. L2 was published at 1.21x in the 0.50.0 run and measures 1.32x here. It is not the 0.66.0 release, since a direct interleaved A/B of 0.65.0 against 0.66.0 on the same database found 0.66.0 equal or marginally faster on every shape. Turbine's absolute L2 number barely moved; the raw control and Drizzle each got about 10% faster and Turbine did not.
+Rows are identical between the encodings, verified by `JSON.stringify` equality across five nested shapes including key order. That property is what the encoding had to earn before it could become the default: positional decoding maps array positions back to field names from a build-time shape, so its failure mode is a silently transposed field rather than a loud error, and it is held by the differential fuzz suite rather than by this page.
 
 ### 4. Pipeline batching is Turbine's clearest win
 
-The 5-query dashboard batch runs in 0.206 ms on Turbine versus 0.431 ms (Prisma) and 0.402 ms (Drizzle): **2.09x and 1.95x faster respectively**, and level with the raw `pg` control at 0.205 ms. Turbine sends all five queries in a single TCP flush using the Postgres extended-query pipeline protocol; Prisma's `$transaction([])` and Drizzle's `db.transaction()` run their queries sequentially, waiting for each reply before sending the next. On a local socket that serialization cost is small in absolute terms; on a high-latency connection it grows with every round-trip.
+The 5-query dashboard batch runs in 0.165 ms on Turbine versus 0.338 ms (Prisma) and 0.341 ms (Drizzle): **2.04x and 2.07x faster respectively**, and level with the raw `pg` control at 0.177 ms. Turbine sends all five queries in a single TCP flush using the Postgres extended-query pipeline protocol; Prisma's `$transaction([])` and Drizzle's `db.transaction()` run their queries sequentially, waiting for each reply before sending the next. On a local socket that serialization cost is small; on a high-latency connection it grows with every round-trip.
 
 ### 5. Prisma trails everywhere on a local socket
 
-Prisma 7 dropped its Rust engine, but the client still does meaningful per-query work in TypeScript. With no network to hide it, that overhead puts Prisma behind Turbine on all ten scenarios, at 1.84x hand-written `pg`. This is a socket-local finding, not a claim about production: over a pooled remote network the same Prisma queries land inside the noise floor.
+Prisma 7 dropped its Rust engine, but the client still does meaningful per-query work in TypeScript. With no network to hide it, that overhead puts Prisma behind Turbine on all ten scenarios, at 1.81x hand-written `pg`. This is a socket-local finding, not a claim about production: over a pooled remote network the same Prisma queries land inside the noise floor.
 
 ## Beyond the headline ten
 
-Measured against **0.67.0** on the same machine, same fixture and same interleaved harness. The ten scenarios above are skewed and it is worth saying how: three of them are `findUnique`, the largest non-stream result is 100 rows, nothing measures a write other than one atomic increment, and nothing measures aggregation, to-one relations, many-to-many or relation filters. That set flatters small hot reads, which is not where applications spend their time.
-
-The suite now covers 24 shapes. Turbine is fastest on 17 of them. The additions changed the picture in both directions: they found a loss the old set could not see, and they overturned a recommendation the old set would have produced.
+Measured against **0.67.0** on the same machine, fixture and interleaved harness. The headline ten skew toward small hot reads: three are `findUnique`, the largest non-stream result is 100 rows, the only write is one atomic increment, and nothing measures aggregation, to-one relations, many-to-many or relation filters. The extended suite covers 24 shapes; Turbine is fastest on 17. The additions found a loss the old set could not see, and overturned a recommendation it would have produced.
 
 ### Large result sets: the thing the old suite was hiding
 
@@ -197,7 +209,7 @@ At 100 rows the row decoder is invisible. At scale it dominates.
 | findMany, 50,000 comments | **44.751 ms** (1.07x raw) | 55.451 (1.33x) | 50.391 (1.20x) | 41.829 |
 | findMany, 1,000 rows x 39 columns | **4.551 ms** (1.21x raw) | 6.087 (1.61x) | 6.118 (1.62x) | 3.772 |
 
-Turbine runs within **7% of hand-written `pg`** on a 50,000-row read where the others are 20% and 33% above it. The wide-table row isolates per-column cost specifically, on a deliberately 39-column table, and both competitors land at ~1.6x raw against Turbine's 1.21x.
+Turbine runs within **7% of hand-written `pg`** on a 50,000-row read where the others are 20% and 33% above it. The wide-table row isolates per-column cost on a deliberately 39-column table: both competitors land at ~1.6x raw against Turbine's 1.21x.
 
 ### Writes
 
@@ -208,7 +220,7 @@ Turbine runs within **7% of hand-written `pg`** on a 50,000-row read where the o
 | upsert on a unique column | 0.105 ms | 0.140 | 0.113 | 0.082 |
 | delete by unique column | 0.084 ms | 0.123 | 0.086 | 0.068 |
 
-**Bulk insert is the widest margin in the whole suite: 5.8x Prisma and 2.5x Drizzle**, and Turbine is the only arm within 2x of a hand-written `UNNEST` insert. The three single-row rows are honest **ties** between Turbine and Drizzle: the differences are 0.009, 0.008 and 0.002 ms against a 0.018 ms drift floor for that run. Both are clearly ahead of Prisma.
+**Bulk insert is the widest margin in the whole suite: 5.8x Prisma and 2.5x Drizzle**, and Turbine is the only arm within 2x of a hand-written `UNNEST` insert. The three single-row rows are ties between Turbine and Drizzle: the differences are 0.009, 0.008 and 0.002 ms against a 0.018 ms drift floor for that run. Both are clearly ahead of Prisma.
 
 ### Relations the headline set never touched
 
@@ -220,7 +232,7 @@ Turbine runs within **7% of hand-written `pg`** on a 50,000-row read where the o
 | relation filter (`some`), 100 users | **0.200 ms** | 0.268 | 0.252 |
 | groupBy + `having`, 5 groups | **0.701 ms** | 0.756 | 0.720 |
 
-Many-to-many is the widest non-write margin, and it is also the one place the **result shapes differ**, which is the finding rather than a caveat: Turbine derives the junction from its two foreign keys and returns `post.tags[]`, while Prisma and Drizzle both need the junction as an explicit model or table here and return `post.postTags[].tag`, one level deeper, for the caller to flatten. Each arm is written the way that ORM's own docs prescribe. The `_count` and relation-filter rows carry the same kind of note in the harness output: Drizzle's relational API has neither primitive, so those arms are hand-written subqueries through its query builder.
+Many-to-many is the widest non-write margin, and the one place the **result shapes differ**: Turbine derives the junction from its two foreign keys and returns `post.tags[]`, while Prisma and Drizzle both need the junction as an explicit model or table here and return `post.postTags[].tag`, one level deeper, for the caller to flatten. Each arm is written the way that ORM's own docs prescribe. Drizzle's relational API has no relation `_count` and no relation-filter primitive, so those two arms are hand-written subqueries through its query builder; a different hand-written formulation would move those numbers.
 
 On groupBy all three sit within a few percent of raw `pg`, and the Turbine-to-Drizzle difference is itself at the drift floor. Read that row as "no ORM has a problem here" rather than as a win.
 
@@ -232,13 +244,13 @@ On groupBy all three sit within a few percent of raw `pg`, and the Turbine-to-Dr
 | the same query at offset 9,000 | 0.549 ms | **0.318** | 0.341 | 0.276 |
 | ...with `forceCustomPlan: true` | **0.292 ms** | | | |
 
-Turbine names its prepared statements, which is exactly what wins the hot repeated-shape reads above, because node-postgres skips `Parse` only for a statement already parsed **by name**. PostgreSQL promotes a named statement to a value-blind **generic** plan on its sixth execution, and with `OFFSET` bound as a parameter that generic plan cannot know the offset is 9,000.
+Turbine names its prepared statements, which is exactly what wins the hot repeated-shape reads above: node-postgres skips `Parse` only for a statement already parsed **by name**. PostgreSQL promotes a named statement to a value-blind **generic** plan on its sixth execution, and with `OFFSET` bound as a parameter that generic plan cannot know the offset is 9,000.
 
 This is a property of naming statements, not of Turbine, and the control arm settles it: the same hand-written `pg` query costs **0.541 ms named and 0.272 ms unnamed**. Drizzle and Prisma escape the cliff only because they never name statements, which is the same reason they never get the `Parse` skip. If you paginate deeply on a hot endpoint, set `forceCustomPlan: true` on that query and you land within 6% of raw.
 
 ## Latency: the axis a socket cannot show
 
-Every number above this line is measured over a Unix socket where a round trip is ~0.05 ms. That is not a footnote, because it changes the **sign** of some results. These were measured through an in-process TCP proxy that forwards to the same PostgreSQL socket and delays each chunk by RTT/2. It models latency, not bandwidth or jitter, and the 0 ms row runs through the proxy too so every comparison is like for like.
+Every number above this line is measured over a Unix socket where a round trip is ~0.05 ms, which changes the **sign** of some results. These tables were measured through an in-process TCP proxy that forwards to the same PostgreSQL socket and delays each chunk by RTT/2. It models latency, not bandwidth or jitter, and the 0 ms row runs through the proxy too, so every comparison is like for like.
 
 **Dashboard, 5 independent queries** (medians, ms)
 
@@ -248,7 +260,7 @@ Every number above this line is measured over a Unix socket where a round trip i
 | Prisma 7 `$transaction` | 1.133 | 18.346 | 35.169 | 183.841 |
 | Drizzle transaction | 1.053 | 18.349 | 34.823 | 184.030 |
 
-**Turbine's pipeline advantage grows from 2.7x to 6.9x** as the link lengthens, because it is one round trip against roughly seven (BEGIN, five queries, COMMIT). Neither competitor has independent-query pipelining. This is the clearest case on the page where a socket-local benchmark *understates* a real difference, and it understated it by 2.5x.
+**Turbine's pipeline advantage grows from 2.7x to 6.9x** as the link lengthens, because it is one round trip against roughly seven (BEGIN, five queries, COMMIT). Neither competitor has independent-query pipelining. This is the clearest case where a socket-local benchmark *understates* a real difference, and it understated it by 2.5x.
 
 **Nested read, 50 users + posts** (medians, ms)
 
@@ -258,33 +270,26 @@ Every number above this line is measured over a Unix socket where a round trip i
 | Turbine `batched` | **1.407** | 6.807 | 11.343 | 54.003 |
 | Drizzle | 1.897 | **4.620** | **7.258** | **27.856** |
 
-**`relationLoadStrategy: 'batched'` inverts.** On a socket it is the fastest strategy by 1.34x, which is exactly the recommendation a socket-only suite would have produced. By **1 ms** of round-trip time it is already slower than the join, and at 25 ms it is 1.83x slower, because it buys its win with an extra round trip per relation. Turbine's default `'auto'` staying on the join is the right call for anything on a real link, and if your deployment is not on a socket the thing to set is [`autoRoundTripMs`](/relations#load-strategy-auto-join-batched-flatten), not a pinned strategy.
+**`relationLoadStrategy: 'batched'` inverts.** On a socket it is the fastest strategy by 1.34x, which is exactly the recommendation a socket-only suite would have produced. By **1 ms** of round-trip time it is already slower than the join, and at 25 ms it is 1.83x slower, because it buys its win with an extra round trip per relation. Turbine's default `'auto'` stays on the join, which is the right call for anything on a real link; if your deployment is not on a socket, set [`autoRoundTripMs`](/relations#load-strategy-auto-join-batched-flatten) rather than pinning a strategy.
 
-**Point reads converge.** At 25 ms every `findUnique` arm lands within 0.3 ms of every other and of raw `pg` (Turbine 26.509, Drizzle 26.753, Prisma 26.828, raw 26.526). Turbine's ~1.5x advantage on hot small reads is real and worth having, but it is a low-latency-link result, and publishing it without this row overstates it.
+**Point reads converge.** At 25 ms every `findUnique` arm lands within 0.3 ms of every other and of raw `pg` (Turbine 26.509, Drizzle 26.753, Prisma 26.828, raw 26.526). Turbine's ~1.5x advantage on hot small reads is real, but it is a low-latency-link result.
 
-**What this cannot show.** The proxy models latency, not bandwidth. The 34% payload reduction `jsonEncoding: 'positional'` buys does not appear in these tables at all and would only show up on a bandwidth-constrained link, so the case for that change is stronger than anything here can demonstrate.
+**What this cannot show.** The proxy models latency, not bandwidth, so the 34% payload reduction `jsonEncoding: 'positional'` buys does not appear in these tables at all; it would only show on a bandwidth-constrained link. These tables predate that encoding becoming the PostgreSQL default, so the nested rows here were measured on the object encoding.
 
 ## Caveats
 
-- **These are socket-local numbers.** They isolate per-query overhead and deliberately exclude the network that usually dominates production latency. For a networked, pooled database the deltas here shrink toward the noise floor.
-- **Read the [drift floor](#the-drift-floor-read-this-before-the-table) before quoting any sub-0.15 ms figure.** Those absolute values carry roughly a third uncertainty. Their orderings are stable; their millisecond values are not precise.
-- **All measurements are wall-clock from the client**, including query execution and result serialization.
-- **Single machine.** Client and database are the same host, so there is no round-trip and no pooler hop.
-- **Prisma's nested scenarios run on its `join` strategy, deliberately.** `benchmarks/prisma/schema.prisma` enables the `relationJoins` preview feature, which per Prisma's docs makes `join` the client-wide default, and the harness never overrides `relationLoadStrategy` on a query. Without the flag Prisma would use its `query` strategy and lose the nested scenarios by a wider margin. We measured Prisma in its favorable configuration.
-- **We did not test connection pool starvation, long transactions, or write-heavy workloads.** Those are different benchmarks.
-- **The streaming scenario drains the full table.** A scenario that breaks out after the first match would show cursor cleanup advantages that a single number cannot capture. It is also the shape that most flatters keyset pagination.
-- **Prisma 7.6 was not installed or measured in this run.** An earlier version of this page quoted 7.6-to-7.9 improvement percentages; they are not reproducible from this data and have been removed rather than carried forward.
-- **`NODE_ENV` is unset**, which leaves Turbine's dev-mode cache cross-check guards armed. A control run with `NODE_ENV=production` produced Turbine numbers indistinguishable on every scenario, so the published figures are not depressed by those guards.
-- **The headline ten were measured against 0.66.0; the extended suite and the latency tables against 0.67.0.** They are separate runs on the same machine and fixture, not one table split in two, so compare within a section rather than across them.
-- **The many-to-many arms do not return the same shape.** Turbine returns `post.tags[]`; Prisma and Drizzle return `post.postTags[].tag`, one level deeper. Each arm is written the way that ORM's own documentation prescribes, and the difference is reported as a finding rather than normalized away.
-- **Drizzle has no relation `_count` and no relation-filter primitive**, so those two arms are hand-written subqueries through its query builder. A different hand-written formulation would move that number.
-- **The latency proxy models latency, not bandwidth or jitter.** It delays each TCP chunk by RTT/2 and forwards to the same local socket. Payload size therefore costs nothing in those tables, which understates the case for `jsonEncoding: 'positional'` and for any strategy that moves fewer bytes.
+- **All measurements are wall-clock from the client**, including query execution and result serialization. Client and database share one host: no round-trip, no pooler hop.
+- **Prisma's nested scenarios run on its `join` strategy, deliberately.** `benchmarks/prisma/schema.prisma` enables the `relationJoins` preview feature, which per Prisma's docs makes `join` the client-wide default, and the harness never overrides `relationLoadStrategy` on a query. Without the flag Prisma would use its `query` strategy and lose the nested scenarios by a wider margin.
+- **Connection pool starvation, long transactions, and write-heavy workloads were not tested.** Those are different benchmarks.
+- **The streaming scenario drains the full table**, the shape that most flatters keyset pagination. A scenario that breaks out after the first match would instead show the cursor's cleanup advantages.
+- **`NODE_ENV` is unset**, which leaves Turbine's dev-mode cache cross-check guards armed. A control run with `NODE_ENV=production` produced Turbine numbers indistinguishable on every scenario.
+- **The headline ten were measured against 0.71.0; the extended suite and the latency tables against 0.67.0.** They are separate runs on the same machine and fixture, so compare within a section rather than across them. The nested-read rows in particular are not comparable across those dates, because the relation JSON encoding changed between them.
 
 ## Reproduce
 
 Raw data, the full writeup and all three harnesses are committed to the repo:
 
-- **[`benchmarks/RESULTS-0.66.0.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-0.66.0.md)** the headline-ten run in full, including the 0.65-vs-0.66 A/B and the harness-disagreement table.
+- **[`benchmarks/RESULTS-0.71.0.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-0.71.0.md)** the headline-ten run in full, including the encoding control suite, the machine-state control, and the harness-disagreement table.
 - **[`benchmarks/RESULTS-EXTENDED.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-EXTENDED.md)** the extended suite and the latency sweep in full, including the per-arm notes and the drift floor for each run.
 - **[`benchmarks/RESULTS-0.50.0.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-0.50.0.md)** the previous (0.50.0) run, including its per-run drift tables.
 - **[`benchmarks/RESULTS.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS.md)** the historical runs.

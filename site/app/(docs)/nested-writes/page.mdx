@@ -9,11 +9,11 @@ export const metadata = {
 
 A nested write resolves relation fields in your `data` argument into the right INSERTs, UPDATEs, and DELETEs, so you can build or mutate a whole object graph in one `create()` or `update()` call instead of orchestrating the statements by hand.
 
-The whole tree is written inside **one transaction** (all-or-nothing) and walked **depth-first, capped at depth 10**, past that Turbine throws `CircularRelationError` ([E007](/errors)). After the write completes, Turbine reads the row back with the touched relations populated, so the return value is the full tree.
+The whole tree is written inside **one transaction** (all-or-nothing) and walked **depth-first, capped at depth 10**; past that Turbine throws `CircularRelationError` ([E007](/errors)). After the write completes, Turbine reads the row back with the touched relations populated, so the return value is the full tree.
 
 ## When it triggers
 
-A key in `data` is treated as a nested write when it matches a relation name and its value is a plain object (not `null`, not an array, not a `Date`). Everything else is a scalar column. No flag to flip, relation fields just work.
+A key in `data` is treated as a nested write when it matches a relation name and its value is a plain object (not `null`, not an array, not a `Date`). Everything else is a scalar column. There is no flag to set.
 
 The examples below assume this shape:
 
@@ -37,7 +37,7 @@ The examples below assume this shape:
 
 `create`, `connect`, and `connectOrCreate` are valid in both `create()` and `update()`. The other five are **update-only**: using them inside `create()` throws `ValidationError` ([E003](/errors)). An unknown operation name throws too.
 
-**Many-to-many** relations support the three operations that only ever touch the junction table: `connect`, `disconnect`, and `set` (see [Many-to-many relations](#many-to-many-relations) below). The operations that would also have to write the *target* row (`create`, `connectOrCreate`, `update`, `upsert`, `delete`) still throw `ValidationError` ([E003](/errors)), because there is no safe default for the junction's own extra columns.
+Many-to-many relations support `connect`, `disconnect`, and `set` only; the full rules are in [Many-to-many relations](#many-to-many-relations) below.
 
 ## Create context
 
@@ -74,7 +74,7 @@ await db.users.create({
 
 ### belongsTo create, link the parent
 
-For a `belongsTo` relation the foreign key lives on the row you're creating, so Turbine resolves the related row **before** the parent INSERT and folds its key in. That means a `NOT NULL` FK column is satisfied on the first insert.
+For a `belongsTo` relation the foreign key lives on the row you're creating, so Turbine resolves the related row **before** the parent INSERT and folds its key in. A `NOT NULL` FK column is therefore satisfied on the first insert.
 
 ```ts
 await db.users.create({
@@ -111,7 +111,7 @@ await db.users.create({
 
 #### The shape that is exposed
 
-This handler is the whole vulnerability. It has an authorization check, and the check is on the wrong row:
+This handler has an authorization check, and the check is on the wrong row:
 
 ```ts
 // POST /api/collections/:id/items   { itemIds: [42] }
@@ -127,7 +127,7 @@ app.post('/api/collections/:id/items', async (req, res) => {
 });
 ```
 
-The caller owns the collection, so the check passes. Nothing checks who owns item 42. The `connect` rewrites `items.collection_id`, so an attacker who can guess or enumerate ids moves **another tenant's rows into their own collection**, reads them back through their own authorized endpoints, and the victim's rows simply disappear from the victim's list. There is no error, no log line, and one statement did it.
+The caller owns the collection, so the check passes. Nothing checks who owns item 42. The `connect` rewrites `items.collection_id`, so an attacker who can guess or enumerate ids moves another tenant's rows into their own collection, reads them back through their own authorized endpoints, and the victim's rows disappear from the victim's list. No error, no log line, one statement.
 
 `connectOrCreate` is the same primitive: when the lookup finds an existing row, it connects it.
 
@@ -146,7 +146,7 @@ await db.users.update({ where: { id: 7 }, data: { posts: { connect: { id: 42 } }
 
 With the flag on, a connect succeeds when the child is **unowned** (its foreign key is null) or **already owned by this parent** (an idempotent re-connect), and is refused otherwise. Re-parenting then has to be an explicit update, which is the point: it stops being something a request body can do by accident.
 
-It is off by default because it changes the outcome of writes that currently succeed. Turn it on in a non-production environment first and run your test suite: anything that legitimately re-parents will start throwing, and that is the list of call sites you need to rewrite as explicit updates.
+It is off by default because it changes the outcome of writes that currently succeed. Turn it on in a non-production environment first and run your test suite: anything that legitimately re-parents will start throwing, and that is the list of call sites to rewrite as explicit updates.
 
 #### What it covers, and what it does not
 
@@ -356,7 +356,7 @@ await db.posts.update({
 
 Behavior worth knowing:
 
-- **`connect` is idempotent.** Turbine reads the parent's existing links for exactly the named targets inside the transaction and inserts only the missing ones. It does not rely on `ON CONFLICT DO NOTHING`, which SQL Server and PowDB refuse and which assumes a unique constraint an implicit junction need not declare. Connecting an already-linked tag is a no-op, not a duplicate row and not a constraint error.
+- **`connect` is idempotent.** Turbine reads the parent's existing links inside the transaction and inserts only the missing ones, rather than relying on `ON CONFLICT DO NOTHING` (which SQL Server and PowDB refuse, and which assumes a unique constraint an implicit junction need not declare). Connecting an already-linked tag is a no-op, not a duplicate row and not a constraint error.
 - **`disconnect` is scoped by both keys.** The delete names the parent key *and* the listed targets, so it can neither clear the parent's other links nor touch another parent's rows.
 - **`set` replaces the whole set.** `set: []` clears every link this parent has. The clearing delete is always scoped by the parent key.
 - **Order within one payload:** `set` runs first, then `disconnect`, then `connect`.

@@ -152,7 +152,10 @@ describe('stress: deep nesting (up to depth 9)', () => {
     });
 
     assert.ok(deferred.sql.length > 0, 'should produce non-empty SQL');
-    assert.ok(deferred.sql.includes('json_build_object'), 'should use json_build_object');
+    // `json_agg`, not the per-row encoder: which of json_build_object /
+    // json_build_array wraps each row is `jsonEncoding`'s business (positional
+    // is the PostgreSQL default), and this test is about nesting depth.
+    assert.ok(deferred.sql.includes('json_agg'), 'should aggregate the relation rows');
     assert.ok(deferred.sql.includes('"posts"'), 'should reference posts table');
     assert.ok(deferred.sql.includes('"comments"'), 'should reference comments table');
   });
@@ -266,7 +269,7 @@ describe('stress: circular relation detection', () => {
     });
     assert.ok(deferred.sql.length > 0, 'should produce SQL');
     // Should include subqueries for all three levels
-    assert.ok(deferred.sql.includes('json_build_object'), 'should have json_build_object');
+    assert.ok(deferred.sql.includes('json_agg'), 'should aggregate the relation rows at every level');
   });
 });
 

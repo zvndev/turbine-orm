@@ -7,7 +7,7 @@ export const metadata = {
 
 # Seeding
 
-`turbine seed` runs a seed file to populate your database. The file can be TypeScript, JavaScript, or SQL, Turbine picks the right runner for each. TypeScript seeds run through `tsx`, so there's no separate build step.
+`turbine seed` runs a seed file to populate your database. The file can be TypeScript, JavaScript, or SQL; Turbine picks the right runner for each. TypeScript seeds run through `tsx`, so there is no separate build step.
 
 ```bash
 npx turbine seed
@@ -30,7 +30,7 @@ export default defineSeed(async (db) => {
 });
 ```
 
-The `db` handed to the callback is a base client, use [`db.raw`](/queries#raw-sql) or [`db.sql`](/queries#typed-raw-sql--dbsqlt) for inserts. For fully typed table accessors, import your generated client instead and manage its lifecycle yourself:
+The `db` handed to the callback is a base client: use [`db.raw`](/queries#raw-sql) or [`db.sql`](/queries#typed-raw-sql-dbsqlt) for inserts. For fully typed table accessors, import your generated client instead and manage its lifecycle yourself:
 
 ```ts
 // seed.ts
@@ -67,8 +67,8 @@ ON CONFLICT (slug) DO NOTHING;
 
 Turbine resolves the seed file in this order:
 
-1. The `seedFile` field in `turbine.config.ts` (an explicit path always wins, even if the file doesn't exist yet).
-2. The first default candidate found, in this order: `seed.ts`, `seed.js`, `seed.sql`, `turbine/seed.ts`, `turbine/seed.js`, `turbine/seed.sql`.
+1. The `seedFile` field in `turbine.config.ts`. An explicit path always wins, even if the file doesn't exist yet.
+2. The first default candidate found: `seed.ts`, `seed.js`, `seed.sql`, `turbine/seed.ts`, `turbine/seed.js`, `turbine/seed.sql`.
 
 ```ts
 // turbine.config.ts
@@ -80,13 +80,11 @@ export default {
 } satisfies TurbineCliConfig;
 ```
 
-`seedFile` is the canonical key, and it is what `turbine init` writes. `seed` is a back-compat alias kept working for configs scaffolded before 0.50; when both are present, `seedFile` wins.
-
-The root-level candidates stay first in the fallback order so an existing project that relies on `./seed.ts` is unaffected. The `turbine/` candidates were appended so a project that drops the key entirely still finds the file `turbine init` scaffolds, which is `./turbine/seed.ts`.
+`seedFile` is the canonical key and what `turbine init` writes. `seed` is a back-compat alias; when both are present, `seedFile` wins.
 
 ## Seeding in CI/CD
 
-For automated environments, pair `migrate deploy` with `seed`. `migrate deploy` applies pending migrations non-interactively, it never prompts, so it's safe in a pipeline, then seed on top:
+Pair `migrate deploy` with `seed`. `migrate deploy` applies pending migrations non-interactively, so it's safe in a pipeline; then seed on top:
 
 ```bash
 # CI: bring a fresh database up to date, then seed it
@@ -94,7 +92,7 @@ npx turbine migrate deploy
 npx turbine seed
 ```
 
-`migrate deploy` refuses to run on a checksum mismatch or a missing migration file (exit 1 with a clear message), so a drifted migration history fails the build instead of silently diverging. See [`migrate deploy`](/cli#turbine-migrate-deploy) for the full contract.
+`migrate deploy` refuses to run on a checksum mismatch or a missing migration file (exit 1), so a drifted migration history fails the build instead of silently diverging. See [`migrate deploy`](/cli#turbine-migrate-deploy).
 
 ## See also
 

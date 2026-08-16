@@ -44,7 +44,7 @@ Each entry in `replicas` is either a connection string or an external pool, and 
 - **Connection string**, Turbine constructs an owned `pg.Pool` for it, with the same pool tuning and one-time type-parser registration as the primary. `disconnect()` closes it.
 - **`PgCompatPool`** (Neon, Vercel Postgres, a shared `pg.Pool`), Turbine registers no type parsers and never ends it. The caller owns its lifecycle, exactly like the [external-pool contract](/serverless) for the primary.
 
-Omitting `replicas` (or passing `[]`) leaves the default single-pool path completely unchanged, there's no proxy, no routing overhead.
+Omitting `replicas` (or passing `[]`) leaves the default single-pool path unchanged: no proxy, no routing overhead.
 
 ## Replication lag, reading your own writes
 

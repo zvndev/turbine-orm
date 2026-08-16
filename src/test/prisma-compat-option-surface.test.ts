@@ -16,7 +16,13 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
 import { PRISMA_ARG_KEYS } from '../prisma-compat.js';
-import { ALL_OPTION_TABLES, applyNativeOptions, FIND_MANY_OPTIONS, type OptionKind } from '../query/index.js';
+import {
+  ALL_OPTION_TABLES,
+  applyNativeOptions,
+  FIND_MANY_OPTIONS,
+  FIND_UNIQUE_OPTIONS,
+  type OptionKind,
+} from '../query/index.js';
 import { skipGate } from './helpers.js';
 
 const KINDS: OptionKind[] = ['prisma', 'native', 'nativeAlias', 'internal'];
@@ -42,6 +48,20 @@ describe('query option surface, table shape', () => {
     assert.equal(FIND_MANY_OPTIONS.forceCustomPlan, 'native');
     assert.equal(FIND_MANY_OPTIONS.warnOnUnlimited, 'native');
     assert.equal(FIND_MANY_OPTIONS.skipGlobalFilters, 'native');
+  });
+
+  it('`jsonEncoding` is native: its value is an encoding NAME, not a schema name', () => {
+    // THE ONE RULE in query/option-surface.ts: `'native'` only when the value
+    // contains no field / relation / column / model name. `'object'` and
+    // `'positional'` name a wire encoding and nothing in the caller's naming
+    // space, so it is copied through verbatim rather than hand-translated.
+    assert.equal(FIND_MANY_OPTIONS.jsonEncoding, 'native');
+    assert.equal(FIND_UNIQUE_OPTIONS.jsonEncoding, 'native');
+    // And it therefore reaches core through the one generic copy, which is the
+    // whole mechanism this file exists to protect.
+    const dst: Record<string, unknown> = {};
+    applyNativeOptions(FIND_MANY_OPTIONS, { jsonEncoding: 'object', where: { id: 1 } }, dst);
+    assert.deepEqual(dst, { jsonEncoding: 'object' });
   });
 
   it('the turbine spellings of Prisma concepts are refused, never copied', () => {

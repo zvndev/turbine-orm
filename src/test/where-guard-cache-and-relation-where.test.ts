@@ -380,7 +380,10 @@ describe('relation limit: 0 and orderBy: {} edge cases', () => {
       with: { posts: { limit: 0, with: { comments: true } } },
     } as never);
     assertParamsAligned(sql, params);
-    assert.match(sql, /'comments'/, 'nested comments relation must still be built');
+    // The nested relation's own subquery, not its JSON KEY: a key literal only
+    // exists under `jsonEncoding: 'object'`, and PostgreSQL's default is
+    // positional, where this assertion would have been vacuous.
+    assert.match(sql, /FROM "comments" t\d/, 'nested comments relation must still be built');
   });
 
   it('treats orderBy: {} as absent (no dangling ORDER BY, nested relations kept)', () => {
@@ -390,7 +393,7 @@ describe('relation limit: 0 and orderBy: {} edge cases', () => {
     } as never);
     assertParamsAligned(sql, params);
     assert.doesNotMatch(sql, /ORDER BY\s*(LIMIT|\)|$)/, 'must not render a dangling ORDER BY');
-    assert.match(sql, /'comments'/);
+    assert.match(sql, /FROM "comments" t\d/);
   });
 
   it('honors limit: 0 on a manyToMany relation', () => {

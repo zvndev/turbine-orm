@@ -7,9 +7,9 @@ export const metadata = {
 
 # Typed Errors
 
-Turbine throws typed errors you can catch with `instanceof`. Every error extends `TurbineError` and carries a stable `readonly code` field you can use for programmatic handling. Human-readable `.message` strings also start with the same code tag (e.g. `[TURBINE_E008] …`) so logs are greppable without structured field access, but **do not parse the message**; branch on `err.code` / `instanceof`. Postgres driver errors (23505, 23503, 40P01, etc.) are translated into typed classes automatically via `wrapPgError()`.
+Turbine throws typed errors you can catch with `instanceof`. Every error extends `TurbineError` and carries a stable `readonly code` field for programmatic handling. Messages start with the same code tag (e.g. `[TURBINE_E008] …`) so logs are greppable, but **do not parse the message**; branch on `err.code` / `instanceof`. Postgres driver errors (23505, 23503, 40P01, etc.) are translated into typed classes via `wrapPgError()`.
 
-Since 0.65 every error also carries `readonly docsUrl` (e.g. `https://turbineorm.dev/errors#e008`, an anchor into the table below) and its message ends with the same link, so a raw log line is one click from its explanation and structured sinks get the URL as a field without parsing anything. A unit test asserts every code has its row and anchor here, so a new code cannot ship undocumented.
+Every error also carries `readonly docsUrl` (e.g. `https://turbineorm.dev/errors#e008`, an anchor into the table below), and its message ends with the same link, so structured sinks get the URL as a field without parsing anything. A unit test asserts every code has its row and anchor here, so a new code cannot ship undocumented.
 
 ## Error code table
 
@@ -72,9 +72,9 @@ try {
 Every name you supply is resolved against the schema, and one that does not
 resolve throws `TURBINE_E003` naming the table and, where it can, the column you
 probably meant. That holds for `where`, `orderBy`, `distinct`, `groupBy` keys,
-aggregate targets, create/update `data`, and (since 0.64) `select` and `omit` at
-every depth, including inside a relation. There is no partial mode: a name is
-never dropped and the query never runs without it.
+aggregate targets, create/update `data`, and `select` / `omit`, at every depth
+including inside a relation. There is no partial mode: a name is never dropped
+and the query never runs without it.
 
 Naming a **relation** in `select` or `omit` gets its own message, because it is
 usually a habit carried over from Prisma rather than a typo:
@@ -124,7 +124,7 @@ try {
 
 ## Retryable errors
 
-`DeadlockError` and `SerializationFailureError` expose a `readonly isRetryable = true as const` field. This isn't just a comment. It's a type-level signal so your retry loop narrows correctly.
+`DeadlockError` and `SerializationFailureError` expose a `readonly isRetryable = true as const` field, a type-level signal your retry loop can narrow on.
 
 You do not have to write that loop. Turbine exports **`withRetry`**, and `TurbineClient` exposes the same thing as **`db.$retry`**:
 
@@ -145,9 +145,7 @@ await withRetry(() =>
 );
 ```
 
-`withRetry(fn, options?)` retries only when the thrown error carries `isRetryable === true`, and rethrows anything else immediately. Options: `maxAttempts` (default `3`), `baseDelay` in ms (default `50`), `maxDelay` (default `5000`), and an `onRetry(error, attempt)` hook. Backoff is exponential with jitter, capped at `maxDelay`. `db.$retry(fn, options)` is the same function bound to the client, for when you would rather not add an import.
-
-Neither Prisma nor Drizzle surfaces a comparable typed retry signal, Prisma uses the stringly-typed `code: 'P2034'` on a generic `PrismaClientKnownRequestError`, and Drizzle bubbles up raw pg errors for you to grep SQL states from.
+`withRetry(fn, options?)` retries only when the thrown error carries `isRetryable === true`, and rethrows anything else immediately. Options: `maxAttempts` (default `3`), `baseDelay` in ms (default `50`), `maxDelay` (default `5000`), and an `onRetry(error, attempt)` hook. Backoff is exponential with jitter, capped at `maxDelay`. `db.$retry(fn, options)` is the same function bound to the client.
 
 ## Pipeline errors
 
@@ -195,13 +193,13 @@ try {
 }
 ```
 
-These particular features (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) never throw on PostgreSQL. **`TURBINE_E017` is not a "wrong engine" error in general**, though, and reading it that way will send you looking in the wrong place. It is the code for *this build cannot do that*, and Postgres raises it too:
+**`TURBINE_E017` is not a "wrong engine" error in general**, though. It is the code for *this build cannot do that*, and Postgres raises it too:
 
 - `relationLoadStrategy: 'batched'` on a **composite-key** relation, including a composite-key many-to-many junction. The batched loader keys on one column, so it refuses instead of loading a wrong set. Use the default join plan for those relations.
-- `relationLoadStrategy: 'batched'` where the **correlation key is missing from every parent row** (since 0.63). The batched loader stitches in JS, so it needs that column in the rows it was handed; if a projection removed it, the relation would come back empty rather than wrong-looking, which is the worse of the two. It refuses instead, naming the relation and the key. This should not be reachable, and if you hit it, it is a bug in Turbine worth reporting; `relationLoadStrategy: 'join'` on that query is the workaround in the meantime.
+- `relationLoadStrategy: 'batched'` where the **correlation key is missing from every parent row**. The batched loader stitches in JS, so it needs that column in the rows it was handed; without it the relation would come back silently empty, so it refuses instead, naming the relation and the key. This should not be reachable; if you hit it, report it, and use `relationLoadStrategy: 'join'` on that query meanwhile.
 - On [`turbine-orm/prisma-compat`](/migrate-from-prisma), a Prisma shape with no Turbine equivalent: a **negative `take`**, `skip` on a nested `include`, the [inclusive-cursor shapes](/migrate-from-prisma#cursor-pagination) that cannot be translated exactly, `limit` on `updateMany` / `deleteMany`, and `$extends` with a `query` or `result` component (or any component the adapter does not implement, refused at `$extends` time with the alternative named).
 
-Catch on `err.code === 'TURBINE_E017'` and read `err.feature`, which names what was refused, rather than inferring the cause from the engine. See [Database Engines](/engines) for the full capability matrix.
+Catch on `err.code === 'TURBINE_E017'` and read `err.feature`, which names what was refused. See [Database Engines](/engines) for the full capability matrix.
 
 The same error carries PowDB's **version-gated** capabilities, where the feature exists but the connected engine is too old for it. Those messages name the feature once and then give the floor and what the connection reported:
 
@@ -215,7 +213,7 @@ Some gates append one more sentence naming a workaround. `err.feature` is the la
 
 ## Read-only refusals
 
-`ReadOnlyError` (`TURBINE_E018`, since v0.35) is the routing signal for writes that hit a read-only database. Its `reason` field tells you which kind:
+`ReadOnlyError` (`TURBINE_E018`) is the routing signal for writes that hit a read-only database. Its `reason` field tells you which kind:
 
 - **`'snapshot'`**, the database itself is read-only: a PowDB `--readonly` snapshot server, an embedded `{ readonly: true }` open, or Turbine's own client-level `readonly: true` fail-fast flag. Nothing can write here; route the write to your primary.
 - **`'rbac'`**, the database is writable but this connection's role may not write (`permission denied: role …`). Re-authenticating with a writer role may suffice.
@@ -236,7 +234,7 @@ See [Read Replicas](/read-replicas) for the snapshot-serving pattern this suppor
 
 ## Safe error messages
 
-By default, `NotFoundError` messages include only the **keys** of the `where` clause, values are redacted so PII doesn't leak into logs (Sentry, Datadog, and friends).
+By default, `NotFoundError` messages include only the **keys** of the `where` clause; values are redacted so PII does not leak into logs (Sentry, Datadog).
 
 ```
 [turbine] findUniqueOrThrow on "users" found no record matching where: { id, email }

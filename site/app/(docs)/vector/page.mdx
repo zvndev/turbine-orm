@@ -32,7 +32,7 @@ const farthest = await db.items.findMany({
 });
 ```
 
-This compiles to `ORDER BY "embedding" <=> $1::vector ASC` with the vector bound as a parameter, never interpolated.
+This compiles to `ORDER BY "embedding" <=> $1::vector ASC`, with the vector bound as a parameter.
 
 ## Distance filter, keep rows within a threshold
 
@@ -45,7 +45,7 @@ const close = await db.items.findMany({
 // Generates: WHERE "embedding" <-> $1::vector < $2
 ```
 
-Distance filters accept `lt`, `lte`, `gt`, and `gte`. Both the vector and the threshold are bound as parameters (`$1::vector < $2`). A distance filter with no comparator throws `ValidationError`.
+Distance filters accept `lt`, `lte`, `gt`, and `gte`. A distance filter with no comparator throws `ValidationError`.
 
 Combine a filter with KNN ordering to retrieve the closest matches above a quality bar:
 

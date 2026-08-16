@@ -1,15 +1,15 @@
 export const metadata = {
   title: 'Migrations in Practice',
   description:
-    'The production migration workflow, what turbine migrate create --auto can and cannot do, and the sanctioned two-phase recipe for changing a populated column type in Turbine ORM.',
+    'The production migration workflow, what turbine migrate create --auto can and cannot do, and the two-phase recipe for changing a populated column type in Turbine ORM.',
   alternates: { canonical: '/migrate' },
 };
 
 # Migrations in Practice
 
-The [Schema & Migrations](/schema) page covers the basics: `.sql` files with `-- UP` and `-- DOWN` sections, tracked in `_turbine_migrations`. This page is the honest operational guide: the exact workflow, the real limits of auto-diffing, and the recipe for the one change that trips everyone up, altering a column's type when the table already has data.
+The [Schema & Migrations](/schema) page covers the basics: `.sql` files with `-- UP` and `-- DOWN` sections, tracked in `_turbine_migrations`. This page covers the production workflow, the real limits of auto-diffing, and the recipe for the change that trips everyone up: altering a column's type when the table already has data.
 
-> **The migration CLI is Postgres-only.** `turbine migrate`, `turbine push`, and `turbine generate` drive PostgreSQL. The other engines (SQLite, MySQL, SQL Server, PowDB) are **code-first and programmatic**: define the schema with `defineSchema`, derive metadata with `schemaDefToMetadata`, and manage DDL yourself. The typed query API is identical across engines; only the migration tooling stays on Postgres today. See [Database Engines](/engines).
+> **The migration CLI is Postgres-only.** `turbine migrate`, `turbine push`, and `turbine generate` drive PostgreSQL. The other engines (SQLite, MySQL, SQL Server, PowDB) are code-first and programmatic: define the schema with `defineSchema`, derive metadata with `schemaDefToMetadata`, and manage DDL yourself. The typed query API is identical across engines. See [Database Engines](/engines).
 
 ## The workflow
 
@@ -34,22 +34,22 @@ npx turbine migrate down --step 2
 npx turbine migrate status
 ```
 
-**`create --auto`** writes a starting-point migration from the diff between your `defineSchema` output and the live database. It is a draft; always read it before committing. **`create --from-diff`** does the same but flags destructive statements inline (see [below](#flagging-destructive-statements-with---from-diff)).
+**`create --auto`** writes a starting-point migration from the diff between your `defineSchema` output and the live database. It is a draft; read it before committing. **`create --from-diff`** does the same but flags destructive statements inline (see [below](#flagging-destructive-statements-with---from-diff)).
 
 **`up`** applies every pending migration in timestamp order. It is the interactive command: if any pending file contains a destructive statement, it stops and asks you to confirm before running anything (see [the destructive gate](#the-destructive-gate)).
 
-**`deploy`** is the production apply. It runs the same pending migrations as `up` but never prompts; it applies the files exactly as written. Use it in CI/CD and deployment hooks where there is no human to answer a prompt. Pair it with `--dry-run` in a pipeline step to preview.
+**`deploy`** runs the same pending migrations but never prompts; it applies the files exactly as written. Use it in CI/CD and deployment hooks. Pair it with `--dry-run` in a pipeline step to preview.
 
 ### What the runner guarantees
 
-- **Per-migration transactions.** Each migration runs inside its own `BEGIN` / `COMMIT`. If its SQL fails, that migration's transaction rolls back and nothing from it is recorded in `_turbine_migrations`.
-- **Stop on first error, partial apply.** When applying a batch of pending migrations, the runner processes them in order and **stops at the first failure**. Migrations that already succeeded stay applied and recorded; the failing one and everything after it do not run. So a failed `up` can leave you partway through the batch: fix the offending migration and re-run to continue from where it stopped.
-- **SHA-256 checksums.** Every applied migration's file is hashed. If an already-applied file changes on disk, `status` reports **drift** and `up` refuses to run until you reconcile (or pass `--allow-drift` when you are intentionally rewriting history).
-- **Advisory lock.** The runner takes a per-database Postgres advisory lock before applying, so two concurrent `migrate up` / `deploy` runs cannot race; the second exits cleanly instead of double-applying.
+- **Per-migration transactions.** Each migration runs inside its own `BEGIN` / `COMMIT`. If its SQL fails, that migration rolls back and nothing from it is recorded in `_turbine_migrations`.
+- **Stop on first error, partial apply.** A batch is processed in order and stops at the first failure. Migrations that already succeeded stay applied and recorded; the failing one and everything after it do not run. Fix the offending migration and re-run to continue.
+- **SHA-256 checksums.** Every applied migration's file is hashed. If an already-applied file changes on disk, `status` reports **drift** and `up` refuses to run until you reconcile (or pass `--allow-drift` when intentionally rewriting history).
+- **Advisory lock.** The runner takes a per-database Postgres advisory lock before applying, so two concurrent runs cannot race; the second exits cleanly instead of double-applying.
 
 ### No-transaction migrations (`CREATE INDEX CONCURRENTLY`)
 
-Some statements cannot run inside a transaction. `CREATE INDEX CONCURRENTLY` is the common one: it builds without holding a write lock, but Postgres forbids it in any transaction block, including the implicit one that wraps a multi-statement query. Put `-- turbine:no-transaction` in the migration's header (before `-- UP`) and the runner applies that file **without** `BEGIN` / `COMMIT`, executing one statement per call:
+Some statements cannot run inside a transaction. `CREATE INDEX CONCURRENTLY` is the common one: it builds without holding a write lock, but Postgres forbids it in any transaction block. Put `-- turbine:no-transaction` in the migration's header (before `-- UP`) and the runner applies that file **without** `BEGIN` / `COMMIT`, executing one statement per call:
 
 ```sql
 -- Migration: add_relation_fk_indexes
@@ -64,18 +64,18 @@ DROP INDEX CONCURRENTLY IF EXISTS "idx_comments_post_id";
 
 This is exactly what `turbine doctor --fix` writes. Two things to know:
 
-- **Every statement must be idempotent.** With no transaction, a mid-file failure leaves earlier statements applied while the migration stays **unrecorded**, so a rerun re-executes the whole file. `IF NOT EXISTS` / `IF EXISTS` keep each statement safe to repeat.
+- **Every statement must be idempotent.** With no transaction, a mid-file failure leaves earlier statements applied while the migration stays unrecorded, so a rerun re-executes the whole file. `IF NOT EXISTS` / `IF EXISTS` keep each statement safe to repeat.
 - **A failed concurrent build leaves an INVALID index.** On rerun, `IF NOT EXISTS` skips that corpse, so it never rebuilds. Fix it with `DROP INDEX CONCURRENTLY`, then rerun; `turbine doctor` lists invalid indexes for you.
 
-`migrate up` prints a loud notice whenever it runs a no-transaction file, and `CREATE INDEX CONCURRENTLY` can wait a while on other open transactions (that is normal, not a hang). The advisory lock and checksum checks are unchanged.
+`migrate up` prints a notice whenever it runs a no-transaction file. `CREATE INDEX CONCURRENTLY` can wait a while on other open transactions; that is normal, not a hang. The advisory lock and checksum checks apply unchanged.
 
 ### Out-of-order migrations
 
-Turbine tracks migrations by name, not by a monotonic sequence number, so there is no strict ordering barrier: **any pending migration applies, even if its timestamp predates one already applied.** This is what lets two branches merge migrations that were authored in parallel: the older-timestamped file that landed second is simply pending, and the next `up` / `deploy` applies it. When the runner applies a migration whose timestamp is older than the most recently applied one, it prints a one-line warning so the out-of-order apply is visible. If your team needs strict linear history, enforce it in review (rebase the timestamp forward) rather than expecting the runner to refuse.
+Turbine tracks migrations by name, not by a monotonic sequence number, so **any pending migration applies, even if its timestamp predates one already applied.** This lets two branches merge migrations authored in parallel: the older-timestamped file that landed second is simply pending, and the next `up` / `deploy` applies it, printing a one-line warning so the out-of-order apply is visible. If your team needs strict linear history, enforce it in review (rebase the timestamp forward) rather than expecting the runner to refuse.
 
 ### Rolling back additive migrations
 
-`migrate down` runs a migration's `-- DOWN` section, and the reverse of an *additive* change is a destructive one. A migration that added a column has a `-- DOWN` that **drops** it, so rolling it back trips the [destructive gate](#the-destructive-gate) exactly like any other `DROP COLUMN`. This is correct by design, not a bug: `down` will refuse and ask for the typed confirmation. In an unattended rollback script (CI), pass `--allow-destructive` so `down` does not stall waiting for a prompt:
+`migrate down` runs a migration's `-- DOWN` section, and the reverse of an additive change is destructive: a migration that added a column has a `-- DOWN` that **drops** it, so rolling it back trips the [destructive gate](#the-destructive-gate) like any other `DROP COLUMN`. In an unattended rollback script (CI), pass `--allow-destructive` so `down` does not stall waiting for a prompt:
 
 ```bash
 npx turbine migrate down --allow-destructive
@@ -83,20 +83,20 @@ npx turbine migrate down --allow-destructive
 
 ## What `--auto` can and cannot do
 
-`create --auto` is a diff tool, not a schema-migration planner. It compares columns and types and emits the obvious DDL, but it has no notion of intent or history. Know its blind spots before you trust a generated file:
+`create --auto` is a diff tool, not a schema-migration planner. It compares columns and types and emits the obvious DDL; it has no notion of intent or history. Its blind spots:
 
-- **Type changes get a blind cast.** A changed column type emits `ALTER COLUMN "col" TYPE <newtype> USING "col"::<newtype>`. That `USING` cast is unconditional, with no transformation hook. It works for widening casts (`int` to `bigint`, `text` to `varchar`) but **fails at apply time on data the cast cannot handle** (for example `text` to `integer` on non-numeric rows). For anything non-trivial, use the [two-phase recipe](#changing-a-column-type-with-existing-data) instead.
-- **Renames are not detected.** The differ has no way to know `full_name` was renamed from `name`. It sees one column gone and one added, so it produces an **add-new plus orphan-old**, and **the data does not move**. If you need a rename, write it by hand as `ALTER TABLE ... RENAME COLUMN`.
-- **`SET NOT NULL` has no backfill.** Making a nullable column `notNull` emits a bare `ALTER COLUMN "col" SET NOT NULL`. On a populated table with any `NULL` in that column, apply **fails**. Backfill the column first (see below).
-- **`varchar` length changes are not detected.** The differ compares the underlying type name, not the length, so `varchar(50)` to `varchar(100)` produces no statement. Change the length by hand if you need it enforced.
-- **Table and column drops are emitted flagged as destructive.** A table or column present in the database but absent from your schema is surfaced in the diff and in `migrate status`. `create --auto` and `create --from-diff` write the `DROP` into the migration **flagged inline as destructive** (a destructive-only diff produces a flagged migration, not a "nothing to migrate"), and the [destructive gate](#the-destructive-gate) still refuses it until you confirm or pass `--allow-destructive`. Review every flagged line before applying: dropping data is a deliberate act. `schemaDiff()` also returns these in `drop` / the `alter` plan for programmatic callers.
+- **Type changes get a blind cast.** A changed column type emits `ALTER COLUMN "col" TYPE <newtype> USING "col"::<newtype>`. The `USING` cast is unconditional, with no transformation hook. It works for widening casts (`int` to `bigint`, `text` to `varchar`) but **fails at apply time on data the cast cannot handle** (`text` to `integer` on non-numeric rows). For anything non-trivial, use the [two-phase recipe](#changing-a-column-type-with-existing-data).
+- **Renames are not detected.** The differ cannot know `full_name` was renamed from `name`. It sees one column gone and one added, so it produces an add-new plus orphan-old, and **the data does not move**. Write renames by hand as `ALTER TABLE ... RENAME COLUMN`.
+- **`SET NOT NULL` has no backfill.** Making a nullable column `notNull` emits a bare `ALTER COLUMN "col" SET NOT NULL`, which fails on a populated table with any `NULL` in that column. Backfill first (see below).
+- **`varchar` length changes are not detected.** The differ compares the type name, not the length, so `varchar(50)` to `varchar(100)` produces no statement. Change the length by hand.
+- **Drops are emitted flagged as destructive.** A table or column present in the database but absent from your schema produces a `DROP` flagged inline as destructive (a destructive-only diff produces a flagged migration, not "nothing to migrate"), and the [destructive gate](#the-destructive-gate) still refuses it until you confirm or pass `--allow-destructive`. `schemaDiff()` returns these in `drop` / the `alter` plan for programmatic callers.
 
 ## Flagging destructive statements with `--from-diff`
 
-`--from-diff` derives the same forward and reverse SQL as `--auto` (the diff goes into `-- UP` and the reverse into `-- DOWN`, with a clearly commented "irreversible, write manually" placeholder when no reverse can be derived), but it also annotates anything that destroys data:
+`--from-diff` derives the same forward and reverse SQL as `--auto` (the diff into `-- UP`, the reverse into `-- DOWN`, with a commented "irreversible, write manually" placeholder when no reverse can be derived), and annotates anything that destroys data:
 
 - A lossy `ALTER COLUMN … TYPE` in UP, or a `DROP TABLE` / `DROP COLUMN` reverse in DOWN, is flagged inline with loud comments and a file-level banner.
-- The statement is left **intact**, so `migrate up` still refuses it by default until you confirm interactively or pass `--allow-destructive` (see [the destructive gate](#the-destructive-gate)).
+- The statement is left **intact**, so `migrate up` still refuses it by default until you confirm or pass `--allow-destructive`.
 - Diff warnings the differ won't apply automatically (e.g. enum value removals) are surfaced as `-- NOTE:` comments.
 
 ```bash
@@ -126,7 +126,7 @@ WHERE "id" IN (
 );
 ```
 
-**Verify** before you tighten anything. Confirm every row converted and the values are what you expect:
+**Verify** before you tighten anything:
 
 ```sql
 SELECT count(*) FROM "orders" WHERE "total_cents" IS NULL;   -- expect 0
@@ -146,15 +146,13 @@ ALTER TABLE "orders" RENAME COLUMN "total_cents" TO "total";
 
 <Callout type="warning" title="Do not write your own BEGIN/COMMIT in a migration">
   Since 0.66, a migration file whose body contains `BEGIN`, `START TRANSACTION`,
-  `COMMIT`, `ROLLBACK` or `ABORT` is refused before anything runs. Earlier
-  versions accepted it, and that was the bug: the runner wraps each file in one
-  transaction, so an embedded `COMMIT` ended the runner's wrapper mid-file.
-  Everything before it became durable, everything after ran unprotected, and the
-  migration was recorded nowhere, so rerunning failed forever on "already
-  exists". If a migration genuinely cannot run inside a transaction (`CREATE
-  INDEX CONCURRENTLY`), put `-- turbine:no-transaction` in the file header and
-  manage it yourself. `ROLLBACK TO SAVEPOINT` is still allowed: it leaves the
-  wrapping transaction open.
+  `COMMIT`, `ROLLBACK` or `ABORT` is refused before anything runs. The runner
+  wraps each file in one transaction, so an embedded `COMMIT` would end that
+  wrapper mid-file: earlier statements become durable, later ones run
+  unprotected, and the migration is recorded nowhere. If a migration genuinely
+  cannot run inside a transaction (`CREATE INDEX CONCURRENTLY`), use
+  `-- turbine:no-transaction`. `ROLLBACK TO SAVEPOINT` is still allowed: it
+  leaves the wrapping transaction open.
 </Callout>
 
 **Drop the old column later**, in a separate migration deployed after the new column has been serving reads and writes long enough to be sure nothing depends on the old one:
@@ -164,27 +162,21 @@ ALTER TABLE "orders" RENAME COLUMN "total_cents" TO "total";
 ALTER TABLE "orders" DROP COLUMN "total_old";
 ```
 
-Keeping the drop in its own later migration means Phase 2 stays instantly reversible if you find a problem: you have not lost the original data until Migration C runs.
+Keeping the drop in its own later migration means Phase 2 stays instantly reversible: you have not lost the original data until Migration C runs.
 
 ### Scaffold it with `--recipe backfill`
 
-Writing that pattern by hand is error-prone, so 0.36 adds a scaffold:
+0.36 adds a scaffold for that pattern:
 
 ```bash
 npx turbine migrate create widen_order_total --recipe backfill
 ```
 
-This generates a migration pre-filled with the expand/contract skeleton (the nullable add, a batched `UPDATE` backfill block, the `SET NOT NULL`, and commented swap/drop steps) with placeholders for you to fill in the table, columns, and conversion expression. It is a starting template, not a turnkey migration: review and adapt every placeholder before applying.
+It generates a migration pre-filled with the expand/contract skeleton (the nullable add, a batched `UPDATE` backfill block, the `SET NOT NULL`, and commented swap/drop steps) with placeholders for the table, columns, and conversion expression. Review and adapt every placeholder before applying.
 
 ## The destructive gate
 
-Turbine treats data-destroying DDL (`DROP TABLE`, `DROP COLUMN`, and similar) as opt-in, never automatic.
-
-- **`migrate up`** scans every pending migration for destructive statements. If it finds any, it stops, prints exactly which statements in which files are destructive, and asks for a two-step typed confirmation (the literal phrase `destroy my data`, then `yes`) before applying anything. Decline and nothing runs; no data is touched. You can skip the prompt with `--allow-destructive` when you know what you are doing.
-- **`migrate deploy`** applies files exactly as written, with no prompt; it is the non-interactive production path. Before it runs anything destructive it prints a one-line NOTICE listing the data-destroying statements, then proceeds. That is by design: production apply is deterministic and unattended, so the review happens when the migration is authored and merged, not at deploy time.
-- **`push`**: as of 0.36, `turbine push` runs the same destructive scanner over the statements it is about to apply. Destructive operations require the same typed confirmation as `migrate up` (or `--allow-destructive`); without it, `push` refuses and applies nothing. `push` is still the fast **development** path that diffs `defineSchema` against the live database and applies the difference directly; for production, author real migrations and `deploy` them.
-
-The ceremony differs by surface. All three run the same scanner; what changes is what happens when they find something destructive:
+Turbine treats data-destroying DDL (`DROP TABLE`, `DROP COLUMN`, and similar) as opt-in, never automatic. All three commands run the same scanner; what changes is what happens on a hit:
 
 | Command | On a destructive statement | Escape hatch |
 |---|---|---|
@@ -192,7 +184,7 @@ The ceremony differs by surface. All three run the same scanner; what changes is
 | `migrate deploy` | Proceeds by design (unattended), after printing a one-line NOTICE of what it will run | none needed; it always proceeds |
 | `push` | Refuses, prints the report, asks for the same typed two-step confirm | `--allow-destructive` |
 
-`deploy` is the only surface that runs destructive SQL without confirmation. That is deliberate: it is for reviewed, merged history applied in CI, where there is no human to answer a prompt.
+`migrate up` and `push` refuse and ask for the typed confirmation; decline and nothing runs. `deploy` is the only surface that proceeds without one, because it applies reviewed, merged history in CI where no human can answer a prompt: the review happens when the migration is authored, not at deploy time. `push` (destructive-scanned since 0.36) remains the fast **development** path, diffing `defineSchema` against the live database and applying the difference directly; for production, author real migrations and `deploy` them.
 
 ## See also
 

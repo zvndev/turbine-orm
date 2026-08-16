@@ -6,38 +6,28 @@ import { HERO_TAGLINE } from '../lib/tagline';
 import { TURBINE_MINOR } from '../lib/version';
 
 export const metadata: Metadata = {
-  title: 'Turbine ORM: the Postgres ORM that assumes your database has real data in it.',
+  title: 'Turbine ORM: a Postgres ORM written from scratch. One dependency.',
   description:
-    'A database UI that is read-only by default, PII tagged in the schema and enforced in the SQL, errors that carry keys and never values, destructive migrations that need consent, and offline missing-index advice. One runtime dependency (pg), no WASM engine.',
+    'Typed queries compiled straight to SQL: no query engine, no WASM, one runtime dependency (pg). Nested relations in one statement, an 11-tool read-only MCP server for coding agents, offline index advice, and migration guards. MIT.',
 };
 
-const heroCode = `export default defineSchema({
-  users: {
-    id:    { type: 'serial', primaryKey: true },
-    name:  { type: 'text', notNull: true },
-    email: { type: 'text', notNull: true, pii: true },
-    //                                    ^^^^^^^^^
+const heroCode = `const users = await db.users.findMany({
+  where: { orgId: 1 },
+  with: {
+    posts: {
+      with: { comments: { with: { author: true } } },
+      orderBy: { createdAt: 'desc' },
+      limit: 5,
+    },
   },
 });
 
-// That one flag changes what the SQL is allowed to say:
-//
-//  1. the column is left out of every default projection,
-//     on every engine: top-level rows, 'with' subqueries,
-//     batched loaders, write returns. It is omitted from
-//     the emitted SQL, not filtered out afterwards.
-//  2. it is refused as a groupBy key and as a _min / _max
-//     target, because both hand back a stored cell.
-//  3. Studio renders it redacted, and refuses to filter,
-//     sort or page on it.
+// One SQL statement, any depth, typed end to end:
+users[0].posts[0].comments[0].author.name
+//                                  ^ autocompletes
 
-import { UNSAFE } from 'turbine-orm';
-
-await db.users.findMany();                       // no email
-await db.users.findMany({ includePii: UNSAFE }); // email
-// includePii: true throws. A privilege option cannot be
-// enabled by a value JSON.parse can produce, or a spread
-// request body would unlock it.`;
+// Everything between your code and Postgres:
+//   "dependencies": { "pg": "^8.13.1" }`;
 
 const sqlCode = `SELECT "users".*,
   (SELECT COALESCE(json_agg(json_build_object(
@@ -57,39 +47,86 @@ const sqlCode = `SELECT "users".*,
 FROM "users"
 WHERE "users"."org_id" = $1`;
 
+const pillars = [
+  {
+    title: 'Written from scratch, on pg alone',
+    description:
+      'No query engine, no WASM compiler, no query-builder library underneath. Query compilation is plain string building into a bounded LRU of SQL templates, and dependencies is one line: pg. The optional engines (SQLite, MySQL, SQL Server, PowDB) are peer dependencies or Node builtins you install only if you use them.',
+    stat: '1',
+    statLabel: 'runtime dependency',
+  },
+  {
+    title: 'Nested relations, one statement',
+    description:
+      'A with clause compiles to correlated json_agg subqueries, so users with posts with comments is one round trip. The result is typed end to end at any depth, with no manual annotation. Four load strategies produce identical rows, held to byte-identical output by a differential fuzz suite.',
+    stat: '1',
+    statLabel: 'query, any depth',
+  },
+  {
+    title: 'Close to hand-written SQL',
+    description:
+      'In the last published run, Turbine ran at 1.08x a hand-written pg control by geometric mean, where Drizzle ran at 1.47x and Prisma at 1.81x. Losses are published with the wins: Drizzle takes streaming, and the benchmarks page states the noise floor next to the numbers.',
+    stat: '1.08x',
+    statLabel: 'vs raw pg (last run)',
+  },
+  {
+    title: 'Small enough for the edge',
+    description:
+      'The main entry is held under 85 kB brotli as an import graph with pg external, the edge entry under 68 kB, enforced by size-limit in CI. One import swap runs the same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase. No separate serverless build, no WASM bundle in your cold start.',
+    stat: '85 kB',
+    statLabel: 'CI-enforced ceiling',
+  },
+  {
+    title: 'MIT, no cloud tier',
+    description:
+      'Studio, doctor, the MCP server, observability: everything named on this site is in the npm package. No paid gateway, no telemetry, no account. All SQL generation routes through a documented Dialect contract, so if you need an engine Turbine does not ship, you extend the seam instead of forking the core.',
+    stat: 'MIT',
+    statLabel: 'everything in the box',
+  },
+];
+
+const agentTools = [
+  ['relation_graph', 'The whole relation graph, or one table’s subtree: cardinality, keys, junction tables.'],
+  ['find_join_path', 'How to get from comments to orgs: the relation chain and the with clause to write.'],
+  ['table_stats', 'Planner row estimate, on-disk size, indexes. Reports analyzed: false instead of guessing 0.'],
+  ['explain_query', 'EXPLAIN for a schema-validated findMany plan. No free-form SQL input exists.'],
+  ['explain_error', 'A Turbine error code mapped to cause, fix, and docs link.'],
+  ['sample_rows', 'Up to 50 rows, PII-tagged columns redacted before they reach the model.'],
+];
+
 const safetyFeatures = [
   {
     title: 'The database UI is read-only by default',
     description:
-      'npx turbine studio binds loopback, authenticates with a 192-bit per-process token, and runs every read inside BEGIN READ ONLY. In the default mode the write endpoints do not exist in the router at all, so there is nothing to bypass. There has been no raw-SQL surface since v0.19: queries are composed in the ORM builder and validated identifier by identifier. --write opts one launch in to edits, each addressed by its full primary key rather than a predicate. Try it with no database: npx turbine-orm@latest studio --demo boots a seeded in-memory sample DB with a live Read-only / Show PII / Write switcher.',
+      'npx turbine studio binds loopback, authenticates with a per-process token, and runs every read inside BEGIN READ ONLY. Without --write, the write endpoints do not exist in the router, so there is nothing to bypass. There is no raw-SQL surface: queries are composed in a builder validated identifier by identifier. Try it with no database: npx turbine-orm@latest studio --demo.',
     stat: '0',
     statLabel: 'write endpoints by default',
   },
   {
-    title: 'PII is a schema contract the SQL enforces',
+    title: 'PII is enforced in the emitted SQL',
     description:
-      'Tag a column pii: true and it is excluded from every default projection on every engine: top-level rows, with subqueries, batched loaders, write returns, and Studio. It is also refused as a groupBy key and as a _min / _max target, because both hand back a stored cell. includePii: UNSAFE unlocks it explicitly, per read, and the symbol is the only value that works: a request body spread into query args cannot escalate, because JSON.parse cannot produce a symbol. A schema with no tagged column emits byte-identical SQL.',
+      'Tag a column pii: true and it is excluded from every default projection at the SQL level: RETURNING "id", "name" instead of RETURNING *. It is also refused as a groupBy key and a _min / _max target. Reading it back takes includePii: UNSAFE, a symbol, so a request body spread into query args cannot unlock it: JSON.parse cannot produce a symbol.',
     stat: 'pii: true',
     statLabel: 'enforced in the projection',
   },
   {
     title: 'Errors carry keys, never values',
     description:
-      'A NotFoundError says where: { id, email }. A UniqueConstraintError names the column that conflicted. Neither prints the row. That means the error is safe to forward straight to Sentry or Datadog with no scrubbing rule in front of it, and the full where object is still available as err.where in code.',
+      'A NotFoundError says where: { id, email } without printing the email. A UniqueConstraintError names the column that conflicted. Errors are safe to forward to your tracker with no scrubbing rule, and the full where object stays available as err.where in code.',
     stat: 'keys',
     statLabel: 'not values',
   },
   {
     title: 'Destructive migrations need consent',
     description:
-      'migrate up, migrate down and push scan for DROP TABLE, DROP COLUMN, TRUNCATE, unqualified DELETE and UPDATE, and ALTER COLUMN ... TYPE, print an itemized report, and refuse to run. Interactively you type "destroy my data" and then yes; in CI you pass --allow-destructive. A refused batch applies nothing. Migrations are real SQL, checksummed with SHA-256 and serialized behind pg_try_advisory_lock().',
+      'migrate up, migrate down and push scan for DROP TABLE, DROP COLUMN, TRUNCATE, unqualified DELETE and UPDATE, and ALTER COLUMN ... TYPE, print an itemized report, and refuse to run. Interactively you type "destroy my data", then yes; in CI you pass --allow-destructive. A refused batch applies nothing. Migrations are SQL, checksummed with SHA-256.',
     stat: 'SHA-256',
     statLabel: 'checksums + refusal',
   },
   {
-    title: 'The review a DBA would have given you, offline',
+    title: 'Index advice, offline',
     description:
-      'npx turbine doctor derives every column set the relation subqueries probe and reports the ones with no covering index, with a cost tier per finding. --fix writes the migration. In dev the first query over an unindexed FK logs the exact CREATE INDEX. No cloud service, no telemetry, no account: it reads your introspected schema.',
+      'Turbine loads relations as correlated subqueries, so an unindexed FK is a scan per parent row. npx turbine doctor reports every relation column set with no covering index, with a cost tier per finding, and --fix writes the migration. It reads your schema and your database’s own statistics: no cloud service, no account.',
     stat: 'doctor',
     statLabel: 'no account required',
   },
@@ -106,7 +143,7 @@ const postgresFeatures = [
   {
     title: 'Realtime (LISTEN / NOTIFY)',
     description:
-      'Postgres pub/sub with db.$listen(channel, handler) and db.$notify(channel, payload). No broker, no extra service, your database is the message bus.',
+      'Postgres pub/sub with db.$listen(channel, handler) and db.$notify(channel, payload). No broker, no extra service: your database is the message bus.',
     href: '/realtime',
     cta: 'Realtime docs',
   },
@@ -120,89 +157,82 @@ const postgresFeatures = [
   {
     title: 'Full-text search',
     description:
-      "where: { body: { search: 'postgres & orm' } } compiles to to_tsvector @@ to_tsquery with the query bound as a parameter. Pick any text search config. No extension, no extra service.",
+      "where: { body: { search: 'postgres & orm' } } compiles to to_tsvector @@ to_tsquery with the query bound as a parameter. Pick any text search config.",
     href: '/queries#full-text-search',
     cta: 'Operator docs',
   },
   {
     title: 'Many-to-many, auto-detected',
     description:
-      'Pure junction tables are detected at generate time, db.posts.findMany({ with: { tags: true } }) just works. Self-relations too: a self-referencing FK gives you parent + children.',
+      'Pure junction tables are detected at generate time, so db.posts.findMany({ with: { tags: true } }) needs no declaration. A self-referencing FK gives you parent and children.',
     href: '/relations',
     cta: 'Relations docs',
   },
   {
-    title: 'Observability, in the box',
+    title: 'Real pipelining',
     description:
-      'db.$on("query") taps every query with PII-redacted params. db.$observe() flushes p50/p95/p99 aggregates to Postgres, and npx turbine observe is the dashboard. No agent, no SaaS.',
-    href: '/observability',
-    cta: 'Observability docs',
+      'db.pipeline(...) uses the extended-query protocol (Parse/Bind/Execute/Sync) to put N queries in one TCP flush. Wire pipelining, not a batch transaction. Write builders batch too.',
+    href: '/transactions',
+    cta: 'Pipeline docs',
   },
 ];
 
 const capabilities = [
   {
-    title: 'One dependency. No WASM.',
+    title: 'Streaming with a true cursor',
     description:
-      'Turbine declares pg and nothing else, no WASM at all. Prisma 7 dropped its Rust engine but its client still bundles a TS/WASM query compiler (~1.6 MB) plus a required driver adapter. The main entry is held under 85 KB brotli as an import graph with pg external, under 68 KB on the edge, enforced by size-limit in CI rather than quoted from a past measurement. That is the client footprint your bundler sees, not the size of the dual ESM+CJS build on disk, which is larger.',
-    href: '/benchmarks',
-    cta: 'Benchmarks',
+      'findManyStream iterates any result set with constant memory over DECLARE CURSOR, on a dedicated connection. Any orderBy, safe early break, nested with per batch.',
+    href: '/queries#findmanystream',
+    cta: 'Streaming docs',
   },
   {
-    title: 'turbine doctor: the missing-index advisor',
+    title: 'Global filters and the UNSAFE symbol',
     description:
-      "Turbine loads relations as correlated subqueries, so an unindexed foreign key becomes a full scan per parent row. npx turbine doctor finds every missing FK index before it hits production, and turbine doctor --fix writes the add-index migration for you. In dev, the first query over an unindexed FK also logs the exact CREATE INDEX. The check your DBA would have asked for, run for you.",
-    href: '/cli#turbine-doctor',
-    cta: 'Doctor docs',
+      'Soft delete and multi-tenancy as client config: a WhereClause AND-merged into every query on a table. Opting out takes a symbol JSON.parse cannot produce, so a spread request body cannot disable tenancy.',
+    href: '/global-filters',
+    cta: 'Global filters docs',
   },
   {
     title: 'Multi-engine, one typed API',
     description:
-      'Postgres is the default and the primary target, but the same findMany / with / where surface runs on SQLite, MySQL 8, SQL Server, and PowDB through subpath exports (turbine-orm/sqlite, /mysql, /mssql, /powdb). npm install turbine-orm still pulls exactly one runtime dependency; each engine driver is an optional peer you install only if you use it.',
+      'The same findMany / with / where surface runs on SQLite (node:sqlite, zero installs), MySQL 8, SQL Server, and PowDB through subpath exports. Postgres-only features throw a typed error instead of degrading silently.',
     href: '/engines',
     cta: 'Engines docs',
   },
   {
     title: 'explain() without dropping to raw',
     description:
-      'Every table accessor has explain(args): it compiles the exact statement findMany(args) would run and returns the engine plan as string[] lines. Verify the query the ORM actually emits hits the index you expect, mapped to EXPLAIN / EXPLAIN QUERY PLAN per engine.',
+      'Every table accessor has explain(args): it compiles the exact statement findMany(args) would run and returns the engine plan. Verify the query the ORM emits hits the index you expect.',
     href: '/queries#explain',
     cta: 'explain() docs',
   },
   {
-    title: 'Edge-native, one import swap',
+    title: 'Observability, in the box',
     description:
-      'turbineHttp(pool, SCHEMA) gives you the same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase. No WASM bundle to ship, no adapter package to install, no separate serverless build step. ~64 KB brotli as an import graph with the driver external.',
-    href: '/serverless',
-    cta: 'Serverless docs',
+      'db.$on("query") taps every query with params redacted by default. db.$observe() flushes p50/p95/p99 aggregates to Postgres, and npx turbine observe is the dashboard. No agent, no SaaS.',
+    href: '/observability',
+    cta: 'Observability docs',
   },
   {
-    title: 'Real pipelining, not a batch transaction',
+    title: 'Typed errors with stable codes',
     description:
-      'db.pipeline(...) uses the Postgres extended-query protocol (Parse/Bind/Execute/Sync) to put N independent queries in one TCP flush. node-postgres does not expose pipelining in its pure-JS core, and Drizzle db.batch() is an implicit transaction on specific drivers rather than independent-query pipelining. Write builders batch too, so a create + createMany + update can go out as one atomic $transaction([...]).',
-    href: '/transactions',
-    cta: 'Pipeline docs',
+      'Every error carries a code (TURBINE_E001..E018) and a docs link. Retryable failures expose isRetryable: true as a typed const, so a retry loop is compiler-checked.',
+    href: '/errors',
+    cta: 'Error reference',
   },
   {
     title: 'Coming from Prisma? Keep your call sites.',
     description:
-      'turbine migrate-from-prisma reads your schema.prisma and emits a typed mapping plus a migration report. Then createPrismaCompatClient wraps a TurbineClient in a PrismaClient-shaped surface: prisma.user.findMany({ include }) keeps working unchanged, so a port is measured in hours rather than in call sites. It is a runtime shim, not a codemod, so it never edits your source and you can move modules to the native API on your own schedule.',
+      'turbine migrate-from-prisma reads schema.prisma and emits a typed mapping. createPrismaCompatClient then wraps Turbine in a PrismaClient-shaped surface, so prisma.user.findMany({ include }) keeps working while you port module by module.',
     href: '/migrate-from-prisma',
     cta: 'Prisma migration guide',
   },
   {
     title: 'Coming from Drizzle?',
     description:
-      'The full API mapping, the schema translation, and the behavioural differences worth auditing before you cut over: the empty-where guard, relation declaration, and where the two query builders disagree about defaults.',
+      'The API mapping, the schema translation, and the behavioural differences worth auditing before you cut over: the empty-where guard, relation declaration, and differing defaults.',
     href: '/migrate-from-drizzle',
     cta: 'Drizzle migration guide',
-  },
-  {
-    title: 'MCP server for AI agents',
-    description:
-      'turbine mcp exposes your database to Claude Code, Cursor, or any MCP client over JSON-RPC stdio. Read-only tools only, no free-form SQL: schema overview, table detail, migrate status, doctor report, EXPLAIN, and sample rows, all inside BEGIN READ ONLY. The same safety stance as Studio.',
-    href: '/mcp',
-    cta: 'MCP docs',
   },
 ];
 
@@ -217,7 +247,7 @@ export default async function Home() {
     '@type': 'SoftwareApplication',
     name: 'Turbine ORM',
     description:
-      'The Postgres ORM that assumes your database has real data in it: a read-only-by-default Studio (writes are an explicit --write opt-in), PII tagged in the schema and enforced in the emitted SQL, error messages that carry keys and never values, destructive migrations that require consent, and offline missing-index advice from turbine doctor. One runtime dependency with no WASM engine. Postgres-maximalist underneath: pgvector search, RLS session context, LISTEN/NOTIFY, and full-text as typed first-class API.',
+      'A Postgres ORM written from scratch with one runtime dependency (pg). Typed queries compiled straight to SQL, nested relations in one statement, an 11-tool read-only MCP server for coding agents, offline index advice from turbine doctor, and destructive-migration guards. Runs on the edge under a CI-enforced size budget. MIT.',
     applicationCategory: 'DeveloperApplication',
     operatingSystem: 'Any',
     url: 'https://turbineorm.dev',
@@ -250,19 +280,19 @@ export default async function Home() {
           </Link>
 
           <h1 className="hero-title animate-fade-in-up delay-1">
-            <span className="text-white">The Postgres ORM that assumes your database</span>
+            <span className="text-white">A Postgres ORM written from scratch.</span>
             <br />
-            <span className="amber">has real data in it.</span>
+            <span className="amber">One dependency.</span>
           </h1>
 
           <p className="hero-subtitle animate-fade-in-up delay-2">
-            Most query layers are designed for the shape of a laptop database:
-            empty, disposable, nobody&apos;s. Turbine is designed for the same
-            schema six months later. The database UI is read-only until you say
-            otherwise. Columns you tag as personal data stay out of results,
-            logs, and aggregates. Anything that can lose data makes you say so
-            out loud. Underneath, it is Postgres-maximalist: typed pgvector, RLS
-            sessions, and realtime are all first-class.
+            Turbine compiles typed queries straight to SQL: no query engine, no
+            WASM, nothing between your code and Postgres but <code>pg</code>.
+            Nested relations resolve in one statement. Small enough for a
+            Worker, close enough to hand-written SQL that the benchmarks
+            publish the control arm, and built so a coding agent can explore
+            your schema through read-only tools instead of guessing. MIT, with
+            the engine seam documented if you want to fork it.
           </p>
 
           <div className="animate-fade-in-up delay-3">
@@ -286,7 +316,7 @@ export default async function Home() {
             <Link href="/why-turbine" style={{ color: 'var(--accent)' }}>
               Why Turbine
             </Link>{' '}
-            puts the three side by side, feature for feature.
+            makes the case, and says what is not a reason to switch.
           </p>
 
           <div className="hero-code-window animate-slide-in-right delay-5 w-full">
@@ -304,12 +334,49 @@ export default async function Home() {
         </div>
       </section>
 
-      {/* ========== SAFETY DEFAULTS (the headline) ========== */}
+      {/* ========== THE PILLARS ========== */}
       <section className="features-section">
         <div className="animate-fade-in-up">
-          <p className="section-label">Designed for a database with real rows in it</p>
+          <p className="section-label">What you are actually installing</p>
+          <h2 className="section-title">Five claims, each checkable.</h2>
+          <p
+            style={{
+              maxWidth: '48rem',
+              marginTop: '0.75rem',
+              color: 'var(--text-secondary)',
+              fontSize: '0.95rem',
+              lineHeight: 1.7,
+            }}
+          >
+            Every number here traces to a source you can run: the benchmark
+            results file, the size-limit config in CI, or the package&apos;s own{' '}
+            <code>dependencies</code> field. Nothing on this page is a mood.
+          </p>
+        </div>
+
+        <div className="feature-grid">
+          {pillars.map((f, i) => (
+            <div
+              key={f.title}
+              className={`feature-card animate-fade-in-up delay-${i + 1}`}
+            >
+              <div className="feature-card-stat">
+                <span className="feature-stat-value">{f.stat}</span>
+                <span className="feature-stat-label">{f.statLabel}</span>
+              </div>
+              <h3>{f.title}</h3>
+              <p>{f.description}</p>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* ========== AGENTS ========== */}
+      <section className="features-section">
+        <div className="animate-fade-in-up">
+          <p className="section-label">Point an agent at it</p>
           <h2 className="section-title">
-            Five defaults, one assumption.
+            Typed tools for agents, not a SQL prompt.
           </h2>
           <p
             style={{
@@ -320,18 +387,67 @@ export default async function Home() {
               lineHeight: 1.7,
             }}
           >
-            Each of these is checkable, so here is the checkable version, as of
-            July 2026. No other TypeScript ORM ships a studio that is read-only
-            by default or that redacts PII: Prisma Studio is open source
-            (@prisma/studio-core is Apache-2.0) but offers no read-only mode,
-            its read-only request has been open since February 2021, Drizzle
-            Studio is not open source and self-hosting runs through the paid
-            Drizzle Gateway, and TypeORM, MikroORM, Kysely and Sequelize have no
-            studio at all. No TypeScript ORM CLI offers missing-index advice, and
-            Prisma Optimize was retired in March 2026 in favour of cloud-only
-            Query Insights. Prior art exists outside TypeScript, notably Ruby&apos;s
-            active_record_doctor, so the honest claim is &quot;no TypeScript
-            ORM&quot;, not &quot;no ORM&quot;.
+            <code>npx turbine mcp</code> ships in the package: a read-only MCP
+            server with eleven tools, every one running inside{' '}
+            <code>BEGIN READ ONLY</code> with PII-tagged columns redacted before
+            rows reach a model. An agent explores the schema, finds the join
+            path, checks the plan, and reads the error catalog through typed
+            tools. It cannot write, and there is no free-form SQL input to talk
+            it into. The rest is structural: typed query args turn a wrong
+            query into a compile error an agent can read, and stable error
+            codes give it something to branch on.
+          </p>
+        </div>
+
+        <div className="feature-grid">
+          {agentTools.map(([name, desc], i) => (
+            <div
+              key={name}
+              className={`feature-card animate-fade-in-up delay-${i + 1}`}
+            >
+              <h3 className="font-mono">{name}</h3>
+              <p>{desc}</p>
+            </div>
+          ))}
+        </div>
+
+        <p
+          style={{
+            marginTop: '1.25rem',
+            color: 'var(--text-secondary)',
+            fontSize: '0.9rem',
+          }}
+        >
+          Plus <code>schema_overview</code>, <code>table_detail</code>,{' '}
+          <code>migrate_status</code>, and <code>doctor_report</code>. Setup for
+          Claude Code and Cursor, a drop-in instructions snippet, and{' '}
+          <code>llms.txt</code>:{' '}
+          <Link href="/ai-agents" style={{ color: 'var(--accent)' }}>
+            Turbine for AI agents
+          </Link>
+          .
+        </p>
+      </section>
+
+      {/* ========== SAFETY DEFAULTS ========== */}
+      <section className="features-section">
+        <div className="animate-fade-in-up">
+          <p className="section-label">Designed for a database with real rows in it</p>
+          <h2 className="section-title">
+            The dangerous operations ask first.
+          </h2>
+          <p
+            style={{
+              maxWidth: '48rem',
+              marginTop: '0.75rem',
+              color: 'var(--text-secondary)',
+              fontSize: '0.95rem',
+              lineHeight: 1.7,
+            }}
+          >
+            The same posture the agent tools inherit, applied everywhere: reads
+            are safe by construction, and anything that can lose or leak data
+            requires an explicit, unspoofable opt-in.
           </p>
         </div>
 
@@ -355,24 +471,10 @@ export default async function Home() {
       {/* ========== POSTGRES-NATIVE ========== */}
       <section className="features-section">
         <div className="animate-fade-in-up">
-          <p className="section-label">And it is still Postgres-maximalist underneath</p>
+          <p className="section-label">Postgres-first underneath</p>
           <h2 className="section-title">
-            None of that costs you the database.
+            The parts other ORMs push to raw SQL are typed here.
           </h2>
-          <p
-            style={{
-              maxWidth: '48rem',
-              marginTop: '0.75rem',
-              color: 'var(--text-secondary)',
-              fontSize: '0.95rem',
-              lineHeight: 1.7,
-            }}
-          >
-            Safe defaults usually arrive as a lowest-common-denominator API that
-            can only do what every database can do. Turbine goes the other way:
-            Postgres is the primary target, and the parts of it that other
-            query layers push you to raw SQL for are typed, first-class surface.
-          </p>
         </div>
 
         <div className="feature-grid">
@@ -396,12 +498,12 @@ export default async function Home() {
         </div>
       </section>
 
-      {/* ========== OPERATIONS / REACH ========== */}
+      {/* ========== CAPABILITIES ========== */}
       <section className="features-section">
         <div className="animate-fade-in-up">
-          <p className="section-label">Ship it and sleep</p>
+          <p className="section-label">And the rest of the box</p>
           <h2 className="section-title">
-            Tooling your DBA will thank you for.
+            Tooling your DBA will sign off on.
           </h2>
         </div>
 
@@ -442,9 +544,10 @@ export default async function Home() {
                 <code>with</code> into correlated <code>json_agg</code> +{' '}
                 <code>json_build_object</code> subqueries, so ten users with
                 their posts and each post&apos;s comments is a single round
-                trip, not an N+1 cascade. Four load strategies are available and
-                the default picks between them per relation from your actual
-                index coverage.
+                trip, not an N+1 cascade. The default <code>auto</code>{' '}
+                strategy keeps that plan, falling back to one flat follow-up
+                statement for a relation whose correlation column has no
+                covering index. The rows are identical either way.
               </p>
               <p>
                 The part that takes the work is staying correct at depth: an
@@ -452,7 +555,7 @@ export default async function Home() {
                 <code>null</code>, per-relation <code>limit</code> and{' '}
                 <code>orderBy</code> apply per parent rather than to the whole
                 result, and every type survives the JSON round trip, dates
-                included. Both strategies are held to byte-identical output by a
+                included. The strategies are held to byte-identical output by a
                 differential fuzz suite.
               </p>
 
@@ -567,7 +670,9 @@ export default async function Home() {
                   '~1.6 MB client (TS/WASM compiler)',
                   '~7 KB core',
                 ],
-                ['Studio', 'Read-only by default, 192-bit auth', 'Full CRUD, cloud-hosted', 'Drizzle Studio (free; Gateway paid)'],
+                ['Studio', 'Read-only by default', 'Full CRUD, cloud-hosted', 'Drizzle Studio (free; Gateway paid)'],
+                ['Index advice', 'turbine doctor, offline, --fix', 'Optimize retired (cloud Query Insights)', 'None'],
+                ['MCP server for agents', '11 read-only tools, PII-redacted', 'Official MCP server', 'drizzle-kit mcp'],
                 ['Error PII safety', 'Keys only by default', 'Values in messages', 'Raw pg errors'],
                 ['Migrations', 'SQL-first, SHA-256 drift detection', 'DSL-generated, shadow DB', 'SQL or Drizzle Kit'],
                 ['Edge runtime', 'One import swap, ~64 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
@@ -638,39 +743,18 @@ export default async function Home() {
             lineHeight: 1.7,
           }}
         >
-          The longer, more honest version of this table, including what is{' '}
-          <em>not</em> a reason to switch, is on{' '}
+          Competitor columns last checked August 2026, against Prisma 7 and
+          Drizzle 0.45. Features marked Preview may change, and bundle sizes
+          move release to release. The longer version of this argument,
+          including what is not a reason to switch, is on{' '}
           <Link href="/why-turbine" style={{ color: 'var(--accent)' }}>
             Why Turbine
           </Link>
-          . Comparison as of July 2026, against Prisma 7 and Drizzle 0.45.
-          Competitor features marked Preview or beta may change, and bundle
-          sizes move release to release. Turbine&apos;s bundle-size and
-          performance claims are measured on the{' '}
+          ; performance claims are measured on the{' '}
           <Link href="/benchmarks" style={{ color: 'var(--accent)' }}>
             benchmarks page
           </Link>
           .
-        </p>
-
-        <p
-          style={{
-            marginTop: '1.5rem',
-            maxWidth: '48rem',
-            color: 'var(--text-secondary)',
-            fontSize: '0.9rem',
-            lineHeight: 1.7,
-          }}
-        >
-          Building nested reads by hand? Kysely&apos;s <code>jsonArrayFrom</code>{' '}
-          recipe uses the same correlated-subquery-plus-JSON approach &mdash;
-          proof the pattern is right. But once rows are aggregated into JSON the
-          driver can no longer see their types, so a <code>Date</code> inside a{' '}
-          <code>jsonArrayFrom</code> result is typed <code>Date</code> yet arrives
-          as a string, and the nesting isn&apos;t type-checked at depth. Turbine
-          types the whole tree and re-applies date coercion to every nested row,
-          so <code>users[0].posts[0].createdAt</code> is a real <code>Date</code>{' '}
-          at any depth &mdash; no plugin to wire up.
         </p>
       </section>
 
@@ -678,8 +762,8 @@ export default async function Home() {
       <section className="cta-section">
         <h2>Start building</h2>
         <p>
-          One install, one generate, one query. Get a typed Postgres client
-          in under two minutes.
+          One install, one generate, one query. A typed Postgres client in
+          under two minutes.
         </p>
 
         <div className="cta-links">
@@ -703,8 +787,8 @@ export default async function Home() {
           <Link href="/queries" className="cta-btn cta-btn-secondary">
             API Reference
           </Link>
-          <Link href="/why-turbine" className="cta-btn cta-btn-secondary">
-            Why Turbine
+          <Link href="/ai-agents" className="cta-btn cta-btn-secondary">
+            For AI agents
           </Link>
         </div>
       </section>
@@ -712,7 +796,7 @@ export default async function Home() {
       {/* ========== FOOTER ========== */}
       <footer className="landing-footer">
         <p>
-          One dependency. No WASM engine. Zero compromises. Built by{' '}
+          One dependency. No WASM. MIT. Built by{' '}
           <a href="https://github.com/zvndev" target="_blank" rel="noopener noreferrer">
             ZVN
           </a>

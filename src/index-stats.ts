@@ -12,7 +12,10 @@
  *
  * DESIGN: the file splits into two halves.
  *   - The COLLECTOR half (`collectStatsSnapshot`) reads pg catalogs. It uses a
- *     single one-connection pool, sets a statement_timeout, and treats every
+ *     single one-connection pool, bounds every read with a CONNECTION-TIME
+ *     statement_timeout rather than a session-level `SET` (see
+ *     `withStatementTimeoutOption` in connection-url.ts for why that
+ *     distinction is a safety property and not a style choice), and treats every
  *     catalog read as INDIVIDUALLY OPTIONAL: a read that fails (privileges,
  *     CockroachDB/YugabyteDB catalog gaps, missing view) degrades that one
  *     signal and records a notice rather than aborting the whole snapshot.
@@ -26,6 +29,7 @@
  * topology-only report.
  */
 
+import { withStatementTimeoutOption } from './connection-url.js';
 import { buildDropIndexSql } from './index-advisor.js';
 
 // ---------------------------------------------------------------------------
@@ -840,7 +844,20 @@ export async function collectStatsSnapshot(options: CollectSnapshotOptions): Pro
   const snapshot = emptyStatsSnapshot(notices);
 
   const { Pool } = (await import('pg')).default;
-  const pool = new Pool({ connectionString: options.connectionString, max: 1 }) as unknown as MinimalPool;
+  // statement_timeout travels as a CONNECTION PARAMETER, never as a `SET`. A
+  // bare `SET` on a fresh connection is a session-state write, and through a
+  // transaction-pooling proxy it attaches to a shared server backend that is
+  // then handed to somebody else's queries. The startup parameter is applied by
+  // the backend as it starts the session, so it bounds this collector's very
+  // first read, costs no round trip, and cannot outlive the connection. Nothing
+  // in the caller's `?options=` or `PGOPTIONS` is discarded; see
+  // withStatementTimeoutOption. (`turbine doctor` also refuses a pooler
+  // endpoint outright, but this collector is callable on its own, so it does
+  // not lean on that.)
+  const pool = new Pool({
+    ...withStatementTimeoutOption({ connectionString: options.connectionString }, timeout),
+    max: 1,
+  }) as unknown as MinimalPool;
 
   const run = async <R>(label: string, text: string, values?: unknown[]): Promise<R[] | null> => {
     try {
@@ -853,9 +870,6 @@ export async function collectStatsSnapshot(options: CollectSnapshotOptions): Pro
   };
 
   try {
-    // statement_timeout is best-effort; if it fails the reads still run.
-    await run('statement_timeout', `SET statement_timeout = ${Number(timeout)}`);
-
     // --- stats_reset / age --------------------------------------------------
     const resetRows = await run<{ stats_reset: Date | null }>(
       'pg_stat_database.stats_reset',
@@ -1134,15 +1148,16 @@ export async function collectTableHeat(options: CollectTableHeatOptions): Promis
   }
 
   const { Pool } = (await import('pg')).default;
-  const pool = new Pool({ connectionString: options.connectionString, max: 1 }) as unknown as MinimalPool;
+  // As in collectStatsSnapshot: the bound is a connection parameter, not a
+  // `SET`. This collector points at whatever `--metrics-url` names, which is
+  // frequently a shared observability database, so leaving session state on a
+  // pooled backend there is if anything the worse version of the same bug.
+  const pool = new Pool({
+    ...withStatementTimeoutOption({ connectionString: options.connectionString }, timeout),
+    max: 1,
+  }) as unknown as MinimalPool;
 
   try {
-    try {
-      await pool.query(`SET statement_timeout = ${Number(timeout)}`);
-    } catch {
-      /* best-effort */
-    }
-
     const exists = await pool
       .query<{ reg: string | null }>(`SELECT to_regclass('_turbine_metrics')::text AS reg`)
       .then((r) => r.rows[0]?.reg ?? null)

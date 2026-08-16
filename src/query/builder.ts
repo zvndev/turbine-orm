@@ -64,6 +64,7 @@ import type {
   GlobalFilters,
   GroupByArgs,
   GroupByResult,
+  JsonEncoding,
   JsonPathOrderBy,
   OrderByClause,
   QueryResult,
@@ -514,6 +515,46 @@ function isEmptyOrderBy(orderBy: unknown): boolean {
   return orderBy === undefined || orderBy === null;
 }
 
+/** The two accepted {@link JsonEncoding} values, frozen so the check is total. */
+const JSON_ENCODINGS: readonly JsonEncoding[] = Object.freeze(['object', 'positional'] as const);
+
+/**
+ * The relation JSON encoding a client on `dialect` gets when it names none.
+ *
+ * `'positional'` (`json_build_array`) on PostgreSQL, `'object'`
+ * (`json_build_object`) everywhere else. The positional form drops the repeated
+ * key names from every relation row: measured on a 50-parent / ~10-child read
+ * against local PostgreSQL 17, server time 0.685 ms → 0.350 ms and 152 KB →
+ * 100 KB on the wire, returning byte-identical parsed rows.
+ *
+ * ## Why the test is `dialect.name`, not "does the dialect have buildJsonArray"
+ *
+ * Because a presence test does not distinguish engines HERE. `buildJsonArray`
+ * is declared on `postgresDialect`, and sqlite.ts / mysql.ts / mssql.ts /
+ * powdb.ts each build their dialect by SPREADING it, so every engine inherits
+ * the hook and an "is it absent" fallback never fires. That is the documented
+ * inheritance trap (see `buildPartitionLimit` in {@link
+ * QueryInterface.batchedContext} and the `distinct` gate in
+ * {@link QueryInterface.buildFindMany}), and it is exactly the shape that
+ * silently turned the partition-limit window on for SQLite.
+ *
+ * A new capability flag would work, but only if every engine set it
+ * explicitly, and it would be a SECOND authority on the same question:
+ * `buildSelectWithRelations` (relations.ts) already refuses `'positional'` with
+ * E017 on `dialect.name !== 'postgresql'`. Deriving the default from the
+ * identical predicate is what makes it impossible for the default to select an
+ * encoding the builder then refuses. A flag could drift from that refusal; this
+ * cannot.
+ *
+ * A wire-compatible engine that reaches this on `postgresDialect` itself
+ * (CockroachDB, YugabyteDB, AlloyDB, Timescale, all of which are ADAPTERS over
+ * the Postgres dialect rather than dialects of their own) gets `'positional'`,
+ * which is correct: they speak `json_build_array`.
+ */
+function defaultJsonEncoding(dialect: Dialect): JsonEncoding {
+  return dialect.name === 'postgresql' ? 'positional' : 'object';
+}
+
 // ---------------------------------------------------------------------------
 // Deferred query + option types (see deferred.ts)
 // ---------------------------------------------------------------------------
@@ -612,8 +653,31 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * is derived. See {@link autoToOneThreshold}.
    */
   private readonly autoRoundTripMs: number | undefined;
-  /** Nested-relation JSON encoding: 'object' (default) or 'positional'. */
-  private readonly jsonEncoding: 'object' | 'positional';
+  /**
+   * The CLIENT-level nested-relation JSON encoding: what a query that names no
+   * `jsonEncoding` of its own gets. `'positional'` on PostgreSQL, `'object'`
+   * everywhere else (see {@link defaultJsonEncoding}).
+   *
+   * Read through {@link QueryInterface.currentJsonEncoding}, never directly, so
+   * a per-query override cannot be missed by one reader.
+   */
+  private readonly jsonEncoding: JsonEncoding;
+  /**
+   * The encoding the query BEING BUILT resolved to, i.e. its own
+   * `jsonEncoding` or {@link QueryInterface.jsonEncoding}.
+   *
+   * Reassigned per `build*` call and exposed on the {@link BuilderCtx} as a live
+   * getter, exactly like {@link QueryInterface.currentSkip} and for the same
+   * reason: relations.ts reads the encoding from four places deep inside the
+   * SELECT walk, and threading it through every one of them as a parameter
+   * would be four chances to forget it.
+   *
+   * Safe because a build is SYNCHRONOUS from the assignment to the last read:
+   * `buildFindMany` / `buildFindUnique` return a fully-formed DeferredQuery
+   * whose parser closure already captured the shapes, so nothing reads this
+   * field after the build returns and no two builds can interleave on it.
+   */
+  private currentJsonEncoding: JsonEncoding;
   /**
    * `parseRow` decode plans, keyed by table plus the exact column list. Bounded
    * like the SQL template cache and for the same reason: the shapes come from
@@ -803,7 +867,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
       autoToOne !== undefined && Number.isFinite(autoToOne) && autoToOne >= 0 ? Math.floor(autoToOne) : undefined;
     const rtt = options?.autoRoundTripMs;
     this.autoRoundTripMs = rtt !== undefined && Number.isFinite(rtt) && rtt > 0 ? rtt : undefined;
-    this.jsonEncoding = options?.jsonEncoding ?? 'object';
+    this.jsonEncoding = options?.jsonEncoding ?? defaultJsonEncoding(this.dialect);
+    this.currentJsonEncoding = this.jsonEncoding;
     // Only retain the map when it has at least one entry, so `globalFilters`
     // stays `undefined` (and every merge path a no-op) for the common case.
     this.globalFilters =
@@ -913,7 +978,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
       acquireSql: (cacheKey, build) => this.acquireSql(cacheKey, build),
       crossCheckCache: (op, cacheKey, entry, build, collectedParams) =>
         this.crossCheckCache(op, cacheKey, entry, build, collectedParams),
-      jsonEncoding: this.jsonEncoding,
+      // LIVE getter, not a copied value: `jsonEncoding` is now a per-query
+      // option, so the module-facing view must see the encoding of the query
+      // being built rather than the one the client was constructed with. Same
+      // shape and same reason as `currentSkip` above.
+      get jsonEncoding(): JsonEncoding {
+        return self.currentJsonEncoding;
+      },
       camelDateFieldCache: this.camelDateFieldCache,
       relationEntryCache: this.relationEntryCache,
       limitOneClause: () => this.limitOneClause(),
@@ -1121,6 +1192,38 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private resolveStableOrder(argFlag: boolean | undefined): boolean {
     return argFlag ?? this.stableRelationOrder;
+  }
+
+  /**
+   * Resolve one query's relation JSON encoding and PIN it for the build, so
+   * every reader inside relations.ts sees the same answer.
+   *
+   * Called at the TOP of each entry point that can emit or decode relation JSON
+   * (`buildFindMany`, `buildFindUnique`, `makeStreamRowParser`), before the
+   * cache key is assembled and before the flatten plan is consulted, because
+   * both of those depend on the answer.
+   *
+   * An unrecognized value THROWS (E003) rather than falling back. A per-query
+   * option that is silently ignored when misspelled is the exact failure this
+   * package has been bitten by before (see query/option-surface.ts), and here it
+   * would be invisible: the wrong encoding still returns correct rows, just
+   * without the saving the caller asked for, or with the flatten plan they were
+   * trying to re-enable still refused. Thrown before the SQL cache is consulted
+   * so a warm template can never serve a call the cold path would refuse.
+   */
+  private resolveJsonEncoding(argEncoding: JsonEncoding | undefined): JsonEncoding {
+    if (argEncoding === undefined) {
+      this.currentJsonEncoding = this.jsonEncoding;
+      return this.currentJsonEncoding;
+    }
+    if (!JSON_ENCODINGS.includes(argEncoding)) {
+      throw new ValidationError(
+        `[turbine] Invalid \`jsonEncoding\` on "${this.table}": ${JSON.stringify(argEncoding)}. ` +
+          `Expected ${JSON_ENCODINGS.map((e) => `'${e}'`).join(' or ')}.`,
+      );
+    }
+    this.currentJsonEncoding = argEncoding;
+    return argEncoding;
   }
 
   /**
@@ -2428,6 +2531,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     O extends Record<string, boolean> | undefined = undefined,
   >(args: FindUniqueArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O> | null> {
     this.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
+    // Pinned before the cache key, which carries it (see buildFindMany).
+    const jsonEncoding = this.resolveJsonEncoding(args.jsonEncoding);
     // Prisma compound-unique selector expansion (before global-filter merge and
     // fingerprinting, so the cache only ever sees the canonical expanded where).
     args = maybeExpandCompoundUnique(this.tableMeta, args);
@@ -2482,7 +2587,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // See buildFindMany: `includePii` is its own cache-key segment so a no-PII
     // statement can never serve an `includePii` call (relation projections that
     // `withFp` does not capture also flip on it).
-    const ck = `fu:${whereFingerprint}|c=${colKey}|w=${withFp}|pii=${includePii ? 1 : 0}${this.globalFilterCacheSegment()}`;
+    // `|je=`: same rule and same hazard as in buildFindMany. findUnique is never
+    // flatten-planned, so this is the only plan-shape segment it needs.
+    const encodingFp = `|je=${jsonEncoding === 'positional' ? 'p' : 'o'}`;
+    const ck = `fu:${whereFingerprint}|c=${colKey}|w=${withFp}|pii=${includePii ? 1 : 0}${encodingFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
@@ -2826,6 +2934,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O>[]> {
     this.currentSkip = resolveSkipGlobalFilters(args?.skipGlobalFilters);
+    // Pinned before the flatten plan and the cache key, both of which read it.
+    const jsonEncoding = this.resolveJsonEncoding(args?.jsonEncoding);
     // Stable relation order (opt-in): fill PK-asc orderBy into unordered to-many
     // relations BEFORE fingerprinting, so the two orderings get distinct cache
     // entries and every downstream path (SQL build, collect, parser) inherits it.
@@ -2980,8 +3090,20 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // key is byte-identical to before.
     const flattenPlan = this.planFlatten(args, includePii);
     const flattenFp = flattenPlan ? `|fl=${flattenPlan.signature}` : '';
+    // `jsonEncoding` decides whether every relation subquery emits
+    // `json_build_object` or `json_build_array`, and the parser built alongside
+    // the statement decodes exactly one of those two. It is invisible to
+    // `withFp` (which fingerprints the `with` SHAPE, not its rendering), so it
+    // needs its own segment for the same reason `pii=` and `fl=` do, and the
+    // consequence of getting it wrong is worse than either: a positional
+    // template served to an object-planned call hands `parseNestedRow` bare
+    // arrays where it expects keyed objects, which is silent data corruption
+    // rather than an error. Emitted for BOTH values rather than only the
+    // non-default one, so the key never depends on what the client default
+    // happens to be.
+    const encodingFp = `|je=${jsonEncoding === 'positional' ? 'p' : 'o'}`;
 
-    const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}|pii=${includePii ? 1 : 0}${flattenFp}${this.globalFilterCacheSegment()}`;
+    const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}|pii=${includePii ? 1 : 0}${flattenFp}${encodingFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
@@ -3182,65 +3304,82 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   // -------------------------------------------------------------------------
-  // findManyStream, async iterable using PostgreSQL cursors
+  // findManyStream / findManyStreamBatches, async iterables using PostgreSQL cursors
   // -------------------------------------------------------------------------
 
   /**
-   * Stream rows from a findMany query using PostgreSQL cursors.
-   * Returns an AsyncIterable that yields individual rows, fetching in batches internally.
+   * Build the one row parser a whole drain uses.
    *
-   * **Speculative fast-path:** Before opening a cursor, issues a single
-   * `SELECT ... LIMIT batchSize+1`. If the result fits within `batchSize`,
-   * all rows are yielded immediately with zero cursor overhead (no BEGIN /
-   * DECLARE / CLOSE / COMMIT). Only when the result overflows does the
-   * method fall back to the full cursor path.
+   * Shared by {@link findManyStream} and {@link findManyStreamBatches} so the
+   * two can never disagree about a row's SHAPE while agreeing about its
+   * contents: the flatten plan, the positional/object relation decode and the
+   * PII projection are all decided here, once, before a statement is issued.
    *
-   * **Cursor path:** Uses DECLARE CURSOR within a dedicated transaction on a
-   * single pooled connection. The cursor is CLOSEd (in the dialect's `finally`)
-   * and the connection released both when iteration completes normally and when
-   * it ends early (`break` from `for await`). An error mid-stream skips the
-   * CLOSE and rolls back instead, which drops the cursor with the transaction.
-   *
-   * **Snapshot semantics note:** Outside a transaction the speculative
-   * fast-path runs unwrapped, and an overflow opens the cursor in its own
-   * transaction, so the two fetches span two separate snapshots. Wrapping the
-   * call in `$transaction` gives strict single-snapshot semantics: both the
-   * speculative fetch and the cursor then run on the caller's connection
-   * inside the caller's transaction (the cursor path issues no BEGIN/COMMIT of
-   * its own and releases nothing, so the caller's transaction is intact when
-   * iteration finishes).
-   *
-   * @example
-   * ```ts
-   * for await (const user of db.users.findManyStream({ where: { orgId: 1 }, batchSize: 500 })) {
-   *   process.stdout.write(`${user.email}\n`);
-   * }
-   * ```
+   * The plan is a pure function of the schema, the `with` shape and
+   * `includePii`, never of `limit`, so the batch-size override the speculative
+   * fetch applies cannot change it and the parser always matches the emitted
+   * SQL. Reading the raw `includePii` sentinel with `=== true` here would have
+   * quietly planned a no-PII parser over a with-PII statement, which is why it
+   * goes through `resolveUnsafeFlag` on every path, `with` clause or not.
    */
-  async *findManyStream<
+  private makeStreamRowParser<
     // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
     W extends TypedWithClause<R> = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args?: FindManyStreamArgs<T, R, W, S, O>): AsyncGenerator<QueryResult<T, R, W, S, O>, void, undefined> {
-    const batchSize = Math.max(1, Math.floor(Number(args?.batchSize ?? 1000)));
-    const hasRelations = !!args?.with;
-    // Build the positional-aware relation parser once for the whole stream.
-    // Same flatten plan buildFindMany compiles below. The plan is a pure
-    // function of the schema, the `with` shape and `includePii`, never of
-    // `limit`, so the batch-size override the speculative fetch applies cannot
-    // change it, and the stream's parser matches the emitted SQL.
-    // Resolved once for the whole stream: the flatten plan and the row parser
-    // MUST agree with the SQL buildFindMany emits below, and reading the raw
-    // sentinel with `=== true` here would have quietly planned a no-PII parser
-    // over a with-PII statement.
+  >(args?: FindManyStreamArgs<T, R, W, S, O>): (row: Record<string, unknown>) => Record<string, unknown> {
     const streamPii = resolveUnsafeFlag(args?.includePii, 'includePii');
-    const streamFlattenPlan = hasRelations ? this.planFlatten(args, streamPii) : null;
-    const parseWith = hasRelations
-      ? this.makeNestedParser(args!.with as WithClause, streamPii, streamFlattenPlan)
-      : null;
+    // THIS CALL IS ORDER-CRITICAL, and it is why the resolution is a method
+    // rather than an expression inlined into the two build sites. The parser is
+    // built HERE, before `streamRaw` reaches `buildFindMany` and pins the
+    // encoding itself, so without this the parser would be planned against the
+    // CLIENT default while the statement was built against the query's
+    // override: positional SQL decoded as objects, or the reverse. Both build
+    // from the same `args`, so both resolve to the same value; the invalid-value
+    // throw also lands here first, before a connection is taken.
+    this.resolveJsonEncoding(args?.jsonEncoding);
+    if (!args?.with) {
+      const table = this.table;
+      return (row) => this.parseRow(row, table);
+    }
+    const streamFlattenPlan = this.planFlatten(args, streamPii);
+    return this.makeNestedParser(args.with as WithClause, streamPii, streamFlattenPlan);
+  }
 
-    this.currentAction = 'findManyStream';
+  /**
+   * Everything a stream does to the DATABASE, and nothing it does to a row.
+   *
+   * {@link findManyStream} and {@link findManyStreamBatches} are the same drain
+   * handed out at two granularities, so the statement they issue, when the
+   * cursor opens, and how the connection is released all live here once. Only
+   * the yielding differs, which is the entire point of having both.
+   *
+   * Parsing deliberately stays in the callers: they parse at different
+   * granularities, and the per-row method must keep parsing LAZILY, one row at
+   * a time, exactly as it always has. Hoisting the parse in here would make a
+   * consumer that breaks after the first row pay for the rest of its batch.
+   *
+   * `action` is the tag query events carry. It is a parameter rather than a
+   * constant so each public method reports its own name instead of the name of
+   * whichever one happens to be implemented over the other.
+   *
+   * An EMPTY batch is never yielded: the dialect's cursor loop breaks on a
+   * zero-row FETCH, and the speculative path below yields nothing at all when
+   * the result set is empty. Callers may therefore treat a yielded batch as
+   * non-empty.
+   */
+  private async *streamRaw<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(
+    args: FindManyStreamArgs<T, R, W, S, O> | undefined,
+    action: string,
+  ): AsyncGenerator<Record<string, unknown>[], void, undefined> {
+    const batchSize = Math.max(1, Math.floor(Number(args?.batchSize ?? 1000)));
+
+    this.currentAction = action;
     // Streaming is ALREADY immune to the generic-plan cliff: the speculative
     // fetch has never passed a prepared name, and the cursor path runs through
     // DECLARE, so neither statement enters the plan cache. `preparedNameFor` is
@@ -3297,10 +3436,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
       );
 
       if (speculativeResult.rows.length <= batchSize) {
-        // Small drain, yield all rows and return, no cursor needed
-        for (const row of speculativeResult.rows) {
-          yield (parseWith ? parseWith(row) : this.parseRow(row, this.table)) as QueryResult<T, R, W, S, O>;
-        }
+        // Small drain, hand over the whole result and return, no cursor needed.
+        if (speculativeResult.rows.length > 0) yield speculativeResult.rows;
         return;
       }
     }
@@ -3311,7 +3448,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // Acquire a dedicated connection: cursors require a single connection in a
     // transaction. The dialect owns the streaming SQL (Postgres: BEGIN → DECLARE
     // … NO SCROLL CURSOR FOR → FETCH n → CLOSE → COMMIT, ROLLBACK on error); we
-    // just parse + yield the row batches it produces.
+    // just yield the row batches it produces.
     //
     // Inside a caller-owned transaction there is nothing to check out: the
     // transaction-scoped pool pins every query to the transaction's own
@@ -3324,18 +3461,117 @@ export class QueryInterface<T extends object, R extends object = {}> {
         (await this.pool.query(text, values)) as { rows: Record<string, unknown>[] },
     };
     try {
-      for await (const batch of this.dialect.openStream(conn, deferred.sql, deferred.params, batchSize, {
+      yield* this.dialect.openStream(conn, deferred.sql, deferred.params, batchSize, {
         ambientTransaction: this.txScoped,
-      })) {
-        for (const row of batch) {
-          yield (parseWith ? parseWith(row) : this.parseRow(row, this.table)) as QueryResult<T, R, W, S, O>;
-        }
-      }
+      });
     } catch (err) {
       // Wrap pg constraint errors so streaming surfaces typed errors like the rest of the API
       throw wrapPgError(err);
     } finally {
       client?.release();
+    }
+  }
+
+  /**
+   * Stream rows from a findMany query using PostgreSQL cursors, one BATCH of
+   * rows at a time.
+   *
+   * The same drain {@link findManyStream} performs, the same statements, the
+   * same cursor, the same rows in the same order, handed out as arrays instead
+   * of one row at a time. That is worth having because the per-row form costs
+   * one promise resolution and one microtask turn PER ROW: measured over 50,000
+   * rows on a local PostgreSQL, per-row yielding costs ~7 ms (~140 ns/row) that
+   * batch yielding does not, which is roughly half of the streaming overhead
+   * over a hand-written cursor loop. Nothing else about the two paths differs,
+   * so the entire saving is the yielding.
+   *
+   * Prefer this whenever the consumer can work on an array; keep
+   * {@link findManyStream} when a row at a time is what the code actually wants,
+   * since flattening a batch by hand costs exactly what it saves.
+   *
+   * A yielded batch is never empty, and its length is NOT a contract: it is at
+   * most `batchSize`, the final batch is usually shorter, and a result set that
+   * fits within one batch arrives as a single array from the speculative fetch
+   * with no cursor involved. Do not use batch boundaries to infer anything
+   * about the data.
+   *
+   * Every other streaming behaviour is shared and documented on
+   * {@link findManyStream}: the speculative fast path, the cursor path and its
+   * cleanup, the snapshot semantics, and early `break`.
+   *
+   * @example
+   * ```ts
+   * for await (const batch of db.users.findManyStreamBatches({ where: { orgId: 1 }, batchSize: 500 })) {
+   *   await sink.writeAll(batch);
+   * }
+   * ```
+   */
+  async *findManyStreamBatches<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args?: FindManyStreamArgs<T, R, W, S, O>): AsyncGenerator<QueryResult<T, R, W, S, O>[], void, undefined> {
+    const parse = this.makeStreamRowParser<W, S, O>(args);
+    for await (const batch of this.streamRaw<W, S, O>(args, 'findManyStreamBatches')) {
+      const parsed = new Array<QueryResult<T, R, W, S, O>>(batch.length);
+      for (let i = 0; i < batch.length; i++) {
+        parsed[i] = parse(batch[i]!) as QueryResult<T, R, W, S, O>;
+      }
+      yield parsed;
+    }
+  }
+
+  /**
+   * Stream rows from a findMany query using PostgreSQL cursors.
+   * Returns an AsyncIterable that yields individual rows, fetching in batches internally.
+   *
+   * See {@link findManyStreamBatches} for the same drain yielded a batch at a
+   * time, which is measurably cheaper when the consumer can take an array.
+   *
+   * **Speculative fast-path:** Before opening a cursor, issues a single
+   * `SELECT ... LIMIT batchSize+1`. If the result fits within `batchSize`,
+   * all rows are yielded immediately with zero cursor overhead (no BEGIN /
+   * DECLARE / CLOSE / COMMIT). Only when the result overflows does the
+   * method fall back to the full cursor path.
+   *
+   * **Cursor path:** Uses DECLARE CURSOR within a dedicated transaction on a
+   * single pooled connection. The cursor is CLOSEd (in the dialect's `finally`)
+   * and the connection released both when iteration completes normally and when
+   * it ends early (`break` from `for await`). An error mid-stream skips the
+   * CLOSE and rolls back instead, which drops the cursor with the transaction.
+   *
+   * **Snapshot semantics note:** Outside a transaction the speculative
+   * fast-path runs unwrapped, and an overflow opens the cursor in its own
+   * transaction, so the two fetches span two separate snapshots. Wrapping the
+   * call in `$transaction` gives strict single-snapshot semantics: both the
+   * speculative fetch and the cursor then run on the caller's connection
+   * inside the caller's transaction (the cursor path issues no BEGIN/COMMIT of
+   * its own and releases nothing, so the caller's transaction is intact when
+   * iteration finishes).
+   *
+   * @example
+   * ```ts
+   * for await (const user of db.users.findManyStream({ where: { orgId: 1 }, batchSize: 500 })) {
+   *   process.stdout.write(`${user.email}\n`);
+   * }
+   * ```
+   */
+  async *findManyStream<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args?: FindManyStreamArgs<T, R, W, S, O>): AsyncGenerator<QueryResult<T, R, W, S, O>, void, undefined> {
+    const parse = this.makeStreamRowParser<W, S, O>(args);
+    // Parsed one row at a time, INSIDE the yield loop rather than a batch ahead
+    // of it, so a consumer that breaks early still pays only for the rows it
+    // took. That laziness is the reason this loop is not written over
+    // `findManyStreamBatches`.
+    for await (const batch of this.streamRaw<W, S, O>(args, 'findManyStream')) {
+      for (let i = 0; i < batch.length; i++) {
+        yield parse(batch[i]!) as QueryResult<T, R, W, S, O>;
+      }
     }
   }
 
@@ -3937,7 +4173,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * strategy, silently and byte-identically):
    *   - the resolved strategy is not `'flatten'`;
    *   - `jsonEncoding: 'positional'` (a flattened relation emits no JSON at all,
-   *     so the two encodings are not composed in this version);
+   *     so the two are not composed in this version). NOTE that this is the
+   *     PostgreSQL DEFAULT, so on Postgres `'flatten'` engages only when the
+   *     caller ALSO passes `jsonEncoding: 'object'`. The fallback is silent and
+   *     byte-identical, and `warnFlattenBlocked` names the encoding and the
+   *     escape hatch in dev;
    *   - the dialect owns relation-subquery generation
    *     (`dialect.buildRelationSubquery`, i.e. SQL Server's `FOR JSON PATH`);
    *   - `distinct` (the `DISTINCT ON` rewrite re-orders in an outer wrapper, and
@@ -3964,8 +4204,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // the query rather than once per relation (relations.ts warns per relation
     // for the eligibility rules it owns).
     const queryLevelBlock =
-      this.jsonEncoding === 'positional'
-        ? "`jsonEncoding: 'positional'` is active, and a flattened relation emits no JSON to encode"
+      this.currentJsonEncoding === 'positional'
+        ? "`jsonEncoding: 'positional'` is active (the PostgreSQL default), and a flattened relation emits no " +
+          "JSON to encode. Pass `jsonEncoding: 'object'` alongside the strategy to get the flatten plan"
         : this.dialect.buildRelationSubquery
           ? `the ${this.dialect.name} dialect generates relation subqueries itself`
           : args?.distinct && args.distinct.length > 0
@@ -4316,9 +4557,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * Build the decode plan for one exact column list, and remember it as this
    * table's most recent shape so the next row of the same result set hits the
    * fast path in {@link parseRow}.
+   *
+   * The shape key's delimiter is NUL because it is the one byte a Postgres
+   * identifier cannot contain, even quoted, so no table or column name can
+   * forge a collision. It MUST be written as the six-character escape, never
+   * as a literal NUL byte: a raw NUL makes byte-oriented tools classify this
+   * file as binary, and `grep` then reports ZERO matches for a term that is
+   * present rather than saying it declined to look. This is the largest file
+   * in the repo, and that silent empty result has already sent more than one
+   * search down the wrong path.
    */
   private buildRowDecodePlan(table: string, meta: TableMetadata, keys: string[]): RowDecodePlan {
-    const shapeKey = `${table} ${keys.join(' ')}`;
+    const shapeKey = `${table}\u0000${keys.join('\u0000')}`;
     let plan = this.rowPlanCache.get(shapeKey);
     if (plan === undefined) {
       const reverseMap = meta.reverseColumnMap;

@@ -36,6 +36,29 @@
  * ties is never rewritten, because with ties the two plans are each free to
  * keep different rows. See `partitionOrderBy` in query/batched-loader.ts.
  *
+ * ...AND A THIRD AND FOURTH ARM ON THE JSON WIRE ENCODING, which is a second
+ * axis of exactly the same kind. `jsonEncoding` decides whether a relation row
+ * is emitted as `json_build_object('id', …)` or as a key-less
+ * `json_build_array(…)` decoded by position client-side, and `'positional'` is
+ * the PostgreSQL DEFAULT. Two encodings of one query surface, so they owe the
+ * same two properties the strategies do, and the failure mode is worse: a
+ * mis-served template is not an error, it is a positional array handed to a
+ * parser expecting keyed objects, which returns WRONG ROWS silently. The
+ * dedicated tests in json-encoding-positional.test.ts pin chosen shapes; these
+ * arms draw the shapes from the same seeded PRNG the strategy arms use.
+ *
+ *   ARM 3 reuses the seeded fixture and the strategy generator, and interleaves
+ *   the two encodings on ONE client so the SQL-template cache is under test
+ *   alongside the encoders.
+ *   ARM 4 exists because the seeded fixture answers only ONE of the questions.
+ *   Its only column type from JSON_WIRE_COERCION_OIDS (the set whose JSON
+ *   rendering does not match the driver's, so the builder bakes `::text` casts
+ *   into the expressions) is `int8`. Positional drops the KEYS and passes each
+ *   expression through verbatim, so fidelity should be preserved for all of
+ *   them, and arm 4 is where that is proved rather than asserted: its own DDL
+ *   carries every type in that set, and a precondition test fails if any of
+ *   them stops being represented.
+ *
  * Reproduction: every assertion message carries the seed, case index, and the
  * full args JSON. Re-run a failure with:
  *   TURBINE_FUZZ_SEED=<seed> TURBINE_FUZZ_CASES=<cases> npx tsx --test src/test/strategy-fuzz.test.ts
@@ -47,9 +70,11 @@ import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { afterEach, beforeEach, describe, it as nodeIt } from 'node:test';
+import pgDriver from 'pg';
 import { TurbineClient } from '../client.js';
 import { TurbineError } from '../errors.js';
 import { introspect } from '../introspect.js';
+import { JSON_WIRE_COERCION_OIDS } from '../query/utils.js';
 import type { SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, turbineSqlite } from '../sqlite.js';
 import { skipGate } from './helpers.js';
@@ -786,6 +811,363 @@ describe('strategy differential fuzz on PostgreSQL (the per-parent limit pushdow
       assert.ok(ineligibleCases > 0, `seed ${seed}: no case carried a non-total limited relation; assertion 2 is idle`);
       assert.ok(eligibleCases > 0, `seed ${seed}: no case carried a totally-ordered limited relation`);
       assert.ok(wrappersSeen > 0, `seed ${seed}: the pushdown never engaged; the arm proves nothing about it`);
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ARM 3: the JSON wire encoding, over the SAME seeded random args.
+//
+// `jsonEncoding: 'object'` and `'positional'` are two renderings of one query
+// surface, so they owe the same two properties the strategies do: they accept
+// and reject the same args, and when both accept they return deeply equal rows.
+//
+// The two encodings are driven PER QUERY on ONE client, deliberately. A
+// QueryInterface holds one SQL-template LRU keyed by query SHAPE, and the two
+// encodings have the same shape: without the `|je=` cache-key segment the
+// second call is served the first's statement and its rows are decoded by the
+// wrong parser, which produces wrong values and no error at all. Interleaving
+// them cold/cold/hot/hot on one client is what puts that under test.
+// ---------------------------------------------------------------------------
+
+type Encoding = 'object' | 'positional';
+
+/** Run `args` under one encoding, normalizing a TurbineError into a value. */
+async function runEncoded(
+  target: TurbineClient,
+  table: string,
+  args: Record<string, unknown>,
+  jsonEncoding: Encoding,
+): Promise<Outcome> {
+  try {
+    const rows = await target.table(table).findMany({ ...args, relationLoadStrategy: 'join', jsonEncoding } as never);
+    return { ok: true, rows };
+  } catch (err) {
+    if (err instanceof TurbineError) return { ok: false, code: err.code, message: err.message };
+    throw err;
+  }
+}
+
+describe('encoding differential fuzz on PostgreSQL (object vs positional)', () => {
+  let pg2: TurbineClient;
+  let emittedSql: string[] = [];
+
+  pgGate.before(async () => {
+    const s = await introspect({ connectionString: PG_URL! });
+    pg2 = new TurbineClient({ connectionString: PG_URL!, poolSize: 5, warnOnUnlimited: false }, s);
+    pg2.$on('query', (e) => emittedSql.push(e.sql));
+    await pg2.connect();
+  });
+
+  pgGate.after(async () => {
+    await pg2.disconnect();
+  });
+
+  for (const seed of SEEDS) {
+    pgGate.it(
+      `seed ${seed}: acceptance + deep row equality across encodings over ${PG_CASES_PER_SEED} cases`,
+      async () => {
+        const rng = mulberry32(seed);
+        let withRelations = 0;
+        let objectStatements = 0;
+        let positionalStatements = 0;
+        for (let i = 0; i < PG_CASES_PER_SEED; i++) {
+          const testCase = pgCase(rng);
+          const repro = () => `seed=${seed} case=${i} table=${testCase.table}\nargs=${JSON.stringify(testCase.args)}`;
+          if (testCase.args.with) withRelations += 1;
+
+          emittedSql = [];
+          // Cold both ways, then HOT both ways in the reverse order: a warm entry
+          // being handed to the other encoding is the failure this ordering hunts.
+          const objCold = await runEncoded(pg2, testCase.table, testCase.args, 'object');
+          const posCold = await runEncoded(pg2, testCase.table, testCase.args, 'positional');
+          const posHot = await runEncoded(pg2, testCase.table, testCase.args, 'positional');
+          const objHot = await runEncoded(pg2, testCase.table, testCase.args, 'object');
+
+          // 1. ACCEPTANCE AGREEMENT.
+          for (const [name, other] of [
+            ['positional (cold)', posCold],
+            ['positional (warm)', posHot],
+            ['object (warm)', objHot],
+          ] as const) {
+            assert.equal(
+              objCold.ok,
+              other.ok,
+              `encodings disagree about validity (object ${objCold.ok ? 'accepted' : 'threw'}, ${name} ${
+                other.ok ? 'accepted' : 'threw'
+              }): ${repro()}`,
+            );
+            if (!objCold.ok && !other.ok) {
+              assert.equal(objCold.code, other.code, `object and ${name} threw different codes: ${repro()}`);
+            }
+          }
+
+          if (!objCold.ok) continue;
+
+          // 2. DEEP ROW EQUALITY, cold and warm, in both directions.
+          assert.deepEqual((posCold as { rows: unknown[] }).rows, objCold.rows, `cold mismatch: ${repro()}`);
+          assert.deepEqual((posHot as { rows: unknown[] }).rows, objCold.rows, `warm positional mismatch: ${repro()}`);
+          assert.deepEqual((objHot as { rows: unknown[] }).rows, objCold.rows, `warm object mismatch: ${repro()}`);
+
+          // 3. VACUITY GUARD. The two arms must actually have emitted different
+          // statements; without this the whole arm would pass if `jsonEncoding`
+          // were silently ignored.
+          objectStatements += emittedSql.filter((s) => s.includes('json_build_object')).length;
+          positionalStatements += emittedSql.filter((s) => s.includes('json_build_array')).length;
+          if (testCase.args.with) {
+            assert.ok(
+              emittedSql.some((s) => s.includes('json_build_object')) &&
+                emittedSql.some((s) => s.includes('json_build_array')),
+              `a case with relations emitted only one encoder: ${repro()}`,
+            );
+          }
+        }
+        assert.ok(withRelations > 0, `seed ${seed}: no generated case carried a \`with\`; the arm proves nothing`);
+        assert.ok(objectStatements > 0, `seed ${seed}: json_build_object never emitted`);
+        assert.ok(positionalStatements > 0, `seed ${seed}: json_build_array never emitted`);
+      },
+    );
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ARM 4: encoding fidelity across the JSON-wire COERCION types.
+//
+// The seeded fixture is BIGINT ids and text/bool/int4/timestamptz/jsonb columns,
+// so of JSON_WIRE_COERCION_OIDS it exercises `int8` and nothing else. Those are
+// exactly the types whose JSON rendering does NOT match what the driver returns
+// for the same column, which is why the builder bakes `::text` casts into the
+// relation expressions and re-parses them on the way back
+// (see the JSON_WIRE_COERCION_OIDS comment block in query/relations.ts).
+//
+// `buildJsonRow` drops only the KEYS and passes each expression through
+// verbatim, so positional should preserve every one of those casts. "Should" is
+// the reason this arm exists: it owns a fixture carrying every type in the set,
+// and the precondition test below FAILS if a type in the set stops being
+// represented, so the coverage claim cannot quietly rot.
+// ---------------------------------------------------------------------------
+
+const ENC_DDL = `
+DROP TABLE IF EXISTS encfuzz_children CASCADE;
+DROP TABLE IF EXISTS encfuzz_parents CASCADE;
+CREATE TABLE encfuzz_parents (
+  id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  label TEXT NOT NULL
+);
+CREATE TABLE encfuzz_children (
+  id             BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  parent_id      BIGINT NOT NULL REFERENCES encfuzz_parents(id),
+  ord            INTEGER NOT NULL,
+  c_numeric      NUMERIC(20,4),
+  c_bigint       BIGINT,
+  c_bytea        BYTEA,
+  c_date         DATE,
+  c_interval     INTERVAL,
+  c_point        POINT,
+  c_circle       CIRCLE,
+  c_numeric_arr  NUMERIC(20,4)[],
+  c_bigint_arr   BIGINT[],
+  c_bytea_arr    BYTEA[],
+  c_date_arr     DATE[],
+  c_interval_arr INTERVAL[],
+  c_point_arr    POINT[],
+  c_ts_arr       TIMESTAMP[],
+  c_tstz_arr     TIMESTAMPTZ[],
+  c_text         TEXT,
+  c_int          INTEGER,
+  c_bool         BOOLEAN,
+  c_jsonb        JSONB
+);
+CREATE INDEX idx_encfuzz_children_parent ON encfuzz_children(parent_id);
+
+INSERT INTO encfuzz_parents (label)
+  SELECT 'p' || g FROM generate_series(1, 12) g;
+
+-- Row 1 of every parent carries real values in every column; row 2 carries
+-- NULLs, so the coercion path is exercised against absent values too; rows 3+
+-- vary so ordering and limits have something to choose between. Parent 12 gets
+-- no children at all (empty-relation stitching).
+INSERT INTO encfuzz_children (
+  parent_id, ord, c_numeric, c_bigint, c_bytea, c_date, c_interval, c_point, c_circle,
+  c_numeric_arr, c_bigint_arr, c_bytea_arr, c_date_arr, c_interval_arr, c_point_arr,
+  c_ts_arr, c_tstz_arr, c_text, c_int, c_bool, c_jsonb
+)
+SELECT
+  p.id,
+  n,
+  CASE WHEN n = 2 THEN NULL ELSE (1000.5001 + n)::numeric(20,4) END,
+  CASE WHEN n = 2 THEN NULL ELSE 9007199254740993 + n END,
+  CASE WHEN n = 2 THEN NULL ELSE decode('deadbeef', 'hex') END,
+  CASE WHEN n = 2 THEN NULL ELSE DATE '2024-03-05' + n END,
+  CASE WHEN n = 2 THEN NULL ELSE INTERVAL '1 day 02:03:04' END,
+  CASE WHEN n = 2 THEN NULL ELSE point(n, n + 1) END,
+  CASE WHEN n = 2 THEN NULL ELSE circle(point(n, n), n + 1) END,
+  CASE WHEN n = 2 THEN NULL ELSE ARRAY[1.2345, 2.5]::numeric(20,4)[] END,
+  CASE WHEN n = 2 THEN NULL ELSE ARRAY[9007199254740993, 1]::bigint[] END,
+  CASE WHEN n = 2 THEN NULL ELSE ARRAY[decode('00ff', 'hex')]::bytea[] END,
+  CASE WHEN n = 2 THEN NULL ELSE ARRAY[DATE '2024-03-05']::date[] END,
+  CASE WHEN n = 2 THEN NULL ELSE ARRAY[INTERVAL '3 hours']::interval[] END,
+  CASE WHEN n = 2 THEN NULL ELSE ARRAY[point(1,2)]::point[] END,
+  CASE WHEN n = 2 THEN NULL ELSE ARRAY[TIMESTAMP '2024-03-05 06:07:08.123']::timestamp[] END,
+  CASE WHEN n = 2 THEN NULL ELSE ARRAY[TIMESTAMPTZ '2024-03-05 06:07:08.123+00']::timestamptz[] END,
+  CASE WHEN n = 2 THEN NULL ELSE 'child ' || n END,
+  n * 7,
+  n % 2 = 0,
+  CASE WHEN n = 2 THEN NULL ELSE jsonb_build_object('n', n) END
+FROM encfuzz_parents p
+CROSS JOIN generate_series(1, 5) n
+WHERE p.id < 12;
+`;
+
+/** Every column of `encfuzz_children` the generator may project or sort on. */
+const ENC_CHILD_FIELDS = [
+  'id',
+  'parentId',
+  'ord',
+  'cNumeric',
+  'cBigint',
+  'cBytea',
+  'cDate',
+  'cInterval',
+  'cPoint',
+  'cCircle',
+  'cNumericArr',
+  'cBigintArr',
+  'cByteaArr',
+  'cDateArr',
+  'cIntervalArr',
+  'cPointArr',
+  'cTsArr',
+  'cTstzArr',
+  'cText',
+  'cInt',
+  'cBool',
+  'cJsonb',
+] as const;
+
+/**
+ * Random findMany args over `encfuzz_parents`, whose only job is to move which
+ * columns land in which POSITION: that is the whole of what the positional
+ * decode depends on, so `select` / `omit` are the interesting dimension and
+ * both are generated, alongside relation `limit` / `orderBy` / `where` and a
+ * nested to-one back to the parent.
+ */
+function encCase(rng: () => number): Record<string, unknown> {
+  const fields = ENC_CHILD_FIELDS;
+  const childOptions: Record<string, unknown> = {};
+  const projection = Math.floor(rng() * 3);
+  if (projection === 1) {
+    // `select`, in the caller's own key order (which the emitted order follows).
+    const keep = fields.filter(() => chance(rng, 0.45));
+    if (keep.length === 0) keep.push('id');
+    childOptions.select = Object.fromEntries(keep.map((f) => [f, true]));
+  } else if (projection === 2) {
+    childOptions.omit = Object.fromEntries(fields.filter(() => chance(rng, 0.25)).map((f) => [f, true]));
+  }
+  if (chance(rng, 0.4)) childOptions.where = { cInt: { gt: Math.floor(rng() * 20) } };
+  if (chance(rng, 0.5)) childOptions.limit = 1 + Math.floor(rng() * 3);
+  // Always totally ordered: `ord` repeats across parents but is unique WITHIN a
+  // parent, and the PK tiebreaker settles everything else.
+  childOptions.orderBy = [{ ord: pick(rng, ['asc', 'desc'] as const) }, { id: 'asc' }];
+  if (chance(rng, 0.3)) childOptions.with = { encfuzzParent: true };
+
+  const args: Record<string, unknown> = {
+    orderBy: [{ id: 'asc' }],
+    with: { encfuzzChildren: chance(rng, 0.15) ? true : childOptions },
+  };
+  if (chance(rng, 0.3)) args.where = { label: { contains: 'p1' } };
+  if (chance(rng, 0.3)) args.limit = 3 + Math.floor(rng() * 6);
+  return args;
+}
+
+describe('encoding fidelity fuzz on PostgreSQL (JSON-wire coercion types)', () => {
+  let encDb: TurbineClient;
+  let encSchema: SchemaMetadata;
+
+  pgGate.before(async () => {
+    const client = new pgDriver.Client({ connectionString: PG_URL! });
+    await client.connect();
+    try {
+      await client.query(ENC_DDL);
+    } finally {
+      await client.end();
+    }
+    encSchema = await introspect({ connectionString: PG_URL! });
+    encDb = new TurbineClient({ connectionString: PG_URL!, poolSize: 5, warnOnUnlimited: false }, encSchema);
+    await encDb.connect();
+  });
+
+  pgGate.after(async () => {
+    await encDb.disconnect();
+  });
+
+  pgGate.it('the fixture carries every JSON-wire coercion type', () => {
+    // THE VACUITY GUARD FOR THIS WHOLE ARM. `::text` casts are emitted for
+    // exactly the types in JSON_WIRE_COERCION_OIDS, so if the fixture stops
+    // carrying one of them, this arm silently stops proving anything about it.
+    const meta = encSchema.tables.encfuzz_children;
+    assert.ok(meta, 'fixture table encfuzz_children is missing');
+    const present = new Set(Object.values(meta.pgTypes ?? {}));
+    const missing = Object.keys(JSON_WIRE_COERCION_OIDS).filter((t) => !present.has(t));
+    assert.deepEqual(
+      missing,
+      [],
+      `these coercion types are not in the fixture, so the arm does not cover them: ${missing.join(', ')}`,
+    );
+  });
+
+  pgGate.it('the relation SQL actually carries ::text casts (so there is something to preserve)', () => {
+    const qi = encDb.table('encfuzz_parents') as unknown as {
+      buildFindMany(a: unknown): { sql: string };
+    };
+    const positional = qi.buildFindMany({ with: { encfuzzChildren: true }, jsonEncoding: 'positional' }).sql;
+    const object = qi.buildFindMany({ with: { encfuzzChildren: true }, jsonEncoding: 'object' }).sql;
+    assert.match(positional, /json_build_array/);
+    assert.match(object, /json_build_object/);
+    // Same cast set on both sides: positional drops the keys, nothing else.
+    const casts = (sql: string) => (sql.match(/::text/g) ?? []).length;
+    assert.ok(casts(positional) > 0, 'no ::text casts emitted; the fidelity claim is untested');
+    assert.equal(casts(positional), casts(object), 'the two encodings must cast the same columns');
+  });
+
+  for (const seed of SEEDS) {
+    pgGate.it(`seed ${seed}: object and positional agree on typed values over ${PG_CASES_PER_SEED} cases`, async () => {
+      const rng = mulberry32(seed);
+      let compared = 0;
+      let sawTypedCell = false;
+      for (let i = 0; i < PG_CASES_PER_SEED; i++) {
+        const args = encCase(rng);
+        const repro = () => `seed=${seed} case=${i}\nargs=${JSON.stringify(args)}`;
+        const obj = await runEncoded(encDb, 'encfuzz_parents', args, 'object');
+        const pos = await runEncoded(encDb, 'encfuzz_parents', args, 'positional');
+
+        assert.equal(obj.ok, pos.ok, `encodings disagree about validity: ${repro()}`);
+        if (!obj.ok && !pos.ok) {
+          assert.equal(obj.code, pos.code, `encodings threw different codes: ${repro()}`);
+          continue;
+        }
+        if (!obj.ok) continue;
+
+        // Deep equality covers value AND runtime type for Date / Buffer /
+        // string-vs-number, which is exactly where the coercion set bites:
+        // `numeric` and `int8` come back as strings, `date` as a Date, `bytea`
+        // as a Buffer, and a lost cast turns each into something else.
+        assert.deepEqual((pos as { rows: unknown[] }).rows, obj.rows, `typed value mismatch: ${repro()}`);
+        compared += 1;
+        for (const parent of obj.rows as Record<string, unknown>[]) {
+          const kids = parent.encfuzzChildren as Record<string, unknown>[] | undefined;
+          for (const kid of kids ?? []) {
+            if (typeof kid.cNumeric === 'string' || Buffer.isBuffer(kid.cBytea) || kid.cDate instanceof Date) {
+              sawTypedCell = true;
+            }
+          }
+        }
+      }
+      assert.ok(compared > 0, `seed ${seed}: every case threw; the equality half never ran`);
+      assert.ok(
+        sawTypedCell,
+        `seed ${seed}: no coercion-typed cell was ever returned, so equality proved nothing about fidelity`,
+      );
     });
   }
 });

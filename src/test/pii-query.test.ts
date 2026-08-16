@@ -204,42 +204,68 @@ describe('pii: includePii returns everything', () => {
 // Relation subqueries (join strategy)
 // ---------------------------------------------------------------------------
 
-describe('pii: relation subqueries exclude the child PII column by default', () => {
-  it('with: { posts } omits secret from the json_build_object', () => {
-    const { sql } = usersQuery().buildFindMany({ with: { posts: true } });
-    assert.match(sql, /'title'/, "the child's non-PII columns are projected");
-    assert.doesNotMatch(sql, /'secret'/, "the child's PII column must be excluded");
-  });
+/**
+ * Match a relation subquery's projection of one COLUMN, in either encoding.
+ *
+ * These assertions used to read the JSON KEY literal (`/'secret'/`), which is a
+ * property of `json_build_object` and not of the projection. Under
+ * `jsonEncoding: 'positional'` (the PostgreSQL DEFAULT) there are no key
+ * literals at all, so every `doesNotMatch(/'secret'/)` here passed for a reason
+ * that had nothing to do with PII, and would have kept passing with the PII
+ * column projected. The column reference is what both encodings emit, so this
+ * is the assertion that means the same thing in both.
+ */
+function relationColumn(column: string): RegExp {
+  return new RegExp(`\\bt\\d+\\."${column}"`);
+}
 
-  it('includePii reaches the relation subquery (secret present)', () => {
-    const { sql } = usersQuery().buildFindMany({ with: { posts: true }, includePii: UNSAFE });
-    assert.match(sql, /'secret'/, 'includePii applies to nested with levels');
-  });
+for (const jsonEncoding of ['object', 'positional'] as const) {
+  describe(`pii: relation subqueries exclude the child PII column by default (${jsonEncoding})`, () => {
+    const q = () => usersQuery(piiSchema(), { jsonEncoding });
 
-  it('relation select naming the PII column returns it (explicit opt-in per level)', () => {
-    const { sql } = usersQuery().buildFindMany({ with: { posts: { select: { secret: true } } } });
-    assert.match(sql, /'secret'/);
-  });
-
-  it('m2m relation excludes the target PII column by default and includes it under includePii', () => {
-    const base = usersQuery().buildFindMany({ with: { tags: true } });
-    assert.match(base.sql, /'label'/);
-    assert.doesNotMatch(base.sql, /'note'/, 'm2m target PII excluded by default');
-    const opted = usersQuery().buildFindMany({ with: { tags: true }, includePii: UNSAFE });
-    assert.match(opted.sql, /'note'/, 'm2m target PII returned under includePii');
-  });
-
-  it('nested with (posts → author) excludes the parent-side PII column at depth', () => {
-    const { sql } = usersQuery().buildFindMany({ with: { posts: { with: { author: true } } } });
-    // author is a users row nested under posts: its email must stay excluded.
-    assert.doesNotMatch(sql, /'email'/, 'PII excluded at every nested level');
-    const opted = usersQuery().buildFindMany({
-      with: { posts: { with: { author: true } } },
-      includePii: UNSAFE,
+    it('with: { posts } omits secret from the relation projection', () => {
+      const { sql } = q().buildFindMany({ with: { posts: true } });
+      assert.match(sql, relationColumn('title'), "the child's non-PII columns are projected");
+      assert.doesNotMatch(sql, relationColumn('secret'), "the child's PII column must be excluded");
     });
-    assert.match(opted.sql, /'email'/, 'includePii reaches deeply nested levels');
+
+    it('includePii reaches the relation subquery (secret present)', () => {
+      const { sql } = q().buildFindMany({ with: { posts: true }, includePii: UNSAFE });
+      assert.match(sql, relationColumn('secret'), 'includePii applies to nested with levels');
+    });
+
+    it('relation select naming the PII column returns it (explicit opt-in per level)', () => {
+      const { sql } = q().buildFindMany({ with: { posts: { select: { secret: true } } } });
+      assert.match(sql, relationColumn('secret'));
+    });
+
+    it('m2m relation excludes the target PII column by default and includes it under includePii', () => {
+      const base = q().buildFindMany({ with: { tags: true } });
+      assert.match(base.sql, relationColumn('label'));
+      assert.doesNotMatch(base.sql, relationColumn('note'), 'm2m target PII excluded by default');
+      const opted = q().buildFindMany({ with: { tags: true }, includePii: UNSAFE });
+      assert.match(opted.sql, relationColumn('note'), 'm2m target PII returned under includePii');
+    });
+
+    it('nested with (posts → author) excludes the parent-side PII column at depth', () => {
+      const { sql } = q().buildFindMany({ with: { posts: { with: { author: true } } } });
+      // author is a users row nested under posts: its email must stay excluded.
+      assert.doesNotMatch(sql, relationColumn('email'), 'PII excluded at every nested level');
+      const opted = q().buildFindMany({
+        with: { posts: { with: { author: true } } },
+        includePii: UNSAFE,
+      });
+      assert.match(opted.sql, relationColumn('email'), 'includePii reaches deeply nested levels');
+    });
+
+    it('the encoding under test is the one actually emitted', () => {
+      // Vacuity guard: without this the whole block would silently run twice
+      // against the same SQL if the per-query option ever stopped being honoured.
+      const { sql } = q().buildFindMany({ with: { posts: true } });
+      assert.match(sql, jsonEncoding === 'positional' ? /json_build_array/ : /json_build_object/);
+    });
   });
-});
+}
 
 // ---------------------------------------------------------------------------
 // Batched loader
@@ -531,8 +557,8 @@ describe('pii: includePii participates in the SQL-cache fingerprint', () => {
     const off = fresh({ with: { posts: true } });
     const on = fresh({ with: { posts: true }, includePii: UNSAFE });
     assert.notEqual(off, on, 'default and includePii SQL must differ');
-    assert.doesNotMatch(off, /'secret'/);
-    assert.match(on, /'secret'/);
+    assert.doesNotMatch(off, relationColumn('secret'));
+    assert.match(on, relationColumn('secret'));
   });
 
   it('warm cache with includePii=false, then hit includePii=true: no cross-serve', () => {
@@ -541,8 +567,8 @@ describe('pii: includePii participates in the SQL-cache fingerprint', () => {
     // interface: it must NOT be served the cached no-PII SQL.
     const cold = q.buildFindMany({ with: { posts: true } } as never) as { sql: string };
     const hot = q.buildFindMany({ with: { posts: true }, includePii: UNSAFE } as never) as { sql: string };
-    assert.doesNotMatch(cold.sql, /'secret'/);
-    assert.match(hot.sql, /'secret'/);
+    assert.doesNotMatch(cold.sql, relationColumn('secret'));
+    assert.match(hot.sql, relationColumn('secret'));
     assert.equal(hot.sql, fresh({ with: { posts: true }, includePii: UNSAFE }));
   });
 
@@ -589,6 +615,6 @@ describe('pii: untagged schemas emit byte-identical SQL', () => {
     ).buildFindMany({
       with: { posts: true },
     });
-    assert.match(sql, /'secret'/, 'untagged posts.secret is a normal column');
+    assert.match(sql, relationColumn('secret'), 'untagged posts.secret is a normal column');
   });
 });

@@ -35,11 +35,11 @@ const result = await db.$transaction(async (tx) => {
 
 The `tx` client has the same surface as `db`, every table accessor, every method. Queries *must* use `tx`, not `db`, or they'll run on a different connection outside the transaction.
 
-> **Note:** If the opening `BEGIN` itself fails, Turbine no longer fires a best-effort `ROLLBACK` afterward (fixed in v0.30). On single-handle engines like embedded PowDB, that stray rollback could tear down an unrelated open transaction; skipping it keeps a failed `BEGIN` from corrupting other work.
+> **Note:** If the opening `BEGIN` itself fails, Turbine does not fire a best-effort `ROLLBACK` afterward: on single-handle engines like embedded PowDB, a stray rollback could tear down an unrelated open transaction.
 
 ## $transaction, batch form
 
-Pass an array of `DeferredQuery` objects (the `build*` methods, same as [`pipeline`](#pipeline--n-queries-1-round-trip)) and `$transaction` runs them atomically on one connection, `BEGIN`, each query in order, `COMMIT`, returning a positionally-typed tuple of each query's result. Any error rolls the whole batch back and rethrows. Unlike a pipeline, this **is** atomic.
+Pass an array of `DeferredQuery` objects (the `build*` methods, same as [`pipeline`](#pipeline-n-queries-1-round-trip)) and `$transaction` runs them atomically on one connection, `BEGIN`, each query in order, `COMMIT`, returning a positionally-typed tuple of each query's result. Any error rolls the whole batch back and rethrows.
 
 ```ts
 const [user, postCount] = await db.$transaction([
@@ -49,9 +49,9 @@ const [user, postCount] = await db.$transaction([
 // user: User | null, postCount: number, all-or-nothing
 ```
 
-Use the batch form when you have a fixed set of independent statements that must succeed or fail together and you don't need a callback's control flow. An empty array resolves to `[]` without opening a transaction. The callback form above is unchanged, `$transaction` accepts either.
+Use the batch form when a fixed set of independent statements must succeed or fail together and you don't need a callback's control flow. An empty array resolves to `[]` without opening a transaction. `$transaction` accepts either form.
 
-> **Batch form vs pipeline:** both take `DeferredQuery[]`. The [pipeline](#pipeline--n-queries-1-round-trip) optimizes for latency (one round-trip, **not** atomic); the batch `$transaction` optimizes for atomicity (`BEGIN`…`COMMIT`, rollback on any failure).
+> **Batch form vs pipeline:** both take `DeferredQuery[]`. The [pipeline](#pipeline-n-queries-1-round-trip) optimizes for latency (one round-trip, **not** atomic); the batch `$transaction` optimizes for atomicity.
 
 ## Isolation levels
 
@@ -76,7 +76,7 @@ When `Serializable` detects a conflict, it throws `SerializationFailureError` (T
 
 ## Timeouts
 
-Per-transaction timeout in milliseconds, enforced client-side: if the callback exceeds `timeout`, Turbine destroys the connection (aborting any in-flight statement server-side) and rolls back:
+Per-transaction timeout in milliseconds, enforced client-side. If the callback exceeds `timeout`, Turbine destroys the connection (aborting any in-flight statement server-side), rolls back, and throws `TimeoutError` (TURBINE_E002):
 
 ```ts
 await db.$transaction(
@@ -86,8 +86,6 @@ await db.$transaction(
   { timeout: 5_000 },
 );
 ```
-
-A query that exceeds the timeout throws `TimeoutError` (TURBINE_E002) and the transaction rolls back.
 
 ## Nested transactions, real SAVEPOINTs
 
@@ -111,11 +109,11 @@ await db.$transaction(async (tx) => {
 });
 ```
 
-SAVEPOINT names are auto-generated with a counter so nesting is safe.
+SAVEPOINT names are auto-generated with a counter, so nesting is safe.
 
 ## Multi-tenant queries with RLS session context
 
-Set transaction-local Postgres settings (GUCs) so PostgreSQL Row-Level Security policies that call `current_setting()` filter rows for you. This is the clean way to do multi-tenant isolation: the database enforces the tenant boundary, not your application code.
+Set transaction-local Postgres settings (GUCs) so PostgreSQL Row-Level Security policies that call `current_setting()` filter rows for you: the database enforces the tenant boundary, not your application code.
 
 Pass `sessionContext` to `$transaction`:
 
@@ -169,19 +167,19 @@ await withRetry(() =>
 
 `withRetry` retries only errors carrying `isRetryable === true` and rethrows everything else at once. Tune it with `maxAttempts` (default `3`), `baseDelay` (default `50` ms), `maxDelay` (default `5000` ms), and `onRetry(error, attempt)`; backoff is exponential with jitter.
 
-The `as const` on `isRetryable` means `err.isRetryable` is the literal type `true` on those classes and never narrows to `false`, so your control flow type-checks without casts, whether you use the helper or write your own loop.
+The `as const` on `isRetryable` means `err.isRetryable` is the literal type `true` on those classes and never narrows to `false`, so your control flow type-checks without casts.
 
 ## pipeline, N queries, 1 round-trip
 
 A pipeline bundles independent queries and sends them together using the Postgres extended-query pipeline protocol. Each query gets its own parsed SQL, own params, own typed result. **The batch is transactional by default** (`transactional: true`): all of it is wrapped in one `BEGIN`/`COMMIT`, so if query 3 fails the whole batch rolls back and nothing is durable.
 
-Pass `{ transactional: false }` when you want the opposite, each query independent, a failure in one leaving the others untouched:
+Pass `{ transactional: false }` when you want each query independent, a failure in one leaving the others untouched:
 
 ```ts
 const results = await db.pipeline(queries, { transactional: false });
 ```
 
-On that path a partial failure rejects with a `PipelineError` (TURBINE_E014) carrying a per-slot `.results` array, so you can see which queries succeeded. The transactional default never produces a `PipelineError`, it rethrows the underlying typed error after the rollback.
+On that path a partial failure rejects with a `PipelineError` (TURBINE_E014) carrying a per-slot `.results` array, so you can see which queries succeeded. The transactional default never produces a `PipelineError`; it rethrows the underlying typed error after the rollback.
 
 ```ts
 const [user, posts, commentCount, orgs, latestLogin] = await db.pipeline([
@@ -193,13 +191,11 @@ const [user, posts, commentCount, orgs, latestLogin] = await db.pipeline([
 ]);
 ```
 
-Each `build*` method returns a `DeferredQuery<T>`, `{ sql, params, transform, tag }`. The pipeline driver writes them all to the wire, reads all responses, applies each `transform`.
-
-Result type is a tuple that matches the input order and carries the per-query return type.
+Each `build*` method returns a `DeferredQuery<T>`, `{ sql, params, transform, tag }`. The pipeline driver writes them all to the wire, reads all responses, applies each `transform`. The result type is a tuple that matches the input order and carries the per-query return type.
 
 ### Driving a pipeline yourself
 
-`db.pipeline()` is the ergonomic wrapper. The underlying function is exported too, for cases where you hold a `pg.Pool` directly rather than a `TurbineClient`:
+`db.pipeline()` is the wrapper. The underlying function is exported too, for cases where you hold a `pg.Pool` directly rather than a `TurbineClient`:
 
 ```ts
 import { executePipeline, pipelineSupported } from 'turbine-orm';
@@ -217,13 +213,13 @@ const results = await executePipeline(pool, queries, options);
 
 ## When pipeline loses
 
-- **One query depends on another's result.** Pipeline queries must be independent, they're all submitted before any response is read.
+- **One query depends on another's result.** Pipeline queries must be independent; they're all submitted before any response is read.
 - **You need interactive control.** A pipeline is one shot: no reading a row, branching, then writing. Use the callback form of `$transaction`.
 - **You opted out of the transaction and a query might fail.** With `{ transactional: false }`, `PipelineError` (TURBINE_E014) wraps the partial-success case; decide how you want to handle each slot.
 
 ## Batching inside a transaction
 
-There is **no `tx.pipeline()`**. The extended-query pipeline protocol needs to own the connection, and inside a transaction the connection is already owned by the `BEGIN` block, so the two cannot be combined. If you want a set of statements to run atomically as one unit, use the array form of `$transaction` at the top level instead:
+There is **no `tx.pipeline()`**. The extended-query pipeline protocol needs to own the connection, and inside a transaction the connection is already owned by the `BEGIN` block. If you want a set of statements to run atomically as one unit, use the array form of `$transaction` at the top level:
 
 ```ts
 const [user, posts] = await db.$transaction([
@@ -232,7 +228,7 @@ const [user, posts] = await db.$transaction([
 ]);
 ```
 
-That runs every statement on one connection inside one `BEGIN` / `COMMIT`, and rolls the whole batch back on the first failure. It is sequential on the connection by default, which is safe on every driver including HTTP and serverless pools. The one-write-burst path needs **both** conditions to hold: the checked-out connection advertises `supportsPipelining`, **and** the active dialect's `resultStrategy` is not `'reselect'`. When both are true the statements are dispatched in one write burst with replies collected in order, saving a round trip each. MySQL is `'reselect'`, so the burst never happens there and the batch always runs sequentially. Either way this is a transaction, not the pipeline protocol: for that, use `db.pipeline(...)` outside a transaction.
+That runs every statement on one connection inside one `BEGIN` / `COMMIT`, and rolls the whole batch back on the first failure. It is sequential on the connection by default, which is safe on every driver including HTTP and serverless pools. The one-write-burst path needs **both** conditions to hold: the checked-out connection advertises `supportsPipelining`, **and** the active dialect's `resultStrategy` is not `'reselect'`. When both are true the statements are dispatched in one write burst with replies collected in order, saving a round trip each. MySQL is `'reselect'`, so the batch always runs sequentially there. Either way this is a transaction, not the pipeline protocol: for that, use `db.pipeline(...)` outside a transaction.
 
 ## TransactionClient reference
 
@@ -244,21 +240,21 @@ The `tx` handed to your `$transaction` callback is a `TransactionClient`, and it
 |---|---|---|
 | Table accessors | `tx.users`, `tx.orderItems`, ... | Same `QueryInterface` API as `db.users`. Accessor names are the camelCase form of each table name in the schema, defined at construction. |
 | `tx.table<T>(name)` | `(name: string) => QueryInterface<T>` | Escape hatch for a table not present in the generated types. Same instance is reused for repeated calls. |
-| `tx.$transaction(fn)` | `(fn: (tx: TransactionClient) => Promise<R>) => Promise<R>` | Nested block via `SAVEPOINT sp_1`, `sp_2`, ... Releases the savepoint on success, rolls back **to the savepoint only** on throw, then rethrows. **Takes no options object**: isolation level, timeout and `sessionContext` are properties of the outer transaction and cannot be changed part way through. Note that `fn` receives the *same* `tx`, not a child object. |
-| `tx.raw` | ``tx.raw<T>`SELECT ... ${value}` `` | Tagged template, and the one to reach for in application code. Every `${value}` becomes a placeholder bound by the driver, so a value cannot end up concatenated into the SQL text. Returns the rows. Driver errors are translated by `wrapPgError`, so you get the same typed errors as ORM queries. |
+| `tx.$transaction(fn)` | `(fn: (tx: TransactionClient) => Promise<R>) => Promise<R>` | Nested block via `SAVEPOINT sp_1`, `sp_2`, ... Releases the savepoint on success, rolls back **to the savepoint only** on throw, then rethrows. **Takes no options object**: isolation level, timeout and `sessionContext` are properties of the outer transaction and cannot be changed part way through. `fn` receives the *same* `tx`, not a child object. |
+| `tx.raw` | ``tx.raw<T>`SELECT ... ${value}` `` | Tagged template, the one to reach for in application code. Every `${value}` becomes a placeholder bound by the driver, so a value cannot end up concatenated into the SQL text. Returns the rows. Driver errors are translated by `wrapPgError`, so you get the same typed errors as ORM queries. |
 | `tx.schema` | `SchemaMetadata` | The metadata the transaction was built from. |
 
 <Callout type="note">
-**Transaction-scoped raw SQL is not instrumented.** `tx.raw` (and the internal `tx.rawQuery` below) go straight to the transaction's connection: they emit no `$on('query')` event, run no middleware, and record no timing, so they never appear in query listeners or `$observe` metrics. Table-scoped calls inside the same transaction (`tx.users.findMany(...)`) are instrumented exactly as they are outside one. If you need a raw statement to show up in your query log, log it yourself at the call site.
+**Transaction-scoped raw SQL is not instrumented.** `tx.raw` (and the internal `tx.rawQuery` below) go straight to the transaction's connection: no `$on('query')` event, no middleware, no timing, so they never appear in query listeners or `$observe` metrics. Table-scoped calls inside the same transaction (`tx.users.findMany(...)`) are instrumented exactly as they are outside one. If you need a raw statement in your query log, log it at the call site.
 </Callout>
 
 ### The one internal member
 
-`tx.rawQuery(text, params)` is marked `@internal` and is **not** application API. It is the seam `turbine-orm/prisma-compat` detects by shape (`typeof tx.rawQuery === 'function'`) so it can run compat raw SQL on the transaction's own connection instead of quietly falling back to a pool connection outside the transaction. It takes the SQL as a plain string rather than a tagged template, which moves the escaping discipline to the caller, and that is precisely the property `tx.raw` exists to remove. It still exists at runtime and still typechecks, so code already calling it keeps working; it is simply no longer advertised. Use `tx.raw`.
+`tx.rawQuery(text, params)` is marked `@internal` and is **not** application API. It is the seam `turbine-orm/prisma-compat` detects by shape (`typeof tx.rawQuery === 'function'`) so it can run compat raw SQL on the transaction's own connection instead of falling back to a pool connection outside the transaction. It takes the SQL as a plain string, which moves the escaping discipline to the caller, the property `tx.raw` exists to remove. It still exists at runtime and still typechecks, so existing callers keep working; use `tx.raw`.
 
 ### What `tx` does not have
 
-Reaching for any of these is a **compile error** (`TS2339: Property '<x>' does not exist on type 'TransactionClient'`). `TransactionClient` is a plain class whose declared members are `table()`, `$transaction()`, `raw`, `schema` and the internal `rawQuery()` above, with no index signature, so TypeScript rejects every name below before the code ever runs. The table accessors are installed at construction with `Object.defineProperty` and typed by the generated `TypedTransactionClient` subclass, which declares one property per table. Neither the base class nor the generated subclass has a catch-all index signature, so nothing below type-checks.
+Reaching for any of these is a **compile error** (`TS2339: Property '<x>' does not exist on type 'TransactionClient'`). `TransactionClient` declares exactly the members above, the table accessors are installed at construction and typed by the generated `TypedTransactionClient` subclass (one property per table), and neither class has an index signature, so nothing below type-checks.
 
 | Missing | Use instead | Why |
 |---|---|---|
@@ -274,8 +270,6 @@ Reaching for any of these is a **compile error** (`TS2339: Property '<x>' does n
 | `tx.$primary` | Nothing needed | Transactions always run on the primary. Read-replica routing never applies inside one. |
 | `tx.$withSession` | `db.$transaction(fn, { sessionContext })` | Session GUCs are applied right after `BEGIN`, before your callback runs. |
 | `tx.pool`, `tx.stats`, `tx.disconnect()`, `tx.end()` | The equivalents on `db` | The transaction does not own a pool and must not close one. |
-
-Because every one of these is caught at compile time, the practical failure mode is a red squiggle in your editor, not a production `TypeError`. If you are reaching for one of them, the "use instead" column is the actual answer.
 
 ### Transaction options
 
@@ -296,7 +290,7 @@ await db.$transaction(
 
 - **`isolationLevel`**: one of `'ReadUncommitted'`, `'ReadCommitted'`, `'RepeatableRead'`, `'Serializable'`. Composed into the `BEGIN` statement by the active dialect. Under `Serializable` or `RepeatableRead`, expect `SerializationFailureError` (`TURBINE_E013`) and retry the whole block.
 - **`timeout`**: milliseconds. When it fires, the transaction is rolled back and the connection is destroyed rather than returned to the pool, so the in-flight backend query is actually aborted rather than left running. You get a `TimeoutError` (`TURBINE_E002`).
-- **`sessionContext`**: a record of transaction-local Postgres GUCs, applied as `SELECT set_config($1, $2, true)` immediately after `BEGIN` and before your callback. Both the name and the value are bound parameters, and the name is additionally checked against a strict identifier pattern, so a malformed name throws `ValidationError` and rolls back before any query runs. `is_local = true` means the setting resets on `COMMIT` or `ROLLBACK` and never leaks onto the pooled connection. This is Postgres-only: on an engine whose dialect reports no RLS support it throws `UnsupportedFeatureError` (`TURBINE_E017`). `db.$withSession(context, fn)` is the shorthand for `db.$transaction(fn, { sessionContext: context })`.
+- **`sessionContext`**: a record of transaction-local Postgres GUCs, applied as `SELECT set_config($1, $2, true)` immediately after `BEGIN` and before your callback. Both the name and the value are bound parameters, and the name is additionally checked against a strict identifier pattern, so a malformed name throws `ValidationError` and rolls back before any query runs. `is_local = true` means the setting resets on `COMMIT` or `ROLLBACK` and never leaks onto the pooled connection. Postgres-only: on an engine whose dialect reports no RLS support it throws `UnsupportedFeatureError` (`TURBINE_E017`). `db.$withSession(context, fn)` is the shorthand.
 
 ### The raw transaction API
 

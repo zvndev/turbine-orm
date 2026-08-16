@@ -7,7 +7,7 @@ export const metadata = {
 
 # Global Filters
 
-A global filter is a `WHERE` predicate Turbine merges into **every** query on a table, reads, mutations, and the relation subqueries that target it, so you never repeat it at the call site. Two patterns motivate it:
+A global filter is a `WHERE` predicate Turbine merges into **every** query on a table: reads, mutations, and the relation subqueries that target it. Two patterns motivate it:
 
 - **Soft delete**, hide rows where `deletedAt` is set, everywhere, without threading `where: { deletedAt: null }` through every query.
 - **Multi-tenancy**, scope every query to the current tenant, evaluated per request.
@@ -65,7 +65,7 @@ The filter's **shape** participates in the SQL cache, and its **values** are re-
 
 ## Filters flow into relations
 
-The reason global filters are more than a call-site helper: they apply to **relation subqueries** too. A filter on `posts` restricts `posts` wherever it appears, including when loaded through a parent's `with` clause.
+Global filters apply to **relation subqueries** too. A filter on `posts` restricts `posts` wherever it appears, including when loaded through a parent's `with` clause.
 
 ```ts
 // globalFilters: { posts: { deletedAt: null } }
@@ -76,17 +76,17 @@ const users = await db.users.findMany({
 // soft-deleted posts never appear under any user.
 ```
 
-This coverage is complete. A target-table filter is applied to:
+A target-table filter is applied to:
 
 - The `with` relation subquery (both the default `join` strategy and the `batched` strategy)
 - Relation filters, `some`, `every`, `none`, and belongsTo `is`
 - Relation `_count` and relation `orderBy: { posts: { _count: 'desc' } }`
 
-So a soft-delete filter on `posts` means a user's post `_count` counts only live posts, and `where: { posts: { some: {...} } }` only matches live posts, consistently, with no extra code.
+So a soft-delete filter on `posts` means a user's post `_count` counts only live posts, and `where: { posts: { some: {...} } }` matches only live posts.
 
 ## Mutations and the empty-where guard
 
-Global filters apply to `update`, `updateMany`, `delete`, `deleteMany`, and the conflict-`UPDATE` of `upsert`. `create` and `createMany` are **never** filtered. You're inserting a new row, there's nothing to scope.
+Global filters apply to `update`, `updateMany`, `delete`, `deleteMany`, and the conflict-`UPDATE` of `upsert`. `create` and `createMany` are **never** filtered: an insert has nothing to scope.
 
 One deliberate interaction: a global filter does **not** satisfy the [empty-where guard](/queries#delete--deletemany). The guard checks the *user-supplied* `where`, so an unguarded mass mutation is still refused even when a filter is configured:
 
@@ -133,13 +133,13 @@ import { UNSAFE } from 'turbine-orm';
 Because all three are ordinary siblings of `where` on the same options object, and the idiomatic handler spreads a request body:
 
 ```ts
-// The shape this closes. Do not ship this either way, but it used to be a breach.
+// The shape this closes: a request body spread straight into query args.
 app.get('/users', (req, res) => db.users.findMany({ ...req.body }));
 ```
 
 A client posting `{"where":{"name":"x"},"skipGlobalFilters":true}` got the same statement **minus the tenant predicate**: the documented multi-tenancy mechanism, removed over the wire by the person it was there to contain. `includePii: true` unlocked the PII projection through the same hole, and `allowFullTableScan: true` disarmed the guard that stops an unqualified `UPDATE` or `DELETE`.
 
-Typing the options `boolean` and writing "be careful" is not a fix. This is a mass-assignment shape, and mass assignment happens precisely because nobody enumerated the keys. `JSON.parse` cannot produce a symbol, and neither can a query string, a form body, or a `structuredClone` of parsed input. There is no untrusted-data path that puts `UNSAFE` on an args object at all, so the escalation stops being discouraged and becomes structurally impossible, which is the only version of the property that survives the next refactor.
+Typing the options `boolean` and writing "be careful" is not a fix: this is a mass-assignment shape, and mass assignment happens precisely because nobody enumerated the keys. `JSON.parse` cannot produce a symbol, and neither can a query string, a form body, or a `structuredClone` of parsed input. No untrusted-data path can put `UNSAFE` on an args object, so the escalation is structurally impossible rather than discouraged.
 
 The array form is policed exactly as hard as the bare one, because `{"skipGlobalFilters":["users"]}` is the same breach with one extra step. `[UNSAFE, 'posts']` is accepted; `['posts']` is not.
 
@@ -156,7 +156,7 @@ The array form is policed exactly as hard as the bare one, because `{"skipGlobal
 
 ### Upgrading from `true`
 
-This is a **breaking change** on those three options, and it is deliberately loud rather than quiet.
+This is a **breaking change** on those three options, and deliberately loud.
 
 | Before | After |
 |---|---|
@@ -165,9 +165,9 @@ This is a **breaking change** on those three options, and it is deliberately lou
 | `includePii: true` | `includePii: UNSAFE` |
 | `allowFullTableScan: true` | `allowFullTableScan: UNSAFE` |
 
-**TypeScript finds every one of them for you.** The option types are now `Unsafe`, so each row of that table is a compile error before it is a runtime error: type-check the project and the compiler hands you the complete list of call sites to change.
+**TypeScript finds every one of them for you.** The option types are `Unsafe`, so each row of that table is a compile error before it is a runtime error: type-check the project and the compiler hands you the complete list of call sites to change.
 
-That includes the boolean shapes, which is the part worth reading twice. `allowFullTableScan: false` does **not** typecheck, and neither does `allowFullTableScan: someFeatureFlag`. A conditional call site is written by adding the key or not:
+That includes the boolean shapes: `allowFullTableScan: false` does **not** typecheck, and neither does `allowFullTableScan: someFeatureFlag`. A conditional call site adds the key or not:
 
 ```ts
 await db.sessions.deleteMany({

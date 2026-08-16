@@ -29,12 +29,12 @@ export const metadata: Metadata = {
     template: '%s, Turbine ORM',
   },
   description:
-    'Postgres-native TypeScript ORM built for a database with real rows in it: a read-only-by-default Studio, PII enforced in the emitted SQL, errors that carry keys not values, and destructive migrations that require consent. One dependency, edge-ready, deep type inference.',
+    'A Postgres ORM written from scratch, with one runtime dependency (pg). Typed queries compiled straight to SQL, nested relations in one statement, an 11-tool read-only MCP server for coding agents, offline index advice, and migration guards. MIT.',
   metadataBase: new URL('https://turbineorm.dev'),
   openGraph: {
     title: 'Turbine ORM',
     description:
-      'Postgres-native TypeScript ORM: read-only-by-default Studio, PII enforced in the SQL, errors that never carry values, consent-gated destructive migrations, one dependency, deep with-clause type inference.',
+      'A Postgres ORM written from scratch. One dependency, no WASM. Nested relations in one statement, a read-only MCP server for agents, offline index advice, migration guards. MIT.',
     url: 'https://turbineorm.dev',
     siteName: 'Turbine ORM',
     type: 'website',
@@ -43,7 +43,7 @@ export const metadata: Metadata = {
     card: 'summary_large_image',
     title: 'Turbine ORM',
     description:
-      'Postgres-native TypeScript ORM. Read-only-by-default Studio, PII enforced in the SQL, errors that never carry values. One dependency. Edge-ready.',
+      'A Postgres ORM written from scratch. One dependency, no WASM. Nested relations in one statement, read-only agent tools, offline index advice. MIT.',
   },
   icons: {
     icon: '/favicon.svg',

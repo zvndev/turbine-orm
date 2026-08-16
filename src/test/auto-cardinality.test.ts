@@ -150,7 +150,10 @@ describe("'auto', to-one cardinality", () => {
     const { q, calls } = db();
     await q.findMany({ with: { order: { with: { vendor: true } } } } as never);
     const base = calls.find((c) => /FROM "order_items"/.test(c.sql))!;
-    assert.doesNotMatch(base.sql, /json_build_object/, 'the to-one subquery left the base statement');
+    // The relation ALIAS, not the row encoder: `json_build_object` is absent
+    // under `jsonEncoding: 'positional'` (PostgreSQL's default) whether or not
+    // the relation left the statement, so the encoder makes a vacuous negative.
+    assert.doesNotMatch(base.sql, /AS "order"/, 'the to-one subquery left the base statement');
     assert.ok(
       calls.some((c) => /FROM "orders"/.test(c.sql)),
       'a flat follow-up loads the to-one parent',
@@ -161,7 +164,11 @@ describe("'auto', to-one cardinality", () => {
     const { q, calls } = db();
     await q.findMany({ limit: 50, with: { order: { with: { vendor: true } } } } as never);
     assert.equal(calls.length, 1, 'bounded parent set → one statement');
-    assert.match(calls[0]!.sql, /json_build_object/);
+    // The relation is projected INSIDE the one statement. Asserted on the
+    // relation alias rather than the row encoder: which encoder appears is
+    // `jsonEncoding`'s business (PostgreSQL defaults to json_build_array) and
+    // has nothing to do with the strategy this file is about.
+    assert.match(calls[0]!.sql, /AS "order"/);
   });
 
   it('a limit above the threshold loads batched again', async () => {
@@ -246,7 +253,7 @@ describe("'auto', to-one cardinality", () => {
     const { q, calls } = db();
     await q.findMany({ with: { order: true }, relationLoadStrategy: 'join' } as never);
     assert.equal(calls.length, 1);
-    assert.match(calls[0]!.sql, /json_build_object/);
+    assert.match(calls[0]!.sql, /AS "order"/);
   });
 
   it('findUnique / findFirst keep the join (their parent set is one row)', async () => {

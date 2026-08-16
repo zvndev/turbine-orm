@@ -21,6 +21,14 @@ import {
   snakeToCamel,
   type TableMetadata,
 } from '../schema.js';
+import {
+  COMPILE_OPERATIONS,
+  type CompileOperation,
+  carriesColumnNamingArg,
+  collectAggregateColumnNames,
+  compileQueryPlan,
+  isAggregateShaped,
+} from './compile-query.js';
 import { CATALOGUED_ERROR_CODES, explainErrorCode } from './error-catalog.js';
 import { listMigrationFiles } from './migrate.js';
 import { assertNoPiiPredicates as assertNoPiiPredicatesShared } from './pii-predicate-guard.js';
@@ -248,6 +256,29 @@ const TOOLS: ToolDefinition[] = [
           type: 'object',
           description: 'Optional field selection map (camelCase or column names → true).',
           additionalProperties: { type: 'boolean' },
+        },
+      },
+      required: ['table'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'compile_query',
+    description:
+      'Compile a Turbine read query to the EXACT SQL it would send, WITHOUT running it: no statement is executed and no row is read, so this is safe to call on production and safe to call in a loop. Use it before you write the query into code. Pass `table`, an `operation` (findMany / findUnique / findFirst / count / aggregate / groupBy, default findMany) and `args`, the same object you would pass to that method. Returns the SQL, the bound parameters, how many STATEMENTS the query costs at execution (a `with` clause can be one join or one follow-up per relation), which relation-load strategy it takes, whether it is bounded by a LIMIT or reads the whole table, the relation depth, and warnings such as a relation whose correlation column has no index. A query that FAILS to compile is a successful answer, not an error: an unknown column (TURBINE_E003), an unknown relation (TURBINE_E005) or the empty-where guard comes back as `ok: false` with the code, the message and how to fix it. READ OPERATIONS ONLY, deliberately: this server has no write surface and compiling one would be the first. A where or orderBy on a PII-tagged or secret-named column is refused, exactly as in explain_query.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        table: { type: 'string', description: 'Table name (must exist in the introspected schema).' },
+        operation: {
+          type: 'string',
+          enum: [...COMPILE_OPERATIONS],
+          description: 'Which read method to compile. Defaults to findMany.',
+        },
+        args: {
+          type: 'object',
+          description:
+            'The query args, exactly as the method takes them: where / orderBy / with / select / omit / limit / offset / take / cursor / distinct / relationLoadStrategy for the find methods, and by / having / _count / _sum / _avg / _min / _max for aggregate and groupBy. Field and relation names are validated against the live schema.',
         },
       },
       required: ['table'],
@@ -502,6 +533,9 @@ async function callTool(params: unknown, ctx: McpContext): Promise<unknown> {
       break;
     case 'explain_query':
       result = await explainQuery(ctx, args);
+      break;
+    case 'compile_query':
+      result = await compileQuery(ctx, args);
       break;
     case 'sample_rows':
       result = await sampleRows(ctx, requiredString(args, 'table'), optionalLimit(args.limit));
@@ -882,6 +916,26 @@ async function explainQuery(ctx: McpContext, args: JsonObject): Promise<unknown>
  * column can be shown to be safe, so every where/orderBy is refused rather than
  * assumed harmless.
  */
+/**
+ * Why this column may not appear in a predicate, or null when it may.
+ *
+ * The two reasons are the two `sample_rows` already refuses to FETCH
+ * (`classifyHiddenColumns`), and they are deliberately the same set: a column
+ * whose bytes are too sensitive to sample is too sensitive to binary-search out
+ * of the planner. A column absent from the table is not judged here, the builder
+ * rejects it by name a moment later.
+ *
+ * ONE definition, shared by `explain_query` and `compile_query`. It was inline
+ * in the former, and lifting it out is the same move that made the WALK shared:
+ * two tools that hide different sets of columns are two perimeters, and the
+ * weaker one is the one an attacker uses.
+ */
+function hiddenColumnReason(owner: TableMetadata, column: string): string | null {
+  if (owner.columns.some((col) => col.name === column && col.pii === true)) return 'is PII-tagged';
+  if (SECRET_NAME_PATTERN.test(column)) return 'has a secret-looking name';
+  return null;
+}
+
 function assertNoPiiPredicates(
   args: Record<string, unknown>,
   table: TableMetadata,
@@ -900,20 +954,7 @@ function assertNoPiiPredicates(
 
   assertNoPiiPredicatesShared(args, table, {
     metadata,
-    /**
-     * Why this column may not appear in a predicate, or null when it may.
-     *
-     * The two reasons are the two `sample_rows` already refuses to FETCH
-     * (`classifyHiddenColumns`), and they are deliberately the same set: a
-     * column whose bytes are too sensitive to sample is too sensitive to
-     * binary-search out of the planner. A column absent from the table is not
-     * judged here, the builder rejects it by name a moment later.
-     */
-    hiddenReason: (owner, column) => {
-      if (owner.columns.some((col) => col.name === column && col.pii === true)) return 'is PII-tagged';
-      if (SECRET_NAME_PATTERN.test(column)) return 'has a secret-looking name';
-      return null;
-    },
+    hiddenReason: hiddenColumnReason,
     refuseColumn: (owner, column, why) => {
       throw jsonRpcError(
         -32602,
@@ -938,6 +979,192 @@ function assertNoPiiPredicates(
       );
     },
   });
+}
+
+// ---------------------------------------------------------------------------
+// compile_query, the build half of the ORM with the execute half removed
+// ---------------------------------------------------------------------------
+
+/**
+ * Compile a read query to SQL and describe it, WITHOUT running it.
+ *
+ * WHAT THIS TOOL DOES AND DOES NOT TOUCH. It reads the CATALOG, once, in its
+ * own `BEGIN READ ONLY` transaction, because it cannot validate a column name
+ * against a schema it has not seen. That read finishes and the connection goes
+ * back to the pool BEFORE anything is compiled: the compile itself is handed
+ * `SEALED_POOL` (see `cli/compile-query.ts`), whose every method throws, so the
+ * compiled statement has no live connection to escape down and the "compiles,
+ * never executes" claim is a property of the code rather than of this comment.
+ * That split is also why the compile is not inside `withReadOnly`: a build walk
+ * on a deep `with` clause has no business holding one of a max:2 pool's
+ * connections while an agent waits.
+ *
+ * WHY THE PII GUARD RUNS HERE AT ALL, given this tool returns no row and no row
+ * ESTIMATE, and so is not the extraction oracle `explain_query` is. Two
+ * reasons, and the first is the load-bearing one. A tool that will compile
+ * `WHERE "api_key" LIKE $1` is a tool that authors the probe for the agent to
+ * run somewhere this server does not control; refusing to write it keeps one
+ * rule ("do not build queries that interrogate a hidden value") rather than two
+ * that differ by which tool you asked. And second, an unguarded compile is a
+ * cheap way to discover which SPELLINGS of a predicate against a hidden column
+ * the builder accepts, which is reconnaissance for the tool that does leak. The
+ * guard is the same shared walker, with the same `hiddenColumnReason` policy
+ * `explain_query` uses, so the two cannot drift apart.
+ */
+async function compileQuery(ctx: McpContext, args: JsonObject): Promise<unknown> {
+  // Same explicit rejection explain_query makes: an agent that reaches for a
+  // raw-SQL argument should be told the surface does not exist, not told that
+  // `table` is missing.
+  if ('sql' in args) {
+    throw jsonRpcError(
+      -32602,
+      'compile_query never accepts SQL; it PRODUCES it. Pass table + operation + args (the object you would ' +
+        'hand to findMany / findUnique / findFirst / count / aggregate / groupBy).',
+    );
+  }
+
+  const tableName = requiredString(args, 'table');
+  const operation = parseCompileOperation(args.operation);
+  const queryArgs = parseCompileArgs(args.args);
+
+  const { metadata, piiTags } = await withReadOnly(ctx, (client) => loadSchemaMetadata(client, ctx.options));
+  const table = requireTable(metadata, tableName);
+
+  assertCompileHidesNothing(queryArgs, operation, table, metadata, piiTags);
+
+  let report: ReturnType<typeof compileQueryPlan>;
+  try {
+    report = compileQueryPlan({ metadata, table, operation, args: queryArgs });
+  } catch (err) {
+    // Not a TurbineError (compileQueryPlan turns those into an `ok: false`
+    // answer): a malformed args shape the builder rejected some other way.
+    throw jsonRpcError(-32602, errorMessage(err));
+  }
+
+  return {
+    schema: ctx.options.schema,
+    ...report,
+    executed: false,
+    executedNote:
+      'Nothing was executed. This tool compiles the statement and returns it; the only database access it makes ' +
+      'is the read-only catalog read that resolves table, column and relation names.',
+  };
+}
+
+/** The requested operation, defaulted to findMany and checked against the closed set. */
+function parseCompileOperation(value: unknown): CompileOperation {
+  if (value === undefined || value === null) return 'findMany';
+  if (typeof value !== 'string' || !(COMPILE_OPERATIONS as readonly string[]).includes(value)) {
+    throw jsonRpcError(
+      -32602,
+      `operation must be one of ${COMPILE_OPERATIONS.join(', ')}. Write operations are not compiled by this ` +
+        'server: it has no write surface at all, which is stronger than having one that refuses to run.',
+    );
+  }
+  return value as CompileOperation;
+}
+
+/**
+ * The query args, passed through whole.
+ *
+ * Deliberately NOT an allowlist of keys the way `parseExplainFindManyArgs` is.
+ * The point of this tool is that the agent compiles the object it is about to
+ * paste into its code, so a key this parser dropped would compile a DIFFERENT
+ * query than the one that ships, silently, which is worse than any error. Every
+ * key is therefore judged by the two things that already judge them correctly:
+ * the PII guard, which fails closed on a shape it does not recognize, and the
+ * builder, which throws E003 by name for an unknown one. The two privilege
+ * options that would matter (`includePii`, `skipGlobalFilters`) are unlocked by
+ * a symbol sentinel that `JSON.parse` cannot produce, so neither is reachable
+ * over this wire.
+ */
+function parseCompileArgs(value: unknown): Record<string, unknown> {
+  if (value === undefined || value === null) return {};
+  if (!isObject(value)) throw jsonRpcError(-32602, 'args must be an object');
+  return value;
+}
+
+/**
+ * Refuse a compile that names a hidden column anywhere it could name one.
+ *
+ * TWO WALKS, because the arg surface has two shapes. The findMany-shaped ops go
+ * through the shared `cli/pii-predicate-guard.ts` walker exactly as
+ * `explain_query` does, relation-aware and fail-closed. `aggregate` / `groupBy`
+ * hand it their `where` only, and everything else through
+ * `collectAggregateColumnNames`: the shared walker's `visitLevel` fails closed
+ * on any object-valued key outside its findMany vocabulary, so handing it a
+ * `by` array or a `_min` block would refuse EVERY aggregate rather than check
+ * one, and teaching it those shapes means a second module that has to stay in
+ * step with the aggregate compiler. The harvest is blunter and errs the safe
+ * way; see its own doc comment.
+ */
+function assertCompileHidesNothing(
+  args: Record<string, unknown>,
+  operation: CompileOperation,
+  table: TableMetadata,
+  metadata: SchemaMetadata,
+  piiTags: PiiTagStatus,
+): void {
+  if (tagsUnreadable(piiTags) && carriesColumnNamingArg(args)) {
+    throw jsonRpcError(
+      -32602,
+      `PII tags could not be read from ${piiTags.path} (${piiTags.reason}), so compile_query cannot prove this ` +
+        `query does not filter, sort or group on a PII column. Re-run \`turbine generate\`, or compile the query ` +
+        `without where/orderBy/cursor/distinct/by/having and the aggregate blocks.`,
+    );
+  }
+
+  const aggregateShaped = isAggregateShaped(operation);
+  const predicateArgs = aggregateShaped ? { where: args.where } : args;
+
+  assertNoPiiPredicatesShared(predicateArgs, table, {
+    metadata,
+    hiddenReason: hiddenColumnReason,
+    refuseColumn: (owner, column, why) => {
+      throw jsonRpcError(
+        -32602,
+        `Column "${column}" on "${owner.name}" ${why}, so compile_query will not build a statement that filters, ` +
+          `sorts, pages or groups on it. This server does not author queries that interrogate a hidden value, ` +
+          `wherever that statement would eventually run. Use a visible column.`,
+      );
+    },
+    refuseDepth: (maxDepth) => {
+      throw jsonRpcError(
+        -32602,
+        `Query is nested more than ${maxDepth} levels deep, past the point where the PII guard can prove it does ` +
+          `not name a hidden column, so it is refused. Flatten the query.`,
+      );
+    },
+    refuseShape: (owner, key) => {
+      throw jsonRpcError(
+        -32602,
+        `The PII guard does not recognize "${key}" in a query on "${owner.name}", so it cannot prove the query ` +
+          `does not name a hidden column, and refuses it rather than guessing. Remove it and compile without it.`,
+      );
+    },
+  });
+
+  if (!aggregateShaped) return;
+
+  let names: string[];
+  try {
+    names = collectAggregateColumnNames(args);
+  } catch (err) {
+    // The harvest throws only on its depth cap, which is the same fail-closed
+    // posture the shared walker takes, reported the same way.
+    throw jsonRpcError(-32602, errorMessage(err));
+  }
+  for (const name of names) {
+    const column = ownLookup(table.columnMap, name) ?? name;
+    const why = hiddenColumnReason(table, column);
+    if (!why) continue;
+    throw jsonRpcError(
+      -32602,
+      `Column "${column}" on "${table.name}" ${why}, so it cannot be used as a group key, an aggregate target, a ` +
+        `HAVING term or an ordering in compile_query. _count over the table is unaffected; group and aggregate on ` +
+        `a visible column instead.`,
+    );
+  }
 }
 
 /**

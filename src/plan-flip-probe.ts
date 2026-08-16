@@ -288,11 +288,27 @@ export async function probePlanFlips(options: ProbePlanFlipsOptions): Promise<Fl
 
   try {
     await client.connect();
-    await client.query(`SET statement_timeout = ${Number(options.statementTimeoutMs ?? 5000)}`);
     // READ ONLY is belt-and-braces: EXPLAIN without ANALYZE cannot write, and the
     // transaction is rolled back regardless. It costs nothing and makes the
     // read-only intent checkable from a server-side log.
     await client.query('BEGIN READ ONLY');
+    // statement_timeout is set INSIDE the transaction and transaction-locally.
+    // It used to be a session-level `SET` on the fresh connection, one statement
+    // earlier, and a dedicated `Client` does not make that safe: through a
+    // transaction-pooling proxy a bare `SET` outside a transaction attaches to a
+    // SHARED server backend, which the pooler then hands to another client
+    // without a DISCARD. Every statement this pass runs is inside this
+    // transaction, so a transaction-local bound covers exactly the same ground
+    // and provably cannot outlive the ROLLBACK below.
+    //
+    // `set_config(name, value, is_local => true)` rather than `SET LOCAL`:
+    // Postgres rejects a bind parameter in `SET LOCAL` (`SET LOCAL x = $1` is a
+    // syntax error), so this is the parameterizable form of the same thing. The
+    // value carries no unit because statement_timeout's default unit is
+    // milliseconds, which is what the previous statement meant.
+    await client.query(`SELECT set_config('statement_timeout', $1, true)`, [
+      String(Number(options.statementTimeoutMs ?? 5000)),
+    ]);
     result.available = true;
 
     for (let i = 0; i < targets.length; i++) {

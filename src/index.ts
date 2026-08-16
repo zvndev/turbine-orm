@@ -161,6 +161,7 @@ export {
   type GroupByDistinctOn,
   type GroupByResult,
   type HavingClause,
+  type JsonEncoding,
   type JsonFilter,
   type JsonPathAggregateTarget,
   type JsonPathGroupKey,

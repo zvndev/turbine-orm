@@ -866,7 +866,24 @@ export interface FindUniqueArgs<
   includePii?: Unsafe;
   /** Plan this query with its real parameter values. See {@link FindManyArgs.forceCustomPlan}. */
   forceCustomPlan?: boolean;
+  /** Override the relation JSON wire encoding for this query. See {@link FindManyArgs.jsonEncoding}. */
+  jsonEncoding?: JsonEncoding;
 }
+
+/**
+ * How a nested relation's rows are encoded on the wire.
+ *
+ * - `'object'`, `json_build_object('id', …, 'title', …)`: every key name is
+ *   repeated on every row. Readable in a query log, and the only shape the
+ *   non-PostgreSQL engines emit.
+ * - `'positional'`, `json_build_array(…)`: the keys are dropped and each row is
+ *   a bare array whose positions are mapped back client-side. Fewer bytes and
+ *   materially less server CPU, and the parsed rows are identical.
+ *
+ * PostgreSQL defaults to `'positional'`; every other engine is `'object'` and
+ * refuses `'positional'` with {@link UnsupportedFeatureError} (E017).
+ */
+export type JsonEncoding = 'object' | 'positional';
 
 export interface FindManyArgs<
   T,
@@ -1063,6 +1080,37 @@ export interface FindManyArgs<
    * made. Omitting it (or `false`) is accepted everywhere.
    */
   forceCustomPlan?: boolean;
+  /**
+   * Override {@link TurbineConfig.jsonEncoding} for this query: how a `with`
+   * clause's relation rows are encoded on the wire.
+   *
+   * No effect on a query without a `with` clause, which emits no relation JSON
+   * at all, and none on `relationLoadStrategy: 'batched'`, whose follow-up
+   * queries are flat.
+   *
+   * PostgreSQL defaults to `'positional'`, which drops the repeated key names
+   * from every relation row. Measured on a 50-parent, ~10-child-per-parent read
+   * against local PostgreSQL 17: server time 0.685 ms → 0.350 ms and 152 KB →
+   * 100 KB on the wire, for byte-identical parsed rows. Every other engine
+   * defaults to `'object'` and refuses `'positional'` with
+   * {@link UnsupportedFeatureError} (E017).
+   *
+   * Two reasons to ask for `'object'` on PostgreSQL:
+   *
+   *   1. READABILITY. A logged positional statement carries no key names, so a
+   *      query log or a Studio SQL pane shows `json_build_array(t0."id", …)`
+   *      where the object form names each field.
+   *   2. `relationLoadStrategy: 'flatten'`. A flattened relation emits no JSON
+   *      to encode, so the two are not composed: with `'positional'` active the
+   *      flatten plan is refused for the whole query and every relation falls
+   *      back to the correlated subquery (same rows, different plan). Setting
+   *      `jsonEncoding: 'object'` alongside `'flatten'` is what makes the
+   *      flatten plan run.
+   *
+   * A value that is neither `'object'` nor `'positional'` throws
+   * {@link ValidationError} (E003) rather than being ignored.
+   */
+  jsonEncoding?: JsonEncoding;
 }
 
 export interface FindManyStreamArgs<

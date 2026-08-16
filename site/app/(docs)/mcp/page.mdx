@@ -1,44 +1,55 @@
 export const metadata = {
   title: 'MCP Server',
   description:
-    'Expose your database to AI coding agents through Turbine ORM’s built-in, read-only Model Context Protocol server, schema, migrations, doctor, EXPLAIN, and sample rows over JSON-RPC stdio.',
+    'Turbine ORM ships a read-only Model Context Protocol server: eleven tools over JSON-RPC stdio, including a relation graph, a join-path finder that returns the with clause to write, EXPLAIN plans, and PII-redacted sample rows.',
   alternates: { canonical: '/mcp' },
 };
 
 # MCP Server
 
-`turbine mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io) server that lets an AI agent, Claude Code, Cursor, or any MCP client, inspect your database safely. It speaks JSON-RPC 2.0 over stdio, ships with the package (no extra dependency), and exposes **read-only** tools only. There is no write surface and no free-form SQL input: the same safety stance as [Studio](/studio).
+`turbine mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io) server so an AI agent (Claude Code, Cursor, or any MCP client) can inspect your database. It speaks JSON-RPC 2.0 over stdio, ships in the package with no extra dependency, and is **read-only by construction**: every database access runs inside `BEGIN READ ONLY` with a statement timeout, and there is no free-form SQL input anywhere on the surface.
 
 ```bash
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine mcp
 ```
 
-The server handles the MCP `initialize` handshake (protocol version `2025-06-18`, server name `turbine-orm`), then serves `tools/list` and `tools/call`. Malformed input returns a JSON-RPC error and never crashes the process.
-
 ## The tools
 
-Ten read-only tools. Every database access runs inside a `BEGIN READ ONLY` transaction with a statement timeout, an agent physically cannot mutate your data through them.
+Eleven tools. The first seven answer "what is here"; the last four exist because the hardest thing for an agent on an unfamiliar schema is working out how tables connect.
 
 | Tool | What it returns |
 |---|---|
-| `schema_overview` | Tables, columns, relations, indexes, and estimated row counts for the schema. |
+| `schema_overview` | Tables, columns, relations, indexes, and estimated row counts. |
 | `table_detail` | Columns, indexes, and relations for one named table. |
-| `migrate_status` | Migration files and the tracking table, applied vs pending, without applying anything. |
+| `migrate_status` | Applied vs pending migrations, without applying anything. |
 | `doctor_report` | Missing relation indexes, from the same [index advisor](/cli#turbine-doctor) `turbine doctor` uses. |
 | `explain_query` | `EXPLAIN (FORMAT JSON)` for a schema-validated `findMany` plan (see below). |
-| `sample_rows` | Up to 50 rows from a table whose name is validated against the introspected schema. PII-tagged columns come back redacted. |
+| `compile_query` | The exact SQL a read query would send, **without executing it**: bound parameters, how many statements it costs, which relation-load strategy it takes, whether a `LIMIT` bounds it, and warnings such as an unindexed correlation column. A query that fails to compile comes back as `ok: false` with the code and the fix, which is an answer rather than an error. |
+| `sample_rows` | Up to 50 rows from a validated table, PII-tagged columns never fetched. |
+| `relation_graph` | The whole relation graph, or one table's subtree: every relation name with its cardinality, target, join keys, and junction table. These are the exact names a `with` clause accepts. |
+| `find_join_path` | The shortest relation chain from one table to another, **with the nested `with` clause to write, as code**. Returns every equal-shortest path, and `found: false` instead of throwing when none exists. |
+| `table_stats` | The planner's row estimate, page count, on-disk bytes, and every index with its columns. A never-analyzed table reports `analyzed: false`, not `0`, because "unknown" and "empty" are different facts. |
+| `explain_error` | A Turbine error code (`TURBINE_E003`, `E003`, or `3`) mapped to its class, causes, fix, and docs URL. Reads no database. |
 
-`explain_query` never accepts free-form SQL. You pass a **subset** of Studio’s builder args (`table` + optional `where` / `orderBy` / `limit` / `select`, not `with` / `omit`). Turbine validates identifiers against the introspected schema, builds parameterized SQL via `QueryInterface.buildFindMany`, then runs `EXPLAIN (FORMAT JSON)` on that SQL with bound params only.
+## What an agent can and cannot do
+
+**Can:** learn the relation names a `with` clause accepts (`relation_graph`), get the query from `orders` to `organizations` written for it (`find_join_path`), check a table's size before writing a query that would scan it (`table_stats`), verify a plan (`explain_query`), and look at real rows (`sample_rows`).
+
+**Cannot:** write anything (every access is inside `BEGIN READ ONLY`), run arbitrary SQL (no tool accepts SQL text), or read PII. `sample_rows` never fetches PII-tagged or secret-named columns and lists exactly what was hidden. `explain_query` refuses a `where` or `orderBy` on such a column, because a planner row estimate can leak whether a value exists. Column *names* are returned everywhere, since a name is schema shape, not data.
+
+PII tags are a code-first declaration (introspection never infers one), so the server reads them from the generated metadata in your `out` directory. With no generated metadata there is nothing to redact, and the server says so rather than implying protection it cannot apply.
+
+## `explain_query`
+
+No free-form SQL. You pass a subset of `findMany` args; Turbine validates every identifier against the introspected schema, compiles parameterized SQL through the same builder your application uses, and runs `EXPLAIN (FORMAT JSON)` with bound params.
 
 | Argument | Required | Description |
 |---|---|---|
 | `table` | yes | Table name; must exist in the live schema. |
-| `where` | no | `findMany`-style where clause (field names validated). |
+| `where` | no | `findMany`-style where clause, field names validated. |
 | `orderBy` | no | `findMany`-style orderBy (object or array). |
 | `limit` | no | Positive integer row limit for the planned query. |
 | `select` | no | Field selection map (`{ field: true }`). |
-
-`sample_rows` caps at 50 rows, validates the table name against the live schema, and **redacts PII-tagged columns** before the rows reach the agent's context (the response lists which columns were redacted). Tags are a code-first declaration that introspection never infers, so the server reads them from the generated metadata in your `out` directory: with no generated metadata there is nothing to redact, and rows come back whole. Together, an agent can explore query plans and real data without a path to writing or to arbitrary SQL.
 
 ## Options
 
@@ -65,11 +76,9 @@ Add the server to your project's `.mcp.json`:
 }
 ```
 
-Claude Code launches `npx turbine mcp` on startup and can then answer questions like "what indexes is the `orders` table missing?" or "show me a few rows from `users`", grounded in your real schema.
-
 ## Connect it to Cursor
 
-Cursor uses the same shape in `.cursor/mcp.json`:
+Same shape, in `.cursor/mcp.json`:
 
 ```json
 {
@@ -85,6 +94,6 @@ Cursor uses the same shape in `.cursor/mcp.json`:
 
 ## See also
 
-- **[Studio](/studio)**, the same read-only stance, as a web UI for humans.
+- **[Turbine for AI agents](/ai-agents)**, the rest of the agent story: typed query args, coded errors, `llms.txt`, and a drop-in instructions snippet.
+- **[Studio](/studio)**, the same read-only stance as a web UI for humans.
 - **[CLI](/cli)**, `turbine doctor` and `migrate status` on the command line.
-- **[Schema & Migrations](/schema)**, what the schema tools introspect.

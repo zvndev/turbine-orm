@@ -9,7 +9,7 @@ export const metadata = {
 
 Push events between processes through Postgres itself, no message broker, no extra service. Turbine wraps Postgres `LISTEN` / `NOTIFY` in two methods: `$listen` subscribes to a channel and `$notify` publishes to it.
 
-This is ideal for cache invalidation, live dashboards, and worker fan-out where you already have a Postgres connection and don't want to stand up Redis or a queue.
+Use it for cache invalidation, live dashboards, and worker fan-out when you already have a Postgres connection and don't want to stand up Redis or a queue.
 
 ## Subscribe with $listen
 

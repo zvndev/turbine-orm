@@ -7,7 +7,7 @@ export const metadata = {
 
 # Views & Generated Columns
 
-Turbine can generate typed accessors for database views, and it understands `STORED` generated columns, computed by Postgres and never writable. Both are read-safe by construction: the type system and the query builder stop you from writing where a write is impossible.
+Turbine generates typed accessors for database views, and it understands `STORED` generated columns, computed by Postgres and never writable. Both are enforced twice: in the generated types, and again in the query builder for untyped callers.
 
 ## Views
 
@@ -40,7 +40,7 @@ The guard is enforced at the query builder, so it holds on every engine, not jus
 
 ### Views without a primary key
 
-A view without a primary key can't be uniquely addressed, so its generated accessor omits the `findUnique` family. The type is `Omit<QueryInterface<T>, 'findUnique' | 'findUniqueOrThrow'>`, `findUnique` on a PK-less view is a compile error, not a runtime surprise. A view that does expose a unique/primary key keeps the full read surface.
+A view without a primary key can't be uniquely addressed, so its generated accessor omits the `findUnique` family. The type is `Omit<QueryInterface<T>, 'findUnique' | 'findUniqueOrThrow'>`, so `findUnique` on a PK-less view is a compile error. A view that does expose a unique/primary key keeps the full read surface.
 
 ## STORED generated columns
 

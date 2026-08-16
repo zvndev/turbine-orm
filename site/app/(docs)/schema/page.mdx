@@ -79,7 +79,7 @@ posts: {
 // REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE RESTRICT
 ```
 
-Supported actions: `'cascade'`, `'restrict'`, `'set null'`, `'set default'`, `'no action'`. Omit a clause to leave it at the SQL default (`NO ACTION`). The plain string form is unchanged, it emits no action clauses. Introspection reads existing actions back from `pg_constraint`, so a `pull` round-trips them and `migrate create --auto` detects action changes.
+Supported actions: `'cascade'`, `'restrict'`, `'set null'`, `'set default'`, `'no action'`. Omit a clause to leave it at the SQL default (`NO ACTION`). The plain string form emits no action clauses. Introspection reads existing actions back from `pg_constraint`, so a `pull` round-trips them and `migrate create --auto` detects action changes.
 
 ### Enums
 
@@ -99,7 +99,7 @@ export default defineSchema(
 
 DDL emits `CREATE TYPE "post_status" AS ENUM ('draft', 'published', 'archived')` before the tables that use it, and the column is typed `"post_status"`. Enum columns generate a string-literal union in `types.ts` (`'draft' | 'published' | 'archived'`).
 
-Writes to an enum column get an explicit `::"post_status"` cast on every path (`create`, `createMany`, `update`, `upsert`), driven by the introspected metadata and schema-qualified so it is safe across schemas. This is automatic and needs no code change, it removes the `column is of type post_status but expression is of type text` error that `createMany` could hit before v0.30.
+Writes to an enum column get an explicit `::"post_status"` cast on every write path (`create`, `createMany`, `update`, `upsert`), schema-qualified so it is safe across schemas. This avoids the `column is of type post_status but expression is of type text` error `createMany` can otherwise hit.
 
 ### Array columns
 
@@ -176,11 +176,18 @@ users: {
 }
 ```
 
-A PII column is **excluded from default projections**. It comes back only when you name it explicitly in `select`, or pass `includePii: UNSAFE` to the query (a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol): the imported symbol is the only value that enables it, and a literal `true` throws `TURBINE_E003`); see [includePii on reads](/queries#pii-fields-includepii). Writes are unaffected: you may write PII fields freely, but a write's returned row applies the same read policy (the value is persisted; it is just absent from the returned object unless you re-read with an opt-in). Referencing a PII column in `where`, `orderBy`, or `having` is always allowed: those narrow, sort, or filter rows and return no PII value. Two aggregate shapes *would* return stored values, so they are gated behind the same `includePii: UNSAFE` opt-in and otherwise throw a `ValidationError` (`TURBINE_E003`): a PII column used as a `groupBy` **`by`** key (including a JSON-path key), and **`_min` / `_max`** over a PII column in either `groupBy` or `aggregate` (including JSON-path targets). `_count`, `_sum`, and `_avg` over a PII column stay allowed, since none of them hands back a stored cell. See [includePii on reads](/queries#pii-fields-includepii).
+A PII column is **excluded from every default projection**. It comes back in two ways: name it explicitly in `select`, or pass `includePii: UNSAFE`, a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol) unlocked only by the imported symbol (a literal `true` throws `TURBINE_E003`). See [includePii on reads](/queries#pii-fields-includepii).
 
-**Tag sensitive data, not keys.** A PII-tagged column that is part of the primary key is returned anyway, on every read and write path (since 0.63), because a row that comes back without part of its own key is unaddressable: feeding it into an `update` builds a partial predicate that silently matches more rows than intended. If a key column is genuinely sensitive, the answer is a surrogate key, not a tag.
+The rest of the policy:
 
-The tag flows through the whole stack: [`turbine studio`](/studio) redacts PII cells in its Data and Query views by default (reveal with `--show-pii`), and `turbine generate` marks each PII field optional in the emitted entity type so it tells the truth about default absence. Studio and the [MCP server](/mcp) build their schema by introspecting the live database, which carries no tags, so they read the tags out of the generated metadata in your `out` directory: run `turbine generate` after tagging, or they will have nothing to redact. Studio says which it found at startup rather than leaving you to assume. The tag is a **code-first declaration only**: introspection never auto-tags a column as PII, so tagging is always a deliberate choice you make in `defineSchema`.
+- **Writes are unaffected.** You can write PII fields freely. The returned row applies the same read policy: the value is persisted, just absent from the returned object unless you re-read with an opt-in.
+- **`where`, `orderBy`, and `having` are always allowed.** They narrow, sort, or filter rows and return no PII value.
+- **Two aggregate shapes are gated** behind the same `includePii: UNSAFE`, because they return stored values: a PII column as a `groupBy` `by` key (including a JSON-path key), and `_min` / `_max` over a PII column in `groupBy` or `aggregate` (including JSON-path targets). Without the opt-in they throw `ValidationError` (`TURBINE_E003`).
+- **`_count`, `_sum`, and `_avg` stay allowed.** None of them hands back a stored cell.
+
+**Tag sensitive data, not keys.** A PII-tagged column that is part of the primary key is returned anyway, on every read and write path, because a row that comes back without part of its own key is unaddressable: feeding it into an `update` builds a partial predicate that matches more rows than intended. If a key column is genuinely sensitive, use a surrogate key, not a tag.
+
+The tag flows through the stack: [`turbine studio`](/studio) redacts PII cells by default (reveal with `--show-pii`), and `turbine generate` marks each PII field optional in the emitted entity type, since it is absent by default. Studio and the [MCP server](/mcp) introspect the live database, which carries no tags, so they read them from the generated metadata in your `out` directory: run `turbine generate` after tagging, or they have nothing to redact. Introspection never auto-tags a column; `pii` is a code-first declaration you make in `defineSchema`.
 
 ### Auto-updated timestamps, `updatedAt`
 
@@ -202,9 +209,9 @@ await db.posts.update({ where: { id: 1 }, data: { title: 'new title' } });
 await db.posts.update({ where: { id: 1 }, data: { title: 'x', updatedAt: pinned } });
 ```
 
-The timestamp is generated client-side (as Prisma does), so it flows through the same UTC coercion as any other bound `Date` and lands correctly on every engine. It applies to `update` and `updateMany`, never to `create`, where a column default is the right tool.
+The timestamp is generated client-side (as Prisma does), so it flows through the same UTC coercion as any other bound `Date` on every engine. It applies to `update` and `updateMany`, never to `create`, where a column default is the right tool.
 
-Like `pii`, this is a **code-first declaration only**, and deliberately never inferred from a column's name. An application that already manages its own `updated_at` would otherwise have its writes silently changed by an upgrade. A schema with no tagged column emits byte-identical SQL.
+Like `pii`, this is a code-first declaration and never inferred from a column's name, so an application that already manages its own `updated_at` is not silently changed by an upgrade. A schema with no tagged column emits byte-identical SQL.
 
 ### Runtime metadata without a database, `schemaDefToMetadata`
 
@@ -217,7 +224,7 @@ const schema = defineSchema({ /* ... */ });
 const metadata = schemaDefToMetadata(schema);
 ```
 
-This is the code-first path for engines with no wire introspection, most notably PowDB, where you can now hand a `defineSchema` straight to the factory instead of writing metadata by hand:
+This is the code-first path for engines with no wire introspection, most notably PowDB, where you can hand a `defineSchema` result straight to the factory:
 
 ```ts
 import { turbinePowDB } from 'turbine-orm/powdb';
@@ -237,7 +244,7 @@ npx turbine push --dry-run
 npx turbine push
 ```
 
-`push` is the fast path for development, it diffs your `defineSchema` output against the live database and applies the difference directly. For production, use migrations.
+`push` is the fast path for development: it diffs your `defineSchema` output against the live database and applies the difference directly. For production, use migrations.
 
 ### Programmatic: `schemaToSQL` and `schemaPush`
 
@@ -307,11 +314,11 @@ Each migration runs in its own transaction. If a migration fails halfway, the tr
 
 ### Concurrency safety
 
-Turbine uses `pg_try_advisory_lock()` before running any migration. If a second process tries to run `migrate up` simultaneously, it exits cleanly instead of racing. Safe to run from CI/CD pipelines and deployment hooks.
+Turbine takes `pg_try_advisory_lock()` before running any migration. If a second process runs `migrate up` simultaneously, it exits cleanly instead of racing. Safe to run from CI/CD pipelines and deployment hooks.
 
 ### Checksums
 
-Every migration's file is SHA-256 hashed and stored alongside the timestamp. If you edit a migration that's already been applied, `migrate status` flags a checksum mismatch and refuses to proceed until you reconcile.
+Every migration file is SHA-256 hashed and stored alongside the timestamp. If you edit a migration that has already been applied, `migrate status` flags a checksum mismatch and refuses to proceed until you reconcile.
 
 ## Schema diffing
 
@@ -336,7 +343,7 @@ for (const warning of diff.warnings ?? []) {
 
 `DiffResult` has the shape `{ create, alter, drop, statements, reverseStatements, warnings }`. `create` / `alter` / `drop` are the structured plan (tables to create, tables to alter, table names present in the DB but absent from the schema), `statements` is the flat SQL to apply and `reverseStatements` the DOWN direction. Anything destructive is deliberately left out of `statements`: table and column **drops are reported** (in `drop` and in the `alter` plan) **but never auto-emitted** into the executable SQL, so you apply those by hand. Enum value removals and reorders surface in `warnings` the same way.
 
-The auto-generated migrations are a starting point; always review them before committing. For the honest limits of `--auto` (blind type casts, undetected renames, `SET NOT NULL` without backfill) and the sanctioned recipe for changing a populated column's type, see [Migrations in Practice](/migrate).
+Auto-generated migrations are a starting point: review them before committing. For the limits of `--auto` (blind type casts, undetected renames, `SET NOT NULL` without backfill) and the sanctioned recipe for changing a populated column's type, see [Migrations in Practice](/migrate).
 
 ## Introspection
 
@@ -358,7 +365,7 @@ Turbine reads `information_schema` and `pg_catalog` to discover:
 
 Pass `--include-views` to also introspect views and materialized views as read-only entities. See [Views & Generated Columns](/views).
 
-> **Note:** When a derived relation name would collide with a scalar column, e.g. a `currentVersionId` foreign key producing a relation that shadowed the `currentVersion` field, v0.30 disambiguates the relation name instead of overwriting the column. Names that were already collision-free are preserved, so regenerating an existing, working schema does not rename its relations. The `turbine mcp` server and the SQLite / MySQL / SQL Server introspectors share the same naming logic.
+> **Note:** When a derived relation name would collide with a scalar column, e.g. a `currentVersionId` foreign key producing a relation named `currentVersion`, the relation name is disambiguated instead of overwriting the column. Collision-free names are preserved, so regenerating an existing schema does not rename its relations. The `turbine mcp` server and the SQLite / MySQL / SQL Server introspectors share the same naming logic.
 
 Three files land in `./generated/turbine/`:
 
@@ -387,9 +394,9 @@ Turbine maps Postgres types to TypeScript:
 
 ### Zone-less columns: `timestamp` and `date` read as UTC
 
-A `timestamptz` carries its offset on the wire, so there is nothing to decide. A `timestamp` (without time zone) and a `date` do not: the database hands over `2026-07-21 09:30:00` or `2026-07-21` and something has to choose which instant that is. The pg driver's own answer is *the process's local zone*, which makes the same stored row a different `Date` in every deployment region.
+A `timestamptz` carries its offset on the wire. A `timestamp` (without time zone) and a `date` do not: the database hands over `2026-07-21 09:30:00` or `2026-07-21`, and something has to choose which instant that is. The pg driver's default is the process's local zone, which makes the same stored row a different `Date` in every deployment region. Turbine reads UTC instead, the same convention Prisma, Rails and Django use.
 
-Turbine's answer is UTC, the same convention Prisma, Rails and Django use. It is applied as pg type parsers on OIDs 1114 (`timestamp`), 1082 (`date`) and their array forms 1115 / 1182, and to the dates coerced out of nested-relation JSON, so every read path agrees.
+The read half is a set of pg type parsers on OIDs 1114 (`timestamp`), 1082 (`date`) and their array forms 1115 / 1182, also applied to the dates coerced out of nested-relation JSON, so every read path agrees, and scalar and array columns cannot settle differently. The write half matches: binding a `Date` to a zone-less column renders its **UTC** components. Reading in the local zone against a UTC write is what made a read-modify-write cycle on a `date` walk the stored day backward east of UTC, and let `where: { runOn: row.runOn }` match nothing.
 
 ```ts
 // Stored: date '2026-07-21'. Process running in Europe/Berlin (UTC+2).
@@ -399,99 +406,70 @@ job.runOn.toISOString();          // '2026-07-21T00:00:00.000Z'
 job.runOn.toISOString().slice(0, 10); // '2026-07-21'  <- format a date like this
 ```
 
-<Callout type="warning" title="date reads changed in v0.54, and the change is silent">
-  Before v0.54 the `date` parser was the driver's, so a stored `2026-07-21` came
-  back as **local** midnight: epoch `2026-07-20T22:00:00.000Z` in
-  `Europe/Berlin` (UTC+2) and `2026-07-20T15:00:00.000Z` in `Asia/Tokyo`
-  (UTC+9), the wrong calendar day everywhere east of UTC. It now reads
-  `2026-07-21T00:00:00.000Z` everywhere. The calendar day the value denotes is
-  unchanged; the **epoch value** moves by your process's UTC offset, so
-  `getTime()`, `toISOString()` and `JSON.stringify(row)` change, and API
-  payloads, exports and golden files containing a `date` column change text.
-
-  West of UTC the old behaviour produced the right calendar day by accident,
-  which is why this went unnoticed: `2026-07-21` in `America/New_York` (UTC-4)
-  parsed to `2026-07-21T04:00:00.000Z`, and `toLocaleDateString()` on it read
-  back `7/21/2026`. That same call now reads `7/20/2026`, because UTC midnight
-  is the previous evening locally. **Format a `date` in UTC**
-  (`toISOString().slice(0, 10)`), never with local-component helpers
-  (`toLocaleDateString()`, `getDate()`, `date-fns` / `dayjs` `format('yyyy-MM-dd')`).
-
-  Nothing stored in the database changes, no emitted SQL changes, and a process
-  running in UTC is byte-identical before and after.
+<Callout type="warning" title="Upgrade note: date reads changed in v0.54, and the change is silent">
+  Before v0.54 a stored `date` came back at **local** midnight; it now reads as
+  UTC midnight everywhere. The calendar day the value denotes is unchanged, but
+  the **epoch value** moves by your process's UTC offset: `getTime()`,
+  `toISOString()` and `JSON.stringify(row)` change for any process not running
+  in UTC, and so does any API payload, export, or golden file containing a
+  `date` column. West of UTC, local-component helpers now read the previous
+  evening: `toLocaleDateString()` on a stored `2026-07-21` returns `7/20/2026`.
+  **Format a `date` in UTC** (`toISOString().slice(0, 10)`), never with
+  local-component helpers (`toLocaleDateString()`, `getDate()`, `date-fns` /
+  `dayjs` `format('yyyy-MM-dd')`). Nothing stored in the database changes, no
+  emitted SQL changes, and a process running in UTC is byte-identical before
+  and after.
 </Callout>
 
-The write half was already UTC, which is what made the old read half a correctness bug rather than a preference. Binding a `Date` to a zone-less column renders its **UTC** components, so east of UTC every read-modify-write cycle on a `date` moved the stored day one day earlier and kept going: read `2026-07-21` as `2026-07-20T22:00Z`, write it back as `2026-07-20`, read that as `2026-07-19T22:00Z`, and so on. A row could also fail to find itself: `where: { runOn: row.runOn }` matched nothing.
+<Callout type="note" title="utcTimestamps is process-wide, not per client">
+  `utcTimestamps: false` opts out, and it reverts **both** halves: reads go
+  back to the local zone and writes bind local-calendar literals.
 
-`date[]` and `timestamp[]` now follow their scalars. Postgres array OIDs do not inherit an element type's parser, so a `timestamp[]` used to come back in the local zone while the `timestamp` column beside it in the same row came back in UTC. Both array OIDs are registered alongside their scalars, so scalar and array cannot settle differently.
-
-<Callout type="note" title="This is a process-wide setting, not a per-client one">
-  `utcTimestamps: false` opts out, and it reverts **both** halves: reads go back
-  to the local zone and writes bind local-calendar literals. Two things to know
-  before setting it.
-
-  `pg.types.setTypeParser` installs one parser per OID for the whole `pg`
-  module, so a Turbine-owned pool changes `date` / `timestamp` parsing for every
-  consumer of that module in the process, including a second ORM or your own
-  `pool.query` reporting code. It is **retroactive**: there is one parser table,
-  read per row at decode time, so this reaches pools that **already exist and
-  are already querying**, not only pools created afterwards. The same pool
-  running the same query returns different values before and after some
-  unrelated module constructs a Turbine client, and lazy route imports make that
-  ordering unstable between requests. If something else had already customized
-  the OID, Turbine emits a one-time dev warning instead of replacing it
-  silently. The first client settles the value, and a later
-  client asking for the **opposite** one throws `ValidationError`
-  (`TURBINE_E003`) at construction rather than reading and writing in different
-  zones. Give every client in the process the same value, or isolate the odd one
-  in its own process.
+  The read half is installed via `pg.types.setTypeParser`, which sets one
+  parser per OID for the whole `pg` module. A Turbine-owned pool therefore
+  changes `date` / `timestamp` parsing for every consumer of that module in
+  the process, including pools that already exist and are already querying.
+  If something else customized the OID first, Turbine warns once instead of
+  replacing it silently. The first client settles the value; a later client
+  asking for the opposite one throws `ValidationError` (`TURBINE_E003`) at
+  construction rather than reading and writing in different zones. Give every
+  client in the process the same value, or isolate the odd one in its own
+  process.
 
   A client on an **external pool** (`pool: …`, `turbineHttp()`) never triggers
-  registration, so a process holding only those keeps whatever the caller's
-  driver set up. It is not exempt from the effect, though: registration is
-  process-global, so once an owned client has installed the parsers an
-  external-pool client reads through them too. That is why it takes part in the
-  agreement check as well.
-
-  Cross-engine, UTC midnight is what SQLite, MySQL, SQL Server and PowDB have
-  always returned for a `date`. Postgres was the outlier, and this closes the
-  divergence rather than creating one.
+  registration, but it reads through parsers an owned client installed, so it
+  takes part in the same agreement check.
 </Callout>
 
 ### `infinity` and `-infinity`
 
-Postgres accepts `infinity` and `-infinity` in `date`, `timestamp` and `timestamptz` columns, usually to model "no end date" without a nullable column. **Turbine reads both as the JS numbers `Infinity` / `-Infinity` by default**, identically on every read strategy.
+Postgres accepts `infinity` and `-infinity` in `date`, `timestamp` and `timestamptz` columns, usually to model "no end date" without a nullable column. **Turbine reads both as the JS numbers `Infinity` / `-Infinity` by default.** No JavaScript `Date` means either value, so every candidate reading gives something up: an `Invalid Date` is silent and `NaN` everywhere, `null` is indistinguishable from a stored `NULL`, and the number breaks the field's declared `Date` type at runtime. The number is the only one of the three that cannot **lose** the value.
 
-There is no JavaScript `Date` that means either value, so every available reading is wrong in some way: an `Invalid Date` is silent and `NaN` everywhere; `null` reads cleanly but is indistinguishable from a stored `NULL`; the number breaks the field's declared `Date` type at runtime. The default is the only one of the three that cannot **lose** the value.
-
-Since v0.55 the reading is applied in one place, the ORM row parser, so top-level reads, `findUnique` / `findFirst`, streaming, the join / batched / flatten strategies, the positional wire encoding, write `RETURNING` / reselect / `OUTPUT` projections, `groupBy` keys and `_min` / `_max` all agree. v0.54 did not: `json_build_object` renders the value as the string `"infinity"`, which no driver parser ever sees, so a `with` clause returned an `Invalid Date` while the same row read at the top level returned the number.
+The reading is applied in one place, the ORM row parser, so every read path agrees: top-level reads, `findUnique` / `findFirst`, streaming, the join / batched / flatten strategies, the positional wire encoding, write `RETURNING` / reselect / `OUTPUT` projections, `groupBy` keys and `_min` / `_max`.
 
 <Callout type="warning" title="Why the number, and not the nicer-looking `null`">
   Because `null` silently destroys data. Under a `null` reading a stored
   `infinity` and a stored `NULL` are indistinguishable, so the commonest write
   shape there is, `const row = await db.leases.findUnique(...)` then
-  `db.leases.update({ where, data: { ...row, note } })`, stores SQL `NULL` over
-  a nullable temporal column and the `infinity` is gone with no error. Measured
-  on PostgreSQL 16 with `valid_until::text` read back through a raw `pg` client:
+  `db.leases.update({ where, data: { ...row, note } })`, stores SQL `NULL`
+  over the column and the `infinity` is gone with no error. Measured on
+  PostgreSQL 16 with `valid_until::text` read back through a raw `pg` client:
   the default reading leaves `"infinity"`, the `null` reading leaves `NULL`.
-
-  The complaint `null` answers is real, `JSON.stringify` renders the number as
-  `null` while the declared type says `Date`, but a lossy default is the wrong
-  price for a cleaner JSON encoding. On a `NOT NULL` column that write would at
-  least fail loudly with `NotNullViolationError` (`TURBINE_E010`); on the
-  nullable columns where `expiresAt` / `validUntil` actually live, it is silent.
+  On a `NOT NULL` column that write would at least fail loudly with
+  `NotNullViolationError` (`TURBINE_E010`); on the nullable columns where
+  `expiresAt` / `validUntil` actually live, it is silent.
 
   Turbine emits a one-time warning naming the table and field the first time a
-  stored infinity is read, describing the reading and both escapes. Unlike every
-  other Turbine warning it is **not** silenced by `NODE_ENV=production`, because
-  production is where a `Date` method throws on live traffic. Naming either
-  reading in the config silences it.
+  stored infinity is read. Unlike every other Turbine warning it is **not**
+  silenced by `NODE_ENV=production`, because production is where a `Date`
+  method throws on live traffic. Naming either reading in the config silences
+  it.
 </Callout>
 
 What the default costs, on exactly the rows that hold an infinity:
 
 - **`Date` methods throw.** The generated type says `Date` and the value is a `number`, so `row.validUntil.toISOString()` and `.getTime()` raise a `TypeError`. Guard with `typeof row.validUntil === 'number'` (or `Number.isFinite`) before calling a `Date` method on a column that can hold one.
-- **`JSON.stringify` still renders `null`**, because JSON has no infinity literal. Your API response is unchanged from v0.54 and from the `Invalid Date` before it.
+- **`JSON.stringify` renders `null`**, because JSON has no infinity literal.
 - **`where: { validUntil: null }` still compiles to `IS NULL`** and does **not** match these rows. Filter them with `where: { validUntil: 'infinity' }`. Making `null` match both would silently change every null predicate on every temporal column.
 
 #### `temporalInfinity: 'null'`
@@ -500,7 +478,7 @@ What the default costs, on exactly the rows that hold an infinity:
 const db = turbine({ connectionString: process.env.DATABASE_URL, temporalInfinity: 'null' });
 ```
 
-Reads a stored infinity as `null` instead. `JSON.stringify` is then honest about what the value became, the declared `Date | null` type of a nullable column holds so no method call throws, and every read strategy agrees just as it does under the default. The cost is the data loss above, plus three consequences worth knowing before you choose it:
+Reads a stored infinity as `null` instead. `JSON.stringify` then matches what the value became, the declared `Date | null` type of a nullable column holds so no method call throws, and every read strategy agrees just as it does under the default. The cost is the data loss above, plus three consequences:
 
 - **`groupBy` keys stop being unique.** `GROUP BY` returns one row per distinct stored value, and the ORM then labels `infinity`, `-infinity` and SQL `NULL` all as `null`. Three rows holding those three values come back as three groups keyed `null`, so a `Map` or `Object.fromEntries` built off the group value keeps one of the three counts. `distinct: ['col']` has the same shape.
 - **`+infinity` and `-infinity` collapse into each other**, not only into `NULL`. On a `validUntil` column that puts "never expires" and "expired forever" in the same bucket.
@@ -508,7 +486,7 @@ Reads a stored infinity as `null` instead. `JSON.stringify` is then honest about
 
 Pick `'null'` when the rows are read-only in that code path and the declared type contract matters more than the stored value; rows read under it must not be written back. Pick the default when anything reads a row and writes it again, which is most code.
 
-The write path is untouched by either reading, so `'infinity'` / `'-infinity'` / `Infinity` / `-Infinity` all remain bindable and a value read as `null` is still recoverable if you know what it held.
+The write path is untouched by either reading: `'infinity'` / `'-infinity'` / `Infinity` / `-Infinity` all remain bindable, and a value read as `null` is still recoverable if you know what it held.
 
 ### Time-of-day columns: `time` and `timetz`
 
@@ -522,15 +500,15 @@ await db.shifts.create({ data: { startsAt: '09:00:00' } });
 await db.shifts.create({ data: { startsAt: new Date('1970-01-01T09:00:00Z') } });
 ```
 
-Why UTC and not the process's local zone: it is what Prisma does with a `DateTime @db.Time(6)` field, so a ported call site stores the same value, and it is the only choice that round-trips regardless of where the process runs. `timetz` gets an explicit `+00:00` so the session's `TimeZone` cannot be attached instead, and fractional seconds are emitted only when non-zero.
+UTC rather than the local zone matches what Prisma does with a `DateTime @db.Time(6)` field, so a ported call site stores the same value, and it round-trips regardless of where the process runs. `timetz` gets an explicit `+00:00` so the session's `TimeZone` cannot be attached instead, and fractional seconds are emitted only when non-zero.
 
-The coercion runs on every write path (`create`, `createMany`, `upsert`, and the `update` `set` clause), on the cached-template path as well as the first build. Widening the input type is the only type change, so existing code still compiles.
+The coercion runs on every write path (`create`, `createMany`, `upsert`, and the `update` `set` clause). Widening the input type is the only type change, so existing code still compiles.
 
 <Callout type="warning" title="One place still takes a string: aggregate `having`">
   A `Date` compared against a `time` / `timetz` column is narrowed the same way
   in a `where` clause (`WHERE "starts_at" >= $1` binds `'09:00:00'`), including
-  the `findUnique` equality fast path since v0.53, and in a scalar `having`
-  predicate on a `groupBy` group key.
+  the `findUnique` equality fast path, and in a scalar `having` predicate on a
+  `groupBy` group key.
 
   It is **not** narrowed inside an *aggregate* `having` filter
   (`having: { startsAt: { _min: { gte: someDate } } }`). That operand is compared

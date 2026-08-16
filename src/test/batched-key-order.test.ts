@@ -133,11 +133,16 @@ describe('batched loader, `_count` key order', () => {
     const { pool, completed } = makeDelayedPool(reverseDelays(expected.map((r) => `c_${r}`)));
     const rows = await usersQi(pool, 'batched').findMany({ with: { _count: spec } } as never);
 
-    // The delays really did invert the order the counts were issued in, so a
-    // completion-ordered implementation cannot accidentally pass.
-    assert.deepEqual(
+    // Guard the PRECONDITION, not the scheduler. What this run needs to prove
+    // anything is that the counts did not finish in spec order, so an
+    // implementation that keys off completion order cannot pass by accident.
+    // Asserting the exact reversal instead would be asserting that setTimeout
+    // preserves 20ms gaps under load, which is not a property of this code and
+    // is the one thing here that can fail on a busy runner.
+    assert.notDeepEqual(
       completed.filter((t) => t.startsWith('c_')),
-      ['c_beta', 'c_mid', 'c_alpha', 'c_zeta'],
+      expected.map((r) => `c_${r}`),
+      'delays failed to reorder the counts, so this run proves nothing',
     );
     const count = (rows[0] as { _count: Record<string, number> })._count;
     assert.deepEqual(Object.keys(count), expected);

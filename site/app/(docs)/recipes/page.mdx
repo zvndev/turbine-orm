@@ -7,11 +7,11 @@ export const metadata = {
 
 # Framework Integration
 
-Drop-in patterns for wiring Turbine into a real app. Each one is small on purpose, Turbine is just a client you create once and call from your handlers.
+Patterns for wiring Turbine into a real app. Each one is small: Turbine is a client you create once and call from your handlers.
 
 ## Next.js, singleton client + Route Handler
 
-Create the client **once** and reuse it. In development, Next.js hot-reload re-evaluates modules, which would otherwise leak a new connection pool on every save, stash the instance on `globalThis` to survive reloads.
+Create the client **once** and reuse it. Next.js hot-reload re-evaluates modules in development, which would leak a new connection pool on every save, so stash the instance on `globalThis`.
 
 ```ts
 // lib/db.ts
@@ -27,7 +27,7 @@ export const db =
 if (process.env.NODE_ENV !== 'production') globalForDb.db = db;
 ```
 
-Then import that `db` from any Route Handler. Don't call `db.disconnect()` per request, the pool is long-lived and shared.
+Import that `db` from any Route Handler. Don't call `db.disconnect()` per request: the pool is long-lived and shared.
 
 ```ts
 // app/api/users/route.ts
@@ -178,7 +178,7 @@ export async function GET(req: Request) {
 }
 ```
 
-The query layer never has to remember to filter by tenant, the policy does it, every time.
+The query layer never has to remember to filter by tenant; the policy does it.
 
 ## See also
 

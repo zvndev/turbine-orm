@@ -7,9 +7,7 @@ export const metadata = {
 
 # Turbine for AI agents
 
-Turbine is built to be legible to AI coding agents, not just to people. Three properties do most of the work: a **deterministic codegen flow** an agent can run and re-run, **fully typed query arguments** that turn an invalid query into a compile error the agent can read, and a **stable coded error system** the agent can branch on instead of parsing prose. This page shows how to point an agent at Turbine and gives you a snippet to drop into your project so the agent uses it correctly.
-
-There is nothing to install for this. The integration point is a plain text file the agent reads, no plugin, no skill catalog, no runtime coupling.
+Turbine is built to be legible to AI coding agents, not just to people. Four properties do the work: a **read-only [MCP server](/mcp)** with eleven tools that ground the agent in your live schema, a **deterministic codegen flow** it can run and re-run, **fully typed query arguments** that turn an invalid query into a compile error it can read, and **stable coded errors** it can branch on instead of parsing prose. This page shows how to point an agent at Turbine and gives you a snippet to drop into your project so the agent uses it correctly.
 
 ## Point an agent at Turbine: `llms.txt`
 
@@ -20,7 +18,18 @@ Turbine publishes an [llms.txt](https://turbineorm.dev/llms.txt) at the site roo
 | `llms.txt` | [turbineorm.dev/llms.txt](https://turbineorm.dev/llms.txt) | Short index: description, key facts, and links to each docs page. |
 | `llms-full.txt` | [turbineorm.dev/llms-full.txt](https://turbineorm.dev/llms-full.txt) | Condensed API reference: reads, writes, WHERE operators, transactions, errors, engines. |
 
-To ground an agent, hand it one or both URLs, or paste them into your project's agent-instructions file (see the snippet below). Both are static text, fetch them, cache them, feed them into context. For an agent that speaks MCP, the read-only [MCP server](/mcp) (`npx turbine mcp`) additionally exposes your **live schema**, migration status, index advice, `EXPLAIN` plans, and sample rows over JSON-RPC, grounding the agent in the actual database, not just the docs.
+To ground an agent, hand it one or both URLs, or paste them into your project's agent-instructions file (see the snippet below). Both are static text: fetch them, cache them, feed them into context.
+
+## The MCP server
+
+For an agent that speaks MCP, `npx turbine mcp` exposes the **live database** through eleven read-only tools, every one inside `BEGIN READ ONLY`, with PII-tagged columns redacted before rows reach the model. The four that matter most on an unfamiliar schema:
+
+- `relation_graph`: every relation name with its cardinality, target, and keys. These are the exact names a `with` clause accepts, so the agent reads them instead of guessing from column names.
+- `find_join_path`: "how do I get from `comments` to `orgs`" answered with the relation chain **and the `with` clause to write, as code**.
+- `table_stats`: the planner's row estimate and index list, so the agent checks size before writing a query that would scan fifty million rows.
+- `explain_error`: a Turbine error code mapped to cause, fix, and docs link, with no database read at all.
+
+Plus `schema_overview`, `table_detail`, `sample_rows`, `explain_query`, `migrate_status`, and `doctor_report`. Setup and the full tool table: [MCP Server](/mcp).
 
 ## The deterministic codegen flow
 

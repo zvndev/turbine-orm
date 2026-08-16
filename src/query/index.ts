@@ -32,6 +32,7 @@ export type {
   GroupByDistinctOn,
   GroupByResult,
   HavingClause,
+  JsonEncoding,
   JsonFilter,
   JsonPathAggregateTarget,
   JsonPathGroupKey,

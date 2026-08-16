@@ -115,6 +115,10 @@ export const FIND_UNIQUE_OPTIONS: OptionTable<FindUniqueArgs<Row>> = {
   skipGlobalFilters: 'native',
   includePii: 'native',
   forceCustomPlan: 'native',
+  // `'object' | 'positional'`: a wire ENCODING, not a name. It cannot reach the
+  // schema's naming space, so THE ONE RULE puts it here rather than in the
+  // hand-translated set.
+  jsonEncoding: 'native',
 };
 
 export const FIND_MANY_OPTIONS: OptionTable<FindManyArgs<Row>> = {
@@ -135,6 +139,8 @@ export const FIND_MANY_OPTIONS: OptionTable<FindManyArgs<Row>> = {
   warnOnUnlimited: 'native',
   includePii: 'native',
   forceCustomPlan: 'native',
+  // See FIND_UNIQUE_OPTIONS: an encoding name carries no schema name.
+  jsonEncoding: 'native',
 };
 
 export const FIND_MANY_STREAM_OPTIONS: OptionTable<FindManyStreamArgs<Row>> = {

@@ -1,8 +1,8 @@
 # Turbine ORM
 
-> Turbine is a Postgres-first TypeScript ORM with a Prisma-like API (findMany, findUnique, with, where), designed for a database that has real data in it: a read-only-by-default Studio, PII tagged in the schema and enforced in the emitted SQL, errors that carry keys and never values, destructive migrations that require consent, and offline missing-index advice. It carries exactly one runtime dependency (pg). Optional SQLite, MySQL, SQL Server, and PowDB engines expose the same typed API behind subpath exports.
+> Turbine is a Postgres-first TypeScript ORM with a Prisma-like API (findMany, findUnique, with, where), written from scratch with exactly one runtime dependency (pg): no query engine, no WASM. Nested relations resolve in one SQL statement. It ships an 11-tool read-only MCP server for coding agents, offline missing-index advice (turbine doctor), a read-only-by-default Studio, PII enforced in the emitted SQL, and consent-gated destructive migrations. Optional SQLite, MySQL, SQL Server, and PowDB engines expose the same typed API behind subpath exports. MIT.
 
-Turbine is designed to be legible to AI coding agents: a deterministic codegen flow (introspect the database, generate a typed client, query through it), fully typed query arguments that make invalid queries a compile error, and a stable typed error system (codes TURBINE_E001 through E018) that agents can branch on instead of parsing messages. Point an agent at this file and the docs below to teach it how to use Turbine correctly.
+Turbine is designed to be legible to AI coding agents: a read-only MCP server (npx turbine mcp, eleven tools including a relation graph and a join-path finder that returns the `with` clause to write), a deterministic codegen flow (introspect the database, generate a typed client, query through it), fully typed query arguments that make invalid queries a compile error, and a stable typed error system (codes TURBINE_E001 through E018) that agents can branch on instead of parsing messages. Point an agent at this file and the docs below to teach it how to use Turbine correctly.
 
 Key facts:
 - Postgres-first. PostgreSQL 14+ is the supported floor, which is what CI tests (14, 15, 16, 17). Node.js 20+ (the SQLite engine needs Node 22.5+).
@@ -47,7 +47,7 @@ Common mistakes to avoid when generating Turbine code:
 - [CLI Config Module](https://turbineorm.dev/cli-module): The importable turbine-orm/cli subpath: TurbineCliConfig, config discovery and loading, resolveConfig precedence, seed-file resolution.
 - [Database Engines](https://turbineorm.dev/engines): SQLite, MySQL, SQL Server, and PowDB behind the same typed API, and which features stay Postgres-only.
 - [Database Compatibility](https://turbineorm.dev/compatibility): PG-wire-compatible databases (CockroachDB, YugabyteDB, AlloyDB, TimescaleDB, Neon, Supabase) and their adapters.
-- [Benchmarks](https://turbineorm.dev/benchmarks): Three-way numbers against Prisma and Drizzle on a local PostgreSQL database. Measured once on 2026-07-25 against 0.50.0 and not re-run since; treat as a dated snapshot.
+- [Benchmarks](https://turbineorm.dev/benchmarks): Three-way numbers against Prisma and Drizzle plus a hand-written pg control, on a local PostgreSQL database. A dated snapshot; the page states the measurement date and versions.
 
 ## Optional
 
@@ -57,7 +57,7 @@ Common mistakes to avoid when generating Turbine code:
 - [Turbine + Neon](https://turbineorm.dev/neon): Neon-specific setup over HTTP and WebSocket drivers.
 - [Turbine + BataDB](https://turbineorm.dev/batadb): Setup notes for BataDB.
 - [Studio](https://turbineorm.dev/studio): The local database UI (npx turbine studio), its security model, and --demo mode.
-- [MCP Server](https://turbineorm.dev/mcp): A read-only Model Context Protocol server (npx turbine mcp) exposing ten tools to agents: schema, table detail, relation graph, join paths (returns the with clause to write), migrations, doctor, EXPLAIN, table stats, sample rows, and error lookup.
+- [MCP Server](https://turbineorm.dev/mcp): A read-only Model Context Protocol server (npx turbine mcp) exposing eleven tools to agents: schema, table detail, relation graph, join paths (returns the with clause to write), migrations, doctor, EXPLAIN, query compilation (the exact SQL, without running it), table stats, sample rows, and error lookup.
 - [Observability](https://turbineorm.dev/observability): Query lifecycle events and built-in metrics aggregation.
 - [The PowDB Module](https://turbineorm.dev/powdb): The turbine-orm/powdb subpath in full: transports, capability gating, PowQL helpers, schema DDL, introspection, and error mapping.
 - [Writing a Custom Dialect](https://turbineorm.dev/dialects): The exported Dialect contract: capability flags, resultStrategy, required primitives, and the additive override hooks.

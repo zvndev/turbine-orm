@@ -1,5 +1,142 @@
 # Changelog
 
+## 0.71.0 (2026-08-15)
+
+A performance release, and the honest version of that sentence is that the
+work was mostly finding out where the time was **not** going.
+
+Turbine's nested reads have lost to Drizzle for several releases. The
+assumption was that the row parser was slow, and the fix everyone expected was
+a JIT-compiled mapper like the one Drizzle ships in its 1.0 release candidate.
+Profiling says the opposite: Turbine's mapping is already the faster of the
+two, 0.369 ms against 0.664 ms on the L2 shape. The gap was 59% server time,
+and almost all of that was PostgreSQL building JSON. `json_build_object`
+repeats every key on every row and `json_build_array` does not.
+
+Turbine has shipped that encoding since 0.26 as `jsonEncoding: 'positional'`.
+It is now the PostgreSQL default. Against Drizzle 0.45.2, Turbine goes from
+seven of ten scenarios to nine of ten, and geometric mean from 1.079x to
+1.025x. No row changes.
+
+Three behaviour changes to Stable surfaces are below. Per
+[STABILITY.md](./STABILITY.md), the 1.0 Stable-surface freeze clock therefore
+does not start with this release.
+
+### Behaviour changes
+
+- **`jsonEncoding` now defaults to `'positional'` on PostgreSQL** (it was
+  `'object'`, and stays `'object'` on every other engine). `TurbineConfig`
+  fields are a Stable surface, so a changed default belongs here even though no
+  API moved.
+
+  What actually changes for you: the emitted SQL. Relation subqueries build
+  `json_build_array` instead of `json_build_object`. Rows are byte-identical,
+  verified by `JSON.stringify` equality including key order, and the
+  value-fidelity `::text` casts are untouched because only the JSON *keys* are
+  dropped, never the expressions. If you log SQL or read raw JSON in a debugger,
+  it is now positional and less readable. Pass `jsonEncoding: 'object'` per
+  query, or set it on the client, to get the old shape back.
+
+  The default is derived from `dialect.name === 'postgresql'` rather than from a
+  capability flag, deliberately. Every engine dialect is built by spreading
+  `postgresDialect`, so testing whether the `buildJsonArray` hook exists hands
+  positional to all of them. `buildSelectWithRelations` already refuses
+  positional on exactly that dialect predicate, so deriving the default from the
+  same predicate makes it structurally impossible for the default to select an
+  encoding the builder then rejects.
+
+- **`relationLoadStrategy: 'flatten'` now falls back to the default correlated
+  subquery on PostgreSQL** unless you also pass `jsonEncoding: 'object'`. A
+  flattened relation emits no JSON at all, so the two are not composed in this
+  version. This is a plan change with no error: rows are identical, and a
+  once-only dev warning names the encoding as the cause and tells you what to
+  pass. `'auto'` never selected `flatten`, so this only affects callers who
+  asked for it by name.
+
+- **`turbine doctor` refuses to run through a connection pooler**, before it
+  opens a connection. `doctor` is a Stable CLI command, so if you point it at a
+  PgBouncer, a Neon `-pooler` endpoint, or Supabase's pooler in CI, that job now
+  exits 1. Pass `--allow-pooler` to restore the old behaviour, or better, use
+  the direct endpoint.
+
+  The reason is not stylistic. A transaction pooler multiplexes many clients
+  onto a few shared server backends and reuses one the moment a transaction
+  ends, so session state set by one client can be left in force for another.
+  `doctor` also reads `pg_prepared_statements` to confirm a cached plan, and
+  through a pooler that view describes whichever backend answered rather than
+  your application. Detection matches whole hostname tokens (`pooler`,
+  `pgbouncer`, numbered variants) and ports 6543 and 6432, so a database named
+  `poolers` or a host `spooler.internal` is not caught.
+
+### Added
+
+- **`findManyStreamBatches`**, a streaming method that yields `T[]` instead of
+  `T`. `findManyStream` yields one row at a time, which over a 50,000 row drain
+  is 50,000 promise resolutions and microtask turns, measured at **7.4 ms, about
+  139 ns per row**. Both share one parser-selection site and one database path,
+  so their flatten, encoding and PII decisions cannot diverge. `findManyStream`
+  is unchanged, including its laziness: it deliberately does not delegate to the
+  batch method, because that would parse a whole batch ahead of the consumer and
+  make an early `break` pay for rows nobody asked for.
+
+- **`jsonEncoding` as a per-query argument** on `findMany`, `findUnique`,
+  `findFirst` and the stream methods, so a single query can opt back to object
+  encoding for debuggability or to use `flatten`. An unrecognized value throws
+  `TURBINE_E003` rather than falling back, because a silently ignored encoding
+  option is invisible: you would get correct rows, no saving, and no signal.
+
+- **`compile_query`**, an eleventh read-only MCP tool. It compiles a read query
+  to the exact SQL it would send without executing it, which is possible because
+  Turbine already separates build from execute: every `build*()` returns a
+  `DeferredQuery` and nothing runs until it is executed. It reports the bound
+  parameters, how many statements the query costs, the relation load strategy it
+  takes, whether it is bounded by a `LIMIT` or reads every row, and relation
+  probes no index serves. A query that fails to compile is a successful answer
+  carrying `TURBINE_E003` / `TURBINE_E005` and how to fix it, which is the most
+  useful outcome when an agent is still writing the query. Read operations only.
+
+### Fixed
+
+- **`turbine doctor` issued a session-level `SET statement_timeout`** on a pool
+  it built from a connection string, in both `index-stats.ts` and
+  `plan-flip-probe.ts`. Through a pooler that attaches to a shared backend that
+  is not reset on release. The timeout is now a connection startup parameter in
+  one case and transaction-local `set_config(..., true)` in the other. (`SET
+  LOCAL x = $1` is a Postgres syntax error, which is why `set_config` is the
+  parameterizable form.)
+
+- **`findManyStreamBatches` ran on the primary with read replicas configured**,
+  because `READ_OPERATIONS` is a hand-maintained list and a missing entry fails
+  silently: the query works, it just does not use the replica. It also had no
+  `PowqlInterface` stub, so on PowDB it was `undefined` and callers got
+  `TypeError: not a function` instead of `TURBINE_E017`. Both lists are now
+  checked mechanically against `QueryInterface`'s read surface.
+
+- **`src/query/builder.ts` contained a literal NUL byte** as a cache-key
+  delimiter, which made `grep` classify the repo's largest file as binary and
+  report zero matches for terms that were present. Written as an escape now.
+  Two benchmark files had picked up the same habit.
+
+### Performance
+
+Measured on PostgreSQL 17.9 over a Unix socket, 200 rounds, arm order rotated
+per round, median of three runs, every run gated on an idle machine. Full
+numbers and method in `benchmarks/RESULTS-0.71.0.md`.
+
+| | vs fastest ORM | record |
+|---|---|---|
+| Turbine 0.71.0 | 1.025x | 10/10 vs Prisma, 9/10 vs Drizzle |
+| Drizzle 0.45.2 | 1.498x | |
+| Prisma 7.9.1 | 2.072x | |
+
+Two caveats stated where they are quoted. The L2 and L3 wins are **contested**:
+their margins sit inside the harness drift floor, and the contiguous
+cross-check disagreed with itself across runs of the same configuration. And
+the overhead figure over raw `pg` is published as **1.08x**, not the 1.00x the
+harness records unadjusted, because the raw control still uses
+`json_build_object` while Turbine no longer does, which is worth 1.83x on its
+own. Streaming remains Turbine's one loss to Drizzle.
+
 ## 0.70.0 (2026-08-15)
 
 An agent-first release. Turbine's MCP server grows from six read-only tools to

@@ -118,6 +118,22 @@ async function withRawClient(fn: (c: pg.Client) => Promise<unknown>): Promise<vo
   }
 }
 
+/**
+ * The strategy AND the encoding it needs.
+ *
+ * `'flatten'` is refused while `jsonEncoding: 'positional'` is active, because a
+ * flattened relation emits no JSON to encode, and positional is the PostgreSQL
+ * DEFAULT. Asking for `'flatten'` alone here would silently get the correlated
+ * subquery, and every `deepEqual(flatten, join)` below would then be comparing
+ * the join plan with itself: passing, and proving nothing.
+ *
+ * The `join` and `batched` arms deliberately keep the DEFAULT encoding, so each
+ * assertion is the real cross-plan claim (flatten+object equals join+positional
+ * equals batched, which emits no relation JSON at all). The encoding axis on its
+ * own is fuzzed in strategy-fuzz.test.ts.
+ */
+const FLATTEN = { relationLoadStrategy: 'flatten', jsonEncoding: 'object' } as const;
+
 describe('relation strategy equivalence: join / batched / flatten', () => {
   before(async () => {
     await withRawClient((c) => c.query(DDL));
@@ -145,7 +161,7 @@ describe('relation strategy equivalence: join / batched / flatten', () => {
    */
   async function assertThreeWay(table: string, args: Record<string, unknown>): Promise<unknown[]> {
     const join = await db.table(table).findMany({ ...args, relationLoadStrategy: 'join' } as never);
-    const flatten = await db.table(table).findMany({ ...args, relationLoadStrategy: 'flatten' } as never);
+    const flatten = await db.table(table).findMany({ ...args, ...FLATTEN } as never);
     const batched = await db.table(table).findMany({ ...args, relationLoadStrategy: 'batched' } as never);
     const label = `${table} ${JSON.stringify(args)}`;
     assert.deepEqual(flatten, join, `flatten must equal join for ${label}`);
@@ -285,7 +301,7 @@ describe('relation strategy equivalence: join / batched / flatten', () => {
     const flat = (await db.table('flatten_people').findMany({
       orderBy: { id: 'asc' },
       with: { flattenItems: { orderBy: { id: 'asc' } } },
-      relationLoadStrategy: 'flatten',
+      ...FLATTEN,
     } as never)) as unknown[];
     assert.equal(flat.length, 5, 'flatten must not multiply parent rows');
     const join = await db.table('flatten_people').findMany({
@@ -300,7 +316,7 @@ describe('relation strategy equivalence: join / batched / flatten', () => {
     const plan = (
       await db.table('flatten_people').explain({
         with: { flattenTeam: true },
-        relationLoadStrategy: 'flatten',
+        ...FLATTEN,
       } as never)
     ).join('\n');
     assert.match(plan, /Join/i, `expected a join node in:\n${plan}`);
@@ -365,9 +381,10 @@ describe('relation strategy equivalence: join / batched / flatten', () => {
     const join = (await db
       .table('flatten_items')
       .findMany({ ...args, relationLoadStrategy: 'join' } as never)) as Record<string, unknown>[];
-    const flatten = (await db
-      .table('flatten_items')
-      .findMany({ ...args, relationLoadStrategy: 'flatten' } as never)) as Record<string, unknown>[];
+    const flatten = (await db.table('flatten_items').findMany({ ...args, ...FLATTEN } as never)) as Record<
+      string,
+      unknown
+    >[];
     const batched = (await db
       .table('flatten_items')
       .findMany({ ...args, relationLoadStrategy: 'batched' } as never)) as Record<string, unknown>[];
@@ -393,7 +410,7 @@ describe('relation strategy equivalence: join / batched / flatten', () => {
         .findMany({ orderBy: { id: 'asc' }, with: { flattenTeam: true }, relationLoadStrategy: 'join' } as never);
       const flatten = await tx
         .table('flatten_people')
-        .findMany({ orderBy: { id: 'asc' }, with: { flattenTeam: true }, relationLoadStrategy: 'flatten' } as never);
+        .findMany({ orderBy: { id: 'asc' }, with: { flattenTeam: true }, ...FLATTEN } as never);
       assert.deepEqual(flatten, join);
     });
   });
@@ -404,7 +421,7 @@ describe('relation strategy equivalence: join / batched / flatten', () => {
       orderBy: { id: 'asc' },
       with: { flattenTeam: true },
       batchSize: 2,
-      relationLoadStrategy: 'flatten',
+      ...FLATTEN,
     } as never)) {
       streamed.push(row);
     }

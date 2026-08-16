@@ -195,7 +195,18 @@ function buildSchema(): SchemaMetadata {
   } as unknown as SchemaMetadata;
 }
 
-const FLATTEN = { relationLoadStrategy: 'flatten' } as const;
+/**
+ * The strategy AND the encoding it needs.
+ *
+ * `jsonEncoding: 'positional'` is the PostgreSQL default, and a flattened
+ * relation emits no JSON to encode, so the two are not composed: asking for
+ * `'flatten'` alone on Postgres now falls back to the correlated subquery
+ * (silently and byte-identically, with a dev warning). `jsonEncoding: 'object'`
+ * is the documented way to get the flatten plan, so every test that is ABOUT
+ * the flatten plan passes it. The fallback itself is asserted directly in the
+ * eligibility block below, so this constant hides nothing.
+ */
+const FLATTEN = { relationLoadStrategy: 'flatten', jsonEncoding: 'object' } as const;
 
 /** Build a findMany under an explicit strategy and return its SQL. */
 // biome-ignore lint/suspicious/noExplicitAny: build-only helper over the generic arg surface
@@ -207,12 +218,16 @@ function sqlFor(args: any, table = 'users', schema: SchemaMetadata = buildSchema
 // biome-ignore lint/suspicious/noExplicitAny: build-only helper over the generic arg surface
 function bothStrategies(args: any, table = 'users', schema: SchemaMetadata = buildSchema()) {
   const q = makeQuery(table, schema);
-  const join = q.buildFindMany({ ...args, relationLoadStrategy: 'join' });
-  const flatten = q.buildFindMany({ ...args, relationLoadStrategy: 'flatten' });
+  // Both arms hold the encoding fixed at `'object'`, so the only thing that
+  // differs between the two cache entries is the STRATEGY, which is what this
+  // helper's callers assert about. (The encoding gets its own cache-key
+  // isolation test in json-encoding-positional.test.ts.)
+  const join = q.buildFindMany({ ...args, relationLoadStrategy: 'join', jsonEncoding: 'object' });
+  const flatten = q.buildFindMany({ ...args, ...FLATTEN });
   // Rebuild both to force a cache HIT (which also runs the dev cross-check that
   // compares the collected params against a fresh build).
-  const joinAgain = q.buildFindMany({ ...args, relationLoadStrategy: 'join' });
-  const flattenAgain = q.buildFindMany({ ...args, relationLoadStrategy: 'flatten' });
+  const joinAgain = q.buildFindMany({ ...args, relationLoadStrategy: 'join', jsonEncoding: 'object' });
+  const flattenAgain = q.buildFindMany({ ...args, ...FLATTEN });
   return { join, flatten, joinAgain, flattenAgain };
 }
 
@@ -323,8 +338,11 @@ describe("relationLoadStrategy: 'flatten', fallback rules", () => {
   /** Assert the shape compiles to EXACTLY the default-strategy statement. */
   // biome-ignore lint/suspicious/noExplicitAny: build-only helper
   function assertFallsBack(args: any, schema: SchemaMetadata = buildSchema(), options?: any) {
-    const flat = sqlFor({ ...args, relationLoadStrategy: 'flatten' }, 'users', schema, options);
-    const join = sqlFor({ ...args, relationLoadStrategy: 'join' }, 'users', schema, options);
+    // `jsonEncoding` is written FIRST so a case can override it (the encoding
+    // cases below do exactly that); both arms get the same value, so the only
+    // difference under test stays the strategy.
+    const flat = sqlFor({ jsonEncoding: 'object', ...args, relationLoadStrategy: 'flatten' }, 'users', schema, options);
+    const join = sqlFor({ jsonEncoding: 'object', ...args, relationLoadStrategy: 'join' }, 'users', schema, options);
     assert.equal(flat, join);
     assert.doesNotMatch(flat, /\) f\d ON /);
   }
@@ -382,8 +400,24 @@ describe("relationLoadStrategy: 'flatten', fallback rules", () => {
     assertFallsBack({ with: { org: true } }, buildSchema(), { dialect: mssqlDialect });
   });
 
-  it("`jsonEncoding: 'positional'` disables the whole plan", () => {
-    assertFallsBack({ with: { org: true } }, buildSchema(), { jsonEncoding: 'positional' });
+  it("`jsonEncoding: 'positional'` disables the whole plan (per-query)", () => {
+    assertFallsBack({ with: { org: true }, jsonEncoding: 'positional' });
+  });
+
+  it("`jsonEncoding: 'positional'` disables the whole plan (client-level)", () => {
+    assertFallsBack({ with: { org: true }, jsonEncoding: undefined }, buildSchema(), { jsonEncoding: 'positional' });
+  });
+
+  it("positional is the PostgreSQL DEFAULT, so 'flatten' on its own falls back", () => {
+    // The behaviour change a caller actually meets: they wrote `'flatten'`, set
+    // no encoding, and got the correlated subquery. Byte-identical to `'join'`,
+    // and the emitted SQL is the positional form, which is what refused it.
+    const schema = buildSchema();
+    const flat = sqlFor({ with: { org: true }, relationLoadStrategy: 'flatten' }, 'users', schema);
+    const join = sqlFor({ with: { org: true }, relationLoadStrategy: 'join' }, 'users', schema);
+    assert.equal(flat, join);
+    assert.doesNotMatch(flat, /\) f\d ON /);
+    assert.match(flat, /json_build_array/);
   });
 
   it('a nested `_count` falls back and still raises the join path error', () => {
@@ -505,7 +539,14 @@ describe("relationLoadStrategy: 'flatten', fallback is announced, not silent", (
     [
       'the positional wire encoding',
       /jsonEncoding: 'positional'/,
-      () => sqlFor({ ...FLATTEN, with: { org: true } }, 'users', buildSchema(), { jsonEncoding: 'positional' }),
+      // Per-query, so this stays a statement about the ENCODING and not about
+      // whichever value the PostgreSQL default happens to hold.
+      () => sqlFor({ ...FLATTEN, with: { org: true }, jsonEncoding: 'positional' }),
+    ],
+    [
+      'the positional wire encoding by default on PostgreSQL',
+      /the PostgreSQL default/,
+      () => sqlFor({ relationLoadStrategy: 'flatten', with: { org: true } }),
     ],
     [
       'a dialect that owns relation subqueries',

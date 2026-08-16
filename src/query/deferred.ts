@@ -9,7 +9,7 @@ import type { PgCompatPool, PgCompatQueryResult } from '../pg-types.js';
 import type { SchemaMetadata } from '../schema.js';
 // Forward-declared to avoid a runtime cycle with builder.ts. Type-only.
 import type { QueryInterface } from './builder.js';
-import type { GlobalFilters, RelationLoadStrategy } from './types.js';
+import type { GlobalFilters, JsonEncoding, RelationLoadStrategy } from './types.js';
 
 /**
  * Runs a SQL statement and resolves its raw result. Passed to a
@@ -253,12 +253,18 @@ export interface QueryInterfaceOptions {
    */
   autoRoundTripMs?: number;
   /**
-   * How nested-relation subqueries encode each row's JSON: `'object'` (default,
-   * `json_build_object`) or `'positional'` (`json_build_array`, key-less, see
-   * {@link Dialect.buildJsonArray}). Positional is Postgres-only in v1; a
-   * `with` clause on any other dialect throws `UnsupportedFeatureError` (E017).
+   * How nested-relation subqueries encode each row's JSON: `'object'`
+   * (`json_build_object`) or `'positional'` (`json_build_array`, key-less, see
+   * {@link Dialect.buildJsonArray}).
+   *
+   * DEFAULTS BY ENGINE: `'positional'` on PostgreSQL, `'object'` on every other
+   * dialect. Positional is Postgres-only; setting it elsewhere makes a `with`
+   * clause throw `UnsupportedFeatureError` (E017).
+   *
+   * Overridable per query (`findMany({ jsonEncoding })`), which is also how a
+   * caller re-enables `relationLoadStrategy: 'flatten'` on PostgreSQL.
    */
-  jsonEncoding?: 'object' | 'positional';
+  jsonEncoding?: JsonEncoding;
   /**
    * Automatic WHERE filters keyed by table accessor, AND-merged into every
    * query on that table and every relation subquery targeting it (soft-delete /

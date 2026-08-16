@@ -150,9 +150,32 @@ async function main() {
 
   console.log('\nConnecting...');
 
-  // Turbine, uses its own internal pg.Pool
-  const turbine = new TurbineClient({ connectionString: DATABASE_URL, logging: false });
+  // Turbine, uses its own internal pg.Pool.
+  //
+  // `TURBINE_JSON` mirrors the switch in bench-interleaved.ts, and unset means
+  // the SHIPPING default, not a literal pinned here. This harness is the
+  // cross-check that decides whether a scenario is contested, so it has to be
+  // able to price the same two encodings the primary harness prices; otherwise
+  // a disagreement between the harnesses cannot be told apart from a
+  // disagreement between two different configurations.
+  const turbineJsonRaw = process.env['TURBINE_JSON'];
+  if (turbineJsonRaw !== undefined && turbineJsonRaw !== 'object' && turbineJsonRaw !== 'positional') {
+    console.error(`TURBINE_JSON must be 'object' or 'positional', got ${JSON.stringify(turbineJsonRaw)}.`);
+    process.exit(1);
+  }
+  const turbine = new TurbineClient({
+    connectionString: DATABASE_URL,
+    logging: false,
+    ...(turbineJsonRaw ? { jsonEncoding: turbineJsonRaw as 'object' | 'positional' } : {}),
+  });
   await turbine.connect();
+  {
+    const sql = (turbine.users.buildFindMany({ limit: 1, with: { posts: true } }) as { sql: string }).sql;
+    const emitted = sql.includes('json_build_array') ? 'positional' : 'object';
+    console.log(
+      `Turbine arm: jsonEncoding='${emitted}' (${turbineJsonRaw ? 'forced' : 'client default'}), verified from emitted SQL.`,
+    );
+  }
 
   // Prisma 7, adapter-pg pattern (no more Rust binary engine)
   const prismaPool = new pg.Pool({ connectionString: DATABASE_URL, max: 10 });

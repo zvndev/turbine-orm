@@ -121,6 +121,7 @@ describe('turbine mcp protocol', () => {
         'migrate_status',
         'doctor_report',
         'explain_query',
+        'compile_query',
         'sample_rows',
         'relation_graph',
         'find_join_path',

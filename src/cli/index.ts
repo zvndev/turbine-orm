@@ -14,7 +14,7 @@
  *   turbine migrate status       , Show migration status
  *   turbine seed                 , Run seed file
  *   turbine status               , Show schema summary
- *   turbine doctor                - Index + cached-plan triage (--fix, --json, --no-concurrently, --unused, --audit, --no-plan-divergence)
+ *   turbine doctor                - Index + cached-plan triage (--fix, --json, --no-concurrently, --unused, --audit, --no-plan-divergence, --allow-pooler)
  *   turbine studio                : Launch local read-only web UI (--demo for a seeded sample DB)
  *   turbine mcp                  , Start read-only MCP server over JSON-RPC stdio
  *   turbine observe              , Launch metrics dashboard (requires TURBINE_OBSERVE_URL)
@@ -40,6 +40,7 @@ import {
 import { tmpdir } from 'node:os';
 import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { detectPooler, poolerRefusalMessage } from '../connection-url.js';
 import { generate, generatePrismaMap } from '../generate.js';
 import {
   buildCreateIndexSql,
@@ -195,6 +196,8 @@ export interface CliArgs {
   metricsUrl?: string;
   /** `doctor --no-plan-divergence`: skip the cached-plan divergence section (and its pg_stats read). */
   noPlanDivergence?: boolean;
+  /** `doctor --allow-pooler`: run even when the connection string looks like a transaction pooler. */
+  allowPooler?: boolean;
   // init flags
   /** `init --yes`/`-y`: accept every step's default non-interactively. */
   yes?: boolean;
@@ -371,6 +374,9 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         break;
       case '--no-plan-divergence':
         result.noPlanDivergence = true;
+        break;
+      case '--allow-pooler':
+        result.allowPooler = true;
         break;
       case '--zod':
         result.zod = true;
@@ -3350,9 +3356,45 @@ const CONCURRENTLY_RECIPE_COMMENT = [
   '--      statement_timeout in a psql session.',
 ].join('\n');
 
+/**
+ * Refuse a `doctor` run whose connection string points at a transaction pooler.
+ *
+ * Called BEFORE anything opens a connection, which is the whole point: the
+ * refusal has to happen while the only thing anybody has touched is a string.
+ *
+ * Doctor is a diagnostic command that reads statistics and reasons about
+ * cached plans, and both of those arguments assume the session it is talking to
+ * is its own. Through a pooler it is not: session state this process sets can be
+ * left on a shared backend for someone else's queries, and the session-scoped
+ * view the report's own remediation tells the reader to inspect
+ * (`pg_prepared_statements`) belongs to whichever backend happened to answer.
+ * Refusing is the honest outcome; reporting confidently over a connection whose
+ * session semantics do not hold is not.
+ *
+ * Written to STDERR, including in `--json` mode, where stdout is contracted to
+ * carry the report and nothing else.
+ *
+ * Exported for the unit test only (like {@link isLoopbackHost}): a gate whose
+ * failure path is `process.exit` is untestable through the command itself.
+ */
+export function refusePoolerConnection(url: string, args: CliArgs): void {
+  if (args.allowPooler === true) return;
+  const detection = detectPooler(url);
+  if (!detection.pooled) return;
+  const lines = poolerRefusalMessage(detection, { command: 'turbine doctor', allowFlag: '--allow-pooler' });
+  console.error('');
+  console.error(`  ${red(symbols.cross)} ${lines[0]}`);
+  for (const line of lines.slice(1)) console.error(line === '' ? '' : `  ${line}`);
+  console.error('');
+  process.exit(1);
+}
+
 async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
   const jsonMode = args.json === true;
   const url = requireUrl(config);
+
+  // Before the banner, before introspect, before any pool is constructed.
+  refusePoolerConnection(url, args);
 
   if (!jsonMode) {
     banner();
@@ -4842,6 +4884,16 @@ function showDoctorHelp(): void {
   console.log(
     `    ${cyan('--no-plan-divergence')}  Skip the cached-plan divergence section ${dim('(and its pg_stats read)')}`,
   );
+  console.log(
+    `    ${cyan('--allow-pooler')}        Run against a connection pooler anyway ${dim('(refused by default)')}`,
+  );
+  newline();
+  console.log(
+    `  ${dim('doctor refuses a transaction-pooling endpoint (a')} ${cyan('-pooler')} ${dim('or')} ${cyan('pgbouncer')}`,
+  );
+  console.log(`  ${dim('host, or port 6543). Point it at the direct endpoint instead: a pooler')}`);
+  console.log(`  ${dim('shares one server backend between clients, so neither the session state')}`);
+  console.log(`  ${dim('doctor needs nor the session-scoped views it cites belong to it.')}`);
   newline();
   console.log(`  ${bold('Examples:')}`);
   console.log(`    ${dim('$')} npx turbine doctor`);

@@ -3680,6 +3680,20 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     );
   }
 
+  // The batch-yielding sibling needs its OWN stub. `PowqlInterface` is a
+  // parallel implementation of QueryInterface's surface rather than a subclass,
+  // so a method that exists on one and not the other is not a type error here:
+  // it is `undefined` at runtime, and the caller gets `TypeError: not a
+  // function` instead of the typed E017 that tells them what to do instead.
+  // biome-ignore lint/correctness/useYield: intentionally throws before yielding, PowDB has no server cursor.
+  async *findManyStreamBatches(): AsyncGenerator<T[]> {
+    throw new UnsupportedFeatureError(
+      'cursor streaming (findManyStreamBatches)',
+      'PowDB',
+      'PowDB has no server-side cursor; page with findMany({ limit, offset }) instead',
+    );
+  }
+
   // -------------------------------------------------------------------------
   // Reselect helper (upsert only, PowDB's upsert has no `returning`)
   // -------------------------------------------------------------------------

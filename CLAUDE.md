@@ -384,6 +384,34 @@ src/
                       moves with the table since it is a cost comparison; a closed-form gate
                       was attempted and failed its own out-of-sample prediction.
 
+  connection-url.ts, Zero-import leaf (0.71) owning everything that reads or rewrites a
+                      CONNECTION STRING. Three jobs. (1) `detectPooler` +
+                      `poolerRefusalMessage`: `turbine doctor` REFUSES a transaction-pooling
+                      endpoint before opening a connection (`--allow-pooler` overrides;
+                      default is refusal). A pooler multiplexes backends, so both the session
+                      state doctor needs and the session-scoped views it reads
+                      (pg_prepared_statements) belong to whichever backend answered. Matching
+                      is on whole dot/dash/underscore TOKENS of the hostname (`pooler`,
+                      `pgbouncer`, plus numbered forms), never a substring of the connection
+                      string, so a database named `poolers` or a host `spooler.internal` is
+                      not caught; ports are 6543 AND 6432 (PgBouncer's documented default
+                      `listen_port`, included because the errors are asymmetric: a false
+                      positive costs one flag on an interactive command, a false negative is
+                      the hazard itself). (2) `withStatementTimeoutOption`: index-stats.ts
+                      used to issue a SESSION-LEVEL `SET statement_timeout` on a pool built
+                      from a connection string, which through a pooler poisons a SHARED
+                      backend that is not DISCARDed on release. It now goes in the
+                      `options=-c` CONNECTION PARAMETER (the `withPlanCacheMode` pattern), and
+                      plan-flip-probe.ts, which had the identical bug, now sets it
+                      transaction-locally via `set_config(..., true)` inside its
+                      `BEGIN READ ONLY` (`SET LOCAL x = $1` is a Postgres SYNTAX ERROR, which
+                      is the 0.17.0 bug, so `set_config` is the parameterizable form). The
+                      value is narrowed to a non-negative safe integer before it can reach the
+                      wire, because a GUC value cannot be a bind param and anything carrying a
+                      space can carry a second `-c`. (3) `mergeConnectionStringOptions`, shared
+                      with `TurbineClient.withPlanCacheMode`. KEEP THIS FILE IMPORT-FREE, that
+                      is what lets client.ts depend on it without a new edge.
+
   client.ts        , TurbineClient wraps a pg.Pool and auto-creates typed table accessors
                       via Object.defineProperty. Manages middleware ($use), transactions
                       ($transaction with SAVEPOINTs for nesting, isolation levels, timeouts,
@@ -404,8 +432,37 @@ src/
                       implicit default: join plan with per-relation batched fallback on
                       proven-unindexed correlation columns, event tag 'auto-batched',
                       composite-key/unknown relations always stay join), `jsonEncoding: 'object' |
-                      'positional'` (Postgres-only lean `json_build_array` wire encoding for
-                      `with` subqueries), and `utcTimestamps` (default true; see parseDbDate
+                      'positional'` (lean `json_build_array` wire encoding for `with`
+                      subqueries; 0.71: POSITIONAL IS THE POSTGRESQL DEFAULT and is also a
+                      PER-QUERY arg on FindManyArgs/FindUniqueArgs. `json_build_object`
+                      repeats every key on every row and `json_build_array` does not: server
+                      time 0.685ms -> 0.350ms and 152 KB -> 100 KB on the L2 shape, which is
+                      the whole of the nested-read gap. Rows are byte-identical, and the
+                      value-fidelity `::text` casts survive because `buildJsonRow` drops only
+                      the KEYS and passes each expression verbatim. THE DEFAULT IS DERIVED
+                      FROM `dialect.name === 'postgresql'`, deliberately NOT from a
+                      capability flag and NOT from `buildJsonArray` being present: every
+                      engine spreads `postgresDialect` so a presence test hands them all
+                      positional (THE INHERITANCE TRAP, see dialect.ts), and
+                      `buildSelectWithRelations` ALREADY refuses positional on that same
+                      predicate with E017, so deriving the default from the identical
+                      predicate makes it structurally impossible for the default to select an
+                      encoding the builder then refuses. A flag would be a second authority
+                      on one question, free to drift. The `fm:` and `fu:` cache keys carry a
+                      `|je=` segment emitted for BOTH values (never only the non-default one,
+                      so the key cannot depend on what the client default happens to be):
+                      serving a positional template to an object-expecting parser is SILENT
+                      WRONG ROWS, not an error, and the dev-only `crossCheckCache` is what
+                      caught it in test, which is exactly why the key segment and not the
+                      cross-check is the fix. Two consequences worth knowing: `flatten` on
+                      Postgres now falls back for everyone who does not ALSO pass
+                      `jsonEncoding: 'object'` (a plan change with no error, warned once), and
+                      flipping the default made five assertions VACUOUS, including a PII test
+                      matching the JSON KEY literal `/'secret'/` that would have passed with
+                      the column fully projected. Assert the COLUMN REFERENCE, which both
+                      encodings emit. The strategy-fuzz suite now carries encoding as a
+                      differential axis plus an arm exercising all 15 JSON_WIRE_COERCION_OIDS
+                      types), and `utcTimestamps` (default true; see parseDbDate
                       in query/utils.ts). 0.54 widened the read half of `utcTimestamps` from
                       OID 1114 alone to the whole zone-less temporal set, 1114 `timestamp`,
                       1082 `date`, 1115 `timestamp[]`, 1182 `date[]`, via the shared
@@ -1034,7 +1091,7 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 
 ## CLI Architecture
 
-The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.argv`. No commander/yargs. Commands: `init`, `generate`/`pull`, `push`, `migrate create|up|deploy|down|status` (`deploy` is `up` with no prompts, for CI), `seed`, `status`, `doctor` (missing-FK-index advisor → `index-advisor.ts`; `--fix` writes an add-index migration; cached-plan divergence section → `plan-divergence.ts`, finding-only, `--no-plan-divergence` skips it and its pg_stats read; since 0.57 an `unindexed-filter` finding renders as EVIDENCE on the missing-index finding for the same column (`attachDivergenceToMissingIndexes` / `renderDivergenceEvidence`) rather than as a second entry, and the remediation text names `forceCustomPlan` without assuming the reader holds the core client or prisma-compat), `migrate-from-prisma` (0.41: zero-dep schema.prisma subset parser in `cli/prisma-schema.ts`, live-metadata resolver in `cli/prisma-resolve.ts`, Markdown report via `cli/prisma-report.ts`, emits the typed PRISMA_MAP module `generate.ts` also regenerates; `--no-db` parse-only mode), `studio`, `mcp` (read-only MCP server over JSON-RPC stdio -> `cli/mcp.ts`), `observe` (metrics dashboard, requires TURBINE_OBSERVE_URL -> `cli/observe.ts`).
+The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.argv`. No commander/yargs. Commands: `init`, `generate`/`pull`, `push`, `migrate create|up|deploy|down|status` (`deploy` is `up` with no prompts, for CI), `seed`, `status`, `doctor` (missing-FK-index advisor → `index-advisor.ts`; `--fix` writes an add-index migration; cached-plan divergence section → `plan-divergence.ts`, finding-only, `--no-plan-divergence` skips it and its pg_stats read; since 0.57 an `unindexed-filter` finding renders as EVIDENCE on the missing-index finding for the same column (`attachDivergenceToMissingIndexes` / `renderDivergenceEvidence`) rather than as a second entry, and the remediation text names `forceCustomPlan` without assuming the reader holds the core client or prisma-compat), `migrate-from-prisma` (0.41: zero-dep schema.prisma subset parser in `cli/prisma-schema.ts`, live-metadata resolver in `cli/prisma-resolve.ts`, Markdown report via `cli/prisma-report.ts`, emits the typed PRISMA_MAP module `generate.ts` also regenerates; `--no-db` parse-only mode), `studio`, `mcp` (read-only MCP server over JSON-RPC stdio -> `cli/mcp.ts`; ELEVEN tools as of 0.71, the newest being `compile_query` -> `cli/compile-query.ts`, which compiles a read query to the exact SQL WITHOUT executing it. Zero pool interaction is guaranteed by construction via `SEALED_POOL`, a `PgCompatPool` whose `query`/`connect`/`end` all throw; the one database access is the catalog read that resolves names, since a column cannot be validated against a schema nobody has seen. It reports statement count, chosen relation strategy, whether the query is bounded or reads every row, and unindexed correlation probes. `auto` reports its statement count as `null` with a stated RANGE rather than duplicating `planAuto`'s decision in cli/, which is the drift class this repo keeps paying for. A failed compile is a SUCCESSFUL result carrying E003/E005 and the fix, because that is the most useful outcome for an agent. Read operations only: the server has no write surface and compiling one would be the first. Args go through the shared `cli/pii-predicate-guard.ts` exactly as `explain_query` does), `observe` (metrics dashboard, requires TURBINE_OBSERVE_URL -> `cli/observe.ts`).
 
 **Config resolution** (`cli/config.ts`): Searches for `turbine.config.ts` / `.mts` / `.js` / `.mjs`, merges with `--url`/`--out`/`--schema` flags and `DATABASE_URL` env var.
 
@@ -1058,6 +1115,9 @@ The CLI (`src/cli/index.ts`) uses a zero-dependency argument parser on `process.
 
 ## Key Patterns
 
+- **Streaming has TWO public shapes (0.71).** `findManyStream` yields rows; `findManyStreamBatches` yields `T[]`. They are not stylistic alternatives: `yield parseRow(row)` per row means 50,000 rows is 50,000 promise resolutions and microtask turns, measured at **~7 ms / ~139 ns per row** over a 50K drain, which was the largest single component of the streaming gap. Both share ONE parser-selection site (`makeStreamRowParser`) and one database path (`streamRaw`), so the flatten / positional / PII decisions cannot diverge between them. `findManyStream` deliberately does NOT delegate to the batch method: doing so would parse a batch ahead of the consumer, so a `break` after row 1 would pay for 999 more rows. Its laziness is pinned by a test.
+- **Adding a read method to `QueryInterface` means TWO hand-maintained lists, and both fail SILENTLY.** `READ_OPERATIONS` in client.ts decides what a read replica may serve, so a missing name keeps working and just runs on the PRIMARY, with no error and no failing test. `PowqlInterface` is a PARALLEL implementation rather than a subclass, so TypeScript does not require it to have the method, and a missing one is `undefined` at runtime: the PowDB user gets `TypeError: not a function` instead of the typed E017 telling them to page with `findMany`. `findManyStreamBatches` hit both. `src/test/read-operations-drift.test.ts` closes it MECHANICALLY (a name starting with `find`, or count/aggregate/groupBy, is a read; writes match none of it), so a new read method is covered the day it is written with no edit to the test, and it carries an anti-vacuous assertion because reflection returning `[]` would make every check pass while testing nothing.
+- **Never write a literal NUL byte into source.** `query/builder.ts`'s row-decode cache key uses NUL as its delimiter, correctly, because it is the one byte a Postgres identifier cannot contain even quoted, so no table or column name can forge a collision. Write it as the `\u0000` ESCAPE. A raw NUL makes byte-oriented tools classify the file as binary, and `grep` then reports ZERO matches for a term that is present rather than saying it declined to look. This is the largest file in the repo and that silent empty result sent more than one search down the wrong path.
 - All SQL identifiers quoted via `quoteIdent()`, doubles internal `"` chars per Postgres rules
 - All user values parameterized (`$1, $2, ...`), never string-interpolated
 - LIKE patterns escaped via `escapeLike()`, escapes `%`, `_`, `\`
