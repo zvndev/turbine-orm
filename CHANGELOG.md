@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.74.0 (2026-08-17)
+
+The 0.73.1 rule, asked of the second engine: **every option on every operation
+must change the answer, or be refused.** `PowqlInterface` is a parallel
+implementation of the same public surface, so a rule enforced on `QueryInterface`
+alone is not a rule. Asking PowDB the same question found five options it
+accepted and ignored, two of them load-bearing.
+
+### Fixed
+
+- **`globalFilters` did nothing on PowDB.** A client configured for
+  multi-tenancy or soft-delete applied its predicate on every SQL engine and
+  NONE on PowDB: the same application code returned one tenant's rows on
+  Postgres and every tenant's rows on PowDB, with no error anywhere.
+  `skipGlobalFilters` was equally inert, so the opt-OUT appeared to work too.
+
+  If you run PowDB with `globalFilters` configured, **this release changes what
+  your queries return**, which is the point, but it is a result change and not
+  only a bug fix. The filter now applies to `findMany`, `findFirst`,
+  `findUnique`, `count`, `aggregate`, `groupBy`, `update`, `updateMany`,
+  `delete` and `deleteMany`, and to relation loads (each level resolves its own
+  target table's filter).
+
+  The rule is SHARED with the SQL engines (`resolveGlobalFilterFrom`) rather than
+  restated, because two copies of a rule this specific is how the engines drifted
+  before. The ordering is a contract in its own right: the empty-`where` guard
+  still sees the USER predicate alone, so a configured global filter can never
+  quietly turn a refused mass mutation into an accepted one.
+
+- **`optimisticLock` did nothing on PowDB.** The version check never happened, so
+  the update applied unconditionally: a concurrent writer's change was
+  overwritten by a caller who believed they held the lock, and no error was
+  raised. It now adds the version predicate, bumps the column, and raises
+  `OptimisticLockError` (E015) when the row moved on, matching the SQL engines.
+
+- **`stableRelationOrder` did nothing on PowDB**, so relation rows came back in
+  whatever order the engine produced, from the option whose entire purpose is
+  that they do not. The transform moved to `query/relation-names.ts` and both
+  engines now run it.
+
+- **`allowFullTableScan` was refused on PowDB's `update` / `delete`** even when
+  passed, while every SQL engine accepted it.
+
+- **`jsonEncoding` is now refused on PowDB** with `UnsupportedFeatureError`
+  (E017) instead of being dropped. It selects between PostgreSQL's
+  `json_build_object` and `json_build_array` relation encodings, and PowQL emits
+  no JSON row encoding at all, so there was nothing for it to select.
+
+### Internal
+
+- `src/test/powdb-option-observability.test.ts`, the 0.73.1 matrix asked of
+  PowQL, with one addition that is the whole reason to ask: an option PowDB
+  cannot honour must throw E017, never be silently ignored. 90 assertions.
+- The SQL matrix now runs over TWO schema shapes (single-column and composite
+  primary key), since several options are key-shaped and one fixture only ever
+  proves an option is observable in the shape it happens to have. 180 assertions.
+- `$retry`, `$observe` and `pipelineSupported` were the three untested public
+  client methods; the first two are thin delegations, which is exactly why they
+  went uncovered, and what a delegation leaves unproven is the wiring.
+
 ## 0.73.1 (2026-08-17)
 
 A correction to the 0.73.0 notes, and the gate that release should have shipped

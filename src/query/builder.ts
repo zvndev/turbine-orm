@@ -41,6 +41,7 @@ import { assertWhereIdentifiesOneRow, expandCompoundUniqueWhere } from './compou
 import {
   dedupeColumnList,
   dedupeOrderEntries,
+  isEmptyOrderBy,
   isJsonPathOrderBy,
   isOrderBySpec,
   isRelationPickOrderBy,
@@ -50,7 +51,7 @@ import {
   sortedEntries,
 } from './filters.js';
 import { warnUnknownQueryOptions } from './option-surface.js';
-import { normalizeWithClause } from './relation-names.js';
+import { applyStableRelationOrderTo, normalizeWithClause } from './relation-names.js';
 import * as relationsMod from './relations.js';
 import type {
   AggregateArgs,
@@ -512,13 +513,8 @@ export function unlockNestedWriteTx<X extends { table(name: string): Record<stri
  * orderBy is never overwritten while an empty `{}` / `[]` still gets the
  * synthesized PK order.
  */
-function isEmptyOrderBy(orderBy: unknown): boolean {
-  if (Array.isArray(orderBy)) return orderBy.length === 0;
-  if (orderBy && typeof orderBy === 'object') {
-    return Object.values(orderBy as Record<string, unknown>).every((v) => v === undefined);
-  }
-  return orderBy === undefined || orderBy === null;
-}
+// Moved to ./filters.ts in 0.74.0 so PowqlInterface consumes the SAME
+// predicate rather than a second copy of it. See applyStableRelationOrderTo.
 
 /** The two accepted {@link JsonEncoding} values, frozen so the check is total. */
 const JSON_ENCODINGS: readonly JsonEncoding[] = Object.freeze(['object', 'positional'] as const);
@@ -1284,42 +1280,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * nothing stable to order by, so both are left untouched.
    */
   private applyStableRelationOrder(withClause: WithClause, table: string, depth = 0): WithClause {
-    if (depth >= 10) return withClause; // parity with the build depth cap
-    const meta = this.schema.tables[table];
-    if (!meta) return withClause;
-    let out: WithClause | undefined;
-    for (const [relName, spec] of Object.entries(withClause)) {
-      if (relName === '_count' || !spec) continue; // `_count` is a count, not a row load
-      const rel = resolveRelationDef(meta.relations, relName);
-      if (!rel) continue; // unknown relation, let the build path surface E005
-      const options: WithOptions = spec === true ? {} : (spec as WithOptions);
-
-      // Recurse first so a nested change alone still clones this level.
-      const nestedWith = options.with as WithClause | undefined;
-      const newNested = nestedWith ? this.applyStableRelationOrder(nestedWith, rel.to, depth + 1) : undefined;
-      const nestedChanged = newNested !== undefined && newNested !== nestedWith;
-
-      const isToMany = rel.type === 'hasMany' || rel.type === 'manyToMany';
-      const hasOrder = options.orderBy !== undefined && !isEmptyOrderBy(options.orderBy);
-      let synthOrder: WithOrderByObject | WithOrderByObject[] | undefined;
-      if (isToMany && !hasOrder) {
-        const targetMeta = this.schema.tables[rel.to];
-        const pk = targetMeta?.primaryKey ?? [];
-        if (targetMeta && pk.length > 0) {
-          const pkFields = pk.map((c) => targetMeta.reverseColumnMap[c] ?? c);
-          synthOrder =
-            pkFields.length === 1 ? { [pkFields[0]!]: 'asc' } : pkFields.map((f) => ({ [f]: 'asc' as const }));
-        }
-      }
-
-      if (!synthOrder && !nestedChanged) continue; // nothing to change, keep the ref
-      out ??= { ...withClause };
-      const clonedSpec: WithOptions = { ...options };
-      if (synthOrder) clonedSpec.orderBy = synthOrder;
-      if (nestedChanged) clonedSpec.with = newNested as WithOptions['with'];
-      out[relName] = clonedSpec;
-    }
-    return out ?? withClause;
+    // The transform itself lives in ./relation-names.ts as of 0.74.0, so PowDB
+    // runs the SAME rule instead of a second copy that accepted the option and
+    // did nothing.
+    return applyStableRelationOrderTo(this.schema, withClause, table, depth);
   }
 
   // -------------------------------------------------------------------------

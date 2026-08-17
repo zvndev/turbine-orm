@@ -57,7 +57,7 @@ import { makeQuery, mockTable } from './helpers.js';
  * (so `findUnique` has a second key), and a numeric column (for `_sum` /
  * `optimisticLock`).
  */
-function schema(): SchemaMetadata {
+function schema(primaryKey: string[] = ['id']): SchemaMetadata {
   return {
     enums: {},
     tables: {
@@ -80,6 +80,7 @@ function schema(): SchemaMetadata {
             referenceKey: 'id',
           },
         },
+        primaryKey,
       ),
       posts: mockTable('posts', [
         { name: 'id', field: 'id' },
@@ -89,6 +90,26 @@ function schema(): SchemaMetadata {
     },
   };
 }
+
+/**
+ * The matrix runs over more than one schema SHAPE.
+ *
+ * A single fixture only ever proves an option is observable in the shape that
+ * fixture happens to have, and several options here are key-shaped: findUnique
+ * selectors, the synthesized stable relation order, and the compound-unique
+ * expansion all read the primary key. A composite-key table is the cheapest
+ * second shape that exercises those paths, and it costs one extra run of an
+ * already-mechanical matrix.
+ */
+const FIXTURES: { name: string; primaryKey: string[]; baselines: Record<string, Args> }[] = [
+  { name: 'single-column key', primaryKey: ['id'], baselines: {} },
+  {
+    name: 'composite key',
+    primaryKey: ['tenant_id', 'id'],
+    // findUnique must address the WHOLE key, or the 0.73.0 rule refuses it.
+    baselines: { findUnique: { where: { tenantId: 't1', id: 1 } } },
+  },
+];
 
 /** A global filter must exist, or `skipGlobalFilters` has nothing to skip. */
 const QI_OPTIONS: QueryInterfaceOptions = {
@@ -100,8 +121,8 @@ const QI_OPTIONS: QueryInterfaceOptions = {
 type Args = Record<string, unknown>;
 
 /** Compile one operation to its SQL + params without touching a database. */
-function compile(op: string, args: Args): { sql: string; params: unknown[] } {
-  const q = makeQuery('users', schema(), QI_OPTIONS) as unknown as Record<
+function compile(op: string, args: Args, primaryKey: string[]): { sql: string; params: unknown[] } {
+  const q = makeQuery('users', schema(primaryKey), QI_OPTIONS) as unknown as Record<
     string,
     (a: Args) => { sql: string; params: unknown[] }
   >;
@@ -259,76 +280,83 @@ function observationFor(op: string, key: string): Observation | undefined {
 // The gate
 // ---------------------------------------------------------------------------
 
-describe('every option on every operation changes something', () => {
-  for (const [op, table] of Object.entries(ALL_OPTION_TABLES)) {
-    // `findManyStream` has no build* entry point of its own; it is asserted
-    // against findMany's table below instead, which is the stronger claim.
-    if (op === 'findManyStream') continue;
+for (const fixture of FIXTURES) {
+  describe(`every option on every operation changes something (${fixture.name})`, () => {
+    for (const [op, table] of Object.entries(ALL_OPTION_TABLES)) {
+      // `findManyStream` has no build* entry point of its own; it is asserted
+      // against findMany's table below instead, which is the stronger claim.
+      if (op === 'findManyStream') continue;
 
-    for (const [key, kind] of Object.entries(table)) {
-      if (kind === 'internal') continue;
+      for (const [key, kind] of Object.entries(table)) {
+        if (kind === 'internal') continue;
 
-      it(`${op}: ${key}`, () => {
-        const obs = observationFor(op, key);
-        assert.ok(
-          obs,
-          `${op}.${key} is on the option surface but has no entry in OBSERVATION. ` +
-            `Say where it is observable (compiled / throws / unblocks / execution) ` +
-            `so an option that does nothing cannot be added silently.`,
-        );
-
-        const baseline: Args = { ...BASELINE[op], ...(obs.needs ?? {}) };
-        const withOption: Args = { ...baseline, [key]: obs.value };
-
-        if (obs.how === 'execution') {
-          assert.ok(obs.coveredBy, `${op}.${key} claims 'execution' but names no covering test`);
+        it(`${op}: ${key}`, () => {
+          const obs = observationFor(op, key);
           assert.ok(
-            existsSync(obs.coveredBy),
-            `${op}.${key} names a covering test that does not exist: ${obs.coveredBy}`,
+            obs,
+            `${op}.${key} is on the option surface but has no entry in OBSERVATION. ` +
+              `Say where it is observable (compiled / throws / unblocks / execution) ` +
+              `so an option that does nothing cannot be added silently.`,
           );
-          // The file must name the option in its HEADER docblock, not merely
-          // somewhere in its body. A plain `includes` was the first cut and it
-          // is too weak to be a gate: pointing `timeout` at errors.test.ts
-          // passed, because that file mentions TimeoutError. A header names
-          // what a file is ABOUT, so a file that only happens to use the word
-          // no longer satisfies the hatch.
-          const covering = readFileSync(obs.coveredBy, 'utf8');
-          const header = covering.match(/^\/\*\*[\s\S]*?\*\//)?.[0] ?? '';
+
+          const baseline: Args = { ...BASELINE[op], ...fixture.baselines[op], ...(obs.needs ?? {}) };
+          const withOption: Args = { ...baseline, [key]: obs.value };
+
+          if (obs.how === 'execution') {
+            assert.ok(obs.coveredBy, `${op}.${key} claims 'execution' but names no covering test`);
+            assert.ok(
+              existsSync(obs.coveredBy),
+              `${op}.${key} names a covering test that does not exist: ${obs.coveredBy}`,
+            );
+            // The file must name the option in its HEADER docblock, not merely
+            // somewhere in its body. A plain `includes` was the first cut and it
+            // is too weak to be a gate: pointing `timeout` at errors.test.ts
+            // passed, because that file mentions TimeoutError. A header names
+            // what a file is ABOUT, so a file that only happens to use the word
+            // no longer satisfies the hatch.
+            const covering = readFileSync(obs.coveredBy, 'utf8');
+            const header = covering.match(/^\/\*\*[\s\S]*?\*\//)?.[0] ?? '';
+            assert.ok(
+              header.includes(key),
+              `${op}.${key} claims to be covered by ${obs.coveredBy}, but that file's header docblock ` +
+                `never names ${key}. Point at the test that exists FOR this option, and say so at the top of it.`,
+            );
+            return;
+          }
+
+          if (obs.how === 'throws') {
+            assert.throws(() => compile(op, withOption, fixture.primaryKey), ValidationError);
+            return;
+          }
+
+          if (obs.how === 'unblocks') {
+            assert.throws(
+              () => compile(op, baseline, fixture.primaryKey),
+              ValidationError,
+              `${op}.${key} claims to unblock a refusal, but the baseline was accepted`,
+            );
+            assert.doesNotThrow(
+              () => compile(op, withOption, fixture.primaryKey),
+              `${op}.${key} did not unblock what it exists to unblock`,
+            );
+            return;
+          }
+
+          const before = compile(op, baseline, fixture.primaryKey);
+          const after = compile(op, withOption, fixture.primaryKey);
+          const differs = before.sql !== after.sql || JSON.stringify(before.params) !== JSON.stringify(after.params);
           assert.ok(
-            header.includes(key),
-            `${op}.${key} claims to be covered by ${obs.coveredBy}, but that file's header docblock ` +
-              `never names ${key}. Point at the test that exists FOR this option, and say so at the top of it.`,
+            differs,
+            `${op}({ ${key} }) compiled byte-for-byte identically to ${op}() without it. ` +
+              `The option was accepted and changed nothing.\n  SQL: ${before.sql}\n  params: ${JSON.stringify(before.params)}`,
           );
-          return;
-        }
-
-        if (obs.how === 'throws') {
-          assert.throws(() => compile(op, withOption), ValidationError);
-          return;
-        }
-
-        if (obs.how === 'unblocks') {
-          assert.throws(
-            () => compile(op, baseline),
-            ValidationError,
-            `${op}.${key} claims to unblock a refusal, but the baseline was accepted`,
-          );
-          assert.doesNotThrow(() => compile(op, withOption), `${op}.${key} did not unblock what it exists to unblock`);
-          return;
-        }
-
-        const before = compile(op, baseline);
-        const after = compile(op, withOption);
-        const differs = before.sql !== after.sql || JSON.stringify(before.params) !== JSON.stringify(after.params);
-        assert.ok(
-          differs,
-          `${op}({ ${key} }) compiled byte-for-byte identically to ${op}() without it. ` +
-            `The option was accepted and changed nothing.\n  SQL: ${before.sql}\n  params: ${JSON.stringify(before.params)}`,
-        );
-      });
+        });
+      }
     }
-  }
+  });
+}
 
+describe('the option matrix itself', () => {
   it('the streaming reads accept exactly the findMany surface, so neither can drift', () => {
     // findManyStream / findManyStreamBatches share findMany's argument handling
     // but not its execute seam, which is how `skip` reached the streaming path

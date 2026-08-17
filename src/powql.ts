@@ -36,7 +36,14 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import { NotFoundError, ReadOnlyError, TimeoutError, UnsupportedFeatureError, ValidationError } from './errors.js';
+import {
+  NotFoundError,
+  OptimisticLockError,
+  ReadOnlyError,
+  TimeoutError,
+  UnsupportedFeatureError,
+  ValidationError,
+} from './errors.js';
 import {
   executeNestedCreate,
   executeNestedUpdate,
@@ -64,7 +71,7 @@ import { assertWhereIdentifiesOneRow, expandCompoundUniqueWhere } from './query/
 import { isJsonFilter, isRelationPickOrderBy, orderByEntries } from './query/filters.js';
 import type { MiddlewareFn, QueryEvent, QueryInterfaceOptions } from './query/index.js';
 import { warnUnknownQueryOptions } from './query/option-surface.js';
-import { normalizeWithClause } from './query/relation-names.js';
+import { applyStableRelationOrderTo, normalizeWithClause } from './query/relation-names.js';
 import type {
   AggregateArgs,
   AggregateResult,
@@ -92,7 +99,7 @@ import type {
 // The privilege sentinel and its resolver: `includePii` / `allowFullTableScan`
 // are unlocked ONLY by the UNSAFE symbol, on this engine exactly as on the SQL
 // engines, so a spread request body cannot turn either on here either.
-import { assertDirectionToken, resolveUnsafeFlag, UNSAFE } from './query/types.js';
+import { assertDirectionToken, resolveSkipGlobalFilters, resolveUnsafeFlag, UNSAFE } from './query/types.js';
 import {
   escapeLike,
   normalizePagination,
@@ -103,7 +110,7 @@ import {
   selectNamesNothingMessage,
   selectOmitExclusiveMessage,
 } from './query/utils.js';
-import { assertJsonFilterKeys, jsonStringEntries } from './query/where.js';
+import { assertJsonFilterKeys, jsonStringEntries, resolveGlobalFilterFrom } from './query/where.js';
 import {
   type ColumnMetadata,
   normalizeKeyColumns,
@@ -554,8 +561,41 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * makes a core rule arrive on its own, and an engine that reads `take` but
    * not `skip` pages differently from one that reads both.
    */
-  private normalizeArgs<A extends { with?: unknown }>(args: A): A {
-    return normalizePagination(this.withDeclaredRelationNames(args));
+  /**
+   * Fill in the deterministic per-relation ordering `stableRelationOrder` asks
+   * for, through the shared transform the SQL engines use.
+   *
+   * PowDB accepted this option and did nothing with it before 0.74.0, so
+   * relation rows came back in whatever order the engine produced, from the one
+   * option whose entire purpose is that they do not. Same resolution as
+   * QueryInterface: a per-query flag wins, else the client-level default.
+   */
+  private withStableRelationOrder<A extends { with?: unknown; stableRelationOrder?: boolean }>(args: A): A {
+    if (!args?.with) return args;
+    const on = args.stableRelationOrder ?? this.options.stableRelationOrder === true;
+    if (!on) return args;
+    const ordered = applyStableRelationOrderTo(this.schema, args.with as WithClause, this.table);
+    return ordered === args.with ? args : ({ ...args, with: ordered } as A);
+  }
+
+  private normalizeArgs<A extends { with?: unknown; stableRelationOrder?: boolean }>(args: A): A {
+    return normalizePagination(this.withStableRelationOrder(this.withDeclaredRelationNames(args)));
+  }
+
+  /**
+   * `jsonEncoding` selects between PostgreSQL's `json_build_object` and
+   * `json_build_array` row encodings for relation subqueries. PowQL emits no
+   * JSON row encoding at all, so there is nothing for the option to select and
+   * it was simply dropped: the caller asked for a wire format and got silence.
+   * Refused for the same reason `forceCustomPlan` is.
+   */
+  private assertNoJsonEncoding(args: { jsonEncoding?: string } | undefined): void {
+    if (args?.jsonEncoding === undefined) return;
+    throw new UnsupportedFeatureError(
+      'jsonEncoding',
+      'PowDB',
+      'PowQL emits no JSON row encoding for relations, so there is nothing to select; omit the option',
+    );
   }
 
   private assertNoForceCustomPlan(args: { forceCustomPlan?: boolean } | undefined): void {
@@ -1614,6 +1654,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async findMany(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T[]> {
     this.assertNoForceCustomPlan(args);
+    this.assertNoJsonEncoding(args);
     args = this.normalizeArgs(args);
     return this.withMiddleware('findMany', args as unknown as Record<string, unknown>, async () => {
       // `limit: 0` means "no rows" (SQL `LIMIT 0`), and answering it client-side
@@ -1726,7 +1767,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
     const nest = nestedPlans.length > 0 || linkPlans.length > 0;
     const alias = nest ? 't0' : undefined;
-    const where = this.buildWhere(resolvedWhere, params, alias);
+    let where = this.buildWhere(resolvedWhere, params, alias);
+    where = this.applyGlobalFilter(where, params, args.skipGlobalFilters, alias);
     // PowQL's `distinct` is row-wide, so these names never reach the emitted
     // statement. They are still caller-supplied names, and a name resolves or
     // throws: reading the array for its LENGTH alone let `distinct: ['nope']`
@@ -1814,6 +1856,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async findUnique(args: FindUniqueArgs<T>): Promise<T | null> {
     this.assertNoForceCustomPlan(args);
+    this.assertNoJsonEncoding(args);
     args = this.normalizeArgs(args);
     // Prisma compound-unique selector → column conjunction (engine parity with
     // the SQL findUnique family; pure metadata, so this is a one-line adoption).
@@ -3038,9 +3081,28 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       }
       const params: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
-      const where = this.buildWhere(resolvedWhere, params);
-      this.assertCompiledWhere(where, false, 'update');
-      const setClause = this.buildUpdateAssignments(args.data as Record<string, unknown>, params);
+      let where = this.buildWhere(resolvedWhere, params);
+      // `false` here refused an empty where even WITH the opt-in, while every
+      // SQL engine accepted it: verified by probe on buildUpdate/buildDelete.
+      this.assertCompiledWhere(where, resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'), 'update');
+      where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
+      let setClause = this.buildUpdateAssignments(args.data as Record<string, unknown>, params);
+      // Optimistic locking, matching the SQL engines exactly: bump the version
+      // column in the SET, add `version = expected` to the filter, and treat
+      // "matched no row" as a lost race rather than a missing row.
+      //
+      // PowqlInterface ignored `optimisticLock` outright before 0.74.0, which is
+      // worse than not supporting it: the update applied, the caller's version
+      // check never happened, and a concurrent writer's change was overwritten
+      // by a caller who believed they held the lock.
+      const lock = args.optimisticLock;
+      if (lock) {
+        const versionCol = quotePowqlIdent(this.column(lock.field).name);
+        setClause += `, ${versionCol} := ${this.ref(lock.field)} + 1`;
+        params.push(lock.expected);
+        const check = `${this.ref(lock.field)} = $${params.length}`;
+        where = where ? `(${where}) and (${check})` : check;
+      }
       // `returning` hands back the post-update row(s); take the first (single-row contract).
       const { rows, native } = await this.exec(
         `${this.qt} filter ${where} update { ${setClause} } returning`,
@@ -3049,7 +3111,16 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         'update',
       );
       const row = rows.length ? this.stripWritePii(this.shape(rows, native)[0]!) : null;
-      if (!row) throw new NotFoundError({ table: this.table, where: args.where as Record<string, unknown> });
+      if (!row) {
+        if (lock) {
+          throw new OptimisticLockError({
+            table: this.table,
+            versionField: lock.field,
+            expectedVersion: lock.expected,
+          });
+        }
+        throw new NotFoundError({ table: this.table, where: args.where as Record<string, unknown> });
+      }
       return row;
     });
   }
@@ -3058,8 +3129,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return this.withMiddleware('updateMany', args as unknown as Record<string, unknown>, async () => {
       const params: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
-      const where = this.buildWhere(resolvedWhere, params);
+      let where = this.buildWhere(resolvedWhere, params);
       this.assertCompiledWhere(where, resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'), 'updateMany');
+      where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
       const setClause = this.buildUpdateAssignments(args.data as Record<string, unknown>, params);
       const filter = where ? ` filter ${where}` : '';
       const { rowCount } = await this.exec(
@@ -3207,8 +3279,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return this.withMiddleware('delete', args as unknown as Record<string, unknown>, async () => {
       const params: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
-      const where = this.buildWhere(resolvedWhere, params);
-      this.assertCompiledWhere(where, false, 'delete');
+      let where = this.buildWhere(resolvedWhere, params);
+      this.assertCompiledWhere(where, resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'), 'delete');
+      where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
       // `returning` hands back the deleted row(s), no separate pre-image reselect needed.
       const { rows, native } = await this.exec(
         `${this.qt} filter ${where} delete returning`,
@@ -3226,8 +3299,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return this.withMiddleware('deleteMany', args as unknown as Record<string, unknown>, async () => {
       const params: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
-      const where = this.buildWhere(resolvedWhere, params);
+      let where = this.buildWhere(resolvedWhere, params);
       this.assertCompiledWhere(where, resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'), 'deleteMany');
+      where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
       const filter = where ? ` filter ${where}` : '';
       const { rowCount } = await this.exec(`${this.qt}${filter} delete`, params, args.timeout, 'deleteMany');
       return { count: rowCount };
@@ -3308,7 +3382,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return this.withMiddleware('count', (args ?? {}) as unknown as Record<string, unknown>, async () => {
       const params: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
-      const where = this.buildWhere(resolvedWhere, params);
+      let where = this.buildWhere(resolvedWhere, params);
+      where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
       const filter = where ? ` filter ${where}` : '';
       const { rows } = await this.exec(`count(${this.qt}${filter})`, params, args.timeout, 'count');
       return Number((rows[0]?.value ?? rows[0]?.count ?? 0) as string | number);
@@ -3355,7 +3430,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const result: AggregateResult<T> = {};
       const filterParams: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
-      const where = this.buildWhere(resolvedWhere, filterParams);
+      let where = this.buildWhere(resolvedWhere, filterParams);
+      where = this.applyGlobalFilter(where, filterParams, args.skipGlobalFilters);
       const filter = where ? ` filter ${where}` : '';
       const scalar = async (expr: string): Promise<number | null> => {
         const params = [...filterParams];
@@ -3425,7 +3501,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const emitNative = Boolean(this.capabilities.nativeRaw);
       const params: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
-      const where = this.buildWhere(resolvedWhere, params);
+      let where = this.buildWhere(resolvedWhere, params);
+      where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
       const filter = where ? ` filter ${where}` : '';
 
       // Result-key namespace, mirroring the SQL builder's `claimResultKey`
@@ -3848,6 +3925,34 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * `{ OR: [{ f: undefined }] }`, compiles to the empty string and is refused,
    * because emitting a filter-less write would hit every row.
    */
+  /**
+   * AND this table's configured global filter (soft-delete / multi-tenancy)
+   * onto an ALREADY-COMPILED user filter, pushing its params after the user's.
+   *
+   * Before 0.74.0 `PowqlInterface` did not read `globalFilters` at all, so a
+   * client configured for multi-tenancy applied its tenant predicate on every
+   * SQL engine and NONE on PowDB, silently, and `skipGlobalFilters` was
+   * accepted and inert. The rule itself is shared
+   * ({@link resolveGlobalFilterFrom}) rather than restated here.
+   *
+   * It takes a COMPILED user filter, and that ordering is the contract, not an
+   * implementation detail: the empty-`where` guard must see the USER filter
+   * alone, or a configured global filter would silently satisfy it and turn a
+   * refused mass mutation into an accepted one. Every write call site therefore
+   * calls {@link assertCompiledWhere} first and this second.
+   *
+   * `alias` is forwarded so the nested/native-join paths qualify the filter's
+   * column references the same way they qualify the user's.
+   */
+  private applyGlobalFilter(compiledUserWhere: string, params: unknown[], skip: unknown, alias?: string): string {
+    const gf = resolveGlobalFilterFrom(this.options.globalFilters, this.table, resolveSkipGlobalFilters(skip));
+    if (!gf) return compiledUserWhere;
+    const gfWhere = this.buildWhere(gf as WhereClause<T>, params, alias);
+    if (!gfWhere) return compiledUserWhere;
+    if (!compiledUserWhere) return gfWhere;
+    return `(${compiledUserWhere}) and (${gfWhere})`;
+  }
+
   private assertCompiledWhere(compiledWhere: string, allow: boolean | undefined, action: string): void {
     if (allow === true) return;
     if (compiledWhere.length > 0) return;

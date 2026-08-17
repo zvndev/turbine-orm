@@ -740,3 +740,18 @@ export function normalizeOrderBy(value: OrderDirection | OrderBySpec): {
   }
   return { dir: String(value).toLowerCase() === 'desc' ? 'DESC' : 'ASC' };
 }
+
+/**
+ * Is this `orderBy` effectively absent?
+ *
+ * `{}` and `[]` and `{ id: undefined }` all mean "no ordering asked for". Used
+ * by the stable-relation-order transform so an explicit (non-empty) orderBy is
+ * never overwritten while an empty one still gets the synthesized PK order.
+ */
+export function isEmptyOrderBy(orderBy: unknown): boolean {
+  if (Array.isArray(orderBy)) return orderBy.length === 0;
+  if (orderBy && typeof orderBy === 'object') {
+    return Object.values(orderBy as Record<string, unknown>).every((v) => v === undefined);
+  }
+  return orderBy === undefined || orderBy === null;
+}

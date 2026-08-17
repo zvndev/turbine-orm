@@ -667,16 +667,23 @@ export function buildWhere<T extends object>(
 }
 
 /**
- * Resolve the configured global filter for `table`, evaluating a function
- * filter, honoring the active query's `skipGlobalFilters`. Returns `null` when
- * no filter applies, the query opted out, or the filter is empty.
+ * THE global-filter resolution rule, with no dependency on a `BuilderCtx`.
+ *
+ * Split out from {@link resolveGlobalFilter} so `PowqlInterface` can consume
+ * the SAME rule rather than a transcription of it. It is a parallel
+ * implementation of the public surface, and this repository's history is
+ * unambiguous that a rule written twice is how two engines come to disagree
+ * (the 0.64 projection resolver, the 0.73 findUnique guard). Every clause here
+ * is load-bearing on both engines: a function filter is evaluated PER BUILD so
+ * per-request tenancy works, an all-undefined filter is treated as absent so it
+ * cannot emit a dangling clause, and `skip` is honoured in both its whole-query
+ * and per-table forms.
  */
-export function resolveGlobalFilter(
-  qi: BuilderCtx,
+export function resolveGlobalFilterFrom(
+  filters: GlobalFilters | undefined,
   table: string,
-  skip: ResolvedSkipGlobalFilters | undefined = qi.currentSkip,
+  skip: ResolvedSkipGlobalFilters | undefined,
 ): Record<string, unknown> | null {
-  const filters = qi.globalFilters;
   if (!filters) return null;
   if (skip === true) return null;
   if (Array.isArray(skip) && skip.includes(table)) return null;
@@ -689,6 +696,19 @@ export function resolveGlobalFilter(
   // nothing, treat it as absent so it never emits a dangling clause.
   if (Object.keys(obj).every((k) => obj[k] === undefined)) return null;
   return obj;
+}
+
+/**
+ * Resolve the configured global filter for `table`, evaluating a function
+ * filter, honoring the active query's `skipGlobalFilters`. Returns `null` when
+ * no filter applies, the query opted out, or the filter is empty.
+ */
+export function resolveGlobalFilter(
+  qi: BuilderCtx,
+  table: string,
+  skip: ResolvedSkipGlobalFilters | undefined = qi.currentSkip,
+): Record<string, unknown> | null {
+  return resolveGlobalFilterFrom(qi.globalFilters, table, skip);
 }
 
 /**

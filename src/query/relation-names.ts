@@ -43,8 +43,9 @@
  */
 
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
-import type { WithClause, WithCount, WithOptions } from './types.js';
-import { resolveRelation } from './utils.js';
+import { isEmptyOrderBy } from './filters.js';
+import type { WithClause, WithCount, WithOptions, WithOrderByObject } from './types.js';
+import { resolveRelation, resolveRelationDef } from './utils.js';
 
 /** Depth cap mirroring the builder's own, so a cyclic `with` cannot spin here. */
 const MAX_DEPTH = 12;
@@ -123,3 +124,63 @@ function normalizeCount(meta: TableMetadata, count: WithCount | undefined): With
  * already a documented single authority; wrapping them here would add a second
  * name for the same rule without removing a caller.
  */
+
+/**
+ * Fill in a deterministic `orderBy` for every to-many relation in a `with`
+ * clause that did not ask for one, using the target table's primary key.
+ *
+ * THE single authority for `stableRelationOrder`, on every engine. It was a
+ * private method on `QueryInterface` until 0.74.0, which meant PowDB accepted
+ * the option and did nothing with it: relation rows came back in whatever order
+ * the engine produced, from the option whose entire purpose is that they do
+ * not. Restating the rule in `powql.ts` would have been the 0.64 projection
+ * resolver again, so it moved here instead, into the same "normalize the whole
+ * `with` tree once, before anything reads it" slot as
+ * {@link normalizeWithClause}.
+ *
+ * Returns the input BY REFERENCE when nothing changed, so a query that already
+ * orders every relation allocates nothing and its SQL/fingerprint stay
+ * byte-identical.
+ */
+export function applyStableRelationOrderTo(
+  schema: SchemaMetadata,
+  withClause: WithClause,
+  table: string,
+  depth = 0,
+): WithClause {
+  if (depth >= 10) return withClause; // parity with the build depth cap
+  const meta = schema.tables[table];
+  if (!meta) return withClause;
+  let out: WithClause | undefined;
+  for (const [relName, spec] of Object.entries(withClause)) {
+    if (relName === '_count' || !spec) continue; // `_count` is a count, not a row load
+    const rel = resolveRelationDef(meta.relations, relName);
+    if (!rel) continue; // unknown relation, let the build path surface E005
+    const options: WithOptions = spec === true ? {} : (spec as WithOptions);
+
+    // Recurse first so a nested change alone still clones this level.
+    const nestedWith = options.with as WithClause | undefined;
+    const newNested = nestedWith ? applyStableRelationOrderTo(schema, nestedWith, rel.to, depth + 1) : undefined;
+    const nestedChanged = newNested !== undefined && newNested !== nestedWith;
+
+    const isToMany = rel.type === 'hasMany' || rel.type === 'manyToMany';
+    const hasOrder = options.orderBy !== undefined && !isEmptyOrderBy(options.orderBy);
+    let synthOrder: WithOrderByObject | WithOrderByObject[] | undefined;
+    if (isToMany && !hasOrder) {
+      const targetMeta = schema.tables[rel.to];
+      const pk = targetMeta?.primaryKey ?? [];
+      if (targetMeta && pk.length > 0) {
+        const pkFields = pk.map((c) => targetMeta.reverseColumnMap[c] ?? c);
+        synthOrder = pkFields.length === 1 ? { [pkFields[0]!]: 'asc' } : pkFields.map((f) => ({ [f]: 'asc' as const }));
+      }
+    }
+
+    if (!synthOrder && !nestedChanged) continue; // nothing to change, keep the ref
+    out ??= { ...withClause };
+    const clonedSpec: WithOptions = { ...options };
+    if (synthOrder) clonedSpec.orderBy = synthOrder;
+    if (nestedChanged) clonedSpec.with = newNested as WithOptions['with'];
+    out[relName] = clonedSpec;
+  }
+  return out ?? withClause;
+}

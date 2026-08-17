@@ -167,11 +167,16 @@ export function mockColumn(name: string, field: string, pgType = 'int8', pii = f
  * `pii: true` tags the column the way `defineSchema`'s `pii` does, so a
  * build-only test can observe the PII projection rules (excluded from every
  * default projection, unlocked by `includePii: UNSAFE`) without a database.
+ *
+ * `primaryKey` defaults to `['id']`; pass a multi-column key to exercise the
+ * compound-key paths (findUnique selectors, stable relation order, the
+ * batched loader's composite refusal) against a shape that has one.
  */
 export function mockTable(
   tableName: string,
   columns: { name: string; field: string; pgType?: string; unique?: boolean; pii?: boolean }[],
   relations: Record<string, RelationDef> = {},
+  primaryKey: string[] = ['id'],
 ): TableMetadata {
   const cols = columns.map((c) => mockColumn(c.name, c.field, c.pgType ?? 'int8', c.pii ?? false));
   const columnMap: Record<string, string> = {};
@@ -193,8 +198,8 @@ export function mockTable(
     dialectTypes: Object.fromEntries(cols.map((c) => [c.name, c.dialectType ?? c.pgType])),
     pgTypes: Object.fromEntries(cols.map((c) => [c.name, c.pgType])),
     allColumns,
-    primaryKey: ['id'],
-    uniqueColumns: [['id'], ...columns.filter((c) => c.unique).map((c) => [c.name])],
+    primaryKey,
+    uniqueColumns: [primaryKey, ...columns.filter((c) => c.unique).map((c) => [c.name])],
     relations,
     indexes: [],
   };
