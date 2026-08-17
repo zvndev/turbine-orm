@@ -558,13 +558,20 @@ jobs:
           SMOKE_DIR=$(mktemp -d)
           cd "$SMOKE_DIR"
           npm init -y > /dev/null
+          # 12 x 10s (2 minutes) was not enough: 0.73.1 published successfully,
+          # with provenance, and was still returning ETARGET when the budget ran
+          # out. Registry propagation is not something this job controls, and the
+          # publish above it is already irreversible, so a budget this tight
+          # turns a GOOD release red and (because the GitHub Release step runs
+          # after this one) leaves the published version with no notes.
+          # 30 x 10s = 5 minutes. A real failure still fails, just later.
           INSTALLED=0
-          for i in $(seq 1 12); do
+          for i in $(seq 1 30); do
             if npm install "turbine-orm@$PKG_VERSION" --no-audit --no-fund; then
               INSTALLED=1
               break
             fi
-            echo "turbine-orm@$PKG_VERSION not installable yet, retrying in 10s ($i/12)..."
+            echo "turbine-orm@$PKG_VERSION not installable yet, retrying in 10s ($i/30)..."
             sleep 10
           done
           if [ "$INSTALLED" != "1" ]; then
@@ -585,8 +592,13 @@ jobs:
       # Idempotent: an existing release (manual or from a re-run) is left alone.
       # Runs even when the npm publish was skipped as already-published, so a
       # re-run can backfill a missing release without republishing.
+      # `always()` scoped to "the publish step got that far": the tarball is on
+      # the registry by now whatever the smoke test said, and a published
+      # version with no release notes is strictly worse than notes for a version
+      # whose smoke test needs a look. A genuine smoke failure still fails the
+      # JOB, which is the signal that matters.
       - name: Create GitHub Release from CHANGELOG
-        if: ${{ github.event.inputs.dry_run != 'true' }}
+        if: ${{ !cancelled() && github.event.inputs.dry_run != 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
