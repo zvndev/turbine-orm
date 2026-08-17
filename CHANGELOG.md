@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.73.1 (2026-08-16)
+
+Documentation only. No change to any shipped code path.
+
+### Fixed
+
+- **A claim in the 0.73.0 notes overstated how far two of its three bugs
+  reached.** The notes said the Prisma pair `{ take: 20, skip: 40 }`
+  "type-checked". Written the way the sentence shows it, a plain object literal,
+  it did not: excess property checking rejects it (`TS2353`), and the same is
+  true of `include`.
+
+  What is true is narrower, and it is the reason a cross-model eval found these
+  and code review had not. Both keys reached runtime only through the calling
+  styles that check does not cover, all of which compile clean: a spread such as
+  `findMany({ ...req.query })`, plain JavaScript, and any JSON-shaped caller,
+  which includes the MCP tools, the `turbine-orm/prisma-compat` delegates (their
+  args are `Record<string, unknown>`, so there every key genuinely did
+  type-check) and the eval harness itself.
+
+  The third bug is the one that was invisible to the type system: `findUnique`
+  takes the full `WhereClause`, so a non-unique `where` compiled for every
+  caller. The notes now draw that distinction instead of flattening all three
+  into one sentence.
+
+- The packaged skill (`skills/turbine-orm/SKILL.md`, installed by
+  `npx turbine skill`) and `llms.txt` described `include` as simply ignored,
+  without saying that a plain literal is a compile error. Both now say which
+  paths reach the runtime behaviour. The instruction itself, relations go in
+  `with`, was correct and is unchanged, and `npm run verify:skill` holds at
+  46/46.
+
 ## 0.73.0 (2026-08-16)
 
 The same rule as 0.72.0, one step further: **an argument the caller wrote must
