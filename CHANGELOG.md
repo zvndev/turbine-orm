@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.75.0 (2026-08-16)
+
+0.74.0 fixed five options PowDB accepted and ignored, and verified the fix
+against a recording pool. Running the same checks against a **live engine**
+found that the headline fix never reached the public factory: `turbinePowDB`
+hand-listed the four config keys it forwarded, so a `globalFilters` passed to it
+was dropped one level above the code that had just been taught to honour it.
+
+The lesson is the one this release series keeps paying for, one level up from
+where it was last applied: **a fix verified through an internal seam is not
+verified.** Asserting the emitted statement proves the option reaches the
+builder; only executing the query proves it reaches the caller.
+
+### Fixed
+
+- **`turbinePowDB` dropped almost every client option, including
+  `globalFilters`.** The factory forwarded `logging`, `defaultLimit`,
+  `warnOnUnlimited` and `relationLoadStrategy` and nothing else, so
+  `globalFilters`, `stableRelationOrder`, `errorMessages`, `logQueryParams`,
+  `sqlCache` and everything else added to `TurbineConfig` since PowDB landed
+  were accepted by the type and discarded before `TurbineClient` saw them.
+
+  This is the same allowlist that `engine-config.ts` was written to kill for
+  SQLite / MySQL / SQL Server; PowDB was never converted. It now extends
+  `EngineClientConfig` like they do, so a new client option is engine-wide the
+  day it lands and only a deliberate exclusion can take it away.
+
+  **This changes what PowDB queries return** for anyone already passing these
+  options: as of 0.74.0 the options worked, and as of this release they arrive.
+  If you configure `globalFilters` against PowDB, your queries are filtered now.
+
+- **`groupBy({ _count: { ... } })` returned no `_count` at all on PowDB.** The
+  record form (`_count: { _all: true, email: true }`) fell through both branches
+  of the aggregate selection, so PowDB answered with the group keys and no
+  `_count` key on any row, while every SQL engine returned the counts. Reading
+  `group._count.email` off that row threw. The scalar form (`_count: true`, and
+  the default) was unaffected.
+
+  `_all` is the row count and a named field is that column's NON-NULL count,
+  matching the SQL builder and `aggregate()`, which already had this right. A
+  per-field count of a nullable column is gated on the same engine version
+  `aggregate()` gates on, for the same reason.
+
+### Changed
+
+- **`turbineHttp` (the `turbine-orm/serverless` subpath) accepts every client
+  option.** `TurbineHttpOptions` was a three-key `Pick`, so passing
+  `globalFilters` to a Neon / Vercel / Hyperdrive client was an excess-property
+  error on an option the runtime would have honoured. It is now
+  `Omit<TurbineConfig, 'pool'>`, which is exactly what the function already
+  spread through. Type-level only: no runtime behaviour changes, and nothing
+  that compiled before stops compiling.
+
+### Testing
+
+- **`src/test/option-behavior.integration.test.ts`** and
+  **`src/test/powdb-option-behavior.integration.test.ts`**: the behavioural half
+  of the option matrix, on PostgreSQL and on a live embedded PowDB. Same
+  inventory as `option-observability.test.ts` (`ALL_OPTION_TABLES`), opposite
+  question: not "does this option change the statement" but "does it change the
+  answer". 105 assertions, every one of them reading or writing rows.
+
+  Both were mutation-tested, and the fixtures are shaped by what escaped. A
+  per-field `_count` was first asserted over the primary key, where the non-null
+  count and the row count are the same number for every possible input, so an
+  implementation that emitted `COUNT(*)` for both passed; both fixtures now carry
+  a nullable column seeded with real NULLs, which is the one place the two
+  answers differ.
+
 ## 0.74.0 (2026-08-17)
 
 The 0.73.1 rule, asked of the second engine: **every option on every operation

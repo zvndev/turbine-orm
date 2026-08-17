@@ -59,7 +59,9 @@ A networked target probes `serverVersion` on connect and throws `ConnectionError
 
 ### Options
 
-`TurbinePowdbOptions` extends the `logging`, `defaultLimit`, `warnOnUnlimited` and `relationLoadStrategy` fields of `TurbineConfig`, plus:
+`TurbinePowdbOptions` extends **every** client-level field of `TurbineConfig` (`globalFilters`, `errorMessages`, `logging`, `defaultLimit`, `warnOnUnlimited`, `relationLoadStrategy`, and the rest), minus the connection and pool plumbing the factory owns, plus the transport options below.
+
+Before 0.75.0 it was a four-key subset, so anything else you passed was accepted by the type and dropped before the client saw it. If you configure `globalFilters` against PowDB, it applies from 0.75.0 on, which changes what your queries return.
 
 | Option | Default | Notes |
 |---|---|---|

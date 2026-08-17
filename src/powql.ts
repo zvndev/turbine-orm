@@ -3596,16 +3596,52 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const aggOrderExprs = new Map<string, string>();
       const aggInner = new Map<string, string>();
       let aggN = 0;
-      // Parity with the SQL builder (query/builder.ts): `_count` is selected by
-      // DEFAULT unless the caller explicitly opts out with `_count: false`, so
-      // every groupBy row carries `_count` and `orderBy: { _count }` works
-      // without requesting it (the alias is seeded into `aggOrderExprs`).
-      const countSelected = args._count === true || args._count === undefined;
-      if (countSelected) {
+      // `_count` has the same two shapes as the SQL groupBy (query/aggregates.ts),
+      // and the record form is why this is not a one-liner:
+      //   - `true` / omitted → scalar `_count` (row count). Selected by DEFAULT
+      //     unless the caller opts out with `_count: false`, so every groupBy row
+      //     carries `_count` and `orderBy: { _count }` works without requesting it.
+      //   - record form → `_all` is the row count and each field is that column's
+      //     NON-NULL count, result `_count: { _all, field }`.
+      // The record form used to fall through both branches here, so PowDB answered
+      // `groupBy({ _count: { id: true } })` with the group keys and NO `_count` key
+      // at all while every SQL engine returned the counts. Accepted and ignored is
+      // the one outcome an aggregate must never have: the caller reads
+      // `g._count.id` off a row that never carried it.
+      const countArg = args._count as boolean | Record<string, boolean> | undefined;
+      const scalarCount = countArg === true || countArg === undefined;
+      const countIsRecord = !scalarCount && countArg !== false && typeof countArg === 'object';
+      if (scalarCount) {
         const alias = `agg_${aggN++}`;
         proj.push(`${alias}: count(*)`);
         aggReaders.push({ alias, outKey: '_count', numeric: true });
         aggOrderExprs.set('_count', `.${alias}`);
+      } else if (countIsRecord) {
+        for (const [field, enabled] of Object.entries(countArg as Record<string, boolean>)) {
+          if (!enabled) continue;
+          const alias = `agg_${aggN++}`;
+          if (field === '_all') {
+            // Double underscore in the output key, collision-proof against a
+            // real column named `all`, exactly as the SQL builder aliases it.
+            claim('_count__all', '_count `_all`');
+            proj.push(`${alias}: count(*)`);
+            aggReaders.push({ alias, outKey: '_count:_all', numeric: true });
+            // COUNT(*) is orderable whenever it is selected: the scalar form
+            // above, or the record form containing `_all`. Same rule as SQL.
+            aggOrderExprs.set('_count', `.${alias}`);
+          } else {
+            // Per-field count is the NON-NULL count, which the engine only
+            // honours from the version `projectedCountSupported` gates on; below
+            // it the projection was ignored and the ROW count came back. Same
+            // per-column gate `aggregate()` applies, for the same reason.
+            const col = this.column(field);
+            this.assertProjectedCountSupported(field);
+            claim(`_count_${col.name}`, `_count of column "${col.name}"`);
+            const inner = this.colRefName(col.name);
+            proj.push(`${alias}: count(${inner})`);
+            aggReaders.push({ alias, outKey: `_count:${col.field}`, numeric: true });
+          }
+        }
       }
       for (const fn of ['_sum', '_avg', '_min', '_max'] as const) {
         const spec = args[fn] as Record<string, boolean | JsonPathAggregateTarget | undefined> | undefined;

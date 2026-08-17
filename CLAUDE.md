@@ -1054,16 +1054,31 @@ src/
                       force-released on disconnect(); serverless HTTP pools (no persistent
                       connection) throw a clear error instead of hanging.
 
-  engine-config.ts , The client-config seam for the non-Postgres engine factories
-                      (`turbine-orm/sqlite`, `turbine-orm/mysql`, `turbine-orm/mssql`).
+  engine-config.ts , The client-config seam for EVERY non-default engine factory
+                      (`turbine-orm/sqlite`, `turbine-orm/mysql`, `turbine-orm/mssql`,
+                      and since 0.75 `turbine-orm/powdb`).
                       Each builds its own driver pool and then hands a TurbineConfig to
                       TurbineClient; each used to list the keys it forwarded BY HAND, which
                       made the forwarded set an allowlist and quietly stranded every option
-                      added afterwards on three engines (that is how `errorMessages` and
-                      later `logQueryParams` became Postgres-only). `EngineClientConfig`
+                      added afterwards (that is how `errorMessages` and later
+                      `logQueryParams` became Postgres-only). `EngineClientConfig`
                       inverts the default: every TurbineConfig field is forwarded unless
                       named as excluded. Type declarations only, so it emits no runtime code
                       and is excluded from coverage.
+                      THE RULE IS THE FACTORY'S, NOT THE TYPE'S, and 0.75 is what that
+                      distinction cost: PowDB extended a four-key `Pick` AND hand-listed the
+                      same four keys into `new TurbineClient`, so `globalFilters` reached
+                      neither. The 0.74 fix that taught `PowqlInterface` to apply global
+                      filters was verified against a recording pool one level BELOW the
+                      drop, and shipped unreachable through the public factory. A factory
+                      converts by extending this type and DESTRUCTURING its own transport
+                      keys out of `options` before spreading the rest, never by listing what
+                      goes in. `turbineHttp` (serverless.ts) is the same shape with a
+                      different exclusion set, `Omit<TurbineConfig, 'pool'>`: it binds no
+                      dialect and pins no prepared-statement mode, so it has no business
+                      narrowing those away. Its allowlist was type-only (the runtime already
+                      spread everything), which is the kind failure mode: a compile error on
+                      a working option rather than a silent drop.
 
   seed.ts          , `defineSeed()` and the runner behind `turbine seed`. Loads the user's
                       seed module, opens a TurbineClient for it, and awaits the callback.

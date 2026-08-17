@@ -62,6 +62,7 @@ import {
   type TurbineConfig,
 } from './client.js';
 import { type Dialect, postgresDialect } from './dialect.js';
+import type { EngineClientConfig } from './engine-config.js';
 import {
   ConnectionError,
   malformedConnectionStringMessage,
@@ -2676,9 +2677,22 @@ export { PowqlInterface } from './powql.js';
 // turbinePowDB, the public factory
 // ---------------------------------------------------------------------------
 
-/** Options for {@link turbinePowDB}. */
-export interface TurbinePowdbOptions
-  extends Pick<TurbineConfig, 'logging' | 'defaultLimit' | 'warnOnUnlimited' | 'relationLoadStrategy'> {
+/**
+ * Options for {@link turbinePowDB}.
+ *
+ * Extends {@link EngineClientConfig}, the same inverted default the SQL engine
+ * factories use: every `TurbineConfig` option reaches the client unless it is one
+ * of the transport keys declared below, which {@link turbinePowDB} destructures
+ * out before spreading. This used to be a four-key `Pick`, so `globalFilters`,
+ * `stableRelationOrder`, `errorMessages` and everything else added after PowDB
+ * landed were accepted by the type and then dropped on the floor. A tenant filter
+ * that silently does not apply is the worst shape that class of bug can take.
+ *
+ * Options that PowDB cannot honour by CAPABILITY (rather than by plumbing) still
+ * throw a typed `UnsupportedFeatureError` (E017) at the point of use, which is a
+ * better answer than an option the type system claims does not exist.
+ */
+export interface TurbinePowdbOptions extends EngineClientConfig {
   /**
    * Client-level default `with`-relation load strategy. On PowDB the default is
    * the batched N+1 loaders; setting `'join'` opts INTO native PowQL server-side
@@ -2995,15 +3009,27 @@ export async function turbinePowDB(
   ) =>
     new PowqlInterface(p as unknown as PowdbPool, table, sch, middlewares, opts) as unknown as QueryInterface<object>;
 
+  // Forward every client-level option EXCEPT the ones this factory owns (they
+  // configure the pool / transport above, and TurbineClient warns on a config
+  // key it does not recognize). Destructured rather than hand-listed on the way
+  // IN: an allowlist is how `globalFilters` came to be accepted and ignored.
+  const {
+    connectionLimit: _connectionLimit,
+    transactionQueueTimeoutMs: _transactionQueueTimeoutMs,
+    retryStaleReads: _retryStaleReads,
+    assumeEngineVersion: _assumeEngineVersion,
+    readonly: _readonly,
+    powdbClientModule: _powdbClientModule,
+    powdbEmbeddedModule: _powdbEmbeddedModule,
+    ...clientConfig
+  } = options;
+
   const client = new TurbineClient(
     {
+      ...clientConfig,
       pool,
       preparedStatements: false,
       dialect: powdbDialect,
-      logging: options.logging,
-      defaultLimit: options.defaultLimit,
-      warnOnUnlimited: options.warnOnUnlimited,
-      relationLoadStrategy: options.relationLoadStrategy,
       queryInterfaceFactory,
     } as TurbineConfig & { queryInterfaceFactory: typeof queryInterfaceFactory },
     schema,

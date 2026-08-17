@@ -86,10 +86,23 @@ import type { SchemaMetadata } from './schema.js';
 export type { PgCompatPool, PgCompatPoolClient, PgCompatQueryResult } from './client.js';
 
 /**
- * Options for `turbineHttp()`. Mirrors the fields of `TurbineConfig`
- * that are relevant for externally-managed pools.
+ * Options for `turbineHttp()`: everything a `TurbineClient` takes except the
+ * pool, which is this function's first argument.
+ *
+ * This used to be a three-key `Pick` (`logging` / `defaultLimit` /
+ * `warnOnUnlimited`), which made the accepted set an ALLOWLIST that stopped
+ * being maintained the day it was written. The runtime already spread the whole
+ * object through, so the effect was purely at the type level: a serverless
+ * caller passing `globalFilters` (or `errorMessages`, or `relationLoadStrategy`)
+ * got an excess-property error on an option that would have worked. That is a
+ * kinder failure than PowDB's silent drop, but the same allowlist, and it lands
+ * on the edge deployments where a tenant filter matters most.
+ *
+ * Deliberately `Omit<TurbineConfig, 'pool'>` rather than `EngineClientConfig`:
+ * unlike the SQL engine factories, this one binds no dialect and pins no
+ * prepared-statement mode, so it has no business narrowing those away.
  */
-export interface TurbineHttpOptions extends Pick<TurbineConfig, 'logging' | 'defaultLimit' | 'warnOnUnlimited'> {}
+export type TurbineHttpOptions = Omit<TurbineConfig, 'pool'>;
 
 /**
  * Create a TurbineClient bound to an external pg-compatible pool.
