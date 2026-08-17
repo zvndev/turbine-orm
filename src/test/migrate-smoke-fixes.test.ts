@@ -355,7 +355,14 @@ describe('migrations smoke fixes (live database)', () => {
     try {
       const results = await Promise.allSettled(Array.from({ length: 12 }, () => migrateStatus(DATABASE_URL!, dir)));
       const rejected = results.filter((r) => r.status === 'rejected');
-      assert.equal(rejected.length, 0, `all 12 should succeed, got: ${JSON.stringify(rejected.map(String))}`);
+      // `String(result)` is "[object Object]" for a settled-result WRAPPER, so
+      // the reason has to be reached explicitly. This test failed a release
+      // with a message that named nothing.
+      const why = rejected.map((r) => {
+        const e = r.reason as { code?: string; message?: string } | undefined;
+        return `${e?.code ?? 'no-code'}: ${e?.message ?? String(r.reason)}`;
+      });
+      assert.equal(rejected.length, 0, `all 12 should succeed, got: ${JSON.stringify(why)}`);
     } finally {
       await resetTracking();
       rmSync(dir, { recursive: true, force: true });

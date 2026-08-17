@@ -142,7 +142,7 @@ export function skipGate(skip: boolean, reason: string): GatedRunners {
  * every mock table claim a bigint array cast, which silently encoded whatever
  * the real UNNEST cast happened to be into `createMany` SQL assertions.
  */
-export function mockColumn(name: string, field: string, pgType = 'int8'): ColumnMetadata {
+export function mockColumn(name: string, field: string, pgType = 'int8', pii = false): ColumnMetadata {
   return {
     name,
     field,
@@ -152,6 +152,7 @@ export function mockColumn(name: string, field: string, pgType = 'int8'): Column
     hasDefault: name === 'id',
     isArray: false,
     pgArrayType: pgArrayType(pgType),
+    ...(pii ? { pii: true as const } : {}),
   };
 }
 
@@ -162,13 +163,17 @@ export function mockColumn(name: string, field: string, pgType = 'int8'): Column
  * `findUnique` reads to decide whether a `where` identifies one row. Without it
  * a mock table's only unique key is its `id`, so a fixture whose test looks up
  * by email has to say so, exactly as a real schema would.
+ *
+ * `pii: true` tags the column the way `defineSchema`'s `pii` does, so a
+ * build-only test can observe the PII projection rules (excluded from every
+ * default projection, unlocked by `includePii: UNSAFE`) without a database.
  */
 export function mockTable(
   tableName: string,
-  columns: { name: string; field: string; pgType?: string; unique?: boolean }[],
+  columns: { name: string; field: string; pgType?: string; unique?: boolean; pii?: boolean }[],
   relations: Record<string, RelationDef> = {},
 ): TableMetadata {
-  const cols = columns.map((c) => mockColumn(c.name, c.field, c.pgType ?? 'int8'));
+  const cols = columns.map((c) => mockColumn(c.name, c.field, c.pgType ?? 'int8', c.pii ?? false));
   const columnMap: Record<string, string> = {};
   const reverseColumnMap: Record<string, string> = {};
   const allColumns: string[] = [];

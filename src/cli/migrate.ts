@@ -197,10 +197,26 @@ function quotedTrackingTable(dialect: Dialect): string {
  * already exists` (42P07). `migrate up`/`down` hold the migration lock before
  * they reach here, but `migrate status` and the deploy inspector deliberately do
  * not, and read-only commands should not need a lock to survive each other.
+ *
+ * 42710 (`duplicate_object`, "type _turbine_migrations already exists") is the
+ * third and was missed for six releases, because this set was written from what
+ * ONE measured run happened to produce rather than from the rule. Creating a
+ * table also creates its composite row TYPE, so a loser can lose on the type
+ * instead of on the relation, and which of the three it reports depends on how
+ * far it got. The test that covers this threw its failure away as
+ * "[object Object]", so the release it eventually blocked named no code at all.
  */
-const TABLE_ALREADY_EXISTS_CODES = new Set(['23505', '42P07']);
+const TABLE_ALREADY_EXISTS_CODES = new Set(['23505', '42P07', '42710']);
 
-async function ensureTrackingTable(client: MigrationQueryClient, dialect: Dialect = postgresDialect): Promise<void> {
+/**
+ * @internal exported for tests. The integration test that covers this races 12
+ * concurrent callers and reproduces the bug about 12% of the time, which is not
+ * a gate. This entry point lets the RULE be asserted directly, once per code.
+ */
+export async function ensureTrackingTable(
+  client: MigrationQueryClient,
+  dialect: Dialect = postgresDialect,
+): Promise<void> {
   const sql = dialect.buildMigrationTrackingTable(quotedTrackingTable(dialect));
   try {
     await client.query(sql);

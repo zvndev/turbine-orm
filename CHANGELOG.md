@@ -1,10 +1,59 @@
 # Changelog
 
-## 0.73.1 (2026-08-16)
+## 0.73.1 (2026-08-17)
 
-Documentation only. No change to any shipped code path.
+A correction to the 0.73.0 notes, and the gate that release should have shipped
+with: **every option on every operation must change the answer, or be refused.**
+0.73.0 fixed three arguments that were accepted and did nothing. It did not close
+the class, and the suite could not have caught them: `take` appears in dozens of
+tests while `skip` was not a key at all, so "is this option mentioned in a test"
+was already true for the half that worked, and line coverage cannot tell "read
+and used" from "read and dropped".
 
 ### Fixed
+
+- **`migrate status` could crash on a fresh database when several ran at once.**
+  `CREATE TABLE IF NOT EXISTS` is not atomic, so the losers of the tracking-table
+  create race are retried once. The set of Postgres codes recognised as that race
+  was written from what ONE measured run happened to produce, `23505` and
+  `42P07`, and creating a table also creates its composite row TYPE, so a loser
+  can instead report `42710` (`duplicate_object`) and fall through to the
+  rethrow. `migrate up`/`down` hold the migration lock and were never affected;
+  `migrate status` and the deploy inspector deliberately do not.
+
+  The same shape as the bug in the notes below: an enumeration written from
+  observation rather than from the rule.
+
+### Internal
+
+None of this changes a shipped code path; it is recorded because it is what the
+release is mostly made of.
+
+- **A gate for the whole option surface.** `src/test/option-observability.test.ts`
+  compiles every operation x every non-internal option, twice, with and without
+  that one option, and requires the two to differ in a declared way: the SQL or
+  params differ, or the option is refused, or it unblocks a refusal, or it is
+  declared observable only at execution and NAMES the test that proves it. 91
+  assertions, driven from the same `ALL_OPTION_TABLES` inventory the compiler
+  already binds, so a new option fails to compile until it is classified and then
+  fails this file until someone says where it is observable. Neither step can be
+  satisfied by an option that does nothing.
+
+- **The per-query `timeout` had no core test.** It sits on all thirteen arg
+  interfaces, and every assertion that it actually aborts a query ran through
+  `turbine-orm/prisma-compat`, so the core client's behaviour rested on an
+  adapter's test. Now covered per call site: `findMany`, `findFirst`, `count`,
+  `aggregate`, `groupBy` and the writes each pass `args.timeout` separately.
+
+- **`pipelineSupported` was untested at both levels**, and each of its failure
+  modes is silent: a wrong `false` costs the 1-RTT batching with no error, and a
+  leaked probe connection drains the pool somewhere else entirely.
+
+- **The tracking-table race test reported `["[object Object]"]`** (it mapped
+  `String` over the settled-result wrappers rather than over `.reason`), so the
+  release it eventually blocked named no error code. It also only reproduces the
+  race about 12% of the time, which is a smoke test and not a gate; the rule it
+  covers is now asserted deterministically, one case per accepted code.
 
 - **A claim in the 0.73.0 notes overstated how far two of its three bugs
   reached.** The notes said the Prisma pair `{ take: 20, skip: 40 }`
