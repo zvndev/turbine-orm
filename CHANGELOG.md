@@ -21,7 +21,9 @@ gets fixed the same day.
   Before, `findUnique({ where: { status: 'active' } })` emitted
   `WHERE status = $1 LIMIT 1` with no `ORDER BY` and returned an arbitrary one
   of the rows that matched, differently between two calls with the same
-  argument. The caller who wrote `findUnique` asked for *the* row, and the
+  argument. Unlike the two option bugs below, this one was invisible to the type
+  system: `where` is typed as the full `WhereClause`, so every TypeScript caller
+  compiled clean. The caller who wrote `findUnique` asked for *the* row, and the
   `null` branch they wrote reads as "no such row" when it meant "none matched
   this filter". This extends the empty-`where` guard added in 0.61, which
   already refused the degenerate case for exactly this reason.
@@ -37,11 +39,20 @@ gets fixed the same day.
 ### Fixed
 
 - **`skip` did nothing.** `take` was a recognized alias for `limit` and `skip`
-  was not a Turbine key at all, so the Prisma pair `{ take: 20, skip: 40 }`
-  type-checked, ran, and returned the FIRST page however far the caller thought
-  they had paged. `skip` is now the alias for `offset` that `take` is for
-  `limit`. Half a recognized pair is worse than neither half: an unknown key is
-  inert on its own, but a half-recognized one changes the answer.
+  was not a Turbine key at all, so the Prisma pair `{ take: 20, skip: 40 }` ran
+  and returned the FIRST page however far the caller thought they had paged.
+  `skip` is now the alias for `offset` that `take` is for `limit`. Half a
+  recognized pair is worse than neither half: an unknown key is inert on its
+  own, but a half-recognized one changes the answer.
+
+  **How far this reached, stated precisely.** Written as a plain object literal,
+  `findMany({ take: 20, skip: 40 })` was a COMPILE ERROR on 0.72.0 and earlier
+  (TS2353, excess property), so a TypeScript caller writing it that way was told.
+  It reached runtime through the calling styles where TypeScript's
+  excess-property check does not apply and which compile clean: a spread
+  (`findMany({ ...req.query })`), plain JavaScript, and any JSON-shaped caller,
+  which includes the MCP tools and anything an agent submits. That is also why a
+  cross-model eval found it and code review had not.
 
   Both aliases are now folded ONCE, before anything reads them, so `limit` and
   `offset` are the single authority below that line and the two spellings share

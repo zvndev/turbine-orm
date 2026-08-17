@@ -162,7 +162,7 @@ Writes enforce the same boundary at the SQL level: a write against a table with 
 Offset pagination uses `limit` + `offset`. `take` and `skip` are Prisma-compatible aliases for them, folded into `limit` / `offset` before anything reads the query, so the two spellings compile to the same SQL and share one cache entry. Passing both spellings of one bound with **different** values throws a `ValidationError` (TURBINE_E003) rather than picking one: there is no reading of `{ limit: 10, take: 5 }` that makes one of the numbers the intended answer. Equal values are accepted. `offset` also works alone, on every engine: SQLite and MySQL reject a bare `OFFSET` at the grammar level, so their dialects emit the engine's own offset-to-end idiom.
 
 <Callout type="warning">
-**Upgrade note (0.73.0).** Before this release `skip` was not a Turbine key at all while `take` was, so the Prisma pair `{ take: 20, skip: 40 }` type-checked, ran, and silently returned the FIRST page however far you thought you had paged. If you have code written that way, it is now paging correctly, which may change what it returns.
+**Upgrade note (0.73.0).** Before this release `skip` was not a Turbine key at all while `take` was, so the Prisma pair `{ take: 20, skip: 40 }` ran and silently returned the FIRST page however far you thought you had paged. Written as a plain object literal it was a compile error (`'skip' does not exist in type 'FindManyArgs'`), so it reached runtime only through the calling styles TypeScript's excess-property check does not cover: a spread such as `findMany({ ...req.query })`, plain JavaScript, and JSON-shaped callers. If you have code written any of those ways, it is now paging correctly, which may change what it returns.
 </Callout>
 
 ```ts

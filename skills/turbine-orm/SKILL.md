@@ -22,10 +22,12 @@ const orders = await db.orders.findMany({
 });
 ```
 
-`include` is Prisma's word. Turbine ignores an unrecognized option, so an
-`include` runs, returns rows, and the relation is simply absent from every one
-of them. Since 0.73.0 it also prints a dev-mode warning naming `with`; in
-production it is silent.
+`include` is Prisma's word. Written as a plain object literal TypeScript rejects
+it, but that check does not apply to a spread (`findMany({ ...args })`) or to
+JSON-shaped args, which is how generated and tool-driven code usually arrives.
+On those paths it is ignored rather than refused: the query runs, returns rows,
+and the relation is simply absent from every one of them. Since 0.73.0 it also
+prints a dev-mode warning naming `with`; in production it is silent.
 
 ## 2. Relation names are derived, and not from the column
 
