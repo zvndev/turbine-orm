@@ -17,14 +17,14 @@
  * Run with `npm start`.
  */
 
-import { TurbineClient } from 'turbine-orm';
-import { SCHEMA } from './generated/turbine/metadata.js';
+// The GENERATED factory. This is what makes the claim below true: the base
+// `TurbineClient` materializes table accessors at runtime but declares none
+// of them, so `db.stories` would not even compile on it, let alone
+// autocomplete four levels deep.
+import { turbine } from './generated/turbine/index.js';
 
 async function main() {
-  const db = new TurbineClient(
-    { connectionString: process.env.DATABASE_URL },
-    SCHEMA,
-  );
+  const db = turbine({ connectionString: process.env.DATABASE_URL });
 
   console.time('load');
 
@@ -55,15 +55,20 @@ async function main() {
 
   // The payoff: every property below autocompletes in your editor.
   // Try it, put your cursor on `handle`, `body`, anything.
+  //
+  // A belongsTo relation infers as `User | null` (a row can always be missing
+  // the parent a LEFT-ish read looked for), so `?.` is not defensive noise
+  // here: under `strict` it is the type telling you which links are optional,
+  // four levels down, with no annotation written anywhere.
   for (const story of stories) {
     console.log(`\x1b[1m${story.score}  ${story.title}\x1b[0m`);
-    console.log(`        by @${story.author.handle} · ${story.author.karma} karma`);
+    console.log(`        by @${story.author?.handle ?? '???'} · ${story.author?.karma ?? 0} karma`);
 
     for (const comment of story.comments) {
-      console.log(`  [${comment.score}] @${comment.author.handle}: ${comment.body}`);
+      console.log(`  [${comment.score}] @${comment.author?.handle ?? '???'}: ${comment.body}`);
 
       for (const reply of comment.replies) {
-        console.log(`      └ [${reply.score}] @${reply.author.handle}: ${reply.body}`);
+        console.log(`      └ [${reply.score}] @${reply.author?.handle ?? '???'}: ${reply.body}`);
       }
     }
     console.log();

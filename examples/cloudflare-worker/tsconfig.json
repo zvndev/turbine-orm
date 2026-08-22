@@ -1,0 +1,18 @@
+{
+  // Bundler resolution, matching wrangler / esbuild. A `.js` specifier resolves to the `.ts`
+  // source here, so the generated-client imports are spelled the same way as in
+  // the NodeNext examples and work under both.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2023", "DOM"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "jsx": "preserve",
+    "allowImportingTsExtensions": false
+  },
+  "include": ["**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules"]
+}

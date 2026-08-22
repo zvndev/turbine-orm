@@ -201,7 +201,11 @@ const OBSERVATION: Record<string, Observation> = {
   // PowDB has no cursor pagination and says so, which is the correct answer for
   // an option it cannot honour.
   cursor: { how: 'unsupported', value: { id: '5' }, needs: { orderBy: { id: 'asc' } } },
-  distinct: { how: 'compiled', value: ['name'] },
+  // `distinct` names COLUMNS (Postgres compiles it to `DISTINCT ON (col)`).
+  // PowQL's `distinct` keyword is ROW-WIDE and takes no column list, so it
+  // used to be "compiled" into a DIFFERENT row set under the same argument,
+  // with no error. Same answer as its groupBy spelling below: E017.
+  distinct: { how: 'unsupported', value: ['name'] },
   // PowQL has no DISTINCT ON row source for a groupBy, and says so.
   distinctOn: { how: 'unsupported', value: { columns: ['name'], orderBy: { id: 'desc' } } },
 

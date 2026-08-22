@@ -162,10 +162,13 @@ export class Spinner {
     process.stdout.write(`\r  ${green(symbols.check)} ${text}\n`);
   }
 
+  /** A failed step, on STDERR (see the note on {@link error}). */
   fail(msg?: string): void {
     this.stop();
     const text = msg ?? this.message;
-    process.stdout.write(`\r  ${red(symbols.cross)} ${text}\n`);
+    // `stop()` has already cleared the spinner's own line on stdout; the
+    // carriage return here returns the cursor to column 0 for the stderr write.
+    process.stderr.write(`\r  ${red(symbols.cross)} ${text}\n`);
   }
 
   info(msg?: string): void {
@@ -200,12 +203,38 @@ export function success(msg: string): void {
   console.log(`  ${green(symbols.check)} ${msg}`);
 }
 
+/**
+ * A failure, on STDERR.
+ *
+ * Every diagnostic stream in this CLI used to be `console.log`, so
+ * `turbine generate > build.log` swallowed the failure whole and a CI step
+ * capturing stderr saw an empty string next to a non-zero exit code. The two
+ * streams have different jobs: stdout carries what the command PRODUCED
+ * (progress, reports, `skill --print`, `doctor --json`), stderr carries why it
+ * did not produce it.
+ *
+ * A multi-line failure keeps its continuation lines on the same stream via
+ * {@link errorLine}, otherwise redirecting one stream tears the message in half.
+ */
 export function error(msg: string): void {
-  console.log(`  ${red(symbols.cross)} ${msg}`);
+  console.error(`  ${red(symbols.cross)} ${msg}`);
 }
 
+/**
+ * One further line of a failure already reported by {@link error}, on STDERR
+ * and indented to match. Pass `''` for a blank separator line.
+ */
+export function errorLine(text = ''): void {
+  console.error(text === '' ? '' : `  ${text}`);
+}
+
+/**
+ * A warning, on STDERR. A warning is a diagnostic, not output: it must survive
+ * `> file.log` for the same reason an error must, and it must stay OUT of the
+ * stdout contract of `doctor --json` and `skill --print`.
+ */
 export function warn(msg: string): void {
-  console.log(`  ${yellow(symbols.warning)} ${msg}`);
+  console.error(`  ${yellow(symbols.warning)} ${msg}`);
 }
 
 export function info(msg: string): void {
@@ -229,11 +258,27 @@ export function divider(): void {
 // Banner
 // ---------------------------------------------------------------------------
 
+const BANNER_LINES = [
+  '',
+  `  ${bold(cyan('turbine-orm'))}`,
+  `  ${dim('TypeScript ORM with json_agg nested queries')}`,
+  '',
+];
+
 export function banner(): void {
-  console.log('');
-  console.log(`  ${bold(cyan('turbine-orm'))}`);
-  console.log(`  ${dim('TypeScript ORM with json_agg nested queries')}`);
-  console.log('');
+  for (const line of BANNER_LINES) console.log(line);
+}
+
+/**
+ * The same banner on STDERR, for a command that does nothing but fail.
+ *
+ * Shares {@link BANNER_LINES} so the two cannot drift, and exists so that a
+ * failed invocation writes NOTHING to stdout: `turbine push --dry-runn >out.log`
+ * should leave out.log empty and put the whole refusal where a shell, a CI step,
+ * and a human all look for it.
+ */
+export function errorBanner(): void {
+  for (const line of BANNER_LINES) console.error(line);
 }
 
 // ---------------------------------------------------------------------------

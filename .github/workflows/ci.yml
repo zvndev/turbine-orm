@@ -842,6 +842,43 @@ jobs:
           TARBALL: ${{ env.TARBALL }}
           DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
 
+  examples-smoke:
+    # Every example, from the packed tarball, against a real Postgres:
+    # push -> generate -> tsc. Added 0.76.0, after a review found seven of the
+    # eight broken at step one and unnoticed for many releases because nothing
+    # ran them. See scripts/examples-smoke.sh for what it deliberately skips.
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Pack tarball
+        run: echo "TARBALL=$GITHUB_WORKSPACE/$(npm pack --silent | tail -1)" >> "$GITHUB_ENV"
+      - name: Push, generate and typecheck every example
+        run: bash scripts/examples-smoke.sh
+        env:
+          TARBALL: ${{ env.TARBALL }}
+          DATABASE_URL: postgres://test:test@localhost:5432/postgres
+
   security:
     timeout-minutes: 15
     runs-on: ubuntu-latest
@@ -875,3 +912,63 @@ jobs:
       - run: npm ci
       - name: Check error code enforcement
         run: npx tsx scripts/check-error-codes.ts
+
+  # ---------------------------------------------------------------------------
+  # The single required check.
+  #
+  # Branch protection can only require job names it already knows about, so a
+  # newly added job is not required until someone remembers to add it in the
+  # GitHub UI. That is a gate that silently weakens every time the workflow
+  # grows, and it grew four times in this release alone. `ci-ok` inverts it:
+  # it is the only required check, and it fails unless every job above it
+  # SUCCEEDED. A new job is covered the moment it is added to `needs`, and
+  # forgetting to add it there is visible in this file's diff rather than
+  # invisible in a settings page nobody reads.
+  #
+  # `if: always()` is load-bearing. Without it a skipped or failed dependency
+  # skips this job too, and a SKIPPED required check is reported as neutral,
+  # not as a failure, which is exactly the hole this is closing.
+  # ---------------------------------------------------------------------------
+  ci-ok:
+    if: always()
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    needs:
+      - lint
+      - typecheck
+      - unit-tests
+      - coverage
+      - coverage-cli
+      - integration-tests
+      - cockroachdb-integration
+      - mysql-integration
+      - mssql-integration
+      - powdb-integration
+      - build
+      - package-types
+      - consumer-types
+      - pack-smoke
+      - quickstart-smoke
+      - examples-smoke
+      - security
+      - error-codes
+    steps:
+      - name: Fail unless every job succeeded
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS"
+          # Anti-vacuous: an empty or unparseable `needs` object would otherwise
+          # report success while checking nothing.
+          count=$(echo "$RESULTS" | jq 'length')
+          if [ "$count" -lt 18 ]; then
+            echo "ci-ok saw $count dependencies, expected at least 18" >&2
+            exit 1
+          fi
+          failed=$(echo "$RESULTS" | jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"')
+          if [ -n "$failed" ]; then
+            echo "These jobs did not succeed:" >&2
+            echo "$failed" >&2
+            exit 1
+          fi
+          echo "All $count jobs succeeded."

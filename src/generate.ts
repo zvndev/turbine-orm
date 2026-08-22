@@ -11,6 +11,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
+import { ValidationError } from './errors.js';
 import {
   type ColumnMetadata,
   type PrismaCompatMap,
@@ -71,9 +72,62 @@ function writeColumnTsType(col: ColumnMetadata, enums: Record<string, string[]>)
   return col.nullable ? `${widened} | null` : widened;
 }
 
-/** Escape a value for embedding in a single-quoted TypeScript string literal */
+/**
+ * Characters that must never reach generated source verbatim: the two that end
+ * a single-quoted literal (backslash, quote), the C0/C1 control range (a raw
+ * newline alone leaves the literal unterminated and starts a new source line),
+ * and the two Unicode line terminators.
+ */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: neutralizing control characters is this pattern's purpose
+const UNSAFE_EMIT_CHARS_GLOBAL = /[\\'\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
+
+/**
+ * Escape a value for embedding in a single-quoted TypeScript string literal.
+ *
+ * Every character that can END the literal has to be neutralized here, not just
+ * the quote. A database identifier is attacker-controlled text (Postgres allows
+ * any character in a double-quoted name, up to 63 bytes) and generated code is
+ * `import`ed, i.e. EXECUTED, so a literal that closes early leaves the rest of
+ * the name in expression position. A raw newline is enough on its own.
+ */
 function escSQ(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  return value.replace(UNSAFE_EMIT_CHARS_GLOBAL, (ch) => {
+    switch (ch) {
+      case '\\':
+        return '\\\\';
+      case "'":
+        return "\\'";
+      case '\n':
+        return '\\n';
+      case '\r':
+        return '\\r';
+      case '\t':
+        return '\\t';
+      case '\b':
+        return '\\b';
+      case '\f':
+        return '\\f';
+      case '\v':
+        return '\\v';
+      default:
+        return `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`;
+    }
+  });
+}
+
+// biome-ignore lint/suspicious/noControlCharactersInRegex: collapsing control characters is this pattern's purpose
+const COMMENT_BREAKING_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g;
+
+/**
+ * Neutralize a catalog string for emission inside a generated JSDoc or line
+ * COMMENT. Two sequences end a comment early and both are legal in a
+ * double-quoted Postgres identifier: an asterisk followed by a slash closes a
+ * block comment, putting everything after it in code position, and a newline
+ * ends a line comment and splits one emitted line into two. Escaping the
+ * asterisk breaks the terminator without changing how the name reads.
+ */
+function docSafe(value: string): string {
+  return value.replace(/\*\//g, '*\\/').replace(COMMENT_BREAKING_CHARS, ' ');
 }
 
 // ---------------------------------------------------------------------------
@@ -376,12 +430,89 @@ function typeSafeRelations(table: TableMetadata, warn = true): [string, Relation
   return usable;
 }
 
+// ---------------------------------------------------------------------------
+// Identifier boundary
+// ---------------------------------------------------------------------------
+
+/**
+ * The JavaScript identifier grammar as a WHOLE-STRING match: `IdentifierStart`
+ * (`ID_Start`, `$`, `_`) followed by `IdentifierPart` (`ID_Continue`, `$`, ZWNJ,
+ * ZWJ). Deliberately Unicode-aware rather than `[A-Za-z_$][\w$]*`: a table named
+ * `café` yields the perfectly valid identifier `Café` and there is no reason to
+ * refuse it. What it does refuse is every character that could end the
+ * identifier token, so a name that passes interpolates as exactly one token.
+ */
+const EMITTABLE_IDENTIFIER_RE = /^[\p{ID_Start}$_][\p{ID_Continue}$\u200C\u200D]*$/u;
+
+/**
+ * Whether `name` can be interpolated into generated TypeScript in IDENTIFIER
+ * position (a type name, an interface name, a class member declaration).
+ *
+ * Identifier position is the one emission site with no escaping option: a value
+ * position becomes a quoted literal ({@link escSQ}), a key position becomes a
+ * quoted key ({@link quoteIfNeeded}), a comment is neutralized
+ * ({@link docSafe}), but `export interface X` needs a real identifier. So the
+ * only sound answer for a name that is not one is to refuse.
+ */
+export function isEmittableIdentifier(name: string): boolean {
+  return EMITTABLE_IDENTIFIER_RE.test(name);
+}
+
+function requireEmittable(derived: string, subject: string, role: string): void {
+  if (isEmittableIdentifier(derived)) return;
+  throw new ValidationError(
+    `[turbine] Cannot generate code for ${subject}: it produces ${JSON.stringify(derived)} as ${role}, ` +
+      `which is not a valid TypeScript identifier. Rename the database object, or exclude it from generation ` +
+      `(introspect \`exclude\`).`,
+  );
+}
+
+/**
+ * Refuse a schema whose names cannot be emitted as TypeScript identifiers.
+ *
+ * Called by every emitter that puts a catalog-derived name in identifier
+ * position ({@link generateTypes}, {@link generateIndex}, {@link generateZod}).
+ * {@link generateMetadata} deliberately does NOT call it: metadata.ts emits no
+ * identifiers derived from catalog names, every name there is a quoted key or a
+ * quoted value, so it has no identifier rule to enforce and stays usable for a
+ * schema whose type layer cannot be generated.
+ *
+ * The check runs on the DERIVED identifier, not the raw name, because that is
+ * what actually lands in the output, but the message names the raw object so
+ * the reader knows what to rename.
+ */
+export function assertEmittableSchema(schema: SchemaMetadata): void {
+  for (const enumName of Object.keys(schema.enums)) {
+    requireEmittable(snakeToPascal(enumName), `enum type "${enumName}"`, 'the generated enum type name');
+  }
+  for (const table of Object.values(schema.tables)) {
+    requireEmittable(entityName(table.name), `table "${table.name}"`, 'the generated entity type name');
+    requireEmittable(snakeToCamelStr(table.name), `table "${table.name}"`, 'the generated client accessor');
+    // Only the relations that reach the TYPE layer: a relation shadowing a
+    // column field is already dropped from types.ts, so refusing on its name
+    // would refuse a schema that generates fine.
+    for (const [relName, rel] of typeSafeRelations(table, false)) {
+      requireEmittable(
+        snakeToPascal(relName),
+        `relation "${relName}" on table "${table.name}"`,
+        'part of the generated `XWithY` interface name',
+      );
+      requireEmittable(
+        entityName(rel.to),
+        `relation "${relName}" on table "${table.name}" (target "${rel.to}")`,
+        'the generated target entity type name',
+      );
+    }
+  }
+}
+
 /**
  * Generate the contents of `types.ts` (entity interfaces, *Create / *Update,
  * and *Relations brand-field interfaces). Exported so tests can pin the
  * generator output without writing files to disk.
  */
 export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOptions): string {
+  assertEmittableSchema(schema);
   const lines: string[] = [...generatedFileHeader(options)];
 
   // We import UpdateOperatorInput so generated *Update types can express
@@ -414,7 +545,7 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
   // Generate enum types
   for (const [enumName, labels] of Object.entries(schema.enums)) {
     const typeName = snakeToPascal(enumName);
-    lines.push(`/** Database enum: ${enumName} */`);
+    lines.push(`/** Database enum: ${docSafe(enumName)} */`);
     lines.push(`export type ${typeName} = ${labels.map((l) => `'${escSQ(l)}'`).join(' | ')};`);
     lines.push('');
   }
@@ -424,7 +555,7 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
     const typeName = entityName(table.name);
 
     // --- Base entity interface ---
-    lines.push(`/** Row type for the \`${table.name}\` table */`);
+    lines.push(`/** Row type for the \`${docSafe(table.name)}\` table */`);
     lines.push(`export interface ${typeName} {`);
     for (const col of table.columns) {
       const pkNote = table.primaryKey.includes(col.name) ? ' (primary key)' : '';
@@ -434,7 +565,7 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
       // The emitted type marks it optional so it tells the truth about absence.
       const piiNote = col.pii ? ' (PII: absent unless selected or includePii)' : '';
       const optional = col.pii ? '?' : '';
-      lines.push(`  /** Column: ${col.name}, ${col.pgType}${pkNote}${nullNote}${piiNote} */`);
+      lines.push(`  /** Column: ${docSafe(col.name)}, ${docSafe(col.pgType)}${pkNote}${nullNote}${piiNote} */`);
       lines.push(`  ${quoteIfNeeded(col.field)}${optional}: ${columnTsType(col, schema.enums)};`);
     }
     lines.push('}');
@@ -443,7 +574,7 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
     // --- Create input type ---
     // Required: non-nullable columns without defaults (except PK)
     // Optional: nullable columns (default to NULL) or columns with explicit defaults
-    lines.push(`/** Input type for creating a row in \`${table.name}\` */`);
+    lines.push(`/** Input type for creating a row in \`${docSafe(table.name)}\` */`);
     lines.push(`export type ${typeName}Create = {`);
     for (const col of table.columns) {
       // STORED generated columns are computed by the database, never writable.
@@ -465,7 +596,7 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
     // Numeric columns additionally accept `UpdateOperatorInput<number>` so
     // users can write `{ viewCount: { increment: 1 } }` without an `as any`.
     const nonPkCols = table.columns.filter((c) => !table.primaryKey.includes(c.name) && !c.isGeneratedStored);
-    lines.push(`/** Input type for updating a row in \`${table.name}\` */`);
+    lines.push(`/** Input type for updating a row in \`${docSafe(table.name)}\` */`);
     lines.push(`export type ${typeName}Update = {`);
     for (const col of nonPkCols) {
       lines.push(`  ${quoteIfNeeded(col.field)}?: ${updateFieldType(writeColumnTsType(col, schema.enums))};`);
@@ -484,14 +615,16 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
     const safeRelations = safeRelationsByTable.get(table.name) ?? [];
     const hasRelations = safeRelations.length > 0;
     if (hasRelations) {
-      lines.push(`/** Available relations for the \`${table.name}\` table */`);
+      lines.push(`/** Available relations for the \`${docSafe(table.name)}\` table */`);
       lines.push(`export interface ${typeName}Relations {`);
       for (const [relName, rel] of safeRelations) {
         const targetType = entityName(rel.to);
         // manyToMany is a collection too → 'many' cardinality (same as hasMany).
         const cardinality = rel.type === 'hasMany' || rel.type === 'manyToMany' ? "'many'" : "'one'";
         const targetRelations = tablesWithRelations.has(rel.to) ? `${targetType}Relations` : '{}';
-        lines.push(`  ${relName}: RelationDescriptor<${targetType}, ${cardinality}, ${targetRelations}>;`);
+        lines.push(
+          `  ${quoteIfNeeded(relName)}: RelationDescriptor<${targetType}, ${cardinality}, ${targetRelations}>;`,
+        );
       }
       lines.push('}');
       lines.push('');
@@ -500,14 +633,18 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
       for (const [relName, rel] of safeRelations) {
         const targetType = entityName(rel.to);
         if (rel.type === 'hasMany' || rel.type === 'manyToMany') {
-          lines.push(`/** ${typeName} with \`${relName}\` relation loaded (${rel.type}: ${rel.to}) */`);
+          lines.push(
+            `/** ${typeName} with \`${docSafe(relName)}\` relation loaded (${rel.type}: ${docSafe(rel.to)}) */`,
+          );
           lines.push(`export interface ${typeName}With${snakeToPascal(relName)} extends ${typeName} {`);
-          lines.push(`  ${relName}: ${targetType}[];`);
+          lines.push(`  ${quoteIfNeeded(relName)}: ${targetType}[];`);
           lines.push('}');
         } else {
-          lines.push(`/** ${typeName} with \`${relName}\` relation loaded (${rel.type}: ${rel.to}) */`);
+          lines.push(
+            `/** ${typeName} with \`${docSafe(relName)}\` relation loaded (${rel.type}: ${docSafe(rel.to)}) */`,
+          );
           lines.push(`export interface ${typeName}With${snakeToPascal(relName)} extends ${typeName} {`);
-          lines.push(`  ${relName}: ${targetType} | null;`);
+          lines.push(`  ${quoteIfNeeded(relName)}: ${targetType} | null;`);
           lines.push('}');
         }
         lines.push('');
@@ -611,7 +748,7 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
       lines.push(`export type ${typeName}CreateInput = ${typeName}Create & {`);
       for (const [relName, rel] of safeRelations) {
         const targetType = entityName(rel.to);
-        lines.push(`  ${relName}?: ${targetType}NestedCreateInput;`);
+        lines.push(`  ${quoteIfNeeded(relName)}?: ${targetType}NestedCreateInput;`);
       }
       lines.push('};');
       lines.push('');
@@ -620,9 +757,9 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
       for (const [relName, rel] of safeRelations) {
         const targetType = entityName(rel.to);
         if (rel.type === 'hasMany') {
-          lines.push(`  ${relName}?: ${targetType}NestedUpdateInput;`);
+          lines.push(`  ${quoteIfNeeded(relName)}?: ${targetType}NestedUpdateInput;`);
         } else {
-          lines.push(`  ${relName}?: ${targetType}NestedCreateInput;`);
+          lines.push(`  ${quoteIfNeeded(relName)}?: ${targetType}NestedCreateInput;`);
         }
       }
       lines.push('};');
@@ -735,6 +872,7 @@ function zodBaseType(col: ColumnMetadata, enums: Record<string, string[]>, forWr
  * the output without writing files.
  */
 export function generateZod(schema: SchemaMetadata, options?: GenerateFileOptions): string {
+  assertEmittableSchema(schema);
   const lines: string[] = [...generatedFileHeader(options)];
   // `zod` is a USER dependency, this generated file imports it, but the Turbine
   // library runtime never does, so Zod stays out of the package's dep graph.
@@ -745,7 +883,7 @@ export function generateZod(schema: SchemaMetadata, options?: GenerateFileOption
     const typeName = entityName(table.name);
 
     // Full-row schema.
-    lines.push(`/** Zod schema for a \`${table.name}\` row */`);
+    lines.push(`/** Zod schema for a \`${docSafe(table.name)}\` row */`);
     lines.push(`export const ${typeName}Schema = z.object({`);
     for (const col of table.columns) {
       let expr = zodBaseType(col, schema.enums);
@@ -757,7 +895,7 @@ export function generateZod(schema: SchemaMetadata, options?: GenerateFileOption
 
     // Create schema, STORED generated columns can never be written; PK,
     // defaulted, and nullable columns are optional.
-    lines.push(`/** Zod schema for creating a \`${table.name}\` row */`);
+    lines.push(`/** Zod schema for creating a \`${docSafe(table.name)}\` row */`);
     lines.push(`export const ${typeName}CreateSchema = z.object({`);
     for (const col of table.columns) {
       if (col.isGeneratedStored) continue;
@@ -771,7 +909,7 @@ export function generateZod(schema: SchemaMetadata, options?: GenerateFileOption
     lines.push('');
 
     // Update schema, PK and STORED generated columns omitted; all else optional.
-    lines.push(`/** Zod schema for updating a \`${table.name}\` row */`);
+    lines.push(`/** Zod schema for updating a \`${docSafe(table.name)}\` row */`);
     lines.push(`export const ${typeName}UpdateSchema = z.object({`);
     for (const col of table.columns) {
       if (col.isGeneratedStored) continue;
@@ -802,7 +940,7 @@ export function generateMetadata(schema: SchemaMetadata, options?: GenerateFileO
   ];
 
   for (const table of Object.values(schema.tables)) {
-    lines.push(`    ${table.name}: {`);
+    lines.push(`    ${quoteIfNeeded(table.name)}: {`);
     lines.push(`      name: '${escSQ(table.name)}',`);
 
     // columns
@@ -876,7 +1014,7 @@ export function generateMetadata(schema: SchemaMetadata, options?: GenerateFileO
           `targetKey: ${keyLiteral(rel.through.targetKey)} }`;
       }
       lines.push(
-        `        ${relName}: { type: '${escSQ(rel.type)}', name: '${escSQ(rel.name)}', from: '${escSQ(rel.from)}', to: '${escSQ(rel.to)}', foreignKey: ${fkLiteral}, referenceKey: ${refLiteral}${throughLiteral} },`,
+        `        ${quoteIfNeeded(relName)}: { type: '${escSQ(rel.type)}', name: '${escSQ(rel.name)}', from: '${escSQ(rel.from)}', to: '${escSQ(rel.to)}', foreignKey: ${fkLiteral}, referenceKey: ${refLiteral}${throughLiteral} },`,
       );
     }
     lines.push('      },');
@@ -917,7 +1055,7 @@ export function generateMetadata(schema: SchemaMetadata, options?: GenerateFileO
   // enums
   lines.push('  enums: {');
   for (const [enumName, labels] of Object.entries(schema.enums)) {
-    lines.push(`    ${enumName}: [${labels.map((l) => `'${escSQ(l)}'`).join(', ')}],`);
+    lines.push(`    ${quoteIfNeeded(enumName)}: [${labels.map((l) => `'${escSQ(l)}'`).join(', ')}],`);
   }
   lines.push('  },');
 
@@ -937,6 +1075,7 @@ export function generateMetadata(schema: SchemaMetadata, options?: GenerateFileO
 // ---------------------------------------------------------------------------
 
 export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOptions): string {
+  assertEmittableSchema(schema);
   const tableEntries = Object.values(schema.tables);
   // Must mirror generateTypes: `XRelations` only exists in types.ts when the
   // table has at least one type-safe (non-column-shadowing) relation.
@@ -984,7 +1123,7 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
     const accessor = snakeToCamelStr(table.name);
     const hasRelations = hasSafeRelations.get(table.name) === true;
     const genericArgs = hasRelations ? `${typeName}, ${typeName}Relations` : typeName;
-    lines.push(`  /** Query interface for the \`${table.name}\` table (transaction-scoped) */`);
+    lines.push(`  /** Query interface for the \`${docSafe(table.name)}\` table (transaction-scoped) */`);
     lines.push(`  declare readonly ${accessor}: ${accessorType(table, genericArgs)};`);
   }
   lines.push('}');
@@ -1008,7 +1147,7 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
   lines.push(' *');
   lines.push(' * Tables:');
   for (const table of tableEntries) {
-    lines.push(` *   - \`${snakeToCamelStr(table.name)}\` (${table.name})`);
+    lines.push(` *   - \`${docSafe(snakeToCamelStr(table.name))}\` (${docSafe(table.name)})`);
   }
   lines.push(' *');
   lines.push(' * @example');
@@ -1017,7 +1156,7 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
   if (tableEntries.length > 0) {
     const firstTable = tableEntries[0]!;
     const accessor = snakeToCamelStr(firstTable.name);
-    lines.push(` * const rows = await db.${accessor}.findMany();`);
+    lines.push(` * const rows = await db.${docSafe(accessor)}.findMany();`);
   }
   lines.push(' * ```');
   lines.push(' */');
@@ -1027,7 +1166,7 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
     const accessor = snakeToCamelStr(table.name);
     const hasRelations = hasSafeRelations.get(table.name) === true;
     const genericArgs = hasRelations ? `${typeName}, ${typeName}Relations` : typeName;
-    lines.push(`  /** Query interface for the \`${table.name}\` table */`);
+    lines.push(`  /** Query interface for the \`${docSafe(table.name)}\` table */`);
     lines.push(`  declare readonly ${accessor}: ${accessorType(table, genericArgs)};`);
   }
   lines.push('');
@@ -1207,8 +1346,38 @@ function serializeColumn(col: ColumnMetadata): string {
   return `{ ${parts.join(', ')} }`;
 }
 
+/**
+ * The subset of names emitted BARE in generated object-key position. Anchored
+ * on purpose: the previous rule only tested whether a name contained a
+ * character outside the set, so a name made entirely of allowed characters but
+ * starting with a digit (`2fa`) was emitted bare and did not parse.
+ */
+const BARE_KEY_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+/**
+ * Emit `s` in generated object-KEY position.
+ *
+ * A key is the one place in the output where catalog text would otherwise land
+ * in EXPRESSION position: `{ [expr]: v }` is a COMPUTED key, evaluated when the
+ * object is constructed, so an unquoted name carrying brackets runs on
+ * `import`. The bare form is therefore gated on a WHOLE-STRING match of the
+ * identifier grammar, which no bracket, parenthesis, quote, newline, or space
+ * can pass; every other name becomes a fully escaped string literal, which is
+ * inert in key position.
+ *
+ * The literal has to be ESCAPED, not merely wrapped: this function used to
+ * return `'${s}'` verbatim, so a name containing a quote closed the key and
+ * reopened in expression position.
+ *
+ * KNOWN LIMIT, deliberately not handled here: a database object named
+ * `__proto__` still sets the emitted object literal's PROTOTYPE rather than
+ * adding a property, because the object-literal special case applies to the
+ * quoted spelling too. Quoting is not a fix for it, so there is no branch for
+ * it; the consequence is a metadata map that silently omits that one entry, not
+ * code execution.
+ */
 function quoteIfNeeded(s: string): string {
-  return /[^a-zA-Z0-9_$]/.test(s) ? `'${s}'` : s;
+  return BARE_KEY_RE.test(s) ? s : `'${escSQ(s)}'`;
 }
 
 function snakeToCamelStr(s: string): string {

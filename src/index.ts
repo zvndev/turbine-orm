@@ -10,7 +10,7 @@
  * //    npx turbine generate
  *
  * // 2. Import the generated client:
- * import { turbine } from './generated/turbine';
+ * import { turbine } from './generated/turbine/index.js';
  *
  * const db = turbine({ connectionString: process.env.DATABASE_URL });
  *

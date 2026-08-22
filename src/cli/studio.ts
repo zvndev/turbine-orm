@@ -50,9 +50,13 @@ import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
 import type { CreateArgs, DeleteArgs, FindManyArgs, UpdateArgs } from '../query/index.js';
 import { QueryInterface, quoteIdent } from '../query/index.js';
-// `ownLookup` is not re-exported from the query barrel, so it is imported from
-// its defining leaf module rather than duplicated here.
-import { ownLookup, registerUtcTemporalParsers } from '../query/utils.js';
+// `ownLookup` and `resolveRelation` are not re-exported from the query barrel,
+// so they are imported from their defining leaf module rather than duplicated
+// here. `resolveRelation` in particular MUST be the compiler's own copy: it is
+// what decides that `blog_posts` and `blogPosts` name the same relation, and a
+// redaction walk that answered that differently would redact a different query
+// than the one that ran.
+import { ownLookup, registerUtcTemporalParsers, resolveRelation } from '../query/utils.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { assertNoPiiPredicates as assertNoPiiPredicatesShared } from './pii-predicate-guard.js';
 import { applyPiiTags, loadPiiTags } from './pii-tags.js';
@@ -1656,6 +1660,20 @@ function redactFlatRow(row: Record<string, unknown>, piiKeys: ReadonlySet<string
  * Redact PII in builder result rows, walking the `with` tree so nested relation
  * rows are redacted against THEIR target table's PII columns (relation rows
  * arrive as parsed json objects keyed by camelCase field names).
+ *
+ * TWO NAMES, and they are not always the same string. The walk is driven by the
+ * caller's `with` clause, which may spell a relation either way (`blogPosts` or
+ * the table spelling `blog_posts`); the ROWS are keyed by the DECLARED name,
+ * because the builder normalizes the clause before it emits the subquery alias.
+ * So the caller's key is resolved through `resolveRelation`, the compiler's own
+ * rule, and the row is then indexed by the CANONICAL name it came back under. A
+ * bare exact-match lookup got both halves wrong at once: it found no relation
+ * for `blog_posts`, skipped the branch, and served every nested PII cell of
+ * `with: { blog_posts: { select: { authorEmail: true } } }` in the clear, while
+ * the identical query written the declared way was redacted. `select` on a PII
+ * column is deliberately permitted precisely because this function redacts it
+ * on the way out (see `assertNoPiiPredicates`), so a miss here is the whole
+ * protection for that shape.
  */
 function redactBuilderRows(
   rows: Record<string, unknown>[],
@@ -1678,9 +1696,12 @@ function redactBuilderRows(
     for (const k of piiKeys) {
       if (k in out && out[k] !== null && out[k] !== undefined) out[k] = PII_REDACTED;
     }
-    for (const [relName, relVal] of relEntries) {
-      const rel = table.relations[relName];
-      if (!rel) continue;
+    for (const [relKey, relVal] of relEntries) {
+      const resolved = resolveRelation(table.relations, relKey);
+      if (!resolved) continue;
+      // The row key is the DECLARED name whatever the caller wrote.
+      const relName = resolved.name;
+      const rel = resolved.def;
       const nestedWith = relVal && typeof relVal === 'object' ? (relVal as { with?: unknown }).with : undefined;
       const child = out[relName];
       if (Array.isArray(child)) {

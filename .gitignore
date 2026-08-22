@@ -8,6 +8,11 @@ dist/
 generated/
 coverage/
 turbine.config.ts
+# ...but the examples ship theirs. The bare pattern above is global, so
+# examples/*/turbine.config.ts existed only in a working tree and a clone
+# got an example that could not run.
+!examples/*/turbine.config.ts
+!examples/*/turbine.config.mts
 *.tgz
 .vercel
 src/cli/studio-ui.generated.ts

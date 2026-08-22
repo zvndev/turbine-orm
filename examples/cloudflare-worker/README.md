@@ -14,7 +14,7 @@ npx wrangler hyperdrive create turbine-db --connection-string="postgres://user:p
 
 # 3. Push the schema (run against the upstream database directly,
 #    not via Hyperdrive, pushing schema needs DDL which Hyperdrive proxies fine)
-DATABASE_URL="postgres://user:pass@host/db" npx turbine push --schema ./schema.ts
+DATABASE_URL="postgres://user:pass@host/db" npx turbine push --schema-file ./schema.ts
 
 # 4. Generate the typed client + runtime metadata
 DATABASE_URL="postgres://user:pass@host/db" npx turbine generate
@@ -44,3 +44,9 @@ Cloudflare Hyperdrive sits in front of any Postgres database and pools / caches 
 |---|---|---|
 | `env.HYPERDRIVE.connectionString` | Worker runtime | Provided automatically by the Hyperdrive binding declared in `wrangler.toml` |
 | `DATABASE_URL` | Local CLI | Direct upstream Postgres URL, used by `turbine push` and `turbine generate` only |
+
+## Running this outside the repo
+
+`package.json` here depends on `"turbine-orm": "file:../../"`, so an example inside
+the repository always builds against the working tree. Copying this directory out?
+Replace that with a published version (`npm install turbine-orm`) first.

@@ -19,7 +19,7 @@ Global filters are configured once on the client and are `AND`-merged into the c
 Pass `globalFilters` to the client, keyed by table accessor (`db.<table>`). Each value is a `WhereClause`, or a function that returns one:
 
 ```ts
-import { turbine } from './generated/turbine';
+import { turbine } from './generated/turbine/index.js';
 
 const db = turbine({
   connectionString: process.env.DATABASE_URL,

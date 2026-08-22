@@ -86,6 +86,7 @@ import type {
 } from './types.js';
 import { resolveSkipGlobalFilters, resolveUnsafeFlag, UNSAFE, type Unsafe } from './types.js';
 import {
+  availableClause,
   isTemporalInfinity,
   LRUCache,
   normalizePagination,
@@ -816,7 +817,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const meta = schema.tables[table];
     if (!meta) {
       throw new ValidationError(
-        `[turbine] Unknown table "${table}". Available: ${Object.keys(schema.tables).join(', ')}`,
+        `[turbine] Unknown table "${table}". ${availableClause(Object.keys(schema.tables), 'The schema has no tables.')}`,
       );
     }
     this.tableMeta = meta;

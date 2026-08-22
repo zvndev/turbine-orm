@@ -1498,6 +1498,22 @@ export function unknownFieldMessage(
 }
 
 /**
+ * The trailing "Available: a, b, c" clause of a name-not-found error, or
+ * `emptySentence` when there is nothing to list.
+ *
+ * The empty branch is the whole reason this exists. Fifteen error sites
+ * interpolated `Object.keys(...).join(', ')` directly, and on a table with no
+ * relations (or a schema with no tables) that renders a dangling
+ * `Available: ` with nothing after the colon, which reads as a broken error
+ * message rather than as an answer. One site already got this right by hand;
+ * the other fourteen are now the same function, so the next one cannot get it
+ * wrong by omission.
+ */
+export function availableClause(names: readonly string[], emptySentence: string): string {
+  return names.length > 0 ? `Available: ${names.join(', ')}` : emptySentence;
+}
+
+/**
  * The error text for a RELATION named inside `select` / `omit`.
  *
  * Separate from {@link unknownFieldMessage} because the generic text degrades

@@ -12,13 +12,14 @@
  */
 
 import { createServer } from 'node:http';
-import { DeadlockError, SerializationFailureError, TurbineClient } from 'turbine-orm';
-import { SCHEMA } from './generated/turbine/metadata.js';
+import { DeadlockError, SerializationFailureError } from 'turbine-orm';
+// The GENERATED factory, not the base client: `new TurbineClient(config, SCHEMA)`
+// creates the table accessors at runtime but types none of them, so
+// `db.posts` is a TypeScript error on it. `turbine()` is the same object
+// with the accessors declared.
+import { turbine } from './generated/turbine/index.js';
 
-const db = new TurbineClient(
-  { connectionString: process.env.DATABASE_URL, max: 20 },
-  SCHEMA,
-);
+const db = turbine({ connectionString: process.env.DATABASE_URL, max: 20 });
 
 const POST_ID = 1;
 
@@ -44,7 +45,10 @@ async function likeUnsafe() {
   const post = await db.posts.findUniqueOrThrow({ where: { id: POST_ID } });
   await db.posts.update({
     where: { id: POST_ID },
-    data: { likesCount: post.likesCount + 1 },
+    // `likes_count` has a DEFAULT but no NOT NULL, so it infers as
+    // `number | null`. That is the column definition talking, not a gap in
+    // the inference.
+    data: { likesCount: (post.likesCount ?? 0) + 1 },
   });
 }
 

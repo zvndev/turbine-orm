@@ -641,7 +641,7 @@ The steps below are the **native port**. For the adapter path: install `turbine-
    - `skip:` → `offset:`
    - `take:` stays as-is at the top level; inside a `with` block, rename it to `limit:`
    - `cursor:` stays as-is, but delete any `skip: 1` next to it, and audit cursors that had *no* `skip`, since Turbine's cursor is exclusive (see [Cursor pagination](#cursor-pagination)).
-6. Replace `import { PrismaClient } from '@prisma/client'` with `import { turbine } from './generated/turbine'`.
+6. Replace `import { PrismaClient } from '@prisma/client'` with `import { turbine } from './generated/turbine/index.js'`.
 7. Port raw SQL from `prisma.$queryRaw` to ``db.raw`SELECT ...` ``; for typed results use ``db.sql<T>`SELECT ...` `` (the drop-in for Prisma's TypedSQL: `T[]` with `.one()` and `.scalar()`).
 8. Update your error-handling to the typed classes (or keep catching by message during transition).
 9. Delete `schema.prisma` and the `prisma/` directory once the build passes.

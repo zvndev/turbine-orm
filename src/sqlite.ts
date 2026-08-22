@@ -34,7 +34,7 @@
  * - **Case-insensitive matching** uses `COLLATE NOCASE`, which is **ASCII-only**
  *   (no Unicode case folding).
  *
- * ## Example, `:memory:` database
+ * ## Example, `:memory:` database, from a generated schema
  *
  * ```ts
  * import { turbineSqlite } from 'turbine-orm/sqlite';
@@ -42,6 +42,38 @@
  *
  * const db = turbineSqlite(':memory:', SCHEMA);
  * const users = await db.users.findMany({ with: { posts: true }, limit: 10 });
+ * await db.disconnect();
+ * ```
+ *
+ * ## Example, SQLite with no Postgres anywhere
+ *
+ * The snippet above needs `turbine generate`, which reads a live **Postgres**
+ * catalog, so it is the wrong starting point if SQLite is your only database.
+ * Describe the schema in code instead: `schemaToSQL` emits the DDL and
+ * `schemaDefToMetadata` derives the runtime metadata (relations included, from
+ * the same `references:`), both pure functions with no database involved.
+ *
+ * ```ts
+ * import { defineSchema, schemaDefToMetadata, schemaToSQL } from 'turbine-orm';
+ * import { sqliteDialect, turbineSqlite } from 'turbine-orm/sqlite';
+ *
+ * const schema = defineSchema({
+ *   users: { id: { type: 'serial', primaryKey: true }, email: { type: 'text', notNull: true } },
+ *   posts: {
+ *     id: { type: 'serial', primaryKey: true },
+ *     userId: { type: 'integer', notNull: true, references: 'users.id' },
+ *     title: { type: 'text', notNull: true },
+ *   },
+ * });
+ *
+ * const db = turbineSqlite(':memory:', schemaDefToMetadata(schema));
+ * for (const stmt of schemaToSQL(schema, { dialect: sqliteDialect })) {
+ *   await db.raw([stmt] as never);
+ * }
+ *
+ * // `db.table(...)`, not `db.users`: the typed property accessors are emitted
+ * // by `turbine generate`, and this path skips it.
+ * const users = await db.table('users').findMany({ with: { posts: true }, orderBy: { id: 'asc' } });
  * await db.disconnect();
  * ```
  */
@@ -68,7 +100,7 @@ import {
   type UpsertStatementInput,
 } from './dialect.js';
 import type { EngineClientConfig } from './engine-config.js';
-import { ConnectionError, UnsupportedFeatureError } from './errors.js';
+import { ConnectionError, UnsupportedFeatureError, ValidationError } from './errors.js';
 import { applyTableFilters, deriveEngineRelations } from './introspect.js';
 import { LRUCache } from './query/utils.js';
 import {
@@ -290,8 +322,24 @@ function statementReturnsRows(sql: string): boolean {
  * recognizable SQLite error.
  *
  * `wrapPgError` is invoked downstream (in the query executor and the
- * transaction proxy), so we only annotate here, we never throw a `new`
- * Turbine error from the driver itself.
+ * transaction proxy), so annotation is the preferred half of the job: every
+ * failure whose meaning Postgres already has a SQLSTATE for is expressed as
+ * that SQLSTATE and typed by the one classifier.
+ *
+ * ONE family cannot be handled that way, and it was the family a new user hits
+ * first. `SQLITE_ERROR` (primary code 1, "SQL logic error") covers
+ * `no such table: users`, `no such column: emial`, and a plain syntax error;
+ * Postgres reports the same three as 42P01 / 42703 / 42601, and `wrapPgError`
+ * classifies none of them, on either engine. So on SQLite they reached the
+ * caller as a bare `Error` with `code: 'ERR_SQLITE_ERROR'`: no `TURBINE_E0NN`,
+ * no `.docsUrl`, not a `TurbineError` at all, in a library whose typed-error
+ * table is a headline feature. {@link sqliteLogicError} builds the
+ * `ValidationError` for them here, the way `wrapPowdbError` builds its errors
+ * for a driver with no SQLSTATEs to annotate.
+ *
+ * Everything else stays annotation, so the two engines cannot drift: fixing a
+ * constraint classification in `wrapPgError` fixes it for SQLite in the same
+ * commit.
  */
 function augmentSqliteError(err: unknown): unknown {
   if (!err || typeof err !== 'object') return err;
@@ -339,9 +387,48 @@ function augmentSqliteError(err: unknown): unknown {
       if (primary === 5 || primary === 6) {
         // Map to serialization_failure so withRetry()/$retry() retry it.
         target.code = '40001';
+        return err;
       }
+      // SQLITE_ERROR (1): the statement itself is wrong. See the note above.
+      if (primary === 1) return sqliteLogicError(message, err);
       return err;
   }
+}
+
+/**
+ * The `ValidationError` for a `SQLITE_ERROR`, with a hint for the two spellings
+ * that account for nearly all of them.
+ *
+ * The driver's own text IS the diagnosis (`no such table: users` names the
+ * table), so it is kept verbatim rather than replaced.
+ *
+ * The original error IS attached as `cause`, and safe mode is not a reason not
+ * to: `TurbineError` runs every cause it is given through `redactCauseForMode`,
+ * so attaching one goes THROUGH the redaction rather than around it. It also
+ * discloses nothing new here, because the driver's message is already quoted
+ * verbatim into the message above it. What it buys is the stack: without it a
+ * `no such table` surfaces with Turbine's frames and none of the driver's.
+ */
+function sqliteLogicError(message: string, cause?: unknown): ValidationError {
+  const missingTable = /^no such table:\s*(\S+)/i.exec(message);
+  if (missingTable) {
+    return new ValidationError(
+      `[turbine] SQLite has no table "${missingTable[1]}": ${message}. ` +
+        'Create it first (run your migrations, or execute the CREATE TABLE statements for this schema); ' +
+        'an in-memory database starts empty on every connection.',
+      { cause },
+    );
+  }
+  const missingColumn = /^no such column:\s*(\S+)/i.exec(message);
+  if (missingColumn) {
+    return new ValidationError(
+      `[turbine] SQLite has no column "${missingColumn[1]}": ${message}. ` +
+        'Check the spelling against the table as it exists in this database, ' +
+        'and re-run `turbine generate` if the schema has changed.',
+      { cause },
+    );
+  }
+  return new ValidationError(`[turbine] SQLite rejected the statement: ${message}`, { cause });
 }
 
 // ---------------------------------------------------------------------------

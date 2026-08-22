@@ -90,3 +90,9 @@ always loses a large chunk.
 | `seed.ts` | Creates the single post that gets hammered |
 | `server.ts` | HTTP server, `/like/safe`, `/like/unsafe`, `/count`, `/reset` |
 | `storm.ts` | Load generator, fires N concurrent clicks at each route |
+
+## Running this outside the repo
+
+`package.json` here depends on `"turbine-orm": "file:../../"`, so an example inside
+the repository always builds against the working tree. Copying this directory out?
+Replace that with a published version (`npm install turbine-orm`) first.

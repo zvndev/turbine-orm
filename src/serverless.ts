@@ -148,7 +148,7 @@ export type TurbineHttpOptions = Omit<TurbineConfig, 'pool'>;
  * ```ts
  * import { Pool } from '@neondatabase/serverless';
  * import { turbineHttp } from 'turbine-orm/serverless';
- * import type { TurbineClient } from './generated/turbine';
+ * import type { TurbineClient } from './generated/turbine/index.js';
  * import { SCHEMA } from './generated/turbine/metadata.js';
  *
  * const pool = new Pool({ connectionString: process.env.DATABASE_URL });

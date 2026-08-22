@@ -12,7 +12,7 @@ npm install
 export DATABASE_URL="postgres://user:pass@ep-xxx.us-east-1.aws.neon.tech/neondb"
 
 # 3. Push the schema
-npx turbine push --schema ./schema.ts
+npx turbine push --schema-file ./schema.ts
 
 # 4. Generate the typed client + runtime metadata
 npx turbine generate
@@ -36,3 +36,9 @@ Drop `app.ts` at `app/api/users/route.ts` in any Next.js project, set `DATABASE_
 | Variable | Description |
 |---|---|
 | `DATABASE_URL` | Neon Postgres connection string from the Neon dashboard |
+
+## Running this outside the repo
+
+`package.json` here depends on `"turbine-orm": "file:../../"`, so an example inside
+the repository always builds against the working tree. Copying this directory out?
+Replace that with a published version (`npm install turbine-orm`) first.

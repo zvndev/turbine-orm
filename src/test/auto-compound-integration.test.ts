@@ -36,6 +36,16 @@ describe("relationLoadStrategy: 'auto' fallback + compound-unique (integration)"
     // Raw DDL bootstrap (no schema metadata needed) via a plain pg pool.
     const bootstrap = new pg.Pool({ connectionString: DATABASE_URL! });
     // Make users.posts probe an UNINDEXED column so 'auto' engages its fallback.
+    // RESTORED IN `after`, and that matters: this is the SHARED fixture from
+    // src/test/fixtures/seed.sql, the files run sequentially
+    // (`--test-concurrency=1`) in alphabetical order, and dropping the index
+    // without putting it back silently re-plans every later suite that reads
+    // `users.posts`. It cost one already: the 0.76.0 global-filter
+    // relation-strategy suite asserts `auto` picks the JOIN plan, which is true
+    // of the fixture and false of the fixture after this file has run, so it
+    // passed alone and failed in the suite. `auto` falling back to batched is
+    // exactly what masked the relation global-filter bug for 48 releases, so a
+    // leak of this particular index is the one most likely to hide a defect.
     await bootstrap.query('DROP INDEX IF EXISTS idx_posts_user_id');
     // A table with a COMPOSITE UNIQUE for the compound-unique selector tests.
     await bootstrap.query(
@@ -62,6 +72,14 @@ describe("relationLoadStrategy: 'auto' fallback + compound-unique (integration)"
 
   after(async () => {
     await db?.disconnect();
+    // Put the fixture back exactly as seed.sql leaves it. Its own pool, because
+    // `db` is already disconnected and this must run even if the suite failed.
+    const restore = new pg.Pool({ connectionString: DATABASE_URL! });
+    try {
+      await restore.query('CREATE INDEX IF NOT EXISTS idx_posts_user_id ON posts(user_id)');
+    } finally {
+      await restore.end();
+    }
   });
 
   it('auto output equals join AND batched, byte-for-byte, for an unindexed hasMany', async () => {

@@ -374,8 +374,22 @@ const PROCEDURAL_STATEMENT = /^(DO\b|CREATE\s+(OR\s+REPLACE\s+)?(FUNCTION|PROCED
  * end of the body, so a later `WHERE` can no longer talk the `update-without-
  * where` rule out of an earlier unrestricted UPDATE.
  */
-function proceduralCandidates(body: string): string[] {
-  const out: string[] = [];
+/**
+ * One destructive verb found inside a procedural body, with the text of its own
+ * statement on either side of it. `before` exists because the evidence that a
+ * statement is ASSEMBLED does not always sit after the verb: in
+ * `concat('DROP TABLE ', t)` the verb is inside the assembling call's argument
+ * list, so everything that identifies the call is to its LEFT.
+ */
+interface ProceduralCandidate {
+  /** The statement from the verb to its end: what the rules and the kind test read. */
+  text: string;
+  /** The same statement up to the verb, bounded at the statement, never the whole body. */
+  before: string;
+}
+
+function proceduralCandidates(body: string): ProceduralCandidate[] {
+  const out: ProceduralCandidate[] = [];
   for (const statement of tokenizeSql(body)) {
     // `code` is the statement with comments gone and everything else verbatim.
     // Literals have to survive: they are where dynamic SQL keeps its payload,
@@ -384,7 +398,7 @@ function proceduralCandidates(body: string): string[] {
     const re = /\b(?:DROP|TRUNCATE|DELETE|ALTER|UPDATE|MERGE)\s/gi;
     let m: RegExpExecArray | null = re.exec(text);
     while (m !== null) {
-      out.push(text.slice(m.index));
+      out.push({ text: text.slice(m.index), before: text.slice(0, m.index) });
       m = re.exec(text);
     }
   }
@@ -424,12 +438,15 @@ export function scanDestructiveSql(sql: string): DestructiveStatement[] {
     // belongs to which statement is no longer an offset calculation that can
     // disagree with the statement split.
     const procedural = PROCEDURAL_STATEMENT.test(stmt);
-    const proceduralTexts: string[] = [];
+    const proceduralParts: ProceduralCandidate[] = [];
     for (const block of procedural ? statement.blocks : []) {
-      for (const text of proceduralCandidates(block)) {
+      for (const part of proceduralCandidates(block)) {
         // The body was blanked in `display`, so name the fragment that matched.
-        candidates.push({ text, display: `${display} [in block: ${text.replace(/\s+/g, ' ').slice(0, 60)}]` });
-        proceduralTexts.push(text);
+        candidates.push({
+          text: part.text,
+          display: `${display} [in block: ${part.text.replace(/\s+/g, ' ').slice(0, 60)}]`,
+        });
+        proceduralParts.push(part);
       }
     }
 
@@ -464,11 +481,11 @@ export function scanDestructiveSql(sql: string): DestructiveStatement[] {
     // `RAISE NOTICE 'DROP the mic'` would prompt, and a guard that fires on
     // prose teaches operators to confirm without reading, which costs more than
     // it saves.
-    for (const text of proceduralTexts) {
-      const kind = dynamicDestructiveKind(text);
+    for (const part of proceduralParts) {
+      const kind = dynamicDestructiveKind(part);
       if (!kind) continue;
       found.push({
-        statement: `${display} [in block: ${text.replace(/\s+/g, ' ').slice(0, 60)}]`,
+        statement: `${display} [in block: ${part.text.replace(/\s+/g, ' ').slice(0, 60)}]`,
         kind,
         target: DYNAMIC_TARGET,
       });
@@ -481,8 +498,72 @@ export function scanDestructiveSql(sql: string): DestructiveStatement[] {
 /** Shown in place of an object name that does not exist until the block runs. */
 export const DYNAMIC_TARGET = '<name assembled at run time>';
 
-/** `||`, `format(...)`, or a `quote_*` helper: the ways a body builds SQL. */
-const DYNAMIC_ASSEMBLY = /\|\||\bformat\s*\(|\bquote_(?:ident|literal|nullable)\s*\(|%[IsL]/;
+/**
+ * The concatenation operator, and `format()`'s placeholders. Case-sensitive on
+ * purpose: `%I`, `%s` and `%L` are the only specifiers `format()` accepts, and
+ * folding case here would also match `%i`, which is not one and does occur in
+ * prose.
+ */
+const DYNAMIC_ASSEMBLY = /\|\||%[IsL]/;
+
+/**
+ * Functions that BUILD a statement out of parts, looked for anywhere in the
+ * fragment (a proximity test, so the list stays tight).
+ *
+ * `concat` / `concat_ws` are the additions, and they are not a nicety: they are
+ * the function spelling of `||`, and the NULL-tolerant one, so they are exactly
+ * what an author reaches for when a name may be null. Their absence was
+ * fail-open in a safety guard, verified on PostgreSQL 16:
+ *
+ *   DO $$ BEGIN EXECUTE 'DROP TABLE ' || 'users'; END $$;       -> flagged
+ *   DO $$ BEGIN EXECUTE concat('DROP TABLE ', 'users'); END $$; -> NOT flagged
+ *
+ * Both drop the table. The second reported a clean inventory, so `migrate up`
+ * never armed its data-loss prompt and applied the drop with no confirmation
+ * and no `--allow-destructive`.
+ */
+const ASSEMBLY_FN = /\b(?:format|concat_ws|concat|quote_ident|quote_literal|quote_nullable)\s*\(/i;
+
+/**
+ * The same question asked of the text BEFORE the verb, and asked PRECISELY: an
+ * assembling call whose parenthesis is still OPEN where the verb appears, i.e.
+ * the verb is one of that call's arguments (`concat('DROP TABLE ', t)`). That
+ * is what `[^)]*$` says, and it is the whole reason a pre-verb test is safe to
+ * add at all: this is not "an assembly function is somewhere nearby", it is
+ * "the destructive verb is inside one".
+ *
+ * Being inside an assembling call is still not enough on its own, and the
+ * counter-example is not hypothetical, it appeared the first time this ran:
+ *
+ *   DO $$ BEGIN UPDATE t SET a = regexp_replace(a, 'DROP .*', '') WHERE id = 1; END $$;
+ *
+ * Nothing there is assembled and nothing is destroyed, but the verb does sit
+ * inside a call. So the pre-verb test ALSO requires an `EXECUTE` in the same
+ * statement, which is the keyword that turns assembled text into a running
+ * statement, and the one thing a data-cleanup expression never has. The
+ * statement bound comes free: {@link proceduralCandidates} builds `before` from
+ * the candidate's OWN statement, so an `EXECUTE` three statements earlier in
+ * the body cannot vouch for this one.
+ *
+ * Precision is also what lets this list be wider than {@link ASSEMBLY_FN}'s.
+ * `array_to_string` joins a list of names into one statement, the shape a
+ * drop-many loop collapses to; `replace` / `regexp_replace` are template
+ * substitution (`EXECUTE replace('DROP TABLE $t', '$t', name)`). Neither may go
+ * in the proximity list: there they would arm the dynamic pass on any body that
+ * both mentions a destructive verb and tidies a string, and a guard that fires
+ * on innocent migrations teaches operators to confirm without reading, which is
+ * this module's other failure mode and costs more than it saves.
+ *
+ * Deliberately left out entirely: `string_agg` (it aggregates over ROWS, and the
+ * per-row half it aggregates is itself a `||` or a `concat` these already
+ * catch), `overlay`, and `substr`/`left`/`right` (they cut text down, they do
+ * not assemble a statement out of parts).
+ */
+const WRAPPING_ASSEMBLY_FN =
+  /\b(?:format|concat_ws|concat|quote_ident|quote_literal|quote_nullable|array_to_string|regexp_replace|replace)\s*\([^)]*$/i;
+
+/** Dynamic SQL only runs if something runs it. Scoped to the candidate's own statement. */
+const RUNS_DYNAMIC_SQL = /\bEXECUTE\b/i;
 
 /**
  * The kind a runtime-assembled procedural fragment should be reported as, or
@@ -495,8 +576,12 @@ const DYNAMIC_ASSEMBLY = /\|\||\bformat\s*\(|\bquote_(?:ident|literal|nullable)\
  * decidable from a fragment whose tail is a runtime expression, so including
  * them would flag every dynamic `UPDATE ... WHERE` in the file.
  */
-function dynamicDestructiveKind(text: string): DestructiveKind | null {
-  if (!DYNAMIC_ASSEMBLY.test(text)) return null;
+function dynamicDestructiveKind({ text, before }: ProceduralCandidate): DestructiveKind | null {
+  const assembled =
+    DYNAMIC_ASSEMBLY.test(text) ||
+    ASSEMBLY_FN.test(text) ||
+    (RUNS_DYNAMIC_SQL.test(before) && WRAPPING_ASSEMBLY_FN.test(before));
+  if (!assembled) return null;
   if (/^DROP\s+TABLE\b/i.test(text)) return 'drop-table';
   if (/^DROP\s+SCHEMA\b/i.test(text)) return 'drop-schema';
   if (/^DROP\s+DATABASE\b/i.test(text)) return 'drop-database';

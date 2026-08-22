@@ -78,3 +78,9 @@ Progress meter is on **stderr** so you can redirect **stdout** to a file.
 | `schema.ts` | `defineSchema(...)`, customers, orders, line_items |
 | `seed.ts` | Bulk-inserts 100K orders via `UNNEST` (configurable via `ORDERS` env) |
 | `index.ts` | The demo, streams to CSV with a live progress meter |
+
+## Running this outside the repo
+
+`package.json` here depends on `"turbine-orm": "file:../../"`, so an example inside
+the repository always builds against the working tree. Copying this directory out?
+Replace that with a published version (`npm install turbine-orm`) first.

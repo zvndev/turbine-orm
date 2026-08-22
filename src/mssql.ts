@@ -123,6 +123,7 @@ import {
 } from './errors.js';
 import { applyTableFilters, deriveEngineRelations } from './introspect.js';
 import importOptionalPeer from './optional-peer-import.cjs';
+import { availableClause } from './query/utils.js';
 import {
   type ColumnMetadata,
   camelToSnake,
@@ -468,6 +469,24 @@ class MssqlTxClient implements PgCompatPoolClient {
 export class MssqlPool implements PgCompatPool {
   /** The underlying `mssql` ConnectionPool, exposed as an escape hatch (seed / DDL / advanced ops). */
   readonly pool: MssqlConnectionPool;
+  /**
+   * The dialect this pool speaks, published so a consumer holding only the POOL
+   * can find it.
+   *
+   * `executePipeline` (src/pipeline.ts) is that consumer: it receives a pool and
+   * nothing else, and its transaction control used to be the literal strings
+   * `BEGIN` / `COMMIT` / `ROLLBACK`. A bare `BEGIN` is a statement-BLOCK opener
+   * in T-SQL, so it missed {@link MssqlTxClient}'s `BEGIN TRAN(SACTION)` branch,
+   * reached the server as a block with no `END`, and was rejected; the COMMIT
+   * and ROLLBACK behind it then found no open transaction and no-oped. Reading
+   * the dialect off the pool is what lets the batch emit `BEGIN TRANSACTION`
+   * and land on the driver's Transaction API instead.
+   *
+   * SQL Server is the only engine whose transaction keywords differ from
+   * Postgres's, so it is the only pool shim that needs to publish this; the
+   * lookup treats an absent `dialect` as PostgreSQL.
+   */
+  readonly dialect: Dialect = mssqlDialect;
   private readonly sqlNS: MssqlModule;
   private closed = false;
 
@@ -1047,7 +1066,7 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
       if (!nestedRelDef) {
         throw new RelationError(
           `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
-            `Available: ${Object.keys(targetMeta.relations).join(', ')}`,
+            availableClause(Object.keys(targetMeta.relations), 'It has no relations.'),
         );
       }
       const sub = ctx.recurse(nestedRelDef, nestedSpec, parentAlias, depth + 1, [...path, relDef.name]);

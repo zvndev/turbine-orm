@@ -34,7 +34,7 @@ The `db` handed to the callback is a base client: use [`db.raw`](/queries#raw-sq
 
 ```ts
 // seed.ts
-import { turbine } from './generated/turbine';
+import { turbine } from './generated/turbine/index.js';
 
 const db = turbine({ connectionString: process.env.DATABASE_URL });
 

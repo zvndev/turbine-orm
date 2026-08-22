@@ -288,6 +288,8 @@ export interface CliOverrides {
   url?: string;
   out?: string;
   schema?: string;
+  /** `--schema-file <path>`: the defineSchema() file, overriding config `schemaFile`. */
+  schemaFile?: string;
   include?: string[];
   exclude?: string[];
   importExtension?: 'js' | 'none' | 'auto';
@@ -311,7 +313,7 @@ export function resolveConfig(fileConfig: TurbineCliConfig, overrides: CliOverri
     // `seedFile` is canonical (what the docs and `turbine init` use); `seed` is a
     // back-compat alias kept working for configs scaffolded before 0.50.
     seedFile: fileConfig.seedFile ?? fileConfig.seed,
-    schemaFile: fileConfig.schemaFile ?? './turbine/schema.ts',
+    schemaFile: overrides.schemaFile ?? fileConfig.schemaFile ?? './turbine/schema.ts',
     importExtension: overrides.importExtension ?? fileConfig.importExtension ?? 'auto',
     keepColumnNames: overrides.keepColumnNames ?? fileConfig.keepColumnNames ?? false,
     legacyToManyUniques: overrides.legacyToManyUniques ?? fileConfig.legacyToManyUniques ?? false,

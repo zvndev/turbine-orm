@@ -550,8 +550,17 @@ export class TimeoutError extends TurbineError {
 
 /** Thrown when query arguments fail validation (unknown column, invalid operator, etc.) */
 export class ValidationError extends TurbineError {
-  constructor(message: string) {
-    super(TurbineErrorCode.VALIDATION, message);
+  /**
+   * `options.cause` is for the engines, not for the query builder. Turbine's own
+   * E003s are raised from validation it performed itself, so there is nothing
+   * underneath them to attach; an engine that classifies a DRIVER error as E003
+   * (`sqliteLogicError`, `wrapPowdbError`) has a real underlying error and used
+   * to have to drop it, because this constructor took a message and nothing
+   * else. The base class already redacts a cause under `errorMessages: 'safe'`,
+   * so forwarding it here does not widen what a safe-mode error discloses.
+   */
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(TurbineErrorCode.VALIDATION, message, options);
     this.name = 'ValidationError';
   }
 }

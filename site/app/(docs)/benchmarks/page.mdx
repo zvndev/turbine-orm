@@ -15,7 +15,7 @@ Three-way head-to-head against **Prisma 7.9** (`@prisma/adapter-pg`, `relationJo
 >
 > **Noise floor:** every sub-0.15 ms figure carries roughly one third uncertainty in its absolute value; the orderings are stable across runs. Per-scenario spreads are in [the drift floor](#the-drift-floor-read-this-before-the-table).
 
-> **TL;DR.** Over a local socket there is no network round-trip, so per-query overhead is the entire signal and most numbers are sub-millisecond. The single most useful figure on this page: **Turbine runs at 1.08x hand-written `pg`, where Drizzle runs at 1.47x and Prisma at 1.81x** (geometric mean over the eight scenarios with a raw control). Across all ten scenarios Turbine is **2.02x faster than Prisma 7.9** and **1.46x faster than Drizzle 0.45** by geometric mean. Turbine took nine of the ten here and Prisma took none; the one Drizzle took was **streaming**, and [0.72.0 closes it](#the-one-we-lost-and-how-it-was-closed) in a targeted re-measurement. Three of the ten are contested and are claimed by neither side.
+> **TL;DR.** Over a local socket there is no network round-trip, so per-query overhead is the entire signal and most numbers are sub-millisecond. The single most useful figure on this page: **Turbine runs at 1.08x hand-written `pg`, where Drizzle runs at 1.47x and Prisma at 1.81x** (geometric mean over the eight scenarios with a raw control). Across all ten scenarios Turbine is **2.02x faster than Prisma 7.9** and **1.46x faster than Drizzle 0.45** by geometric mean. Turbine took nine of the ten here and Prisma took none; the one Drizzle took was **streaming**, and two later re-measurements ([0.72.0](#the-one-we-lost-and-how-it-was-closed) and 0.76.0) both reverse it against the published Drizzle 0.45.2. Three of the ten are contested and are claimed by neither side.
 >
 > The [extended suite](#beyond-the-headline-ten) widens the set to **24** shapes; Turbine leads **17**. The additions found a loss the ten could not see (**deep pagination**, where a named prepared statement hits PostgreSQL's generic-plan cliff) and overturned a recommendation they would have produced (`relationLoadStrategy: 'batched'` is fastest on a socket and **slower by 1 ms of round-trip time**). Read [Latency](#latency-the-axis-a-socket-cannot-show) before acting on any single number here.
 
@@ -96,13 +96,49 @@ The control arm locates the gap. Hand-written keyset pagination in raw `pg` drai
   the loss to Drizzle from 1.28x to 1.16x. **It does not win the scenario.**
 </Callout>
 
+<Callout type="note" title="Re-measured on 0.76.0, with Drizzle 1.0.0-rc.4 in the rotation">
+  Three runs of 15 interleaved rounds on 2026-08-22, medians of the three
+  medians, same 50,000-comment drain at `batchSize: 1000`:
+
+  | arm | median | vs Drizzle 0.45.2 |
+  |---|---|---|
+  | `findManyStreamBatches` | **36.70 ms** | **1.20x faster** |
+  | `findManyStream` (per row) | 40.69 ms | 1.09x faster |
+  | Drizzle 1.0.0-rc.4 | 37.10 ms | |
+  | Drizzle 0.45.2 | 44.20 ms | |
+  | raw `pg`, hand-written keyset | 46.70 ms | |
+
+  **Against the published Drizzle 0.45.2 the scenario has reversed**, in all
+  three runs and on both Turbine spellings. **Against the release candidate it
+  is a tie, not a win.** The paired per-round delta between
+  `findManyStreamBatches` and rc.4 came out +3.1%, -2.1% and -4.9% across the
+  three runs, while the negative control (one Turbine batch arm timed twice
+  under two names, identical work) spanned -3.7% to +3.2%. The difference is
+  inside the noise, so it is reported as a tie. The per-row API is a genuine
+  loss to rc.4: +4.9% to +11.1%, winning 24-29% of rounds.
+
+  **Do not read the raw control as a bound here.** On every other scenario on
+  this page it is the floor; on this one the arms do different database work.
+  Turbine declares one `NO SCROLL` cursor and drains it with 51 `FETCH`es, one
+  unordered sequential scan inside a transaction. The control and both Drizzle
+  arms issue 51 separate keyset `SELECT`s, each an ordered index walk with its
+  own planner entry. That is why the control lands below the ORMs rather than
+  above them, and it is a property of the strategy, not evidence that Turbine
+  beats hand-written SQL.
+
+  Harness: `benchmarks/bench-stream-parity.ts`, which runs both Turbine
+  spellings in one rotation against the same competitors, because the older
+  single-arm harness compared a per-row API against four arms consuming arrays
+  and reported the API difference as a speed difference.
+</Callout>
+
 What the 19% buys:
 
 1. **Correctness without a monotonic key.** Keyset pagination requires `orderBy` on a unique column. Turbine's cursor works with any `orderBy`.
 2. **Clean early break.** `for await ... break` closes server-side state and releases the connection deterministically. This scenario drains the whole table, which is the case that flatters keyset most.
 3. **Nested `with` inside the stream.** Cursor batches resolve a full `with` clause per batch.
 
-If you are draining a large table on a unique ascending key and nothing else, Drizzle is measurably faster at it today, and `findManyStreamBatches` narrows that without reversing it.
+If you are draining a large table on a unique ascending key and nothing else, keyset pagination is the leaner shape and `findManyStream` is the arm that still pays for the difference. `findManyStreamBatches` gives up the per-row API and takes the scenario back against Drizzle 0.45.2; against the 1.0 release candidate it draws level rather than passing it.
 
 ## Methodology, and why the harness changed
 
@@ -176,7 +212,7 @@ Median wall-clock ms per operation (lower is better). Bold = fastest ORM. The `r
 
 Both tables are 0.71.0 data, as measured on 2026-08-15. The **stream** row is the one since superseded: 0.72.0 takes it, and the figures are [above](#the-one-we-lost-and-how-it-was-closed). It is left standing here rather than patched in because that would mix two harnesses on two dates in one table, and the rest of these rows have not been re-run.
 
-**Three of the ten are contested and should not be read as leads by either side.** The interleaved harness gives Turbine **L2 nested** (1.670 vs 1.711) and **L3 nested** (1.082 vs 1.166), but the contiguous harness will not confirm either: run twice on the identical configuration it reversed itself on both, giving L2 to Drizzle once (2.18 vs 1.63) and to Turbine once (1.54 vs 1.61). **Atomic increment** is the third, a tie under both designs (interleaved: Turbine 0.067 vs Drizzle 0.073; contiguous: 0.09 vs 0.09). The tables above report the interleaved harness because it rotates arm order every round, sharing drift across arms instead of letting it land on one. Streaming is **not** contested: Drizzle wins it by 22% in every run of both harnesses.
+**Three of the ten are contested and should not be read as leads by either side.** The interleaved harness gives Turbine **L2 nested** (1.670 vs 1.711) and **L3 nested** (1.082 vs 1.166), but the contiguous harness will not confirm either: run twice on the identical configuration it reversed itself on both, giving L2 to Drizzle once (2.18 vs 1.63) and to Turbine once (1.54 vs 1.61). **Atomic increment** is the third, a tie under both designs (interleaved: Turbine 0.067 vs Drizzle 0.073; contiguous: 0.09 vs 0.09). The tables above report the interleaved harness because it rotates arm order every round, sharing drift across arms instead of letting it land on one. Streaming was **not** contested in this run either, and Drizzle took it by 22% in every run of both harnesses. It has since been re-measured twice and reversed both times; see [above](#the-one-we-lost-and-how-it-was-closed).
 
 ## Overhead above hand-written `pg`
 
@@ -206,7 +242,7 @@ Flat `findMany`, both `findUnique` shapes, `count`, the 5-query pipeline and the
 
 ### 3. The nested reads stopped being losses, narrowly
 
-Both nested `findMany` shapes were Drizzle's in the previous run and are Turbine's here: L2 **1.670 ms against 1.711**, L3 **1.082 against 1.166**. Turbine leads Prisma on the nested shapes by **2.6x on L2, 3.9x on L3 and 2.6x on the nested `findUnique`**. Drizzle still wins streaming outright, by 22% (see [above](#the-one-we-lose-stated-plainly)).
+Both nested `findMany` shapes were Drizzle's in the previous run and are Turbine's here: L2 **1.670 ms against 1.711**, L3 **1.082 against 1.166**. Turbine leads Prisma on the nested shapes by **2.6x on L2, 3.9x on L3 and 2.6x on the nested `findUnique`**. Streaming was Drizzle's by 22% in this run; it is the one row here that later re-measurements overturn (see [above](#the-one-we-lost-and-how-it-was-closed)).
 
 **Both are marked contested, and the mark is doing real work.** L2's margin is 2.5%, which is inside what this page tells you not to quote, and the contiguous cross-check harness cannot arbitrate: two runs of the identical configuration reversed each other on both scenarios (L2 gave 2.18 ms against Drizzle's 1.63 in one run and 1.54 against 1.61 in the next). Read L2 and L3 as ties that Turbine now enters level, not as leads.
 

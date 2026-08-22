@@ -1,0 +1,20 @@
+{
+  // Bundler resolution, matching Next.js's own default. A `.js` specifier resolves to the `.ts`
+  // source here, so the generated-client imports are spelled the same way as in
+  // the NodeNext examples and work under both.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2023", "DOM"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "jsx": "preserve",
+    // Next.js route handlers run on Node/Edge; `process.env` needs the types.
+    "types": ["node"],
+    "allowImportingTsExtensions": false
+  },
+  "include": ["**/*.ts", "**/*.tsx"],
+  "exclude": ["node_modules"]
+}

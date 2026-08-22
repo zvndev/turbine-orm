@@ -65,7 +65,7 @@ Create the client at startup, pass errors to `next(err)` so your error middlewar
 ```ts
 // server.ts
 import express from 'express';
-import { turbine } from './generated/turbine';
+import { turbine } from './generated/turbine/index.js';
 import { NotFoundError } from 'turbine-orm';
 
 const db = turbine({ connectionString: process.env.DATABASE_URL });

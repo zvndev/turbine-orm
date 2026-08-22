@@ -62,6 +62,7 @@ import type { ReselectExecutor } from './builder.js';
 import { dedupeOrderEntries, isOrderBySpec, isRelationPickOrderBy, orderByEntries, sortedEntries } from './filters.js';
 import type { SkipGlobalFilters, Unsafe, WithClause, WithCount, WithOptions } from './types.js';
 import {
+  availableClause,
   type ColumnNameSource,
   markInternalCombinator,
   ownLookup,
@@ -516,7 +517,7 @@ export function resolveCountRelations(parentMeta: TableMetadata, countSpec: With
     if (!rel) {
       throw new RelationError(
         `[turbine] Unknown relation "${relName}" in _count on table "${parentMeta.name}". ` +
-          `Available: ${Object.keys(parentMeta.relations).join(', ')}`,
+          availableClause(Object.keys(parentMeta.relations), 'It has no relations.'),
       );
     }
     if (!isToMany(rel)) {
@@ -604,7 +605,7 @@ export async function loadRelationsBatched(
       // must refuse identically or the error CODE depends on table size.
       throw new RelationError(
         `[turbine] Unknown relation "${relName}" on table "${ctx.parentMeta.name}". ` +
-          `Available: ${Object.keys(ctx.parentMeta.relations).join(', ')}`,
+          availableClause(Object.keys(ctx.parentMeta.relations), 'It has no relations.'),
       );
     }
     resolved.push({ relName, rel, options: spec === true ? {} : (spec as WithOptions) });
@@ -635,7 +636,7 @@ export async function loadRelationsBatched(
   if (hasCount && depth > 0) {
     throw new RelationError(
       `[turbine] Unknown relation "_count" on table "${ctx.parentMeta.name}". ` +
-        `Available: ${Object.keys(ctx.parentMeta.relations).join(', ')}. ` +
+        `${availableClause(Object.keys(ctx.parentMeta.relations), 'It has no relations.')} ` +
         '(`_count` is supported on the top-level `with` only, on every relationLoadStrategy.)',
     );
   }

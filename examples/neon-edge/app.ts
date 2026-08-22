@@ -14,14 +14,17 @@
 
 import { Pool } from '@neondatabase/serverless';
 import { turbineHttp } from 'turbine-orm/serverless';
-// After running `npx turbine generate`, this file exposes the introspected
-// schema as `SCHEMA` (matching the generator's output convention).
-import { SCHEMA } from './generated/turbine/metadata';
+// After running `npx turbine generate`, this directory holds the runtime
+// schema (`SCHEMA`) and the generated client TYPE. Naming that type is what
+// gives the edge client the same typed accessors as the TCP one; without it
+// `turbineHttp` returns the base client and `db.users` does not compile.
+import type { TurbineClient } from './generated/turbine/index.js';
+import { SCHEMA } from './generated/turbine/metadata.js';
 
 export const runtime = 'edge';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-const db = turbineHttp(pool, SCHEMA);
+const db = turbineHttp<TurbineClient>(pool, SCHEMA);
 
 export async function GET() {
   const users = await db.users.findMany({ limit: 10 });

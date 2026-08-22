@@ -13,7 +13,7 @@ npm install
 #    Vercel injects POSTGRES_URL into your project env automatically.
 
 # 3. Push the schema
-npx turbine push --schema ./schema.ts
+npx turbine push --schema-file ./schema.ts
 
 # 4. Generate the typed client + runtime metadata
 npx turbine generate
@@ -41,3 +41,9 @@ curl http://localhost:3000/api/users
 ## Notes
 
 `@vercel/postgres` wraps `@neondatabase/serverless` under the hood, so this example works on both the Edge and Node runtimes. Switch `runtime` from `'edge'` to `'nodejs'` in `route.ts` if you'd rather run on the Node runtime.
+
+## Running this outside the repo
+
+`package.json` here depends on `"turbine-orm": "file:../../"`, so an example inside
+the repository always builds against the working tree. Copying this directory out?
+Replace that with a published version (`npm install turbine-orm`) first.

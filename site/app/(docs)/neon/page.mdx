@@ -30,7 +30,7 @@ This introspects your schema and writes typed accessors to `./generated/turbine/
 For traditional Node.js servers, Express, Fastify, or any long-running process:
 
 ```ts
-import { turbine } from './generated/turbine';
+import { turbine } from './generated/turbine/index.js';
 
 const db = turbine({
   connectionString: process.env.DATABASE_URL,
@@ -76,7 +76,7 @@ npx turbine migrate status
 
 ## Why Turbine on Neon?
 
-- **No WASM**: the edge entry is held under 68 kB brotli in CI (Prisma 7: ~1.6 MB TS/WASM query compiler)
+- **No WASM**: the edge entry is held under 69 kB brotli in CI (Prisma 7: ~1.6 MB TS/WASM query compiler)
 - **Single-query nested reads**, one SQL statement via `json_agg`, not N+1
 - **Pipeline batching**, N queries in 1 round-trip (critical for high-latency serverless)
 - **No adapter layer**, `turbineHttp(pool, SCHEMA)` with any pg-compatible driver

@@ -293,10 +293,11 @@ testFn('turbine integration tests', () => {
       });
       assert.ok(user);
       assert.ok(Array.isArray(user.posts), 'posts should be an array');
-      if (user.posts.length > 0) {
-        assert.equal(typeof user.posts[0]!.id, 'number');
-        assert.equal(typeof user.posts[0]!.title, 'string');
-      }
+      // Asserted, not guarded: user 1 has posts in the fixture, so an empty
+      // array here is a defect and `if (length > 0)` would have hidden it.
+      assert.ok(user.posts.length > 0, 'user 1 has posts in the fixture');
+      assert.equal(typeof user.posts[0]!.id, 'number');
+      assert.equal(typeof user.posts[0]!.title, 'string');
     });
 
     it('L3: user with posts with comments', async () => {
@@ -314,10 +315,11 @@ testFn('turbine integration tests', () => {
       });
       assert.ok(user);
       assert.ok(Array.isArray(user.posts));
-      if (user.posts.length > 0) {
-        const firstPost = user.posts[0]!;
-        assert.ok(Array.isArray(firstPost.comments), 'comments should be an array');
-      }
+      // Asserted, not guarded: user 1 has posts in the fixture, so an empty
+      // array here is a defect and `if (length > 0)` would have hidden it.
+      assert.ok(user.posts.length > 0, 'user 1 has posts in the fixture');
+      const firstPost = user.posts[0]!;
+      assert.ok(Array.isArray(firstPost.comments), 'comments should be an array');
     });
 
     it('L2: organization with users', async () => {
@@ -1507,12 +1509,16 @@ testFn('turbine integration tests', () => {
         ],
         skipDuplicates: true,
       });
-      // Should only insert the new one (or none if slug is not unique constraint)
+      // EXACTLY one. `organizations.slug` carries a unique index in the fixture
+      // (`organizations_slug_key`), so of the three rows offered, two collide and
+      // one is new. The old assertion hedged with "or none if slug is not unique
+      // constraint" and then guarded on `length > 0`, which passes for a
+      // `skipDuplicates` that skipped EVERYTHING, including the row it should
+      // have inserted.
       assert.ok(Array.isArray(created));
-      if (created.length > 0) {
-        for (const org of created) {
-          createdIds.push(org.id);
-        }
+      assert.equal(created.length, 1, `expected exactly the one new row, got ${JSON.stringify(created)}`);
+      for (const org of created) {
+        createdIds.push(org.id);
       }
     });
 
@@ -1823,15 +1829,16 @@ testFn('turbine integration tests', () => {
       });
       assert.ok(user);
       assert.ok(Array.isArray(user.posts));
-      if (user.posts.length > 0) {
-        const post = user.posts[0]!;
-        assert.ok('id' in post, 'should have id');
-        assert.ok('title' in post, 'should have title');
-        // content, published, viewCount etc. should NOT be present
-        assert.ok(!('content' in post), 'content should not be included when not selected');
-        assert.ok(!('published' in post), 'published should not be included when not selected');
-        assert.ok(!('viewCount' in post), 'viewCount should not be included when not selected');
-      }
+      // Asserted, not guarded: user 1 has posts in the fixture, so an empty
+      // array here is a defect and `if (length > 0)` would have hidden it.
+      assert.ok(user.posts.length > 0, 'user 1 has posts in the fixture');
+      const post = user.posts[0]!;
+      assert.ok('id' in post, 'should have id');
+      assert.ok('title' in post, 'should have title');
+      // content, published, viewCount etc. should NOT be present
+      assert.ok(!('content' in post), 'content should not be included when not selected');
+      assert.ok(!('published' in post), 'published should not be included when not selected');
+      assert.ok(!('viewCount' in post), 'viewCount should not be included when not selected');
     });
 
     it('omit excludes specified fields from nested relation', async () => {
@@ -1849,12 +1856,13 @@ testFn('turbine integration tests', () => {
       });
       assert.ok(user);
       assert.ok(Array.isArray(user.posts));
-      if (user.posts.length > 0) {
-        const post = user.posts[0]!;
-        assert.ok('id' in post, 'should have id');
-        assert.ok('title' in post, 'should have title');
-        assert.ok(!('content' in post), 'content should be omitted');
-      }
+      // Asserted, not guarded: user 1 has posts in the fixture, so an empty
+      // array here is a defect and `if (length > 0)` would have hidden it.
+      assert.ok(user.posts.length > 0, 'user 1 has posts in the fixture');
+      const post = user.posts[0]!;
+      assert.ok('id' in post, 'should have id');
+      assert.ok('title' in post, 'should have title');
+      assert.ok(!('content' in post), 'content should be omitted');
     });
 
     it('select works with nested relation + limit + orderBy', async () => {
@@ -1874,12 +1882,13 @@ testFn('turbine integration tests', () => {
       });
       assert.ok(user);
       assert.ok(user.posts.length <= 3);
-      if (user.posts.length > 0) {
-        const post = user.posts[0]!;
-        assert.ok('id' in post, 'should have id');
-        assert.ok('title' in post, 'should have title');
-        assert.ok(!('content' in post), 'content should not be included');
-      }
+      // Asserted, not guarded: user 1 has posts in the fixture, so an empty
+      // array here is a defect and `if (length > 0)` would have hidden it.
+      assert.ok(user.posts.length > 0, 'user 1 has posts in the fixture');
+      const post = user.posts[0]!;
+      assert.ok('id' in post, 'should have id');
+      assert.ok('title' in post, 'should have title');
+      assert.ok(!('content' in post), 'content should not be included');
     });
 
     it('select works with nested relation + nested with', async () => {
@@ -1898,13 +1907,14 @@ testFn('turbine integration tests', () => {
       });
       assert.ok(user);
       assert.ok(Array.isArray(user.posts));
-      if (user.posts.length > 0) {
-        const post = user.posts[0]!;
-        assert.ok('id' in post, 'should have id');
-        assert.ok('title' in post, 'should have title');
-        assert.ok('comments' in post, 'should have nested comments');
-        assert.ok(Array.isArray(post.comments));
-      }
+      // Asserted, not guarded: user 1 has posts in the fixture, so an empty
+      // array here is a defect and `if (length > 0)` would have hidden it.
+      assert.ok(user.posts.length > 0, 'user 1 has posts in the fixture');
+      const post = user.posts[0]!;
+      assert.ok('id' in post, 'should have id');
+      assert.ok('title' in post, 'should have title');
+      assert.ok('comments' in post, 'should have nested comments');
+      assert.ok(Array.isArray(post.comments));
     });
 
     it('belongsTo relation with select', async () => {

@@ -67,3 +67,9 @@ npm start
 | `schema.ts` | `defineSchema(...)`, users, stories, comments, replies |
 | `seed.ts` | Populates ~20 users, 15 stories, ~75 comments, ~150 replies |
 | `index.ts` | The demo, one `findMany`, one `count`, a terminal render |
+
+## Running this outside the repo
+
+`package.json` here depends on `"turbine-orm": "file:../../"`, so an example inside
+the repository always builds against the working tree. Copying this directory out?
+Replace that with a published version (`npm install turbine-orm`) first.

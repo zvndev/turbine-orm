@@ -12,9 +12,12 @@
 
 import { Pool } from 'pg';
 import { turbineHttp } from 'turbine-orm/serverless';
-// After running `npx turbine generate`, this file exposes the introspected
-// schema as `SCHEMA` (matching the generator's output convention).
-import { SCHEMA } from './generated/turbine/metadata';
+// After running `npx turbine generate`, this directory holds the runtime
+// schema (`SCHEMA`) and the generated client TYPE. `turbineHttp` returns the
+// base client unless you name that type, and the base client declares no
+// table accessors, so `db.users` below would not compile without it.
+import type { TurbineClient } from './generated/turbine/index.js';
+import { SCHEMA } from './generated/turbine/metadata.js';
 
 export interface Env {
   HYPERDRIVE: Hyperdrive;
@@ -27,7 +30,7 @@ interface Hyperdrive {
 export default {
   async fetch(_req: Request, env: Env): Promise<Response> {
     const pool = new Pool({ connectionString: env.HYPERDRIVE.connectionString });
-    const db = turbineHttp(pool, SCHEMA);
+    const db = turbineHttp<TurbineClient>(pool, SCHEMA);
 
     try {
       const users = await db.users.findMany({ limit: 10 });

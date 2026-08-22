@@ -39,3 +39,9 @@ npm start
 ## Notes
 
 Supabase serves Postgres directly, there is no HTTP fallback. Use the regular `TurbineClient` with `ssl: { rejectUnauthorized: false }` to accept Supabase's managed TLS certificate. For long-running processes use the direct (5432) URL; for serverless functions use the pooled (6543) URL.
+
+## Running this outside the repo
+
+`package.json` here depends on `"turbine-orm": "file:../../"`, so an example inside
+the repository always builds against the working tree. Copying this directory out?
+Replace that with a published version (`npm install turbine-orm`) first.

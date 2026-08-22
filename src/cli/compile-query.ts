@@ -46,7 +46,7 @@ import type {
   RelationLoadStrategy,
 } from '../query/index.js';
 import { QueryInterface } from '../query/index.js';
-import { ownLookup } from '../query/utils.js';
+import { ownLookup, resolveRelation } from '../query/utils.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { explainErrorCode } from './error-catalog.js';
 import { PII_GUARD_MAX_DEPTH } from './pii-predicate-guard.js';
@@ -122,9 +122,44 @@ export const COLUMN_NAMING_ARG_KEYS: readonly string[] = [
   '_max',
 ];
 
-/** Does this args object carry a key that names a column? */
-export function carriesColumnNamingArg(args: Record<string, unknown>): boolean {
-  return COLUMN_NAMING_ARG_KEYS.some((key) => args[key] !== undefined);
+/**
+ * Does this args object carry a key that names a column, AT ANY DEPTH?
+ *
+ * The depth is the whole point and it was missing until 0.76.0. This is the
+ * fail-closed test for the case where the PII tag file could not be read, so
+ * "no column-naming arg" is a claim that the query cannot be filtering on a
+ * hidden column. A top-level-only check makes that claim falsely:
+ * `{ with: { posts: { where: { secretNote: { not: null } } } } }` has no
+ * column-naming key at the top level and filters on a column two levels down,
+ * and the tool reported it as safe to compile.
+ *
+ * `with` is not itself a column-naming key (its keys are RELATION names, and
+ * `select` / `omit` are excluded on the guard's own rule that they return
+ * values, which this tool never does), but the OPTIONS inside a `with` entry
+ * are the full findMany surface, so the walk descends through them.
+ *
+ * It errs toward TRUE: an unrecognized object value is descended into rather
+ * than skipped, and the depth cap answers true rather than false. This function
+ * only ever gates a refusal, so a false positive costs a caller one message and
+ * a false negative is the disclosure it exists to prevent.
+ */
+export function carriesColumnNamingArg(args: Record<string, unknown>, depth = 0): boolean {
+  if (depth > PII_GUARD_MAX_DEPTH) return true;
+  for (const [key, value] of Object.entries(args)) {
+    if (COLUMN_NAMING_ARG_KEYS.includes(key) && value !== undefined) return true;
+    // `select` / `omit` name columns but return them rather than filtering on
+    // them, and nothing is returned here; skipping them keeps this aligned with
+    // cli/pii-predicate-guard.ts, which makes the same call for the same reason.
+    if (key === 'select' || key === 'omit') continue;
+    if (value && typeof value === 'object') {
+      for (const entry of Array.isArray(value) ? value : [value]) {
+        if (entry && typeof entry === 'object' && carriesColumnNamingArg(entry as Record<string, unknown>, depth + 1)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -427,8 +462,14 @@ function walkWith(
     // `_count` is an inline aggregate, not a relation node: it adds no follow-up
     // statement and has no target table of its own.
     if (key === '_count') continue;
-    const relation = ownLookup(table.relations, key);
-    if (!relation) continue;
+    // Resolve the caller's spelling the way the compiler does: a relation declared
+    // `blogPosts` is also reachable as `blog_posts` (resolveRelation, since 0.72). An
+    // exact-match lookup here did not fail loudly, it silently dropped the relation from
+    // the report, so compile_query under-counted statements and skipped the correlation
+    // probes for exactly the relation the caller asked about.
+    const resolved = resolveRelation(table.relations, key);
+    if (!resolved) continue;
+    const relation = resolved.def;
     const path = prefix ? `${prefix}.${relation.name}` : relation.name;
     out.push({
       path,

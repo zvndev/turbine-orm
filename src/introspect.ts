@@ -395,6 +395,104 @@ export interface IntrospectOptions {
 // Main introspection function
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Catalog identifier boundary
+// ---------------------------------------------------------------------------
+
+/**
+ * Characters that no legitimate SQL object name carries and that are exactly
+ * the primitives for breaking OUT of a generated string literal or comment: the
+ * C0 control range (NUL, newline, carriage return, tab), the C1 range, and the
+ * two Unicode line terminators.
+ *
+ * Postgres permits ANY character in a double-quoted identifier up to 63 bytes,
+ * so a catalog name is attacker-controlled text as soon as anyone but the DBA
+ * can create an object. `turbine generate` turns those names into TypeScript
+ * that is then `import`ed, i.e. EXECUTED, and `turbine studio` / the MCP server
+ * render them into HTML and JSON. Escaping at each of those sinks is the actual
+ * fix (see `escSQ` / `quoteIfNeeded` / `docSafe` in generate.ts); this boundary
+ * is the belt-and-braces refusal one layer earlier, and it names the object so
+ * the operator can see WHICH one is malformed instead of debugging generated
+ * output.
+ *
+ * Deliberately narrow. It does NOT refuse a name that merely cannot become a
+ * TypeScript identifier (`2fa_codes`), because `introspect()` also feeds
+ * Studio, the MCP server, and `doctor`, none of which emit identifiers, and
+ * refusing there would break tools that work today. That question belongs to
+ * the code generator and is answered by `assertEmittableSchema` in generate.ts.
+ */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: detecting control characters is this pattern's purpose
+const UNSAFE_CATALOG_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+
+/**
+ * Refuse one catalog identifier carrying a character from
+ * {@link UNSAFE_CATALOG_CHARS}. `subject` names the object in the error.
+ */
+export function assertSafeCatalogIdentifier(name: string, subject: string): void {
+  const match = UNSAFE_CATALOG_CHARS.exec(name);
+  if (match === null) return;
+  const code = match[0].charCodeAt(0).toString(16).padStart(4, '0');
+  throw new ValidationError(
+    `[turbine] Refusing to introspect ${subject}: its name contains the control character U+${code.toUpperCase()} ` +
+      `at position ${match.index}. Such a name cannot be safely emitted into generated code, SQL comments, or ` +
+      `tooling output. Rename the database object, or exclude it from introspection.`,
+  );
+}
+
+/**
+ * Walk a freshly introspected {@link SchemaMetadata} and refuse any catalog
+ * identifier that carries a control character (see
+ * {@link assertSafeCatalogIdentifier}).
+ *
+ * Covers every string that is a NAME: tables, columns (catalog name and derived
+ * field), relations (key, name, endpoints, keys, junction), enum types and their
+ * labels, index names and their columns, and check-constraint names. It does
+ * NOT cover free-text SQL, index definitions, check expressions, and column
+ * defaults are emitted with `JSON.stringify` and are not identifiers.
+ */
+export function assertSafeCatalogSchema(schema: SchemaMetadata): void {
+  for (const [enumName, labels] of Object.entries(schema.enums)) {
+    assertSafeCatalogIdentifier(enumName, `enum type "${enumName}"`);
+    for (const label of labels) {
+      assertSafeCatalogIdentifier(label, `a label of enum type "${enumName}"`);
+    }
+  }
+  for (const [tableKey, table] of Object.entries(schema.tables)) {
+    assertSafeCatalogIdentifier(tableKey, `table "${tableKey}"`);
+    assertSafeCatalogIdentifier(table.name, `table "${tableKey}"`);
+    const where = `table "${table.name}"`;
+    for (const col of table.columns) {
+      assertSafeCatalogIdentifier(col.name, `column "${col.name}" on ${where}`);
+      assertSafeCatalogIdentifier(col.field, `the field name derived for a column on ${where}`);
+    }
+    for (const [relKey, rel] of Object.entries(table.relations)) {
+      const relWhere = `relation "${relKey}" on ${where}`;
+      assertSafeCatalogIdentifier(relKey, relWhere);
+      assertSafeCatalogIdentifier(rel.name, relWhere);
+      assertSafeCatalogIdentifier(rel.from, `the source table of ${relWhere}`);
+      assertSafeCatalogIdentifier(rel.to, `the target table of ${relWhere}`);
+      for (const k of [rel.foreignKey, rel.referenceKey].flat()) {
+        assertSafeCatalogIdentifier(k, `a key column of ${relWhere}`);
+      }
+      if (rel.through) {
+        assertSafeCatalogIdentifier(rel.through.table, `the junction table of ${relWhere}`);
+        for (const k of [rel.through.sourceKey, rel.through.targetKey].flat()) {
+          assertSafeCatalogIdentifier(k, `a junction key column of ${relWhere}`);
+        }
+      }
+    }
+    for (const idx of table.indexes) {
+      assertSafeCatalogIdentifier(idx.name, `index "${idx.name}" on ${where}`);
+      for (const c of idx.columns) {
+        assertSafeCatalogIdentifier(c, `a column of index "${idx.name}" on ${where}`);
+      }
+    }
+    for (const chk of table.checks ?? []) {
+      assertSafeCatalogIdentifier(chk.name, `check constraint "${chk.name}" on ${where}`);
+    }
+  }
+}
+
 /**
  * Introspect a database into {@link SchemaMetadata}, routing through the active
  * dialect's {@link Dialect.introspector} so each engine can override the catalog
@@ -408,7 +506,11 @@ export async function introspect(options: IntrospectOptions): Promise<SchemaMeta
     : // Dialects without an introspector fall back to the Postgres catalog reader.
       await introspectPostgresCatalog(options);
   // Applied here rather than inside each introspector so every engine gets it.
-  return options.relationNames ? applyRelationRenames(schema, options.relationNames) : schema;
+  const renamed = options.relationNames ? applyRelationRenames(schema, options.relationNames) : schema;
+  // Same reason: one boundary for every engine, and AFTER the renames so a
+  // caller-supplied relation name is checked too.
+  assertSafeCatalogSchema(renamed);
+  return renamed;
 }
 
 /**
