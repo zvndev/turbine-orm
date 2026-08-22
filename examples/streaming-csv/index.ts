@@ -16,14 +16,12 @@
  */
 
 import { createWriteStream } from 'node:fs';
-import { TurbineClient } from 'turbine-orm';
-import { SCHEMA } from './generated/turbine/metadata.js';
+// The GENERATED factory: the base `TurbineClient` types no table accessors,
+// so `db.orders` would be a TypeScript error on it.
+import { turbine } from './generated/turbine/index.js';
 
 async function main() {
-  const db = new TurbineClient(
-    { connectionString: process.env.DATABASE_URL, max: 4 },
-    SCHEMA,
-  );
+  const db = turbine({ connectionString: process.env.DATABASE_URL, max: 4 });
 
   const outPath = process.env.OUT ?? 'orders.csv';
   const out = createWriteStream(outPath);
@@ -58,7 +56,7 @@ async function main() {
   })) {
     const first = order.lineItems[0]?.productName ?? '';
     out.write(
-      `${order.id},${csvEscape(order.customer.email)},${order.status},` +
+      `${order.id},${csvEscape(order.customer?.email ?? '')},${order.status},` +
         `${order.totalCents},${order.lineItems.length},${csvEscape(first)}\n`,
     );
     count++;

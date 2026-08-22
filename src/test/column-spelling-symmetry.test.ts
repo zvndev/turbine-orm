@@ -552,7 +552,17 @@ const POWQL_SURFACES: PowqlSurface[] = [
   { name: 'select', run: (qi, n) => qi.findMany({ select: { [n]: true } } as never) },
   { name: 'omit', run: (qi, n) => qi.findMany({ omit: { [n]: true } } as never) },
   { name: 'orderBy', run: (qi, n) => qi.findMany({ orderBy: { [n]: 'asc' } } as never) },
-  { name: 'distinct', run: (qi, n) => qi.findMany({ distinct: [n] } as never) },
+  // `distinct` is NOT a PowQL column-name surface and no longer belongs in this
+  // list. It is `DISTINCT ON`, PostgreSQL-only, and PowDB now refuses it with
+  // E017 the way sqlite / mysql / mssql already did, BEFORE any name is read,
+  // so neither half of the pair below can hold: no statement is emitted to
+  // compare, and an unknown name is E017 rather than E003. Measured on all four
+  // dialects, `distinct: ['creatd_at']` -> E017 on every engine that lacks the
+  // feature and E003 only on Postgres, where the feature exists; making PowDB
+  // resolve the name first would have left it the one engine answering E003.
+  // It stays in the SQL block above, where `q()` is a Postgres interface and
+  // both properties are real. The refusal itself is covered by
+  // src/test/powdb-dialect-contract.test.ts.
   { name: 'count where', run: (qi, n) => qi.count({ where: { [n]: null } } as never) },
   { name: 'groupBy by', run: (qi, n) => qi.groupBy({ by: [n] } as never) },
   { name: 'groupBy orderBy', run: (qi, n) => qi.groupBy({ by: [n], orderBy: { [n]: 'asc' } } as never) },

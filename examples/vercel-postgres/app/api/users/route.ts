@@ -13,12 +13,15 @@ import { turbineHttp } from 'turbine-orm/serverless';
 // typical Next.js app-router layout, adjust to wherever your generated/
 // directory lives. (No `@/` alias is used so this file copy-pastes cleanly
 // without a tsconfig.json `paths` entry.)
-import { SCHEMA } from '../../../generated/turbine/metadata';
+import type { TurbineClient } from '../../../generated/turbine/index.js';
+import { SCHEMA } from '../../../generated/turbine/metadata.js';
 
 export const runtime = 'edge';
 
 const pool = createPool({ connectionString: process.env.POSTGRES_URL });
-const db = turbineHttp(pool, SCHEMA);
+// Naming the generated client type is what types the accessors: without it
+// `turbineHttp` returns the base client and `db.users` does not compile.
+const db = turbineHttp<TurbineClient>(pool, SCHEMA);
 
 export async function GET() {
   const users = await db.users.findMany({ limit: 10 });

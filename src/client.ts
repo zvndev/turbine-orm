@@ -11,7 +11,7 @@
  * @example
  * ```ts
  * // With generated client (recommended):
- * import { turbine } from './generated/turbine';
+ * import { turbine } from './generated/turbine/index.js';
  * const db = turbine({ connectionString: process.env.DATABASE_URL });
  * const user = await db.users.findUnique({ where: { id: 1 } });
  *
@@ -525,6 +525,18 @@ export interface TurbineConfig {
    * drivers may not support named statements).
    *
    * Override with `TURBINE_DISABLE_PREPARED=1` env var.
+   *
+   * **A named statement is never deallocated**, so each pooled connection
+   * retains every distinct SQL text it has parsed. That is safe while the set of
+   * texts is fixed by your code, and it stops being fixed when a request decides
+   * the shape. Turbine sends a `where`/`having` carrying a caller-written
+   * `AND`/`OR` ARRAY unnamed for exactly this reason (see `markVariableArity`).
+   * The case it CANNOT detect is a caller-chosen `select` / `omit` / `with`
+   * subset: those change the projection and therefore the text, and nothing in
+   * the shape distinguishes a hand-written projection from one built out of
+   * `req.query.fields`. If you build projections from user input, map them
+   * through a fixed allowlist or set this to `false`. Documented for readers at
+   * https://turbineorm.dev/queries#client-escape-hatches
    */
   preparedStatements?: boolean;
   /**

@@ -5,14 +5,14 @@
   "type": "module",
   "scripts": {
     "start": "tsx index.ts",
-    "db:push": "npx turbine push --schema ./schema.ts",
+    "db:push": "npx turbine push",
     "db:seed": "npx tsx seed.ts",
     "db:generate": "npx turbine generate",
     "setup": "npm run db:push && npm run db:seed && npm run db:generate"
   },
   "dependencies": {
     "pg": "^8.13.1",
-    "turbine-orm": "^0.7.1"
+    "turbine-orm": "file:../../"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

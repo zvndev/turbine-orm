@@ -25,7 +25,7 @@ The footprint follows from the same decision: the main entry's import graph is h
 
 ## Fast enough to publish the control arm
 
-The [benchmark suite](/benchmarks) runs Turbine against Prisma, Drizzle, and a hand-written `pg` control on the same schema, data, and pool. In the last published run Turbine ran at **1.08x the raw `pg` control** by geometric mean, where Drizzle ran at 1.47x and Prisma at 1.81x. Turbine took nine of ten scenarios; Drizzle took one, streaming, outright.
+The [benchmark suite](/benchmarks) runs Turbine against Prisma, Drizzle, and a hand-written `pg` control on the same schema, data, and pool. In the last published run Turbine ran at **1.08x the raw `pg` control** by geometric mean, where Drizzle ran at 1.47x and Prisma at 1.81x. Turbine took nine of ten scenarios; the tenth, streaming, was Drizzle's in that run and has reversed in both re-measurements since.
 
 The losses are on the page next to the wins, with the measurement noise floor, because a benchmark you cannot audit is an advertisement.
 
@@ -47,13 +47,13 @@ The checkable version of the claim, as of July 2026: no TypeScript ORM CLI offer
 
 **PII enforced in the emitted SQL.** Tag a column [`pii: true`](/schema#pii-fields) and it is excluded from every default projection in the statement itself: `RETURNING "id", "name"` rather than `RETURNING *`, so the value never leaves the database. It is also refused as a `groupBy` key and a `_min` / `_max` target. Unlocking it takes [`includePii: UNSAFE`](/global-filters#privilege-options-and-the-unsafe-symbol), a symbol, so an options object built from a request body cannot escalate. A schema with no tagged column emits byte-identical SQL. Relatedly, errors carry keys and never values: a `NotFoundError` says `where: { id, email }` without printing the email.
 
-**A read-only Studio.** `npx turbine studio` binds loopback, authenticates with a per-process token, runs every read inside `BEGIN READ ONLY`, and has no raw-SQL surface. Without `--write` the write endpoints do not exist in the router, so there is nothing to bypass. As of July 2026, no other TypeScript ORM ships a studio that is read-only by default or that redacts PII: Prisma Studio has no read-only mode (the request has been open since February 2021), Drizzle Studio is closed source with self-hosting through the paid Drizzle Gateway, and TypeORM, MikroORM, Kysely and Sequelize ship no studio.
+**A read-only Studio.** `npx turbine studio` binds loopback, authenticates with a per-process token, runs every read inside `BEGIN READ ONLY`, and has no raw-SQL surface. Without `--write` the write endpoints do not exist in the router, so there is nothing to bypass. As of July 2026, no other TypeScript ORM ships a studio that is read-only by default or that redacts PII: Prisma Studio has no read-only mode (the request has been open since February 2021), Drizzle Studio is closed source with self-hosting through Drizzle Gateway, and TypeORM, MikroORM, Kysely and Sequelize ship no studio.
 
 **Destructive migrations need consent.** `migrate up`, `migrate down` and `push` scan for data-destroying statements, print an itemized report, and refuse. Interactively you type `destroy my data`, then `yes`; in CI you pass `--allow-destructive`. A refused batch applies nothing.
 
 ## Free, and forkable
 
-MIT, no cloud tier, no paid gateway, no telemetry: Studio, doctor, the MCP server, and observability are all in the npm package. Compare Drizzle Studio's paid Gateway for self-hosting and Prisma's index advice moving to a cloud subscription.
+MIT, no cloud tier, no telemetry, no account: Studio, doctor, the MCP server, and observability are all in the npm package. Compare Prisma's index advice moving to a cloud subscription.
 
 And it is built to be extended rather than wrapped. All SQL generation routes through the documented [`Dialect` contract](/dialects); the SQLite, MySQL, and SQL Server engines are implementations of that seam, not forks of the core. An engine Turbine does not ship starts there.
 
@@ -63,7 +63,7 @@ Stated so you do not find out three weeks in:
 
 - **Postgres is the primary target.** SQLite, MySQL and SQL Server are real, tested [engines](/engines), but pgvector, LISTEN/NOTIFY, and RLS `sessionContext` are Postgres-only and throw a typed [`UnsupportedFeatureError`](/errors) rather than degrading silently. The `turbine generate` / `turbine migrate` CLI is Postgres-only.
 - **Only Postgres streams with a true cursor.** The other engines' `findManyStream` materializes the result and then yields it in batches. Same rows, same API, not constant memory.
-- **Drizzle wins the streaming benchmark.** By 22% in the last run. Turbine's cursor buys arbitrary `orderBy`, early break, and nested `with` per batch, and on a full-table drain that costs. `findManyStreamBatches` narrows it to 16% and does not close it.
+- **Streaming is the closest scenario, and the per-row API still loses it.** Turbine's cursor buys arbitrary `orderBy`, early break, and nested `with` per batch, and on a full-table drain of a monotonic key that costs: `findManyStream` runs 5-11% behind Drizzle 1.0.0-rc.4. `findManyStreamBatches` gives up the per-row API to match the competitors' unit of work and draws level with rc.4 (inside the noise floor, both directions across three runs), passing Drizzle 0.45.2 by 20%. If a full-table drain on an ascending unique key is your hot path, measure it yourself.
 - **It is younger.** Fewer Stack Overflow answers, a smaller community. The mitigation is that the [migration paths](/migrate-from-prisma) are real and reversible, not that the gap does not exist.
 - **The schema is code-first or introspected.** There is no `.prisma` DSL, which is a feature for some teams and a cost for others.
 

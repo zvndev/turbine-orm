@@ -41,6 +41,7 @@ import type {
 } from './types.js';
 import { assertDirectionToken, assertOrderDirection } from './types.js';
 import {
+  availableClause,
   canonicalColumnOrder,
   ownLookup,
   relationInProjectionMessage,
@@ -251,6 +252,48 @@ export function resolveColumns(
 }
 
 /**
+ * The one place `with: { posts: true }` becomes an options object.
+ *
+ * `true` is not a third kind of relation spec, it is shorthand for "include
+ * this relation with no options", i.e. `{}`. Every walker over a `with` tree
+ * needs the same reading of it, and there are SIX of them: the build path
+ * ({@link buildRelationSubquery} / {@link buildManyToManySubquery}), the
+ * param-collect mirror ({@link collectRelationSubqueryParams}), the cache
+ * fingerprint ({@link withFingerprint}), the decode shape
+ * ({@link buildRelationShape}), the projection resolver
+ * ({@link resolveTargetColumns}) and the flatten planner.
+ *
+ * Each of them USED TO spell the shorthand out for itself, with a
+ * `spec !== true && spec.x` guard per option on the build side and a single
+ * `if (spec === true) return` early exit on the collect side. Those two
+ * readings are not the same, and the difference was a live bug: since global
+ * filters reached relation subqueries the build path has emitted the target's
+ * filter UNCONDITIONALLY (a `with` must never surface rows the filter hides),
+ * while the collect path's early exit returned before pushing its params. A
+ * value-bearing filter on a relation target therefore compiled a `$N` that no
+ * value backed, and `with: { posts: true }` failed at bind time with
+ * "bind message supplies N parameters, but prepared statement requires N+1"
+ * while the identical query written `with: { posts: {} }` worked.
+ *
+ * Returning ONE frozen empty options object removes the branch instead of
+ * duplicating it: below this call there is no `true` case left to keep in
+ * sync, so a future option added to one walker cannot be forgotten by the
+ * shorthand in another. Frozen and shared because it is read-only by
+ * construction (every consumer only reads `select`/`omit`/`where`/`orderBy`/
+ * `limit`/`with`), so one instance serves every call and allocates nothing on
+ * the hot path.
+ */
+const EMPTY_WITH_OPTIONS: WithOptions = Object.freeze({});
+
+/**
+ * Read a relation spec as options. See {@link EMPTY_WITH_OPTIONS} for why this
+ * is a shared authority rather than a guard repeated per walker.
+ */
+export function relationOptions(spec: true | WithOptions): WithOptions {
+  return spec === true ? EMPTY_WITH_OPTIONS : spec;
+}
+
+/**
  * Produce a fingerprint for a `with` clause tree. Recursion mirrors
  * buildSelectWithRelations / buildRelationSubquery.
  *
@@ -288,12 +331,7 @@ export function withFingerprint(qi: BuilderCtx, withClause: WithClause | undefin
       continue;
     }
 
-    if (spec === true) {
-      parts.push(relName);
-      continue;
-    }
-
-    const opts = spec as WithOptions;
+    const opts = relationOptions(spec);
     const subParts: string[] = [];
 
     // select/omit shape
@@ -394,7 +432,10 @@ export function collectRelationSubqueryParams(
   _parentRef: string,
   depth = 0,
 ): void {
-  if (spec === true) return; // No params for default include
+  // `true` IS `{}` (see {@link relationOptions}). This used to be an early
+  // `return`, which skipped the target's global-filter params the build path
+  // always pushes.
+  const opts = relationOptions(spec);
   const targetTable = relDef.to;
   const targetMeta = qi.schema.tables[targetTable];
   if (!targetMeta) return;
@@ -410,19 +451,19 @@ export function collectRelationSubqueryParams(
   //   orderBy params → where params → limit param → nested-with params
   //   (always, both paths).
   if (relDef.type === 'manyToMany') {
-    const m2mOrderEntries = spec.orderBy ? orderByEntries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
+    const m2mOrderEntries = opts.orderBy ? orderByEntries(opts.orderBy).filter(([, dir]) => dir !== undefined) : [];
     if (nativeOrderPath && m2mOrderEntries.length > 0) {
       collectRelationOrderParams(qi, targetTable, targetMeta, m2mOrderEntries, params);
     }
-    if (spec.where) {
-      whereMod.collectAliasWhereParams(qi, targetTable, targetMeta, spec.where as Record<string, unknown>, params);
+    if (opts.where) {
+      whereMod.collectAliasWhereParams(qi, targetTable, targetMeta, opts.where as Record<string, unknown>, params);
     }
     whereMod.collectTargetGlobalFilterAlias(qi, targetTable, params);
-    if (spec.limit !== undefined && !qi.dialect.inlineLimitOffset) {
-      params.push(qi.paginationValue(spec.limit, 'relation limit'));
+    if (opts.limit !== undefined && !qi.dialect.inlineLimitOffset) {
+      params.push(qi.paginationValue(opts.limit, 'relation limit'));
     }
-    if (spec.with) {
-      for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
+    if (opts.with) {
+      for (const [nestedRelName, nestedSpec] of sortedEntries(opts.with)) {
         const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
         if (!nestedRelDef) continue;
         collectRelationSubqueryParams(qi, nestedRelDef, nestedSpec, params, 'alias', depth + 1);
@@ -432,13 +473,13 @@ export function collectRelationSubqueryParams(
   }
 
   // Mirrors buildRelationSubquery's willWrap: `orderBy: {}` is treated as absent.
-  const relOrderEntries = spec.orderBy ? orderByEntries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
+  const relOrderEntries = opts.orderBy ? orderByEntries(opts.orderBy).filter(([, dir]) => dir !== undefined) : [];
   const hasOrder = relOrderEntries.length > 0;
-  const willWrap = relDef.type === 'hasMany' && (spec.limit !== undefined || hasOrder);
+  const willWrap = relDef.type === 'hasMany' && (opts.limit !== undefined || hasOrder);
 
   // Non-wrapped path: nested relations BEFORE where/limit
-  if (!willWrap && spec.with) {
-    for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
+  if (!willWrap && opts.with) {
+    for (const [nestedRelName, nestedSpec] of sortedEntries(opts.with)) {
       const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
       if (!nestedRelDef) continue;
       collectRelationSubqueryParams(qi, nestedRelDef, nestedSpec, params, 'alias', depth + 1);
@@ -453,8 +494,8 @@ export function collectRelationSubqueryParams(
   }
 
   // where params, mirrors buildAliasWhere push order
-  if (spec.where) {
-    whereMod.collectAliasWhereParams(qi, targetTable, targetMeta, spec.where as Record<string, unknown>, params);
+  if (opts.where) {
+    whereMod.collectAliasWhereParams(qi, targetTable, targetMeta, opts.where as Record<string, unknown>, params);
   }
 
   // Global filter on the target, mirrors targetGlobalFilterAlias in
@@ -465,13 +506,13 @@ export function collectRelationSubqueryParams(
   // buildRelationSubquery). belongsTo/hasOne ignore limit (always LIMIT 1), so
   // pushing one here would orphan a param and desync the collect path.
   // `limit: 0` pushes (LIMIT 0 is honored), so check !== undefined.
-  if (relDef.type === 'hasMany' && spec.limit !== undefined && !qi.dialect.inlineLimitOffset) {
-    params.push(qi.paginationValue(spec.limit, 'relation limit'));
+  if (relDef.type === 'hasMany' && opts.limit !== undefined && !qi.dialect.inlineLimitOffset) {
+    params.push(qi.paginationValue(opts.limit, 'relation limit'));
   }
 
   // Wrapped path: nested relations AFTER where/limit (inside inner subquery)
-  if (willWrap && spec.with) {
-    for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
+  if (willWrap && opts.with) {
+    for (const [nestedRelName, nestedSpec] of sortedEntries(opts.with)) {
       const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
       if (!nestedRelDef) continue;
       collectRelationSubqueryParams(qi, nestedRelDef, nestedSpec, params, 'innerAlias', depth + 1);
@@ -916,14 +957,13 @@ export function buildRelationOrderBy(
     // landing here on such a table is an orderBy VALUE of the wrong shape on a
     // scalar column, which deserves to be named rather than reported as a
     // missing relation.
-    const known = Object.keys(ownerMeta.relations);
     const isColumn = resolveColumnName(ownerMeta, relName) !== undefined;
     throw new RelationError(
       isColumn
         ? `[turbine] orderBy on "${ownerTable}.${relName}" got a relation-shaped value, but "${relName}" is a ` +
             `column. Order a column with 'asc' / 'desc' (or { sort, nulls }); the object form is for relations.`
         : `[turbine] Unknown relation "${relName}" in orderBy on table "${ownerTable}". ` +
-            (known.length > 0 ? `Available: ${known.join(', ')}` : `"${ownerTable}" has no relations.`),
+            availableClause(Object.keys(ownerMeta.relations), `"${ownerTable}" has no relations.`),
     );
   }
 
@@ -1638,8 +1678,9 @@ export function resolveTargetColumns(
   includePii?: boolean,
   targetTable: string = targetMeta.name,
 ): string[] {
-  const select = spec === true ? undefined : (spec.select as Record<string, boolean> | undefined);
-  const omit = spec === true ? undefined : (spec.omit as Record<string, boolean> | undefined);
+  const opts = relationOptions(spec);
+  const select = opts.select as Record<string, boolean> | undefined;
+  const omit = opts.omit as Record<string, boolean> | undefined;
   return resolveProjection(qi, targetTable, targetMeta, select, omit, includePii) ?? targetMeta.allColumns;
 }
 
@@ -1816,8 +1857,9 @@ export function buildRelationShape(
   const targetColumns = resolveTargetColumns(qi, spec, targetMeta, includePii, relDef.to);
   const keys = targetColumns.map((col) => targetMeta.reverseColumnMap[col] ?? snakeToCamel(col));
   const nested: Record<string, RelationShape> = {};
-  if (spec !== true && spec.with) {
-    for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
+  const nestedWith = relationOptions(spec).with;
+  if (nestedWith) {
+    for (const [nestedRelName, nestedSpec] of sortedEntries(nestedWith)) {
       const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
       if (!nestedRelDef) continue;
       keys.push(nestedRelName);
@@ -2153,15 +2195,13 @@ function planFlattenNode(
     );
   }
 
-  const opts = spec === true ? undefined : spec;
-  if (opts) {
-    if (opts.limit !== undefined) return decline('it declares a `limit`');
-    if (opts.orderBy && orderByEntries(opts.orderBy).some(([, dir]) => dir !== undefined)) {
-      return decline('it declares an `orderBy`');
-    }
+  const opts = relationOptions(spec);
+  if (opts.limit !== undefined) return decline('it declares a `limit`');
+  if (opts.orderBy && orderByEntries(opts.orderBy).some(([, dir]) => dir !== undefined)) {
+    return decline('it declares an `orderBy`');
   }
 
-  const nestedEntries = opts?.with ? sortedEntries(opts.with as WithClause) : [];
+  const nestedEntries = opts.with ? sortedEntries(opts.with as WithClause) : [];
   for (const [nestedRelName] of nestedEntries) {
     if (nestedRelName === '_count') return decline('its nested `with` uses `_count`');
     if (!ownLookup(targetMeta.relations, nestedRelName)) {
@@ -2415,13 +2455,14 @@ function emitFlattenInner(
   // than dropping the parent row, matching what the correlated subquery's
   // `LIMIT 1` did when it returned NULL.
   const filters = innerWhere;
-  if (node.spec !== true && node.spec.where) {
+  const nodeWhere = relationOptions(node.spec).where;
+  if (nodeWhere) {
     const extra = whereMod.buildAliasWhere(
       qi,
       targetTable,
       targetMeta,
       srcAlias,
-      node.spec.where as Record<string, unknown>,
+      nodeWhere as Record<string, unknown>,
       params,
     );
     if (extra) filters.push(extra);
@@ -2498,12 +2539,13 @@ function projectFlattenNode(qi: BuilderCtx, node: FlattenNode, outerAlias: strin
 
 /** Param-collect mirror of {@link emitFlattenNode}. */
 export function collectFlattenNodeParams(qi: BuilderCtx, node: FlattenNode, params: unknown[]): void {
-  if (node.spec !== true && node.spec.where) {
+  const nodeWhere = relationOptions(node.spec).where;
+  if (nodeWhere) {
     whereMod.collectAliasWhereParams(
       qi,
       node.targetTable,
       node.targetMeta,
-      node.spec.where as Record<string, unknown>,
+      nodeWhere as Record<string, unknown>,
       params,
     );
   }
@@ -2678,7 +2720,7 @@ export function buildSelectWithRelations(
     if (!relDef) {
       throw new RelationError(
         `[turbine] Unknown relation "${relName}" on table "${table}". ` +
-          `Available: ${Object.keys(meta.relations).join(', ')}`,
+          availableClause(Object.keys(meta.relations), `"${table}" has no relations.`),
       );
     }
 
@@ -2830,6 +2872,12 @@ export function buildRelationSubquery(
   const targetMeta = qi.schema.tables[targetTable];
   if (!targetMeta) throw new RelationError(`[turbine] Unknown relation target "${targetTable}"`);
 
+  // `true` IS `{}`; below this line there is no `true` case, which is what
+  // keeps this walk and collectRelationSubqueryParams reading one shape.
+  // The raw `spec` is still what crosses the dialect seam below, since
+  // RelationSubqueryContext is a published contract.
+  const opts = relationOptions(spec);
+
   // Dev-only: correlated relation loading probes the child table once per parent
   // row, so a missing FK index multiplies into per-parent full-table scans (a
   // batched-loader ORM pays the same missing index only once, which is why
@@ -2883,17 +2931,40 @@ export function buildRelationSubquery(
       depth: currentDepth,
       path: currentPath,
       quote: (name) => qi.q(name),
-      buildWhere: (whereAlias) =>
-        (spec !== true && spec.where
-          ? whereMod.buildAliasWhere(
-              qi,
-              targetTable,
-              targetMeta,
-              whereAlias,
-              spec.where as Record<string, unknown>,
-              params,
-            )
-          : '') ?? '',
+      // The relation target's WHERE, which is the caller's `spec.where` AND the
+      // target table's GLOBAL FILTER. Both, not just the first.
+      //
+      // A dialect that overrides buildRelationSubquery takes over the whole
+      // subquery, so the generic builder returns at this seam BEFORE it would
+      // have applied targetGlobalFilterAlias itself. The override cannot apply
+      // the filter on its own: RelationSubqueryContext deliberately hands it no
+      // BuilderCtx, so `targetGlobalFilterAlias` is not reachable from a dialect
+      // file. That left SQL Server's `FOR JSON PATH` path emitting a correlation
+      // predicate and nothing else, so a `with` returned rows a tenancy or
+      // soft-delete filter is supposed to hide, while the collect mirror still
+      // pushed the filter's params. Wrong rows AND an orphan param, on every
+      // spec shape.
+      //
+      // Folding it in here rather than at each override keeps ONE authority for
+      // "what does this relation's WHERE contain", and lands the params exactly
+      // where collectRelationSubqueryParams already expects them: after
+      // spec.where, before the limit.
+      buildWhere: (whereAlias) => {
+        const userWhere =
+          (opts.where
+            ? whereMod.buildAliasWhere(
+                qi,
+                targetTable,
+                targetMeta,
+                whereAlias,
+                opts.where as Record<string, unknown>,
+                params,
+              )
+            : '') ?? '';
+        const gf = whereMod.targetGlobalFilterAlias(qi, targetTable, whereAlias, params);
+        if (userWhere && gf) return `${userWhere} AND ${gf}`;
+        return userWhere || gf || '';
+      },
       recurse: (nRelDef, nSpec, nParent, nDepth, nPath) =>
         buildRelationSubquery(qi, nRelDef, nSpec, params, nParent, aliasCounter, nDepth, nPath, includePii),
     });
@@ -2908,10 +2979,8 @@ export function buildRelationSubquery(
   // An orderBy with no defined entries (`orderBy: {}`) is treated as absent -
   // it must neither trigger the wrap (dropping nested relations) nor render a
   // dangling `ORDER BY `. `limit: 0` is meaningful (LIMIT 0) and DOES wrap.
-  const relOrderEntries =
-    spec !== true && spec.orderBy ? orderByEntries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
-  const willWrap =
-    relDef.type === 'hasMany' && spec !== true && (spec.limit !== undefined || relOrderEntries.length > 0);
+  const relOrderEntries = opts.orderBy ? orderByEntries(opts.orderBy).filter(([, dir]) => dir !== undefined) : [];
+  const willWrap = relDef.type === 'hasMany' && (opts.limit !== undefined || relOrderEntries.length > 0);
 
   // manyToMany takes a dedicated JOIN-through-junction path. Nested relations,
   // where, orderBy, and select/omit are handled there (the target alias is the
@@ -2934,13 +3003,13 @@ export function buildRelationSubquery(
   }
 
   // Nested relations, only in the non-wrapped path (wrapped path builds them separately)
-  if (!willWrap && spec !== true && spec.with) {
-    for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
+  if (!willWrap && opts.with) {
+    for (const [nestedRelName, nestedSpec] of sortedEntries(opts.with)) {
       const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
       if (!nestedRelDef) {
         throw new RelationError(
           `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
-            `Available: ${Object.keys(targetMeta.relations).join(', ')}`,
+            availableClause(Object.keys(targetMeta.relations), `"${relDef.to}" has no relations.`),
         );
       }
       // Recursively build nested subquery, passing THIS alias as the parent reference
@@ -2992,13 +3061,13 @@ export function buildRelationSubquery(
 
   // Additional filters, full scalar where surface (equality, null, operator
   // objects, OR/AND/NOT), properly parameterized against this alias.
-  if (spec !== true && spec.where) {
+  if (opts.where) {
     const extra = whereMod.buildAliasWhere(
       qi,
       targetTable,
       targetMeta,
       alias,
-      spec.where as Record<string, unknown>,
+      opts.where as Record<string, unknown>,
       params,
     );
     if (extra) whereClause += ` AND ${extra}`;
@@ -3017,8 +3086,8 @@ export function buildRelationSubquery(
   // (and shifts every later placeholder by one). To-one relations ignore limit.
   // `limit: 0` is honored (LIMIT 0 → empty array), so check !== undefined.
   let limitClause = '';
-  if (relDef.type === 'hasMany' && spec !== true && spec.limit !== undefined) {
-    limitClause = ` LIMIT ${qi.paginationRef(spec.limit, params, 'relation limit')}`;
+  if (relDef.type === 'hasMany' && opts.limit !== undefined) {
+    limitClause = ` LIMIT ${qi.paginationRef(opts.limit, params, 'relation limit')}`;
   }
 
   if (relDef.type === 'hasMany') {
@@ -3032,13 +3101,13 @@ export function buildRelationSubquery(
       // For the json_build_object, reference the inner alias, only include resolved columns
       const innerJsonPairs: [key: string, expr: string][] = jsonScalarPairs(qi, targetMeta, targetColumns, innerAlias);
       // Build nested relation subqueries referencing innerAlias
-      if (spec !== true && spec.with) {
-        for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
+      if (opts.with) {
+        for (const [nestedRelName, nestedSpec] of sortedEntries(opts.with)) {
           const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
           if (!nestedRelDef) {
             throw new RelationError(
               `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
-                `Available: ${Object.keys(targetMeta.relations).join(', ')}`,
+                availableClause(Object.keys(targetMeta.relations), `"${relDef.to}" has no relations.`),
             );
           }
           const nestedSub = buildRelationSubquery(
@@ -3113,6 +3182,10 @@ export function buildManyToManySubquery(
     );
   }
 
+  // `true` IS `{}`; see {@link relationOptions}. Same reading as
+  // buildRelationSubquery and collectRelationSubqueryParams' m2m branch.
+  const opts = relationOptions(spec);
+
   const targetTable = relDef.to;
   const qTarget = qi.q(targetTable);
   const qJunction = qi.q(relDef.through.table);
@@ -3157,8 +3230,7 @@ export function buildManyToManySubquery(
   // `orderBy: {}` (no defined entries) is treated as absent: it must not
   // render a dangling `ORDER BY `. Param pushes here land BEFORE the
   // spec.where params, mirrored by collectRelationSubqueryParams' m2m branch.
-  const relOrderEntries =
-    spec !== true && spec.orderBy ? orderByEntries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
+  const relOrderEntries = opts.orderBy ? orderByEntries(opts.orderBy).filter(([, dir]) => dir !== undefined) : [];
   let orderClause = '';
   if (relOrderEntries.length > 0) {
     orderClause = buildRelationOrderClause(qi, targetTable, targetMeta, talias, relOrderEntries, params);
@@ -3166,13 +3238,13 @@ export function buildManyToManySubquery(
 
   // Additional WHERE filters on the target, full scalar where surface,
   // properly parameterized against the target alias.
-  if (spec !== true && spec.where) {
+  if (opts.where) {
     const extra = whereMod.buildAliasWhere(
       qi,
       targetTable,
       targetMeta,
       talias,
-      spec.where as Record<string, unknown>,
+      opts.where as Record<string, unknown>,
       params,
     );
     if (extra) whereClause += ` AND ${extra}`;
@@ -3185,8 +3257,8 @@ export function buildManyToManySubquery(
 
   // LIMIT, `limit: 0` is honored (LIMIT 0 → empty array)
   let limitClause = '';
-  if (spec !== true && spec.limit !== undefined) {
-    limitClause = ` LIMIT ${qi.paginationRef(spec.limit, params, 'relation limit')}`;
+  if (opts.limit !== undefined) {
+    limitClause = ` LIMIT ${qi.paginationRef(opts.limit, params, 'relation limit')}`;
   }
 
   const fromJoin = `FROM ${qTarget} ${talias} JOIN ${qJunction} ${jalias} ON ${joinOn}`;
@@ -3200,13 +3272,13 @@ export function buildManyToManySubquery(
       `${fromJoin} WHERE ${whereClause}${orderClause}${limitClause}`;
     const innerJsonPairs: [key: string, expr: string][] = jsonScalarPairs(qi, targetMeta, targetColumns, innerAlias);
     // Nested relations reference the inner alias.
-    if (spec !== true && spec.with) {
-      for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
+    if (opts.with) {
+      for (const [nestedRelName, nestedSpec] of sortedEntries(opts.with)) {
         const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
         if (!nestedRelDef) {
           throw new RelationError(
             `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
-              `Available: ${Object.keys(targetMeta.relations).join(', ')}`,
+              availableClause(Object.keys(targetMeta.relations), `"${relDef.to}" has no relations.`),
           );
         }
         const nestedSub = buildRelationSubquery(
@@ -3234,13 +3306,13 @@ export function buildManyToManySubquery(
   // Simple path: build the json object pairs directly off the target alias,
   // including any nested relations (correlated to the target alias).
   const jsonPairs: [key: string, expr: string][] = jsonScalarPairs(qi, targetMeta, targetColumns, talias);
-  if (spec !== true && spec.with) {
-    for (const [nestedRelName, nestedSpec] of sortedEntries(spec.with)) {
+  if (opts.with) {
+    for (const [nestedRelName, nestedSpec] of sortedEntries(opts.with)) {
       const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
       if (!nestedRelDef) {
         throw new RelationError(
           `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
-            `Available: ${Object.keys(targetMeta.relations).join(', ')}`,
+            availableClause(Object.keys(targetMeta.relations), `"${relDef.to}" has no relations.`),
         );
       }
       const nestedSub = buildRelationSubquery(

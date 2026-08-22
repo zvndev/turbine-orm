@@ -64,7 +64,7 @@ npx turbine generate              # introspect the DB, emit a typed client
 ```
 
 ```typescript
-import { turbine } from './generated/turbine';
+import { turbine } from './generated/turbine/index.js';
 
 const db = turbine({ connectionString: process.env.DATABASE_URL });
 
@@ -78,6 +78,8 @@ await db.disconnect();
 ```
 
 `generate` writes three files to `./generated/turbine/`: entity types, runtime schema metadata, and a typed client with a `turbine()` factory. The factory is generated (it is typed against your schema), so import it from your output directory, not from `'turbine-orm'`. ESM and CommonJS both work.
+
+The `/index.js` on that import is required under `moduleResolution: NodeNext` (a relative import needs an explicit extension, and there is no directory-index resolution). Under a bundler (`moduleResolution: bundler`, the Next.js and Vite default) `'./generated/turbine'` works too. `turbine generate` prints the spelling that matches your `tsconfig.json`.
 
 Full walkthrough, including the code-first `defineSchema` path for an empty database: [turbineorm.dev/quickstart](https://turbineorm.dev/quickstart).
 
@@ -267,12 +269,12 @@ Going deep on one database means the parts other ORMs push to raw SQL are typed 
 
 ## Serverless and edge
 
-The core is driver-agnostic: hand any pg-compatible pool to `turbineHttp()` and Turbine runs on Vercel Edge, Cloudflare Workers, Deno Deploy, or anywhere else without TCP. The main entry's import graph is held under **85 kB brotli** (edge entry under **68 kB**) with `pg` external, enforced by `size-limit` in CI; run `npm run size` for the current figure.
+The core is driver-agnostic: hand any pg-compatible pool to `turbineHttp()` and Turbine runs on Vercel Edge, Cloudflare Workers, Deno Deploy, or anywhere else without TCP. The main entry's import graph is held under **87 kB brotli** (edge entry under **69 kB**) with `pg` external, enforced by `size-limit` in CI at those exact numbers; run `npm run size` for the current figure.
 
 ```typescript
 import { Pool } from '@neondatabase/serverless';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { SCHEMA } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata.js';
 
 const db = turbineHttp(new Pool({ connectionString: process.env.DATABASE_URL }), SCHEMA);
 const users = await db.table('users').findMany({ with: { posts: true }, limit: 10 });
@@ -299,6 +301,45 @@ const db = turbineSqlite(':memory:', SCHEMA);
 const users = await db.users.findMany({ with: { posts: true }, limit: 10 });
 ```
 
+That snippet assumes a Postgres database somewhere, because `SCHEMA` comes from
+`turbine generate` and `generate` reads a live Postgres catalog. **If SQLite is
+your only database, describe the schema in code instead.** `defineSchema` is the
+same declaration `push` and `migrate` consume, and two pure functions turn it
+into the DDL and the runtime metadata, with no database involved:
+
+```typescript
+import { defineSchema, schemaDefToMetadata, schemaToSQL } from 'turbine-orm';
+import { sqliteDialect, turbineSqlite } from 'turbine-orm/sqlite';
+
+const schema = defineSchema({
+  users: {
+    id: { type: 'serial', primaryKey: true },
+    email: { type: 'text', notNull: true, unique: true },
+  },
+  posts: {
+    id: { type: 'serial', primaryKey: true },
+    // "table.column" — this is what makes `with: { posts: true }` work below.
+    userId: { type: 'integer', notNull: true, references: 'users.id' },
+    title: { type: 'text', notNull: true },
+  },
+});
+
+const db = turbineSqlite(':memory:', schemaDefToMetadata(schema));
+for (const stmt of schemaToSQL(schema, { dialect: sqliteDialect })) {
+  await db.raw([stmt] as never);
+}
+
+const users = await db
+  .table('users')
+  .findMany({ with: { posts: true }, orderBy: { id: 'asc' }, limit: 10 });
+```
+
+`schemaToSQL` emits SQLite DDL (including the foreign key and its index) and
+`schemaDefToMetadata` derives the `posts` / `users` relations from the same
+`references:`, so nested `with` works without a code-generation step. The
+accessors are `db.table('users')` rather than `db.users`: the typed property
+accessors are what `turbine generate` emits, and this path skips it.
+
 Single-statement nested `with` works on all four SQL engines (`json_agg`, `json_group_array`, `JSON_ARRAYAGG`, `FOR JSON PATH`). Postgres-only features (pgvector, LISTEN/NOTIFY, RLS `sessionContext`, true cursor streaming) throw a typed `UnsupportedFeatureError` (`TURBINE_E017`) elsewhere instead of degrading silently. The `turbine generate` / `migrate` CLI is Postgres-only. Full capability matrix and per-engine notes: [turbineorm.dev/engines](https://turbineorm.dev/engines).
 
 **Migrating from Prisma?** `turbine migrate-from-prisma` reads your `schema.prisma` and emits a typed mapping; `turbine-orm/prisma-compat` then wraps a TurbineClient in a `PrismaClient`-shaped surface, so `prisma.user.findMany({ include })` keeps working while you port. [Guide](https://turbineorm.dev/migrate-from-prisma). Coming from Drizzle: [the mapping](https://turbineorm.dev/migrate-from-drizzle).
@@ -315,11 +356,11 @@ It is also built to be extended rather than wrapped. All SQL generation routes t
 |---|---|---|---|---|
 | **Engine / runtime** | No engine binary (`pg` only) | Client + TS/WASM query compiler | No engine | No engine |
 | **Runtime deps** | 1 (`pg`) | `@prisma/client` + required driver adapter | 0 | 0 |
-| **Main bundle (brotli)** | under 85 kB import graph (CI-enforced), `pg` external | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small |
-| **Studio** | Read-only by default | Full CRUD, cloud-hosted | Free; hosted Gateway paid | None |
+| **Main bundle (brotli)** | under 87 kB import graph (CI-enforced), `pg` external | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small |
+| **Studio** | Read-only by default | Full CRUD, cloud-hosted | Full CRUD; [Gateway](https://gateway.drizzle.team/) self-hosted, free | None |
 | **Error PII safety** | Keys only by default | Values in messages | Raw pg errors | Raw pg errors |
 | **Migrations** | SQL-first, SHA-256 checksums | DSL-generated, shadow DB | SQL or Drizzle Kit | None |
-| **Edge runtime** | One import swap, under 68 kB brotli (CI-enforced) | Driver adapter + WASM compiler | Native | Native |
+| **Edge runtime** | One import swap, under 69 kB brotli (CI-enforced) | Driver adapter + WASM compiler | Native | Native |
 | **Pipeline batching** | Parse/Bind/Execute protocol | Sequential in txn | Sequential | Manual |
 | **Typed errors** | `isRetryable` discriminant | Error codes only | None | None |
 | **Nested relations** | 1 query, deep type inference | 1 query per relation by default; single-query `relationJoins` is Preview | 1 query, `relations()` re-declaration | Manual (`jsonArrayFrom`) |
@@ -328,7 +369,7 @@ It is also built to be extended rather than wrapped. All SQL generation routes t
 | **Vector search** | Built-in `distance` / KNN | Preview / raw | Extension API | Manual |
 | **LISTEN/NOTIFY** | `$listen` / `$notify` | None | None | None |
 
-Competitor columns last checked August 2026, against Prisma 7 and Drizzle 0.45. Features marked Preview may change; bundle sizes move release to release. The longer version of this argument, including what is not a reason to switch: [turbineorm.dev/why-turbine](https://turbineorm.dev/why-turbine).
+Competitor columns last checked 2026-08-22, against Prisma 7 and Drizzle 0.45 (the current `latest`; 1.0 is at rc.4). Cells that make a claim about someone else's pricing or licensing carry a link to that vendor's own page, because those are the cells that go stale silently: this table said Drizzle's Gateway was paid, which was true of the old Drizzle Studio subscription and is not true of Gateway, and nothing in the repo would have caught it. Features marked Preview may change; bundle sizes move release to release. The longer version of this argument, including what is not a reason to switch: [turbineorm.dev/why-turbine](https://turbineorm.dev/why-turbine).
 
 ## Limitations
 

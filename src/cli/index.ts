@@ -6,7 +6,7 @@
  *   turbine init                 , Initialize a Turbine project
  *   turbine generate | pull      , Introspect database and generate TypeScript types
  *   turbine migrate-from-prisma   - Parse a schema.prisma and emit a Prisma->Turbine name map + report
- *   turbine push                  - Apply schema-builder definitions to database (destructive ops gated)
+ *   turbine push                  - Apply schema-builder definitions to database (--schema-file, destructive ops gated)
  *   turbine migrate create <name> - Create a new SQL migration file (--auto | --from-diff | --recipe <name>)
  *   turbine migrate up           , Apply pending migrations
  *   turbine migrate deploy       , Apply pending migrations without prompts
@@ -42,7 +42,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { detectPooler, poolerRefusalMessage } from '../connection-url.js';
-import { generate, generatePrismaMap } from '../generate.js';
+import { generate, generatePrismaMap, resolveImportExtension } from '../generate.js';
 import {
   buildCreateIndexSql,
   buildCreateIndexStatements,
@@ -83,6 +83,7 @@ import {
 } from '../plan-divergence.js';
 import { applyFlipVerdicts, emptyFlipProbeResult, needsFlipProbe, probePlanFlips } from '../plan-flip-probe.js';
 import { fingerprintPrismaSchema } from '../prisma-schema-fingerprint.js';
+import { closestName } from '../query/utils.js';
 import { type SchemaMetadata, snakeToCamel } from '../schema.js';
 import type { SchemaDef } from '../schema-builder.js';
 import { DestructivePushRefusal, schemaDiff, schemaPush } from '../schema-sql.js';
@@ -139,6 +140,8 @@ import {
   divider,
   elapsed,
   error,
+  errorBanner,
+  errorLine,
   table as formatTable,
   gray,
   green,
@@ -167,6 +170,18 @@ export interface CliArgs {
   url?: string;
   out?: string;
   schema?: string;
+  /**
+   * `--schema-file <path>`: the defineSchema() FILE, the `schemaFile` config key
+   * as a flag.
+   *
+   * `--schema` is the Postgres NAMESPACE, and it has been mistaken for this one
+   * often enough to be its own class of bug: `turbine push --schema ./schema.ts`
+   * reported "Schema file not found: ./turbine/schema.ts", naming a path the
+   * user never typed while their schema file sat in the directory they ran it
+   * from. Labelling the mistake is not the whole fix; the mistake exists because
+   * one of the two ideas had a flag and the other did not.
+   */
+  schemaFile?: string;
   include?: string[];
   exclude?: string[];
   step?: number;
@@ -267,10 +282,233 @@ export interface CliArgs {
  * rather than "you forgot the recipe name".
  */
 function failArg(message: string, ...hints: string[]): never {
-  banner();
+  errorBanner();
   error(message);
-  for (const hint of hints) console.log(`  ${dim(hint)}`);
-  newline();
+  for (const hint of hints) errorLine(dim(hint));
+  errorLine();
+  process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// The flag surface, as data
+// ---------------------------------------------------------------------------
+
+/**
+ * Long flags accepted by EVERY command.
+ *
+ * Deliberately generous: these are connection/output overrides and diagnostics,
+ * so accepting one where it happens to be inert costs nothing. Nothing that
+ * changes what a command DOES to your data belongs here, which is why
+ * `--dry-run`, `--allow-destructive`, `--fix` and `--yes` are all per-command
+ * below.
+ */
+const GLOBAL_FLAGS = [
+  '--url',
+  '--out',
+  '--schema',
+  '--include',
+  '--exclude',
+  '--verbose',
+  '--force',
+  '--help',
+] as const;
+
+/**
+ * The flags each command accepts, BEYOND {@link GLOBAL_FLAGS}. Long spellings
+ * only; short forms come from {@link FLAG_ALIAS}.
+ *
+ * This table is the CLI's flag surface as data, for the same reason
+ * `query/option-surface.ts` is the query surface as data: an unknown flag used
+ * to be DISCARDED by the parser's `default:` branch, so `push --dry-runn`
+ * executed for real, `migrate create x --autoo` wrote an empty template and
+ * reported success, and `doctor --fixx` wrote nothing and exited 0. A typo in a
+ * safety flag silently disarmed the safety. Every entry here is cross-checked
+ * against the parser's own `case` labels by
+ * `src/test/cli-unknown-flags.test.ts`, so adding a flag to one and not the
+ * other fails the build rather than stranding it.
+ */
+const COMMAND_FLAGS: Record<string, readonly string[]> = {
+  init: ['--yes', '--schema-file', '--skip-schema', '--with-schema', '--skip-seed', '--skip-push', '--skip-generate'],
+  generate: [
+    '--zod',
+    '--include-views',
+    '--no-timestamp',
+    '--import-ext',
+    '--keep-column-names',
+    '--legacy-to-many-uniques',
+    '--allow-empty',
+  ],
+  'migrate-from-prisma': ['--no-db', '--if-db', '--allow-partial', '--no-timestamp'],
+  push: ['--schema-file', '--dry-run', '--allow-destructive'],
+  migrate: [
+    '--schema-file',
+    '--auto',
+    '--from-diff',
+    '--recipe',
+    '--step',
+    '--dry-run',
+    '--allow-drift',
+    '--allow-destructive',
+  ],
+  seed: [],
+  status: [],
+  doctor: [
+    '--fix',
+    '--json',
+    '--no-concurrently',
+    '--unused',
+    '--audit',
+    '--min-scans',
+    '--metrics-url',
+    '--no-plan-divergence',
+    '--allow-pooler',
+  ],
+  studio: ['--port', '--host', '--no-open', '--allow-remote', '--write', '--show-pii', '--demo'],
+  mcp: [],
+  observe: ['--port', '--host', '--no-open', '--allow-remote', '--metrics-url'],
+  skill: ['--print', '--agents', '--dir'],
+  help: [],
+  version: [],
+};
+
+/** Command spellings that dispatch to another command's handler. */
+const COMMAND_ALIASES: Record<string, string> = {
+  gen: 'generate',
+  g: 'generate',
+  pull: 'generate',
+  migration: 'migrate',
+  m: 'migrate',
+  s: 'seed',
+  info: 'status',
+};
+
+/**
+ * Long flag to its alternative spelling, for MATCHING and for display.
+ *
+ * Kept out of {@link COMMAND_FLAGS} so a command lists each flag once: the
+ * "valid flags" block a rejection prints reads as one flag per idea, with its
+ * short form attached, rather than as a list twice as long.
+ */
+const FLAG_ALIAS: Record<string, string> = {
+  '--url': '-u',
+  '--out': '-o',
+  '--schema': '-s',
+  '--step': '-n',
+  '--yes': '-y',
+  '--force': '-f',
+  '--verbose': '-v',
+  '--help': '-h',
+  '--import-ext': '--import-extension',
+};
+
+/**
+ * The canonical name of `command`, or undefined when nothing dispatches it.
+ *
+ * @internal exported for tests.
+ */
+export function canonicalCommand(command: string): string | undefined {
+  const resolved = COMMAND_ALIASES[command] ?? command;
+  return resolved in COMMAND_FLAGS ? resolved : undefined;
+}
+
+/** Every command name a user could reasonably have meant, canonical spellings only. */
+export function knownCommands(): string[] {
+  return Object.keys(COMMAND_FLAGS);
+}
+
+/**
+ * The long flags `command` accepts (its own, then the global ones), or
+ * undefined when the command itself is unrecognized.
+ *
+ * An unknown command returns undefined rather than an empty list on purpose:
+ * `turbine genrate --url ...` should be told the COMMAND is misspelled, not
+ * handed a flag error for a flag that is perfectly valid on the command it
+ * meant.
+ *
+ * @internal exported for tests.
+ */
+export function flagsForCommand(command: string): { own: readonly string[]; global: readonly string[] } | undefined {
+  const canonical = canonicalCommand(command);
+  if (canonical === undefined) return undefined;
+  return { own: COMMAND_FLAGS[canonical] ?? [], global: GLOBAL_FLAGS };
+}
+
+/** Every token (long + alias) `command` accepts, or undefined for an unknown command. */
+function acceptedFlagTokens(command: string): Set<string> | undefined {
+  const flags = flagsForCommand(command);
+  if (!flags) return undefined;
+  const tokens = new Set<string>();
+  for (const flag of [...flags.own, ...flags.global]) {
+    tokens.add(flag);
+    const alias = FLAG_ALIAS[flag];
+    if (alias) tokens.add(alias);
+  }
+  return tokens;
+}
+
+/**
+ * Every flag token any command accepts, long spellings and aliases alike.
+ *
+ * Exists for `src/test/cli-arg-safety.test.ts`, which cross-checks it against
+ * the `case` labels in {@link parseArgs} in both directions. A flag in the
+ * parser but in no command's list is unreachable (the validator rejects it
+ * before the case runs); a flag in a list with no case is accepted and then
+ * silently ignored, which is the bug this whole surface exists to end.
+ *
+ * @internal exported for tests.
+ */
+export function allFlagTokens(): Set<string> {
+  const tokens = new Set<string>();
+  for (const command of knownCommands()) {
+    for (const token of acceptedFlagTokens(command) ?? []) tokens.add(token);
+  }
+  return tokens;
+}
+
+/** `--url` rendered for the help block: `--url, -u`. */
+function displayFlag(flag: string): string {
+  const alias = FLAG_ALIAS[flag];
+  return alias ? `${flag}, ${alias}` : flag;
+}
+
+/**
+ * Reject the unknown flags on a recognized command, naming the closest real one.
+ *
+ * `closestName` rather than `suggestKey`: the second pass `suggestKey` adds is a
+ * camelCase-word-subsequence match, which does nothing for kebab-case flags.
+ * Long spellings ONLY are offered as candidates, because `nameCloseness` scores
+ * substring containment above edit distance and every short flag is a substring
+ * of something: `--no-opn` contains `-o`, which would otherwise outrank the
+ * `--no-open` the user obviously meant.
+ */
+function failUnknownFlags(command: string, unknown: string[]): never {
+  const flags = flagsForCommand(command);
+  const canonical = canonicalCommand(command) ?? command;
+  errorBanner();
+  const plural = unknown.length > 1 ? 's' : '';
+  error(`Unknown flag${plural} for ${cyan(`turbine ${canonical}`)}: ${unknown.map((f) => bold(f)).join(' ')}`);
+  errorLine();
+  if (flags) {
+    for (const flag of unknown) {
+      const suggestion = closestName(flag, [...flags.own, ...flags.global]);
+      if (!suggestion) continue;
+      // With one bad flag the headline already names it; with several, each
+      // suggestion has to say which flag it is about.
+      const subject = unknown.length > 1 ? `${bold(flag)} ${symbols.arrow} ` : '';
+      errorLine(`${subject}${dim('Did you mean')} ${cyan(displayFlag(suggestion))}${dim('?')}`);
+    }
+    if (flags.own.length > 0) {
+      errorLine();
+      errorLine(dim(`Flags for ${canonical}:`));
+      errorLine(`  ${flags.own.map(displayFlag).join('  ')}`);
+    }
+    errorLine();
+    errorLine(dim('Flags for every command:'));
+    errorLine(`  ${flags.global.map(displayFlag).join('  ')}`);
+  }
+  errorLine();
+  errorLine(`${dim('Run')} ${cyan(`npx turbine ${canonical} --help`)} ${dim('for the full list.')}`);
+  errorLine();
   process.exit(1);
 }
 
@@ -289,9 +527,21 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
     i++;
   }
 
+  // The flags this command accepts. `undefined` means the COMMAND is unknown,
+  // in which case nothing here validates flags: main() reports the misspelled
+  // command instead, which is the actual problem.
+  const accepted = acceptedFlagTokens(result.command);
+  const unknownFlags: string[] = [];
+
   for (; i < args.length; i++) {
     const arg = args[i]!;
     const next = args[i + 1];
+
+    // Checked BEFORE the switch, and on the same cursor, so a flag's VALUE
+    // (`--step -1`, `--host -x`) is consumed by its own case and never reaches
+    // this test. A bare `-`-prefixed token that is not a flag reaches it and is
+    // rejected: no command takes a negative-number positional.
+    if (accepted && arg.startsWith('-') && !accepted.has(arg)) unknownFlags.push(arg);
 
     switch (arg) {
       case '--url':
@@ -307,6 +557,10 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
       case '--schema':
       case '-s':
         result.schema = next;
+        i++;
+        break;
+      case '--schema-file':
+        result.schemaFile = next;
         i++;
         break;
       case '--include':
@@ -488,6 +742,10 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
     }
   }
 
+  // Reported once, after the whole line is parsed, so two typos on one command
+  // are two lines of one error rather than two runs of the CLI.
+  if (unknownFlags.length > 0) failUnknownFlags(result.command, unknownFlags);
+
   return result;
 }
 
@@ -500,37 +758,37 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
  * Called when we know we need to load a `.ts` file but the loader isn't available.
  */
 function failMissingTsLoader(filePath: string, reason: 'missing' | 'unsupported' | 'failed'): never {
-  newline();
+  errorLine();
   error(`Cannot load TypeScript file: ${filePath}`);
-  newline();
+  errorLine();
   if (reason === 'unsupported') {
-    console.log(`  ${dim('Your Node.js version does not support')} ${cyan('module.register()')}.`);
-    console.log(
-      `  ${dim('Upgrade to Node.js')} ${cyan('20.6+')} ${dim('or use a')} ${cyan('.js')} ${dim('/')} ${cyan('.mjs')} ${dim('config file.')}`,
+    errorLine(`${dim('Your Node.js version does not support')} ${cyan('module.register()')}.`);
+    errorLine(
+      `${dim('Upgrade to Node.js')} ${cyan('20.6+')} ${dim('or use a')} ${cyan('.js')} ${dim('/')} ${cyan('.mjs')} ${dim('config file.')}`,
     );
   } else if (reason === 'failed') {
     // tsx IS installed but registering its loader threw. Report the real
     // cause, telling the user to install tsx here would be a misdiagnosis.
-    console.log(`  ${dim('tsx is installed, but registering its TypeScript loader failed:')}`);
-    newline();
-    console.log(`    ${getTsLoaderError() ?? '(unknown error)'}`);
-    newline();
-    console.log(
-      `  ${dim('Try upgrading tsx:')} ${cyan('npm install --save-dev tsx@latest')}${dim(', or rename your file to')} ${cyan('.mjs')}.`,
+    errorLine(`${dim('tsx is installed, but registering its TypeScript loader failed:')}`);
+    errorLine();
+    errorLine(`  ${getTsLoaderError() ?? '(unknown error)'}`);
+    errorLine();
+    errorLine(
+      `${dim('Try upgrading tsx:')} ${cyan('npm install --save-dev tsx@latest')}${dim(', or rename your file to')} ${cyan('.mjs')}.`,
     );
   } else {
-    console.log(`  ${dim('Loading .ts config / schema files requires')} ${cyan('tsx')} ${dim('to be installed.')}`);
-    newline();
-    console.log(`  ${dim('Install it as a dev dependency:')}`);
-    console.log(`    ${cyan('npm install --save-dev tsx')}`);
-    console.log(`    ${dim('or')}`);
-    console.log(`    ${cyan('pnpm add -D tsx')}`);
-    console.log(`    ${dim('or')}`);
-    console.log(`    ${cyan('yarn add -D tsx')}`);
-    newline();
-    console.log(`  ${dim('Alternatively, rename your file to')} ${cyan('.js')} ${dim('or')} ${cyan('.mjs')}.`);
+    errorLine(`${dim('Loading .ts config / schema files requires')} ${cyan('tsx')} ${dim('to be installed.')}`);
+    errorLine();
+    errorLine(`${dim('Install it as a dev dependency:')}`);
+    errorLine(`  ${cyan('npm install --save-dev tsx')}`);
+    errorLine(`  ${dim('or')}`);
+    errorLine(`  ${cyan('pnpm add -D tsx')}`);
+    errorLine(`  ${dim('or')}`);
+    errorLine(`  ${cyan('yarn add -D tsx')}`);
+    errorLine();
+    errorLine(`${dim('Alternatively, rename your file to')} ${cyan('.js')} ${dim('or')} ${cyan('.mjs')}.`);
   }
-  newline();
+  errorLine();
   process.exit(1);
 }
 
@@ -617,25 +875,25 @@ interface RequireUrlOptions {
 function requireUrl(config: ResolvedConfig, options: RequireUrlOptions = {}): string {
   if (!config.url) {
     error('No database URL provided.');
-    newline();
-    console.log(`  ${dim('Set it in one of these ways:')}`);
-    console.log(`    ${dim('1.')} Add ${cyan('url')} to ${cyan('turbine.config.ts')}`);
+    errorLine();
+    errorLine(`${dim('Set it in one of these ways:')}`);
+    errorLine(`  ${dim('1.')} Add ${cyan('url')} to ${cyan('turbine.config.ts')}`);
     // .env auto-load needs Node 20.12+ (process.loadEnvFile); be honest below it.
     const envFileNote =
       typeof process.loadEnvFile === 'function' ? '(auto-loaded)' : '(needs Node 20.12+ to auto-load)';
-    console.log(
-      `    ${dim('2.')} Set ${cyan('DATABASE_URL')} in your environment or a ${cyan('.env')} file ${dim(envFileNote)}`,
+    errorLine(
+      `  ${dim('2.')} Set ${cyan('DATABASE_URL')} in your environment or a ${cyan('.env')} file ${dim(envFileNote)}`,
     );
-    console.log(`    ${dim('3.')} Pass ${cyan('--url')} flag`);
+    errorLine(`  ${dim('3.')} Pass ${cyan('--url')} flag`);
     const vars = options.datasourceVars ?? [];
     if (vars.length > 0) {
       const list = vars.map((v) => cyan(v)).join(', ');
       const plural = vars.length > 1 ? 'these variables' : 'this variable';
-      console.log(
-        `    ${dim('4.')} Set ${list} ${dim(`(${plural}, declared by your schema.prisma datasource, ${vars.length > 1 ? 'are' : 'is'} unset)`)}`,
+      errorLine(
+        `  ${dim('4.')} Set ${list} ${dim(`(${plural}, declared by your schema.prisma datasource, ${vars.length > 1 ? 'are' : 'is'} unset)`)}`,
       );
     }
-    newline();
+    errorLine();
     process.exit(1);
   }
   return config.url;
@@ -645,7 +903,7 @@ async function loadSchemaFile(schemaFile: string): Promise<SchemaDef> {
   const absPath = resolve(schemaFile);
   if (!existsSync(absPath)) {
     error(`Schema file not found: ${schemaFile}`);
-    console.log(`  ${dim('Create one with:')} ${cyan('turbine init')}`);
+    errorLine(`${dim('Create one with:')} ${cyan('turbine init')}`);
     process.exit(1);
   }
 
@@ -675,12 +933,12 @@ async function loadSchemaFile(schemaFile: string): Promise<SchemaDef> {
   } catch (err) {
     error(`Failed to load schema file: ${schemaFile}`);
     if (err instanceof Error) {
-      console.log(`  ${dim(err.message)}`);
+      errorLine(`${dim(err.message)}`);
       // If the error is the classic ERR_UNKNOWN_FILE_EXTENSION, give a hint.
       if (err.message.includes('ERR_UNKNOWN_FILE_EXTENSION') || err.message.includes('Unknown file extension')) {
-        newline();
-        console.log(
-          `  ${dim('Hint: install')} ${cyan('tsx')} ${dim('to load .ts files:')} ${cyan('npm install --save-dev tsx')}`,
+        errorLine();
+        errorLine(
+          `${dim('Hint: install')} ${cyan('tsx')} ${dim('to load .ts files:')} ${cyan('npm install --save-dev tsx')}`,
         );
       }
       printCjsHintIfApplicable(err);
@@ -703,12 +961,10 @@ function printCjsHintIfApplicable(err: Error): void {
     msg.includes('require() of ES Module') ||
     msg.includes('Cannot require() ES Module')
   ) {
-    newline();
-    console.log(
-      `  ${dim('Hint: add')} ${cyan('"type": "module"')} ${dim('to your')} ${cyan('package.json')}${dim('.')}`,
-    );
-    console.log(
-      `  ${dim('Turbine is an ESM package; without it, Node/tsx tries to')} ${cyan('require()')} ${dim('it and fails.')}`,
+    errorLine();
+    errorLine(`${dim('Hint: add')} ${cyan('"type": "module"')} ${dim('to your')} ${cyan('package.json')}${dim('.')}`);
+    errorLine(
+      `${dim('Turbine is an ESM package; without it, Node/tsx tries to')} ${cyan('require()')} ${dim('it and fails.')}`,
     );
   }
 }
@@ -1136,7 +1392,55 @@ export default defineSeed(async (db) => {
 });
 `;
 
-const INIT_SCHEMA_TEMPLATE = `/**
+/**
+ * The starter schema, with two real tables and a foreign key between them.
+ *
+ * Scaffolded ONLY when the target database has no tables of its own (see
+ * {@link initSchemaTemplate}). An all-commented-out schema next to an empty
+ * database is a dead end: `push` reports "Database already in sync",
+ * `generate` refuses to emit an empty client, and the next-steps text ends up
+ * describing a `db.users` that does not exist. Two tables rather than one
+ * because the relation is what the very next query in the quickstart reads.
+ */
+const INIT_SCHEMA_EXAMPLE = `/**
+ * Turbine schema definition
+ *
+ * Define your database schema in TypeScript.
+ * Use \`npx turbine push\` to sync it to your database, then
+ * \`npx turbine generate\` to emit the typed client.
+ *
+ * This starter is a working example. Rename it, edit it, or replace it
+ * entirely: nothing here is special to Turbine.
+ *
+ * @see https://turbineorm.dev
+ */
+
+import { defineSchema } from 'turbine-orm';
+
+export default defineSchema({
+  users: {
+    id: { type: 'serial', primaryKey: true },
+    email: { type: 'text', notNull: true, unique: true },
+    name: { type: 'text', notNull: true },
+    created_at: { type: 'timestamptz', notNull: true, default: 'NOW()' },
+  },
+  posts: {
+    id: { type: 'serial', primaryKey: true },
+    user_id: { type: 'integer', notNull: true, references: 'users.id' },
+    title: { type: 'text', notNull: true },
+    published: { type: 'boolean', notNull: true, default: 'false' },
+    created_at: { type: 'timestamptz', notNull: true, default: 'NOW()' },
+  },
+});
+`;
+
+/**
+ * The starter schema with nothing defined, for the one case where a real
+ * example could collide: `init --with-schema` beside a database that already
+ * has tables. There, an example `users` table is a schema diff against
+ * somebody's real data, so the file stays a comment.
+ */
+const INIT_SCHEMA_PLACEHOLDER = `/**
  * Turbine schema definition
  *
  * Define your database schema in TypeScript.
@@ -1148,15 +1452,28 @@ const INIT_SCHEMA_TEMPLATE = `/**
 import { defineSchema } from 'turbine-orm';
 
 export default defineSchema({
-  // Example:
+  // Your database already has tables, so this file starts empty on purpose:
+  // \`turbine push\` applies exactly what is declared here. Describe the tables
+  // you want Turbine to own, or run \`npx turbine generate\` to work from the
+  // database as it already is.
+  //
   // users: {
   //   id: { type: 'serial', primaryKey: true },
   //   email: { type: 'text', notNull: true, unique: true },
   //   name: { type: 'text', notNull: true },
-  //   created_at: { type: 'timestamp', default: 'NOW()' },
+  //   created_at: { type: 'timestamptz', notNull: true, default: 'NOW()' },
   // },
 });
 `;
+
+/**
+ * Which starter schema to scaffold.
+ *
+ * @internal exported for tests.
+ */
+export function initSchemaTemplate(dbHasTables: boolean): string {
+  return dbHasTables ? INIT_SCHEMA_PLACEHOLDER : INIT_SCHEMA_EXAMPLE;
+}
 
 // ---------------------------------------------------------------------------
 // `turbine init --url <secret>`: keep the password out of the committed config
@@ -1342,11 +1659,16 @@ function ensureInitScaffoldDirs(config: ResolvedConfig): void {
   }
 }
 
-function writeInitSchemaTemplate(config: ResolvedConfig): void {
+function writeInitSchemaTemplate(config: ResolvedConfig, dbHasTables: boolean): void {
   const schemaDir = dirname(config.schemaFile);
   if (schemaDir && !existsSync(schemaDir)) mkdirSync(schemaDir, { recursive: true });
-  writeFileSync(config.schemaFile, INIT_SCHEMA_TEMPLATE, 'utf-8');
+  writeFileSync(config.schemaFile, initSchemaTemplate(dbHasTables), 'utf-8');
   success(`Created ${cyan(config.schemaFile)}`);
+  if (!dbHasTables) {
+    console.log(
+      `  ${dim('It defines a')} ${cyan('users')} ${dim('and a')} ${cyan('posts')} ${dim('table to start from.')}`,
+    );
+  }
 }
 
 function writeInitSeedTemplate(seedFilePath: string): void {
@@ -1396,8 +1718,46 @@ async function runInitPush(config: ResolvedConfig, url: string): Promise<void> {
   }
 }
 
+/**
+ * What `init`'s generate step actually produced.
+ *
+ * `init` used to print "const users = await db.users.findMany()" whatever
+ * happened, including against an empty database where the emitted client has no
+ * table accessors at all. The next-steps text is derived from this instead of
+ * assumed, so it can only ever name a table the generated client really has.
+ */
+interface InitGenerateOutcome {
+  /** Tables in the generated client. `null` when generation did not run or failed. */
+  tableCount: number | null;
+  /** A real table accessor on the generated client, for the example query. */
+  sampleAccessor?: string;
+}
+
+/**
+ * The exact import line for the generated client, extension included.
+ *
+ * `import { turbine } from './generated/turbine'` is a hard TypeScript error
+ * (TS2834) under `moduleResolution: NodeNext`, which is what this package ships
+ * and what its own tsconfig uses: a relative import needs an explicit file
+ * extension, and NodeNext does no directory-index resolution either. The
+ * generator has always appended the extension to its OWN sibling imports; the
+ * line printed at the reader was the one place it never reached.
+ *
+ * The extension comes from {@link resolveImportExtension}, the same resolver the
+ * generator runs, so the printed line matches the files just written rather
+ * than a second guess about the consumer's tsconfig. Under bundler resolution
+ * it resolves to `''` and the directory form is correct as-is.
+ *
+ * @internal exported for tests.
+ */
+export function generatedClientImport(config: Pick<ResolvedConfig, 'out' | 'importExtension'>): string {
+  const dir = `./${config.out.replace(/^\.\//, '').replace(/\/+$/, '')}`;
+  const { ext } = resolveImportExtension(config.out, config.importExtension);
+  return `import { turbine } from '${ext === '' ? dir : `${dir}/index${ext}`}';`;
+}
+
 /** Introspect the database and generate the typed client. */
-async function runInitGenerate(config: ResolvedConfig, url: string): Promise<void> {
+async function runInitGenerate(config: ResolvedConfig, url: string): Promise<InitGenerateOutcome> {
   const spinner = new Spinner('Introspecting database').start();
   try {
     const schema = await introspect({
@@ -1407,15 +1767,21 @@ async function runInitGenerate(config: ResolvedConfig, url: string): Promise<voi
       exclude: config.exclude.length ? config.exclude : undefined,
       relationNames: config.relationNames,
     });
-    spinner.succeed(`Found ${bold(String(Object.keys(schema.tables).length))} tables`);
+    const tableNames = Object.keys(schema.tables);
+    spinner.succeed(`Found ${bold(String(tableNames.length))} tables`);
 
     const genSpinner = new Spinner('Generating TypeScript client').start();
     const result = generate({ schema, outDir: config.out, connectionString: url });
     genSpinner.succeed(`Generated ${bold(String(result.files.length))} files to ${cyan(`${config.out}/`)}`);
+    // The accessor name the generator emits is snakeToCamel of the table name
+    // (generate.ts, generateIndex), so this is the spelling that autocompletes.
+    const first = tableNames[0];
+    return { tableCount: tableNames.length, sampleAccessor: first ? snakeToCamel(first) : undefined };
   } catch (err) {
     spinner.fail('Could not generate client');
-    if (err instanceof Error) console.log(`  ${dim(redactUrl(err.message))}`);
+    if (err instanceof Error) errorLine(dim(redactUrl(err.message)));
     info(`Run generation later with: ${cyan('npx turbine generate')}`);
+    return { tableCount: null };
   }
 }
 
@@ -1680,6 +2046,10 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
 
   // TypeScript files this run actually created: they drive the tsx heads-up below.
   const tsFilesWritten: string[] = [];
+  // What the generate step produced, if it ran. The next-steps text is derived
+  // from this rather than assumed, so it cannot promise a `db.users` the
+  // generated client does not have.
+  let generated: InitGenerateOutcome = { tableCount: null };
 
   // Execute the plan in order. `run` proceeds; `prompt` asks; `skip` reports.
   for (const step of plan) {
@@ -1710,7 +2080,7 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
         break;
       }
       case 'schema':
-        writeInitSchemaTemplate(config);
+        writeInitSchemaTemplate(config, state.dbHasTables === true);
         if (needsTsLoader(config.schemaFile)) tsFilesWritten.push(config.schemaFile);
         break;
       case 'seed-file':
@@ -1721,7 +2091,7 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
         await runInitPush(config, url);
         break;
       case 'generate':
-        await runInitGenerate(config, url);
+        generated = await runInitGenerate(config, url);
         break;
       case 'seed-run':
         await runInitSeed(config);
@@ -1769,20 +2139,93 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
         `     ${dim('Note: the TypeScript config requires')} ${cyan('tsx')}: ${cyan(tsxInstallCommand(detectPackageManager()))}`,
       );
     }
+    newline();
+    console.log(`  ${dim('3.')} Create migrations: ${cyan('npx turbine migrate create <name>')}`);
+    console.log(`  ${dim('4.')} Run migrations:    ${cyan('npx turbine migrate up')}`);
+    console.log(`  ${dim('5.')} Seed your database: ${cyan('npx turbine seed')}`);
+  } else if (generated.tableCount === null || generated.tableCount === 0) {
+    // There is no typed client to import: either generate did not run (push /
+    // generate declined or skipped), or it ran against a database with no
+    // tables and emitted a client with no accessors. Printing
+    // `await db.users.findMany()` here is the single most misleading line the
+    // CLI produces, because the reader has no way to know it cannot work.
+    console.log(`  ${dim('1.')} Describe your tables in ${cyan(config.schemaFile)}`);
+    console.log(`  ${dim('2.')} Create them:         ${cyan('npx turbine push')}`);
+    console.log(`  ${dim('3.')} Emit the client:     ${cyan('npx turbine generate')}`);
+    newline();
+    console.log(`  ${dim('Until a table exists, the generated client has no table accessors, so')}`);
+    console.log(`  ${dim('there is nothing to import yet. Working from a database you already')}`);
+    console.log(`  ${dim('have? Skip step 1 and run')} ${cyan('npx turbine generate')} ${dim('on its own.')}`);
+    newline();
+    console.log(
+      `  ${dim('Nothing to connect to yet?')} ${cyan('npx turbine studio --demo')} ${dim('needs no database.')}`,
+    );
   } else {
+    const accessor = generated.sampleAccessor ?? 'users';
     console.log(`  ${dim('1.')} Import the generated client:`);
-    console.log(`     ${cyan(`import { turbine } from './${config.out.replace('./', '')}';`)}`);
+    console.log(`     ${cyan(generatedClientImport(config))}`);
     newline();
     console.log(`  ${dim('2.')} Create a connection and query:`);
     console.log(`     ${dim('const db = turbine();')}`);
-    console.log(`     ${dim('const users = await db.users.findMany();')}`);
+    console.log(`     ${dim(`const rows = await db.${accessor}.findMany();`)}`);
+    newline();
+    console.log(`  ${dim('3.')} Create migrations: ${cyan('npx turbine migrate create <name>')}`);
+    console.log(`  ${dim('4.')} Run migrations:    ${cyan('npx turbine migrate up')}`);
+    console.log(`  ${dim('5.')} Seed your database: ${cyan('npx turbine seed')}`);
   }
 
   newline();
-  console.log(`  ${dim('3.')} Create migrations: ${cyan('npx turbine migrate create <name>')}`);
-  console.log(`  ${dim('4.')} Run migrations:    ${cyan('npx turbine migrate up')}`);
-  console.log(`  ${dim('5.')} Seed your database: ${cyan('npx turbine seed')}`);
-  newline();
+}
+
+// ---------------------------------------------------------------------------
+// `--schema` is the namespace, `--schema-file` is the file
+// ---------------------------------------------------------------------------
+
+/**
+ * Refuse a `schema` that is plainly a FILE PATH, on every command that reads it
+ * as a Postgres namespace.
+ *
+ * `--schema` / `-s` sets the namespace to introspect (default `public`). The
+ * defineSchema() file is a different idea entirely, and mistaking the two is
+ * silent on every command that used to accept it: `generate` introspects
+ * `WHERE table_schema = './turbine/schema.ts'` and matches nothing, and `push`
+ * reads `config.schemaFile` instead and reports
+ * "Schema file not found: ./turbine/schema.ts", naming a path the reader never
+ * typed while their schema file sits in the directory they ran it from.
+ *
+ * The check was written for `generate` and wired into `generate` alone, which is
+ * how `push`, the command whose flag name the mistake is actually about, kept
+ * the bad error. It is one function called from every `--schema` command now,
+ * for the same reason `resolveColumnName` is one function: two copies of a rule
+ * is how two commands come to disagree about whether an argument is valid.
+ *
+ * @internal exported for tests.
+ */
+export function refuseSchemaFilePath(
+  config: Pick<ResolvedConfig, 'schema' | 'schemaFile'>,
+  options: { escapeHatch?: string } = {},
+): void {
+  if (!looksLikeSchemaFilePath(config.schema)) return;
+  error(`The ${cyan('--schema')} value looks like a file path: ${cyan(config.schema)}`);
+  errorLine();
+  errorLine(`${dim('Did you mean')} ${cyan(`--schema-file ${config.schema}`)}${dim('?')}`);
+  errorLine();
+  errorLine(`${dim('--schema is the Postgres schema NAME to read')} ${dim('(default:')} ${cyan('public')}${dim(').')}`);
+  errorLine(
+    `${dim('--schema-file is the path to your')} ${cyan('defineSchema()')} ${dim('file')} ${dim(`(default: ${config.schemaFile}).`)}`,
+  );
+  errorLine();
+  errorLine(`${dim('Or set it once in')} ${cyan('turbine.config.ts')}${dim(':')}`);
+  errorLine(`  ${green('schema:')} ${cyan("'public'")}${dim(",       // or omit, reads the 'public' schema")}`);
+  errorLine(
+    `  ${green('schemaFile:')} ${cyan(`'${config.schema}'`)}${dim(', // your defineSchema() file (used by `turbine push`)')}`,
+  );
+  if (options.escapeHatch) {
+    errorLine();
+    errorLine(`${dim('Re-run with')} ${cyan(options.escapeHatch)} ${dim('to use this literal schema name anyway.')}`);
+  }
+  errorLine();
+  process.exit(1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1794,32 +2237,10 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
   const url = requireUrl(config);
   const startTime = performance.now();
 
-  // Guard: `schema` is the Postgres NAMESPACE to introspect (default `public`),
-  // NOT the path to your schema-builder file, that goes in `schemaFile`. If the
-  // configured `schema` looks like a file path, introspection would silently
-  // match zero tables and emit an empty client. Fail loudly instead.
-  if (!args.allowEmpty && looksLikeSchemaFilePath(config.schema)) {
-    error(`The "schema" option looks like a file path: ${cyan(config.schema)}`);
-    newline();
-    console.log(
-      `  ${dim('"schema" is the Postgres schema NAME to introspect')} ${dim('(default:')} ${cyan('public')}${dim(').')}`,
-    );
-    console.log(`  ${dim('The path to your defineSchema() file belongs in')} ${cyan('schemaFile')}${dim('.')}`);
-    newline();
-    console.log(`  ${dim('Fix your')} ${cyan('turbine.config.ts')}${dim(':')}`);
-    console.log(
-      `    ${green('schema:')} ${cyan("'public'")}${dim(",       // or omit, introspects the 'public' schema")}`,
-    );
-    console.log(
-      `    ${green('schemaFile:')} ${cyan(`'${config.schema}'`)}${dim(', // your defineSchema() file (used by `turbine push`)')}`,
-    );
-    newline();
-    console.log(
-      `  ${dim('Re-run with')} ${cyan('--allow-empty')} ${dim('to introspect this literal schema name anyway.')}`,
-    );
-    newline();
-    process.exit(1);
-  }
+  // `--allow-empty` is generate's documented escape hatch for introspecting a
+  // literal schema name that happens to look like a path, so it SKIPS the
+  // refusal rather than merely being named by it.
+  if (args.allowEmpty !== true) refuseSchemaFilePath(config, { escapeHatch: '--allow-empty' });
 
   label('Database', redactUrl(url));
   label('Schema', config.schema);
@@ -1862,23 +2283,23 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
   if (tableNames.length === 0 && !args.allowEmpty) {
     newline();
     error(`Introspection matched 0 tables in schema ${cyan(config.schema)}, refusing to generate an empty client.`);
-    newline();
-    console.log(`  ${dim('Common causes:')}`);
-    console.log(
-      `    ${dim('•')} ${cyan('schema')} ${dim('points at the wrong Postgres namespace')} ${dim('(it is the schema NAME, default')} ${cyan('public')}${dim(').')}`,
+    errorLine();
+    errorLine(`${dim('Common causes:')}`);
+    errorLine(
+      `  ${dim('•')} ${cyan('schema')} ${dim('points at the wrong Postgres namespace')} ${dim('(it is the schema NAME, default')} ${cyan('public')}${dim(').')}`,
     );
-    console.log(
-      `    ${dim('•')} ${dim('You meant to set')} ${cyan('schemaFile')} ${dim('(your defineSchema() file), not')} ${cyan('schema')}${dim('.')}`,
+    errorLine(
+      `  ${dim('•')} ${dim('You meant to set')} ${cyan('schemaFile')} ${dim('(your defineSchema() file), not')} ${cyan('schema')}${dim('.')}`,
     );
-    console.log(`    ${dim('•')} ${cyan('include')}/${cyan('exclude')} ${dim('filtered out every table.')}`);
-    console.log(
-      `    ${dim('•')} ${dim('The database has no tables yet, run')} ${cyan('turbine push')} ${dim('or a migration first.')}`,
+    errorLine(`  ${dim('•')} ${cyan('include')}/${cyan('exclude')} ${dim('filtered out every table.')}`);
+    errorLine(
+      `  ${dim('•')} ${dim('The database has no tables yet, run')} ${cyan('turbine push')} ${dim('or a migration first.')}`,
     );
-    newline();
-    console.log(
-      `  ${dim('If an empty client is genuinely what you want, re-run with')} ${cyan('--allow-empty')}${dim('.')}`,
+    errorLine();
+    errorLine(
+      `${dim('If an empty client is genuinely what you want, re-run with')} ${cyan('--allow-empty')}${dim('.')}`,
     );
-    newline();
+    errorLine();
     process.exit(1);
   }
 
@@ -1925,9 +2346,11 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
   newline();
   console.log(`  ${bold('Usage:')}`);
   newline();
-  console.log(`  ${cyan(`import { turbine } from './${config.out.replace('./', '')}';`)}`);
+  console.log(`  ${cyan(generatedClientImport(config))}`);
   console.log(`  ${dim('const db = turbine({ connectionString: process.env.DATABASE_URL });')}`);
-  console.log(`  ${dim('const user = await db.users.findUnique({ where: { id: 1 } });')}`);
+  // Name a table the client just emitted rather than a hardcoded `users`.
+  const sampleAccessor = snakeToCamel(tableNames[0] ?? 'users');
+  console.log(`  ${dim(`const row = await db.${sampleAccessor}.findFirst();`)}`);
   newline();
 }
 
@@ -2026,12 +2449,12 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
   }
   if (!existsSync(prismaPath)) {
     error(`Prisma schema not found: ${cyan(prismaPath)}`);
-    newline();
-    console.log(
-      `  ${dim('Point at it with')} ${cyan('--schema <path>')} ${dim('(a .prisma file, or a directory of them;')}`,
+    errorLine();
+    errorLine(
+      `${dim('Point at it with')} ${cyan('--schema <path>')} ${dim('(a .prisma file, or a directory of them;')}`,
     );
-    console.log(`  ${dim('default: prisma/schema.prisma, then prisma/schema/).')}`);
-    newline();
+    errorLine(`${dim('default: prisma/schema.prisma, then prisma/schema/).')}`);
+    errorLine();
     process.exit(1);
   }
 
@@ -2042,8 +2465,8 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
   } catch (err) {
     newline();
     error(`Could not read ${cyan(prismaPath)}`);
-    console.log(`  ${red(err instanceof Error ? err.message : String(err))}`);
-    newline();
+    errorLine(`${red(err instanceof Error ? err.message : String(err))}`);
+    errorLine();
     process.exit(1);
   }
   let ast: ReturnType<typeof parsePrismaSchema>;
@@ -2053,8 +2476,8 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
     if (err instanceof PrismaParseError) {
       newline();
       error(`Could not parse ${cyan(prismaPath)}`);
-      console.log(`  ${red(err.message)}`);
-      newline();
+      errorLine(`${red(err.message)}`);
+      errorLine();
       process.exit(1);
     }
     throw err;
@@ -2137,7 +2560,7 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
   const rel = relative(process.cwd(), outDir);
   if (rel.startsWith('..') || resolve(rel) !== outDir) {
     error(`Output directory must be within the project root. Got: ${config.out}`);
-    newline();
+    errorLine();
     process.exit(1);
   }
   mkdirSync(outDir, { recursive: true });
@@ -2215,6 +2638,7 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
 
 async function cmdPush(args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
+  refuseSchemaFilePath(config);
   const url = requireUrl(config);
 
   label('Database', redactUrl(url));
@@ -2414,21 +2838,24 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
       break;
     default:
       error(`Unknown migrate subcommand: ${sub}`);
-      console.log(`  ${dim('Run')} ${cyan('npx turbine migrate help')} ${dim('for usage.')}`);
+      errorLine(`${dim('Run')} ${cyan('npx turbine migrate help')} ${dim('for usage.')}`);
       process.exit(1);
   }
 }
 
 async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
+  // `--auto` / `--from-diff` diff the schema FILE against the namespace, so both
+  // halves of the confusion are live on this one command.
+  refuseSchemaFilePath(config);
   const name = args.positional[0];
   if (!name) {
     error('Migration name is required.');
-    newline();
-    console.log(`  ${dim('Usage:')} ${cyan('npx turbine migrate create <name>')}`);
-    console.log(`  ${dim('Example:')} ${cyan('npx turbine migrate create add_users_table')}`);
-    console.log(`  ${dim('Auto:')}    ${cyan('npx turbine migrate create my_change --auto')}`);
-    newline();
+    errorLine();
+    errorLine(`${dim('Usage:')} ${cyan('npx turbine migrate create <name>')}`);
+    errorLine(`${dim('Example:')} ${cyan('npx turbine migrate create add_users_table')}`);
+    errorLine(`${dim('Auto:')}    ${cyan('npx turbine migrate create my_change --auto')}`);
+    errorLine();
     process.exit(1);
   }
 
@@ -2436,14 +2863,14 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
   // ambiguous. Refuse up front (before any of the strategy blocks run).
   if (args.fromDiff && args.recipe) {
     error('--from-diff cannot be combined with --recipe.');
-    console.log(`  ${dim('Pick one: --from-diff generates from the schema diff, --recipe scaffolds a pattern.')}`);
-    newline();
+    errorLine(`${dim('Pick one: --from-diff generates from the schema diff, --recipe scaffolds a pattern.')}`);
+    errorLine();
     process.exit(1);
   }
   if (args.fromDiff && args.auto) {
     error('--from-diff cannot be combined with --auto.');
-    console.log(`  ${dim('Both generate from the schema diff; --from-diff also flags destructive statements.')}`);
-    newline();
+    errorLine(`${dim('Both generate from the schema diff; --from-diff also flags destructive statements.')}`);
+    errorLine();
     process.exit(1);
   }
 
@@ -2627,12 +3054,12 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
   if (args.recipe) {
     if (!MIGRATION_RECIPES[args.recipe]) {
       error(`Unknown migration recipe: ${args.recipe}`);
-      newline();
-      console.log(`  ${dim('Available recipes:')}`);
+      errorLine();
+      errorLine(`${dim('Available recipes:')}`);
       for (const [key, recipe] of Object.entries(MIGRATION_RECIPES)) {
-        console.log(`    ${cyan(key)}  ${dim(recipe.description)}`);
+        errorLine(`  ${cyan(key)}  ${dim(recipe.description)}`);
       }
-      newline();
+      errorLine();
       process.exit(1);
     }
     const file = createMigration(config.migrationsDir, name, undefined, { recipe: args.recipe });
@@ -2853,11 +3280,11 @@ async function cmdMigrateDeploy(args: CliArgs, config: ResolvedConfig): Promise<
   if (plan.mismatches.length > 0) {
     if (!args.allowDrift) {
       error('Deploy blocked by migration drift');
-      newline();
+      errorLine();
       for (const line of formatChecksumMismatchError(plan.mismatches).split('\n')) {
-        console.log(`  ${line.replace('[turbine] ', '')}`);
+        errorLine(`${line.replace('[turbine] ', '')}`);
       }
-      newline();
+      errorLine();
       process.exit(1);
     }
     warn('--allow-drift is set: checksum validation is DISABLED for this deploy.');
@@ -3243,6 +3670,7 @@ async function cmdSeed(_args: CliArgs, config: ResolvedConfig): Promise<void> {
 
 async function cmdStatus(_args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
+  refuseSchemaFilePath(config);
   const url = requireUrl(config);
 
   label('Database', redactUrl(url));
@@ -3409,6 +3837,7 @@ export function refusePoolerConnection(url: string, args: CliArgs): void {
 
 async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
   const jsonMode = args.json === true;
+  refuseSchemaFilePath(config);
   const url = requireUrl(config);
 
   // Before the banner, before introspect, before any pool is constructed.
@@ -4368,6 +4797,8 @@ export function isLoopbackHost(host: string): boolean {
 async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
   const demo = args.demo === true;
+  // Demo mode reads no namespace at all, so there is nothing to mistake there.
+  if (!demo) refuseSchemaFilePath(config);
   // Demo mode is self-contained (seeded in-memory database), so it never needs
   // a DATABASE_URL. The placeholder is only used for display.
   const url = demo ? 'demo://in-memory' : requireUrl(config);
@@ -4387,10 +4818,10 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
   if (!isLoopbackHost(host)) {
     if (!args.allowRemote) {
       error(`Studio refuses to bind to ${yellow(host)} without ${cyan('--allow-remote')}.`);
-      newline();
-      console.log(`  ${dim('Loopback only by default')} ${dim('(127.0.0.1, localhost, ::1).')}`);
-      console.log(`  ${dim('Pass')} ${cyan('--allow-remote')} ${dim('to opt in to network exposure.')}`);
-      newline();
+      errorLine();
+      errorLine(`${dim('Loopback only by default')} ${dim('(127.0.0.1, localhost, ::1).')}`);
+      errorLine(`${dim('Pass')} ${cyan('--allow-remote')} ${dim('to opt in to network exposure.')}`);
+      errorLine();
       process.exit(1);
     }
     // warn() prints; it returns void. Wrapping it in console.log() printed a
@@ -4524,6 +4955,7 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
 // ---------------------------------------------------------------------------
 
 async function cmdMcp(_args: CliArgs, config: ResolvedConfig): Promise<void> {
+  refuseSchemaFilePath(config);
   const url = requireUrl(config);
   await runMcpServer({
     url,
@@ -4545,10 +4977,10 @@ async function cmdObserve(args: CliArgs): Promise<void> {
   const url = process.env.TURBINE_OBSERVE_URL;
   if (!url) {
     error('TURBINE_OBSERVE_URL environment variable is required for the observe command.');
-    newline();
-    console.log(`  ${dim('Set it to the Postgres connection string where metrics are stored.')}`);
-    console.log(`  ${dim('Example:')} ${cyan('TURBINE_OBSERVE_URL=postgres://... npx turbine observe')}`);
-    newline();
+    errorLine();
+    errorLine(`${dim('Set it to the Postgres connection string where metrics are stored.')}`);
+    errorLine(`${dim('Example:')} ${cyan('TURBINE_OBSERVE_URL=postgres://... npx turbine observe')}`);
+    errorLine();
     process.exit(1);
   }
 
@@ -4566,10 +4998,10 @@ async function cmdObserve(args: CliArgs): Promise<void> {
   if (!isLoopbackHost(host)) {
     if (!args.allowRemote) {
       error(`Observe refuses to bind to ${yellow(host)} without ${cyan('--allow-remote')}.`);
-      newline();
-      console.log(`  ${dim('Loopback only by default')} ${dim('(127.0.0.1, localhost, ::1).')}`);
-      console.log(`  ${dim('Pass')} ${cyan('--allow-remote')} ${dim('to opt in to network exposure.')}`);
-      newline();
+      errorLine();
+      errorLine(`${dim('Loopback only by default')} ${dim('(127.0.0.1, localhost, ::1).')}`);
+      errorLine(`${dim('Pass')} ${cyan('--allow-remote')} ${dim('to opt in to network exposure.')}`);
+      errorLine();
       process.exit(1);
     }
     // warn() prints and returns void; see the same guard in cmdStudio.
@@ -4644,6 +5076,8 @@ export function showSubcommandHelp(command: string): boolean {
     doctor: showDoctorHelp,
     studio: showStudioHelp,
     mcp: showMcpHelp,
+    observe: showObserveHelp,
+    skill: showSkillHelp,
   };
   const fn = helpMap[command];
   if (fn) {
@@ -4672,6 +5106,9 @@ function showInitHelp(): void {
   console.log(`    ${cyan('--url, -u')} ${dim('<url>')}   Postgres connection string to embed in config`);
   console.log(`    ${cyan('--force, -f')}        Overwrite existing config file`);
   console.log(`    ${cyan('--yes, -y')}          Accept every step's default (non-interactive)`);
+  console.log(
+    `    ${cyan('--schema-file')} ${dim('<path>')} Where to scaffold the schema file ${dim('(default: ./turbine/schema.ts)')}`,
+  );
   console.log(`    ${cyan('--skip-schema')}      Don't create the starter schema file`);
   console.log(`    ${cyan('--with-schema')}      Create it even if the database already has tables`);
   console.log(`    ${cyan('--skip-seed')}        Don't create the seed file or run the seed`);
@@ -4775,8 +5212,15 @@ function showPushHelp(): void {
   console.log(`  Reads your ${cyan('turbine/schema.ts')} file, diffs against the live database,`);
   console.log(`  and applies CREATE/ALTER statements.`);
   newline();
+  console.log(
+    `  ${dim('Note:')} the file is ${cyan('--schema-file')}${dim('.')} ${cyan('--schema')} ${dim('is the Postgres namespace to write into.')}`,
+  );
+  newline();
   console.log(`  ${bold('Options:')}`);
   console.log(`    ${cyan('--url, -u')} ${dim('<url>')}   Postgres connection string`);
+  console.log(
+    `    ${cyan('--schema-file')} ${dim('<path>')} Your ${cyan('defineSchema()')} file ${dim('(default: ./turbine/schema.ts)')}`,
+  );
   console.log(`    ${cyan('--dry-run')}          Show SQL without executing`);
   console.log(
     `    ${cyan('--allow-destructive')} Skip the interactive confirmation for data-destroying statements ${dim('(CI)')}`,
@@ -4801,6 +5245,9 @@ function showMigrateHelp(): void {
   newline();
   console.log(`  ${bold('Options:')}`);
   console.log(`    ${cyan('--url, -u')} ${dim('<url>')}   Postgres connection string`);
+  console.log(
+    `    ${cyan('--schema-file')} ${dim('<path>')} Your ${cyan('defineSchema()')} file, for ${cyan('--auto')} / ${cyan('--from-diff')}`,
+  );
   console.log(`    ${cyan('--auto')}            Auto-generate UP/DOWN SQL from schema diff ${dim('(create only)')}`);
   console.log(
     `    ${cyan('--from-diff')}       Generate from schema diff, flagging destructive statements ${dim('(create only)')}`,
@@ -4983,6 +5430,59 @@ function showMcpHelp(): void {
   newline();
 }
 
+function showObserveHelp(): void {
+  banner();
+  console.log(`  ${bold('turbine observe')}, Query metrics dashboard`);
+  newline();
+  console.log(`  ${bold('Usage:')}`);
+  console.log(`    TURBINE_OBSERVE_URL=postgres://... npx turbine observe ${dim('[options]')}`);
+  newline();
+  console.log(`  Reads the ${cyan('_turbine_metrics')} table written by ${cyan('db.$observe()')} and serves`);
+  console.log(`  per-minute count / avg / p50 / p95 / p99 / error aggregates. Read-only,`);
+  console.log(`  loopback-bound, behind a random per-session token, same model as Studio.`);
+  newline();
+  console.log(
+    `  ${dim('The connection string comes from')} ${cyan('TURBINE_OBSERVE_URL')}${dim(', not')} ${cyan('DATABASE_URL')}${dim(':')}`,
+  );
+  console.log(`  ${dim('metrics are meant to live in a different database from the one they measure.')}`);
+  newline();
+  console.log(`  ${bold('Options:')}`);
+  console.log(`    ${cyan('--port')} ${dim('<n>')}            HTTP port ${dim('(default: 4984)')}`);
+  console.log(`    ${cyan('--host')} ${dim('<addr>')}         Bind address ${dim('(default: 127.0.0.1)')}`);
+  console.log(`    ${cyan('--no-open')}             Don't auto-open the browser`);
+  console.log(
+    `    ${cyan('--allow-remote')}        Allow a non-loopback ${cyan('--host')} ${dim('(refused without it)')}`,
+  );
+  newline();
+}
+
+function showSkillHelp(): void {
+  banner();
+  console.log(`  ${bold('turbine skill')}, Install the agent query skill`);
+  newline();
+  console.log(`  ${bold('Usage:')}`);
+  console.log(`    npx turbine skill ${dim('[options]')}`);
+  newline();
+  console.log(`  Writes ${cyan('.claude/skills/turbine-orm/SKILL.md')}: how to write Turbine queries,`);
+  console.log(`  for a coding agent working in this project. The file ships in the package`);
+  console.log(`  rather than being generated here, and every factual claim in it is executed`);
+  console.log(`  against a live database on each release.`);
+  newline();
+  console.log(`  ${bold('Options:')}`);
+  console.log(`    ${cyan('--print')}               Write the skill to stdout instead of installing it`);
+  console.log(`    ${cyan('--agents')}              Print the AGENTS.md / CLAUDE.md instructions block`);
+  console.log(
+    `    ${cyan('--dir')} ${dim('<path>')}          Skills root to install into ${dim('(default: .claude/skills)')}`,
+  );
+  newline();
+  console.log(`  ${bold('Examples:')}`);
+  console.log(`    ${dim('$')} npx turbine skill`);
+  console.log(`    ${dim('$')} npx turbine skill --agents >> AGENTS.md`);
+  newline();
+  console.log(`  ${dim('Also worth connecting:')} ${cyan('npx turbine mcp')}${dim(', the read-only MCP server.')}`);
+  newline();
+}
+
 // ---------------------------------------------------------------------------
 // Help
 // ---------------------------------------------------------------------------
@@ -5027,7 +5527,10 @@ function showHelp(): void {
   console.log(
     `    ${cyan('--out, -o')} ${dim('<dir>')}      Output directory ${dim('(default: ./generated/turbine)')}`,
   );
-  console.log(`    ${cyan('--schema, -s')} ${dim('<name>')}  Postgres schema ${dim('(default: public)')}`);
+  console.log(`    ${cyan('--schema, -s')} ${dim('<name>')}  Postgres schema NAME to read ${dim('(default: public)')}`);
+  console.log(
+    `    ${cyan('--schema-file')} ${dim('<path>')} Your ${cyan('defineSchema()')} file ${dim('(push / migrate --auto / init)')}`,
+  );
   console.log(`    ${cyan('--include')} ${dim('<tables>')}   Comma-separated tables to include`);
   console.log(`    ${cyan('--exclude')} ${dim('<tables>')}   Comma-separated tables to exclude`);
   console.log(`    ${cyan('--dry-run')}            Show SQL without executing`);
@@ -5165,9 +5668,9 @@ function cmdSkill(args: CliArgs): void {
   const source = root ? resolve(root, 'skills', 'turbine-orm', 'SKILL.md') : undefined;
   if (!source || !existsSync(source)) {
     error('Could not find the packaged skill inside turbine-orm.');
-    newline();
-    console.log(`  ${dim('Read it online instead:')} ${cyan('https://turbineorm.dev/ai-agents')}`);
-    newline();
+    errorLine();
+    errorLine(`${dim('Read it online instead:')} ${cyan('https://turbineorm.dev/ai-agents')}`);
+    errorLine();
     process.exit(1);
   }
   const body = readFileSync(source, 'utf8');
@@ -5272,6 +5775,7 @@ async function main() {
     url: args.url,
     out: args.out,
     schema: args.schema,
+    schemaFile: args.schemaFile,
     include: args.include,
     exclude: args.exclude,
     importExtension: args.importExtension,
@@ -5362,45 +5866,55 @@ async function main() {
         cmdSkill(args);
         break;
 
-      default:
+      default: {
         error(`Unknown command: ${bold(args.command)}`);
-        newline();
-        console.log(`  ${dim('Run')} ${cyan('npx turbine help')} ${dim('for available commands.')}`);
-        newline();
+        errorLine();
+        // Only canonical spellings are offered. `nameCloseness` scores substring
+        // containment above edit distance, so including the one-letter aliases
+        // would answer "genrate" with "g" (contained, score 501) instead of
+        // "generate" (one edit away, score 99).
+        const suggestion = closestName(args.command, knownCommands());
+        if (suggestion) {
+          errorLine(`${dim('Did you mean')} ${cyan(`turbine ${suggestion}`)}${dim('?')}`);
+          errorLine();
+        }
+        errorLine(`${dim('Run')} ${cyan('npx turbine help')} ${dim('for available commands.')}`);
+        errorLine();
         process.exit(1);
+      }
     }
   } catch (err) {
     if (err instanceof Error) {
       if (err.message.includes('ECONNREFUSED') || err.message.includes('connection')) {
-        newline();
+        errorLine();
         error(`Could not connect to database`);
-        console.log(`  ${dim(redactUrl(err.message))}`);
-        newline();
-        console.log(`  ${dim('Check that:')}`);
-        console.log(`    ${dim('1.')} Your database is running`);
-        console.log(`    ${dim('2.')} The connection string is correct`);
-        console.log(`    ${dim('3.')} Network/firewall allows the connection`);
+        errorLine(`${dim(redactUrl(err.message))}`);
+        errorLine();
+        errorLine(`${dim('Check that:')}`);
+        errorLine(`  ${dim('1.')} Your database is running`);
+        errorLine(`  ${dim('2.')} The connection string is correct`);
+        errorLine(`  ${dim('3.')} Network/firewall allows the connection`);
       } else if (err.message.includes('authentication')) {
-        newline();
+        errorLine();
         error(`Authentication failed`);
-        console.log(`  ${dim(redactUrl(err.message))}`);
+        errorLine(`${dim(redactUrl(err.message))}`);
       } else if (err.message.includes('does not exist')) {
-        newline();
+        errorLine();
         error(`Database or schema not found`);
-        console.log(`  ${dim(redactUrl(err.message))}`);
+        errorLine(`${dim(redactUrl(err.message))}`);
       } else {
-        newline();
+        errorLine();
         error(redactUrl(err.message));
         if (args.verbose && err.stack) {
-          newline();
-          console.log(dim(redactUrl(err.stack)));
+          errorLine();
+          console.error(dim(redactUrl(err.stack)));
         }
       }
     } else {
-      newline();
+      errorLine();
       error(`Unexpected error: ${redactUrl(String(err))}`);
     }
-    newline();
+    errorLine();
     process.exit(1);
   }
 }

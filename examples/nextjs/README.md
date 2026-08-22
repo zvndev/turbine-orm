@@ -56,3 +56,9 @@ turbine/
   schema.ts          , Turbine schema definition
   seed.ts            , Seed script with demo data
 ```
+
+## Running this outside the repo
+
+`package.json` here depends on `"turbine-orm": "file:../../"`, so an example inside
+the repository always builds against the working tree. Copying this directory out?
+Replace that with a published version (`npm install turbine-orm`) first.

@@ -1,5 +1,296 @@
 # Changelog
 
+## 0.76.0 (2026-08-22)
+
+An outside review of 0.75.0 went looking for a SQL injection in the query
+builder, did not find one, and found nine real defects in everything around it:
+a code generator that trusts the database catalog, a PII guard that resolves a
+name differently from the compiler it guards, a relation global filter that
+emitted a placeholder and bound nothing, and a set of transport perimeters with
+no ceiling on their input.
+
+That shape is the release. **The invariant everyone worries about held; the
+tooling built on top of it did not.** Two of these are remotely triggered, both
+were reproduced by execution rather than inferred from reading, and both are
+fixed here with the mechanism that makes the class hard to reintroduce rather
+than the instance easy to close.
+
+### Security
+
+- **`turbine generate` gave a hostile database catalog arbitrary code execution
+  in the developer's environment.** Table, relation and enum names were
+  interpolated raw into JavaScript object-key position in the emitted
+  `metadata.ts` / `types.ts` / `index.ts`. A Postgres enum named
+  `` [Function('…')()+'x'] `` emitted a COMPUTED key, and a computed key inside an
+  object literal is evaluated when the module is imported, which the generated
+  client is, by every subsequent build. Reproduced end to end against a live
+  database, including the payload executing on import.
+
+  Two boundaries now, not one. `src/introspect.ts` refuses a catalog whose names
+  carry characters no identifier can contain, so the payload never reaches the
+  generator; and the generator emits every key through an ANCHORED identifier
+  match, falling back to a quoted string literal, so a name that is merely
+  unusual still round-trips and a name that is hostile cannot become syntax.
+  Output for every ordinary schema is byte-identical.
+
+  **This is a behaviour change:** `turbine generate` now fails with a
+  `ValidationError` (E003) naming the offending object, where it previously
+  emitted a file. If you have a table or column whose name contains a control
+  character, a line separator, or a quote, generation will now stop.
+
+- **A relation's global filter emitted `$N` and bound no parameter.** With a
+  value-bearing `globalFilters` entry on a relation TARGET, `with: { rel: true }`
+  built the filter into the correlated subquery and the collect path skipped it,
+  so the driver refused the statement outright (`bind message supplies 1
+  parameters, but prepared statement requires 2`). On the join plan this is the
+  flagship single-query nested read, and on a multi-tenant schema it is every
+  query that touches a filtered table. Live since 0.28.0, about 48 releases.
+
+  Two things kept it hidden, and both are worth knowing. The default `auto`
+  strategy falls back to the batched plan on an unindexed correlation column,
+  and the batched plan was correct, so **adding the covering index `turbine
+  doctor` tells you to create is what turned a working query into an error.**
+  And the whole `global-filters.test.ts` fixture was built on `deletedAt: null`,
+  which binds nothing, so every assertion in the file was blind to a
+  collect-path that pushed nothing. The fixture is now value-bearing and the
+  parameterless shape keeps its own separate case.
+
+  The fix is not a patched branch: six independent walkers each decided for
+  themselves what a `with` entry's options were, and `true` / `{}` / `{ … }` are
+  now one shape (`relationOptions()`) for all of them.
+
+- **SQL Server dropped a relation target's global filter entirely.** Found while
+  fixing the above, and worse than it: `mssqlDialect` overrides
+  `buildRelationSubquery` wholesale for `FOR JSON PATH` and returned before the
+  filter could be applied, while the collect path still pushed its value. So on
+  SQL Server the predicate simply vanished and the subquery returned every
+  tenant's rows, with an orphan parameter riding along. There was no error.
+
+  The filter is applied in the `buildWhere` closure the core hands to a dialect
+  override, not in the override, so **every present and future dialect override
+  inherits it** rather than each having to remember. `RelationSubqueryContext`
+  deliberately carries no builder context, which is why it could not have been
+  fixed in `src/mssql.ts`.
+
+- **Two PII guard bypasses, one root cause.** A relation written in its
+  `snake_case` DDL spelling (`blog_posts` for a declared `blogPosts`) walked
+  straight past the guard's exact-match lookup and into the compiler, which
+  since 0.72 accepts both spellings, so Studio and the MCP server filtered and
+  sorted on hidden columns they had refused under the other spelling. Separately,
+  `distinct: [["email"]]` slipped through a check that assumed the array's
+  elements were strings, and emitted byte-identical SQL to `distinct: ["email"]`.
+
+  Both are the guard disagreeing with the compiler about what a name is. It now
+  resolves names through the same `resolveRelation` / `resolveColumnName` the
+  builder uses, and refuses any non-string element in a field list.
+  `src/test/pii-guard-symmetry.test.ts` asserts the two agree on ACCEPTANCE
+  rather than checking a list of spellings, so the next spelling rule is covered
+  the day it is written.
+
+- **The destructive-migration scanner missed `concat()`.** `EXECUTE 'DROP TABLE '
+  || 'users'` was flagged and `EXECUTE concat('DROP TABLE ', 'users')` was not,
+  so a migration assembling a `DROP` that way applied it with no prompt and no
+  `--allow-destructive`. The scanner now knows `concat` / `concat_ws` as
+  proximity forms and `array_to_string` / `replace` / `regexp_replace` as
+  open-call-wrapping verbs, gated on `EXECUTE`.
+
+- **Three transport perimeters had no ceiling on their input.** The MCP stdio
+  reader buffered an unframed line without limit, so a peer that never sent a
+  newline grew it until the process died; it is now bounded at 8 MiB and ENDS the
+  session rather than truncating, because there is no correct way to continue a
+  stream whose framing has been lost. The shared rate limiter's key map never
+  evicted, so under `--allow-remote` it held one permanent entry per source
+  address ever seen; it now sweeps expired windows and is capped, evicting oldest
+  first so it can only ever forgive a caller early. And `compile_query`'s
+  fail-closed "does this query name a column" test read the top level only, so
+  `with: { posts: { where: { secretNote: … } } }` was reported as safe to compile
+  when the PII tag file could not be read; it now walks every depth and errs
+  toward refusing.
+
+- **`sample_rows` promised more than it enforced on an untagged schema.** The
+  tool description said PII columns are never fetched without saying that `pii`
+  is a code-first tag loaded from generated metadata, so on a project that has
+  not run `turbine generate` a 13-word name denylist was the whole protection and
+  `redactedColumns: []` read as "checked, holds no PII". The guarantee is
+  unchanged and still stated; the description now names what decides the SET of
+  hidden columns, points at the `piiTagSource` field, and says plainly that
+  returned rows are untrusted database content rather than instructions.
+
+### Fixed
+
+- **`turbine` silently discarded unknown flags.** `push --dry-runn` executed for
+  real, `doctor --fixx` exited 0 and wrote nothing, and `migrate create x --autoo`
+  reported success and wrote an empty template. On the product whose sixth
+  selling point is that dangerous operations ask first, a typo in a safety flag
+  turned a dry run into a real one. The flag surface is now data, an unknown flag
+  is an error with a nearest-name suggestion and the command's real flags, and an
+  unknown COMMAND suggests too.
+
+- **CLI failures went to stdout.** 633 `console.log` against 5 `console.error`,
+  so `turbine generate > build.log` swallowed the error and CI capturing stderr
+  saw nothing. Failures now write to stderr and a pure failure writes NOTHING to
+  stdout, verified by measuring both streams separately. `doctor --json` and
+  `skill --print` remain byte-clean on stdout.
+
+- **`--schema ./schema.ts` was accepted and ignored on six commands.**
+  `--schema` is the Postgres namespace; the file path belongs to the new
+  `--schema-file`. The refusal that already existed on `generate` now covers
+  `push`, `status`, `doctor`, `studio`, `mcp` and `migrate create`.
+
+- **`turbine init` against an empty database told you to query a table you do not
+  have.** It scaffolded a fully commented-out schema, found 0 tables, and then
+  printed `db.users.findMany()`. It now writes a real two-table starter schema
+  when the database is empty, and the next-steps text names a table the generated
+  client actually has.
+
+- **The documented import path did not compile.** `import { turbine } from
+  './generated/turbine'` is a hard `TS2834` under NodeNext, the resolution this
+  package itself ships. The CLI now derives the specifier from the generator's own
+  extension resolution, and the README, JSDoc and docs snippets carry the form
+  that compiles.
+
+- **SQLite logic errors were untyped.** `no such table` / `no such column` /
+  syntax errors have no SQLSTATE for `wrapPgError` to borrow, so they surfaced as
+  a bare `Error` with `code: 'ERR_SQLITE_ERROR'`, no `TURBINE_E0NN` and no
+  `docsUrl`, which made the typed-errors promise Postgres-only in practice. They
+  are now `ValidationError` (E003) with the driver's text kept verbatim and the
+  driver error attached as `cause`. `ValidationError` accepts a `cause` for the
+  first time; the base class already redacts one under `errorMessages: 'safe'`,
+  so this goes through the redaction rather than around it.
+
+- **`compile_query` under-reported a relation written in `snake_case`.** The same
+  exact-match bug as the PII guard, in the MCP tool: the relation was silently
+  dropped from the report, so the statement count was low and the correlation
+  probes were skipped for exactly the relation the caller asked about.
+
+- **Seven of eight examples failed at step one.** They pinned `turbine-orm:
+  ^0.7.x`, which on a `0.x` version resolves a release 68 versions old, passed a
+  file path to `--schema`, and constructed a client the generator has not emitted
+  in a long time. All eight now install from the workspace, run their own setup,
+  and typecheck. Three were also missing `tsx`, which their own `db:push` needs,
+  and one imported `pg` with no `@types/pg`; both were found by the new CI job
+  rather than by reading.
+
+- **A dangling `Available: ` on a table with no relations.** Fourteen error sites
+  interpolated a joined key list directly, so on an empty list the message ended
+  at the colon. One shared `availableClause()` now renders the list or a sentence
+  saying there is none.
+
+### Changed
+
+- **PowDB refuses `distinct` with `UnsupportedFeatureError` (E017)** instead of
+  compiling PowQL that silently ignored it. Verified across all four dialects
+  before choosing where the refusal goes: PostgreSQL supports the feature and so
+  raises E003 for an unknown column name, while SQLite, MySQL and SQL Server all
+  raise E017 for the feature. E003-for-an-unknown-name is therefore not a shared
+  contract, and PowDB refuses before resolving names, like its peers.
+
+- **`pipeline()` takes the caller's dialect**, so a batch on SQL Server emits SQL
+  Server transaction keywords rather than PostgreSQL's.
+
+- **Writes on a PowDB table with a PII-tagged primary key keep the key.** The
+  client-side strip removed it along with the other tagged columns, leaving a row
+  nothing could address.
+
+- **`jsonEncoding`, the MCP tool count, and the generated-SQL showcase** are
+  corrected across the site. `relations` said `jsonEncoding` defaults to
+  `'object'`, false since 0.71, with the knock-on that `flatten` silently
+  no-ops on PostgreSQL under the real default. The landing page advertised eleven
+  MCP tools and listed ten, and its "Generated SQL" panel showed
+  `json_build_object`, which PostgreSQL no longer emits.
+
+- **The bundle claim, the size gate and the site now carry one number.** The
+  README said "under 85 kB brotli, enforced by size-limit in CI" while the entry
+  measured 85.22 kB and the gate was 90 kB: the published figure was exceeded and
+  the gate cited as enforcing it was 4.78 kB looser. Main is now **87 kB** and
+  the edge entry **69 kB**, the same numbers in `.size-limit.js`, the README and
+  the site, with a test that fails if they diverge. The re-baseline from 86/68 is
+  this release's own growth in the shared client/query graph, checked against an
+  esbuild metafile first to confirm no engine or CLI module had leaked in.
+
+- **The streaming benchmark is re-measured and the claim reversed.** The site
+  said in three places that Drizzle takes streaming by 22%, from a 0.71.0 run,
+  while the same page carried a 0.72.0 table showing Turbine ahead. Three fresh
+  runs of fifteen interleaved rounds: `findManyStreamBatches` **36.70 ms**,
+  `findManyStream` **40.69 ms**, Drizzle 1.0.0-rc.4 **37.10 ms**, Drizzle 0.45.2
+  **44.20 ms**. Against the published Drizzle the scenario has reversed on both
+  Turbine spellings; **against the release candidate it is a tie, not a win** (the
+  paired delta spanned -4.9% to +3.1% while the negative control spanned -3.7% to
+  +3.2%), and the per-row API is a real 5-11% loss to rc.4. A new harness,
+  `benchmarks/bench-stream-parity.ts`, runs both Turbine spellings in one
+  rotation, because the old single-arm harness compared a per-row API against
+  four arms consuming arrays and reported the API difference as a speed
+  difference.
+
+- **The competitor table said Drizzle's Gateway is paid.** It is free to
+  self-host; the claim was true of the retired Drizzle Studio subscription. The
+  cell now links the vendor's own page, and the table's footnote states the rule:
+  a cell asserting someone else's pricing carries a link, because that is the
+  cell that goes stale silently.
+
+- **The README documents the code-first SQLite path.** The section said "SQLite
+  needs nothing else" and then imported `./generated/turbine/metadata.js`, which
+  only `turbine generate` produces and `generate` is Postgres-only. The
+  `defineSchema` -> `schemaToSQL(schema, { dialect: sqliteDialect })` ->
+  `schemaDefToMetadata` route works and was verified end to end; it simply was
+  not written down. Same correction in the shipped JSDoc.
+
+- **The prepared-statement memory channel is documented where a reader looks.**
+  A named statement is never deallocated, and 0.66 closed the largest
+  request-controlled case by sending variable-arity combinators unnamed. The
+  residual channel is a caller-chosen `select` / `omit` / `with` subset, which the
+  builder cannot distinguish from a hand-written one. It was a code comment; it is
+  now in the queries docs and in the `preparedStatements` JSDoc, with the
+  mitigation.
+
+### Testing
+
+- **`src/test/generate-injection.test.ts`** drives the real generator with
+  hostile catalog names and executes the emitted module in a `node:vm` to prove
+  nothing runs on import.
+- **`src/test/pii-guard-symmetry.test.ts`** asserts the guard and the compiler
+  agree on which queries are ACCEPTED, over both spellings and both field-list
+  shapes.
+- **`src/test/with-spec-shorthand-drift.test.ts`** sweeps `true` / `{}` / options
+  across four dialects, two encodings and every nesting shape, asserting the SQL
+  is identical and every placeholder is backed. SQL Server is in that sweep now;
+  the block that pinned its broken behaviour has been replaced by one asserting
+  the fix.
+- **`src/test/global-filter-relation-strategies.integration.test.ts`** runs every
+  relation-load strategy against a live database and compares rows, with an
+  explicit precondition check on the covering index so a missing fixture index
+  reads as a fixture problem rather than a product defect.
+- **`src/test/mcp-perimeter-bounds.test.ts`** exercises each transport bound at
+  the scale that made it a defect: 12 MiB unframed, 50,000 distinct rate-limit
+  keys, and a 40-level nested args object.
+- **`src/test/cli-arg-safety.test.ts`**, **`cli-first-run.paths.test.ts`**,
+  **`sqlite-error-classification.test.ts`**, **`size-claim-sync.test.ts`**,
+  **`destructive-dynamic-assembly.test.ts`**, **`pipeline-dialect-tx.test.ts`**,
+  **`powdb-dialect-contract.test.ts`**.
+- **Nine vacuous assertions removed.** `if (posts.length > 0) { … }` on a fixture
+  that guarantees posts is an assertion that passes when the relation comes back
+  empty, which is the failure it was written to catch. They assert now. One
+  `createMany({ skipDuplicates })` case hedged with "or none" against a column
+  that carries a unique index, and now asserts the exact count.
+- **A shared-fixture leak.** `auto-compound-integration.test.ts` drops
+  `idx_posts_user_id` in setup and did not put it back, so every later suite in
+  the run planned differently. Since the index's absence is precisely what makes
+  `auto` fall back to batched, which is what hid the relation global-filter bug
+  for 48 releases, this is the one index whose leak is most likely to hide a
+  defect. It is restored in teardown.
+
+### CI
+
+- **`examples-smoke`**: every example, installed from the packed tarball against
+  a real Postgres, push -> generate -> `tsc --noEmit`. Nothing ran the examples
+  before, which is how seven of eight stayed broken.
+- **`ci-ok`**: one aggregate job that fails unless all eighteen others succeeded,
+  intended as the single required check. Branch protection can only require job
+  names it already knows, so a newly added job was not required until someone
+  remembered to add it in a settings page; now forgetting is a visible diff in
+  the workflow file. It runs with `if: always()`, because a skipped required
+  check is reported as neutral rather than as a failure.
+
 ## 0.75.0 (2026-08-16)
 
 0.74.0 fixed five options PowDB accepted and ignored, and verified the fix

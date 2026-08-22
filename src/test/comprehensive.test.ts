@@ -143,13 +143,14 @@ testFn('comprehensive integration tests', () => {
       });
       assert.ok(users.length > 0);
       const posts = users[0]!.posts as Record<string, unknown>[];
-      if (posts.length > 0) {
-        const post = posts[0]!;
-        assert.ok('id' in post);
-        assert.ok('title' in post);
-        assert.ok(!('content' in post));
-        assert.ok(!('viewCount' in post));
-      }
+      // Asserted, not guarded: user 1 has posts in the fixture, so an empty
+      // array here is a defect and `if (length > 0)` would have hidden it.
+      assert.ok(posts.length > 0, 'user 1 has posts in the fixture');
+      const post = posts[0]!;
+      assert.ok('id' in post);
+      assert.ok('title' in post);
+      assert.ok(!('content' in post));
+      assert.ok(!('viewCount' in post));
     });
 
     it('omit on nested relation excludes relation fields', async () => {
@@ -164,12 +165,13 @@ testFn('comprehensive integration tests', () => {
       });
       assert.ok(users.length > 0);
       const posts = users[0]!.posts as Record<string, unknown>[];
-      if (posts.length > 0) {
-        const post = posts[0]!;
-        assert.ok('id' in post);
-        assert.ok('title' in post);
-        assert.ok(!('content' in post));
-      }
+      // Asserted, not guarded: user 1 has posts in the fixture, so an empty
+      // array here is a defect and `if (length > 0)` would have hidden it.
+      assert.ok(posts.length > 0, 'user 1 has posts in the fixture');
+      const post = posts[0]!;
+      assert.ok('id' in post);
+      assert.ok('title' in post);
+      assert.ok(!('content' in post));
     });
   });
 

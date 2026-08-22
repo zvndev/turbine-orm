@@ -68,6 +68,12 @@ const ALLOWED_IN_TESTS = new Set(['Error', 'TypeError', 'RangeError', 'SyntaxErr
 // zero-dependency schema.prisma reader used by `turbine migrate-from-prisma`.
 const FILE_LOCAL_ERRORS = new Map<string, Set<string>>([
   ['src/cli/prisma-schema.ts', new Set(['PrismaParseError'])],
+  // The PII guard's refusal callbacks (`refuseColumn` / `refuseDepth` /
+  // `refuseShape`) exist so each caller throws ITS OWN error type: Studio throws
+  // an HTTP refusal, the MCP server throws a JSON-RPC one. The symmetry test
+  // therefore has to supply a third, and a test-local class is the point rather
+  // than a shortcut.
+  ['src/test/pii-guard-symmetry.test.ts', new Set(['GuardRefusal'])],
 ]);
 
 function walkDir(dir: string): string[] {

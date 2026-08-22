@@ -1,0 +1,18 @@
+{
+  // NodeNext, which is what `tsx` and plain `node` use. Under it a relative
+  // import needs its file extension: that is why the generated client is
+  // imported as `./generated/turbine/index.js`.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "lib": ["ES2023"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    // `process` / `console` are Node globals; @types/node is a devDependency.
+    "types": ["node"]
+  },
+  "include": ["**/*.ts"],
+  "exclude": ["node_modules"]
+}

@@ -19,6 +19,7 @@
  * Hyperdrive), mock pools in tests, and any pool that doesn't expose pg internals.
  */
 
+import { type Dialect, postgresDialect } from './dialect.js';
 import { PipelineError, type PipelineResultSlot, wrapPgError } from './errors.js';
 import type { PgCompatPool, PgCompatPoolClient, PgCompatQueryResult } from './pg-types.js';
 import { type PipelineRunOptions, runPipelined, supportsExtendedPipeline } from './pipeline-submittable.js';
@@ -66,6 +67,7 @@ interface SequentialClient {
 async function runSequential<T extends readonly DeferredQuery<unknown>[]>(
   client: SequentialClient,
   queries: T,
+  dialect: Dialect,
   options: PipelineOptions = {},
 ): Promise<PipelineResults<T>> {
   const { transactional = true } = options;
@@ -80,7 +82,7 @@ async function runSequential<T extends readonly DeferredQuery<unknown>[]>(
     // `TURBINE_E004` nor a retryable flag for the one failure that is most
     // worth retrying.
     try {
-      await client.query('BEGIN');
+      await client.query(dialect.beginStatement());
     } catch (err) {
       throw wrapPgError(err);
     }
@@ -97,7 +99,7 @@ async function runSequential<T extends readonly DeferredQuery<unknown>[]>(
     }
 
     try {
-      await client.query('COMMIT');
+      await client.query(dialect.commitStatement());
     } catch (err) {
       throw wrapPgError(err);
     }
@@ -105,12 +107,49 @@ async function runSequential<T extends readonly DeferredQuery<unknown>[]>(
     return results as PipelineResults<T>;
   } catch (err) {
     try {
-      await client.query('ROLLBACK');
+      await client.query(dialect.rollbackStatement());
     } catch {
       // Best-effort rollback
     }
     throw err;
   }
+}
+
+/**
+ * The dialect whose transaction keywords this batch must use.
+ *
+ * `executePipeline` is handed a POOL and nothing else, so the pool is the only
+ * place the engine can be read from; the engine pool shims are the objects that
+ * know their own dialect, and one of them (`MssqlPool`) publishes it for exactly
+ * this. Anything else, a real `pg.Pool`, a serverless HTTP pool, a test mock,
+ * keeps PostgreSQL, which is what every one of them already spoke.
+ *
+ * This existed as three hard-coded strings, `BEGIN` / `COMMIT` / `ROLLBACK`,
+ * which is the one engine-specific decision in this file and the one it was not
+ * making. On SQL Server a bare `BEGIN` opens a statement BLOCK, not a
+ * transaction: `MssqlTxClient` matches the dialect's `BEGIN TRANSACTION` and
+ * nothing else, so a bare `BEGIN` missed that branch, reached the server as a
+ * block opener with no `END`, and was rejected; the `COMMIT` and `ROLLBACK`
+ * that followed then found no open transaction and silently did nothing. A
+ * pipeline that documents itself as atomic was neither atomic nor rolled back.
+ *
+ * Duck-typed rather than `instanceof`, deliberately: importing an engine module
+ * here would pull an optional peer's whole module graph into the Postgres path.
+ * The three methods tested are exactly the three called below, so a partial
+ * object can never be accepted and then fail at the call site.
+ */
+function poolDialect(pool: PgCompatPool): Dialect {
+  const candidate = (pool as { dialect?: unknown }).dialect;
+  if (
+    candidate !== null &&
+    typeof candidate === 'object' &&
+    typeof (candidate as Dialect).beginStatement === 'function' &&
+    typeof (candidate as Dialect).commitStatement === 'function' &&
+    typeof (candidate as Dialect).rollbackStatement === 'function'
+  ) {
+    return candidate as Dialect;
+  }
+  return postgresDialect;
 }
 
 /**
@@ -226,8 +265,11 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
       const results = await runPipelined(client, queries, pipelineOptions);
       return results as PipelineResults<T>;
     }
-    // Sequential fallback, reuses the same client
-    return await runSequential(client, queries, options);
+    // Sequential fallback, reuses the same client. This is the path every
+    // non-Postgres engine takes (none of their clients expose pg's wire
+    // internals), so it is the one that has to speak the engine's transaction
+    // keywords rather than Postgres's.
+    return await runSequential(client, queries, poolDialect(pool), options);
   } finally {
     client.release();
   }

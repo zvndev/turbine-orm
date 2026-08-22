@@ -18,7 +18,7 @@
  * Env:
  *   ROUNDS=200      interleaved rounds per scenario
  *   WARMUP=20       warmup calls per arm per scenario
- *   STREAM_ROUNDS=9 interleaved rounds for the 50K streaming scenario
+ *   STREAM_ROUNDS=15 interleaved rounds for the 50K streaming scenario
  *   INCLUDE_RC=1    add a fifth arm, drizzle-orm 1.0.0-rc.4 with its JIT row
  *                   mapper enabled (see below)
  *
@@ -60,7 +60,21 @@ import { Bench } from './bench-harness.js';
 const DATABASE_URL = process.env['DATABASE_URL'] ?? 'postgres://localhost:5432/turbine_bench';
 const ROUNDS = parseInt(process.env['ROUNDS'] ?? '200', 10);
 const WARMUP = parseInt(process.env['WARMUP'] ?? '20', 10);
-const STREAM_ROUNDS = parseInt(process.env['STREAM_ROUNDS'] ?? '9', 10);
+/**
+ * 15, not 9.
+ *
+ * Nine rounds is the smallest sample anywhere in this suite (every other
+ * scenario runs 200) and it is spent on the LONGEST scenario, where a single
+ * scheduler stall is a whole-round outlier rather than something a median can
+ * absorb. On a quiet box nine is enough and the p95 sits within ~10% of the
+ * median; on a contended one the same nine rounds produced medians that moved
+ * by more than the difference the scenario is trying to resolve.
+ *
+ * 15 is what `RESULTS-0.72.0.md` used for exactly this drain, so this is the
+ * suite catching up with the repo's own precedent rather than a new number. The
+ * cost is about six extra seconds.
+ */
+const STREAM_ROUNDS = parseInt(process.env['STREAM_ROUNDS'] ?? '15', 10);
 const INCLUDE_RC = process.env['INCLUDE_RC'] === '1';
 /**
  * `TURBINE_JSON` overrides the Turbine arm's relation JSON wire encoding.
@@ -442,7 +456,51 @@ async function main() {
         return n;
       },
     }),
-    { rounds: STREAM_ROUNDS, warmup: 1 },
+    {
+      rounds: STREAM_ROUNDS,
+      warmup: 1,
+      /**
+       * THE ARMS IN THIS SCENARIO ARE NOT DOING THE SAME WORK, and until this
+       * note existed the table said so nowhere.
+       *
+       * Two asymmetries, both measured (`stream-arm-audit.ts` records every
+       * statement each arm puts on the wire; `bench-stream-parity.ts` prices
+       * them):
+       *
+       * 1. UNIT OF WORK. Every competitor arm here pages with keyset
+       *    pagination: it awaits a `SELECT … WHERE id > $1 ORDER BY id LIMIT
+       *    1000`, receives a materialised array, and walks it with a plain
+       *    synchronous `for` loop. One generator suspension per THOUSAND rows.
+       *    The Turbine arm defaults to `findManyStream`, which yields one row
+       *    at a time: one suspension per ROW. Measured at 84-87 ns/row over
+       *    three runs, that is ~4.3 ms of the drain, ~13%, and it is charged to
+       *    Turbine alone because no other arm offers a per-row API to charge it
+       *    to. `TURBINE_STREAM=batches` points this arm at
+       *    `findManyStreamBatches`, whose unit of work IS the competitors', and
+       *    that spelling wins the scenario. Both numbers are true; publishing
+       *    only the first one is not neutral.
+       *
+       * 2. DATABASE WORK. Turbine holds a real `NO SCROLL CURSOR` open in a
+       *    transaction over one unordered sequential scan, and additionally
+       *    pays a speculative `SELECT … LIMIT 1001` that OVERFLOWS on a 50K
+       *    drain and is discarded: 56 statements and 51,001 rows decoded to
+       *    deliver 50,000, against the competitors' 51 statements and 50,000
+       *    rows. That discarded fetch measures 0.63 ms. In exchange the cursor
+       *    reads one consistent snapshot, which keyset paging does not, and it
+       *    is the only arm whose memory is bounded by the SERVER rather than by
+       *    the page size the caller happened to pick.
+       *
+       * So this row compares two different streaming strategies end to end. It
+       * is a fair question to ask and a useful number to have; it is not a
+       * like-for-like decode benchmark, and a reader should not read it as one.
+       */
+      note:
+        'ARMS DIFFER. Turbine = true server-side cursor, and by default the PER-ROW api ' +
+        '(findManyStream, ~86 ns/row of generator suspension = ~13% of the drain); ' +
+        'every other arm = keyset pagination consuming materialised 1000-row arrays. ' +
+        'TURBINE_STREAM=batches selects the unit-of-work-matched Turbine api. ' +
+        'See bench-stream-parity.ts and stream-arm-audit.ts.',
+    },
   );
 
   // 8. atomic increment

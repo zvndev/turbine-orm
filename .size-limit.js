@@ -44,6 +44,40 @@ const nodePlatform = (config) => {
 // or to change the README, and it has to be MADE rather than absorbed by
 // bumping a limit. Every other entry follows the convention above.
 //
+// THE MAIN ENTRY JOINS THAT RULE (2026-08-21), because it is a published claim
+// too and the two numbers had come apart in the worst direction. The README said
+// "under 85 kB brotli ... enforced by size-limit in CI" in two places while the
+// entry measured 85.22 kB and the gate here was 90 kB: the published figure was
+// EXCEEDED, and the gate that was cited as enforcing it enforced something 4.78 kB
+// looser, so nothing would have gone red until long after the sentence stopped
+// being true. Measured 2026-08-21 against the 0.75.0 dist with `npx size-limit`:
+// main 85.22, serverless 67.66, sqlite 70.61, mysql 71.97, mssql 73.33,
+// powdb 89.09, cli 1.71, adapters 1.19, prisma-compat 12.78.
+//
+// So main is 86 kB here and "under 86 kB" in the README, one number in two
+// places, 0.78 kB of headroom. That is a TIGHTENING of the gate (90 -> 86), not
+// a re-baseline to cover a regression, and it is the only move that makes the
+// sentence true without deleting it. When it goes red the same choice applies as
+// for serverless: shrink the graph or change the claim, deliberately, in both
+// files at once. Do not raise this number to make a build pass.
+//
+// BOTH CLAIM-PINNED ENTRIES RE-BASELINED 2026-08-22, at the end of the 0.76.0
+// review-fix sprint. Measured on this build: main 86.14 (limit was 86),
+// serverless 68.27 (limit was 68). Both went red by a few hundred bytes, and
+// both are published claims, so this is the deliberate choice the notes above
+// say has to be made rather than absorbed: main 87 kB, serverless 69 kB, and
+// the README and site sentences moved to the same two numbers in the same
+// commit.
+//
+// The growth is accounted for and it is uniform (+0.92 main, +0.61 serverless),
+// which is the signature of the SHARED client/query graph rather than a new
+// edge. It is this sprint's core fixes: the relation-target global filter now
+// reaching every walker (query/relations.ts, query/where.ts), the `with`-spec
+// shorthand unification behind `relationOptions()`, and the pipeline's dialect
+// parameter. Checked before accepting it: no engine (mssql/mysql/sqlite/powql)
+// and no `cli/` module is reachable from `dist/index.js`, so nothing leaked
+// into the graph.
+//
 // Prior baseline 2026-08-09 at the 0.66.0 SPRINT COMMIT, `npm run build` then
 // `npx size-limit`: main 80.57 kB, serverless 64.16 kB, sqlite 67.11 kB,
 // mysql 68.24 kB, mssql 69.71 kB, powdb 85.03 kB, prisma-compat 12.42 kB.
@@ -177,7 +211,8 @@ export default [
   {
     name: "main entry, import { TurbineClient } from 'turbine-orm'",
     path: 'dist/index.js',
-    limit: '90 kB',
+    // Same number as the README's claim, on purpose. See the note above.
+    limit: '87 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },
@@ -188,7 +223,7 @@ export default [
     // pagination dialect-hook dispatch). These are tiny and engine-neutral, but
     // the edge bundle includes the query builder, so the budget gets a small bump.
     path: 'dist/serverless.js',
-    limit: '68 kB',
+    limit: '69 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },

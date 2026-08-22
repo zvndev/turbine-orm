@@ -11,6 +11,7 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { UnsupportedFeatureError } from '../errors.js';
 import { ALL_POWDB_CAPABILITIES, capabilitiesFromVersion, type PowdbCapabilities, type PowdbPool } from '../powdb.js';
 import { PowqlInterface } from '../powql.js';
 import { UNSAFE } from '../query/index.js';
@@ -336,10 +337,18 @@ describe('powdb nested projections: loader fallbacks', () => {
     assert.doesNotMatch(mock.first().powql, / as t0/);
   });
 
-  it('parent distinct never nests', async () => {
+  it('a parent distinct is refused outright, so the question of nesting never arises', async () => {
+    // This used to assert that `distinct` merely stayed off the nested path.
+    // It never should have reached a plan at all: PowQL's `distinct` is
+    // ROW-WIDE and Postgres's is `DISTINCT ON (col)`, so accepting it returned
+    // a different row set with no error. The refusal now lands one statement
+    // earlier than the nesting decision (see buildFind in powql.ts).
     const mock = mockPool({ rows: [{ id: '1', name: 'Ada', age: 36, author_id: '1' }] });
-    await qi(mock).findMany({ distinct: ['name'], with: { posts: true } });
-    assert.doesNotMatch(mock.first().powql, / as t0/);
+    await assert.rejects(
+      () => qi(mock).findMany({ distinct: ['name'], with: { posts: true } }),
+      UnsupportedFeatureError,
+    );
+    assert.equal(mock.calls.length, 0, 'nothing may reach the engine');
   });
 
   it('an ineligible descendant makes the WHOLE relation fall back', async () => {

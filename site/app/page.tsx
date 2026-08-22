@@ -29,23 +29,22 @@ users[0].posts[0].comments[0].author.name
 // Everything between your code and Postgres:
 //   "dependencies": { "pg": "^8.13.1" }`;
 
-const sqlCode = `SELECT "users".*,
-  (SELECT COALESCE(json_agg(json_build_object(
-    'id', t0."id",
-    'title', t0."title",
-    'comments', (SELECT COALESCE(json_agg(json_build_object(
-      'id', t1."id",
-      'body', t1."body"
+const sqlCode = `SELECT "users"."id", "users"."name", "users"."email",
+  (SELECT COALESCE(json_agg(json_build_array(
+    t0i."id"::text,
+    t0i."title",
+    COALESCE((SELECT COALESCE(json_agg(json_build_array(
+      t1."id"::text,
+      t1."body"
     )), '[]'::json) FROM "comments" t1
-      WHERE t1."post_id" = t0."id")
+      WHERE t1."post_id" = "t0i"."id"), '[]'::json)
   )), '[]'::json)
-  FROM (SELECT * FROM "posts"
-    WHERE "posts"."user_id" = "users"."id"
-    ORDER BY "posts"."created_at" DESC
-    LIMIT 5) t0
+  FROM (SELECT t0."id", t0."title" FROM "posts" t0
+    WHERE t0."user_id" = "users"."id"
+    ORDER BY t0."created_at" DESC
+    LIMIT $2) t0i
   ) AS "posts"
-FROM "users"
-WHERE "users"."org_id" = $1`;
+FROM "users" WHERE "org_id" = $1`;
 
 const pillars = [
   {
@@ -65,21 +64,21 @@ const pillars = [
   {
     title: 'Close to hand-written SQL',
     description:
-      'In the last published run, Turbine ran at 1.08x a hand-written pg control by geometric mean, where Drizzle ran at 1.47x and Prisma at 1.81x. Losses are published with the wins: Drizzle takes streaming, and the benchmarks page states the noise floor next to the numbers.',
+      'In the last published run, Turbine ran at 1.08x a hand-written pg control by geometric mean, where Drizzle ran at 1.47x and Prisma at 1.81x. Losses are published with the wins: the row-at-a-time streaming API still trails the Drizzle 1.0 release candidate, and the benchmarks page states the noise floor next to the numbers.',
     stat: '1.08x',
     statLabel: 'vs raw pg (last run)',
   },
   {
     title: 'Small enough for the edge',
     description:
-      'The main entry is held under 85 kB brotli as an import graph with pg external, the edge entry under 68 kB, enforced by size-limit in CI. One import swap runs the same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase. No separate serverless build, no WASM bundle in your cold start.',
-    stat: '85 kB',
+      'The main entry is held under 87 kB brotli as an import graph with pg external, the edge entry under 69 kB, enforced by size-limit in CI. One import swap runs the same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase. No separate serverless build, no WASM bundle in your cold start.',
+    stat: '87 kB',
     statLabel: 'CI-enforced ceiling',
   },
   {
     title: 'MIT, no cloud tier',
     description:
-      'Studio, doctor, the MCP server, observability: everything named on this site is in the npm package. No paid gateway, no telemetry, no account. All SQL generation routes through a documented Dialect contract, so if you need an engine Turbine does not ship, you extend the seam instead of forking the core.',
+      'Studio, doctor, the MCP server, observability: everything named on this site is in the npm package. No paid tier, no telemetry, no account. All SQL generation routes through a documented Dialect contract, so if you need an engine Turbine does not ship, you extend the seam instead of forking the core.',
     stat: 'MIT',
     statLabel: 'everything in the box',
   },
@@ -92,6 +91,7 @@ const agentTools = [
   ['explain_query', 'EXPLAIN for a schema-validated findMany plan. No free-form SQL input exists.'],
   ['explain_error', 'A Turbine error code mapped to cause, fix, and docs link.'],
   ['sample_rows', 'Up to 50 rows, PII-tagged columns redacted before they reach the model.'],
+  ['compile_query', 'The exact SQL a read query compiles to, without running it. Zero database writes, zero execution.'],
 ];
 
 const safetyFeatures = [
@@ -542,7 +542,7 @@ export default async function Home() {
               <p>
                 A nested read is one statement, at any depth. Turbine compiles{' '}
                 <code>with</code> into correlated <code>json_agg</code> +{' '}
-                <code>json_build_object</code> subqueries, so ten users with
+                <code>json_build_array</code> subqueries, so ten users with
                 their posts and each post&apos;s comments is a single round
                 trip, not an N+1 cascade. The default <code>auto</code>{' '}
                 strategy keeps that plan, falling back to one flat follow-up
@@ -562,7 +562,7 @@ export default async function Home() {
               <ul className="showcase-list">
                 <li>
                   <span className="check">&#10003;</span>
-                  <span>Correlated subqueries with json_agg + json_build_object</span>
+                  <span>Correlated subqueries with json_agg + json_build_array</span>
                 </li>
                 <li>
                   <span className="check">&#10003;</span>
@@ -666,16 +666,16 @@ export default async function Home() {
                 ['Runtime deps', '1 (pg)', '@prisma/client + required driver adapter', '0'],
                 [
                   'Main bundle (brotli)',
-                  '~81 KB import graph, pg external',
+                  'under 87 KB import graph, pg external',
                   '~1.6 MB client (TS/WASM compiler)',
                   '~7 KB core',
                 ],
-                ['Studio', 'Read-only by default', 'Full CRUD, cloud-hosted', 'Drizzle Studio (free; Gateway paid)'],
+                ['Studio', 'Read-only by default', 'Full CRUD, cloud-hosted', 'Drizzle Studio (free)'],
                 ['Index advice', 'turbine doctor, offline, --fix', 'Optimize retired (cloud Query Insights)', 'None'],
                 ['MCP server for agents', '11 read-only tools, PII-redacted', 'Official MCP server', 'drizzle-kit mcp'],
                 ['Error PII safety', 'Keys only by default', 'Values in messages', 'Raw pg errors'],
                 ['Migrations', 'SQL-first, SHA-256 drift detection', 'DSL-generated, shadow DB', 'SQL or Drizzle Kit'],
-                ['Edge runtime', 'One import swap, ~64 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
+                ['Edge runtime', 'One import swap, under 69 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
                 ['Pipeline batching', 'Parse/Bind/Execute protocol', 'Sequential in txn', 'Sequential'],
                 ['Typed errors', 'isRetryable discriminant', 'Error codes only', 'None'],
                 [

@@ -113,7 +113,7 @@ Either path writes three files to `./generated/turbine/` (or your config `out`):
 ## 5. Your first query
 
 ```ts
-import { turbine } from './generated/turbine';
+import { turbine } from './generated/turbine/index.js';
 
 // No arguments needed: turbine() reads DATABASE_URL from the environment.
 // (Pass { connectionString } explicitly if you'd rather not rely on the env var.)

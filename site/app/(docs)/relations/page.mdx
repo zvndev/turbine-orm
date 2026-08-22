@@ -334,8 +334,8 @@ await db.posts.findMany({
 The generated SQL for `with: { user: true }` looks like:
 
 ```sql
-SELECT "posts".*,
-  (SELECT json_build_object('id', t0."id", 'email', t0."email")
+SELECT "posts"."id", "posts"."title", "posts"."user_id",
+  (SELECT json_build_array(t0."id"::text, t0."email")
      FROM "users" t0
      WHERE t0."id" = "posts"."user_id"
      LIMIT 1) AS "user"
@@ -352,7 +352,7 @@ When you don't set `relationLoadStrategy`, Turbine uses **`'auto'`** (since 0.41
 Every strategy returns deep-equal rows, and every strategy agrees about whether a query is *valid*: the whole `with` tree is validated on every strategy, even when the base query matches no rows, with the same error codes. A seeded differential fuzz suite runs the same random queries through the join and batched plans on every release and nightly, asserting row equality and accept/reject agreement.
 
 <Callout type="note" title="Value fidelity across strategies">
-A nested relation is built as JSON (`json_build_object`, `JSON_OBJECT`, `FOR JSON PATH`, `json_group_array`), and a JSON number is an IEEE double, so a value read through a `with` relation could once differ lossily from the same value read at top level or through the batched loader. Fixed per engine: PostgreSQL `numeric` / `int8` / `date` (v0.50); SQLite `INTEGER` and `BLOB`, MySQL `BIGINT`, `DECIMAL` and `VARBINARY`, SQL Server `BIGINT` and `VARBINARY` (v0.51). Divergent columns are carried as text and decoded through each driver's own rule, so all three read paths agree on all four engines. If you read a bigint, decimal or binary column through a `with` relation before v0.51, the values you get back change with the upgrade, to the correct ones.
+A nested relation is built as JSON (`json_build_array` / `json_build_object`, `JSON_OBJECT`, `FOR JSON PATH`, `json_group_array`), and a JSON number is an IEEE double, so a value read through a `with` relation could once differ lossily from the same value read at top level or through the batched loader. Fixed per engine: PostgreSQL `numeric` / `int8` / `date` (v0.50); SQLite `INTEGER` and `BLOB`, MySQL `BIGINT`, `DECIMAL` and `VARBINARY`, SQL Server `BIGINT` and `VARBINARY` (v0.51). Divergent columns are carried as text and decoded through each driver's own rule, so all three read paths agree on all four engines. If you read a bigint, decimal or binary column through a `with` relation before v0.51, the values you get back change with the upgrade, to the correct ones.
 </Callout>
 
 | Rule | Fires when | Why |
@@ -416,7 +416,7 @@ To keep `_count` in the single statement: add the covering index (`npx turbine d
 The correlated-subquery strategy (`relationLoadStrategy: 'join'`) resolves an entire `with` tree in **one** SQL statement: a single round-trip, and an index seek per parent when the child FK is indexed. Two situations favor the alternative:
 
 - **A child FK column is unindexed.** A correlated probe per parent becomes N-parents × full-table-scan. [`npx turbine doctor`](/cli#turbine-doctor) finds these; until the index exists, batched loading pays for its absence only once.
-- **Huge result sets.** Nested JSON (`json_build_object` per row, re-serialized inside `json_agg`) is heavier to encode and decode than flat rows.
+- **Huge result sets.** Nested JSON (one `json_build_array` per row, re-serialized inside `json_agg`) is heavier to encode and decode than flat rows.
 
 Opt in per query, or set a client-wide default:
 
@@ -518,18 +518,26 @@ What `'flatten'` buys: one round-trip, transaction-trivial, no client-side stitc
 
 ## Lean JSON encoding
 
-With the join strategy, each nested row is a `json_build_object('id', …, 'title', …)`: every key name repeats in every row of every relation, and for wide relations over large result sets that repetition dominates the wire payload. `jsonEncoding: 'positional'` (Postgres-only) drops the keys:
+With the join strategy, each nested row has to be encoded as JSON by the server. There are two encodings, and **on PostgreSQL the lean one is the default**.
+
+`jsonEncoding: 'positional'` emits `json_agg(json_build_array(…))`, a key-less array per row. Turbine knows the column order at build time and maps positions back to keys when parsing. The alternative, `'object'`, emits `json_build_object('id', …, 'title', …)`, which repeats every key name in every row of every relation; for wide relations over large result sets that repetition dominates the wire payload.
+
+Measured on the L2 shape: **152 KB to 100 KB** on the wire and **0.685 ms to 0.350 ms** of server time. On a 14-column `hasMany` relation, 39% fewer wire bytes. The parsed rows are **byte-identical** either way; only the wire format changes.
+
+**The default is `'positional'` on PostgreSQL and `'object'` everywhere else.** The default is derived from the dialect, not from a capability flag, so an engine that cannot build a JSON array never selects an encoding its builder would then refuse. You can override it per client or per query:
 
 ```ts
+// per client
 const db = turbine({
   connectionString: process.env.DATABASE_URL,
-  jsonEncoding: 'positional',
+  jsonEncoding: 'object',
 });
+
+// or per query
+await db.users.findMany({ with: { posts: true }, jsonEncoding: 'object' });
 ```
 
-Relation subqueries then emit `json_agg(json_build_array(…))`, a key-less array per row; Turbine knows the column order at build time and maps positions back to keys when parsing. The parsed output is **byte-identical** to the default `'object'` encoding; only the wire format changes.
-
-Measured on a 14-column `hasMany` relation: **39% fewer wire bytes** and ~13% faster end-to-end `findMany`. The win grows with column count and result size. It composes with `select` / `omit`, ordered and limited relations, `hasOne` / `belongsTo`, many-to-many, and nested trees. (`relationLoadStrategy: 'batched'` bypasses it; there is no JSON aggregation on that path.) Default is `'object'`.
+Two things to know. `relationLoadStrategy: 'batched'` bypasses the encoding entirely, since there is no JSON aggregation on that path. And `relationLoadStrategy: 'flatten'` requires `'object'`: under the positional default a flatten-planned relation silently falls back to the correlated subquery (with a once-only warning in development), so pass `jsonEncoding: 'object'` alongside it if you want flatten to engage.
 
 ## SQL template cache size
 

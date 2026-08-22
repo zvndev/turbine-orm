@@ -72,7 +72,7 @@ For an agent that speaks MCP, `npx turbine mcp` exposes the **live database** th
 - `table_stats`: the planner's row estimate and index list, so the agent checks size before writing a query that would scan fifty million rows.
 - `explain_error`: a Turbine error code mapped to cause, fix, and docs link, with no database read at all.
 
-Plus `schema_overview`, `table_detail`, `sample_rows`, `explain_query`, `migrate_status`, and `doctor_report`. Setup and the full tool table: [MCP Server](/mcp).
+Plus `compile_query` (the exact SQL a read query compiles to, without executing it), `schema_overview`, `table_detail`, `sample_rows`, `explain_query`, `migrate_status`, and `doctor_report`. Setup and the full tool table: [MCP Server](/mcp).
 
 ## The deterministic codegen flow
 

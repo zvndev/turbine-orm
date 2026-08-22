@@ -36,10 +36,35 @@
  * next orderBy shape the query builder grows is refused here until someone
  * teaches this walker about it. Over-refusing is a usability bug; under-refusing
  * is a data leak.
+ *
+ * WHY IT RESOLVES NAMES THROUGH THE QUERY MODULE. A guard that decides which
+ * NAMES a query mentions has to decide it the way the compiler does, or it is
+ * guarding a different query than the one that runs. There are two ways the two
+ * can disagree and both have shipped:
+ *
+ *  1. A SPELLING the compiler accepts and the guard does not. Since 0.72 a
+ *     relation may be named by its declared name (`blogPosts`) OR by the table
+ *     spelling anyone reads off the DDL (`blog_posts`), resolved by
+ *     `resolveRelation`; columns have carried the same two-spelling rule
+ *     (`resolveColumnName`) for longer. Both are IMPORTED here rather than
+ *     re-derived: an exact-match lookup answered "not a relation" for the snake
+ *     spelling and the walk simply moved on, so `with: { blog_posts: … }` and
+ *     `where: { blog_posts: { some: … } }` reached the builder unguarded while
+ *     the declared spelling of the identical query was refused. Every fixture in
+ *     the tree used single-word relation names, whose two spellings are the same
+ *     string, so nothing failed.
+ *
+ *  2. A SHAPE the compiler coerces and the guard's `typeof x === 'string'`
+ *     rejects. JS property keys are coerced to strings, so
+ *     `Object.hasOwn(columnMap, ['email'])` is TRUE and the builder resolves
+ *     `distinct: [['email']]` to the same column, emitting byte-identical SQL to
+ *     `distinct: ['email']`. Only the string form was refused. So a
+ *     name-carrying position that is not a string is refused as a SHAPE here,
+ *     never skipped: skipping is the branch that leaks.
  */
 
 import { COLUMN_REF_OPERATORS } from '../query/filters.js';
-import { ownLookup } from '../query/utils.js';
+import { ownLookup, resolveColumnName, resolveRelation } from '../query/utils.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 
 /**
@@ -225,9 +250,16 @@ export function assertNoPiiPredicates(
    * Check one caller-supplied name against `table`. A predicate may name a
    * column by its camelCase field OR by its real column name; both compile to
    * the same SQL, so both have to resolve to the same check.
+   *
+   * `resolveColumnName` IS that rule, imported rather than restated: it is what
+   * `QueryInterface.toColumn` is built on, so the name this guard judges is the
+   * column the statement will actually reference. The `?? name` fallback keeps
+   * an UNRESOLVABLE key flowing into `hiddenReason` verbatim, which matters for
+   * the MCP host, whose policy also hides columns by NAME PATTERN and so has an
+   * opinion about names this schema does not carry.
    */
   const checkColumnName = (table: TableMetadata, name: string): void => {
-    const column = ownLookup(table.columnMap, name) ?? name;
+    const column = resolveColumnName(table, name) ?? name;
     const reason = host.hiddenReason(table, column);
     if (reason) host.refuseColumn(table, column, reason);
   };
@@ -289,7 +321,9 @@ export function assertNoPiiPredicates(
       return;
     }
 
-    const relation = ownLookup(table.relations, key);
+    // `resolveRelation`, not an exact-match lookup: a relation answers to its
+    // declared name AND to the table spelling, and the builder resolves both.
+    const relation = resolveRelation(table.relations, key)?.def;
     if (relation) {
       const target = ownLookup(host.metadata.tables, relation.to);
       // A relation whose target is not in the metadata cannot be walked, and a
@@ -302,7 +336,7 @@ export function assertNoPiiPredicates(
     checkColumnName(table, key);
 
     if (!isObjectLike(value)) return;
-    const column = ownLookup(table.columnMap, key) ?? key;
+    const column = resolveColumnName(table, key) ?? key;
     // FAIL CLOSED. Under a relation, a key that is neither a known relation-value
     // keyword nor a real column of the target, yet carries an object or array, is
     // a shape this walker has never been taught. At clause scope the same key is
@@ -386,15 +420,35 @@ export function assertNoPiiPredicates(
       }
       host.refuseShape(target, 'by');
     }
-    // Any other `by` (number, null, array) names no column and the builder
-    // rejects the shape.
+    // Any other `by` CARRYING A STRUCTURE (an array, most reachably) is refused
+    // rather than assumed inert: the builder reads `.field` off whatever this
+    // is, and "the builder rejects it" is a claim about today's builder. A
+    // scalar `by` (number, null) names nothing under any resolution rule.
+    if (isObjectLike(value)) host.refuseShape(target, 'by');
   };
 
-  /** Field-name lists (`distinct`) name columns directly rather than in a clause. */
-  const visitFieldList = (value: unknown, table: TableMetadata): void => {
-    if (!Array.isArray(value)) return;
+  /**
+   * Field-name lists (`distinct`) name columns directly rather than in a clause.
+   *
+   * EVERY ELEMENT MUST BE A STRING, and a non-string one is refused rather than
+   * skipped. The builder resolves an element through `Object.hasOwn(columnMap,
+   * k)`, and a JS property key is COERCED to a string, so `[['email']]` reads
+   * the same column as `['email']` and emits byte-identical SQL. Skipping the
+   * elements that are not strings therefore refused one spelling of a query and
+   * ran the other. Both forms arrive as plain JSON, so both are reachable over
+   * the wire.
+   *
+   * A FALSY value is absent, matching the builder's own `args.distinct &&
+   * args.distinct.length > 0` gate: refusing `distinct: null` would refuse a
+   * shape that compiles to no SQL at all. Anything else truthy that is not an
+   * array of strings is a shape, not a field list.
+   */
+  const visitFieldList = (value: unknown, table: TableMetadata, argKey: string): void => {
+    if (!value) return;
+    if (!Array.isArray(value)) host.refuseShape(table, argKey);
     for (const field of value) {
-      if (typeof field === 'string') checkColumnName(table, field);
+      if (typeof field !== 'string') host.refuseShape(table, argKey);
+      checkColumnName(table, field);
     }
   };
 
@@ -407,7 +461,7 @@ export function assertNoPiiPredicates(
     // a WHERE range comparison against the sort key, so it reads exactly like a
     // where on the same column.
     visitClause(level.cursor, table, depth);
-    visitFieldList(level.distinct, table);
+    visitFieldList(level.distinct, table, 'distinct');
 
     // FAIL CLOSED one level up: a query-level arg this walker does not know,
     // carrying a structure, could name columns the same way `orderBy` does.
@@ -419,7 +473,11 @@ export function assertNoPiiPredicates(
     const withClause = level.with;
     if (!isPlainObject(withClause)) return;
     for (const [relName, spec] of Object.entries(withClause)) {
-      const relation = ownLookup(table.relations, relName);
+      // Both spellings, same rule as `visitEntry`: the walk has to descend into
+      // `with: { blog_posts: { where: … } }` exactly as it does into
+      // `with: { blogPosts: { where: … } }`, because the builder compiles them
+      // to the same statement.
+      const relation = resolveRelation(table.relations, relName)?.def;
       // `_count` and an unknown relation name are not levels; the builder
       // decides whether they are valid, and neither carries a column name.
       if (!relation || spec === true || !isPlainObject(spec)) continue;

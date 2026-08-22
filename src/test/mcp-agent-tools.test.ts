@@ -1194,7 +1194,15 @@ describe('mcp agent tools: values are the perimeter, names are not', () => {
       assert.doesNotMatch(description, /name of a PII-tagged or secret-named .* is withheld/, tool);
     }
     // sample_rows is the tool that DOES protect, and still says so.
-    assert.match(byName.get('sample_rows') ?? '', /never fetched/);
+    const sampleRowsDescription = byName.get('sample_rows') ?? '';
+    assert.match(sampleRowsDescription, /never fetched/);
+    // ...and, since 0.76.0, says what "hidden" actually depends on. The
+    // guarantee above is unconditional; the SET of hidden columns is not, and a
+    // description that stated only the guarantee let an agent read
+    // `redactedColumns: []` on an untagged schema as "checked, holds no PII".
+    assert.match(sampleRowsDescription, /piiTagSource/, 'must point at the provenance field');
+    assert.match(sampleRowsDescription, /denylist/, 'must say the name check is a fixed list');
+    assert.match(sampleRowsDescription, /untrusted data/, 'rows are a prompt-injection channel and must say so');
     await h.dispose();
   });
 

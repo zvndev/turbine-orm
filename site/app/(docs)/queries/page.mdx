@@ -1199,6 +1199,37 @@ The suggestion covers plain typos and a guess that leaves out a whole word (`log
   set `TURBINE_DISABLE_PREPARED=1` in a deployment you cannot rebuild.
 </Callout>
 
+<Callout type="warning" title="Named statements accumulate, and a request body can choose how many">
+  A named prepared statement is never deallocated: each pooled connection keeps
+  every distinct statement text it has parsed, for as long as the connection
+  lives. That is exactly what makes them fast, and it is safe while the set of
+  texts is fixed by your code. It stops being fixed when a **request** decides
+  the shape.
+
+  Turbine closes the largest case itself. A `where` (or `having`) containing a
+  caller-written `AND` / `OR` **array** writes one parenthesized branch per
+  element into the SQL, so a filter assembled from a UI multi-select mints a new
+  statement text per arity. Those statements are sent **unnamed**, automatically
+  and with no configuration, so they are parsed per execution and never
+  retained. Measured on PostgreSQL 16 before that rule existed: 600 distinct
+  arities left 600 statements and 20.9 MB of resident plan memory on ONE
+  connection, and 200 further executions reclaimed none of it. Note that
+  `in: [...]` was never this shape, since it binds `= ANY($1)`, one parameter
+  whatever the list length.
+
+  **The residual channel is a caller-chosen `select`, `omit` or `with` subset.**
+  Those change the projection, which changes the SQL text, and unlike a
+  combinator arity there is no signal in the shape that says the caller picked
+  it: a hand-written `select` and a `select` built from `req.query.fields` are
+  indistinguishable to the builder. `n` columns have `2^n` subsets. If you build
+  a projection from user input, either map it through a fixed allowlist of a
+  handful of shapes, or set `preparedStatements: false` and pay the re-parse.
+
+  `db.<table>.cacheStats()` is the cheap way to notice: a `hitRate` near zero on
+  a query you believe is repeated means its SHAPE is varying, which is the same
+  condition.
+</Callout>
+
 ## Client escape hatches
 
 | Member | Type | What it is for |

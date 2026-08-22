@@ -68,7 +68,7 @@ import {
 } from './powdb.js';
 import { assertAggregatePiiOptIn } from './query/aggregates.js';
 import { assertWhereIdentifiesOneRow, expandCompoundUniqueWhere } from './query/compound-unique.js';
-import { isJsonFilter, isRelationPickOrderBy, orderByEntries } from './query/filters.js';
+import { ARRAY_OPERATOR_KEYS, isJsonFilter, isRelationPickOrderBy, orderByEntries } from './query/filters.js';
 import type { MiddlewareFn, QueryEvent, QueryInterfaceOptions } from './query/index.js';
 import { warnUnknownQueryOptions } from './query/option-surface.js';
 import { applyStableRelationOrderTo, normalizeWithClause } from './query/relation-names.js';
@@ -101,6 +101,7 @@ import type {
 // engines, so a spread request body cannot turn either on here either.
 import { assertDirectionToken, resolveSkipGlobalFilters, resolveUnsafeFlag, UNSAFE } from './query/types.js';
 import {
+  availableClause,
   escapeLike,
   normalizePagination,
   ownLookup,
@@ -307,8 +308,17 @@ function rejectUnsupportedFilter(value: Record<string, unknown>, field: string):
   if ('path' in value || 'hasKey' in value) {
     throw new UnsupportedFeatureError('JSON path/key filters', 'PowDB', `field "${field}"`);
   }
-  if ('hasEvery' in value || 'hasSome' in value || 'isEmpty' in value) {
-    throw new UnsupportedFeatureError('array filters', 'PowDB', `field "${field}"`);
+  // Enumerated from the SHARED {@link ARRAY_OPERATOR_KEYS} rather than
+  // re-listed here, because the hand-written copy had already drifted from it:
+  // `has` was missing, so `{ tags: { has: 'x' } }` was not recognised as an
+  // array filter at all, fell through to the bare-object equality branch, and
+  // bound the whole `{ has: 'x' }` OBJECT as a scalar parameter. A silent wrong
+  // answer where its three siblings raise E017. Two lists is how that happened;
+  // reading the one the SQL side reads is what stops it happening again.
+  for (const key of ARRAY_OPERATOR_KEYS) {
+    if (key in value) {
+      throw new UnsupportedFeatureError('array filters', 'PowDB', `field "${field}"`);
+    }
   }
   if ('search' in value) {
     throw new UnsupportedFeatureError('full-text search filters', 'PowDB', `field "${field}"`);
@@ -337,7 +347,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const meta = schema.tables[table];
     if (!meta) {
       throw new ValidationError(
-        `[turbine] Unknown table "${table}". Available: ${Object.keys(schema.tables).join(', ')}`,
+        `[turbine] Unknown table "${table}". ${availableClause(Object.keys(schema.tables), 'The schema has no tables.')}`,
       );
     }
     this.meta = meta;
@@ -1397,8 +1407,18 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    */
   private stripWritePii(entity: T | null): T | null {
     if (!entity) return entity;
+    // Same PRIMARY-KEY exemption as the SQL engines' `piiColumns` / `piiFields`
+    // (query/writes.ts), and for the same measured reason: the returned row has
+    // to stay ADDRESSABLE. Without it a PII-tagged key column came back deleted,
+    // so the caller's follow-up `update`/`delete` built its where from a partial
+    // key, the empty-where guard did not fire (the other member was present),
+    // and the write hit every row sharing the remaining member. The policy is
+    // "tag sensitive data, not keys": a PII PK is documented out of scope for
+    // stripping. This docstring already cross-referenced the SQL rule; only the
+    // exemption itself was missing.
+    const pk = new Set(this.meta.primaryKey);
     for (const col of this.meta.columns) {
-      if (col.pii) delete (entity as Record<string, unknown>)[col.field];
+      if (col.pii && !pk.has(col.name)) delete (entity as Record<string, unknown>)[col.field];
     }
     return entity;
   }
@@ -1715,6 +1735,29 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     if ((args as { cursor?: unknown }).cursor) {
       throw new UnsupportedFeatureError('cursor pagination', 'PowDB', 'use limit/offset instead');
     }
+    // `distinct` names COLUMNS: Postgres compiles it to `SELECT DISTINCT ON
+    // (col)`, one row per distinct value of those columns. PowQL's `distinct`
+    // keyword is ROW-WIDE (`SELECT DISTINCT *`) and takes no column list, and
+    // the language has no window functions to rebuild per-column distinct with,
+    // so there is nothing faithful to emit. Accepting the option and emitting
+    // the row-wide keyword returned a DIFFERENT row set under the same
+    // argument, with no error and no warning, which is the one outcome the
+    // dialect seam exists to prevent.
+    //
+    // Refused with the same E017 the other non-Postgres engines already raise
+    // (query/builder.ts's `dialect.name !== 'postgresql'` gate) and in the same
+    // words, so `distinct` now means one thing across every engine and matches
+    // what the README documents. Refused BEFORE the column names are resolved,
+    // matching that gate's position, so `distinct: ['nope']` reports the
+    // unsupported feature rather than the typo on every engine alike.
+    if (args.distinct?.length) {
+      throw new UnsupportedFeatureError(
+        'DISTINCT ON (findMany distinct)',
+        'PowDB',
+        "findMany({ distinct }) requires PostgreSQL: PowQL's `distinct` is row-wide, not per-column. " +
+          'Group in application code, or use groupBy({ by }) for one row per combination.',
+      );
+    }
     const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
     const { cols, forcedPk } = this.projectionPlan(
       args.select as Record<string, boolean> | undefined,
@@ -1723,15 +1766,18 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     );
 
     // Partition the `with` clause: nested-projection blocks vs loader residue.
-    // A parent `distinct` never nests (distinct over a row containing a JSON
-    // array is not a defined comparison), and a relation whose field name
-    // collides with a projected parent column stays on the loaders (its block
-    // key would duplicate the column's).
+    // A relation whose field name collides with a projected parent column stays
+    // on the loaders (its block key would duplicate the column's). A parent
+    // `distinct` used to be a third exclusion here (distinct over a row
+    // containing a JSON array is not a defined comparison); the refusal above
+    // now settles that one statement earlier, so the branch cannot be reached
+    // with a `distinct` present and testing for it again would be dead code
+    // implying the option is still accepted.
     const withClause = args.with as Record<string, unknown> | undefined;
     const nestedPlans: NestedRelationPlan[] = [];
     const linkPlans: LinkPathPlan[] = [];
     let residualWith = withClause;
-    if (withClause && !args.distinct?.length && this.nestedProjectionsPreferred(args)) {
+    if (withClause && this.nestedProjectionsPreferred(args)) {
       const residue: Record<string, unknown> = {};
       for (const [relName, opt] of Object.entries(withClause)) {
         if (!opt) continue;
@@ -1769,12 +1815,6 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const alias = nest ? 't0' : undefined;
     let where = this.buildWhere(resolvedWhere, params, alias);
     where = this.applyGlobalFilter(where, params, args.skipGlobalFilters, alias);
-    // PowQL's `distinct` is row-wide, so these names never reach the emitted
-    // statement. They are still caller-supplied names, and a name resolves or
-    // throws: reading the array for its LENGTH alone let `distinct: ['nope']`
-    // succeed here while every SQL engine refuses it. Validation only.
-    for (const key of args.distinct ?? []) this.column(key as string);
-    const distinct = args.distinct?.length ? ' distinct' : '';
     const filter = where ? ` filter ${where}` : '';
     const order = this.buildOrder(args.orderBy, params, alias);
     const limit = this.effectiveLimit(args);
@@ -1800,7 +1840,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     } else {
       projection = this.projection(cols);
     }
-    const powql = `${this.qt}${nest ? ' as t0' : ''}${distinct}${filter}${order}${limitClause}${offsetClause} ${projection}`;
+    const powql = `${this.qt}${nest ? ' as t0' : ''}${filter}${order}${limitClause}${offsetClause} ${projection}`;
     return { powql, resolvedWhere, nestedPlans, linkPlans, residualWith, forcedPk };
   }
 

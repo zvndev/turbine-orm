@@ -34,7 +34,7 @@ Generation reads the catalog over **TCP**, so the branch's compute must be runni
 For Node.js servers (Express, Fastify, any worker or job), Turbine owns the pool and you get the full feature set: nested `json_agg` reads, transactions, streaming cursors, `LISTEN`/`NOTIFY`, pgvector, RLS.
 
 ```ts
-import { turbine } from './generated/turbine';
+import { turbine } from './generated/turbine/index.js';
 
 const db = turbine({
   connectionString: process.env.DATABASE_URL,
@@ -112,7 +112,7 @@ Run transactional work, streaming, and realtime on a server or worker over the *
 
 ## Why Turbine on BataDB?
 
-- **No WASM**: the edge entry is held under 68 kB brotli in CI (Prisma 7: ~1.6 MB TS/WASM query compiler)
+- **No WASM**: the edge entry is held under 69 kB brotli in CI (Prisma 7: ~1.6 MB TS/WASM query compiler)
 - **Single-query nested reads**: one SQL statement via `json_agg`, not N+1
 - **Pipeline batching**: N queries in 1 round-trip, which matters most on high-latency serverless
 - **No adapter layer**: `turbineHttp(pool, SCHEMA)` with any pg-compatible driver, including `@batadata/serverless`

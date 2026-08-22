@@ -10,7 +10,7 @@ export const metadata = {
 Configure one or more read replicas and Turbine load-balances read-only queries across them, round-robin, while every write stays on the primary. It's one config field, no query-site changes, no separate client.
 
 ```ts
-import { turbine } from './generated/turbine';
+import { turbine } from './generated/turbine/index.js';
 
 const db = turbine({
   connectionString: process.env.DATABASE_URL,          // primary
