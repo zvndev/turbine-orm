@@ -17,7 +17,8 @@
  */
 
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
+import { createRequire } from 'node:module';
+import { describe } from 'node:test';
 import {
   CheckConstraintError,
   ForeignKeyError,
@@ -29,6 +30,25 @@ import {
 import { defineSchema } from '../schema-builder.js';
 import { schemaDefToMetadata } from '../schema-metadata.js';
 import { turbineSqlite } from '../sqlite.js';
+import { skipGate } from './helpers.js';
+
+// `node:sqlite` is a builtin only on Node >= 22.5, and the unit matrix's lowest
+// leg is Node 20, where importing it throws ERR_UNKNOWN_BUILTIN_MODULE. Probed
+// through `createRequire` rather than a static import so this file LOADS there
+// and its tests register as skipped, the same shape src/test/sqlite.test.ts
+// uses. The reason text names `node:sqlite` on purpose: that is what
+// `ENGINE_GATE_PATTERNS.sqlite` matches, so a job setting
+// `TURBINE_REQUIRE_ENGINE=sqlite` gets a throw here rather than a green skip.
+const HAVE_NODE_SQLITE = (() => {
+  try {
+    createRequire(process.cwd())('node:sqlite');
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+const { it } = skipGate(!HAVE_NODE_SQLITE, 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)');
 
 const SCHEMA = schemaDefToMetadata(
   defineSchema({

@@ -38,6 +38,31 @@
  *     workflow (`TURBINE_REQUIRE_ENGINE: postgress`) throws at test time, but
  *     only in the job that has it, and only once someone reads the log.
  *
+ *  4. EVERY FILE THAT CALLS `turbineSqlite()` IS GATED ON `node:sqlite`. Added
+ *     0.76.0 after `src/test/sqlite-error-classification.test.ts` shipped
+ *     ungated: it passed lint, typecheck, the full local suite, the coverage
+ *     gates and the entire `prepublishOnly` chain, and failed only on the
+ *     `unit-tests (20)` matrix leg, which is to say after the release was
+ *     published. Checks 1-3 could not see it, and that is the point: they all
+ *     validate gates that EXIST, and this one asks whether a gate exists.
+ *
+ *     SQLITE ONLY, on purpose. Its precondition is a Node VERSION (`node:sqlite`
+ *     is a builtin only on >= 22.5), so it holds on every developer machine and
+ *     on three of the four unit-matrix legs, which is exactly what makes a
+ *     missing gate invisible until CI. The other three engines gate on an env
+ *     var or an optional peer that CI sets deliberately and that fails loudly in
+ *     the one job that owns it. Extending this to them was tried and produced
+ *     eight false positives on correctly-ungated build-only suites (a test that
+ *     asserts `mssqlDialect` emits SQL Server SQL through a mock driver needs no
+ *     server), and an allowlist that long is the failure mode this file's own
+ *     doctrine warns about.
+ *
+ *     Deliberately shape-agnostic: it looks for the reason TEXT, not for a
+ *     `skipGate` call, because `src/test/sqlite.test.ts` hand-rolls its own
+ *     `{ skip: ... }` wrapper and is correctly gated. The reason text is what
+ *     `TURBINE_REQUIRE_ENGINE` matches on, so it is the thing that has to be
+ *     right either way.
+ *
  * Plus the anti-vacuous-pass rule this repo's other guards already follow (see
  * scripts/check-import-cycles.mjs and scripts/check-error-codes.ts): if the scan
  * finds zero call sites or zero workflow declarations, the layout has moved and
@@ -321,6 +346,126 @@ for (const [token, files] of declared) {
   );
 }
 
+/**
+ * Reason strings in `{ skip: '…' }` position, the hand-rolled gate shape
+ * `src/test/sqlite.test.ts` uses instead of `skipGate`. Both shapes are valid
+ * gates, so both count; nothing else in the file does.
+ */
+function skipPropertyReasons(source: string): string[] {
+  const out: string[] = [];
+  const prop = /\bskip\s*:\s*(['"`])/g;
+  let match: RegExpExecArray | null = prop.exec(source);
+  while (match !== null) {
+    const quote = match[1]!;
+    const start = match.index + match[0].length;
+    let i = start;
+    while (i < source.length) {
+      if (source[i] === '\\') i += 2;
+      else if (source[i] === quote) break;
+      else i++;
+    }
+    out.push(source.slice(start, i));
+    prop.lastIndex = i + 1;
+    match = prop.exec(source);
+  }
+  return out;
+}
+
+// --- Check 4: every engine test file carries that engine's gate -----------
+
+/**
+ * `ENGINE_GATE_PATTERNS` key -> the CALL that actually opens a driver.
+ *
+ * Matched on the factory CALL rather than the module specifier, which is the
+ * whole precision of this check. Every engine module exports two very different
+ * things: a `Dialect` object (`sqliteDialect`), which is a plain value a
+ * build-only test asserts against on any Node version with no driver anywhere,
+ * and the factory, which loads one. Gating on the specifier flagged eight
+ * correctly-ungated build-only suites.
+ */
+const ENGINE_DRIVER_IMPORTS: Readonly<Record<string, RegExp>> = {
+  sqlite: /\bturbineSqlite\s*\(/,
+};
+
+/**
+ * A `node:sqlite` AVAILABILITY PROBE: a runtime require/import of the builtin
+ * inside a try, which is the only way to learn on Node 20 that it is absent
+ * without throwing ERR_UNKNOWN_BUILTIN_MODULE at load.
+ *
+ * THE INVARIANT IS THE PROBE, not the reason text, and that took two wrong cuts
+ * to land on. Matching the reason pattern anywhere in the file is a false
+ * negative: the very file this check exists for says "must not still be the
+ * node:sqlite object" in an assertion message, which satisfies the pattern while
+ * gating nothing. Matching it in skip-REASON position only is a false positive:
+ * three correctly-gated files pass their reason through a variable
+ * (`skip: sqliteSkip`, a struct field), and a text scan cannot follow that.
+ *
+ * The probe is what every correctly-gated file actually has and what the ungated
+ * one lacked, it is unambiguous in source text, and it is the step that has to
+ * happen for any gate to be possible at all. Check 1 then holds the reason
+ * string itself to the pattern, so the two checks cover the two halves.
+ *
+ * Matched as the specifier in CALL position (parenthesized), which covers
+ * `require('node:sqlite')`, `import('node:sqlite')` and the
+ * `createRequire(process.cwd())('node:sqlite')` form all twenty existing call
+ * sites actually use. A `type`-only `from 'node:sqlite'` deliberately does NOT
+ * count and has no parens: it is erased at runtime and tells you nothing about
+ * whether the builtin is there. (Every gated file has both, which is why the
+ * distinction has to be drawn rather than assumed away.)
+ */
+const NODE_SQLITE_PROBE = /\(\s*['"`]node:sqlite['"`]\s*\)/;
+
+/**
+ * Files that import an engine module WITHOUT needing its driver, so no gate is
+ * owed. Exact path match, and each entry says why, on the same rule as
+ * {@link NON_ENGINE_GATES}: an entry here suppresses a build failure.
+ */
+const UNGATED_ENGINE_IMPORTS: Readonly<Record<string, string>> = {
+  // Empty, and that is the result rather than an oversight: with the check
+  // scoped to the `turbineSqlite()` call, every one of the 20 call sites in
+  // src/test/** is genuinely gated. The escape hatch stays because the next file
+  // that legitimately needs it should record WHY here rather than widen the
+  // pattern, on the same rule as NON_ENGINE_GATES above.
+};
+
+let engineFilesChecked = 0;
+for (const file of testFiles(testDir)) {
+  const rel = relative(repoRoot, file).replace(/\\/g, '/');
+  const raw = readFileSync(file, 'utf8');
+  const source = stripComments(raw);
+  // Reason POSITION only, never the whole file. Matching the pattern anywhere
+  // is a false negative with teeth: the ungated file this check was written for
+  // says "and must not still be the node:sqlite object" in an assertion message,
+  // which satisfies `/\bnode:sqlite\b/` while gating nothing. Demonstrated, not
+  // supposed: the first cut of this check passed on that exact file.
+  for (const [token, driverNames] of Object.entries(ENGINE_DRIVER_IMPORTS)) {
+    if (!driverNames.test(source)) continue;
+    engineFilesChecked++;
+    if (rel in UNGATED_ENGINE_IMPORTS) continue;
+    if (NODE_SQLITE_PROBE.test(source)) continue;
+    failures.push(
+      `${rel}: calls turbineSqlite() without first probing that node:sqlite EXISTS ` +
+        `(nothing in the file matches ${NODE_SQLITE_PROBE}).\n` +
+        `    node:sqlite is a builtin only on Node >= 22.5, so this file passes on your machine and on three ` +
+        `of the four unit-matrix legs, and fails on \`unit-tests (20)\` after review.\n` +
+        `    Fix: probe with createRequire(process.cwd())('node:sqlite') in a try/catch and feed the result to ` +
+        `skipGate(...) with a reason naming node:sqlite (that text is what TURBINE_REQUIRE_ENGINE=${token} ` +
+        `matches, so check 1 will then hold you to it), the shape src/test/sqlite.test.ts uses. Or add this ` +
+        `file to UNGATED_ENGINE_IMPORTS with the reason it needs no driver.`,
+    );
+  }
+}
+
+// Anti-vacuous, the same rule checks 1-3 follow: a scan that matched no engine
+// import means the specifiers or the layout moved, not that everything is fine.
+if (engineFilesChecked === 0) {
+  console.error(
+    'check-skip-gate-reasons: found no test file calling an engine factory. ' +
+      'ENGINE_DRIVER_IMPORTS is stale or src/test/ moved; refusing to pass over nothing.',
+  );
+  process.exit(1);
+}
+
 if (failures.length > 0) {
   console.error(`\ncheck-skip-gate-reasons: ${failures.length} problem(s)\n`);
   for (const failure of failures) console.error(`  ${failure}\n`);
@@ -329,5 +474,6 @@ if (failures.length > 0) {
 
 console.log(
   `check-skip-gate-reasons: ${reasonCount} skipGate reason(s) across ${scanned} file(s) are all claimed by an ` +
-    `engine pattern or allowlisted, and all ${tokens.length} token(s) (${tokens.join(', ')}) are set by a CI job.`,
+    `engine pattern or allowlisted, and all ${tokens.length} token(s) (${tokens.join(', ')}) are set by a CI job. ` +
+    `${engineFilesChecked} engine-factory call site(s) are gated or allowlisted.`,
 );
