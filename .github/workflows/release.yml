@@ -646,16 +646,32 @@ jobs:
           SMOKE_DIR=$(mktemp -d)
           cd "$SMOKE_DIR"
           npm init -y > /dev/null
-          # 12 x 10s (2 minutes) was not enough: 0.73.1 published successfully,
-          # with provenance, and was still returning ETARGET when the budget ran
-          # out. Registry propagation is not something this job controls, and the
-          # publish above it is already irreversible, so a budget this tight
-          # turns a GOOD release red and (because the GitHub Release step runs
-          # after this one) leaves the published version with no notes.
-          # 30 x 10s = 5 minutes. A real failure still fails, just later.
+          # THE RETRY BUDGET WAS NEVER THE PROBLEM, and raising it twice is how
+          # we found that out. 0.73.1 failed here at 12 x 10s, the budget went to
+          # 30 x 10s, and 0.77.0 failed at that too, having published fine with
+          # provenance both times.
+          #
+          # The mechanism is npm's CLIENT-SIDE cache, not registry propagation.
+          # registry.npmjs.org serves packuments with `Cache-Control: max-age=300`
+          # and npm's `prefer-online` defaults to false, so for 300 seconds npm
+          # answers from its local cache WITHOUT revalidating. The first attempt,
+          # moments after publish, caches a packument that does not yet list the
+          # new version; every later attempt reads that same cached copy and never
+          # touches the network. 30 x 10s is exactly 300s, so the loop expired at
+          # the precise moment its own cache would have. It could not have
+          # succeeded, at any point, for any release.
+          #
+          # `--prefer-online` forces revalidation on every attempt, which is what
+          # makes the retries mean something. The budget stays at 5 minutes: it is
+          # now a bound on genuine propagation lag rather than a race against a
+          # cache TTL.
+          #
+          # This step runs AFTER an irreversible publish, so its failure message
+          # must not read as "the release failed". By this line the package is on
+          # the registry with provenance and the GitHub Release step still runs.
           INSTALLED=0
           for i in $(seq 1 30); do
-            if npm install "turbine-orm@$PKG_VERSION" --no-audit --no-fund; then
+            if npm install "turbine-orm@$PKG_VERSION" --prefer-online --no-audit --no-fund; then
               INSTALLED=1
               break
             fi
@@ -663,7 +679,7 @@ jobs:
             sleep 10
           done
           if [ "$INSTALLED" != "1" ]; then
-            echo "::error::turbine-orm@$PKG_VERSION never became installable from the registry"
+            echo "::error::turbine-orm@$PKG_VERSION was PUBLISHED but did not become installable within 5 minutes. The package is on the registry; this is a propagation or registry-availability problem, not a bad release. Verify by hand with: npm view turbine-orm@$PKG_VERSION version"
             exit 1
           fi
           node --input-type=module -e "const m = await import('turbine-orm'); if (!m.TurbineClient) { console.error('ESM import missing TurbineClient'); process.exit(1); } console.log('ESM import OK');"
