@@ -2,6 +2,35 @@
 
 Postgres-first TypeScript ORM, with optional SQLite/MySQL/SQL Server engines behind subpath exports. Single-query nested relations via `json_agg`. Postgres remains the default and primary target; the other engines share the same typed API but several flagship features stay Postgres-only (see the capability notes in `dialect.ts` below).
 
+## How work happens here, READ THIS FIRST
+
+Full contract: **`docs/WORKFLOW.md`** (tracked). The non-negotiables, so you do
+not have to open it before your first write:
+
+- **`main` is protected and PR-only.** `ci-ok` is the sole required check and
+  `enforce_admins` is on, so nobody pushes to `main` directly. Branch, push,
+  `gh pr create`, wait for `ci-ok`, merge.
+- **Never `--no-verify`. Never `git worktree`. Never force-push `main`.**
+- **The tag publishes, not `npm publish`.** Land the release commit via PR, then
+  `git tag vX.Y.Z && git push origin vX.Y.Z`; `release.yml` runs the gates and
+  publishes with provenance. A local publish is a gated fallback that refuses
+  unless CI is green on HEAD.
+- **Adding a CI job means adding it to `ci-ok`'s `needs:` AND raising the
+  anti-vacuous count to match.** A test asserts the two are equal.
+- **A skipped suite is not a passing suite.** `TURBINE_REQUIRE_ENGINE` is set on
+  every database job; an unset `DATABASE_URL` otherwise yields "12 tests, 0
+  pass, 0 fail, 12 skipped" and exit 0.
+- **Prove your guard fails.** Break the thing it checks, confirm a useful error,
+  revert. A guard that has never failed is not known to work. This repo has
+  shipped several assertions that were green because they tested nothing.
+- **Prefer a mechanism over a correction.** A document edit re-drifts; a guard
+  does not.
+- **`DATABASE_URL` must be a direct endpoint, never a pooler, and never issue a
+  session-level `SET`.**
+- **This repo is PUBLIC.** See the `Don't` section at the end of this file.
+- **If the plan is wrong, do the right thing and say so.** A recent 14-task plan
+  carried eleven defects, all found during implementation and none in review.
+
 ## Quick Reference
 
 ```bash

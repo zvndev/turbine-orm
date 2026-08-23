@@ -45,11 +45,22 @@ npm run typecheck  # Type checking only
 
 ## Pull Request Process
 
-1. Fork the repo and create a branch from `main`
-2. Make your changes
-3. Add tests for new functionality
-4. Run `npm run typecheck && npm run test:unit` to verify
-5. Open a PR with a clear description of what changed and why
+`main` is protected: `ci-ok` is the only required status check and it applies to
+admins too, so every change lands through a pull request.
+
+1. Create a branch from `main` (`fix/`, `feat/`, `refactor/`, `ci/`, `docs/`)
+2. Make your changes, and add tests for new functionality
+3. Run `npm run typecheck && npm run lint && npm run test:unit` to verify
+4. Open a PR with a clear description of what changed and why
+5. Wait for `ci-ok` to go green, then merge
+
+Do not use `git commit --no-verify`: the pre-commit hook runs Biome and the
+private-material guard.
+
+**Releases are triggered by a tag, not by `npm publish`.** See
+[`docs/WORKFLOW.md`](./docs/WORKFLOW.md) for the full contract covering
+branches, releases, test requirements, the guard set, and the public-repo
+security rules. Read it before a first substantial contribution.
 
 ## Architecture
 
