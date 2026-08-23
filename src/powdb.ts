@@ -75,9 +75,43 @@ import {
 } from './errors.js';
 import importOptionalPeer from './optional-peer-import.cjs';
 import type { PowdbExec } from './powdb-introspect.js';
+import {
+  ALL_POWDB_CAPABILITIES,
+  isDateColumn,
+  type PowdbCapabilities,
+  PowdbFloatParam,
+  PowdbJsonParam,
+  powqlColumnType,
+  quotePowqlIdent,
+  requireCapability,
+} from './powdb-shared.js';
 import type { QueryInterface, QueryInterfaceOptions } from './query/index.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
-import { type ColumnMetadata, normalizeKeyColumns, type SchemaMetadata, type TableMetadata } from './schema.js';
+import { type ColumnMetadata, normalizeKeyColumns, type SchemaMetadata } from './schema.js';
+
+// The shared PowDB primitives live in a leaf module (see powdb-shared.ts): this
+// file re-exports from powql.ts and powdb-introspect.ts, and both of those need
+// the primitives, so keeping them here made the three a runtime cycle. Re-export
+// every name that was public before the split, under its original name, so the
+// `turbine-orm/powdb` surface is unchanged.
+export {
+  ALL_POWDB_CAPABILITIES,
+  coerceNativeValue,
+  coerceValue,
+  isJsonColumn,
+  isPowdbDatetimeColumn,
+  isStaleFramePowdbError,
+  POWQL_KEYWORDS,
+  type PowdbCapabilities,
+  PowdbFloatParam,
+  PowdbJsonParam,
+  type PowqlType,
+  powqlColumnType,
+  quotePowqlDotted,
+  quotePowqlIdent,
+  requireCapability,
+  rowToEntity,
+} from './powdb-shared.js';
 
 /**
  * Capability descriptor for PowDB. PowQL generation is owned by
@@ -149,35 +183,6 @@ function throwNoNestedTransaction(): never {
 
 /** A single value PowDB accepts as a positional `$N` parameter. */
 type PowdbParam = string | number | bigint | boolean | null;
-
-/**
- * Marker wrapper for a value bound to a `float` column. The networked driver
- * unwraps it to the plain number (the wire param is unchanged), but the
- * *embedded* literal encoder reads it to emit a float-form PowQL literal (`42`
- * → `42.0`) so an integer-valued float column stays unambiguously a float.
- * Constructed in {@link PowqlInterface.param}.
- */
-export class PowdbFloatParam {
-  constructor(readonly value: number) {}
-}
-
-/**
- * Marker wrapper for a JS object/array bound to a `json` document column. Both
- * transports serialize `value` with `JSON.stringify` and send the text as a
- * `str` param / string literal, exactly how the PowDB docs insert a json
- * document (the engine validates it as JSON text and stores the canonical
- * binary form). Constructed in {@link PowqlInterface.param} when the target
- * column is `json` and the value is a non-null object/array; a JS string
- * written to a json column passes through RAW (same contract as pg jsonb,
- * pass `'"x"'` to store the JSON string `"x"`), and `null` stays `null`.
- */
-export class PowdbJsonParam {
-  /** `column` is diagnostic only: it names the target column when serialization fails. */
-  constructor(
-    readonly value: unknown,
-    readonly column?: string,
-  ) {}
-}
 
 /** The four shapes a PowQL result takes over the legacy string wire. */
 type PowdbResult =
@@ -269,9 +274,7 @@ export function parsePowdbUrl(connectionString: string): PowdbConnOptions {
     throw new ConnectionError(malformedConnectionStringMessage('PowDB', 'powdb://user:password@127.0.0.1:5433/app'));
   }
   if (u.protocol !== 'powdb:') {
-    throw new ConnectionError(
-      `[turbine] PowDB connection string must use the powdb:// scheme (got "${u.protocol}//…").`,
-    );
+    throw new ConnectionError(`PowDB connection string must use the powdb:// scheme (got "${u.protocol}//…").`);
   }
   const opts: PowdbConnOptions = {
     host: u.hostname || '127.0.0.1',
@@ -299,7 +302,7 @@ export function assertSupportedPowdbVersion(version: string | undefined): void {
   // 0.7.0 is the floor; >= 0.7 (or any 1.x+) passes.
   if (major > 0 || (major === 0 && minor >= 7)) return;
   throw new ConnectionError(
-    `[turbine] turbine-orm/powdb requires PowDB >= ${MIN_POWDB_VERSION}; the server reports "${version}". ` +
+    `turbine-orm/powdb requires PowDB >= ${MIN_POWDB_VERSION}; the server reports "${version}". ` +
       'Upgrade the PowDB server (0.7.0 added the `returning` keyword and the int->float coercion fix Turbine relies on).',
   );
 }
@@ -307,93 +310,6 @@ export function assertSupportedPowdbVersion(version: string | undefined): void {
 // ---------------------------------------------------------------------------
 // Capability gating: per-version / per-transport feature flags
 // ---------------------------------------------------------------------------
-
-/**
- * Feature capabilities of a bound PowDB connection. Resolved once (from the
- * probed server version on the networked transport, or the addon package
- * version on embedded) and carried on the pool so {@link PowqlInterface} can
- * gate PowQL features that only exist on newer engines, an old engine gets a
- * typed {@link UnsupportedFeatureError} (E017) with a version hint instead of a
- * raw PowQL parse error.
- */
-export interface PowdbCapabilities {
-  /** Best-known engine version (e.g. `'0.13.0'`), or `null` when unknowable. */
-  engineVersion: string | null;
-  /** ≥ 0.12: `json` column type, `->` path filters / ordering / grouping. */
-  jsonDocs: boolean;
-  /** ≥ 0.13: `alter T add index (.col->seg)` expression indexes. */
-  docFieldIndexes: boolean;
-  /** ≥ 0.10: `schema` / `describe` introspection statements. */
-  introspection: boolean;
-  /** ≥ 0.13: server-side joins, hash-accelerated and bounded. */
-  serverJoins: boolean;
-  /**
-   * ≥ 0.18: nested projections (shaped results), a projection field may be a
-   * whole correlated child query returning a per-parent JSON array. When set,
-   * eligible `with` clauses compile into the parent statement instead of the
-   * batched loaders.
-   */
-  nestedProjections: boolean;
-  /**
-   * ≥ 0.19: entity links (`link` DDL, scalar/block traversal). Capability is
-   * recognized (probe-only), but query generation deliberately does NOT consume
-   * links yet: turbine keeps composing its own nested projections (see the
-   * PowDB engine page for the rationale). Declaring a link permanently upgrades
-   * the on-disk catalog to v7, so this stays FALSE in ALL_POWDB_CAPABILITIES.
-   */
-  entityLinks: boolean;
-  /**
-   * ≥ 0.19.1: link INTROSPECTION, the `schema links` listing statement and the
-   * appended link rows in `describe <T>`. Only meaningful when probed (there is
-   * no query-generation flip behind it), so it stays FALSE in
-   * ALL_POWDB_CAPABILITIES like the other probe-only gates. Floored at the PATCH
-   * 0.19.1: the listing statement shipped there, not in 0.19.0.
-   */
-  linkIntrospection: boolean;
-  /**
-   * ≥ 0.19.1: scalar to-one link PATHS in query generation. Floored at the PATCH
-   * 0.19.1 (never 0.19.0) because 0.19.0 had silent-wrong-results link bugs
-   * (bare-dotted-path split, wrong aggregates over links) that make traversal
-   * unsafe; 0.19.1 turned those into hard errors. This flag flips real query
-   * generation (a to-one `with` whose child carries bigint/bytes compiles to
-   * link-path projections instead of a loader), so it stays FALSE in
-   * ALL_POWDB_CAPABILITIES: it must only light up behind a real version probe.
-   */
-  linkPaths: boolean;
-  /**
-   * ≥ 0.20: a comparison between a `datetime` column and an integer timestamp
-   * literal evaluates as microseconds. Below 0.20 that pairing was unhandled and
-   * fell back to comparing TYPE TAGS (every DateTime sorted above every Int), so
-   * `>` matched every non-null row, `=` and `<` matched none, and the answer
-   * additionally depended on whether the column carried an index. Turbine binds
-   * a JS `Date` as int micros, so that is exactly the shape it emits: every
-   * datetime predicate was silently wrong on an older engine.
-   *
-   * The `in` / `not in` LIST form is a separate, still-open engine bug that 0.20
-   * did NOT fix, so this flag does not unlock it: a datetime `in` list is
-   * COMPILED AWAY into the equality chain the engine does answer correctly (see
-   * `PowqlInterface.buildInList`). That expansion needs working binary
-   * comparisons, so it too sits behind this flag.
-   *
-   * Predominantly a refusal gate, but the `in` rewrite makes it a (bounded)
-   * generation flip as well. It stays ON in {@link ALL_POWDB_CAPABILITIES}
-   * anyway: with the flag OFF the datetime paths do not fall back to some other
-   * SQL, they refuse outright, so a hand-constructed pool defaulting to OFF
-   * would break datetime queries that work rather than protect anything.
-   */
-  datetimeCompare: boolean;
-  /**
-   * ≥ 0.20: `count(T { .col })` counts non-null values of `.col` (SQL's
-   * `COUNT(col)`), which is what Turbine's per-field `_count` means. Below 0.20
-   * both frontends ignored the projection and returned the ROW count, so
-   * `aggregate({ _count: { field: true } })` silently disagreed with every SQL
-   * engine on a nullable column. `count(T)` / `_count: true` is unaffected on
-   * every version. Refusal-only gate (the emitted PowQL does not change).
-   */
-  projectedCountNonNull: boolean;
-  /** Networked only: server ≥ 0.13 AND the client exposes `queryNativeRaw`. */
-  nativeRaw: boolean;
-}
 
 /**
  * PowQL's parser bounds the SHAPE of the AST it produces, not just its own
@@ -423,81 +339,6 @@ export interface PowdbCapabilities {
  * powql.ts.
  */
 export const POWQL_MAX_NESTING_DEPTH = 64;
-
-/** The feature-gate capability keys (everything except the version/nativeRaw metadata). */
-type PowdbFeatureKey =
-  | 'jsonDocs'
-  | 'docFieldIndexes'
-  | 'introspection'
-  | 'serverJoins'
-  | 'nestedProjections'
-  | 'entityLinks'
-  | 'linkIntrospection'
-  | 'linkPaths'
-  | 'datetimeCompare'
-  | 'projectedCountNonNull';
-
-/**
- * Minimum engine version each gated feature needs, for the E017 hint text.
- * Most gates carry a `major.minor` floor (patch-insensitive); the two link
- * lanes carry a `major.minor.patch` floor (`0.19.1`) because the listing
- * statement and the safe traversal semantics landed in the PATCH release, not
- * in 0.19.0. {@link atLeastVersion} compares all three components, so a
- * `major.minor` floor still matches every patch of that minor.
- */
-const POWDB_FEATURE_MIN_VERSION: Record<PowdbFeatureKey, string> = {
-  introspection: '0.10',
-  jsonDocs: '0.12',
-  docFieldIndexes: '0.13',
-  serverJoins: '0.13',
-  nestedProjections: '0.18',
-  entityLinks: '0.19',
-  linkIntrospection: '0.19.1',
-  linkPaths: '0.19.1',
-  datetimeCompare: '0.20',
-  projectedCountNonNull: '0.20',
-};
-
-/**
- * Trusted-caller default: every FEATURE gate on, engine version unknown. Used
- * for a directly-constructed {@link PowdbPool} / {@link PowdbEmbeddedPool} that
- * did not go through {@link turbinePowDB}'s version probe (e.g. an injected
- * pool, or a unit-test pool). `nativeRaw` stays OFF here because it flips the
- * actual wire path and must only be enabled after a real server-version probe,
- * never inferred from a bare construction. `nestedProjections` stays OFF for
- * the same reason: it changes the generated PowQL for every `with` query, and
- * an unprobed engine below 0.18 would reject the syntax outright.
- * `entityLinks` stays OFF for a stronger reason still: declaring a link
- * one-way-upgrades the on-disk catalog to v7 and locks out pre-0.19 binaries,
- * so it must only ever light up behind a real version probe.
- * `linkIntrospection` / `linkPaths` stay OFF for the same probe-only discipline:
- * `linkPaths` flips real query generation (a to-one `with` compiling to link
- * projections), and `linkIntrospection` is only meaningful once genuinely
- * probed, so both must come from a real version resolution, never a bare
- * construction.
- * `datetimeCompare` / `projectedCountNonNull` stay ON here for the same
- * trusted-caller reason as `jsonDocs` and `serverJoins`. Neither is a fallback
- * gate: with the flag OFF the affected query is REFUSED, not served by some
- * other statement, so defaulting them off would break working queries rather
- * than protect anything. Every path that can learn the engine version
- * (`turbinePowDB`, embedded or networked) resolves them from a real probe; this
- * fallback only covers a hand-constructed or injected pool, whose owner is
- * asserting the engine is current.
- */
-export const ALL_POWDB_CAPABILITIES: PowdbCapabilities = {
-  engineVersion: null,
-  jsonDocs: true,
-  docFieldIndexes: true,
-  introspection: true,
-  serverJoins: true,
-  nestedProjections: false,
-  entityLinks: false,
-  linkIntrospection: false,
-  linkPaths: false,
-  datetimeCompare: true,
-  projectedCountNonNull: true,
-  nativeRaw: false,
-};
 
 /** Parse a PowDB semver prefix (`0.13.0`, `0.13`, `1.2.3-rc`) into components, or `null`. */
 function parsePowdbSemver(version: string | undefined | null): { major: number; minor: number; patch: number } | null {
@@ -571,293 +412,9 @@ export function capabilitiesFromVersion(
   };
 }
 
-/**
- * Throw a version-hinting {@link UnsupportedFeatureError} (E017) when a gated
- * PowQL feature is used on an engine that does not support it. Keeps old engines
- * getting clean typed errors instead of raw PowQL parse failures.
- *
- * The error's first sentence already names the feature (`<feature> is
- * unsupported on "PowDB".`), so the hint says "Requires PowDB >= x" rather than
- * repeating the label: a long feature description read twice in one message
- * (`per-field \`_count\` … is unsupported … per-field \`_count\` … requires …`)
- * buries the version floor that is the actionable part.
- *
- * `extra` appends one more sentence for gates that have a workaround worth
- * naming (e.g. the read path that answers the same query without the gated
- * comparison).
- */
-export function requireCapability(
-  caps: PowdbCapabilities,
-  key: PowdbFeatureKey,
-  feature: string,
-  extra?: string,
-): void {
-  if (caps[key]) return;
-  const min = POWDB_FEATURE_MIN_VERSION[key];
-  const reported = caps.engineVersion
-    ? `this connection reports ${caps.engineVersion}`
-    : 'this connection could not report a version';
-  throw new UnsupportedFeatureError(
-    feature,
-    'PowDB',
-    `Requires PowDB >= ${min}; ${reported}. Upgrade powdb-server / @zvndev/powdb-embedded ` +
-      `(or pass \`assumeEngineVersion\` if the version cannot be detected).${extra ? ` ${extra}` : ''}`,
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Type mapping, Turbine schema type → PowQL DDL type, and value coercion
 // ---------------------------------------------------------------------------
-
-/**
- * PowQL column types Turbine emits: the four writable scalars plus PowDB's
- * native `json` document type (added to the map in the 0.12/0.13 parity round,
- * see {@link isJsonColumn}). A `json` column stores a canonical binary document
- * (sorted keys, int/float distinction preserved) that Turbine writes as a JSON
- * string literal and reads back by parsing the canonical JSON text.
- */
-export type PowqlType = 'str' | 'int' | 'float' | 'bool' | 'json';
-
-/**
- * Does this column map to PowDB's native `json` document type? A Postgres
- * `json`/`jsonb` type (via `dialectType`/`pgType`) is authoritative; otherwise
- * the tsType heuristic (`Record<…>`, `object`, `unknown`, an object/array
- * literal) that the four scalar branches do not claim. Array columns never map
- * to json, a PowDB array only exists INSIDE a json document, so a Postgres
- * array column has no PowDB shape and still throws in {@link powqlColumnType}.
- */
-export function isJsonColumn(col: ColumnMetadata): boolean {
-  if (col.isArray) return false;
-  const dbType = (col.dialectType ?? col.pgType ?? '').toLowerCase();
-  if (dbType === 'json' || dbType === 'jsonb') return true;
-  const ts = col.tsType.replace(/\s*\|\s*null$/i, '').trim();
-  if (ts === 'Date' || ts === 'boolean' || ts === 'number' || ts === 'bigint' || ts === 'string') return false;
-  if (ts === 'Buffer' || ts === 'Uint8Array') return false;
-  return /Record<|object|unknown|\[\]|\{/.test(ts);
-}
-
-/**
- * Map a Turbine column to the PowQL DDL type used in `defineSchema` →
- * `type T { … }`. Turbine never emits PowDB's `uuid`/`datetime`/`bytes` types,
- * which cannot hold client-supplied values on the wire (no literal, no cast):
- *   - `Date` → `int` (epoch micros)   - `boolean` → `bool`
- *   - integral `number`/`bigint` → `int`   - fractional `number` → `float`
- *   - JSON / object columns → `json` (native PowDB document type, ≥ 0.12)
- *   - everything else (incl. UUID/PK strings) → `str`
- * Array (non-json) and bytes columns throw, they have no PowDB equivalent.
- */
-export function powqlColumnType(col: ColumnMetadata): PowqlType {
-  if (col.isArray) {
-    throw new ValidationError(
-      `[turbine] Column "${col.name}" is an array, PowDB has no array type. Arrays are unsupported on the PowDB backend.`,
-    );
-  }
-  if (isJsonColumn(col)) return 'json';
-  const ts = col.tsType.replace(/\s*\|\s*null$/i, '').trim();
-  if (ts === 'Date') return 'int'; // epoch micros
-  if (ts === 'boolean') return 'bool';
-  if (ts === 'number') return isFloatColumn(col) ? 'float' : 'int';
-  if (ts === 'bigint') return 'int';
-  if (ts === 'string') return 'str';
-  if (ts === 'Buffer' || ts === 'Uint8Array') {
-    throw new ValidationError(
-      `[turbine] Column "${col.name}" is binary, PowDB cannot store client-supplied bytes on the wire. Use a string (e.g. base64) instead.`,
-    );
-  }
-  return 'str';
-}
-
-/** Heuristic: does this numeric column hold fractional values (→ PowQL `float`)? */
-function isFloatColumn(col: ColumnMetadata): boolean {
-  const t = (col.dialectType ?? col.pgType ?? '').toLowerCase();
-  return /float|double|real|numeric|decimal|money/.test(t);
-}
-
-/** Is a column stored as `int` epoch micros but surfaced as a JS `Date`? */
-function isDateColumn(col: ColumnMetadata): boolean {
-  return col.tsType.replace(/\s*\|\s*null$/i, '').trim() === 'Date';
-}
-
-/**
- * Is this column stored in PowDB's NATIVE `datetime` type (as opposed to the
- * `int` epoch micros Turbine's own DDL emits for a `Date` column)?
- *
- * Only the literal PowQL type name counts. `powqlColumnType` never returns
- * `datetime`, so a Turbine-provisioned table can never have one; the shapes that
- * do are a table created outside Turbine and read back through
- * `introspectPowdbDatabase` (which maps `datetime` → `{ tsType: 'Date',
- * dialectType: 'datetime' }`), or hand-written metadata declaring it. Deliberately
- * strict: a Postgres-sourced `timestamptz` column is DDL'd as PowQL `int`, so it
- * is NOT a PowDB datetime and must not be caught here.
- *
- * Matters because comparing a datetime column against the integer timestamp
- * literal Turbine binds was silently wrong below engine 0.20 (see
- * {@link PowdbCapabilities.datetimeCompare}).
- */
-export function isPowdbDatetimeColumn(col: ColumnMetadata): boolean {
-  return (col.dialectType ?? col.pgType ?? '').toLowerCase() === 'datetime';
-}
-
-/**
- * Generate PowQL DDL (`type T { … }`) for every table in a schema. Used to
- * provision a PowDB database from a code-first `defineSchema`/`SchemaMetadata`
- * (PowDB has no migration runner yet). The primary key column is declared
- * `required unique`; non-nullable columns are `required`. A server-generated
- * column ({@link ColumnMetadata.isGenerated}) that maps to PowQL `int` gets the
- * `auto` modifier, so PowDB assigns a monotonic id on insert and Turbine stops
- * synthesizing a client-side value for it.
- */
-/**
- * PowQL reserved words, the v0.10 lexer keyword table from POWQL.md's
- * "Reserved Words and Quoting" section, including the v0.10 additions
- * `schema` and `describe`. Keyword matching is case-sensitive in the lexer,
- * so only the exact lowercase form collides.
- */
-export const POWQL_KEYWORDS: ReadonlySet<string> = new Set([
-  'abs',
-  'add',
-  'alter',
-  'and',
-  'as',
-  'asc',
-  'auto',
-  'avg',
-  'begin',
-  'between',
-  'case',
-  'cast',
-  'ceil',
-  'column',
-  'commit',
-  'concat',
-  'conflict',
-  'count',
-  'cross',
-  'date_add',
-  'date_diff',
-  'default',
-  'delete',
-  'dense_rank',
-  'desc',
-  'describe',
-  'distinct',
-  'drop',
-  'else',
-  'end',
-  'exists',
-  'explain',
-  'extract',
-  'false',
-  'filter',
-  'floor',
-  'group',
-  'having',
-  'in',
-  'index',
-  'inner',
-  'insert',
-  'is',
-  'join',
-  'left',
-  'length',
-  'let',
-  'like',
-  'limit',
-  'link',
-  'lower',
-  'match',
-  'materialize',
-  'materialized',
-  'max',
-  'min',
-  'multi',
-  'not',
-  'now',
-  'null',
-  'offset',
-  'on',
-  'or',
-  'order',
-  'outer',
-  'over',
-  'partition',
-  'pow',
-  'rank',
-  'refresh',
-  'required',
-  'returning',
-  'right',
-  'rollback',
-  'round',
-  'row_number',
-  'schema',
-  'select',
-  'sqrt',
-  'substring',
-  'sum',
-  'then',
-  'transaction',
-  'trim',
-  'true',
-  'type',
-  'union',
-  'unique',
-  'update',
-  'upper',
-  'upsert',
-  'view',
-  'when',
-]);
-
-const POWQL_BARE_IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-/**
- * Backtick-quote an identifier when PowQL would otherwise lex it as a keyword
- * (or when it contains characters outside the bare-identifier grammar).
- * Applied only in bare-identifier positions, DDL type/field names, index DDL,
- * and `insert`/`update`/`upsert` assignment targets. Dotted references
- * (`.col` in filters/projections/ordering) bypass keyword lookup on every
- * engine version and deliberately stay bare for ≤0.9 compatibility. Backticks
- * parse on PowDB ≥ 0.10; on older engines these names were already parse
- * errors when emitted bare, so quoting is strictly an improvement.
- */
-export function quotePowqlIdent(name: string): string {
-  if (name.includes('`')) {
-    // The lexer has no backtick escape inside a quoted identifier.
-    throw new ValidationError(`[turbine] Identifier "${name}" contains a backtick, which PowQL cannot represent.`);
-  }
-  return POWQL_KEYWORDS.has(name) || !POWQL_BARE_IDENT.test(name) ? `\`${name}\`` : name;
-}
-
-/**
- * The DOTTED-position spelling of {@link quotePowqlIdent}: quote a name that
- * falls outside the bare-identifier grammar, and only that.
- *
- * A dotted reference (`.col` in a filter, projection, `order`, `group`, or an
- * `upsert on`) bypasses keyword lookup, so `.order` parses on every engine
- * version and stays bare here, which is the ≤0.9 compatibility decision
- * {@link quotePowqlIdent} documents and which this must not undo.
- *
- * What it does NOT excuse is interpolating the name RAW, which is what these
- * sites used to do. Keyword-ness is a parsing question; a name outside
- * `POWQL_BARE_IDENT` is a statement-integrity one, and that name is the only
- * thing that can carry PowQL syntax into a statement whose values are all bound
- * as `$N` params. Reaching it needs a hostile column name (an introspected
- * database, a generator, a migration authored elsewhere) since names come from
- * schema metadata, but "the names are trusted" is not the invariant the rest of
- * this engine is written to. So: bare when the grammar allows it (byte-identical
- * output for every ordinary and every keyword name), quoted when it does not,
- * where the bare form was a parse error anyway. Verified against the engine that
- * a quoted dotted reference parses everywhere the bare one does and yields the
- * same result-column name.
- */
-export function quotePowqlDotted(name: string): string {
-  if (POWQL_BARE_IDENT.test(name)) return name;
-  if (name.includes('`')) {
-    throw new ValidationError(`[turbine] Identifier "${name}" contains a backtick, which PowQL cannot represent.`);
-  }
-  return `\`${name}\``;
-}
 
 /**
  * Options for {@link powqlSchemaDDL}. Additive: with no options the DDL is
@@ -951,6 +508,15 @@ export function powdbLinkStatement(link: PowdbDesiredLink): string {
   );
 }
 
+/**
+ * Generate PowQL DDL (`type T { … }`) for every table in a schema. Used to
+ * provision a PowDB database from a code-first `defineSchema`/`SchemaMetadata`
+ * (PowDB has no migration runner yet). The primary key column is declared
+ * `required unique`; non-nullable columns are `required`. A server-generated
+ * column ({@link ColumnMetadata.isGenerated}) that maps to PowQL `int` gets the
+ * `auto` modifier, so PowDB assigns a monotonic id on insert and Turbine stops
+ * synthesizing a client-side value for it.
+ */
 export function powqlSchemaDDL(schema: SchemaMetadata, opts: PowqlSchemaDDLOptions = {}): string[] {
   const caps = opts.capabilities;
   const stmts: string[] = [];
@@ -1003,9 +569,7 @@ export function powqlSchemaDDL(schema: SchemaMetadata, opts: PowqlSchemaDDLOptio
         if (caps) requireCapability(caps, 'docFieldIndexes', 'JSON doc-field expression indexes');
         const column = idx.columns[0];
         if (column === undefined) {
-          throw new ValidationError(
-            `[turbine] Doc-field index "${idx.name}" on ${meta.name} has no target json column.`,
-          );
+          throw new ValidationError(`Doc-field index "${idx.name}" on ${meta.name} has no target json column.`);
         }
         const segs = idx.docPath.map((s) => (typeof s === 'number' ? `->${s}` : `->${encodePowqlString(s)}`)).join('');
         stmts.push(`alter ${quotePowqlIdent(meta.name)} add ${kind} (.${quotePowqlIdent(column)}${segs})`);
@@ -1143,13 +707,11 @@ function powdbJsonText(param: PowdbJsonParam, position?: string): string {
   try {
     json = JSON.stringify(param.value);
   } catch (err) {
-    throw new ValidationError(
-      `[turbine] The json value ${where} cannot be serialized for PowDB: ${(err as Error).message}`,
-    );
+    throw new ValidationError(`The json value ${where} cannot be serialized for PowDB: ${(err as Error).message}`);
   }
   if (json === undefined) {
     throw new ValidationError(
-      `[turbine] The json value ${where} serializes to nothing (JSON.stringify returned undefined); ` +
+      `The json value ${where} serializes to nothing (JSON.stringify returned undefined); ` +
         'write `null` explicitly instead.',
     );
   }
@@ -1161,7 +723,7 @@ function powdbDateMicros(value: Date, position?: string): bigint {
   const ms = value.getTime();
   if (!Number.isFinite(ms)) {
     throw new ValidationError(
-      `[turbine] Invalid Date${position ? ` (${position})` : ''} cannot be encoded as a PowDB timestamp.`,
+      `Invalid Date${position ? ` (${position})` : ''} cannot be encoded as a PowDB timestamp.`,
     );
   }
   return BigInt(ms) * 1000n;
@@ -1185,112 +747,7 @@ function toPowdbParam(value: unknown, col?: ColumnMetadata): PowdbParam {
     return value;
   }
   // Objects/arrays have no PowDB representation.
-  throw new ValidationError(`[turbine] Value of type ${typeof value} cannot be bound as a PowDB parameter.`);
-}
-
-/**
- * Coerce a single PowDB wire string into the JS value its column type implies.
- * Every PowDB value arrives as a string; NULL arrives as the bareword `"null"`.
- * Metadata resolves the `"null"` ambiguity for nullable non-string columns.
- */
-export function coerceValue(raw: string, col: ColumnMetadata): unknown {
-  const ts = col.tsType.replace(/\s*\|\s*null$/i, '').trim();
-  const json = isJsonColumn(col);
-  // NULL bareword: unambiguous for non-string columns; for `str` we cannot tell a
-  // literal "null" from SQL NULL, so a nullable str of value "null" reads as null.
-  // For a `json` column the bareword `null` (a legacy-wire rendering shared by an
-  // absent value AND a top-level JSON-null document, documented residual,
-  // resolved on the native transport by the WireValue path) maps to null; a JSON
-  // string document "null" renders WITH quotes (`"null"`) and parses distinctly.
-  if (raw === 'null' && (json || ts !== 'string' || col.nullable)) return null;
-  if (json) {
-    try {
-      return JSON.parse(raw);
-    } catch {
-      return raw; // defensive: canonical JSON text always parses
-    }
-  }
-  if (ts === 'Date') {
-    const micros = Number(raw);
-    return Number.isFinite(micros) ? new Date(micros / 1000) : null;
-  }
-  if (ts === 'boolean') return raw === 'true';
-  if (ts === 'number') {
-    const n = Number(raw);
-    // int8 policy: keep precision-losing big integers as strings.
-    return Number.isSafeInteger(n) || !Number.isInteger(n) ? n : raw;
-  }
-  if (ts === 'bigint') return BigInt(raw);
-  return raw; // string / uuid-as-string
-}
-
-/**
- * Coerce a single cell that arrived over the NATIVE typed wire (decoded from a
- * {@link PowdbWireValue}, so already a JS `bigint`/`number`/`boolean`/`string`/
- * `NativeJson`/`Uint8Array`/`null`, never a bare `"null"` string). Unlike
- * {@link coerceValue} this NEVER collapses the string `"null"` to `null`: an
- * absent value already decoded to `null` (from the `empty` cell), so a genuine
- * str `"null"` stays the string `"null"` (fixes the legacy-wire wart on the
- * native transport). `datetime`-shaped cells (int micros) become `Date`; a
- * bigint on a `number` column follows the int8 safe-integer policy.
- *
- * A date cell can also arrive as a DIGIT STRING: a nested-projection block's
- * children ride a JSON array, and micros exceed `Number.MAX_SAFE_INTEGER`'s
- * decimal comfort, so the engine renders them as a JSON string. Before that
- * string was parsed here, a nested `with` handed back the raw micros text while
- * the batched loader and the native join both handed back a `Date` (the same
- * relation, three answers). Only an all-digit string is parsed; any other text
- * on a date column passes through untouched.
- */
-export function coerceNativeValue(value: unknown, col: ColumnMetadata): unknown {
-  if (value === undefined || value === null) return null;
-  if (isDateColumn(col)) {
-    if (typeof value === 'bigint') return new Date(Number(value) / 1000);
-    if (typeof value === 'number') return new Date(value / 1000);
-    if (typeof value === 'string' && /^-?\d+$/.test(value)) return new Date(Number(value) / 1000);
-    return value;
-  }
-  const ts = col.tsType.replace(/\s*\|\s*null$/i, '').trim();
-  if (typeof value === 'bigint') {
-    if (ts === 'bigint') return value;
-    if (ts === 'number') {
-      const n = Number(value);
-      return Number.isSafeInteger(n) ? n : value.toString(); // int8 policy: keep big ints as strings
-    }
-    return value;
-  }
-  return value; // number / boolean / string / NativeJson document / Uint8Array
-}
-
-/**
- * Map one raw PowDB row into a typed entity (camelCase fields, coerced values).
- * Only the columns present in `raw` are emitted, so partial `select`
- * projections round-trip unchanged. `native` selects the coercion policy: the
- * default `false` handles the legacy string wire (every cell is a string, via
- * {@link coerceValue}); `true` handles the native typed wire, where non-string
- * cells arrive pre-typed and go through {@link coerceNativeValue} (see F3).
- * Callers on the native transport pass `this.pool.capabilities.nativeRaw`.
- */
-export function rowToEntity(
-  raw: Record<string, unknown>,
-  meta: TableMetadata,
-  native = false,
-): Record<string, unknown> {
-  const byName = new Map(meta.columns.map((c) => [c.name, c]));
-  const out: Record<string, unknown> = {};
-  for (const snake of Object.keys(raw)) {
-    const col = byName.get(snake);
-    const field = meta.reverseColumnMap[snake] ?? snake;
-    const value = raw[snake];
-    if (!col) {
-      out[field] = value;
-    } else if (native) {
-      out[field] = coerceNativeValue(value, col);
-    } else {
-      out[field] = typeof value === 'string' ? coerceValue(value, col) : value;
-    }
-  }
-  return out;
+  throw new ValidationError(`Value of type ${typeof value} cannot be bound as a PowDB parameter.`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1314,7 +771,7 @@ export function rowToEntity(
  * then fall through to the networked `.code` switch.
  */
 export function wrapPowdbError(err: unknown): Error {
-  if (!err || typeof err !== 'object') return new ConnectionError(`[turbine] PowDB error: ${String(err)}`);
+  if (!err || typeof err !== 'object') return new ConnectionError(`PowDB error: ${String(err)}`);
   const e = err as { code?: string; message?: string };
   const msg = e.message ?? 'unknown PowDB error';
 
@@ -1333,7 +790,7 @@ export function wrapPowdbError(err: unknown): Error {
   // statement reaching an already-closed embedded handle) carry no .code:
   // classify by message so both transports surface E004.
   if (/pool closed|pool acquire timeout|database is closed/i.test(msg)) {
-    return new ConnectionError(`[turbine] PowDB connection unavailable: ${msg}`, { cause: err });
+    return new ConnectionError(`PowDB connection unavailable: ${msg}`, { cause: err });
   }
   // Server-side transaction-gate wait bound (PowDB ≥ 0.10, default 5s): another
   // connection held the single global write lock past the server's
@@ -1354,7 +811,7 @@ export function wrapPowdbError(err: unknown): Error {
     e.code === 'protocol_error' ||
     /received unexpected frame|unknown message type|truncated payload|bad framing/i.test(msg)
   ) {
-    return new ConnectionError(`[turbine] PowDB connection is in an invalid state: ${msg}`, { cause: err });
+    return new ConnectionError(`PowDB connection is in an invalid state: ${msg}`, { cause: err });
   }
   // Read-only refusal → ReadOnlyError (E018). Two engine shapes, both mapped by
   // substring (the networked transport prefixes the message with `query failed:
@@ -1381,7 +838,7 @@ export function wrapPowdbError(err: unknown): Error {
   // fix is to recover the directory with a writable open first.
   if (/cannot open read-only: the WAL is not empty/i.test(msg)) {
     return new ConnectionError(
-      `[turbine] PowDB could not open the directory read-only: ${msg}. Open it once with a writable handle to ` +
+      `PowDB could not open the directory read-only: ${msg}. Open it once with a writable handle to ` +
         'flush the WAL (recover the directory), then reopen it read-only for snapshot serving.',
       { cause: err },
     );
@@ -1393,7 +850,7 @@ export function wrapPowdbError(err: unknown): Error {
   // generic validation regexes below.
   if (/unsupported catalog version/i.test(msg)) {
     return new ConnectionError(
-      `[turbine] PowDB could not open the data directory: ${msg}. This directory uses a newer PowDB catalog ` +
+      `PowDB could not open the data directory: ${msg}. This directory uses a newer PowDB catalog ` +
         'format (a `link` declaration upgrades it to v7); upgrade the PowDB addon/server to a version that can read it.',
       { cause: err },
     );
@@ -1404,20 +861,20 @@ export function wrapPowdbError(err: unknown): Error {
   // transaction-gate timeout below) so the real "query timeout after <n>ms"
   // survives instead of rendering the placeholder "timed out after 0ms".
   if (/query timeout after/i.test(msg)) {
-    return new TimeoutError(0, 'PowDB query', { message: `[turbine] PowDB ${msg}`, cause: err });
+    return new TimeoutError(0, 'PowDB query', { message: `PowDB ${msg}`, cause: err });
   }
   // Client-initiated cancellation → ConnectionError (E004). This is FINAL: the
   // issuing client disconnected, so the query was a clean early return, never
   // auto-retry it (the opt-in stale-read retry only replays stale-FRAME reads).
   if (/query cancelled by client disconnect/i.test(msg)) {
-    return new ConnectionError(`[turbine] PowDB query cancelled by client disconnect: ${msg}`, { cause: err });
+    return new ConnectionError(`PowDB query cancelled by client disconnect: ${msg}`, { cause: err });
   }
   // Bounded join rejection → ValidationError (E003). The engine rejects a pure
   // nested-loop join whose candidate-pair count (or result row count) exceeds
   // the safety bound BEFORE executing, and names the fix in the message, keep
   // that fix-hint intact so the caller knows how to make the join eligible.
   if (/nested-loop join would evaluate|join result exceeds row limit/i.test(msg)) {
-    return new ValidationError(`[turbine] PowDB join rejected: ${msg}`);
+    return new ValidationError(`PowDB join rejected: ${msg}`);
   }
   // Entity-link misuse hard errors (0.19.1 turned the two silent-wrong-results
   // 0.19.0 behaviors into hard errors) → ValidationError (E003), a query defect
@@ -1429,7 +886,7 @@ export function wrapPowdbError(err: unknown): Error {
   // always aliases and never aggregates over a link), so these fire only for a
   // raw user PowQL string; mapping them keeps that path typed.
   if (/is ambiguous in a projection|aggregates over a nested or link projection/i.test(msg)) {
-    return new ValidationError(`[turbine] PowDB query rejected: ${msg}`);
+    return new ValidationError(`PowDB query rejected: ${msg}`);
   }
   // Corrupt storage → ConnectionError (E004). PowDB 0.20 verifies page checksums
   // at table-OPEN time and fails closed (previously the open scan skipped the bad
@@ -1440,7 +897,7 @@ export function wrapPowdbError(err: unknown): Error {
   // from a backup is the documented recovery, so say so.
   if (/page corrupt|catalog corrupt|corrupt heap superblock|CRC32 mismatch/i.test(msg)) {
     return new ConnectionError(
-      `[turbine] PowDB refused to open a corrupt data directory: ${msg}. PowDB verifies page checksums on open ` +
+      `PowDB refused to open a corrupt data directory: ${msg}. PowDB verifies page checksums on open ` +
         'and fails closed rather than serving partial data; there is no skip-corrupt-pages mode, so recover by ' +
         'restoring the directory from a backup.',
       { cause: err },
@@ -1457,7 +914,7 @@ export function wrapPowdbError(err: unknown): Error {
     if (m) {
       const where = m[2] ? ` on table "${m[2]}"` : '';
       return new ValidationError(
-        `[turbine] PowDB rejected column "${m[1]}"${where}: it does not exist in the live catalog. ` +
+        `PowDB rejected column "${m[1]}"${where}: it does not exist in the live catalog. ` +
           'The schema metadata Turbine is using has drifted from the database; re-derive it ' +
           '(`schemaDefToMetadata` / `introspectPowdbDatabase`) or apply the missing DDL. ' +
           `(engine: ${msg})`,
@@ -1472,7 +929,7 @@ export function wrapPowdbError(err: unknown): Error {
     const m = /type mismatch for column '([^']+)': expected ([^,]+), got (\w+)/i.exec(msg);
     if (m) {
       return new ValidationError(
-        `[turbine] PowDB rejected a comparison on column "${m[1]}": the column is ${m[2]} but the bound value is ` +
+        `PowDB rejected a comparison on column "${m[1]}": the column is ${m[2]} but the bound value is ` +
           `${m[3]}. PowQL never coerces across types in a comparison (before engine 0.20 this silently matched ` +
           "every row), so bind a value of the column's own type.",
       );
@@ -1484,7 +941,7 @@ export function wrapPowdbError(err: unknown): Error {
   // rejected outright (see POWQL_MAX_NESTING_DEPTH).
   if (/nesting depth exceeds maximum/i.test(msg)) {
     return new ValidationError(
-      `[turbine] PowDB rejected the query: ${msg}. PowQL bounds the shape of the predicate tree, and a flat ` +
+      `PowDB rejected the query: ${msg}. PowQL bounds the shape of the predicate tree, and a flat ` +
         `\`OR\` / \`AND\` array counts one level per term (roughly ${POWQL_MAX_NESTING_DEPTH - 1} terms at the top ` +
         'level, fewer inside a nested `with` block). Split a large `OR` / `AND` array into several queries and ' +
         'merge the results, or express it as a single `in` list, which is one flat node and does not count ' +
@@ -1495,7 +952,7 @@ export function wrapPowdbError(err: unknown): Error {
   // client-side before emitting, so this is the backstop for a raw PowQL string.
   if (/(limit|offset) must not be negative/i.test(msg)) {
     return new ValidationError(
-      `[turbine] PowDB rejected the query: ${msg}. Pass a non-negative \`limit\` / \`offset\` ` +
+      `PowDB rejected the query: ${msg}. Pass a non-negative \`limit\` / \`offset\` ` +
         '(before engine 0.20 a negative limit was ignored and returned every row).',
     );
   }
@@ -1506,7 +963,7 @@ export function wrapPowdbError(err: unknown): Error {
   // remedies instead of letting it fall through untyped.
   if (/result too large: \d+ cells/i.test(msg)) {
     return new ValidationError(
-      `[turbine] PowDB result too large to decode: ${msg}. The client caps one result frame at 2,000,000 cells ` +
+      `PowDB result too large to decode: ${msg}. The client caps one result frame at 2,000,000 cells ` +
         '(rows x columns). Page the query with `limit` / `offset`, or narrow the row with `select` so each row ' +
         'carries fewer columns.',
     );
@@ -1526,9 +983,9 @@ export function wrapPowdbError(err: unknown): Error {
   if (typeof wireClass === 'number') {
     switch (wireClass) {
       case 3: // timeout (per-query budget, gate wait, idle timeout), retryable
-        return new TimeoutError(0, 'PowDB query', { message: `[turbine] PowDB ${msg}`, cause: err });
+        return new TimeoutError(0, 'PowDB query', { message: `PowDB ${msg}`, cause: err });
       case 4: // limit_exceeded (memory / size budget), a query-shape defect
-        return new ValidationError(`[turbine] PowDB resource limit exceeded: ${msg}`);
+        return new ValidationError(`PowDB resource limit exceeded: ${msg}`);
       case 5: // readonly_refused, the snapshot-serving routing signal
         return new ReadOnlyError(`PowDB refused a write on a read-only database: ${msg}.`, {
           cause: err,
@@ -1536,12 +993,12 @@ export function wrapPowdbError(err: unknown): Error {
         });
       case 6: // auth_failed at CONNECT
         return new ConnectionError(
-          `[turbine] PowDB authentication failed: ${msg} (check the user / password / dbName for this connection).`,
+          `PowDB authentication failed: ${msg} (check the user / password / dbName for this connection).`,
           { cause: err },
         );
       case 7: // rate_limited (repeated bad auth), connection-establishment class
         return new ConnectionError(
-          `[turbine] PowDB rate-limited this address after repeated failed authentication: ${msg}. Wait before retrying.`,
+          `PowDB rate-limited this address after repeated failed authentication: ${msg}. Wait before retrying.`,
           { cause: err },
         );
       case 8: {
@@ -1550,10 +1007,10 @@ export function wrapPowdbError(err: unknown): Error {
         return new UniqueConstraintError({ constraint: m?.[1], cause: err as Error });
       }
       case 9: // cancelled (issuing client disconnected), final, never retry
-        return new ConnectionError(`[turbine] PowDB query cancelled by client disconnect: ${msg}`, { cause: err });
+        return new ConnectionError(`PowDB query cancelled by client disconnect: ${msg}`, { cause: err });
       case 1: // parse
       case 2: // execution
-        return new ValidationError(`[turbine] PowDB query rejected: ${msg}`);
+        return new ValidationError(`PowDB query rejected: ${msg}`);
       default: // internal (0) or an unknown future class: fall through
         break;
     }
@@ -1563,19 +1020,19 @@ export function wrapPowdbError(err: unknown): Error {
   // signal we get (code is always 'GenericFailure'); on the networked path they
   // are a safety net before the .code switch.
   if (/type mismatch|\bParse\b|\bExecution\b|StorageError|unexpected|row too large/i.test(msg)) {
-    return new ValidationError(`[turbine] PowDB query rejected: ${msg}`);
+    return new ValidationError(`PowDB query rejected: ${msg}`);
   }
 
   switch (e.code) {
     case 'connect_failed':
     case 'closed':
-      return new ConnectionError(`[turbine] PowDB connection failed: ${msg}`, { cause: err });
+      return new ConnectionError(`PowDB connection failed: ${msg}`, { cause: err });
     case 'auth_failed':
       // Connection-establishment class, non-retryable: the handshake was
       // rejected. Surface E004 with a concrete remediation hint instead of
       // letting it fall through to the raw error.
       return new ConnectionError(
-        `[turbine] PowDB authentication failed: ${msg} (check the user / password / dbName for this connection).`,
+        `PowDB authentication failed: ${msg} (check the user / password / dbName for this connection).`,
         { cause: err },
       );
     case 'timeout':
@@ -1584,26 +1041,10 @@ export function wrapPowdbError(err: unknown): Error {
     case 'query_failed':
     case 'type_coercion_failed':
     case 'size_exceeded':
-      return new ValidationError(`[turbine] PowDB query rejected: ${msg}`);
+      return new ValidationError(`PowDB query rejected: ${msg}`);
     default:
-      return err instanceof Error ? err : new ConnectionError(`[turbine] PowDB error: ${msg}`, { cause: err });
+      return err instanceof Error ? err : new ConnectionError(`PowDB error: ${msg}`, { cause: err });
   }
-}
-
-/**
- * True when `err` is the stale-wire-frame {@link ConnectionError} produced by
- * {@link wrapPowdbError} (its `.cause` is a `protocol_error` PowDBError, or the
- * message carries the invalid-state signature). The opt-in read retry
- * (`retryStaleReads`, evaluated in {@link PowqlInterface}'s exec seam) uses this
- * to decide whether a first-statement READ may be replayed once on a fresh
- * connection; writes are NEVER retried (an ambiguous mutation reply is unsafe
- * to replay, matching the client's own native-path policy).
- */
-export function isStaleFramePowdbError(err: unknown): boolean {
-  if (!(err instanceof ConnectionError)) return false;
-  const cause = (err as { cause?: { code?: string } }).cause;
-  if (cause && typeof cause === 'object' && cause.code === 'protocol_error') return true;
-  return /PowDB connection is in an invalid state/.test(err.message);
 }
 
 // ---------------------------------------------------------------------------
@@ -2075,7 +1516,7 @@ export class PowdbPool implements PgCompatPool {
    */
   private assertOpen(): void {
     if (this.closed) {
-      throw new ConnectionError('[turbine] The PowDB pool is closed, disconnect() was already called on this client.');
+      throw new ConnectionError('The PowDB pool is closed, disconnect() was already called on this client.');
     }
   }
 
@@ -2303,7 +1744,7 @@ export function encodePowqlLiteral(value: unknown, position?: string): string {
   const at = position ? ` (${position})` : '';
   if (value instanceof PowdbFloatParam) {
     const n = value.value;
-    if (!Number.isFinite(n)) throw new ValidationError(`[turbine] Non-finite float cannot be encoded for PowDB${at}.`);
+    if (!Number.isFinite(n)) throw new ValidationError(`Non-finite float cannot be encoded for PowDB${at}.`);
     // Force a float-form literal so an integer-valued float column stays a float.
     const text = powqlNumberText(n);
     return text.includes('.') ? text : `${text}.0`;
@@ -2316,14 +1757,13 @@ export function encodePowqlLiteral(value: unknown, position?: string): string {
   if (typeof value === 'boolean') return value ? 'true' : 'false';
   if (typeof value === 'bigint') return value.toString();
   if (typeof value === 'number') {
-    if (!Number.isFinite(value))
-      throw new ValidationError(`[turbine] Non-finite number cannot be encoded for PowDB${at}.`);
+    if (!Number.isFinite(value)) throw new ValidationError(`Non-finite number cannot be encoded for PowDB${at}.`);
     // Renders an integer as an int literal (`42`) and a fractional number as a
     // float literal (`4.2`); PowQL distinguishes them by the dot.
     return powqlNumberText(value);
   }
   if (typeof value === 'string') return encodePowqlString(value, position);
-  throw new ValidationError(`[turbine] Value of type ${typeof value} cannot be encoded as a PowDB literal${at}.`);
+  throw new ValidationError(`Value of type ${typeof value} cannot be encoded as a PowDB literal${at}.`);
 }
 
 /**
@@ -2343,7 +1783,7 @@ function powqlNumberText(n: number): string {
   if (Number.isInteger(n)) return BigInt(n).toString();
   const m = /^(-?)(\d+)(?:\.(\d+))?[eE]([+-]?\d+)$/.exec(s);
   if (!m) {
-    throw new ValidationError(`[turbine] Number ${s} cannot be rendered as a PowDB literal.`);
+    throw new ValidationError(`Number ${s} cannot be rendered as a PowDB literal.`);
   }
   const sign = m[1] ?? '';
   const intPart = m[2] ?? '';
@@ -2410,7 +1850,7 @@ export const POWQL_LEXER_TESTED_CEILING = '0.20';
 function encodePowqlString(s: string, position?: string): string {
   if (s.includes('\0')) {
     throw new ValidationError(
-      `[turbine] String value${position ? ` (${position})` : ''} contains a NUL byte (U+0000), which PowQL string ` +
+      `String value${position ? ` (${position})` : ''} contains a NUL byte (U+0000), which PowQL string ` +
         'literals cannot represent. Strip it before writing.',
     );
   }
@@ -2437,7 +1877,7 @@ export function materializePowql(powql: string, params: unknown[]): string {
   return powql.replace(/\$(\d+)/g, (_m, n: string) => {
     const idx = Number(n) - 1;
     if (idx < 0 || idx >= params.length) {
-      throw new ValidationError(`[turbine] PowQL placeholder $${n} has no bound parameter (have ${params.length}).`);
+      throw new ValidationError(`PowQL placeholder $${n} has no bound parameter (have ${params.length}).`);
     }
     return encodePowqlLiteral(params[idx], `parameter $${n}`);
   });
@@ -2531,7 +1971,7 @@ export class PowdbEmbeddedPool implements PgCompatPool {
       (engineSem.major > ceiling.major || (engineSem.major === ceiling.major && engineSem.minor > ceiling.minor))
     ) {
       throw new ValidationError(
-        `[turbine] Refusing the PowDB legacy string wire: this embedded addon reports engine ` +
+        `Refusing the PowDB legacy string wire: this embedded addon reports engine ` +
           `${this.capabilities.engineVersion}, which is newer than the escaper's verified lexer range ` +
           `(<= ${POWQL_LEXER_TESTED_CEILING}) AND such an addon exposes the parameterized native API, so ` +
           `reaching the legacy materialize path means the queryWithParams feature-detect failed. Upgrade ` +
@@ -2554,9 +1994,7 @@ export class PowdbEmbeddedPool implements PgCompatPool {
     holdRef: { hold: PowdbTxHold | null },
   ): Promise<PgCompatQueryResult> {
     if (this.closed) {
-      throw new ConnectionError(
-        '[turbine] The PowDB embedded pool is closed: disconnect() was already called on this client.',
-      );
+      throw new ConnectionError('The PowDB embedded pool is closed: disconnect() was already called on this client.');
     }
     const ctl = txControl(powql);
     if (ctl === 'begin') {
@@ -2571,9 +2009,7 @@ export class PowdbEmbeddedPool implements PgCompatPool {
       if (this.closed) {
         holdRef.hold.finish();
         holdRef.hold = null;
-        throw new ConnectionError(
-          '[turbine] The PowDB embedded pool is closed: disconnect() was already called on this client.',
-        );
+        throw new ConnectionError('The PowDB embedded pool is closed: disconnect() was already called on this client.');
       }
     }
     if ((ctl === 'commit' || ctl === 'rollback') && holdRef.hold === null) {
@@ -2816,7 +2252,7 @@ async function loadPowdb(): Promise<PowdbModule> {
     return (await importOptionalPeer('@zvndev/powdb-client')) as unknown as PowdbModule;
   } catch (err) {
     throw new ConnectionError(
-      "[turbine] turbine-orm/powdb requires the optional peer dependency '@zvndev/powdb-client'. Install it: npm i @zvndev/powdb-client, " +
+      "turbine-orm/powdb requires the optional peer dependency '@zvndev/powdb-client'. Install it: npm i @zvndev/powdb-client, " +
         'or construct the PowDB pool yourself and inject it: turbinePowDB(pool, schema). ' +
         `(${(err as Error).message})`,
     );
@@ -2838,7 +2274,7 @@ async function loadPowdbEmbedded(): Promise<EmbeddedModule> {
     mod = (await importOptionalPeer('@zvndev/powdb-embedded')) as unknown as EmbeddedModule;
   } catch (err) {
     throw new ConnectionError(
-      "[turbine] turbine-orm/powdb embedded mode requires the optional peer '@zvndev/powdb-embedded'. " +
+      "turbine-orm/powdb embedded mode requires the optional peer '@zvndev/powdb-embedded'. " +
         'Install it: npm i @zvndev/powdb-embedded. If install succeeded but loading failed, your platform has no ' +
         'prebuilt binary (prebuilts ship for macOS arm64/x64 and Linux glibc x64/arm64; Intel-mac/musl/Windows ' +
         'build from source), build it with `npm run build` in the addon, then retry. You can also construct the ' +
@@ -2848,7 +2284,7 @@ async function loadPowdbEmbedded(): Promise<EmbeddedModule> {
   }
   if (!mod || typeof mod.Database?.open !== 'function') {
     throw new ConnectionError(
-      "[turbine] '@zvndev/powdb-embedded' loaded but did not export Database.open, the installed version is " +
+      "'@zvndev/powdb-embedded' loaded but did not export Database.open, the installed version is " +
         'likely incompatible (turbine-orm/powdb embedded requires @zvndev/powdb-embedded ^0.7.0).',
     );
   }
@@ -2881,7 +2317,7 @@ async function openEmbeddedPool(
   // there, reject the combination loudly rather than silently ignoring one.
   if (readonly && syncMode !== undefined) {
     throw new ValidationError(
-      '[turbine] embedded `syncMode` is meaningless with `readonly: true` (a read-only database never writes). Remove one.',
+      'embedded `syncMode` is meaningless with `readonly: true` (a read-only database never writes). Remove one.',
     );
   }
   let db: EmbeddedDatabase;
@@ -2893,21 +2329,21 @@ async function openEmbeddedPool(
       if (memoryLimit !== undefined) {
         if (typeof mod.Database.openReadOnlyWithMemoryLimit !== 'function') {
           throw new ConnectionError(
-            '[turbine] embedded `readonly` + `memoryLimit` requires @zvndev/powdb-embedded >= 0.14 (openReadOnlyWithMemoryLimit).',
+            'embedded `readonly` + `memoryLimit` requires @zvndev/powdb-embedded >= 0.14 (openReadOnlyWithMemoryLimit).',
           );
         }
         db = mod.Database.openReadOnlyWithMemoryLimit(dir, memoryLimit);
       } else {
         if (typeof mod.Database.openReadOnly !== 'function') {
           throw new ConnectionError(
-            '[turbine] embedded `readonly: true` requires @zvndev/powdb-embedded >= 0.14 (the installed addon has no openReadOnly).',
+            'embedded `readonly: true` requires @zvndev/powdb-embedded >= 0.14 (the installed addon has no openReadOnly).',
           );
         }
         db = mod.Database.openReadOnly(dir);
       }
     } else if (memoryLimit !== undefined) {
       if (typeof mod.Database.openWithMemoryLimit !== 'function') {
-        throw new ConnectionError('[turbine] embedded `memoryLimit` requires @zvndev/powdb-embedded ≥ 0.7.1.');
+        throw new ConnectionError('embedded `memoryLimit` requires @zvndev/powdb-embedded ≥ 0.7.1.');
       }
       db = mod.Database.openWithMemoryLimit(dir, memoryLimit);
     } else {
@@ -2915,12 +2351,12 @@ async function openEmbeddedPool(
     }
   } catch (err) {
     if (err instanceof ConnectionError) throw err;
-    throw new ConnectionError(`[turbine] PowDB embedded could not open data dir "${dir}": ${(err as Error).message}`);
+    throw new ConnectionError(`PowDB embedded could not open data dir "${dir}": ${(err as Error).message}`);
   }
   if (syncMode !== undefined) {
     if (typeof db.setSyncMode !== 'function') {
       throw new ConnectionError(
-        '[turbine] embedded `syncMode` requires @zvndev/powdb-embedded ≥ 0.7.1 (the installed addon has no setSyncMode).',
+        'embedded `syncMode` requires @zvndev/powdb-embedded ≥ 0.7.1 (the installed addon has no setSyncMode).',
       );
     }
     db.setSyncMode(syncMode);

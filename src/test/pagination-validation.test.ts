@@ -52,8 +52,14 @@ function assertPaginationError(err: unknown, needle: string): true {
   assert.ok(err instanceof ValidationError, `expected ValidationError, got ${String(err)}`);
   assert.equal(err.code, TurbineErrorCode.VALIDATION);
   assert.match(err.message, /must be a non-negative integer/);
-  // Message shape matches the rest of query/: `[turbine]` prefix + the table.
-  assert.ok(err.message.includes('[turbine] '), `message should carry the [turbine] prefix: ${err.message}`);
+  // Message shape matches the rest of query/: ONE prefix, the code tag that
+  // formatErrorMessage adds, and then the table. A hand-written `[turbine] `
+  // would sit behind the tag and double it.
+  assert.ok(
+    err.message.startsWith(`[${TurbineErrorCode.VALIDATION}] `),
+    `message should open with the code tag: ${err.message}`,
+  );
+  assert.doesNotMatch(err.message, /\[turbine\]/, `message should carry no second prefix: ${err.message}`);
   assert.ok(err.message.includes('on "users"'), `message should name the table: ${err.message}`);
   assert.ok(err.message.includes(needle), `message should name "${needle}": ${err.message}`);
   return true;

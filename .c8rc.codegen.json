@@ -1,0 +1,26 @@
+{
+  "//": "Coverage ratchet for the two code-generation modules, which .c8rc.json excludes from the main gate and which therefore sat in no gate at all. The goal is not a high number, it is that the number cannot fall silently, which is verbatim the argument .c8rc.json's //cli-gate note makes for the CLI files it does gate. introspect.ts carries a stated correctness invariant (determinism: every catalog query orders explicitly, because creation order used to decide which relation won a name), and generate.ts writes executable TypeScript from database-controlled identifiers, which is the highest-consequence untested code in the package. Both were excluded from all measurement. Same ratchet argument.",
+  "//reads-the-main-collection": "temp-directory is the MAIN run's `coverage/tmp`, so this adds no test execution: `npm run test:coverage` collects, this re-reports the same bytes under a different include set. reports-dir is its own directory so it cannot overwrite coverage/lcov.info, which the main report owns.",
+  "//why-not-c8-report": "This gate is read through scripts/coverage-report.mjs, not `c8 report`, for the same reason the main gate is: c8 merges every process's V8 coverage before converting to istanbul and that merge is not monotonic past roughly 350 process files. The main collection is 418. Stock c8 and the istanbul merge happened to AGREE on these two files when the floors below were measured (96.66 both ways), which is exactly what the //merge-bug note predicts wherever stock c8 is still monotonic, and is not a property a release gate may depend on: the collapse bisects to a single added test file, so the next file added to the suite can move it. Reading through the sound merge costs nothing and removes the question.",
+  "//per-file": "per-file is TRUE, so each module must independently clear the floors below. An aggregate over two files of similar size lets the weaker one spend the slack the stronger one earned, which is the masking .c8rc.json's //cli-gate-per-file note describes one level down: at the measured 97.17 and 96.26, an aggregate floor of 94 would let introspect.ts fall about six points with the gate still green. c8 applies one threshold set per invocation and --per-file applies the SAME numbers to every file, which is workable here only because the two modules measure within about one point of each other. If they diverge, split this into two configs rather than lowering a floor.",
+  "//measurements": "MEASURED 2026-08-23 with a seeded Postgres, by re-reporting the `npm run test:coverage` collection (418 process files) through the istanbul merge. generate.ts: lines/statements 97.17, branches 93.2, functions 100. introspect.ts: lines/statements 96.26, branches 91.77, functions 96. Floors are the LOWER of the two minus about two points, the same margin rule the CLI gate and the main thresholds use. RULE, the same one .c8rc.json states: raise these as coverage improves; never lower one without recording the reason here.",
+  "all": true,
+  "include": [
+    "src/generate.ts",
+    "src/introspect.ts"
+  ],
+  "exclude": [
+    "src/test/**"
+  ],
+  "reporter": [
+    "text"
+  ],
+  "reports-dir": "./coverage/codegen",
+  "temp-directory": "./coverage/tmp",
+  "check-coverage": true,
+  "per-file": true,
+  "lines": 94,
+  "functions": 94,
+  "branches": 89,
+  "statements": 94
+}

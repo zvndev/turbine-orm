@@ -143,13 +143,13 @@ function loadDatabaseSync(): DatabaseSyncCtor {
     ctor = (req('node:sqlite') as { DatabaseSync?: DatabaseSyncCtor }).DatabaseSync;
   } catch (err) {
     throw new ConnectionError(
-      "[turbine] turbine-orm/sqlite requires Node's built-in 'node:sqlite' module (Node >= 22.5). " +
+      "turbine-orm/sqlite requires Node's built-in 'node:sqlite' module (Node >= 22.5). " +
         `Upgrade Node to >= 22.5, or pass an already-open better-sqlite3-compatible handle. (${(err as Error).message})`,
     );
   }
   if (typeof ctor !== 'function') {
     throw new ConnectionError(
-      "[turbine] 'node:sqlite' loaded but did not export a DatabaseSync constructor, this Node build may lack SQLite support.",
+      "'node:sqlite' loaded but did not export a DatabaseSync constructor, this Node build may lack SQLite support.",
     );
   }
   cachedDatabaseSync = ctor;
@@ -413,7 +413,7 @@ function sqliteLogicError(message: string, cause?: unknown): ValidationError {
   const missingTable = /^no such table:\s*(\S+)/i.exec(message);
   if (missingTable) {
     return new ValidationError(
-      `[turbine] SQLite has no table "${missingTable[1]}": ${message}. ` +
+      `SQLite has no table "${missingTable[1]}": ${message}. ` +
         'Create it first (run your migrations, or execute the CREATE TABLE statements for this schema); ' +
         'an in-memory database starts empty on every connection.',
       { cause },
@@ -422,13 +422,13 @@ function sqliteLogicError(message: string, cause?: unknown): ValidationError {
   const missingColumn = /^no such column:\s*(\S+)/i.exec(message);
   if (missingColumn) {
     return new ValidationError(
-      `[turbine] SQLite has no column "${missingColumn[1]}": ${message}. ` +
+      `SQLite has no column "${missingColumn[1]}": ${message}. ` +
         'Check the spelling against the table as it exists in this database, ' +
         'and re-run `turbine generate` if the schema has changed.',
       { cause },
     );
   }
-  return new ValidationError(`[turbine] SQLite rejected the statement: ${message}`, { cause });
+  return new ValidationError(`SQLite rejected the statement: ${message}`, { cause });
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,7 +1146,7 @@ export async function introspectSqlite(options: IntrospectOptions): Promise<Sche
     db = new DatabaseSync(options.connectionString);
   } catch (err) {
     throw new ConnectionError(
-      `[turbine] Failed to open SQLite database "${options.connectionString}": ${(err as Error).message}`,
+      `Failed to open SQLite database "${options.connectionString}": ${(err as Error).message}`,
     );
   }
   try {
@@ -1183,7 +1183,7 @@ function openSqliteDatabase(target: string, options: TurbineSqliteOptions): Data
   try {
     db = new DatabaseSync(target);
   } catch (err) {
-    throw new ConnectionError(`[turbine] Failed to open SQLite database "${target}": ${(err as Error).message}`);
+    throw new ConnectionError(`Failed to open SQLite database "${target}": ${(err as Error).message}`);
   }
   db.exec(`PRAGMA busy_timeout = ${Number(options.busyTimeoutMs ?? 5000)}`);
   if (options.foreignKeys !== false) db.exec('PRAGMA foreign_keys = ON');

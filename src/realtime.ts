@@ -54,16 +54,16 @@ const MAX_CHANNEL_LEN = 63;
  */
 export function validateChannel(channel: string): void {
   if (typeof channel !== 'string' || channel.length === 0) {
-    throw new ValidationError('[turbine] $listen/$notify channel must be a non-empty string');
+    throw new ValidationError('$listen/$notify channel must be a non-empty string');
   }
   if (channel.length > MAX_CHANNEL_LEN) {
     throw new ValidationError(
-      `[turbine] $listen/$notify channel "${channel}" exceeds the ${MAX_CHANNEL_LEN}-character Postgres identifier limit`,
+      `$listen/$notify channel "${channel}" exceeds the ${MAX_CHANNEL_LEN}-character Postgres identifier limit`,
     );
   }
   if (!CHANNEL_REGEX.test(channel)) {
     throw new ValidationError(
-      `[turbine] Invalid $listen/$notify channel "${channel}", must match /^[A-Za-z_][A-Za-z0-9_]*$/ ` +
+      `Invalid $listen/$notify channel "${channel}", must match /^[A-Za-z_][A-Za-z0-9_]*$/ ` +
         '(letters, digits, underscores; cannot start with a digit)',
     );
   }
@@ -142,7 +142,7 @@ export async function createSubscription(
   if (typeof client.on !== 'function') {
     client.release?.();
     throw new ConnectionError(
-      '[turbine] $listen requires a persistent connection that can push notifications. ' +
+      '$listen requires a persistent connection that can push notifications. ' +
         'The configured pool returned a client with no event support (stateless HTTP drivers ' +
         'like Neon HTTP / Vercel Postgres cannot LISTEN). Use a TCP pg.Pool for LISTEN/NOTIFY.',
     );

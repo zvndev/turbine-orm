@@ -128,7 +128,7 @@ export function assertNoEmbeddedTransactions(files: MigrationFile[], section: 'u
   if (offenders.length === 0) return;
 
   const lines = [
-    `[turbine] Refusing to run migrations that manage transactions themselves (${section.toUpperCase()} section):`,
+    `Refusing to run migrations that manage transactions themselves (${section.toUpperCase()} section):`,
     '',
   ];
   for (const o of offenders) {
@@ -412,7 +412,7 @@ export function parseMigrationContent(content: string, source?: string): ParsedM
   if (!sawUpMarker) {
     throw new MigrationError(
       [
-        `[turbine] Migration file has no \`-- UP\` section marker${source ? `: ${source}` : '.'}`,
+        `Migration file has no \`-- UP\` section marker${source ? `: ${source}` : '.'}`,
         '',
         'A migration must contain a line reading `-- UP` (a `-- DOWN` line is optional).',
         'Without it the whole file is a header comment: nothing would run, and the',
@@ -758,7 +758,7 @@ export function createMigration(
     const recipe = MIGRATION_RECIPES[options.recipe];
     if (!recipe) {
       const known = Object.keys(MIGRATION_RECIPES).join(', ') || '(none)';
-      throw new MigrationError(`[turbine] Unknown migration recipe "${options.recipe}". Available recipes: ${known}`);
+      throw new MigrationError(`Unknown migration recipe "${options.recipe}". Available recipes: ${known}`);
     }
     // A recipe builds the BODY, below `-- UP`, where a newline is not merely a
     // comment break but directly executable, so it gets the safe name too.
@@ -1084,7 +1084,7 @@ export function formatChecksumMismatchError(mismatches: ChecksumMismatch[]): str
   const modified = mismatches.filter((m) => m.type === 'modified');
   const missing = mismatches.filter((m) => m.type === 'missing');
   const lines: string[] = [
-    '[turbine] Migration drift detected, refusing to apply pending migrations.',
+    'Migration drift detected, refusing to apply pending migrations.',
     '',
     'Applied migrations should be immutable. The following files no longer match their applied state:',
     '',
@@ -1230,7 +1230,7 @@ export async function migrateUp(
     const adapter = options?.adapter;
     const lock = await acquireMigrationLock(client, lockId, adapter, () => openLockConnection(connectionString));
     if (!lock.acquired) {
-      throw new MigrationError('[turbine] Could not acquire migration lock, another migration is already running');
+      throw new MigrationError('Could not acquire migration lock, another migration is already running');
     }
 
     try {
@@ -1283,7 +1283,7 @@ export async function migrateUp(
       // pass `allowDestructive: true`. Safe-by-default is the whole point, a
       // DROP TABLE should never run just because a file exists.
       if (!options?.allowDestructive && destructive.length > 0) {
-        const lines = ['[turbine] Refusing to apply migrations containing DESTRUCTIVE statements:', ''];
+        const lines = ['Refusing to apply migrations containing DESTRUCTIVE statements:', ''];
         for (const o of destructive) {
           lines.push(`  ${o.file}`);
           for (const h of o.hits) {
@@ -1489,7 +1489,7 @@ export async function migrateDown(
     const adapter = options?.adapter;
     const lock = await acquireMigrationLock(client, lockId, adapter, () => openLockConnection(connectionString));
     if (!lock.acquired) {
-      throw new MigrationError('[turbine] Could not acquire migration lock, another migration is already running');
+      throw new MigrationError('Could not acquire migration lock, another migration is already running');
     }
 
     try {
@@ -1527,7 +1527,7 @@ export async function migrateDown(
           if (hits.length > 0) offenders.push({ file: file.filename, hits });
         }
         if (offenders.length > 0) {
-          const lines = ['[turbine] Refusing to roll back migrations whose DOWN sections are DESTRUCTIVE:', ''];
+          const lines = ['Refusing to roll back migrations whose DOWN sections are DESTRUCTIVE:', ''];
           for (const o of offenders) {
             lines.push(`  ${o.file}`);
             for (const h of o.hits) {

@@ -156,7 +156,7 @@ export function fingerprintOperatorShape(value: WhereOperator): string {
 export function assertBindableEqualsOperand(value: unknown, column: string): void {
   if (!isUnmatchedPlainObject(value)) return;
   throw new ValidationError(
-    `[turbine] Plain-object value for operator 'equals' on ${column}: ` +
+    `Plain-object value for operator 'equals' on ${column}: ` +
       `objects are only valid 'equals' values on JSON (json/jsonb) columns, ` +
       `where 'equals' is the JSONB containment filter.`,
   );

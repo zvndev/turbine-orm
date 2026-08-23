@@ -1,5 +1,151 @@
 # Changelog
 
+## 0.77.0 (2026-08-23)
+
+0.76.0 published from a commit whose CI was red. Nothing was wrong with the
+gates: the failing job was `unit-tests (20)`, and the release went out from a
+laptop, which never runs the Node 20 leg. The gates were real, thorough, and
+sitting beside the road rather than on it.
+
+That is the release. **Most of what follows moves an existing check onto the
+path that actually reaches npm**, and the two user-visible bug fixes are both
+cases of an error that could not be caught by the code written to catch it.
+
+### Security
+
+- **A polynomial regular expression on the PowDB type mapper.**
+  `tsType.replace(/\s*\|\s*null$/i, '')` strips a trailing `| null` from a
+  generated TypeScript type. `\s*` can begin matching at every position, so an
+  input of N whitespace characters with no `|` costs O(N^2). Measured on Node 24:
+  10,000 spaces took 39.6 ms, 20,000 took 150.3 ms, 40,000 took 617.5 ms.
+
+  It was written **eight times** across `powdb.ts` and `powql.ts`. All eight now
+  call one linear `baseTsType`, whose equivalence to the regex it replaces is
+  asserted against the real old regex over a corpus and 4,000 generated inputs,
+  not against a description of it. The same input that cost the regex 352 ms at
+  30,000 characters costs the replacement 0.13 ms at 200,000.
+
+  **Reachability, stated plainly: this was not remotely exploitable.** `tsType`
+  comes from a generated `metadata.ts` or from a `defineSchema` call, so it is
+  authored by the developer or derived from their own database catalog, never
+  from request input. It is fixed because eight hand-copied spellings of one
+  predicate is the drift shape this codebase keeps paying for, and because the
+  linear version is not harder to read.
+
+### Fixed
+
+- **A pipeline timeout rejected with a bare `Error`, so it could not be
+  retried.** `catch (e) { if (e instanceof TimeoutError) retry() }` silently did
+  not retry, because the timeout branch in `pipeline-submittable.ts` never
+  constructed a `TimeoutError`. It does now, carrying code `TURBINE_E002` like
+  every other timeout in the package.
+
+  `executePipeline` in `pipeline.ts` was also missing its `catch` entirely, so a
+  raw pg driver error escaped unwrapped past `wrapPgError` and arrived as a
+  driver object rather than a typed Turbine error. A unique-constraint violation
+  inside a pipeline now surfaces as `UniqueConstraintError` (E008), matching
+  every other execution path.
+
+- **A relation payload that would not parse was returned as a raw string.**
+  `parseNestedRow` caught a JSON parse failure, logged, and assigned the
+  unparsed text to the relation field. A caller who asked for
+  `with: { posts: true }` and expected an array received a string, and the
+  failure surfaced later and elsewhere, as a type error with no visible
+  connection to its cause.
+
+  **This is a behaviour change.** It now throws a `ValidationError` (E003)
+  naming the relation, with a once-only dev warning. If you were relying on the
+  raw value reaching your code, you were relying on a bug, but the failure mode
+  does move from silent to loud.
+
+- **Every error message carried two prefixes.** `formatErrorMessage` prepends
+  `[TURBINE_EXXX] `, and 433 call sites also hand-wrote a `[turbine] ` prefix
+  into the message they passed in, so the shipped text read
+  `[TURBINE_E003] [turbine] Unknown column "titel" on table "posts".` Two
+  display-strips in the CLI existed only to undo the doubling at print time.
+
+  Messages now carry one prefix. The 73 remaining occurrences are diagnostics
+  that no code tag ever touches (`console.*`, `process.stderr`, Studio's HTTP
+  bodies), where the prefix is the only thing marking the line as ours.
+  `check:error-prefix` keeps the two populations apart by resolving the
+  enclosing callee, because the same literal is correct in one and wrong in the
+  other and no context-free rule can tell them apart.
+
+  Error message text is not part of the stable contract (see `STABILITY.md`),
+  but this is visible in every log line, so it is worth calling out.
+
+### Changed
+
+- **`main` is now protected and pull-request only.** `ci-ok` is the single
+  required status check and `enforce_admins` is on. `ci-ok` aggregates all 19
+  CI jobs, so a new job is covered the moment it joins the `needs:` list, where
+  a hand-listed set of required contexts silently was not: the previous
+  configuration listed eleven and left ten jobs unrequired, including every
+  non-Postgres engine and the blocking security audit.
+
+- **Releases are triggered by a tag.** `release.yml` runs the gate chain, then
+  publishes with `--provenance`, creates the GitHub Release, and runs a
+  post-publish registry smoke test. A local `npm publish` still works as a
+  fallback but now refuses unless CI is green on `HEAD`, asked of GitHub rather
+  than inferred from a local run, and failing closed on a missing run, an
+  unfinished run, or an unusable `gh`.
+
+- **`docs/WORKFLOW.md`** is new and tracked: branches, pull requests, releases,
+  test requirements, the guard set, and the public-repo security rules, in one
+  place. `CONTRIBUTING.md` and `CLAUDE.md` point at it.
+
+### Internal
+
+None of this changes the published API. It is listed because it changes what
+can reach the registry.
+
+- **Five checks moved onto the publish path.** `check:private-terms`,
+  `check:cycles`, `check:error-prefix` and `check:skip-gates` now run in
+  `release.yml` and in `prepublishOnly`, and `TURBINE_REQUIRE_ENGINE` is set on
+  both of `release.yml`'s database jobs. `ci.yml` does not gate a tag push and
+  `prepublishOnly` does not run when the tag path publishes, so on the one route
+  that reaches npm they ran nowhere.
+
+- **The shipped agent skill is verified by CI, not by habit.** `README.md`
+  states that every factual claim in it is executed against a live database
+  before release; the 417-line verifier was referenced by no workflow and no
+  script. It is a required job now, 46 of 46 claims hold, and the verifier
+  asserts its own coverage, because the claim list is hand-written and a
+  sentence added to `SKILL.md` would otherwise become an unverified claim in
+  silence.
+
+- **Import-cycle detection finds real cycles.** The previous check answered one
+  question, whether `query/` or `cli/` statically imports `client.ts`, and was
+  blind to every other cycle. It now runs Tarjan over the whole value-import
+  graph, sees `export ... from` re-export edges, excludes type-only edges, and
+  carries two self-tests plus a zero-file refusal.
+
+  It immediately found one: `powdb.ts` re-exported `PowqlInterface` and
+  `introspectPowdbDatabase` while both of those modules imported values back
+  from it, a three-node cycle in the largest engine entry. Broken by hoisting
+  the shared primitives into `powdb-shared.ts`. The `turbine-orm/powdb` surface
+  is byte-identical, verified across CJS, ESM and `.d.ts`.
+
+- **`cli/index.ts`, `introspect.ts` and `generate.ts` are under coverage
+  ratchets** for the first time. `cli/index.ts` is the largest file in the repo
+  at 5,945 lines and was in no gate at all. It is deliberately kept out of the
+  CLI aggregate: one file that size at 33% drags the aggregate's line and
+  function floors down about 25 points, which would let the other eight files
+  shed over a thousand covered lines with the gate still green.
+
+- **Documented numbers that keep drifting are asserted from source.** The
+  coverage floors, error-code range, module count and fixture row counts quoted
+  in `STABILITY.md` and `CONTRIBUTING.md` were stale again, three weeks after
+  the last time they were corrected by hand. `docs-claims-sync.test.ts` reads
+  each one from `.c8rc.json`, `package.json`, the `TurbineErrorCode` union,
+  `seed.sql` and the directory listing, so the next drift fails a test instead
+  of surviving to the next audit.
+
+- **Test-integrity fixes.** Five PII relation assertions were inside loops that
+  did not execute on an empty result set, so they passed while testing nothing;
+  they now assert a non-empty result first. A skip-on-unsupported branch used a
+  bare `return`, reporting a pass; it calls `t.skip()` now.
+
 ## 0.76.0 (2026-08-22)
 
 An outside review of 0.75.0 went looking for a SQL injection in the query

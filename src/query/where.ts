@@ -838,7 +838,7 @@ export function assertMutationHasPredicate(
   if (whereSql.length > 0) return;
   if (allowFullTableScan === true) return;
   throw new ValidationError(
-    `[turbine] ${operation} on "${qi.table}" refused: the \`where\` clause is empty. ` +
+    `${operation} on "${qi.table}" refused: the \`where\` clause is empty. ` +
       "Pass `allowFullTableScan: UNSAFE` to opt in (import { UNSAFE } from 'turbine-orm'), " +
       'or check that your filter values are defined.',
   );
@@ -939,7 +939,7 @@ export function buildScalarClause(
       // or schema mismatch. `contains`/`equals` are shared with WhereOperator
       // (LIKE / equality), so only shape-unique keys reach here.
       throw new ValidationError(
-        `[turbine] Column "${rawColumn}" on table "${qi.table}" is not a JSON column ` +
+        `Column "${rawColumn}" on table "${qi.table}" is not a JSON column ` +
           `(actual type: ${getColumnPgType(qi, rawColumn)}); cannot apply JSON operator '${cls.jsonKey}'.`,
       );
     case 'array':
@@ -947,7 +947,7 @@ export function buildScalarClause(
       return;
     case 'arrayThrow':
       throw new ValidationError(
-        `[turbine] Column "${rawColumn}" on table "${qi.table}" is not an array column ` +
+        `Column "${rawColumn}" on table "${qi.table}" is not an array column ` +
           `(actual type: ${getColumnPgType(qi, rawColumn)}); cannot apply array operator '${cls.arrayKey}'.`,
       );
     case 'textsearch':
@@ -1013,7 +1013,7 @@ export function relationWhereScope(qi: BuilderCtx, targetTable: string, meta: Ta
     host: scopedWhereHost(qi, meta),
     unknownColumn: (field) =>
       new ValidationError(
-        `[turbine] Unknown field "${field}" in relation filter for table "${targetTable}". ` +
+        `Unknown field "${field}" in relation filter for table "${targetTable}". ` +
           `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
       ),
   };
@@ -1027,8 +1027,7 @@ export function aliasWhereScope(qi: BuilderCtx, targetTable: string, meta: Table
     qualifier: `${alias}.`,
     relationParent: alias,
     host: scopedWhereHost(qi, meta),
-    unknownColumn: (field) =>
-      new ValidationError(`[turbine] Unknown column "${field}" in where for table "${targetTable}"`),
+    unknownColumn: (field) => new ValidationError(`Unknown column "${field}" in where for table "${targetTable}"`),
   };
 }
 
@@ -1124,7 +1123,7 @@ export function buildScopedScalarClause(
     const jsonKey = findJsonUniqueKey(value);
     if (jsonKey) {
       throw new ValidationError(
-        `[turbine] Column "${col}" on table "${scope.table}" is not a JSON column ` +
+        `Column "${col}" on table "${scope.table}" is not a JSON column ` +
           `(actual type: ${colType}); cannot apply JSON operator '${jsonKey}'.`,
       );
     }
@@ -1139,7 +1138,7 @@ export function buildScopedScalarClause(
     const arrayKey = findArrayUniqueKey(value);
     if (arrayKey) {
       throw new ValidationError(
-        `[turbine] Column "${col}" on table "${scope.table}" is not an array column ` +
+        `Column "${col}" on table "${scope.table}" is not an array column ` +
           `(actual type: ${colType}); cannot apply array operator '${arrayKey}'.`,
       );
     }
@@ -1316,22 +1315,20 @@ export function buildRelationFilter(
     // nested relation filters inside the branch keep their qualification. The
     // fragment binds no params, so collectRelationFilterParams needs no mirror.
     if (!relDef.through) {
-      throw new ValidationError(
-        `[turbine] manyToMany relation "${relDef.name}" is missing a \`through\` junction descriptor.`,
-      );
+      throw new ValidationError(`manyToMany relation "${relDef.name}" is missing a \`through\` junction descriptor.`);
     }
     const qJunction = qi.q(relDef.through.table);
     const targetKeys = normalizeKeyColumns(relDef.through.targetKey);
     const targetPk = targetMeta.primaryKey;
     if (targetPk.length === 0) {
       throw new ValidationError(
-        `[turbine] manyToMany relation "${relDef.name}" targets table "${targetTable}" which has no primary key; ` +
+        `manyToMany relation "${relDef.name}" targets table "${targetTable}" which has no primary key; ` +
           `cannot correlate the relation filter through the junction.`,
       );
     }
     if (targetKeys.length !== targetPk.length) {
       throw new ValidationError(
-        `[turbine] manyToMany relation "${relDef.name}": through.targetKey has ${targetKeys.length} column(s) ` +
+        `manyToMany relation "${relDef.name}": through.targetKey has ${targetKeys.length} column(s) ` +
           `but target "${targetTable}" primary key has ${targetPk.length}. Composite keys must pair positionally.`,
       );
     }
@@ -1339,7 +1336,7 @@ export function buildRelationFilter(
     const refKeys = normalizeKeyColumns(relDef.referenceKey);
     if (sourceKeys.length !== refKeys.length) {
       throw new ValidationError(
-        `[turbine] manyToMany relation "${relDef.name}": through.sourceKey has ${sourceKeys.length} column(s) ` +
+        `manyToMany relation "${relDef.name}": through.sourceKey has ${sourceKeys.length} column(s) ` +
           `but referenceKey has ${refKeys.length}. Composite keys must pair positionally.`,
       );
     }
@@ -1545,9 +1542,9 @@ export function assertBindableEqualityValue(
   const badKeys = Object.keys(value as Record<string, unknown>);
   throw new ValidationError(
     badKeys.length === 0
-      ? `[turbine] Empty filter object on "${rawColumn}" for table "${table}". ` +
+      ? `Empty filter object on "${rawColumn}" for table "${table}". ` +
           `Provide a value or an operator like { gt: 1 }.`
-      : `[turbine] Unknown operator${badKeys.length > 1 ? 's' : ''} ` +
+      : `Unknown operator${badKeys.length > 1 ? 's' : ''} ` +
           `${badKeys.map((k) => `"${k}"`).join(', ')} on "${rawColumn}" for table "${table}". ` +
           `Supported operators: ${[...OPERATOR_KEYS].join(', ')}.`,
   );
@@ -1614,7 +1611,7 @@ export function resolveColumnRef(
 ): string {
   if (mode === 'insensitive') {
     throw new ValidationError(
-      `[turbine] mode: 'insensitive' cannot be combined with a column reference ({ col: "${ref.col}" }). ` +
+      `mode: 'insensitive' cannot be combined with a column reference ({ col: "${ref.col}" }). ` +
         `Case-insensitive column-to-column comparison is not supported: use client.sql\`...\` ` +
         `for lower(a) = lower(b).`,
     );
@@ -1622,7 +1619,7 @@ export function resolveColumnRef(
   const col = resolveColumnName(ctx.meta, ref.col);
   if (col === undefined) {
     throw new ValidationError(
-      `[turbine] Unknown field "${ref.col}" referenced by { col } in where on table "${ctx.table}". ` +
+      `Unknown field "${ref.col}" referenced by { col } in where on table "${ctx.table}". ` +
         `Known fields: ${Object.keys(ctx.meta.columnMap).join(', ') || '(none)'}.`,
     );
   }
@@ -1641,9 +1638,7 @@ export function columnRefSql(
   mode?: 'default' | 'insensitive',
 ): string {
   if (!ctx) {
-    throw new ValidationError(
-      `[turbine] Column reference { col: "${ref.col}" } is not supported in this filter context.`,
-    );
+    throw new ValidationError(`Column reference { col: "${ref.col}" } is not supported in this filter context.`);
   }
   return `${ctx.prefix}${qi.q(resolveColumnRef(qi, ref, ctx, mode))}`;
 }
@@ -1832,7 +1827,7 @@ export function vectorOperator(qi: BuilderCtx, field: string, rawColumn: string,
   const colType = getColumnPgType(qi, rawColumn);
   if (colType !== 'vector') {
     throw new ValidationError(
-      `[turbine] Column "${field}" on table "${qi.table}" is not a vector column ` +
+      `Column "${field}" on table "${qi.table}" is not a vector column ` +
         `(actual type: ${colType}); cannot apply a vector distance operation.`,
     );
   }
@@ -1842,7 +1837,7 @@ export function vectorOperator(qi: BuilderCtx, field: string, rawColumn: string,
   const op = ownLookup(VECTOR_METRIC_OPERATORS, metric);
   if (!op) {
     throw new ValidationError(
-      `[turbine] Unknown vector metric "${metric}" for column "${field}". ` +
+      `Unknown vector metric "${metric}" for column "${field}". ` +
         `Valid metrics: ${Object.keys(VECTOR_METRIC_OPERATORS).join(', ')}.`,
     );
   }
@@ -1871,14 +1866,12 @@ export function pushVectorParam(
     );
   }
   if (!Array.isArray(to) || to.length === 0) {
-    throw new ValidationError(
-      `[turbine] Vector distance on "${field}" requires a non-empty array of numbers for "to".`,
-    );
+    throw new ValidationError(`Vector distance on "${field}" requires a non-empty array of numbers for "to".`);
   }
   for (const el of to) {
     if (typeof el !== 'number' || !Number.isFinite(el)) {
       throw new ValidationError(
-        `[turbine] Vector "to" for column "${field}" must contain only finite numbers; ` + `got ${JSON.stringify(el)}.`,
+        `Vector "to" for column "${field}" must contain only finite numbers; ` + `got ${JSON.stringify(el)}.`,
       );
     }
   }
@@ -1998,7 +1991,7 @@ export function assertJsonFilterKeys(filter: JsonFilter, column: string): void {
     if (JSON_FILTER_KEYS.has(key)) continue;
     const suggestion = JSON_PRISMA_SPELLINGS[key];
     throw new ValidationError(
-      `[turbine] Unknown JSON filter operator "${key}" on ${column}.` +
+      `Unknown JSON filter operator "${key}" on ${column}.` +
         (suggestion ? ` Did you mean \`${suggestion}\`?` : '') +
         ` Supported operators: ${[...JSON_FILTER_KEYS].sort().join(', ')}.`,
     );
@@ -2008,7 +2001,7 @@ export function assertJsonFilterKeys(filter: JsonFilter, column: string): void {
   // those compares nothing, which is exactly the silent no-op shape above.
   if (present.length > 0 && present.every((k) => k === 'path' || k === 'mode')) {
     throw new ValidationError(
-      `[turbine] JSON filter on ${column} selects a \`path\` but has no comparison. ` +
+      `JSON filter on ${column} selects a \`path\` but has no comparison. ` +
         `Add one of: ${[...JSON_FILTER_KEYS]
           .filter((k) => k !== 'path' && k !== 'mode')
           .sort()
@@ -2046,7 +2039,7 @@ export function jsonStringEntries(
     if (value === undefined) continue;
     if (filter.path === undefined) {
       throw new ValidationError(
-        `[turbine] JSON operator '${op}' on ${column} requires a \`path\` ` +
+        `JSON operator '${op}' on ${column} requires a \`path\` ` +
           `(e.g. { path: ['meta', 'title'], ${op}: ${valueForMessage(value)} }).`,
       );
     }
@@ -2054,8 +2047,7 @@ export function jsonStringEntries(
       // `typeof` rather than the value: it says everything the reader needs
       // (they passed a number where a string belongs) and carries no data.
       throw new ValidationError(
-        `[turbine] JSON operator '${op}' on ${column} requires a string, got ${typeof value} ` +
-          `(${valueForMessage(value)}).`,
+        `JSON operator '${op}' on ${column} requires a string, got ${typeof value} ` + `(${valueForMessage(value)}).`,
       );
     }
     entries.push({ op, pattern, value });
@@ -2074,18 +2066,18 @@ export function jsonRangeEntries(
     if (value === undefined) continue;
     if (filter.path === undefined) {
       throw new ValidationError(
-        `[turbine] JSON range operator '${op}' on ${column} requires a \`path\` ` +
+        `JSON range operator '${op}' on ${column} requires a \`path\` ` +
           `(e.g. { path: ['meta', 'score'], ${op}: ${valueForMessage(value)} }).`,
       );
     }
     if (typeof value !== 'number' && typeof value !== 'string') {
       throw new ValidationError(
-        `[turbine] JSON range operator '${op}' on ${column} requires a number or string, ` +
+        `JSON range operator '${op}' on ${column} requires a number or string, ` +
           `got ${typeof value} (${valueForMessage(value)}).`,
       );
     }
     if (typeof value === 'number' && !Number.isFinite(value)) {
-      throw new ValidationError(`[turbine] JSON range operator '${op}' on ${column} requires a finite number.`);
+      throw new ValidationError(`JSON range operator '${op}' on ${column} requires a finite number.`);
     }
     entries.push({ sqlOp, value });
   }
@@ -2304,7 +2296,7 @@ export function vectorThresholdEntries(filter: VectorFilter, field: string): { s
     if (threshold === undefined) continue;
     if (typeof threshold !== 'number' || !Number.isFinite(threshold)) {
       throw new ValidationError(
-        `[turbine] Vector distance threshold "${cmp}" on "${field}" must be a finite number; ` +
+        `Vector distance threshold "${cmp}" on "${field}" must be a finite number; ` +
           `got ${typeof threshold} (${valueForMessage(threshold)}).`,
       );
     }
@@ -2312,7 +2304,7 @@ export function vectorThresholdEntries(filter: VectorFilter, field: string): { s
   }
   if (entries.length === 0) {
     throw new ValidationError(
-      `[turbine] Vector distance filter on "${field}" requires at least one comparison (lt / lte / gt / gte).`,
+      `Vector distance filter on "${field}" requires at least one comparison (lt / lte / gt / gte).`,
     );
   }
   return entries;
@@ -2332,7 +2324,7 @@ export function buildTextSearchClause(
   const config = filter.config ?? 'english';
   if (!validateTextSearchConfig(config)) {
     throw new ValidationError(
-      `[turbine] Invalid text search config "${config}": only alphanumeric characters and underscores are allowed.`,
+      `Invalid text search config "${config}": only alphanumeric characters and underscores are allowed.`,
     );
   }
   params.push(filter.search);

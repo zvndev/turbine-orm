@@ -77,7 +77,7 @@ export type PrivilegeOption = 'skipGlobalFilters' | 'includePii' | 'allowFullTab
 /** The one message shape every privilege refusal uses. */
 function privilegeRefusal(option: string, received: unknown, extra = ''): ValidationError {
   return new ValidationError(
-    `[turbine] \`${option}\` must be the \`UNSAFE\` symbol, received ${describeValue(received)}. ` +
+    `\`${option}\` must be the \`UNSAFE\` symbol, received ${describeValue(received)}. ` +
       `${option} is a privilege option: it removes a safety boundary (a tenant filter, the PII ` +
       'projection, or the empty-`where` guard), so it cannot be enabled by a plain value that ' +
       'JSON.parse can produce. Import the sentinel and pass it explicitly: ' +
@@ -156,14 +156,14 @@ export function resolveSkipGlobalFilters(value: unknown): ResolvedSkipGlobalFilt
     // to come back empty, which is the same accident with a much worse outcome.
     if (tables.length === 0) {
       throw new ValidationError(
-        '[turbine] `skipGlobalFilters: [UNSAFE]` names no table, so it would skip nothing. ' +
+        '`skipGlobalFilters: [UNSAFE]` names no table, so it would skip nothing. ' +
           'Pass the tables to skip (`[UNSAFE, "posts"]`), or the bare sentinel (`UNSAFE`) to skip every table.',
       );
     }
     for (const t of tables) {
       if (typeof t !== 'string') {
         throw new ValidationError(
-          '[turbine] `skipGlobalFilters: [UNSAFE, ...]` takes table accessor NAMES after the sentinel, ' +
+          '`skipGlobalFilters: [UNSAFE, ...]` takes table accessor NAMES after the sentinel, ' +
             `received ${describeValue(t)}.`,
         );
       }
@@ -225,7 +225,7 @@ export function assertDirectionToken(value: unknown, context: string): void {
     if (lowered === 'asc' || lowered === 'desc') return;
   }
   throw new ValidationError(
-    `[turbine] Invalid orderBy direction ${describeValue(value)} for ${context}. ` +
+    `Invalid orderBy direction ${describeValue(value)} for ${context}. ` +
       "Use 'asc' or 'desc'. An unrecognized direction used to sort ASCENDING silently, " +
       'which returns a correct-looking page in the wrong order.',
   );

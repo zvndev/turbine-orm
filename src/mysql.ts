@@ -1209,7 +1209,7 @@ export async function introspectMysql(options: IntrospectOptions): Promise<Schem
     }
     if (!schemaName) {
       throw new ConnectionError(
-        '[turbine] Could not determine the MySQL database to introspect, pass a database in the connection string or a `schema` option.',
+        'Could not determine the MySQL database to introspect, pass a database in the connection string or a `schema` option.',
       );
     }
     // `await` is LOAD-BEARING, not stylistic: `return somePromise` inside a
@@ -1296,13 +1296,13 @@ async function loadCreatePool(): Promise<CreatePool> {
     mod = (await importOptionalPeer('mysql2/promise')) as typeof mod;
   } catch (err) {
     throw new ConnectionError(
-      "[turbine] turbine-orm/mysql requires the optional peer dependency 'mysql2'. Install it: npm i mysql2. " +
+      "turbine-orm/mysql requires the optional peer dependency 'mysql2'. Install it: npm i mysql2. " +
         `(${(err as Error).message})`,
     );
   }
   const createPool = mod.createPool ?? mod.default?.createPool;
   if (typeof createPool !== 'function') {
-    throw new ConnectionError("[turbine] Loaded 'mysql2/promise' but it has no createPool export.");
+    throw new ConnectionError("Loaded 'mysql2/promise' but it has no createPool export.");
   }
   return createPool;
 }
@@ -1313,16 +1313,12 @@ async function loadCreatePool(): Promise<CreatePool> {
  */
 function assertSupportedVersion(version: string): void {
   if (/mariadb/i.test(version)) {
-    throw new ConnectionError(
-      `[turbine] MariaDB is not supported by turbine-orm/mysql (got "${version}"). Use MySQL 8.0+.`,
-    );
+    throw new ConnectionError(`MariaDB is not supported by turbine-orm/mysql (got "${version}"). Use MySQL 8.0+.`);
   }
   const m = /^(\d+)\.(\d+)/.exec(version);
   const major = m ? Number(m[1]) : 0;
   if (major < 8) {
-    throw new ConnectionError(
-      `[turbine] turbine-orm/mysql requires MySQL 8.0+ (5.7 lacks JSON_ARRAYAGG); got "${version}".`,
-    );
+    throw new ConnectionError(`turbine-orm/mysql requires MySQL 8.0+ (5.7 lacks JSON_ARRAYAGG); got "${version}".`);
   }
 }
 

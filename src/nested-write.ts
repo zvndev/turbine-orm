@@ -305,13 +305,13 @@ function validateOps(relationName: string, ops: Record<string, unknown>, isUpdat
   for (const opName of Object.keys(ops)) {
     if (!CREATE_ONLY_OPS.has(opName) && !UPDATE_ONLY_OPS.has(opName)) {
       throw new ValidationError(
-        `[turbine] Unknown nested write operation "${opName}" on relation "${relationName}". ` +
+        `Unknown nested write operation "${opName}" on relation "${relationName}". ` +
           `Valid operations: create, connect, connectOrCreate${isUpdate ? ', disconnect, set, delete, update, upsert' : ''}.`,
       );
     }
     if (!isUpdate && UPDATE_ONLY_OPS.has(opName)) {
       throw new ValidationError(
-        `[turbine] Operation "${opName}" on relation "${relationName}" is only valid inside update(), not create().`,
+        `Operation "${opName}" on relation "${relationName}" is only valid inside update(), not create().`,
       );
     }
   }
@@ -333,7 +333,7 @@ function pkWhere(tableMeta: TableMetadata, row: Record<string, unknown>): Record
     // and the only safe response is to refuse rather than to run.
     if (row[field] === undefined) {
       throw new ValidationError(
-        `[turbine] Cannot address a row of "${tableMeta.name}" by primary key: "${field}" is missing from the ` +
+        `Cannot address a row of "${tableMeta.name}" by primary key: "${field}" is missing from the ` +
           'row this nested write is operating on, so the generated predicate would match more rows than intended. ' +
           'This is a bug in turbine, please report it.',
       );
@@ -451,7 +451,7 @@ function assertTargetSelectsSomething(target: unknown, op: string, relName: stri
   if (target === true) {
     if (toOne) return;
     throw new ValidationError(
-      `[turbine] Nested ${op} on to-many relation "${relName}" needs a "where" selector: ` +
+      `Nested ${op} on to-many relation "${relName}" needs a "where" selector: ` +
         `"${op}: true" would ${op} every related "${rel.to}" row.`,
     );
   }
@@ -460,7 +460,7 @@ function assertTargetSelectsSomething(target: unknown, op: string, relName: stri
     if (bound) return;
   }
   throw new ValidationError(
-    `[turbine] Nested ${op} on relation "${relName}" requires a selector with at least one defined value. ` +
+    `Nested ${op} on relation "${relName}" requires a selector with at least one defined value. ` +
       `An empty or all-undefined "where" would ${op} every related "${rel.to}" row of this parent.`,
   );
 }
@@ -506,7 +506,7 @@ function junctionAccessorHint(junction: string): string {
 function manyToManyOpUnsupported(op: string, relName: string, rel: RelationDef): ValidationError {
   const junction = rel.through?.table ?? 'junction';
   return new ValidationError(
-    `[turbine] Nested "${op}" is not supported on the many-to-many relation "${relName}" ` +
+    `Nested "${op}" is not supported on the many-to-many relation "${relName}" ` +
       `(via the "${junction}" junction table). The supported many-to-many nested operations are ` +
       `connect, disconnect and set. To ${op} a "${rel.to}" row itself, write it directly on the ` +
       `"${rel.to}" table inside the same $transaction and link it with a nested connect; to write ` +
@@ -585,14 +585,12 @@ function junctionPlan(
 ): JunctionPlan {
   const through = rel.through;
   if (!through) {
-    throw new ValidationError(
-      `[turbine] manyToMany relation "${relName}" is missing a \`through\` junction descriptor.`,
-    );
+    throw new ValidationError(`manyToMany relation "${relName}" is missing a \`through\` junction descriptor.`);
   }
   const junctionMeta = ctx.schema.tables[through.table];
   if (!junctionMeta) {
     throw new ValidationError(
-      `[turbine] Nested write on the many-to-many relation "${relName}": junction table ` +
+      `Nested write on the many-to-many relation "${relName}": junction table ` +
         `"${through.table}" is not present in the schema metadata, so its rows cannot be written. ` +
         `Regenerate the schema (turbine generate) so the junction table is included.`,
     );
@@ -600,7 +598,7 @@ function junctionPlan(
   const targetMeta = ctx.schema.tables[rel.to];
   if (!targetMeta) {
     throw new ValidationError(
-      `[turbine] Nested write on the many-to-many relation "${relName}": unknown target table "${rel.to}".`,
+      `Nested write on the many-to-many relation "${relName}": unknown target table "${rel.to}".`,
     );
   }
 
@@ -610,7 +608,7 @@ function junctionPlan(
   const targetPk = targetMeta.primaryKey;
   if (sourceKeys.length !== 1 || targetKeys.length !== 1 || refKeys.length !== 1 || targetPk.length !== 1) {
     throw new ValidationError(
-      `[turbine] Nested writes on the many-to-many relation "${relName}" (via "${through.table}") support ` +
+      `Nested writes on the many-to-many relation "${relName}" (via "${through.table}") support ` +
         `single-column junction keys only; this relation links on composite keys ` +
         `(source ${sourceKeys.length}, target ${targetKeys.length}, target primary key ${targetPk.length} column(s)). ` +
         `Write the junction rows directly inside the same $transaction: ${junctionAccessorHint(through.table)}.`,
@@ -626,7 +624,7 @@ function junctionPlan(
   // FK columns), but a hand-declared `defineSchema` manyToMany can.
   if (sourceKeys[0] === targetKeys[0]) {
     throw new ValidationError(
-      `[turbine] Nested write on the many-to-many relation "${relName}" cannot run: the junction ` +
+      `Nested write on the many-to-many relation "${relName}" cannot run: the junction ` +
         `"${through.table}" names the same column "${sourceKeys[0]}" as BOTH its sourceKey and its ` +
         `targetKey, so a link row cannot hold the parent key and the target key at once. Fix the ` +
         `relation's \`through\` descriptor to name the two distinct junction columns.`,
@@ -637,7 +635,7 @@ function junctionPlan(
   const parentValue = parentRow[parentField];
   if (parentValue === null || parentValue === undefined) {
     throw new ValidationError(
-      `[turbine] Nested write on the many-to-many relation "${relName}" cannot run: the parent's reference ` +
+      `Nested write on the many-to-many relation "${relName}" cannot run: the parent's reference ` +
         `key "${parentField}" is ${parentValue === null ? 'null' : 'missing from the loaded row'}, so no ` +
         `junction row can be correlated to this parent.`,
     );
@@ -656,7 +654,7 @@ function junctionPlan(
 /** The E003 for a target selector that matched no row. */
 function noTargetRow(op: string, relName: string, rel: RelationDef, target: unknown): ValidationError {
   return new ValidationError(
-    `[turbine] Nested ${op} on the many-to-many relation "${relName}": no "${rel.to}" row found ` +
+    `Nested ${op} on the many-to-many relation "${relName}": no "${rel.to}" row found ` +
       `matching ${describeTargetForMessage(target)}.`,
   );
 }
@@ -721,7 +719,7 @@ async function resolveJunctionTargets(
     const value = row[plan.targetKeyField];
     if (value === null || value === undefined) {
       throw new ValidationError(
-        `[turbine] Nested ${op} on the many-to-many relation "${relName}": the "${rel.to}" row matching ` +
+        `Nested ${op} on the many-to-many relation "${relName}": the "${rel.to}" row matching ` +
           `${describeTargetForMessage(target)} has no "${plan.targetKeyField}" value to link.`,
       );
     }
@@ -979,7 +977,7 @@ function notRelatedToParent(op: string, relName: string, rel: RelationDef, targe
     where: target,
     operation: `nested ${op}`,
     message:
-      `[turbine] Nested ${op} on relation "${relName}": no "${rel.to}" record matching ` +
+      `Nested ${op} on relation "${relName}": no "${rel.to}" record matching ` +
       `${describeTargetForMessage(target)} is related to this parent. Either it does not exist, ` +
       `or it belongs to a different parent (a nested ${op} can only touch this parent's rows).`,
   });
@@ -1022,7 +1020,7 @@ export async function executeNestedCreate(
 
   const tableMeta = ctx.schema.tables[tableName];
   if (!tableMeta) {
-    throw new ValidationError(`[turbine] Unknown table "${tableName}".`);
+    throw new ValidationError(`Unknown table "${tableName}".`);
   }
 
   const { scalars, relations } = extractRelationFields(data, tableMeta);
@@ -1032,7 +1030,7 @@ export async function executeNestedCreate(
     const rel = tableMeta.relations[relName];
     if (!rel) {
       throw new RelationError(
-        `[turbine] Unknown relation "${relName}" on table "${tableName}". ` +
+        `Unknown relation "${relName}" on table "${tableName}". ` +
           `Available relations: ${Object.keys(tableMeta.relations).join(', ') || '(none)'}.`,
       );
     }
@@ -1119,7 +1117,7 @@ export async function executeNestedUpdate(
 
   const tableMeta = ctx.schema.tables[tableName];
   if (!tableMeta) {
-    throw new ValidationError(`[turbine] Unknown table "${tableName}".`);
+    throw new ValidationError(`Unknown table "${tableName}".`);
   }
 
   const { scalars, relations } = extractRelationFields(data, tableMeta);
@@ -1129,7 +1127,7 @@ export async function executeNestedUpdate(
     const rel = tableMeta.relations[relName];
     if (!rel) {
       throw new RelationError(
-        `[turbine] Unknown relation "${relName}" on table "${tableName}". ` +
+        `Unknown relation "${relName}" on table "${tableName}". ` +
           `Available relations: ${Object.keys(tableMeta.relations).join(', ') || '(none)'}.`,
       );
     }
@@ -1143,9 +1141,7 @@ export async function executeNestedUpdate(
   } else {
     parentRow = (await ctx.tx.table(tableName).findUnique({ where })) as Record<string, unknown>;
     if (!parentRow) {
-      throw new ValidationError(
-        `[turbine] update: no ${tableName} row found matching ${describeTargetForMessage(where)}.`,
-      );
+      throw new ValidationError(`update: no ${tableName} row found matching ${describeTargetForMessage(where)}.`);
     }
   }
 
@@ -1203,7 +1199,7 @@ export async function executeNestedUpdate(
         });
         if (!nullable) {
           throw new ValidationError(
-            `[turbine] Cannot disconnect "${relName}": foreign key column(s) ${fks.join(', ')} are NOT NULL. Use delete instead.`,
+            `Cannot disconnect "${relName}": foreign key column(s) ${fks.join(', ')} are NOT NULL. Use delete instead.`,
           );
         }
         const updateData: Record<string, unknown> = {};
@@ -1343,7 +1339,7 @@ async function resolveBelongsToForCreate(
       relatedRow = (await ctx.tx.table(rel.to).findUnique({ where: target })) as Record<string, unknown> | null;
       if (!relatedRow) {
         throw new ValidationError(
-          `[turbine] connect on "${relName}": no ${rel.to} row found matching ${describeTargetForMessage(target)}.`,
+          `connect on "${relName}": no ${rel.to} row found matching ${describeTargetForMessage(target)}.`,
         );
       }
     }
@@ -1415,7 +1411,7 @@ async function processBelongsToCreate(
       const existing = await ctx.tx.table(rel.to).findUnique({ where: target });
       if (!existing) {
         throw new ValidationError(
-          `[turbine] connect on "${relName}": no ${rel.to} row found matching ${describeTargetForMessage(target)}.`,
+          `connect on "${relName}": no ${rel.to} row found matching ${describeTargetForMessage(target)}.`,
         );
       }
       const updateData: Record<string, unknown> = {};
@@ -1473,7 +1469,7 @@ function assertConnectInScope(
     if (current === null) continue;
     if (current === key(parentRow[refField])) continue;
     throw new ValidationError(
-      `[turbine] connect refused: ${rel.to} row ${describeTargetForMessage(target)} is already owned by ` +
+      `connect refused: ${rel.to} row ${describeTargetForMessage(target)} is already owned by ` +
         `another "${rel.from}" (its ${fks[i]} is ${current}). \`scopedConnect\` only allows connecting a row ` +
         `that is unowned or already owned by this parent; re-parenting must be an explicit update.`,
     );
@@ -1496,9 +1492,7 @@ async function batchConnect(
   for (const target of items) {
     const existing = await ctx.tx.table(rel.to).findUnique({ where: target });
     if (!existing) {
-      throw new ValidationError(
-        `[turbine] connect: no ${rel.to} row found matching ${describeTargetForMessage(target)}.`,
-      );
+      throw new ValidationError(`connect: no ${rel.to} row found matching ${describeTargetForMessage(target)}.`);
     }
     assertConnectInScope(ctx, rel, existing as Record<string, unknown>, parentRow, target);
   }
@@ -1566,7 +1560,7 @@ async function processDisconnect(
   });
   if (!nullable) {
     throw new ValidationError(
-      `[turbine] Cannot disconnect "${relName}": foreign key column(s) ${fks.join(', ')} on "${rel.to}" are NOT NULL. Use delete instead.`,
+      `Cannot disconnect "${relName}": foreign key column(s) ${fks.join(', ')} on "${rel.to}" are NOT NULL. Use delete instead.`,
     );
   }
 
@@ -1617,7 +1611,7 @@ async function processSet(
     const value = parentRow[refField];
     if (value === null || value === undefined) {
       throw new ValidationError(
-        `[turbine] Nested set on relation "${rel.name}" cannot run: the parent's reference key ` +
+        `Nested set on relation "${rel.name}" cannot run: the parent's reference key ` +
           `"${refField}" is ${value === null ? 'null' : 'missing from the loaded row'}, so no child rows ` +
           `can be correlated to this parent.`,
       );
@@ -1670,7 +1664,7 @@ async function processNestedUpdate(
   const correlation = parentCorrelationWhere(ctx, rel, parentRow);
   for (const item of items) {
     if (!item.where || !item.data) {
-      throw new ValidationError(`[turbine] Nested update on "${rel.name}" requires both "where" and "data" fields.`);
+      throw new ValidationError(`Nested update on "${rel.name}" requires both "where" and "data" fields.`);
     }
     assertTargetSelectsSomething(item.where, 'update', relName, rel);
     if (!correlation) throw notRelatedToParent('update', relName, rel, item.where);
@@ -1703,9 +1697,7 @@ async function processNestedUpsert(
   const correlation = parentCorrelationWhere(ctx, rel, parentRow);
   for (const item of items) {
     if (!item.where || !item.create || !item.update) {
-      throw new ValidationError(
-        `[turbine] Nested upsert on "${rel.name}" requires "where", "create", and "update" fields.`,
-      );
+      throw new ValidationError(`Nested upsert on "${rel.name}" requires "where", "create", and "update" fields.`);
     }
     assertTargetSelectsSomething(item.where, 'upsert', relName, rel);
     const scoped = correlation ? scopeWhereToParent(item.where, correlation) : null;
@@ -1732,7 +1724,7 @@ async function processBelongsToUpdate(
 ): Promise<void> {
   const item = updateArg as { data: Record<string, unknown> };
   if (!item.data) {
-    throw new ValidationError(`[turbine] Nested update on belongsTo "${rel.name}" requires a "data" field.`);
+    throw new ValidationError(`Nested update on belongsTo "${rel.name}" requires a "data" field.`);
   }
 
   // The related row is the one this parent's FK points at. Route through the
@@ -1767,7 +1759,7 @@ async function processBelongsToUpsert(
   };
   if (!item.where || !item.create || !item.update) {
     throw new ValidationError(
-      `[turbine] Nested upsert on belongsTo "${rel.name}" requires "where", "create", and "update" fields.`,
+      `Nested upsert on belongsTo "${rel.name}" requires "where", "create", and "update" fields.`,
     );
   }
 

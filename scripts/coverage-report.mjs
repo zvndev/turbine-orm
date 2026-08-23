@@ -26,7 +26,28 @@ import { createIstanbulMergeReport } from './coverage-istanbul-merge.mjs';
 
 const require = createRequire(import.meta.url);
 const root = resolve(import.meta.dirname, '..');
-const rc = require(resolve(root, '.c8rc.json'));
+
+/**
+ * `--config <file>` selects the rc, defaulting to `.c8rc.json`.
+ *
+ * A second gate over a different file set cannot use `c8 report`: c8's own
+ * merge is what this script exists to replace, and the main collection is well
+ * past the file count where that merge stops being monotonic (see .c8rc.json's
+ * //merge-bug). So a gate over `coverage/tmp` has to come through here, and the
+ * only thing that varies between such gates is the config.
+ */
+const configIdx = process.argv.indexOf('--config');
+const configFile = configIdx !== -1 ? process.argv[configIdx + 1] : '.c8rc.json';
+if (configIdx !== -1 && !configFile) {
+  console.error('[coverage] --config needs a file path.');
+  process.exit(1);
+}
+const configPath = resolve(root, configFile);
+if (!existsSync(configPath)) {
+  console.error(`[coverage] config not found: ${configPath}`);
+  process.exit(1);
+}
+const rc = require(configPath);
 
 const reportsDirectory = resolve(root, rc['reports-dir'] ?? './coverage');
 const tempDirectory = resolve(root, rc['temp-directory'] ?? `${reportsDirectory}/tmp`);

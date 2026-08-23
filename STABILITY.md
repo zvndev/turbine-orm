@@ -74,11 +74,16 @@ The practical guidance: stay on the latest minor. We do not backport fixes to ol
 - **Stable-surface API freeze, sustained.** No breaking change to a Stable surface for **three consecutive minor releases**. If we have to break one, the clock resets.
 - **A real parity suite, green.** The non-Postgres adapters move from Experimental to a defined support tier only once a cross-dialect parity suite passes against real engines, not mocks. (The 0.17.0 Studio bug shipped green precisely because a test mocked the pool instead of hitting a server; we are not repeating that.)
 - **Real-engine CI.** Integration tests run against live PostgreSQL in CI on every change, not only locally, and the full suite stays green.
-- **Coverage gate held.** The configured thresholds in `.c8rc.json` (currently lines 75%, statements 75%, branches 85%, functions 59%) stay green, with no silently-narrowed subset. These floors were re-baselined on 2026-07-24 to values measured with the exact command CI runs against a seeded database, replacing earlier numbers that had never actually passed; each sits a point or two below measured so an unrelated PR does not trip the gate. Floors ratchet up only, and are never lowered without the reason being recorded in `.c8rc.json`. Function coverage is the real gap and carries a dated target there.
+- **Coverage gate held.** The configured thresholds in `.c8rc.json` (currently lines 93%, statements 93%, branches 89%, functions 78%) stay green, with no silently-narrowed subset. These floors were re-baselined on 2026-08-16 onto a corrected measurement, taken with the exact command CI runs; each sits a point or two below measured so an unrelated PR does not trip the gate. Floors ratchet up only, and are never lowered without the reason being recorded in `.c8rc.json`.
+  > These four numbers are asserted against `.c8rc.json` by
+  > `src/test/docs-claims-sync.test.ts`. Change them there, not here, and the
+  > test will tell you if this paragraph goes stale. They were corrected once by
+  > hand in 0.65.0 and had drifted again by 0.76.0, which is why the assertion
+  > exists.
 - **Published releases, in sync.** Every release has a matching `vX.Y.Z` git tag **and** a published GitHub Release with notes. npm, git tags, and GitHub Releases agree. (See [docs/releases/](./docs/releases/).)
 - **Migration durability.** The migration format and `_turbine_migrations` schema are committed to as-is, a 1.0 upgrade must not require re-checksumming or re-applying existing migrations.
 
-### Honest status today (0.65 line)
+### Honest status today (0.76 line)
 
 We are **not at 1.0 yet**, and the gaps are specific. (This section is dated by its claims, not by a version stamp; an earlier revision froze itself at 0.48.0 and quietly aged for 16 minors.)
 

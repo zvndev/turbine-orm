@@ -173,8 +173,7 @@ export function resolveProjection(
     // with an actionable message.
     if (Array.isArray(select)) {
       throw new ValidationError(
-        `[turbine] "select" must be an object mapping field names to true ` +
-          `(e.g. { id: true, name: true }), not an array.`,
+        `"select" must be an object mapping field names to true ` + `(e.g. { id: true, name: true }), not an array.`,
       );
     }
     // Only include columns where value is true. An explicit `select` naming a
@@ -221,7 +220,7 @@ export function resolveProjection(
   if (omit) {
     if (Array.isArray(omit)) {
       throw new ValidationError(
-        `[turbine] "omit" must be an object mapping field names to true ` + `(e.g. { createdAt: true }), not an array.`,
+        `"omit" must be an object mapping field names to true ` + `(e.g. { createdAt: true }), not an array.`,
       );
     }
     // Include all columns except those where value is true (and PII columns).
@@ -620,7 +619,7 @@ export function buildOrderBy(
         if (meta) resolveOrderByColumn(qi, qi.table, meta, key);
         if (!params) {
           throw new ValidationError(
-            `[turbine] Vector distance ordering on "${key}" is only supported in a top-level findMany orderBy.`,
+            `Vector distance ordering on "${key}" is only supported in a top-level findMany orderBy.`,
           );
         }
         const rawColumn = qi.toColumn(key);
@@ -720,7 +719,7 @@ export function resolveOrderByColumn(_qi: BuilderCtx, table: string, meta: Table
   const col = resolveColumnName(meta, key);
   if (col === undefined) {
     throw new ValidationError(
-      `[turbine] Unknown field "${key}" in orderBy on table "${table}". ` +
+      `Unknown field "${key}" in orderBy on table "${table}". ` +
         `Known fields: ${Object.keys(meta.columnMap).join(', ') || '(none)'}.`,
     );
   }
@@ -747,14 +746,14 @@ export function validateJsonPathOrderBy(
     spec.path.some((el) => typeof el !== 'string' && !(typeof el === 'number' && Number.isFinite(el)))
   ) {
     throw new ValidationError(
-      `[turbine] JSON-path orderBy on "${field}" (table "${table}") requires a non-empty \`path\` array ` +
+      `JSON-path orderBy on "${field}" (table "${table}") requires a non-empty \`path\` array ` +
         `of keys/indexes (e.g. { path: ['weight'], direction: 'asc' }).`,
     );
   }
   const colType = whereMod.pgTypeForColumn(qi, meta, col);
   if (!whereMod.isJsonColumnType(qi, colType)) {
     throw new ValidationError(
-      `[turbine] JSON-path orderBy on "${field}": column "${col}" on table "${table}" is not a JSON column ` +
+      `JSON-path orderBy on "${field}": column "${col}" on table "${table}" is not a JSON column ` +
         `(actual type: ${colType}).`,
     );
   }
@@ -781,7 +780,7 @@ export function buildJsonPathOrderEntry(
 ): string {
   const col = validateJsonPathOrderBy(qi, table, meta, field, spec);
   if (!params) {
-    throw new ValidationError(`[turbine] JSON-path ordering on "${field}" is not supported in this orderBy context.`);
+    throw new ValidationError(`JSON-path ordering on "${field}" is not supported in this orderBy context.`);
   }
   params.push(whereMod.jsonPathParam(qi, spec.path));
   const extract = qi.dialect.buildJsonPathExtract(`${prefix}${qi.q(col)}`, qi.p(params.length));
@@ -840,17 +839,17 @@ function buildChainedToOneOrderBy(
   // Walk the chain, emitting one JOIN per hop, until the value stops being a
   // relation object. Bounded by the same depth cap as nested `with`.
   for (;;) {
-    if (!currentMeta) throw new RelationError(`[turbine] Unknown relation target in orderBy chain "${path.join('.')}"`);
+    if (!currentMeta) throw new RelationError(`Unknown relation target in orderBy chain "${path.join('.')}"`);
     const relDef = ownLookup(currentMeta.relations, relName);
     if (!relDef) {
       throw new ValidationError(
-        `[turbine] Unknown relation "${relName}" in orderBy on relation "${path.join('.')}" ` +
+        `Unknown relation "${relName}" in orderBy on relation "${path.join('.')}" ` +
           `(table "${currentMeta.name}"). Available: ${Object.keys(currentMeta.relations).join(', ') || '(none)'}.`,
       );
     }
     if (relDef.type !== 'belongsTo' && relDef.type !== 'hasOne') {
       throw new ValidationError(
-        `[turbine] orderBy cannot traverse the to-many relation "${relName}" on "${currentMeta.name}" ` +
+        `orderBy cannot traverse the to-many relation "${relName}" on "${currentMeta.name}" ` +
           `(path "${path.concat(relName).join('.')}"): a to-many relation has no single value to order by. ` +
           `Use a pick-row ordering ({ pick, by }) at the top level, or order by "_count".`,
       );
@@ -860,7 +859,7 @@ function buildChainedToOneOrderBy(
     }
 
     const nextMeta = qi.schema.tables[relDef.to];
-    if (!nextMeta) throw new RelationError(`[turbine] Unknown relation target "${relDef.to}" in orderBy`);
+    if (!nextMeta) throw new RelationError(`Unknown relation target "${relDef.to}" in orderBy`);
     const nextAlias = `${head.alias}c${hop}`;
     const on =
       relDef.type === 'belongsTo'
@@ -881,7 +880,7 @@ function buildChainedToOneOrderBy(
     const entries = Object.entries(value);
     if (entries.length !== 1) {
       throw new ValidationError(
-        `[turbine] orderBy on relation "${path.join('.')}" needs exactly one key per level ` +
+        `orderBy on relation "${path.join('.')}" needs exactly one key per level ` +
           `(got: ${entries.map(([k]) => k).join(', ') || '(empty)'}).`,
       );
     }
@@ -900,7 +899,7 @@ function buildChainedToOneOrderBy(
     const snakeCol = resolveColumnName(currentMeta, key);
     if (snakeCol === undefined) {
       throw new ValidationError(
-        `[turbine] Unknown column "${key}" in orderBy on relation "${path.join('.')}" (table "${currentMeta.name}").`,
+        `Unknown column "${key}" in orderBy on relation "${path.join('.')}" (table "${currentMeta.name}").`,
       );
     }
     assertOrderDirection(entryValue, `orderBy on relation path "${path.join('.')}"`);
@@ -960,9 +959,9 @@ export function buildRelationOrderBy(
     const isColumn = resolveColumnName(ownerMeta, relName) !== undefined;
     throw new RelationError(
       isColumn
-        ? `[turbine] orderBy on "${ownerTable}.${relName}" got a relation-shaped value, but "${relName}" is a ` +
+        ? `orderBy on "${ownerTable}.${relName}" got a relation-shaped value, but "${relName}" is a ` +
             `column. Order a column with 'asc' / 'desc' (or { sort, nulls }); the object form is for relations.`
-        : `[turbine] Unknown relation "${relName}" in orderBy on table "${ownerTable}". ` +
+        : `Unknown relation "${relName}" in orderBy on table "${ownerTable}". ` +
             availableClause(Object.keys(ownerMeta.relations), `"${ownerTable}" has no relations.`),
     );
   }
@@ -982,7 +981,7 @@ export function buildRelationOrderBy(
     const keys = Object.keys(value);
     if (keys.length !== 1 || keys[0] !== '_count') {
       throw new ValidationError(
-        `[turbine] orderBy on to-many relation "${relName}" only supports "_count" ` +
+        `orderBy on to-many relation "${relName}" only supports "_count" ` +
           `or a pick-row ordering ({ pick, by }) (got: ${keys.join(', ') || '(empty)'}).`,
       );
     }
@@ -993,7 +992,7 @@ export function buildRelationOrderBy(
 
   // To-one: each entry orders by a correlated scalar subquery on a target column.
   const targetMeta = qi.schema.tables[relDef.to];
-  if (!targetMeta) throw new RelationError(`[turbine] Unknown relation target "${relDef.to}"`);
+  if (!targetMeta) throw new RelationError(`Unknown relation target "${relDef.to}"`);
   const qTarget = qi.q(relDef.to);
   const qParent = qi.q(parentRef);
   // belongsTo: alias.referenceKey = parent.foreignKey; hasOne: reversed.
@@ -1004,7 +1003,7 @@ export function buildRelationOrderBy(
 
   const entries = Object.entries(value);
   if (entries.length === 0) {
-    throw new ValidationError(`[turbine] orderBy on to-one relation "${relName}" needs at least one target column.`);
+    throw new ValidationError(`orderBy on to-one relation "${relName}" needs at least one target column.`);
   }
   return entries
     .map(([col, dirValue]) => {
@@ -1032,7 +1031,7 @@ export function buildRelationOrderBy(
             `{ ${relName}: { ${col}: { <column>: 'asc' } } }.`
           : '';
         throw new ValidationError(
-          `[turbine] Unknown column "${col}" in orderBy on relation "${relName}" (table "${relDef.to}").${relationHint}`,
+          `Unknown column "${col}" in orderBy on relation "${relName}" (table "${relDef.to}").${relationHint}`,
         );
       }
       assertOrderDirection(dirValue, `orderBy "${col}" on relation "${relName}"`);
@@ -1065,7 +1064,7 @@ export function buildRelationOrderBy(
  */
 export function pickOrderNestedError(_qi: BuilderCtx, relName: string): ValidationError {
   return new ValidationError(
-    `[turbine] Pick-row ordering on relation "${relName}" is only supported in a top-level ` +
+    `Pick-row ordering on relation "${relName}" is only supported in a top-level ` +
       'findMany orderBy: nested `with` orderBy does not support it.',
   );
 }
@@ -1082,12 +1081,12 @@ export function validatePickOrderBy(
   }
   if (relDef.type === 'manyToMany') {
     throw new ValidationError(
-      `[turbine] Pick-row ordering is not supported on manyToMany relation "${relName}": hasMany relations only.`,
+      `Pick-row ordering is not supported on manyToMany relation "${relName}": hasMany relations only.`,
     );
   }
   if (relDef.type !== 'hasMany') {
     throw new ValidationError(
-      `[turbine] Pick-row ordering is only for to-many (hasMany) relations; "${relName}" is ${relDef.type}. ` +
+      `Pick-row ordering is only for to-many (hasMany) relations; "${relName}" is ${relDef.type}. ` +
         `Order by the target column directly instead ({ ${relName}: { <column>: 'asc' } }).`,
     );
   }
@@ -1100,7 +1099,7 @@ export function validatePickOrderBy(
     Object.keys(pickOrder).length === 0
   ) {
     throw new ValidationError(
-      `[turbine] Pick-row ordering on relation "${relName}" requires \`pick.orderBy\` to choose ONE ` +
+      `Pick-row ordering on relation "${relName}" requires \`pick.orderBy\` to choose ONE ` +
         "related row deterministically (e.g. pick: { orderBy: { createdAt: 'desc' } }).",
     );
   }
@@ -1108,7 +1107,7 @@ export function validatePickOrderBy(
   const validJsonBy = typeof by === 'object' && by !== null && typeof by.field === 'string' && Array.isArray(by.path);
   if (typeof by !== 'string' && !validJsonBy) {
     throw new ValidationError(
-      `[turbine] Pick-row ordering on relation "${relName}" requires \`by\`: a target column name ` +
+      `Pick-row ordering on relation "${relName}" requires \`by\`: a target column name ` +
         "or a JSON-path spec ({ field: 'data', path: ['title'] }).",
     );
   }
@@ -1117,7 +1116,7 @@ export function validatePickOrderBy(
   // by build and cache-hit collect so a warmed cache throws identically.
   if (spec.plan !== undefined && spec.plan !== 'subquery' && spec.plan !== 'lateral') {
     throw new ValidationError(
-      `[turbine] Pick-row ordering on relation "${relName}" has an invalid \`plan\`: ` +
+      `Pick-row ordering on relation "${relName}" has an invalid \`plan\`: ` +
         `${JSON.stringify(spec.plan)}. Use 'subquery' (default) or 'lateral'.`,
     );
   }
@@ -1134,7 +1133,7 @@ export function validatePickOrderBy(
     // reference ambiguous once the join is in scope; refuse it explicitly.
     if (qi.tableMeta.allColumns.includes('__turbine_pick')) {
       throw new ValidationError(
-        `[turbine] Pick-row ordering with plan: 'lateral' cannot be used: table "${qi.tableMeta.name}" ` +
+        `Pick-row ordering with plan: 'lateral' cannot be used: table "${qi.tableMeta.name}" ` +
           'has a column named "__turbine_pick", which the lateral join output reserves.',
       );
     }
@@ -1170,11 +1169,11 @@ export function buildRelationPickOrderBy(
 ): string {
   if (!params) {
     throw new ValidationError(
-      `[turbine] Pick-row ordering on relation "${relName}" is only supported in a top-level findMany orderBy.`,
+      `Pick-row ordering on relation "${relName}" is only supported in a top-level findMany orderBy.`,
     );
   }
   const targetMeta = qi.schema.tables[relDef.to];
-  if (!targetMeta) throw new RelationError(`[turbine] Unknown relation target "${relDef.to}"`);
+  if (!targetMeta) throw new RelationError(`Unknown relation target "${relDef.to}"`);
 
   assertDirectionToken(spec.direction, `pick-row orderBy on relation "${relName}"`);
   const dir = spec.direction?.toLowerCase() === 'desc' ? 'DESC' : 'ASC';
@@ -1202,7 +1201,7 @@ export function buildRelationPickOrderBy(
   if (spec.plan === 'lateral') {
     if (!lateralSink) {
       throw new ValidationError(
-        `[turbine] Pick-row ordering with plan: 'lateral' on relation "${relName}" is only supported ` +
+        `Pick-row ordering with plan: 'lateral' on relation "${relName}" is only supported ` +
           'in a top-level findMany orderBy.',
       );
     }
@@ -1302,7 +1301,7 @@ export function collectRelationPickOrderParams(
 ): void {
   validatePickOrderBy(qi, relName, relDef, spec, false);
   const targetMeta = qi.schema.tables[relDef.to];
-  if (!targetMeta) throw new RelationError(`[turbine] Unknown relation target "${relDef.to}"`);
+  if (!targetMeta) throw new RelationError(`Unknown relation target "${relDef.to}"`);
   if (typeof spec.by === 'string') {
     resolveOrderByColumn(qi, relDef.to, targetMeta, spec.by);
   } else {
@@ -1354,7 +1353,7 @@ export function buildRelationOrderClause(
     .map(([key, dirValue]) => {
       if (isVectorOrderBy(dirValue)) {
         throw new ValidationError(
-          `[turbine] Vector distance ordering on "${key}" is only supported in a top-level findMany orderBy.`,
+          `Vector distance ordering on "${key}" is only supported in a top-level findMany orderBy.`,
         );
       }
       if (isJsonPathOrderBy(dirValue)) {
@@ -1396,7 +1395,7 @@ export function collectRelationOrderParams(
   for (const [key, dirValue] of orderEntries) {
     if (isVectorOrderBy(dirValue)) {
       throw new ValidationError(
-        `[turbine] Vector distance ordering on "${key}" is only supported in a top-level findMany orderBy.`,
+        `Vector distance ordering on "${key}" is only supported in a top-level findMany orderBy.`,
       );
     }
     if (isJsonPathOrderBy(dirValue)) {
@@ -1447,7 +1446,7 @@ export function buildRelationCountExpr(
   const count = qi.castAgg('COUNT(*)', 'int');
   if (relDef.type === 'manyToMany') {
     if (!relDef.through) {
-      throw new ValidationError(`[turbine] manyToMany relation "${relDef.name}" is missing its \`through\` junction.`);
+      throw new ValidationError(`manyToMany relation "${relDef.name}" is missing its \`through\` junction.`);
     }
     const qJ = qi.q(relDef.through.table);
     const jalias = `${alias}j`;
@@ -1638,11 +1637,29 @@ export function parseNestedRow(
         } else {
           parsed[relName] = jsonVal;
         }
-      } catch {
-        console.warn(
-          `[turbine] Warning: Failed to parse JSON for relation "${relName}" on table "${qi.table}". Using raw value.`,
+      } catch (err) {
+        // A relation column that does not parse is a bug in the emitted SQL or
+        // a driver-level corruption, not a recoverable condition. Handing back
+        // the raw string satisfied the assignment and violated the generated
+        // type: callers got a `string` where `Post[]` was promised, and found
+        // out at the first `.map`. Throw instead, with the context needed to
+        // find it.
+        //
+        // The warn is gated and deduped because this sits in parseNestedRow's
+        // per-relation loop: one 10,000-row page was 10,000 console.warn calls.
+        if (
+          process.env.NODE_ENV !== 'production' &&
+          shouldWarnOnce(WARN_NS.relationParseFailure, `${qi.table}.${relName}`)
+        ) {
+          console.warn(
+            `[turbine] Relation "${relName}" on "${qi.table}" returned a payload that is not valid JSON. ` +
+              `This is a bug; please report it with the emitted SQL.`,
+          );
+        }
+        throw new ValidationError(
+          `Relation "${relName}" on table "${qi.table}" returned a payload that could not be parsed as JSON.`,
+          { cause: err },
         );
-        parsed[relName] = rawValue;
       }
     } else if (Array.isArray(rawValue)) {
       parsed[relName] = rawValue.map((item) =>
@@ -2692,7 +2709,7 @@ export function buildSelectWithRelations(
   flatten?: { plan: FlattenPlan; joinSink: string[] },
 ): string {
   const meta = qi.schema.tables[table];
-  if (!meta) throw new ValidationError(`[turbine] Unknown table "${table}"`);
+  if (!meta) throw new ValidationError(`Unknown table "${table}"`);
 
   // Positional JSON encoding is Postgres-only in v1. Gate here, the single
   // entry point for every `with` clause, so no engine ever emits the
@@ -2719,7 +2736,7 @@ export function buildSelectWithRelations(
     const relDef = ownLookup(meta.relations, relName);
     if (!relDef) {
       throw new RelationError(
-        `[turbine] Unknown relation "${relName}" on table "${table}". ` +
+        `Unknown relation "${relName}" on table "${table}". ` +
           availableClause(Object.keys(meta.relations), `"${table}" has no relations.`),
       );
     }
@@ -2870,7 +2887,7 @@ export function buildRelationSubquery(
     throw new CircularRelationError([...currentPath, targetTable]);
   }
   const targetMeta = qi.schema.tables[targetTable];
-  if (!targetMeta) throw new RelationError(`[turbine] Unknown relation target "${targetTable}"`);
+  if (!targetMeta) throw new RelationError(`Unknown relation target "${targetTable}"`);
 
   // `true` IS `{}`; below this line there is no `true` case, which is what
   // keeps this walk and collectRelationSubqueryParams reading one shape.
@@ -3008,7 +3025,7 @@ export function buildRelationSubquery(
       const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
       if (!nestedRelDef) {
         throw new RelationError(
-          `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
+          `Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
             availableClause(Object.keys(targetMeta.relations), `"${relDef.to}" has no relations.`),
         );
       }
@@ -3106,7 +3123,7 @@ export function buildRelationSubquery(
           const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
           if (!nestedRelDef) {
             throw new RelationError(
-              `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
+              `Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
                 availableClause(Object.keys(targetMeta.relations), `"${relDef.to}" has no relations.`),
             );
           }
@@ -3177,9 +3194,7 @@ export function buildManyToManySubquery(
   includePii?: boolean,
 ): string {
   if (!relDef.through) {
-    throw new ValidationError(
-      `[turbine] manyToMany relation "${relDef.name}" is missing a \`through\` junction descriptor.`,
-    );
+    throw new ValidationError(`manyToMany relation "${relDef.name}" is missing a \`through\` junction descriptor.`);
   }
 
   // `true` IS `{}`; see {@link relationOptions}. Same reading as
@@ -3199,14 +3214,14 @@ export function buildManyToManySubquery(
   // silently guessing `id` and generating a wrong JOIN.
   if (targetMeta.primaryKey.length === 0) {
     throw new ValidationError(
-      `[turbine] manyToMany relation "${relDef.name}" targets table "${targetTable}" which has no primary key; ` +
+      `manyToMany relation "${relDef.name}" targets table "${targetTable}" which has no primary key; ` +
         `cannot determine the join column. Define a primary key or use an explicit through descriptor.`,
     );
   }
   const targetPk = targetMeta.primaryKey;
   if (targetKeys.length !== targetPk.length) {
     throw new ValidationError(
-      `[turbine] manyToMany relation "${relDef.name}": through.targetKey has ${targetKeys.length} column(s) ` +
+      `manyToMany relation "${relDef.name}": through.targetKey has ${targetKeys.length} column(s) ` +
         `but target "${targetTable}" primary key has ${targetPk.length}. Composite keys must pair positionally.`,
     );
   }
@@ -3217,7 +3232,7 @@ export function buildManyToManySubquery(
   const refKeys = normalizeKeyColumns(relDef.referenceKey);
   if (sourceKeys.length !== refKeys.length) {
     throw new ValidationError(
-      `[turbine] manyToMany relation "${relDef.name}": through.sourceKey has ${sourceKeys.length} column(s) ` +
+      `manyToMany relation "${relDef.name}": through.sourceKey has ${sourceKeys.length} column(s) ` +
         `but referenceKey has ${refKeys.length}. Composite keys must pair positionally.`,
     );
   }
@@ -3277,7 +3292,7 @@ export function buildManyToManySubquery(
         const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
         if (!nestedRelDef) {
           throw new RelationError(
-            `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
+            `Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
               availableClause(Object.keys(targetMeta.relations), `"${relDef.to}" has no relations.`),
           );
         }
@@ -3311,7 +3326,7 @@ export function buildManyToManySubquery(
       const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
       if (!nestedRelDef) {
         throw new RelationError(
-          `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
+          `Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
             availableClause(Object.keys(targetMeta.relations), `"${relDef.to}" has no relations.`),
         );
       }

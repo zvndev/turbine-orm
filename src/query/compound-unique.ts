@@ -189,7 +189,7 @@ export function expandCompoundUniqueWhere(
       [...providedByColumn.keys()].every((c) => expected.has(c));
     if (!exact) {
       throw new ValidationError(
-        `[turbine] Compound unique selector "${key}" on table "${meta.name}" must supply exactly ` +
+        `Compound unique selector "${key}" on table "${meta.name}" must supply exactly ` +
           `{ ${fields.join(', ')} }, received { ${provided.join(', ') || '(none)'} }.`,
       );
     }
@@ -256,7 +256,7 @@ export function assertWhereIdentifiesOneRow(
       : `Table "${table}" declares no primary key and no unique constraint, so no \`where\` can identify one row ` +
         'here. Use `findFirst` (add an `orderBy` to make which row it is deterministic).';
   throw new ValidationError(
-    `[turbine] findUnique on "${table}" refused: the \`where\` clause does not identify a single row, ` +
+    `findUnique on "${table}" refused: the \`where\` clause does not identify a single row, ` +
       `so this would return an arbitrary one of the rows that match. ${advice}`,
   );
 }

@@ -74,7 +74,7 @@ export function buildTypedSql(
   // loudly here instead).
   if (strings.length !== values.length + 1) {
     throw new ValidationError(
-      `[turbine] sql template segment/value count mismatch: ${strings.length} segments, ${values.length} values.`,
+      `sql template segment/value count mismatch: ${strings.length} segments, ${values.length} values.`,
     );
   }
   let sql = '';

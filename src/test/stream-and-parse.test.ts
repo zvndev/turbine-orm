@@ -12,7 +12,9 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { ValidationError } from '../errors.js';
 import { QueryInterface } from '../query/index.js';
+import { resetWarnOnce, WARN_NS } from '../query/warn-registry.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { mockTable } from './helpers.js';
 
@@ -731,7 +733,16 @@ describe('parseNestedRow: short-circuit optimizations', () => {
     assert.equal(comments[0]!.userId, 1);
   });
 
-  it('malformed JSON fallback preserves raw value', () => {
+  it('malformed JSON is refused, not substituted for the parsed relation', () => {
+    // This test used to assert the opposite: that the raw string was preserved
+    // as the relation value and a warning was emitted per row. That encoded a
+    // bug. The raw string satisfies the assignment and violates the generated
+    // type (a `string` where `Post[]` is promised), so the caller found out at
+    // the first `.map`, arbitrarily far from the query. The warn was also
+    // ungated and undeduped inside a per-row loop, so a 10,000-row page was
+    // 10,000 production warnings. See relation-parse-failure.test.ts for the
+    // gate, the dedupe and the production behaviour.
+    resetWarnOnce(WARN_NS.relationParseFailure);
     const schema = buildSchemaWithRelations();
     const q = new QueryInterface<Record<string, unknown>>(
       // biome-ignore lint/suspicious/noExplicitAny: mock pool for testing
@@ -750,22 +761,25 @@ describe('parseNestedRow: short-circuit optimizations', () => {
     try {
       // biome-ignore lint/suspicious/noExplicitAny: testing relation parsing with mock schema that lacks type info
       const deferred = q.buildFindMany({ with: { posts: true } as any });
-      const result = deferred.transform({
-        rows: [{ id: 1, name: 'Alice', email: 'a@test.com', posts: 'not valid json' }],
-        command: '',
-        rowCount: 1,
-        oid: 0,
-        fields: [],
-      });
-
-      assert.equal(result.length, 1);
-      // biome-ignore lint/suspicious/noExplicitAny: accessing untyped properties on mock query result
-      const row = result[0] as any;
-      // Malformed JSON should be preserved as raw string
-      assert.equal(row.posts, 'not valid json');
-      // Warning should have been emitted
-      assert.ok(warnings.length > 0, 'should emit a warning for malformed JSON');
-      assert.ok(warnings[0]!.includes('Failed to parse JSON'));
+      assert.throws(
+        () =>
+          deferred.transform({
+            rows: [{ id: 1, name: 'Alice', email: 'a@test.com', posts: 'not valid json' }],
+            command: '',
+            rowCount: 1,
+            oid: 0,
+            fields: [],
+          }),
+        (err: unknown) => {
+          assert.ok(err instanceof ValidationError, 'a payload that will not parse must be an error');
+          assert.match(err.message, /"posts"/, 'the message must name the relation');
+          assert.match(err.message, /"users"/, 'the message must name the table');
+          return true;
+        },
+      );
+      // The diagnostic still fires in dev, once per (table, relation).
+      assert.equal(warnings.length, 1, 'should say something once for malformed JSON');
+      assert.match(warnings[0] as string, /not valid JSON/);
     } finally {
       console.warn = origWarn;
     }

@@ -931,7 +931,7 @@ export const postgresDialect: Dialect = {
   buildBulkInsertStatement(input: BulkInsertStatementInput): BuiltStatement {
     if (!input.columnArrayTypes || input.columnArrayTypes.length !== input.columns.length) {
       throw new ValidationError(
-        `[turbine] createMany bulk insert into "${input.table}": columnArrayTypes must supply one UNNEST cast ` +
+        `createMany bulk insert into "${input.table}": columnArrayTypes must supply one UNNEST cast ` +
           `per column, got ${input.columnArrayTypes?.length ?? 0} for ${input.columns.length} columns ` +
           `(${input.columns.join(', ')}). Schema metadata is missing a pgType for at least one column; ` +
           'regenerate it with `npx turbine generate`.',

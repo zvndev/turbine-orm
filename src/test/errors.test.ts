@@ -123,8 +123,10 @@ describe('NotFoundError', () => {
     assert.ok(err.message.includes('findUniqueOrThrow'), 'message should include operation');
     assert.ok(err.message.includes('{ id }'), 'safe mode should include where key, not value');
     assert.ok(!err.message.includes('"id":1'), 'safe mode should NOT include where value JSON');
-    // Old prefix is preserved so substring assertions in other tests still pass:
-    assert.ok(err.message.includes('[turbine] findUniqueOrThrow on "users" found no record'));
+    // One prefix only: formatErrorMessage owns the [CODE] tag, and the message
+    // body no longer hand-writes a second `[turbine] ` in front of it.
+    assert.ok(err.message.includes('[TURBINE_E001] findUniqueOrThrow on "users" found no record'));
+    assert.doesNotMatch(err.message, /\[turbine\]/);
   });
 
   it('options object: populates .table, .where, .operation fields', () => {
@@ -159,7 +161,7 @@ describe('NotFoundError', () => {
 
   it('options object: empty object falls back to generic message', () => {
     const err = new NotFoundError({});
-    assert.equal(err.message, '[TURBINE_E001] [turbine] Record not found (https://turbineorm.dev/errors#e001)');
+    assert.equal(err.message, '[TURBINE_E001] Record not found (https://turbineorm.dev/errors#e001)');
     assert.equal(err.table, undefined);
     assert.equal(err.where, undefined);
     assert.equal(err.operation, undefined);
@@ -191,18 +193,12 @@ describe('TimeoutError', () => {
 
   it('message includes timeout value and default context', () => {
     const err = new TimeoutError(3000);
-    assert.equal(
-      err.message,
-      '[TURBINE_E002] [turbine] Query timed out after 3000ms (https://turbineorm.dev/errors#e002)',
-    );
+    assert.equal(err.message, '[TURBINE_E002] Query timed out after 3000ms (https://turbineorm.dev/errors#e002)');
   });
 
   it('message includes custom context', () => {
     const err = new TimeoutError(1500, 'Transaction');
-    assert.equal(
-      err.message,
-      '[TURBINE_E002] [turbine] Transaction timed out after 1500ms (https://turbineorm.dev/errors#e002)',
-    );
+    assert.equal(err.message, '[TURBINE_E002] Transaction timed out after 1500ms (https://turbineorm.dev/errors#e002)');
   });
 
   it('has .code === TURBINE_E002', () => {
@@ -434,10 +430,7 @@ describe('UniqueConstraintError', () => {
 
   it('default message is generic when no fields are passed', () => {
     const err = new UniqueConstraintError();
-    assert.equal(
-      err.message,
-      '[TURBINE_E008] [turbine] Unique constraint violation (https://turbineorm.dev/errors#e008)',
-    );
+    assert.equal(err.message, '[TURBINE_E008] Unique constraint violation (https://turbineorm.dev/errors#e008)');
   });
 
   it('default message includes constraint name when passed', () => {
@@ -860,7 +853,7 @@ describe('DeadlockError', () => {
 
   it('default message is generic when no cause is passed', () => {
     const err = new DeadlockError();
-    assert.equal(err.message, '[TURBINE_E012] [turbine] Deadlock detected (https://turbineorm.dev/errors#e012)');
+    assert.equal(err.message, '[TURBINE_E012] Deadlock detected (https://turbineorm.dev/errors#e012)');
   });
 
   it('default message embeds pg cause message', () => {
@@ -912,10 +905,7 @@ describe('SerializationFailureError', () => {
 
   it('default message is generic when no cause is passed', () => {
     const err = new SerializationFailureError();
-    assert.equal(
-      err.message,
-      '[TURBINE_E013] [turbine] Serializable transaction conflict (https://turbineorm.dev/errors#e013)',
-    );
+    assert.equal(err.message, '[TURBINE_E013] Serializable transaction conflict (https://turbineorm.dev/errors#e013)');
   });
 
   it('default message embeds pg cause message', () => {
@@ -979,7 +969,7 @@ describe('NotFoundError redaction modes', () => {
     }
   });
 
-  it('safe mode: preserves the legacy message prefix for substring tests', () => {
+  it('safe mode: carries exactly one prefix, the code tag', () => {
     setErrorMessageMode('safe');
     try {
       const err = new NotFoundError({
@@ -987,7 +977,8 @@ describe('NotFoundError redaction modes', () => {
         where: { id: 1 },
         operation: 'findUniqueOrThrow',
       });
-      assert.ok(err.message.startsWith('[TURBINE_E001] [turbine] findUniqueOrThrow on "users" found no record'));
+      assert.ok(err.message.startsWith('[TURBINE_E001] findUniqueOrThrow on "users" found no record'));
+      assert.doesNotMatch(err.message, /\[turbine\]/);
     } finally {
       restore();
     }
@@ -1018,7 +1009,7 @@ describe('NotFoundError redaction modes', () => {
     }
   });
 
-  it('verbose mode: preserves the legacy message prefix for substring tests', () => {
+  it('verbose mode: carries exactly one prefix, the code tag', () => {
     setErrorMessageMode('verbose');
     try {
       const err = new NotFoundError({
@@ -1026,7 +1017,8 @@ describe('NotFoundError redaction modes', () => {
         where: { id: 1 },
         operation: 'findUniqueOrThrow',
       });
-      assert.ok(err.message.startsWith('[TURBINE_E001] [turbine] findUniqueOrThrow on "users" found no record'));
+      assert.ok(err.message.startsWith('[TURBINE_E001] findUniqueOrThrow on "users" found no record'));
+      assert.doesNotMatch(err.message, /\[turbine\]/);
     } finally {
       restore();
     }

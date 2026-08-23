@@ -50,8 +50,10 @@ import {
   hasRelationFields,
   type NestedWriteContext,
 } from './nested-write.js';
+import type { PowdbPool } from './powdb.js';
 import {
   ALL_POWDB_CAPABILITIES,
+  baseTsType,
   coerceNativeValue,
   isJsonColumn,
   isPowdbDatetimeColumn,
@@ -59,13 +61,12 @@ import {
   type PowdbCapabilities,
   PowdbFloatParam,
   PowdbJsonParam,
-  type PowdbPool,
   powqlColumnType,
   quotePowqlDotted,
   quotePowqlIdent,
   requireCapability,
   rowToEntity,
-} from './powdb.js';
+} from './powdb-shared.js';
 import { assertAggregatePiiOptIn } from './query/aggregates.js';
 import { assertWhereIdentifiesOneRow, expandCompoundUniqueWhere } from './query/compound-unique.js';
 import { ARRAY_OPERATOR_KEYS, isJsonFilter, isRelationPickOrderBy, orderByEntries } from './query/filters.js';
@@ -347,7 +348,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const meta = schema.tables[table];
     if (!meta) {
       throw new ValidationError(
-        `[turbine] Unknown table "${table}". ${availableClause(Object.keys(schema.tables), 'The schema has no tables.')}`,
+        `Unknown table "${table}". ${availableClause(Object.keys(schema.tables), 'The schema has no tables.')}`,
       );
     }
     this.meta = meta;
@@ -384,7 +385,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const col = this.meta.columns.find((c) => c.name === snake || c.field === field);
     if (!col) {
       throw new ValidationError(
-        `[turbine] Unknown column "${field}" on table "${this.table}". Known: ${this.meta.columns
+        `Unknown column "${field}" on table "${this.table}". Known: ${this.meta.columns
           .map((c) => c.field)
           .join(', ')}`,
       );
@@ -491,7 +492,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    */
   private writeRef(value: unknown, col: ColumnMetadata, params: unknown[]): string {
     if (typeof value === 'number' && !Number.isFinite(value) && this.isFloatCol(col)) {
-      throw new ValidationError(`[turbine] Non-finite value for float column "${col.name}" on "${this.table}".`);
+      throw new ValidationError(`Non-finite value for float column "${col.name}" on "${this.table}".`);
     }
     return this.param(value, params, col);
   }
@@ -629,9 +630,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       ['offset', offset],
     ] as const) {
       if (value !== undefined && value !== null && value < 0) {
-        throw new ValidationError(
-          `[turbine] ${context} on "${this.table}": \`${name}\` must not be negative (got ${value}).`,
-        );
+        throw new ValidationError(`${context} on "${this.table}": \`${name}\` must not be negative (got ${value}).`);
       }
     }
   }
@@ -677,7 +676,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         // resolveRelationFilters() before buildWhere runs, reaching here means
         // a caller skipped that step (an internal bug, not user error).
         throw new ValidationError(
-          `[turbine] internal: relation filter "${key}" reached buildWhere unresolved (missing resolveRelationFilters()).`,
+          `internal: relation filter "${key}" reached buildWhere unresolved (missing resolveRelationFilters()).`,
         );
       } else {
         // A JsonFilter (or a bare `{ path }`) can compile to zero clauses; skip
@@ -810,7 +809,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           conds.push(`${lhs} like ${this.bindLike(`%${escapeLike(String(opVal))}`, params, insensitive)}`);
           break;
         default:
-          throw new ValidationError(`[turbine] Unsupported operator "${opName}" on PowDB.`);
+          throw new ValidationError(`Unsupported operator "${opName}" on PowDB.`);
       }
     }
     return conds.length > 1 ? `(${conds.join(' and ')})` : (conds[0] ?? this.alwaysFalse());
@@ -909,17 +908,17 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       if (v === undefined) continue;
       if (filter.path === undefined) {
         throw new ValidationError(
-          `[turbine] JSON range operator '${op}' on ${col.name} requires a \`path\` ` +
+          `JSON range operator '${op}' on ${col.name} requires a \`path\` ` +
             `(e.g. { path: ['meta', 'score'], ${op}: ${JSON.stringify(v)} }).`,
         );
       }
       if (typeof v !== 'number' && typeof v !== 'string') {
         throw new ValidationError(
-          `[turbine] JSON range operator '${op}' on ${col.name} requires a number or string, got ${JSON.stringify(v)}.`,
+          `JSON range operator '${op}' on ${col.name} requires a number or string, got ${JSON.stringify(v)}.`,
         );
       }
       if (typeof v === 'number' && !Number.isFinite(v)) {
-        throw new ValidationError(`[turbine] JSON range operator '${op}' on ${col.name} requires a finite number.`);
+        throw new ValidationError(`JSON range operator '${op}' on ${col.name} requires a finite number.`);
       }
       conds.push(`${pathP()} ${powOp} ${this.param(v, params)}`);
     }
@@ -938,7 +937,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     // query the way it used to.
     if (!conds.length) {
       throw new ValidationError(
-        `[turbine] internal: JSON filter on "${col.name}" compiled to no condition. This is a bug in turbine-orm.`,
+        `internal: JSON filter on "${col.name}" compiled to no condition. This is a bug in turbine-orm.`,
       );
     }
     return conds.length > 1 ? `(${conds.join(' and ')})` : conds[0]!;
@@ -1139,7 +1138,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       );
     }
     const targetMeta = this.schema.tables[rel.to];
-    if (!targetMeta) throw new ValidationError(`[turbine] Relation "${rel.name}" targets unknown table "${rel.to}".`);
+    if (!targetMeta) throw new ValidationError(`Relation "${rel.name}" targets unknown table "${rel.to}".`);
     // hasMany/hasOne: localKey = our referenceKey, collect the child's foreignKey.
     // belongsTo:      localKey = our foreignKey,   collect the target's referenceKey.
     const localCol = rel.type === 'belongsTo' ? fk[0]! : rk[0]!;
@@ -1171,13 +1170,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     timeout?: number,
   ): Promise<Record<string, unknown>> {
     const through = rel.through;
-    if (!through)
-      throw new ValidationError(`[turbine] manyToMany relation "${rel.name}" is missing its junction (\`through\`).`);
+    if (!through) throw new ValidationError(`manyToMany relation "${rel.name}" is missing its junction (\`through\`).`);
     const sourceJ = normalizeKeyColumns(through.sourceKey);
     const targetJ = normalizeKeyColumns(through.targetKey);
     const sourceRef = normalizeKeyColumns(rel.referenceKey);
     const targetMeta = this.schema.tables[rel.to];
-    if (!targetMeta) throw new ValidationError(`[turbine] Relation "${rel.name}" targets unknown table "${rel.to}".`);
+    if (!targetMeta) throw new ValidationError(`Relation "${rel.name}" targets unknown table "${rel.to}".`);
     if (sourceJ.length > 1 || targetJ.length > 1 || sourceRef.length > 1 || targetMeta.primaryKey.length > 1) {
       throw new UnsupportedFeatureError(
         'composite-key manyToMany filters',
@@ -1544,9 +1542,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   /** Build the E018 refusal for a write / `begin` on a read-only pool. */
   private readOnlyError(operation: string): ReadOnlyError {
-    // Pass a clean detail: the ReadOnlyError constructor owns both the
-    // `[turbine] ` prefix and the "Route writes to a writable primary." hint,
-    // so adding either here would double them.
+    // Pass a clean detail: the ReadOnlyError constructor owns the "Route writes
+    // to a writable primary." hint, so adding it here would double it. The
+    // `[TURBINE_E018]` tag is added once, later, by formatErrorMessage.
     return new ReadOnlyError(`${operation} on "${this.table}" refused: this PowDB connection is read-only.`);
   }
 
@@ -1996,7 +1994,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     includePii = false,
   ): Promise<void> {
     if (depth >= 10) {
-      throw new ValidationError(`[turbine] Nested 'with' on PowDB exceeded depth 10 (relation cycle?).`);
+      throw new ValidationError(`Nested 'with' on PowDB exceeded depth 10 (relation cycle?).`);
     }
     if (!parents.length) return;
     // The resolved strategy is 'join' only for an EXPLICIT 'join' (per-query arg
@@ -2008,7 +2006,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     for (const [relName, opt] of Object.entries(withClause)) {
       if (!opt) continue;
       const rel = this.meta.relations[relName];
-      if (!rel) throw new ValidationError(`[turbine] Unknown relation "${relName}" on "${this.table}".`);
+      if (!rel) throw new ValidationError(`Unknown relation "${relName}" on "${this.table}".`);
       if (strategyIsJoin && parent && this.joinEligible(rel, opt, parent.args, parents.length)) {
         if (this.capabilities.serverJoins) {
           await this.loadRelationViaJoin(parents, rel, relName, opt, parent, timeout, includePii);
@@ -2139,13 +2137,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     includePii = false,
   ): Promise<void> {
     const through = rel.through;
-    if (!through)
-      throw new ValidationError(`[turbine] manyToMany relation "${relName}" is missing its junction (\`through\`).`);
+    if (!through) throw new ValidationError(`manyToMany relation "${relName}" is missing its junction (\`through\`).`);
     const sourceJ = normalizeKeyColumns(through.sourceKey);
     const targetJ = normalizeKeyColumns(through.targetKey);
     const sourceRef = normalizeKeyColumns(rel.referenceKey);
     const targetMeta = this.schema.tables[rel.to];
-    if (!targetMeta) throw new ValidationError(`[turbine] Relation "${relName}" targets unknown table "${rel.to}".`);
+    if (!targetMeta) throw new ValidationError(`Relation "${relName}" targets unknown table "${rel.to}".`);
     if (sourceJ.length > 1 || targetJ.length > 1 || sourceRef.length > 1 || targetMeta.primaryKey.length > 1) {
       throw new UnsupportedFeatureError(
         'composite-key manyToMany',
@@ -2390,7 +2387,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     }
     const options = (opt === true ? {} : opt) as FindManyArgs<object>;
     const targetMeta = this.schema.tables[rel.to];
-    if (!targetMeta) throw new ValidationError(`[turbine] Relation "${relName}" targets unknown table "${rel.to}".`);
+    if (!targetMeta) throw new ValidationError(`Relation "${relName}" targets unknown table "${rel.to}".`);
     const targetQi = new PowqlInterface<object>(this.pool, rel.to, this.schema, [], this.options);
     const fk = normalizeKeyColumns(rel.foreignKey);
     const rk = normalizeKeyColumns(rel.referenceKey);
@@ -2448,11 +2445,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     includePii = false,
   ): Promise<void> {
     const through = rel.through;
-    if (!through)
-      throw new ValidationError(`[turbine] manyToMany relation "${relName}" is missing its junction (\`through\`).`);
+    if (!through) throw new ValidationError(`manyToMany relation "${relName}" is missing its junction (\`through\`).`);
     const options = (opt === true ? {} : opt) as FindManyArgs<object>;
     const targetMeta = this.schema.tables[rel.to];
-    if (!targetMeta) throw new ValidationError(`[turbine] Relation "${relName}" targets unknown table "${rel.to}".`);
+    if (!targetMeta) throw new ValidationError(`Relation "${relName}" targets unknown table "${rel.to}".`);
     const targetQi = new PowqlInterface<object>(this.pool, rel.to, this.schema, [], this.options);
     const sourceJCol = normalizeKeyColumns(through.sourceKey)[0]!;
     const targetJCol = normalizeKeyColumns(through.targetKey)[0]!;
@@ -2502,7 +2498,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     );
     if (plan.cols.includes('__tpk')) {
       throw new ValidationError(
-        `[turbine] relation target "${targetQi.table}" has a column named "__tpk", which collides with the reserved ` +
+        `relation target "${targetQi.table}" has a column named "__tpk", which collides with the reserved ` +
           `join correlation alias. Rename the column or load this relation with relationLoadStrategy: 'batched'.`,
       );
     }
@@ -2652,7 +2648,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     );
     const byName = new Map(targetQi.meta.columns.map((c) => [c.name, c]));
     for (const c of cols) {
-      const ts = (byName.get(c)?.tsType ?? '').replace(/\s*\|\s*null$/i, '').trim();
+      const ts = baseTsType(byName.get(c)?.tsType ?? '');
       if (ts === 'bigint' || ts === 'Uint8Array') return null;
     }
     const children: NestedRelationPlan[] = [];
@@ -2875,7 +2871,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     // at least one projected child column is bigint/bytes. Otherwise nested
     // projections already handle it (and cache), so leave it to them.
     const hasCarrierBlockedCol = userCols.some((c) => {
-      const ts = (byName.get(c)?.tsType ?? '').replace(/\s*\|\s*null$/i, '').trim();
+      const ts = baseTsType(byName.get(c)?.tsType ?? '');
       return ts === 'bigint' || ts === 'Uint8Array';
     });
     if (!hasCarrierBlockedCol) return null;
@@ -3074,7 +3070,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       if (missing.length > 0) parts.push(`does not supply ${quoteList(missing)}`);
       if (unexpected.length > 0) parts.push(`supplies ${quoteList(unexpected)}, which the first row does not`);
       throw new ValidationError(
-        `[turbine] createMany on "${this.table}": row ${i} ${parts.join(' and ')}. ` +
+        `createMany on "${this.table}": row ${i} ${parts.join(' and ')}. ` +
           'Every row must supply the same fields (a field set to `undefined` counts as omitted, exactly as it does ' +
           'in `create`). PowQL itself would insert the ragged rows, but the SQL engines build ONE statement whose ' +
           "column list comes from the first row, so there a later row's extra field is dropped and a field it " +
@@ -3209,12 +3205,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         else if ('multiply' in opObj)
           parts.push(`${col} := ${ref} * ${this.writeRef(opObj.multiply, colMeta, params)}`);
         else if ('divide' in opObj) parts.push(`${col} := ${ref} / ${this.writeRef(opObj.divide, colMeta, params)}`);
-        else throw new ValidationError(`[turbine] Unsupported update operator on "${field}".`);
+        else throw new ValidationError(`Unsupported update operator on "${field}".`);
       } else {
         parts.push(`${col} := ${this.writeRef(value, colMeta, params)}`);
       }
     }
-    if (!parts.length) throw new ValidationError(`[turbine] update on "${this.table}" has no fields to set.`);
+    if (!parts.length) throw new ValidationError(`update on "${this.table}" has no fields to set.`);
     return parts.join(', ');
   }
 
@@ -3397,7 +3393,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     });
     if (pkPairs.some((p) => p.value == null)) {
       throw new ValidationError(
-        `[turbine] upsert on "${this.table}" needs every composite-PK field in \`create\` (${pkPairs
+        `upsert on "${this.table}" needs every composite-PK field in \`create\` (${pkPairs
           .map((p) => p.field)
           .join(', ')}).`,
       );
@@ -3552,7 +3548,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const claim = (key: string, what: string): void => {
         if (key === '_count' || usedKeys.has(key)) {
           throw new ValidationError(
-            `[turbine] groupBy output name "${key}" (${what}) collides with another output column on table ` +
+            `groupBy output name "${key}" (${what}) collides with another output column on table ` +
               `"${this.table}": set an explicit \`alias\` (or rename the aggregate key) to disambiguate.`,
           );
         }
@@ -3597,7 +3593,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           const col = this.column(entry.field);
           if (!isJsonColumn(col)) {
             throw new ValidationError(
-              `[turbine] groupBy JSON group key on "${entry.field}" (table "${this.table}") requires a json column.`,
+              `groupBy JSON group key on "${entry.field}" (table "${this.table}") requires a json column.`,
             );
           }
           assertAggregatePiiOptIn(
@@ -3714,7 +3710,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
             const col = this.column(target.field);
             if (!isJsonColumn(col)) {
               throw new ValidationError(
-                `[turbine] groupBy ${fn} target "${key}" on "${target.field}" (table "${this.table}") requires a json column.`,
+                `groupBy ${fn} target "${key}" on "${target.field}" (table "${this.table}") requires a json column.`,
               );
             }
             if (fn === '_min' || fn === '_max') {
@@ -3731,7 +3727,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
             const alwaysNumeric = fn === '_sum' || fn === '_avg';
             if (alwaysNumeric && target.type === 'text') {
               throw new ValidationError(
-                `[turbine] groupBy ${fn} target "${key}" on table "${this.table}": ` +
+                `groupBy ${fn} target "${key}" on table "${this.table}": ` +
                   `${fn} over a JSON path is always numeric: remove \`type: 'text'\`.`,
               );
             }
@@ -3803,7 +3799,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       path.some((el) => typeof el !== 'string' && !(typeof el === 'number' && Number.isFinite(el)))
     ) {
       throw new ValidationError(
-        `[turbine] groupBy ${context} on "${field}" (table "${this.table}") requires a non-empty \`path\` ` +
+        `groupBy ${context} on "${field}" (table "${this.table}") requires a non-empty \`path\` ` +
           `array of keys/indexes (e.g. { field: '${field}', path: ['category'] }).`,
       );
     }
@@ -3853,7 +3849,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           const fn = POWQL_HAVING_AGG_FNS.get(aggKey);
           if (!fn) {
             throw new ValidationError(
-              `[turbine] Unknown aggregate "${aggKey}" in having for field "${key}" on table "${this.table}". ` +
+              `Unknown aggregate "${aggKey}" in having for field "${key}" on table "${this.table}". ` +
                 `Supported: ${[...POWQL_HAVING_AGG_FNS.keys()].join(', ')}.`,
             );
           }
@@ -3895,7 +3891,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           const expr = aggOrderExprs.get('_count');
           if (!expr) {
             throw new ValidationError(
-              `[turbine] Cannot order groupBy by "_count" on table "${this.table}": _count is not selected. ` +
+              `Cannot order groupBy by "_count" on table "${this.table}": _count is not selected. ` +
                 `Orderable keys: ${validKeys()}.`,
             );
           }
@@ -3904,7 +3900,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         }
         if (typeof value !== 'object' || value === null || Array.isArray(value)) {
           throw new ValidationError(
-            `[turbine] Invalid groupBy orderBy for "${key}" on table "${this.table}": ` +
+            `Invalid groupBy orderBy for "${key}" on table "${this.table}": ` +
               `expected a field map like { ${key}: { amount: 'desc' } }.`,
           );
         }
@@ -3915,7 +3911,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           const expr = aggOrderExprs.get(`${key}:${field}`) ?? this.aggOrderExpr(aggOrderExprs, key, field);
           if (!expr) {
             throw new ValidationError(
-              `[turbine] Cannot order groupBy by "${key}.${field}" on table "${this.table}": ` +
+              `Cannot order groupBy by "${key}.${field}" on table "${this.table}": ` +
                 `that aggregate is not requested in this call. Orderable keys: ${validKeys()}.`,
             );
           }
@@ -3926,7 +3922,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const expr = this.lookupGroupKey(byOrderExprs, key);
       if (!expr) {
         throw new ValidationError(
-          `[turbine] Unknown field "${key}" in groupBy orderBy on table "${this.table}". Orderable keys: ${validKeys()}.`,
+          `Unknown field "${key}" in groupBy orderBy on table "${this.table}". Orderable keys: ${validKeys()}.`,
         );
       }
       parts.push(`${expr} ${this.groupOrderDir(value, key)}`);
@@ -4033,7 +4029,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     if (allow === true) return;
     if (compiledWhere.length > 0) return;
     throw new ValidationError(
-      `[turbine] ${action} on "${this.table}" refused: the \`where\` clause is empty. ` +
+      `${action} on "${this.table}" refused: the \`where\` clause is empty. ` +
         "Pass `allowFullTableScan: UNSAFE` to opt in (import { UNSAFE } from 'turbine-orm'), " +
         'or check that your filter values are defined.',
     );
@@ -4042,7 +4038,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
 /** Coerce a group-key scalar string by the column's TS type (numbers/bools). */
 function coerceScalar(raw: string, tsType: string): unknown {
-  const ts = tsType.replace(/\s*\|\s*null$/i, '').trim();
+  const ts = baseTsType(tsType);
   if (raw === 'null') return null;
   if (ts === 'number' || ts === 'bigint') {
     const n = Number(raw);

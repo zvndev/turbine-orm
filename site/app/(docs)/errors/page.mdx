@@ -80,9 +80,9 @@ Naming a **relation** in `select` or `omit` gets its own message, because it is
 usually a habit carried over from Prisma rather than a typo:
 
 ```
-[turbine] "comments" is a relation on table "post", not a column, so it cannot
-be named in `select`. Load it with `with: { comments: true }`, which is a
-sibling of `select`, not a member of it.
+[TURBINE_E003] "comments" is a relation on table "post", not a column, so it
+cannot be named in `select`. Load it with `with: { comments: true }`, which is
+a sibling of `select`, not a member of it.
 ```
 
 Relations live in [`with`](/relations), which sits beside `select` rather than
@@ -204,7 +204,7 @@ Catch on `err.code === 'TURBINE_E017'` and read `err.feature`, which names what 
 The same error carries PowDB's **version-gated** capabilities, where the feature exists but the connected engine is too old for it. Those messages name the feature once and then give the floor and what the connection reported:
 
 ```
-[turbine] JSON path filters is unsupported on "PowDB". Requires PowDB >= 0.12;
+[TURBINE_E017] JSON path filters is unsupported on "PowDB". Requires PowDB >= 0.12;
 this connection reports 0.11.0. Upgrade powdb-server / @zvndev/powdb-embedded
 (or pass `assumeEngineVersion` if the version cannot be detected).
 ```
@@ -237,7 +237,7 @@ See [Read Replicas](/read-replicas) for the snapshot-serving pattern this suppor
 By default, `NotFoundError` messages include only the **keys** of the `where` clause; values are redacted so PII does not leak into logs (Sentry, Datadog).
 
 ```
-[turbine] findUniqueOrThrow on "users" found no record matching where: { id, email }
+[TURBINE_E001] findUniqueOrThrow on "users" found no record matching where: { id, email }
 ```
 
 The full `where` object is always available as `err.where` for programmatic access, only the human-readable message is redacted. Opt into verbose messages (useful in local development) by setting `errorMessages: 'verbose'` in your `TurbineConfig`, or by calling `setErrorMessageMode('verbose')` at startup.

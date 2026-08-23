@@ -753,13 +753,13 @@ export const mssqlDialect: Dialect = {
     const paramCount = input.rowValues.reduce((n, row) => n + row.length, 0);
     if (rowCount > MSSQL_MAX_INSERT_ROWS) {
       throw new ValidationError(
-        `[turbine] SQL Server INSERT … VALUES is limited to ${MSSQL_MAX_INSERT_ROWS} rows per statement (got ${rowCount}). ` +
+        `SQL Server INSERT … VALUES is limited to ${MSSQL_MAX_INSERT_ROWS} rows per statement (got ${rowCount}). ` +
           'Chunk the data or use individual create() calls.',
       );
     }
     if (paramCount > MSSQL_MAX_PARAMS) {
       throw new ValidationError(
-        `[turbine] SQL Server is limited to ${MSSQL_MAX_PARAMS} bound parameters per statement (got ${paramCount}). ` +
+        `SQL Server is limited to ${MSSQL_MAX_PARAMS} bound parameters per statement (got ${paramCount}). ` +
           'Reduce the batch size.',
       );
     }
@@ -1065,7 +1065,7 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
       const nestedRelDef = targetMeta.relations[nestedRelName];
       if (!nestedRelDef) {
         throw new RelationError(
-          `[turbine] Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
+          `Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
             availableClause(Object.keys(targetMeta.relations), 'It has no relations.'),
         );
       }
@@ -1090,7 +1090,7 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
             const sortValue = (dir as { sort?: unknown }).sort;
             if (typeof sortValue !== 'string') {
               throw new ValidationError(
-                `[turbine] Nested orderBy on "${k}" (table "${targetTable}"): only plain directions and ` +
+                `Nested orderBy on "${k}" (table "${targetTable}"): only plain directions and ` +
                   `{ sort } specs are supported inside a relation orderBy on SQL Server.`,
               );
             }
@@ -1109,7 +1109,7 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
           const col = targetMeta.columnMap[k] ?? camelToSnake(k);
           if (!targetMeta.allColumns.includes(col)) {
             throw new ValidationError(
-              `[turbine] Unknown field "${k}" in orderBy on table "${targetTable}". ` +
+              `Unknown field "${k}" in orderBy on table "${targetTable}". ` +
                 `Known fields: ${Object.keys(targetMeta.columnMap).join(', ') || '(none)'}.`,
             );
           }
@@ -1190,9 +1190,7 @@ function buildForJsonManyToMany(dialect: Dialect, ctx: RelationSubqueryContext, 
   const { relDef, spec, params, parentRef, alias, targetTable, targetMeta } = ctx;
   const q = (name: string): string => dialect.quoteIdentifier(name);
   if (!relDef.through) {
-    throw new ValidationError(
-      `[turbine] manyToMany relation "${relDef.name}" is missing a \`through\` junction descriptor.`,
-    );
+    throw new ValidationError(`manyToMany relation "${relDef.name}" is missing a \`through\` junction descriptor.`);
   }
 
   const qTarget = q(targetTable);
@@ -1204,14 +1202,14 @@ function buildForJsonManyToMany(dialect: Dialect, ctx: RelationSubqueryContext, 
   const targetKeys = normalizeKeyColumns(relDef.through.targetKey);
   if (targetMeta.primaryKey.length === 0) {
     throw new ValidationError(
-      `[turbine] manyToMany relation "${relDef.name}" targets table "${targetTable}" which has no primary key; ` +
+      `manyToMany relation "${relDef.name}" targets table "${targetTable}" which has no primary key; ` +
         'cannot determine the join column.',
     );
   }
   const targetPk = targetMeta.primaryKey;
   if (targetKeys.length !== targetPk.length) {
     throw new ValidationError(
-      `[turbine] manyToMany relation "${relDef.name}": through.targetKey has ${targetKeys.length} column(s) ` +
+      `manyToMany relation "${relDef.name}": through.targetKey has ${targetKeys.length} column(s) ` +
         `but target "${targetTable}" primary key has ${targetPk.length}.`,
     );
   }
@@ -1222,7 +1220,7 @@ function buildForJsonManyToMany(dialect: Dialect, ctx: RelationSubqueryContext, 
   const refKeys = normalizeKeyColumns(relDef.referenceKey);
   if (sourceKeys.length !== refKeys.length) {
     throw new ValidationError(
-      `[turbine] manyToMany relation "${relDef.name}": through.sourceKey has ${sourceKeys.length} column(s) ` +
+      `manyToMany relation "${relDef.name}": through.sourceKey has ${sourceKeys.length} column(s) ` +
         `but referenceKey has ${refKeys.length}.`,
     );
   }
@@ -1568,14 +1566,14 @@ async function loadMssql(): Promise<MssqlModule> {
     mod = (await importOptionalPeer('mssql')) as typeof mod;
   } catch (err) {
     throw new ConnectionError(
-      "[turbine] turbine-orm/mssql requires the optional peer dependency 'mssql'. Install it: npm i mssql. " +
+      "turbine-orm/mssql requires the optional peer dependency 'mssql'. Install it: npm i mssql. " +
         `(${(err as Error).message})`,
     );
   }
   // `mssql` is a CommonJS module; the namespace may be on `default` under ESM interop.
   const ns = (mod.default ?? mod) as MssqlModule;
   if (typeof ns.ConnectionPool !== 'function' || typeof ns.Request !== 'function') {
-    throw new ConnectionError("[turbine] Loaded 'mssql' but it is missing ConnectionPool/Request exports.");
+    throw new ConnectionError("Loaded 'mssql' but it is missing ConnectionPool/Request exports.");
   }
   return ns;
 }
@@ -1587,7 +1585,7 @@ async function loadMssql(): Promise<MssqlModule> {
 function assertSupportedVersion(majorVersion: number): void {
   if (majorVersion > 0 && majorVersion < 13) {
     throw new ConnectionError(
-      `[turbine] turbine-orm/mssql requires SQL Server 2016+ (FOR JSON / OPENJSON); got major version ${majorVersion}.`,
+      `turbine-orm/mssql requires SQL Server 2016+ (FOR JSON / OPENJSON); got major version ${majorVersion}.`,
     );
   }
 }

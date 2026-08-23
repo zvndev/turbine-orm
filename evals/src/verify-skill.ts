@@ -16,6 +16,7 @@
  * Run: `npm run verify:skill` (needs the seeded eval database).
  */
 import { deepStrictEqual } from 'node:assert';
+import { readFileSync } from 'node:fs';
 import { TurbineError, type SchemaMetadata } from 'turbine-orm';
 import { closeClient, evalClient } from './execute.js';
 import { evalSchema } from './schema-meta.js';
@@ -386,6 +387,74 @@ const CLAIMS: Claim[] = [
   },
 ];
 
+/** SKILL.md's frontmatter name. Read back to prove the right file was opened. */
+const SKILL_IDENTITY = 'name: turbine-orm';
+
+/**
+ * Second gate: does CLAIMS still describe most of what SKILL.md asserts?
+ *
+ * Every claim above is hand-written, so a sentence ADDED to SKILL.md becomes an
+ * unverified claim silently: the loop above still reports "46/46 hold" while
+ * the file it speaks for has grown past it. That is the same shape as a suite
+ * that skips every test and reports green. This counts the skill's assertive
+ * sentences and refuses a large gap.
+ *
+ * The count is a heuristic, deliberately: recognising an assertion in prose is
+ * not decidable, and this only has to notice a file that has roughly doubled
+ * without anyone adding rows. The ratio can exceed 100%, because several claims
+ * routinely back one sentence.
+ *
+ * Fails closed on every ambiguous input. An unreadable file, a file that is not
+ * SKILL.md, and a zero-sentence parse are all refusals rather than passes: a
+ * denominator of zero would otherwise make the ratio infinite and the gate
+ * green precisely when the parse has broken.
+ *
+ * @returns true when coverage is adequate, false when the run must fail.
+ */
+function claimCoverageHolds(): boolean {
+  const MIN_RATIO = 0.5;
+  let skillText: string;
+  const skillPath = new URL('../../skills/turbine-orm/SKILL.md', import.meta.url);
+  try {
+    skillText = readFileSync(skillPath, 'utf8');
+  } catch (err) {
+    console.error(`\ncould not read ${skillPath.pathname}: ${err instanceof Error ? err.message : String(err)}`);
+    console.error('The skill is a published file (package.json `files`), so this is a refusal, not a skip.');
+    return false;
+  }
+
+  if (!skillText.includes(SKILL_IDENTITY)) {
+    console.error(`\n${skillPath.pathname} does not contain "${SKILL_IDENTITY}"; this is not the shipped skill.`);
+    return false;
+  }
+
+  const assertiveSentences = skillText
+    .split('\n')
+    .filter((l) => !l.startsWith('#') && !l.startsWith('```') && !l.startsWith('|'))
+    .join(' ')
+    .split(/(?<=\.)\s+/)
+    .filter((s) => /\b(returns?|throws?|accepts?|rejects?|emits?|is|are|must|never|always)\b/i.test(s.trim()))
+    .filter((s) => s.trim().length > 30);
+
+  if (assertiveSentences.length === 0) {
+    console.error('\nparsed zero assertive sentences out of SKILL.md; the heuristic has broken. Refusing to pass.');
+    return false;
+  }
+
+  const ratio = CLAIMS.length / assertiveSentences.length;
+  console.log(
+    `claim coverage: ${CLAIMS.length} claims for ~${assertiveSentences.length} assertive sentences (${(ratio * 100).toFixed(0)}%)`,
+  );
+  if (ratio < MIN_RATIO) {
+    console.error('');
+    console.error('SKILL.md has grown well past its verified claim set. README.md states that');
+    console.error('every factual claim in it is executed against a live database before');
+    console.error('release. Add CLAIMS rows for the new sentences, or soften the README.');
+    return false;
+  }
+  return true;
+}
+
 async function main(): Promise<void> {
   const schema: SchemaMetadata = await evalSchema();
   const db = evalClient(schema);
@@ -404,10 +473,15 @@ async function main(): Promise<void> {
 
   await closeClient();
   console.log(`\n${CLAIMS.length - failed}/${CLAIMS.length} claims hold`);
+
+  // Computed before the claim-failure exit so one run reports both problems.
+  const coverageHolds = claimCoverageHolds();
+
   if (failed > 0) {
     console.log('Every FAIL above is a sentence in skills/turbine-orm/SKILL.md that is now wrong.');
     process.exit(1);
   }
+  if (!coverageHolds) process.exit(1);
 }
 
 main().catch(async (err) => {

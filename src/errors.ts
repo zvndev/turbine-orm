@@ -474,11 +474,11 @@ function renderWhereForMessage(where: unknown, mode: ErrorMessageMode): string {
  * When called with an options object and no explicit `message`, a Prisma-style
  * message is built automatically. By default, only the where-clause keys are
  * shown to avoid leaking PII into logs:
- *   `[turbine] findUniqueOrThrow on "users" found no record matching where: { id }`
+ *   `[TURBINE_E001] findUniqueOrThrow on "users" found no record matching where: { id }`
  *
  * Set `setErrorMessageMode('verbose')` (or pass `errorMessages: 'verbose'` to
  * the TurbineClient constructor) to include the full where values:
- *   `[turbine] findUniqueOrThrow on "users" found no record matching where: {"id":1}`
+ *   `[TURBINE_E001] findUniqueOrThrow on "users" found no record matching where: {"id":1}`
  *
  * The full `where` object, `table`, and `operation` are always available as
  * structured properties on the error instance regardless of mode.
@@ -512,13 +512,13 @@ export class NotFoundError extends TurbineError {
       if (operation && table) {
         const wherePart =
           where !== undefined ? ` matching where: ${renderWhereForMessage(where, currentErrorMessageMode())}` : '';
-        message = `[turbine] ${operation} on "${table}" found no record${wherePart}`;
+        message = `${operation} on "${table}" found no record${wherePart}`;
       } else if (table) {
         const wherePart =
           where !== undefined ? ` matching where ${renderWhereForMessage(where, currentErrorMessageMode())}` : '';
-        message = `[turbine] No record found in "${table}"${wherePart}`;
+        message = `No record found in "${table}"${wherePart}`;
       } else {
-        message = '[turbine] Record not found';
+        message = 'Record not found';
       }
     }
     super(TurbineErrorCode.NOT_FOUND, message, { cause });
@@ -542,7 +542,7 @@ export class TimeoutError extends TurbineError {
    *   when wrapping a driver error rather than a client-side timer expiry.
    */
   constructor(timeoutMs: number, context = 'Query', options?: { message?: string; cause?: unknown }) {
-    super(TurbineErrorCode.TIMEOUT, options?.message ?? `[turbine] ${context} timed out after ${timeoutMs}ms`, options);
+    super(TurbineErrorCode.TIMEOUT, options?.message ?? `${context} timed out after ${timeoutMs}ms`, options);
     this.name = 'TimeoutError';
     this.timeoutMs = timeoutMs;
   }
@@ -617,7 +617,7 @@ export class ConnectionError extends TurbineError {
  */
 export function malformedConnectionStringMessage(engine: string, example: string): string {
   return (
-    `[turbine] The ${engine} connection string could not be parsed as a URL. Expected something like "${example}". ` +
+    `The ${engine} connection string could not be parsed as a URL. Expected something like "${example}". ` +
     '(Check for a missing "//", a stray quote copied out of a .env file, or a shell-truncated value.) ' +
     'The value is not included here because it may contain a password.'
   );
@@ -646,7 +646,7 @@ export class CircularRelationError extends TurbineError {
   constructor(path: string[]) {
     super(
       TurbineErrorCode.CIRCULAR_RELATION,
-      `[turbine] Circular or too-deep relation nesting detected: ${path.join(' → ')}. Maximum nesting depth is 10.`,
+      `Circular or too-deep relation nesting detected: ${path.join(' → ')}. Maximum nesting depth is 10.`,
     );
     this.name = 'CircularRelationError';
     this.path = path;
@@ -687,7 +687,7 @@ export class UniqueConstraintError extends TurbineError {
     if (!message) {
       const constraintPart = constraint ? ` on ${constraint}` : '';
       const columnsPart = columns && columns.length > 0 ? ` (${columns.join(', ')})` : '';
-      message = `[turbine] Unique constraint violation${constraintPart}${columnsPart}`;
+      message = `Unique constraint violation${constraintPart}${columnsPart}`;
       // PII-safe by default: the raw pg `detail` string contains the
       // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
       // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
@@ -725,7 +725,7 @@ export class ForeignKeyError extends TurbineError {
     let message = opts.message;
     if (!message) {
       const constraintPart = constraint ? ` on ${constraint}` : '';
-      message = `[turbine] Foreign key constraint violation${constraintPart}`;
+      message = `Foreign key constraint violation${constraintPart}`;
       // PII-safe by default: the raw pg `detail` string contains the
       // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
       // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
@@ -762,7 +762,7 @@ export class NotNullViolationError extends TurbineError {
     let message = opts.message;
     if (!message) {
       const columnPart = column ? ` on column "${column}"` : '';
-      message = `[turbine] NOT NULL constraint violation${columnPart}`;
+      message = `NOT NULL constraint violation${columnPart}`;
       // PII-safe by default: the raw pg `detail` string contains the
       // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
       // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
@@ -814,7 +814,7 @@ export class DeadlockError extends TurbineError {
     let message = opts.message;
     if (!message) {
       const pgMessage = (cause as { message?: string } | null | undefined)?.message;
-      message = pgMessage ? `[turbine] Deadlock detected: ${pgMessage}` : '[turbine] Deadlock detected';
+      message = pgMessage ? `Deadlock detected: ${pgMessage}` : 'Deadlock detected';
     }
     super(TurbineErrorCode.DEADLOCK_DETECTED, message, { cause });
     this.name = 'DeadlockError';
@@ -853,9 +853,7 @@ export class SerializationFailureError extends TurbineError {
     let message = opts.message;
     if (!message) {
       const pgMessage = (cause as { message?: string } | null | undefined)?.message;
-      message = pgMessage
-        ? `[turbine] Serializable transaction conflict: ${pgMessage}`
-        : '[turbine] Serializable transaction conflict';
+      message = pgMessage ? `Serializable transaction conflict: ${pgMessage}` : 'Serializable transaction conflict';
     }
     super(TurbineErrorCode.SERIALIZATION_FAILURE, message, { cause });
     this.name = 'SerializationFailureError';
@@ -879,7 +877,7 @@ export class CheckConstraintError extends TurbineError {
     let message = opts.message;
     if (!message) {
       const constraintPart = constraint ? ` on ${constraint}` : '';
-      message = `[turbine] Check constraint violation${constraintPart}`;
+      message = `Check constraint violation${constraintPart}`;
       // PII-safe by default: the raw pg `detail` string contains the
       // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
       // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
@@ -915,7 +913,7 @@ export class ExclusionConstraintError extends TurbineError {
     let message = opts.message;
     if (!message) {
       const constraintPart = constraint ? ` on ${constraint}` : '';
-      message = `[turbine] Exclusion constraint violation${constraintPart}`;
+      message = `Exclusion constraint violation${constraintPart}`;
       // PII-safe by default: the raw pg `detail` string contains the
       // conflicting row VALUES (e.g. `Key (email)=(alice@x.com) already
       // exists.`). Only append it in 'verbose' mode. In 'safe' mode the
@@ -983,7 +981,7 @@ export class PipelineError extends TurbineError {
     const failedCount = results.filter((r) => r.status === 'error').length;
     const message =
       opts.message ??
-      `[turbine] Pipeline completed with ${failedCount} error(s) out of ${results.length} queries` +
+      `Pipeline completed with ${failedCount} error(s) out of ${results.length} queries` +
         (failedTag ? ` (first failure: ${failedTag} at index ${failedIndex})` : '');
     super(TurbineErrorCode.PIPELINE, message, { cause });
     this.name = 'PipelineError';
@@ -1001,7 +999,7 @@ export class OptimisticLockError extends TurbineError {
   constructor(opts: { table: string; versionField: string; expectedVersion: unknown }) {
     super(
       TurbineErrorCode.OPTIMISTIC_LOCK,
-      `[turbine] Optimistic lock failed on "${opts.table}", ` +
+      `Optimistic lock failed on "${opts.table}", ` +
         `expected ${opts.versionField} = ${opts.expectedVersion} but row was modified by another transaction`,
     );
     this.name = 'OptimisticLockError';
@@ -1022,10 +1020,7 @@ export class UnsupportedFeatureError extends TurbineError {
   readonly dialect: string;
 
   constructor(feature: string, dialect: string, hint?: string) {
-    super(
-      TurbineErrorCode.UNSUPPORTED_FEATURE,
-      `[turbine] ${feature} is unsupported on "${dialect}".${hint ? ` ${hint}` : ''}`,
-    );
+    super(TurbineErrorCode.UNSUPPORTED_FEATURE, `${feature} is unsupported on "${dialect}".${hint ? ` ${hint}` : ''}`);
     this.name = 'UnsupportedFeatureError';
     this.feature = feature;
     this.dialect = dialect;
@@ -1064,7 +1059,7 @@ export class ReadOnlyError extends TurbineError {
    *   and the refusal `reason` (default `'snapshot'`).
    */
   constructor(detail: string, options?: { cause?: unknown; reason?: 'snapshot' | 'rbac' }) {
-    super(TurbineErrorCode.READ_ONLY, `[turbine] ${detail} Route writes to a writable primary.`, {
+    super(TurbineErrorCode.READ_ONLY, `${detail} Route writes to a writable primary.`, {
       cause: options?.cause,
     });
     this.name = 'ReadOnlyError';
@@ -1254,7 +1249,7 @@ export function wrapPgError(err: unknown): unknown {
       // Turbine did not set the deadline (that lives in Postgres config), so
       // there is no client-side budget to report → timeoutMs = 0.
       return new TimeoutError(0, 'Query', {
-        message: '[turbine] Query canceled by server-side statement_timeout',
+        message: 'Query canceled by server-side statement_timeout',
         cause: err,
       });
     default:
@@ -1264,9 +1259,7 @@ export function wrapPgError(err: unknown): unknown {
         // plain-object map would happily resolve `constructor` or `toString`
         // to a function and interpolate it into the message.
         const hint = Object.hasOwn(CONNECTION_ERROR_HINTS, e.code) ? CONNECTION_ERROR_HINTS[e.code] : undefined;
-        const head = pgMessage
-          ? `[turbine] Database connection error: ${pgMessage}`
-          : `[turbine] Database connection error (${e.code})`;
+        const head = pgMessage ? `Database connection error: ${pgMessage}` : `Database connection error (${e.code})`;
         return new ConnectionError(hint ? `${head} (${e.code}) ${hint}` : head, { cause: err, sqlstate: e.code });
       }
       return err;

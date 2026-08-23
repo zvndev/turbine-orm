@@ -65,7 +65,7 @@
 
 import { ValidationError } from './errors.js';
 import { applyTableFilters } from './introspect.js';
-import { type PowdbCapabilities, quotePowqlIdent, requireCapability } from './powdb.js';
+import { type PowdbCapabilities, quotePowqlIdent, requireCapability } from './powdb-shared.js';
 import type { ColumnMetadata, IndexMetadata, RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
 import { singularize, snakeToCamel } from './schema.js';
 
@@ -162,7 +162,7 @@ export async function introspectPowdbDatabase(
   // that instead of losing data: real rows must carry a `name`.
   if (schemaRows.length > 0 && candidateTables.length === 0) {
     throw new ValidationError(
-      `[turbine] PowDB introspection: the \`schema\` statement returned ${schemaRows.length} row(s) but none carried a ` +
+      `PowDB introspection: the \`schema\` statement returned ${schemaRows.length} row(s) but none carried a ` +
         '`name` cell. The `exec` you supplied likely returns POSITIONAL rows (string[][]) rather than records keyed by ' +
         'column name; zip `columns` with each row (see introspectPowdbDatabase docs).',
     );

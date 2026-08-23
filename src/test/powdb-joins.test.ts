@@ -482,15 +482,17 @@ describe('powdb: read-only guard', () => {
     assert.equal(mock.calls.length, 1);
   });
 
-  it('the E018 message is not doubled (single `[turbine]` prefix + single routing hint)', async () => {
+  it('the E018 message is not doubled (single code tag + single routing hint)', async () => {
     const mock = mockPool({ readonly: true });
     const err = await qi(mock)
       .create({ data: { name: 'x' } })
       .catch((e: unknown) => e as Error);
     assert.ok(err instanceof ReadOnlyError);
-    // The ReadOnlyError constructor owns the prefix and the routing hint, so the
-    // guard's detail must not repeat either.
-    assert.equal(err.message.match(/\[turbine\]/g)?.length, 1, 'exactly one [turbine] prefix');
+    // The ReadOnlyError constructor owns the routing hint and formatErrorMessage
+    // owns the code tag, so the guard's detail must not repeat either, and no
+    // hand-written `[turbine] ` may sit behind the tag.
+    assert.equal(err.message.match(/\[TURBINE_E018\]/g)?.length, 1, 'exactly one code tag');
+    assert.doesNotMatch(err.message, /\[turbine\]/, 'no second hand-written prefix');
     assert.equal(err.message.match(/Route writes to a writable primary/g)?.length, 1, 'exactly one routing hint');
   });
 

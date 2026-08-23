@@ -165,7 +165,7 @@ export function buildCreate<T extends object>(qi: BuilderCtx, args: CreateArgs<T
         throw new NotFoundError({
           table: qi.table,
           operation: 'create',
-          message: `[turbine] create on "${qi.table}" returned no row from RETURNING *; this should never happen.`,
+          message: `create on "${qi.table}" returned no row from RETURNING *; this should never happen.`,
         });
       }
       return parseWriteRow(qi, row) as T;
@@ -286,7 +286,7 @@ function assertUniformCreateManyRows(qi: BuilderCtx, rows: Record<string, unknow
     if (missing.length > 0) parts.push(`does not supply ${quoteList(missing)}`);
     if (unexpected.length > 0) parts.push(`supplies ${quoteList(unexpected)}, which the first row does not`);
     throw new ValidationError(
-      `[turbine] createMany on "${qi.table}": row ${i} ${parts.join(' and ')}. ` +
+      `createMany on "${qi.table}": row ${i} ${parts.join(' and ')}. ` +
         'Every row must supply the same fields: createMany builds ONE statement whose column list comes from the ' +
         "first row, so a field a later row omits would be written as NULL over that column's default, and a field " +
         'only a later row names would be dropped. Supply the field explicitly on every row (a field set to ' +
@@ -663,7 +663,7 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
           table: qi.table,
           where: args.where,
           operation: 'upsert',
-          message: `[turbine] upsert on "${qi.table}" returned no row from RETURNING *; this should never happen.`,
+          message: `upsert on "${qi.table}" returned no row from RETURNING *; this should never happen.`,
         });
       }
       return parseWriteRow(qi, row) as T;
@@ -944,7 +944,7 @@ export function parseWriteRow(qi: BuilderCtx, row: Record<string, unknown>): Rec
 export function assertWritable(qi: BuilderCtx, operation: string): void {
   if (qi.tableMeta.isView) {
     throw new ValidationError(
-      `[turbine] Cannot ${operation} "${qi.table}": it is a view (read-only). ` +
+      `Cannot ${operation} "${qi.table}": it is a view (read-only). ` +
         'Views support reads (findMany/findFirst/…) but not writes.',
     );
   }
@@ -963,7 +963,7 @@ export function assertNoGeneratedColumns(qi: BuilderCtx, data: Record<string, un
     const col = qi.tableMeta.columns.find((c) => c.field === key || c.name === key || c.name === camelToSnake(key));
     if (col?.isGeneratedStored) {
       throw new ValidationError(
-        `[turbine] Cannot ${operation} "${qi.table}": column "${key}" is a GENERATED ALWAYS AS (…) STORED ` +
+        `Cannot ${operation} "${qi.table}": column "${key}" is a GENERATED ALWAYS AS (…) STORED ` +
           'column whose value the database computes, remove it from your data.',
       );
     }
@@ -1015,7 +1015,7 @@ export function buildSetClause(qi: BuilderCtx, key: string, value: unknown, para
       // Arithmetic operators: must be finite numbers
       if (typeof opValue !== 'number' || !Number.isFinite(opValue)) {
         throw new ValidationError(
-          `[turbine] update operator "${op}" on "${qi.table}.${key}" requires a finite number, got ${typeof opValue}`,
+          `update operator "${op}" on "${qi.table}.${key}" requires a finite number, got ${typeof opValue}`,
         );
       }
 
@@ -1071,7 +1071,7 @@ export function assertBindableSetValue(qi: BuilderCtx, key: string, value: unkno
   const column = qi.toColumn(key);
   if (whereMod.isJsonColumnType(qi, whereMod.getColumnPgType(qi, column))) return;
   throw new ValidationError(
-    `[turbine] Unknown update operator "${keys[0]}" on "${qi.table}.${key}". ` +
+    `Unknown update operator "${keys[0]}" on "${qi.table}.${key}". ` +
       `Supported: ${[...UPDATE_OPERATOR_KEYS].join(', ')}. ` +
       'A plain object is only written as a value on a json/jsonb column.',
   );
