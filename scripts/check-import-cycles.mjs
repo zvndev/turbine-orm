@@ -175,8 +175,11 @@ console.log(`check-import-cycles: ${scanned} files scanned under ${scanRoots.joi
 // Pass 1 enforces ONE edge in TWO directories against ONE file. It is a rule,
 // not a detector, and it cannot see a cycle anywhere else. It also scans only
 // `import` statements, while `export ... from` is a runtime edge exactly like
-// an import: both edges of the PowDB cycle are re-exports, so a scan for
-// `import` alone finds nothing at all.
+// an import: both edges of the PowDB cycle this pass was written to find were
+// re-exports, so a scan for `import` alone found nothing at all. That cycle is
+// gone (its shared primitives live in src/powdb-shared.ts), which is why the
+// allowlist below is empty; it stays because the next one will be found the
+// same way.
 // ---------------------------------------------------------------------------
 
 /**
@@ -201,11 +204,7 @@ const EDGE_RE = /(?:^|\n)[ \t]*((?:import|export)\b[^;'"]*?)\bfrom\s*['"](\.[^'"
 const BARE_EDGE_RE = /(?:^|\n)[ \t]*import\s*['"](\.[^'"]+)['"]/g;
 
 /** Known cycles, each with the reason it is tolerated and who removes it. */
-const KNOWN_CYCLES = [
-  // Removed by the powdb-shared extraction. Until then this entry keeps the
-  // gate green without hiding the finding: the message below still prints it.
-  ['src/powdb.ts', 'src/powdb-introspect.ts', 'src/powql.ts'].sort().join(' <-> '),
-];
+const KNOWN_CYCLES = [];
 
 /**
  * Every specifier list on a statement head, with the leading keyword removed.

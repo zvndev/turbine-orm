@@ -50,6 +50,7 @@ import {
   hasRelationFields,
   type NestedWriteContext,
 } from './nested-write.js';
+import type { PowdbPool } from './powdb.js';
 import {
   ALL_POWDB_CAPABILITIES,
   coerceNativeValue,
@@ -59,13 +60,12 @@ import {
   type PowdbCapabilities,
   PowdbFloatParam,
   PowdbJsonParam,
-  type PowdbPool,
   powqlColumnType,
   quotePowqlDotted,
   quotePowqlIdent,
   requireCapability,
   rowToEntity,
-} from './powdb.js';
+} from './powdb-shared.js';
 import { assertAggregatePiiOptIn } from './query/aggregates.js';
 import { assertWhereIdentifiesOneRow, expandCompoundUniqueWhere } from './query/compound-unique.js';
 import { ARRAY_OPERATOR_KEYS, isJsonFilter, isRelationPickOrderBy, orderByEntries } from './query/filters.js';

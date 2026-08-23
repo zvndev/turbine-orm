@@ -65,7 +65,7 @@
 
 import { ValidationError } from './errors.js';
 import { applyTableFilters } from './introspect.js';
-import { type PowdbCapabilities, quotePowqlIdent, requireCapability } from './powdb.js';
+import { type PowdbCapabilities, quotePowqlIdent, requireCapability } from './powdb-shared.js';
 import type { ColumnMetadata, IndexMetadata, RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
 import { singularize, snakeToCamel } from './schema.js';
 

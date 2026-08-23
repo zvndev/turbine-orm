@@ -837,6 +837,29 @@ src/
                       powdb.integration.test.ts skip-gates on the addon version. See
                       `docs/internal/strategy/powdb-parity-matrix.md` (local-only, untracked).
 
+  powdb-shared.ts  , The PowDB engine's zero-cycle LEAF, the same shape pg-types.ts and
+                      connection-url.ts use for client.ts / query/. Holds the primitives all
+                      three PowDB modules need: identifier quoting (`quotePowqlIdent` /
+                      `quotePowqlDotted` over `POWQL_KEYWORDS`), capability gating
+                      (`PowdbCapabilities`, `ALL_POWDB_CAPABILITIES`, `requireCapability`),
+                      type mapping (`PowqlType`, `powqlColumnType`, `isJsonColumn`,
+                      `isPowdbDatetimeColumn`), value coercion (`coerceValue`,
+                      `coerceNativeValue`, `rowToEntity`), the `PowdbFloatParam` /
+                      `PowdbJsonParam` bind markers, and `isStaleFramePowdbError`. It imports
+                      errors.ts and schema.ts and NOTHING else, which is the whole point:
+                      powdb.ts re-exports `PowqlInterface` and `introspectPowdbDatabase` while
+                      both of those imported the primitives back from it, so the three were a
+                      runtime SCC in the largest engine entry, where an initialization-order
+                      bug is hardest to trace. `scripts/check-import-cycles.mjs` pass 2 now
+                      fails on any cycle under `src/` and its allowlist is EMPTY.
+                      powdb.ts re-exports every previously public name EXPLICITLY, never with
+                      `export *`, and that distinction is load-bearing: the leaf also exports
+                      `isDateColumn` for powdb.ts's own parameter encoder, and a star
+                      re-export puts it on the published `turbine-orm/powdb` surface (measured,
+                      it was the one key that differed). The subpath's exports are otherwise
+                      byte-identical to before the split, 34 runtime keys and 44 declared
+                      names.
+
   errors.ts        , Error hierarchy rooted at TurbineError. Each error has a code
                       (TURBINE_E001-E018). wrapPgError() translates pg driver errors
                       (23505, 23503, 23502, 23514, 23P01, 40P01, 40001) into typed
