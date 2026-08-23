@@ -170,4 +170,11 @@ export const WARN_NS = {
    * Keyed on the requested mode.
    */
   planCacheModeIgnored: 'planCacheModeIgnored',
+  /**
+   * A relation's JSON payload could not be parsed in `parseNestedRow`
+   * (relations.ts). Keyed on `table.relation`, so a page of 10,000 rows whose
+   * relation column is malformed says it once rather than once per row: the
+   * warn sits in the per-relation loop, which runs once per row per relation.
+   */
+  relationParseFailure: 'relationParseFailure',
 } as const;

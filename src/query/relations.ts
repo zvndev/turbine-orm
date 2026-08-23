@@ -1638,11 +1638,29 @@ export function parseNestedRow(
         } else {
           parsed[relName] = jsonVal;
         }
-      } catch {
-        console.warn(
-          `[turbine] Warning: Failed to parse JSON for relation "${relName}" on table "${qi.table}". Using raw value.`,
+      } catch (err) {
+        // A relation column that does not parse is a bug in the emitted SQL or
+        // a driver-level corruption, not a recoverable condition. Handing back
+        // the raw string satisfied the assignment and violated the generated
+        // type: callers got a `string` where `Post[]` was promised, and found
+        // out at the first `.map`. Throw instead, with the context needed to
+        // find it.
+        //
+        // The warn is gated and deduped because this sits in parseNestedRow's
+        // per-relation loop: one 10,000-row page was 10,000 console.warn calls.
+        if (
+          process.env.NODE_ENV !== 'production' &&
+          shouldWarnOnce(WARN_NS.relationParseFailure, `${qi.table}.${relName}`)
+        ) {
+          console.warn(
+            `[turbine] Relation "${relName}" on "${qi.table}" returned a payload that is not valid JSON. ` +
+              `This is a bug; please report it with the emitted SQL.`,
+          );
+        }
+        throw new ValidationError(
+          `Relation "${relName}" on table "${qi.table}" returned a payload that could not be parsed as JSON.`,
+          { cause: err },
         );
-        parsed[relName] = rawValue;
       }
     } else if (Array.isArray(rawValue)) {
       parsed[relName] = rawValue.map((item) =>
