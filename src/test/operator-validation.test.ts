@@ -180,7 +180,8 @@ describe('strict operator validation', () => {
         () => q.buildFindMany({ where: { title: { startWith: 'x' } } as never }),
         (err: unknown) => {
           assert.ok(err instanceof ValidationError, 'should be ValidationError');
-          assert.match((err as Error).message, /\[turbine\]/);
+          assert.match((err as Error).message, /^\[TURBINE_E003\] /);
+          assert.doesNotMatch((err as Error).message, /\[turbine\]/);
           assert.match((err as Error).message, /title/);
           assert.match((err as Error).message, /startWith/);
           // Lists the supported operators so the typo is obvious.
@@ -232,13 +233,14 @@ describe('strict operator validation', () => {
   });
 
   describe('orderBy field validation', () => {
-    it('throws a consistent [turbine] error listing known fields', () => {
+    it('throws a consistently code-tagged error listing known fields', () => {
       const q = makeQuery('posts', buildSchema());
       assert.throws(
         () => q.buildFindMany({ orderBy: { bogus: 'asc' } as never }),
         (err: unknown) => {
           assert.ok(err instanceof ValidationError);
-          assert.match((err as Error).message, /\[turbine\]/);
+          assert.match((err as Error).message, /^\[TURBINE_E003\] /);
+          assert.doesNotMatch((err as Error).message, /\[turbine\]/);
           assert.match((err as Error).message, /orderBy/);
           assert.match((err as Error).message, /bogus/);
           assert.match((err as Error).message, /Known fields/);

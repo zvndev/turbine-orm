@@ -68,7 +68,7 @@ export function assertAggregatePiiOptIn(
   const colMeta = meta.columns.find((c) => c.name === column);
   if (!colMeta?.pii) return;
   throw new ValidationError(
-    `[turbine] ${usage} on column "${field}" of table "${table}" is refused: that column is ` +
+    `${usage} on column "${field}" of table "${table}" is refused: that column is ` +
       'PII-tagged (`pii: true`), and this aggregate returns its stored values, which are excluded ' +
       'from every default projection. Pass `includePii: UNSAFE` on this call to opt in ' +
       "(import { UNSAFE } from 'turbine-orm'). " +
@@ -139,7 +139,7 @@ export function buildGroupBy<T extends object>(
   const claimResultKey = (key: string, what: string): void => {
     if (key === '_count' || usedResultKeys.has(key)) {
       throw new ValidationError(
-        `[turbine] groupBy output name "${key}" (${what}) collides with another output column on table ` +
+        `groupBy output name "${key}" (${what}) collides with another output column on table ` +
           `"${qi.table}": set an explicit \`alias\` (or rename the aggregate key) to disambiguate.`,
       );
     }
@@ -263,7 +263,7 @@ export function buildGroupBy<T extends object>(
       const alwaysNumeric = aggKey === '_sum' || aggKey === '_avg';
       if (alwaysNumeric && target.type === 'text') {
         throw new ValidationError(
-          `[turbine] groupBy ${aggKey} target "${key}" on table "${qi.table}": ` +
+          `groupBy ${aggKey} target "${key}" on table "${qi.table}": ` +
             `${aggKey} over a JSON path is always numeric: remove \`type: 'text'\`.`,
         );
       }
@@ -500,7 +500,7 @@ export function buildGroupByOrderBy(
         const expr = aggOrderExprs.get('_count');
         if (!expr) {
           throw new ValidationError(
-            `[turbine] Cannot order groupBy by "_count" on table "${qi.table}": _count is not selected. ` +
+            `Cannot order groupBy by "_count" on table "${qi.table}": _count is not selected. ` +
               `Orderable keys: ${validKeys()}.`,
           );
         }
@@ -513,7 +513,7 @@ export function buildGroupByOrderBy(
       // `_sum` / `_avg` / `_min` / `_max`: an object of field → direction/spec.
       if (typeof value !== 'object' || value === null || Array.isArray(value)) {
         throw new ValidationError(
-          `[turbine] Invalid groupBy orderBy for "${key}" on table "${qi.table}": ` +
+          `Invalid groupBy orderBy for "${key}" on table "${qi.table}": ` +
             `expected a field map like { ${key}: { amount: 'desc' } }.`,
         );
       }
@@ -527,7 +527,7 @@ export function buildGroupByOrderBy(
           (canonical === undefined ? undefined : aggOrderExprs.get(`${key}:${canonical}`));
         if (!expr) {
           throw new ValidationError(
-            `[turbine] Cannot order groupBy by "${key}.${field}" on table "${qi.table}": ` +
+            `Cannot order groupBy by "${key}.${field}" on table "${qi.table}": ` +
               `that aggregate is not requested in this call. Orderable keys: ${validKeys()}.`,
           );
         }
@@ -541,8 +541,7 @@ export function buildGroupByOrderBy(
     const expr = lookupGroupKey(qi, byOrderExprs, key);
     if (!expr) {
       throw new ValidationError(
-        `[turbine] Unknown field "${key}" in groupBy orderBy on table "${qi.table}". ` +
-          `Orderable keys: ${validKeys()}.`,
+        `Unknown field "${key}" in groupBy orderBy on table "${qi.table}". ` + `Orderable keys: ${validKeys()}.`,
       );
     }
     assertOrderDirection(value, `groupBy orderBy "${key}" on table "${qi.table}"`);
@@ -563,7 +562,7 @@ export function resolveJsonPathTarget(
   path: (string | number)[],
 ): string {
   if (typeof field !== 'string') {
-    throw new ValidationError(`[turbine] groupBy ${context} on table "${qi.table}" requires a string \`field\`.`);
+    throw new ValidationError(`groupBy ${context} on table "${qi.table}" requires a string \`field\`.`);
   }
   const col = qi.toColumn(field);
   if (
@@ -572,14 +571,14 @@ export function resolveJsonPathTarget(
     path.some((el) => typeof el !== 'string' && !(typeof el === 'number' && Number.isFinite(el)))
   ) {
     throw new ValidationError(
-      `[turbine] groupBy ${context} on "${field}" (table "${qi.table}") requires a non-empty \`path\` ` +
+      `groupBy ${context} on "${field}" (table "${qi.table}") requires a non-empty \`path\` ` +
         `array of keys/indexes (e.g. { field: '${field}', path: ['category'] }).`,
     );
   }
   const colType = whereMod.pgTypeForColumn(qi, qi.tableMeta, col);
   if (!whereMod.isJsonColumnType(qi, colType)) {
     throw new ValidationError(
-      `[turbine] groupBy ${context} on "${field}": column "${col}" on table "${qi.table}" is not a JSON ` +
+      `groupBy ${context} on "${field}": column "${col}" on table "${qi.table}" is not a JSON ` +
         `column (actual type: ${colType}).`,
     );
   }
@@ -614,14 +613,12 @@ export function buildDistinctOnSource<T extends object>(
     );
   }
   if (!Array.isArray(distinctOn.columns) || distinctOn.columns.length === 0) {
-    throw new ValidationError(
-      `[turbine] groupBy distinctOn on table "${qi.table}" requires a non-empty \`columns\` array.`,
-    );
+    throw new ValidationError(`groupBy distinctOn on table "${qi.table}" requires a non-empty \`columns\` array.`);
   }
   const orderEntries = Object.entries(distinctOn.orderBy ?? {});
   if (orderEntries.length === 0) {
     throw new ValidationError(
-      `[turbine] groupBy distinctOn on table "${qi.table}" requires \`orderBy\` to pick ONE row per ` +
+      `groupBy distinctOn on table "${qi.table}" requires \`orderBy\` to pick ONE row per ` +
         "column combination deterministically (e.g. orderBy: { createdAt: 'desc' }).",
     );
   }
@@ -642,7 +639,7 @@ export function buildDistinctOnSource<T extends object>(
     }
     if (isVectorOrderBy(value) || qi.isRelationOrderByValue(value)) {
       throw new ValidationError(
-        `[turbine] groupBy distinctOn.orderBy on "${key}" (table "${qi.table}") supports plain columns, ` +
+        `groupBy distinctOn.orderBy on "${key}" (table "${qi.table}") supports plain columns, ` +
           'sort specs, and JSON-path orderings only.',
       );
     }
@@ -787,7 +784,7 @@ function splitHavingField(
       aggEntries.push({ key: k, fn, filter: v });
     } else if (k.startsWith('_')) {
       throw new ValidationError(
-        `[turbine] Unknown aggregate "${k}" in having for field "${field}" on table "${qi.table}". ` +
+        `Unknown aggregate "${k}" in having for field "${field}" on table "${qi.table}". ` +
           `Supported: ${Object.keys(HAVING_AGGREGATE_FNS).join(', ')}.`,
       );
     } else {
@@ -832,7 +829,7 @@ function buildHavingCombinator<T extends object>(
   for (const condition of conditions) {
     if (!isUnmatchedPlainObject(condition)) {
       throw new ValidationError(
-        `[turbine] Invalid having "${key}" on table "${qi.table}": expected ` +
+        `Invalid having "${key}" on table "${qi.table}": expected ` +
           `${key === 'OR' ? 'an array of having objects' : 'a having object (or an array of them)'}.`,
       );
     }
@@ -878,7 +875,7 @@ function buildHavingScalarClauses(
   if (!ref) {
     const known = groupKeys ? [...groupKeys.keys()] : [];
     throw new ValidationError(
-      `[turbine] having on "${field}" (table "${qi.table}") filters the grouped value itself, but ` +
+      `having on "${field}" (table "${qi.table}") filters the grouped value itself, but ` +
         `"${field}" is not one of the \`by\` group keys [${known.join(', ') || 'none'}]. A predicate on a ` +
         'non-grouped column cannot go in HAVING: move it to `where` (it filters rows, not groups), add ' +
         `"${field}" to \`by\`, or filter an aggregate of it instead (e.g. { ${field}: { _count: { gt: 0 } } }).`,
@@ -900,7 +897,7 @@ function buildHavingScalarClauses(
     clauses.push(...whereMod.buildOperatorClauses(qi, ref.expr, value, params));
   } else if (isUnmatchedPlainObject(value)) {
     throw new ValidationError(
-      `[turbine] Unknown operator${Object.keys(value as object).length > 1 ? 's' : ''} ` +
+      `Unknown operator${Object.keys(value as object).length > 1 ? 's' : ''} ` +
         `${Object.keys(value as object)
           .map((k) => `"${k}"`)
           .join(', ')} on ${ref.label} in having for table "${qi.table}".`,
@@ -922,7 +919,7 @@ function buildHavingScalarClauses(
 export function buildHavingNumericClauses(qi: BuilderCtx, expr: string, filter: unknown, params: unknown[]): string[] {
   if (filter === null) {
     throw new ValidationError(
-      `[turbine] Invalid having filter on "${expr}" for table "${qi.table}": expected a value or operator object.`,
+      `Invalid having filter on "${expr}" for table "${qi.table}": expected a value or operator object.`,
     );
   }
 
@@ -937,7 +934,7 @@ export function buildHavingNumericClauses(qi: BuilderCtx, expr: string, filter: 
   for (const k of Object.keys(op)) {
     if (!allowedKeys.has(k)) {
       throw new ValidationError(
-        `[turbine] Unknown having operator "${k}" on "${expr}" for table "${qi.table}". ` +
+        `Unknown having operator "${k}" on "${expr}" for table "${qi.table}". ` +
           `Supported: ${[...allowedKeys].join(', ')}.`,
       );
     }

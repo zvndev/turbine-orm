@@ -1491,7 +1491,7 @@ export function unknownFieldMessage(
     ? ` Did you mean "${suggestion}"${relations.includes(suggestion) ? ' (a relation)' : ''}?`
     : '';
   return (
-    `[turbine] Unknown field "${field}" on table "${table}".${didYouMean}` +
+    `Unknown field "${field}" on table "${table}".${didYouMean}` +
     ` Known columns: ${columns.join(', ') || '(none)'}.` +
     (relations.length ? ` Known relations (valid in \`where\` and \`with\`): ${relations.join(', ')}.` : '')
   );
@@ -1529,7 +1529,7 @@ export function availableClause(names: readonly string[], emptySentence: string)
  * it. Naming the fix costs one sentence and saves a search.
  */
 export function relationInProjectionMessage(table: string, field: string, clause: 'select' | 'omit'): string {
-  const head = `[turbine] "${field}" is a relation on table "${table}", not a column, so it cannot be named in \`${clause}\`.`;
+  const head = `"${field}" is a relation on table "${table}", not a column, so it cannot be named in \`${clause}\`.`;
   return clause === 'select'
     ? `${head} Load it with \`with: { ${field}: true }\`, which is a sibling of \`select\`, not a member of it.` +
         " To narrow the relation's own columns, put a `select` inside that relation's options:" +
@@ -1588,14 +1588,14 @@ export function warnRedundantSortTerm(
  */
 export function selectNamesNothingMessage(table: string): string {
   return (
-    `[turbine] "select" names no fields (on table "${table}"): every value is false or it is empty. ` +
+    `"select" names no fields (on table "${table}"): every value is false or it is empty. ` +
     `Pass at least one field as true, or drop "select" to get the default projection.`
   );
 }
 
 export function selectOmitExclusiveMessage(table: string): string {
   return (
-    `[turbine] "select" and "omit" are mutually exclusive (on table "${table}"). ` +
+    `"select" and "omit" are mutually exclusive (on table "${table}"). ` +
     `A select already lists exactly the fields you want.`
   );
 }
@@ -1651,7 +1651,7 @@ export function normalizePagination<A extends object | undefined>(args: A): A {
 function assertAliasAgrees(alias: string, aliasValue: unknown, native: string, nativeValue: unknown): void {
   if (nativeValue === undefined || nativeValue === aliasValue) return;
   throw new ValidationError(
-    `[turbine] "${alias}" and "${native}" are the same option and were given different values ` +
+    `"${alias}" and "${native}" are the same option and were given different values ` +
       `(${alias}: ${String(aliasValue)}, ${native}: ${String(nativeValue)}). ` +
       `"${alias}" is Prisma's spelling of "${native}"; pass one of them.`,
   );

@@ -912,6 +912,8 @@ jobs:
       - run: npm ci
       - name: Check error code enforcement
         run: npx tsx scripts/check-error-codes.ts
+      - name: Check no doubled error prefix
+        run: npm run check:error-prefix
 
   # ---------------------------------------------------------------------------
   # The single required check.

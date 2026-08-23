@@ -181,7 +181,7 @@ function mapIndexes(tableDef: TableDef, declared: readonly SchemaIndexDef[] | un
       for (const seg of idx.path) {
         if (typeof seg === 'number' && (!Number.isInteger(seg) || seg < 0)) {
           throw new ValidationError(
-            `[turbine] Doc-field index "${name}" on "${tableDef.name}": array-index path segment ${seg} must be a ` +
+            `Doc-field index "${name}" on "${tableDef.name}": array-index path segment ${seg} must be a ` +
               'non-negative integer (a JSON array index). Use a string for an object key.',
           );
         }

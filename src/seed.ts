@@ -132,7 +132,7 @@ function markSeedRan(): void {
 async function runSeed(fn: SeedFunction): Promise<void> {
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) {
-    throw new ConnectionError('[turbine] DATABASE_URL is required to run this seed.');
+    throw new ConnectionError('DATABASE_URL is required to run this seed.');
   }
 
   const db = new TurbineClient({ connectionString }, emptySchema);

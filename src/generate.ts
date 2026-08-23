@@ -461,7 +461,7 @@ export function isEmittableIdentifier(name: string): boolean {
 function requireEmittable(derived: string, subject: string, role: string): void {
   if (isEmittableIdentifier(derived)) return;
   throw new ValidationError(
-    `[turbine] Cannot generate code for ${subject}: it produces ${JSON.stringify(derived)} as ${role}, ` +
+    `Cannot generate code for ${subject}: it produces ${JSON.stringify(derived)} as ${role}, ` +
       `which is not a valid TypeScript identifier. Rename the database object, or exclude it from generation ` +
       `(introspect \`exclude\`).`,
   );

@@ -90,7 +90,7 @@ export const MAX_WHERE_DEPTH = 32;
 export function assertWhereDepth(depth: number, clause: 'where' | 'having' = 'where'): void {
   if (depth <= MAX_WHERE_DEPTH) return;
   throw new ValidationError(
-    `[turbine] \`${clause}\` clause nests more than ${MAX_WHERE_DEPTH} levels of AND / OR / NOT ` +
+    `\`${clause}\` clause nests more than ${MAX_WHERE_DEPTH} levels of AND / OR / NOT ` +
       `(or relation filters) deep. That is far past anything a real predicate needs, and an unbounded ` +
       `walk over caller-supplied nesting is a stack-overflow surface, so it is refused. If this is a ` +
       `generated predicate, flatten it: a single \`AND\` / \`OR\` array of N conditions is one level, ` +

@@ -486,7 +486,7 @@ function assertTranslateDepth(depth: number, clause: TranslateClause): void {
   // The two clauses core also walks raise core's own error, verbatim.
   if (clause === 'where' || clause === 'having') assertWhereDepth(depth, clause);
   throw new ValidationError(
-    `[turbine] \`${clause}\` nests more than ${MAX_WHERE_DEPTH} levels deep. That is far past anything a real ` +
+    `\`${clause}\` nests more than ${MAX_WHERE_DEPTH} levels deep. That is far past anything a real ` +
       `query needs, and an unbounded walk over caller-supplied nesting is a stack-overflow surface, so it is ` +
       `refused. If this is a generated argument, flatten it: a single array of N entries is one level, not N.`,
   );
@@ -940,7 +940,7 @@ function translateOmit(
     if (val === false || val == null) continue;
     if (mm.relations[key]) {
       throw new ValidationError(
-        `[turbine] prisma-compat: \`omit\` on model "${modelName(ctx, mm)}" takes scalar fields, but "${key}" ` +
+        `prisma-compat: \`omit\` on model "${modelName(ctx, mm)}" takes scalar fields, but "${key}" ` +
           'is a relation. Leave the relation out of `include` instead.',
       );
     }
@@ -968,11 +968,11 @@ function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, 
   const select = args.select as Record<string, unknown> | undefined;
   const omitArg = args.omit as Record<string, unknown> | undefined;
   if (include && select) {
-    throw new ValidationError('[turbine] prisma-compat: `include` and `select` are mutually exclusive.');
+    throw new ValidationError('prisma-compat: `include` and `select` are mutually exclusive.');
   }
   if (select && omitArg) {
     throw new ValidationError(
-      '[turbine] prisma-compat: `select` and `omit` are mutually exclusive. ' +
+      'prisma-compat: `select` and `omit` are mutually exclusive. ' +
         'A `select` already lists exactly the fields you want.',
     );
   }
@@ -991,7 +991,7 @@ function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, 
       const rel = mm.relations[key];
       if (!rel) {
         throw new ValidationError(
-          `[turbine] prisma-compat: unknown relation "${key}" in include on model "${modelName(ctx, mm)}".`,
+          `prisma-compat: unknown relation "${key}" in include on model "${modelName(ctx, mm)}".`,
         );
       }
       withClause[rel.name] = translateWithOption(ctx, mm, rel.name, val, depth + 1);
@@ -1061,7 +1061,7 @@ function assertWriteProjectionField(ctx: Ctx, mm: PrismaModelMap, op: string, cl
   const known = Object.keys(mm.fields);
   const suggestion = suggestKey(key, new Set(known));
   throw new ValidationError(
-    `[turbine] prisma-compat: unknown field "${key}" in \`${clause}\` on ${modelName(ctx, mm)}.${op}().` +
+    `prisma-compat: unknown field "${key}" in \`${clause}\` on ${modelName(ctx, mm)}.${op}().` +
       (suggestion ? ` Did you mean "${suggestion}"?` : '') +
       ` Known fields: ${known.join(', ') || '(none)'}.`,
   );
@@ -1099,11 +1099,11 @@ function resolveWriteProjection(
   const select = args.select as Record<string, unknown> | undefined;
   const omitArg = args.omit as Record<string, unknown> | undefined;
   if (include && select) {
-    throw new ValidationError('[turbine] prisma-compat: `include` and `select` are mutually exclusive.');
+    throw new ValidationError('prisma-compat: `include` and `select` are mutually exclusive.');
   }
   if (select && omitArg) {
     throw new ValidationError(
-      '[turbine] prisma-compat: `select` and `omit` are mutually exclusive. ' +
+      'prisma-compat: `select` and `omit` are mutually exclusive. ' +
         'A `select` already lists exactly the fields you want.',
     );
   }
@@ -1144,7 +1144,7 @@ function resolveWriteProjection(
       if (val === false || val == null) continue;
       if (mm.relations[key]) {
         throw new ValidationError(
-          `[turbine] prisma-compat: \`omit\` on model "${modelName(ctx, mm)}" takes scalar fields, but "${key}" ` +
+          `prisma-compat: \`omit\` on model "${modelName(ctx, mm)}" takes scalar fields, but "${key}" ` +
             'is a relation.',
         );
       }
@@ -2262,7 +2262,7 @@ function makeDelegate(
 
   const requireWhere = (args: Args | undefined, op: string): Args => {
     if (!args || args.where === undefined) {
-      throw new ValidationError(`[turbine] prisma-compat: ${op} on "${modelName(ctx, mm)}" requires a \`where\`.`);
+      throw new ValidationError(`prisma-compat: ${op} on "${modelName(ctx, mm)}" requires a \`where\`.`);
     }
     return args;
   };
@@ -2537,7 +2537,7 @@ interface DialectLike {
 
 function poolOf(db: CompatTurbineClient): PgLikePool {
   const pool = (db as unknown as { pool?: PgLikePool }).pool;
-  if (!pool) throw new ValidationError('[turbine] prisma-compat: raw SQL needs a TurbineClient with an active pool.');
+  if (!pool) throw new ValidationError('prisma-compat: raw SQL needs a TurbineClient with an active pool.');
   return pool;
 }
 
@@ -2763,7 +2763,7 @@ function applyExtension(
 ): ExtensionState {
   if (typeof ext !== 'object' || ext === null) {
     throw new ValidationError(
-      '[turbine] prisma-compat: $extends expects an extension object or a function ' +
+      'prisma-compat: $extends expects an extension object or a function ' +
         `(Prisma.defineExtension callback form), received ${ext === null ? 'null' : typeof ext}.`,
     );
   }
@@ -2786,7 +2786,7 @@ function applyExtension(
   for (const [name, member] of Object.entries(ext.client ?? {})) {
     if (clientKeys.has(name)) {
       throw new ValidationError(
-        `[turbine] prisma-compat: $extends \`client\` member "${name}" would shadow an existing client ` +
+        `prisma-compat: $extends \`client\` member "${name}" would shadow an existing client ` +
           'member (a model delegate or a client-level method). Rename it.',
       );
     }
@@ -2803,7 +2803,7 @@ function applyExtension(
     const canonical = modelKeys.get(key);
     if (!canonical) {
       throw new ValidationError(
-        `[turbine] prisma-compat: $extends \`model\` key "${key}" is not a model on this client. ` +
+        `prisma-compat: $extends \`model\` key "${key}" is not a model on this client. ` +
           `Known models: ${[...new Set(modelKeys.values())].sort().join(', ') || '(none)'}.`,
       );
     }
@@ -2937,7 +2937,7 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
       if (typeof tx.rawQuery !== 'function') {
         throw decorate(
           new ValidationError(
-            '[turbine] prisma-compat: raw SQL inside $transaction needs a transaction client that can execute it ' +
+            'prisma-compat: raw SQL inside $transaction needs a transaction client that can execute it ' +
               '(core TransactionClient.rawQuery). Refusing to run the statement on a pool connection, which would ' +
               'silently place it outside the transaction.',
           ),
@@ -2987,7 +2987,7 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
                 const b = batchableOf(p);
                 if (!b) {
                   throw new ValidationError(
-                    `[turbine] prisma-compat: $transaction([...]) item ${i} is not a lazy model call. Pass un-awaited delegate calls (e.g. prisma.User.create(...)).`,
+                    `prisma-compat: $transaction([...]) item ${i} is not a lazy model call. Pass un-awaited delegate calls (e.g. prisma.User.create(...)).`,
                   );
                 }
                 return b;

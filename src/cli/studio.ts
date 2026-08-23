@@ -537,6 +537,9 @@ function constantTimeEqual(a: string, b: string): boolean {
 function unknownTableMessage(name: string, ctx: StudioContext): string {
   const available = Object.keys(ctx.metadata.tables);
   const list = available.length ? available.join(', ') : '(none)';
+  // turbine-prefix-ok: every caller passes this straight to sendJson as an HTTP
+  // body, never to a TurbineError, so nothing prepends a `[TURBINE_EXXX]` tag
+  // and the prefix is the browser's only signal of who produced the message.
   return `[turbine] Unknown table "${name}" in schema "${ctx.options.schema}". Available: ${list}`;
 }
 
@@ -1043,21 +1046,21 @@ function assertNoPiiPredicates(
     hiddenReason: (table, column) => (isRedactedColumn(table, column, showPii) ? 'is PII-tagged and redacted' : null),
     refuseColumn: (table, column, reason) => {
       throw new ValidationError(
-        `[turbine] Column "${column}" on "${table.name}" ${reason}, so it cannot be used ` +
+        `Column "${column}" on "${table.name}" ${reason}, so it cannot be used ` +
           `in a where, orderBy, cursor, or distinct: filtering, sorting, paging, or de-duplicating on a hidden ` +
           `value reveals it. Restart Studio with --show-pii to query it.`,
       );
     },
     refuseDepth: (maxDepth) => {
       throw new ValidationError(
-        `[turbine] Query is nested more than ${maxDepth} levels deep, which is past the point where ` +
+        `Query is nested more than ${maxDepth} levels deep, which is past the point where ` +
           `Studio can prove it does not filter or sort on a PII-tagged and redacted column, so it is refused. ` +
           `Flatten the query, or restart Studio with --show-pii.`,
       );
     },
     refuseShape: (table, key) => {
       throw new ValidationError(
-        `[turbine] Studio does not recognize "${key}" in a query on "${table.name}", so it cannot prove the ` +
+        `Studio does not recognize "${key}" in a query on "${table.name}", so it cannot prove the ` +
           `query does not filter or sort on a PII-tagged and redacted column, and refuses it rather than ` +
           `guessing. Remove it, or restart Studio with --show-pii.`,
       );

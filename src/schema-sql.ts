@@ -95,7 +95,7 @@ function resolveDdlType(config: ColumnConfig, dialect: Dialect, columnName: stri
     // pgvector caps a `vector` column at 16000 dimensions.
     if (typeof dims !== 'number' || !Number.isInteger(dims) || dims < 1 || dims > 16000) {
       throw new ValidationError(
-        `[turbine] Column "${columnName}": vector dimensions must be an integer between 1 and 16000, got ${String(dims)}.`,
+        `Column "${columnName}": vector dimensions must be an integer between 1 and 16000, got ${String(dims)}.`,
       );
     }
     base = `vector(${dims})`;
@@ -1898,7 +1898,7 @@ async function pinSearchPath(client: pg.Client, pgSchema: string): Promise<void>
   ]);
   if (!present.rows[0]?.present) {
     throw new ValidationError(
-      `[turbine] Schema "${pgSchema}" does not exist in this database. ` +
+      `Schema "${pgSchema}" does not exist in this database. ` +
         `Postgres accepts a missing namespace in search_path without complaint, so pushing anyway would ` +
         `create every table in whichever schema resolves next (usually public) and report success. ` +
         `Create the schema first (CREATE SCHEMA "${pgSchema}") or correct the configured schema name.`,
@@ -1917,7 +1917,7 @@ async function pinSearchPath(client: pg.Client, pgSchema: string): Promise<void>
 
 /** Format the destructive-push refusal message (mirrors the migrate gate copy). */
 function formatDestructivePushError(hits: readonly DestructiveStatement[]): string {
-  const lines = ['[turbine] Refusing to apply schema changes containing DESTRUCTIVE statements:', ''];
+  const lines = ['Refusing to apply schema changes containing DESTRUCTIVE statements:', ''];
   for (const h of hits) {
     lines.push(`  - [${h.kind}] ${h.target}: ${DESTRUCTIVE_KIND_LABEL[h.kind]}`);
   }

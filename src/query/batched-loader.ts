@@ -516,13 +516,13 @@ export function resolveCountRelations(parentMeta: TableMetadata, countSpec: With
     const rel = ownLookup(parentMeta.relations, relName);
     if (!rel) {
       throw new RelationError(
-        `[turbine] Unknown relation "${relName}" in _count on table "${parentMeta.name}". ` +
+        `Unknown relation "${relName}" in _count on table "${parentMeta.name}". ` +
           availableClause(Object.keys(parentMeta.relations), 'It has no relations.'),
       );
     }
     if (!isToMany(rel)) {
       throw new ValidationError(
-        `[turbine] _count is only supported for to-many relations; "${relName}" on ` +
+        `_count is only supported for to-many relations; "${relName}" on ` +
           `"${parentMeta.name}" is a to-one relation.`,
       );
     }
@@ -555,7 +555,7 @@ export function rejectNestedPickOrder(withClause: WithClause): void {
       for (const [key, value] of Object.entries(options.orderBy)) {
         if (isRelationPickOrderBy(value)) {
           throw new ValidationError(
-            `[turbine] Pick-row ordering on relation "${key}" is only supported in a top-level ` +
+            `Pick-row ordering on relation "${key}" is only supported in a top-level ` +
               'findMany orderBy: nested `with` orderBy does not support it.',
           );
         }
@@ -604,7 +604,7 @@ export async function loadRelationsBatched(
       // E005 for this exact shape (relations.ts), and under 'auto' the two
       // must refuse identically or the error CODE depends on table size.
       throw new RelationError(
-        `[turbine] Unknown relation "${relName}" on table "${ctx.parentMeta.name}". ` +
+        `Unknown relation "${relName}" on table "${ctx.parentMeta.name}". ` +
           availableClause(Object.keys(ctx.parentMeta.relations), 'It has no relations.'),
       );
     }
@@ -635,7 +635,7 @@ export async function loadRelationsBatched(
   // not a line in a correctness fix. Until then both strategies say no.
   if (hasCount && depth > 0) {
     throw new RelationError(
-      `[turbine] Unknown relation "_count" on table "${ctx.parentMeta.name}". ` +
+      `Unknown relation "_count" on table "${ctx.parentMeta.name}". ` +
         `${availableClause(Object.keys(ctx.parentMeta.relations), 'It has no relations.')} ` +
         '(`_count` is supported on the top-level `with` only, on every relationLoadStrategy.)',
     );
@@ -974,7 +974,7 @@ async function loadManyToMany(
 ): Promise<void> {
   const through = rel.through;
   if (!through) {
-    throw new ValidationError(`[turbine] manyToMany relation "${relName}" is missing its junction (\`through\`).`);
+    throw new ValidationError(`manyToMany relation "${relName}" is missing its junction (\`through\`).`);
   }
   const sourceJ = normalizeKeyColumns(through.sourceKey);
   const targetJ = normalizeKeyColumns(through.targetKey);
@@ -1164,7 +1164,7 @@ async function loadOneCount(
   if (rel.type === 'manyToMany') {
     const through = rel.through;
     if (!through) {
-      throw new ValidationError(`[turbine] manyToMany relation "${rel.name}" is missing its junction (\`through\`).`);
+      throw new ValidationError(`manyToMany relation "${rel.name}" is missing its junction (\`through\`).`);
     }
     const sourceRef = normalizeKeyColumns(rel.referenceKey);
     const sourceJ = normalizeKeyColumns(through.sourceKey);
@@ -1370,6 +1370,6 @@ function groupBy(rows: Record<string, unknown>[], field: string): Map<string, Re
  */
 function requireTable(schema: SchemaMetadata, table: string, relName: string): TableMetadata {
   const meta = schema.tables[table];
-  if (!meta) throw new RelationError(`[turbine] Unknown relation target "${table}" (relation "${relName}").`);
+  if (!meta) throw new RelationError(`Unknown relation target "${table}" (relation "${relName}").`);
   return meta;
 }

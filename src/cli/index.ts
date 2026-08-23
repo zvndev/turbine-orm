@@ -3282,7 +3282,7 @@ async function cmdMigrateDeploy(args: CliArgs, config: ResolvedConfig): Promise<
       error('Deploy blocked by migration drift');
       errorLine();
       for (const line of formatChecksumMismatchError(plan.mismatches).split('\n')) {
-        errorLine(`${line.replace('[turbine] ', '')}`);
+        errorLine(line);
       }
       errorLine();
       process.exit(1);
@@ -3365,8 +3365,7 @@ async function confirmDestructive(report: string): Promise<boolean> {
   newline();
   error('DESTRUCTIVE MIGRATION DETECTED');
   newline();
-  for (const line of report.split('\n'))
-    console.log(`  ${line.includes('[turbine]') ? line.replace('[turbine] ', '') : line}`);
+  for (const line of report.split('\n')) console.log(`  ${line}`);
   newline();
 
   if (!process.stdin.isTTY) {

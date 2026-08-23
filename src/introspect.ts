@@ -433,7 +433,7 @@ export function assertSafeCatalogIdentifier(name: string, subject: string): void
   if (match === null) return;
   const code = match[0].charCodeAt(0).toString(16).padStart(4, '0');
   throw new ValidationError(
-    `[turbine] Refusing to introspect ${subject}: its name contains the control character U+${code.toUpperCase()} ` +
+    `Refusing to introspect ${subject}: its name contains the control character U+${code.toUpperCase()} ` +
       `at position ${match.index}. Such a name cannot be safely emitted into generated code, SQL comments, or ` +
       `tooling output. Rename the database object, or exclude it from introspection.`,
   );
@@ -539,7 +539,7 @@ export function applyRelationRenames(
     const meta = tables[table];
     if (!meta) {
       throw new ValidationError(
-        `[turbine] relationNames: unknown table "${table}". Known tables: ${Object.keys(tables).join(', ')}.`,
+        `relationNames: unknown table "${table}". Known tables: ${Object.keys(tables).join(', ')}.`,
       );
     }
     const relations: Record<string, RelationDef> = { ...meta.relations };
@@ -548,19 +548,19 @@ export function applyRelationRenames(
     for (const [from, to] of Object.entries(mapping)) {
       if (!Object.hasOwn(relations, from)) {
         throw new ValidationError(
-          `[turbine] relationNames: table "${table}" has no relation "${from}". ` +
+          `relationNames: table "${table}" has no relation "${from}". ` +
             `Derived relations: ${Object.keys(relations).join(', ') || '(none)'}.`,
         );
       }
       if (from === to) continue;
       if (Object.hasOwn(relations, to)) {
         throw new ValidationError(
-          `[turbine] relationNames: cannot rename "${table}.${from}" to "${to}", that relation already exists.`,
+          `relationNames: cannot rename "${table}.${from}" to "${to}", that relation already exists.`,
         );
       }
       if (columnFields.has(to)) {
         throw new ValidationError(
-          `[turbine] relationNames: cannot rename "${table}.${from}" to "${to}", a column on "${table}" ` +
+          `relationNames: cannot rename "${table}.${from}" to "${to}", a column on "${table}" ` +
             `already uses that field name, and a relation must never shadow a column.`,
         );
       }

@@ -817,7 +817,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const meta = schema.tables[table];
     if (!meta) {
       throw new ValidationError(
-        `[turbine] Unknown table "${table}". ${availableClause(Object.keys(schema.tables), 'The schema has no tables.')}`,
+        `Unknown table "${table}". ${availableClause(Object.keys(schema.tables), 'The schema has no tables.')}`,
       );
     }
     this.tableMeta = meta;
@@ -1126,9 +1126,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private paginationValue(value: unknown, arg: string): number {
     const n = Number(value);
     if (!Number.isSafeInteger(n) || n < 0) {
-      throw new ValidationError(
-        `[turbine] ${arg} on "${this.table}" must be a non-negative integer, received: ${String(value)}`,
-      );
+      throw new ValidationError(`${arg} on "${this.table}" must be a non-negative integer, received: ${String(value)}`);
     }
     return n;
   }
@@ -1220,7 +1218,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
     if (!JSON_ENCODINGS.includes(argEncoding)) {
       throw new ValidationError(
-        `[turbine] Invalid \`jsonEncoding\` on "${this.table}": ${JSON.stringify(argEncoding)}. ` +
+        `Invalid \`jsonEncoding\` on "${this.table}": ${JSON.stringify(argEncoding)}. ` +
           `Expected ${JSON_ENCODINGS.map((e) => `'${e}'`).join(' or ')}.`,
       );
     }
@@ -2160,7 +2158,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       );
     }
     const message =
-      `[turbine] SQL cache lockstep violation on ${op} (fingerprint "${cacheKey}"). ` +
+      `SQL cache lockstep violation on ${op} (fingerprint "${cacheKey}"). ` +
       `This is a Turbine internal invariant violation, please report it at ` +
       `https://github.com/zvndev/turbine-orm/issues. The fingerprint, SQL-build, and ` +
       `param-collect paths must enumerate where-clause keys identically.\n${details.join('\n')}`;
@@ -2269,7 +2267,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
     if (this.options?.planCacheMode === 'force_generic_plan') {
       throw new ValidationError(
-        '[turbine] forceCustomPlan: true cannot be honoured on a client configured with ' +
+        'forceCustomPlan: true cannot be honoured on a client configured with ' +
           "planCacheMode: 'force_generic_plan'. That setting is a connection parameter and it governs UNNAMED " +
           'statements as well as named ones, so the mechanism this option uses (withholding the ' +
           'prepared-statement name, so the driver re-parses the statement on every execution and it is planned ' +
@@ -2588,7 +2586,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // the same way; ask for one row by identity with `findUnique`.
     if (whereMod.userPredicateIsEmpty(this.ctx, (args.where ?? {}) as Record<string, unknown>)) {
       throw new ValidationError(
-        `[turbine] findUnique on "${this.table}" refused: the \`where\` clause has no predicate, ` +
+        `findUnique on "${this.table}" refused: the \`where\` clause has no predicate, ` +
           'so this would return an arbitrary row rather than a specific one. ' +
           'A key whose value is `undefined` does not count, check that the value you are looking up is defined. ' +
           'If you meant "any row matching an optional filter", use `findFirst`.',
@@ -3086,7 +3084,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       for (const [, d] of orderByEntries(args.orderBy)) {
         if (this.isRelationOrderByValue(d)) {
           throw new ValidationError(
-            '[turbine] `distinct` cannot be combined with relation orderBy (pick-row, `_count`, or ' +
+            '`distinct` cannot be combined with relation orderBy (pick-row, `_count`, or ' +
               'to-one relation ordering): the outer re-order cannot reference the parent table.',
           );
         }
@@ -3301,7 +3299,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         // the user's order (picks the right representative row), outer re-ordered
         // by the user's order alone.
         if (orderByEntries(args.orderBy).some(([, d]) => isVectorOrderBy(d))) {
-          throw new ValidationError('[turbine] `distinct` cannot be combined with vector distance ordering.');
+          throw new ValidationError('`distinct` cannot be combined with vector distance ordering.');
         }
         const userOrder = this.buildOrderBy(args.orderBy, freshParams);
         const inner = `SELECT ${distinctPrefix}${selectClause} FROM ${qt}${tail} ORDER BY ${distinctCols

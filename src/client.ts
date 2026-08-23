@@ -836,7 +836,7 @@ function assertUsableConnectionString(value: string, source: string): void {
   // empty is more useful than reporting the phantom host.
   if (value.trim().length === 0) {
     throw new ConnectionError(
-      `[turbine] The ${source} is empty. Expected a Postgres connection string such as ` +
+      `The ${source} is empty. Expected a Postgres connection string such as ` +
         '"postgresql://user:password@host:5432/database".',
     );
   }
@@ -851,7 +851,7 @@ function assertUsableConnectionString(value: string, source: string): void {
     'The value is not included here because it may contain a password.';
   if (verdict.kind === 'unparseable') {
     throw new ConnectionError(
-      `[turbine] The ${source} cannot be parsed as a connection string, pg rejects it with "Invalid URL" ` +
+      `The ${source} cannot be parsed as a connection string, pg rejects it with "Invalid URL" ` +
         '(most often a non-numeric port). Expected something like ' +
         `"postgresql://user:password@host:5432/database". ${tail}`,
     );
@@ -864,7 +864,7 @@ function assertUsableConnectionString(value: string, source: string): void {
     ? 'It looks like a libpq "host=… dbname=…" keyword/value string, which node-postgres does not support. '
     : '';
   throw new ConnectionError(
-    `[turbine] The ${source} names no host: it has no "postgres://" or "postgresql://" scheme, so pg would ` +
+    `The ${source} names no host: it has no "postgres://" or "postgresql://" scheme, so pg would ` +
       `resolve it as a relative URL and try to connect to its internal placeholder host. ${keywordForm}` +
       `Expected something like "postgresql://user:password@host:5432/database". ${tail}`,
   );
@@ -1003,7 +1003,7 @@ function resolveIsolationLevel(level: string | undefined): string | undefined {
   const sql = ownLookup(ISOLATION_LEVELS, level);
   if (sql === undefined) {
     throw new ValidationError(
-      `[turbine] $transaction: unknown isolationLevel ${JSON.stringify(level)}. ` +
+      `$transaction: unknown isolationLevel ${JSON.stringify(level)}. ` +
         `Expected one of: ${Object.keys(ISOLATION_LEVELS).join(', ')} (case-sensitive).`,
     );
   }
@@ -1373,7 +1373,7 @@ export class TurbineClient {
       const looksLikeSchemaDef =
         schema !== null && typeof schema === 'object' && Object.hasOwn(schema as object, 'name') === false;
       throw new ValidationError(
-        '[turbine] TurbineClient requires schema metadata as its second argument. ' +
+        'TurbineClient requires schema metadata as its second argument. ' +
           'Run `npx turbine generate` and use the generated client (`turbine()` from your output dir), ' +
           'or pass the generated `schemaMetadata` object: new TurbineClient(config, schemaMetadata).' +
           (looksLikeSchemaDef
@@ -1388,7 +1388,7 @@ export class TurbineClient {
     for (const [name, meta] of Object.entries(schema.tables)) {
       if (!meta || typeof meta !== 'object' || !Array.isArray((meta as { columns?: unknown }).columns)) {
         throw new ValidationError(
-          `[turbine] Table "${name}" in the schema passed to TurbineClient has no \`columns\` array, so this is ` +
+          `Table "${name}" in the schema passed to TurbineClient has no \`columns\` array, so this is ` +
             'not runtime SchemaMetadata. A `defineSchema()` result is a SchemaDef: convert it with ' +
             '`schemaDefToMetadata(def)`, or use the metadata emitted by `npx turbine generate`.',
         );
@@ -1737,7 +1737,7 @@ export class TurbineClient {
     if (value === undefined) return undefined;
     if (value !== 'null' && value !== 'preserve') {
       throw new ValidationError(
-        `[turbine] Invalid temporalInfinity: ${JSON.stringify(value)}. Expected 'preserve' (default: read a Postgres ` +
+        `Invalid temporalInfinity: ${JSON.stringify(value)}. Expected 'preserve' (default: read a Postgres ` +
           'temporal `infinity` as the JS number `Infinity` / `-Infinity`, which round-trips through a write ' +
           "but breaks the declared `Date` type) or 'null' (read it as null, which serializes cleanly but " +
           'makes it indistinguishable from a stored NULL, so a read-modify-write destroys the value).',
@@ -1751,9 +1751,9 @@ export class TurbineClient {
     const matched = PLAN_CACHE_MODES.find((m) => m === mode);
     if (matched === undefined) {
       throw new ValidationError(
-        `[turbine] Invalid planCacheMode: ${JSON.stringify(mode)}. Expected one of ${PLAN_CACHE_MODES.map(
-          (m) => `'${m}'`,
-        ).join(', ')}.`,
+        `Invalid planCacheMode: ${JSON.stringify(mode)}. Expected one of ${PLAN_CACHE_MODES.map((m) => `'${m}'`).join(
+          ', ',
+        )}.`,
       );
     }
     if (dialect.supportsPlanCacheMode !== true) {
@@ -1857,7 +1857,7 @@ export class TurbineClient {
     const settled = TurbineClient.utcTimestampParserMode;
     if (settled === undefined || settled === want) return;
     throw new ValidationError(
-      `[turbine] utcTimestamps: ${want} conflicts with utcTimestamps: ${settled}, which an earlier TurbineClient ` +
+      `utcTimestamps: ${want} conflicts with utcTimestamps: ${settled}, which an earlier TurbineClient ` +
         'in this process already applied. The zone-less temporal READ parsers (pg OIDs 1114, 1082, 1115, 1182) are ' +
         'process-global, so they cannot ' +
         'differ per client, while the WRITE side is per client. Serving both values would give this client a ' +
@@ -2484,7 +2484,7 @@ export class TurbineClient {
         for (const [name, value] of Object.entries(options.sessionContext)) {
           if (!GUC_NAME_REGEX.test(name)) {
             throw new ValidationError(
-              `[turbine] Invalid session-context GUC name "${name}", must match ` +
+              `Invalid session-context GUC name "${name}", must match ` +
                 '/^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)?$/ (optionally namespaced, e.g. "app.current_tenant")',
             );
           }
