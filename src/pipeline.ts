@@ -20,7 +20,7 @@
  */
 
 import { type Dialect, postgresDialect } from './dialect.js';
-import { PipelineError, type PipelineResultSlot, wrapPgError } from './errors.js';
+import { PipelineError, type PipelineResultSlot, TurbineError, wrapPgError } from './errors.js';
 import type { PgCompatPool, PgCompatPoolClient, PgCompatQueryResult } from './pg-types.js';
 import { type PipelineRunOptions, runPipelined, supportsExtendedPipeline } from './pipeline-submittable.js';
 import type { DeferredQuery } from './query/index.js';
@@ -270,6 +270,12 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
     // internals), so it is the one that has to speak the engine's transaction
     // keywords rather than Postgres's.
     return await runSequential(client, queries, poolDialect(pool), options);
+  } catch (err) {
+    // Already-typed Turbine errors pass through untouched; anything else is a
+    // driver error that must not escape with a SQLSTATE sitting in the same
+    // `.code` slot Turbine puts TURBINE_E0NN in.
+    if (err instanceof TurbineError) throw err;
+    throw wrapPgError(err);
   } finally {
     client.release();
   }

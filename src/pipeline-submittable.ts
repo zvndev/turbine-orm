@@ -20,7 +20,7 @@
 import type { EventEmitter } from 'node:events';
 import Result from 'pg/lib/result';
 import { prepareValue } from 'pg/lib/utils';
-import { PipelineError, wrapPgError } from './errors.js';
+import { PipelineError, TimeoutError, wrapPgError } from './errors.js';
 import type { PgCompatQueryResult } from './pg-types.js';
 import type { DeferredQuery } from './query/index.js';
 
@@ -421,7 +421,11 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
 
     if (timeout && timeout > 0) {
       timeoutHandle = setTimeout(() => {
-        pipelineError = new Error(`[turbine] Pipeline timed out after ${timeout}ms`);
+        // TimeoutError (E002), matching $transaction({ timeout }). A bare Error
+        // here meant `pipeline({ timeout })` rejected with no .code, no
+        // .docsUrl, and failing `instanceof TurbineError`, so the two timeout
+        // paths in the same client disagreed about their own contract.
+        pipelineError = new TimeoutError(timeout, 'Pipeline');
         if (connection.stream.destroy) {
           connection.stream.destroy(pipelineError);
         }
