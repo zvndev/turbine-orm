@@ -157,6 +157,7 @@ async function assertPiiSemantics(db: DB, authorId: unknown): Promise<void> {
   const withPostsPii = await db
     .table('app_user')
     .findUnique({ where: { id: authorId }, with: { posts: { orderBy: { title: 'asc' } } }, includePii: UNSAFE });
+  assert.ok(withPostsPii.posts.length > 0, 'fixture must return child posts, or this step asserts nothing');
   for (const p of withPostsPii.posts) {
     assert.equal(typeof p.secret, 'string', 'child PII column present under includePii');
   }
@@ -166,6 +167,7 @@ async function assertPiiSemantics(db: DB, authorId: unknown): Promise<void> {
     where: { id: authorId },
     with: { posts: { orderBy: { title: 'asc' }, select: { secret: true } } },
   });
+  assert.ok(withPostsSelect.posts.length > 0, 'fixture must return child posts, or this step asserts nothing');
   for (const p of withPostsSelect.posts) assert.ok('secret' in p, 'relation select opt-in returns child PII');
 }
 
@@ -216,7 +218,7 @@ describe('pii integration (powdb embedded)', () => {
     });
   });
 
-  powdb.it('native join strategy applies the same exclusion (parity with loaders)', async () => {
+  powdb.it('native join strategy applies the same exclusion (parity with loaders)', async (t) => {
     await withPowdb(async (db, authorId) => {
       let joinRows: Record<string, unknown>[];
       try {
@@ -227,14 +229,24 @@ describe('pii integration (powdb embedded)', () => {
         });
       } catch (err) {
         // Older addons without the serverJoins capability throw E017 for an
-        // explicit per-query 'join'; that is not a Track-F regression.
-        if (err instanceof UnsupportedFeatureError) return;
+        // explicit per-query 'join'; that is not a regression. Report it as a
+        // skip rather than returning: a bare return made the whole arm green
+        // while executing none of its assertions, which is indistinguishable
+        // in the reporter from the arm having passed.
+        if (err instanceof UnsupportedFeatureError) {
+          t.skip('addon predates the serverJoins capability (E017)');
+          return;
+        }
         throw err;
       }
       const loaderRows = await db
         .table('app_user')
         .findMany({ where: { id: authorId }, with: { posts: { orderBy: { title: 'asc' } } } });
       assert.deepEqual(joinRows, loaderRows, 'join and loader output must match (both PII-excluded)');
+      assert.ok(
+        (joinRows[0]!.posts as unknown[]).length > 0,
+        'join arm must return child posts, or the PII exclusion assertion below is vacuous',
+      );
       for (const p of joinRows[0]!.posts as Record<string, unknown>[]) {
         assert.ok(!('secret' in p), 'native join excludes the child PII column');
       }
@@ -245,6 +257,10 @@ describe('pii integration (powdb embedded)', () => {
         relationLoadStrategy: 'join',
         includePii: UNSAFE,
       });
+      assert.ok(
+        (joinPii[0]!.posts as unknown[]).length > 0,
+        'join+UNSAFE arm must return child posts, or the PII inclusion assertion below is vacuous',
+      );
       for (const p of joinPii[0]!.posts as Record<string, unknown>[]) {
         assert.equal(typeof p.secret, 'string', 'includePii reaches the join path');
       }
@@ -306,6 +322,10 @@ describe('pii integration (postgres)', () => {
         with: { posts: { orderBy: { title: 'asc' } } },
         relationLoadStrategy: 'batched',
       });
+      assert.ok(
+        (batched[0]!.posts as unknown[]).length > 0,
+        'batched arm must return child posts, or the PII exclusion assertion below is vacuous',
+      );
       for (const p of batched[0]!.posts as Record<string, unknown>[]) {
         assert.ok(!('secret' in p), 'batched loader excludes the child PII column');
       }
