@@ -77,6 +77,29 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      # Public-repo leak guard. It ran in exactly one place, ci.yml's lint job,
+      # which is the one workflow that does not gate publishing. prepublishOnly
+      # and this workflow both skipped it, and the pre-commit hook that also
+      # runs it is skippable with `git commit --no-verify`. A leak guard with a
+      # single bypassable enforcement point is not a guard.
+      - name: Private-material guard
+        run: npm run check:private-terms
+
+      # Same gap class as the leak guard above, on the same path. These three
+      # run in ci.yml and in prepublishOnly, but ci.yml does not gate a tag
+      # push and prepublishOnly does not run when the tag path publishes. So
+      # on the one route that actually reaches npm they ran nowhere. They are
+      # seconds each; the reason they were missing is that nobody diffed the
+      # two workflows' guard lists, which is what makes them worth stating.
+      - name: Import-cycle guard
+        run: npm run check:cycles
+
+      - name: Error-prefix guard
+        run: npm run check:error-prefix
+
+      - name: Skip-gate guard
+        run: npm run check:skip-gates
+
       - name: Typecheck
         run: npm run typecheck
 
@@ -145,6 +168,15 @@ jobs:
       - run: npm test
         env:
           DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
+          # Parity with ci.yml's integration-tests job. Without this a misnamed
+          # DATABASE_URL, an unhealthy container, or a reworded skip-gate reason
+          # makes every Postgres suite skip and the job still reports green.
+          # That is the exact failure mode the variable exists to prevent, and
+          # it was missing from precisely the two jobs that gate what reaches
+          # npm. `sqlite` rides along for the same reason it does in ci.yml:
+          # this job pins Node 22, so node:sqlite is present and its gates have
+          # no business skipping.
+          TURBINE_REQUIRE_ENGINE: postgres,sqlite
 
   # Packed-tarball smoke gate, mirrors ci.yml's pack-smoke. Installs the real
   # `npm pack` output into a clean temp project and verifies the published
@@ -278,6 +310,15 @@ jobs:
       - run: npm run test:coverage
         env:
           DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
+          # Parity with ci.yml's coverage job, same reasoning as the
+          # integration-postgres job above. A fully-skipped run would otherwise
+          # measure coverage over SQL generation alone and still meet the
+          # thresholds.
+          TURBINE_REQUIRE_ENGINE: postgres,sqlite
+
+      # The code-generation ratchet, mirroring ci.yml's coverage job. Re-reports
+      # the coverage the step above wrote to coverage/tmp, so it runs no tests.
+      - run: npm run coverage:codegen
 
   # Error-code gate: mirrors ci.yml's error-codes job. Every `throw new` in src/
   # must be a known TurbineError subclass (or an explicitly allow-listed
@@ -295,6 +336,53 @@ jobs:
       - run: npm ci
       - name: Check error code enforcement
         run: npx tsx scripts/check-error-codes.ts
+
+  # Claim gate for the shipped agent skill: mirrors ci.yml's verify-skill job.
+  # skills/turbine-orm/SKILL.md is in package.json `files`, so a tag push
+  # publishes it, and README.md states that every factual claim in it is
+  # executed against a live database before release. This is the job that
+  # executes them, so a tag cannot publish a skill whose claims have gone stale.
+  #
+  # Database wiring differs from every other job here on purpose: the harness
+  # reads TURBINE_EVAL_URL (never DATABASE_URL) and refuses any database not
+  # named `turbine_eval`, and its schema comes from evals/schema.sql via the
+  # harness's own `db:reset`, not from src/test/fixtures/seed.sql. `npm run
+  # build` first, because evals/node_modules resolves turbine-orm through a
+  # symlink to this repo root and therefore imports dist/.
+  verify-skill:
+    name: verify-skill
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: turbine_eval
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TURBINE_EVAL_URL: postgres://test:test@localhost:5432/turbine_eval
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Build the package the harness imports
+        run: npm run build
+      - run: npm ci --prefix evals
+      - name: Seed the eval database
+        run: npm run db:reset --prefix evals
+      - name: Verify every skill claim against the live database
+        run: npm run verify:skill --prefix evals
 
   # Publish-surface type gate: mirrors ci.yml's package-types job. pack-smoke
   # only proves the package RUNS from CJS; this proves its TYPES resolve from
@@ -488,7 +576,7 @@ jobs:
 
   publish:
     timeout-minutes: 30
-    needs: [test, integration-postgres, pack-smoke, package-types, consumer-types, coverage, error-codes]
+    needs: [test, integration-postgres, pack-smoke, package-types, consumer-types, coverage, error-codes, verify-skill]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

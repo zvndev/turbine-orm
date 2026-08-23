@@ -9,10 +9,13 @@
  *
  *   [TURBINE_E003] [turbine] Unknown column "titel" on table "posts". (…)
  *
- * The 2026-08-01 audit declined a prefix rule because `formatErrorMessage`
- * already guarantees the `[CODE]` tag. That is true, and it is not the failure
- * mode: the bug is the INTERACTION between the automatic tag and a manual one,
- * which no rule about either one alone can see.
+ * The tempting objection is that a prefix rule is unnecessary because
+ * `formatErrorMessage` already guarantees the `[CODE]` tag. That is true, and
+ * it is not the failure mode: the bug is the INTERACTION between the automatic
+ * tag and a manual one, which no rule about either one alone can see. That is
+ * also why the check has to resolve the enclosing callee rather than match the
+ * literal, since the same literal is correct in a diagnostic and wrong in a
+ * thrown message.
  *
  * ## What is NOT a violation, and why
  *

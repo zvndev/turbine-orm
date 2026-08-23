@@ -140,6 +140,14 @@ jobs:
           # set it: Node 20 has no node:sqlite and skipping there is correct.
           TURBINE_REQUIRE_ENGINE: postgres,sqlite
 
+      # The code-generation ratchet. `.c8rc.json` excludes generate.ts and
+      # introspect.ts from the main gate, so they were in no gate at all: their
+      # coverage could fall to zero with everything green. This re-reports the
+      # coverage the step above already wrote to coverage/tmp under
+      # .c8rc.codegen.json, so it runs no tests and costs seconds. It must come
+      # after that step, which is where the data comes from.
+      - run: npm run coverage:codegen
+
   # Coverage gate for the three highest-consequence CLI files: cli/studio.ts
   # (WRITE MODE executes mutations, plus the PII redaction path), cli/migrate.ts
   # (runs destructive DDL) and cli/destructive.ts (decides what counts as
@@ -915,6 +923,57 @@ jobs:
       - name: Check no doubled error prefix
         run: npm run check:error-prefix
 
+  # Claim gate for the shipped agent skill. skills/turbine-orm/SKILL.md is in
+  # package.json `files`, so it is a published artifact, and README.md states
+  # that every factual claim in it is executed against a live database before
+  # release. evals/src/verify-skill.ts is what executes them, and nothing ran
+  # it: it was reachable only from evals/package.json, so that sentence
+  # described a habit rather than a gate. It is a gate now.
+  #
+  # Its database is NOT the repo's test fixture. The harness reads
+  # TURBINE_EVAL_URL (never DATABASE_URL) and evals/src/config.ts refuses any
+  # database not named `turbine_eval`, so the service container is named for it
+  # and seeded by the harness's own `db:reset`, which applies evals/schema.sql.
+  # No pgvector: the eval schema declares no extension.
+  #
+  # `npm run build` is required before the verify step. evals/node_modules
+  # resolves turbine-orm through a symlink to this repo root, so the harness
+  # imports dist/, not src/.
+  verify-skill:
+    name: verify-skill
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: turbine_eval
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TURBINE_EVAL_URL: postgres://test:test@localhost:5432/turbine_eval
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Build the package the harness imports
+        run: npm run build
+      - run: npm ci --prefix evals
+      - name: Seed the eval database
+        run: npm run db:reset --prefix evals
+      - name: Verify every skill claim against the live database
+        run: npm run verify:skill --prefix evals
+
   # ---------------------------------------------------------------------------
   # The single required check.
   #
@@ -954,6 +1013,7 @@ jobs:
       - examples-smoke
       - security
       - error-codes
+      - verify-skill
     steps:
       - name: Fail unless every job succeeded
         env:
@@ -963,8 +1023,8 @@ jobs:
           # Anti-vacuous: an empty or unparseable `needs` object would otherwise
           # report success while checking nothing.
           count=$(echo "$RESULTS" | jq 'length')
-          if [ "$count" -lt 18 ]; then
-            echo "ci-ok saw $count dependencies, expected at least 18" >&2
+          if [ "$count" -lt 19 ]; then
+            echo "ci-ok saw $count dependencies, expected at least 19" >&2
             exit 1
           fi
           failed=$(echo "$RESULTS" | jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"')
