@@ -53,6 +53,7 @@ import {
 import type { PowdbPool } from './powdb.js';
 import {
   ALL_POWDB_CAPABILITIES,
+  baseTsType,
   coerceNativeValue,
   isJsonColumn,
   isPowdbDatetimeColumn,
@@ -2647,7 +2648,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     );
     const byName = new Map(targetQi.meta.columns.map((c) => [c.name, c]));
     for (const c of cols) {
-      const ts = (byName.get(c)?.tsType ?? '').replace(/\s*\|\s*null$/i, '').trim();
+      const ts = baseTsType(byName.get(c)?.tsType ?? '');
       if (ts === 'bigint' || ts === 'Uint8Array') return null;
     }
     const children: NestedRelationPlan[] = [];
@@ -2870,7 +2871,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     // at least one projected child column is bigint/bytes. Otherwise nested
     // projections already handle it (and cache), so leave it to them.
     const hasCarrierBlockedCol = userCols.some((c) => {
-      const ts = (byName.get(c)?.tsType ?? '').replace(/\s*\|\s*null$/i, '').trim();
+      const ts = baseTsType(byName.get(c)?.tsType ?? '');
       return ts === 'bigint' || ts === 'Uint8Array';
     });
     if (!hasCarrierBlockedCol) return null;
@@ -4037,7 +4038,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
 /** Coerce a group-key scalar string by the column's TS type (numbers/bools). */
 function coerceScalar(raw: string, tsType: string): unknown {
-  const ts = tsType.replace(/\s*\|\s*null$/i, '').trim();
+  const ts = baseTsType(tsType);
   if (raw === 'null') return null;
   if (ts === 'number' || ts === 'bigint') {
     const n = Number(raw);

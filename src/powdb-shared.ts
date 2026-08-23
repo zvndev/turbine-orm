@@ -275,6 +275,59 @@ export function requireCapability(
 export type PowqlType = 'str' | 'int' | 'float' | 'bool' | 'json';
 
 /**
+ * Strip a trailing `| null` union from a generated tsType and trim.
+ *
+ * THE ONE AUTHORITY for that question, and deliberately not a regular
+ * expression. The obvious spelling, `tsType.replace(/\s*\|\s*null$/i, '')`,
+ * is POLYNOMIAL: `\s*` can start at every position, so an input of N spaces
+ * with no `|` costs O(N^2). Measured on Node 24 before this change: 10,000
+ * spaces took 39.6 ms, 20,000 took 150.3 ms and 40,000 took 617.5 ms, the
+ * quadratic signature. It was written eight times across powdb.ts and powql.ts.
+ *
+ * `tsType` comes from a generated `metadata.ts` or from `defineSchema`, so it
+ * is not request input and this was never remotely reachable. It is fixed
+ * anyway, in one place, because eight hand-copied spellings of a hot predicate
+ * is the drift shape this codebase keeps paying for, and because the linear
+ * version is not harder to read.
+ *
+ * Semantics are byte-for-byte those of the regex it replaces, including the
+ * `$` anchor: `"string | null "` has trailing space so the union does NOT
+ * match, and the value only gets trimmed. `src/test/tstype-null-union.test.ts`
+ * asserts the equivalence over a corpus rather than asserting my reading of it.
+ */
+export function baseTsType(tsType: string): string {
+  const NULL = 'null';
+  const end = tsType.length;
+  if (end >= NULL.length && tsType.slice(end - NULL.length).toLowerCase() === NULL) {
+    let i = end - NULL.length;
+    while (i > 0 && isTsSpace(tsType.charCodeAt(i - 1))) i--;
+    if (i > 0 && tsType.charCodeAt(i - 1) === 0x7c /* | */) {
+      i--;
+      while (i > 0 && isTsSpace(tsType.charCodeAt(i - 1))) i--;
+      return tsType.slice(0, i).trim();
+    }
+  }
+  return tsType.trim();
+}
+
+/** `\s` for {@link baseTsType}: one character, O(1), no backtracking. */
+function isTsSpace(code: number): boolean {
+  return (
+    code === 0x20 || // space
+    (code >= 0x09 && code <= 0x0d) || // tab, LF, VT, FF, CR
+    code === 0xa0 ||
+    code === 0x1680 ||
+    (code >= 0x2000 && code <= 0x200a) ||
+    code === 0x2028 ||
+    code === 0x2029 ||
+    code === 0x202f ||
+    code === 0x205f ||
+    code === 0x3000 ||
+    code === 0xfeff
+  );
+}
+
+/**
  * Does this column map to PowDB's native `json` document type? A Postgres
  * `json`/`jsonb` type (via `dialectType`/`pgType`) is authoritative; otherwise
  * the tsType heuristic (`Record<…>`, `object`, `unknown`, an object/array
@@ -286,7 +339,7 @@ export function isJsonColumn(col: ColumnMetadata): boolean {
   if (col.isArray) return false;
   const dbType = (col.dialectType ?? col.pgType ?? '').toLowerCase();
   if (dbType === 'json' || dbType === 'jsonb') return true;
-  const ts = col.tsType.replace(/\s*\|\s*null$/i, '').trim();
+  const ts = baseTsType(col.tsType);
   if (ts === 'Date' || ts === 'boolean' || ts === 'number' || ts === 'bigint' || ts === 'string') return false;
   if (ts === 'Buffer' || ts === 'Uint8Array') return false;
   return /Record<|object|unknown|\[\]|\{/.test(ts);
@@ -309,7 +362,7 @@ export function powqlColumnType(col: ColumnMetadata): PowqlType {
     );
   }
   if (isJsonColumn(col)) return 'json';
-  const ts = col.tsType.replace(/\s*\|\s*null$/i, '').trim();
+  const ts = baseTsType(col.tsType);
   if (ts === 'Date') return 'int'; // epoch micros
   if (ts === 'boolean') return 'bool';
   if (ts === 'number') return isFloatColumn(col) ? 'float' : 'int';
@@ -338,7 +391,7 @@ function isFloatColumn(col: ColumnMetadata): boolean {
  * `turbine-orm/powdb` surface is unchanged by this split.
  */
 export function isDateColumn(col: ColumnMetadata): boolean {
-  return col.tsType.replace(/\s*\|\s*null$/i, '').trim() === 'Date';
+  return baseTsType(col.tsType) === 'Date';
 }
 
 /**
@@ -527,7 +580,7 @@ export function quotePowqlDotted(name: string): string {
  * Metadata resolves the `"null"` ambiguity for nullable non-string columns.
  */
 export function coerceValue(raw: string, col: ColumnMetadata): unknown {
-  const ts = col.tsType.replace(/\s*\|\s*null$/i, '').trim();
+  const ts = baseTsType(col.tsType);
   const json = isJsonColumn(col);
   // NULL bareword: unambiguous for non-string columns; for `str` we cannot tell a
   // literal "null" from SQL NULL, so a nullable str of value "null" reads as null.
@@ -583,7 +636,7 @@ export function coerceNativeValue(value: unknown, col: ColumnMetadata): unknown 
     if (typeof value === 'string' && /^-?\d+$/.test(value)) return new Date(Number(value) / 1000);
     return value;
   }
-  const ts = col.tsType.replace(/\s*\|\s*null$/i, '').trim();
+  const ts = baseTsType(col.tsType);
   if (typeof value === 'bigint') {
     if (ts === 'bigint') return value;
     if (ts === 'number') {

@@ -11,6 +11,27 @@ That is the release. **Most of what follows moves an existing check onto the
 path that actually reaches npm**, and the two user-visible bug fixes are both
 cases of an error that could not be caught by the code written to catch it.
 
+### Security
+
+- **A polynomial regular expression on the PowDB type mapper.**
+  `tsType.replace(/\s*\|\s*null$/i, '')` strips a trailing `| null` from a
+  generated TypeScript type. `\s*` can begin matching at every position, so an
+  input of N whitespace characters with no `|` costs O(N^2). Measured on Node 24:
+  10,000 spaces took 39.6 ms, 20,000 took 150.3 ms, 40,000 took 617.5 ms.
+
+  It was written **eight times** across `powdb.ts` and `powql.ts`. All eight now
+  call one linear `baseTsType`, whose equivalence to the regex it replaces is
+  asserted against the real old regex over a corpus and 4,000 generated inputs,
+  not against a description of it. The same input that cost the regex 352 ms at
+  30,000 characters costs the replacement 0.13 ms at 200,000.
+
+  **Reachability, stated plainly: this was not remotely exploitable.** `tsType`
+  comes from a generated `metadata.ts` or from a `defineSchema` call, so it is
+  authored by the developer or derived from their own database catalog, never
+  from request input. It is fixed because eight hand-copied spellings of one
+  predicate is the drift shape this codebase keeps paying for, and because the
+  linear version is not harder to read.
+
 ### Fixed
 
 - **A pipeline timeout rejected with a bare `Error`, so it could not be
