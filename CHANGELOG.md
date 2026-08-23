@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.77.1 (2026-08-23)
+
+**No package changes.** The published tarball is functionally identical to
+0.77.0; `.github/` is not in `files`. This release exists because the thing it
+fixes lives in the release workflow, and a release workflow can only be verified
+by running one.
+
+### Fixed
+
+- **The post-publish smoke test could not have succeeded, for any release.** It
+  went red on 0.73.1, the retry budget was raised from 12 x 10s to 30 x 10s, and
+  it went red again on 0.77.0. Both versions published correctly, with
+  provenance. Raising the number twice is how we found out the number was never
+  the problem.
+
+  The mechanism is npm's client-side cache, not registry propagation.
+  `registry.npmjs.org` serves packuments with `Cache-Control: max-age=300`, and
+  npm's `prefer-online` defaults to `false`, so for 300 seconds npm answers from
+  its local cache without revalidating. The first attempt runs moments after
+  publish and caches a packument that does not yet list the new version; all 29
+  later attempts read that cached copy and never reach the network. `30 x 10s`
+  is exactly `300s`, so the loop expired at the precise moment its own cache
+  would have.
+
+  `--prefer-online` forces revalidation per attempt, which is what makes a retry
+  loop a retry loop. The budget stays at five minutes and is now a bound on
+  genuine propagation lag rather than a race against a TTL. The failure message
+  no longer reads as though the release failed, either: the step runs after an
+  irreversible publish, so by the time it can fail the package is on the
+  registry and the GitHub Release step still runs.
+
+  This is the same lesson as the rest of 0.77.0, arriving one release later and
+  at our own expense: the earlier fix changed a number and left the mechanism
+  unexamined, so it came back.
+
 ## 0.77.0 (2026-08-23)
 
 0.76.0 published from a commit whose CI was red. Nothing was wrong with the
