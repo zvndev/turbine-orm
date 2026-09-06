@@ -57,13 +57,32 @@ function parseCi(text: string): CiShape {
 
   const jobs: string[] = [];
   const jobStart = new Map<string, number>();
+  // A job id may carry an uppercase letter or a trailing comment, both legal
+  // YAML and both invisible to the first version of this regex, which took
+  // `[a-z0-9_-]+` up to end of line. A job it cannot see is a job that can sit
+  // outside `ci-ok.needs` while this file passes, which is the whole thing it
+  // exists to prevent, so the second loop below FAILS CLOSED on any two-space
+  // key the first one did not claim rather than trusting the pattern.
   for (let i = jobsAt + 1; i < lines.length; i++) {
-    const m = /^ {2}([a-z0-9_-]+):\s*$/.exec(lines[i] as string);
+    const line = lines[i] as string;
+    const m = /^ {2}([A-Za-z0-9_-]+):\s*(#.*)?$/.exec(line);
     if (m?.[1]) {
       jobs.push(m[1]);
       jobStart.set(m[1], i);
     }
   }
+  // A two-space line that looks like a KEY but is not one this parser read.
+  // Comment lines at that indent are the file's job-level documentation and are
+  // not keys, so they are excluded by the leading `[^\s#]`.
+  const unclaimed = lines
+    .slice(jobsAt + 1)
+    .filter((line) => /^ {2}[^\s#][^:]*:/.test(line) && !/^ {2}([A-Za-z0-9_-]+):\s*(#.*)?$/.test(line));
+  assert.deepEqual(
+    unclaimed,
+    [],
+    `ci.yml has two-space keys under \`jobs:\` that the job parser did not read:\n  ${unclaimed.join('\n  ')}\n` +
+      "A job this parser cannot see can sit outside `ci-ok`'s `needs:` with every assertion here still green.",
+  );
 
   const start = jobStart.get(AGGREGATOR);
   assert.notEqual(start, undefined, `ci.yml defines no \`${AGGREGATOR}\` job`);
