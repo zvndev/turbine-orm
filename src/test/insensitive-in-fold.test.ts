@@ -37,8 +37,9 @@
  */
 
 import assert from 'node:assert/strict';
-import { DatabaseSync } from 'node:sqlite';
-import { describe, it } from 'node:test';
+import { createRequire } from 'node:module';
+import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
+import { describe, it, it as nodeIt } from 'node:test';
 import { TurbineErrorCode, UnsupportedFeatureError } from '../errors.js';
 import { mssqlDialect } from '../mssql.js';
 import { mysqlDialect } from '../mysql.js';
@@ -48,6 +49,31 @@ import { makeQuery, mockTable } from './helpers.js';
 
 // biome-ignore lint/suspicious/noExplicitAny: test harness plumbing
 type Any = any;
+
+// `node:sqlite` is a builtin only on Node >= 22.5. Probed WITHOUT a static
+// import so this file LOADS on Node 20 (the unit matrix's lowest leg) and skips
+// only its SQLite arm, rather than crashing the lane with
+// ERR_UNKNOWN_BUILTIN_MODULE and taking the dialect refusals down with it.
+// createRequire is anchored on cwd so it resolves the builtin identically in
+// any module system.
+const DatabaseSync: (new (path: string) => DatabaseSyncType) | undefined = (() => {
+  try {
+    return createRequire(process.cwd())('node:sqlite').DatabaseSync;
+  } catch {
+    return undefined;
+  }
+})();
+
+/**
+ * The SQLite arm's `it`. Only the LIVE differential needs the engine; the
+ * per-dialect refusals below read `sqliteDialect`, a plain object, and run
+ * everywhere. Registered as skipped rather than omitted, so the reporter shows
+ * the gap instead of a smaller green total.
+ */
+const sqliteIt: typeof nodeIt = DatabaseSync
+  ? nodeIt
+  : (((name: string) =>
+      nodeIt(name, { skip: 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)' }, () => {})) as typeof nodeIt);
 
 /**
  * Rows whose case variants differ OUTSIDE ASCII, which is exactly where two
@@ -68,6 +94,8 @@ interface Engine {
 }
 
 async function sqliteEngine(): Promise<Engine> {
+  // Unreachable when the probe found nothing: every caller is a `sqliteIt`.
+  if (!DatabaseSync) throw new Error('node:sqlite is absent; this arm should have been skipped');
   const handle = new DatabaseSync(':memory:');
   handle.exec('CREATE TABLE folk (id INTEGER PRIMARY KEY, name TEXT NOT NULL)');
   const insert = handle.prepare('INSERT INTO folk (id, name) VALUES (?, ?)');
@@ -129,7 +157,7 @@ async function assertNotAndNotInAgree(engine: Engine, operand: string): Promise<
 // ---------------------------------------------------------------------------
 
 describe('mode: insensitive, equals and in never disagree (sqlite, in-process)', () => {
-  it('every operand: same rows, or a typed refusal', async () => {
+  sqliteIt('every operand: same rows, or a typed refusal', async () => {
     const engine = await sqliteEngine();
     try {
       let served = 0;
@@ -147,7 +175,7 @@ describe('mode: insensitive, equals and in never disagree (sqlite, in-process)',
     }
   });
 
-  it('a case-SENSITIVE in is untouched and still returns the exact spelling', async () => {
+  sqliteIt('a case-SENSITIVE in is untouched and still returns the exact spelling', async () => {
     const engine = await sqliteEngine();
     try {
       assert.deepEqual(await engine.ids({ name: { in: ['CAFÉ'] } }), [1]);
@@ -158,7 +186,7 @@ describe('mode: insensitive, equals and in never disagree (sqlite, in-process)',
     }
   });
 
-  it('the operators that fold a SINGLE operand still work on this engine', async () => {
+  sqliteIt('the operators that fold a SINGLE operand still work on this engine', async () => {
     const engine = await sqliteEngine();
     try {
       // `equals` / `not` / the LIKE family bind one operand the engine can
