@@ -75,10 +75,15 @@ npx turbine doctor --fix
 Until the index migration lands, `relationLoadStrategy: 'batched'` reproduces Prisma's loading pattern: one `WHERE fk = ANY(...)` follow-up per relation, paying a missing index only once. Output is deep-equal to the default.
 
 ```ts
-const db = new TurbineClient({
-  connectionString: process.env.DATABASE_URL,
-  relationLoadStrategy: 'batched',
-});
+import { TurbineClient } from 'turbine-orm';
+import { SCHEMA } from './generated/turbine/metadata.js';
+
+// The constructor takes (config, schema). The generated `turbine()` factory in
+// ./generated/turbine/index.js passes SCHEMA for you and types `db.users`.
+const db = new TurbineClient(
+  { connectionString: process.env.DATABASE_URL, relationLoadStrategy: 'batched' },
+  SCHEMA,
+);
 ```
 
 Turbine picks a strategy per relation unless you pin one:

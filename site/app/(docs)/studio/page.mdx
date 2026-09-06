@@ -88,7 +88,7 @@ By default there is nothing to opt out of: the write endpoints are not registere
 - The row editor is typed: enum and boolean columns get dropdowns, JSON columns validate before submit, timestamps get ISO 8601 placeholders.
 - Write requests additionally require a matching `Origin` header; absent or mismatched origins are rejected.
 
-Write mode is for fixing a few bad rows without opening psql, not for data entry. Tables without a primary key, and views, are not editable.
+Write mode is for fixing a few bad rows without opening psql, not for data entry. Tables without a primary key are not editable. Views are not shown at all: Studio introspects tables only, so a view never appears in the sidebar or the schema API (`--include-views` is a `pull` / `generate` flag, and `studio` has no equivalent).
 
 ## PII redaction
 
@@ -100,7 +100,7 @@ One nuance in write mode: the row echoed immediately after a write never contain
 
 Queries you save persist to `.turbine/studio-queries.json` in your project (commit it to share a query library with your team). In `--demo` mode saved queries live in memory only. Saved queries appear in the sidebar and in the **Cmd+K command palette**, which also jumps to any table or tab in one keystroke.
 
-Keyboard shortcuts: **Cmd+Enter** runs the current query, **Cmd+S** saves it, **G then Q / D / S** switches tabs, **R** refreshes the Data tab, **Shift+R** reloads the schema, **/** focuses the sidebar filter.
+Keyboard shortcuts: **Cmd+Enter** runs the current query, **Cmd+S** opens the Save dialog for it (the dialog's Save button confirms; the browser's own save dialog is suppressed), **G then Q / D / S** switches tabs, **R** refreshes the Data tab, **Shift+R** reloads the schema, **/** focuses the sidebar filter.
 
 Saved queries are builder-state only. Entries saved as raw SQL by old Studio versions are ignored on load, with a console notice; Studio has no way to execute them.
 

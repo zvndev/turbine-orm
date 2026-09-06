@@ -19,7 +19,7 @@ When you pass an external pool, Turbine:
 
 ```ts
 import { turbineHttp } from 'turbine-orm/serverless';
-import { SCHEMA } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata.js';
 import { Pool } from '<your-edge-driver>';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL! });
@@ -42,7 +42,7 @@ npm install @neondatabase/serverless
 // db.ts
 import { Pool } from '@neondatabase/serverless';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { SCHEMA } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata.js';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL! });
 export const db = turbineHttp(pool, SCHEMA);
@@ -73,7 +73,7 @@ npm install @vercel/postgres
 ```ts
 import { createPool } from '@vercel/postgres';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { SCHEMA } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata.js';
 
 const pool = createPool();
 export const db = turbineHttp(pool, SCHEMA);
@@ -97,7 +97,7 @@ id = "<your-hyperdrive-id>"
 ```ts
 import { Pool } from 'pg';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { SCHEMA } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata.js';
 
 export default {
   async fetch(req: Request, env: Env) {
@@ -116,7 +116,7 @@ Hyperdrive pools connections at the edge, so there's no per-request TLS handshak
 ```ts
 import { Pool } from 'pg';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { SCHEMA } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata.js';
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL!, // supabase connection string
@@ -134,7 +134,7 @@ For Node runtimes where you prefer `postgres.js` over `pg`:
 ```ts
 import postgres from 'postgres';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { SCHEMA } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata.js';
 
 // postgres.js isn't exactly pg-compatible out of the box, adapt its
 // interface to PgCompatPool. See the PgCompatPool type for the contract.

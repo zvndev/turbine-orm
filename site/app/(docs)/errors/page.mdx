@@ -7,7 +7,9 @@ export const metadata = {
 
 # Typed Errors
 
-Turbine throws typed errors you can catch with `instanceof`. Every error extends `TurbineError` and carries a stable `readonly code` field for programmatic handling. Messages start with the same code tag (e.g. `[TURBINE_E008] …`) so logs are greppable, but **do not parse the message**; branch on `err.code` / `instanceof`. Postgres driver errors (23505, 23503, 40P01, etc.) are translated into typed classes via `wrapPgError()`.
+Turbine throws typed errors you can catch with `instanceof` or by code. Every error extends `TurbineError` and carries a stable `readonly code` field for programmatic handling. Messages start with the same code tag (e.g. `[TURBINE_E008] …`) so logs are greppable, but **do not parse the message**; branch on `err.code` / `instanceof`. Postgres driver errors (23505, 23503, 40P01, etc.) are translated into typed classes via `wrapPgError()`.
+
+`err.code` is the check that survives any module graph. A process that loads the package twice, once as ESM and once as CommonJS (a `"type": "commonjs"` project whose generated client is `require`d while an `.mts` entry `import`s the package, a CJS library that wraps Turbine, a Jest setup), holds two copies of every class, and a plain prototype-chain `instanceof` against the other copy is `false`. Since 0.78 `instanceof` works across copies too: every error carries a cross-copy brand and each class implements `Symbol.hasInstance` over that brand and the error's code, so `err instanceof UniqueConstraintError` is true whichever copy threw it. The code comparison needs no import at all, which makes it the right check in a shared handler or a library.
 
 Every error also carries `readonly docsUrl` (e.g. `https://turbineorm.dev/errors#e008`, an anchor into the table below), and its message ends with the same link, so structured sinks get the URL as a field without parsing anything. A unit test asserts every code has its row and anchor here, so a new code cannot ship undocumented.
 
@@ -102,8 +104,10 @@ Every query execution runs its pg error through `wrapPgError()`. The original dr
 | `23P01` | exclusion_violation | `ExclusionConstraintError` |
 | `40P01` | deadlock_detected | `DeadlockError` (retryable) |
 | `40001` | serialization_failure | `SerializationFailureError` (retryable) |
+| class `22` (`22P02`, `22003`, `22001`, `22007`, `22008`, `22012`) | data_exception: a bad enum label, numeric overflow, a value too long, a bad date, division by zero | `ValidationError` (E003), naming the column when the driver reports one |
+| `42601` from `to_tsquery` | syntax_error in a `search` query string | `ValidationError` (E003) with a hint about the search syntax |
 
-Other pg errors pass through unchanged.
+The driver's own text stays on `.cause` and `.detail` of a class-22 `ValidationError`, so `errorMessages: 'verbose'` still shows it and the default `'safe'` mode redacts it. Any other SQLSTATE passes through as the driver's own error (it is not a `TurbineError` and has no `TURBINE_` code): under `'safe'` its `.message` is replaced with `Database error <SQLSTATE>` and the original error is kept on `.cause`; under `'verbose'` it passes through unchanged.
 
 ```ts
 import { UniqueConstraintError } from 'turbine-orm';

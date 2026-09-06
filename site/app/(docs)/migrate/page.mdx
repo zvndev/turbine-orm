@@ -46,6 +46,7 @@ npx turbine migrate status
 - **Stop on first error, partial apply.** A batch is processed in order and stops at the first failure. Migrations that already succeeded stay applied and recorded; the failing one and everything after it do not run. Fix the offending migration and re-run to continue.
 - **SHA-256 checksums.** Every applied migration's file is hashed. If an already-applied file changes on disk, `status` reports **drift** and `up` refuses to run until you reconcile (or pass `--allow-drift` when intentionally rewriting history).
 - **Advisory lock.** The runner takes a per-database Postgres advisory lock before applying, so two concurrent runs cannot race; the second exits cleanly instead of double-applying.
+- **Configured schema.** With `schema` set to anything but `public` in `turbine.config.ts`, `migrate up` / `down` / `deploy` / `status` connect with `search_path` pinned to that schema as a connection **startup parameter** (`options=-c search_path="<schema>"`, never a session `SET`), so a migration's unqualified DDL and the `_turbine_migrations` table itself land in the schema `push`, `generate` and `doctor` already read. The value replaces the role's default path rather than extending it, so an object from another schema (an extension type installed in `public`, say) must be qualified. The name must be a plain identifier (letters, digits, `_`, `$`, not starting with a digit); anything else is refused with `TURBINE_E003` before a connection is opened.
 
 ### No-transaction migrations (`CREATE INDEX CONCURRENTLY`)
 
@@ -56,16 +57,17 @@ Some statements cannot run inside a transaction. `CREATE INDEX CONCURRENTLY` is 
 -- turbine:no-transaction
 
 -- UP
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "idx_comments_post_id" ON "comments" ("post_id");
+DROP INDEX CONCURRENTLY IF EXISTS "idx_comments_post_id";
+CREATE INDEX CONCURRENTLY "idx_comments_post_id" ON "comments" ("post_id");
 
 -- DOWN
 DROP INDEX CONCURRENTLY IF EXISTS "idx_comments_post_id";
 ```
 
-This is exactly what `turbine doctor --fix` writes. Two things to know:
+This is the shape `turbine doctor --fix` writes (its file also carries a comment explaining the points below). Two things to know:
 
-- **Every statement must be idempotent.** With no transaction, a mid-file failure leaves earlier statements applied while the migration stays unrecorded, so a rerun re-executes the whole file. `IF NOT EXISTS` / `IF EXISTS` keep each statement safe to repeat.
-- **A failed concurrent build leaves an INVALID index.** On rerun, `IF NOT EXISTS` skips that corpse, so it never rebuilds. Fix it with `DROP INDEX CONCURRENTLY`, then rerun; `turbine doctor` lists invalid indexes for you.
+- **Every statement must be safe to rerun.** With no transaction, a mid-file failure leaves earlier statements applied while the migration stays unrecorded, so a rerun re-executes the whole file. For most statements `IF EXISTS` / `IF NOT EXISTS` is the right guard.
+- **A failed concurrent build leaves an INVALID index, and `CREATE INDEX ... IF NOT EXISTS` is the trap, not the fix.** The corpse sits under the requested name, and `IF NOT EXISTS` matches on the name rather than on validity, so a rerun would skip it, record the migration as applied, and the index would never build. That is why each `CREATE INDEX CONCURRENTLY` above is preceded by `DROP INDEX CONCURRENTLY IF EXISTS`: a no-op on the first run (the index does not exist yet), the repair on a rerun, so rerunning converges on a valid index. `turbine doctor` lists invalid indexes for you.
 
 `migrate up` prints a notice whenever it runs a no-transaction file. `CREATE INDEX CONCURRENTLY` can wait a while on other open transactions; that is normal, not a hang. The advisory lock and checksum checks apply unchanged.
 

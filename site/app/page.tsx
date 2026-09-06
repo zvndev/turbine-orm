@@ -57,7 +57,7 @@ const pillars = [
   {
     title: 'Nested relations, one statement',
     description:
-      'A with clause compiles to correlated json_agg subqueries, so users with posts with comments is one round trip. The result is typed end to end at any depth, with no manual annotation. Four load strategies produce identical rows, held to byte-identical output by a differential fuzz suite.',
+      'A with clause compiles to correlated json_agg subqueries, so users with posts with comments is one round trip. The result is typed end to end at any depth, with no manual annotation. Four load strategies produce identical rows: join, batched and auto are held to byte-identical output by a differential fuzz suite, flatten by its own parity suite.',
     stat: '1',
     statLabel: 'query, any depth',
   },
@@ -555,8 +555,9 @@ export default async function Home() {
                 <code>null</code>, per-relation <code>limit</code> and{' '}
                 <code>orderBy</code> apply per parent rather than to the whole
                 result, and every type survives the JSON round trip, dates
-                included. The strategies are held to byte-identical output by a
-                differential fuzz suite.
+                included. The join, batched and auto strategies are held to
+                byte-identical output by a differential fuzz suite, and flatten
+                to the same parity by its own suite.
               </p>
 
               <ul className="showcase-list">

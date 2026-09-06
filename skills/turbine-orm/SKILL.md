@@ -171,15 +171,29 @@ where: { tastingNotes: { path: ['panel', 'score'], gte: 9 } }
 where: { credentialBlob: { path: ['tier'], equals: 'master' } }
 ```
 
-A path takes a NARROWER operator set than a plain column: `equals`, `gt`, `gte`,
-`lt`, `lte`, `contains`, `startsWith`, `endsWith`, plus `mode`. `not`, `in` and
-`notIn` are refused with `TURBINE_E003` listing what is accepted; express them
-with `NOT` / `OR` around the path filter instead.
+A path takes a DIFFERENT operator set from a plain column: `equals`, `gt`,
+`gte`, `lt`, `lte`, `hasKey`, `contains`, `stringContains`, `stringStartsWith`,
+`stringEndsWith`, plus `mode` (which applies to the three `string*` operators).
+`contains` on a JSON column is containment (`@>`, a whole sub-document such as
+`{ contains: { panel: { seats: 4 } } }`), NOT a substring test; the substring
+operators on a path are `stringContains`, `stringStartsWith` and
+`stringEndsWith`. `not`, `in`, `notIn`, `startsWith` and `endsWith` are refused
+with `TURBINE_E003` listing the accepted set (the last two point at their
+`string*` spelling); express `not` / `in` with `NOT` / `OR` around the path
+filter instead.
 
-`_count` accepts a JSON path, and `groupBy` accepts one as a grouping key via
-`{ field, path }`. **`_avg`, `_sum`, `_min` and `_max` do not work on a JSON
-path**: they reach the database as `avg(jsonb)` and fail there. Cast the value
-into a real column, or aggregate in application code.
+`groupBy` accepts a JSON path as a grouping key via `{ field, path }`, and its
+`_sum`, `_avg`, `_min` and `_max` accept the same `{ field, path }` object under
+an alias key: `_sum: { score: { field: 'tastingNotes', path: ['panel', 'score'] } }`
+comes back as `_sum.score`. `_sum` / `_avg` cast the value to numeric; `_min` /
+`_max` compare as text unless `type: 'numeric'`. **`aggregate()` has no JSON-path
+form**: every key there must be a column (anything else is `TURBINE_E003`) and
+every value `true`; an object value is read as `true`, so the whole column
+reaches the database as `avg(jsonb)` and fails there with a database error, not
+a Turbine code. **`_count` never takes a path**, in `groupBy` or `aggregate()`:
+an object under a `_count` key is read as `true` (a count of that column's
+non-null values) and any path in it is ignored. To count per JSON value, group
+by the path and read `_count`.
 
 ## Aggregates
 

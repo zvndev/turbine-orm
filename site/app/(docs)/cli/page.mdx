@@ -53,7 +53,7 @@ npx turbine init
 npx turbine init --url postgres://user:pass@localhost:5432/mydb
 ```
 
-Re-runs are safe: existing files are detected and their steps skipped. A destructive push keeps the usual typed confirmation.
+Re-runs are safe: existing files are detected and their steps skipped. A destructive push keeps the usual typed confirmation. `init --schema <name>` probes that Postgres schema and writes it into the generated `turbine.config.ts` as `schema: '<name>'`, so the next `push` and `generate` target the same namespace.
 
 ### Flags
 
@@ -365,7 +365,7 @@ If statistics are unavailable or too young to trust, `doctor` says so in one lin
 
 ### `--fix` writes a CONCURRENTLY migration
 
-`--fix` writes a migration that adds the missing indexes with `CREATE INDEX CONCURRENTLY IF NOT EXISTS`. A concurrent build cannot run inside a transaction, so the file carries a `-- turbine:no-transaction` directive and `turbine migrate up` runs it without BEGIN/COMMIT, one statement at a time. The file documents the idempotency requirement, the invalid-index trap, and lock-timeout guidance.
+`--fix` writes a migration that adds the missing indexes. Each one is a `DROP INDEX CONCURRENTLY IF EXISTS` followed by a plain `CREATE INDEX CONCURRENTLY`, deliberately **without** `IF NOT EXISTS`: a concurrent build that fails partway leaves an INVALID index under the requested name, and `IF NOT EXISTS` matches on the name rather than on validity, so a rerun would skip the corpse and record the migration as applied while the index doctor reported is still missing. The DROP is a no-op on the first run (the index does not exist yet, which is why it was proposed) and clears the corpse on a rerun, so rerunning converges on a valid index. A concurrent build cannot run inside a transaction, so the file carries a `-- turbine:no-transaction` directive and `turbine migrate up` runs it without BEGIN/COMMIT, one statement at a time. The file's own comment documents the idempotency requirement, the invalid-index trap, and lock-timeout guidance. The `CREATE INDEX IF NOT EXISTS` line printed in the report itself is a different thing: advice meant for pasting into psql, where there is no rerun and no corpse to skip.
 
 ```bash
 npx turbine doctor --fix

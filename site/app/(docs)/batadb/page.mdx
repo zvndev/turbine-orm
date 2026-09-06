@@ -56,7 +56,7 @@ For Vercel Edge, Cloudflare Workers, Deno Deploy, or any serverless runtime, use
 ```ts
 import { Pool } from '@batadata/serverless';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { SCHEMA } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata.js';
 
 const pool = new Pool({
   apiKey: process.env.BATA_API_KEY,      // bata_…, routes + authorizes the request

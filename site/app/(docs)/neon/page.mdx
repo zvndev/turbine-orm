@@ -48,7 +48,7 @@ For Vercel Edge, Cloudflare Workers, Deno Deploy, or any serverless runtime:
 ```ts
 import { Pool } from '@neondatabase/serverless';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { SCHEMA } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata.js';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const db = turbineHttp(pool, SCHEMA);

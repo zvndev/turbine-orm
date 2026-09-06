@@ -146,7 +146,7 @@ const usersWithPosts = await db.users.findMany({
   where: { orgId: 1 },
   with: {
     posts: {
-      with: { comments: { with: { author: true } } },
+      with: { comments: { with: { user: true } } },
       orderBy: { createdAt: 'desc' },
       limit: 5,
     },
@@ -154,8 +154,10 @@ const usersWithPosts = await db.users.findMany({
 });
 
 // One statement, one round-trip, fully typed all the way down:
-usersWithPosts[0].posts[0].comments[0].author;
+usersWithPosts[0].posts[0].comments[0].user;
 ```
+
+> **Where `user` comes from.** Introspection names a to-one relation after the table it points at, so `comments.user_id` referencing `users.id` becomes `comments.user`, and the reverse side becomes `users.comments`. A name that reads better at the call site, `author` say, is a config rename, not a schema change: add `relationNames: { comments: { user: 'author' } }` to `turbine.config.ts` and run `generate` again. A rename that names a relation that does not exist is an error, never a silent no-op.
 
 Turbine compiles the `with` clause to a single SQL statement using PostgreSQL's `json_agg` and correlated subqueries. No client-side stitching, no N+1. The default `'auto'` strategy keeps that plan, falling back to one flat follow-up statement for a relation whose correlation column has no covering index; the rows are identical either way. Pin `relationLoadStrategy: 'join'` for the single statement unconditionally: [Load strategies](/relations#load-strategy-auto-join-batched-flatten).
 

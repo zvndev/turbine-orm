@@ -22,7 +22,7 @@ These are the surfaces we intend to carry to 1.0 and beyond. We will not break t
 | **Query API** | `findMany`, `findUnique`, `findFirst`, `findUniqueOrThrow`, `findFirstOrThrow`, `create`, `createMany`, `update`, `updateMany`, `delete`, `deleteMany`, `upsert`, `count`, `aggregate`, `groupBy`, including their `where`, `with`, `orderBy`, `select`, `omit`, and `limit`/cursor arguments and the types they return. |
 | **`with`-clause type inference** | The compile-time return types produced by `with`, `select`, and `omit`. We treat a regression in inference as a bug, not a free minor change. |
 | **Typed errors** | The `TurbineError` hierarchy and the **error codes** (`TURBINE_E001`–`TURBINE_E018`). A code, once assigned, keeps its meaning. Structured fields on errors (`.code`, `.docsUrl`, `.columns`, `.constraint`, `.where`, `.cause`) are stable; human-readable `.message` *text* is not (see below). |
-| **CLI commands** | `init`, `generate` / `pull`, `push`, `migrate create\|up\|down\|deploy\|status`, `seed`, `status`, `doctor`, `studio`, `mcp`, `observe`. The migration file format (`-- UP` / `-- DOWN`, timestamp-prefixed `.sql`, SHA-256 checksums in `_turbine_migrations`) is stable. |
+| **CLI commands** | `init`, `generate` / `pull`, `push`, `migrate create\|up\|down\|deploy\|status`, `seed`, `status`, `doctor`, `studio`, `mcp`. The migration file format (`-- UP` / `-- DOWN`, timestamp-prefixed `.sql`, SHA-256 checksums in `_turbine_migrations`) is stable. `observe`, `migrate-from-prisma` and `skill` are tiered Experimental below. |
 | **Client configuration** | `TurbineConfig` fields and the `$transaction`, `$use`, `$on`/`$off`, `pipeline`, and raw-SQL tagged-template APIs on `TurbineClient`. |
 
 ### Experimental surfaces
@@ -32,7 +32,8 @@ These work and are tested, but they are still moving. We may change their API or
 | Surface | Why it's experimental |
 |---|---|
 | **Non-Postgres dialect adapters** (`src/adapters/`, CockroachDB, YugabyteDB) | These ride on PostgreSQL wire compatibility and are not yet covered by a full parity suite. Behavior may change as we expand coverage. |
-| **Observability** (`db.$observe`, the `_turbine_metrics` table, `turbine observe`) | The metric schema, aggregation windows, and dashboard are subject to change. |
+| **Observability** (`db.$observe`, the `_turbine_metrics` table, `turbine observe`) | The metric schema, aggregation windows, and the `turbine observe` dashboard (which needs `TURBINE_OBSERVE_URL` to point at the metrics database) are subject to change. |
+| **Agent skill** (`turbine skill`, the packaged `skills/turbine-orm/SKILL.md`) | The command's flags (`--print`, `--agents`, `--dir`) are few and unlikely to move, but the skill's text is rewritten whenever the ORM's behaviour changes: every sentence in it is executed against a live database before release, so it tracks the current minor by design. Treat the text as documentation, not as a contract. |
 | **Serverless / edge binding** (`turbine-orm/serverless`, `turbineHttp`) | The query API it exposes is Stable; the *driver-binding contract* (which external pools we accept and how) may evolve as serverless Postgres drivers change. |
 | **Non-Postgres engines** (`turbine-orm/sqlite`, `/mysql`, `/mssql`, `/powdb`) | The typed query API is shared with the Postgres path, but each engine's capability boundaries and factory options are still moving, and PowDB tracks a young upstream engine whose supported feature set is version-gated. |
 | **Prisma migration toolkit** (`turbine migrate-from-prisma`, `turbine-orm/prisma-compat`) | The report format, the emitted `PRISMA_MAP` shape, and the set of Prisma behaviors the adapter translates are all expected to grow. It is a migration aid, not a surface to build on long-term. |

@@ -80,7 +80,7 @@ export const PostUpdateSchema = z.object({
 ## Using the schemas
 
 ```ts
-import { PostCreateSchema } from './generated/turbine/zod';
+import { PostCreateSchema } from './generated/turbine/zod.js';
 
 // Validate an untrusted request body before writing
 const data = PostCreateSchema.parse(await req.json());

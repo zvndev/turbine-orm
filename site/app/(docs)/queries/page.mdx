@@ -42,7 +42,7 @@ Under `relationLoadStrategy: 'join'` the whole graph resolves in one SQL stateme
 
 ### Silencing the unlimited-query warning
 
-When `warnOnUnlimited` is enabled, a `findMany` with no `limit` / `take` / `cursor` logs a one-time warning. Silence it for a query you know is bounded:
+When `warnOnUnlimited` is enabled, a `findMany` with no `limit` / `take` / `cursor` logs a warning once per table (a `where` that pins the primary key or a unique column set is exempt, since that query is bounded by the constraint, and so is a client with a `defaultLimit`). This warning is **not** gated on `NODE_ENV`: it fires in production too, because an unbounded read is a production cost. Silence it for a query you know is bounded:
 
 ```ts
 // This one is fine, a tiny lookup table
@@ -63,9 +63,9 @@ const page = await db.users.findMany({ limit: 20, offset: 40 });
 const page = await db.users.findMany({ orderBy: { id: 'asc' }, limit: 20, offset: 40 });
 ```
 
-`cursor` and `distinct` queries are exempt (both impose their own ordering semantics). The warning is gated exactly like `warnOnUnlimited` (per-call, per-table, global), deduped per table and shape, and silent under `NODE_ENV=production`.
+`distinct` queries are exempt (`DISTINCT ON` imposes its own ordering). A `cursor` with no `orderBy` is **not** exempt, and is the worse case: the seek compares against rows the engine may return in any order, so the page skips and repeats rows, and the warning's suggested `orderBy` names the cursor field rather than the primary key. The warning is gated exactly like `warnOnUnlimited` (per-call, per-table, global) and deduped per table and shape, but unlike `warnOnUnlimited` it is silent under `NODE_ENV=production`.
 
-To fix it globally instead of per query, set **`implicitPkOrdering: true`** on the client. Turbine then adds `ORDER BY <primary key> ASC` (every column of a composite key, in declaration order) to any paginating `findMany` that declares no `orderBy`, and the warning stops firing. An explicit `orderBy` always wins, and a table with no primary key is left alone.
+To fix it globally instead of per query, set **`implicitPkOrdering: true`** on the client. Turbine then adds `ORDER BY <primary key> ASC` (every column of a composite key, in declaration order) to any paginating `findMany` that declares no `orderBy`, and the warning stops firing. An explicit `orderBy` always wins, and a table with no primary key is left alone. A single-field `cursor` is ordered by its own field rather than by the primary key, the only ordering coherent with the seek; a multi-field cursor with no `orderBy` gets nothing injected, because its key precedence has to come from `orderBy`, and the warning stays.
 
 ```ts
 const db = turbine({ connectionString: process.env.DATABASE_URL, implicitPkOrdering: true });
@@ -173,7 +173,7 @@ const page2 = await db.posts.findMany({
 });
 ```
 
-For deep pagination, `cursor` is the keyset alternative: pass the column values of the last row you saw, and Turbine adds one comparison per cursor field (`>` for ascending order, `<` for descending, direction taken from `orderBy`). The cursor row itself is **excluded**, so the next page starts immediately after it:
+For deep pagination, `cursor` is the keyset alternative: pass the column values of the last row you saw, and Turbine compiles a seek over the cursor fields (`>` for ascending order, `<` for descending, direction taken from `orderBy`). The cursor row itself is **excluded**, so the next page starts immediately after it:
 
 ```ts
 const firstPage = await db.posts.findMany({
@@ -188,7 +188,7 @@ const nextPage = await db.posts.findMany({
 });
 ```
 
-Multiple cursor fields combine with `AND`. Use a unique (or unique-in-combination) column in `cursor` + `orderBy` so the ordering is total; unlike `OFFSET 100000`, a keyset page never scans the skipped rows.
+A multi-field cursor is a **keyset seek**, not a conjunction: for `orderBy: [{ viewCount: 'asc' }, { id: 'asc' }]` and `cursor: { viewCount, id }` the predicate is `(view_count > $1 OR (view_count = $1 AND id > $2))`, with `<` for a `desc` field, so rows that tie on the leading key are not skipped. Field precedence comes from `orderBy`; a cursor field the `orderBy` does not name trails the named ones and seeks ascending, and each value is bound once however many branches reference it. End the `orderBy` with a unique column (or a unique combination) so the ordering is total; unlike `OFFSET 100000`, a keyset page never scans the skipped rows. Before 0.78 a multi-field cursor joined its comparisons with `AND`, which dropped every row whose leading key equalled the cursor's; if you paged over a low-cardinality leading key, the pages now contain the rows they used to miss.
 
 ### distinct
 
@@ -511,6 +511,8 @@ const stats = await db.posts.aggregate({
 On a **PII-tagged** column, `_min` / `_max` require `includePii: UNSAFE`;
 `_count` and `where` need no opt-in. See [PII fields](#pii-fields-includepii).
 
+`_sum` / `_avg` return a `number` over `int2` / `int4` / `float` columns and an exact **string** over `int8` / `bigint` and `numeric` / `decimal` columns, where PostgreSQL computes the result as `numeric` and `Number()` would round it; `_min` / `_max` return the column's own type, so `_max` of a `bigint` is a string too. The same rule, with the reasoning, is under [groupBy](#groupby).
+
 ## groupBy
 
 Group rows by one or more columns and compute aggregations per group. Similar to SQL `GROUP BY` with aggregate functions.
@@ -529,13 +531,15 @@ Grouping **by** a PII-tagged column, or `_min` / `_max` over one, requires
 `includePii: UNSAFE`; `where` / `orderBy` / `having` stay unrestricted. See
 [PII fields](#pii-fields-includepii).
 
-The result row is **fully typed** from the args, no `as const` needed: each `by` field carries its entity field type, `_count` is a `number`, `_sum` / `_avg` fields are `number | null` (an aggregate over zero matching rows is null), and `_min` / `_max` fields carry the field's own type. The call above infers:
+The result row is **fully typed** from the args, no `as const` needed: each `by` field carries its entity field type, `_count` is a `number`, `_sum` / `_avg` fields are `number | string | null`, and `_min` / `_max` fields carry the field's own type. The call above infers:
 
 ```ts
 // { userId: number; _count: number;
-//   _sum: { viewCount: number | null };
-//   _avg: { score: number | null } }[]
+//   _sum: { viewCount: number | string | null };
+//   _avg: { score: number | string | null } }[]
 ```
+
+The `string` in `_sum` / `_avg` is the exact-value rule the rest of the read path already follows: over an `int8` / `bigint` or a `numeric` / `decimal` column, PostgreSQL returns the sum and the average as `numeric` text, and `Number()` would round anything past 15 significant digits (a `SUM(bigint)` clears 2^53 easily), so the text is passed through verbatim. Over `int2` / `int4` / `float` columns the value is a `number`, and an aggregate over zero matching rows is `null` either way. Before 0.78 every `_sum` / `_avg` was coerced with `Number()`, so a bigint total came back rounded with no error.
 
 Grouping by a JSON path yields a runtime alias that cannot be typed, so those columns are left off the row type; cast the result.
 
@@ -812,6 +816,8 @@ Because this is a type-level guarantee, `tsx` and other transpile-only runners w
 | `in` | Match any value in the array | `where: { id: { in: [1, 2, 3] } }` |
 | `notIn` | Match none of the values | `where: { role: { notIn: ['banned', 'spam'] } }` |
 
+`mode: 'insensitive'` applies to `equals`, `not`, `in` and `notIn` on string columns as well as to the substring operators; see [String](#string). Before 0.78 it was read only by `contains` / `startsWith` / `endsWith` and silently ignored beside the others.
+
 ### Comparison
 
 | Operator | Description | Example |
@@ -828,7 +834,7 @@ Because this is a type-level guarantee, `tsx` and other transpile-only runners w
 | `contains` | Substring match (`LIKE %v%`) | `where: { title: { contains: 'sql' } }` |
 | `startsWith` | Prefix match (`LIKE v%`) | `where: { email: { startsWith: 'admin@' } }` |
 | `endsWith` | Suffix match (`LIKE %v`) | `where: { email: { endsWith: '@acme.com' } }` |
-| `mode: 'insensitive'` | Switch any string operator to `ILIKE` | `where: { title: { contains: 'SQL', mode: 'insensitive' } }` |
+| `mode: 'insensitive'` | Case-insensitive match. On `contains` / `startsWith` / `endsWith` the `LIKE` becomes `ILIKE` (or the engine's equivalent); on `equals` (or a bare string), `not`, `in` and `notIn` both sides are folded with `LOWER(...)`, so `{ equals: 'ada', mode: 'insensitive' }` matches `Ada`. String columns only: `mode` beside a non-string operand is `TURBINE_E003`. | `where: { title: { contains: 'SQL', mode: 'insensitive' } }` |
 
 LIKE wildcards in user input (`%`, `_`, `\`) are escaped automatically.
 
@@ -975,6 +981,16 @@ where: {
   OR: [{ role: 'owner' }, { role: 'admin' }],
   NOT: { deletedAt: { not: null } },
 }
+```
+
+An **empty** combinator adds no predicate: `OR: []`, `AND: []`, `NOT: {}` and `NOT: []` each compile to nothing, so `where: { OR: [] }` on its own returns **every row**. Prisma agrees for `AND` and `NOT` but not for `OR`, where an empty list matches nothing. A filter list assembled from user selections therefore needs an explicit decision about zero selections:
+
+```ts
+const picked = selectedRoles.map((role) => ({ role }));
+const rows = await db.users.findMany({
+  // OR: [] would return every user, so say what zero selections means.
+  where: picked.length > 0 ? { OR: picked } : { id: { in: [] } }, // in: [] matches nothing
+});
 ```
 
 ## Nested `with`
@@ -1152,7 +1168,7 @@ const db = turbine({
 | `preparedStatements` | `true` for Turbine-owned pools, `false` for external pools | Submit queries as `{ name, text, values }` so Postgres caches the parse and plan per backend connection. |
 | `sqlCache` | `true` | The per-table SQL template cache. Setting `false` is the kill switch. |
 | `sqlCacheSize` | `1000` | How many distinct query **shapes** each table's LRU retains. Values are parameterized, so they never fragment the cache. `0` is equivalent to `sqlCache: false`; a negative value falls back to the default. |
-| `implicitPkOrdering` | `false` | Order a paginating `findMany` that declares no `orderBy` by the primary key ascending, making its pages [deterministic](#deterministic-pages-the-unordered-pagination-warning). An explicit `orderBy` wins; PK-less tables, `cursor` and `distinct` shapes are untouched. |
+| `implicitPkOrdering` | `false` | Order a paginating `findMany` that declares no `orderBy` by the primary key ascending, making its pages [deterministic](#deterministic-pages-the-unordered-pagination-warning). An explicit `orderBy` wins; PK-less tables and `distinct` shapes are untouched, a single-field `cursor` is ordered by its own field, and a multi-field cursor with no `orderBy` gets nothing injected. |
 | `planCacheMode` | unset (Turbine sends nothing) | **Postgres only.** Pin `plan_cache_mode` on every connection this client opens: `'auto'`, `'force_custom_plan'`, `'force_generic_plan'`. The remedy for [the generic-plan cliff](/relations#the-generic-plan-cliff-plancachemode). Any other value throws `ValidationError` at construction; a non-Postgres engine throws `UnsupportedFeatureError` (`TURBINE_E017`). |
 | `utcTimestamps` | `true` | Read and write zone-less `timestamp` / `date` columns as UTC rather than in the process's local zone. Process-wide, not per client. See [Zone-less columns](/schema#zone-less-columns-timestamp-and-date-read-as-utc). |
 | `temporalInfinity` | `'preserve'` | How a Postgres temporal `infinity` / `-infinity` is handed back: `'preserve'` (the round-trip-safe JS numbers `Infinity` / `-Infinity`, so `.toISOString()` throws on those rows) or `'null'` (serializes cleanly, but indistinguishable from a stored `NULL`). Leaving it unset selects `'preserve'` and a one-time warning the first time a stored infinity is read. See [`infinity` and `-infinity`](/schema#infinity-and--infinity). |

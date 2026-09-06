@@ -8,6 +8,8 @@ Turbine compiles typed queries straight to SQL. There is no query engine, no WAS
 npm install turbine-orm
 ```
 
+Turbine is **pre-1.0** (`0.x`). Which surfaces hold steady across minors, which are Experimental, and what has to be true before 1.0: [STABILITY.md](STABILITY.md).
+
 **Docs: [turbineorm.dev](https://turbineorm.dev)** · [Quick Start](https://turbineorm.dev/quickstart) · [Why Turbine](https://turbineorm.dev/why-turbine) · [API Reference](https://turbineorm.dev/queries) · [Relations](https://turbineorm.dev/relations) · [AI Agents](https://turbineorm.dev/ai-agents) · [Benchmarks](https://turbineorm.dev/benchmarks) · [Errors](https://turbineorm.dev/errors)
 
 **Contents:** [Why Turbine](#why-turbine) · [Benchmarks](#benchmarks) · [Quick Start](#quick-start) · [Queries](#queries) · [Built for agents](#built-for-agents) · [Safety tooling](#safety-tooling) · [Postgres features](#postgres-features) · [Serverless and edge](#serverless-and-edge) · [Database engines](#database-engines) · [From scratch, and forkable](#from-scratch-and-forkable) · [Comparison](#comparison) · [Limitations](#limitations) · [Requirements](#requirements) · [Contributing](#contributing)
@@ -16,7 +18,7 @@ npm install turbine-orm
 
 Six reasons, each with the mechanism that makes it true:
 
-1. **One dependency.** `dependencies` is `{ "pg": "^8.13.1" }`. No engine binary, no WASM compiler, no adapter packages in lockstep. The optional engines (SQLite, MySQL, SQL Server, PowDB) are peer dependencies or Node builtins you install only if you use them.
+1. **One dependency.** `dependencies` is `{ "pg": "^8.13.1" }`. No engine binary, no WASM compiler, no adapter packages in lockstep. The optional engines (SQLite, MySQL, SQL Server, PowDB, all tiered Experimental in [STABILITY.md](STABILITY.md)) are peer dependencies or Node builtins you install only if you use them.
 2. **Written from scratch.** Turbine is not a layer over Knex or a query-builder library. Query compilation is plain string building with an FNV-1a shape fingerprint into a bounded LRU of SQL templates, so there is no plan cache to size and no compiler running on your event loop.
 3. **Nested relations in one statement.** A `with` clause compiles to correlated `json_agg` subqueries, so users with posts with comments is one round trip, typed end to end: `users[0].posts[0].comments[0].author.name` autocompletes with no annotation.
 4. **Close to raw SQL.** In the last published run, Turbine's overhead over a hand-written `pg` control was 1.08x by geometric mean. The table is below; the losses are stated with the wins.
@@ -58,6 +60,7 @@ Reproduce it: `cd benchmarks && npm install && npx prisma generate && DATABASE_U
 ```bash
 npm install turbine-orm
 npm install --save-dev tsx        # the CLI loads .ts config/schema files via tsx
+npm pkg set type=module           # the snippet below uses top-level await: ESM, or save it as a .mts file
 
 npx turbine init --url postgres://user:pass@localhost:5432/mydb
 npx turbine generate              # introspect the DB, emit a typed client
@@ -103,9 +106,9 @@ const users = await db.users.findMany({
 // users[0].posts[0].comments is typed, and this was one SQL statement
 ```
 
-Per-relation `where`, `orderBy`, `limit`, `select`, and `omit` work at every depth. Many-to-many junction tables are auto-detected during `generate`, and self-referencing FKs give you parent and children relations. Relation filters (`some` / `every` / `none`) filter parents by their children.
+Per-relation `where`, `orderBy`, `limit`, `select`, and `omit` work at every depth. Many-to-many junction tables are auto-detected during `generate`, and a self-referencing FK (`users.manager_id` referencing `users.id`) gives you both directions, named `user` (to-one) and `users` (to-many) by default and renameable in `turbine.config.ts`. Relation filters (`some` / `every` / `none`) filter parents by their children.
 
-Four load strategies produce identical rows: `join` (one statement), `batched` (one flat follow-up per relation), `flatten` (LEFT JOIN for eligible to-one relations), and `auto` (the default: the join plan, falling back to batched per relation when the correlation column has no covering index). A differential fuzz suite holds the strategies to byte-identical output. Details: [turbineorm.dev/relations](https://turbineorm.dev/relations).
+Four load strategies produce identical rows: `join` (one statement), `batched` (one flat follow-up per relation), `flatten` (LEFT JOIN for eligible to-one relations), and `auto` (the default: the join plan, falling back to batched per relation when the correlation column has no covering index). A differential fuzz suite holds `join`, `batched` and `auto` to byte-identical output on every release and nightly; `flatten` is held to the same parity by its own deterministic suite (`src/test/flatten-parity.integration.test.ts`). Details: [turbineorm.dev/relations](https://turbineorm.dev/relations).
 
 ### Writes, including atomic operators
 
@@ -214,7 +217,7 @@ try {
 }
 ```
 
-Every error extends `TurbineError` with a stable code (`TURBINE_E001` through `E018`) and a `docsUrl`. Error messages carry keys, never values: a `NotFoundError` says `where: { id, email }` without printing the email, so errors are safe to forward to a tracker without a scrubbing rule. Retryable failures (`DeadlockError`, `SerializationFailureError`) expose `isRetryable: true` as a typed const. Full table: [turbineorm.dev/errors](https://turbineorm.dev/errors).
+Every error extends `TurbineError` with a stable code (`TURBINE_E001` through `E018`) and a `docsUrl`. Error messages carry keys, never values: a `NotFoundError` says `where: { id, email }` without printing the email, so errors are safe to forward to a tracker without a scrubbing rule. Retryable failures (`DeadlockError`, `SerializationFailureError`) expose `isRetryable: true` as a typed const. `err.code` is the check that survives a mixed ESM/CJS module graph, where two copies of the package hold two copies of every class; since 0.78 `instanceof` works across copies too, through a cross-copy brand on every error. Full table: [turbineorm.dev/errors](https://turbineorm.dev/errors).
 
 ## Built for agents
 
@@ -284,7 +287,7 @@ HTTP drivers cannot hold a cursor or a LISTEN connection, so `findManyStream` an
 
 ## Database engines
 
-Postgres is the default and primary target. The same typed API also runs on **SQLite** (Node's built-in `node:sqlite`, zero extra installs, Node ≥ 22.5), **MySQL 8** (`mysql2`), **SQL Server 2016+** (`mssql`), and **PowDB** (embedded or networked), each behind a subpath export with its driver as an optional peer:
+Postgres is the default and primary target. The same typed API also runs on **SQLite** (Node's built-in `node:sqlite`, zero extra installs, Node ≥ 22.5), **MySQL 8** (`mysql2`), **SQL Server 2016+** (`mssql`), and **PowDB** (embedded or networked), each behind a subpath export with its driver as an optional peer. All four are **Experimental** in the [stability policy](STABILITY.md): the query API they expose is the shared one, but each engine's capability boundaries and factory options may still change in a minor release.
 
 ```bash
 npm install turbine-orm                        # SQLite needs nothing else
@@ -318,7 +321,7 @@ const schema = defineSchema({
   },
   posts: {
     id: { type: 'serial', primaryKey: true },
-    // "table.column" — this is what makes `with: { posts: true }` work below.
+    // "table.column": this is what makes `with: { posts: true }` work below.
     userId: { type: 'integer', notNull: true, references: 'users.id' },
     title: { type: 'text', notNull: true },
   },
@@ -406,6 +409,7 @@ Stated so you do not find out three weeks in:
 - Node.js ≥ 20 (the SQLite engine needs ≥ 22.5 for `node:sqlite`)
 - PostgreSQL ≥ 14 tested; CI runs the integration suite against PostgreSQL 14, 15, 16, and 17
 - ESM and CommonJS both supported
+- `@types/node` in `devDependencies` when you typecheck with `skipLibCheck: false`: the `turbine-orm/sqlite` engine and the `turbine-orm/cli` declarations reference Node's own types (`node:sqlite`, `NodeJS`)
 
 ## Contributing
 
