@@ -1980,15 +1980,25 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // Query-level opt-in threaded onto every follow-up child `buildFindMany`,
       // so a batched load excludes/includes PII exactly as the join strategy.
       includePii,
-      tableGlobalFilter: (table, alias, precedingParams) => {
+      // `ref` is the follow-up query's FROM-item AS THE SQL REFERS TO IT: the
+      // quoted child table for a hasMany `_count`, the bare junction alias `t`
+      // for the m2m one. Compiled through the rendered-reference scope, which
+      // uses it verbatim for the column qualifier and for a nested relation
+      // filter's correlation parent alike. It went through the BARE-alias scope
+      // before, which quotes what it is given, so a `globalFilters` entry that
+      // was itself a relation filter emitted `"""posts"""` into the EXISTS
+      // body and the count failed 42P01. Reproduced live; the plain batched
+      // relation fetch was never affected, because that one goes through the
+      // child's own buildFindMany and merges the filter unqualified.
+      tableGlobalFilter: (table, ref, precedingParams) => {
         const gf = this.resolveGlobalFilter(table, resolvedSkip);
         if (!gf) return null;
         const meta = this.schema.tables[table];
         if (!meta) return null;
-        // Seed the param array with `precedingParams` placeholders so
-        // buildAliasWhere numbers the gf params after the already-bound ones.
+        // Seed the param array with `precedingParams` placeholders so the
+        // builder numbers the gf params after the already-bound ones.
         const seeded: unknown[] = new Array(precedingParams).fill(undefined);
-        const clause = this.buildAliasWhere(table, meta, alias, gf, seeded);
+        const clause = whereMod.buildRenderedRefWhere(this.ctx, table, meta, ref, gf, seeded);
         if (!clause) return null;
         return { clause, params: seeded.slice(precedingParams) };
       },

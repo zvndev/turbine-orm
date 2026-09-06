@@ -1064,8 +1064,24 @@ export function relationWhereScope(
   };
 }
 
-/** Build the scope for a relation `with`-clause `where` compiled against `alias`. */
+/**
+ * Build the scope for a relation `with`-clause `where` compiled against
+ * `alias`. The alias is BARE (`t0`), never a rendered reference: this scope
+ * quotes it itself for the nested-relation correlation parent, so a caller
+ * that hands over an already-quoted name gets `"""posts"""` inside an EXISTS
+ * body and a 42P01 that names the table three times. That happened twice, on
+ * two independent paths, from the same one-parameter-two-meanings ambiguity,
+ * so the ambiguity is refused here rather than corrected at each call site.
+ * A caller that genuinely holds a rendered reference wants
+ * {@link renderedRefWhereScope}.
+ */
 export function aliasWhereScope(qi: BuilderCtx, targetTable: string, meta: TableMetadata, alias: string): WhereScope {
+  if (alias.includes('"')) {
+    throw new ValidationError(
+      `Internal: aliasWhereScope was given the rendered reference ${alias} for table "${targetTable}", ` +
+        'but it takes a bare alias and quotes it itself. Use renderedRefWhereScope for an already-quoted reference.',
+    );
+  }
   return {
     meta,
     table: targetTable,
@@ -1078,6 +1094,48 @@ export function aliasWhereScope(qi: BuilderCtx, targetTable: string, meta: Table
     host: scopedWhereHost(qi, meta),
     unknownColumn: (field) => new ValidationError(`Unknown column "${field}" in where for table "${targetTable}"`),
   };
+}
+
+/**
+ * The scope for a `where` compiled against an ALREADY-RENDERED FROM-item
+ * reference: `"users"` inside `ON CONFLICT ... DO UPDATE`, or the quoted child
+ * table a batched follow-up selects from. One parameter with one meaning, used
+ * verbatim for the column qualifier AND for a nested relation filter's
+ * correlation parent, which is exactly the pair {@link aliasWhereScope} gets
+ * wrong when it is handed a rendered reference.
+ *
+ * It is {@link relationWhereScope} with the unknown-column wording of a plain
+ * `where`, because the filters compiled through it are `globalFilters` entries
+ * and a misconfigured one should read the same here as it does on the `update`
+ * path.
+ */
+export function renderedRefWhereScope(
+  qi: BuilderCtx,
+  targetTable: string,
+  meta: TableMetadata,
+  targetRef: string,
+): WhereScope {
+  return {
+    ...relationWhereScope(qi, targetTable, meta, targetRef),
+    unknownColumn: (field: string) =>
+      new ValidationError(`Unknown column "${field}" in where for table "${targetTable}"`),
+  };
+}
+
+/**
+ * Compile `where` against an already-rendered FROM-item reference. The seam
+ * both global-filter callers that hold one go through, so neither can reach
+ * {@link aliasWhereScope} by mistake again.
+ */
+export function buildRenderedRefWhere(
+  qi: BuilderCtx,
+  targetTable: string,
+  targetMeta: TableMetadata,
+  targetRef: string,
+  where: Record<string, unknown>,
+  params: unknown[],
+): string | null {
+  return buildScopedWhere(qi, renderedRefWhereScope(qi, targetTable, targetMeta, targetRef), where, params);
 }
 
 /**
