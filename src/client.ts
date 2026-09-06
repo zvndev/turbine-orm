@@ -2142,6 +2142,13 @@ export class TurbineClient {
    * replicas are configured this simply returns the client itself (already
    * primary-only). The view is cached, repeated calls return the same instance.
    *
+   * Typed as `this` so a generated subclass keeps its declared table accessors
+   * through the call (`db.$primary().users`, the form in the example below).
+   * With the base class as the return type the accessors were gone and the only
+   * typed route was `db.$primary().table('users')`. The view is a base-class
+   * instance built from the same schema, so at runtime it carries every table
+   * accessor the subclass `declare`s; the cast states exactly that.
+   *
    * @example
    * ```ts
    * await db.users.create({ data: { email: 'a@b.com' } });
@@ -2149,7 +2156,7 @@ export class TurbineClient {
    * const user = await db.$primary().users.findFirst({ where: { email: 'a@b.com' } });
    * ```
    */
-  $primary(): TurbineClient {
+  $primary(): this {
     if (this.replicaPools.length === 0) return this;
     if (!this.primaryView) {
       this.primaryView = new TurbineClient(
@@ -2157,7 +2164,7 @@ export class TurbineClient {
         this.schema,
       );
     }
-    return this.primaryView;
+    return this.primaryView as this;
   }
 
   // -------------------------------------------------------------------------

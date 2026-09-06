@@ -58,7 +58,7 @@ If another writer bumped `version` after you read it, the `version = $3` predica
 
 ## Handling a conflict
 
-`OptimisticLockError` is `TURBINE_E015`. It carries the `table`, the `versionField`, and the `expectedVersion` you supplied.
+`OptimisticLockError` is `TURBINE_E015`. It carries the `table`, the `versionField`, and the `expectedVersion` you supplied. Under the default `errorMessages: 'safe'` the message names the version field but not the value you sent (a version can be a timestamp or any stored cell, so it is treated like one); the value stays on `.expectedVersion` and `.detail` in both modes.
 
 ```ts
 import { OptimisticLockError } from 'turbine-orm';

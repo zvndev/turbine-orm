@@ -15,7 +15,7 @@ npx turbine seed
 
 ## `defineSeed`, TypeScript seeds
 
-`defineSeed` wraps a function that receives a connected client. It reads `DATABASE_URL`, runs your function, and disconnects when it's done. You don't manage the connection lifecycle.
+`defineSeed` wraps a function that receives a connected client. It reads `DATABASE_URL`, runs your function, and disconnects when it's done. You don't manage the connection lifecycle. When `turbine.config.ts` sets a `schema` other than `public`, `turbine seed` connects with `search_path` pinned to it through the connection's startup parameters (`options=-c search_path="<schema>"`, never a `SET`), so unqualified table names in the seed land in the same schema `push`, `generate` and `migrate` use.
 
 ```ts
 // seed.ts

@@ -60,6 +60,33 @@ export interface PgPoolClient {
   release(err?: Error | boolean): void;
 }
 
+/**
+ * Marks a client this module could not hand back in a reusable state, so the
+ * caller releases it WITH an error and the pool drops it instead of lending it
+ * out again.
+ *
+ * A symbol, and `Symbol.for` so an ESM and a CJS copy of this module agree on
+ * it (the same reason the internal-combinator brand uses one). Set only when
+ * the backend still reports an open or aborted transaction after this module
+ * has done what it can, which after {@link runPipelined}'s rollback means the
+ * rollback itself did not take.
+ */
+const PIPELINE_DISCARD = Symbol.for('turbine.pipeline.discardClient');
+
+/** Did {@link runPipelined} leave this client unusable? See {@link PIPELINE_DISCARD}. */
+export function pipelineClientNeedsDiscard(client: unknown): boolean {
+  return (
+    typeof client === 'object' && client !== null && (client as Record<symbol, unknown>)[PIPELINE_DISCARD] === true
+  );
+}
+
+/**
+ * The `ReadyForQuery` transaction-status byte: `I` idle, `T` inside a
+ * transaction block, `E` inside a FAILED transaction block. Absent when the
+ * emitter does not carry one (a test double), which is treated as "unknown".
+ */
+type TransactionStatus = 'I' | 'T' | 'E' | undefined;
+
 // ---------------------------------------------------------------------------
 // Event names we intercept
 // ---------------------------------------------------------------------------
@@ -206,6 +233,12 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
     // Whether cleanup has already been performed
     let cleaned = false;
 
+    /** Transaction status reported by the most recent ReadyForQuery. */
+    let txStatus: TransactionStatus;
+
+    /** Whether the recovery ROLLBACK has already been sent (it is sent at most once). */
+    let rollbackSent = false;
+
     /**
      * Map commandComplete index to the corresponding results[] index.
      * In transactional mode: index 0 = BEGIN, 1..N = queries, N+1 = COMMIT
@@ -250,6 +283,60 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
     // -----------------------------------------------------------------------
     // Finalize: called on final readyForQuery
     // -----------------------------------------------------------------------
+
+    /**
+     * Return the connection to the pool in a state the next borrower can use.
+     *
+     * The hazard this exists for: a transactional batch is `BEGIN` + queries +
+     * `COMMIT` + ONE `Sync`, so a query error makes the backend skip everything
+     * up to that Sync, the `COMMIT` included, and the connection goes back to
+     * the pool `idle in transaction (aborted)`. The next borrower's first
+     * statement then failed with `25P02`, a `$transaction` that landed on it
+     * lost its write, and a non-transactional pipeline failed every slot and
+     * released it still aborted, so the poisoning survived indefinitely.
+     *
+     * The recovery is one `ROLLBACK` on the same connection, sent AFTER the
+     * ReadyForQuery that says the backend will accept a new statement, and
+     * waited for: its own ReadyForQuery brings us back here with `I`. That
+     * keeps the connection, which matters at small pool sizes where discarding
+     * is a reconnect on the caller's next query.
+     *
+     * Returns true when the caller should finalize now, false when a rollback
+     * is in flight and the next ReadyForQuery will finish the job.
+     */
+    function settleTransactionState(): boolean {
+      // `I` (idle) is the ordinary case and needs nothing, and neither does a
+      // batch that had no error: transactional mode's COMMIT closed the
+      // transaction, non-transactional mode never opened one. That keeps the
+      // happy path at exactly one round trip, which a `ROLLBACK`-on-unknown
+      // would have cost an extra Sync (caught by the cork/uncork test). A real
+      // backend always sends the status byte; an emitter without one is only
+      // ever a test double.
+      if (txStatus === 'I') return true;
+      if (txStatus === undefined && !(transactional && pipelineError)) return true;
+      if (!transactional || rollbackSent) {
+        // Either nothing to roll back (non-transactional mode opens no
+        // transaction of its own), or the rollback already ran and did not
+        // clear the status. Hand the client back marked for disposal.
+        if (txStatus === 'E' || txStatus === 'T') {
+          Object.defineProperty(client, PIPELINE_DISCARD, { value: true, enumerable: false, configurable: true });
+        }
+        return true;
+      }
+      rollbackSent = true;
+      try {
+        connection.parse({ text: 'ROLLBACK', name: '' });
+        connection.bind({ portal: '', statement: '', values: [], valueMapper: prepareValue });
+        connection.execute({ portal: '', rows: 0 });
+        connection.sync();
+        return false;
+      } catch {
+        // The socket would not take the rollback, so this connection cannot be
+        // repaired from here. Mark it and let the caller drop it.
+        Object.defineProperty(client, PIPELINE_DISCARD, { value: true, enumerable: false, configurable: true });
+        return true;
+      }
+    }
 
     function finalize(): void {
       cleanup();
@@ -390,11 +477,17 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
       // We don't use row-limited portals
     }
 
-    function onReadyForQuery(): void {
-      rfqCount++;
-      if (rfqCount >= expectedRfq) {
+    function onReadyForQuery(msg?: { status?: string }): void {
+      txStatus = msg?.status as TransactionStatus;
+      // The recovery ROLLBACK's own ReadyForQuery is not one of the batch's, so
+      // it must not advance the counter that decides when the batch is done.
+      if (rollbackSent) {
         finalize();
+        return;
       }
+      rfqCount++;
+      if (rfqCount < expectedRfq) return;
+      if (settleTransactionState()) finalize();
     }
 
     // -----------------------------------------------------------------------

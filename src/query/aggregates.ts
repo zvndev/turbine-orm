@@ -249,7 +249,7 @@ export function buildGroupBy<T extends object>(
         // would emit two "_sum_total_price" columns and silently drop one.
         claimResultKey(`${aggKey}_${col}`, `${aggKey} of column "${col}"`);
         const inner = `${sqlFn}(${qi.q(col)})`;
-        const expr = aggKey === '_avg' ? qi.castAgg(inner, 'float') : inner;
+        const expr = aggKey === '_avg' ? plainAvgExpr(qi, col) : inner;
         selectExprs.push(`${expr} AS ${qi.q(`${aggKey}_${col}`)}`);
         // Canonical field, matching the result bucket the transform fills;
         // `orderBy` may spell it either way (see {@link lookupGroupKey}).
@@ -372,12 +372,18 @@ export function buildGroupBy<T extends object>(
         const fieldFor = (rawKey: string, col: string): string =>
           jsonAgg(rawKey)?.field ?? qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
 
+        // A JSON-path `_sum` / `_avg` casts its extracted text to numeric in
+        // SQL and is always a number; a plain column follows its source type
+        // (see {@link isExactNumericType}).
+        const sumAvg = (rawKey: string, rawValue: unknown): number | string | null =>
+          jsonAgg(rawKey) ? (rawValue !== null ? Number(rawValue) : null) : sumAvgValue(qi, rawKey.slice(5), rawValue);
+
         for (const [rawKey, rawValue] of Object.entries(row)) {
           if (rawKey.startsWith('_sum_')) {
-            sumObj[fieldFor(rawKey, rawKey.slice(5))] = rawValue !== null ? Number(rawValue) : null;
+            sumObj[fieldFor(rawKey, rawKey.slice(5))] = sumAvg(rawKey, rawValue);
             hasSums = true;
           } else if (rawKey.startsWith('_avg_')) {
-            avgObj[fieldFor(rawKey, rawKey.slice(5))] = rawValue !== null ? Number(rawValue) : null;
+            avgObj[fieldFor(rawKey, rawKey.slice(5))] = sumAvg(rawKey, rawValue);
             hasAvgs = true;
           } else if (rawKey.startsWith('_min_')) {
             const j = jsonAgg(rawKey);
@@ -1022,6 +1028,53 @@ function temporalAggValue(qi: BuilderCtx, col: string, value: unknown): unknown 
   return value;
 }
 
+/**
+ * Whether `SUM` / `AVG` over a column of `pgType` is EXACT on the wire and must
+ * not be narrowed to a JS number.
+ *
+ * PostgreSQL widens both past their input: over int8 they are `numeric`, over
+ * numeric they stay `numeric`. (An int2 / int4 sum is int8 and its average
+ * `numeric` too, but those totals fit a double, which is the line this draws.)
+ * The driver delivers `numeric` as its exact text, because no parser is
+ * registered for it, deliberately: the type is arbitrary-precision. `Number()`
+ * over that text rounded a `SUM(int8)` of 461168601842738790350 to
+ * 461168601842738800000 and a numeric(12,2) total of 1020.50 to 1020.5, while
+ * `_min` / `_max` on the very same columns came back exact, because they hand
+ * the driver's value through untouched.
+ *
+ * So for these source types the aggregate is returned as the driver delivered
+ * it (on PostgreSQL the text, a string; an engine whose driver already hands
+ * back a number keeps that number) and `_avg` is not cast to float in SQL,
+ * which would otherwise round on the server before the value reached the
+ * wire. Every other type keeps `Number()` and the cast. Spelled for every
+ * engine's type names: the PostgreSQL `udt_name` (`int8`, `numeric`) and the
+ * SQL names the other dialects report (`bigint`, `decimal`), with case and any
+ * `(precision, scale)` suffix ignored. JSON-path aggregates never reach this:
+ * they cast the extracted text to numeric themselves and stay numbers.
+ */
+function isExactNumericType(pgType: string): boolean {
+  const paren = pgType.indexOf('(');
+  const base = (paren === -1 ? pgType : pgType.slice(0, paren)).trim().toLowerCase();
+  return base === 'int8' || base === 'bigint' || base === 'numeric' || base === 'decimal';
+}
+
+/** `AVG(col)`, float-cast unless the source column is exact (see {@link isExactNumericType}). */
+function plainAvgExpr(qi: BuilderCtx, col: string): string {
+  const inner = `AVG(${qi.q(col)})`;
+  return isExactNumericType(whereMod.getColumnPgType(qi, col)) ? inner : qi.castAgg(inner, 'float');
+}
+
+/**
+ * A `_sum` / `_avg` value over a plain column: the driver's value verbatim
+ * for an exact source type (see {@link isExactNumericType}), a JS number for
+ * every other, `null` for an aggregate over zero rows.
+ */
+function sumAvgValue(qi: BuilderCtx, col: string, value: unknown): number | string | null {
+  if (value === null || value === undefined) return null;
+  if (isExactNumericType(whereMod.getColumnPgType(qi, col))) return value as number | string;
+  return Number(value);
+}
+
 export function buildAggregate<T extends object>(
   qi: BuilderCtx,
   args: AggregateArgs<T>,
@@ -1086,7 +1139,7 @@ export function buildAggregate<T extends object>(
     for (const [field, enabled] of Object.entries(args._avg)) {
       if (enabled) {
         const col = qi.toColumn(field);
-        selectExprs.push(`${qi.castAgg(`AVG(${qi.q(col)})`, 'float')} AS ${qi.q(`_avg_${col}`)}`);
+        selectExprs.push(`${plainAvgExpr(qi, col)} AS ${qi.q(`_avg_${col}`)}`);
       }
     }
   }
@@ -1151,8 +1204,8 @@ export function buildAggregate<T extends object>(
       }
 
       // Build nested aggregate objects
-      const sumObj: Record<string, number | null> = {};
-      const avgObj: Record<string, number | null> = {};
+      const sumObj: Record<string, number | string | null> = {};
+      const avgObj: Record<string, number | string | null> = {};
       const minObj: Record<string, unknown> = {};
       const maxObj: Record<string, unknown> = {};
       let hasSums = false,
@@ -1164,12 +1217,12 @@ export function buildAggregate<T extends object>(
         if (key.startsWith('_sum_')) {
           const col = key.slice(5);
           const field = qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
-          sumObj[field] = val !== null ? Number(val) : null;
+          sumObj[field] = sumAvgValue(qi, col, val);
           hasSums = true;
         } else if (key.startsWith('_avg_')) {
           const col = key.slice(5);
           const field = qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
-          avgObj[field] = val !== null ? Number(val) : null;
+          avgObj[field] = sumAvgValue(qi, col, val);
           hasAvgs = true;
         } else if (key.startsWith('_min_')) {
           const col = key.slice(5);
@@ -1184,8 +1237,8 @@ export function buildAggregate<T extends object>(
         }
       }
 
-      if (hasSums) aggResult._sum = sumObj as Partial<Record<keyof T & string, number | null>>;
-      if (hasAvgs) aggResult._avg = avgObj as Partial<Record<keyof T & string, number | null>>;
+      if (hasSums) aggResult._sum = sumObj as Partial<Record<keyof T & string, number | string | null>>;
+      if (hasAvgs) aggResult._avg = avgObj as Partial<Record<keyof T & string, number | string | null>>;
       if (hasMins) aggResult._min = minObj as Partial<Record<keyof T & string, unknown>>;
       if (hasMaxs) aggResult._max = maxObj as Partial<Record<keyof T & string, unknown>>;
 

@@ -1304,9 +1304,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   /**
    * The field names a `cursor` actually seeks on (its own keys with a defined
-   * value), in the canonical sorted order the cursor conditions are built in.
-   * Empty for a missing cursor or one whose every value is `undefined` (which
-   * emits no seek condition at all, so it does not paginate).
+   * value), in canonical sorted order. This is the diagnostic / implicit-
+   * ordering view; the seek itself orders the fields by their `orderBy`
+   * precedence (see {@link cursorSeekEntries}). Empty for a missing cursor or
+   * one whose every value is `undefined` (which emits no seek condition at
+   * all, so it does not paginate).
    */
   private cursorFields(cursor: unknown): string[] {
     if (!cursor || typeof cursor !== 'object') return [];
@@ -1320,18 +1322,20 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * The ascending ordering implied by a `cursor`, or `undefined` when the shape
    * is too ambiguous to order safely.
    *
-   * A cursor seek emits `col > $n` per field (`<` when the orderBy says desc),
-   * so the ONLY ordering coherent with it is on the cursor's own field: ordering
-   * a seek on column X by column Y walks the table in an order the seek does not
-   * follow, which skips and repeats rows just as badly as no order at all. That
-   * is why this orders on the cursor field rather than blindly on the primary
-   * key when the two differ.
+   * A cursor seek compares against the cursor's own field(s) (`col > $n`, `<`
+   * when the orderBy says desc), so the ONLY ordering coherent with it is on
+   * those fields: ordering a seek on column X by column Y walks the table in an
+   * order the seek does not follow, which skips and repeats rows just as badly
+   * as no order at all. That is why this orders on the cursor field rather than
+   * blindly on the primary key when the two differ.
    *
    * Returns `undefined` (warn, inject nothing) for two shapes:
-   *  - a MULTI-field cursor. `a > $1 AND b > $2` is a conjunction, not a proper
-   *    composite keyset seek (`(a, b) > ($1, $2)`), so no single ORDER BY makes
-   *    it correct. Injecting `(a asc, b asc)` would dress a broken seek up as a
-   *    sound one.
+   *  - a MULTI-field cursor. The seek is a proper keyset predicate, but its
+   *    column PRECEDENCE comes from the `orderBy` ({@link cursorSeekEntries}),
+   *    and with no orderBy there is nothing to derive it from: the cursor
+   *    object's key order is canonicalized away, so `(a asc, b asc)` would be a
+   *    guess at which key the caller meant to lead. The caller must state the
+   *    order, and the unordered-page warning says so.
    *  - a field that does not resolve to a real column. Column validation belongs
    *    to the normal build path, which raises a precise error; synthesizing an
    *    ORDER BY on it here would only change which error the caller sees.
@@ -1346,6 +1350,88 @@ export class QueryInterface<T extends object, R extends object = {}> {
       return undefined;
     }
     return { [field]: 'asc' };
+  }
+
+  /**
+   * The fields a `cursor` seeks on, in KEYSET order with their seek direction.
+   * THE single authority the cache fingerprint (`cur=`), the SQL build and the
+   * cache-hit param collect all consume, so the three cannot disagree about
+   * which value binds to which `$n`.
+   *
+   * Keyset order is the `orderBy` precedence: the predicate for
+   * `orderBy: [{ viewCount }, { id }]` must test `view_count` first and `id`
+   * only within equal `view_count`, whatever order the caller wrote the cursor
+   * object in (its keys are canonicalized for the cache anyway). A cursor field
+   * the orderBy does not name trails the named ones in sorted key order and
+   * seeks ascending, the same default a single-field cursor with no orderBy has
+   * always had.
+   *
+   * Directions are indexed by the RESOLVED COLUMN, never the caller's key: both
+   * `cursor` and `orderBy` take either spelling, so a cursor written
+   * `{ created_at }` against `orderBy: { createdAt: 'desc' }` used to miss the
+   * lookup, default to ascending, and seek the wrong side of the page. The
+   * `{ sort, nulls }` spec form is normalized for the same reason. A relation /
+   * JSON-path / vector orderBy key resolves to no column and is skipped.
+   *
+   * An unknown cursor field throws the same E003 here that the build path
+   * threw before this helper existed; the fingerprint simply meets it first.
+   */
+  private cursorSeekEntries(
+    cursor: Record<string, unknown>,
+    orderBy: unknown,
+  ): { column: string; value: unknown; desc: boolean }[] {
+    const orderPos = new Map<string, number>();
+    const orderDesc = new Map<string, boolean>();
+    for (const [ok, od] of orderByEntries(orderBy)) {
+      const ocol = resolveColumnName(this.tableMeta, ok);
+      if (ocol === undefined) continue;
+      if (!orderPos.has(ocol)) orderPos.set(ocol, orderPos.size);
+      // Last wins, matching object-key semantics (duplicates are refused
+      // upstream anyway, so in practice there is exactly one).
+      orderDesc.set(ocol, isOrderBySpec(od) ? od.sort === 'desc' : od === 'desc');
+    }
+    const entries = sortedEntries(cursor)
+      .filter(([, v]) => v !== undefined)
+      .map(([k, value]) => {
+        const column = this.toColumn(k);
+        return { column, value, desc: orderDesc.get(column) === true };
+      });
+    // Stable sort over the canonical (sorted-key) list: orderBy precedence
+    // first, unnamed fields after it in their sorted order.
+    return entries.sort(
+      (a, b) =>
+        (orderPos.get(a.column) ?? Number.MAX_SAFE_INTEGER) - (orderPos.get(b.column) ?? Number.MAX_SAFE_INTEGER),
+    );
+  }
+
+  /**
+   * The keyset predicate for cursor terms in keyset order.
+   *
+   * One field is the plain `col > $1` (byte-identical to every single-field
+   * cursor ever emitted). Two or more expand to
+   * `(c1 > $1 OR (c1 = $1 AND c2 > $2) OR (c1 = $1 AND c2 = $2 AND c3 > $3))`,
+   * with `<` for a `desc` field: the row-value form `(c1, c2) > ($1, $2)` is
+   * shorter, but it cannot express a MIXED direction at all and SQL Server has
+   * no row-value comparison, so the expanded form is the one path every engine
+   * and every direction set share. Each value is bound ONCE and its `$n` is
+   * referenced by every branch that needs it (legal on every supported
+   * placeholder syntax), which is what keeps the param count equal to the field
+   * count on both the build and the collect side.
+   *
+   * The former `c1 > $1 AND c2 > $2` was a conjunction, not a seek: it skipped
+   * every row whose leading key EQUALED the cursor's, so a table with few
+   * distinct leading values lost most of its rows across a page walk, silently.
+   */
+  private keysetPredicate(terms: { column: string; placeholder: string; desc: boolean }[]): string {
+    const compare = (t: { column: string; placeholder: string; desc: boolean }) =>
+      `${t.column} ${t.desc ? '<' : '>'} ${t.placeholder}`;
+    if (terms.length === 1) return compare(terms[0]!);
+    const branches = terms.map((term, i) => {
+      if (i === 0) return compare(term);
+      const prefix = terms.slice(0, i).map((t) => `${t.column} = ${t.placeholder}`);
+      return `(${[...prefix, compare(term)].join(' AND ')})`;
+    });
+    return `(${branches.join(' OR ')})`;
   }
 
   /**
@@ -1894,15 +1980,25 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // Query-level opt-in threaded onto every follow-up child `buildFindMany`,
       // so a batched load excludes/includes PII exactly as the join strategy.
       includePii,
-      tableGlobalFilter: (table, alias, precedingParams) => {
+      // `ref` is the follow-up query's FROM-item AS THE SQL REFERS TO IT: the
+      // quoted child table for a hasMany `_count`, the bare junction alias `t`
+      // for the m2m one. Compiled through the rendered-reference scope, which
+      // uses it verbatim for the column qualifier and for a nested relation
+      // filter's correlation parent alike. It went through the BARE-alias scope
+      // before, which quotes what it is given, so a `globalFilters` entry that
+      // was itself a relation filter emitted `"""posts"""` into the EXISTS
+      // body and the count failed 42P01. Reproduced live; the plain batched
+      // relation fetch was never affected, because that one goes through the
+      // child's own buildFindMany and merges the filter unqualified.
+      tableGlobalFilter: (table, ref, precedingParams) => {
         const gf = this.resolveGlobalFilter(table, resolvedSkip);
         if (!gf) return null;
         const meta = this.schema.tables[table];
         if (!meta) return null;
-        // Seed the param array with `precedingParams` placeholders so
-        // buildAliasWhere numbers the gf params after the already-bound ones.
+        // Seed the param array with `precedingParams` placeholders so the
+        // builder numbers the gf params after the already-bound ones.
         const seeded: unknown[] = new Array(precedingParams).fill(undefined);
-        const clause = this.buildAliasWhere(table, meta, alias, gf, seeded);
+        const clause = whereMod.buildRenderedRefWhere(this.ctx, table, meta, ref, gf, seeded);
         if (!clause) return null;
         return { clause, params: seeded.slice(precedingParams) };
       },
@@ -3122,10 +3218,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
           })
           .join(',')
       : '';
+    // Keyset order AND per-field direction: a multi-field cursor's predicate
+    // is one OR-branch per field in orderBy precedence, and `<` / `>` are SQL
+    // text, so `asc` and `desc` (or two precedences) can never share a template.
     const cursorFp = args?.cursor
-      ? Object.keys(args.cursor as Record<string, unknown>)
-          .filter((k) => (args.cursor as Record<string, unknown>)[k] !== undefined)
-          .sort()
+      ? this.cursorSeekEntries(args.cursor as Record<string, unknown>, args.orderBy)
+          .map((e) => `${e.column}:${e.desc ? 'd' : 'a'}`)
           .join(',')
       : '';
     // distinct must fingerprint in USER order: the SQL emits `DISTINCT ON` in
@@ -3251,38 +3349,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // where → cursor order (the collect path mirrors this exactly).
       let tail = freshWhereSql;
       if (args?.cursor) {
-        // Sorted (canonical) order, MUST match cursorFp and the cache-hit collect below.
-        const cursorEntries = sortedEntries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
-        if (cursorEntries.length > 0) {
-          // Resolve the seek direction per cursor field from the flattened
-          // orderBy entries (last wins, matching object-key semantics), so both
-          // the object and array orderBy forms drive the cursor comparison.
-          //
-          // Indexed by the RESOLVED COLUMN, never the caller's key: both
-          // `cursor` and `orderBy` take either spelling, so a cursor written
-          // `{ created_at }` against `orderBy: { createdAt: 'desc' }` missed
-          // this lookup, defaulted to ascending, and emitted `created_at > $n`
-          // under `ORDER BY created_at DESC` — the wrong page, silently. Same
-          // failure the `{ sort, nulls }` normalization below prevents, reached
-          // through the spelling instead of the value shape. A relation /
-          // JSON-path / vector key resolves to no column and is skipped.
-          const orderDirByColumn = new Map<string, unknown>();
-          for (const [ok, od] of orderByEntries(args.orderBy)) {
-            const ocol = resolveColumnName(this.tableMeta, ok);
-            if (ocol !== undefined) orderDirByColumn.set(ocol, od);
-          }
-          const cursorConditions = cursorEntries.map(([k, v]) => {
-            const rawCol = this.toColumn(k);
-            const col = this.q(rawCol);
-            // orderBy values can be the { sort, nulls } spec form: normalize
-            // before comparing, or a desc spec would seek the ascending side.
-            const dir = orderDirByColumn.get(rawCol);
-            const desc = isOrderBySpec(dir) ? dir.sort === 'desc' : dir === 'desc';
-            const op = desc ? '<' : '>';
-            freshParams.push(v);
-            return `${qt}.${col} ${op} ${this.p(freshParams.length)}`;
+        // Keyset order (orderBy precedence), MUST match cursorFp and the
+        // cache-hit collect below: both go through cursorSeekEntries.
+        const seek = this.cursorSeekEntries(args.cursor as Record<string, unknown>, args.orderBy);
+        if (seek.length > 0) {
+          const terms = seek.map((e) => {
+            freshParams.push(e.value);
+            return { column: `${qt}.${this.q(e.column)}`, placeholder: this.p(freshParams.length), desc: e.desc };
           });
-          tail += freshWhereSql ? ` AND ${cursorConditions.join(' AND ')}` : ` WHERE ${cursorConditions.join(' AND ')}`;
+          const predicate = this.keysetPredicate(terms);
+          tail += freshWhereSql ? ` AND ${predicate}` : ` WHERE ${predicate}`;
         }
       }
 
@@ -3302,10 +3378,39 @@ export class QueryInterface<T extends object, R extends object = {}> {
           throw new ValidationError('`distinct` cannot be combined with vector distance ordering.');
         }
         const userOrder = this.buildOrderBy(args.orderBy, freshParams);
-        const inner = `SELECT ${distinctPrefix}${selectClause} FROM ${qt}${tail} ORDER BY ${distinctCols
+        // The outer level re-orders by the user's columns, which must therefore
+        // exist in the derived table. A NARROWED projection (`select`, `omit`,
+        // or the PII rule, which narrows with no user projection at all) left
+        // them out, so the statement failed with 42703. Every order column the
+        // projection omits is projected into the INNER query under its own
+        // name, and the outer SELECT then lists the projected columns
+        // explicitly instead of `*`, so the extra column orders the result and
+        // never reaches a row (a PII column never even crosses the wire). The
+        // full projection (`columnsList === null`, `"t".*`) and a projection
+        // that already covers the order keeps the `SELECT *` wrapper byte for
+        // byte. The user's order is rendered ONCE (params pushed once, as the
+        // collect path mirrors) and its text reused at both levels.
+        let innerSelect = selectClause;
+        let outerSelect = '*';
+        if (columnsList) {
+          const projected = new Set(columnsList);
+          const extras: string[] = [];
+          for (const [key] of orderByEntries(args.orderBy)) {
+            // Relation and vector ordering are refused above, so every key
+            // names a column of this table (a JSON-path entry's key is its
+            // column); buildOrderBy has already validated it.
+            const col = this.toColumn(key);
+            if (!projected.has(col) && !extras.includes(col)) extras.push(col);
+          }
+          if (extras.length > 0) {
+            innerSelect = `${selectClause}, ${extras.map((c) => `${qt}.${this.q(c)}`).join(', ')}`;
+            outerSelect = this.distinctOuterSelectList(columnsList, args.with as WithClause | undefined).join(', ');
+          }
+        }
+        const inner = `SELECT ${distinctPrefix}${innerSelect} FROM ${qt}${tail} ORDER BY ${distinctCols
           .map((c) => `${c} ASC`)
           .join(', ')}, ${userOrder}`;
-        sql = `SELECT * FROM (${inner}) AS ${this.q(`${this.table}_distinct`)} ORDER BY ${userOrder}`;
+        sql = `SELECT ${outerSelect} FROM (${inner}) AS ${this.q(`${this.table}_distinct`)} ORDER BY ${userOrder}`;
       } else {
         // Pass freshParams so vector KNN ordering binds its `$n::vector` query
         // vector at the correct position (after cursor params, before LIMIT), and
@@ -3342,11 +3447,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (args?.with) {
       this.collectWithParams(args.with as WithClause, params, undefined, flattenPlan);
     }
-    // 3. Cursor params, sorted (canonical) order, matching cursorFp and the build path.
+    // 3. Cursor params, keyset order, matching cursorFp and the build path
+    //    (each value binds ONCE; the expanded predicate re-references its `$n`).
     if (args?.cursor) {
-      const cursorEntries = sortedEntries(args.cursor as Record<string, unknown>).filter(([, v]) => v !== undefined);
-      for (const [, v] of cursorEntries) {
-        params.push(v);
+      for (const e of this.cursorSeekEntries(args.cursor as Record<string, unknown>, args.orderBy)) {
+        params.push(e.value);
       }
     }
     // 4. ORDER BY params (vector KNN ordering binds a `$n::vector` query vector).
@@ -4353,6 +4458,34 @@ export class QueryInterface<T extends object, R extends object = {}> {
   /** Convert camelCase field name to a double-quoted SQL identifier */
   private toSqlColumn(field: string): string {
     return this.q(this.toColumn(field));
+  }
+
+  /**
+   * The explicit outer SELECT list of the `distinct` + `orderBy` wrapper, used
+   * only when the inner derived table had to carry ORDER BY columns the
+   * projection leaves out (see the distinct branch of {@link buildFindMany}):
+   * the projected base columns, then one column per `with` relation, then one
+   * per counted relation. These are the aliases `buildSelectWithRelations`
+   * (relations.ts) gives the same columns, `AS "<relName>"` per entry in sorted
+   * order and `AS "_count__<rel>"` per counted relation, over the SAME
+   * `resolveCountRelations` it uses, so the two lists name the same columns.
+   * `flatten` never reaches here (the strategy is gated off under `distinct`),
+   * so no prefixed scalar aliases exist to enumerate. A drift between the two
+   * would fail LOUDLY, as a 42703 on the outer list, never as a silently wrong
+   * row, and the live distinct test pins the `with` + `_count` shape.
+   */
+  private distinctOuterSelectList(columnsList: string[], withClause: WithClause | undefined): string[] {
+    const list = columnsList.map((c) => this.q(c));
+    if (!withClause) return list;
+    for (const [relName] of sortedEntries(withClause as Record<string, unknown>)) {
+      if (relName === '_count') continue;
+      list.push(this.q(relName));
+    }
+    const countSpec = (withClause as { _count?: WithCount })._count;
+    if (countSpec !== undefined) {
+      for (const rel of resolveCountRelations(this.tableMeta, countSpec)) list.push(this.q(`_count__${rel.name}`));
+    }
+    return list;
   }
 
   // =========================================================================

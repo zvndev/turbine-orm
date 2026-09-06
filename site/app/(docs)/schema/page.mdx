@@ -48,6 +48,8 @@ export default defineSchema({
 });
 ```
 
+Two things the example does not show. `type: 'timestamp'` emits `TIMESTAMPTZ`: the alias is kept for back-compat and means the same as `'timestamptz'`, so there is no code-first spelling for a zone-less `TIMESTAMP` column (declare one in a SQL migration and `generate` picks it up; the [type mapping](#type-mapping) below describes how such a column reads). And `varchar` takes its bound as `maxLength` (`{ type: 'varchar', maxLength: 200 }`); `defineSchema` does not validate column option names, so a misspelt option such as `length` is ignored and an unbounded `VARCHAR` is emitted.
+
 ### Composite primary keys
 
 Pass a table-level `primaryKey` array:
@@ -252,7 +254,7 @@ Both are exported from the package root, for test harnesses, custom bootstrap sc
 
 ```ts
 import { schemaToSQL, schemaToSQLString, schemaPush } from 'turbine-orm';
-import schema from './turbine/schema';
+import schema from './turbine/schema.js';
 
 // Build the DDL. No connection involved, so this works for any engine
 // whose driver can execute the statements.
@@ -260,7 +262,8 @@ const statements = schemaToSQL(schema);          // string[]
 const oneScript = schemaToSQLString(schema);     // the same, joined
 
 // Diff against a live Postgres database and apply the difference in ONE
-// transaction. Never drops tables or columns.
+// transaction. Data-destroying statements (drops, lossy type changes) are
+// refused unless you pass allowDestructive: true.
 const result = await schemaPush(schema, process.env.DATABASE_URL!);
 console.log(result.statementsExecuted, result.tablesCreated, result.tablesAltered);
 
@@ -326,7 +329,7 @@ Every migration file is SHA-256 hashed and stored alongside the timestamp. If yo
 
 ```ts
 import { schemaDiff } from 'turbine-orm';
-import schema from './turbine/schema';
+import schema from './turbine/schema.js';
 
 const diff = await schemaDiff(schema, process.env.DATABASE_URL!);
 
@@ -460,10 +463,12 @@ The reading is applied in one place, the ORM row parser, so every read path agre
   `expiresAt` / `validUntil` actually live, it is silent.
 
   Turbine emits a one-time warning naming the table and field the first time a
-  stored infinity is read. Unlike every other Turbine warning it is **not**
+  stored infinity is read. Unlike the development-only warnings (an unknown
+  option, an unordered page) and like the unlimited-read warning, it is **not**
   silenced by `NODE_ENV=production`, because production is where a `Date`
-  method throws on live traffic. Naming either reading in the config silences
-  it.
+  method throws on live traffic. It fires once per process per field, and only
+  on a row that actually held an infinity. Naming either reading in the config
+  silences it.
 </Callout>
 
 What the default costs, on exactly the rows that hold an infinity:

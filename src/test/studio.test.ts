@@ -8,7 +8,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,7 +20,6 @@ import {
   apiDeleteSavedQuery,
   apiListSavedQueries,
   apiTableRows,
-  escapeLikePattern,
   isTextishType,
   resolveColumnName,
   type StudioContext,
@@ -70,15 +69,65 @@ describe('Studio, isTextishType', () => {
   });
 });
 
-describe('Studio, escapeLikePattern', () => {
-  it('escapes LIKE wildcards literally', () => {
-    assert.equal(escapeLikePattern('100%'), '100\\%');
-    assert.equal(escapeLikePattern('foo_bar'), 'foo\\_bar');
-    assert.equal(escapeLikePattern('a\\b'), 'a\\\\b');
+describe('Studio has no LIKE escaper of its own', () => {
+  // What a LIKE operand needs escaped is a property of the ENGINE's pattern
+  // grammar (T-SQL also reads `[` as a character-class opener), which is why
+  // it is a `Dialect` hook. Studio used to carry a byte-identical copy of the
+  // Postgres default under its own name, so it bypassed the hook and would
+  // have read `[draft]` as "any one of d, r, a, f, t" against SQL Server. The
+  // rule this pins: the hook is DEFINED in dialect.ts (the contract) and in
+  // the engine dialect files, and nowhere else under src/; everyone else,
+  // Studio included, calls `dialect.escapeLikePattern?.(v) ?? escapeLike(v)`.
+  const SRC = new URL('../', import.meta.url);
+  const ALLOWED_DEFINERS = new Set(['dialect.ts', 'mssql.ts', 'mysql.ts', 'sqlite.ts', 'powdb.ts']);
+  // A function, an arrow/const binding, an interface member or a class method
+  // named escapeLikePattern. A CALL (`x.escapeLikePattern?.(v)`) never starts a
+  // line with the bare name, so it does not match.
+  const DEFINITION =
+    /^\s*(?:export\s+)?(?:(?:async\s+)?function\s+escapeLikePattern\s*\(|(?:const|let|var)\s+escapeLikePattern\s*=|escapeLikePattern\??\s*\([^)]*\)\s*:\s*string\s*[{;])/m;
+  // The Postgres default's body. A copy under a NEW name slips past the name
+  // check; its body does not. mssql.ts legitimately extends this sequence.
+  const DEFAULT_BODY = String.raw`.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')`;
+  const ALLOWED_BODIES = new Set(['query/utils.ts', 'mssql.ts']);
+
+  const sources = readdirSync(SRC, { recursive: true, encoding: 'utf8' })
+    .filter((rel) => rel.endsWith('.ts') && !rel.startsWith('test/') && !rel.endsWith('.generated.ts'))
+    .map((rel) => ({ rel, text: readFileSync(new URL(rel, SRC), 'utf8') }));
+
+  it('scans the runtime sources at all (anti-vacuous)', () => {
+    assert.ok(sources.length > 50, `only ${sources.length} .ts files under src/; the walk is broken`);
   });
 
-  it('leaves plain text alone', () => {
-    assert.equal(escapeLikePattern('hello world'), 'hello world');
+  it('defines escapeLikePattern only in dialect.ts and the engine dialect files', () => {
+    const definers = sources.filter((s) => DEFINITION.test(s.text)).map((s) => s.rel);
+    // The scanner must see the contract declaration and the SQL Server override;
+    // if it cannot see those two it cannot see a duplicate either.
+    assert.ok(
+      definers.includes('dialect.ts'),
+      `the definition scanner missed dialect.ts (saw: ${definers.join(', ')})`,
+    );
+    assert.ok(definers.includes('mssql.ts'), `the definition scanner missed mssql.ts (saw: ${definers.join(', ')})`);
+    const rogue = definers.filter((rel) => !ALLOWED_DEFINERS.has(rel));
+    assert.deepEqual(
+      rogue,
+      [],
+      `escapeLikePattern is defined outside the dialect files, in ${rogue.join(', ')}. ` +
+        `Call \`dialect.escapeLikePattern?.(v) ?? escapeLike(v)\` instead: a private copy bypasses the engine's escaping rules.`,
+    );
+  });
+
+  it('the default escape sequence lives in query/utils.ts (and the mssql override that extends it)', () => {
+    const carriers = sources.filter((s) => s.text.includes(DEFAULT_BODY)).map((s) => s.rel);
+    assert.ok(
+      carriers.includes('query/utils.ts'),
+      `the body scanner missed query/utils.ts (saw: ${carriers.join(', ')})`,
+    );
+    const copies = carriers.filter((rel) => !ALLOWED_BODIES.has(rel));
+    assert.deepEqual(
+      copies,
+      [],
+      `a copy of escapeLike's body lives in ${copies.join(', ')}; import escapeLike from query/utils.js`,
+    );
   });
 });
 

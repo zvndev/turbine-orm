@@ -130,15 +130,18 @@ describe('upsert conflict-UPDATE predicate: SQL and params agree', () => {
     assert.doesNotMatch(buildTenantUpsert(mssqlDialect).sql, /WHEN MATCHED AND/);
   });
 
-  it('sqlite really emits the predicate it claims to support', () => {
+  // The predicate is TABLE-QUALIFIED: inside `ON CONFLICT ... DO UPDATE ... WHERE`
+  // both the target table and `excluded` are in scope, so a bare column there
+  // is ambiguous (42702 on PostgreSQL) and the statement never ran at all.
+  it('sqlite really emits the predicate it claims to support, table-qualified', () => {
     assert.equal(sqliteDialect.supportsUpsertUpdateWhere, true);
     const { sql } = buildTenantUpsert(sqliteDialect);
-    assert.match(sql, /DO UPDATE SET .* WHERE "tenant_id" = :p5/);
+    assert.match(sql, /DO UPDATE SET .* WHERE "users"\."tenant_id" = :p5/);
   });
 
-  it('postgres really emits the predicate it claims to support', () => {
+  it('postgres really emits the predicate it claims to support, table-qualified', () => {
     assert.equal(postgresDialect.supportsUpsertUpdateWhere, true);
     const { sql } = buildTenantUpsert(postgresDialect);
-    assert.match(sql, /DO UPDATE SET .* WHERE "tenant_id" = \$5/);
+    assert.match(sql, /DO UPDATE SET .* WHERE "users"\."tenant_id" = \$5/);
   });
 });

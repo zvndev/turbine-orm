@@ -124,7 +124,9 @@ describe('update operators: SQL build (no DB)', () => {
   it('WHERE clause param numbering continues after SET (multi-arg case)', () => {
     const q = makeQuery('posts', buildSchema());
     const deferred = q.buildUpdate({
-      where: { published: true, id: { gt: 10 } },
+      // Two WHERE params with the PK among them: `update` refuses a where
+      // that identifies no row (query/compound-unique.ts).
+      where: { published: true, id: 10 },
       data: { viewCount: { increment: 2 }, title: 'x' },
     });
     // SET uses $1, $2; WHERE uses $3, $4 in some order. The SET list is in the

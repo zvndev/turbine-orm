@@ -8,9 +8,10 @@ name: Release
 #   2. Add it to this repo as a secret named NPM_TOKEN
 #      (Settings → Secrets and variables → Actions → New repository secret)
 #
-# Usage:
-#   npm version patch   # or minor / major, bumps package.json and creates a git tag
-#   git push --follow-tags
+# Usage (docs/WORKFLOW.md, section 2): land the release commit on main through
+# a PR, then tag it. `main` is PR-only, so `npm version` + `git push
+# --follow-tags` is refused there; the tag alone is the publish trigger.
+#   git tag vX.Y.Z && git push origin vX.Y.Z
 #
 # The workflow runs lint → typecheck → unit tests → build, then the release
 # gates that mirror ci.yml (a real Postgres integration run on the seeded fixture,
@@ -42,10 +43,15 @@ on:
         type: boolean
         default: false
 
+# Least privilege at the workflow level, the same posture as ci.yml. Every
+# pre-publish gate job runs `npm ci` and then the whole devDependency tree,
+# and none of them writes anything, so none of them should hold a token that
+# can. `publish` alone needs more (the tag push on the workflow_dispatch path,
+# `gh release create`, and an OIDC token for the npm provenance attestation)
+# and declares it on the job. Before this block was narrowed, a compromised
+# devDependency running inside `test` held a token that could push to main.
 permissions:
-  contents: write
-  # Required for npm provenance attestation
-  id-token: write
+  contents: read
 
 # Releases queue, they never cancel each other MID-RUN: cancelling a
 # half-finished publish can leave npm updated with no tag-side follow-through
@@ -64,9 +70,9 @@ jobs:
     timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: npm
@@ -152,8 +158,8 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: npm
@@ -186,8 +192,8 @@ jobs:
     timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: npm
@@ -294,8 +300,8 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: npm
@@ -328,8 +334,8 @@ jobs:
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: npm
@@ -370,8 +376,8 @@ jobs:
     env:
       TURBINE_EVAL_URL: postgres://test:test@localhost:5432/turbine_eval
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: npm
@@ -392,8 +398,8 @@ jobs:
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: npm
@@ -472,8 +478,8 @@ jobs:
     timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: npm
@@ -578,10 +584,17 @@ jobs:
     timeout-minutes: 30
     needs: [test, integration-postgres, pack-smoke, package-types, consumer-types, coverage, error-codes, verify-skill]
     runs-on: ubuntu-latest
+    # The only job that writes: `contents: write` for the workflow_dispatch tag
+    # push and for `gh release create`, `id-token: write` for `--provenance`.
+    # A job-level block REPLACES the workflow-level one rather than adding to
+    # it, so `contents` is restated here.
+    permissions:
+      contents: write
+      id-token: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
@@ -612,14 +625,27 @@ jobs:
       - name: Build
         run: npm run build
 
-      # Backfilled/old tags must not re-attempt a publish: npm rejects
-      # republishing an existing version, which would just paint the run red.
+      # The tag is the publish trigger, so on a tag PUSH a version that is
+      # already on npm got there some other way: a local `npm publish` before
+      # the tag, which turns this whole `needs:` chain into an advisory run over
+      # a package strangers already have. That used to be answered with a
+      # silent skip, and the skip is how four of the six releases before 0.77.0
+      # went out tag-second, one of them from a commit whose CI was red. It is
+      # now a FAILURE that names the version, so the run is red and says why.
+      # `workflow_dispatch` keeps the skip: it is the deliberate re-run path for
+      # backfilling a GitHub Release on a version that is legitimately on the
+      # registry (npm refuses a republish, so skipping is what lets the release
+      # step below run at all), and the dry run never publishes anyway.
       - name: Check version not already published
         id: published
         run: |
           PKG_VERSION=$(jq -r .version package.json)
           if npm view "turbine-orm@$PKG_VERSION" version >/dev/null 2>&1; then
-            echo "already=true >> note: turbine-orm@$PKG_VERSION already on npm, skipping publish"
+            if [ "${{ github.event_name }}" = "push" ]; then
+              echo "::error::turbine-orm@$PKG_VERSION is already on npm, but this run was started by the v$PKG_VERSION tag push. The tag is what publishes; a version that is on the registry before its tag run exists was published outside the release gates. If only the GitHub Release is missing, re-run this workflow with workflow_dispatch instead."
+              exit 1
+            fi
+            echo "turbine-orm@$PKG_VERSION is already on npm; workflow_dispatch run, skipping the publish"
             echo "already=true" >> "$GITHUB_OUTPUT"
           else
             echo "already=false" >> "$GITHUB_OUTPUT"

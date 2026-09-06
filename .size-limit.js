@@ -61,6 +61,65 @@ const nodePlatform = (config) => {
 // for serverless: shrink the graph or change the claim, deliberately, in both
 // files at once. Do not raise this number to make a build pass.
 //
+// ALL THREE RE-BASELINED 2026-09-06, at the end of the 0.78.0 review-fix sprint.
+// Measured on this build: main 89.41 (limit was 87), serverless 70.67 (was 69),
+// prisma-compat 14.28 (was 14). main and serverless are published claims, so
+// this is the deliberate choice the notes below say has to be MADE: main 90 kB,
+// serverless 71 kB, and the same two numbers moved in README.md (three places),
+// site/app/page.tsx (prose and the stat card) and the serverless / batadb / neon
+// docs pages in the same commit. prisma-compat is not a claim and follows the
+// 5% convention: 14.28 + the 1 kB minimum, rounded up, is 16 kB.
+//
+// MAIN AND SERVERLESS MOVED AGAIN, ONE kB EACH, at the end of the same sprint's
+// REVIEW round (main 90 -> 91, serverless 71 -> 72). Measured on this build:
+// main 90.38, serverless 71.30, so both were 0.3-0.4 kB over the limits set
+// three days of work earlier. The claims moved with them in the same commit,
+// which is the whole point of the rule above: README.md (three places),
+// site/app/page.tsx (prose and the stat card), and the serverless / batadb /
+// neon docs pages.
+//
+// Checked the same way BEFORE moving anything, and the answer was the same:
+// bundling dist/index.js with esbuild gives 41 modules, the only cli/ entries
+// are cli/sql-statements.js and cli/destructive.js (the one sanctioned lib->cli
+// import), and no engine module is reachable. So this is not a new edge, it is
+// the review round's own code inside modules already in the graph: the
+// value-bearing-field redaction table and its two clone paths (errors.ts), the
+// upsert identity guard and its three messages (query/compound-unique.ts), the
+// rendered-reference where scope (query/where.ts), and the destructive
+// scanner's quoting-form and EXECUTE-placement rules, which are in the graph
+// through that sanctioned pair.
+//
+// prisma-compat is unchanged at 16 kB and measures 14.57, which is more
+// headroom than the 5% convention gives. It is deliberately NOT tightened here:
+// it was set to 16 in the same sprint, tightening a limit twice in one release
+// is churn, and it is not a published claim so nothing is stated about it that
+// could go stale. Tighten it at the next re-measure.
+//
+// The growth is +3.27 main, +2.40 serverless, and it is NOT uniform, which is
+// the case this note exists to make someone explain. It is explained, and it is
+// not a new edge. Checked first, by bundling dist/index.js with esbuild and
+// reading the metafile: 41 modules, and the only cli/ entries are
+// cli/destructive.js and cli/sql-statements.js, which are the ONE sanctioned
+// lib->cli import (schema-sql.ts's destructive-statement refusal, documented in
+// CLAUDE.md since 0.36). No engine module is reachable. The extra ~0.9 kB on
+// main over serverless is that pair: this sprint taught the destructive scanner
+// to classify DYNAMICALLY ASSEMBLED SQL, which is +214 lines in destructive.ts,
+// and main carries it while the edge entry does not.
+//
+// The rest is the shared client/query graph and it is the sprint's own fixes:
+// errors.ts +459 lines (the class-22 mapping, the safe-mode scrub for an
+// unclassified SQLSTATE, and the Symbol.for brand plus Symbol.hasInstance that
+// make instanceof work across the ESM and CJS copies), query/where.ts +277 (the
+// keyset cursor seek and the relation-filter target aliasing), query/builder.ts
+// +229, query/writes.ts +119 (upsert operator compilation and the update/delete
+// identity rule), and query/compound-unique.ts +61.
+//
+// prisma-compat moved +1.5 kB, its own growth rather than inherited: the array
+// orderBy flattening, the empty-OR predicate and the bare-null to-one mapping.
+// At 14.28 kB it is still an order of magnitude below the entries that bundle
+// the core graph, which is the property this budget exists to guard. If it ever
+// jumps toward 60 kB, something started importing core values instead of types.
+//
 // BOTH CLAIM-PINNED ENTRIES RE-BASELINED 2026-08-22, at the end of the 0.76.0
 // review-fix sprint. Measured on this build: main 86.14 (limit was 86),
 // serverless 68.27 (limit was 68). Both went red by a few hundred bytes, and
@@ -212,7 +271,7 @@ export default [
     name: "main entry, import { TurbineClient } from 'turbine-orm'",
     path: 'dist/index.js',
     // Same number as the README's claim, on purpose. See the note above.
-    limit: '87 kB',
+    limit: '91 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },
@@ -223,7 +282,7 @@ export default [
     // pagination dialect-hook dispatch). These are tiny and engine-neutral, but
     // the edge bundle includes the query builder, so the budget gets a small bump.
     path: 'dist/serverless.js',
-    limit: '69 kB',
+    limit: '72 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },
@@ -296,7 +355,7 @@ export default [
     // graph is NOT bundled with it. If this number jumps toward the other
     // entries, something started importing core values instead of core types.
     path: 'dist/prisma-compat.js',
-    limit: '14 kB',
+    limit: '16 kB',
     ignore: ['pg'],
     modifyEsbuildConfig: nodePlatform,
   },

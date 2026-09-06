@@ -615,9 +615,27 @@ describe('wrapPgError', () => {
     assert.equal(wrapPgError(err), err);
   });
 
-  it('returns input unchanged for unknown sqlstate codes', () => {
+  it('returns input unchanged for an unknown code on an error that is not a pg server error', () => {
+    // No `severity`: node-postgres stamps one on every ErrorResponse, so its
+    // absence means this is not a server error and nothing here is Turbine's
+    // to rewrite (a user's fs error in a transaction callback reaches here too).
     const err = Object.assign(new Error('weird'), { code: '99999' });
     assert.equal(wrapPgError(err), err);
+  });
+
+  it('scrubs an unknown SQLSTATE on a pg server error in safe mode (full matrix in errors-unmapped-sqlstate.test.ts)', () => {
+    const prev = getErrorMessageMode();
+    setErrorMessageMode('safe');
+    try {
+      const err = Object.assign(new Error('weird: "value"'), { code: '99999', severity: 'ERROR' });
+      const wrapped = wrapPgError(err) as Error & { code?: string };
+      assert.notEqual(wrapped, err);
+      assert.ok(wrapped.message.startsWith('Database error 99999'), wrapped.message);
+      assert.ok(wrapped.message.includes('driver text withheld'), wrapped.message);
+      assert.equal(wrapped.code, '99999');
+    } finally {
+      setErrorMessageMode(prev);
+    }
   });
 
   it('wraps 23505 into UniqueConstraintError', () => {
@@ -1101,6 +1119,29 @@ describe('constraint errors are PII-safe by default', () => {
     withMode('safe', () => {
       const err = wrapPgError(pgUnique) as UniqueConstraintError;
       assert.equal((err.cause as { code?: string }).code, '23505');
+    });
+  });
+
+  // The version value is not a constraint detail, but it is a stored cell value
+  // all the same, and `optimisticLock` accepts any column as the version field
+  // (a `updated_at` timestamp or an etag string are common), so the message
+  // treats it exactly like the constraint classes treat `detail`.
+  it('safe mode: optimistic lock names the version field but NOT the expected value', () => {
+    withMode('safe', () => {
+      const err = new OptimisticLockError({ table: 'posts', versionField: 'etag', expectedVersion: 'etag-SECRET-41' });
+      assert.ok(err.message.includes('"posts"'));
+      assert.ok(err.message.includes('etag'), 'the field name is the useful, value-free part');
+      assert.ok(!err.message.includes('etag-SECRET-41'), `the expected value leaked into the message: ${err.message}`);
+      assert.equal(err.expectedVersion, 'etag-SECRET-41', 'the structured field carries the value in both modes');
+      assert.equal(err.detail, 'expected etag = etag-SECRET-41', 'the value moves to .detail');
+    });
+  });
+
+  it('verbose mode (opt-in): the optimistic lock message carries the expected value', () => {
+    withMode('verbose', () => {
+      const err = new OptimisticLockError({ table: 'posts', versionField: 'etag', expectedVersion: 'etag-SECRET-41' });
+      assert.ok(err.message.includes('expected etag = etag-SECRET-41'), err.message);
+      assert.equal(err.detail, 'expected etag = etag-SECRET-41');
     });
   });
 });

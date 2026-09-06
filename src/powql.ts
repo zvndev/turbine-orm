@@ -68,7 +68,11 @@ import {
   rowToEntity,
 } from './powdb-shared.js';
 import { assertAggregatePiiOptIn } from './query/aggregates.js';
-import { assertWhereIdentifiesOneRow, expandCompoundUniqueWhere } from './query/compound-unique.js';
+import {
+  assertMutationWhereIdentifiesOneRow,
+  assertWhereIdentifiesOneRow,
+  expandCompoundUniqueWhere,
+} from './query/compound-unique.js';
 import { ARRAY_OPERATOR_KEYS, isJsonFilter, isRelationPickOrderBy, orderByEntries } from './query/filters.js';
 import type { MiddlewareFn, QueryEvent, QueryInterfaceOptions } from './query/index.js';
 import { warnUnknownQueryOptions } from './query/option-surface.js';
@@ -622,6 +626,32 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   /** See query/compound-unique.ts: one rule and one message across engines. */
   private assertIdentifiesOneRow(where: Record<string, unknown> | undefined): void {
     assertWhereIdentifiesOneRow(this.meta, this.table, where);
+  }
+
+  /**
+   * The single-row WRITE rule (`update` / `delete` return one row, so their
+   * `where` must identify one; `upsert`'s `where` names the row it conflicts
+   * on), shared with the SQL engines through query/compound-unique.ts so the
+   * two cannot disagree about which writes are valid. Skipped under the
+   * explicit full-table opt-in, which already means "every row". For `update` /
+   * `delete` it runs AFTER `assertCompiledWhere`, so an empty selector keeps
+   * the empty-where message and this only refuses a non-empty one that names no
+   * key; `upsert` takes no `allowFullTableScan` and has no empty-where guard to
+   * run first, so this is its only where check and it covers `{}` as well.
+   */
+  private assertMutationIdentifiesOneRow(
+    where: WhereClause<T> | undefined,
+    allowFullTableScan: boolean | undefined,
+    operation: 'update' | 'delete' | 'upsert',
+  ): void {
+    if (allowFullTableScan) return;
+    assertMutationWhereIdentifiesOneRow(this.meta, this.table, where as Record<string, unknown> | undefined, operation);
+  }
+
+  /** A caller `where` with a Prisma compound-unique selector expanded to its member columns. */
+  private expandedWhere(where: WhereClause<T> | undefined): WhereClause<T> | undefined {
+    if (!where) return where;
+    return expandCompoundUniqueWhere(this.meta, where as Record<string, unknown>) as WhereClause<T>;
   }
 
   private assertPagination(limit: number | undefined, offset: number | undefined, context: string): void {
@@ -3113,14 +3143,22 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   async update(args: UpdateArgs<T>): Promise<T> {
     return this.withMiddleware('update', args as unknown as Record<string, unknown>, async () => {
       if (hasRelationFields(args.data as Record<string, unknown>, this.meta)) {
+        // The nested engine re-enters `update` / `findUnique` for the parent
+        // row before it writes anything, so the identity rule below still runs
+        // first on this path.
         return this.nestedUpdate(args);
       }
+      const allowFullTableScan = resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan');
+      // Prisma compound-unique selector → column conjunction, so the selector
+      // counts as the key it is (engine parity with the SQL buildUpdate).
+      const userWhere = this.expandedWhere(args.where);
       const params: unknown[] = [];
-      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
+      const resolvedWhere = await this.resolveRelationFilters(userWhere, args.timeout);
       let where = this.buildWhere(resolvedWhere, params);
       // `false` here refused an empty where even WITH the opt-in, while every
       // SQL engine accepted it: verified by probe on buildUpdate/buildDelete.
-      this.assertCompiledWhere(where, resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'), 'update');
+      this.assertCompiledWhere(where, allowFullTableScan, 'update');
+      this.assertMutationIdentifiesOneRow(userWhere, allowFullTableScan, 'update');
       where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
       let setClause = this.buildUpdateAssignments(args.data as Record<string, unknown>, params);
       // Optimistic locking, matching the SQL engines exactly: bump the version
@@ -3313,10 +3351,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async delete(args: DeleteArgs<T>): Promise<T> {
     return this.withMiddleware('delete', args as unknown as Record<string, unknown>, async () => {
+      const allowFullTableScan = resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan');
+      const userWhere = this.expandedWhere(args.where);
       const params: unknown[] = [];
-      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
+      const resolvedWhere = await this.resolveRelationFilters(userWhere, args.timeout);
       let where = this.buildWhere(resolvedWhere, params);
-      this.assertCompiledWhere(where, resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'), 'delete');
+      this.assertCompiledWhere(where, allowFullTableScan, 'delete');
+      this.assertMutationIdentifiesOneRow(userWhere, allowFullTableScan, 'delete');
       where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
       // `returning` hands back the deleted row(s), no separate pre-image reselect needed.
       const { rows, native } = await this.exec(
@@ -3346,6 +3387,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async upsert(args: UpsertArgs<T>): Promise<T> {
     return this.withMiddleware('upsert', args as unknown as Record<string, unknown>, async () => {
+      // The single-row rule for `upsert`, shared with the SQL engines through
+      // query/compound-unique.ts. PowqlInterface is a PARALLEL implementation,
+      // not a subclass, so a rule adopted only on the SQL side is two engines
+      // disagreeing about whether a query is VALID, which is the failure class
+      // 0.64.0 and 0.72.0 were both spent on. Before `applyPkDefault`, so a
+      // refused upsert mints no client-side UUID and sends nothing.
+      this.assertMutationIdentifiesOneRow(this.expandedWhere(args.where), false, 'upsert');
       const createData = this.applyPkDefault(args.create as Record<string, unknown>);
       const pkCol = this.meta.primaryKey[0];
       if (this.meta.primaryKey.length !== 1 || !pkCol) {

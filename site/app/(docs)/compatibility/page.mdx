@@ -327,7 +327,7 @@ CockroachDB Serverless exposes a standard PostgreSQL connection string. Use it d
 ```ts
 import { turbineHttp } from 'turbine-orm/serverless';
 import { Pool } from 'pg';
-import { SCHEMA } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata.js';
 
 const pool = new Pool({
   connectionString: process.env.COCKROACH_URL,

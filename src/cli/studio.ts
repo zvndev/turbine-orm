@@ -56,7 +56,7 @@ import { QueryInterface, quoteIdent } from '../query/index.js';
 // what decides that `blog_posts` and `blogPosts` name the same relation, and a
 // redaction walk that answered that differently would redact a different query
 // than the one that ran.
-import { ownLookup, registerUtcTemporalParsers, resolveRelation } from '../query/utils.js';
+import { escapeLike, ownLookup, registerUtcTemporalParsers, resolveRelation } from '../query/utils.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { assertNoPiiPredicates as assertNoPiiPredicatesShared } from './pii-predicate-guard.js';
 import { applyPiiTags, loadPiiTags } from './pii-tags.js';
@@ -783,12 +783,19 @@ export async function apiTableRows(
   // Full-text-ish search: ILIKE across text/varchar columns. The value is
   // parameterized so injection is impossible. Each query gets its own
   // WHERE clause with parameter indices matching that query's param array.
+  // LIKE operands go through the dialect's escaper, the same hook the query
+  // builder uses (`Dialect.escapeLikePattern`): which characters need escaping
+  // is a property of the engine's pattern grammar, not of this SQL text, and a
+  // private copy here is how Studio came to bypass the SQL Server rule for
+  // `[`. No hook (Postgres, and the demo's SQLite, which inherits none) means
+  // the shared default. Paired with the `ESCAPE '\'` clause `likeCond` emits.
+  const escapeLikeOperand = (v: string): string => ctx.dialect?.escapeLikePattern?.(v) ?? escapeLike(v);
   const search = params.get('search')?.trim() ?? '';
   const textColumns = table.columns
     .filter((c) => isTextishType(c.pgType) && !redactedPii.has(c.name))
     .map((c) => c.name);
   const hasSearch = search.length > 0 && textColumns.length > 0;
-  const pattern = hasSearch ? `%${escapeLikePattern(search)}%` : null;
+  const pattern = hasSearch ? `%${escapeLikeOperand(search)}%` : null;
 
   // Per-column filters: `filters` is a JSON array of { column, op, value }
   // composed by the Data tab's filter bar. Every column is validated against
@@ -832,7 +839,7 @@ export async function apiTableRows(
       } else if (f.op === 'notNull') {
         conds.push(`${quoteIdent(f.column)} IS NOT NULL`);
       } else if (f.op === 'contains') {
-        values.push(`%${escapeLikePattern(String(f.value))}%`);
+        values.push(`%${escapeLikeOperand(String(f.value))}%`);
         conds.push(likeCond(f.column, n++));
       } else {
         const sqlOp = FILTER_OPS[f.op];
@@ -917,11 +924,6 @@ export function isTextishType(pgType: string): boolean {
     pgType === 'citext' ||
     pgType === 'uuid'
   );
-}
-
-export function escapeLikePattern(s: string): string {
-  // Escape the LIKE wildcards so user input is treated literally.
-  return s.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
 }
 
 // ---------------------------------------------------------------------------

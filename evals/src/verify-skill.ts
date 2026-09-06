@@ -17,9 +17,42 @@
  */
 import { deepStrictEqual } from 'node:assert';
 import { readFileSync } from 'node:fs';
+import pg from 'pg';
 import { TurbineError, type SchemaMetadata } from 'turbine-orm';
+import { assertEvalDatabase, EVAL_DATABASE_URL } from './config.js';
 import { closeClient, evalClient } from './execute.js';
 import { evalSchema } from './schema-meta.js';
+
+/**
+ * A scratch table for the exact-total claim. The eval schema has no bigint or
+ * numeric column (its numbers are `integer` and `serial`), so the skill's
+ * sentence about `_sum` / `_avg` returning PostgreSQL's exact text over those
+ * types had nothing to run against. Created BEFORE the schema is introspected,
+ * so `db.table()` knows it, and dropped after the claims run; IF NOT EXISTS plus
+ * TRUNCATE make a leftover from an aborted run harmless. The rows are 2^53 + 1
+ * twice: the sum is 18014398509481986, which a double renders as ...984, so a
+ * Number() anywhere on the path shows up as a wrong digit, not only a wrong type.
+ */
+const EXACT_TOTALS_TABLE = 'qa78_skill_exact_totals';
+
+async function createExactTotalsFixture(client: pg.Client): Promise<void> {
+  await client.query(
+    `CREATE TABLE IF NOT EXISTS ${EXACT_TOTALS_TABLE} (
+       id serial PRIMARY KEY,
+       big bigint NOT NULL,
+       amount numeric(12,2) NOT NULL,
+       small integer NOT NULL
+     )`,
+  );
+  await client.query(`TRUNCATE ${EXACT_TOTALS_TABLE}`);
+  await client.query(
+    `INSERT INTO ${EXACT_TOTALS_TABLE} (big, amount, small) VALUES (9007199254740993, 1020.50, 3), (9007199254740993, 0.10, 4)`,
+  );
+}
+
+async function dropExactTotalsFixture(client: pg.Client): Promise<void> {
+  await client.query(`DROP TABLE IF EXISTS ${EXACT_TOTALS_TABLE}`);
+}
 
 type Db = ReturnType<typeof evalClient>;
 type Args = Record<string, unknown>;
@@ -45,6 +78,39 @@ const throws = (code: string, table: string, method: string, args: Args) => asyn
   }
   throw new Error(`expected ${code}, but the query was accepted`);
 };
+
+/**
+ * Refused with a specific code AND a specific phrase in the message.
+ *
+ * `throws` alone passes on ANY error of that code, and that is how a sentence
+ * about WHICH operators a JSON path accepts was "verified" for two releases by
+ * an E003 that listed a different set from the one the skill named. When the
+ * message IS the claim (the accepted list, the suggested spelling), the check
+ * has to read the message.
+ */
+const throwsSaying = (code: string, phrase: string, table: string, method: string, args: Args) => async (db: Db) => {
+  try {
+    await call(db, table, method, args);
+  } catch (err) {
+    if (!(err instanceof TurbineError) || err.code !== code) {
+      throw new Error(`expected ${code}, got ${err instanceof Error ? `${err.name}: ${err.message}` : String(err)}`);
+    }
+    if (!err.message.includes(phrase)) {
+      throw new Error(`expected the ${code} message to say "${phrase}", got: ${err.message.split('\n')[0]}`);
+    }
+    return;
+  }
+  throw new Error(`expected ${code}, but the query was accepted`);
+};
+
+/**
+ * The JSON-path operator set SKILL.md lists, spelled the way the runtime's own
+ * refusal message spells it (sorted, so the set and not the order is the claim).
+ * If the runtime gains or loses an operator this string stops matching, which
+ * is the point: the skill's sentence has to change with it.
+ */
+const JSON_PATH_OPERATORS =
+  'Supported operators: contains, equals, gt, gte, hasKey, lt, lte, mode, path, stringContains, stringEndsWith, stringStartsWith.';
 
 /**
  * Two spellings, one answer. This is the assertion that matters for the whole
@@ -87,6 +153,29 @@ const CLAIMS: Claim[] = [
       })) as Array<Record<string, unknown>>;
       if (!rows[0] || 'affineur' in rows[0]) throw new Error('`include` attached the relation after all');
     },
+  },
+
+  // ---- single-row writes carry findUnique's identity rule ------------------
+  // These three run against the real database and write nothing: the refusal
+  // happens before any SQL is built, which is itself part of the claim.
+  {
+    says: '`update` requires a `where` that identifies one row.',
+    run: throws('TURBINE_E003', 'cheese_wheels', 'update', {
+      where: { status: 'graded' },
+      data: { status: 'graded' },
+    }),
+  },
+  {
+    says: '`delete` requires a `where` that identifies one row.',
+    run: throws('TURBINE_E003', 'cheese_wheels', 'delete', { where: { status: 'graded' } }),
+  },
+  {
+    says: "an upsert's `where` IS its `ON CONFLICT` target, so a non-unique one is refused, not sent.",
+    run: throwsSaying('TURBINE_E003', 'conflict target', 'cheese_wheels', 'upsert', {
+      where: { status: 'graded' },
+      create: { status: 'graded' },
+      update: { status: 'graded' },
+    }),
   },
 
   // ---- relation naming ----------------------------------------------------
@@ -293,40 +382,139 @@ const CLAIMS: Claim[] = [
     run: accepts('cheese_wheels', 'groupBy', { by: [{ field: 'tastingNotes', path: ['panel', 'verdict'] }], _count: { id: true } }),
   },
   {
-    says: 'a JSON path takes a narrower operator set: equals/gt/gte/lt/lte/contains/startsWith/endsWith.',
+    says: 'a JSON path takes a DIFFERENT operator set: equals/gt/gte/lt/lte/hasKey/contains/stringContains/stringStartsWith/stringEndsWith plus mode.',
     run: accepts('cheese_wheels', 'findMany', {
       select: { id: true },
       where: {
         OR: [
           { tastingNotes: { path: ['panel', 'score'], gte: 9 } },
+          { tastingNotes: { path: ['panel', 'score'], lt: 3 } },
           { tastingNotes: { path: ['panel', 'verdict'], equals: 'hold' } },
-          { tastingNotes: { path: ['panel', 'verdict'], contains: 'ho' } },
+          { tastingNotes: { hasKey: 'descriptors' } },
+          { tastingNotes: { contains: { panel: { seats: 4 } } } },
+          { tastingNotes: { path: ['descriptors', '0'], stringContains: 'a' } },
+          { tastingNotes: { path: ['descriptors', '0'], stringStartsWith: 'B', mode: 'insensitive' } },
+          { tastingNotes: { path: ['descriptors', '1'], stringEndsWith: 'y' } },
         ],
       },
     }),
   },
   {
-    says: 'not / in / notIn are REFUSED on a JSON path, with the accepted list in the message.',
+    says: '`contains` on a JSON column is containment (a whole sub-document), not a substring test.',
+    run: async (db) => {
+      // Containment of `{ panel: { seats: 4 } }` and equality at the path
+      // `panel.seats` select the same rows; a substring reading of `contains`
+      // could not even take an object operand. Asserted non-empty so the
+      // equality is not two empty arrays agreeing.
+      const byContainment = (await call(db, 'cheese_wheels', 'findMany', {
+        select: { id: true },
+        where: { tastingNotes: { contains: { panel: { seats: 4 } } } },
+        orderBy: { id: 'asc' },
+      })) as unknown[];
+      const byPath = await call(db, 'cheese_wheels', 'findMany', {
+        select: { id: true },
+        where: { tastingNotes: { path: ['panel', 'seats'], equals: 4 } },
+        orderBy: { id: 'asc' },
+      });
+      if (byContainment.length === 0) throw new Error('no wheel has panel.seats = 4; fixture too small to back the claim');
+      deepStrictEqual(byContainment, byPath);
+    },
+  },
+  {
+    says: 'not / in / notIn / startsWith / endsWith are REFUSED on a JSON path with E003, and the message lists the accepted set.',
     run: async (db) => {
       for (const filter of [
         { path: ['panel', 'verdict'], not: 'hold' },
         { path: ['panel', 'verdict'], in: ['hold'] },
         { path: ['panel', 'verdict'], notIn: ['hold'] },
+        { path: ['panel', 'verdict'], startsWith: 'ho' },
+        { path: ['panel', 'verdict'], endsWith: 'ld' },
       ]) {
-        await throws('TURBINE_E003', 'cheese_wheels', 'findMany', { where: { tastingNotes: filter } })(db);
+        await throwsSaying('TURBINE_E003', JSON_PATH_OPERATORS, 'cheese_wheels', 'findMany', {
+          where: { tastingNotes: filter },
+        })(db);
       }
     },
   },
   {
-    says: '_avg / _sum / _min / _max do NOT work on a JSON path.',
+    says: 'the refusal of startsWith / endsWith on a path points at the string* spelling.',
+    run: async (db) => {
+      await throwsSaying('TURBINE_E003', 'Did you mean `stringStartsWith`?', 'cheese_wheels', 'findMany', {
+        where: { tastingNotes: { path: ['panel', 'verdict'], startsWith: 'ho' } },
+      })(db);
+      await throwsSaying('TURBINE_E003', 'Did you mean `stringEndsWith`?', 'cheese_wheels', 'findMany', {
+        where: { tastingNotes: { path: ['panel', 'verdict'], endsWith: 'ld' } },
+      })(db);
+    },
+  },
+  {
+    says: 'groupBy _sum / _avg / _min / _max accept a JSON path as { field, path } under an alias key, and the alias is the result key.',
+    run: async (db) => {
+      const rows = (await call(db, 'cheese_wheels', 'groupBy', {
+        by: ['rindStyle'],
+        _sum: { score: { field: 'tastingNotes', path: ['panel', 'score'] } },
+        _avg: { meanScore: { field: 'tastingNotes', path: ['panel', 'score'] } },
+        _min: { lowest: { field: 'tastingNotes', path: ['panel', 'score'], type: 'numeric' } },
+        _max: { highest: { field: 'tastingNotes', path: ['panel', 'score'] } },
+        orderBy: { rindStyle: 'asc' },
+      })) as Array<Record<string, Record<string, unknown> | undefined>>;
+      if (rows.length === 0) throw new Error('groupBy returned no groups; fixture too small to back the claim');
+      const blocks: Array<[string, string]> = [
+        ['_sum', 'score'],
+        ['_avg', 'meanScore'],
+        ['_min', 'lowest'],
+        ['_max', 'highest'],
+      ];
+      for (const [block, alias] of blocks) {
+        if (!rows.every((r) => r[block] !== undefined && alias in r[block])) {
+          throw new Error(`${block}.${alias} is missing from a group row`);
+        }
+      }
+      if (!rows.some((r) => r._sum?.score !== null)) throw new Error('every _sum.score is null, so the path was not aggregated');
+    },
+  },
+  {
+    says: 'aggregate() has no JSON-path form: a { field, path } object is read as `true`, so the whole column reaches the database as avg(jsonb) and fails there with a DATABASE error, not a Turbine code.',
     run: async (db) => {
       try {
-        await call(db, 'cheese_wheels', 'aggregate', { _avg: { tastingNotes: { path: ['panel', 'score'] } } });
-      } catch {
-        return; // any failure backs the claim; the point is "do not do this"
+        await call(db, 'cheese_wheels', 'aggregate', {
+          _avg: { tastingNotes: { field: 'tastingNotes', path: ['panel', 'score'] } },
+        });
+      } catch (err) {
+        if (err instanceof TurbineError) {
+          throw new Error(
+            `expected a raw database error, got ${err.code}: ${err.message.split('\n')[0]}; the aggregate() sentence is now wrong`,
+          );
+        }
+        // 42883 undefined_function, `function avg(jsonb) does not exist`. Read
+        // off the error or its cause, so a safe-mode wrapper that redacts the
+        // driver's message and keeps the driver error on .cause still identifies it.
+        const sqlstate = (err as { code?: string }).code ?? (err as { cause?: { code?: string } }).cause?.code;
+        if (sqlstate !== '42883') {
+          throw new Error(
+            `expected SQLSTATE 42883 (avg(jsonb) does not exist), got ${String(sqlstate)}: ` +
+              `${err instanceof Error ? err.message.split('\n')[0] : String(err)}`,
+          );
+        }
+        return;
       }
-      throw new Error('a JSON-path aggregate succeeded, so the warning is now wrong');
+      throw new Error('a JSON-path aggregate() succeeded, so the aggregate() sentence is now wrong');
     },
+  },
+  {
+    says: 'an aggregate() key that is not a column is E003, whatever its value.',
+    run: throws('TURBINE_E003', 'cheese_wheels', 'aggregate', {
+      _sum: { score: { field: 'tastingNotes', path: ['panel', 'score'] } },
+    }),
+  },
+  {
+    says: '_count never takes a path: an object under a _count key is read as `true` and any path in it is ignored.',
+    run: same(
+      'cheese_wheels',
+      'groupBy',
+      { by: ['rindStyle'], _count: { tastingNotes: { path: ['panel'] } }, orderBy: { rindStyle: 'asc' } },
+      { by: ['rindStyle'], _count: { tastingNotes: true }, orderBy: { rindStyle: 'asc' } },
+    ),
   },
 
   // ---- aggregates and groupBy --------------------------------------------
@@ -338,6 +526,30 @@ const CLAIMS: Claim[] = [
       _max: { aromaScore: true },
       _count: { id: true },
     }),
+  },
+  {
+    says: "_sum / _avg over int8 / bigint and numeric / decimal columns return PostgreSQL's exact text as a string; over int4 they return a number.",
+    run: async (db) => {
+      const truth = await db.sql<{ sum_big: string; avg_big: string; sum_amount: string; avg_amount: string }>`
+        SELECT sum(big)::text AS sum_big, avg(big)::text AS avg_big,
+               sum(amount)::text AS sum_amount, avg(amount)::text AS avg_amount
+        FROM qa78_skill_exact_totals`.one();
+      if (!truth) throw new Error(`${EXACT_TOTALS_TABLE} is empty; the fixture did not seed`);
+      if (truth.sum_big !== '18014398509481986') throw new Error(`fixture drifted: sum(big) is ${truth.sum_big}`);
+      const agg = (await call(db, EXACT_TOTALS_TABLE, 'aggregate', {
+        _sum: { big: true, amount: true, small: true },
+        _avg: { big: true, amount: true, small: true },
+      })) as { _sum: Record<string, unknown>; _avg: Record<string, unknown> };
+      // Compared as STRINGS against the database's own rendering, so a Number()
+      // on the path fails on the value (…984 vs …986) and on the type at once.
+      deepStrictEqual(agg._sum.big, truth.sum_big);
+      deepStrictEqual(agg._avg.big, truth.avg_big);
+      deepStrictEqual(agg._sum.amount, truth.sum_amount);
+      deepStrictEqual(agg._avg.amount, truth.avg_amount);
+      if (typeof agg._sum.small !== 'number' || typeof agg._avg.small !== 'number') {
+        throw new Error(`int4 totals should stay numbers, got ${typeof agg._sum.small} / ${typeof agg._avg.small}`);
+      }
+    },
   },
   {
     says: 'groupBy `having` is column first, aggregate second.',
@@ -456,22 +668,35 @@ function claimCoverageHolds(): boolean {
 }
 
 async function main(): Promise<void> {
-  const schema: SchemaMetadata = await evalSchema();
-  const db = evalClient(schema);
+  // The database-name guard runs before the scratch table is created, so a
+  // stray URL can never receive DDL from this harness.
+  assertEvalDatabase(EVAL_DATABASE_URL);
+  const scratch = new pg.Client({ connectionString: EVAL_DATABASE_URL });
+  await scratch.connect();
   let failed = 0;
+  try {
+    await createExactTotalsFixture(scratch);
+    const schema: SchemaMetadata = await evalSchema();
+    const db = evalClient(schema);
 
-  for (const claim of CLAIMS) {
-    try {
-      await claim.run(db);
-      console.log(`  ok    ${claim.says}`);
-    } catch (err) {
-      failed++;
-      console.log(`  FAIL  ${claim.says}`);
-      console.log(`        ${err instanceof Error ? err.message.split('\n')[0] : String(err)}`);
+    for (const claim of CLAIMS) {
+      try {
+        await claim.run(db);
+        console.log(`  ok    ${claim.says}`);
+      } catch (err) {
+        failed++;
+        console.log(`  FAIL  ${claim.says}`);
+        console.log(`        ${err instanceof Error ? err.message.split('\n')[0] : String(err)}`);
+      }
     }
-  }
 
-  await closeClient();
+    await closeClient();
+  } finally {
+    // Dropped whatever happened above, and BEFORE any process.exit below,
+    // which would skip a finally.
+    await dropExactTotalsFixture(scratch).catch(() => {});
+    await scratch.end().catch(() => {});
+  }
   console.log(`\n${CLAIMS.length - failed}/${CLAIMS.length} claims hold`);
 
   // Computed before the claim-failure exit so one run reports both problems.

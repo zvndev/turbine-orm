@@ -72,19 +72,65 @@ describe('migrations smoke fixes (pure)', () => {
     }
   });
 
-  it('fix #8: drift remedy special-cases deleted files (no impossible roll-back)', () => {
+  it('fix #8: a remedy is only offered when it is actually available', () => {
+    // THE RULE: `migrate down` is offered as a way out of drift only when it
+    // could work. It needs the file on disk to read its DOWN section, so it is
+    // never a remedy for a DELETED migration, and it is never a remedy for
+    // `down` ITSELF: the refusal used to tell the reader to run the very
+    // command that had just refused.
     const missingOnly = formatChecksumMismatchError([
       { name: '20260101000000_x', expected: 'a', actual: '', type: 'missing' },
     ]);
-    assert.match(missingOnly, /deleted files cannot be rolled back/);
-    // With no modified files, the plain "roll back" line must NOT appear.
-    assert.doesNotMatch(missingOnly, /Roll back the affected migrations with `npx turbine migrate down`, OR/);
+    assert.doesNotMatch(missingOnly, /migrate down/, 'a deleted migration cannot be rolled back');
+    assert.match(missingOnly, /[Rr]estore/, 'so restoring the file is what it must say');
 
     const modifiedOnly = formatChecksumMismatchError([
       { name: '20260101000000_y', expected: 'a', actual: 'b', type: 'modified' },
     ]);
-    assert.match(modifiedOnly, /modified files only/);
-    assert.doesNotMatch(modifiedOnly, /deleted files cannot be rolled back/);
+    assert.match(modifiedOnly, /migrate down/, 'a modified migration CAN be rolled back');
+
+    const modifiedOnDown = formatChecksumMismatchError(
+      [{ name: '20260101000000_y', expected: 'a', actual: 'b', type: 'modified' }],
+      'roll back',
+    );
+    assert.doesNotMatch(modifiedOnDown, /migrate down/, 'never offer the command that just refused');
+  });
+
+  it('fix #8: the remedy list is numbered without gaps, whichever remedies apply', () => {
+    // The numbers were hardcoded 1/2/3 with 2 printed conditionally, so a
+    // deleted-only refusal read "1., (paren), 3." with no 2 anywhere.
+    for (const mismatches of [
+      [{ name: 'a', expected: 'a', actual: '', type: 'missing' as const }],
+      [{ name: 'b', expected: 'a', actual: 'b', type: 'modified' as const }],
+      [
+        { name: 'a', expected: 'a', actual: '', type: 'missing' as const },
+        { name: 'b', expected: 'a', actual: 'b', type: 'modified' as const },
+      ],
+    ]) {
+      for (const action of ['apply pending migrations', 'roll back'] as const) {
+        const numbers = [...formatChecksumMismatchError(mismatches, action).matchAll(/^ {2}(\d+)\. /gm)].map((m) =>
+          Number(m[1]),
+        );
+        assert.ok(numbers.length >= 2, `expected a numbered list, got ${numbers.length} entries`);
+        assert.deepEqual(
+          numbers,
+          numbers.map((_, i) => i + 1),
+          `${action}: numbering must run 1..n with no gaps, got ${numbers.join(',')}`,
+        );
+      }
+    }
+  });
+
+  it('fix #8: --allow-drift is described as the rewrite it performs, not as a bypass', () => {
+    // It used to be called three things in one release: the help said
+    // "Re-baseline", the runtime warning said validation was "DISABLED", and
+    // this refusal said "bypass this check". Validation runs and its result is
+    // WRITTEN BACK, so only the first was true.
+    const text = formatChecksumMismatchError([{ name: 'y', expected: 'a', actual: 'b', type: 'modified' }]);
+    assert.match(text, /--allow-drift/);
+    assert.doesNotMatch(text, /bypass this check/i, 'the flag does not skip the check');
+    assert.doesNotMatch(text, /DISABLED/i, 'nor does it disable it');
+    assert.match(text, /REWRITES|record the on-disk content/i, 'it must say what it writes');
   });
 
   it('fix #3: buildMigrateDeployOptions honors --allow-drift', () => {
@@ -285,8 +331,23 @@ describe('migrations smoke fixes (live database)', () => {
     }
   });
 
-  /** Same rule on the way up: a file with an empty UP section stops the batch. */
-  dbIt('migrate up stops at a migration with an empty UP section', async () => {
+  /**
+   * Same rule on the way up, now enforced one step EARLIER: a file whose UP
+   * section runs nothing is refused as a PRE-FLIGHT over the whole batch, so
+   * nothing at all is applied.
+   *
+   * It used to stop mid-run (migration 1 applied, migration 2 recorded as an
+   * error), which kept the important half of the contract, that a later
+   * migration is never applied over the gap. The pre-flight keeps that and
+   * costs nothing: an UP with no executable statement can only ever be a
+   * mistake, so refusing before the first BEGIN leaves the operator with one
+   * file to fix and one command to re-run rather than a half-applied batch.
+   * The check runs alongside assertNoEmbeddedTransactions, on the same batch,
+   * for the same reason. A comment-only UP (the untouched `migrate create`
+   * scaffold) is refused by the same rule, which is what the empty string here
+   * never covered.
+   */
+  dbIt('migrate up refuses the whole batch when a migration has an empty UP section', async () => {
     await resetTracking();
     const dir = freshDir('up-gap');
     const base = `sf_upgap_${Date.now()}`;
@@ -295,20 +356,20 @@ describe('migrations smoke fixes (live database)', () => {
       writeFileSync(join(dir, '20260402000002_empty.sql'), '-- UP\n-- DOWN\n');
       writeFileSync(join(dir, '20260402000003_third.sql'), `-- UP\nCREATE TABLE "${base}_c" (id int);\n-- DOWN\n`);
 
-      const res = await migrateUp(DATABASE_URL!, dir, { allowDestructive: true });
+      await assert.rejects(migrateUp(DATABASE_URL!, dir, { allowDestructive: true }), (err: unknown) => {
+        assert.ok(err instanceof Error);
+        assert.match(err.message, /TURBINE_E006/);
+        assert.match(err.message, /20260402000002_empty\.sql/);
+        return true;
+      });
 
-      assert.deepEqual(
-        res.applied.map((f) => f.filename),
-        ['20260402000001_first.sql'],
-      );
-      assert.equal(res.errors.length, 1);
-      assert.match(res.errors[0]!.file.filename, /_empty\.sql$/);
-
-      // The third migration must NOT have been applied over the gap.
-      const exists = await withClient((c) =>
-        c.query(`SELECT 1 FROM information_schema.tables WHERE table_name = $1`, [`${base}_c`]),
-      );
-      assert.equal(exists.rowCount, 0);
+      // Neither the first nor the third migration ran: nothing is applied.
+      for (const table of [`${base}_a`, `${base}_c`]) {
+        const exists = await withClient((c) =>
+          c.query(`SELECT 1 FROM information_schema.tables WHERE table_name = $1`, [table]),
+        );
+        assert.equal(exists.rowCount, 0, `${table} must not exist`);
+      }
     } finally {
       await withClient(async (c) => {
         await c.query(`DROP TABLE IF EXISTS "${base}_a"`);

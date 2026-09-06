@@ -22,11 +22,17 @@
  *
  * ## Behavior
  *
- *   - In CI (`CI` env var set): skip. The CI publish paths (release.yml,
+ *   - On GitHub Actions (`GITHUB_ACTIONS=true`, which the runner sets and
+ *     nothing else does): skip. The CI publish paths (release.yml,
  *     nightly.yml) run the full suite as their own jobs with a service
  *     container, and running it twice in the publish job would only slow the
  *     pipeline without checking anything new. The CI-status gate is skipped
  *     here too: on that path release.yml's own `needs:` chain is the gate.
+ *     NOT the generic `CI` variable: any value of it satisfied the old test,
+ *     so `CI=1 npm publish` from a laptop skipped every gate on this path with
+ *     one informational line. The skip exists for the one environment whose
+ *     own `needs:` chain is the gate, so it keys on that environment's marker
+ *     and on its exact value (src/test/check-release-tests.test.ts pins both).
  *   - Outside CI, DATABASE_URL set: run `npm test` against it and fail the
  *     publish on any failure.
  *   - Outside CI, no DATABASE_URL: refuse with instructions. The escape hatch
@@ -131,8 +137,10 @@ export function checkCiGreen(sha, deps = {}) {
 
 /** The gate itself. Exits the process; never returns on a refusal. */
 function main() {
-  if (process.env.CI) {
-    console.log('check-release-tests: CI detected, skipping (the CI publish path runs the full suite as its own job)');
+  if (process.env.GITHUB_ACTIONS === 'true') {
+    console.log(
+      'check-release-tests: GitHub Actions detected, skipping (the CI publish path runs the full suite as its own job)',
+    );
     process.exit(0);
   }
 

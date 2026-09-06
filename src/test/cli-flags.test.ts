@@ -20,7 +20,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { isLoopbackHost, parseArgs } from '../cli/index.js';
+import { isLoopbackHost, parseArgs, showSubcommandHelp } from '../cli/index.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const CLI_INDEX = resolve(__dirname, '../cli/index.ts');
@@ -86,6 +86,69 @@ describe('CLI flag regression guard', () => {
     assert.ok(source.includes('Studio refuses to bind'), 'cmdStudio must hard-fail');
     assert.ok(source.includes('Observe refuses to bind'), 'cmdObserve must hard-fail');
   });
+});
+
+describe('a global flag that CHANGES a command is documented on that command', () => {
+  /**
+   * The commands `--schema` changes the behaviour of.
+   *
+   * It is a GLOBAL flag, and the "every long flag is documented" drift guard in
+   * cli-arg-safety.test.ts walks each command's OWN flags only, deliberately:
+   * most globals are inert on most commands and demanding a help line for
+   * `--include` on `seed` would be noise. `--schema` is the exception, because
+   * it decides which Postgres namespace the command reads or writes, and
+   * `init`, `migrate` and `seed` all gained that behaviour without gaining a
+   * help line for it. `seed --help` documented exactly one flag and it was not
+   * this one.
+   *
+   * The rule, and the reason this list is explicit rather than derived: a flag
+   * that changes WHERE a command writes has to appear in that command's own
+   * `--help`, because that is what the CLI's own error messages tell the reader
+   * to run.
+   */
+  const SCHEMA_AWARE_COMMANDS = ['init', 'generate', 'pull', 'push', 'migrate', 'seed', 'status'] as const;
+
+  /** The command's rendered help, with `console.log` captured. */
+  function helpText(command: string): string {
+    const real = console.log;
+    const lines: string[] = [];
+    console.log = (...parts: unknown[]) => {
+      lines.push(parts.map(String).join(' '));
+    };
+    try {
+      assert.ok(showSubcommandHelp(command), `${command} must have a help block`);
+    } finally {
+      console.log = real;
+    }
+    return lines.join('\n');
+  }
+
+  it('renders help at all (anti-vacuous)', () => {
+    // Capturing nothing would make every assertion below pass over an empty
+    // string, which is the shape of vacuous test this repo keeps finding.
+    const text = helpText('migrate');
+    assert.ok(text.length > 200, `expected a real help block, got ${text.length} chars`);
+    assert.match(text, /Options:/);
+  });
+
+  // `--schema` and NOT `--schema-file`, which is a different flag (the path to
+  // your defineSchema() file) that every one of these help blocks already
+  // mentions. The first cut of this guard used `\\b`, which matches between `a`
+  // and `-`, so `--schema-file` satisfied it and the guard stayed green with the
+  // real lines deleted, on exactly the commands the defect was about.
+  const DOCUMENTS_SCHEMA = /--schema(?![\w-])/;
+
+  it('does not accept --schema-file as documentation for --schema (anti-vacuous)', () => {
+    assert.ok(!DOCUMENTS_SCHEMA.test('--schema-file <path>  Your defineSchema() file'));
+    assert.ok(DOCUMENTS_SCHEMA.test('--schema, -s <name>   Postgres schema'));
+    assert.ok(DOCUMENTS_SCHEMA.test('--schema <name>'));
+  });
+
+  for (const command of SCHEMA_AWARE_COMMANDS) {
+    it(`turbine ${command} --help documents --schema`, () => {
+      assert.match(helpText(command), DOCUMENTS_SCHEMA, `${command} accepts --schema and changes behaviour on it`);
+    });
+  }
 });
 
 describe('isLoopbackHost', () => {

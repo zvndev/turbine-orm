@@ -175,6 +175,54 @@ describe('global filters on a relation target, every relation-load strategy (liv
     });
   }
 
+  /**
+   * A global filter that is itself a RELATION filter, which every arm above
+   * deliberately is not: they all filter a plain column, so the sub-where they
+   * compile never needs a correlation parent and the one thing the scope quotes
+   * is never emitted. `_count` is the other missing dimension, because the
+   * batched plan answers it with a grouped COUNT of its own rather than through
+   * the child's `findMany`.
+   *
+   * Together they were the live defect: the `_count` follow-up handed the
+   * ALREADY-QUOTED child table to a scope that quotes what it is given, so the
+   * EXISTS body named `"""posts"""` and the query failed 42P01 while the join
+   * plan answered it correctly. The counts have to AGREE, not merely not throw.
+   */
+  const PRO_ORG_POSTS = { posts: { organization: { plan: 'pro' } } };
+
+  it('a relation-filter global filter on a `_count` target agrees across strategies', async () => {
+    const rows = await assertStrategiesAgree('users', PRO_ORG_POSTS, {
+      orderBy: { id: 'asc' },
+      limit: 10,
+      with: { _count: { posts: true } },
+    });
+    const counts = rows.map((u) => (u as { _count: { posts: number } })._count.posts);
+    assert.ok(
+      counts.some((c) => c > 0),
+      'every count came back 0, so an unapplied filter would agree with an applied one',
+    );
+    // The fixture has 4 posts in a `pro` org against 422 in an `enterprise` one,
+    // so a DROPPED filter would show counts far above this bound.
+    assert.ok(
+      counts.every((c) => c <= 4),
+      `expected the filter to bound each count at 4, got ${JSON.stringify(counts)}`,
+    );
+  });
+
+  it('a relation-filter global filter on relation ROWS agrees across strategies', async () => {
+    const rows = await assertStrategiesAgree('users', PRO_ORG_POSTS, {
+      orderBy: { id: 'asc' },
+      limit: 10,
+      with: { posts: true },
+    });
+    const posts = rows.flatMap((u) => (u as { posts: { orgId: unknown }[] }).posts);
+    assert.ok(posts.length > 0, 'expected at least one post to survive the relation filter');
+    assert.ok(
+      posts.every((p) => Number(p.orgId) === 2 || Number(p.orgId) === 3),
+      'every surviving post must belong to a `pro` org',
+    );
+  });
+
   it('belongsTo with: { user: true } binds the target filter under every strategy', async () => {
     // `limit` keeps `auto` on the join plan for a to-one relation (unbounded, it
     // prefers one batched follow-up over a per-parent correlated subquery).

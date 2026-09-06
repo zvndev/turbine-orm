@@ -408,9 +408,18 @@ export function connectionStringHasPassword(connectionString: string): boolean {
  * `.env` that holds the real value. The refusal lives here rather than at the
  * call site so no future caller can reintroduce the leak by passing the raw
  * `--url` through.
+ *
+ * `schema` is the RESOLVED Postgres schema (`--schema` or the default), written
+ * as the config's `schema` value. `init --schema app` probes `app` and then
+ * used to write `schema: 'public'` regardless, so the next documented step,
+ * `push`, diffed the starter schema against the wrong namespace and proposed
+ * dropping every column it found there.
  */
-export function configTemplate(connectionString?: string): string {
+export function configTemplate(connectionString?: string, schema = 'public'): string {
   const inlineUrl = connectionString && !connectionStringHasPassword(connectionString) ? connectionString : undefined;
+  // Same delimiter rule as the URL below: a schema name is an arbitrary
+  // identifier, and a quote in it must not end the TS string early.
+  const schemaLiteral = schema.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
   // Single quotes are the string delimiter in the emitted TS, so a connection
   // string containing one would otherwise produce a config file that does not
   // parse (a password-free URL can still carry a quote in a query parameter).
@@ -432,7 +441,7 @@ ${urlLine}
   out: './generated/turbine',
 
   /** Postgres schema to introspect (default: public) */
-  schema: 'public',
+  schema: '${schemaLiteral}',
 
   /** Tables to exclude from generation */
   // exclude: ['_migrations', '_sessions'],

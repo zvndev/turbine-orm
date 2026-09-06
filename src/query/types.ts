@@ -321,7 +321,13 @@ export interface WhereOperator<V = unknown, F extends string = string> {
   contains?: string;
   startsWith?: string;
   endsWith?: string;
-  /** Set to 'insensitive' to use ILIKE instead of LIKE for string comparisons */
+  /**
+   * `'insensitive'` makes the comparison case-insensitive on a string column:
+   * `contains` / `startsWith` / `endsWith` use ILIKE (or the dialect's
+   * equivalent), and `equals` (or a bare value), `not`, `in` and `notIn` fold
+   * case on both sides (`LOWER(...)`). A `mode` beside a non-string operand
+   * throws `ValidationError` (E003).
+   */
   mode?: 'default' | 'insensitive';
 }
 
@@ -1285,8 +1291,15 @@ export interface DeleteManyArgs<T, R extends object = {}> {
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
 export interface UpsertArgs<T, R extends object = {}> {
   where: WhereClause<T, R>;
+  /** The row to insert when `where` matches nothing. Plain values only: there is no stored value to operate on yet. */
   create: Partial<T>;
-  update: Partial<T>;
+  /**
+   * Applied to the existing row on conflict. Each field takes a plain value or
+   * the same atomic {@link UpdateOperatorInput} `update()` takes, so
+   * `count: { increment: 1 }` adds to the stored value instead of overwriting
+   * it. Scalar fields only: nested relation writes are not part of an upsert.
+   */
+  update: UpdateInput<T>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
@@ -1659,14 +1672,19 @@ type GroupByKeys<A> = A extends { by: infer BY } ? (BY extends readonly unknown[
 type GroupByFieldKeys<T, A> = Extract<GroupByKeys<A>, keyof T & string>;
 
 /**
- * `_sum` / `_avg` result block: every requested key maps to `number | null`
- * (an aggregate over zero matching rows is null). Present only when the args
- * actually requested the block. A JSON-path aggregate target keys by its arg
- * key (the alias), so `keyof S` covers both plain columns and JSON aliases.
+ * `_sum` / `_avg` result block: every requested key maps to
+ * `number | string | null`. A `string` comes back for an int8 / bigint or
+ * numeric / decimal source column, whose SUM and AVG PostgreSQL widens to
+ * arbitrary-precision `numeric` and whose exact text is returned to avoid
+ * precision loss (see {@link AggregateResult}); every other column, and every
+ * JSON-path aggregate, is a `number`; `null` is an aggregate over zero
+ * matching rows. Present only when the args actually requested the block. A
+ * JSON-path aggregate target keys by its arg key (the alias), so `keyof S`
+ * covers both plain columns and JSON aliases.
  */
 type GroupBySumAvgPart<A, Key extends '_sum' | '_avg'> = A extends { [P in Key]: infer S }
   ? [S] extends [object]
-    ? { [P in Key]: { [K in keyof S & string]: number | null } }
+    ? { [P in Key]: { [K in keyof S & string]: number | string | null } }
     : unknown
   : unknown;
 
@@ -1753,11 +1771,20 @@ export interface AggregateArgs<T, R extends object = {}> {
   forceCustomPlan?: boolean;
 }
 
-/** Result type for aggregate queries */
+/**
+ * Result type for aggregate queries.
+ *
+ * `_sum` / `_avg` are a `number` for int2 / int4 / float columns and a
+ * `string` for int8 / bigint and numeric / decimal columns: PostgreSQL widens
+ * SUM and AVG over those to arbitrary-precision `numeric`, and the exact text
+ * is returned to avoid precision loss, the same policy under which a `numeric`
+ * column value and an int8 value above 2^53 - 1 read back as strings. `null`
+ * is an aggregate over zero rows.
+ */
 export interface AggregateResult<T> {
   _count?: number | Record<string, number>;
-  _sum?: Partial<Record<keyof T & string, number | null>>;
-  _avg?: Partial<Record<keyof T & string, number | null>>;
+  _sum?: Partial<Record<keyof T & string, number | string | null>>;
+  _avg?: Partial<Record<keyof T & string, number | string | null>>;
   _min?: Partial<Record<keyof T & string, unknown>>;
   _max?: Partial<Record<keyof T & string, unknown>>;
 }
@@ -1983,8 +2010,40 @@ export interface JsonPathOrderBy {
  *  - to-one (belongsTo / hasOne): `{ author: { name: 'asc' } }`, orders by a
  *    correlated scalar subquery on the target column (an {@link OrderBySpec} with
  *    `nulls` is accepted too).
+ *  - a CHAIN of to-one hops: `{ author: { organization: { name: 'asc' } } }`.
+ *    Each further hop is a JOIN inside that same subquery, so the chain costs
+ *    one subquery whatever its length. The type admits a head relation plus
+ *    ten chained hops, eleven relation keys in all, which is exactly where the
+ *    builder stops (`MAX_ORDER_BY_RELATION_HOPS` in query/relations.ts, the
+ *    nested-`with` cap; a twelfth hop is E007). The bound is a countdown
+ *    through a fixed table rather than an unbounded self reference, so `tsc`
+ *    never has to report an excessively deep instantiation.
+ *
+ * The chain is keyed by `string`, not by the target's relation map, so it
+ * cannot tell a to-many hop from a to-one one: `{ author: { posts: { title } } }`
+ * typechecks and is refused by the builder with E003 (a to-many relation has
+ * no single value to order by; {@link RelationPickOrderBy} exists for that).
+ * Everything else about the shape is checked: a value at any depth is a
+ * direction, a `{ sort, nulls }` spec, or the next hop.
  */
-export type RelationOrderBy = { _count: OrderDirection } | Record<string, OrderDirection | OrderBySpec>;
+export type RelationOrderBy = { _count: OrderDirection } | RelationOrderByChain<10>;
+
+/**
+ * The to-one branch of {@link RelationOrderBy}: a map from a target column to
+ * a direction or an {@link OrderBySpec}, or from a further to-one relation to
+ * the next link, with `Hops` links still allowed beneath this one. At `0` the
+ * next link is `never`, so only columns remain.
+ */
+export type RelationOrderByChain<Hops extends number> = Record<
+  string,
+  OrderDirection | OrderBySpec | ([Hops] extends [0] ? never : RelationOrderByChain<RelationOrderByHopsLeft[Hops]>)
+>;
+
+/**
+ * `RelationOrderByHopsLeft[n]` is `n - 1`. Index 0 holds `never` and is never
+ * read: {@link RelationOrderByChain} stops before indexing it.
+ */
+type RelationOrderByHopsLeft = [never, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 
 /**
  * The ordering value extracted from the picked row in a

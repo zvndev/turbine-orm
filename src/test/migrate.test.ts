@@ -17,19 +17,24 @@ import { after, before, describe, it } from 'node:test';
 import {
   type AppliedMigration,
   assertNoEmbeddedTransactions,
+  assertUpHasStatements,
   canUpgradeLegacyChecksum,
   createMigration,
+  deriveLockId,
   findTransactionControlStatements,
   formatTimestamp,
+  getCurrentDatabaseName,
   getPendingMigrations,
   headerSafeName,
   isChecksumValid,
+  listIgnoredSqlFiles,
   listMigrationFiles,
   type MigrationFile,
   type MigrationTxClient,
   parseMigrationContent,
   parseMigrationFilename,
   planMigrationDeploy,
+  rebaselineChecksums,
   rollbackMigrations,
   runMigrationInTransaction,
   sanitizeName,
@@ -1046,6 +1051,74 @@ function fakeClient(failOn: Record<string, string>): MigrationTxClient & { calls
   };
 }
 
+describe('deriveLockId', () => {
+  // The advisory lock ID is derived from the database NAME so two databases in
+  // one cluster do not contend on a single hardcoded number. Two properties are
+  // load-bearing and neither is observable from the migration path that uses
+  // it: the value must be stable across processes, and it must fit in a
+  // POSITIVE int4, which is the range pg_advisory_lock's single-argument form
+  // accepts. A negative or out-of-range id is not a weaker lock, it is an
+  // error from the server in the middle of a migration run.
+  it('is stable for one name and differs across names', () => {
+    assert.equal(deriveLockId('turbine_test'), deriveLockId('turbine_test'));
+    assert.notEqual(deriveLockId('turbine_test'), deriveLockId('turbine_prod'));
+    assert.notEqual(deriveLockId('a'), deriveLockId('b'));
+  });
+
+  it('always lands in the positive int4 range pg_advisory_lock accepts', () => {
+    const names = ['', 'a', 'turbine', 'turbine_test', 'x'.repeat(200), 'DB-with.dots_and-dashes', 'ünïcødé'];
+    for (const name of names) {
+      const id = deriveLockId(name);
+      assert.ok(Number.isSafeInteger(id), `${JSON.stringify(name)} produced ${id}`);
+      assert.ok(id >= 0, `${JSON.stringify(name)} produced a negative id: ${id}`);
+      assert.ok(id <= 0x7fffffff, `${JSON.stringify(name)} produced ${id}, above int4 max`);
+    }
+  });
+
+  it('spreads plausible sibling database names without collision', () => {
+    const names = Array.from({ length: 500 }, (_, i) => `app_tenant_${i}`);
+    const ids = new Set(names.map(deriveLockId));
+    assert.equal(ids.size, names.length, 'FNV-1a collided on sequential database names');
+  });
+});
+
+describe('getCurrentDatabaseName', () => {
+  // The value `deriveLockId` is given. The block above pins what the derivation
+  // does with a name; this pins where the name comes from, and the pair is the
+  // claim. It is asked of `current_database()` rather than parsed out of the
+  // connection string, because the string may carry no database path at all (a
+  // PGDATABASE default, a service file, a .pgpass entry) and every such
+  // database would then share one lock id.
+  const client = (rows: { current_database?: string }[]) => {
+    const asked: string[] = [];
+    return {
+      asked,
+      query: async (sql: string) => {
+        asked.push(sql);
+        return { rows };
+      },
+    };
+  };
+
+  it('reads the name from the server, not from the connection string', async () => {
+    const c = client([{ current_database: 'turbine_test' }]);
+    assert.equal(await getCurrentDatabaseName(c), 'turbine_test');
+    assert.deepEqual(c.asked, ['SELECT current_database()']);
+  });
+
+  it('an answer it cannot read becomes the empty name, and that name is still lockable', async () => {
+    // Not a throw, deliberately: the migration would then fail on a diagnostic
+    // rather than on anything the user did. The cost is that two unreadable
+    // answers share one lock, which is over-serialising and safe, and the id
+    // still has to be a legal one, so assert that rather than assume it.
+    for (const rows of [[], [{}], [{ current_database: undefined }]]) {
+      assert.equal(await getCurrentDatabaseName(client(rows)), '', JSON.stringify(rows));
+    }
+    const id = deriveLockId('');
+    assert.ok(Number.isSafeInteger(id) && id >= 0 && id <= 0x7fffffff, `empty name produced ${id}`);
+  });
+});
+
 describe('runMigrationInTransaction', () => {
   const tracking = { sql: 'INSERT INTO _turbine_migrations', params: ['m1', 'hash'] };
 
@@ -1209,5 +1282,162 @@ describe('rollbackMigrations', () => {
     assert.equal(result.rolledBack.length, 0);
     assert.equal(result.errors.length, 1);
     assert.ok(!client.calls.includes('DROP TABLE p;'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// assertUpHasStatements: an UP that runs nothing must not be recorded
+// ---------------------------------------------------------------------------
+
+describe('assertUpHasStatements', () => {
+  const dir = join(tmpdir(), `turbine-empty-up-${process.pid}-${Date.now()}`);
+  before(() => mkdirSync(dir, { recursive: true }));
+  after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const withFile = (name: string, content: string): MigrationFile => {
+    const filename = `${name}.sql`;
+    writeFileSync(join(dir, filename), content);
+    return { filename, path: join(dir, filename), name, timestamp: name.slice(0, 14) };
+  };
+
+  it('refuses the untouched `migrate create` scaffold, naming the file and the fix', () => {
+    const file = createMigration(dir, 'forgot_to_edit');
+    assert.throws(
+      () => assertUpHasStatements([file]),
+      (err: unknown) => {
+        assert.ok(err instanceof Error);
+        assert.match(err.message, /TURBINE_E006/);
+        assert.ok(err.message.includes(file.filename), err.message);
+        assert.match(err.message, /no executable statement/);
+        assert.match(err.message, /Write the UP section or delete the file/);
+        return true;
+      },
+    );
+  });
+
+  it('refuses a comment-only UP under -- turbine:no-transaction just the same', () => {
+    const file = withFile(
+      '20260101000001_concurrent_nothing',
+      '-- turbine:no-transaction\n-- UP\n-- CREATE INDEX CONCURRENTLY later\n\n-- DOWN\n-- nothing\n',
+    );
+    assert.throws(() => assertUpHasStatements([file]), /TURBINE_E006/);
+  });
+
+  it('refuses an UP that is only whitespace and a block comment', () => {
+    const file = withFile('20260101000002_blank', '-- UP\n\n  /* todo */\n\n-- DOWN\nSELECT 1;\n');
+    assert.throws(() => assertUpHasStatements([file]), /TURBINE_E006/);
+  });
+
+  it('accepts one real statement surrounded by comments, and a statement with no trailing semicolon', () => {
+    const a = withFile(
+      '20260101000003_real',
+      '-- UP\n-- adds t\nCREATE TABLE t (id int); -- done\n\n-- DOWN\nDROP TABLE t;\n',
+    );
+    const b = withFile('20260101000004_nosemi', '-- UP\nCREATE TABLE u (id int)\n-- DOWN\nDROP TABLE u;\n');
+    assert.doesNotThrow(() => assertUpHasStatements([a, b]));
+  });
+
+  it('checks the WHOLE batch before anything runs: the empty file is refused even when it is not first', () => {
+    const real = withFile('20260101000005_real2', '-- UP\nCREATE TABLE v (id int);\n-- DOWN\nDROP TABLE v;\n');
+    const empty = withFile('20260101000006_empty2', '-- UP\n-- later\n-- DOWN\n');
+    assert.throws(() => assertUpHasStatements([real, empty]), /20260101000006_empty2\.sql/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// listIgnoredSqlFiles: a misnamed migration must not vanish in silence
+// ---------------------------------------------------------------------------
+
+describe('listIgnoredSqlFiles', () => {
+  const dir = join(tmpdir(), `turbine-ignored-sql-${process.pid}-${Date.now()}`);
+  before(() => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '20260101000001_ok.sql'), '-- UP\nSELECT 1;\n-- DOWN\n');
+    writeFileSync(join(dir, 'add_thing.sql'), '-- UP\nSELECT 1;\n-- DOWN\n');
+    writeFileSync(join(dir, '2026090100017_short_ts.sql'), '-- UP\nSELECT 1;\n-- DOWN\n');
+    writeFileSync(join(dir, 'notes.txt'), 'not sql');
+  });
+  after(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('names every .sql file the runner will never see, and nothing else', () => {
+    assert.deepEqual(listIgnoredSqlFiles(dir), ['2026090100017_short_ts.sql', 'add_thing.sql']);
+    assert.deepEqual(
+      listMigrationFiles(dir).map((f) => f.filename),
+      ['20260101000001_ok.sql'],
+    );
+  });
+
+  it('is empty for a missing directory and for a clean one', () => {
+    assert.deepEqual(listIgnoredSqlFiles(join(dir, 'nope')), []);
+    const clean = join(dir, 'clean');
+    mkdirSync(clean);
+    writeFileSync(join(clean, '20260101000001_ok.sql'), '-- UP\nSELECT 1;\n-- DOWN\n');
+    assert.deepEqual(listIgnoredSqlFiles(clean), []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// rebaselineChecksums: --allow-drift is a decision, not a permanent condition
+// ---------------------------------------------------------------------------
+
+describe('rebaselineChecksums', () => {
+  const dir = join(tmpdir(), `turbine-rebaseline-${process.pid}-${Date.now()}`);
+  const NAME = '20260101000001_init';
+  const CURRENT = '-- UP\nCREATE TABLE t (id int);\n-- DOWN\nDROP TABLE t;\n';
+  const currentHash = createHash('sha256').update(CURRENT, 'utf-8').digest('hex');
+
+  before(() => {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, `${NAME}.sql`), CURRENT);
+  });
+  after(() => rmSync(dir, { recursive: true, force: true }));
+
+  /** Records the UPDATEs so the test can see exactly which rows were rewritten. */
+  function recordingClient() {
+    const updates: Array<{ sql: string; params: unknown[] }> = [];
+    return {
+      updates,
+      client: {
+        async query(sql: string, params: unknown[] = []): Promise<unknown> {
+          if (/^\s*UPDATE/i.test(sql)) updates.push({ sql, params });
+          return { rows: [] };
+        },
+      } as unknown as Parameters<typeof rebaselineChecksums>[0],
+    };
+  }
+
+  it("rewrites a modified migration's stored hash to the file's current hash, and reports both", async () => {
+    const fake = recordingClient();
+    const done = await rebaselineChecksums(fake.client, dir, [
+      { name: NAME, expected: 'stale0000000000', actual: currentHash, type: 'modified' },
+    ]);
+    assert.deepEqual(done, [{ name: NAME, from: 'stale0000000000', to: currentHash }]);
+    assert.equal(fake.updates.length, 1);
+    assert.deepEqual(fake.updates[0]!.params, [currentHash, NAME]);
+  });
+
+  it("never touches a DELETED file's row: there is no content to hash, and the row is the only record it ran", async () => {
+    const fake = recordingClient();
+    const done = await rebaselineChecksums(fake.client, dir, [
+      { name: '20260101000002_gone', expected: 'stale', actual: '', type: 'missing' },
+    ]);
+    assert.deepEqual(done, []);
+    assert.deepEqual(fake.updates, []);
+  });
+
+  it('issues no statement at all when nothing drifted', async () => {
+    const fake = recordingClient();
+    assert.deepEqual(await rebaselineChecksums(fake.client, dir, []), []);
+    assert.deepEqual(fake.updates, []);
+  });
+
+  it("hashes the file as it stands now, not the mismatch report's `actual`", async () => {
+    // The report is a snapshot; the file is the authority at the moment of the
+    // rewrite, and a stale `actual` would re-baseline to content nobody has.
+    const fake = recordingClient();
+    const done = await rebaselineChecksums(fake.client, dir, [
+      { name: NAME, expected: 'stale', actual: 'not-the-file-hash', type: 'modified' },
+    ]);
+    assert.equal(done[0]!.to, currentHash);
   });
 });

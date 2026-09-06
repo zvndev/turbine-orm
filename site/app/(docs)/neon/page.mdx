@@ -48,7 +48,7 @@ For Vercel Edge, Cloudflare Workers, Deno Deploy, or any serverless runtime:
 ```ts
 import { Pool } from '@neondatabase/serverless';
 import { turbineHttp } from 'turbine-orm/serverless';
-import { SCHEMA } from './generated/turbine/metadata';
+import { SCHEMA } from './generated/turbine/metadata.js';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
 const db = turbineHttp(pool, SCHEMA);
@@ -76,7 +76,7 @@ npx turbine migrate status
 
 ## Why Turbine on Neon?
 
-- **No WASM**: the edge entry is held under 69 kB brotli in CI (Prisma 7: ~1.6 MB TS/WASM query compiler)
+- **No WASM**: the edge entry is held under 72 kB brotli in CI (Prisma 7: ~1.6 MB TS/WASM query compiler)
 - **Single-query nested reads**, one SQL statement via `json_agg`, not N+1
 - **Pipeline batching**, N queries in 1 round-trip (critical for high-latency serverless)
 - **No adapter layer**, `turbineHttp(pool, SCHEMA)` with any pg-compatible driver

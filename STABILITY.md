@@ -22,7 +22,7 @@ These are the surfaces we intend to carry to 1.0 and beyond. We will not break t
 | **Query API** | `findMany`, `findUnique`, `findFirst`, `findUniqueOrThrow`, `findFirstOrThrow`, `create`, `createMany`, `update`, `updateMany`, `delete`, `deleteMany`, `upsert`, `count`, `aggregate`, `groupBy`, including their `where`, `with`, `orderBy`, `select`, `omit`, and `limit`/cursor arguments and the types they return. |
 | **`with`-clause type inference** | The compile-time return types produced by `with`, `select`, and `omit`. We treat a regression in inference as a bug, not a free minor change. |
 | **Typed errors** | The `TurbineError` hierarchy and the **error codes** (`TURBINE_E001`–`TURBINE_E018`). A code, once assigned, keeps its meaning. Structured fields on errors (`.code`, `.docsUrl`, `.columns`, `.constraint`, `.where`, `.cause`) are stable; human-readable `.message` *text* is not (see below). |
-| **CLI commands** | `init`, `generate` / `pull`, `push`, `migrate create\|up\|down\|deploy\|status`, `seed`, `status`, `doctor`, `studio`, `mcp`, `observe`. The migration file format (`-- UP` / `-- DOWN`, timestamp-prefixed `.sql`, SHA-256 checksums in `_turbine_migrations`) is stable. |
+| **CLI commands** | `init`, `generate` / `pull`, `push`, `migrate create\|up\|down\|deploy\|status`, `seed`, `status`, `doctor`, `studio`, `mcp`. The migration file format (`-- UP` / `-- DOWN`, timestamp-prefixed `.sql`, SHA-256 checksums in `_turbine_migrations`) is stable. `observe`, `migrate-from-prisma` and `skill` are tiered Experimental below. |
 | **Client configuration** | `TurbineConfig` fields and the `$transaction`, `$use`, `$on`/`$off`, `pipeline`, and raw-SQL tagged-template APIs on `TurbineClient`. |
 
 ### Experimental surfaces
@@ -32,7 +32,8 @@ These work and are tested, but they are still moving. We may change their API or
 | Surface | Why it's experimental |
 |---|---|
 | **Non-Postgres dialect adapters** (`src/adapters/`, CockroachDB, YugabyteDB) | These ride on PostgreSQL wire compatibility and are not yet covered by a full parity suite. Behavior may change as we expand coverage. |
-| **Observability** (`db.$observe`, the `_turbine_metrics` table, `turbine observe`) | The metric schema, aggregation windows, and dashboard are subject to change. |
+| **Observability** (`db.$observe`, the `_turbine_metrics` table, `turbine observe`) | The metric schema, aggregation windows, and the `turbine observe` dashboard (which needs `TURBINE_OBSERVE_URL` to point at the metrics database) are subject to change. |
+| **Agent skill** (`turbine skill`, the packaged `skills/turbine-orm/SKILL.md`) | The command's flags (`--print`, `--agents`, `--dir`) are few and unlikely to move, but the skill's text is rewritten whenever the ORM's behaviour changes: every sentence in it is executed against a live database before release, so it tracks the current minor by design. Treat the text as documentation, not as a contract. |
 | **Serverless / edge binding** (`turbine-orm/serverless`, `turbineHttp`) | The query API it exposes is Stable; the *driver-binding contract* (which external pools we accept and how) may evolve as serverless Postgres drivers change. |
 | **Non-Postgres engines** (`turbine-orm/sqlite`, `/mysql`, `/mssql`, `/powdb`) | The typed query API is shared with the Postgres path, but each engine's capability boundaries and factory options are still moving, and PowDB tracks a young upstream engine whose supported feature set is version-gated. |
 | **Prisma migration toolkit** (`turbine migrate-from-prisma`, `turbine-orm/prisma-compat`) | The report format, the emitted `PRISMA_MAP` shape, and the set of Prisma behaviors the adapter translates are all expected to grow. It is a migration aid, not a surface to build on long-term. |
@@ -80,17 +81,17 @@ The practical guidance: stay on the latest minor. We do not backport fixes to ol
   > test will tell you if this paragraph goes stale. They were corrected once by
   > hand in 0.65.0 and had drifted again by 0.76.0, which is why the assertion
   > exists.
-- **Published releases, in sync.** Every release has a matching `vX.Y.Z` git tag **and** a published GitHub Release with notes. npm, git tags, and GitHub Releases agree. (See [docs/releases/](./docs/releases/).)
+- **Published releases, in sync.** Every release has a matching `vX.Y.Z` git tag **and** a published GitHub Release with notes. npm, git tags, and GitHub Releases agree. (See [GitHub Releases](https://github.com/zvndev/turbine-orm/releases) and [CHANGELOG.md](./CHANGELOG.md); [docs/releases/](./docs/releases/) holds only one hand-written file from before that step was automated.)
 - **Migration durability.** The migration format and `_turbine_migrations` schema are committed to as-is, a 1.0 upgrade must not require re-checksumming or re-applying existing migrations.
 
-### Honest status today (0.76 line)
+### Honest status today (0.78 line)
 
 We are **not at 1.0 yet**, and the gaps are specific. (This section is dated by its claims, not by a version stamp; an earlier revision froze itself at 0.48.0 and quietly aged for 16 minors.)
 
 - Real-engine CI runs Postgres 14–17 on every PR, plus MySQL / SQL Server / CockroachDB / PowDB integration jobs as hard gates. Non-Postgres engines remain **Experimental** for the public API contract.
 - Multi-dialect engines (SQLite / MySQL / MSSQL / PowDB) ship as subpath exports but are not yet on the Stable tier, see Experimental surfaces.
 - Every release gets a git tag and a GitHub Release with notes from the CHANGELOG; the release workflow creates the GitHub Release automatically on a tag push.
-- The formal Stable-surface freeze has **not started**. The 0.49–0.73 run shipped several breaking changes to Stable surfaces, each under the security/correctness escape hatch above (silent-wrong-results fixes), each called out in the CHANGELOG. The most recent is 0.73.0, where `findUnique` began refusing a `where` that does not identify a single row: it previously returned an arbitrary one of the matching rows, which is the same class. The freeze clock starts when a release ships with no such change, and resets when one does.
+- The formal Stable-surface freeze has **not started**. The 0.49–0.78 run shipped several breaking changes to Stable surfaces, each under the security/correctness escape hatch above (silent-wrong-results fixes), each called out in the CHANGELOG. The most recent is 0.78.0, and it is the largest of them: six, of which the clearest is `update()`, `delete()` and `upsert()` refusing a `where` that does not identify a single row. That is the exact sibling of the 0.73.0 change to `findUnique`, five releases later, on the three methods that write to one row. The freeze clock starts when a release ships with no such change, and resets when one does, so it resets here.
 
 When those are addressed, we'll cut 1.0, and not before. Until then, the safe way to adopt Turbine is to **pin a version** and read the CHANGELOG before upgrading. Stable surfaces should carry you across minors without code changes; Experimental surfaces may not.
 

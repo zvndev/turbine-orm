@@ -57,7 +57,7 @@ const pillars = [
   {
     title: 'Nested relations, one statement',
     description:
-      'A with clause compiles to correlated json_agg subqueries, so users with posts with comments is one round trip. The result is typed end to end at any depth, with no manual annotation. Four load strategies produce identical rows, held to byte-identical output by a differential fuzz suite.',
+      'A with clause compiles to correlated json_agg subqueries, so users with posts with comments is one round trip. The result is typed end to end at any depth, with no manual annotation. Four load strategies produce identical rows: join, batched and auto are held to byte-identical output by a differential fuzz suite, flatten by its own parity suite.',
     stat: '1',
     statLabel: 'query, any depth',
   },
@@ -71,8 +71,8 @@ const pillars = [
   {
     title: 'Small enough for the edge',
     description:
-      'The main entry is held under 87 kB brotli as an import graph with pg external, the edge entry under 69 kB, enforced by size-limit in CI. One import swap runs the same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase. No separate serverless build, no WASM bundle in your cold start.',
-    stat: '87 kB',
+      'The main entry is held under 91 kB brotli as an import graph with pg external, the edge entry under 72 kB, enforced by size-limit in CI. One import swap runs the same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase. No separate serverless build, no WASM bundle in your cold start.',
+    stat: '91 kB',
     statLabel: 'CI-enforced ceiling',
   },
   {
@@ -555,8 +555,9 @@ export default async function Home() {
                 <code>null</code>, per-relation <code>limit</code> and{' '}
                 <code>orderBy</code> apply per parent rather than to the whole
                 result, and every type survives the JSON round trip, dates
-                included. The strategies are held to byte-identical output by a
-                differential fuzz suite.
+                included. The join, batched and auto strategies are held to
+                byte-identical output by a differential fuzz suite, and flatten
+                to the same parity by its own suite.
               </p>
 
               <ul className="showcase-list">
@@ -666,7 +667,7 @@ export default async function Home() {
                 ['Runtime deps', '1 (pg)', '@prisma/client + required driver adapter', '0'],
                 [
                   'Main bundle (brotli)',
-                  'under 87 KB import graph, pg external',
+                  'under 91 KB import graph, pg external',
                   '~1.6 MB client (TS/WASM compiler)',
                   '~7 KB core',
                 ],
@@ -675,7 +676,7 @@ export default async function Home() {
                 ['MCP server for agents', '11 read-only tools, PII-redacted', 'Official MCP server', 'drizzle-kit mcp'],
                 ['Error PII safety', 'Keys only by default', 'Values in messages', 'Raw pg errors'],
                 ['Migrations', 'SQL-first, SHA-256 drift detection', 'DSL-generated, shadow DB', 'SQL or Drizzle Kit'],
-                ['Edge runtime', 'One import swap, under 69 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
+                ['Edge runtime', 'One import swap, under 72 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
                 ['Pipeline batching', 'Parse/Bind/Execute protocol', 'Sequential in txn', 'Sequential'],
                 ['Typed errors', 'isRetryable discriminant', 'Error codes only', 'None'],
                 [

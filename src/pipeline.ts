@@ -22,7 +22,12 @@
 import { type Dialect, postgresDialect } from './dialect.js';
 import { PipelineError, type PipelineResultSlot, TurbineError, wrapPgError } from './errors.js';
 import type { PgCompatPool, PgCompatPoolClient, PgCompatQueryResult } from './pg-types.js';
-import { type PipelineRunOptions, runPipelined, supportsExtendedPipeline } from './pipeline-submittable.js';
+import {
+  type PipelineRunOptions,
+  pipelineClientNeedsDiscard,
+  runPipelined,
+  supportsExtendedPipeline,
+} from './pipeline-submittable.js';
 import type { DeferredQuery } from './query/index.js';
 
 // ---------------------------------------------------------------------------
@@ -277,7 +282,18 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
     if (err instanceof TurbineError) throw err;
     throw wrapPgError(err);
   } finally {
-    client.release();
+    // A client the pipeline could not return to a clean state is released WITH
+    // an error, which is how pg-pool is told to drop it rather than lend it
+    // out again. `runPipelined` rolls back its own aborted transaction, so this
+    // is the residue: a rollback that did not take, or a backend left in a
+    // transaction by something other than this module. Releasing such a client
+    // normally is what turned one failed batch into `25P02` on somebody else's
+    // query.
+    if (pipelineClientNeedsDiscard(client)) {
+      client.release(new Error('turbine: pipeline connection left an open transaction and was discarded'));
+    } else {
+      client.release();
+    }
   }
 }
 

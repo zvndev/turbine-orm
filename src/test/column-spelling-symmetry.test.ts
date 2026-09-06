@@ -272,7 +272,9 @@ const SURFACES: Surface[] = [
   },
   {
     name: 'update where',
-    build: (n) => q().buildUpdate({ where: { [n]: null }, data: { viewCount: 1 } } as never),
+    // `update` returns one row, so its where must carry an identifying key
+    // (query/compound-unique.ts); the probed column rides beside it.
+    build: (n) => q().buildUpdate({ where: { id: 'x', [n]: null }, data: { viewCount: 1 } } as never),
   },
   {
     name: 'updateMany data',

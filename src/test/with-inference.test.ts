@@ -433,10 +433,11 @@ type GbByCount = GroupByResult<Sale, { by: ['region'] }>;
 assertTrue<Equals<GbByCount['region'], string>>();
 assertTrue<Equals<GbByCount['_count'], number>>();
 
-// --- _sum / _avg map their fields to number | null ---
+// --- _sum / _avg map their fields to number | string | null (a string is the
+//     exact text of an int8 / numeric total, see AggregateResult) ---
 type GbSumAvg = GroupByResult<Sale, { by: ['region']; _sum: { amount: true }; _avg: { amount: true } }>;
-assertTrue<Equals<GbSumAvg['_sum'], { amount: number | null }>>();
-assertTrue<Equals<GbSumAvg['_avg'], { amount: number | null }>>();
+assertTrue<Equals<GbSumAvg['_sum'], { amount: number | string | null }>>();
+assertTrue<Equals<GbSumAvg['_avg'], { amount: number | string | null }>>();
 
 // --- _min / _max carry the entity field's own type ---
 type GbMinMax = GroupByResult<Sale, { by: ['region']; _min: { createdAt: true }; _max: { amount: true } }>;
@@ -461,7 +462,7 @@ async function groupByCallSite() {
     type Row = (typeof rows)[number];
     assertTrue<Equals<Row['region'], string>>();
     assertTrue<Equals<Row['_count'], number>>();
-    assertTrue<Equals<Row['_sum'], { amount: number | null }>>();
+    assertTrue<Equals<Row['_sum'], { amount: number | string | null }>>();
   }
 }
 void groupByCallSite;

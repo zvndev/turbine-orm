@@ -2147,9 +2147,11 @@ describe('powdb: reserved-word identifiers are backtick-quoted in bare positions
     assert.match(m.last().powql, /^insert `order` \{ /);
     assert.match(m.last().powql, /`type` := \$\d/);
 
-    await kwQi(m).update({ where: { type: 'news' }, data: { limit: { increment: 1 } } as never });
-    // filter uses the dotted ref (bare); the assignment target is quoted.
-    assert.match(m.last().powql, /^`order` filter \.type = \$1 update \{ `limit` := \.limit \+ \$2 \} returning$/);
+    // Addressed by PK: `update` returns one row, so its where must identify
+    // one (query/compound-unique.ts). The filter uses the dotted ref (bare);
+    // the assignment target is quoted.
+    await kwQi(m).update({ where: { id: 'x' }, data: { limit: { increment: 1 } } as never });
+    assert.match(m.last().powql, /^`order` filter \.id = \$1 update \{ `limit` := \.limit \+ \$2 \} returning$/);
 
     await kwQi(m).upsert({
       where: { id: 'x' },

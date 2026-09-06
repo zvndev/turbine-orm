@@ -12,11 +12,20 @@
  * needs a build). It fails when someone edits one number without the other, in
  * either direction, which is the only way the two can come apart.
  *
+ * IT READ README.md ONLY, and the same two numbers are published in five more
+ * places under `site/`, which is the actual marketing surface. A re-baseline
+ * moved the README and the site's feature paragraph and left the comparison
+ * TABLE on the same page saying the old figures, so the homepage stated two
+ * numbers about the shipped artifact that were false. A guard that covers one
+ * of six copies is the drift it exists to prevent, so it now sweeps every
+ * tracked file that states one of these claims and requires each to equal the
+ * gate. Adding a new page that repeats the claim needs no edit here.
+ *
  * Run: npx tsx --test src/test/size-claim-sync.test.ts
  */
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
@@ -25,6 +34,39 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(__dirname, '../..');
 const README = readFileSync(resolve(ROOT, 'README.md'), 'utf-8');
 const SIZE_LIMIT = readFileSync(resolve(ROOT, '.size-limit.js'), 'utf-8');
+
+/**
+ * Every tracked file that could state a size claim, README and site alike.
+ * Found by walking rather than listed, so a new page is covered the day it is
+ * written. `site/lib/changelog.generated.ts` is excluded because it is the
+ * rendered CHANGELOG, whose older entries quote the figures that were true at
+ * the time and must stay that way.
+ */
+function claimBearingFiles(): string[] {
+  const roots = ['README.md', 'STABILITY.md', 'site/app', 'docs/releases'];
+  const out: string[] = [];
+  const walk = (rel: string): void => {
+    const abs = resolve(ROOT, rel);
+    if (!existsSync(abs)) return;
+    if (!statSync(abs).isDirectory()) {
+      if (/\.(md|mdx|tsx?)$/.test(rel)) out.push(rel);
+      return;
+    }
+    for (const entry of readdirSync(abs)) {
+      if (entry === 'node_modules' || entry.startsWith('.')) continue;
+      walk(`${rel}/${entry}`);
+    }
+  };
+  for (const r of roots) walk(r);
+  return out.filter((f) => !f.endsWith('changelog.generated.ts'));
+}
+
+/**
+ * Any "under N kB/KB" figure that is followed, within the same sentence, by
+ * language tying it to this package's bundle. Deliberately loose about the
+ * wording and strict about the number: the claim is the number.
+ */
+const CLAIM = /under\s+\*{0,2}(\d+)\s*[kK]B\*{0,2}\s*(brotli|import graph)/g;
 
 /** The `limit: 'N kB'` of the size-limit entry whose `name` contains `label`. */
 function limitFor(label: string): number {
@@ -66,6 +108,35 @@ describe('README bundle-size claims equal the size-limit gate', () => {
     ];
     assert.ok(figures.length >= 2, 'both edge claims must still be present');
     for (const n of figures) assert.equal(n, gate, `README says ${n} kB, the gate is ${gate} kB`);
+  });
+
+  it('every tracked file that states one of these claims states the gate', () => {
+    const gates = new Set([
+      limitFor('main entry, import { TurbineClient }'),
+      limitFor('edge entry, turbine-orm/serverless'),
+    ]);
+    const files = claimBearingFiles();
+    assert.ok(files.length > 5, `the file walk found ${files.length} files, so this check would be vacuous`);
+
+    const wrong: string[] = [];
+    let claims = 0;
+    for (const file of files) {
+      const text = readFileSync(resolve(ROOT, file), 'utf-8');
+      for (const m of text.matchAll(CLAIM)) {
+        claims++;
+        const n = Number(m[1]);
+        if (!gates.has(n)) wrong.push(`${file}: "${m[0]}" (gates are ${[...gates].join(', ')} kB)`);
+      }
+    }
+    assert.ok(
+      claims >= 6,
+      `only ${claims} claims found across ${files.length} files; the pattern has stopped matching`,
+    );
+    assert.deepEqual(
+      wrong,
+      [],
+      `these published size claims do not equal any size-limit gate:\n  ${wrong.join('\n  ')}`,
+    );
   });
 
   it('the two published entries are exempted from the 5% headroom convention, in writing', () => {

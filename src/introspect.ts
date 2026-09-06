@@ -377,6 +377,18 @@ export interface IntrospectOptions {
    */
   legacyToManyUniques?: boolean;
   /**
+   * Use the raw database column name as each column's TypeScript field
+   * (`user_id` stays `user_id`) instead of the camelCase default (`userId`).
+   * The same identity mapping `withDbFieldNames` applies at generate time, so
+   * a schema introspected with this flag is byte-identical after that
+   * transform; declaring it here as well is what makes it the escape from the
+   * field-collision refusal (see {@link assertDistinctColumnFields}): a table
+   * carrying both `"createdAt"` and `created_at` has two distinct raw names and
+   * one shared camelCase name, and only the flag can tell introspection which
+   * of those two facts to build the field from.
+   */
+  keepColumnNames?: boolean;
+  /**
    * Called with any {@link DEFAULT_EXCLUDED_TABLES} that were present in the
    * database but dropped from this run (F12), so the CLI can print a
    * "skipped internal table X (add it to include to keep it)" note. Not invoked
@@ -577,6 +589,49 @@ export function applyRelationRenames(
 }
 
 /**
+ * THE field-collision rule: two columns of one table may never resolve to the
+ * same TypeScript field.
+ *
+ * Fields are derived with `snakeToCamel`, so a table carrying both a quoted
+ * `"createdAt"` and a `created_at` column (a Prisma-era column beside a
+ * hand-written one is the common way to get there) yields two `createdAt`
+ * fields. Nothing used to refuse that, and every consumer keyed by field then
+ * lost a column silently: `columnMap` kept whichever column was written last,
+ * reads folded both columns into one property, a write to the field reached
+ * only one of them, and `types.ts` carried a duplicate member that failed the
+ * consumer's `tsc` (TS2300) while `turbine generate` exited 0.
+ *
+ * A thrown error names the table, every colliding column and the fix. There is
+ * no per-column rename option, so the fix is `keepColumnNames` (the field is
+ * then the raw column name, and two distinct columns cannot collide) or a
+ * rename in the database. Applied once per table right after the catalog's
+ * columns are grouped, and again by the generate.ts emitters so a schema that
+ * never went through introspection is refused at the same boundary.
+ */
+export function assertDistinctColumnFields(tableName: string, columns: readonly ColumnMetadata[]): void {
+  const columnsByField = new Map<string, string[]>();
+  for (const col of columns) {
+    const names = columnsByField.get(col.field);
+    if (names) names.push(col.name);
+    else columnsByField.set(col.field, [col.name]);
+  }
+  const collisions: string[] = [];
+  for (const [field, names] of columnsByField) {
+    if (names.length < 2) continue;
+    const quoted = names.map((n) => `"${n}"`);
+    const list = `${quoted.slice(0, -1).join(', ')} and ${quoted[quoted.length - 1]}`;
+    collisions.push(`columns ${list} ${names.length === 2 ? 'both' : 'all'} resolve to the field "${field}"`);
+  }
+  if (collisions.length === 0) return;
+  throw new ValidationError(
+    `Field collision on table "${tableName}": ${collisions.join('; ')}. A client addresses one column per field, ` +
+      'so reads would fold the colliding columns into one property and a write to that field would reach only ' +
+      'one of them. Rename one of the columns, or set `keepColumnNames: true` in turbine.config.ts ' +
+      '(`turbine generate --keep-column-names`) so every field is its raw column name.',
+  );
+}
+
+/**
  * PostgreSQL catalog introspector: reads information_schema + pg_catalog and
  * produces {@link SchemaMetadata}. This is the implementation wrapped by
  * `postgresDialect.introspector`; call {@link introspect} for dialect routing.
@@ -651,7 +706,9 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
       const arrayType = dialect.arrayType?.(baseType) ?? 'text[]';
       const col: ColumnMetadata = {
         name: row.column_name,
-        field: snakeToCamel(row.column_name),
+        // Under keepColumnNames the field IS the column name, which is why two
+        // distinct columns can never collide there (see assertDistinctColumnFields).
+        field: options.keepColumnNames ? row.column_name : snakeToCamel(row.column_name),
         dialectType,
         pgType: dialectType,
         tsType:
@@ -688,6 +745,12 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
       if (!columnsByTable.has(tableName)) columnsByTable.set(tableName, []);
       columnsByTable.get(tableName)!.push(col);
     }
+
+    // Every consumer below keys the table by FIELD (columnMap, the relation
+    // derivation's shadow check, the generated interface), so the field set
+    // must be sound before any of them runs. THE one place the rule is applied
+    // to a live catalog; generate.ts re-asserts it for schemas built elsewhere.
+    for (const [tableName, cols] of columnsByTable) assertDistinctColumnFields(tableName, cols);
 
     // ----- Group primary keys by table -----
     const pkByTable = new Map<string, string[]>();

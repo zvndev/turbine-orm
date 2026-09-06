@@ -551,6 +551,77 @@ describe('turbine-orm/mssql, introspector (mock executor)', () => {
     assert.ok(meta.tables.users!.uniqueColumns.some((c) => c.length === 1 && c[0] === 'email'));
     assert.ok(meta.tables.users!.indexes.some((i) => i.name === 'IX_users_org_id'));
   });
+
+  /**
+   * `sys.indexes.is_unique` is a `bit`, and the value the DRIVER hands over
+   * decides whether SQL Server has any unique keys at all.
+   *
+   * tedious parses TDS bits with `!!value`, so the live transport sends a
+   * BOOLEAN. The introspector compared it to the number 1, so every unique
+   * index came back non-unique, `uniqueColumns` was empty on every table, and
+   * `findUnique` (and later `upsert`) on a genuinely unique non-PK column was
+   * refused as not identifying one row. Live for the whole life of the engine,
+   * and invisible here because the fixture builder's parameter was typed
+   * `number`, so the mock only ever produced the spelling the code handled.
+   *
+   * Asked of all three spellings a transport might send, and of the falsy ones
+   * beside them, so the fix cannot be "treat everything as unique".
+   */
+  it('reads is_unique as the driver sends it: boolean, number or string', async () => {
+    const introspectWithIsUnique = async (isUnique: unknown, notUnique: unknown) => {
+      const exec: MssqlRowExecutor = async (sql: string) => {
+        if (/INFORMATION_SCHEMA\.TABLES/.test(sql)) return [{ TABLE_NAME: 'users' }];
+        if (/INFORMATION_SCHEMA\.COLUMNS/.test(sql))
+          return [
+            col('users', 'id', 'bigint'),
+            col('users', 'email', 'nvarchar', 'NO', 255),
+            col('users', 'org_id', 'bigint'),
+          ];
+        if (/PRIMARY KEY/.test(sql)) return [pk('users', 'id', 1)];
+        if (/sys\.foreign_keys/.test(sql)) return [];
+        if (/sys\.indexes/.test(sql))
+          return [
+            idx('users', 'UQ_users_email', isUnique, 'email', 1),
+            idx('users', 'IX_users_org_id', notUnique, 'org_id', 1),
+          ];
+        return [];
+      };
+      return (await introspectMssqlWith(exec, 'dbo')).tables.users!;
+    };
+
+    for (const [truthy, falsy] of [
+      [true, false],
+      [1, 0],
+      ['1', '0'],
+      ['true', 'false'],
+    ] as [unknown, unknown][]) {
+      const users = await introspectWithIsUnique(truthy, falsy);
+      const label = JSON.stringify(truthy);
+      assert.deepEqual(users.uniqueColumns, [['email']], `is_unique as ${label} did not make email unique`);
+      assert.equal(
+        users.indexes.find((i) => i.name === 'UQ_users_email')?.unique,
+        true,
+        `is_unique as ${label} did not mark the index unique`,
+      );
+      // The other half of the claim: a NON-unique index must stay non-unique,
+      // or "unique" would just mean "has an index".
+      assert.equal(
+        users.indexes.find((i) => i.name === 'IX_users_org_id')?.unique,
+        false,
+        `is_unique as ${JSON.stringify(falsy)} was read as unique`,
+      );
+      assert.ok(
+        !users.uniqueColumns.some((c) => c[0] === 'org_id'),
+        `is_unique as ${JSON.stringify(falsy)} put org_id in uniqueColumns`,
+      );
+    }
+
+    // Nothing at all is not a unique index either.
+    for (const empty of [null, undefined, '', 0] as unknown[]) {
+      const users = await introspectWithIsUnique(empty, empty);
+      assert.deepEqual(users.uniqueColumns, [], `is_unique as ${JSON.stringify(empty)} was read as unique`);
+    }
+  });
 });
 
 // Tiny row-builders for the introspector mock.
@@ -577,7 +648,17 @@ function fk(t: string, c: string, rt: string, rc: string, name: string, pos: num
     ORDINAL_POSITION: pos,
   };
 }
-function idx(t: string, name: string, isUnique: number, c: string, seq: number) {
+/**
+ * `isUnique` is deliberately `unknown`, not `number`.
+ *
+ * `sys.indexes.is_unique` is a `bit`, and tedious parses TDS bits with
+ * `!!value`, so the live driver sends a BOOLEAN. Typing this parameter `number`
+ * meant every fixture row said `1`, the mock chose the one shape the code
+ * already handled, and the introspector's boolean blind spot was invisible to
+ * the unit lane for the whole life of the engine. The parameter now accepts
+ * whatever a transport might send so a test can ask the question.
+ */
+function idx(t: string, name: string, isUnique: unknown, c: string, seq: number) {
   return { TABLE_NAME: t, INDEX_NAME: name, IS_UNIQUE: isUnique, COLUMN_NAME: c, SEQ: seq };
 }
 
