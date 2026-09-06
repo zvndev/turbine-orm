@@ -42,6 +42,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { detectPooler, poolerRefusalMessage } from '../connection-url.js';
+import { ValidationError } from '../errors.js';
 import { generate, generatePrismaMap, resolveImportExtension } from '../generate.js';
 import {
   buildCreateIndexSql,
@@ -105,10 +106,12 @@ import { runMcpServer } from './mcp.js';
 import {
   buildDiffMigrationBody,
   collectUpDestructive,
+  connectionStringForSchema,
   createMigration,
   type DestructiveOffender,
   formatChecksumMismatchError,
   inspectMigrationDeploy,
+  listIgnoredSqlFiles,
   listMigrationFiles,
   MIGRATION_RECIPES,
   type MigrationFile,
@@ -118,6 +121,8 @@ import {
   migrateUp,
   type OutOfOrderApply,
   parseMigrationContent,
+  planMigrationRollback,
+  type RebaselinedChecksum,
 } from './migrate.js';
 import { startObserve } from './observe.js';
 import { formatPrismaReport, summaryLines } from './prisma-report.js';
@@ -572,10 +577,24 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         i++;
         break;
       case '--step':
-      case '-n':
-        result.step = next ? parseInt(next, 10) : undefined;
+      case '-n': {
+        // VALIDATED here, at the one place the flag is read. `--step -1` reached
+        // `applied.reverse().slice(0, -1)`, which is "every migration except the
+        // oldest" and began tearing down the history newest-first; `--step 0`
+        // and `--step abc` (NaN) were silent no-ops that look like a successful
+        // rollback. A count of things to do is a positive integer or it is a
+        // mistake, and a mistake must say so rather than pick a meaning.
+        const raw = next ?? '';
+        const parsed = /^\d+$/.test(raw.trim()) ? Number.parseInt(raw, 10) : Number.NaN;
+        if (!Number.isSafeInteger(parsed) || parsed < 1) {
+          throw new ValidationError(
+            `--step expects a positive whole number of migrations, got ${raw === '' ? '(nothing)' : `"${raw}"`}.`,
+          );
+        }
+        result.step = parsed;
         i++;
         break;
+      }
       case '--dry-run':
         result.dryRun = true;
         break;
@@ -1761,6 +1780,7 @@ async function runInitGenerate(config: ResolvedConfig, url: string): Promise<Ini
   const spinner = new Spinner('Introspecting database').start();
   try {
     const schema = await introspect({
+      keepColumnNames: config.keepColumnNames,
       connectionString: url,
       schema: config.schema,
       include: config.include.length ? config.include : undefined,
@@ -2068,7 +2088,7 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
 
     switch (step.id) {
       case 'config': {
-        writeFileSync('turbine.config.ts', configTemplate(args.url ?? undefined), 'utf-8');
+        writeFileSync('turbine.config.ts', configTemplate(args.url ?? undefined, config.schema), 'utf-8');
         success(state.configExists ? `Overwrote ${cyan('turbine.config.ts')}` : `Created ${cyan('turbine.config.ts')}`);
         tsFilesWritten.push('turbine.config.ts');
         // A `--url` with a password is never inlined by configTemplate, so the
@@ -2252,6 +2272,7 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
 
   const skippedInternalTables: string[] = [];
   const schema = await introspect({
+    keepColumnNames: config.keepColumnNames,
     connectionString: url,
     schema: config.schema,
     include: config.include.length ? config.include : undefined,
@@ -2516,6 +2537,7 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
     label('Database', redactUrl(url));
     const spinner = new Spinner('Introspecting database schema').start();
     schemaMeta = await introspect({
+      keepColumnNames: config.keepColumnNames,
       connectionString: url,
       // The Postgres NAMESPACE is fixed to `public` here (`--schema` names the
       // Prisma file, not the namespace).
@@ -2799,7 +2821,7 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
     console.log(`    ${cyan('--dry-run')}          Show SQL without executing`);
     console.log(`    ${cyan('--allow-destructive')} Run data-destroying statements without prompting`);
     console.log(
-      `    ${cyan('--allow-drift')}      Bypass checksum validation on ${cyan('up')} / ${cyan('deploy')} ${dim('(advanced)')}`,
+      `    ${cyan('--allow-drift')}      Re-baseline drifted checksums on ${cyan('up')} / ${cyan('deploy')} / ${cyan('down')} ${dim('(advanced)')}`,
     );
     newline();
     console.log(`  ${bold('Recipes')} ${dim('(--recipe):')}`);
@@ -3129,6 +3151,8 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
   label('Migrations', config.migrationsDir);
   newline();
 
+  warnIgnoredMigrationFiles(config.migrationsDir);
+
   const allFiles = listMigrationFiles(config.migrationsDir);
   if (allFiles.length === 0) {
     warn('No migration files found.');
@@ -3138,7 +3162,7 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
   }
 
   if (args.dryRun) {
-    const status = await migrateStatus(url, config.migrationsDir);
+    const status = await migrateStatus(url, config.migrationsDir, { schema: config.schema });
     let pending = status.filter((st) => !st.applied).map((st) => st.file);
     if (args.step != null && args.step > 0) pending = pending.slice(0, args.step);
     printMigrationDryRun(pending, 'up');
@@ -3180,6 +3204,7 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
       allowDrift: args.allowDrift,
       allowDestructive: args.allowDestructive,
       onNoTransaction,
+      schema: config.schema,
     });
   } catch (err) {
     if (!isDestructiveRefusal(err)) throw err;
@@ -3195,6 +3220,7 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
       allowDrift: args.allowDrift,
       allowDestructive: true,
       onNoTransaction,
+      schema: config.schema,
     });
   }
 
@@ -3211,6 +3237,7 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
     }
   }
 
+  reportRebaselined(result.rebaselined);
   warnOutOfOrder(result.outOfOrder);
 
   if (result.errors.length > 0) {
@@ -3223,6 +3250,43 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
     process.exit(1);
   }
 
+  newline();
+}
+
+/**
+ * Report each applied migration whose stored checksum was re-baselined to the
+ * file's current content, naming both hashes so the change is auditable from
+ * the terminal output alone.
+ */
+function reportRebaselined(rebaselined: RebaselinedChecksum[]): void {
+  if (rebaselined.length === 0) return;
+  newline();
+  warn(`Re-baselined ${bold(String(rebaselined.length))} migration checksum(s) to the current file content:`);
+  for (const r of rebaselined) {
+    console.log(
+      `    ${yellow(symbols.arrowRight)} ${r.name}.sql  ${dim(`${r.from.slice(0, 12)} -> ${r.to.slice(0, 12)}`)}`,
+    );
+  }
+  console.log(`  ${dim('The history table now records what is on disk, so future runs need no --allow-drift.')}`);
+  newline();
+}
+
+/**
+ * Warn about `.sql` files in the migrations directory that the runner will
+ * never see, because their name is not `YYYYMMDDHHMMSS_<name>.sql`.
+ *
+ * They were skipped in silence by `status`, `up` and `deploy` alike, so a
+ * hand-named migration simply never ran and nothing said so.
+ */
+function warnIgnoredMigrationFiles(migrationsDir: string): void {
+  const ignored = listIgnoredSqlFiles(migrationsDir);
+  if (ignored.length === 0) return;
+  warn(`${bold(String(ignored.length))} .sql file(s) in ${migrationsDir} are NOT migrations and will never run:`);
+  for (const name of ignored) console.log(`    ${yellow(symbols.dot)} ${name}`);
+  console.log(`  ${dim('A migration filename must be')} ${cyan('YYYYMMDDHHMMSS_name.sql')}${dim('.')}`);
+  console.log(
+    `  ${dim('Rename the file(s), or create them with')} ${cyan('npx turbine migrate create <name>')}${dim('.')}`,
+  );
   newline();
 }
 
@@ -3271,8 +3335,10 @@ async function cmdMigrateDeploy(args: CliArgs, config: ResolvedConfig): Promise<
   label('Migrations', config.migrationsDir);
   newline();
 
+  warnIgnoredMigrationFiles(config.migrationsDir);
+
   const spinner = new Spinner('Checking pending migrations').start();
-  const plan = await inspectMigrationDeploy(url, config.migrationsDir);
+  const plan = await inspectMigrationDeploy(url, config.migrationsDir, { schema: config.schema });
   spinner.stop();
 
   // Drift handling: honor --allow-drift exactly like `up`. Without it, block;
@@ -3303,6 +3369,9 @@ async function cmdMigrateDeploy(args: CliArgs, config: ResolvedConfig): Promise<
     for (const file of plan.pending) {
       console.log(`    ${yellow(symbols.dot)} ${file.filename}`);
     }
+    // The real deploy warns about out-of-order applies; a preview that is
+    // quieter than the run it previews is not a preview.
+    warnOutOfOrder(plan.outOfOrder);
     // Surface destructive statements even in a dry run so CI can see them.
     const destructive = collectUpDestructive(plan.pending);
     if (destructive.length > 0) {
@@ -3318,7 +3387,7 @@ async function cmdMigrateDeploy(args: CliArgs, config: ResolvedConfig): Promise<
   if (destructive.length > 0) printDestructiveNotice(destructive);
 
   const runSpinner = new Spinner('Deploying migrations').start();
-  const result = await migrateDeploy(url, config.migrationsDir, { allowDrift: args.allowDrift });
+  const result = await migrateDeploy(url, config.migrationsDir, { allowDrift: args.allowDrift, schema: config.schema });
 
   if (result.applied.length === 0 && result.errors.length === 0) {
     runSpinner.succeed('0 applied, all migrations are up to date');
@@ -3333,6 +3402,7 @@ async function cmdMigrateDeploy(args: CliArgs, config: ResolvedConfig): Promise<
     }
   }
 
+  reportRebaselined(result.rebaselined);
   warnOutOfOrder(result.outOfOrder);
 
   if (result.errors.length > 0) {
@@ -3398,11 +3468,20 @@ async function cmdMigrateDown(args: CliArgs, config: ResolvedConfig): Promise<vo
   newline();
 
   if (args.dryRun) {
-    const status = await migrateStatus(url, config.migrationsDir);
-    // Rollback order is newest-applied first, and a migration whose file is
-    // missing has no DOWN section to show.
-    const applied = status.filter((st) => st.applied && !st.missingFile).map((st) => st.file);
-    printMigrationDryRun(applied.reverse().slice(0, args.step ?? 1), 'down');
+    // Computed by the RUNNER'S rule (planMigrationRollback), not re-derived
+    // from `status`. The old derivation sorted by filename and dropped applied
+    // migrations whose file is missing, so with a deleted file it named the
+    // migration AFTER the gap while the real run stopped at the gap.
+    const plan = await planMigrationRollback(url, config.migrationsDir, {
+      step: args.step ?? 1,
+      schema: config.schema,
+    });
+    printMigrationDryRun(plan.toRollback, 'down');
+    if (plan.stoppedAt) {
+      warn(`Rollback would STOP at ${bold(`${plan.stoppedAt.name}.sql`)}: ${plan.stoppedAt.error}`);
+      console.log(`  ${dim('A rollback batch is strictly LIFO with no gaps, so nothing after it would run.')}`);
+      newline();
+    }
     return;
   }
 
@@ -3413,6 +3492,8 @@ async function cmdMigrateDown(args: CliArgs, config: ResolvedConfig): Promise<vo
     result = await migrateDown(url, config.migrationsDir, {
       step: args.step ?? 1,
       allowDestructive: args.allowDestructive,
+      allowDrift: args.allowDrift,
+      schema: config.schema,
     });
   } catch (err) {
     if (!isDestructiveRefusal(err)) throw err;
@@ -3426,6 +3507,8 @@ async function cmdMigrateDown(args: CliArgs, config: ResolvedConfig): Promise<vo
     result = await migrateDown(url, config.migrationsDir, {
       step: args.step ?? 1,
       allowDestructive: true,
+      allowDrift: args.allowDrift,
+      schema: config.schema,
     });
   }
 
@@ -3441,6 +3524,8 @@ async function cmdMigrateDown(args: CliArgs, config: ResolvedConfig): Promise<vo
       console.log(`    ${yellow(symbols.arrowRight)} ${file.filename}`);
     }
   }
+
+  reportRebaselined(result.rebaselined);
 
   if (result.errors.length > 0) {
     spinner.fail('Rollback failed');
@@ -3471,7 +3556,9 @@ async function cmdMigrateStatus(_args: CliArgs, config: ResolvedConfig): Promise
     return;
   }
 
-  const statuses = await migrateStatus(url, config.migrationsDir);
+  warnIgnoredMigrationFiles(config.migrationsDir);
+
+  const statuses = await migrateStatus(url, config.migrationsDir, { schema: config.schema });
 
   const appliedCount = statuses.filter((s) => s.applied).length;
   const pendingCount = statuses.filter((s) => !s.applied).length;
@@ -3562,7 +3649,15 @@ export function getSeedExecutionPlan(seedFile: string): SeedExecutionPlan {
 
 async function runSeedPlan(plan: SeedExecutionPlan, config: ResolvedConfig): Promise<void> {
   const oldDatabaseUrl = process.env.DATABASE_URL;
-  if (config.url) process.env.DATABASE_URL = config.url;
+  // The seed connects through DATABASE_URL, whichever way it runs: `defineSeed`
+  // reads it in the tsx child and in the in-process `import()`, and the `.sql`
+  // path opens a client on it below. So the configured schema is applied HERE,
+  // once, as the `options=-c search_path` connection parameter (never a `SET`),
+  // and every seed kind inherits it. Without this the seed ran against the
+  // role's default path while `push` and the generated client used
+  // `config.schema`, so the two halves of one project wrote to two namespaces.
+  const seedUrl = config.url ? connectionStringForSchema(config.url, config.schema) : undefined;
+  if (seedUrl) process.env.DATABASE_URL = seedUrl;
 
   try {
     if (plan.kind === 'tsx') {
@@ -3582,7 +3677,7 @@ async function runSeedPlan(plan: SeedExecutionPlan, config: ResolvedConfig): Pro
           stdio: 'inherit',
           env: {
             ...process.env,
-            DATABASE_URL: config.url || process.env.DATABASE_URL,
+            DATABASE_URL: seedUrl || process.env.DATABASE_URL,
             TURBINE_SEED_SENTINEL: sentinel,
           },
         });
@@ -3610,7 +3705,7 @@ async function runSeedPlan(plan: SeedExecutionPlan, config: ResolvedConfig): Pro
       return;
     }
 
-    const url = requireUrl(config);
+    const url = connectionStringForSchema(requireUrl(config), config.schema);
     const { default: pg } = await import('pg');
     const client = new pg.Client({ connectionString: url });
     await client.connect();
@@ -3679,6 +3774,7 @@ async function cmdStatus(_args: CliArgs, config: ResolvedConfig): Promise<void> 
   const spinner = new Spinner('Introspecting database').start();
 
   const schema = await introspect({
+    keepColumnNames: config.keepColumnNames,
     connectionString: url,
     schema: config.schema,
     include: config.include.length ? config.include : undefined,
@@ -3852,6 +3948,7 @@ async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
   const spinner = jsonMode ? null : new Spinner('Introspecting database').start();
 
   const schema = await introspect({
+    keepColumnNames: config.keepColumnNames,
     connectionString: url,
     schema: config.schema,
     include: config.include.length ? config.include : undefined,
@@ -5256,7 +5353,9 @@ function showMigrateHelp(): void {
   );
   console.log(`    ${cyan('--step, -n')} ${dim('<N>')}    Number of migrations to apply/rollback`);
   console.log(`    ${cyan('--dry-run')}         Show SQL without executing`);
-  console.log(`    ${cyan('--allow-drift')}     Bypass checksum validation ${dim('(migrate up only, advanced)')}`);
+  console.log(
+    `    ${cyan('--allow-drift')}     Re-baseline drifted checksums ${dim('(up / deploy / down, advanced)')}`,
+  );
   console.log(
     `    ${cyan('--allow-destructive')} Run data-destroying migration statements without the interactive confirm`,
   );
@@ -5550,7 +5649,7 @@ function showHelp(): void {
     `    ${cyan('--allow-destructive')}  Run data-destroying statements without prompting ${dim('(up/down/push)')}`,
   );
   console.log(
-    `    ${cyan('--allow-drift')}        Bypass checksum validation on ${cyan('migrate up')} / ${cyan('deploy')} ${dim('(advanced)')}`,
+    `    ${cyan('--allow-drift')}        Re-baseline drifted checksums on ${cyan('migrate up')} / ${cyan('deploy')} / ${cyan('down')} ${dim('(advanced)')}`,
   );
   newline();
 
@@ -5738,7 +5837,17 @@ function showVersion(): void {
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const args = parseArgs();
+  let args: CliArgs;
+  try {
+    args = parseArgs();
+  } catch (err) {
+    // A refused flag value (see `--step`). The command never starts, so there
+    // is no spinner or banner to unwind: print the message and stop.
+    errorLine();
+    error(err instanceof Error ? err.message : String(err));
+    errorLine();
+    process.exit(1);
+  }
 
   // Quick exits that don't need config
   if (args.command === 'help' || args.command === '--help' || args.command === '-h') {

@@ -144,6 +144,22 @@ async function runSeed(fn: SeedFunction): Promise<void> {
   }
 }
 
+/**
+ * Declare a seed: `fn` receives a connected `TurbineClient` and is awaited.
+ *
+ * The returned function runs the seed on demand. When the module that calls
+ * `defineSeed` is itself the process entry point (`npx tsx seed.ts`, or the
+ * child `turbine seed` spawns), the seed also runs automatically.
+ *
+ * The client connects through `DATABASE_URL`. Under `turbine seed` that value
+ * is the configured connection string with `search_path` PINNED to the
+ * configured `schema` (as the `options=-c search_path` connection parameter,
+ * so it can never leak onto a pooled backend the way a `SET` would). Every
+ * unqualified table name the seed writes therefore lands in the same schema
+ * `push`, `generate` and the generated client use; a seed that must reach
+ * another schema qualifies the name. The default `public` adds nothing, so a
+ * project that never set `schema` connects exactly as before.
+ */
 export function defineSeed(fn: SeedFunction): DefinedSeed {
   const run = () => runSeed(fn);
 

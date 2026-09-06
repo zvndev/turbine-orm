@@ -285,8 +285,23 @@ describe('migrations smoke fixes (live database)', () => {
     }
   });
 
-  /** Same rule on the way up: a file with an empty UP section stops the batch. */
-  dbIt('migrate up stops at a migration with an empty UP section', async () => {
+  /**
+   * Same rule on the way up, now enforced one step EARLIER: a file whose UP
+   * section runs nothing is refused as a PRE-FLIGHT over the whole batch, so
+   * nothing at all is applied.
+   *
+   * It used to stop mid-run (migration 1 applied, migration 2 recorded as an
+   * error), which kept the important half of the contract, that a later
+   * migration is never applied over the gap. The pre-flight keeps that and
+   * costs nothing: an UP with no executable statement can only ever be a
+   * mistake, so refusing before the first BEGIN leaves the operator with one
+   * file to fix and one command to re-run rather than a half-applied batch.
+   * The check runs alongside assertNoEmbeddedTransactions, on the same batch,
+   * for the same reason. A comment-only UP (the untouched `migrate create`
+   * scaffold) is refused by the same rule, which is what the empty string here
+   * never covered.
+   */
+  dbIt('migrate up refuses the whole batch when a migration has an empty UP section', async () => {
     await resetTracking();
     const dir = freshDir('up-gap');
     const base = `sf_upgap_${Date.now()}`;
@@ -295,20 +310,20 @@ describe('migrations smoke fixes (live database)', () => {
       writeFileSync(join(dir, '20260402000002_empty.sql'), '-- UP\n-- DOWN\n');
       writeFileSync(join(dir, '20260402000003_third.sql'), `-- UP\nCREATE TABLE "${base}_c" (id int);\n-- DOWN\n`);
 
-      const res = await migrateUp(DATABASE_URL!, dir, { allowDestructive: true });
+      await assert.rejects(migrateUp(DATABASE_URL!, dir, { allowDestructive: true }), (err: unknown) => {
+        assert.ok(err instanceof Error);
+        assert.match(err.message, /TURBINE_E006/);
+        assert.match(err.message, /20260402000002_empty\.sql/);
+        return true;
+      });
 
-      assert.deepEqual(
-        res.applied.map((f) => f.filename),
-        ['20260402000001_first.sql'],
-      );
-      assert.equal(res.errors.length, 1);
-      assert.match(res.errors[0]!.file.filename, /_empty\.sql$/);
-
-      // The third migration must NOT have been applied over the gap.
-      const exists = await withClient((c) =>
-        c.query(`SELECT 1 FROM information_schema.tables WHERE table_name = $1`, [`${base}_c`]),
-      );
-      assert.equal(exists.rowCount, 0);
+      // Neither the first nor the third migration ran: nothing is applied.
+      for (const table of [`${base}_a`, `${base}_c`]) {
+        const exists = await withClient((c) =>
+          c.query(`SELECT 1 FROM information_schema.tables WHERE table_name = $1`, [table]),
+        );
+        assert.equal(exists.rowCount, 0, `${table} must not exist`);
+      }
     } finally {
       await withClient(async (c) => {
         await c.query(`DROP TABLE IF EXISTS "${base}_a"`);

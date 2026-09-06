@@ -110,15 +110,16 @@ const INDEX_ROWS = [
 ];
 
 /**
- * Mock pool that EMULATES search_path resolution rather than answering the
- * question the test is about.
+ * Mock pool that EMULATES name resolution rather than answering the question
+ * the test is about.
  *
  * The tracking table really lives in `public`. An unqualified `to_regclass`
  * therefore resolves it only while the connection's search_path still includes
  * `public`, exactly as Postgres behaves: pin search_path to `app` and the same
- * lookup finds nothing. That is the divergence between `turbine migrate status`
- * (no pin) and a pinned `migrate_status`, and it is reproduced here rather than
- * hard-coded.
+ * lookup finds nothing. A QUALIFIED lookup (`"app"."_turbine_migrations"`) is
+ * answered by the schema it names, whatever the search_path. Both are what
+ * Postgres does, reproduced here rather than hard-coded, so the tool's choice
+ * of lookup is what the assertions observe.
  */
 function makePool(recorded: Recorded[]): pg.Pool {
   let searchPath = 'public';
@@ -126,7 +127,7 @@ function makePool(recorded: Recorded[]): pg.Pool {
     query(sql: string, params?: unknown[]) {
       recorded.push({ sql, params });
       if (sql.includes("set_config('search_path'")) searchPath = String(params?.[0] ?? '');
-      const rows = route(sql, searchPath);
+      const rows = route(sql, searchPath, params);
       return Promise.resolve({ rows, rowCount: rows.length, fields: [] });
     },
     release() {},
@@ -143,7 +144,7 @@ function makePool(recorded: Recorded[]): pg.Pool {
   } as unknown as pg.Pool;
 }
 
-function route(sql: string, searchPath: string): Record<string, unknown>[] {
+function route(sql: string, searchPath: string, params?: unknown[]): Record<string, unknown>[] {
   if (sql.includes('information_schema.tables')) return [{ table_name: 'users' }];
   if (sql.includes('information_schema.columns')) return COLUMNS as unknown as Record<string, unknown>[];
   if (sql.includes("'PRIMARY KEY'")) return [{ table_name: 'users', column_name: 'id' }];
@@ -156,6 +157,11 @@ function route(sql: string, searchPath: string): Record<string, unknown>[] {
   if (sql.includes('pg_class') && sql.includes('reltuples')) return [{ relname: 'users', reltuples: '100' }];
   if (sql.startsWith('EXPLAIN')) return [{ 'QUERY PLAN': [{ Plan: { 'Plan Rows': 412 } }] }];
   if (sql.includes('to_regclass')) {
+    const ref = String(params?.[0] ?? '');
+    const qualified = /^"([^"]+)"\./.exec(ref);
+    // Qualified: found only if it names the schema the table lives in.
+    if (qualified)
+      return [{ exists: qualified[1] === 'public', table_schema: qualified[1] === 'public' ? 'public' : null }];
     const visible = searchPath.split(',').some((part) => part.trim() === 'public');
     return [{ exists: visible, table_schema: visible ? 'public' : null }];
   }
@@ -374,21 +380,30 @@ describe('mcp table_detail: index literals never reach the reply', () => {
 });
 
 describe('mcp migrate_status: agrees with `turbine migrate status`', () => {
-  it('resolves the tracking table the way the CLI does, and discloses where', async () => {
+  it('a configured schema other than public looks the tracking table up THERE, as the runner does', async () => {
     // The tracking table lives in `public`; the server is pointed at `app`.
-    // `turbine migrate status` reads the name unqualified, so it finds it.
+    // `turbine migrate status` on `schema: 'app'` connects with search_path
+    // pinned to `app` and so reads `"app"._turbine_migrations`, which does not
+    // exist. The tool must say the same, not find the public one.
     const h = createHarness({ schema: 'app' });
     const result = payload(await h.call('migrate_status'));
-    assert.equal(result.trackingTableExists, true, 'must not disagree with `turbine migrate status`');
-    assert.equal(result.trackingTableSchema, 'public');
-    // And the disagreement with the configured schema is disclosed, not hidden.
-    assert.match(String(result.trackingTableNote ?? ''), /app/);
+    const lookup = h.recorded.find((r) => r.sql.includes('to_regclass'));
+    assert.deepEqual(
+      lookup?.params,
+      ['"app"."_turbine_migrations"'],
+      'the lookup must be qualified by the configured schema',
+    );
+    assert.equal(result.trackingTableExists, false, 'must not disagree with `turbine migrate status`');
+    assert.equal(result.trackingTableSchema, null);
+    assert.equal(result.trackingTableNote, undefined);
     await h.dispose();
   });
 
-  it('adds no note when the tracking table resolves inside the configured schema', async () => {
+  it('the default public resolves the name UNQUALIFIED through the connection, as the runner does', async () => {
     const h = createHarness();
     const result = payload(await h.call('migrate_status'));
+    const lookup = h.recorded.find((r) => r.sql.includes('to_regclass'));
+    assert.deepEqual(lookup?.params, ['"_turbine_migrations"']);
     assert.equal(result.trackingTableExists, true);
     assert.equal(result.trackingTableSchema, 'public');
     assert.equal(result.trackingTableNote, undefined);

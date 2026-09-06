@@ -18,8 +18,9 @@ import { join } from 'node:path';
 import pg from 'pg';
 import type { DatabaseAdapter } from '../adapters/index.js';
 import { postgresql } from '../adapters/index.js';
+import { isPlainSchemaIdentifier, withSearchPathOption } from '../connection-url.js';
 import { type Dialect, postgresDialect } from '../dialect.js';
-import { MigrationError } from '../errors.js';
+import { MigrationError, ValidationError } from '../errors.js';
 import type { PgCompatQueryResult } from '../pg-types.js';
 import { DESTRUCTIVE_KIND_LABEL, type DestructiveStatement, scanDestructiveSql } from './destructive.js';
 import { splitSqlStatements, tokenizeSql } from './sql-statements.js';
@@ -99,6 +100,20 @@ export interface MigrationRunResult {
    * unrecorded, so every statement in one of these must be idempotent.
    */
   noTransaction: MigrationFile[];
+  /**
+   * Applied migrations whose stored checksum was re-baselined to the file's
+   * current hash, because the run was given `allowDrift`. Empty otherwise.
+   */
+  rebaselined: RebaselinedChecksum[];
+}
+
+/** One applied migration whose stored checksum was rewritten to match its file. */
+export interface RebaselinedChecksum {
+  name: string;
+  /** The hash the tracking table held, i.e. the content that was actually applied. */
+  from: string;
+  /** The hash of the file as it stands now. */
+  to: string;
 }
 
 /** Extract the YYYYMMDDHHMMSS timestamp prefix from a migration name, or null. */
@@ -240,6 +255,35 @@ async function getAppliedMigrations(
   return result.rows;
 }
 
+/**
+ * The applied rows for a READ-ONLY caller: existence is TESTED, never created.
+ *
+ * `migrate status` used to reach the tracking table through
+ * {@link ensureTrackingTable}, which issues `CREATE TABLE IF NOT EXISTS`
+ * unconditionally. PostgreSQL checks the CREATE privilege on the schema BEFORE
+ * the `IF NOT EXISTS` short-circuit, so a read-only role got `permission denied
+ * for schema public` and a CI "is production up to date?" check could not run
+ * as one. A report must not need write rights to say what it can see: an
+ * absent table means "no migration has been applied here", which is the honest
+ * answer and the one `up` will act on.
+ *
+ * @internal exported for tests.
+ */
+export async function readAppliedMigrations(
+  client: MigrationQueryClient,
+  dialect: Dialect = postgresDialect,
+): Promise<{ applied: AppliedMigration[]; trackingTableExists: boolean }> {
+  const present = await client.query<{ present: boolean }>(
+    `SELECT to_regclass(${dialect.paramPlaceholder(1)}) IS NOT NULL AS present`,
+    [TRACKING_TABLE],
+  );
+  if (present.rows[0]?.present !== true) return { applied: [], trackingTableExists: false };
+  const result = await client.query<AppliedMigration>(
+    dialect.buildMigrationSelectApplied(quotedTrackingTable(dialect)),
+  );
+  return { applied: result.rows, trackingTableExists: true };
+}
+
 // ---------------------------------------------------------------------------
 // File operations
 // ---------------------------------------------------------------------------
@@ -334,6 +378,21 @@ export function listMigrationFiles(migrationsDir: string): MigrationFile[] {
     }
   }
   return files;
+}
+
+/**
+ * `.sql` files in `migrationsDir` that the runner NEVER sees, because their
+ * name lacks the `YYYYMMDDHHMMSS_<name>.sql` shape {@link listMigrationFiles}
+ * requires (a hand-written `add_thing.sql`, a 13-digit prefix). Such a file
+ * used to be skipped in silence by `status`, `up` and `deploy` alike, so a
+ * misnamed migration simply never ran and nothing said so. The CLI prints one
+ * warning per entry.
+ */
+export function listIgnoredSqlFiles(migrationsDir: string): string[] {
+  if (!existsSync(migrationsDir)) return [];
+  return readdirSync(migrationsDir)
+    .filter((f) => f.endsWith('.sql') && parseMigrationFilename(f) === null)
+    .sort();
 }
 
 /**
@@ -845,6 +904,83 @@ async function getCurrentDatabaseName(client: pg.Client): Promise<string> {
   return result.rows[0]?.current_database ?? '';
 }
 
+/**
+ * The connection string the migration runner (and `turbine seed`) connects
+ * with for a configured schema: unchanged for the default, pinned otherwise.
+ *
+ * `public` and "not configured" are the same case and emit NOTHING, so a project
+ * that never set `schema` connects byte-for-byte as it always has, resolving
+ * through the role's own search_path. Any other schema is applied as the
+ * `options=-c search_path="<schema>"` startup parameter through
+ * {@link withSearchPathOption}, never as a `SET`, so the migration's own DDL,
+ * its `_turbine_migrations` tracking table, and the lock connection all resolve
+ * unqualified names in the schema the rest of the CLI (`push`, `generate`,
+ * `doctor`, Studio) already reads. Before this the runner had no schema at all,
+ * and a code-first project on `schema: 'app'` pushed its tables into `app`,
+ * diffed against `app`, and then applied the resulting migration into `public`.
+ *
+ * The helper is a pure leaf and returns `null` for a name it cannot emit safely
+ * or a string it cannot rewrite; here each becomes the E003 the rest of the CLI
+ * raises for a bad configured value, because a connection parameter is a
+ * literal and a name that can carry a space can carry a second `-c`.
+ *
+ * @internal exported for the seed runner and tests.
+ */
+export function connectionStringForSchema(connectionString: string, schema?: string): string {
+  if (schema === undefined || schema === '' || schema === 'public') return connectionString;
+  if (!isPlainSchemaIdentifier(schema)) {
+    throw new ValidationError(
+      `Cannot pin search_path to "${schema}": a schema name used as a connection parameter must be a plain ` +
+        `identifier (letters, digits, "_" and "$", not starting with a digit).`,
+    );
+  }
+  const pinned = withSearchPathOption(connectionString, schema);
+  if (pinned === null) {
+    throw new ValidationError(
+      'Cannot pin search_path on a connection string that is not a URL (expected postgres://... or postgresql://...).',
+    );
+  }
+  return pinned;
+}
+
+/**
+ * Open the runner's primary connection for `schema`, and hand back the string
+ * the second (lock-only) connection must use too.
+ *
+ * Postgres does not validate `search_path`: pinning it to a namespace that does
+ * not exist succeeds, and the first unqualified CREATE then fails with "no
+ * schema has been selected to create in", which names neither the schema nor
+ * the setting. `current_schema()` is NULL in exactly that state, so a pinned
+ * connection is checked once, up front, and refused with a message that says
+ * what to create. Unpinned connections are not checked: there the role's own
+ * path decides, as it always has.
+ */
+async function connectMigrationClient(
+  connectionString: string,
+  schema: string | undefined,
+): Promise<{ client: pg.Client; connectionString: string }> {
+  const pinned = connectionStringForSchema(connectionString, schema);
+  const client = new pg.Client({ connectionString: pinned });
+  await client.connect();
+  if (pinned !== connectionString && schema !== undefined) {
+    try {
+      const resolved = await client.query<{ current_schema: string | null }>('SELECT current_schema()');
+      if (resolved.rows[0]?.current_schema == null) {
+        throw new MigrationError(
+          `Schema "${schema}" does not exist in this database. ` +
+            `Postgres accepts a missing namespace in search_path without complaint, so running anyway would ` +
+            `fail on the first unqualified statement with a message that names neither. ` +
+            `Create the schema first (CREATE SCHEMA "${schema}") or correct the configured schema name.`,
+        );
+      }
+    } catch (err) {
+      await client.end();
+      throw err;
+    }
+  }
+  return { client, connectionString: pinned };
+}
+
 /** Open the second, lock-only connection. Separated so tests can fake it. */
 async function openLockConnection(connectionString: string): Promise<MigrationLockClient> {
   const client = new pg.Client({ connectionString });
@@ -1025,6 +1161,31 @@ export interface ChecksumMismatch {
 export interface MigrationDeployPlan {
   pending: MigrationFile[];
   mismatches: ChecksumMismatch[];
+  /**
+   * The out-of-order applies the real run WOULD flag (a pending migration whose
+   * timestamp is older than one already applied). Present so `deploy --dry-run`
+   * can print the same warning the real deploy prints instead of being quieter
+   * than the thing it previews.
+   */
+  outOfOrder: OutOfOrderApply[];
+}
+
+/**
+ * Which of `pending` would be applied out of timestamp order, given `applied`.
+ *
+ * The rule `migrateUp` applies, extracted so the dry run cannot drift from it.
+ *
+ * @internal exported for tests.
+ */
+export function predictOutOfOrder(applied: AppliedMigration[], pending: MigrationFile[]): OutOfOrderApply[] {
+  const newestPrior = applied
+    .map((m) => ({ ts: migrationTimestamp(m.name), name: m.name }))
+    .filter((m): m is { ts: string; name: string } => m.ts !== null)
+    .sort((a, b) => (a.ts < b.ts ? 1 : a.ts > b.ts ? -1 : 0))[0];
+  if (!newestPrior) return [];
+  return pending
+    .filter((file) => file.timestamp && file.timestamp < newestPrior.ts)
+    .map((file) => ({ applied: file.filename, newestPrior: `${newestPrior.name}.sql` }));
 }
 
 /**
@@ -1080,11 +1241,53 @@ export async function validateChecksums(
   return mismatches;
 }
 
-export function formatChecksumMismatchError(mismatches: ChecksumMismatch[]): string {
+/**
+ * Rewrite the stored checksum of each MODIFIED migration to its file's current
+ * hash, and report what changed.
+ *
+ * This is what `--allow-drift` was always documented to mean ("when
+ * intentionally rewriting history") and never did. The flag let the run
+ * proceed and left the stored hash alone, so the very next `up` was blocked
+ * again, forever: the only ways out were reverting the file byte-for-byte or
+ * editing `_turbine_migrations` by hand. Recording the new hash is what makes
+ * the flag a one-time decision instead of a permanent one.
+ *
+ * DELETED files are deliberately not touched. There is no content to hash, and
+ * the row is the only remaining record that the migration ran; rewriting or
+ * removing it would erase history rather than re-baseline it.
+ *
+ * @internal exported for tests.
+ */
+export async function rebaselineChecksums(
+  client: MigrationQueryClient,
+  migrationsDir: string,
+  mismatches: ChecksumMismatch[],
+  dialect: Dialect = postgresDialect,
+): Promise<RebaselinedChecksum[]> {
+  const fileMap = new Map(listMigrationFiles(migrationsDir).map((f) => [f.name, f]));
+  const done: RebaselinedChecksum[] = [];
+  for (const mismatch of mismatches) {
+    if (mismatch.type !== 'modified') continue;
+    const file = fileMap.get(mismatch.name);
+    if (!file) continue;
+    const current = checksum(readFileSync(file.path, 'utf-8'));
+    await client.query(dialect.buildMigrationUpdateChecksum(quotedTrackingTable(dialect)), [current, mismatch.name]);
+    done.push({ name: mismatch.name, from: mismatch.expected, to: current });
+  }
+  return done;
+}
+
+export function formatChecksumMismatchError(
+  mismatches: ChecksumMismatch[],
+  // `down` reuses this report, and a rollback refusal that says it is
+  // "refusing to apply pending migrations" sends the reader after the wrong
+  // command. Default keeps `up` / `deploy` byte-identical.
+  action: 'apply pending migrations' | 'roll back' = 'apply pending migrations',
+): string {
   const modified = mismatches.filter((m) => m.type === 'modified');
   const missing = mismatches.filter((m) => m.type === 'missing');
   const lines: string[] = [
-    'Migration drift detected, refusing to apply pending migrations.',
+    `Migration drift detected, refusing to ${action}.`,
     '',
     'Applied migrations should be immutable. The following files no longer match their applied state:',
     '',
@@ -1108,6 +1311,35 @@ export function formatChecksumMismatchError(mismatches: ChecksumMismatch[]): str
   }
   lines.push('  3. Pass `--allow-drift` to bypass this check (advanced, make sure you know what you are doing).');
   return lines.join('\n');
+}
+
+/**
+ * Refuse a batch containing a migration whose UP section runs NOTHING.
+ *
+ * The untouched `migrate create` scaffold is exactly this: a `-- UP` marker
+ * followed by `-- Write your migration SQL here`. It used to be applied and
+ * recorded, and the developer who then filled the file in was refused as
+ * drift; with `--allow-drift` the file was "already applied" and its SQL never
+ * ran, and the only exit was editing `_turbine_migrations` by hand. The runner
+ * already refuses a file with no marker on the grounds that "nothing would run,
+ * and the migration would still be recorded as applied": a marker over zero
+ * executable statements records the same thing. Same rule for a
+ * `-- turbine:no-transaction` file. Pre-flight over the whole batch, alongside
+ * {@link assertNoEmbeddedTransactions}, so nothing is applied first.
+ *
+ * @internal exported for tests.
+ */
+export function assertUpHasStatements(files: MigrationFile[]): void {
+  for (const file of files) {
+    const { up } = parseMigrationSQL(file.path);
+    const executable = tokenizeSql(up).filter((s) => !s.commentOnly && s.stripped.trim() !== '');
+    if (executable.length > 0) continue;
+    throw new MigrationError(
+      `Migration ${file.filename} has an UP section with no executable statement (comments only). ` +
+        `Applying it would record the migration as applied while running nothing, and filling the file in ` +
+        `afterwards would then be refused as drift. Write the UP section or delete the file.`,
+    );
+  }
 }
 
 /**
@@ -1147,10 +1379,8 @@ export function planMigrationDeploy(migrationsDir: string, applied: AppliedMigra
     }
   }
 
-  return {
-    pending: allFiles.filter((f) => !appliedNames.has(f.name)),
-    mismatches,
-  };
+  const pending = allFiles.filter((f) => !appliedNames.has(f.name));
+  return { pending, mismatches, outOfOrder: predictOutOfOrder(applied, pending) };
 }
 
 /**
@@ -1159,9 +1389,9 @@ export function planMigrationDeploy(migrationsDir: string, applied: AppliedMigra
 export async function inspectMigrationDeploy(
   connectionString: string,
   migrationsDir: string,
+  options?: { schema?: string },
 ): Promise<MigrationDeployPlan> {
-  const client = new pg.Client({ connectionString });
-  await client.connect();
+  const { client } = await connectMigrationClient(connectionString, options?.schema);
   const dialect = migrationDialect();
 
   try {
@@ -1169,10 +1399,8 @@ export async function inspectMigrationDeploy(
     const mismatches = await validateChecksums(client, migrationsDir, dialect);
     const applied = await getAppliedMigrations(client, dialect);
     const appliedNames = new Set(applied.map((m) => m.name));
-    return {
-      pending: listMigrationFiles(migrationsDir).filter((f) => !appliedNames.has(f.name)),
-      mismatches,
-    };
+    const pending = listMigrationFiles(migrationsDir).filter((f) => !appliedNames.has(f.name));
+    return { pending, mismatches, outOfOrder: predictOutOfOrder(applied, pending) };
   } finally {
     await client.end();
   }
@@ -1208,14 +1436,19 @@ export async function migrateUp(
      * long time on other transactions and otherwise looks hung).
      */
     onNoTransaction?: (file: MigrationFile) => void;
+    /**
+     * The Postgres schema unqualified identifiers resolve in, for the migration
+     * SQL and the tracking table alike. See {@link connectionStringForSchema}.
+     */
+    schema?: string;
   },
 ): Promise<MigrationRunResult> {
-  const client = new pg.Client({ connectionString });
-  await client.connect();
+  const { client, connectionString: url } = await connectMigrationClient(connectionString, options?.schema);
 
   // Treat `force` as an alias for `allowDrift` for backwards compatibility.
   const allowDrift = options?.allowDrift === true || options?.force === true;
   const dialect = migrationDialect();
+  const rebaselined: RebaselinedChecksum[] = [];
 
   try {
     // Derive an advisory lock ID per-database so concurrent migrations in
@@ -1228,7 +1461,7 @@ export async function migrateUp(
     // table-lock adapter gets its OWN connection so the per-migration
     // BEGIN/COMMIT below cannot end the transaction the lock lives in.
     const adapter = options?.adapter;
-    const lock = await acquireMigrationLock(client, lockId, adapter, () => openLockConnection(connectionString));
+    const lock = await acquireMigrationLock(client, lockId, adapter, () => openLockConnection(url));
     if (!lock.acquired) {
       throw new MigrationError('Could not acquire migration lock, another migration is already running');
     }
@@ -1242,11 +1475,13 @@ export async function migrateUp(
       // migration history no longer agree, so we BLOCK the run by default.
       // Users can pass `allowDrift: true` (CLI: `--allow-drift`) to force past
       // the block when they are intentionally rewriting history.
-      if (!allowDrift) {
-        const mismatches = await validateChecksums(client, migrationsDir, dialect);
-        if (mismatches.length > 0) {
-          throw new MigrationError(formatChecksumMismatchError(mismatches));
-        }
+      // Computed on BOTH paths. Without the flag a mismatch blocks the run;
+      // with it, the drifted files are re-baselined so the decision is made
+      // once rather than on every future run (see rebaselineChecksums).
+      const mismatches = await validateChecksums(client, migrationsDir, dialect);
+      if (mismatches.length > 0) {
+        if (!allowDrift) throw new MigrationError(formatChecksumMismatchError(mismatches));
+        rebaselined.push(...(await rebaselineChecksums(client, migrationsDir, mismatches, dialect)));
       }
 
       const applied = await getAppliedMigrations(client, dialect);
@@ -1271,6 +1506,7 @@ export async function migrateUp(
       // transactions cannot be run safely at all, so it is refused for everyone,
       // deploy included. Pre-flight over the whole batch, so nothing is applied.
       assertNoEmbeddedTransactions(pending, 'up');
+      assertUpHasStatements(pending);
 
       // Destructive statements in the pending batch, computed once. Returned in
       // the result regardless of the gate so `deploy` can print a notice even
@@ -1361,7 +1597,7 @@ export async function migrateUp(
         flagOutOfOrder(file);
       }
 
-      return { applied: results, errors, destructive, outOfOrder, noTransaction: noTransactionApplied };
+      return { applied: results, errors, destructive, outOfOrder, noTransaction: noTransactionApplied, rebaselined };
     } finally {
       await releaseMigrationLock(lock, client);
     }
@@ -1377,7 +1613,7 @@ export async function migrateUp(
 export async function migrateDeploy(
   connectionString: string,
   migrationsDir: string,
-  options?: { adapter?: DatabaseAdapter; allowDrift?: boolean },
+  options?: { adapter?: DatabaseAdapter; allowDrift?: boolean; schema?: string },
 ): Promise<MigrationRunResult> {
   return migrateUp(connectionString, migrationsDir, {
     // Honor `--allow-drift` on deploy exactly as `up` does: deploy's own drift
@@ -1385,6 +1621,7 @@ export async function migrateDeploy(
     allowDrift: options?.allowDrift === true,
     allowDestructive: true,
     adapter: options?.adapter,
+    schema: options?.schema,
   });
 }
 
@@ -1464,6 +1701,53 @@ export async function rollbackMigrations(
 }
 
 /**
+ * What `migrateDown` WOULD roll back, computed by the same rule it uses, and
+ * where it would stop.
+ *
+ * `migrate down --dry-run` used to build its list from `migrateStatus`, which
+ * sorts by filename and drops applied migrations whose file is missing. The
+ * real run walks the tracking table newest-APPLIED first and STOPS at the first
+ * migration it cannot read, so with a deleted file the two named different
+ * migrations: the dry run reported the one after the gap. A dry run that names
+ * the wrong migration is not a dry run, so both now read the same function.
+ *
+ * `stoppedAt` is the migration the real run would fail on (a missing file, or a
+ * missing DOWN section) together with the message it would print; `toRollback`
+ * is what it would get through first.
+ */
+export async function planMigrationRollback(
+  connectionString: string,
+  migrationsDir: string,
+  options?: { step?: number; schema?: string },
+): Promise<{ toRollback: MigrationFile[]; stoppedAt: { name: string; error: string } | null }> {
+  const { client } = await connectMigrationClient(connectionString, options?.schema);
+  const dialect = migrationDialect();
+  try {
+    const { applied } = await readAppliedMigrations(client, dialect);
+    const fileMap = new Map(listMigrationFiles(migrationsDir).map((f) => [f.name, f]));
+    const batch = applied.reverse().slice(0, options?.step ?? 1);
+
+    const toRollback: MigrationFile[] = [];
+    for (const migration of batch) {
+      const file = fileMap.get(migration.name);
+      if (!file) {
+        return {
+          toRollback,
+          stoppedAt: { name: migration.name, error: `Migration file not found for "${migration.name}"` },
+        };
+      }
+      if (!parseMigrationSQL(file.path).down) {
+        return { toRollback, stoppedAt: { name: migration.name, error: 'No DOWN section found in migration file' } };
+      }
+      toRollback.push(file);
+    }
+    return { toRollback, stoppedAt: null };
+  } finally {
+    await client.end();
+  }
+}
+
+/**
  * Rollback the last N migrations (DOWN).
  *
  * Features:
@@ -1474,10 +1758,20 @@ export async function rollbackMigrations(
 export async function migrateDown(
   connectionString: string,
   migrationsDir: string,
-  options?: { step?: number; allowDestructive?: boolean; adapter?: DatabaseAdapter },
-): Promise<{ rolledBack: MigrationFile[]; errors: Array<{ file: MigrationFile; error: string }> }> {
-  const client = new pg.Client({ connectionString });
-  await client.connect();
+  options?: {
+    step?: number;
+    allowDestructive?: boolean;
+    adapter?: DatabaseAdapter;
+    schema?: string;
+    /** Roll back anyway when an applied file has drifted, re-baselining as `up` does. */
+    allowDrift?: boolean;
+  },
+): Promise<{
+  rolledBack: MigrationFile[];
+  errors: Array<{ file: MigrationFile; error: string }>;
+  rebaselined: RebaselinedChecksum[];
+}> {
+  const { client, connectionString: url } = await connectMigrationClient(connectionString, options?.schema);
   const dialect = migrationDialect();
 
   try {
@@ -1487,17 +1781,31 @@ export async function migrateDown(
     const lockId = deriveLockId(dbName);
 
     const adapter = options?.adapter;
-    const lock = await acquireMigrationLock(client, lockId, adapter, () => openLockConnection(connectionString));
+    const lock = await acquireMigrationLock(client, lockId, adapter, () => openLockConnection(url));
     if (!lock.acquired) {
       throw new MigrationError('Could not acquire migration lock, another migration is already running');
     }
 
     try {
       await ensureTrackingTable(client, dialect);
+
+      // THE SAME DRIFT QUESTION `up` ASKS, and it matters more here: the DOWN
+      // that runs is read from the CURRENT file, so rolling back a drifted
+      // migration executes SQL that was never the applied file's DOWN. This
+      // used to happen with no check and no warning.
+      const rebaselined: RebaselinedChecksum[] = [];
+      const mismatches = await validateChecksums(client, migrationsDir, dialect);
+      if (mismatches.length > 0) {
+        if (options?.allowDrift !== true) {
+          throw new MigrationError(formatChecksumMismatchError(mismatches, 'roll back'));
+        }
+        rebaselined.push(...(await rebaselineChecksums(client, migrationsDir, mismatches, dialect)));
+      }
+
       const applied = await getAppliedMigrations(client, dialect);
 
       if (applied.length === 0) {
-        return { rolledBack: [], errors: [] };
+        return { rolledBack: [], errors: [], rebaselined };
       }
 
       const allFiles = listMigrationFiles(migrationsDir);
@@ -1541,12 +1849,13 @@ export async function migrateDown(
         }
       }
 
-      return await rollbackMigrations(
+      const result = await rollbackMigrations(
         client,
         toRollback,
         fileMap,
         dialect.buildMigrationDeleteApplied(quotedTrackingTable(dialect)),
       );
+      return { ...result, rebaselined };
     } finally {
       await releaseMigrationLock(lock, client);
     }
@@ -1562,14 +1871,17 @@ export async function migrateDown(
  * unchanged pre-v0.6 row reports the same way `migrate up` treats it (valid,
  * pending an in-place hash upgrade) rather than looking like drift.
  */
-export async function migrateStatus(connectionString: string, migrationsDir: string): Promise<MigrationStatus[]> {
-  const client = new pg.Client({ connectionString });
-  await client.connect();
+export async function migrateStatus(
+  connectionString: string,
+  migrationsDir: string,
+  options?: { schema?: string },
+): Promise<MigrationStatus[]> {
+  const { client } = await connectMigrationClient(connectionString, options?.schema);
   const dialect = migrationDialect();
 
   try {
-    await ensureTrackingTable(client, dialect);
-    const applied = await getAppliedMigrations(client, dialect);
+    // READ ONLY: never create the tracking table here, see readAppliedMigrations.
+    const { applied } = await readAppliedMigrations(client, dialect);
     const appliedMap = new Map(applied.map((m) => [m.name, m]));
 
     const allFiles = listMigrationFiles(migrationsDir);

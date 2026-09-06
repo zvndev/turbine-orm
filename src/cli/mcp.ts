@@ -96,8 +96,23 @@ export interface McpTransport {
   pool?: PgCompatPool;
 }
 
+/**
+ * Why a session ended: an explicit {@link McpServerHandle.dispose} (a signal,
+ * stdin closing), or the server closing it ITSELF because the peer's framing
+ * was lost. `runMcpServer` exits non-zero on the latter so a supervisor
+ * restarts the server rather than assuming a clean end.
+ */
+export type McpCloseReason = 'disposed' | 'framing-lost';
+
 export interface McpServerHandle {
   dispose(): Promise<void>;
+  /**
+   * Resolves once the session has ended and the pool is closed, by either
+   * path. After the unframed-buffer refusal the server used to detach its
+   * reader and then neither exit nor answer: a live process that would never
+   * speak again, which a supervisor cannot tell from a healthy idle one.
+   */
+  closed: Promise<McpCloseReason>;
 }
 
 interface JsonRpcRequest {
@@ -207,7 +222,7 @@ interface LoadedSchema {
  * meaningfully be in one. It is a liveness bound, not a policy: see the check
  * itself for why an over-long line ends the session instead of being truncated.
  */
-const MAX_STDIO_BUFFER_BYTES = 8 * 1024 * 1024;
+export const MAX_STDIO_BUFFER_BYTES = 8 * 1024 * 1024;
 
 /** True when tags could not be read, so nothing may be assumed to be non-PII. */
 function tagsUnreadable(status: PiiTagStatus): status is Extract<PiiTagStatus, { state: 'tags-unreadable' }> {
@@ -404,9 +419,26 @@ export function startMcpServer(options: McpServerOptions, transport: McpTranspor
 
   let buffer = '';
   let disposed = false;
+  let settleClosed: (reason: McpCloseReason) => void = () => {};
+  const closed = new Promise<McpCloseReason>((resolve) => {
+    settleClosed = resolve;
+  });
 
   const write = (payload: unknown) => {
     output.write(`${JSON.stringify(payload)}\n`);
+  };
+
+  // The ONE way a session ends, whichever side ends it. `closed` settles in a
+  // `finally` so a pool that fails to close still lets the process exit.
+  const close = async (reason: McpCloseReason): Promise<void> => {
+    if (disposed) return;
+    disposed = true;
+    input.off('data', onData);
+    try {
+      await ctx.pool.end();
+    } finally {
+      settleClosed(reason);
+    }
   };
 
   const onData = (chunk: Buffer | string) => {
@@ -436,7 +468,11 @@ export function startMcpServer(options: McpServerOptions, transport: McpTranspor
         ),
       );
       buffer = '';
-      input.off('data', onData);
+      // END THE SESSION, not just the reader. Detaching alone left the process
+      // alive with nothing listening: it could neither answer nor exit.
+      close('framing-lost').catch((err) => {
+        process.stderr.write(`[turbine] mcp close error: ${redactUrl(errorMessage(err))}\n`);
+      });
       return;
     }
 
@@ -456,12 +492,8 @@ export function startMcpServer(options: McpServerOptions, transport: McpTranspor
   input.on('data', onData);
 
   return {
-    dispose: async () => {
-      if (disposed) return;
-      disposed = true;
-      input.off('data', onData);
-      await ctx.pool.end();
-    },
+    dispose: () => close('disposed'),
+    closed,
   };
 }
 
@@ -778,37 +810,45 @@ function keyList(definition: string): string | null {
 async function migrationStatus(ctx: McpContext): Promise<unknown> {
   return withReadOnly(ctx, async (client) => {
     const files = listMigrationFiles(ctx.options.migrationsDir);
-    // DELIBERATELY UNPINNED, unlike every other tool here.
-    //
     // This tool's whole job is to report what `turbine migrate status` would
-    // report, and the runner in cli/migrate.ts names `_turbine_migrations`
-    // unqualified with no search_path of its own, so the tracking table lives
-    // wherever the connecting role's search_path put it, which is frequently
-    // `public` even for a project whose data schema is something else. Pinning
-    // `search_path` to `--schema` here does not harden that, it ANSWERS A
+    // report, so the tracking table is resolved by the RUNNER'S rule
+    // (`connectionStringForSchema` in cli/migrate.ts), not by this server's
+    // own `search_path` pin:
+    //
+    //   - a configured schema other than `public` pins the runner's connection
+    //     to it, so its tracking table is `"<schema>"._turbine_migrations` and
+    //     is looked up qualified here;
+    //   - the default `public` leaves the runner's connection unpinned, so its
+    //     tracking table lives wherever the connecting role's search_path put
+    //     it (often `public`, not always), and the lookup here is left
+    //     unqualified for the same reason.
+    //
+    // Pinning `search_path` to `--schema` in the second case would ANSWER A
     // DIFFERENT QUESTION: `turbine migrate status` would say "applied" while
     // `migrate_status` said the tracking table did not exist. Between agreeing
     // with the migration runner and imposing a rule the runner does not follow,
-    // agreeing is the only one that can be right.
-    //
-    // The resolution is DISCLOSED instead: the reply names the schema the
-    // tracking table actually resolved in, plus a note when that is not the
-    // configured schema, so the divergence is visible rather than silently
-    // decided either way. (`explain_query` and `sample_rows` still pin, because
-    // they read the schema's own tables, not the runner's bookkeeping.)
+    // agreeing is the only one that can be right. The resolution is DISCLOSED
+    // either way: the reply names the schema the table actually resolved in,
+    // plus a note when that is not the configured schema. (`explain_query` and
+    // `sample_rows` still pin, because they read the schema's own tables, not
+    // the runner's bookkeeping.)
+    const trackingRef =
+      ctx.options.schema === 'public'
+        ? quoteIdent(TRACKING_TABLE)
+        : `${quoteIdent(ctx.options.schema)}.${quoteIdent(TRACKING_TABLE)}`;
     const trackingExists = await client.query<{ exists: boolean; table_schema: string | null }>(
       `SELECT reg.oid IS NOT NULL AS exists, n.nspname AS table_schema
        FROM (SELECT to_regclass($1) AS oid) reg
        LEFT JOIN pg_class c ON c.oid = reg.oid
        LEFT JOIN pg_namespace n ON n.oid = c.relnamespace`,
-      [TRACKING_TABLE],
+      [trackingRef],
     );
     const trackingSchema = trackingExists.rows[0]?.table_schema ?? null;
 
     const applied = new Map<string, { appliedAt: Date; checksum: string }>();
     if (trackingExists.rows[0]?.exists) {
       const result = await client.query<{ name: string; applied_at: Date; checksum: string }>(
-        `SELECT name, applied_at, checksum FROM ${quoteIdent(TRACKING_TABLE)} ORDER BY name`,
+        `SELECT name, applied_at, checksum FROM ${trackingRef} ORDER BY name`,
       );
       for (const row of result.rows) {
         applied.set(row.name, { appliedAt: row.applied_at, checksum: row.checksum });
@@ -833,8 +873,8 @@ async function migrationStatus(ctx: McpContext): Promise<unknown> {
       trackingTableNote:
         trackingSchema !== null && trackingSchema !== ctx.options.schema
           ? `Migrations are tracked in "${trackingSchema}", not the configured schema "${ctx.options.schema}". ` +
-            `This is what \`turbine migrate status\` reads too: the runner resolves the tracking table through ` +
-            `the connection's search_path rather than the --schema flag.`
+            `This is what \`turbine migrate status\` reads too: with the default schema the runner resolves the ` +
+            `tracking table through the connection's own search_path rather than pinning it.`
           : undefined,
       applied: statuses.filter((status) => status.applied).length,
       pending: statuses.filter((status) => !status.applied).length,
@@ -1888,154 +1928,160 @@ async function withReadOnly<T>(ctx: McpContext, fn: (client: PgCompatPoolClient)
 }
 
 async function loadSchemaMetadata(client: PgCompatPoolClient, options: McpServerOptions): Promise<LoadedSchema> {
-  const [tablesResult, columnsResult, pkResult, fkResult, uniqueResult, indexResult, enumResult] = await Promise.all([
-    client.query<{ table_name: string }>(
-      `SELECT table_name
-       FROM information_schema.tables
-       WHERE table_schema = $1 AND table_type = 'BASE TABLE'
-       ORDER BY table_name`,
-      [options.schema],
-    ),
-    client.query<{
-      table_name: string;
-      column_name: string;
-      udt_name: string;
-      data_type: string;
-      is_nullable: string;
-      column_default: string | null;
-      is_identity: string;
-      character_maximum_length: number | null;
-    }>(
-      `SELECT table_name, column_name, udt_name, data_type, is_nullable, column_default, is_identity,
-              character_maximum_length
-       FROM information_schema.columns
-       WHERE table_schema = $1
-       ORDER BY table_name, ordinal_position`,
-      [options.schema],
-    ),
-    client.query<{ table_name: string; column_name: string }>(
-      // Joined on the table as well as the constraint name. Not because two
-      // primary keys can share a name (they cannot: a PK is backed by an INDEX,
-      // and index names ARE unique per schema, so Postgres itself refuses the
-      // second `CREATE TABLE ... CONSTRAINT pk_shared PRIMARY KEY` with
-      // `relation "pk_shared" already exists`, verified on PG 16) but because
-      // the join reads as if the name were the identity, which is what put the
-      // FOREIGN KEY query below one refactor away from a silent cross product.
-      // A foreign key has no backing index and so genuinely can collide.
-      `SELECT tc.table_name, kcu.column_name
-       FROM information_schema.table_constraints tc
-       JOIN information_schema.key_column_usage kcu
-         ON tc.constraint_name = kcu.constraint_name
-        AND tc.table_schema = kcu.table_schema
-        AND tc.table_name = kcu.table_name
-       WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1
-       ORDER BY tc.table_name, kcu.ordinal_position`,
-      [options.schema],
-    ),
-    // Foreign keys come from pg_catalog, not information_schema, and the reason
-    // is the same one written up over `SQL_FOREIGN_KEYS` in ../introspect.ts
-    // (KEEP THE TWO IN LOCKSTEP: this is a second copy of that query because
-    // introspect.ts does not export it, and mcp reads through its own pooled
-    // client inside a read-only transaction rather than opening the pool
-    // `introspect()` owns). The information_schema formulation this replaces
-    // joined key_column_usage (constrained columns) to constraint_column_usage
-    // (referenced columns) on the constraint NAME, which is wrong twice:
-    //
-    //   1. Those two column lists have no positional link, so the join is an
-    //      N-by-N cross product: a two-column FK came back as four rows and
-    //      grouped into four AND-ed correlations, two of them pairing the wrong
-    //      columns. Every read through the relation silently returned nothing.
-    //   2. A constraint name is unique per TABLE (conrelid, conname), not per
-    //      schema, so two tables may both have a `shared_fk`. This is specific
-    //      to foreign keys: a PRIMARY KEY or UNIQUE constraint is backed by an
-    //      index and index names ARE schema-unique, so Postgres refuses that
-    //      collision outright, while an FK has no backing index and the
-    //      collision is legal. On the name alone the two cross: measured on PG
-    //      16, two tables with a `shared_fk` produced EIGHT rows instead of two,
-    //      which grouped by name into one entry, so one table lost its relation
-    //      entirely and the other pointed at a column its target does not have
-    //      (42703 at query time). Which one won depended on catalog row order.
-    //
-    // conkey and confkey are parallel arrays, so unnesting BOTH `WITH
-    // ORDINALITY` and joining on the ordinal IS the pairing, exactly; the OID is
-    // the grouping key because it is unique catalog-wide.
-    //
-    // The target is constrained to the SAME schema, which is what the old query
-    // did implicitly (it joined on ccu.table_schema). Keeping it explicit
-    // matters: `buildRelations` resolves targets by bare name against the
-    // introspected table set, so a cross-schema reference to a same-named table
-    // would silently bind to the local one.
-    //
-    // `conparentid = 0` (declared constraints only) and the by-NAME ordering are
-    // both part of the lockstep: one FK against a partitioned table otherwise
-    // yields an extra phantom relation per partition, and ordering by `con.oid`
-    // makes relation naming a function of DDL execution order rather than of the
-    // schema. Both are written up at length over SQL_FOREIGN_KEYS.
-    client.query<{
-      constraint_oid: string;
-      source_table: string;
-      source_column: string;
-      target_table: string;
-      target_column: string;
-      constraint_name: string;
-    }>(
-      `SELECT
-         con.oid::text AS constraint_oid,
-         con.conname AS constraint_name,
-         src.relname AS source_table,
-         src_att.attname AS source_column,
-         tgt.relname AS target_table,
-         tgt_att.attname AS target_column
-       FROM pg_catalog.pg_constraint con
-       JOIN pg_catalog.pg_class src ON src.oid = con.conrelid
-       JOIN pg_catalog.pg_namespace src_ns ON src_ns.oid = src.relnamespace
-       JOIN pg_catalog.pg_class tgt ON tgt.oid = con.confrelid
-       JOIN pg_catalog.pg_namespace tgt_ns ON tgt_ns.oid = tgt.relnamespace
-       JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS sk(attnum, ord) ON TRUE
-       JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS tk(attnum, ord) ON tk.ord = sk.ord
-       JOIN pg_catalog.pg_attribute src_att
-         ON src_att.attrelid = con.conrelid AND src_att.attnum = sk.attnum
-       JOIN pg_catalog.pg_attribute tgt_att
-         ON tgt_att.attrelid = con.confrelid AND tgt_att.attnum = tk.attnum
-       WHERE con.contype = 'f'
-         AND con.conparentid = 0
-         AND src_ns.nspname = $1
-         AND tgt_ns.nspname = src_ns.nspname
-       ORDER BY src.relname, con.conname, sk.ord`,
-      [options.schema],
-    ),
-    client.query<{ table_name: string; constraint_name: string; column_name: string }>(
-      // Joined on the table too, same reasoning as the primary-key query above:
-      // a UNIQUE constraint is index-backed and therefore cannot collide, and
-      // the join says so.
-      `SELECT tc.table_name, tc.constraint_name, kcu.column_name
-       FROM information_schema.table_constraints tc
-       JOIN information_schema.key_column_usage kcu
-         ON tc.constraint_name = kcu.constraint_name
-        AND tc.table_schema = kcu.table_schema
-        AND tc.table_name = kcu.table_name
-       WHERE tc.constraint_type = 'UNIQUE' AND tc.table_schema = $1
-       ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`,
-      [options.schema],
-    ),
-    client.query<{ tablename: string; indexname: string; indexdef: string }>(
-      // Ordered for the same reason SQL_INDEXES is: these rows feed the
-      // unique-set detection that decides hasOne-versus-hasMany, and they are
-      // reported verbatim by the schema tools, so physical catalog order must
-      // not leak into either answer. Index names are unique per schema.
-      `SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = $1 ORDER BY tablename, indexname`,
-      [options.schema],
-    ),
-    client.query<{ typname: string; enumlabel: string }>(
-      `SELECT t.typname, e.enumlabel
-       FROM pg_type t
-       JOIN pg_enum e ON t.oid = e.enumtypid
-       JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
-       WHERE n.nspname = $1
-       ORDER BY t.typname, e.enumsortorder`,
-      [options.schema],
-    ),
-  ]);
+  // SEQUENTIAL, deliberately, on the one client `withReadOnly` checked out. These
+  // used to run in a single `Promise.all`, which node-postgres tolerates by
+  // queueing the calls behind one another with a `DeprecationWarning` on every
+  // session (`Calling client.query() when the client is already executing a
+  // query ... will be removed in pg@9.0`) and which pg 9 refuses outright, so
+  // every schema-reading tool would throw. The queueing meant they were never
+  // concurrent on the wire anyway; awaiting them in turn costs nothing and puts
+  // the ordering in this file rather than in a deprecated driver behaviour.
+  const tablesResult = await client.query<{ table_name: string }>(
+    `SELECT table_name
+     FROM information_schema.tables
+     WHERE table_schema = $1 AND table_type = 'BASE TABLE'
+     ORDER BY table_name`,
+    [options.schema],
+  );
+  const columnsResult = await client.query<{
+    table_name: string;
+    column_name: string;
+    udt_name: string;
+    data_type: string;
+    is_nullable: string;
+    column_default: string | null;
+    is_identity: string;
+    character_maximum_length: number | null;
+  }>(
+    `SELECT table_name, column_name, udt_name, data_type, is_nullable, column_default, is_identity,
+            character_maximum_length
+     FROM information_schema.columns
+     WHERE table_schema = $1
+     ORDER BY table_name, ordinal_position`,
+    [options.schema],
+  );
+  const pkResult = await client.query<{ table_name: string; column_name: string }>(
+    // Joined on the table as well as the constraint name. Not because two
+    // primary keys can share a name (they cannot: a PK is backed by an INDEX,
+    // and index names ARE unique per schema, so Postgres itself refuses the
+    // second `CREATE TABLE ... CONSTRAINT pk_shared PRIMARY KEY` with
+    // `relation "pk_shared" already exists`, verified on PG 16) but because
+    // the join reads as if the name were the identity, which is what put the
+    // FOREIGN KEY query below one refactor away from a silent cross product.
+    // A foreign key has no backing index and so genuinely can collide.
+    `SELECT tc.table_name, kcu.column_name
+     FROM information_schema.table_constraints tc
+     JOIN information_schema.key_column_usage kcu
+       ON tc.constraint_name = kcu.constraint_name
+      AND tc.table_schema = kcu.table_schema
+      AND tc.table_name = kcu.table_name
+     WHERE tc.constraint_type = 'PRIMARY KEY' AND tc.table_schema = $1
+     ORDER BY tc.table_name, kcu.ordinal_position`,
+    [options.schema],
+  );
+  // Foreign keys come from pg_catalog, not information_schema, and the reason
+  // is the same one written up over `SQL_FOREIGN_KEYS` in ../introspect.ts
+  // (KEEP THE TWO IN LOCKSTEP: this is a second copy of that query because
+  // introspect.ts does not export it, and mcp reads through its own pooled
+  // client inside a read-only transaction rather than opening the pool
+  // `introspect()` owns). The information_schema formulation this replaces
+  // joined key_column_usage (constrained columns) to constraint_column_usage
+  // (referenced columns) on the constraint NAME, which is wrong twice:
+  //
+  //   1. Those two column lists have no positional link, so the join is an
+  //      N-by-N cross product: a two-column FK came back as four rows and
+  //      grouped into four AND-ed correlations, two of them pairing the wrong
+  //      columns. Every read through the relation silently returned nothing.
+  //   2. A constraint name is unique per TABLE (conrelid, conname), not per
+  //      schema, so two tables may both have a `shared_fk`. This is specific
+  //      to foreign keys: a PRIMARY KEY or UNIQUE constraint is backed by an
+  //      index and index names ARE schema-unique, so Postgres refuses that
+  //      collision outright, while an FK has no backing index and the
+  //      collision is legal. On the name alone the two cross: measured on PG
+  //      16, two tables with a `shared_fk` produced EIGHT rows instead of two,
+  //      which grouped by name into one entry, so one table lost its relation
+  //      entirely and the other pointed at a column its target does not have
+  //      (42703 at query time). Which one won depended on catalog row order.
+  //
+  // conkey and confkey are parallel arrays, so unnesting BOTH `WITH
+  // ORDINALITY` and joining on the ordinal IS the pairing, exactly; the OID is
+  // the grouping key because it is unique catalog-wide.
+  //
+  // The target is constrained to the SAME schema, which is what the old query
+  // did implicitly (it joined on ccu.table_schema). Keeping it explicit
+  // matters: `buildRelations` resolves targets by bare name against the
+  // introspected table set, so a cross-schema reference to a same-named table
+  // would silently bind to the local one.
+  //
+  // `conparentid = 0` (declared constraints only) and the by-NAME ordering are
+  // both part of the lockstep: one FK against a partitioned table otherwise
+  // yields an extra phantom relation per partition, and ordering by `con.oid`
+  // makes relation naming a function of DDL execution order rather than of the
+  // schema. Both are written up at length over SQL_FOREIGN_KEYS.
+  const fkResult = await client.query<{
+    constraint_oid: string;
+    source_table: string;
+    source_column: string;
+    target_table: string;
+    target_column: string;
+    constraint_name: string;
+  }>(
+    `SELECT
+       con.oid::text AS constraint_oid,
+       con.conname AS constraint_name,
+       src.relname AS source_table,
+       src_att.attname AS source_column,
+       tgt.relname AS target_table,
+       tgt_att.attname AS target_column
+     FROM pg_catalog.pg_constraint con
+     JOIN pg_catalog.pg_class src ON src.oid = con.conrelid
+     JOIN pg_catalog.pg_namespace src_ns ON src_ns.oid = src.relnamespace
+     JOIN pg_catalog.pg_class tgt ON tgt.oid = con.confrelid
+     JOIN pg_catalog.pg_namespace tgt_ns ON tgt_ns.oid = tgt.relnamespace
+     JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS sk(attnum, ord) ON TRUE
+     JOIN LATERAL unnest(con.confkey) WITH ORDINALITY AS tk(attnum, ord) ON tk.ord = sk.ord
+     JOIN pg_catalog.pg_attribute src_att
+       ON src_att.attrelid = con.conrelid AND src_att.attnum = sk.attnum
+     JOIN pg_catalog.pg_attribute tgt_att
+       ON tgt_att.attrelid = con.confrelid AND tgt_att.attnum = tk.attnum
+     WHERE con.contype = 'f'
+       AND con.conparentid = 0
+       AND src_ns.nspname = $1
+       AND tgt_ns.nspname = src_ns.nspname
+     ORDER BY src.relname, con.conname, sk.ord`,
+    [options.schema],
+  );
+  const uniqueResult = await client.query<{ table_name: string; constraint_name: string; column_name: string }>(
+    // Joined on the table too, same reasoning as the primary-key query above:
+    // a UNIQUE constraint is index-backed and therefore cannot collide, and
+    // the join says so.
+    `SELECT tc.table_name, tc.constraint_name, kcu.column_name
+     FROM information_schema.table_constraints tc
+     JOIN information_schema.key_column_usage kcu
+       ON tc.constraint_name = kcu.constraint_name
+      AND tc.table_schema = kcu.table_schema
+      AND tc.table_name = kcu.table_name
+     WHERE tc.constraint_type = 'UNIQUE' AND tc.table_schema = $1
+     ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position`,
+    [options.schema],
+  );
+  const indexResult = await client.query<{ tablename: string; indexname: string; indexdef: string }>(
+    // Ordered for the same reason SQL_INDEXES is: these rows feed the
+    // unique-set detection that decides hasOne-versus-hasMany, and they are
+    // reported verbatim by the schema tools, so physical catalog order must
+    // not leak into either answer. Index names are unique per schema.
+    `SELECT tablename, indexname, indexdef FROM pg_indexes WHERE schemaname = $1 ORDER BY tablename, indexname`,
+    [options.schema],
+  );
+  const enumResult = await client.query<{ typname: string; enumlabel: string }>(
+    `SELECT t.typname, e.enumlabel
+     FROM pg_type t
+     JOIN pg_enum e ON t.oid = e.enumtypid
+     JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace
+     WHERE n.nspname = $1
+     ORDER BY t.typname, e.enumsortorder`,
+    [options.schema],
+  );
 
   let tableNames = tablesResult.rows.map((row) => row.table_name);
   if (options.include?.length) {
@@ -2445,13 +2491,21 @@ function errorResponse(id: string | number | null, code: number, message: string
 
 export async function runMcpServer(options: McpServerOptions): Promise<void> {
   const handle = startMcpServer(options);
-  await new Promise<void>((resolve) => {
-    const shutdown = async () => {
-      await handle.dispose();
-      resolve();
-    };
-    process.once('SIGINT', shutdown);
-    process.once('SIGTERM', shutdown);
-    process.stdin.once('end', shutdown);
-  });
+  const shutdown = (): void => {
+    handle.dispose().catch((err) => {
+      process.stderr.write(`[turbine] mcp shutdown error: ${redactUrl(errorMessage(err))}\n`);
+    });
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
+  process.stdin.once('end', shutdown);
+
+  const reason = await handle.closed;
+  if (reason === 'framing-lost') {
+    // The reader is detached but a paused stdin still holds the event loop
+    // open, so release it, and exit non-zero: this end was the peer's doing and
+    // a supervisor should restart the server rather than record a clean stop.
+    process.exitCode = 1;
+    process.stdin.destroy();
+  }
 }

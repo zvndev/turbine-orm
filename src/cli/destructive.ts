@@ -46,7 +46,9 @@ export type DestructiveKind =
   | 'alter-column-type'
   | 'merge-delete'
   | 'rename'
-  | 'dynamic-destructive';
+  | 'rewrite-rule'
+  | 'dynamic-destructive'
+  | 'dynamic-unclassified';
 
 export interface DestructiveStatement {
   /** The offending SQL statement (trimmed, possibly long, display truncated) */
@@ -77,8 +79,12 @@ export const DESTRUCTIVE_KIND_LABEL: Record<DestructiveKind, string> = {
   'alter-column-type': 'rewrites a column type (cast may truncate or fail)',
   'merge-delete': 'deletes matched rows (MERGE ... THEN DELETE)',
   rename: 'renames a table or column, every query and view referencing the old name breaks',
+  'rewrite-rule':
+    'installs a rewrite rule that runs a destructive statement every time a later ordinary statement matches it',
   'dynamic-destructive':
     'runs destructive SQL assembled at run time, what it destroys cannot be known without running it',
+  'dynamic-unclassified':
+    'runs SQL assembled at run time whose statement the scanner cannot read; confirm what it does yourself',
 };
 
 /** Unquote a "quoted" identifier for display. */
@@ -208,6 +214,20 @@ const RULES: Rule[] = [
     regex: new RegExp(String.raw`^UPDATE\s+(ONLY\s+)?${IDENT}\b`, 'i'),
     target: (m) => (m[4] ? `${ident(m[2])}.${ident(m[4])}` : ident(m[2])),
     also: (stmt) => !hasTopLevelWhere(stmt),
+  },
+  {
+    // `CREATE RULE r AS ON INSERT TO t DO INSTEAD DELETE FROM u`. The rule
+    // destroys nothing when it is created, which is why it passed: the DELETE
+    // runs later, on every ordinary INSERT into `t`, and the first one emptied
+    // the table. Deferred destruction is still destruction the migration
+    // installs. `DO ALSO` counts too (the action runs in addition), and the
+    // action may be a parenthesized list, whose FIRST statement decides.
+    kind: 'rewrite-rule',
+    regex: new RegExp(
+      String.raw`^CREATE\s+(?:OR\s+REPLACE\s+)?RULE\s+${IDENT}\s+AS\s+ON\s+(?:SELECT|INSERT|UPDATE|DELETE)\s+TO\s+${IDENT}${OUTSIDE_QUOTES}\bDO\s+(?:ALSO\s+|INSTEAD\s+)?\(?\s*(DELETE|UPDATE|TRUNCATE|DROP)\b`,
+      'i',
+    ),
+    target: (m) => `${qualified(m, 4)} (${(m[7] ?? '').toUpperCase()} on every matching statement)`,
   },
   // Renames come LAST: they destroy no data, so any statement that is BOTH a
   // rename and a data-loss operation should report the data loss instead.
@@ -481,6 +501,7 @@ export function scanDestructiveSql(sql: string): DestructiveStatement[] {
     // `RAISE NOTICE 'DROP the mic'` would prompt, and a guard that fires on
     // prose teaches operators to confirm without reading, which costs more than
     // it saves.
+    let dynamicHit = false;
     for (const part of proceduralParts) {
       const kind = dynamicDestructiveKind(part);
       if (!kind) continue;
@@ -489,10 +510,147 @@ export function scanDestructiveSql(sql: string): DestructiveStatement[] {
         kind,
         target: DYNAMIC_TARGET,
       });
+      dynamicHit = true;
+      break;
+    }
+    if (dynamicHit) continue;
+
+    // Still nothing, in a procedural body. Every pass above needs to SEE a verb,
+    // and an EXECUTE whose text is assembled so that no verb is visible
+    // (`'D' || 'ROP TABLE t'`, `chr(68) || ...`, `reverse(...)`, an escape-
+    // encoded literal, a variable built across statements) walked past all of
+    // them and dropped the table live. The scanner cannot classify such a
+    // statement, and "cannot classify" must not be reported as "clean": that is
+    // the consent gate deciding in the author's favour on no evidence. So it
+    // asks, with a kind whose label says exactly that.
+    for (const block of procedural ? statement.blocks : []) {
+      const unreadable = unclassifiableExecute(block);
+      if (unreadable === null) continue;
+      found.push({
+        statement: `${display} [in block: ${unreadable.replace(/\s+/g, ' ').slice(0, 60)}]`,
+        kind: 'dynamic-unclassified',
+        target: DYNAMIC_TARGET,
+      });
       break;
     }
   }
   return found;
+}
+
+/**
+ * Statement openers that destroy nothing, so an assembled `EXECUTE` whose text
+ * visibly begins with one of them is left alone. `UPDATE` is here because its
+ * destructive form is the ABSENCE of a `WHERE`, which the tail of an assembled
+ * fragment cannot answer; flagging every dynamic `UPDATE ... WHERE` is the
+ * false-positive cost this module refuses to pay.
+ */
+const HARMLESS_OPENER =
+  /^(?:SELECT|INSERT|UPDATE|CREATE|COMMENT|GRANT|REVOKE|ANALYZE|ANALYSE|REFRESH|VACUUM|REINDEX|CLUSTER|SET|RESET|SHOW|NOTIFY|LOCK|CALL|PERFORM|EXPLAIN)\b/i;
+
+/**
+ * Openers the verb-anchored passes above already decide, one way or the other
+ * (`ALTER TABLE ... ADD` is silent there on purpose, `DROP ...` is reported).
+ * Reporting them AGAIN here would double-count, or contradict a deliberate
+ * silence.
+ */
+const VERB_HANDLED_OPENER = /^(?:DROP|TRUNCATE|DELETE|ALTER|MERGE|WITH)\b/i;
+
+/**
+ * Functions whose FIRST literal argument is the statement text (or its
+ * template), so the opener can be read through the call.
+ */
+const TEMPLATE_FN = /^(?:format|replace|regexp_replace|concat|concat_ws|array_to_string)\s*\(/i;
+
+/** The leading string literal of `text`: its raw content and whether it can hide a verb. */
+function leadingLiteral(text: string): { content: string; rest: string; escaped: boolean } | null {
+  const m = /^(U&'|[EeBbXx]'|'|\$([A-Za-z_][\w]*)?\$)/.exec(text);
+  if (!m) return null;
+  const open = m[1]!;
+  if (open.startsWith('$')) {
+    const close = text.indexOf(open, open.length);
+    if (close === -1) return null;
+    return { content: text.slice(open.length, close), rest: text.slice(close + open.length), escaped: false };
+  }
+  // Single-quoted: `''` is an escaped quote inside the literal.
+  let i = open.length;
+  let content = '';
+  while (i < text.length) {
+    const ch = text[i]!;
+    if (ch === "'") {
+      if (text[i + 1] === "'") {
+        content += "'";
+        i += 2;
+        continue;
+      }
+      break;
+    }
+    content += ch;
+    i++;
+  }
+  if (i >= text.length) return null;
+  // `E'\x44ROP'` and `U&'\0044ROP'` spell a verb the scanner cannot see; an
+  // escape string with no backslash in it hides nothing.
+  const escaped = open !== "'" && content.includes('\\');
+  return { content, rest: text.slice(i + 1), escaped };
+}
+
+/**
+ * The first word of the statement an `EXECUTE` argument would run, read as far
+ * as the text allows, plus whether the argument is one PLAIN literal (in which
+ * case the literal passes already had their chance and this pass stays out).
+ * `null` opener = the scanner cannot see a verb at all.
+ */
+function executeOpener(expr: string): { opener: string | null; plain: boolean } {
+  const text = expr.trim();
+  const lit = leadingLiteral(text);
+  if (lit) {
+    const word = /^\s*([A-Za-z_][\w]*)/.exec(lit.content)?.[1] ?? null;
+    // Plain: the literal IS the whole argument (bar an INTO / USING clause),
+    // spelled without escapes.
+    const plain = !lit.escaped && /^\s*(?:;|INTO\b|USING\b|$)/i.test(lit.rest);
+    return { opener: lit.escaped ? null : word, plain };
+  }
+  if (TEMPLATE_FN.test(text)) {
+    // Read the opener from the first literal argument that carries a word: a
+    // `concat_ws(' ', ...)` separator or a `format('%s', ...)` placeholder is
+    // not a verb, and neither is a `concat('DR', 'OP', ...)` fragment.
+    const inner = text.slice(text.indexOf('(') + 1);
+    let cursor = inner;
+    for (let guard = 0; guard < 16; guard++) {
+      const lit2 = leadingLiteral(cursor.trimStart());
+      if (!lit2) break;
+      const word = /^\s*([A-Za-z_][\w]*)/.exec(lit2.content)?.[1];
+      if (word) return { opener: lit2.escaped ? null : word, plain: false };
+      const comma = lit2.rest.indexOf(',');
+      if (comma === -1) break;
+      cursor = lit2.rest.slice(comma + 1);
+    }
+    return { opener: null, plain: false };
+  }
+  // Any other function call, a parenthesised expression, or a bare variable
+  // (`EXECUTE s`, built across earlier statements): nothing readable.
+  return { opener: null, plain: false };
+}
+
+/**
+ * The EXECUTE argument in `body`, when it is assembled or encoded such that no
+ * statement verb is visible to the passes above. Returns the offending
+ * fragment for display, or `null` when every EXECUTE in the body either is a
+ * plain literal (the literal rules own it) or visibly begins with a verb some
+ * other rule has already judged.
+ */
+function unclassifiableExecute(body: string): string | null {
+  for (const statement of tokenizeSql(body)) {
+    const code = statement.code;
+    const m = /\bEXECUTE\s+([\s\S]+)$/i.exec(code);
+    if (!m) continue;
+    const expr = m[1]!;
+    const { opener, plain } = executeOpener(expr);
+    if (plain) continue;
+    if (opener !== null && (HARMLESS_OPENER.test(opener) || VERB_HANDLED_OPENER.test(opener))) continue;
+    return `EXECUTE ${expr}`;
+  }
+  return null;
 }
 
 /** Shown in place of an object name that does not exist until the block runs. */
@@ -566,15 +724,52 @@ const WRAPPING_ASSEMBLY_FN =
 const RUNS_DYNAMIC_SQL = /\bEXECUTE\b/i;
 
 /**
+ * `ALTER TABLE <assembled name> DROP [COLUMN] ...`: the sub-action that loses
+ * rows, with the same exclusions as the static `drop-column` rule (`DROP
+ * CONSTRAINT` / `DEFAULT` / `NOT NULL` / `IDENTITY` / `EXPRESSION` lose none).
+ * Matches when the keyword `COLUMN`, an `IF EXISTS`, or a literal column name
+ * follows the `DROP`; a `DROP` followed by nothing literal is handled below.
+ * {@link OUTSIDE_QUOTES} keeps `ADD COLUMN "drop me"` out, as it does statically.
+ */
+const DYNAMIC_ALTER_DROP_COLUMN = new RegExp(
+  String.raw`^ALTER\s+TABLE\b${OUTSIDE_QUOTES}\bDROP\s+(?!CONSTRAINT\b|DEFAULT\b|NOT\b|IDENTITY\b|EXPRESSION\b)(?:COLUMN\b|IF\s+EXISTS\b|${IDENT})`,
+  'i',
+);
+
+/** `ALTER TABLE <assembled name> ALTER [COLUMN] <col> [SET DATA] TYPE ...`. */
+const DYNAMIC_ALTER_COLUMN_TYPE = new RegExp(
+  String.raw`^ALTER\s+TABLE\b${OUTSIDE_QUOTES}\bALTER\s+(?:COLUMN\s+)?${IDENT}\s+(?:SET\s+DATA\s+)?TYPE\b`,
+  'i',
+);
+
+/** The `DROP <thing>` sub-actions of ALTER TABLE that lose no rows. */
+const DYNAMIC_ALTER_DROP_HARMLESS = new RegExp(
+  String.raw`^ALTER\s+TABLE\b${OUTSIDE_QUOTES}\bDROP\s+(?:CONSTRAINT|DEFAULT|NOT\s+NULL|IDENTITY|EXPRESSION)\b`,
+  'i',
+);
+
+/**
  * The kind a runtime-assembled procedural fragment should be reported as, or
  * `null` when it is not dynamic (so a rule already had its chance) or its verb
  * is not one that destroys data on its own.
  *
- * `ALTER` and `UPDATE` are deliberately absent even though
- * {@link proceduralCandidates} collects them: their destructive forms are
- * narrow (`ALTER COLUMN ... TYPE`, an `UPDATE` with no `WHERE`) and neither is
- * decidable from a fragment whose tail is a runtime expression, so including
- * them would flag every dynamic `UPDATE ... WHERE` in the file.
+ * `ALTER TABLE` IS decided here, by the sub-action that follows the assembled
+ * table name, because in the shape that matters that sub-action is literal
+ * text: a multi-tenant loop assembles the TABLE (`'ALTER TABLE ' ||
+ * quote_ident(t) || ' DROP COLUMN legacy_phone'`) and writes out what it does
+ * to it. That statement dropped the column from every tenant table while the
+ * scan reported a clean inventory, and its `DROP TABLE` twin was already being
+ * flagged, so an operator who had seen the guard fire once would assume this
+ * was covered. Only the forms that lose rows are reported (`DROP [COLUMN]`,
+ * `ALTER COLUMN ... TYPE`), with the same exclusions as their static rules; an
+ * assembled `ADD COLUMN` stays silent. A `DROP` whose object is itself in the
+ * runtime expression (`' DROP ' || what`) is `dynamic-destructive`, the bare
+ * `DROP` precedent below: alarming is fine, wrong is not.
+ *
+ * `UPDATE` is still deliberately absent even though {@link proceduralCandidates}
+ * collects it: its destructive form is the ABSENCE of a `WHERE`, and absence
+ * is not decidable from a fragment whose tail is a runtime expression, so
+ * including it would flag every dynamic `UPDATE ... WHERE` in the file.
  */
 function dynamicDestructiveKind({ text, before }: ProceduralCandidate): DestructiveKind | null {
   const assembled =
@@ -582,6 +777,13 @@ function dynamicDestructiveKind({ text, before }: ProceduralCandidate): Destruct
     ASSEMBLY_FN.test(text) ||
     (RUNS_DYNAMIC_SQL.test(before) && WRAPPING_ASSEMBLY_FN.test(before));
   if (!assembled) return null;
+  if (/^ALTER\s+TABLE\b/i.test(text)) {
+    if (DYNAMIC_ALTER_DROP_COLUMN.test(text)) return 'drop-column';
+    if (DYNAMIC_ALTER_COLUMN_TYPE.test(text)) return 'alter-column-type';
+    if (DYNAMIC_ALTER_DROP_HARMLESS.test(text)) return null;
+    if (new RegExp(String.raw`^ALTER\s+TABLE\b${OUTSIDE_QUOTES}\bDROP\b`, 'i').test(text)) return 'dynamic-destructive';
+    return null;
+  }
   if (/^DROP\s+TABLE\b/i.test(text)) return 'drop-table';
   if (/^DROP\s+SCHEMA\b/i.test(text)) return 'drop-schema';
   if (/^DROP\s+DATABASE\b/i.test(text)) return 'drop-database';

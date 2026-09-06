@@ -103,3 +103,75 @@ describe('destructive scan: what must NOT be flagged', () => {
     assert.deepEqual(kinds('CREATE TABLE t (id int); CREATE INDEX idx_t_id ON t (id);'), []);
   });
 });
+
+describe('destructive scan: dynamic ALTER TABLE forms whose sub-action is literal text', () => {
+  // The multi-tenant shape: the TABLE name is assembled at run time, the
+  // sub-action after it is written out. `DROP TABLE ' || quote_ident(t)` was
+  // already flagged; this is its ALTER sibling, and it drops the column on
+  // PostgreSQL just as surely.
+  const loop = (action: string) =>
+    `DO $$ DECLARE t text; BEGIN
+       FOR t IN SELECT tablename FROM pg_tables WHERE tablename LIKE 'tenant_%' LOOP
+         EXECUTE 'ALTER TABLE ' || quote_ident(t) || ' ${action}';
+       END LOOP;
+     END $$;`;
+
+  it('DROP COLUMN <name> on an assembled table is reported as drop-column with an unknown target', () => {
+    const found = scanDestructiveSql(loop('DROP COLUMN legacy_phone'));
+    assert.equal(found.length, 1, `expected exactly one finding, got ${JSON.stringify(found)}`);
+    assert.equal(found[0]!.kind, 'drop-column');
+    assert.equal(found[0]!.target, DYNAMIC_TARGET);
+  });
+
+  it('the COLUMN keyword is optional in Postgres, so `DROP legacy_phone` is the same finding', () => {
+    assert.deepEqual(kinds(loop('DROP legacy_phone')), ['drop-column']);
+    assert.deepEqual(kinds(loop('DROP COLUMN IF EXISTS legacy_phone')), ['drop-column']);
+  });
+
+  it('DROP COLUMN whose column NAME is also assembled is still drop-column (the keyword decides)', () => {
+    assert.deepEqual(
+      kinds(`DO $$ BEGIN EXECUTE 'ALTER TABLE ' || quote_ident(t) || ' DROP COLUMN ' || quote_ident(c); END $$;`),
+      ['drop-column'],
+    );
+  });
+
+  it('ALTER COLUMN ... TYPE and SET DATA TYPE on an assembled table are alter-column-type', () => {
+    assert.deepEqual(kinds(loop('ALTER COLUMN amount TYPE int')), ['alter-column-type']);
+    assert.deepEqual(kinds(loop('ALTER amount SET DATA TYPE int')), ['alter-column-type']);
+  });
+
+  it('the format() spelling is the same statement', () => {
+    assert.deepEqual(kinds(`DO $$ BEGIN EXECUTE format('ALTER TABLE %I DROP COLUMN legacy_phone', t); END $$;`), [
+      'drop-column',
+    ]);
+  });
+
+  it('a DROP whose object keyword is itself in the runtime expression is dynamic-destructive, like the bare DROP', () => {
+    assert.deepEqual(kinds(`DO $$ BEGIN EXECUTE 'ALTER TABLE ' || quote_ident(t) || ' DROP ' || what; END $$;`), [
+      'dynamic-destructive',
+    ]);
+  });
+
+  // Controls. Over-matching here teaches operators to confirm without reading.
+  it('ADD COLUMN on an assembled table is not flagged', () => {
+    assert.deepEqual(kinds(loop('ADD COLUMN legacy_phone text')), []);
+  });
+
+  it('ADD COLUMN "drop me" is not a DROP: quoted identifiers are consumed whole', () => {
+    assert.deepEqual(kinds(loop('ADD COLUMN "drop me" int')), []);
+  });
+
+  it('the ALTER TABLE sub-actions that lose no rows are not flagged', () => {
+    assert.deepEqual(kinds(loop('DROP CONSTRAINT tenant_pkey')), []);
+    assert.deepEqual(kinds(loop('ALTER COLUMN amount DROP DEFAULT')), []);
+    assert.deepEqual(kinds(loop('ALTER COLUMN amount DROP NOT NULL')), []);
+    assert.deepEqual(kinds(loop('ALTER COLUMN amount SET NOT NULL')), []);
+  });
+
+  it('a dynamic UPDATE ... WHERE is still not flagged', () => {
+    assert.deepEqual(
+      kinds(`DO $$ BEGIN EXECUTE 'UPDATE ' || quote_ident(t) || ' SET flag = true WHERE id = 1'; END $$;`),
+      [],
+    );
+  });
+});

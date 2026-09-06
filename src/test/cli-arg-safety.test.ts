@@ -166,9 +166,31 @@ describe('unknown flags do not fire on valid input', () => {
   it('does not mistake a flag VALUE for a flag, including a negative number', () => {
     // Values are consumed by their own case on the same cursor, so they never
     // reach the unknown-flag test.
-    assert.equal(run(['migrate', 'down', '--step', '-1']).exited, null);
     assert.equal(run(['studio', '--host', '-weird']).exited, null);
     assert.equal(run(['doctor', '--min-scans', '-5']).exited, null);
+  });
+
+  it('a refused flag VALUE is refused as a VALUE, never reported as an unknown flag', () => {
+    // `--step -1` used to parse clean and mean "every migration except the
+    // oldest", so `--step` now refuses a value that is not a positive count.
+    // That refusal must come from the `--step` case, which is what proves the
+    // value was consumed there rather than falling through to the unknown-flag
+    // test and being reported as a flag named `-1`.
+    //
+    // Asserted on the error IDENTITY and the two things the reader needs (the
+    // flag, the offending value), never the full sentence: message wording is
+    // explicitly not part of the stability contract.
+    assert.throws(
+      () => parseArgs(['migrate', 'down', '--step', '-1']),
+      (err: unknown) => {
+        assert.ok(err instanceof Error);
+        assert.match(err.message, /TURBINE_E003/);
+        assert.match(err.message, /--step/);
+        assert.match(err.message, /-1/);
+        assert.doesNotMatch(err.message, /Unknown flag/);
+        return true;
+      },
+    );
   });
 
   it("leaves an unknown command's flags alone, so the command error is what surfaces", () => {
