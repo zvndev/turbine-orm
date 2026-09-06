@@ -324,6 +324,19 @@ neighbouring implementation.
   `--schema` was undocumented on `init`, `migrate` and `seed`, which the "every
   long flag is documented" guard could not see because it is a global flag.
 
+- **SQL Server reported every unique index as non-unique, so the engine had no
+  unique keys at all.** `sys.indexes.is_unique` is a `bit` and tedious parses
+  TDS bits with `!!value`, so the driver sends a boolean; the introspector
+  compared it to the number 1. `uniqueColumns` was therefore empty on every
+  introspected table, `IndexMetadata.unique` was false on every unique index,
+  and no compound-unique selector could derive. Invisible until a rule asked the
+  metadata a question: since 0.73 `findUnique` on a genuinely unique non-PK
+  column has been refused on SQL Server as not identifying a single row, and
+  this release gave `upsert` the same rule. The unit lane could not see it
+  because the introspector mock's index-row builder typed its `is_unique`
+  parameter `number`, so the fixture only ever produced the spelling the code
+  already handled.
+
 ### Added
 
 - `RelationOrderBy` is a depth-bounded chain of to-one hops, matching what the
