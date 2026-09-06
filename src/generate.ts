@@ -12,6 +12,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { ValidationError } from './errors.js';
+import { assertDistinctColumnFields } from './introspect.js';
 import {
   type ColumnMetadata,
   type PrismaCompatMap,
@@ -488,6 +489,11 @@ export function assertEmittableSchema(schema: SchemaMetadata): void {
   for (const table of Object.values(schema.tables)) {
     requireEmittable(entityName(table.name), `table "${table.name}"`, 'the generated entity type name');
     requireEmittable(snakeToCamelStr(table.name), `table "${table.name}"`, 'the generated client accessor');
+    // Two columns on one field would emit a duplicate interface member (TS2300
+    // in the consumer's build) and a `columnMap` missing a column. The rule is
+    // introspect.ts's; re-asserting it here covers a hand-built or
+    // engine-introspected schema that never went through that path.
+    assertDistinctColumnFields(table.name, table.columns);
     // Only the relations that reach the TYPE layer: a relation shadowing a
     // column field is already dropped from types.ts, so refusing on its name
     // would refuse a schema that generates fine.
@@ -572,17 +578,23 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
     lines.push('');
 
     // --- Create input type ---
-    // Required: non-nullable columns without defaults (except PK)
-    // Optional: nullable columns (default to NULL) or columns with explicit defaults
+    // Optional: server-generated columns (serial / identity), columns with a
+    // default, and nullable columns (default to NULL). Everything else is
+    // required, PRIMARY KEY MEMBERSHIP INCLUDED. A text natural key, a
+    // client-supplied uuid with no default, or a composite key of plain
+    // integers must be supplied, and the database rejects the row otherwise
+    // (E010). Marking every PK column optional let `create({ data: {} })` on
+    // a junction table typecheck and fail at runtime, which is the opposite of
+    // what a generated type is for.
     lines.push(`/** Input type for creating a row in \`${docSafe(table.name)}\` */`);
     lines.push(`export type ${typeName}Create = {`);
     for (const col of table.columns) {
       // STORED generated columns are computed by the database, never writable.
       if (col.isGeneratedStored) continue;
-      const isPk = table.primaryKey.includes(col.name);
-      const isOptional = col.hasDefault || col.nullable || isPk;
+      const isGenerated = col.isGenerated === true;
+      const isOptional = isGenerated || col.hasDefault || col.nullable;
       if (isOptional) {
-        const reason = isPk ? 'auto-generated' : col.hasDefault ? 'has default' : 'nullable';
+        const reason = isGenerated ? 'auto-generated' : col.hasDefault ? 'has default' : 'nullable';
         lines.push(`  /** Optional: ${reason} */`);
         lines.push(`  ${quoteIfNeeded(col.field)}?: ${writeColumnTsType(col, schema.enums)};`);
       } else {
@@ -893,16 +905,16 @@ export function generateZod(schema: SchemaMetadata, options?: GenerateFileOption
     lines.push('});');
     lines.push('');
 
-    // Create schema, STORED generated columns can never be written; PK,
-    // defaulted, and nullable columns are optional.
+    // Create schema, STORED generated columns can never be written;
+    // server-generated, defaulted, and nullable columns are optional, the same
+    // rule as the `*Create` type (a PK with none of those is required).
     lines.push(`/** Zod schema for creating a \`${docSafe(table.name)}\` row */`);
     lines.push(`export const ${typeName}CreateSchema = z.object({`);
     for (const col of table.columns) {
       if (col.isGeneratedStored) continue;
-      const isPk = table.primaryKey.includes(col.name);
       let expr = zodBaseType(col, schema.enums, true);
       if (col.nullable) expr += '.nullable()';
-      if (col.hasDefault || col.nullable || isPk) expr += '.optional()';
+      if (col.isGenerated === true || col.hasDefault || col.nullable) expr += '.optional()';
       lines.push(`  ${quoteIfNeeded(col.field)}: ${expr},`);
     }
     lines.push('});');
@@ -931,6 +943,10 @@ export function generateZod(schema: SchemaMetadata, options?: GenerateFileOption
 // ---------------------------------------------------------------------------
 
 export function generateMetadata(schema: SchemaMetadata, options?: GenerateFileOptions): string {
+  // metadata.ts is where a field collision does its runtime damage: the
+  // emitted `columnMap` keeps whichever column was written last, so refuse it
+  // here as well as in the type emitters (see assertEmittableSchema).
+  for (const table of Object.values(schema.tables)) assertDistinctColumnFields(table.name, table.columns);
   const lines: string[] = [
     ...generatedFileHeader(options),
     "import type { SchemaMetadata } from 'turbine-orm';",
@@ -1175,15 +1191,21 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
   lines.push('  }');
   lines.push('}');
   lines.push('');
-  // Augment TurbineClient via interface merging with a typed $transaction
-  // overload. The callback parameter is narrowed to `TypedTransactionClient`
-  // so users get autocomplete on `tx.users`, `tx.posts`, etc.
+  // Augment TurbineClient via interface merging with typed $transaction and
+  // $withSession overloads. The callback parameter is narrowed to
+  // `TypedTransactionClient` so users get autocomplete on `tx.users`,
+  // `tx.posts`, etc. $withSession is the RLS shorthand for
+  // `$transaction(fn, { sessionContext })`; it used to be left out, so its
+  // callback stayed the untyped base `TransactionClient` and the documented
+  // `tx.<table>.findMany()` did not compile on a generated client.
   //
-  // IMPORTANT: the merged member must be compatible with the base class's
-  // $transaction ON ITS OWN (TS2415), since v0.26 the base method also has a
+  // IMPORTANT: each merged member must be compatible with the base class's
+  // member ON ITS OWN (TS2415), since v0.26 the base $transaction also has a
   // batch-array overload (`$transaction([...queries])`), so the merged
   // interface must redeclare BOTH signatures. Emitting only the callback form
-  // makes every generated client fail `tsc` with "incorrectly extends".
+  // makes every generated client fail `tsc` with "incorrectly extends". The
+  // $withSession overload mirrors the base parameter list exactly for the same
+  // reason; src/test/generate-typecheck.test.ts compiles the result.
   lines.push('export interface TurbineClient {');
   lines.push('  /**');
   lines.push('   * Run a callback inside a transaction. The callback receives a typed');
@@ -1200,6 +1222,15 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
   lines.push('  $transaction<T extends readonly DeferredQuery<unknown>[]>(');
   lines.push('    queries: readonly [...T],');
   lines.push('  ): Promise<PipelineResults<T>>;');
+  lines.push('  /**');
+  lines.push('   * Run a callback inside a transaction with the given session GUCs applied');
+  lines.push('   * via `set_config(..., true)` (the RLS / multi-tenant shorthand). The');
+  lines.push('   * callback receives a typed `TypedTransactionClient`, same as `$transaction`.');
+  lines.push('   */');
+  lines.push('  $withSession<R>(');
+  lines.push('    context: Record<string, string | number | boolean>,');
+  lines.push('    fn: (tx: TypedTransactionClient) => Promise<R>,');
+  lines.push('  ): Promise<R>;');
   lines.push('}');
   lines.push('');
 

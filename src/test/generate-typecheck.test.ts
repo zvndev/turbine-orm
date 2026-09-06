@@ -93,7 +93,38 @@ const DOCUMENT_VERSIONS = table(
   ['id'],
 );
 
-const T4_FOREIGN_KEYS: ForeignKeyEntry[] = [
+// Documented call forms need a table with a natural-key PK (a `text` primary
+// key with no default must be REQUIRED in `*Create`) and a two-hop to-one
+// chain (`comments -> post -> user`) for the relation `orderBy` form.
+const USERS = table(
+  'users',
+  [col('id', 'int8', 'number', { hasDefault: true, isGenerated: true }), col('email', 'text', 'string')],
+  ['id'],
+);
+
+const TAGS = table('tags', [col('slug', 'text', 'string'), col('label', 'text', 'string')], ['slug']);
+
+const POSTS = table(
+  'posts',
+  [
+    col('id', 'int8', 'number', { hasDefault: true, isGenerated: true }),
+    col('user_id', 'int8', 'number'),
+    col('title', 'text', 'string'),
+  ],
+  ['id'],
+);
+
+const COMMENTS = table(
+  'comments',
+  [
+    col('id', 'int8', 'number', { hasDefault: true, isGenerated: true }),
+    col('post_id', 'int8', 'number'),
+    col('body', 'text', 'string'),
+  ],
+  ['id'],
+);
+
+const FOREIGN_KEYS: ForeignKeyEntry[] = [
   {
     sourceTable: 'documents',
     sourceColumns: ['currentVersionId'],
@@ -108,7 +139,23 @@ const T4_FOREIGN_KEYS: ForeignKeyEntry[] = [
     targetColumns: ['id'],
     constraintName: 'documents_publishedVersionId_fkey',
   },
+  {
+    sourceTable: 'posts',
+    sourceColumns: ['user_id'],
+    targetTable: 'users',
+    targetColumns: ['id'],
+    constraintName: 'posts_user_id_fkey',
+  },
+  {
+    sourceTable: 'comments',
+    sourceColumns: ['post_id'],
+    targetTable: 'posts',
+    targetColumns: ['id'],
+    constraintName: 'comments_post_id_fkey',
+  },
 ];
+
+const RELATION_TABLES = [DOCUMENTS, DOCUMENT_VERSIONS, USERS, TAGS, POSTS, COMMENTS];
 
 // Derive relations exactly the way `turbine generate` introspection does
 // (silencing the expected collision warning for `currentVersion`).
@@ -117,14 +164,10 @@ const T4_FOREIGN_KEYS: ForeignKeyEntry[] = [
   console.warn = () => {};
   try {
     const derived = buildRelationsFromForeignKeys(
-      T4_FOREIGN_KEYS,
-      new Map([
-        ['documents', new Set(DOCUMENTS.columns.map((c) => c.field))],
-        ['document_versions', new Set(DOCUMENT_VERSIONS.columns.map((c) => c.field))],
-      ]),
+      FOREIGN_KEYS,
+      new Map(RELATION_TABLES.map((t) => [t.name, new Set(t.columns.map((c) => c.field))])),
     );
-    DOCUMENTS.relations = derived.get('documents') ?? {};
-    DOCUMENT_VERSIONS.relations = derived.get('document_versions') ?? {};
+    for (const t of RELATION_TABLES) t.relations = derived.get(t.name) ?? {};
   } finally {
     console.warn = originalWarn;
   }
@@ -165,88 +208,118 @@ type AssertMany<T extends RelationDescriptor<Document, 'many', DocumentRelations
 export type _many = AssertMany<ByCurrent>;
 `;
 
+// Every call form the docs show on a generated client, in one consumer file.
+// Each line here is a sentence somewhere in the public docs; the file exists so
+// that a base-class signature change (return type, callback parameter type,
+// constructor arity) fails THIS test instead of a reader's `tsc`.
+const CALL_FORMS_USAGE = `
+import { TurbineClient as BaseTurbineClient } from 'turbine-orm';
+import { SCHEMA, TurbineClient, turbine } from './index.js';
+import type { TagCreate } from './types.js';
+
+declare const db: TurbineClient;
+
+// Read-your-own-write: the primary-pinned view keeps the generated accessors.
+export async function primaryRead(): Promise<string | undefined> {
+  const user = await db.$primary().users.findFirst({ where: { email: 'a@b.com' } });
+  return user?.email;
+}
+
+// RLS shorthand: the session callback receives the TYPED transaction client.
+export async function sessionRead(): Promise<string | undefined> {
+  const rows = await db.$withSession({ 'app.current_tenant': 1 }, (tx) => tx.users.findMany());
+  return rows[0]?.email;
+}
+
+// The base class takes (config, schema); the generated subclass and factory take config only.
+export const base = new BaseTurbineClient({ connectionString: 'postgres://localhost/app' }, SCHEMA);
+export const generated = new TurbineClient({ connectionString: 'postgres://localhost/app' });
+export const viaFactory = turbine({ connectionString: 'postgres://localhost/app' });
+
+// A text primary key with no default and no identity is REQUIRED on create.
+export const tag: TagCreate = { slug: 'ts', label: 'TypeScript' };
+// @ts-expect-error slug has no default, so omitting it must not compile
+export const tagWithoutPk: TagCreate = { label: 'TypeScript' };
+`;
+
+// Two-hop to-one relation ordering, documented as "the chain can be more than
+// one hop long". The builder accepts any depth; the public type must too.
+const TWO_HOP_ORDER_BY_USAGE = `
+import type { TurbineClient } from './index.js';
+
+declare const db: TurbineClient;
+
+export const ordered = db.comments.findMany({ orderBy: { post: { user: { email: 'asc' } } } });
+`;
+
 const SCHEMA: SchemaMetadata = {
   enums: {},
   tables: {
     documents: DOCUMENTS,
     document_versions: DOCUMENT_VERSIONS,
-    users: {
-      name: 'users',
-      columns: [
-        {
-          name: 'id',
-          field: 'id',
-          pgType: 'int8',
-          tsType: 'number',
-          nullable: false,
-          hasDefault: true,
-          isArray: false,
-          pgArrayType: 'bigint[]',
-        },
-        {
-          name: 'email',
-          field: 'email',
-          pgType: 'text',
-          tsType: 'string',
-          nullable: false,
-          hasDefault: false,
-          isArray: false,
-          pgArrayType: 'text[]',
-        },
-      ],
-      columnMap: { id: 'id', email: 'email' },
-      reverseColumnMap: { id: 'id', email: 'email' },
-      dateColumns: new Set<string>(),
-      pgTypes: { id: 'int8', email: 'text' },
-      allColumns: ['id', 'email'],
-      primaryKey: ['id'],
-      uniqueColumns: [],
-      indexes: [],
-      isView: false,
-      relations: {},
-    },
+    users: USERS,
+    tags: TAGS,
+    posts: POSTS,
+    comments: COMMENTS,
   },
 };
 
+/**
+ * Write a freshly generated client plus the given consumer files into a temp
+ * project and run `tsc --noEmit` over it against the CURRENT source types.
+ * Returns the tsc output so a failing assertion quotes the real diagnostics.
+ */
+function typecheckGenerated(consumers: Record<string, string>): { status: number | null; output: string } {
+  const dir = mkdtempSync(join(tmpdir(), 'turbine-gen-typecheck-'));
+  try {
+    writeFileSync(join(dir, 'types.ts'), generateTypes(SCHEMA), 'utf-8');
+    writeFileSync(join(dir, 'metadata.ts'), generateMetadata(SCHEMA), 'utf-8');
+    writeFileSync(join(dir, 'index.ts'), generateIndex(SCHEMA), 'utf-8');
+    for (const [name, source] of Object.entries(consumers)) writeFileSync(join(dir, name), source, 'utf-8');
+    const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
+    writeFileSync(
+      join(dir, 'tsconfig.json'),
+      JSON.stringify({
+        compilerOptions: {
+          strict: true,
+          noEmit: true,
+          skipLibCheck: true,
+          target: 'ES2022',
+          module: 'NodeNext',
+          moduleResolution: 'NodeNext',
+          // Compile the generated output against the CURRENT source types -
+          // this is exactly what drifts when the client class changes shape.
+          paths: { 'turbine-orm': [join(repoRoot, 'src', 'index.ts')] },
+        },
+        // The repo's ambient shims (pg/lib/*) must ride along, same as the
+        // main tsconfig's include of types/**/*.d.ts.
+        include: ['*.ts', join(repoRoot, 'types', '**', '*.d.ts')],
+      }),
+      'utf-8',
+    );
+    const tsc = join(repoRoot, 'node_modules', '.bin', 'tsc');
+    const result = spawnSync(tsc, ['--noEmit', '-p', dir], {
+      cwd: repoRoot,
+      encoding: 'utf-8',
+      timeout: 120_000,
+    });
+    return { status: result.status, output: `${result.stdout}\n${result.stderr}` };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 describe('generated client typechecks against the shipped client types', () => {
-  it('tsc --noEmit passes on generate output (pins $transaction overload parity)', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'turbine-gen-typecheck-'));
-    try {
-      writeFileSync(join(dir, 'types.ts'), generateTypes(SCHEMA), 'utf-8');
-      writeFileSync(join(dir, 'metadata.ts'), generateMetadata(SCHEMA), 'utf-8');
-      writeFileSync(join(dir, 'index.ts'), generateIndex(SCHEMA), 'utf-8');
-      // T-4 gate: same-target FK columns must yield strict-clean, targetable types.
-      writeFileSync(join(dir, 'usage.ts'), T4_USAGE, 'utf-8');
-      const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
-      writeFileSync(
-        join(dir, 'tsconfig.json'),
-        JSON.stringify({
-          compilerOptions: {
-            strict: true,
-            noEmit: true,
-            skipLibCheck: true,
-            target: 'ES2022',
-            module: 'NodeNext',
-            moduleResolution: 'NodeNext',
-            // Compile the generated output against the CURRENT source types -
-            // this is exactly what drifts when the client class changes shape.
-            paths: { 'turbine-orm': [join(repoRoot, 'src', 'index.ts')] },
-          },
-          // The repo's ambient shims (pg/lib/*) must ride along, same as the
-          // main tsconfig's include of types/**/*.d.ts.
-          include: ['*.ts', join(repoRoot, 'types', '**', '*.d.ts')],
-        }),
-        'utf-8',
-      );
-      const tsc = join(repoRoot, 'node_modules', '.bin', 'tsc');
-      const result = spawnSync(tsc, ['--noEmit', '-p', dir], {
-        cwd: repoRoot,
-        encoding: 'utf-8',
-        timeout: 120_000,
-      });
-      assert.equal(result.status, 0, `generated client failed to typecheck:\n${result.stdout}\n${result.stderr}`);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
+  it('tsc --noEmit passes on generate output plus the documented call forms', () => {
+    // T-4 gate: same-target FK columns must yield strict-clean, targetable
+    // types. Call-forms gate: $primary(), $withSession, both constructor
+    // arities and a required natural-key PK, all as the docs write them.
+    const result = typecheckGenerated({ 'usage.ts': T4_USAGE, 'call-forms.ts': CALL_FORMS_USAGE });
+    assert.equal(result.status, 0, `generated client failed to typecheck:\n${result.output}`);
+  });
+
+  it('a two-hop to-one relation orderBy typechecks on the generated client', () => {
+    const result = typecheckGenerated({ 'two-hop.ts': TWO_HOP_ORDER_BY_USAGE });
+    assert.equal(result.status, 0, `two-hop relation orderBy failed to typecheck:\n${result.output}`);
   });
 });
