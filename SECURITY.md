@@ -59,4 +59,8 @@ With `--write`:
 
 ### Error messages
 
-Error messages are PII-safe by default: where-clause values are rendered as key names only, and wrapped driver errors have the value-carrying `detail` field stripped before they are attached as `.cause`. The verbose mode is an explicit opt-in (`errorMessages: 'verbose'`).
+Error messages are PII-safe by default: where-clause values are rendered as key names only, and wrapped driver errors have the value-carrying `detail` field stripped before they are attached as `.cause`. The verbose mode is an explicit opt-in (`errorMessages: 'verbose'`). `errorMessages: 'safe'` covers every error Turbine raises or wraps, including PostgreSQL server errors it does not classify: those keep their SQLSTATE on `.code` and come back with a value-free `Database error <SQLSTATE>` message, with the driver text available only under `errorMessages: 'verbose'`.
+
+### Trust boundary
+
+The CLI executes `turbine.config.ts`, the schema file and the seed file from the current directory as code, so treat them as you treat `package.json` scripts: running `npx turbine` inside a checkout you do not trust runs that checkout's TypeScript.

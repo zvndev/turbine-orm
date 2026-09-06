@@ -66,8 +66,40 @@ function formatErrorMessage(code: TurbineErrorCode, message: string): string {
   return `${body}${link}`;
 }
 
+/**
+ * The cross-copy identity brand every Turbine error carries as an own,
+ * non-enumerable symbol property.
+ *
+ * The package ships an ESM build and a CJS build, and one process can hold
+ * both: a generated client compiled as CommonJS `require`s `dist/cjs` while an
+ * `.mts` entry file `import`s `dist`. The error is then constructed by one
+ * copy's class and tested against the other copy's, and prototype-chain
+ * `instanceof` says false, so every documented
+ * `if (err instanceof UniqueConstraintError)` branch is skipped and the error
+ * propagates as unhandled, with nothing logged. `Symbol.for` gives both copies
+ * the same key, so {@link TurbineError[Symbol.hasInstance]} can recognise the
+ * other copy's instances by brand plus code instead of by class identity. Same
+ * pattern as {@link VALUE_BEARING_MESSAGE} below.
+ */
+const TURBINE_ERROR_BRAND = Symbol.for('turbine-orm.error');
+
 /** Base error class for all Turbine errors */
 export class TurbineError extends Error {
+  /**
+   * The code every instance of this class passes to `super()`, declared once
+   * per subclass on the line above the constructor that names it, so the two
+   * are read together. It exists for {@link TurbineError[Symbol.hasInstance]}:
+   * a subclass recognises a branded error from another copy of this module
+   * when the codes agree. `undefined` here on the base class, which therefore
+   * recognises any branded error.
+   *
+   * A static per class rather than a class-to-code map because the code is
+   * already written once per class; this puts the second mention next to the
+   * first instead of in a table at the bottom of the file, and a unit test
+   * asserts the two agree for every exported class.
+   */
+  static readonly CODE: TurbineErrorCode | undefined = undefined;
+
   readonly code: TurbineErrorCode;
   /** Docs page for this code, e.g. `https://turbineorm.dev/errors#e003`. */
   readonly docsUrl: string;
@@ -83,6 +115,42 @@ export class TurbineError extends Error {
     this.name = 'TurbineError';
     this.code = code;
     this.docsUrl = docsUrlForCode(code);
+    // Non-enumerable, like the message flag, so the brand never appears in a
+    // serialized error; non-writable so nothing downstream can unbrand it.
+    Object.defineProperty(this, TURBINE_ERROR_BRAND, {
+      value: true,
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
+  }
+
+  /**
+   * `instanceof` that survives two copies of this module in one process.
+   *
+   * The ordinary prototype-chain answer is taken first, so a single-copy
+   * process behaves exactly as before, user subclasses included. Only when that
+   * says no is the brand consulted: a branded object is an instance of the base
+   * class outright, and of a coded subclass when its `code` equals that class's
+   * {@link CODE}. The `hasOwn` guard restricts the code match to classes that
+   * declare their own CODE, i.e. the ones in this module: a user subclass such
+   * as `class MyError extends ValidationError {}` inherits E003 without
+   * declaring it, and every ValidationError must not become an instance of the
+   * user's narrower class.
+   */
+  static [Symbol.hasInstance](value: unknown): boolean {
+    // `this` is the class `instanceof` was invoked on, which for an inherited
+    // static is the SUBCLASS (NotFoundError, not TurbineError); naming the base
+    // class here, as the lint rule wants, would make every subclass answer for
+    // the base. Named once so the reason is stated once.
+    // biome-ignore lint/complexity/noThisInStatic: the receiver is the subclass being tested against, see above
+    // biome-ignore lint/complexity/noUselessThisAlias: one alias carries one suppression instead of three
+    const cls: { CODE?: TurbineErrorCode } & (new (...args: never[]) => unknown) = this;
+    if (Function.prototype[Symbol.hasInstance].call(cls, value)) return true;
+    if (value === null || typeof value !== 'object') return false;
+    if ((value as Record<PropertyKey, unknown>)[TURBINE_ERROR_BRAND] !== true) return false;
+    if (!Object.hasOwn(cls, 'CODE')) return false;
+    return cls.CODE === undefined || (value as { code?: unknown }).code === cls.CODE;
   }
 }
 
@@ -185,17 +253,18 @@ export function runWithErrorMessageMode<R>(mode: ErrorMessageMode, fn: () => R):
  *     clause (e.g. `where: {"id":1,"email":"alice@x.com"}`).
  *
  * SCOPE, stated precisely because the useful version of this contract is the
- * one that is true. 'safe' mode redacts row values from the surfaces Turbine
- * OWNS: its own error messages, and the `detail` field of a driver error it
- * wraps and attaches as `.cause` (see redactCauseForMode).
- *
- * It is NOT a blanket guarantee that no row value can be reached from a thrown
- * error. A driver error whose SQLSTATE {@link wrapPgError} does not classify is
- * returned UNCHANGED, and some of those carry a value in the `message` field
- * itself, where nothing can be removed without destroying the diagnosis:
- * `22P02 invalid input syntax for type integer: "alice@example.com"` is the
- * common one. Treat 'safe' mode as removing Turbine's own contribution to the
- * leak, not as a log-scrubbing boundary.
+ * one that is true. 'safe' mode redacts row and parameter values from every
+ * error Turbine raises or wraps: its own messages; the `detail` field of a
+ * driver error it attaches as `.cause` (see redactCauseForMode); the driver
+ * MESSAGE where that is what carries the value, so `22P02 invalid input syntax
+ * for type integer: "alice@example.com"` becomes a ValidationError whose
+ * safe-mode text names the column and the SQLSTATE and nothing else (see
+ * {@link wrapPgError}); and the message of a PostgreSQL server error whose
+ * SQLSTATE wrapPgError has no class for, which is scrubbed to
+ * `Database error <SQLSTATE>` with the driver text held back on a redacted
+ * `.cause`. It is not a log-scrubbing boundary for errors that never pass
+ * through Turbine, and an unclassified NATIVE error code from one of the
+ * non-Postgres engines is left to that engine's own classifier.
  */
 export function setErrorMessageMode(mode: ErrorMessageMode): void {
   errorMessageMode = mode;
@@ -235,11 +304,14 @@ export const REDACTED_DETAIL = '[redacted by turbine errorMessages:"safe"]';
  * every log line, Sentry event and uncaught-rejection dump that renders the
  * cause chain, in the mode whose entire job is to prevent exactly that.
  *
- * A flag rather than a code list, and set by the ENGINE that knows its own
- * message grammar, for two reasons. It keeps Postgres byte-identical (pg never
- * sets it, so its cause is returned exactly as before), and it puts "this
- * engine's message embeds values" next to the code that reads that engine's
- * messages instead of in a table here that would silently rot.
+ * A flag rather than a code list, and set by the code that knows the message
+ * grammar in question, for two reasons. It keeps every constraint-class
+ * Postgres cause byte-identical (nothing sets it for those, so they are
+ * returned exactly as before; `wrapPgError` sets it only for the class-22 and
+ * `to_tsquery` shapes whose value sits in `message`, and for a server error it
+ * cannot classify at all), and it puts "this engine's message embeds values"
+ * next to the code that reads that engine's messages instead of in a table
+ * here that would silently rot.
  *
  * `Symbol.for` so the ESM and CJS copies of this module agree on the key: a
  * dual-package consumer can hand an error marked by one build to the other.
@@ -281,7 +353,7 @@ export function markValueBearingMessage<T>(err: T): T {
  */
 function redactedDriverMessage(code: unknown): string {
   const codePart = typeof code === 'string' && code.length > 0 ? ` (driver code ${code})` : '';
-  return `${REDACTED_DETAIL}${codePart}: this engine reports the conflicting row values in the message text, so errorMessages:"safe" withholds it. Use errorMessages:"verbose" to see it.`;
+  return `${REDACTED_DETAIL}${codePart}: the driver puts a row or parameter value in this message text, so errorMessages:"safe" withholds it. Use errorMessages:"verbose" to see it.`;
 }
 
 /**
@@ -305,18 +377,9 @@ function redactedDriverMessage(code: unknown): string {
  * driver's own object untouched (a caller holding it from their own catch sees
  * what the driver produced).
  *
- * The clone must remain a REAL error, which is the part that is easy to get
- * wrong. `Object.create(proto, descriptors)` looks equivalent and is not: V8
- * installs `stack` as an own ACCESSOR whose backing store is the internal
- * [[ErrorData]] slot, and that slot is not a property, so it is not copied. The
- * result reads `cause.stack === undefined`, `util.types.isNativeError(cause) ===
- * false` and `Object.prototype.toString.call(cause) === '[object Object]'`, i.e.
- * every log serializer that does `err.cause.stack.split('\n')` throws a
- * TypeError and Sentry/pino drop the cause's frames. So the clone starts life
- * as `new Error()` (which HAS the slot), is re-prototyped to the driver error's
- * own prototype, and takes the original's stack as a plain string. That keeps
- * `cause instanceof pg.DatabaseError`, `cause.code === '23505'`, the native
- * brand, and the frames.
+ * The clone must remain a REAL error (string stack, native brand,
+ * `instanceof pg.DatabaseError`); see {@link cloneErrorWithOverrides} for why
+ * `Object.create` is not enough.
  *
  * In 'verbose' mode the cause passes through untouched: that mode's documented
  * job is full-fidelity debugging.
@@ -342,21 +405,20 @@ function redactCauseForMode(cause: unknown): unknown {
   // keeps object identity with what the driver threw.
   if (!hasDetail && !valueBearingMessage) return cause;
   try {
-    const descriptors = Object.getOwnPropertyDescriptors(cause);
+    const overrides: PropertyDescriptorMap = {};
     // Replace the descriptor rather than assigning after the clone exists: a
     // non-writable `detail` would make the assignment throw in strict mode
     // (every module here is ESM, so it always would), and losing the cause is
     // worse than paying for one descriptor literal.
     if (hasDetail) {
-      descriptors.detail = {
+      overrides.detail = {
         value: REDACTED_DETAIL,
         writable: true,
-        enumerable: descriptors.detail?.enumerable ?? true,
+        enumerable: Object.getOwnPropertyDescriptor(cause, 'detail')?.enumerable ?? true,
         configurable: true,
       };
     }
-    // The exact message strings to scrub out of the rendered stack, collected
-    // BEFORE the descriptors are overwritten.
+    // The exact message strings to scrub out of the rendered stack.
     const withheldTexts: string[] = [];
     if (valueBearingMessage) {
       const code = (cause as { code?: unknown }).code;
@@ -365,48 +427,18 @@ function redactCauseForMode(cause: unknown): unknown {
         const current = (cause as Record<string, unknown>)[key];
         if (typeof current !== 'string' || current.length === 0) continue;
         withheldTexts.push(current);
-        descriptors[key] = {
+        overrides[key] = {
           value: replacement,
           writable: true,
           // `message` is non-enumerable on a native Error and mysql2's
           // `sqlMessage` is enumerable; keep whichever the driver chose so the
           // clone serializes with the same key set as the original.
-          enumerable: descriptors[key]?.enumerable ?? false,
+          enumerable: Object.getOwnPropertyDescriptor(cause, key)?.enumerable ?? false,
           configurable: true,
         };
       }
     }
-    // Brand check rather than `instanceof Error`, so a driver error thrown from
-    // another realm (a worker, a bundled duplicate of pg) is still recognized.
-    const isError = Object.prototype.toString.call(cause) === '[object Error]';
-    if (!isError) return Object.create(Object.getPrototypeOf(cause), descriptors);
-
-    // `new Error()` is the only way to obtain the [[ErrorData]] slot; the
-    // prototype is then pointed at the driver error's, so `instanceof` and
-    // `.name` behave exactly as before.
-    const clone = new Error();
-    Object.setPrototypeOf(clone, Object.getPrototypeOf(cause));
-    // The clone's own fresh `stack` accessor would otherwise describe THIS
-    // function's frames, and the original's accessor cannot be transplanted
-    // (it reads the receiver's slot). Copy the rendered string instead, and
-    // only when it is one: a driver that stashed a non-string there keeps its
-    // own descriptor rather than having a lie written over it.
-    const originalStack = (cause as { stack?: unknown }).stack;
-    if (typeof originalStack === 'string') {
-      // V8 renders the stack as `<name>: <message>\n    at …`, so a withheld
-      // message is still sitting in it. Substitute the exact strings that were
-      // withheld (split/join, so a message repeated in a nested frame goes
-      // too); everything else, the frames included, is untouched.
-      let stackText = originalStack;
-      for (const text of withheldTexts) stackText = stackText.split(text).join(REDACTED_DETAIL);
-      descriptors.stack = { value: stackText, writable: true, enumerable: false, configurable: true };
-    } else if (descriptors.stack && typeof descriptors.stack.get === 'function') {
-      // An own accessor bound to the ORIGINAL receiver would return undefined
-      // here; drop it and let the clone keep its own working one.
-      delete descriptors.stack;
-    }
-    Object.defineProperties(clone, descriptors);
-    return clone;
+    return cloneErrorWithOverrides(cause, overrides, withheldTexts);
   } catch {
     // A cause whose descriptors cannot be replayed (an exotic proxy, a frozen
     // prototype chain) must not turn a database error into a TypeError thrown
@@ -414,6 +446,64 @@ function redactCauseForMode(cause: unknown): unknown {
     // direction here: 'safe' mode's contract is that no row value escapes.
     return undefined;
   }
+}
+
+/**
+ * A copy of `original` with some own properties replaced, that is still a REAL
+ * error. Shared by {@link redactCauseForMode} and the unclassified-SQLSTATE
+ * scrub in {@link wrapPgError}, so the two cannot drift in how they clone.
+ *
+ * This is the part that is easy to get wrong. `Object.create(proto,
+ * descriptors)` looks equivalent and is not: V8 installs `stack` as an own
+ * ACCESSOR whose backing store is the internal [[ErrorData]] slot, and that
+ * slot is not a property, so it is not copied. The result reads `stack ===
+ * undefined`, `util.types.isNativeError() === false` and
+ * `Object.prototype.toString.call() === '[object Object]'`, i.e. every log
+ * serializer that does `err.stack.split('\n')` throws a TypeError and
+ * Sentry/pino drop the frames. So the clone starts life as `new Error()`
+ * (which HAS the slot), is re-prototyped to the original's own prototype, and
+ * takes the original's stack as a plain string. That keeps `instanceof
+ * pg.DatabaseError`, `.code`, the native brand, and the frames.
+ *
+ * `withheldTexts` are the exact message strings that were replaced: V8 renders
+ * the stack as `<name>: <message>\n    at …`, so a withheld message is still
+ * sitting in it and is substituted out (split/join, so a message repeated in a
+ * nested frame goes too). Everything else, the frames included, is untouched.
+ * `omit` names own keys the copy must NOT carry over.
+ */
+function cloneErrorWithOverrides(
+  original: object,
+  overrides: PropertyDescriptorMap,
+  withheldTexts: readonly string[],
+  omit: readonly symbol[] = [],
+): unknown {
+  const descriptors: PropertyDescriptorMap = Object.getOwnPropertyDescriptors(original);
+  for (const key of omit) delete descriptors[key];
+  Object.assign(descriptors, overrides);
+  // Brand check rather than `instanceof Error`, so a driver error thrown from
+  // another realm (a worker, a bundled duplicate of pg) is still recognized.
+  const isError = Object.prototype.toString.call(original) === '[object Error]';
+  if (!isError) return Object.create(Object.getPrototypeOf(original), descriptors);
+
+  const clone = new Error();
+  Object.setPrototypeOf(clone, Object.getPrototypeOf(original));
+  // The clone's own fresh `stack` accessor would otherwise describe THIS
+  // function's frames, and the original's accessor cannot be transplanted (it
+  // reads the receiver's slot). Copy the rendered string instead, and only when
+  // it is one: a driver that stashed a non-string there keeps its own
+  // descriptor rather than having a lie written over it.
+  const originalStack = (original as { stack?: unknown }).stack;
+  if (typeof originalStack === 'string') {
+    let stackText = originalStack;
+    for (const text of withheldTexts) stackText = stackText.split(text).join(REDACTED_DETAIL);
+    descriptors.stack = { value: stackText, writable: true, enumerable: false, configurable: true };
+  } else if (descriptors.stack && typeof descriptors.stack.get === 'function') {
+    // An own accessor bound to the ORIGINAL receiver would return undefined
+    // here; drop it and let the clone keep its own working one.
+    delete descriptors.stack;
+  }
+  Object.defineProperties(clone, descriptors);
+  return clone;
 }
 
 /**
@@ -484,6 +574,7 @@ function renderWhereForMessage(where: unknown, mode: ErrorMessageMode): string {
  * structured properties on the error instance regardless of mode.
  */
 export class NotFoundError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.NOT_FOUND;
   readonly table?: string;
   readonly where?: unknown;
   readonly operation?: string;
@@ -531,6 +622,7 @@ export class NotFoundError extends TurbineError {
 
 /** Thrown when a query or transaction exceeds the configured timeout */
 export class TimeoutError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.TIMEOUT;
   readonly timeoutMs: number;
 
   /**
@@ -550,6 +642,25 @@ export class TimeoutError extends TurbineError {
 
 /** Thrown when query arguments fail validation (unknown column, invalid operator, etc.) */
 export class ValidationError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.VALIDATION;
+
+  /**
+   * For an E003 that wraps a PostgreSQL data exception (SQLSTATE class 22) or a
+   * `search` operand `to_tsquery` rejected (42601): the column the server named,
+   * when it named one, and the SQLSTATE that classified the error. Undefined
+   * for validation Turbine performed itself, which never reaches the server.
+   */
+  readonly column?: string;
+  readonly sqlstate?: string;
+  /**
+   * The driver's own text for a wrapped data exception. PostgreSQL puts the
+   * offending VALUE in that text (`invalid input syntax for type integer:
+   * "alice@example.com"`), so under `errorMessages: 'safe'` this is
+   * {@link REDACTED_DETAIL} and under `'verbose'` the driver text in full, the
+   * same split the constraint classes apply to `.cause.detail`.
+   */
+  readonly detail?: string;
+
   /**
    * `options.cause` is for the engines, not for the query builder. Turbine's own
    * E003s are raised from validation it performed itself, so there is nothing
@@ -559,14 +670,18 @@ export class ValidationError extends TurbineError {
    * else. The base class already redacts a cause under `errorMessages: 'safe'`,
    * so forwarding it here does not widen what a safe-mode error discloses.
    */
-  constructor(message: string, options?: { cause?: unknown }) {
+  constructor(message: string, options?: { cause?: unknown; column?: string; sqlstate?: string; detail?: string }) {
     super(TurbineErrorCode.VALIDATION, message, options);
     this.name = 'ValidationError';
+    this.column = options?.column;
+    this.sqlstate = options?.sqlstate;
+    this.detail = options?.detail;
   }
 }
 
 /** Thrown when a database connection fails */
 export class ConnectionError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.CONNECTION;
   /**
    * The driver code that produced this error: a Postgres SQLSTATE (`28P01`
    * wrong password, `3D000` no such database, `08006` connection failure, ...)
@@ -625,6 +740,7 @@ export function malformedConnectionStringMessage(engine: string, example: string
 
 /** Thrown when a relation reference is invalid */
 export class RelationError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.RELATION;
   constructor(message: string) {
     super(TurbineErrorCode.RELATION, message);
     this.name = 'RelationError';
@@ -633,6 +749,7 @@ export class RelationError extends TurbineError {
 
 /** Thrown when a migration operation fails */
 export class MigrationError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.MIGRATION;
   constructor(message: string) {
     super(TurbineErrorCode.MIGRATION, message);
     this.name = 'MigrationError';
@@ -641,6 +758,7 @@ export class MigrationError extends TurbineError {
 
 /** Thrown when circular relation nesting is detected */
 export class CircularRelationError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.CIRCULAR_RELATION;
   readonly path: string[];
 
   constructor(path: string[]) {
@@ -669,6 +787,7 @@ function detailFromCause(cause: unknown): string | undefined {
 
 /** Thrown when a UNIQUE constraint is violated (pg code 23505) */
 export class UniqueConstraintError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.UNIQUE_VIOLATION;
   readonly constraint?: string;
   readonly columns?: string[];
   readonly table?: string;
@@ -710,6 +829,7 @@ export class UniqueConstraintError extends TurbineError {
 
 /** Thrown when a FOREIGN KEY constraint is violated (pg code 23503) */
 export class ForeignKeyError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.FOREIGN_KEY_VIOLATION;
   readonly constraint?: string;
   readonly table?: string;
 
@@ -747,6 +867,7 @@ export class ForeignKeyError extends TurbineError {
 
 /** Thrown when a NOT NULL constraint is violated (pg code 23502) */
 export class NotNullViolationError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.NOT_NULL_VIOLATION;
   readonly column?: string;
   readonly table?: string;
 
@@ -799,6 +920,7 @@ export class NotNullViolationError extends TurbineError {
  * ```
  */
 export class DeadlockError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.DEADLOCK_DETECTED;
   /** Marks this error as safe to retry */
   readonly isRetryable = true as const;
   readonly constraint?: string;
@@ -840,6 +962,7 @@ export class DeadlockError extends TurbineError {
  * ```
  */
 export class SerializationFailureError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.SERIALIZATION_FAILURE;
   /** Marks this error as safe to retry */
   readonly isRetryable = true as const;
 
@@ -862,6 +985,7 @@ export class SerializationFailureError extends TurbineError {
 
 /** Thrown when a CHECK constraint is violated (pg code 23514) */
 export class CheckConstraintError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.CHECK_VIOLATION;
   readonly constraint?: string;
   readonly table?: string;
 
@@ -898,6 +1022,7 @@ export class CheckConstraintError extends TurbineError {
 }
 
 export class ExclusionConstraintError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.EXCLUSION_VIOLATION;
   readonly constraint?: string;
   readonly table?: string;
 
@@ -961,6 +1086,7 @@ export type PipelineResultSlot = { status: 'ok'; value: unknown } | { status: 'e
  * ```
  */
 export class PipelineError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.PIPELINE;
   /** Per-query results: each slot is either `{status:'ok', value}` or `{status:'error', error}` */
   readonly results: PipelineResultSlot[];
 
@@ -992,20 +1118,32 @@ export class PipelineError extends TurbineError {
 }
 
 export class OptimisticLockError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.OPTIMISTIC_LOCK;
   readonly table: string;
   readonly versionField: string;
   readonly expectedVersion: unknown;
+  /**
+   * The comparison that failed, value included: `expected version = 3`.
+   * Populated in both modes, like `expectedVersion` itself; only the MESSAGE
+   * withholds the value under `errorMessages: 'safe'`. `optimisticLock` accepts
+   * any column as the version field (an `updated_at` timestamp, an etag
+   * string), so the value is a stored cell like any other, and the message
+   * treats it the way the constraint classes treat `detail`.
+   */
+  readonly detail: string;
 
   constructor(opts: { table: string; versionField: string; expectedVersion: unknown }) {
-    super(
-      TurbineErrorCode.OPTIMISTIC_LOCK,
-      `Optimistic lock failed on "${opts.table}", ` +
-        `expected ${opts.versionField} = ${opts.expectedVersion} but row was modified by another transaction`,
-    );
+    const detail = `expected ${opts.versionField} = ${String(opts.expectedVersion)}`;
+    const account =
+      currentErrorMessageMode() === 'verbose'
+        ? `${detail} but row was modified by another transaction`
+        : `the ${opts.versionField} value did not match, the row was modified by another transaction`;
+    super(TurbineErrorCode.OPTIMISTIC_LOCK, `Optimistic lock failed on "${opts.table}", ${account}`);
     this.name = 'OptimisticLockError';
     this.table = opts.table;
     this.versionField = opts.versionField;
     this.expectedVersion = opts.expectedVersion;
+    this.detail = detail;
   }
 }
 
@@ -1016,6 +1154,7 @@ export class OptimisticLockError extends TurbineError {
  * clear `unsupported on <engine>` message instead of generating broken SQL.
  */
 export class UnsupportedFeatureError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.UNSUPPORTED_FEATURE;
   readonly feature: string;
   readonly dialect: string;
 
@@ -1042,6 +1181,7 @@ export class UnsupportedFeatureError extends TurbineError {
  * identically; route it to a writable primary instead.
  */
 export class ReadOnlyError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.READ_ONLY;
   /**
    * Why the write was refused. `'snapshot'`: the database itself is read-only
    * (snapshot serving, an embedded `readonly: true` open, or the client-level
@@ -1170,9 +1310,135 @@ const CONNECTION_ERROR_HINTS: Readonly<Record<string, string>> = {
     "The server's TLS certificate does not cover the host you connected to. Check the host name in the connection string.",
 };
 
+/** The fields node-postgres copies off an ErrorResponse that this module reads. */
+type PgErrorFields = {
+  code?: string;
+  constraint?: string;
+  column?: string;
+  table?: string;
+  detail?: string;
+  message?: string;
+  severity?: unknown;
+};
+
+/** The SQLSTATE shape: five characters from [0-9A-Z]. */
+const SQLSTATE_RE = /^[0-9A-Z]{5}$/;
+
+/**
+ * Whether `e` is a PostgreSQL SERVER error, as opposed to anything else that
+ * reaches {@link wrapPgError} carrying a `.code`. The distinction matters for
+ * the safe-mode scrub of an unclassified code, which rewrites the MESSAGE: a
+ * user's own `fs` error thrown inside a `$transaction` callback travels the
+ * same path with `code: 'EPERM'`, five uppercase characters like a SQLSTATE,
+ * and rewriting that would turn "permission denied, open /etc/x" into
+ * "Database error EPERM". node-postgres stamps `severity` (`ERROR`, `FATAL`,
+ * `PANIC`) on every ErrorResponse it parses and on nothing else, so its
+ * presence is the positive signal. The engines that reuse this function
+ * (SQLite, MySQL, SQL Server) rewrite `.code` to a mapped SQLSTATE for the
+ * shapes they classify and leave their native codes on the rest, so their
+ * unclassified errors pass through exactly as before.
+ */
+function isPgServerError(e: PgErrorFields): boolean {
+  return typeof e.code === 'string' && SQLSTATE_RE.test(e.code) && typeof e.severity === 'string';
+}
+
+/**
+ * Value-free accounts of the common data exceptions, so the safe-mode message
+ * still says WHAT kind of bad input it was. PostgreSQL's own text is
+ * `<fixed phrase>: "<the value>"`; the fixed half is what these paraphrase.
+ * Anything else in class 22 gets the class-wide fallback. Never derived from
+ * the driver text.
+ */
+const DATA_EXCEPTION_PHRASES: Readonly<Record<string, string>> = {
+  '22P02': 'the value could not be parsed as the column type',
+  '22003': 'the number is out of range for the column type',
+  '22001': 'the string is too long for the column type',
+  '22007': 'the value is not a valid date or time',
+  '22008': 'a date or time field is out of range',
+  '22012': 'division by zero',
+};
+const DATA_EXCEPTION_FALLBACK = "invalid input for the column's type";
+
+/**
+ * Wrap a driver error whose MESSAGE embeds the offending value into a
+ * ValidationError (E003): SQLSTATE class 22 (data exception) and the
+ * `to_tsquery` parse failure. `describe` is the value-free account of what went
+ * wrong; in 'verbose' mode the driver text replaces it, because that text IS
+ * the precise account and 'verbose' exists to show it.
+ *
+ * The driver text also goes on `.detail` (redacted in 'safe' mode, full in
+ * 'verbose'), and the driver error is marked value-bearing before it becomes
+ * `.cause`, so the base constructor's cause redaction withholds its message in
+ * 'safe' mode exactly as it does for the MySQL and SQL Server augmenters'
+ * errors. There is no `detail` field to redact for these codes: the value sits
+ * in `message`, which is why the constraint-class treatment (redact `detail`,
+ * keep `message`) was not enough.
+ */
+function wrapValueBearingPgError(
+  err: object,
+  e: PgErrorFields,
+  subject: string,
+  describe: string,
+  hint = '',
+): ValidationError {
+  const driverText = typeof e.message === 'string' && e.message.length > 0 ? e.message : undefined;
+  const verbose = currentErrorMessageMode() === 'verbose';
+  const account = verbose && driverText ? driverText : describe;
+  markValueBearingMessage(err);
+  return new ValidationError(`${subject}: ${account} (SQLSTATE ${e.code}).${hint}`, {
+    cause: err,
+    column: e.column,
+    sqlstate: e.code,
+    detail: verbose ? driverText : REDACTED_DETAIL,
+  });
+}
+
+/**
+ * The 'safe'-mode treatment of a PostgreSQL server error {@link wrapPgError}
+ * has no class for. The code set is frozen (STABILITY.md), so this mints no
+ * TURBINE_E0NN and stays outside the TurbineError hierarchy: what comes back is
+ * a clone of the driver error, same prototype, same `.code` (the SQLSTATE) and
+ * same fields, with the MESSAGE replaced by `Database error <SQLSTATE>`, the
+ * `detail` redacted, the rendered stack scrubbed of the original text, and the
+ * driver error on `.cause` with the same redaction every mapped class's cause
+ * gets. An unclassified code's message grammar is by definition unknown here,
+ * so it may embed a value, and withholding it is the only rule that stays
+ * true. 'verbose' mode never reaches this function: the raw error passes
+ * through, as it always did.
+ */
+function scrubUnclassifiedServerError(err: object, code: string): unknown {
+  const message = `Database error ${code}`;
+  try {
+    const original = err as { message?: unknown; detail?: unknown };
+    // The cause: the ordinary mapped-class treatment, with the message withheld
+    // because its grammar is unknown (the flag is what asks for that).
+    const cause = redactCauseForMode(markValueBearingMessage(err));
+    const overrides: PropertyDescriptorMap = {
+      message: { value: message, writable: true, enumerable: false, configurable: true },
+      cause: { value: cause, writable: true, enumerable: false, configurable: true },
+    };
+    if (typeof original.detail === 'string' && original.detail.length > 0) {
+      overrides.detail = {
+        value: REDACTED_DETAIL,
+        writable: true,
+        enumerable: Object.getOwnPropertyDescriptor(err, 'detail')?.enumerable ?? true,
+        configurable: true,
+      };
+    }
+    const withheld = typeof original.message === 'string' && original.message.length > 0 ? [original.message] : [];
+    // The wrapper's own message is value-free, so it must not carry the flag
+    // that the cause needed.
+    return cloneErrorWithOverrides(err, overrides, withheld, [VALUE_BEARING_MESSAGE]);
+  } catch {
+    // Same posture as redactCauseForMode: a driver error whose descriptors
+    // cannot be replayed must not become a TypeError, and must not leak either,
+    // so the fallback carries the code and the fixed message and nothing else.
+    return Object.assign(new Error(message), { code });
+  }
+}
+
 /**
  * Translate a pg driver error into a typed Turbine error.
- * If the error doesn't match a known constraint code, returns it unchanged.
  *
  * Maps:
  *   23505 (unique_violation)      -> UniqueConstraintError
@@ -1186,19 +1452,22 @@ const CONNECTION_ERROR_HINTS: Readonly<Record<string, string>> = {
  *   28P01 / 28000 (auth refused)  -> ConnectionError, with a remediation hint
  *   3D000 (no such database)      -> ConnectionError, with a remediation hint
  *   connection-class codes        -> ConnectionError (see CONNECTION_ERROR_CODES)
+ *   22xxx (data exception)        -> ValidationError naming the column (when the
+ *                                    server did) and the SQLSTATE; driver text
+ *                                    on `.detail`, redacted in 'safe' mode
+ *   42601 from to_tsquery         -> ValidationError with a `search` hint
+ *   any other server SQLSTATE     -> 'safe' mode: a clone whose message is
+ *                                    `Database error <SQLSTATE>`, original on
+ *                                    `.cause`; 'verbose' mode: returned unchanged
+ *
+ * Anything that is not a PostgreSQL server error (no SQLSTATE-shaped code, or
+ * no `severity`) is returned unchanged whatever the mode: see isPgServerError.
  *
  * The original pg error is preserved as `.cause` on the wrapped error.
  */
 export function wrapPgError(err: unknown): unknown {
   if (!err || typeof err !== 'object') return err;
-  const e = err as {
-    code?: string;
-    constraint?: string;
-    column?: string;
-    table?: string;
-    detail?: string;
-    message?: string;
-  };
+  const e = err as PgErrorFields;
   if (!e.code) return err;
 
   switch (e.code) {
@@ -1262,6 +1531,32 @@ export function wrapPgError(err: unknown): unknown {
         const head = pgMessage ? `Database connection error: ${pgMessage}` : `Database connection error (${e.code})`;
         return new ConnectionError(hint ? `${head} (${e.code}) ${hint}` : head, { cause: err, sqlstate: e.code });
       }
+      // Class 22, data exception: a bound value did not fit the column type
+      // (`where: { id: req.params.id }` with a non-numeric id is the common
+      // one). Specific enough on its own that no severity check is needed:
+      // nothing but a SQL engine produces a `22xxx` code.
+      if (e.code.startsWith('22') && SQLSTATE_RE.test(e.code)) {
+        const subject = e.column ? `Invalid input for column "${e.column}"` : 'Invalid input';
+        // Own-property lookup, same reason as CONNECTION_ERROR_HINTS above.
+        const phrase = Object.hasOwn(DATA_EXCEPTION_PHRASES, e.code)
+          ? DATA_EXCEPTION_PHRASES[e.code]!
+          : DATA_EXCEPTION_FALLBACK;
+        return wrapValueBearingPgError(err, e, subject, phrase);
+      }
+      // 42601 is any syntax error. Only the to_tsquery parse failure is a
+      // caller-input problem Turbine can name (the `search` operator), so the
+      // message text is the discriminator; every other 42601 takes the generic
+      // path below.
+      if (e.code === '42601' && typeof e.message === 'string' && /tsquery/i.test(e.message)) {
+        return wrapValueBearingPgError(
+          err,
+          e,
+          'Invalid full-text search operand',
+          'PostgreSQL could not parse the `search` value as a tsquery',
+          ' `search` compiles to to_tsquery(), so `&`, `|`, `!`, `<->` and parentheses in the value are operators rather than text; quote such terms in single quotes, or strip them before searching.',
+        );
+      }
+      if (currentErrorMessageMode() === 'safe' && isPgServerError(e)) return scrubUnclassifiedServerError(err, e.code);
       return err;
   }
 }
