@@ -20,6 +20,7 @@ import {
   assertUpHasStatements,
   canUpgradeLegacyChecksum,
   createMigration,
+  deriveLockId,
   findTransactionControlStatements,
   formatTimestamp,
   getPendingMigrations,
@@ -1048,6 +1049,37 @@ function fakeClient(failOn: Record<string, string>): MigrationTxClient & { calls
     },
   };
 }
+
+describe('deriveLockId', () => {
+  // The advisory lock ID is derived from the database NAME so two databases in
+  // one cluster do not contend on a single hardcoded number. Two properties are
+  // load-bearing and neither is observable from the migration path that uses
+  // it: the value must be stable across processes, and it must fit in a
+  // POSITIVE int4, which is the range pg_advisory_lock's single-argument form
+  // accepts. A negative or out-of-range id is not a weaker lock, it is an
+  // error from the server in the middle of a migration run.
+  it('is stable for one name and differs across names', () => {
+    assert.equal(deriveLockId('turbine_test'), deriveLockId('turbine_test'));
+    assert.notEqual(deriveLockId('turbine_test'), deriveLockId('turbine_prod'));
+    assert.notEqual(deriveLockId('a'), deriveLockId('b'));
+  });
+
+  it('always lands in the positive int4 range pg_advisory_lock accepts', () => {
+    const names = ['', 'a', 'turbine', 'turbine_test', 'x'.repeat(200), 'DB-with.dots_and-dashes', 'ünïcødé'];
+    for (const name of names) {
+      const id = deriveLockId(name);
+      assert.ok(Number.isSafeInteger(id), `${JSON.stringify(name)} produced ${id}`);
+      assert.ok(id >= 0, `${JSON.stringify(name)} produced a negative id: ${id}`);
+      assert.ok(id <= 0x7fffffff, `${JSON.stringify(name)} produced ${id}, above int4 max`);
+    }
+  });
+
+  it('spreads plausible sibling database names without collision', () => {
+    const names = Array.from({ length: 500 }, (_, i) => `app_tenant_${i}`);
+    const ids = new Set(names.map(deriveLockId));
+    assert.equal(ids.size, names.length, 'FNV-1a collided on sequential database names');
+  });
+});
 
 describe('runMigrationInTransaction', () => {
   const tracking = { sql: 'INSERT INTO _turbine_migrations', params: ['m1', 'hash'] };

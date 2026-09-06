@@ -68,6 +68,35 @@ const it: typeof nodeIt = sqliteSkip
   ? (((name: string) => nodeIt(name, { skip: sqliteSkip }, () => {})) as typeof nodeIt)
   : nodeIt;
 
+/**
+ * Does THIS runtime's `node:sqlite` report a result column's declared type?
+ *
+ * The engine feature-detects `StatementSync.prototype.columns()` and keeps
+ * reading 1/0 when it is absent, on purpose: see `driverReportsDeclaredTypes`
+ * in sqlite.ts. The band where it is absent is real and inside the supported
+ * range, MEASURED here rather than taken from a version number: absent on Node
+ * 22.13.1, present on 24.18.0 and 26.8.1. So the assertions below have to ask
+ * the SAME question the engine asks, or this file is green only on the half of
+ * the band that happens to have the capability, which is the very split the
+ * rule it guards exists to prevent.
+ */
+const driverNamesBooleanColumns = (() => {
+  try {
+    const ns = createRequire(process.cwd())('node:sqlite') as {
+      StatementSync?: { prototype?: { columns?: unknown } };
+    };
+    return typeof ns.StatementSync?.prototype?.columns === 'function';
+  } catch {
+    return false;
+  }
+})();
+/** What a declared-BOOLEAN column reads back as on this runtime. */
+const TRUE_VALUE: unknown = driverNamesBooleanColumns ? true : 1;
+const FALSE_VALUE: unknown = driverNamesBooleanColumns ? false : 0;
+const noCapabilitySkip = driverNamesBooleanColumns
+  ? ''
+  : 'this Node build has no StatementSync.columns(), so removing it would simulate nothing';
+
 const DDL = `
 CREATE TABLE orgs (
   id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,10 +139,13 @@ describe('engine value fidelity: a declared boolean reads back as a boolean on e
     if (!client) await connect();
 
     const top = await client.table('items').findMany({ orderBy: { id: 'asc' } });
-    // Strict, not truthy: `1 === true` is false, which is the whole bug.
-    assert.equal(top[0].ok, true);
-    assert.equal(top[1].ok, false);
-    assert.equal(typeof top[0].ok, 'boolean');
+    // Strict, not truthy: `1 === true` is false, which is the whole bug. The
+    // expected value follows the driver capability, because a runtime that
+    // cannot name a boolean result column is documented to keep 1/0 rather
+    // than guess.
+    assert.equal(top[0].ok, TRUE_VALUE);
+    assert.equal(top[1].ok, FALSE_VALUE);
+    assert.equal(typeof top[0].ok, driverNamesBooleanColumns ? 'boolean' : 'number');
 
     // The relation strategies. `flatten` declines a hasMany and falls back to
     // the correlated subquery, which is fine: the point is that whatever plan
@@ -121,17 +153,17 @@ describe('engine value fidelity: a declared boolean reads back as a boolean on e
     for (const relationLoadStrategy of ['join', 'batched', 'flatten'] as const) {
       const rows = await client.table('orgs').findMany({ with: { items: true }, relationLoadStrategy });
       const items = rows[0].items as { ok: unknown }[];
-      assert.equal(items[0]?.ok, true, `relationLoadStrategy: ${relationLoadStrategy}`);
-      assert.equal(items[1]?.ok, false, `relationLoadStrategy: ${relationLoadStrategy}`);
+      assert.equal(items[0]?.ok, TRUE_VALUE, `relationLoadStrategy: ${relationLoadStrategy}`);
+      assert.equal(items[1]?.ok, FALSE_VALUE, `relationLoadStrategy: ${relationLoadStrategy}`);
     }
   });
 
   it('returns a boolean from a write the ORM itself performed', async () => {
     if (!client) await connect();
     const created = await client.table('items').create({ data: { orgId: 1, ok: true, n: 7 } });
-    assert.equal(created.ok, true);
+    assert.equal(created.ok, TRUE_VALUE);
     const readBack = await client.table('items').findUnique({ where: { id: created.id } });
-    assert.equal(readBack.ok, true);
+    assert.equal(readBack.ok, TRUE_VALUE);
   });
 
   it('leaves a non-boolean value in a declared-boolean column alone, on every path', async () => {
@@ -150,9 +182,10 @@ describe('engine value fidelity: a declared boolean reads back as a boolean on e
 });
 
 describe('engine value fidelity: the SQLite boolean rule is gated on the capability it depends on', () => {
-  // `StatementSync.columns()` landed in Node 22.13 / 23.4 and this engine's
-  // floor is 22.5, so there is a real band where the driver cannot name a
-  // boolean result column. On it, every DIRECT read keeps 1/0; a join that
+  // `StatementSync.columns()` arrived after this engine's 22.5 floor, so there
+  // is a real band where the driver cannot name a boolean result column.
+  // Measured, not read off a release note: absent on 22.13.1, present on
+  // 24.18.0 and 26.8.1. On it, every DIRECT read keeps 1/0; a join that
   // still converted would be the same strategy-dependent flip pointing the
   // other way, and it would only ever show up on that band.
   const withoutColumns = async (fn: () => Promise<void> | void): Promise<void> => {
@@ -170,8 +203,9 @@ describe('engine value fidelity: the SQLite boolean rule is gated on the capabil
     }
   };
 
-  it('declares no BOOL rule when the driver cannot report declared types', async () => {
+  it('declares no BOOL rule when the driver cannot report declared types', async (t) => {
     if (sqliteSkip) return;
+    if (noCapabilitySkip) return t.skip(noCapabilitySkip);
     const { sqliteDialect } = await import('../sqlite.js');
     // Present by default on a supported Node: the rule exists.
     assert.ok(sqliteDialect.jsonWireRule?.('BOOLEAN'), 'the rule must exist when the capability does');
@@ -180,8 +214,9 @@ describe('engine value fidelity: the SQLite boolean rule is gated on the capabil
     });
   });
 
-  it('reads 1/0 on BOTH the top level and the join when the capability is missing', async () => {
+  it('reads 1/0 on BOTH the top level and the join when the capability is missing', async (t) => {
     if (sqliteSkip) return;
+    if (noCapabilitySkip) return t.skip(noCapabilitySkip);
     const { introspectSqliteDatabase, turbineSqlite } = await import('../sqlite.js');
     await withoutColumns(async () => {
       const db = new (DatabaseSync as DatabaseSyncCtor)(':memory:');
