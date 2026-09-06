@@ -40,7 +40,11 @@
  *     yields `primaryKey: []` and a warning; single-row ops on it fail loudly.
  *   - `isGenerated` is always `false`: `describe` does not expose PowDB's `auto`
  *     modifier, so an introspected int PK is treated as client-supplied unless
- *     the caller hand-edits the metadata.
+ *     the caller hand-edits the metadata. Since 0.78.0 that costs more than it
+ *     did: the generated `*Create` type marks a primary key optional only when
+ *     it is server-generated, defaulted or nullable, so codegen driven from
+ *     THIS metadata makes an `auto` id REQUIRED on create. `defineSchema` is
+ *     the path that knows, and remains the recommended one.
  *   - Doc-field expression indexes are INVISIBLE to `describe`, so they never
  *     round-trip; only plain `unique`/`index` columns appear in `indexes`.
  *   - `datetime` / `uuid` / `bytes` columns map to read-oriented TS types

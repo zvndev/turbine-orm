@@ -35,9 +35,11 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { CircularRelationError, ValidationError } from '../errors.js';
 import type { FindManyArgs, QueryInterface, RelationDescriptor, UpsertArgs } from '../query/index.js';
-// `RelationOrderBy` is referenced by name in the public `OrderByObject` /
-// `TypedOrderByObject` types but is not re-exported by the barrel, so the
-// assertions on it read the declaring module directly.
+// Read from the declaring module deliberately, not from the barrel: these
+// assertions are about the TYPE's shape, and importing it here from
+// `../query/index.js` would make them pass or fail on whether the barrel
+// re-exports it, which is a different question that `public-surface` covers.
+// (It does re-export it, as of this release.)
 import type { RelationOrderBy } from '../query/types.js';
 import type { SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
