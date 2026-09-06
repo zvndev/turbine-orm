@@ -299,8 +299,11 @@ describe('mutation guard: OR/AND all-undefined hardening', () => {
   it('OR with at least one defined sub-condition still works (regression guard)', () => {
     // Sanity check, make sure the hardening above didn't over-fire on the
     // legitimate case where one OR branch resolves to a real predicate.
+    // `updateMany`, not `update`: the hardening under test is shared by both,
+    // and a key inside an OR does not identify one row, which `update` (one
+    // returned row) refuses on its own (query/compound-unique.ts).
     const q = makeQuery('users', buildSchema());
-    const deferred = q.buildUpdate({
+    const deferred = q.buildUpdateMany({
       where: { OR: [{ id: 5 }, { name: undefined }] },
       data: { name: 'x' },
     });

@@ -413,6 +413,23 @@ function lookupsFor(ctx: Ctx, mm: PrismaModelMap): ModelLookups {
 }
 
 /** Resolve a turbine relation's target Prisma model map (for nested translation). */
+/**
+ * A `where` fragment no row satisfies, for Prisma's empty `OR`.
+ *
+ * `{ <key>: { in: [] } }`, which core compiles to `= ANY($n)` with an empty
+ * array: false for every row, NULL-valued ones included, and one ordinary bound
+ * param rather than a literal spliced into the SQL. The column is the first
+ * primary-key column, else the table's first column, so it is always a real
+ * column of this table and the predicate stays a plain scalar comparison the
+ * cache fingerprints like any other.
+ */
+function matchNothing(ctx: Ctx, mm: PrismaModelMap): Record<string, unknown> {
+  const meta = ctx.schema.tables[mm.table];
+  const column = meta?.primaryKey?.[0] ?? meta?.allColumns?.[0];
+  if (!meta || !column) return {};
+  return { [meta.reverseColumnMap?.[column] ?? column]: { in: [] } };
+}
+
 function relTargetModel(ctx: Ctx, mm: PrismaModelMap, turbineRel: string): PrismaModelMap | undefined {
   const rd: RelationDef | undefined = ctx.schema.tables[mm.table]?.relations?.[turbineRel];
   if (!rd) return undefined;
@@ -813,6 +830,17 @@ function translateWhere(ctx: Ctx, mm: PrismaModelMap, where: unknown, depth = 0)
   const out: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(where)) {
     if (COMBINATORS.has(key)) {
+      // An EMPTY `OR` is false in Prisma (no branch can match), while an empty
+      // `AND` / `NOT` is true. Core drops an empty combinator entirely, so the
+      // same call returned EVERY row here: the classic trigger is
+      // `OR: ids.map(...)` over a selection that turned out to be empty, i.e.
+      // "none of these" answered with "all of them". Compiled to a predicate
+      // that matches nothing so this layer keeps Prisma's meaning; core's own
+      // semantics are unchanged and documented separately.
+      if (key === 'OR' && Array.isArray(val) && val.length === 0) {
+        Object.assign(out, matchNothing(ctx, mm));
+        continue;
+      }
       // An `AND` / `OR` array of N conditions is ONE level, not N: the elements
       // are siblings, so they all translate at the same incremented depth.
       out[key] = Array.isArray(val)
@@ -833,6 +861,17 @@ function translateWhere(ctx: Ctx, mm: PrismaModelMap, where: unknown, depth = 0)
     // Relation filter.
     const rel = mm.relations[key];
     if (rel) {
+      // Prisma spells "this to-one relation has no related row" as a bare
+      // `null` on the relation key; core spells it `{ is: null }` and answers a
+      // bare null with E003. The generic message then degraded into naming the
+      // key that was just passed ("Did you mean "user" (a relation)?"), because
+      // the adapter had already renamed it. To-many keys are NOT mapped: Prisma
+      // has no bare-null shape there, so core still refuses them by name rather
+      // than this layer inventing a meaning.
+      if (val === null && rel.cardinality === 'one') {
+        out[rel.name] = { is: null };
+        continue;
+      }
       const target = relTargetModel(ctx, mm, rel.name);
       out[rel.name] = translateRelationFilter(ctx, target, val, depth + 1);
       continue;
@@ -1441,14 +1480,28 @@ function translateCursor(
   t.where = mergeKeyset((t.where as Record<string, unknown>) ?? {}, field, op, value);
 }
 
-/** Flatten a Turbine orderBy (object or single-object array) into [field, isDesc] pairs. */
+/**
+ * Flatten a Turbine orderBy (object, or an array of them) into [field, isDesc]
+ * pairs.
+ *
+ * EVERY array element is read. Reading only an array of length one returned
+ * `[]` for a two-element array, and `[]` is also what "no orderBy at all"
+ * returns, so {@link translateCursor} took its no-orderBy branch: it found a
+ * bare cursor on the primary key, wrote `orderBy = { id: 'asc' }` over the
+ * caller's array, and returned the rows following the anchor in PK order
+ * instead of in the caller's order. The single-sort-key check downstream is
+ * what refuses a shape a bare (inclusive) cursor cannot express, and it can
+ * only fire if the pairs it counts are all there.
+ */
 function orderByPairs(ob: unknown): [string, boolean][] {
-  const one = Array.isArray(ob) ? (ob.length === 1 ? ob[0] : undefined) : ob;
-  if (!isPlainObject(one)) return [];
+  const entries = Array.isArray(ob) ? ob : [ob];
   const out: [string, boolean][] = [];
-  for (const [k, v] of Object.entries(one)) {
-    const dir = isPlainObject(v) ? (v.sort as string) : (v as string);
-    out.push([k, dir === 'desc']);
+  for (const entry of entries) {
+    if (!isPlainObject(entry)) continue;
+    for (const [k, v] of Object.entries(entry)) {
+      const dir = isPlainObject(v) ? (v.sort as string) : (v as string);
+      out.push([k, dir === 'desc']);
+    }
   }
   return out;
 }

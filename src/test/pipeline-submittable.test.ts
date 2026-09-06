@@ -119,6 +119,14 @@ class FakeConnection extends EventEmitter {
     for (const fn of queue) {
       fn();
     }
+    // A handler may have sent MORE protocol messages while this batch drained,
+    // which is what the recovery `ROLLBACK` after a failed transactional batch
+    // does: it is sent from the readyForQuery handler and its own responses are
+    // queued by `parse` / `bind` / `sync` above. Drain those too, on the next
+    // tick, the way a real backend answers a second round trip.
+    if (this.responseQueue.length > 0) {
+      process.nextTick(() => this.drainResponses());
+    }
   }
 
   /**

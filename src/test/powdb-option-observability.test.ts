@@ -184,6 +184,10 @@ interface Observation {
 const OBSERVATION: Record<string, Observation> = {
   where: { how: 'compiled', value: { name: 'zzz-distinct' } },
   'findUnique.where': { how: 'compiled', value: { email: 'other@example.test' } },
+  // The single-row writes refuse a where that identifies no row (query/
+  // compound-unique.ts), so their probe changes the PK value instead.
+  'update.where': { how: 'compiled', value: { id: 'zzz-distinct' } },
+  'delete.where': { how: 'compiled', value: { id: 'zzz-distinct' } },
   select: { how: 'compiled', value: { id: true } },
   omit: { how: 'compiled', value: { name: true } },
   with: { how: 'compiled', value: { posts: true } },

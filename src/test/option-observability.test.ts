@@ -106,8 +106,13 @@ const FIXTURES: { name: string; primaryKey: string[]; baselines: Record<string, 
   {
     name: 'composite key',
     primaryKey: ['tenant_id', 'id'],
-    // findUnique must address the WHOLE key, or the 0.73.0 rule refuses it.
-    baselines: { findUnique: { where: { tenantId: 't1', id: 1 } } },
+    // findUnique must address the WHOLE key, or the 0.73.0 rule refuses it, and
+    // `update` / `delete` return ONE row, so the same rule applies to them.
+    baselines: {
+      findUnique: { where: { tenantId: 't1', id: 1 } },
+      update: { where: { tenantId: 't1', id: 1 }, data: { name: 'b' } },
+      delete: { where: { tenantId: 't1', id: 1 } },
+    },
   },
 ];
 
@@ -184,8 +189,13 @@ const OBSERVATION: Record<string, Observation> = {
   // --- shape and projection ------------------------------------------------
   where: { how: 'compiled', value: { name: 'zzz-distinct' } },
   // findUnique refuses a where that does not identify one row (0.73.0), so the
-  // sample has to be a second unique key rather than any other column.
+  // sample has to be a second unique key rather than any other column. The
+  // single-row WRITES refuse the same shape for the same reason (they return
+  // one row), so they take the same second key; `updateMany` / `deleteMany` are
+  // the many-row path and keep the plain column above.
   'findUnique.where': { how: 'compiled', value: { email: 'other@example.test' } },
+  'update.where': { how: 'compiled', value: { email: 'other@example.test' } },
+  'delete.where': { how: 'compiled', value: { email: 'other@example.test' } },
   select: { how: 'compiled', value: { id: true } },
   omit: { how: 'compiled', value: { name: true } },
   with: { how: 'compiled', value: { posts: true } },

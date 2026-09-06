@@ -42,7 +42,7 @@
 import { ValidationError } from '../errors.js';
 import type { TableMetadata } from '../schema.js';
 import { isArrayFilter, isJsonFilter, isVectorFilter, isWhereOperator } from './filters.js';
-import { ownLookup, resolveColumnName, resolveRelationDef } from './utils.js';
+import { isInternalCombinator, ownLookup, resolveColumnName, resolveRelationDef } from './utils.js';
 
 const syntheticKeyCache = new WeakMap<TableMetadata, Map<string, string[]>>();
 
@@ -261,6 +261,51 @@ export function assertWhereIdentifiesOneRow(
   );
 }
 
+/**
+ * The same refusal for the single-row WRITE methods, `update` and `delete`.
+ *
+ * Those two emit `... WHERE <predicate> RETURNING *` and hand back `rows[0]`,
+ * so a `where` that matches many rows mutates EVERY one of them and reports
+ * one: the `findUnique` hazard (an arbitrary one of many) with a write
+ * attached. Same rule, same sources of uniqueness, same null policy as
+ * {@link assertWhereIdentifiesOneRow}; only the sentence differs, because the
+ * fix differs. A reader who meant one row names a key; a reader who meant every
+ * matching row has `updateMany` / `deleteMany`, which report `{ count }` and
+ * never pretend to have touched one row.
+ *
+ * Called on the CALLER's where, before any global filter is merged in (a
+ * tenancy filter narrows, it does not identify) and only when the caller has
+ * not opted into a full-table mutation with `allowFullTableScan: UNSAFE`, which
+ * already says "every row" in so many words.
+ */
+export function assertMutationWhereIdentifiesOneRow(
+  meta: TableMetadata,
+  table: string,
+  where: Record<string, unknown> | undefined,
+  operation: 'update' | 'delete',
+): void {
+  if (whereIdentifiesOneRow(meta, where ?? {})) return;
+  const many = operation === 'update' ? 'updateMany' : 'deleteMany';
+  const keys = describeUniqueKeys(meta);
+  const advice =
+    keys.length > 0
+      ? `Name a unique key (${keys.join(', ')}), or use \`${many}\` if you meant "every row matching a filter".`
+      : `Table "${table}" declares no primary key and no unique constraint, so no \`where\` can identify one row ` +
+        `here. Use \`${many}\`, which reports how many rows it touched.`;
+  throw new ValidationError(
+    `${operation} on "${table}" refused: the \`where\` clause does not identify a single row, ` +
+      `so this would ${operation} every row that matches and return only one of them. ${advice}`,
+  );
+}
+
+/** Each unique key of `meta` rendered in field spelling, for an error message. */
+function describeUniqueKeys(meta: TableMetadata): string[] {
+  const field = (c: string): string => meta.reverseColumnMap[c] ?? c;
+  return uniqueKeyNames(meta).map((cols) =>
+    cols.length === 1 ? `\`${field(cols[0] as string)}\`` : `\`{ ${cols.map(field).join(', ')} }\``,
+  );
+}
+
 export function uniqueKeyNames(meta: TableMetadata): string[][] {
   return dedupeColumnSets(uniqueColumnSets(meta));
 }
@@ -301,8 +346,22 @@ function uniqueColumnSets(meta: TableMetadata): string[][] {
  * A NULL is not an identity. `WHERE email IS NULL` matches every row whose
  * email is null, which a UNIQUE constraint permits any number of, so a null
  * value satisfies no key here even on a unique column.
+ *
+ * The one combinator it does read through is Turbine's OWN: a nested write
+ * scopes a child selector to its parent by merging the parent correlation in,
+ * and when the two name the same column the merge is `{ AND: [selector,
+ * correlation] }` BRANDED via `markInternalCombinator` (query/utils.ts). That
+ * brand is a Symbol no request body can produce, the arity is fixed at two,
+ * and each branch only narrows the other, so the wrapper identifies a row
+ * exactly when one of its branches does. A caller-written `AND` is not read.
  */
 export function whereIdentifiesOneRow(meta: TableMetadata, where: Record<string, unknown>): boolean {
+  if (isInternalCombinator(where) && Array.isArray(where.AND)) {
+    return (where.AND as unknown[]).some(
+      (branch) =>
+        typeof branch === 'object' && branch !== null && whereIdentifiesOneRow(meta, branch as Record<string, unknown>),
+    );
+  }
   const pinned = new Set<string>();
   for (const [key, value] of Object.entries(where)) {
     if (!isPinnedToOneValue(value)) continue;

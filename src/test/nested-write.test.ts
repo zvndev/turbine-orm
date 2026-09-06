@@ -1146,3 +1146,139 @@ describe('nested-write: internal reads do not raise user-facing dev warnings', (
     assert.equal((read.args as { warnOnUnlimited?: boolean }).warnOnUnlimited, false);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Read-back `with`: the whole tree that was written, not just its top level
+// ---------------------------------------------------------------------------
+
+/**
+ * A nested write reads the row back with the relations it touched populated.
+ * The `with` clause was built from the TOP-LEVEL relation keys only, so a
+ * depth-3 create wrote all three levels and returned an object whose
+ * grandchildren were simply absent (`users[0].posts === undefined`), which
+ * reads as "there are none" rather than "this layer did not ask for them".
+ * The clause now mirrors the shape of the data that was written, to the same
+ * depth cap the walk itself uses.
+ */
+const deepSchema: SchemaMetadata = {
+  enums: {},
+  tables: {
+    orgs: {
+      ...mockTable('orgs', [
+        { name: 'id', field: 'id' },
+        { name: 'name', field: 'name', pgType: 'text' },
+      ]),
+      relations: {
+        members: {
+          type: 'hasMany',
+          name: 'members',
+          from: 'orgs',
+          to: 'members',
+          foreignKey: 'org_id',
+          referenceKey: 'id',
+        },
+      },
+    },
+    members: {
+      ...mockTable('members', [
+        { name: 'id', field: 'id' },
+        { name: 'org_id', field: 'orgId' },
+        { name: 'name', field: 'name', pgType: 'text' },
+      ]),
+      relations: {
+        notes: {
+          type: 'hasMany',
+          name: 'notes',
+          from: 'members',
+          to: 'notes',
+          foreignKey: 'member_id',
+          referenceKey: 'id',
+        },
+      },
+    },
+    notes: {
+      ...mockTable('notes', [
+        { name: 'id', field: 'id' },
+        { name: 'member_id', field: 'memberId' },
+        { name: 'body', field: 'body', pgType: 'text' },
+      ]),
+      relations: {},
+    },
+  },
+};
+
+/** The `with` clause of the read-back that followed the write on `table`. */
+function readBackWith(log: { op: string; table: string; args: unknown }[], table: string): unknown {
+  const reads = log.filter((l) => l.op === 'findUnique' && l.table === table);
+  return (reads[reads.length - 1]!.args as { with?: unknown }).with;
+}
+
+describe('nested-write: the read-back asks for the whole written tree', () => {
+  it('a depth-3 create reads back three levels of relations', async () => {
+    const { ctx, log } = makeMockCtx(deepSchema);
+
+    await executeNestedCreate(ctx, 'orgs', {
+      name: 'Acme',
+      members: { create: [{ name: 'Ada', notes: { create: [{ body: 'first' }] } }] },
+    });
+
+    assert.deepStrictEqual(readBackWith(log, 'orgs'), { members: { with: { notes: true } } });
+  });
+
+  it('a depth-1 create still asks for exactly `{ rel: true }` (unchanged shape)', async () => {
+    const { ctx, log } = makeMockCtx(deepSchema);
+
+    await executeNestedCreate(ctx, 'orgs', { name: 'Acme', members: { create: [{ name: 'Ada' }] } });
+
+    assert.deepStrictEqual(readBackWith(log, 'orgs'), { members: true });
+  });
+
+  it('a relation written by `connect` (no nested data) stays `true`', async () => {
+    const { ctx, log } = makeMockCtx(deepSchema);
+
+    await executeNestedCreate(ctx, 'orgs', { name: 'Acme', members: { connect: [{ id: 1 }] } });
+
+    assert.deepStrictEqual(readBackWith(log, 'orgs'), { members: true });
+  });
+
+  it('only the branch that has nested writes gets a nested `with`', async () => {
+    const { ctx, log } = makeMockCtx(deepSchema);
+
+    await executeNestedCreate(ctx, 'orgs', {
+      name: 'Acme',
+      members: {
+        create: [{ name: 'Ada', notes: { create: [{ body: 'x' }] } }, { name: 'Bob' }],
+      },
+    });
+
+    // One member carries notes and the other does not; the relation is asked
+    // for once, so the union is what the read must request.
+    assert.deepStrictEqual(readBackWith(log, 'orgs'), { members: { with: { notes: true } } });
+  });
+
+  it('a depth-3 update reads back three levels too', async () => {
+    const { ctx, log } = makeMockCtx(deepSchema);
+
+    await executeNestedUpdate(
+      ctx,
+      'orgs',
+      { id: 1 },
+      { members: { create: [{ name: 'Ada', notes: { create: [{ body: 'x' }] } }] } },
+    );
+
+    assert.deepStrictEqual(readBackWith(log, 'orgs'), { members: { with: { notes: true } } });
+  });
+
+  it('an unknown key inside nested data never reaches the `with` clause', async () => {
+    const { ctx, log } = makeMockCtx(deepSchema);
+
+    await executeNestedCreate(ctx, 'orgs', {
+      name: 'Acme',
+      members: { create: [{ name: 'Ada', nonexistent: { create: [{}] } }] },
+    });
+
+    // `nonexistent` is a scalar as far as the child table is concerned, so it
+    // must not be requested as a relation of `members`.
+    assert.deepStrictEqual(readBackWith(log, 'orgs'), { members: true });
+  });
+});

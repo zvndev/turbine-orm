@@ -318,6 +318,71 @@ function validateOps(relationName: string, ops: Record<string, unknown>, isUpdat
 }
 
 /**
+ * The `with` clause that reads back the tree a nested write just wrote.
+ *
+ * Built from the DATA, recursively: a relation whose payload itself contains
+ * relation writes is requested as `{ rel: { with: { ... } } }` rather than
+ * `{ rel: true }`. It used to be the top-level keys alone, so a depth-3 create
+ * wrote all three levels and returned an object whose grandchildren were
+ * missing entirely, which a caller reads as "there are none".
+ *
+ * Only relations that were actually WRITTEN are requested, so a create with no
+ * nested data still reads back exactly what it did before. The walk is capped
+ * at {@link MAX_DEPTH}, the cap the write walk itself uses, and the builder's
+ * own relation-depth guard is the backstop below that.
+ */
+function readBackWith(
+  schema: SchemaMetadata,
+  tableName: string,
+  relations: Record<string, Record<string, unknown>>,
+  depth = 0,
+): Record<string, unknown> | undefined {
+  const tableMeta = schema.tables[tableName];
+  if (!tableMeta || depth >= MAX_DEPTH) return undefined;
+  const clause: Record<string, unknown> = {};
+
+  for (const [relName, ops] of Object.entries(relations)) {
+    const rel = tableMeta.relations[relName];
+    if (!rel) continue;
+    // Every payload this relation was written with: `create` / `update` /
+    // `upsert` take objects (or arrays of them) whose own keys may name
+    // relations of the TARGET table. `connect` / `disconnect` / `set` name
+    // existing rows and write no nested data, so they contribute nothing here.
+    const nested: Record<string, Record<string, unknown>> = {};
+    for (const key of ['create', 'update', 'upsert'] as const) {
+      const payload = ops[key];
+      if (payload === undefined) continue;
+      for (const item of toArray(payload as unknown)) {
+        // `{ where, data }` (nested update) and `{ where, create, update }`
+        // (nested upsert) carry their written fields one level in.
+        const bodies =
+          isPlainRecord(item) && ('data' in item || 'create' in item || 'update' in item)
+            ? [item.data, item.create, item.update]
+            : [item];
+        for (const body of bodies) {
+          if (!isPlainRecord(body)) continue;
+          const child = schema.tables[rel.to];
+          if (!child) continue;
+          for (const [k, v] of Object.entries(extractRelationFields(body, child).relations)) {
+            nested[k] = { ...(nested[k] ?? {}), ...v };
+          }
+        }
+      }
+    }
+
+    const deeper = Object.keys(nested).length > 0 ? readBackWith(schema, rel.to, nested, depth + 1) : undefined;
+    clause[relName] = deeper ? { with: deeper } : true;
+  }
+
+  return Object.keys(clause).length > 0 ? clause : undefined;
+}
+
+/** A plain object (not an array, Date or null), the shape nested payloads take. */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value) && !(value instanceof Date);
+}
+
+/**
  * Build a PK-based where clause from a parent row and its table metadata.
  */
 function pkWhere(tableMeta: TableMetadata, row: Record<string, unknown>): Record<string, unknown> {
@@ -1079,16 +1144,14 @@ export async function executeNestedCreate(
     }
   }
 
-  // Build the `with` clause for the final read to return the full tree
-  const withClause: Record<string, true> = {};
-  for (const relName of Object.keys(relations)) {
-    withClause[relName] = true;
-  }
+  // The `with` clause for the final read: the whole tree that was written, at
+  // every depth (see readBackWith), not only its top level.
+  const withClause = readBackWith(ctx.schema, tableName, relations);
 
   // Final read using existing json_agg machinery
   const fullRow = await ctx.tx.table(tableName).findUnique({
     where: pkWhere(tableMeta, parentRow),
-    with: Object.keys(withClause).length > 0 ? withClause : undefined,
+    with: withClause,
   });
 
   return (fullRow ?? parentRow) as Record<string, unknown>;
@@ -1217,15 +1280,10 @@ export async function executeNestedUpdate(
     }
   }
 
-  // Final read with all touched relations
-  const withClause: Record<string, true> = {};
-  for (const relName of Object.keys(relations)) {
-    withClause[relName] = true;
-  }
-
+  // Final read with all touched relations, to the depth they were written.
   const fullRow = await ctx.tx.table(tableName).findUnique({
     where: pkWhere(tableMeta, parentRow),
-    with: Object.keys(withClause).length > 0 ? withClause : undefined,
+    with: readBackWith(ctx.schema, tableName, relations),
   });
 
   return (fullRow ?? parentRow) as Record<string, unknown>;

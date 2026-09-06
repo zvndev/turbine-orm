@@ -15,7 +15,7 @@ import type { ReturningSelection } from '../dialect.js';
 import { NotFoundError, OptimisticLockError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import type { TableMetadata } from '../schema.js';
 import { camelToSnake, snakeToCamel } from '../schema.js';
-import { expandCompoundUniqueWhere } from './compound-unique.js';
+import { assertMutationWhereIdentifiesOneRow, expandCompoundUniqueWhere } from './compound-unique.js';
 import type { DeferredQuery } from './deferred.js';
 import { isUnmatchedPlainObject, UPDATE_OPERATOR_KEYS } from './filters.js';
 import type {
@@ -395,12 +395,14 @@ export function buildUpdate<T extends object>(qi: BuilderCtx, args: UpdateArgs<T
   // The empty-`where` guard checks the USER predicate only, a global filter
   // must never turn an unguarded mass update into an allowed one.
   const userHasPredicate = !whereMod.userPredicateIsEmpty(qi, userWhere) || !!lock;
-  whereMod.assertMutationHasPredicate(
-    qi,
-    'update',
-    userHasPredicate ? ' WHERE x' : '',
-    resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'),
-  );
+  const allowFullTableScan = resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan');
+  whereMod.assertMutationHasPredicate(qi, 'update', userHasPredicate ? ' WHERE x' : '', allowFullTableScan);
+  // `update` returns ONE row, so its where must identify one: the 0.73
+  // `findUnique` rule (query/compound-unique.ts) applied to the write that has
+  // the same shape. On the USER's where, before the global filter is merged
+  // (a filter narrows, it never identifies), and skipped only under the
+  // explicit full-table opt-in, which already means "every row".
+  if (!allowFullTableScan) assertMutationWhereIdentifiesOneRow(qi.tableMeta, qi.table, userWhere, 'update');
   // The SQL is built from the global-filter-merged where (soft-delete keeps an
   // update from touching already-deleted rows).
   const whereObj = (whereMod.mergeGlobalFilter(qi, userWhere) ?? {}) as Record<string, unknown>;
@@ -545,12 +547,16 @@ export function buildDelete<T extends object>(qi: BuilderCtx, args: DeleteArgs<T
   // Prisma compound-unique selector → the column conjunction (before the guard).
   const userWhere = expandCompoundUniqueWhere(qi.tableMeta, args.where as Record<string, unknown>);
   // Guard the USER predicate (a global filter must not satisfy the guard).
+  const allowFullTableScan = resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan');
   whereMod.assertMutationHasPredicate(
     qi,
     'delete',
     whereMod.userPredicateIsEmpty(qi, userWhere) ? '' : ' WHERE x',
-    resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'),
+    allowFullTableScan,
   );
+  // Same identity rule as `update` (see buildUpdate): one returned row means
+  // one addressed row. `deleteMany` is the many-row path.
+  if (!allowFullTableScan) assertMutationWhereIdentifiesOneRow(qi.tableMeta, qi.table, userWhere, 'delete');
   const whereObj = (whereMod.mergeGlobalFilter(qi, userWhere) ?? {}) as Record<string, unknown>;
   const whereFp = whereMod.fingerprintWhere(qi, whereObj);
   const ck = `d:${whereFp}${whereMod.globalFilterCacheSegment(qi)}`;
@@ -621,26 +627,35 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
   const conflictKeys = Object.keys(upsertWhere).filter((k) => upsertWhere[k] !== undefined);
   const conflictColumns = conflictKeys.map((k) => qi.toSqlColumn(k));
 
-  // Build the UPDATE SET part
+  // The conflict-UPDATE SET goes through the SAME operator-aware compiler as
+  // `update()` (buildSetClause), so `set` / `increment` / `decrement` /
+  // `multiply` / `divide` mean here what they mean there and a misspelled
+  // operator gets the same E003. This branch used to bind each value directly,
+  // which stored an operator OBJECT as the JSON text `{"set":"x"}` in a text
+  // column with no error at all. buildSetClause pushes onto `params` as it
+  // goes, so the numbering continues after the create params exactly as the
+  // hand-rolled `paramIdx` did. No SQL cache here (the statement is rebuilt per
+  // call), so the fingerprint / collect mirrors update() keeps are not needed.
   const updateEntries = writeEntries(qi, args.update as Record<string, unknown>);
-  let paramIdx = createParams.length + 1;
-  const setClauses = updateEntries.map(([k]) => {
-    const clause = `${qi.toSqlColumn(k)} = ${qi.p(paramIdx)}${whereMod.enumCastSuffix(qi, qi.toColumn(k))}`;
-    paramIdx++;
-    return clause;
-  });
-  const updateParams = updateEntries.map(([k, v]) => coerceWriteValue(qi, k, v));
-
-  const params = [...createParams, ...updateParams];
+  const params: unknown[] = [...createParams];
+  const refQualifier = upsertReferenceQualifier(qi);
+  const setClauses = updateEntries.map(([k, v]) => buildSetClause(qi, k, v, params, refQualifier));
 
   // Global filter → restrict the conflict-UPDATE (soft-delete / tenancy) so an
   // upsert never resurrects a soft-deleted row or writes across tenants. Only
-  // on engines whose upsert can carry a predicate (Postgres); the gf params
-  // continue the placeholder numbering after create+update params.
+  // on engines whose upsert can carry a predicate (Postgres, SQLite); the gf
+  // params continue the placeholder numbering after create+update params.
+  //
+  // Compiled against the TABLE QUALIFIER, not bare: in `ON CONFLICT ... DO
+  // UPDATE ... WHERE` both the target table and `excluded` are in scope, so an
+  // unqualified column is ambiguous and PostgreSQL rejected EVERY upsert on a
+  // globally filtered table at parse time (42702), insert path included.
   let updateWhere: string | undefined;
   if (qi.dialect.supportsUpsertUpdateWhere) {
     const gf = whereMod.resolveGlobalFilter(qi, qi.table);
-    if (gf) updateWhere = whereMod.buildWhereClause(qi, gf, params) ?? undefined;
+    if (gf) {
+      updateWhere = whereMod.buildAliasWhere(qi, qi.table, qi.tableMeta, qi.q(qi.table), gf, params) ?? undefined;
+    }
   }
 
   const sql = qi.dialect.buildUpsertStatement({
@@ -659,11 +674,21 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
     transform: (result) => {
       const row = result.rows[0];
       if (!row) {
+        // With a conflict-UPDATE predicate in play there IS a way to get no
+        // row: the key conflicts with a row the global filter hides, the
+        // predicate is false for it, the engine skips the update, and the
+        // insert cannot happen either because the key is taken. Nothing was
+        // written and the hidden row is untouched; say so, rather than "this
+        // should never happen".
         throw new NotFoundError({
           table: qi.table,
           where: args.where,
           operation: 'upsert',
-          message: `upsert on "${qi.table}" returned no row from RETURNING *; this should never happen.`,
+          message: updateWhere
+            ? `upsert on "${qi.table}" wrote nothing: the row that conflicts on the given key is excluded by the ` +
+              `configured global filter for "${qi.table}", so it was neither updated (the filter hides it) nor ` +
+              'inserted (the key is taken). Pass `skipGlobalFilters: UNSAFE` to address it anyway.'
+            : `upsert on "${qi.table}" returned no row from RETURNING *; this should never happen.`,
         });
       }
       return parseWriteRow(qi, row) as T;
@@ -682,6 +707,30 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
           }
         : undefined,
   };
+}
+
+/**
+ * The qualifier an upsert's arithmetic SET operator reads its column through.
+ *
+ * `INSERT ... ON CONFLICT DO UPDATE SET n = n + 1` is 42702 on PostgreSQL
+ * because `n` could be the target row's or `excluded`'s, so the reference is
+ * qualified with the table name on every engine whose upsert statement names
+ * the table directly (PostgreSQL, SQLite, MySQL all accept `"t"."n"` there).
+ * SQL Server is the exception and keeps the bare reference: its `MERGE`
+ * aliases the target as `T`, so the TABLE NAME does not resolve there at all,
+ * and the alias belongs to that dialect's own `buildUpsertStatement` rather
+ * than to this module. An arithmetic operator in an mssql upsert may therefore
+ * still be refused by the server as an ambiguous column; that shape has never
+ * worked (it previously bound the operator OBJECT as the value), and the sound
+ * fix is for the dialect to publish its target alias, which is a change to
+ * `dialect.ts`. It fails loudly either way, so no wrong answer is possible.
+ * `set` and literal values reference no column and are unaffected everywhere.
+ *
+ * Gated on the dialect NAME, never on hook presence: every engine dialect
+ * spreads `postgresDialect`, so a presence test would say yes for all of them.
+ */
+function upsertReferenceQualifier(qi: BuilderCtx): string {
+  return qi.dialect.name === 'mssql' ? '' : `${qi.q(qi.table)}.`;
 }
 
 export function buildUpdateMany<T extends object>(
@@ -984,9 +1033,25 @@ export function assertNoGeneratedColumns(qi: BuilderCtx, data: Record<string, un
  * Returns the SQL fragment (e.g., `"view_count" = "view_count" + $3`) and
  * pushes any required params onto the shared params array so that WHERE
  * clause numbering continues correctly afterward.
+ *
+ * `refQualifier` prefixes the column REFERENCE an arithmetic operator reads
+ * from (`"view_count" = <qualifier>"view_count" + $n`). A plain `UPDATE` has
+ * one table in scope and passes nothing; `upsert` passes the table name,
+ * because inside `ON CONFLICT ... DO UPDATE SET` the target table and
+ * `excluded` are BOTH in scope and a bare reference is 42702 on PostgreSQL.
+ * The assignment target on the left stays bare on every engine (it can only
+ * ever be the target table's column), and `set` / literal values reference no
+ * column at all, so their SQL is byte-identical with or without a qualifier.
  */
-export function buildSetClause(qi: BuilderCtx, key: string, value: unknown, params: unknown[]): string {
+export function buildSetClause(
+  qi: BuilderCtx,
+  key: string,
+  value: unknown,
+  params: unknown[],
+  refQualifier = '',
+): string {
   const col = qi.toSqlColumn(key);
+  const ref = `${refQualifier}${col}`;
   // Enum columns get an explicit `::"EnumName"` cast on their value bind
   // (see enumTypeForColumn); `''` everywhere else. Value-invariant, so the
   // SQL cache and collectSetParams are unaffected.
@@ -1021,19 +1086,19 @@ export function buildSetClause(qi: BuilderCtx, key: string, value: unknown, para
 
       if (op === 'increment') {
         params.push(opValue);
-        return `${col} = ${col} + ${qi.p(params.length)}`;
+        return `${col} = ${ref} + ${qi.p(params.length)}`;
       }
       if (op === 'decrement') {
         params.push(opValue);
-        return `${col} = ${col} - ${qi.p(params.length)}`;
+        return `${col} = ${ref} - ${qi.p(params.length)}`;
       }
       if (op === 'multiply') {
         params.push(opValue);
-        return `${col} = ${col} * ${qi.p(params.length)}`;
+        return `${col} = ${ref} * ${qi.p(params.length)}`;
       }
       if (op === 'divide') {
         params.push(opValue);
-        return `${col} = ${col} / ${qi.p(params.length)}`;
+        return `${col} = ${ref} / ${qi.p(params.length)}`;
       }
     }
     // Fall through: multi-key objects or non-operator single-key objects

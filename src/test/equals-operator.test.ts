@@ -44,7 +44,8 @@ function buildSchema(): SchemaMetadata {
         'users',
         [
           { name: 'id', field: 'id' },
-          { name: 'email', field: 'email', pgType: 'text' },
+          // Unique: the update / delete WHERE case below addresses a row by it.
+          { name: 'email', field: 'email', pgType: 'text', unique: true },
           { name: 'age', field: 'age', pgType: 'int4' },
           { name: 'settings', field: 'settings', pgType: 'jsonb' },
         ],

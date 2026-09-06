@@ -286,7 +286,9 @@ describe('global filters, mutations', () => {
       create: { id: 1, name: 'x' } as never,
       update: { name: 'y' } as never,
     });
-    assert.match(sql, /ON CONFLICT .* DO UPDATE SET .* WHERE "deleted_at" IS NULL/);
+    // Table-qualified: inside `ON CONFLICT ... DO UPDATE ... WHERE` both the
+    // target and `excluded` are in scope, so a bare column is 42702.
+    assert.match(sql, /ON CONFLICT .* DO UPDATE SET .* WHERE "users"\."deleted_at" IS NULL/);
     assertParamsAligned(sql, params);
   });
 });
