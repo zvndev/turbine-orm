@@ -428,7 +428,7 @@ The full mapping for a native port. Skip to [Side-by-side](#side-by-side) to see
 | `prisma.user.deleteMany` | `db.users.deleteMany` | Empty `where` rejected unless [`allowFullTableScan: UNSAFE`](/global-filters#privilege-options-and-the-unsafe-symbol). |
 | `prisma.user.upsert` | `db.users.upsert` | Same `where` / `create` / `update` shape. |
 | `prisma.user.count` | `db.users.count` | Same. |
-| `prisma.user.aggregate` | `db.users.aggregate` | `_sum` / `_avg` / `_min` / `_max` / `_count`. `_count: true` returns a number; `_count: { _all: true }` returns `{ _all: n }` (Prisma's shape). |
+| `prisma.user.aggregate` | `db.users.aggregate` | `_sum` / `_avg` / `_min` / `_max` / `_count`. `_count: true` returns a number; `_count: { _all: true }` returns `{ _all: n }` (Prisma's shape). Over `int8` / `bigint` and `numeric` / `decimal` columns, `_sum` / `_avg` come back as exact **strings** where Prisma hands you a `Decimal`, the same rule as the `numeric` row in [Silent value differences](#silent-value-differences-check-these-first); over `int4` / `float` columns they are numbers. |
 | `prisma.user.groupBy` | `db.users.groupBy` | `by`, `where`, `orderBy`, plus `_count` / `_sum` / `_avg` / `_min` / `_max`. Same `_count` shapes as `aggregate`. |
 | `prisma.$transaction` | `db.$transaction` | Callback form with nested SAVEPOINTs and isolation levels. |
 | `include: { posts: true }` | `with: { posts: true }` | The only renamed key. |

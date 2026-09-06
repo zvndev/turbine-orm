@@ -270,9 +270,9 @@ const versions = await db.versions.findMany({
 });
 ```
 
-Each extra hop becomes an INNER JOIN inside the *same* correlated subquery: one subquery, one `LIMIT 1`, however many hops. Every hop applies its target's global filter to the join condition, so ordering never keys off a soft-deleted or other-tenant row.
+Each extra hop becomes an INNER JOIN inside the *same* correlated subquery: one subquery, one `LIMIT 1`, however many hops. Every hop applies its target's global filter to the join condition, so ordering never keys off a soft-deleted or other-tenant row. On a generated client the chain is typed, too: each value is a direction, a `{ sort, nulls }` spec, or the next hop, and the type admits the head relation plus ten further hops, which is exactly where the builder stops (one more is `TURBINE_E007`).
 
-A **to-many** hop mid-chain is refused: it has no single value to order by. Use a pick-row ordering (`{ pick, by }`) or `_count` instead.
+A **to-many** hop mid-chain is refused at runtime with `TURBINE_E003` (the type keys hops by name and cannot tell a to-many relation from a to-one one): it has no single value to order by. Use a pick-row ordering (`{ pick, by }`) or `_count` instead.
 
 Relation ordering adds no bound parameters. An unknown relation throws `RelationError` (TURBINE_E005); a non-`_count` key on a to-many relation, or an unknown column on a to-one relation, throws `ValidationError` (TURBINE_E003).
 
@@ -525,6 +525,8 @@ const postsByUser = await db.posts.groupBy({
   _avg: { score: true },
 });
 // [{ userId: 1, _count: 12, _sum: { viewCount: 4800 }, _avg: { score: 4.2 } }, ...]
+// If `score` were numeric (or bigint), _avg would be the exact string PostgreSQL
+// renders, e.g. _avg: { score: '4.2000000000000000' }; see the type note below.
 ```
 
 Grouping **by** a PII-tagged column, or `_min` / `_max` over one, requires

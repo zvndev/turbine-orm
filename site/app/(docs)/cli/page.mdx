@@ -103,6 +103,16 @@ npx turbine pull --include-views
 
 Views get entity types and read accessors; write builders reject them (TURBINE_E003). See [Views & Generated Columns](/views).
 
+### `--keep-column-names`
+
+Keep the raw database column names as the generated field names (`created_at` stays `created_at`) instead of camelCasing them. The config key is `keepColumnNames: true`.
+
+```bash
+npx turbine generate --keep-column-names
+```
+
+It is also the fix for a field collision. Two columns of one table that camelCase to the same field, a quoted `"createdAt"` beside a `created_at` say, used to generate a `types.ts` with a duplicate member and a `columnMap` that kept whichever column came last, so a write to the field reached only one of them. Introspection now refuses that table with `TURBINE_E003`, naming every colliding column; with `keepColumnNames: true` the field is the raw column name and two distinct columns cannot collide. There is no per-column rename option, so the alternative is a rename in the database.
+
 ### `--no-timestamp`
 
 Omit the `Generated at: <ISO timestamp>` header so regenerating an unchanged schema produces byte-identical output. Useful when generated code is committed or checked in CI.

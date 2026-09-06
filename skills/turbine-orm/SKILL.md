@@ -206,6 +206,11 @@ await db.ripeningChecks.aggregate({
 });
 ```
 
+`_sum` / `_avg` over an `int8` / `bigint` or `numeric` / `decimal` column return
+PostgreSQL's exact text as a **string** (every value, not only large ones; `AVG`
+is not float-cast there); over `int4` / `float` columns and over a JSON path they
+return a number. `_min` / `_max` return the column's own type.
+
 ## groupBy and having
 
 `by` lists the grouping columns. The `having` shape is **column first, aggregate

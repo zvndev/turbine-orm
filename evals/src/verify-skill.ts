@@ -17,9 +17,42 @@
  */
 import { deepStrictEqual } from 'node:assert';
 import { readFileSync } from 'node:fs';
+import pg from 'pg';
 import { TurbineError, type SchemaMetadata } from 'turbine-orm';
+import { assertEvalDatabase, EVAL_DATABASE_URL } from './config.js';
 import { closeClient, evalClient } from './execute.js';
 import { evalSchema } from './schema-meta.js';
+
+/**
+ * A scratch table for the exact-total claim. The eval schema has no bigint or
+ * numeric column (its numbers are `integer` and `serial`), so the skill's
+ * sentence about `_sum` / `_avg` returning PostgreSQL's exact text over those
+ * types had nothing to run against. Created BEFORE the schema is introspected,
+ * so `db.table()` knows it, and dropped after the claims run; IF NOT EXISTS plus
+ * TRUNCATE make a leftover from an aborted run harmless. The rows are 2^53 + 1
+ * twice: the sum is 18014398509481986, which a double renders as ...984, so a
+ * Number() anywhere on the path shows up as a wrong digit, not only a wrong type.
+ */
+const EXACT_TOTALS_TABLE = 'qa78_skill_exact_totals';
+
+async function createExactTotalsFixture(client: pg.Client): Promise<void> {
+  await client.query(
+    `CREATE TABLE IF NOT EXISTS ${EXACT_TOTALS_TABLE} (
+       id serial PRIMARY KEY,
+       big bigint NOT NULL,
+       amount numeric(12,2) NOT NULL,
+       small integer NOT NULL
+     )`,
+  );
+  await client.query(`TRUNCATE ${EXACT_TOTALS_TABLE}`);
+  await client.query(
+    `INSERT INTO ${EXACT_TOTALS_TABLE} (big, amount, small) VALUES (9007199254740993, 1020.50, 3), (9007199254740993, 0.10, 4)`,
+  );
+}
+
+async function dropExactTotalsFixture(client: pg.Client): Promise<void> {
+  await client.query(`DROP TABLE IF EXISTS ${EXACT_TOTALS_TABLE}`);
+}
 
 type Db = ReturnType<typeof evalClient>;
 type Args = Record<string, unknown>;
@@ -472,6 +505,30 @@ const CLAIMS: Claim[] = [
     }),
   },
   {
+    says: "_sum / _avg over int8 / bigint and numeric / decimal columns return PostgreSQL's exact text as a string; over int4 they return a number.",
+    run: async (db) => {
+      const truth = await db.sql<{ sum_big: string; avg_big: string; sum_amount: string; avg_amount: string }>`
+        SELECT sum(big)::text AS sum_big, avg(big)::text AS avg_big,
+               sum(amount)::text AS sum_amount, avg(amount)::text AS avg_amount
+        FROM qa78_skill_exact_totals`.one();
+      if (!truth) throw new Error(`${EXACT_TOTALS_TABLE} is empty; the fixture did not seed`);
+      if (truth.sum_big !== '18014398509481986') throw new Error(`fixture drifted: sum(big) is ${truth.sum_big}`);
+      const agg = (await call(db, EXACT_TOTALS_TABLE, 'aggregate', {
+        _sum: { big: true, amount: true, small: true },
+        _avg: { big: true, amount: true, small: true },
+      })) as { _sum: Record<string, unknown>; _avg: Record<string, unknown> };
+      // Compared as STRINGS against the database's own rendering, so a Number()
+      // on the path fails on the value (…984 vs …986) and on the type at once.
+      deepStrictEqual(agg._sum.big, truth.sum_big);
+      deepStrictEqual(agg._avg.big, truth.avg_big);
+      deepStrictEqual(agg._sum.amount, truth.sum_amount);
+      deepStrictEqual(agg._avg.amount, truth.avg_amount);
+      if (typeof agg._sum.small !== 'number' || typeof agg._avg.small !== 'number') {
+        throw new Error(`int4 totals should stay numbers, got ${typeof agg._sum.small} / ${typeof agg._avg.small}`);
+      }
+    },
+  },
+  {
     says: 'groupBy `having` is column first, aggregate second.',
     run: accepts('cheese_wheels', 'groupBy', {
       by: ['rindStyle'],
@@ -588,22 +645,35 @@ function claimCoverageHolds(): boolean {
 }
 
 async function main(): Promise<void> {
-  const schema: SchemaMetadata = await evalSchema();
-  const db = evalClient(schema);
+  // The database-name guard runs before the scratch table is created, so a
+  // stray URL can never receive DDL from this harness.
+  assertEvalDatabase(EVAL_DATABASE_URL);
+  const scratch = new pg.Client({ connectionString: EVAL_DATABASE_URL });
+  await scratch.connect();
   let failed = 0;
+  try {
+    await createExactTotalsFixture(scratch);
+    const schema: SchemaMetadata = await evalSchema();
+    const db = evalClient(schema);
 
-  for (const claim of CLAIMS) {
-    try {
-      await claim.run(db);
-      console.log(`  ok    ${claim.says}`);
-    } catch (err) {
-      failed++;
-      console.log(`  FAIL  ${claim.says}`);
-      console.log(`        ${err instanceof Error ? err.message.split('\n')[0] : String(err)}`);
+    for (const claim of CLAIMS) {
+      try {
+        await claim.run(db);
+        console.log(`  ok    ${claim.says}`);
+      } catch (err) {
+        failed++;
+        console.log(`  FAIL  ${claim.says}`);
+        console.log(`        ${err instanceof Error ? err.message.split('\n')[0] : String(err)}`);
+      }
     }
-  }
 
-  await closeClient();
+    await closeClient();
+  } finally {
+    // Dropped whatever happened above, and BEFORE any process.exit below,
+    // which would skip a finally.
+    await dropExactTotalsFixture(scratch).catch(() => {});
+    await scratch.end().catch(() => {});
+  }
   console.log(`\n${CLAIMS.length - failed}/${CLAIMS.length} claims hold`);
 
   // Computed before the claim-failure exit so one run reports both problems.
