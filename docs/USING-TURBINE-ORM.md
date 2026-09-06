@@ -166,7 +166,7 @@ Three files in `./generated/turbine/`:
 
 ```ts
 // src/db.ts
-import { turbine } from '../generated/turbine';
+import { turbine } from '../generated/turbine/index.js';
 
 export const db = turbine({
   connectionString: process.env.DATABASE_URL,
@@ -181,8 +181,8 @@ export const db = turbine({
 
 ```ts
 import { turbineHttp } from 'turbine-orm/serverless';
-import type { TurbineClient } from '../generated/turbine';
-import { schema } from '../generated/turbine/metadata';
+import type { TurbineClient } from '../generated/turbine/index.js';
+import { schema } from '../generated/turbine/metadata.js';
 import { Pool } from '@neondatabase/serverless';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL! });
@@ -852,7 +852,7 @@ Turbine does not ship a public mocking or test-helper surface. Its own build-onl
 Point `DATABASE_URL` at a disposable Postgres (a local container, a per-run schema, or an ephemeral branch on a serverless provider), run migrations or seed a fixture, then exercise the same generated client your app uses:
 
 ```ts
-import { turbine } from '../generated/turbine';
+import { turbine } from '../generated/turbine/index.js';
 
 const db = turbine({ connectionString: process.env.DATABASE_URL });
 

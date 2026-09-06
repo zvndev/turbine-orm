@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { readdirSync, readFileSync, statSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { join, relative, sep } from 'node:path';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -17,9 +17,16 @@ import { fileURLToPath } from 'node:url';
  * extensionless form is merely one of two that work, while the `.js` form works
  * everywhere, so the docs carry the form that compiles under both.
  *
- * This walks every `.mdx` page under `site/app`, pulls out the fenced `ts` /
- * `tsx` / `typescript` blocks, and fails on a relative specifier with no
- * extension, naming the page, line and specifier. The scan counts are asserted
+ * This walks every `.mdx` page under `site/app` AND every `.md` file under
+ * `docs/`, pulls out the fenced `ts` / `tsx` / `typescript` blocks, and fails
+ * on a relative specifier with no extension, naming the page, line and
+ * specifier.
+ *
+ * `docs/` was outside the walk when this guard was written, and it held four
+ * more of exactly the offender the guard exists to catch. A reader copying from
+ * a tracked markdown file has the same compile error as one copying from the
+ * site, so the two surfaces belong in one sweep rather than one guard and one
+ * blind spot. The scan counts are asserted
  * too: a walker that finds no fences, or a specifier regex that matches no
  * imports, would pass while checking nothing, which is how the previous sync
  * tests came to guard numbers nobody read.
@@ -27,6 +34,7 @@ import { fileURLToPath } from 'node:url';
 
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const SITE_APP = join(ROOT, 'site', 'app');
+const DOCS = join(ROOT, 'docs');
 
 /** Fence languages that are TypeScript modules, i.e. where a bare specifier is a compile error. */
 const TS_FENCE_LANGS = new Set(['ts', 'tsx', 'typescript']);
@@ -61,7 +69,7 @@ function walkMdx(dir: string, out: string[] = []): string[] {
     if (statSync(full).isDirectory()) {
       if (entry === 'node_modules') continue;
       walkMdx(full, out);
-    } else if (entry.endsWith('.mdx')) {
+    } else if (entry.endsWith('.mdx') || entry.endsWith('.md')) {
       out.push(full);
     }
   }
@@ -127,11 +135,12 @@ export function scanDocsSnippets(files: string[]): ScanResult {
 }
 
 describe('docs snippets: relative imports carry an extension', () => {
-  const files = walkMdx(SITE_APP);
+  // `docs/internal/` is gitignored working material, not a published surface.
+  const files = [...walkMdx(SITE_APP), ...walkMdx(DOCS).filter((f) => !f.includes(`${sep}internal${sep}`))];
   const scan = scanDocsSnippets(files);
 
   it('scanned a real number of TypeScript fences and relative imports', () => {
-    assert.ok(files.length > 0, `no .mdx files found under ${SITE_APP}`);
+    assert.ok(files.length > 0, `no docs files found under ${SITE_APP} or ${DOCS}`);
     assert.ok(
       scan.fences >= MIN_FENCES,
       `expected at least ${MIN_FENCES} ts/tsx/typescript fences under site/app, scanned ${scan.fences}; ` +
