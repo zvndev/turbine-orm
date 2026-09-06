@@ -49,6 +49,7 @@ export type {
   RelationDescriptor,
   RelationFilter,
   RelationLoadStrategy,
+  RelationOrderBy,
   RelationPickBy,
   RelationPickOrderBy,
   ResolvedSkipGlobalFilters,

@@ -25,7 +25,13 @@
 import assert from 'node:assert/strict';
 import { after, describe, it } from 'node:test';
 import { inspect, types } from 'node:util';
-import { REDACTED_DETAIL, setErrorMessageMode, type UniqueConstraintError, wrapPgError } from '../errors.js';
+import {
+  REDACTED_DETAIL,
+  setErrorMessageMode,
+  type UniqueConstraintError,
+  ValidationError,
+  wrapPgError,
+} from '../errors.js';
 
 const SECRET = 'alice@example.com';
 
@@ -182,19 +188,24 @@ describe("errorMessages: 'verbose', full fidelity for local debugging", () => {
 });
 
 /**
- * The honest edge of the contract. `wrapPgError` returns an unclassified
- * SQLSTATE unchanged, so safe mode never sees it, and a few of those carry a
- * row value in the driver `message` itself, where removing it would destroy
- * the diagnosis. This test exists so the behaviour is pinned and documented
- * rather than believed to be something it is not.
+ * The edge of the contract, now closed. `wrapPgError` used to return an
+ * unclassified SQLSTATE unchanged, so a class-22 data exception carried the
+ * bound row value straight through safe mode in the driver `message`. Class 22
+ * is now a ValidationError whose message names the column and the SQLSTATE,
+ * with the driver text redacted under safe mode and the raw error kept on
+ * `.cause` with its own message withheld. This test pins that the value is
+ * gone from every surface a logger reads.
  */
-describe("errorMessages: 'safe', the documented limit", () => {
-  it('passes an unclassified driver error (22P02) through untouched, value and all', () => {
+describe("errorMessages: 'safe', class-22 data exceptions", () => {
+  it('wraps an invalid-input driver error (22P02) as ValidationError with the value redacted', () => {
     setErrorMessageMode('safe');
     const raw = new FakeDatabaseError('22P02', `invalid input syntax for type integer: "${SECRET}"`, 'unused detail');
-    const err = wrapPgError(raw);
-    // Identity, not a wrapped copy: nothing about it is Turbine's to redact.
-    assert.equal(err, raw);
-    assert.ok((err as Error).message.includes(SECRET));
+    const err = wrapPgError(raw) as Error & { code?: string; cause?: { code?: string } };
+    assert.ok(err instanceof ValidationError, 'class 22 is a ValidationError');
+    assert.equal(err.code, 'TURBINE_E003');
+    assert.ok(!err.message.includes(SECRET), `message leaked the value: ${err.message}`);
+    assert.ok(err.message.includes('22P02'), 'message names the SQLSTATE');
+    assert.equal(err.cause?.code, '22P02', 'the raw driver error is kept on .cause');
+    assert.ok(!inspect(err, { depth: 6 }).includes(SECRET), 'util.inspect must not surface the value');
   });
 });

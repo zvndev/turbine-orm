@@ -183,6 +183,7 @@ export {
   type RelationDescriptor,
   type RelationFilter,
   type RelationLoadStrategy,
+  type RelationOrderBy,
   type RelationPickBy,
   type RelationPickOrderBy,
   type SelectResult,
