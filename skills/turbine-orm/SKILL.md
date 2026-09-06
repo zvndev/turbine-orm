@@ -244,7 +244,7 @@ where: { guildId: 4, batchRef: 'WB-0007' }              // equivalent
 
 ## Errors worth branching on
 
-Every error extends `TurbineError` and carries a stable `code`. The ones a query
+Every error Turbine raises extends `TurbineError` and carries a stable `code`; an unmapped driver SQLSTATE stays the driver's error, with that SQLSTATE on `.code`. The ones a query
 produces:
 
 | code | class | means |

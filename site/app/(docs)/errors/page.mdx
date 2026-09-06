@@ -7,7 +7,7 @@ export const metadata = {
 
 # Typed Errors
 
-Turbine throws typed errors you can catch with `instanceof` or by code. Every error extends `TurbineError` and carries a stable `readonly code` field for programmatic handling. Messages start with the same code tag (e.g. `[TURBINE_E008] …`) so logs are greppable, but **do not parse the message**; branch on `err.code` / `instanceof`. Postgres driver errors (23505, 23503, 40P01, etc.) are translated into typed classes via `wrapPgError()`.
+Turbine throws typed errors you can catch with `instanceof` or by code. Every error Turbine RAISES extends `TurbineError` and carries a stable `readonly code` field for programmatic handling. The one exception is a driver error whose SQLSTATE Turbine does not map: it reaches you as the driver's own error, with the SQLSTATE on `.code` and `.sqlstate`, in both message modes. See [unmapped SQLSTATEs](#unmapped-sqlstates) below. Messages start with the same code tag (e.g. `[TURBINE_E008] …`) so logs are greppable, but **do not parse the message**; branch on `err.code` / `instanceof`. Postgres driver errors (23505, 23503, 40P01, etc.) are translated into typed classes via `wrapPgError()`.
 
 `err.code` is the check that survives any module graph. A process that loads the package twice, once as ESM and once as CommonJS (a `"type": "commonjs"` project whose generated client is `require`d while an `.mts` entry `import`s the package, a CJS library that wraps Turbine, a Jest setup), holds two copies of every class, and a plain prototype-chain `instanceof` against the other copy is `false`. Since 0.78 `instanceof` works across copies too: every error carries a cross-copy brand and each class implements `Symbol.hasInstance` over that brand and the error's code, so `err instanceof UniqueConstraintError` is true whichever copy threw it. The code comparison needs no import at all, which makes it the right check in a shared handler or a library.
 
@@ -251,6 +251,41 @@ const db = turbine({
   connectionString: process.env.DATABASE_URL,
   errorMessages: process.env.NODE_ENV === 'development' ? 'verbose' : 'safe',
 });
+```
+
+### What safe mode redacts
+
+Safe mode redacts the four PostgreSQL error fields that can carry a row value: `detail`, `hint`, `where` (the CONTEXT line) and `internalQuery`. Each is replaced on both the returned error and on `.cause`, so nothing a logger walks holds the value. `hint` is the one most often missed, because a `RAISE ... USING HINT` interpolates whatever the function author put there, and `internalQuery` carries the text an `EXECUTE format(...)` built, bound values included.
+
+## Unmapped SQLSTATEs
+
+A driver error whose SQLSTATE has no typed class reaches you as **the driver's own error**, not a `TurbineError`. That is the same in both message modes, deliberately: `verbose` has always returned the raw error, and minting a typed error only under `safe` would make one database failure land in different `catch` branches depending on a logging setting.
+
+It carries the SQLSTATE on `.code`, and on `.sqlstate` under the name the typed errors use:
+
+```ts
+try {
+  await db.orders.findMany();
+} catch (err) {
+  if (err instanceof TurbineError) handleTyped(err);
+  else if ((err as { sqlstate?: string }).sqlstate === '42P01') runMigrations();
+}
+```
+
+Under `safe` the **message** is kept when the SQLSTATE class's grammar cannot hold a row value, and withheld when it can:
+
+| Class | Example | Message under `safe` |
+| --- | --- | --- |
+| `42` (except `42601`) | `42P01`, `42703` | kept: `relation "orders" does not exist` |
+| `08`, `3D`, `3F`, `53`, `57`, `58` | connection, catalog, resource, operator, system | kept |
+| `42601` | syntax error | withheld: the message quotes a token of the statement, and a token can be a string literal |
+| `P0001`, class `55` | `RAISE EXCEPTION` from your own function | withheld: that text is yours, and nothing here knows what is in it |
+| everything else | | withheld |
+
+A withheld message says so and names the setting that shows it:
+
+```
+Database error P0001 (driver text withheld by errorMessages: 'safe'; set errorMessages: 'verbose' to see it)
 ```
 
 ## See also
