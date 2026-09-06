@@ -284,6 +284,32 @@ export function tokenizeSql(sql: string): SqlStatement[] {
 
     // Single-quoted literal. `''` always escapes a quote; inside an E-string a
     // backslash escapes the next character too.
+    //
+    // The CONTENT is handed over as a block, exactly as a dollar-quoted body
+    // is. A routine body does not have to be dollar-quoted: `DO 'BEGIN DROP
+    // TABLE users; END'` and `CREATE FUNCTION f() ... AS 'DELETE FROM t'` are
+    // both ordinary PostgreSQL and both execute. This branch used to push
+    // NOTHING, so `SqlStatement.blocks` came back empty for them, and the
+    // destructive scanner iterates `procedural ? statement.blocks : []`: with
+    // no blocks, every procedural pass was skipped, INCLUDING the fail-closed
+    // "cannot classify" backstop. The statement was correctly recognized as
+    // procedural and then scanned against nothing, so the guard reported a
+    // clean inventory for a file that drops a table. Verified live before the
+    // fix on PostgreSQL 17: no prompt, no `--allow-destructive`, table gone.
+    //
+    // Handing over EVERY single-quoted literal, not only the ones in a
+    // procedural statement, is deliberate and costs nothing: this tokenizer
+    // does not know which statement it is in the middle of, the consumer
+    // already gates on `PROCEDURAL_STATEMENT`, and pushing more is the
+    // fail-CLOSED direction this file resolves ambiguity toward. `INSERT INTO
+    // log VALUES ('DROP TABLE x')` is unaffected because an INSERT is not
+    // procedural, which is the same reason the dollar-quoted branch above can
+    // push unconditionally.
+    //
+    // `''` is unescaped to `'` so the block lexes as the SQL it will BE when
+    // the server reads it: the payload of `DO 'BEGIN EXECUTE ''DROP TABLE
+    // t''; END'` is `EXECUTE 'DROP TABLE t'`, and a nested scan of the raw
+    // slice would see a doubled quote where a string opener belongs.
     if (ch === "'") {
       const escapes = isEscapeStringPrefix(sql, i);
       let j = i + 1;
@@ -300,6 +326,7 @@ export function tokenizeSql(sql: string): SqlStatement[] {
         j++;
       }
       const end = Math.min(j + 1, n);
+      blocks.push(sql.slice(i + 1, Math.min(j, n)).replace(/''/g, "'"));
       stripped += "''";
       code += sql.slice(i, end);
       i = end;

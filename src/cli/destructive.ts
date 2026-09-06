@@ -228,6 +228,14 @@ const RULES: Rule[] = [
       'i',
     ),
     target: (m) => `${qualified(m, 4)} (${(m[7] ?? '').toUpperCase()} on every matching statement)`,
+    // An UPDATE action is judged the way a top-level UPDATE is: destructive
+    // without a WHERE, ordinary with one. `CREATE RULE v_upd AS ON UPDATE TO v
+    // DO INSTEAD UPDATE base SET n = 1 WHERE id = 2` is the standard updatable
+    // -view idiom and was being reported, which is a false positive on a shape
+    // that appears in ordinary migrations. DELETE, TRUNCATE and DROP stay
+    // unconditional: a DELETE inside a rule destroys on every matching
+    // statement whether or not it is narrowed, and the other two take no WHERE.
+    also: (stmt) => !/\bDO\s+(?:ALSO\s+|INSTEAD\s+)?\(?\s*UPDATE\b/i.test(stmt) || !hasTopLevelWhere(stmt),
   },
   // Renames come LAST: they destroy no data, so any statement that is BOTH a
   // rename and a data-loss operation should report the data loss instead.
@@ -299,6 +307,27 @@ function matchRules(candidate: string): { kind: DestructiveKind; target: string 
     return { kind: rule.kind, target: rule.target(m) };
   }
   return null;
+}
+
+/**
+ * The DML inside `COPY (DELETE FROM t RETURNING *) TO ...`.
+ *
+ * The same trick as a data-modifying CTE, through a different wrapper: the
+ * statement reads as a COPY, which nothing here treats as destructive, and the
+ * DELETE inside it runs and empties the table. Verified live on PostgreSQL 17
+ * through node-postgres, `TO STDOUT` included, so it needs no server-side file
+ * permission and no `TO PROGRAM`. `cteSubstatements` does not reach it because
+ * that one only fires on a leading `WITH`.
+ */
+function copySubstatements(stmt: string): string[] {
+  if (!/^COPY\s*\(/i.test(stmt)) return [];
+  const open = stmt.indexOf('(');
+  if (open === -1) return [];
+  const inner = stmt.slice(open + 1, closingParenIndex(stmt, open)).trim();
+  // A `COPY (SELECT ...) TO` is the ordinary export form and destroys nothing.
+  // A leading WITH is handed on so its own CTE bodies are read by the rule
+  // above rather than being judged as one blob here.
+  return /^(?:DELETE|UPDATE|INSERT|MERGE|WITH)\b/i.test(inner) ? [inner] : [];
 }
 
 /**
@@ -406,6 +435,13 @@ interface ProceduralCandidate {
   text: string;
   /** The same statement up to the verb, bounded at the statement, never the whole body. */
   before: string;
+  /**
+   * The whole sub-statement this candidate was cut from, used as its identity.
+   * One body holds several statements, and each is judged on its own: a pass
+   * that reports one must not silence the others, and the unclassified backstop
+   * must not report a statement an earlier pass already named.
+   */
+  statementCode: string;
 }
 
 function proceduralCandidates(body: string): ProceduralCandidate[] {
@@ -418,7 +454,7 @@ function proceduralCandidates(body: string): ProceduralCandidate[] {
     const re = /\b(?:DROP|TRUNCATE|DELETE|ALTER|UPDATE|MERGE)\s/gi;
     let m: RegExpExecArray | null = re.exec(text);
     while (m !== null) {
-      out.push({ text: text.slice(m.index), before: text.slice(0, m.index) });
+      out.push({ text: text.slice(m.index), before: text.slice(0, m.index), statementCode: text });
       m = re.exec(text);
     }
   }
@@ -445,9 +481,10 @@ export function scanDestructiveSql(sql: string): DestructiveStatement[] {
     // Top level, then data-modifying CTEs, then any procedural body this
     // statement blanked. First match per statement wins, as before.
     const display = stmt.replace(/\s+/g, ' ');
-    const candidates: Array<{ text: string; display: string }> = [
+    const candidates: Array<{ text: string; display: string; statementCode?: string }> = [
       stripLeadingCtes(body),
       ...cteSubstatements(body),
+      ...copySubstatements(body).flatMap((inner) => [inner, ...cteSubstatements(inner)]),
     ].map((text) => ({
       text,
       display,
@@ -465,10 +502,21 @@ export function scanDestructiveSql(sql: string): DestructiveStatement[] {
         candidates.push({
           text: part.text,
           display: `${display} [in block: ${part.text.replace(/\s+/g, ' ').slice(0, 60)}]`,
+          statementCode: part.statementCode,
         });
         proceduralParts.push(part);
       }
     }
+
+    // Sub-statements of a procedural body that some pass has already named.
+    // ONE body holds several statements and each is judged on its own, so a
+    // pass that reports one must not silence the others: `DO $$ BEGIN EXECUTE
+    // 'ALTER TABLE t DROP COLUMN x'; EXECUTE 'D'||'ROP TABLE victim'; END $$`
+    // reported only the DROP COLUMN, and the DROP TABLE then ran under a
+    // confirmation the operator gave for something else. Equally, the
+    // unclassified backstop must not re-report a statement an earlier pass
+    // already named, which is what this set is for.
+    const spokenFor = new Set<string>();
 
     let matched = false;
     for (const candidate of candidates) {
@@ -476,9 +524,13 @@ export function scanDestructiveSql(sql: string): DestructiveStatement[] {
       if (!hit) continue;
       found.push({ statement: candidate.display, kind: hit.kind, target: hit.target });
       matched = true;
-      break;
+      if (candidate.statementCode !== undefined) spokenFor.add(candidate.statementCode);
+      // A statement outside a procedural body has exactly one verdict, as
+      // before. Inside one, keep going: the remaining sub-statements have not
+      // been judged yet.
+      if (!procedural) break;
     }
-    if (matched) continue;
+    if (matched && !procedural) continue;
 
     // Nothing matched a rule. Inside a PROCEDURAL body that is not the end of
     // the question, because the rules all need a parseable object name and
@@ -503,6 +555,7 @@ export function scanDestructiveSql(sql: string): DestructiveStatement[] {
     // it saves.
     let dynamicHit = false;
     for (const part of proceduralParts) {
+      if (spokenFor.has(part.statementCode)) continue;
       const kind = dynamicDestructiveKind(part);
       if (!kind) continue;
       found.push({
@@ -511,9 +564,8 @@ export function scanDestructiveSql(sql: string): DestructiveStatement[] {
         target: DYNAMIC_TARGET,
       });
       dynamicHit = true;
-      break;
+      spokenFor.add(part.statementCode);
     }
-    if (dynamicHit) continue;
 
     // Still nothing, in a procedural body. Every pass above needs to SEE a verb,
     // and an EXECUTE whose text is assembled so that no verb is visible
@@ -524,14 +576,15 @@ export function scanDestructiveSql(sql: string): DestructiveStatement[] {
     // the consent gate deciding in the author's favour on no evidence. So it
     // asks, with a kind whose label says exactly that.
     for (const block of procedural ? statement.blocks : []) {
-      const unreadable = unclassifiableExecute(block);
-      if (unreadable === null) continue;
-      found.push({
-        statement: `${display} [in block: ${unreadable.replace(/\s+/g, ' ').slice(0, 60)}]`,
-        kind: 'dynamic-unclassified',
-        target: DYNAMIC_TARGET,
-      });
-      break;
+      for (const unreadable of unclassifiableExecutes(block, matched || dynamicHit)) {
+        if (spokenFor.has(unreadable.code)) continue;
+        spokenFor.add(unreadable.code);
+        found.push({
+          statement: `${display} [in block: ${`EXECUTE ${unreadable.expr}`.replace(/\s+/g, ' ').slice(0, 60)}]`,
+          kind: 'dynamic-unclassified',
+          target: DYNAMIC_TARGET,
+        });
+      }
     }
   }
   return found;
@@ -548,12 +601,37 @@ const HARMLESS_OPENER =
   /^(?:SELECT|INSERT|UPDATE|CREATE|COMMENT|GRANT|REVOKE|ANALYZE|ANALYSE|REFRESH|VACUUM|REINDEX|CLUSTER|SET|RESET|SHOW|NOTIFY|LOCK|CALL|PERFORM|EXPLAIN)\b/i;
 
 /**
- * Openers the verb-anchored passes above already decide, one way or the other
- * (`ALTER TABLE ... ADD` is silent there on purpose, `DROP ...` is reported).
- * Reporting them AGAIN here would double-count, or contradict a deliberate
- * silence.
+ * Openers whose rules deliberately stay SILENT on a benign form, so silence
+ * from them is a decision rather than a failure to parse. `ALTER TABLE ... ADD
+ * COLUMN` loses nothing and is not reported on purpose; a `MERGE` without a
+ * `THEN DELETE` likewise; a `WITH` whose CTE bodies are all reads likewise.
+ * Reporting these again here would contradict that silence.
  */
-const VERB_HANDLED_OPENER = /^(?:DROP|TRUNCATE|DELETE|ALTER|MERGE|WITH)\b/i;
+const VERB_SILENT_WHEN_BENIGN = /^(?:ALTER|MERGE|WITH)\b/i;
+
+/**
+ * Openers whose rules ALWAYS report when they can read the statement. Silence
+ * from one of these is not a verdict, it is the rules failing to parse, so the
+ * skip is conditional on an earlier pass having actually reported.
+ *
+ * The shape that made the distinction necessary: two adjacent string literals
+ * are ONE string in PostgreSQL, so `EXECUTE 'DROP TABLE '\n'victims'` reads as
+ * `DROP` to the opener test while every earlier pass declines, the literal
+ * rules because a quote is not an identifier and the assembly test because
+ * continuation is lexical and carries no `||`, `concat` or `format`. The
+ * opener was trusted, the statement was skipped, and the table went.
+ */
+const VERB_ALWAYS_REPORTS = /^(?:DROP|TRUNCATE|DELETE)\b/i;
+
+/**
+ * `EXECUTE` in a position where plpgsql can begin a statement.
+ *
+ * Matched against a statement's `stripped` view, so the word can never be one
+ * that lived inside a string literal. `GRANT`/`REVOKE EXECUTE ON FUNCTION` are
+ * excluded by construction: their preceding token is a verb, not one of the
+ * introducers here.
+ */
+const EXECUTE_AT_STATEMENT_START = /(?:^|;|\bTHEN\b|\bELSE\b|\bLOOP\b|\bBEGIN\b|\bDECLARE\b)\s*EXECUTE\s/i;
 
 /**
  * Functions whose FIRST literal argument is the statement text (or its
@@ -639,18 +717,51 @@ function executeOpener(expr: string): { opener: string | null; plain: boolean } 
  * plain literal (the literal rules own it) or visibly begins with a verb some
  * other rule has already judged.
  */
-function unclassifiableExecute(body: string): string | null {
+function unclassifiableExecutes(body: string, verbPassesReported: boolean): { code: string; expr: string }[] {
+  const out: { code: string; expr: string }[] = [];
   for (const statement of tokenizeSql(body)) {
-    const code = statement.code;
-    const m = /\bEXECUTE\s+([\s\S]+)$/i.exec(code);
+    // Decide PRESENCE against `stripped`, whose literals are emptied, and read
+    // the ARGUMENT out of `code`, which keeps them. Reading both out of `code`
+    // fired on the word rather than on the statement: `RAISE NOTICE 'EXECUTE
+    // the plan'` and `INSERT INTO log(msg) VALUES ('EXECUTE me later')` both
+    // prompted, and a guard that fires on prose teaches operators to confirm
+    // without reading, which is the cost this module's own doctrine refuses to
+    // pay. `stripped` cannot contain a word that only ever appeared inside a
+    // literal, so it settles the question the offsets cannot.
+    //
+    // The keyword must also sit where a plpgsql STATEMENT can start, not
+    // merely somewhere in the text: `GRANT EXECUTE ON FUNCTION f() TO app` is
+    // an ordinary permission grant and was being reported as unreadable
+    // dynamic SQL, which fails an ordinary migration under `migrate deploy`
+    // where there is no terminal to confirm at. The introducers below are the
+    // positions plpgsql actually allows one at, since `tokenizeSql` splits on
+    // top-level semicolons and a body's `IF ... THEN EXECUTE ...` therefore
+    // arrives as one statement.
+    if (!EXECUTE_AT_STATEMENT_START.test(statement.stripped)) continue;
+    const m = /\bEXECUTE\s+([\s\S]+)$/i.exec(statement.code);
     if (!m) continue;
     const expr = m[1]!;
     const { opener, plain } = executeOpener(expr);
     if (plain) continue;
-    if (opener !== null && (HARMLESS_OPENER.test(opener) || VERB_HANDLED_OPENER.test(opener))) continue;
-    return `EXECUTE ${expr}`;
+    // `EXECUTE s` where `s` is a bare variable: the statement it runs was
+    // assembled by some EARLIER sub-statement of the same block, so when a pass
+    // has already named one, the operator has been told what this body does and
+    // a second "cannot classify" entry for the same thing is noise that
+    // contradicts the first. When nothing was named, this is the whole finding
+    // and it stands: an assignment the rules could not read leaves
+    // `verbPassesReported` false.
+    if (opener === null && verbPassesReported && /^[A-Za-z_]\w*\s*;?$/.test(expr.trim())) continue;
+    if (opener !== null) {
+      if (HARMLESS_OPENER.test(opener)) continue;
+      if (VERB_SILENT_WHEN_BENIGN.test(opener)) continue;
+      // The remaining skip is a claim that an earlier pass already reported
+      // this statement, so it holds only when one actually did. See
+      // VERB_ALWAYS_REPORTS for the shape where none does.
+      if (verbPassesReported && VERB_ALWAYS_REPORTS.test(opener)) continue;
+    }
+    out.push({ code: statement.code, expr });
   }
-  return null;
+  return out;
 }
 
 /** Shown in place of an object name that does not exist until the block runs. */
