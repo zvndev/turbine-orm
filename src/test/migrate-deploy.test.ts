@@ -92,28 +92,78 @@ describe('turbine migrate deploy', () => {
 // --step is a count, so it is a positive integer or it is a mistake
 // ---------------------------------------------------------------------------
 
+/**
+ * `parseArgs` with `process.exit` and both streams captured.
+ *
+ * A refused flag VALUE goes through `failArg` (banner, red line, hints) and
+ * exits, the same path every other flag refusal takes, so it cannot be observed
+ * with `assert.throws`. `--step` used to throw a bare `ValidationError` past
+ * `main()` instead, which printed one unstyled sentence with no banner.
+ */
+const EXITED = Symbol('process.exit called');
+
+function runParse(argv: string[]): { step?: number; exited: number | null; stderr: string } {
+  const realError = console.error;
+  const realLog = console.log;
+  const realExit = process.exit;
+  const err: string[] = [];
+  let exited: number | null = null;
+  let step: number | undefined;
+  console.error = (...parts: unknown[]) => {
+    err.push(parts.map(String).join(' '));
+  };
+  console.log = () => {};
+  process.exit = ((code?: number) => {
+    exited = code ?? 0;
+    throw EXITED;
+  }) as unknown as typeof process.exit;
+  try {
+    step = parseArgs(argv).step;
+  } catch (e) {
+    if (e !== EXITED) throw e;
+  } finally {
+    console.error = realError;
+    console.log = realLog;
+    process.exit = realExit;
+  }
+  return { step, exited, stderr: err.join('\n') };
+}
+
 describe('parseArgs: --step', () => {
   it('accepts a positive whole number', () => {
-    assert.equal(parseArgs(['migrate', 'down', '--step', '3']).step, 3);
-    assert.equal(parseArgs(['migrate', 'down', '-n', '1']).step, 1);
+    assert.equal(runParse(['migrate', 'down', '--step', '3']).step, 3);
+    assert.equal(runParse(['migrate', 'down', '-n', '1']).step, 1);
   });
 
   it('refuses a negative step, which used to mean "everything except the oldest"', () => {
     // `applied.reverse().slice(0, -1)` is every migration but one, and with
     // --allow-destructive in a script it began tearing the history down.
-    assert.throws(() => parseArgs(['migrate', 'down', '--step', '-1']), /TURBINE_E003[\s\S]*positive whole number/);
+    const { exited, stderr, step } = runParse(['migrate', 'down', '--step', '-1']);
+    assert.equal(exited, 1);
+    assert.equal(step, undefined, 'a refused value must never reach the command');
+    assert.match(stderr, /--step/);
+    assert.match(stderr, /positive whole number/);
   });
 
   it('refuses 0 and a non-number, which used to be silent no-ops that look like success', () => {
-    assert.throws(() => parseArgs(['migrate', 'down', '--step', '0']), /TURBINE_E003/);
-    assert.throws(() => parseArgs(['migrate', 'down', '--step', 'abc']), /TURBINE_E003/);
-    assert.throws(() => parseArgs(['migrate', 'down', '--step', '1.5']), /TURBINE_E003/);
-    assert.throws(() => parseArgs(['migrate', 'down', '--step']), /TURBINE_E003/);
+    for (const value of [['0'], ['abc'], ['1.5'], []]) {
+      const { exited, step } = runParse(['migrate', 'down', '--step', ...value]);
+      assert.equal(exited, 1, `--step ${value[0] ?? '(nothing)'} must be refused`);
+      assert.equal(step, undefined);
+    }
   });
 
   it('names the offending value so the message is actionable', () => {
-    assert.throws(() => parseArgs(['migrate', 'down', '--step', 'abc']), /"abc"/);
-    assert.throws(() => parseArgs(['migrate', 'down', '--step']), /\(nothing\)/);
+    assert.match(runParse(['migrate', 'down', '--step', 'abc']).stderr, /"abc"/);
+    assert.match(runParse(['migrate', 'down', '--step']).stderr, /\(nothing\)/);
+  });
+
+  it('does not fire for an UNKNOWN command, whose misspelling is the real problem', () => {
+    // `turbine genrate --step 0` used to report a `--step` problem and never
+    // mention the command. Fixing `--step` would not have helped.
+    const { exited, stderr } = runParse(['genrate', '--step', '0']);
+    assert.equal(exited, null, 'flag-value validation must not run for an unrecognized command');
+    assert.equal(stderr, '');
   });
 });
 

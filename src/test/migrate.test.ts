@@ -23,6 +23,7 @@ import {
   deriveLockId,
   findTransactionControlStatements,
   formatTimestamp,
+  getCurrentDatabaseName,
   getPendingMigrations,
   headerSafeName,
   isChecksumValid,
@@ -1078,6 +1079,43 @@ describe('deriveLockId', () => {
     const names = Array.from({ length: 500 }, (_, i) => `app_tenant_${i}`);
     const ids = new Set(names.map(deriveLockId));
     assert.equal(ids.size, names.length, 'FNV-1a collided on sequential database names');
+  });
+});
+
+describe('getCurrentDatabaseName', () => {
+  // The value `deriveLockId` is given. The block above pins what the derivation
+  // does with a name; this pins where the name comes from, and the pair is the
+  // claim. It is asked of `current_database()` rather than parsed out of the
+  // connection string, because the string may carry no database path at all (a
+  // PGDATABASE default, a service file, a .pgpass entry) and every such
+  // database would then share one lock id.
+  const client = (rows: { current_database?: string }[]) => {
+    const asked: string[] = [];
+    return {
+      asked,
+      query: async (sql: string) => {
+        asked.push(sql);
+        return { rows };
+      },
+    };
+  };
+
+  it('reads the name from the server, not from the connection string', async () => {
+    const c = client([{ current_database: 'turbine_test' }]);
+    assert.equal(await getCurrentDatabaseName(c), 'turbine_test');
+    assert.deepEqual(c.asked, ['SELECT current_database()']);
+  });
+
+  it('an answer it cannot read becomes the empty name, and that name is still lockable', async () => {
+    // Not a throw, deliberately: the migration would then fail on a diagnostic
+    // rather than on anything the user did. The cost is that two unreadable
+    // answers share one lock, which is over-serialising and safe, and the id
+    // still has to be a legal one, so assert that rather than assume it.
+    for (const rows of [[], [{}], [{ current_database: undefined }]]) {
+      assert.equal(await getCurrentDatabaseName(client(rows)), '', JSON.stringify(rows));
+    }
+    const id = deriveLockId('');
+    assert.ok(Number.isSafeInteger(id) && id >= 0 && id <= 0x7fffffff, `empty name produced ${id}`);
   });
 });
 

@@ -18,7 +18,7 @@ import { join } from 'node:path';
 import pg from 'pg';
 import type { DatabaseAdapter } from '../adapters/index.js';
 import { postgresql } from '../adapters/index.js';
-import { isPlainSchemaIdentifier, withSearchPathOption } from '../connection-url.js';
+import { isPlainSchemaIdentifier, parseSearchPathValue, withSearchPathOption } from '../connection-url.js';
 import { type Dialect, postgresDialect } from '../dialect.js';
 import { MigrationError, ValidationError } from '../errors.js';
 import type { PgCompatQueryResult } from '../pg-types.js';
@@ -273,8 +273,20 @@ export async function readAppliedMigrations(
   client: MigrationQueryClient,
   dialect: Dialect = postgresDialect,
 ): Promise<{ applied: AppliedMigration[]; trackingTableExists: boolean }> {
+  // Asked of the schema the tracking table would be CREATED in, not of the
+  // whole search_path. Since a pin EXTENDS the caller's path
+  // (`connectionStringForSchema`), a bare `to_regclass('_turbine_migrations')`
+  // matches the FIRST such table anywhere on it, so a project moving to
+  // `schema: 'app'` with an old `public._turbine_migrations` still around read
+  // public's rows and reported them as app's. `ensureTrackingTable` has no such
+  // ambiguity: `CREATE TABLE IF NOT EXISTS` tests the CREATION target, which is
+  // `current_schema()`, and creates there even when the name is visible further
+  // down the path (measured). So this asks the writer's question. When it says
+  // present, the unqualified SELECT below resolves to that same table:
+  // `current_schema()` is the first EXISTING entry, and a table there shadows
+  // any later one.
   const present = await client.query<{ present: boolean }>(
-    `SELECT to_regclass(${dialect.paramPlaceholder(1)}) IS NOT NULL AS present`,
+    `SELECT to_regclass(quote_ident(current_schema()) || '.' || quote_ident(${dialect.paramPlaceholder(1)})) IS NOT NULL AS present`,
     [TRACKING_TABLE],
   );
   if (present.rows[0]?.present !== true) return { applied: [], trackingTableExists: false };
@@ -898,9 +910,22 @@ export function deriveLockId(databaseName: string): number {
  * Fetch the current database name from the connected client. Used to derive
  * the advisory lock ID so concurrent migrations in sibling databases do not
  * contend on one another.
+ *
+ * Asked of `current_database()` and NOT parsed out of the connection string:
+ * the string may carry no path at all (a `PGDATABASE` environment default, a
+ * service file, a `.pgpass` entry), and a lock id derived from an empty name
+ * would put every such database on ONE lock. The empty-string fallback is the
+ * same hazard one step further in, so it is here to be seen rather than to be
+ * relied on.
+ *
+ * @internal exported for tests. `deriveLockId` is tested for stability and for
+ * staying inside the positive int4 range; this is the value it is given, and an
+ * untested input to a tested function is an untested pair.
  */
-async function getCurrentDatabaseName(client: pg.Client): Promise<string> {
-  const result = await client.query<{ current_database: string }>(`SELECT current_database()`);
+export async function getCurrentDatabaseName(client: {
+  query: (sql: string) => Promise<{ rows: { current_database?: string }[] }>;
+}): Promise<string> {
+  const result = await client.query(`SELECT current_database()`);
   return result.rows[0]?.current_database ?? '';
 }
 
@@ -908,16 +933,28 @@ async function getCurrentDatabaseName(client: pg.Client): Promise<string> {
  * The connection string the migration runner (and `turbine seed`) connects
  * with for a configured schema: unchanged for the default, pinned otherwise.
  *
- * `public` and "not configured" are the same case and emit NOTHING, so a project
- * that never set `schema` connects byte-for-byte as it always has, resolving
- * through the role's own search_path. Any other schema is applied as the
- * `options=-c search_path="<schema>"` startup parameter through
+ * "Not configured" emits NOTHING: with no `schema` at all the role's own
+ * search_path decides, as it always has. A CONFIGURED schema is applied as the
+ * `options=-c search_path=...` startup parameter through
  * {@link withSearchPathOption}, never as a `SET`, so the migration's own DDL,
  * its `_turbine_migrations` tracking table, and the lock connection all resolve
  * unqualified names in the schema the rest of the CLI (`push`, `generate`,
  * `doctor`, Studio) already reads. Before this the runner had no schema at all,
  * and a code-first project on `schema: 'app'` pushed its tables into `app`,
  * diffed against `app`, and then applied the resulting migration into `public`.
+ *
+ * `public` is pinned like any other name, and used to be exempted on the
+ * reasoning that it is the default anyway. It is not: `search_path` is a
+ * role/database/connection-string setting, so on a role whose path is
+ * `app, public` a project configured `schema: 'public'` had `push` creating in
+ * `public` (its own pin is unconditional) while `migrate up` created in `app`.
+ * That is the same split this function exists to close, reintroduced for the
+ * one schema most projects actually use. `schema-sql.ts`'s `pinSearchPath` is
+ * the other half of the rule and the two now answer identically: pin
+ * unconditionally, and EXTEND the caller's path rather than replace it. The
+ * extension is why `inheritedSchemas` exists, since a startup parameter cannot
+ * read the path it is about to override; {@link connectMigrationClient} probes
+ * for it. Left empty, the emitted parameter is byte-identical to before.
  *
  * The helper is a pure leaf and returns `null` for a name it cannot emit safely
  * or a string it cannot rewrite; here each becomes the E003 the rest of the CLI
@@ -926,15 +963,36 @@ async function getCurrentDatabaseName(client: pg.Client): Promise<string> {
  *
  * @internal exported for the seed runner and tests.
  */
-export function connectionStringForSchema(connectionString: string, schema?: string): string {
-  if (schema === undefined || schema === '' || schema === 'public') return connectionString;
-  if (!isPlainSchemaIdentifier(schema)) {
-    throw new ValidationError(
-      `Cannot pin search_path to "${schema}": a schema name used as a connection parameter must be a plain ` +
-        `identifier (letters, digits, "_" and "$", not starting with a digit).`,
-    );
-  }
-  const pinned = withSearchPathOption(connectionString, schema);
+/**
+ * Refuse a configured schema NAME the CLI cannot emit into a connection
+ * parameter, before anything opens a connection with it.
+ *
+ * Separate from {@link assertSchemaExists}, and it has to run FIRST: they answer
+ * different questions and only one of them has a useful answer for a name like
+ * `bad name`. Asking the catalog first reports "schema does not exist" and
+ * suggests `CREATE SCHEMA "bad name"`, which is true and useless; the real
+ * problem is that a value carrying whitespace cannot go into `options=-c` at
+ * all, because libpq splits that parameter on spaces and a second `-c` would
+ * set any GUC it liked.
+ *
+ * @internal exported for tests.
+ */
+export function assertPinnableSchema(schema: string): void {
+  if (isPlainSchemaIdentifier(schema)) return;
+  throw new ValidationError(
+    `Cannot pin search_path to "${schema}": a schema name used as a connection parameter must be a plain ` +
+      `identifier (letters, digits, "_" and "$", not starting with a digit).`,
+  );
+}
+
+export function connectionStringForSchema(
+  connectionString: string,
+  schema?: string,
+  inheritedSchemas: readonly string[] = [],
+): string {
+  if (schema === undefined || schema === '') return connectionString;
+  assertPinnableSchema(schema);
+  const pinned = withSearchPathOption(connectionString, schema, inheritedSchemas);
   if (pinned === null) {
     throw new ValidationError(
       'Cannot pin search_path on a connection string that is not a URL (expected postgres://... or postgresql://...).',
@@ -944,41 +1002,79 @@ export function connectionStringForSchema(connectionString: string, schema?: str
 }
 
 /**
+ * Refuse a configured schema that does not exist in this database.
+ *
+ * Postgres does not validate `search_path`: pinning it to a namespace that does
+ * not exist succeeds, and the first unqualified statement then fails with
+ * `relation "..." does not exist` or "no schema has been selected to create in",
+ * neither of which names the schema or the setting that caused it. This is the
+ * ONE place that question is asked, and it is asked of the CATALOG
+ * (`to_regnamespace`, bound as a parameter) rather than of the connection's own
+ * resolved `current_schema()`, so it gives the same answer whether the client
+ * calling it is pinned or not. That is what lets `turbine seed` use it: the seed
+ * runs its callback in a child process and could not have been checked through
+ * the pin at all.
+ *
+ * @internal exported for the seed runner and tests.
+ */
+export async function assertSchemaExists(client: MigrationQueryClient, schema: string): Promise<void> {
+  const present = await client.query<{ present: boolean }>('SELECT to_regnamespace($1) IS NOT NULL AS present', [
+    schema,
+  ]);
+  if (present.rows[0]?.present === true) return;
+  throw new MigrationError(
+    `Schema "${schema}" does not exist in this database. ` +
+      `Postgres accepts a missing namespace in search_path without complaint, so running anyway would ` +
+      `fail on the first unqualified statement with a message that names neither. ` +
+      `Create the schema first (CREATE SCHEMA "${schema}"), or correct the schema name in turbine.config.ts ` +
+      `(or the --schema flag).`,
+  );
+}
+
+/**
  * Open the runner's primary connection for `schema`, and hand back the string
  * the second (lock-only) connection must use too.
  *
- * Postgres does not validate `search_path`: pinning it to a namespace that does
- * not exist succeeds, and the first unqualified CREATE then fails with "no
- * schema has been selected to create in", which names neither the schema nor
- * the setting. `current_schema()` is NULL in exactly that state, so a pinned
- * connection is checked once, up front, and refused with a message that says
- * what to create. Unpinned connections are not checked: there the role's own
- * path decides, as it always has.
+ * TWO connections are opened when a schema is configured, and the first one is
+ * not an accident. A `search_path` startup parameter is in force before the
+ * connection's first statement, which is exactly what makes it safe (it cannot
+ * leak onto a pooled backend the way a `SET` does) and exactly what stops it
+ * reading the path it is about to override. So the probe connects with the
+ * caller's string untouched, asks the two questions that need the caller's own
+ * view (does the schema exist, and what does this connection resolve through),
+ * and closes; the real connection is then pinned to the target FOLLOWED BY what
+ * the probe saw. Without the second half, pinning breaks any migration that
+ * names an extension type unqualified, because `citext` / `vector` / `postgis`
+ * live in a schema the pin had discarded.
  */
 async function connectMigrationClient(
   connectionString: string,
   schema: string | undefined,
 ): Promise<{ client: pg.Client; connectionString: string }> {
-  const pinned = connectionStringForSchema(connectionString, schema);
+  const inherited = schema === undefined || schema === '' ? [] : await probeConnectionSchemas(connectionString, schema);
+  const pinned = connectionStringForSchema(connectionString, schema, inherited);
   const client = new pg.Client({ connectionString: pinned });
   await client.connect();
-  if (pinned !== connectionString && schema !== undefined) {
-    try {
-      const resolved = await client.query<{ current_schema: string | null }>('SELECT current_schema()');
-      if (resolved.rows[0]?.current_schema == null) {
-        throw new MigrationError(
-          `Schema "${schema}" does not exist in this database. ` +
-            `Postgres accepts a missing namespace in search_path without complaint, so running anyway would ` +
-            `fail on the first unqualified statement with a message that names neither. ` +
-            `Create the schema first (CREATE SCHEMA "${schema}") or correct the configured schema name.`,
-        );
-      }
-    } catch (err) {
-      await client.end();
-      throw err;
-    }
-  }
   return { client, connectionString: pinned };
+}
+
+/**
+ * Ask an UNPINNED connection the two questions a pin cannot answer for itself,
+ * and close it again.
+ */
+async function probeConnectionSchemas(connectionString: string, schema: string): Promise<string[]> {
+  // Before the connection, not after: a name that cannot be pinned has to say
+  // so in those terms, see assertPinnableSchema.
+  assertPinnableSchema(schema);
+  const probe = new pg.Client({ connectionString });
+  await probe.connect();
+  try {
+    await assertSchemaExists(probe, schema);
+    const shown = await probe.query<{ search_path: string }>('SHOW search_path');
+    return parseSearchPathValue(shown.rows[0]?.search_path ?? '');
+  } finally {
+    await probe.end();
+  }
 }
 
 /** Open the second, lock-only connection. Separated so tests can fake it. */
@@ -1200,9 +1296,37 @@ export async function validateChecksums(
   dialect: Dialect = postgresDialect,
 ): Promise<ChecksumMismatch[]> {
   const applied = await getAppliedMigrations(client, dialect);
+  const { mismatches, legacyUpgrades } = compareAppliedChecksums(applied, migrationsDir);
+  for (const upgrade of legacyUpgrades) {
+    await client.query(dialect.buildMigrationUpdateChecksum(quotedTrackingTable(dialect)), [
+      upgrade.checksum,
+      upgrade.name,
+    ]);
+  }
+  return mismatches;
+}
+
+/**
+ * THE drift comparison, over rows already read: which applied migrations no
+ * longer match their file, and which are merely carrying a pre-v0.6 hash.
+ *
+ * Split out of {@link validateChecksums} so a DRY RUN can ask the same question
+ * without answering it in the database. `validateChecksums` reads through
+ * `getAppliedMigrations`, which CREATES the tracking table, and then WRITES the
+ * legacy-hash upgrades; a preview must do neither. A dry run that re-derived
+ * drift its own way is how `migrate down --dry-run` came to green-light a batch
+ * the real command refuses, so the rule lives here once and both paths call it.
+ *
+ * @internal exported for tests.
+ */
+export function compareAppliedChecksums(
+  applied: readonly AppliedMigration[],
+  migrationsDir: string,
+): { mismatches: ChecksumMismatch[]; legacyUpgrades: Array<{ name: string; checksum: string }> } {
   const allFiles = listMigrationFiles(migrationsDir);
   const fileMap = new Map(allFiles.map((f) => [f.name, f]));
   const mismatches: ChecksumMismatch[] = [];
+  const legacyUpgrades: Array<{ name: string; checksum: string }> = [];
 
   for (const migration of applied) {
     const file = fileMap.get(migration.name);
@@ -1223,10 +1347,7 @@ export async function validateChecksums(
       // matches what was stored. A legacy row whose file HAS changed falls
       // through to the mismatch path below (bypassable with --allow-drift).
       if (canUpgradeLegacyChecksum(migration.checksum, content)) {
-        await client.query(dialect.buildMigrationUpdateChecksum(quotedTrackingTable(dialect)), [
-          currentHash,
-          migration.name,
-        ]);
+        legacyUpgrades.push({ name: migration.name, checksum: currentHash });
         continue;
       }
       mismatches.push({
@@ -1238,7 +1359,7 @@ export async function validateChecksums(
     }
   }
 
-  return mismatches;
+  return { mismatches, legacyUpgrades };
 }
 
 /**
@@ -1300,16 +1421,28 @@ export function formatChecksumMismatchError(
   }
   lines.push('');
   lines.push('Fix one of these:');
-  lines.push('  1. Restore the file(s) to their original content, OR');
-  if (modified.length > 0) {
-    // `migrate down` needs the file on disk to read its DOWN section, so it is
-    // only a remedy for MODIFIED files, never for deleted ones.
-    lines.push('  2. Roll back the affected migrations with `npx turbine migrate down` (modified files only), OR');
+  const remedies = ['Restore the file(s) to their original content'];
+  // `migrate down` needs the file on disk to read its DOWN section, so it is
+  // only a remedy for MODIFIED files, never for deleted ones. It is also not a
+  // remedy for `down` ITSELF: offering the command that just refused sends the
+  // reader in a circle.
+  if (modified.length > 0 && action === 'apply pending migrations') {
+    remedies.push('Roll back the affected migrations with `npx turbine migrate down` (modified files only)');
   }
   if (missing.length > 0) {
-    lines.push('     (deleted files cannot be rolled back: restore the file, then run `migrate down` if needed), OR');
+    remedies.push('Restore each deleted file (a deleted migration cannot be rolled back: its DOWN is gone)');
   }
-  lines.push('  3. Pass `--allow-drift` to bypass this check (advanced, make sure you know what you are doing).');
+  // The flag no longer skips the check, it RE-BASELINES: validation still runs
+  // and its result is written back to `_turbine_migrations`. Said three
+  // different ways in one release ("disabled", "bypass", "re-baseline"), only
+  // the last of which was true, so every copy of it now says the same thing.
+  remedies.push(
+    'Pass `--allow-drift` to record the on-disk content as the applied state ' +
+      '(advanced: it REWRITES migration history, and the SQL that already ran is not re-run)',
+  );
+  for (const [index, remedy] of remedies.entries()) {
+    lines.push(`  ${index + 1}. ${remedy}${index === remedies.length - 1 ? '.' : ', OR'}`);
+  }
   return lines.join('\n');
 }
 
@@ -1718,12 +1851,24 @@ export async function rollbackMigrations(
 export async function planMigrationRollback(
   connectionString: string,
   migrationsDir: string,
-  options?: { step?: number; schema?: string },
+  options?: { step?: number; schema?: string; allowDrift?: boolean },
 ): Promise<{ toRollback: MigrationFile[]; stoppedAt: { name: string; error: string } | null }> {
   const { client } = await connectMigrationClient(connectionString, options?.schema);
   const dialect = migrationDialect();
   try {
     const { applied } = await readAppliedMigrations(client, dialect);
+
+    // The drift gate the real rollback runs, asked of the same rows by the same
+    // function. Without it the preview reported a batch `migrate down` refuses
+    // outright, which is the failure this whole function exists to prevent: a
+    // dry run that disagrees with the run is not a dry run. Read-only, so the
+    // legacy-hash upgrades `validateChecksums` would write are left for the
+    // real run; they are not drift and never reach the refusal.
+    if (options?.allowDrift !== true) {
+      const { mismatches } = compareAppliedChecksums(applied, migrationsDir);
+      if (mismatches.length > 0) throw new MigrationError(formatChecksumMismatchError(mismatches, 'roll back'));
+    }
+
     const fileMap = new Map(listMigrationFiles(migrationsDir).map((f) => [f.name, f]));
     const batch = applied.reverse().slice(0, options?.step ?? 1);
 
@@ -1793,13 +1938,16 @@ export async function migrateDown(
       // that runs is read from the CURRENT file, so rolling back a drifted
       // migration executes SQL that was never the applied file's DOWN. This
       // used to happen with no check and no warning.
+      // VALIDATED here, REBASELINED further down. The two used to happen
+      // together, above every gate, so a rollback the destructive gate then
+      // refused had already rewritten `_turbine_migrations` by the time the CLI
+      // printed "nothing was rolled back and no data was touched". A refusal
+      // must touch nothing, which means the only write on this path happens
+      // after the last thing that can refuse.
       const rebaselined: RebaselinedChecksum[] = [];
       const mismatches = await validateChecksums(client, migrationsDir, dialect);
-      if (mismatches.length > 0) {
-        if (options?.allowDrift !== true) {
-          throw new MigrationError(formatChecksumMismatchError(mismatches, 'roll back'));
-        }
-        rebaselined.push(...(await rebaselineChecksums(client, migrationsDir, mismatches, dialect)));
+      if (mismatches.length > 0 && options?.allowDrift !== true) {
+        throw new MigrationError(formatChecksumMismatchError(mismatches, 'roll back'));
       }
 
       const applied = await getAppliedMigrations(client, dialect);
@@ -1847,6 +1995,12 @@ export async function migrateDown(
           lines.push('--allow-destructive, or set allowDestructive: true programmatically.');
           throw new MigrationError(lines.join('\n'));
         }
+      }
+
+      // Past every gate: nothing below this line can refuse, so the history
+      // rewrite `--allow-drift` asks for is finally safe to perform.
+      if (mismatches.length > 0) {
+        rebaselined.push(...(await rebaselineChecksums(client, migrationsDir, mismatches, dialect)));
       }
 
       const result = await rollbackMigrations(

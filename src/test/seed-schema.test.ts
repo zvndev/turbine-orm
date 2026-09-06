@@ -20,9 +20,10 @@ import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
 import { pathToFileURL } from 'node:url';
 import pg from 'pg';
-import { connectionStringForSchema } from '../cli/migrate.js';
+import { assertSchemaExists, connectionStringForSchema, type MigrationQueryClient } from '../cli/migrate.js';
 import { TurbineClient } from '../client.js';
-import { isPlainSchemaIdentifier, withSearchPathOption } from '../connection-url.js';
+import { isPlainSchemaIdentifier, parseSearchPathValue, withSearchPathOption } from '../connection-url.js';
+import { MigrationError } from '../errors.js';
 import { skipGate } from './helpers.js';
 
 const options = (url: string | null): string | null =>
@@ -92,16 +93,86 @@ describe('withSearchPathOption: the URL rewrite', () => {
   });
 });
 
-describe('connectionStringForSchema: the default is unpinned, everything else is', () => {
-  it('undefined, the empty string and `public` all return the input by reference', () => {
+describe('parseSearchPathValue: reading the path a connection already has', () => {
+  it('splits on commas outside quotes and un-doubles an escaped quote', () => {
+    assert.deepEqual(parseSearchPathValue('"$user", public'), ['$user', 'public']);
+    assert.deepEqual(parseSearchPathValue('app,public'), ['app', 'public']);
+    assert.deepEqual(parseSearchPathValue('a, "b, c", d'), ['a', 'b, c', 'd']);
+    assert.deepEqual(parseSearchPathValue('"we""ird", x'), ['we"ird', 'x']);
+  });
+
+  it('yields nothing for an empty path, which `SHOW` can render as an empty identifier', () => {
+    assert.deepEqual(parseSearchPathValue(''), []);
+    assert.deepEqual(parseSearchPathValue('""'), []);
+    assert.deepEqual(parseSearchPathValue('"", public'), ['public']);
+  });
+});
+
+describe('connectionStringForSchema: only "not configured" is unpinned', () => {
+  it('undefined and the empty string return the input by reference', () => {
     const url = 'postgres://u:p@h/db';
     assert.equal(connectionStringForSchema(url, undefined), url);
     assert.equal(connectionStringForSchema(url, ''), url);
-    assert.equal(connectionStringForSchema(url, 'public'), url);
   });
 
-  it('any other schema is pinned', () => {
+  it('every configured schema is pinned, `public` included', () => {
+    // `public` used to be exempted here on the reasoning that it is the default
+    // anyway. It is not: `search_path` is a role/database/connection-string
+    // setting, so on a role whose path is `app, public` a project configured
+    // `schema: 'public'` had `push` creating in public (its pin is
+    // unconditional) and `migrate up` creating in app. Two authorities on one
+    // question; the answer is `push`'s, so `public` is pinned like any other.
     assert.equal(options(connectionStringForSchema('postgres://u:p@h/db', 'qa78_ns')), '-c search_path="qa78_ns"');
+    assert.equal(options(connectionStringForSchema('postgres://u:p@h/db', 'public')), '-c search_path="public"');
+  });
+
+  it("the pin EXTENDS the connection's own path rather than replacing it", () => {
+    // The other half of the same rule. Pinning the target ALONE means an
+    // extension type installed in its own schema (`citext`, `vector`,
+    // `postgis`) stops resolving, so a migration that ran fine unpinned fails
+    // under the pin with `type "..." does not exist`. The target still comes
+    // FIRST, which is what decides where an unqualified CREATE lands.
+    assert.equal(
+      options(connectionStringForSchema('postgres://u:p@h/db', 'app', ['public', 'extensions'])),
+      '-c search_path="app","public","extensions"',
+    );
+    // The target is not repeated when the inherited path already names it.
+    assert.equal(
+      options(connectionStringForSchema('postgres://u:p@h/db', 'public', ['public', 'extensions'])),
+      '-c search_path="public","extensions"',
+    );
+  });
+
+  it('drops an inherited name it cannot emit safely, rather than escaping it', () => {
+    // The emitted value is a LITERAL inside `options=-c`, which libpq splits on
+    // whitespace, so a name carrying a space could carry a second `-c` and set
+    // any GUC it liked. Inherited names come from the server, but the alphabet
+    // is what makes the literal safe and it is not relaxed for them. Dropping
+    // is monotone: before this parameter existed, ALL of them were dropped.
+    for (const hostile of ['x -c log_statement=all', 'a"b', "a'b", 'a b', 'a\\b', '-c', 'a,b', '1abc', 'a\nb', '']) {
+      assert.equal(
+        options(connectionStringForSchema('postgres://u:p@h/db', 'app', [hostile])),
+        '-c search_path="app"',
+        JSON.stringify(hostile),
+      );
+    }
+    // `$user` is the one name outside the pattern that is still emitted: it is
+    // Postgres's own token, leads the default path nearly everywhere, and
+    // carries no whitespace, quote or backslash.
+    assert.equal(
+      options(connectionStringForSchema('postgres://u:p@h/db', 'app', ['$user', 'public'])),
+      '-c search_path="app","$user","public"',
+    );
+  });
+
+  it('a hostile TARGET is still refused outright (the validator did not move)', () => {
+    for (const bad of ['x -c log_statement=all', 'a"b', 'a b', '1abc', 'pg;drop']) {
+      assert.throws(
+        () => connectionStringForSchema('postgres://u:p@h/db', bad, ['public']),
+        /TURBINE_E003/,
+        JSON.stringify(bad),
+      );
+    }
   });
 
   it('a name or a string the leaf refuses surfaces as ValidationError E003, with the reason', () => {
@@ -210,5 +281,68 @@ describe('seed runs in the configured schema (integration)', () => {
     const { code } = runSeedCli(dir, ['--url', url!, '--schema', 'qa78_missing_ns']);
     assert.notEqual(code, 0);
     assert.deepEqual(await tableSchemas('qa78_seeded_missing'), []);
+  });
+});
+
+/**
+ * `assertSchemaExists` on its own, with a fake client and no database.
+ *
+ * The live half above proves the CLI refuses; this proves the refusal is asked
+ * of the CATALOG rather than of the connection's resolved `current_schema()`,
+ * which is the property that lets a pinned migration client and an unpinned
+ * seed probe get the same answer. A fake is the only way to see the SQL and the
+ * bound parameter, and the whole rule is in those two.
+ */
+interface Asked {
+  sql: string;
+  params: unknown[];
+}
+
+describe('assertSchemaExists asks the catalog, and its refusal names the schema', () => {
+  /** Records what it was asked, and answers with whatever `rows` the test gives. */
+  const fakeClient = (rows: Record<string, unknown>[]): MigrationQueryClient & { asked: Asked[] } => {
+    const asked: Asked[] = [];
+    return {
+      asked,
+      query: async <R = Record<string, unknown>>(sql: string, params?: unknown[]) => {
+        asked.push({ sql, params: params ?? [] });
+        return { rows: rows as R[], rowCount: rows.length, command: 'SELECT', fields: [] };
+      },
+    };
+  };
+
+  it('a present schema returns, having asked to_regnamespace with the name BOUND', async () => {
+    const client = fakeClient([{ present: true }]);
+    await assertSchemaExists(client, 'app');
+    assert.equal(client.asked.length, 1);
+    assert.match(client.asked[0]!.sql, /to_regnamespace\(\$1\)/);
+    assert.deepEqual(client.asked[0]!.params, ['app']);
+    // Not current_schema(): that answers for the CONNECTION, so a pinned client
+    // and an unpinned one would disagree about the same database.
+    assert.doesNotMatch(client.asked[0]!.sql, /current_schema/);
+  });
+
+  it('a missing schema throws E006 naming the schema, the CREATE and the config key', async () => {
+    const client = fakeClient([{ present: false }]);
+    await assert.rejects(
+      () => assertSchemaExists(client, 'no_such_ns'),
+      (err: unknown) => {
+        assert.ok(err instanceof MigrationError, `expected MigrationError, got ${String(err)}`);
+        assert.equal(err.code, 'TURBINE_E006');
+        assert.match(err.message, /"no_such_ns"/);
+        assert.match(err.message, /CREATE SCHEMA "no_such_ns"/);
+        assert.match(err.message, /turbine\.config\.ts/);
+        return true;
+      },
+    );
+  });
+
+  it('an unreadable answer is a refusal, not a pass', async () => {
+    // `rows[0]` absent, or `present` anything but exactly true. A helper that
+    // treated an unparseable answer as "yes" would be a guard that fails OPEN
+    // on the one input it cannot interpret.
+    for (const rows of [[], [{}], [{ present: null }], [{ present: 'true' }]] as Record<string, unknown>[][]) {
+      await assert.rejects(() => assertSchemaExists(fakeClient(rows), 'app'), MigrationError, JSON.stringify(rows));
+    }
   });
 });

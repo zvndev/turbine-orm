@@ -387,6 +387,93 @@ export function isPlainSchemaIdentifier(schema: string): boolean {
 }
 
 /**
+ * The one name outside {@link SEARCH_PATH_SCHEMA_PATTERN} that is still safe to
+ * emit into the `options=-c` literal, and worth keeping.
+ *
+ * `$user` is Postgres's own token for "the schema named after the current
+ * role", and it leads the default `search_path` on nearly every installation.
+ * The pattern refuses it because a name may not START with `$`, which is right
+ * for a CALLER-supplied schema; dropping it from an inherited path, however,
+ * silently changes name resolution. It carries no whitespace, no quote and no
+ * backslash, so it cannot smuggle a second `-c`, which is the only property the
+ * literal needs.
+ */
+const SEARCH_PATH_USER_TOKEN = '$user';
+
+/**
+ * The schema names in a `SHOW search_path` value, unquoted.
+ *
+ * Postgres renders the GUC as a comma-separated identifier list, quoting only
+ * the entries that need it, so this splits on commas OUTSIDE double quotes and
+ * un-doubles `""`. Anything the caller cannot safely re-emit is dropped by
+ * {@link searchPathListValue}, not here: this function's job is to say what the
+ * connection's path IS.
+ */
+export function parseSearchPathValue(shown: string): string[] {
+  const names: string[] = [];
+  let current = '';
+  let quoted = false;
+  let sawContent = false;
+  for (let i = 0; i < shown.length; i++) {
+    const ch = shown[i]!;
+    if (quoted) {
+      if (ch === '"') {
+        if (shown[i + 1] === '"') {
+          current += '"';
+          i++;
+        } else {
+          quoted = false;
+        }
+      } else {
+        current += ch;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      quoted = true;
+      sawContent = true;
+      continue;
+    }
+    if (ch === ',') {
+      const name = current.trim();
+      if (name !== '' || sawContent) names.push(name);
+      current = '';
+      sawContent = false;
+      continue;
+    }
+    current += ch;
+  }
+  const last = current.trim();
+  if (last !== '' || sawContent) names.push(last);
+  return names.filter((n) => n !== '');
+}
+
+/**
+ * The `search_path` GUC value a pin emits: `schema` first, then each name in
+ * `alsoResolveIn` that survives the same validation `schema` did.
+ *
+ * Every entry is quoted (Postgres folds an unquoted one to lower case, and the
+ * rest of the CLI treats the configured name exactly), and the list is joined
+ * with a BARE comma: the libpq `options` parameter is split on WHITESPACE, so a
+ * space inside the value would start a second `-c`. A name that cannot be
+ * emitted safely is DROPPED rather than escaped, because the alternative is
+ * inventing an escaping rule for a literal whose only defence is its alphabet.
+ * Dropping is monotone against the previous behaviour, which dropped all of
+ * them.
+ */
+function searchPathListValue(schema: string, alsoResolveIn: readonly string[]): string {
+  const seen = new Set<string>([schema]);
+  const names = [schema];
+  for (const name of alsoResolveIn) {
+    if (seen.has(name)) continue;
+    if (!isPlainSchemaIdentifier(name) && name !== SEARCH_PATH_USER_TOKEN) continue;
+    seen.add(name);
+    names.push(name);
+  }
+  return names.map((n) => `"${n}"`).join(',');
+}
+
+/**
  * `connectionString` with `search_path` pinned to `schema` through the
  * connection's **startup parameters** (`options=-c search_path="<schema>"`),
  * never through a `SET`.
@@ -407,12 +494,20 @@ export function isPlainSchemaIdentifier(schema: string): boolean {
  * safe to emit because {@link SEARCH_PATH_SCHEMA_PATTERN} admits no `"` and no
  * whitespace; anything else throws rather than reaching the wire.
  *
- * The value REPLACES the role's default path for this connection rather than
- * extending it. A migration that names an object from another schema
- * unqualified (an extension type installed in `public`, say) must qualify it,
- * and fails with a clear "does not exist" error if it does not. The inherited
- * path cannot be read before the connection exists, and the startup parameter
- * is the one mechanism that cannot leak.
+ * The value EXTENDS the caller's path rather than discarding it: `schema` goes
+ * FIRST (an unqualified CREATE uses the first entry, which is the whole point of
+ * the pin) and every name in `alsoResolveIn` follows. Pinning used to emit the
+ * target ALONE, which is a different behaviour from the push path's
+ * `pinSearchPath`, and the difference is not cosmetic: on the ordinary managed
+ * layout (`public, extensions`) a `citext` / `vector` / `hstore` / `postgis`
+ * column, an extension opclass in a CREATE INDEX, or a CHECK calling an
+ * extension function all failed under a pin that the same DDL did not need
+ * without one. Two authorities on one question, so there is now one.
+ *
+ * The inherited path cannot be read before the connection exists, so
+ * `alsoResolveIn` is the caller's job: connect once unpinned, `SHOW
+ * search_path`, hand the names here (see {@link parseSearchPathValue}). Nothing
+ * is guessed, and an empty list emits exactly what it always did.
  *
  * Merge rules match {@link withStatementTimeoutOption}: an existing
  * `?options=` is appended to (the later `-c search_path` wins on the backend),
@@ -434,9 +529,13 @@ export function isPlainSchemaIdentifier(schema: string): boolean {
  * `null` as a refusal: the unpinned string means "into whichever schema the
  * role defaults to", the exact outcome this exists to prevent.
  */
-export function withSearchPathOption(connectionString: string, schema: string): string | null {
+export function withSearchPathOption(
+  connectionString: string,
+  schema: string,
+  alsoResolveIn: readonly string[] = [],
+): string | null {
   if (!isPlainSchemaIdentifier(schema)) return null;
-  const setting = `-c search_path="${schema}"`;
+  const setting = `-c search_path=${searchPathListValue(schema, alsoResolveIn)}`;
 
   const merged = mergeConnectionStringOptions(connectionString, setting);
   if (merged !== null) return merged;

@@ -6,7 +6,9 @@
  * applied the migration that diff produced into `public`, tracking table
  * included, and reported success. The fix is the `options=-c search_path`
  * CONNECTION PARAMETER (never a session `SET`), applied by
- * `connectionStringForSchema` for every schema other than the default.
+ * `connectionStringForSchema` for every CONFIGURED schema, `public` included,
+ * and extending the connection's own path rather than replacing it, so that the
+ * rule matches `pinSearchPath` on the push side exactly.
  *
  * Requires DATABASE_URL (a direct endpoint, never a pooler). Creates and drops
  * schema `qa78_ns`; every table it touches carries the `qa78_` prefix.
@@ -157,9 +159,18 @@ describe('migrate honours the configured schema (integration)', () => {
     assert.deepEqual(await tableSchemas('qa78_t1_default'), []);
   });
 
-  gate.it('`public` emits no connection parameter at all (byte-identical to the unconfigured default)', () => {
-    assert.equal(connectionStringForSchema(url!, 'public'), url);
+  gate.it('only an UNCONFIGURED schema emits no connection parameter; `public` is pinned like any other', () => {
+    // `public` used to be exempted here, on the reasoning that it is the
+    // default anyway. It is not: `search_path` is a role/database/
+    // connection-string setting, so on a role whose path is `app, public` a
+    // project configured `schema: 'public'` had `push` creating in public (its
+    // own pin, in schema-sql.ts, has always been unconditional) and `migrate up`
+    // creating in app. Two authorities on one question, eight lines apart in
+    // behaviour, for the one schema most projects actually use.
     assert.equal(connectionStringForSchema(url!, undefined), url);
+    assert.equal(connectionStringForSchema(url!, ''), url);
+    assert.notEqual(connectionStringForSchema(url!, 'public'), url);
+    assert.match(connectionStringForSchema(url!, 'public'), /search_path/);
   });
 
   gate.it('a schema that does not exist is refused up front, naming the schema and the fix', async () => {

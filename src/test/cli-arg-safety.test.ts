@@ -172,25 +172,32 @@ describe('unknown flags do not fire on valid input', () => {
 
   it('a refused flag VALUE is refused as a VALUE, never reported as an unknown flag', () => {
     // `--step -1` used to parse clean and mean "every migration except the
-    // oldest", so `--step` now refuses a value that is not a positive count.
-    // That refusal must come from the `--step` case, which is what proves the
-    // value was consumed there rather than falling through to the unknown-flag
-    // test and being reported as a flag named `-1`.
+    // oldest", so `--step` refuses a value that is not a positive count. That
+    // refusal must name the FLAG, which is what proves the value was consumed
+    // by `--step` rather than falling through to the unknown-flag test and
+    // being reported as a flag named `-1`.
     //
-    // Asserted on the error IDENTITY and the two things the reader needs (the
-    // flag, the offending value), never the full sentence: message wording is
-    // explicitly not part of the stability contract.
-    assert.throws(
-      () => parseArgs(['migrate', 'down', '--step', '-1']),
-      (err: unknown) => {
-        assert.ok(err instanceof Error);
-        assert.match(err.message, /TURBINE_E003/);
-        assert.match(err.message, /--step/);
-        assert.match(err.message, /-1/);
-        assert.doesNotMatch(err.message, /Unknown flag/);
-        return true;
-      },
-    );
+    // It goes through `failArg` like every other flag refusal (banner, red
+    // line, hints, exit 1) rather than throwing past main(), which printed one
+    // unstyled sentence that read like an internal crash. Asserted on the exit
+    // code and the two things the reader needs (the flag, the offending value),
+    // never the full sentence: wording is not part of the stability contract.
+    const { exited, stderr, args } = run(['migrate', 'down', '--step', '-1']);
+    assert.equal(exited, 1);
+    assert.equal(args, undefined, 'a refused value must never reach the command');
+    assert.match(stderr, /--step/);
+    assert.match(stderr, /-1/);
+    assert.doesNotMatch(stderr, /Unknown flag/);
+  });
+
+  it('but a flag VALUE is not judged at all when the COMMAND is unknown', () => {
+    // Order matters to the reader: `turbine genrate --step 0` has two problems
+    // and only one of them is worth acting on. The `--step` check used to run
+    // mid-loop, so it fired first and the misspelled command was never
+    // mentioned. main()'s dispatch reports the command instead.
+    const { exited, stderr } = run(['genrate', '--step', '0']);
+    assert.equal(exited, null, 'flag-value validation must not run for an unrecognized command');
+    assert.doesNotMatch(stderr, /--step/);
   });
 
   it("leaves an unknown command's flags alone, so the command error is what surfaces", () => {
