@@ -652,6 +652,7 @@ jobs:
           fi
 
       - name: Publish to npm
+        id: publish
         if: ${{ github.event.inputs.dry_run != 'true' && steps.published.outputs.already != 'true' }}
         run: npm publish --provenance --access public
         env:
@@ -722,13 +723,24 @@ jobs:
       # Idempotent: an existing release (manual or from a re-run) is left alone.
       # Runs even when the npm publish was skipped as already-published, so a
       # re-run can backfill a missing release without republishing.
-      # `always()` scoped to "the publish step got that far": the tarball is on
-      # the registry by now whatever the smoke test said, and a published
-      # version with no release notes is strictly worse than notes for a version
-      # whose smoke test needs a look. A genuine smoke failure still fails the
-      # JOB, which is the signal that matters.
+      # The condition has to say "the tarball is on the registry", and the
+      # obvious spelling of that does NOT: `!cancelled()` alone was written to
+      # survive the SMOKE TEST, on the reasoning that the tarball is published
+      # by the time that step runs, so notes for a version whose smoke test
+      # needs a look beat a published version with no notes. True of the smoke
+      # test. Not true of the publish step above it, which the same condition
+      # also survives, and 0.78.0 is what that cost: `npm publish` failed on an
+      # expired token, and this step went on to announce a GitHub Release,
+      # marked Latest, for a version the registry did not have.
+      #
+      # So gate on the fact rather than on a step that implies it: the publish
+      # SUCCEEDED, or it was skipped because the version was already on the
+      # registry (the workflow_dispatch backfill path, which is the whole reason
+      # this cannot be a plain `success()`). A smoke-test failure still reaches
+      # here and still fails the JOB, which was the original intent and is
+      # unchanged.
       - name: Create GitHub Release from CHANGELOG
-        if: ${{ !cancelled() && github.event.inputs.dry_run != 'true' }}
+        if: ${{ !cancelled() && github.event.inputs.dry_run != 'true' && (steps.publish.outcome == 'success' || steps.published.outputs.already == 'true') }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
