@@ -1,5 +1,251 @@
 # Changelog
 
+## 0.78.0 (2026-09-06)
+
+A full product review, a gold-standard audit and a three-database end-to-end QA
+run found five defects that all share one shape: **the query compiled, the
+statement ran, the database returned rows, and the rows were wrong.** No error,
+no warning, nothing in a log. The suite was 6,907 tests and green.
+
+It missed them because it is exhaustively self-consistent. Every differential
+fuzz compares the compiler against itself, so a rule the compiler applies
+uniformly and wrongly agrees with itself perfectly. The write path was tested
+one statement at a time rather than against the rule the documentation states,
+so `update()` compiling an operator object correctly and `upsert()` compiling
+the same object as a literal 200 lines away is two passing tests. The fixes are
+below; the tests added with them assert against the stated rule, not against the
+neighbouring implementation.
+
+### Breaking
+
+- **`update()` and `delete()` require a `where` that identifies one row.** Both
+  accepted any filter, mutated every matching row and returned one of them,
+  arbitrarily. `findUnique` has refused that exact shape since 0.73 through a
+  shared helper these two never called; they call it now, and the refusal is
+  E003 naming the unique keys the table actually has. Use `updateMany` /
+  `deleteMany` for "every row matching a filter", which is what they are for.
+
+- **`_sum` and `_avg` over `bigint` and `numeric` columns return exact strings.**
+  They were passed through `Number()`, which silently rounds past 2^53 and turns
+  a money column into a float. The type is now `number | string | null` on
+  `AggregateResult` and on the groupBy result. `int4` and float columns still
+  return JS numbers, and JSON-path aggregates are unchanged. The `::float` cast
+  is gone from the generated SQL for those columns too, which had also collapsed
+  distinct averages into ties when ordering by `_avg`.
+
+- **A non-generated primary key is required in the generated `*Create` type.**
+  The generator marked every PK optional, so a plain `text` PK or a composite PK
+  of two ints typechecked when omitted and failed at the database. Optionality
+  now follows the column: server-generated, defaulted or nullable.
+
+- **`mode: 'insensitive'` applies to `equals`, `not`, `in` and `notIn`.** It was
+  documented as case-insensitive matching and silently ignored on every operator
+  except the LIKE family, so `{ email: { equals: 'A@B.com', mode: 'insensitive' } }`
+  ran a case-sensitive comparison. A non-string operand beside the mode now
+  throws E003 rather than being ignored.
+
+- **Introspection refuses to generate when two columns of one table resolve to
+  the same field.** A table with both `"createdAt"` and `created_at` emitted a
+  duplicate interface member and mapped writes to whichever came last. It now
+  throws E003 naming both columns, with `--keep-column-names` as the escape
+  hatch.
+
+### Fixed
+
+- **A multi-field `cursor` compiled to a conjunction, not a keyset.** `cursor:
+  { score, id }` emitted `score > $1 AND id > $2`, which drops every row whose
+  score ties the cursor's and whose id sorts below it. Paging a 600-row table
+  with ties on the leading key visited 250 rows and skipped 350, silently, with
+  every page individually well formed.
+
+  It emits the expanded OR-of-ANDs seek now, ordered by `orderBy` precedence and
+  honouring each field's own direction. Deliberately not a row-value comparison
+  (`(a, b) > ($1, $2)`): that form cannot express a mixed direction and does not
+  exist on every engine we target. One authority builds the seek entries for the
+  fingerprint, the build and the cache-hit collect, so they cannot drift, and
+  the cache key carries the direction of each field.
+
+- **A relation filter on a self-relation correlated a row with itself.** The
+  `EXISTS` subquery did not alias its target, so when the target's rendered name
+  equalled the parent's, `where: { manager: { some: {} } }` resolved both sides
+  of the correlation to the same row and returned nothing. The same file aliases
+  correctly in `with` and in `orderBy: { _count }`, which is why it survived
+  review. The alias now flows through the correlation, the scoped sub-where, the
+  global-filter fragment and nested filters, and the junction gets its own.
+  Non-self relations emit the same SQL as before, byte for byte.
+
+- **`distinct` with a narrowed projection emitted SQL PostgreSQL rejects.**
+  Ordering by a column that `select`, `omit` or the PII rule had removed put
+  that column in the ORDER BY of a derived table that did not select it. The
+  ordering columns are projected into the inner table and the outer columns are
+  named explicitly, so the extra column never reaches a row.
+
+- **`upsert`'s update branch bound an atomic operator object as a literal
+  value.** `update: { name: { set: 'Upserted' } }` stored the TEXT
+  `{"set":"Upserted"}` in a text column, and `{ views: { increment: 1 } }`
+  failed 22P02 against an int one. `update()` compiles the same object
+  correctly two hundred lines away, which is why two passing tests coexisted
+  with the bug. The conflict-update SET now routes through the same builder, so
+  the five operators mean the same thing everywhere and a misspelled one raises
+  the same E003.
+
+- **`upsert` on a table with a global filter failed 42702.** The filter was
+  compiled unqualified into the conflict clause, so the column reference was
+  ambiguous on both the insert and the update path. It goes through the aliased
+  where builder now. A conflict against a row the filter hides inserts nothing
+  and updates nothing, and raises E001 naming the filter and
+  `skipGlobalFilters`.
+
+- **A failing transactional `pipeline()` released its connection while the
+  backend was still `idle in transaction (aborted)`.** The next caller to draw
+  that connection from the pool got 25P02 on a query that had nothing to do
+  with the failure. The transactional path now issues its own ROLLBACK after
+  ReadyForQuery and waits for the status; a connection still in `E` or `T` is
+  released with an error so the pool discards it. Non-transactional mode
+  discards on a final status of `E`.
+
+- **`turbine migrate` and `turbine seed` ignored the configured schema.** Push,
+  generate, doctor and Studio all honoured `config.schema`; these two did not,
+  so a code-first project on `schema: 'app'` pushed its tables into `app`,
+  diffed against `app`, and applied the resulting migration into `public`,
+  tracking table included. Both pin `search_path` through the connection
+  parameter now, never a session `SET`. A schema that does not exist is refused
+  up front with E006 naming CREATE SCHEMA, because PostgreSQL accepts a bogus
+  `search_path` in silence and the eventual error names neither the schema nor
+  the setting.
+
+- **Dynamically assembled destructive DDL passed the confirmation gate.** A
+  `DROP COLUMN` built inside a DO block, and eight further obfuscations of the
+  same shape, ran live without the two-step prompt. Dynamic SQL whose payload
+  the scanner cannot classify is now reported as unclassified rather than
+  waved through, which is the honest answer: "cannot classify" reported as
+  "clean" is the consent gate deciding in the author's favour on no evidence.
+  `CREATE RULE ... DO INSTEAD DELETE` is flagged too. The controls hold: a
+  dynamic ADD COLUMN, DROP CONSTRAINT or UPDATE with a WHERE stays silent.
+
+- **`migrate down --step` accepted `-1`, `0` and `abc`.** `-1` reached
+  `applied.reverse().slice(0, -1)`, which is every migration except the oldest,
+  and began tearing down the history newest first. The other two were silent
+  no-ops that read as a successful rollback. All three are E003 now.
+
+- **The MCP server ran up to seven queries at once on one client and left its
+  transport open after close.** Queries are sequential and close is observable.
+
+- **prisma-compat replaced a caller's array `orderBy` with the primary key
+  under a bare cursor.** The documented E017 for a cursor whose field is not
+  the sort key never fired, because the check read only the first element. It
+  flattens the array now. `OR: []` compiles to a predicate matching nothing,
+  and a bare `null` on a to-one relation key means `{ is: null }` instead of
+  being read as a column name.
+
+- **`instanceof` on a Turbine error was false in the layout the README
+  recommends.** A project with `"type": "commonjs"` and an `.mts` entry loads
+  both the CJS and ESM copies of the package through the generated client, and
+  each copy defines its own classes. Every error now carries a `Symbol.for`
+  brand and `TurbineError` defines `Symbol.hasInstance`, keyed on the code, so
+  an error thrown by one copy is `instanceof` the other copy's class and the
+  right subclass.
+
+- **An unclassified driver error reached the caller verbatim under
+  `errorMessages: 'safe'`.** The whole point of safe mode is that a value never
+  reaches a log, and `invalid input syntax for type integer: "<the value>"` is a
+  value in a message. SQLSTATE class 22 and tsquery syntax errors map to
+  `ValidationError` with the column and the SQLSTATE in the message and the
+  driver text on `.detail`; any other unclassified PostgreSQL error is scrubbed
+  to `Database error <SQLSTATE>` with the original on `.cause`. Verbose mode is
+  unchanged. `OptimisticLockError` moves the expected value to `.detail` for the
+  same reason. No new error code.
+
+### Added
+
+- `RelationOrderBy` is a depth-bounded chain of to-one hops, matching what the
+  builder has always compiled. Two- and three-hop ordering typechecks; the 12th
+  hop is refused at the type level as it already was at runtime.
+- `UpsertArgs.update` accepts the atomic operator objects `update()` accepts, so
+  the type matches the conflict-update compiler.
+- `$primary()` returns `this`, so the primary-only view keeps the generated
+  table accessors, and the generated client gains a typed `$withSession`
+  overload mirroring its typed `$transaction`.
+- `--keep-column-names` on `turbine generate`, for a schema that genuinely has
+  colliding column spellings.
+- `turbine init --schema` writes the schema into the generated config.
+- `migrate up --allow-drift` re-baselines a checksum a reviewed edit changed,
+  printing one line per file. `down` refuses drift in its own words rather than
+  borrowing `up`'s.
+- `migrate down --dry-run` and `migrate deploy --dry-run` report through the
+  runner's own planner instead of a second copy of the rule. The old dry run
+  built its list from `migrate status`, which sorts by filename and drops
+  applied migrations whose file is missing, while the real run walks the
+  tracking table newest-applied first and stops at the first file it cannot
+  read. With a deleted file the two named different migrations, and a dry run
+  that names the wrong migration is not a dry run.
+- A migration batch containing an empty UP section is refused before anything
+  is applied, and a `.sql` file that does not match the timestamp naming is
+  warned about rather than ignored.
+
+### CI
+
+- `release.yml` and `nightly.yml` grant `contents: read` at the workflow level;
+  only the publish jobs hold `contents: write` and `id-token: write`. All 65
+  action references are pinned to full commit SHAs with the version in a
+  trailing comment, and the existing Dependabot ecosystem keeps them current.
+- A tag push whose version is already on npm fails the run instead of skipping
+  silently. A `workflow_dispatch` still skips.
+- `check-release-tests.mjs` bypasses the local gate only under
+  `GITHUB_ACTIONS=true`. A bare `CI=1` no longer does.
+- `lint-staged` runs the same flags as `npm run lint`, so the pre-commit hook
+  and CI agree about what a warning is.
+- `prepare` runs husky when it resolves and exits 0 otherwise, so a fresh clone
+  can install the examples.
+
+### Testing
+
+- `ci-ok-needs-sync.test.ts` asserts what WORKFLOW.md already claimed: every
+  `ci.yml` job is in `ci-ok`'s `needs`, and the anti-vacuous literal equals that
+  count.
+- `docs-claims-sync.test.ts` reads CLAUDE.md against `.c8rc.json`, `package.json`
+  and the source tree. Five sentences were stale and are corrected once.
+- `docs-snippet-imports.test.ts` refuses a docs snippet that imports a relative
+  module with no extension. Twelve had to be fixed to make it pass.
+- `verify-skill` creates a bigint and numeric fixture, compares aggregate output
+  against the database's own text rendering, and drops the table afterwards.
+- The SQLite declared-boolean assertions now ask the same capability question
+  the engine asks. They expected `true` / `false` unconditionally while the
+  engine deliberately keeps 1 / 0 whenever `StatementSync.columns()` is absent,
+  so the file was green only on the part of the supported Node range that has
+  the capability and red on the rest. Measured rather than read off a release
+  note: `columns()` is absent on Node 22.13.1 and present on 24.18.0.
+- `deriveLockId` has a test. It is the advisory-lock id the migration runner
+  derives from the database name so sibling databases do not contend, and two
+  properties are load-bearing and invisible from the path that uses it:
+  stability across processes, and a value inside the positive int4 range
+  `pg_advisory_lock`'s one-argument form accepts.
+- `src/query/types.ts` is no longer excluded from coverage. It was on the
+  type-only list, which is for files that compile to `export {};`, and it has
+  carried the `UNSAFE` sentinel and the privilege-option guards since those
+  moved in. Measured both ways over the same collected coverage: counting it
+  raises the project figure from 96.98 to 97.09, because the file itself reads
+  99.67. The exclusion was hiding well-tested runtime code, not denominator
+  noise.
+
+### Docs
+
+- The queries page carries the keyset cursor, the exact `_sum` / `_avg`
+  rendering, the two-hop relation `orderBy` and its depth bound, the `mode` row,
+  the `OR: []` semantics, and which warnings survive production.
+- The errors page leads with `err.code`, documents the class-22 and tsquery
+  mappings and the safe-mode scrub, and drops the old "returned unchanged"
+  wording. The optimistic-locking page says the expected value lives on
+  `.detail`.
+- The migrate-from-prisma page notes that int8 and numeric totals arrive as
+  exact strings where Prisma hands back a `Decimal`, and constructs the client
+  with both arguments.
+- README gains a pre-1.0 note linking STABILITY.md, `Experimental` labels on the
+  engines that are, the `"type": "module"` step, the relation names
+  introspection actually produces, and the `@types/node` requirement. The fuzz
+  sentence is limited to the three strategies it covers.
+- `site/lib/changelog.generated.ts` was stale at 0.76.0 and is regenerated.
+
 ## 0.77.1 (2026-08-23)
 
 **No package changes.** The published tarball is functionally identical to
