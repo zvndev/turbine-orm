@@ -23,15 +23,22 @@ concurrency:
   group: publish-next-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege at the workflow level: the engine and fuzz jobs below run
+# the whole devDependency tree and write nothing. Only `publish-next` needs an
+# OIDC token (for the npm provenance attestation) and declares it on the job.
 permissions:
   contents: read
-  # Required for npm provenance attestation
-  id-token: write
 
 jobs:
   publish-next:
     timeout-minutes: 30
     runs-on: ubuntu-latest
+    # A job-level block REPLACES the workflow-level one, so `contents` is
+    # restated. No `contents: write`: this job pushes no tag and creates no
+    # release, it publishes a prerelease and stops.
+    permissions:
+      contents: read
+      id-token: write
     # Only publish when a CI run on main SUCCEEDED. Not on the nightly schedule,
     # and never off a red, cancelled or skipped CI run. `head_branch` is checked
     # explicitly as well as in the trigger filter so a workflow_run replay from
@@ -44,11 +51,11 @@ jobs:
     steps:
       # workflow_run runs against the default branch by default; check out the
       # exact commit CI validated so the published prerelease is that commit.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           registry-url: 'https://registry.npmjs.org'
@@ -120,8 +127,8 @@ jobs:
           - 5433:5433
           - 15433:15433
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: npm
@@ -157,8 +164,8 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
           cache: npm

@@ -19,7 +19,10 @@ import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
-const DEFAULT_VALUE = 'husky';
+// Fallback only, used when strip-prepare's saved value is missing: it must be
+// the value package.json actually carries, i.e. the resolving wrapper, not a
+// bare `husky` that a fresh clone's example install cannot find.
+const DEFAULT_VALUE = 'node scripts/prepare.mjs';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const pkgPath = resolve(repoRoot, 'package.json');

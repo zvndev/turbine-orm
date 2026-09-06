@@ -87,10 +87,12 @@ PR-only.
 
 **Why tag-first.** Publishing locally and tagging afterwards makes
 `release.yml`'s entire `needs:` chain advisory: the package is already on the
-registry by the time the gates run, and the publish job then short-circuits on
-"version already published", which also skips the post-publish smoke test. Four
-of the six releases before 0.77.0 went out that way, and one of them shipped
-from a commit whose CI was red.
+registry by the time the gates run. Four of the six releases before 0.77.0 went
+out that way, and one of them shipped from a commit whose CI was red. The
+publish job used to answer "version already published" with a silent skip; on a
+tag push it now FAILS the run naming the version, so a tag-second release is
+red rather than quiet. A `workflow_dispatch` run keeps the skip, which is how a
+missing GitHub Release is backfilled for a version that is legitimately on npm.
 
 **The local fallback is gated.** `npm publish` runs `prepublishOnly`, which
 ends in `check:release-tests`. That refuses to publish unless CI is green on

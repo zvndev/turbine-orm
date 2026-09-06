@@ -166,7 +166,7 @@
     "//check:package-types": "The @types/pg tripwire, and the permanent guard on the v0.28.1 regression: no reference to the pg module family may reach a published .d.ts, or a types-only package becomes a hard requirement for every consumer compiling under strict. It lived as an inline grep in ONE ci.yml job, which left the gate proving the change safe off the publish path entirely (a tag push and a local `npm publish` both reached npm without asking). The logic is scripts/check-no-pg-types.mjs now and this script is its single entry point, called by prepublishOnly and by the `consumer-types` job in BOTH ci.yml and release.yml. Reads dist/, so it must run after `npm run build`.",
     "check:package-types": "node scripts/check-no-pg-types.mjs",
     "prepublishOnly": "npm run build && npm run typecheck && npm run lint && npm run test:unit && npm run test:coverage:cli && npm run check:error-codes && npm run check:error-prefix && npm run check:changelog && npm run check:cycles && npm run check:skip-gates && npm run check:private-terms && npm run check:package && npm run check:package-types && npm run size && npm run check:release-tests",
-    "prepare": "husky",
+    "prepare": "node scripts/prepare.mjs",
     "prepack": "node scripts/strip-prepare.mjs",
     "postpack": "node scripts/restore-prepare.mjs",
     "size": "size-limit",
@@ -255,7 +255,7 @@
   },
   "lint-staged": {
     "*.ts": [
-      "biome check --no-errors-on-unmatched"
+      "biome check --error-on-warnings --no-errors-on-unmatched"
     ]
   }
 }

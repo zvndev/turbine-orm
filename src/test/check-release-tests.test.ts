@@ -16,6 +16,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { describe, it } from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 type GhResult = { status: number | null; stdout: string; error?: Error };
 type GhRunner = (cmd: string, args: string[]) => GhResult;
@@ -106,8 +107,8 @@ describe('checkCiGreen', () => {
 describe('check-release-tests import safety', () => {
   it('runs the gate only when executed directly, never on import', () => {
     // THE VACUITY HOLE THIS CLOSES. The gate's side effects used to be
-    // top-level. With `CI` set (which is exactly how the unit suite runs in
-    // CI) importing the module printed the skip line and called
+    // top-level. With `GITHUB_ACTIONS=true` set (which is exactly how the unit
+    // suite runs in CI) importing the module printed the skip line and called
     // process.exit(0), which killed the test runner mid-import: node:test
     // then reported ONE PASSING TEST for this whole file, having executed none
     // of the assertions above. A green run with zero assertions is invisible,
@@ -116,15 +117,71 @@ describe('check-release-tests import safety', () => {
     const child = spawnSync(
       process.execPath,
       ['--input-type=module', '-e', `await import(${JSON.stringify(GATE_URL.href)}); console.log('IMPORT_CLEAN');`],
-      { encoding: 'utf8', env: { ...process.env, CI: '1' } },
+      { encoding: 'utf8', env: { ...process.env, CI: 'true', GITHUB_ACTIONS: 'true' } },
     );
 
     assert.equal(child.status, 0, `importing the gate must not exit the process (stderr: ${child.stderr})`);
     assert.match(child.stdout, /IMPORT_CLEAN/, 'the importing process must survive the import and reach its own code');
     assert.doesNotMatch(
       child.stdout,
-      /CI detected, skipping/,
+      /detected, skipping/,
       'importing must produce no gate output; the entry-point guard has regressed',
     );
+  });
+});
+
+/**
+ * Run the gate AS THE ENTRY POINT under a controlled environment. The five
+ * variables it reads are cleared first so the parent's shell (a CI runner, a
+ * developer's exported DATABASE_URL) cannot leak into a case; `overrides`
+ * then sets exactly what the case is about. With no DATABASE_URL the gate
+ * refuses before it would spawn `npm test`, so every case is side-effect free.
+ */
+function runGate(overrides: Record<string, string>): { status: number | null; stdout: string; stderr: string } {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of [
+    'CI',
+    'GITHUB_ACTIONS',
+    'DATABASE_URL',
+    'TURBINE_PUBLISH_WITHOUT_DB',
+    'TURBINE_PUBLISH_WITHOUT_CI',
+  ]) {
+    delete env[key];
+  }
+  const child = spawnSync(process.execPath, [fileURLToPath(GATE_URL)], {
+    encoding: 'utf8',
+    env: { ...env, ...overrides },
+  });
+  return { status: child.status, stdout: child.stdout, stderr: child.stderr };
+}
+
+describe('check-release-tests skips only on GitHub Actions', () => {
+  it("skips when GITHUB_ACTIONS=true, where release.yml's own needs chain is the gate", () => {
+    const r = runGate({ GITHUB_ACTIONS: 'true', CI: 'true' });
+    assert.equal(r.status, 0, `expected the skip, got exit ${r.status} (stderr: ${r.stderr})`);
+    assert.match(r.stdout, /GitHub Actions detected, skipping/);
+  });
+
+  it('does NOT skip on CI=1 alone: a laptop exporting CI is not a release pipeline', () => {
+    // The old test was `if (process.env.CI)`, satisfied by ANY value, so
+    // `CI=1 npm publish` bypassed the DB-backed suite AND the CI-status check
+    // with one informational line. The gate must run, and with no
+    // DATABASE_URL running means refusing.
+    const r = runGate({ CI: '1' });
+    assert.equal(r.status, 1, `CI=1 must not skip the gate (stdout: ${r.stdout})`);
+    assert.doesNotMatch(r.stdout, /skipping/);
+    assert.match(r.stderr, /no DATABASE_URL is set/, 'the gate ran and refused for the reason it should have');
+  });
+
+  it('does NOT skip on CI=true either, the value GitHub sets, without its own marker', () => {
+    const r = runGate({ CI: 'true' });
+    assert.equal(r.status, 1, `CI=true must not skip the gate (stdout: ${r.stdout})`);
+    assert.match(r.stderr, /no DATABASE_URL is set/);
+  });
+
+  it('does NOT skip on GITHUB_ACTIONS=1: the runner sets the string "true" and only that is accepted', () => {
+    const r = runGate({ GITHUB_ACTIONS: '1' });
+    assert.equal(r.status, 1, `GITHUB_ACTIONS=1 must not skip the gate (stdout: ${r.stdout})`);
+    assert.match(r.stderr, /no DATABASE_URL is set/);
   });
 });
