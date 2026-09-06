@@ -1263,6 +1263,27 @@ interface FKEntry {
 const num = (v: number | string | null | undefined): number => (typeof v === 'string' ? Number(v) : (v ?? 0));
 
 /**
+ * A `bit` column, as the driver actually delivers it.
+ *
+ * tedious parses TDS `BITTYPE` with `!!value`, so `sys.indexes.is_unique`
+ * arrives as a JavaScript BOOLEAN, never as 1. Reading it through {@link num}
+ * and comparing to 1 therefore answered `false` for EVERY unique index on SQL
+ * Server, which emptied `uniqueColumns` on every introspected table and set
+ * `IndexMetadata.unique` to false on every unique index. The visible cost was a
+ * `findUnique` (and, once it carried the same rule, an `upsert`) on a genuinely
+ * unique non-PK column being refused as not identifying one row, on the one
+ * engine where the metadata could not say otherwise.
+ *
+ * The unit test could not see it: its mock built index rows with `1` and `0`
+ * because the helper's parameter was typed `number`, so the fixture chose the
+ * shape the code already handled. Only the live SQL Server leg produces the
+ * boolean. Written to accept all three spellings rather than the one this
+ * driver happens to send, because another `mssql` transport is free to send a
+ * number or the string `'1'` and this is metadata, not a hot path.
+ */
+const bitIsTrue = (v: unknown): boolean => v === true || v === 1 || v === '1' || v === 'true';
+
+/**
  * Derive relations from the FK list via the SHARED introspection pipeline
  * (`deriveEngineRelations` → `buildRelationsFromForeignKeys` +
  * `addAutoManyToManyRelations` in introspect.ts), so this engine derives
@@ -1424,7 +1445,7 @@ export async function introspectMssqlWith(
     const key = `${t}.${name}`;
     let g = indexGroups.get(key);
     if (!g) {
-      g = { table: t, name, unique: num(r.IS_UNIQUE as number) === 1, columns: [] };
+      g = { table: t, name, unique: bitIsTrue(r.IS_UNIQUE), columns: [] };
       indexGroups.set(key, g);
     }
     g.columns.push(String(r.COLUMN_NAME));
