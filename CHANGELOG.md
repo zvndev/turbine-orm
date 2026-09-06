@@ -18,12 +18,23 @@ neighbouring implementation.
 
 ### Breaking
 
-- **`update()` and `delete()` require a `where` that identifies one row.** Both
-  accepted any filter, mutated every matching row and returned one of them,
-  arbitrarily. `findUnique` has refused that exact shape since 0.73 through a
-  shared helper these two never called; they call it now, and the refusal is
-  E003 naming the unique keys the table actually has. Use `updateMany` /
+- **`update()`, `delete()` and `upsert()` require a `where` that identifies one
+  row.** All three accepted any filter. `update` and `delete` mutated every
+  matching row and returned one of them, arbitrarily; `upsert`'s `where` becomes
+  its `ON CONFLICT` target, so a non-unique predicate emitted a conflict clause
+  no constraint backs and PostgreSQL answered with a bare `Database error 42P10`
+  naming nothing the caller wrote. `findUnique` has refused that exact shape
+  since 0.73 through a shared helper none of the three called; they call it now,
+  and the refusal is E003 naming the unique keys the table actually has, with
+  its own sentence for a table that declares none. Use `updateMany` /
   `deleteMany` for "every row matching a filter", which is what they are for.
+
+  Two consequences worth naming. `update({ where: {}, optimisticLock })` is
+  refused: a version column is not unique, so that shape silently updated every
+  row at that version and reported one, which is precisely the hazard. And the
+  refusal message states the cost of its own escape hatch, because
+  `allowFullTableScan: UNSAFE` gives up the empty-`where` guard as well, so an
+  all-`undefined` `where` then matches every row instead of being refused.
 
 - **`_sum` and `_avg` over `bigint` and `numeric` columns return exact strings.**
   They were passed through `Number()`, which silently rounds past 2^53 and turns
@@ -49,6 +60,39 @@ neighbouring implementation.
   duplicate interface member and mapped writes to whichever came last. It now
   throws E003 naming both columns, with `--keep-column-names` as the escape
   hatch.
+
+### Security
+
+- **A destructive statement inside a single-quoted routine body passed the
+  confirmation gate.** `DO 'BEGIN DROP TABLE users; END'` ran with a clean
+  inventory, no prompt and no `--allow-destructive`, verified live on PostgreSQL
+  17. The tokenizer filled a statement's block list from the dollar-quote and
+  `BEGIN ATOMIC` branches only, so a single-quoted body came back with no blocks
+  and the scanner iterated nothing: every pass was skipped, the fail-closed
+  "cannot classify" backstop included. Six shapes went through it, `DO` in three
+  quoting forms plus `CREATE FUNCTION` and `CREATE PROCEDURE`. The existing
+  suites are entirely dollar-quoted, which is why a backstop that had never been
+  exercised against this form was green.
+
+- **Two further shapes reached the same gate.** Two adjacent string literals are
+  ONE string in PostgreSQL, so a `DROP TABLE` split across two quoted fragments
+  read as destructive to the opener test while every rule that could have named
+  it declined, and the skip for an already-handled verb was unconditional, so
+  the statement was passed over on the strength of a pass that never spoke. And
+  `COPY (DELETE FROM t RETURNING *) TO STDOUT` runs the DELETE through a wrapper
+  the data-modifying-CTE rule never sees, because that rule fires only on a
+  leading `WITH`.
+
+- **And the opposite error, which failed ordinary migrations rather than passing
+  destructive ones.** The unclassifiable-`EXECUTE` backstop matched the word
+  anywhere in a statement's code, literals included, so `GRANT EXECUTE ON
+  FUNCTION f() TO app` and `RAISE NOTICE 'EXECUTE the plan'` both armed the
+  gate, and under `migrate deploy` there is no terminal to confirm at. Presence
+  is decided against the literal-emptied view now, and the keyword must sit
+  where plpgsql can begin a statement. A rewrite rule whose action is an
+  `UPDATE` is judged the way a top-level `UPDATE` is, destructive only without a
+  `WHERE`, so the standard updatable-view idiom is silent again. Each
+  sub-statement of a body is judged on its own and reported once.
 
 ### Fixed
 
@@ -151,10 +195,70 @@ neighbouring implementation.
   reaches a log, and `invalid input syntax for type integer: "<the value>"` is a
   value in a message. SQLSTATE class 22 and tsquery syntax errors map to
   `ValidationError` with the column and the SQLSTATE in the message and the
-  driver text on `.detail`; any other unclassified PostgreSQL error is scrubbed
-  to `Database error <SQLSTATE>` with the original on `.cause`. Verbose mode is
-  unchanged. `OptimisticLockError` moves the expected value to `.detail` for the
-  same reason. No new error code.
+  driver text on `.detail`. `OptimisticLockError` moves the expected value to
+  `.detail` for the same reason. No new error code.
+
+- **Safe mode redacted two driver fields and PostgreSQL puts row values in
+  five.** `hint`, `where` and `internalQuery` passed through verbatim, on the
+  returned error and on `.cause` alike, with `util.inspect` rendering them.
+  Reproduced live: a plpgsql `RAISE ... USING HINT` carried an email address, an
+  `EXECUTE format(...)` put a bound value in `internalQuery`, and a cast failure
+  rendered `unnamed portal parameter $1 = '...'` into `where`. The last two leak
+  through a CLASSIFIED error too, so this was never confined to the unclassified
+  path; one list and one helper drive both clone paths now, on every SQLSTATE.
+
+  The scrub was too broad in the other direction as well. `Database error 42P01`
+  deleted `relation "orders" does not exist`, the single most useful sentence a
+  first-run user sees after forgetting to migrate, kept it nowhere including
+  `.cause`, and bought no privacy, because a class-42 message is a grammar over
+  schema object names. The driver's message survives now for the classes whose
+  grammar cannot hold a row value (08, 3D, 3F, 42, 53, 57, 58), with 42601
+  carved out because it quotes a token of the statement and a token can be a
+  literal. `P0001` and class 55 still scrub: that text is written by the
+  function author. When the text is withheld the message says so and names the
+  setting that shows it, and the error gains `.sqlstate` beside its raw `.code`.
+  It stays a plain driver error rather than becoming typed, deliberately:
+  verbose mode returns the raw error and always has, so minting a `TurbineError`
+  under safe mode would make the same database failure a different class
+  depending on a log-redaction setting.
+
+- **`mode: 'insensitive'` on `in` / `notIn` folded two different alphabets.**
+  The column went through the engine's `LOWER` and the list elements through
+  JavaScript's `toLowerCase()`. SQLite's `LOWER` is ASCII-only, so over one row
+  spelled with an accented capital and one with an accented lowercase letter,
+  the same operand matched one row through `equals` and the other through `in`.
+  PostgreSQL folds both sides inside `unnest` unconditionally; every other
+  dialect refuses the operator with E017, naming the engine and the branch form
+  that works. Restoring it there needs a dialect hook with one verified
+  implementation per engine, because each unpacks a bound IN-list in a subquery
+  its own dialect writes, and the portable alternative of one placeholder per
+  element would make the statement text a function of the list length, which the
+  SQL-template cache keys on. `equals`, `not` and the LIKE operators are
+  unaffected: they fold a single operand the engine can reach.
+
+- **prisma-compat's empty-`OR` sentinel was dropped, or dropped its neighbour,
+  depending on key order.** The sentinel is keyed on a real column of the table
+  and was merged with `Object.assign`, so `{ OR: [], id: 5 }` kept `id = 5` and
+  returned the row Prisma excludes, while `{ id: 5, OR: [] }` kept the sentinel
+  and discarded the caller's own predicate. Same query, same meaning, opposite
+  result. It is conjoined now, and the wrapper is branded internal so an empty
+  `OR` does not quietly take a compat query off named prepared statements. A
+  table whose metadata lists no column throws E003 rather than compiling to an
+  empty `where`, which is not "no rows" but its exact opposite.
+
+- **A `globalFilters` entry that was itself a relation filter failed 42P01 on
+  two paths.** `aliasWhereScope` takes a bare alias (`t0`) and quotes it for a
+  nested relation filter's correlation parent; the batched `_count` follow-up
+  and the `upsert` conflict clause both handed it an already-rendered table
+  reference, so the EXISTS body named the table three times over. Under
+  `relationLoadStrategy: 'batched'` the count therefore failed while the join
+  plan answered the same query correctly. A parameter with two meanings is the
+  defect, so both callers go through one rendered-reference seam now and the
+  bare-alias scope refuses a quoted alias by name. The existing
+  strategy-agreement suite could not have caught it: every global filter it
+  tested was a plain column filter, whose sub-where never needs a correlation
+  parent, and `_count` was not covered because the batched plan answers it with
+  a grouped COUNT rather than through the child's `findMany`.
 
 ### Added
 
@@ -166,6 +270,10 @@ neighbouring implementation.
 - `$primary()` returns `this`, so the primary-only view keeps the generated
   table accessors, and the generated client gains a typed `$withSession`
   overload mirroring its typed `$transaction`.
+- `OrderBySpec` and `RelationOrderByChain` are exported from the package root
+  and the query barrel. `RelationOrderBy` became public this release and is
+  written in terms of both, so annotating a variable by hand needed an import
+  the package did not offer.
 - `--keep-column-names` on `turbine generate`, for a schema that genuinely has
   colliding column spellings.
 - `turbine init --schema` writes the schema into the generated config.
@@ -228,6 +336,37 @@ neighbouring implementation.
   99.67. The exclusion was hiding well-tested runtime code, not denominator
   noise.
 
+- `check-changelog-headings.mjs` gained the check `docs/releases/README.md`
+  already told readers existed. No such gate existed, and a document that
+  invents a mechanism is worse than one that states a convention, because the
+  next reader stops looking. Whether a change is breaking is a judgement no
+  regex makes, so the gate does the mechanical part: every `###` heading in the
+  entry being released must be one of the sanctioned names. It checks the
+  current entry only, because ninety-odd published entries use a wider
+  vocabulary and rewriting them to satisfy a rule invented afterwards would make
+  the log disagree with the releases it records.
+- `ci-ok-needs-sync.test.ts` could not see two legal job shapes, so it failed
+  open. Its job parser rejected an uppercase letter in a job id and a key
+  carrying a trailing comment; with either shape the job sat outside `ci-ok`'s
+  `needs` and all four assertions stayed green. The parser fails CLOSED now: any
+  two-space key under `jobs:` that the job pattern did not claim is itself a
+  failure, naming the lines. Verified against four mutations.
+- `size-claim-sync.test.ts` read README.md, one of six places these numbers
+  appear, so the re-baseline below left two false figures on the site's
+  comparison table. It walks every tracked README, STABILITY, site and
+  release-docs file now and requires each claim to equal a gate, with a floor on
+  how many it found so the sweep cannot pass by matching nothing.
+- `docs-snippet-imports.test.ts` scanned `site/app` and stopped there, so four
+  extensionless imports sat in `docs/USING-TURBINE-ORM.md`, on the two snippets
+  a new user reaches first. It walks `docs/` too.
+
+### Measured
+
+- The three size budgets moved: main 87 kB to 90 kB, serverless 69 kB to 71 kB,
+  prisma-compat 14 kB to 16 kB, all brotli. Checked against the esbuild metafile
+  first to confirm that no engine module had leaked into a graph; the growth is
+  this release's own code, and every published claim moved with the budgets.
+
 ### Docs
 
 - The queries page carries the keyset cursor, the exact `_sum` / `_avg`
@@ -244,6 +383,16 @@ neighbouring implementation.
   engines that are, the `"type": "module"` step, the relation names
   introspection actually produces, and the `@types/node` requirement. The fuzz
   sentence is limited to the three strategies it covers.
+- The zod page still described the primary-key optionality rule this release
+  replaced, on the only page that ever documented it. The queries page claimed
+  `_max` of a bigint is a string; it is a number until the value leaves the safe
+  integer range, because `_min` / `_max` read one stored cell through the row
+  rule while `_sum` / `_avg` follow the column type. That page also offered a
+  bare-string `mode` form that does not exist, did not mention that folding both
+  sides with `LOWER` puts a plain btree index out of reach, and had no prose at
+  all about the new identity refusal on `update` / `updateMany`.
+- The errors page says which failures are `TurbineError`s and which stay plain
+  driver errors, and what safe mode actually withholds.
 - `site/lib/changelog.generated.ts` was stale at 0.76.0 and is regenerated.
 
 ## 0.77.1 (2026-08-23)
