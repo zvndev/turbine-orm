@@ -238,6 +238,14 @@ where: { guildId_batchRef: { guildId: 4, batchRef: 'WB-0007' } }
 where: { guildId: 4, batchRef: 'WB-0007' }              // equivalent
 ```
 
+## Single-row writes carry the same rule
+
+`update`, `delete` and `upsert` each require a `where` that identifies one row,
+by the same rule as `findUnique`, and anything else is `TURBINE_E003` naming the
+keys that would work. For an upsert the `where` **is** the `ON CONFLICT` target,
+so a non-unique predicate is refused rather than sent. Use `updateMany` and
+`deleteMany` for "every row matching a filter".
+
 ## `distinct`
 
 `distinct: ['status']` de-duplicates on those columns.

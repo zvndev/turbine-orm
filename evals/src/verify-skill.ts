@@ -155,6 +155,29 @@ const CLAIMS: Claim[] = [
     },
   },
 
+  // ---- single-row writes carry findUnique's identity rule ------------------
+  // These three run against the real database and write nothing: the refusal
+  // happens before any SQL is built, which is itself part of the claim.
+  {
+    says: '`update` requires a `where` that identifies one row.',
+    run: throws('TURBINE_E003', 'cheese_wheels', 'update', {
+      where: { status: 'graded' },
+      data: { status: 'graded' },
+    }),
+  },
+  {
+    says: '`delete` requires a `where` that identifies one row.',
+    run: throws('TURBINE_E003', 'cheese_wheels', 'delete', { where: { status: 'graded' } }),
+  },
+  {
+    says: "an upsert's `where` IS its `ON CONFLICT` target, so a non-unique one is refused, not sent.",
+    run: throwsSaying('TURBINE_E003', 'conflict target', 'cheese_wheels', 'upsert', {
+      where: { status: 'graded' },
+      create: { status: 'graded' },
+      update: { status: 'graded' },
+    }),
+  },
+
   // ---- relation naming ----------------------------------------------------
   {
     says: 'belongsTo is the target table singularised and camelCased (`guild_id` gives `guild`).',
