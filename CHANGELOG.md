@@ -61,6 +61,31 @@ neighbouring implementation.
   throws E003 naming both columns, with `--keep-column-names` as the escape
   hatch.
 
+- **`turbine migrate` and `turbine seed` pin `search_path` for every configured
+  schema, `public` included, and the pin EXTENDS the connection's own path.**
+  Two halves of one change, and neither is safe alone.
+
+  `public` used to be exempt, so a role whose own `search_path` led with another
+  schema had `push` creating tables in `public` while `migrate` created them,
+  and `_turbine_migrations` with them, wherever the role pointed. But the pin
+  also REPLACED the path, and pinning `public` under that rule turns a working
+  migration into a broken one on the ordinary managed layout: measured, an
+  unqualified `CREATE TABLE t (email citext)` succeeds unpinned and fails under
+  a `"public"`-only pin, because the extension lives in an `extensions` schema
+  the pin discarded. So the pin extends. The target goes first, the connection's
+  own inherited names follow, read from `SHOW search_path` on an unpinned probe
+  because a startup parameter cannot read the path it overrides. Every inherited
+  name passes the same validator the target does and is dropped otherwise, never
+  escaped.
+
+  What to expect on upgrade: with the default `schema: 'public'`, `migrate` now
+  emits a connection parameter where it emitted none. On a project whose role
+  path led elsewhere this MOVES where migrations and the tracking table land,
+  into `public`, matching what `push` has always done. That is the fix, and it
+  is silent, so such a project may see its migrations look unapplied on the
+  first run after upgrading. Not configuring a schema at all is still unpinned
+  and unchanged.
+
 ### Security
 
 - **A destructive statement inside a single-quoted routine body passed the
@@ -260,6 +285,45 @@ neighbouring implementation.
   parent, and `_count` was not covered because the batched plan answers it with
   a grouped COUNT rather than through the child's `findMany`.
 
+- **`migrate --allow-drift` rewrote stored checksums and reported a no-op.**
+  With nothing pending, `up` said "All migrations are up to date" while
+  rewriting a row, `deploy` said "0 applied", and `down` said "Aborted, nothing
+  was rolled back" having already rewritten the history it then refused to roll
+  back. The no-op early return skipped the report, so the one command whose
+  whole purpose is to change a checksum was the one that never said which.
+  `down` validates before its gates and re-baselines after the last thing that
+  can refuse, so a refused rollback now leaves every stored checksum exactly as
+  it found it.
+
+- **Three dry runs green-lit a batch the real command refuses.** `up --dry-run`,
+  `deploy --dry-run` and `down --step N --dry-run` each exited 0 on input the
+  real run rejects with E006, because each preview reimplemented the plan rather
+  than asking for it. They run the same assertions now, and the tests compare
+  the preview's exit code with the real one rather than with a fixed number.
+  Keeping the preview read-only meant splitting the checksum comparison out of
+  the validation, since validating creates the tracking table and writes
+  legacy-hash upgrades: a dry run against a database with no tracking table
+  still creates none.
+
+- **`turbine seed` ran without the schema guard `migrate` has.** A misspelled
+  schema failed with `relation "..." does not exist`, naming neither the schema
+  nor the setting that caused it. One helper serves both, asked of the catalog
+  rather than of the connection's resolved `current_schema()`, which is what
+  lets it check a pinned migration client and an unpinned seed probe alike.
+
+- **A bad `--schema` printed a connection-failure banner.** `Cannot pin
+  search_path to "bad name"` is an E003 about the name, and it arrived under
+  "Could not connect to database" with three firewall hints. A real
+  ECONNREFUSED still gets the banner.
+
+- **`migrate down`'s drift refusal offered the command that had just failed**,
+  and numbered its remedies 1, blank, 3 when the middle one did not apply.
+  `--allow-drift` was described three different ways across three help texts;
+  all three now say the same true thing. `--step` took a different error path
+  from every other flag, so a bad value skipped the banner and the hints. And
+  `--schema` was undocumented on `init`, `migrate` and `seed`, which the "every
+  long flag is documented" guard could not see because it is a global flag.
+
 ### Added
 
 - `RelationOrderBy` is a depth-bounded chain of to-one hops, matching what the
@@ -359,6 +423,18 @@ neighbouring implementation.
 - `docs-snippet-imports.test.ts` scanned `site/app` and stopped there, so four
   extensionless imports sat in `docs/USING-TURBINE-ORM.md`, on the two snippets
   a new user reaches first. It walks `docs/` too.
+
+- Two of the CLI round's new guards were VACUOUS on first writing and were
+  caught by breaking them, which is the only way that is ever caught: `/--schema\b/`
+  is satisfied by `--schema-file`, because `\b` matches between a letter and a
+  dash, and a donor-schema test whose donor was never on the inherited path
+  stayed green with its fix removed. Both are rewritten and both now go red.
+- `assertSchemaExists` and `getCurrentDatabaseName` have unit tests with fake
+  clients, and both new CLI test files joined `coverage:cli:collect`. With only
+  the collect-list change the aggregate function floor was met at exactly 89.0,
+  which is a gate sitting on its floor; it is 89.5 now. `getCurrentDatabaseName`
+  is the input to `deriveLockId`, which got its own test earlier this release,
+  and an untested input to a tested function is an untested pair.
 
 ### Measured
 
