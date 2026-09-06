@@ -71,8 +71,8 @@ const pillars = [
   {
     title: 'Small enough for the edge',
     description:
-      'The main entry is held under 87 kB brotli as an import graph with pg external, the edge entry under 69 kB, enforced by size-limit in CI. One import swap runs the same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase. No separate serverless build, no WASM bundle in your cold start.',
-    stat: '87 kB',
+      'The main entry is held under 90 kB brotli as an import graph with pg external, the edge entry under 71 kB, enforced by size-limit in CI. One import swap runs the same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase. No separate serverless build, no WASM bundle in your cold start.',
+    stat: '90 kB',
     statLabel: 'CI-enforced ceiling',
   },
   {
