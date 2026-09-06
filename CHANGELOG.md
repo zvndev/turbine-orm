@@ -362,10 +362,14 @@ neighbouring implementation.
 
 ### Measured
 
-- The three size budgets moved: main 87 kB to 90 kB, serverless 69 kB to 71 kB,
-  prisma-compat 14 kB to 16 kB, all brotli. Checked against the esbuild metafile
-  first to confirm that no engine module had leaked into a graph; the growth is
-  this release's own code, and every published claim moved with the budgets.
+- The three size budgets moved: main 87 kB to 91 kB, serverless 69 kB to 72 kB,
+  prisma-compat 14 kB to 16 kB, all brotli, in two steps as the review round
+  landed. Checked against the esbuild metafile before each step and the answer
+  was the same both times: 41 modules, the only `cli/` entries the one
+  sanctioned pair, no engine module reachable. The growth is this release's own
+  code inside modules already in the graph, and every published claim moved with
+  the budgets, in eight places across the README, the site homepage and three
+  docs pages.
 
 ### Docs
 
