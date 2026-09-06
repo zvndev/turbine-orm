@@ -113,6 +113,106 @@ describe('self-relation SQL generation (unit)', () => {
   });
 });
 
+describe('self-relation FILTER SQL generation (unit)', () => {
+  // A relation filter compiles to a correlated EXISTS. With the target table
+  // named bare in the subquery's FROM, a self-relation's correlation
+  // `"categories"."parent_id" = "categories"."id"` binds BOTH sides to the
+  // inner row, so `some: {}` matched nothing and `none: {}` matched everything.
+  // The inner table takes an alias whenever the parent reference would
+  // otherwise name it.
+  it('hasMany some: the EXISTS table is aliased and correlated to the OUTER row', () => {
+    const q = makeQuery('categories', selfRelationSchema());
+    const { sql } = q.buildFindMany({ where: { children: { some: {} } } });
+    assert.match(sql, /EXISTS \(SELECT 1 FROM "categories" rf0 WHERE rf0\."parent_id" = "categories"\."id"\)/);
+    assert.doesNotMatch(
+      sql,
+      /"categories"\."parent_id" = "categories"\."id"/,
+      'the inner row must not correlate to itself',
+    );
+  });
+
+  it('hasMany none / every: NOT EXISTS carries the same alias and qualifies the sub-where by it', () => {
+    const q = makeQuery('categories', selfRelationSchema());
+    const none = q.buildFindMany({ where: { children: { none: {} } } });
+    assert.match(none.sql, /NOT EXISTS \(SELECT 1 FROM "categories" rf0 WHERE rf0\."parent_id" = "categories"\."id"\)/);
+    const every = q.buildFindMany({ where: { children: { every: { name: { not: null } } } } });
+    assert.match(
+      every.sql,
+      /NOT EXISTS \(SELECT 1 FROM "categories" rf0 WHERE rf0\."parent_id" = "categories"\."id" AND NOT \(rf0\."name" IS NOT NULL\)\)/,
+    );
+  });
+
+  it("belongsTo is / bare / is null: the parent row is the aliased one, the FK is the outer row's", () => {
+    const q = makeQuery('categories', selfRelationSchema());
+    const is = q.buildFindMany({ where: { parent: { is: { id: 8 } } } });
+    assert.match(
+      is.sql,
+      /EXISTS \(SELECT 1 FROM "categories" rf0 WHERE rf0\."id" = "categories"\."parent_id" AND rf0\."id" = \$1\)/,
+    );
+    assert.deepEqual(is.params, [8]);
+    const bare = q.buildFindMany({ where: { parent: { id: 8 } } });
+    assert.equal(bare.sql, is.sql, 'the bare to-one shape is the implicit `is`');
+    const isNull = q.buildFindMany({ where: { parent: { is: null } } });
+    assert.match(
+      isNull.sql,
+      /NOT EXISTS \(SELECT 1 FROM "categories" rf0 WHERE rf0\."id" = "categories"\."parent_id"\)/,
+    );
+  });
+
+  it('two nested levels alias each level distinctly and chain the correlation through the alias', () => {
+    const q = makeQuery('categories', selfRelationSchema());
+    const { sql } = q.buildFindMany({ where: { children: { some: { children: { some: {} } } } } });
+    // Outer level: rf0 correlated to the outer row. Inner level: its parent is
+    // rf0 (an alias, so no capture is possible) and it keeps the bare name.
+    assert.match(
+      sql,
+      /EXISTS \(SELECT 1 FROM "categories" rf0 WHERE rf0\."parent_id" = "categories"\."id" AND EXISTS \(SELECT 1 FROM "categories" WHERE "categories"\."parent_id" = rf0\."id"\)\)/,
+    );
+  });
+
+  it('a self filter inside a with-clause where correlates to the with alias, not to itself', () => {
+    const q = makeQuery('categories', selfRelationSchema());
+    const { sql } = q.buildFindMany({ with: { children: { where: { children: { none: {} } } } } });
+    // The with subquery's table is `t0`; the relation filter's parent reference
+    // is that alias, so the bare inner name cannot capture it.
+    assert.match(sql, /NOT EXISTS \(SELECT 1 FROM "categories" WHERE "categories"\."parent_id" = "?t0"?\."id"\)/);
+  });
+
+  it('count carries the aliased correlation too', () => {
+    const q = makeQuery('categories', selfRelationSchema());
+    const { sql } = q.buildCount({ where: { children: { some: {} } } });
+    assert.match(sql, /FROM "categories" rf0 WHERE rf0\."parent_id" = "categories"\."id"/);
+  });
+
+  it('a non-self relation filter keeps its bare-table template byte for byte', () => {
+    const schema = selfRelationSchema();
+    schema.tables.posts = mockTable(
+      'posts',
+      [
+        { name: 'id', field: 'id' },
+        { name: 'category_id', field: 'categoryId' },
+      ],
+      {
+        category: {
+          type: 'belongsTo',
+          name: 'category',
+          from: 'posts',
+          to: 'categories',
+          foreignKey: 'category_id',
+          referenceKey: 'id',
+        },
+      },
+    );
+    const q = makeQuery('posts', schema);
+    const { sql } = q.buildFindMany({ where: { category: { is: { name: 'x' } } } });
+    assert.match(
+      sql,
+      /EXISTS \(SELECT 1 FROM "categories" WHERE "categories"\."id" = "posts"\."category_id" AND "categories"\."name" = \$1\)/,
+    );
+    assert.doesNotMatch(sql, /rf0/);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Integration (needs DATABASE_URL)
 // ---------------------------------------------------------------------------

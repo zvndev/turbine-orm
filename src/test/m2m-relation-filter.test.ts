@@ -94,6 +94,27 @@ describe('manyToMany relation filters route through the junction', () => {
     assert.doesNotMatch(sql, /"schedules"\."id" = "reports"\."id"/);
   });
 
+  it('a SELF manyToMany aliases the target so the junction links two different rows', () => {
+    const schema = buildSchema();
+    schema.tables.reports!.relations.related = {
+      type: 'manyToMany',
+      name: 'related',
+      from: 'reports',
+      to: 'reports',
+      foreignKey: 'id',
+      referenceKey: 'id',
+      through: { table: '_report_related', sourceKey: 'A', targetKey: 'B' },
+    };
+    const q = makeQuery('reports', schema);
+    const { sql, params } = q.buildFindMany({ where: { related: { some: { title: 'x' } } } });
+    assert.match(
+      sql,
+      /EXISTS \(SELECT 1 FROM "reports" rf0 WHERE EXISTS \(SELECT 1 FROM "_report_related" WHERE "_report_related"\."B" = rf0\."id" AND "_report_related"\."A" = "reports"\."id"\) AND rf0\."title" = \$1\)/,
+    );
+    assert.doesNotMatch(sql, /"reports"\."id" = "reports"\."id"/, 'never a row linked to itself by name capture');
+    assert.deepEqual(params, ['x']);
+  });
+
   it('a missing through descriptor throws loudly instead of compiling wrong SQL', () => {
     const schema = buildSchema();
     // biome-ignore lint/suspicious/noExplicitAny: corrupting the fixture on purpose

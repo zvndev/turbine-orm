@@ -283,22 +283,28 @@ interface ColumnRefContext {
 /**
  * A table-scoped WHERE compilation context for a sub-where that is NOT the
  * top-level `this.tableMeta` clause. Both relation-filter `EXISTS` sub-wheres
- * (correlated against the bare target table, `"target".col`) and relation
- * `with`-clause `where` filters (against a per-subquery alias, `t0.col`) compile
- * an arbitrary target table's where against a column qualifier. They differ ONLY
- * in that qualifier, the correlation parent handed to `buildRelationFilter`, and
- * the unknown-column error wording, so a single scoped build/collect/fingerprint
- * trio, driven by the SAME canonical {@link walkWhere} the top level uses, serves
- * both. See `buildScopedWhere` / `collectScopedWhereParams` / `fingerprintScopedWhere`.
+ * (correlated against the subquery's FROM item, the bare target table
+ * `"target".col` or its `rf0.col` alias, see {@link buildRelationFilter}) and
+ * relation `with`-clause `where` filters (against a per-subquery alias, `t0.col`)
+ * compile an arbitrary target table's where against a column qualifier. They
+ * differ ONLY in that qualifier, the correlation parent handed to
+ * `buildRelationFilter`, and the unknown-column error wording, so a single
+ * scoped build/collect/fingerprint trio, driven by the SAME canonical
+ * {@link walkWhere} the top level uses, serves both. See `buildScopedWhere` /
+ * `collectScopedWhereParams` / `fingerprintScopedWhere`.
  */
 interface WhereScope {
   /** The target table's metadata (column map, relations, types). */
   meta: TableMetadata;
   /** The target table name (used for host binding + error messages). */
   table: string;
-  /** SQL prefix before `q(col)`, `"target".` for EXISTS sub-wheres, `t0.` for aliases. */
+  /** SQL prefix before `q(col)`: the FROM item's reference (`"target".` / `rf0.` / `t0.`) plus a dot. */
   qualifier: string;
-  /** The `parentTable` correlation argument for nested `buildRelationFilter` calls. */
+  /**
+   * The RENDERED parent reference handed to nested `buildRelationFilter` calls
+   * as `parentRef`: the same reference `qualifier` is built from, so a nested
+   * filter correlates to the row this scope is compiling against.
+   */
   relationParent: string;
   /** {@link WhereHost} bound to `meta`, so {@link walkWhere} enumerates this scope's keys. */
   host: WhereHost;
@@ -518,7 +524,10 @@ export function collectRelationFilterParams(
   if (filterObj.every !== undefined && filterObj.every !== null) {
     // gf is only emitted (build) when the `every` sub-where compiles to a
     // filter, otherwise `every` is trivially true and no subquery is built.
-    if (buildSubWhereForRelation(qi, target, filterObj.every as Record<string, unknown>, [], depth + 1) !== null) {
+    if (
+      buildSubWhereForRelation(qi, target, qi.q(target), filterObj.every as Record<string, unknown>, [], depth + 1) !==
+      null
+    ) {
       collectRelFilterParams(qi, target, filterObj.every as Record<string, unknown>, params, depth + 1);
       collectTargetGlobalFilterExists(qi, target, params);
     }
@@ -544,7 +553,9 @@ export function collectRelFilterParams(
 ): void {
   const meta = qi.schema.tables[targetTable];
   if (!meta) return;
-  collectScopedWhereParams(qi, relationWhereScope(qi, targetTable, meta), subWhere, params, depth);
+  // The FROM-item reference only shapes SQL text, never params, so the bare
+  // name serves the collect mirror whether or not the build path aliased it.
+  collectScopedWhereParams(qi, relationWhereScope(qi, targetTable, meta, qi.q(targetTable)), subWhere, params, depth);
 }
 
 /**
@@ -567,17 +578,28 @@ export function collectOperatorParams(
   };
   // Mirrors buildOperatorClauses' temporal bind rewrite exactly.
   const cv = (v: unknown): unknown => (refCtx ? coerceWhereOperand(qi, refCtx.meta, refCtx.rawColumn, v) : v);
+  const insensitive = op.mode === 'insensitive';
   if (op.equals !== undefined && op.equals !== null && !skipRef(op.equals)) {
     assertBindableEqualsOperand(op.equals, `"${column}"`);
+    if (insensitive) assertInsensitiveOperand(op.equals, 'equals', column);
     params.push(cv(op.equals));
   }
   if (op.gt !== undefined && !skipRef(op.gt)) params.push(cv(op.gt));
   if (op.gte !== undefined && !skipRef(op.gte)) params.push(cv(op.gte));
   if (op.lt !== undefined && !skipRef(op.lt)) params.push(cv(op.lt));
   if (op.lte !== undefined && !skipRef(op.lte)) params.push(cv(op.lte));
-  if (op.not !== undefined && op.not !== null && !skipRef(op.not)) params.push(cv(op.not));
-  if (op.in !== undefined) params.push(qi.inParam(cv(op.in)));
-  if (op.notIn !== undefined) params.push(qi.inParam(cv(op.notIn)));
+  if (op.not !== undefined && op.not !== null && !skipRef(op.not)) {
+    if (insensitive) assertInsensitiveOperand(op.not, 'not', column);
+    params.push(cv(op.not));
+  }
+  if (op.in !== undefined) {
+    if (insensitive) assertInsensitiveOperand(op.in, 'in', column);
+    params.push(qi.inParam(insensitiveListOperand(qi, cv(op.in), insensitive)));
+  }
+  if (op.notIn !== undefined) {
+    if (insensitive) assertInsensitiveOperand(op.notIn, 'notIn', column);
+    params.push(qi.inParam(insensitiveListOperand(qi, cv(op.notIn), insensitive)));
+  }
   if (op.contains !== undefined) params.push(`%${likeOperand(qi, op.contains)}%`);
   if (op.startsWith !== undefined) params.push(`${likeOperand(qi, op.startsWith)}%`);
   if (op.endsWith !== undefined) params.push(`%${likeOperand(qi, op.endsWith)}`);
@@ -753,15 +775,20 @@ export function collectTargetGlobalFilterAlias(qi: BuilderCtx, targetTable: stri
 }
 
 /**
- * SQL clause for `targetTable`'s global filter rendered against the bare
- * (unaliased) table name, the form used inside relation-filter `EXISTS`
- * subqueries. Pushes its params; `''` when none. Mirror:
- * {@link collectTargetGlobalFilterExists}.
+ * SQL clause for `targetTable`'s global filter rendered against `targetRef`,
+ * the relation-filter `EXISTS` subquery's FROM item (the bare table name, or
+ * its alias when {@link buildRelationFilter} had to alias it). Pushes its
+ * params; `''` when none. Mirror: {@link collectTargetGlobalFilterExists}.
  */
-export function targetGlobalFilterExists(qi: BuilderCtx, targetTable: string, params: unknown[]): string {
+export function targetGlobalFilterExists(
+  qi: BuilderCtx,
+  targetTable: string,
+  targetRef: string,
+  params: unknown[],
+): string {
   const gf = resolveGlobalFilter(qi, targetTable);
   if (!gf) return '';
-  return buildSubWhereForRelation(qi, targetTable, gf, params) ?? '';
+  return buildSubWhereForRelation(qi, targetTable, targetRef, gf, params) ?? '';
 }
 
 /** Param-collect mirror of {@link targetGlobalFilterExists}. */
@@ -1003,13 +1030,25 @@ export function scopedWhereHost(qi: BuilderCtx, meta: TableMetadata): WhereHost 
   return host;
 }
 
-/** Build the scope for a relation-filter EXISTS sub-where over the bare target table. */
-export function relationWhereScope(qi: BuilderCtx, targetTable: string, meta: TableMetadata): WhereScope {
+/**
+ * Build the scope for a relation-filter EXISTS sub-where. `targetRef` is the
+ * subquery's FROM item as the SQL refers to it: the quoted target table, or the
+ * alias {@link buildRelationFilter} gave it when the bare name would have been
+ * captured by the correlation. Every column the sub-where names, and every
+ * nested relation filter's correlation parent, is qualified by that same
+ * reference, so the two can never point at different rows.
+ */
+export function relationWhereScope(
+  qi: BuilderCtx,
+  targetTable: string,
+  meta: TableMetadata,
+  targetRef: string,
+): WhereScope {
   return {
     meta,
     table: targetTable,
-    qualifier: `${qi.q(targetTable)}.`,
-    relationParent: targetTable,
+    qualifier: `${targetRef}.`,
+    relationParent: targetRef,
     host: scopedWhereHost(qi, meta),
     unknownColumn: (field) =>
       new ValidationError(
@@ -1025,7 +1064,11 @@ export function aliasWhereScope(qi: BuilderCtx, targetTable: string, meta: Table
     meta,
     table: targetTable,
     qualifier: `${alias}.`,
-    relationParent: alias,
+    // Rendered through the quoter (`"t0"`), which is what a nested relation
+    // filter always emitted for this parent; PostgreSQL folds the unquoted
+    // alias to the same identifier. The empty alias the collect mirror passes
+    // never reaches SQL text.
+    relationParent: alias === '' ? alias : qi.q(alias),
     host: scopedWhereHost(qi, meta),
     unknownColumn: (field) => new ValidationError(`Unknown column "${field}" in where for table "${targetTable}"`),
   };
@@ -1277,8 +1320,43 @@ export function fingerprintScopedWhere(
 }
 
 /**
+ * The alias a relation-filter subquery's FROM item takes when the bare table
+ * name would be captured by the correlation (see {@link buildRelationFilter}).
+ * Derived from the WHERE walk depth rather than from a counter: the depth is a
+ * pure function of the where SHAPE, which the cache fingerprint already
+ * encodes, so the same fingerprint always yields the same SQL text, and two
+ * nested levels are one depth apart and therefore never share a name.
+ */
+function relationFilterAlias(depth: number): string {
+  return `rf${depth}`;
+}
+
+/**
  * Build relation filter SQL: WHERE EXISTS / NOT EXISTS subquery
  * Supports: some (EXISTS), every (NOT EXISTS ... NOT), none (NOT EXISTS)
+ *
+ * NAME CAPTURE, and the aliasing rule that closes it. The subquery correlates
+ * its FROM item to the parent row (`target.fk = parent.pk`). When the target
+ * is named bare and the parent reference is that same bare name, a
+ * self-referencing relation (`comments.parent_id -> comments.id`) compiles
+ * `"comments"."parent_id" = "comments"."id"`, and SQL resolves BOTH sides to
+ * the inner row: `some: {}` matched nothing, `none: {}` matched everything,
+ * `is: null` matched every row, and the defect propagated through nested
+ * filters and into the batched loader's follow-up query (which is a top-level
+ * findMany on the child table). So the FROM item is aliased EXACTLY when its
+ * quoted name equals `parentRef`, and the alias is then used for the
+ * correlation, the sub-where qualifier, the global-filter fragment and as the
+ * parent reference of nested filters. Every other relation filter keeps the
+ * bare-table template it always emitted, byte for byte. The rule is complete
+ * rather than a heuristic: the only reference the inner FROM item can capture
+ * is one that spells its own name, and a nested level whose parent is already
+ * an alias (`rf0`, `t0`, `ord0`) has no such reference to capture. The
+ * junction of a manyToMany branch gets the same treatment for the same reason.
+ *
+ * `parentRef` is the RENDERED reference of the row being correlated against:
+ * the quoted table at the top level (`undefined` here), an alias inside a
+ * relation `with` where (`"t0"`), or the enclosing filter's FROM reference for
+ * a nested relation filter.
  */
 export function buildRelationFilter(
   qi: BuilderCtx,
@@ -1286,7 +1364,7 @@ export function buildRelationFilter(
   relDef: RelationDef,
   filterObj: Record<string, unknown>,
   params: unknown[],
-  parentTable?: string,
+  parentRef?: string,
   /**
    * Nesting depth of the WHERE walk that reached this relation filter. Each
    * relation descent is a level too: `{ posts: { some: { comments: { some:
@@ -1299,8 +1377,12 @@ export function buildRelationFilter(
   const targetMeta = qi.schema.tables[targetTable];
   if (!targetMeta) return null;
 
-  const qt = qi.q(targetTable);
-  const qSelf = qi.q(parentTable ?? qi.table);
+  const qSelf = parentRef ?? qi.q(qi.table);
+  const qTargetName = qi.q(targetTable);
+  // `qt` is how the subquery REFERS to its FROM item (bare name or alias);
+  // `fromTarget` is the FROM item itself (`"t"` or `"t" rf0`).
+  const qt = qTargetName === qSelf ? relationFilterAlias(depth) : qTargetName;
+  const fromTarget = qt === qTargetName ? qTargetName : `${qTargetName} ${qt}`;
   const clauses: string[] = [];
 
   // Correlation: link child table to parent table (supports composite FKs)
@@ -1311,13 +1393,16 @@ export function buildRelationFilter(
     // parent.pk and silently match nothing, so route through the junction:
     //   EXISTS (SELECT 1 FROM junction
     //           WHERE junction.targetKey = target.pk AND junction.sourceKey = parent.ref)
-    // All bare table names (no aliases), so the scoped sub-where machinery and
-    // nested relation filters inside the branch keep their qualification. The
-    // fragment binds no params, so collectRelationFilterParams needs no mirror.
+    // The target reference is `qt` (bare or aliased, see above), and the
+    // junction is aliased by the same capture rule should its name coincide
+    // with either side. The fragment binds no params, so
+    // collectRelationFilterParams needs no mirror.
     if (!relDef.through) {
       throw new ValidationError(`manyToMany relation "${relDef.name}" is missing a \`through\` junction descriptor.`);
     }
-    const qJunction = qi.q(relDef.through.table);
+    const qJunctionName = qi.q(relDef.through.table);
+    const qJunction = qJunctionName === qSelf || qJunctionName === qt ? `rj${depth}` : qJunctionName;
+    const fromJunction = qJunction === qJunctionName ? qJunctionName : `${qJunctionName} ${qJunction}`;
     const targetKeys = normalizeKeyColumns(relDef.through.targetKey);
     const targetPk = targetMeta.primaryKey;
     if (targetPk.length === 0) {
@@ -1346,7 +1431,7 @@ export function buildRelationFilter(
     const parentLink = sourceKeys
       .map((jcol, i) => `${qJunction}.${qi.q(jcol)} = ${qSelf}.${qi.q(refKeys[i]!)}`)
       .join(' AND ');
-    correlation = `EXISTS (SELECT 1 FROM ${qJunction} WHERE ${targetLink} AND ${parentLink})`;
+    correlation = `EXISTS (SELECT 1 FROM ${fromJunction} WHERE ${targetLink} AND ${parentLink})`;
   } else if (relDef.type === 'hasMany' || relDef.type === 'hasOne') {
     // parent.pk = child.fk
     correlation = qi.dialect.buildCorrelation(qt, relDef.foreignKey, qSelf, relDef.referenceKey);
@@ -1360,10 +1445,10 @@ export function buildRelationFilter(
   // ignore filtered-out rows, and `every` quantifies over only the surviving
   // rows ("every NON-deleted related row matches P"). It is ANDed into the
   // correlation and its params pushed AFTER the per-branch filter, mirrored
-  // exactly in collectWhereParams' relation-filter branch. `qt` is the bare
-  // target table, matching the `FROM ${qt}` here (see targetGlobalFilterExists).
+  // exactly in collectWhereParams' relation-filter branch. Rendered against
+  // `qt`, the same reference the FROM item and the sub-where use.
   const gfAnd = (): string => {
-    const gf = targetGlobalFilterExists(qi, targetTable, params);
+    const gf = targetGlobalFilterExists(qi, targetTable, qt, params);
     return gf ? ` AND ${gf}` : '';
   };
 
@@ -1373,28 +1458,28 @@ export function buildRelationFilter(
   // which also skips null. Unreachable via normalization today, guarded anyway.
   if (filterObj.some !== undefined && filterObj.some !== null) {
     const subWhere = filterObj.some as Record<string, unknown>;
-    const filterClause = buildSubWhereForRelation(qi, targetTable, subWhere, params, depth + 1);
+    const filterClause = buildSubWhereForRelation(qi, targetTable, qt, subWhere, params, depth + 1);
     const filterAnd = filterClause ? ` AND ${filterClause}` : '';
-    clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${filterAnd}${gfAnd()})`);
+    clauses.push(`EXISTS (SELECT 1 FROM ${fromTarget} WHERE ${correlation}${filterAnd}${gfAnd()})`);
   }
 
   // "none": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND filter AND gf)
   if (filterObj.none !== undefined && filterObj.none !== null) {
     const subWhere = filterObj.none as Record<string, unknown>;
-    const filterClause = buildSubWhereForRelation(qi, targetTable, subWhere, params, depth + 1);
+    const filterClause = buildSubWhereForRelation(qi, targetTable, qt, subWhere, params, depth + 1);
     const filterAnd = filterClause ? ` AND ${filterClause}` : '';
-    clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${filterAnd}${gfAnd()})`);
+    clauses.push(`NOT EXISTS (SELECT 1 FROM ${fromTarget} WHERE ${correlation}${filterAnd}${gfAnd()})`);
   }
 
   // "every": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND gf AND NOT (filter))
   if (filterObj.every !== undefined && filterObj.every !== null) {
     const subWhere = filterObj.every as Record<string, unknown>;
-    const filterClause = buildSubWhereForRelation(qi, targetTable, subWhere, params, depth + 1);
+    const filterClause = buildSubWhereForRelation(qi, targetTable, qt, subWhere, params, depth + 1);
     if (filterClause) {
       // gf params pushed AFTER filter params (collect mirrors this order), but
       // placed textually inside the domain so it restricts which rows count.
       const gf = gfAnd();
-      clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${gf} AND NOT (${filterClause}))`);
+      clauses.push(`NOT EXISTS (SELECT 1 FROM ${fromTarget} WHERE ${correlation}${gf} AND NOT (${filterClause}))`);
     } else {
       // "every" with empty filter = true (all match trivially), gf irrelevant.
     }
@@ -1404,12 +1489,12 @@ export function buildRelationFilter(
   // `is: null` = "no related row" (Prisma semantics) → NOT EXISTS.
   if (filterObj.is !== undefined) {
     if (filterObj.is === null) {
-      clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${gfAnd()})`);
+      clauses.push(`NOT EXISTS (SELECT 1 FROM ${fromTarget} WHERE ${correlation}${gfAnd()})`);
     } else {
       const subWhere = filterObj.is as Record<string, unknown>;
-      const filterClause = buildSubWhereForRelation(qi, targetTable, subWhere, params, depth + 1);
+      const filterClause = buildSubWhereForRelation(qi, targetTable, qt, subWhere, params, depth + 1);
       const filterAnd = filterClause ? ` AND ${filterClause}` : '';
-      clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${filterAnd}${gfAnd()})`);
+      clauses.push(`EXISTS (SELECT 1 FROM ${fromTarget} WHERE ${correlation}${filterAnd}${gfAnd()})`);
     }
   }
 
@@ -1417,12 +1502,12 @@ export function buildRelationFilter(
   // `isNot: null` = "a related row exists" → EXISTS.
   if (filterObj.isNot !== undefined) {
     if (filterObj.isNot === null) {
-      clauses.push(`EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${gfAnd()})`);
+      clauses.push(`EXISTS (SELECT 1 FROM ${fromTarget} WHERE ${correlation}${gfAnd()})`);
     } else {
       const subWhere = filterObj.isNot as Record<string, unknown>;
-      const filterClause = buildSubWhereForRelation(qi, targetTable, subWhere, params, depth + 1);
+      const filterClause = buildSubWhereForRelation(qi, targetTable, qt, subWhere, params, depth + 1);
       const filterAnd = filterClause ? ` AND ${filterClause}` : '';
-      clauses.push(`NOT EXISTS (SELECT 1 FROM ${qt} WHERE ${correlation}${filterAnd}${gfAnd()})`);
+      clauses.push(`NOT EXISTS (SELECT 1 FROM ${fromTarget} WHERE ${correlation}${filterAnd}${gfAnd()})`);
     }
   }
 
@@ -1436,13 +1521,14 @@ export function buildRelationFilter(
 export function buildSubWhereForRelation(
   qi: BuilderCtx,
   targetTable: string,
+  targetRef: string,
   subWhere: Record<string, unknown>,
   params: unknown[],
   depth = 0,
 ): string | null {
   const meta = qi.schema.tables[targetTable];
   if (!meta) return null;
-  return buildScopedWhere(qi, relationWhereScope(qi, targetTable, meta), subWhere, params, depth);
+  return buildScopedWhere(qi, relationWhereScope(qi, targetTable, meta, targetRef), subWhere, params, depth);
 }
 
 /**
@@ -1663,6 +1749,7 @@ export function buildOperatorClauses(
   // Temporal bind rewrite, identical to `collectOperatorParams`. Value-only, so
   // the emitted SQL (and therefore the template cache) is untouched.
   const cv = (v: unknown): unknown => (refCtx ? coerceWhereOperand(qi, refCtx.meta, refCtx.rawColumn, v) : v);
+  const insensitive = op.mode === 'insensitive';
 
   if (op.equals !== undefined) {
     if (op.equals === null) {
@@ -1671,8 +1758,9 @@ export function buildOperatorClauses(
       clauses.push(`${column} = ${columnRefSql(qi, op.equals, refCtx, op.mode)}`);
     } else {
       assertBindableEqualsOperand(op.equals, column);
+      if (insensitive) assertInsensitiveOperand(op.equals, 'equals', column);
       params.push(cv(op.equals));
-      clauses.push(`${column} = ${qi.p(params.length)}`);
+      clauses.push(insensitiveEquality(column, '=', qi.p(params.length), insensitive));
     }
   }
   if (op.gt !== undefined) {
@@ -1713,19 +1801,29 @@ export function buildOperatorClauses(
     } else if (isColumnRef(op.not)) {
       clauses.push(`${column} != ${columnRefSql(qi, op.not, refCtx, op.mode)}`);
     } else {
+      if (insensitive) assertInsensitiveOperand(op.not, 'not', column);
       params.push(cv(op.not));
-      clauses.push(`${column} != ${qi.p(params.length)}`);
+      clauses.push(insensitiveEquality(column, '!=', qi.p(params.length), insensitive));
     }
   }
   if (op.in !== undefined) {
-    params.push(qi.inParam(cv(op.in)));
-    clauses.push(qi.inClause(column, qi.p(params.length), false));
+    if (insensitive) assertInsensitiveOperand(op.in, 'in', column);
+    params.push(qi.inParam(insensitiveListOperand(qi, cv(op.in), insensitive)));
+    clauses.push(
+      insensitive
+        ? insensitiveInClause(qi, column, qi.p(params.length), false)
+        : qi.inClause(column, qi.p(params.length), false),
+    );
   }
   if (op.notIn !== undefined) {
-    params.push(qi.inParam(cv(op.notIn)));
-    clauses.push(qi.inClause(column, qi.p(params.length), true));
+    if (insensitive) assertInsensitiveOperand(op.notIn, 'notIn', column);
+    params.push(qi.inParam(insensitiveListOperand(qi, cv(op.notIn), insensitive)));
+    clauses.push(
+      insensitive
+        ? insensitiveInClause(qi, column, qi.p(params.length), true)
+        : qi.inClause(column, qi.p(params.length), true),
+    );
   }
-  const insensitive = op.mode === 'insensitive';
 
   if (op.contains !== undefined) {
     params.push(`%${likeOperand(qi, op.contains)}%`);
@@ -1966,6 +2064,73 @@ export function getArrayElementType(_qi: BuilderCtx, pgType: string): string {
 function buildLikeClause(qi: BuilderCtx, column: string, paramRef: string, insensitive: boolean): string {
   const base = insensitive ? qi.dialect.buildInsensitiveLike(column, paramRef) : `${column} LIKE ${paramRef}`;
   return `${base} ESCAPE '\\'`;
+}
+
+/**
+ * One equality-family comparison (`=` / `!=`) honoring `mode: 'insensitive'`.
+ *
+ * `mode` is a sibling key of `equals` / `not` / `in` / `notIn` on
+ * {@link WhereOperator}, and it used to be read by the three LIKE operators
+ * ONLY, so `{ equals: 'dup name', mode: 'insensitive' }` compiled to a
+ * case-sensitive `"name" = $1` and returned zero rows where `ILIKE` found the
+ * variants, with no error. The fold is `LOWER(col) = LOWER($n)`: exact,
+ * portable to every engine, and computed by the DATABASE on both sides, because
+ * the JavaScript `toLowerCase()` and PostgreSQL's `LOWER` disagree on `İ` and
+ * `ß`, so folding the operand client-side would compare two different
+ * alphabets. Without the mode the emitted text is byte-identical to before.
+ */
+function insensitiveEquality(column: string, operator: '=' | '!=', paramRef: string, insensitive: boolean): string {
+  return insensitive ? `LOWER(${column}) ${operator} LOWER(${paramRef})` : `${column} ${operator} ${paramRef}`;
+}
+
+/**
+ * The `in` / `notIn` comparison under `mode: 'insensitive'`.
+ *
+ * PostgreSQL keeps the fold on the server: the list stays ONE bound `text[]`
+ * (length-independent, so the statement text and its cache key are unchanged
+ * whatever the list length) and each element is lowered by the engine inside
+ * `unnest`. `NOT IN` keeps SQL's NULL semantics, matching the plain `!= ALL`.
+ *
+ * Every other engine binds an IN list as a JSON document its dialect unpacks
+ * in a subquery whose column name is the dialect's own, so the elements cannot
+ * be lowered in SQL from here; they are lowered on the client instead, by
+ * {@link insensitiveListOperand}, and only the column side is folded here.
+ */
+function insensitiveInClause(qi: BuilderCtx, column: string, paramRef: string, negated: boolean): string {
+  if (qi.dialect.name === 'postgresql') {
+    return `LOWER(${column}) ${negated ? 'NOT IN' : 'IN'} (SELECT LOWER(v) FROM unnest(${paramRef}::text[]) AS v(v))`;
+  }
+  return qi.inClause(`LOWER(${column})`, paramRef, negated);
+}
+
+/**
+ * The bound list for an insensitive `in` / `notIn`. PostgreSQL folds inside
+ * the statement (see {@link insensitiveInClause}) and gets the list verbatim;
+ * the other engines get the elements lowered here, with the documented caveat
+ * that a JavaScript fold of `İ` / `ß` can differ from the engine's own. Runs on
+ * the build AND the collect path, so a warm template binds the same values.
+ */
+function insensitiveListOperand(qi: BuilderCtx, values: unknown, insensitive: boolean): unknown {
+  if (!insensitive || qi.dialect.name === 'postgresql' || !Array.isArray(values)) return values;
+  return values.map((v) => (typeof v === 'string' ? v.toLowerCase() : v));
+}
+
+/**
+ * Refuse `mode: 'insensitive'` beside a non-string equality operand (E003).
+ * `LOWER(5)` is a type error the engine would raise in its own words on the
+ * build path and, worse, a warm template would bind the value without ever
+ * reaching the engine's check for the SQL it was compiled against, so the
+ * refusal runs on both the build and the collect side. The value itself stays
+ * out of the message (safe error mode renders keys, never values).
+ */
+function assertInsensitiveOperand(value: unknown, operator: 'equals' | 'not' | 'in' | 'notIn', column: string): void {
+  const ok = Array.isArray(value) ? value.every((v) => typeof v === 'string') : typeof value === 'string';
+  if (ok) return;
+  throw new ValidationError(
+    `mode: 'insensitive' on ${column} requires a string operand for '${operator}' ` +
+      `(received ${Array.isArray(value) ? 'a list with a non-string element' : typeof value}). ` +
+      `Case folding applies to text; drop the mode or compare a string.`,
+  );
 }
 
 /**
