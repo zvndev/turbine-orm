@@ -630,7 +630,8 @@ describe('wrapPgError', () => {
       const err = Object.assign(new Error('weird: "value"'), { code: '99999', severity: 'ERROR' });
       const wrapped = wrapPgError(err) as Error & { code?: string };
       assert.notEqual(wrapped, err);
-      assert.equal(wrapped.message, 'Database error 99999');
+      assert.ok(wrapped.message.startsWith('Database error 99999'), wrapped.message);
+      assert.ok(wrapped.message.includes('driver text withheld'), wrapped.message);
       assert.equal(wrapped.code, '99999');
     } finally {
       setErrorMessageMode(prev);

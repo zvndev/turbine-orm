@@ -185,11 +185,19 @@ describe('wrapPgError, 42601 from to_tsquery becomes ValidationError with a sear
     });
   });
 
+  /**
+   * 42601 is the carve-out from the value-free class-42 allowlist: PostgreSQL
+   * quotes the offending TOKEN, and a token can be a string literal, so the
+   * text is withheld here even though a sibling 42703 keeps its own.
+   */
   it('a 42601 that is not about tsquery is not a ValidationError (it takes the generic path)', () => {
     withMode('safe', () => {
       const err = wrapPgError(pgError({ code: '42601', message: `syntax error at or near "${SECRET}"` }));
       assert.equal(err instanceof TurbineError, false);
-      assert.equal((err as Error).message, 'Database error 42601');
+      const message = (err as Error).message;
+      assert.ok(message.startsWith('Database error 42601'), message);
+      assert.ok(message.includes('driver text withheld'), `the message must say the text was withheld: ${message}`);
+      assert.ok(!rendered(err).includes(SECRET), `token leaked:\n${rendered(err)}`);
     });
   });
 });
@@ -207,8 +215,13 @@ describe('wrapPgError, any other unmapped SQLSTATE under safe mode', () => {
       const raw = makeUnmapped();
       const err = wrapPgError(raw) as PgShaped & { cause?: unknown };
       assert.notEqual(err, raw, 'safe mode must not hand the raw driver error back');
-      assert.equal(err.message, 'Database error 0A000');
+      assert.ok(err.message.startsWith('Database error 0A000'), err.message);
+      assert.ok(
+        err.message.includes('driver text withheld'),
+        `the message must say the text was withheld: ${err.message}`,
+      );
       assert.equal(err.code, '0A000', 'no new Turbine code is minted; the SQLSTATE is kept');
+      assert.equal((err as { sqlstate?: string }).sqlstate, '0A000', 'the SQLSTATE is also carried under its own name');
       assert.equal(err instanceof TurbineError, false, 'an unclassified driver error is not a TurbineError');
       assert.ok(err instanceof Error, 'it is still a real error');
       assert.equal(Object.getPrototypeOf(err), Object.getPrototypeOf(raw), 'the driver prototype survives');
@@ -232,7 +245,7 @@ describe('wrapPgError, any other unmapped SQLSTATE under safe mode', () => {
       const raw = makeUnmapped();
       const scoped = runWithErrorMessageMode('safe', () => wrapPgError(raw));
       assert.notEqual(scoped, raw, 'a safe-scoped client wraps even when the process default is verbose');
-      assert.equal((scoped as Error).message, 'Database error 0A000');
+      assert.ok((scoped as Error).message.startsWith('Database error 0A000'), (scoped as Error).message);
     });
     withMode('safe', () => {
       const raw = makeUnmapped();

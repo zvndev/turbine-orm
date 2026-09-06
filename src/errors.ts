@@ -254,17 +254,27 @@ export function runWithErrorMessageMode<R>(mode: ErrorMessageMode, fn: () => R):
  *
  * SCOPE, stated precisely because the useful version of this contract is the
  * one that is true. 'safe' mode redacts row and parameter values from every
- * error Turbine raises or wraps: its own messages; the `detail` field of a
- * driver error it attaches as `.cause` (see redactCauseForMode); the driver
- * MESSAGE where that is what carries the value, so `22P02 invalid input syntax
- * for type integer: "alice@example.com"` becomes a ValidationError whose
- * safe-mode text names the column and the SQLSTATE and nothing else (see
- * {@link wrapPgError}); and the message of a PostgreSQL server error whose
- * SQLSTATE wrapPgError has no class for, which is scrubbed to
- * `Database error <SQLSTATE>` with the driver text held back on a redacted
- * `.cause`. It is not a log-scrubbing boundary for errors that never pass
- * through Turbine, and an unclassified NATIVE error code from one of the
- * non-Postgres engines is left to that engine's own classifier.
+ * error Turbine raises or wraps:
+ *   - its own messages;
+ *   - the `detail`, `hint`, `where` (the CONTEXT field, which carries the bound
+ *     PARAMETERS when `log_parameter_max_length_on_error` is non-zero) and
+ *     `internalQuery` fields of a driver error it attaches as `.cause`, and of
+ *     the error it hands back. See {@link VALUE_BEARING_FIELDS} for what puts a
+ *     value in each of them;
+ *   - the driver MESSAGE where that is what carries the value, so `22P02
+ *     invalid input syntax for type integer: "alice@example.com"` becomes a
+ *     ValidationError whose safe-mode text names the column and the SQLSTATE
+ *     and nothing else (see {@link wrapPgError});
+ *   - the message of a PostgreSQL server error whose SQLSTATE wrapPgError has
+ *     no class for AND whose SQLSTATE class can hold a value in its message
+ *     text (`P0001`, say, whose text the function author wrote), replaced by a
+ *     sentence naming the SQLSTATE and saying the text was withheld. A class
+ *     whose grammar is written over schema object names keeps its text, because
+ *     withholding what cannot leak protects nothing: see
+ *     {@link messageTextIsValueFree}.
+ * It is not a log-scrubbing boundary for errors that never pass through
+ * Turbine, and an unclassified NATIVE error code from one of the non-Postgres
+ * engines is left to that engine's own classifier.
  */
 export function setErrorMessageMode(mode: ErrorMessageMode): void {
   errorMessageMode = mode;
@@ -357,25 +367,91 @@ function redactedDriverMessage(code: unknown): string {
 }
 
 /**
- * Postgres puts the CONFLICTING ROW VALUES in the `detail` field of a
- * constraint error, and nowhere else: `Key (email)=(alice@example.com) already
- * exists.` for 23505, `Failing row contains (7, alice@example.com, …)` for
- * 23502. The `message` field carries only relation/constraint/column NAMES.
+ * The PostgreSQL error fields that can carry a ROW or PARAMETER value, and are
+ * therefore replaced by {@link REDACTED_DETAIL} in 'safe' mode wherever this
+ * module clones a driver error.
  *
- * 'safe' mode keeps those values out of the Turbine error's own message, but
- * the raw driver error used to be attached verbatim as `.cause`, so the values
- * still reached every place an error object gets rendered whole:
+ * `detail` was the whole list until it turned out not to be. All four ride the
+ * same ErrorResponse wire message, node-postgres copies all four verbatim onto
+ * the error object as own ENUMERABLE properties, and `util.inspect` (which is
+ * what `console.error`, an uncaught rejection and every structured log
+ * serializer effectively run) prints all four:
+ *
+ *   - `detail` (D) is where a constraint error puts the conflicting values:
+ *     `Key (email)=(alice@example.com) already exists.` for 23505, `Failing row
+ *     contains (7, alice@example.com, ...)` for 23502. The `message` of those
+ *     carries only relation / constraint / column NAMES, which is why redacting
+ *     `detail` alone looked like the whole job.
+ *   - `hint` (H): server-generated hints name catalog objects, but
+ *     `RAISE ... USING HINT = 'the email was ' || v` inside a plpgsql function
+ *     puts a row value there. It needs no non-default server setting and no
+ *     cooperation from the application.
+ *   - `where` (W), the CONTEXT field: with `log_parameter_max_length_on_error`
+ *     set to anything but 0 the server appends `unnamed portal parameter $1 =
+ *     '...'`, i.e. THE BOUND PARAMETERS, to the context of any error raised
+ *     while executing a bound statement.
+ *   - `internalQuery` (q): the SQL text of a statement executed INSIDE a
+ *     function, so an `EXECUTE format('SELECT %L::int', v)` hands the
+ *     interpolated value straight back as SQL text.
+ *
+ * Redacted on EVERY SQLSTATE, deliberately, including the classes whose
+ * `message` is kept (see {@link messageTextIsValueFree}). None of these three
+ * is tied to the SQLSTATE the way a message grammar is: parameter context can
+ * attach to an error of any class, `format()` can build any internal query, and
+ * `RAISE ... USING ERRCODE` lets author-written hint text ride whatever code the
+ * author picked. That allowlist is a claim about one field, `message`, and
+ * stretching it over these three would be a claim nothing supports.
+ *
+ * NOT substituted out of the rendered `stack`, unlike a withheld message. V8
+ * renders a stack as `<name>: <message>` plus frames, so none of these fields is
+ * ever in it, and a global substitution of arbitrary short server text across
+ * the frames would risk mangling them to remove something that is not there.
+ */
+const VALUE_BEARING_FIELDS = ['detail', 'hint', 'where', 'internalQuery'] as const;
+
+/**
+ * The property overrides that redact every {@link VALUE_BEARING_FIELDS} entry
+ * `err` actually carries; empty when it carries none, which is the signal both
+ * callers use to skip cloning altogether.
+ *
+ * Replaces the DESCRIPTOR rather than assigning after the clone exists: a
+ * non-writable field would make the assignment throw in strict mode (every
+ * module here is ESM, so it always would), and losing the error is worse than
+ * paying for one descriptor literal.
+ */
+function redactValueBearingFields(err: object): PropertyDescriptorMap {
+  const overrides: PropertyDescriptorMap = {};
+  for (const key of VALUE_BEARING_FIELDS) {
+    const current = (err as Record<string, unknown>)[key];
+    if (typeof current !== 'string' || current.length === 0) continue;
+    overrides[key] = {
+      value: REDACTED_DETAIL,
+      writable: true,
+      // Keep whichever visibility the driver chose so the clone serializes with
+      // the same key set as the original.
+      enumerable: Object.getOwnPropertyDescriptor(err, key)?.enumerable ?? true,
+      configurable: true,
+    };
+  }
+  return overrides;
+}
+
+/**
+ * 'safe' mode keeps a driver error's row values out of the Turbine error's own
+ * message, but the raw driver error used to be attached verbatim as `.cause`,
+ * so the values still reached every place an error object gets rendered whole:
  *   - `console.error(err)` / an uncaught rejection: Node's error printer walks
- *     the cause chain and prints `[cause]: … detail: 'Key (email)=(…)'`. Note
- *     that `cause` is ALREADY non-enumerable (the Error constructor defines it
- *     that way) and Node prints it anyway, so hiding the property is not a fix;
+ *     the cause chain and prints `[cause]: ... detail: 'Key (email)=(...)'`.
+ *     Note that `cause` is ALREADY non-enumerable (the Error constructor defines
+ *     it that way) and Node prints it anyway, so hiding the property is not a
+ *     fix;
  *   - Sentry and similar sinks link `cause` chains by default and serialize
  *     each link's own properties.
  *
- * So in 'safe' mode the cause is replaced by a shallow clone with `detail`
- * swapped for {@link REDACTED_DETAIL}. Cloning rather than mutating leaves the
- * driver's own object untouched (a caller holding it from their own catch sees
- * what the driver produced).
+ * So in 'safe' mode the cause is replaced by a shallow clone with every
+ * {@link VALUE_BEARING_FIELDS} entry swapped for {@link REDACTED_DETAIL}.
+ * Cloning rather than mutating leaves the driver's own object untouched (a
+ * caller holding it from their own catch sees what the driver produced).
  *
  * The clone must remain a REAL error (string stack, native brand,
  * `instanceof pg.DatabaseError`); see {@link cloneErrorWithOverrides} for why
@@ -386,38 +462,24 @@ function redactedDriverMessage(code: unknown): string {
  *
  * ENGINES WHOSE MESSAGE CARRIES THE VALUE. MySQL and SQL Server do not have a
  * `detail` field at all and put the conflicting value in `message`, so the
- * early return below used to hand the raw driver error straight back (see
- * {@link markValueBearingMessage}). When the engine set that flag the clone
- * also withholds `message`, `sqlMessage` (mysql2's copy, which is the field
- * mysql2 formats `message` FROM, so leaving it would put the value straight
- * back) and the message text embedded in the rendered `stack` string. The stack
- * substitution is an exact replacement of the known message string, never a
- * grammar guess, so the frames survive intact.
+ * "nothing to remove" early return below used to hand the raw driver error
+ * straight back (see {@link markValueBearingMessage}). When the engine set that
+ * flag the clone also withholds `message`, `sqlMessage` (mysql2's copy, which is
+ * the field mysql2 formats `message` FROM, so leaving it would put the value
+ * straight back) and the message text embedded in the rendered `stack` string.
+ * The stack substitution is an exact replacement of the known message string,
+ * never a grammar guess, so the frames survive intact.
  */
 function redactCauseForMode(cause: unknown): unknown {
   if (currentErrorMessageMode() === 'verbose') return cause;
   if (!cause || typeof cause !== 'object') return cause;
-  const detail = (cause as { detail?: unknown }).detail;
-  const hasDetail = typeof detail === 'string' && detail.length > 0;
   const valueBearingMessage = (cause as Record<PropertyKey, unknown>)[VALUE_BEARING_MESSAGE] === true;
-  // Nothing value-bearing to remove: return the original object so the common
-  // case (a non-pg cause, or a pg error without a detail) allocates nothing and
-  // keeps object identity with what the driver threw.
-  if (!hasDetail && !valueBearingMessage) return cause;
   try {
-    const overrides: PropertyDescriptorMap = {};
-    // Replace the descriptor rather than assigning after the clone exists: a
-    // non-writable `detail` would make the assignment throw in strict mode
-    // (every module here is ESM, so it always would), and losing the cause is
-    // worse than paying for one descriptor literal.
-    if (hasDetail) {
-      overrides.detail = {
-        value: REDACTED_DETAIL,
-        writable: true,
-        enumerable: Object.getOwnPropertyDescriptor(cause, 'detail')?.enumerable ?? true,
-        configurable: true,
-      };
-    }
+    const overrides = redactValueBearingFields(cause);
+    // Nothing value-bearing to remove: return the original object so the common
+    // case (a non-pg cause, or a pg error carrying none of these fields)
+    // allocates nothing and keeps object identity with what the driver threw.
+    if (!valueBearingMessage && Object.keys(overrides).length === 0) return cause;
     // The exact message strings to scrub out of the rendered stack.
     const withheldTexts: string[] = [];
     if (valueBearingMessage) {
@@ -440,10 +502,11 @@ function redactCauseForMode(cause: unknown): unknown {
     }
     return cloneErrorWithOverrides(cause, overrides, withheldTexts);
   } catch {
-    // A cause whose descriptors cannot be replayed (an exotic proxy, a frozen
-    // prototype chain) must not turn a database error into a TypeError thrown
-    // from an error constructor. Dropping the cause entirely is the safe
-    // direction here: 'safe' mode's contract is that no row value escapes.
+    // A cause whose descriptors cannot be replayed, or whose properties cannot
+    // even be read (an exotic proxy, a throwing getter, a frozen prototype
+    // chain), must not turn a database error into a TypeError thrown from an
+    // error constructor. Dropping the cause entirely is the safe direction
+    // here: 'safe' mode's contract is that no row value escapes.
     return undefined;
   }
 }
@@ -1316,9 +1379,15 @@ type PgErrorFields = {
   constraint?: string;
   column?: string;
   table?: string;
-  detail?: string;
   message?: string;
   severity?: unknown;
+  // The value-bearing four, kept together and in the order
+  // VALUE_BEARING_FIELDS lists them so a reader sees one set, not five
+  // properties that happen to be adjacent.
+  detail?: string;
+  hint?: string;
+  where?: string;
+  internalQuery?: string;
 };
 
 /** The SQLSTATE shape: five characters from [0-9A-Z]. */
@@ -1394,46 +1463,153 @@ function wrapValueBearingPgError(
 }
 
 /**
+ * SQLSTATE CLASSES whose MESSAGE text is structurally value-free, so 'safe'
+ * mode keeps it instead of scrubbing it.
+ *
+ * WHY AN ALLOWLIST AT ALL. Scrubbing every unclassified SQLSTATE deletes the
+ * single most useful sentence a first-run or mistyped query produces, and buys
+ * no privacy doing it. `relation "orders" does not exist` (42P01: you forgot to
+ * migrate) and `column "emial" of relation "users" does not exist` (42703: you
+ * misspelled a field) name SCHEMA OBJECTS. There is no row value in either, so
+ * withholding them protects nothing and costs the reader the entire diagnosis,
+ * in the mode that is on by default. A redaction that removes text which cannot
+ * leak is not a safety measure, it is a cost with nothing on the other side.
+ *
+ * THE RULE. A class is listed when PostgreSQL's message grammar for the codes
+ * in it is written over schema object NAMES, over the STRUCTURE of the
+ * statement, or over SERVER STATE, and never over row data:
+ *   - `42` syntax error or access rule violation: undefined table / column /
+ *     function / object, duplicate object, insufficient privilege, datatype
+ *     mismatch. Names and types, and the whole developer-typo population.
+ *   - `3D` invalid catalog name and `3F` invalid schema name: a database or a
+ *     schema name. (3D000 is claimed by CONNECTION_ERROR_CODES before it can
+ *     reach here; the list states the rule for the class, not which branch
+ *     happens to answer first.)
+ *   - `08` connection exception, `53` insufficient resources, `57` operator
+ *     intervention, `58` system error: transport, resource and server state. No
+ *     statement data at all.
+ *
+ * WHAT IS DELIBERATELY NOT LISTED, because the argument for it fails:
+ *   - `P0001` raise_exception and class `55` object_not_in_prerequisite_state
+ *     carry text written by the FUNCTION AUTHOR, and `RAISE EXCEPTION 'order %
+ *     is already shipped', order_id` is the idiomatic way to write a business
+ *     rule. What is in that text is not knowable from here, and this mode's job
+ *     is to be right about the case it cannot see. So they scrub, and the
+ *     replacement message says the text was withheld and how to see it.
+ *   - Every class nobody has argued about yet. The safe direction for an
+ *     unknown grammar is to withhold; adding a class later is cheap and needs
+ *     exactly the argument above.
+ *
+ * ONLY THE MESSAGE. `detail`, `hint`, `where` and `internalQuery` are redacted
+ * on a listed class exactly as on any other, for the reasons in
+ * {@link VALUE_BEARING_FIELDS}.
+ */
+const VALUE_FREE_MESSAGE_CLASSES: ReadonlySet<string> = new Set(['08', '3D', '3F', '42', '53', '57', '58']);
+
+/**
+ * The one carve-out from {@link VALUE_FREE_MESSAGE_CLASSES}. `42601`
+ * syntax_error is the single class-42 code whose message is defined over the
+ * statement TEXT rather than over names: PostgreSQL quotes the offending token,
+ * and a token can be a string literal, so `syntax error at or near
+ * "'alice@example.com'"` is a reachable message. Turbine binds every value it
+ * emits, so its own SQL text never holds one; SQL a caller assembled by
+ * concatenation does, and that is precisely the code path a syntax error comes
+ * from. Keeping the rule ("scrub where a value can actually ride") true is
+ * worth losing the text on a raw-SQL syntax error, which the replacement
+ * message says how to get back.
+ *
+ * (The `to_tsquery` 42601 never reaches here; {@link wrapPgError} classifies it
+ * as an E003 further up.)
+ */
+const VALUE_BEARING_CODES_IN_VALUE_FREE_CLASSES: ReadonlySet<string> = new Set(['42601']);
+
+/** Whether 'safe' mode may keep the driver's message text for this SQLSTATE. */
+function messageTextIsValueFree(code: string): boolean {
+  return VALUE_FREE_MESSAGE_CLASSES.has(code.slice(0, 2)) && !VALUE_BEARING_CODES_IN_VALUE_FREE_CLASSES.has(code);
+}
+
+/**
+ * The replacement for a withheld server message. It SAYS the text was withheld
+ * and how to see it: `Database error P0001` on its own reads like the whole of
+ * what the server said, so a reader has no reason to look further. Same
+ * reasoning as {@link REDACTED_DETAIL}, which marks the field rather than
+ * deleting it.
+ */
+function withheldServerMessage(code: string): string {
+  return `Database error ${code} (driver text withheld by errorMessages: 'safe'; set errorMessages: 'verbose' to see it)`;
+}
+
+/**
  * The 'safe'-mode treatment of a PostgreSQL server error {@link wrapPgError}
- * has no class for. The code set is frozen (STABILITY.md), so this mints no
- * TURBINE_E0NN and stays outside the TurbineError hierarchy: what comes back is
- * a clone of the driver error, same prototype, same `.code` (the SQLSTATE) and
- * same fields, with the MESSAGE replaced by `Database error <SQLSTATE>`, the
- * `detail` redacted, the rendered stack scrubbed of the original text, and the
- * driver error on `.cause` with the same redaction every mapped class's cause
- * gets. An unclassified code's message grammar is by definition unknown here,
- * so it may embed a value, and withholding it is the only rule that stays
- * true. 'verbose' mode never reaches this function: the raw error passes
- * through, as it always did.
+ * has no class for. 'verbose' mode never reaches this function: the raw error
+ * passes through, as it always did.
+ *
+ * WHAT COMES BACK: a clone of the driver error, same prototype, same frames,
+ * same `.code` (the SQLSTATE), plus `.sqlstate` carrying that same SQLSTATE
+ * under the name every typed Turbine error uses for it
+ * (`ValidationError.sqlstate`, `ConnectionError.sqlstate`), so one `catch`
+ * branch reads one field whichever of the two an operation produced. Every
+ * {@link VALUE_BEARING_FIELDS} entry is redacted. The MESSAGE survives when
+ * {@link messageTextIsValueFree} says this SQLSTATE's grammar cannot hold a row
+ * value, and is replaced by {@link withheldServerMessage} (and substituted out
+ * of the rendered stack) when it can.
+ *
+ * The original is on `.cause` under the same rules, and that matters more than
+ * it looks: `.cause` is the documented escape hatch, so a scrub that empties it
+ * too leaves no way to debug at all. Its message is withheld only where the
+ * returned error's is.
+ *
+ * NOT A TurbineError, deliberately. The obvious complaint about this branch is
+ * that `err instanceof TurbineError` is false, so a caller's
+ * `catch (e) { if (e instanceof TurbineError) ... }` misses it. Making it one is
+ * still wrong, because 'verbose' mode returns the raw driver error UNCHANGED
+ * here and always has: the same database failure would then be a TurbineError
+ * under one setting and a `pg.DatabaseError` under the other, i.e. a
+ * LOG-REDACTION setting would decide which `catch` branch runs. An error whose
+ * TYPE depends on a logging option is a worse bug than the one that would fix.
+ * The frozen code set (STABILITY.md) points the same way: there is no
+ * TURBINE_E0NN for "a SQLSTATE we have no opinion about", minting one is out of
+ * scope, and a Turbine class whose `.code` held a raw SQLSTATE instead would
+ * break both the `TurbineErrorCode` type and the brand matching in
+ * {@link TurbineError[Symbol.hasInstance]}. So `.code` stays the raw SQLSTATE it
+ * has always been, `.sqlstate` is added beside it, and there is no `.docsUrl`:
+ * that field is the anchor for a Turbine CODE, and pointing it at a docs section
+ * that does not exist would be worse than its absence.
  */
 function scrubUnclassifiedServerError(err: object, code: string): unknown {
-  const message = `Database error ${code}`;
+  const keepMessage = messageTextIsValueFree(code);
   try {
-    const original = err as { message?: unknown; detail?: unknown };
-    // The cause: the ordinary mapped-class treatment, with the message withheld
-    // because its grammar is unknown (the flag is what asks for that).
-    const cause = redactCauseForMode(markValueBearingMessage(err));
-    const overrides: PropertyDescriptorMap = {
-      message: { value: message, writable: true, enumerable: false, configurable: true },
-      cause: { value: cause, writable: true, enumerable: false, configurable: true },
-    };
-    if (typeof original.detail === 'string' && original.detail.length > 0) {
-      overrides.detail = {
-        value: REDACTED_DETAIL,
+    const overrides = redactValueBearingFields(err);
+    // The exact message string to substitute out of the rendered stack.
+    const withheld: string[] = [];
+    if (!keepMessage) {
+      const original = (err as { message?: unknown }).message;
+      overrides.message = {
+        value: withheldServerMessage(code),
         writable: true,
-        enumerable: Object.getOwnPropertyDescriptor(err, 'detail')?.enumerable ?? true,
+        enumerable: false,
         configurable: true,
       };
+      if (typeof original === 'string' && original.length > 0) withheld.push(original);
     }
-    const withheld = typeof original.message === 'string' && original.message.length > 0 ? [original.message] : [];
-    // The wrapper's own message is value-free, so it must not carry the flag
-    // that the cause needed.
+    overrides.sqlstate = { value: code, writable: true, enumerable: true, configurable: true };
+    // The value-bearing-message flag is set on `err` itself, so the omit list
+    // strips it from the clone: the clone's own message is either the driver's
+    // value-free text or the withheld sentence, and neither needs the flag.
+    overrides.cause = {
+      value: redactCauseForMode(keepMessage ? err : markValueBearingMessage(err)),
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    };
     return cloneErrorWithOverrides(err, overrides, withheld, [VALUE_BEARING_MESSAGE]);
   } catch {
     // Same posture as redactCauseForMode: a driver error whose descriptors
-    // cannot be replayed must not become a TypeError, and must not leak either,
-    // so the fallback carries the code and the fixed message and nothing else.
-    return Object.assign(new Error(message), { code });
+    // cannot be replayed must not become a TypeError, and must not leak either.
+    // The fallback withholds the text whatever the allowlist said, because
+    // reading it off an object whose own descriptors just failed to replay is
+    // the one thing this branch cannot safely do.
+    return Object.assign(new Error(withheldServerMessage(code)), { code, sqlstate: code });
   }
 }
 
@@ -1456,9 +1632,15 @@ function scrubUnclassifiedServerError(err: object, code: string): unknown {
  *                                    server did) and the SQLSTATE; driver text
  *                                    on `.detail`, redacted in 'safe' mode
  *   42601 from to_tsquery         -> ValidationError with a `search` hint
- *   any other server SQLSTATE     -> 'safe' mode: a clone whose message is
- *                                    `Database error <SQLSTATE>`, original on
- *                                    `.cause`; 'verbose' mode: returned unchanged
+ *   any other server SQLSTATE     -> 'safe' mode: a clone keeping the SQLSTATE
+ *                                    on `.code` and repeating it on `.sqlstate`,
+ *                                    with the value-bearing fields redacted, the
+ *                                    driver message kept when the SQLSTATE
+ *                                    class's grammar cannot hold a row value and
+ *                                    withheld when it can, and the original on
+ *                                    `.cause` under the same rules (see
+ *                                    scrubUnclassifiedServerError);
+ *                                    'verbose' mode: returned unchanged
  *
  * Anything that is not a PostgreSQL server error (no SQLSTATE-shaped code, or
  * no `severity`) is returned unchanged whatever the mode: see isPgServerError.
