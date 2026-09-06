@@ -411,7 +411,9 @@ Turbine therefore refuses the ragged call with a `ValidationError` (`TURBINE_E00
 
 ## update / updateMany
 
-Update a single row by unique key, or every row matching a `where`.
+`update` changes **one row, addressed by a unique key**. `updateMany` changes every row matching a filter.
+
+Since 0.78.0 that is enforced rather than assumed: a `where` that does not identify a single row is refused with `TURBINE_E003`, naming the unique keys the table actually has. It used to update every matching row and return one of them, arbitrarily, which is the same hazard `findUnique` has refused since 0.73. `delete` and `deleteMany` split the same way. If a predicate really does identify one row through a constraint Turbine's metadata cannot see, `allowFullTableScan: UNSAFE` opts out.
 
 ```ts
 await db.users.update({
@@ -511,7 +513,7 @@ const stats = await db.posts.aggregate({
 On a **PII-tagged** column, `_min` / `_max` require `includePii: UNSAFE`;
 `_count` and `where` need no opt-in. See [PII fields](#pii-fields-includepii).
 
-`_sum` / `_avg` return a `number` over `int2` / `int4` / `float` columns and an exact **string** over `int8` / `bigint` and `numeric` / `decimal` columns, where PostgreSQL computes the result as `numeric` and `Number()` would round it; `_min` / `_max` return the column's own type, so `_max` of a `bigint` is a string too. The same rule, with the reasoning, is under [groupBy](#groupby).
+`_sum` / `_avg` return a `number` over `int2` / `int4` / `float` columns and an exact **string** over `int8` / `bigint` and `numeric` / `decimal` columns, where PostgreSQL computes the result as `numeric` and `Number()` would round it; `_min` / `_max` are different, and deliberately so: they return one stored cell, read back by the same driver rule a row uses, so an `int8` comes back as a `number` while it fits in JavaScript's safe integer range and as a string above it. The aggregate rule is decided by the column TYPE and the row rule by the VALUE's magnitude, because `_sum` and `_avg` compute a result no row holds and rounding it is a loss that no later read can undo. The same rule, with the reasoning, is under [groupBy](#groupby).
 
 ## groupBy
 
@@ -836,7 +838,7 @@ Because this is a type-level guarantee, `tsx` and other transpile-only runners w
 | `contains` | Substring match (`LIKE %v%`) | `where: { title: { contains: 'sql' } }` |
 | `startsWith` | Prefix match (`LIKE v%`) | `where: { email: { startsWith: 'admin@' } }` |
 | `endsWith` | Suffix match (`LIKE %v`) | `where: { email: { endsWith: '@acme.com' } }` |
-| `mode: 'insensitive'` | Case-insensitive match. On `contains` / `startsWith` / `endsWith` the `LIKE` becomes `ILIKE` (or the engine's equivalent); on `equals` (or a bare string), `not`, `in` and `notIn` both sides are folded with `LOWER(...)`, so `{ equals: 'ada', mode: 'insensitive' }` matches `Ada`. String columns only: `mode` beside a non-string operand is `TURBINE_E003`. | `where: { title: { contains: 'SQL', mode: 'insensitive' } }` |
+| `mode: 'insensitive'` | Case-insensitive match. On `contains` / `startsWith` / `endsWith` the `LIKE` becomes `ILIKE` (or the engine's equivalent); on `equals`, `not`, `in` and `notIn` both sides are folded with `LOWER(...)`, so `{ equals: 'ada', mode: 'insensitive' }` matches `Ada`. `mode` lives in the operator object, so a bare string has nowhere to carry it: `{ name: 'ada', mode: 'insensitive' }` is an unknown field. String columns only, and `mode` beside a non-string operand is `TURBINE_E003`. **A plain btree index on the column cannot serve the folded comparison**, so a hot equality lookup that was an index scan becomes a sequential one the moment the mode starts being honoured: add `CREATE INDEX ... ON t (LOWER(col))`, or make the column `citext`. | `where: { title: { contains: 'SQL', mode: 'insensitive' } }` |
 
 LIKE wildcards in user input (`%`, `_`, `\`) are escaped automatically.
 

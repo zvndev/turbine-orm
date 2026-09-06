@@ -667,7 +667,7 @@ export default async function Home() {
                 ['Runtime deps', '1 (pg)', '@prisma/client + required driver adapter', '0'],
                 [
                   'Main bundle (brotli)',
-                  'under 87 KB import graph, pg external',
+                  'under 90 KB import graph, pg external',
                   '~1.6 MB client (TS/WASM compiler)',
                   '~7 KB core',
                 ],
@@ -676,7 +676,7 @@ export default async function Home() {
                 ['MCP server for agents', '11 read-only tools, PII-redacted', 'Official MCP server', 'drizzle-kit mcp'],
                 ['Error PII safety', 'Keys only by default', 'Values in messages', 'Raw pg errors'],
                 ['Migrations', 'SQL-first, SHA-256 drift detection', 'DSL-generated, shadow DB', 'SQL or Drizzle Kit'],
-                ['Edge runtime', 'One import swap, under 69 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
+                ['Edge runtime', 'One import swap, under 71 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
                 ['Pipeline batching', 'Parse/Bind/Execute protocol', 'Sequential in txn', 'Sequential'],
                 ['Typed errors', 'isRetryable discriminant', 'Error codes only', 'None'],
                 [

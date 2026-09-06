@@ -15,7 +15,35 @@
  * Checks, in order of how they have actually failed:
  *   1. every git tag `vX.Y.Z` has a matching `## X.Y.Z` heading (the real bug);
  *   2. the version in package.json has one;
- *   3. headings are unique and in descending semver order.
+ *   3. headings are unique and in descending semver order;
+ *   4. every `###` section heading IN THE ENTRY BEING RELEASED is one of the
+ *      sanctioned names.
+ *
+ * ## Why (4)
+ *
+ * `docs/releases/README.md` told readers that "a release that changes behaviour
+ * says so under a `### Breaking` or `### Behaviour changes` heading, and a
+ * release gate checks that the heading is there". No such gate existed. A
+ * document that invents a mechanism is worse than one that states a convention,
+ * because the next reader stops looking.
+ *
+ * What a gate can actually decide is the VOCABULARY. Whether a given change is
+ * breaking is a judgement no regex makes, but a misspelled or invented heading
+ * is mechanical, and the closed set is what makes "under the Breaking heading"
+ * a thing a reader can rely on and a writer cannot fat-finger. Both surfaces
+ * that render this file, the site and the GitHub Release body, group by these
+ * headings, so an unrecognized one is also a rendering bug.
+ *
+ * Adding a heading to the set is a deliberate act: put it in SECTION_HEADINGS
+ * with the release that introduced it, so the list stays a decision rather than
+ * a transcript of whatever anyone typed.
+ *
+ * It checks the CURRENT version's entry only, and deliberately not the file.
+ * Ninety-odd published entries use a wider vocabulary (`### Improved`,
+ * `### Added, client`, `### Benchmarks`), and those are what shipped: rewriting
+ * them to satisfy a rule invented afterwards would make the log disagree with
+ * the releases it records. The rule starts at the entry being written, which is
+ * also the only moment at which a typo is still cheap to fix.
  *
  * Tags are the source of truth for (1) because a published release is the thing
  * that cannot be quietly rewritten. When git is unavailable (a tarball, a fresh
@@ -49,6 +77,32 @@ const changelog = readFileSync(resolve(root, 'CHANGELOG.md'), 'utf8');
 const pkg = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'));
 
 const headings = [...changelog.matchAll(/^## (\d+\.\d+\.\d+)/gm)].map((m) => m[1]);
+
+/**
+ * The sanctioned `###` section names. Kept in the order a release entry reads
+ * best in, which is also the order the site renders them.
+ */
+const SECTION_HEADINGS = new Set([
+  'Breaking',
+  'Behaviour changes',
+  'Security',
+  'Added',
+  'Fixed',
+  'Changed',
+  'Corrected',
+  'Performance',
+  'Measured',
+  'Upgrading',
+  'Docs',
+  'Documentation',
+  'Tests',
+  'Testing',
+  'CI',
+  'Tooling / CI',
+  'Internal',
+  'Notes',
+  'Known limits',
+]);
 const problems = [];
 
 /** `0.64.0-next.c4c43d6` -> `0.64.0`. A prerelease belongs to its base entry. */
@@ -105,6 +159,31 @@ for (const tag of tags) {
   if (version === null || cmp(tag, version) < 0) continue;
   if (!seen.has(tag)) {
     problems.push(`v${tag} is tagged and published but CHANGELOG.md has no \`## ${tag}\` heading.`);
+  }
+}
+
+// (4) Every `###` section heading in the entry being released is sanctioned.
+if (version !== null) {
+  const at = changelog.indexOf(`\n## ${version}`);
+  if (at !== -1) {
+    const rest = changelog.slice(at + 1);
+    const nextVersion = rest.search(/\n## \d+\.\d+\.\d+/);
+    const entry = nextVersion === -1 ? rest : rest.slice(0, nextVersion);
+    const sections = [...entry.matchAll(/^### (.+?)\s*$/gm)].map((m) => m[1]);
+    if (sections.length === 0) {
+      problems.push(
+        `The ## ${version} entry has no \`###\` section headings, so a reader and both renderers ` +
+          `(the site and the GitHub Release body) get one undifferentiated block.`,
+      );
+    }
+    for (const h of [...new Set(sections.filter((x) => !SECTION_HEADINGS.has(x)))]) {
+      problems.push(
+        `The ## ${version} entry uses the section heading "### ${h}", which is not one of the ` +
+          `sanctioned names (${[...SECTION_HEADINGS].join(', ')}). Use one of those, or add this one ` +
+          `to SECTION_HEADINGS in scripts/check-changelog-headings.mjs with the release that ` +
+          `introduced it.`,
+      );
+    }
   }
 }
 

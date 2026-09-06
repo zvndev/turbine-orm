@@ -39,7 +39,7 @@ export const PostSchema = z.object({
   createdAt: z.coerce.date(),
 });
 
-// Create input, PK, defaulted, and nullable columns optional
+// Create input: server-generated, defaulted and nullable columns optional
 export const PostCreateSchema = z.object({
   id: z.number().optional(),
   title: z.string(),
@@ -57,7 +57,7 @@ export const PostUpdateSchema = z.object({
 });
 ```
 
-`XCreateSchema` and `XUpdateSchema` mirror the generated `*Create` / `*Update` input types: the create schema makes primary-key, defaulted, and nullable columns optional; the update schema makes every non-PK column optional and drops the primary key.
+`XCreateSchema` and `XUpdateSchema` mirror the generated `*Create` / `*Update` input types: the create schema makes server-generated (serial / identity), defaulted, and nullable columns optional, so a primary key that is none of those (a `text` natural key, a client-supplied `uuid` with no database default, a composite key of plain integers) is **required**; the update schema makes every non-PK column optional and drops the primary key. Before 0.78.0 every primary key was optional, which typechecked a `create` the database then refused.
 
 ## Type mapping
 
