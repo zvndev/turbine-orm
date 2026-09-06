@@ -616,6 +616,23 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
   qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
   // Prisma compound-unique selector on the conflict target → its member columns.
   const upsertWhere = expandCompoundUniqueWhere(qi.tableMeta, args.where as Record<string, unknown>);
+  // An upsert's `where` becomes the CONFLICT TARGET, so it carries the same
+  // one-row contract `update` / `delete` do and is refused by the same rule
+  // (query/compound-unique.ts), with its own sentence because the consequence
+  // differs. Without it a non-unique `where` reached the server as
+  // `ON CONFLICT ("role")` and came back as a bare SQLSTATE 42P10 on
+  // PostgreSQL, and WORSE than an error on the engines that do not read the
+  // conflict target back: MySQL's `ON DUPLICATE KEY UPDATE` ignores it and
+  // keys off whichever unique index the row happens to violate, and SQL
+  // Server's `MERGE ... ON` matches every row the predicate matches and
+  // updates all of them.
+  //
+  // Before any SQL is assembled, and this is the only where-guard `upsert`
+  // runs: `{}` and `{ email: undefined }` are refused here too, and by the
+  // right sentence. The empty-`where` guard's own message points at
+  // `allowFullTableScan: UNSAFE`, which is not an option on `UpsertArgs` at
+  // all, so borrowing it here would name a way out that does not exist.
+  assertMutationWhereIdentifiesOneRow(qi.tableMeta, qi.table, upsertWhere, 'upsert');
   // Build the INSERT part from create data
   const createEntries = writeEntries(qi, args.create as Record<string, unknown>);
   const columns = createEntries.map(([k]) => qi.toSqlColumn(k));
@@ -654,7 +671,20 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
   if (qi.dialect.supportsUpsertUpdateWhere) {
     const gf = whereMod.resolveGlobalFilter(qi, qi.table);
     if (gf) {
-      updateWhere = whereMod.buildAliasWhere(qi, qi.table, qi.tableMeta, qi.q(qi.table), gf, params) ?? undefined;
+      // Compiled through a scope whose FROM-item reference is ALREADY RENDERED
+      // (`"users"`), which is what the target table is inside `ON CONFLICT ...
+      // DO UPDATE`. `aliasWhereScope` is the wrong seam for that: it takes a
+      // BARE alias and quotes it itself for the nested-relation correlation
+      // parent, so handing it `q(table)` produced a triple-quoted reference
+      // inside an EXISTS body and the whole statement failed with 42P01
+      // whenever the configured global filter was a relation filter rather
+      // than a plain column. A bare table name is not the answer either: it
+      // would leave the qualifier unquoted and break every table whose name
+      // needs quoting. `buildRenderedRefWhere` is the rendered-reference seam,
+      // one parameter with one meaning, used for the qualifier and the
+      // correlation parent alike, and shared with the batched `_count`
+      // follow-up, which had the identical bug.
+      updateWhere = whereMod.buildRenderedRefWhere(qi, qi.table, qi.tableMeta, qi.q(qi.table), gf, params) ?? undefined;
     }
   }
 

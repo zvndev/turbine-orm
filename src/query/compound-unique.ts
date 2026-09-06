@@ -262,31 +262,66 @@ export function assertWhereIdentifiesOneRow(
 }
 
 /**
- * The same refusal for the single-row WRITE methods, `update` and `delete`.
+ * The escape hatch sentence, on `update` / `delete` only.
  *
- * Those two emit `... WHERE <predicate> RETURNING *` and hand back `rows[0]`,
- * so a `where` that matches many rows mutates EVERY one of them and reports
- * one: the `findUnique` hazard (an arbitrary one of many) with a write
- * attached. Same rule, same sources of uniqueness, same null policy as
+ * Stated with its cost rather than as an option to reach for: the same flag
+ * turns off the empty-`where` guard, so a predicate that is merely NARROW today
+ * and becomes EMPTY tomorrow (every value `undefined` on a request that omitted
+ * them) writes the whole table instead of being refused.
+ */
+const UNSAFE_ESCAPE =
+  'If this predicate really does identify one row through a constraint this schema does not describe, ' +
+  '`allowFullTableScan: UNSAFE` writes it anyway, at the cost of the empty-`where` guard as well: an ' +
+  'all-`undefined` `where` then matches every row instead of being refused.';
+
+/**
+ * The same refusal for the single-row WRITE methods, `update` and `delete`, and
+ * for `upsert`, whose `where` carries the same one-row contract by a different
+ * mechanism.
+ *
+ * `update` / `delete` emit `... WHERE <predicate> RETURNING *` and hand back
+ * `rows[0]`, so a `where` that matches many rows mutates EVERY one of them and
+ * reports one: the `findUnique` hazard (an arbitrary one of many) with a write
+ * attached. `upsert`'s `where` is not a predicate at all, it IS the conflict
+ * target, so a non-unique one has no single row to update on conflict and the
+ * emitted `ON CONFLICT (...)` names columns no unique index backs. Same rule,
+ * same sources of uniqueness, same null policy as
  * {@link assertWhereIdentifiesOneRow}; only the sentence differs, because the
- * fix differs. A reader who meant one row names a key; a reader who meant every
- * matching row has `updateMany` / `deleteMany`, which report `{ count }` and
- * never pretend to have touched one row.
+ * consequence and the fix differ per operation. A reader who meant one row
+ * names a key; a reader who meant every matching row has `updateMany` /
+ * `deleteMany`, which report `{ count }` and never pretend to have touched one
+ * row.
  *
  * Called on the CALLER's where, before any global filter is merged in (a
- * tenancy filter narrows, it does not identify) and only when the caller has
- * not opted into a full-table mutation with `allowFullTableScan: UNSAFE`, which
- * already says "every row" in so many words.
+ * tenancy filter narrows, it does not identify). `update` / `delete` skip it
+ * under `allowFullTableScan: UNSAFE`, which already says "every row" in so many
+ * words, and their message names that hatch: a predicate CAN identify one row
+ * through a constraint this schema's metadata does not carry (a stale generated
+ * `metadata.ts`, a `defineSchema` that declares fewer uniques than the database
+ * has), and a rule with no way past it turns that into an unreachable method.
+ * `upsert` has no such option and its message therefore offers none.
  */
 export function assertMutationWhereIdentifiesOneRow(
   meta: TableMetadata,
   table: string,
   where: Record<string, unknown> | undefined,
-  operation: 'update' | 'delete',
+  operation: 'update' | 'delete' | 'upsert',
 ): void {
   if (whereIdentifiesOneRow(meta, where ?? {})) return;
-  const many = operation === 'update' ? 'updateMany' : 'deleteMany';
   const keys = describeUniqueKeys(meta);
+  if (operation === 'upsert') {
+    const advice =
+      keys.length > 0
+        ? `Name a unique key (${keys.join(', ')}).`
+        : `Table "${table}" declares no primary key and no unique constraint, so no \`where\` can identify one row ` +
+          'here and no upsert is possible on it: insert with `create`, or change matching rows with `updateMany`.';
+    throw new ValidationError(
+      `upsert on "${table}" refused: the \`where\` clause does not identify a single row. An upsert's \`where\` IS ` +
+        'its conflict target, so there is no one row to update on conflict, and the `ON CONFLICT` this would emit ' +
+        `names columns no unique constraint backs. ${advice}`,
+    );
+  }
+  const many = operation === 'update' ? 'updateMany' : 'deleteMany';
   const advice =
     keys.length > 0
       ? `Name a unique key (${keys.join(', ')}), or use \`${many}\` if you meant "every row matching a filter".`
@@ -294,7 +329,7 @@ export function assertMutationWhereIdentifiesOneRow(
         `here. Use \`${many}\`, which reports how many rows it touched.`;
   throw new ValidationError(
     `${operation} on "${table}" refused: the \`where\` clause does not identify a single row, ` +
-      `so this would ${operation} every row that matches and return only one of them. ${advice}`,
+      `so this would ${operation} every row that matches and return only one of them. ${advice} ${UNSAFE_ESCAPE}`,
   );
 }
 
@@ -333,6 +368,55 @@ function uniqueColumnSets(meta: TableMetadata): string[][] {
   return sets;
 }
 
+// ---------------------------------------------------------------------------
+// Engine-addressed row selectors
+// ---------------------------------------------------------------------------
+
+/**
+ * Brands a predicate Turbine wrote ENTIRELY itself to address the one row a
+ * DECLARED to-one relation points at, so the single-row write rule accepts it.
+ *
+ * A nested `disconnect: true` / `delete: true` on a `hasOne`, and a nested
+ * `update` on a `belongsTo` (whose argument is `{ data }`, with no `where` at
+ * all), give the caller no selector to write. The engine builds the predicate
+ * from the relation's own correlation key, and the thing that makes it one row
+ * is the relation's declared CARDINALITY, which is not in `primaryKey` /
+ * `uniqueColumns` / `indexes` and so is invisible to
+ * {@link whereIdentifiesOneRow}. Without this the rule refused those writes
+ * with "Name a unique key", advice the caller cannot take because they never
+ * wrote a `where`, on every schema whose `hasOne` FK is not ALSO declared
+ * unique: the `defineSchema` code-first path, the PowDB path, and any FK backed
+ * only by a partial unique index.
+ *
+ * Turbine believes a declared `hasOne` everywhere else (it reads the relation
+ * as an object rather than an array, and emits `LIMIT 1` for it), so believing
+ * it here is consistency, not a hole. The brand is applied at the one place the
+ * predicate is synthesized (`scopeWhereToParent` / the belongsTo correlation in
+ * nested-write.ts) and never to anything a caller supplied.
+ *
+ * A distinct Symbol rather than a second meaning for `markInternalCombinator`:
+ * that brand exists to keep a fixed-arity wrapper on a NAMED prepared
+ * statement, and folding "identifies one row" into it would mean any future
+ * fixed-arity wrapper silently switched this rule off. `Symbol.for` for the
+ * ESM/CJS cross-copy identity reason `INTERNAL_COMBINATOR` documents, and a
+ * SYMBOL so the `Object.keys` every where walker enumerates never sees it and
+ * no emitted SQL can change.
+ */
+export const INTERNAL_ROW_SELECTOR = Symbol.for('turbine.internalRowSelector');
+
+/** Tag `where` as an engine-written single-row selector, and return it. */
+export function markInternalRowSelector<T extends object>(where: T): T {
+  Object.defineProperty(where, INTERNAL_ROW_SELECTOR, { value: true, enumerable: false, configurable: true });
+  return where;
+}
+
+/** Did Turbine itself write this predicate to address one declared related row? */
+export function isInternalRowSelector(where: unknown): boolean {
+  return (
+    typeof where === 'object' && where !== null && (where as Record<symbol, unknown>)[INTERNAL_ROW_SELECTOR] === true
+  );
+}
+
 /**
  * True when `where` pins every column of at least one unique key to a single
  * value, so the row it names is the row it gets.
@@ -354,8 +438,14 @@ function uniqueColumnSets(meta: TableMetadata): string[][] {
  * brand is a Symbol no request body can produce, the arity is fixed at two,
  * and each branch only narrows the other, so the wrapper identifies a row
  * exactly when one of its branches does. A caller-written `AND` is not read.
+ *
+ * The other thing it reads is {@link markInternalRowSelector}: a predicate the
+ * ENGINE wrote in full, for which there is no caller `where` this rule could be
+ * about. See that function for why the declaration, not the metadata, is the
+ * uniqueness source there.
  */
 export function whereIdentifiesOneRow(meta: TableMetadata, where: Record<string, unknown>): boolean {
+  if (isInternalRowSelector(where)) return true;
   if (isInternalCombinator(where) && Array.isArray(where.AND)) {
     return (where.AND as unknown[]).some(
       (branch) =>

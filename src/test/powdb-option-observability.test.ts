@@ -188,6 +188,8 @@ const OBSERVATION: Record<string, Observation> = {
   // compound-unique.ts), so their probe changes the PK value instead.
   'update.where': { how: 'compiled', value: { id: 'zzz-distinct' } },
   'delete.where': { how: 'compiled', value: { id: 'zzz-distinct' } },
+  // `upsert`'s where is its conflict target and carries the same rule.
+  'upsert.where': { how: 'compiled', value: { id: 'zzz-distinct' } },
   select: { how: 'compiled', value: { id: true } },
   omit: { how: 'compiled', value: { name: true } },
   with: { how: 'compiled', value: { posts: true } },

@@ -630,17 +630,19 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   /**
    * The single-row WRITE rule (`update` / `delete` return one row, so their
-   * `where` must identify one), shared with the SQL engines through
-   * query/compound-unique.ts so the two cannot disagree about which writes are
-   * valid. Skipped under the explicit full-table opt-in, which already means
-   * "every row". Runs AFTER `assertCompiledWhere`, so an empty selector keeps
+   * `where` must identify one; `upsert`'s `where` names the row it conflicts
+   * on), shared with the SQL engines through query/compound-unique.ts so the
+   * two cannot disagree about which writes are valid. Skipped under the
+   * explicit full-table opt-in, which already means "every row". For `update` /
+   * `delete` it runs AFTER `assertCompiledWhere`, so an empty selector keeps
    * the empty-where message and this only refuses a non-empty one that names no
-   * key.
+   * key; `upsert` takes no `allowFullTableScan` and has no empty-where guard to
+   * run first, so this is its only where check and it covers `{}` as well.
    */
   private assertMutationIdentifiesOneRow(
     where: WhereClause<T> | undefined,
     allowFullTableScan: boolean | undefined,
-    operation: 'update' | 'delete',
+    operation: 'update' | 'delete' | 'upsert',
   ): void {
     if (allowFullTableScan) return;
     assertMutationWhereIdentifiesOneRow(this.meta, this.table, where as Record<string, unknown> | undefined, operation);
@@ -3385,6 +3387,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async upsert(args: UpsertArgs<T>): Promise<T> {
     return this.withMiddleware('upsert', args as unknown as Record<string, unknown>, async () => {
+      // The single-row rule for `upsert`, shared with the SQL engines through
+      // query/compound-unique.ts. PowqlInterface is a PARALLEL implementation,
+      // not a subclass, so a rule adopted only on the SQL side is two engines
+      // disagreeing about whether a query is VALID, which is the failure class
+      // 0.64.0 and 0.72.0 were both spent on. Before `applyPkDefault`, so a
+      // refused upsert mints no client-side UUID and sends nothing.
+      this.assertMutationIdentifiesOneRow(this.expandedWhere(args.where), false, 'upsert');
       const createData = this.applyPkDefault(args.create as Record<string, unknown>);
       const pkCol = this.meta.primaryKey[0];
       if (this.meta.primaryKey.length !== 1 || !pkCol) {

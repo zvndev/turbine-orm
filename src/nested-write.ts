@@ -20,6 +20,7 @@ import {
   UnsupportedFeatureError,
   ValidationError,
 } from './errors.js';
+import { markInternalRowSelector } from './query/compound-unique.js';
 import { markInternalCombinator, resolveColumnName } from './query/utils.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
 import { normalizeKeyColumns } from './schema.js';
@@ -483,9 +484,20 @@ function belongsToCorrelationWhere(
  * can silently overwrite the other.
  */
 function scopeWhereToParent(
-  target: Record<string, unknown>,
+  // `true` is the to-one "the single related row" spelling, the only non-object
+  // value assertTargetSelectsSomething lets through.
+  target: Record<string, unknown> | true,
   correlation: Record<string, unknown>,
 ): Record<string, unknown> {
+  // `disconnect: true` / `delete: true` on a to-one relation (the only place
+  // `true` gets past assertTargetSelectsSomething) leaves the caller with no
+  // selector at all: the predicate below is the correlation and nothing else,
+  // written entirely by the engine. Branded so the single-row write rule reads
+  // the relation's declared cardinality as the uniqueness source, since a
+  // `hasOne` FK is frequently not ALSO declared unique in metadata and the
+  // rule would otherwise refuse the write with "Name a unique key" against a
+  // call that never named one. See markInternalRowSelector.
+  if (target === true) return markInternalRowSelector({ ...correlation });
   for (const key of Object.keys(correlation)) {
     // Branded as Turbine's own: this `AND` has a FIXED arity of two, chosen
     // here rather than reachable from a request body, so it must not cost the
@@ -1789,7 +1801,11 @@ async function processBelongsToUpdate(
   // shared correlation helper (like every sibling operation) so a NULL parent
   // FK reports not-found instead of compiling to `refField IS NULL` and
   // updating EVERY row of the related table with a null reference key.
-  const where = belongsToCorrelationWhere(ctx, rel, parentRow, parentTable);
+  // No caller `where` exists on this shape (`update: { data }`), so the
+  // predicate is entirely the engine's: branded for the single-row write rule
+  // exactly as the to-one disconnect/delete correlation is.
+  const correlationWhere = belongsToCorrelationWhere(ctx, rel, parentRow, parentTable);
+  const where = correlationWhere && markInternalRowSelector(correlationWhere);
   if (!where) {
     // Parent FK is NULL: it points at nothing, so nothing is in scope to update.
     const nullFk = Object.fromEntries(normalizeKeyColumns(rel.foreignKey).map((c) => [c, null]));

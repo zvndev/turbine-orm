@@ -112,6 +112,9 @@ const FIXTURES: { name: string; primaryKey: string[]; baselines: Record<string, 
       findUnique: { where: { tenantId: 't1', id: 1 } },
       update: { where: { tenantId: 't1', id: 1 }, data: { name: 'b' } },
       delete: { where: { tenantId: 't1', id: 1 } },
+      // `upsert`'s where is its CONFLICT TARGET, so the same rule applies: the
+      // whole composite key, or nothing addresses one row to conflict on.
+      upsert: { where: { tenantId: 't1', id: 1 }, create: { name: 'a' }, update: { name: 'b' } },
     },
   },
 ];
@@ -196,6 +199,8 @@ const OBSERVATION: Record<string, Observation> = {
   'findUnique.where': { how: 'compiled', value: { email: 'other@example.test' } },
   'update.where': { how: 'compiled', value: { email: 'other@example.test' } },
   'delete.where': { how: 'compiled', value: { email: 'other@example.test' } },
+  // `upsert.where` is the conflict target, refused unless it names a unique key.
+  'upsert.where': { how: 'compiled', value: { email: 'other@example.test' } },
   select: { how: 'compiled', value: { id: true } },
   omit: { how: 'compiled', value: { name: true } },
   with: { how: 'compiled', value: { posts: true } },
