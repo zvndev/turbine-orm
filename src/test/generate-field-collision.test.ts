@@ -26,7 +26,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { describe } from 'node:test';
+import { describe, it } from 'node:test';
 import pg from 'pg';
 import { TurbineErrorCode, ValidationError } from '../errors.js';
 import { generateIndex, generateMetadata, generateTypes } from '../generate.js';
@@ -92,8 +92,6 @@ function expectCollision(fn: () => unknown, columns: string[], tableName: string
 }
 
 describe('assertDistinctColumnFields (pure)', () => {
-  const { it } = skipGate(false, '');
-
   it('two columns on one field throw E003 naming the table, both columns and the fix', () => {
     const message = expectCollision(
       () => assertDistinctColumnFields(COLLIDING.name, COLLIDING.columns),
@@ -139,7 +137,6 @@ describe('assertDistinctColumnFields (pure)', () => {
 });
 
 describe('generate* refuses a schema whose table carries a field collision', () => {
-  const { it } = skipGate(false, '');
   const colliding: SchemaMetadata = { enums: {}, tables: { order: COLLIDING } };
   const distinct: SchemaMetadata = { enums: {}, tables: { order: DISTINCT } };
 
