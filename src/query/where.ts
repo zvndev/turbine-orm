@@ -593,12 +593,18 @@ export function collectOperatorParams(
     params.push(cv(op.not));
   }
   if (op.in !== undefined) {
-    if (insensitive) assertInsensitiveOperand(op.in, 'in', column);
-    params.push(qi.inParam(insensitiveListOperand(qi, cv(op.in), insensitive)));
+    if (insensitive) {
+      assertInsensitiveOperand(op.in, 'in', column);
+      requireInsensitiveList(qi, column, 'in');
+    }
+    params.push(qi.inParam(cv(op.in)));
   }
   if (op.notIn !== undefined) {
-    if (insensitive) assertInsensitiveOperand(op.notIn, 'notIn', column);
-    params.push(qi.inParam(insensitiveListOperand(qi, cv(op.notIn), insensitive)));
+    if (insensitive) {
+      assertInsensitiveOperand(op.notIn, 'notIn', column);
+      requireInsensitiveList(qi, column, 'notIn');
+    }
+    params.push(qi.inParam(cv(op.notIn)));
   }
   if (op.contains !== undefined) params.push(`%${likeOperand(qi, op.contains)}%`);
   if (op.startsWith !== undefined) params.push(`${likeOperand(qi, op.startsWith)}%`);
@@ -1807,20 +1813,26 @@ export function buildOperatorClauses(
     }
   }
   if (op.in !== undefined) {
-    if (insensitive) assertInsensitiveOperand(op.in, 'in', column);
-    params.push(qi.inParam(insensitiveListOperand(qi, cv(op.in), insensitive)));
+    if (insensitive) {
+      assertInsensitiveOperand(op.in, 'in', column);
+      requireInsensitiveList(qi, column, 'in');
+    }
+    params.push(qi.inParam(cv(op.in)));
     clauses.push(
       insensitive
-        ? insensitiveInClause(qi, column, qi.p(params.length), false)
+        ? insensitiveInClause(qi, column, qi.p(params.length), false, 'in')
         : qi.inClause(column, qi.p(params.length), false),
     );
   }
   if (op.notIn !== undefined) {
-    if (insensitive) assertInsensitiveOperand(op.notIn, 'notIn', column);
-    params.push(qi.inParam(insensitiveListOperand(qi, cv(op.notIn), insensitive)));
+    if (insensitive) {
+      assertInsensitiveOperand(op.notIn, 'notIn', column);
+      requireInsensitiveList(qi, column, 'notIn');
+    }
+    params.push(qi.inParam(cv(op.notIn)));
     clauses.push(
       insensitive
-        ? insensitiveInClause(qi, column, qi.p(params.length), true)
+        ? insensitiveInClause(qi, column, qi.p(params.length), true, 'notIn')
         : qi.inClause(column, qi.p(params.length), true),
     );
   }
@@ -2086,33 +2098,65 @@ function insensitiveEquality(column: string, operator: '=' | '!=', paramRef: str
 /**
  * The `in` / `notIn` comparison under `mode: 'insensitive'`.
  *
- * PostgreSQL keeps the fold on the server: the list stays ONE bound `text[]`
- * (length-independent, so the statement text and its cache key are unchanged
- * whatever the list length) and each element is lowered by the engine inside
- * `unnest`. `NOT IN` keeps SQL's NULL semantics, matching the plain `!= ALL`.
+ * The fold is the engine's on BOTH sides: the column is lowered by `LOWER`,
+ * and so is every list element, inside `unnest`. The list stays ONE bound
+ * `text[]`, so the statement text (and therefore its cache key) is independent
+ * of the list length. `NOT IN` keeps SQL's NULL semantics, matching the plain
+ * `!= ALL`.
  *
- * Every other engine binds an IN list as a JSON document its dialect unpacks
- * in a subquery whose column name is the dialect's own, so the elements cannot
- * be lowered in SQL from here; they are lowered on the client instead, by
- * {@link insensitiveListOperand}, and only the column side is folded here.
+ * PostgreSQL only; {@link requireInsensitiveList} is the gate, and it runs on
+ * the param path as well so a warm template cannot slip past it.
  */
-function insensitiveInClause(qi: BuilderCtx, column: string, paramRef: string, negated: boolean): string {
-  if (qi.dialect.name === 'postgresql') {
-    return `LOWER(${column}) ${negated ? 'NOT IN' : 'IN'} (SELECT LOWER(v) FROM unnest(${paramRef}::text[]) AS v(v))`;
-  }
-  return qi.inClause(`LOWER(${column})`, paramRef, negated);
+function insensitiveInClause(
+  qi: BuilderCtx,
+  column: string,
+  paramRef: string,
+  negated: boolean,
+  operator: 'in' | 'notIn',
+): string {
+  requireInsensitiveList(qi, column, operator);
+  return `LOWER(${column}) ${negated ? 'NOT IN' : 'IN'} (SELECT LOWER(v) FROM unnest(${paramRef}::text[]) AS v(v))`;
 }
 
 /**
- * The bound list for an insensitive `in` / `notIn`. PostgreSQL folds inside
- * the statement (see {@link insensitiveInClause}) and gets the list verbatim;
- * the other engines get the elements lowered here, with the documented caveat
- * that a JavaScript fold of `İ` / `ß` can differ from the engine's own. Runs on
- * the build AND the collect path, so a warm template binds the same values.
+ * Gate `mode: 'insensitive'` on `in` / `notIn` to PostgreSQL.
+ *
+ * The property the operator has to hold is that the COLUMN and the LIST
+ * ELEMENTS are folded by the SAME function. Break that and `equals` and `in`
+ * answer the same operand with DIFFERENT rows on the same engine, which is a
+ * wrong row and not an error.
+ *
+ * The first cut broke it: the column went through the engine's `LOWER` while
+ * the elements went through JavaScript's `toLowerCase()`. Those are two
+ * alphabets. SQLite's `LOWER` is ASCII-only, so over the rows `CAFÉ` and
+ * `café` the operand `'CAFÉ'` matched `CAFÉ` through `equals` and `café`
+ * through `in` - not an exotic-codepoint edge case but every non-ASCII letter
+ * on that engine.
+ *
+ * Folding the elements in SQL instead is not reachable from here for the other
+ * dialects: each unpacks a bound IN list in a subquery of its OWN shape
+ * (`json_each` / `JSON_TABLE` / `OPENJSON`) whose projection is written by the
+ * dialect, not by this module, and the length-independence the SQL-template
+ * cache depends on rules out the other portable form, one placeholder per
+ * element. Restoring the operator on those engines means a dialect hook that
+ * projects the folded element, one correct implementation per engine. Until
+ * then a typed refusal is the honest outcome. `equals`, `not` and the LIKE
+ * operators are unaffected: they fold a single operand the engine can reach.
+ *
+ * Called from BOTH the build and the cache-hit param-collect path, mirroring
+ * every other gate in this module.
  */
-function insensitiveListOperand(qi: BuilderCtx, values: unknown, insensitive: boolean): unknown {
-  if (!insensitive || qi.dialect.name === 'postgresql' || !Array.isArray(values)) return values;
-  return values.map((v) => (typeof v === 'string' ? v.toLowerCase() : v));
+function requireInsensitiveList(qi: BuilderCtx, column: string, operator: 'in' | 'notIn'): void {
+  if (qi.dialect.name === 'postgresql') return;
+  throw new UnsupportedFeatureError(
+    `mode: 'insensitive' on \`${operator}\` (${column})`,
+    qi.dialect.name,
+    "Case-folding a bound list needs the engine to lower every element in SQL, which this dialect's " +
+      'IN-list form cannot express. Lowering them in JavaScript instead would fold the list and the ' +
+      `column by two different functions, so \`equals\` and \`${operator}\` would return different rows ` +
+      'for the same operand. Write the list as branches: ' +
+      "`{ OR: [{ field: { equals: a, mode: 'insensitive' } }, ...] }`.",
+  );
 }
 
 /**

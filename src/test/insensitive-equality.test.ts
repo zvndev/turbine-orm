@@ -6,8 +6,15 @@
  * type-checks, but the builder read `mode` for the three LIKE operators only
  * and silently compiled the equality case-sensitively (`"name" = $1`, zero rows
  * where ILIKE finds 55). The case fold is `LOWER(col) = LOWER($n)`: exact,
- * portable to every engine, and evaluated by the DATABASE, because the JS
- * `toLowerCase()` disagrees with PostgreSQL's `LOWER` on `İ` and `ß`.
+ * portable to every engine, and evaluated by the DATABASE on BOTH sides. That
+ * last part is the whole rule: folding one side in JavaScript and the other in
+ * SQL compares two different alphabets, so the operand never reaches
+ * `toLowerCase()` here.
+ *
+ * The list operators (`in` / `notIn`) hold the same rule but can only keep it
+ * on PostgreSQL, which folds the elements inside `unnest`; every other dialect
+ * refuses them with E017. That half lives in `insensitive-in-fold.test.ts`,
+ * which asserts the rule itself (equals and in never disagree) across engines.
  *
  * Two layers:
  *  1. Build-only SQL pins (no DB).
@@ -52,7 +59,7 @@ describe('mode: insensitive on the equality family (build-only)', () => {
     assert.deepEqual(params, ['Dup Name']);
   });
 
-  it('in / notIn fold the column and every list element inside the database', () => {
+  it('in / notIn fold the column and every list element inside the database (postgresql)', () => {
     const q = makeQuery('users', buildSchema());
     const inQ = q.buildFindMany({ where: { name: { in: ['Dup Name', 'USER 1'], mode: 'insensitive' } } });
     assert.match(inQ.sql, /WHERE LOWER\("name"\) IN \(SELECT LOWER\(v\) FROM unnest\(\$1::text\[\]\) AS v\(v\)\)$/);

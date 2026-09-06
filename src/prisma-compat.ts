@@ -146,7 +146,7 @@ import {
   UPDATE_OPTIONS,
   UPSERT_OPTIONS,
 } from './query/index.js';
-import { suggestKey } from './query/utils.js';
+import { markInternalCombinator, suggestKey } from './query/utils.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
 import { assertWhereDepth, MAX_WHERE_DEPTH } from './query/where-compile.js';
 import type { PrismaCompatMap, PrismaModelMap, RelationDef, SchemaMetadata } from './schema.js';
@@ -422,11 +422,24 @@ function lookupsFor(ctx: Ctx, mm: PrismaModelMap): ModelLookups {
  * primary-key column, else the table's first column, so it is always a real
  * column of this table and the predicate stays a plain scalar comparison the
  * cache fingerprints like any other.
+ *
+ * A table this layer cannot name a column of THROWS. The fallback used to be
+ * `{}`, an empty `where` fragment - which is not "no rows" but its exact
+ * opposite, EVERY row, and it would have been merged in silently beside the
+ * caller's other predicates. A sentinel builder that cannot build a sentinel
+ * has not succeeded, and the one shape it exists to compile is the one where
+ * answering "all of them" instead of "none of them" is worst.
  */
 function matchNothing(ctx: Ctx, mm: PrismaModelMap): Record<string, unknown> {
   const meta = ctx.schema.tables[mm.table];
   const column = meta?.primaryKey?.[0] ?? meta?.allColumns?.[0];
-  if (!meta || !column) return {};
+  if (!meta || !column) {
+    throw new ValidationError(
+      `An empty \`OR\` on model ${mm.table} means "no rows", and compiling that needs one real column ` +
+        `of the table, but the schema metadata for "${mm.table}" lists none. Regenerate the client ` +
+        '(`npx turbine generate`) so the table carries its columns, or drop the empty `OR`.',
+    );
+  }
   return { [meta.reverseColumnMap?.[column] ?? column]: { in: [] } };
 }
 
@@ -828,6 +841,9 @@ function translateWhere(ctx: Ctx, mm: PrismaModelMap, where: unknown, depth = 0)
   assertTranslateDepth(depth, 'where');
   if (!isPlainObject(where)) return where as undefined;
   const out: Record<string, unknown> = {};
+  // The empty-`OR` sentinel, held aside rather than merged into `out`. At most
+  // one per level, since `OR` is a single object key.
+  let matchNone: Record<string, unknown> | undefined;
   for (const [key, val] of Object.entries(where)) {
     if (COMBINATORS.has(key)) {
       // An EMPTY `OR` is false in Prisma (no branch can match), while an empty
@@ -837,8 +853,16 @@ function translateWhere(ctx: Ctx, mm: PrismaModelMap, where: unknown, depth = 0)
       // "none of these" answered with "all of them". Compiled to a predicate
       // that matches nothing so this layer keeps Prisma's meaning; core's own
       // semantics are unchanged and documented separately.
+      //
+      // Held aside, NOT `Object.assign`ed onto `out`: the sentinel is keyed on
+      // a real column of the table, so merging it made two predicates on one
+      // key collide and JavaScript's key ORDER decided which survived.
+      // `{ OR: [], id: 5 }` kept the caller's `id = 5` and dropped the
+      // sentinel (returning the row Prisma excludes); `{ id: 5, OR: [] }` kept
+      // the sentinel and dropped the caller's `id = 5`. Same query, same
+      // meaning, opposite predicate.
       if (key === 'OR' && Array.isArray(val) && val.length === 0) {
-        Object.assign(out, matchNothing(ctx, mm));
+        matchNone = matchNothing(ctx, mm);
         continue;
       }
       // An `AND` / `OR` array of N conditions is ONE level, not N: the elements
@@ -880,7 +904,18 @@ function translateWhere(ctx: Ctx, mm: PrismaModelMap, where: unknown, depth = 0)
     // through unchanged (Prisma operator names match Turbine's).
     out[renameField(mm, key)] = val;
   }
-  return out;
+  if (!matchNone) return out;
+  // Nothing else at this level: the sentinel IS the where, no wrapper needed.
+  if (Object.keys(out).length === 0) return matchNone;
+  // Otherwise conjoin, so neither half can overwrite the other whatever order
+  // the caller wrote the keys in. BRANDED, because an `AND` array is the shape
+  // that makes a statement unnamed (a caller-written combinator has a
+  // caller-sized arity); this one is Turbine's, with a fixed arity of two, and
+  // an unbranded wrapper here would quietly take every compat query carrying an
+  // empty `OR` off named prepared statements. The caller's own combinators sit
+  // INSIDE `out` and are walked at the next level with their own brand check,
+  // so they still count.
+  return markInternalCombinator({ AND: [out, matchNone] });
 }
 
 function translateRelationFilter(ctx: Ctx, target: PrismaModelMap | undefined, val: unknown, depth: number): unknown {
