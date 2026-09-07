@@ -227,6 +227,56 @@ describe('powdb F2 integration: join vs loader parity (embedded)', () => {
     });
   });
 
+  it('a relation limit is applied PER PARENT on every strategy (absolute counts, not parity)', async () => {
+    // The parity test above compares the join path against the loader path and
+    // both used to be wrong the same way: a relation `limit` was emitted on the
+    // flat child fetch (`... filter .member_id in (...) limit 2`), so two posts
+    // were shared across every parent and most parents got none. Parity held.
+    // This test pins the ABSOLUTE answer against a fixture where a global cap
+    // and a per-parent cap differ: Ada has 3 posts, Bob 2, Cy 0.
+    await withSeeded(async (db) => {
+      const base = { orderBy: { id: 'asc' }, with: { posts: { orderBy: { views: 'desc' }, limit: 2 } } };
+      const titles = (rows: { name: string; posts: { title: string }[] }[]) =>
+        rows.map((r) => `${r.name}:${r.posts.map((p) => p.title).join(',')}`);
+      const expected = ['Ada:a2,a3', 'Bob:b2,b1', 'Cy:'];
+      for (const relationLoadStrategy of ['batched', 'join', undefined] as const) {
+        const rows = await db.table('member').findMany({ ...base, relationLoadStrategy });
+        assert.deepEqual(titles(rows), expected, `strategy ${relationLoadStrategy ?? 'default'}`);
+      }
+      // offset walks each parent's own list, not the flat fetch.
+      const paged = await db.table('member').findMany({
+        orderBy: { id: 'asc' },
+        with: { posts: { orderBy: { views: 'desc' }, limit: 1, offset: 1 } },
+        relationLoadStrategy: 'batched',
+      });
+      assert.deepEqual(titles(paged), ['Ada:a3', 'Bob:b1', 'Cy:']);
+      // limit 0 is an empty list for every parent, on the loader path too.
+      const none = await db.table('member').findMany({
+        orderBy: { id: 'asc' },
+        with: { posts: { limit: 0 } },
+        relationLoadStrategy: 'batched',
+      });
+      assert.deepEqual(titles(none), ['Ada:', 'Bob:', 'Cy:']);
+    });
+  });
+
+  it('a manyToMany relation limit is applied per parent, in the relation orderBy', async () => {
+    // Ada has tags red + blue, Bob has green, Cy none. A global `limit 1` on the
+    // target fetch left Bob with nothing whenever red or blue sorted first.
+    await withSeeded(async (db) => {
+      const rows = await db.table('member').findMany({
+        orderBy: { id: 'asc' },
+        with: { tags: { orderBy: { label: 'asc' }, limit: 1 } },
+      });
+      assert.deepEqual(
+        rows.map(
+          (r: { name: string; tags: { label: string }[] }) => `${r.name}:${r.tags.map((t) => t.label).join(',')}`,
+        ),
+        ['Ada:blue', 'Bob:green', 'Cy:'],
+      );
+    });
+  });
+
   it('hasMany, unfiltered', async () => {
     await withSeeded(async (db) => {
       await assertParity(db, { orderBy: { id: 'asc' }, with: { posts: true } });
