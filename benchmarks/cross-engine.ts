@@ -56,7 +56,7 @@ const ORGS = 5;
 
 const PG_URL = process.env.PG_URL ?? 'postgresql://localhost:5432/turbine_bench';
 const MYSQL_URL = process.env.MYSQL_URL ?? 'mysql://root@127.0.0.1:3306/turbine_bench';
-const MSSQL_URL = process.env.MSSQL_URL ?? 'mssql://sa:Turbine_bench1@127.0.0.1:1433/master';
+const MSSQL_URL = process.env.MSSQL_URL ?? 'mssql://sa:Turbine_bench1@localhost:1433/master';
 const POWDB_HOST = process.env.POWDB_HOST ?? '127.0.0.1';
 const POWDB_PORT = Number(process.env.POWDB_PORT ?? 5457);
 const POWDB_SOCKET = process.env.POWDB_SOCKET; // if set, the networked engine connects via this Unix socket
@@ -192,20 +192,24 @@ function sqlDDL(d: 'pg' | 'sqlite' | 'mysql' | 'mssql'): string[] {
   const txt = d === 'mysql' ? 'VARCHAR(512)' : d === 'mssql' ? 'NVARCHAR(512)' : 'TEXT';
   const bool = d === 'pg' ? 'BOOLEAN' : d === 'mssql' ? 'BIT' : d === 'mysql' ? 'TINYINT(1)' : 'INTEGER';
   const pk = `${int} PRIMARY KEY`;
-  const drops = TABLES.map((t) => `DROP TABLE IF EXISTS ${t}`);
+  // Every identifier is quoted: `plan` is a reserved word in T-SQL and the bare
+  // form failed SQL Server's setup, and Turbine's own SQL quotes per dialect
+  // anyway, so the setup DDL should not be the one place that does not.
+  const q = (id: string): string => (d === 'mysql' ? `\`${id}\`` : `"${id}"`);
+  const drops = TABLES.map((t) => `DROP TABLE IF EXISTS ${q(t)}`);
   const creates = [
-    `CREATE TABLE organizations (id ${pk}, name ${txt}, slug ${txt}, plan ${txt})`,
-    `CREATE TABLE users (id ${pk}, org_id ${int}, email ${txt}, name ${txt}, role ${txt})`,
-    `CREATE TABLE posts (id ${pk}, user_id ${int}, org_id ${int}, title ${txt}, content ${txt}, published ${bool}, view_count ${i32})`,
-    `CREATE TABLE comments (id ${pk}, post_id ${int}, user_id ${int}, body ${txt})`,
+    `CREATE TABLE ${q('organizations')} (${q('id')} ${pk}, ${q('name')} ${txt}, ${q('slug')} ${txt}, ${q('plan')} ${txt})`,
+    `CREATE TABLE ${q('users')} (${q('id')} ${pk}, ${q('org_id')} ${int}, ${q('email')} ${txt}, ${q('name')} ${txt}, ${q('role')} ${txt})`,
+    `CREATE TABLE ${q('posts')} (${q('id')} ${pk}, ${q('user_id')} ${int}, ${q('org_id')} ${int}, ${q('title')} ${txt}, ${q('content')} ${txt}, ${q('published')} ${bool}, ${q('view_count')} ${i32})`,
+    `CREATE TABLE ${q('comments')} (${q('id')} ${pk}, ${q('post_id')} ${int}, ${q('user_id')} ${int}, ${q('body')} ${txt})`,
   ];
   const indexes = [
-    `CREATE INDEX idx_users_org ON users (org_id)`,
-    `CREATE INDEX idx_posts_user ON posts (user_id)`,
-    `CREATE INDEX idx_posts_org ON posts (org_id)`,
-    `CREATE INDEX idx_posts_pub ON posts (published)`,
-    `CREATE INDEX idx_comments_post ON comments (post_id)`,
-    `CREATE INDEX idx_comments_user ON comments (user_id)`,
+    `CREATE INDEX ${q('idx_users_org')} ON ${q('users')} (${q('org_id')})`,
+    `CREATE INDEX ${q('idx_posts_user')} ON ${q('posts')} (${q('user_id')})`,
+    `CREATE INDEX ${q('idx_posts_org')} ON ${q('posts')} (${q('org_id')})`,
+    `CREATE INDEX ${q('idx_posts_pub')} ON ${q('posts')} (${q('published')})`,
+    `CREATE INDEX ${q('idx_comments_post')} ON ${q('comments')} (${q('post_id')})`,
+    `CREATE INDEX ${q('idx_comments_user')} ON ${q('comments')} (${q('user_id')})`,
   ];
   return [...drops, ...creates, ...indexes];
 }
@@ -362,7 +366,8 @@ interface Engine {
 
 const engines: Record<string, Engine> = {
   pg: {
-    name: 'Postgres 16',
+    // Static label; the results file records the detected server version.
+    name: 'PostgreSQL 17',
     async setup() {
       const pg = require('pg');
       const pool = new pg.Pool({ connectionString: PG_URL });
@@ -387,7 +392,7 @@ const engines: Record<string, Engine> = {
     },
   },
   mysql: {
-    name: 'MySQL 9',
+    name: 'MySQL 8',
     async setup() {
       const mysql = require('mysql2/promise');
       const conn = await mysql.createConnection(MYSQL_URL);
@@ -400,10 +405,24 @@ const engines: Record<string, Engine> = {
     },
   },
   mssql: {
-    name: 'SQL Server 2022',
+    // Azure SQL Edge is the SQL Server engine core in an arm64-native image;
+    // the amd64-only SQL Server 2022 image crashes under emulation on Apple
+    // Silicon (see RESULTS-CROSS-ENGINE-0.78.0.md).
+    name: 'SQL Server (Azure SQL Edge)',
     async setup() {
       const mssql = require('mssql');
-      const pool = await mssql.connect(MSSQL_URL);
+      // tedious does not parse `mssql://` URLs (Turbine's turbineMssql does), so
+      // the raw setup pool gets a config built from the same URL. Host must be a
+      // NAME: tedious rejects an IP as the TLS ServerName.
+      const mu = new URL(MSSQL_URL);
+      const pool = await mssql.connect({
+        server: mu.hostname || 'localhost',
+        port: mu.port ? Number(mu.port) : 1433,
+        user: decodeURIComponent(mu.username),
+        password: decodeURIComponent(mu.password),
+        database: mu.pathname.replace(/^\//, '') || 'master',
+        options: { encrypt: false, trustServerCertificate: true },
+      });
       for (const stmt of sqlDDL('mssql')) await pool.request().query(stmt);
       await pool.close();
       return turbineMssql(MSSQL_URL, schema, { warnOnUnlimited: false });
