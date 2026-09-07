@@ -708,6 +708,37 @@ describe('powdb: findMany generation', () => {
     assert.match(m.last().powql, /\(\.name = \$1 or \.name = \$2\)/);
   });
 
+  // PowDB SUPPORTS `mode: 'insensitive'` on `in` / `notIn`, and that is worth
+  // pinning because the SQL engines do NOT: 0.78.0 made SQLite, MySQL and SQL
+  // Server refuse the combination with E017, since their IN-list forms cannot
+  // lower every element in SQL and folding in JavaScript would make `equals`
+  // and `in` disagree on the same operand. PowQL's list form takes an
+  // expression per element, so `lower($N)` applies to each one and the fold is
+  // the same function on both sides, which is the condition the SQL refusal
+  // exists to protect. The docs said "PostgreSQL-only, every other engine
+  // refuses it" on the strength of the four SQL dialects; PowDB is a parallel
+  // implementation and was never in that set. Without this test the docs and
+  // the engine can drift apart again with nothing failing.
+  it('in / notIn: insensitive folds every list element, unlike the SQL engines', async () => {
+    const m = mockPool();
+
+    await qi(m).findMany({ where: { name: { in: ['A', 'b'], mode: 'insensitive' } } });
+    assert.match(
+      m.last().powql,
+      /lower\(\.name\) in \(lower\(\$1\), lower\(\$2\)\)/,
+      'both sides of the comparison must be folded by the same function',
+    );
+    assert.deepEqual(m.last().params, ['A', 'b'], 'operands stay bound and unmodified');
+
+    await qi(m).findMany({ where: { name: { notIn: ['A', 'b'], mode: 'insensitive' } } });
+    assert.match(m.last().powql, /lower\(\.name\) not in \(lower\(\$1\), lower\(\$2\)\)/);
+
+    // Sensitive stays untouched, so the fold is driven by `mode` and not by the
+    // operator: an unconditional lower() would silently change every list query.
+    await qi(m).findMany({ where: { name: { in: ['A', 'b'] } } });
+    assert.ok(!/lower\(/.test(m.last().powql), 'no fold without mode: insensitive');
+  });
+
   it('not: spells as `!=` (SQL null parity), plain and insensitive', async () => {
     // `lhs != $N` EXCLUDES missing-value rows on PowDB >= 0.18.2, matching SQL,
     // where the old `not (lhs = $N)` matched them. No `not (` wrapping.
