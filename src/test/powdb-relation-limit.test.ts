@@ -120,8 +120,10 @@ describe('powdb keyed loader: relation limit / offset are per parent', () => {
   it('the child fetch carries the relation orderBy but NO limit and NO offset', async () => {
     const m = mockPool();
     const qi = new PowqlInterface(m.pool, 'app_user', schema, [], { warnOnUnlimited: false });
+    // `offset` is not on the public WithOptions type (only `limit` is); the PowDB
+    // paths accept it untyped, so the probe passes it through a cast on purpose.
     await qi.findMany({
-      with: { posts: { orderBy: { views: 'desc' }, limit: 2, offset: 1 } },
+      with: { posts: { orderBy: { views: 'desc' }, limit: 2, offset: 1 } as never },
       relationLoadStrategy: 'batched',
     });
     const child = m.child();
@@ -146,12 +148,12 @@ describe('powdb keyed loader: relation limit / offset are per parent', () => {
     const m = mockPool();
     const qi = new PowqlInterface(m.pool, 'app_user', schema, [], { warnOnUnlimited: false });
     const rows = (await qi.findMany({
-      with: { posts: { orderBy: { views: 'desc' }, limit: 1, offset: 1 } },
+      with: { posts: { orderBy: { views: 'desc' }, limit: 1, offset: 1 } as never },
       relationLoadStrategy: 'batched',
     })) as Row[];
     assert.deepEqual(titles(rows), ['u1:a2', 'u2:b2']);
     const tail = (await qi.findMany({
-      with: { posts: { orderBy: { views: 'desc' }, offset: 2 } },
+      with: { posts: { orderBy: { views: 'desc' }, offset: 2 } as never },
       relationLoadStrategy: 'batched',
     })) as Row[];
     assert.deepEqual(titles(tail), ['u1:a1', 'u2:b1'], 'offset without limit');

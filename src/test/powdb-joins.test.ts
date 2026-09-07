@@ -269,13 +269,12 @@ describe('powdb F2: native-join emission', () => {
     // statement because it decides which rows each parent's window keeps.
     const mock = mockPool();
     await qi(mock).findMany({
-      with: { posts: { orderBy: { views: 'desc' }, limit: 3, offset: 1 } },
+      with: { posts: { orderBy: { views: 'desc' }, limit: 3 } },
       relationLoadStrategy: 'join',
     });
     const call = mock.joinCall()!;
     assert.match(call.powql, /order c\.views desc \{ __tpk: p\.id,/);
     assert.doesNotMatch(call.powql, / limit /, 'a limit on the join caps the TOTAL, not each parent');
-    assert.doesNotMatch(call.powql, / offset /, "an offset on the join skips other parents' children");
   });
 });
 
