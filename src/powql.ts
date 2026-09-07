@@ -531,6 +531,43 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   /**
+   * Options for the child-side interfaces the relation loaders and the
+   * relation-filter resolvers build: the client's, with `defaultLimit` cleared
+   * and the unlimited warning off. `defaultLimit` bounds the caller's PAGE; on
+   * an internal fetch that serves that page (a relation's children, a filter's
+   * key set) it would cap the whole page's children, or the key set, at the
+   * page size: a silent wrong answer by another route than the one
+   * {@link pageOf} closes. The SQL batched loader clears it the same way
+   * (`batchedChildOptions` in query/builder.ts).
+   */
+  private childOptions?: QueryInterfaceOptions;
+  private loaderChildOptions(): QueryInterfaceOptions {
+    this.childOptions ??= { ...this.options, defaultLimit: undefined, warnOnUnlimited: false };
+    return this.childOptions;
+  }
+
+  /**
+   * ONE parent's window of its stitched children: the relation's `offset` and
+   * `limit` applied to that parent's own list.
+   *
+   * A relation `limit` means "at most N on EACH parent". The loaders used to
+   * spread it onto the flat child fetch (`post filter .author_id in (...)
+   * limit 5`), which caps the TOTAL across every parent in the chunk, so ten
+   * parents shared five posts and most got none, with no error. It shipped
+   * for the loaders' whole life because the one test of the shape compared
+   * the join path against the loader path and both were wrong the same way;
+   * the cross-engine benchmark found it, where the wrong answer was the fast
+   * one. Every loader now fetches its children unbounded, WITH the relation
+   * `orderBy` (which decides which rows the window keeps), and applies this
+   * at stitch time: the rule the SQL engines' batched loader has always used.
+   */
+  private static pageOf<R>(rows: R[], limit: number | undefined, offset: number | undefined): R[] {
+    if (limit === undefined && !offset) return rows;
+    const start = offset ?? 0;
+    return rows.slice(start, limit === undefined ? undefined : start + limit);
+  }
+
+  /**
    * Reject a negative `limit` / `offset` before it reaches the engine. PowDB
    * casts both with `as usize` at execution, so below engine 0.20 a negative
    * limit wrapped to `usize::MAX` and silently returned EVERY row, the opposite
@@ -1175,7 +1212,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const childCol = rel.type === 'belongsTo' ? rk[0]! : fk[0]!;
     const localField = this.meta.reverseColumnMap[localCol] ?? localCol;
     const childField = targetMeta.reverseColumnMap[childCol] ?? childCol;
-    const targetQi = new PowqlInterface(this.pool, rel.to, this.schema, [], this.options);
+    const targetQi = new PowqlInterface(this.pool, rel.to, this.schema, [], this.loaderChildOptions());
     const collect = async (w: Record<string, unknown> | undefined): Promise<unknown[]> => {
       const rows = await targetQi.findMany({
         where: w as WhereClause<object> | undefined,
@@ -1220,7 +1257,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const sourceRefField = this.meta.reverseColumnMap[sourceRefCol] ?? sourceRefCol;
     const sourceRefColMeta = this.meta.columns.find((c) => c.name === sourceRefCol);
     const targetPkField = targetMeta.reverseColumnMap[targetPkCol] ?? targetPkCol;
-    const targetQi = new PowqlInterface(this.pool, rel.to, this.schema, [], this.options);
+    const targetQi = new PowqlInterface(this.pool, rel.to, this.schema, [], this.loaderChildOptions());
     const collectTargetPks = async (w: Record<string, unknown> | undefined): Promise<unknown[]> => {
       const rows = await targetQi.findMany({
         where: w as WhereClause<object> | undefined,
@@ -2037,7 +2074,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       if (!opt) continue;
       const rel = this.meta.relations[relName];
       if (!rel) throw new ValidationError(`Unknown relation "${relName}" on "${this.table}".`);
-      if (strategyIsJoin && parent && this.joinEligible(rel, opt, parent.args, parents.length)) {
+      if (strategyIsJoin && parent && this.joinEligible(rel, opt, parent.args)) {
         if (this.capabilities.serverJoins) {
           await this.loadRelationViaJoin(parents, rel, relName, opt, parent, timeout, includePii);
           continue;
@@ -2060,7 +2097,18 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         throw new UnsupportedFeatureError('composite-key nested reads', 'PowDB', `relation "${relName}"`);
       }
       const options = (opt === true ? {} : opt) as FindManyArgs<object> & { with?: Record<string, unknown> };
-      const targetQi = new PowqlInterface(this.pool, rel.to, this.schema, [], this.options);
+      // The relation's own page, applied PER PARENT at stitch time (see pageOf),
+      // never on the flat fetch below.
+      const relLimit = options.limit;
+      const relOffset = options.offset;
+      this.assertPagination(relLimit, relOffset, `relation "${relName}"`);
+      const single = rel.type === 'belongsTo' || rel.type === 'hasOne';
+      if (relLimit === 0) {
+        // `[]` on every parent by construction: nothing to fetch.
+        for (const parent of parents) (parent as Record<string, unknown>)[relName] = single ? null : [];
+        continue;
+      }
+      const targetQi = new PowqlInterface(this.pool, rel.to, this.schema, [], this.loaderChildOptions());
       const targetMeta = this.schema.tables[rel.to]!;
 
       // Local key on the parent, remote key on the target child.
@@ -2119,6 +2167,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         } as WhereClause<object>;
         const children = (await targetQi.findMany({
           ...fetchOptions,
+          // Unbounded: the relation limit/offset are per parent, applied below.
+          limit: undefined,
+          offset: undefined,
           where: childWhere,
           with: options.with,
           timeout: options.timeout ?? timeout,
@@ -2141,11 +2192,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           for (const child of bucket) delete (child as Record<string, unknown>)[childKeyField];
         }
       }
-      const single = rel.type === 'belongsTo' || rel.type === 'hasOne';
       for (const parent of parents) {
         const k = this.joinKey((parent as Record<string, unknown>)[parentKeyField]);
         const matches = (k == null ? undefined : childByKey.get(k)) ?? [];
-        (parent as Record<string, unknown>)[relName] = single ? (matches[0] ?? null) : matches;
+        (parent as Record<string, unknown>)[relName] = single
+          ? (matches[0] ?? null)
+          : PowqlInterface.pageOf(matches, relLimit, relOffset);
       }
     }
   }
@@ -2222,7 +2274,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
     // (2) Target rows by PK, honouring the relation's own where/with/select/…
     const options = (opt === true ? {} : opt) as FindManyArgs<object> & { with?: Record<string, unknown> };
-    const targetQi = new PowqlInterface(this.pool, rel.to, this.schema, [], this.options);
+    this.assertPagination(options.limit, options.offset, `relation "${relName}"`);
+    if (options.limit === 0) {
+      for (const parent of parents) (parent as Record<string, unknown>)[relName] = [];
+      return;
+    }
+    const targetQi = new PowqlInterface(this.pool, rel.to, this.schema, [], this.loaderChildOptions());
     // This loader stitches on the TARGET's own primary key, so the PK has to be
     // in the fetch even when the caller's select/omit excludes it, and has to
     // come back off afterwards. Exactly the shape `loadRelation` uses for its
@@ -2258,6 +2315,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       }
     }
     const targetByPk = new Map<string, T>();
+    // Position of each target in the fetch, i.e. its rank under the relation's
+    // `orderBy`; the stitch below sorts a parent's children by it when an
+    // orderBy was given, so `limit` keeps that parent's top-N and not its first
+    // N junction rows. Across fetch CHUNKS the rank is fetch order.
+    const targetRank = new Map<string, number>();
     const targetValList = [...allTargetVals].map((v) =>
       targetPkColMeta ? coerceScalar(v, targetPkColMeta.tsType) : v,
     );
@@ -2270,13 +2332,20 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       } as WhereClause<object>;
       const targets = (await targetQi.findMany({
         ...fetchOptions,
+        // Unbounded: the relation limit/offset are per parent, applied in the stitch.
+        limit: undefined,
+        offset: undefined,
         where,
         with: options.with,
         timeout: options.timeout ?? timeout,
         // Public findMany, so the sentinel form. See loadRelation above.
         includePii: includePii ? UNSAFE : undefined,
       } as FindManyArgs<object>)) as T[];
-      for (const t of targets) targetByPk.set(String((t as Record<string, unknown>)[targetPkField]), t);
+      for (const t of targets) {
+        const pk = String((t as Record<string, unknown>)[targetPkField]);
+        targetByPk.set(pk, t);
+        if (!targetRank.has(pk)) targetRank.set(pk, targetRank.size);
+      }
     }
 
     // (3) Stitch: each parent → its junction targets (m2m is always a list).
@@ -2288,7 +2357,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         const child = targetByPk.get(tv);
         if (child) children.push(child);
       }
-      (parent as Record<string, unknown>)[relName] = children;
+      if (options.orderBy) {
+        const rank = (t: T) => targetRank.get(String((t as Record<string, unknown>)[targetPkField])) ?? 0;
+        children.sort((a, b) => rank(a) - rank(b));
+      }
+      (parent as Record<string, unknown>)[relName] = PowqlInterface.pageOf(children, options.limit, options.offset);
     }
 
     // Stitching is done: take the forced PK back off. Iterating the map rather
@@ -2335,11 +2408,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    *     `referenceKey` on the TARGET table (the join's non-fetched side);
    *   - m2m keeps any `orderBy`/`limit`/`offset` on the loader (the junction-order
    *     stitch can't be reproduced by the 3-table join deterministically);
-   *   - a to-one relation `limit`/`offset` (meaningless) stays on the loader, as
-   *     does a to-many relation `limit`/`offset` when the parent set spills past
-   *     one loader chunk (the loader limits per chunk, the join once globally).
+   *   - a to-one relation `limit`/`offset` (meaningless) stays on the loader. A
+   *     to-many relation `limit`/`offset` is a PER-PARENT bound on both paths,
+   *     fetched unbounded and sliced per parent at stitch time (`pageOf`), so
+   *     the join statement carries neither clause.
    */
-  private joinEligible(rel: RelationDef, opt: unknown, args: FindManyArgs<T>, parentCount: number): boolean {
+  private joinEligible(rel: RelationDef, opt: unknown, args: FindManyArgs<T>): boolean {
     const effLimit = args.limit ?? this.defaultLimit;
     if (effLimit !== undefined || args.offset) return false;
     const options = (opt === true ? {} : opt) as FindManyArgs<object> & { with?: unknown };
@@ -2375,9 +2449,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       return false;
     }
     const single = rel.type === 'belongsTo' || rel.type === 'hasOne';
-    if ((options.limit !== undefined || options.offset) && (single || parentCount > MAX_RELATION_KEYS)) {
-      return false;
-    }
+    if ((options.limit !== undefined || options.offset) && single) return false;
     // A `limit 0` relation stays off the join statement for the same reason it
     // stays off a nested projection: PowDB answered `limit 0` with one row below
     // engine 0.20. The loader resolves it client-side, correctly on every version.
@@ -2440,14 +2512,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       options.timeout ?? timeout,
     );
     const order = targetQi.buildOrder(options.orderBy, params, 'c');
+    // No limit/offset clause: on the join they would bound the TOTAL child
+    // count across every parent. The relation's page is per parent (pageOf).
     this.assertPagination(options.limit, options.offset, `relation "${relName}"`);
-    const limitClause = options.limit !== undefined ? ` limit ${this.param(options.limit, params)}` : '';
-    const offsetClause = options.offset ? ` offset ${this.param(options.offset, params)}` : '';
     const proj = this.joinProjection(childCols, `p.${quotePowqlIdent(parentKeyCol)}`, 'c');
     const powql =
       `${targetQi.qt} as c join ${this.qt} as p ` +
       `on c.${quotePowqlIdent(childKeyCol)} = p.${quotePowqlIdent(parentKeyCol)}` +
-      `${filter}${order}${limitClause}${offsetClause} ${proj}`;
+      `${filter}${order} ${proj}`;
     // A READ: thread a read-shaped action through the exec seam.
     const { rows, native } = await targetQi.exec(powql, params, timeout, 'findMany');
 
@@ -2456,7 +2528,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     for (const p of parents) {
       const key = this.joinKey((p as Record<string, unknown>)[parentKeyField]);
       const matches = (key == null ? undefined : byKey.get(key)) ?? [];
-      (p as Record<string, unknown>)[relName] = single ? (matches[0] ?? null) : matches;
+      (p as Record<string, unknown>)[relName] = single
+        ? (matches[0] ?? null)
+        : PowqlInterface.pageOf(matches, options.limit, options.offset);
     }
   }
 
