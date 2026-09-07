@@ -58,11 +58,39 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: 22
-          registry-url: 'https://registry.npmjs.org'
           cache: npm
 
       - name: Install dependencies
         run: npm ci
+
+      # npm trusted publishing (OIDC). The publish below carries NO token: npm
+      # asks GitHub for a short-lived OIDC identity token (`id-token: write`
+      # above), npm's registry checks it against the trusted publisher
+      # registered for THIS repository and THIS workflow file, and mints a
+      # one-shot credential for the upload. There is no long-lived secret to
+      # expire, leak, or rotate. The token this replaced expired three times in
+      # four months and the third one failed a release.
+      #
+      # Two requirements, both asserted here so the failure is named rather
+      # than surfacing as npm's misleading `E404 Not Found - PUT`:
+      #   1. npm >= 11.5.1. Node 22 ships npm 10, so npm is upgraded in place.
+      #   2. No `_authToken` in any .npmrc. setup-node's `registry-url` writes
+      #      one that reads `${NODE_AUTH_TOKEN}` and errors when it is unset,
+      #      and a token line makes npm prefer the token over OIDC, so
+      #      `registry-url` is deliberately absent from the setup-node step.
+      - name: Require an OIDC-capable npm
+        run: |
+          npm install -g npm@^11 >/dev/null 2>&1
+          V=$(npm --version)
+          if [ "$(printf '%s\n11.5.1\n' "$V" | sort -V | head -1)" != "11.5.1" ]; then
+            echo "::error::npm $V cannot do trusted publishing; >= 11.5.1 is required"
+            exit 1
+          fi
+          echo "npm $V (trusted publishing capable)"
+          if grep -rs "_authToken" "$HOME/.npmrc" .npmrc 2>/dev/null; then
+            echo "::error::an _authToken is configured; npm would use it instead of OIDC"
+            exit 1
+          fi
 
       - name: Lint
         run: npm run lint
@@ -87,8 +115,6 @@ jobs:
 
       - name: Publish to npm with @next tag
         run: npm publish --tag next --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # Real YugabyteDB job, moved here from ci.yml. Same motivation as ci.yml's
   # CockroachDB job: prove the yugabytedb adapter's set_config() timeout SQL is
