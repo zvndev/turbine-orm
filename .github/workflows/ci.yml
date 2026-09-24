@@ -503,6 +503,12 @@ jobs:
       - name: Check bundle sizes
         run: npx size-limit
 
+      # turbine-orm/serverless must bundle for an edge runtime: no pg and no Node
+      # builtin beyond node:async_hooks under the edge-light/worker/browser
+      # conditions (scripts/check-edge-bundle.mjs, with a built-in control).
+      - name: Edge bundle check
+        run: npm run check:edge
+
   # Publish-surface type gate. pack-smoke proves the package RUNS from CJS
   # (`node -e "require(...)"`), which is exactly the blind spot that let broken
   # CJS TYPES ship: with one shared top-level "types" per subpath, a CJS

@@ -148,10 +148,14 @@ const SPECIFIER_FORMS = [
 
 const REFERENCE_TYPES = /\/\/\/\s*<reference\s+types\s*=\s*['"]([^'"]+)['"]/g;
 
-/** The pg package family. `pgsql`, `pgvector` and the like are not in it. */
+/**
+ * The pg package family. `pgsql`, `pgvector` and the like are not in it.
+ * `#pg` is this package's own `imports` alias for `pg` (see package.json
+ * `//imports`): it resolves to the same types, so it leaks them the same way.
+ */
 function isPgFamily(specifier) {
   if (specifier.startsWith('.') || specifier.startsWith('/')) return false;
-  return /^pg$|^pg[/-]|^@types\/pg(?:\/|$)/.test(specifier);
+  return /^#?pg$|^pg[/-]|^@types\/pg(?:\/|$)/.test(specifier);
 }
 
 function lineAt(source, index) {
@@ -200,6 +204,7 @@ function findPgReferences(source) {
       "declare module 'pg' {}",
       "declare const s: import('@types/pg');",
       '/// <reference types="pg" />',
+      "import pg from '#pg';",
     ].join('\n'),
   );
   const good = findPgReferences(
@@ -215,9 +220,9 @@ function findPgReferences(source) {
       "// import pg = require('pg');",
     ].join('\n'),
   );
-  if (bad.length !== 11 || good.length !== 0) {
+  if (bad.length !== 12 || good.length !== 0) {
     console.error(
-      `check-no-pg-types: matcher self-test failed (expected 11 hits and 0 false positives, got ${bad.length} and ${good.length}); the guard cannot be trusted, refusing to pass`,
+      `check-no-pg-types: matcher self-test failed (expected 12 hits and 0 false positives, got ${bad.length} and ${good.length}); the guard cannot be trusted, refusing to pass`,
     );
     process.exit(1);
   }

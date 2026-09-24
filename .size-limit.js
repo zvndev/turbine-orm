@@ -2,6 +2,12 @@
 // the bare barrel file. `pg` (the one runtime dependency) is excluded so the
 // numbers reflect Turbine's own footprint; platform:node keeps Node builtins
 // external, matching how the package is actually consumed.
+// The driver as the shared modules import it: `pg` by name in the CLI and the
+// engine files, and `#pg` (package.json `imports`, which resolves to `pg` on
+// Node) in the modules the serverless entry reaches. Both are the one runtime
+// dependency, so both stay out of Turbine's own footprint.
+const PG = ['pg', '#pg'];
+
 const nodePlatform = (config) => {
   config.platform = 'node';
   return config;
@@ -285,7 +291,7 @@ export default [
     path: 'dist/index.js',
     // Same number as the README's claim, on purpose. See the note above.
     limit: '91 kB',
-    ignore: ['pg'],
+    ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },
   {
@@ -296,14 +302,14 @@ export default [
     // the edge bundle includes the query builder, so the budget gets a small bump.
     path: 'dist/serverless.js',
     limit: '72 kB',
-    ignore: ['pg'],
+    ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },
   {
     name: 'sqlite entry, turbine-orm/sqlite (node:sqlite + client graph)',
     path: 'dist/sqlite.js',
     limit: '76 kB',
-    ignore: ['pg', 'node:sqlite'],
+    ignore: [...PG, 'node:sqlite'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
@@ -312,7 +318,7 @@ export default [
     limit: '77 kB',
     // mysql2 is an optional peer loaded via a dynamic import in the factory, so
     // it is never in the static graph, exclude it (and pg) from the footprint.
-    ignore: ['pg', 'mysql2', 'mysql2/promise'],
+    ignore: [...PG, 'mysql2', 'mysql2/promise'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
@@ -323,7 +329,7 @@ export default [
     limit: '78 kB',
     // mssql is an optional peer loaded via a dynamic import in the factory, so it
     // is never in the static graph, exclude it (and pg) from the footprint.
-    ignore: ['pg', 'mssql'],
+    ignore: [...PG, 'mssql'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
@@ -335,7 +341,7 @@ export default [
     // Both PowDB drivers are optional peers behind dynamic imports (the
     // networked client and the embedded napi addon), so neither is in the
     // static graph.
-    ignore: ['pg', '@zvndev/powdb-client', '@zvndev/powdb-embedded'],
+    ignore: [...PG, '@zvndev/powdb-client', '@zvndev/powdb-embedded'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
@@ -348,7 +354,7 @@ export default [
     // the client/query graph, every config load pays for the whole ORM.
     path: 'dist/cli/config.js',
     limit: '3 kB',
-    ignore: ['pg'],
+    ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },
   {
@@ -359,7 +365,7 @@ export default [
     // were the only published subpaths without a budget.
     path: 'dist/adapters/index.js',
     limit: '3 kB',
-    ignore: ['pg'],
+    ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },
   {
@@ -369,7 +375,7 @@ export default [
     // entries, something started importing core values instead of core types.
     path: 'dist/prisma-compat.js',
     limit: '16 kB',
-    ignore: ['pg'],
+    ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },
 ];

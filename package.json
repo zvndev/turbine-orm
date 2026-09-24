@@ -1,6 +1,6 @@
 {
   "name": "turbine-orm",
-  "version": "0.79.0",
+  "version": "0.79.1",
   "description": "Postgres-native TypeScript ORM, runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. One dependency, no WASM engine",
   "type": "module",
   "//exports": "Each subpath declares its types PER CONDITION. A single shared top-level \"types\" resolves to the ESM declarations for `require` too, which is TS1479 (\"is an ES module ... cannot be require()d\") for any CJS consumer on moduleResolution node16/nodenext. The require condition points at dist/cjs, which ships its own {\"type\":\"commonjs\"} package.json, so those declarations are CJS declarations. Gated in CI by publint + @arethetypeswrong/cli + a real .cts consumer typecheck (see the package-types job in ci.yml).",
@@ -96,6 +96,15 @@
       }
     }
   },
+  "//imports": "`#pg` is how the modules shared with the serverless entry reach node-postgres. It is `pg` itself everywhere except edge-light and browser, which get dist/pg-edge.js (see src/pg-edge.ts): those runtimes cannot bundle pg at all, and turbineHttp() never uses it. workerd is listed first so Cloudflare keeps the real driver (pg supports Workers). An imports target may be a bare package name, which is what keeps src/ runnable under tsx with no dist/ present. The CJS build (dist/cjs) is Node-only: scripts/finish-cjs-build.mjs rewrites its require(\"#pg\") to require(\"pg\"), because a require() resolves #imports against the NEAREST package.json (dist/cjs/package.json) and publint rejects a nested imports field. Edge bundlers resolve the import condition, i.e. the ESM files. `npm run check:edge` bundles the serverless entry for the edge conditions and fails on any pg or Node-builtin import.",
+  "imports": {
+    "#pg": {
+      "workerd": "pg",
+      "edge-light": "./dist/pg-edge.js",
+      "browser": "./dist/pg-edge.js",
+      "default": "pg"
+    }
+  },
   "main": "./dist/cjs/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
@@ -115,7 +124,7 @@
   "//prepublishOnly": "The gate for a MANUAL LOCAL `npm publish`, which is the normal release flow here, so it is the ONLY gate on that path (release.yml runs on a pushed tag, and a local publish never triggers it). `check:package` joined it 2026-07-28: publint --strict + attw --pack, the two checks that catch a broken exports map or CJS declarations that resolve to ESM, which is a class of bug that shipped once already and is invisible to every other script here. `test:coverage:cli` joined at the same time (~3s) so a local publish cannot ship a Studio/migrate coverage regression. Still deliberately absent, because they need containers or minutes of packing: the non-Postgres engine suites and the tarball install smoke, which release.yml + ci.yml run. check:cycles joined 2026-08-02 (the query/->client.ts acyclicity rule as a build failure instead of CLAUDE.md prose). check:release-tests joined at the same time and runs LAST because it is the expensive one: outside CI it runs the full DB-backed `npm test` (refusing to publish when no DATABASE_URL is reachable, escape hatch TURBINE_PUBLISH_WITHOUT_DB=1), which closes the old gap where the release path never executed a query against a real Postgres; in CI it self-skips since release.yml/nightly.yml run that suite as dedicated jobs. Known double-coverage: `npm test` re-runs the unit-lane files serially, so a local publish executes them twice; accepted, the second pass is the one with a real database behind it.",
   "scripts": {
     "prebuild": "npm run gen:studio",
-    "build": "rm -rf dist && tsc && tsc --project tsconfig.cjs.json && echo '{\"type\":\"commonjs\"}' > dist/cjs/package.json",
+    "build": "rm -rf dist && tsc && tsc --project tsconfig.cjs.json && node scripts/finish-cjs-build.mjs",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit --project tsconfig.test.json",
     "generate": "tsx src/cli/index.ts generate",
@@ -165,7 +174,9 @@
     "check:package": "publint --strict && attw --pack . --profile node16",
     "//check:package-types": "The @types/pg tripwire, and the permanent guard on the v0.28.1 regression: no reference to the pg module family may reach a published .d.ts, or a types-only package becomes a hard requirement for every consumer compiling under strict. It lived as an inline grep in ONE ci.yml job, which left the gate proving the change safe off the publish path entirely (a tag push and a local `npm publish` both reached npm without asking). The logic is scripts/check-no-pg-types.mjs now and this script is its single entry point, called by prepublishOnly and by the `consumer-types` job in BOTH ci.yml and release.yml. Reads dist/, so it must run after `npm run build`.",
     "check:package-types": "node scripts/check-no-pg-types.mjs",
-    "prepublishOnly": "npm run build && npm run typecheck && npm run lint && npm run test:unit && npm run test:coverage:cli && npm run check:error-codes && npm run check:error-prefix && npm run check:changelog && npm run check:cycles && npm run check:skip-gates && npm run check:private-terms && npm run check:package && npm run check:package-types && npm run size && npm run check:release-tests",
+    "//check:edge": "The edge-runtime gate for turbine-orm/serverless: bundles dist/serverless.js (the ESM build, which is what edge bundlers resolve) with esbuild under the edge-light/worker/browser conditions and fails on any pg-family import, any Node builtin but node:async_hooks, or any other package. Every other gate here runs on Node, which is how a static `import pg from 'pg'` in a shared module broke every edge build while CI stayed green. A CONTROL bundle under Node conditions must reach pg first, or the scan refuses to pass. Reads dist/, so it runs after `npm run build`: in prepublishOnly, and in the build job of ci.yml and the test job of release.yml.",
+    "check:edge": "node scripts/check-edge-bundle.mjs",
+    "prepublishOnly": "npm run build && npm run typecheck && npm run lint && npm run test:unit && npm run test:coverage:cli && npm run check:error-codes && npm run check:error-prefix && npm run check:changelog && npm run check:cycles && npm run check:skip-gates && npm run check:private-terms && npm run check:package && npm run check:package-types && npm run check:edge && npm run size && npm run check:release-tests",
     "prepare": "node scripts/prepare.mjs",
     "prepack": "node scripts/strip-prepare.mjs",
     "postpack": "node scripts/restore-prepare.mjs",
@@ -196,11 +207,13 @@
     "@biomejs/biome": "^2.4.10",
     "@size-limit/esbuild": "^12.1.0",
     "@size-limit/file": "^12.1.0",
+    "@swc/core": "1.16.2",
     "@types/node": "^26.1.0",
     "@types/pg": "^8.11.11",
     "@zvndev/powdb-client": "^0.20.0",
     "@zvndev/powdb-embedded": "^0.20.0",
     "c8": "^11.0.0",
+    "esbuild": "^0.28.2",
     "husky": "^9.1.7",
     "lint-staged": "^17.0.8",
     "mssql": "^12.7.0",

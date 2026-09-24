@@ -134,6 +134,12 @@ jobs:
       - name: Verify bundle sizes
         run: npx size-limit
 
+      # turbine-orm/serverless must bundle for an edge runtime: no pg and no Node
+      # builtin beyond node:async_hooks under the edge-light/worker/browser
+      # conditions (scripts/check-edge-bundle.mjs, with a built-in control).
+      - name: Edge bundle check
+        run: npm run check:edge
+
   # Postgres integration gate, mirrors ci.yml's integration-tests but pinned to
   # a single representative major (16). Seeds src/test/fixtures/seed.sql, then
   # runs the full DB-backed suite so a tag can never publish SQL that a real

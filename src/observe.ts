@@ -13,7 +13,7 @@
  * carries SQL text or bound parameter values.
  */
 
-import pg from 'pg';
+import pg from '#pg';
 import { ValidationError } from './errors.js';
 import type { QueryEvent, QueryEventListener } from './query/index.js';
 

@@ -22,7 +22,7 @@
  * ```
  */
 
-import pg from 'pg';
+import pg from '#pg';
 import { mergeConnectionStringOptions } from './connection-url.js';
 import { type Dialect, postgresDialect } from './dialect.js';
 import {

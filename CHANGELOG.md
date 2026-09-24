@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.79.1 (2026-09-24)
+
+Two fixes for applications that bundle turbine-orm, both invisible to code run
+straight from `node_modules`.
+
+### Fixed
+
+- **Failed raw and batch statements reported as successes after minification.**
+  SWC's minifier (the one `next build` runs over server bundles) rewrote the
+  statement reporter's `catch (err) { error = wrap(err); throw error; }` into
+  `throw wrap(err)`, dropping the assignment its `finally` block then read. In
+  any minified bundle, the `$on('query')` event of a failing `db.raw`, `db.sql`,
+  `tx.raw` / `tx.rawQuery`, prisma-compat `$queryRaw` family call, or
+  `$transaction([...])` slot arrived with no `error`, so telemetry built on it
+  counted the failure as a success. The reporter now emits the failure from
+  inside the `catch`. Model methods and pipelines were not affected. The
+  workaround for 0.79.0 is `serverExternalPackages: ['turbine-orm']` in
+  `next.config`.
+- **`turbine-orm/serverless` builds for edge runtimes.** The modules it shares
+  with the main entry imported `pg` statically, so a Vercel Edge or Next.js
+  edge route failed to build (webpack: `Can't resolve 'fs'`; Turbopack:
+  `node:util/types`) unless `pg` was aliased to a stub. They now import the
+  driver as `#pg`, a package `imports` alias that is `pg` everywhere except
+  under the `edge-light` and `browser` conditions, where it is a pg-free shim.
+  `workerd` keeps the real driver, and the CommonJS build, which edge bundlers
+  never resolve, names `pg` directly. On the shim, constructing a client that
+  would open its own connection throws `ConnectionError` (E004) naming
+  `turbineHttp(pool, schema)`, and a relation's JSON column is left as the
+  wire text rather than run through a driver type parser.
+
+### Tests
+
+- `minified-events.test.ts` compiles every module with SWC (compress + mangle)
+  and asserts each failure path's event still carries the caller's error, with a
+  control proving the pinned SWC still performs the rewrite.
+
+### CI
+
+- `npm run check:edge` bundles the serverless entry under the edge conditions and fails on any pg import, any Node builtin other than
+  `node:async_hooks`, or any other package. A control bundle under Node
+  conditions must reach `pg`, or the check refuses to pass. It runs in
+  `prepublishOnly`, the CI build job and the release test job.
+- The `@types/pg` declaration tripwire also refuses the `#pg` alias.
+
 ## 0.79.0 (2026-09-24)
 
 `$on('query')` now sees every statement the client sends, and a query can say

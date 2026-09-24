@@ -8,7 +8,7 @@
  * This is the foundation of `npx turbine generate`.
  */
 
-import pg from 'pg';
+import pg from '#pg';
 import { type Dialect, postgresDialect } from './dialect.js';
 import { ValidationError } from './errors.js';
 import {
