@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.79.0 (unreleased)
+## 0.79.0 (2026-09-24)
 
 `$on('query')` now sees every statement the client sends, and a query can say
 which feature sent it. Until this release only model methods emitted events:
@@ -40,6 +40,20 @@ picture for any application that leans on raw SQL.
   count toward the heat of the tables they touch, which they always should have.
   A listener that assumed `model` is always a table name should skip
   `RAW_QUERY_MODEL`.
+
+### Fixed
+
+- **PowDB: a relation `limit` is a per-parent bound on every loader path.**
+  `with: { posts: { limit: 5 } }` means at most five posts on each parent. The
+  PowDB keyed loader, the native-join path and the manyToMany loader applied the
+  limit to the whole flat child fetch instead, so five posts were shared across
+  every parent in the chunk and most parents came back with none, with no
+  error. Reachable with `relationLoadStrategy: 'batched'` on any addon, and by
+  default on addons below 0.18; nested projections (the default on 0.18+) were
+  already correct. Children are now fetched with `where` and `orderBy` only and
+  sliced per parent at stitch time, the rule the SQL batched loader has always
+  used. `limit: 0` returns `[]` without a fetch, and a manyToMany parent keeps
+  its top N by the target `orderBy`.
 
 ## 0.78.0 (2026-09-06)
 
