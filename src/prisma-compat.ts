@@ -202,7 +202,11 @@ export interface CompatTransactionClient {
    * breaks atomicity. Optional only so a test stub can omit it: when it is
    * absent the raw methods throw instead of escaping the transaction.
    */
-  rawQuery?(text: string, params?: readonly unknown[]): Promise<{ rows: unknown[]; rowCount: number | null }>;
+  rawQuery?(
+    text: string,
+    params?: readonly unknown[],
+    action?: string,
+  ): Promise<{ rows: unknown[]; rowCount: number | null }>;
 }
 
 /** The minimal `TurbineClient` surface the adapter consumes. */
@@ -2667,7 +2671,12 @@ function flattenTemplate(
 }
 
 /** Runs one prebuilt statement and returns the driver's rows + affected count. */
-type RawExecutor = (text: string, params: unknown[]) => Promise<{ rows: unknown[]; rowCount: number | null }>;
+type RawExecutor = (
+  text: string,
+  params: unknown[],
+  /** The Prisma method name, reported as the `$on('query')` event's action. */
+  action: string,
+) => Promise<{ rows: unknown[]; rowCount: number | null }>;
 
 /**
  * Build the four Prisma raw methods over ONE executor. Both the client-level and
@@ -2680,17 +2689,17 @@ function makeRawSurface(exec: RawExecutor, ph: (n: number) => string): PrismaCom
   return {
     $queryRaw: async <T = unknown>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T[]> => {
       const { text, params } = flattenTemplate(strings as unknown as string[], values, ph);
-      return (await exec(text, params)).rows as T[];
+      return (await exec(text, params, '$queryRaw')).rows as T[];
     },
     $queryRawUnsafe: async <T = unknown>(sql: string, ...params: unknown[]): Promise<T[]> => {
-      return (await exec(sql, params)).rows as T[];
+      return (await exec(sql, params, '$queryRawUnsafe')).rows as T[];
     },
     $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]): Promise<number> => {
       const { text, params } = flattenTemplate(strings as unknown as string[], values, ph);
-      return (await exec(text, params)).rowCount ?? 0;
+      return (await exec(text, params, '$executeRaw')).rowCount ?? 0;
     },
     $executeRawUnsafe: async (sql: string, ...params: unknown[]): Promise<number> => {
-      return (await exec(sql, params)).rowCount ?? 0;
+      return (await exec(sql, params, '$executeRawUnsafe')).rowCount ?? 0;
     },
   };
 }
@@ -3003,8 +3012,11 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
 
   const ph = placeholderOf(db);
 
-  const runRaw: RawExecutor = async (text, params) => {
+  // Prefer the client's own raw seam, which emits a `$on('query')` event; a
+  // client without one (an older core, a test stub) runs on the pool as before.
+  const runRaw: RawExecutor = async (text, params, action) => {
     try {
+      if (typeof db.rawQuery === 'function') return await db.rawQuery(text, params, action);
       return await poolOf(db).query(text, params);
     } catch (err) {
       throw decorate(wrapPgError(err), ctx.options.prismaErrorCodes);
@@ -3021,7 +3033,7 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
    */
   const txRunRaw =
     (tx: CompatTransactionClient): RawExecutor =>
-    async (text, params) => {
+    async (text, params, action) => {
       if (typeof tx.rawQuery !== 'function') {
         throw decorate(
           new ValidationError(
@@ -3033,7 +3045,7 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
         );
       }
       try {
-        return await tx.rawQuery(text, params);
+        return await tx.rawQuery(text, params, action);
       } catch (err) {
         throw decorate(wrapPgError(err), ctx.options.prismaErrorCodes);
       }

@@ -51,6 +51,8 @@
 import type { PgCompatPool } from './client.js';
 import { type Dialect, postgresDialect } from './dialect.js';
 import { ValidationError, wrapPgError } from './errors.js';
+import type { QueryEvent } from './query/deferred.js';
+import { rawIdentity, runReportedStatement } from './query-events.js';
 
 /**
  * Build a `(sql, params)` pair from a tagged-template invocation.
@@ -117,6 +119,12 @@ export class TypedSqlQuery<T extends Record<string, unknown>> implements Promise
      * behaves exactly as before.
      */
     private readonly runScoped: <R>(fn: () => R) => R = (fn) => fn(),
+    /**
+     * The owning client's `$on('query')` sink. Each execution emits one event
+     * with model `'$raw'` and action `'sql'`. Absent for a `TypedSqlQuery`
+     * built outside a client, which then emits nothing, as before.
+     */
+    private readonly onQuery?: (event: QueryEvent) => void,
   ) {}
 
   /** Execute and return all rows. Internal; powers `then`, `one`, and `scalar`. */
@@ -125,12 +133,15 @@ export class TypedSqlQuery<T extends Record<string, unknown>> implements Promise
       if (this.logging) {
         console.log(`[turbine] Typed SQL: ${this.sql.trim().substring(0, 120)}...`);
       }
-      try {
-        const result = await this.pool.query(this.sql, this.params);
-        return result.rows as T[];
-      } catch (err) {
-        throw wrapPgError(err);
-      }
+      const result = await runReportedStatement(
+        this.onQuery,
+        rawIdentity('sql'),
+        this.sql,
+        this.params,
+        () => this.pool.query(this.sql, this.params),
+        wrapPgError,
+      );
+      return result.rows as T[];
     });
   }
 

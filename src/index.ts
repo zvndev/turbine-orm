@@ -214,6 +214,8 @@ export {
   type WithOrderByObject,
   type WithResult,
 } from './query/index.js';
+// $on('query') event metadata: raw-statement model name, $tag() label limit
+export { MAX_QUERY_TAG_LENGTH, RAW_QUERY_MODEL } from './query-events.js';
 // Realtime, LISTEN/NOTIFY pub/sub
 export { type ActiveSubscription, type NotificationHandler, type Subscription, validateChannel } from './realtime.js';
 // Schema metadata types

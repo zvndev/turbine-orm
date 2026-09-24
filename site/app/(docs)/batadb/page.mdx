@@ -74,7 +74,20 @@ const authors = await db.authors.findMany({
 // authors[0].posts[0].title  ← fully typed
 ```
 
-## 5. Migrations
+## 5. Query telemetry
+
+Turbine's [`$on('query')`](/observability) events carry the model and action of every statement, which the database alone cannot see. `@batadata/serverless` (0.7.0+) forwards them to your BataDB project in one call, for either client above:
+
+```ts
+import { batadbTelemetry } from '@batadata/serverless';
+
+const telemetry = batadbTelemetry(db); // reads BATA_API_KEY, BATA_PROJECT_ID, BATA_BRANCH_ID
+// on shutdown (or at the end of a serverless invocation): await telemetry.stop() / telemetry.flush()
+```
+
+It sends parameterized SQL shapes and per-minute p50/p95/p99 latency per model and action, never parameter values, on a background timer that never throws into your app. Wrap a code path in [`db.$tag('checkout', fn)`](/observability) and its queries are grouped under that tag. Raw SQL, pipelines and `$transaction([...])` are reported too.
+
+## 6. Migrations
 
 SQL-first migrations, no shadow database and no proprietary schema DSL:
 
