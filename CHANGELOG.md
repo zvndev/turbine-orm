@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.79.1 (unreleased)
+## 0.79.1 (2026-09-24)
 
 Two fixes for applications that bundle turbine-orm, both invisible to code run
 straight from `node_modules`.
