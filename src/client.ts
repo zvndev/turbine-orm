@@ -61,7 +61,15 @@ import {
   warnParserOverwrite,
 } from './query/utils.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
-import { currentQueryTag, RAW_QUERY_MODEL, runWithQueryTag } from './query-events.js';
+import {
+  currentQueryTag,
+  deferredIdentity,
+  emitStatementEvent,
+  rawIdentity,
+  resultRowCount,
+  runReportedStatement,
+  runWithQueryTag,
+} from './query-events.js';
 import {
   type ActiveSubscription,
   createSubscription,
@@ -1071,84 +1079,6 @@ interface PrimaryViewSeed {
  * All queries run on a dedicated connection within a BEGIN/COMMIT block.
  * Supports nested transactions via SAVEPOINTs.
  */
-// ---------------------------------------------------------------------------
-// Query events for statements that do not go through a QueryInterface
-// ---------------------------------------------------------------------------
-
-/** The client's event sink, as QueryInterfaceOptions carries it. */
-type QueryEventSink = ((event: QueryEvent) => void) | undefined;
-
-/** Rows a driver result reports: the affected count, else the returned rows. */
-function resultRowCount(result: { rowCount?: number | null; rows?: unknown[] } | undefined): number {
-  if (!result) return 0;
-  if (typeof result.rowCount === 'number') return result.rowCount;
-  return Array.isArray(result.rows) ? result.rows.length : 0;
-}
-
-/**
- * Emit one query event for a statement that ran outside a QueryInterface (raw
- * SQL, a pipeline slot, a transaction-batch slot). Never throws: a listener
- * problem must not turn a successful statement into a failed one.
- */
-function emitStatementEvent(sink: QueryEventSink, event: Omit<QueryEvent, 'timestamp'> & { timestamp?: Date }): void {
-  if (!sink) return;
-  try {
-    sink({ ...event, timestamp: event.timestamp ?? new Date() });
-  } catch {
-    // Listener errors must never crash a query.
-  }
-}
-
-/**
- * Split a {@link DeferredQuery.tag} (`'<table>.<action>'`) into the event's
- * model and action. A tag without a dot is reported as a raw statement.
- */
-function deferredIdentity(tag: string | undefined): { model: string; action: string } {
-  const at = typeof tag === 'string' ? tag.lastIndexOf('.') : -1;
-  if (!tag || at <= 0 || at === tag.length - 1) return { model: RAW_QUERY_MODEL, action: tag || 'deferred' };
-  return { model: tag.slice(0, at), action: tag.slice(at + 1) };
-}
-
-/**
- * Run a raw statement and report it. `action` names the entry point (`'raw'`,
- * `'sql'`, `'rawQuery'`, `'$queryRaw'` ...). The error is reported as the
- * caller will see it: `wrap` is applied before the event is emitted.
- */
-async function runReportedStatement<R extends { rowCount?: number | null; rows?: unknown[] }>(
-  sink: QueryEventSink,
-  action: string,
-  sql: string,
-  params: unknown[],
-  run: () => Promise<R>,
-  wrap: (err: unknown) => unknown,
-): Promise<R> {
-  const start = performance.now();
-  try {
-    const result = await run();
-    emitStatementEvent(sink, {
-      sql,
-      params,
-      duration: performance.now() - start,
-      model: RAW_QUERY_MODEL,
-      action,
-      rows: resultRowCount(result),
-    });
-    return result;
-  } catch (err) {
-    const wrapped = wrap(err);
-    emitStatementEvent(sink, {
-      sql,
-      params,
-      duration: performance.now() - start,
-      model: RAW_QUERY_MODEL,
-      action,
-      rows: 0,
-      error: wrapped instanceof Error ? wrapped : new Error(String(wrapped)),
-    });
-    throw wrapped;
-  }
-}
-
 export class TransactionClient {
   private readonly tableCache = new Map<string, QueryInterface<object>>();
   private savepointCounter = 0;
@@ -1236,7 +1166,7 @@ export class TransactionClient {
     });
     const result = await runReportedStatement(
       this.queryOptions?._onQuery,
-      'raw',
+      rawIdentity('raw'),
       sql,
       values,
       () => this.client.query(sql, values),
@@ -1278,7 +1208,7 @@ export class TransactionClient {
   ): Promise<{ rows: T[]; rowCount: number | null }> {
     const result = await runReportedStatement(
       this.queryOptions?._onQuery,
-      action,
+      rawIdentity(action),
       text,
       params as unknown[],
       () => this.client.query(text, params as unknown[]),
@@ -2342,28 +2272,29 @@ export class TurbineClient {
       failure = err;
       throw err;
     } finally {
-      const share = queries.length > 0 ? (performance.now() - start) / queries.length : 0;
-      // The failing slot: PipelineError names it; any other error (connect,
+      const duration = (performance.now() - start) / queries.length;
+      // PipelineError names the failing slot; any other failure (connect,
       // BEGIN) is charged to the first statement that produced no result.
-      let failedIndex: number | undefined;
-      if (failure !== undefined) {
-        failedIndex =
-          failure instanceof PipelineError && typeof failure.failedIndex === 'number'
+      const failedIndex =
+        failure === undefined
+          ? -1
+          : failure instanceof PipelineError && failure.failedIndex !== undefined
             ? failure.failedIndex
-            : rowCounts.findIndex((n) => n === undefined);
-      }
+            : rowCounts.indexOf(undefined);
       queries.forEach((q, i) => {
         const failed = i === failedIndex;
-        if (!failed && rowCounts[i] === undefined) return; // never ran, or rolled back unseen
-        emitStatementEvent(sink, {
-          sql: q.sql,
-          params: q.params,
-          duration: share,
-          ...deferredIdentity(q.tag),
-          rows: failed ? 0 : (rowCounts[i] ?? 0),
-          batch: 'pipeline',
-          ...(failed ? { error: failure instanceof Error ? failure : new Error(String(failure)) } : {}),
-        });
+        // A slot that never ran (or rolled back unseen) is not reported.
+        if (failed || rowCounts[i] !== undefined) {
+          emitStatementEvent(sink, {
+            sql: q.sql,
+            params: q.params,
+            duration,
+            ...deferredIdentity(q.tag),
+            rows: rowCounts[i] ?? 0,
+            batch: 'pipeline',
+            ...(failed ? { error: failure instanceof Error ? failure : new Error(String(failure)) } : {}),
+          });
+        }
       });
     }
   }
@@ -2411,7 +2342,7 @@ export class TurbineClient {
 
     const result = await runReportedStatement(
       this.queryOptions._onQuery,
-      'raw',
+      rawIdentity('raw'),
       sql,
       values,
       () => this.pool.query(sql, values),
@@ -2436,7 +2367,7 @@ export class TurbineClient {
   ): Promise<{ rows: T[]; rowCount: number | null }> {
     const result = await runReportedStatement(
       this.queryOptions._onQuery,
-      action,
+      rawIdentity(action),
       text,
       params as unknown[],
       () => this.pool.query(text, params as unknown[]),
@@ -2832,18 +2763,15 @@ export class TurbineClient {
     // One `$on('query')` event per statement, `batch: 'transaction'`, only
     // when someone is listening; each statement is timed on its own.
     const sink = this.queryListeners.size > 0 ? this.queryOptions._onQuery : undefined;
-    const report = (dq: DeferredQuery<unknown>, start: number, raw?: PgCompatQueryResult, error?: unknown): void => {
-      if (!sink) return;
-      emitStatementEvent(sink, {
-        sql: dq.sql,
-        params: dq.params,
-        duration: performance.now() - start,
-        ...deferredIdentity(dq.tag),
-        rows: raw ? resultRowCount(raw) : 0,
-        batch: 'transaction',
-        ...(error !== undefined ? { error: error instanceof Error ? error : new Error(String(error)) } : {}),
-      });
-    };
+    const reported = (dq: DeferredQuery<unknown>, run: () => Promise<PgCompatQueryResult>) =>
+      runReportedStatement(
+        sink,
+        { ...deferredIdentity(dq.tag), batch: 'transaction' },
+        dq.sql,
+        dq.params,
+        run,
+        wrapPgError,
+      );
     return this.transaction(async (client) => {
       const pipelined =
         (client as unknown as PgCompatPoolClient).supportsPipelining === true &&
@@ -2854,19 +2782,7 @@ export class TurbineClient {
         // FIFO guarantee makes settled[i] the reply to queries[i]. Each
         // statement is timed from its dispatch to its own reply.
         const settled = await Promise.allSettled(
-          queries.map((dq) => {
-            const start = performance.now();
-            return client.query(dq.sql, dq.params).then(
-              (raw) => {
-                report(dq, start, raw);
-                return raw;
-              },
-              (err: unknown) => {
-                report(dq, start, undefined, wrapPgError(err));
-                throw err;
-              },
-            );
-          }),
+          queries.map((dq) => reported(dq, () => client.query(dq.sql, dq.params))),
         );
         const results: unknown[] = [];
         for (let i = 0; i < settled.length; i++) {
@@ -2881,22 +2797,14 @@ export class TurbineClient {
 
       const results: unknown[] = [];
       for (const dq of queries) {
-        let raw: PgCompatQueryResult;
-        const start = performance.now();
-        try {
-          // Non-RETURNING engines (resultStrategy 'reselect', e.g. MySQL)
-          // attach a reselect plan that runs the write plus a follow-up SELECT;
-          // running dq.sql alone would transform a row-less write result.
-          raw =
-            this.dialect.resultStrategy === 'reselect' && dq.reselect
-              ? await dq.reselect((sql, params) => client.query(sql, params))
-              : await client.query(dq.sql, dq.params);
-        } catch (err) {
-          const wrapped = wrapPgError(err);
-          report(dq, start, undefined, wrapped);
-          throw wrapped;
-        }
-        report(dq, start, raw);
+        // Non-RETURNING engines (resultStrategy 'reselect', e.g. MySQL) attach a
+        // reselect plan that runs the write plus a follow-up SELECT; running
+        // dq.sql alone would transform a row-less write result.
+        const raw = await reported(dq, () =>
+          this.dialect.resultStrategy === 'reselect' && dq.reselect
+            ? dq.reselect((sql, params) => client.query(sql, params))
+            : client.query(dq.sql, dq.params),
+        );
         results.push(dq.transform(raw));
       }
       return results as PipelineResults<T>;

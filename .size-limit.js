@@ -266,6 +266,19 @@ const nodePlatform = (config) => {
 // being ~1.7K LOC because it takes a TurbineClient by value and imports only
 // types from the core, so the client/query graph is not in its bundle: that
 // property is worth guarding, and this budget is what guards it.
+// SQLITE, MYSQL AND MSSQL +1 kB EACH (0.79.0, query-event coverage). Measured
+// on this build: main 90.89 (91), serverless 71.94 (72), sqlite 74.99 (was 75),
+// mysql 76.08 (was 76), mssql 77.61 (was 77); on 0.78.0 main they were 90.38,
+// 71.30, 74.37, 75.53, 76.81. The growth is uniform across every entry that
+// carries the client graph (+0.5 to +0.8 kB), which is the signature of shared
+// code rather than a new edge, and it is accounted for: src/query-events.ts (the
+// $tag scope and the statement-event helpers) and the reporting paths in
+// client.ts (raw / rawQuery / pipeline / transaction batch) and typed-sql.ts.
+// It was TRIMMED first to keep both published claims true (main under 91,
+// serverless under 72, both unchanged); the three engine entries are not claims,
+// so they move by the 1 kB minimum instead. Note main and serverless now have
+// 0.11 and 0.06 kB of headroom: the next change to the shared graph decides the
+// claim, per the rule above.
 export default [
   {
     name: "main entry, import { TurbineClient } from 'turbine-orm'",
@@ -289,14 +302,14 @@ export default [
   {
     name: 'sqlite entry, turbine-orm/sqlite (node:sqlite + client graph)',
     path: 'dist/sqlite.js',
-    limit: '75 kB',
+    limit: '76 kB',
     ignore: ['pg', 'node:sqlite'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
     name: 'mysql entry, turbine-orm/mysql (client graph; mysql2 lazy-loaded)',
     path: 'dist/mysql.js',
-    limit: '76 kB',
+    limit: '77 kB',
     // mysql2 is an optional peer loaded via a dynamic import in the factory, so
     // it is never in the static graph, exclude it (and pg) from the footprint.
     ignore: ['pg', 'mysql2', 'mysql2/promise'],
@@ -307,7 +320,7 @@ export default [
     path: 'dist/mssql.js',
     // Slightly larger than the other engines: the FOR JSON PATH relation generator
     // and the INFORMATION_SCHEMA/sys introspector add real code (no extra deps).
-    limit: '77 kB',
+    limit: '78 kB',
     // mssql is an optional peer loaded via a dynamic import in the factory, so it
     // is never in the static graph, exclude it (and pg) from the footprint.
     ignore: ['pg', 'mssql'],

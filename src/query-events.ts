@@ -29,6 +29,7 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { ValidationError } from './errors.js';
+import type { QueryEvent } from './query/deferred.js';
 
 /**
  * The `model` reported for statements that are not tied to one table: `raw`,
@@ -65,14 +66,86 @@ export function currentQueryTag(): string | undefined {
  * {@link MAX_QUERY_TAG_LENGTH} characters, before `fn` runs.
  */
 export function runWithQueryTag<R>(tag: string, fn: () => R): R {
-  if (typeof tag !== 'string' || tag.trim().length === 0) {
-    throw new ValidationError('$tag() needs a non-empty string label, e.g. db.$tag("checkout", () => ...).');
-  }
-  if (tag.length > MAX_QUERY_TAG_LENGTH) {
-    throw new ValidationError(
-      `$tag() label is ${tag.length} characters; the limit is ${MAX_QUERY_TAG_LENGTH}. ` +
-        'A tag names a feature or a code path, it is not a place to put request data.',
-    );
+  if (typeof tag !== 'string' || !tag.trim() || tag.length > MAX_QUERY_TAG_LENGTH) {
+    throw new ValidationError(`$tag() needs a label of 1-${MAX_QUERY_TAG_LENGTH} characters.`);
   }
   return scope().run(tag, fn);
 }
+
+// ---------------------------------------------------------------------------
+// Events for statements that do not go through a QueryInterface
+// ---------------------------------------------------------------------------
+
+/** A client's event sink, as QueryInterfaceOptions carries it. */
+type QueryEventSink = ((event: QueryEvent) => void) | undefined;
+
+/** Rows a driver result reports: the affected count, else the returned rows. */
+export function resultRowCount(result: { rowCount?: number | null; rows?: unknown[] } | undefined): number {
+  return typeof result?.rowCount === 'number' ? result.rowCount : (result?.rows?.length ?? 0);
+}
+
+/**
+ * Emit one query event for a statement that ran outside a QueryInterface (raw
+ * SQL, a pipeline slot, a transaction-batch slot). Never throws: a listener
+ * problem must not turn a successful statement into a failed one.
+ */
+export function emitStatementEvent(sink: QueryEventSink, event: Omit<QueryEvent, 'timestamp'>): void {
+  try {
+    sink?.({ ...event, timestamp: new Date() });
+  } catch {
+    // Listener errors must never crash a query.
+  }
+}
+
+/**
+ * Split a DeferredQuery tag (`'<table>.<action>'`) into the event's model and
+ * action. A tag without one is reported as a raw statement.
+ */
+export function deferredIdentity(tag: string): { model: string; action: string } {
+  const at = tag.lastIndexOf('.');
+  return at > 0 ? { model: tag.slice(0, at), action: tag.slice(at + 1) } : { model: RAW_QUERY_MODEL, action: tag };
+}
+
+/**
+ * Run one statement and report it. `identity` is the event's model and action
+ * (plus `batch` for a batch slot); for raw SQL the model is
+ * {@link RAW_QUERY_MODEL} and the action names the entry point (`'raw'`,
+ * `'sql'`, `'rawQuery'`, `'$queryRaw'` ...). `wrap` turns a driver error into
+ * what the caller sees, and the event carries that same error.
+ */
+export async function runReportedStatement<R extends { rowCount?: number | null; rows?: unknown[] }>(
+  sink: QueryEventSink,
+  identity: Pick<QueryEvent, 'model' | 'action' | 'batch'>,
+  sql: string,
+  params: unknown[],
+  run: () => Promise<R>,
+  wrap: (err: unknown) => unknown,
+): Promise<R> {
+  const start = performance.now();
+  let result: R | undefined;
+  let error: unknown;
+  try {
+    result = await run();
+    return result;
+  } catch (err) {
+    error = wrap(err);
+    throw error;
+  } finally {
+    if (sink) {
+      emitStatementEvent(sink, {
+        ...identity,
+        sql,
+        params,
+        duration: performance.now() - start,
+        rows: resultRowCount(result),
+        ...(error === undefined ? {} : { error: error instanceof Error ? error : new Error(String(error)) }),
+      });
+    }
+  }
+}
+
+/** The identity of a raw statement run through `action`. */
+export const rawIdentity = (action: string): Pick<QueryEvent, 'model' | 'action'> => ({
+  model: RAW_QUERY_MODEL,
+  action,
+});
