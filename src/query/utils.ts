@@ -4,7 +4,7 @@
  * Standalone utility functions and classes used by the query builder.
  */
 
-import pg from 'pg';
+import pg from '#pg';
 import { ValidationError } from '../errors.js';
 import { camelToSnake, localDateTimeKind, snakeToCamel, timeOfDayKind } from '../schema.js';
 import { shouldWarnOnce, WARN_NS } from './warn-registry.js';

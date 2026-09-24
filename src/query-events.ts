@@ -112,6 +112,13 @@ export function deferredIdentity(tag: string): { model: string; action: string }
  * {@link RAW_QUERY_MODEL} and the action names the entry point (`'raw'`,
  * `'sql'`, `'rawQuery'`, `'$queryRaw'` ...). `wrap` turns a driver error into
  * what the caller sees, and the event carries that same error.
+ *
+ * The failure is reported from inside the `catch`, never handed to a `finally`
+ * through a local. SWC's minifier (the one Next.js runs over server bundles)
+ * treats `error = wrap(err); throw error;` as a single-use temporary and
+ * rewrites it to `throw wrap(err)`, dropping the assignment the `finally` then
+ * reads. Every failed statement in a minified bundle was reported as a
+ * success. `minified-events.test.ts` runs this module through that minifier.
  */
 export async function runReportedStatement<R extends { rowCount?: number | null; rows?: unknown[] }>(
   sink: QueryEventSink,
@@ -122,26 +129,27 @@ export async function runReportedStatement<R extends { rowCount?: number | null;
   wrap: (err: unknown) => unknown,
 ): Promise<R> {
   const start = performance.now();
-  let result: R | undefined;
-  let error: unknown;
+  const report = (rows: number, error?: Error): void => {
+    if (!sink) return;
+    emitStatementEvent(sink, {
+      ...identity,
+      sql,
+      params,
+      duration: performance.now() - start,
+      rows,
+      ...(error === undefined ? {} : { error }),
+    });
+  };
+  let result: R;
   try {
     result = await run();
-    return result;
   } catch (err) {
-    error = wrap(err);
+    const error = wrap(err);
+    report(0, error instanceof Error ? error : new Error(String(error)));
     throw error;
-  } finally {
-    if (sink) {
-      emitStatementEvent(sink, {
-        ...identity,
-        sql,
-        params,
-        duration: performance.now() - start,
-        rows: resultRowCount(result),
-        ...(error === undefined ? {} : { error: error instanceof Error ? error : new Error(String(error)) }),
-      });
-    }
   }
+  report(resultRowCount(result));
+  return result;
 }
 
 /** The identity of a raw statement run through `action`. */

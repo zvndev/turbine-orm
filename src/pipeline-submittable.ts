@@ -18,11 +18,17 @@
  */
 
 import type { EventEmitter } from 'node:events';
-import Result from 'pg/lib/result';
-import { prepareValue } from 'pg/lib/utils';
+import type PgResult from 'pg/lib/result';
+import pg from '#pg';
 import { PipelineError, TimeoutError, wrapPgError } from './errors.js';
 import type { PgCompatQueryResult } from './pg-types.js';
 import type { DeferredQuery } from './query/index.js';
+
+// Read off pg's own module object (`pg.Result` IS `pg/lib/result`, `pg.utils`
+// IS `pg/lib/utils`) rather than imported by subpath, so the whole driver comes
+// through the one `#pg` alias that edge bundles swap out (see src/pg-edge.ts).
+const Result = (pg as unknown as { Result: typeof PgResult }).Result;
+const { prepareValue } = (pg as unknown as { utils: { prepareValue(value: unknown): unknown } }).utils;
 
 // ---------------------------------------------------------------------------
 // Types for pg internals we interact with
