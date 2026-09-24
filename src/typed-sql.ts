@@ -51,6 +51,7 @@
 import type { PgCompatPool } from './client.js';
 import { type Dialect, postgresDialect } from './dialect.js';
 import { ValidationError, wrapPgError } from './errors.js';
+import { type QueryEvent, RAW_QUERY_MODEL } from './query/deferred.js';
 
 /**
  * Build a `(sql, params)` pair from a tagged-template invocation.
@@ -117,7 +118,31 @@ export class TypedSqlQuery<T extends Record<string, unknown>> implements Promise
      * behaves exactly as before.
      */
     private readonly runScoped: <R>(fn: () => R) => R = (fn) => fn(),
+    /**
+     * The owning client's `$on('query')` sink. Each execution emits one event
+     * with model `'$raw'` and action `'sql'`. Absent for a `TypedSqlQuery`
+     * built outside a client, which then emits nothing, as before.
+     */
+    private readonly onQuery?: (event: QueryEvent) => void,
   ) {}
+
+  private report(start: number, rows: number, error?: Error): void {
+    if (!this.onQuery) return;
+    try {
+      this.onQuery({
+        sql: this.sql,
+        params: this.params,
+        duration: performance.now() - start,
+        model: RAW_QUERY_MODEL,
+        action: 'sql',
+        rows,
+        timestamp: new Date(),
+        ...(error ? { error } : {}),
+      });
+    } catch {
+      // Listener errors must never crash a query.
+    }
+  }
 
   /** Execute and return all rows. Internal; powers `then`, `one`, and `scalar`. */
   private run(): Promise<T[]> {
@@ -125,11 +150,15 @@ export class TypedSqlQuery<T extends Record<string, unknown>> implements Promise
       if (this.logging) {
         console.log(`[turbine] Typed SQL: ${this.sql.trim().substring(0, 120)}...`);
       }
+      const start = performance.now();
       try {
         const result = await this.pool.query(this.sql, this.params);
+        this.report(start, typeof result.rowCount === 'number' ? result.rowCount : result.rows.length);
         return result.rows as T[];
       } catch (err) {
-        throw wrapPgError(err);
+        const wrapped = wrapPgError(err);
+        this.report(start, 0, wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
+        throw wrapped;
       }
     });
   }

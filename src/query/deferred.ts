@@ -99,7 +99,30 @@ export interface QueryEvent {
    * observability can see exactly which queries the auto default re-planned.
    */
   strategy?: 'auto-batched';
+  /**
+   * The label of the innermost `db.$tag(label, fn)` scope the query ran in.
+   * Absent outside any scope. Lets a listener attribute a query to the feature
+   * or code path that issued it, which `model` + `action` cannot.
+   */
+  tag?: string;
+  /**
+   * Set on statements that ran as part of a batch rather than on their own:
+   * `'pipeline'` for `db.pipeline(...)`, `'transaction'` for the array form
+   * `$transaction([...])`. A pipeline sends every statement in one round trip,
+   * so its per-statement `duration` is the batch's wall time divided evenly
+   * across the statements (the sum is exact, the split is not). Transaction
+   * batch statements are timed individually. Absent for everything else.
+   */
+  batch?: 'pipeline' | 'transaction';
 }
+
+/**
+ * The `model` reported for statements that are not tied to one table: `raw`,
+ * `sql`, the transaction-scoped `raw` / `rawQuery`, and prisma-compat's
+ * `$queryRaw` / `$executeRaw` family. `action` names the entry point that ran
+ * it. The `$` prefix cannot collide with a generated table accessor.
+ */
+export const RAW_QUERY_MODEL = '$raw';
 
 export type QueryEventListener = (event: QueryEvent) => void;
 

@@ -181,6 +181,7 @@ export {
   type QueryEventListener,
   QueryInterface,
   type QueryResult,
+  RAW_QUERY_MODEL,
   type RelationDescriptor,
   type RelationFilter,
   type RelationLoadStrategy,
@@ -214,6 +215,8 @@ export {
   type WithOrderByObject,
   type WithResult,
 } from './query/index.js';
+// Per-scope query tags for $on('query') attribution (db.$tag is the entry point)
+export { MAX_QUERY_TAG_LENGTH } from './query-tag.js';
 // Realtime, LISTEN/NOTIFY pub/sub
 export { type ActiveSubscription, type NotificationHandler, type Subscription, validateChannel } from './realtime.js';
 // Schema metadata types

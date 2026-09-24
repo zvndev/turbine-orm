@@ -29,6 +29,7 @@ import {
   ConnectionError,
   type ErrorMessageMode,
   errorMessageModesDiverged,
+  PipelineError,
   registerClientErrorMessageMode,
   runWithErrorMessageMode,
   setErrorMessageMode,
@@ -48,6 +49,7 @@ import {
   type QueryEventListener,
   QueryInterface,
   type QueryInterfaceOptions,
+  RAW_QUERY_MODEL,
   type RelationLoadStrategy,
   type TemporalInfinityReading,
 } from './query/index.js';
@@ -60,6 +62,7 @@ import {
   warnParserOverwrite,
 } from './query/utils.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
+import { currentQueryTag, runWithQueryTag } from './query-tag.js';
 import {
   type ActiveSubscription,
   createSubscription,
@@ -1069,6 +1072,84 @@ interface PrimaryViewSeed {
  * All queries run on a dedicated connection within a BEGIN/COMMIT block.
  * Supports nested transactions via SAVEPOINTs.
  */
+// ---------------------------------------------------------------------------
+// Query events for statements that do not go through a QueryInterface
+// ---------------------------------------------------------------------------
+
+/** The client's event sink, as QueryInterfaceOptions carries it. */
+type QueryEventSink = ((event: QueryEvent) => void) | undefined;
+
+/** Rows a driver result reports: the affected count, else the returned rows. */
+function resultRowCount(result: { rowCount?: number | null; rows?: unknown[] } | undefined): number {
+  if (!result) return 0;
+  if (typeof result.rowCount === 'number') return result.rowCount;
+  return Array.isArray(result.rows) ? result.rows.length : 0;
+}
+
+/**
+ * Emit one query event for a statement that ran outside a QueryInterface (raw
+ * SQL, a pipeline slot, a transaction-batch slot). Never throws: a listener
+ * problem must not turn a successful statement into a failed one.
+ */
+function emitStatementEvent(sink: QueryEventSink, event: Omit<QueryEvent, 'timestamp'> & { timestamp?: Date }): void {
+  if (!sink) return;
+  try {
+    sink({ ...event, timestamp: event.timestamp ?? new Date() });
+  } catch {
+    // Listener errors must never crash a query.
+  }
+}
+
+/**
+ * Split a {@link DeferredQuery.tag} (`'<table>.<action>'`) into the event's
+ * model and action. A tag without a dot is reported as a raw statement.
+ */
+function deferredIdentity(tag: string | undefined): { model: string; action: string } {
+  const at = typeof tag === 'string' ? tag.lastIndexOf('.') : -1;
+  if (!tag || at <= 0 || at === tag.length - 1) return { model: RAW_QUERY_MODEL, action: tag || 'deferred' };
+  return { model: tag.slice(0, at), action: tag.slice(at + 1) };
+}
+
+/**
+ * Run a raw statement and report it. `action` names the entry point (`'raw'`,
+ * `'sql'`, `'rawQuery'`, `'$queryRaw'` ...). The error is reported as the
+ * caller will see it: `wrap` is applied before the event is emitted.
+ */
+async function runReportedStatement<R extends { rowCount?: number | null; rows?: unknown[] }>(
+  sink: QueryEventSink,
+  action: string,
+  sql: string,
+  params: unknown[],
+  run: () => Promise<R>,
+  wrap: (err: unknown) => unknown,
+): Promise<R> {
+  const start = performance.now();
+  try {
+    const result = await run();
+    emitStatementEvent(sink, {
+      sql,
+      params,
+      duration: performance.now() - start,
+      model: RAW_QUERY_MODEL,
+      action,
+      rows: resultRowCount(result),
+    });
+    return result;
+  } catch (err) {
+    const wrapped = wrap(err);
+    emitStatementEvent(sink, {
+      sql,
+      params,
+      duration: performance.now() - start,
+      model: RAW_QUERY_MODEL,
+      action,
+      rows: 0,
+      error: wrapped instanceof Error ? wrapped : new Error(String(wrapped)),
+    });
+    throw wrapped;
+  }
+}
+
 export class TransactionClient {
   private readonly tableCache = new Map<string, QueryInterface<object>>();
   private savepointCounter = 0;
@@ -1154,12 +1235,15 @@ export class TransactionClient {
         sql += this.dialect.paramPlaceholder(i + 1);
       }
     });
-    try {
-      const result = await this.client.query(sql, values);
-      return result.rows as T[];
-    } catch (err) {
-      throw wrapPgError(err);
-    }
+    const result = await runReportedStatement(
+      this.queryOptions?._onQuery,
+      'raw',
+      sql,
+      values,
+      () => this.client.query(sql, values),
+      wrapPgError,
+    );
+    return result.rows as T[];
   }
 
   /**
@@ -1184,18 +1268,24 @@ export class TransactionClient {
    * inside the same BEGIN/COMMIT (and any active SAVEPOINT) as every other
    * statement in the callback. Driver errors are translated by `wrapPgError`,
    * exactly as pool-scoped and table-scoped queries are. Like {@link raw}, it
-   * emits no `$on('query')` event and runs no middleware.
+   * runs no middleware, and it emits one `$on('query')` event with model
+   * `'$raw'` and `action` set to the optional `action` label (the adapter
+   * passes `'$queryRaw'` / `'$executeRaw'` ...; default `'rawQuery'`).
    */
   async rawQuery<T extends object = Record<string, unknown>>(
     text: string,
     params: readonly unknown[] = [],
+    action = 'rawQuery',
   ): Promise<{ rows: T[]; rowCount: number | null }> {
-    try {
-      const result = await this.client.query(text, params as unknown[]);
-      return { rows: result.rows as T[], rowCount: result.rowCount };
-    } catch (err) {
-      throw wrapPgError(err);
-    }
+    const result = await runReportedStatement(
+      this.queryOptions?._onQuery,
+      action,
+      text,
+      params as unknown[],
+      () => this.client.query(text, params as unknown[]),
+      wrapPgError,
+    );
+    return { rows: result.rows as T[], rowCount: result.rowCount };
   }
 
   /**
@@ -1542,7 +1632,11 @@ export class TurbineClient {
         .queryInterfaceFactory,
       _onQuery: (event: QueryEvent) => {
         if (this.queryListeners.size === 0) return;
-        const emitted = this.queryParamsVisible ? event : { ...event, params: event.params.map(() => '[REDACTED]') };
+        // The $tag() scope is read here, at the one seam every emitter shares,
+        // so a tag reaches model, raw, pipeline and batch events alike.
+        const tag = event.tag ?? currentQueryTag();
+        const tagged = tag === undefined || event.tag !== undefined ? event : { ...event, tag };
+        const emitted = this.queryParamsVisible ? tagged : { ...tagged, params: tagged.params.map(() => '[REDACTED]') };
         for (const listener of this.queryListeners) {
           try {
             listener(emitted);
@@ -2214,7 +2308,65 @@ export class TurbineClient {
     // where VALUES as soon as any verbose client existed in the process. The
     // scope is established around the await, so every continuation of the batch
     // resolves this client's mode.
-    return this.withErrorMode(() => executePipeline(this.pool, queries, options));
+    const sink = this.queryListeners.size > 0 ? this.queryOptions._onQuery : undefined;
+    if (!sink) return this.withErrorMode(() => executePipeline(this.pool, queries, options));
+    return this.withErrorMode(() => this.reportedPipeline(sink, queries, options));
+  }
+
+  /**
+   * {@link pipeline} with one `$on('query')` event per statement. Only taken
+   * when a listener is registered, so an unobserved pipeline runs exactly as
+   * before. Each statement's `transform` is wrapped to capture the driver's
+   * row count on the way through (the pipeline returns transformed values, not
+   * driver results). The statements share one round trip, so the batch's wall
+   * time is split evenly across them and each event carries
+   * `batch: 'pipeline'`.
+   */
+  private async reportedPipeline<T extends readonly DeferredQuery<unknown>[]>(
+    sink: (event: QueryEvent) => void,
+    queries: T,
+    options: PipelineOptions | undefined,
+  ): Promise<PipelineResults<T>> {
+    const rowCounts: (number | undefined)[] = new Array(queries.length).fill(undefined);
+    const observed = queries.map((q, i) => ({
+      ...q,
+      transform: (raw: PgCompatQueryResult) => {
+        rowCounts[i] = resultRowCount(raw);
+        return q.transform(raw);
+      },
+    })) as unknown as T;
+    const start = performance.now();
+    let failure: unknown;
+    try {
+      return await executePipeline(this.pool, observed, options);
+    } catch (err) {
+      failure = err;
+      throw err;
+    } finally {
+      const share = queries.length > 0 ? (performance.now() - start) / queries.length : 0;
+      // The failing slot: PipelineError names it; any other error (connect,
+      // BEGIN) is charged to the first statement that produced no result.
+      let failedIndex: number | undefined;
+      if (failure !== undefined) {
+        failedIndex =
+          failure instanceof PipelineError && typeof failure.failedIndex === 'number'
+            ? failure.failedIndex
+            : rowCounts.findIndex((n) => n === undefined);
+      }
+      queries.forEach((q, i) => {
+        const failed = i === failedIndex;
+        if (!failed && rowCounts[i] === undefined) return; // never ran, or rolled back unseen
+        emitStatementEvent(sink, {
+          sql: q.sql,
+          params: q.params,
+          duration: share,
+          ...deferredIdentity(q.tag),
+          rows: failed ? 0 : (rowCounts[i] ?? 0),
+          batch: 'pipeline',
+          ...(failed ? { error: failure instanceof Error ? failure : new Error(String(failure)) } : {}),
+        });
+      });
+    }
   }
 
   /**
@@ -2258,12 +2410,63 @@ export class TurbineClient {
       console.log(`[turbine] Raw SQL: ${sql.trim().substring(0, 120)}...`);
     }
 
-    try {
-      const result = await this.pool.query(sql, values);
-      return result.rows as T[];
-    } catch (err) {
-      throw this.withErrorMode(() => wrapPgError(err));
-    }
+    const result = await runReportedStatement(
+      this.queryOptions._onQuery,
+      'raw',
+      sql,
+      values,
+      () => this.pool.query(sql, values),
+      (err) => this.withErrorMode(() => wrapPgError(err)),
+    );
+    return result.rows as T[];
+  }
+
+  /**
+   * @internal The `turbine-orm/prisma-compat` adapter's pool-level raw seam,
+   * the twin of {@link TransactionClient.rawQuery}. NOT application API: use
+   * {@link raw} or {@link sql}, whose tagged templates make concatenating a
+   * value into the SQL text impossible. It exists so the adapter's
+   * `$queryRaw` / `$executeRaw` statements emit a `$on('query')` event (model
+   * `'$raw'`, `action` the adapter's label) instead of running unobserved on
+   * the pool. Errors are translated by `wrapPgError`, like {@link raw}.
+   */
+  async rawQuery<T extends object = Record<string, unknown>>(
+    text: string,
+    params: readonly unknown[] = [],
+    action = 'rawQuery',
+  ): Promise<{ rows: T[]; rowCount: number | null }> {
+    const result = await runReportedStatement(
+      this.queryOptions._onQuery,
+      action,
+      text,
+      params as unknown[],
+      () => this.pool.query(text, params as unknown[]),
+      (err) => this.withErrorMode(() => wrapPgError(err)),
+    );
+    return { rows: result.rows as T[], rowCount: result.rowCount };
+  }
+
+  /**
+   * Run `fn` with `tag` attached to every `$on('query')` event it causes, so a
+   * listener can attribute queries to the feature or code path that issued
+   * them. The scope follows async context: queries in awaited helpers,
+   * transactions, pipelines and raw SQL inside `fn` are all tagged. An inner
+   * `$tag` replaces an outer one for its own duration. The tag is event
+   * metadata only and never reaches SQL.
+   *
+   * Throws {@link ValidationError} (E003) for an empty tag or one longer than
+   * {@link MAX_QUERY_TAG_LENGTH} (128) characters.
+   *
+   * @example
+   * ```ts
+   * const order = await db.$tag('checkout', async () => {
+   *   const cart = await db.carts.findUnique({ where: { id } });
+   *   return db.orders.create({ data: { cartId: cart.id } });
+   * });
+   * ```
+   */
+  $tag<R>(tag: string, fn: () => R): R {
+    return runWithQueryTag(tag, fn);
   }
 
   /**
@@ -2307,7 +2510,14 @@ export class TurbineClient {
     // `withErrorMode` docstring already claimed to cover the typed-SQL builder
     // and did not, which left two raw-SQL entry points disagreeing about the
     // same statement, since the adjacent `raw` tag WAS scoped.
-    return new TypedSqlQuery<T>(this.pool, sql, params, this.logging, <R>(fn: () => R): R => this.withErrorMode(fn));
+    return new TypedSqlQuery<T>(
+      this.pool,
+      sql,
+      params,
+      this.logging,
+      <R>(fn: () => R): R => this.withErrorMode(fn),
+      this.queryOptions._onQuery,
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -2620,6 +2830,21 @@ export class TurbineClient {
     if (queries.length === 0) {
       return [] as unknown as PipelineResults<T>;
     }
+    // One `$on('query')` event per statement, `batch: 'transaction'`, only
+    // when someone is listening; each statement is timed on its own.
+    const sink = this.queryListeners.size > 0 ? this.queryOptions._onQuery : undefined;
+    const report = (dq: DeferredQuery<unknown>, start: number, raw?: PgCompatQueryResult, error?: unknown): void => {
+      if (!sink) return;
+      emitStatementEvent(sink, {
+        sql: dq.sql,
+        params: dq.params,
+        duration: performance.now() - start,
+        ...deferredIdentity(dq.tag),
+        rows: raw ? resultRowCount(raw) : 0,
+        batch: 'transaction',
+        ...(error !== undefined ? { error: error instanceof Error ? error : new Error(String(error)) } : {}),
+      });
+    };
     return this.transaction(async (client) => {
       const pipelined =
         (client as unknown as PgCompatPoolClient).supportsPipelining === true &&
@@ -2627,8 +2852,23 @@ export class TurbineClient {
 
       if (pipelined) {
         // Dispatch every statement before awaiting any reply. The driver's
-        // FIFO guarantee makes settled[i] the reply to queries[i].
-        const settled = await Promise.allSettled(queries.map((dq) => client.query(dq.sql, dq.params)));
+        // FIFO guarantee makes settled[i] the reply to queries[i]. Each
+        // statement is timed from its dispatch to its own reply.
+        const settled = await Promise.allSettled(
+          queries.map((dq) => {
+            const start = performance.now();
+            return client.query(dq.sql, dq.params).then(
+              (raw) => {
+                report(dq, start, raw);
+                return raw;
+              },
+              (err: unknown) => {
+                report(dq, start, undefined, wrapPgError(err));
+                throw err;
+              },
+            );
+          }),
+        );
         const results: unknown[] = [];
         for (let i = 0; i < settled.length; i++) {
           const outcome = settled[i]!;
@@ -2643,6 +2883,7 @@ export class TurbineClient {
       const results: unknown[] = [];
       for (const dq of queries) {
         let raw: PgCompatQueryResult;
+        const start = performance.now();
         try {
           // Non-RETURNING engines (resultStrategy 'reselect', e.g. MySQL)
           // attach a reselect plan that runs the write plus a follow-up SELECT;
@@ -2652,8 +2893,11 @@ export class TurbineClient {
               ? await dq.reselect((sql, params) => client.query(sql, params))
               : await client.query(dq.sql, dq.params);
         } catch (err) {
-          throw wrapPgError(err);
+          const wrapped = wrapPgError(err);
+          report(dq, start, undefined, wrapped);
+          throw wrapped;
         }
+        report(dq, start, raw);
         results.push(dq.transform(raw));
       }
       return results as PipelineResults<T>;
