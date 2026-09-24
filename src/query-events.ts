@@ -1,5 +1,6 @@
 /**
- * turbine-orm, per-scope query tags for `$on('query')` attribution.
+ * turbine-orm, `$on('query')` event metadata: the raw-statement model name
+ * and per-scope query tags for attribution.
  *
  * A tag is a caller-chosen label (`'checkout'`, `'nightly-report'`) that rides
  * on every {@link QueryEvent} emitted while a `db.$tag(label, fn)` callback is
@@ -28,6 +29,14 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { ValidationError } from './errors.js';
+
+/**
+ * The `model` reported for statements that are not tied to one table: `raw`,
+ * `sql`, the transaction-scoped `raw` / `rawQuery`, and prisma-compat's
+ * `$queryRaw` / `$executeRaw` family. `action` names the entry point that ran
+ * it. The `$` prefix cannot collide with a generated table accessor.
+ */
+export const RAW_QUERY_MODEL = '$raw';
 
 /** Longest tag accepted. Keeps a tag a label, not a payload. */
 export const MAX_QUERY_TAG_LENGTH = 128;

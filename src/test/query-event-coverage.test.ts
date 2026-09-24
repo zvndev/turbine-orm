@@ -18,8 +18,8 @@ import { describe, it } from 'node:test';
 import { type PgCompatPool, TurbineClient } from '../client.js';
 import { TurbineError, TurbineErrorCode } from '../errors.js';
 import { createPrismaCompatClient } from '../prisma-compat.js';
-import { type QueryEvent, RAW_QUERY_MODEL } from '../query/index.js';
-import { MAX_QUERY_TAG_LENGTH } from '../query-tag.js';
+import type { QueryEvent } from '../query/index.js';
+import { MAX_QUERY_TAG_LENGTH, RAW_QUERY_MODEL } from '../query-events.js';
 import type { PrismaCompatMap, SchemaMetadata } from '../schema.js';
 import { mockTable } from './helpers.js';
 

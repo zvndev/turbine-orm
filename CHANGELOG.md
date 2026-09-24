@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.79.0 (unreleased)
+
+`$on('query')` now sees every statement the client sends, and a query can say
+which feature sent it. Until this release only model methods emitted events:
+raw SQL, pipelines and the array form of `$transaction` ran unobserved, so the
+observe engine and any telemetry listener built on `$on` reported a partial
+picture for any application that leans on raw SQL.
+
+### Added
+
+- **Query events for raw SQL.** `db.raw`, `db.sql` (every execution: `await`,
+  `.one()`, `.scalar()`), the transaction-scoped `tx.raw` and `tx.rawQuery`, and
+  prisma-compat's `$queryRaw`, `$executeRaw`, `$queryRawUnsafe` and
+  `$executeRawUnsafe` each emit one event. `model` is `'$raw'` (exported as
+  `RAW_QUERY_MODEL`) and `action` names the entry point. A failing statement
+  emits an event whose `error` is the error the caller receives.
+- **Query events for batches.** Each statement of `db.pipeline(...)` and of
+  `db.$transaction([...])` emits an event attributed to its own table and
+  method, with the new `batch` field set to `'pipeline'` or `'transaction'`. A
+  pipeline is one round trip, so its statements share the batch's wall time
+  evenly (the sum is exact, the split is not); transaction-batch statements are
+  timed individually. The pipeline path only does this work when a listener is
+  registered.
+- **`db.$tag(label, fn)`.** Every event caused inside `fn` carries
+  `tag: label`, including queries in awaited helpers, transactions, pipelines
+  and raw SQL, and concurrent scopes stay separate. An inner `$tag` wins for its
+  own duration. Labels are 1 to 128 characters (`MAX_QUERY_TAG_LENGTH`), E003
+  otherwise, checked before `fn` runs. The tag is event metadata and never
+  reaches SQL.
+- `QueryEvent` gains two optional fields, `tag` and `batch`.
+
+### Behaviour changes
+
+- `$observe` metrics (and so `_turbine_metrics` and `turbine observe`) now
+  include raw SQL under model `'$raw'`, plus pipeline and batch-transaction
+  statements under their tables. `turbine doctor` table heat reads table names
+  only, so `'$raw'` rows do not affect it; pipeline and batch statements now
+  count toward the heat of the tables they touch, which they always should have.
+  A listener that assumed `model` is always a table name should skip
+  `RAW_QUERY_MODEL`.
+
 ## 0.78.0 (2026-09-06)
 
 A full product review, a gold-standard audit and a three-database end-to-end QA

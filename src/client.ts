@@ -49,7 +49,6 @@ import {
   type QueryEventListener,
   QueryInterface,
   type QueryInterfaceOptions,
-  RAW_QUERY_MODEL,
   type RelationLoadStrategy,
   type TemporalInfinityReading,
 } from './query/index.js';
@@ -62,7 +61,7 @@ import {
   warnParserOverwrite,
 } from './query/utils.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
-import { currentQueryTag, runWithQueryTag } from './query-tag.js';
+import { currentQueryTag, RAW_QUERY_MODEL, runWithQueryTag } from './query-events.js';
 import {
   type ActiveSubscription,
   createSubscription,

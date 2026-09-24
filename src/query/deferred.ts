@@ -116,14 +116,6 @@ export interface QueryEvent {
   batch?: 'pipeline' | 'transaction';
 }
 
-/**
- * The `model` reported for statements that are not tied to one table: `raw`,
- * `sql`, the transaction-scoped `raw` / `rawQuery`, and prisma-compat's
- * `$queryRaw` / `$executeRaw` family. `action` names the entry point that ran
- * it. The `$` prefix cannot collide with a generated table accessor.
- */
-export const RAW_QUERY_MODEL = '$raw';
-
 export type QueryEventListener = (event: QueryEvent) => void;
 
 /** Options passed from TurbineClient to QueryInterface */

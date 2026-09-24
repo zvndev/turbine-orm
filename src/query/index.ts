@@ -152,5 +152,3 @@ export {
   AUTO_TO_ONE_JOIN_ROWS_MIN,
   QueryInterface,
 } from './builder.js';
-// The `model` raw-SQL query events carry (a runtime value, see deferred.ts).
-export { RAW_QUERY_MODEL } from './deferred.js';

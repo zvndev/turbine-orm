@@ -51,7 +51,8 @@
 import type { PgCompatPool } from './client.js';
 import { type Dialect, postgresDialect } from './dialect.js';
 import { ValidationError, wrapPgError } from './errors.js';
-import { type QueryEvent, RAW_QUERY_MODEL } from './query/deferred.js';
+import type { QueryEvent } from './query/deferred.js';
+import { RAW_QUERY_MODEL } from './query-events.js';
 
 /**
  * Build a `(sql, params)` pair from a tagged-template invocation.

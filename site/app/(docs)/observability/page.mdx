@@ -33,10 +33,44 @@ interface QueryEvent {
   rows: number;       // rows returned / affected
   timestamp: Date;
   error?: Error;      // present when the query failed
+  strategy?: 'auto-batched';            // the 'auto' relation strategy re-planned this query
+  tag?: string;                         // the enclosing db.$tag() label, see below
+  batch?: 'pipeline' | 'transaction';   // ran inside pipeline() or $transaction([...])
 }
 ```
 
 A listener that throws never breaks the query; the error is swallowed (logged when `logging: true`).
+
+### What emits an event
+
+Every statement the client sends on your behalf:
+
+| Entry point | `model` | `action` |
+|---|---|---|
+| `db.users.findMany()` and every other model method | the table, e.g. `'users'` | the method, e.g. `'findMany'` |
+| `db.raw` and `tx.raw` tagged templates | `'$raw'` | `'raw'` |
+| `db.sql` tagged template (`await`, `.one()`, `.scalar()`) | `'$raw'` | `'sql'` |
+| `tx.rawQuery(text, params)` | `'$raw'` | `'rawQuery'` |
+| prisma-compat `$queryRaw`, `$executeRaw` and the `Unsafe` forms | `'$raw'` | the method name, e.g. `'$queryRaw'` |
+| each statement of `db.pipeline(...)` | the statement's table | its method, with `batch: 'pipeline'` |
+| each statement of `db.$transaction([...])` | the statement's table | its method, with `batch: 'transaction'` |
+
+`'$raw'` is exported as `RAW_QUERY_MODEL`. A pipeline sends all of its statements in one round trip, so each pipeline event's `duration` is the batch's wall time split evenly across its statements: the total is exact, the per-statement split is not. Statements in `$transaction([...])` are timed one by one. Transaction control statements (`BEGIN`, `COMMIT`, savepoints) are not reported.
+
+### Attributing queries to a feature, `db.$tag()`
+
+`model` and `action` say what ran, not why: `orders.findMany` may be called from a dozen places. Wrap a code path in `$tag` and every event it causes carries that label:
+
+```ts
+const order = await db.$tag('checkout', async () => {
+  const cart = await db.carts.findUnique({ where: { id: cartId } });
+  await db.raw`SELECT pg_advisory_xact_lock(${cart.id})`;
+  return db.orders.create({ data: { cartId: cart.id } });
+});
+// all three events carry tag: 'checkout'
+```
+
+The scope follows async context, so queries in awaited helpers, transactions, pipelines and raw SQL inside the callback are all tagged, and concurrent requests keep their own tags. An inner `$tag` replaces an outer one for its own duration. `$tag` returns whatever the callback returns. A label must be 1 to 128 characters (`MAX_QUERY_TAG_LENGTH`); anything else throws `ValidationError` (E003) before the callback runs. The tag is event metadata only and never reaches SQL, so keep request data such as user ids out of it.
 
 `$on` differs from [middleware](/queries#middleware): middleware wraps the call and can transform results; `$on` is a passive tap that fires after execution with the final SQL, timing, and outcome.
 
