@@ -59,6 +59,10 @@ export default function RootLayout({ children }: { children: ReactNode }) {
       lang="en"
       className={`dark ${bricolage.variable} ${dmSans.variable} ${jetbrains.variable}`}
     >
+      <head>
+        {/* Little Friend analytics. It tracks client-side navigations itself, so it loads once here. */}
+        <script defer src="https://cdn.littlefriend.io/lf.js" data-site="lf_lPpOvu9zeRrHMLiQjS8IwAyp" data-mode="journey" />
+      </head>
       <body className="font-sans">{children}</body>
     </html>
   );
