@@ -214,6 +214,7 @@ export function Sidebar() {
               href="https://github.com/zvndev/turbine-orm"
               target="_blank"
               rel="noopener noreferrer"
+              data-lf="github-sidebar"
               className="flex items-center gap-1.5 text-xs"
               style={{ color: 'var(--text-muted)', textDecoration: 'none' }}
             >
