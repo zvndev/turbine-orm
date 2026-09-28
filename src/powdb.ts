@@ -77,17 +77,19 @@ import importOptionalPeer from './optional-peer-import.cjs';
 import type { PowdbExec } from './powdb-introspect.js';
 import {
   ALL_POWDB_CAPABILITIES,
+  atLeastVersion,
   isDateColumn,
   type PowdbCapabilities,
   PowdbFloatParam,
   PowdbJsonParam,
+  parsePowdbSemver,
   powqlColumnType,
   quotePowqlIdent,
   requireCapability,
 } from './powdb-shared.js';
 import type { QueryInterface, QueryInterfaceOptions } from './query/index.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
-import { type ColumnMetadata, normalizeKeyColumns, type SchemaMetadata } from './schema.js';
+import { type ColumnMetadata, type IndexMetadata, normalizeKeyColumns, type SchemaMetadata } from './schema.js';
 
 // The shared PowDB primitives live in a leaf module (see powdb-shared.ts): this
 // file re-exports from powql.ts and powdb-introspect.ts, and both of those need
@@ -340,32 +342,6 @@ export function assertSupportedPowdbVersion(version: string | undefined): void {
  */
 export const POWQL_MAX_NESTING_DEPTH = 64;
 
-/** Parse a PowDB semver prefix (`0.13.0`, `0.13`, `1.2.3-rc`) into components, or `null`. */
-function parsePowdbSemver(version: string | undefined | null): { major: number; minor: number; patch: number } | null {
-  const m = /^(\d+)\.(\d+)(?:\.(\d+))?/.exec(String(version ?? '').trim());
-  if (!m) return null;
-  return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3] ?? 0) };
-}
-
-/**
- * Is `sem` at least `major.minor.patch`? PATCH-AWARE: `patch` defaults to `0`,
- * so a two-component floor (`atLeastVersion(sem, 0, 19)`) behaves exactly as the
- * old major/minor comparison did (matches every patch of 0.19), while a
- * three-component floor (`atLeastVersion(sem, 0, 19, 1)`) additionally requires
- * the patch, the distinction the link lanes need (0.19.1, never 0.19.0). Every
- * existing two-argument call keeps its prior semantics unchanged.
- */
-function atLeastVersion(
-  sem: { major: number; minor: number; patch: number },
-  major: number,
-  minor: number,
-  patch = 0,
-): boolean {
-  if (sem.major !== major) return sem.major > major;
-  if (sem.minor !== minor) return sem.minor > minor;
-  return sem.patch >= patch;
-}
-
 /**
  * Derive {@link PowdbCapabilities} from an engine version string. A non-semver /
  * unknown version turns every gate OFF (the E017 hint then tells the caller to
@@ -528,6 +504,20 @@ export function powqlSchemaDDL(schema: SchemaMetadata, opts: PowqlSchemaDDLOptio
     // m2m junction's `(source_id, target_id)`) marks its columns `required` but
     // cannot enforce the tuple's uniqueness at the engine level.
     const pkIsSingle = meta.primaryKey.length === 1;
+    // The primary key's OWN index: introspection lists it in `indexes` (the
+    // `<table>_pkey` a PRIMARY KEY constraint creates), so a composite key used
+    // to reach the composite-index refusal below even though the type body
+    // already handles it. Identified by what it guarantees rather than by name:
+    // a full (non-partial) unique index over exactly the PK's column SET states
+    // the PK constraint and nothing else, whatever order it lists the columns in.
+    // Anything short of that (non-unique, partial, a subset or superset) is a
+    // genuine composite index and is still refused.
+    const isPrimaryKeyIndex = (idx: IndexMetadata): boolean =>
+      idx.unique &&
+      !idx.partial &&
+      !idx.docPath &&
+      new Set(idx.columns).size === pkSet.size &&
+      idx.columns.every((c) => pkSet.has(c));
     const fields = meta.columns.map((col) => {
       const powqlType = powqlColumnType(col);
       // Gate `json` columns behind the engine's jsonDocs capability when a
@@ -574,8 +564,15 @@ export function powqlSchemaDDL(schema: SchemaMetadata, opts: PowqlSchemaDDLOptio
         const segs = idx.docPath.map((s) => (typeof s === 'number' ? `->${s}` : `->${encodePowqlString(s)}`)).join('');
         stmts.push(`alter ${quotePowqlIdent(meta.name)} add ${kind} (.${quotePowqlIdent(column)}${segs})`);
       } else {
+        // The composite PK's index is already the type body's `required` columns
+        // (see isPrimaryKeyIndex); a single-column PK's index is skipped by the
+        // emittedUnique check below.
+        if (idx.columns.length > 1 && isPrimaryKeyIndex(idx)) continue;
         // Plain column index. PowDB has no composite index (`add index` takes a
-        // single `.column`), so a multi-column entry is a typed E017.
+        // single `.column`), so a multi-column entry is a typed E017. That
+        // includes a composite UNIQUE index other than the PK: it is an
+        // integrity rule the engine cannot enforce, so it is refused rather than
+        // dropped without a word.
         if (idx.columns.length !== 1) {
           throw new UnsupportedFeatureError(
             'composite indexes',

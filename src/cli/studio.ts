@@ -45,6 +45,7 @@ import { platform } from 'node:os';
 import { dirname, resolve as pathResolve } from 'node:path';
 import pg from 'pg';
 import type { PgCompatPool } from '../client.js';
+import { absorbCheckedOutErrors } from '../connection-guard.js';
 import type { Dialect } from '../dialect.js';
 import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
@@ -63,6 +64,7 @@ import { applyPiiTags, loadPiiTags } from './pii-tags.js';
 import { callerKey, checkRateLimit } from './rate-limit.js';
 import { createDemoContext } from './studio-demo.js';
 import { STUDIO_HTML } from './studio-ui.generated.js';
+import { redactUrl } from './ui.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -219,11 +221,21 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
     registerUtcTemporalParsers();
     // pg.Pool satisfies the PgCompatPool contract (same as the external-pool
     // seam in client.ts); the cast keeps one typed pool field for both modes.
-    pool = new pg.Pool({
+    const pgPool = new pg.Pool({
       connectionString: options.url,
       max: 4, // small pool, single-user tool
       idleTimeoutMillis: 10_000,
-    }) as unknown as PgCompatPool;
+    });
+    // A connection that dies while idle emits 'error' on the POOL, and one that
+    // dies mid-request emits it on the checked-out client. Neither had a
+    // listener, so a database restart exited Studio. Now the pending request
+    // fails and the server keeps running. The message is redacted because pg
+    // can echo the connection string into connection failures.
+    pgPool.on('error', (err) => {
+      console.error(`[turbine] studio pool error: ${redactUrl(err.message)}`);
+    });
+    absorbCheckedOutErrors(pgPool);
+    pool = pgPool as unknown as PgCompatPool;
 
     // Verify connectivity before starting the server, fail fast.
     const probe = await pool.connect();

@@ -27,7 +27,7 @@ users[0].posts[0].comments[0].author.name
 //                                  ^ autocompletes
 
 // Everything between your code and Postgres:
-//   "dependencies": { "pg": "^8.13.1" }`;
+//   "dependencies": { "pg": "^8.15.0" }`;
 
 const sqlCode = `SELECT "users"."id", "users"."name", "users"."email",
   (SELECT COALESCE(json_agg(json_build_array(
@@ -71,8 +71,8 @@ const pillars = [
   {
     title: 'Small enough for the edge',
     description:
-      'The main entry is held under 91 kB brotli as an import graph with pg external, the edge entry under 72 kB, enforced by size-limit in CI. One import swap runs the same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase. No separate serverless build, no WASM bundle in your cold start.',
-    stat: '91 kB',
+      'The main entry is held under 93 kB brotli as an import graph with pg external, the edge entry under 74 kB, enforced by size-limit in CI. One import swap runs the same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase. No separate serverless build, no WASM bundle in your cold start.',
+    stat: '93 kB',
     statLabel: 'CI-enforced ceiling',
   },
   {

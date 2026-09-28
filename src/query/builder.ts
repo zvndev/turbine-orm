@@ -11,9 +11,19 @@
  * metadata, nothing is hardcoded.
  */
 
+import { acquireConnection, type Checkout, openCheckout } from '../checkout.js';
+import { settleEventLoop } from '../connection-guard.js';
 import type { Dialect, StreamableConnection } from '../dialect.js';
 import { postgresDialect } from '../dialect.js';
-import { NotFoundError, TimeoutError, UnsupportedFeatureError, ValidationError, wrapPgError } from '../errors.js';
+import {
+  explainConnectionLoss,
+  isStaleConnectionError,
+  NotFoundError,
+  TimeoutError,
+  UnsupportedFeatureError,
+  ValidationError,
+  wrapPgError,
+} from '../errors.js';
 import { missingIndexForRelation, schemaHasIndexInfo } from '../index-advisor.js';
 import {
   executeNestedCreate,
@@ -21,7 +31,7 @@ import {
   hasRelationFields,
   type NestedWriteContext,
 } from '../nested-write.js';
-import type { PgCompatPool, PgCompatPoolClient, PgCompatQueryConfig, PgCompatQueryResult } from '../pg-types.js';
+import type { PgCompatPool, PgCompatQueryConfig, PgCompatQueryResult } from '../pg-types.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { normalizeKeyColumns, snakeToCamel } from '../schema.js';
 import * as aggMod from './aggregates.js';
@@ -61,6 +71,7 @@ import type {
   CreateManyArgs,
   DeleteArgs,
   DeleteManyArgs,
+  FieldResult,
   FindManyArgs,
   FindManyStreamArgs,
   FindUniqueArgs,
@@ -1897,7 +1908,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       const deferred = single
         ? this.buildFindUnique(baseArgs as Parameters<QueryInterface<T, R>['buildFindUnique']>[0])
         : this.buildFindMany(baseArgs as Parameters<QueryInterface<T, R>['buildFindMany']>[0]);
-      const result = await this.queryWithTimeout(
+      const result = await this.readWithTimeout(
         deferred.sql,
         deferred.params,
         args.timeout,
@@ -1953,7 +1964,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // level down, so leaving those named would keep exactly the plan-cache
       // exposure the caller asked to be rid of.
       exec: (sql, params, preparedName) =>
-        this.queryWithTimeout(sql, params, timeout, this.preparedNameFor({ forceCustomPlan }, preparedName)),
+        this.readWithTimeout(sql, params, timeout, this.preparedNameFor({ forceCustomPlan }, preparedName)),
       quote: (name) => this.q(name),
       buildInClause: (expr, paramRef, negated) => this.inClause(expr, paramRef, negated),
       inClauseParam: (values) => this.inParam(values),
@@ -2072,7 +2083,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const { baseArgs, strip } = this.prepareBatchedBase(args, withClause);
     // baseArgs.with is always undefined here; the cast just bridges the R generic.
     const deferred = this.buildFindMany(baseArgs as Parameters<QueryInterface<T, R>['buildFindMany']>[0]);
-    const result = await this.queryWithTimeout(
+    const result = await this.readWithTimeout(
       deferred.sql,
       deferred.params,
       args.timeout,
@@ -2284,6 +2295,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     action: string,
     rows: number,
     error?: Error,
+    retried?: boolean,
   ): void {
     const onQuery = this.options?._onQuery;
     if (!onQuery) return;
@@ -2298,6 +2310,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         timestamp: new Date(),
         error,
         strategy: this.currentStrategyTag,
+        ...(retried ? { retried: true as const } : {}),
       });
     } catch {
       // Listener errors must never crash a query
@@ -2377,17 +2390,50 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
+   * {@link queryWithTimeout} for a statement that only READS, which makes it
+   * safe to send twice. Outside a transaction, a read that fails because the
+   * connection it went out on had already been closed by the server
+   * ({@link isStaleConnectionError}) is sent once more, after one event-loop
+   * turn, on whatever connection the pool hands out next.
+   *
+   * Reads only, and the distinction is the whole design. For a write, "the
+   * connection died" does not say whether the statement committed first: a
+   * connection can drop after the server commits and before the reply
+   * arrives, so resending an INSERT can insert it twice. A read has no such
+   * outcome. Nor inside a transaction, where the connection that died WAS the
+   * transaction and a retry on another one would run outside it.
+   *
+   * The loop turn is what makes a second attempt worth making: pg-pool evicts
+   * an idle connection whose close it has read, so after one poll phase every
+   * other connection that died alongside this one is gone from the idle list
+   * rather than lent out to the retry.
+   *
+   * Every read call site uses this and every write uses `queryWithTimeout`
+   * directly; `src/test/stale-connection-retry.test.ts` pins which is which.
+   */
+  private readWithTimeout(
+    sql: string,
+    params: unknown[],
+    timeout?: number,
+    preparedName?: string,
+  ): Promise<PgCompatQueryResult> {
+    return this.queryWithTimeout(sql, params, timeout, preparedName, true);
+  }
+
+  /**
    * Execute a pool.query with an optional timeout.
    * If timeout is set, races the query against a timer and rejects on expiry.
    * pg driver errors are translated to typed Turbine errors via wrapPgError.
+   * `retryIfStale` is {@link readWithTimeout}'s; nothing else sets it.
    */
   private async queryWithTimeout(
     sql: string,
     params: unknown[],
     timeout?: number,
     preparedName?: string,
+    retryIfStale = false,
   ): Promise<PgCompatQueryResult> {
-    const start = performance.now();
+    let start = performance.now();
     const action = this.currentAction;
     // Build the query argument, use object form with `name` for prepared
     // statements, or the plain (text, values) form otherwise.
@@ -2397,13 +2443,40 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // cast. Guarded at runtime by `preparedStatementsEnabled`, which only the
     // drivers that accept it turn on.
     const usePrepared = preparedName && this.preparedStatementsEnabled;
-    const exec = usePrepared
-      ? (this.pool as unknown as { query(config: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query({
-          name: preparedName,
-          text: sql,
-          values: params,
-        })
-      : this.pool.query(sql, params);
+    const send = (): Promise<PgCompatQueryResult> =>
+      usePrepared
+        ? (this.pool as unknown as { query(config: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query({
+            name: preparedName,
+            text: sql,
+            values: params,
+          })
+        : this.pool.query(sql, params);
+    let exec = send();
+    // Set when the caller's timeout has already answered, so a first attempt
+    // that fails AFTER that does not send a retry nobody is waiting for.
+    let abandoned = false;
+    if (retryIfStale && !this.txScoped) {
+      exec = exec.catch(async (err: unknown) => {
+        if (abandoned || !isStaleConnectionError(err)) throw err;
+        // The failed attempt is reported as its own event, marked `retried`,
+        // so a listener counting errors sees it and one alerting on failed
+        // CALLS can skip it. The final event below times the retry alone.
+        const wrapped = wrapPgError(err);
+        this.emitQueryEvent(
+          sql,
+          params,
+          performance.now() - start,
+          action,
+          0,
+          wrapped instanceof Error ? wrapped : undefined,
+          true,
+        );
+        await settleEventLoop();
+        if (abandoned) throw err;
+        start = performance.now();
+        return send();
+      });
+    }
 
     if (!timeout) {
       try {
@@ -2425,7 +2498,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeoutPromise = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new TimeoutError(timeout)), timeout);
+      timer = setTimeout(() => {
+        abandoned = true;
+        reject(new TimeoutError(timeout));
+      }, timeout);
     });
     try {
       const result = await Promise.race([exec, timeoutPromise]);
@@ -2475,24 +2551,75 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // Write compilation (extracted to writes.ts).
   // ---------------------------------------------------------------------------
 
-  buildCreate(args: CreateArgs<T>): DeferredQuery<T> {
-    return writesMod.buildCreate(this.ctx, args);
+  buildCreate<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: CreateArgs<T, R, S, O>): DeferredQuery<FieldResult<T, S, O>> {
+    return writesMod.buildCreate(
+      this.ctx,
+      args as CreateArgs<T>,
+      this.resolveWriteProjection(args),
+    ) as unknown as DeferredQuery<FieldResult<T, S, O>>;
+  }
+
+  /**
+   * A single-row write's `select` / `omit`, resolved through the SAME
+   * `resolveProjection` reads use (see WriteProjection in writes.ts), or
+   * `undefined` for the default return shape. Resolved here rather than in
+   * writes.ts because relations.ts imports writes.ts.
+   */
+  private resolveWriteProjection(args: {
+    select?: Record<string, boolean>;
+    omit?: Record<string, boolean>;
+  }): writesMod.WriteProjection | undefined {
+    if (args.select === undefined && args.omit === undefined) return undefined;
+    const columns = relationsMod.resolveProjection(this.ctx, this.table, this.tableMeta, args.select, args.omit, false);
+    if (!columns || columns.length === 0) {
+      // Only an `omit` naming every column gets here (an empty `select` is
+      // refused inside resolveProjection): a write must return SOMETHING, and
+      // an empty RETURNING list is a syntax error on every engine.
+      throw new ValidationError(
+        `\`omit\` on a write to "${this.table}" leaves no column to return. Name the fields to keep with \`select\` instead.`,
+      );
+    }
+    return { columns };
   }
 
   buildCreateMany(args: CreateManyArgs<T>): DeferredQuery<T[]> {
     return writesMod.buildCreateMany(this.ctx, args);
   }
 
-  buildUpdate(args: UpdateArgs<T>): DeferredQuery<T> {
-    return writesMod.buildUpdate(this.ctx, args);
+  buildUpdate<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: UpdateArgs<T, R, S, O>): DeferredQuery<FieldResult<T, S, O>> {
+    return writesMod.buildUpdate(
+      this.ctx,
+      args as UpdateArgs<T>,
+      this.resolveWriteProjection(args),
+    ) as unknown as DeferredQuery<FieldResult<T, S, O>>;
   }
 
-  buildDelete(args: DeleteArgs<T>): DeferredQuery<T> {
-    return writesMod.buildDelete(this.ctx, args);
+  buildDelete<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: DeleteArgs<T, R, S, O>): DeferredQuery<FieldResult<T, S, O>> {
+    return writesMod.buildDelete(
+      this.ctx,
+      args as DeleteArgs<T>,
+      this.resolveWriteProjection(args),
+    ) as unknown as DeferredQuery<FieldResult<T, S, O>>;
   }
 
-  buildUpsert(args: UpsertArgs<T>): DeferredQuery<T> {
-    return writesMod.buildUpsert(this.ctx, args);
+  buildUpsert<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: UpsertArgs<T, R, S, O>): DeferredQuery<FieldResult<T, S, O>> {
+    return writesMod.buildUpsert(
+      this.ctx,
+      args as UpsertArgs<T>,
+      this.resolveWriteProjection(args),
+    ) as unknown as DeferredQuery<FieldResult<T, S, O>>;
   }
 
   buildUpdateMany(args: UpdateManyArgs<T>): DeferredQuery<{ count: number }> {
@@ -2589,7 +2716,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }
       }
       const deferred = this.buildFindUnique(args);
-      const result = await this.queryWithTimeout(
+      const result = await this.readWithTimeout(
         deferred.sql,
         deferred.params,
         args.timeout,
@@ -2629,7 +2756,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     );
     const baseArgs = { ...args, with: undefined, select: proj.select, omit: proj.omit } as unknown as FindUniqueArgs<T>;
     const deferred = this.buildFindUnique(baseArgs as Parameters<QueryInterface<T, R>['buildFindUnique']>[0]);
-    const result = await this.queryWithTimeout(
+    const result = await this.readWithTimeout(
       deferred.sql,
       deferred.params,
       args.timeout,
@@ -2915,7 +3042,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }
       }
       const deferred = this.buildFindMany(args as unknown as FindManyArgs<T, R, W, S, O>);
-      const result = await this.queryWithTimeout(
+      const result = await this.readWithTimeout(
         deferred.sql,
         deferred.params,
         args?.timeout,
@@ -3625,7 +3752,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         Record<string, boolean> | undefined
       >);
 
-      const speculativeResult = await this.queryWithTimeout(
+      const speculativeResult = await this.readWithTimeout(
         speculativeDeferred.sql,
         speculativeDeferred.params,
         args?.timeout,
@@ -3652,7 +3779,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // connection, so `pool.query` already IS that connection. The stream rides
     // on it, is never released here, and the dialect is told to emit no
     // transaction control of its own (`ambientTransaction`).
-    const client = this.txScoped ? null : await this.acquireConnection();
+    const held = this.txScoped ? null : await this.acquireConnection();
+    const client = held?.client ?? null;
     const conn: StreamableConnection = client ?? {
       query: async (text: string, values?: unknown[]) =>
         (await this.pool.query(text, values)) as { rows: Record<string, unknown>[] },
@@ -3663,9 +3791,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       });
     } catch (err) {
       // Wrap pg constraint errors so streaming surfaces typed errors like the rest of the API
-      throw wrapPgError(err);
+      throw explainConnectionLoss(wrapPgError(err), held?.checkout.lostWith);
     } finally {
-      client?.release();
+      held?.checkout.release();
     }
   }
 
@@ -3813,7 +3941,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         }
       }
       const deferred = this.buildFindFirst(args);
-      const result = await this.queryWithTimeout(
+      const result = await this.readWithTimeout(
         deferred.sql,
         deferred.params,
         args?.timeout,
@@ -3856,7 +3984,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   >(args?: FindManyArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O>> {
     return this.executeWithMiddleware('findFirstOrThrow', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildFindFirstOrThrow(args);
-      const result = await this.queryWithTimeout(
+      const result = await this.readWithTimeout(
         deferred.sql,
         deferred.params,
         args?.timeout,
@@ -3904,7 +4032,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   >(args: FindUniqueArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O>> {
     return this.executeWithMiddleware('findUniqueOrThrow', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildFindUniqueOrThrow(args);
-      const result = await this.queryWithTimeout(
+      const result = await this.readWithTimeout(
         deferred.sql,
         deferred.params,
         args.timeout,
@@ -3944,10 +4072,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // create
   // -------------------------------------------------------------------------
 
-  async create(args: CreateArgs<T, R>): Promise<T> {
+  async create<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: CreateArgs<T, R, S, O>): Promise<FieldResult<T, S, O>> {
     return this.executeWithMiddleware('create', args as unknown as Record<string, unknown>, async () => {
       if (hasRelationFields(args.data as Record<string, unknown>, this.tableMeta)) {
-        return this.nestedCreate(args);
+        return this.nestedCreate(args) as Promise<FieldResult<T, S, O>>;
       }
       const deferred = this.buildCreate(args);
       return this.executeMutation(deferred, args.timeout);
@@ -3970,10 +4101,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // update
   // -------------------------------------------------------------------------
 
-  async update(args: UpdateArgs<T, R>): Promise<T> {
+  async update<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: UpdateArgs<T, R, S, O>): Promise<FieldResult<T, S, O>> {
     return this.executeWithMiddleware('update', args as unknown as Record<string, unknown>, async () => {
       if (hasRelationFields(args.data as Record<string, unknown>, this.tableMeta)) {
-        return this.nestedUpdate(args);
+        return this.nestedUpdate(args) as Promise<FieldResult<T, S, O>>;
       }
       const deferred = this.buildUpdate(args);
       return this.executeMutation(deferred, args.timeout);
@@ -3984,66 +4118,63 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // Nested write helpers (shared by create + update)
   // -------------------------------------------------------------------------
 
-  private async nestedCreate(args: CreateArgs<T, R>): Promise<T> {
+  private async nestedCreate(
+    args: CreateArgs<T, R, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
+  ): Promise<T> {
     const data = args.data as Record<string, unknown>;
+    // Validated up front, before any row is written, and then applied by the
+    // nested engine's final read-back, which already speaks select/omit.
+    this.resolveWriteProjection(args);
+    const shape = { select: args.select, omit: args.omit };
 
     if (this.txScoped) {
       const ctx = this.buildNestedCtx();
-      return executeNestedCreate(ctx, this.table, data) as Promise<T>;
+      return executeNestedCreate(ctx, this.table, data, 0, [], shape) as Promise<T>;
     }
 
     return this.runInImplicitTx(async (ctx) => {
-      const result = await executeNestedCreate(ctx, this.table, data);
+      const result = await executeNestedCreate(ctx, this.table, data, 0, [], shape);
       return result as T;
     });
   }
 
-  private async nestedUpdate(args: UpdateArgs<T, R>): Promise<T> {
+  private async nestedUpdate(
+    args: UpdateArgs<T, R, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
+  ): Promise<T> {
     const data = args.data as Record<string, unknown>;
     const where = args.where as Record<string, unknown>;
+    this.resolveWriteProjection(args);
+    const shape = { select: args.select, omit: args.omit };
 
     if (this.txScoped) {
       const ctx = this.buildNestedCtx();
-      return executeNestedUpdate(ctx, this.table, where, data) as Promise<T>;
+      return executeNestedUpdate(ctx, this.table, where, data, 0, [], shape) as Promise<T>;
     }
 
     return this.runInImplicitTx(async (ctx) => {
-      const result = await executeNestedUpdate(ctx, this.table, where, data);
+      const result = await executeNestedUpdate(ctx, this.table, where, data, 0, [], shape);
       return result as T;
     });
   }
 
   /**
-   * Check out a pooled connection, translating a driver failure into a typed
-   * Turbine error.
-   *
-   * `pool.connect()` is where the first-run failures land: wrong password
-   * (SQLSTATE 28P01), no such database (3D000), nothing listening
-   * (ECONNREFUSED), an unverifiable TLS certificate. Unwrapped, every one of
-   * those surfaces from an ordinary `db.users.create({ data: { ...nested } })`
-   * as a raw pg `DatabaseError` whose `.code` is a SQLSTATE, on the same
-   * property Turbine puts `TURBINE_E0NN` in.
-   *
-   * client.ts has its own copy for `$transaction` / `connect()`; this one
-   * exists because `query/` must not import client.ts (circular dependency).
-   * The query paths need no equivalent: `pool.query()` opens the connection
-   * itself and rejects with the connect error, which the query boundary
-   * already wraps.
+   * Check out a guarded pooled connection, as a typed error when that fails.
+   * Shared with client.ts through checkout.ts (see there for why each part
+   * matters); the cursor stream holds it, and a nested write opens its
+   * implicit transaction on one through `openCheckout`.
    */
-  private async acquireConnection(): Promise<PgCompatPoolClient> {
-    try {
-      return await this.pool.connect();
-    } catch (err) {
-      throw wrapPgError(err);
-    }
+  private acquireConnection(): Promise<Checkout> {
+    return acquireConnection(this.pool);
   }
 
   private async runInImplicitTx<R>(fn: (ctx: NestedWriteContext) => Promise<R>): Promise<R> {
-    const client = await this.acquireConnection();
-    let began = false;
+    // BEGIN runs inside openCheckout, which sends it once more on a fresh
+    // connection when the first one turns out to be dead and releases the
+    // connection itself when BEGIN fails for good. The catch below therefore
+    // only sees a transaction that began, and never emits a stray ROLLBACK on
+    // a connection that opened none.
+    const { client, checkout } = await openCheckout(this.pool, (c) => c.query(this.dialect.beginStatement()));
     try {
-      await client.query(this.dialect.beginStatement());
-      began = true;
       const { TransactionClient } = await import('../client.js');
       const tx = new TransactionClient(
         // biome-ignore lint/suspicious/noExplicitAny: MiddlewareFn and Middleware are structurally identical
@@ -4069,18 +4200,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
       await client.query(this.dialect.commitStatement());
       return result;
     } catch (err) {
-      // Only roll back a transaction we actually opened: a failed BEGIN must
-      // not emit a stray ROLLBACK on a connection that never began one.
-      if (began) {
-        try {
-          await client.query(this.dialect.rollbackStatement());
-        } catch {
-          // Best-effort rollback: connection may have died.
-        }
+      try {
+        await client.query(this.dialect.rollbackStatement());
+      } catch {
+        // Best-effort rollback: connection may have died.
       }
-      throw err;
+      throw explainConnectionLoss(err, checkout.lostWith);
     } finally {
-      client.release();
+      checkout.release();
     }
   }
 
@@ -4106,7 +4233,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // delete
   // -------------------------------------------------------------------------
 
-  async delete(args: DeleteArgs<T, R>): Promise<T> {
+  async delete<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: DeleteArgs<T, R, S, O>): Promise<FieldResult<T, S, O>> {
     return this.executeWithMiddleware('delete', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildDelete(args);
       return this.executeMutation(deferred, args.timeout);
@@ -4117,7 +4247,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // upsert, INSERT ... ON CONFLICT ... DO UPDATE
   // -------------------------------------------------------------------------
 
-  async upsert(args: UpsertArgs<T, R>): Promise<T> {
+  async upsert<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: UpsertArgs<T, R, S, O>): Promise<FieldResult<T, S, O>> {
     return this.executeWithMiddleware('upsert', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildUpsert(args);
       return this.executeMutation(deferred, args.timeout);
@@ -4155,7 +4288,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async count(args?: CountArgs<T, R>): Promise<number> {
     return this.executeWithMiddleware('count', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildCount(args);
-      const result = await this.queryWithTimeout(
+      const result = await this.readWithTimeout(
         deferred.sql,
         deferred.params,
         args?.timeout,
@@ -4211,7 +4344,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async groupBy<A extends GroupByArgs<T, R>>(args: A): Promise<GroupByResult<T, A>[]> {
     return this.executeWithMiddleware('groupBy', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildGroupBy(args);
-      const result = await this.queryWithTimeout(
+      const result = await this.readWithTimeout(
         deferred.sql,
         deferred.params,
         args.timeout,
@@ -4240,7 +4373,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async aggregate(args: AggregateArgs<T, R>): Promise<AggregateResult<T>> {
     return this.executeWithMiddleware('aggregate', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildAggregate(args);
-      const result = await this.queryWithTimeout(
+      const result = await this.readWithTimeout(
         deferred.sql,
         deferred.params,
         args.timeout,

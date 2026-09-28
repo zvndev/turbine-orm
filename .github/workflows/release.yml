@@ -225,6 +225,12 @@ jobs:
             exit 1
           fi
           echo "Packed manifest has no install scripts OK"
+      - name: Verify the tarball loads against the oldest pg its range allows
+        # scripts/check-pg-floor.mjs installs the packed tarball next to EXACTLY
+        # the floor of dependencies.pg and imports every published entry point.
+        # CI otherwise only ever installs the newest pg in range, which is how a
+        # ^8.13.1 range shipped code that needs 8.15.0 to import at all.
+        run: node scripts/check-pg-floor.mjs "$TARBALL"
       - name: Install tarball in temp project
         run: |
           SMOKE_DIR=$(mktemp -d)

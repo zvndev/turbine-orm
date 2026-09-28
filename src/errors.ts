@@ -1341,6 +1341,88 @@ const CONNECTION_ERROR_CODES = new Set<string>([
 ]);
 
 /**
+ * The driver's own words for "this connection is gone", which carry NO code.
+ *
+ * node-postgres raises these as plain `Error`s with no SQLSTATE and no socket
+ * code: the first when the socket closes under a live client, the next two for
+ * any query sent to a client after that, the last two when a connect or an
+ * orderly `end()` cuts a query off. Keyed on `.code` alone, wrapPgError handed
+ * every one of them back untyped, so the commonest symptom of a database
+ * restart was the one connection failure a `catch (e) { if (e instanceof
+ * ConnectionError) ... }` did not see. Exact matches on the full message, and
+ * only on code-less errors: these strings are pg's and have not changed across
+ * the 8.x line, and nothing else produces them.
+ */
+const PG_CONNECTION_LOSS_MESSAGES = new Set<string>([
+  'Connection terminated unexpectedly',
+  'Client has encountered a connection error and is not queryable',
+  'Client was closed and is not queryable',
+  'Connection terminated',
+  'Connection terminated due to connection timeout',
+]);
+
+/** The follow-on errors pg raises for a query sent to a client already known to be dead. */
+const PG_NOT_QUERYABLE_MESSAGES = new Set<string>([
+  'Client has encountered a connection error and is not queryable',
+  'Client was closed and is not queryable',
+]);
+
+/**
+ * Report the error that KILLED a held connection instead of its follow-on.
+ *
+ * When a connection dies while a transaction callback is between queries, the
+ * next query fails with "Client has encountered a connection error and is not
+ * queryable", which says nothing about why. The connection guard recorded the
+ * real cause (`lostWith`, e.g. 57P01 `terminating connection due to
+ * administrator command`), so a not-queryable ConnectionError is swapped for
+ * that one. Anything else passes through: an error the caller threw, or a
+ * query that was IN FLIGHT when the connection died, which already carries the
+ * server's own message.
+ */
+export function explainConnectionLoss(err: unknown, lostWith: Error | undefined): unknown {
+  if (!lostWith || !(err instanceof ConnectionError)) return err;
+  const cause = err.cause;
+  if (!(cause instanceof Error) || !PG_NOT_QUERYABLE_MESSAGES.has(cause.message)) return err;
+  const original = wrapPgError(lostWith);
+  return original instanceof ConnectionError ? original : err;
+}
+
+/**
+ * Codes that mean an ESTABLISHED connection went away: the server ended the
+ * backend (57P01, which is also what a dead idle connection hands the next
+ * query, since pg attributes the FATAL it buffered to whatever is sent next),
+ * or the peer reset the socket.
+ */
+const STALE_CONNECTION_CODES = new Set<string>(['57P01', 'ECONNRESET', 'EPIPE']);
+
+/** pg's code-less messages for the same thing. */
+const STALE_CONNECTION_MESSAGES = new Set<string>(['Connection terminated unexpectedly', ...PG_NOT_QUERYABLE_MESSAGES]);
+
+/**
+ * Whether `err` says a connection that was already open is gone, so the same
+ * statement on a fresh connection can succeed. Accepts the raw driver error or
+ * the {@link ConnectionError} wrapPgError made of it.
+ *
+ * Narrower than "is a ConnectionError" on purpose. A connection that could not
+ * be OPENED (refused, DNS, auth, a connect timeout, 57P03 while the server
+ * starts) will not open on an immediate second try either, and retrying it
+ * only doubles the wait before the caller hears about it. Nor does it cover
+ * `Connection terminated` without "unexpectedly", which is the pool itself
+ * shutting down.
+ */
+export function isStaleConnectionError(err: unknown): boolean {
+  const raw = err instanceof ConnectionError && err.cause instanceof Error ? err.cause : err;
+  if (!raw || typeof raw !== 'object') return false;
+  const code = (raw as PgErrorFields).code;
+  if (code) return STALE_CONNECTION_CODES.has(code);
+  return raw instanceof Error && STALE_CONNECTION_MESSAGES.has(raw.message);
+}
+
+const CONNECTION_LOSS_HINT =
+  'The server or the network closed it (a restart, failover, idle timeout, compute suspend, or ' +
+  'pg_terminate_backend). The pool discards the connection, so retrying the operation opens a fresh one.';
+
+/**
  * Actionable next step per connection-class code, appended to the driver's own
  * message. The driver message states WHAT happened ("password authentication
  * failed for user \"postgres\""); these state what to do about it, which is the
@@ -1650,7 +1732,12 @@ function scrubUnclassifiedServerError(err: object, code: string): unknown {
 export function wrapPgError(err: unknown): unknown {
   if (!err || typeof err !== 'object') return err;
   const e = err as PgErrorFields;
-  if (!e.code) return err;
+  if (!e.code) {
+    if (err instanceof Error && PG_CONNECTION_LOSS_MESSAGES.has(err.message)) {
+      return new ConnectionError(`Database connection lost: ${err.message}. ${CONNECTION_LOSS_HINT}`, { cause: err });
+    }
+    return err;
+  }
 
   switch (e.code) {
     case '23505': {

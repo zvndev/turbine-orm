@@ -204,7 +204,14 @@ src/
                       helpers (writeReturningColumns / writeReselectSelection / parseWriteRow,
                       the PII column set, optimistic-lock + atomic-operator SET clauses,
                       reselect-by-where). Reuses where.ts; the async execute wrappers stay in
-                      builder.ts.
+                      builder.ts. Single-row writes take `select` / `omit` (0.80) as a
+                      `WriteProjection` (the column list, resolved in builder.ts by the SAME
+                      `resolveProjection` reads use, because writes.ts cannot import
+                      relations.ts without a cycle). It narrows the STATEMENT (RETURNING /
+                      reselect / OUTPUT), and the update + delete template-cache keys carry a
+                      `|rt=` segment for it: without one, two calls differing only in `select`
+                      shared a statement and the second got the first's columns. PowDB narrows
+                      the returned ROW instead (its `returning` takes no column list).
     relations.ts    - Relation + orderBy compilation: the json_agg nested-relation
                       machinery (buildSelectWithRelations, buildRelationSubquery,
                       buildManyToManySubquery), the positional-encoding shapes + nested-row
@@ -519,6 +526,41 @@ src/
                       with `TurbineClient.withPlanCacheMode`. KEEP THIS FILE IMPORT-FREE, that
                       is what lets client.ts depend on it without a new edge.
 
+  connection-guard.ts, Zero-import leaf (0.80): surviving a connection the SERVER closes.
+                      Three mechanisms. (1) `guardCheckout` / `guardConnection`: pg-pool
+                      listens for a client's 'error' only while it is IDLE, so a checked-out
+                      client whose socket died emitted an unheard 'error' and NODE EXITED.
+                      Every held connection carries a listener for exactly its checkout, and
+                      `absorbCheckedOutErrors` puts one on every connection an owned pool
+                      opens. A source scan in connection-loss.test.ts requires every
+                      `pool.connect()` to be guarded and every `new pg.Client()` to call
+                      `guardConnection`. (2) `settleLongIdleCheckouts` (owned pools only):
+                      pg-pool evicts an idle connection when it READS the close, which needs
+                      the event loop; after a freeze (serverless between invocations) every
+                      idle connection is dead and still lendable. A checkout reusing one idle
+                      >= LONG_IDLE_SETTLE_MS first waits for `settleEventLoop` (TWO
+                      setImmediate hops, since one runs before the next poll), no round trip.
+                      (3) `settleEventLoop` also precedes every retry below. Keep it
+                      import-free: client.ts, query/, cli/ and powql.ts all share it.
+
+  checkout.ts      , The one checkout seam (0.80): `acquireConnection` (typed E004 +
+                      guard) and `openCheckout(pool, opening)`, which retries the OPENING
+                      statement (BEGIN, connect()'s SELECT 1) once on a fresh connection when
+                      it failed on a dead one (`isStaleConnectionError` in errors.ts, which is
+                      deliberately narrower than "is a ConnectionError": a connection that
+                      could not be OPENED is not retried). Safe because nothing has run.
+                      `$transaction`, `transaction()`, nested writes and `connect()` open
+                      here, so a failed BEGIN never reaches their catch and their ROLLBACK is
+                      unconditional. THE READ/WRITE RULE: reads outside a transaction retry
+                      once (`QueryInterface.readWithTimeout`), writes NEVER do, because a lost
+                      connection does not say whether the statement committed. `currentAction`
+                      cannot decide that (it is shared instance state a concurrent call can
+                      overwrite), so read call sites call `readWithTimeout` explicitly and
+                      stale-connection.test.ts pins which methods retry, with the read list
+                      checked against reflection. Live net:
+                      stale-connection.integration.test.ts freezes the loop for real (a
+                      worker terminates backends while the main thread is in Atomics.wait).
+
   client.ts        , TurbineClient wraps a pg.Pool and auto-creates typed table accessors
                       via Object.defineProperty. Manages middleware ($use), transactions
                       ($transaction with SAVEPOINTs for nesting, isolation levels, timeouts,
@@ -733,7 +775,7 @@ src/
                       `$listen`/`$notify`/RLS/pgvector throw E017). PowDB realities shaping it:
                       writes use the trailing **`returning`** keyword (create/createMany/update/
                       delete), `upsert` reselects by PK (its statement rejects `returning`; a
-                      **composite-PK upsert** reselects-or-writes in one flat txn via `upsertComposite`).
+                      **upsert** conflicts on the `where` keys like SQL; only a single-column-PK conflict with no global filter uses the native statement, every other shape (non-PK unique key, composite PK, filtered table) reselects-or-writes in one flat txn via `upsertLookupFirst`, which is also what keeps a tenant-scoped upsert off another tenant's row).
                       **PKs: server-assigned `auto` int OR client UUID**, `isGenerated` columns emit
                       PowDB's `auto` modifier (`powqlSchemaDDL`) and let the engine assign the id;
                       otherwise a defaulted string PK gets a client UUID (`applyPkDefault`). No
@@ -1103,6 +1145,9 @@ src/
                       / client.$notify() (pg_notify($1,$2)). Subscriptions are tracked and
                       force-released on disconnect(); serverless HTTP pools (no persistent
                       connection) throw a clear error instead of hanging.
+                      0.80: a lost LISTEN connection reconnects with exponential backoff
+                      (`ListenOptions`: reconnect / onError / onReconnect), default on;
+                      NOTIFY is not durable, so onReconnect is the caller's cue to resync.
 
   engine-config.ts , The client-config seam for EVERY non-default engine factory
                       (`turbine-orm/sqlite`, `turbine-orm/mysql`, `turbine-orm/mssql`,

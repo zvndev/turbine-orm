@@ -114,6 +114,15 @@ export interface QueryEvent {
    * batch statements are timed individually. Absent for everything else.
    */
   batch?: 'pipeline' | 'transaction';
+  /**
+   * Set on a READ that failed because its connection had already been closed
+   * by the server, and that Turbine therefore sent once more on a fresh one.
+   * This event carries that first attempt's `error`; the retry reports its own
+   * event, so a failed read that was then answered shows as two events and a
+   * listener alerting on failed calls can skip the ones marked here. Writes
+   * and statements inside a transaction are never retried.
+   */
+  retried?: true;
 }
 
 export type QueryEventListener = (event: QueryEvent) => void;

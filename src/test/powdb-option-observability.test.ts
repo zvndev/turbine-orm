@@ -29,9 +29,9 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
 import { UnsupportedFeatureError, ValidationError } from '../errors.js';
-import { capabilitiesFromVersion, type PowdbPool } from '../powdb.js';
+import { capabilitiesFromVersion, type PowdbPool, powdbDialect } from '../powdb.js';
 import { PowqlInterface } from '../powql.js';
-import { UNSAFE } from '../query/index.js';
+import { type QueryInterface, UNSAFE } from '../query/index.js';
 import { ALL_OPTION_TABLES } from '../query/option-surface.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 
@@ -113,22 +113,35 @@ const schema: SchemaMetadata = {
 
 const CAPS = capabilitiesFromVersion('0.18.0');
 
-/** Records every PowQL statement an operation emits, in order. */
-function recorder() {
+const WRITE_STATEMENT = /^(insert|upsert) |\b(update|delete)\b/;
+
+/**
+ * Records every PowQL statement an operation emits, in order. `emptyReads`
+ * answers every READ with no rows (writes still return one), for an option
+ * that only acts when a lookup finds nothing: the create branch of a
+ * lookup-first upsert.
+ */
+function recorder(emptyReads = false) {
   const calls: { powql: string; params: unknown[] }[] = [];
+  const query = (powql: string, params: unknown[] = []) => {
+    calls.push({ powql, params });
+    if (emptyReads && !WRITE_STATEMENT.test(powql)) return Promise.resolve({ rows: [], rowCount: 0 });
+    // A row shaped for every operation the matrix drives: writes reselect it,
+    // reads return it, aggregates read whatever key they asked for.
+    return Promise.resolve({
+      rows: [{ id: '1', name: 'Ada', email: 'a@b.c', tenant_id: 't1', version: 1, _count: 1, count: 1 }],
+      rowCount: 1,
+    });
+  };
   const pool = {
     capabilities: CAPS,
     retryStaleReads: false,
     readonly: false,
-    query(powql: string, params: unknown[]) {
-      calls.push({ powql, params });
-      // A row shaped for every operation the matrix drives: writes reselect it,
-      // reads return it, aggregates read whatever key they asked for.
-      return Promise.resolve({
-        rows: [{ id: '1', name: 'Ada', email: 'a@b.c', tenant_id: 't1', version: 1, _count: 1, count: 1 }],
-        rowCount: 1,
-      });
-    },
+    query,
+    // The lookup-first upsert (composite key, or a table under a global
+    // filter) runs in a transaction on a pinned connection; its statements are
+    // recorded in the same list.
+    connect: () => Promise.resolve({ query, release() {} }),
   } as unknown as PowdbPool;
   return { pool, calls };
 }
@@ -140,16 +153,39 @@ type Args = Record<string, unknown>;
  * emitted. Multi-statement operations are the norm here, so comparing only the
  * first would call an option inert whenever it moved a later one.
  */
-async function emit(op: string, args: Args): Promise<string> {
-  const rec = recorder();
+async function run(op: string, args: Args, emptyReads = false): Promise<{ statements: string; value: unknown }> {
+  const rec = recorder(emptyReads);
   const qi = new PowqlInterface(rec.pool, 'app_user', schema, [], {
     warnOnUnlimited: false,
     globalFilters: { app_user: { tenantId: 't1' } },
+    // What turbinePowDB wires, so a transaction the operation opens builds its
+    // table interfaces as PowQL too, and records PowQL rather than SQL.
+    dialect: powdbDialect,
+    queryInterfaceFactory: (p, t, sch, mw, opts) =>
+      new PowqlInterface(p as unknown as PowdbPool, t, sch, mw, opts) as unknown as QueryInterface<object>,
   }) as unknown as Record<string, (a: Args) => Promise<unknown>>;
-  const run = qi[op];
-  if (typeof run !== 'function') throw new Error(`PowqlInterface has no ${op}()`);
-  await run.call(qi, args);
-  return rec.calls.map((c) => `${c.powql} :: ${JSON.stringify(c.params)}`).join('\n---\n');
+  const method = qi[op];
+  if (typeof method !== 'function') throw new Error(`PowqlInterface has no ${op}()`);
+  const value = await method.call(qi, args);
+  const statements = rec.calls.map((c) => `${c.powql} :: ${JSON.stringify(c.params.map(stableParam))}`).join('\n---\n');
+  return { statements, value };
+}
+
+const GENERATED_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * A create on a table whose string key has a default binds a FRESH client UUID
+ * every run (`applyPkDefault`). Rendered raw, two runs of the same call never
+ * compared equal, so every `create` option in the matrix below passed whether
+ * or not it did anything. The UUID is rendered as a placeholder, and the
+ * determinism check further down fails if another source of noise appears.
+ */
+function stableParam(p: unknown): unknown {
+  return typeof p === 'string' && GENERATED_UUID.test(p) ? '<generated-uuid>' : p;
+}
+
+async function emit(op: string, args: Args, emptyReads = false): Promise<string> {
+  return (await run(op, args, emptyReads)).statements;
 }
 
 // ---------------------------------------------------------------------------
@@ -171,12 +207,14 @@ const BASELINE: Record<string, Args> = {
   groupBy: { by: ['name'], _count: { id: true } },
 };
 
-type How = 'compiled' | 'throws' | 'unsupported' | 'unblocks' | 'execution';
+type How = 'compiled' | 'result' | 'throws' | 'unsupported' | 'unblocks' | 'execution';
 
 interface Observation {
   how: How;
   value: unknown;
   needs?: Args;
+  /** Run both sides with {@link recorder}'s `emptyReads`. */
+  emptyReads?: boolean;
   coveredBy?: string;
   why?: string;
 }
@@ -188,14 +226,31 @@ const OBSERVATION: Record<string, Observation> = {
   // compound-unique.ts), so their probe changes the PK value instead.
   'update.where': { how: 'compiled', value: { id: 'zzz-distinct' } },
   'delete.where': { how: 'compiled', value: { id: 'zzz-distinct' } },
-  // `upsert`'s where is its conflict target and carries the same rule.
-  'upsert.where': { how: 'compiled', value: { id: 'zzz-distinct' } },
+  // `upsert`'s where names its conflict target: the KEYS choose the column,
+  // and the conflicting value comes from `create`, on every engine. So the
+  // probe names a different unique key, as the SQL matrix does. A different
+  // value for the same key is inert by design, and read as "changed" here only
+  // while each run bound a fresh UUID (see stableParam).
+  'upsert.where': { how: 'compiled', value: { email: 'other@example.test' } },
   select: { how: 'compiled', value: { id: true } },
   omit: { how: 'compiled', value: { name: true } },
+  // PowQL's `returning` takes no column list (driver spec), so a single-row
+  // write's projection narrows the ROW it returns, not the statement it sends.
+  // The SQL engines narrow the statement; the answer is the same.
+  'create.select': { how: 'result', value: { id: true } },
+  'create.omit': { how: 'result', value: { name: true } },
+  'update.select': { how: 'result', value: { id: true } },
+  'update.omit': { how: 'result', value: { name: true } },
+  'delete.select': { how: 'result', value: { id: true } },
+  'delete.omit': { how: 'result', value: { name: true } },
+  'upsert.select': { how: 'result', value: { id: true } },
+  'upsert.omit': { how: 'result', value: { name: true } },
   with: { how: 'compiled', value: { posts: true } },
   data: { how: 'compiled', value: { name: 'changed-by-the-matrix' } },
   'createMany.data': { how: 'compiled', value: [{ name: 'x' }, { name: 'y' }] },
-  'upsert.create': { how: 'compiled', value: { name: 'created-differently' } },
+  // Under the matrix's global filter an upsert is a lookup, then an update or
+  // an insert. `create` only acts on the insert, so the lookup finds nothing.
+  'upsert.create': { how: 'compiled', value: { name: 'created-differently' }, emptyReads: true },
   'upsert.update': { how: 'compiled', value: { name: 'updated-differently' } },
 
   orderBy: { how: 'compiled', value: { id: 'asc' } },
@@ -317,8 +372,19 @@ describe('powdb: every option on every operation changes something, or is refuse
           return;
         }
 
-        const before = await emit(op, baseline);
-        const after = await emit(op, withOption);
+        if (obs.how === 'result') {
+          const plain = await run(op, baseline);
+          const shaped = await run(op, withOption);
+          assert.notDeepEqual(
+            shaped.value,
+            plain.value,
+            `${op}({ ${key} }) returned the same value as ${op}() without it. The option was accepted and changed nothing.`,
+          );
+          return;
+        }
+
+        const before = await emit(op, baseline, obs.emptyReads);
+        const after = await emit(op, withOption, obs.emptyReads);
         assert.notEqual(
           after,
           before,
@@ -327,6 +393,15 @@ describe('powdb: every option on every operation changes something, or is refuse
         );
       });
     }
+  }
+
+  // Every comparison above is "the option changed the output". If the output
+  // differed between two runs of the SAME call, every option would pass it.
+  // That is not hypothetical: `create` bound a fresh UUID per run and did.
+  for (const [op, args] of Object.entries(BASELINE)) {
+    it(`${op}: the same call renders identically twice`, async () => {
+      assert.equal(await emit(op, args), await emit(op, args));
+    });
   }
 
   it('the matrix is not vacuous', () => {

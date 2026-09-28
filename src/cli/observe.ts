@@ -9,9 +9,11 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import pg from 'pg';
+import { absorbCheckedOutErrors } from '../connection-guard.js';
 import type { PgCompatPool } from '../pg-types.js';
 import { OBSERVE_HTML } from './observe-ui.js';
 import { callerKey, checkRateLimit } from './rate-limit.js';
+import { redactUrl } from './ui.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -40,6 +42,12 @@ export async function startObserve(options: ObserveOptions): Promise<ObserveServ
     max: 2,
     idleTimeoutMillis: 10_000,
   });
+  // Idle-client errors surface on the pool, checked-out ones on the client;
+  // with no listener either one exits the dashboard (see connection-guard.ts).
+  pool.on('error', (err) => {
+    console.error(`[turbine] observe pool error: ${redactUrl(err.message)}`);
+  });
+  absorbCheckedOutErrors(pool);
 
   const probe = await pool.connect();
   try {

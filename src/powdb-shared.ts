@@ -19,8 +19,9 @@
  *
  * Everything here is re-exported by powdb.ts under its original name, so the
  * public `turbine-orm/powdb` surface is byte-identical to before the split.
- * The few helpers powdb.ts consumes but never published (`isDateColumn`) are
- * exported from this module and NOT re-exported from powdb.ts.
+ * The few helpers powdb.ts consumes but never published (`isDateColumn`,
+ * `parsePowdbSemver`, `atLeastVersion`) are exported from this module and NOT
+ * re-exported from powdb.ts.
  *
  * @module
  */
@@ -164,6 +165,34 @@ type PowdbFeatureKey =
   | 'linkPaths'
   | 'datetimeCompare'
   | 'projectedCountNonNull';
+
+/** Parse a PowDB semver prefix (`0.13.0`, `0.13`, `1.2.3-rc`) into components, or `null`. */
+export function parsePowdbSemver(
+  version: string | undefined | null,
+): { major: number; minor: number; patch: number } | null {
+  const m = /^(\d+)\.(\d+)(?:\.(\d+))?/.exec(String(version ?? '').trim());
+  if (!m) return null;
+  return { major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3] ?? 0) };
+}
+
+/**
+ * Is `sem` at least `major.minor.patch`? PATCH-AWARE: `patch` defaults to `0`,
+ * so a two-component floor (`atLeastVersion(sem, 0, 19)`) behaves exactly as the
+ * old major/minor comparison did (matches every patch of 0.19), while a
+ * three-component floor (`atLeastVersion(sem, 0, 19, 1)`) additionally requires
+ * the patch, the distinction the link lanes need (0.19.1, never 0.19.0). Every
+ * existing two-argument call keeps its prior semantics unchanged.
+ */
+export function atLeastVersion(
+  sem: { major: number; minor: number; patch: number },
+  major: number,
+  minor: number,
+  patch = 0,
+): boolean {
+  if (sem.major !== major) return sem.major > major;
+  if (sem.minor !== minor) return sem.minor > minor;
+  return sem.patch >= patch;
+}
 
 /**
  * Minimum engine version each gated feature needs, for the E017 hint text.

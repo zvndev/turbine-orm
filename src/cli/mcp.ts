@@ -3,6 +3,7 @@ import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import type { Readable, Writable } from 'node:stream';
 import pg from 'pg';
+import { absorbCheckedOutErrors } from '../connection-guard.js';
 import { findMissingRelationIndexes } from '../index-advisor.js';
 import { formatBytes, type TableStats } from '../index-stats.js';
 import { deriveCatalogRelations, type ForeignKeyEntry, indexKeyColumn, parseIndexKeyEntries } from '../introspect.js';
@@ -414,6 +415,9 @@ export function startMcpServer(options: McpServerOptions, transport: McpTranspor
   ctx.pool.on?.('error', (err: Error) => {
     process.stderr.write(`[turbine] mcp pool error: ${redactUrl(err.message)}\n`);
   });
+  // The same event on a CHECKED-OUT client (a tool call mid-query when the
+  // server restarts) has no pool listener to fall back on; see connection-guard.ts.
+  absorbCheckedOutErrors(ctx.pool);
 
   announcePiiTags(options);
 

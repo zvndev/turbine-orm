@@ -53,6 +53,25 @@ await sub.unsubscribe();
 
 All live subscriptions are also force-released when you call `db.disconnect()`, so you won't leak connections on shutdown.
 
+## Lost connections
+
+A subscription holds one connection for its whole life, so a database restart, failover or compute suspend will eventually close it. Since 0.80 `$listen` reopens the connection with exponential backoff and runs `LISTEN` again, 100 ms at first and doubling to at most 30 s.
+
+```ts
+const sub = await db.$listen('order_created', onOrder, {
+  onReconnect: () => refreshOrders(), // resync: anything sent while down is gone
+  onError: (err) => log.warn(err),    // each loss, as a ConnectionError (E004)
+});
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `reconnect` | `true` | `false` ends the subscription at the first loss. An object `{ initialDelayMs, maxDelayMs }` tunes the backoff |
+| `onError` | one line on stderr | Called with each loss and each failed reconnect attempt |
+| `onReconnect` | none | Called once the subscription is live again |
+
+`NOTIFY` is not durable. A notification sent while the subscription is reconnecting is never delivered, so treat `onReconnect` as the signal to re-read whatever state the channel tracks. `unsubscribe()` and `db.disconnect()` cancel a pending reconnect.
+
 ## Channel names
 
 Channel names are validated as plain identifiers and quoted before use, they're the one interpolated token in the generated SQL, so the validation is strict. Names with spaces, leading digits, dots, or other special characters throw `ValidationError` *before* any connection is touched.
