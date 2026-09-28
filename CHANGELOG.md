@@ -1,5 +1,97 @@
 # Changelog
 
+## 0.81.0 (2026-09-27)
+
+`upsert` now updates the row its `where` names. When `where` and `create`
+disagree it used to run a statement that answered a different question, with
+no error.
+
+### Fixed
+
+- **`upsert` updates the row you name.** A single `INSERT ... ON CONFLICT`
+  compares the conflict columns against the values it inserts, which are
+  `create`'s, and never reads `where`'s values. Core emitted that statement
+  whatever the two said, so:
+  - `where: { id: 5 }` with a `create` that leaves `id` to its sequence
+    inserted a new row on every call and never touched row 5;
+  - `where: { email: a }` with `create: { email: b }` updated or inserted `b`,
+    and on MySQL returned a row re-read by `a`, which the statement never
+    wrote.
+
+  When every `where` key carries the same value in `create`, the upsert is
+  still one atomic statement. Otherwise it looks the row up by `where`, then
+  updates it or inserts `create`, in one transaction (the caller's, inside
+  `$transaction`). That is Prisma's contract, and prisma-compat already
+  emulated it; calling core directly did not get it. One rule decides for
+  every engine (`upsertWhereMatchesCreate` in `query/compound-unique.ts`).
+- **PowDB's lookup uses `where`'s values.** 0.80 routed filtered and non-key
+  upserts through a lookup, but took the values from `create`, so the same
+  shapes missed the row there too.
+- **An empty `update` works.** `update: {}` reads as "create it if it is
+  missing". It compiled to `DO UPDATE SET` with nothing after it, a syntax
+  error on every SQL engine, and E003 on PowDB. It now returns the row as it
+  is, or inserts `create`.
+
+### Added
+
+- **Nested writes inside `upsert`.** Relation operations in `create` or
+  `update` run through the nested-write engine, on every engine. They used to
+  be refused.
+- **MySQL and SQL Server run a globally filtered `upsert()`.** Their conflict
+  statements cannot carry the filter, so 0.80 refused the call with E017. The
+  lookup carries it instead: another tenant's row is invisible to it and is
+  never updated.
+
+### Behaviour changes
+
+- **A lookup is two statements, not one.** The lookup path emits a `SELECT`
+  then an `UPDATE` or an `INSERT`, each with its own `$on('query')` event.
+  Like Prisma's, it is not atomic against a concurrent insert of the same key:
+  two callers can both miss, and the second insert fails with
+  `UniqueConstraintError` (E008) when `create` carries the key.
+- **Both halves are validated first.** A typo in `update` is refused whether
+  or not the row exists, before any statement is sent.
+- **A batched `buildUpsert` refuses what it cannot express.** A pipeline or an
+  array `$transaction` has no round trip for a lookup, so `buildUpsert` throws
+  E003 for a `where` that differs from `create` or an empty `update`, and E017
+  for a filtered table on MySQL or SQL Server. Each message names the fix.
+- **prisma-compat hands `upsert` to core.** Its own lookup emulation is gone.
+  An array `$transaction` still batches an upsert when core would run it as one
+  statement, and runs the array inside a transaction otherwise.
+
+### Upgrading
+
+- A call whose `where` and `create` carry the same key values changes nothing.
+- A call where they differ was writing a different row than it named. Look for
+  rows it duplicated, typically from `where: { id }` with a keyless `create`.
+- A batched `buildUpsert` in that shape now throws. Call `upsert()` itself, or
+  give `create` the `where` values.
+- A workaround for 0.80's E017 on a filtered MySQL or SQL Server upsert can go.
+
+### Tests
+
+- `upsert-where-lookup.integration.test.ts`: twelve live PostgreSQL cases,
+  including the statement sequence of each path, caller-transaction rollback,
+  nested writes, and a tenant filter.
+- The cross-engine battery gained four cases, run on SQLite in every PR and on
+  MySQL and SQL Server in CI. Verified locally against MySQL 9.7.
+- Three live PowDB embedded cases for the `where`-keyed lookup.
+- Every mechanism was mutation-tested: routing, the matching rule, up-front
+  validation, the empty-`update` shortcut, the batched refusal, and filter
+  forwarding, on PostgreSQL, SQLite, MySQL and PowDB.
+- A byte-pinned parity test was pinning the wrong statement: an `INSERT`
+  without `id` followed by `ON CONFLICT ("id")`, which can never conflict. It
+  now inserts the key it conflicts on.
+
+### Tooling / CI
+
+- The site's `baseline-browser-mapping` moves from 2.10.17 to 2.11.26, which
+  fixes a denial of service on invalid input. It is a build-time dependency of
+  Next, not part of the library.
+- c8 moves from 11 to 12, so the coverage gates run on Node 26, where 11
+  crashed at startup. Measured on the same code under Node 22, all 50 files
+  report identical figures under both versions (97.09% lines).
+
 ## 0.80.0 (2026-09-27)
 
 A database that drops connections no longer takes the application down with

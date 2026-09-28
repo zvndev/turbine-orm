@@ -409,7 +409,11 @@ describe('pii: write RETURNING excludes the PII column (Postgres)', () => {
   });
 
   it('upsert emits an explicit non-PII RETURNING list', () => {
-    const d = usersQuery().buildUpsert({ where: { id: 1 }, create: { name: 'a' }, update: { name: 'b' } } as never);
+    const d = usersQuery().buildUpsert({
+      where: { id: 1 },
+      create: { id: 1, name: 'a' },
+      update: { name: 'b' },
+    } as never);
     assert.match(d.sql, /RETURNING "id", "name"/);
     assert.doesNotMatch(returnTail(d.sql), /"email"/);
   });

@@ -212,6 +212,15 @@ src/
                       `|rt=` segment for it: without one, two calls differing only in `select`
                       shared a statement and the second got the first's columns. PowDB narrows
                       the returned ROW instead (its `returning` takes no column list).
+                      `upsertLookupReason` (0.81) is the one authority on when `upsert()`
+                      looks the row up instead of running `buildUpsert`'s statement
+                      (`where` not pinned to `create`, an empty `update`, a global filter
+                      on an engine without `supportsUpsertUpdateWhere`); `buildUpsert`
+                      REFUSES the same shapes, since a batched DeferredQuery has no round
+                      trip for a lookup. The lookup itself is `upsertLookupFirst` in
+                      builder.ts, which also takes nested relation writes and compiles both
+                      halves BEFORE the lookup so validity never depends on whether the row
+                      exists.
     relations.ts    - Relation + orderBy compilation: the json_agg nested-relation
                       machinery (buildSelectWithRelations, buildRelationSubquery,
                       buildManyToManySubquery), the positional-encoding shapes + nested-row
@@ -321,7 +330,16 @@ src/
                       most one row. SHARED rather than written twice because PowqlInterface
                       is a parallel implementation, and two copies of a rule this specific
                       is how two engines come to disagree about whether a query is VALID
-                      (the 0.64 projection-resolver class).
+                      (the 0.64 projection-resolver class). 0.81 adds the upsert question:
+                      `upsertWhereMatchesCreate`, whether ONE conflict statement means what
+                      the call says. `ON CONFLICT` compares the values it INSERTS (`create`'s)
+                      and never reads `where`'s, so `where: { id: 5 }` with a keyless `create`
+                      inserted a new row on every call. Only when every `where` key is pinned
+                      to `create`'s value may an engine take its single-statement path;
+                      otherwise it looks the row up by `where` in one transaction (Prisma's
+                      contract). `false` is always safe (the lookup is correct for every
+                      shape), so anything unrecognized answers false. Every engine and
+                      prisma-compat read this one rule.
     relation-names.ts, THE relation-name rule (0.72), the twin of
                       `resolveColumnName` one level up. A relation carries one DECLARED
                       name (`blogPosts`) while the DDL anyone reads carries only the TABLE
@@ -775,7 +793,7 @@ src/
                       `$listen`/`$notify`/RLS/pgvector throw E017). PowDB realities shaping it:
                       writes use the trailing **`returning`** keyword (create/createMany/update/
                       delete), `upsert` reselects by PK (its statement rejects `returning`; a
-                      **upsert** conflicts on the `where` keys like SQL; only a single-column-PK conflict with no global filter uses the native statement, every other shape (non-PK unique key, composite PK, filtered table) reselects-or-writes in one flat txn via `upsertLookupFirst`, which is also what keeps a tenant-scoped upsert off another tenant's row).
+                      **upsert** follows the shared `upsertWhereMatchesCreate` rule; only a single-column-PK `where` pinned to `create`'s value, with a non-empty `update`, no nested writes and no global filter, uses the native statement. Every other shape looks the row up BY `where` in one flat txn via `upsertLookupFirst` (0.81: it used to take the values from `create`), which is also what keeps a tenant-scoped upsert off another tenant's row).
                       **PKs: server-assigned `auto` int OR client UUID**, `isGenerated` columns emit
                       PowDB's `auto` modifier (`powqlSchemaDDL`) and let the engine assign the id;
                       otherwise a defaulted string PK gets a client UUID (`applyPkDefault`). No

@@ -127,7 +127,10 @@ describe('upsert conflict-UPDATE predicate: SQL and params agree', () => {
 
   // These two used to DROP the predicate and run the upsert anyway, so a
   // tenant-scoped upsert whose key matched another tenant's row updated it.
-  it('mysql refuses a filtered upsert: ON DUPLICATE KEY UPDATE has no predicate slot', () => {
+  // `upsert()` itself now looks the row up with the filter applied (proven live
+  // in cross-engine-correctness.test.ts); only the one-statement BATCHED form,
+  // which has no round trip for a lookup, is refused.
+  it('mysql refuses a filtered batched upsert: ON DUPLICATE KEY UPDATE has no predicate slot', () => {
     assert.equal(mysqlDialect.supportsUpsertUpdateWhere, false);
     assert.throws(
       () => buildTenantUpsert(mysqlDialect),
@@ -135,13 +138,14 @@ describe('upsert conflict-UPDATE predicate: SQL and params agree', () => {
         assert.ok(e instanceof UnsupportedFeatureError);
         assert.match(e.message, /global filter/);
         assert.match(e.message, /skipGlobalFilters: UNSAFE/);
+        assert.match(e.message, /Call `upsert\(\)` unbatched/, 'names the call that does work');
         return true;
       },
     );
     assert.doesNotMatch(buildTenantUpsert(mysqlDialect, { skipGlobalFilters: UNSAFE }).sql, /WHERE/);
   });
 
-  it('mssql refuses a filtered upsert: MERGE cannot take the predicate', () => {
+  it('mssql refuses a filtered batched upsert: MERGE cannot take the predicate', () => {
     // MERGE's `WHEN MATCHED AND <pred>` cannot take the unqualified column
     // references the builder produces (ambiguous between the T and S aliases).
     assert.equal(mssqlDialect.supportsUpsertUpdateWhere, false);

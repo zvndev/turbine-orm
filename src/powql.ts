@@ -48,6 +48,7 @@ import {
 import {
   executeNestedCreate,
   executeNestedUpdate,
+  extractRelationFields,
   hasRelationFields,
   type NestedWriteContext,
 } from './nested-write.js';
@@ -75,6 +76,7 @@ import {
   assertMutationWhereIdentifiesOneRow,
   assertWhereIdentifiesOneRow,
   expandCompoundUniqueWhere,
+  upsertWhereMatchesCreate,
 } from './query/compound-unique.js';
 import { ARRAY_OPERATOR_KEYS, isJsonFilter, isRelationPickOrderBy, orderByEntries } from './query/filters.js';
 import type { MiddlewareFn, QueryEvent, QueryInterfaceOptions } from './query/index.js';
@@ -3104,7 +3106,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         throw new UnsupportedFeatureError(
           'nested writes',
           'PowDB',
-          `relation "${field}", nested writes need create()/update(), not createMany()/upsert()`,
+          `relation "${field}", nested writes need create()/update()/upsert(), not createMany()`,
         );
       }
       out.push({ col: this.column(field), value });
@@ -3338,7 +3340,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         throw new UnsupportedFeatureError(
           'nested writes',
           'PowDB',
-          `relation "${field}", nested writes need create()/update(), not updateMany()/upsert()`,
+          `relation "${field}", nested writes need create()/update()/upsert(), not updateMany()`,
         );
       }
       const colMeta = this.column(field);
@@ -3516,47 +3518,48 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const plan = this.writeReturnPlan(args);
       const createData = this.applyPkDefault(args.create as Record<string, unknown>);
       const pkCol = this.meta.primaryKey[0];
-      // The conflict target is the columns `where` names, as on the SQL
-      // engines (`ON CONFLICT (<where keys>)`), with the conflicting VALUES
-      // taken from `create`. This path used to conflict on the primary key
-      // whatever `where` named, so an upsert keyed on another unique column
-      // (`where: { email }`) never found the existing row.
       const conflictColumns = Object.keys(upsertWhere)
         .filter((k) => upsertWhere[k] !== undefined)
         .map((k) => this.column(k).name);
+      const updateData = (args.update ?? {}) as Record<string, unknown>;
       // PowQL's native `upsert … on .col` expresses exactly one shape: a single
-      // conflict column that is the primary key, with no predicate on its
-      // conflict branch. Everything else is an atomic reselect-or-write
-      // transaction.
+      // conflict column that is the primary key, pinned to the value `create`
+      // inserts, with a non-empty update and no predicate on its conflict
+      // branch. Every other shape looks the row up by `where` first, in one
+      // transaction, which is what the SQL engines do for the same shapes and
+      // what the call means (query/compound-unique.ts upsertWhereMatchesCreate).
       //
       // That includes a table under a global filter. The native statement's
       // `on conflict` branch carries no predicate, so a tenant-scoped client
       // whose `create` key matched ANOTHER tenant's row updated that row, and
       // the tenant-filtered reselect then reported the write it had just made
-      // as a NotFoundError. The SQL engines guard the same branch with the
-      // filter (`DO UPDATE … WHERE tenant_id = $n`). The lookup-first path runs
-      // its find and its update through the filtered interface, so another
-      // tenant's row is invisible to it: the insert then collides on the key
-      // and fails, as it does on the SQL engines, and nothing is overwritten.
+      // as a NotFoundError. The lookup runs its find and its update through the
+      // filtered interface, so another tenant's row is invisible to it: the
+      // insert then collides on the key and fails, and nothing is overwritten.
       const filtered = this.applyGlobalFilter('', [], args.skipGlobalFilters) !== '';
       const native =
         this.meta.primaryKey.length === 1 &&
         pkCol !== undefined &&
         conflictColumns.length === 1 &&
         conflictColumns[0] === pkCol &&
+        upsertWhereMatchesCreate(this.meta, upsertWhere, (args.create ?? {}) as Record<string, unknown>) &&
+        !hasRelationFields(args.create as Record<string, unknown>, this.meta) &&
+        !hasRelationFields(updateData, this.meta) &&
+        Object.values(updateData).some((v) => v !== undefined) &&
         !filtered;
       if (!native) {
-        return this.upsertLookupFirst(createData, args.update as Record<string, unknown>, conflictColumns, {
+        return this.upsertLookupFirst(upsertWhere, createData, updateData, {
           select: args.select,
           omit: args.omit,
           skipGlobalFilters: args.skipGlobalFilters,
+          timeout: args.timeout,
         });
       }
       const params: unknown[] = [];
       const createBody = this.scalarData(createData)
         .map((a) => `${quotePowqlIdent(a.col.name)} := ${this.writeRef(a.value, a.col, params)}`)
         .join(', ');
-      const updateBody = this.buildUpdateAssignments(args.update as Record<string, unknown>, params);
+      const updateBody = this.buildUpdateAssignments(updateData, params);
       // PowDB 0.7.0's `upsert` statement does NOT accept a trailing `returning`
       // (verified: "unexpected trailing token … 'returning'"), because it is one
       // atomic insert-or-update, not two branches. So upsert alone keeps the
@@ -3581,56 +3584,50 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   /**
-   * Upsert as a reselect-or-write inside one flat transaction, for every shape
-   * the native `upsert … on .col` statement cannot express: a conflict target
-   * other than a single-column primary key (it takes one column and PowDB has
-   * no composite unique), and a table under a global filter (its conflict
-   * branch takes no predicate). PowDB's single writer makes the read-then-write
-   * safe from concurrent writers; the transaction makes it atomic with the
-   * write.
+   * `upsert` as Prisma defines it, for every shape the native `upsert … on`
+   * statement cannot express: find the row `where` names, update it if it
+   * exists, else insert `create`, in one flat transaction. PowDB's single
+   * writer makes the read-then-write safe from concurrent writers; the
+   * transaction makes it atomic with the write.
    *
-   * The row is looked up by the conflict columns with `create`'s values for
-   * them, which is what `ON CONFLICT (<cols>)` compares on the SQL engines. The
-   * find and the update run through the transaction's table interface, so a
-   * configured global filter applies to both exactly as it does to any other
-   * read or write, and `skipGlobalFilters` is forwarded to both.
+   * The lookup is by `where`'s own values. It used to be by `create`'s values
+   * for the conflict columns, which is what the native statement compares, and
+   * so answered a different question whenever the two disagreed: `where: { id }`
+   * with a `create` that leaves the key to the engine inserted a new row every
+   * time. The find and the update run through the transaction's table
+   * interface, so a configured global filter applies to both exactly as it does
+   * to any other read or write, and `skipGlobalFilters` is forwarded to both.
+   *
+   * Both halves are compiled before the lookup, so an unknown field in `update`
+   * is refused whether or not the row exists (the SQL engines do the same).
    */
   private async upsertLookupFirst(
+    where: Record<string, unknown>,
     createData: Record<string, unknown>,
     updateData: Record<string, unknown>,
-    conflictColumns: readonly string[],
-    shape: { select?: Record<string, boolean>; omit?: Record<string, boolean>; skipGlobalFilters?: unknown },
+    shape: {
+      select?: Record<string, boolean>;
+      omit?: Record<string, boolean>;
+      skipGlobalFilters?: unknown;
+      timeout?: number;
+    },
   ): Promise<T> {
-    const { skipGlobalFilters, ...projection } = shape;
+    const { skipGlobalFilters, timeout, ...projection } = shape;
     const skip = skipGlobalFilters === undefined ? {} : { skipGlobalFilters };
-    // Accept either the camelCase field or the snake_case column in `create`
-    // (create() resolves both), and key the where by field name.
-    const keyPairs = conflictColumns.map((col) => {
-      const field = this.meta.reverseColumnMap[col] ?? col;
-      return { field, value: createData[field] ?? createData[col] };
-    });
-    const keyless = keyPairs.some((p) => p.value == null);
-    const isCompositePk =
-      keyPairs.length > 1 &&
-      keyPairs.length === this.meta.primaryKey.length &&
-      conflictColumns.every((c) => this.meta.primaryKey.includes(c));
-    if (keyless && isCompositePk) {
-      throw new ValidationError(
-        `upsert on "${this.table}" needs every composite-PK field in \`create\` (${keyPairs
-          .map((p) => p.field)
-          .join(', ')}).`,
-      );
-    }
-    const keyWhere = Object.fromEntries(keyPairs.map((p) => [p.field, p.value]));
+    const time = timeout === undefined ? {} : { timeout };
+    this.scalarData(extractRelationFields(createData, this.meta).scalars);
+    const scalarUpdate = extractRelationFields(updateData, this.meta).scalars;
+    if (Object.values(scalarUpdate).some((v) => v !== undefined)) this.buildUpdateAssignments(scalarUpdate, []);
+    const updateIsEmpty = Object.values(updateData).every((v) => v === undefined);
     const run = async (ctx: NestedWriteContext): Promise<T> => {
       const tbl = ctx.tx.table<T>(this.table);
-      // A row whose `create` leaves a conflict column unset cannot collide on
-      // it (NULL never equals NULL in a unique index, and a server-assigned key
-      // is new), which is what `ON CONFLICT` concludes on the SQL engines too.
-      const existing = keyless ? null : await tbl.findUnique({ where: keyWhere, ...skip } as never);
-      return existing
-        ? ((await tbl.update({ where: keyWhere, data: updateData, ...projection, ...skip } as never)) as T)
-        : ((await tbl.create({ data: createData as Partial<T>, ...projection })) as T);
+      const existing = await tbl.findUnique({ where, ...projection, ...skip, ...time } as never);
+      if (existing) {
+        // An empty `update` means "leave it as it is": the row found is the answer.
+        if (updateIsEmpty) return existing as T;
+        return (await tbl.update({ where, data: updateData, ...projection, ...skip, ...time } as never)) as T;
+      }
+      return (await tbl.create({ data: createData as Partial<T>, ...projection, ...time } as never)) as T;
     };
     return this.isTxScoped() ? run(this.buildNestedCtx()) : this.runInImplicitTx(run);
   }

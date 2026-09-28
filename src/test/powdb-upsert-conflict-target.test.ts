@@ -89,6 +89,52 @@ describe('PowDB upsert: the conflict target is what `where` names', () => {
     });
   });
 
+  // The lookup is by `where`'s VALUES, not `create`'s. It used to take the
+  // conflict values from `create`, so a `where` naming one row with a `create`
+  // carrying another key updated or inserted the wrong one.
+  it('`where` naming row 1 updates row 1 even when `create` carries another key', async () => {
+    await withDb(async (t) => {
+      const row = (await t.upsert({
+        where: { id: 1 },
+        create: { id: 2, email: 'z@x.test', name: 'never' },
+        update: { name: 'A9' },
+      })) as Member;
+      assert.equal(row.id, 1);
+      assert.equal(row.name, 'A9');
+      assert.equal(await t.count(), 1, 'row 2 was never inserted');
+    });
+  });
+
+  it('`where: { email: a }` with `create: { email: b }` updates a', async () => {
+    await withDb(async (t) => {
+      const row = (await t.upsert({
+        where: { email: 'a@x.test' },
+        create: { id: 2, email: 'b@x.test', name: 'never' },
+        update: { name: 'A10' },
+      })) as Member;
+      assert.deepEqual(row, { id: 1, email: 'a@x.test', name: 'A10' });
+      assert.equal(await t.count(), 1);
+    });
+  });
+
+  it('an empty `update` returns the found row unchanged, and inserts when it is missing', async () => {
+    await withDb(async (t) => {
+      const found = (await t.upsert({
+        where: { id: 1 },
+        create: { id: 1, email: 'a@x.test', name: 'x' },
+        update: {},
+      })) as Member;
+      assert.equal(found.name, 'A');
+      const made = (await t.upsert({
+        where: { id: 3 },
+        create: { id: 3, email: 'c@x.test', name: 'C' },
+        update: {},
+      })) as Member;
+      assert.equal(made.name, 'C');
+      assert.equal(await t.count(), 2);
+    });
+  });
+
   it('a primary-key upsert still takes the native statement and behaves the same', async () => {
     await withDb(async (t) => {
       const updated = (await t.upsert({

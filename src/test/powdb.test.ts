@@ -1074,14 +1074,12 @@ describe('powdb: capability guards throw E017', () => {
       UnsupportedFeatureError,
     );
   });
-  it('createMany/upsert reject nested-write relation data (only create/update support it)', async () => {
+  // `upsert` accepts nested writes since it looks the row up and runs them
+  // through create()/update() (powdb-upsert-conflict-target.test.ts, live).
+  it('createMany rejects nested-write relation data (create/update/upsert support it)', async () => {
     const m = mockPool();
     await assert.rejects(
       () => qi(m).createMany({ data: [{ name: 'x', posts: { create: [] } }] as never }),
-      UnsupportedFeatureError,
-    );
-    await assert.rejects(
-      () => qi(m).upsert({ where: { id: 'x' }, create: { name: 'x', posts: { create: [] } }, update: {} } as never),
       UnsupportedFeatureError,
     );
   });

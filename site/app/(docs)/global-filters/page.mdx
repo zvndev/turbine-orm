@@ -88,7 +88,9 @@ So a soft-delete filter on `posts` means a user's post `_count` counts only live
 
 Global filters apply to `update`, `updateMany`, `delete`, `deleteMany`, and the conflict-`UPDATE` of `upsert`. `create` and `createMany` are **never** filtered: an insert has nothing to scope.
 
-The conflict update of `upsert` needs an engine that can put a predicate on it. PostgreSQL and SQLite emit `ON CONFLICT … DO UPDATE … WHERE`, and PowDB runs the upsert as a filtered lookup and update in one transaction. MySQL's `ON DUPLICATE KEY UPDATE` and SQL Server's `MERGE` cannot carry the filter there, so since 0.80 an `upsert` on a filtered table is refused on those two engines with `UnsupportedFeatureError` (`TURBINE_E017`). Before 0.80 they ran it without the filter, which could update a row the filter hides. Use `findUnique`, then `update` or `create`, inside `$transaction`, or pass `skipGlobalFilters: UNSAFE` when the upsert is meant to reach every row.
+The conflict update of `upsert` needs an engine that can put a predicate on it. PostgreSQL and SQLite emit `ON CONFLICT … DO UPDATE … WHERE`. MySQL's `ON DUPLICATE KEY UPDATE`, SQL Server's `MERGE` and PowDB's `upsert` cannot carry the filter there, so on those engines an `upsert` on a filtered table runs as a filtered lookup, then an update or an insert, in one transaction. Another tenant's row is invisible to the lookup and is never updated.
+
+Before 0.80, MySQL and SQL Server ran the conflict statement without the filter, which could update a row the filter hides. 0.80 refused the call with `UnsupportedFeatureError` (`TURBINE_E017`); since 0.81 it runs the lookup instead. Only a [batched](/queries#pipeline) `buildUpsert` is still refused there, because it has no round trip for the lookup. Pass `skipGlobalFilters: UNSAFE` when the upsert is meant to reach every row.
 
 One deliberate interaction: a global filter does **not** satisfy the [empty-where guard](/queries#delete--deletemany). The guard checks the *user-supplied* `where`, so an unguarded mass mutation is still refused even when a filter is configured:
 

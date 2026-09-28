@@ -487,7 +487,7 @@ await db.users.upsert({
 // INSERT ... ON CONFLICT DO UPDATE
 ```
 
-**Port note:** keep the `upsert` shape identical, it's the only way to get race-free "create or update" without a transaction. PowDB equivalents will need similar atomic primitives in PowQL or a transaction-wrapped fallback documented clearly.
+When `create` carries the same values as `where` (as above) this is one atomic statement. Otherwise (a `create` that leaves `id` to its sequence, an empty `update`, nested writes) `upsert` looks the row up by `where` first and then updates or inserts, inside one transaction. Keep the shape above when you need race-free "create or update".
 
 ### Nested writes
 
