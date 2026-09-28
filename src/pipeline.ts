@@ -19,8 +19,9 @@
  * Hyperdrive), mock pools in tests, and any pool that doesn't expose pg internals.
  */
 
+import { type CheckoutGuard, guardCheckout } from './connection-guard.js';
 import { type Dialect, postgresDialect } from './dialect.js';
-import { PipelineError, type PipelineResultSlot, TurbineError, wrapPgError } from './errors.js';
+import { explainConnectionLoss, PipelineError, type PipelineResultSlot, TurbineError, wrapPgError } from './errors.js';
 import type { PgCompatPool, PgCompatPoolClient, PgCompatQueryResult } from './pg-types.js';
 import {
   type PipelineRunOptions,
@@ -259,6 +260,9 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
   } catch (err) {
     throw wrapPgError(err);
   }
+  // Guarded for the checkout window, see connection-guard.ts: a connection that
+  // dies mid-batch emits 'error', which with no listener exits the process.
+  const checkout = guardCheckout(client);
 
   try {
     if (supportsExtendedPipeline(client)) {
@@ -279,8 +283,8 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
     // Already-typed Turbine errors pass through untouched; anything else is a
     // driver error that must not escape with a SQLSTATE sitting in the same
     // `.code` slot Turbine puts TURBINE_E0NN in.
-    if (err instanceof TurbineError) throw err;
-    throw wrapPgError(err);
+    if (err instanceof TurbineError) throw explainConnectionLoss(err, checkout.lostWith);
+    throw explainConnectionLoss(wrapPgError(err), checkout.lostWith);
   } finally {
     // A client the pipeline could not return to a clean state is released WITH
     // an error, which is how pg-pool is told to drop it rather than lend it
@@ -290,9 +294,9 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
     // normally is what turned one failed batch into `25P02` on somebody else's
     // query.
     if (pipelineClientNeedsDiscard(client)) {
-      client.release(new Error('turbine: pipeline connection left an open transaction and was discarded'));
+      checkout.release(new Error('turbine: pipeline connection left an open transaction and was discarded'));
     } else {
-      client.release();
+      checkout.release();
     }
   }
 }
@@ -305,14 +309,15 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
  * Note: This acquires and immediately releases a connection to inspect it.
  */
 export async function pipelineSupported(pool: PgCompatPool): Promise<boolean> {
-  let client: PgCompatPoolClient | undefined;
+  let checkout: CheckoutGuard | undefined;
   try {
-    client = await pool.connect();
+    const client = await pool.connect();
+    checkout = guardCheckout(client);
     return supportsExtendedPipeline(client);
   } catch {
     return false;
   } finally {
-    client?.release();
+    checkout?.release();
   }
 }
 

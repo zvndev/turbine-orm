@@ -1,5 +1,189 @@
 # Changelog
 
+## 0.80.0 (2026-09-27)
+
+A database that drops connections no longer takes the application down with
+it, and a write can say which columns it wants back. Along the way, fixing a
+test that could not fail turned up three `upsert` bugs, two of them able to
+write across tenants.
+
+### Security
+
+- **A tenant-scoped `upsert` could update another tenant's row on PowDB,
+  MySQL and SQL Server.** A global filter guards the conflict update of an
+  upsert, so a key that collides with a row the filter hides updates nothing.
+  PostgreSQL and SQLite emit that guard (`ON CONFLICT … DO UPDATE … WHERE`).
+  PowDB's native `upsert … on conflict` statement took no predicate, and
+  MySQL's `ON DUPLICATE KEY UPDATE` and SQL Server's `MERGE` dropped it,
+  silently, so the colliding row was updated. On PowDB the filtered reselect
+  then reported the write it had just made as `NotFoundError`. PowDB now runs a
+  filtered upsert as a lookup then an update or insert in one transaction,
+  with the filter on both. MySQL and SQL Server refuse it with
+  `UnsupportedFeatureError` (E017), naming the two ways forward: `findUnique`
+  then `update` or `create` inside `$transaction`, or `skipGlobalFilters:
+  UNSAFE` when the upsert is meant to reach every row.
+
+### Fixed
+
+- **A dropped connection no longer exits the process.** pg-pool listens for a
+  connection's `'error'` only while it is idle, and stops at checkout. So
+  whenever `$transaction`, `transaction()`, a nested write, a cursor stream, a
+  pipeline or `$listen` held a connection, a restart, failover, compute
+  suspend or `pg_terminate_backend` emitted an `'error'` nobody heard, and Node
+  exits on that. Every checkout now carries a listener for exactly as long as
+  it is held, and pools Turbine creates keep one on every connection they
+  open, so `db.pool.connect()` in application code is covered too. The pending
+  call rejects with `ConnectionError` (E004) and the pool discards the
+  connection. The CLI's own connections (`migrate`, `push`, `doctor`, Studio,
+  `observe`, the MCP server) are guarded the same way.
+- **Connection loss is always E004.** pg reports a closed socket with messages
+  that carry no code ("Connection terminated unexpectedly", "Client has
+  encountered a connection error and is not queryable"), and `wrapPgError`
+  looked only at the code, so the commonest symptom of a restart came back
+  untyped. Those messages now map to `ConnectionError`. When a transaction's
+  connection dies between two statements, the error names the original cause
+  (57P01, say) instead of the follow-on "not queryable".
+- **The `pg` range matches what Turbine needs.** It allowed `^8.13.1`, but the
+  pipeline module reads `pg.utils`, which pg first exports in 8.15.0, so
+  importing Turbine threw at load on pg 8.13 and 8.14 ("Cannot destructure
+  property 'prepareValue' of 'pg.utils'"). Measured on 8.13.1: six of the
+  eight subpath entries failed to import. The range is now `^8.15.0`.
+- **PowDB `upsert` conflicts on the columns `where` names.** On the SQL
+  engines the `where` keys are the conflict target. PowDB always conflicted on
+  the primary key, so `upsert({ where: { email } })` never found the row that
+  had that email. A single-column primary key with no global filter still uses
+  the native statement; everything else runs as the transaction above.
+- **PowDB: composite primary keys.** `powqlSchemaDDL` refused any table with a
+  composite primary key, because introspected metadata lists the key's own
+  `<table>_pkey` index and PowDB has no composite indexes. The key's columns
+  are already declared `required`, so that index is now skipped. Every other
+  composite index, a composite unique included, is still refused with E017:
+  PowDB cannot enforce it.
+
+### Added
+
+- **`select` / `omit` on `create`, `update`, `delete` and `upsert`.** The same
+  shape and rules as on a read, resolved by the same code. An unknown field, a
+  relation name, an empty `select`, or `select` with `omit` is refused before
+  anything is written; a PII field comes back only when selected by name; the
+  result type narrows to match. The narrowing happens in the statement (the
+  `RETURNING` list on PostgreSQL and SQLite, the re-select on MySQL, `OUTPUT`
+  on SQL Server), not by trimming a row that already crossed the wire. Nested
+  creates and updates apply it to the row they return. On PowDB, whose
+  `returning` takes no column list, the row is narrowed after it arrives, with
+  the same result. prisma-compat passes its `select` / `omit` down to the
+  write instead of trimming the whole row afterwards.
+- **`$listen` reconnects.** A lost LISTEN connection is reopened with
+  exponential backoff (100 ms, doubling to 30 s) and listens again.
+  `$listen(channel, handler, { reconnect, onError, onReconnect })` configures
+  it: `reconnect: false` ends the subscription at the first loss, `onError`
+  receives each loss and failed attempt (by default, one line on stderr), and
+  `onReconnect` fires when the subscription is live again. NOTIFY is not
+  durable, so anything sent during the gap is lost; `onReconnect` is the cue
+  to resync. `ListenOptions` and `ListenReconnectOptions` are exported.
+- **`QueryEvent.retried`**, set on the event of a read attempt that failed on a
+  dead connection and was sent again (below).
+
+### Behaviour changes
+
+- **Dead idle connections are not lent out after a freeze.** pg-pool drops an
+  idle connection when it reads the server's close, which needs the event
+  loop. A serverless function frozen between invocations reads nothing, so a
+  restart, pooler recycle or compute suspend in that window left every idle
+  connection dead and still in the pool, and each caller after the thaw got
+  one. Measured with five idle connections terminated while the loop was
+  blocked: five concurrent queries, five failures (57P01). Pools Turbine
+  creates now wait one event-loop turn before lending a connection that has
+  been idle for a second or more, which reads those closes first. No round
+  trip, and a pool in steady use never waits. Same measurement after: zero
+  failures, reads and writes alike.
+- **A read on a dead connection is sent once more.** `findMany`, `findFirst`,
+  `findUnique`, the `OrThrow` forms, `count`, `aggregate`, `groupBy` and a
+  stream's first query, outside a transaction, are retried once on a fresh
+  connection when the one they went out on had already been closed (57P01,
+  ECONNRESET, EPIPE, or pg's "terminated unexpectedly" and "not queryable").
+  The failed attempt is its own `$on('query')` event, marked `retried: true`.
+  A connection that could not be opened is not retried.
+- **So is the `BEGIN` of a transaction**, for `$transaction` (both forms),
+  `transaction()`, a nested write, and `connect()`'s check: nothing has run yet.
+- **Writes are never resent.** A lost connection does not say whether the
+  statement committed first, so a `create`, `update`, `delete`, `upsert` or
+  `*Many` sent on a dead connection still fails with E004. The checkout wait
+  above prevents that after a freeze of a second or more; inside a shorter one
+  the caller decides.
+- **`$listen` survives a lost connection by default.** It used to exit the
+  process. Pass `reconnect: false` to end the subscription instead.
+- **PowDB `aggregate()` runs several fields in one statement**, on an engine
+  probed at 0.20 or later, and validates every field before any statement is
+  sent.
+
+### Performance
+
+- **`create` with a narrow `select`.** 3.1 KB `jsonb` payload, concurrency 50,
+  local PostgreSQL 17, two rounds: whole row 46,473 and 54,784 inserts/s;
+  `select: { id: true }` 62,688 and 64,675; a raw INSERT with no `RETURNING`
+  75,642 and 78,513. What is left to the raw figure is per-call ORM work, not
+  bytes.
+- **PowDB `aggregate()`**, eight sums, median of 20: 2.5 ms to 2.1 ms at 50k
+  rows embedded (1.2x), 42 to 59 ms to 32 ms at 500k rows embedded (1.3x to
+  1.8x), 3.5 ms to 2.3 ms networked on loopback (1.5x). Results are identical
+  to the per-field path. Engines 0.13 to 0.19 keep per-field statements, where
+  a per-field `count` of a nullable column disagrees between the two forms, and
+  an empty filtered set still takes the per-field path so its answer stays
+  exact.
+
+### Known limits
+
+- The checkout wait applies to pools Turbine creates. A pool you pass in
+  (`TurbineConfig.pool`, `turbineHttp`) is not Turbine's to change; the read
+  and `BEGIN` retries still apply to it.
+- A cursor stream that loses its connection mid-drain, and a pipeline, fail
+  with E004 rather than retry: rows or statements have already gone out.
+- PowDB keeps its own opt-in `retryStaleReads` rather than the read retry
+  above.
+
+### Notes
+
+- The size claims move: the main entry is held under 93 kB brotli (was 91)
+  and the edge entry under 74 kB (was 72). Against the published 0.79.1
+  tarball every entry carrying the client graph grew by about 1.7 kB, all of it
+  this release's features; no new module outside that graph is reachable.
+
+### Upgrading
+
+- On pg 8.13 or 8.14, upgrade pg; those versions could not import Turbine.
+- An `upsert` on a table with a global filter now throws E017 on MySQL and
+  SQL Server. See Security above for the two replacements.
+- A retry you wrap around reads for connection loss can go. Keep one around
+  writes only if they are idempotent.
+
+### Tests
+
+- `connection-loss.integration.test.ts` kills real backends under every
+  holder (`$transaction` in flight and idle, `transaction()`, a stream
+  mid-drain, `db.pool.connect()`, `$listen`) and asserts the call rejects, the
+  process lives and the pool still serves. Each case exited the process before
+  the fix, which fails the whole file.
+- `stale-connection.integration.test.ts` freezes the event loop for real: a
+  worker thread terminates the client's idle backends while the main thread is
+  parked in `Atomics.wait`. Each recovery mechanism is mutation-tested against
+  it.
+- A source scan requires every `pool.connect()` to be guarded and every
+  `new pg.Client()` to call `guardConnection`.
+- The PowDB option matrix compared each option's PowQL against a baseline, and
+  every `create` run bound a fresh random key, so every `create` option passed
+  whether or not it did anything. Generated keys are now normalized, a
+  determinism check per operation keeps it that way, and options that shape
+  the returned row rather than the statement are compared on the row. Fixing
+  it is what exposed the PowDB `upsert` bugs above.
+
+### CI
+
+- `npm run check:pg-floor` installs the packed tarball with the lowest `pg`
+  the declared range allows and imports every subpath under ESM and CommonJS.
+  It runs in `prepublishOnly` and in the pack-smoke jobs of both workflows,
+  and fails against the old range.
+
 ## 0.79.1 (2026-09-24)
 
 Two fixes for applications that bundle turbine-orm, both invisible to code run

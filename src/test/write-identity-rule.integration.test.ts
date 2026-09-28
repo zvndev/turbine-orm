@@ -44,10 +44,10 @@ import pg from 'pg';
 import { TurbineClient } from '../client.js';
 import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
-import { capabilitiesFromVersion, type PowdbPool } from '../powdb.js';
+import { capabilitiesFromVersion, type PowdbPool, powdbDialect } from '../powdb.js';
 import { PowqlInterface } from '../powql.js';
 import { isInternalRowSelector, markInternalRowSelector } from '../query/compound-unique.js';
-import { UNSAFE } from '../query/index.js';
+import { type QueryInterface, UNSAFE } from '../query/index.js';
 import { markInternalCombinator } from '../query/utils.js';
 import type { RelationDef, SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable, skipGate } from './helpers.js';
@@ -419,20 +419,33 @@ describe('update / delete identity rule (build-only, SQL engines)', () => {
 
 function powqlMock() {
   const calls: { powql: string; params: unknown[] }[] = [];
+  const query = (powql: string, params: unknown[] = []) => {
+    calls.push({ powql, params });
+    return Promise.resolve({ rows: [{ id: 1, email: 'a', role: 'guest', name: 'x' }], rowCount: 1 });
+  };
   const pool = {
     capabilities: capabilitiesFromVersion('0.18.0'),
     retryStaleReads: false,
     readonly: false,
-    query(powql: string, params: unknown[]) {
-      calls.push({ powql, params });
-      return Promise.resolve({ rows: [{ id: 1, email: 'a', role: 'guest', name: 'x' }], rowCount: 1 });
-    },
+    query,
+    // An upsert on anything but the PK runs as a lookup then a write in one
+    // transaction on a pinned connection; its statements land in `calls` too.
+    connect: () => Promise.resolve({ query, release() {} }),
   } as unknown as PowdbPool;
   const schema = buildSchema();
   for (const t of Object.values(schema.tables)) {
     for (const c of t.columns) c.tsType = c.name === 'id' || c.name === 'user_id' ? 'number' : 'string';
   }
-  return { calls, qi: () => new PowqlInterface(pool, 'users', schema, [], { warnOnUnlimited: false }) };
+  return {
+    calls,
+    qi: () =>
+      new PowqlInterface(pool, 'users', schema, [], {
+        warnOnUnlimited: false,
+        dialect: powdbDialect,
+        queryInterfaceFactory: (p, t, sch, mw, opts) =>
+          new PowqlInterface(p as unknown as PowdbPool, t, sch, mw, opts) as unknown as QueryInterface<object>,
+      }),
+  };
 }
 
 describe('update / delete identity rule (PowQL)', () => {
@@ -925,11 +938,21 @@ describe('upsert identity rule (PowQL)', () => {
     assert.match(m.calls[0]!.powql, /^upsert users on \.id \{/);
   });
 
-  plainIt('a single-column unique that is not the PK is accepted', async () => {
+  plainIt('a single-column unique that is not the PK is accepted, and is the conflict target', async () => {
     const m = powqlMock();
     await m
       .qi()
       .upsert({ where: { email: 'a' }, create: { id: 1, email: 'a', role: 'g', name: 'n' }, update: { name: 'x' } });
     assert.ok(m.calls.length > 0, 'the statement reached the engine');
+    // PowQL's native upsert only conflicts on one column, and it named the PK
+    // here whatever `where` said, so the row that had this email was never found.
+    assert.ok(
+      m.calls.some((c) => /filter[^{]*\.email = \$1/.test(c.powql)),
+      m.calls.map((c) => c.powql).join('\n'),
+    );
+    assert.equal(
+      m.calls.some((c) => /^upsert users on \.id/.test(c.powql)),
+      false,
+    );
   });
 });

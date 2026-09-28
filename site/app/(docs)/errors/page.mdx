@@ -20,7 +20,7 @@ Every error also carries `readonly docsUrl` (e.g. `https://turbineorm.dev/errors
 | <a id="e001" /> `TURBINE_E001` | `NotFoundError` | `findUniqueOrThrow`, `findFirstOrThrow`, update/delete against a non-matching row |
 | <a id="e002" /> `TURBINE_E002` | `TimeoutError` | Query or transaction exceeds its configured timeout |
 | <a id="e003" /> `TURBINE_E003` | `ValidationError` | Unknown column, invalid operator, empty-where guard on update/delete, PII aggregate without `includePii`, a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol) passed a plain `true` instead of the `UNSAFE` symbol, a `createMany` whose first data row names no column while a later row does |
-| <a id="e004" /> `TURBINE_E004` | `ConnectionError` | Pool connection failure |
+| <a id="e004" /> `TURBINE_E004` | `ConnectionError` | A connection could not be opened, or an open one was closed by the server (restart, failover, idle timeout, compute suspend). See [lost connections](/transactions#lost-connections) for what Turbine retries |
 | <a id="e005" /> `TURBINE_E005` | `RelationError` | Unknown relation name in a `with` clause |
 | <a id="e006" /> `TURBINE_E006` | `MigrationError` | Checksum mismatch, migration-lock contention, or a failure while applying a migration |
 | <a id="e007" /> `TURBINE_E007` | `CircularRelationError` | Relation nesting depth exceeds 10 |

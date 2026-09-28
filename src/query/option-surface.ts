@@ -164,6 +164,9 @@ export const FIND_MANY_STREAM_OPTIONS: OptionTable<FindManyStreamArgs<Row>> = {
 
 export const CREATE_OPTIONS: OptionTable<CreateArgs<Row>> = {
   data: 'prisma',
+  // Field names, so hand-translated; prisma-compat narrows write results itself.
+  select: 'prisma',
+  omit: 'prisma',
   timeout: 'native',
 };
 
@@ -176,6 +179,9 @@ export const CREATE_MANY_OPTIONS: OptionTable<CreateManyArgs<Row>> = {
 export const UPDATE_OPTIONS: OptionTable<UpdateArgs<Row>> = {
   where: 'prisma',
   data: 'prisma',
+  // Field names, so hand-translated; prisma-compat narrows write results itself.
+  select: 'prisma',
+  omit: 'prisma',
   // `{ field, expected }`, and `field` is a FIELD NAME, so it has to be renamed
   // into turbine's naming space rather than copied. See THE ONE RULE above.
   optimisticLock: 'prisma',
@@ -194,6 +200,9 @@ export const UPDATE_MANY_OPTIONS: OptionTable<UpdateManyArgs<Row>> = {
 
 export const DELETE_OPTIONS: OptionTable<DeleteArgs<Row>> = {
   where: 'prisma',
+  // Field names, so hand-translated; prisma-compat narrows write results itself.
+  select: 'prisma',
+  omit: 'prisma',
   timeout: 'native',
   allowFullTableScan: 'native',
   skipGlobalFilters: 'native',
@@ -208,6 +217,9 @@ export const DELETE_MANY_OPTIONS: OptionTable<DeleteManyArgs<Row>> = {
 
 export const UPSERT_OPTIONS: OptionTable<UpsertArgs<Row>> = {
   where: 'prisma',
+  // Field names, so hand-translated; prisma-compat narrows write results itself.
+  select: 'prisma',
+  omit: 'prisma',
   create: 'prisma',
   update: 'prisma',
   timeout: 'native',

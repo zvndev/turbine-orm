@@ -23,12 +23,15 @@
  */
 
 import pg from '#pg';
+import { openCheckout } from './checkout.js';
+import { absorbCheckedOutErrors, settleLongIdleCheckouts } from './connection-guard.js';
 import { mergeConnectionStringOptions } from './connection-url.js';
 import { type Dialect, postgresDialect } from './dialect.js';
 import {
   ConnectionError,
   type ErrorMessageMode,
   errorMessageModesDiverged,
+  explainConnectionLoss,
   PipelineError,
   registerClientErrorMessageMode,
   runWithErrorMessageMode,
@@ -73,6 +76,7 @@ import {
 import {
   type ActiveSubscription,
   createSubscription,
+  type ListenOptions,
   type NotificationHandler,
   type Subscription,
   validateChannel,
@@ -977,29 +981,6 @@ const ISOLATION_LEVELS: Record<string, string> = Object.assign(Object.create(nul
  * loops, and a loop keyed on it would never fire for the commit-time conflicts
  * that are the main reason to run SERIALIZABLE at all.
  */
-/**
- * Check out a pooled connection, translating a driver failure into a typed
- * Turbine error.
- *
- * `pool.connect()` is where the first-run failures actually land: wrong
- * password (SQLSTATE 28P01), no such database (3D000), nothing listening
- * (ECONNREFUSED), an unverifiable TLS certificate. Unwrapped, every one of
- * those left `$transaction`, `transaction()` and `connect()` as a raw pg
- * `DatabaseError` carrying a SQLSTATE in `.code`, the same property Turbine
- * puts `TURBINE_E0NN` in, so the single error a new user is most likely to see
- * was the one error the typed-error contract did not cover.
- *
- * Query paths need no equivalent: `pool.query()` opens the connection itself
- * and rejects with the connect error, which the query boundary already wraps.
- */
-async function acquireConnection(pool: PgCompatPool): Promise<PgCompatPoolClient> {
-  try {
-    return await pool.connect();
-  } catch (err) {
-    throw wrapPgError(err);
-  }
-}
-
 async function runTxControl(client: PgCompatPoolClient, sql: string): Promise<void> {
   try {
     await client.query(sql);
@@ -1644,6 +1625,11 @@ export class TurbineClient {
       ownPool.on('error', (err) => {
         console.error('[turbine] Unexpected pool error:', err.message);
       });
+      absorbCheckedOutErrors(ownPool);
+      // After a freeze (a serverless function between invocations), wait one
+      // loop turn before reusing a long-idle connection, so the pool has read
+      // any close the server sent meanwhile. See connection-guard.ts.
+      settleLongIdleCheckouts(ownPool);
       this.pool = ownPool;
       this.ownsPool = true;
 
@@ -1676,6 +1662,8 @@ export class TurbineClient {
         replicaPool.on('error', (err) => {
           console.error('[turbine] Unexpected replica pool error:', err.message);
         });
+        absorbCheckedOutErrors(replicaPool);
+        settleLongIdleCheckouts(replicaPool);
         this.replicaPools.push(replicaPool);
         this.ownedReplicaPools.push(replicaPool);
       } else {
@@ -2472,19 +2460,15 @@ export class TurbineClient {
    * ```
    */
   async transaction<T>(fn: (client: PgCompatPoolClient) => Promise<T>): Promise<T> {
-    const client = await acquireConnection(this.pool);
-    /**
-     * Only true once BEGIN has actually succeeded. If BEGIN itself throws
-     * (e.g. a single-writer engine's transaction gate times out or rejects a
-     * re-entrant begin), issuing a "best-effort" ROLLBACK would be a stray
-     * statement from a context that never opened a transaction, on a driver
-     * with one shared engine handle (PowDB embedded) it would roll back a
-     * DIFFERENT caller's open transaction.
-     */
-    let began = false;
+    // BEGIN runs inside openCheckout, which sends it once more on a fresh
+    // connection when the first one turns out to be dead. A BEGIN that fails
+    // for good throws from there with the connection already released, so the
+    // catch below only ever sees a transaction that began: its ROLLBACK can
+    // never be a stray statement from a context that opened none, which on a
+    // driver with one shared engine handle (PowDB embedded) would roll back a
+    // DIFFERENT caller's open transaction.
+    const { client, checkout } = await openCheckout(this.pool, (c) => runTxControl(c, this.dialect.beginStatement()));
     try {
-      await runTxControl(client, this.dialect.beginStatement());
-      began = true;
       // Engine seam: single-writer engines scope their transaction re-entrancy
       // marker to the callback's async subtree (see
       // PgCompatPoolClient.wrapTransactionCallback). Absent everywhere else.
@@ -2494,16 +2478,14 @@ export class TurbineClient {
       await runTxControl(client, this.dialect.commitStatement());
       return result;
     } catch (err) {
-      if (began) {
-        try {
-          await client.query(this.dialect.rollbackStatement());
-        } catch {
-          // Best-effort rollback, the connection may have died mid-query.
-        }
+      try {
+        await client.query(this.dialect.rollbackStatement());
+      } catch {
+        // Best-effort rollback, the connection may have died mid-query.
       }
-      throw err;
+      throw explainConnectionLoss(err, checkout.lostWith);
     } finally {
-      client.release();
+      checkout.release();
     }
   }
 
@@ -2578,7 +2560,15 @@ export class TurbineClient {
     // Resolve the isolation level BEFORE taking a pool slot: a bad argument is
     // the caller's bug and should not cost a connection to discover.
     const isolationSql = resolveIsolationLevel(options?.isolationLevel);
-    const client = await acquireConnection(this.pool);
+    // BEGIN with optional isolation level, the dialect owns the keyword and
+    // BEGIN+isolation composition (Postgres appends ` ISOLATION LEVEL …`). It
+    // runs inside openCheckout, which sends it once more on a fresh connection
+    // when the first one turns out to be dead, and which releases the
+    // connection itself when BEGIN fails for good. So everything below runs in
+    // a transaction that began.
+    const { client, checkout } = await openCheckout(this.pool, (c) =>
+      runTxControl(c, this.dialect.beginStatement(isolationSql)),
+    );
     const timeout = options?.timeout;
 
     /**
@@ -2591,29 +2581,15 @@ export class TurbineClient {
       if (released) return;
       released = true;
       try {
-        client.release(err);
+        checkout.release(err);
       } catch {
         // pg may throw if the client is already released, swallow.
       }
     };
 
     let timedOut = false;
-    /**
-     * Only true once BEGIN has actually succeeded. If BEGIN itself throws -
-     * e.g. a single-writer engine's transaction gate times out in its FIFO
-     * queue or rejects a re-entrant begin (PowDB, E002/E017), this context
-     * never opened a transaction, so the catch below must NOT issue its
-     * best-effort ROLLBACK: on a driver with one shared engine handle that
-     * stray ROLLBACK would tear down a DIFFERENT caller's open transaction.
-     */
-    let began = false;
 
     try {
-      // BEGIN with optional isolation level, the dialect owns the keyword and
-      // BEGIN+isolation composition (Postgres appends ` ISOLATION LEVEL …`).
-      await runTxControl(client, this.dialect.beginStatement(isolationSql));
-      began = true;
-
       // Apply transaction-local session context (RLS / multi-tenant GUCs).
       // Order matters: BEGIN -> isolation level (above) -> set_config loop ->
       // user fn. Any error here propagates to the catch below and rolls back
@@ -2711,11 +2687,9 @@ export class TurbineClient {
       // If the timeout fired we already destroyed the connection, issuing a
       // ROLLBACK on a released client would throw "Client has already been
       // released". Skip the rollback in that case (the backend rolled back
-      // when its socket was closed). Likewise skip it when BEGIN never
-      // succeeded (`began` false), there is no transaction to roll back and
-      // the stray statement could hit another caller's transaction on a
-      // shared-handle engine.
-      if (began && !timedOut && !released) {
+      // when its socket was closed). A BEGIN that failed never gets here, see
+      // openCheckout above, so there is always a transaction to roll back.
+      if (!timedOut && !released) {
         try {
           await client.query(this.dialect.rollbackStatement());
         } catch {
@@ -2725,7 +2699,7 @@ export class TurbineClient {
       if (this.logging) {
         console.log('[turbine] Transaction rolled back');
       }
-      throw err;
+      throw explainConnectionLoss(err, checkout.lostWith);
     } finally {
       releaseOnce();
     }
@@ -2857,17 +2831,27 @@ export class TurbineClient {
    * cannot do this, `$listen` throws a `ConnectionError` rather than hang.
    * `$notify` works on every driver.
    *
+   * **Connection loss:** if the subscription's connection dies (a restart,
+   * failover, compute suspend, `pg_terminate_backend`), it reconnects with
+   * exponential backoff and re-issues `LISTEN`; `options.reconnect: false`
+   * ends it instead. Postgres does not hold notifications for a disconnected
+   * listener, so anything sent during the gap is lost: use
+   * `options.onReconnect` to resynchronise. `options.onError` receives the loss
+   * and each failed attempt (default: one `console.error` line each).
+   *
    * @example
    * ```ts
    * const sub = await db.$listen('order_created', (payload) => {
    *   const order = JSON.parse(payload);
    *   console.log('new order', order.id);
+   * }, {
+   *   onReconnect: () => refreshOrdersFromDatabase(),
    * });
    * // ...later
    * await sub.unsubscribe();
    * ```
    */
-  async $listen(channel: string, handler: NotificationHandler): Promise<Subscription> {
+  async $listen(channel: string, handler: NotificationHandler, options?: ListenOptions): Promise<Subscription> {
     if (!this.dialect.supportsListenNotify) {
       throw new UnsupportedFeatureError(
         '$listen (LISTEN/NOTIFY realtime)',
@@ -2882,9 +2866,16 @@ export class TurbineClient {
       console.log(`[turbine] LISTEN ${quoted}`);
     }
 
-    const sub = await createSubscription(this.pool, channel, quoted, handler, (closed) => {
-      this.activeSubscriptions.delete(closed);
-    });
+    const sub = await createSubscription(
+      this.pool,
+      channel,
+      quoted,
+      handler,
+      (closed) => {
+        this.activeSubscriptions.delete(closed);
+      },
+      options,
+    );
     this.activeSubscriptions.add(sub);
     return sub;
   }
@@ -2953,14 +2944,19 @@ export class TurbineClient {
    * Throws if the connection fails.
    */
   async connect(): Promise<void> {
-    const client = await acquireConnection(this.pool);
-    try {
-      await client.query('SELECT 1');
-      if (this.logging) {
-        console.log('[turbine] Connection verified');
+    // A connection the server closed while idle says nothing about whether
+    // the database is reachable, so the check runs on a fresh one when the
+    // first turns out to be dead (see openCheckout).
+    const { checkout } = await openCheckout(this.pool, async (client) => {
+      try {
+        await client.query('SELECT 1');
+      } catch (err) {
+        throw wrapPgError(err);
       }
-    } finally {
-      client.release();
+    });
+    checkout.release();
+    if (this.logging) {
+      console.log('[turbine] Connection verified');
     }
   }
 

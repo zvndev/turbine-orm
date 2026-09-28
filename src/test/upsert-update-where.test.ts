@@ -22,8 +22,10 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { Dialect } from '../dialect.js';
 import { postgresDialect } from '../dialect.js';
+import { UnsupportedFeatureError } from '../errors.js';
 import { mssqlDialect } from '../mssql.js';
 import { mysqlDialect } from '../mysql.js';
+import { UNSAFE } from '../query/index.js';
 import type { SchemaMetadata } from '../schema.js';
 import { sqliteDialect } from '../sqlite.js';
 import { makeQuery, mockTable } from './helpers.js';
@@ -73,7 +75,7 @@ function assertParamsAligned(dialect: Dialect, sql: string, params: unknown[]): 
   }
 }
 
-function buildTenantUpsert(dialect: Dialect) {
+function buildTenantUpsert(dialect: Dialect, extra: Record<string, unknown> = {}) {
   return makeQuery('users', schema(), {
     dialect,
     globalFilters: { users: { tenantId: 'acme' } },
@@ -81,6 +83,7 @@ function buildTenantUpsert(dialect: Dialect) {
     where: { id: 1 },
     create: { id: 1, name: 'x', tenantId: 'acme' } as never,
     update: { name: 'y' } as never,
+    ...extra,
   });
 }
 
@@ -93,41 +96,67 @@ const ENGINES: [name: string, dialect: Dialect][] = [
 
 describe('upsert conflict-UPDATE predicate: SQL and params agree', () => {
   for (const [name, dialect] of ENGINES) {
-    it(`${name}: no orphaned or unbound placeholders with a global filter`, () => {
-      const { sql, params } = buildTenantUpsert(dialect);
-      assertParamsAligned(dialect, sql, params);
-    });
+    // With the filter opted out every engine builds, so alignment is checked
+    // on all four; with it in force only the engines that can carry it build.
+    const variants: Array<[string, Record<string, unknown>]> = [
+      ['with the filter opted out', { skipGlobalFilters: UNSAFE }],
+      ...(dialect.supportsUpsertUpdateWhere ? [['with a global filter', {}] as [string, Record<string, unknown>]] : []),
+    ];
+    for (const [label, extra] of variants) {
+      it(`${name}: no orphaned or unbound placeholders ${label}`, () => {
+        const { sql, params } = buildTenantUpsert(dialect, extra);
+        assertParamsAligned(dialect, sql, params);
+      });
+    }
 
-    it(`${name}: emits a conflict-UPDATE predicate exactly when the flag claims it can`, () => {
-      const { sql, params } = buildTenantUpsert(dialect);
-      // The filter value is the LAST param when (and only when) the predicate
-      // was compiled: create params, then update params, then the filter's.
-      const filterBound = params.length === 5;
-      assert.equal(
-        filterBound,
-        dialect.supportsUpsertUpdateWhere === true,
-        `${name}: the filter param is bound iff supportsUpsertUpdateWhere is true (params: ${params.length})`,
-      );
-      if (dialect.supportsUpsertUpdateWhere) {
-        assert.ok(
-          sql.includes(`tenant_id`) && sql.includes(dialect.paramPlaceholder(5)),
-          `${name}: flag is true so the predicate must reach the SQL: ${sql}`,
-        );
+    it(`${name}: honours the filter on the conflict update, or refuses the upsert`, () => {
+      if (!dialect.supportsUpsertUpdateWhere) {
+        assert.throws(() => buildTenantUpsert(dialect), UnsupportedFeatureError);
+        return;
       }
+      const { sql, params } = buildTenantUpsert(dialect);
+      // The filter value is the LAST param: create params, then update params,
+      // then the filter's.
+      assert.equal(params.length, 5, `${name}: the filter param must be bound (params: ${params.length})`);
+      assert.ok(
+        sql.includes(`tenant_id`) && sql.includes(dialect.paramPlaceholder(5)),
+        `${name}: the predicate must reach the SQL: ${sql}`,
+      );
     });
   }
 
-  it('mysql drops the predicate and therefore reports the flag false', () => {
-    // ON DUPLICATE KEY UPDATE has no predicate slot.
+  // These two used to DROP the predicate and run the upsert anyway, so a
+  // tenant-scoped upsert whose key matched another tenant's row updated it.
+  it('mysql refuses a filtered upsert: ON DUPLICATE KEY UPDATE has no predicate slot', () => {
     assert.equal(mysqlDialect.supportsUpsertUpdateWhere, false);
-    assert.doesNotMatch(buildTenantUpsert(mysqlDialect).sql, /WHERE/);
+    assert.throws(
+      () => buildTenantUpsert(mysqlDialect),
+      (e: unknown) => {
+        assert.ok(e instanceof UnsupportedFeatureError);
+        assert.match(e.message, /global filter/);
+        assert.match(e.message, /skipGlobalFilters: UNSAFE/);
+        return true;
+      },
+    );
+    assert.doesNotMatch(buildTenantUpsert(mysqlDialect, { skipGlobalFilters: UNSAFE }).sql, /WHERE/);
   });
 
-  it('mssql drops the predicate and therefore reports the flag false', () => {
+  it('mssql refuses a filtered upsert: MERGE cannot take the predicate', () => {
     // MERGE's `WHEN MATCHED AND <pred>` cannot take the unqualified column
     // references the builder produces (ambiguous between the T and S aliases).
     assert.equal(mssqlDialect.supportsUpsertUpdateWhere, false);
-    assert.doesNotMatch(buildTenantUpsert(mssqlDialect).sql, /WHEN MATCHED AND/);
+    assert.throws(() => buildTenantUpsert(mssqlDialect), UnsupportedFeatureError);
+    assert.doesNotMatch(buildTenantUpsert(mssqlDialect, { skipGlobalFilters: UNSAFE }).sql, /WHEN MATCHED AND/);
+  });
+
+  it('a filter that compiles to nothing does not refuse', () => {
+    const q = makeQuery('users', schema(), {
+      dialect: mysqlDialect,
+      globalFilters: { users: () => ({ tenantId: undefined }) },
+    });
+    assert.doesNotThrow(() =>
+      q.buildUpsert({ where: { id: 1 }, create: { id: 1, name: 'x' } as never, update: { name: 'y' } as never }),
+    );
   });
 
   // The predicate is TABLE-QUALIFIED: inside `ON CONFLICT ... DO UPDATE ... WHERE`

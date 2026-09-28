@@ -1159,12 +1159,30 @@ export interface CreateArgs<
   T,
   // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
   R extends object = {},
+  S extends Record<string, boolean> | undefined = undefined,
+  O extends Record<string, boolean> | undefined = undefined,
 > {
   /**
    * Row data. On typed clients, relation names additionally accept nested
    * write ops ({@link NestedCreateOp}): `create` / `connect` / `connectOrCreate`.
    */
   data: CreateDataInput<T, R>;
+  /**
+   * Return only these fields of the written row, instead of the whole row.
+   * Keys are checked against `T` (see {@link FieldFlags}) and follow the read
+   * rules: an unknown name throws E003, a `select` must name at least one field,
+   * and it cannot be combined with `omit`. Narrows the `RETURNING` list itself,
+   * so the unselected columns never cross the wire, which is the point on a
+   * table with a large JSON or text column. Naming a PII-tagged column here is
+   * the explicit opt-in that returns it, exactly as on a read.
+   */
+  select?: S & FieldFlags<T, S>;
+  /**
+   * Return the written row without these fields. Same rules as `select`;
+   * PII-tagged columns stay excluded, as they are from every default write
+   * return.
+   */
+  omit?: O & FieldFlags<T, O>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
 }
@@ -1208,6 +1226,8 @@ export interface UpdateArgs<
   T,
   // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
   R extends object = {},
+  S extends Record<string, boolean> | undefined = undefined,
+  O extends Record<string, boolean> | undefined = undefined,
 > {
   /** Row selector. Keys are checked against `T` and `R` (see {@link WhereClause}). */
   where: WhereClause<T, R>;
@@ -1217,6 +1237,22 @@ export interface UpdateArgs<
    * / `disconnect` / `set` / `delete` / `update` / `upsert`.
    */
   data: UpdateDataInput<T, R>;
+  /**
+   * Return only these fields of the updated row, instead of the whole row.
+   * Keys are checked against `T` (see {@link FieldFlags}) and follow the read
+   * rules: an unknown name throws E003, a `select` must name at least one field,
+   * and it cannot be combined with `omit`. Narrows the `RETURNING` list itself,
+   * so the unselected columns never cross the wire, which is the point on a
+   * table with a large JSON or text column. Naming a PII-tagged column here is
+   * the explicit opt-in that returns it, exactly as on a read.
+   */
+  select?: S & FieldFlags<T, S>;
+  /**
+   * Return the updated row without these fields. Same rules as `select`;
+   * PII-tagged columns stay excluded, as they are from every default write
+   * return.
+   */
+  omit?: O & FieldFlags<T, O>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
   /**
@@ -1266,9 +1302,30 @@ export interface UpdateManyArgs<T, R extends object = {}> {
   skipGlobalFilters?: SkipGlobalFilters;
 }
 
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
-export interface DeleteArgs<T, R extends object = {}> {
+export interface DeleteArgs<
+  T,
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
+  R extends object = {},
+  S extends Record<string, boolean> | undefined = undefined,
+  O extends Record<string, boolean> | undefined = undefined,
+> {
   where: WhereClause<T, R>;
+  /**
+   * Return only these fields of the deleted row, instead of the whole row.
+   * Keys are checked against `T` (see {@link FieldFlags}) and follow the read
+   * rules: an unknown name throws E003, a `select` must name at least one field,
+   * and it cannot be combined with `omit`. Narrows the `RETURNING` list itself,
+   * so the unselected columns never cross the wire, which is the point on a
+   * table with a large JSON or text column. Naming a PII-tagged column here is
+   * the explicit opt-in that returns it, exactly as on a read.
+   */
+  select?: S & FieldFlags<T, S>;
+  /**
+   * Return the deleted row without these fields. Same rules as `select`;
+   * PII-tagged columns stay excluded, as they are from every default write
+   * return.
+   */
+  omit?: O & FieldFlags<T, O>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number;
   /** See {@link UpdateArgs.allowFullTableScan}. */
@@ -1288,9 +1345,30 @@ export interface DeleteManyArgs<T, R extends object = {}> {
   skipGlobalFilters?: SkipGlobalFilters;
 }
 
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
-export interface UpsertArgs<T, R extends object = {}> {
+export interface UpsertArgs<
+  T,
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
+  R extends object = {},
+  S extends Record<string, boolean> | undefined = undefined,
+  O extends Record<string, boolean> | undefined = undefined,
+> {
   where: WhereClause<T, R>;
+  /**
+   * Return only these fields of the inserted or updated row, instead of the whole row.
+   * Keys are checked against `T` (see {@link FieldFlags}) and follow the read
+   * rules: an unknown name throws E003, a `select` must name at least one field,
+   * and it cannot be combined with `omit`. Narrows the `RETURNING` list itself,
+   * so the unselected columns never cross the wire, which is the point on a
+   * table with a large JSON or text column. Naming a PII-tagged column here is
+   * the explicit opt-in that returns it, exactly as on a read.
+   */
+  select?: S & FieldFlags<T, S>;
+  /**
+   * Return the inserted or updated row without these fields. Same rules as `select`;
+   * PII-tagged columns stay excluded, as they are from every default write
+   * return.
+   */
+  omit?: O & FieldFlags<T, O>;
   /** The row to insert when `where` matches nothing. Plain values only: there is no stored value to operate on yet. */
   create: Partial<T>;
   /**

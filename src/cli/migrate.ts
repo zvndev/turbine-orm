@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import pg from 'pg';
 import type { DatabaseAdapter } from '../adapters/index.js';
 import { postgresql } from '../adapters/index.js';
+import { guardConnection } from '../connection-guard.js';
 import { isPlainSchemaIdentifier, parseSearchPathValue, withSearchPathOption } from '../connection-url.js';
 import { type Dialect, postgresDialect } from '../dialect.js';
 import { MigrationError, ValidationError } from '../errors.js';
@@ -1054,6 +1055,9 @@ async function connectMigrationClient(
   const inherited = schema === undefined || schema === '' ? [] : await probeConnectionSchemas(connectionString, schema);
   const pinned = connectionStringForSchema(connectionString, schema, inherited);
   const client = new pg.Client({ connectionString: pinned });
+  // Held for the whole run: a server restart must fail the migration with a
+  // message, not exit through an unheard 'error' event (connection-guard.ts).
+  guardConnection(client);
   await client.connect();
   return { client, connectionString: pinned };
 }
@@ -1067,6 +1071,7 @@ async function probeConnectionSchemas(connectionString: string, schema: string):
   // so in those terms, see assertPinnableSchema.
   assertPinnableSchema(schema);
   const probe = new pg.Client({ connectionString });
+  guardConnection(probe);
   await probe.connect();
   try {
     await assertSchemaExists(probe, schema);
@@ -1080,6 +1085,7 @@ async function probeConnectionSchemas(connectionString: string, schema: string):
 /** Open the second, lock-only connection. Separated so tests can fake it. */
 async function openLockConnection(connectionString: string): Promise<MigrationLockClient> {
   const client = new pg.Client({ connectionString });
+  guardConnection(client);
   await client.connect();
   return client;
 }

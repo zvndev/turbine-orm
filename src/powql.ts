@@ -36,6 +36,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { guardCheckout } from './connection-guard.js';
 import {
   NotFoundError,
   OptimisticLockError,
@@ -53,6 +54,7 @@ import {
 import type { PowdbPool } from './powdb.js';
 import {
   ALL_POWDB_CAPABILITIES,
+  atLeastVersion,
   baseTsType,
   coerceNativeValue,
   isJsonColumn,
@@ -61,6 +63,7 @@ import {
   type PowdbCapabilities,
   PowdbFloatParam,
   PowdbJsonParam,
+  parsePowdbSemver,
   powqlColumnType,
   quotePowqlDotted,
   quotePowqlIdent,
@@ -1484,6 +1487,38 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const pk = new Set(this.meta.primaryKey);
     for (const col of this.meta.columns) {
       if (col.pii && !pk.has(col.name)) delete (entity as Record<string, unknown>)[col.field];
+    }
+    return entity;
+  }
+
+  /**
+   * A single-row write's `select` / `omit`, resolved by {@link projectionPlan}
+   * so the rules and messages are the read path's, and the SQL engines' (an
+   * unknown name is E003, `select` must name something, the pair is refused).
+   * `undefined` for the default return shape. Resolved BEFORE the write is sent,
+   * so a bad projection writes nothing.
+   *
+   * The narrowing itself happens on the returned row ({@link shapeWriteRow}):
+   * PowQL's `returning` takes no column list (see {@link stripWritePii}), so
+   * unlike the SQL engines the unselected columns still cross the wire here.
+   * The RESULT is identical across engines; the byte saving is SQL-only.
+   */
+  private writeReturnPlan(args: {
+    select?: Record<string, boolean>;
+    omit?: Record<string, boolean>;
+  }): { cols: string[]; forcedPk: string[] } | undefined {
+    if (args.select === undefined && args.omit === undefined) return undefined;
+    return this.projectionPlan(args.select, args.omit, false);
+  }
+
+  /** Apply a write's return plan to its row, or the default PII strip without one. */
+  private shapeWriteRow(entity: T | null, plan: { cols: string[]; forcedPk: string[] } | undefined): T | null {
+    if (!entity || !plan) return this.stripWritePii(entity);
+    const keep = new Set(
+      plan.cols.filter((c) => !plan.forcedPk.includes(c)).map((c) => this.meta.reverseColumnMap[c] ?? c),
+    );
+    for (const key of Object.keys(entity)) {
+      if (!keep.has(key)) delete (entity as Record<string, unknown>)[key];
     }
     return entity;
   }
@@ -3115,6 +3150,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async create(args: CreateArgs<T>): Promise<T> {
     return this.withMiddleware('create', args as unknown as Record<string, unknown>, async () => {
+      const plan = this.writeReturnPlan(args);
       if (hasRelationFields(args.data as Record<string, unknown>, this.meta)) {
         return this.nestedCreate(args);
       }
@@ -3131,7 +3167,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         args.timeout,
         'create',
       );
-      const row = rows.length ? this.stripWritePii(this.shape(rows, native)[0]!) : null;
+      const row = rows.length ? this.shapeWriteRow(this.shape(rows, native)[0]!, plan) : null;
       if (!row) throw new NotFoundError({ table: this.table, where: data });
       return row;
     });
@@ -3216,6 +3252,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async update(args: UpdateArgs<T>): Promise<T> {
     return this.withMiddleware('update', args as unknown as Record<string, unknown>, async () => {
+      const plan = this.writeReturnPlan(args);
       if (hasRelationFields(args.data as Record<string, unknown>, this.meta)) {
         // The nested engine re-enters `update` / `findUnique` for the parent
         // row before it writes anything, so the identity rule below still runs
@@ -3258,7 +3295,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         args.timeout,
         'update',
       );
-      const row = rows.length ? this.stripWritePii(this.shape(rows, native)[0]!) : null;
+      const row = rows.length ? this.shapeWriteRow(this.shape(rows, native)[0]!, plan) : null;
       if (!row) {
         if (lock) {
           throw new OptimisticLockError({
@@ -3343,19 +3380,22 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   private async nestedCreate(args: CreateArgs<T>): Promise<T> {
     const data = args.data as Record<string, unknown>;
+    // Applied by the nested engine's final read-back, as on the SQL engines.
+    const shape = { select: args.select, omit: args.omit };
     if (this.isTxScoped()) {
-      return executeNestedCreate(this.buildNestedCtx(), this.table, data) as Promise<T>;
+      return executeNestedCreate(this.buildNestedCtx(), this.table, data, 0, [], shape) as Promise<T>;
     }
-    return this.runInImplicitTx((ctx) => executeNestedCreate(ctx, this.table, data)) as Promise<T>;
+    return this.runInImplicitTx((ctx) => executeNestedCreate(ctx, this.table, data, 0, [], shape)) as Promise<T>;
   }
 
   private async nestedUpdate(args: UpdateArgs<T>): Promise<T> {
     const data = args.data as Record<string, unknown>;
     const where = args.where as Record<string, unknown>;
+    const shape = { select: args.select, omit: args.omit };
     if (this.isTxScoped()) {
-      return executeNestedUpdate(this.buildNestedCtx(), this.table, where, data) as Promise<T>;
+      return executeNestedUpdate(this.buildNestedCtx(), this.table, where, data, 0, [], shape) as Promise<T>;
     }
-    return this.runInImplicitTx((ctx) => executeNestedUpdate(ctx, this.table, where, data)) as Promise<T>;
+    return this.runInImplicitTx((ctx) => executeNestedUpdate(ctx, this.table, where, data, 0, [], shape)) as Promise<T>;
   }
 
   /** Open a flat PowDB transaction on a pinned connection and run `fn` inside it. */
@@ -3368,6 +3408,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     // drifts from `powdbDialect`; falls back to the literal lowercase keywords.
     const d = this.options.dialect;
     const client = await this.pool.connect();
+    // A no-op today (PowDB checkouts have no event surface), kept so this path
+    // cannot become the one unguarded checkout if a transport ever emits 'error'.
+    const checkout = guardCheckout(client);
     let began = false;
     try {
       await client.query(d?.beginStatement?.() ?? 'begin');
@@ -3409,7 +3452,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       }
       throw err;
     } finally {
-      client.release();
+      checkout.release();
     }
   }
 
@@ -3425,6 +3468,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async delete(args: DeleteArgs<T>): Promise<T> {
     return this.withMiddleware('delete', args as unknown as Record<string, unknown>, async () => {
+      const plan = this.writeReturnPlan(args);
       const allowFullTableScan = resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan');
       const userWhere = this.expandedWhere(args.where);
       const params: unknown[] = [];
@@ -3440,7 +3484,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         args.timeout,
         'delete',
       );
-      const row = rows.length ? this.stripWritePii(this.shape(rows, native)[0]!) : null;
+      const row = rows.length ? this.shapeWriteRow(this.shape(rows, native)[0]!, plan) : null;
       if (!row) throw new NotFoundError({ table: this.table, where: args.where as Record<string, unknown> });
       return row;
     });
@@ -3467,13 +3511,46 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       // disagreeing about whether a query is VALID, which is the failure class
       // 0.64.0 and 0.72.0 were both spent on. Before `applyPkDefault`, so a
       // refused upsert mints no client-side UUID and sends nothing.
-      this.assertMutationIdentifiesOneRow(this.expandedWhere(args.where), false, 'upsert');
+      const upsertWhere = (this.expandedWhere(args.where) ?? {}) as Record<string, unknown>;
+      this.assertMutationIdentifiesOneRow(upsertWhere as WhereClause<T>, false, 'upsert');
+      const plan = this.writeReturnPlan(args);
       const createData = this.applyPkDefault(args.create as Record<string, unknown>);
       const pkCol = this.meta.primaryKey[0];
-      if (this.meta.primaryKey.length !== 1 || !pkCol) {
-        // PowQL's native `upsert … on .col` takes a single conflict column, so a
-        // composite PK falls back to an atomic reselect-or-write transaction.
-        return this.upsertComposite(createData, args.update as Record<string, unknown>);
+      // The conflict target is the columns `where` names, as on the SQL
+      // engines (`ON CONFLICT (<where keys>)`), with the conflicting VALUES
+      // taken from `create`. This path used to conflict on the primary key
+      // whatever `where` named, so an upsert keyed on another unique column
+      // (`where: { email }`) never found the existing row.
+      const conflictColumns = Object.keys(upsertWhere)
+        .filter((k) => upsertWhere[k] !== undefined)
+        .map((k) => this.column(k).name);
+      // PowQL's native `upsert … on .col` expresses exactly one shape: a single
+      // conflict column that is the primary key, with no predicate on its
+      // conflict branch. Everything else is an atomic reselect-or-write
+      // transaction.
+      //
+      // That includes a table under a global filter. The native statement's
+      // `on conflict` branch carries no predicate, so a tenant-scoped client
+      // whose `create` key matched ANOTHER tenant's row updated that row, and
+      // the tenant-filtered reselect then reported the write it had just made
+      // as a NotFoundError. The SQL engines guard the same branch with the
+      // filter (`DO UPDATE … WHERE tenant_id = $n`). The lookup-first path runs
+      // its find and its update through the filtered interface, so another
+      // tenant's row is invisible to it: the insert then collides on the key
+      // and fails, as it does on the SQL engines, and nothing is overwritten.
+      const filtered = this.applyGlobalFilter('', [], args.skipGlobalFilters) !== '';
+      const native =
+        this.meta.primaryKey.length === 1 &&
+        pkCol !== undefined &&
+        conflictColumns.length === 1 &&
+        conflictColumns[0] === pkCol &&
+        !filtered;
+      if (!native) {
+        return this.upsertLookupFirst(createData, args.update as Record<string, unknown>, conflictColumns, {
+          select: args.select,
+          omit: args.omit,
+          skipGlobalFilters: args.skipGlobalFilters,
+        });
       }
       const params: unknown[] = [];
       const createBody = this.scalarData(createData)
@@ -3491,42 +3568,69 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         'upsert',
       );
       const pkField = this.meta.reverseColumnMap[pkCol] ?? pkCol;
-      // Either spelling, as `upsertComposite` already does below: reading the
+      // Either spelling, as `upsertLookupFirst` already does below: reading the
       // camelCase field alone reselected `undefined` for a snake-spelled PK and
       // reported a write that had SUCCEEDED as a NotFoundError.
-      const row = await this.reselectByPk(createData[pkField] ?? createData[pkCol], args.timeout);
+      // `args` carries skipGlobalFilters too: an upsert that opted out of the
+      // filter must not have its own write filtered out of the reselect.
+      const row = await this.reselectByPk(createData[pkField] ?? createData[pkCol], args.timeout, args);
       if (!row) throw new NotFoundError({ table: this.table, where: createData });
-      return row;
+      // Without a plan the reselect's default projection already left PII out.
+      return plan ? (this.shapeWriteRow(row, plan) as T) : row;
     });
   }
 
   /**
-   * Composite-key upsert: PowQL's `upsert … on .col` only takes one conflict
-   * column, so reselect by the full composite PK and update-or-create inside one
-   * flat transaction (PowDB single-writer makes the read-then-write safe from
-   * concurrent writers; the transaction makes it atomic with the write).
+   * Upsert as a reselect-or-write inside one flat transaction, for every shape
+   * the native `upsert … on .col` statement cannot express: a conflict target
+   * other than a single-column primary key (it takes one column and PowDB has
+   * no composite unique), and a table under a global filter (its conflict
+   * branch takes no predicate). PowDB's single writer makes the read-then-write
+   * safe from concurrent writers; the transaction makes it atomic with the
+   * write.
+   *
+   * The row is looked up by the conflict columns with `create`'s values for
+   * them, which is what `ON CONFLICT (<cols>)` compares on the SQL engines. The
+   * find and the update run through the transaction's table interface, so a
+   * configured global filter applies to both exactly as it does to any other
+   * read or write, and `skipGlobalFilters` is forwarded to both.
    */
-  private async upsertComposite(createData: Record<string, unknown>, updateData: Record<string, unknown>): Promise<T> {
+  private async upsertLookupFirst(
+    createData: Record<string, unknown>,
+    updateData: Record<string, unknown>,
+    conflictColumns: readonly string[],
+    shape: { select?: Record<string, boolean>; omit?: Record<string, boolean>; skipGlobalFilters?: unknown },
+  ): Promise<T> {
+    const { skipGlobalFilters, ...projection } = shape;
+    const skip = skipGlobalFilters === undefined ? {} : { skipGlobalFilters };
     // Accept either the camelCase field or the snake_case column in `create`
     // (create() resolves both), and key the where by field name.
-    const pkPairs = this.meta.primaryKey.map((pk) => {
-      const field = this.meta.reverseColumnMap[pk] ?? pk;
-      return { field, value: createData[field] ?? createData[pk] };
+    const keyPairs = conflictColumns.map((col) => {
+      const field = this.meta.reverseColumnMap[col] ?? col;
+      return { field, value: createData[field] ?? createData[col] };
     });
-    if (pkPairs.some((p) => p.value == null)) {
+    const keyless = keyPairs.some((p) => p.value == null);
+    const isCompositePk =
+      keyPairs.length > 1 &&
+      keyPairs.length === this.meta.primaryKey.length &&
+      conflictColumns.every((c) => this.meta.primaryKey.includes(c));
+    if (keyless && isCompositePk) {
       throw new ValidationError(
-        `upsert on "${this.table}" needs every composite-PK field in \`create\` (${pkPairs
+        `upsert on "${this.table}" needs every composite-PK field in \`create\` (${keyPairs
           .map((p) => p.field)
           .join(', ')}).`,
       );
     }
-    const pkWhere = Object.fromEntries(pkPairs.map((p) => [p.field, p.value]));
+    const keyWhere = Object.fromEntries(keyPairs.map((p) => [p.field, p.value]));
     const run = async (ctx: NestedWriteContext): Promise<T> => {
       const tbl = ctx.tx.table<T>(this.table);
-      const existing = await tbl.findUnique({ where: pkWhere });
+      // A row whose `create` leaves a conflict column unset cannot collide on
+      // it (NULL never equals NULL in a unique index, and a server-assigned key
+      // is new), which is what `ON CONFLICT` concludes on the SQL engines too.
+      const existing = keyless ? null : await tbl.findUnique({ where: keyWhere, ...skip } as never);
       return existing
-        ? ((await tbl.update({ where: pkWhere, data: updateData })) as T)
-        : ((await tbl.create({ data: createData as Partial<T> })) as T);
+        ? ((await tbl.update({ where: keyWhere, data: updateData, ...projection, ...skip } as never)) as T)
+        : ((await tbl.create({ data: createData as Partial<T>, ...projection })) as T);
     };
     return this.isTxScoped() ? run(this.buildNestedCtx()) : this.runInImplicitTx(run);
   }
@@ -3581,40 +3685,81 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     );
   }
 
+  /**
+   * Can `aggregate()` compute several aggregates in ONE statement on this engine?
+   *
+   * PowQL refuses a bare multi-aggregate projection (`T { a: sum(.x), b: sum(.y) }`
+   * is "aggregate function in an unsupported position" on every engine version),
+   * so the only one-statement form is a grouping over a literal key,
+   * `T filter … group 1 { agg_0: sum(.x), agg_1: sum(.y) }`, which yields a
+   * single group holding every row the filter matched. Measured against the
+   * embedded addon at 0.7.1 through 0.28: below 0.13 a literal group key does not
+   * parse, from 0.13 to 0.19.1 the grouped per-field `count` disagrees with the
+   * scalar `count(T { .col })` on a nullable column, and from 0.20 every
+   * aggregate kind (count / sum / avg / min / max over int, float, str, an
+   * all-null column, and several filters) answers identically on both wires.
+   *
+   * Derived from the PROBED engine version rather than from a capability flag,
+   * so an unprobed pool (`engineVersion: null`, e.g. an injected pool carrying
+   * {@link ALL_POWDB_CAPABILITIES}) keeps the per-field statements: this changes
+   * the emitted PowQL, and an older engine would reject it outright, the same
+   * probe-only discipline `nestedProjections` follows.
+   */
+  private get groupsAggregatesInOneStatement(): boolean {
+    const sem = parsePowdbSemver(this.capabilities.engineVersion);
+    return sem !== null && atLeastVersion(sem, 0, 20);
+  }
+
   async aggregate(args: AggregateArgs<T>): Promise<AggregateResult<T>> {
     this.assertNoForceCustomPlan(args);
     return this.withMiddleware('aggregate', args as unknown as Record<string, unknown>, async () => {
-      // One scalar query per aggregate, PowDB's bare-projection aggregate is broken.
       const result: AggregateResult<T> = {};
       const filterParams: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
       let where = this.buildWhere(resolvedWhere, filterParams);
       where = this.applyGlobalFilter(where, filterParams, args.skipGlobalFilters);
       const filter = where ? ` filter ${where}` : '';
-      const scalar = async (expr: string): Promise<number | null> => {
-        const params = [...filterParams];
-        const { rows } = await this.exec(expr, params, args.timeout, 'aggregate');
-        const v = rows[0]?.value;
-        return v == null || v === 'null' ? null : Number(v);
-      };
+
+      // Plan every requested aggregate before any statement runs, so every
+      // refusal (unknown column, the nullable per-field count gate, the PII
+      // opt-in) fires with nothing sent. Each entry carries both spellings of
+      // the same aggregate: the standalone scalar statement and the inner
+      // expression of the one-statement form. `result`'s buckets are created
+      // here, in the order the result has always had.
+      type Planned = { scalar: string; inner: string; assign: (v: number | null) => void };
+      const plan: Planned[] = [];
       if (args._count) {
         if (args._count === true) {
-          result._count = (await scalar(`count(${this.qt}${filter})`)) ?? 0;
+          plan.push({
+            scalar: `count(${this.qt}${filter})`,
+            inner: 'count(*)',
+            assign: (v) => {
+              result._count = v ?? 0;
+            },
+          });
         } else {
           const counts: Record<string, number> = {};
+          result._count = counts;
           for (const field of Object.keys(args._count).filter((f) => (args._count as Record<string, boolean>)[f])) {
             this.assertProjectedCountSupported(field);
-            counts[field] = (await scalar(`count(${this.qt}${filter} { ${this.ref(field)} })`)) ?? 0;
+            const ref = this.ref(field);
+            plan.push({
+              scalar: `count(${this.qt}${filter} { ${ref} })`,
+              inner: `count(${ref})`,
+              assign: (v) => {
+                counts[field] = v ?? 0;
+              },
+            });
           }
-          result._count = counts;
         }
       }
       for (const fn of ['_sum', '_avg', '_min', '_max'] as const) {
         const spec = args[fn];
         if (!spec) continue;
         const acc: Record<string, number | null> = {};
+        (result as Record<string, unknown>)[fn] = acc;
+        const powfn = fn.slice(1); // sum/avg/min/max
         for (const field of Object.keys(spec).filter((f) => (spec as Record<string, boolean>)[f])) {
-          const powfn = fn.slice(1); // sum/avg/min/max
           // Same PII contract as the SQL engines: _min/_max return a stored cell.
           if (fn === '_min' || fn === '_max') {
             assertAggregatePiiOptIn(
@@ -3626,9 +3771,43 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
               resolveUnsafeFlag(args.includePii, 'includePii'),
             );
           }
-          acc[field] = await scalar(`${powfn}(${this.qt}${filter} { ${this.ref(field)} })`);
+          const ref = this.ref(field);
+          plan.push({
+            scalar: `${powfn}(${this.qt}${filter} { ${ref} })`,
+            inner: `${powfn}(${ref})`,
+            assign: (v) => {
+              acc[field] = v;
+            },
+          });
         }
-        (result as Record<string, unknown>)[fn] = acc;
+      }
+
+      // A scalar cell and a grouped cell decode through the same wire decoder,
+      // so one coercion serves both forms.
+      const toNumber = (v: unknown): number | null => (v == null || v === 'null' ? null : Number(v));
+
+      if (plan.length > 1 && this.groupsAggregatesInOneStatement) {
+        const proj = plan.map((p, i) => `agg_${i}: ${p.inner}`).join(', ');
+        const { rows } = await this.exec(
+          `${this.qt}${filter} group 1 { ${proj} }`,
+          [...filterParams],
+          args.timeout,
+          'aggregate',
+        );
+        // Zero groups means the filter matched no row. The per-field statements
+        // below answer that case instead of a synthesized one, because what an
+        // aggregate over NO rows returns is engine-versioned (`sum` answered 0
+        // before PowDB 0.28 and null since), and the scalar form is the one
+        // whose answer this method has always returned.
+        const row = rows.length === 1 ? rows[0] : undefined;
+        if (row) {
+          for (const [i, p] of plan.entries()) p.assign(toNumber(row[`agg_${i}`]));
+          return result;
+        }
+      }
+      for (const p of plan) {
+        const { rows } = await this.exec(p.scalar, [...filterParams], args.timeout, 'aggregate');
+        p.assign(toNumber(rows[0]?.value));
       }
       return result;
     });
@@ -4100,12 +4279,19 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   // -------------------------------------------------------------------------
 
   /** Reselect a single row by its single-column primary key value. */
-  private async reselectByPk(pkValue: unknown, timeout?: number): Promise<T | null> {
+  private async reselectByPk(
+    pkValue: unknown,
+    timeout?: number,
+    shape?: { select?: Record<string, boolean>; omit?: Record<string, boolean>; skipGlobalFilters?: unknown },
+  ): Promise<T | null> {
     const pkField = this.meta.reverseColumnMap[this.meta.primaryKey[0]!] ?? this.meta.primaryKey[0]!;
     const { rows, native } = await this.runFind({
       where: { [pkField]: pkValue } as WhereClause<T>,
       limit: 1,
       timeout,
+      select: shape?.select,
+      omit: shape?.omit,
+      ...(shape?.skipGlobalFilters === undefined ? {} : { skipGlobalFilters: shape.skipGlobalFilters }),
     } as FindManyArgs<T>);
     return rows.length ? this.shape(rows, native)[0]! : null;
   }

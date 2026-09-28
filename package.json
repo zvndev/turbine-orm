@@ -1,6 +1,6 @@
 {
   "name": "turbine-orm",
-  "version": "0.79.1",
+  "version": "0.80.0",
   "description": "Postgres-native TypeScript ORM, runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. One dependency, no WASM engine",
   "type": "module",
   "//exports": "Each subpath declares its types PER CONDITION. A single shared top-level \"types\" resolves to the ESM declarations for `require` too, which is TS1479 (\"is an ES module ... cannot be require()d\") for any CJS consumer on moduleResolution node16/nodenext. The require condition points at dist/cjs, which ships its own {\"type\":\"commonjs\"} package.json, so those declarations are CJS declarations. Gated in CI by publint + @arethetypeswrong/cli + a real .cts consumer typecheck (see the package-types job in ci.yml).",
@@ -176,7 +176,9 @@
     "check:package-types": "node scripts/check-no-pg-types.mjs",
     "//check:edge": "The edge-runtime gate for turbine-orm/serverless: bundles dist/serverless.js (the ESM build, which is what edge bundlers resolve) with esbuild under the edge-light/worker/browser conditions and fails on any pg-family import, any Node builtin but node:async_hooks, or any other package. Every other gate here runs on Node, which is how a static `import pg from 'pg'` in a shared module broke every edge build while CI stayed green. A CONTROL bundle under Node conditions must reach pg first, or the scan refuses to pass. Reads dist/, so it runs after `npm run build`: in prepublishOnly, and in the build job of ci.yml and the test job of release.yml.",
     "check:edge": "node scripts/check-edge-bundle.mjs",
-    "prepublishOnly": "npm run build && npm run typecheck && npm run lint && npm run test:unit && npm run test:coverage:cli && npm run check:error-codes && npm run check:error-prefix && npm run check:changelog && npm run check:cycles && npm run check:skip-gates && npm run check:private-terms && npm run check:package && npm run check:package-types && npm run check:edge && npm run size && npm run check:release-tests",
+    "//check:pg-floor": "Installs the packed tarball next to EXACTLY the floor of dependencies.pg and imports every published entry point under both import and require. CI and dev machines only ever install the newest pg in range, so the floor is otherwise never exercised: a ^8.13.1 range shipped code that read pg.utils at load time, which pg first exports in 8.15.0, and 6 of the 8 entry points failed to import on 8.13 and 8.14. Packs dist/ itself when given no tarball, so it runs after `npm run build`. Called from prepublishOnly and from the pack-smoke job of both ci.yml and release.yml.",
+    "check:pg-floor": "node scripts/check-pg-floor.mjs",
+    "prepublishOnly": "npm run build && npm run typecheck && npm run lint && npm run test:unit && npm run test:coverage:cli && npm run check:error-codes && npm run check:error-prefix && npm run check:changelog && npm run check:cycles && npm run check:skip-gates && npm run check:private-terms && npm run check:package && npm run check:package-types && npm run check:edge && npm run check:pg-floor && npm run size && npm run check:release-tests",
     "prepare": "node scripts/prepare.mjs",
     "prepack": "node scripts/strip-prepare.mjs",
     "postpack": "node scripts/restore-prepare.mjs",
@@ -200,7 +202,7 @@
   },
   "//dependencies": "EXACTLY ONE runtime dependency, `pg`. `@types/pg` sat here until 0.70.0 because the published declarations named `pg.Pool` / `pg.PoolClient` / `pg.QueryResult`, which makes a types-only package a hard requirement for every consumer compiling under strict (the v0.28.1 regression). The declaration surface is now pg-free (see src/pg-types.ts) and the `consumer-types` CI job proves it against the real tarball, so the types package is a devDependency. The order is one-way: clear the surface FIRST, then move the dependency.",
   "dependencies": {
-    "pg": "^8.13.1"
+    "pg": "^8.15.0"
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.2",

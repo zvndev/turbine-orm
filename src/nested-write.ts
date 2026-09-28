@@ -1084,12 +1084,24 @@ function rethrowAsNotRelated(err: unknown, op: string, relName: string, rel: Rel
  * operation (create, connect, connectOrCreate), and finally reads back the
  * full tree using `findUnique` with an auto-built `with` clause.
  */
+/**
+ * The caller's `select` / `omit` for the TOP-LEVEL row of a nested write. Only
+ * the final read-back applies it (see executeNestedCreate), so it narrows the
+ * returned scalars exactly as it does on a read, while every intermediate
+ * statement keeps the full row it needs for keys.
+ */
+export interface NestedReturnShape {
+  select?: Record<string, boolean>;
+  omit?: Record<string, boolean>;
+}
+
 export async function executeNestedCreate(
   ctx: NestedWriteContext,
   tableName: string,
   data: Record<string, unknown>,
   depth = 0,
   path: string[] = [],
+  returnShape?: NestedReturnShape,
 ): Promise<Record<string, unknown>> {
   if (depth > MAX_DEPTH) {
     throw new CircularRelationError(path);
@@ -1164,6 +1176,7 @@ export async function executeNestedCreate(
   const fullRow = await ctx.tx.table(tableName).findUnique({
     where: pkWhere(tableMeta, parentRow),
     with: withClause,
+    ...returnShape,
   });
 
   return (fullRow ?? parentRow) as Record<string, unknown>;
@@ -1185,6 +1198,7 @@ export async function executeNestedUpdate(
   data: Record<string, unknown>,
   depth = 0,
   path: string[] = [],
+  returnShape?: NestedReturnShape,
 ): Promise<Record<string, unknown>> {
   if (depth > MAX_DEPTH) {
     throw new CircularRelationError(path);
@@ -1296,6 +1310,7 @@ export async function executeNestedUpdate(
   const fullRow = await ctx.tx.table(tableName).findUnique({
     where: pkWhere(tableMeta, parentRow),
     with: readBackWith(ctx.schema, tableName, relations),
+    ...returnShape,
   });
 
   return (fullRow ?? parentRow) as Record<string, unknown>;

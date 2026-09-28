@@ -27,7 +27,7 @@ users[0].posts[0].comments[0].author.name
 //                                  ^ autocompletes
 
 // Everything between your code and Postgres:
-//   "dependencies": { "pg": "^8.13.1" }`;
+//   "dependencies": { "pg": "^8.15.0" }`;
 
 const sqlCode = `SELECT "users"."id", "users"."name", "users"."email",
   (SELECT COALESCE(json_agg(json_build_array(
@@ -71,8 +71,8 @@ const pillars = [
   {
     title: 'Small enough for the edge',
     description:
-      'The main entry is held under 91 kB brotli as an import graph with pg external, the edge entry under 72 kB, enforced by size-limit in CI. One import swap runs the same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase. No separate serverless build, no WASM bundle in your cold start.',
-    stat: '91 kB',
+      'The main entry is held under 93 kB brotli as an import graph with pg external, the edge entry under 74 kB, enforced by size-limit in CI. One import swap runs the same API on Neon, Vercel Postgres, Cloudflare Hyperdrive, and Supabase. No separate serverless build, no WASM bundle in your cold start.',
+    stat: '93 kB',
     statLabel: 'CI-enforced ceiling',
   },
   {
@@ -667,7 +667,7 @@ export default async function Home() {
                 ['Runtime deps', '1 (pg)', '@prisma/client + required driver adapter', '0'],
                 [
                   'Main bundle (brotli)',
-                  'under 91 KB import graph, pg external',
+                  'under 93 KB import graph, pg external',
                   '~1.6 MB client (TS/WASM compiler)',
                   '~7 KB core',
                 ],
@@ -676,7 +676,7 @@ export default async function Home() {
                 ['MCP server for agents', '11 read-only tools, PII-redacted', 'Official MCP server', 'drizzle-kit mcp'],
                 ['Error PII safety', 'Keys only by default', 'Values in messages', 'Raw pg errors'],
                 ['Migrations', 'SQL-first, SHA-256 drift detection', 'DSL-generated, shadow DB', 'SQL or Drizzle Kit'],
-                ['Edge runtime', 'One import swap, under 72 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
+                ['Edge runtime', 'One import swap, under 74 KB brotli', 'Driver adapter + WASM compiler', 'Native'],
                 ['Pipeline batching', 'Parse/Bind/Execute protocol', 'Sequential in txn', 'Sequential'],
                 ['Typed errors', 'isRetryable discriminant', 'Error codes only', 'None'],
                 [

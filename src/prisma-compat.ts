@@ -1234,6 +1234,21 @@ function resolveWriteProjection(
   return NO_WRITE_PROJECTION;
 }
 
+/**
+ * The same projection in core's spelling, for the write itself. Passed DOWN so
+ * the SQL engines narrow the RETURNING list rather than fetching the whole row
+ * for {@link applyWriteProjection} to trim afterwards, which on a table with a
+ * large JSON column was most of the bytes the write moved. The trim stays: it
+ * is what keeps the result Prisma-shaped on every path, including the
+ * lookup-first upsert and PowDB, whose `returning` takes no column list.
+ */
+function coreWriteProjection(mm: PrismaModelMap, proj: WriteProjection): Args {
+  const spell = (keys: ReadonlySet<string>) => Object.fromEntries([...keys].map((k) => [renameField(mm, k), true]));
+  if (proj.pick) return { select: spell(proj.pick) };
+  if (proj.omit) return { omit: spell(proj.omit) };
+  return {};
+}
+
 /** Apply a {@link WriteProjection} to one already-reshaped write result row. */
 function applyWriteProjection(proj: WriteProjection, row: unknown): unknown {
   if (!isPlainObject(row)) return row;
@@ -2238,8 +2253,11 @@ function upsertKeysMatch(t: Args): boolean {
 /** Prisma upsert semantics: look up by where; update the found row, else insert create. */
 async function upsertLookupFirst(qi: CompatQueryInterface, t: Args): Promise<unknown> {
   const existing = await qi.findUnique({ where: t.where });
-  if (existing) return qi.update({ where: t.where, data: t.update });
-  return qi.create({ data: t.create });
+  // The projection rides along so both branches return what the native upsert
+  // path returns (an explicitly selected PII field included).
+  const shape = { select: t.select, omit: t.omit };
+  if (existing) return qi.update({ where: t.where, data: t.update, ...shape });
+  return qi.create({ data: t.create, ...shape });
 }
 
 /**
@@ -2410,7 +2428,10 @@ function makeDelegate(
         args,
         () => {
           proj = resolveWriteProjection(ctx, mm, 'create', args as Args);
-          const t: Args = { data: translateWriteData(ctx, mm, applyCreateDefaults(mm, (args as Args).data)) };
+          const t: Args = {
+            data: translateWriteData(ctx, mm, applyCreateDefaults(mm, (args as Args).data)),
+            ...coreWriteProjection(mm, proj),
+          };
           applyNativeOptions(CREATE_OPTIONS, args as Args, t);
           return t;
         },
@@ -2466,6 +2487,7 @@ function makeDelegate(
           const t: Args = {
             where: translateWhere(ctx, mm, a.where),
             data: translateWriteData(ctx, mm, applyUpdateTouch(mm, a.data)),
+            ...coreWriteProjection(mm, proj),
           };
           applyNativeOptions(UPDATE_OPTIONS, a, t);
           // `optimisticLock.field` is a FIELD NAME, so it is renamed rather than
@@ -2517,7 +2539,7 @@ function makeDelegate(
         () => {
           const a = requireWhere(args, 'delete');
           proj = resolveWriteProjection(ctx, mm, 'delete', a);
-          const t: Args = { where: translateWhere(ctx, mm, a.where) };
+          const t: Args = { where: translateWhere(ctx, mm, a.where), ...coreWriteProjection(mm, proj) };
           applyNativeOptions(DELETE_OPTIONS, a, t);
           return t;
         },
@@ -2554,6 +2576,7 @@ function makeDelegate(
             where: translateWhere(ctx, mm, a.where),
             create: translateWriteData(ctx, mm, applyCreateDefaults(mm, a.create)),
             update: translateWriteData(ctx, mm, applyUpdateTouch(mm, a.update)),
+            ...coreWriteProjection(mm, proj),
           };
           applyNativeOptions(UPSERT_OPTIONS, a, t);
           return t;

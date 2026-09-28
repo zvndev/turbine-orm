@@ -7,6 +7,7 @@
 
 import pg from 'pg';
 import { DESTRUCTIVE_KIND_LABEL, type DestructiveStatement, scanDestructiveSql } from './cli/destructive.js';
+import { guardConnection } from './connection-guard.js';
 import { type Dialect, postgresDialect } from './dialect.js';
 import { UnsupportedFeatureError, ValidationError } from './errors.js';
 import { pgConfActionToReferential, stripCheckWrapper } from './introspect.js';
@@ -830,6 +831,9 @@ export async function schemaDiff(
   // `pgSchema` because `schema` is already the SchemaDef in this function.
   const pgSchema = options.schema ?? 'public';
   const client = new pg.Client({ connectionString });
+  // A bare client with no 'error' listener exits the process if the server
+  // drops it mid-diff; guarded, the pending query rejects instead.
+  guardConnection(client);
   await client.connect();
 
   try {
@@ -2018,6 +2022,8 @@ export async function schemaPush(
 
   // Execute all statements in a transaction
   const client = new pg.Client({ connectionString });
+  // Same as schemaDiff: a dropped connection must reject the push, not exit.
+  guardConnection(client);
   await client.connect();
 
   try {

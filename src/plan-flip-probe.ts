@@ -77,6 +77,7 @@
  * @module
  */
 
+import { guardConnection } from './connection-guard.js';
 import type { PlanDivergenceFinding, PlanDivergenceReport } from './plan-divergence.js';
 import { quoteIdent } from './query/utils.js';
 
@@ -285,6 +286,9 @@ export async function probePlanFlips(options: ProbePlanFlipsOptions): Promise<Fl
 
   const { Client } = (await import('pg')).default;
   const client = new Client({ connectionString: options.connectionString }) as unknown as MinimalClient;
+  // A dropped connection must fail the probe (which then reports 'unknown'),
+  // not exit the process through an unheard 'error' event.
+  guardConnection(client);
 
   try {
     await client.connect();

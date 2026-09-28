@@ -41,6 +41,7 @@ import {
 import { tmpdir } from 'node:os';
 import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { guardConnection } from '../connection-guard.js';
 import { detectPooler, parseSearchPathValue, poolerRefusalMessage } from '../connection-url.js';
 import { ValidationError } from '../errors.js';
 import { generate, generatePrismaMap, resolveImportExtension } from '../generate.js';
@@ -1389,6 +1390,7 @@ async function probeDatabase(url: string, schema: string): Promise<InitDatabaseP
   try {
     const { default: pg } = await import('pg');
     const client = new pg.Client({ connectionString: url });
+    guardConnection(client);
     await client.connect();
     let tableCount = 0;
     try {
@@ -3730,6 +3732,7 @@ async function seedConnectionString(config: ResolvedConfig): Promise<string> {
   assertPinnableSchema(schema);
   const { default: pg } = await import('pg');
   const probe = new pg.Client({ connectionString: config.url });
+  guardConnection(probe);
   await probe.connect();
   let inherited: string[];
   try {
@@ -3806,6 +3809,7 @@ async function runSeedPlan(plan: SeedExecutionPlan, config: ResolvedConfig): Pro
     const url = seedUrl ?? requireUrl(config);
     const { default: pg } = await import('pg');
     const client = new pg.Client({ connectionString: url });
+    guardConnection(client);
     await client.connect();
     try {
       await client.query(readFileSync(plan.file, 'utf-8'));

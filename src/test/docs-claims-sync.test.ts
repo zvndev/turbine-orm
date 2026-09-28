@@ -56,6 +56,27 @@ describe('documented numbers match their source of truth', () => {
     );
   });
 
+  it('README.md and the landing page quote the real pg dependency range', () => {
+    const pkg = JSON.parse(read('package.json')) as { dependencies?: Record<string, string> };
+    const range = pkg.dependencies?.pg;
+    assert.ok(range, 'package.json must declare pg as a dependency; this assertion cannot pass vacuously');
+
+    // The range is what a consumer's installer honours, and its floor is the
+    // oldest pg the package claims to import cleanly (scripts/check-pg-floor.mjs
+    // proves that claim against the packed tarball). A document quoting an older
+    // floor is advertising a version that crashes on import.
+    for (const file of ['README.md', 'site/app/page.tsx']) {
+      const quoted = [...read(file).matchAll(/"pg":\s*"([^"]+)"/g)].map((m) => m[1]);
+      assert.ok(
+        quoted.length > 0,
+        `${file} no longer quotes the pg range; drop it from this list if that is deliberate`,
+      );
+      for (const q of quoted) {
+        assert.equal(q, range, `${file} quotes "pg": "${q}" but package.json declares "${range}"`);
+      }
+    }
+  });
+
   it('CONTRIBUTING.md states the real error-code range', () => {
     const codes = Object.values(TurbineErrorCode).map((c) => Number(String(c).replace('TURBINE_E', '')));
     assert.ok(codes.length > 0 && codes.every(Number.isFinite), 'TurbineErrorCode must yield numeric codes');

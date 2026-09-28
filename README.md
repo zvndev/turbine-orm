@@ -18,7 +18,7 @@ Turbine is **pre-1.0** (`0.x`). Which surfaces hold steady across minors, which 
 
 Six reasons, each with the mechanism that makes it true:
 
-1. **One dependency.** `dependencies` is `{ "pg": "^8.13.1" }`. No engine binary, no WASM compiler, no adapter packages in lockstep. The optional engines (SQLite, MySQL, SQL Server, PowDB, all tiered Experimental in [STABILITY.md](STABILITY.md)) are peer dependencies or Node builtins you install only if you use them.
+1. **One dependency.** `dependencies` is `{ "pg": "^8.15.0" }`. No engine binary, no WASM compiler, no adapter packages in lockstep. The optional engines (SQLite, MySQL, SQL Server, PowDB, all tiered Experimental in [STABILITY.md](STABILITY.md)) are peer dependencies or Node builtins you install only if you use them.
 2. **Written from scratch.** Turbine is not a layer over Knex or a query-builder library. Query compilation is plain string building with an FNV-1a shape fingerprint into a bounded LRU of SQL templates, so there is no plan cache to size and no compiler running on your event loop.
 3. **Nested relations in one statement.** A `with` clause compiles to correlated `json_agg` subqueries, so users with posts with comments is one round trip, typed end to end: `users[0].posts[0].comments[0].author.name` autocompletes with no annotation.
 4. **Close to raw SQL.** In the last published run, Turbine's overhead over a hand-written `pg` control was 1.08x by geometric mean. The table is below; the losses are stated with the wins.
@@ -272,7 +272,7 @@ Going deep on one database means the parts other ORMs push to raw SQL are typed 
 
 ## Serverless and edge
 
-The core is driver-agnostic: hand any pg-compatible pool to `turbineHttp()` and Turbine runs on Vercel Edge, Cloudflare Workers, Deno Deploy, or anywhere else without TCP. The main entry's import graph is held under **91 kB brotli** (edge entry under **72 kB**) with `pg` external, enforced by `size-limit` in CI at those exact numbers; run `npm run size` for the current figure.
+The core is driver-agnostic: hand any pg-compatible pool to `turbineHttp()` and Turbine runs on Vercel Edge, Cloudflare Workers, Deno Deploy, or anywhere else without TCP. The main entry's import graph is held under **93 kB brotli** (edge entry under **74 kB**) with `pg` external, enforced by `size-limit` in CI at those exact numbers; run `npm run size` for the current figure.
 
 ```typescript
 import { Pool } from '@neondatabase/serverless';
@@ -359,11 +359,11 @@ It is also built to be extended rather than wrapped. All SQL generation routes t
 |---|---|---|---|---|
 | **Engine / runtime** | No engine binary (`pg` only) | Client + TS/WASM query compiler | No engine | No engine |
 | **Runtime deps** | 1 (`pg`) | `@prisma/client` + required driver adapter | 0 | 0 |
-| **Main bundle (brotli)** | under 91 kB import graph (CI-enforced), `pg` external | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small |
+| **Main bundle (brotli)** | under 93 kB import graph (CI-enforced), `pg` external | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small |
 | **Studio** | Read-only by default | Full CRUD, cloud-hosted | Full CRUD; [Gateway](https://gateway.drizzle.team/) self-hosted, free | None |
 | **Error PII safety** | Keys only by default | Values in messages | Raw pg errors | Raw pg errors |
 | **Migrations** | SQL-first, SHA-256 checksums | DSL-generated, shadow DB | SQL or Drizzle Kit | None |
-| **Edge runtime** | One import swap, under 72 kB brotli (CI-enforced) | Driver adapter + WASM compiler | Native | Native |
+| **Edge runtime** | One import swap, under 74 kB brotli (CI-enforced) | Driver adapter + WASM compiler | Native | Native |
 | **Pipeline batching** | Parse/Bind/Execute protocol | Sequential in txn | Sequential | Manual |
 | **Typed errors** | `isRetryable` discriminant | Error codes only | None | None |
 | **Nested relations** | 1 query, deep type inference | 1 query per relation by default; single-query `relationJoins` is Preview | 1 query, `relations()` re-declaration | Manual (`jsonArrayFrom`) |

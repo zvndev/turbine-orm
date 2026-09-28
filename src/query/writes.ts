@@ -94,11 +94,12 @@ function utcDateTimeWrites(qi: BuilderCtx): boolean {
 export function buildReselectByWhere(
   qi: BuilderCtx,
   whereObj: Record<string, unknown>,
+  projection?: WriteProjection,
 ): { sql: string; params: unknown[] } {
   const params: unknown[] = [];
   const clause = whereMod.buildWhereClause(qi, whereObj, params);
   const where = clause ? ` WHERE ${clause}` : '';
-  return { sql: `SELECT ${writeReselectSelection(qi)} FROM ${qi.q(qi.table)}${where}`, params };
+  return { sql: `SELECT ${writeReselectSelection(qi, projection)} FROM ${qi.q(qi.table)}${where}`, params };
 }
 
 /**
@@ -119,7 +120,12 @@ export function buildReselectByWhere(
  * A dialect predating the hook raises E017 rather than emitting SQL its engine
  * will reject.
  */
-function buildDefaultValuesInsert(qi: BuilderCtx, rowCount: number, skipDuplicates?: boolean): string {
+function buildDefaultValuesInsert(
+  qi: BuilderCtx,
+  rowCount: number,
+  skipDuplicates?: boolean,
+  projection?: WriteProjection,
+): string {
   const build = qi.dialect.buildDefaultValuesInsertStatement;
   if (!build) {
     throw new UnsupportedFeatureError(
@@ -132,11 +138,15 @@ function buildDefaultValuesInsert(qi: BuilderCtx, rowCount: number, skipDuplicat
     table: qi.q(qi.table),
     rowCount,
     skipDuplicates,
-    returning: writeReturningColumns(qi),
+    returning: writeReturningColumns(qi, projection),
   });
 }
 
-export function buildCreate<T extends object>(qi: BuilderCtx, args: CreateArgs<T>): DeferredQuery<T> {
+export function buildCreate<T extends object>(
+  qi: BuilderCtx,
+  args: CreateArgs<T>,
+  projection?: WriteProjection,
+): DeferredQuery<T> {
   assertWritable(qi, 'create');
   assertNoGeneratedColumns(qi, args.data as Record<string, unknown>, 'create');
   const entries = writeEntries(qi, args.data as Record<string, unknown>);
@@ -148,12 +158,12 @@ export function buildCreate<T extends object>(qi: BuilderCtx, args: CreateArgs<T
   // `data: {}` (or all-undefined) names no column: insert a row of defaults.
   const sql =
     entries.length === 0
-      ? buildDefaultValuesInsert(qi, 1)
+      ? buildDefaultValuesInsert(qi, 1, undefined, projection)
       : qi.dialect.buildInsertStatement({
           table: qi.q(qi.table),
           columns,
           valuePlaceholders: placeholders,
-          returning: writeReturningColumns(qi),
+          returning: writeReturningColumns(qi, projection),
         });
 
   return {
@@ -168,12 +178,12 @@ export function buildCreate<T extends object>(qi: BuilderCtx, args: CreateArgs<T
           message: `create on "${qi.table}" returned no row from RETURNING *; this should never happen.`,
         });
       }
-      return parseWriteRow(qi, row) as T;
+      return parseWriteRow(qi, row, projection) as T;
     },
     tag: `${qi.table}.create`,
     // Non-RETURNING engines: INSERT, then re-fetch the new row by primary key
     // (provided value, else the driver's generated insert id).
-    reselect: makeCreateReselect(qi, sql, params, args.data as Record<string, unknown>),
+    reselect: makeCreateReselect(qi, sql, params, args.data as Record<string, unknown>, projection),
   };
 }
 
@@ -188,6 +198,7 @@ export function makeCreateReselect<T extends object>(
   insertSql: string,
   insertParams: unknown[],
   data: Record<string, unknown>,
+  projection?: WriteProjection,
 ): DeferredQuery<T>['reselect'] {
   if (qi.dialect.resultStrategy !== 'reselect') return undefined;
   return async (exec) => {
@@ -204,7 +215,7 @@ export function makeCreateReselect<T extends object>(
       conds.push(`${qi.q(pk)} = ${qi.p(idx++)}`);
     }
     const where = conds.length > 0 ? ` WHERE ${conds.join(' AND ')}` : '';
-    return exec(`SELECT ${writeReselectSelection(qi)} FROM ${qi.q(qi.table)}${where}`, selParams);
+    return exec(`SELECT ${writeReselectSelection(qi, projection)} FROM ${qi.q(qi.table)}${where}`, selParams);
   };
 }
 
@@ -380,7 +391,11 @@ export function buildCreateMany<T extends object>(qi: BuilderCtx, args: CreateMa
   };
 }
 
-export function buildUpdate<T extends object>(qi: BuilderCtx, args: UpdateArgs<T>): DeferredQuery<T> {
+export function buildUpdate<T extends object>(
+  qi: BuilderCtx,
+  args: UpdateArgs<T>,
+  projection?: WriteProjection,
+): DeferredQuery<T> {
   assertWritable(qi, 'update');
   qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
   // `updatedAt`-tagged columns are filled in before anything reads `data`, so
@@ -423,14 +438,14 @@ export function buildUpdate<T extends object>(qi: BuilderCtx, args: UpdateArgs<T
   // version check that must still run.
   const hasSetData = Object.values(dataObj).some((v) => v !== undefined);
   if (!hasSetData && !lock) {
-    const sel = buildReselectByWhere(qi, whereObj);
+    const sel = buildReselectByWhere(qi, whereObj, projection);
     return {
       sql: sel.sql,
       params: sel.params,
       transform: (result) => {
         const row = result.rows[0];
         if (!row) throw new NotFoundError({ table: qi.table, where: args.where, operation: 'update' });
-        return parseWriteRow(qi, row) as T;
+        return parseWriteRow(qi, row, projection) as T;
       },
       tag: `${qi.table}.update`,
     };
@@ -438,7 +453,9 @@ export function buildUpdate<T extends object>(qi: BuilderCtx, args: UpdateArgs<T
 
   const setFp = fingerprintSet(qi, dataObj);
   const whereFp = whereMod.fingerprintWhere(qi, whereObj);
-  const ck = lock ? null : `u:${setFp}|${whereFp}${whereMod.globalFilterCacheSegment(qi)}`;
+  const ck = lock
+    ? null
+    : `u:${setFp}|${whereFp}${whereMod.globalFilterCacheSegment(qi)}${writeProjectionCacheSegment(projection)}`;
 
   const params: unknown[] = [];
 
@@ -465,7 +482,7 @@ export function buildUpdate<T extends object>(qi: BuilderCtx, args: UpdateArgs<T
     // `OUTPUT INSERTED.*` between SET and WHERE) override buildUpdateStatement;
     // absent → the trailing-clause PG/SQLite/MySQL form (byte-identical).
     // `returning` excludes PII columns on tagged tables (else '*').
-    const returning = writeReturningColumns(qi);
+    const returning = writeReturningColumns(qi, projection);
     return qi.dialect.buildUpdateStatement
       ? qi.dialect.buildUpdateStatement({ table: qi.q(qi.table), setClauses, whereSql, returning })
       : `UPDATE ${qi.q(qi.table)} SET ${setClauses.join(', ')}${whereSql}${qi.dialect.buildReturningClause(returning)}`;
@@ -513,7 +530,7 @@ export function buildUpdate<T extends object>(qi: BuilderCtx, args: UpdateArgs<T
           operation: 'update',
         });
       }
-      return parseWriteRow(qi, row) as T;
+      return parseWriteRow(qi, row, projection) as T;
     },
     tag: `${qi.table}.update`,
     preparedName,
@@ -534,14 +551,18 @@ export function buildUpdate<T extends object>(qi: BuilderCtx, args: UpdateArgs<T
                 expectedVersion: lock.expected,
               });
             }
-            const sel = buildReselectByWhere(qi, whereObj);
+            const sel = buildReselectByWhere(qi, whereObj, projection);
             return exec(sel.sql, sel.params);
           }
         : undefined,
   };
 }
 
-export function buildDelete<T extends object>(qi: BuilderCtx, args: DeleteArgs<T>): DeferredQuery<T> {
+export function buildDelete<T extends object>(
+  qi: BuilderCtx,
+  args: DeleteArgs<T>,
+  projection?: WriteProjection,
+): DeferredQuery<T> {
   assertWritable(qi, 'delete');
   qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
   // Prisma compound-unique selector → the column conjunction (before the guard).
@@ -559,7 +580,7 @@ export function buildDelete<T extends object>(qi: BuilderCtx, args: DeleteArgs<T
   if (!allowFullTableScan) assertMutationWhereIdentifiesOneRow(qi.tableMeta, qi.table, userWhere, 'delete');
   const whereObj = (whereMod.mergeGlobalFilter(qi, userWhere) ?? {}) as Record<string, unknown>;
   const whereFp = whereMod.fingerprintWhere(qi, whereObj);
-  const ck = `d:${whereFp}${whereMod.globalFilterCacheSegment(qi)}`;
+  const ck = `d:${whereFp}${whereMod.globalFilterCacheSegment(qi)}${writeProjectionCacheSegment(projection)}`;
 
   const params: unknown[] = [];
 
@@ -569,7 +590,7 @@ export function buildDelete<T extends object>(qi: BuilderCtx, args: DeleteArgs<T
     // SQL Server injects `OUTPUT DELETED.*` between `DELETE FROM <t>` and WHERE;
     // absent override → the trailing-clause PG/SQLite/MySQL form (byte-identical).
     // `returning` excludes PII columns on tagged tables (else '*').
-    const returning = writeReturningColumns(qi);
+    const returning = writeReturningColumns(qi, projection);
     return qi.dialect.buildDeleteStatement
       ? qi.dialect.buildDeleteStatement({ table: qi.q(qi.table), whereSql, returning })
       : `DELETE FROM ${qi.q(qi.table)}${whereSql}${qi.dialect.buildReturningClause(returning)}`;
@@ -591,7 +612,7 @@ export function buildDelete<T extends object>(qi: BuilderCtx, args: DeleteArgs<T
           operation: 'delete',
         });
       }
-      return parseWriteRow(qi, row) as T;
+      return parseWriteRow(qi, row, projection) as T;
     },
     tag: `${qi.table}.delete`,
     preparedName: entry.name,
@@ -600,7 +621,7 @@ export function buildDelete<T extends object>(qi: BuilderCtx, args: DeleteArgs<T
     reselect:
       qi.dialect.resultStrategy === 'reselect'
         ? async (exec) => {
-            const sel = buildReselectByWhere(qi, whereObj);
+            const sel = buildReselectByWhere(qi, whereObj, projection);
             const pre = await exec(sel.sql, sel.params);
             await exec(entry.sql, params, entry.name);
             return pre;
@@ -609,7 +630,11 @@ export function buildDelete<T extends object>(qi: BuilderCtx, args: DeleteArgs<T
   };
 }
 
-export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T>): DeferredQuery<T> {
+export function buildUpsert<T extends object>(
+  qi: BuilderCtx,
+  args: UpsertArgs<T>,
+  projection?: WriteProjection,
+): DeferredQuery<T> {
   assertWritable(qi, 'upsert');
   assertNoGeneratedColumns(qi, args.create as Record<string, unknown>, 'upsert');
   assertNoGeneratedColumns(qi, args.update as Record<string, unknown>, 'upsert');
@@ -668,8 +693,27 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
   // unqualified column is ambiguous and PostgreSQL rejected EVERY upsert on a
   // globally filtered table at parse time (42702), insert path included.
   let updateWhere: string | undefined;
+  const upsertFilter = whereMod.resolveGlobalFilter(qi, qi.table);
+  if (upsertFilter && !qi.dialect.supportsUpsertUpdateWhere) {
+    // MySQL's `ON DUPLICATE KEY UPDATE` has no predicate slot and SQL Server's
+    // MERGE cannot take the builder's column references there, so on those
+    // engines the filter used to be DROPPED from the conflict update, silently.
+    // A tenant-scoped upsert whose key matched another tenant's row updated
+    // that row. Refused instead, when the filter would compile to anything:
+    // the global-filter contract is that it scopes every update, and an
+    // upsert that cannot honour it must not run as if it did.
+    if (whereMod.buildRenderedRefWhere(qi, qi.table, qi.tableMeta, qi.q(qi.table), upsertFilter, [])) {
+      throw new UnsupportedFeatureError(
+        `upsert on "${qi.table}", which has a global filter,`,
+        qi.dialect.name,
+        "This engine's upsert statement cannot carry the filter on its conflict update, so it could update a row " +
+          'the filter hides. Use findUnique, then update or create, inside $transaction; or pass ' +
+          '`skipGlobalFilters: UNSAFE` if the upsert is meant to reach every row.',
+      );
+    }
+  }
   if (qi.dialect.supportsUpsertUpdateWhere) {
-    const gf = whereMod.resolveGlobalFilter(qi, qi.table);
+    const gf = upsertFilter;
     if (gf) {
       // Compiled through a scope whose FROM-item reference is ALREADY RENDERED
       // (`"users"`), which is what the target table is inside `ON CONFLICT ...
@@ -695,7 +739,7 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
     conflictColumns,
     updateSetClauses: setClauses,
     updateWhere,
-    returning: writeReturningColumns(qi),
+    returning: writeReturningColumns(qi, projection),
   });
 
   return {
@@ -721,7 +765,7 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
             : `upsert on "${qi.table}" returned no row from RETURNING *; this should never happen.`,
         });
       }
-      return parseWriteRow(qi, row) as T;
+      return parseWriteRow(qi, row, projection) as T;
     },
     tag: `${qi.table}.upsert`,
     // Non-RETURNING engines: run the upsert, then re-fetch by the where keys.
@@ -732,6 +776,7 @@ export function buildUpsert<T extends object>(qi: BuilderCtx, args: UpsertArgs<T
             const sel = buildReselectByWhere(
               qi,
               (whereMod.mergeGlobalFilter(qi, upsertWhere) ?? {}) as Record<string, unknown>,
+              projection,
             );
             return exec(sel.sql, sel.params);
           }
@@ -917,6 +962,40 @@ export function piiFields(_qi: BuilderCtx, meta: TableMetadata): string[] {
 }
 
 /**
+ * A single-row write's caller-chosen return shape, from its `select` / `omit`.
+ *
+ * Resolved ONCE per call by builder.ts through `resolveProjection`, the same
+ * authority reads use, so a write and a read agree on every rule: a name must
+ * resolve to a column or the call throws E003, a relation name gets its own
+ * message, `select` must name something, `select` and `omit` are exclusive, the
+ * list is in TABLE order (a caller's key order must not mint distinct
+ * statements), and an explicit `select` of a PII column is the opt-in that
+ * returns it while `omit` leaves PII excluded. (builder.ts rather than this
+ * module because relations.ts already imports this one.)
+ *
+ * The point is bytes: `RETURNING *` sends back every column, a large JSON
+ * payload included, on every insert. Measured with a 3.1 KB jsonb column at
+ * concurrency 50, the same INSERT ran at 60,900/s with no RETURNING and at
+ * 34,500/s with `RETURNING *`.
+ */
+export interface WriteProjection {
+  /** Unquoted column names, in table order. Never empty. */
+  readonly columns: readonly string[];
+}
+
+/**
+ * The write-SQL cache segment for a projection. EMPTY for the default shape, so
+ * every existing key is byte-identical; a projected statement differs only in
+ * its RETURNING/OUTPUT text, and without this segment two calls with the same
+ * SET and WHERE but different `select`s would share one cached statement, i.e.
+ * the second caller would get the first caller's columns. NUL is the delimiter
+ * because it is the one byte a PostgreSQL identifier cannot contain.
+ */
+export function writeProjectionCacheSegment(projection: WriteProjection | undefined): string {
+  return projection ? `|rt=${projection.columns.join('\u0000')}` : '';
+}
+
+/**
  * The `RETURNING` / `OUTPUT` selection for a write on this table. A table with
  * no PII column returns `'*'` (every column, byte-identical SQL to before);
  * a table WITH PII columns returns an explicit quoted list of every non-PII
@@ -980,7 +1059,8 @@ function namedColumns(meta: TableMetadata, data: Record<string, unknown>): Set<s
   return out;
 }
 
-export function writeReturningColumns(qi: BuilderCtx): ReturningSelection {
+export function writeReturningColumns(qi: BuilderCtx, projection?: WriteProjection): ReturningSelection {
+  if (projection) return projection.columns.map((col) => qi.q(col));
   // The PK exemption used to be re-stated here as `|| pk.has(col)`. It now
   // lives in `piiColumns` so every projection inherits it and none can drift.
   const piiCols = piiColumns(qi, qi.tableMeta);
@@ -993,8 +1073,8 @@ export function writeReturningColumns(qi: BuilderCtx): ReturningSelection {
  * `'reselect'` result strategy re-fetches via a SELECT, not RETURNING).
  * `'*'` when there is no PII column; otherwise the comma-joined quoted list.
  */
-export function writeReselectSelection(qi: BuilderCtx): string {
-  const cols = writeReturningColumns(qi);
+export function writeReselectSelection(qi: BuilderCtx, projection?: WriteProjection): string {
+  const cols = writeReturningColumns(qi, projection);
   return cols === '*' ? '*' : cols.join(', ');
 }
 
@@ -1006,10 +1086,19 @@ export function writeReselectSelection(qi: BuilderCtx): string {
  * no-op. Untagged tables incur only one `for` over a zero-length field list,
  * so behavior is unchanged.
  */
-export function parseWriteRow(qi: BuilderCtx, row: Record<string, unknown>): Record<string, unknown> {
+export function parseWriteRow(
+  qi: BuilderCtx,
+  row: Record<string, unknown>,
+  projection?: WriteProjection,
+): Record<string, unknown> {
   const parsed = qi.parseRow(row, qi.table);
-  for (const field of piiFields(qi, qi.tableMeta)) {
-    delete parsed[field];
+  // A column the caller named in `select` is the opt-in (see WriteProjection),
+  // so the strip spares exactly the projected columns and nothing else.
+  const pii = piiColumns(qi, qi.tableMeta);
+  if (pii.size === 0) return parsed;
+  const requested = projection ? new Set(projection.columns) : undefined;
+  for (const col of qi.tableMeta.columns) {
+    if (pii.has(col.name) && !requested?.has(col.name)) delete parsed[col.field];
   }
   return parsed;
 }

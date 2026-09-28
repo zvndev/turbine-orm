@@ -35,7 +35,7 @@ const result = await db.$transaction(async (tx) => {
 
 The `tx` client has the same surface as `db`, every table accessor, every method. Queries *must* use `tx`, not `db`, or they'll run on a different connection outside the transaction.
 
-> **Note:** If the opening `BEGIN` itself fails, Turbine does not fire a best-effort `ROLLBACK` afterward: on single-handle engines like embedded PowDB, a stray rollback could tear down an unrelated open transaction.
+> **Note:** If the opening `BEGIN` itself fails, Turbine does not fire a best-effort `ROLLBACK` afterward: on single-handle engines like embedded PowDB, a stray rollback could tear down an unrelated open transaction. A `BEGIN` that failed because its connection was already closed is sent once more on a fresh connection first, see [Lost connections](#lost-connections).
 
 ## $transaction, batch form
 
@@ -168,6 +168,31 @@ await withRetry(() =>
 `withRetry` retries only errors carrying `isRetryable === true` and rethrows everything else at once. Tune it with `maxAttempts` (default `3`), `baseDelay` (default `50` ms), `maxDelay` (default `5000` ms), and `onRetry(error, attempt)`; backoff is exponential with jitter.
 
 The `as const` on `isRetryable` means `err.isRetryable` is the literal type `true` on those classes and never narrows to `false`, so your control flow type-checks without casts.
+
+## Lost connections
+
+A database restart, a failover, a pooler recycle, a serverless compute suspend or `pg_terminate_backend` closes connections from the server side. Since 0.80 this never exits your process, whatever held the connection at the time. The pending call rejects with `ConnectionError` (E004) and the pool discards the connection.
+
+Turbine recovers on its own where resending cannot change the outcome.
+
+| Statement | On a connection the server already closed |
+|---|---|
+| A read outside a transaction (`findMany`, `findFirst`, `findUnique`, `count`, `aggregate`, `groupBy`, a stream's first query) | Sent once more on a fresh connection |
+| The `BEGIN` of `$transaction`, `transaction()` or a nested write, and `connect()`'s check | Sent once more on a fresh connection |
+| A write (`create`, `update`, `delete`, `upsert`, `*Many`) | Fails with E004, never resent |
+| Anything inside a transaction | Fails with E004: the connection was the transaction |
+
+Writes are not resent because a lost connection does not say whether the statement committed first. A connection can drop after the server commits and before the reply arrives, so a second `INSERT` could insert the row twice. If your write is idempotent, retry it yourself on `ConnectionError`.
+
+The retried attempt shows up in `$on('query')` as its own event, carrying the error and `retried: true`. A listener that alerts on failed calls can skip those.
+
+### After a freeze
+
+The dead connections that matter most come from a process that was not running. pg-pool drops an idle connection when it reads the server's close, which needs the event loop. A serverless function frozen between invocations reads nothing, so a restart during the freeze leaves every idle connection dead and still in the pool.
+
+So a pool Turbine creates waits one event-loop turn before lending out a connection that has been idle for a second or more. That turn reads the closes, the dead connections are evicted, and the caller gets a live one. It costs no round trip, and a pool in steady use never waits. Measured with five idle connections terminated while the loop was blocked: five concurrent queries all failed before, none after, reads and writes alike.
+
+A pool you pass in yourself (`TurbineConfig.pool`, `turbineHttp`) does not get the wait, since it is not Turbine's to change. The read and `BEGIN` retries above still apply to it.
 
 ## pipeline, N queries, 1 round-trip
 

@@ -197,6 +197,63 @@ describe('powdb options, executed against the real engine', () => {
     );
   });
 
+  // PowQL's native `upsert … on conflict { … }` takes no predicate, so before
+  // the lookup-first routing a tenant-scoped upsert whose key matched another
+  // tenant's row UPDATED that row, then reported NotFoundError because the
+  // tenant-filtered reselect could not see what it had just written.
+  it('a filtered upsert cannot overwrite another tenant row', async () => {
+    await withDb(
+      async (db) => {
+        await assert.rejects(
+          db.table('widget').upsert({
+            where: { id: 5 },
+            create: { id: 5, name: 'mine', tenantId: 't1', qty: 1, version: 1 },
+            update: { name: 'hijacked' },
+          }),
+        );
+        const row = await db.table('widget').findUnique({ where: { id: 5 }, skipGlobalFilters: UNSAFE });
+        assert.equal(row?.name, 'echo', 'the other tenant row must be untouched');
+      },
+      { globalFilters: TENANT },
+    );
+  });
+
+  it('a filtered upsert still updates its own row and inserts a new one', async () => {
+    await withDb(
+      async (db) => {
+        const updated = await db.table('widget').upsert({
+          where: { id: 1 },
+          create: { id: 1, name: 'never', tenantId: 't1', qty: 1, version: 1 },
+          update: { name: 'alpha2' },
+        });
+        assert.equal(updated.name, 'alpha2');
+        const created = await db.table('widget').upsert({
+          where: { id: 7 },
+          create: { id: 7, name: 'golf', tenantId: 't1', qty: 70, version: 1 },
+          update: { name: 'never' },
+          select: { id: true, name: true },
+        });
+        assert.deepEqual(created, { id: 7, name: 'golf' });
+      },
+      { globalFilters: TENANT },
+    );
+  });
+
+  it('skipGlobalFilters: UNSAFE on upsert reaches any row and returns what it wrote', async () => {
+    await withDb(
+      async (db) => {
+        const row = await db.table('widget').upsert({
+          where: { id: 5 },
+          create: { id: 5, name: 'never', tenantId: 't2', qty: 1, version: 1 },
+          update: { name: 'admin-edit' },
+          skipGlobalFilters: UNSAFE,
+        });
+        assert.equal(row.name, 'admin-edit', 'the reselect must not filter out the row the upsert just wrote');
+      },
+      { globalFilters: TENANT },
+    );
+  });
+
   it('the empty-where guard still sees the USER predicate, not the global filter', async () => {
     await withDb(
       async (db) => {

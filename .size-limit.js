@@ -285,12 +285,38 @@ const nodePlatform = (config) => {
 // so they move by the 1 kB minimum instead. Note main and serverless now have
 // 0.11 and 0.06 kB of headroom: the next change to the shared graph decides the
 // claim, per the rule above.
+// EVERY CLIENT-GRAPH ENTRY RE-BASELINED 2026-09-27, at the 0.80.0 release.
+// Measured on this build against the PUBLISHED 0.79.1 tarball, same config:
+// main 90.79 -> 92.50 (+1.71), serverless 71.90 -> 73.54 (+1.64), sqlite
+// 75.04 -> 76.74, mysql 76.10 -> 77.79, mssql 77.53 -> 79.26 (each about +1.7),
+// powdb 93.54 -> 95.66 (+2.12), prisma-compat 14.62 -> 14.91, cli and adapters
+// flat. Uniform across every entry that carries the client graph, which is the
+// shared-code signature, and checked the same way as before: bundling
+// dist/index.js gives 44 modules, the only cli/ entries are still the sanctioned
+// destructive.js / sql-statements.js pair, and no engine module is reachable.
+// The two new modules are connection-guard.js and checkout.js. The growth is
+// this release's features, all in the shared graph: the connection guard and
+// the stale-connection settle (connection-guard.ts), the BEGIN retry
+// (checkout.ts), the read retry (query/builder.ts), $listen reconnect with
+// backoff (realtime.ts), select/omit on single-row writes (query/writes.ts,
+// builder.ts), the code-less connection-loss classification (errors.ts), and
+// the filtered-upsert refusal. powdb's extra 0.4 kB is its own: the one-statement
+// aggregate plan and the lookup-first upsert. prisma-compat's +0.29 is the
+// write projection it now passes down.
+//
+// Nothing here could be trimmed without removing a feature, so main and
+// serverless, both published claims, move deliberately: main 93 kB, serverless
+// 74 kB, and README.md (three places), site/app/page.tsx (prose and the stat
+// card) and the serverless / batadb / neon docs pages move to the same two
+// numbers in this commit. The three SQL engine entries and powdb follow the
+// latest precedent (0.79.0), measured plus the 1 kB minimum, rounded up: sqlite
+// 78, mysql 79, mssql 81, powdb 97.
 export default [
   {
     name: "main entry, import { TurbineClient } from 'turbine-orm'",
     path: 'dist/index.js',
     // Same number as the README's claim, on purpose. See the note above.
-    limit: '91 kB',
+    limit: '93 kB',
     ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },
@@ -301,21 +327,21 @@ export default [
     // pagination dialect-hook dispatch). These are tiny and engine-neutral, but
     // the edge bundle includes the query builder, so the budget gets a small bump.
     path: 'dist/serverless.js',
-    limit: '72 kB',
+    limit: '74 kB',
     ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },
   {
     name: 'sqlite entry, turbine-orm/sqlite (node:sqlite + client graph)',
     path: 'dist/sqlite.js',
-    limit: '76 kB',
+    limit: '78 kB',
     ignore: [...PG, 'node:sqlite'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
     name: 'mysql entry, turbine-orm/mysql (client graph; mysql2 lazy-loaded)',
     path: 'dist/mysql.js',
-    limit: '77 kB',
+    limit: '79 kB',
     // mysql2 is an optional peer loaded via a dynamic import in the factory, so
     // it is never in the static graph, exclude it (and pg) from the footprint.
     ignore: [...PG, 'mysql2', 'mysql2/promise'],
@@ -326,7 +352,7 @@ export default [
     path: 'dist/mssql.js',
     // Slightly larger than the other engines: the FOR JSON PATH relation generator
     // and the INFORMATION_SCHEMA/sys introspector add real code (no extra deps).
-    limit: '78 kB',
+    limit: '81 kB',
     // mssql is an optional peer loaded via a dynamic import in the factory, so it
     // is never in the static graph, exclude it (and pg) from the footprint.
     ignore: [...PG, 'mssql'],
@@ -337,7 +363,7 @@ export default [
     // The largest entry: it carries the whole client/query graph AND powql.ts,
     // a second, parallel query generator for a non-SQL language.
     path: 'dist/powdb.js',
-    limit: '94 kB',
+    limit: '97 kB',
     // Both PowDB drivers are optional peers behind dynamic imports (the
     // networked client and the embedded napi addon), so neither is in the
     // static graph.
