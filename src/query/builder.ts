@@ -28,6 +28,7 @@ import { missingIndexForRelation, schemaHasIndexInfo } from '../index-advisor.js
 import {
   executeNestedCreate,
   executeNestedUpdate,
+  extractRelationFields,
   hasRelationFields,
   type NestedWriteContext,
 } from '../nested-write.js';
@@ -47,7 +48,11 @@ import {
   resolveCountRelations,
   stripFields,
 } from './batched-loader.js';
-import { assertWhereIdentifiesOneRow, expandCompoundUniqueWhere } from './compound-unique.js';
+import {
+  assertMutationWhereIdentifiesOneRow,
+  assertWhereIdentifiesOneRow,
+  expandCompoundUniqueWhere,
+} from './compound-unique.js';
 import {
   dedupeColumnList,
   dedupeOrderEntries,
@@ -4252,9 +4257,89 @@ export class QueryInterface<T extends object, R extends object = {}> {
     O extends Record<string, boolean> | undefined = undefined,
   >(args: UpsertArgs<T, R, S, O>): Promise<FieldResult<T, S, O>> {
     return this.executeWithMiddleware('upsert', args as unknown as Record<string, unknown>, async () => {
+      if (this.upsertNeedsLookup(args)) {
+        return this.upsertLookupFirst(args) as Promise<FieldResult<T, S, O>>;
+      }
       const deferred = this.buildUpsert(args);
       return this.executeMutation(deferred, args.timeout);
     });
+  }
+
+  /**
+   * @internal Whether `upsert()` looks the row up rather than running one
+   * statement, which is also exactly when `buildUpsert` refuses these args.
+   * prisma-compat reads it to decide whether an array `$transaction` can batch
+   * an upsert or has to run the array inside a transaction.
+   */
+  upsertNeedsLookup(
+    args: UpsertArgs<T, R, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
+  ): boolean {
+    return (
+      hasRelationFields((args.create ?? {}) as Record<string, unknown>, this.tableMeta) ||
+      hasRelationFields((args.update ?? {}) as Record<string, unknown>, this.tableMeta) ||
+      writesMod.upsertLookupReason(this.ctx, args as UpsertArgs<T>) !== null
+    );
+  }
+
+  /**
+   * `upsert` as Prisma defines it: find the row `where` names, update it if it
+   * exists, else insert `create`, in one transaction (the caller's, when there
+   * is one). Taken whenever the single conflict statement would mean something
+   * else (`upsertLookupReason`: `where` not pinned to `create`'s values, an
+   * empty `update`, a global filter the engine's statement cannot carry) and
+   * whenever `create` or `update` holds nested relation writes, which only the
+   * nested-write engine can run.
+   *
+   * Validation is DATA-INDEPENDENT, as it is for the batched relation loader:
+   * both halves are compiled before the lookup runs, so an unknown field in
+   * `update` is refused whether or not the row exists, and a call is never
+   * valid on one row and invalid on the next. Only the scalar part of each half
+   * is compiled here; nested relation writes are validated by the engine that
+   * runs them.
+   *
+   * Not atomic against a concurrent insert of the same key, exactly as Prisma's
+   * own lookup is not: two callers can both miss, and the second insert then
+   * fails on the unique constraint (E008) when `create` carries the key. It
+   * never writes two rows over one key the database enforces.
+   */
+  private async upsertLookupFirst(
+    args: UpsertArgs<T, R, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
+  ): Promise<T> {
+    const where = (args.where ?? {}) as Record<string, unknown>;
+    const create = (args.create ?? {}) as Record<string, unknown>;
+    const update = (args.update ?? {}) as Record<string, unknown>;
+    assertMutationWhereIdentifiesOneRow(
+      this.tableMeta,
+      this.table,
+      expandCompoundUniqueWhere(this.tableMeta, where),
+      'upsert',
+    );
+    this.resolveWriteProjection(args);
+    // An undefined option is an absent one on every call below.
+    const skip = { skipGlobalFilters: args.skipGlobalFilters };
+    const shape = { select: args.select, omit: args.omit, timeout: args.timeout };
+    const scalarCreate = extractRelationFields(create, this.tableMeta).scalars;
+    const scalarUpdate = extractRelationFields(update, this.tableMeta).scalars;
+    const updateIsEmpty = Object.values(update).every((v) => v === undefined);
+    if (Object.keys(scalarCreate).length > 0) this.buildCreate({ data: scalarCreate } as CreateArgs<T, R>);
+    if (Object.values(scalarUpdate).some((v) => v !== undefined)) {
+      this.buildUpdate({ where, data: scalarUpdate, ...skip } as UpdateArgs<T, R>);
+    }
+
+    const run = async (table: QueryInterface<T>): Promise<T> => {
+      const found = await table.findUnique({ where, ...shape, ...skip } as FindUniqueArgs<T>);
+      if (found) {
+        // Prisma reads an empty `update` as "leave it as it is": the row found
+        // IS the answer, projected as the write would have projected it.
+        if (updateIsEmpty) return found as T;
+        return (await table.update({ where, data: update, ...shape, ...skip } as UpdateArgs<T, R>)) as T;
+      }
+      return (await table.create({ data: create as Partial<T>, ...shape } as CreateArgs<T, R>)) as T;
+    };
+    if (this.txScoped) {
+      return run(this.buildNestedCtx().tx.table<T>(this.table) as unknown as QueryInterface<T>);
+    }
+    return this.runInImplicitTx((ctx) => run(ctx.tx.table<T>(this.table) as unknown as QueryInterface<T>));
   }
 
   // -------------------------------------------------------------------------

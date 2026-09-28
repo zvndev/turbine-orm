@@ -10,6 +10,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { ValidationError } from '../errors.js';
+import { upsertWhereMatchesCreate } from '../query/compound-unique.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
 
@@ -153,5 +154,45 @@ describe('compound-unique selector, code-first declared unique index', () => {
       () => q.buildFindUnique({ where: { orgId_userId: { orgId: 3, userId: 4 } } } as never),
       (err: unknown) => err instanceof ValidationError,
     );
+  });
+});
+
+// `upsertWhereMatchesCreate` decides whether ONE conflict statement means what
+// an upsert says. `false` sends the call down the (always correct) lookup path,
+// so every doubtful shape must answer false; `true` must mean the statement
+// matches exactly the row `where` names.
+describe('upsertWhereMatchesCreate', () => {
+  const meta = schema().tables.memberships!;
+  const match = (where: Record<string, unknown>, create: Record<string, unknown>) =>
+    upsertWhereMatchesCreate(meta, where, create);
+
+  it("true only when every where key carries create's value", () => {
+    assert.equal(match({ id: 1 }, { id: 1, role: 'a' }), true);
+    assert.equal(match({ id: 1 }, { id: 2, role: 'a' }), false, 'a different value');
+    assert.equal(match({ id: 1 }, { role: 'a' }), false, 'create leaves the key to its default');
+    assert.equal(match({ orgId: 1, userId: 2 }, { orgId: 1, userId: 3 }), false, 'every key, not some');
+  });
+
+  it('reads either spelling on both sides, and a compound selector', () => {
+    assert.equal(match({ org_id: 1, userId: 2 }, { orgId: 1, user_id: 2 }), true);
+    assert.equal(match({ orgId_userId: { orgId: 1, userId: 2 } }, { orgId: 1, userId: 2 }), true);
+  });
+
+  it('a bare `equals` is a value; any other operator is not', () => {
+    assert.equal(match({ id: { equals: 1 } }, { id: 1 }), true);
+    assert.equal(match({ id: { equals: 1, mode: 'insensitive' } }, { id: 1 }), false);
+    assert.equal(match({ id: { in: [1] } }, { id: 1 }), false);
+  });
+
+  it('NULL never matches, and Dates compare by instant', () => {
+    assert.equal(match({ id: null }, { id: null }), false);
+    assert.equal(match({ id: new Date(5) }, { id: new Date(5) }), true);
+    assert.equal(match({ id: new Date(5) }, { id: new Date(6) }), false);
+  });
+
+  it('an empty or all-undefined where, or an unknown key, is never a match', () => {
+    assert.equal(match({}, { id: 1 }), false);
+    assert.equal(match({ id: undefined }, { id: 1 }), false);
+    assert.equal(match({ nope: 1 }, { nope: 1 }), false);
   });
 });

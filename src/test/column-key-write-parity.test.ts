@@ -72,7 +72,7 @@ const SURFACES: { name: string; build: (data: Record<string, unknown>) => Built 
   { name: 'createMany', build: (data) => q().buildCreateMany({ data: [data, data] }) },
   { name: 'update', build: (data) => q().buildUpdate({ where: { id: 1 }, data }) },
   { name: 'updateMany', build: (data) => q().buildUpdateMany({ where: { id: 1 }, data }) },
-  { name: 'upsert', build: (data) => q().buildUpsert({ where: { id: 1 }, create: data, update: data }) },
+  { name: 'upsert', build: (data) => q().buildUpsert({ where: { id: 1 }, create: { id: 1, ...data }, update: data }) },
   {
     name: 'update { set }',
     build: (data) =>
@@ -147,11 +147,11 @@ describe('column-key parity: the field-spelled output is unchanged, byte for byt
     },
     {
       name: 'upsert',
-      built: q().buildUpsert({ where: { id: 1 }, create: { ...BY_FIELD }, update: { ...BY_FIELD } }),
+      built: q().buildUpsert({ where: { id: 1 }, create: { id: 1, ...BY_FIELD }, update: { ...BY_FIELD } }),
       sql:
-        'INSERT INTO "report_schedule" ("last_run", "day", "tz", "ran_stamps") VALUES ($1, $2, $3, $4) ' +
-        'ON CONFLICT ("id") DO UPDATE SET "last_run" = $5, "day" = $6, "tz" = $7, "ran_stamps" = $8 RETURNING *',
-      params: [TS, DAY, TZ, [TS, TS2], TS, DAY, TZ, [TS, TS2]],
+        'INSERT INTO "report_schedule" ("id", "last_run", "day", "tz", "ran_stamps") VALUES ($1, $2, $3, $4, $5) ' +
+        'ON CONFLICT ("id") DO UPDATE SET "last_run" = $6, "day" = $7, "tz" = $8, "ran_stamps" = $9 RETURNING *',
+      params: [1, TS, DAY, TZ, [TS, TS2], TS, DAY, TZ, [TS, TS2]],
     },
   ];
 

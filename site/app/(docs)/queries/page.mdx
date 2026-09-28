@@ -489,9 +489,25 @@ await db.sessions.deleteMany({ where: {}, allowFullTableScan: UNSAFE }); // ever
 
 ## upsert
 
-Insert a row, or update it if a row matching the `where` clause already exists, via one atomic `INSERT ... ON CONFLICT ... DO UPDATE`. The `where` keys determine the conflict target and must be unique or primary key columns: no match inserts `create`, a match applies `update`.
+Update the row the `where` clause names, or insert `create` if no row matches. The `where` must identify one row, through a unique or primary key column: no match inserts `create`, a match applies `update`.
 
-Since 0.78.0 that requirement is checked before any SQL is built, with the same `TURBINE_E003` `update` and `delete` raise. An upsert's `where` **is** its conflict target, so a non-unique predicate emitted an `ON CONFLICT` clause no constraint backs and PostgreSQL answered with a bare `Database error 42P10` naming nothing you wrote. A table that declares no primary key and no unique constraint gets its own message: no `where` can identify one row there, so use `create` or `updateMany` instead.
+Since 0.78.0 that requirement is checked before any SQL is built, with the same `TURBINE_E003` `update` and `delete` raise. A table that declares no primary key and no unique constraint gets its own message: no `where` can identify one row there, so use `create` or `updateMany` instead.
+
+### One statement, or a lookup first
+
+When every `where` key carries the same value in `create`, the upsert runs as one atomic `INSERT ... ON CONFLICT ... DO UPDATE`. That is the common shape, as in the examples below.
+
+Otherwise Turbine looks the row up by `where` first, then updates it or inserts `create`, inside one transaction (yours, when the call is already inside `$transaction`). A single conflict statement cannot answer that call: it matches on the values it inserts, which are `create`'s. Since 0.81 these shapes take the lookup:
+
+- `where: { id: 5 }` with a `create` that leaves `id` to its sequence. Before 0.81 this inserted a new row every time and never touched row 5.
+- `where: { email: a }` with `create: { email: b }`. Before 0.81 this updated or inserted `b`.
+- An empty `update: {}`, which reads as "create it if it is missing". Before 0.81 it was a syntax error.
+- [Nested writes](/nested-writes) inside `create` or `update`.
+- A table with a [global filter](/global-filters) on MySQL or SQL Server, whose conflict statements cannot carry the filter.
+
+Like Prisma's own lookup, it is not atomic against a concurrent insert of the same key: two callers can both miss, and the second insert then fails with `UniqueConstraintError` (`TURBINE_E008`).
+
+Both halves are validated before the lookup runs, so a typo in `update` is refused whether or not the row exists. A [batched](#pipeline) `buildUpsert` has no round trip for a lookup, so it refuses those shapes with `TURBINE_E003` (`TURBINE_E017` for the global-filter case) and names the fix.
 
 ```ts
 const user = await db.users.upsert({

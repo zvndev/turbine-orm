@@ -462,6 +462,62 @@ export function whereIdentifiesOneRow(meta: TableMetadata, where: Record<string,
   return uniqueColumnSets(meta).some((cols) => cols.every((c) => pinned.has(c)));
 }
 
+/**
+ * Whether an `upsert` means the same thing as ONE conflict statement.
+ *
+ * An upsert's contract is Prisma's: find the row `where` names; update it if
+ * it exists, else insert `create`. A single `INSERT ... ON CONFLICT (<where
+ * keys>)` (or PowDB's `upsert ... on`) compares the conflict columns against
+ * the values being INSERTED, which are `create`'s, and never reads `where`'s
+ * values at all. The two agree exactly when every `where` key is pinned to the
+ * value `create` carries for that column. Otherwise the statement answers a
+ * different question: `where: { id: 5 }` with a `create` that leaves `id` to
+ * its sequence inserted a new row every time and never touched row 5, and
+ * `where: { email: a }` with `create: { email: b }` updated the row holding
+ * `b`, silently.
+ *
+ * Shared by every engine, like the one-row rule above: each one decides here
+ * whether it may take its single-statement fast path, and looks the row up by
+ * `where` first when it may not. `false` is always a SAFE answer (the lookup
+ * path is correct for every shape, only slower), so anything this does not
+ * recognise as a plain matching value answers `false`: an operator other than a
+ * bare `equals`, a different object (two Dates compare by instant), a key that
+ * names no column, and NULL, which a unique index never treats as equal to
+ * anything.
+ */
+export function upsertWhereMatchesCreate(
+  meta: TableMetadata,
+  where: Record<string, unknown>,
+  create: Record<string, unknown>,
+): boolean {
+  const createByColumn = new Map<string, unknown>();
+  for (const [key, value] of Object.entries(create)) {
+    if (value === undefined) continue;
+    const column = resolveColumnName(meta, key);
+    if (column !== undefined) createByColumn.set(column, value);
+  }
+  let keys = 0;
+  for (const [key, raw] of Object.entries(expandCompoundUniqueWhere(meta, where))) {
+    if (raw === undefined) continue;
+    const column = resolveColumnName(meta, key);
+    if (column === undefined || !createByColumn.has(column)) return false;
+    const value = isBareEquals(raw) ? (raw as { equals: unknown }).equals : raw;
+    if (!sameKeyValue(value, createByColumn.get(column))) return false;
+    keys++;
+  }
+  return keys > 0;
+}
+
+/** `{ equals: v }` and nothing else (a `mode` beside it changes the match). */
+function isBareEquals(value: unknown): boolean {
+  return isPlainObject(value) && Object.keys(value as object).length === 1 && 'equals' in (value as object);
+}
+
+/** Equal non-null key values; two Dates compare by instant, other objects by identity. */
+function sameKeyValue(a: unknown, b: unknown): boolean {
+  return a != null && (a instanceof Date && b instanceof Date ? a.getTime() === b.getTime() : a === b);
+}
+
 /** A bare value, or an operator object whose `equals` is a value. */
 function isPinnedToOneValue(value: unknown): boolean {
   if (value === undefined || value === null) return false;

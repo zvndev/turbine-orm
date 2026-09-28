@@ -186,6 +186,8 @@ export interface CompatQueryInterface {
   buildDelete(args: Record<string, unknown>): DeferredQuery<unknown>;
   buildDeleteMany(args: Record<string, unknown>): DeferredQuery<{ count: number }>;
   buildUpsert(args: Record<string, unknown>): DeferredQuery<unknown>;
+  /** Whether `upsert()` will look the row up first (and `buildUpsert` refuse). Absent on PowDB. */
+  upsertNeedsLookup?(args: Record<string, unknown>): boolean;
   buildCount(args?: Record<string, unknown>): DeferredQuery<number>;
   buildAggregate(args: Record<string, unknown>): DeferredQuery<unknown>;
   buildGroupBy(args: Record<string, unknown>): DeferredQuery<unknown[]>;
@@ -2218,49 +2220,6 @@ function hasNestedKeys(ctx: Ctx, mm: PrismaModelMap, data: unknown): boolean {
 }
 
 /**
- * Whether an upsert's translated `where` key values all equal the
- * corresponding `create` values. When they do (the common Prisma idiom), the
- * native single-statement ON CONFLICT upsert is semantically identical to
- * Prisma's lookup-first and stays atomic. When they differ, native upsert
- * would insert the `create` row even though the `where` row exists, so the
- * adapter must emulate lookup-first instead.
- */
-function upsertKeysMatch(t: Args): boolean {
-  const where = t.where;
-  const create = t.create;
-  if (!isPlainObject(where) || !isPlainObject(create)) return false;
-  const scalarEq = (a: unknown, b: unknown): boolean => {
-    if (a instanceof Date || b instanceof Date) {
-      return a instanceof Date && b instanceof Date && a.getTime() === b.getTime();
-    }
-    return a === b;
-  };
-  for (const [k, v] of Object.entries(where)) {
-    if (v !== null && typeof v === 'object' && !(v instanceof Date)) {
-      // Compound-unique selector object: every member must scalar-match create.
-      if (Array.isArray(v)) return false;
-      for (const [mk, mv] of Object.entries(v as Record<string, unknown>)) {
-        if (mv !== null && typeof mv === 'object' && !(mv instanceof Date)) return false;
-        if (!scalarEq(mv, (create as Record<string, unknown>)[mk])) return false;
-      }
-      continue;
-    }
-    if (!scalarEq(v, (create as Record<string, unknown>)[k])) return false;
-  }
-  return true;
-}
-
-/** Prisma upsert semantics: look up by where; update the found row, else insert create. */
-async function upsertLookupFirst(qi: CompatQueryInterface, t: Args): Promise<unknown> {
-  const existing = await qi.findUnique({ where: t.where });
-  // The projection rides along so both branches return what the native upsert
-  // path returns (an explicitly selected PII field included).
-  const shape = { select: t.select, omit: t.omit };
-  if (existing) return qi.update({ where: t.where, data: t.update, ...shape });
-  return qi.create({ data: t.create, ...shape });
-}
-
-/**
  * The row shapes a translated `createMany` has to insert, as contiguous runs
  * that each name the same fields (see {@link createManyShapeRuns}).
  *
@@ -2328,7 +2287,7 @@ function makeDelegate(
       build: (qi: CompatQueryInterface, t: Args) => DeferredQuery<unknown>;
       reshape: (raw: unknown) => unknown;
       /** True when this call cannot run as one deferred statement (see Batchable.nested). */
-      nested?: (t: Args) => boolean;
+      nested?: (t: Args, qi: CompatQueryInterface) => boolean;
       /** Sequential-in-tx override used by the batch fallback (defaults to `run` on the tx table). */
       execInTx?: (table: (name: string) => CompatQueryInterface, t: Args) => Promise<unknown>;
     },
@@ -2346,7 +2305,7 @@ function makeDelegate(
           reshape: batch.reshape,
           nested: () => {
             try {
-              return batch.nested?.(translate()) ?? false;
+              return batch.nested?.(translate(), getQI()) ?? false;
             } catch {
               return false; // let the build path surface the translation error consistently
             }
@@ -2581,25 +2540,17 @@ function makeDelegate(
           applyNativeOptions(UPSERT_OPTIONS, a, t);
           return t;
         },
-        (qi, t) => {
-          // Native ON CONFLICT upsert is only Prisma-equivalent when the where
-          // key values equal the create values AND no nested write data is
-          // present; otherwise emulate Prisma's lookup-first atomically.
-          if (upsertKeysMatch(t) && !hasNestedKeys(ctx, mm, t.create) && !hasNestedKeys(ctx, mm, t.update)) {
-            return qi.upsert(t).then(shape);
-          }
-          return runInTx(async (table) => shape(await upsertLookupFirst(table(mm.table), t)));
-        },
+        // Core `upsert` has Prisma's semantics itself (it looks the row up by
+        // `where` whenever one conflict statement would mean something else,
+        // and runs nested writes), so the adapter passes it straight through.
+        (qi, t) => qi.upsert(t).then(shape),
         {
           build: (qi, t) => qi.buildUpsert(t),
           reshape: shape,
-          nested: (t) => !upsertKeysMatch(t) || hasNestedKeys(ctx, mm, t.create) || hasNestedKeys(ctx, mm, t.update),
-          execInTx: async (table, t) => {
-            if (upsertKeysMatch(t) && !hasNestedKeys(ctx, mm, t.create) && !hasNestedKeys(ctx, mm, t.update)) {
-              return shape(await table(mm.table).upsert(t));
-            }
-            return shape(await upsertLookupFirst(table(mm.table), t));
-          },
+          // Batchable only when core would run it as one statement. PowDB has
+          // no deferred statements at all, so it always takes the tx path.
+          nested: (t, qi) => qi.upsertNeedsLookup?.(t) ?? true,
+          execInTx: async (table, t) => shape(await table(mm.table).upsert(t)),
         },
       ) as unknown as Promise<PrismaModelTypes['Row']>;
     },

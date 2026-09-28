@@ -170,10 +170,18 @@ const CLAIMS: Claim[] = [
     run: throws('TURBINE_E003', 'cheese_wheels', 'delete', { where: { status: 'graded' } }),
   },
   {
-    says: "an upsert's `where` IS its `ON CONFLICT` target, so a non-unique one is refused, not sent.",
+    says: "an upsert's `where` names the row to update (the `ON CONFLICT` target when `create` agrees), so a non-unique one is refused, not sent.",
     run: throwsSaying('TURBINE_E003', 'conflict target', 'cheese_wheels', 'upsert', {
       where: { status: 'graded' },
       create: { status: 'graded' },
+      update: { status: 'graded' },
+    }),
+  },
+  {
+    says: 'a non-unique upsert `where` is refused the same way when `create` does not carry its values (the lookup path).',
+    run: throwsSaying('TURBINE_E003', 'conflict target', 'cheese_wheels', 'upsert', {
+      where: { status: 'graded' },
+      create: {},
       update: { status: 'graded' },
     }),
   },

@@ -242,9 +242,12 @@ where: { guildId: 4, batchRef: 'WB-0007' }              // equivalent
 
 `update`, `delete` and `upsert` each require a `where` that identifies one row,
 by the same rule as `findUnique`, and anything else is `TURBINE_E003` naming the
-keys that would work. For an upsert the `where` **is** the `ON CONFLICT` target,
-so a non-unique predicate is refused rather than sent. Use `updateMany` and
-`deleteMany` for "every row matching a filter".
+keys that would work. For an upsert the `where` names the row to update, and is
+the `ON CONFLICT` target when `create` carries the same values, so a non-unique
+predicate is refused rather than sent. When `create` does not carry them (a
+`create` that leaves `id` to its sequence, say), `upsert` looks the row up by
+`where` first, inside a transaction. Use `updateMany` and `deleteMany` for
+"every row matching a filter".
 
 ## `distinct`
 

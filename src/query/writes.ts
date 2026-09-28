@@ -15,7 +15,11 @@ import type { ReturningSelection } from '../dialect.js';
 import { NotFoundError, OptimisticLockError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import type { TableMetadata } from '../schema.js';
 import { camelToSnake, snakeToCamel } from '../schema.js';
-import { assertMutationWhereIdentifiesOneRow, expandCompoundUniqueWhere } from './compound-unique.js';
+import {
+  assertMutationWhereIdentifiesOneRow,
+  expandCompoundUniqueWhere,
+  upsertWhereMatchesCreate,
+} from './compound-unique.js';
 import type { DeferredQuery } from './deferred.js';
 import { isUnmatchedPlainObject, UPDATE_OPERATOR_KEYS } from './filters.js';
 import type {
@@ -630,6 +634,64 @@ export function buildDelete<T extends object>(
   };
 }
 
+/**
+ * Why an `upsert` cannot run as this engine's single conflict statement, or
+ * `null` when it can. The one authority for that decision: `upsert()` asks it
+ * to choose between the statement and a lookup by `where` inside a
+ * transaction, and `buildUpsert` asks it to refuse the shapes its one
+ * statement cannot express, since a `DeferredQuery` (a pipeline, an array
+ * `$transaction`) has no second round trip to look anything up with.
+ *
+ * - `where-differs`: `where` is not pinned to `create`'s values, so the
+ *   conflict statement would compare the wrong row (upsertWhereMatchesCreate).
+ * - `empty-update`: an `update` with no fields has no `DO UPDATE SET` to emit;
+ *   every engine rejected the statement as a syntax error. Prisma reads it as
+ *   "create it if it is missing", which the lookup answers.
+ * - `global-filter`: MySQL's `ON DUPLICATE KEY UPDATE` has no predicate slot
+ *   and SQL Server's MERGE cannot take the builder's column references there,
+ *   so the table's global filter cannot guard the conflict update. The lookup
+ *   and the update both carry the filter, so another tenant's row is invisible
+ *   to them.
+ *
+ * Reads `currentSkip`, so it resolves `skipGlobalFilters` itself first.
+ */
+export type UpsertLookupReason = 'where-differs' | 'empty-update' | 'global-filter';
+
+export function upsertLookupReason<T extends object>(qi: BuilderCtx, args: UpsertArgs<T>): UpsertLookupReason | null {
+  const where = (args.where ?? {}) as Record<string, unknown>;
+  const create = (args.create ?? {}) as Record<string, unknown>;
+  if (!upsertWhereMatchesCreate(qi.tableMeta, where, create)) return 'where-differs';
+  if (writeEntries(qi, (args.update ?? {}) as Record<string, unknown>).length === 0) return 'empty-update';
+  if (!qi.dialect.supportsUpsertUpdateWhere) {
+    qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
+    const filter = whereMod.resolveGlobalFilter(qi, qi.table);
+    if (filter && whereMod.buildRenderedRefWhere(qi, qi.table, qi.tableMeta, qi.q(qi.table), filter, [])) {
+      return 'global-filter';
+    }
+  }
+  return null;
+}
+
+/** The refusal `buildUpsert` raises for each reason, naming the way forward. */
+function upsertStatementRefusal(qi: BuilderCtx, reason: UpsertLookupReason, where: Record<string, unknown>): Error {
+  const call = 'Call `upsert()` unbatched: it looks the row up by `where` first.';
+  if (reason === 'global-filter') {
+    return new UnsupportedFeatureError(
+      `a batched upsert on "${qi.table}", which has a global filter,`,
+      qi.dialect.name,
+      `Its upsert statement cannot carry the filter. ${call} Or pass \`skipGlobalFilters: UNSAFE\`.`,
+    );
+  }
+  const keys = Object.keys(where).filter((k) => where[k] !== undefined);
+  return new ValidationError(
+    `A batched upsert on "${qi.table}" cannot be one statement: ` +
+      (reason === 'empty-update'
+        ? 'its `update` is empty. '
+        : `\`where\` (${keys.join(', ')}) does not carry \`create\`'s values, which are what one statement matches on. `) +
+      call,
+  );
+}
+
 export function buildUpsert<T extends object>(
   qi: BuilderCtx,
   args: UpsertArgs<T>,
@@ -658,6 +720,10 @@ export function buildUpsert<T extends object>(
   // `allowFullTableScan: UNSAFE`, which is not an option on `UpsertArgs` at
   // all, so borrowing it here would name a way out that does not exist.
   assertMutationWhereIdentifiesOneRow(qi.tableMeta, qi.table, upsertWhere, 'upsert');
+  // `upsert()` never reaches here with a reason (it looks the row up instead),
+  // so this refuses only a batched upsert, which has no round trip to spare.
+  const lookupReason = upsertLookupReason(qi, args);
+  if (lookupReason) throw upsertStatementRefusal(qi, lookupReason, upsertWhere);
   // Build the INSERT part from create data
   const createEntries = writeEntries(qi, args.create as Record<string, unknown>);
   const columns = createEntries.map(([k]) => qi.toSqlColumn(k));
@@ -694,24 +760,6 @@ export function buildUpsert<T extends object>(
   // globally filtered table at parse time (42702), insert path included.
   let updateWhere: string | undefined;
   const upsertFilter = whereMod.resolveGlobalFilter(qi, qi.table);
-  if (upsertFilter && !qi.dialect.supportsUpsertUpdateWhere) {
-    // MySQL's `ON DUPLICATE KEY UPDATE` has no predicate slot and SQL Server's
-    // MERGE cannot take the builder's column references there, so on those
-    // engines the filter used to be DROPPED from the conflict update, silently.
-    // A tenant-scoped upsert whose key matched another tenant's row updated
-    // that row. Refused instead, when the filter would compile to anything:
-    // the global-filter contract is that it scopes every update, and an
-    // upsert that cannot honour it must not run as if it did.
-    if (whereMod.buildRenderedRefWhere(qi, qi.table, qi.tableMeta, qi.q(qi.table), upsertFilter, [])) {
-      throw new UnsupportedFeatureError(
-        `upsert on "${qi.table}", which has a global filter,`,
-        qi.dialect.name,
-        "This engine's upsert statement cannot carry the filter on its conflict update, so it could update a row " +
-          'the filter hides. Use findUnique, then update or create, inside $transaction; or pass ' +
-          '`skipGlobalFilters: UNSAFE` if the upsert is meant to reach every row.',
-      );
-    }
-  }
   if (qi.dialect.supportsUpsertUpdateWhere) {
     const gf = upsertFilter;
     if (gf) {

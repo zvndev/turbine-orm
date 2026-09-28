@@ -84,7 +84,7 @@ The practical guidance: stay on the latest minor. We do not backport fixes to ol
 - **Published releases, in sync.** Every release has a matching `vX.Y.Z` git tag **and** a published GitHub Release with notes. npm, git tags, and GitHub Releases agree. (See [GitHub Releases](https://github.com/zvndev/turbine-orm/releases) and [CHANGELOG.md](./CHANGELOG.md); [docs/releases/](./docs/releases/) holds only one hand-written file from before that step was automated.)
 - **Migration durability.** The migration format and `_turbine_migrations` schema are committed to as-is, a 1.0 upgrade must not require re-checksumming or re-applying existing migrations.
 
-### Honest status today (0.80 line)
+### Honest status today (0.81 line)
 
 We are **not at 1.0 yet**, and the gaps are specific. (This section is dated by its claims, not by a version stamp; an earlier revision froze itself at 0.48.0 and quietly aged for 16 minors.)
 
@@ -92,6 +92,7 @@ We are **not at 1.0 yet**, and the gaps are specific. (This section is dated by 
 - Multi-dialect engines (SQLite / MySQL / MSSQL / PowDB) ship as subpath exports but are not yet on the Stable tier, see Experimental surfaces.
 - Every release gets a git tag and a GitHub Release with notes from the CHANGELOG; the release workflow creates the GitHub Release automatically on a tag push.
 - The formal Stable-surface freeze has **not started**. The 0.49–0.78 run shipped several breaking changes to Stable surfaces, each under the security/correctness escape hatch above (silent-wrong-results fixes), each called out in the CHANGELOG. The most recent is 0.78.0, and it is the largest of them: six, of which the clearest is `update()`, `delete()` and `upsert()` refusing a `where` that does not identify a single row. That is the exact sibling of the 0.73.0 change to `findUnique`, five releases later, on the three methods that write to one row. The freeze clock starts when a release ships with no such change, and resets when one does, so it resets here.
+- 0.81.0 changes what `upsert()` does on a Stable surface, under the correctness escape hatch: when its `where` values are not the ones `create` carries, it now updates the row `where` names instead of running a conflict statement that matched on `create`'s values. The old answer was silently wrong (a keyless `create` inserted a new row on every call). The same release lets MySQL and SQL Server run a globally filtered `upsert()` through a filtered lookup instead of refusing it. A batched `buildUpsert` refuses the shapes it cannot express, with `TURBINE_E003`. The freeze clock resets here.
 - 0.80.0's one breaking change is on Experimental engines only: an `upsert` on a table with a global filter is refused with E017 on MySQL and SQL Server, where it used to run without the filter and could update a row the filter hides. On Stable surfaces it changes defaults without breaking them: a dropped connection rejects with E004 instead of exiting the process, and a read or a transaction's `BEGIN` sent on a connection the server had already closed is retried once.
 
 When those are addressed, we'll cut 1.0, and not before. Until then, the safe way to adopt Turbine is to **pin a version** and read the CHANGELOG before upgrading. Stable surfaces should carry you across minors without code changes; Experimental surfaces may not.

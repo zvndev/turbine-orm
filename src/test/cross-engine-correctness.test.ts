@@ -359,6 +359,13 @@ interface EngineHarness {
    * still asserts the rows LANDED, it just reads them back on MySQL.
    */
   createManyReturnsRows: boolean;
+  /**
+   * A second client over the SAME connection pool, configured with global
+   * filters (a tenant scope). Never disconnected on its own: the pool belongs
+   * to the harness and `close()` ends it.
+   */
+  // biome-ignore lint/suspicious/noExplicitAny: TurbineClient, see client().
+  filtered(globalFilters: Record<string, Record<string, unknown>>): Promise<any>;
 }
 
 // --- sqlite ----------------------------------------------------------------
@@ -400,6 +407,10 @@ function sqliteHarness(): EngineHarness {
       c = turbineSqlite(db, s);
       await this.reseed();
     },
+    async filtered(globalFilters) {
+      const { turbineSqlite } = await import('../sqlite.js');
+      return turbineSqlite(db, s, { globalFilters });
+    },
     async reseed() {
       for (const t of TABLES_CHILD_FIRST) db.exec(`DELETE FROM ${t};`);
       const stmts = [
@@ -427,6 +438,8 @@ const MYSQL_URL = process.env.MYSQL_URL ?? process.env.MYSQL_TEST_URL ?? '';
 function mysqlHarness(): EngineHarness {
   // biome-ignore lint/suspicious/noExplicitAny: mysql2 pool, loaded dynamically only when gated on.
   let rawPool: any;
+  // biome-ignore lint/suspicious/noExplicitAny: MysqlPool, loaded dynamically only when gated on.
+  let pool: any;
   // biome-ignore lint/suspicious/noExplicitAny: TurbineClient, see EngineHarness.
   let c: any;
   let s: SchemaMetadata;
@@ -478,10 +491,14 @@ function mysqlHarness(): EngineHarness {
       for (const t of TABLES_CHILD_FIRST) await rawPool.query(`DROP TABLE IF EXISTS \`${t}\``);
       await rawPool.query('SET FOREIGN_KEY_CHECKS=1');
       for (const stmt of MYSQL_DDL) await rawPool.query(stmt);
-      const pool = new MysqlPool(rawPool);
+      pool = new MysqlPool(rawPool);
       s = await introspectMysqlWith(async (sql, params) => (await pool.query(sql, params)).rows, 'turbine_cross');
       c = await turbineMysql(pool, s);
       await this.reseed();
+    },
+    async filtered(globalFilters) {
+      const { turbineMysql } = await import('../mysql.js');
+      return turbineMysql(pool, s, { globalFilters });
     },
     async reseed() {
       await rawPool.query('SET FOREIGN_KEY_CHECKS=0');
@@ -514,6 +531,8 @@ const MSSQL_URL = process.env.MSSQL_URL ?? process.env.MSSQL_TEST_URL ?? '';
 function mssqlHarness(): EngineHarness {
   // biome-ignore lint/suspicious/noExplicitAny: mssql pool, loaded dynamically only when gated on.
   let rawPool: any;
+  // biome-ignore lint/suspicious/noExplicitAny: MssqlPool, loaded dynamically only when gated on.
+  let pool: any;
   // biome-ignore lint/suspicious/noExplicitAny: TurbineClient, see EngineHarness.
   let c: any;
   let s: SchemaMetadata;
@@ -556,10 +575,14 @@ function mssqlHarness(): EngineHarness {
         await rawPool.request().batch(`IF OBJECT_ID('${t}','U') IS NOT NULL DROP TABLE ${t}`);
       }
       for (const stmt of MSSQL_DDL) await rawPool.request().batch(stmt);
-      const pool = new MssqlPool(rawPool, mssql.default ?? mssql);
+      pool = new MssqlPool(rawPool, mssql.default ?? mssql);
       s = await introspectMssqlWith(async (sql, params) => (await pool.query(sql, params)).rows, 'dbo');
       c = await turbineMssql(pool, s);
       await this.reseed();
+    },
+    async filtered(globalFilters) {
+      const { turbineMssql } = await import('../mssql.js');
+      return turbineMssql(pool, s, { globalFilters });
     },
     async reseed() {
       for (const t of TABLES_CHILD_FIRST) await rawPool.request().batch(`DELETE FROM ${t}`);
@@ -941,6 +964,65 @@ function registerBattery(h: EngineHarness): void {
       });
       assert.equal(updated.name, 'Upsert Two');
       assert.equal(n(await users().count({ where: { email: 'ups@example.com' } })), 1);
+    });
+
+    // `upsert` finds the row `where` names. One conflict statement compares
+    // `create`'s values instead, so these shapes look the row up first; before
+    // that, the first inserted a new row every time, the second updated (or on
+    // MySQL, re-read) the wrong row, and the empty update was a syntax error.
+    const newUser = (email: string) => ({ orgId: 1, email, name: 'Never', nameCs: 'Never', role: 'member' });
+
+    it('upsert `where: { id }` with a keyless `create` updates that row and inserts nothing', async () => {
+      const row = await users().upsert({
+        where: { id: 1 },
+        create: newUser('never@example.com'),
+        update: { name: 'Alice Renamed' },
+      });
+      assert.equal(n(row.id), 1);
+      assert.equal(row.name, 'Alice Renamed');
+      assert.equal(n(await users().count()), USERS.length);
+    });
+
+    it('upsert `where: { email: a }` with `create: { email: b }` updates and returns a', async () => {
+      const row = await users().upsert({
+        where: { email: 'user1@example.com' },
+        create: newUser('user2@example.com'),
+        update: { name: 'Alice Again' },
+      });
+      assert.equal(row.email, 'user1@example.com');
+      assert.equal(row.name, 'Alice Again');
+      assert.equal((await users().findUnique({ where: { id: 2 } }))?.name, 'Bob %Editor_');
+    });
+
+    it('upsert with an empty `update` returns the row unchanged, and inserts when it is missing', async () => {
+      const found = await users().upsert({ where: { id: 1 }, create: newUser('x@example.com'), update: {} });
+      assert.equal(found.name, 'Alice Admin');
+      const made = await users().upsert({
+        where: { email: 'e@example.com' },
+        create: newUser('e@example.com'),
+        update: {},
+      });
+      assert.equal(made.email, 'e@example.com');
+      assert.equal(n(await users().count()), USERS.length + 1);
+    });
+
+    // MySQL and SQL Server cannot put the filter on their conflict statement,
+    // so 0.80 refused this call there (E017). The lookup carries the filter on
+    // every engine: another tenant's row is invisible to it, and never updated.
+    it('a tenant-filtered upsert runs, and never updates another tenant row', async () => {
+      const scoped = await h.filtered({ users: { orgId: 1 } });
+      const mine = await scoped
+        .table('users')
+        .upsert({ where: { id: 1 }, create: newUser('y@example.com'), update: { name: 'Scoped' } });
+      assert.equal(mine.name, 'Scoped');
+      await assert.rejects(
+        () =>
+          scoped
+            .table('users')
+            .upsert({ where: { id: 4 }, create: newUser('user4@example.com'), update: { name: 'Hijack' } }),
+        UniqueConstraintError,
+      );
+      assert.equal((await users().findUnique({ where: { id: 4 } }))?.name, 'Dave Admin');
     });
 
     it('a unique violation surfaces as UniqueConstraintError (E008), not a raw driver error', async () => {

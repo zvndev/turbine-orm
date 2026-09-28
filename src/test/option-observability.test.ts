@@ -114,7 +114,9 @@ const FIXTURES: { name: string; primaryKey: string[]; baselines: Record<string, 
       delete: { where: { tenantId: 't1', id: 1 } },
       // `upsert`'s where is its CONFLICT TARGET, so the same rule applies: the
       // whole composite key, or nothing addresses one row to conflict on.
-      upsert: { where: { tenantId: 't1', id: 1 }, create: { name: 'a' }, update: { name: 'b' } },
+      // `create` carries the same key values: the one-statement form is only
+      // compiled when `where` is pinned to `create`'s values.
+      upsert: { where: { tenantId: 't1', id: 1 }, create: { tenantId: 't1', id: 1, name: 'a' }, update: { name: 'b' } },
     },
   },
 ];
@@ -157,7 +159,7 @@ const BASELINE: Record<string, Args> = {
   updateMany: { where: { name: 'a' }, data: { name: 'b' } },
   delete: { where: { id: 1 } },
   deleteMany: { where: { name: 'a' } },
-  upsert: { where: { id: 1 }, create: { name: 'a' }, update: { name: 'b' } },
+  upsert: { where: { id: 1 }, create: { id: 1, name: 'a' }, update: { name: 'b' } },
   count: {},
   aggregate: { _count: { id: true } },
   groupBy: { by: ['name'], _count: { id: true } },
@@ -199,14 +201,21 @@ const OBSERVATION: Record<string, Observation> = {
   'findUnique.where': { how: 'compiled', value: { email: 'other@example.test' } },
   'update.where': { how: 'compiled', value: { email: 'other@example.test' } },
   'delete.where': { how: 'compiled', value: { email: 'other@example.test' } },
-  // `upsert.where` is the conflict target, refused unless it names a unique key.
-  'upsert.where': { how: 'compiled', value: { email: 'other@example.test' } },
+  // `upsert.where` names the row, refused unless it names a unique key. The
+  // compiled (one-statement) form also needs `create` to carry the same values,
+  // or it is refused as a shape only `upsert()`'s lookup can answer, so the
+  // probe brings a `create` that agrees with both the baseline and the probe.
+  'upsert.where': {
+    how: 'compiled',
+    value: { email: 'other@example.test' },
+    needs: { create: { tenantId: 't1', id: 1, email: 'other@example.test', name: 'a' } },
+  },
   select: { how: 'compiled', value: { id: true } },
   omit: { how: 'compiled', value: { name: true } },
   with: { how: 'compiled', value: { posts: true } },
   data: { how: 'compiled', value: { name: 'changed-by-the-matrix' } },
   'createMany.data': { how: 'compiled', value: [{ name: 'x' }, { name: 'y' }] },
-  'upsert.create': { how: 'compiled', value: { name: 'created-differently' } },
+  'upsert.create': { how: 'compiled', value: { tenantId: 't1', id: 1, name: 'created-differently' } },
   'upsert.update': { how: 'compiled', value: { name: 'updated-differently' } },
 
   // --- ordering, paging, de-duplication ------------------------------------

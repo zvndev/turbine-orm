@@ -740,8 +740,8 @@ describe('prisma-compat, $transaction([...]) with nested write data', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Upsert semantics (Prisma is where-lookup-first; native ON CONFLICT only
-// when the where key values equal the create values)
+// Upsert semantics (Prisma is where-lookup-first; core decides when one
+// conflict statement means the same thing)
 // ---------------------------------------------------------------------------
 
 describe('prisma-compat, upsert semantics', () => {
@@ -758,42 +758,29 @@ describe('prisma-compat, upsert semantics', () => {
     assert.ok(!calls.some((c) => c.method === 'findUnique'));
   });
 
-  it('key mismatch: updates the where row when it exists (never inserts create)', async () => {
+  // Core `upsert` owns Prisma's lookup-first semantics since 0.81 (the adapter
+  // used to emulate it, which left direct core callers with the silent
+  // single-statement answer). The behaviour itself is proven against a live
+  // database in upsert-where-lookup.integration.test.ts; here the adapter's
+  // job is only to hand the translated call through unchanged.
+  it('key mismatch: hands the translated upsert to core, which looks the row up', async () => {
     const { schema, map } = fixture();
-    const { db, calls } = spyDb(schema, {
-      'users.findUnique': { id: 1, emailAddress: 'a@b.com' },
-      'users.update': { id: 1, emailAddress: 'a@b.com', name: 'X' },
-    });
+    const { db, calls } = spyDb(schema, { 'users.upsert': { id: 1, emailAddress: 'a@b.com', name: 'X' } });
     const compat = mkCompat(db, map);
     const row: Any = await compat.User.upsert({
       where: { id: 1 },
       create: { id: 2, email: 'b@c.com' } as Any,
       update: { name: 'X' },
     });
-    assert.equal(row.id, 1, 'row A updated, row B never inserted');
+    assert.equal(row.id, 1);
     assert.deepEqual(
       calls.map((c) => c.method),
-      ['findUnique', 'update'],
+      ['upsert'],
     );
-  });
-
-  it('key mismatch: creates when the where row does not exist', async () => {
-    const { schema, map } = fixture();
-    const { db, calls } = spyDb(schema, {
-      'users.findUnique': null,
-      'users.create': { id: 2, emailAddress: 'b@c.com' },
-    });
-    const compat = mkCompat(db, map);
-    const row: Any = await compat.User.upsert({
-      where: { id: 99 },
-      create: { id: 2, email: 'b@c.com' } as Any,
-      update: { name: 'X' },
-    });
-    assert.equal(row.id, 2);
-    assert.deepEqual(
-      calls.map((c) => c.method),
-      ['findUnique', 'create'],
-    );
+    const args = calls[0]!.args as Any;
+    assert.deepEqual(args.where, { id: 1 });
+    assert.equal(args.create.id, 2);
+    assert.equal(args.create.emailAddress, 'b@c.com', 'create is translated to core field names');
   });
 
   it('compound-selector where matches when member values equal create values', async () => {

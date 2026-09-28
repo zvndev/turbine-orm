@@ -363,7 +363,7 @@ Beyond the Postgres-only trio every non-Postgres engine throws on (pgvector, LIS
 
 - **Filters:** array, full-text, and pgvector-distance filters; vector / distance ordering. (JSON path filters: see above.)
 - **Composite keys via subqueries:** composite-key relation filters, composite-key nested reads, and composite-junction many-to-many; PowQL has no tuple-`in`. (A single-row `findUnique`/`upsert` on a composite PK works.)
-- **Writes:** nested writes inside `createMany` / `upsert` (use `create` / `update`).
+- **Writes:** nested writes inside `createMany` (use `create`).
 - **Reads:** cursor pagination and `findManyStream` (no server-side cursor; page with `findMany({ limit, offset })`).
 - **Version-gated correctness (engine < 0.20):** comparisons on a PowDB-native `datetime` column, including `in` / `notIn`, and per-field `_count` of a **nullable** column. See the [correctness round](#correctness-round-powdb-020).
 
