@@ -6,7 +6,7 @@ If you discover a security vulnerability in Turbine ORM, please report it respon
 
 **Do NOT open a public GitHub issue for security vulnerabilities.**
 
-Instead, email: **dev@zvndev.com**
+Instead, email: **support@turbineorm.dev**
 
 Include:
 - Description of the vulnerability

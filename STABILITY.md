@@ -66,7 +66,7 @@ Turbine is pre-1.0. **Security and correctness fixes land on the latest minor re
 
 There is deliberately no version table here. An earlier revision of this document carried one, and it drifted 36 minors behind the shipping package before an audit caught it, which is worse than no table: a policy document that names stale versions reads as a policy. The rule is the contract: **the supported version is whatever minor is current on [npm's `latest` tag](https://www.npmjs.com/package/turbine-orm)**; older minors receive nothing.
 
-The practical guidance: stay on the latest minor. We do not backport fixes to older minors. To report a vulnerability privately, email **dev@zvndev.com**, see [SECURITY.md](./SECURITY.md) for the process.
+The practical guidance: stay on the latest minor. We do not backport fixes to older minors. To report a vulnerability privately, email **support@turbineorm.dev**, see [SECURITY.md](./SECURITY.md) for the process.
 
 ## The road to 1.0
 
@@ -100,5 +100,5 @@ When those are addressed, we'll cut 1.0, and not before. Until then, the safe wa
 ## Questions
 
 - Stability or upgrade questions: open a GitHub issue.
-- Security: **dev@zvndev.com** (see [SECURITY.md](./SECURITY.md)).
+- Security: **support@turbineorm.dev** (see [SECURITY.md](./SECURITY.md)).
 - Full change history: [CHANGELOG.md](./CHANGELOG.md).

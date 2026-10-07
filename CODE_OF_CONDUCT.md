@@ -34,7 +34,7 @@ This Code of Conduct applies within all project spaces (GitHub issues, pull requ
 
 ## Enforcement
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the maintainers at **dev@zvndev.com**. All complaints will be reviewed and investigated promptly and fairly. Maintainers are obligated to respect the privacy and security of the reporter.
+Instances of abusive, harassing, or otherwise unacceptable behavior may be reported to the maintainers at **support@turbineorm.dev**. All complaints will be reviewed and investigated promptly and fairly. Maintainers are obligated to respect the privacy and security of the reporter.
 
 ## Enforcement Guidelines
 
