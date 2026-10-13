@@ -2,13 +2,10 @@
  * turbine-orm, `globalFilters` checked when the client is constructed
  *
  * A global filter is a tenancy or soft-delete boundary, so a filter that
- * silently applies to nothing is the worst way for it to fail. Two ways to get
- * one used to be accepted without a word:
- *
- *   - a key naming no table (a typo, or a table that was renamed);
- *   - the client ACCESSOR spelling of a multi-word table (`blogPosts` for
- *     `blog_posts`), which the config docs show, while the query builder looked
- *     filters up by table name only.
+ * silently applies to nothing is the worst way for it to fail: a key naming no
+ * table (a typo, a renamed table), or a key the query builder does not look
+ * up. The builder looks filters up by TABLE name, while the config docs key
+ * them by client ACCESSOR (`blogPosts` for `blog_posts`).
  *
  * {@link normalizeGlobalFilters} maps each key to its table name, refuses a key
  * that names no table and a static filter whose keys name no column or
@@ -18,16 +15,62 @@
  */
 
 import { ValidationError } from './errors.js';
+import { isPlainRecord, setOwn } from './query/filters.js';
 import type { GlobalFilters } from './query/index.js';
 import { resolveColumnName, resolveRelation } from './query/utils.js';
+import { type CombinatorKey, combinatorBranches } from './query/where-compile.js';
 import type { SchemaMetadata, TableMetadata } from './schema.js';
 
-/** The accessor a table gets on the client (`blog_posts` -> `blogPosts`), as the constructors derive it. */
-function accessorFor(tableName: string): string {
+/** The accessor a table gets on the client (`blog_posts` -> `blogPosts`). The one place it is derived. */
+export function tableAccessorName(tableName: string): string {
   return tableName.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
 }
 
+/**
+ * Whether a `skipGlobalFilters: [UNSAFE, ...names]` list names `table`, by its
+ * table name or by its client accessor, the two spellings `globalFilters` keys
+ * accept. With `tables` (the schema's table map), an accessor spelling that is
+ * itself another table's name refers to that other table only.
+ */
+export function skipListNamesTable(
+  names: readonly string[],
+  table: string,
+  tables?: Readonly<Record<string, unknown>>,
+): boolean {
+  if (names.includes(table)) return true;
+  const accessor = tableAccessorName(table);
+  if (accessor === table || (tables !== undefined && Object.hasOwn(tables, accessor))) return false;
+  return names.includes(accessor);
+}
+
+/**
+ * Refuse a `skipGlobalFilters` list entry that names no table, by table name or
+ * accessor: a misspelled entry skips nothing, so the filter the caller meant to
+ * lift stays on and the query quietly returns fewer rows than intended.
+ */
+export function assertSkipListNames(names: readonly string[], tables: Readonly<Record<string, unknown>>): void {
+  for (const name of names) {
+    if (Object.hasOwn(tables, name)) continue;
+    if (Object.keys(tables).some((table) => skipListNamesTable([name], table, tables))) continue;
+    const candidates = Object.keys(tables).flatMap((table) => [table, tableAccessorName(table)]);
+    const hint = nearestName(name, candidates);
+    throw new ValidationError(
+      `skipGlobalFilters names "${name}", which is not a table in the schema${hint ? `. Did you mean "${hint}"?` : '.'} ` +
+        'An entry that names no table skips nothing. List tables by table name (`blog_posts`) or client accessor (`blogPosts`).',
+    );
+  }
+}
+
 const COMBINATORS = new Set(['AND', 'OR', 'NOT']);
+
+/** How a non-plain-object config value reads in an error message. */
+function describeShape(value: unknown): string {
+  if (Array.isArray(value)) return 'an array';
+  if (value === null) return 'null';
+  if (typeof value !== 'object') return typeof value;
+  const name = (Object.getPrototypeOf(value) as { constructor?: { name?: string } } | null)?.constructor?.name;
+  return `an instance of ${name || 'a class'}, not a plain object`;
+}
 
 /**
  * Validate `globalFilters` against the schema and key it by table name.
@@ -38,16 +81,16 @@ export function normalizeGlobalFilters(
   schema: SchemaMetadata,
 ): GlobalFilters | undefined {
   if (filters === undefined || filters === null) return undefined;
-  if (typeof filters !== 'object' || Array.isArray(filters)) {
+  if (!isPlainRecord(filters)) {
     throw new ValidationError(
-      `globalFilters must be an object keyed by table, for example \`{ posts: { deletedAt: null } }\`; received ${
-        Array.isArray(filters) ? 'an array' : typeof filters
-      }.`,
+      `globalFilters must be an object keyed by table, for example \`{ posts: { deletedAt: null } }\`; received ${describeShape(
+        filters,
+      )}.`,
     );
   }
   const byAccessor = new Map<string, string>();
   for (const table of Object.keys(schema.tables)) {
-    const accessor = accessorFor(table);
+    const accessor = tableAccessorName(table);
     if (accessor !== table && !Object.hasOwn(schema.tables, accessor)) byAccessor.set(accessor, table);
   }
   const normalized: GlobalFilters = {};
@@ -70,37 +113,50 @@ export function normalizeGlobalFilters(
       );
     }
     keyFor.set(table, key);
-    const value = (filters as Record<string, unknown>)[key];
+    const value = filters[key];
     if (typeof value === 'function' || value === null) {
-      normalized[table] = value as GlobalFilters[string];
+      setOwn(normalized as Record<string, unknown>, table, value);
       continue;
     }
-    if (typeof value !== 'object' || Array.isArray(value)) {
+    if (!isPlainRecord(value)) {
       throw new ValidationError(
-        `globalFilters["${key}"] must be a where object or a function returning one; received ${
-          Array.isArray(value) ? 'an array' : value === undefined ? 'undefined' : typeof value
-        }. An undefined filter usually means the value it was built from was not available yet: pass a ` +
+        `globalFilters["${key}"] must be a where object or a function returning one; received ${describeShape(
+          value,
+        )}. An undefined filter usually means the value it was built from was not available yet: pass a ` +
           'function, which is evaluated per query, for anything that depends on the current request.',
       );
     }
-    assertFilterNamesExist(value as Record<string, unknown>, schema.tables[table]!, key, '');
-    normalized[table] = value as GlobalFilters[string];
+    assertFilterNamesExist(value, schema.tables[table]!, key, '');
+    setOwn(normalized as Record<string, unknown>, table, value);
   }
   return normalized;
 }
 
-/** Every top-level key of a static filter (and of its AND/OR/NOT branches) must be a column or relation. */
+/**
+ * Every top-level key of a static filter (and of its AND/OR/NOT branches) must
+ * be a column or relation, and every combinator must have a shape the query
+ * compiler reads: one it cannot read would apply no condition, so a tenant
+ * filter written as `OR: { ... }` would match every row.
+ */
 function assertFilterNamesExist(filter: Record<string, unknown>, meta: TableMetadata, key: string, path: string): void {
   for (const field of Object.keys(filter)) {
     const at = path ? `${path}.${field}` : field;
     if (COMBINATORS.has(field)) {
       const branch = filter[field];
-      const branches = Array.isArray(branch) ? branch : [branch];
-      branches.forEach((b, i) => {
-        if (b !== null && typeof b === 'object' && !Array.isArray(b)) {
-          assertFilterNamesExist(b as Record<string, unknown>, meta, key, Array.isArray(branch) ? `${at}[${i}]` : at);
-        }
-      });
+      try {
+        combinatorBranches(field as CombinatorKey, branch, meta.name);
+      } catch (err) {
+        if (!(err instanceof ValidationError)) throw err;
+        const reason = err.message.replace(/^\[TURBINE_E\d+\] /, '').replace(/ \(https:\/\/\S+\)$/, '');
+        throw new ValidationError(`globalFilters["${key}"]: "${at}" is refused. ${reason}`);
+      }
+      if (Array.isArray(branch)) {
+        branch.forEach((b, i) => {
+          if (b !== undefined) assertFilterNamesExist(b as Record<string, unknown>, meta, key, `${at}[${i}]`);
+        });
+      } else if (branch !== undefined) {
+        assertFilterNamesExist(branch as Record<string, unknown>, meta, key, at);
+      }
       continue;
     }
     if (resolveColumnName(meta, field) !== undefined) continue;
