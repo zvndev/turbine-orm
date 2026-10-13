@@ -85,13 +85,13 @@ function readmeFigures(pattern: RegExp): number[] {
 
 describe('README bundle-size claims equal the size-limit gate', () => {
   it('finds both numbers at all (anti-vacuous)', () => {
-    assert.ok(limitFor('main entry, import { TurbineClient }') > 0);
+    assert.ok(limitFor('main entry, the whole') > 0);
     assert.ok(limitFor('edge entry, turbine-orm/serverless') > 0);
     assert.ok(readmeFigures(/under \*\*(\d+) kB brotli\*\*/g).length > 0, 'the README must still state a figure');
   });
 
   it('the main entry: every README figure is the gate', () => {
-    const gate = limitFor('main entry, import { TurbineClient }');
+    const gate = limitFor('main entry, the whole');
     // "held under **86 kB brotli**" in the serverless section...
     const prose = readmeFigures(/under \*\*(\d+) kB brotli\*\*/g);
     assert.ok(prose.includes(gate), `README prose says ${prose.join('/')} kB, the gate is ${gate} kB`);
@@ -111,10 +111,7 @@ describe('README bundle-size claims equal the size-limit gate', () => {
   });
 
   it('every tracked file that states one of these claims states the gate', () => {
-    const gates = new Set([
-      limitFor('main entry, import { TurbineClient }'),
-      limitFor('edge entry, turbine-orm/serverless'),
-    ]);
+    const gates = new Set([limitFor('main entry, the whole'), limitFor('edge entry, turbine-orm/serverless')]);
     const files = claimBearingFiles();
     assert.ok(files.length > 5, `the file walk found ${files.length} files, so this check would be vacuous`);
 

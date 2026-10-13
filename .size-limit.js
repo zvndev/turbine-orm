@@ -311,12 +311,83 @@ const nodePlatform = (config) => {
 // numbers in this commit. The three SQL engine entries and powdb follow the
 // latest precedent (0.79.0), measured plus the 1 kB minimum, rounded up: sqlite
 // 78, mysql 79, mssql 81, powdb 97.
+// EVERY ENTRY RE-BASELINED 2026-10-13, at the 0.90.0 release, and by far the
+// largest move this file records. Measured on this build against main at the
+// 0.81 line (d9b06dd), same config: main 92.94 -> 145.53 (+52.6), serverless
+// 73.99 -> 114.08 (+40.1), sqlite 121.43, mysql 121.74, mssql 123.14,
+// powdb 143.27 (each about +43 to +48), prisma-compat 18.38, cli 1.85,
+// adapters 1.19.
+//
+// It is accounted for, module by module, from an esbuild metafile. On the edge
+// entry about 27 kB of the growth is new code and about 10 kB is new message
+// text, net of a 5.3 kB saving 0.90 already made (the catalog reader left the
+// edge graph). The largest contributors are query/writes.js (createMany sizing,
+// the onConflict bulk upsert, expression SET compilation, the MySQL re-read
+// safety rules), query/builder.js (cursor planning, protocol-cancel timeouts,
+// the one-deadline multi-statement write), client.js (the transaction runner,
+// sessionContext validation, pooler detection, logger and diagnostics wiring)
+// and eleven NEW modules: query/expr.js, transaction-state.js,
+// global-filters-config.js, query/normalize-args.js, transaction-control.js,
+// query/row-lock.js, supplied-pool-types.js, query/stream-idle.js,
+// diagnostics.js, logger.js and query/table-client.js. The explicit engine
+// capabilities add about 0.5 kB per entry. main carries about 7 kB more growth
+// than serverless: the schema tooling (generate.js, schema-sql.js,
+// schema-builder.js and the destructive scanner) grew with the release's
+// codegen and defineSchema validation.
+//
+// Checked the same way as every earlier move: bundling dist/index.js gives 58
+// modules, the only cli/ entries are still the sanctioned destructive.js /
+// sql-statements.js pair, and no engine module is reachable; dist/serverless.js
+// gives 45 modules with no cli/ or engine module at all.
+//
+// Two measured reductions were deliberately NOT taken in this release. Removing
+// esbuild's lazy-init wrappers (a registration slot in place of builder.ts's
+// dynamic import of client.ts) saves about 1 kB per entry and changes no public
+// behavior, but it touches the transaction path and was left for 0.91 rather
+// than landed at the release commit. Moving generate / introspect / schemaDiff /
+// schemaPush to a `turbine-orm/schema-tools` subpath saves 20.8 kB on main and
+// nothing anywhere else, and it is a breaking import change for a figure a
+// tree-shaking bundler already drops (see the next paragraph).
+//
+// THE MAIN ENTRY'S NAME WAS WRONG, and is corrected here. It said
+// `import { TurbineClient } from 'turbine-orm'` while measuring the WHOLE
+// barrel: size-limit bundles a file's full graph unless `import` is set. The
+// entry is renamed to say what it measures, and the tree-shaken
+// `import { TurbineClient }` is now its own entry, 113.88 kB on this build,
+// because a tree-shaking bundler drops the schema tooling a query-only
+// application never calls. The published claim stays on the barrel: it is the
+// conservative figure, and it is the number every earlier release published.
+// The published 0.81.0 tarball measures 74.03 kB for the tree-shaken import,
+// the same as its serverless entry, so this one grew 74.03 -> 113.88.
+//
+// main and serverless are published claims, so both move deliberately and in
+// the same commit as README.md (three places), site/app/page.tsx (prose and
+// the stat card) and the serverless / batadb / neon docs pages: main 147 kB,
+// serverless 116 kB. Each is the measured figure rounded up plus 1 kB, rather
+// than the bare round-up of earlier moves, so a review fix landing after this
+// measurement does not force a second claim change in the same release. Every
+// other entry follows the 5% convention at the top of this file: sqlite 128,
+// mysql 128, mssql 130, powdb 151, prisma-compat 20, the tree-shaken client
+// 120; cli and adapters are unchanged.
 export default [
   {
-    name: "main entry, import { TurbineClient } from 'turbine-orm'",
+    name: "main entry, the whole 'turbine-orm' barrel",
     path: 'dist/index.js',
     // Same number as the README's claim, on purpose. See the note above.
-    limit: '93 kB',
+    limit: '147 kB',
+    ignore: PG,
+    modifyEsbuildConfig: nodePlatform,
+  },
+  {
+    name: "client import, import { TurbineClient } from 'turbine-orm' (tree-shaken)",
+    // What a bundled application that only queries pays: the barrel minus the
+    // schema tooling (generate, introspect, schemaDiff, schemaPush). Not a
+    // published claim, so it follows the 5% convention. If it ever approaches
+    // the barrel, something in the client graph started importing the
+    // tooling. Added 2026-10-13, see the 0.90.0 note above.
+    path: 'dist/index.js',
+    import: '{ TurbineClient }',
+    limit: '120 kB',
     ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },
@@ -327,21 +398,21 @@ export default [
     // pagination dialect-hook dispatch). These are tiny and engine-neutral, but
     // the edge bundle includes the query builder, so the budget gets a small bump.
     path: 'dist/serverless.js',
-    limit: '74 kB',
+    limit: '116 kB',
     ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },
   {
     name: 'sqlite entry, turbine-orm/sqlite (node:sqlite + client graph)',
     path: 'dist/sqlite.js',
-    limit: '78 kB',
+    limit: '128 kB',
     ignore: [...PG, 'node:sqlite'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
     name: 'mysql entry, turbine-orm/mysql (client graph; mysql2 lazy-loaded)',
     path: 'dist/mysql.js',
-    limit: '79 kB',
+    limit: '128 kB',
     // mysql2 is an optional peer loaded via a dynamic import in the factory, so
     // it is never in the static graph, exclude it (and pg) from the footprint.
     ignore: [...PG, 'mysql2', 'mysql2/promise'],
@@ -352,7 +423,7 @@ export default [
     path: 'dist/mssql.js',
     // Slightly larger than the other engines: the FOR JSON PATH relation generator
     // and the INFORMATION_SCHEMA/sys introspector add real code (no extra deps).
-    limit: '81 kB',
+    limit: '130 kB',
     // mssql is an optional peer loaded via a dynamic import in the factory, so it
     // is never in the static graph, exclude it (and pg) from the footprint.
     ignore: [...PG, 'mssql'],
@@ -363,7 +434,7 @@ export default [
     // The largest entry: it carries the whole client/query graph AND powql.ts,
     // a second, parallel query generator for a non-SQL language.
     path: 'dist/powdb.js',
-    limit: '97 kB',
+    limit: '151 kB',
     // Both PowDB drivers are optional peers behind dynamic imports (the
     // networked client and the embedded napi addon), so neither is in the
     // static graph.
@@ -400,7 +471,7 @@ export default [
     // graph is NOT bundled with it. If this number jumps toward the other
     // entries, something started importing core values instead of core types.
     path: 'dist/prisma-compat.js',
-    limit: '16 kB',
+    limit: '20 kB',
     ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },

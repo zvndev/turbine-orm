@@ -52,6 +52,9 @@ import { postgresDialect, type Dialect } from 'turbine-orm';
 export const myDialect: Dialect = {
   ...postgresDialect,
   name: 'myengine',
+  // Without this, the spread hands your engine PostgreSQL's answers.
+  // See "Engine capabilities" below.
+  capabilities: { ...postgresDialect.capabilities, distinctOn: false },
   paramPlaceholder: (i) => `@p${i}`,
   supportsVector: false,
   supportsListenNotify: false,
@@ -92,6 +95,70 @@ The most important design rule in the contract. When your engine cannot do somet
 | `explainQuery` | optional | `{ prefix: string }`. Absent means `explain()` throws `TURBINE_E017` (SQL Server, whose SHOWPLAN needs a separate session toggle). |
 
 Every optional flag defaults to the behaviour that keeps existing dialects byte-identical, which is why new hooks can be added without touching the ones already shipped.
+
+## Engine capabilities: what the engine is, not what it is called
+
+Every dialect carries a `capabilities` object (`EngineCapabilities`, exported as a type). It answers the questions Turbine used to answer by comparing `dialect.name`: whether the engine has `DISTINCT ON`, where it sorts NULL, how many bind parameters one statement may carry, whether a failed statement aborts the transaction, and about thirty more. The `Dialect` type requires it, and `TurbineClient` refuses a dialect without one (`TURBINE_E003`).
+
+A spread copies `capabilities`, so a dialect built from an engine dialect inherits that engine's answers under whatever `name` you give it. That is right for a PostgreSQL-compatible engine and wrong for any other, so a dialect for a different engine states its own:
+
+```ts
+export const myDialect: Dialect = {
+  ...postgresDialect,
+  name: 'myengine',
+  capabilities: {
+    ...postgresDialect.capabilities,
+    distinctOn: false,
+    positionalJson: false,
+    nullsSortHigh: false,
+    readOnlyTransactions: false,
+    backendCancel: false,
+    abortsTransactionOnError: false,
+    statementSyntax: null,
+    // ...and every other key your engine answers differently
+  },
+};
+```
+
+Go through every key, not only the ones above. A key left at PostgreSQL's value is a claim about your engine, and a wrong `true` is a broken query at runtime rather than a clear `TURBINE_E017`. The JSDoc on `EngineCapabilities` describes each key, and the shipped engines are worked examples: `sqliteDialect.capabilities` (`turbine-orm/sqlite`), `mysqlDialect.capabilities` (`turbine-orm/mysql`) and `mssqlDialect.capabilities` (`turbine-orm/mssql`).
+
+Two things still follow the engine name rather than `capabilities`. `expr.now()`, `expr.greatest()` and `expr.least()` are spelled per engine, so a dialect under any name other than `postgresql`, `mysql`, `sqlite` or `mssql` refuses them with `TURBINE_E017`; every other update expression follows `capabilities`. And the column `DEFAULT` spellings `schemaToSQL` emits use PostgreSQL's spelling under any other name. Both become dialect hooks in a later release.
+
+| Key | PostgreSQL | What it decides |
+|---|---|---|
+| `distinctOn` | `true` | `SELECT DISTINCT ON`, for findMany `distinct` and groupBy `distinctOn`. Else E017. |
+| `positionalJson` | `true` | The positional relation encoding: the default `jsonEncoding` where true, refused where false. |
+| `nullsOrderingClause` | `true` | `NULLS FIRST` / `NULLS LAST`. Explicit `nulls` placement is E017 without it. |
+| `nullsSortHigh` | `true` | NULL sorts after every value ascending. A cursor seek places NULL keys where the engine sorts them. |
+| `insensitiveInList` | `true` | `mode: 'insensitive'` on `in` / `notIn`. Else E017. |
+| `jsonDocumentEquality` | `'jsonb'` | How two whole JSON documents compare: `'jsonb'`, `'exact'` (MySQL) or `'text'` (SQLite, SQL Server, which refuse a document comparison). |
+| `jsonExtractTyped` | `false` | Path extraction returns SQL-typed values (SQLite). |
+| `jsonExactNumericCast` | `true` | A JSON path range filter casts to exact `numeric`, rather than the dialect's float cast. |
+| `numericTextComparison` | `false` | A number compared with a text column converts the text (MySQL), so Turbine binds the number as text. |
+| `enforcesForeignKeys` | `true` | Declared foreign keys are always enforced, which the mass-mutation guard relies on. |
+| `partitionLimitPushdown` | `true` | The batched loader pushes a per-parent `limit` into its query through `buildPartitionLimit`. |
+| `utcTimestampRewrite` | `true` | The `utcTimestamps` rewrite of zone-less timestamps and `Date` parameters. |
+| `paramTypeCasts` | `true` | Bound values in update expressions carry a `::type` cast. |
+| `namedEnumTypes` | `true` | An enum is a named type (`CREATE TYPE ... AS ENUM`, `::"Enum"` casts). Else `buildEnumColumn`. |
+| `structuredValueColumns` | `'pg-scalars'` | Which columns refuse an object or array written to them. |
+| `maxBindParameters` | `65535` | The most bind parameters per statement. `createMany` sizes its chunks by it. |
+| `maxInsertRows` | `Infinity` | The most rows per plain `INSERT ... VALUES` (SQL Server: 1000). |
+| `upsertConflictTarget` | `'explicit'` | What a single-statement upsert conflicts on: the named target, or `'any-unique-key'` (MySQL). |
+| `setClauseOrder` | `'snapshot'` | Whether a later SET expression reads an earlier assignment (`'left-to-right'`, MySQL). |
+| `reselectLocksRows` | `false` | A reselect write's reads take `FOR UPDATE`. |
+| `integerDivision` | `'/'` | The truncating integer division operator (`DIV` on MySQL). |
+| `updateExpressions` | `true` | `expr.*` and `col()` in update data. Else E017. |
+| `bulkUpsertAppliesRepeatedKeys` | `false` | A multi-row upsert applies collation-equal keys instead of refusing, so Turbine checks afterwards in a transaction. |
+| `readOnlyTransactions` | `true` | `$transaction({ readOnly: true })`. Else E017. |
+| `connectionParameters` | `true` | Server settings as connection parameters, which `statementTimeoutMs` uses. Else E017. |
+| `backendCancel` | `true` | A timed-out statement can be cancelled on the server, so a timeout can report `outcome: 'not-executed'`. |
+| `idleTransactionTimeout` | `true` | A transaction can bound its own idle time on the server (the stream backstop). |
+| `abortsTransactionOnError` | `true` | A failed statement aborts the transaction, so the next one is refused locally. |
+| `connectionDriver` | `'pg-compatible'` | What backs a transaction's connection: `'pg-compatible'`, `'engine-driver'` or `'none'`. |
+| `preparesEveryStatement` | `false` | Every distinct statement text is prepared under a server-wide cap (MySQL), so `sqlComment.dynamic` is refused. |
+| `statementSyntax` | `'postgresql'` | The lexer that screens raw SQL for transaction control; `null` screens nothing. |
+| `inlineForeignKeys` | `true` | A column's inline `REFERENCES` creates a foreign key (MySQL ignores it). |
+| `unboundedTextKeys` | `true` | An unbounded text or binary column can be a key (not on MySQL or SQL Server). |
 
 ## `resultStrategy`: how a write returns its rows
 
@@ -179,7 +246,7 @@ Every hook here is optional, and omitting it falls back to the PostgreSQL behavi
 
 ## A checklist before you ship one
 
-1. Set every required capability flag from measured behavior. A `true` you cannot back up becomes a broken query at runtime; a `false` becomes a clear `TURBINE_E017`.
+1. Set every `capabilities` key and every required capability flag from measured behavior. A `true` you cannot back up becomes a broken query at runtime; a `false` becomes a clear `TURBINE_E017`.
 2. Pick the `resultStrategy` that matches reality, and document the consequences if it is not `'returning'`.
 3. Run the same query shapes the shipped engines are tested on: nested `with` at depth, an ordered to-many with a per-relation `limit`, a composite-key correlation, an empty to-many (it must be `[]`, never `null`), and a to-one that misses (it must be `null`).
 4. Check that identifiers with embedded quote characters survive `quoteIdentifier`.
