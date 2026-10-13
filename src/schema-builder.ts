@@ -120,8 +120,12 @@ export interface ColumnDef {
   nullable?: boolean;
   /** UNIQUE constraint */
   unique?: boolean;
-  /** DEFAULT expression (raw SQL, e.g. 'now()' or "'active'") */
-  default?: string;
+  /**
+   * DEFAULT expression (raw SQL, e.g. `'now()'` or `"'active'"`). A finite number
+   * or a boolean is written as the literal it is (`5`, `true`). Anything else is
+   * refused (E003).
+   */
+  default?: string | number | boolean;
   /**
    * REFERENCES target. Either the "table.column" string form or an object with
    * referential actions ({@link ReferenceDef}).
@@ -219,9 +223,33 @@ export interface ColumnConfig {
   tsType?: string | null;
 }
 
+/** What a value is, for a message: `an array`, `null`, `a string`. */
+function describeKind(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'an array';
+  return typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+}
+
+/**
+ * A declared DEFAULT as the SQL text the DDL generators take. A string is raw
+ * SQL, kept as written. A finite number or a boolean is the literal it is,
+ * where it used to reach the generator as a non-string and crash it with a
+ * TypeError. `undefined` and `null` mean no default.
+ */
+function declaredDefault(value: unknown, where: string): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'string') return value;
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  if ((typeof value === 'number' && Number.isFinite(value)) || typeof value === 'bigint') return String(value);
+  throw new ValidationError(
+    `Invalid default for ${where}: received ${describeKind(value)}${typeof value === 'number' ? ` (${value})` : ''}. ` +
+      `Write it as a string of raw SQL such as 'now()' or "'active'", or as a finite number or a boolean.`,
+  );
+}
+
 /** Convert a user-facing ColumnDef to the internal ColumnConfig */
-function resolveColumn(def: ColumnDef): ColumnConfig {
-  if (!(def.type in TYPE_MAP)) {
+function resolveColumn(def: ColumnDef, where = 'a column'): ColumnConfig {
+  if (!Object.hasOwn(TYPE_MAP, def.type)) {
     throw new ValidationError(`Invalid column type "${def.type}". Valid types: ${Object.keys(TYPE_MAP).join(', ')}`);
   }
   if (def.type === 'enum' && !def.enumName) {
@@ -237,7 +265,13 @@ function resolveColumn(def: ColumnDef): ColumnConfig {
   let onUpdate: ReferentialAction | null = null;
   if (typeof def.references === 'string') {
     referencesTarget = def.references;
-  } else if (def.references) {
+  } else if (def.references !== undefined && def.references !== null) {
+    if (typeof def.references !== 'object' || typeof def.references.target !== 'string') {
+      throw new ValidationError(
+        `defineSchema: ${where} has a "references" that is neither a "table.column" string nor ` +
+          `{ target: "table.column", onDelete?, onUpdate? }.`,
+      );
+    }
     referencesTarget = def.references.target;
     onDelete = def.references.onDelete ?? null;
     onUpdate = def.references.onUpdate ?? null;
@@ -249,7 +283,7 @@ function resolveColumn(def: ColumnDef): ColumnConfig {
     isNotNull: def.notNull ?? false,
     isNullable: def.nullable ?? false,
     isUnique: def.unique ?? false,
-    defaultValue: def.default ?? null,
+    defaultValue: declaredDefault(def.default, where),
     referencesTarget,
     maxLength: def.maxLength ?? null,
     onDelete,
@@ -675,9 +709,135 @@ function assertIndexKinds(list: readonly unknown[], accessor: string): void {
   });
 }
 
-/** Check if a value is a TableDef (from legacy table() builder) */
+/**
+ * Is this value a TableDef (the legacy `table()` builder's output)?
+ *
+ * A TableDef carries a STRING `name` and a `columns` record of column configs.
+ * In the object format a key called `name` or `columns` is a column, and a
+ * column definition is an object, so the string is what tells the two apart: a
+ * table with columns named `name` and `columns` used to be read as a TableDef
+ * and emitted as a different table. A table that has a string `name` but is not
+ * a TableDef falls through to the object format, which refuses the string.
+ */
 function isTableDef(v: unknown): v is TableDef {
-  return typeof v === 'object' && v !== null && 'columns' in v && 'name' in v;
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const t = v as { name?: unknown; columns?: unknown };
+  if (typeof t.name !== 'string') return false;
+  const columns = t.columns;
+  if (typeof columns !== 'object' || columns === null || Array.isArray(columns)) return false;
+  return Object.values(columns).every((c) => typeof c === 'object' && c !== null);
+}
+
+/** A name list for a message: `a, b, c`, or `(none)`. */
+function nameList(names: Iterable<string>): string {
+  const list = [...names];
+  return list.length > 0 ? list.join(', ') : '(none)';
+}
+
+/** The DDL column name of a field: what `CREATE TABLE` and every index write for it. */
+const ddlColumnName = camelToSnakeLocal;
+
+/**
+ * Refuse a schema that names something it does not contain. Every one of these
+ * used to be accepted and then went wrong somewhere else, or nowhere:
+ *
+ * - `userId` and `user_id` in one table are the SAME column to the database, so
+ *   the DDL declared it twice.
+ * - A `references` that is not `table.column` was dropped (no foreign key, no
+ *   error), and one naming a column its target table does not have became a
+ *   `REFERENCES` clause the database rejects at push time. A target table that
+ *   is not in this schema is left alone, since it may be owned elsewhere.
+ * - An index on a column the table does not have failed the same way.
+ *
+ * It runs once, after every table is built, because a reference may name a
+ * table declared later.
+ */
+function assertSchemaIntegrity(tables: Record<string, TableDef>): void {
+  const byDdlName = new Map<string, string>();
+  const byName = new Map<string, TableDef>();
+  for (const [accessor, table] of Object.entries(tables)) {
+    const owner = byDdlName.get(table.name);
+    if (owner !== undefined) {
+      throw new ValidationError(
+        `defineSchema: tables "${owner}" and "${accessor}" are both the table "${table.name}" in the database ` +
+          `(a camelCase name is written in snake_case). Keep one, or rename one.`,
+      );
+    }
+    byDdlName.set(table.name, accessor);
+    byName.set(accessor, table);
+    byName.set(table.name, table);
+  }
+
+  for (const [accessor, table] of Object.entries(tables)) {
+    const columnOf = new Map<string, string>();
+    for (const field of Object.keys(table.columns)) {
+      const ddl = ddlColumnName(field);
+      const other = columnOf.get(ddl);
+      if (other !== undefined) {
+        throw new ValidationError(
+          `defineSchema: table "${accessor}" has columns "${other}" and "${field}", which are the same column ` +
+            `"${ddl}" in the database. Keep one.`,
+        );
+      }
+      columnOf.set(ddl, field);
+    }
+
+    const hasColumn = (name: string): boolean => Object.hasOwn(table.columns, name) || columnOf.has(name);
+    const columnNames = (): string[] => Object.keys(table.columns);
+
+    for (const [i, idx] of (table.indexes ?? []).entries()) {
+      if (!isDocFieldIndexDef(idx) && !Array.isArray(idx.columns)) {
+        throw new ValidationError(
+          `defineSchema: index ${i} of table "${accessor}" declares neither "columns" (an array of column names) ` +
+            `nor "docField" with "path".`,
+        );
+      }
+      const named: unknown[] = isDocFieldIndexDef(idx) ? [idx.docField] : idx.columns;
+      for (const name of named) {
+        if (typeof name === 'string' && hasColumn(name)) continue;
+        const suggestion = typeof name === 'string' ? suggestKey(name, columnNames()) : null;
+        throw new ValidationError(
+          `defineSchema: index ${i} of table "${accessor}" names ${typeof name === 'string' ? `column "${name}"` : `a ${describeKind(name)} instead of a column name`}, ` +
+            `which the table does not have.${suggestion ? ` Did you mean "${suggestion}"?` : ''} ` +
+            `Columns: ${nameList(columnNames())}.`,
+        );
+      }
+    }
+
+    for (const [field, config] of Object.entries(table.columns)) {
+      if (config.referencesTarget === null || config.referencesTarget === undefined) continue;
+      const where = `column "${accessor}.${field}"`;
+      const target = config.referencesTarget;
+      const parts = typeof target === 'string' ? target.split('.') : [];
+      if (parts.length !== 2 || !parts[0] || !parts[1]) {
+        throw new ValidationError(
+          `defineSchema: ${where} has references ${JSON.stringify(target)}, which is not in "table.column" form, so no foreign ` +
+            `key would be created. Write it as "users.id".` +
+            (parts.length > 2 ? ' A schema-qualified name ("auth.users.id") is not supported.' : ''),
+        );
+      }
+      const [refTable, refColumn] = parts as [string, string];
+      // A table outside this schema is allowed, since something else may own
+      // it. Its columns cannot be checked here.
+      const targetTable = byName.get(refTable);
+      if (!targetTable) continue;
+      const targetDdl = new Set(Object.keys(targetTable.columns).map(ddlColumnName));
+      const isField = Object.hasOwn(targetTable.columns, refColumn);
+      if (!isField && !targetDdl.has(refColumn)) {
+        const suggestion = suggestKey(refColumn, Object.keys(targetTable.columns));
+        throw new ValidationError(
+          `defineSchema: ${where} references "${target}", but table "${refTable}" has no column "${refColumn}".` +
+            (suggestion ? ` Did you mean "${suggestion}"?` : '') +
+            ` Columns: ${nameList(Object.keys(targetTable.columns))}.`,
+        );
+      }
+      // The DDL names the column as written, so a field name (`displayName`)
+      // becomes the column it is (`display_name`) here, where the table is known.
+      if (isField && ddlColumnName(refColumn) !== refColumn) {
+        config.referencesTarget = `${refTable}.${ddlColumnName(refColumn)}`;
+      }
+    }
+  }
 }
 
 /**
@@ -785,14 +945,20 @@ export function defineSchema<S extends SchemaInput>(
           );
         }
         assertOrdinaryName(fieldName, `column "${accessor}.${fieldName}"`);
-        if (typeof def === 'object' && def !== null) {
-          assertKnownKeys(def, COLUMN_KEYS, `column "${accessor}.${fieldName}"`);
-          const ref = (def as ColumnDef).references;
-          if (typeof ref === 'object' && ref !== null) {
-            assertKnownKeys(ref, REFERENCE_KEYS, `the references of column "${accessor}.${fieldName}"`);
-          }
+        // An `undefined` column is absent, like an `undefined` option anywhere else.
+        if (def === undefined) continue;
+        if (typeof def !== 'object' || def === null) {
+          throw new ValidationError(
+            `defineSchema: column "${accessor}.${fieldName}" must be an object such as { type: 'text' }, ` +
+              `received ${describeKind(def)}.`,
+          );
         }
-        columns[fieldName] = resolveColumn(def as ColumnDef);
+        assertKnownKeys(def, COLUMN_KEYS, `column "${accessor}.${fieldName}"`);
+        const ref = (def as ColumnDef).references;
+        if (typeof ref === 'object' && ref !== null) {
+          assertKnownKeys(ref, REFERENCE_KEYS, `the references of column "${accessor}.${fieldName}"`);
+        }
+        columns[fieldName] = resolveColumn(def as ColumnDef, `column "${accessor}.${fieldName}"`);
       }
 
       // Validate composite PK references real columns and clear column-level PKs
@@ -831,6 +997,7 @@ export function defineSchema<S extends SchemaInput>(
     }
   }
 
+  assertSchemaIntegrity(tables);
   return { tables, ...(options?.enums ? { enums: options.enums } : {}) };
 }
 
@@ -962,8 +1129,8 @@ export class ColumnBuilder {
     this._config.isUnique = true;
     return this;
   }
-  default(val: string): this {
-    this._config.defaultValue = val;
+  default(val: string | number | boolean): this {
+    this._config.defaultValue = declaredDefault(val, 'ColumnBuilder.default()');
     return this;
   }
   references(target: string, opts?: { onDelete?: ReferentialAction; onUpdate?: ReferentialAction }): this {
