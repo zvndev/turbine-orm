@@ -19,9 +19,12 @@
  * the optional-`COLUMN` shorthand (`ALTER TABLE t DROP email`), data-modifying
  * CTEs (`WITH d AS (DELETE ...) SELECT ...`), `MERGE ... THEN DELETE`, dynamic
  * SQL inside a `DO`/function body, an `UPDATE` whose only WHERE sits inside a
- * subquery (which restricts nothing), a `DROP ... CASCADE` of a non-table
- * object (which takes dependent COLUMNS with it), a detached partition, and an
- * `EXPLAIN ANALYZE` of any of the above (which really executes it).
+ * subquery (which restricts nothing) or is a constant-true predicate (`WHERE
+ * true`, `WHERE 1 = 1`), a `DROP ... CASCADE` of a non-table object (which takes
+ * dependent COLUMNS with it), a detached partition, an `ON CONFLICT DO UPDATE`
+ * with no `WHERE` (it rewrites every conflicting row), a `PREPARE`d destructive
+ * statement, `lo_unlink` (it deletes large objects), and an `EXPLAIN ANALYZE` of
+ * any of the above (which really executes it).
  *
  * The lexing, "where does a statement end" and "which characters are code",
  * is NOT done here: it lives in `sql-statements.ts` and is shared with the
@@ -43,6 +46,8 @@ export type DestructiveKind =
   | 'truncate'
   | 'delete'
   | 'update-without-where'
+  | 'overwrite-on-conflict'
+  | 'large-object-unlink'
   | 'alter-column-type'
   | 'merge-delete'
   | 'rename'
@@ -75,7 +80,9 @@ export const DESTRUCTIVE_KIND_LABEL: Record<DestructiveKind, string> = {
   'detach-partition': 'detaches a partition, every row in it leaves the table',
   truncate: 'deletes every row',
   delete: 'deletes rows',
-  'update-without-where': 'rewrites every row (no WHERE clause)',
+  'update-without-where': 'rewrites every row (no WHERE clause, or one that is always true)',
+  'overwrite-on-conflict': 'overwrites every conflicting row (ON CONFLICT DO UPDATE with no restricting WHERE)',
+  'large-object-unlink': 'permanently deletes large objects (lo_unlink)',
   'alter-column-type': 'rewrites a column type (cast may truncate or fail)',
   'merge-delete': 'deletes matched rows (MERGE ... THEN DELETE)',
   rename: 'renames a table or column, every query and view referencing the old name breaks',
@@ -91,6 +98,13 @@ export const DESTRUCTIVE_KIND_LABEL: Record<DestructiveKind, string> = {
 const ident = (raw: string | undefined): string => (raw ?? '?').replace(/^"|"$/g, '');
 
 const IDENT = String.raw`("[^"]+"|[a-zA-Z_][\w$]*)(\.("[^"]+"|[a-zA-Z_][\w$]*))?`;
+
+/**
+ * Ends an `IDENT` match. Not `\b`: after a closing `"` the next character is
+ * not a word character either, so `\b` fails and `UPDATE "users" SET ...` was
+ * never matched.
+ */
+const NOT_IDENT_CHAR = String.raw`(?![\w$])`;
 
 /**
  * Render one `IDENT` capture triple (name, `.qualifier`, qualifier) as text,
@@ -153,11 +167,12 @@ const RULES: Rule[] = [
     // CASCADE these are safe: Postgres refuses the drop while a dependency
     // exists. With it, the dependents go too, and a dependent of a TYPE or a
     // DOMAIN is typically a COLUMN, so `DROP TYPE order_status CASCADE`
-    // silently removes `orders.status` and every value in it. The presence of
-    // CASCADE is therefore the whole rule, not an extra detail.
+    // silently removes `orders.status` and every value in it, and a dependent of
+    // a VIEW can be a materialized view, whose stored rows go with it. The
+    // presence of CASCADE is therefore the whole rule, not an extra detail.
     kind: 'drop-cascade',
     regex: new RegExp(
-      String.raw`^DROP\s+(TYPE|DOMAIN|EXTENSION|SEQUENCE|FUNCTION|PROCEDURE|ROUTINE|AGGREGATE)\s+(IF\s+EXISTS\s+)?${IDENT}${OUTSIDE_QUOTES}\bCASCADE\b`,
+      String.raw`^DROP\s+(TYPE|DOMAIN|EXTENSION|SEQUENCE|FUNCTION|PROCEDURE|ROUTINE|AGGREGATE|VIEW)\s+(IF\s+EXISTS\s+)?${IDENT}${OUTSIDE_QUOTES}\bCASCADE\b`,
       'i',
     ),
     target: (m) => `${m[1]!.toUpperCase()} ${qualified(m, 3)}`,
@@ -204,16 +219,45 @@ const RULES: Rule[] = [
   {
     // MERGE's DELETE action removes rows from the target table.
     kind: 'merge-delete',
-    regex: new RegExp(String.raw`^MERGE\s+INTO\s+(ONLY\s+)?${IDENT}\b${OUTSIDE_QUOTES}\bTHEN\s+DELETE\b`, 'i'),
+    regex: new RegExp(
+      String.raw`^MERGE\s+INTO\s+(ONLY\s+)?${IDENT}${NOT_IDENT_CHAR}${OUTSIDE_QUOTES}\bTHEN\s+DELETE\b`,
+      'i',
+    ),
     target: (m) => (m[4] ? `${ident(m[2])}.${ident(m[4])}` : ident(m[2])),
   },
   {
     // A WHERE inside a scalar subquery (`SET x = (SELECT ... WHERE ...)`) does
-    // NOT restrict the rows updated, so the guard tests only the TOP level.
+    // NOT restrict the rows updated, so the guard tests only the TOP level, and
+    // a top-level WHERE that is always true restricts nothing either.
     kind: 'update-without-where',
-    regex: new RegExp(String.raw`^UPDATE\s+(ONLY\s+)?${IDENT}\b`, 'i'),
+    regex: new RegExp(String.raw`^UPDATE\s+(ONLY\s+)?${IDENT}${NOT_IDENT_CHAR}`, 'i'),
     target: (m) => (m[4] ? `${ident(m[2])}.${ident(m[4])}` : ident(m[2])),
-    also: (stmt) => !hasTopLevelWhere(stmt),
+    also: (stmt) => !hasRestrictingWhere(stmt),
+  },
+  {
+    // `INSERT ... ON CONFLICT ... DO UPDATE SET ...` rewrites every row the
+    // insert conflicts with. The WHERE that narrows it sits AFTER `DO UPDATE`;
+    // the one before it is the conflict target's index predicate and restricts
+    // nothing. Add `WHERE t.col IS DISTINCT FROM EXCLUDED.col` to say which rows
+    // may change.
+    kind: 'overwrite-on-conflict',
+    regex: new RegExp(String.raw`^INSERT\s+INTO\s+${IDENT}${NOT_IDENT_CHAR}`, 'i'),
+    target: (m) => (m[3] ? `${ident(m[1])}.${ident(m[3])}` : ident(m[1])),
+    also: (stmt) => {
+      const code = stmt.replace(/"(?:[^"]|"")*"/g, '""');
+      if (!/\bON\s+CONFLICT\b/i.test(code)) return false;
+      const at = code.search(/\bDO\s+UPDATE\b/i);
+      return at !== -1 && !hasRestrictingWhere(code.slice(at));
+    },
+  },
+  {
+    // `SELECT lo_unlink(oid) FROM pg_largeobject_metadata` deletes the large
+    // objects whatever they hold, and there is no WHERE to look for. Statements
+    // that only NAME the function (GRANT, COMMENT, ALTER, DROP) call nothing.
+    kind: 'large-object-unlink',
+    regex: /\blo_unlink\s*\(/i,
+    target: () => 'large objects',
+    also: (stmt) => !/^(?:GRANT|REVOKE|COMMENT|ALTER|DROP)\b/i.test(stmt),
   },
   {
     // `CREATE RULE r AS ON INSERT TO t DO INSTEAD DELETE FROM u`. The rule
@@ -235,7 +279,7 @@ const RULES: Rule[] = [
     // that appears in ordinary migrations. DELETE, TRUNCATE and DROP stay
     // unconditional: a DELETE inside a rule destroys on every matching
     // statement whether or not it is narrowed, and the other two take no WHERE.
-    also: (stmt) => !/\bDO\s+(?:ALSO\s+|INSTEAD\s+)?\(?\s*UPDATE\b/i.test(stmt) || !hasTopLevelWhere(stmt),
+    also: (stmt) => !/\bDO\s+(?:ALSO\s+|INSTEAD\s+)?\(?\s*UPDATE\b/i.test(stmt) || !hasRestrictingWhere(stmt),
   },
   // Renames come LAST: they destroy no data, so any statement that is BOTH a
   // rename and a data-loss operation should report the data loss instead.
@@ -261,18 +305,153 @@ const RULES: Rule[] = [
   },
 ];
 
-/** True when the statement has a `WHERE` outside every parenthesized group. */
-function hasTopLevelWhere(stmt: string): boolean {
-  const re = /[()]|\bWHERE\b/gi;
+/**
+ * The predicate of the statement's top-level `WHERE` (outside every
+ * parenthesized group), up to a top-level `RETURNING` or the end, or `null` when
+ * there is none.
+ */
+function topLevelWherePredicate(stmt: string): string | null {
+  // A quoted identifier is consumed whole, so a column named "where" is not one.
+  const re = /"(?:[^"]|"")*"|[()]|\bWHERE\b|\bRETURNING\b/gi;
   let depth = 0;
+  let from = -1;
   let m: RegExpExecArray | null = re.exec(stmt);
   while (m !== null) {
-    if (m[0] === '(') depth++;
+    if (m[0].startsWith('"')) {
+      // not a keyword
+    } else if (m[0] === '(') depth++;
     else if (m[0] === ')') depth = Math.max(0, depth - 1);
-    else if (depth === 0) return true;
+    else if (depth === 0) {
+      if (from === -1 && /^WHERE$/i.test(m[0])) from = m.index + m[0].length;
+      else if (from !== -1 && /^RETURNING$/i.test(m[0])) return stmt.slice(from, m.index).trim();
+    }
     m = re.exec(stmt);
   }
-  return false;
+  return from === -1 ? null : stmt.slice(from).trim();
+}
+
+/**
+ * True when the statement has a top-level `WHERE` that can leave some rows out.
+ * A predicate proven always true (`true`, `1 = 1`, `x OR true`) restricts nothing
+ * and counts as no WHERE. A predicate this cannot read is assumed to restrict,
+ * and that statement is then NOT flagged, so only a proof of constant-true may
+ * turn a WHERE into none.
+ */
+function hasRestrictingWhere(stmt: string): boolean {
+  const predicate = topLevelWherePredicate(stmt);
+  return predicate !== null && constantValue(predicate) !== true;
+}
+
+/**
+ * Split on a top-level (paren depth 0, outside `CASE ... END`) `AND` or `OR`.
+ * The `AND` of a `BETWEEN a AND b` belongs to the BETWEEN and splits nothing.
+ */
+function splitTopLevel(text: string, keyword: 'AND' | 'OR'): string[] {
+  const re = /"(?:[^"]|"")*"|[()]|\b(?:AND|OR|BETWEEN|CASE|END)\b/gi;
+  const parts: string[] = [];
+  let depth = 0;
+  let caseDepth = 0;
+  let betweenOpen = 0;
+  let last = 0;
+  let m: RegExpExecArray | null = re.exec(text);
+  while (m !== null) {
+    const token = m[0].toUpperCase();
+    if (token.startsWith('"')) {
+      // a quoted identifier, never a keyword
+    } else if (token === '(') depth++;
+    else if (token === ')') depth = Math.max(0, depth - 1);
+    else if (depth === 0) {
+      if (token === 'CASE') caseDepth++;
+      else if (token === 'END') caseDepth = Math.max(0, caseDepth - 1);
+      else if (caseDepth === 0) {
+        if (token === 'BETWEEN') betweenOpen++;
+        else if (token === 'AND' && betweenOpen > 0) betweenOpen--;
+        else if (token === keyword) {
+          parts.push(text.slice(last, m.index));
+          last = m.index + m[0].length;
+        }
+      }
+    }
+    m = re.exec(text);
+  }
+  parts.push(text.slice(last));
+  return parts.map((part) => part.trim());
+}
+
+/** Strip parentheses that wrap the WHOLE text: `((a = 1))` becomes `a = 1`. */
+function unwrapParens(text: string): string {
+  let out = text.trim();
+  while (out.startsWith('(') && closingParenIndex(out, 0) === out.length - 1) out = out.slice(1, -1).trim();
+  return out;
+}
+
+const NUMBER_LITERAL = String.raw`[+-]?\d+(?:\.\d+)?`;
+const COMPARISON = new RegExp(String.raw`^(${NUMBER_LITERAL}|'')\s*(=|<>|!=|<=|>=|<|>)\s*(${NUMBER_LITERAL}|'')$`);
+const SELF_COMPARISON = new RegExp(String.raw`^(${IDENT})\s*(=|<>|!=|<=|>=|<|>)\s*(${IDENT})$`);
+
+/**
+ * The truth value of a predicate when it does not depend on any row: `true`,
+ * `false`, or `undefined` when it does (or when this cannot tell). Strings reach
+ * here already emptied to `''`, so two string literals compare equal; the only
+ * mistake that costs is calling a false predicate true, a prompt on a statement
+ * that updates nothing.
+ */
+function constantValue(predicate: string): boolean | undefined {
+  const text = unwrapParens(predicate);
+  if (text === '') return undefined;
+
+  const ors = splitTopLevel(text, 'OR');
+  if (ors.length > 1) {
+    const values = ors.map(constantValue);
+    if (values.includes(true)) return true;
+    return values.every((v) => v === false) ? false : undefined;
+  }
+  const ands = splitTopLevel(text, 'AND');
+  if (ands.length > 1) {
+    const values = ands.map(constantValue);
+    if (values.includes(false)) return false;
+    return values.every((v) => v === true) ? true : undefined;
+  }
+
+  const negated = /^NOT\s+([\s\S]+)$/i.exec(text);
+  if (negated) {
+    const inner = constantValue(negated[1]!);
+    return inner === undefined ? undefined : !inner;
+  }
+  if (/^TRUE$/i.test(text)) return true;
+  if (/^(?:FALSE|NULL)$/i.test(text)) return false;
+
+  const literals = COMPARISON.exec(text);
+  if (literals) return compareConstants(literals[1]!, literals[2]!, literals[3]!);
+  // `id = id` is true for every row whose id is not null; calling it true errs
+  // toward the prompt, which is the safe side.
+  const self = SELF_COMPARISON.exec(text);
+  if (self && self[1]!.toLowerCase() === self[6]!.toLowerCase()) return compareConstants('0', self[5]!, '0');
+  return undefined;
+}
+
+/** Compare two literals, where two `''` (emptied strings) are taken as equal. */
+function compareConstants(left: string, op: string, right: string): boolean | undefined {
+  const a = left === "''" ? 0 : Number(left);
+  const b = right === "''" ? 0 : Number(right);
+  if (Number.isNaN(a) || Number.isNaN(b)) return undefined;
+  switch (op) {
+    case '=':
+      return a === b;
+    case '<>':
+    case '!=':
+      return a !== b;
+    case '<':
+      return a < b;
+    case '<=':
+      return a <= b;
+    case '>':
+      return a > b;
+    case '>=':
+      return a >= b;
+    default:
+      return undefined;
+  }
 }
 
 /**
@@ -328,6 +507,23 @@ function copySubstatements(stmt: string): string[] {
   // A leading WITH is handed on so its own CTE bodies are read by the rule
   // above rather than being judged as one blob here.
   return /^(?:DELETE|UPDATE|INSERT|MERGE|WITH)\b/i.test(inner) ? [inner] : [];
+}
+
+/**
+ * The statement a `PREPARE name [(types)] AS <statement>` stores. Nothing runs at
+ * PREPARE time, but `EXECUTE name` runs it later on the same connection, so the
+ * stored statement is judged as if it had been written out. A prepared `DELETE`
+ * or unrestricted `UPDATE` followed by `EXECUTE` was reported as clean.
+ */
+function prepareSubstatements(stmt: string): string[] {
+  const head = /^PREPARE\s+(?:"[^"]+"|[A-Za-z_][\w$]*)\s*/i.exec(stmt);
+  if (!head) return [];
+  let rest = stmt.slice(head[0].length);
+  if (rest.startsWith('(')) rest = rest.slice(closingParenIndex(rest, 0) + 1).trimStart();
+  const as = /^AS\s+/i.exec(rest);
+  if (!as) return [];
+  const inner = rest.slice(as[0].length);
+  return [stripLeadingCtes(inner), ...cteSubstatements(inner)];
 }
 
 /**
@@ -451,7 +647,8 @@ function proceduralCandidates(body: string): ProceduralCandidate[] {
     // Literals have to survive: they are where dynamic SQL keeps its payload,
     // and `stripped` would have emptied exactly them.
     const text = statement.code;
-    const re = /\b(?:DROP|TRUNCATE|DELETE|ALTER|UPDATE|MERGE)\s/gi;
+    // `DO UPDATE` is the tail of an `ON CONFLICT` clause, judged with its INSERT.
+    const re = /\b(?:(?:DROP|TRUNCATE|DELETE|ALTER|MERGE|INSERT)\s|(?<!\bDO\s+)UPDATE\s|lo_unlink\s*\()/gi;
     let m: RegExpExecArray | null = re.exec(text);
     while (m !== null) {
       out.push({ text: text.slice(m.index), before: text.slice(0, m.index), statementCode: text });
@@ -485,6 +682,7 @@ export function scanDestructiveSql(sql: string): DestructiveStatement[] {
       stripLeadingCtes(body),
       ...cteSubstatements(body),
       ...copySubstatements(body).flatMap((inner) => [inner, ...cteSubstatements(inner)]),
+      ...prepareSubstatements(body),
     ].map((text) => ({
       text,
       display,
