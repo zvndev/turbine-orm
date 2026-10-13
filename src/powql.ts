@@ -39,6 +39,7 @@ import { randomUUID } from 'node:crypto';
 import { guardCheckout } from './connection-guard.js';
 import { resolveDiagnostics } from './diagnostics.js';
 import {
+  InvariantError,
   NotFoundError,
   OptimisticLockError,
   ReadOnlyError,
@@ -1160,8 +1161,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
         // Relation filters are pre-resolved to scalar in/notIn by
         // resolveRelationFilters() before buildWhere runs, reaching here means
         // a caller skipped that step (an internal bug, not user error).
-        throw new ValidationError(
-          `internal: relation filter "${key}" reached buildWhere unresolved (missing resolveRelationFilters()).`,
+        throw new InvariantError(
+          'powql-relation-filter-unresolved',
+          `relation filter "${key}" reached buildWhere unresolved: resolveRelationFilters() must run first.`,
         );
       } else {
         // A JsonFilter (or a bare `{ path }`) can compile to zero clauses; skip
@@ -1549,7 +1551,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     for (const { op, value } of jsonStringEntries(filter, col.name)) {
       const insensitive = filter.mode === 'insensitive';
       const kind = stringOps[op];
-      if (!kind) throw new ValidationError(`internal: unknown JSON string operator "${op}" on "${col.name}".`);
+      if (!kind)
+        throw new InvariantError('powql-json-operator', `unknown JSON string operator "${op}" on "${col.name}".`);
       conds.push(this.buildStringMatch(kind, pathP(), value, params, insensitive, `the JSON path on "${col.name}"`));
     }
 
@@ -1558,9 +1561,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     // generator bug rather than a user error, and must not silently widen the
     // query the way it used to.
     if (!conds.length) {
-      throw new ValidationError(
-        `internal: JSON filter on "${col.name}" compiled to no condition. This is a bug in turbine-orm.`,
-      );
+      throw new InvariantError('powql-json-filter-empty', `JSON filter on "${col.name}" compiled to no condition.`);
     }
     return conds.length > 1 ? `(${conds.join(' and ')})` : conds[0]!;
   }
