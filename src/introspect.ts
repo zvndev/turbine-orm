@@ -565,14 +565,15 @@ export function assertSafeCatalogSchema(schema: SchemaMetadata): void {
 /**
  * Introspect a database into {@link SchemaMetadata}, routing through the active
  * dialect's {@link Dialect.introspector} so each engine can override the catalog
- * SQL. PostgreSQL is driven by {@link introspectPostgresCatalog}.
+ * SQL. A dialect with none, PostgreSQL included, is read by
+ * {@link introspectPostgresCatalog}.
  */
 export async function introspect(options: IntrospectOptions): Promise<SchemaMetadata> {
   const dialect = options.dialect ?? postgresDialect;
   const introspector = dialect.introspector;
   const schema = introspector
     ? await introspector.introspect(options)
-    : // Dialects without an introspector fall back to the Postgres catalog reader.
+    : // PostgreSQL, and any dialect without an introspector, reads the Postgres catalog.
       await introspectPostgresCatalog(options);
   // Applied here rather than inside each introspector so every engine gets it.
   const renamed = options.relationNames ? applyRelationRenames(schema, options.relationNames) : schema;
@@ -692,8 +693,8 @@ export function assertDistinctColumnFields(tableName: string, columns: readonly 
 
 /**
  * PostgreSQL catalog introspector: reads information_schema + pg_catalog and
- * produces {@link SchemaMetadata}. This is the implementation wrapped by
- * `postgresDialect.introspector`; call {@link introspect} for dialect routing.
+ * produces {@link SchemaMetadata}. {@link introspect} calls it for PostgreSQL;
+ * call {@link introspect} for dialect routing.
  */
 export async function introspectPostgresCatalog(options: IntrospectOptions): Promise<SchemaMetadata> {
   const schema = options.schema ?? 'public';

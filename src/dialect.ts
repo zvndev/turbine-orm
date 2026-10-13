@@ -910,8 +910,9 @@ export interface Dialect {
 
   /**
    * Schema introspector for this engine. `introspect()` routes through it so
-   * engines can override the catalog SQL. PostgreSQL wraps the
-   * information_schema / pg_catalog reader in `introspect.ts`.
+   * engines can override the catalog SQL. Absent on PostgreSQL, whose
+   * information_schema / pg_catalog reader in `introspect.ts` is what
+   * `introspect()` uses when a dialect has no introspector.
    */
   readonly introspector?: DialectIntrospector;
 
@@ -1447,13 +1448,10 @@ export const postgresDialect: Dialect = {
     }
   },
 
-  // Postgres introspection wraps the information_schema / pg_catalog reader in
-  // introspect.ts. A dynamic import keeps the static graph acyclic (introspect.ts
-  // imports postgresDialect) and calls the raw catalog reader (never the router).
-  introspector: {
-    async introspect(options) {
-      const { introspectPostgresCatalog } = await import('./introspect.js');
-      return introspectPostgresCatalog(options);
-    },
-  },
+  // No `introspector`: `introspect()` reads the PostgreSQL catalog itself when a
+  // dialect has none. A field here would have to reach introspect.ts through a
+  // dynamic import (introspect.ts imports this dialect), and a bundler without
+  // code splitting inlines that import WHOLE, which put the entire catalog
+  // reader into the serverless entry and every engine entry (4 to 6 kB brotli
+  // each) for a function none of them call at runtime.
 };
