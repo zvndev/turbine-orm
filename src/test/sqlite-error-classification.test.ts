@@ -66,7 +66,7 @@ function open(sql?: string[]) {
   return {
     db,
     ready: (async () => {
-      for (const s of sql ?? []) await db.raw([s] as unknown as TemplateStringsArray);
+      for (const s of sql ?? []) await db.rawUnsafe(s);
     })(),
   };
 }
@@ -187,7 +187,7 @@ describe('sqlite logic errors preserve the driver error as `cause`', () => {
     it(`${label}: the ValidationError carries the driver error`, async () => {
       const { db, ready } = open();
       await ready;
-      const err = await thrown(() => db.raw([sql] as unknown as TemplateStringsArray));
+      const err = await thrown(() => db.rawUnsafe(sql));
       await db.disconnect();
       assert.ok(err instanceof ValidationError, `expected ValidationError, got ${String(err)}`);
       assert.equal((err as ValidationError).code, 'TURBINE_E003');

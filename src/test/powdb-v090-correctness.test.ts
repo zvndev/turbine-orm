@@ -143,15 +143,11 @@ after(() => {
 });
 
 /** A seeded embedded database, reopened with `opts`. */
-/** One literal statement as the tagged-template argument `raw` takes. */
-const tsa = (sql: string): TemplateStringsArray =>
-  Object.assign([sql], { raw: [sql] }) as unknown as TemplateStringsArray;
-
 async function openPow(opts: Record<string, unknown> = {}, schema: SchemaMetadata = SCHEMA): Promise<Db> {
   const dir = mkdtempSync(join(tmpdir(), 'turbine-powdb-v090-'));
   dirs.push(dir);
   const boot = await turbinePowDB({ embedded: dir }, SCHEMA, { warnOnUnlimited: false });
-  for (const stmt of powqlSchemaDDL(SCHEMA)) await boot.raw(tsa(stmt));
+  for (const stmt of powqlSchemaDDL(SCHEMA)) await boot.rawUnsafe(stmt);
   await seed(boot);
   await boot.disconnect();
   return turbinePowDB({ embedded: dir }, schema, { warnOnUnlimited: false, ...opts });
@@ -634,7 +630,7 @@ describe('powdb v0.90: each relation path applies the global filter', () => {
       bigintSchema.tables.users!.columns.find((c) => c.name === 'big')!.tsType = 'bigint | null';
       const linked = async (opts: Record<string, unknown>): Promise<Db> => {
         const linkDb = await openPow(opts, bigintSchema);
-        await applyPowdbLinks(async (q: string) => ({ rows: await linkDb.raw(tsa(q)) }), bigintSchema);
+        await applyPowdbLinks(async (q: string) => ({ rows: await linkDb.rawUnsafe(q) }), bigintSchema);
         return linkDb;
       };
       const unfiltered = await linked({});
@@ -991,17 +987,17 @@ function oracleUrl(): string {
 describe('powdb v0.90: Postgres oracle', () => {
   oracle.before(async () => {
     const admin = new TurbineClient({ connectionString: PG_URL!, warnOnUnlimited: false } as never, SCHEMA);
-    await admin.raw(tsa(`DROP SCHEMA IF EXISTS "${ORACLE_SCHEMA}" CASCADE`));
-    await admin.raw(tsa(`CREATE SCHEMA "${ORACLE_SCHEMA}"`));
+    await admin.rawUnsafe(`DROP SCHEMA IF EXISTS "${ORACLE_SCHEMA}" CASCADE`);
+    await admin.rawUnsafe(`CREATE SCHEMA "${ORACLE_SCHEMA}"`);
     await admin.disconnect();
     const boot = new TurbineClient({ connectionString: oracleUrl(), warnOnUnlimited: false } as never, SCHEMA);
-    for (const stmt of schemaToSQL(def)) await boot.raw(tsa(stmt));
+    for (const stmt of schemaToSQL(def)) await boot.rawUnsafe(stmt);
     await seed(boot);
     await boot.disconnect();
   });
   oracle.after(async () => {
     const admin = new TurbineClient({ connectionString: PG_URL!, warnOnUnlimited: false } as never, SCHEMA);
-    await admin.raw(tsa(`DROP SCHEMA IF EXISTS "${ORACLE_SCHEMA}" CASCADE`));
+    await admin.rawUnsafe(`DROP SCHEMA IF EXISTS "${ORACLE_SCHEMA}" CASCADE`);
     await admin.disconnect();
   });
 

@@ -35,6 +35,7 @@ import {
 import type { PgCompatPool, PgCompatQueryConfig, PgCompatQueryResult } from '../pg-types.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { normalizeKeyColumns, snakeToCamel } from '../schema.js';
+import { type TransactionState, transactionStateOf, withSavepoint } from '../transaction-state.js';
 import * as aggMod from './aggregates.js';
 import {
   assertProjectionShape,
@@ -113,6 +114,7 @@ import {
   assertMiddlewareArgsKept,
   availableClause,
   boundedPreparedName,
+  canCancelBackend,
   isNodePostgresPool,
   isTemporalInfinity,
   LRUCache,
@@ -673,6 +675,12 @@ const CANCEL_GRACE_MS = 2000;
 
 /** How a statement in flight ended. */
 type Settled = { result: PgCompatQueryResult } | { error: unknown };
+
+/** Whether `err` is PostgreSQL's query_canceled (57014), as the driver raised it or as Turbine wrapped it. */
+function isQueryCanceled(err: unknown): boolean {
+  const e = err as { code?: unknown; cause?: { code?: unknown } | null } | null;
+  return e?.code === '57014' || e?.cause?.code === '57014';
+}
 
 /** The two accepted {@link JsonEncoding} values, frozen so the check is total. */
 const JSON_ENCODINGS: readonly JsonEncoding[] = Object.freeze(['object', 'positional'] as const);
@@ -2829,6 +2837,12 @@ export class QueryInterface<
     if (timeout !== undefined && pool === this.pool && this.cancelsOnTimeout()) {
       return this.queryCancellable(sql, params, timeout, preparedName, retryIfStale);
     }
+    if (timeout !== undefined && pool === this.pool && this.txScoped && this.dialect.name === 'postgresql') {
+      const state = transactionStateOf(this.pool);
+      if (state !== undefined && canCancelBackend(state.client)) {
+        return this.queryCancellableInTransaction(sql, params, timeout, preparedName, state);
+      }
+    }
     let start = performance.now();
     const action = this.currentAction;
     // Build the query argument, use object form with `name` for prepared
@@ -3031,6 +3045,93 @@ export class QueryInterface<
   }
 
   /**
+   * A timed statement inside a transaction, cancelled on the server when the
+   * deadline passes, on the transaction's own connection.
+   *
+   * A cancelled statement made no change, but PostgreSQL aborts the
+   * transaction it ran in, so the timeout ends the transaction too: it is
+   * marked to roll back ({@link TransactionState.abort}), which also covers a
+   * cancel that arrived after the statement finished. The error is
+   * `outcome: 'not-executed'` either way, because nothing it did can commit.
+   * A statement that finishes before the deadline is returned as usual.
+   */
+  private async queryCancellableInTransaction(
+    sql: string,
+    params: unknown[],
+    timeout: number,
+    preparedName: string | undefined,
+    state: TransactionState,
+  ): Promise<PgCompatQueryResult> {
+    const start = performance.now();
+    const action = this.currentAction;
+    const running: Promise<Settled> = (
+      preparedName && this.preparedStatementsEnabled
+        ? (this.pool as unknown as { query(c: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query({
+            name: preparedName,
+            text: sql,
+            values: params,
+          })
+        : this.pool.query(sql, params)
+    ).then(
+      (result) => ({ result }),
+      (error: unknown) => ({ error }),
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<typeof TIMED_OUT>((resolve) => {
+      timer = setTimeout(() => resolve(TIMED_OUT), timeout);
+    });
+    let settled: Settled | { timeout: TimeoutError };
+    try {
+      const first = await Promise.race([running, deadline]);
+      settled = first === TIMED_OUT ? await this.cancelInTransaction(state, running, timeout) : first;
+    } finally {
+      clearTimeout(timer);
+    }
+    if ('result' in settled) {
+      this.emitQueryEvent(sql, params, performance.now() - start, action, settled.result.rowCount ?? 0);
+      return settled.result;
+    }
+    const err = 'timeout' in settled ? settled.timeout : wrapPgError(settled.error);
+    this.emitQueryEvent(sql, params, performance.now() - start, action, 0, err instanceof Error ? err : undefined);
+    throw err;
+  }
+
+  /** Cancel a timed-out statement in a transaction and end the transaction. See {@link queryCancellableInTransaction}. */
+  private async cancelInTransaction(
+    state: TransactionState,
+    running: Promise<Settled>,
+    timeout: number,
+  ): Promise<Settled | { timeout: TimeoutError }> {
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    const graceOver = new Promise<typeof TIMED_OUT>((resolve) => {
+      graceTimer = setTimeout(() => resolve(TIMED_OUT), CANCEL_GRACE_MS);
+    });
+    try {
+      await Promise.race([sendCancelRequest(state.client, CANCEL_GRACE_MS), graceOver]);
+      const answer = await Promise.race([running, graceOver]);
+      if (answer !== TIMED_OUT && 'result' in answer) return answer;
+      const cancelled = answer !== TIMED_OUT && isQueryCanceled(answer.error);
+      if (answer !== TIMED_OUT && !cancelled) return answer;
+      const error = new TimeoutError(timeout, 'Query', {
+        outcome: 'not-executed',
+        ...(cancelled ? { cause: answer.error } : {}),
+        message:
+          (cancelled
+            ? `Query timed out after ${timeout}ms and was cancelled on the server, so it made no change. `
+            : `Query timed out after ${timeout}ms, and the server did not confirm its cancellation within ` +
+              `${CANCEL_GRACE_MS}ms. `) +
+          'The transaction it ran in is over: it rolls back instead of committing, and no statement in it is ' +
+          'kept. Let this error leave the transaction callback and retry the whole transaction, or run a ' +
+          'statement that may time out in a nested `tx.$transaction(...)`, which rolls back only that block.',
+      });
+      state.abort(error);
+      return { timeout: error };
+    } finally {
+      clearTimeout(graceTimer);
+    }
+  }
+
+  /**
    * Cancel a statement that outlived its timeout, wait for it to answer, and
    * release its connection accordingly. See {@link queryCancellable}.
    */
@@ -3101,7 +3202,12 @@ export class QueryInterface<
     if (this.dialect.resultStrategy === 'reselect' && reselect) {
       // One transaction, so the row returned is the row this call wrote, and
       // the transform runs before COMMIT so a refusal it raises writes nothing.
-      return this.inOneTransaction(async (exec) => deferred.transform(await reselect(exec)), timeout);
+      return this.inOneTransaction(
+        async (exec) => deferred.transform(await reselect(exec)),
+        timeout,
+        `A ${this.dialect.name} write`,
+        'Pass a pool that can check out a connection.',
+      );
     }
     const result = await this.queryWithTimeout(deferred.sql, deferred.params, timeout, deferred.preparedName);
     return deferred.transform(result);
@@ -3114,9 +3220,26 @@ export class QueryInterface<
    * and its connection is closed rather than rolled back (a ROLLBACK would wait
    * behind it); the transaction never commits, so the write made no change.
    */
-  private async inOneTransaction<V>(work: (exec: ReselectExecutor) => Promise<V>, timeout?: number): Promise<V> {
+  private async inOneTransaction<V>(
+    work: (exec: ReselectExecutor) => Promise<V>,
+    timeout: number | undefined,
+    operation: string,
+    alternative: string,
+  ): Promise<V> {
     if (this.txScoped) {
-      return work((sql, params, preparedName) => this.queryWithTimeout(sql, params, timeout, preparedName));
+      // In the caller's transaction, a savepoint keeps the write whole: a later
+      // statement that fails and is caught cannot leave the earlier ones behind.
+      return withSavepoint(this.pool, () =>
+        work((sql, params, preparedName) => this.queryWithTimeout(sql, params, timeout, preparedName)),
+      );
+    }
+    if (typeof (this.pool as { connect?: unknown }).connect !== 'function') {
+      throw new UnsupportedFeatureError(
+        `${operation} on a pool without connect()`,
+        this.dialect.name,
+        `${operation} runs several statements in one transaction, which needs a connection of its own, and ` +
+          `this pool cannot check one out (a stateless HTTP driver). ${alternative}`,
+      );
     }
     const { client, checkout } = await openCheckout(this.pool, (c) => c.query(this.dialect.beginStatement()));
     const onClient = {
@@ -4752,17 +4875,23 @@ export class QueryInterface<
       // not at all. (`buildCreateMany`, one statement for a pipeline, refuses.)
       const perRow = Math.ceil(deferred.params.length / args.data.length);
       const rowsPerChunk = Math.max(1, Math.floor(limit / perRow));
-      return this.inOneTransaction(async (exec) => {
-        const rows: T[] = [];
-        for (let i = 0; i < args.data.length; i += rowsPerChunk) {
-          const chunk = writesMod.buildCreateMany(this.ctx, {
-            ...args,
-            data: args.data.slice(i, i + rowsPerChunk),
-          } as CreateManyArgs<T>);
-          rows.push(...chunk.transform(await exec(chunk.sql, chunk.params, chunk.preparedName)));
-        }
-        return rows;
-      }, args.timeout);
+      return this.inOneTransaction(
+        async (exec) => {
+          const rows: T[] = [];
+          for (let i = 0; i < args.data.length; i += rowsPerChunk) {
+            const chunk = writesMod.buildCreateMany(this.ctx, {
+              ...args,
+              data: args.data.slice(i, i + rowsPerChunk),
+            } as CreateManyArgs<T>);
+            rows.push(...chunk.transform(await exec(chunk.sql, chunk.params, chunk.preparedName)));
+          }
+          return rows;
+        },
+        args.timeout,
+        `createMany of ${args.data.length} rows`,
+        `Insert at most ${rowsPerChunk} rows per call, which fits one statement, or pass a pool that can check ` +
+          'out a connection.',
+      );
     });
   }
 

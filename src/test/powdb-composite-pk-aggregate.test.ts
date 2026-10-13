@@ -295,7 +295,7 @@ describe('PowDB aggregate() live: grouped and per-field answers are identical', 
     const liveSchema = { tables: { sample: liveTable }, enums: {} } as SchemaMetadata;
     const db = await turbinePowDB({ embedded: dir }, liveSchema, { warnOnUnlimited: false });
     try {
-      for (const stmt of powqlSchemaDDL(liveSchema)) await db.raw([stmt] as unknown as TemplateStringsArray);
+      for (const stmt of powqlSchemaDDL(liveSchema)) await db.rawUnsafe(stmt);
       const t = db.table('sample');
       for (let i = 1; i <= 120; i++) {
         await t.create({

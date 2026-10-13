@@ -156,12 +156,20 @@ describe('transactions: a settled tx refuses every call (live Postgres)', () => 
     assert.equal(await fx.count(fx.t.users, 'id = 3'), 1, 'the refused delete never ran');
   });
 
-  it('a statement issued while the transaction was open still belongs to it', async () => {
-    await db.$transaction(async (tx) => {
-      // Not awaited, but issued before the callback returns: it is part of
-      // this transaction and committed with it.
-      void tx.rawQuery(`INSERT INTO ${fx.t.users} (email) VALUES ('queued@x')`);
-    });
-    assert.equal(await fx.count(fx.t.users, "email = 'queued@x'"), 1);
+  it('a statement still running when the callback returns rolls the transaction back', async () => {
+    let unawaited: Promise<unknown> | undefined;
+    await assert.rejects(
+      db.$transaction(async (tx) => {
+        // Not awaited: still running when the callback returns, so committing
+        // would save whatever part of the caller's work happened to have run.
+        unawaited = tx.rawQuery(`INSERT INTO ${fx.t.users} (email) VALUES ('queued@x')`);
+        // The rollback cancels it on the server, so it may reject before the
+        // assertion below gets to it.
+        unawaited.catch(() => {});
+      }),
+      (err: unknown) => err instanceof ValidationError && /callback returned while a query/.test(err.message),
+    );
+    await unawaited?.catch(() => {});
+    assert.equal(await fx.count(fx.t.users, "email = 'queued@x'"), 0, 'the unawaited insert was committed');
   });
 });

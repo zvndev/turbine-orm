@@ -171,6 +171,17 @@ export const WARN_NS = {
    */
   planCacheModeIgnored: 'planCacheModeIgnored',
   /**
+   * `statementTimeoutMs` or `maxLifetimeSeconds` was set on a client given an
+   * EXTERNAL pool, whose connections Turbine never opens (client.ts
+   * `warnExternalPoolOptions`). Keyed on the option name.
+   */
+  connectionOptionIgnored: 'connectionOptionIgnored',
+  /**
+   * `preparedStatements: true` on a connection string that names a connection
+   * pooler (client.ts `warnPreparedOnPooler`). Keyed on `host:port`.
+   */
+  preparedStatementsOnPooler: 'preparedStatementsOnPooler',
+  /**
    * A relation's JSON payload could not be parsed in `parseNestedRow`
    * (relations.ts). Keyed on `table.relation`, so a page of 10,000 rows whose
    * relation column is malformed says it once rather than once per row: the

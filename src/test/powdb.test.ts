@@ -2316,7 +2316,7 @@ describe('powdb: owned-pool disconnect() closes every driver client (socket-leak
       },
     );
     assert.ok(fake.clients.length >= 1, 'the version probe checked out a client');
-    await db.raw(['note work'] as never);
+    await db.rawUnsafe('note work');
     await db.$transaction(async () => 'tx-work');
     await db.disconnect();
     assert.ok(fake.closeCalled(), 'disconnect() must close the OWNED driver pool (was skipped entirely)');
@@ -2332,7 +2332,7 @@ describe('powdb: owned-pool disconnect() closes every driver client (socket-leak
         powdbClientModule: fake.mod,
       },
     );
-    await db.raw(['note work'] as never);
+    await db.rawUnsafe('note work');
     await db.end(); // the end() alias must be patched too
     assert.equal(fake.live(), 0);
   });
@@ -2361,7 +2361,7 @@ describe('powdb: owned-pool disconnect() closes every driver client (socket-leak
     const FakePool = (fake.mod as unknown as { Pool: new (o: unknown) => unknown }).Pool;
     const driverPool = new FakePool({});
     const db = await turbinePowDB(driverPool as never, { tables: {}, enums: {} });
-    await db.raw(['note work'] as never);
+    await db.rawUnsafe('note work');
     await db.disconnect();
     assert.ok(!fake.closeCalled(), 'injected pool must NOT be closed by disconnect()');
   });

@@ -53,7 +53,7 @@ async function withDb(fn: (t: ReturnType<Awaited<ReturnType<typeof turbinePowDB>
   const s = schema();
   const db = await turbinePowDB({ embedded: dir }, s, { warnOnUnlimited: false });
   try {
-    for (const stmt of powqlSchemaDDL(s)) await db.raw([stmt] as unknown as TemplateStringsArray);
+    for (const stmt of powqlSchemaDDL(s)) await db.rawUnsafe(stmt);
     const t = db.table<Member>('member');
     await t.create({ data: { id: 1, email: 'a@x.test', name: 'A' } });
     await fn(t as never);

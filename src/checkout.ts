@@ -19,7 +19,13 @@
  */
 
 import { type CheckoutGuard, guardCheckout, settleEventLoop } from './connection-guard.js';
-import { ConnectionError, explainConnectionLoss, isStaleConnectionError, wrapPgError } from './errors.js';
+import {
+  ConnectionError,
+  explainConnectionLoss,
+  isStaleConnectionError,
+  UnsupportedFeatureError,
+  wrapPgError,
+} from './errors.js';
 import type { PgCompatPool, PgCompatPoolClient } from './pg-types.js';
 
 export interface Checkout {
@@ -44,6 +50,16 @@ export interface Checkout {
  * failures on the pools Turbine owns.
  */
 export async function acquireConnection(pool: PgCompatPool): Promise<Checkout> {
+  if (typeof (pool as { connect?: unknown }).connect !== 'function') {
+    const dialect = (pool as unknown as { dialect?: { name?: unknown } }).dialect?.name;
+    throw new UnsupportedFeatureError(
+      'Checking out a connection',
+      typeof dialect === 'string' ? dialect : 'postgresql',
+      'A transaction, a cursor stream, a pipeline or a write that takes several statements needs a connection ' +
+        'of its own, and this pool has no `connect()` (a stateless HTTP driver). Pass a pool that can check out ' +
+        'a connection, or run single statements.',
+    );
+  }
   let client: PgCompatPoolClient;
   try {
     client = await pool.connect();

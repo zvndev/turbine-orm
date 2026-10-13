@@ -90,7 +90,13 @@
  * ```
  */
 
-import { type PgCompatPool, type PgCompatPoolClient, TurbineClient } from './client.js';
+import {
+  type DisconnectOptions,
+  type DisconnectResult,
+  type PgCompatPool,
+  type PgCompatPoolClient,
+  TurbineClient,
+} from './client.js';
 import {
   type BulkInsertStatementInput,
   type ColumnDefinitionInput,
@@ -1775,11 +1781,12 @@ export async function turbineMssql(
     // (injection) stay the caller's responsibility (disconnect() no-op), consistent
     // with turbineHttp / turbineMysql / turbineSqlite.
     const baseDisconnect = client.disconnect.bind(client);
-    const close = async (): Promise<void> => {
-      await baseDisconnect();
+    const close = async (options?: DisconnectOptions): Promise<DisconnectResult | undefined> => {
+      const result = options === undefined ? await baseDisconnect() : await baseDisconnect(options);
       await pool.end();
+      return result ?? undefined;
     };
-    const patch = client as unknown as { disconnect: () => Promise<void>; end: () => Promise<void> };
+    const patch = client as unknown as { disconnect: typeof close; end: typeof close };
     patch.disconnect = close;
     patch.end = close;
   }

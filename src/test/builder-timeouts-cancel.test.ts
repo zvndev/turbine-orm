@@ -198,7 +198,7 @@ describe('per-query timeout cancels the statement on the server', () => {
     await db.disconnect();
   });
 
-  it('inside a transaction the statement cannot be cancelled, and the error says the outcome is unknown', async () => {
+  it('inside a transaction the statement is cancelled on the server, and the transaction rolls back', async () => {
     await admin.query('DELETE FROM bt_counter');
     await admin.query('INSERT INTO bt_counter VALUES (1, 0)');
     const db = client();
@@ -215,8 +215,10 @@ describe('per-query timeout cancels the statement on the server', () => {
     await lock.release();
     await tx;
     assert.ok(err instanceof TimeoutError, `expected TimeoutError, got ${String(err)}`);
-    assert.equal(err.outcome, 'unknown');
-    assert.match(err.message, /may still complete/);
+    assert.equal(err.outcome, 'not-executed');
+    assert.match(err.message, /cancelled on the server, so it made no change[\s\S]*rolls back instead of committing/);
+    const { rows } = await admin.query('SELECT n FROM bt_counter WHERE id = 1');
+    assert.equal(rows[0].n, 0);
     await db.disconnect();
   });
   it('a write inside a read-only transaction is a ReadOnlyError naming the transaction', async () => {

@@ -111,16 +111,14 @@ const mysqlGate = skipGate(!MYSQL_URL, 'requires MYSQL_URL / MYSQL_TEST_URL poin
 
 async function openMysqlProbe(options?: Parameters<typeof turbineMysql>[2]): Promise<TurbineClient> {
   const db = await turbineMysql(MYSQL_URL, probeSchema(), options);
-  await db.raw(['DROP TABLE IF EXISTS cfg_probe'] as unknown as TemplateStringsArray);
-  await db.raw([
-    'CREATE TABLE cfg_probe (id INT NOT NULL PRIMARY KEY, name VARCHAR(50) NOT NULL)',
-  ] as unknown as TemplateStringsArray);
-  await db.raw(["INSERT INTO cfg_probe (id, name) VALUES (1, 'probe')"] as unknown as TemplateStringsArray);
+  await db.rawUnsafe('DROP TABLE IF EXISTS cfg_probe');
+  await db.rawUnsafe('CREATE TABLE cfg_probe (id INT NOT NULL PRIMARY KEY, name VARCHAR(50) NOT NULL)');
+  await db.rawUnsafe("INSERT INTO cfg_probe (id, name) VALUES (1, 'probe')");
   return db;
 }
 
 async function closeMysqlProbe(db: TurbineClient): Promise<void> {
-  await db.raw(['DROP TABLE IF EXISTS cfg_probe'] as unknown as TemplateStringsArray);
+  await db.rawUnsafe('DROP TABLE IF EXISTS cfg_probe');
   await db.disconnect();
 }
 

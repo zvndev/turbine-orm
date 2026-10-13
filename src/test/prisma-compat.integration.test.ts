@@ -51,16 +51,12 @@ describe('prisma-compat, integration (real Postgres)', () => {
   before(async () => {
     if (!url) return;
     const admin = new TurbineClient({ connectionString: url }, { enums: {}, tables: {} });
-    for (const stmt of ddl) await admin.raw([stmt] as unknown as TemplateStringsArray);
-    await admin.raw([
+    for (const stmt of ddl) await admin.rawUnsafe(stmt);
+    await admin.rawUnsafe(
       "INSERT INTO app_user (email_address, display_name) VALUES ('a@acme.com','Ada'),('b@other.com','Bob')",
-    ] as unknown as TemplateStringsArray);
-    await admin.raw([
-      "INSERT INTO post (title, author_id) VALUES ('First', 1),('Second', 1),('Third', 2)",
-    ] as unknown as TemplateStringsArray);
-    await admin.raw([
-      "INSERT INTO membership (org_id, user_id, role) VALUES (10, 1, 'admin'),(10, 2, 'member')",
-    ] as unknown as TemplateStringsArray);
+    );
+    await admin.rawUnsafe("INSERT INTO post (title, author_id) VALUES ('First', 1),('Second', 1),('Third', 2)");
+    await admin.rawUnsafe("INSERT INTO membership (org_id, user_id, role) VALUES (10, 1, 'admin'),(10, 2, 'member')");
     await admin.disconnect();
 
     schema = await introspect({ connectionString: url });
@@ -103,7 +99,7 @@ describe('prisma-compat, integration (real Postgres)', () => {
 
   after(async () => {
     if (!url || !db) return;
-    await db.raw(['DROP TABLE IF EXISTS membership, post, app_user CASCADE'] as unknown as TemplateStringsArray);
+    await db.rawUnsafe('DROP TABLE IF EXISTS membership, post, app_user CASCADE');
     await db.disconnect();
   });
 

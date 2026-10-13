@@ -55,6 +55,8 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import {
+  type DisconnectOptions,
+  type DisconnectResult,
   type PgCompatPool,
   type PgCompatPoolClient,
   type PgCompatQueryResult,
@@ -2532,16 +2534,19 @@ export async function turbinePowDB(
     // open until powdb-server's idle timeout (~300s) closed them. Consistent
     // with turbineMssql's owned-pool patch.
     const baseDisconnect = client.disconnect.bind(client);
-    const close = async (): Promise<void> => {
-      await baseDisconnect();
+    const close = async (options?: DisconnectOptions): Promise<DisconnectResult | undefined> => {
+      const result = options === undefined ? await baseDisconnect() : await baseDisconnect(options);
       await pool.end();
+      return result ?? undefined;
     };
-    const patch = client as unknown as { disconnect: () => Promise<void>; end: () => Promise<void> };
+    const patch = client as unknown as { disconnect: typeof close; end: typeof close };
     patch.disconnect = close;
     patch.end = close;
   } else {
     // Injected pool, the caller owns its lifecycle.
-    (client as { disconnect: () => Promise<void> }).disconnect = async () => {};
+    (
+      client as unknown as { disconnect: (options?: DisconnectOptions) => Promise<DisconnectResult | undefined> }
+    ).disconnect = async (options) => (options === undefined ? undefined : { timedOut: false, forcedConnections: 0 });
   }
   return client;
 }

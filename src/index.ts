@@ -38,6 +38,9 @@ export type { DatabaseAdapter, IntrospectionOverrides } from './adapters/index.j
 export { alloydb, cockroachdb, postgresql, timescale, yugabytedb } from './adapters/index.js';
 // Client
 export {
+  type ConnectionLostEvent,
+  type DisconnectOptions,
+  type DisconnectResult,
   type Middleware,
   type MiddlewareNext,
   type MiddlewareParams,
@@ -45,6 +48,9 @@ export {
   type PgCompatPoolClient,
   type PgCompatQueryResult,
   type PlanCacheMode,
+  type PoolErrorEvent,
+  type PoolEvent,
+  type PoolEventOrigin,
   type RetryOptions,
   TransactionClient,
   type TransactionOptions,
@@ -90,10 +96,12 @@ export {
   type PipelineResultSlot,
   REDACTED_DETAIL,
   ReadOnlyError,
+  type ReadOnlyReason,
   RelationError,
   SerializationFailureError,
   setErrorMessageMode,
   TimeoutError,
+  type TimeoutOutcome,
   TurbineError,
   TurbineErrorCode,
   UniqueConstraintError,
@@ -217,6 +225,16 @@ export {
   type WithOrderByObject,
   type WithResult,
 } from './query/index.js';
+export type {
+  AggregateResultOf,
+  DefaultInputTypes,
+  GlobalFilter,
+  NestedToOneCreateOp,
+  NestedToOneUpdateOp,
+  OptionalInput,
+  RelationKind,
+  TableInputTypes,
+} from './query/types.js';
 // $on('query') event metadata: raw-statement model name, $tag() label limit
 export { MAX_QUERY_TAG_LENGTH, RAW_QUERY_MODEL } from './query-events.js';
 // Realtime, LISTEN/NOTIFY pub/sub
