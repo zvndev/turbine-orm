@@ -63,13 +63,13 @@ import { dedupeOrderEntries, isOrderBySpec, isRelationPickOrderBy, orderByEntrie
 import type { SkipGlobalFilters, Unsafe, WithClause, WithCount, WithOptions } from './types.js';
 import {
   availableClause,
+  boundedPreparedName,
   type ColumnNameSource,
   markInternalCombinator,
   ownLookup,
   resolveColumnName,
   selectNamesNothingMessage,
   selectOmitExclusiveMessage,
-  sqlToPreparedName,
 } from './utils.js';
 
 /**
@@ -1006,7 +1006,7 @@ function boundedChildQuery(
   return {
     sql,
     params: [...deferred.params, limit],
-    preparedName: deferred.preparedName ? sqlToPreparedName(sql) : deferred.preparedName,
+    preparedName: deferred.preparedName ? boundedPreparedName(sql) : deferred.preparedName,
     transform: deferred.transform,
   };
 }
