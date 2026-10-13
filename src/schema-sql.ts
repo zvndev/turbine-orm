@@ -1433,9 +1433,9 @@ export async function schemaDiff(
       // gate, not by hiding the statement: withholding it here previously made
       // `push` report "already in sync" for a destructive-only diff and print a
       // false "Altered" for a mixed one, since the 0.36 guard never received it.
-      // No reverse is emitted (a dropped column and its data cannot be recreated
-      // automatically), so diff-generated migrations fall back to the documented
-      // irreversible-DOWN placeholder for this change.
+      // A dropped column and its data cannot be recreated automatically, so the
+      // reverse is irreversibleDropPlaceholder: an IRREVERSIBLE note in the DOWN
+      // section describing the column, never SQL that pretends to restore it.
       for (const dbColName of Object.keys(dbCols)) {
         const hasField = Object.entries(tableDef.columns).some(([fieldName]) => camelToSnake(fieldName) === dbColName);
         if (!hasField) {
