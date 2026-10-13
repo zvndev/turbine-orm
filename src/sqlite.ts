@@ -837,6 +837,13 @@ export const sqliteDialect: Dialect = {
   // No FROM-clause LATERAL: the opt-in lateral pick plan is Postgres-only.
   supportsLateralJoin: false,
   supportsPlanCacheMode: false,
+  // No row locks: a write transaction locks the whole database.
+  rowLockModes: [],
+  // percentile_cont / percentile_disc exist only in builds compiled with
+  // SQLITE_ENABLE_PERCENTILE, which node:sqlite cannot be assumed to have.
+  supportsPercentileAggregates: false,
+  // INSERT ... ON CONFLICT (cols) DO UPDATE ... RETURNING (3.24 + 3.35).
+  supportsBulkUpsert: true,
   // SQLite explains a compiled query with `EXPLAIN QUERY PLAN` (four columns:
   // id, parent, notused, detail), overriding the inherited Postgres `EXPLAIN`.
   explainQuery: { prefix: 'EXPLAIN QUERY PLAN' },

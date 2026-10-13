@@ -622,6 +622,14 @@ export const mssqlDialect: Dialect = {
   // is Postgres-only (out of scope here).
   supportsLateralJoin: false,
   supportsPlanCacheMode: false,
+  // SQL Server locks through table hints, not a trailing clause: not in this
+  // release.
+  rowLockModes: [],
+  // PERCENTILE_CONT is a window function here (OVER required), so it does not
+  // combine with other aggregates in one statement.
+  supportsPercentileAggregates: false,
+  // MERGE ... WITH (HOLDLOCK).
+  supportsBulkUpsert: true,
   // sp_getapplock / sp_releaseapplock exist (used by a future migrate adapter).
   supportsAdvisoryLock: true,
   // No in-band EXPLAIN: SQL Server's SHOWPLAN is a session toggle

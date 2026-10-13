@@ -7,7 +7,7 @@
  */
 
 import { ValidationError } from './errors.js';
-import type { WithOptions } from './query/types.js';
+import type { RowLockMode, WithOptions } from './query/types.js';
 import { coerceJsonWireValue, jsonWireCoercionOid } from './query/utils.js';
 import { pgArrayType, pgTypeToTs, type RelationDef, type SchemaMetadata, type TableMetadata } from './schema.js';
 
@@ -567,6 +567,34 @@ export interface Dialect {
   readonly supportsLateralJoin?: boolean;
 
   /**
+   * The row-lock strengths a locking read (`lock`) may use on this dialect.
+   * The builder appends `FOR <mode> OF <table>` after pagination for a mode in
+   * this list and throws {@link UnsupportedFeatureError} (E017) for any other.
+   * Optional: absent means none.
+   *
+   * Every engine dialect sets this as its OWN property, never by inheritance:
+   * each one spreads `postgresDialect`, which allows all four, so an engine
+   * that forgot it would silently emit PostgreSQL's locking clause. A unit test
+   * asserts `Object.hasOwn` for every engine.
+   */
+  readonly rowLockModes?: readonly RowLockMode[];
+
+  /**
+   * Whether `_percentile` aggregates compile here (`percentile_cont` /
+   * `percentile_disc ... WITHIN GROUP (ORDER BY ...)`). Optional: absent means
+   * E017. Set as an own property on every engine dialect, like
+   * {@link rowLockModes}.
+   */
+  readonly supportsPercentileAggregates?: boolean;
+
+  /**
+   * Whether `createMany({ onConflict })` (a multi-row upsert on one named
+   * unique key) compiles here. Optional: absent means E017. Set as an own
+   * property on every engine dialect, like {@link rowLockModes}.
+   */
+  readonly supportsBulkUpsert?: boolean;
+
+  /**
    * How this dialect surfaces a query plan for a compiled SELECT. When present,
    * `QueryInterface.explain()` prepends `prefix` (plus a single space) to the
    * compiled findMany SQL and runs it as a read, returning the plan text lines.
@@ -944,6 +972,9 @@ export const postgresDialect: Dialect = {
   supportsAdvisoryLock: true,
   supportsPlanCacheMode: true,
   supportsLateralJoin: true,
+  rowLockModes: ['update', 'noKeyUpdate', 'share', 'keyShare'],
+  supportsPercentileAggregates: true,
+  supportsBulkUpsert: true,
   explainQuery: { prefix: 'EXPLAIN' },
 
   paramPlaceholder(index: number): string {

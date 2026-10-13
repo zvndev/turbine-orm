@@ -125,6 +125,9 @@ export const FIND_UNIQUE_OPTIONS: OptionTable<FindUniqueArgs<Row>> = {
   // schema's naming space, so THE ONE RULE puts it here rather than in the
   // hand-translated set.
   jsonEncoding: 'native',
+  // A lock mode and a wait flag: no schema name in the value, so compat
+  // forwards it unchanged.
+  lock: 'native',
 };
 
 export const FIND_MANY_OPTIONS: OptionTable<FindManyArgs<Row>> = {
@@ -153,10 +156,15 @@ export const FIND_MANY_OPTIONS: OptionTable<FindManyArgs<Row>> = {
   forceCustomPlan: 'native',
   // See FIND_UNIQUE_OPTIONS: an encoding name carries no schema name.
   jsonEncoding: 'native',
+  lock: 'native',
 };
 
+// Streams take findMany's surface minus `lock` (a cursor cannot hold its rows
+// locked across fetches), so the spread drops it by name.
+const { lock: _streamsTakeNoLock, ...FIND_MANY_STREAM_BASE } = FIND_MANY_OPTIONS;
+
 export const FIND_MANY_STREAM_OPTIONS: OptionTable<FindManyStreamArgs<Row>> = {
-  ...FIND_MANY_OPTIONS,
+  ...FIND_MANY_STREAM_BASE,
   // No streaming delegate exists on the compat surface, so this is not a known
   // key there and passing it is reported rather than quietly ignored.
   batchSize: 'internal',
@@ -173,7 +181,13 @@ export const CREATE_OPTIONS: OptionTable<CreateArgs<Row>> = {
 export const CREATE_MANY_OPTIONS: OptionTable<CreateManyArgs<Row>> = {
   data: 'prisma',
   skipDuplicates: 'prisma',
+  // Field names (the target, the update columns, the projection), and compat's
+  // createMany does not expose them, so they are not known keys there.
+  onConflict: 'internal',
+  select: 'internal',
+  omit: 'internal',
   timeout: 'native',
+  skipGlobalFilters: 'native',
 };
 
 export const UPDATE_OPTIONS: OptionTable<UpdateArgs<Row>> = {
@@ -240,6 +254,8 @@ export const AGGREGATE_OPTIONS: OptionTable<AggregateArgs<Row>> = {
   _avg: 'prisma',
   _min: 'prisma',
   _max: 'prisma',
+  // Field names in the keys, and Prisma has no percentile aggregate.
+  _percentile: 'internal',
   timeout: 'native',
   skipGlobalFilters: 'native',
   includePii: 'native',
@@ -256,6 +272,7 @@ export const GROUP_BY_OPTIONS: OptionTable<GroupByArgs<Row>> = {
   _avg: 'prisma',
   _min: 'prisma',
   _max: 'prisma',
+  _percentile: 'internal',
   // `{ columns, orderBy }`, both in FIELD-NAME space. See THE ONE RULE.
   distinctOn: 'prisma',
   limit: 'nativeAlias',

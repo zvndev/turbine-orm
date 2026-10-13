@@ -10,6 +10,7 @@
 
 import { ValidationError } from '../errors.js';
 import type { ColumnRef } from './column-ref.js';
+import type { EXCLUDED_REF, SQL_EXPR } from './expr.js';
 
 // ---------------------------------------------------------------------------
 // The privilege sentinel
@@ -954,6 +955,25 @@ export type QueryResult<
       >
     : WithResult<T, R, W>;
 
+/**
+ * Row-lock strength for a locking read, PostgreSQL's four (`FOR UPDATE`,
+ * `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`). MySQL has `'update'` and
+ * `'share'` only; SQLite, SQL Server and PowDB have none and refuse `lock`
+ * with `UnsupportedFeatureError` (E017).
+ */
+export type RowLockMode = 'update' | 'noKeyUpdate' | 'share' | 'keyShare';
+
+/**
+ * The `lock` read option: a {@link RowLockMode}, or the mode plus ONE wait
+ * policy. `noWait` fails at once with `LockNotAvailableError` when a row is
+ * locked by another transaction; `skipLocked` leaves such rows out of the
+ * result, so a page can come back short (the queue-claim pattern).
+ */
+export type RowLock =
+  | RowLockMode
+  | { mode: RowLockMode; noWait?: true | undefined; skipLocked?: undefined }
+  | { mode: RowLockMode; skipLocked?: true | undefined; noWait?: undefined };
+
 export interface FindUniqueArgs<
   T,
   // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches TypedWithClause default
@@ -989,6 +1009,8 @@ export interface FindUniqueArgs<
   forceCustomPlan?: boolean | undefined;
   /** Override the relation JSON wire encoding for this query. See {@link FindManyArgs.jsonEncoding}. */
   jsonEncoding?: JsonEncoding | undefined;
+  /** Lock the returned row until the transaction ends. See {@link FindManyArgs.lock}. */
+  lock?: RowLock | undefined;
 }
 
 /**
@@ -1249,8 +1271,23 @@ export interface FindManyArgs<
    * {@link ValidationError} (E003) rather than being ignored.
    */
   jsonEncoding?: JsonEncoding | undefined;
+  /**
+   * Lock the returned rows of THIS table until the transaction ends
+   * (`SELECT ... FOR UPDATE OF "t"` and friends, see {@link RowLock}).
+   *
+   * Only inside a transaction: outside one the lock is released before the
+   * call returns, so the read is refused (E003). Rows loaded through `with`
+   * are read, not locked, on every relation strategy; to lock them, run a
+   * second locking read on that table. Cannot be combined with `distinct`.
+   */
+  lock?: RowLock | undefined;
 }
 
+/**
+ * Streaming reads take the {@link FindManyArgs} surface minus `lock`: a cursor
+ * holds its rows across many fetches, so page with `findMany` inside the
+ * transaction instead.
+ */
 export interface FindManyStreamArgs<
   T,
   // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches TypedWithClause default
@@ -1258,7 +1295,7 @@ export interface FindManyStreamArgs<
   W extends TypedWithClause<R> = TypedWithClause<R>,
   S extends Record<string, boolean> | undefined = undefined,
   O extends Record<string, boolean> | undefined = undefined,
-> extends FindManyArgs<T, R, W, S, O> {
+> extends Omit<FindManyArgs<T, R, W, S, O>, 'lock'> {
   /**
    * Number of rows to fetch per internal FETCH batch (default: 1000).
    *
@@ -1311,13 +1348,115 @@ export interface CreateArgs<
   timeout?: number | undefined;
 }
 
-export interface CreateManyArgs<T, D = OptionalInput<T>> {
+export interface CreateManyArgs<
+  T,
+  D = OptionalInput<T>,
+  S extends Record<string, boolean> | undefined = undefined,
+  O extends Record<string, boolean> | undefined = undefined,
+> {
   /** The rows. A generated client passes its `XCreate` as `D`. */
   data: D[];
-  /** When true, adds ON CONFLICT DO NOTHING to skip duplicate rows */
+  /** Skip rows that conflict on ANY unique constraint (ON CONFLICT DO NOTHING). */
   skipDuplicates?: boolean | undefined;
+  /**
+   * Conflict handling on ONE named unique key: skip the conflicting rows, or
+   * update them. Cannot be combined with `skipDuplicates`. See
+   * {@link CreateManyOnConflict}.
+   */
+  onConflict?: CreateManyOnConflict<T> | undefined;
+  /**
+   * Return only these fields of the written rows. Same rules as `create()`:
+   * a PII-tagged column is never returned, and naming one throws (E003).
+   */
+  select?: FlagsArg<T, S>;
+  /** Return the written rows without these fields. Same rules as `select`. */
+  omit?: FlagsArg<T, O>;
+  /**
+   * Opt out of configured {@link GlobalFilters} on the conflict-UPDATE of
+   * `onConflict` (inserts are never filtered). See {@link SkipGlobalFilters}.
+   */
+  skipGlobalFilters?: SkipGlobalFilters | undefined;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number | undefined;
+}
+
+/**
+ * The columns of the primary key, or of one non-partial unique constraint or
+ * index, in any order. A `createMany` conflict target.
+ */
+export type ConflictTarget<T> = readonly [keyof T & string, ...(keyof T & string)[]];
+
+/**
+ * `createMany({ onConflict })`: what to do with a row whose `target` key
+ * already exists.
+ *
+ * - `{ target, ignore: true }` skips it (it is not returned). A conflict on a
+ *   DIFFERENT unique key still raises `UniqueConstraintError`.
+ * - `{ target, update }` updates the existing row. `update` is a field list
+ *   (each listed column takes the incoming row's value) or a per-column
+ *   {@link ConflictUpdateData} object. `where` limits the update to existing
+ *   rows that match it; a row it excludes is left alone and not returned.
+ *
+ * The result holds the rows inserted or updated, in no guaranteed order.
+ */
+export type CreateManyOnConflict<T> =
+  | { target: ConflictTarget<T>; ignore: true; update?: undefined; where?: undefined }
+  | {
+      target: ConflictTarget<T>;
+      update: readonly (keyof T & string)[] | ConflictUpdateData<T>;
+      where?: WhereClause<T> | undefined;
+      ignore?: undefined;
+    };
+
+/**
+ * The per-column update of a `createMany` conflict. A plain value is the same
+ * for every row; an atomic operator, a {@link SqlExpr}, `col(...)` (the
+ * existing row) and `expr.excluded(...)` (the incoming row) are per row.
+ */
+export type ConflictUpdateData<T> = {
+  [K in keyof T]?: T[K] | UpdateOperatorInput<T[K]> | SqlExpr<T[K]> | ColumnRef | ExcludedRef | undefined;
+};
+
+/** The node kinds an update expression is built from (see {@link SqlExpr}). */
+export type SqlExprKind =
+  | 'add'
+  | 'sub'
+  | 'mul'
+  | 'div'
+  | 'coalesce'
+  | 'greatest'
+  | 'least'
+  | 'case'
+  | 'now'
+  | 'excluded';
+
+/** Carries the phantom result type of a {@link SqlExpr}. Type-level only. */
+declare const SQL_EXPR_RESULT: unique symbol;
+
+/**
+ * A SQL expression in update data, built only by the `expr` constructors
+ * (`expr.add`, `expr.greatest`, `expr.now`, ...). `V` is the expression's
+ * result type, so an expression typechecks only against a column it can be
+ * stored in. The node is frozen and branded: a look-alike plain object (what
+ * `JSON.parse` produces) is a value, never SQL.
+ */
+export interface SqlExpr<V = unknown> {
+  readonly [SQL_EXPR]: true;
+  readonly kind: SqlExprKind;
+  readonly args: readonly unknown[];
+  /** Phantom: the result type. Never present at run time. */
+  readonly [SQL_EXPR_RESULT]?: V;
+}
+
+/**
+ * `expr.excluded(field)`: the incoming row's value for `field` inside an
+ * upsert's update or a `createMany` `onConflict.update` (PostgreSQL's
+ * `EXCLUDED."c"`). Refused (E003) anywhere else.
+ */
+export interface ExcludedRef<F extends string = string> extends SqlExpr<never> {
+  readonly [EXCLUDED_REF]: true;
+  readonly kind: 'excluded';
+  readonly field: F;
 }
 
 /**
@@ -1340,11 +1479,13 @@ export type UpdateOperatorInput<V> =
   | (V extends number ? { divide: number } : never);
 
 /**
- * Update data, each field can be a plain value or an atomic operator object.
- * Back-compatible with `Partial<T>`: plain values still typecheck unchanged.
+ * Update data: each field takes a plain value, an atomic operator object, a
+ * {@link SqlExpr} whose result fits the column, or `col(...)` to copy another
+ * column of the same row. Back-compatible with `Partial<T>`: plain values
+ * still typecheck unchanged.
  */
 export type UpdateInput<T> = {
-  [K in keyof T]?: T[K] | UpdateOperatorInput<T[K]> | undefined;
+  [K in keyof T]?: T[K] | UpdateOperatorInput<T[K]> | SqlExpr<T[K]> | ColumnRef | undefined;
 };
 
 /**
@@ -1898,6 +2039,8 @@ export interface GroupByArgs<T, R extends object = {}> {
   _min?: GroupByAggregateSpec<T> | undefined;
   /** Maximum value of fields (or JSON paths) in each group */
   _max?: GroupByAggregateSpec<T> | undefined;
+  /** Percentiles of fields in each group (PostgreSQL only). See {@link PercentileSpec}. */
+  _percentile?: Partial<Record<keyof T & string, PercentileSpec>> | undefined;
   /** Filter whole groups by their aggregate values (SQL HAVING). JSON-path aggregates key by their alias. */
   having?: HavingClause<T> | undefined;
   /**
@@ -1924,10 +2067,10 @@ export interface GroupByArgs<T, R extends object = {}> {
   offset?: number | undefined;
   /**
    * Opt in to grouping on / aggregating PII-tagged (`defineSchema` `pii: true`)
-   * columns. A PII column in `by`, and `_min` / `_max` over a PII column, return
-   * STORED VALUES, so without this they throw `ValidationError` (E003).
-   * `_count` (a count, not a value), `_sum` / `_avg`, and `where` / `orderBy` /
-   * `having` on PII columns stay allowed.
+   * columns. A PII column in `by`, and `_min` / `_max` / `_percentile` over a
+   * PII column, return STORED VALUES, so without this they throw
+   * `ValidationError` (E003). `_count` (a count, not a value), `_sum` / `_avg`,
+   * and `where` / `orderBy` / `having` on PII columns stay allowed.
    *
    * PRIVILEGE OPTION: unlocked by the {@link UNSAFE} sentinel only. See
    * {@link FindManyArgs.includePii}.
@@ -1996,7 +2139,8 @@ export type GroupByResult<T, A> = { [K in GroupByFieldKeys<T, A>]: T[K] } & Grou
   GroupBySumAvgPart<A, '_sum'> &
   GroupBySumAvgPart<A, '_avg'> &
   GroupByMinMaxPart<T, A, '_min'> &
-  GroupByMinMaxPart<T, A, '_max'>;
+  GroupByMinMaxPart<T, A, '_max'> &
+  PercentilePart<T, A>;
 
 /**
  * The `_count` block on a groupBy result row. Scalar `_count: true` (or an
@@ -2033,11 +2177,25 @@ export interface AggregateArgs<T, R extends object = {}> {
   /** Maximum value of fields */
   _max?: Partial<Record<keyof T & string, boolean>> | undefined;
   /**
+   * Percentiles of fields (PostgreSQL only; other engines throw E017).
+   *
+   * ```ts
+   * const s = await db.requests.aggregate({
+   *   _percentile: { latencyMs: { p: [0.5, 0.95, 0.99] }, statusCode: { p: 0.5, method: 'disc' } },
+   * });
+   * s._percentile.latencyMs;  // number[] | null
+   * s._percentile.statusCode; // number | null
+   * ```
+   *
+   * See {@link PercentileSpec}.
+   */
+  _percentile?: Partial<Record<keyof T & string, PercentileSpec>> | undefined;
+  /**
    * Opt in to aggregating PII-tagged (`defineSchema` `pii: true`) columns.
-   * `_min` / `_max` return a STORED VALUE, so without this they throw
-   * `ValidationError` (E003) on a PII column. `_count` (a count, not a value)
-   * and `_sum` / `_avg` (a computed total over many rows) stay allowed, as do
-   * `where` filters on PII columns.
+   * `_min` / `_max` / `_percentile` return a STORED VALUE (or one that equals a
+   * stored value), so without this they throw `ValidationError` (E003) on a PII
+   * column. `_count` (a count, not a value) and `_sum` / `_avg` (a computed
+   * total over many rows) stay allowed, as do `where` filters on PII columns.
    *
    * PRIVILEGE OPTION: unlocked by the {@link UNSAFE} sentinel only. See
    * {@link FindManyArgs.includePii}.
@@ -2067,19 +2225,68 @@ export interface AggregateResult<T> {
   _avg?: Partial<Record<keyof T & string, number | string | null>>;
   _min?: Partial<Record<keyof T & string, unknown>>;
   _max?: Partial<Record<keyof T & string, unknown>>;
+  _percentile?: Partial<Record<keyof T & string, unknown>>;
 }
 
 /**
  * The result of `aggregate(args)`, derived from the args: only the blocks the
  * call requested are present, each keyed by exactly the requested fields.
  * `_sum` / `_avg` follow {@link AggregateResult}'s number-or-string rule;
- * `_min` / `_max` carry the column's own type, or `null` over zero rows.
+ * `_min` / `_max` carry the column's own type, or `null` over zero rows;
+ * `_percentile` follows {@link PercentileSpec}.
  */
 export type AggregateResultOf<T, A> = AggregateCountPart<A> &
   GroupBySumAvgPart<A, '_sum'> &
   GroupBySumAvgPart<A, '_avg'> &
   AggregateMinMaxPart<T, A, '_min'> &
-  AggregateMinMaxPart<T, A, '_max'>;
+  AggregateMinMaxPart<T, A, '_max'> &
+  PercentilePart<T, A>;
+
+/**
+ * One `_percentile` entry: which fractions of a column to compute.
+ *
+ * - `p`: a fraction in [0, 1], or a non-empty array of them. The result
+ *   mirrors the shape: a scalar for a number, an array (in the same order)
+ *   for an array. A fraction outside [0, 1], `NaN` or `[]` throws E003.
+ * - `method`: `'cont'` (the default, `percentile_cont`) interpolates between
+ *   the two nearest values, so it needs a numeric or interval column and
+ *   returns a `number` (an interval reads back as a string). `'disc'`
+ *   (`percentile_disc`) returns an actual stored value of the column, so it
+ *   works on any sortable column and carries the column's own type.
+ *
+ * Over zero rows the result is `null` (the whole array in the array form).
+ * Both methods need `includePii: UNSAFE` on a PII-tagged column.
+ */
+export interface PercentileSpec {
+  p: number | readonly number[];
+  method?: PercentileMethod | undefined;
+}
+
+/** `'cont'` interpolates (`percentile_cont`); `'disc'` returns a stored value (`percentile_disc`). */
+export type PercentileMethod = 'cont' | 'disc';
+
+/** One percentile value: the column's own type for `disc`, a number (or interval text) for `cont`. */
+type PercentileScalar<T, K, Spec> = K extends keyof T
+  ? Spec extends { method: 'disc' }
+    ? NonNullable<T[K]>
+    : [NonNullable<T[K]>] extends [number]
+      ? number
+      : number | string
+  : unknown;
+
+/** A scalar `p` yields one value, an array `p` yields an array, `null` over zero rows. */
+type PercentileValue<T, K, Spec> = Spec extends { p: infer P }
+  ? P extends readonly number[]
+    ? PercentileScalar<T, K, Spec>[] | null
+    : PercentileScalar<T, K, Spec> | null
+  : unknown;
+
+/** The `_percentile` block of an aggregate or groupBy result, present only when requested. */
+type PercentilePart<T, A> = A extends { _percentile: infer S }
+  ? [S] extends [object]
+    ? { _percentile: { [K in keyof S & string]: PercentileValue<T, K, S[K]> } }
+    : unknown
+  : unknown;
 
 type AggregateCountPart<A> = A extends { _count: infer C }
   ? C extends true

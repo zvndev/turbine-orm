@@ -634,6 +634,13 @@ export const mysqlDialect: Dialect = {
   // Postgres-only in this release (flipping it on is a one-line change + tests).
   supportsLateralJoin: false,
   supportsPlanCacheMode: false,
+  // FOR UPDATE / FOR SHARE (8.0); there is no NO KEY UPDATE or KEY SHARE.
+  rowLockModes: ['update', 'share'],
+  // No percentile_cont / percentile_disc.
+  supportsPercentileAggregates: false,
+  // INSERT ... AS alias ON DUPLICATE KEY UPDATE, with the refusals that
+  // keyless conflict resolution needs.
+  supportsBulkUpsert: true,
   // GET_LOCK / RELEASE_LOCK exist (used by a future migrate adapter).
   supportsAdvisoryLock: true,
   // Plain `EXPLAIN` (one row of tabular plan columns) works on every supported

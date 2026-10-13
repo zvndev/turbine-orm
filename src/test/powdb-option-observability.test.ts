@@ -297,6 +297,15 @@ const OBSERVATION: Record<string, Observation> = {
   // PowQL insert has no ON CONFLICT DO NOTHING, and says so.
   skipDuplicates: { how: 'unsupported', value: true },
   optimisticLock: { how: 'compiled', value: { field: 'version', expected: 1 } },
+  // On createMany the option acts only on the conflict-UPDATE of `onConflict`,
+  // and PowDB refuses `onConflict` (its upsert statement takes one row).
+  'createMany.skipGlobalFilters': {
+    how: 'unsupported',
+    value: UNSAFE,
+    needs: { onConflict: { target: ['email'], update: ['name'] } },
+  },
+  // PowDB has no row locks: a transaction holds the single writer gate.
+  lock: { how: 'unsupported', value: 'update' },
 
   // Postgres plan control has no PowDB equivalent and is documented as E017.
   forceCustomPlan: { how: 'unsupported', value: true },

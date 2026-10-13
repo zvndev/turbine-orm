@@ -157,6 +157,11 @@ export const powdbDialect: Dialect = {
   // earlier, this override keeps the flag truthful if a future path consults it.
   supportsLateralJoin: false,
   supportsPlanCacheMode: false,
+  // PowqlInterface reads none of these (it refuses each feature itself); they
+  // are set so the flags stay truthful if a shared path consults them.
+  rowLockModes: [],
+  supportsPercentileAggregates: false,
+  supportsBulkUpsert: false,
   beginStatement: () => 'begin',
   commitStatement: () => 'commit',
   rollbackStatement: () => 'rollback',
