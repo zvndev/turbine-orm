@@ -513,6 +513,14 @@ export function isDateType(pgType: string): boolean {
 }
 
 /**
+ * A precision suffix with the whitespace around it: `(6)` in `time(6)` or
+ * `time (6) with time zone`. Every quantifier is bounded, because a leading
+ * `\s*` retried from each position of a long whitespace run is quadratic in
+ * the type name's length; no real type name comes near the bounds.
+ */
+const TYPE_PRECISION = /\s{0,32}\(\s{0,32}\d{1,9}\s{0,32}\)\s{0,32}/;
+
+/**
  * Classify a column type as a TIME-OF-DAY type (`time` / `timetz`), or `null`
  * for anything else.
  *
@@ -536,7 +544,7 @@ export function timeOfDayKind(dbType: string | undefined): 'time' | 'timetz' | n
     .toLowerCase()
     // Precision can sit at the end (`time(6)`) or mid-spelling
     // (`time(6) with time zone`), so strip it wherever it appears.
-    .replace(/\s*\(\s*\d+\s*\)\s*/, ' ')
+    .replace(TYPE_PRECISION, ' ')
     .trim();
   if (t === 'time' || t === 'time without time zone') return 'time';
   if (t === 'timetz' || t === 'time with time zone') return 'timetz';
@@ -569,7 +577,7 @@ export function localDateTimeKind(dbType: string | undefined): 'date' | 'timesta
     .toLowerCase()
     // Precision can sit at the end (`timestamp(3)`) or mid-spelling
     // (`timestamp(3) without time zone`), so strip it wherever it appears.
-    .replace(/\s*\(\s*\d+\s*\)\s*/, ' ')
+    .replace(TYPE_PRECISION, ' ')
     .trim();
   if (t === 'date') return 'date';
   if (t === 'timestamp' || t === 'timestamp without time zone') return 'timestamp';
