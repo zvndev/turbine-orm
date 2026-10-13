@@ -386,11 +386,9 @@ function generateColumnDef(
   const implicitNotNull = isSerial || config.isPrimaryKey;
   const notNull = config.isNotNull && !implicitNotNull;
 
-  // DEFAULT
-  let defaultValue: string | undefined;
-  if (config.defaultValue != null) {
-    defaultValue = dialectDefault(normalizeDefault(config.defaultValue), dialect, config.type);
-  }
+  // DEFAULT, normalized here and spelled for the dialect once the column's
+  // final type is known (a MySQL default depends on it).
+  const normalizedDefault = config.defaultValue != null ? normalizeDefault(config.defaultValue) : undefined;
 
   // REFERENCES, resolve the raw table name through the optional resolver so
   // both camelCase accessor names and snake_case DDL names work.
@@ -426,6 +424,11 @@ function generateColumnDef(
   } else {
     typeInput = { type: config.type, maxLength: config.maxLength };
   }
+
+  const defaultValue =
+    normalizedDefault === undefined
+      ? undefined
+      : dialectDefault(normalizedDefault, dialect, dialect.name === 'mysql' ? dialect.buildColumnType(typeInput) : '');
 
   let def = dialect.buildColumnDefinition({
     name: dialect.quoteIdentifier(snakeName),
@@ -496,15 +499,43 @@ function normalizeDefault(val: string): string {
 }
 
 /**
+ * MySQL column types that accept no literal default: a default has to be written
+ * as an expression, in parentheses (8.0.13+), even when its value is a constant.
+ */
+const MYSQL_EXPRESSION_DEFAULT_TYPES = /^(TINY|MEDIUM|LONG)?(TEXT|BLOB)\b|^JSON\b/i;
+
+/** What a clock default means on a MySQL date or time column. */
+function mysqlClockDefault(key: string, ddlType: string): string | null {
+  const isClock = key === 'NOW()' || key === 'CURRENT_TIMESTAMP' || key === 'CURRENT_DATE' || key === 'CURRENT_TIME';
+  if (!isClock) return null;
+  const datetime = /^(?:DATETIME|TIMESTAMP)(?:\((\d)\))?$/i.exec(ddlType);
+  if (datetime) {
+    // MySQL 8 rejects a default whose fractional precision differs from the
+    // column's, and a bare CURRENT_DATE / CURRENT_TIME is not a valid default
+    // for a DATETIME (only the parenthesized expression is).
+    if (key === 'NOW()' || key === 'CURRENT_TIMESTAMP') {
+      return datetime[1] ? `CURRENT_TIMESTAMP(${datetime[1]})` : 'CURRENT_TIMESTAMP';
+    }
+    return `(${key})`;
+  }
+  // DATE and TIME columns accept neither NOW() nor a bare CURRENT_*, so the
+  // default is the matching clock function as an expression.
+  if (/^DATE$/i.test(ddlType)) return '(CURRENT_DATE)';
+  if (/^TIME(?:\(\d\))?$/i.test(ddlType)) return '(CURRENT_TIME)';
+  return null;
+}
+
+/**
  * The spelling of an already-normalized default for `dialect`. The schema
  * vocabulary (`now()`, `true`, `gen_random_uuid()`) is Postgres's, and some of
  * it is not SQL on the other engines: SQLite has no `NOW()` default, SQLite and
  * MySQL have no `GEN_RANDOM_UUID()`, and SQL Server has none of `NOW()`, boolean
  * literals or `CURRENT_DATE`. A literal (number, string, NULL) is the same
- * everywhere and passes through. `columnType` is the schema-level type token,
- * which MySQL needs to match a timestamp default to its column's precision.
+ * everywhere and passes through, except on a MySQL TEXT, BLOB or JSON column,
+ * where it has to be an expression. `columnType` is the column's MySQL type as
+ * the dialect spells it (`DATETIME(3)`, `TEXT`); other dialects ignore it.
  */
-function dialectDefault(normalized: string, dialect: Dialect, columnType?: string): string {
+function dialectDefault(normalized: string, dialect: Dialect, columnType = ''): string {
   const key = normalized.toUpperCase();
   switch (dialect.name) {
     case 'sqlite':
@@ -513,14 +544,14 @@ function dialectDefault(normalized: string, dialect: Dialect, columnType?: strin
         return "(lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || substr(hex(randomblob(2)), 2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(hex(randomblob(2)), 2) || '-' || hex(randomblob(6))))";
       }
       return normalized;
-    case 'mysql':
+    case 'mysql': {
       if (key === 'GEN_RANDOM_UUID()') return '(UUID())';
-      // A timestamp column is DATETIME(3) here (mysqlColumnType), and MySQL 8
-      // rejects a default whose fractional precision differs from the column's.
-      if ((key === 'NOW()' || key === 'CURRENT_TIMESTAMP') && /^TIMESTAMP(TZ)?$/i.test(columnType ?? '')) {
-        return 'CURRENT_TIMESTAMP(3)';
-      }
+      const clock = mysqlClockDefault(key, columnType);
+      if (clock) return clock;
+      // `DEFAULT NULL` is the one default these types accept as a literal.
+      if (key !== 'NULL' && MYSQL_EXPRESSION_DEFAULT_TYPES.test(columnType)) return `(${normalized})`;
       return normalized;
+    }
     case 'mssql':
       if (key === 'NOW()') return 'CURRENT_TIMESTAMP';
       if (key === 'GEN_RANDOM_UUID()') return 'NEWID()';
@@ -748,6 +779,14 @@ export interface DiffResult {
    */
   warnings?: string[];
   /**
+   * The members of `warnings` the diff cannot decide are real. Postgres rewrites
+   * a CHECK expression when it stores it, so a named check whose text differs
+   * from the schema's is usually the same constraint. They are printed like any
+   * other warning, but {@link driftWarnings} leaves them out, so a gate does not
+   * fail forever on a database that was just pushed.
+   */
+  inexactWarnings?: string[];
+  /**
    * Type changes in `statements` that can never lose a value (see
    * {@link isLosslessWidening}). The destructive gate skips exactly these
    * statements; every other `ALTER COLUMN ... TYPE` is still flagged.
@@ -759,6 +798,17 @@ export interface DiffResult {
    * lists these beside it.
    */
   notCompared?: string[];
+}
+
+/**
+ * The warnings in a diff that report a real difference between the database and
+ * the schema file: everything in `warnings` except the entries the diff marked
+ * as possibly cosmetic ({@link DiffResult.inexactWarnings}). `push --dry-run
+ * --exit-code` fails on these.
+ */
+export function driftWarnings(diff: Pick<DiffResult, 'warnings' | 'inexactWarnings'>): string[] {
+  const inexact = new Set(diff.inexactWarnings ?? []);
+  return (diff.warnings ?? []).filter((w) => !inexact.has(w));
 }
 
 /** One lossless `ALTER COLUMN ... TYPE` in a {@link DiffResult}. */
@@ -1215,6 +1265,7 @@ export async function schemaDiff(
       statements: [],
       reverseStatements: [],
       warnings: [],
+      inexactWarnings: [],
       widenings: [],
       notCompared: [],
     };
@@ -1520,11 +1571,12 @@ export async function schemaDiff(
           result.statements.push(addSql);
           result.reverseStatements.unshift(dropSql);
         } else if (normExpr(existing.expression) !== normExpr(sc.expression)) {
-          result.warnings!.push(
+          const checkWarning =
             `check constraint "${sc.name}" on "${tableName}": stored expression differs from the schema text ` +
-              `(Postgres canonicalizes CHECK expressions, so this is usually cosmetic). ` +
-              `To intentionally replace it, rename the constraint or drop/re-add it in a manual migration.`,
-          );
+            `(Postgres canonicalizes CHECK expressions, so this is usually cosmetic). ` +
+            `To intentionally replace it, rename the constraint or drop/re-add it in a manual migration.`;
+          result.warnings!.push(checkWarning);
+          result.inexactWarnings!.push(checkWarning);
         }
       }
 

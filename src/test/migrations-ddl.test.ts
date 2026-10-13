@@ -137,12 +137,13 @@ describe('schemaToSQL: MySQL', () => {
     assert.doesNotMatch(sql, /DATETIME[,\s]|DEFAULT NOW\(\)|DEFAULT CURRENT_TIMESTAMP[,\s]/);
   });
 
-  it('leaves a default on a column that is not a timestamp as written', () => {
+  it('writes the clock default of a date column as an expression, which MySQL accepts', () => {
     const dated = defineSchema({
       mig_dated: { id: { type: 'serial', primaryKey: true }, on: { type: 'date', default: 'now()' } },
     });
     const ddl = schemaToSQL(dated, { dialect: mysqlDialect }).join('\n');
-    assert.match(ddl, /`on` DATE DEFAULT NOW\(\)/);
+    assert.match(ddl, /`on` DATE DEFAULT \(CURRENT_DATE\)/);
+    assert.doesNotMatch(ddl, /DEFAULT NOW\(\)/);
   });
 });
 
