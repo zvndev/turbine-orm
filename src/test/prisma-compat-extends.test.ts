@@ -415,13 +415,9 @@ describe('prisma-compat, $extends integration (real Postgres)', () => {
   before(async () => {
     if (!url) return;
     const admin = new TurbineClient({ connectionString: url }, { enums: {}, tables: {} });
-    for (const stmt of ddl) await admin.raw([stmt] as unknown as TemplateStringsArray);
-    await admin.raw([
-      "INSERT INTO ext_user (email_address) VALUES ('a@acme.com'),('b@other.com')",
-    ] as unknown as TemplateStringsArray);
-    await admin.raw([
-      "INSERT INTO ext_post (title, author_id) VALUES ('First', 1),('Second', 2)",
-    ] as unknown as TemplateStringsArray);
+    for (const stmt of ddl) await admin.rawUnsafe(stmt);
+    await admin.rawUnsafe("INSERT INTO ext_user (email_address) VALUES ('a@acme.com'),('b@other.com')");
+    await admin.rawUnsafe("INSERT INTO ext_post (title, author_id) VALUES ('First', 1),('Second', 2)");
     await admin.disconnect();
 
     const schema = await introspect({ connectionString: url });
@@ -450,7 +446,7 @@ describe('prisma-compat, $extends integration (real Postgres)', () => {
 
   after(async () => {
     if (!url) return;
-    await db.raw(['DROP TABLE IF EXISTS ext_post, ext_user CASCADE'] as unknown as TemplateStringsArray);
+    await db.rawUnsafe('DROP TABLE IF EXISTS ext_post, ext_user CASCADE');
     await db.disconnect();
   });
 

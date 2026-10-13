@@ -356,16 +356,44 @@ function isTsSpace(code: number): boolean {
   );
 }
 
+/** A schema's enum types (`SchemaMetadata.enums`): type name to labels, in declaration order. */
+export type PowdbEnums = Readonly<Record<string, readonly string[]>>;
+
 /**
- * Does this column map to PowDB's native `json` document type? A Postgres
+ * The labels of the enum type this column is declared as, or `undefined` when
+ * it is not an enum column of `enums`.
+ *
+ * An enum column carries its TYPE NAME as `dialectType` / `pgType` and a
+ * `tsType` that says nothing useful (`unknown` from `defineSchema`, a union of
+ * the labels from introspection), so the column's own metadata cannot answer
+ * the question: the schema's `enums` map is the only authority. PowDB has no
+ * enum type, so such a column is a `str` holding the label text, which is what
+ * PostgreSQL stores and returns. Without this the tsType heuristic in
+ * {@link isJsonColumn} declared a `defineSchema` enum column as `json`, and
+ * writing a label failed as invalid JSON.
+ */
+export function powdbEnumLabels(col: ColumnMetadata, enums: PowdbEnums | undefined): readonly string[] | undefined {
+  if (!enums || col.isArray) return undefined;
+  const type = col.dialectType ?? col.pgType;
+  return type !== undefined && Object.hasOwn(enums, type) ? enums[type] : undefined;
+}
+
+/**
+ * Does this column map to PowDB's native `json` document type? An enum column
+ * of `enums` never does (see {@link powdbEnumLabels}). A Postgres
  * `json`/`jsonb` type (via `dialectType`/`pgType`) is authoritative; otherwise
  * the tsType heuristic (`Record<…>`, `object`, `unknown`, an object/array
  * literal) that the four scalar branches do not claim. Array columns never map
  * to json, a PowDB array only exists INSIDE a json document, so a Postgres
  * array column has no PowDB shape and still throws in {@link powqlColumnType}.
+ *
+ * `enums` is optional for callers outside Turbine; every call inside the
+ * engine passes the schema's map (a source scan in fx-powdb-r2.test.ts
+ * checks it).
  */
-export function isJsonColumn(col: ColumnMetadata): boolean {
+export function isJsonColumn(col: ColumnMetadata, enums?: PowdbEnums): boolean {
   if (col.isArray) return false;
+  if (powdbEnumLabels(col, enums)) return false;
   const dbType = (col.dialectType ?? col.pgType ?? '').toLowerCase();
   if (dbType === 'json' || dbType === 'jsonb') return true;
   const ts = baseTsType(col.tsType);
@@ -381,16 +409,18 @@ export function isJsonColumn(col: ColumnMetadata): boolean {
  *   - `Date` → `int` (epoch micros)   - `boolean` → `bool`
  *   - integral `number`/`bigint` → `int`   - fractional `number` → `float`
  *   - JSON / object columns → `json` (native PowDB document type, ≥ 0.12)
+ *   - an enum column of `enums` → `str` (the label text)
  *   - everything else (incl. UUID/PK strings) → `str`
  * Array (non-json) and bytes columns throw, they have no PowDB equivalent.
  */
-export function powqlColumnType(col: ColumnMetadata): PowqlType {
+export function powqlColumnType(col: ColumnMetadata, enums?: PowdbEnums): PowqlType {
   if (col.isArray) {
     throw new ValidationError(
       `Column "${col.name}" is an array, PowDB has no array type. Arrays are unsupported on the PowDB backend.`,
     );
   }
-  if (isJsonColumn(col)) return 'json';
+  if (powdbEnumLabels(col, enums)) return 'str';
+  if (isJsonColumn(col, enums)) return 'json';
   const ts = baseTsType(col.tsType);
   if (ts === 'Date') return 'int'; // epoch micros
   if (ts === 'boolean') return 'bool';
@@ -403,6 +433,22 @@ export function powqlColumnType(col: ColumnMetadata): PowqlType {
     );
   }
   return 'str';
+}
+
+/**
+ * Is this a `numeric` / `decimal` / `money` column that PowDB stores as `str`?
+ *
+ * A Postgres-sourced decimal surfaces as a JS string (so its digits survive),
+ * and PowDB has no decimal type, so the column is DDL'd as PowQL `str`. Every
+ * comparison, ordering and aggregate the engine runs on it is then a TEXT
+ * operation, which is why the query generator refuses those on such a column.
+ */
+export function isPowdbDecimalTextColumn(col: ColumnMetadata, enums?: PowdbEnums): boolean {
+  // An enum type's NAME is free text (`money_kind`), so an enum column is
+  // answered before the type-name match below can mistake it for a decimal.
+  if (powdbEnumLabels(col, enums)) return false;
+  if (col.isArray || isJsonColumn(col, enums) || baseTsType(col.tsType) !== 'string') return false;
+  return /numeric|decimal|money/.test((col.dialectType ?? col.pgType ?? '').toLowerCase());
 }
 
 /** Heuristic: does this numeric column hold fractional values (→ PowQL `float`)? */
@@ -608,9 +654,11 @@ export function quotePowqlDotted(name: string): string {
  * Every PowDB value arrives as a string; NULL arrives as the bareword `"null"`.
  * Metadata resolves the `"null"` ambiguity for nullable non-string columns.
  */
-export function coerceValue(raw: string, col: ColumnMetadata): unknown {
+export function coerceValue(raw: string, col: ColumnMetadata, enums?: PowdbEnums): unknown {
+  // An enum column holds its label as text, read as a string column is.
+  if (powdbEnumLabels(col, enums)) return raw === 'null' && col.nullable ? null : raw;
   const ts = baseTsType(col.tsType);
-  const json = isJsonColumn(col);
+  const json = isJsonColumn(col, enums);
   // NULL bareword: unambiguous for non-string columns; for `str` we cannot tell a
   // literal "null" from SQL NULL, so a nullable str of value "null" reads as null.
   // For a `json` column the bareword `null` (a legacy-wire rendering shared by an
@@ -690,6 +738,7 @@ export function rowToEntity(
   raw: Record<string, unknown>,
   meta: TableMetadata,
   native = false,
+  enums?: PowdbEnums,
 ): Record<string, unknown> {
   const byName = new Map(meta.columns.map((c) => [c.name, c]));
   const out: Record<string, unknown> = {};
@@ -701,8 +750,14 @@ export function rowToEntity(
       out[field] = value;
     } else if (native) {
       out[field] = coerceNativeValue(value, col);
+    } else if (typeof value === 'string') {
+      out[field] = coerceValue(value, col, enums);
+    } else if ((typeof value === 'number' || typeof value === 'bigint') && isDateColumn(col)) {
+      // A Date column's micros as a number cell: the Date it stores, as on the
+      // other wires, never the raw count (which a filter would then refuse).
+      out[field] = new Date(Number(value) / 1000);
     } else {
-      out[field] = typeof value === 'string' ? coerceValue(value, col) : value;
+      out[field] = value;
     }
   }
   return out;

@@ -23,7 +23,6 @@ import { describe, it } from 'node:test';
 import type { Dialect } from '../dialect.js';
 import { postgresDialect } from '../dialect.js';
 import { setErrorMessageMode, TurbineErrorCode, ValidationError } from '../errors.js';
-import { resetCacheCrossCheckEnv } from '../query/builder.js';
 import { MAX_WHERE_DEPTH } from '../query/where-compile.js';
 import type { SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
@@ -103,7 +102,6 @@ function withCacheCheckOff(fn: () => void): void {
   const savedSample = process.env.TURBINE_CACHE_CHECK_SAMPLE;
   process.env.NODE_ENV = 'production';
   delete process.env.TURBINE_CACHE_CHECK_SAMPLE;
-  resetCacheCrossCheckEnv();
   try {
     fn();
   } finally {
@@ -111,7 +109,6 @@ function withCacheCheckOff(fn: () => void): void {
     else process.env.NODE_ENV = savedEnv;
     if (savedSample === undefined) delete process.env.TURBINE_CACHE_CHECK_SAMPLE;
     else process.env.TURBINE_CACHE_CHECK_SAMPLE = savedSample;
-    resetCacheCrossCheckEnv();
   }
 }
 

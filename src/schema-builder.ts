@@ -26,6 +26,8 @@
 // Type-only import, erased at runtime, so it cannot introduce a circular
 // runtime dependency (the local `camelToSnakeLocal` copy avoids that for the
 // value-level helper).
+import { ValidationError } from './errors.js';
+import { suggestKey } from './query/utils.js';
 import type { ReferentialAction, RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
 
 export type { ReferentialAction } from './schema.js';
@@ -118,8 +120,12 @@ export interface ColumnDef {
   nullable?: boolean;
   /** UNIQUE constraint */
   unique?: boolean;
-  /** DEFAULT expression (raw SQL, e.g. 'now()' or "'active'") */
-  default?: string;
+  /**
+   * DEFAULT expression (raw SQL, e.g. `'now()'` or `"'active'"`). A finite number
+   * or a boolean is written as the literal it is (`5`, `true`). Anything else is
+   * refused (E003).
+   */
+  default?: string | number | boolean;
   /**
    * REFERENCES target. Either the "table.column" string form or an object with
    * referential actions ({@link ReferenceDef}).
@@ -152,6 +158,15 @@ export interface ColumnDef {
    * {@link import('./schema.js').ColumnMetadata.updatedAt}.
    */
   updatedAt?: boolean;
+  /**
+   * The TypeScript type `turbine generate` emits for this column, replacing
+   * the one derived from `type`. Mainly for `json` / `jsonb`, which otherwise
+   * generate as `unknown`: `{ type: 'jsonb', tsType: '{ theme: string }' }`.
+   * Emitted verbatim (nullability is still added), so it may name any type
+   * the generated file can see. The same override as the generator's
+   * `columnTypes` option, declared next to the column.
+   */
+  tsType?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -204,18 +219,44 @@ export interface ColumnConfig {
   pii: boolean;
   /** Whether this column is auto-set to the current time on update. */
   updatedAt: boolean;
+  /** Generated TypeScript type override ({@link ColumnDef.tsType}), or null / absent. */
+  tsType?: string | null;
+}
+
+/** What a value is, for a message: `an array`, `null`, `a string`. */
+function describeKind(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'an array';
+  return typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+}
+
+/**
+ * A declared DEFAULT as the SQL text the DDL generators take. A string is raw
+ * SQL, kept as written. A finite number or a boolean is the literal it is,
+ * where it used to reach the generator as a non-string and crash it with a
+ * TypeError. `undefined` and `null` mean no default.
+ */
+function declaredDefault(value: unknown, where: string): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'string') return value;
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  if ((typeof value === 'number' && Number.isFinite(value)) || typeof value === 'bigint') return String(value);
+  throw new ValidationError(
+    `Invalid default for ${where}: received ${describeKind(value)}${typeof value === 'number' ? ` (${value})` : ''}. ` +
+      `Write it as a string of raw SQL such as 'now()' or "'active'", or as a finite number or a boolean.`,
+  );
 }
 
 /** Convert a user-facing ColumnDef to the internal ColumnConfig */
-function resolveColumn(def: ColumnDef): ColumnConfig {
-  if (!(def.type in TYPE_MAP)) {
-    throw new Error(`Invalid column type "${def.type}". Valid types: ${Object.keys(TYPE_MAP).join(', ')}`);
+function resolveColumn(def: ColumnDef, where = 'a column'): ColumnConfig {
+  if (!Object.hasOwn(TYPE_MAP, def.type)) {
+    throw new ValidationError(`Invalid column type "${def.type}". Valid types: ${Object.keys(TYPE_MAP).join(', ')}`);
   }
   if (def.type === 'enum' && !def.enumName) {
-    throw new Error(`Column of type "enum" requires an "enumName" (the CREATE TYPE name).`);
+    throw new ValidationError(`Column of type "enum" requires an "enumName" (the CREATE TYPE name).`);
   }
   if (def.type === 'vector' && (def.dimensions == null || def.dimensions <= 0)) {
-    throw new Error(`Column of type "vector" requires a positive "dimensions" count.`);
+    throw new ValidationError(`Column of type "vector" requires a positive "dimensions" count.`);
   }
 
   // `references` is either the "table.column" string or a { target, onDelete, onUpdate } object.
@@ -224,7 +265,13 @@ function resolveColumn(def: ColumnDef): ColumnConfig {
   let onUpdate: ReferentialAction | null = null;
   if (typeof def.references === 'string') {
     referencesTarget = def.references;
-  } else if (def.references) {
+  } else if (def.references !== undefined && def.references !== null) {
+    if (typeof def.references !== 'object' || typeof def.references.target !== 'string') {
+      throw new ValidationError(
+        `defineSchema: ${where} has a "references" that is neither a "table.column" string nor ` +
+          `{ target: "table.column", onDelete?, onUpdate? }.`,
+      );
+    }
     referencesTarget = def.references.target;
     onDelete = def.references.onDelete ?? null;
     onUpdate = def.references.onUpdate ?? null;
@@ -236,7 +283,7 @@ function resolveColumn(def: ColumnDef): ColumnConfig {
     isNotNull: def.notNull ?? false,
     isNullable: def.nullable ?? false,
     isUnique: def.unique ?? false,
-    defaultValue: def.default ?? null,
+    defaultValue: declaredDefault(def.default, where),
     referencesTarget,
     maxLength: def.maxLength ?? null,
     onDelete,
@@ -247,7 +294,74 @@ function resolveColumn(def: ColumnDef): ColumnConfig {
     check: def.check ?? null,
     pii: def.pii ?? false,
     updatedAt: def.updatedAt ?? false,
+    tsType: checkedTsType(def.tsType),
   };
+}
+
+/** Characters a declared type may not contain (the generator refuses the same set). */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is this pattern's purpose
+const UNSAFE_TS_TYPE_TEXT = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+
+/** Characters a type expression uses outside a string literal and a bracket. */
+const TS_TYPE_CHAR = /^[\p{L}\p{N}_$.:?|&!+\-= \t]$/u;
+
+const TS_TYPE_CLOSER: Readonly<Record<string, string>> = { '(': ')', '[': ']', '{': '}', '<': '>' };
+
+/**
+ * Why `text` cannot be written into a generated file as a TypeScript type, or
+ * null when it can. The text lands verbatim as a member type or an alias body,
+ * so what has to hold is that it stays ONE type: brackets balance, nothing at
+ * the top level ends the member (`;` or `,`), and it holds no comment, template
+ * literal or character a type does not use. A `//` would swallow the rest of the
+ * line and a stray `}` would close the interface and start a statement.
+ *
+ * It does not check that the type is well formed or that its names exist; the
+ * compiler of the generated file does that.
+ */
+export function tsTypeTextProblem(text: string): string | null {
+  if (text.trim() === '') return 'it is empty';
+  if (UNSAFE_TS_TYPE_TEXT.test(text)) return 'it contains a control or line-separator character';
+  const chars = Array.from(text);
+  const open: string[] = [];
+  for (let i = 0; i < chars.length; i++) {
+    const c = chars[i]!;
+    if (c === "'" || c === '"') {
+      let end = i + 1;
+      while (end < chars.length && chars[end] !== c) end += chars[end] === '\\' ? 2 : 1;
+      if (end >= chars.length) return `a ${c} string literal is not closed`;
+      if (chars.slice(i, end).join('').includes('*/')) return 'a string literal contains "*/"';
+      i = end;
+    } else if (c === '=' && chars[i + 1] === '>') {
+      i++;
+    } else if (TS_TYPE_CLOSER[c] !== undefined) {
+      open.push(TS_TYPE_CLOSER[c]!);
+    } else if (c === ')' || c === ']' || c === '}' || c === '>') {
+      if (open.pop() !== c) return `"${c}" closes a bracket that was never opened`;
+    } else if (c === ';' || c === ',') {
+      if (open.length === 0) return `"${c}" outside any brackets would end the type`;
+    } else if (c === '`') {
+      return 'a template literal type is not supported here, name it with a type alias and use import()';
+    } else if (!TS_TYPE_CHAR.test(c)) {
+      return `"${c}" cannot appear in a type${c === '/' ? ' (no comments)' : ''}`;
+    }
+  }
+  return open.length > 0 ? 'a bracket is not closed' : null;
+}
+
+/**
+ * A `tsType` is emitted verbatim into generated source, so it must be one type
+ * on one line (see {@link tsTypeTextProblem}).
+ */
+function checkedTsType(tsType: string | undefined): string | null {
+  if (tsType === undefined) return null;
+  const problem = typeof tsType === 'string' ? tsTypeTextProblem(tsType) : 'it is not a string';
+  if (problem !== null) {
+    throw new ValidationError(
+      `Invalid column "tsType" ${JSON.stringify(tsType)}: ${problem}. ` +
+        `Give one TypeScript type on one line, for example '{ theme: string }' or "import('../src/types.js').Settings".`,
+    );
+  }
+  return tsType;
 }
 
 // ---------------------------------------------------------------------------
@@ -432,9 +546,298 @@ export interface DefineSchemaOptions {
 /** Input format: table name -> column defs (object format) or TableDef (legacy builder) */
 type SchemaInput = Record<string, Record<string, ColumnDef> | TableDef | TableInput>;
 
-/** Check if a value is a TableDef (from legacy table() builder) */
+// ---------------------------------------------------------------------------
+// Known keys: one table per declaration shape
+// ---------------------------------------------------------------------------
+//
+// A schema is static code, and a key `defineSchema` does not know is not
+// harmless: it is an option the caller meant and did not get (`defaultValue`
+// for `default` emits a column with no DEFAULT, `uniq` for `unique` a
+// non-unique index). So an unknown key is refused, at compile time in a
+// literal and at runtime for JSON or plain JS.
+//
+// Each table is a `Record<keyof Shape, true>`: adding an option to the shape
+// without listing it here fails the build, and listing a key the shape does
+// not have fails as an excess property. The compile-time check types below
+// and the runtime refusal both read these, so they cannot disagree.
+
+const COLUMN_KEYS: Record<keyof ColumnDef, true> = {
+  type: true,
+  primaryKey: true,
+  notNull: true,
+  nullable: true,
+  unique: true,
+  default: true,
+  references: true,
+  maxLength: true,
+  enumName: true,
+  dimensions: true,
+  array: true,
+  check: true,
+  pii: true,
+  updatedAt: true,
+  tsType: true,
+};
+
+const REFERENCE_KEYS: Record<keyof ReferenceDef, true> = { target: true, onDelete: true, onUpdate: true };
+const CHECK_KEYS: Record<keyof CheckDef, true> = { name: true, expression: true };
+const MANY_TO_MANY_KEYS: Record<keyof ManyToManyDef, true> = {
+  name: true,
+  target: true,
+  through: true,
+  sourceKey: true,
+  targetKey: true,
+  references: true,
+};
+const INDEX_KEYS: Record<keyof ColumnIndexDef | keyof DocFieldIndexDef, true> = {
+  columns: true,
+  docField: true,
+  path: true,
+  unique: true,
+  name: true,
+};
+/** The table-level options of {@link TableInput}; every other key is a column. */
+type TableOptionKey = 'primaryKey' | 'manyToMany' | 'checks' | 'indexes';
+const TABLE_OPTION_KEYS: Record<TableOptionKey, true> = {
+  primaryKey: true,
+  manyToMany: true,
+  checks: true,
+  indexes: true,
+};
+const SCHEMA_OPTION_KEYS: Record<keyof DefineSchemaOptions, true> = { enums: true };
+
+/**
+ * Refuse every key of `value` that `known` does not list (E003), naming where
+ * it sits and the key it most likely meant.
+ */
+function assertKnownKeys(value: object, known: Readonly<Record<string, true>>, where: string): void {
+  for (const key of Object.keys(value)) {
+    if (Object.hasOwn(known, key)) continue;
+    // suggestKey covers typos and the metadata spellings (`defaultValue`,
+    // `isUnique`) alike: the second pass matches a key that adds words.
+    const suggestion = suggestKey(key, Object.keys(known));
+    throw new ValidationError(
+      `defineSchema: unknown key "${key}" in ${where}.` +
+        (suggestion ? ` Did you mean "${suggestion}"?` : '') +
+        ` Valid keys: ${Object.keys(known).join(', ')}.`,
+    );
+  }
+}
+
+/** Each element of an option array, checked as `what` (non-objects are left to the consumer's own checks). */
+function assertKnownElementKeys(list: readonly unknown[], known: Readonly<Record<string, true>>, where: string): void {
+  list.forEach((item, i) => {
+    if (typeof item === 'object' && item !== null) assertKnownKeys(item, known, `${where}[${i}]`);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Compile-time key checks for a literal schema
+// ---------------------------------------------------------------------------
+//
+// `TableInput`'s index signature has to admit the array-valued table options
+// under ANY key (TypeScript requires named members to fit the signature), so
+// `primarykey: ['id']` type-checked. And once `defineSchema` is generic over
+// its input, the excess-property check that used to catch a misspelled column
+// option no longer applies (the inferred type has the key). These types put
+// both back: an unknown key's expected type becomes a message string, so the
+// literal fails at that key with the message in the diagnostic.
+
+/** The expected type an unknown key is given, so the compile error names it. */
+type UnknownKey<Where extends string, K> = `unknown key "${K & string}" in ${Where}`;
+/** Every key of every member of a union (`keyof` of a union is only the shared keys). */
+type AllKeys<T> = T extends unknown ? keyof T : never;
+type KnownKeys<T, Allowed, Where extends string> = T extends readonly unknown[]
+  ? unknown
+  : T extends object
+    ? { [K in AllKeys<T>]?: K extends Allowed ? unknown : UnknownKey<Where, K> }
+    : unknown;
+type KnownElementKeys<A, Allowed, Where extends string> = A extends readonly (infer E)[]
+  ? readonly KnownKeys<E, Allowed, Where>[]
+  : unknown;
+type ColumnKeyCheck<C> = KnownKeys<C, keyof ColumnDef, 'a column'> &
+  (C extends { references: infer R } ? { references?: KnownKeys<R, keyof ReferenceDef, 'references'> } : unknown);
+type TableKeyCheck<T> = T extends TableDef
+  ? unknown
+  : string extends keyof T
+    ? unknown
+    : {
+        [K in keyof T]: K extends 'indexes'
+          ? KnownElementKeys<T[K], keyof ColumnIndexDef | keyof DocFieldIndexDef, 'an index'>
+          : K extends 'checks'
+            ? KnownElementKeys<T[K], keyof CheckDef, 'a check'>
+            : K extends 'manyToMany'
+              ? KnownElementKeys<T[K], keyof ManyToManyDef, 'a manyToMany relation'>
+              : K extends TableOptionKey
+                ? unknown
+                : T[K] extends readonly unknown[]
+                  ? UnknownKey<'a table (not a table option, and an array is not a column)', K>
+                  : ColumnKeyCheck<T[K]>;
+      };
+/** Rejects, in a literal, every key {@link defineSchema} would refuse at runtime. */
+export type SchemaKeyCheck<S> = { [A in keyof S]: TableKeyCheck<S[A]> };
+
+/**
+ * Refuse `__proto__` as a table or column name. `JSON.parse` can produce it as
+ * an own key, but assigning to it on a record sets the record's prototype
+ * instead of adding a key, so the column would vanish without a word.
+ */
+function assertOrdinaryName(name: string, what: string): void {
+  if (name === '__proto__') {
+    throw new ValidationError(
+      `defineSchema: ${what} is named "__proto__", which JavaScript treats as the prototype setter rather than a ` +
+        `property name, so it could not be stored or queried. Rename it.`,
+    );
+  }
+}
+
+/**
+ * An index is either a column index (`columns`) or a document-field index
+ * (`docField` and `path`), never both. A declaration carrying both was taken
+ * for the document-field kind, which only PowDB creates, so the SQL engines
+ * skipped it without saying so.
+ */
+function assertIndexKinds(list: readonly unknown[], accessor: string): void {
+  list.forEach((item, i) => {
+    if (typeof item === 'object' && item !== null && 'columns' in item && 'docField' in item) {
+      throw new ValidationError(
+        `defineSchema: index ${i} of table "${accessor}" declares both "columns" and "docField". ` +
+          `Use "columns" for a column index, or "docField" with "path" for an index into a json document. ` +
+          `Declare two indexes if you need both.`,
+      );
+    }
+  });
+}
+
+/**
+ * Is this value a TableDef (the legacy `table()` builder's output)?
+ *
+ * A TableDef carries a STRING `name` and a `columns` record of column configs.
+ * In the object format a key called `name` or `columns` is a column, and a
+ * column definition is an object, so the string is what tells the two apart: a
+ * table with columns named `name` and `columns` used to be read as a TableDef
+ * and emitted as a different table. A table that has a string `name` but is not
+ * a TableDef falls through to the object format, which refuses the string.
+ */
 function isTableDef(v: unknown): v is TableDef {
-  return typeof v === 'object' && v !== null && 'columns' in v && 'name' in v;
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const t = v as { name?: unknown; columns?: unknown };
+  if (typeof t.name !== 'string') return false;
+  const columns = t.columns;
+  if (typeof columns !== 'object' || columns === null || Array.isArray(columns)) return false;
+  return Object.values(columns).every((c) => typeof c === 'object' && c !== null);
+}
+
+/** A name list for a message: `a, b, c`, or `(none)`. */
+function nameList(names: Iterable<string>): string {
+  const list = [...names];
+  return list.length > 0 ? list.join(', ') : '(none)';
+}
+
+/** The DDL column name of a field: what `CREATE TABLE` and every index write for it. */
+const ddlColumnName = camelToSnakeLocal;
+
+/**
+ * Refuse a schema that names something it does not contain. Every one of these
+ * used to be accepted and then went wrong somewhere else, or nowhere:
+ *
+ * - `userId` and `user_id` in one table are the SAME column to the database, so
+ *   the DDL declared it twice.
+ * - A `references` that is not `table.column` was dropped (no foreign key, no
+ *   error), and one naming a column its target table does not have became a
+ *   `REFERENCES` clause the database rejects at push time. A target table that
+ *   is not in this schema is left alone, since it may be owned elsewhere.
+ * - An index on a column the table does not have failed the same way.
+ *
+ * It runs once, after every table is built, because a reference may name a
+ * table declared later.
+ */
+function assertSchemaIntegrity(tables: Record<string, TableDef>): void {
+  const byDdlName = new Map<string, string>();
+  const byName = new Map<string, TableDef>();
+  for (const [accessor, table] of Object.entries(tables)) {
+    const owner = byDdlName.get(table.name);
+    if (owner !== undefined) {
+      throw new ValidationError(
+        `defineSchema: tables "${owner}" and "${accessor}" are both the table "${table.name}" in the database ` +
+          `(a camelCase name is written in snake_case). Keep one, or rename one.`,
+      );
+    }
+    byDdlName.set(table.name, accessor);
+    byName.set(accessor, table);
+    byName.set(table.name, table);
+  }
+
+  for (const [accessor, table] of Object.entries(tables)) {
+    const columnOf = new Map<string, string>();
+    for (const field of Object.keys(table.columns)) {
+      const ddl = ddlColumnName(field);
+      const other = columnOf.get(ddl);
+      if (other !== undefined) {
+        throw new ValidationError(
+          `defineSchema: table "${accessor}" has columns "${other}" and "${field}", which are the same column ` +
+            `"${ddl}" in the database. Keep one.`,
+        );
+      }
+      columnOf.set(ddl, field);
+    }
+
+    const hasColumn = (name: string): boolean => Object.hasOwn(table.columns, name) || columnOf.has(name);
+    const columnNames = (): string[] => Object.keys(table.columns);
+
+    for (const [i, idx] of (table.indexes ?? []).entries()) {
+      if (!isDocFieldIndexDef(idx) && !Array.isArray(idx.columns)) {
+        throw new ValidationError(
+          `defineSchema: index ${i} of table "${accessor}" declares neither "columns" (an array of column names) ` +
+            `nor "docField" with "path".`,
+        );
+      }
+      const named: unknown[] = isDocFieldIndexDef(idx) ? [idx.docField] : idx.columns;
+      for (const name of named) {
+        if (typeof name === 'string' && hasColumn(name)) continue;
+        const suggestion = typeof name === 'string' ? suggestKey(name, columnNames()) : null;
+        throw new ValidationError(
+          `defineSchema: index ${i} of table "${accessor}" names ${typeof name === 'string' ? `column "${name}"` : `a ${describeKind(name)} instead of a column name`}, ` +
+            `which the table does not have.${suggestion ? ` Did you mean "${suggestion}"?` : ''} ` +
+            `Columns: ${nameList(columnNames())}.`,
+        );
+      }
+    }
+
+    for (const [field, config] of Object.entries(table.columns)) {
+      if (config.referencesTarget === null || config.referencesTarget === undefined) continue;
+      const where = `column "${accessor}.${field}"`;
+      const target = config.referencesTarget;
+      const parts = typeof target === 'string' ? target.split('.') : [];
+      if (parts.length !== 2 || !parts[0] || !parts[1]) {
+        throw new ValidationError(
+          `defineSchema: ${where} has references ${JSON.stringify(target)}, which is not in "table.column" form, so no foreign ` +
+            `key would be created. Write it as "users.id".` +
+            (parts.length > 2 ? ' A schema-qualified name ("auth.users.id") is not supported.' : ''),
+        );
+      }
+      const [refTable, refColumn] = parts as [string, string];
+      // A table outside this schema is allowed, since something else may own
+      // it. Its columns cannot be checked here.
+      const targetTable = byName.get(refTable);
+      if (!targetTable) continue;
+      const targetDdl = new Set(Object.keys(targetTable.columns).map(ddlColumnName));
+      const isField = Object.hasOwn(targetTable.columns, refColumn);
+      if (!isField && !targetDdl.has(refColumn)) {
+        const suggestion = suggestKey(refColumn, Object.keys(targetTable.columns));
+        throw new ValidationError(
+          `defineSchema: ${where} references "${target}", but table "${refTable}" has no column "${refColumn}".` +
+            (suggestion ? ` Did you mean "${suggestion}"?` : '') +
+            ` Columns: ${nameList(Object.keys(targetTable.columns))}.`,
+        );
+      }
+      // The DDL names the column as written, so a field name (`displayName`)
+      // becomes the column it is (`display_name`) here, where the table is known.
+      if (isField && ddlColumnName(refColumn) !== refColumn) {
+        config.referencesTarget = `${refTable}.${ddlColumnName(refColumn)}`;
+      }
+    }
+  }
 }
 
 /**
@@ -456,10 +859,15 @@ function isTableDef(v: unknown): v is TableDef {
  * });
  * ```
  */
-export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions): SchemaDef {
+export function defineSchema<S extends SchemaInput>(
+  input: S & SchemaKeyCheck<S>,
+  options?: DefineSchemaOptions,
+): SchemaDef {
   const tables: Record<string, TableDef> = {};
+  if (options !== undefined) assertKnownKeys(options, SCHEMA_OPTION_KEYS, 'the defineSchema options');
 
   for (const [accessor, value] of Object.entries(input)) {
+    assertOrdinaryName(accessor, `table "${accessor}"`);
     // The user-facing key is the camelCase JS accessor; the DDL-facing
     // table name is its snake_case form (e.g. `postTags` → `post_tags`).
     const dbName = camelToSnakeLocal(accessor);
@@ -483,8 +891,10 @@ export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions):
         if (fieldName === 'indexes') {
           if (def !== undefined) {
             if (!Array.isArray(def)) {
-              throw new Error(`Table "${accessor}": "indexes" must be an array of index declarations`);
+              throw new ValidationError(`Table "${accessor}": "indexes" must be an array of index declarations`);
             }
+            assertKnownElementKeys(def, INDEX_KEYS, `table "${accessor}" indexes`);
+            assertIndexKinds(def, accessor);
             indexes = def as readonly SchemaIndexDef[];
           }
           continue;
@@ -492,8 +902,9 @@ export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions):
         if (fieldName === 'manyToMany') {
           if (def !== undefined) {
             if (!Array.isArray(def)) {
-              throw new Error(`Table "${accessor}": "manyToMany" must be an array of relation declarations`);
+              throw new ValidationError(`Table "${accessor}": "manyToMany" must be an array of relation declarations`);
             }
+            assertKnownElementKeys(def, MANY_TO_MANY_KEYS, `table "${accessor}" manyToMany`);
             m2m = def as readonly ManyToManyDef[];
           }
           continue;
@@ -501,8 +912,11 @@ export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions):
         if (fieldName === 'checks') {
           if (def !== undefined) {
             if (!Array.isArray(def)) {
-              throw new Error(`Table "${accessor}": "checks" must be an array of { name?, expression } objects`);
+              throw new ValidationError(
+                `Table "${accessor}": "checks" must be an array of { name?, expression } objects`,
+              );
             }
+            assertKnownElementKeys(def, CHECK_KEYS, `table "${accessor}" checks`);
             checks = def as readonly CheckDef[];
           }
           continue;
@@ -511,7 +925,7 @@ export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions):
           // Top-level composite primary key declaration
           if (def !== undefined) {
             if (!Array.isArray(def)) {
-              throw new Error(
+              throw new ValidationError(
                 `Table "${accessor}": top-level "primaryKey" must be an array of column names (string[])`,
               );
             }
@@ -519,8 +933,32 @@ export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions):
           }
           continue;
         }
-        // Anything else is a ColumnDef
-        columns[fieldName] = resolveColumn(def as ColumnDef);
+        // Anything else is a ColumnDef. An array here is a table option under a
+        // name defineSchema does not know (`primarykey`, `index`): refuse it by
+        // that name rather than as a column with no type.
+        if (Array.isArray(def)) {
+          const suggestion = suggestKey(fieldName, Object.keys(TABLE_OPTION_KEYS));
+          throw new ValidationError(
+            `defineSchema: table "${accessor}" has an array under "${fieldName}", which is not a table option ` +
+              `(${Object.keys(TABLE_OPTION_KEYS).join(', ')}) and cannot be a column.` +
+              (suggestion ? ` Did you mean "${suggestion}"?` : ''),
+          );
+        }
+        assertOrdinaryName(fieldName, `column "${accessor}.${fieldName}"`);
+        // An `undefined` column is absent, like an `undefined` option anywhere else.
+        if (def === undefined) continue;
+        if (typeof def !== 'object' || def === null) {
+          throw new ValidationError(
+            `defineSchema: column "${accessor}.${fieldName}" must be an object such as { type: 'text' }, ` +
+              `received ${describeKind(def)}.`,
+          );
+        }
+        assertKnownKeys(def, COLUMN_KEYS, `column "${accessor}.${fieldName}"`);
+        const ref = (def as ColumnDef).references;
+        if (typeof ref === 'object' && ref !== null) {
+          assertKnownKeys(ref, REFERENCE_KEYS, `the references of column "${accessor}.${fieldName}"`);
+        }
+        columns[fieldName] = resolveColumn(def as ColumnDef, `column "${accessor}.${fieldName}"`);
       }
 
       // Validate composite PK references real columns and clear column-level PKs
@@ -530,7 +968,7 @@ export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions):
       if (pk && pk.length > 0) {
         for (const colName of pk) {
           if (!(colName in columns)) {
-            throw new Error(
+            throw new ValidationError(
               `Table "${accessor}": composite primaryKey references unknown column "${colName}". ` +
                 `Known columns: ${Object.keys(columns).join(', ') || '(none)'}`,
             );
@@ -559,6 +997,7 @@ export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions):
     }
   }
 
+  assertSchemaIntegrity(tables);
   return { tables, ...(options?.enums ? { enums: options.enums } : {}) };
 }
 
@@ -595,6 +1034,7 @@ export class ColumnBuilder {
       check: null,
       pii: false,
       updatedAt: false,
+      tsType: null,
     };
   }
 
@@ -689,11 +1129,13 @@ export class ColumnBuilder {
     this._config.isUnique = true;
     return this;
   }
-  default(val: string): this {
-    this._config.defaultValue = val;
+  default(val: string | number | boolean): this {
+    this._config.defaultValue = declaredDefault(val, 'ColumnBuilder.default()');
     return this;
   }
   references(target: string, opts?: { onDelete?: ReferentialAction; onUpdate?: ReferentialAction }): this {
+    if (opts !== undefined)
+      assertKnownKeys(opts, { onDelete: true, onUpdate: true }, `references("${target}") options`);
     this._config.referencesTarget = target;
     this._config.onDelete = opts?.onDelete ?? null;
     this._config.onUpdate = opts?.onUpdate ?? null;
@@ -710,6 +1152,11 @@ export class ColumnBuilder {
   /** Auto-set this column to the current time on every update. Prisma's `@updatedAt`. */
   updatedAt(): this {
     this._config.updatedAt = true;
+    return this;
+  }
+  /** The TypeScript type `turbine generate` emits for this column. See {@link ColumnDef.tsType}. */
+  tsType(type: string): this {
+    this._config.tsType = checkedTsType(type);
     return this;
   }
   array(): this {
@@ -781,7 +1228,7 @@ export const column: ColumnProxy = new Proxy({} as ColumnProxy, {
       };
     }
     return () => {
-      throw new Error(`Unknown column type: ${prop}`);
+      throw new ValidationError(`Unknown column type: ${prop}`);
     };
   },
 });

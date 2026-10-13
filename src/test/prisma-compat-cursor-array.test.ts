@@ -3,15 +3,12 @@
  * write that the adapter answered differently from Prisma.
  *
  * 1. A BARE INCLUSIVE CURSOR beside a MULTI-ELEMENT `orderBy` array. A Prisma
- *    cursor is inclusive, so translating one needs the cursor field to be the
- *    single sort key; the adapter documents that anything else throws E017 and
- *    points at `skip: 1`. `orderByPairs` read only an array of length one and
- *    returned `[]` for every other array, which is the same value it returns
- *    for "no orderBy at all", so a two-element array took the no-orderBy branch:
- *    it saw a PK cursor, wrote `orderBy = { id: 'asc' }` OVER the caller's array
- *    and returned the rows after the anchor in PK order. Silent wrong rows on
- *    the paginated path. Flattening every element restores the documented
- *    refusal, and `skip: 1` (the exact exclusive translation) keeps the array.
+ *    cursor is inclusive and names one row; the page starts AT that row in the
+ *    query's order. `orderByPairs` once read only an array of length one, took
+ *    the no-orderBy branch for a longer one and wrote `orderBy = { id: 'asc' }`
+ *    OVER the caller's array. The adapter now hands core an inclusive cursor,
+ *    and core reads the cursor row's ordered values, so every array shape keeps
+ *    its ordering and starts at the right row.
  *
  * 2. An EMPTY `OR`. Prisma treats `OR: []` as false (no rows) and empty
  *    `AND` / `NOT` as true; core drops an empty combinator, so the adapter
@@ -28,7 +25,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { TurbineClient } from '../client.js';
-import { TurbineError, TurbineErrorCode } from '../errors.js';
+import { TurbineError } from '../errors.js';
 import { type CompatTurbineClient, createPrismaCompatClient } from '../prisma-compat.js';
 import type { PrismaCompatMap, SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
@@ -125,52 +122,43 @@ function sqlOf(promise: unknown): { sql: string; params: unknown[] } {
 // ---------------------------------------------------------------------------
 
 describe('prisma-compat: a bare cursor beside an array orderBy', () => {
-  it('throws E017 for a two-element array instead of overwriting the ordering', () => {
+  it('a two-element array keeps its ordering and starts AT the cursor row', () => {
     const compat = compatClient();
-    assert.throws(
-      // Built, not merely called: a compat delegate is lazy, so the translation
-      // (and its refusal) happens when the query is compiled.
-      () =>
-        sqlOf(
-          compat.Post.findMany({
-            orderBy: [{ viewCount: 'asc' }, { id: 'asc' }],
-            cursor: { id: 239 },
-            take: 3,
-          } as Any),
-        ),
-      (err: unknown) => {
-        assert.ok(err instanceof TurbineError, `expected a TurbineError, got ${String(err)}`);
-        assert.equal(err.code, TurbineErrorCode.UNSUPPORTED_FEATURE);
-        assert.match(err.message, /cursor/i);
-        assert.match(err.message, /skip: 1|`skip`/, 'the message points at the exact exclusive translation');
-        return true;
-      },
+    const { sql, params } = sqlOf(
+      compat.Post.findMany({
+        orderBy: [{ viewCount: 'asc' }, { id: 'asc' }],
+        cursor: { id: 239 },
+        take: 3,
+      } as Any),
     );
+    assert.match(sql, /ORDER BY "view_count" ASC, "id" ASC LIMIT/, 'the caller ordering survives verbatim');
+    // The cursor names a row, so the seek reads that row's ordered values.
+    assert.match(sql, /"posts"\."view_count" > \(SELECT cursor_row\."view_count" FROM "posts" cursor_row WHERE/);
+    assert.match(sql, /"posts"\."id" >= \(SELECT cursor_row\."id"/, 'inclusive: the cursor row itself is on the page');
+    assert.deepEqual(params, [239, 3]);
   });
 
-  it('throws for a single-element array whose field is not the cursor field (unchanged)', () => {
+  it('a single-element array whose field is not the cursor field reads the cursor row the same way', () => {
     const compat = compatClient();
-    assert.throws(
-      () => sqlOf(compat.Post.findMany({ orderBy: [{ viewCount: 'asc' }], cursor: { id: 5 } } as Any)),
-      (err: unknown) => {
-        assert.ok(err instanceof TurbineError);
-        assert.equal(err.code, TurbineErrorCode.UNSUPPORTED_FEATURE);
-        return true;
-      },
-    );
+    const { sql } = sqlOf(compat.Post.findMany({ orderBy: [{ viewCount: 'asc' }], cursor: { id: 5 } } as Any));
+    assert.match(sql, /ORDER BY "view_count" ASC, "id" ASC/, 'the primary key breaks view_count ties');
+    assert.match(sql, /EXISTS \(SELECT 1 FROM "posts" cursor_row WHERE cursor_row\."id" = \$1\)/);
   });
 
-  it('a single-element array naming the cursor field is still the inclusive keyset', () => {
+  it('a single-element array naming the cursor field reads the cursor row too', () => {
     const compat = compatClient();
     const { sql, params } = sqlOf(
       compat.Post.findMany({ orderBy: [{ id: 'asc' }], cursor: { id: 239 }, take: 3 } as Any),
     );
-    assert.match(sql, /"id" >= \$1/, 'inclusive: gte, not a plain equality');
+    // A Prisma cursor names a row, so a deleted cursor row is an empty page
+    // even when the cursor already carries the only ordered value.
+    assert.match(sql, /EXISTS \(SELECT 1 FROM "posts" cursor_row WHERE cursor_row\."id" = \$1\)/);
+    assert.match(sql, /"posts"\."id" >= \(SELECT cursor_row\."id"/, 'inclusive: gte, not a plain equality');
     assert.match(sql, /ORDER BY "id" ASC/);
     assert.deepEqual(params, [239, 3]);
   });
 
-  it('the same array with skip: 1 keeps the caller ordering and pages exclusively', () => {
+  it('the same array with skip: 1 keeps the caller ordering and skips the cursor row', () => {
     const compat = compatClient();
     const { sql, params } = sqlOf(
       compat.Post.findMany({
@@ -182,9 +170,9 @@ describe('prisma-compat: a bare cursor beside an array orderBy', () => {
     );
     // The caller's two-key ordering survives verbatim, which is the property
     // the overwrite destroyed.
-    assert.match(sql, /ORDER BY "view_count" ASC, "id" ASC/);
-    assert.match(sql, /"id" > \$1/, 'skip: 1 is the exclusive cursor');
-    assert.ok(params.includes(239));
+    assert.match(sql, /ORDER BY "view_count" ASC, "id" ASC LIMIT \$2 OFFSET \$3/);
+    assert.match(sql, /"posts"\."id" >= \(SELECT/, 'the page starts at the cursor row');
+    assert.deepEqual(params, [239, 3, 1], 'skip: 1 is an offset of one: the cursor row');
   });
 
   it('a descending array orderBy with skip: 1 keeps its direction', () => {
@@ -198,6 +186,7 @@ describe('prisma-compat: a bare cursor beside an array orderBy', () => {
       } as Any),
     );
     assert.match(sql, /ORDER BY "view_count" DESC, "id" DESC/);
+    assert.match(sql, /"posts"\."view_count" < \(SELECT/);
   });
 });
 

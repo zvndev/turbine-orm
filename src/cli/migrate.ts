@@ -23,6 +23,7 @@ import { isPlainSchemaIdentifier, parseSearchPathValue, withSearchPathOption } f
 import { type Dialect, postgresDialect } from '../dialect.js';
 import { MigrationError, ValidationError } from '../errors.js';
 import type { PgCompatQueryResult } from '../pg-types.js';
+import { isLosslessWidening, type TypeWidening } from '../schema-sql.js';
 import { DESTRUCTIVE_KIND_LABEL, type DestructiveStatement, scanDestructiveSql } from './destructive.js';
 import { splitSqlStatements, tokenizeSql } from './sql-statements.js';
 
@@ -163,13 +164,88 @@ export function assertNoEmbeddedTransactions(files: MigrationFile[], section: 'u
   throw new MigrationError(lines.join('\n'));
 }
 
+// ---------------------------------------------------------------------------
+// Lossless type widenings
+// ---------------------------------------------------------------------------
+
+/**
+ * The comment a diff-generated migration puts directly above an
+ * `ALTER COLUMN ... TYPE` that cannot lose a value: `-- turbine:widening
+ * <from> -> <to>`.
+ *
+ * `ALTER COLUMN ... TYPE` is a destructive statement to the scanner, which can
+ * read the new type and nothing else. The generator knows the old one, so it
+ * says what it knows in the file, and {@link scanMigrationDestructive} believes
+ * the claim only as far as it can check it: the pair must itself be a lossless
+ * widening ({@link isLosslessWidening}) and the statement below must change that
+ * one column to exactly the claimed type. It is an accident guard, like the rest
+ * of the scanner: a hand-written marker over a column whose real type differs
+ * from `from` is not caught.
+ */
+const WIDENING_MARKER = /^--\s*turbine:widening\s+(.+?)\s*->\s*(.+?)\s*$/i;
+
+/** `ALTER TABLE <t> ALTER [COLUMN] <c> [SET DATA] TYPE <type>` and nothing else. */
+const SINGLE_ALTER_TYPE =
+  /^ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?:"[^"]+"|[A-Za-z_][\w$]*)(?:\.(?:"[^"]+"|[A-Za-z_][\w$]*))?\s+ALTER\s+(?:COLUMN\s+)?(?:"[^"]+"|[A-Za-z_][\w$]*)\s+(?:SET\s+DATA\s+)?TYPE\s+((?:[^,();]|\([^)]*\))+?)\s*$/i;
+
+/** The marker's claim from a statement's leading comment lines, or null. */
+function leadingWideningClaim(raw: string): { from: string; to: string } | null {
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (t === '') continue;
+    const m = WIDENING_MARKER.exec(t);
+    if (m) return { from: m[1]!, to: m[2]! };
+    if (!t.startsWith('--')) break;
+  }
+  return null;
+}
+
+const normalizeTypeText = (t: string): string => t.replace(/\s+/g, ' ').trim().toUpperCase();
+
+/** The marker line for a {@link TypeWidening}. */
+export function wideningMarker(w: Pick<TypeWidening, 'from' | 'to'>): string {
+  return `-- turbine:widening ${w.from} -> ${w.to}`;
+}
+
+/**
+ * {@link scanDestructiveSql}, minus the `ALTER COLUMN ... TYPE` statements that
+ * carry a checked widening marker. Everything else is reported exactly as the
+ * scanner reports it.
+ */
+export function scanMigrationDestructive(sql: string): DestructiveStatement[] {
+  const hits = scanDestructiveSql(sql);
+  if (!hits.some((h) => h.kind === 'alter-column-type')) return hits;
+
+  // How many marked widenings of each statement text the file holds, so that one
+  // marked statement cannot excuse an identical unmarked one beside it.
+  const excused = new Map<string, number>();
+  for (const st of tokenizeSql(sql)) {
+    if (st.commentOnly) continue;
+    const claim = leadingWideningClaim(st.raw);
+    if (!claim || !isLosslessWidening(claim.from, claim.to)) continue;
+    const display = st.stripped.replace(/\s+/g, ' ');
+    const alter = SINGLE_ALTER_TYPE.exec(display.trim());
+    if (!alter || normalizeTypeText(alter[1]!) !== normalizeTypeText(claim.to)) continue;
+    excused.set(display, (excused.get(display) ?? 0) + 1);
+  }
+  if (excused.size === 0) return hits;
+
+  return hits.filter((h) => {
+    if (h.kind !== 'alter-column-type') return true;
+    const left = excused.get(h.statement) ?? 0;
+    if (left === 0) return true;
+    excused.set(h.statement, left - 1);
+    return false;
+  });
+}
+
 /** Scan a set of migration files' UP sections for data-destroying statements. */
 export function collectUpDestructive(files: MigrationFile[]): DestructiveOffender[] {
   const offenders: DestructiveOffender[] = [];
   for (const file of files) {
     const { up } = parseMigrationSQL(file.path);
     if (!up) continue;
-    const hits = scanDestructiveSql(up);
+    const hits = scanMigrationDestructive(up);
     if (hits.length > 0) offenders.push({ file: file.filename, hits });
   }
   return offenders;
@@ -350,16 +426,23 @@ export function sanitizeName(name: string): string {
 }
 
 /**
- * Generate a YYYYMMDDHHMMSS timestamp string from a Date.
+ * Generate a YYYYMMDDHHMMSS timestamp string from a Date, in UTC.
+ *
+ * Apply order is the filename order, so two people who create migrations in
+ * different time zones must stamp the same instant with the same digits. In local
+ * time a migration made at 09:00 in Berlin (07:00 UTC) sorted AFTER one made at
+ * 08:00 in New York (13:00 UTC) the same morning, and ran out of creation order.
+ * Files already on disk keep their local-time names; the runner reads any 14
+ * digits.
  */
 export function formatTimestamp(date: Date): string {
   return [
-    date.getFullYear(),
-    String(date.getMonth() + 1).padStart(2, '0'),
-    String(date.getDate()).padStart(2, '0'),
-    String(date.getHours()).padStart(2, '0'),
-    String(date.getMinutes()).padStart(2, '0'),
-    String(date.getSeconds()).padStart(2, '0'),
+    date.getUTCFullYear(),
+    String(date.getUTCMonth() + 1).padStart(2, '0'),
+    String(date.getUTCDate()).padStart(2, '0'),
+    String(date.getUTCHours()).padStart(2, '0'),
+    String(date.getUTCMinutes()).padStart(2, '0'),
+    String(date.getUTCSeconds()).padStart(2, '0'),
   ].join('');
 }
 
@@ -396,15 +479,19 @@ export function listMigrationFiles(migrationsDir: string): MigrationFile[] {
 /**
  * `.sql` files in `migrationsDir` that the runner NEVER sees, because their
  * name lacks the `YYYYMMDDHHMMSS_<name>.sql` shape {@link listMigrationFiles}
- * requires (a hand-written `add_thing.sql`, a 13-digit prefix). Such a file
- * used to be skipped in silence by `status`, `up` and `deploy` alike, so a
- * misnamed migration simply never ran and nothing said so. The CLI prints one
- * warning per entry.
+ * requires (a hand-written `add_thing.sql`, a 13-digit prefix, an upper-case
+ * `.SQL` extension). Such a file used to be skipped in silence by `status`,
+ * `up` and `deploy` alike, so a misnamed migration simply never ran and
+ * nothing said so. The CLI prints one warning per entry.
+ *
+ * The extension is matched in any case here and only in lower case by the
+ * runner: `20260101000000_init.SQL` is a migration somebody meant to run, so
+ * it is reported rather than ignored like a `.txt` file.
  */
 export function listIgnoredSqlFiles(migrationsDir: string): string[] {
   if (!existsSync(migrationsDir)) return [];
   return readdirSync(migrationsDir)
-    .filter((f) => f.endsWith('.sql') && parseMigrationFilename(f) === null)
+    .filter((f) => /\.sql$/i.test(f) && parseMigrationFilename(f) === null)
     .sort();
 }
 
@@ -715,19 +802,57 @@ const DESTRUCTIVE_MIGRATION_BANNER = [
   '-- ============================================================',
 ];
 
+/** Same banner when only the DOWN direction is destructive: UP runs without a prompt. */
+const DESTRUCTIVE_DOWN_ONLY_BANNER = [
+  '-- ============================================================',
+  '-- WARNING: this migration contains DESTRUCTIVE statement(s).',
+  '-- Only the DOWN section is destructive (flagged inline there).',
+  '-- `turbine migrate up` runs UP as written; `turbine migrate down`',
+  '-- asks you to confirm before it runs the flagged statements.',
+  '-- ============================================================',
+];
+
+/** True for a block that is nothing but comments and blank lines. */
+function isCommentBlock(text: string): boolean {
+  return text.split('\n').every((line) => {
+    const t = line.trim();
+    return t === '' || t.startsWith('--');
+  });
+}
+
 /**
  * Annotate a list of SQL statements: scan each for data-destroying operations
  * (via {@link scanDestructiveSql}) and prefix any offender with loud, commented
  * warnings. Statements are left intact so the existing `migrate up` gate still
  * refuses them by default; the comments just make the danger visible on review.
+ *
+ * A comment-only entry (the DOWN placeholder for a dropped column) is written
+ * through untouched: it is not SQL, so it is neither scanned nor given a `;`.
+ * A statement the diff proved to be a lossless widening gets its
+ * {@link wideningMarker} instead of a warning, and is not scanned.
  */
-function annotateDiffStatements(statements: string[]): { text: string; destructive: DestructiveStatement[] } {
+function annotateDiffStatements(
+  statements: string[],
+  widenings: readonly TypeWidening[] = [],
+): { text: string; destructive: DestructiveStatement[] } {
   const destructive: DestructiveStatement[] = [];
   const out: string[] = [];
+  const widened = new Map(widenings.map((w) => [w.statement.trim(), w]));
 
   for (const raw of statements) {
     const stmt = raw.trim();
     if (!stmt) continue;
+
+    if (isCommentBlock(stmt)) {
+      out.push(stmt);
+      continue;
+    }
+
+    const widening = widened.get(stmt.endsWith(';') ? stmt : `${stmt};`);
+    if (widening) {
+      out.push(wideningMarker(widening), stmt.endsWith(';') ? stmt : `${stmt};`);
+      continue;
+    }
 
     const hits = scanDestructiveSql(stmt);
     if (hits.length > 0) {
@@ -753,6 +878,11 @@ function annotateDiffStatements(statements: string[]): { text: string; destructi
  *   when any exist, a loud file-level banner is prepended to UP.
  * - Any diff `warnings` (changes the diff refuses to apply automatically, e.g.
  *   enum value removals) are surfaced as `-- NOTE:` comments in UP.
+ * - A type change the diff proved lossless (`widenings`) is not flagged: it is
+ *   preceded by a {@link wideningMarker}, which `migrate up` checks before it
+ *   stops excusing the statement.
+ * - Every `DROP COLUMN` in UP has a comment block in DOWN saying the data
+ *   cannot be restored automatically (the diff supplies it as a reverse entry).
  *
  * Pure and DB-free, so it is unit-testable from a synthesized diff.
  */
@@ -760,8 +890,9 @@ export function buildDiffMigrationBody(diff: {
   statements: string[];
   reverseStatements: string[];
   warnings?: string[];
+  widenings?: readonly TypeWidening[];
 }): DiffMigrationBody {
-  const up = annotateDiffStatements(diff.statements);
+  const up = annotateDiffStatements(diff.statements, diff.widenings);
   const hasReverse = diff.reverseStatements.length > 0;
   const down = hasReverse
     ? annotateDiffStatements(diff.reverseStatements)
@@ -769,7 +900,7 @@ export function buildDiffMigrationBody(diff: {
 
   const upParts: string[] = [];
   if (up.destructive.length > 0 || down.destructive.length > 0) {
-    upParts.push(...DESTRUCTIVE_MIGRATION_BANNER, '');
+    upParts.push(...(up.destructive.length > 0 ? DESTRUCTIVE_MIGRATION_BANNER : DESTRUCTIVE_DOWN_ONLY_BANNER), '');
   }
   if (diff.warnings && diff.warnings.length > 0) {
     for (const w of diff.warnings) upParts.push(`-- NOTE: ${w}`);
@@ -869,7 +1000,18 @@ ${autoContent.down}
 `;
   }
 
-  writeFileSync(filePath, template, 'utf-8');
+  // `wx` (create, fail if the name exists): the name carries a one-second
+  // timestamp, so a second create with the same name in that second would
+  // otherwise silently replace the first file, edits included.
+  try {
+    writeFileSync(filePath, template, { encoding: 'utf-8', flag: 'wx' });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    throw new MigrationError(
+      `Migration file ${filename} already exists, and its name is timestamped to the second. ` +
+        'Wait a second and run the command again, or choose a different name.',
+    );
+  }
 
   return {
     filename,
@@ -1185,6 +1327,55 @@ export async function acquireMigrationLock(
   }
 }
 
+/** How long, and how, {@link acquireMigrationLockWaiting} waits for a held lock. */
+export interface MigrationLockWait {
+  /** The longest total wait, in milliseconds. */
+  timeoutMs: number;
+  /** The pause between attempts, in milliseconds. Default 1000. */
+  intervalMs?: number;
+  /** Called once, on the first refusal, so the CLI can say it is waiting. */
+  onWait?: () => void;
+  /** @internal clock and sleep, replaced by tests. */
+  now?: () => number;
+  /** @internal */
+  sleep?: (ms: number) => Promise<void>;
+}
+
+/**
+ * {@link acquireMigrationLock}, retried until `wait.timeoutMs` has passed.
+ *
+ * Polls the adapter's own non-blocking acquire rather than issuing a blocking
+ * `pg_advisory_lock`: a blocking wait needs a `lock_timeout` to be bounded, and
+ * setting one is a `SET`, which must never run on a connection that may sit
+ * behind a pooler. Polling needs nothing but the statement the adapter already
+ * uses, and works for the lock-table adapters too. Without `wait` it is exactly
+ * one attempt, which is what every caller did before.
+ *
+ * @internal exported for tests.
+ */
+export async function acquireMigrationLockWaiting(
+  runner: MigrationLockClient,
+  lockId: number,
+  adapter: DatabaseAdapter | undefined,
+  openLockConnection: () => Promise<MigrationLockClient>,
+  wait?: MigrationLockWait,
+): Promise<MigrationLock> {
+  let lock = await acquireMigrationLock(runner, lockId, adapter, openLockConnection);
+  if (lock.acquired || !wait) return lock;
+
+  const now = wait.now ?? Date.now;
+  const sleep = wait.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const interval = wait.intervalMs ?? 1000;
+  const deadline = now() + wait.timeoutMs;
+
+  wait.onWait?.();
+  while (!lock.acquired && now() < deadline) {
+    await sleep(Math.max(0, Math.min(interval, deadline - now())));
+    lock = await acquireMigrationLock(runner, lockId, adapter, openLockConnection);
+  }
+  return lock;
+}
+
 /**
  * Release a lock taken by {@link acquireMigrationLock}, and close the dedicated
  * connection when there is one. A refused lock owns nothing, so releasing it is
@@ -1471,14 +1662,31 @@ export function formatChecksumMismatchError(
 export function assertUpHasStatements(files: MigrationFile[]): void {
   for (const file of files) {
     const { up } = parseMigrationSQL(file.path);
-    const executable = tokenizeSql(up).filter((s) => !s.commentOnly && s.stripped.trim() !== '');
-    if (executable.length > 0) continue;
+    if (hasExecutableStatement(up)) continue;
     throw new MigrationError(
       `Migration ${file.filename} has an UP section with no executable statement (comments only). ` +
         `Applying it would record the migration as applied while running nothing, and filling the file in ` +
         `afterwards would then be refused as drift. Write the UP section or delete the file.`,
     );
   }
+}
+
+/** True when `sql` holds at least one statement that is not just comments. */
+export function hasExecutableStatement(sql: string): boolean {
+  return tokenizeSql(sql).some((s) => !s.commentOnly && s.stripped.trim() !== '');
+}
+
+/**
+ * The files among `files` whose DOWN section runs no SQL at all (comments only).
+ *
+ * A diff-generated migration that drops a column ships a commented IRREVERSIBLE
+ * note as its DOWN, because no statement can bring the data back. Rolling such a
+ * migration back succeeds, removes its tracking row, and restores nothing, so
+ * the CLI names these files after a rollback instead of letting "rolled back"
+ * stand unqualified.
+ */
+export function rollbacksWithoutSql(files: readonly MigrationFile[]): MigrationFile[] {
+  return files.filter((f) => f.path !== '' && !hasExecutableStatement(parseMigrationSQL(f.path).down));
 }
 
 /**
@@ -1580,6 +1788,14 @@ export async function migrateUp(
      * SQL and the tracking table alike. See {@link connectionStringForSchema}.
      */
     schema?: string;
+    /**
+     * Wait up to this many milliseconds for another migration to release the
+     * lock, instead of failing at once. The pending list is read AFTER the lock
+     * is taken, so whatever the other run applied is simply no longer pending.
+     */
+    lockWaitMs?: number;
+    /** Called once when the lock is held by someone else and the wait begins. */
+    onLockWait?: () => void;
   },
 ): Promise<MigrationRunResult> {
   const { client, connectionString: url } = await connectMigrationClient(connectionString, options?.schema);
@@ -1600,9 +1816,21 @@ export async function migrateUp(
     // table-lock adapter gets its OWN connection so the per-migration
     // BEGIN/COMMIT below cannot end the transaction the lock lives in.
     const adapter = options?.adapter;
-    const lock = await acquireMigrationLock(client, lockId, adapter, () => openLockConnection(url));
+    const lockWaitMs = options?.lockWaitMs;
+    const lock = await acquireMigrationLockWaiting(
+      client,
+      lockId,
+      adapter,
+      () => openLockConnection(url),
+      lockWaitMs !== undefined && lockWaitMs > 0 ? { timeoutMs: lockWaitMs, onWait: options?.onLockWait } : undefined,
+    );
     if (!lock.acquired) {
-      throw new MigrationError('Could not acquire migration lock, another migration is already running');
+      throw new MigrationError(
+        lockWaitMs !== undefined && lockWaitMs > 0
+          ? `Could not acquire migration lock within ${Math.round(lockWaitMs / 1000)}s: another migration is still running. ` +
+              'Raise --wait if it is expected to take longer.'
+          : 'Could not acquire migration lock, another migration is already running',
+      );
     }
 
     try {
@@ -1752,7 +1980,14 @@ export async function migrateUp(
 export async function migrateDeploy(
   connectionString: string,
   migrationsDir: string,
-  options?: { adapter?: DatabaseAdapter; allowDrift?: boolean; schema?: string },
+  options?: {
+    adapter?: DatabaseAdapter;
+    allowDrift?: boolean;
+    schema?: string;
+    /** Wait up to this many milliseconds for a concurrent deploy to finish. See `migrateUp`. */
+    lockWaitMs?: number;
+    onLockWait?: () => void;
+  },
 ): Promise<MigrationRunResult> {
   return migrateUp(connectionString, migrationsDir, {
     // Honor `--allow-drift` on deploy exactly as `up` does: deploy's own drift
@@ -1761,6 +1996,8 @@ export async function migrateDeploy(
     allowDestructive: true,
     adapter: options?.adapter,
     schema: options?.schema,
+    lockWaitMs: options?.lockWaitMs,
+    onLockWait: options?.onLockWait,
   });
 }
 
@@ -2088,4 +2325,78 @@ export async function migrateStatus(
   } finally {
     await client.end();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Status helpers (pending files, CI exit code)
+// ---------------------------------------------------------------------------
+
+/** The migration files in `statuses` that have not been applied to the database. */
+export function pendingMigrationFiles(statuses: readonly MigrationStatus[]): MigrationFile[] {
+  return statuses.filter((st) => !st.applied).map((st) => st.file);
+}
+
+/**
+ * The refusal `migrate create --auto` / `--from-diff` prints while migrations
+ * are still pending.
+ *
+ * Both flags diff the schema file against the LIVE database. A pending migration
+ * is a change the file already describes and the database does not have yet, so
+ * the diff reports it AGAIN: the new migration repeats those statements and
+ * fails on the first database that applies the pending one before it.
+ */
+export function formatPendingAutoRefusal(pending: readonly MigrationFile[], flag: string): string {
+  const lines = [
+    `Refusing to create a migration with ${flag}: ${pending.length} migration(s) in the migrations directory are not applied to this database yet:`,
+    '',
+    ...pending.map((f) => `  ${f.filename}`),
+    '',
+    `${flag} compares your schema file with the LIVE database. The pending file(s) above already describe part of`,
+    'that difference, so the new migration would repeat their statements and fail when they run first.',
+    '',
+    'Apply them, then run this command again:   npx turbine migrate up',
+    `If they do not touch what the schema file describes (a data migration, say), pass --allow-pending.`,
+  ];
+  return lines.join('\n');
+}
+
+/** What `migrate status --exit-code` decides from. */
+export interface MigrationHealth {
+  /** Migration files not yet applied. */
+  pending: number;
+  /** Applied migrations whose file has changed since. */
+  drifted: number;
+  /** Applied migrations whose file is gone. */
+  missing: number;
+  /** True only when all three are zero. */
+  ok: boolean;
+}
+
+/**
+ * Every reason `migrate status --exit-code` exits 2, as phrases for the message.
+ * Empty means the gate passes. `ignoredFiles` are the `.sql` files in the
+ * migrations directory whose name the runner never matches (see
+ * {@link listIgnoredSqlFiles}): a migration that will never run is as much a
+ * disagreement between the files and the database as a pending one.
+ */
+export function statusGateProblems(health: MigrationHealth, ignoredFiles: readonly string[]): string[] {
+  const problems: string[] = [];
+  if (health.pending > 0) problems.push(`${health.pending} pending`);
+  if (health.drifted > 0) problems.push(`${health.drifted} modified after being applied`);
+  if (health.missing > 0) problems.push(`${health.missing} missing from disk`);
+  if (ignoredFiles.length > 0) {
+    problems.push(
+      `${ignoredFiles.length} misnamed .sql file(s) that will never run (${ignoredFiles.join(', ')}; ` +
+        `a migration filename is YYYYMMDDHHMMSS_name.sql)`,
+    );
+  }
+  return problems;
+}
+
+/** Count the ways a migration history can disagree with the files on disk. */
+export function summarizeMigrationStatus(statuses: readonly MigrationStatus[]): MigrationHealth {
+  const pending = statuses.filter((st) => !st.applied).length;
+  const missing = statuses.filter((st) => st.missingFile).length;
+  const drifted = statuses.filter((st) => st.applied && st.checksumValid === false && !st.missingFile).length;
+  return { pending, drifted, missing, ok: pending === 0 && drifted === 0 && missing === 0 };
 }

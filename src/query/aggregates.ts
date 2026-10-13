@@ -14,6 +14,7 @@ import type { TableMetadata } from '../schema.js';
 import { snakeToCamel } from '../schema.js';
 import type { DeferredQuery } from './deferred.js';
 import {
+  assertEqualityOperand,
   dedupeColumnList,
   isJsonPathOrderBy,
   isUnmatchedPlainObject,
@@ -21,6 +22,7 @@ import {
   isWhereOperator,
   normalizeOrderBy,
   orderByEntries,
+  setOwn,
 } from './filters.js';
 import type {
   AggregateArgs,
@@ -32,13 +34,21 @@ import type {
   JsonPathAggregateTarget,
   OrderBySpec,
   OrderDirection,
+  PercentileSpec,
   WhereClause,
 } from './types.js';
 import { assertOrderDirection, resolveSkipGlobalFilters, resolveUnsafeFlag } from './types.js';
-import { isTemporalInfinity, ownLookup, parseDbDate, resolveColumnName, warnRedundantSortTerm } from './utils.js';
+import {
+  isTemporalInfinity,
+  ownLookup,
+  parseDbDate,
+  resolveColumnName,
+  suggestKey,
+  warnRedundantSortTerm,
+} from './utils.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
-import { assertWhereDepth } from './where-compile.js';
+import { assertWhereDepth, combinatorBranches } from './where-compile.js';
 
 /**
  * Enforce the PII contract on the aggregate surface. A PII-tagged
@@ -77,10 +87,48 @@ export function assertAggregatePiiOptIn(
   );
 }
 
+/**
+ * `by` is required, and must be a non-empty array of field names and
+ * `{ field, path }` JSON keys. Checked before anything reads it: a missing
+ * `by` was a TypeError ("args.by is not iterable"), a string was iterated
+ * character by character ("Unknown field \"n\""), an empty array emitted
+ * `GROUP BY ` with nothing after it for the server to reject, and a `null`
+ * entry was a TypeError. Exported for PowqlInterface, whose groupBy takes
+ * the same `by`.
+ */
+export function assertGroupByKeys(table: string, by: unknown): void {
+  if (!Array.isArray(by)) {
+    const example = typeof by === 'string' ? `, for example \`by: [${JSON.stringify(by)}]\`` : '';
+    throw new ValidationError(
+      `groupBy on table "${table}" requires \`by\`, an array of field names${example}; got ${describeByValue(by)}.`,
+    );
+  }
+  if (by.length === 0) {
+    throw new ValidationError(
+      `groupBy on table "${table}" requires at least one \`by\` key. To aggregate every row as one group, use aggregate().`,
+    );
+  }
+  for (const entry of by) {
+    if (typeof entry !== 'string' && (typeof entry !== 'object' || entry === null || Array.isArray(entry))) {
+      throw new ValidationError(
+        `groupBy \`by\` on table "${table}" takes field names and { field, path } JSON keys; got ${describeByValue(entry)}.`,
+      );
+    }
+  }
+}
+
+/** The kind of a bad `by` value, never the value itself. */
+function describeByValue(value: unknown): string {
+  if (value === null || value === undefined) return String(value);
+  if (Array.isArray(value)) return 'an array';
+  return typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+}
+
 export function buildGroupBy<T extends object>(
   qi: BuilderCtx,
   args: GroupByArgs<T>,
 ): DeferredQuery<Record<string, unknown>[]> {
+  assertGroupByKeys(qi.table, args.by);
   const meta = qi.schema.tables[qi.table];
   // Up-front, so a bad `by` key is reported before anything else in the call,
   // and through `qi.toColumn` (the ONE `resolveColumnName` rule) rather than
@@ -283,6 +331,8 @@ export function buildGroupBy<T extends object>(
   buildAggregates('_avg', 'AVG', args._avg as Record<string, boolean | JsonPathAggregateTarget> | undefined);
   buildAggregates('_min', 'MIN', args._min as Record<string, boolean | JsonPathAggregateTarget> | undefined);
   buildAggregates('_max', 'MAX', args._max as Record<string, boolean | JsonPathAggregateTarget> | undefined);
+  const percentiles = planPercentiles(qi, args._percentile, params, includePii, 'groupBy', claimResultKey);
+  selectExprs.push(...percentiles.map((plan) => plan.expr));
 
   let sql = `SELECT ${selectExprs.join(', ')} FROM ${fromSql} GROUP BY ${groupExprs.join(', ')}`;
 
@@ -402,6 +452,7 @@ export function buildGroupBy<T extends object>(
         if (hasAvgs) restructured._avg = avgObj;
         if (hasMins) restructured._min = minObj;
         if (hasMaxs) restructured._max = maxObj;
+        if (percentiles.length > 0) restructured._percentile = readPercentiles(qi, percentiles, row);
 
         return restructured;
       }),
@@ -489,7 +540,9 @@ export function buildGroupByOrderBy(
   const pushOrderTerm = (expr: string, label: string, value: OrderDirection | OrderBySpec): void => {
     const first = seen.get(expr);
     if (first !== undefined) {
-      warnRedundantSortTerm(qi.table, 'groupBy orderBy', [{ key: label, first, resolved: expr }]);
+      warnRedundantSortTerm(whereMod.adviceLogger(qi), qi.table, 'groupBy orderBy', [
+        { key: label, first, resolved: expr },
+      ]);
       return;
     }
     seen.set(expr, label);
@@ -499,6 +552,9 @@ export function buildGroupByOrderBy(
 
   for (const [key, value] of orderByEntries(orderBy)) {
     if (value === undefined) continue;
+    if (key === '_percentile') {
+      throw new ValidationError(`groupBy orderBy on table "${qi.table}": ${PERCENTILE_NOT_ORDERABLE}`);
+    }
 
     // Aggregate ordering blocks.
     if (aggBlocks.has(key)) {
@@ -611,7 +667,7 @@ export function buildDistinctOnSource<T extends object>(
   whereSql: string,
   params: unknown[],
 ): string {
-  if (qi.dialect.name !== 'postgresql') {
+  if (!qi.dialect.capabilities.distinctOn) {
     throw new UnsupportedFeatureError(
       'DISTINCT ON row source (groupBy distinctOn)',
       qi.dialect.name,
@@ -632,8 +688,9 @@ export function buildDistinctOnSource<T extends object>(
   // twice (see `dedupeColumnList`). The orderBy below needs no equivalent: its
   // keys come from an object, and the DISTINCT ON columns lead the ORDER BY, so
   // a key repeating one of them is already merged by `orderParts`' construction.
-  const dedupedCols = dedupeColumnList(qi.tableMeta, distinctOn.columns);
-  if (dedupedCols) warnRedundantSortTerm(qi.table, 'groupBy distinctOn.columns', dedupedCols.dropped);
+  const dedupedCols = dedupeColumnList(qi.tableMeta, distinctOn.columns, 'distinctOn.columns');
+  if (dedupedCols)
+    warnRedundantSortTerm(whereMod.adviceLogger(qi), qi.table, 'groupBy distinctOn.columns', dedupedCols.dropped);
   const distinctCols = (dedupedCols?.columns ?? distinctOn.columns).map((c) => qi.q(qi.toColumn(c)));
   // DISTINCT ON expressions must lead the ORDER BY; the user's orderBy then
   // decides which row survives per combination.
@@ -719,6 +776,8 @@ export function buildHavingClauses<T extends object>(
   const clauses: string[] = [];
 
   for (const [key, value] of Object.entries(having)) {
+    // Same `undefined` rule as the where walk (`walkWhere`): the args seam
+    // removes it, and a key still holding it here is skipped.
     if (value === undefined) continue;
 
     // Top-level `_count` (no field) → COUNT(*) for the whole group.
@@ -754,10 +813,19 @@ export function buildHavingClauses<T extends object>(
       quotedCol ??= qi.q(qi.toColumn(key));
       return quotedCol;
     };
+    const plainAggregate = (agg: { fn: string }): string =>
+      agg.fn === 'AVG' ? avgCall(qi, qi.toColumn(key)) : `${agg.fn}(${columnExpr()})`;
 
     for (const agg of aggEntries) {
-      const expr = jsonAggExprs?.get(`${key}:${agg.key}`) ?? `${agg.fn}(${columnExpr()})`;
-      clauses.push(...buildHavingNumericClauses(qi, expr, agg.filter, params));
+      const jsonExpr = jsonAggExprs?.get(`${key}:${agg.key}`);
+      const expr = jsonExpr ?? plainAggregate(agg);
+      // `_min` / `_max` return the column's own stored value, so their operands
+      // bind the way a where operand against that column does.
+      const operandType =
+        jsonExpr === undefined && (agg.fn === 'MIN' || agg.fn === 'MAX')
+          ? qi.columnPgTypeMap.get(qi.toColumn(key))
+          : undefined;
+      clauses.push(...buildHavingNumericClauses(qi, expr, agg.filter, params, operandType));
     }
   }
 
@@ -788,13 +856,15 @@ function splitHavingField(
     const fn = ownLookup(HAVING_AGGREGATE_FNS, k);
     if (fn) {
       aggEntries.push({ key: k, fn, filter: v });
+    } else if (k === '_percentile') {
+      throw new ValidationError(`groupBy having on "${qi.table}.${field}": ${PERCENTILE_NOT_ORDERABLE}`);
     } else if (k.startsWith('_')) {
       throw new ValidationError(
         `Unknown aggregate "${k}" in having for field "${field}" on table "${qi.table}". ` +
           `Supported: ${Object.keys(HAVING_AGGREGATE_FNS).join(', ')}.`,
       );
     } else {
-      scalarKeys[k] = v;
+      setOwn(scalarKeys, k, v);
     }
   }
 
@@ -805,9 +875,11 @@ function splitHavingField(
 /**
  * Compile a `having` AND / OR / NOT branch. Each condition is a nested
  * {@link HavingClause}; its own clauses are ANDed (parenthesized when there is
- * more than one) before being combined. `AND` contributes its parts directly
- * (the caller ANDs them), mirroring {@link buildWhereClause}'s combinator
- * shapes so HAVING and WHERE read the same way.
+ * more than one) before being combined. The branch shapes are the WHERE
+ * combinator rule ({@link combinatorBranches}), so HAVING and WHERE accept and
+ * refuse the same values and mean the same thing by them: `AND` contributes its
+ * parts directly (the caller ANDs them), `OR: []` matches no group, a `NOT`
+ * object negates the object as a whole, and a `NOT` array negates each branch.
  */
 function buildHavingCombinator<T extends object>(
   qi: BuilderCtx,
@@ -818,7 +890,9 @@ function buildHavingCombinator<T extends object>(
   groupKeys?: Map<string, HavingGroupKey>,
   depth = 0,
 ): string[] {
-  const conditions = Array.isArray(value) ? value : [value];
+  const branches = combinatorBranches(key, value, qi.table, 'having');
+  if (branches === null) return [];
+  if (branches.length === 0) return key === 'OR' ? ['1 = 0'] : [];
   // Same variable-arity shape as the WHERE combinators: an ARRAY branch writes
   // one parenthesized condition per element into the SQL text, so a
   // caller-sized `having.OR` is a new statement per length.
@@ -830,22 +904,17 @@ function buildHavingCombinator<T extends object>(
   // them through the cache later cannot silently reopen the hole, and so the
   // rule reads the same in both clause compilers. The DEPTH cap above is the
   // half of this that bites here and now.
-  if (Array.isArray(value) && key !== 'NOT') qi.markVariableArity();
+  if (Array.isArray(value)) qi.markVariableArity();
   const parts: string[] = [];
-  for (const condition of conditions) {
-    if (!isUnmatchedPlainObject(condition)) {
-      throw new ValidationError(
-        `Invalid having "${key}" on table "${qi.table}": expected ` +
-          `${key === 'OR' ? 'an array of having objects' : 'a having object (or an array of them)'}.`,
-      );
-    }
-    const sub = buildHavingClauses(qi, condition as HavingClause<T>, params, jsonAggExprs, groupKeys, depth + 1);
+  for (const branch of branches) {
+    const sub = buildHavingClauses(qi, branch as HavingClause<T>, params, jsonAggExprs, groupKeys, depth + 1);
     if (sub.length === 0) continue;
     parts.push(sub.length === 1 ? sub[0]! : `(${sub.join(' AND ')})`);
   }
   if (parts.length === 0) return [];
   if (key === 'AND') return parts;
   if (key === 'OR') return [`(${parts.join(' OR ')})`];
+  if (Array.isArray(value)) return parts.map((part) => `NOT (${part})`);
   return [`NOT (${parts.join(' AND ')})`];
 }
 
@@ -909,6 +978,7 @@ function buildHavingScalarClauses(
           .join(', ')} on ${ref.label} in having for table "${qi.table}".`,
     );
   } else {
+    assertEqualityOperand(value, { column: ref.label, table: qi.table, kind: 'scalar' });
     params.push(value);
     clauses.push(`${ref.expr} = ${qi.p(params.length)}`);
   }
@@ -921,8 +991,24 @@ function buildHavingScalarClauses(
  * shorthand for equality. Operands are not numeric-only: `_min` / `_max`
  * return a stored cell, so `MIN("title") > 'm'` is as valid as
  * `SUM("views") > 10`. Unknown operator keys throw {@link ValidationError}.
+ *
+ * `operandType` is the column type a `_min` / `_max` operand is compared with.
+ * When given, each operand (and each `in` / `notIn` element) is bound through
+ * the where compiler's {@link whereMod.textComparedOperand}, so on MySQL a
+ * number compared with the MIN of a text column is sent as text rather than
+ * compared numerically (`'0zz' = 0` is true there).
  */
-export function buildHavingNumericClauses(qi: BuilderCtx, expr: string, filter: unknown, params: unknown[]): string[] {
+export function buildHavingNumericClauses(
+  qi: BuilderCtx,
+  expr: string,
+  filter: unknown,
+  params: unknown[],
+  operandType?: string,
+): string[] {
+  const bind = (value: unknown): unknown =>
+    operandType === undefined ? value : whereMod.textComparedOperand(qi, operandType, value);
+  const bindList = (value: unknown): unknown =>
+    operandType !== undefined && Array.isArray(value) ? value.map(bind) : value;
   if (filter === null) {
     throw new ValidationError(
       `Invalid having filter on "${expr}" for table "${qi.table}": expected a value or operator object.`,
@@ -931,7 +1017,7 @@ export function buildHavingNumericClauses(qi: BuilderCtx, expr: string, filter: 
 
   // Bare value (number, string, boolean, Date, …) → equality.
   if (typeof filter !== 'object' || filter instanceof Date) {
-    params.push(filter);
+    params.push(bind(filter));
     return [`${expr} = ${qi.p(params.length)}`];
   }
 
@@ -948,35 +1034,35 @@ export function buildHavingNumericClauses(qi: BuilderCtx, expr: string, filter: 
 
   const clauses: string[] = [];
   if (op.equals !== undefined) {
-    params.push(op.equals);
+    params.push(bind(op.equals));
     clauses.push(`${expr} = ${qi.p(params.length)}`);
   }
   if (op.not !== undefined) {
-    params.push(op.not);
+    params.push(bind(op.not));
     clauses.push(`${expr} != ${qi.p(params.length)}`);
   }
   if (op.gt !== undefined) {
-    params.push(op.gt);
+    params.push(bind(op.gt));
     clauses.push(`${expr} > ${qi.p(params.length)}`);
   }
   if (op.gte !== undefined) {
-    params.push(op.gte);
+    params.push(bind(op.gte));
     clauses.push(`${expr} >= ${qi.p(params.length)}`);
   }
   if (op.lt !== undefined) {
-    params.push(op.lt);
+    params.push(bind(op.lt));
     clauses.push(`${expr} < ${qi.p(params.length)}`);
   }
   if (op.lte !== undefined) {
-    params.push(op.lte);
+    params.push(bind(op.lte));
     clauses.push(`${expr} <= ${qi.p(params.length)}`);
   }
   if (op.in !== undefined) {
-    params.push(qi.inParam(op.in));
+    params.push(qi.inParam(bindList(op.in)));
     clauses.push(qi.inClause(expr, qi.p(params.length), false));
   }
   if (op.notIn !== undefined) {
-    params.push(qi.inParam(op.notIn));
+    params.push(qi.inParam(bindList(op.notIn)));
     clauses.push(qi.inClause(expr, qi.p(params.length), true));
   }
   return clauses;
@@ -1060,8 +1146,19 @@ function isExactNumericType(pgType: string): boolean {
 
 /** `AVG(col)`, float-cast unless the source column is exact (see {@link isExactNumericType}). */
 function plainAvgExpr(qi: BuilderCtx, col: string): string {
-  const inner = `AVG(${qi.q(col)})`;
+  const inner = avgCall(qi, col);
   return isExactNumericType(whereMod.getColumnPgType(qi, col)) ? inner : qi.castAgg(inner, 'float');
+}
+
+/**
+ * `AVG(col)` over a plain column, with the input widened where the engine
+ * would otherwise average an integer column as an integer (see
+ * {@link Dialect.averageArgument}). Shared by SELECT and HAVING, so a filter
+ * on `_avg` compares the same value the result reports.
+ */
+function avgCall(qi: BuilderCtx, col: string): string {
+  const ref = qi.q(col);
+  return `AVG(${qi.dialect.averageArgument?.(ref, whereMod.getColumnPgType(qi, col)) ?? ref})`;
 }
 
 /**
@@ -1073,6 +1170,194 @@ function sumAvgValue(qi: BuilderCtx, col: string, value: unknown): number | stri
   if (value === null || value === undefined) return null;
   if (isExactNumericType(whereMod.getColumnPgType(qi, col))) return value as number | string;
   return Number(value);
+}
+
+// ---------------------------------------------------------------------------
+// _percentile (PostgreSQL: percentile_cont / percentile_disc)
+// ---------------------------------------------------------------------------
+
+/** Why an engine refuses `_percentile`, keyed by dialect name. */
+const PERCENTILE_HINT: Readonly<Record<string, string>> = {
+  mysql: 'Percentile aggregates need PostgreSQL; MySQL has no percentile_cont/percentile_disc.',
+  sqlite:
+    'Percentile aggregates need PostgreSQL; SQLite has percentile functions only in builds compiled with ' +
+    'SQLITE_ENABLE_PERCENTILE, which node:sqlite cannot be assumed to have.',
+  mssql:
+    'Percentile aggregates are not available on SQL Server in this release: PERCENTILE_CONT is a window ' +
+    'function there, not an aggregate.',
+};
+
+const PERCENTILE_SPEC_KEYS = ['p', 'method'];
+const PERCENTILE_METHODS = ['cont', 'disc'];
+const PERCENTILE_NOT_ORDERABLE = 'ordering or filtering groups by _percentile is not supported yet.';
+
+/** One compiled `_percentile` entry: its SELECT expression and how to read it back. */
+interface PercentilePlan {
+  readonly expr: string;
+  readonly alias: string;
+  /** The canonical field name the result is keyed by (as `_min` / `_max` are). */
+  readonly field: string;
+  readonly col: string;
+}
+
+/**
+ * Compile `_percentile` into SELECT expressions, binding each fraction (or
+ * fraction array) as a `float8` / `float8[]` parameter so the SQL text does not
+ * depend on the values or on how many there are.
+ *
+ * Refusals, all before any SQL runs: E017 on a dialect without
+ * `supportsPercentileAggregates`; E003 for a spec that is not `{ p, method? }`,
+ * a fraction outside [0, 1] or not a finite number, an empty array, an unknown
+ * method, `cont` on a date/time column (`percentile_cont` has no temporal
+ * form), a JSON-path target, and two keys naming one column. Both methods need
+ * `includePii: UNSAFE` on a PII column: `disc` returns a stored cell, and so
+ * does `cont` at p = 0 or 1 or over a one-row group.
+ */
+function planPercentiles(
+  qi: BuilderCtx,
+  spec: unknown,
+  params: unknown[],
+  includePii: boolean,
+  operation: 'aggregate' | 'groupBy',
+  claimResultKey?: (key: string, what: string) => void,
+): PercentilePlan[] {
+  if (spec === undefined) return [];
+  const where = `${operation} _percentile on table "${qi.table}"`;
+  if (typeof spec !== 'object' || spec === null || Array.isArray(spec)) {
+    throw new ValidationError(
+      `${where} must be an object of field -> { p, method? }, e.g. { latencyMs: { p: 0.95 } }.`,
+    );
+  }
+  const entries = Object.entries(spec as Record<string, unknown>).filter(([, v]) => v !== undefined && v !== null);
+  if (entries.length === 0) return [];
+  if (qi.dialect.supportsPercentileAggregates !== true) {
+    throw new UnsupportedFeatureError(
+      '_percentile',
+      qi.dialect.name,
+      PERCENTILE_HINT[qi.dialect.name] ?? 'Percentile aggregates need PostgreSQL.',
+    );
+  }
+  const meta = qi.schema.tables[qi.table];
+  const plans: PercentilePlan[] = [];
+  const aliases = new Set<string>();
+  for (const [key, entry] of entries) {
+    const label = `${where}, field "${key}"`;
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      throw new ValidationError(`${label}: expected { p, method? }, received ${describeValue(entry)}.`);
+    }
+    if ('path' in entry) {
+      throw new ValidationError(`${label}: a JSON-path target is not supported for _percentile yet.`);
+    }
+    for (const k of Object.keys(entry)) {
+      if (!PERCENTILE_SPEC_KEYS.includes(k)) {
+        const hint = suggestKey(k, PERCENTILE_SPEC_KEYS);
+        throw new ValidationError(
+          `${label}: unknown key "${k}".${hint ? ` Did you mean "${hint}"?` : ''} Expected { p, method? }.`,
+        );
+      }
+    }
+    const { p, method = 'cont' } = entry as PercentileSpec;
+    if (!PERCENTILE_METHODS.includes(method as string)) {
+      throw new ValidationError(`${label}: method must be 'cont' or 'disc', received ${describeValue(method)}.`);
+    }
+    if (Array.isArray(p)) {
+      if (p.length === 0) throw new ValidationError(`${label}: p is an empty array. Give at least one fraction.`);
+      for (const fraction of p) assertFraction(fraction, label);
+    } else {
+      assertFraction(p, label);
+    }
+    const col = qi.toColumn(key);
+    if (method === 'cont' && qi.tableMeta.dateColumns.has(col)) {
+      throw new ValidationError(
+        `${label}: method 'cont' interpolates and needs a numeric or interval column, and "${col}" is a ` +
+          "date/time column. Use method: 'disc' for an actual stored value.",
+      );
+    }
+    assertAggregatePiiOptIn(qi.table, meta, key, col, `${operation} _percentile`, includePii);
+    const alias = `_percentile_${col}`;
+    if (aliases.has(alias)) {
+      throw new ValidationError(`${label}: column "${col}" is already named by another _percentile key.`);
+    }
+    aliases.add(alias);
+    claimResultKey?.(alias, `_percentile of column "${col}"`);
+    params.push(Array.isArray(p) ? [...p] : p);
+    const fractions = `${qi.p(params.length)}::float8${Array.isArray(p) ? '[]' : ''}`;
+    let expr = `percentile_${method}(${fractions}) WITHIN GROUP (ORDER BY ${qi.q(col)})`;
+    // numeric[] has a driver parser that returns JS numbers, which rounds an
+    // exact value the scalar form returns as text. Read the array as text too.
+    if (Array.isArray(p) && method === 'disc' && isDecimalType(whereMod.getColumnPgType(qi, col))) {
+      expr = `(${expr})::text[]`;
+    }
+    plans.push({
+      expr: `${expr} AS ${qi.q(alias)}`,
+      alias,
+      field: qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col),
+      col,
+    });
+  }
+  return plans;
+}
+
+function assertFraction(value: unknown, label: string): void {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1) return;
+  throw new ValidationError(
+    `${label}: p must be a fraction from 0 to 1 (0.95 for the 95th percentile), or an array of them, ` +
+      `received ${describeValue(value)}.`,
+  );
+}
+
+function describeValue(value: unknown): string {
+  if (typeof value === 'string') return `'${value}'`;
+  if (Array.isArray(value)) return 'an array';
+  if (value !== null && typeof value === 'object') return 'an object';
+  return String(value);
+}
+
+function isDecimalType(pgType: string): boolean {
+  const paren = pgType.indexOf('(');
+  const base = (paren === -1 ? pgType : pgType.slice(0, paren)).trim().toLowerCase();
+  return base === 'numeric' || base === 'decimal';
+}
+
+/** The `_percentile` block of one result row, keyed by canonical field. */
+function readPercentiles(
+  qi: BuilderCtx,
+  plans: readonly PercentilePlan[],
+  row: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const plan of plans) {
+    const value = row[plan.alias];
+    setOwn(
+      out,
+      plan.field,
+      Array.isArray(value)
+        ? value.map((element) => percentileElement(qi, plan.col, element))
+        : percentileElement(qi, plan.col, value),
+    );
+  }
+  return out;
+}
+
+/**
+ * One percentile value, read the way the column itself reads: a date/time
+ * value through {@link temporalAggValue} (element by element in the array
+ * form, where the driver may hand back text or a bare infinity), and an int8
+ * that the array form delivers as text through the same exact-number rule the
+ * scalar int8 parser applies. `null` over zero rows.
+ */
+function percentileElement(qi: BuilderCtx, col: string, value: unknown): unknown {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string' && isInt8Type(whereMod.getColumnPgType(qi, col))) {
+    const n = Number(value);
+    return Number.isSafeInteger(n) ? n : value;
+  }
+  return temporalAggValue(qi, col, value);
+}
+
+function isInt8Type(pgType: string): boolean {
+  const base = pgType.trim().toLowerCase();
+  return base === 'int8' || base === 'bigint';
 }
 
 export function buildAggregate<T extends object>(
@@ -1167,6 +1452,9 @@ export function buildAggregate<T extends object>(
     }
   }
 
+  const percentiles = planPercentiles(qi, args._percentile, params, includePii, 'aggregate');
+  selectExprs.push(...percentiles.map((plan) => plan.expr));
+
   if (selectExprs.length === 0) {
     selectExprs.push(`${qi.castAgg('COUNT(*)', 'int')} AS _count`);
   }
@@ -1241,6 +1529,9 @@ export function buildAggregate<T extends object>(
       if (hasAvgs) aggResult._avg = avgObj as Partial<Record<keyof T & string, number | string | null>>;
       if (hasMins) aggResult._min = minObj as Partial<Record<keyof T & string, unknown>>;
       if (hasMaxs) aggResult._max = maxObj as Partial<Record<keyof T & string, unknown>>;
+      if (percentiles.length > 0) {
+        aggResult._percentile = readPercentiles(qi, percentiles, row) as Partial<Record<keyof T & string, unknown>>;
+      }
 
       return aggResult;
     },

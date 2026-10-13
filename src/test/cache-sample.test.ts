@@ -6,12 +6,15 @@
  * untouched. The `TURBINE_CACHE_CHECK_SAMPLE` env knob (a float in `(0,1]`)
  * re-enables it for that FRACTION of cache hits under real load: a sampled hit
  * rebuilds the SQL + params fresh and, on a mismatch, logs `console.error` once
- * per distinct fingerprint AND throws the same `ValidationError` (E003).
+ * per distinct fingerprint AND throws the same `InvariantError` (E020).
+ *
+ * The variables are read once, when a query interface is constructed (see
+ * diagnostics.ts), so each test builds its interface inside the override.
  *
  * These tests force `NODE_ENV=production`, stub `Math.random` for a
  * deterministic sampling decision, and capture `console.error`, then prove:
  *   (a) no sampling configured => no check (production hot path unchanged),
- *   (b) sample=1 + a corrupted entry => throw E003 + a single logged error,
+ *   (b) sample=1 + a corrupted entry => throw E020 + a single logged error,
  *   (c) the per-hit sampling gate honors the stubbed random vs the rate,
  *   (d) the mismatch log fires once per DISTINCT fingerprint,
  *   (e) invalid / non-positive sample values keep the check fully off,
@@ -20,9 +23,9 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { ValidationError } from '../errors.js';
-import { resetCacheCrossCheckEnv } from '../query/builder.js';
+import { InvariantError } from '../errors.js';
 import type { QueryInterface } from '../query/index.js';
+import { resetWarnOnce } from '../query/warn-registry.js';
 import type { SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
 
@@ -64,12 +67,6 @@ function withEnv(overrides: Record<string, string | undefined>, fn: () => void):
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
-  // The cross-check resolves these variables ONCE and memoizes the answer
-  // (`process.env` reads are a C++ interceptor call, and this ran twice on
-  // every cache hit). Flipping them mid-process is a thing only these suites
-  // do, so they are also the ones that have to re-arm the read, on the way in
-  // and again on the way out.
-  resetCacheCrossCheckEnv();
   try {
     fn();
   } finally {
@@ -77,7 +74,6 @@ function withEnv(overrides: Record<string, string | undefined>, fn: () => void):
       if (saved[key] === undefined) delete process.env[key];
       else process.env[key] = saved[key];
     }
-    resetCacheCrossCheckEnv();
   }
 }
 
@@ -86,6 +82,9 @@ function withEnv(overrides: Record<string, string | undefined>, fn: () => void):
  * captured, restoring both afterward. Returns the captured error messages.
  */
 function withStubs(randomValue: number, fn: () => void): string[] {
+  // The mismatch log dedupes through the process-wide warn-once registry, so
+  // each capture starts from an empty one.
+  resetWarnOnce();
   const realRandom = Math.random;
   const realError = console.error;
   const logs: string[] = [];
@@ -114,10 +113,10 @@ function warmAndCorrupt(
 
 describe('sampled cross-check: production off by default', () => {
   it('no TURBINE_CACHE_CHECK_SAMPLE => a corrupted entry is served, no throw, no log', () => {
-    const q = makeQuery('users', buildSchema());
-    warmAndCorrupt(q, { age: 1 }, 'no-sample');
-
     withEnv({ NODE_ENV: 'production', TURBINE_CACHE_CHECK_SAMPLE: undefined }, () => {
+      const q = makeQuery('users', buildSchema());
+      warmAndCorrupt(q, { age: 1 }, 'no-sample');
+
       const logs = withStubs(0, () => {
         const result = q.buildFindMany({ where: { age: 2 } } as never);
         assert.equal(result.sql, 'SELECT 1 -- no-sample');
@@ -128,17 +127,17 @@ describe('sampled cross-check: production off by default', () => {
 });
 
 describe('sampled cross-check: sample=1 verifies every hit', () => {
-  it('a corrupted entry throws E003 and logs the violation once', () => {
-    const q = makeQuery('users', buildSchema());
-    warmAndCorrupt(q, { age: 1 }, 'sample-1-corrupt');
-
+  it('a corrupted entry throws E020 and logs the violation once', () => {
     withEnv({ NODE_ENV: 'production', TURBINE_CACHE_CHECK_SAMPLE: '1' }, () => {
+      const q = makeQuery('users', buildSchema());
+      warmAndCorrupt(q, { age: 1 }, 'sample-1-corrupt');
+
       const logs = withStubs(0, () => {
         assert.throws(
           () => q.buildFindMany({ where: { age: 2 } } as never),
           (err: unknown) =>
-            err instanceof ValidationError &&
-            err.code === 'TURBINE_E003' &&
+            err instanceof InvariantError &&
+            err.code === 'TURBINE_E020' &&
             /SQL cache lockstep violation on findMany/.test(err.message) &&
             /cached SQL and freshly-built SQL diverge/.test(err.message),
         );
@@ -149,24 +148,24 @@ describe('sampled cross-check: sample=1 verifies every hit', () => {
   });
 
   it('a param-collect drift throws under sampling too', () => {
-    const q = makeQuery('users', buildSchema());
-    q.buildFindMany({ where: { age: 1, score: 2 } } as never);
-    const original = (
-      q as unknown as { collectWhereParams: (w: unknown, p: unknown[]) => void }
-    ).collectWhereParams.bind(q);
-    (q as unknown as { collectWhereParams: (w: unknown, p: unknown[]) => void }).collectWhereParams = (w, p) => {
-      const scratch: unknown[] = [];
-      original(w, scratch);
-      scratch.reverse();
-      for (const v of scratch) p.push(v);
-    };
-
     withEnv({ NODE_ENV: 'production', TURBINE_CACHE_CHECK_SAMPLE: '1' }, () => {
+      const q = makeQuery('users', buildSchema());
+      q.buildFindMany({ where: { age: 1, score: 2 } } as never);
+      const original = (
+        q as unknown as { collectWhereParams: (w: unknown, p: unknown[]) => void }
+      ).collectWhereParams.bind(q);
+      (q as unknown as { collectWhereParams: (w: unknown, p: unknown[]) => void }).collectWhereParams = (w, p) => {
+        const scratch: unknown[] = [];
+        original(w, scratch);
+        scratch.reverse();
+        for (const v of scratch) p.push(v);
+      };
+
       withStubs(0, () => {
         assert.throws(
           () => q.buildFindMany({ where: { age: 10, score: 20 } } as never),
           (err: unknown) =>
-            err instanceof ValidationError && err.code === 'TURBINE_E003' && /params .* diverge/.test(err.message),
+            err instanceof InvariantError && err.code === 'TURBINE_E020' && /params .* diverge/.test(err.message),
         );
       });
     });
@@ -175,10 +174,10 @@ describe('sampled cross-check: sample=1 verifies every hit', () => {
 
 describe('sampled cross-check: the per-hit sampling gate', () => {
   it('Math.random >= rate skips the check (corrupted entry served)', () => {
-    const q = makeQuery('users', buildSchema());
-    warmAndCorrupt(q, { score: 1 }, 'above-rate');
-
     withEnv({ NODE_ENV: 'production', TURBINE_CACHE_CHECK_SAMPLE: '0.5' }, () => {
+      const q = makeQuery('users', buildSchema());
+      warmAndCorrupt(q, { score: 1 }, 'above-rate');
+
       const logs = withStubs(0.9, () => {
         const result = q.buildFindMany({ where: { score: 2 } } as never);
         assert.equal(result.sql, 'SELECT 1 -- above-rate');
@@ -188,14 +187,14 @@ describe('sampled cross-check: the per-hit sampling gate', () => {
   });
 
   it('Math.random < rate runs the check (throws)', () => {
-    const q = makeQuery('users', buildSchema());
-    warmAndCorrupt(q, { score: 1 }, 'below-rate');
-
     withEnv({ NODE_ENV: 'production', TURBINE_CACHE_CHECK_SAMPLE: '0.5' }, () => {
+      const q = makeQuery('users', buildSchema());
+      warmAndCorrupt(q, { score: 1 }, 'below-rate');
+
       withStubs(0.4, () => {
         assert.throws(
           () => q.buildFindMany({ where: { score: 2 } } as never),
-          (err: unknown) => err instanceof ValidationError && err.code === 'TURBINE_E003',
+          (err: unknown) => err instanceof InvariantError && err.code === 'TURBINE_E020',
         );
       });
     });
@@ -204,9 +203,9 @@ describe('sampled cross-check: the per-hit sampling gate', () => {
 
 describe('sampled cross-check: log once per distinct fingerprint', () => {
   it('the same shape logs once; a different shape logs again', () => {
-    const q = makeQuery('users', buildSchema());
-
     withEnv({ NODE_ENV: 'production', TURBINE_CACHE_CHECK_SAMPLE: '1' }, () => {
+      const q = makeQuery('users', buildSchema());
+
       // First distinct fingerprint: tenantId. Warm, corrupt, then hit twice.
       warmAndCorrupt(q, { tenantId: 1 }, 'dedup-a');
       const logs = withStubs(0, () => {
@@ -219,15 +218,32 @@ describe('sampled cross-check: log once per distinct fingerprint', () => {
       assert.equal(logs.length, 2, 'one log per distinct fingerprint, not per hit');
     });
   });
+
+  it('the same shape on another table logs again', () => {
+    withEnv({ NODE_ENV: 'production', TURBINE_CACHE_CHECK_SAMPLE: '1' }, () => {
+      const schema = buildSchema();
+      schema.tables.accounts = { ...schema.tables.users!, name: 'accounts' };
+      const users = makeQuery('users', schema);
+      const accounts = makeQuery('accounts', schema);
+      warmAndCorrupt(users, { tenantId: 1 }, 'table-a');
+      warmAndCorrupt(accounts, { tenantId: 1 }, 'table-b');
+      const logs = withStubs(0, () => {
+        assert.throws(() => users.buildFindMany({ where: { tenantId: 2 } } as never));
+        assert.throws(() => accounts.buildFindMany({ where: { tenantId: 2 } } as never));
+      });
+      assert.equal(logs.length, 2, 'the fingerprint carries no table, so the dedupe key must');
+      assert.match(logs[0] ?? '', /FROM "users"/);
+      assert.match(logs[1] ?? '', /FROM "accounts"/);
+    });
+  });
 });
 
 describe('sampled cross-check: invalid / non-positive sample keeps it off', () => {
   for (const value of ['0', '-1', 'abc', '']) {
     it(`sample=${JSON.stringify(value)} => no check`, () => {
-      const q = makeQuery('users', buildSchema());
-      warmAndCorrupt(q, { age: 1 }, `off-${value || 'empty'}`);
-
       withEnv({ NODE_ENV: 'production', TURBINE_CACHE_CHECK_SAMPLE: value }, () => {
+        const q = makeQuery('users', buildSchema());
+        warmAndCorrupt(q, { age: 1 }, `off-${value || 'empty'}`);
         const logs = withStubs(0, () => {
           const result = q.buildFindMany({ where: { age: 2 } } as never);
           assert.match(result.sql, /off-/);
@@ -240,16 +256,16 @@ describe('sampled cross-check: invalid / non-positive sample keeps it off', () =
 
 describe('sampled cross-check: dev mode is unchanged', () => {
   it('dev throws on a corrupted entry but does NOT use the sampled log path', () => {
-    const q = makeQuery('users', buildSchema());
-    warmAndCorrupt(q, { age: 1 }, 'dev-mode');
-
-    // No NODE_ENV override => dev default; the check is always-on and throws,
-    // but the console.error-once logging is reserved for the sampled path.
     withEnv({ TURBINE_CACHE_CHECK_SAMPLE: '1' }, () => {
+      const q = makeQuery('users', buildSchema());
+      warmAndCorrupt(q, { age: 1 }, 'dev-mode');
+      // No NODE_ENV override => dev default; the check is always-on and throws,
+      // but the console.error-once logging is reserved for the sampled path.
+
       const logs = withStubs(0, () => {
         assert.throws(
           () => q.buildFindMany({ where: { age: 2 } } as never),
-          (err: unknown) => err instanceof ValidationError && err.code === 'TURBINE_E003',
+          (err: unknown) => err instanceof InvariantError && err.code === 'TURBINE_E020',
         );
       });
       assert.deepEqual(logs, [], 'dev mode does not log via the sampled path');

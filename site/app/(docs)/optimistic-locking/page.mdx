@@ -56,6 +56,31 @@ RETURNING *
 
 If another writer bumped `version` after you read it, the `version = $3` predicate fails, no row is updated, and Turbine raises `OptimisticLockError` instead of silently doing nothing.
 
+### `update` only
+
+`optimisticLock` is an `update` option. Passing it to `updateMany` or `upsert` throws `ValidationError` ([`TURBINE_E003`](/errors#e003)). Before 0.90 both ignored it, so a stale write went through with no error, the one outcome the option exists to prevent. The message names the equivalent:
+
+```ts
+// updateMany: put the expected version in `where` and bump it in `data`.
+const { count } = await db.posts.updateMany({
+  where: { authorId: 7, version: expected },
+  data: { published: true, version: { increment: 1 } },
+});
+// `count` is the number of rows that were still at that version.
+
+// upsert: read the row first, then update or create, inside one transaction.
+await db.$transaction(async (tx) => {
+  const row = await tx.posts.findUnique({ where: { id } });
+  if (row) {
+    await tx.posts.update({ where: { id }, data, optimisticLock: { field: 'version', expected } });
+  } else {
+    await tx.posts.create({ data: { id, ...data } });
+  }
+});
+```
+
+The `upsert` refusal holds whatever the call carries. An `upsert` whose `create` or `update` includes nested relation data takes another code path, and before 0.90 that path skipped the check. It now throws the same `TURBINE_E003` before anything is read or written.
+
 ## Handling a conflict
 
 `OptimisticLockError` is `TURBINE_E015`. It carries the `table`, the `versionField`, and the `expectedVersion` you supplied. Under the default `errorMessages: 'safe'` the message names the version field but not the value you sent (a version can be a timestamp or any stored cell, so it is treated like one); the value stays on `.expectedVersion` and `.detail` in both modes.

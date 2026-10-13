@@ -175,3 +175,66 @@ jobs:
           SEED=$(date -u +%Y%m%d)
           echo "Reproduce locally with: TURBINE_FUZZ_SEED=$SEED TURBINE_FUZZ_CASES=20000 npx tsx --test src/test/strategy-fuzz.test.ts"
           TURBINE_FUZZ_SEED="$SEED" TURBINE_FUZZ_CASES=20000 npx tsx --test src/test/strategy-fuzz.test.ts
+
+  # The differential oracle tests at their nightly sizes. Every PR already runs
+  # them at the fast sizes and the fixed default seed: they are
+  # src/test/oracle-*.test.ts, which `npm test` picks up in gates.yml's
+  # integration-tests (Postgres 14 to 17) and coverage jobs. This run widens
+  # the random search (TURBINE_ORACLE_FULL=1) and moves the seed every day, so
+  # it explores inputs the per-PR run never reaches. The seed is printed with
+  # the command that replays it.
+  #
+  # The cross-engine battery (oracle-engines-*) is not here: its scenarios are
+  # fixed rather than random, so neither variable changes it, and it runs on
+  # every PR in each engine's own job.
+  oracle-extended:
+    timeout-minutes: 45
+    name: oracle-extended (postgres ${{ matrix.postgres-version }})
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres-version: [14, 17]
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres-version }}
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: turbine_oracle
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Oracle tests, full sizes, date-derived seed
+        env:
+          DATABASE_URL: postgres://test:test@localhost:5432/turbine_oracle
+          TURBINE_ORACLE_FULL: '1'
+          # A skipped oracle file is a failure here, not a pass.
+          TURBINE_REQUIRE_ENGINE: postgres
+        run: |
+          SEED=$(date -u +%Y%m%d)
+          FILES=()
+          for f in src/test/oracle-*.test.ts; do
+            case "$f" in src/test/oracle-engines-*) continue ;; esac
+            FILES+=("$f")
+          done
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "::error::No oracle test files found; this job would pass while running nothing."
+            exit 1
+          fi
+          echo "Seed $SEED. Reproduce one file locally with:"
+          echo "  TURBINE_ORACLE_SEED=$SEED TURBINE_ORACLE_FULL=1 DATABASE_URL=... npx tsx --test src/test/<file>"
+          printf 'Running %s\n' "${FILES[@]}"
+          TURBINE_ORACLE_SEED="$SEED" npx tsx --test --test-concurrency=1 "${FILES[@]}"

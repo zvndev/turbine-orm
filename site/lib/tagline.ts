@@ -11,6 +11,7 @@ import { LATEST_TAGLINE, LATEST_VERSION } from './changelog.generated';
  */
 const TAGLINE_OVERRIDES: Record<string, string> = {
   '0.49.0': 'Correctness release: nested-write scoping, PII contract, guard hardening',
+  '0.90.0': 'Correctness release: wrong-result queries now throw, pluggable logger, five-engine fixes',
 };
 
 /** The tagline shown in the landing hero badge. */

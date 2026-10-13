@@ -42,7 +42,7 @@ Under `relationLoadStrategy: 'join'` the whole graph resolves in one SQL stateme
 
 ### Silencing the unlimited-query warning
 
-When `warnOnUnlimited` is enabled, a `findMany` with no `limit` / `take` / `cursor` logs a warning once per table (a `where` that pins the primary key or a unique column set is exempt, since that query is bounded by the constraint, and so is a client with a `defaultLimit`). This warning is **not** gated on `NODE_ENV`: it fires in production too, because an unbounded read is a production cost. Silence it for a query you know is bounded:
+When `warnOnUnlimited` is enabled, a `findMany` with no `limit` / `take` / `cursor` logs a warning once per table (a `where` that pins the primary key or a unique column set is exempt, since that query is bounded by the constraint, and so is a client with a `defaultLimit`). This warning does **not** depend on `NODE_ENV` or [`diagnostics`](/observability#diagnostics-diagnostics): it fires in production too, because an unbounded read is a production cost. It goes through the client's `logger` with code `unlimited-find-many`. Silence it for a query you know is bounded:
 
 ```ts
 // This one is fine, a tiny lookup table
@@ -53,7 +53,7 @@ You can also set it per table on the client: `warnOnUnlimited: { userProfiles: f
 
 ### Deterministic pages: the unordered-pagination warning
 
-An unordered `LIMIT` is not stable: Postgres is free to return different rows for the same `LIMIT` once the heap changes underneath it, so paging with no `orderBy` can hand you the same row twice or skip one entirely. A `findMany` that paginates (`limit` / `take` / `offset`) with no `orderBy` therefore logs a one-time dev warning naming the table, the pagination shape, and the exact `orderBy` to add:
+An unordered `LIMIT` is not stable: Postgres is free to return different rows for the same `LIMIT` once the heap changes underneath it, so paging with no `orderBy` can hand you the same row twice or skip one entirely. A `findMany` that paginates (`limit` / `take` / `offset`) with no `orderBy` therefore logs a one-time warning (code `unordered-page`) naming the table, the pagination shape, and the exact `orderBy` to add:
 
 ```ts
 // warns: the page is not deterministic
@@ -63,9 +63,9 @@ const page = await db.users.findMany({ limit: 20, offset: 40 });
 const page = await db.users.findMany({ orderBy: { id: 'asc' }, limit: 20, offset: 40 });
 ```
 
-`distinct` queries are exempt (`DISTINCT ON` imposes its own ordering). A `cursor` with no `orderBy` is **not** exempt, and is the worse case: the seek compares against rows the engine may return in any order, so the page skips and repeats rows, and the warning's suggested `orderBy` names the cursor field rather than the primary key. The warning is gated exactly like `warnOnUnlimited` (per-call, per-table, global) and deduped per table and shape, but unlike `warnOnUnlimited` it is silent under `NODE_ENV=production`.
+`distinct` queries are exempt (`DISTINCT ON` imposes its own ordering), and so is a `cursor` page: since 0.90 a cursor page is always ordered (see [cursor](#pagination-limit--take-offset--skip-cursor)), so it never warns. The warning is gated exactly like `warnOnUnlimited` (per-call, per-table, global) and deduped per table and shape, but unlike `warnOnUnlimited` it is advice: silent while the client's [`diagnostics`](/observability#diagnostics-diagnostics) advice is off, which is the default under `NODE_ENV=production`.
 
-To fix it globally instead of per query, set **`implicitPkOrdering: true`** on the client. Turbine then adds `ORDER BY <primary key> ASC` (every column of a composite key, in declaration order) to any paginating `findMany` that declares no `orderBy`, and the warning stops firing. An explicit `orderBy` always wins, and a table with no primary key is left alone. A single-field `cursor` is ordered by its own field rather than by the primary key, the only ordering coherent with the seek; a multi-field cursor with no `orderBy` gets nothing injected, because its key precedence has to come from `orderBy`, and the warning stays.
+To fix it globally instead of per query, set **`implicitPkOrdering: true`** on the client. Turbine then adds `ORDER BY <primary key> ASC` (every column of a composite key, in declaration order) to any paginating `findMany` that declares no `orderBy`, and the warning stops firing. An explicit `orderBy` always wins, and a table with no primary key is left alone. The flag does not change a `cursor` page, which is ordered by its own rule either way.
 
 ```ts
 const db = turbine({ connectionString: process.env.DATABASE_URL, implicitPkOrdering: true });
@@ -100,7 +100,9 @@ pointing at `with`.
 
 ### PII fields: `includePii`
 
-Columns tagged `pii: true` in [`defineSchema`](/schema#pii-fields) are excluded from every default projection: top-level rows, relation subqueries, batched loads, and a write's returned row. They come back in two ways: name the column explicitly in `select` (the explicit request is the opt-in), or pass `includePii: UNSAFE` to return every PII column at the top level **and** at every nested `with` level of that query.
+Columns tagged `pii: true` in [`defineSchema`](/schema#pii-fields) are excluded from every default projection: top-level rows, relation subqueries, batched loads, and a write's returned row. A read returns them only with `includePii: UNSAFE`, which returns every PII column at the top level **and** at every nested `with` level of that query. With it set, `select` can also narrow the result to a PII column.
+
+Naming a PII column in `select` is **not** an opt-in on its own: without `includePii: UNSAFE` it throws a `ValidationError` (`TURBINE_E003`), at the top level and at every `with` depth. `select` often arrives in request data, and a request must not be able to read PII by naming a column. Before 0.90 the `select` was the opt-in; see [Upgrading to 0.90](/upgrading-to-0-90#a-pii-column-in-select-needs-includepii-unsafe).
 
 One column is exempt: a PII-tagged column that is **part of the primary key** is returned anyway, on reads and writes alike. With part of its key missing, feeding a row back into an `update` builds a partial predicate that matches more rows than you meant. Tag sensitive data, not keys.
 
@@ -111,8 +113,11 @@ import { UNSAFE } from 'turbine-orm';
 const u = await db.users.findFirst({ where: { id: 1 } });
 u.email; // undefined
 
-// Explicit select returns exactly it
-const withEmail = await db.users.findFirst({ where: { id: 1 }, select: { email: true } });
+// select alone is refused: ValidationError [TURBINE_E003] ... "email", which is tagged PII
+await db.users.findFirst({ where: { id: 1 }, select: { email: true } });
+
+// With the opt-in, select narrows to exactly it
+const withEmail = await db.users.findFirst({ where: { id: 1 }, select: { email: true }, includePii: UNSAFE });
 
 // includePii returns every PII column, including inside `with`
 const full = await db.users.findMany({
@@ -155,7 +160,7 @@ await db.users.aggregate({ _count: true, where: { email: { endsWith: '@acme.com'
 
 `includePii` is a field on both `GroupByArgs` and `AggregateArgs`. With it set, the emitted SQL is byte-identical to an untagged schema's; the policy applies on **PowDB** as well as the SQL engines, and schemas with no `pii` tags are unaffected everywhere.
 
-Writes enforce the same boundary at the SQL level: a write against a table with PII columns (`create`, `createMany`, `update`, `delete`, `upsert`, nested writes) returns an explicit non-PII projection instead of `RETURNING *` (`RETURNING "id", "name", ...` on Postgres and SQLite, a projected re-select on MySQL, per-column `OUTPUT` on SQL Server, a client-side strip on PowDB, whose `returning` takes no column list). PII values write and persist normally; they are just not returned. A PII-tagged primary key stays in the projection, and tables with no PII columns keep `RETURNING *` byte-for-byte.
+Writes enforce the same boundary at the SQL level: a write against a table with PII columns (`create`, `createMany`, `update`, `delete`, `upsert`, nested writes) returns an explicit non-PII projection instead of `RETURNING *` (`RETURNING "id", "name", ...` on Postgres and SQLite, a projected re-select on MySQL, per-column `OUTPUT` on SQL Server, a client-side strip on PowDB, whose `returning` takes no column list). PII values write and persist normally; they are just not returned. A PII-tagged primary key stays in the projection, and tables with no PII columns keep `RETURNING *` byte-for-byte. A write never returns a PII column: a write `select` that names one throws `TURBINE_E003` (writes take no `includePii`), so read the row back with `includePii: UNSAFE`.
 
 ### Pagination, `limit` / `take`, `offset` / `skip`, `cursor`
 
@@ -173,7 +178,7 @@ const page2 = await db.posts.findMany({
 });
 ```
 
-For deep pagination, `cursor` is the keyset alternative: pass the column values of the last row you saw, and Turbine compiles a seek over the cursor fields (`>` for ascending order, `<` for descending, direction taken from `orderBy`). The cursor row itself is **excluded**, so the next page starts immediately after it:
+For deep pagination, `cursor` is the keyset alternative: it names where the last page ended, and Turbine seeks past that point (`>` for ascending order, `<` for descending). The cursor row itself is **excluded**, so the next page starts immediately after it, and unlike `OFFSET 100000` a keyset page never scans the skipped rows:
 
 ```ts
 const firstPage = await db.posts.findMany({
@@ -188,7 +193,43 @@ const nextPage = await db.posts.findMany({
 });
 ```
 
-A multi-field cursor is a **keyset seek**, not a conjunction: for `orderBy: [{ viewCount: 'asc' }, { id: 'asc' }]` and `cursor: { viewCount, id }` the predicate is `(view_count > $1 OR (view_count = $1 AND id > $2))`, with `<` for a `desc` field, so rows that tie on the leading key are not skipped. Field precedence comes from `orderBy`; a cursor field the `orderBy` does not name trails the named ones and seeks ascending, and each value is bound once however many branches reference it. End the `orderBy` with a unique column (or a unique combination) so the ordering is total; unlike `OFFSET 100000`, a keyset page never scans the skipped rows. Before 0.78 a multi-field cursor joined its comparisons with `AND`, which dropped every row whose leading key equalled the cursor's; if you paged over a low-cardinality leading key, the pages now contain the rows they used to miss.
+**The page order.** A cursor page is always ordered. Its order is your `orderBy` plus the primary key as a tiebreaker, in the direction of the last `orderBy` term, unless the `orderBy` already contains a unique key. With no `orderBy` at all, the page is ordered by the primary key. A table with neither a primary key nor a unique key on NOT NULL columns cannot take a cursor (`TURBINE_E003`).
+
+**Placing the page.** The cursor places the page in one of two ways:
+
+- **By value.** It carries a value for every column of the page order. Pass the last row's values for each ordered field plus the key: `cursor: { createdAt: last.createdAt, id: last.id }`. Extra fields are ignored, so passing the whole last row works.
+- **By row.** It names one row by a unique key, the same rule as [`findUnique`](#findunique--finduniqueorthrow): `cursor: { id: last.id }` under `orderBy: { createdAt: 'desc' }`. Turbine reads that row's ordered values in the same statement. If the row has been deleted, the page is empty.
+
+A cursor that does neither throws a `ValidationError` (`TURBINE_E003`) naming the missing fields and the unique keys that would work. So does a cursor beside a relation, JSON-path or vector `orderBy`; page those with `offset`.
+
+```ts
+// TURBINE_E003: the page order is (createdAt desc, id desc) and the cursor has no "id"
+await db.posts.findMany({ orderBy: { createdAt: 'desc' }, cursor: { createdAt: last.createdAt }, take: 20 });
+```
+
+A multi-column order is a **keyset seek**, not a conjunction: for `orderBy: [{ viewCount: 'asc' }, { id: 'asc' }]` the predicate is `(view_count > $1 OR (view_count = $1 AND id > $2))`, with `<` for a `desc` field, so rows that tie on the leading key are not skipped. Each value is bound once however many branches reference it.
+
+**NULL sort keys.** Rows whose sort key is `NULL` are visited exactly once, following each engine's NULL placement: PostgreSQL puts NULLs last ascending and first descending (an explicit `nulls` overrides it), SQLite, MySQL and SQL Server treat NULL as the smallest value. On PostgreSQL a nullable ordered column gets its placement written out, so a Postgres-compatible engine with a different default reads the order the seek assumes.
+
+Before 0.90 a cursor with no `orderBy` ran unordered, and a cursor named by a key under another order sought on the key while sorting by the order, which returned the wrong rows. See [Upgrading to 0.90](/upgrading-to-0-90#a-cursor-page-is-always-ordered).
+
+**Cursor values.** Each cursor value follows the one-row rule of `findUnique`: a plain value, or `{ equals: value }`. An operator object, an array, or a column reference throws `TURBINE_E003`. A cursor whose every field is `undefined` throws too, because it would quietly restart at the first row. So do `cursor: null`, `cursor: {}` and a cursor that is not an object, and a `null` value for a NOT NULL or primary-key column, since no row holds it (`null` on a nullable column is a real position). Leave `cursor` out, or pass `undefined`, for the first page:
+
+```ts
+// First page: no cursor. Later pages: the last row's key.
+await db.posts.findMany({ orderBy: { createdAt: 'desc' }, take: 20, cursor: last ? { id: last.id } : undefined });
+```
+
+Before 0.90 `cursor: null` and `cursor: {}` meant no cursor, and that first page was ordered without the tiebreaker the later pages used, so a pager written as `cursor: last ? { id: last.id } : {}` could skip rows.
+
+**The first page uses the same order.** A paginated `findMany` (`limit` / `take` / `offset` / `skip`) whose `orderBy` can tie gets the same tiebreaker appended, so the first page and the cursor pages after it are cut from one total order:
+
+```ts
+await db.users.findMany({ orderBy: { name: 'desc' }, take: 20 });
+// ORDER BY "name" DESC, "id" DESC LIMIT $1
+```
+
+An `orderBy` that already contains a unique NOT NULL key is left as written. A `findFirst` with `offset` is a page and gets the tiebreaker too, so the row it returns does not depend on the engine's choice among tied rows. `findFirst` without `offset`, a query with no `limit` or `offset`, a `distinct` query and an order by vector distance are unchanged (a tiebreaker after a distance would turn a nearest-neighbour index scan into a full sort), and a paginated query with no `orderBy` at all still gets only the warning above. Before 0.90 a tie at a page boundary could be broken differently on each page, so an offset walk could skip or repeat a row.
 
 ### distinct
 
@@ -286,6 +327,16 @@ Look up a row by a unique column (primary key or any `unique` constraint).
 
 The `where` must identify a **single row**: the primary key, a single-column unique, every column of a compound unique, or a compound-unique selector. Extra predicates alongside the key are fine, since they can only narrow a set that already holds at most one row. Anything else throws a `ValidationError` (TURBINE_E003) naming the keys that would have worked.
 
+Each key column must be pinned to a plain value (`{ id: 42 }`) or `{ equals: value }`. A column reference, `mode: 'insensitive'`, an `in` list, a range, or another operator beside `equals` in the same key object can match many rows, so since 0.90 it does not count as identifying one. The same rule applies to the `where` of `update`, `delete` and `upsert`, and on every engine.
+
+```ts
+// TURBINE_E003: an insensitive match can hit "Ada@x.com" and "ada@x.com"
+await db.users.findUnique({ where: { email: { equals: input, mode: 'insensitive' } } });
+
+// "Any row matching a filter" is findFirst
+await db.users.findFirst({ where: { email: { equals: input, mode: 'insensitive' } } });
+```
+
 ```ts
 const user = await db.users.findUnique({
   where: { id: 42 },
@@ -324,6 +375,59 @@ const post = await db.posts.findFirst({
 });
 ```
 
+A `where` whose every key is `undefined` is refused with `TURBINE_E003`: `findFirst({ where: { resetToken: token } })` with `token` undefined would otherwise return an arbitrary row rather than one matching your filter. To ask for any row on purpose, omit `where` or pass `where: {}`. `findMany` and `count` keep treating an all-`undefined` `where` as no filter; see [`undefined` means absent](#undefined-means-absent).
+
+## Row locks
+
+`findMany`, `findFirst`, `findFirstOrThrow`, `findUnique` and `findUniqueOrThrow` take `lock`, which locks the rows they return until the transaction ends. Use it to read a row you are about to change, so no other transaction can change it in between:
+
+```ts
+await db.$transaction(async (tx) => {
+  const job = await tx.jobs.findFirst({
+    where: { status: 'queued' },
+    orderBy: { id: 'asc' },
+    lock: { mode: 'update', skipLocked: true },
+  });
+  // SELECT ... WHERE "status" = $1 ORDER BY "id" ASC LIMIT $2 FOR UPDATE OF "jobs" SKIP LOCKED
+  if (job) await tx.jobs.update({ where: { id: job.id }, data: { status: 'running' } });
+});
+```
+
+| `lock` | SQL |
+|---|---|
+| `'update'` | `FOR UPDATE` |
+| `'noKeyUpdate'` | `FOR NO KEY UPDATE` |
+| `'share'` | `FOR SHARE` |
+| `'keyShare'` | `FOR KEY SHARE` |
+| `{ mode, noWait: true }` | `... NOWAIT`: fail at once if a row is locked by another transaction |
+| `{ mode, skipLocked: true }` | `... SKIP LOCKED`: leave locked rows out of the result |
+
+`noWait` and `skipLocked` cannot be combined. A misspelled mode or key throws `TURBINE_E003` with a suggestion.
+
+- **Only the queried table is locked.** Turbine emits `FOR <mode> OF "<table>"` after `LIMIT` / `OFFSET`, so rows of a relation loaded by `with` are never locked, whatever the [relation strategy](/relations).
+- **It needs a transaction.** Outside `$transaction` the lock would be released before the call returns, so a locking read on `db` throws `TURBINE_E003`. A `$transaction([...])` batch and a transactional [pipeline](#pipeline) keep the lock for the batch; a pipeline with `transactional: false` refuses a locking read.
+- **Refused shapes:** a locking read on `findManyStream` / `findManyStreamBatches`, or with `distinct`, throws `TURBINE_E003`.
+- **Engines:** PostgreSQL takes all four modes. MySQL 8 takes `'update'` and `'share'`. SQLite, SQL Server and PowDB throw `UnsupportedFeatureError` (`TURBINE_E017`).
+
+A lock that could not be taken (`noWait` on a locked row, or a lock wait that hit the server's lock timeout) throws [`LockNotAvailableError`](/errors#e013). It is `TURBINE_E013`, carries `isRetryable`, and extends `SerializationFailureError`, so an existing retry loop catches it. On PostgreSQL that failure aborts the transaction. To try a lock and carry on when it fails, take it in a nested block:
+
+```ts
+import { LockNotAvailableError } from 'turbine-orm';
+
+await db.$transaction(async (tx) => {
+  try {
+    await tx.$transaction((inner) =>
+      inner.accounts.findUnique({ where: { id }, lock: { mode: 'update', noWait: true } }),
+    );
+  } catch (err) {
+    if (!(err instanceof LockNotAvailableError)) throw err;
+    // Only the savepoint rolled back; the transaction is still usable.
+  }
+});
+```
+
+Studio's Query tab and the MCP server's `explain_query` and `compile_query` tools refuse `lock` by name: they run reads in a read-only transaction, where a lock cannot be taken.
+
 ## create
 
 Insert a single row. Returns the full row (including generated columns).
@@ -351,7 +455,7 @@ const { id } = await db.events.create({
 
 The narrowing happens in the statement: `RETURNING "id"` on PostgreSQL and SQLite, the follow-up `SELECT` on MySQL, `OUTPUT INSERTED.[id]` on SQL Server. The rest of the row never crosses the wire. Measured with a 3.1 KB `jsonb` payload at concurrency 50, `select: { id: true }` inserted 64,675 rows/s against 54,784/s for the whole row.
 
-The rules are the read path's. An unknown field, a relation name, an empty `select`, or `select` and `omit` together throw `ValidationError` (`TURBINE_E003`) before anything is written. A [PII field](#pii-fields-includepii) comes back only when `select` names it. The result type narrows to match. A nested create or update applies the projection to the row it returns. On PowDB, whose `returning` takes no column list, the row is narrowed after it arrives, with the same result.
+The rules are the read path's. An unknown field, a relation name, an empty `select`, or `select` and `omit` together throw `ValidationError` (`TURBINE_E003`) before anything is written. A write never returns a [PII field](#pii-fields-includepii), and a `select` that names one throws `TURBINE_E003`. The result type narrows to match. A nested create or update applies the projection to the row it returns. On PowDB, whose `returning` takes no column list, the row is narrowed after it arrives, with the same result.
 
 ### Inserting a row of pure defaults
 
@@ -373,6 +477,34 @@ A table with no usable defaults still fails with the database's own NOT NULL vio
 
 Every row must also name the same fields; see [uniform rows](#createmany) below.
 </Callout>
+
+### Writing JSON columns
+
+What a `json` / `jsonb` column stores depends on the JS value you write, on every write path (`create`, `createMany`, `update`, `updateMany`, `upsert`, nested writes) and every engine:
+
+| Value | Stored |
+|---|---|
+| an object | that JSON object |
+| an array | that JSON array |
+| a string | **raw JSON text**: `'{"a":1}'` stores the object `{ a: 1 }`, so `JSON.stringify(value)` works |
+| `null` | SQL `NULL` |
+| `jsonValue(v)` | `JSON.stringify(v)`: a way to store a JSON string or a JSON `null` |
+
+```ts
+import { jsonValue } from 'turbine-orm';
+
+await db.docs.create({ data: { data: ['a', 'b'] } });          // the JSON array ["a", "b"]
+await db.docs.create({ data: { data: jsonValue('hello') } });  // the JSON string "hello"
+await db.docs.create({ data: { data: jsonValue(null) } });     // JSON null; the column is not SQL NULL
+```
+
+A value with no JSON form (a `bigint` inside an array, say) throws `ValidationError` (`TURBINE_E003`) naming the column. Before 0.90 an array was sent as a Postgres array literal, so `[]` stored `{}`.
+
+### Objects on non-JSON columns
+
+On PostgreSQL, a plain object or an array written to a built-in scalar column (the text types, integers, `numeric`, floats, `boolean`, the temporal types, `uuid`, `bytea`, network types, `money`, `xml`, `interval`) throws `ValidationError` (`TURBINE_E003`) naming the column, its type and the fix. Store JSON text on purpose with `JSON.stringify(value)` or `jsonValue(value)`. Dates, Buffers, `bigint`, class instances, array columns, enums, domains and extension types are not affected.
+
+SQLite, MySQL and SQL Server keep accepting an object on a text column, because a text column is a legitimate home for JSON there.
 
 ### Field names and column names resolve identically
 
@@ -424,6 +556,60 @@ const users = await db.users.createMany({
 Turbine therefore refuses the ragged call with a `ValidationError` (`TURBINE_E003`) naming the offending row index and the differing columns, on every engine including PowDB. A field explicitly set to `undefined` counts as omitted, exactly as in `create`. Supply the field on every row, or split the call into one `createMany` per field set.
 </Callout>
 
+A `json` / `jsonb` cell takes the same values as a single [JSON write](#writing-json-columns), and inserts exactly one row per element of `data` (before 0.90 an array cell could add rows on PostgreSQL).
+
+**Large batches.** One statement takes a limited number of bind parameters: 65,535 on PostgreSQL and MySQL, 32,766 on SQLite. A `createMany` whose rows need more is split into chunks that fit, all inside one transaction, so the rows land together or not at all. PostgreSQL's `UNNEST` form binds one array per column and never gets near the limit; a table with an array column inserts row by row with `VALUES`, which can, and is chunked the same way. Before 0.90 an oversized call threw `TURBINE_E003`.
+
+- **SQL Server** takes at most 1,000 rows and 2,098 parameters in one `INSERT`, so a plain `createMany` is chunked at whichever it reaches first, inside one transaction. A [`createMany` with `onConflict`](#multi-row-upsert-onconflict) is chunked at 2,098 parameters.
+- **`buildCreateMany`** (one statement, for [`pipeline`](#pipeline) or `$transaction([...])`) still refuses an oversized batch with `TURBINE_E003`, naming the limit and a chunk size.
+- **Inside a `$transaction` callback** the chunks run on that transaction, inside a savepoint of their own. A failed chunk rolls back every chunk before it, even when your callback catches the error and commits.
+- **A pool without `connect()`** (a stateless HTTP driver) cannot hold the transaction the chunks need, so an oversized call there throws `UnsupportedFeatureError` (`TURBINE_E017`) naming the alternative.
+
+`createMany` takes [`select` / `omit`](#returning-fewer-columns) like `create`, to narrow the rows it returns.
+
+### Multi-row upsert: `onConflict`
+
+`onConflict` turns `createMany` into an upsert of many rows in one statement. Rows whose key is new are inserted; rows whose key already exists update the existing row instead:
+
+```ts
+const rows = await db.users.createMany({
+  data: [
+    { email: 'a@b.com', name: 'A' },
+    { email: 'b@b.com', name: 'B' },
+  ],
+  onConflict: { target: ['email'], update: ['name'] },
+});
+// INSERT ... ON CONFLICT ("email") DO UPDATE SET "name" = EXCLUDED."name" RETURNING *
+```
+
+- **`target`** names the conflict key: the primary key or one full unique key, in any order. A partial unique index cannot be a target. Anything else throws `TURBINE_E003` listing the valid targets.
+- **`update`** is either a list of fields, each set to the incoming row's value, or a per-column object. The object takes plain values, the [atomic operators](#atomic-update-operators), [update expressions](#update-expressions-expr), and `expr.excluded('field')` for the incoming row's value:
+
+```ts
+import { col, expr } from 'turbine-orm';
+
+await db.pageViews.createMany({
+  data: batch, // [{ path, views }, ...]
+  onConflict: {
+    target: ['path'],
+    update: { views: expr.add(col('views'), expr.excluded('views')) },
+    where: { archived: false }, // only existing rows that match are updated
+  },
+});
+```
+
+- **`where`** limits which existing rows are updated. A conflicting row that does not match is left alone and is not returned. Inserted rows are not filtered, as with `create`.
+- **`ignore: true`** (instead of `update`) leaves every existing row untouched.
+
+Two rows in one call with the same key throw `TURBINE_E003` before any SQL runs: one statement cannot insert or update a key twice, so merge them first. Two keys that differ in JavaScript but are equal under the column's comparison rules (`'bob'` and `'BOB'` under a case-insensitive collation, `citext`, or SQLite's `COLLATE NOCASE`) also throw `TURBINE_E003`, on every engine and across the statements of a chunked call. The call is rolled back, so no row it wrote stays. An active [global filter](/global-filters) applies to the conflict update, as `where` does. [`updatedAt`](#updatedat-columns) columns are stamped on the update unless `update` names them. The result holds the rows inserted or updated, in no guaranteed order.
+
+| Engine | Support |
+|---|---|
+| PostgreSQL, SQLite | `INSERT ... ON CONFLICT` |
+| SQL Server | `MERGE ... WITH (HOLDLOCK)` |
+| MySQL 8.0.19+ | `INSERT ... AS ... ON DUPLICATE KEY UPDATE`. Throws `UnsupportedFeatureError` (`TURBINE_E017`) for `where` (no predicate slot), `ignore` (inserted and skipped rows cannot be told apart), an active global filter (unless `skipGlobalFilters: UNSAFE`), a NULL target value, and a second unique key whose columns are in `data` (MySQL cannot limit the update to one key). The rows come back through a re-read by key in the same transaction |
+| PowDB | `TURBINE_E017` |
+
 ## update / updateMany
 
 `update` changes **one row, addressed by a unique key**. `updateMany` changes every row matching a filter.
@@ -444,6 +630,13 @@ await db.users.updateMany({
 
 `update` returns the updated row and takes [`select` / `omit`](#returning-fewer-columns) to narrow it. `updateMany` returns `{ count }`.
 
+`limit`, `take`, `offset` and `skip` on `updateMany` or `deleteMany` throw `TURBINE_E003` on every engine. Before 0.90 they were ignored, so every matching row was written. To write a bounded batch, select the ids first:
+
+```ts
+const batch = await db.jobs.findMany({ where: { status: 'queued' }, select: { id: true }, orderBy: { id: 'asc' }, limit: 100 });
+await db.jobs.updateMany({ where: { id: { in: batch.map((j) => j.id) } }, data: { status: 'running' } });
+```
+
 ### Atomic update operators
 
 For race-safe counter updates, pass an operator object instead of a literal. Turbine generates `col = col + $n` style SQL so concurrent updates can't lose writes.
@@ -463,6 +656,55 @@ await db.posts.update({
 
 Supported operators on numeric columns: `set`, `increment`, `decrement`, `multiply`, `divide`.
 
+On a `json` / `jsonb` column only `set` is an operator. `{ increment: 1 }` there is the JSON document `{"increment":1}`, and `{ set: doc }` is how to write a document that itself has a `set` key. Operators apply in `update` data only; in `create` data an operator object is a value, so on a scalar PostgreSQL column it is refused like any [object](#objects-on-non-json-columns).
+
+### Update expressions: `expr`
+
+When the new value depends on the row itself, build it with `expr` and refer to columns with `col()`. The expression runs in the database, inside the `UPDATE`, so concurrent writers cannot lose each other's changes:
+
+```ts
+import { col, expr } from 'turbine-orm';
+
+await db.posts.update({
+  where: { id: 1 },
+  data: {
+    viewCount: expr.add(col('viewCount'), 1),
+    peakViews: expr.greatest(col('peakViews'), col('viewCount')),
+    tier: expr.case([{ when: { viewCount: { gt: 1000 } }, then: 'hot' }], 'cold'),
+    seenAt: expr.now(),
+  },
+});
+```
+
+| Builder | SQL | Notes |
+|---|---|---|
+| `expr.add(a, b)`, `sub`, `mul`, `div` | `a + b`, `a - b`, `a * b`, `a / b` | Numeric operands only. Between integers (integer numbers and integer columns) the arithmetic is integer arithmetic on every engine, and `div` truncates toward zero: `75 / 2` is `37`, also when the result goes into a float column. With a non-integer operand it is decimal arithmetic, and writing that result to an integer column throws `TURBINE_E003`. For a decimal half, write `expr.mul(col('n'), 0.5)` into a float column |
+| `expr.coalesce(a, b, ...)` | `COALESCE(...)` | 2 to 8 operands |
+| `expr.greatest(a, b, ...)`, `expr.least(...)` | `GREATEST(...)`, `LEAST(...)` | 2 to 8 operands. NULLs are ignored on every engine, as on PostgreSQL: the result is NULL only when every operand is |
+| `expr.case(arms, otherwise?)` | `CASE WHEN ... THEN ... ELSE ... END` | 1 to 16 arms of `{ when, then }`. `when` is a filter on the row's own columns, written like `where` (no relation filters). The first matching arm wins; without `otherwise` an unmatched row gets NULL |
+| `expr.now()` | The server's current time | Temporal columns only. Stored in the zone convention Turbine reads with, so a zone-less `timestamp` gets the UTC wall clock and a `date` column gets the UTC day, SQLite included. On PostgreSQL it is the transaction's start time |
+| `expr.excluded('field')` | The incoming row's value | Only in `upsert`'s `update` and `createMany`'s [`onConflict.update`](#multi-row-upsert-onconflict) |
+
+An operand is a JavaScript value, `col('field')` for the current row's column, or another expression, so expressions nest: `expr.add(col('a'), expr.mul(col('b'), 2))`. A client generated by 0.90 types expressions in its update inputs; regenerate an older one.
+
+Expressions are accepted as the direct value of a field in `update`, `updateMany`, `upsert`'s `update`, nested `update` and `upsert` data, and `onConflict.update`. They throw `ValidationError` (`TURBINE_E003`) in `create` and `createMany` data, inside an operator such as `{ set }`, and on a `json`, `jsonb` or array column.
+
+Only `expr` builds an expression. Each node carries a symbol brand that `JSON.parse` cannot produce, so request data can never become SQL. A plain object shaped like a node (`{ kind: 'add', args: [...] }`) is a value, and on a non-JSON column it throws `TURBINE_E003`.
+
+PostgreSQL, MySQL, SQLite and SQL Server support expressions. PowDB and `turbine-orm/prisma-compat` throw `UnsupportedFeatureError` (`TURBINE_E017`).
+
+<Callout type="note">
+Lint rules that ban an object property named `then` (Biome's `noThenProperty`, `unicorn/no-thenable`) flag the `{ when, then }` arms of `expr.case`. Disable the rule for that line.
+</Callout>
+
+### `updatedAt` columns
+
+A column tagged [`updatedAt`](/schema#auto-updated-timestamps-updatedat) is stamped by `update`, `updateMany` and both branches of `upsert` that update a row, unless the call names it. An explicit value always wins.
+
+### `optimisticLock`
+
+[`optimisticLock`](/optimistic-locking) is an `update` option. `updateMany` and `upsert` refuse it with `TURBINE_E003` rather than ignore it: on `updateMany`, put `version: expected` in `where` and `version: { increment: 1 }` in `data`; on `upsert`, read the row and `update` with `optimisticLock` or `create`, inside one `$transaction`.
+
 ## delete / deleteMany
 
 ```ts
@@ -473,9 +715,13 @@ await db.users.deleteMany({
 });
 ```
 
-`delete` returns the deleted row and takes [`select` / `omit`](#returning-fewer-columns) to narrow it. `deleteMany` returns `{ count }`.
+`delete` returns the deleted row and takes [`select` / `omit`](#returning-fewer-columns) to narrow it. `deleteMany` returns `{ count }`, and refuses `limit` / `take` / `offset` / `skip` as [`updateMany`](#update--updatemany) does.
 
-An empty `where` (`{}`, or one whose every value is `undefined`) throws `ValidationError`: Turbine blocks accidental mass deletes. To really mean it, import the sentinel and pass `allowFullTableScan: UNSAFE` alongside it:
+An empty `where` (`{}`, or one whose every value is `undefined`) throws `ValidationError`: Turbine blocks accidental mass deletes. So does a `where` that is always true, such as `NOT: { OR: [] }`, `{ id: { notIn: [] } }`, `{ posts: { none: { OR: [] } } }` or an `OR` with a branch that applies no condition (`OR: [{ id: 1 }, {}]`), which would compile to SQL matching every row.
+
+Since 0.90 the guard also reads which columns are NOT NULL, so these are refused too on a NOT NULL column: `contains: ''` (and `startsWith: ''` / `endsWith: ''`), `not: null`, a column compared with itself (`{ equals: col('email') }` on `email`), and `hasEvery: []` on an array column. A bare to-one relation filter (`{ author: {} }` or `{ author: { is: {} } }`) over a NOT NULL foreign key is refused as well, except on SQLite, where a row can point at a row that does not exist when the connection's `foreign_keys` pragma is off, and when the target table has a global filter. Reads with these shapes are unchanged.
+
+An always-false `where` (`{ id: { in: [] } }`, `OR: []`) is not refused; it matches nothing. To really mean it, import the sentinel and pass `allowFullTableScan: UNSAFE` alongside it:
 
 ```ts
 import { UNSAFE } from 'turbine-orm';
@@ -483,7 +729,7 @@ import { UNSAFE } from 'turbine-orm';
 await db.sessions.deleteMany({ where: {}, allowFullTableScan: UNSAFE }); // every row
 ```
 
-`where` itself is still required: `allowFullTableScan` disarms the guard on an *empty* `where`, it does not let you drop the key.
+`where` itself is still required: `allowFullTableScan` disarms the guard on an empty or always-true `where`, it does not let you drop the key. A list that may be empty (`notIn: excludedIds`) needs a decision: pass `allowFullTableScan: UNSAFE` when every row is meant, or skip the call.
 
 `allowFullTableScan` is a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol): the `UNSAFE` symbol is the only value that enables it, and `true` throws (`TURBINE_E003`). The option is typed `Unsafe`, so a boolean does not compile; write a conditional call site as `{ where, ...(flag ? { allowFullTableScan: UNSAFE } : {}) }`. The same applies to `updateMany`.
 
@@ -552,6 +798,28 @@ On a **PII-tagged** column, `_min` / `_max` require `includePii: UNSAFE`;
 
 `_sum` / `_avg` return a `number` over `int2` / `int4` / `float` columns and an exact **string** over `int8` / `bigint` and `numeric` / `decimal` columns, where PostgreSQL computes the result as `numeric` and `Number()` would round it; `_min` / `_max` are different, and deliberately so: they return one stored cell, read back by the same driver rule a row uses, so an `int8` comes back as a `number` while it fits in JavaScript's safe integer range and as a string above it. The aggregate rule is decided by the column TYPE and the row rule by the VALUE's magnitude, because `_sum` and `_avg` compute a result no row holds and rounding it is a loss that no later read can undo. The same rule, with the reasoning, is under [groupBy](#groupby).
 
+### Percentiles: `_percentile`
+
+`aggregate` and `groupBy` take `_percentile: { field: { p, method? } }`. `p` is a fraction from 0 to 1, or an array of them, and the result mirrors that shape:
+
+```ts
+const stats = await db.requests.aggregate({
+  _percentile: {
+    latencyMs: { p: [0.5, 0.95, 0.99] },
+    sizeBytes: { p: 0.5, method: 'disc' },
+  },
+});
+// stats._percentile.latencyMs: [median, p95, p99]
+// stats._percentile.sizeBytes: one stored value
+```
+
+- **`method: 'cont'`** (the default) interpolates between rows, `percentile_cont`. It needs a numeric or interval column; on a date or time column it throws `TURBINE_E003`, which names `method: 'disc'`.
+- **`method: 'disc'`** returns a value actually stored in the column, `percentile_disc`.
+
+Values read the way the column reads: a date column gives `Date`, an interval gives the driver's interval object, and `numeric` stays an exact string. Over zero rows the result is `null`, in both the scalar and the array form. On a PII-tagged column both methods need `includePii: UNSAFE`, as `_min` / `_max` do.
+
+PostgreSQL only: other engines throw `UnsupportedFeatureError` (`TURBINE_E017`). A JSON-path target throws `TURBINE_E003`, and so do ordering groups by `_percentile` and filtering them on it in `having` (not supported yet).
+
 ## groupBy
 
 Group rows by one or more columns and compute aggregations per group. Similar to SQL `GROUP BY` with aggregate functions.
@@ -567,6 +835,8 @@ const postsByUser = await db.posts.groupBy({
 // If `score` were numeric (or bigint), _avg would be the exact string PostgreSQL
 // renders, e.g. _avg: { score: '4.2000000000000000' }; see the type note below.
 ```
+
+`by` must be a non-empty array of field names. A missing `by`, a string (write `by: ['name']`), an empty array or a `null` entry throws `TURBINE_E003` naming `by`; for one group over every row, use [`aggregate()`](#aggregate). Before 0.90 these were a `TypeError`, an "Unknown field" per character, or SQL the server rejected.
 
 Grouping **by** a PII-tagged column, or `_min` / `_max` over one, requires
 `includePii: UNSAFE`; `where` / `orderBy` / `having` stay unrestricted. See
@@ -715,6 +985,8 @@ const lateAlphabetically = await db.posts.groupBy({
 // ... HAVING MIN("title") > $1
 ```
 
+Each `_min` / `_max` operand, and each `in` / `notIn` element, binds the way a `where` operand on that column does. On MySQL a number compared with a text column therefore binds as text: before 0.90 `having: { token: { _min: 0 } }` also matched a group whose smallest token was `'abc'`, because MySQL compared the two as numbers.
+
 #### Filtering on the grouped value
 
 A field entry also accepts a filter on the **grouped value itself**, not just on an aggregate of it. This is Prisma's `having` shape, and it covers the common "drop the NULL group" case:
@@ -791,6 +1063,8 @@ for await (const user of db.users.findManyStream({
 
 Under the hood, a stream whose `batchSize` is at or below the default (1000) opens with a speculative `LIMIT batchSize + 1` first fetch: if the whole result fits in one batch, rows are yielded directly and the four round trips of `BEGIN` / `DECLARE` / `CLOSE` / `COMMIT` are skipped entirely. Larger results escalate to a cursor. Safe to `break` early; the cursor and connection are cleaned up deterministically.
 
+A stream honours `limit` / `take` and `offset` / `skip` exactly as `findMany` does, and the speculative fetch is capped by your `limit` (or the client's `defaultLimit`). Before 0.90, `findManyStream({ limit: 3 })` streamed every matching row whenever the result fit one batch.
+
 <Callout type="note" title="Why the speculative fetch stops above batchSize 1000">
   Rows from a failed speculation cannot be reused (they were read outside the
   cursor's transaction), so the cursor re-reads from row one and the waste is
@@ -799,6 +1073,26 @@ Under the hood, a stream whose `batchSize` is at or below the default (1000) ope
   have fit, never any transferred rows. The [benchmarks](/benchmarks) carry the
   streaming measurements.
 </Callout>
+
+### Abandoned streams close themselves
+
+A stream that holds a connection between pulls is closed when its consumer asks for nothing for five minutes. That is a stream that outgrew its first batch and opened a cursor; one that fit in a single batch holds nothing. An iterator that is kept and never finished, or a response stream torn down without calling `return()`, would otherwise hold a pooled connection forever, and on PostgreSQL an open transaction whose snapshot holds back vacuum.
+
+On expiry Turbine closes the cursor, releases the connection and logs `stream-idle-timeout`. The next pull, if one comes, throws `TimeoutError` (`TURBINE_E002`, `outcome: 'not-executed'`). Time Turbine spends fetching does not count, only time the consumer spends between pulls.
+
+```ts
+// Per call: a slow consumer that pauses longer than five minutes between rows
+for await (const row of db.events.findManyStream({ idleTimeoutMs: 30 * 60_000 })) {
+  await slowSink.write(row);
+}
+
+// Per client: streamIdleTimeoutMs, in milliseconds. 0 disables the timeout.
+const db = turbine({ connectionString: process.env.DATABASE_URL, streamIdleTimeoutMs: 0 });
+```
+
+Both take a whole number of milliseconds; anything else throws `TURBINE_E003`. The stream option is `idleTimeoutMs`; the client option of the same name is the pool's idle-connection timeout, so the client-level stream setting is spelled `streamIdleTimeoutMs`. A stream inside `$transaction` is not watched: it rides the transaction's connection, and the transaction's own timeout bounds it.
+
+On PostgreSQL the stream's transaction also carries a server-side `idle_in_transaction_session_timeout` of the idle timeout plus 10 seconds. It is transaction-local, never a session `SET`, and a stricter limit already in force is kept. So a process that stops running timers, such as a serverless instance frozen between invocations, cannot hold the transaction open either; its next pull is `ConnectionError` (`TURBINE_E004`). Until the stream expires, Turbine sends `SELECT 1` on its connection whenever half the timeout passes with no statement, so a consumer reading an already-fetched batch slowly never looks idle to the server, and the server limit acts only when timers cannot run.
 
 ## WHERE operators
 
@@ -842,6 +1136,41 @@ No regeneration is needed: the check reuses the relation brand your generated cl
 
 Because this is a type-level guarantee, `tsx` and other transpile-only runners will not catch it. Run `tsc --noEmit` in CI.
 
+### Operands must fit the column
+
+Every operand is checked against its column at runtime, on the first build and on every cache hit. On a non-JSON column a value position (a bare value, `equals`, `not`, `gt`, `gte`, `lt`, `lte`) takes a string, number, `bigint`, boolean, `Date`, `Buffer` or typed array, `null` where it means something, or a [column reference](#column-to-column-comparison). Everything else throws `ValidationError` (`TURBINE_E003`):
+
+| Shape | Use instead |
+|---|---|
+| an object or array as a value: `{ id: [1, 2] }` | `{ id: { in: [1, 2] } }` |
+| `gt` / `gte` / `lt` / `lte: null` | `equals: null` or `not: null` |
+| a non-string `contains` / `startsWith` / `endsWith` | a string |
+| a non-array `in` / `notIn`, or an element that is not a scalar | an array of values |
+| an empty operator object as written: `{ id: {} }` | a value or an operator |
+| an operator object naming no operator: `{ name: { mode: 'insensitive' } }` | add one, `{ contains: 'x', mode: 'insensitive' }` |
+| a `distinct` element that is not a field-name string | `distinct: ['email']` |
+| a `Map`, `Set`, `Promise`, `RegExp` or `Error` | a scalar |
+| `mode` other than `'insensitive'` or `'default'` | one of those |
+
+Before 0.90 these were bound as JSON text and matched nothing, or the wrong rows. A class instance that renders itself (`toPostgres`, `toJSON`, or its own `toString`, as decimal libraries do) is accepted as a scalar.
+
+### `undefined` means absent
+
+A key whose value is `undefined` is removed before the query is built, at every depth of `where` (inside `AND` / `OR` / `NOT`, relation filters and `with` wheres), and in `having`, `cursor` and `orderBy`. An object that becomes empty that way is removed too, so `{ user: { email: undefined } }` is no filter at all, and an optional search box needs no special casing:
+
+```ts
+// search may be undefined: no title predicate, and the same cached SQL as omitting it
+await db.posts.findMany({ where: { orgId, title: { contains: search, mode: 'insensitive' } } });
+```
+
+What an emptied `where` then means depends on the method:
+
+- `findMany` and `count` return every row, as with no `where`.
+- `findFirst` / `findFirstOrThrow` throw `TURBINE_E003`, so a missing value cannot turn a lookup into "any row".
+- Mutations refuse it through the [empty-where guard](#delete--deletemany), including one emptied inside a relation filter: `deleteMany({ where: { user: { email: undefined } } })` throws. The same guard refuses a `where` that is always true, such as `NOT: { OR: [] }`.
+
+An object you write empty is left as written and keeps its own rule (`{ id: {} }` throws, `where: {}` is "no filter" on a read). `data` is not pruned the same way: a top-level `undefined` field is skipped, and an emptied object stays, because `{}` is a legitimate JSON value.
+
 ### Equality
 
 | Operator | Description | Example |
@@ -849,6 +1178,9 @@ Because this is a type-level guarantee, `tsx` and other transpile-only runners w
 | literal | Implicit equality | `where: { email: 'a@b.com' }` |
 | `equals` | Explicit equality | `where: { email: { equals: 'a@b.com' } }` |
 | `not` | Inequality (or `not: null` for `IS NOT NULL`) | `where: { role: { not: 'admin' } }` |
+| `not: { ... }` | Negates an operator object: `NOT (<inner>)` | `where: { title: { not: { contains: 'draft' } } }` |
+
+`not` with an operator object negates it, as in Prisma: `{ not: { lt: 4 } }` compiles to `NOT ("score" < $1)`, and an outer `mode` applies inside. A row whose column is `NULL` matches neither the filter nor its negation (SQL three-valued logic), so add `{ score: null }` under an `OR` if you want those rows. Before 0.90 the object was bound as a value and the filter matched nearly every row.
 
 ### Sets
 
@@ -858,6 +1190,10 @@ Because this is a type-level guarantee, `tsx` and other transpile-only runners w
 | `notIn` | Match none of the values | `where: { role: { notIn: ['banned', 'spam'] } }` |
 
 `mode: 'insensitive'` applies to `equals`, `not`, `in` and `notIn` on string columns as well as to the substring operators; see [String](#string). Before 0.78 it was read only by `contains` / `startsWith` / `endsWith` and silently ignored beside the others. On `in` / `notIn` it is PostgreSQL-only **among the SQL engines**: SQLite, MySQL and SQL Server refuse it with `TURBINE_E017`, for the reason given in the table below. PowDB supports it, because PowQL's list form takes an expression per element and can fold each one in the engine.
+
+On every engine `in` / `notIn` match exactly the rows `equals` / `not` match for each element, whatever the column type. Before 0.90 MySQL compared the list as JSON values, so a boolean, a date or time, a binary value, a decimal or bigint written as a string, and text under a case-insensitive collation never matched, and `notIn` matched every row: `deleteMany({ where: { published: { notIn: [true] } } })` deleted the published rows too. MySQL now binds each element as its own placeholder, and a list that takes the statement past MySQL's 65,535 placeholders throws `TURBINE_E003`; split it across several queries. SQLite takes a bigint past 2^53 and binary values in a list. SQL Server takes bigint and `Date` elements, and refuses a binary element with `TURBINE_E017`; write that list as `OR` branches.
+
+On MySQL a number or boolean compared with a text column binds as text, so `{ resetToken: 0 }` matches only the text `'0'`. Before 0.90 MySQL compared the two as numbers, and `0` matched every token that does not start with a digit.
 
 ### Comparison
 
@@ -902,9 +1238,10 @@ Filter into a JSON document with a `JsonFilter`. `path` drills into nested keys 
 
 | Operator | Description | Example |
 |---|---|---|
-| `path` | Drill into nested keys (`#>>`) before applying the test | `where: { data: { path: ['meta', 'tier'], equals: 'pro' } }` |
-| `equals` | Value at `path` equals | `where: { data: { path: ['tier'], equals: 'pro' } }` |
-| `contains` | jsonb containment (`@>`) | `where: { data: { contains: { active: true } } }` |
+| `path` | Drill into nested keys before applying the test | `where: { data: { path: ['meta', 'tier'], equals: 'pro' } }` |
+| `equals` with `path` | The JSON value at `path` equals the operand, compared as JSON | `where: { data: { path: ['tier'], equals: 'pro' } }` |
+| `equals` without `path` | The whole document equals the operand exactly | `where: { data: { equals: { tier: 'pro' } } }` |
+| `contains` | jsonb containment (`@>`): the document holds the operand, maybe among other keys | `where: { data: { contains: { active: true } } }` |
 | `hasKey` | Top-level key exists (`?`) | `where: { data: { hasKey: 'meta' } }` |
 | `gt` / `gte` / `lt` / `lte` | Range-compare the value at `path` | `where: { data: { path: ['rating'], gte: 4 } }` |
 | `stringContains` | Substring match on the text at `path` | `where: { data: { path: ['title'], stringContains: 'orm' } }` |
@@ -922,6 +1259,32 @@ const topRated = await db.products.findMany({
 
 > **Note:** A bare `{ gt: 5 }` with no `path` on a jsonb column is the plain column comparison, not a JSON test; reach for `path` whenever you mean "the value inside the document."
 
+#### `equals` compares JSON values
+
+`equals` compares JSON to JSON, so the operand's JSON type matters:
+
+```ts
+// Stored: { n: 5 }, { n: "5" }, { n: null }, and {}
+where: { data: { path: ['n'], equals: 5 } }     // only { n: 5 }
+where: { data: { path: ['n'], equals: '5' } }   // only { n: "5" }
+where: { data: { path: ['n'], equals: null } }  // only { n: null }: a missing key is not JSON null
+```
+
+On PostgreSQL the path form compiles to `(col #> $1::text[])::jsonb = $2::jsonb` and the operand is bound as JSON text (a `Date` as its ISO string, a `bigint` as a JSON number); MySQL compares `JSON_EXTRACT(col, path) = CAST(? AS JSON)`. Arrays and objects at a path compare as JSON on both. A function, a symbol, a column reference or a non-finite number is refused with `TURBINE_E003`.
+
+Without a `path`, `equals` is exact equality of the whole document: `"col"::jsonb = $1::jsonb` on PostgreSQL (key order and whitespace do not matter, and a `json` column works too), `col = CAST(? AS JSON)` on MySQL. `{ equals: { plan: 'pro' } }` does **not** match `{ plan: 'pro', seats: 5 }`; use `contains` for that. On a JSON column, `not: <document>` and `not: { equals: <document> }` mean "not this document" on PostgreSQL and MySQL. A `not` whose object has only filter-operator keys (`not: { gt: 1 }`, `not: { path: ['a'], equals: 1 }`) throws `TURBINE_E003`, because it would be compared as the literal document `{"gt":1}` and match nearly every row. Write `NOT: { data: { ... } }` to negate a filter, or `not: jsonValue({ gt: 1 })` to compare against a document with those keys. On MySQL a bare document in a `where` (`{ data: { a: 1 } }`) is compared as a document too; before 0.90 it was compared as a string and matched nothing.
+
+The other engines cannot compare every shape exactly, and refuse what they cannot compare with `UnsupportedFeatureError` (`TURBINE_E017`) rather than approximate it:
+
+| Engine | Path `equals` | Pathless `equals` |
+|---|---|---|
+| PostgreSQL, MySQL | every JSON value | exact document equality |
+| SQL Server | numbers compare as numbers, strings case-sensitively; arrays and objects `E017` | `E017` |
+| SQLite | numbers and strings; `null`, arrays, objects and booleans `E017` (SQLite extracts `true` as `1`) | `E017` |
+
+SQL Server and SQLite also refuse a bare document as the value (`{ data: { a: 1 } }`) and `not: <document>` with `TURBINE_E017`, as they refuse a pathless `equals`; before 0.90 they compared JSON text, so key order decided the match. PowDB refuses all three the same way. On MySQL, SQLite and SQL Server a path key holding a backslash, a quote or a newline is written as a JSON string literal, so it finds its value.
+
+Before 0.90 a path `equals` compared the extracted text (`equals: 5` also matched `"5"`) and a pathless one was containment. See [Upgrading to 0.90](/upgrading-to-0-90#pathless-json-equals-compares-the-whole-document).
 The three substring operators are the JSON counterpart of the scalar `contains` / `startsWith` / `endsWith`, and they all require `path`. They are deliberately **not** spelled `contains`, because on a JSON column `contains` already means whole-document jsonb containment (`@>`). The operand is LIKE-escaped, so `%` and `_` match literally.
 
 ```ts
@@ -937,17 +1300,21 @@ const matches = await db.docs.findMany({
 
 ### Column-to-column comparison
 
-Compare a column against **another column of the same table** by passing `{ col: 'field' }` to `equals`, `not`, `gt`, `gte`, `lt`, or `lte`. The referenced column is compiled into the SQL, no value is bound:
+Compare a column against **another column of the same table** by passing `col('field')` to `equals`, `not`, `gt`, `gte`, `lt`, or `lte`. The referenced column is compiled into the SQL, no value is bound:
 
 ```ts
+import { col } from 'turbine-orm';
+
 // Instances whose published version lags behind the draft
 const stale = await db.modelInstances.findMany({
-  where: { currentVersionId: { not: { col: 'publishedVersionId' } } },
+  where: { currentVersionId: { not: col('publishedVersionId') } },
 });
-// → WHERE "current_version_id" <> "published_version_id"
+// → WHERE "current_version_id" != "published_version_id"
 ```
 
-An unknown referenced field throws `ValidationError` (`TURBINE_E003`), and `mode: 'insensitive'` cannot be combined with a column reference. On `json`/`jsonb` columns an `equals` object is always a JSON value (containment), never a column reference, use `path` filters for JSON tests.
+`col()` returns a frozen reference carrying a symbol brand. A plain `{ col: 'field' }` object is **not** a reference: it is exactly what `JSON.parse` produces from a request body, so it throws `ValidationError` (`TURBINE_E003`) naming `col()`, and it does not typecheck. Request data therefore cannot name a column. Before 0.90 the plain object was the spelling, and `delete({ where: { id: body.id } })` with a body of `{"id":{"equals":{"col":"id"}}}` compiled to `WHERE "id" = "id"`.
+
+An unknown referenced field throws `ValidationError` (`TURBINE_E003`), and `mode: 'insensitive'` cannot be combined with a column reference. A reference never identifies a row for `findUnique` / `update` / `delete`. On `json`/`jsonb` columns an object operand is always a JSON value, never a column reference; use `path` filters for JSON tests.
 
 ### Ordering by a JSON path
 
@@ -1005,7 +1372,9 @@ Filter parent rows by predicates on their child rows.
 | `every` | Every related row matches | `where: { posts: { every: { published: true } } }` |
 | `none` | No related row matches | `where: { posts: { none: { published: false } } }` |
 
-Any operator above, including JSON filters, composes inside `some` / `every` / `none`.
+Any operator above, including JSON filters, composes inside `some` / `every` / `none`. A relation filter takes only `some`, `every`, `none`, `is` and `isNot` (or, on a to-one relation, a bare where object); any other key beside them throws `TURBINE_E003` naming it, where it used to be dropped and widen the filter.
+
+A quantifier takes a where object. `some: null`, `none: null`, `every: null`, a scalar or an array throws `TURBINE_E003`, at every depth (in global filters and `with` wheres too). Before 0.90 such a value was dropped, so the query matched every row and a `deleteMany` deleted every row. Write `some: {}` for "has a related row" and `none: {}` for "has none". On a to-one relation `is` / `isNot` take a where object or `null`; `is: null` and `isNot: null` work as before, and a scalar or an array throws `TURBINE_E003`. `is` / `isNot` on a to-many relation throws `TURBINE_E003` naming `some` / `every` / `none`; before 0.90 an untyped caller's `is` there ran. `some` / `every` / `none` on a to-one relation still work.
 
 ```ts
 // Users who own at least one product rated 4+
@@ -1024,19 +1393,23 @@ where: {
 }
 ```
 
-An **empty** combinator adds no predicate: `OR: []`, `AND: []`, `NOT: {}` and `NOT: []` each compile to nothing, so `where: { OR: [] }` on its own returns **every row**. Prisma agrees for `AND` and `NOT` but not for `OR`, where an empty list matches nothing. A filter list assembled from user selections therefore needs an explicit decision about zero selections:
+`OR` takes an array of where objects. `AND` and `NOT` take one where object or an array of them, and `NOT: [a, b]` means `NOT a AND NOT b`. Anything else in a combinator position (an object for `OR`, `null`, a scalar, an array member that is not an object) throws `ValidationError` ([`TURBINE_E003`](/errors#e003)) naming the fix. Before 0.90 each of those applied no condition at all, which inside a relation filter or a global filter meant matching every row.
+
+**`OR: []` matches no row**, as in Prisma. `AND: []`, `NOT: {}` and `NOT: []` add no predicate. Before 0.90 `OR: []` also added no predicate and returned every row, so a list built from user selections that may be empty needs a decision about zero selections:
 
 ```ts
 const picked = selectedRoles.map((role) => ({ role }));
 const rows = await db.users.findMany({
-  // OR: [] would return every user, so say what zero selections means.
-  where: picked.length > 0 ? { OR: picked } : { id: { in: [] } }, // in: [] matches nothing
+  // Zero selections now return no users. Leave OR out to mean "any role".
+  where: picked.length > 0 ? { OR: picked } : {},
 });
 ```
 
+The same rules hold in a `groupBy` `having`, where `NOT: [a, b]` used to mean `NOT (a AND b)`; write `NOT: { AND: [a, b] }` for that meaning.
+
 ## Nested `with`
 
-Relations in a `with` clause accept their own `where`, `orderBy`, `limit`, `select` / `omit`, and nested `with`.
+Relations in a `with` clause accept their own `where`, `orderBy`, `limit` / `take`, `offset` / `skip`, `select` / `omit`, and nested `with`.
 
 ```ts
 const users = await db.users.findMany({
@@ -1059,6 +1432,8 @@ const users = await db.users.findMany({
 ```
 
 Nesting depth is capped at 10; beyond that, Turbine throws `CircularRelationError` (TURBINE_E007) with the full relation path.
+
+Pagination inside `with` applies **per parent**: `limit: 5, offset: 5` returns each user's posts 6 to 10. `take` and `skip` are aliases, folded the same way as at the top level (both spellings of one bound with different values throw). It works on the `join` and `batched` strategies alike, and on every engine. `offset` / `skip` on a to-one relation (`belongsTo`, `hasOne`) throws `TURBINE_E003`, since there is nothing to skip. Before 0.90 `skip` inside `with` was ignored.
 
 ### Counting related rows, `_count`
 
@@ -1095,7 +1470,7 @@ await db.$transaction(async (tx) => {
 });
 ```
 
-`tx` has the same typed table accessors as `db`. Nested `$transaction` calls create SAVEPOINTs automatically.
+`tx` has the same typed table accessors as `db`. Nested `$transaction` calls create SAVEPOINTs automatically. A `tx` used after its transaction settled throws `TURBINE_E003`, and a transaction PostgreSQL rolled back (a statement failed and the callback caught the error) rejects instead of reporting a commit. The [Transactions](/transactions) page has the full rules.
 
 ### Isolation levels + timeout
 
@@ -1129,7 +1504,7 @@ The `build*` methods return `DeferredQuery` objects, generated SQL + params + a 
 
 ### Non-transactional pipelines
 
-By default, pipelines run inside a transaction: any failure rolls back the batch. Opt out for error-isolated execution:
+By default, pipelines run inside a transaction: any failure rolls back the batch, and so does a transform that rejects its result (an `*OrThrow` miss, an optimistic-lock conflict). A batch that may write therefore takes two round trips, holding its `COMMIT` until every result is checked; a read-only batch takes one. Opt out for error-isolated execution:
 
 ```ts
 try {
@@ -1205,14 +1580,20 @@ const db = turbine({
 |---|---|---|
 | `poolSize` | `10` | Maximum pooled connections. pg-style alias: `max`. |
 | `idleTimeoutMs` | `30000` | Close a pooled connection after this long idle. pg-style alias: `idleTimeoutMillis`. |
-| `connectionTimeoutMs` | `5000` | Give up acquiring a connection after this long. pg-style alias: `connectionTimeoutMillis`. |
-| `preparedStatements` | `true` for Turbine-owned pools, `false` for external pools | Submit queries as `{ name, text, values }` so Postgres caches the parse and plan per backend connection. |
+| `connectionTimeoutMs` | `5000` | Give up acquiring a connection after this long, with a `ConnectionError` (`TURBINE_E004`) naming the pool size and the usual cause. pg-style alias: `connectionTimeoutMillis`. |
+| `preparedStatements` | `true` for Turbine-owned pools; `false` for external pools and for a connection that names a pooler | Submit queries as `{ name, text, values }` so Postgres caches the parse and plan per backend connection. A connection string, `host` or `port` that names a pooler (a `pooler` or `pgbouncer` host, or port 6432 or 6543) defaults to `false`; an explicit `true` there is honored with a warning, printed once per process in every mode. |
+| `statementTimeoutMs` | unset (Turbine sends nothing) | **Postgres only.** A server-side ceiling on every statement this client's connections run (`statement_timeout`), in milliseconds. A statement that runs longer is cancelled by the server and rejects with `TimeoutError` (`outcome: 'not-executed'`). It also bounds what a per-query `timeout` cannot reach, such as a stream's `FETCH`. Sent as a connection parameter on pools Turbine opens, never as a `SET`. `0` disables a timeout the server or role would apply. Must be a non-negative whole number (`TURBINE_E003`); `TURBINE_E017` on other engines. A no-op on an external pool, with a warning printed once per process. A pooler may refuse connection parameters; set it on the role there (`ALTER ROLE app SET statement_timeout = '30s'`). |
+| `streamIdleTimeoutMs` | `300000` (five minutes) | Close a cursor stream whose consumer has asked for nothing for this long, and release its connection. `0` disables. A stream call's `idleTimeoutMs` overrides it. See [Abandoned streams close themselves](#abandoned-streams-close-themselves). |
+| `sqlComment` | unset | Append [sqlcommenter](/observability#sql-comments-sqlcomment) key/values (static pairs, the model and method, the `$tag` label, per-statement values) to every statement a model call sends. |
+| `maxLifetimeSeconds` | `1800` on pools Turbine opens | Close a pooled connection once it is this old, when it is next idle, and open a fresh one on demand. Bounds what a long-lived server session accumulates and moves connections to a new server after a failover. A checked-out connection is never closed under its holder. `0` keeps connections indefinitely, the behaviour before 0.90. Ignored on an external pool, with a warning printed once per process. |
 | `sqlCache` | `true` | The per-table SQL template cache. Setting `false` is the kill switch. |
 | `sqlCacheSize` | `1000` | How many distinct query **shapes** each table's LRU retains. Values are parameterized, so they never fragment the cache. `0` is equivalent to `sqlCache: false`; a negative value falls back to the default. |
-| `implicitPkOrdering` | `false` | Order a paginating `findMany` that declares no `orderBy` by the primary key ascending, making its pages [deterministic](#deterministic-pages-the-unordered-pagination-warning). An explicit `orderBy` wins; PK-less tables and `distinct` shapes are untouched, a single-field `cursor` is ordered by its own field, and a multi-field cursor with no `orderBy` gets nothing injected. |
+| `implicitPkOrdering` | `false` | Order a paginating `findMany` that declares no `orderBy` by the primary key ascending, making its pages [deterministic](#deterministic-pages-the-unordered-pagination-warning). An explicit `orderBy` wins; PK-less tables and `distinct` shapes are untouched. A `cursor` page is [always ordered](#pagination-limit--take-offset--skip-cursor), with or without the flag. |
 | `planCacheMode` | unset (Turbine sends nothing) | **Postgres only.** Pin `plan_cache_mode` on every connection this client opens: `'auto'`, `'force_custom_plan'`, `'force_generic_plan'`. The remedy for [the generic-plan cliff](/relations#the-generic-plan-cliff-plancachemode). Any other value throws `ValidationError` at construction; a non-Postgres engine throws `UnsupportedFeatureError` (`TURBINE_E017`). |
 | `utcTimestamps` | `true` | Read and write zone-less `timestamp` / `date` columns as UTC rather than in the process's local zone. Process-wide, not per client. See [Zone-less columns](/schema#zone-less-columns-timestamp-and-date-read-as-utc). |
 | `temporalInfinity` | `'preserve'` | How a Postgres temporal `infinity` / `-infinity` is handed back: `'preserve'` (the round-trip-safe JS numbers `Infinity` / `-Infinity`, so `.toISOString()` throws on those rows) or `'null'` (serializes cleanly, but indistinguishable from a stored `NULL`). Leaving it unset selects `'preserve'` and a one-time warning the first time a stored infinity is read. See [`infinity` and `-infinity`](/schema#infinity-and--infinity). |
+| `logger` | `console` | Where Turbine's log lines go: an object with optional `debug`, `info`, `warn` and `error` methods, each called with `(message, entry)`. `{}` silences Turbine. See [Log output](/observability#log-output-logger). |
+| `diagnostics` | from `NODE_ENV`, read at construction | `'development'` or `'production'`, or an object overriding `advice` and `cacheCheck`. Decides per-query advice and the SQL-cache self-check. See [Diagnostics](/observability#diagnostics-diagnostics). |
 | `autoToOneJoinMaxRows` | `1000` | Parent-row ceiling for the [`'auto'` strategy's to-one rule](/relations#load-strategy-auto-join-batched-flatten): a `belongsTo` / `hasOne` include stays in the single-statement join when the query's `limit` bounds the parent set at or under this value, and loads batched when the query is unbounded or bounded above it. Only consulted under `'auto'`. |
 
 Where a pg-style alias exists, the explicit Turbine field wins when both are set.
@@ -1227,7 +1608,7 @@ Every key on the config object is checked against the config surface, and an unr
 [turbine] Unknown option "logParams" in the config passed to TurbineClient, it is ignored. Did you mean "logQueryParams"?
 ```
 
-The suggestion covers plain typos and a guess that leaves out a whole word (`logParams` names the same words as `logQueryParams`). It is a warning, never an error, so an app that passes an option from a newer Turbine keeps running; it fires once per key name per process and is silent under `NODE_ENV=production`. `url` and `schema` never warn, since `turbine.config.*` files carry both for the CLI.
+The suggestion covers plain typos and a guess that leaves out a whole word (`logParams` names the same words as `logQueryParams`). It is a warning, never an error, so an app that passes an option from a newer Turbine keeps running; it fires once per key name per process, through the client's [`logger`](/observability#log-output-logger) with code `unknown-config-key`. Since 0.90 it fires in production too: a misspelled option is a production hazard. `url` and `schema` never warn, since `turbine.config.*` files carry both for the CLI.
 
 <Callout type="note" title="planCacheMode: when a query gets slower on its sixth execution">
   PostgreSQL promotes a **named** prepared statement to a generic plan after
@@ -1251,9 +1632,14 @@ The suggestion covers plain typos and a guess that leaves out a whole word (`log
   transaction-pooling proxy (PgBouncer in `transaction` mode, Supabase's pooler
   port, some serverless poolers) your next query can land on a different
   backend and fail with `prepared statement "..." does not exist`. That is why
-  the default is `false` for external pools. If you point a **Turbine-owned**
-  pool at a transaction pooler, set `preparedStatements: false` yourself, or
-  set `TURBINE_DISABLE_PREPARED=1` in a deployment you cannot rebuild.
+  the default is `false` for external pools, and, since 0.90, for a
+  Turbine-owned pool whose connection names a pooler (a `pooler` or
+  `pgbouncer` host, or port 6432 or 6543). For a pooler Turbine cannot
+  recognize, set `preparedStatements: false` yourself, or set
+  `TURBINE_DISABLE_PREPARED=1` in a deployment you cannot rebuild. If your
+  pooler tracks prepared statements (PgBouncer 1.21+ with
+  `max_prepared_statements` above 0), `preparedStatements: true` turns them
+  back on.
 </Callout>
 
 <Callout type="warning" title="Named statements accumulate, and a request body can choose how many">
@@ -1285,6 +1671,13 @@ The suggestion covers plain typos and a guess that leaves out a whole word (`log
   `db.<table>.cacheStats()` is the cheap way to notice: a `hitRate` near zero on
   a query you believe is repeated means its SHAPE is varying, which is the same
   condition.
+
+  Since 0.90 the total is also capped. A process names at most 200 distinct
+  statements; every shape after that is sent unnamed, parsed per execution and
+  never kept. The first shapes a process runs, in practice its hot ones, keep
+  their names for its lifetime. Measured on one connection with 2,000 distinct
+  `where` shapes run twice each: 2,001 named statements and +29.2 MB of backend
+  memory before the cap, 200 and +2.3 MB after.
 </Callout>
 
 ## Client escape hatches
@@ -1295,8 +1688,10 @@ The suggestion covers plain typos and a guess that leaves out a whole word (`log
 | `db.pool` | `pg.Pool` | The underlying pool, for anything Turbine does not wrap. |
 | `db.schema` | `SchemaMetadata` | The metadata the client was built from. |
 | `db.stats` | `{ totalCount, idleCount, waitingCount }` | Pool gauges, suitable for a health endpoint. Returns zeros on drivers that do not expose counts, such as Neon HTTP. |
-| `db.transaction(fn)` | raw `pg.PoolClient` | The lower-level transaction API. Prefer `$transaction`; reach for this only to run hand-written SQL on the transaction's own connection. |
-| `db.disconnect()` / `db.end()` | `Promise<void>` | The same method. Both tear down live `$listen` subscriptions first, then close pools Turbine owns. Both are a **no-op for the primary pool when you supplied it yourself**, because the caller owns its lifecycle. |
+| `db.transaction(fn)` | raw `pg.PoolClient` | The lower-level transaction API. Prefer `$transaction`; reach for this only to run hand-written SQL on the transaction's own connection. The client is closed once the callback settles, and `release()` on it is refused. |
+| `db.disconnect(options?)` / `db.end(options?)` | `Promise<void>`, or `Promise<{ timedOut, forcedConnections }>` with options | The same method. Both tear down live `$listen` subscriptions first, then close pools Turbine owns. Both are a **no-op for the primary pool when you supplied it yourself**, because the caller owns its lifecycle. With `{ timeoutMs }`, connections still checked out at the deadline are cancelled and closed, and the call resolves with how many were forced. The MySQL, SQL Server and PowDB factories take the same option. |
+| `db.$ping()` | `Promise<number>` | One `SELECT 1` on the primary. Resolves with the round trip in milliseconds, for a health check. Rejects with the typed connection error when the database cannot be reached. |
+| `db.$on(event, fn)` / `db.$off(event, fn)` | `void` | Listen for `'query'` (one event per statement), `'poolError'` (an idle pooled connection failed) or `'connectionLost'` (a checked-out connection failed). The two pool events fire for pools Turbine opens. Any other name throws `TURBINE_E003`. |
 | `db.<table>.cacheStats()` | `{ size, hits, misses, hitRate }` | Per-table SQL-template cache counters. A `hitRate` near zero on a repeated query means the args are varying in shape, not just value. |
 
 ```ts
@@ -1314,9 +1709,36 @@ db.users.cacheStats();
 // returns the same instance every time.
 ```
 
+## Per-query timeout
+
+Every operation takes `timeout`, in milliseconds. It must be a positive number up to 2,147,483,647, or `0` for no timeout (the same rule `$transaction`'s `timeout` follows); anything else (a negative number, `NaN`, a string) throws `TURBINE_E003`. Before 0.90 an out-of-range value was clamped by Node to 1 ms or ignored.
+
+```ts
+import { TimeoutError } from 'turbine-orm';
+
+try {
+  await db.orders.update({ where: { id }, data: { status: 'shipped' }, timeout: 2_000 });
+} catch (err) {
+  if (err instanceof TimeoutError && err.outcome === 'not-executed') {
+    // The statement made no change: safe to retry.
+  }
+}
+```
+
+A `TimeoutError` (`TURBINE_E002`) carries `outcome`, which says whether the statement could have taken effect:
+
+- **`'not-executed'`**: it made no change. On PostgreSQL through a node-postgres pool, outside a transaction, Turbine sends the server a cancel request when the deadline passes and waits up to two seconds for the statement to answer. A confirmed cancel, a deadline that passed while still waiting for a connection, and a write that ran in its own transaction (a chunked `createMany`, a MySQL single-row write) that was rolled back all report this. A retry applies once.
+- **`'unknown'`**: the statement may still complete, so a write may have been applied. This is the answer on the other engines and on HTTP-style pools, and when the server did not confirm the cancel in time (Turbine then closes that connection instead of returning it to the pool). Check the database before retrying a write.
+
+If the statement finishes during that wait, its result is returned, late, rather than reported as a timeout: a write that committed must not invite a retry. A read changes nothing whatever `outcome` says.
+
+A write that runs several statements (a chunked `createMany`, or a MySQL write and its re-read) shares one deadline across them, so `timeout` bounds the whole call rather than each statement. When the deadline passes the write is rolled back.
+
+Inside `$transaction` on PostgreSQL the statement is cancelled on the transaction's connection and the error is `'not-executed'`, but the transaction itself is now rolled back. If the callback catches the error and returns, `$transaction` rejects with `TransactionRolledBackError` ([`TURBINE_E019`](/errors#e019)); in a nested `tx.$transaction` block, only that block rolls back. A transaction's own `timeout` is described under [Transactions](/transactions#timeouts).
+
 ## Middleware
 
-`db.$use(fn)` registers a middleware that wraps every query. It runs **after SQL generation**, so it can observe what's about to execute (`params.model`, `params.action`, `params.args`), measure timing, and transform the result returned by `next()`, but it cannot change the query itself.
+`db.$use(fn)` registers a middleware that wraps every query. It can observe what is about to run (`params.model`, `params.action`, `params.args`), measure timing, and transform the result returned by `next()`, but it cannot change the query itself: the SQL is compiled from the arguments the caller passed.
 
 ```ts
 // Query timing
@@ -1337,7 +1759,7 @@ db.$use(async (params, next) => {
 });
 ```
 
-> **Warning:** `params.args` is a read-only snapshot, mutating it does not change the executed SQL. The query is fully built and parameterized before middleware runs.
+> **Warning:** `params.args` is a plain copy of the arguments, so reading it, `JSON.stringify`, `structuredClone` and spreading it all work. Changing the copy does not change the query, which is compiled from the arguments the caller passed. If a middleware changes anything under it, or passes `next()` an args object that differs from the caller's, `next()` throws a `TypeError` naming the first path that differs, for example `params.args.where.role`. Assigning `params.args = ...` throws at once. Before 0.90 such a change was silently ignored. Passing the unchanged copy on, or a structurally equal one, still works.
 
 Because middleware cannot rewrite queries, cross-cutting filters like **soft deletes** belong in a [global filter](/global-filters), an explicit `where`, or a small scoped helper:
 
@@ -1383,6 +1805,19 @@ const stats = await db.raw<{ day: Date; count: number }>`
 ```
 
 Parameters from `${}` interpolations become `$1, $2, ...`, never string-interpolated into the SQL text.
+
+`db.raw` and `db.sql` take only a real tagged template. An array passed in its place (`db.raw([text])`) throws `ValidationError` (`TURBINE_E003`), because its text would reach the database unescaped. For SQL text built at runtime, use `rawUnsafe` with numbered placeholders:
+
+```ts
+const table = 'audit_' + year; // from your own code, never from a request
+const rows = await db.rawUnsafe(`SELECT * FROM ${table} WHERE actor_id = $1`, actorId);
+```
+
+Nothing in the text passed to `rawUnsafe` is escaped, so it must never contain untrusted input. Values go in the trailing arguments.
+
+Write placeholders as `$1`, `$2` and so on on every engine. On SQLite, MySQL and SQL Server Turbine rewrites them to the engine's own form, skipping string literals, quoted identifiers and comments. A `?` placeholder, or a `$n` past the values given, throws `TURBINE_E003`. Before 0.90 the text went through unchanged: SQLite read `$1` as a parameter named `$1`, MySQL rejected it, and SQL Server read it as a money literal. With no values the text is sent as written.
+
+On PostgreSQL, a `Date` passed to `raw`, `rawUnsafe` or `sql` binds as its UTC fields under [`utcTimestamps`](/schema#zone-less-columns-timestamp-and-date-read-as-utc), as Turbine's own queries do. An Invalid Date throws `TURBINE_E003`. Raw SQL emits a `$on('query')` event but runs no `$use` middleware.
 
 ## Typed raw SQL, `db.sql<T>`
 

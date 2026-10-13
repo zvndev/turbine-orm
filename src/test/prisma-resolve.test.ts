@@ -574,11 +574,15 @@ model Widget {
 
   it('carries uuid/now/updatedAt for db-defaultless columns only', () => {
     const res = resolvePrismaSchema(parsePrismaSchema(prisma), widgetSchema());
-    assert.deepEqual(res.map.models.Widget!.clientDefaults, {
-      id: 'uuid',
-      created_at: 'now',
-      updated_at: 'updatedAt',
-    });
+    // Spread: the resolver's records are prototype-less, and deepEqual compares prototypes.
+    assert.deepEqual(
+      { ...res.map.models.Widget!.clientDefaults },
+      {
+        id: 'uuid',
+        created_at: 'now',
+        updated_at: 'updatedAt',
+      },
+    );
   });
 
   it('omits the key entirely when a model has no client-side defaults', () => {

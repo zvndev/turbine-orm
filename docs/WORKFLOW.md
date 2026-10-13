@@ -45,17 +45,25 @@ commit that is already on a pushed branch someone else may have.
 
 ### `ci-ok` is the only required check, on purpose
 
-`ci-ok` is an aggregator job in `.github/workflows/ci.yml`. It `needs:` every
-other job and fails unless all of them succeeded. Branch protection can only
-require job names it already knows, so a hand-listed set of required contexts
-silently fails to cover new jobs. Before 2026-08-23 the protection listed
-eleven contexts and left ten jobs unrequired, including every non-Postgres
-engine and the blocking security audit.
+Every gate job is defined once, in `.github/workflows/gates.yml`, a reusable
+workflow (`on: workflow_call`). `ci.yml` calls it as its `gates` job and adds
+`ci-ok`, an aggregator that fails unless `gates` succeeded. `release.yml` calls
+the same file, so a tag runs exactly the matrix a pull request runs. The two
+copies used to drift: before 0.90.0 the release copy ran one Postgres version,
+no other engine and no error-prefix check.
 
-**When you add a CI job, add it to `ci-ok`'s `needs:` list and raise the
-anti-vacuous count in its run script to match.** The count guard exists because
-an emptied `needs` would otherwise report success while checking nothing. The
-two numbers must be equal; a test asserts it.
+Inside `gates.yml`, `gates-ok` `needs:` every gate job and fails unless all of
+them succeeded, so a failing job inside the reusable workflow fails `gates`,
+which fails `ci-ok`. Branch protection can only require job names it already
+knows, so a hand-listed set of required contexts silently fails to cover new
+jobs. Before 2026-08-23 the protection listed eleven contexts and left ten jobs
+unrequired, including every non-Postgres engine and the blocking security audit.
+
+**When you add a CI job, add it to `gates.yml`, list it in `gates-ok`'s
+`needs:`, and raise the anti-vacuous floor in `gates-ok`'s run script to
+match.** The floor exists because an emptied `needs` would otherwise report
+success while checking nothing. The two numbers must be equal; a test asserts
+it. A job added to `ci.yml` itself gates pull requests but not releases.
 
 ---
 
@@ -76,11 +84,14 @@ git tag vX.Y.Z && git push origin vX.Y.Z
 gh run watch
 ```
 
-The tag push triggers `.github/workflows/release.yml`, which runs the full gate
-chain (`test`, `integration-postgres`, `pack-smoke`, `package-types`,
-`consumer-types`, `coverage`, `error-codes`, `verify-skill`), then publishes
-with `--provenance`, creates the GitHub Release from the CHANGELOG section, and
-runs a post-publish registry smoke test.
+The tag push triggers `.github/workflows/release.yml`. It first refuses a tag
+whose commit is not on `origin/main` (`scripts/check-tag-ancestry.mjs`), then
+runs every gate through `gates.yml`. The tarball is packed once, by the `pack`
+gate, and every package gate installs that file. `publish` builds nothing and
+runs no lifecycle scripts: it checks the tested tarball's sha256, version and
+integrity, publishes it with `--provenance`, confirms the registry's integrity
+matches, creates the GitHub Release from the CHANGELOG section, and runs a
+post-publish registry smoke test.
 
 Branch protection does not apply to tags, so this works even though `main` is
 PR-only.
@@ -143,9 +154,10 @@ file it was pointed at. When you write a test or a guard:
 
 ## 4. The guard set
 
-These run in `ci.yml`, in `release.yml`, and in `prepublishOnly`. Keeping all
-three in sync is the point: `ci.yml` does not gate a tag push, and
-`prepublishOnly` does not run when the tag path publishes.
+These run in `gates.yml`, which `ci.yml` and `release.yml` both call, and in
+`prepublishOnly`. The tag path publishes the tested tarball with
+`--ignore-scripts`, so `prepublishOnly` guards only the local fallback; that is
+why every guard must also be a gate job.
 
 | Command | What it refuses |
 |---|---|

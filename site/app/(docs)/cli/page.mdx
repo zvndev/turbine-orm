@@ -83,6 +83,33 @@ Reads `information_schema` + `pg_catalog` and writes three files to the output d
 - `metadata.ts`, runtime `SchemaMetadata` constant (column maps, relations, indexes)
 - `index.ts`, typed `TurbineClient` subclass + `turbine()` factory
 
+### Column tags from the schema file
+
+The database has no column for the code-first `pii` and `updatedAt` tags, so `generate` also reads your `defineSchema()` file (`--schema-file <path>`, or `schemaFile` in the config, default `./turbine/schema.ts`) and overlays its `pii`, `updatedAt`, `maxLength` and `tsType` declarations onto the introspected schema. It prints what it applied, for example `Applied column tags from ./turbine/schema.ts: 2 pii, 1 updatedAt, 1 tsType`.
+
+```bash
+npx turbine generate --schema-file ./db/schema.ts
+```
+
+A schema file you named that is missing, a schema file that fails to load, and a `pii` or `updatedAt` tag on a table or column the database lacks all fail the command, because carrying on would generate a client that returns the columns the tags hide. Only a missing file at the default path is skipped. A `.ts` file needs `tsx` installed as a dev dependency. See [How generate picks up the tags](/schema#how-generate-picks-up-the-tags).
+
+### Typing columns, `columnTypes`
+
+A `json` / `jsonb` column generates as `unknown`. `columnTypes` in `turbine.config.ts` replaces the generated type of any column. Keys are `"<table>.<column>"` with database names:
+
+```ts
+const config: TurbineCliConfig = {
+  columnTypes: {
+    'users.settings': '{ theme: string; beta?: boolean }',
+    'orders.meta': "import('../src/types.js').OrderMeta",
+  },
+};
+```
+
+The type replaces the column's row, create and update types. Its text is emitted verbatim, so an `import()` type resolves from the generated directory, and `| null` is still added for a nullable column. A value must be one TypeScript type on one line, by the same rule as [`tsType`](/schema#typing-a-json-column-tstype). A key naming no table or column, a key not in `table.column` form, or a value that is not one type throws `ValidationError` (`TURBINE_E003`) with the closest name. A key for a table that `include` / `exclude` leaves out is skipped, but only when the database has that table: with `include` set, a misspelt table name is still refused with a suggestion, at the cost of one extra catalog read.
+
+A schema file can declare the same thing next to the column with [`tsType`](/schema#typing-a-json-column-tstype). When both name one column, `columnTypes` wins.
+
 ### `--zod`
 
 Emit a fourth file, `zod.ts`, with a Zod schema per table (`XSchema`, `XCreateSchema`, `XUpdateSchema`). The generated file imports the user-side `zod` dependency; the Turbine runtime never does.
@@ -127,9 +154,12 @@ Controls the extension on the sibling imports between the generated files (`type
 
 ```bash
 npx turbine generate --import-ext js     # './types.js'  (NodeNext / ESM resolution)
+npx turbine generate --import-ext ts     # './types.ts'  (Node type stripping)
 npx turbine generate --import-ext none   # './types'     (bundler / classic resolution)
 npx turbine generate --import-ext auto   # detect from tsconfig (default)
 ```
+
+`ts` is for running the generated client directly with Node's type stripping (`node app.ts` on Node 22.18+ or 23.6+; earlier 22.x releases need `--experimental-strip-types`). A type checker then needs `allowImportingTsExtensions` or `rewriteRelativeImportExtensions` in `tsconfig.json`. The config key is `importExtension: 'ts'`.
 
 `auto` walks up from the output directory to the nearest `tsconfig.json` and picks the spelling its module resolution requires. Set it explicitly if your build resolves differently.
 
@@ -175,11 +205,16 @@ export default {
 Apply your `defineSchema()` output directly to the database. The fast path for local development.
 
 ```bash
-npx turbine push              # Apply schema changes
-npx turbine push --dry-run    # Preview generated SQL without executing
+npx turbine push                         # Apply schema changes
+npx turbine push --dry-run               # Preview generated SQL without executing
+npx turbine push --dry-run --exit-code   # CI: exit 2 when the database differs, 0 when in sync
 ```
 
+`--exit-code` also exits 2 when the diff carries a warning it cannot apply, such as a declared `UNIQUE` index over a non-unique index of the same name, a removed enum label, or an undeclared index on a table that manages its indexes. Two things stay at 0: what the diff says it does not compare, and a named `CHECK` whose stored text differs only because PostgreSQL rewrites the expression it was given (the warning is still printed).
+
 `push` diffs `turbine/schema.ts` against the live database and executes the difference as a single transaction. Safe to re-run: it is a no-op when the schema already matches. For production deploys, use migrations instead.
+
+`push` reports "already in sync" only when the diff has nothing left to say; otherwise it lists what the diff does not compare (see [Migrations in Practice](/migrate#what---auto-can-and-cannot-do)).
 
 `push` runs the same destructive scanner as `migrate up`. If the diff contains a data-destroying statement (`DROP TABLE` / `DROP COLUMN`, a lossy `ALTER COLUMN … TYPE`, and similar), `push` refuses to run, prints an itemized report, and applies nothing. To proceed, confirm interactively (type `destroy my data`, then `yes`) or pass `--allow-destructive`:
 
@@ -202,7 +237,9 @@ npx turbine migrate create add_email_index --auto
 npx turbine migrate create sync_schema --from-diff
 ```
 
-Writes `turbine/migrations/<timestamp>_<name>.sql` with `-- UP` and `-- DOWN` sections. Auto mode populates both sections from the schema diff. Blank mode gives you empty sections to fill in.
+Writes `turbine/migrations/<timestamp>_<name>.sql` with `-- UP` and `-- DOWN` sections; the timestamp is UTC. Auto mode populates both sections from the schema diff. Blank mode gives you empty sections to fill in.
+
+`--auto` and `--from-diff` refuse while migrations in the folder are pending, because the diff reads the live database and would repeat what those files do. Apply them first, or pass `--allow-pending` when they do not touch what the schema file describes.
 
 ### `--from-diff`
 
@@ -240,11 +277,13 @@ npx turbine migrate up
 npx turbine migrate up --dry-run
 ```
 
+`migrate up`, `migrate deploy` and `migrate down` refuse a transaction-pooler connection string (a `pooler` or `pgbouncer` hostname, or port 6543 or 6432) before they connect, and exit 1. The advisory lock is session-level, so through a pooler it can be taken on one backend and released on another. Point them at the direct endpoint, or pass `--allow-pooler` to override. `--dry-run`, `migrate status` and `migrate create` are not refused.
+
 Checks for checksum mismatches before applying: if a previously-applied migration file has been edited, the command halts and reports the conflict. Pass `--allow-drift` to bypass that check when you are intentionally rewriting history. Use `--step N` to apply only the first `N` pending migrations.
 
 ### Destructive-migration guard
 
-`migrate up` and `migrate down` scan the SQL they are about to run for statements that destroy data (`DROP TABLE`, `DROP SCHEMA`, `DROP COLUMN`, `TRUNCATE`, `DELETE FROM`, `UPDATE` without a `WHERE`, `ALTER COLUMN … TYPE`). Comments and string literals are ignored; structure-only drops (`DROP INDEX`, `DROP CONSTRAINT`, `DROP TRIGGER`) are not flagged.
+`migrate up` and `migrate down` scan the SQL they are about to run for statements that destroy data (`DROP TABLE`, `DROP SCHEMA`, `DROP COLUMN`, `DROP VIEW ... CASCADE`, `TRUNCATE`, `DELETE FROM`, an `UPDATE` without a `WHERE` or with one that is always true such as `WHERE 1=1`, `ON CONFLICT DO UPDATE` without a `WHERE`, `lo_unlink`, the same shapes inside a `PREPARE ... AS` body, and `ALTER COLUMN … TYPE`). A lossless widening carrying a matching `-- turbine:widening` marker is not flagged. Comments and string literals are ignored; structure-only drops (`DROP INDEX`, `DROP CONSTRAINT`, `DROP TRIGGER`) are not flagged.
 
 On a hit, Turbine refuses to run anything and prints an itemized report. To proceed, confirm interactively (type the literal phrase `destroy my data`, then `yes`) or pass `--allow-destructive` (required in CI and other non-interactive shells). Programmatic callers of `migrateUp`/`migrateDown` opt in with `allowDestructive: true`.
 
@@ -255,7 +294,11 @@ Apply pending migrations non-interactively, the command for CI/CD and production
 ```bash
 npx turbine migrate deploy
 npx turbine migrate deploy --dry-run   # list pending migrations without applying
+npx turbine migrate deploy --wait      # wait up to 300 s for a concurrent deploy's lock
+npx turbine migrate deploy --wait=120  # ... or up to 120 s
 ```
+
+Without `--wait`, a deploy that finds the advisory lock held by another run fails (exit 1). With it, the deploy waits for the lock, then applies whatever is still pending, which is usually nothing.
 
 `deploy` uses the same advisory-lock and per-migration-transaction machinery as `migrate up`. It applies files as written: the destructive guard runs when you author a migration, not at deploy time. Before applying anything destructive, it prints a one-line NOTICE listing the statements, then proceeds.
 
@@ -276,7 +319,7 @@ npx turbine migrate down            # roll back the last migration
 npx turbine migrate down --step 2   # roll back the last 2 migrations
 ```
 
-Pass `--step N` (or `-n N`) to roll back the last `N` applied migrations. A `-- DOWN` that drops a column is destructive and hits the same [destructive gate](#destructive-migration-guard) as `migrate up`.
+Pass `--step N` (or `-n N`) to roll back the last `N` applied migrations. A `-- DOWN` that drops a column is destructive and hits the same [destructive gate](#destructive-migration-guard) as `migrate up`. A `-- DOWN` that ran no SQL (only comments, such as an `IRREVERSIBLE` note) is reported with a warning.
 
 ## `turbine migrate status`
 
@@ -284,6 +327,7 @@ Show which migrations have been applied and which are pending.
 
 ```bash
 npx turbine migrate status
+npx turbine migrate status --exit-code   # CI: exit 2 on pending, modified, missing or misnamed migrations
 ```
 
 Example output:
@@ -350,7 +394,7 @@ npx turbine doctor --json
 
 Turbine loads `with` relations as correlated subqueries: the child table is probed once per parent row (`child.fk = parent.pk`). An unindexed probe column therefore costs a full table scan per parent. Schemas migrated from batched-loader ORMs routinely lack these indexes. `doctor` introspects the database, derives every column set relations will probe (hasMany/hasOne child FKs, belongsTo reference keys, many-to-many junction keys), and reads live Postgres statistics to score each finding.
 
-`doctor` reads session-scoped statistics, so it refuses a transaction-pooler endpoint (a `pooler`/`pgbouncer` hostname or a known pooling port; exit 1). Point it at the direct endpoint, or pass `--allow-pooler` to override.
+`doctor` reads session-scoped statistics, so it refuses a transaction-pooler endpoint (a `pooler`/`pgbouncer` hostname or a known pooling port; exit 1). Point it at the direct endpoint, or pass `--allow-pooler` to override. The migration commands that take the advisory lock refuse the same endpoints, see [`migrate up`](#turbine-migrate-up).
 
 ### Three-tier triage
 
@@ -477,9 +521,9 @@ The report prints how many columns were scored, split by indexed and unindexed, 
 - Each divergence finding carries a `branch` (`'sparse-value'` or `'unindexed-filter'`), and branch-shaped fields are optional rather than zero-filled: `crossoverRows`, `crossoverRowsWide`, `valuesBelowCrossover`, `walkPages`, `walkFraction` and `approxAmplification` are absent on an `unindexed-filter` finding; `tuplesWalked`, `worstCaseAmplification`, `orderColumnCorrelation` and `heapNearlyOrdered` are present only there. Branch on `branch`.
 - The `unused`, `redundant`, `audit`, and `invalid` arrays are always present (empty when the scan did not run), and a `subtraction` object reports which scans ran (`unusedRan`, `auditRan`, `minScans`), so the key set never varies by flag. Each unused-index entry carries a structured `shape` (`kinds`, `accessMethod`, `definition`) alongside the `caveat` string.
 
-### Dev-mode warning
+### Runtime warning
 
-In non-production (`NODE_ENV !== 'production'`), the first query that builds a relation subquery over an unindexed FK logs a one-time warning naming the relation, the table and columns, and the exact `CREATE INDEX` statement. It only fires when the schema metadata carries index information (introspected or generated clients), so `defineSchema`-only setups see no false positives.
+While the client's [`diagnostics`](/observability#diagnostics-diagnostics) advice is on (the default outside `NODE_ENV=production`), the first query that builds a relation subquery over an unindexed FK logs a one-time warning naming the relation, the table and columns, and the exact `CREATE INDEX` statement. It goes through the client's `logger` at `warn` level with code `unindexed-relation`. It only fires when the schema metadata carries index information (introspected or generated clients), so `defineSchema`-only setups see no false positives.
 
 ## `turbine migrate-from-prisma`
 
@@ -533,7 +577,7 @@ A stale `prisma-map.ts` fails silently: the adapter goes on translating the name
 
 `--if-db` is what makes that safe: an `npm ci` in a build image with no `DATABASE_URL` prints one line and exits 0 instead of failing the install.
 
-The emitted map also records a fingerprint of the `schema.prisma` it was generated from, and `createPrismaCompatClient` warns once at startup, in development only, when the file on disk no longer matches. See [Keeping the map current](/migrate-from-prisma#keeping-the-map-current).
+The emitted map also records a fingerprint of the `schema.prisma` it was generated from, and `createPrismaCompatClient` warns once at startup, in production too, when the file on disk no longer matches. See [Keeping the map current](/migrate-from-prisma#keeping-the-map-current).
 
 ### The `--out` directory guard
 
@@ -627,6 +671,7 @@ const config: TurbineCliConfig = {
   migrationsDir: './turbine/migrations',
   seedFile: './turbine/seed.ts',
   schemaFile: './turbine/schema.ts',
+  columnTypes: { 'users.settings': '{ theme: string }' },
 };
 
 export default config;

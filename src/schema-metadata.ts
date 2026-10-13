@@ -210,6 +210,39 @@ function mapIndexes(tableDef: TableDef, declared: readonly SchemaIndexDef[] | un
 }
 
 // ---------------------------------------------------------------------------
+// Code-first column tags (pii, updatedAt, maxLength, tsType)
+// ---------------------------------------------------------------------------
+
+/** The code-first-only flags a column can declare. */
+export interface CodeFirstColumnTags {
+  pii?: true;
+  updatedAt?: true;
+  maxLength?: number;
+  /**
+   * The declared TypeScript type, WITHOUT nullability. On metadata built by
+   * {@link schemaDefToMetadata} it is the column's `declaredTsType`, never its
+   * `tsType`; `turbine generate` passes it to the generator as a `columnTypes`
+   * entry.
+   */
+  tsType?: string;
+}
+
+/**
+ * The tags a column declares, as the fields they take on {@link ColumnMetadata}.
+ * The one place the tag set is listed, so `schemaDefToMetadata` and the CLI's
+ * overlay of these tags onto an introspected schema (`cli/code-first-tags.ts`)
+ * cannot disagree about what counts as one.
+ */
+export function declaredTagsOf(config: ColumnConfig): CodeFirstColumnTags {
+  return {
+    ...(config.pii ? { pii: true as const } : {}),
+    ...(config.updatedAt ? { updatedAt: true as const } : {}),
+    ...(config.maxLength != null ? { maxLength: config.maxLength } : {}),
+    ...(config.tsType != null ? { tsType: config.tsType } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // The converter
 // ---------------------------------------------------------------------------
 
@@ -400,23 +433,30 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
       // PK members and serials are NOT NULL in Postgres regardless of flags.
       const nullable = !(config.isPrimaryKey || config.isNotNull || serial);
 
+      const { tsType: declaredTsType, ...declaredTags } = declaredTagsOf(config);
       const col: ColumnMetadata = {
         name,
         field,
         dialectType: wireType,
         pgType: wireType,
-        tsType: pgTypeToTs(wireType, nullable),
         nullable,
         hasDefault: config.defaultValue != null || serial,
+        // The expression itself, as written in the schema (`now()`, `'draft'`).
+        // Engines with no column defaults (PowDB) apply it client-side on
+        // create, which they cannot do from `hasDefault` alone.
+        ...(config.defaultValue != null ? { defaultValue: config.defaultValue } : {}),
         isArray: config.isArray,
         arrayType: pgArrayType(base),
         pgArrayType: pgArrayType(base),
         ...(serial ? { isGenerated: true } : {}),
-        // PII is a code-first declaration; carry it through so query-layer
-        // default-projection exclusion and Studio redaction can honor it.
-        // Only set when true, keeping output byte-stable for untagged schemas.
-        ...(config.pii ? { pii: true } : {}),
-        ...(config.maxLength != null ? { maxLength: config.maxLength } : {}),
+        // PII, updatedAt and maxLength are code-first declarations; carry them
+        // through so query-layer projection, the updatedAt stamp and Studio
+        // redaction can honor them. Only set when declared, keeping output
+        // byte-stable for untagged schemas.
+        ...declaredTags,
+        // Always the mapped type. A declared `tsType` rides along separately.
+        tsType: pgTypeToTs(wireType, nullable),
+        ...(declaredTsType !== undefined ? { declaredTsType } : {}),
       };
       columns.push(col);
 
@@ -446,7 +486,7 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
       allColumns,
       primaryKey: pk,
       uniqueColumns,
-      relations: relationsByTable.get(tableDef.name) ?? {},
+      relations: { ...relationsByTable.get(tableDef.name) },
       // Declared `indexes` (plain column + doc-field expression) carry through;
       // an undeclared table gets `[]`, which keeps schemaHasIndexInfo() false so
       // the index advisor stays silent. Doc-field (docPath) indexes are ignored

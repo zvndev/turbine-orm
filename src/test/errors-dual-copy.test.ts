@@ -45,11 +45,14 @@ const CONSTRUCT: Record<string, (m: ErrorsModule) => Error> = {
   CheckConstraintError: (m) => new m.CheckConstraintError(),
   DeadlockError: (m) => new m.DeadlockError(),
   SerializationFailureError: (m) => new m.SerializationFailureError(),
+  LockNotAvailableError: (m) => new m.LockNotAvailableError(),
   PipelineError: (m) => new m.PipelineError({ results: [{ status: 'error', error: new Error('e') }] }),
   OptimisticLockError: (m) => new m.OptimisticLockError({ table: 't', versionField: 'v', expectedVersion: 1 }),
   ExclusionConstraintError: (m) => new m.ExclusionConstraintError(),
   UnsupportedFeatureError: (m) => new m.UnsupportedFeatureError('vector', 'sqlite'),
   ReadOnlyError: (m) => new m.ReadOnlyError('refused.'),
+  TransactionRolledBackError: (m) => new m.TransactionRolledBackError('rolled back.'),
+  InvariantError: (m) => new m.InvariantError('probe', 'two internal paths disagreed.'),
 };
 
 /** Every exported class that is TurbineError or extends it, in export order. */
@@ -78,8 +81,8 @@ describe('errors module, two copies loaded', () => {
   });
 
   it('anti-vacuous: the enumeration found every class and every class has a constructor entry', () => {
-    // 19 = TurbineError plus the 18 coded classes; a new class raises this.
-    assert.ok(classes2.length >= 19, `expected at least 19 error classes, enumerated ${classes2.length}`);
+    // 20 = TurbineError plus the 19 coded classes; a new class raises this.
+    assert.ok(classes2.length >= 20, `expected at least 20 error classes, enumerated ${classes2.length}`);
     const names = classes2.map(([name]) => name);
     for (const name of names) {
       assert.ok(Object.hasOwn(CONSTRUCT, name), `add a CONSTRUCT entry for the exported error class ${name}`);
@@ -110,8 +113,16 @@ describe('errors module, two copies loaded', () => {
     for (const [name] of classes2) {
       if (name === 'TurbineError') continue;
       const err = CONSTRUCT[name]!(copy2);
+      const own1 = (copy1 as unknown as Record<string, ErrorClass>)[name]!;
       for (const [otherName, other1] of errorClassesOf(copy1)) {
         if (otherName === name || otherName === 'TurbineError') continue;
+        // A declared subclass is an instance of its parent
+        // (LockNotAvailableError is a SerializationFailureError); the reverse
+        // direction stays asserted below.
+        if (Object.prototype.isPrototypeOf.call(other1.prototype, own1.prototype)) {
+          assert.equal(err instanceof other1, true, `${name} must be instanceof its parent ${otherName}`);
+          continue;
+        }
         assert.equal(err instanceof other1, false, `${name} must not be instanceof ${otherName}`);
       }
     }

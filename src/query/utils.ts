@@ -6,6 +6,7 @@
 
 import pg from '#pg';
 import { ValidationError } from '../errors.js';
+import { consoleLogger, logTo, type TurbineLogger } from '../logger.js';
 import { camelToSnake, localDateTimeKind, snakeToCamel, timeOfDayKind } from '../schema.js';
 import { shouldWarnOnce, WARN_NS } from './warn-registry.js';
 
@@ -275,9 +276,16 @@ export function canonicalWriteEntries(meta: ColumnNameSource, entries: [string, 
  */
 export const INTERNAL_COMBINATOR = Symbol.for('turbine.internalCombinator');
 
+/** Shared by every brand: a frozen descriptor saves an allocation per branded where. */
+const INTERNAL_COMBINATOR_DESCRIPTOR: PropertyDescriptor = Object.freeze({
+  value: true,
+  enumerable: false,
+  configurable: true,
+});
+
 /** Tag `where` as carrying a Turbine-synthesized combinator, and return it. */
 export function markInternalCombinator<T extends object>(where: T): T {
-  Object.defineProperty(where, INTERNAL_COMBINATOR, { value: true, enumerable: false, configurable: true });
+  Object.defineProperty(where, INTERNAL_COMBINATOR, INTERNAL_COMBINATOR_DESCRIPTOR);
   return where;
 }
 
@@ -296,12 +304,18 @@ export function escSingleQuote(s: string): string {
   return s.replace(/'/g, "''");
 }
 
+const LIKE_META = /[\\%_]/;
+const LIKE_META_G = /[\\%_]/g;
+
 /**
  * Escape LIKE pattern metacharacters: %, _, and \.
  * Must be used with `ESCAPE '\'` in the LIKE clause.
  */
 export function escapeLike(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+  // One pass, and none at all for the common operand with no metacharacter.
+  // Identical output to escaping `\` then `%` then `_` in turn: the backslashes
+  // the first step adds are never `%` or `_`, so the steps never interact.
+  return LIKE_META.test(value) ? value.replace(LIKE_META_G, '\\$&') : value;
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +394,14 @@ export interface SqlCacheEntry {
    * a warmed template cannot regain one. See `buildCacheEntry` in builder.ts.
    */
   name: string;
+  /**
+   * How many params the build pushed, i.e. the statement's placeholder count.
+   * A cache hit whose collect path produces a different count is refused with
+   * an InvariantError before anything is sent. Optional so an entry built
+   * outside the cache (a test fixture) still type-checks; such an entry skips
+   * the count check.
+   */
+  paramCount?: number;
 }
 
 /**
@@ -410,6 +432,340 @@ export function fnv1a64Hex(s: string): string {
  */
 export function sqlToPreparedName(sql: string): string {
   return `t_${fnv1a64Hex(sql)}`;
+}
+
+/**
+ * How many distinct statement names one process hands out. Every connection
+ * keeps each named statement it has prepared, at 9 to 45 KB of server memory
+ * apiece, until the connection closes, so the number of names is what bounds
+ * that memory. A statement past the budget is sent unnamed: parsed on every
+ * execution and never kept, which costs a few microseconds on a cheap query.
+ */
+export const PREPARED_STATEMENT_BUDGET = 200;
+
+/** `Symbol.for` so the ESM and CJS copies of this module share one budget. */
+const PREPARED_NAMES = Symbol.for('turbine.preparedStatementNames');
+
+function preparedNames(): Set<string> {
+  const holder = globalThis as { [PREPARED_NAMES]?: Set<string> };
+  let names = holder[PREPARED_NAMES];
+  if (!names) {
+    names = new Set();
+    holder[PREPARED_NAMES] = names;
+  }
+  return names;
+}
+
+/**
+ * The prepared-statement name for `sql`, or `''` (send it unnamed) once the
+ * process has named {@link PREPARED_STATEMENT_BUDGET} other statements.
+ *
+ * The first shapes a process runs keep their names for its lifetime, which in
+ * practice are its hot shapes. A server-side `DEALLOCATE` cannot replace this:
+ * a pooled query does not know which connection it will run on, and a
+ * connection keeps every name it ever prepared.
+ */
+export function boundedPreparedName(sql: string): string {
+  return claimPreparedName(sqlToPreparedName(sql));
+}
+
+/**
+ * Claim an already derived statement name from the same budget as
+ * {@link boundedPreparedName}: `name` itself, or `''` (send it unnamed) once
+ * the budget is spent. `sqlComment`'s `c_` names (query/sql-comment.ts) are
+ * claimed here, so a commented statement costs one slot like any other.
+ */
+export function claimPreparedName(name: string): string {
+  const names = preparedNames();
+  if (names.has(name)) return name;
+  if (names.size >= PREPARED_STATEMENT_BUDGET) return '';
+  names.add(name);
+  return name;
+}
+
+/** @internal Tests only: forget every name handed out. */
+export function resetPreparedNameBudget(): void {
+  preparedNames().clear();
+}
+
+/** The `params` object a middleware receives. */
+export interface MiddlewareParams {
+  model: string;
+  action: string;
+  args: Record<string, unknown>;
+}
+
+function argsRewriteError(model: string, action: string, path: string): TypeError {
+  return new TypeError(
+    `[turbine] middleware cannot change \`params.${path}\` on ${model}.${action}: the query is compiled from the ` +
+      'arguments the caller passed, so a change made in middleware would not reliably reach it. Put the ' +
+      'condition in the query itself, or use `globalFilters` for a filter that applies to every query.',
+  );
+}
+
+/** Plain objects and arrays are copied; a Date, Buffer, class instance or other value is shared as it is. */
+function isPlainContainer(value: unknown): value is object {
+  if (value === null || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return true;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/** Nesting past this is shared, not copied, so a cyclic object cannot recurse without end. */
+const MIDDLEWARE_ARGS_MAX_DEPTH = 100;
+
+/**
+ * A copy of `value` that middleware may read, spread, serialize or
+ * `structuredClone`: plain objects and arrays are copied at every depth, and
+ * everything else (Date, Buffer, bigint, symbol, class instance) is shared.
+ * Symbol-keyed properties are copied by descriptor, so the markers the
+ * pipeline reads (the internal-combinator brand, the inclusive-cursor flag,
+ * column and expression brands) are on the copy exactly as on the original,
+ * non-enumerable ones included.
+ */
+function copyArgs(value: unknown, depth: number): unknown {
+  if (depth > MIDDLEWARE_ARGS_MAX_DEPTH || !isPlainContainer(value)) return value;
+  let out: Record<PropertyKey, unknown>;
+  if (Array.isArray(value)) {
+    const items: unknown[] = new Array(value.length);
+    // A long list of ids is the common big argument; keep its scalars off the call path.
+    for (let i = 0; i < value.length; i++) {
+      const item: unknown = value[i];
+      items[i] = item !== null && typeof item === 'object' ? copyArgs(item, depth + 1) : item;
+    }
+    out = items as unknown as Record<PropertyKey, unknown>;
+  } else {
+    out = Object.getPrototypeOf(value) === null ? Object.create(null) : {};
+    for (const key of Object.keys(value)) {
+      const item = (value as Record<string, unknown>)[key];
+      const copied = item !== null && typeof item === 'object' ? copyArgs(item, depth + 1) : item;
+      // `__proto__` from JSON.parse is an own key; assigning it would set the prototype.
+      if (key === '__proto__')
+        Object.defineProperty(out, key, { value: copied, enumerable: true, writable: true, configurable: true });
+      else out[key] = copied;
+    }
+  }
+  for (const sym of Object.getOwnPropertySymbols(value)) {
+    Object.defineProperty(out, sym, Object.getOwnPropertyDescriptor(value, sym) as PropertyDescriptor);
+  }
+  return out;
+}
+
+/**
+ * Where `b` first differs from `a`, as a path suffix (`.where.id`, or `''` for
+ * the values themselves), or undefined when they are structurally equal. The
+ * suffix is built on the way back out, so an equal pair costs no string work.
+ */
+function argsDifference(a: unknown, b: unknown, depth: number): string | undefined {
+  if (Object.is(a, b)) return undefined;
+  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return '';
+  if (a instanceof Date || b instanceof Date) {
+    return a instanceof Date && b instanceof Date && Object.is(a.getTime(), b.getTime()) ? undefined : '';
+  }
+  if (ArrayBuffer.isView(a) || ArrayBuffer.isView(b)) {
+    if (!(ArrayBuffer.isView(a) && ArrayBuffer.isView(b)) || a.byteLength !== b.byteLength) return '';
+    const x = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+    const y = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return '';
+    return undefined;
+  }
+  if (a instanceof RegExp || b instanceof RegExp) return String(a) === String(b) ? undefined : '';
+  if (a instanceof Map || a instanceof Set || b instanceof Map || b instanceof Set) return '';
+  if (Array.isArray(a) !== Array.isArray(b) || depth > MIDDLEWARE_ARGS_MAX_DEPTH) return '';
+  if (Array.isArray(a)) {
+    const other = b as unknown[];
+    const shared = Math.min(a.length, other.length);
+    for (let i = 0; i < shared; i++) {
+      if (Object.is(a[i], other[i])) continue;
+      const inner = argsDifference(a[i], other[i], depth + 1);
+      if (inner !== undefined) return `.${i}${inner}`;
+    }
+    return a.length === other.length ? undefined : `.${shared}`;
+  }
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  for (const key of Object.keys(left)) {
+    if (!Object.hasOwn(right, key)) return `.${key}`;
+    const inner = argsDifference(left[key], right[key], depth + 1);
+    if (inner !== undefined) return `.${key}${inner}`;
+  }
+  for (const key of Object.keys(right)) if (!Object.hasOwn(left, key)) return `.${key}`;
+  return undefined;
+}
+
+/** What {@link readOnlyMiddlewareParams} remembers about the `params` it handed out. */
+interface MiddlewareArgsState {
+  readonly model: string;
+  readonly action: string;
+  /** The caller's args: what the query is compiled from. */
+  readonly original: Record<string, unknown>;
+  /** The copy middleware reads, made on the first read of `params.args`. */
+  copy: Record<string, unknown> | undefined;
+}
+
+const MIDDLEWARE_ARGS = new WeakMap<object, MiddlewareArgsState>();
+
+/** The key Node's `util.inspect` looks for, from the global registry so no `node:` import is needed. */
+const NODE_INSPECT = Symbol.for('nodejs.util.inspect.custom');
+
+/** Makes `console.log(params)` show the values rather than an accessor. Not own, so a spread of `params` never carries it. */
+const MIDDLEWARE_PARAMS_PROTOTYPE = Object.defineProperty({}, NODE_INSPECT, {
+  value(
+    this: MiddlewareParams,
+    _depth: number,
+    options: unknown,
+    inspect: (value: unknown, options?: unknown) => string,
+  ) {
+    return inspect({ model: this.model, action: this.action, args: this.args }, options);
+  },
+});
+
+/**
+ * The `params` a middleware receives. `params.args` is a plain copy of the
+ * caller's args, made when it is first read, so middleware can read it, spread
+ * it, serialize it and `structuredClone` it, and one that never reads it pays
+ * nothing.
+ *
+ * It is a copy because the query is compiled from the caller's args, not from
+ * what middleware sees. A change to the copy would never reach the query, so
+ * {@link assertMiddlewareArgsKept} refuses it, naming the path, when the
+ * middleware calls `next`. That check compares contents, which is why the copy
+ * is not frozen: a frozen object ignores a write silently in a script that is
+ * not in strict mode, and a filter added there would be dropped without a word.
+ * Assigning to `params.args` itself throws at once.
+ */
+export function readOnlyMiddlewareParams(
+  model: string,
+  action: string,
+  args: Record<string, unknown>,
+): MiddlewareParams {
+  const state: MiddlewareArgsState = { model, action, original: args, copy: undefined };
+  const params: MiddlewareParams = {
+    __proto__: MIDDLEWARE_PARAMS_PROTOTYPE,
+    model,
+    action,
+    get args(): Record<string, unknown> {
+      if (state.copy === undefined) state.copy = copyArgs(args, 0) as Record<string, unknown>;
+      return state.copy;
+    },
+    set args(_replacement: Record<string, unknown>) {
+      throw argsRewriteError(model, action, 'args');
+    },
+  } as MiddlewareParams;
+  MIDDLEWARE_ARGS.set(params, state);
+  return params;
+}
+
+/**
+ * Refuse a `next(p)` whose `p.args` is not the caller's args: one that
+ * middleware changed in place, or replaced with an object that differs from
+ * them. A copy that is structurally equal passes (`structuredClone(params.args)`,
+ * `{ ...params.args }`), because nothing it would change is lost. Throws a
+ * TypeError naming the first path that differs.
+ */
+export function assertMiddlewareArgsKept(handedOut: MiddlewareParams, passed: { args?: unknown } | undefined): void {
+  const state = MIDDLEWARE_ARGS.get(handedOut) as MiddlewareArgsState;
+  if (passed === handedOut) {
+    if (handedOut.model !== state.model) throw argsRewriteError(state.model, state.action, 'model');
+    if (handedOut.action !== state.action) throw argsRewriteError(state.model, state.action, 'action');
+    // Nothing has read the args, so nothing could have changed them.
+    if (state.copy === undefined) return;
+  }
+  const given = passed?.args;
+  if (given === state.original) return;
+  const changed = argsDifference(state.original, given, 0);
+  if (changed !== undefined) throw argsRewriteError(state.model, state.action, `args${changed}`);
+}
+
+/** The fields of a connected node-postgres client a cancel request needs. */
+interface CancelTarget {
+  processID?: unknown;
+  secretKey?: unknown;
+  host?: unknown;
+  port?: unknown;
+  ssl?: unknown;
+  sslNegotiation?: unknown;
+}
+
+/** The part of node-postgres' `Connection` a cancel request uses. */
+interface CancelConnection {
+  on(event: string, listener: (...args: unknown[]) => void): unknown;
+  connect(portOrPath: number | string, host?: string): void;
+  requestSsl(): void;
+  cancel(processID: number, secretKey: number): void;
+  stream?: { destroy?(): void };
+}
+
+/** Whether `pool` is a node-postgres `Pool`, whose checkouts are real backend connections. */
+export function isNodePostgresPool(pool: unknown): boolean {
+  const Pool = (pg as { Pool?: unknown }).Pool;
+  return typeof Pool === 'function' && pool instanceof (Pool as new (...args: never[]) => object);
+}
+
+/** Whether `client` is a node-postgres connection a cancel request can reach. */
+export function canCancelBackend(client: unknown): boolean {
+  const c = client as CancelTarget | null;
+  return (
+    typeof (pg as { Connection?: unknown }).Connection === 'function' &&
+    !!c &&
+    typeof c.processID === 'number' &&
+    typeof c.secretKey === 'number' &&
+    (typeof c.port === 'number' || typeof c.port === 'string')
+  );
+}
+
+/**
+ * Ask the server to cancel whatever `client`'s backend is running, with the
+ * protocol's CancelRequest: a separate short connection carrying the backend's
+ * process id and secret key. No login, no session state, and a pooler forwards
+ * it to the right server backend, which `pg_cancel_backend(pid)` through a
+ * pooler would not.
+ *
+ * Resolves `true` once the server has closed the cancel connection, i.e. has
+ * signalled the backend; `false` when the request could not be delivered
+ * within `waitMs`. A cancel that arrives after the statement finished is
+ * ignored by the server.
+ */
+export function sendCancelRequest(client: unknown, waitMs: number): Promise<boolean> {
+  if (!canCancelBackend(client)) return Promise.resolve(false);
+  const target = client as CancelTarget;
+  const Connection = (pg as unknown as { Connection: new (options: object) => CancelConnection }).Connection;
+  return new Promise((resolve) => {
+    let con: CancelConnection | undefined;
+    let sent = false;
+    let done = false;
+    const finish = (delivered: boolean): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try {
+        con?.stream?.destroy?.();
+      } catch {
+        // already closed
+      }
+      resolve(delivered);
+    };
+    const timer = setTimeout(() => finish(false), waitMs);
+    try {
+      con = new Connection({ ssl: target.ssl, sslNegotiation: target.sslNegotiation });
+      const send = (): void => {
+        sent = true;
+        con?.cancel(target.processID as number, target.secretKey as number);
+      };
+      con.on('error', () => finish(false));
+      con.on('end', () => finish(sent));
+      con.on('connect', () => {
+        if (!target.ssl) send();
+        else if (target.sslNegotiation !== 'direct') con?.requestSsl();
+      });
+      con.on('sslconnect', send);
+      const host = typeof target.host === 'string' ? target.host : undefined;
+      if (host?.startsWith('/')) con.connect(`${host}/.s.PGSQL.${String(target.port)}`);
+      else con.connect(target.port as number, host);
+    } catch {
+      finish(false);
+    }
+  });
 }
 
 /** Known operator keys, used to detect operator objects vs plain values */
@@ -585,6 +941,13 @@ const TZ_SUFFIX_RE = /(?:Z|[+-]\d{2}(?::?\d{2})?)$/;
  * as-is.
  */
 export function parseDbDate(value: string): Date {
+  const date = parseDbDateCommon(value);
+  // The shapes JS cannot parse (a BC year, an offset with seconds, a year past
+  // 9999) come out invalid; only those pay for the general parse.
+  return Number.isNaN(date.getTime()) ? (parseDbDateGeneral(value) ?? date) : date;
+}
+
+function parseDbDateCommon(value: string): Date {
   // Date-only values (`2026-07-07`, from `date` columns in json_agg output)
   // have no time to zone-pin, and their `-07` tail must not be read as an
   // offset. JS parses bare ISO dates as UTC midnight already.
@@ -597,6 +960,79 @@ export function parseDbDate(value: string): Date {
   }
   // normalize `YYYY-MM-DD HH:MM:SS` (driver form) to ISO before pinning UTC
   return new Date(`${value.replace(' ', 'T')}Z`);
+}
+
+const DB_DATE_GENERAL_RE =
+  /^(\d{4,})-(\d\d)-(\d\d)(?:[T ](\d\d):(\d\d):(\d\d)(\.\d+)?)?(?:(Z)|([+-])(\d\d)(?::?(\d\d))?(?::?(\d\d))?)?( BC)?$/;
+
+/**
+ * The Postgres renderings JS `Date` cannot parse: a ` BC` suffix, a
+ * local-mean-time offset with seconds (`-04:56:02`, any zone before about
+ * 1900), and years of five or more digits. Offset-less text is read as UTC,
+ * as in {@link parseDbDate}. `undefined` when the text is none of these.
+ */
+function parseDbDateGeneral(value: string): Date | undefined {
+  const m = DB_DATE_GENERAL_RE.exec(value);
+  if (!m) return undefined;
+  let year = Number(m[1]);
+  if (m[13]) year = 1 - year;
+  const month = Number(m[2]) - 1;
+  const ms = m[7] ? Math.trunc(1000 * Number(`0${m[7]}`)) : 0;
+  const date = new Date(
+    Date.UTC(2000, month, Number(m[3]), Number(m[4] ?? 0), Number(m[5] ?? 0), Number(m[6] ?? 0), ms),
+  );
+  // setUTCFullYear, not Date.UTC: Date.UTC reads years 0-99 as 1900-1999.
+  date.setUTCFullYear(year, month, Number(m[3]));
+  if (m[9]) {
+    const offset = Number(m[10]) * 3600 + Number(m[11] ?? 0) * 60 + Number(m[12] ?? 0);
+    return new Date(date.getTime() - (m[9] === '-' ? -offset : offset) * 1000);
+  }
+  return date;
+}
+
+/**
+ * A float column's value as the driver reads it. JSON has no NaN or infinity,
+ * so `json_build_object` renders them as the strings "NaN", "Infinity" and
+ * "-Infinity"; every other value passes through.
+ */
+export function readJsonFloat(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  if (value === 'NaN') return Number.NaN;
+  if (value === 'Infinity') return Number.POSITIVE_INFINITY;
+  if (value === '-Infinity') return Number.NEGATIVE_INFINITY;
+  return value;
+}
+
+/** {@link readJsonFloat} over a float array (at any depth); the input when nothing changes. */
+export function readJsonFloatArray(value: unknown): unknown {
+  if (!Array.isArray(value)) return value;
+  let out: unknown[] | undefined;
+  for (let i = 0; i < value.length; i++) {
+    const el = value[i];
+    const read = Array.isArray(el) ? readJsonFloatArray(el) : readJsonFloat(el);
+    if (read !== el) {
+      out ??= value.slice();
+      out[i] = read;
+    }
+  }
+  return out ?? value;
+}
+
+let textArrayParser: ((text: string) => unknown[] | null) | undefined;
+
+/**
+ * An array column the driver has no parser for (an enum array) arrives as
+ * Postgres array text, `{ok,sad}`; read it into an array of strings, as the
+ * same column reads through a relation. The input when it cannot be parsed.
+ */
+export function readTextArray(value: unknown): unknown {
+  if (typeof value !== 'string' || value.charCodeAt(0) !== 123) return value;
+  try {
+    textArrayParser ??= createPgArrayParser((text) => text);
+    return textArrayParser(value) ?? value;
+  } catch {
+    return value;
+  }
 }
 
 /**
@@ -1147,7 +1583,7 @@ export function isDefaultTextParser(oid: number, parser: (text: string) => unkno
  * construction, and only when somebody else's non-default parser is actually
  * being replaced.
  */
-export function warnParserOverwrite(oid: number, typeName: string): void {
+export function warnParserOverwrite(oid: number, typeName: string, logger: TurbineLogger = consoleLogger): void {
   const getParser = pg.types.getTypeParser as unknown as (oid: number, format: 'text') => (value: string) => unknown;
   const current = getParser(oid, 'text');
   // Turbine's own earlier registration is not a third party's expectation.
@@ -1163,14 +1599,17 @@ export function warnParserOverwrite(oid: number, typeName: string): void {
   const remedy = TEMPORAL_PARSER_OIDS.has(oid)
     ? ' `utcTimestamps: false` leaves the six temporal OIDs (1114, 1082, 1115, 1182, 1184, 1185) alone entirely.'
     : ' There is no opt-out for this OID: Turbine registers it so bigint values come back as numbers.';
-  console.warn(
-    `[turbine] pg type parser for OID ${oid} (${typeName}) was already customized by something else in this ` +
+  logTo(
+    logger,
+    'warn',
+    `pg type parser for OID ${oid} (${typeName}) was already customized by something else in this ` +
       'process, and Turbine is replacing it. `pg.types.setTypeParser` is process-global and takes effect ' +
       'immediately for EVERY pg.Pool in the process, including pools that already exist and are already ' +
       'querying, so whatever set that parser will now read this column differently. If yours should win, ' +
       `register it AFTER constructing the client.${remedy} This warning fires under \`NODE_ENV=production\` ` +
       'too: which parser wins depends on module evaluation order, so a process can be clean in dev and wrong ' +
       'in production from import order alone.',
+    { code: 'parser-overwrite', oid, type: typeName },
   );
 }
 
@@ -1208,16 +1647,16 @@ export function warnParserOverwrite(oid: number, typeName: string): void {
  * per row at decode time, not captured per pool). If any of the four OIDs is
  * already on a NON-default parser, {@link warnParserOverwrite} says so once.
  */
-export function registerUtcTemporalParsers(): void {
+export function registerUtcTemporalParsers(logger?: TurbineLogger): void {
   // pg-types declares get/setTypeParser over its own OID enum, which lists the
   // scalar types only. The array OIDs are just as real, so both calls are
   // retyped over a plain number rather than the incomplete enum.
   const getParser = pg.types.getTypeParser as unknown as (oid: number, format: 'text') => (value: string) => unknown;
   const setParser = pg.types.setTypeParser as unknown as (oid: number, parse: (value: string) => unknown) => void;
-  warnParserOverwrite(1114, 'timestamp');
-  warnParserOverwrite(1082, 'date');
-  warnParserOverwrite(1115, 'timestamp[]');
-  warnParserOverwrite(1182, 'date[]');
+  warnParserOverwrite(1114, 'timestamp', logger);
+  warnParserOverwrite(1082, 'date', logger);
+  warnParserOverwrite(1115, 'timestamp[]', logger);
+  warnParserOverwrite(1182, 'date[]', logger);
   const parseDate = createUtcDateParser(getParser(1082, 'text'));
   const parseTimestamp = createUtcTimestampParser(getParser(1114, 'text'));
   setParser(1114, markTurbineParser(parseTimestamp));
@@ -1392,7 +1831,11 @@ function nameCloseness(input: string, candidate: string): number {
   const a = input.toLowerCase();
   const b = candidate.toLowerCase();
   if (a === b) return 1000;
-  if (a.includes(b) || b.includes(a)) return 500 + Math.min(a.length, b.length);
+  // Containment only between names of 3+ characters: `id` sits inside almost
+  // any name, so `tenentId` must reach `tenantId` by edit distance instead.
+  if (Math.min(a.length, b.length) >= 3 && (a.includes(b) || b.includes(a))) {
+    return 500 + Math.min(a.length, b.length);
+  }
   // Levenshtein, bounded: only near-misses are worth suggesting.
   const rows = a.length + 1;
   const cols = b.length + 1;
@@ -1539,7 +1982,7 @@ export function relationInProjectionMessage(table: string, field: string, clause
 }
 
 /**
- * Dev-only advisory for a sort/grouping term Turbine dropped as redundant
+ * Advice (`diagnostics.advice`) for a sort/grouping term Turbine dropped as redundant
  * (`filters.ts` `dedupeOrderEntries` / `dedupeColumnList`).
  *
  * Deliberately a WARNING and not an error, and deliberately not silent either.
@@ -1548,29 +1991,34 @@ export function relationInProjectionMessage(table: string, field: string, clause
  * plus an unconditional primary-key tiebreak, which collide exactly when the
  * caller sorts by the primary key). But a caller who wrote the duplicate by
  * hand, or who believes a second key is doing something, should hear about it
- * once. Dev-only for the usual reason: it describes the QUERY the application
+ * once. Advice for the usual reason: it describes the QUERY the application
  * sends, which does not vary with the environment, so a production process
- * learns nothing from repeating it.
+ * learns nothing from repeating it. The caller passes its advice logger, or
+ * `undefined` when advice is off.
  *
  * Keyed per dropped key, so a sort assembled per request from the same UI says
  * it once rather than once per request.
  */
 export function warnRedundantSortTerm(
+  advice: TurbineLogger | undefined,
   table: string,
   clause: string,
   dropped: readonly { key: string; first: string; resolved: string }[],
 ): void {
-  if (process.env.NODE_ENV === 'production') return;
+  if (!advice) return;
   for (const d of dropped) {
     if (!shouldWarnOnce(WARN_NS.redundantSortTerm, `${table}|${clause}|${d.key}`)) continue;
     const how =
       d.first === d.key
         ? `"${d.key}" is named twice`
         : `"${d.key}" and the earlier "${d.first}" both target ${d.resolved}`;
-    console.warn(
-      `[turbine] ${clause} on table "${table}": ${how}, so the later one was dropped. It could not have ` +
+    logTo(
+      advice,
+      'warn',
+      `${clause} on table "${table}": ${how}, so the later one was dropped. It could not have ` +
         'changed the result (the earlier term already orders those rows), and dropping it keeps the query on ' +
         'a shared prepared statement. Remove it to silence this.',
+      { code: 'redundant-sort-term', table, clause, key: d.key },
     );
   }
 }

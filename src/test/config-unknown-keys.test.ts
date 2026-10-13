@@ -158,14 +158,15 @@ describe('TurbineConfig: unknown keys are named', () => {
     assert.deepEqual(warnings, []);
   });
 
-  it('is silent in production', async () => {
+  it('fires in production too: a construction warning is always on', async () => {
     const previous = process.env.NODE_ENV;
     process.env.NODE_ENV = 'production';
     try {
       const warnings = await captureWarnings(() => {
         new TurbineClient({ pool: idlePool(), logParams: true } as never, probeSchema());
       });
-      assert.deepEqual(warnings, []);
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0]!, /Unknown option "logParams".*Did you mean "logQueryParams"\?/);
     } finally {
       if (previous === undefined) delete process.env.NODE_ENV;
       else process.env.NODE_ENV = previous;

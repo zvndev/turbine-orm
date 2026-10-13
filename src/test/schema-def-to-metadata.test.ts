@@ -101,6 +101,9 @@ describe('schemaDefToMetadata, full deep-equal against hand-written metadata', (
           tsType: 'unknown | null',
           nullable: true,
           hasDefault: true,
+          // The declared expression, which an engine without column defaults
+          // applies on create.
+          defaultValue: "'member'",
           isArray: false,
           arrayType: 'text[]',
           pgArrayType: 'text[]',
@@ -138,6 +141,7 @@ describe('schemaDefToMetadata, full deep-equal against hand-written metadata', (
           tsType: 'Date | null',
           nullable: true,
           hasDefault: true,
+          defaultValue: 'now()',
           isArray: false,
           arrayType: 'timestamptz[]',
           pgArrayType: 'timestamptz[]',
@@ -229,6 +233,7 @@ describe('schemaDefToMetadata, full deep-equal against hand-written metadata', (
           tsType: 'Date | null',
           nullable: true,
           hasDefault: true,
+          defaultValue: 'now()',
           isArray: false,
           arrayType: 'timestamptz[]',
           pgArrayType: 'timestamptz[]',

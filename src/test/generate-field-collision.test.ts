@@ -219,7 +219,8 @@ describe('introspect (live catalog): a field collision is refused, keepColumnNam
         ['created_at', 'created_at'],
       ],
     );
-    assert.deepEqual(orders.columnMap, { id: 'id', createdAt: 'createdAt', created_at: 'created_at' });
+    // Introspected maps have a null prototype, so spread before comparing.
+    assert.deepEqual({ ...orders.columnMap }, { id: 'id', createdAt: 'createdAt', created_at: 'created_at' });
     // The generated types carry one member per column and typecheck-clean names.
     const types = generateTypes(schema, { noTimestamp: true });
     const entity = types.match(/export interface Qa78Order \{\n([\s\S]*?)\n\}/);
@@ -228,6 +229,6 @@ describe('introspect (live catalog): a field collision is refused, keepColumnNam
     assert.equal((entity[1]!.match(/^ {2}created_at: /gm) ?? []).length, 1);
     // The table without a collision is untouched by the flag except for the
     // raw field name, which for snake_case columns is the only visible change.
-    assert.deepEqual(schema.tables.qa78_clean?.columnMap, { id: 'id', created_at: 'created_at' });
+    assert.deepEqual({ ...schema.tables.qa78_clean?.columnMap }, { id: 'id', created_at: 'created_at' });
   });
 });

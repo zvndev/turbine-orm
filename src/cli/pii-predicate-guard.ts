@@ -63,37 +63,23 @@
  *     never skipped: skipping is the branch that leaks.
  */
 
-import { COLUMN_REF_OPERATORS } from '../query/filters.js';
+import { isPlainColumnRefShape } from '../query/column-ref.js';
+import {
+  COLUMN_REF_OPERATORS,
+  isColumnRef,
+  RELATION_FILTER_WRAPPER_SET,
+  RELATION_FILTER_WRAPPERS,
+} from '../query/filters.js';
 import { ownLookup, resolveColumnName, resolveRelation } from '../query/utils.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 
 /**
- * Relation-filter wrappers whose body is a clause against the relation's target.
- *
- * THREE copies of this list exist in the tree, and they have to agree: a wrapper
- * the compiler understands and this guard does not is a wrapper that reaches the
- * builder unguarded.
- *
- *   1. this one, the only NAMED definition;
- *   2. `query/where-compile.ts`, inlined as `'some' in x || 'every' in x || …`;
- *   3. `prisma-compat.ts`, SPLIT across `RELATION_QUANTIFIERS`
- *      (`some`/`every`/`none`) and two inline `k === 'is' || k === 'isNot'`
- *      tests, which is the copy most likely to drift because half of it does
- *      not look like a list at all.
- *
- * Copy 2 belongs to the SQL compiler and cannot import this one (a query-path
- * module must not depend on `cli/`), so the deduplication has to go the other
- * way: the list wants to live in `query/filters.ts` and be imported here, the
- * way {@link COLUMN_REF_OPERATORS} above now is.
- *
- * That destination now EXISTS (`RELATION_FILTER_WRAPPERS` in `query/filters.ts`)
- * and nothing imports it, including this file, so it is a fourth copy rather
- * than a deduplication and this comment is still the only thing holding them in
- * step. Moving each walk onto it is a change per walk, each with its own tests.
+ * Relation-filter wrappers whose body is a clause against the relation's target:
+ * the SQL compiler's own list (`query/filters.ts`), imported so a wrapper the
+ * compiler understands can never reach the builder unguarded. Re-exported for
+ * callers that still import it from here.
  */
-export const RELATION_FILTER_WRAPPERS = ['some', 'none', 'every', 'is', 'isNot'] as const;
-
-const RELATION_FILTER_WRAPPER_SET: ReadonlySet<string> = new Set<string>(RELATION_FILTER_WRAPPERS);
+export { RELATION_FILTER_WRAPPERS };
 
 /**
  * Recursion bound for the guard walk.
@@ -136,6 +122,90 @@ const LEVEL_OBJECT_KEYS: ReadonlySet<string> = new Set([
  * which is what the builder itself branches on.
  */
 const RELATION_PICK_KEYS: ReadonlySet<string> = new Set(['pick', 'by', 'direction', 'nulls', 'plan']);
+
+/**
+ * One level of the `lock` search: a query level (the args, or one `with` entry's
+ * options) plus the link back to the level that contained it, so the path to a
+ * hit is built once, on a hit, instead of being extended at every level.
+ */
+interface LockSearchFrame {
+  level: Record<string, unknown>;
+  parent: LockSearchFrame | null;
+  /** The relation name this level sits under (empty at the root). */
+  relation: string;
+}
+
+/**
+ * Find a `lock` option anywhere a query level can carry one: the args
+ * themselves, or the options of any `with` entry at any depth. Returns the
+ * dotted path to the shallowest hit (`lock`, `with.posts.lock`), or `null`.
+ *
+ * WHY THIS IS NOT PART OF {@link assertNoPiiPredicates}. A locking read is not
+ * a hidden-column question, and the PII walk is conditional by design: Studio
+ * skips it under `--show-pii`, `explain_query` hands it an allowlisted subset
+ * of its arguments, and `compile_query` hands it only `where` for an aggregate.
+ * A read-only refusal has to hold in every one of those, so each surface calls
+ * this directly and unconditionally. It lives in this module because both
+ * surfaces already import it, which is what keeps the rule and its wording in
+ * one place.
+ *
+ * ANY VALUE other than `undefined` counts, `null` and `false` included. The
+ * builder treats exactly `undefined` as "no lock" and refuses every other
+ * non-lock value itself (E003), so answering "present" for all of them means
+ * the verdict here never depends on what the builder would have made of it.
+ *
+ * A `with` MAP is keyed by relation names, so a relation that happens to be
+ * called `lock` is a level to descend into and never a hit; only the option
+ * position on a level is read. A table column called `lock` is likewise safe:
+ * columns live under `where` / `orderBy` / `select`, which are not searched.
+ *
+ * Iterative and breadth-first, so a deeply nested payload costs time and no
+ * stack, and the shallowest hit is the one reported. The visited set makes it
+ * terminate on a cyclic object, which parsed JSON cannot produce but a caller
+ * of a pure helper can.
+ */
+export function findRowLockOption(args: Record<string, unknown>): string | null {
+  const queue: LockSearchFrame[] = [{ level: args, parent: null, relation: '' }];
+  const seen = new Set<object>();
+  for (let next = 0; next < queue.length; next++) {
+    const frame = queue[next] as LockSearchFrame;
+    if (seen.has(frame.level)) continue;
+    seen.add(frame.level);
+    if (frame.level.lock !== undefined) return lockPath(frame);
+    const withClause = frame.level.with;
+    if (!isPlainObject(withClause)) continue;
+    for (const [relation, spec] of Object.entries(withClause)) {
+      if (isPlainObject(spec)) queue.push({ level: spec, parent: frame, relation });
+    }
+  }
+  return null;
+}
+
+/** `lock`, `with.posts.lock`, `with.posts.with.author.lock`: the path from the root to a hit. */
+function lockPath(frame: LockSearchFrame): string {
+  const relations: string[] = [];
+  for (let at: LockSearchFrame | null = frame; at !== null && at.parent !== null; at = at.parent) {
+    relations.push(at.relation);
+  }
+  const parts: string[] = [];
+  for (let i = relations.length - 1; i >= 0; i--) parts.push('with', relations[i] as string);
+  parts.push('lock');
+  return parts.join('.');
+}
+
+/**
+ * The refusal text for a `lock` found by {@link findRowLockOption}, shared so
+ * the two surfaces cannot word the same rule two ways. `path` is interpolated
+ * as given: it can carry a caller-chosen relation name, so each surface passes
+ * it through its own printable-name escaping first.
+ */
+export function rowLockRefusalMessage(path: string, tool: string): string {
+  return (
+    `${tool} does not accept \`${path}\`: it is read-only, and a locking read takes row locks, which needs a ` +
+    'write-capable transaction in your application. Remove it from the query here (nothing else about the query ' +
+    'changes), and run the locking read inside db.$transaction(async (tx) => ...) in your code.'
+  );
+}
 
 /**
  * The two things Studio and the MCP server genuinely do differently, plus the
@@ -267,21 +337,32 @@ export function assertNoPiiPredicates(
   /**
    * A column-keyed operator object (`{ gt: 5 }`, `{ sort, nulls }`, a JSON path,
    * a vector distance) holds values, not names, with ONE exception: the
-   * comparison operators also accept `{ col: 'otherField' }`, which compiles to
-   * a column-to-column comparison in the same table. Scan for that.
+   * comparison operators also accept a column reference (`col('otherField')`),
+   * which compiles to a column-to-column comparison in the same table. Scan for
+   * that, including inside a `not` operator object, which compiles to
+   * `NOT (<inner>)` with the same operand positions.
+   *
+   * A reference carries a symbol brand that parsed JSON cannot produce, so the
+   * request data these tools compile never holds one, and the builder refuses
+   * the plain `{ col }` spelling. That spelling is refused HERE as well, as a
+   * shape: the guard must not depend on the builder to close a channel it is
+   * responsible for.
    *
    * The operator list is IMPORTED from `query/filters.ts` rather than copied:
    * that is the set the SQL compiler itself branches on, and a guard that
    * disagreed with it would be guarding a different query than the one that
-   * runs. A copy that drifted short by one operator reopens the operand-position
-   * channel this scan exists to close, silently.
+   * runs.
    */
-  const checkColumnRefs = (table: TableMetadata, operatorNode: Record<string, unknown>): void => {
+  const checkColumnRefs = (table: TableMetadata, operatorNode: Record<string, unknown>, depth: number): void => {
+    assertWithinDepth(depth);
     for (const opKey of COLUMN_REF_OPERATORS) {
       const operand = ownLookup(operatorNode, opKey);
-      if (!isPlainObject(operand)) continue;
-      const ref = operand.col;
-      if (typeof ref === 'string') checkColumnName(table, ref);
+      if (isColumnRef(operand)) {
+        checkColumnName(table, operand.col);
+        continue;
+      }
+      if (isPlainColumnRefShape(operand)) host.refuseShape(table, `${opKey}: { col }`);
+      if (opKey === 'not' && isPlainObject(operand)) checkColumnRefs(table, operand, depth + 1);
     }
   };
 
@@ -343,7 +424,7 @@ export function assertNoPiiPredicates(
     // rejected by the builder by name (E003, "unknown column"), which keeps a
     // plain typo reading like a typo.
     if (scope === 'relation' && !table.allColumns.includes(column)) host.refuseShape(table, key);
-    if (isPlainObject(value)) checkColumnRefs(table, value);
+    if (isPlainObject(value)) checkColumnRefs(table, value, depth + 1);
   };
 
   /** A where / orderBy / cursor object (or a Prisma-style array of them). */

@@ -160,7 +160,7 @@ async function withSeeded(fn: (db: DB) => Promise<void>): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'powdb-joins-'));
   const db: DB = await turbinePowDB({ embedded: dir, syncMode: 'normal' }, schema, { warnOnUnlimited: false });
   try {
-    for (const stmt of powqlSchemaDDL(schema)) await db.raw([stmt]);
+    for (const stmt of powqlSchemaDDL(schema)) await db.rawUnsafe(stmt);
     const ada = await db.table('member').create({ data: { name: 'Ada' } });
     const bob = await db.table('member').create({ data: { name: 'Bob' } });
     // Cy is created but has no posts / profile / tags (the empty-stitch case).
@@ -379,7 +379,7 @@ describe('powdb integration: client-level relationLoadStrategy activates single-
     const emitted: string[] = [];
     db.$on('query', (e: { sql: string }) => emitted.push(e.sql));
     try {
-      for (const stmt of powqlSchemaDDL(schema)) await db.raw([stmt]);
+      for (const stmt of powqlSchemaDDL(schema)) await db.rawUnsafe(stmt);
       const ada = await db.table('member').create({ data: { name: 'Ada' } });
       await db.table('ppost').createMany({ data: [{ memberId: ada.id, title: 'a1', views: 1 }] });
       emitted.length = 0; // ignore the seeding statements
@@ -453,7 +453,7 @@ describe('powdb F2 integration: datetime correlation key (embedded)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'powdb-dtjoin-'));
     const db: DB = await turbinePowDB({ embedded: dir, syncMode: 'normal' }, dtSchema, { warnOnUnlimited: false });
     try {
-      for (const stmt of powqlSchemaDDL(dtSchema)) await db.raw([stmt]);
+      for (const stmt of powqlSchemaDDL(dtSchema)) await db.rawUnsafe(stmt);
       const t0 = new Date('2024-01-01T00:00:00.000Z');
       const t1 = new Date('2024-06-15T12:30:00.000Z');
       const s0 = await db.table('slot').create({ data: { at: t0 } });
@@ -517,7 +517,7 @@ describe('powdb integration: $transaction inherits pool readonly + capabilities 
       warnOnUnlimited: false,
     });
     try {
-      for (const stmt of powqlSchemaDDL(schema)) await db.raw([stmt]);
+      for (const stmt of powqlSchemaDDL(schema)) await db.rawUnsafe(stmt);
       await db.table('member').create({ data: { name: 'Ada' } });
       await assert.rejects(
         () =>

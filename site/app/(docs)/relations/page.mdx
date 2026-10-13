@@ -537,7 +537,7 @@ const db = turbine({
 await db.users.findMany({ with: { posts: true }, jsonEncoding: 'object' });
 ```
 
-Two things to know. `relationLoadStrategy: 'batched'` bypasses the encoding entirely, since there is no JSON aggregation on that path. And `relationLoadStrategy: 'flatten'` requires `'object'`: under the positional default a flatten-planned relation silently falls back to the correlated subquery (with a once-only warning in development), so pass `jsonEncoding: 'object'` alongside it if you want flatten to engage.
+Two things to know. `relationLoadStrategy: 'batched'` bypasses the encoding entirely, since there is no JSON aggregation on that path. And `relationLoadStrategy: 'flatten'` requires `'object'`: under the positional default a flatten-planned relation silently falls back to the correlated subquery (with a once-only warning while [`diagnostics`](/observability#diagnostics-diagnostics) advice is on, code `flatten-fallback`), so pass `jsonEncoding: 'object'` alongside it if you want flatten to engage.
 
 ## SQL template cache size
 
@@ -757,7 +757,7 @@ The cost: the backend re-parses and re-plans **every execution of every statemen
 
 ### Three scope limits
 
-- **External pools.** Turbine never opens those connections, so the option is a no-op there, with a dev-mode warning. Set the GUC in the driver's own connection setup instead. Turbine-owned string `replicas` on that same client **are** Turbine's connections and do get it, which splits the policy between reads and writes, so the warning names them when they exist.
+- **External pools.** Turbine never opens those connections, so the option is a no-op there, with a warning (code `plan-cache-mode-ignored`) printed once per process in every mode. Set the GUC in the driver's own connection setup instead. Turbine-owned string `replicas` on that same client **are** Turbine's connections and do get it, which splits the policy between reads and writes, so the warning names them when they exist.
 - **Postgres wire-compatible engines.** The capability flag speaks for the dialect, not the server. CockroachDB, YugabyteDB and pre-12 PostgreSQL run through the default Postgres dialect and have no `plan_cache_mode`, so they reject the connection parameter itself with `unrecognized configuration parameter` rather than raising `TURBINE_E017`. Leave it unset there. A non-Postgres engine (SQLite, MySQL, SQL Server, PowDB) throws `UnsupportedFeatureError` (`TURBINE_E017`) at construction, and any value outside the three throws `ValidationError` (`TURBINE_E003`).
 - **Connection poolers.** The GUC travels as a connection-time startup parameter, and a pooler may refuse to pass it through (PgBouncer's `ignore_startup_parameters`). Set it on the role there instead: `ALTER ROLE app_user SET plan_cache_mode = 'force_custom_plan';`.
 

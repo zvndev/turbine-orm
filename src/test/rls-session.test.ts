@@ -9,7 +9,7 @@
  *         with BOUND [name, value] params (never interpolated), applied AFTER
  *         BEGIN and before the user fn;
  *       - an invalid GUC name throws ValidationError and NEVER reaches a query
- *         (no set_config, and the transaction rolls back).
+ *         (refused before a connection is checked out: no BEGIN, no set_config).
  *
  *  2. **Integration (needs DATABASE_URL).** Create a real RLS-protected table
  *     with a policy keyed on current_setting('app.current_tenant'), seed two
@@ -118,16 +118,14 @@ describe('rls session-context (unit)', () => {
       },
     );
 
-    // No set_config call ever happened, and the txn rolled back (not committed).
+    // No set_config call ever happened, and nothing committed. The name is
+    // checked before a connection is checked out, so no transaction opens.
     assert.ok(
       !captured.some((c) => c.sql === 'SELECT set_config($1, $2, true)'),
       'set_config must never run for an invalid name',
     );
     assert.ok(!captured.some((c) => c.sql === 'COMMIT'), 'transaction must NOT commit');
-    assert.ok(
-      captured.some((c) => c.sql === 'ROLLBACK'),
-      'transaction must roll back after the validation error',
-    );
+    assert.ok(!captured.some((c) => c.sql === 'BEGIN'), 'the name is refused before any transaction opens');
   });
 
   it('$withSession is equivalent to $transaction with sessionContext', async () => {

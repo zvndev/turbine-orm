@@ -66,6 +66,13 @@ const schema: SchemaMetadata = {
  * bytes with PLAIN storage so the heap is wide: that inflates the bad plan's
  * full-scan cost without touching the index-only plan's, which is what puts the
  * good plan inside the window where the two plans disagree.
+ *
+ * `tenant_id` gets the maximum statistics target so ANALYZE reads every row and
+ * the sparse tenant's frequency is exact. At the default target ANALYZE samples
+ * 30,000 rows, where 500 rows in 358k is about 42 sampled hits with real spread,
+ * and an overestimate was enough to make even the CUSTOM plan pick the ordered
+ * scan on one CI run. The generic plan is costed from rows / n_distinct, which
+ * this does not change, so the cliff the other tests need is untouched.
  */
 const SEED = `
   DROP TABLE IF EXISTS ${TABLE};
@@ -76,6 +83,7 @@ const SEED = `
     payload    text NOT NULL
   );
   ALTER TABLE ${TABLE} ALTER COLUMN payload SET STORAGE PLAIN;
+  ALTER TABLE ${TABLE} ALTER COLUMN tenant_id SET STATISTICS 10000;
   INSERT INTO ${TABLE} (tenant_id, created_at, payload)
   SELECT t.tid, timestamptz '2020-01-01' + t.secs * interval '1 second', repeat('x', 600)
   FROM (

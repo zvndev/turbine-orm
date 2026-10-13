@@ -42,10 +42,11 @@
  * context and change which error type callers see.
  */
 
+import { ValidationError } from '../errors.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { isEmptyOrderBy } from './filters.js';
 import type { WithClause, WithCount, WithOptions, WithOrderByObject } from './types.js';
-import { resolveRelation, resolveRelationDef } from './utils.js';
+import { normalizePagination, resolveRelation, resolveRelationDef } from './utils.js';
 
 /** Depth cap mirroring the builder's own, so a cyclic `with` cannot spin here. */
 const MAX_DEPTH = 12;
@@ -66,27 +67,34 @@ export function normalizeWithClause(
   const meta = schema.tables[table];
   if (!meta) return withClause;
 
-  let changed = false;
-  const out: Record<string, unknown> = {};
-
-  for (const [key, spec] of Object.entries(withClause)) {
+  // The copy is allocated only once something changes (the common call
+  // spells every relation the declared way and allocates nothing); the keys
+  // before that point are copied in order, so the result is the same object
+  // the eager version built.
+  let out: Record<string, unknown> | undefined;
+  const source = withClause as Record<string, unknown>;
+  const keys = Object.keys(source);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i] as string;
+    const spec = source[key];
+    let name = key;
+    let nextSpec: unknown;
     if (key === '_count') {
-      const nextCount = normalizeCount(meta, spec as WithCount);
-      if (nextCount !== spec) changed = true;
-      out[key] = nextCount;
-      continue;
+      nextSpec = normalizeCount(meta, spec as WithCount);
+    } else {
+      const resolved = resolveRelation(meta.relations, key);
+      // Unknown key: keep it verbatim and let the builder raise E005 by name.
+      name = resolved?.name ?? key;
+      nextSpec = resolved ? normalizeSpec(schema, resolved.def.to, spec, depth) : spec;
     }
-    const resolved = resolveRelation(meta.relations, key);
-    // Unknown key: keep it verbatim and let the builder raise E005 by name.
-    const name = resolved?.name ?? key;
-    if (name !== key) changed = true;
-
-    const nextSpec = resolved ? normalizeSpec(schema, resolved.def.to, spec, depth) : spec;
-    if (nextSpec !== spec) changed = true;
-    out[name] = nextSpec;
+    if (out === undefined && (name !== key || nextSpec !== spec)) {
+      out = {};
+      for (let j = 0; j < i; j++) out[keys[j] as string] = source[keys[j] as string];
+    }
+    if (out !== undefined) out[name] = nextSpec;
   }
 
-  return changed ? (out as WithClause) : withClause;
+  return (out as WithClause | undefined) ?? withClause;
 }
 
 /** A relation's `with` options, normalizing its nested `with` against the TARGET table. */
@@ -183,4 +191,55 @@ export function applyStableRelationOrderTo(
     out[relName] = clonedSpec;
   }
   return out ?? withClause;
+}
+
+/**
+ * Fold Prisma's `take` / `skip` into `limit` / `offset` inside every `with`
+ * level, by the same rule {@link normalizePagination} applies at the top level
+ * (both spellings of one bound with different values throw). Runs once, before
+ * any walker reads the tree, so the fingerprint, the join build, the batched
+ * loader and the row parser all see `limit` / `offset` and never the aliases.
+ *
+ * A per-relation `offset` on a to-one relation is refused: the relation is a
+ * single row or `null`, so there is nothing to skip past, and silently
+ * returning the row anyway would ignore what the caller wrote.
+ *
+ * Returns the input by reference when nothing changed.
+ */
+export function normalizeWithPagination(
+  schema: SchemaMetadata,
+  table: string,
+  withClause: WithClause | undefined,
+  depth = 0,
+): WithClause | undefined {
+  if (!withClause || typeof withClause !== 'object' || depth > MAX_DEPTH) return withClause;
+  const meta = schema.tables[table];
+  if (!meta) return withClause;
+  let out: Record<string, unknown> | undefined;
+  // Object.keys, not Object.entries: no [key, value] pair allocated per key.
+  const keys = Object.keys(withClause);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i] as string;
+    const spec = (withClause as Record<string, unknown>)[key];
+    if (key === '_count' || spec === null || typeof spec !== 'object') continue;
+    const rel = resolveRelation(meta.relations, key);
+    if (!rel) continue; // unknown relation: the builder raises E005 by name
+    const folded = normalizePagination(spec as WithOptions & { take?: unknown; skip?: unknown });
+    const offset = (folded as { offset?: unknown }).offset;
+    if (offset !== undefined && (rel.def.type === 'belongsTo' || rel.def.type === 'hasOne')) {
+      throw new ValidationError(
+        `\`offset\` (or \`skip\`) on the to-one relation "${rel.name}" of "${table}" has nothing to skip: ` +
+          'a to-one relation is a single row or null. Remove it, or page the relation from its own table.',
+      );
+    }
+    const nested = (folded as WithOptions).with as WithClause | undefined;
+    const nextNested = nested ? normalizeWithPagination(schema, rel.def.to, nested, depth + 1) : nested;
+    let next: unknown = folded;
+    if (nextNested !== nested) next = { ...(folded as WithOptions), with: nextNested };
+    if (next !== spec) {
+      out ??= { ...withClause };
+      out[key] = next;
+    }
+  }
+  return (out as WithClause | undefined) ?? withClause;
 }

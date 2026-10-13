@@ -500,11 +500,12 @@ describe('prisma-compat, unknown query-option warnings', () => {
   it('does not warn in production', async () => {
     const { schema, map } = fixture();
     const { db } = spyDb(schema);
-    const compat = mkCompat(db, map) as Any;
     resetWarnOnce(WARN_NS_UNKNOWN_QUERY_OPTION);
     const previous = process.env.NODE_ENV;
     process.env.NODE_ENV = 'production';
     try {
+      // The mode is read when the compat client is built, so build it here.
+      const compat = mkCompat(db, map) as Any;
       const lines = await captureWarnings(() => compat.User.findMany({ definitelyNotAnOption: true }));
       assert.deepEqual(lines, []);
     } finally {

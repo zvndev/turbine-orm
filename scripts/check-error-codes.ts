@@ -50,6 +50,8 @@ const KNOWN_ERRORS = new Set([
   'ExclusionConstraintError',
   'UnsupportedFeatureError',
   'ReadOnlyError',
+  'TransactionRolledBackError',
+  'InvariantError',
   // Typed subclasses of the above defined outside errors.ts:
   // DestructivePushRefusal (schema-sql.ts) extends ValidationError so callers
   // can `instanceof` the refusal instead of sniffing message text.
@@ -74,6 +76,10 @@ const FILE_LOCAL_ERRORS = new Map<string, Set<string>>([
   // therefore has to supply a third, and a test-local class is the point rather
   // than a shortcut.
   ['src/test/pii-guard-symmetry.test.ts', new Set(['GuardRefusal'])],
+  // Studio's request-body reader refuses an oversized or malformed body with an
+  // HTTP status (413 / 400). It never leaves the HTTP layer, so it is not a
+  // TurbineError and carries no TURBINE_E code.
+  ['src/cli/studio.ts', new Set(['RequestError'])],
 ]);
 
 function walkDir(dir: string): string[] {

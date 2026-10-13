@@ -12,11 +12,15 @@ not have to open it before your first write:
   `gh pr create`, wait for `ci-ok`, merge.
 - **Never `--no-verify`. Never `git worktree`. Never force-push `main`.**
 - **The tag publishes, not `npm publish`.** Land the release commit via PR, then
-  `git tag vX.Y.Z && git push origin vX.Y.Z`; `release.yml` runs the gates and
-  publishes with provenance. A local publish is a gated fallback that refuses
-  unless CI is green on HEAD.
-- **Adding a CI job means adding it to `ci-ok`'s `needs:` AND raising the
-  anti-vacuous count to match.** A test asserts the two are equal.
+  `git tag vX.Y.Z && git push origin vX.Y.Z`; `release.yml` refuses a tag that
+  is not on `origin/main`, runs the gates, and publishes the TESTED tarball with
+  provenance and `--ignore-scripts`. A local publish is a gated fallback that
+  refuses unless CI is green on HEAD.
+- **Adding a CI job means adding it to `.github/workflows/gates.yml`, listing
+  it in `gates-ok`'s `needs:` AND raising its anti-vacuous floor to match.** A
+  test asserts the two are equal. `ci.yml` and `release.yml` both call
+  gates.yml, so a tag runs the same matrix as a pull request; `ci-ok` (the
+  required check) needs only `gates`.
 - **A skipped suite is not a passing suite.** `TURBINE_REQUIRE_ENGINE` is set on
   every database job; an unset `DATABASE_URL` otherwise yields "12 tests, 0
   pass, 0 fail, 12 skipped" and exit 0.
@@ -115,14 +119,56 @@ src/
                       per-target-table WhereHost and drives ONE `buildScopedWhere` /
                       `collectScopedWhereParams` / `fingerprintScopedWhere` trio (over a
                       small `WhereScope` = column qualifier + meta + correlation parent), so
-                      no walker is hand-mirrored anymore. cacheCrossCheckMode() in
-                      builder.ts: 'dev' (always-on NODE_ENV guard) | 'sampled'
-                      (TURBINE_CACHE_CHECK_SAMPLE env, rate in (0,1], log-once-per-
-                      fingerprint then throw) | 'off'.
+                      no walker is hand-mirrored anymore. The cache cross-check in
+                      builder.ts reads the client's resolved `diagnostics.cacheCheck`
+                      (0.90; no env read on the hot path): 'every-hit' (development
+                      default, throw on mismatch) | `{ sample }` (rate in (0,1], log
+                      `cache-mismatch` once per fingerprint then throw) | 'off'
+                      (production default). The legacy TURBINE_* variables are read
+                      only by diagnostics.ts. A mismatch is `InvariantError` (E020,
+                      `invariant: 'sql-cache-lockstep'`), not E003. Two cheaper prechecks in
+                      `crossCheckCache` run in EVERY mode (production, 'off' and
+                      `sqlCache: false` included): on a miss the collected params must equal
+                      the build's (`lastMissParams`, cleared once compared, so no bound
+                      value outlives the call), and on a hit the collected count must equal
+                      `SqlCacheEntry.paramCount` (`'sql-cache-param-count'`), before anything
+                      is sent.
+                      0.90 adds two rules here. `relationFilterValueProblem` /
+                      `assertRelationFilterValues`: a quantifier (`some` / `none` / `every`)
+                      must be a where object and `is` / `isNot` a where object or `null`;
+                      anything else is E003 at every depth, global filters and `with`
+                      wheres included, because `posts: { some: null }` used to compile to
+                      nothing and a deleteMany carrying it deleted the table. And
+                      `foldWhere` (`foldWhereFor` for plain metadata): what a where IS for
+                      every row, `'empty'` / `'true'` / `'false'` / `'row'`, read from the
+                      SQL the compiler would emit, branch for branch (a branch that compiles
+                      to nothing is dropped from an `OR` and not negated by `NOT`). Constants
+                      come from exactly three places: an empty `in` (FALSE), an empty
+                      `notIn` (TRUE), and an `EXISTS` over a constant sub-where. The
+                      mass-mutation guard (`userPredicateIsEmpty` in where.ts) refuses
+                      `'true'` exactly as it refuses `'empty'`, so `NOT: { OR: [] }` and
+                      `{ id: { notIn: [] } }` no longer write every row; anything not
+                      provably constant is `'row'`, so folding never refuses a filter that
+                      narrows. global-filters-config.ts runs the same fold at construction.
+                      An `OR` branch that applies no condition (`{}`, `{ AND: [] }`) is TRUE
+                      for its `OR`, as `OR: [{}]` always was (it used to be dropped, so its
+                      `NOT` matched every other row); `OR: [{}]` compiles to `(1 = 1)`. A
+                      branch emptied by `undefined` is still pruned before this rule. With
+                      `options.notNull` (the guard only, via `guardFoldOptions` in where.ts)
+                      the fold also reads NOT NULL columns: `not: null`, an empty
+                      `contains` / `startsWith` / `endsWith`, a column compared with itself
+                      and `hasEvery: []` are TRUE, and a bare to-one filter over a NOT NULL
+                      foreign key is TRUE except on SQLite (orphans possible with
+                      `foreign_keys` off) and when the target has a global filter. Reads never
+                      consult it. `relationCardinalityProblem` refuses `is` / `isNot` on a
+                      to-many (E003 naming `some` / `every` / `none`); PowDB calls the same
+                      function.
 
     prepared-statement naming, A where (or having) clause containing a
                       CALLER-WRITTEN `AND` / `OR` ARRAY produces an UNNAMED prepared
-                      statement (0.66). Load-bearing for `acquireSql`, not an
+                      statement (0.66). `AND: { ... }` written as ONE object is one branch
+                      whatever the caller sends, so walkWhere tags it `fixedArity` and it
+                      keeps its name. Load-bearing for `acquireSql`, not an
                       implementation detail: a named statement is never deallocated and
                       each pooled connection accumulates its own, which is fine while
                       the set of SQL texts is fixed by the application's code. A
@@ -157,8 +203,41 @@ src/
                       protect. The honest cost: a genuinely fixed two-branch `OR` (a
                       search box over name and email) loses its name too, because the
                       builder sees one call and cannot know whether the length varies
-                      across calls.
+                      across calls. A second bound sits under all of this:
+                      `boundedPreparedName` (utils.ts) hands out at most
+                      `PREPARED_STATEMENT_BUDGET` (200) distinct names per PROCESS (a
+                      `Symbol.for` registry, so the ESM and CJS copies share it), and a
+                      statement past the budget is sent unnamed. The first shapes a process
+                      runs keep their names, which in practice are its hot ones; a
+                      server-side DEALLOCATE cannot do this job, because a pooled query does
+                      not know which connection it will run on. Behind a pooler,
+                      `preparedStatements` defaults to `false` (client.ts: a connection
+                      string, `host` or `port` that `detectPooler` recognizes, on a pool
+                      Turbine builds; an explicit `true` there warns), and
+                      `TURBINE_DISABLE_PREPARED=1` turns names off everywhere.
     deferred.ts    , DeferredQuery, QueryInterfaceOptions, middleware/event types.
+                      `queryInterfaceFactory` returns a `TableClient` (see below).
+    table-client.ts, The table-accessor contract every engine implements (0.90).
+                      `TABLE_METHODS` classifies each of QueryInterface's 34 public accessor
+                      methods as `read` / `write` / `deferred` (the 15 `build*`) /
+                      `primary` (`explain`, `cacheStats`), and `satisfies` a partial record
+                      of QueryInterface's keys, so naming a method the class lacks fails to
+                      compile. A type-only exhaustiveness check
+                      (`EveryQueryInterfaceMemberClassified`) fails the build, NAMING the
+                      member, when QueryInterface gains a public member that is neither in
+                      `TABLE_METHODS` nor in `SqlInternalMember` (the five SQL-only
+                      internals: collectWhereParams, fingerprintWhere, withFingerprint,
+                      upsertNeedsLookup, resetUnlimitedWarnings). `TableClient<T, R, M>` is
+                      `Pick<QueryInterface, TableMethod>`. `PowqlInterface implements` it,
+                      so a missing or mistyped PowDB method is a compile error rather than
+                      `undefined` at runtime; PowDB's `build*` throw E017 (it has no
+                      deferred query, so `db.pipeline()` / `$transaction([...])` were a
+                      `TypeError`) and its `cacheStats()` answers zeros. client.ts's
+                      `READ_OPERATIONS` is DERIVED from the `read` entries.
+                      `asQueryInterface` is the ONE cast from `TableClient` back to
+                      `QueryInterface`, used by both factory call sites in client.ts
+                      (`TransactionClient.table`, `TurbineClient.buildTableQI`); it sits next
+                      to the check that makes it sound. Type-only imports, so no cycle.
     builder.ts      - QueryInterface class + the execute FACADE. Owns the
                       constructor, connection/middleware/timeout execution, the SQL-template
                       cache (acquireSql + crossCheckCache), findMany/findUnique/findFirst +
@@ -175,12 +254,34 @@ src/
                       bound method members. Each module's functions are `export function
                       f(qi: BuilderCtx, …)` and import each other directly; the class holds a
                       `private readonly ctx: BuilderCtx`.
+                      TIMEOUTS (0.90): a per-query `timeout` is a number of ms up to
+                      2^31-1, or `0` for NO timeout (the pre-0.90 meaning, and the same word
+                      `$transaction`'s `timeout` takes); `queryWithTimeout` maps 0 to no
+                      timer, which is load-bearing, since without it the cancellable path
+                      armed a 0 ms timer. Negative, NaN or a string is E003 (PowDB's twin
+                      check in powql.ts says the same). On PostgreSQL through a
+                      node-postgres pool outside a transaction (`cancelsOnTimeout`),
+                      `queryCancellable` runs the statement on its own checkout and, at the
+                      deadline, sends a protocol cancel (`sendCancelRequest`, utils.ts), then
+                      waits at most `CANCEL_GRACE_MS` (2 s): cancelled is `TimeoutError`
+                      `outcome: 'not-executed'`; a statement that finished first returns its
+                      result late, because reporting a committed write as a timeout invites
+                      a double apply; no answer is `'unknown'` and the connection is destroyed
+                      rather than pooled busy. Inside `$transaction` the cancel goes to the
+                      transaction's connection and the transaction is marked rolled back.
+                      Every other engine and pool answers `'unknown'`.
     where.ts        - The whole WHERE web: the top-level and table-scoped
                       build/collect/fingerprint trios, leaf JSON/array/vector/text-search
                       clause builders, operator-clause + column-reference compilation, and
                       the client-level global-filter helpers. Owns the `BuilderCtx`
                       interface. Depends on nothing else in query/ (relation filters build
                       EXISTS inline), so it is the base module the others build on.
+                      `textComparedOperand` (0.90) is THE MySQL rule for a value bound
+                      against a text column: a number or bigint binds as its decimal text and
+                      a boolean as `'1'` / `'0'`, because MySQL compares a number with text
+                      numerically (`{ resetToken: 0 }` matched every non-digit token). The
+                      where compiler applies it to each operand and list element, writes to
+                      the keys they re-read by, and aggregates.ts to having `_min` / `_max`.
     aggregates.ts   - buildAggregate + buildGroupBy and helpers: HAVING clauses,
                       groupBy ordering, DISTINCT-ON sources, JSON-path aggregate targets.
                       Reuses where.ts for WHERE compilation; shared orderBy / row-parse
@@ -199,6 +300,12 @@ src/
                       buildHavingCombinator does AND/OR/NOT recursively, mirroring
                       buildWhereClause's shapes. buildHavingNumericClauses is
                       operand-type-agnostic now (equals/not/gt/gte/lt/lte/in/notIn).
+                      0.90: a `_min` / `_max` operand (and each `in` / `notIn` element) goes
+                      through `whereMod.textComparedOperand`, since it compares a stored
+                      cell; `_count` / `_sum` / `_avg` keep theirs. `assertGroupByKeys` runs
+                      before anything reads `by`: missing, a string, an empty array or a
+                      `null` entry is E003 naming `by` (the empty case points at
+                      `aggregate()`).
     writes.ts       - Mutation SQL builders: create / createMany / update /
                       delete / upsert / updateMany / deleteMany plus the write-projection
                       helpers (writeReturningColumns / writeReselectSelection / parseWriteRow,
@@ -215,12 +322,36 @@ src/
                       `upsertLookupReason` (0.81) is the one authority on when `upsert()`
                       looks the row up instead of running `buildUpsert`'s statement
                       (`where` not pinned to `create`, an empty `update`, a global filter
-                      on an engine without `supportsUpsertUpdateWhere`); `buildUpsert`
+                      on an engine without `supportsUpsertUpdateWhere`, and since 0.90
+                      `other-unique-key` on MySQL: `ON DUPLICATE KEY UPDATE` has no
+                      conflict target and updates whichever unique key collides first, so
+                      a `create` that can collide on a key `where` does not pin, the
+                      primary key included, could update a row `where` does not name);
+                      `buildUpsert`
                       REFUSES the same shapes, since a batched DeferredQuery has no round
                       trip for a lookup. The lookup itself is `upsertLookupFirst` in
                       builder.ts, which also takes nested relation writes and compiles both
                       halves BEFORE the lookup so validity never depends on whether the row
-                      exists.
+                      exists. `planCreateMany` (0.90) is the one sizing authority for
+                      `createMany`: it validates every row once, then `rowsPerStatement`
+                      measures the per-row parameter cost from one-row and two-row builds
+                      and caps it by `maxBindParameters` and, for a plain INSERT,
+                      `capabilities.maxInsertRows`, so chunks are sized before any statement is
+                      built and no engine's own per-statement check refuses one. The MySQL
+                      reselect (0.90) re-reads a `create` only by a key whose value is known
+                      EXACTLY (a supplied primary key, the driver's insert id for a
+                      server-numbered key, decided by `isGenerated` when the metadata
+                      records it, else a unique key supplied in full) and refuses with E017
+                      before the INSERT when there is none: it used to re-read by a guessed
+                      key and could return another tenant's row. A write that moves its row
+                      out of its own `where` locks by `where` and re-reads by key
+                      (`lockMovedRowKey`), and a re-read or lock matching more than one row
+                      is E017 and rolls back. A multi-statement write runs in
+                      `inOneTransaction` (builder.ts) on one deadline (`deadlineExec`), so
+                      `timeout` bounds the whole call. `divide` on a MySQL integer column
+                      compiles to `DIV` (truncates, as PostgreSQL does), and a `Date`
+                      written to a `date` column binds its UTC day on every SQL engine
+                      through the same `utcDateTimeRewrite` gate the where side uses.
     relations.ts    - Relation + orderBy compilation: the json_agg nested-relation
                       machinery (buildSelectWithRelations, buildRelationSubquery,
                       buildManyToManySubquery), the positional-encoding shapes + nested-row
@@ -291,7 +422,8 @@ src/
                       client-side. Rows are byte-identical to the join strategy's.
                       Eligibility is per relation and every refusal falls back to the
                       default correlated subquery SILENTLY and byte-identically (with a
-                      once-only dev warning, WARN_NS.flattenFallback): to-one only, a
+                      once-only warning gated on `diagnostics.advice`, WARN_NS.flattenFallback,
+                      code `flatten-fallback`): to-one only, a
                       PROVABLY UNIQUE target key, no per-relation `limit` / `orderBy`, no
                       `_count` in the nested `with`, no alias collision or over-length alias,
                       and depth < FLATTEN_MAX_DEPTH (10, mirroring the join cap). Four
@@ -383,7 +515,7 @@ src/
                       unordered-page, PowDB link DDL skips, 'flatten' fallbacks, and
                       unknownConfigKey (0.53: client.ts warnUnknownConfigKeys checks every
                       key on the config object against TURBINE_CONFIG_KEYS and warns once
-                      per key name outside production, with suggestConfigKey's correction,
+                      per key name (always on since 0.90), with suggestConfigKey's correction,
                       closestName first then a camel-word-subsequence pass so `logParams`
                       still suggests `logQueryParams`; `url`/`schema`/queryInterfaceFactory
                       are exempt, and the whole check is try/caught so a diagnostic can
@@ -413,9 +545,118 @@ src/
                       the query runs, returns rows, and the relation is absent from every
                       one of them; it gets its own message rather than a nearest-name guess.
                       A WARNING and never an error, because `findMany({ ...optionsBag })` is
-                      ordinary code and the surface grows between minors. This is the file's
+                      ordinary code and the surface grows between minors. Since 0.90 the
+                      caller's advice logger (or `null`) is a REQUIRED parameter and the
+                      module reads no environment: an omitted logger used to fall back to
+                      the console whatever the client's `diagnostics` said. This is the file's
                       first runtime import (warn-registry + utils, both leaves that do not
                       import it back), so everything above it stays type-only.
+
+    normalize-args.ts, `undefined` means absent, decided ONCE (0.90). `pruneUndefinedArgs`
+                      runs at the args seam of every public operation and its `build*` twin,
+                      before the empty-where guards, the fingerprint, the build and the param
+                      collect read anything. A key whose value is `undefined` is removed, and so
+                      is an object or combinator array that BECOMES empty because of it, so
+                      `{ user: { email: undefined } }` is exactly `{}`. Never prunes `data` /
+                      `create` / `update`, an operand value, or an object written empty. Also
+                      carries prisma-compat's inclusive-cursor flag through the prune.
+                      The cursor refusals sit beside it (0.90, every engine): `assertCursorWritten`
+                      refuses `cursor: null`, a non-object and `{}` (each used to mean "no
+                      cursor", so `cursor: last ? { id: last.id } : {}` cut page one from a
+                      different order than every later page), and `assertCursorNotEmptied`
+                      a cursor whose every field was `undefined`. A NULL cursor value on a
+                      NOT NULL or primary-key column is refused by the cursor value check in
+                      filters.ts.
+
+    column-ref.ts  , `col('field')`, a column compared against another column of the same
+                      row (`{ equals: col('b') }` emits `"a" = "b"`). BRANDED with a
+                      `Symbol.for` key: a plain `{ col: 'id' }` is exactly what `JSON.parse`
+                      makes from a request body, and if that shape were a reference,
+                      `delete({ where: { id: body.id } })` could compile to `"id" = "id"`.
+                      Same reasoning as `UNSAFE`.
+
+    json-value.ts  , `jsonValue(v)`, the explicit JSON write: a JS string written to a json
+                      column is raw JSON TEXT, so without the wrapper there is no way to store
+                      the JSON string `"hello"` or JSON `null`. Branded the same way.
+
+    expr.ts        , Update expressions (0.90): `expr.add/sub/mul/div/coalesce/greatest/
+                      least/case/now/excluded`, accepted in `update`, `updateMany`, upsert
+                      `update`, nested update data and `createMany`'s `onConflict.update`;
+                      refused in create data. Nodes are frozen and carry a `Symbol.for` brand,
+                      so a JSON look-alike `{ kind, args }` is a VALUE (refused on a non-JSON
+                      column). `compileSetExpr` is the ONE traversal producing the SQL, the
+                      params and the fingerprint together, the where-cache lesson applied
+                      before it could bite. Rendering is chosen by `dialect.name`: GREATEST /
+                      LEAST ignore NULLs on every engine, `now()` follows the UTC read path
+                      per column type. A `case`, or a variadic with more than two operands,
+                      makes the statement UNNAMED (its arity is in the text, the 0.66
+                      variable-arity rule). `resolveExcludedFromCreate` turns
+                      `expr.excluded(field)` into `create`'s value on the lookup-first upsert
+                      path and in nested upserts. PowDB refuses expressions (E017).
+                      Arithmetic is typed from its operands: integer between integers (DIV on
+                      MySQL, so `expr.div` truncates toward zero everywhere, float target
+                      included), and a result that can be non-integer is refused on an integer
+                      column (E003). A bound value's class is in the fingerprint.
+
+    row-lock.ts    , The `lock` read option (0.90). `resolveRowLock` is the one place a lock
+                      value is validated and rendered; the SQL and the `|lk=` cache-key
+                      segment both read it, and an unlocked key is byte-identical to before.
+                      The clause is `FOR <mode> OF "<table>"` after pagination: `OF` keeps the
+                      lock on the queried table's rows only, on every relation strategy, and
+                      without it PostgreSQL refuses the flatten plan. Modes come from the
+                      `dialect.rowLockModes` flag each engine sets explicitly (PostgreSQL all
+                      four, MySQL 'update' and 'share', the rest none, so E017). Refused: a
+                      locking read outside a transaction (E003, autocommit would release the
+                      lock before the caller saw the rows; "inside" is `txScoped`), on a stream,
+                      with `distinct`, and in an autocommit pipeline (`DeferredQuery.rowLock`,
+                      checked in client.ts `pipeline()`). Studio and MCP refuse `lock` by name
+                      (`findRowLockOption` in cli/pii-predicate-guard.ts). A lock that cannot be
+                      taken is `LockNotAvailableError` (E013, see the error table).
+
+    stream-idle.ts , The abandoned-stream guard (0.90), a leaf importing errors.ts only.
+                      A cursor stream (`findManyStream` / `findManyStreamBatches`) that holds
+                      its OWN connection between pulls is watched (one that fit the speculative
+                      fetch holds nothing; one inside `$transaction` rides the caller's
+                      connection and is not watched). Client `streamIdleTimeoutMs` (default
+                      300000, `0` disables), per call `idleTimeoutMs`; `resolveStreamIdleTimeout`
+                      is the E003 validator (a whole number of ms). NOTE the client's plain
+                      `idleTimeoutMs` is the POOL's idle-connection timeout, a different thing.
+                      `StreamIdleGuard` is an unref'd interval ticking at min(timeout/4, 5 s):
+                      only time the consumer is suspended counts, never time Turbine spends
+                      fetching. On expiry `expireIdleStream` (builder.ts) runs the dialect's
+                      cleanup, releases the connection, logs `stream-idle-timeout` (always
+                      on), and the next pull throws `TimeoutError` (E002, `'not-executed'`).
+                      builder.ts drives the dialect's generator by hand (not `yield*`) so the
+                      timer can close it while the consumer is suspended. PostgreSQL only:
+                      `streamBackstopStatement` rides on the dialect's own BEGIN (matched by
+                      exact text in `watchStreamConnection`, one simple-protocol round trip)
+                      and sets `idle_in_transaction_session_timeout` TRANSACTION-LOCALLY
+                      (`set_config(..., true)`, never a session `SET`) to timeout + 10 s,
+                      reading `pg_settings` so a stricter existing limit is kept; a keepalive
+                      `SELECT 1` goes out when the connection has been quiet for half the
+                      timeout, so the server limit only fires when timers cannot run (a frozen
+                      process), which surfaces as 25P03 -> `ConnectionError` (E004).
+
+    sql-comment.ts , `sqlComment` (0.90): sqlcommenter key/values (`static`, `model` +
+                      `action`, `tag` from `$tag`, per-statement `dynamic`) on every
+                      statement a MODEL call sends, appended in `QueryInterface.outgoing()`
+                      AFTER the SQL-template cache, so cache keys and hit rates do not change
+                      and events keep commentless `sql` plus `e.comment`. `resolveSqlComment`
+                      validates at construction (E003 for bad keys/values/types; E017 on a
+                      backend that builds no SQL, i.e. PowDB, detected as
+                      `queryInterfaceFactory` present, and for `dynamic` on MySQL, whose
+                      mysql2 `execute()` keeps a server-side prepared statement per distinct
+                      text against the server-wide `max_prepared_stmt_count`). Prepared
+                      names: no comment keeps the template name; static/model/tag comments
+                      get a `c_<fnv1a64>` name from the shared process budget (the `t_`
+                      template name is not claimed when every statement is commented,
+                      `alwaysComments`); ANY dynamic value makes the statement unnamed. A bad
+                      dynamic key/value is dropped with one `sql-comment-dropped` warn and
+                      never fails the query. Batch paths (`pipeline`, `$transaction([...])`)
+                      go through `commentDeferred`. Raw SQL and transaction control get no
+                      comment. `withoutTrailingComment` is for engine shims that read
+                      statement text (sqlite.ts `statementReturnsRows`, so a value like
+                      `orders-returning` cannot turn a write into a row read).
 
     index.ts       , Barrel re-export. All imports use `./query/index.js`.
 
@@ -517,7 +758,9 @@ src/
                       was attempted and failed its own out-of-sample prediction.
 
   connection-url.ts, Zero-import leaf (0.71) owning everything that reads or rewrites a
-                      CONNECTION STRING. Three jobs. (1) `detectPooler` +
+                      CONNECTION STRING. Three jobs. (1) `detectPooler(connectionString,
+                      environment?)` (0.90: `fillTargetFromEnvironment` fills an unset host /
+                      port from PGHOST / PGPORT, `detectPoolerTarget` judges the result) +
                       `poolerRefusalMessage`: `turbine doctor` REFUSES a transaction-pooling
                       endpoint before opening a connection (`--allow-pooler` overrides;
                       default is refusal). A pooler multiplexes backends, so both the session
@@ -529,7 +772,11 @@ src/
                       not caught; ports are 6543 AND 6432 (PgBouncer's documented default
                       `listen_port`, included because the errors are asymmetric: a false
                       positive costs one flag on an interactive command, a false negative is
-                      the hazard itself). (2) `withStatementTimeoutOption`: index-stats.ts
+                      the hazard itself). Since 0.90 `migrate up` / `deploy` / `down` refuse
+                      the same way (`--allow-pooler` overrides; `--dry-run`, `status` and
+                      `create` are not refused), because the migration lock is a
+                      SESSION-level advisory lock a pooler can take on one backend and
+                      release on another. (2) `withStatementTimeoutOption`: index-stats.ts
                       used to issue a SESSION-LEVEL `SET statement_timeout` on a pool built
                       from a connection string, which through a pooler poisons a SHARED
                       backend that is not DISCARDed on release. It now goes in the
@@ -579,6 +826,140 @@ src/
                       stale-connection.integration.test.ts freezes the loop for real (a
                       worker terminates backends while the main thread is in Atomics.wait).
 
+  transaction-state.ts, The state one open transaction shares (0.90): whether it is still
+                      open (a `tx` captured by an un-awaited promise or a timer is refused once
+                      the transaction settles, because its connection may already serve another
+                      request), the FIRST statement failure, and the savepoint stack. Blocks
+                      that share a parent run one at a time, since two open savepoints on one
+                      connection would roll each other back. `commitTransaction` refuses to
+                      report success when PostgreSQL answers COMMIT with the `ROLLBACK` command
+                      tag (an aborted transaction, no error), and `rolledBackError` builds the
+                      error that carries the first failure as `cause`; a retryable first
+                      failure keeps its class so `$retry` still retries (a `LockNotAvailableError`
+                      included, which used to collapse to `SerializationFailureError`); any
+                      other first failure is `TransactionRolledBackError` (E019), for the
+                      transaction and a rolled-back savepoint block alike, and the pipeline
+                      COMMIT-answered-with-ROLLBACK path goes through the same function. A callback that returns
+                      with work still running rolls back (`unawaitedWorkError`, E003). Shared
+                      by `$transaction`, nested blocks and raw `transaction()`.
+                      Also tracks whether PostgreSQL has ABORTED the transaction (per
+                      savepoint tick): the next statement is refused locally with the first
+                      failure's class (retryable) or E019, never sent to come back as an
+                      untyped 25P02; a successful `ROLLBACK TO` ends the abort. Each nested
+                      `tx.$transaction` gets its own `TransactionScope` handle (`withBlock`);
+                      a statement through an outer handle while an inner block is open is
+                      E003. `withSavepoint` is the handle-less savepoint one multi-statement
+                      write runs in. `runRaw` / `screenRaw` refuse transaction-control SQL on
+                      the raw paths (via transaction-control.ts); raw `transaction()` keeps
+                      SAVEPOINT / RELEASE / ROLLBACK TO.
+
+  transaction-control.ts, Zero-import leaf (0.90): `findTransactionControl(sql, syntax)`
+                      finds BEGIN / COMMIT / ROLLBACK / SAVEPOINT / RELEASE / SET
+                      TRANSACTION / PREPARE TRANSACTION and the rest at statement STARTS,
+                      with per-engine lexical rules (`ControlSyntax`: postgresql, mysql,
+                      sqlite, mssql), so a word in a comment, literal or quoted identifier is
+                      never a statement. Ambiguity reads as quoted (a missed statement goes
+                      through as before; an invented one would refuse a valid query). NOT a
+                      second splitter: `src/test/fx-tx-control.test.ts` holds it to
+                      `cli/sql-statements.ts` over an adversarial corpus. Kept out of cli/
+                      because library code imports one CLI file only (schema-sql.ts ->
+                      `cli/destructive.ts`), and the CLI tokenizer would land in every engine
+                      and edge bundle.
+
+  sql-placeholders.ts, Zero-import leaf (0.90) every non-PostgreSQL engine entry shares.
+                      `scanPlaceholders(sql, 'mysql' | 'sqlite' | 'mssql')` finds placeholders
+                      outside string literals, quoted identifiers and comments under THAT
+                      engine's lexical rules, and `rewritePositionalPlaceholders` maps `$n` to
+                      `:pN` (SQLite, MySQL) or `@pN` (SQL Server), so `rawUnsafe(text, ...values)`
+                      takes `$1..$n` on every engine (SQLite read `$1` as a parameter NAMED
+                      `$1`, MySQL rejected it, SQL Server read it as a MONEY literal). A `?`, or a
+                      `$n` past the values given, is E003; with no values the text is untouched.
+                      MySQL's pool shim also expands a list bound as one `IN (:pN)` into one
+                      placeholder per element, padded to the next power of two by repeating the
+                      last element (at most 17 texts per base statement), refusing a statement
+                      whose placeholders, list elements included, pass 65,535 (E003). Deliberately NOT `cli/sql-statements.ts`: that lexer is
+                      PostgreSQL's grammar (dollar quotes, `E''`, nesting comments) and has no
+                      backtick / bracket identifiers, `#` comments or MySQL backslash escapes;
+                      different grammars, not a second lexer for one. Ambiguity reads as quoted.
+
+  global-filters-config.ts, `globalFilters` checked at CONSTRUCTION (0.90). The config is
+                      keyed by client ACCESSOR (`blogPosts`) while the builder looks filters
+                      up by TABLE name, so a key that names neither was a filter applied to
+                      nothing, which for a tenancy boundary is the worst way to fail.
+                      `normalizeGlobalFilters` maps every key to its table, refuses an unknown
+                      key and a static filter naming no column or relation, runs each static
+                      filter through `foldWhereFor` so its WHOLE shape is checked at every
+                      depth (a relation filter value like `author: { is: 5 }` used to pass
+                      construction and fail the first query on that table, i.e. a request),
+                      prefixes any E003 with `globalFilters["<key>"]`, and returns the map
+                      the builder reads. `tableAccessorName` is the ONE place the accessor
+                      name is derived. `assertStaticFiltersCompile` then compiles every static
+                      filter through a real `QueryInterface.buildFindMany` with the client's
+                      dialect (first each table alone, so an error names the filter that holds
+                      it, then all together), so any value a query would refuse throws from the
+                      constructor. `assertNoFilterCycle` refuses static filters that reach their
+                      own table through relation filters, directly or via another table's
+                      filter, naming the chain (it was a `RangeError` on every query). Function
+                      filters are never called at construction: they are checked per query by
+                      the resolver, and where.ts's `filtersBeingApplied` stack applies each
+                      table's filter once per chain (a relation leading back to a table whose
+                      filter is being compiled reads unfiltered).
+
+  supplied-pool-types.ts, Turbine's column readings on a pool the CALLER supplied (0.90).
+                      On an owned pool the int8 / UTC-temporal parsers are registered on the
+                      pg module; a supplied pool keeps the caller's parser table, so Turbine
+                      attaches its parsers to each of its OWN queries as a query-level `types`
+                      (node-postgres reads it in place of the connection's). Every type
+                      Turbine does not govern falls through to the table the query would have
+                      used, so the caller's own parsers still apply, and the caller's own
+                      queries on that pool are untouched.
+
+  diagnostics.ts   , The `diagnostics` client option (0.90): `resolveDiagnostics(config, env)`
+                      returns a frozen `{ mode, advice, cacheCheck }`. Mode defaults to
+                      'production' when NODE_ENV is 'production' OR there is no `process`
+                      (edge), else 'development'; resolved ONCE at construction and handed to
+                      every query interface the client builds. Also reads the legacy
+                      TURBINE_DISABLE_CACHE_CHECK / TURBINE_CACHE_CHECK_SAMPLE. E003 on an
+                      unknown mode or key, a non-boolean `advice`, a sample outside (0, 1].
+                      Imports only errors.ts. The ONE NODE_ENV reader in the library, with no
+                      exceptions: powql.ts's unknown-option advice and no-limit warning go
+                      through the client's logger and `diagnostics` since 0.90, and the
+                      env-scan test's PENDING allowlist is empty. `advice` gates
+                      the builder's advice (`this.advice`), the relations.ts advice
+                      (`whereMod.adviceLogger(qi)`), option-surface's unknown-option
+                      warning, utils.ts's redundant sort term and prisma-compat's option
+                      advice; `cacheCheck` drives the builder's cache cross-check. Explicit
+                      `cacheCheck` beats the legacy variables, which beat the mode default;
+                      `TURBINE_DISABLE_CACHE_CHECK=1` wins over the sample variable.
+
+  logger.ts        , The pluggable logger (0.90). `TurbineLogger` has optional
+                      debug/info/warn/error methods called as `(message, entry)`, a missing
+                      method drops the level (`{}` silences Turbine), a throwing method is
+                      ignored, and `this` is kept. `TurbineLogEntry` = `{ code, table?,
+                      operation?, error?, ... }`. `consoleLogger` prints `[turbine] message`
+                      (plus the error when the message ends with ':'), looking `console` up
+                      per call. `resolveLogger` is the E003 validator; `logTo` the one send
+                      path. No line carries a bound value, whatever `logQueryParams` says.
+                      Warn-once dedup is process-wide (a second client's logger does not see
+                      a line the first already emitted). `CLIENT_LOG_CONTEXT`
+                      (`Symbol.for('turbine-orm.clientLogContext')`) hands the client's
+                      logger + diagnostics to prisma-compat. Only this module and seed.ts
+                      call `console` directly by design. The types (`TurbineLogger`,
+                      `TurbineLogEntry`, `TurbineLogCode`, `TurbineLogLevel`) and the
+                      diagnostics types are exported from the package root; the runtime
+                      `LOG_CODES` array is not. `src/test/fleet-diagnostics-env-scan.test.ts`
+                      enforces both rules (one NODE_ENV reader, one console caller) over
+                      `src/` minus `test/` and `cli/`, with a PENDING allowlist (now empty)
+                      whose entries must still have a hit. The engine introspectors (sqlite,
+                      mysql, mssql) take `IntrospectOptions.logger` and pass it to
+                      `deriveEngineRelations`.
+
+  log-codes.ts     , `LOG_CODES`, the closed list of every log `code` (50 at 0.90). The
+                      CODE is the stable contract, the message text is not (STABILITY.md).
+                      Library code imports it as a TYPE only (`TurbineLogCode`), so an
+                      emitter cannot invent a code; the tests import the array, one test per
+                      code plus a scan that fails on a code nothing emits.
+
   client.ts        , TurbineClient wraps a pg.Pool and auto-creates typed table accessors
                       via Object.defineProperty. Manages middleware ($use), transactions
                       ($transaction with SAVEPOINTs for nesting, isolation levels, timeouts,
@@ -606,16 +987,15 @@ src/
                       time 0.685ms -> 0.350ms and 152 KB -> 100 KB on the L2 shape, which is
                       the whole of the nested-read gap. Rows are byte-identical, and the
                       value-fidelity `::text` casts survive because `buildJsonRow` drops only
-                      the KEYS and passes each expression verbatim. THE DEFAULT IS DERIVED
-                      FROM `dialect.name === 'postgresql'`, deliberately NOT from a
-                      capability flag and NOT from `buildJsonArray` being present: every
-                      engine spreads `postgresDialect` so a presence test hands them all
-                      positional (THE INHERITANCE TRAP, see dialect.ts), and
-                      `buildSelectWithRelations` ALREADY refuses positional on that same
-                      predicate with E017, so deriving the default from the identical
-                      predicate makes it structurally impossible for the default to select an
-                      encoding the builder then refuses. A flag would be a second authority
-                      on one question, free to drift. The `fm:` and `fu:` cache keys carry a
+                      the KEYS and passes each expression verbatim. THE DEFAULT AND THE
+                      REFUSAL READ ONE CAPABILITY, `dialect.capabilities.positionalJson`
+                      (0.90; both read `dialect.name === 'postgresql'` before), deliberately
+                      NOT `buildJsonArray` being present: every engine spreads
+                      `postgresDialect`, so a presence test hands them all positional (THE
+                      INHERITANCE TRAP, see dialect.ts). `buildSelectWithRelations` refuses
+                      positional with E017 on that same key, so the default can never select
+                      an encoding the builder then refuses; a second question for either
+                      would be a second authority, free to drift. The `fm:` and `fu:` cache keys carry a
                       `|je=` segment emitted for BOTH values (never only the non-default one,
                       so the key cannot depend on what the client default happens to be):
                       serving a positional template to an object-expecting parser is SILENT
@@ -661,9 +1041,26 @@ src/
                       param, so the closed enum IS the injection boundary, and the emitted
                       literal is the matched MEMBER, never the caller's string), gated on the
                       `supportsPlanCacheMode` dialect flag (E017), owned pools + owned string
-                      `replicas` only (external pool = no-op + one dev warning). ALL config
+                      `replicas` only (external pool = no-op + one always-on warning). ALL config
                       validation now runs BEFORE any process-global side effect, so a throwing
-                      constructor cannot leave the parser mode settled.
+                      constructor cannot leave the parser mode settled. `streamIdleTimeoutMs`
+                      (see query/stream-idle.ts) and `sqlComment` (resolved after the other
+                      config validation and before any process-global side effect, handed to
+                      every query interface as `_sqlCommenter`; `pipeline()` and `runBatch`
+                      comment each deferred query with its own model and action, see
+                      query/sql-comment.ts) are client options since 0.90. `logger` and
+                      `diagnostics` (0.90) are validated FIRST in the constructor; every line
+                      the client writes goes through `logTo(this.logger, ...)` with a code from
+                      log-codes.ts. Construction warnings (unknown config key, planCacheMode
+                      ignored, prepared statements on a pooler, connection option ignored on
+                      an external pool) are ALWAYS ON, whatever `diagnostics` says; `logging:
+                      true` lifecycle lines go to `debug`. `$listen` reconnect lines moved from
+                      console.error to warn (`listen-reconnecting`). A nested
+                      `tx.$transaction` callback receives its own `TransactionClient`;
+                      `poolerEndpoint` fills an unset host and port from PGHOST / PGPORT
+                      before pooler detection; `closableRawClient` (the `$connection()` and
+                      raw `transaction()` client) refuses `end` / `connect` and hides
+                      `connection`.
 
   adapters/        , Database adapter layer for Postgres-compatible engines.
                       cockroachdb.ts + yugabytedb.ts override the operations with
@@ -687,6 +1084,45 @@ src/
                         pool shim (`SqlitePool`/`MysqlPool`/`MssqlPool`) plus
                         `paramPlaceholder`, `quoteIdentifier`, and tx-keyword hooks
                         (`begin/commit/rollback/savepoint/buildSetSessionConfig`).
+                      • `capabilities: EngineCapabilities` (0.90), REQUIRED: what the engine
+                        can do, one fresh frozen literal per engine
+                        (`Object.freeze({ ... } satisfies EngineCapabilities)`), 33 keys:
+                        query shape (`distinctOn`, `positionalJson`, `nullsOrderingClause`,
+                        `nullsSortHigh`, `insensitiveInList`), value semantics
+                        (`jsonDocumentEquality`, `jsonExtractTyped`, `jsonExactNumericCast`,
+                        `numericTextComparison`, `enforcesForeignKeys`,
+                        `utcTimestampRewrite`, `paramTypeCasts`, `namedEnumTypes`,
+                        `structuredValueColumns`), writes (`maxBindParameters`,
+                        `maxInsertRows`, `upsertConflictTarget`, `setClauseOrder`,
+                        `reselectLocksRows`, `integerDivision`, `updateExpressions`,
+                        `bulkUpsertAppliesRepeatedKeys`, `partitionLimitPushdown`),
+                        connections and transactions (`readOnlyTransactions`,
+                        `connectionParameters`, `backendCancel`, `idleTransactionTimeout`,
+                        `abortsTransactionOnError`, `connectionDriver`,
+                        `preparesEveryStatement`, `statementSyntax`, which picks the lexer
+                        transaction-state.ts screens raw SQL with) and DDL (`inlineForeignKeys`,
+                        `unboundedTextKeys`). Every site that asked `dialect.name ===
+                        '<engine>'` a capability question reads its key instead, so a
+                        dialect built from an engine dialect under another name gets that
+                        engine's answers rather than whichever side of a name test its name
+                        fell on. A required key is the inverse of an optional hook: adding
+                        one fails the build in all five engine files until each states its
+                        value, and the spread cannot supply it because each literal is the
+                        engine's own. `maxBindParameters(dialect)` reads
+                        `capabilities.maxBindParameters` (`Infinity` is no limit), and
+                        writes.ts `rowsPerStatement` reads `capabilities.maxInsertRows` (SQL
+                        Server 1000; an `onConflict` MERGE is not bound by it).
+                        `TurbineClient` refuses a dialect with no `capabilities` (E003).
+                        `src/test/capabilities-guard.test.ts` pins every value per engine,
+                        requires each engine's object to be its OWN and frozen, builds the
+                        same ops under a renamed copy of each engine dialect and requires
+                        identical SQL, and SCANS `src/` for any `dialect.name` comparison,
+                        switch, `Set.has` or keyed lookup, and any comparison with an engine
+                        name literal, outside a commented allowlist (expr.ts GREATEST /
+                        LEAST / now() rendering, schema-sql.ts DEFAULT spelling, two
+                        error-hint lookups, grammar branches inside the statement lexers); a stale allowlist entry
+                        fails too. The `supports*` flags below are still top-level and
+                        inherited; moving them in is 0.91 work.
                       • Capability flags, `supportsReturning`, `supportsVector`,
                         `supportsListenNotify`, `supportsRLS`, `supportsAdvisoryLock`,
                         `supportsILike`, `aggSupportsInlineOrderBy`, `jsonPathSupport`,
@@ -706,21 +1142,64 @@ src/
                         `LIMIT -1` / `LIMIT 2^64-1` respectively), `buildUpdateStatement`/
                         `buildDeleteStatement` (mid-statement `OUTPUT`), and
                         `buildRelationSubquery` (SQL Server's `FOR JSON PATH` override).
-                        `openStream()` and the `DialectIntrospector` round out the seam.
+                        `openStream()` and the engines' `DialectIntrospector` round out the
+                        seam. `postgresDialect` has NO `introspector` since 0.90:
+                        `introspect()` reads the PostgreSQL catalog itself when a dialect
+                        has none, and the field reached introspect.ts through a dynamic
+                        import that a non-splitting bundler inlines WHOLE, so the catalog
+                        reader rode in the serverless entry and every engine entry (about
+                        4 to 6 kB brotli each) for a function none of them call.
+                      • Value-parity hooks (0.90), each ABSENT on `postgresDialect`, so the
+                        spread that builds every engine dialect inherits nothing and a
+                        presence test is sound (the inverse of the trap below: an engine
+                        opts in by defining the hook on its own dialect, and PostgreSQL's
+                        SQL is unchanged). `averageArgument(ref, type)` widens the `AVG`
+                        input (MySQL and SQL Server; used by SELECT and HAVING alike in
+                        aggregates.ts), because SQL Server averages an INT as an INT and
+                        MySQL as a DECIMAL with four more digits. `decodeColumnValue(type)`
+                        (SQL Server: json/jsonb, stored as NVARCHAR) is resolved once per
+                        column in the row parser's `getCellKinds` and cached per table in
+                        `dialectDecodeCache` as a `CELL_DIALECT` cell, so top-level and
+                        nested rows decode the same way; it keys on the METADATA type, so a
+                        schema introspected from SQL Server (`nvarchar`) still reads text.
+                        (The SQL Server row cap of a plain `INSERT ... VALUES` is
+                        `capabilities.maxInsertRows`, above.) `checkTextWrite(table, column, columnType, value)`
+                        (SQLite only) returns a refusal for a string SQLite's type affinity
+                        would store as TEXT in a numeric or boolean column; writes.ts
+                        `coerceWriteValue` throws it as E003. Presence-gated, which is sound
+                        here because no dialect spreads SQLite's. The type match is anchored
+                        on whole type names, since a recorded type can be an enum's name.
+                      • `buildEnumColumn(column, labels)` (0.90): MySQL inline `ENUM(...)`,
+                        SQLite `TEXT` + CHECK, SQL Server `NVARCHAR` + CHECK over `N'...'`.
+                        `schemaToSQL` emits `CREATE TYPE ... AS ENUM` only when
+                        `capabilities.namedEnumTypes`; any other engine without the hook
+                        gets E017 for an enum column (the inheritance trap again). Off
+                        PostgreSQL an undeclared enum or an empty label list is E003, an
+                        enum array E017, and a MySQL label with a backslash E003.
                       • `escapeLikePattern` (0.66), per-engine LIKE metacharacter
                         escaping for a bound `contains` / `startsWith` / `endsWith`
                         operand, defaulting to the shared `escapeLike` (the
-                        SQL-standard `\` `%` `_`, paired with the `ESCAPE '\'` clause
-                        the builders always emit). SQL Server overrides it because
+                        SQL-standard `\` `%` `_`, paired with the `ESCAPE` clause the
+                        builders always emit, which names `dialect.likeEscapeCharacter ?? '\'`). SQL Server overrides it because
                         T-SQL's `LIKE` ALSO treats `[` as opening a character class,
                         so `{ contains: '[draft]' }` silently means "contains any one
                         of d, r, a, f, t" there while every other engine reads the
                         value literally. Not injection (the operand stays bound), a
                         WRONG ANSWER, and a property of the engine's pattern grammar
                         rather than of the SQL text, which is what makes it a dialect
-                        hook. Whatever a dialect returns must be escaped for the same
-                        `ESCAPE '\'` clause; the build and cache-hit param-collect
+                        hook. Whatever a dialect returns must be escaped for its own
+                        `likeEscapeCharacter`; the build and cache-hit param-collect
                         paths call the one hook, so they cannot drift.
+                      • `likeEscapeCharacter` (0.90), the character `buildLikeClause`
+                        (where.ts) names in `ESCAPE '<c>'`; absent on `postgresDialect`,
+                        so nothing inherits it, and absent means `\`. MySQL names `!`:
+                        in MySQL's default `sql_mode` `'\'` never closes, so every LIKE
+                        filter was a syntax error on a caller-supplied pool without
+                        `NO_BACKSLASH_ESCAPES` (Turbine sets that mode only on pools it
+                        opens, and never runs a session `SET` on a caller's pool). A dialect
+                        that sets it must define `escapeLikePattern` for the same
+                        character. MySQL's `buildJsonObject` writes a key holding a
+                        backslash as `CONVERT(X'<hex>' USING utf8mb4)` for the same reason.
                       • `buildPartitionLimit` (0.66), the per-correlation-key row bound
                         the batched relation loader pushes DOWN into its follow-up
                         query. That follow-up is one flat `WHERE fk = ANY($1)` over
@@ -733,7 +1212,8 @@ src/
                         in bytes over the wire (measured, 200 parents x ~505 children
                         with `limit: 3`, 101,000 rows fetched to keep 600, +52.9 MB
                         peak heap against +0.5 MB for the join plan). PostgreSQL only
-                        in this release; the other engines' emitted SQL is unchanged.
+                        in this release (gated on `capabilities.partitionLimitPushdown`);
+                        the other engines' emitted SQL is unchanged.
                         The client-side slice is KEPT as the belt-and-braces bound and
                         is a no-op once the engine has already limited each partition.
                       • THE INHERITANCE TRAP, and the rule that follows from it: EVERY
@@ -743,11 +1223,16 @@ src/
                         INHERITED by all of them and an "is the hook absent" fallback
                         NEVER FIRES. Hit live: the first `buildPartitionLimit` silently
                         enabled the window wrapper on SQLite. It is the same trap
-                        behind the `DISTINCT ON` blocker. So gate a Postgres-only hook
-                        on `dialect.name === 'postgresql'`, never on hook presence (see
-                        the `buildPartitionLimit` wiring in query/builder.ts); a
-                        capability FLAG that each engine sets explicitly is the other
-                        sound shape.
+                        behind the `DISTINCT ON` blocker. So ask a capability question
+                        of `dialect.capabilities` (add a key to `EngineCapabilities` and
+                        set it in every engine's literal), never of hook presence and
+                        never of `dialect.name`: a name test hands a PostgreSQL-compatible
+                        dialect under another name the non-PostgreSQL answer, and the
+                        capabilities guard test refuses a new one. `dialect.name` is left
+                        for RENDERING (which SQL text an engine spells), error text and
+                        the lexers, each allowlisted with its reason. Those rendering
+                        switches become per-engine hooks once engines stop spreading
+                        `postgresDialect` (0.91).
 
   sqlite.ts        , `turbine-orm/sqlite` engine. `turbineSqlite(path | ':memory:' |
                       DatabaseSync, schema, options?)`, synchronous, zero new dependency
@@ -755,21 +1240,55 @@ src/
                       documented fallback). `sqliteDialect` uses `resultStrategy:
                       'returning'`, `json_group_array(json(...))` nested relations, and
                       `COLLATE NOCASE` (ASCII-only) for insensitive matching. The
-                      in-process test / edge / "try it in 10 seconds" engine.
+                      in-process test / edge / "try it in 10 seconds" engine. Since 0.90 a
+                      column the SCHEMA declares boolean or json/jsonb reads back as a
+                      boolean / parsed value on every read path. The direct-read half is
+                      `resultColumnDecoders`, which reads `StatementSync.columns()` (declared
+                      type plus origin table and column, all null for an expression, so a
+                      computed column is never decoded) and so needs Node 22.16+ / 23.11+;
+                      it is feature-detected, and on the band without it the columns keep
+                      reading as stored. The join half is the boolean / json `jsonWireRule`,
+                      gated on `driverReportsDeclaredTypes()`, the SAME capability question,
+                      so the two halves cannot split into a strategy-dependent type flip.
+                      REAL / NUMERIC through a join are carried as `printf('%!.17g')` text
+                      and rebuilt (`json_object` rounds to 15 digits on SQLite 3.47 to 3.51).
+                      A safe integer binds as INTEGER (node:sqlite binds every JS number as
+                      REAL), so integer `divide` truncates and `3` written to TEXT is
+                      `'3'`. Since 0.90 `disconnect()` / `end()` close a handle the factory
+                      OPENED (path or `':memory:'`; a later query is E004), and the factory
+                      closes it if the constructor or the open-time PRAGMAs throw; a
+                      `DatabaseSync` the caller passed is never closed. `turbineMysql`,
+                      `turbineMssql` and `turbinePowDB` likewise close a pool (or embedded
+                      handle) they built when a later step throws (version refusal, an
+                      embedded `syncMode` the addon cannot apply, constructor refusal).
 
   mysql.ts         , `turbine-orm/mysql` engine. `await turbineMysql(url | config |
                       mysql2-pool, schema, options?)`, MySQL 8.0+ via the optional peer
                       `mysql2` (loaded by dynamic import; never a root dep). `mysqlDialect`
                       uses `resultStrategy: 'reselect'` (no RETURNING, write then re-SELECT
                       by PK/where), `JSON_ARRAYAGG`/`JSON_OBJECT` nested relations, and
-                      named `:pN` placeholders. `createMany` returns `[]` (count-not-rows).
+                      named `:pN` placeholders. A plain `createMany` returns `[]`
+                      (count-not-rows); one with `onConflict` re-reads its rows by the
+                      conflict key. A `create` re-reads by an exactly known key or is
+                      refused with E017 before the INSERT (see writes.ts), and introspection
+                      marks an `AUTO_INCREMENT` column `isGenerated` (0.90), so the insert id
+                      is used even when another column also has a default. `averageArgument`
+                      gives `_avg` over a non-BIGINT integer full double precision
+                      (`+ 0E0`); BIGINT keeps its exact DECIMAL average. LIKE escapes with
+                      `!` (`likeEscapeCharacter`, see dialect.ts), so an injected pool works in
+                      any `sql_mode`; the owned pool still sets `NO_BACKSLASH_ESCAPES`, which
+                      only raw SQL now depends on.
 
   mssql.ts         , `turbine-orm/mssql` engine. `await turbineMssql(url | config |
                       mssql-pool, schema, options?)`, SQL Server 2016+ via the optional
                       peer `mssql` (dynamic import). `mssqlDialect` uses `resultStrategy:
                       'output'` (`OUTPUT INSERTED.*` / `MERGE`), `FOR JSON PATH` nested
                       relations (`buildRelationSubquery` override), `OFFSET/FETCH` paging,
-                      and named `@pN` placeholders.
+                      and named `@pN` placeholders. 0.90: `capabilities.maxInsertRows: 1000` (a larger
+                      `createMany` is chunked in one transaction instead of throwing),
+                      `decodeColumnValue` parses json/jsonb, and `averageArgument` makes
+                      `_avg` over an integer fractional (FLOAT, or DECIMAL(38,0) for BIGINT
+                      so the average stays exact).
 
   powdb.ts +       , `turbine-orm/powdb` engine (PowDB **≥ 0.7.1**).
   powql.ts            `await turbinePowDB(url | connOpts | pool | { embedded: dir, syncMode?, memoryLimit? }, schema, options?)`
@@ -782,18 +1301,21 @@ src/
                       `import()`, `npm i turbine-orm` still pulls only `pg`. PowQL shares no
                       surface with `SELECT…FROM…WHERE`, so this is NOT a `Dialect`: powql.ts ships
                       a parallel `PowqlInterface` (PowQL generator with the same public method
-                      surface as `QueryInterface`) wired in via the `queryInterfaceFactory`
+                      surface as `QueryInterface`, enforced since 0.90 by `implements
+                      TableClient`, see query/table-client.ts) wired in via the `queryInterfaceFactory`
                       option on `QueryInterfaceOptions`, `TurbineClient.table()` calls that
                       factory when present, else `new QueryInterface` (SQL engines untouched).
                       powdb.ts holds the driver shims (`PowdbPool` over the client `Pool`;
                       `PowdbEmbeddedPool` over a single `Database` handle), type mapping
                       (Turbine→PowQL `str/int/float/bool/json`; never emits `uuid/datetime/bytes`;
-                      `Date`→int micros), `powqlSchemaDDL`, `wrapPowdbError`, and `powdbDialect`
+                      `Date`→int micros; an enum column of `schema.enums` → `str` holding the
+                      label, via `powdbEnumLabels` in powdb-shared.ts: a non-label is E003,
+                      ranges compare in declaration order, ordering it is E017), `powqlSchemaDDL`, `wrapPowdbError`, and `powdbDialect`
                       (`supportsReturning: true`; the Postgres-only flags stay false →
                       `$listen`/`$notify`/RLS/pgvector throw E017). PowDB realities shaping it:
                       writes use the trailing **`returning`** keyword (create/createMany/update/
                       delete), `upsert` reselects by PK (its statement rejects `returning`; a
-                      **upsert** follows the shared `upsertWhereMatchesCreate` rule; only a single-column-PK `where` pinned to `create`'s value, with a non-empty `update`, no nested writes and no global filter, uses the native statement. Every other shape looks the row up BY `where` in one flat txn via `upsertLookupFirst` (0.81: it used to take the values from `create`), which is also what keeps a tenant-scoped upsert off another tenant's row).
+                      **upsert** follows the shared `upsertWhereMatchesCreate` rule; only a single-column-PK `where` pinned to `create`'s value, with a non-empty `update`, no nested writes and no global filter, uses the native statement. Every other shape looks the row up BY `where` in one flat txn via `upsertLookupFirst` (0.81: it used to take the values from `create`), which is also what keeps a tenant-scoped upsert off another tenant's row; since 0.90, when `where` is pinned to `create` and the lookup misses only because the global filter hides the row, `hiddenConflictIsNotFound` makes it E001 and writes nothing, as on the SQL engines, instead of E008).
                       **PKs: server-assigned `auto` int OR client UUID**, `isGenerated` columns emit
                       PowDB's `auto` modifier (`powqlSchemaDDL`) and let the engine assign the id;
                       otherwise a defaulted string PK gets a client UUID (`applyPkDefault`). No
@@ -810,7 +1332,12 @@ src/
                       literal `in (list)`), NEVER an IN-subquery: PowDB's executor caches a subquery
                       result by plan shape ignoring the literal → a repeated `in (<subquery>)` returns
                       stale rows (a real engine bug, reproduced on the raw addon; it had silently
-                      broken the 0.22.0 hasMany/belongsTo filters). **Nested writes** (relation ops in
+                      broken the 0.22.0 hasMany/belongsTo filters). Since 0.90 relation filters
+                      INSIDE a global filter resolve the same way (`globalFilterWhere`), function
+                      filters that reach each other once per chain; they used to make every query
+                      on the table E003. A number, bigint or boolean against a Date column is E003
+                      (it bound as raw micros), and a whole JSON document in a `where` is E017.
+                      **Nested writes** (relation ops in
                       create/update data) route to the shared `executeNestedCreate/Update` engine via
                       `runInImplicitTx` (one flat top-level txn; same hasMany/hasOne/belongsTo coverage
                       as SQL; m2m nested writes unhandled on every backend). Composite-PK columns are
@@ -950,9 +1477,21 @@ src/
                       names.
 
   errors.ts        , Error hierarchy rooted at TurbineError. Each error has a code
-                      (TURBINE_E001-E018). wrapPgError() translates pg driver errors
+                      (TURBINE_E001-E020). wrapPgError() translates pg driver errors
                       (23505, 23503, 23502, 23514, 23P01, 40P01, 40001) into typed
-                      Turbine errors. UnsupportedFeatureError (E017) is thrown directly
+                      Turbine errors. 0.90: 42P05 and 26000 (a named prepared statement
+                      the server connection already holds, or never prepared, which is
+                      what a transaction-pooling endpoint produces) are `ConnectionError`
+                      (E004) carrying `sqlstate` and `PREPARED_STATEMENT_POOLER_HINT`
+                      (direct endpoint, `preparedStatements: false`, or PgBouncer 1.21+
+                      with `max_prepared_statements` above 0). `TimeoutError.outcome` is
+                      `'not-executed'` (never sent, or the server confirmed the cancel:
+                      safe to retry) or `'unknown'` (the default, the only answer never
+                      wrong); see the timeout note under builder.ts. 25P02 (in failed
+                      transaction) maps to `TransactionRolledBackError` (E019) as a fallback;
+                      25P03 (idle_in_transaction_session_timeout, which a cursor stream sets
+                      transaction-locally, see query/stream-idle.ts) is `ConnectionError` (E004);
+                      the transaction state normally refuses that statement before it is sent. UnsupportedFeatureError (E017) is thrown directly
                       (not via wrapPgError) when a non-Postgres engine hits a Postgres-only
                       feature. 0.65: every TurbineError carries `.docsUrl`
                       (`https://turbineorm.dev/errors#eNNN` via docsUrlForCode) and
@@ -1017,9 +1556,31 @@ src/
                       pii-tagged column is unaffected by ANY of the above and emits
                       byte-identical SQL (tested). TableMetadata.checks round-trips named check
                       constraints through generate (emitted into metadata.ts).
+                      `ColumnMetadata.declaredTsType` (0.90) carries a `defineSchema` `tsType`
+                      (without `| null`) and ONLY `turbine generate` reads it; `tsType` stays
+                      the type mapped from the database type, because every engine branches
+                      on it. A declared type used to replace `tsType` in the metadata the
+                      engines read, so embedded PowDB created integer, timestamptz and
+                      boolean columns as strings and MySQL read a nested boolean as `1`.
 
   schema-builder.ts, defineSchema() API for code-first schema definitions. Produces
-                      SchemaDef objects consumed by schema-sql.ts for DDL generation.
+                      SchemaDef objects consumed by schema-sql.ts for DDL generation. Every
+                      refusal of a malformed declaration is `ValidationError` (E003) since
+                      0.90 (nine threw a plain `Error`: an unknown column type, an enum
+                      with no `enumName`, a vector with no `dimensions`, a non-array
+                      `indexes` / `manyToMany` / `checks` / `primaryKey`, a composite
+                      primary key naming no column, an unknown type on the deprecated
+                      `column` proxy). It also refuses an unknown key naming the nearest
+                      valid one, a `__proto__` table or column, an index with both `columns`
+                      and `docField`, and a `tsType` that is not one TypeScript type on one
+                      line (`tsTypeTextProblem`, which generate.ts also applies to
+                      `columnTypes`, since the text is emitted verbatim into source).
+                      An integrity pass (0.90) refuses names it cannot resolve: a `references`
+                      not in `table.column` form, or naming a column its in-schema target
+                      lacks (a field name resolves to its column; a table outside the schema
+                      is left alone), an index naming an unknown column, and two fields or
+                      two tables mapping to one database name. `default` takes a number or
+                      boolean as a literal; any other non-string default is E003.
 
   schema-metadata.ts, `defineSchema()` -> `SchemaMetadata` bridge (`schemaDefToMetadata`).
                       The pure-function equivalent of introspect + generate, for the paths
@@ -1128,6 +1689,15 @@ src/
                       A `client` member shadowing a delegate or CLIENT_RESERVED_KEYS, or a
                       `model` key naming no model, throws E003. `Prisma.getExtensionContext`
                       is the identity function; `$name` is runtime-only, not on the type.
+                      Nothing is accepted and dropped (0.90): a filtered `_count` and a nested
+                      `distinct` / `cursor` are E017; an unknown nested option (Turbine's
+                      `limit` / `offset` / `with` included), an unknown `_count` key, an
+                      unknown `$transaction` option, an unread nested-write key, and a
+                      projection on a relation outside the map are E003. The array-form
+                      `$transaction` forwards its options; `maxWait` is accepted, not
+                      forwarded, and warned once. Its advice goes through the client's
+                      logger via CLIENT_LOG_CONTEXT, gated on `diagnostics.advice`; the
+                      stale-map check is always on.
                       Pure shim: zero new deps, never imported by core.
 
   errorMessages scoping, `errorMessages: 'safe' | 'verbose'` is a property of the
@@ -1257,7 +1827,7 @@ The core of Turbine's single-query strategy lives in `buildRelationSubquery()` (
 
 **Query arg types** (query/types.ts): `WhereClause<T>` supports equality, null checks, operators (`gt`, `gte`, `lt`, `lte`, `not`, `in`, `notIn`, `contains`, `startsWith`, `endsWith`), `mode: 'insensitive'` for ILIKE, `OR`/`AND`/`NOT` combinators, and relation filters (`some`/`every`/`none`). `WithClause` maps relation names to `true | WithOptions`. `WithOptions` supports nested `with`, `where`, `orderBy`, `limit`, `select`, and `omit`.
 
-**Atomic updates** (query/types.ts): `UpdateOperatorInput<V>` supports `set`, `increment`, `decrement`, `multiply`, `divide` for numeric fields. These generate `col = col + $n` style SQL for concurrent safety.
+**Atomic updates** (query/types.ts): `UpdateOperatorInput<V>` supports `set`, `increment`, `decrement`, `multiply`, `divide` for numeric fields. These generate `col = col + $n` style SQL for concurrent safety. `divide` on an integer column truncates on every engine (0.90: MySQL emits `DIV`, and SQLite binds a safe integer as INTEGER).
 
 **Generated types** (generate.ts): The code generator emits three files:
 - `types.ts`, Entity interfaces (singularized PascalCase), `*Create` types (optional for PK/default/nullable fields), `*Update` types (all non-PK fields optional), and `*With*` interfaces for each relation.
@@ -1275,9 +1845,9 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 | Code | Class | When |
 |---|---|---|
 | E001 | `NotFoundError` | `findUniqueOrThrow`, `findFirstOrThrow`, missing row |
-| E002 | `TimeoutError` | Query or transaction exceeds timeout |
+| E002 | `TimeoutError` | Query or transaction exceeds timeout. Carries `outcome`: `'not-executed'` or `'unknown'` (0.90) |
 | E003 | `ValidationError` | Unknown column, invalid operator, empty where guard |
-| E004 | `ConnectionError` | Pool connection failure |
+| E004 | `ConnectionError` | Pool connection failure. Since 0.90 also pg 42P05 / 26000, a named prepared statement behind a transaction pooler, with the pooler advice |
 | E005 | `RelationError` | Unknown relation name in `with` clause |
 | E006 | `MigrationError` | Migration file parse error, checksum mismatch |
 | E007 | `CircularRelationError` | Nesting depth exceeds 10 |
@@ -1286,12 +1856,14 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 | E010 | `NotNullViolationError` | pg 23502, via `wrapPgError()` |
 | E011 | `CheckConstraintError` | pg 23514, via `wrapPgError()` |
 | E012 | `DeadlockError` | pg 40P01, `isRetryable = true as const` |
-| E013 | `SerializationFailureError` | pg 40001, `isRetryable = true as const` |
+| E013 | `SerializationFailureError` | pg 40001, `isRetryable = true as const`. Subclass `LockNotAvailableError` (same code, retryable): a `lock` read with `noWait`, or a lock wait past the server's lock timeout (pg 55P03, MySQL 3572 / 1205, SQL Server 1222); on PostgreSQL it aborts the transaction, so take the lock in a nested `tx.$transaction` to recover |
 | E014 | `PipelineError` | One or more queries in a pipeline batch failed |
 | E015 | `OptimisticLockError` | Version mismatch on `optimisticLock` update |
 | E016 | `ExclusionConstraintError` | pg 23P01, via `wrapPgError()` |
 | E017 | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) invoked on an engine whose capability flag reports it unsupported, thrown directly, not via `wrapPgError()` |
 | E018 | `ReadOnlyError` | A write refused because the database is read-only, `reason: 'snapshot'` (PowDB snapshot serving / client-level `readonly: true` fail-fast) or `'rbac'` (read-only role). Thrown locally by the PowDB readonly guard and via `wrapPowdbError()` message families |
+| E019 | `TransactionRolledBackError` | A transaction PostgreSQL rolled back instead of committing (the callback caught a failed statement, or a per-query timeout cancelled one); the first failure is `cause`. Deadlock, serialization and lock-not-available first failures keep their own class. Built by `rolledBackError` in transaction-state.ts; pg 25P02 also maps here via `wrapPgError()` as a fallback |
+| E020 | `InvariantError` | Turbine caught a bug in itself before sending a statement it knew was wrong: two internal paths that must agree did not (the SQL-template cache vs a fresh build, `invariant: 'sql-cache-lockstep'`; a cached entry whose param count differs from the params collected, `'sql-cache-param-count'`; a where scope built from an already-quoted reference, `'where-scope-reference'`; a relation payload that does not parse as JSON, `'relation-payload-json'`, both formerly E003; and in powql.ts a relation filter reaching `buildWhere` unresolved, `'powql-relation-filter-unresolved'`, a JSON string operator with no PowQL spelling, `'powql-json-operator'`, and a JSON filter that compiled to no condition, `'powql-json-filter-empty'`, formerly E003 with an `internal:` prefix). Thrown by the always-on cache prechecks in query/builder.ts, `aliasWhereScope` in where.ts, `parseNestedRow` in relations.ts and the three PowQL generator sites. Not retryable, not caused by the arguments; the message names the query shape and no value |
 
 `wrapPgError(err)` inspects the pg driver error's `.code` field and wraps it in the appropriate typed error, preserving the original as `.cause`. It is called in `client.ts` (raw queries, transaction pool proxy) and at query execution boundaries in `query/builder.ts`.
 
@@ -1308,7 +1880,7 @@ which exists because the previous copy asserted a snake_case column name was rej
 
 **Config resolution** (`cli/config.ts`): Searches for `turbine.config.ts` / `.mts` / `.js` / `.mjs`, merges with `--url`/`--out`/`--schema` flags and `DATABASE_URL` env var.
 
-**Migration system** (`cli/migrate.ts`): SQL-first migrations stored as timestamp-prefixed `.sql` files with `-- UP` and `-- DOWN` sections. Tracked in a `_turbine_migrations` table with SHA-256 checksums. Uses `pg_try_advisory_lock()` to prevent concurrent migration runs. Each migration runs in its own transaction. Checksum validation detects modified migration files. Destructive statements (both `migrate up`/`down` and, since 0.36, `push`) require a two-step typed confirmation (`destroy my data` then `yes`) or `--allow-destructive`. `migrate create <name> --recipe backfill` (0.36) scaffolds the sanctioned two-phase type-change pattern from the MIGRATION_RECIPES registry (fully commented: nullable add → batched keyed UPDATE → SET NOT NULL → atomic rename swap); `--recipe` without a name errors.
+**Migration system** (`cli/migrate.ts`): SQL-first migrations stored as timestamp-prefixed `.sql` files with `-- UP` and `-- DOWN` sections. CI gates (0.90): `push --dry-run --exit-code` exits 2 on a statement OR on a drift warning it cannot apply (`driftWarnings`: a declared UNIQUE index over a non-unique one of that name, a removed enum label, an undeclared index on a table that manages its indexes), while disclosed not-compared items and a named CHECK that differs only by PostgreSQL's rewrite of the expression stay 0; `migrate status --exit-code` exits 2 on a pending, modified, missing or MISNAMED migration file. `generate` refuses a `columnTypes` key naming no table with a did-you-mean, and with `include` set it reads the table list once (`generatorColumnTypesFor`) so a typo is not mistaken for a table the filter left out. Tracked in a `_turbine_migrations` table with SHA-256 checksums. Uses `pg_try_advisory_lock()` to prevent concurrent migration runs. Each migration runs in its own transaction. Checksum validation detects modified migration files. Destructive statements (both `migrate up`/`down` and, since 0.36, `push`) require a two-step typed confirmation (`destroy my data` then `yes`) or `--allow-destructive`. `migrate create <name> --recipe backfill` (0.36) scaffolds the sanctioned two-phase type-change pattern from the MIGRATION_RECIPES registry (fully commented: nullable add → batched keyed UPDATE → SET NOT NULL → atomic rename swap); `--recipe` without a name errors.
 
 **Studio** (`cli/studio.ts`): Local web UI served over Node's built-in `http` module, no new runtime deps, read-only by default. ORM-native since v0.19: there is NO raw-SQL surface. The Query tab (default) is a visual `findMany` builder; `POST /api/builder` validates every identifier (table/relation/field/orderBy) against the introspected schema and compiles the args with `QueryInterface.buildFindMany` (`sqlCache: false`, all values as `$N` params). Saved queries are builder-kind only, legacy raw-SQL entries are dropped on load with a console notice. Binds `127.0.0.1` by default (warns loudly on non-loopback hosts), authenticates via a random 24-byte hex token (constant-time check on every `/api/*` route), per-session rate limiting (100 req/60s), refuses cross-origin requests, and ships nonce-based CSP + security headers (`script-src 'self' 'nonce-...'`, no unsafe-inline in script-src since 0.36; style-src keeps it; `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`). Every read runs inside `BEGIN READ ONLY` with `SELECT set_config('statement_timeout', $1, true)` (NOT `SET LOCAL ... = $1`, which Postgres rejects, that was the 0.17.0 critical bug) and `set_config('search_path', $1, true)` pinned to the configured `--schema`. **Write mode (0.36, `--write`; bulk since 0.38):** `/api/row/update|insert|delete` POST routes exist ONLY when writable (404 otherwise, deliberately not 403); each rebuilds the predicate from the FULL primary key alone via `extractPkWhere` (extra where keys dropped, operator objects refused, PK-addressed by construction), validates table/columns against metadata, compiles via buildUpdate/buildCreate/buildDelete (`sqlCache: false`), runs in a plain BEGIN txn with the same parameterized timeout + search_path, and requires a matching `Origin` (absent OR mismatched → 403). insert/delete also accept `rows: [...]` (MAX_BULK_ROWS=500): per-row validation up front, one statement per row in ONE all-or-nothing txn (any no-match → ROLLBACK + 404); bulk update refused; predicate-based mutations never exist. Views and PK-less tables refused. Loud startup warning + persistent red WRITE MODE banner. **PII redaction:** PII-tagged cells are redacted SERVER-SIDE ("•• redacted ••") before serialization, table rows, builder rows, nested `with` rows (redactBuilderRows walks the tree against each relation's target table), and the post-write echo; redacted columns are also excluded from the Data-tab ILIKE search OR-set, orderBy, AND the per-column `filters` param (even isNull, null-ness is an oracle too; parseTableFilters 400s). The Data tab's `filters` (JSON array, max 10, ops equals/not/contains/gt/gte/lt/lte/isNull/notNull) compile via a param-counter buildWhere shared with search, engine-aware placeholders. `--show-pii` reveals (terminal warning + persistent PII SHOWN banner). DB-less perimeter tests drive the exported `handleRequest` (src/test/studio-write.test.ts). **Temporal parity (0.54):** Studio builds a RAW pg pool and never constructs a TurbineClient, so it used to keep the driver's local-zone parsers and render a `date` cell as the previous evening east of UTC, which in `--write` is also the value an edit echoes BACK into the column; the Postgres path (never demo, which is sqlite) now calls `registerUtcTemporalParsers()` from query/utils.ts, the same helper client.ts uses. `cli/mcp.ts` does the same for its sampled rows. **Demo mode (0.37, `--demo`):** boots with NO DATABASE_URL against a seeded in-memory store (`cli/studio-demo.ts`: DEMO_SCHEMA users/posts/comments/orgs with pii-tagged email/phone + deterministic seed) backed by the sqlite engine over `node:sqlite` `:memory:` (Node >= 22.5, dynamic import with a clear error). `StudioContext.demo` + `dialect` branch the few PG-isms (pg_class counts → COUNT(*), ILIKE → LOWER LIKE, no BEGIN READ ONLY/set_config/search_path, `:pN` placeholders, `parseDemoRelationRows` re-parses sqlite's JSON-string relation columns); `POST /api/demo/mode` (demo-only, token+Origin gated) flips ctx.writable/ctx.showPii live for the UI's two toggle pills; boots read-only + redacted; each launch pristine, nothing persisted (saved queries too: demo routes them to ctx.memorySavedQueries, never .turbine/studio-queries.json, and never reads the real file). Postgres path byte-identical when off; tests in src/test/studio-demo.test.ts drive the REAL in-memory store through handleRequest. UI is an embedded single-file HTML/CSS/JS (`studio-ui.html`, prebuilt into `studio-ui.generated.ts` by `npm run gen:studio`) with Query / Data / Schema tabs matching the turbineorm.dev dark theme.
 
@@ -1316,7 +1888,7 @@ which exists because the previous copy asserted a snake_case column name was rej
 
 **UI module** (`cli/ui.ts`): Terminal formatting helpers, colors, spinners, tables, boxes. Imported throughout CLI but never by library code.
 
-**Other CLI leaves**: `cli/loader.ts` registers a TypeScript loader (prefers `tsx/esm/api`'s `register()`, probed from the user's CWD) before the CLI `import()`s a user-supplied `turbine.config.ts` / schema file, which plain Node rejects with `ERR_UNKNOWN_FILE_EXTENSION`. `cli/pii-tags.ts` reads `ColumnMetadata.pii` out of the generated `metadata.ts` and applies it to a LIVE introspected schema: `pii` is a code-first declaration that `introspect.ts` never sets, so without this Studio's and the MCP server's redaction would be inert against a real database; it distinguishes "this file declares no PII" from "this file could not be parsed" (`PiiScan.ok === false`), and the latter fails closed by tagging every column. `cli/rate-limit.ts` is the fixed-window limiter (100 requests / 60s) both local servers share. `cli/observe.ts` is the read-only metrics dashboard over the `_turbine_metrics` table written by `observe.ts`, with Studio's security model (loopback, random token, HttpOnly cookie, CSP, read-only transactions); its UI is the hand-authored embedded HTML in `cli/observe-ui.ts` (same pattern as `studio-ui.generated.ts` but with no build step).
+**Other CLI leaves**: `cli/local-server-output.ts` is the leaf both local servers share for what they emit: `responseErrorText` (an `Error` gives its message only, with its aggregated messages, cause or code when the message is empty; a non-Error gets a fixed sentence, never `stack` or `String(err)`) and `openInBrowser`, which launches only a plain `http` URL of the exact shape the servers print, so `--host` cannot put shell syntax in front of `cmd /c start`. `cli/loader.ts` registers a TypeScript loader (prefers `tsx/esm/api`'s `register()`, probed from the user's CWD) before the CLI `import()`s a user-supplied `turbine.config.ts` / schema file, which plain Node rejects with `ERR_UNKNOWN_FILE_EXTENSION`. `cli/pii-tags.ts` reads `ColumnMetadata.pii` out of the generated `metadata.ts` and applies it to a LIVE introspected schema: `pii` is a code-first declaration that `introspect.ts` never sets, so without this Studio's and the MCP server's redaction would be inert against a real database; it distinguishes "this file declares no PII" from "this file could not be parsed" (`PiiScan.ok === false`), and the latter fails closed by tagging every column. `cli/error-text.ts` (`errorText`, zero imports, 0.90) is how every CLI catch site reads an error: the message, else each aggregated error's message once, else the cause, else the code, else the name. A refused `localhost` rejects with an `AggregateError` whose message is EMPTY, so commands printed a bare prefix; a source scan keeps `cli/index.ts` on it. `cli/rate-limit.ts` is the fixed-window limiter (100 requests / 60s) both local servers share. `cli/local-server-guard.ts` holds the rest of the perimeter both local servers share: the `Host` allowlist that stops DNS rebinding, the ONE-TIME login ticket printed in the terminal (a URL that lands in history or a log is a spent ticket, not a standing key), and the one constant-time token comparison. `cli/code-first-tags.ts` overlays the `defineSchema()`-only tags (`pii`, `updatedAt`, `maxLength`, `tsType`) onto an introspected schema for `turbine generate`, since the database has no column for any of them. `cli/observe.ts` is the read-only metrics dashboard over the `_turbine_metrics` table written by `observe.ts`, with Studio's security model (loopback, random token, HttpOnly cookie, CSP, read-only transactions); its UI is the hand-authored embedded HTML in `cli/observe-ui.ts` (same pattern as `studio-ui.generated.ts` but with no build step).
 
 ## Testing
 
@@ -1324,21 +1896,21 @@ which exists because the previous copy asserted a snake_case column name was rej
 
 **Integration tests** need a PostgreSQL instance with seeded data. Set `DATABASE_URL` env var. The small correctness fixture is `src/test/fixtures/seed.sql` (8 users / 10 posts / 20 comments / 5 orgs). The larger benchmark seed lives in `benchmarks/seed-neon.ts` and defaults to 1K users / 10K posts / 50K comments (override via `USERS`/`POSTS_PER_USER`/`COMMENTS_PER_POST`). Tests that require a database are gated via the `skipGate()` helper in `src/test/helpers.ts` when `DATABASE_URL` is absent, each test registers with `{ skip }` so the reporter shows real skipped counts, not silent passes.
 
-**Coverage** is configured in `.c8rc.json`. It covers `src/**` but excludes `src/test/**`, `src/cli/**`, `src/generate.ts`, `src/introspect.ts`, `src/serverless.ts`, `src/index.ts`, and the three type-only modules that emit no runtime code (`src/query/deferred.ts`, `src/engine-config.ts`, `src/pg-types.ts`, each compiles to `export {};` and would only count as permanently-uncovered denominator). `src/query/types.ts` was excluded under that same rationale and no longer is: it carries the `UNSAFE` sentinel and the privilege-option guards, and measured 2026-09-06 it reads 99.67% lines on its own and RAISES the project figure from 96.98 to 97.09, so the exclusion was hiding well-tested runtime code rather than denominator noise. Thresholds: 93% lines, 78% functions, 89% branches, 93% statements. Those are MEASURED floors, re-baselined 2026-08-16 onto a corrected measurement: every earlier figure (75/59/85/75, and before it the aspirational 80/82/82/80 that had been failing continuously, which is how a permanently-red gate got normalized) was read under a broken coverage merge that understated the truth by about 20 points, see `//merge-bug` in `.c8rc.json`. `.c8rc.json` carries the measurements and the rule in its own `//` keys: raise as coverage improves, never lower one without recording why. `src/cli/**` is excluded HERE but has its own per-file gate, `npm run test:coverage:cli`, over NINE files: `cli/studio.ts`, `cli/migrate.ts`, `cli/destructive.ts`, `cli/sql-statements.ts`, `cli/pii-predicate-guard.ts`, `cli/mcp.ts`, `cli/compile-query.ts`, `cli/error-catalog.ts` and `cli/index.ts`, each with its own floor (`cli/index.ts` is deliberately kept out of the aggregate pass, see `//cli-gate` in `.c8rc.json`); a new test file for any of them must be added to `coverage:cli:collect` in package.json or its coverage does not count. These numbers and this file list are asserted against `.c8rc.json` and package.json by `src/test/docs-claims-sync.test.ts`. THE TWO HALVES ARE SEPARATE, and both are required: a file added to `coverage:cli:collect` with no `coverage:cli:gate:<file>` of its own and no entry in `coverage:cli:gate:aggregate`'s `--include` list is COLLECTED and gated by nothing, i.e. a slower lane enforcing a floor of zero. That is what happened to mcp.ts and error-catalog.ts when they were first added.
+**Coverage** is configured in `.c8rc.json`. It covers `src/**` but excludes `src/test/**`, `src/cli/**`, `src/generate.ts`, `src/introspect.ts`, `src/serverless.ts`, `src/index.ts`, and the three type-only modules that emit no runtime code (`src/query/deferred.ts`, `src/engine-config.ts`, `src/pg-types.ts`, each compiles to `export {};` and would only count as permanently-uncovered denominator). `src/query/types.ts` was excluded under that same rationale and no longer is: it carries the `UNSAFE` sentinel and the privilege-option guards, and measured 2026-09-06 it reads 99.67% lines on its own and RAISES the project figure from 96.98 to 97.09, so the exclusion was hiding well-tested runtime code rather than denominator noise. Thresholds: 93% lines, 78% functions, 89% branches, 93% statements. Those are MEASURED floors, re-baselined 2026-08-16 onto a corrected measurement: every earlier figure (75/59/85/75, and before it the aspirational 80/82/82/80 that had been failing continuously, which is how a permanently-red gate got normalized) was read under a broken coverage merge that understated the truth by about 20 points, see `//merge-bug` in `.c8rc.json`. `.c8rc.json` carries the measurements and the rule in its own `//` keys: raise as coverage improves, never lower one without recording why. `src/cli/**` is excluded HERE but has its own per-file gate, `npm run test:coverage:cli`, over ELEVEN files: `cli/studio.ts`, `cli/migrate.ts`, `cli/destructive.ts`, `cli/sql-statements.ts`, `cli/pii-predicate-guard.ts`, `cli/mcp.ts`, `cli/compile-query.ts`, `cli/error-catalog.ts`, `cli/local-server-guard.ts`, `cli/observe.ts` and `cli/index.ts`, each with its own floor (`cli/index.ts` is deliberately kept out of the aggregate pass, see `//cli-gate` in `.c8rc.json`); a new test file for any of them must be added to `coverage:cli:collect` in package.json or its coverage does not count. These numbers and this file list are asserted against `.c8rc.json` and package.json by `src/test/docs-claims-sync.test.ts`. THE TWO HALVES ARE SEPARATE, and both are required: a file added to `coverage:cli:collect` with no `coverage:cli:gate:<file>` of its own and no entry in `coverage:cli:gate:aggregate`'s `--include` list is COLLECTED and gated by nothing, i.e. a slower lane enforcing a floor of zero. That is what happened to mcp.ts and error-catalog.ts when they were first added.
 
 ## Key Patterns
 
 - **Streaming has TWO public shapes (0.71).** `findManyStream` yields rows; `findManyStreamBatches` yields `T[]`. They are not stylistic alternatives: `yield parseRow(row)` per row means 50,000 rows is 50,000 promise resolutions and microtask turns, measured at **~7 ms / ~139 ns per row** over a 50K drain, which was the largest single component of the streaming gap. Both share ONE parser-selection site (`makeStreamRowParser`) and one database path (`streamRaw`), so the flatten / positional / PII decisions cannot diverge between them. `findManyStream` deliberately does NOT delegate to the batch method: doing so would parse a batch ahead of the consumer, so a `break` after row 1 would pay for 999 more rows. Its laziness is pinned by a test.
-- **Adding a read method to `QueryInterface` means TWO hand-maintained lists, and both fail SILENTLY.** `READ_OPERATIONS` in client.ts decides what a read replica may serve, so a missing name keeps working and just runs on the PRIMARY, with no error and no failing test. `PowqlInterface` is a PARALLEL implementation rather than a subclass, so TypeScript does not require it to have the method, and a missing one is `undefined` at runtime: the PowDB user gets `TypeError: not a function` instead of the typed E017 telling them to page with `findMany`. `findManyStreamBatches` hit both. `src/test/read-operations-drift.test.ts` closes it MECHANICALLY (a name starting with `find`, or count/aggregate/groupBy, is a read; writes match none of it), so a new read method is covered the day it is written with no edit to the test, and it carries an anti-vacuous assertion because reflection returning `[]` would make every check pass while testing nothing.
+- **Adding a public method to `QueryInterface` fails the build until it is classified (0.90).** It must go in `TABLE_METHODS` (query/table-client.ts) as `read` / `write` / `deferred` / `primary`, or in `SqlInternalMember`, and `PowqlInterface`, which `implements TableClient`, must then have it with a matching signature. `READ_OPERATIONS` in client.ts, which decides what a read replica may serve, is derived from the `read` entries. Both used to be hand-maintained lists that failed SILENTLY: a read missing from `READ_OPERATIONS` just ran on the PRIMARY, and a method missing from `PowqlInterface` was `undefined` at runtime (`findManyStreamBatches` hit both; PowDB's `build*` and `cacheStats` were a `TypeError` until 0.90). `src/test/read-operations-drift.test.ts` stays as the run-time check (a name starting with `find`, or count/aggregate/groupBy, is a read; writes match none of it), with its anti-vacuous assertion, because reflection returning `[]` would make every check pass while testing nothing.
 - **Never write a literal NUL byte into source.** `query/builder.ts`'s row-decode cache key uses NUL as its delimiter, correctly, because it is the one byte a Postgres identifier cannot contain even quoted, so no table or column name can forge a collision. Write it as the `\u0000` ESCAPE. A raw NUL makes byte-oriented tools classify the file as binary, and `grep` then reports ZERO matches for a term that is present rather than saying it declined to look. `query/builder.ts` is the largest file under `src/query/` and that silent empty result sent more than one search down the wrong path.
 - All SQL identifiers quoted via `quoteIdent()`, doubles internal `"` chars per Postgres rules
 - All user values parameterized (`$1, $2, ...`), never string-interpolated
 - LIKE patterns escaped via `escapeLike()`, escapes `%`, `_`, `\`
-- Empty-where guard blocks accidental mass mutations: update/delete with `{}` or all-undefined where throws `ValidationError` unless `allowFullTableScan: true`
+- Empty-where guard blocks accidental mass mutations: update/delete with `{}`, an all-undefined where, or one that folds to always-true (`NOT: { OR: [] }`, `{ id: { notIn: [] } }`, an `OR` with an empty branch, `contains: ''` on a NOT NULL column, see `foldWhere`) throws `ValidationError` unless `allowFullTableScan: UNSAFE` (a literal `true` throws)
 - `LRUCache` bounds the SQL template cache at 1,000 entries (Map insertion order for O(1) eviction)
 - Module has no side effects, `setTypeParser` for int8 is gated behind a static flag in the TurbineClient constructor
 - ESM source with `.js` extensions (NodeNext resolution), CJS output via separate `tsconfig.cjs.json`
-- Middleware runs after SQL generation, it can inspect/log params and transform results, but cannot modify the SQL itself
+- Middleware runs around execution: it can read and log params, time the call and transform the result, but it cannot change the query. `params.args` is a plain copy of the caller's args made on first read (`readOnlyMiddlewareParams`, utils.ts), so reading, spreading, `JSON.stringify` and `structuredClone` work; `next()` compares what it is passed against the caller's original (`assertMiddlewareArgsKept`) and throws a `TypeError` naming the first differing path (`params.args.where.role`), and assigning `params.args` throws at once. A structurally equal copy passes. Deliberately NOT a frozen object: a frozen object ignores writes silently in sloppy-mode code, so a tenant or soft-delete filter written in place would be dropped without a word, which is fail-open
 
 ## Common Tasks
 

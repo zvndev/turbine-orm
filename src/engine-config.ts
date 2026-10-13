@@ -28,16 +28,17 @@ import type { TurbineConfig } from './client.js';
  *     the engine from its own SQL.
  *   - `connectionString`, `host`, `port`, `database`, `user`, `password`, `ssl`,
  *     `poolSize`, `idleTimeoutMs`, `connectionTimeoutMs`, `max`,
- *     `idleTimeoutMillis`, `connectionTimeoutMillis`: pg connection and
- *     pool-tuning fields, ignored by `TurbineClient` whenever `pool` is set (it
- *     always is here). Each engine takes its connection target as its first
- *     argument instead, in that driver's own vocabulary.
+ *     `idleTimeoutMillis`, `connectionTimeoutMillis`, `maxLifetimeSeconds`: pg
+ *     connection and pool-tuning fields, ignored by `TurbineClient` whenever
+ *     `pool` is set (it always is here). Each engine takes its connection
+ *     target as its first argument instead, in that driver's own vocabulary.
  *   - `replicas`: entries are Postgres connection strings or pg-compatible
  *     pools, which `TurbineClient` opens as `pg.Pool`s. There is no engine
  *     equivalent to route reads to.
  *
  * Everything else is forwarded, including options that are Postgres-only by
- * CAPABILITY rather than by plumbing (`jsonEncoding: 'positional'`). Those throw
+ * CAPABILITY rather than by plumbing (`jsonEncoding: 'positional'`,
+ * `statementTimeoutMs`, `planCacheMode`). Those throw
  * a typed `UnsupportedFeatureError` (E017) when used, which is a better answer
  * than an option the type system says does not exist.
  */
@@ -58,6 +59,7 @@ type EngineOwnedConfigKey =
   | 'max'
   | 'idleTimeoutMillis'
   | 'connectionTimeoutMillis'
+  | 'maxLifetimeSeconds'
   | 'replicas';
 
 /**

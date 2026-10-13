@@ -9,6 +9,8 @@
  */
 
 import { ValidationError } from '../errors.js';
+import type { ColumnRef } from './column-ref.js';
+import type { EXCLUDED_REF, SQL_EXPR } from './expr.js';
 
 // ---------------------------------------------------------------------------
 // The privilege sentinel
@@ -273,54 +275,51 @@ export type OrderDirection = 'asc' | 'desc';
  */
 export type RelationLoadStrategy = 'join' | 'batched' | 'auto' | 'flatten';
 
-/**
- * Reference to ANOTHER COLUMN of the same table inside a where operator,
- * enabling column-to-column comparison:
- *
- * ```ts
- * where: { currentVersionId: { equals: { col: 'publishedVersionId' } } }
- * // → WHERE "current_version_id" = "published_version_id"
- * ```
- *
- * Accepted by `equals`, `not`, `gt`, `gte`, `lt`, and `lte`. The referenced
- * field resolves through the table's columnMap (camelCase accepted, same as a
- * where key) and compiles to a quoted identifier: NO parameter is bound.
- * An unknown referenced field throws {@link ValidationError} (E003).
- *
- * Notes:
- *  - `mode: 'insensitive'` cannot be combined with a column reference: it
- *    throws E003 (use `client.sql` for `lower(a) = lower(b)`).
- *  - On json/jsonb columns `equals` routes to the JSONB containment filter
- *    first, so `{ equals: { col } }` there is treated as a JSON value, not a
- *    column reference.
- *
- * `F` narrows the referenced name to the table's field names when the
- * surrounding {@link WhereClause} knows the entity type.
- */
-export interface ColumnRef<F extends string = string> {
-  col: F;
-}
+// Column references (`col()`): the branded operand type lives with its
+// constructor in column-ref.ts and is re-exported here with the other where
+// types.
+export type { ColumnRef } from './column-ref.js';
 
-/** Operator object for advanced where filtering */
+/**
+ * Operator object for advanced where filtering.
+ *
+ * Every value operand is checked against the column before any SQL is built:
+ * on a non-JSON column it must be a string, number, bigint, boolean, Date or
+ * Buffer (or `null` for `equals` / `not`), `in` / `notIn` take an array of
+ * those, and the LIKE operators take a string. An object at a value position
+ * throws `ValidationError` (E003) instead of being bound, so a request body
+ * cannot turn a value into an operator.
+ */
 export interface WhereOperator<V = unknown, F extends string = string> {
   /**
    * Explicit equality: `{ equals: value }` → `column = $n`.
    * `{ equals: null }` → `column IS NULL`.
-   * `{ equals: { col: 'otherField' } }` → `column = "other_field"` ({@link ColumnRef}).
+   * `{ equals: col('otherField') }` → `column = "other_field"` ({@link ColumnRef}).
    * On json/jsonb columns `equals` routes to the JSONB containment filter
    * ({@link JsonFilter}) instead.
    */
-  equals?: V | ColumnRef<F> | null;
-  gt?: V | ColumnRef<F>;
-  gte?: V | ColumnRef<F>;
-  lt?: V | ColumnRef<F>;
-  lte?: V | ColumnRef<F>;
-  not?: V | ColumnRef<F> | null;
-  in?: V[];
-  notIn?: V[];
-  contains?: string;
-  startsWith?: string;
-  endsWith?: string;
+  equals?: V | ColumnRef<F> | null | undefined;
+  gt?: V | ColumnRef<F> | undefined;
+  gte?: V | ColumnRef<F> | undefined;
+  lt?: V | ColumnRef<F> | undefined;
+  lte?: V | ColumnRef<F> | undefined;
+  /**
+   * `{ not: value }` → `column != $n`, `{ not: null }` → `column IS NOT NULL`,
+   * `{ not: col('other') }` → `column != "other"`.
+   *
+   * An operator object negates the whole inner filter, as in Prisma:
+   * `{ not: { contains: 'x' } }` → `NOT (column LIKE '%x%')`. The inner object
+   * inherits this object's `mode` unless it sets its own. SQL three-valued
+   * logic applies: a row whose column is NULL matches neither the inner filter
+   * nor its negation. Add `{ OR: [{ col: { not: ... } }, { col: null }] }` to
+   * keep NULL rows.
+   */
+  not?: V | ColumnRef<F> | WhereOperator<V, F> | null | undefined;
+  in?: V[] | undefined;
+  notIn?: V[] | undefined;
+  contains?: string | undefined;
+  startsWith?: string | undefined;
+  endsWith?: string | undefined;
   /**
    * `'insensitive'` makes the comparison case-insensitive on a string column:
    * `contains` / `startsWith` / `endsWith` use ILIKE (or the dialect's
@@ -328,7 +327,7 @@ export interface WhereOperator<V = unknown, F extends string = string> {
    * case on both sides (`LOWER(...)`). A `mode` beside a non-string operand
    * throws `ValidationError` (E003).
    */
-  mode?: 'default' | 'insensitive';
+  mode?: 'default' | 'insensitive' | undefined;
 }
 
 /**
@@ -336,7 +335,8 @@ export interface WhereOperator<V = unknown, F extends string = string> {
  * - A plain value (equality: column = $N)
  * - null (column IS NULL)
  * - An operator object ({ gt: 5, lte: 10 })
- * - A JSONB filter object ({ contains, equals, path, hasKey })
+ * - A JSONB filter object ({ contains, equals, path, hasKey }), on a column
+ *   whose type is not a plain scalar (json columns are typed `unknown`)
  * - An array filter object ({ has, hasEvery, hasSome, isEmpty })
  * - A text search filter object ({ search, config? })
  * - A vector distance filter object ({ distance: { to, metric, lt } }) for pgvector columns
@@ -350,11 +350,16 @@ export type WhereValue<V = unknown, F extends string = string> =
           ? V | TypedToOneFilter<V> | WhereClause<V> // to-one relation → is/isNot or bare where (implicit is)
           : V)
   | WhereOperator<V, F>
-  | JsonFilter
+  // Not offered on a scalar-typed column: `JsonFilter.equals` is `unknown`, so
+  // it would accept any object there, including an unbranded `{ col }`.
+  | ([V] extends [ScalarWhereType] ? never : JsonFilter)
   | ArrayFilter
   | TextSearchFilter
   | VectorFilter
   | null;
+
+/** Column value types that are never JSON documents. */
+type ScalarWhereType = string | number | bigint | boolean | Date | null | undefined;
 
 /**
  * Relation filter on a to-many relation property.
@@ -365,9 +370,9 @@ export type WhereValue<V = unknown, F extends string = string> =
  */
 // biome-ignore lint/complexity/noBannedTypes: {} means "target relations unknown", matches RelationDescriptor default
 export interface TypedRelationFilter<U, UR extends object = {}> {
-  some?: WhereClause<U, UR>;
-  every?: WhereClause<U, UR>;
-  none?: WhereClause<U, UR>;
+  some?: WhereClause<U, UR> | undefined;
+  every?: WhereClause<U, UR> | undefined;
+  none?: WhereClause<U, UR> | undefined;
 }
 
 /**
@@ -378,8 +383,8 @@ export interface TypedRelationFilter<U, UR extends object = {}> {
  */
 // biome-ignore lint/complexity/noBannedTypes: {} means "target relations unknown", matches RelationDescriptor default
 export interface TypedToOneFilter<V, VR extends object = {}> {
-  is?: WhereClause<V, VR>;
-  isNot?: WhereClause<V, VR>;
+  is?: WhereClause<V, VR> | undefined;
+  isNot?: WhereClause<V, VR> | undefined;
 }
 
 /**
@@ -425,24 +430,24 @@ export type WhereClause<T, R extends object = {}> = [keyof R] extends [never]
 
 /** The historical, index-signature-carrying where clause. See {@link WhereClause}. */
 export type LooseWhereClause<T> = {
-  [K in keyof T]?: WhereValue<T[K], Extract<keyof T, string>>;
+  [K in keyof T]?: WhereValue<T[K], Extract<keyof T, string>> | undefined;
 } & {
-  OR?: LooseWhereClause<T>[];
-  AND?: LooseWhereClause<T>[];
-  NOT?: LooseWhereClause<T>;
+  OR?: LooseWhereClause<T>[] | undefined;
+  AND?: LooseWhereClause<T>[] | undefined;
+  NOT?: LooseWhereClause<T> | undefined;
   /** Relation filters, keyed by relation name, value is { some, every, none } */
   [relationName: string]: unknown;
 };
 
 /** Key-checked where clause: column keys from `T`, relation keys from `R`, no index signature. */
 type StrictWhereClause<T, R extends object> = {
-  [K in keyof T]?: WhereValue<T[K], Extract<keyof T, string>>;
+  [K in keyof T]?: WhereValue<T[K], Extract<keyof T, string>> | undefined;
 } & {
-  [K in keyof R]?: RelationWhereValue<R[K]>;
+  [K in keyof R]?: RelationWhereValue<R[K]> | undefined;
 } & {
-  OR?: WhereClause<T, R>[];
-  AND?: WhereClause<T, R>[];
-  NOT?: WhereClause<T, R>;
+  OR?: WhereClause<T, R>[] | undefined;
+  AND?: WhereClause<T, R>[] | undefined;
+  NOT?: WhereClause<T, R> | undefined;
 };
 
 /**
@@ -453,11 +458,25 @@ type StrictWhereClause<T, R extends object> = {
  * multi-tenancy. A function value is evaluated at query-build time (per query),
  * so a closure over per-request state (e.g. the current tenant id) enables
  * request-scoped filters. `create`/`createMany` are never filtered.
+ *
+ * Fail closed: a filter that resolves to `undefined`, or holds `undefined` at
+ * any depth (`{ tenantId: undefined }` when the tenant context is missing),
+ * throws `ValidationError` (E003) instead of being dropped. Return `null` or
+ * `{}` to apply no filter on purpose, or pass `skipGlobalFilters: UNSAFE`.
  */
 export type GlobalFilters = {
   // biome-ignore lint/suspicious/noExplicitAny: filters are keyed by table name; per-table entity types are not known here
-  [tableAccessor: string]: WhereClause<any> | (() => WhereClause<any>);
+  [tableAccessor: string]: GlobalFilter<any>;
 };
+
+/**
+ * One table's global filter: a where clause over that table, or a function
+ * returning one per query. `null` applies no filter on purpose. A generated
+ * client types its `globalFilters` config with this per table, so a
+ * misspelled table or column is a compile error.
+ */
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches WhereClause default
+export type GlobalFilter<T, R extends object = {}> = WhereClause<T, R> | null | (() => WhereClause<T, R> | null);
 
 /**
  * Per-query opt-out of the configured {@link GlobalFilters}. {@link UNSAFE}
@@ -508,10 +527,10 @@ export interface WithClause {
 export type TypedWithClause<R extends object = {}> = [keyof R] extends [never]
   ? WithClause
   : {
-      [K in keyof R]?: true | WithOptions<RelationRelations<R[K]> & object, RelationTarget<R[K]>>;
+      [K in keyof R]?: true | WithOptions<RelationRelations<R[K]> & object, RelationTarget<R[K]>> | undefined;
     } & {
       /** Reserved: correlated relation counts. `true` counts all to-many relations. */
-      _count?: true | { [K in keyof R]?: true };
+      _count?: true | { [K in keyof R]?: true } | undefined;
     };
 
 /**
@@ -566,9 +585,9 @@ export type TypedOrderByObject<T, R extends object> = [unknown] extends [T]
     [keyof R] extends [never]
     ? OrderByObject
     : {
-        [K in keyof T]?: OrderDirection | OrderBySpec | JsonPathOrderBy | VectorOrderBy;
+        [K in keyof T]?: OrderDirection | OrderBySpec | JsonPathOrderBy | VectorOrderBy | undefined;
       } & {
-        [K in keyof R]?: RelationOrderBy | RelationPickOrderBy;
+        [K in keyof R]?: RelationOrderBy | RelationPickOrderBy | undefined;
       };
 
 /** {@link TypedOrderByObject}, single or Prisma-style array. */
@@ -597,20 +616,27 @@ export type WithFieldFlags<NestedT> = [unknown] extends [NestedT]
  * matters.
  */
 export interface WithOptions<NestedR extends object = Record<never, never>, NestedT = unknown> {
-  with?: TypedWithClause<NestedR>;
+  with?: TypedWithClause<NestedR> | undefined;
   /** Filter the related rows. Keys are checked against the relation target when it is known (see {@link WithWhere}). */
-  where?: WithWhere<NestedT, NestedR>;
+  where?: WithWhere<NestedT, NestedR> | undefined;
   /**
    * Order the related rows. Accepts a single object (`{ a: 'asc', b: 'desc' }`)
    * or a Prisma-style array of objects (`[{ a: 'asc' }, { b: 'desc' }]`, whose
    * element order is the authoritative multi-key sort precedence).
    */
-  orderBy?: TypedOrderByClause<NestedT, NestedR>;
-  limit?: number;
+  orderBy?: TypedOrderByClause<NestedT, NestedR> | undefined;
+  /** Keep at most this many of each parent's related rows. */
+  limit?: number | undefined;
+  /** Skip this many of each parent's related rows. To-many relations only; refused on a to-one relation. */
+  offset?: number | undefined;
+  /** Prisma's spelling of `limit`, folded into it at the args seam. */
+  take?: number | undefined;
+  /** Prisma's spelling of `offset`, folded into it at the args seam. */
+  skip?: number | undefined;
   /** Only include these fields from the relation. Key-checked against the target when it is known. */
-  select?: WithFieldFlags<NestedT>;
+  select?: WithFieldFlags<NestedT> | undefined;
   /** Exclude these fields from the relation. Key-checked against the target when it is known. */
-  omit?: WithFieldFlags<NestedT>;
+  omit?: WithFieldFlags<NestedT> | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -651,17 +677,43 @@ export interface WithOptions<NestedR extends object = Record<never, never>, Nest
  * @typeParam Cardinality - `'many'` (array) or `'one'` (single object | null).
  * @typeParam Relations   - The target entity's own `*Relations` interface, or
  *                          `{}` if the target has no relations of its own.
+ * @typeParam Kind        - The relation kind (`'belongsTo'`, `'hasOne'`, ...).
+ *                          The write input types use it: a belongsTo takes the
+ *                          to-one nested write operations. Optional:
+ *                          the default (any kind) keeps the to-many write
+ *                          shape, and a descriptor written with three
+ *                          arguments still accepts a generated one.
+ * @typeParam Nullable    - `false` for a belongsTo whose foreign key is NOT
+ *                          NULL: the row always points at a target, so a loaded
+ *                          relation is never null. A `where` on the relation
+ *                          (`with: { author: { where } }`) brings `| null` back.
+ *                          A global filter on the target table can also hide
+ *                          the row it points at; the type does not see global
+ *                          filters, so a client that filters a parent table
+ *                          should treat that relation as nullable. Defaults to
+ *                          `boolean`, which reads as nullable.
  */
-// biome-ignore lint/complexity/noBannedTypes: {} means target has no relations, intentional for code generator output
-export interface RelationDescriptor<Target, Cardinality extends 'one' | 'many', Relations extends object = {}> {
+export interface RelationDescriptor<
+  Target,
+  Cardinality extends 'one' | 'many',
+  // biome-ignore lint/complexity/noBannedTypes: {} means target has no relations, intentional for code generator output
+  Relations extends object = {},
+  Kind extends RelationKind | undefined = RelationKind | undefined,
+  Nullable extends boolean = boolean,
+> {
   readonly __target?: Target;
   readonly __cardinality?: Cardinality;
   readonly __relations?: Relations;
+  readonly __kind?: Kind;
+  readonly __nullable?: Nullable;
 }
+
+/** The relation kinds a {@link RelationDescriptor} can carry. */
+export type RelationKind = 'hasMany' | 'hasOne' | 'belongsTo' | 'manyToMany';
 
 /** Extract the target entity from a relation descriptor or bare relation type. */
 type RelationTarget<Rel> =
-  Rel extends RelationDescriptor<infer Target, infer _C, infer _R>
+  Rel extends RelationDescriptor<infer Target, infer _C, infer _R, infer _K, infer _N>
     ? Target
     : Rel extends Array<infer Item>
       ? Item
@@ -671,14 +723,32 @@ type RelationTarget<Rel> =
 
 /** Extract the target's relations map from a relation descriptor (or `{}` for bare types). */
 // biome-ignore lint/complexity/noBannedTypes: {} fallback for bare types without RelationDescriptor wrapping
-type RelationRelations<Rel> = Rel extends RelationDescriptor<infer _T, infer _C, infer R> ? R : {};
+type RelationRelations<Rel> = Rel extends RelationDescriptor<infer _T, infer _C, infer R, infer _K, infer _N> ? R : {};
 
-/** Project the target type into its runtime shape (array for many, single for one). */
-type ApplyCardinality<Rel, Resolved> =
-  Rel extends RelationDescriptor<infer _T, infer Cardinality, infer _R>
+/** Whether a relation descriptor is a belongsTo (the to-one nested write operations apply). */
+type IsBelongsTo<Rel> =
+  Rel extends RelationDescriptor<infer _T, infer _C, infer _R, infer K, infer _N>
+    ? [K] extends ['belongsTo']
+      ? true
+      : false
+    : false;
+
+/**
+ * Project the target type into its runtime shape: an array for a to-many
+ * relation, the row for a to-one relation that cannot be null (see
+ * {@link RelationDescriptor} `Nullable`), and `row | null` otherwise. `Opt` is
+ * the relation's `with` value: a `where` on a to-one relation can match
+ * nothing, so it keeps `| null`.
+ */
+type ApplyCardinality<Rel, Resolved, Opt = true> =
+  Rel extends RelationDescriptor<infer _T, infer Cardinality, infer _R, infer _K, infer Nullable>
     ? Cardinality extends 'many'
       ? Resolved[]
-      : Resolved | null
+      : [Nullable] extends [false]
+        ? [Opt] extends [{ where: object }]
+          ? Resolved | null
+          : Resolved
+        : Resolved | null
     : Rel extends Array<infer _Item>
       ? Resolved[]
       : Resolved | null;
@@ -718,42 +788,71 @@ export type WithResult<T, R extends object, W> = [keyof R] extends [never]
   : W extends object
     ? W extends { _count: infer C }
       ? // `_count` requested, add the typed count object alongside any relations.
-        WithRelationAdditions<T, R, W> & { _count: CountResult<C> }
+        WithRelationAdditions<T, R, W> & { _count: CountResult<C, R> }
       : WithRelationAdditions<T, R, W>
     : T;
 
 /**
  * The relation additions grafted onto `T` by a `with` clause (the `_count`
- * reserved key is handled separately by {@link WithResult}). Kept as its own
- * alias so the no-`_count` path stays byte-identical to the pre-`_count` type.
+ * reserved key is handled separately by {@link WithResult}). A relation
+ * named by an optional key is grafted as an optional property: the type
+ * cannot know whether the value at runtime includes it.
  */
 type WithRelationAdditions<T, R extends object, W> = [keyof W & keyof R] extends [never]
   ? T
   : T & {
-      [K in keyof W & keyof R]: W[K] extends true
-        ? // Leaf inclusion, no further `with`. Project the relation's runtime shape.
-          ApplyCardinality<R[K], RelationTarget<R[K]>>
-        : W[K] extends { with?: infer NestedW }
-          ? NestedW extends object
-            ? // Recursive case, drill into the target's relations map.
-              ApplyCardinality<R[K], WithResult<RelationTarget<R[K]>, RelationRelations<R[K]> & object, NestedW>>
-            : // `with` was passed but is not an object literal, treat as leaf.
-              ApplyCardinality<R[K], RelationTarget<R[K]>>
-          : // `WithOptions` was passed without a nested `with`, treat as leaf.
-            ApplyCardinality<R[K], RelationTarget<R[K]>>;
+      // Remapping over `keyof W` keeps each key's optionality: a `with` typed
+      // as TypedWithClause (args built in a variable or a helper) has every
+      // relation as an optional key, and those may or may not be loaded.
+      [K in keyof W as K extends keyof R ? K : never]: K extends keyof R
+        ? W[K] extends true
+          ? ApplyCardinality<R[K], RelationTarget<R[K]>>
+          : ApplyCardinality<
+              R[K],
+              ShapeRelated<
+                RelationTarget<R[K]>,
+                W[K] extends { with: infer NestedW extends object }
+                  ? WithResult<RelationTarget<R[K]>, RelationRelations<R[K]> & object, NestedW>
+                  : RelationTarget<R[K]>,
+                W[K]
+              >,
+              W[K]
+            >
+        : never;
     };
 
 /**
- * Compute the shape of the `_count` object on a result row. `_count: true`
- * counts every to-many relation (keys unknown at the type level → an open
- * `Record<string, number>`); the record form (`_count: { posts: true }`) yields
- * `{ [K in selected]: number }`.
+ * Apply a relation's `select` / `omit` to its loaded row: the selected (or not
+ * omitted) target columns, plus every relation its nested `with` added.
  */
-type CountResult<C> = C extends true
-  ? Record<string, number>
+type ShapeRelated<Target, Loaded, Opt> = [Opt] extends [{ select: infer S extends Record<string, boolean> }]
+  ? Pick<Loaded, Extract<keyof Loaded, Extract<keyof Target, TrueKeys<S>> | Exclude<keyof Loaded, keyof Target>>>
+  : [Opt] extends [{ omit: infer O extends Record<string, boolean> }]
+    ? Omit<Loaded, Extract<keyof Target, TrueKeys<O>>>
+    : Loaded;
+
+/**
+ * Compute the shape of the `_count` object on a result row. `_count: true`
+ * counts every to-many relation of the table; the record form
+ * (`_count: { posts: true }`) yields `{ [K in selected]: number }`.
+ */
+// biome-ignore lint/complexity/noBannedTypes: {} is the empty relations map, as on RelationDescriptor
+type CountResult<C, R = {}> = C extends true
+  ? [ToManyKeys<R>] extends [never]
+    ? Record<string, number>
+    : { [K in ToManyKeys<R>]: number }
   : C extends object
     ? { [K in keyof C]: number }
     : Record<string, number>;
+
+/** The to-many relation names of a relations map. */
+type ToManyKeys<R> = {
+  [K in keyof R]: R[K] extends RelationDescriptor<infer _T, infer C, infer _R, infer _K, infer _N>
+    ? C extends 'many'
+      ? K
+      : never
+    : never;
+}[keyof R];
 
 // ---------------------------------------------------------------------------
 // Select / Omit compile-time type narrowing
@@ -785,6 +884,17 @@ export type FieldFlags<T, S> = S extends object
         [K in keyof S]: K extends keyof T ? boolean : never;
       }
   : S;
+
+/**
+ * The `select` / `omit` parameter type. `S` is the inference site and
+ * {@link FieldFlags} rejects an unknown key. While an editor completes an
+ * empty `{}`, `S` is still its default `undefined`; that branch is the
+ * entity's fields, so they are what the editor offers. (The index signature
+ * keeps the branch assignable to the open flag map the builder reads.)
+ */
+export type FlagsArg<T, S> =
+  | ([S] extends [undefined] ? { [K in keyof T]?: boolean } & Record<string, boolean> : S & FieldFlags<T, S>)
+  | undefined;
 
 /** Extract keys from a boolean record where the value is `true`. */
 type TrueKeys<S extends Record<string, boolean>> = {
@@ -845,6 +955,25 @@ export type QueryResult<
       >
     : WithResult<T, R, W>;
 
+/**
+ * Row-lock strength for a locking read, PostgreSQL's four (`FOR UPDATE`,
+ * `FOR NO KEY UPDATE`, `FOR SHARE`, `FOR KEY SHARE`). MySQL has `'update'` and
+ * `'share'` only; SQLite, SQL Server and PowDB have none and refuse `lock`
+ * with `UnsupportedFeatureError` (E017).
+ */
+export type RowLockMode = 'update' | 'noKeyUpdate' | 'share' | 'keyShare';
+
+/**
+ * The `lock` read option: a {@link RowLockMode}, or the mode plus ONE wait
+ * policy. `noWait` fails at once with `LockNotAvailableError` when a row is
+ * locked by another transaction; `skipLocked` leaves such rows out of the
+ * result, so a page can come back short (the queue-claim pattern).
+ */
+export type RowLock =
+  | RowLockMode
+  | { mode: RowLockMode; noWait?: true | undefined; skipLocked?: undefined }
+  | { mode: RowLockMode; skipLocked?: true | undefined; noWait?: undefined };
+
 export interface FindUniqueArgs<
   T,
   // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches TypedWithClause default
@@ -852,28 +981,36 @@ export interface FindUniqueArgs<
   W extends TypedWithClause<R> = TypedWithClause<R>,
   S extends Record<string, boolean> | undefined = undefined,
   O extends Record<string, boolean> | undefined = undefined,
+  U = unknown,
 > {
-  /** Row selector. Keys are checked against `T` and `R` (see {@link WhereClause}). */
-  where: WhereClause<T, R>;
+  /**
+   * Row selector. Keys are checked against `T` and `R` (see {@link WhereClause}).
+   * `U` is the table's unique-key type (the generated `XWhereUnique`): when it
+   * is known, the selector must name one unique key or compound selector, and
+   * may add further filters beside it.
+   */
+  where: U & WhereClause<T, R>;
   /** Only return these fields. Keys are checked against `T` (see {@link FieldFlags}). */
-  select?: S & FieldFlags<T, S>;
+  select?: FlagsArg<T, S>;
   /** Exclude these fields. Keys are checked against `T` (see {@link FieldFlags}). */
-  omit?: O & FieldFlags<T, O>;
-  with?: W;
+  omit?: FlagsArg<T, O>;
+  with?: (W & TypedWithClause<R>) | undefined;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
+  timeout?: number | undefined;
   /** Override the client's relation-loading strategy for this query. See {@link RelationLoadStrategy}. */
-  relationLoadStrategy?: RelationLoadStrategy;
+  relationLoadStrategy?: RelationLoadStrategy | undefined;
   /** Override the client's {@link TurbineConfig.stableRelationOrder} for this query. */
-  stableRelationOrder?: boolean;
+  stableRelationOrder?: boolean | undefined;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
-  skipGlobalFilters?: SkipGlobalFilters;
+  skipGlobalFilters?: SkipGlobalFilters | undefined;
   /** Include PII-tagged columns (`includePii: UNSAFE`). See {@link FindManyArgs.includePii}. */
-  includePii?: Unsafe;
+  includePii?: Unsafe | undefined;
   /** Plan this query with its real parameter values. See {@link FindManyArgs.forceCustomPlan}. */
-  forceCustomPlan?: boolean;
+  forceCustomPlan?: boolean | undefined;
   /** Override the relation JSON wire encoding for this query. See {@link FindManyArgs.jsonEncoding}. */
-  jsonEncoding?: JsonEncoding;
+  jsonEncoding?: JsonEncoding | undefined;
+  /** Lock the returned row until the transaction ends. See {@link FindManyArgs.lock}. */
+  lock?: RowLock | undefined;
 }
 
 /**
@@ -900,23 +1037,23 @@ export interface FindManyArgs<
   O extends Record<string, boolean> | undefined = undefined,
 > {
   /** Row filter. Keys are checked against `T` and `R` (see {@link WhereClause}). */
-  where?: WhereClause<T, R>;
+  where?: WhereClause<T, R> | undefined;
   /** Only return these fields. Keys are checked against `T` (see {@link FieldFlags}). */
-  select?: S & FieldFlags<T, S>;
+  select?: FlagsArg<T, S>;
   /** Exclude these fields. Keys are checked against `T` (see {@link FieldFlags}). */
-  omit?: O & FieldFlags<T, O>;
-  orderBy?: TypedOrderByClause<T, R>;
-  limit?: number;
-  offset?: number;
-  with?: W;
+  omit?: FlagsArg<T, O>;
+  orderBy?: TypedOrderByClause<T, R> | undefined;
+  limit?: number | undefined;
+  offset?: number | undefined;
+  with?: (W & TypedWithClause<R>) | undefined;
   /** Cursor-based pagination: start after this row */
-  cursor?: Partial<T>;
+  cursor?: Partial<T> | undefined;
   /**
    * Prisma's spelling of {@link FindManyArgs.limit}. Folded into `limit` before
    * anything reads it; passing both with different values is a
    * `ValidationError`.
    */
-  take?: number;
+  take?: number | undefined;
   /**
    * Prisma's spelling of {@link FindManyArgs.offset}. Folded into `offset`
    * before anything reads it; passing both with different values is a
@@ -926,13 +1063,13 @@ export interface FindManyArgs<
    * not, so the Prisma pair `{ take, skip }` silently returned the first page
    * however far the caller thought they had paged.
    */
-  skip?: number;
+  skip?: number | undefined;
   /** De-duplicate results by specified fields */
-  distinct?: (keyof T & string)[];
+  distinct?: (keyof T & string)[] | undefined;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
+  timeout?: number | undefined;
   /** Override the client's relation-loading strategy for this query. See {@link RelationLoadStrategy}. */
-  relationLoadStrategy?: RelationLoadStrategy;
+  relationLoadStrategy?: RelationLoadStrategy | undefined;
   /**
    * Override the client's {@link TurbineConfig.stableRelationOrder} for this
    * query. When `true`, every to-many `with` relation that has no explicit
@@ -941,33 +1078,36 @@ export interface FindManyArgs<
    * per-relation `orderBy` always wins. Off by default; when off the emitted SQL
    * is byte-identical to before.
    */
-  stableRelationOrder?: boolean;
+  stableRelationOrder?: boolean | undefined;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
-  skipGlobalFilters?: SkipGlobalFilters;
+  skipGlobalFilters?: SkipGlobalFilters | undefined;
   /**
    * Per-call override of the unbounded-findMany warning. Pass `false` when
    * this call intentionally reads the full table (the config-level
    * `warnOnUnlimited` stays in effect for every other call); pass `true` to
    * force the warning even when it is disabled in config.
    */
-  warnOnUnlimited?: boolean;
+  warnOnUnlimited?: boolean | undefined;
   /**
    * Include PII-tagged columns (`defineSchema` `pii: true`) in the result.
    *
-   * PII columns are EXCLUDED from default projections: they come back only when
-   * explicitly named in `select`, or when this flag is `true`. Set it to `true`
-   * to return every PII column at the top level AND at every nested `with`
-   * level of this query. Default `false`. Schemas with no PII-tagged columns are
-   * unaffected (the emitted SQL is byte-identical either way).
+   * PII columns are EXCLUDED from default projections, and this flag is the
+   * only way to read one. With it, every PII column comes back at the top
+   * level AND at every nested `with` level of this query, and a `select` may
+   * name one. Without it, a `select` naming a PII column throws (E003): `select`
+   * can arrive in request data, so naming a column is not an opt-in. Schemas
+   * with no PII-tagged columns are unaffected (the emitted SQL is
+   * byte-identical either way).
    *
-   * Referencing a PII column in `where` / `orderBy` / `groupBy` / aggregates is
-   * always allowed regardless of this flag (the reference is explicit).
+   * Filtering or sorting on a PII column (`where`, `orderBy`) is always
+   * allowed, since it returns no PII value. Grouping by one, or `_min` / `_max`
+   * over one, needs the same flag on {@link GroupByArgs} / {@link AggregateArgs}.
    *
    * PRIVILEGE OPTION: unlocked by the {@link UNSAFE} sentinel only
    * (`includePii: UNSAFE`). A literal `true` throws (E003), because a request
    * body spread into these args must not be able to unlock the PII projection.
    */
-  includePii?: Unsafe;
+  includePii?: Unsafe | undefined;
   /**
    * Plan THIS query with its actual parameter values, every execution.
    * PostgreSQL only (see the refusal below).
@@ -1099,7 +1239,7 @@ export interface FindManyArgs<
    * so silently accepting the flag would report a guarantee that was never
    * made. Omitting it (or `false`) is accepted everywhere.
    */
-  forceCustomPlan?: boolean;
+  forceCustomPlan?: boolean | undefined;
   /**
    * Override {@link TurbineConfig.jsonEncoding} for this query: how a `with`
    * clause's relation rows are encoded on the wire.
@@ -1130,9 +1270,24 @@ export interface FindManyArgs<
    * A value that is neither `'object'` nor `'positional'` throws
    * {@link ValidationError} (E003) rather than being ignored.
    */
-  jsonEncoding?: JsonEncoding;
+  jsonEncoding?: JsonEncoding | undefined;
+  /**
+   * Lock the returned rows of THIS table until the transaction ends
+   * (`SELECT ... FOR UPDATE OF "t"` and friends, see {@link RowLock}).
+   *
+   * Only inside a transaction: outside one the lock is released before the
+   * call returns, so the read is refused (E003). Rows loaded through `with`
+   * are read, not locked, on every relation strategy; to lock them, run a
+   * second locking read on that table. Cannot be combined with `distinct`.
+   */
+  lock?: RowLock | undefined;
 }
 
+/**
+ * Streaming reads take the {@link FindManyArgs} surface minus `lock`: a cursor
+ * holds its rows across many fetches, so page with `findMany` inside the
+ * transaction instead.
+ */
 export interface FindManyStreamArgs<
   T,
   // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches TypedWithClause default
@@ -1140,7 +1295,7 @@ export interface FindManyStreamArgs<
   W extends TypedWithClause<R> = TypedWithClause<R>,
   S extends Record<string, boolean> | undefined = undefined,
   O extends Record<string, boolean> | undefined = undefined,
-> extends FindManyArgs<T, R, W, S, O> {
+> extends Omit<FindManyArgs<T, R, W, S, O>, 'lock'> {
   /**
    * Number of rows to fetch per internal FETCH batch (default: 1000).
    *
@@ -1152,7 +1307,22 @@ export interface FindManyStreamArgs<
    * cursor overhead entirely (no BEGIN / DECLARE / CLOSE / COMMIT) by
    * using a speculative `SELECT ... LIMIT batchSize+1` first.
    */
-  batchSize?: number;
+  batchSize?: number | undefined;
+  /**
+   * Close this stream's cursor and release its connection once the consumer
+   * has asked for nothing for this many milliseconds (no row from
+   * `findManyStream`, no batch from `findManyStreamBatches`). Overrides the
+   * client's `streamIdleTimeoutMs` (default 300000, five minutes). `0`
+   * disables it for this call.
+   *
+   * Only a stream that holds a connection between pulls is watched: one that
+   * fit in a single batch holds nothing, and one inside `$transaction` rides
+   * the caller's connection, which the transaction's own timeout bounds. On
+   * expiry Turbine logs `stream-idle-timeout` and the next pull, if one comes,
+   * throws `TimeoutError` (E002). Time Turbine spends fetching does not count.
+   * A whole number of milliseconds (E003 otherwise).
+   */
+  idleTimeoutMs?: number | undefined;
 }
 
 export interface CreateArgs<
@@ -1161,38 +1331,147 @@ export interface CreateArgs<
   R extends object = {},
   S extends Record<string, boolean> | undefined = undefined,
   O extends Record<string, boolean> | undefined = undefined,
+  D = never,
 > {
   /**
    * Row data. On typed clients, relation names additionally accept nested
    * write ops ({@link NestedCreateOp}): `create` / `connect` / `connectOrCreate`.
+   * A generated client passes its `XCreateInput` as `D`, which requires the
+   * columns the table requires. `never` (the default) means
+   * `CreateDataInput<T, R>`; a defaulted `D = CreateDataInput<T, R>` makes the
+   * builder's own `CreateArgs` conversions fail to typecheck.
    */
-  data: CreateDataInput<T, R>;
+  data: [D] extends [never] ? CreateDataInput<T, R> : D;
   /**
    * Return only these fields of the written row, instead of the whole row.
    * Keys are checked against `T` (see {@link FieldFlags}) and follow the read
    * rules: an unknown name throws E003, a `select` must name at least one field,
    * and it cannot be combined with `omit`. Narrows the `RETURNING` list itself,
    * so the unselected columns never cross the wire, which is the point on a
-   * table with a large JSON or text column. Naming a PII-tagged column here is
-   * the explicit opt-in that returns it, exactly as on a read.
+   * table with a large JSON or text column. A write never returns a PII-tagged
+   * column: naming one here throws (E003), so read the row back with
+   * `includePii: UNSAFE` instead.
    */
-  select?: S & FieldFlags<T, S>;
+  select?: FlagsArg<T, S>;
   /**
    * Return the written row without these fields. Same rules as `select`;
    * PII-tagged columns stay excluded, as they are from every default write
    * return.
    */
-  omit?: O & FieldFlags<T, O>;
+  omit?: FlagsArg<T, O>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
+  timeout?: number | undefined;
 }
 
-export interface CreateManyArgs<T> {
-  data: Partial<T>[];
-  /** When true, adds ON CONFLICT DO NOTHING to skip duplicate rows */
-  skipDuplicates?: boolean;
+export interface CreateManyArgs<
+  T,
+  D = OptionalInput<T>,
+  S extends Record<string, boolean> | undefined = undefined,
+  O extends Record<string, boolean> | undefined = undefined,
+> {
+  /** The rows. A generated client passes its `XCreate` as `D`. */
+  data: D[];
+  /** Skip rows that conflict on ANY unique constraint (ON CONFLICT DO NOTHING). */
+  skipDuplicates?: boolean | undefined;
+  /**
+   * Conflict handling on ONE named unique key: skip the conflicting rows, or
+   * update them. Cannot be combined with `skipDuplicates`. See
+   * {@link CreateManyOnConflict}.
+   */
+  onConflict?: CreateManyOnConflict<T> | undefined;
+  /**
+   * Return only these fields of the written rows. Same rules as `create()`:
+   * a PII-tagged column is never returned, and naming one throws (E003).
+   */
+  select?: FlagsArg<T, S>;
+  /** Return the written rows without these fields. Same rules as `select`. */
+  omit?: FlagsArg<T, O>;
+  /**
+   * Opt out of configured {@link GlobalFilters} on the conflict-UPDATE of
+   * `onConflict` (inserts are never filtered). See {@link SkipGlobalFilters}.
+   */
+  skipGlobalFilters?: SkipGlobalFilters | undefined;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
+  timeout?: number | undefined;
+}
+
+/**
+ * The columns of the primary key, or of one non-partial unique constraint or
+ * index, in any order. A `createMany` conflict target.
+ */
+export type ConflictTarget<T> = readonly [keyof T & string, ...(keyof T & string)[]];
+
+/**
+ * `createMany({ onConflict })`: what to do with a row whose `target` key
+ * already exists.
+ *
+ * - `{ target, ignore: true }` skips it (it is not returned). A conflict on a
+ *   DIFFERENT unique key still raises `UniqueConstraintError`.
+ * - `{ target, update }` updates the existing row. `update` is a field list
+ *   (each listed column takes the incoming row's value) or a per-column
+ *   {@link ConflictUpdateData} object. `where` limits the update to existing
+ *   rows that match it; a row it excludes is left alone and not returned.
+ *
+ * The result holds the rows inserted or updated, in no guaranteed order.
+ */
+export type CreateManyOnConflict<T> =
+  | { target: ConflictTarget<T>; ignore: true; update?: undefined; where?: undefined }
+  | {
+      target: ConflictTarget<T>;
+      update: readonly (keyof T & string)[] | ConflictUpdateData<T>;
+      where?: WhereClause<T> | undefined;
+      ignore?: undefined;
+    };
+
+/**
+ * The per-column update of a `createMany` conflict. A plain value is the same
+ * for every row; an atomic operator, a {@link SqlExpr}, `col(...)` (the
+ * existing row) and `expr.excluded(...)` (the incoming row) are per row.
+ */
+export type ConflictUpdateData<T> = {
+  [K in keyof T]?: T[K] | UpdateOperatorInput<T[K]> | SqlExpr<T[K]> | ColumnRef | ExcludedRef | undefined;
+};
+
+/** The node kinds an update expression is built from (see {@link SqlExpr}). */
+export type SqlExprKind =
+  | 'add'
+  | 'sub'
+  | 'mul'
+  | 'div'
+  | 'coalesce'
+  | 'greatest'
+  | 'least'
+  | 'case'
+  | 'now'
+  | 'excluded';
+
+/** Carries the phantom result type of a {@link SqlExpr}. Type-level only. */
+declare const SQL_EXPR_RESULT: unique symbol;
+
+/**
+ * A SQL expression in update data, built only by the `expr` constructors
+ * (`expr.add`, `expr.greatest`, `expr.now`, ...). `V` is the expression's
+ * result type, so an expression typechecks only against a column it can be
+ * stored in. The node is frozen and branded: a look-alike plain object (what
+ * `JSON.parse` produces) is a value, never SQL.
+ */
+export interface SqlExpr<V = unknown> {
+  readonly [SQL_EXPR]: true;
+  readonly kind: SqlExprKind;
+  readonly args: readonly unknown[];
+  /** Phantom: the result type. Never present at run time. */
+  readonly [SQL_EXPR_RESULT]?: V;
+}
+
+/**
+ * `expr.excluded(field)`: the incoming row's value for `field` inside an
+ * upsert's update or a `createMany` `onConflict.update` (PostgreSQL's
+ * `EXCLUDED."c"`). Refused (E003) anywhere else.
+ */
+export interface ExcludedRef<F extends string = string> extends SqlExpr<never> {
+  readonly [EXCLUDED_REF]: true;
+  readonly kind: 'excluded';
+  readonly field: F;
 }
 
 /**
@@ -1215,12 +1494,52 @@ export type UpdateOperatorInput<V> =
   | (V extends number ? { divide: number } : never);
 
 /**
- * Update data, each field can be a plain value or an atomic operator object.
- * Back-compatible with `Partial<T>`: plain values still typecheck unchanged.
+ * Update data: each field takes a plain value, an atomic operator object, a
+ * {@link SqlExpr} whose result fits the column, or `col(...)` to copy another
+ * column of the same row. Back-compatible with `Partial<T>`: plain values
+ * still typecheck unchanged.
  */
 export type UpdateInput<T> = {
-  [K in keyof T]?: T[K] | UpdateOperatorInput<T[K]>;
+  [K in keyof T]?: T[K] | UpdateOperatorInput<T[K]> | SqlExpr<T[K]> | ColumnRef | undefined;
 };
+
+/**
+ * `Partial<T>` that also admits an explicit `undefined` per key, which every
+ * write path treats as "leave this column out". Spelled out so a consumer
+ * compiling with `exactOptionalPropertyTypes` can pass `{ name: maybeName }`.
+ */
+export type OptionalInput<T> = {
+  [K in keyof T]?: T[K] | undefined;
+};
+
+/**
+ * The write and lookup input types one table's accessor uses. A generated
+ * client passes its per-table `XInputs` interface as the third type argument
+ * of `QueryInterface`; untyped clients get {@link DefaultInputTypes}.
+ */
+export interface TableInputTypes {
+  /** `create()` data, nested relation writes included. */
+  create: object;
+  /** One row of `createMany()` data, and `upsert()`'s `create`. */
+  createMany: object;
+  /** `update()` data, nested relation writes included. */
+  update: object;
+  /** `updateMany()` data, and `upsert()`'s `update`. */
+  updateMany: object;
+  /** The unique-key selector for `findUnique` / `upsert` (`unknown` when unknown). */
+  whereUnique: unknown;
+}
+
+/** The {@link TableInputTypes} an accessor uses when no generated input types are supplied. */
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
+export interface DefaultInputTypes<T, R extends object = {}> extends TableInputTypes {
+  /** `never` selects {@link CreateArgs}' own default, `CreateDataInput<T, R>`. */
+  create: never;
+  createMany: OptionalInput<T>;
+  update: UpdateDataInput<T, R>;
+  updateMany: UpdateInput<T>;
+  whereUnique: unknown;
+}
 
 export interface UpdateArgs<
   T,
@@ -1228,6 +1547,7 @@ export interface UpdateArgs<
   R extends object = {},
   S extends Record<string, boolean> | undefined = undefined,
   O extends Record<string, boolean> | undefined = undefined,
+  D = UpdateDataInput<T, R>,
 > {
   /** Row selector. Keys are checked against `T` and `R` (see {@link WhereClause}). */
   where: WhereClause<T, R>;
@@ -1236,25 +1556,26 @@ export interface UpdateArgs<
    * write ops ({@link NestedUpdateOp}): `create` / `connect` / `connectOrCreate`
    * / `disconnect` / `set` / `delete` / `update` / `upsert`.
    */
-  data: UpdateDataInput<T, R>;
+  data: D;
   /**
    * Return only these fields of the updated row, instead of the whole row.
    * Keys are checked against `T` (see {@link FieldFlags}) and follow the read
    * rules: an unknown name throws E003, a `select` must name at least one field,
    * and it cannot be combined with `omit`. Narrows the `RETURNING` list itself,
    * so the unselected columns never cross the wire, which is the point on a
-   * table with a large JSON or text column. Naming a PII-tagged column here is
-   * the explicit opt-in that returns it, exactly as on a read.
+   * table with a large JSON or text column. A write never returns a PII-tagged
+   * column: naming one here throws (E003), so read the row back with
+   * `includePii: UNSAFE` instead.
    */
-  select?: S & FieldFlags<T, S>;
+  select?: FlagsArg<T, S>;
   /**
    * Return the updated row without these fields. Same rules as `select`;
    * PII-tagged columns stay excluded, as they are from every default write
    * return.
    */
-  omit?: O & FieldFlags<T, O>;
+  omit?: FlagsArg<T, O>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
+  timeout?: number | undefined;
   /**
    * Opt in to running this mutation when `where` resolves to an empty
    * predicate (e.g. `{}` or `{ id: undefined }`). Default `false`, an
@@ -1267,7 +1588,7 @@ export interface UpdateArgs<
    * last thing standing between a spread request body and an unconditional
    * `UPDATE` / `DELETE` over the whole table.
    */
-  allowFullTableScan?: Unsafe;
+  allowFullTableScan?: Unsafe | undefined;
   /**
    * Optimistic locking, prevents lost updates in concurrent scenarios.
    * Specify the version field and its expected value. The update adds a
@@ -1285,21 +1606,21 @@ export interface UpdateArgs<
    * //            WHERE id=$2 AND version=$3 RETURNING *
    * ```
    */
-  optimisticLock?: { field: keyof T & string; expected: number };
+  optimisticLock?: { field: keyof T & string; expected: number } | undefined;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
-  skipGlobalFilters?: SkipGlobalFilters;
+  skipGlobalFilters?: SkipGlobalFilters | undefined;
 }
 
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
-export interface UpdateManyArgs<T, R extends object = {}> {
+export interface UpdateManyArgs<T, R extends object = {}, D = UpdateInput<T>> {
   where: WhereClause<T, R>;
-  data: UpdateInput<T>;
+  data: D;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
+  timeout?: number | undefined;
   /** See {@link UpdateArgs.allowFullTableScan}. */
-  allowFullTableScan?: Unsafe;
+  allowFullTableScan?: Unsafe | undefined;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
-  skipGlobalFilters?: SkipGlobalFilters;
+  skipGlobalFilters?: SkipGlobalFilters | undefined;
 }
 
 export interface DeleteArgs<
@@ -1316,33 +1637,34 @@ export interface DeleteArgs<
    * rules: an unknown name throws E003, a `select` must name at least one field,
    * and it cannot be combined with `omit`. Narrows the `RETURNING` list itself,
    * so the unselected columns never cross the wire, which is the point on a
-   * table with a large JSON or text column. Naming a PII-tagged column here is
-   * the explicit opt-in that returns it, exactly as on a read.
+   * table with a large JSON or text column. A write never returns a PII-tagged
+   * column: naming one here throws (E003), so read the row back with
+   * `includePii: UNSAFE` instead.
    */
-  select?: S & FieldFlags<T, S>;
+  select?: FlagsArg<T, S>;
   /**
    * Return the deleted row without these fields. Same rules as `select`;
    * PII-tagged columns stay excluded, as they are from every default write
    * return.
    */
-  omit?: O & FieldFlags<T, O>;
+  omit?: FlagsArg<T, O>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
+  timeout?: number | undefined;
   /** See {@link UpdateArgs.allowFullTableScan}. */
-  allowFullTableScan?: Unsafe;
+  allowFullTableScan?: Unsafe | undefined;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
-  skipGlobalFilters?: SkipGlobalFilters;
+  skipGlobalFilters?: SkipGlobalFilters | undefined;
 }
 
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
 export interface DeleteManyArgs<T, R extends object = {}> {
   where: WhereClause<T, R>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
+  timeout?: number | undefined;
   /** See {@link UpdateArgs.allowFullTableScan}. */
-  allowFullTableScan?: Unsafe;
+  allowFullTableScan?: Unsafe | undefined;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
-  skipGlobalFilters?: SkipGlobalFilters;
+  skipGlobalFilters?: SkipGlobalFilters | undefined;
 }
 
 export interface UpsertArgs<
@@ -1351,37 +1673,42 @@ export interface UpsertArgs<
   R extends object = {},
   S extends Record<string, boolean> | undefined = undefined,
   O extends Record<string, boolean> | undefined = undefined,
+  U = unknown,
+  C = OptionalInput<T>,
+  D = UpdateInput<T>,
 > {
-  where: WhereClause<T, R>;
+  /** The row to update. A generated client passes its `XWhereUnique` as `U`, so this names a unique key. */
+  where: U & WhereClause<T, R>;
   /**
    * Return only these fields of the inserted or updated row, instead of the whole row.
    * Keys are checked against `T` (see {@link FieldFlags}) and follow the read
    * rules: an unknown name throws E003, a `select` must name at least one field,
    * and it cannot be combined with `omit`. Narrows the `RETURNING` list itself,
    * so the unselected columns never cross the wire, which is the point on a
-   * table with a large JSON or text column. Naming a PII-tagged column here is
-   * the explicit opt-in that returns it, exactly as on a read.
+   * table with a large JSON or text column. A write never returns a PII-tagged
+   * column: naming one here throws (E003), so read the row back with
+   * `includePii: UNSAFE` instead.
    */
-  select?: S & FieldFlags<T, S>;
+  select?: FlagsArg<T, S>;
   /**
    * Return the inserted or updated row without these fields. Same rules as `select`;
    * PII-tagged columns stay excluded, as they are from every default write
    * return.
    */
-  omit?: O & FieldFlags<T, O>;
+  omit?: FlagsArg<T, O>;
   /** The row to insert when `where` matches nothing. Plain values only: there is no stored value to operate on yet. */
-  create: Partial<T>;
+  create: C;
   /**
    * Applied to the existing row on conflict. Each field takes a plain value or
    * the same atomic {@link UpdateOperatorInput} `update()` takes, so
    * `count: { increment: 1 }` adds to the stored value instead of overwriting
    * it. Scalar fields only: nested relation writes are not part of an upsert.
    */
-  update: UpdateInput<T>;
+  update: D;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
+  timeout?: number | undefined;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
-  skipGlobalFilters?: SkipGlobalFilters;
+  skipGlobalFilters?: SkipGlobalFilters | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -1411,15 +1738,15 @@ export interface ConnectOrCreateOp<T, TR extends object = {}> {
 /** Nested write ops valid inside `create()` data for a relation field. */
 // biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations", matches RelationDescriptor default
 export interface NestedCreateOp<T, TR extends object = {}> {
-  create?: CreateDataInput<T, TR> | CreateDataInput<T, TR>[];
-  connect?: Partial<T> | Partial<T>[];
-  connectOrCreate?: ConnectOrCreateOp<T, TR> | ConnectOrCreateOp<T, TR>[];
+  create?: CreateDataInput<T, TR> | CreateDataInput<T, TR>[] | undefined;
+  connect?: Partial<T> | Partial<T>[] | undefined;
+  connectOrCreate?: ConnectOrCreateOp<T, TR> | ConnectOrCreateOp<T, TR>[] | undefined;
 }
 
 /** A nested `update` op item: update the related row(s) matching `where`. `where` is optional for belongsTo relations (derived from the parent's FK). */
 // biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations", matches RelationDescriptor default
 export interface NestedUpdateOpItem<T, TR extends object = {}> {
-  where?: Partial<T>;
+  where?: Partial<T> | undefined;
   data: UpdateDataInput<T, TR>;
 }
 
@@ -1431,17 +1758,44 @@ export interface NestedUpsertOpItem<T, TR extends object = {}> {
   update: UpdateDataInput<T, TR>;
 }
 
+/**
+ * Nested write ops for a belongsTo relation inside `create()` data. The row
+ * points at ONE target, so each op takes a single object.
+ */
+// biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations", matches RelationDescriptor default
+export interface NestedToOneCreateOp<T, TR extends object = {}> {
+  create?: CreateDataInput<T, TR> | undefined;
+  connect?: Partial<T> | undefined;
+  connectOrCreate?: ConnectOrCreateOp<T, TR> | undefined;
+}
+
+/**
+ * Nested write ops for a belongsTo relation inside `update()` data, with
+ * Prisma's to-one rules: single objects, no `set`, and `disconnect` /
+ * `delete` take `true` (or `{}`) for the connected row, `false` for a no-op,
+ * or a filter the connected row must match. At most one of create, connect,
+ * connectOrCreate, disconnect and delete per write (refused at runtime).
+ */
+// biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations", matches RelationDescriptor default
+export interface NestedToOneUpdateOp<T, TR extends object = {}> extends NestedToOneCreateOp<T, TR> {
+  disconnect?: boolean | Partial<T> | undefined;
+  delete?: boolean | Partial<T> | undefined;
+  /** Update the row this record points at. */
+  update?: { data: UpdateDataInput<T, TR> } | undefined;
+  upsert?: NestedUpsertOpItem<T, TR> | undefined;
+}
+
 /** Nested write ops valid inside `update()` data for a relation field. */
 // biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations", matches RelationDescriptor default
 export interface NestedUpdateOp<T, TR extends object = {}> {
-  create?: CreateDataInput<T, TR> | CreateDataInput<T, TR>[];
-  connect?: Partial<T> | Partial<T>[];
-  connectOrCreate?: ConnectOrCreateOp<T, TR> | ConnectOrCreateOp<T, TR>[];
-  disconnect?: Partial<T> | Partial<T>[];
-  set?: Partial<T>[];
-  delete?: Partial<T> | Partial<T>[];
-  update?: NestedUpdateOpItem<T, TR> | NestedUpdateOpItem<T, TR>[];
-  upsert?: NestedUpsertOpItem<T, TR> | NestedUpsertOpItem<T, TR>[];
+  create?: CreateDataInput<T, TR> | CreateDataInput<T, TR>[] | undefined;
+  connect?: Partial<T> | Partial<T>[] | undefined;
+  connectOrCreate?: ConnectOrCreateOp<T, TR> | ConnectOrCreateOp<T, TR>[] | undefined;
+  disconnect?: Partial<T> | Partial<T>[] | undefined;
+  set?: Partial<T>[] | undefined;
+  delete?: Partial<T> | Partial<T>[] | undefined;
+  update?: NestedUpdateOpItem<T, TR> | NestedUpdateOpItem<T, TR>[] | undefined;
+  upsert?: NestedUpsertOpItem<T, TR> | NestedUpsertOpItem<T, TR>[] | undefined;
 }
 
 /**
@@ -1452,9 +1806,11 @@ export interface NestedUpdateOp<T, TR extends object = {}> {
  */
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
 export type CreateDataInput<T, R extends object = {}> = [keyof R] extends [never]
-  ? Partial<T>
-  : Partial<T> & {
-      [K in keyof R]?: NestedCreateOp<RelationTarget<R[K]> & object, RelationRelations<R[K]> & object>;
+  ? OptionalInput<T>
+  : OptionalInput<T> & {
+      [K in keyof R]?: IsBelongsTo<R[K]> extends true
+        ? NestedToOneCreateOp<RelationTarget<R[K]> & object, RelationRelations<R[K]> & object>
+        : NestedCreateOp<RelationTarget<R[K]> & object, RelationRelations<R[K]> & object>;
     };
 
 /**
@@ -1467,18 +1823,20 @@ export type CreateDataInput<T, R extends object = {}> = [keyof R] extends [never
 export type UpdateDataInput<T, R extends object = {}> = [keyof R] extends [never]
   ? UpdateInput<T>
   : UpdateInput<T> & {
-      [K in keyof R]?: NestedUpdateOp<RelationTarget<R[K]> & object, RelationRelations<R[K]> & object>;
+      [K in keyof R]?: IsBelongsTo<R[K]> extends true
+        ? NestedToOneUpdateOp<RelationTarget<R[K]> & object, RelationRelations<R[K]> & object>
+        : NestedUpdateOp<RelationTarget<R[K]> & object, RelationRelations<R[K]> & object>;
     };
 
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
 export interface CountArgs<T, R extends object = {}> {
-  where?: WhereClause<T, R>;
+  where?: WhereClause<T, R> | undefined;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
+  timeout?: number | undefined;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
-  skipGlobalFilters?: SkipGlobalFilters;
+  skipGlobalFilters?: SkipGlobalFilters | undefined;
   /** Plan this query with its real parameter values. See {@link FindManyArgs.forceCustomPlan}. */
-  forceCustomPlan?: boolean;
+  forceCustomPlan?: boolean | undefined;
 }
 
 /**
@@ -1492,14 +1850,14 @@ export interface CountArgs<T, R extends object = {}> {
  * `MIN("title") > 'm'` is as valid as `MIN("views") > 10`).
  */
 export interface HavingComparisonOperator<V = number> {
-  equals?: V;
-  not?: V;
-  gt?: V;
-  gte?: V;
-  lt?: V;
-  lte?: V;
-  in?: V[];
-  notIn?: V[];
+  equals?: V | undefined;
+  not?: V | undefined;
+  gt?: V | undefined;
+  gte?: V | undefined;
+  lt?: V | undefined;
+  lte?: V | undefined;
+  in?: V[] | undefined;
+  notIn?: V[] | undefined;
 }
 
 /** The number-operand spelling, kept as the historical public name. */
@@ -1516,11 +1874,11 @@ export type HavingFilter<V = number> = V | HavingComparisonOperator<V>;
  *   viewCount: { _sum: { gt: 100 }, _avg: { lte: 50 } }
  */
 export interface HavingAggregateFilter<V = unknown> {
-  _sum?: HavingFilter;
-  _avg?: HavingFilter;
-  _min?: HavingFilter<V>;
-  _max?: HavingFilter<V>;
-  _count?: HavingFilter;
+  _sum?: HavingFilter | undefined;
+  _avg?: HavingFilter | undefined;
+  _min?: HavingFilter<V> | undefined;
+  _max?: HavingFilter<V> | undefined;
+  _count?: HavingFilter | undefined;
 }
 
 /**
@@ -1557,12 +1915,12 @@ export type HavingFieldFilter<V = unknown> = (HavingAggregateFilter<V> & WhereOp
  */
 export type HavingClause<T> = {
   /** Filter on `COUNT(*)` for the whole group. */
-  _count?: HavingFilter;
-  AND?: HavingClause<T> | HavingClause<T>[];
-  OR?: HavingClause<T>[];
-  NOT?: HavingClause<T> | HavingClause<T>[];
+  _count?: HavingFilter | undefined;
+  AND?: HavingClause<T> | HavingClause<T>[] | undefined;
+  OR?: HavingClause<T>[] | undefined;
+  NOT?: HavingClause<T> | HavingClause<T>[] | undefined;
 } & {
-  [K in keyof T & string]?: HavingFieldFilter<T[K]>;
+  [K in keyof T & string]?: HavingFieldFilter<T[K]> | undefined;
 };
 
 /**
@@ -1579,7 +1937,7 @@ export interface JsonPathGroupKey {
   /** JSON path into the column (each element a key or array index). Bound as one text[] param. */
   path: (string | number)[];
   /** Result key for the group value. Defaults to the last path segment. */
-  alias?: string;
+  alias?: string | undefined;
 }
 
 /**
@@ -1600,7 +1958,7 @@ export interface JsonPathAggregateTarget {
   /** JSON path into the column (each element a key or array index). Bound as one text[] param. */
   path: (string | number)[];
   /** Comparison/aggregation kind. `_sum`/`_avg` are always numeric; `_min`/`_max` default to text. */
-  type?: 'numeric' | 'text';
+  type?: 'numeric' | 'text' | undefined;
 }
 
 /**
@@ -1657,15 +2015,15 @@ export type GroupByAggregateOrderBy = Record<string, OrderDirection | OrderBySpe
  */
 export interface GroupByOrderBy {
   /** Order by the group's row count (requires `_count` to be selected). */
-  _count?: OrderDirection | OrderBySpec;
+  _count?: OrderDirection | OrderBySpec | undefined;
   /** Order by a requested `_sum` aggregate, keyed by its field/alias. */
-  _sum?: GroupByAggregateOrderBy;
+  _sum?: GroupByAggregateOrderBy | undefined;
   /** Order by a requested `_avg` aggregate, keyed by its field/alias. */
-  _avg?: GroupByAggregateOrderBy;
+  _avg?: GroupByAggregateOrderBy | undefined;
   /** Order by a requested `_min` aggregate, keyed by its field/alias. */
-  _min?: GroupByAggregateOrderBy;
+  _min?: GroupByAggregateOrderBy | undefined;
   /** Order by a requested `_max` aggregate, keyed by its field/alias. */
-  _max?: GroupByAggregateOrderBy;
+  _max?: GroupByAggregateOrderBy | undefined;
   /** A by-column field name or JSON group-key alias → direction or sort spec. */
   [key: string]: OrderDirection | OrderBySpec | GroupByAggregateOrderBy | undefined;
 }
@@ -1674,12 +2032,12 @@ export interface GroupByOrderBy {
 export interface GroupByArgs<T, R extends object = {}> {
   /** Group keys: plain column field names and/or JSON-path keys ({@link JsonPathGroupKey}). */
   by: ((keyof T & string) | JsonPathGroupKey)[];
-  where?: WhereClause<T, R>;
+  where?: WhereClause<T, R> | undefined;
   /**
    * PostgreSQL only: group over one representative row per column combination
    * (`SELECT DISTINCT ON … ORDER BY …` row source). See {@link GroupByDistinctOn}.
    */
-  distinctOn?: GroupByDistinctOn<T>;
+  distinctOn?: GroupByDistinctOn<T> | undefined;
   /**
    * Count each group. `true` (or omitted) → `_count: number` (COUNT(*)). The
    * record form counts per selection: the reserved `_all: true` key → COUNT(*),
@@ -1687,17 +2045,19 @@ export interface GroupByArgs<T, R extends object = {}> {
    * `_count: { _all: n, field: n }` (Prisma parity). Ordering/HAVING on `_count`
    * stays available whenever COUNT(*) is selected (`true`, omitted, or `_all`).
    */
-  _count?: true | ({ _all?: true } & Partial<Record<keyof T & string, boolean>>);
+  _count?: true | ({ _all?: true } & Partial<Record<keyof T & string, boolean>>) | undefined;
   /** Sum of numeric fields (or JSON paths: see {@link JsonPathAggregateTarget}) in each group */
-  _sum?: GroupByAggregateSpec<T>;
+  _sum?: GroupByAggregateSpec<T> | undefined;
   /** Average of numeric fields (or JSON paths) in each group */
-  _avg?: GroupByAggregateSpec<T>;
+  _avg?: GroupByAggregateSpec<T> | undefined;
   /** Minimum value of fields (or JSON paths) in each group */
-  _min?: GroupByAggregateSpec<T>;
+  _min?: GroupByAggregateSpec<T> | undefined;
   /** Maximum value of fields (or JSON paths) in each group */
-  _max?: GroupByAggregateSpec<T>;
+  _max?: GroupByAggregateSpec<T> | undefined;
+  /** Percentiles of fields in each group (PostgreSQL only). See {@link PercentileSpec}. */
+  _percentile?: Partial<Record<keyof T & string, PercentileSpec>> | undefined;
   /** Filter whole groups by their aggregate values (SQL HAVING). JSON-path aggregates key by their alias. */
-  having?: HavingClause<T>;
+  having?: HavingClause<T> | undefined;
   /**
    * Order the result groups. Keys may be any column the groupBy result actually
    * contains: a plain by-column field name, a JSON group-key alias (explicit
@@ -1709,34 +2069,34 @@ export interface GroupByArgs<T, R extends object = {}> {
    * Accepts a single object or a Prisma-style array of objects
    * (`[{ region: 'asc' }, { _count: 'desc' }]`, array order authoritative).
    */
-  orderBy?: GroupByOrderBy | GroupByOrderBy[];
+  orderBy?: GroupByOrderBy | GroupByOrderBy[] | undefined;
   /**
    * Cap the number of result groups (`LIMIT`, applied after `ORDER BY`). Useful
    * for "top N groups" queries; pair with `orderBy` for a deterministic set.
    */
-  limit?: number;
+  limit?: number | undefined;
   /**
    * Skip this many result groups (`OFFSET`, applied after `ORDER BY`). Paginates
    * grouped results; combine with `limit` and a deterministic `orderBy`.
    */
-  offset?: number;
+  offset?: number | undefined;
   /**
    * Opt in to grouping on / aggregating PII-tagged (`defineSchema` `pii: true`)
-   * columns. A PII column in `by`, and `_min` / `_max` over a PII column, return
-   * STORED VALUES, so without this they throw `ValidationError` (E003).
-   * `_count` (a count, not a value), `_sum` / `_avg`, and `where` / `orderBy` /
-   * `having` on PII columns stay allowed.
+   * columns. A PII column in `by`, and `_min` / `_max` / `_percentile` over a
+   * PII column, return STORED VALUES, so without this they throw
+   * `ValidationError` (E003). `_count` (a count, not a value), `_sum` / `_avg`,
+   * and `where` / `orderBy` / `having` on PII columns stay allowed.
    *
    * PRIVILEGE OPTION: unlocked by the {@link UNSAFE} sentinel only. See
    * {@link FindManyArgs.includePii}.
    */
-  includePii?: Unsafe;
+  includePii?: Unsafe | undefined;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
+  timeout?: number | undefined;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
-  skipGlobalFilters?: SkipGlobalFilters;
+  skipGlobalFilters?: SkipGlobalFilters | undefined;
   /** Plan this query with its real parameter values. See {@link FindManyArgs.forceCustomPlan}. */
-  forceCustomPlan?: boolean;
+  forceCustomPlan?: boolean | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -1794,7 +2154,8 @@ export type GroupByResult<T, A> = { [K in GroupByFieldKeys<T, A>]: T[K] } & Grou
   GroupBySumAvgPart<A, '_sum'> &
   GroupBySumAvgPart<A, '_avg'> &
   GroupByMinMaxPart<T, A, '_min'> &
-  GroupByMinMaxPart<T, A, '_max'>;
+  GroupByMinMaxPart<T, A, '_max'> &
+  PercentilePart<T, A>;
 
 /**
  * The `_count` block on a groupBy result row. Scalar `_count: true` (or an
@@ -1814,39 +2175,53 @@ type GroupByCountPart<A> = A extends { _count: infer C }
 /** Arguments for the standalone aggregate method */
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
 export interface AggregateArgs<T, R extends object = {}> {
-  where?: WhereClause<T, R>;
+  where?: WhereClause<T, R> | undefined;
   /**
    * Count rows. `true` → `_count: number` (COUNT(*)). The record form counts per
    * selection: the reserved `_all: true` key → COUNT(*), and each entity field
    * key → COUNT(that column) (non-null count), yielding
    * `_count: { _all: n, field: n }` (Prisma parity).
    */
-  _count?: true | ({ _all?: true } & Partial<Record<keyof T & string, boolean>>);
+  _count?: true | ({ _all?: true } & Partial<Record<keyof T & string, boolean>>) | undefined;
   /** Sum of numeric fields */
-  _sum?: Partial<Record<keyof T & string, boolean>>;
+  _sum?: Partial<Record<keyof T & string, boolean>> | undefined;
   /** Average of numeric fields */
-  _avg?: Partial<Record<keyof T & string, boolean>>;
+  _avg?: Partial<Record<keyof T & string, boolean>> | undefined;
   /** Minimum value of fields */
-  _min?: Partial<Record<keyof T & string, boolean>>;
+  _min?: Partial<Record<keyof T & string, boolean>> | undefined;
   /** Maximum value of fields */
-  _max?: Partial<Record<keyof T & string, boolean>>;
+  _max?: Partial<Record<keyof T & string, boolean>> | undefined;
+  /**
+   * Percentiles of fields (PostgreSQL only; other engines throw E017).
+   *
+   * ```ts
+   * const s = await db.requests.aggregate({
+   *   _percentile: { latencyMs: { p: [0.5, 0.95, 0.99] }, statusCode: { p: 0.5, method: 'disc' } },
+   * });
+   * s._percentile.latencyMs;  // number[] | null
+   * s._percentile.statusCode; // number | null
+   * ```
+   *
+   * See {@link PercentileSpec}.
+   */
+  _percentile?: Partial<Record<keyof T & string, PercentileSpec>> | undefined;
   /**
    * Opt in to aggregating PII-tagged (`defineSchema` `pii: true`) columns.
-   * `_min` / `_max` return a STORED VALUE, so without this they throw
-   * `ValidationError` (E003) on a PII column. `_count` (a count, not a value)
-   * and `_sum` / `_avg` (a computed total over many rows) stay allowed, as do
-   * `where` filters on PII columns.
+   * `_min` / `_max` / `_percentile` return a STORED VALUE (or one that equals a
+   * stored value), so without this they throw `ValidationError` (E003) on a PII
+   * column. `_count` (a count, not a value) and `_sum` / `_avg` (a computed
+   * total over many rows) stay allowed, as do `where` filters on PII columns.
    *
    * PRIVILEGE OPTION: unlocked by the {@link UNSAFE} sentinel only. See
    * {@link FindManyArgs.includePii}.
    */
-  includePii?: Unsafe;
+  includePii?: Unsafe | undefined;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
-  timeout?: number;
+  timeout?: number | undefined;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */
-  skipGlobalFilters?: SkipGlobalFilters;
+  skipGlobalFilters?: SkipGlobalFilters | undefined;
   /** Plan this query with its real parameter values. See {@link FindManyArgs.forceCustomPlan}. */
-  forceCustomPlan?: boolean;
+  forceCustomPlan?: boolean | undefined;
 }
 
 /**
@@ -1865,31 +2240,116 @@ export interface AggregateResult<T> {
   _avg?: Partial<Record<keyof T & string, number | string | null>>;
   _min?: Partial<Record<keyof T & string, unknown>>;
   _max?: Partial<Record<keyof T & string, unknown>>;
+  _percentile?: Partial<Record<keyof T & string, unknown>>;
 }
+
+/**
+ * The result of `aggregate(args)`, derived from the args: only the blocks the
+ * call requested are present, each keyed by exactly the requested fields.
+ * `_sum` / `_avg` follow {@link AggregateResult}'s number-or-string rule;
+ * `_min` / `_max` carry the column's own type, or `null` over zero rows;
+ * `_percentile` follows {@link PercentileSpec}.
+ */
+export type AggregateResultOf<T, A> = AggregateCountPart<A> &
+  GroupBySumAvgPart<A, '_sum'> &
+  GroupBySumAvgPart<A, '_avg'> &
+  AggregateMinMaxPart<T, A, '_min'> &
+  AggregateMinMaxPart<T, A, '_max'> &
+  PercentilePart<T, A>;
+
+/**
+ * One `_percentile` entry: which fractions of a column to compute.
+ *
+ * - `p`: a fraction in [0, 1], or a non-empty array of them. The result
+ *   mirrors the shape: a scalar for a number, an array (in the same order)
+ *   for an array. A fraction outside [0, 1], `NaN` or `[]` throws E003.
+ * - `method`: `'cont'` (the default, `percentile_cont`) interpolates between
+ *   the two nearest values, so it needs a numeric or interval column. It
+ *   returns a `number` (a numeric or int8 column included), or an interval
+ *   read the way the column reads. `'cont'` on a date/time column throws E003.
+ *   `'disc'` (`percentile_disc`) returns an actual stored value of the
+ *   column, so it works on any sortable column and carries the column's own
+ *   type.
+ *
+ * Over zero rows the result is `null` (the whole array in the array form).
+ * Both methods need `includePii: UNSAFE` on a PII-tagged column.
+ */
+export interface PercentileSpec {
+  p: number | readonly number[];
+  method?: PercentileMethod | undefined;
+}
+
+/** `'cont'` interpolates (`percentile_cont`); `'disc'` returns a stored value (`percentile_disc`). */
+export type PercentileMethod = 'cont' | 'disc';
+
+/** One percentile value: the column's own type for `disc`; for `cont` a number, or an interval as the column reads. */
+type PercentileScalar<T, K, Spec> = K extends keyof T
+  ? Spec extends { method: 'disc' }
+    ? NonNullable<T[K]>
+    : [NonNullable<T[K]>] extends [number]
+      ? number
+      : number | NonNullable<T[K]>
+  : unknown;
+
+/** A scalar `p` yields one value, an array `p` yields an array, `null` over zero rows. */
+type PercentileValue<T, K, Spec> = Spec extends { p: infer P }
+  ? P extends readonly number[]
+    ? PercentileScalar<T, K, Spec>[] | null
+    : PercentileScalar<T, K, Spec> | null
+  : unknown;
+
+/** The `_percentile` block of an aggregate or groupBy result, present only when requested. */
+type PercentilePart<T, A> = A extends { _percentile: infer S }
+  ? [S] extends [object]
+    ? { _percentile: { [K in keyof S & string]: PercentileValue<T, K, S[K]> } }
+    : unknown
+  : unknown;
+
+type AggregateCountPart<A> = A extends { _count: infer C }
+  ? C extends true
+    ? { _count: number }
+    : [C] extends [object]
+      ? { _count: { [K in keyof C & string]: number } }
+      : unknown
+  : unknown;
+
+type AggregateMinMaxPart<T, A, Key extends '_min' | '_max'> = A extends { [P in Key]: infer S }
+  ? [S] extends [object]
+    ? { [P in Key]: { [K in keyof S & string]: (K extends keyof T ? T[K] : unknown) | null } }
+    : unknown
+  : unknown;
 
 /** Relation filter operators for where clauses */
 export interface RelationFilter {
-  some?: Record<string, unknown>;
-  every?: Record<string, unknown>;
-  none?: Record<string, unknown>;
+  some?: Record<string, unknown> | undefined;
+  every?: Record<string, unknown> | undefined;
+  none?: Record<string, unknown> | undefined;
   /** To-one relation match (bare objects on to-one keys are implicit `is`). */
-  is?: Record<string, unknown>;
-  isNot?: Record<string, unknown>;
+  is?: Record<string, unknown> | undefined;
+  isNot?: Record<string, unknown> | undefined;
 }
 
 /**
  * JSONB query operators for where clauses.
  *
- * PowDB (`turbine-orm/powdb`) semantic deltas. The PowDB engine evaluates
- * `->` path filters with full type knowledge, so a few behaviours differ from
- * the Postgres `#>>`-text driver (documented, never silently wrong):
+ * `{ path, equals }` compares the JSON VALUE at `path`, typed:
+ *   - PostgreSQL: `(col #> path)::jsonb = $v::jsonb`, so `equals: 7` matches a
+ *     JSON number 7 and not the string `"7"`, `equals: null` matches a JSON
+ *     null (not a missing key), and arrays and objects compare as JSON.
+ *   - SQLite: `json_extract` keeps numbers and strings apart; `equals` with a
+ *     boolean, null, array or object throws `UnsupportedFeatureError` (E017),
+ *     because SQLite extracts JSON booleans as 1 / 0 and null, arrays and
+ *     objects have no comparable form there.
+ *   - MySQL and SQL Server compare the extracted TEXT, so `equals: 7` also
+ *     matches `"7"`; null, arrays and objects throw E017.
+ *
+ * PowDB (`turbine-orm/powdb`) evaluates `->` path filters with full type
+ * knowledge:
  *   - `{ path, equals: null }` matches JSON null OR a MISSING key on PowDB
- *     (compiles to `is null`), whereas the PG driver compares extracted text
- *     against the string `'null'` and matches only a JSON string `"null"`.
- *   - equality is TYPE-STRICT on PowDB: `{ path, equals: 7 }` matches a stored
- *     JSON int `7` but not `7.0` or the JSON string `"7"` (PG text-extraction
- *     matches `equals: 7` against the string `"7"`). Range ops (`gt`/`lt`/…)
- *     still coerce int/float numerically.
+ *     (compiles to `is null`); PostgreSQL matches JSON null only.
+ *   - equality is TYPE-STRICT: `{ path, equals: 7 }` matches a stored JSON int
+ *     `7` but not `7.0` or the JSON string `"7"`. Range ops (`gt`/`lt`/…) still
+ *     coerce int/float numerically.
  *   - a digit-only path segment (`path: ['tags', '0']`) is an ARRAY INDEX on
  *     both PowDB and the SQL engines (a json object key that is literally `"0"`
  *     is likewise addressed by index).
@@ -1899,28 +2359,32 @@ export interface RelationFilter {
  */
 export interface JsonFilter {
   /**
-   * Access nested path via `#>>` operator (Postgres) / `->` path (PowDB). A
+   * Access a nested path (`#>` / `#>>` on Postgres, `->` on PowDB). A
    * digit-only segment (`'0'`) is treated as an array index on every engine.
    */
-  path?: string[];
-  /** Exact match: `column @> value::jsonb` (containment). On PowDB, requires `path` and compares the typed value (throws E017 without `path`). */
-  equals?: unknown;
+  path?: string[] | undefined;
+  /**
+   * With `path`: the JSON value at the path equals this value (typed on
+   * PostgreSQL, see {@link JsonFilter}). Without `path`: containment,
+   * `column @> value::jsonb` (E017 on PowDB).
+   */
+  equals?: unknown | undefined;
   /** Containment check: `column @> value::jsonb`. Unsupported on PowDB (E017: PowQL has no containment operator). */
-  contains?: unknown;
+  contains?: unknown | undefined;
   /** Key existence check: `column ? key`. */
-  hasKey?: string;
+  hasKey?: string | undefined;
   /**
    * Greater-than comparison of the value at `path` (required). Numbers cast
    * the extracted text to numeric, `(col #>> path)::numeric > $n`, while
    * strings compare as text.
    */
-  gt?: number | string;
+  gt?: number | string | undefined;
   /** Greater-than-or-equal comparison of the value at `path` (required). See {@link JsonFilter.gt}. */
-  gte?: number | string;
+  gte?: number | string | undefined;
   /** Less-than comparison of the value at `path` (required). See {@link JsonFilter.gt}. */
-  lt?: number | string;
+  lt?: number | string | undefined;
   /** Less-than-or-equal comparison of the value at `path` (required). See {@link JsonFilter.gt}. */
-  lte?: number | string;
+  lte?: number | string | undefined;
   /**
    * Substring match against the TEXT at `path` (required): `col #>> path LIKE
    * '%value%'`. This is Prisma's `string_contains`.
@@ -1929,29 +2393,29 @@ export interface JsonFilter {
    * whole-document containment (`@>`) and means something entirely different.
    * The operand is LIKE-escaped, so `%` and `_` match literally.
    */
-  stringContains?: string;
+  stringContains?: string | undefined;
   /** Prefix match against the text at `path` (required). Prisma's `string_starts_with`. See {@link JsonFilter.stringContains}. */
-  stringStartsWith?: string;
+  stringStartsWith?: string | undefined;
   /** Suffix match against the text at `path` (required). Prisma's `string_ends_with`. See {@link JsonFilter.stringContains}. */
-  stringEndsWith?: string;
+  stringEndsWith?: string | undefined;
   /**
    * Case-insensitive matching for the substring operators above (ILIKE on
    * PostgreSQL, the dialect's equivalent elsewhere). Has no effect on
    * `equals` / `contains` / `hasKey` / the range operators.
    */
-  mode?: 'default' | 'insensitive';
+  mode?: 'default' | 'insensitive' | undefined;
 }
 
 /** Array query operators for where clauses */
 export interface ArrayFilter {
   /** Check if array contains a single value: value = ANY(column) */
-  has?: unknown;
+  has?: unknown | undefined;
   /** Check if array contains ALL values: column @> ARRAY[...] */
-  hasEvery?: unknown[];
+  hasEvery?: unknown[] | undefined;
   /** Check if array has ANY of the values: column && ARRAY[...] */
-  hasSome?: unknown[];
+  hasSome?: unknown[] | undefined;
   /** Check if array is empty: array_length(column, 1) IS NULL */
-  isEmpty?: boolean;
+  isEmpty?: boolean | undefined;
 }
 
 /** Full-text search filter using PostgreSQL to_tsvector / to_tsquery */
@@ -1959,7 +2423,7 @@ export interface TextSearchFilter {
   /** The search query string passed to to_tsquery */
   search: string;
   /** PostgreSQL text search configuration name (defaults to 'english') */
-  config?: string;
+  config?: string | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -1996,13 +2460,13 @@ export interface VectorDistanceFilter {
   /** Distance metric → operator. */
   metric: VectorMetric;
   /** distance < threshold */
-  lt?: number;
+  lt?: number | undefined;
   /** distance <= threshold */
-  lte?: number;
+  lte?: number | undefined;
   /** distance > threshold */
-  gt?: number;
+  gt?: number | undefined;
   /** distance >= threshold */
-  gte?: number;
+  gte?: number | undefined;
 }
 
 /** Vector query operators for where clauses (pgvector). */
@@ -2026,7 +2490,7 @@ export interface VectorOrderByDistance {
   to: number[];
   metric: VectorMetric;
   /** Sort direction for the computed distance. Defaults to `'asc'` (nearest first). */
-  direction?: OrderDirection;
+  direction?: OrderDirection | undefined;
 }
 
 /** Per-column orderBy value: a plain direction or a vector-distance ordering. */
@@ -2044,7 +2508,7 @@ export interface VectorOrderBy {
  */
 export interface OrderBySpec {
   sort: OrderDirection;
-  nulls?: 'first' | 'last';
+  nulls?: 'first' | 'last' | undefined;
 }
 
 /**
@@ -2067,9 +2531,9 @@ export interface JsonPathOrderBy {
   /** JSON path into the column (each element a key or array index). Bound as one text[] param. */
   path: (string | number)[];
   /** Sort direction. Defaults to `'asc'`. */
-  direction?: OrderDirection;
+  direction?: OrderDirection | undefined;
   /** Comparison kind for the extracted value. Defaults to `'text'`; `'numeric'` adds a numeric cast. */
-  type?: 'numeric' | 'text';
+  type?: 'numeric' | 'text' | undefined;
   /**
    * NULLS placement (PostgreSQL / SQLite only: see {@link OrderBySpec}).
    * Rows whose document lacks the path extract to NULL and sort LAST in BOTH
@@ -2077,7 +2541,7 @@ export interface JsonPathOrderBy {
    * contract, so ordering is predictable across drivers); set `nulls` to
    * override on PostgreSQL / SQLite.
    */
-  nulls?: 'first' | 'last';
+  nulls?: 'first' | 'last' | undefined;
 }
 
 /**
@@ -2142,7 +2606,7 @@ export type RelationPickBy =
        */
       path: (string | number)[];
       /** Comparison kind for the extracted value. Defaults to `'text'`. */
-      type?: 'numeric' | 'text';
+      type?: 'numeric' | 'text' | undefined;
     };
 
 /**
@@ -2177,12 +2641,12 @@ export interface RelationPickOrderBy {
     /** Inner ORDER BY choosing the row (required for determinism). */
     orderBy: Record<string, OrderDirection | OrderBySpec | JsonPathOrderBy>;
     /** Optional filter on the candidate rows before picking. */
-    where?: Record<string, unknown>;
+    where?: Record<string, unknown> | undefined;
   };
   /** The value on the picked row to order the parents by. */
   by: RelationPickBy;
   /** Sort direction for the parents. Defaults to `'asc'`. */
-  direction?: OrderDirection;
+  direction?: OrderDirection | undefined;
   /**
    * NULLS placement (PostgreSQL / SQLite only: see {@link OrderBySpec}).
    *
@@ -2192,7 +2656,7 @@ export interface RelationPickOrderBy {
    * NULLS FIRST, which would put every childless parent at the top of a
    * "highest first" sort). Set `nulls` explicitly to override.
    */
-  nulls?: 'first' | 'last';
+  nulls?: 'first' | 'last' | undefined;
   /**
    * Physical plan for the pick. `'subquery'` (default) compiles a correlated
    * scalar subquery in ORDER BY. `'lateral'` (PostgreSQL only, E017 elsewhere)
@@ -2203,7 +2667,7 @@ export interface RelationPickOrderBy {
    * engines, `distinct`, nested `with` orderBy, a parent column literally named
    * `__turbine_pick`) throw.
    */
-  plan?: 'subquery' | 'lateral';
+  plan?: 'subquery' | 'lateral' | undefined;
 }
 
 /**

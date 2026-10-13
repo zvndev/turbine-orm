@@ -12,6 +12,8 @@ import { mockTable } from './helpers.js';
 const mysqlishDialect: Dialect = {
   ...postgresDialect,
   name: 'mysql',
+  // A MySQL stand-in answers MySQL's capability questions.
+  capabilities: mysqlDialect.capabilities,
   emptyJsonArrayLiteral: 'JSON_ARRAY()',
   nullJsonLiteral: 'NULL',
   supportsReturning: false,
@@ -223,7 +225,9 @@ describe('Dialect contract', () => {
     assert.match(sql, /CREATE TABLE `organizations`/);
     // `serial` now emits SERIAL (int4); the dialect translates it to INT AUTO_INCREMENT.
     assert.match(sql, /`id` INT AUTO_INCREMENT PRIMARY KEY/);
-    assert.match(sql, /`created_at` DATETIME NOT NULL DEFAULT NOW\(\)/);
+    // This test double maps timestamps to a bare DATETIME, and a MySQL default carries the precision of
+    // the type the dialect actually emits, so the default has none either.
+    assert.match(sql, /`created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP\n/);
     assert.match(sql, /`profile` JSON/);
     assert.match(sql, /REFERENCES `organizations`\(`id`\)/);
     assert.match(sql, /CREATE INDEX `idx_users_org_id` ON `users`\(`org_id`\);/);
@@ -254,6 +258,8 @@ describe('Dialect contract', () => {
 const sqliteishDialect: Dialect = {
   ...postgresDialect,
   name: 'sqlite',
+  // A SQLite stand-in answers SQLite's capability questions.
+  capabilities: sqliteDialect.capabilities,
   resultStrategy: 'returning', // SQLite ≥ 3.35 has RETURNING
   supportsReturning: true,
   supportsILike: false,
@@ -545,10 +551,21 @@ function mockPool(rowsFor: (sql: string) => Record<string, unknown>[]): {
       const params = typeof textOrConfig === 'string' ? (values ?? []) : (textOrConfig.values ?? []);
       calls.push({ sql, params });
       const rows = rowsFor(sql);
-      return { rows, rowCount: rows.length, fields: [] };
+      // A write with no returned rows reports one affected row, as a driver does.
+      const rowCount = rows.length > 0 || /^SELECT/.test(sql) ? rows.length : 1;
+      return { rows, rowCount, fields: [] };
     },
+    // A reselect write checks out one connection for its transaction.
+    connect: async () => ({ query: pool.query, release: () => {} }),
   };
   return { pool, calls };
+}
+
+/** The statements a reselect write sent, after checking they ran in one transaction. */
+function inTransaction(calls: MockCall[]): MockCall[] {
+  assert.equal(calls[0]?.sql, postgresDialect.beginStatement(), 'the write and its re-read share one transaction');
+  assert.equal(calls[calls.length - 1]?.sql, postgresDialect.commitStatement());
+  return calls.slice(1, -1);
 }
 
 function reselectQuery(pool: unknown, dialect: Dialect): QueryInterface<Record<string, unknown>> {
@@ -573,11 +590,12 @@ describe('resultStrategy execution', () => {
   };
 
   it("'reselect' create: INSERT (no RETURNING) then SELECT by primary key", async () => {
-    const { pool, calls } = mockPool((sql) => (sql.startsWith('SELECT') ? [{ id: 1, name: 'Ada' }] : []));
+    const { pool, calls: sent } = mockPool((sql) => (sql.startsWith('SELECT') ? [{ id: 1, name: 'Ada' }] : []));
     const q = reselectQuery(pool, reselectDialect);
     const created = await q.create({ data: { id: 1, name: 'Ada' } });
 
     assert.deepEqual(created, { id: 1, name: 'Ada' });
+    const calls = inTransaction(sent);
     assert.equal(calls.length, 2);
     assert.match(calls[0]!.sql, /^INSERT INTO `users`/);
     assert.doesNotMatch(calls[0]!.sql, /RETURNING/);
@@ -586,11 +604,12 @@ describe('resultStrategy execution', () => {
   });
 
   it("'reselect' update: UPDATE then SELECT by the same where", async () => {
-    const { pool, calls } = mockPool((sql) => (sql.startsWith('SELECT') ? [{ id: 1, name: 'Ada L.' }] : []));
+    const { pool, calls: sent } = mockPool((sql) => (sql.startsWith('SELECT') ? [{ id: 1, name: 'Ada L.' }] : []));
     const q = reselectQuery(pool, reselectDialect);
     const updated = await q.update({ where: { id: 1 }, data: { name: 'Ada L.' } });
 
     assert.deepEqual(updated, { id: 1, name: 'Ada L.' });
+    const calls = inTransaction(sent);
     assert.equal(calls.length, 2);
     assert.match(calls[0]!.sql, /^UPDATE `users` SET/);
     assert.doesNotMatch(calls[0]!.sql, /RETURNING/);
@@ -598,14 +617,16 @@ describe('resultStrategy execution', () => {
   });
 
   it("'reselect' delete: SELECT the row first, then DELETE, returning the captured row", async () => {
-    const { pool, calls } = mockPool((sql) => (sql.startsWith('SELECT') ? [{ id: 1, name: 'Ada' }] : []));
+    const { pool, calls: sent } = mockPool((sql) => (sql.startsWith('SELECT') ? [{ id: 1, name: 'Ada' }] : []));
     const q = reselectQuery(pool, reselectDialect);
     const deleted = await q.delete({ where: { id: 1 } });
 
     assert.deepEqual(deleted, { id: 1, name: 'Ada' });
+    const calls = inTransaction(sent);
     assert.equal(calls.length, 2);
-    // Pre-SELECT happens BEFORE the DELETE (the row is gone afterwards).
-    assert.match(calls[0]!.sql, /^SELECT \* FROM `users` WHERE `id` = \?$/);
+    // Pre-SELECT happens BEFORE the DELETE (the row is gone afterwards), and
+    // locks the row so a concurrent delete waits.
+    assert.match(calls[0]!.sql, /^SELECT \* FROM `users` WHERE `id` = \? FOR UPDATE$/);
     assert.match(calls[1]!.sql, /^DELETE FROM `users`/);
   });
 
@@ -620,7 +641,7 @@ describe('resultStrategy execution', () => {
   });
 
   it("'reselect' create falls back to the driver insert id when the PK is not supplied", async () => {
-    const { pool, calls } = mockPool((sql) => (sql.startsWith('SELECT') ? [{ id: 42, name: 'Hopper' }] : []));
+    const { pool, calls: sent } = mockPool((sql) => (sql.startsWith('SELECT') ? [{ id: 42, name: 'Hopper' }] : []));
     // Mock INSERT result carries a driver insertId (mysql2-style).
     const wrapped = {
       // biome-ignore lint/suspicious/noExplicitAny: augment the mock to emit an insertId on INSERT
@@ -631,11 +652,13 @@ describe('resultStrategy execution', () => {
         if (sql.startsWith('INSERT')) res.insertId = 42;
         return res;
       },
+      connect: async () => ({ query: wrapped.query, release: () => {} }),
     };
     const q = reselectQuery(wrapped, reselectDialect);
     const created = await q.create({ data: { name: 'Hopper' } });
 
     assert.deepEqual(created, { id: 42, name: 'Hopper' });
+    const calls = inTransaction(sent);
     assert.equal(calls.length, 2);
     assert.deepEqual(calls[1]!.params, [42]);
   });

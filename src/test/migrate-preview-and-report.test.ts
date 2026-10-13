@@ -30,7 +30,7 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { after, describe } from 'node:test';
@@ -102,7 +102,7 @@ function runCli(cwd: string, args: string[]): CliRun {
 
 /** A throwaway project directory with a `turbine/migrations` folder. */
 function project(tag: string): string {
-  const dir = join(tmpdir(), `turbine-preview-${tag}-${process.pid}-${Date.now()}`);
+  const dir = mkdtempSync(join(tmpdir(), `turbine-preview-${tag}-`));
   mkdirSync(join(dir, 'turbine', 'migrations'), { recursive: true });
   return dir;
 }

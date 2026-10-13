@@ -52,7 +52,7 @@
  *   the row selection).
  * - **Result strategy `'output'`:** create/update/delete/upsert return their rows
  *   from the same statement. `createMany` returns the inserted rows via
- *   `OUTPUT INSERTED.*` on the multi-row VALUES insert (≤ 1000 rows / 2100 params
+ *   `OUTPUT INSERTED.*` on the multi-row VALUES insert (≤ 1000 rows / 2098 params
  *   per statement, exceeding either throws a clear `ValidationError`; chunk
  *   yourself or use single `create`s).
  * - **MERGE concurrency caveat:** `MERGE` is the upsert primitive; under high
@@ -90,9 +90,17 @@
  * ```
  */
 
-import { type PgCompatPool, type PgCompatPoolClient, TurbineClient } from './client.js';
 import {
+  type DisconnectOptions,
+  type DisconnectResult,
+  type PgCompatPool,
+  type PgCompatPoolClient,
+  TurbineClient,
+} from './client.js';
+import {
+  type BuiltStatement,
   type BulkInsertStatementInput,
+  type BulkUpsertStatementInput,
   type ColumnDefinitionInput,
   type ColumnTypeInput,
   type CreateIndexStatementInput,
@@ -101,8 +109,10 @@ import {
   type DeleteStatementInput,
   type Dialect,
   type DialectIntrospector,
+  type EngineCapabilities,
   type InsertStatementInput,
   type IntrospectOptions,
+  type JsonPathEqualsInput,
   type JsonWireRule,
   type LimitOffsetInput,
   postgresDialect,
@@ -121,8 +131,9 @@ import {
   UnsupportedFeatureError,
   ValidationError,
 } from './errors.js';
-import { applyTableFilters, deriveEngineRelations } from './introspect.js';
+import { applyTableFilters, assertDistinctColumnFields, deriveEngineRelations, nullRecord } from './introspect.js';
 import importOptionalPeer from './optional-peer-import.cjs';
+import { orderByEntries } from './query/filters.js';
 import { availableClause } from './query/utils.js';
 import {
   type ColumnMetadata,
@@ -135,15 +146,33 @@ import {
   snakeToCamel,
   type TableMetadata,
 } from './schema.js';
+import { rewritePositionalPlaceholders } from './sql-placeholders.js';
 
 // ---------------------------------------------------------------------------
 // SQL Server / connection limits
 // ---------------------------------------------------------------------------
 
-/** Max bound parameters per SQL Server statement. */
-const MSSQL_MAX_PARAMS = 2100;
+/**
+ * Max bound parameters per SQL Server statement, as the driver sends them.
+ * The server's limit is 2100 per RPC call, and `mssql` runs a parameterized
+ * statement through `sp_executesql`, whose own `@stmt` and `@params` take two
+ * of them: measured, 2098 runs and 2099 is refused with error 8003.
+ */
+const MSSQL_MAX_PARAMS = 2098;
 /** Max rows per multi-row INSERT … VALUES statement. */
 const MSSQL_MAX_INSERT_ROWS = 1000;
+
+/** Integer column types narrower than 64 bits, in SQL Server and code-first (PostgreSQL) spellings. */
+const SMALL_INTEGER_TYPES: ReadonlySet<string> = new Set([
+  'tinyint',
+  'smallint',
+  'int',
+  'integer',
+  'int2',
+  'int4',
+  'serial',
+  'smallserial',
+]);
 
 /** Canonical key sort matching the query builder's `sortedEntries`/collect order. */
 function sortedRelEntries<V>(obj: Record<string, V>): [string, V][] {
@@ -164,6 +193,7 @@ type MssqlParam = null | number | bigint | string | boolean | Date | Uint8Array;
 
 interface MssqlRequest {
   input(name: string, value: unknown): MssqlRequest;
+  input(name: string, type: unknown, value: unknown): MssqlRequest;
   query<R = Record<string, unknown>>(text: string): Promise<MssqlQueryResult<R>>;
   batch<R = Record<string, unknown>>(text: string): Promise<MssqlQueryResult<R>>;
 }
@@ -204,6 +234,9 @@ interface MssqlModule {
   Request: new (parent: MssqlConnectionPool | MssqlTransaction) => MssqlRequest;
   Transaction: new (pool: MssqlConnectionPool) => MssqlTransaction;
   ISOLATION_LEVEL: Record<string, number>;
+  /** SQL types a parameter is declared with when the driver's own inference is wrong for it. */
+  BigInt?: unknown;
+  DateTime2?: (scale?: number) => unknown;
 }
 
 // ---------------------------------------------------------------------------
@@ -214,8 +247,9 @@ interface MssqlModule {
  * Coerce an arbitrary JS value into something `mssql` can bind. `BIT` accepts JS
  * booleans directly; `undefined`/`null` → NULL; `bigint` follows the safe-int
  * policy (number when it fits in 2^53, else a decimal string, no precision
- * loss); `Date`/`Uint8Array` pass through; any remaining object/array → JSON text
- * (matches how Turbine already pre-serializes JSON filter / `IN`-list params).
+ * loss); a `Date` passes through, a `Uint8Array` binds as a Buffer view (VARBINARY);
+ * any remaining object/array → JSON text
+ * (matches how Turbine already pre-serializes JSON filter params).
  */
 function toMssqlParam(value: unknown): MssqlParam {
   if (value === undefined || value === null) return null;
@@ -230,8 +264,49 @@ function toMssqlParam(value: unknown): MssqlParam {
         : value.toString();
   }
   if (value instanceof Date) return value;
-  if (value instanceof Uint8Array) return value; // Buffer is a Uint8Array subclass
+  // The driver infers VARBINARY only for a Buffer; any other Uint8Array was
+  // bound as NVARCHAR and refused ("Invalid string"). A Buffer view shares the
+  // bytes, so nothing is copied.
+  if (value instanceof Uint8Array) {
+    return Buffer.isBuffer(value) ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  }
   return JSON.stringify(value);
+}
+
+/**
+ * The JSON text an `in` / `notIn` list binds as. OPENJSON hands each element
+ * back as NVARCHAR text, and SQL Server converts that text to the compared
+ * column's type, so each element is written as the text that converts to the
+ * value `equals` would bind: a bigint as its digits (`JSON.stringify` refuses
+ * one) and a Date as its UTC date and time with no zone (the driver binds a
+ * Date as DATETIME2 in UTC; `JSON.stringify` adds a `Z`). No text converts to
+ * bytes, so a binary element is refused with the spelling that works.
+ */
+function mssqlInListJson(values: readonly unknown[]): string {
+  const parts = values.map((value): string => {
+    if (typeof value === 'bigint') return value.toString();
+    if (value instanceof Date) {
+      if (Number.isNaN(value.getTime())) {
+        throw new ValidationError(
+          'SQL Server cannot bind an Invalid Date in an `in` list. Pass a valid Date, or null.',
+        );
+      }
+      return JSON.stringify(value.toISOString().slice(0, 23));
+    }
+    if (value instanceof Uint8Array) {
+      throw new UnsupportedFeatureError(
+        'a binary value in an `in` / `notIn` list',
+        'mssql',
+        'SQL Server receives the list as JSON text, which cannot carry bytes. Write the list as branches: ' +
+          '`{ OR: [{ field: value1 }, { field: value2 }] }`, or use the default `join` relation strategy for ' +
+          'a relation keyed on a binary column.',
+      );
+    }
+    if (value === undefined) return 'null';
+    const bound = toMssqlParam(value);
+    return JSON.stringify(bound);
+  });
+  return `[${parts.join(',')}]`;
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +356,16 @@ function coerceBigIntColumns(rows: Record<string, unknown>[], columns: MssqlColu
 }
 
 const EMPTY_RESULT = { rows: [] as Record<string, unknown>[], rowCount: 0 };
+
+/** A JSON column's stored text as its value; text that is not JSON is returned as stored. */
+function parseJsonText(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
 
 /**
  * Augment a `mssql` driver error with the Postgres-shaped `.code` (SQLSTATE) and
@@ -354,17 +439,55 @@ function normalizeQueryArgs(arg: QueryArg, values?: unknown[]): { text: string; 
   return { text: arg.text, params: arg.values ?? values ?? [] };
 }
 
-/** Bind positional `params[]` to `@p1`, `@p2`, … inputs and run the statement. */
+/**
+ * Bind one parameter. Two value kinds get an explicit SQL type, because the
+ * driver's inference picks the wrong one for them:
+ *
+ *  - A JS `bigint` is declared BIGINT. Inferred, a small one became INT and one
+ *    past 2^53 an NVARCHAR string, and a multi-row `VALUES` list types each
+ *    column by the highest-precedence type across its rows, so a `createMany`
+ *    mixing the two converted the string to INT and failed ("overflowed an int
+ *    column").
+ *  - A `Date` is declared DATETIME2(7). Inferred, it is the legacy DATETIME,
+ *    whose 1/300 s ticks round milliseconds on the way in, so 23:59:59.999 was
+ *    stored as the next day's 00:00:00.000. DATETIME2 holds the exact instant
+ *    and converts to every temporal column type.
+ */
+function bindParam(request: MssqlRequest, name: string, value: unknown, types: MssqlModule | undefined): void {
+  if (typeof value === 'bigint' && types?.BigInt !== undefined) {
+    request.input(name, types.BigInt, value);
+    return;
+  }
+  if (value instanceof Date && !Number.isNaN(value.getTime()) && typeof types?.DateTime2 === 'function') {
+    request.input(name, types.DateTime2(7), value);
+    return;
+  }
+  request.input(name, toMssqlParam(value));
+}
+
+/** The refusal for a placeholder the shim cannot bind (see rewritePositionalPlaceholders). */
+function refusePlaceholder(message: string): never {
+  throw new ValidationError(message);
+}
+
+/**
+ * Bind positional `params[]` to `@p1`, `@p2`, … inputs and run the statement.
+ * A `$n` (the spelling `rawUnsafe` documents for every engine) is rewritten to
+ * `@pN` first: T-SQL reads `$1` as a MONEY literal, so it would run, compare
+ * against the number 1, and bind nothing.
+ */
 async function runRequest(
   request: MssqlRequest,
   text: string,
   params: unknown[],
+  types?: MssqlModule,
 ): Promise<ReturnType<typeof shapeResult>> {
+  const sql = rewritePositionalPlaceholders(text, 'mssql', params.length, (i) => `@p${i}`, refusePlaceholder);
   for (let i = 0; i < params.length; i++) {
-    request.input(`p${i + 1}`, toMssqlParam(params[i]));
+    bindParam(request, `p${i + 1}`, params[i], types);
   }
   try {
-    const result = await request.query(text);
+    const result = await request.query(sql);
     return shapeResult(result);
   } catch (err) {
     throw augmentMssqlError(err);
@@ -450,7 +573,7 @@ class MssqlTxClient implements PgCompatPoolClient {
     }
 
     const request = new this.sqlNS.Request(this.tx ?? this.pool);
-    return runRequest(request, rawSql, params);
+    return runRequest(request, rawSql, params, this.sqlNS);
   }
 
   release(): void {
@@ -498,7 +621,7 @@ export class MssqlPool implements PgCompatPool {
   // biome-ignore lint/suspicious/noExplicitAny: pg-compat query is generic over the row shape.
   async query(text: QueryArg, values?: unknown[]): Promise<any> {
     const { text: sql, params } = normalizeQueryArgs(text, values);
-    return runRequest(this.pool.request(), sql, params);
+    return runRequest(this.pool.request(), sql, params, this.sqlNS);
   }
 
   async connect(): Promise<PgCompatPoolClient> {
@@ -560,7 +683,9 @@ function mssqlColumnType(type: string, maxLength?: number | null): string {
   if (/TIMESTAMP|DATETIME/.test(t)) return 'DATETIME2';
   if (/\bDATE\b/.test(t)) return 'DATE';
   if (/\bTIME\b/.test(t)) return 'TIME';
-  if (/BYTEA|BLOB/.test(t)) return 'VARBINARY(MAX)';
+  // A bounded binary column is VARBINARY(n): VARBINARY(MAX) cannot be a key.
+  if (/VARBINARY/.test(t)) return `VARBINARY(${maxLength ?? 255})`;
+  if (/BYTEA|BLOB/.test(t)) return maxLength != null ? `VARBINARY(${maxLength})` : 'VARBINARY(MAX)';
   if (/VARCHAR/.test(t)) return maxLength != null ? `NVARCHAR(${maxLength})` : 'NVARCHAR(255)';
   if (/CHAR/.test(t)) return maxLength != null ? `NCHAR(${maxLength})` : 'NCHAR(255)';
   if (/TEXT|CLOB/.test(t)) return 'NVARCHAR(MAX)';
@@ -598,6 +723,45 @@ function mssqlOutput(returning: ReturningSelection | undefined, alias: 'INSERTED
 export const mssqlDialect: Dialect = {
   ...postgresDialect,
   name: 'mssql',
+  capabilities: Object.freeze({
+    distinctOn: false,
+    positionalJson: false,
+    nullsOrderingClause: false,
+    nullsSortHigh: false,
+    insensitiveInList: false,
+    jsonDocumentEquality: 'text',
+    jsonExtractTyped: false,
+    jsonExactNumericCast: false,
+    numericTextComparison: false,
+    enforcesForeignKeys: true,
+    partitionLimitPushdown: false,
+    utcTimestampRewrite: false,
+    paramTypeCasts: false,
+    namedEnumTypes: false,
+    // No JSON column type: json is NVARCHAR(MAX), so a text column holds JSON.
+    structuredValueColumns: 'scalars',
+    // The limit the driver can actually send (see MSSQL_MAX_PARAMS), not 2100.
+    maxBindParameters: MSSQL_MAX_PARAMS,
+    maxInsertRows: MSSQL_MAX_INSERT_ROWS,
+    upsertConflictTarget: 'explicit',
+    setClauseOrder: 'snapshot',
+    reselectLocksRows: false,
+    integerDivision: '/',
+    updateExpressions: true,
+    // MERGE refuses a target row matched twice (error 8672).
+    bulkUpsertAppliesRepeatedKeys: false,
+    readOnlyTransactions: false,
+    connectionParameters: false,
+    backendCancel: false,
+    idleTransactionTimeout: false,
+    abortsTransactionOnError: false,
+    connectionDriver: 'engine-driver',
+    preparesEveryStatement: false,
+    statementSyntax: 'mssql',
+    inlineForeignKeys: true,
+    // NVARCHAR(MAX) / VARBINARY(MAX) cannot be an index key column.
+    unboundedTextKeys: false,
+  } satisfies EngineCapabilities),
   // No RETURNING → the statement emits its rows via OUTPUT INSERTED.* in ONE
   // round-trip (Phase-0 'output' strategy, executed like 'returning').
   resultStrategy: 'output',
@@ -621,6 +785,17 @@ export const mssqlDialect: Dialect = {
   // is Postgres-only (out of scope here).
   supportsLateralJoin: false,
   supportsPlanCacheMode: false,
+  // SQL Server locks through table hints, not a trailing clause: not in this
+  // release.
+  rowLockModes: [],
+  // PERCENTILE_CONT is a window function here (OVER required), so it does not
+  // combine with other aggregates in one statement.
+  supportsPercentileAggregates: false,
+  // MERGE ... WITH (HOLDLOCK).
+  supportsBulkUpsert: true,
+  // Both MERGE forms alias the target `T` (and the incoming rows `S`), so the
+  // conflict-UPDATE reads the existing row through `T.`, never the table name.
+  upsertTargetAlias: 'T',
   // sp_getapplock / sp_releaseapplock exist (used by a future migrate adapter).
   supportsAdvisoryLock: true,
   // No in-band EXPLAIN: SQL Server's SHOWPLAN is a session toggle
@@ -684,7 +859,9 @@ export const mssqlDialect: Dialect = {
     // returned `1`, i.e. the strategy silently changed the caller's value
     // types. Above 2^53 all three keep the string, which is the point of
     // carrying text at all.
-    if (t === 'bigint') {
+    // `int8` is the spelling a code-first (`defineSchema`) schema records for
+    // the same BIGINT column, so it needs the same rule.
+    if (t === 'bigint' || t === 'int8') {
       return {
         sql: (ref) => `CAST(${ref} AS NVARCHAR(50))`,
         decode: (value) => {
@@ -702,7 +879,8 @@ export const mssqlDialect: Dialect = {
     // nvarchar cell as a JSON *string* (only `buildRelationSubquery`'s nested
     // relations are JSON_QUERY-wrapped, never a scalar column), so parsing the
     // row hands back exactly the string the driver returns for a top-level
-    // read. Both routes already agree, and casting would only add noise. This
+    // read. Both routes already agree, and casting would only add noise; the
+    // text is parsed for both by `decodeColumnValue` in the row parser. This
     // is the divergence MySQL DOES have, where JSON_OBJECT embeds a real JSON
     // column as a nested value while the driver hands back text.
     //
@@ -718,21 +896,43 @@ export const mssqlDialect: Dialect = {
     return undefined;
   },
 
+  // A json/jsonb column is NVARCHAR(MAX) here, so the driver hands back the
+  // document's text, and FOR JSON PATH embeds that text as a JSON string, which
+  // the relation parser turns back into the same text. Parsing it once in the
+  // row parser gives both paths the value PostgreSQL returns.
+  decodeColumnValue(columnType: string): ((value: unknown) => unknown) | undefined {
+    const t = columnType.toLowerCase();
+    return t === 'json' || t === 'jsonb' ? parseJsonText : undefined;
+  },
+
   castAggregate(expr: string, target: 'int' | 'float'): string {
     return `CAST(${expr} AS ${target === 'int' ? 'INT' : 'FLOAT'})`;
+  },
+
+  // AVG over an integer column is an integer here (56.4 came back 56), and
+  // casting the RESULT cannot recover the fraction. Widen the input instead:
+  // FLOAT for the narrow integers, the PostgreSQL `avg` value in double
+  // precision; DECIMAL for BIGINT, which keeps an exact average (AVG of
+  // DECIMAL(38,0) is DECIMAL(38,6)) where FLOAT would round past 2^53.
+  averageArgument(columnRef: string, columnType: string): string | undefined {
+    const t = columnType.toLowerCase();
+    if (t === 'bigint' || t === 'int8' || t === 'bigserial') return `CAST(${columnRef} AS DECIMAL(38, 0))`;
+    if (SMALL_INTEGER_TYPES.has(t)) return `CAST(${columnRef} AS FLOAT)`;
+    return undefined;
   },
 
   // No array params. OPENJSON expands a single JSON-array param into a row set,
   // keeping ONE placeholder (so the SQL cache stays valid regardless of list
   // length) and handling the empty list (OPENJSON('[]') → zero rows). SQL Server
-  // implicitly converts the nvarchar `value` to the column's type, so this works
-  // for numbers AND strings. OPENJSON requires SQL Server 2016+.
+  // implicitly converts the nvarchar `value` to the column's type, and
+  // mssqlInListJson writes each element as the text that converts to the value
+  // `equals` binds. OPENJSON requires SQL Server 2016+.
   buildInClause(expr: string, paramRef: string, negated: boolean): string {
     return `${expr} ${negated ? 'NOT IN' : 'IN'} (SELECT [value] FROM OPENJSON(${paramRef}))`;
   },
 
   inClauseParam(values: unknown[]): unknown {
-    return JSON.stringify(values ?? []);
+    return mssqlInListJson(Array.isArray(values) ? values : []);
   },
 
   // OUTPUT replaces RETURNING, injected mid-statement by the statement builders,
@@ -748,7 +948,7 @@ export const mssqlDialect: Dialect = {
 
   buildBulkInsertStatement(input: BulkInsertStatementInput): { sql: string; params: unknown[] } {
     // No UNNEST in SQL Server, emit multi-row VALUES with flattened, named `@pN`
-    // placeholders. Enforce the engine's 1000-row / 2100-param statement limits.
+    // placeholders. Enforce the engine's 1000-row / 2098-param statement limits.
     const rowCount = input.rowValues.length;
     const paramCount = input.rowValues.reduce((n, row) => n + row.length, 0);
     if (rowCount > MSSQL_MAX_INSERT_ROWS) {
@@ -828,6 +1028,37 @@ export const mssqlDialect: Dialect = {
     );
   },
 
+  buildBulkUpsertStatement(input: BulkUpsertStatementInput): BuiltStatement {
+    // MERGE, with HOLDLOCK: without it two concurrent MERGEs can both see "not
+    // matched" for one key and the second insert fails on the unique key. A
+    // NULL in a key column never matches (T.c = S.c is not true), so the row
+    // is inserted, as PostgreSQL's ON CONFLICT treats it. `ignore` drops the
+    // WHEN MATCHED arm, so only the inserted rows come back through OUTPUT.
+    // The bind-parameter limit (MSSQL_MAX_PARAMS) is enforced by the caller's chunking.
+    let n = 0;
+    const tuples = input.rowValues.map((row) => `(${row.map(() => this.paramPlaceholder(++n)).join(', ')})`).join(', ');
+    const params = input.rowValues.flat();
+    const alias = this.upsertTargetAlias ?? 'T';
+    const on = input.conflictColumns.map((c) => `${alias}.${c} = S.${c}`).join(' AND ');
+    const cols = input.columns.join(', ');
+    let matched = '';
+    if (input.update) {
+      const update = input.update(params, { target: alias, incoming: 'S' });
+      matched =
+        `WHEN MATCHED${update.where ? ` AND (${update.where})` : ''} ` +
+        `THEN UPDATE SET ${update.setClauses.join(', ')} `;
+    }
+    return {
+      sql:
+        `MERGE INTO ${input.table} WITH (HOLDLOCK) AS ${alias} ` +
+        `USING (VALUES ${tuples}) AS S (${cols}) ON (${on}) ` +
+        matched +
+        `WHEN NOT MATCHED THEN INSERT (${cols}) VALUES (${input.columns.map((c) => `S.${c}`).join(', ')})` +
+        `${mssqlOutput(input.returning, 'INSERTED')};`,
+      params,
+    };
+  },
+
   // UPDATE/DELETE inject OUTPUT mid-statement (between SET and WHERE / FROM and
   // WHERE), a trailing clause would be invalid T-SQL.
   buildUpdateStatement(input: UpdateStatementInput): string {
@@ -876,6 +1107,46 @@ export const mssqlDialect: Dialect = {
     return `JSON_VALUE(${column}, ${pathParamRef})`;
   },
 
+  // `JSON_VALUE` returns the same text for 5 and "5", so `{ path, equals }`
+  // reads the value's JSON TYPE from OPENJSON over the parent of the path
+  // (type 0 null, 1 string, 2 number, 3 boolean) and compares within it.
+  // Every part is bound, so the SQL text is the same for every operand type.
+  // Numbers compare as float (5 equals 5.0; beyond 2^53 precision is lost);
+  // strings compare with a binary collation, i.e. case-sensitively, whatever
+  // the column's collation. Arrays and objects are refused: OPENJSON returns
+  // their stored text, so whitespace and key order would decide the match.
+  buildJsonPathEquals(input: JsonPathEqualsInput): string {
+    const { value, path } = input;
+    if (path.length === 0) {
+      throw new UnsupportedFeatureError(
+        `JSON \`equals\` on the whole document (${input.label})`,
+        'mssql',
+        'SQL Server stores the document as text, so whitespace and key order would decide the match. Compare a ' +
+          'scalar with `{ path: [...], equals }`, or run the query on PostgreSQL or MySQL.',
+      );
+    }
+    if (value !== null && typeof value === 'object') {
+      throw new UnsupportedFeatureError(
+        `JSON path \`equals\` with ${Array.isArray(value) ? 'an array' : 'an object'} (${input.label})`,
+        'mssql',
+        'SQL Server returns an array or object at a path as its stored text, so whitespace and key order would ' +
+          'decide the match. Compare a scalar at a deeper path, or run the query on PostgreSQL or MySQL.',
+      );
+    }
+    const type = value === null ? 0 : typeof value === 'string' ? 1 : typeof value === 'boolean' ? 3 : 2;
+    const text = value === null ? null : String(value);
+    const parent = input.bind(input.encodePath(path.slice(0, -1)));
+    const key = input.bind(String(path[path.length - 1]));
+    const typeRef = input.bind(type);
+    const v = input.bind(text);
+    return (
+      `EXISTS (SELECT 1 FROM OPENJSON(${input.column}, ${parent}) AS [jpe] ` +
+      `WHERE [jpe].[key] = ${key} AND [jpe].[type] = ${typeRef} AND ([jpe].[type] = 0 ` +
+      `OR ([jpe].[type] = 2 AND TRY_CONVERT(float, [jpe].[value]) = TRY_CONVERT(float, ${v})) ` +
+      `OR ([jpe].[type] <> 2 AND [jpe].[value] = ${v} COLLATE Latin1_General_BIN2)))`
+    );
+  },
+
   // ---- Type mapping -------------------------------------------------------
 
   typeToTypeScript(dialectType: string, nullable: boolean): string {
@@ -889,6 +1160,19 @@ export const mssqlDialect: Dialect = {
 
   buildColumnType(input: ColumnTypeInput): string {
     return mssqlColumnType(input.type, input.maxLength);
+  },
+
+  /**
+   * SQL Server has no enum type: an NVARCHAR column long enough for the
+   * longest label (at least 255), and a CHECK that admits only the labels.
+   * The CHECK compares under the column's collation, so on a case-insensitive
+   * default collation `'ACTIVE'` passes for a label `'active'`, as it does in
+   * every other text comparison there.
+   */
+  buildEnumColumn(column: string, labels: readonly string[]): { type: string; maxLength: number; check: string } {
+    const literals = labels.map((label) => `N'${label.replace(/'/g, "''")}'`);
+    const longest = Math.max(255, ...labels.map((label) => label.length));
+    return { type: 'VARCHAR', maxLength: longest, check: `${column} IN (${literals.join(', ')})` };
   },
 
   buildColumnDefinition(input: ColumnDefinitionInput): string {
@@ -1025,7 +1309,7 @@ export const mssqlDialect: Dialect = {
  * as a string.
  *
  * **Param-push order** strictly mirrors `collectRelationSubqueryParams`:
- *   - manyToMany / to-many with limit|orderBy: `where` → `limit` → nested;
+ *   - manyToMany / to-many with limit|offset|orderBy: `where` → `limit` → `offset` → nested;
  *   - to-one / unordered-unlimited to-many: nested → `where` (no limit).
  */
 function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): string {
@@ -1034,10 +1318,29 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
   const qTarget = q(targetTable);
   const qParent = q(parentRef);
 
+  // `orderByEntries` flattens the array form (`[{ views: 'desc' }, { id: 'asc' }]`)
+  // into the same entry list as the object form, as the core relation builder
+  // does; `Object.entries` read an array's indexes as field names.
   const orderEntries =
-    spec !== true && spec.orderBy ? Object.entries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
+    spec !== true && spec.orderBy ? orderByEntries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
   const hasOrder = orderEntries.length > 0;
   const hasLimit = spec !== true && spec.limit !== undefined;
+  // `skip` arrives folded into `offset` (the args seam does that, and refuses
+  // it on a to-one relation).
+  const offset = spec === true ? undefined : (spec as { offset?: unknown }).offset;
+  const hasOffset = offset !== undefined;
+  /** Bind the relation offset after the limit, the order the param-collect mirror pushes them. */
+  const bindOffset = (): string | undefined => {
+    if (!hasOffset) return undefined;
+    const n = Number(offset);
+    if (!Number.isSafeInteger(n) || n < 0) {
+      throw new ValidationError(
+        `relation offset on "${targetTable}" must be a non-negative integer, received: ${String(offset)}`,
+      );
+    }
+    params.push(n);
+    return dialect.paramPlaceholder(params.length);
+  };
 
   /**
    * `<alias>.<col> AS [<field>]` selection for the FOR JSON object keys.
@@ -1076,7 +1379,10 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
   };
 
   /** ORDER BY + OFFSET/FETCH paging clause for a to-many FOR JSON subquery. */
-  const buildPaging = (a: string, limitPlaceholder: string | undefined): string => {
+  const buildPaging = (a: string, limitPlaceholder: string | undefined, offsetPlaceholder?: string): string => {
+    const offsetRows = `OFFSET ${offsetPlaceholder ?? '0'} ROWS`;
+    const fetch = limitPlaceholder !== undefined ? ` FETCH NEXT ${limitPlaceholder} ROWS ONLY` : '';
+    const paged = limitPlaceholder !== undefined || offsetPlaceholder !== undefined;
     if (hasOrder) {
       const orderBy = orderEntries
         .map(([k, dir]) => {
@@ -1117,20 +1423,16 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
           return `${a}.${q(col)} ${safeDir}`;
         })
         .join(', ');
-      // FOR JSON permits ORDER BY; OFFSET/FETCH is only needed to apply a LIMIT.
-      return limitPlaceholder !== undefined
-        ? ` ORDER BY ${orderBy} OFFSET 0 ROWS FETCH NEXT ${limitPlaceholder} ROWS ONLY`
-        : ` ORDER BY ${orderBy}`;
+      // FOR JSON permits ORDER BY; OFFSET/FETCH is only needed to page.
+      return paged ? ` ORDER BY ${orderBy} ${offsetRows}${fetch}` : ` ORDER BY ${orderBy}`;
     }
-    if (limitPlaceholder !== undefined) {
-      return ` ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT ${limitPlaceholder} ROWS ONLY`;
-    }
-    return '';
+    // OFFSET/FETCH requires an ORDER BY.
+    return paged ? ` ORDER BY (SELECT NULL) ${offsetRows}${fetch}` : '';
   };
 
   // ----- manyToMany: JOIN target through the junction table -----------------
   if (relDef.type === 'manyToMany') {
-    return buildForJsonManyToMany(dialect, ctx, { colSelect, buildNested, buildPaging, hasLimit });
+    return buildForJsonManyToMany(dialect, ctx, { colSelect, buildNested, buildPaging, bindOffset, hasLimit });
   }
 
   const isToOne = relDef.type === 'belongsTo' || relDef.type === 'hasOne';
@@ -1153,18 +1455,20 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
   }
 
   // ----- hasMany ------------------------------------------------------------
-  const willWrap = hasLimit || hasOrder;
+  const willWrap = hasLimit || hasOrder || hasOffset;
   let nestedCols: string[];
   let extra: string;
   let limitPlaceholder: string | undefined;
+  let offsetPlaceholder: string | undefined;
 
   if (willWrap) {
-    // Wrap order: where → limit → nested.
+    // Wrap order: where → limit → offset → nested.
     extra = ctx.buildWhere(alias);
     if (hasLimit) {
       params.push(Number((spec as { limit?: unknown }).limit));
       limitPlaceholder = dialect.paramPlaceholder(params.length);
     }
+    offsetPlaceholder = bindOffset();
     nestedCols = buildNested(alias);
   } else {
     // Non-wrap order: nested → where (no limit param).
@@ -1174,14 +1478,15 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
 
   const where = extra ? `${correlation} AND ${extra}` : correlation;
   const cols = [...colSelect(alias), ...nestedCols].join(', ');
-  const paging = buildPaging(alias, limitPlaceholder);
+  const paging = buildPaging(alias, limitPlaceholder, offsetPlaceholder);
   return `SELECT ISNULL((SELECT ${cols} FROM ${qTarget} ${alias} WHERE ${where}${paging} FOR JSON PATH, INCLUDE_NULL_VALUES), '[]')`;
 }
 
 interface ForJsonHelpers {
   colSelect(alias: string): string[];
   buildNested(parentAlias: string): string[];
-  buildPaging(alias: string, limitPlaceholder: string | undefined): string;
+  buildPaging(alias: string, limitPlaceholder: string | undefined, offsetPlaceholder?: string): string;
+  bindOffset(): string | undefined;
   hasLimit: boolean;
 }
 
@@ -1226,18 +1531,19 @@ function buildForJsonManyToMany(dialect: Dialect, ctx: RelationSubqueryContext, 
   }
   const correlation = sourceKeys.map((jcol, i) => `${jalias}.${q(jcol)} = ${qParent}.${q(refKeys[i]!)}`).join(' AND ');
 
-  // Param order mirrors collectRelationSubqueryParams: where → limit → nested.
+  // Param order mirrors collectRelationSubqueryParams: where → limit → offset → nested.
   const extra = ctx.buildWhere(alias);
   let limitPlaceholder: string | undefined;
   if (h.hasLimit) {
     params.push(Number((spec as { limit?: unknown }).limit));
     limitPlaceholder = dialect.paramPlaceholder(params.length);
   }
+  const offsetPlaceholder = h.bindOffset();
   const nestedCols = h.buildNested(alias);
 
   const where = extra ? `${correlation} AND ${extra}` : correlation;
   const cols = [...h.colSelect(alias), ...nestedCols].join(', ');
-  const paging = h.buildPaging(alias, limitPlaceholder);
+  const paging = h.buildPaging(alias, limitPlaceholder, offsetPlaceholder);
   return (
     `SELECT ISNULL((SELECT ${cols} FROM ${qTarget} ${alias} ` +
     `JOIN ${qJunction} ${jalias} ON ${joinOn} WHERE ${where}${paging} ` +
@@ -1296,8 +1602,9 @@ function buildRelationsFromForeignKeys(
   foreignKeys: FKEntry[],
   pkByTable: Map<string, string[]>,
   columnsByTable: Map<string, ColumnMetadata[]>,
+  logger: IntrospectOptions['logger'],
 ): Map<string, Record<string, RelationDef>> {
-  return deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable);
+  return deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable, logger);
 }
 
 /**
@@ -1309,11 +1616,13 @@ function buildRelationsFromForeignKeys(
  *
  * @param exec   Runs a parameterized (`@p1`, `@p2`, …) query and returns rows.
  * @param schema The SQL Server schema to introspect (default `dbo`).
+ * @param options Optional include / exclude table-name filters, and the logger
+ *               that receives relation-naming notes (console when absent).
  */
 export async function introspectMssqlWith(
   exec: MssqlRowExecutor,
   schema = 'dbo',
-  options: { include?: string[]; exclude?: string[] } = {},
+  options: Pick<IntrospectOptions, 'include' | 'exclude' | 'logger'> = {},
 ): Promise<SchemaMetadata> {
   // ----- Tables -----
   const candidateTables = (
@@ -1467,17 +1776,25 @@ export async function introspectMssqlWith(
   }
 
   // ----- Relations -----
-  const relationsByTable = buildRelationsFromForeignKeys(tableNames, foreignKeys, pkByTable, columnsByTable);
+  // One field per column, as the PostgreSQL introspector requires.
+  for (const [tableName, cols] of columnsByTable) assertDistinctColumnFields(tableName, cols);
+  const relationsByTable = buildRelationsFromForeignKeys(
+    tableNames,
+    foreignKeys,
+    pkByTable,
+    columnsByTable,
+    options.logger,
+  );
 
   // ----- Assemble TableMetadata -----
-  const tables: Record<string, TableMetadata> = {};
+  const tables: Record<string, TableMetadata> = nullRecord<TableMetadata>();
   for (const tableName of tableNames) {
     const columns = columnsByTable.get(tableName) ?? [];
-    const columnMap: Record<string, string> = {};
-    const reverseColumnMap: Record<string, string> = {};
+    const columnMap: Record<string, string> = nullRecord<string>();
+    const reverseColumnMap: Record<string, string> = nullRecord<string>();
     const dateColumns = new Set<string>();
-    const dialectTypes: Record<string, string> = {};
-    const pgTypes: Record<string, string> = {};
+    const dialectTypes: Record<string, string> = nullRecord<string>();
+    const pgTypes: Record<string, string> = nullRecord<string>();
     const allColumns: string[] = [];
 
     for (const col of columns) {
@@ -1500,7 +1817,7 @@ export async function introspectMssqlWith(
       allColumns,
       primaryKey: pkByTable.get(tableName) ?? [],
       uniqueColumns: uniqueByTable.get(tableName) ?? [],
-      relations: relationsByTable.get(tableName) ?? {},
+      relations: relationsByTable.get(tableName) ?? nullRecord<RelationDef>(),
       indexes: indexesByTable.get(tableName) ?? [],
     };
   }
@@ -1528,6 +1845,7 @@ export async function introspectMssql(options: IntrospectOptions): Promise<Schem
     return await introspectMssqlWith(exec, options.schema ?? 'dbo', {
       include: options.include,
       exclude: options.exclude,
+      logger: options.logger,
     });
   } finally {
     await pool.close();
@@ -1674,42 +1992,53 @@ export async function turbineMssql(
     }
   }
 
-  // Probe the server version (fail fast on SQL Server < 2016).
+  let client: TurbineClient;
   try {
-    const rows = (await pool.query("SELECT CAST(SERVERPROPERTY('ProductMajorVersion') AS INT) AS v")).rows as {
-      v?: number;
-    }[];
-    assertSupportedVersion(Number(rows[0]?.v ?? 0));
-  } catch (err) {
-    if (err instanceof ConnectionError) throw err;
-    // A non-version probe failure (permissions, etc.) should not block startup.
-  }
+    // Probe the server version (fail fast on SQL Server < 2016).
+    try {
+      const rows = (await pool.query("SELECT CAST(SERVERPROPERTY('ProductMajorVersion') AS INT) AS v")).rows as {
+        v?: number;
+      }[];
+      assertSupportedVersion(Number(rows[0]?.v ?? 0));
+    } catch (err) {
+      if (err instanceof ConnectionError) throw err;
+      // A non-version probe failure (permissions, etc.) should not block startup.
+    }
 
-  // Everything that is not a SQL Server introspection option is client config
-  // and rides through untouched, so a new TurbineConfig option works here the
-  // day it lands. The engine-owned keys come last, so no caller can unbind the
-  // dialect.
-  const { schema: _dbSchema, ...clientConfig } = options;
-  const client = new TurbineClient(
-    {
-      ...clientConfig,
-      pool,
-      dialect: mssqlDialect,
-      preparedStatements: false,
-    },
-    schema,
-  );
+    // Everything that is not a SQL Server introspection option is client config
+    // and rides through untouched, so a new TurbineConfig option works here the
+    // day it lands. The engine-owned keys come last, so no caller can unbind the
+    // dialect.
+    const { schema: _dbSchema, ...clientConfig } = options;
+    client = new TurbineClient(
+      {
+        ...clientConfig,
+        pool,
+        dialect: mssqlDialect,
+        preparedStatements: false,
+      },
+      schema,
+    );
+  } catch (err) {
+    // A failed factory hands the caller nothing to close, so a pool it BUILT
+    // (already connected) is closed here rather than left holding the process
+    // open; the client constructor refuses a bad config, a static global filter
+    // naming no table or column for one. A pool the caller supplied stays open.
+    if (owns) await pool.end().catch(() => {});
+    throw err;
+  }
 
   if (owns) {
     // Turbine built this pool, so disconnect()/end() must close it. External pools
     // (injection) stay the caller's responsibility (disconnect() no-op), consistent
     // with turbineHttp / turbineMysql / turbineSqlite.
     const baseDisconnect = client.disconnect.bind(client);
-    const close = async (): Promise<void> => {
-      await baseDisconnect();
+    const close = async (options?: DisconnectOptions): Promise<DisconnectResult | undefined> => {
+      const result = options === undefined ? await baseDisconnect() : await baseDisconnect(options);
       await pool.end();
+      return result ?? undefined;
     };
-    const patch = client as unknown as { disconnect: () => Promise<void>; end: () => Promise<void> };
+    const patch = client as unknown as { disconnect: typeof close; end: typeof close };
     patch.disconnect = close;
     patch.end = close;
   }

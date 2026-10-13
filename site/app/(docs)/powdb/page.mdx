@@ -57,6 +57,8 @@ The two injected-pool shapes are not equivalent. A raw client `Pool` is wrapped 
 
 A networked target probes `serverVersion` on connect and throws `ConnectionError` on anything below `MIN_POWDB_VERSION` (`'0.7.0'`).
 
+When the factory fails after it opened something, it closes what it opened before it throws. That covers a server below the version floor, an embedded `syncMode` the installed addon cannot apply, and a client option refused at construction, such as a `globalFilters` key naming no table. A client `Pool` or `PowdbPool` you pass in is never closed. Before 0.90 the pool or handle stayed open, and an idle socket kept the process alive.
+
 ### Options
 
 `TurbinePowdbOptions` extends **every** client-level field of `TurbineConfig` (`globalFilters`, `errorMessages`, `logging`, `defaultLimit`, `warnOnUnlimited`, `relationLoadStrategy`, and the rest), minus the connection and pool plumbing the factory owns, plus the transport options below.
@@ -143,7 +145,9 @@ for (const stmt of powqlSchemaDDL(SCHEMA)) {
 
 `PowqlSchemaDDLOptions` carries `emitLinks` (also emit link DDL for the schema's relations, gated on the `entityLinks` capability) and a `capabilities` set, so a statement an older engine cannot parse is refused at build time rather than at the wire.
 
-Type mapping is deliberately narrow: `powqlColumnType(col)` maps a Turbine column to one of `'str' | 'int' | 'float' | 'bool' | 'json'` (`PowqlType`). It never emits `uuid`, `datetime` or `bytes`, because PowQL has no such types; a `Date` binds as integer microseconds. `isJsonColumn(col)` is the predicate behind the `json` mapping.
+Type mapping is deliberately narrow: `powqlColumnType(col)` maps a Turbine column to one of `'str' | 'int' | 'float' | 'bool' | 'json'` (`PowqlType`). It never emits `uuid`, `datetime` or `bytes`, because PowQL has no such types; a `Date` binds as integer microseconds. Since 0.90 a number, bigint or boolean compared with or written to a `Date` column throws `ValidationError` (`TURBINE_E003`), as on PostgreSQL; pass `new Date(ms)` or ISO text. Before, the number was bound as raw microseconds, so a filter matched nothing and a write stored the wrong instant. `isJsonColumn(col)` is the predicate behind the `json` mapping.
+
+An enum column (declared in `defineSchema`'s `enums`, or an introspected enum type) maps to `str` and holds its label. A value that is not one of its labels is `TURBINE_E003` in writes and filters, and `gt` / `gte` / `lt` / `lte` compare in declaration order, as on PostgreSQL. `contains`, `startsWith`, `endsWith`, `mode: 'insensitive'`, `_sum` and `_avg` on an enum are `TURBINE_E003`, as on PostgreSQL. Ordering by an enum (`orderBy`, `_min` / `_max`, groupBy ordering) throws `UnsupportedFeatureError` (`TURBINE_E017`), because PowDB would sort the label text alphabetically; order by the label's position in application code. Before 0.90 an enum column was declared `json`, and every write of a label failed.
 
 Two column kinds have no mapping at all and throw `ValidationError` (`TURBINE_E003`) naming the column, rather than being coerced into something wrong:
 
@@ -158,7 +162,7 @@ A composite primary key's own index (`<table>_pkey` in introspected metadata) is
 
 ## Upsert and aggregates
 
-`upsert` updates the row its `where` names, or inserts `create`, as on the SQL engines. PowQL's native `upsert … on .col` statement is used for the one shape it expresses: a single-column primary key whose `where` value is the one `create` carries, a non-empty `update`, and no global filter on the table. Every other shape looks the row up by `where` first, then updates it or inserts `create`, in one transaction. That covers a unique non-key column, a composite key, nested writes, an empty `update`, and a table under a [global filter](/global-filters), where the lookup and the update carry the filter so another tenant's row is never overwritten.
+`upsert` updates the row its `where` names, or inserts `create`, as on the SQL engines. PowQL's native `upsert … on .col` statement is used for the one shape it expresses: a single-column primary key whose `where` value is the one `create` carries, a non-empty `update`, and no global filter on the table. Every other shape looks the row up by `where` first, then updates it or inserts `create`, in one transaction. That covers a unique non-key column, a composite key, nested writes, an empty `update`, and a table under a [global filter](/global-filters), where the lookup and the update carry the filter so another tenant's row is never overwritten. When `where` carries the same key as `create` and the lookup misses only because the filter hides that row, the upsert throws `NotFoundError` (`TURBINE_E001`) and writes nothing, as on PostgreSQL; before 0.90 it was `UniqueConstraintError` (`TURBINE_E008`).
 
 Before 0.80 the native statement was used for all of them, so an upsert by email never found the existing row and a tenant-scoped upsert could update another tenant's. Before 0.81 the lookup used `create`'s values rather than `where`'s, so `where: { id: 1 }` with a `create` carrying another key missed row 1.
 

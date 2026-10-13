@@ -19,7 +19,13 @@
  */
 
 import { type CheckoutGuard, guardCheckout, settleEventLoop } from './connection-guard.js';
-import { explainConnectionLoss, isStaleConnectionError, wrapPgError } from './errors.js';
+import {
+  ConnectionError,
+  explainConnectionLoss,
+  isStaleConnectionError,
+  UnsupportedFeatureError,
+  wrapPgError,
+} from './errors.js';
 import type { PgCompatPool, PgCompatPoolClient } from './pg-types.js';
 
 export interface Checkout {
@@ -38,17 +44,114 @@ export interface Checkout {
  * `DatabaseError` carrying a SQLSTATE in `.code`, the same property Turbine
  * puts `TURBINE_E0NN` in.
  *
- * Query paths need no equivalent: `pool.query()` opens the connection itself
- * and rejects with the connect error, which the query boundary already wraps.
+ * Query paths reach the same errors through `pool.query()`, which checks out
+ * internally and rejects with the connect error; the query boundary wraps
+ * those, and {@link typeCheckoutTimeouts} types pg-pool's own checkout
+ * failures on the pools Turbine owns.
  */
 export async function acquireConnection(pool: PgCompatPool): Promise<Checkout> {
+  if (typeof (pool as { connect?: unknown }).connect !== 'function') {
+    const dialect = (pool as unknown as { dialect?: { name?: unknown } }).dialect?.name;
+    throw new UnsupportedFeatureError(
+      'Checking out a connection',
+      typeof dialect === 'string' ? dialect : 'postgresql',
+      'A transaction, a cursor stream, a pipeline or a write that takes several statements needs a connection ' +
+        'of its own, and this pool has no `connect()` (a stateless HTTP driver). Pass a pool that can check out ' +
+        'a connection, or run single statements.',
+    );
+  }
   let client: PgCompatPoolClient;
   try {
     client = await pool.connect();
   } catch (err) {
-    throw wrapPgError(err);
+    throw checkoutError(err, pool);
   }
   return { client, checkout: guardCheckout(client) };
+}
+
+/** pg-pool's own words for a checkout that waited longer than `connectionTimeoutMillis`. */
+const POOL_TIMEOUT_MESSAGE = 'timeout exceeded when trying to connect';
+/** pg-pool's own words for a checkout from a pool that has been ended. */
+const POOL_ENDED_MESSAGE = 'Cannot use a pool after calling end on the pool';
+
+/** The pg-pool fields the timeout message reads. Absent on HTTP and engine pools. */
+interface PoolSizing {
+  readonly totalCount?: number;
+  readonly waitingCount?: number;
+  readonly options?: { readonly max?: number; readonly connectionTimeoutMillis?: number };
+}
+
+/**
+ * A failed checkout as a typed error.
+ *
+ * pg-pool raises its two checkout failures as plain `Error`s with no code, so
+ * `wrapPgError` (keyed on SQLSTATE and socket codes) passes them through and
+ * the most common production connection failure, an exhausted pool, reached
+ * callers as an untyped error: `instanceof ConnectionError` and
+ * `code === 'TURBINE_E004'` both missed it. Everything else goes through
+ * `wrapPgError` as before.
+ */
+export function checkoutError(err: unknown, pool?: unknown): unknown {
+  if (!(err instanceof Error) || (err as { code?: unknown }).code !== undefined) return wrapPgError(err);
+  if (err.message === POOL_TIMEOUT_MESSAGE) {
+    const sizing = (pool ?? {}) as PoolSizing;
+    const max = sizing.options?.max;
+    const waitMs = sizing.options?.connectionTimeoutMillis;
+    const waiting = sizing.waitingCount;
+    const occupancy =
+      max !== undefined
+        ? ` All ${max} connections of the pool were checked out${waiting ? ` and ${waiting} other callers were waiting` : ''}.`
+        : '';
+    return new ConnectionError(
+      `Timed out${waitMs ? ` after ${waitMs}ms` : ''} waiting for a free connection from the pool.${occupancy} ` +
+        'Something is holding connections for longer than `connectionTimeoutMs`: long transactions or streams, ' +
+        'or a query on the outer client inside a `$transaction` callback, which needs a second connection ' +
+        'while the transaction holds the first (use `tx` there). Raise `poolSize` if the load is genuine.',
+      { cause: err },
+    );
+  }
+  if (err.message === POOL_ENDED_MESSAGE) {
+    return new ConnectionError(
+      'The connection pool has been shut down (`disconnect()` or `end()` was called), so no connection can be ' +
+        'checked out. Create a new client, or stop issuing queries after shutting this one down.',
+      { cause: err },
+    );
+  }
+  return wrapPgError(err);
+}
+
+/** The pg-pool `connect` surface, in both its promise and callback forms. */
+interface PatchablePool {
+  connect?: (...args: unknown[]) => unknown;
+}
+
+/**
+ * Make every checkout failure of a pool Turbine owns a typed error, for
+ * `pool.query` as well as `pool.connect`.
+ *
+ * {@link acquireConnection} covers the paths that check out explicitly
+ * (transactions, nested writes, streams, pipelines). An ordinary read or write
+ * goes through `pool.query`, which checks out internally via `this.connect`
+ * in callback form, so the conversion has to sit on `connect` itself. Wrapping
+ * the error is all it does. For pools Turbine creates only, the same rule as
+ * the connection guards: a caller's own pool is not Turbine's to patch.
+ */
+export function typeCheckoutTimeouts(pool: unknown): void {
+  const p = pool as PatchablePool;
+  const connect = p.connect;
+  if (typeof connect !== 'function') return;
+  p.connect = (...args: unknown[]): unknown => {
+    const callback = args[0];
+    if (typeof callback === 'function') {
+      return connect.call(p, (err: unknown, ...rest: unknown[]) =>
+        (callback as (...a: unknown[]) => unknown)(err ? checkoutError(err, pool) : err, ...rest),
+      );
+    }
+    const pending = connect.apply(p, args) as Promise<unknown>;
+    return pending.catch((err: unknown) => {
+      throw checkoutError(err, pool);
+    });
+  };
 }
 
 /**

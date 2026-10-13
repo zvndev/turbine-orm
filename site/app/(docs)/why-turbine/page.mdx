@@ -37,7 +37,7 @@ Prisma ships an official MCP server and Drizzle ships `drizzle-kit mcp`, so "has
 - **The schema questions agents actually struggle with are first-class.** `relation_graph` returns the exact relation names a `with` clause accepts. `find_join_path` answers "how do I get from `comments` to `orgs`" with the `with` clause to write, as code. `table_stats` lets the agent check size before writing a query that would scan the table.
 - **PII never reaches the model.** `sample_rows` never fetches PII-tagged columns, and `explain_query` refuses predicates on them, because a planner row estimate can leak whether a value exists.
 
-The rest of the agent story is structural: typed query args make a wrong query a compile error the agent can read, and stable error codes (`TURBINE_E001`..`E018`, each with a docs URL) give it something to branch on. Details and setup: [Turbine for AI agents](/ai-agents).
+The rest of the agent story is structural: typed query args make a wrong query a compile error the agent can read, and stable error codes (`TURBINE_E001`..`E020`, each with a docs URL) give it something to branch on. Details and setup: [Turbine for AI agents](/ai-agents).
 
 ## The operational tooling is in the box, offline
 

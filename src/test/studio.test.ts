@@ -27,6 +27,9 @@ import {
 } from '../cli/studio.js';
 import type { SchemaMetadata } from '../schema.js';
 import { mockTable } from './helpers.js';
+import { studioTestStateDir } from './studio-test-state.js';
+
+const STATE_DIR = studioTestStateDir();
 
 // ---------------------------------------------------------------------------
 // Small helpers for exercising Studio's helper functions
@@ -85,9 +88,14 @@ describe('Studio has no LIKE escaper of its own', () => {
   // line with the bare name, so it does not match.
   const DEFINITION =
     /^\s*(?:export\s+)?(?:(?:async\s+)?function\s+escapeLikePattern\s*\(|(?:const|let|var)\s+escapeLikePattern\s*=|escapeLikePattern\??\s*\([^)]*\)\s*:\s*string\s*[{;])/m;
-  // The Postgres default's body. A copy under a NEW name slips past the name
-  // check; its body does not. mssql.ts legitimately extends this sequence.
-  const DEFAULT_BODY = String.raw`.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')`;
+  // The Postgres default's body, in both spellings it has had: the chained
+  // replace (mssql.ts legitimately extends that sequence) and the one-pass
+  // character class query/utils.ts uses. A copy under a NEW name slips past the
+  // name check; its body does not.
+  const DEFAULT_BODIES = [
+    String.raw`.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')`,
+    String.raw`/[\\%_]/g`,
+  ];
   const ALLOWED_BODIES = new Set(['query/utils.ts', 'mssql.ts']);
 
   const sources = readdirSync(SRC, { recursive: true, encoding: 'utf8' })
@@ -117,7 +125,7 @@ describe('Studio has no LIKE escaper of its own', () => {
   });
 
   it('the default escape sequence lives in query/utils.ts (and the mssql override that extends it)', () => {
-    const carriers = sources.filter((s) => s.text.includes(DEFAULT_BODY)).map((s) => s.rel);
+    const carriers = sources.filter((s) => DEFAULT_BODIES.some((b) => s.text.includes(b))).map((s) => s.rel);
     assert.ok(
       carriers.includes('query/utils.ts'),
       `the body scanner missed query/utils.ts (saw: ${carriers.join(', ')})`,
@@ -281,7 +289,7 @@ describe('Studio, apiBuilder', () => {
       },
       { rows: [] }, // COMMIT
     ]);
-    const ctx = makeCtx(pool, tmpdir());
+    const ctx = makeCtx(pool, STATE_DIR);
     const req = makeReq({ table: 'users', args: { where: { name: 'Alice' }, limit: 10 } });
     const { res, done } = makeRes();
 
@@ -303,7 +311,7 @@ describe('Studio, apiBuilder', () => {
 
   it('rejects unknown tables with 400', async () => {
     const { pool } = makePool();
-    const ctx = makeCtx(pool, tmpdir());
+    const ctx = makeCtx(pool, STATE_DIR);
     const req = makeReq({ table: 'ghost', args: {} });
     const { res, done } = makeRes();
 
@@ -317,7 +325,7 @@ describe('Studio, apiBuilder', () => {
 
   it('returns 400 when the builder rejects invalid args (e.g. bogus field)', async () => {
     const { pool } = makePool();
-    const ctx = makeCtx(pool, tmpdir());
+    const ctx = makeCtx(pool, STATE_DIR);
     const req = makeReq({ table: 'users', args: { where: { notARealField: 'x' } } });
     const { res, done } = makeRes();
 
@@ -343,7 +351,7 @@ describe('Studio, apiTableRows with search', () => {
       { rows: [{ count: '1' }] }, // count
       { rows: [] }, // COMMIT
     ]);
-    const ctx = makeCtx(pool, tmpdir());
+    const ctx = makeCtx(pool, STATE_DIR);
     const { res, done } = makeRes();
 
     const params = new URLSearchParams({ search: 'ali' });
@@ -381,7 +389,7 @@ describe('Studio, apiTableRows with search', () => {
       { rows: [{ count: '0' }] }, // count
       { rows: [] }, // COMMIT
     ]);
-    const ctx = makeCtx(pool, tmpdir());
+    const ctx = makeCtx(pool, STATE_DIR);
     const { res, done } = makeRes();
 
     await apiTableRows(res, ctx, 'users', new URLSearchParams());

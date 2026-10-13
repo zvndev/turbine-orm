@@ -14,12 +14,14 @@
 
 import assert from 'node:assert/strict';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { tmpdir } from 'node:os';
 import { describe, it } from 'node:test';
 import type pg from 'pg';
 import { handleRequest, PII_REDACTED, type StudioContext, type StudioOptions } from '../cli/studio.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { mockTable } from './helpers.js';
+import { studioTestStateDir } from './studio-test-state.js';
+
+const STATE_DIR = studioTestStateDir();
 
 // ---------------------------------------------------------------------------
 // Mock req / res / pool
@@ -245,7 +247,7 @@ function makeCtx(pool: pg.Pool, opts: { writable?: boolean; showPii?: boolean } 
     port: PORT,
     host: HOST,
     openBrowser: false,
-    stateDir: tmpdir(),
+    stateDir: STATE_DIR,
     write: opts.writable,
     showPii: opts.showPii,
   };
@@ -254,7 +256,7 @@ function makeCtx(pool: pg.Pool, opts: { writable?: boolean; showPii?: boolean } 
     metadata: buildSchema(),
     options,
     authToken: TOKEN,
-    stateDir: tmpdir(),
+    stateDir: STATE_DIR,
     statementTimeout: { sql: `SELECT set_config('statement_timeout', $1, true)`, params: ['30s'] },
     rateLimiter: new Map(),
     writable: opts.writable === true,
@@ -1377,7 +1379,7 @@ describe('Studio builder: PII guard covers cursor, distinct, and array orderBy',
   });
 
   for (const [label, args] of [
-    ['cursor', { orderBy: { id: 'asc' }, cursor: { email: 'ada@example.com' }, take: 5 }],
+    ['cursor', { orderBy: { id: 'asc' }, cursor: { email: 'ada@example.com', id: 3 }, take: 5 }],
     ['distinct', { distinct: ['email'], limit: 5 }],
     ['array orderBy', { orderBy: [{ email: 'asc' }], limit: 5 }],
   ] as const) {
@@ -1732,21 +1734,29 @@ describe('Studio PII guard: fails closed on shapes it does not recognize', () =>
 });
 
 /**
- * A `{ col }` reference names a column in the OPERAND position, so it reaches a
- * hidden column without ever putting its name in a key. `WHERE "title" > "secret"`
- * partitions the rows by a comparison against the hidden value, which is the
- * same oracle as an ordinary predicate on it.
+ * A column reference names a column in the OPERAND position, so it would reach a
+ * hidden column without ever putting its name in a key: `WHERE "title" > "secret"`
+ * partitions the rows by a comparison against the hidden value. A reference is
+ * built with `col()` and carries a symbol brand, so a JSON request body cannot
+ * contain one; the plain `{ col }` spelling it can contain is refused as a shape.
  */
 describe('Studio PII guard: column references in operands', () => {
-  it('refuses a comparison against a redacted column', async () => {
+  it('refuses a plain { col } against a redacted column', async () => {
     const r = await runBuilder('posts', { where: { title: { gt: { col: 'secret' } } } });
     assert.equal(r.status, 400, r.body);
-    assert.match(errorOf(r), /"secret" on "posts" is PII-tagged and redacted/);
+    assert.match(errorOf(r), /does not recognize "gt: \{ col \}"/);
   });
 
-  it('allows a comparison between two visible columns', async () => {
+  it('refuses a plain { col } between two visible columns too: JSON cannot carry a reference', async () => {
     const r = await runBuilder('posts', { where: { title: { gt: { col: 'id' } } }, limit: 2 });
-    assert.equal(r.status, 200, r.body);
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /\{ col \}/);
+  });
+
+  it('refuses a plain { col } nested in a `not` operator object', async () => {
+    const r = await runBuilder('posts', { where: { title: { not: { lt: { col: 'secret' } } } } });
+    assert.equal(r.status, 400, r.body);
+    assert.match(errorOf(r), /\{ col \}/);
   });
 });
 

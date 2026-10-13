@@ -28,10 +28,12 @@
 import assert from 'node:assert/strict';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createRequire } from 'node:module';
-import { tmpdir } from 'node:os';
 import { describe, it as nodeIt } from 'node:test';
 import { handleRequest, PII_REDACTED, type StudioContext, type StudioOptions } from '../cli/studio.js';
 import { createDemoContext } from '../cli/studio-demo.js';
+import { studioTestStateDir } from './studio-test-state.js';
+
+const STATE_DIR = studioTestStateDir();
 
 const hasSqlite: boolean = (() => {
   try {
@@ -94,7 +96,7 @@ function makeDemoCtx(showPii = false): StudioContext {
     port: 0,
     host: HOST,
     openBrowser: false,
-    stateDir: tmpdir(),
+    stateDir: STATE_DIR,
     demo: true,
   };
   return {
@@ -102,7 +104,7 @@ function makeDemoCtx(showPii = false): StudioContext {
     metadata: demo.metadata,
     options,
     authToken: TOKEN,
-    stateDir: tmpdir(),
+    stateDir: STATE_DIR,
     statementTimeout: { sql: 'SELECT 1', params: [] },
     rateLimiter: new Map(),
     writable: false,

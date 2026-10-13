@@ -23,9 +23,22 @@
  */
 
 import pg from '#pg';
-import { openCheckout } from './checkout.js';
-import { absorbCheckedOutErrors, settleLongIdleCheckouts } from './connection-guard.js';
-import { mergeConnectionStringOptions } from './connection-url.js';
+import { openCheckout, typeCheckoutTimeouts } from './checkout.js';
+import {
+  absorbCheckedOutErrors,
+  type CheckoutWatch,
+  settleLongIdleCheckouts,
+  watchCheckouts,
+} from './connection-guard.js';
+import {
+  type ConnectionTarget,
+  detectPoolerTarget,
+  fillTargetFromEnvironment,
+  parseConnectionTarget,
+  statementTimeoutSetting,
+  withStartupSetting,
+} from './connection-url.js';
+import { type DiagnosticsConfig, type ResolvedDiagnostics, resolveDiagnostics } from './diagnostics.js';
 import { type Dialect, postgresDialect } from './dialect.js';
 import {
   ConnectionError,
@@ -41,6 +54,9 @@ import {
   ValidationError,
   wrapPgError,
 } from './errors.js';
+import { normalizeGlobalFilters, tableAccessorName } from './global-filters-config.js';
+import { CLIENT_LOG_CONTEXT, type ClientLogContext, logTo, resolveLogger, type TurbineLogger } from './logger.js';
+import { hasRelationFields } from './nested-write.js';
 import { type ObserveConfig, ObserveEngine, type ObserveHandle } from './observe.js';
 import type { PgCompatPool, PgCompatPoolClient, PgCompatQueryResult } from './pg-types.js';
 import { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
@@ -55,11 +71,15 @@ import {
   type RelationLoadStrategy,
   type TemporalInfinityReading,
 } from './query/index.js';
+import { assertNoLockInAutocommitPipeline } from './query/row-lock.js';
+import { commentDeferred, resolveSqlComment, type SqlCommenter, type SqlCommentOptions } from './query/sql-comment.js';
+import { resolveStreamIdleTimeout } from './query/stream-idle.js';
+import { asQueryInterface, TABLE_METHODS } from './query/table-client.js';
 import {
-  markTurbineParser,
   ownLookup,
   quoteIdent,
   registerUtcTemporalParsers,
+  sendCancelRequest,
   suggestKey,
   warnParserOverwrite,
 } from './query/utils.js';
@@ -81,8 +101,17 @@ import {
   type Subscription,
   validateChannel,
 } from './realtime.js';
-import type { SchemaMetadata } from './schema.js';
-import { buildTypedSql, TypedSqlQuery } from './typed-sql.js';
+import type { SchemaMetadata, TableMetadata } from './schema.js';
+import { parseInt8, rawClientOf, typedQueryPool } from './supplied-pool-types.js';
+import {
+  commitTransaction,
+  rolledBackError,
+  TRANSACTION_STATE,
+  type TransactionScope,
+  TransactionState,
+  unawaitedWorkError,
+} from './transaction-state.js';
+import { buildTypedSql, TypedSqlQuery, utcDateParams } from './typed-sql.js';
 
 // ---------------------------------------------------------------------------
 // Retry utility
@@ -187,49 +216,106 @@ export interface TurbineConfig {
    * like `@neondatabase/serverless`, `@vercel/postgres`, or any other pg-API
    * compatible pool. When provided, all connection-string fields are ignored
    * and Turbine will NOT create its own pg.Pool.
+   *
+   * Turbine's own queries on it read `bigint` as a number and, under
+   * {@link utcTimestamps}, zone-less temporals as UTC, by attaching parsers to
+   * each query (node-postgres' query-level `types`). Your own queries on the
+   * pool, and the pg module's parser table, are left alone. A driver that does
+   * not read a query's `types` keeps its own readings, as does every driver on
+   * the `edge-light` / `browser` builds, where Turbine has no parsers to attach.
    */
-  pool?: PgCompatPool;
+  pool?: PgCompatPool | undefined;
   /** Postgres connection string (e.g. postgres://user:pass@host:5432/db) */
-  connectionString?: string;
+  connectionString?: string | undefined;
   /** Host (used if connectionString is not set) */
-  host?: string;
+  host?: string | undefined;
   /** Port (default: 5432) */
-  port?: number;
+  port?: number | undefined;
   /** Database name */
-  database?: string;
+  database?: string | undefined;
   /** Username */
-  user?: string;
+  user?: string | undefined;
   /** Password */
-  password?: string;
+  password?: string | undefined;
   /** SSL/TLS options for the connection (required for most cloud providers) */
-  ssl?: boolean | { rejectUnauthorized?: boolean; ca?: string; key?: string; cert?: string };
+  ssl?:
+    | boolean
+    | {
+        rejectUnauthorized?: boolean | undefined;
+        ca?: string | undefined;
+        key?: string | undefined;
+        cert?: string | undefined;
+      }
+    | undefined;
   /** Maximum number of connections in the pool (default: 10) */
-  poolSize?: number;
+  poolSize?: number | undefined;
   /** Idle timeout in ms before a connection is closed (default: 30000) */
-  idleTimeoutMs?: number;
+  idleTimeoutMs?: number | undefined;
   /** Connection timeout in ms (default: 5000) */
-  connectionTimeoutMs?: number;
+  connectionTimeoutMs?: number | undefined;
   /** pg-style alias for {@link poolSize}; the explicit field wins when both are set. */
-  max?: number;
+  max?: number | undefined;
   /** pg-style alias for {@link idleTimeoutMs}; the explicit field wins when both are set. */
-  idleTimeoutMillis?: number;
+  idleTimeoutMillis?: number | undefined;
   /** pg-style alias for {@link connectionTimeoutMs}; the explicit field wins when both are set. */
-  connectionTimeoutMillis?: number;
-  /** Enable query logging to console (default: false) */
-  logging?: boolean;
+  connectionTimeoutMillis?: number | undefined;
+  /**
+   * Emit Turbine's lifecycle lines (pool created, raw SQL preview, transaction
+   * committed, ...) at the logger's `debug` level, plus the errors a throwing
+   * `$on` listener raises. Default: false. With the default logger the lines
+   * go to `console`. Bound parameter values are never logged.
+   */
+  logging?: boolean | undefined;
+  /**
+   * Where Turbine's log lines go. Each line is a message plus a structured
+   * entry whose `code` is stable (`'pool-error'`, `'unknown-config-key'`); the
+   * message text is not. Every method is optional and a missing one drops that
+   * level, so `{}` silences Turbine entirely. Default: `console`, each line
+   * prefixed `[turbine]`.
+   *
+   * The arguments are `(message, entry)`, like `console` and winston. For pino
+   * or bunyan, which take `(object, message)`, adapt:
+   * `{ warn: (msg, e) => log.warn(e, msg), error: (msg, e) => log.error(e, msg) }`.
+   *
+   * No line carries a bound parameter value, whatever `logQueryParams` says.
+   * Once-per-process warnings are deduplicated process-wide, so a warning one
+   * client already emitted does not reach a second client's logger.
+   */
+  logger?: TurbineLogger | undefined;
+  /**
+   * What Turbine checks and says about itself: per-query advice (unknown
+   * options, unordered pages, missing FK indexes, ...) and the SQL-cache
+   * self-check. `'development'` turns both on; `'production'` turns both off.
+   * An object overrides either part: `{ mode: 'production', cacheCheck: {
+   * sample: 0.001 } }`.
+   *
+   * Default: `'production'` when `NODE_ENV` is `'production'` when the client is
+   * constructed (or when there is no `process`, as on an edge runtime), else
+   * `'development'`. Read once, at construction. Set it explicitly on a worker
+   * or serverless function that does not set `NODE_ENV`.
+   *
+   * Construction warnings (a misspelled config key, an option an external pool
+   * ignores, prepared statements behind a pooler) do not depend on it: they
+   * describe production hazards, fire once per process, and are always on.
+   */
+  diagnostics?: DiagnosticsConfig | undefined;
   /** Default LIMIT applied to findMany() when no limit is specified (opt-in, default: undefined) */
-  defaultLimit?: number;
+  defaultLimit?: number | undefined;
   /**
    * Log a warning when findMany() is called without a limit (default: false).
    * Pass a per-table map (`{ users: false }`) to override the default for
    * specific tables; per-call `warnOnUnlimited` on findMany args wins over both.
    */
-  warnOnUnlimited?: boolean | Record<string, boolean>;
+  warnOnUnlimited?: boolean | Record<string, boolean> | undefined;
   /**
    * Interpret Postgres `timestamp` (without time zone) values as UTC, both
    * at the driver level (type parsers for OIDs 1114 `timestamp`, 1082 `date`,
-   * and their array forms 1115 / 1182, registered only when Turbine owns the
-   * pool) and when coercing nested-relation JSON dates. A `date` column is
+   * and their array forms 1115 / 1182) and when coercing nested-relation JSON
+   * dates. The parsers are registered on the pg module when Turbine owns the
+   * pool; on a pool you supply they are attached to each of Turbine's own
+   * queries instead, and your own queries on that pool keep your parsers. A
+   * bound `Date` in `raw` / `rawUnsafe` / `sql` is sent as its UTC fields under
+   * this setting, so it reads back unchanged from a zone-less column. A `date` column is
    * zone-less too, so it reads back as UTC midnight rather than the process's
    * local midnight. This is the
    * Prisma/Rails/Django convention and makes results independent of the
@@ -254,15 +340,13 @@ export interface TurbineConfig {
    * `ValidationError` rather than handing back a client whose writes and reads
    * disagree. Give every
    * client in the process the same value, or isolate the odd one in its own
-   * process. A client on an EXTERNAL pool never REGISTERS a parser (it inherits
-   * whatever configuration the caller's driver has, so a process containing
-   * only external-pool clients is untouched), but it does take part in the
-   * agreement check: registration is process-global, so once a Turbine-owned
-   * client has installed the parsers an external-pool client reads through them
-   * too, and a disagreeing one would write local `date` literals while reading
-   * UTC.
+   * process. A client on an EXTERNAL pool never REGISTERS a parser (a process
+   * containing only external-pool clients keeps the pg module untouched), but
+   * it does take part in the agreement check: with `false` it reads through the
+   * pg module's table, which a Turbine-owned client may have set to UTC, and
+   * would then write local `date` literals while reading UTC.
    */
-  utcTimestamps?: boolean;
+  utcTimestamps?: boolean | undefined;
   /**
    * How a Postgres temporal `infinity` / `-infinity` is handed back:
    * `'preserve'` (the default, the JS numbers `Infinity` / `-Infinity`) or
@@ -285,11 +369,11 @@ export interface TurbineConfig {
    * strategy, every write projection, `groupBy` keys and `_min` / `_max`.
    *
    * Leaving the option unset selects `'preserve'` AND enables a one-time
-   * warning (per process, per field, not silenced by `NODE_ENV=production`) the
+   * warning (per process, per field, not silenced by `diagnostics: 'production'`) the
    * first time a stored infinity is actually read, describing that reading and
    * both escapes. Naming either reading explicitly silences it.
    */
-  temporalInfinity?: TemporalInfinityReading;
+  temporalInfinity?: TemporalInfinityReading | undefined;
   /**
    * Pin `plan_cache_mode` on every connection this client opens, fixing how the
    * PostgreSQL backend chooses between a custom plan (re-planned per parameter
@@ -387,7 +471,101 @@ export interface TurbineConfig {
    * `ignore_startup_parameters`). Set it on the role or server there
    * (`ALTER ROLE ... SET plan_cache_mode = ...`) instead.
    */
-  planCacheMode?: PlanCacheMode;
+  planCacheMode?: PlanCacheMode | undefined;
+  /**
+   * A server-side ceiling, in milliseconds, on every statement this client's
+   * connections run: PostgreSQL's `statement_timeout`. A statement that runs
+   * longer is cancelled by the server, which rolls back its effect and frees the
+   * connection, and it rejects with `TimeoutError` (E002, `outcome:
+   * 'not-executed'`). It bounds what a per-query `timeout` cannot reach: a
+   * forgotten query, a stream's `FETCH`, a statement inside `$transaction`.
+   *
+   * Applied as the `options=-c statement_timeout=...` connection parameter on
+   * pools Turbine opens (the primary and string `replicas`), so it is in force
+   * from each connection's first statement and nothing is ever `SET` on a
+   * session. `0` sends `statement_timeout=0`, which disables a timeout the
+   * server or role would otherwise apply. Unset (the default) sends nothing.
+   *
+   * Must be a non-negative integer (E003). PostgreSQL only (E017 elsewhere). An
+   * external `pool` is not touched: the option is then a no-op with a one-time
+   * dev warning, and the driver's own connection setup should set the GUC. A
+   * connection pooler may refuse startup parameters (PgBouncer's
+   * `ignore_startup_parameters`); set it on the role there instead
+   * (`ALTER ROLE app SET statement_timeout = '30s'`).
+   */
+  statementTimeoutMs?: number | undefined;
+  /**
+   * Close a pooled connection once it is this many seconds old, when it is
+   * next idle, and open a fresh one on demand. Default `1800` (30 minutes) on
+   * pools Turbine opens; `0` keeps connections for as long as they are in use.
+   *
+   * Recycling bounds what a long-lived server session accumulates: the
+   * prepared statements and their cached plans, catalog caches, and memory a
+   * backend keeps after a large query. It also moves connections onto a new
+   * server after a DNS failover or a replica scale-out. A connection that is
+   * checked out is never closed under its holder; it is retired when it comes
+   * back. Must be a non-negative integer (E003). Ignored, with a one-time dev
+   * warning, on an external `pool`.
+   */
+  maxLifetimeSeconds?: number | undefined;
+  /**
+   * Close a cursor stream (`findManyStream`, `findManyStreamBatches`) and
+   * release its connection once its consumer has asked for nothing for this
+   * many milliseconds. Default `300000` (five minutes); `0` disables. A stream
+   * call's own `idleTimeoutMs` overrides it.
+   *
+   * A consumer that stops pulling without calling `return()` (an iterator that
+   * is stored and forgotten, a response stream torn down without propagating)
+   * would otherwise hold a pooled connection forever and, on PostgreSQL, an
+   * open transaction whose snapshot holds back vacuum for the whole database.
+   * On expiry Turbine closes the cursor, releases the connection, and logs
+   * `stream-idle-timeout`; the next pull, if one comes, throws `TimeoutError`
+   * (E002). Only streams that hold a connection between pulls are watched.
+   *
+   * On PostgreSQL the stream's own transaction also gets a server-side limit,
+   * `idle_in_transaction_session_timeout` at this value plus 10 seconds
+   * (transaction-local, never a session `SET`; a stricter setting already in
+   * force is kept), so a process that stops running timers (frozen between
+   * serverless invocations) cannot hold the transaction open either. Must be a
+   * whole number of milliseconds (E003).
+   */
+  streamIdleTimeoutMs?: number | undefined;
+  /**
+   * Append sqlcommenter-style key/values to every statement this client builds,
+   * so `pg_stat_activity`, the server log, `auto_explain` and database APM
+   * tools can attribute a statement to a service, model, feature or trace:
+   *
+   * ```sql
+   * SELECT ... /*action='findMany',application='billing',model='users',tag='checkout'*\/
+   * ```
+   *
+   * `static` adds constant pairs, `model: true` the table and operation,
+   * `tag: true` the label of the innermost `db.$tag(label, fn)`, and `dynamic`
+   * per-statement pairs computed in the caller's async context (a W3C
+   * `traceparent`). Keys are lower-case `[a-z][a-z0-9_]*`; values are
+   * URL-encoded (so none can end or nest the comment) and at most 256
+   * characters. A malformed `static` key or value is E003 here; a bad
+   * `dynamic` one is left out with a `sql-comment-dropped` warning, never
+   * thrown.
+   *
+   * Model statements get it: reads, writes, streams, pipelines and
+   * `$transaction` batches. Raw SQL, transaction control and `set_config`
+   * calls do not. It is added after the SQL-template cache, so caching is
+   * unchanged, and `$on('query')` events keep `sql` commentless and carry the
+   * comment as `comment`.
+   *
+   * Prepared statements: a statement whose comment is static, model or tag is
+   * still prepared, under a name of its own (counted against the same budget
+   * as every other name). One carrying any `dynamic` value is sent unnamed,
+   * so it is parsed and planned on every execution (tens of microseconds per
+   * statement on a local PostgreSQL, more for nested reads): return dynamic
+   * values only when they are worth that, for example only for sampled traces.
+   *
+   * Refused (E017) on PowDB, which runs no SQL, and `dynamic` on MySQL, whose
+   * engine keeps a server-side prepared statement per distinct text and would
+   * exhaust the server's `max_prepared_stmt_count`.
+   */
+  sqlComment?: SqlCommentOptions | undefined;
   /**
    * Refuse a nested `connect` / `connectOrCreate` that would re-parent a
    * to-many child already owned by a different parent. Off by default,
@@ -398,7 +576,7 @@ export interface TurbineConfig {
    * take another tenant's row. See
    * {@link import('./nested-write.js').NestedWriteContext.scopedConnect}.
    */
-  scopedConnect?: boolean;
+  scopedConnect?: boolean | undefined;
   /**
    * Default strategy for resolving `with`-clause relations, applied to every
    * `findMany`/`findUnique`/`findFirst` unless overridden per query.
@@ -421,7 +599,7 @@ export interface TurbineConfig {
    * batched loaders (an ineligible relation falls back to them silently even
    * under `'join'`; `'auto'` resolves to PowDB's own default).
    */
-  relationLoadStrategy?: RelationLoadStrategy;
+  relationLoadStrategy?: RelationLoadStrategy | undefined;
   /**
    * When `true`, every to-many `with` relation with no explicit `orderBy` is
    * loaded ordered by the target table's primary key ascending, so unordered
@@ -431,7 +609,7 @@ export interface TurbineConfig {
    * `stableRelationOrder` overrides this. Default `false` (SQL is byte-identical
    * when off). SQL engines only. See {@link RelationLoadStrategy}.
    */
-  stableRelationOrder?: boolean;
+  stableRelationOrder?: boolean | undefined;
   /**
    * When `true`, a `findMany` that paginates (`limit` / `take` / `offset`) but
    * declares no `orderBy` is ordered by the table's primary key ascending
@@ -449,7 +627,7 @@ export interface TurbineConfig {
    * emitted SQL is byte-identical to before, and a dev-mode warning points at
    * the affected queries.
    */
-  implicitPkOrdering?: boolean;
+  implicitPkOrdering?: boolean | undefined;
   /**
    * Parent-row ceiling for the `relationLoadStrategy: 'auto'` to-one rule: a
    * to-one relation stays in the single-statement join when the query's `limit`
@@ -457,7 +635,7 @@ export interface TurbineConfig {
    * query is unbounded or bounded above it. Defaults to 1000 (see
    * `AUTO_TO_ONE_JOIN_MAX_ROWS`). Only consulted under `'auto'`.
    */
-  autoToOneJoinMaxRows?: number;
+  autoToOneJoinMaxRows?: number | undefined;
   /**
    * Round-trip time to the database, in milliseconds, used to DERIVE the
    * `relationLoadStrategy: 'auto'` to-one threshold instead of guessing a row
@@ -471,7 +649,7 @@ export interface TurbineConfig {
    * which reproduces the historical 1000-row threshold exactly. Overridden by
    * an explicit `autoToOneJoinMaxRows`; only consulted under `'auto'`.
    */
-  autoRoundTripMs?: number;
+  autoRoundTripMs?: number | undefined;
   /**
    * How nested-relation subqueries encode each row's JSON.
    *
@@ -499,7 +677,7 @@ export interface TurbineConfig {
    * `relationLoadStrategy: 'flatten'`, which is refused while positional is
    * active because a flattened relation emits no JSON to encode.
    */
-  jsonEncoding?: JsonEncoding;
+  jsonEncoding?: JsonEncoding | undefined;
   /**
    * Controls how `NotFoundError` (and other where-aware errors) format their
    * messages.
@@ -513,7 +691,7 @@ export interface TurbineConfig {
    * The full `where` object is always available as `err.where` for
    * programmatic access regardless of mode.
    */
-  errorMessages?: ErrorMessageMode;
+  errorMessages?: ErrorMessageMode | undefined;
   /**
    * Whether `$on('query')` listeners receive the real bound parameter values.
    *
@@ -530,13 +708,19 @@ export interface TurbineConfig {
    * events while keeping error MESSAGES redacted, which is the combination
    * that was previously unreachable.
    */
-  logQueryParams?: boolean;
+  logQueryParams?: boolean | undefined;
   /**
    * Enable prepared statements. Queries are submitted with `{ name, text, values }`
    * to the pg driver, which caches the parse+plan on the server per connection.
    *
    * Default: `true` for Turbine-owned pools, `false` for external pools (serverless
-   * drivers may not support named statements).
+   * drivers may not support named statements) and for a connection string that
+   * names a connection pooler (a `pooler` / `pgbouncer` host, or port 6432 or
+   * 6543). A transaction-mode pooler runs each transaction on any server
+   * connection, so a statement named on one is missing (or already present) on
+   * the next, unless the pooler tracks prepared statements (PgBouncer 1.21+
+   * with `max_prepared_statements` above 0). Set `true` on such a pooler only
+   * when it does; Turbine warns once in development when you do.
    *
    * Override with `TURBINE_DISABLE_PREPARED=1` env var.
    *
@@ -552,14 +736,14 @@ export interface TurbineConfig {
    * through a fixed allowlist or set this to `false`. Documented for readers at
    * https://turbineorm.dev/queries#client-escape-hatches
    */
-  preparedStatements?: boolean;
+  preparedStatements?: boolean | undefined;
   /**
    * Enable the SQL template cache. Repeated queries with the same shape reuse
    * cached SQL text instead of rebuilding from scratch.
    *
    * Default: `true`. Set to `false` as a nuclear kill switch.
    */
-  sqlCache?: boolean;
+  sqlCache?: boolean | undefined;
   /**
    * Maximum number of distinct SQL templates each per-table LRU cache retains.
    *
@@ -569,9 +753,9 @@ export interface TurbineConfig {
    * memory; lower it to cap memory. `0` disables caching entirely (identical to
    * `sqlCache: false`); a negative value is ignored (treated as the default).
    */
-  sqlCacheSize?: number;
+  sqlCacheSize?: number | undefined;
   /** SQL dialect implementation. Defaults to PostgreSQL. Internal Phase-1 seam for dialect packages. */
-  dialect?: Dialect;
+  dialect?: Dialect | undefined;
   /**
    * Read replicas. When set, read-only operations issued outside a transaction
    * (`findMany`, `findFirst`, `findUnique`, `*OrThrow`, `count`, `aggregate`,
@@ -593,7 +777,7 @@ export interface TurbineConfig {
    * without replication lag. Omitting `replicas` (or passing `[]`) leaves the
    * default single-pool path completely unchanged.
    */
-  replicas?: readonly (string | PgCompatPool)[];
+  replicas?: readonly (string | PgCompatPool)[] | undefined;
   /**
    * Automatic WHERE filters applied to every query, keyed by table accessor
    * (`db[name]`). Each value is AND-merged into the compiled WHERE of every
@@ -619,7 +803,7 @@ export interface TurbineConfig {
    * }});
    * ```
    */
-  globalFilters?: GlobalFilters;
+  globalFilters?: GlobalFilters | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -650,11 +834,17 @@ const TURBINE_CONFIG_KEYS: Record<keyof TurbineConfig, true> = {
   idleTimeoutMillis: true,
   connectionTimeoutMillis: true,
   logging: true,
+  logger: true,
+  diagnostics: true,
   defaultLimit: true,
   warnOnUnlimited: true,
   utcTimestamps: true,
   temporalInfinity: true,
   planCacheMode: true,
+  statementTimeoutMs: true,
+  maxLifetimeSeconds: true,
+  streamIdleTimeoutMs: true,
+  sqlComment: true,
   scopedConnect: true,
   relationLoadStrategy: true,
   stableRelationOrder: true,
@@ -706,8 +896,7 @@ function suggestConfigKey(key: string): string | null {
 }
 
 /**
- * Dev-mode notice for a key on the config object that is not part of the config
- * surface.
+ * Notice for a key on the config object that is not part of the config surface.
  *
  * An unknown key is silently ignored (JavaScript objects have no schema), which
  * makes a typo or a wrong guess indistinguishable from a broken feature: a
@@ -719,19 +908,21 @@ function suggestConfigKey(key: string): string | null {
  * turbine that passes a key this version has not heard of must keep running,
  * and the whole check is wrapped so that a hostile / exotic config object
  * (a Proxy whose `ownKeys` throws) cannot take down the constructor either.
- * Dev-only (`NODE_ENV !== 'production'`) and once per key per process, like the
- * other advisory diagnostics.
+ * Always on, whatever `diagnostics` says: an ignored option is ignored in
+ * production too, and the line fires once per key per process.
  */
-function warnUnknownConfigKeys(config: TurbineConfig): void {
-  if (process.env.NODE_ENV === 'production') return;
+function warnUnknownConfigKeys(config: TurbineConfig, logger: TurbineLogger): void {
   try {
     for (const key of Object.keys(config)) {
       if (CONFIG_KEY_SET.has(key) || NON_CONFIG_KEYS.has(key)) continue;
       if (!shouldWarnOnce(WARN_NS.unknownConfigKey, key)) continue;
       const suggestion = suggestConfigKey(key);
-      console.warn(
-        `[turbine] Unknown option "${key}" in the config passed to TurbineClient, it is ignored.` +
+      logTo(
+        logger,
+        'warn',
+        `Unknown option "${key}" in the config passed to TurbineClient, it is ignored.` +
           (suggestion ? ` Did you mean "${suggestion}"?` : ''),
+        { code: 'unknown-config-key', key, ...(suggestion ? { suggestion } : {}) },
       );
     }
   } catch {
@@ -925,6 +1116,13 @@ export interface TransactionOptions {
    * bound parameters (never interpolated); the GUC name is additionally
    * validated against a strict identifier regex.
    *
+   * Names must be namespaced custom settings (`app.current_tenant`, with a
+   * dot). A name without a dot is one of PostgreSQL's own settings (`role`,
+   * `search_path`, `statement_timeout`, `session_authorization`), which can
+   * change who the transaction runs as or lift its limits, so it is refused
+   * (E003) unless listed in {@link allowBuiltinSettings}. An application that
+   * maps request data into the context then cannot be steered into setting one.
+   *
    * @example
    * ```ts
    * await db.$transaction(
@@ -937,6 +1135,73 @@ export interface TransactionOptions {
    * ```
    */
   sessionContext?: Record<string, string | number | boolean>;
+  /**
+   * PostgreSQL's own settings that {@link sessionContext} may set, by name
+   * (`['statement_timeout']`). Every other name in `sessionContext` must be a
+   * namespaced custom setting. List only what the code itself chooses to set,
+   * never a name taken from a request.
+   */
+  allowBuiltinSettings?: readonly string[];
+  /**
+   * Run the transaction READ ONLY (`BEGIN READ ONLY` on PostgreSQL, `START
+   * TRANSACTION READ ONLY` on MySQL): any write inside it is refused by the
+   * server. Use it for multi-statement reads that must see one consistent
+   * snapshot (with `isolationLevel: 'RepeatableRead'`) and must not write.
+   * Other engines have no read-only transaction and throw
+   * `UnsupportedFeatureError` (E017).
+   */
+  readOnly?: boolean;
+}
+
+/** Which of a client's pools a pool event came from. */
+export interface PoolEventOrigin {
+  /** `'primary'`, or `'replica'` for one of the string `replicas`. */
+  pool: 'primary' | 'replica';
+  /** Index into `replicas` when `pool` is `'replica'`. */
+  replica?: number;
+}
+
+/** A pool lifecycle event: the connection's error, and the pool it belonged to. */
+export interface PoolEvent extends PoolEventOrigin {
+  /** The driver's error: a server restart, an administrator's terminate, a network drop. */
+  error: Error;
+}
+
+/**
+ * `$on('poolError')`: an IDLE connection in a pool this client opened failed,
+ * and the pool discarded it. No query was affected. Without a listener the
+ * error is logged at `error` level (code `'pool-error'`), through `logger`.
+ */
+export type PoolErrorEvent = PoolEvent;
+
+/**
+ * `$on('connectionLost')`: a connection failed while CHECKED OUT, so the query,
+ * stream or transaction using it rejected (with `ConnectionError`, E004).
+ * Emitted once per connection, for pools this client opened.
+ */
+export type ConnectionLostEvent = PoolEvent;
+
+/** The listener sets behind `$on('poolError')` and `$on('connectionLost')`. */
+interface PoolListeners {
+  poolError: Set<(event: PoolErrorEvent) => void>;
+  connectionLost: Set<(event: ConnectionLostEvent) => void>;
+}
+
+export interface DisconnectOptions {
+  /**
+   * Stop waiting for checked-out connections after this many milliseconds.
+   * Statements still running then are cancelled on the server and their
+   * connections closed, so a transaction among them rolls back. Without it,
+   * `disconnect()` waits for every connection to be returned.
+   */
+  timeoutMs?: number | undefined;
+}
+
+export interface DisconnectResult {
+  /** True when connections were still checked out at the deadline and were closed. */
+  timedOut: boolean;
+  /** How many checked-out connections were cancelled and closed at the deadline. */
+  forcedConnections: number;
 }
 
 /**
@@ -953,20 +1218,6 @@ const ISOLATION_LEVELS: Record<string, string> = Object.assign(Object.create(nul
 });
 
 /**
- * Resolve a requested isolation level, REFUSING anything not in the map.
- *
- * A miss used to yield `undefined`, which `beginStatement` renders as a plain
- * `BEGIN`. So `isolationLevel: 'serializable'` (wrong case) asked for
- * SERIALIZABLE and silently got READ COMMITTED, which is the worst available
- * outcome for this option: the caller believes it has a guarantee it does not
- * have, and the workload that depended on it produces wrong data with no error.
- *
- * The TypeScript union on `TransactionOptions.isolationLevel` does not prevent
- * this. It is not enforced for a JavaScript consumer of a published package, for
- * a value read from config or an environment variable, or across any `as`.
- * Throwing costs a caller who was already broken one clear error.
- */
-/**
  * Run a transaction-control statement (BEGIN / COMMIT / ROLLBACK) with the same
  * error translation every other query boundary gets.
  *
@@ -981,20 +1232,117 @@ const ISOLATION_LEVELS: Record<string, string> = Object.assign(Object.create(nul
  * loops, and a loop keyed on it would never fire for the commit-time conflicts
  * that are the main reason to run SERIALIZABLE at all.
  */
-async function runTxControl(client: PgCompatPoolClient, sql: string): Promise<void> {
+async function runTxControl(client: PgCompatPoolClient, sql: string, params?: unknown[]): Promise<void> {
   try {
-    await client.query(sql);
+    await client.query(sql, params);
   } catch (err) {
     throw wrapPgError(err);
   }
 }
 
+/**
+ * Refuse anything in a batch that is not a deferred query, before any of it
+ * runs.
+ *
+ * The array forms take the descriptors `build*()` returns. Prisma's array form
+ * takes promises instead, so code ported from it passes `db.users.create(...)`,
+ * whose query has ALREADY started on its own connection, outside any
+ * transaction, by the time the array exists. That cannot be undone here, so
+ * the error says so and names the builder to use instead. The promise's own
+ * rejection is observed, so this refusal is the error the caller sees rather
+ * than an unhandled rejection from a query nobody awaits.
+ */
+function assertDeferredQueries(queries: readonly unknown[], api: string, unit: 'transaction' | 'pipeline'): void {
+  queries.forEach((q, i) => {
+    if (
+      q !== null &&
+      (typeof q === 'object' || typeof q === 'function') &&
+      typeof (q as PromiseLike<unknown>).then === 'function'
+    ) {
+      Promise.resolve(q).catch(() => {});
+      throw new ValidationError(
+        `${api}: item ${i} is a Promise. Its query started running on its own the moment it was created, ` +
+          `outside this ${unit}, and may already have committed. Pass the deferred form instead, built with ` +
+          '`build*()`: `db.users.buildCreate(...)` rather than `db.users.create(...)` (likewise `buildUpdate`, ' +
+          '`buildDelete`, `buildUpsert`, `buildFindMany`).' +
+          (unit === 'transaction' ? ' Or use the callback form, `$transaction(async (tx) => { ... })`.' : ''),
+      );
+    }
+    const dq = q as Partial<DeferredQuery<unknown>> | null;
+    if (!dq || typeof dq !== 'object' || typeof dq.sql !== 'string' || typeof dq.transform !== 'function') {
+      throw new ValidationError(
+        `${api}: item ${i} is not a deferred query. Build each item with a \`build*()\` method, ` +
+          'for example `db.users.buildCreate({ data })` or `db.posts.buildCount({ where })`.',
+      );
+    }
+  });
+}
+
+/** The PG* variables pg reads for a connection target when its config leaves the field unset. */
+const PG_ENV_TARGETS = ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER'] as const;
+
+/** A non-empty environment variable, or undefined (also where `process` does not exist). */
+function pgEnv(name: string): string | undefined {
+  return (typeof process !== 'undefined' ? process.env?.[name] : undefined) || undefined;
+}
+
+/**
+ * Whether an owned pool's config names a database at all: a connection
+ * string, any host setting, DATABASE_URL (unless an explicit, empty
+ * `connectionString` suppresses it, as the pool branch does), or a PG*
+ * variable pg will read.
+ */
+function hasDatabaseTarget(config: TurbineConfig): boolean {
+  if (config.connectionString) return true;
+  if (
+    config.host != null ||
+    config.port != null ||
+    config.database != null ||
+    config.user != null ||
+    config.password != null
+  ) {
+    return true;
+  }
+  if (config.connectionString == null && pgEnv('DATABASE_URL')) return true;
+  return PG_ENV_TARGETS.some((name) => pgEnv(name) !== undefined);
+}
+
+/**
+ * The pool of a client that was given no database: every query and checkout
+ * rejects with a {@link ConnectionError} naming the fix, and `disconnect()`
+ * succeeds. Building SQL never touches the pool, so it still works.
+ */
+function unconfiguredPool(emptyConnectionString: boolean): PgCompatPool {
+  const fail = (): Promise<never> =>
+    Promise.reject(
+      new ConnectionError(
+        'No database configured: ' +
+          (emptyConnectionString
+            ? "`connectionString` is an empty string, which names no database (often `process.env.DATABASE_URL ?? ''` " +
+              'evaluated before DATABASE_URL was loaded). '
+            : 'this client was given no `connectionString`, `pool` or host settings, and the DATABASE_URL environment ' +
+              'variable is not set. ') +
+          'turbine-orm does not read `.env` files: load yours before the app starts (`node --env-file=.env app.js`, ' +
+          'or `process.loadEnvFile()` on Node 20.12 and later), or pass `connectionString` explicitly.',
+      ),
+    );
+  return { query: fail, connect: fail, end: async () => {}, on: () => {} } as unknown as PgCompatPool;
+}
+
+/**
+ * Resolve a requested isolation level, REFUSING anything not in the map.
+ *
+ * A miss rendered as a plain `BEGIN` would be the worst outcome for this
+ * option: `isolationLevel: 'serializable'` (wrong case) would ask for
+ * SERIALIZABLE and silently get READ COMMITTED. The TypeScript union does not
+ * prevent it for a JavaScript caller, a value read from config, or any `as`.
+ */
 function resolveIsolationLevel(level: string | undefined): string | undefined {
   if (level === undefined) return undefined;
   const sql = ownLookup(ISOLATION_LEVELS, level);
   if (sql === undefined) {
     throw new ValidationError(
-      `$transaction: unknown isolationLevel ${JSON.stringify(level)}. ` +
+      `$transaction: unknown isolationLevel ${describeValue(level)}. ` +
         `Expected one of: ${Object.keys(ISOLATION_LEVELS).join(', ')} (case-sensitive).`,
     );
   }
@@ -1010,34 +1358,314 @@ function resolveIsolationLevel(level: string | undefined): string | undefined {
 const GUC_NAME_REGEX = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/;
 
 /**
- * The read-only `QueryInterface` operations that a read-replica setup may route
- * to a replica pool. Every other method (all writes, plus internals) stays on
- * the primary. Kept as a Set so the routing proxy's `get` trap is O(1).
+ * How long a transaction being abandoned (timed out, failed, or returned with
+ * work still running) gives its in-flight statement to answer a cancel
+ * request, and its ROLLBACK to answer, before the connection is destroyed
+ * instead of reused.
  */
+const TX_ABORT_GRACE_MS = 2000;
+
+/** Default {@link TurbineConfig.maxLifetimeSeconds} on pools Turbine opens. */
+const DEFAULT_MAX_LIFETIME_SECONDS = 1800;
+
 /**
- * Operations that may be served by a read replica.
+ * A value as an error message should quote it. `JSON.stringify` writes `NaN` and
+ * `Infinity` as `null`, throws on a bigint, and returns `undefined` for a symbol
+ * or a function, so a message built from it can name a value the caller never
+ * passed.
+ */
+function describeValue(value: unknown): string {
+  switch (typeof value) {
+    case 'string':
+      return JSON.stringify(value);
+    case 'bigint':
+      return `${value}n`;
+    case 'symbol':
+      return value.toString();
+    case 'function':
+      return 'a function';
+    case 'object':
+      return value === null ? 'null' : Array.isArray(value) ? 'an array' : 'an object';
+    default:
+      return String(value);
+  }
+}
+
+/**
+ * `allowBuiltinSettings` as a lower-cased set (PostgreSQL folds setting names).
+ * Each entry must be a plain un-dotted setting name; anything else is E003.
+ */
+function resolveBuiltinSettingsAllowlist(value: unknown): ReadonlySet<string> {
+  if (value === undefined) return new Set();
+  if (!Array.isArray(value)) {
+    throw new ValidationError(
+      `$transaction: allowBuiltinSettings must be an array of setting names, received ${typeof value}.`,
+    );
+  }
+  const names = new Set<string>();
+  for (const name of value) {
+    if (typeof name !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      throw new ValidationError(
+        `$transaction: allowBuiltinSettings entry ${describeValue(name)} is not a PostgreSQL setting name ` +
+          '(a plain identifier such as "statement_timeout"). Namespaced custom settings need no entry.',
+      );
+    }
+    names.add(name.toLowerCase());
+  }
+  return names;
+}
+
+/**
+ * SQLSTATEs with which the server refuses a `set_config`, and what each means
+ * for the caller. A function of the setting where the cause depends on it: the
+ * same SQLSTATE says "no such role" for `role` and "unreadable duration" for
+ * `statement_timeout`.
+ */
+const SESSION_SETTING_REFUSALS: Readonly<Record<string, (setting: string) => string>> = Object.assign(
+  Object.create(null),
+  {
+    '22023': (setting: string) =>
+      setting === 'role' || setting === 'session_authorization'
+        ? 'the value is not valid for this setting (the role must exist)'
+        : 'the value is not valid for this setting',
+    '42704': () => 'the server has no setting by that name',
+    '42501': () => 'the database role is not allowed to change it',
+    '55P02': () => 'it cannot be changed after the connection has started',
+  },
+);
+
+/**
+ * Apply one `sessionContext` entry. A refusal by the server names the setting
+ * that caused it rather than reading as a column or type error; the server's
+ * own message (which may contain the value) stays on `cause`.
+ */
+async function applySessionSetting(
+  client: PgCompatPoolClient,
+  setting: { name: string; sql: string; params: unknown[] },
+): Promise<void> {
+  try {
+    await client.query(setting.sql, setting.params);
+  } catch (err) {
+    const code = (err as { code?: unknown } | null)?.code;
+    const describe = typeof code === 'string' ? SESSION_SETTING_REFUSALS[code] : undefined;
+    if (describe === undefined) throw wrapPgError(err);
+    throw new ValidationError(
+      `sessionContext["${setting.name}"] was refused by the server: ${describe(setting.name.toLowerCase())} (SQLSTATE ${code}). ` +
+        'The transaction was rolled back before your callback ran.',
+      { cause: err },
+    );
+  }
+}
+
+/** A non-negative safe integer config value, or `undefined` when unset. Anything else is E003. */
+function resolveNonNegativeInteger(value: unknown, name: string, unit: string): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new ValidationError(
+      `Invalid ${name}: ${typeof value === 'string' ? JSON.stringify(value) : String(value)}. Expected a ` +
+        `non-negative whole number of ${unit}.`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Refuse a dialect with no `capabilities` object (E003): every code path asks
+ * it what the engine can do, so a hand-built dialect without one would fail on
+ * its first query with a TypeError instead of here.
+ */
+function assertDialectCapabilities(dialect: Dialect): void {
+  const capabilities = (dialect as { capabilities?: unknown }).capabilities;
+  if (typeof capabilities === 'object' && capabilities !== null) return;
+  throw new ValidationError(
+    `The dialect "${String(dialect.name)}" has no \`capabilities\` object, which says what the engine can do. ` +
+      'Build it from an engine dialect (`{ ...postgresDialect, name, capabilities: { ... } }`) and state every ' +
+      'EngineCapabilities key.',
+  );
+}
+
+/**
+ * The statement that opens a transaction, read-only when asked. PostgreSQL and
+ * MySQL both accept `READ ONLY` after their own BEGIN form (`BEGIN [ISOLATION
+ * LEVEL x] READ ONLY`, `[SET TRANSACTION ISOLATION LEVEL x; ]START TRANSACTION
+ * READ ONLY`); the other engines have no read-only transaction.
+ */
+function beginStatementFor(dialect: Dialect, isolationSql: string | undefined, readOnly: boolean): string {
+  const begin = dialect.beginStatement(isolationSql);
+  if (!readOnly) return begin;
+  if (dialect.capabilities.readOnlyTransactions) return `${begin} READ ONLY`;
+  throw new UnsupportedFeatureError(
+    '$transaction({ readOnly: true })',
+    dialect.name,
+    'This engine has no read-only transaction mode. Drop the option, or enforce read-only access with a ' +
+      'database role that has no write privileges.',
+  );
+}
+
+/** `readOnly` as a boolean; anything but a boolean or `undefined` is E003. */
+function resolveReadOnly(value: unknown): boolean {
+  if (value === undefined || value === false) return false;
+  if (value === true) return true;
+  throw new ValidationError(`$transaction: readOnly must be true or false, received ${describeValue(value)}.`);
+}
+
+/** Whether `pending` settles (either way) within `ms`. */
+async function settlesWithin(pending: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+  });
+  try {
+    return await Promise.race([
+      pending.then(
+        () => true,
+        () => true,
+      ),
+      late,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Stop a transaction that will not commit, on the server and now: cancel the
+ * statement it is running (the protocol's CancelRequest, which also reaches the
+ * right backend through a pooler), wait for it to answer, then ROLLBACK, which
+ * releases every lock the transaction holds.
  *
- * This is a hand-maintained list of names, so it drifts the moment a read
- * method is added to `QueryInterface` and not added here. The failure is
- * SILENT and directional: the missing operation keeps working, it just runs on
- * the PRIMARY, so no test fails and no user sees an error, only a busier
- * primary. `findManyStreamBatches` was added and missed exactly this way.
- * `src/test/read-operations-drift.test.ts` closes the loop mechanically.
+ * Closing the socket alone does not do that. PostgreSQL notices a closed
+ * client only when it next writes to it, so a backend waiting on a lock keeps
+ * the transaction, and every lock it already took, until that lock clears.
+ *
+ * Resolves `true` when the connection is rolled back and reusable, `false` when
+ * it is not (the cancel could not be sent, the statement or the ROLLBACK did not
+ * answer within {@link TX_ABORT_GRACE_MS}, or the ROLLBACK failed); the caller
+ * then destroys it. Call after `state.end()`, so nothing new is sent meanwhile.
+ */
+async function rollbackOnServer(
+  client: PgCompatPoolClient,
+  state: TransactionState,
+  dialect: Dialect,
+): Promise<boolean> {
+  if (state.running) {
+    if (!(await sendCancelRequest(client, TX_ABORT_GRACE_MS))) return false;
+    if (!(await state.whenIdle(TX_ABORT_GRACE_MS))) return false;
+  }
+  let failed = false;
+  const rollback = client.query(dialect.rollbackStatement()).catch(() => {
+    failed = true;
+  });
+  return (await settlesWithin(rollback, TX_ABORT_GRACE_MS)) && !failed;
+}
+
+/** `rawUnsafe` takes statement text; a tagged-template call or a non-string is E003. */
+function assertSqlText(text: unknown, api: string): asserts text is string {
+  if (typeof text === 'string' && text.trim() !== '') return;
+  throw new ValidationError(
+    Array.isArray(text)
+      ? `${api} takes the statement as a string, not as a tagged template. Use raw\`...\` or sql\`...\` for a ` +
+          'template, whose values are bound for you.'
+      : `${api} takes the statement text as a non-empty string, received ${text === null ? 'null' : typeof text}.`,
+  );
+}
+
+/**
+ * The connection `transaction(fn)` and `tx.$connection()` hand out: the
+ * checked-out client, with every statement routed through the transaction's
+ * state, so one issued after the transaction settled is refused rather than
+ * run on a connection that is back in the pool, and transaction-control SQL
+ * (`COMMIT`, `BEGIN`, ...) is refused rather than ending the transaction behind
+ * the state that tracks it.
+ *
+ * What would take the connection away is refused too: `release` (the
+ * transaction returns it itself), `end` and `connect`, and the driver's
+ * `connection` (the wire-level object, whose writes bypass every check here) is
+ * hidden. Everything else is the driver client's own.
+ */
+function closableRawClient(
+  client: PgCompatPoolClient,
+  state: TransactionState,
+  scope: TransactionScope = state.rootScope,
+  api: 'transaction()' | '$connection()' = 'transaction()',
+): PgCompatPoolClient {
+  // The refusals name the API the caller used: a `tx.$connection()` caller
+  // never called `transaction()`.
+  const who = api === 'transaction()' ? 'transaction(): the callback' : '$connection(): the $transaction callback';
+  const target = client as unknown as Record<PropertyKey, unknown>;
+  const send = target.query as (...args: unknown[]) => unknown;
+  const query = (...args: unknown[]): unknown => {
+    const first = args[0] as { submit?: unknown; text?: unknown } | string | null;
+    const text = typeof first === 'string' ? first : first?.text;
+    // Callback form and submittables (cursors, COPY streams) answer through
+    // their own channel, not a promise: checked, then passed straight through.
+    if (
+      typeof args[args.length - 1] === 'function' ||
+      typeof (first as { submit?: unknown } | null)?.submit === 'function'
+    ) {
+      state.assertOpen();
+      state.screenRaw(text);
+      return send.apply(client, args);
+    }
+    return state.runRaw(text, () => send.apply(client, args) as Promise<unknown>, scope);
+  };
+  const release = (): never => {
+    throw new ValidationError(
+      `${who} must not release its client; the transaction releases it after COMMIT or ROLLBACK.`,
+    );
+  };
+  const refuse = (verb: string): (() => never) => {
+    return () => {
+      throw new ValidationError(
+        `${who} must not ${verb} its client; the transaction owns the connection and ` +
+          'returns it to the pool after COMMIT or ROLLBACK.',
+      );
+    };
+  };
+  const refused = new Map<PropertyKey, () => never>([
+    ['end', refuse('end')],
+    ['connect', refuse('connect')],
+  ]);
+  const bound = new Map<PropertyKey, unknown>();
+  return new Proxy(target, {
+    has(t, prop) {
+      return prop === 'connection' ? false : Reflect.has(t, prop);
+    },
+    get(t, prop) {
+      if (prop === 'query') return query;
+      if (prop === 'release') return release;
+      if (prop === 'connection') return undefined;
+      const refusal = refused.get(prop);
+      if (refusal !== undefined) return refusal;
+      const value = Reflect.get(t, prop, t);
+      if (typeof value !== 'function') return value;
+      let fn = bound.get(prop);
+      if (fn === undefined) {
+        fn = (value as (...a: unknown[]) => unknown).bind(t);
+        bound.set(prop, fn);
+      }
+      return fn;
+    },
+  }) as unknown as PgCompatPoolClient;
+}
+
+/**
+ * Operations that may be served by a read replica: the `read` entries of
+ * {@link TABLE_METHODS}. Every other method (writes, `build*`, internals) stays
+ * on the primary. A Set so the routing proxy's `get` trap is O(1).
+ *
+ * Derived, not listed, because a hand-kept list drifts SILENTLY: a read method
+ * missing here keeps working on the primary, so no test fails. A new public
+ * QueryInterface method cannot compile until it is classified in TABLE_METHODS.
+ * `src/test/read-operations-drift.test.ts` is the run-time check.
  *
  * Exported for that test only.
  */
-export const READ_OPERATIONS: ReadonlySet<string> = new Set([
-  'findMany',
-  'findFirst',
-  'findUnique',
-  'findFirstOrThrow',
-  'findUniqueOrThrow',
-  'count',
-  'aggregate',
-  'groupBy',
-  'findManyStream',
-  'findManyStreamBatches',
-]);
+export const READ_OPERATIONS: ReadonlySet<string> = new Set(
+  Object.entries(TABLE_METHODS)
+    .filter(([, kind]) => kind === 'read')
+    .map(([name]) => name),
+);
 
 /**
  * Internal marker on the config object that tells the `TurbineClient`
@@ -1059,12 +1687,26 @@ interface PrimaryViewSeed {
  * A transaction-scoped client that provides the same table accessor API as TurbineClient.
  * All queries run on a dedicated connection within a BEGIN/COMMIT block.
  * Supports nested transactions via SAVEPOINTs.
+ *
+ * Closed when its transaction settles (commit, rollback, timeout, error): every
+ * later call through it throws `ValidationError` (E003) instead of running on a
+ * connection that is back in the pool and may belong to another request.
  */
 export class TransactionClient {
   private readonly tableCache = new Map<string, QueryInterface<object>>();
-  private savepointCounter = 0;
   /** Active SQL dialect, owns savepoint keywords and raw-SQL placeholders. */
   private readonly dialect: Dialect;
+  /** Open/closed state, first failure and savepoint blocks, shared by everything this client hands out. */
+  private readonly state: TransactionState;
+  /**
+   * Where in the transaction this handle sits: the transaction itself, or the
+   * nested block whose callback received it. Statements carry it, so one issued
+   * through an outer handle from inside a block can be told from one issued
+   * through the block's own.
+   */
+  private readonly scope: TransactionScope;
+  /** What {@link $connection} hands out, built on first use. */
+  private connectionHandle?: PgCompatPoolClient;
 
   constructor(
     private readonly client: PgCompatPoolClient,
@@ -1081,11 +1723,21 @@ export class TransactionClient {
      * for a plain pg pool leave the proxy unchanged.
      */
     private readonly sourcePool?: { readonly readonly?: boolean; readonly capabilities?: unknown },
+    /**
+     * The state of the transaction this client belongs to. `$transaction`
+     * passes the one it opened, which also turns on per-write savepoints for
+     * multi-statement writes. Omitted for Turbine's own implicit transactions.
+     */
+    state?: TransactionState,
+    /** The nested block this handle belongs to; omitted for the transaction's own handle. */
+    scope?: TransactionScope,
   ) {
     this.dialect = queryOptions?.dialect ?? postgresDialect;
+    this.state = state ?? new TransactionState(client, this.dialect);
+    this.scope = scope ?? this.state.rootScope;
     // Auto-create typed table accessors for all tables in the schema
     for (const tableName of Object.keys(schema.tables)) {
-      const camelName = tableName.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+      const camelName = tableAccessorName(tableName);
       if (!(camelName in this)) {
         Object.defineProperty(this, camelName, {
           get: () => this.table(tableName),
@@ -1107,53 +1759,163 @@ export class TransactionClient {
       const txPool = this.createTxPool();
       const txOpts = { ...this.queryOptions, _txScoped: true };
       qi = txOpts.queryInterfaceFactory
-        ? txOpts.queryInterfaceFactory(txPool, name, this.schema, this.middlewares, txOpts)
+        ? asQueryInterface(txOpts.queryInterfaceFactory(txPool, name, this.schema, this.middlewares, txOpts))
         : new QueryInterface<object>(txPool, name, this.schema, this.middlewares, txOpts);
+      if (this.state.savepointWrites) savepointMultiStatementWrites(qi, this.schema.tables[name], this.state);
       this.tableCache.set(name, qi);
     }
-    return qi as QueryInterface<T>;
+    return qi as unknown as QueryInterface<T>;
+  }
+
+  /**
+   * The driver connection this transaction runs on, for code that needs one:
+   * another library's query function, a COPY stream, a driver feature Turbine
+   * does not wrap. Statements sent on it run inside this transaction.
+   *
+   * - It closes with the transaction: a statement sent after COMMIT or
+   *   ROLLBACK is refused with `ValidationError` (E003) instead of running on a
+   *   connection that is back in the pool.
+   * - `release()` is refused. The transaction returns the connection.
+   * - COMMIT, ROLLBACK, BEGIN, SAVEPOINT, RELEASE and SET TRANSACTION are
+   *   refused with `ValidationError` (E003): the transaction ends itself, and
+   *   Turbine would then commit or roll back a transaction that is no longer
+   *   open. Use `tx.$transaction` for a savepoint.
+   * - `end()` and `connect()` are refused like `release()`, and the driver's
+   *   `connection` object is not reachable through it.
+   * - Its queries use the driver's own parsers. On a pool you supplied, that is
+   *   your parser configuration, not Turbine's int8 and UTC readings.
+   *
+   * Typed as the driver-neutral client. For the pg-only surface, cast:
+   * `tx.$connection() as unknown as PoolClient`.
+   *
+   * Throws `UnsupportedFeatureError` (E017) where no driver connection backs
+   * the transaction: PowDB, and a stateless HTTP driver.
+   */
+  $connection(): PgCompatPoolClient {
+    this.state.assertOpen();
+    if (this.connectionHandle) return this.connectionHandle;
+    const raw = rawClientOf(this.client);
+    const driver = this.dialect.capabilities.connectionDriver;
+    if (driver === 'none') {
+      throw new UnsupportedFeatureError(
+        'tx.$connection()',
+        this.dialect.name,
+        'A PowDB transaction has no driver connection to hand out. Run PowQL inside it with `tx.rawUnsafe(text, ...values)`.',
+      );
+    }
+    if (driver === 'pg-compatible' && typeof (raw as { on?: unknown }).on !== 'function') {
+      throw new UnsupportedFeatureError(
+        'tx.$connection()',
+        this.dialect.name,
+        'The pool returned a client with no event support, as a stateless HTTP driver does, so there is no ' +
+          'connection to hand out. Use `tx.raw` / `tx.rawUnsafe`, or a TCP pool.',
+      );
+    }
+    this.connectionHandle = closableRawClient(raw, this.state, this.scope, '$connection()');
+    return this.connectionHandle;
   }
 
   /**
    * Execute a nested transaction via SAVEPOINT.
-   * If the inner function throws, only the savepoint is rolled back.
+   *
+   * If the inner function throws, only the savepoint is rolled back. Blocks
+   * started side by side (`Promise.all`) run one after another, because
+   * savepoints are a stack on the connection and a rollback in one would
+   * otherwise undo a sibling that already reported success.
+   *
+   * The callback receives a `tx` of its own, bound to the block. Use it for the
+   * work inside the block: a statement through the OUTER `tx` from inside the
+   * block would run in the block's savepoint and be undone with it, so it is
+   * refused with `ValidationError` (E003).
    */
   async $transaction<R>(fn: (tx: TransactionClient) => Promise<R>): Promise<R> {
-    const savepointName = `sp_${++this.savepointCounter}`;
-    await this.client.query(this.dialect.savepointStatement(savepointName));
-    try {
-      const result = await fn(this);
-      await this.client.query(this.dialect.releaseSavepointStatement(savepointName));
-      return result;
-    } catch (err) {
-      await this.client.query(this.dialect.rollbackToSavepointStatement(savepointName));
-      throw err;
-    }
+    return this.state.withBlock((scope) => fn(this.inScope(scope)), this.scope);
+  }
+
+  /** A handle on the same transaction bound to nested block `scope`. */
+  private inScope(scope: TransactionScope): TransactionClient {
+    return new TransactionClient(
+      this.client,
+      this.schema,
+      this.middlewares,
+      this.queryOptions,
+      this.sourcePool,
+      this.state,
+      scope,
+    );
   }
 
   /**
-   * Execute a raw SQL query within this transaction.
+   * Execute a raw SQL query within this transaction, as a tagged template:
+   * every `${value}` is sent as a bound parameter.
    */
   async raw<T extends Record<string, unknown> = Record<string, unknown>>(
     strings: TemplateStringsArray,
     ...values: unknown[]
   ): Promise<T[]> {
-    let sql = '';
-    strings.forEach((str, i) => {
-      sql += str;
-      if (i < values.length) {
-        sql += this.dialect.paramPlaceholder(i + 1);
-      }
-    });
-    const result = await runReportedStatement(
-      this.queryOptions?._onQuery,
-      rawIdentity('raw'),
+    const { sql, params } = buildTypedSql(strings, values, this.dialect, 'raw');
+    return this.runRaw<T>(sql, params, 'raw');
+  }
+
+  /**
+   * Execute SQL text built at runtime within this transaction. See
+   * {@link TurbineClient.rawUnsafe}: nothing in `text` is escaped, so it must
+   * never contain untrusted input. Values go in `values`, referenced as `$1`,
+   * `$2`, ... (the engine's own placeholders on other engines).
+   */
+  async rawUnsafe<T extends Record<string, unknown> = Record<string, unknown>>(
+    text: string,
+    ...values: unknown[]
+  ): Promise<T[]> {
+    assertSqlText(text, 'rawUnsafe');
+    return this.runRaw<T>(text, values, 'rawUnsafe');
+  }
+
+  /**
+   * Typed raw SQL on this transaction's connection, like
+   * {@link TurbineClient.sql}: await it for `T[]`, or call `.one()` /
+   * `.scalar()`. Refused, like every other `tx` call, once the transaction has
+   * settled.
+   */
+  sql<T extends Record<string, unknown> = Record<string, unknown>>(
+    strings: TemplateStringsArray,
+    ...values: unknown[]
+  ): TypedSqlQuery<T> {
+    this.state.assertOpen();
+    const { sql, params: bound } = buildTypedSql(strings, values, this.dialect);
+    const params = this.rawParams(bound, 'sql');
+    const state = this.state;
+    const client = this.client;
+    const scope = this.scope;
+    const pool = {
+      query: (text: string, vals?: unknown[]) => state.runRaw(text, () => client.query(text, vals), scope),
+    } as unknown as PgCompatPool;
+    return new TypedSqlQuery<T>(pool, sql, params, false, undefined, this.queryOptions?._onQuery);
+  }
+
+  private async runRaw<T>(sql: string, values: unknown[], action: string): Promise<T[]> {
+    const params = this.rawParams(values, action);
+    const result = await this.state.runRaw(
       sql,
-      values,
-      () => this.client.query(sql, values),
-      wrapPgError,
+      () =>
+        runReportedStatement(
+          this.queryOptions?._onQuery,
+          rawIdentity(action),
+          sql,
+          params,
+          () => this.client.query(sql, params),
+          wrapPgError,
+        ),
+      this.scope,
     );
     return result.rows as T[];
+  }
+
+  /** Bound Dates as UTC text on a PostgreSQL client reading temporal types as UTC. */
+  private rawParams(params: unknown[], api: string): unknown[] {
+    return this.dialect.capabilities.utcTimestampRewrite && this.queryOptions?.utcTimestamps !== false
+      ? utcDateParams(params, api)
+      : params;
   }
 
   /**
@@ -1187,13 +1949,19 @@ export class TransactionClient {
     params: readonly unknown[] = [],
     action = 'rawQuery',
   ): Promise<{ rows: T[]; rowCount: number | null }> {
-    const result = await runReportedStatement(
-      this.queryOptions?._onQuery,
-      rawIdentity(action),
+    const bound = this.rawParams(params as unknown[], action);
+    const result = await this.state.runRaw(
       text,
-      params as unknown[],
-      () => this.client.query(text, params as unknown[]),
-      wrapPgError,
+      () =>
+        runReportedStatement(
+          this.queryOptions?._onQuery,
+          rawIdentity(action),
+          text,
+          bound,
+          () => this.client.query(text, bound),
+          wrapPgError,
+        ),
+      this.scope,
     );
     return { rows: result.rows as T[], rowCount: result.rowCount };
   }
@@ -1205,14 +1973,15 @@ export class TransactionClient {
    *
    * pg driver errors thrown by queries are translated into typed Turbine
    * errors via wrapPgError so transaction-scoped queries surface the same
-   * typed errors as pool-scoped queries.
+   * typed errors as pool-scoped queries. Every statement passes through the
+   * transaction state, which refuses it once the transaction has settled.
    */
   private createTxPool(): PgCompatPool {
     const client = this.client;
-    // Return a minimal pool-compatible object that routes queries
-    // through the transaction client
-    const txPool: Record<string, unknown> = {
-      query: async (textOrConfig: string | { name?: string; text: string; values?: unknown[] }, values?: unknown[]) => {
+    const state = this.state;
+    const scope = this.scope;
+    const query = (textOrConfig: string | { name?: string; text: string; values?: unknown[] }, values?: unknown[]) =>
+      state.run(async () => {
         try {
           if (typeof textOrConfig === 'string') {
             return await client.query(textOrConfig, values);
@@ -1226,8 +1995,20 @@ export class TransactionClient {
         } catch (err) {
           throw wrapPgError(err);
         }
+      }, scope);
+    // Return a minimal pool-compatible object that routes queries
+    // through the transaction client
+    const txPool: Record<PropertyKey, unknown> = {
+      query,
+      // The transaction's connection is not this pool's to lend: a "checkout"
+      // runs on it through the same guarded `query`, and releasing it is a
+      // no-op, so nothing reached through the pool can hand the connection back
+      // to the real pool while the transaction still holds it.
+      connect: async () => {
+        state.assertOpen();
+        return { query, release: () => {} };
       },
-      connect: () => Promise.resolve(client),
+      [TRANSACTION_STATE]: state,
     };
     // Carry the parent pool's PowDB-only flags through so a transaction-scoped
     // PowqlInterface reads the same read-only guard and capabilities it would
@@ -1236,6 +2017,54 @@ export class TransactionClient {
     if (this.sourcePool?.capabilities !== undefined) txPool.capabilities = this.sourcePool.capabilities;
     return txPool as unknown as PgCompatPool;
   }
+}
+
+/**
+ * Give each multi-statement write on a transaction-scoped accessor its own
+ * savepoint: `create` / `update` carrying nested relation writes, and an
+ * `upsert` that looks the row up first.
+ *
+ * Joining the caller's transaction statement by statement, a failure raised
+ * part way through (a nested `connect` that finds nothing, a validation error
+ * found mid-walk) would leave the statements before it in place, and a caller
+ * that caught the error and went on would commit half of the write. In its own
+ * savepoint the write is all or nothing, and the caller's transaction
+ * continues either way.
+ *
+ * Installed as own methods on the accessor this transaction created and owns,
+ * so a single-statement write pays one property lookup and a shape check.
+ */
+function savepointMultiStatementWrites(
+  qi: QueryInterface<object>,
+  meta: TableMetadata | undefined,
+  state: TransactionState,
+): void {
+  if (!meta) return;
+  const target = qi as unknown as Record<string, (args: Record<string, unknown> | undefined) => Promise<unknown>>;
+  const nestedData = (args: Record<string, unknown> | undefined): boolean => {
+    const data = args?.data;
+    return data !== null && typeof data === 'object' && hasRelationFields(data as Record<string, unknown>, meta);
+  };
+  const lookupUpsert = (args: Record<string, unknown> | undefined): boolean => {
+    const needsLookup = (qi as unknown as { upsertNeedsLookup?: (a: unknown) => boolean }).upsertNeedsLookup;
+    return typeof needsLookup === 'function' && args !== undefined && needsLookup.call(qi, args);
+  };
+  const wrap = (
+    method: 'create' | 'update' | 'upsert',
+    multiStatement: (args: Record<string, unknown> | undefined) => boolean,
+  ) => {
+    const original = target[method];
+    if (typeof original !== 'function') return;
+    Object.defineProperty(qi, method, {
+      value: (args: Record<string, unknown> | undefined) =>
+        multiStatement(args) ? state.withSavepoint(() => original.call(qi, args)) : original.call(qi, args),
+      configurable: true,
+      writable: true,
+    });
+  };
+  wrap('create', nestedData);
+  wrap('update', nestedData);
+  wrap('upsert', lookupUpsert);
 }
 
 // ---------------------------------------------------------------------------
@@ -1256,6 +2085,13 @@ export class TurbineClient {
    * `db.pool as unknown as Pool`.
    */
   readonly pool: PgCompatPool;
+  /**
+   * The pool Turbine's own statements go through: {@link pool}, or for a
+   * caller-supplied PostgreSQL pool a view of it whose queries carry Turbine's
+   * int8 and temporal parsers (see supplied-pool-types.ts). `pool` stays the
+   * caller's object, and queries the caller runs on it keep their parsers.
+   */
+  private readonly queryPool: PgCompatPool;
 
   /** The schema metadata this client was built from */
   readonly schema: SchemaMetadata;
@@ -1285,6 +2121,10 @@ export class TurbineClient {
    */
   private static utcTimestampParsersRegistered = false;
   private readonly logging: boolean;
+  /** Where this client's log lines go (the `logger` option, else console). */
+  private readonly logger: TurbineLogger;
+  /** The `diagnostics` option, resolved once at construction. */
+  private readonly diagnostics: ResolvedDiagnostics;
   /** Active SQL dialect, owns transaction keywords, set_config, raw-SQL placeholders, capability flags. */
   private readonly dialect: Dialect;
   /** Validated `plan_cache_mode` to pin on every owned connection, or undefined to issue nothing. */
@@ -1293,6 +2133,10 @@ export class TurbineClient {
   private readonly middlewares: Middleware[] = [];
   private readonly queryListeners = new Set<QueryEventListener>();
   private queryOptions: QueryInterfaceOptions;
+  /** The resolved `sqlComment` every accessor shares, for the batch paths that bypass them. */
+  private get sqlCommenter(): SqlCommenter | undefined {
+    return this.queryOptions._sqlCommenter;
+  }
   private readonly errorMessagesSafe: boolean;
   /**
    * THIS client's error-message mode. Not the process default: see
@@ -1309,6 +2153,10 @@ export class TurbineClient {
   private readonly ownsPool: boolean = true;
   /** Active LISTEN subscriptions, torn down on disconnect() so it never hangs */
   private readonly activeSubscriptions = new Set<ActiveSubscription>();
+  /** `$on('poolError')` / `$on('connectionLost')` listeners. */
+  private readonly poolListeners: PoolListeners = { poolError: new Set(), connectionLost: new Set() };
+  /** What each pool Turbine opened has checked out, for `disconnect({ timeoutMs })`. */
+  private readonly checkoutWatches: CheckoutWatch[] = [];
 
   /**
    * Read-replica pools in round-robin order. Empty when no replicas are
@@ -1340,19 +2188,23 @@ export class TurbineClient {
       const parent = seed.parent;
       this.schema = schema;
       this.logging = parent.logging;
+      this.logger = parent.logger;
+      this.diagnostics = parent.diagnostics;
       this.dialect = parent.dialect;
       this.errorMessagesSafe = parent.errorMessagesSafe;
       this.errorMessageMode = parent.errorMessageMode;
       this.queryParamsVisible = parent.queryParamsVisible;
       this.queryOptions = parent.queryOptions;
       this.middlewares = parent.middlewares; // shared reference: $use on parent flows through
+      this.poolListeners = parent.poolListeners;
       this.pool = parent.pool;
+      this.queryPool = parent.queryPool;
       this.ownsPool = false;
       this.replicaPools = [];
       this.ownedReplicaPools = [];
       this.replicaTableCaches = [];
       for (const tableName of Object.keys(schema.tables)) {
-        const camelName = tableName.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+        const camelName = tableAccessorName(tableName);
         if (!(camelName in this)) {
           Object.defineProperty(this, camelName, {
             get: () => this.table(tableName),
@@ -1395,15 +2247,42 @@ export class TurbineClient {
       }
       break;
     }
+    // The logger and the diagnostics mode are validated first, so every line
+    // below, the construction warnings included, reaches the caller's logger.
+    // NODE_ENV is read here and nowhere on a query path.
+    const logger = resolveLogger(config.logger);
+    const diagnostics = resolveDiagnostics(config.diagnostics);
     // Name any key on the config object that is not part of the config surface
-    // (dev only, once per key, never throws). See warnUnknownConfigKeys.
-    warnUnknownConfigKeys(config);
+    // (once per key, never throws). See warnUnknownConfigKeys.
+    warnUnknownConfigKeys(config, logger);
     // ALL config validation runs before ANY process-global side effect below.
     // A constructor that throws must leave the process exactly as it found it:
     // settling the process-global parser mode and then rejecting the config
     // would poison the next, valid, TurbineClient with a phantom conflict.
     const dialect = config.dialect ?? postgresDialect;
+    assertDialectCapabilities(dialect);
     const planCacheMode = TurbineClient.resolvePlanCacheMode(config.planCacheMode, dialect);
+    const statementTimeoutMs = TurbineClient.resolveStatementTimeout(config.statementTimeoutMs, dialect);
+    const maxLifetimeSeconds = resolveNonNegativeInteger(config.maxLifetimeSeconds, 'maxLifetimeSeconds', 'seconds');
+    const streamIdleTimeoutMs = resolveStreamIdleTimeout(config.streamIdleTimeoutMs, 'streamIdleTimeoutMs');
+    // A backend that injects its own query interface (PowDB) builds no SQL,
+    // so there is nothing for a comment to ride on: refused, not ignored.
+    const sqlComment = resolveSqlComment(config.sqlComment, logger, {
+      dialect: dialect.name,
+      preparesEveryStatement: dialect.capabilities.preparesEveryStatement,
+      buildsSql: (config as { queryInterfaceFactory?: unknown }).queryInterfaceFactory === undefined,
+    });
+    // Keyed by table name, with every key checked against the schema: a
+    // filter under a name that matches no table would never be applied.
+    // A non-SQL backend (PowDB) injects its own query interface and checks
+    // its own filters; every SQL engine compiles each static filter here once,
+    // with this client's dialect, so a value the compiler refuses fails now.
+    const factory = (config as { queryInterfaceFactory?: unknown }).queryInterfaceFactory;
+    const globalFilters = normalizeGlobalFilters(
+      config.globalFilters,
+      schema,
+      factory === undefined ? { QueryInterface, dialect, utcTimestamps: config.utcTimestamps } : undefined,
+    );
     // Refuse a connection string that cannot address a database, before it
     // reaches pg's permissive parser and comes back one query later as a DNS
     // error about a fragment of itself. Only the strings this client will
@@ -1458,19 +2337,14 @@ export class TurbineClient {
     // fork and rely on their own parser configuration, registration is
     // process-global, so flipping it because a string replica exists alongside
     // an external primary would silently change the external primary's parsing
-    // too. String replicas configured next to an external primary therefore
-    // inherit the caller's parser configuration (documented). Registration is
-    // constructor-gated by the static flags, so it happens at most once.
+    // too. With an external primary, Turbine's own queries carry the parsers
+    // per query instead, on the primary and on every replica (see typedPool).
+    // Registration is constructor-gated by the static flags, so it happens at
+    // most once.
     const ownsAnyPool = !config.pool;
     if (ownsAnyPool && !TurbineClient.int8ParserRegistered) {
-      warnParserOverwrite(20, 'int8');
-      pg.types.setTypeParser(
-        20,
-        markTurbineParser((val: string) => {
-          const n = Number(val);
-          return Number.isSafeInteger(n) ? n : val;
-        }),
-      );
+      warnParserOverwrite(20, 'int8', logger);
+      pg.types.setTypeParser(20, parseInt8);
       TurbineClient.int8ParserRegistered = true;
     }
     // Parse the zone-less temporal types (`timestamp` OID 1114, `date` OID
@@ -1495,17 +2369,23 @@ export class TurbineClient {
     const wantUtcTimestamps = config.utcTimestamps !== false;
     TurbineClient.assertUtcTimestampsAgree(wantUtcTimestamps);
     if (ownsAnyPool && wantUtcTimestamps && !TurbineClient.utcTimestampParsersRegistered) {
-      registerUtcTemporalParsers();
+      registerUtcTemporalParsers(logger);
       TurbineClient.utcTimestampParsersRegistered = true;
     }
     TurbineClient.utcTimestampParserMode = wantUtcTimestamps;
 
     this.logging = config.logging ?? false;
+    this.logger = logger;
+    this.diagnostics = diagnostics;
     this.dialect = dialect;
     this.planCacheMode = planCacheMode;
     this.schema = schema;
     // Respect env var kill switch
     const envDisablePrepared = typeof process !== 'undefined' && process.env?.TURBINE_DISABLE_PREPARED === '1';
+    const pooler = config.pool ? undefined : TurbineClient.poolerEndpoint(config);
+    if (config.preparedStatements === true && pooler !== undefined) {
+      TurbineClient.warnPreparedOnPooler(pooler, logger);
+    }
 
     this.errorMessageMode = config.errorMessages ?? 'safe';
     this.errorMessagesSafe = this.errorMessageMode === 'safe';
@@ -1526,15 +2406,19 @@ export class TurbineClient {
       autoToOneJoinMaxRows: config.autoToOneJoinMaxRows,
       autoRoundTripMs: config.autoRoundTripMs,
       jsonEncoding: config.jsonEncoding,
-      globalFilters: config.globalFilters,
-      preparedStatements: envDisablePrepared ? false : (config.preparedStatements ?? !config.pool),
+      globalFilters,
+      preparedStatements: envDisablePrepared ? false : (config.preparedStatements ?? (!config.pool && !pooler)),
       // Forwarded so a per-query `forceCustomPlan` can refuse the combination
       // this client's own connections would silently defeat, see the
       // `planCacheMode` note on QueryInterfaceOptions.
       planCacheMode,
       sqlCache: config.sqlCache ?? true,
       sqlCacheSize: config.sqlCacheSize,
+      streamIdleTimeoutMs,
+      _sqlCommenter: sqlComment,
       dialect: config.dialect,
+      diagnostics,
+      logger,
       // Non-SQL backends (PowDB) inject a factory that builds their own query
       // interface (PowqlInterface) instead of the SQL QueryInterface. SQL engines
       // never set this, so `table()` keeps constructing `new QueryInterface`.
@@ -1551,7 +2435,8 @@ export class TurbineClient {
           try {
             listener(emitted);
           } catch (e) {
-            if (this.logging) console.error('[turbine] Query listener error:', e);
+            if (this.logging)
+              logTo(this.logger, 'error', 'Query listener error:', { code: 'query-listener-error', error: e });
           }
         }
       },
@@ -1576,10 +2461,22 @@ export class TurbineClient {
     if (config.pool) {
       // External pool, use directly. Turbine doesn't manage its lifecycle.
       this.pool = config.pool;
+      // Turbine registers no parsers for a pool it did not open, so its own
+      // queries on this one carry them instead.
+      this.queryPool = this.typedPool(config.pool);
       this.ownsPool = false;
       if (this.logging) {
-        console.log(`[turbine] Using external pool, ${Object.keys(schema.tables).length} tables`);
+        const tables = Object.keys(schema.tables).length;
+        logTo(this.logger, 'debug', `Using external pool, ${tables} tables`, { code: 'external-pool', tables });
       }
+    } else if (!hasDatabaseTarget(config)) {
+      // Nothing names a database: no pool, connection string, host settings,
+      // DATABASE_URL or PG* variable. The first query fails with the fix,
+      // which beats connecting to a guessed localhost. Failing here instead
+      // would break every build step that imports the client without a database.
+      this.pool = unconfiguredPool(config.connectionString === '');
+      this.queryPool = this.pool;
+      this.ownsPool = true;
     } else {
       const poolConfig: pg.PoolConfig = {
         max: config.poolSize ?? config.max ?? 10,
@@ -1607,10 +2504,12 @@ export class TurbineClient {
       } else if (!hasExplicitConnection && process.env.DATABASE_URL) {
         poolConfig.connectionString = process.env.DATABASE_URL;
       } else {
-        poolConfig.host = config.host ?? 'localhost';
-        poolConfig.port = config.port ?? 5432;
-        poolConfig.database = config.database ?? 'postgres';
-        poolConfig.user = config.user ?? 'postgres';
+        // A default filled in here would override the PG* variable pg reads
+        // for the same field, so a field the environment sets is left to pg.
+        poolConfig.host = config.host ?? (pgEnv('PGHOST') ? undefined : 'localhost');
+        poolConfig.port = config.port ?? (pgEnv('PGPORT') ? undefined : 5432);
+        poolConfig.database = config.database ?? (pgEnv('PGDATABASE') ? undefined : 'postgres');
+        poolConfig.user = config.user ?? (pgEnv('PGUSER') ? undefined : 'postgres');
         poolConfig.password = config.password;
       }
 
@@ -1621,22 +2520,28 @@ export class TurbineClient {
       // Held as a `pg.Pool` for the length of this block: `PgCompatPool.on` is
       // optional (HTTP drivers have no pool events), and here we know we own a
       // real pg pool that has one. Same shape as the replica loop below.
-      const ownPool = new pg.Pool(TurbineClient.withPlanCacheMode(poolConfig, this.planCacheMode));
-      ownPool.on('error', (err) => {
-        console.error('[turbine] Unexpected pool error:', err.message);
-      });
-      absorbCheckedOutErrors(ownPool);
+      const ownPool = new pg.Pool(
+        TurbineClient.ownedPoolConfig(poolConfig, planCacheMode, statementTimeoutMs, maxLifetimeSeconds),
+      );
+      this.watchOwnedPool(ownPool, { pool: 'primary' });
       // After a freeze (a serverless function between invocations), wait one
       // loop turn before reusing a long-idle connection, so the pool has read
       // any close the server sent meanwhile. See connection-guard.ts.
       settleLongIdleCheckouts(ownPool);
+      // An exhausted pool rejects a checkout with an untyped pg-pool error;
+      // make it a ConnectionError on every path, `pool.query` included.
+      typeCheckoutTimeouts(ownPool);
       this.pool = ownPool;
+      this.queryPool = ownPool;
       this.ownsPool = true;
 
       if (this.logging) {
-        console.log(
-          `[turbine] Pool created, max ${poolConfig.max} connections, ${Object.keys(schema.tables).length} tables`,
-        );
+        const tables = Object.keys(schema.tables).length;
+        logTo(this.logger, 'debug', `Pool created, max ${poolConfig.max} connections, ${tables} tables`, {
+          code: 'pool-created',
+          max: poolConfig.max,
+          tables,
+        });
       }
     }
 
@@ -1648,7 +2553,7 @@ export class TurbineClient {
     for (const replica of config.replicas ?? []) {
       if (typeof replica === 'string') {
         const replicaPool = new pg.Pool(
-          TurbineClient.withPlanCacheMode(
+          TurbineClient.ownedPoolConfig(
             {
               connectionString: replica,
               max: config.poolSize ?? config.max ?? 10,
@@ -1656,18 +2561,20 @@ export class TurbineClient {
               connectionTimeoutMillis: config.connectionTimeoutMs ?? config.connectionTimeoutMillis ?? 5_000,
               ...(config.ssl !== undefined ? { ssl: config.ssl } : {}),
             },
-            this.planCacheMode,
+            planCacheMode,
+            statementTimeoutMs,
+            maxLifetimeSeconds,
           ),
         );
-        replicaPool.on('error', (err) => {
-          console.error('[turbine] Unexpected replica pool error:', err.message);
-        });
-        absorbCheckedOutErrors(replicaPool);
+        this.watchOwnedPool(replicaPool, { pool: 'replica', replica: this.replicaPools.length });
         settleLongIdleCheckouts(replicaPool);
-        this.replicaPools.push(replicaPool);
+        typeCheckoutTimeouts(replicaPool);
+        // Next to a supplied primary no parsers were registered, so this
+        // replica's reads carry them like the primary's do.
+        this.replicaPools.push(this.ownsPool ? replicaPool : this.typedPool(replicaPool));
         this.ownedReplicaPools.push(replicaPool);
       } else {
-        this.replicaPools.push(replica);
+        this.replicaPools.push(this.typedPool(replica));
       }
     }
     // `planCacheMode` reaches a pool only where Turbine opens the connections.
@@ -1678,32 +2585,41 @@ export class TurbineClient {
     // Deliberate no-op rather than a throw: the option is a performance knob,
     // and an app that moves from an owned pool to a serverless driver should
     // not stop booting over it. Same ownership rule as the type parsers, which
-    // also skip external pools silently.
-    if (this.planCacheMode !== undefined && !this.ownsPool && process.env.NODE_ENV !== 'production') {
+    // also skip external pools silently. Always on, like every construction
+    // warning: the option is just as ignored in production.
+    if (this.planCacheMode !== undefined && !this.ownsPool) {
       if (shouldWarnOnce(WARN_NS.planCacheModeIgnored, this.planCacheMode)) {
         const replicaNote =
           this.ownedReplicaPools.length > 0
             ? ` It IS applied to the ${this.ownedReplicaPools.length} Turbine-owned read replica pool(s) on this ` +
               'client, so reads and writes would run under different plan-cache policies until the primary is set too.'
             : '';
-        console.warn(
-          `[turbine] planCacheMode: '${this.planCacheMode}' was not applied to the primary: this client was given an ` +
+        logTo(
+          this.logger,
+          'warn',
+          `planCacheMode: '${this.planCacheMode}' was not applied to the primary: this client was given an ` +
             'external `pool`, whose connection lifecycle the caller owns, so Turbine never opens its connections. Set ' +
             `\`plan_cache_mode\` in the driver's own connection setup (or run \`SET plan_cache_mode = ${this.planCacheMode}\` ` +
             `on checkout) instead.${replicaNote}`,
+          { code: 'plan-cache-mode-ignored', option: 'planCacheMode', ownedReplicas: this.ownedReplicaPools.length },
         );
       }
     }
+    this.warnExternalPoolOptions(statementTimeoutMs, maxLifetimeSeconds);
     this.replicaTableCaches = this.replicaPools.map(() => new Map<string, QueryInterface<object>>());
     if (this.logging && this.replicaPools.length > 0) {
-      console.log(
-        `[turbine] ${this.replicaPools.length} read replica(s) configured (${this.ownedReplicaPools.length} owned)`,
-      );
+      const replicas = this.replicaPools.length;
+      const owned = this.ownedReplicaPools.length;
+      logTo(this.logger, 'debug', `${replicas} read replica(s) configured (${owned} owned)`, {
+        code: 'replicas-configured',
+        replicas,
+        owned,
+      });
     }
 
     // Auto-create typed table accessors for all tables in the schema
     for (const tableName of Object.keys(schema.tables)) {
-      const camelName = tableName.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
+      const camelName = tableAccessorName(tableName);
       if (!(camelName in this)) {
         Object.defineProperty(this, camelName, {
           get: () => this.table(tableName),
@@ -1779,8 +2695,10 @@ export class TurbineClient {
   }
 
   /**
-   * Pin `plan_cache_mode` on every connection an OWNED pool opens, by putting
-   * it in the pool's **connection parameters** rather than issuing a `SET`.
+   * The pg pool config for a pool Turbine opens: the `maxLifetimeSeconds`
+   * recycling default, plus `plan_cache_mode` and `statement_timeout` pinned
+   * on every connection through the pool's **connection parameters** rather
+   * than a `SET`.
    *
    * PostgreSQL's `options` startup parameter (`-c plan_cache_mode=...`) is
    * applied by the backend as it starts the session, so the setting is in force
@@ -1814,21 +2732,184 @@ export class TurbineClient {
    * should set the GUC on the server or role instead
    * (`ALTER ROLE ... SET plan_cache_mode = ...`).
    */
-  private static withPlanCacheMode(poolConfig: pg.PoolConfig, mode: PlanCacheMode | undefined): pg.PoolConfig {
-    if (mode === undefined) return poolConfig;
-    // `mode` is a member of PLAN_CACHE_MODES, never caller text (see
-    // resolvePlanCacheMode), which is what makes this literal safe: a GUC value
-    // cannot be a bind parameter.
-    const setting = `-c plan_cache_mode=${mode}`;
-    const merged = poolConfig.connectionString
-      ? mergeConnectionStringOptions(poolConfig.connectionString, setting)
-      : null;
-    if (merged) return { ...poolConfig, connectionString: merged };
-    // pg reads `config.options` when truthy and `process.env.PGOPTIONS`
-    // otherwise, so an unmerged setting would replace the caller's PGOPTIONS
-    // rather than add to it.
-    const existing = poolConfig.options || (typeof process !== 'undefined' ? process.env?.PGOPTIONS : undefined);
-    return { ...poolConfig, options: existing ? `${existing} ${setting}` : setting };
+  private static ownedPoolConfig(
+    poolConfig: pg.PoolConfig,
+    planCacheMode: PlanCacheMode | undefined,
+    statementTimeoutMs: number | undefined,
+    maxLifetimeSeconds: number | undefined,
+  ): pg.PoolConfig {
+    let config: pg.PoolConfig = {
+      ...poolConfig,
+      maxLifetimeSeconds: maxLifetimeSeconds ?? DEFAULT_MAX_LIFETIME_SECONDS,
+    };
+    // `planCacheMode` is a member of PLAN_CACHE_MODES and `statementTimeoutMs`
+    // a narrowed integer, never caller text, which is what makes these
+    // literals safe: a GUC value cannot be a bind parameter.
+    if (planCacheMode !== undefined) config = withStartupSetting(config, `-c plan_cache_mode=${planCacheMode}`);
+    const timeout = statementTimeoutMs === undefined ? null : statementTimeoutSetting(statementTimeoutMs);
+    if (timeout !== null) config = withStartupSetting(config, timeout);
+    return config;
+  }
+
+  /**
+   * Validate `statementTimeoutMs`: a non-negative integer (E003), on
+   * PostgreSQL only (E017), since it is applied as a PostgreSQL connection
+   * parameter.
+   */
+  private static resolveStatementTimeout(value: unknown, dialect: Dialect): number | undefined {
+    const ms = resolveNonNegativeInteger(value, 'statementTimeoutMs', 'milliseconds');
+    if (ms !== undefined && !dialect.capabilities.connectionParameters) {
+      throw new UnsupportedFeatureError(
+        `The statementTimeoutMs option (statement_timeout = ${ms})`,
+        dialect.name,
+        '`statement_timeout` is applied as a PostgreSQL connection parameter. Remove the option on this engine, ' +
+          'and bound slow statements with the per-query `timeout` instead.',
+      );
+    }
+    return ms;
+  }
+
+  /**
+   * The first connection target this client opens that names a connection
+   * pooler (see `detectPooler`), as `host:port`, or `undefined`. Covers the
+   * connection string, the DATABASE_URL fallback, host/port settings, and
+   * string replicas, each read the way node-postgres reads it: a host or port
+   * the target leaves unset is `PGHOST` / `PGPORT`.
+   */
+  private static poolerEndpoint(config: TurbineConfig): string | undefined {
+    const explicit =
+      config.connectionString != null ||
+      config.host != null ||
+      config.port != null ||
+      config.database != null ||
+      config.user != null ||
+      config.password != null;
+    const targets: ConnectionTarget[] = [];
+    if (config.connectionString) targets.push(parseConnectionTarget(config.connectionString));
+    else if (!explicit && process.env.DATABASE_URL) targets.push(parseConnectionTarget(process.env.DATABASE_URL));
+    else {
+      targets.push({
+        host: config.host ? config.host.toLowerCase() : null,
+        port: typeof config.port === 'number' ? config.port : null,
+      });
+    }
+    for (const replica of config.replicas ?? []) {
+      if (typeof replica === 'string' && replica) targets.push(parseConnectionTarget(replica));
+    }
+    const environment = { host: pgEnv('PGHOST'), port: pgEnv('PGPORT') };
+    for (const target of targets) {
+      const found = detectPoolerTarget(fillTargetFromEnvironment(target, environment));
+      if (found.pooled) return `${found.host ?? 'localhost'}:${found.port ?? 5432}`;
+    }
+    return undefined;
+  }
+
+  /** Always on: named statements behind a transaction pooler fail in production first. */
+  private static warnPreparedOnPooler(endpoint: string, logger: TurbineLogger): void {
+    if (!shouldWarnOnce(WARN_NS.preparedStatementsOnPooler, endpoint)) return;
+    logTo(
+      logger,
+      'warn',
+      `preparedStatements: true on ${endpoint}, which looks like a connection pooler. In transaction ` +
+        'mode a pooler runs each transaction on any server connection, so a statement named on one fails on ' +
+        'the next ("prepared statement ... does not exist" or "already exists") unless the pooler tracks ' +
+        'prepared statements: PgBouncer 1.21+ with max_prepared_statements above 0. If yours does not, leave ' +
+        'preparedStatements unset; Turbine then sends unnamed statements to a pooler.',
+      { code: 'prepared-statements-on-pooler', endpoint },
+    );
+  }
+
+  /**
+   * `pool` as Turbine's own statements should reach it: with Turbine's int8
+   * and temporal parsers on every query, for a PostgreSQL pool built on
+   * node-postgres. Any other pool is returned unchanged.
+   */
+  private typedPool(pool: PgCompatPool): PgCompatPool {
+    if (this.dialect.capabilities.connectionDriver !== 'pg-compatible') return pool;
+    return typedQueryPool(pool, this.queryOptions.utcTimestamps !== false) ?? pool;
+  }
+
+  /**
+   * Listen to a pool this client opened: its idle-connection errors become
+   * `poolError` events, a checked-out connection's loss a `connectionLost`
+   * event, and its checkouts are tracked for `disconnect({ timeoutMs })`.
+   * Also the connection guards every owned pool gets (connection-guard.ts):
+   * no unheard `'error'`, a settle after a freeze, typed checkout timeouts.
+   */
+  private watchOwnedPool(pool: pg.Pool, origin: PoolEventOrigin): void {
+    pool.on('error', (err) => this.emitPoolEvent('poolError', { error: err, ...origin }));
+    absorbCheckedOutErrors(pool);
+    this.checkoutWatches.push(
+      watchCheckouts(pool, (err) => this.emitPoolEvent('connectionLost', { error: err, ...origin })),
+    );
+  }
+
+  /**
+   * Hand a pool event to its listeners. A `poolError` with no listener is
+   * logged at `error`, always; a listener that throws is ignored, like a query
+   * listener.
+   */
+  private emitPoolEvent(kind: keyof PoolListeners, event: PoolEvent): void {
+    const listeners = this.poolListeners[kind];
+    if (listeners.size === 0) {
+      if (kind === 'poolError') {
+        logTo(this.logger, 'error', `Unexpected ${event.pool} pool error: ${event.error.message}`, {
+          code: 'pool-error',
+          pool: event.pool,
+          ...(event.replica !== undefined ? { replica: event.replica } : {}),
+          error: event.error,
+        });
+      }
+      return;
+    }
+    for (const listener of listeners) {
+      try {
+        listener(event);
+      } catch (e) {
+        if (this.logging) {
+          logTo(this.logger, 'error', `${kind} listener error:`, {
+            code: 'pool-listener-error',
+            listener: kind,
+            error: e,
+          });
+        }
+      }
+    }
+  }
+
+  /**
+   * `statementTimeoutMs` and an explicit `maxLifetimeSeconds` reach only the
+   * pools Turbine opens. On an external primary they do nothing, which a
+   * warning says once, naming where the setting belongs instead. Always on: an
+   * ignored timeout means no timeout in production.
+   */
+  private warnExternalPoolOptions(
+    statementTimeoutMs: number | undefined,
+    maxLifetimeSeconds: number | undefined,
+  ): void {
+    if (this.ownsPool) return;
+    const ownedReplicas = this.ownedReplicaPools.length;
+    if (statementTimeoutMs !== undefined && shouldWarnOnce(WARN_NS.connectionOptionIgnored, 'statementTimeoutMs')) {
+      logTo(
+        this.logger,
+        'warn',
+        `statementTimeoutMs: ${statementTimeoutMs} was not applied to the primary: this client was given an ` +
+          "external `pool`, whose connections Turbine never opens. Set `statement_timeout` in the driver's own " +
+          "connection setup, or on the role (`ALTER ROLE app SET statement_timeout = '30s'`)." +
+          (ownedReplicas > 0 ? ' It IS applied to the Turbine-owned read replica pools.' : ''),
+        { code: 'connection-option-ignored', option: 'statementTimeoutMs', ownedReplicas },
+      );
+    }
+    if (maxLifetimeSeconds !== undefined && shouldWarnOnce(WARN_NS.connectionOptionIgnored, 'maxLifetimeSeconds')) {
+      logTo(
+        this.logger,
+        'warn',
+        `maxLifetimeSeconds: ${maxLifetimeSeconds} was not applied to the primary: this client was given ` +
+          "an external `pool`, whose connection lifecycle the caller owns. Set it on that pool's own options." +
+          (ownedReplicas > 0 ? ' It IS applied to the Turbine-owned read replica pools.' : ''),
+        { code: 'connection-option-ignored', option: 'maxLifetimeSeconds', ownedReplicas },
+      );
+    }
   }
 
   /**
@@ -1942,12 +3023,35 @@ export class TurbineClient {
   // Event emitter, subscribe to query lifecycle events
   // -------------------------------------------------------------------------
 
-  $on(_event: 'query', listener: QueryEventListener): void {
-    this.queryListeners.add(listener);
+  /**
+   * Subscribe to client events:
+   *   - `'query'`: one {@link QueryEvent} per statement.
+   *   - `'poolError'`: an idle pooled connection failed ({@link PoolErrorEvent}).
+   *   - `'connectionLost'`: a checked-out connection failed ({@link ConnectionLostEvent}).
+   *
+   * Pool events come from the pools this client opened; an external `pool`
+   * emits its own. Any other event name throws `ValidationError` (E003).
+   */
+  $on(event: 'query', listener: QueryEventListener): void;
+  $on(event: 'poolError', listener: (event: PoolErrorEvent) => void): void;
+  $on(event: 'connectionLost', listener: (event: ConnectionLostEvent) => void): void;
+  $on(event: string, listener: (event: never) => void): void {
+    this.listenersFor(event, '$on').add(listener as never);
   }
 
-  $off(_event: 'query', listener: QueryEventListener): void {
-    this.queryListeners.delete(listener);
+  $off(event: 'query', listener: QueryEventListener): void;
+  $off(event: 'poolError', listener: (event: PoolErrorEvent) => void): void;
+  $off(event: 'connectionLost', listener: (event: ConnectionLostEvent) => void): void;
+  $off(event: string, listener: (event: never) => void): void {
+    this.listenersFor(event, '$off').delete(listener as never);
+  }
+
+  private listenersFor(event: string, api: string): Set<never> {
+    if (event === 'query') return this.queryListeners as Set<never>;
+    if (event === 'poolError' || event === 'connectionLost') return this.poolListeners[event] as Set<never>;
+    throw new ValidationError(
+      `${api}: unknown event ${JSON.stringify(event)}. Expected 'query', 'poolError' or 'connectionLost'.`,
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -2011,7 +3115,7 @@ export class TurbineClient {
       scoped = this.createErrorModeAccessor(base);
       this.errorScopedTableCache.set(name, scoped);
     }
-    return scoped as QueryInterface<T>;
+    return scoped as unknown as QueryInterface<T>;
   }
 
   /** Get (and cache) the replica-routing accessor for a table. */
@@ -2043,20 +3147,21 @@ export class TurbineClient {
    */
   private createErrorModeAccessor(target: QueryInterface<object>): QueryInterface<object> {
     const mode = this.errorMessageMode;
-    const wrapped = new Map<string, unknown>();
+    // Keyed by name AND the function found under it, so a method replaced
+    // after first use (a spy, a mock, an APM patch) is the one that runs.
+    const wrapped = new Map<string, { fn: unknown; wrapper: unknown }>();
     return new Proxy(target, {
       get(t, prop, receiver) {
         const value = Reflect.get(t, prop, receiver);
         if (typeof value !== 'function' || typeof prop !== 'string') return value;
-        let fn = wrapped.get(prop);
-        if (!fn) {
-          fn = (...args: unknown[]) => {
-            const call = () => (value as (...a: unknown[]) => unknown).apply(t, args);
-            return errorMessageModesDiverged() ? runWithErrorMessageMode(mode, call) : call();
-          };
-          wrapped.set(prop, fn);
-        }
-        return fn;
+        const hit = wrapped.get(prop);
+        if (hit !== undefined && hit.fn === value) return hit.wrapper;
+        const wrapper = (...args: unknown[]) => {
+          const call = () => (value as (...a: unknown[]) => unknown).apply(t, args);
+          return errorMessageModesDiverged() ? runWithErrorMessageMode(mode, call) : call();
+        };
+        wrapped.set(prop, { fn: value, wrapper });
+        return wrapper;
       },
     }) as QueryInterface<object>;
   }
@@ -2081,7 +3186,7 @@ export class TurbineClient {
   private primaryTableQI(name: string): QueryInterface<object> {
     let qi = this.tableCache.get(name);
     if (!qi) {
-      qi = this.buildTableQI(this.pool, name);
+      qi = this.buildTableQI(this.queryPool, name);
       this.tableCache.set(name, qi);
     }
     return qi;
@@ -2109,7 +3214,9 @@ export class TurbineClient {
   /** Construct a QueryInterface bound to `pool` (honoring any injected factory). */
   private buildTableQI(pool: PgCompatPool, name: string): QueryInterface<object> {
     return this.queryOptions?.queryInterfaceFactory
-      ? this.queryOptions.queryInterfaceFactory(pool, name, this.schema, this.middlewares, this.queryOptions)
+      ? asQueryInterface(
+          this.queryOptions.queryInterfaceFactory(pool, name, this.schema, this.middlewares, this.queryOptions),
+        )
       : new QueryInterface<object>(pool, name, this.schema, this.middlewares, this.queryOptions);
   }
 
@@ -2121,23 +3228,33 @@ export class TurbineClient {
   private createRoutingAccessor(name: string): QueryInterface<object> {
     const primaryQI = this.primaryTableQI(name);
     const client = this;
+    // One routing function per operation, so the accessor above can tell a
+    // replaced method from this one by identity.
+    const routed = new Map<string, (...args: unknown[]) => unknown>();
     return new Proxy(primaryQI, {
       get(target, prop, receiver) {
-        if (typeof prop === 'string' && READ_OPERATIONS.has(prop)) {
+        // A read replaced on the accessor (a spy, a mock) is an own property of
+        // the primary instance, and runs as installed rather than routed past.
+        if (typeof prop !== 'string' || !READ_OPERATIONS.has(prop) || Object.hasOwn(target, prop)) {
+          return Reflect.get(target, prop, receiver);
+        }
+        let route = routed.get(prop);
+        if (route === undefined) {
           // Pick the replica at CALL time so round-robin advances per operation.
-          return (...args: unknown[]) => {
+          route = (...args: unknown[]) => {
             const replicaQI = client.nextReplicaTableQI(name) as unknown as Record<
               string,
               ((...a: unknown[]) => unknown) | undefined
             >;
             const method = replicaQI[prop];
             if (typeof method !== 'function') {
-              return Reflect.get(target, prop, receiver);
+              return (Reflect.get(target, prop, receiver) as (...a: unknown[]) => unknown).apply(target, args);
             }
             return method.apply(replicaQI, args);
           };
+          routed.set(prop, route);
         }
-        return Reflect.get(target, prop, receiver);
+        return route;
       },
     }) as unknown as QueryInterface<object>;
   }
@@ -2193,20 +3310,21 @@ export class TurbineClient {
    * extended-query pipeline protocol (one TCP flush, one round-trip).
    * On HTTP-based drivers it falls back to sequential execution.
    */
+  pipeline<T extends readonly DeferredQuery<unknown>[]>(...queries: T): Promise<PipelineResults<T>>;
+  pipeline<T extends readonly DeferredQuery<unknown>[]>(
+    queries: readonly [...T],
+    options?: PipelineOptions,
+  ): Promise<PipelineResults<T>>;
   async pipeline<T extends readonly DeferredQuery<unknown>[]>(
     ...args: T | [T, PipelineOptions?]
   ): Promise<PipelineResults<T>> {
     let queries: T;
     let options: PipelineOptions | undefined;
 
-    // Detect which overload was used
-    if (
-      args.length > 0 &&
-      Array.isArray(args[0]) &&
-      (args[0] as unknown[]).every(
-        (item) => item && typeof item === 'object' && 'sql' in (item as Record<string, unknown>),
-      )
-    ) {
+    // Detect which overload was used. A deferred query is never an array, so
+    // an array first argument is the array form whatever it contains; its
+    // items are checked below like the rest form's.
+    if (args.length > 0 && Array.isArray(args[0])) {
       // Array form: pipeline([q1, q2], opts?)
       queries = args[0] as unknown as T;
       options = args[1] as PipelineOptions | undefined;
@@ -2214,9 +3332,18 @@ export class TurbineClient {
       // Rest-param form: pipeline(q1, q2, q3)
       queries = args as unknown as T;
     }
+    assertDeferredQueries(queries, 'pipeline', 'pipeline');
+    // A locking read outside a transaction would release its locks before
+    // the caller saw the rows; a transactional pipeline keeps them for the batch.
+    if (options?.transactional === false) assertNoLockInAutocommitPipeline(queries);
 
     if (this.logging) {
-      console.log(`[turbine] Pipeline: ${queries.length} queries, ${queries.map((q) => q.tag).join(', ')}`);
+      const tags = queries.map((q) => q.tag);
+      logTo(this.logger, 'debug', `Pipeline: ${queries.length} queries, ${tags.join(', ')}`, {
+        code: 'pipeline',
+        queries: queries.length,
+        tags,
+      });
     }
     // Scoped like every other entry point. A pipeline builds NotFoundErrors (a
     // `buildFindUniqueOrThrow` slot) and wraps driver errors into
@@ -2225,9 +3352,26 @@ export class TurbineClient {
     // where VALUES as soon as any verbose client existed in the process. The
     // scope is established around the await, so every continuation of the batch
     // resolves this client's mode.
+    // Each statement carries the `sqlComment` its query interface would have
+    // given it, computed here in the caller's async context.
+    const comments = this.statementComments(queries);
+    const sent = comments ? (queries.map((q, i) => commentDeferred(q, comments[i])) as unknown as T) : queries;
     const sink = this.queryListeners.size > 0 ? this.queryOptions._onQuery : undefined;
-    if (!sink) return this.withErrorMode(() => executePipeline(this.pool, queries, options));
-    return this.withErrorMode(() => this.reportedPipeline(sink, queries, options));
+    if (!sink) return this.withErrorMode(() => executePipeline(this.queryPool, sent, options));
+    return this.withErrorMode(() => this.reportedPipeline(sink, queries, options, sent, comments));
+  }
+
+  /**
+   * The `sqlComment` of each deferred query, named by its own model and action
+   * (a pipeline can mix tables), or `undefined` when this client adds none.
+   */
+  private statementComments(queries: readonly DeferredQuery<unknown>[]): (string | undefined)[] | undefined {
+    const commenter = this.sqlCommenter;
+    if (commenter === undefined) return undefined;
+    return queries.map((q) => {
+      const { model, action } = deferredIdentity(q.tag);
+      return commenter.commentFor(model, action)?.comment;
+    });
   }
 
   /**
@@ -2243,9 +3387,11 @@ export class TurbineClient {
     sink: (event: QueryEvent) => void,
     queries: T,
     options: PipelineOptions | undefined,
+    sent: T,
+    comments: (string | undefined)[] | undefined,
   ): Promise<PipelineResults<T>> {
     const rowCounts: (number | undefined)[] = new Array(queries.length).fill(undefined);
-    const observed = queries.map((q, i) => ({
+    const observed = sent.map((q, i) => ({
       ...q,
       transform: (raw: PgCompatQueryResult) => {
         rowCounts[i] = resultRowCount(raw);
@@ -2255,7 +3401,7 @@ export class TurbineClient {
     const start = performance.now();
     let failure: unknown;
     try {
-      return await executePipeline(this.pool, observed, options);
+      return await executePipeline(this.queryPool, observed, options);
     } catch (err) {
       failure = err;
       throw err;
@@ -2280,6 +3426,7 @@ export class TurbineClient {
             ...deferredIdentity(q.tag),
             rows: rowCounts[i] ?? 0,
             batch: 'pipeline',
+            ...(comments?.[i] === undefined ? {} : { comment: comments[i] }),
             ...(failed ? { error: failure instanceof Error ? failure : new Error(String(failure)) } : {}),
           });
         }
@@ -2293,7 +3440,7 @@ export class TurbineClient {
    * drivers (Neon HTTP, Vercel Postgres, etc.) and mock pools.
    */
   async pipelineSupported(): Promise<boolean> {
-    return pipelineSupported(this.pool);
+    return pipelineSupported(this.queryPool);
   }
 
   // -------------------------------------------------------------------------
@@ -2302,6 +3449,10 @@ export class TurbineClient {
 
   /**
    * Execute a raw SQL query with parameter interpolation via tagged templates.
+   * Every `${value}` is sent as a bound parameter. Only a real tagged-template
+   * call is accepted: an array passed in its place throws `ValidationError`
+   * (E003), since its text would reach the SQL unescaped. For statement text
+   * built at runtime, see {@link rawUnsafe}.
    *
    * @example
    * ```ts
@@ -2316,24 +3467,50 @@ export class TurbineClient {
     strings: TemplateStringsArray,
     ...values: unknown[]
   ): Promise<T[]> {
-    let sql = '';
-    strings.forEach((str, i) => {
-      sql += str;
-      if (i < values.length) {
-        sql += this.dialect.paramPlaceholder(i + 1);
-      }
-    });
+    const { sql, params } = buildTypedSql(strings, values, this.dialect, 'raw');
+    return this.runRaw<T>(sql, params, 'raw');
+  }
 
+  /**
+   * Execute SQL text built at runtime: DDL read from a file, a statement in
+   * another engine's own language (PowQL), a migration step. Values go in
+   * `values` and are referenced from the text with the engine's placeholders
+   * (`$1`, `$2`, ... on PostgreSQL), so they are still bound.
+   *
+   * NOTHING IN `text` IS ESCAPED. It is the one raw entry point where
+   * concatenating input into the statement is possible, which is why it is
+   * separate from {@link raw} and named for it: never build `text` from
+   * request data. Prefer {@link raw} or {@link sql} wherever the statement is
+   * known when the code is written.
+   *
+   * @example
+   * ```ts
+   * for (const statement of ddlStatements) await db.rawUnsafe(statement);
+   * await db.rawUnsafe('SELECT * FROM users WHERE id = $1', userId);
+   * ```
+   */
+  async rawUnsafe<T extends Record<string, unknown> = Record<string, unknown>>(
+    text: string,
+    ...values: unknown[]
+  ): Promise<T[]> {
+    assertSqlText(text, 'rawUnsafe');
+    return this.runRaw<T>(text, values, 'rawUnsafe');
+  }
+
+  private async runRaw<T>(sql: string, values: unknown[], action: string): Promise<T[]> {
+    const params = this.rawParams(values, action);
     if (this.logging) {
-      console.log(`[turbine] Raw SQL: ${sql.trim().substring(0, 120)}...`);
+      logTo(this.logger, 'debug', `Raw SQL: ${sql.trim().substring(0, 120)}...`, {
+        code: 'raw-sql',
+        operation: action,
+      });
     }
-
     const result = await runReportedStatement(
       this.queryOptions._onQuery,
-      rawIdentity('raw'),
+      rawIdentity(action),
       sql,
-      values,
-      () => this.pool.query(sql, values),
+      params,
+      () => this.queryPool.query(sql, params),
       (err) => this.withErrorMode(() => wrapPgError(err)),
     );
     return result.rows as T[];
@@ -2353,15 +3530,27 @@ export class TurbineClient {
     params: readonly unknown[] = [],
     action = 'rawQuery',
   ): Promise<{ rows: T[]; rowCount: number | null }> {
+    const bound = this.rawParams(params as unknown[], action);
     const result = await runReportedStatement(
       this.queryOptions._onQuery,
       rawIdentity(action),
       text,
-      params as unknown[],
-      () => this.pool.query(text, params as unknown[]),
+      bound,
+      () => this.queryPool.query(text, bound),
       (err) => this.withErrorMode(() => wrapPgError(err)),
     );
     return { rows: result.rows as T[], rowCount: result.rowCount };
+  }
+
+  /**
+   * Bound Dates as UTC text, on a PostgreSQL client reading zone-less temporal
+   * types as UTC (see {@link utcDateParams}). Typed builder writes convert per
+   * column instead and never come through here.
+   */
+  private rawParams(params: unknown[], api: string): unknown[] {
+    return this.dialect.capabilities.utcTimestampRewrite && this.queryOptions.utcTimestamps !== false
+      ? utcDateParams(params, api)
+      : params;
   }
 
   /**
@@ -2421,7 +3610,8 @@ export class TurbineClient {
     strings: TemplateStringsArray,
     ...values: unknown[]
   ): TypedSqlQuery<T> {
-    const { sql, params } = buildTypedSql(strings, values, this.dialect);
+    const { sql, params: bound } = buildTypedSql(strings, values, this.dialect);
+    const params = this.rawParams(bound, 'sql');
     // The scope has to be handed to the BUILDER, not wrapped around this call.
     // `TypedSqlQuery` is lazy (it runs on `await` / `.one()` / `.scalar()`), so
     // a scope opened here would close before any row was fetched. The
@@ -2429,12 +3619,13 @@ export class TurbineClient {
     // and did not, which left two raw-SQL entry points disagreeing about the
     // same statement, since the adjacent `raw` tag WAS scoped.
     return new TypedSqlQuery<T>(
-      this.pool,
+      this.queryPool,
       sql,
       params,
       this.logging,
       <R>(fn: () => R): R => this.withErrorMode(fn),
       this.queryOptions._onQuery,
+      this.logger,
     );
   }
 
@@ -2447,10 +3638,16 @@ export class TurbineClient {
    * connection. For the typed API, use `$transaction()` instead.
    *
    * The client is typed as {@link PgCompatPoolClient}, the driver-neutral
-   * contract: `query(text, values)` plus `release()`, which is all any
-   * supported driver guarantees. For the pg-only surface (cursors, COPY
-   * streams, the `QueryConfig` object form), import `PoolClient` from the pg
-   * package and cast: `client as unknown as PoolClient`.
+   * contract: `query(text, values)`, which is all any supported driver
+   * guarantees. For the pg-only surface (cursors, COPY streams, the
+   * `QueryConfig` object form), import `PoolClient` from the pg package and
+   * cast: `client as unknown as PoolClient`.
+   *
+   * Like `$transaction`'s `tx`, the client is closed when the transaction
+   * settles: a query sent through it afterwards throws `ValidationError`
+   * (E003). The callback must not `release()` it, and must await every query
+   * it starts: one still running when the callback returns rolls the
+   * transaction back with E003.
    *
    * @example
    * ```ts
@@ -2468,24 +3665,31 @@ export class TurbineClient {
     // driver with one shared engine handle (PowDB embedded) would roll back a
     // DIFFERENT caller's open transaction.
     const { client, checkout } = await openCheckout(this.pool, (c) => runTxControl(c, this.dialect.beginStatement()));
+    const state = new TransactionState(client, this.dialect, { api: 'transaction' });
+    const guarded = closableRawClient(client, state);
     try {
       // Engine seam: single-writer engines scope their transaction re-entrancy
       // marker to the callback's async subtree (see
       // PgCompatPoolClient.wrapTransactionCallback). Absent everywhere else.
       const wrap = (client as unknown as PgCompatPoolClient).wrapTransactionCallback;
       // `.call` erases the generic, so the callback's Promise<T> is re-asserted.
-      const result = wrap ? ((await wrap.call(client, () => fn(client))) as T) : await fn(client);
-      await runTxControl(client, this.dialect.commitStatement());
+      const result = wrap ? ((await wrap.call(client, () => fn(guarded))) as T) : await fn(guarded);
+      const unawaited = state.busy;
+      state.end('has ended');
+      if (unawaited) throw unawaitedWorkError('transaction');
+      // A COMMIT answered with ROLLBACK (a statement failed and the callback
+      // caught it) rejects, with the first failed statement as the cause.
+      await commitTransaction(client, this.dialect.commitStatement(), state.firstFailure, 'transaction');
+      state.end('committed');
+      checkout.release();
       return result;
     } catch (err) {
-      try {
-        await client.query(this.dialect.rollbackStatement());
-      } catch {
-        // Best-effort rollback, the connection may have died mid-query.
-      }
+      state.end('was rolled back');
+      const clean = await rollbackOnServer(client, state, this.dialect);
+      checkout.release(
+        clean ? undefined : new Error('[turbine] transaction connection discarded: rollback not confirmed'),
+      );
       throw explainConnectionLoss(err, checkout.lostWith);
-    } finally {
-      checkout.release();
     }
   }
 
@@ -2536,7 +3740,10 @@ export class TurbineClient {
    * ]);
    * ```
    */
-  $transaction<T extends readonly DeferredQuery<unknown>[]>(queries: readonly [...T]): Promise<PipelineResults<T>>;
+  $transaction<T extends readonly DeferredQuery<unknown>[]>(
+    queries: readonly [...T],
+    options?: TransactionOptions,
+  ): Promise<PipelineResults<T>>;
   async $transaction(
     fnOrQueries: ((tx: TransactionClient) => Promise<unknown>) | readonly DeferredQuery<unknown>[],
     options?: TransactionOptions,
@@ -2552,164 +3759,217 @@ export class TurbineClient {
     options?: TransactionOptions,
   ): Promise<unknown> {
     // Batch overload: an array of DeferredQuery objects runs atomically inside
-    // one BEGIN…COMMIT, reusing the raw transaction machinery below.
+    // one BEGIN…COMMIT, through the same lifecycle (and options) as a callback.
     if (Array.isArray(fnOrQueries)) {
-      return this.transactionBatch(fnOrQueries);
+      assertDeferredQueries(fnOrQueries, '$transaction([...])', 'transaction');
+      if (fnOrQueries.length === 0) {
+        this.resolveTransactionOptions(options);
+        return [];
+      }
+      return this.runInTransaction(options, (client, state) => this.runBatch(client, state, fnOrQueries));
+    }
+    if (typeof fnOrQueries !== 'function') {
+      throw new ValidationError(
+        '$transaction expects a callback, `async (tx) => { ... }`, or an array of deferred queries built with ' +
+          `\`build*()\`, but received ${fnOrQueries === null ? 'null' : typeof fnOrQueries}.`,
+      );
     }
     const fn = fnOrQueries as (tx: TransactionClient) => Promise<unknown>;
-    // Resolve the isolation level BEFORE taking a pool slot: a bad argument is
-    // the caller's bug and should not cost a connection to discover.
-    const isolationSql = resolveIsolationLevel(options?.isolationLevel);
-    // BEGIN with optional isolation level, the dialect owns the keyword and
-    // BEGIN+isolation composition (Postgres appends ` ISOLATION LEVEL …`). It
-    // runs inside openCheckout, which sends it once more on a fresh connection
-    // when the first one turns out to be dead, and which releases the
-    // connection itself when BEGIN fails for good. So everything below runs in
-    // a transaction that began.
-    const { client, checkout } = await openCheckout(this.pool, (c) =>
-      runTxControl(c, this.dialect.beginStatement(isolationSql)),
+    // Pass the parent pool so its read-only guard + PowDB capabilities flow
+    // into the transaction-scoped proxy pool (see TransactionClient.createTxPool).
+    const sourcePool = this.pool as unknown as { readonly?: boolean; capabilities?: unknown };
+    return this.runInTransaction(options, (client, state) =>
+      fn(new TransactionClient(client, this.schema, this.middlewares, this.queryOptions, sourcePool, state)),
     );
+  }
+
+  /**
+   * Validate every transaction option and build the statements they need,
+   * BEFORE a pool slot is taken: a bad argument is the caller's bug and should
+   * not cost a connection to discover.
+   */
+  private resolveTransactionOptions(options: TransactionOptions | undefined): {
+    begin: string;
+    sessionConfig: Array<{ name: string; sql: string; params: unknown[] }>;
+    timeout: number | undefined;
+  } {
+    const isolationSql = resolveIsolationLevel(options?.isolationLevel);
+    const begin = beginStatementFor(this.dialect, isolationSql, resolveReadOnly(options?.readOnly));
+    const sessionConfig = this.resolveSessionContext(options?.sessionContext, options?.allowBuiltinSettings);
     const timeout = options?.timeout;
+    if (timeout !== undefined && timeout !== 0 && !(typeof timeout === 'number' && timeout > 0 && timeout < 2 ** 31)) {
+      throw new ValidationError(
+        `$transaction: timeout must be a positive number of milliseconds (or 0 for none), received ${describeValue(timeout)}.`,
+      );
+    }
+    return { begin, sessionConfig, timeout: timeout || undefined };
+  }
 
-    /**
-     * Track whether the connection has already been released so the finally
-     * block doesn't double-release. When a timeout fires we destroy the
-     * connection eagerly to abort the in-flight backend query.
-     */
-    let released = false;
-    const releaseOnce = (err?: Error | boolean): void => {
-      if (released) return;
-      released = true;
-      try {
-        checkout.release(err);
-      } catch {
-        // pg may throw if the client is already released, swallow.
-      }
-    };
-
+  /**
+   * The one transaction lifecycle both `$transaction` forms share, so an option
+   * one form honours is honoured by the other: BEGIN (isolation level, read
+   * only) -> `sessionContext` GUCs -> body, raced against `timeout` -> COMMIT,
+   * and ROLLBACK on any failure.
+   *
+   * The transaction state is ended as soon as the body settles, BEFORE the
+   * COMMIT, so a `tx` that leaked out of the callback can never slip a
+   * statement in ahead of the COMMIT or onto the connection after it. Work the
+   * body started and did not await is caught there too: the transaction rolls
+   * back rather than committing whatever part of it had run.
+   *
+   * A transaction that will not commit (timed out, failed, unawaited work) is
+   * stopped on the server before its connection is released: the running
+   * statement is cancelled and ROLLBACK sent, so its locks are freed now (see
+   * {@link rollbackOnServer}). A connection that cannot be confirmed clean is
+   * destroyed instead of reused.
+   */
+  private async runInTransaction<R>(
+    options: TransactionOptions | undefined,
+    body: (client: PgCompatPoolClient, state: TransactionState) => Promise<R>,
+  ): Promise<R> {
+    const { begin, sessionConfig, timeout } = this.resolveTransactionOptions(options);
+    // openCheckout sends BEGIN once more on a fresh connection when the first
+    // one turns out to be dead, and releases the connection itself when BEGIN
+    // fails for good. So everything below runs in a transaction that began.
+    const { client, checkout } = await openCheckout(this.queryPool, (c) => runTxControl(c, begin));
+    const state = new TransactionState(client, this.dialect, { userTransaction: true });
     let timedOut = false;
 
     try {
-      // Apply transaction-local session context (RLS / multi-tenant GUCs).
-      // Order matters: BEGIN -> isolation level (above) -> set_config loop ->
-      // user fn. Any error here propagates to the catch below and rolls back
-      // like any other transaction failure. We use set_config(name, value,
-      // is_local=true), the parameterizable, transaction-scoped equivalent of
-      // SET LOCAL, so both name and value are BOUND params, never interpolated.
-      if (options?.sessionContext) {
-        if (!this.dialect.supportsRLS) {
-          throw new UnsupportedFeatureError(
-            'sessionContext (RLS session GUCs)',
-            this.dialect.name,
-            'set_config-based row-level-security context requires PostgreSQL.',
-          );
-        }
-        for (const [name, value] of Object.entries(options.sessionContext)) {
-          if (!GUC_NAME_REGEX.test(name)) {
-            throw new ValidationError(
-              `Invalid session-context GUC name "${name}", must match ` +
-                '/^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)?$/ (optionally namespaced, e.g. "app.current_tenant")',
-            );
-          }
-          const cfg = this.dialect.buildSetSessionConfig(name, String(value));
-          await client.query(cfg.sql, cfg.params);
-        }
-      }
-
-      // Create the transaction client with typed table accessors. Pass the
-      // parent pool so its read-only guard + PowDB capabilities flow into the
-      // transaction-scoped proxy pool (see TransactionClient.createTxPool).
-      const tx = new TransactionClient(
-        client,
-        this.schema,
-        this.middlewares,
-        this.queryOptions,
-        this.pool as unknown as { readonly?: boolean; capabilities?: unknown },
-      );
-
-      // Dynamically attach table accessors to tx
-      for (const tableName of Object.keys(this.schema.tables)) {
-        const camelName = tableName.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
-        if (!(camelName in tx)) {
-          Object.defineProperty(tx, camelName, {
-            get: () => tx.table(tableName),
-            enumerable: true,
-          });
-        }
-      }
-
-      let result: unknown;
+      // Transaction-local session context (RLS / multi-tenant GUCs), applied
+      // after BEGIN and before the body via set_config(name, value,
+      // is_local=true), so both name and value are BOUND params.
+      for (const cfg of sessionConfig) await applySessionSetting(client, cfg);
 
       // Engine seam: when the checked-out connection exposes
-      // wrapTransactionCallback (single-writer engines such as PowDB), run the user
-      // callback through it so the engine can scope its re-entrancy marker to
-      // the callback's async subtree. All other drivers: plain fn(tx).
+      // wrapTransactionCallback (single-writer engines such as PowDB), run the
+      // body through it so the engine can scope its re-entrancy marker to the
+      // body's async subtree. All other drivers: plain body().
       const wrap = (client as unknown as PgCompatPoolClient).wrapTransactionCallback;
-      const runCallback = (): Promise<unknown> => (wrap ? wrap.call(client, () => fn(tx)) : fn(tx));
+      const runBody = (): Promise<R> =>
+        state.enter(() => (wrap ? (wrap.call(client, () => body(client, state)) as Promise<R>) : body(client, state)));
 
+      let result: R;
       if (timeout) {
-        // Race between the function and a timeout. If the timeout fires we
-        // need to actually abort the in-flight query, otherwise the backend
-        // keeps running until pg's own timeout, holding a pool slot the whole
-        // time. The simplest reliable cancellation is to destroy the
-        // connection: passing a truthy argument to client.release() tells the
-        // pg pool to discard the client (its socket is closed, which causes
-        // Postgres to abort the active query and roll back the transaction).
-        // The pool will spin up a fresh connection on the next checkout.
         let timer: ReturnType<typeof setTimeout> | undefined;
         const timeoutPromise = new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
             timedOut = true;
-            // Destroy the connection to abort the in-flight backend query.
-            // We do this BEFORE rejecting so the socket is gone by the time
-            // the caller's catch block runs.
-            releaseOnce(new Error('[turbine] Transaction timeout, connection destroyed'));
-            reject(new TimeoutError(timeout, 'Transaction'));
+            state.end('timed out');
+            reject(
+              new TimeoutError(timeout, 'Transaction', {
+                message:
+                  `Transaction timed out after ${timeout}ms and was rolled back, so none of its writes were ` +
+                  'saved. A statement it was running was cancelled on the server.',
+                outcome: 'not-executed',
+              }),
+            );
           }, timeout);
         });
         try {
-          result = await Promise.race([runCallback(), timeoutPromise]);
+          result = await Promise.race([runBody(), timeoutPromise]);
         } finally {
           clearTimeout(timer);
         }
       } else {
-        result = await runCallback();
+        result = await runBody();
       }
 
-      await runTxControl(client, this.dialect.commitStatement());
+      const unawaited = state.busy;
+      state.end('has ended');
+      if (unawaited) throw unawaitedWorkError('$transaction');
+      // A statement inside was cut short by its timeout, and the callback
+      // caught the error: whether it ran is not known, so nothing commits.
+      if (state.abortedWith !== undefined) throw rolledBackError(state.abortedWith, 'transaction');
+      await commitTransaction(client, this.dialect.commitStatement(), state.firstFailure);
+      state.end('committed');
+      checkout.release();
 
       if (this.logging) {
-        console.log('[turbine] Transaction committed');
+        logTo(this.logger, 'debug', 'Transaction committed', {
+          code: 'transaction-committed',
+          operation: '$transaction',
+        });
       }
 
       return result;
     } catch (err) {
-      // If the timeout fired we already destroyed the connection, issuing a
-      // ROLLBACK on a released client would throw "Client has already been
-      // released". Skip the rollback in that case (the backend rolled back
-      // when its socket was closed). A BEGIN that failed never gets here, see
-      // openCheckout above, so there is always a transaction to roll back.
-      if (!timedOut && !released) {
-        try {
-          await client.query(this.dialect.rollbackStatement());
-        } catch {
-          // Best-effort rollback, the connection may have died mid-query.
-        }
-      }
+      // A timed-out transaction keeps its 'timed out' wording for any late
+      // statement the callback still tries to send.
+      if (!timedOut) state.end('was rolled back');
+      const clean = await rollbackOnServer(client, state, this.dialect);
+      checkout.release(
+        clean ? undefined : new Error('[turbine] transaction connection discarded: rollback not confirmed'),
+      );
       if (this.logging) {
-        console.log('[turbine] Transaction rolled back');
+        logTo(this.logger, 'debug', 'Transaction rolled back', {
+          code: 'transaction-rolled-back',
+          operation: '$transaction',
+        });
       }
       throw explainConnectionLoss(err, checkout.lostWith);
-    } finally {
-      releaseOnce();
     }
   }
 
   /**
-   * Execute a batch of {@link DeferredQuery} objects atomically inside one
-   * transaction. Backs the `$transaction([...])` array overload. Reuses the raw
-   * {@link transaction} machinery (BEGIN/COMMIT/ROLLBACK + connection release);
-   * each result is passed through its query's `transform`.
+   * Validate `sessionContext` and build its `set_config` statements, before
+   * any connection is taken.
+   *
+   * A name must be a namespaced custom setting (`app.tenant_id`) unless it is
+   * listed in `allowBuiltinSettings`: an un-dotted name is one of PostgreSQL's
+   * own settings (`role`, `search_path`, `statement_timeout`), and a context
+   * built from request data must not be able to reach one. A value that is not
+   * a string, number or boolean is refused, so a missing tenant id cannot reach
+   * a row-level security policy as the text `'undefined'`.
+   */
+  private resolveSessionContext(
+    context: TransactionOptions['sessionContext'],
+    allowBuiltinSettings?: readonly string[],
+  ): Array<{ name: string; sql: string; params: unknown[] }> {
+    const allowed = resolveBuiltinSettingsAllowlist(allowBuiltinSettings);
+    if (!context) return [];
+    if (!this.dialect.supportsRLS) {
+      throw new UnsupportedFeatureError(
+        'sessionContext (RLS session GUCs)',
+        this.dialect.name,
+        'set_config-based row-level-security context requires PostgreSQL.',
+      );
+    }
+    const statements: Array<{ name: string; sql: string; params: unknown[] }> = [];
+    for (const [name, value] of Object.entries(context)) {
+      if (!GUC_NAME_REGEX.test(name)) {
+        throw new ValidationError(
+          `Invalid session-context GUC name "${name}", must match ` +
+            '/^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)?$/ (optionally namespaced, e.g. "app.current_tenant")',
+        );
+      }
+      if (!name.includes('.') && !allowed.has(name.toLowerCase())) {
+        throw new ValidationError(
+          `sessionContext["${name}"] names a PostgreSQL setting, not a custom one. A session context may set ` +
+            'namespaced custom settings only (`app.tenant_id`, with a dot), because a built-in setting such as ' +
+            '`role`, `search_path` or `statement_timeout` changes who the transaction runs as or what limits it ' +
+            `has. Rename it into a namespace, or, if your code sets it on purpose, pass \`allowBuiltinSettings: ['${name}']\`.`,
+        );
+      }
+      const kind = typeof value;
+      if (kind !== 'string' && kind !== 'number' && kind !== 'boolean') {
+        throw new ValidationError(
+          `sessionContext["${name}"] is ${value === null ? 'null' : kind}. A session setting is text, and ` +
+            `${value === undefined ? 'a missing value' : 'this value'} would reach your row-level security ` +
+            `policies as the string "${String(value)}". Pass a string, number or boolean, and check the value ` +
+            'your request context supplies.',
+        );
+      }
+      statements.push({ name, ...this.dialect.buildSetSessionConfig(name, String(value)) });
+    }
+    return statements;
+  }
+
+  /**
+   * Run a batch of {@link DeferredQuery} objects on a transaction's connection.
+   * Backs the `$transaction([...])` array overload; the transaction itself
+   * (BEGIN/COMMIT/ROLLBACK, options, release) is {@link runInTransaction}'s.
+   * Each result is passed through its query's `transform`.
    *
    * Execution strategy on the single transaction connection:
    *   - **Sequential (default).** Await each statement's reply before sending
@@ -2730,59 +3990,68 @@ export class TurbineClient {
    * rethrowing, which keeps the connection's request/reply pairing intact and
    * means ROLLBACK is only issued once no statement is still in flight.
    */
-  private async transactionBatch<T extends readonly DeferredQuery<unknown>[]>(queries: T): Promise<PipelineResults<T>> {
-    if (queries.length === 0) {
-      return [] as unknown as PipelineResults<T>;
-    }
+  private async runBatch<T extends readonly DeferredQuery<unknown>[]>(
+    client: PgCompatPoolClient,
+    state: TransactionState,
+    queries: T,
+  ): Promise<PipelineResults<T>> {
     // One `$on('query')` event per statement, `batch: 'transaction'`, only
-    // when someone is listening; each statement is timed on its own.
+    // when someone is listening; each statement is timed on its own. Every
+    // statement goes through the transaction state, so a timeout can tell
+    // what is still on the wire and stop it.
     const sink = this.queryListeners.size > 0 ? this.queryOptions._onQuery : undefined;
-    const reported = (dq: DeferredQuery<unknown>, run: () => Promise<PgCompatQueryResult>) =>
-      runReportedStatement(
-        sink,
-        { ...deferredIdentity(dq.tag), batch: 'transaction' },
-        dq.sql,
-        dq.params,
-        run,
-        wrapPgError,
+    // Each statement is sent with its `sqlComment`; its event reports the
+    // commentless text and the comment beside it, as a model call's does.
+    const comments = this.statementComments(queries);
+    const reported = (i: number, run: (dq: DeferredQuery<unknown>) => Promise<PgCompatQueryResult>) => {
+      const dq = queries[i]!;
+      const comment = comments?.[i];
+      return state.run(() =>
+        runReportedStatement(
+          sink,
+          { ...deferredIdentity(dq.tag), batch: 'transaction', ...(comment === undefined ? {} : { comment }) },
+          dq.sql,
+          dq.params,
+          () => run(commentDeferred(dq, comment)),
+          wrapPgError,
+        ),
       );
-    return this.transaction(async (client) => {
-      const pipelined =
-        (client as unknown as PgCompatPoolClient).supportsPipelining === true &&
-        this.dialect.resultStrategy !== 'reselect';
+    };
+    const pipelined =
+      (client as unknown as PgCompatPoolClient).supportsPipelining === true &&
+      this.dialect.resultStrategy !== 'reselect';
 
-      if (pipelined) {
-        // Dispatch every statement before awaiting any reply. The driver's
-        // FIFO guarantee makes settled[i] the reply to queries[i]. Each
-        // statement is timed from its dispatch to its own reply.
-        const settled = await Promise.allSettled(
-          queries.map((dq) => reported(dq, () => client.query(dq.sql, dq.params))),
-        );
-        const results: unknown[] = [];
-        for (let i = 0; i < settled.length; i++) {
-          const outcome = settled[i]!;
-          if (outcome.status === 'rejected') {
-            throw wrapPgError(outcome.reason);
-          }
-          results.push(queries[i]!.transform(outcome.value));
-        }
-        return results as PipelineResults<T>;
-      }
-
+    if (pipelined) {
+      // Dispatch every statement before awaiting any reply. The driver's
+      // FIFO guarantee makes settled[i] the reply to queries[i]. Each
+      // statement is timed from its dispatch to its own reply.
+      const settled = await Promise.allSettled(
+        queries.map((_, i) => reported(i, (dq) => client.query(dq.sql, dq.params))),
+      );
       const results: unknown[] = [];
-      for (const dq of queries) {
-        // Non-RETURNING engines (resultStrategy 'reselect', e.g. MySQL) attach a
-        // reselect plan that runs the write plus a follow-up SELECT; running
-        // dq.sql alone would transform a row-less write result.
-        const raw = await reported(dq, () =>
-          this.dialect.resultStrategy === 'reselect' && dq.reselect
-            ? dq.reselect((sql, params) => client.query(sql, params))
-            : client.query(dq.sql, dq.params),
-        );
-        results.push(dq.transform(raw));
+      for (let i = 0; i < settled.length; i++) {
+        const outcome = settled[i]!;
+        if (outcome.status === 'rejected') {
+          throw wrapPgError(outcome.reason);
+        }
+        results.push(queries[i]!.transform(outcome.value));
       }
       return results as PipelineResults<T>;
-    });
+    }
+
+    const results: unknown[] = [];
+    for (let i = 0; i < queries.length; i++) {
+      // Non-RETURNING engines (resultStrategy 'reselect', e.g. MySQL) attach a
+      // reselect plan that runs the write plus a follow-up SELECT; running
+      // dq.sql alone would transform a row-less write result.
+      const raw = await reported(i, (dq) =>
+        this.dialect.resultStrategy === 'reselect' && dq.reselect
+          ? dq.reselect((sql, params) => client.query(sql, params))
+          : client.query(dq.sql, dq.params),
+      );
+      results.push(queries[i]!.transform(raw));
+    }
+    return results as PipelineResults<T>;
   }
 
   /**
@@ -2837,7 +4106,8 @@ export class TurbineClient {
    * ends it instead. Postgres does not hold notifications for a disconnected
    * listener, so anything sent during the gap is lost: use
    * `options.onReconnect` to resynchronise. `options.onError` receives the loss
-   * and each failed attempt (default: one `console.error` line each).
+   * and each failed attempt (default: one log line each through `logger`, at
+   * `warn` while it reconnects and `error` once it stops).
    *
    * @example
    * ```ts
@@ -2863,7 +4133,7 @@ export class TurbineClient {
     const quoted = quoteIdent(channel);
 
     if (this.logging) {
-      console.log(`[turbine] LISTEN ${quoted}`);
+      logTo(this.logger, 'debug', `LISTEN ${quoted}`, { code: 'listen', channel });
     }
 
     const sub = await createSubscription(
@@ -2875,6 +4145,7 @@ export class TurbineClient {
         this.activeSubscriptions.delete(closed);
       },
       options,
+      this.logger,
     );
     this.activeSubscriptions.add(sub);
     return sub;
@@ -2903,7 +4174,7 @@ export class TurbineClient {
     }
     validateChannel(channel);
     if (this.logging) {
-      console.log(`[turbine] NOTIFY ${channel}`);
+      logTo(this.logger, 'debug', `NOTIFY ${channel}`, { code: 'notify', channel });
     }
     try {
       await this.pool.query('SELECT pg_notify($1, $2)', [channel, payload ?? '']);
@@ -2944,29 +4215,62 @@ export class TurbineClient {
    * Throws if the connection fails.
    */
   async connect(): Promise<void> {
-    // A connection the server closed while idle says nothing about whether
-    // the database is reachable, so the check runs on a fresh one when the
-    // first turns out to be dead (see openCheckout).
+    await this.roundTrip();
+    if (this.logging) {
+      logTo(this.logger, 'debug', 'Connection verified', { code: 'connection-verified' });
+    }
+  }
+
+  /**
+   * Run one cheap round trip (`SELECT 1`) on the primary and resolve with its
+   * latency in milliseconds, for health checks and for setting
+   * `autoRoundTripMs`. The time measures the statement on a checked-out
+   * connection, not the wait for one: an exhausted pool rejects with
+   * `ConnectionError` (E004) after `connectionTimeoutMs` instead. Rejects with
+   * the typed connection error when the database cannot be reached.
+   */
+  async $ping(): Promise<number> {
+    return this.roundTrip();
+  }
+
+  /**
+   * `SELECT 1` on a checked-out primary connection, timed. A connection the
+   * server closed while idle says nothing about whether the database is
+   * reachable, so it runs on a fresh one when the first turns out to be dead
+   * (see openCheckout).
+   */
+  private async roundTrip(): Promise<number> {
+    let latency = 0;
     const { checkout } = await openCheckout(this.pool, async (client) => {
+      const start = performance.now();
       try {
         await client.query('SELECT 1');
       } catch (err) {
         throw wrapPgError(err);
       }
+      latency = performance.now() - start;
     });
     checkout.release();
-    if (this.logging) {
-      console.log('[turbine] Connection verified');
-    }
+    return latency;
   }
 
   /**
    * Gracefully shut down the connection pool.
    *
-   * If Turbine was given an external pool via `TurbineConfig.pool`, this
-   * method is a no-op, the caller is responsible for the pool's lifecycle.
+   * Waits for every checked-out connection to be returned, then closes them
+   * all. With `timeoutMs`, it stops waiting at the deadline: each connection
+   * still in use has its running statement cancelled on the server and is
+   * closed (a transaction on it rolls back), and the result says how many
+   * were. Resolves within about `timeoutMs` plus two seconds of grace.
+   *
+   * If Turbine was given an external pool via `TurbineConfig.pool`, the
+   * primary is left open, the caller is responsible for its lifecycle;
+   * Turbine-owned replica pools are still closed.
    */
-  async disconnect(): Promise<void> {
+  disconnect(): Promise<void>;
+  disconnect(options: DisconnectOptions): Promise<DisconnectResult>;
+  async disconnect(options?: DisconnectOptions): Promise<unknown> {
+    const timeoutMs = resolveNonNegativeInteger(options?.timeoutMs, 'disconnect timeoutMs', 'milliseconds');
     // Tear down any live LISTEN subscriptions first. Each holds a dedicated
     // pooled connection checked out; if we ended the pool (or returned for an
     // external pool) without releasing them, pool.end() would wait forever for
@@ -2983,34 +4287,79 @@ export class TurbineClient {
       this.activeSubscriptions.clear();
     }
 
-    // Close owned (string-configured) replica pools regardless of whether the
-    // primary is owned, external replica pools are left untouched (caller owns
-    // their lifecycle), same contract as an external primary.
-    for (const replicaPool of this.ownedReplicaPools) {
-      try {
-        await replicaPool.end();
-      } catch (err) {
-        if (this.logging) {
-          console.error('[turbine] Error closing replica pool:', (err as Error).message);
-        }
-      }
+    // Owned (string-configured) replica pools are closed whether or not the
+    // primary is owned; external replica pools are the caller's, like an
+    // external primary.
+    const endReplicas = Promise.all(
+      this.ownedReplicaPools.map((replicaPool) =>
+        replicaPool.end().catch((err: unknown) => {
+          if (this.logging) {
+            logTo(this.logger, 'error', `Error closing replica pool: ${(err as Error).message}`, {
+              code: 'replica-close-error',
+              error: err,
+            });
+          }
+        }),
+      ),
+    );
+    if (!this.ownsPool && this.logging) {
+      logTo(this.logger, 'debug', 'disconnect() skipped, external primary pool is not owned by Turbine', {
+        code: 'disconnect-skipped',
+      });
     }
+    const ending = Promise.all([endReplicas, this.ownsPool ? this.pool.end() : undefined]);
 
-    if (!this.ownsPool) {
-      if (this.logging) {
-        console.log('[turbine] disconnect() skipped, external primary pool is not owned by Turbine');
+    if (timeoutMs === undefined || (await settlesWithin(ending, timeoutMs))) {
+      await ending;
+      if (this.logging && this.ownsPool) {
+        logTo(this.logger, 'debug', 'Pool disconnected', { code: 'pool-disconnected', timedOut: false });
       }
-      return;
+      return options === undefined ? undefined : { timedOut: false, forcedConnections: 0 };
     }
-    await this.pool.end();
+    const forcedConnections = await this.forceCloseCheckedOut();
+    // Closed connections reach the pool as their holders' queries fail; give
+    // that one grace period, then return either way rather than hang on a
+    // holder that never releases.
+    await settlesWithin(ending, TX_ABORT_GRACE_MS);
     if (this.logging) {
-      console.log('[turbine] Pool disconnected');
+      logTo(
+        this.logger,
+        'debug',
+        `Pool disconnected after ${timeoutMs}ms, ${forcedConnections} connection(s) closed in use`,
+        { code: 'pool-disconnected', timedOut: true, timeoutMs, forcedConnections },
+      );
     }
+    return { timedOut: true, forcedConnections };
+  }
+
+  /**
+   * Cancel the running statement of every connection still checked out of a
+   * pool this client opened, then close the connection. Cancelling first is
+   * what stops the work on the server: a closed socket alone is noticed only
+   * when the backend next writes to it. Returns how many were closed.
+   */
+  private async forceCloseCheckedOut(): Promise<number> {
+    const clients = this.checkoutWatches.flatMap((watch) => [...watch.checkedOut]);
+    await Promise.all(
+      clients.map(async (client) => {
+        await sendCancelRequest(client, TX_ABORT_GRACE_MS);
+        const c = client as { end?: () => Promise<void>; connection?: { stream?: { destroy?(): void } } };
+        const closing = Promise.resolve()
+          .then(() => c.end?.())
+          .catch(() => {});
+        // A backend that does not answer the terminate message within the
+        // grace period has its socket destroyed instead.
+        if (!(await settlesWithin(closing, TX_ABORT_GRACE_MS))) c.connection?.stream?.destroy?.();
+      }),
+    );
+    return clients.length;
   }
 
   /** Alias for disconnect() */
-  async end(): Promise<void> {
-    return this.disconnect();
+  end(): Promise<void>;
+  end(options: DisconnectOptions): Promise<DisconnectResult>;
+  async end(options?: DisconnectOptions): Promise<unknown> {
+    return options === undefined ? this.disconnect() : this.disconnect(options);
   }
 
   /**
@@ -3025,3 +4374,16 @@ export class TurbineClient {
     };
   }
 }
+
+// What prisma-compat (and anything else that wraps a client) logs through: the
+// client's logger and resolved diagnostics, under a `Symbol.for` key so a CJS
+// and an ESM copy agree. Defined outside the class body so it stays off the
+// published declaration of `TurbineClient`.
+Object.defineProperty(TurbineClient.prototype, CLIENT_LOG_CONTEXT, {
+  get(this: TurbineClient): ClientLogContext {
+    const self = this as unknown as ClientLogContext;
+    return { logger: self.logger, diagnostics: self.diagnostics };
+  },
+  enumerable: false,
+  configurable: false,
+});

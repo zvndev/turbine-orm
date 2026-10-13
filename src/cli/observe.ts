@@ -6,11 +6,19 @@
  * random token, HttpOnly cookie, CSP headers, read-only transactions.
  */
 
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import pg from 'pg';
 import { absorbCheckedOutErrors } from '../connection-guard.js';
 import type { PgCompatPool } from '../pg-types.js';
+import {
+  constantTimeEqual,
+  createTicketGate,
+  isAllowedHostHeader,
+  redeemTicket,
+  type TicketGate,
+} from './local-server-guard.js';
+import { openInBrowser, responseErrorText } from './local-server-output.js';
 import { OBSERVE_HTML } from './observe-ui.js';
 import { callerKey, checkRateLimit } from './rate-limit.js';
 import { redactUrl } from './ui.js';
@@ -28,7 +36,9 @@ export interface ObserveOptions {
 
 export interface ObserveServerHandle {
   dispose: () => Promise<void>;
+  /** The session credential (header or cookie). Never part of `url`. */
   authToken: string;
+  /** Printable URL carrying a ONE-TIME login ticket, exchanged for the session cookie on first load. */
   url: string;
 }
 
@@ -49,35 +59,44 @@ export async function startObserve(options: ObserveOptions): Promise<ObserveServ
   });
   absorbCheckedOutErrors(pool);
 
-  const probe = await pool.connect();
-  try {
-    await probe.query('SELECT 1');
-  } finally {
-    probe.release();
-  }
-
   const authToken = randomBytes(24).toString('hex');
+  const ticketGate = createTicketGate();
   const rateLimiter = new Map<string, { count: number; resetAt: number }>();
 
   const server = createServer((req, res) => {
-    handleRequest(req, res, pool, options, authToken, rateLimiter).catch((err) => {
-      sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+    handleRequest(req, res, pool, options, authToken, rateLimiter, ticketGate).catch((err) => {
+      sendJson(res, 500, { error: responseErrorText(err) });
     });
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(options.port, options.host, () => {
-      server.off('error', reject);
-      resolve();
+  try {
+    const probe = await pool.connect();
+    try {
+      await probe.query('SELECT 1');
+    } finally {
+      probe.release();
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(options.port, options.host, () => {
+        server.off('error', reject);
+        resolve();
+      });
     });
-  });
+  } catch (err) {
+    // A start that fails (probe refused, port taken) must not leave the probe
+    // connection idling in a pool nobody holds: it would keep a database session
+    // open and the process alive until the idle timeout.
+    await pool.end().catch(() => {});
+    throw err;
+  }
 
   const hostPart = options.host.includes(':') && !options.host.startsWith('[') ? `[${options.host}]` : options.host;
-  const url = `http://${hostPart}:${options.port}/?token=${authToken}`;
+  const url = `http://${hostPart}:${options.port}/?token=${ticketGate.token}`;
 
   if (options.openBrowser) {
-    openUrl(url);
+    openInBrowser(url);
   }
 
   return {
@@ -101,9 +120,18 @@ export async function handleRequest(
   options: ObserveOptions,
   authToken: string,
   rateLimiter: Map<string, { count: number; resetAt: number }>,
+  /** The one-time login ticket. Absent on a hand-built call: the ticket is then `authToken` itself. */
+  ticketGate: TicketGate = gateFor(authToken),
 ): Promise<void> {
   const hostPart = options.host.includes(':') && !options.host.startsWith('[') ? `[${options.host}]` : options.host;
   const expectedOrigin = `http://${hostPart}:${options.port}`;
+
+  // DNS rebinding: a page on another domain that re-resolves to this port still
+  // sends its own hostname in `Host`. Checked before any route or token logic.
+  if (!isAllowedHostHeader(req.headers.host, options.host, options.port)) {
+    sendJson(res, 403, { error: 'host not allowed: open Observe at the address printed in the terminal' });
+    return;
+  }
 
   const origin = req.headers.origin;
   if (origin && origin !== expectedOrigin) {
@@ -111,7 +139,14 @@ export async function handleRequest(
     return;
   }
 
-  const url = new URL(req.url ?? '/', expectedOrigin);
+  // A request target that is not a URL (`GET //`) is a client error, not a 500.
+  let url: URL;
+  try {
+    url = new URL(req.url ?? '/', expectedOrigin);
+  } catch {
+    sendJson(res, 400, { error: 'malformed request target' });
+    return;
+  }
   const pathname = url.pathname;
 
   if (pathname === '/' || pathname === '/index.html') {
@@ -120,13 +155,27 @@ export async function handleRequest(
       return;
     }
     const queryToken = url.searchParams.get('token');
-    if (queryToken && constantTimeEqual(queryToken, authToken)) {
-      res.writeHead(302, {
-        Location: '/',
-        'Set-Cookie': `turbine_observe_token=${authToken}; Path=/; HttpOnly; SameSite=Strict`,
-      });
-      res.end();
-      return;
+    if (queryToken) {
+      // The printed URL's token is a ONE-TIME ticket, exchanged here for the
+      // session cookie by the first GET that carries it. HEAD never spends it.
+      const outcome = req.method === 'GET' ? redeemTicket(ticketGate, queryToken) : 'invalid';
+      if (outcome === 'granted') {
+        res.writeHead(302, {
+          Location: '/',
+          'Set-Cookie': `turbine_observe_token=${authToken}; Path=/; HttpOnly; SameSite=Strict`,
+        });
+        res.end();
+        return;
+      }
+      if (outcome === 'used') {
+        if (isAuthorized(req, authToken)) {
+          res.writeHead(302, { Location: '/' });
+          res.end();
+        } else {
+          sendText(res, 403, 'This login link was already used. Restart Observe to get a new one.');
+        }
+        return;
+      }
     }
     sendHtml(res, 200, OBSERVE_HTML, cspNonce());
     return;
@@ -180,13 +229,18 @@ function isAuthorized(req: IncomingMessage, expectedToken: string): boolean {
   return false;
 }
 
-function constantTimeEqual(a: string, b: string): boolean {
-  // Hash both inputs to fixed-length 32-byte SHA-256 digests before comparing.
-  // This makes the comparison constant-length (timingSafeEqual never throws on a
-  // length mismatch) and leaks neither length nor content via timing.
-  const ah = createHash('sha256').update(a).digest();
-  const bh = createHash('sha256').update(b).digest();
-  return timingSafeEqual(ah, bh);
+/**
+ * The ticket for a caller that passed none (a hand-built dispatch): `authToken`
+ * itself, remembered per token so it is still spent exactly once.
+ */
+const FALLBACK_GATES = new Map<string, TicketGate>();
+function gateFor(authToken: string): TicketGate {
+  let gate = FALLBACK_GATES.get(authToken);
+  if (!gate) {
+    gate = createTicketGate(authToken);
+    FALLBACK_GATES.set(authToken, gate);
+  }
+  return gate;
 }
 
 // ---------------------------------------------------------------------------
@@ -240,7 +294,7 @@ async function apiLatency(res: ServerResponse, pool: PgCompatPool, params: URLSe
       // this server writes no log of its own, so the HTTP response is the only
       // channel either error could reach. Same shape as cli/studio.ts.
     }
-    sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+    sendJson(res, 500, { error: responseErrorText(err) });
   } finally {
     client.release();
   }
@@ -283,7 +337,7 @@ async function apiModels(res: ServerResponse, pool: PgCompatPool, params: URLSea
       // this server writes no log of its own, so the HTTP response is the only
       // channel either error could reach. Same shape as cli/studio.ts.
     }
-    sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+    sendJson(res, 500, { error: responseErrorText(err) });
   } finally {
     client.release();
   }
@@ -336,20 +390,4 @@ function sendHtml(res: ServerResponse, status: number, html: string, nonce: stri
 function sendText(res: ServerResponse, status: number, text: string): void {
   res.writeHead(status, { ...SECURITY_HEADERS, 'Content-Security-Policy': JSON_CSP, 'Content-Type': 'text/plain' });
   res.end(text);
-}
-
-// ---------------------------------------------------------------------------
-// Browser open
-// ---------------------------------------------------------------------------
-
-function openUrl(url: string): void {
-  const { platform: os } = process;
-  const { spawn } = require('node:child_process') as typeof import('node:child_process');
-  try {
-    if (os === 'darwin') spawn('open', [url], { stdio: 'ignore', detached: true }).unref();
-    else if (os === 'win32') spawn('cmd', ['/c', 'start', '', url], { stdio: 'ignore', detached: true }).unref();
-    else spawn('xdg-open', [url], { stdio: 'ignore', detached: true }).unref();
-  } catch {
-    // Best effort
-  }
 }

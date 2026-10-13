@@ -22,7 +22,9 @@
  * package ships ESM and CJS, and a mixed graph loading both copies must still
  * see the tag a caller set through either copy.
  *
- * The tag never reaches SQL. It is metadata on the in-process event only; what
+ * The tag reaches SQL only when the client asks for it: `sqlComment: { tag:
+ * true }` (query/sql-comment.ts) appends it to each statement as a comment,
+ * URL-encoded. Otherwise it is metadata on the in-process event only, and what
  * a listener does with it (log it, forward it to a collector) is the
  * listener's business.
  */
@@ -122,7 +124,7 @@ export function deferredIdentity(tag: string): { model: string; action: string }
  */
 export async function runReportedStatement<R extends { rowCount?: number | null; rows?: unknown[] }>(
   sink: QueryEventSink,
-  identity: Pick<QueryEvent, 'model' | 'action' | 'batch'>,
+  identity: Pick<QueryEvent, 'model' | 'action' | 'batch' | 'comment'>,
   sql: string,
   params: unknown[],
   run: () => Promise<R>,

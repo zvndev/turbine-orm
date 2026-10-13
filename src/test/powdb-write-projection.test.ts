@@ -53,7 +53,7 @@ describe('PowDB write select / omit', () => {
     const s = schema();
     const db = await turbinePowDB({ embedded: dir }, s, { warnOnUnlimited: false });
     try {
-      for (const stmt of powqlSchemaDDL(s)) await db.raw([stmt] as unknown as TemplateStringsArray);
+      for (const stmt of powqlSchemaDDL(s)) await db.rawUnsafe(stmt);
       const t = db.table<Inbox>('inbox');
 
       const created = await t.create({
@@ -65,8 +65,13 @@ describe('PowDB write select / omit', () => {
       const omitted = await t.create({ data: { id: 2, kind: 'b', body: 'y', secret: 's2' }, omit: { body: true } });
       assert.deepEqual(omitted, { id: 2, kind: 'b' }, 'omit leaves PII out, as on the SQL engines');
 
-      const withPii = await t.create({ data: { id: 3, kind: 'c', secret: 'shh' }, select: { id: true, secret: true } });
-      assert.deepEqual(withPii, { id: 3, secret: 'shh' }, 'an explicit select of PII is the opt-in');
+      await assert.rejects(
+        t.create({ data: { id: 3, kind: 'c', secret: 'shh' }, select: { id: true, secret: true } }),
+        (err: unknown) => err instanceof ValidationError && /tagged PII/.test(err.message),
+        'a write never returns a PII column, even when select names it',
+      );
+      const plain = await t.create({ data: { id: 3, kind: 'c', secret: 'shh' }, select: { id: true } });
+      assert.deepEqual(plain, { id: 3 }, 'the refused write inserted nothing, so id 3 is still free');
 
       const updated = await t.update({ where: { id: 1 }, data: { kind: 'a2' }, select: { kind: true } });
       assert.deepEqual(updated, { kind: 'a2' });
@@ -95,7 +100,7 @@ describe('PowDB write select / omit', () => {
     const s = schema();
     const db = await turbinePowDB({ embedded: dir }, s, { warnOnUnlimited: false });
     try {
-      for (const stmt of powqlSchemaDDL(s)) await db.raw([stmt] as unknown as TemplateStringsArray);
+      for (const stmt of powqlSchemaDDL(s)) await db.rawUnsafe(stmt);
       const t = db.table<Inbox>('inbox');
       await assert.rejects(
         t.create({ data: { id: 9, kind: 'z' }, select: { kynd: true } as never }),

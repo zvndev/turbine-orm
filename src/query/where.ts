@@ -11,24 +11,33 @@
  * primitives this module needs. See builder.ts for the thin delegating methods.
  */
 
-import type { Dialect } from '../dialect.js';
-import { getErrorMessageMode, UnsupportedFeatureError, ValidationError } from '../errors.js';
+import { type ResolvedDiagnostics, resolveDiagnostics } from '../diagnostics.js';
+import type { Dialect, JsonPathEqualsInput } from '../dialect.js';
+import { getErrorMessageMode, InvariantError, UnsupportedFeatureError, ValidationError } from '../errors.js';
+import { assertSkipListNames, skipListNamesTable } from '../global-filters-config.js';
+import { consoleLogger, type TurbineLogger } from '../logger.js';
 import type { PgCompatQueryResult } from '../pg-types.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
-import { camelToSnake, normalizeKeyColumns } from '../schema.js';
+import { camelToSnake, localDateTimeKind, normalizeKeyColumns } from '../schema.js';
 import type { TemporalInfinityReading } from './deferred.js';
 import {
-  assertBindableEqualsOperand,
+  assertArrayFilter,
+  assertEqualityOperand,
+  assertJsonFilterKeys,
+  assertOperatorOperands,
   findArrayUniqueKey,
   findJsonUniqueKey,
+  findUndefinedPath,
+  holdsUndefinedValue,
   isArrayFilter,
   isColumnRef,
   isJsonFilter,
-  isUnmatchedPlainObject,
+  isPlainRecord,
   isWhereOperator,
-  JSON_FILTER_KEYS,
   JSON_RANGE_OPERATORS,
   JSON_STRING_OPERATORS,
+  type OperandContext,
+  operandColumnKind,
   VECTOR_DISTANCE_COMPARATORS,
   VECTOR_METRIC_OPERATORS,
   validateTextSearchConfig,
@@ -51,7 +60,6 @@ import {
   escapeLike,
   isInternalCombinator,
   markInternalCombinator,
-  OPERATOR_KEYS,
   ownLookup,
   resolveColumnName,
   type SqlCacheEntry,
@@ -60,10 +68,17 @@ import {
   assertWhereDepth,
   classifyScalarForSql,
   fingerprintScalarToken,
+  foldWhere,
+  normalizeToOneRelationFilter,
+  type WhereFoldOptions,
   type WhereHost,
   type WhereRecord,
   walkWhere,
 } from './where-compile.js';
+
+// The JSON filter key check lives with the other operand checks in filters.ts;
+// re-exported so the engines keep one import site for it.
+export { assertJsonFilterKeys } from './filters.js';
 
 /**
  * The privacy-preserving view of a {@link QueryInterface} instance passed as the
@@ -98,6 +113,14 @@ export interface BuilderCtx {
    * default.
    */
   readonly temporalInfinity?: TemporalInfinityReading;
+  /**
+   * The owning client's resolved `diagnostics`. Resolved once, at client
+   * construction; the modules never read the environment. Read through
+   * {@link adviceLogger}.
+   */
+  readonly diagnostics?: ResolvedDiagnostics;
+  /** The owning client's logger. Read through {@link adviceLogger}. */
+  readonly logger?: TurbineLogger;
   readonly crossSchemaTypeColumns: Set<string>;
   /**
    * The active query's `skipGlobalFilters` opt-out. A live getter/setter over
@@ -223,6 +246,19 @@ export interface BuilderCtx {
 }
 
 /**
+ * Where per-query advice goes for this context: the client's logger when its
+ * `diagnostics.advice` is on, else `undefined`. A site calls this first and
+ * builds its message only on a logger.
+ *
+ * A context without the client's diagnostics (one built by hand) resolves
+ * them here; every context a QueryInterface builds carries them, so on a query
+ * path this never reads the environment.
+ */
+export function adviceLogger(qi: Pick<BuilderCtx, 'diagnostics' | 'logger'>): TurbineLogger | undefined {
+  return (qi.diagnostics ?? resolveDiagnostics()).advice ? (qi.logger ?? consoleLogger) : undefined;
+}
+
+/**
  * LIKE-escape one bound operand through the ACTIVE dialect, falling back to the
  * shared {@link escapeLike} (`\`, `%`, `_`) when the dialect declares no
  * override. See {@link Dialect.escapeLikePattern} for why an engine would need
@@ -278,6 +314,28 @@ interface ColumnRefContext {
    * from here instead, the one value both sides pass identically.
    */
   rawColumn: string;
+  /**
+   * The column's type token, which decides what its operands may be (see
+   * `operandColumnKind`). Resolved by the caller from the same source its
+   * classification used, identically on the build and collect side.
+   */
+  pgType: string;
+}
+
+/** The operand-validation context for an operator object on `refCtx`'s column. */
+function operandContext(qi: BuilderCtx, column: string, refCtx: ColumnRefContext | undefined): OperandContext {
+  if (!refCtx) return { column, table: qi.table, kind: 'scalar' };
+  return { column: refCtx.rawColumn, table: refCtx.table, kind: operandColumnKind(refCtx.pgType) };
+}
+
+/**
+ * The inner operator object of `not: { ... }`, with this object's `mode`
+ * inherited when the inner one sets none. The fingerprint reads the same
+ * effective mode (`fingerprintOperatorShape`).
+ */
+function notOperand(op: WhereOperator): WhereOperator {
+  const inner = op.not as WhereOperator;
+  return inner.mode === undefined && op.mode !== undefined ? { ...inner, mode: op.mode } : inner;
 }
 
 /**
@@ -351,10 +409,11 @@ export function fingerprintWhere(qi: BuilderCtx, where: Record<string, unknown>,
 
 /**
  * Fingerprint the present branches of a normalized relation filter, in the
- * fixed order some→every→none→is→isNot. A `null` branch tokenizes as
- * `<branch>(null)`; a present branch recurses through
+ * fixed order some→every→none→is→isNot. A present branch recurses through
  * {@link fingerprintRelFilter} so the FULL inner shape is captured (two
- * different sub-wheres must never collide on one cached SQL text).
+ * different sub-wheres must never collide on one cached SQL text). `is: null`
+ * and `isNot: null` tokenize as `<branch>(null)`; the where walk refuses any
+ * other non-object value before this runs.
  */
 export function fingerprintRelationParts(
   qi: BuilderCtx,
@@ -364,23 +423,13 @@ export function fingerprintRelationParts(
 ): string[] {
   const relParts: string[] = [];
   if (filterObj.some !== undefined)
-    relParts.push(
-      filterObj.some === null
-        ? 'some(null)'
-        : `some(${fingerprintRelFilter(qi, relDef.to, filterObj.some as Record<string, unknown>, depth + 1)})`,
-    );
+    relParts.push(`some(${fingerprintRelFilter(qi, relDef.to, filterObj.some as Record<string, unknown>, depth + 1)})`);
   if (filterObj.every !== undefined)
     relParts.push(
-      filterObj.every === null
-        ? 'every(null)'
-        : `every(${fingerprintRelFilter(qi, relDef.to, filterObj.every as Record<string, unknown>, depth + 1)})`,
+      `every(${fingerprintRelFilter(qi, relDef.to, filterObj.every as Record<string, unknown>, depth + 1)})`,
     );
   if (filterObj.none !== undefined)
-    relParts.push(
-      filterObj.none === null
-        ? 'none(null)'
-        : `none(${fingerprintRelFilter(qi, relDef.to, filterObj.none as Record<string, unknown>, depth + 1)})`,
-    );
+    relParts.push(`none(${fingerprintRelFilter(qi, relDef.to, filterObj.none as Record<string, unknown>, depth + 1)})`);
   if (filterObj.is !== undefined)
     relParts.push(
       filterObj.is === null
@@ -416,31 +465,45 @@ export function fingerprintRelFilter(
 /**
  * Walk a where clause and push ONLY values into `params`, in the EXACT same
  * order that `buildWhereClause` pushes them. Used on cache hit to fill params
- * without rebuilding SQL.
+ * without rebuilding SQL. Returns whether the clause compiles to a condition,
+ * i.e. whether `buildWhereClause` returns non-null for it.
  *
  * @internal Exposed as package-private for testing.
  */
-export function collectWhereParams(qi: BuilderCtx, where: Record<string, unknown>, params: unknown[], depth = 0): void {
+export function collectWhereParams(
+  qi: BuilderCtx,
+  where: Record<string, unknown>,
+  params: unknown[],
+  depth = 0,
+): boolean {
   assertWhereDepth(depth);
+  let emitted = false;
   // ONE canonical walk (shared with fingerprintWhere + buildWhereClause), so
   // the key order + combinator structure cannot drift out of lockstep.
   for (const event of walkWhere(qi.whereHost, where)) {
     switch (event.kind) {
       case 'or':
+        collectOrParams(event.conditions, params, (cond) => collectWhereParams(qi, cond, params, depth + 1));
+        emitted = true;
+        break;
       case 'and':
-        for (const cond of event.conditions) collectWhereParams(qi, cond, params, depth + 1);
+        for (const cond of event.conditions) {
+          if (collectWhereParams(qi, cond, params, depth + 1)) emitted = true;
+        }
         break;
       case 'not':
-        collectWhereParams(qi, event.condition, params, depth + 1);
+        if (collectWhereParams(qi, event.condition, params, depth + 1)) emitted = true;
         break;
       case 'relation':
-        collectRelationFilterParams(qi, event.relDef, event.filterObj, params, depth + 1);
+        if (collectRelationFilterParams(qi, event.relDef, event.filterObj, params, depth + 1)) emitted = true;
         break;
       case 'scalar':
         collectScalarParams(qi, event.key, event.value, params);
+        emitted = true;
         break;
     }
   }
+  return emitted;
 }
 
 /**
@@ -469,7 +532,7 @@ export function collectScalarParams(qi: BuilderCtx, key: string, value: unknown,
       collectJsonFilterParams(qi, value as JsonFilter, params, qi.q(rawColumn));
       return;
     case 'array':
-      collectArrayFilterParams(qi, value as ArrayFilter, params);
+      collectArrayFilterParams(qi, value as ArrayFilter, params, qi.q(rawColumn));
       return;
     case 'textsearch':
       // Same gate the build path applies, so the collect path never diverges
@@ -483,15 +546,22 @@ export function collectScalarParams(qi: BuilderCtx, key: string, value: unknown,
         table: qi.table,
         prefix: '',
         rawColumn,
+        pgType: getColumnPgType(qi, rawColumn),
       });
       return;
-    default:
+    default: {
       // 'equality' | 'jsonThrow' | 'arrayThrow': same strict validation as
       // the build path, so a cache hit can never silently bind a
       // misspelled-operator object.
-      assertBindableEqualityValue(qi, rawColumn, value, getColumnPgType(qi, rawColumn), qi.table);
+      const pgType = getColumnPgType(qi, rawColumn);
+      assertBindableEqualityValue(qi, rawColumn, value, pgType, qi.table);
+      if (isBareJsonDocument(qi, pgType, value)) {
+        jsonDocumentEquals(qi, '', rawColumn, value, collectOnly(params));
+        return;
+      }
       params.push(coerceWhereOperand(qi, qi.tableMeta, rawColumn, value));
       return;
+    }
   }
 }
 
@@ -504,6 +574,7 @@ export function collectScalarParams(qi: BuilderCtx, key: string, value: unknown,
  * the gf calls are no-ops, so this stays byte-identical to the pre-0.28 path.
  * Shared by every collect site that mirrors buildRelationFilter
  * (collectWhereParams, collectRelFilterParams, collectAliasWhereParams).
+ * Returns whether {@link buildRelationFilter} emits a clause for it.
  */
 export function collectRelationFilterParams(
   qi: BuilderCtx,
@@ -511,58 +582,73 @@ export function collectRelationFilterParams(
   filterObj: Record<string, unknown>,
   params: unknown[],
   depth = 0,
-): void {
+): boolean {
   const target = relDef.to;
-  if (filterObj.some !== undefined && filterObj.some !== null) {
+  if (!qi.schema.tables[target]) return false;
+  let emitted = false;
+  if (filterObj.some !== undefined) {
     collectRelFilterParams(qi, target, filterObj.some as Record<string, unknown>, params, depth + 1);
     collectTargetGlobalFilterExists(qi, target, params);
+    emitted = true;
   }
-  if (filterObj.none !== undefined && filterObj.none !== null) {
+  if (filterObj.none !== undefined) {
     collectRelFilterParams(qi, target, filterObj.none as Record<string, unknown>, params, depth + 1);
     collectTargetGlobalFilterExists(qi, target, params);
+    emitted = true;
   }
-  if (filterObj.every !== undefined && filterObj.every !== null) {
-    // gf is only emitted (build) when the `every` sub-where compiles to a
-    // filter, otherwise `every` is trivially true and no subquery is built.
-    if (
-      buildSubWhereForRelation(qi, target, qi.q(target), filterObj.every as Record<string, unknown>, [], depth + 1) !==
-      null
-    ) {
-      collectRelFilterParams(qi, target, filterObj.every as Record<string, unknown>, params, depth + 1);
-      collectTargetGlobalFilterExists(qi, target, params);
-    }
+  // gf is only emitted (build) when the `every` sub-where compiles to a
+  // filter, otherwise `every` is trivially true and no subquery is built. A
+  // sub-where that compiles to nothing pushes nothing.
+  if (
+    filterObj.every !== undefined &&
+    collectRelFilterParams(qi, target, filterObj.every as Record<string, unknown>, params, depth + 1)
+  ) {
+    collectTargetGlobalFilterExists(qi, target, params);
+    emitted = true;
   }
   if (filterObj.is !== undefined) {
     if (filterObj.is !== null)
       collectRelFilterParams(qi, target, filterObj.is as Record<string, unknown>, params, depth + 1);
     collectTargetGlobalFilterExists(qi, target, params);
+    emitted = true;
   }
   if (filterObj.isNot !== undefined) {
     if (filterObj.isNot !== null)
       collectRelFilterParams(qi, target, filterObj.isNot as Record<string, unknown>, params, depth + 1);
     collectTargetGlobalFilterExists(qi, target, params);
+    emitted = true;
   }
+  return emitted;
 }
 
+/** Collect a relation sub-where's params; returns whether it compiles to a condition. */
 export function collectRelFilterParams(
   qi: BuilderCtx,
   targetTable: string,
   subWhere: Record<string, unknown>,
   params: unknown[],
   depth = 0,
-): void {
+): boolean {
   const meta = qi.schema.tables[targetTable];
-  if (!meta) return;
+  if (!meta) return false;
   // The FROM-item reference only shapes SQL text, never params, so the bare
   // name serves the collect mirror whether or not the build path aliased it.
-  collectScopedWhereParams(qi, relationWhereScope(qi, targetTable, meta, qi.q(targetTable)), subWhere, params, depth);
+  return collectScopedWhereParams(
+    qi,
+    relationWhereScope(qi, targetTable, meta, qi.q(targetTable)),
+    subWhere,
+    params,
+    depth,
+  );
 }
 
 /**
  * Collect params from operator clauses. Mirrors buildOperatorClauses:
  * {@link ColumnRef} values compile into the SQL text, so they push NOTHING -
  * but they re-run the same validation (unknown ref / insensitive mode) so a
- * warmed cache can never skip a check the build path enforces.
+ * warmed cache can never skip a check the build path enforces. The operand
+ * validation ({@link assertOperatorOperands}) runs here too, for the same
+ * reason.
  */
 export function collectOperatorParams(
   qi: BuilderCtx,
@@ -570,6 +656,20 @@ export function collectOperatorParams(
   op: WhereOperator,
   params: unknown[],
   refCtx?: ColumnRefContext,
+): void {
+  const operand = operandContext(qi, column, refCtx);
+  assertOperatorOperands(op as Record<string, unknown>, operand);
+  collectOperatorParamsChecked(qi, column, op, params, refCtx, operand);
+}
+
+/** {@link collectOperatorParams} after validation; recursive for a `not` operator object. */
+function collectOperatorParamsChecked(
+  qi: BuilderCtx,
+  column: string,
+  op: WhereOperator,
+  params: unknown[],
+  refCtx: ColumnRefContext | undefined,
+  operand: OperandContext,
 ): void {
   const skipRef = (v: unknown): boolean => {
     if (!isColumnRef(v)) return false;
@@ -580,7 +680,6 @@ export function collectOperatorParams(
   const cv = (v: unknown): unknown => (refCtx ? coerceWhereOperand(qi, refCtx.meta, refCtx.rawColumn, v) : v);
   const insensitive = op.mode === 'insensitive';
   if (op.equals !== undefined && op.equals !== null && !skipRef(op.equals)) {
-    assertBindableEqualsOperand(op.equals, `"${column}"`);
     if (insensitive) assertInsensitiveOperand(op.equals, 'equals', column);
     params.push(cv(op.equals));
   }
@@ -589,8 +688,15 @@ export function collectOperatorParams(
   if (op.lt !== undefined && !skipRef(op.lt)) params.push(cv(op.lt));
   if (op.lte !== undefined && !skipRef(op.lte)) params.push(cv(op.lte));
   if (op.not !== undefined && op.not !== null && !skipRef(op.not)) {
-    if (insensitive) assertInsensitiveOperand(op.not, 'not', column);
-    params.push(cv(op.not));
+    const negatedDocument = jsonNegatedDocument(qi, op.not, operand);
+    if (negatedDocument !== NO_JSON_NEGATION) {
+      jsonDocumentEquals(qi, '', column, negatedDocument, collectOnly(params));
+    } else if (isNegatedOperatorObject(op.not, operand)) {
+      collectOperatorParamsChecked(qi, column, notOperand(op), params, refCtx, operand);
+    } else {
+      if (insensitive) assertInsensitiveOperand(op.not, 'not', column);
+      params.push(cv(op.not));
+    }
   }
   if (op.in !== undefined) {
     if (insensitive) {
@@ -612,6 +718,15 @@ export function collectOperatorParams(
 }
 
 /**
+ * Is this `not` operand an operator object to negate as a whole, rather than a
+ * value? On a JSON column an object is a JSON VALUE (`not: { a: 1 }` compares
+ * documents), so only non-JSON columns read it as an operator object.
+ */
+function isNegatedOperatorObject(value: unknown, operand: OperandContext): value is WhereOperator {
+  return operand.kind !== 'json' && isWhereOperator(value);
+}
+
+/**
  * Collect params from JSON filter. Mirrors buildJsonFilterClauses exactly:
  * the `path` is bound at most once (its placeholder is shared by every
  * extraction clause), then equals/contains/hasKey values, then the range
@@ -630,13 +745,16 @@ export function collectJsonFilterParams(qi: BuilderCtx, filter: JsonFilter, para
 
   if (filter.path !== undefined && filter.equals !== undefined) {
     pushPathOnce();
-    params.push(String(filter.equals));
+    const hook = jsonPathEqualsHook(qi);
+    if (hook) {
+      hook.call(qi.dialect, jsonPathEqualsInput(qi, filter, column, '', '', collectOnly(params)));
+    } else {
+      params.push(jsonPathEqualsOperand(qi, filter.equals, column));
+    }
   } else if (filter.equals !== undefined) {
-    // Mirrors the build path's refusal, and thrown before any param is pushed,
-    // like the text-search gate a few cases above. Not defensive: it is what
-    // stops a warmed template serving a shape the cold build refuses.
-    requireJsonContains(qi, 'equals');
-    params.push(JSON.stringify(filter.equals));
+    // Mirrors the build path, refusals included: a warmed template must never
+    // serve a shape the cold build refuses.
+    jsonDocumentEquals(qi, '', column, filter.equals, collectOnly(params));
   }
   if (filter.contains !== undefined) {
     requireJsonContains(qi, 'contains');
@@ -656,8 +774,9 @@ export function collectJsonFilterParams(qi: BuilderCtx, filter: JsonFilter, para
 }
 
 /** Collect params from array filter. Mirrors buildArrayFilterClauses. */
-export function collectArrayFilterParams(qi: BuilderCtx, filter: ArrayFilter, params: unknown[]): void {
+export function collectArrayFilterParams(qi: BuilderCtx, filter: ArrayFilter, params: unknown[], column: string): void {
   requireArrayColumns(qi);
+  assertArrayFilter(filter, column);
   if (filter.has !== undefined) params.push(filter.has);
   if (filter.hasEvery !== undefined) params.push(filter.hasEvery);
   if (filter.hasSome !== undefined) params.push(filter.hasSome);
@@ -698,32 +817,59 @@ export function buildWhere<T extends object>(
  * THE global-filter resolution rule, with no dependency on a `BuilderCtx`.
  *
  * Split out from {@link resolveGlobalFilter} so `PowqlInterface` can consume
- * the SAME rule rather than a transcription of it. It is a parallel
- * implementation of the public surface, and this repository's history is
- * unambiguous that a rule written twice is how two engines come to disagree
- * (the 0.64 projection resolver, the 0.73 findUnique guard). Every clause here
- * is load-bearing on both engines: a function filter is evaluated PER BUILD so
- * per-request tenancy works, an all-undefined filter is treated as absent so it
- * cannot emit a dangling clause, and `skip` is honoured in both its whole-query
- * and per-table forms.
+ * the SAME rule rather than a transcription of it: a rule written twice is how
+ * two engines come to disagree. A function filter is evaluated PER BUILD so
+ * per-request tenancy works, and `skip` is honoured in both its whole-query and
+ * per-table forms.
+ *
+ * FAIL CLOSED. A filter that resolves to `undefined`, or to an object holding
+ * an `undefined` anywhere inside it, throws {@link ValidationError} (E003). A
+ * missing tenant context is exactly what produces `{ tenantId: undefined }`,
+ * and treating that as "no filter" read and wrote every tenant's rows. The
+ * explicit values `null` and `{}` still mean "no filter for this call": neither
+ * is what a missing value produces.
+ *
+ * A `skipGlobalFilters` list names tables by table name or client accessor,
+ * the two spellings `globalFilters` keys take. With `tables` (the schema's
+ * table map), an entry that names no table is refused (E003): it would skip
+ * nothing, so the caller who meant to lift a filter would silently keep it.
  */
 export function resolveGlobalFilterFrom(
   filters: GlobalFilters | undefined,
   table: string,
   skip: ResolvedSkipGlobalFilters | undefined,
+  tables?: Readonly<Record<string, unknown>>,
 ): Record<string, unknown> | null {
-  if (!filters) return null;
   if (skip === true) return null;
-  if (Array.isArray(skip) && skip.includes(table)) return null;
+  if (Array.isArray(skip)) {
+    if (tables !== undefined) assertSkipListNames(skip, tables);
+    if (skipListNamesTable(skip, table, tables)) return null;
+  }
+  if (!filters) return null;
+  if (!Object.hasOwn(filters, table)) return null;
   const raw = filters[table];
-  if (raw === undefined) return null;
   const resolved = typeof raw === 'function' ? raw() : raw;
-  if (resolved === null || resolved === undefined) return null;
-  const obj = resolved as Record<string, unknown>;
-  // An all-undefined filter (e.g. `{ tenantId: undefined }`) contributes
-  // nothing, treat it as absent so it never emits a dangling clause.
-  if (Object.keys(obj).every((k) => obj[k] === undefined)) return null;
-  return obj;
+  if (resolved === null) return null;
+  if (resolved === undefined) throw unresolvedGlobalFilter(table, 'resolved to undefined');
+  if (typeof resolved !== 'object' || Array.isArray(resolved)) {
+    throw new ValidationError(
+      `Global filter for "${table}" must be a where object (or a function returning one), received ` +
+        `${Array.isArray(resolved) ? 'an array' : typeof resolved}.`,
+    );
+  }
+  // The boolean scan allocates nothing; the path string is built only on the throw path.
+  const hole = holdsUndefinedValue(resolved, 0) ? findUndefinedPath(resolved, '', 0) : null;
+  if (hole !== null) throw unresolvedGlobalFilter(table, `has an undefined value at "${hole}"`);
+  return Object.keys(resolved).length === 0 ? null : (resolved as Record<string, unknown>);
+}
+
+function unresolvedGlobalFilter(table: string, what: string): ValidationError {
+  return new ValidationError(
+    `Global filter for "${table}" ${what}. A global filter is never dropped because its input is missing: ` +
+      "an undefined tenant id would otherwise read and write every tenant's rows. Supply the value it reads " +
+      '(for example the current tenant) before this query runs, or pass `skipGlobalFilters: UNSAFE` ' +
+      "(import { UNSAFE } from 'turbine-orm') on a query that must see every row.",
+  );
 }
 
 /**
@@ -736,7 +882,7 @@ export function resolveGlobalFilter(
   table: string,
   skip: ResolvedSkipGlobalFilters | undefined = qi.currentSkip,
 ): Record<string, unknown> | null {
-  return resolveGlobalFilterFrom(qi.globalFilters, table, skip);
+  return resolveGlobalFilterFrom(qi.globalFilters, table, skip, qi.schema.tables);
 }
 
 /**
@@ -758,26 +904,70 @@ export function mergeGlobalFilter(
 }
 
 /**
+ * The tables whose global filter is being compiled right now, per builder
+ * context. A table's filter applies to every relation target a query reaches,
+ * the targets inside another table's filter included, so two filters that
+ * reach each other through relations (or one that reaches its own table) would
+ * apply each other without end. While a table's filter is being compiled, a
+ * relation that reaches that table again reads its rows unfiltered, which ends
+ * the chain. A static filter that forms such a cycle is refused when the client
+ * is built (`normalizeGlobalFilters`); this covers function filters, whose
+ * relations are known only per query. Compilation is synchronous, so the stack
+ * is pushed and popped around each application, on the build and the collect
+ * pass alike.
+ */
+const filtersBeingApplied = new WeakMap<object, string[]>();
+
+/**
+ * Apply `table`'s global filter as a relation target: `apply(gf)` with the
+ * table on the stack, or `none` when no filter applies or the table's filter
+ * is already being compiled further out (see {@link filtersBeingApplied}).
+ * Every target application goes through here, build and collect alike.
+ */
+export function withTargetGlobalFilter<T>(
+  qi: BuilderCtx,
+  table: string,
+  none: T,
+  apply: (gf: Record<string, unknown>) => T,
+): T {
+  let stack = filtersBeingApplied.get(qi);
+  if (stack?.includes(table)) return none;
+  const gf = resolveGlobalFilter(qi, table);
+  if (!gf) return none;
+  if (!stack) {
+    stack = [];
+    filtersBeingApplied.set(qi, stack);
+  }
+  stack.push(table);
+  try {
+    return apply(gf);
+  } finally {
+    stack.pop();
+  }
+}
+
+/**
  * SQL clause for `targetTable`'s global filter rendered against `alias`
  * (relation subqueries, `_count`, relation `orderBy`). Pushes its params to
  * `params`; returns `''` when no filter applies. Mirror:
  * {@link collectTargetGlobalFilterAlias}.
  */
 export function targetGlobalFilterAlias(qi: BuilderCtx, targetTable: string, alias: string, params: unknown[]): string {
-  const gf = resolveGlobalFilter(qi, targetTable);
-  if (!gf) return '';
   const meta = qi.schema.tables[targetTable];
   if (!meta) return '';
-  return buildAliasWhere(qi, targetTable, meta, alias, gf, params) ?? '';
+  return withTargetGlobalFilter(
+    qi,
+    targetTable,
+    '',
+    (gf) => buildAliasWhere(qi, targetTable, meta, alias, gf, params) ?? '',
+  );
 }
 
 /** Param-collect mirror of {@link targetGlobalFilterAlias}. */
 export function collectTargetGlobalFilterAlias(qi: BuilderCtx, targetTable: string, params: unknown[]): void {
-  const gf = resolveGlobalFilter(qi, targetTable);
-  if (!gf) return;
   const meta = qi.schema.tables[targetTable];
   if (!meta) return;
-  collectAliasWhereParams(qi, targetTable, meta, gf, params);
+  withTargetGlobalFilter(qi, targetTable, false, (gf) => collectAliasWhereParams(qi, targetTable, meta, gf, params));
 }
 
 /**
@@ -792,16 +982,17 @@ export function targetGlobalFilterExists(
   targetRef: string,
   params: unknown[],
 ): string {
-  const gf = resolveGlobalFilter(qi, targetTable);
-  if (!gf) return '';
-  return buildSubWhereForRelation(qi, targetTable, targetRef, gf, params) ?? '';
+  return withTargetGlobalFilter(
+    qi,
+    targetTable,
+    '',
+    (gf) => buildSubWhereForRelation(qi, targetTable, targetRef, gf, params) ?? '',
+  );
 }
 
 /** Param-collect mirror of {@link targetGlobalFilterExists}. */
 export function collectTargetGlobalFilterExists(qi: BuilderCtx, targetTable: string, params: unknown[]): void {
-  const gf = resolveGlobalFilter(qi, targetTable);
-  if (!gf) return;
-  collectRelFilterParams(qi, targetTable, gf, params);
+  withTargetGlobalFilter(qi, targetTable, false, (gf) => collectRelFilterParams(qi, targetTable, gf, params));
 }
 
 /**
@@ -846,16 +1037,41 @@ export function globalFilterCacheSegment(qi: BuilderCtx): string {
 }
 
 /**
- * True when the USER-supplied `where` compiles to no predicate (`{}`,
- * `{ id: undefined }`, `{ OR: [{ a: undefined }] }`, …). This is the exact
- * signal the empty-`where` guard needs, the compiled emptiness, NOT the
- * fingerprint (which is non-empty for an all-undefined `OR`/`AND`). It ignores
- * any configured global filter, so a global filter never lets an unguarded
- * mass mutation through.
+ * True when the USER-supplied `where` narrows no row: it compiles to no
+ * predicate (`{}`, `{ id: undefined }`, `{ OR: [{ a: undefined }] }`, …), or
+ * to one that is TRUE for every row (`{ NOT: { OR: [] } }`,
+ * `{ id: { notIn: [] } }`, and on a NOT NULL column `{ email: { contains: '' } }`
+ * or `{ id: { not: null } }`, see {@link foldWhere}). Either way a mutation
+ * guarded by it would write every row. It reads the compiled emptiness, NOT
+ * the fingerprint (which is non-empty for an all-undefined `OR`/`AND`), and it
+ * ignores any configured global filter, so a global filter never lets an
+ * unguarded mass mutation through.
  */
 export function userPredicateIsEmpty(qi: BuilderCtx, userWhere: Record<string, unknown>): boolean {
   const throwaway: unknown[] = [];
-  return buildWhereClause(qi, userWhere, throwaway) === null;
+  if (buildWhereClause(qi, userWhere, throwaway) === null) return true;
+  return foldWhere(qi.whereHost, userWhere, (table) => tableWhereHost(qi, table), 0, guardFoldOptions(qi)) === 'true';
+}
+
+/**
+ * The guard's fold reads NOT NULL columns, and trusts a declared foreign key
+ * except on SQLite, which enforces one only when the connection turned
+ * `foreign_keys` on, so a row there can point at a row that does not exist.
+ */
+function guardFoldOptions(qi: BuilderCtx): WhereFoldOptions {
+  return {
+    notNull: {
+      foreignKeys: qi.dialect.capabilities.enforcesForeignKeys,
+      hasGlobalFilter: (table) => qi.globalFilters !== undefined && Object.hasOwn(qi.globalFilters, table),
+    },
+  };
+}
+
+/** The where host of `table` in this client's schema, or `undefined` when the schema has no such table. */
+function tableWhereHost(qi: BuilderCtx, table: string): WhereHost | undefined {
+  const meta = ownLookup(qi.schema.tables, table);
+  if (!meta) return undefined;
+  return meta.name === qi.tableMeta.name ? qi.whereHost : scopedWhereHost(qi, meta);
 }
 
 export function assertMutationHasPredicate(
@@ -870,10 +1086,20 @@ export function assertMutationHasPredicate(
 ): void {
   if (whereSql.length > 0) return;
   if (allowFullTableScan === true) return;
-  throw new ValidationError(
-    `${operation} on "${qi.table}" refused: the \`where\` clause is empty. ` +
-      "Pass `allowFullTableScan: UNSAFE` to opt in (import { UNSAFE } from 'turbine-orm'), " +
-      'or check that your filter values are defined.',
+  throw new ValidationError(emptyMutationWhereMessage(operation, qi.table));
+}
+
+/**
+ * The mass-mutation refusal, one text for every engine. "Empty" covers a where
+ * that is always true (see {@link userPredicateIsEmpty}), which writes every
+ * row just the same.
+ */
+export function emptyMutationWhereMessage(operation: string, table: string): string {
+  return (
+    `${operation} on "${table}" refused: the \`where\` clause is empty or always true ` +
+    '(for example `NOT: { OR: [] }` or `{ id: { notIn: [] } }`), so it would apply to every row. ' +
+    "Pass `allowFullTableScan: UNSAFE` to opt in (import { UNSAFE } from 'turbine-orm'), " +
+    'or check that your filter values are defined and your lists are not empty.'
   );
 }
 
@@ -904,16 +1130,14 @@ export function buildWhereClause(
     switch (event.kind) {
       case 'or': {
         if (!internal) qi.markVariableArity();
-        const orClauses: string[] = [];
-        for (const orCond of event.conditions) {
-          const sub = buildWhereClause(qi, orCond, params, depth + 1);
-          if (sub) orClauses.push(sub);
-        }
-        if (orClauses.length > 0) andClauses.push(`(${orClauses.join(' OR ')})`);
+        andClauses.push(
+          buildOrClause(event.conditions, params, (cond) => buildWhereClause(qi, cond, params, depth + 1)),
+        );
         break;
       }
       case 'and':
-        if (!internal) qi.markVariableArity();
+        // `AND: { ... }` is one branch whatever the caller sends (fixedArity).
+        if (!internal && !event.fixedArity) qi.markVariableArity();
         for (const andCond of event.conditions) {
           const sub = buildWhereClause(qi, andCond, params, depth + 1);
           if (sub) andClauses.push(sub);
@@ -938,6 +1162,52 @@ export function buildWhereClause(
 
   if (andClauses.length === 0) return null;
   return andClauses.join(' AND ');
+}
+
+/**
+ * The SQL an `OR` compiles to when one of its branches compiles to nothing.
+ * Written out rather than left empty, because `NOT` of an empty clause applies
+ * no condition while `NOT` of this matches no row.
+ */
+const ALWAYS_TRUE_SQL = '(1 = 1)';
+
+/**
+ * Compile an `OR` from its branches. A branch with no condition (`{}`,
+ * `{ AND: [] }`) is TRUE for every row, so the whole `OR` is TRUE: the clause
+ * is {@link ALWAYS_TRUE_SQL} and the params the other branches pushed are
+ * taken back. Every branch is still built, so each is validated exactly as the
+ * param collect validates it. {@link collectOrParams} is the mirror.
+ */
+function buildOrClause(
+  branches: readonly WhereRecord[],
+  params: unknown[],
+  build: (branch: WhereRecord) => string | null,
+): string {
+  const mark = params.length;
+  const parts: string[] = [];
+  let alwaysTrue = false;
+  for (const branch of branches) {
+    const sub = build(branch);
+    if (sub === null) alwaysTrue = true;
+    else parts.push(sub);
+  }
+  if (!alwaysTrue) return `(${parts.join(' OR ')})`;
+  params.length = mark;
+  return ALWAYS_TRUE_SQL;
+}
+
+/** Param-collect mirror of {@link buildOrClause}; `collect` reports whether the branch compiled to a condition. */
+function collectOrParams(
+  branches: readonly WhereRecord[],
+  params: unknown[],
+  collect: (branch: WhereRecord) => boolean,
+): void {
+  const mark = params.length;
+  let alwaysTrue = false;
+  for (const branch of branches) {
+    if (!collect(branch)) alwaysTrue = true;
+  }
+  if (alwaysTrue) params.length = mark;
 }
 
 /**
@@ -993,18 +1263,54 @@ export function buildScalarClause(
           table: qi.table,
           prefix: '',
           rawColumn,
+          pgType: getColumnPgType(qi, rawColumn),
         }),
       );
       return;
-    default:
+    default: {
       // 'equality': a plain object literal that matched no known filter shape
       // is almost always a misspelled operator (`startWith` for `startsWith`);
       // the guard also runs on the cache-hit param-collect path.
-      assertBindableEqualityValue(qi, rawColumn, value, getColumnPgType(qi, rawColumn), qi.table);
+      const pgType = getColumnPgType(qi, rawColumn);
+      assertBindableEqualityValue(qi, rawColumn, value, pgType, qi.table);
+      if (isBareJsonDocument(qi, pgType, value)) {
+        andClauses.push(jsonDocumentEquals(qi, column, rawColumn, value, bindInto(qi, params)));
+        return;
+      }
       params.push(coerceWhereOperand(qi, qi.tableMeta, rawColumn, value));
       andClauses.push(`${column} = ${qi.p(params.length)}`);
       return;
+    }
   }
+}
+
+/**
+ * A bare object on a JSON column is a whole-document equality, the same thing
+ * `equals` is. PostgreSQL's `jsonb = $1` already reads it so. MySQL compared
+ * the column with the bound TEXT, which matched no row (and its `NOT` every
+ * row), so there it compiles to the typed comparison `equals` uses. SQLite and
+ * SQL Server compared the stored text, so key order and whitespace decided the
+ * match; they refuse it (E017) as they refuse `equals`, and a bare array with
+ * it. Decided from the dialect, the column and the value's shape, all of which
+ * the cache key already carries (a bare object fingerprints as `obj(...)`; a
+ * bare array only ever refuses, so it changes no SQL).
+ */
+function isBareJsonDocument(qi: BuilderCtx, pgType: string, value: unknown): boolean {
+  if (qi.dialect.capabilities.jsonDocumentEquality === 'jsonb' || operandColumnKind(pgType) !== 'json') return false;
+  return isPlainRecord(value) || (Array.isArray(value) && !comparesJsonDocuments(qi));
+}
+
+/** Whether the engine compares two whole JSON documents exactly (key order and whitespace aside). */
+function comparesJsonDocuments(qi: BuilderCtx): boolean {
+  return qi.dialect.capabilities.jsonDocumentEquality !== 'text';
+}
+
+/** A bind callback for the build passes: pushes the value and returns its placeholder. */
+function bindInto(qi: BuilderCtx, params: unknown[]): (value: unknown) => string {
+  return (value) => {
+    params.push(value);
+    return qi.p(params.length);
+  };
 }
 
 /**
@@ -1077,9 +1383,10 @@ export function relationWhereScope(
  */
 export function aliasWhereScope(qi: BuilderCtx, targetTable: string, meta: TableMetadata, alias: string): WhereScope {
   if (alias.includes('"')) {
-    throw new ValidationError(
-      `Internal: aliasWhereScope was given the rendered reference ${alias} for table "${targetTable}", ` +
-        'but it takes a bare alias and quotes it itself. Use renderedRefWhereScope for an already-quoted reference.',
+    throw new InvariantError(
+      'where-scope-reference',
+      `aliasWhereScope was given the rendered reference ${alias} for table "${targetTable}", but it takes a ` +
+        'bare alias and quotes it itself. Use renderedRefWhereScope for an already-quoted reference.',
     );
   }
   return {
@@ -1158,15 +1465,23 @@ export function buildScopedWhere(
   for (const event of walkWhere(scope.host, where)) {
     switch (event.kind) {
       case 'or':
-      case 'and': {
         // Same variable-arity rule as the top level: a nested relation filter
         // or a relation `with` where can carry a caller-sized OR just as easily.
         if (!internal) qi.markVariableArity();
+        clauses.push(
+          buildOrClause(event.conditions, params, (cond) => {
+            const sub = buildScopedWhere(qi, scope, cond, params, depth + 1);
+            return sub === null ? null : `(${sub})`;
+          }),
+        );
+        break;
+      case 'and': {
+        if (!internal && !event.fixedArity) qi.markVariableArity();
         const parts = event.conditions
           .map((cond) => buildScopedWhere(qi, scope, cond, params, depth + 1))
           .filter((s): s is string => s !== null)
           .map((s) => `(${s})`);
-        if (parts.length > 0) clauses.push(`(${parts.join(event.kind === 'or' ? ' OR ' : ' AND ')})`);
+        if (parts.length > 0) clauses.push(`(${parts.join(' AND ')})`);
         break;
       }
       case 'not': {
@@ -1258,12 +1573,18 @@ export function buildScopedScalarClause(
         table: scope.table,
         prefix: scope.qualifier,
         rawColumn: col,
+        pgType: pgTypeForColumn(qi, meta, col),
       }),
     );
     return;
   }
 
-  assertBindableEqualityValue(qi, col, value, pgTypeForColumn(qi, meta, col), scope.table);
+  const pgType = pgTypeForColumn(qi, meta, col);
+  assertBindableEqualityValue(qi, col, value, pgType, scope.table);
+  if (isBareJsonDocument(qi, pgType, value)) {
+    clauses.push(jsonDocumentEquals(qi, qCol, col, value, bindInto(qi, params)));
+    return;
+  }
   params.push(coerceWhereOperand(qi, meta, col, value));
   clauses.push(`${qCol} = ${qi.p(params.length)}`);
 }
@@ -1272,7 +1593,8 @@ export function buildScopedScalarClause(
  * Cache-hit param-collect mirror of {@link buildScopedWhere}: pushes the exact
  * same params in the exact same order (driven by the same {@link walkWhere}),
  * without rebuilding SQL. Serves both {@link collectRelFilterParams} and
- * {@link collectAliasWhereParams}.
+ * {@link collectAliasWhereParams}. Returns whether the clause compiles to a
+ * condition (`buildScopedWhere` non-null).
  */
 export function collectScopedWhereParams(
   qi: BuilderCtx,
@@ -1280,27 +1602,37 @@ export function collectScopedWhereParams(
   where: Record<string, unknown>,
   params: unknown[],
   depth = 0,
-): void {
+): boolean {
   assertWhereDepth(depth);
+  let emitted = false;
   for (const event of walkWhere(scope.host, where)) {
     switch (event.kind) {
       case 'or':
+        collectOrParams(event.conditions, params, (cond) =>
+          collectScopedWhereParams(qi, scope, cond, params, depth + 1),
+        );
+        emitted = true;
+        break;
       case 'and':
-        for (const cond of event.conditions) collectScopedWhereParams(qi, scope, cond, params, depth + 1);
+        for (const cond of event.conditions) {
+          if (collectScopedWhereParams(qi, scope, cond, params, depth + 1)) emitted = true;
+        }
         break;
       case 'not':
-        collectScopedWhereParams(qi, scope, event.condition, params, depth + 1);
+        if (collectScopedWhereParams(qi, scope, event.condition, params, depth + 1)) emitted = true;
         break;
       case 'relation':
         // Same some→none→every→is→isNot (each: sub-where params then target
         // global-filter params) as buildRelationFilter emits.
-        collectRelationFilterParams(qi, event.relDef, event.filterObj, params, depth);
+        if (collectRelationFilterParams(qi, event.relDef, event.filterObj, params, depth)) emitted = true;
         break;
       case 'scalar':
         collectScopedScalarParams(qi, scope, event.key, event.value, params);
+        emitted = true;
         break;
     }
   }
+  return emitted;
 }
 
 /** Param-collect mirror of {@link buildScopedScalarClause}. */
@@ -1330,17 +1662,28 @@ export function collectScopedScalarParams(
   if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
     const colType = pgTypeForColumn(qi, meta, col);
     if (colType.startsWith('_')) {
-      collectArrayFilterParams(qi, value, params);
+      collectArrayFilterParams(qi, value, params, `${qi.q(scope.table)}.${qi.q(col)}`);
       return;
     }
   }
 
   if (isWhereOperator(value)) {
-    collectOperatorParams(qi, col, value, params, { meta, table: scope.table, prefix: '', rawColumn: col });
+    collectOperatorParams(qi, col, value, params, {
+      meta,
+      table: scope.table,
+      prefix: '',
+      rawColumn: col,
+      pgType: pgTypeForColumn(qi, meta, col),
+    });
     return;
   }
 
-  assertBindableEqualityValue(qi, col, value, pgTypeForColumn(qi, meta, col), scope.table);
+  const pgType = pgTypeForColumn(qi, meta, col);
+  assertBindableEqualityValue(qi, col, value, pgType, scope.table);
+  if (isBareJsonDocument(qi, pgType, value)) {
+    jsonDocumentEquals(qi, '', col, value, collectOnly(params));
+    return;
+  }
   params.push(coerceWhereOperand(qi, meta, col, value));
 }
 
@@ -1517,10 +1860,9 @@ export function buildRelationFilter(
   };
 
   // "some": EXISTS (SELECT 1 FROM target WHERE correlation AND filter AND gf)
-  // A `null` branch is skipped (never reaches buildSubWhereForRelation, which
-  // would throw on Object.keys(null)), matching collectRelationFilterParams,
-  // which also skips null. Unreachable via normalization today, guarded anyway.
-  if (filterObj.some !== undefined && filterObj.some !== null) {
+  // `some` / `none` / `every` hold a where object here: the where walk refuses
+  // any other value (relationFilterValueProblem), so none compiles to nothing.
+  if (filterObj.some !== undefined) {
     const subWhere = filterObj.some as Record<string, unknown>;
     const filterClause = buildSubWhereForRelation(qi, targetTable, qt, subWhere, params, depth + 1);
     const filterAnd = filterClause ? ` AND ${filterClause}` : '';
@@ -1528,7 +1870,7 @@ export function buildRelationFilter(
   }
 
   // "none": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND filter AND gf)
-  if (filterObj.none !== undefined && filterObj.none !== null) {
+  if (filterObj.none !== undefined) {
     const subWhere = filterObj.none as Record<string, unknown>;
     const filterClause = buildSubWhereForRelation(qi, targetTable, qt, subWhere, params, depth + 1);
     const filterAnd = filterClause ? ` AND ${filterClause}` : '';
@@ -1536,7 +1878,7 @@ export function buildRelationFilter(
   }
 
   // "every": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND gf AND NOT (filter))
-  if (filterObj.every !== undefined && filterObj.every !== null) {
+  if (filterObj.every !== undefined) {
     const subWhere = filterObj.every as Record<string, unknown>;
     const filterClause = buildSubWhereForRelation(qi, targetTable, qt, subWhere, params, depth + 1);
     if (filterClause) {
@@ -1616,18 +1958,98 @@ export function pgTypeForColumn(_qi: BuilderCtx, meta: TableMetadata, column: st
  * SQL-template cache is unaffected, and it is applied on the cache-hit
  * param-collect path as well as the build path.
  *
+ * On MySQL a number, bigint or boolean compared with a text column binds as
+ * text ({@link textComparedOperand}), and so does each such element of a list.
+ *
  * `timestamptz` and every non-temporal column are returned by identity.
  */
 export function coerceWhereOperand(qi: BuilderCtx, meta: TableMetadata, column: string, value: unknown): unknown {
-  if (!(value instanceof Date) && !Array.isArray(value)) return value;
-  return coerceTemporalValue(
-    pgTypeForColumn(qi, meta, column),
-    value,
-    // Same PostgreSQL + `utcTimestamps` gate as the write path (see
-    // `utcDateTimeWrites` in writes.ts): only the read/write-symmetric engine
-    // gets the zone-less rewrite. Time-of-day always rewrites.
-    qi.dialect.name === 'postgresql' && qi.utcTimestamps !== false,
-  );
+  if (value instanceof Date || Array.isArray(value)) {
+    const dbType = pgTypeForColumn(qi, meta, column);
+    const coerced = coerceTemporalValue(dbType, value, utcDateTimeRewrite(qi, dbType));
+    return Array.isArray(coerced) ? textComparedList(qi, dbType, coerced) : coerced;
+  }
+  if (!qi.dialect.capabilities.numericTextComparison || typeof value === 'string' || typeof value === 'object') {
+    return value;
+  }
+  return textComparedOperand(qi, pgTypeForColumn(qi, meta, column), value);
+}
+
+/**
+ * Column types MySQL compares with a NUMBER numerically, converting each
+ * stored text to a number: `'0zz' = 0` and `'abc' = 0` are both true, and a
+ * boolean is the number 1 or 0 there. A request body that carries `0` or
+ * `false` where a token string belongs would match the first row whose token
+ * does not start with a digit. Exported so the write path's re-read keys use
+ * this one list rather than a copy.
+ */
+export const TEXT_COMPARED_TYPES: ReadonlySet<string> = new Set([
+  'char',
+  'varchar',
+  'character',
+  'character varying',
+  'bpchar',
+  'nchar',
+  'nvarchar',
+  'text',
+  'tinytext',
+  'mediumtext',
+  'longtext',
+  'binary',
+  'varbinary',
+  'tinyblob',
+  'blob',
+  'mediumblob',
+  'longblob',
+  'uuid',
+  'citext',
+]);
+
+/**
+ * A value bound against a column of `columnType`, as MySQL must receive it to
+ * compare it as the value it is: a number or bigint becomes its decimal text
+ * and a boolean `'1'` / `'0'` (what MySQL stores when a boolean is written to
+ * a text column), so the comparison is text with text. Every other engine,
+ * value and column type is returned unchanged. THE rule for every value Turbine
+ * binds against a column on MySQL: the where compiler applies it to each
+ * operand, and the writes apply it to the keys they re-read a row by.
+ */
+export function textComparedOperand(
+  qi: Pick<BuilderCtx, 'dialect'>,
+  columnType: string | undefined,
+  value: unknown,
+): unknown {
+  if (!qi.dialect.capabilities.numericTextComparison) return value;
+  if (typeof value !== 'number' && typeof value !== 'bigint' && typeof value !== 'boolean') return value;
+  if (columnType === undefined || !TEXT_COMPARED_TYPES.has(columnType.toLowerCase())) return value;
+  return typeof value === 'boolean' ? (value ? '1' : '0') : String(value);
+}
+
+/** {@link textComparedOperand} for each element of an `in` / `notIn` list; the list itself when none changes. */
+function textComparedList(qi: BuilderCtx, columnType: string | undefined, list: unknown[]): unknown[] {
+  if (!qi.dialect.capabilities.numericTextComparison) return list;
+  let out: unknown[] | undefined;
+  for (let i = 0; i < list.length; i++) {
+    const next = textComparedOperand(qi, columnType, list[i]);
+    if (next === list[i]) continue;
+    out ??= list.slice();
+    out[i] = next;
+  }
+  return out ?? list;
+}
+
+/**
+ * Whether a `Date` bound against `dbType` gets the zone-less UTC rewrite (the
+ * write path's gate). A `date` column takes the UTC date part on every SQL
+ * engine: the write path stores `YYYY-MM-DD` there, and a full timestamp
+ * compared with that text matches nothing. A zone-less `timestamp` is
+ * rewritten on PostgreSQL only, because MySQL reads a zone-less literal in the
+ * session time zone. `utcTimestamps: false` turns both off. Time-of-day
+ * columns always rewrite.
+ */
+export function utcDateTimeRewrite(qi: BuilderCtx, dbType: string | undefined): boolean {
+  if (qi.utcTimestamps === false) return false;
+  return qi.dialect.capabilities.utcTimestampRewrite || localDateTimeKind(dbType) === 'date';
 }
 
 /**
@@ -1640,13 +2062,13 @@ export function coerceWhereOperand(qi: BuilderCtx, meta: TableMetadata, column: 
  * value as text and Postgres refuses the implicit text→enum coercion
  * ("column X is of type Y but expression is of type text").
  *
- * Postgres-only by construction: gated on the active dialect being
- * `postgresql` AND on `schema.enums` having entries (only PG introspection
- * produces them, `defineSchema` and the other engines leave it empty), so
- * SQLite/MySQL/MSSQL/PowDB output is byte-identical.
+ * Postgres-only by construction: gated on the engine having named enum types
+ * (`namedEnumTypes`) AND on `schema.enums` having entries (only PG
+ * introspection produces them, `defineSchema` and the other engines leave it
+ * empty), so SQLite/MySQL/MSSQL/PowDB output is byte-identical.
  */
 export function enumTypeForColumn(qi: BuilderCtx, column: string): string | null {
-  if (qi.dialect.name !== 'postgresql') return null;
+  if (!qi.dialect.capabilities.namedEnumTypes) return null;
   const enums = qi.schema.enums;
   if (!enums) return null;
   // Cross-schema guard: introspection records pgTypeSchema ONLY when
@@ -1673,31 +2095,20 @@ export function enumCastSuffix(qi: BuilderCtx, column: string): string {
 
 /**
  * Equality-fallthrough guard shared by every SQL-build path AND every
- * cache-hit param-collect path. A plain object literal that matched no known
- * filter shape on a non-JSON column is almost always a misspelled operator
- * (`startWith` for `startsWith`); binding it as `col = $1` silently returns
- * wrong rows. Class instances (Buffer for bytea, Decimal wrappers, ...) are
- * legitimate bind values and pass through, as do objects on json/jsonb
- * columns (object equality).
+ * cache-hit param-collect path: a bare value must fit its column
+ * ({@link assertEqualityOperand}). A plain object literal that matched no
+ * known filter shape on a non-JSON column is almost always a misspelled
+ * operator (`startWith` for `startsWith`), and binding it as `col = $1` would
+ * silently return wrong rows. Objects on json/jsonb columns are JSON values.
  */
 export function assertBindableEqualityValue(
-  qi: BuilderCtx,
+  _qi: BuilderCtx,
   rawColumn: string,
   value: unknown,
   columnPgType: string,
   table: string,
 ): void {
-  if (!isUnmatchedPlainObject(value)) return;
-  if (isJsonColumnType(qi, columnPgType)) return;
-  const badKeys = Object.keys(value as Record<string, unknown>);
-  throw new ValidationError(
-    badKeys.length === 0
-      ? `Empty filter object on "${rawColumn}" for table "${table}". ` +
-          `Provide a value or an operator like { gt: 1 }.`
-      : `Unknown operator${badKeys.length > 1 ? 's' : ''} ` +
-          `${badKeys.map((k) => `"${k}"`).join(', ')} on "${rawColumn}" for table "${table}". ` +
-          `Supported operators: ${[...OPERATOR_KEYS].join(', ')}.`,
-  );
+  assertEqualityOperand(value, { column: rawColumn, table, kind: operandColumnKind(columnPgType) });
 }
 
 /**
@@ -1728,10 +2139,10 @@ export function collectAliasWhereParams(
   targetMeta: TableMetadata,
   where: Record<string, unknown>,
   params: unknown[],
-): void {
+): boolean {
   // The alias identifier is irrelevant to param collection (it only shapes SQL
   // text), so reuse the relation scope's host binding for `targetMeta`.
-  collectScopedWhereParams(qi, aliasWhereScope(qi, targetTable, targetMeta, ''), where, params);
+  return collectScopedWhereParams(qi, aliasWhereScope(qi, targetTable, targetMeta, ''), where, params);
 }
 
 /**
@@ -1798,9 +2209,12 @@ export function columnRefSql(
  * Each operator key becomes its own clause, all ANDed together.
  *
  * `equals`/`not`/`gt`/`gte`/`lt`/`lte` also accept a {@link ColumnRef}
- * (`{ col: 'otherField' }`) which compiles to a column-to-column comparison
+ * (`col('otherField')`) which compiles to a column-to-column comparison
  * against `refCtx`: no param bound, so `collectOperatorParams` mirrors by
  * pushing nothing and the referenced name lives in the fingerprint.
+ *
+ * `not` also accepts an operator object, compiled as `NOT (<inner clauses>)`
+ * (see {@link WhereOperator.not}).
  */
 export function buildOperatorClauses(
   qi: BuilderCtx,
@@ -1809,19 +2223,31 @@ export function buildOperatorClauses(
   params: unknown[],
   refCtx?: ColumnRefContext,
 ): string[] {
+  const operand = operandContext(qi, column, refCtx);
+  assertOperatorOperands(op as Record<string, unknown>, operand);
+  return buildOperatorClausesChecked(qi, column, op, params, refCtx, operand);
+}
+
+/** {@link buildOperatorClauses} after validation; recursive for a `not` operator object. */
+function buildOperatorClausesChecked(
+  qi: BuilderCtx,
+  column: string,
+  op: WhereOperator,
+  params: unknown[],
+  refCtx: ColumnRefContext | undefined,
+  operand: OperandContext,
+): string[] {
   const clauses: string[] = [];
   // Temporal bind rewrite, identical to `collectOperatorParams`. Value-only, so
   // the emitted SQL (and therefore the template cache) is untouched.
   const cv = (v: unknown): unknown => (refCtx ? coerceWhereOperand(qi, refCtx.meta, refCtx.rawColumn, v) : v);
   const insensitive = op.mode === 'insensitive';
-
   if (op.equals !== undefined) {
     if (op.equals === null) {
       clauses.push(`${column} IS NULL`);
     } else if (isColumnRef(op.equals)) {
       clauses.push(`${column} = ${columnRefSql(qi, op.equals, refCtx, op.mode)}`);
     } else {
-      assertBindableEqualsOperand(op.equals, column);
       if (insensitive) assertInsensitiveOperand(op.equals, 'equals', column);
       params.push(cv(op.equals));
       clauses.push(insensitiveEquality(column, '=', qi.p(params.length), insensitive));
@@ -1860,10 +2286,21 @@ export function buildOperatorClauses(
     }
   }
   if (op.not !== undefined) {
+    const negatedDocument =
+      op.not === null || isColumnRef(op.not) ? NO_JSON_NEGATION : jsonNegatedDocument(qi, op.not, operand);
     if (op.not === null) {
       clauses.push(`${column} IS NOT NULL`);
     } else if (isColumnRef(op.not)) {
       clauses.push(`${column} != ${columnRefSql(qi, op.not, refCtx, op.mode)}`);
+    } else if (negatedDocument !== NO_JSON_NEGATION) {
+      const equality = jsonDocumentEquals(qi, column, column, negatedDocument, (v) => {
+        params.push(v);
+        return qi.p(params.length);
+      });
+      clauses.push(`NOT (${equality})`);
+    } else if (isNegatedOperatorObject(op.not, operand)) {
+      const inner = buildOperatorClausesChecked(qi, column, notOperand(op), params, refCtx, operand);
+      if (inner.length > 0) clauses.push(`NOT (${inner.join(' AND ')})`);
     } else {
       if (insensitive) assertInsensitiveOperand(op.not, 'not', column);
       params.push(cv(op.not));
@@ -1930,9 +2367,8 @@ export function requireFullTextSearch(qi: BuilderCtx): void {
 }
 
 /**
- * Gate the pathless JSON containment filters (`contains`, and the `equals`
- * spelling that compiles to the same expression) on
- * {@link Dialect.supportsJsonContains}.
+ * Gate the pathless JSON filters, `contains` (containment) and `equals`
+ * (whole-document equality), on {@link Dialect.supportsJsonContains}.
  *
  * The engine this exists for is SQLite, whose emulation compares a decoded
  * `json_each.value` against a param bound as JSON TEXT and therefore matched
@@ -1950,14 +2386,15 @@ export function requireFullTextSearch(qi: BuilderCtx): void {
  */
 export function requireJsonContains(qi: BuilderCtx, clause: 'contains' | 'equals'): void {
   if (qi.dialect.supportsJsonContains) return;
+  const what = clause === 'equals' ? 'way to compare two whole JSON documents' : "JSON containment (PostgreSQL's `@>`)";
   throw new UnsupportedFeatureError(
-    `JSON containment (\`${clause}\` without \`path\`)`,
+    clause === 'equals'
+      ? 'JSON document equality (`equals` without `path`)'
+      : 'JSON containment (`contains` without `path`)',
     qi.dialect.name,
-    `This engine has no equivalent of PostgreSQL's \`@>\`, and the emulation Turbine used for ` +
-      `\`${clause}\` matched no rows for any operand rather than failing, so it is refused instead. ` +
+    `This engine has no ${what}, so the filter is refused rather than emulated. ` +
       'Filter on the specific value instead: `{ path: [...], equals: ... }` compiles to a real JSON ' +
-      'extraction (`json_extract`) rather than an emulation. For structural containment, run the ' +
-      'query on PostgreSQL or MySQL.',
+      'extraction (`json_extract`). To compare or match whole documents, run the query on PostgreSQL or MySQL.',
   );
 }
 
@@ -2063,17 +2500,7 @@ export function normalizeRelationFilter(
   relDef: RelationDef,
   filterObj: Record<string, unknown>,
 ): Record<string, unknown> {
-  if (
-    (relDef.type === 'belongsTo' || relDef.type === 'hasOne') &&
-    !('some' in filterObj) &&
-    !('every' in filterObj) &&
-    !('none' in filterObj) &&
-    !('is' in filterObj) &&
-    !('isNot' in filterObj)
-  ) {
-    return { is: filterObj };
-  }
-  return filterObj;
+  return normalizeToOneRelationFilter(relDef, filterObj);
 }
 
 /**
@@ -2125,7 +2552,11 @@ export function getArrayElementType(_qi: BuilderCtx, pgType: string): string {
  */
 /**
  * One LIKE comparison, honoring `mode: 'insensitive'` through the dialect and
- * always carrying the `ESCAPE '\'` clause that pairs with {@link escapeLike}.
+ * always carrying the `ESCAPE` clause that pairs with {@link likeOperand}: the
+ * dialect's `likeEscapeCharacter`, else `\` (the character {@link escapeLike}
+ * escapes with). MySQL names `!`, because `'\'` is a syntax error there unless
+ * the session runs with `NO_BACKSLASH_ESCAPES`, which a caller-supplied pool
+ * need not.
  *
  * Shared by the scalar `contains` / `startsWith` / `endsWith` operators and by
  * the JSON substring operators, so the two can never drift into escaping their
@@ -2133,7 +2564,7 @@ export function getArrayElementType(_qi: BuilderCtx, pgType: string): string {
  */
 function buildLikeClause(qi: BuilderCtx, column: string, paramRef: string, insensitive: boolean): string {
   const base = insensitive ? qi.dialect.buildInsensitiveLike(column, paramRef) : `${column} LIKE ${paramRef}`;
-  return `${base} ESCAPE '\\'`;
+  return `${base} ESCAPE '${qi.dialect.likeEscapeCharacter ?? '\\'}'`;
 }
 
 /**
@@ -2192,11 +2623,12 @@ function insensitiveInClause(
  * on that engine.
  *
  * Folding the elements in SQL instead is not reachable from here for the other
- * dialects: each unpacks a bound IN list in a subquery of its OWN shape
- * (`json_each` / `JSON_TABLE` / `OPENJSON`) whose projection is written by the
- * dialect, not by this module, and the length-independence the SQL-template
- * cache depends on rules out the other portable form, one placeholder per
- * element. Restoring the operator on those engines means a dialect hook that
+ * dialects: each unpacks a bound IN list in its OWN way (`json_each` on SQLite,
+ * `OPENJSON` on SQL Server, one placeholder per element expanded by the MySQL
+ * pool shim after the statement leaves the builder), that shape is the
+ * dialect's and not this module's, and the length-independence the
+ * SQL-template cache depends on rules out emitting one placeholder per element
+ * here. Restoring the operator on those engines means a dialect hook that
  * projects the folded element, one correct implementation per engine. Until
  * then a typed refusal is the honest outcome. `equals`, `not` and the LIKE
  * operators are unaffected: they fold a single operand the engine can reach.
@@ -2205,7 +2637,7 @@ function insensitiveInClause(
  * every other gate in this module.
  */
 function requireInsensitiveList(qi: BuilderCtx, column: string, operator: 'in' | 'notIn'): void {
-  if (qi.dialect.name === 'postgresql') return;
+  if (qi.dialect.capabilities.insensitiveInList) return;
   throw new UnsupportedFeatureError(
     `mode: 'insensitive' on \`${operator}\` (${column})`,
     qi.dialect.name,
@@ -2234,61 +2666,6 @@ function assertInsensitiveOperand(value: unknown, operator: 'equals' | 'not' | '
       `Case folding applies to text; drop the mode or compare a string.`,
   );
 }
-
-/**
- * Refuse a {@link JsonFilter} carrying a key that is not a JSON operator, and
- * refuse a filter that selects a `path` but never compares it.
- *
- * Both shapes used to compile to NOTHING. `buildJsonFilterClauses` only ever
- * emitted a clause for a key it recognized, so `{ path: ['title'],
- * string_contains: 'x' }`, the Prisma spelling, and an easy typo besides -
- * produced an empty clause list, the predicate vanished, and the query
- * returned EVERY row. Inside an `AND` it silently dropped that conjunct, so a
- * tenant scope written this way widened to the whole table. The equivalent
- * typo on a scalar column has always thrown; this closes the inconsistency.
- *
- * Called from both the SQL-build path and the cache-hit param-collect path, so
- * a warmed SQL cache cannot skip the check.
- */
-export function assertJsonFilterKeys(filter: JsonFilter, column: string): void {
-  const obj = filter as Record<string, unknown>;
-  const present = Object.keys(obj).filter((k) => obj[k] !== undefined);
-
-  for (const key of present) {
-    if (JSON_FILTER_KEYS.has(key)) continue;
-    const suggestion = JSON_PRISMA_SPELLINGS[key];
-    throw new ValidationError(
-      `Unknown JSON filter operator "${key}" on ${column}.` +
-        (suggestion ? ` Did you mean \`${suggestion}\`?` : '') +
-        ` Supported operators: ${[...JSON_FILTER_KEYS].sort().join(', ')}.`,
-    );
-  }
-
-  // `mode` and `path` are modifiers, not comparisons: a filter made only of
-  // those compares nothing, which is exactly the silent no-op shape above.
-  if (present.length > 0 && present.every((k) => k === 'path' || k === 'mode')) {
-    throw new ValidationError(
-      `JSON filter on ${column} selects a \`path\` but has no comparison. ` +
-        `Add one of: ${[...JSON_FILTER_KEYS]
-          .filter((k) => k !== 'path' && k !== 'mode')
-          .sort()
-          .join(', ')}.`,
-    );
-  }
-}
-
-/**
- * The Prisma spelling of each JSON operator, so a migrator who writes the
- * name they already know gets told the turbine one instead of a bare list.
- */
-const JSON_PRISMA_SPELLINGS: Record<string, string> = {
-  string_contains: 'stringContains',
-  string_starts_with: 'stringStartsWith',
-  string_ends_with: 'stringEndsWith',
-  array_contains: 'contains',
-  startsWith: 'stringStartsWith',
-  endsWith: 'stringEndsWith',
-};
 
 /**
  * Validate and enumerate the substring comparisons on a JSON filter, in the
@@ -2352,6 +2729,166 @@ export function jsonRangeEntries(
 }
 
 /**
+ * The `{ path, equals }` operand after the checks every engine shares: a
+ * function, symbol or column reference is refused, a non-finite number is
+ * refused (JSON.stringify would turn it into `null`, which matches JSON null),
+ * and a Date becomes the ISO string JSON stores it as.
+ */
+function jsonPathEqualsValue(value: unknown, column: string): unknown {
+  if (typeof value === 'function' || typeof value === 'symbol' || isColumnRef(value)) {
+    throw new ValidationError(
+      `JSON path 'equals' on ${column} takes a JSON value (string, number, boolean, null, array or object), ` +
+        `received ${isColumnRef(value) ? 'a column reference' : `a ${typeof value}`}.`,
+    );
+  }
+  const scalar = value instanceof Date ? value.toISOString() : value;
+  if (typeof scalar === 'number' && !Number.isFinite(scalar)) {
+    throw new ValidationError(`JSON path 'equals' on ${column} takes a finite number: JSON has no form for ${scalar}.`);
+  }
+  return scalar;
+}
+
+/** The engine's typed `{ path, equals }` hook; the jsonb form lives here, so an engine using it never takes one. */
+function jsonPathEqualsHook(qi: BuilderCtx): Dialect['buildJsonPathEquals'] {
+  return qi.dialect.capabilities.jsonDocumentEquality === 'jsonb' ? undefined : qi.dialect.buildJsonPathEquals;
+}
+
+/** The hook input, identical on the build and collect passes but for `column`, `pathRef` and `bind`. */
+function jsonPathEqualsInput(
+  qi: BuilderCtx,
+  filter: JsonFilter,
+  label: string,
+  column: string,
+  pathRef: string,
+  bind: (value: unknown) => string,
+): JsonPathEqualsInput {
+  return {
+    column,
+    pathRef,
+    path: filter.path!,
+    value: jsonPathEqualsValue(filter.equals, label),
+    label,
+    bind,
+    encodePath: (path) => jsonPathParam(qi, path) as string,
+  };
+}
+
+/**
+ * A whole-document JSON `equals` (no `path`): the column equals the operand as
+ * a JSON value, on the build and collect passes alike (`bind` pushes; on the
+ * collect pass the returned SQL is discarded). PostgreSQL compares jsonb, which
+ * ignores object key order and whitespace; the cast makes a `json` column
+ * comparable too (it has no `=` operator). MySQL compares through its typed
+ * hook; an engine without one refuses (E017) through
+ * {@link requireJsonContains}.
+ */
+function jsonDocumentEquals(
+  qi: BuilderCtx,
+  column: string,
+  label: string,
+  value: unknown,
+  bind: (value: unknown) => string,
+): string {
+  const v = jsonPathEqualsValue(value, label);
+  if (qi.dialect.capabilities.jsonDocumentEquality === 'jsonb') {
+    return `${column}::jsonb = ${bind(typeof v === 'bigint' ? v.toString() : JSON.stringify(v))}::jsonb`;
+  }
+  const hook = qi.dialect.buildJsonPathEquals;
+  if (hook) {
+    return hook.call(qi.dialect, {
+      column,
+      pathRef: undefined,
+      path: [],
+      value: v,
+      label,
+      bind,
+      encodePath: (path) => jsonPathParam(qi, path) as string,
+    });
+  }
+  requireJsonContains(qi, 'equals');
+  throw new UnsupportedFeatureError(
+    `JSON \`equals\` on the whole document (${label})`,
+    qi.dialect.name,
+    'This engine has no exact comparison of JSON documents. Compare a value with `{ path: [...], equals }`.',
+  );
+}
+
+/** A bind callback for the collect passes: pushes the value, emits no SQL. */
+function collectOnly(params: unknown[]): (value: unknown) => string {
+  return (value) => {
+    params.push(value);
+    return '';
+  };
+}
+
+/**
+ * The operand of a `not` on a JSON column that negates a whole-document
+ * equality, or `NO_JSON_NEGATION` when the `not` keeps its bound-value form.
+ * `not: { equals: X }` is the negation of `equals: X` everywhere it compiles
+ * (an engine without an exact comparison refuses it rather than comparing a
+ * document `{"equals": X}`). A plain `not: X` means the same thing on the
+ * engines that compare whole documents exactly (PostgreSQL, MySQL). On SQLite
+ * and SQL Server a document (object or array) is refused the same way, since
+ * comparing it as text lets key order decide; a scalar keeps comparing as the
+ * bound value, as before.
+ */
+function jsonNegatedDocument(qi: BuilderCtx, not: unknown, operand: OperandContext): unknown {
+  if (operand.kind !== 'json' || not === null || not === undefined || isColumnRef(not)) return NO_JSON_NEGATION;
+  if (isWhereOperator(not)) {
+    const keys = Object.keys(not).filter((k) => (not as Record<string, unknown>)[k] !== undefined);
+    if (keys.length === 1 && keys[0] === 'equals') return (not as { equals: unknown }).equals;
+  }
+  if (comparesJsonDocuments(qi)) return not;
+  return isPlainRecord(not) || Array.isArray(not) ? not : NO_JSON_NEGATION;
+}
+const NO_JSON_NEGATION: unique symbol = Symbol('no JSON negation');
+
+/**
+ * The bound operand of `{ path, equals }`, shared by the build and collect
+ * paths so both bind (and refuse) identically.
+ *
+ * PostgreSQL compares JSON to JSON, so the operand is its JSON text: `5`,
+ * `"5"`, `null`, `[1,2]` and `{"a":1}` each match only that JSON value at the
+ * path (numbers compare numerically, so `5` also matches `5.0`). A Date is the
+ * ISO string JSON would store, and a bigint is a JSON number.
+ *
+ * MySQL and SQL Server compare typed through `Dialect.buildJsonPathEquals`
+ * and never reach this function. SQLite compares the value its path
+ * extraction returns, so only a value with a text form can match: a string,
+ * number, boolean, bigint or Date.
+ * There a number and a numeric string match the same rows, except on SQLite,
+ * whose extraction returns typed values: a number binds as a number there, and
+ * a boolean is refused because SQLite reads `true` and `1` alike. `null`,
+ * objects and arrays matched no row on those engines and are refused (E017).
+ */
+export function jsonPathEqualsOperand(qi: BuilderCtx, value: unknown, column: string): unknown {
+  const scalar = jsonPathEqualsValue(value, column);
+  if (qi.dialect.capabilities.jsonDocumentEquality === 'jsonb') {
+    return typeof scalar === 'bigint' ? scalar.toString() : JSON.stringify(scalar);
+  }
+  if (scalar === null || typeof scalar === 'object') {
+    throw new UnsupportedFeatureError(
+      `JSON path \`equals\` with ${scalar === null ? 'null' : Array.isArray(scalar) ? 'an array' : 'an object'} (${column})`,
+      qi.dialect.name,
+      'This engine compares the text extracted at the path, which has no form for null, arrays or objects, so ' +
+        'the comparison would match no row. Compare a scalar at a deeper path, or run the query on PostgreSQL.',
+    );
+  }
+  if (qi.dialect.capabilities.jsonExtractTyped) {
+    if (typeof scalar === 'number') return scalar;
+    if (typeof scalar === 'boolean') {
+      throw new UnsupportedFeatureError(
+        `JSON path \`equals\` with a boolean (${column})`,
+        qi.dialect.name,
+        'SQLite extracts JSON true and false as the integers 1 and 0, so a boolean comparison would also match ' +
+          'those numbers. Compare with 1 / 0 if the documents hold only booleans there.',
+      );
+    }
+  }
+  return String(scalar);
+}
+
+/**
  * Build SQL clauses for JSONB filter operators on a column.
  * Supports: path, equals, contains, hasKey, gt, gte, lt, lte.
  *
@@ -2370,29 +2907,53 @@ export function buildJsonFilterClauses(
 
   // Lazily bind the path once; reuse the same $N in every extraction clause.
   let pathParamIdx: number | null = null;
-  const pathExtract = (): string => {
+  const pathRef = (): string => {
     if (pathParamIdx === null) {
       // Only reached when a path-requiring clause validated filter.path.
       params.push(jsonPathParam(qi, filter.path!, filter.path));
       pathParamIdx = params.length;
     }
-    return qi.dialect.buildJsonPathExtract(column, qi.p(pathParamIdx));
+    return qi.p(pathParamIdx);
   };
+  const pathExtract = (): string => qi.dialect.buildJsonPathExtract(column, pathRef());
 
   if (filter.path !== undefined && filter.equals !== undefined) {
-    // Path access + equals: column #>> $N::text[] = $M
-    const extract = pathExtract();
-    params.push(String(filter.equals));
-    clauses.push(`${extract} = ${qi.p(params.length)}`);
+    // Path access + equals. PostgreSQL compares the JSON VALUE at the path,
+    // typed: `(column #> $N::text[])::jsonb = $M::jsonb`, so 5 and "5" differ,
+    // and null, arrays and objects compare as JSON. MySQL and SQL Server bring
+    // their own typed form (Dialect.buildJsonPathEquals); SQLite compares the
+    // extracted value (see jsonPathEqualsOperand).
+    const ref = pathRef();
+    const hook = jsonPathEqualsHook(qi);
+    if (hook) {
+      // The engine's typed comparison (MySQL, SQL Server).
+      clauses.push(
+        hook.call(
+          qi.dialect,
+          jsonPathEqualsInput(qi, filter, column, column, ref, (v) => {
+            params.push(v);
+            return qi.p(params.length);
+          }),
+        ),
+      );
+    } else {
+      const value = jsonPathEqualsOperand(qi, filter.equals, column);
+      params.push(value);
+      clauses.push(
+        qi.dialect.capabilities.jsonDocumentEquality === 'jsonb'
+          ? `(${column} #> ${ref}::text[])::jsonb = ${qi.p(params.length)}::jsonb`
+          : `${qi.dialect.buildJsonPathExtract(column, ref)} = ${qi.p(params.length)}`,
+      );
+    }
   } else if (filter.equals !== undefined) {
-    // Containment equality: column @> $N::jsonb. A pathless `equals` compiles
-    // to the SAME containment expression `contains` does, so it inherits the
-    // same engine limitation and is refused under its own clause name (the two
-    // spellings are far enough apart that naming the wrong one would send the
-    // reader to the wrong line).
-    requireJsonContains(qi, 'equals');
-    params.push(JSON.stringify(filter.equals));
-    clauses.push(qi.dialect.buildJsonContains(column, qi.p(params.length)));
+    // Whole-document equality, NOT containment (`@>` matched every document
+    // holding the operand's keys).
+    clauses.push(
+      jsonDocumentEquals(qi, column, column, filter.equals, (v) => {
+        params.push(v);
+        return qi.p(params.length);
+      }),
+    );
   }
 
   if (filter.contains !== undefined) {
@@ -2439,12 +3000,19 @@ export function buildJsonFilterClauses(
  * params) and fail at runtime with the engine's bad-JSON-path error. The
  * encoded path stays a bound parameter, never spliced into SQL text, so
  * the build/collect param mirrors stay in lockstep and injection-safe.
+ *
+ * A key segment is written as a JSON string literal (`JSON.stringify`), the
+ * form the engines' JSONPath grammars read a quoted key in: a backslash, a
+ * quote and a control character are each escaped. Escaping only the quote
+ * read a key holding a backslash as an escape sequence, so the key `a\b` was
+ * looked up as a different key and matched nothing, a key ending in a
+ * backslash was a bad path, and MySQL refused a key holding a newline.
  */
 export function jsonPathParam(qi: BuilderCtx, path: readonly (string | number)[], nativeForm?: unknown): unknown {
   if (qi.dialect.jsonPathSupport === 'native') return nativeForm ?? path.map(String);
   return `$${path
     .map((seg) =>
-      typeof seg === 'number' || /^\d+$/.test(String(seg)) ? `[${seg}]` : `."${String(seg).replace(/"/g, '\\"')}"`,
+      typeof seg === 'number' || /^\d+$/.test(String(seg)) ? `[${seg}]` : `.${JSON.stringify(String(seg))}`,
     )
     .join('')}`;
 }
@@ -2457,7 +3025,7 @@ export function jsonPathParam(qi: BuilderCtx, path: readonly (string | number)[]
  * SQL Server have no `::` operator) as a float cast.
  */
 export function castJsonNumeric(qi: BuilderCtx, extract: string): string {
-  if (qi.dialect.name === 'postgresql') return `(${extract})::numeric`;
+  if (qi.dialect.capabilities.jsonExactNumericCast) return `(${extract})::numeric`;
   return qi.dialect.castAggregate ? qi.dialect.castAggregate(`(${extract})`, 'float') : `(${extract})::numeric`;
 }
 
@@ -2473,6 +3041,7 @@ export function buildArrayFilterClauses(
   pgType: string,
 ): string[] {
   requireArrayColumns(qi);
+  assertArrayFilter(filter, column);
   const clauses: string[] = [];
   const elementType = getArrayElementType(qi, pgType);
 

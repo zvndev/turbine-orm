@@ -79,9 +79,12 @@ describe('H4, codegen for views', () => {
   it('excludes the findUnique-family from a no-PK view accessor', () => {
     const index = generateIndex(SCHEMA);
     // The view accessor omits findUnique/findUniqueOrThrow.
-    assert.match(index, /readonly activeUsers: Omit<QueryInterface<ActiveUser>, 'findUnique' \| 'findUniqueOrThrow'>;/);
+    assert.match(
+      index,
+      /readonly activeUsers: Omit<QueryInterface<ActiveUser, \{\}, ActiveUserInputs>, 'findUnique' \| 'findUniqueOrThrow'>;/,
+    );
     // The base table accessor is a plain QueryInterface.
-    assert.match(index, /readonly users: QueryInterface<User>;/);
+    assert.match(index, /readonly users: QueryInterface<User, \{\}, UserInputs>;/);
   });
 });
 

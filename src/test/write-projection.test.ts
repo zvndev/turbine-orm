@@ -93,13 +93,29 @@ describe('create: select / omit narrow the RETURNING list itself', () => {
   });
 });
 
-describe('the returned row matches the projection, PII included only when selected', () => {
+describe('the returned row matches the projection, and a write never returns PII', () => {
   const row = { id: 7, kind: 'click', payload: { a: 1 }, owner_email: 'o@x', user_id: 3 };
 
-  it('an explicit select of a PII column is the opt-in, exactly as on a read', () => {
-    const d = events().buildCreate({ data: { kind: 'x' }, select: { id: true, ownerEmail: true } });
-    assert.match(d.sql, /RETURNING "id", "owner_email"$/);
-    assert.deepEqual(d.transform({ rows: [{ id: 7, owner_email: 'o@x' }] } as never), { id: 7, ownerEmail: 'o@x' });
+  it('a select naming a PII column is refused, exactly as on a read without includePii', () => {
+    // A write cannot carry `includePii: UNSAFE`, and `select` is request data, so
+    // naming the column is not an opt-in. The refusal fires before any SQL exists.
+    for (const build of [
+      () => events().buildCreate({ data: { kind: 'x' }, select: { id: true, ownerEmail: true } }),
+      () => events().buildUpdate({ where: { id: 1 }, data: { kind: 'x' }, select: { ownerEmail: true } }),
+      () => events().buildDelete({ where: { id: 1 }, select: { ownerEmail: true } }),
+    ]) {
+      assert.throws(
+        build,
+        (err: unknown) =>
+          (err as { code?: string }).code === 'TURBINE_E003' &&
+          /names "ownerEmail", which is tagged PII/.test((err as Error).message),
+      );
+    }
+  });
+
+  it('a select of non-PII columns still narrows RETURNING', () => {
+    const d = events().buildCreate({ data: { kind: 'x' }, select: { id: true, kind: true } });
+    assert.match(d.sql, /RETURNING "id", "kind"$/);
   });
 
   it('without a select the PII field is still stripped from a row that carries it', () => {

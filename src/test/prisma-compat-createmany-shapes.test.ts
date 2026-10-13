@@ -202,8 +202,7 @@ describe('prisma-compat createMany, live Postgres', () => {
      slug  text UNIQUE
    )`;
 
-  const raw = async (client: TurbineClient, sql: string) =>
-    client.raw([sql] as unknown as TemplateStringsArray) as Promise<unknown>;
+  const raw = async (client: TurbineClient, sql: string) => client.rawUnsafe(sql) as Promise<unknown>;
 
   before(async () => {
     if (!url) return;

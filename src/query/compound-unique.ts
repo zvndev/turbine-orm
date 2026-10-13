@@ -41,7 +41,7 @@
 
 import { ValidationError } from '../errors.js';
 import type { TableMetadata } from '../schema.js';
-import { isArrayFilter, isJsonFilter, isVectorFilter, isWhereOperator } from './filters.js';
+import { isArrayFilter, isJsonFilter, isPlainRecord, isVectorFilter, isWhereOperator } from './filters.js';
 import { isInternalCombinator, ownLookup, resolveColumnName, resolveRelationDef } from './utils.js';
 
 const syntheticKeyCache = new WeakMap<TableMetadata, Map<string, string[]>>();
@@ -508,9 +508,74 @@ export function upsertWhereMatchesCreate(
   return keys > 0;
 }
 
+/**
+ * A unique key, other than the ones in `pinned`, that a new row could collide
+ * on, or `undefined` when there is none.
+ *
+ * The question MySQL's `ON DUPLICATE KEY UPDATE` raises: it has no conflict
+ * target and updates the row whichever unique key collides first, so a row
+ * that also collides on another key can update a row the caller did not name.
+ * A key collides only when every member holds a value, so a key is ruled out
+ * when a member is NULL (written as null, or absent with no default), when
+ * none of its members is set (defaults are server-generated values in
+ * practice), or when it contains a pinned key (it then collides only where the
+ * pinned key does, on the same row). `undefined` is the safe answer only for
+ * shapes that can never collide; anything uncertain returns the key.
+ */
+export function otherCollidingUniqueKey(
+  meta: TableMetadata,
+  pinned: readonly (readonly string[])[],
+  stateOf: (column: string) => 'value' | 'null' | 'absent',
+): string[] | undefined {
+  for (const key of uniqueKeyNames(meta)) {
+    if (pinned.some((p) => p.every((c) => key.includes(c)))) continue;
+    let sets = false;
+    let nullMember = false;
+    for (const column of key) {
+      const state = stateOf(column);
+      if (state === 'value') sets = true;
+      else if (state === 'null' || defaultsToNull(meta, column)) nullMember = true;
+    }
+    if (sets && !nullMember) return key;
+  }
+  return undefined;
+}
+
+/** A nullable column with no default: absent from an INSERT, it is NULL. */
+function defaultsToNull(meta: TableMetadata, column: string): boolean {
+  const col = meta.columns.find((c) => c.name === column);
+  return col?.nullable === true && !col.hasDefault;
+}
+
+/**
+ * {@link otherCollidingUniqueKey} for a single-row upsert: the keys `where`
+ * pins, against the values `create` inserts. Read only after
+ * {@link upsertWhereMatchesCreate} holds, so every `where` key is a column.
+ */
+export function upsertCreateCollidingKey(
+  meta: TableMetadata,
+  where: Record<string, unknown>,
+  create: Record<string, unknown>,
+): string[] | undefined {
+  const whereColumns = new Set<string>();
+  for (const [key, value] of Object.entries(expandCompoundUniqueWhere(meta, where))) {
+    if (value === undefined) continue;
+    const column = resolveColumnName(meta, key);
+    if (column !== undefined) whereColumns.add(column);
+  }
+  const pinned = uniqueKeyNames(meta).filter((key) => key.every((c) => whereColumns.has(c)));
+  const createState = new Map<string, 'value' | 'null'>();
+  for (const [key, value] of Object.entries(create)) {
+    if (value === undefined) continue;
+    const column = resolveColumnName(meta, key);
+    if (column !== undefined) createState.set(column, value === null ? 'null' : 'value');
+  }
+  return otherCollidingUniqueKey(meta, pinned, (c) => createState.get(c) ?? 'absent');
+}
+
 /** `{ equals: v }` and nothing else (a `mode` beside it changes the match). */
 function isBareEquals(value: unknown): boolean {
-  return isPlainObject(value) && Object.keys(value as object).length === 1 && 'equals' in (value as object);
+  return isPlainRecord(value) && Object.keys(value).length === 1 && 'equals' in value;
 }
 
 /** Equal non-null key values; two Dates compare by instant, other objects by identity. */
@@ -518,22 +583,41 @@ function sameKeyValue(a: unknown, b: unknown): boolean {
   return a != null && (a instanceof Date && b instanceof Date ? a.getTime() === b.getTime() : a === b);
 }
 
-/** A bare value, or an operator object whose `equals` is a value. */
+/**
+ * A bare scalar, or `{ equals: <scalar> }` (optionally with `mode: 'default'`).
+ *
+ * Nothing else pins a column, and the refusals are the point. A column
+ * reference (`{ equals: col('id') }`, or the plain `{ col }` a request body
+ * carries) compiles to `"id" = "id"`, which every row satisfies, so a
+ * `delete({ where: { id: body.id } })` would delete the table. A plain object
+ * is a relation filter or a sub-where, `mode: 'insensitive'` matches every
+ * casing of the value, and a JSON / array / vector filter narrows rather than
+ * identifies.
+ */
 function isPinnedToOneValue(value: unknown): boolean {
-  if (value === undefined || value === null) return false;
-  if (isWhereOperator(value)) {
-    const eq = (value as { equals?: unknown }).equals;
-    return eq !== undefined && eq !== null;
-  }
-  // A JSON / array / vector filter narrows, it does not identify.
-  if (isJsonFilter(value) || isArrayFilter(value) || isVectorFilter(value)) return false;
-  // Anything else that is a plain object is a relation filter or a sub-where,
-  // neither of which pins a column. Dates, Buffers and primitives are values.
-  return !isPlainObject(value);
+  if (isIdentityScalar(value)) return true;
+  if (!isPlainRecord(value)) return false;
+  const keys = Object.keys(value).filter((k) => value[k] !== undefined);
+  const op = value as { equals?: unknown; mode?: unknown };
+  return (
+    keys.every((k) => k === 'equals' || (k === 'mode' && op.mode === 'default')) &&
+    keys.includes('equals') &&
+    isIdentityScalar(op.equals)
+  );
 }
 
-function isPlainObject(value: unknown): boolean {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
+/** A non-null scalar a unique index compares by value. */
+function isIdentityScalar(value: unknown): boolean {
+  switch (typeof value) {
+    case 'string':
+    case 'bigint':
+    case 'boolean':
+      return true;
+    case 'number':
+      return !Number.isNaN(value);
+    case 'object':
+      return value instanceof Date || ArrayBuffer.isView(value);
+    default:
+      return false;
+  }
 }

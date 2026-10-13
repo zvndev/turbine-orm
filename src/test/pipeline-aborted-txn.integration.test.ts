@@ -69,9 +69,7 @@ describe('pipeline: a failing transactional batch leaves a usable connection', (
     Number((await observer.query('SELECT count(*)::int AS n FROM qa78_pipe')).rows[0].n);
 
   const backendPid = async (): Promise<number> => {
-    const rows = await db.raw<{ pid: number }>([
-      'SELECT pg_backend_pid()::int AS pid',
-    ] as unknown as TemplateStringsArray);
+    const rows = await db.raw<{ pid: number }>`SELECT pg_backend_pid()::int AS pid`;
     return rows[0]!.pid;
   };
 

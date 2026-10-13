@@ -43,6 +43,11 @@ function schema(): SchemaMetadata {
   };
 }
 
+/** Escape every regular-expression metacharacter, so a placeholder is matched literally. */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /**
  * Every placeholder the dialect can emit, indexed. Built from the dialect's own
  * `paramPlaceholder`, so `$1` / `:p1` / `@p1` are all covered without
@@ -53,7 +58,7 @@ function placeholderIndexes(dialect: Dialect, sql: string, upTo: number): Set<nu
   for (let i = 1; i <= upTo; i++) {
     const ph = dialect.paramPlaceholder(i);
     // A word boundary stops `:p1` from matching inside `:p10`.
-    if (new RegExp(`${ph.replace(/[$@]/g, '\\$&')}(?![0-9])`).test(sql)) found.add(i);
+    if (new RegExp(`${escapeRegExp(ph)}(?![0-9])`).test(sql)) found.add(i);
   }
   return found;
 }
@@ -156,10 +161,21 @@ describe('upsert conflict-UPDATE predicate: SQL and params agree', () => {
   it('a filter that compiles to nothing does not refuse', () => {
     const q = makeQuery('users', schema(), {
       dialect: mysqlDialect,
-      globalFilters: { users: () => ({ tenantId: undefined }) },
+      globalFilters: { users: () => ({}) },
     });
     assert.doesNotThrow(() =>
       q.buildUpsert({ where: { id: 1 }, create: { id: 1, name: 'x' } as never, update: { name: 'y' } as never }),
+    );
+  });
+
+  it('a filter whose value is undefined is refused, never treated as absent', () => {
+    const q = makeQuery('users', schema(), {
+      dialect: mysqlDialect,
+      globalFilters: { users: () => ({ tenantId: undefined }) },
+    });
+    assert.throws(
+      () => q.buildUpsert({ where: { id: 1 }, create: { id: 1, name: 'x' } as never, update: { name: 'y' } as never }),
+      /Global filter for "users" has an undefined value at "tenantId"/,
     );
   });
 

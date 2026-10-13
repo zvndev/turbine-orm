@@ -226,7 +226,9 @@ const OBSERVATION: Record<string, Observation> = {
   offset: { how: 'compiled', value: 3 },
   take: { how: 'compiled', value: 7 },
   skip: { how: 'compiled', value: 3 },
-  cursor: { how: 'compiled', value: { id: 5 }, needs: { orderBy: { id: 'asc' } } },
+  // A cursor carries a value for every column of its page order, which on the
+  // composite-key table includes the `tenantId` tiebreaker.
+  cursor: { how: 'compiled', value: { id: 5, tenantId: 't1' }, needs: { orderBy: { id: 'asc' } } },
   distinct: { how: 'compiled', value: ['name'] },
   distinctOn: { how: 'compiled', value: { columns: ['name'], orderBy: { id: 'desc' } } },
 
@@ -274,6 +276,21 @@ const OBSERVATION: Record<string, Observation> = {
   // --- write-specific ------------------------------------------------------
   skipDuplicates: { how: 'compiled', value: true },
   optimisticLock: { how: 'compiled', value: { field: 'version', expected: 1 } },
+  // createMany honors global filters only on the conflict-UPDATE, so the
+  // option is observable once there is one. Every row must carry the target.
+  'createMany.skipGlobalFilters': {
+    how: 'compiled',
+    value: UNSAFE,
+    needs: {
+      data: [{ name: 'a', email: 'a@example.test' }],
+      onConflict: { target: ['email'], update: ['name'] },
+    },
+  },
+
+  // --- row locks -------------------------------------------------------------
+  // The build path accepts a lock (the SQL is right wherever it runs); only the
+  // execute path insists on a transaction.
+  lock: { how: 'compiled', value: 'update' },
 
   // --- observable only at execution ----------------------------------------
   timeout: {
@@ -389,11 +406,14 @@ describe('the option matrix itself', () => {
     const many = new Set(Object.keys(FIND_MANY_OPTIONS));
     const missing = [...many].filter((k) => !stream.has(k));
     const extra = [...stream].filter((k) => !many.has(k));
-    assert.deepEqual(missing, [], 'the streaming reads dropped a findMany option');
-    // `batchSize` is the one legitimate addition: findManyStreamBatches yields
-    // T[] and needs to be told how big a batch is. Pinned by name so a SECOND
-    // divergence cannot hide behind it.
-    assert.deepEqual(extra, ['batchSize'], 'the streaming table grew an unexpected option');
+    // `lock` is the one deliberate omission: a cursor cannot hold its rows
+    // locked across fetches, so streams refuse it. Pinned by name.
+    assert.deepEqual(missing, ['lock'], 'the streaming reads dropped a findMany option');
+    // The two legitimate additions, pinned by name so a THIRD divergence cannot
+    // hide behind them: `batchSize` (findManyStreamBatches yields T[] and needs
+    // to be told how big a batch is) and `idleTimeoutMs` (how long a cursor may
+    // wait for its consumer, which a one-shot read never does).
+    assert.deepEqual(extra, ['batchSize', 'idleTimeoutMs'], 'the streaming table grew an unexpected option');
   });
 
   it('the matrix is not vacuous', () => {

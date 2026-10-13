@@ -1,10 +1,11 @@
 /**
  * turbine-orm: column-to-column where comparison (regression)
  *
- * `{ currentVersionId: { equals: { col: 'publishedVersionId' } } }` compiles
- * to `"current_version_id" = "published_version_id"`: a ColumnRef marker
+ * `{ currentVersionId: { equals: col('publishedVersionId') } }` compiles
+ * to `"current_version_id" = "published_version_id"`: a branded ColumnRef
  * accepted by equals/not/gt/gte/lt/lte, resolved through the table's
- * columnMap and quoted, with NO param bound.
+ * columnMap and quoted, with NO param bound. The unbranded `{ col }` object
+ * is refused (E003): JSON can produce it, so it must never name a column.
  *
  * Cache safety: the referenced column lives in the SQL TEXT, so it is part of
  * the where fingerprint (distinct refs never share a cache entry) and the
@@ -14,6 +15,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { ValidationError } from '../errors.js';
+import { col } from '../query/column-ref.js';
 import type { SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
 
@@ -66,7 +68,7 @@ describe('column-ref where: operators', () => {
     it(`${op} → "current_version_id" ${sqlOp} "published_version_id", no param bound`, () => {
       const q = makeQuery('documents', schema());
       const { sql, params } = q.buildFindMany({
-        where: { currentVersionId: { [op]: { col: 'publishedVersionId' } } },
+        where: { currentVersionId: { [op]: col('publishedVersionId') } },
       } as never);
       assert.ok(sql.includes(`"current_version_id" ${sqlOp} "published_version_id"`), sql);
       assert.deepEqual(params, []);
@@ -78,7 +80,7 @@ describe('column-ref where: operators', () => {
     const { sql, params } = q.buildFindMany({
       where: {
         publishedVersionId: { not: null },
-        currentVersionId: { not: { col: 'publishedVersionId' } },
+        currentVersionId: { not: col('publishedVersionId') },
       },
     } as never);
     assert.ok(sql.includes('"published_version_id" IS NOT NULL'), sql);
@@ -89,7 +91,7 @@ describe('column-ref where: operators', () => {
   it('resolves a camelCase-named DB column reference', () => {
     const q = makeQuery('documents', schema());
     const { sql, params } = q.buildFindMany({
-      where: { currentVersionId: { equals: { col: 'draftVersionId' } } },
+      where: { currentVersionId: { equals: col('draftVersionId') } },
     } as never);
     assert.ok(sql.includes('"current_version_id" = "draftVersionId"'), sql);
     assert.deepEqual(params, []);
@@ -99,7 +101,7 @@ describe('column-ref where: operators', () => {
     const q = makeQuery('documents', schema());
     const { sql, params } = q.buildFindMany({
       where: {
-        currentVersionId: { equals: { col: 'publishedVersionId' } },
+        currentVersionId: { equals: col('publishedVersionId') },
         title: { contains: 'draft' },
       },
     } as never);
@@ -113,7 +115,7 @@ describe('column-ref where: validation', () => {
   it('unknown referenced field throws E003 with the known-fields list', () => {
     const q = makeQuery('documents', schema());
     assert.throws(
-      () => q.buildFindMany({ where: { currentVersionId: { equals: { col: 'bogusField' } } } } as never),
+      () => q.buildFindMany({ where: { currentVersionId: { equals: col('bogusField') } } } as never),
       (err: unknown) => {
         assert.ok(err instanceof ValidationError);
         assert.match(err.message, /Unknown field "bogusField" referenced by \{ col \} in where on table "documents"/);
@@ -128,7 +130,7 @@ describe('column-ref where: validation', () => {
     assert.throws(
       () =>
         q.buildFindMany({
-          where: { currentVersionId: { equals: { col: 'publishedVersionId' }, mode: 'insensitive' } },
+          where: { currentVersionId: { equals: col('publishedVersionId'), mode: 'insensitive' } },
         } as never),
       (err: unknown) => {
         assert.ok(err instanceof ValidationError);
@@ -138,20 +140,20 @@ describe('column-ref where: validation', () => {
     );
   });
 
-  it('a bare { col } outside an operator keeps the unknown-operator error', () => {
+  it('a bare { col } outside an operator is refused and names col()', () => {
     const q = makeQuery('documents', schema());
     assert.throws(
       () => q.buildFindMany({ where: { currentVersionId: { col: 'publishedVersionId' } } } as never),
-      /Unknown operator "col"/,
+      /is not a column reference\. Build one with col\("publishedVersionId"\)/,
     );
   });
 
   it('non-string col and extra keys are NOT treated as a column reference', () => {
     const q = makeQuery('documents', schema());
-    // { col: 7 } → plain object equality value → strict-validation throw (not a silent ref)
+    // { col: 7 } → a plain object at a value position → refused, never a silent ref
     assert.throws(
       () => q.buildFindMany({ where: { currentVersionId: { equals: { col: 7 } } } } as never),
-      /objects are only valid 'equals' values on JSON/,
+      /Invalid operand for 'equals'.*accepted only on json\/jsonb columns/,
     );
   });
 });
@@ -161,8 +163,8 @@ describe('column-ref where: combinators and relation scopes', () => {
     const q = makeQuery('documents', schema());
     const { sql, params } = q.buildFindMany({
       where: {
-        OR: [{ currentVersionId: { equals: { col: 'publishedVersionId' } } }, { title: 'x' }],
-        AND: [{ currentVersionId: { gt: { col: 'draftVersionId' } } }],
+        OR: [{ currentVersionId: { equals: col('publishedVersionId') } }, { title: 'x' }],
+        AND: [{ currentVersionId: { gt: col('draftVersionId') } }],
       },
     } as never);
     assert.ok(sql.includes('"current_version_id" = "published_version_id"'), sql);
@@ -173,7 +175,7 @@ describe('column-ref where: combinators and relation scopes', () => {
   it('works inside a relation some: table-qualified against the target', () => {
     const q = makeQuery('documents', schema());
     const { sql, params } = q.buildFindMany({
-      where: { versions: { some: { parentId: { not: { col: 'supersedesId' } } } } },
+      where: { versions: { some: { parentId: { not: col('supersedesId') } } } },
     } as never);
     assert.ok(sql.includes('"versions"."parent_id" != "versions"."supersedes_id"'), sql);
     assert.deepEqual(params, []);
@@ -182,7 +184,7 @@ describe('column-ref where: combinators and relation scopes', () => {
   it('works inside with.where: alias-qualified against the relation alias', () => {
     const q = makeQuery('documents', schema());
     const { sql, params } = q.buildFindMany({
-      with: { versions: { where: { parentId: { equals: { col: 'supersedesId' } } } } },
+      with: { versions: { where: { parentId: { equals: col('supersedesId') } } } },
     } as never);
     assert.ok(sql.includes('t0."parent_id" = t0."supersedes_id"'), sql);
     assert.deepEqual(params, []);
@@ -193,8 +195,8 @@ describe('column-ref where: cache safety', () => {
   it('double-run identity: cache hit collects identical SQL and params', () => {
     const q = makeQuery('documents', schema());
     const args = {
-      where: { currentVersionId: { not: { col: 'publishedVersionId' } }, title: { contains: 'a' } },
-      with: { versions: { where: { parentId: { equals: { col: 'supersedesId' } } } } },
+      where: { currentVersionId: { not: col('publishedVersionId') }, title: { contains: 'a' } },
+      with: { versions: { where: { parentId: { equals: col('supersedesId') } } } },
     } as never;
     const first = q.buildFindMany(args);
     const second = q.buildFindMany(args);
@@ -205,8 +207,8 @@ describe('column-ref where: cache safety', () => {
 
   it('distinct referenced columns produce distinct SQL (never share a cache entry)', () => {
     const q = makeQuery('documents', schema());
-    const a = q.buildFindMany({ where: { currentVersionId: { equals: { col: 'publishedVersionId' } } } } as never);
-    const b = q.buildFindMany({ where: { currentVersionId: { equals: { col: 'draftVersionId' } } } } as never);
+    const a = q.buildFindMany({ where: { currentVersionId: { equals: col('publishedVersionId') } } } as never);
+    const b = q.buildFindMany({ where: { currentVersionId: { equals: col('draftVersionId') } } } as never);
     assert.notEqual(a.sql, b.sql);
     assert.ok(a.sql.includes('"published_version_id"'), a.sql);
     assert.ok(b.sql.includes('"draftVersionId"'), b.sql);
@@ -214,8 +216,8 @@ describe('column-ref where: cache safety', () => {
 
   it('fingerprintWhere distinguishes the referenced field and ref-vs-value shape', () => {
     const q = makeQuery('documents', schema());
-    const fpRefA = q.fingerprintWhere({ currentVersionId: { equals: { col: 'publishedVersionId' } } });
-    const fpRefB = q.fingerprintWhere({ currentVersionId: { equals: { col: 'draftVersionId' } } });
+    const fpRefA = q.fingerprintWhere({ currentVersionId: { equals: col('publishedVersionId') } });
+    const fpRefB = q.fingerprintWhere({ currentVersionId: { equals: col('draftVersionId') } });
     const fpValue = q.fingerprintWhere({ currentVersionId: { equals: 42 } });
     assert.notEqual(fpRefA, fpRefB);
     assert.notEqual(fpRefA, fpValue);

@@ -114,10 +114,11 @@ describe('equals operator (plain equality)', () => {
     assert.deepEqual(explicit.params, bare.params);
   });
 
-  it('still routes equals on a jsonb column to the JSONB containment filter', () => {
+  it('routes equals on a jsonb column to whole-document JSON equality', () => {
     const q = makeQuery('users', buildSchema());
     const d = q.buildFindMany({ where: { settings: { equals: { theme: 'dark' } } } as never });
-    assert.match(d.sql, /"settings" @> \$1::jsonb/);
+    assert.match(d.sql, /"settings"::jsonb = \$1::jsonb/);
+    assert.doesNotMatch(d.sql, /@>/);
     assert.deepEqual(d.params, [JSON.stringify({ theme: 'dark' })]);
     assertParamsAligned(d.sql, d.params);
   });
@@ -125,8 +126,8 @@ describe('equals operator (plain equality)', () => {
   it('still routes path + equals on a jsonb column to path extraction', () => {
     const q = makeQuery('users', buildSchema());
     const d = q.buildFindMany({ where: { settings: { path: ['theme'], equals: 'dark' } } as never });
-    assert.match(d.sql, /#>>/);
-    assert.deepEqual(d.params, [['theme'], 'dark']);
+    assert.match(d.sql, /\("settings" #> \$1::text\[\]\)::jsonb = \$2::jsonb/);
+    assert.deepEqual(d.params, [['theme'], '"dark"']);
     assertParamsAligned(d.sql, d.params);
   });
 

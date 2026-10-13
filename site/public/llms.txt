@@ -2,7 +2,7 @@
 
 > Turbine is a Postgres-first TypeScript ORM with a Prisma-like API (findMany, findUnique, with, where), written from scratch with exactly one runtime dependency (pg): no query engine, no WASM. Nested relations resolve in one SQL statement. It ships an 11-tool read-only MCP server for coding agents, offline missing-index advice (turbine doctor), a read-only-by-default Studio, PII enforced in the emitted SQL, and consent-gated destructive migrations. Optional SQLite, MySQL, SQL Server, and PowDB engines expose the same typed API behind subpath exports. MIT.
 
-Turbine is designed to be legible to AI coding agents: an installable query-writing skill (npx turbine skill, whose every factual claim is executed against a live database on each release), a read-only MCP server (npx turbine mcp, eleven tools including a relation graph and a join-path finder that returns the `with` clause to write), a deterministic codegen flow (introspect the database, generate a typed client, query through it), fully typed query arguments that make invalid queries a compile error, and a stable typed error system (codes TURBINE_E001 through E018) that agents can branch on instead of parsing messages. Point an agent at this file and the docs below to teach it how to use Turbine correctly.
+Turbine is designed to be legible to AI coding agents: an installable query-writing skill (npx turbine skill, whose every factual claim is executed against a live database on each release), a read-only MCP server (npx turbine mcp, eleven tools including a relation graph and a join-path finder that returns the `with` clause to write), a deterministic codegen flow (introspect the database, generate a typed client, query through it), fully typed query arguments that make invalid queries a compile error, and a stable typed error system (codes TURBINE_E001 through E020) that agents can branch on instead of parsing messages. Point an agent at this file and the docs below to teach it how to use Turbine correctly.
 
 Key facts:
 - Postgres-first. PostgreSQL 14+ is the supported floor, which is what CI tests (14, 15, 16, 17). Node.js 20+ (the SQLite engine needs Node 22.5+).
@@ -47,7 +47,8 @@ Common mistakes to avoid when generating Turbine code:
 - [Views & Generated Columns](https://turbineorm.dev/views): Read-only views and generated columns in the generated client.
 - [Zod Schemas](https://turbineorm.dev/zod): Generating Zod validators from the introspected schema.
 - [Read Replicas](https://turbineorm.dev/read-replicas): Round-robin read routing and the $primary() escape hatch.
-- [Typed Errors](https://turbineorm.dev/errors): Every error code (E001-E018) and the retry patterns.
+- [Typed Errors](https://turbineorm.dev/errors): Every error code (E001-E020) and the retry patterns.
+- [Upgrading to 0.90](https://turbineorm.dev/upgrading-to-0-90): The breaking changes in 0.90, results that change without an error first, with how to find affected call sites and before/after code for most.
 - [CLI](https://turbineorm.dev/cli): init, generate/pull, push, migrate, seed, doctor, studio, mcp, observe.
 - [CLI Config Module](https://turbineorm.dev/cli-module): The importable turbine-orm/cli subpath: TurbineCliConfig, config discovery and loading, resolveConfig precedence, seed-file resolution.
 - [Database Engines](https://turbineorm.dev/engines): SQLite, MySQL, SQL Server, and PowDB behind the same typed API, and which features stay Postgres-only.

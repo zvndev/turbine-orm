@@ -27,6 +27,8 @@ export const TurbineErrorCode = {
   EXCLUSION_VIOLATION: 'TURBINE_E016',
   UNSUPPORTED_FEATURE: 'TURBINE_E017',
   READ_ONLY: 'TURBINE_E018',
+  TRANSACTION_ROLLED_BACK: 'TURBINE_E019',
+  INVARIANT_VIOLATION: 'TURBINE_E020',
 } as const;
 
 export type TurbineErrorCode = (typeof TurbineErrorCode)[keyof typeof TurbineErrorCode];
@@ -634,12 +636,15 @@ function renderWhereForMessage(where: unknown, mode: ErrorMessageMode): string {
  *   `[TURBINE_E001] findUniqueOrThrow on "users" found no record matching where: {"id":1}`
  *
  * The full `where` object, `table`, and `operation` are always available as
- * structured properties on the error instance regardless of mode.
+ * structured properties on the error instance regardless of mode. `where`
+ * carries the caller's raw values, so under 'safe' it is NON-ENUMERABLE:
+ * `err.where` reads it, while `JSON.stringify`, `util.inspect` and error
+ * serializers that copy own enumerable fields leave it out.
  */
 export class NotFoundError extends TurbineError {
   static override readonly CODE = TurbineErrorCode.NOT_FOUND;
   readonly table?: string;
-  readonly where?: unknown;
+  declare readonly where?: unknown;
   readonly operation?: string;
 
   constructor(
@@ -678,15 +683,35 @@ export class NotFoundError extends TurbineError {
     super(TurbineErrorCode.NOT_FOUND, message, { cause });
     this.name = 'NotFoundError';
     this.table = table;
-    this.where = where;
+    Object.defineProperty(this, 'where', {
+      value: where,
+      enumerable: currentErrorMessageMode() === 'verbose',
+      writable: false,
+      configurable: true,
+    });
     this.operation = operation;
   }
 }
+
+/**
+ * What a {@link TimeoutError} says about the statement it interrupted.
+ *
+ *   - `'not-executed'`: the statement made no change. It was never sent (the
+ *     deadline passed while waiting for a connection), or the server confirmed
+ *     it was cancelled. Safe to retry.
+ *   - `'unknown'`: the statement may still have completed. A write retried on
+ *     this outcome can be applied twice; check the database first.
+ *
+ * A read changes nothing whatever this says, so a read is always safe to retry.
+ */
+export type TimeoutOutcome = 'not-executed' | 'unknown';
 
 /** Thrown when a query or transaction exceeds the configured timeout */
 export class TimeoutError extends TurbineError {
   static override readonly CODE = TurbineErrorCode.TIMEOUT;
   readonly timeoutMs: number;
+  /** Whether the interrupted statement can have taken effect. See {@link TimeoutOutcome}. */
+  readonly outcome: TimeoutOutcome;
 
   /**
    * @param timeoutMs the client-side timeout budget in ms. Pass `0` when the
@@ -694,12 +719,18 @@ export class TimeoutError extends TurbineError {
    *   surfaced via `wrapPgError`, where Turbine did not set the deadline).
    * @param context human label for the operation ("Query", "Transaction").
    * @param options optional `message` override and pg `cause` to preserve, used
-   *   when wrapping a driver error rather than a client-side timer expiry.
+   *   when wrapping a driver error rather than a client-side timer expiry, and
+   *   the `outcome` (default `'unknown'`, the only answer that is never wrong).
    */
-  constructor(timeoutMs: number, context = 'Query', options?: { message?: string; cause?: unknown }) {
+  constructor(
+    timeoutMs: number,
+    context = 'Query',
+    options?: { message?: string; cause?: unknown; outcome?: TimeoutOutcome },
+  ) {
     super(TurbineErrorCode.TIMEOUT, options?.message ?? `${context} timed out after ${timeoutMs}ms`, options);
     this.name = 'TimeoutError';
     this.timeoutMs = timeoutMs;
+    this.outcome = options?.outcome ?? 'unknown';
   }
 }
 
@@ -1046,6 +1077,76 @@ export class SerializationFailureError extends TurbineError {
   }
 }
 
+/** Marks a {@link LockNotAvailableError} across copies of this module (it shares E013 with its parent). */
+const LOCK_NOT_AVAILABLE_BRAND = Symbol.for('turbine-orm.lockNotAvailable');
+
+/**
+ * A row lock could not be taken. A locking read with `noWait` found a row
+ * locked by another transaction (PostgreSQL 55P03, MySQL 3572), or a lock wait
+ * outlasted the server's lock timeout (PostgreSQL 55P03 under `lock_timeout`,
+ * MySQL 1205, SQL Server 1222).
+ *
+ * A {@link SerializationFailureError}: same code (E013) and `isRetryable`, so
+ * code that already retries E013 retries this too. Retry after a backoff, or
+ * read with `skipLocked` to move on to the rows that are free.
+ *
+ * On PostgreSQL the failed statement aborts the transaction it ran in. To keep
+ * the outer transaction alive, take the lock in a nested `tx.$transaction(...)`
+ * (a savepoint) and catch the error outside it.
+ */
+export class LockNotAvailableError extends SerializationFailureError {
+  constructor(opts: { message?: string; cause?: unknown } = {}) {
+    const { cause } = opts;
+    let message = opts.message;
+    if (!message) {
+      const driverMessage = (cause as { message?: string } | null | undefined)?.message;
+      message =
+        `Row lock not available${driverMessage ? `: ${driverMessage}` : ''}. Another transaction holds the lock. ` +
+        'Retry after a backoff, or read with skipLocked to take only the rows that are free.';
+    }
+    super({ message, cause });
+    this.name = 'LockNotAvailableError';
+    Object.defineProperty(this, LOCK_NOT_AVAILABLE_BRAND, {
+      value: true,
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
+  }
+
+  /**
+   * `instanceof` across two copies of this module. The code alone cannot tell
+   * this class from its parent (both E013), so another copy's instance must
+   * also carry this class's own brand. A caller's subclass answers only for
+   * its own instances, as {@link TurbineError[Symbol.hasInstance]} does.
+   */
+  static override [Symbol.hasInstance](value: unknown): boolean {
+    // biome-ignore lint/complexity/noThisInStatic: the receiver may be a caller's subclass, see TurbineError
+    // biome-ignore lint/complexity/noUselessThisAlias: one alias carries one suppression
+    const cls: new (...args: never[]) => unknown = this;
+    if (Function.prototype[Symbol.hasInstance].call(cls, value)) return true;
+    if (cls !== LockNotAvailableError) return false;
+    return (
+      SerializationFailureError[Symbol.hasInstance](value) &&
+      (value as Record<PropertyKey, unknown>)[LOCK_NOT_AVAILABLE_BRAND] === true
+    );
+  }
+}
+
+/**
+ * A lock that could not be taken: PostgreSQL 55P03 (`NOWAIT`, or
+ * `lock_timeout`), MySQL 3572 (`NOWAIT`) and 1205 (lock wait timeout), SQL
+ * Server 1222 (lock request timeout). The MySQL and SQL Server shapes arrive
+ * with `.code` already set to 40001 by their engine modules, so the driver's
+ * own number decides.
+ */
+function isLockNotAvailableError(err: object, code: string): boolean {
+  if (code === '55P03' || code === 'ER_LOCK_NOWAIT') return true;
+  const e = err as { errno?: unknown; number?: unknown };
+  if (e.errno === 3572) return true;
+  return code === '40001' && (e.errno === 1205 || e.number === 1222);
+}
+
 /** Thrown when a CHECK constraint is violated (pg code 23514) */
 export class CheckConstraintError extends TurbineError {
   static override readonly CODE = TurbineErrorCode.CHECK_VIOLATION;
@@ -1251,23 +1352,122 @@ export class ReadOnlyError extends TurbineError {
    * fail-fast flag), so NOTHING can write here and writes must route to the
    * primary. `'rbac'`: the database is writable but THIS connection's role may
    * not write (per-connection permission), so re-authenticating may suffice.
+   * `'transaction'`: the transaction is read-only (`$transaction({ readOnly:
+   * true })`, `BEGIN READ ONLY`, or a read replica, where every transaction
+   * is), so the write belongs in a read-write transaction on the primary.
    */
-  readonly reason: 'snapshot' | 'rbac';
+  readonly reason: ReadOnlyReason;
 
   /**
    * @param detail human-readable description of the refused write (the engine
-   *   message, or a local fail-fast description). A "route writes to a writable
-   *   primary" hint is always appended.
+   *   message, or a local fail-fast description). A hint naming where the
+   *   write belongs is always appended.
    * @param options optional driver `cause` to preserve when wrapping a refusal,
    *   and the refusal `reason` (default `'snapshot'`).
    */
-  constructor(detail: string, options?: { cause?: unknown; reason?: 'snapshot' | 'rbac' }) {
-    super(TurbineErrorCode.READ_ONLY, `${detail} Route writes to a writable primary.`, {
+  constructor(detail: string, options?: { cause?: unknown; reason?: ReadOnlyReason }) {
+    const reason = options?.reason ?? 'snapshot';
+    super(TurbineErrorCode.READ_ONLY, `${detail} ${READ_ONLY_HINTS[reason]}`, {
       cause: options?.cause,
     });
     this.name = 'ReadOnlyError';
-    this.reason = options?.reason ?? 'snapshot';
+    this.reason = reason;
   }
+}
+
+/** Why a {@link ReadOnlyError} write was refused. */
+export type ReadOnlyReason = 'snapshot' | 'rbac' | 'transaction';
+
+const READ_ONLY_HINTS: Readonly<Record<ReadOnlyReason, string>> = {
+  snapshot: 'Route writes to a writable primary.',
+  rbac: 'Route writes to a writable primary.',
+  transaction:
+    'Run the write in a read-write transaction (not `readOnly: true` or BEGIN READ ONLY) on the primary, ' +
+    'not a read replica.',
+};
+
+/**
+ * Thrown when work the caller expected to be saved was rolled back instead:
+ * a `$transaction` or `transaction()` whose COMMIT the server answered with
+ * ROLLBACK, a transaction that cannot commit because a statement inside it was
+ * cut short by its `timeout`, or a nested `tx.$transaction(...)` block that
+ * could not be kept for the same reasons.
+ *
+ * PostgreSQL aborts a transaction at its first error. Catching that error
+ * inside the callback does not undo the abort, so the callback returns, the
+ * COMMIT ends as a ROLLBACK, and none of the transaction's writes are saved.
+ * The first failure is attached as `cause`. Nothing was committed, so the
+ * whole transaction can be run again once the cause is dealt with; to keep the
+ * rest of the work after an expected failure, run the statement that can fail
+ * in its own nested `tx.$transaction(...)`.
+ *
+ * NOT retryable on its own: the failure that caused it is not known to be
+ * transient. When that first failure WAS a deadlock or a serialization
+ * conflict, the retryable class (`DeadlockError`, `SerializationFailureError`)
+ * is thrown instead, so `$retry` re-runs the transaction.
+ */
+export class TransactionRolledBackError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.TRANSACTION_ROLLED_BACK;
+
+  /**
+   * @param message what was rolled back and how to keep the work next time.
+   * @param options the first failure inside the transaction, as `cause`.
+   */
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(TurbineErrorCode.TRANSACTION_ROLLED_BACK, message, options);
+    this.name = 'TransactionRolledBackError';
+  }
+}
+
+/**
+ * The sentence every {@link InvariantError} message ends with, before the docs
+ * link. Exported so a test can assert it without restating it.
+ */
+export const INVARIANT_REPORT_HINT =
+  'This is a bug in turbine-orm, not in your code. Please report it at ' +
+  'https://github.com/zvndev/turbine-orm/issues with this message.';
+
+/**
+ * Turbine detected a bug in itself: a branch that no argument can reach was
+ * reached, or two internal paths that must agree did not (the SQL-template
+ * cache's build and param-collect paths, for example).
+ *
+ * Not caused by the arguments, so rewriting the call is not the fix, and not
+ * retryable: the same call fails the same way. `invariant` is a stable id for
+ * the broken rule (`'sql-cache-lockstep'`, `'sql-cache-param-count'`, ...), so
+ * a report or an alert can group on it. The message names no row or parameter
+ * value.
+ *
+ * Thrown in place of executing a statement Turbine knows is wrong, which is
+ * what makes the checks behind it safe to run in production.
+ */
+export class InvariantError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.INVARIANT_VIOLATION;
+  /** Stable id of the broken invariant, e.g. `'sql-cache-lockstep'`. */
+  readonly invariant: string;
+
+  /**
+   * @param invariant stable id of the broken rule.
+   * @param message what disagreed, with no row or parameter value in it. The
+   *   report hint is appended once.
+   * @param options the error that exposed the broken rule, as `cause`.
+   */
+  constructor(invariant: string, message: string, options?: { cause?: unknown }) {
+    const body = message.includes(INVARIANT_REPORT_HINT) ? message : `${message} ${INVARIANT_REPORT_HINT}`;
+    super(TurbineErrorCode.INVARIANT_VIOLATION, body, options);
+    this.name = 'InvariantError';
+    this.invariant = invariant;
+  }
+}
+
+/**
+ * A write refused because its transaction is read-only: PostgreSQL SQLSTATE
+ * 25006, or MySQL's error 1792 (which carries the same SQLSTATE).
+ */
+function isReadOnlyTransactionError(err: object, code: string): boolean {
+  if (code === '25006' || code === 'ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION') return true;
+  const e = err as { errno?: unknown; sqlState?: unknown };
+  return e.errno === 1792 && e.sqlState === '25006';
 }
 
 /**
@@ -1301,6 +1501,11 @@ const CONNECTION_ERROR_CODES = new Set<string>([
   '08006', // connection_failure
   '08007', // transaction_resolution_unknown
   '08P01', // protocol_violation
+  // A named prepared statement met a server connection that did not prepare it
+  // (26000) or already holds it (42P05). Turbine names its own statements, so
+  // the usual cause is a transaction-pooling endpoint switching backends.
+  '42P05', // duplicate_prepared_statement
+  '26000', // invalid_sql_statement_name
   // pg SQLSTATE class 28: the server answered and REFUSED us. These are the
   // most common first-run failures there are (wrong password, a pg_hba rule
   // that does not cover this user/host), and they used to fall through
@@ -1320,6 +1525,11 @@ const CONNECTION_ERROR_CODES = new Set<string>([
   '57P01', // admin_shutdown
   '57P02', // crash_shutdown
   '57P03', // cannot_connect_now
+  // The server ended a session that sat idle inside an open transaction past
+  // idle_in_transaction_session_timeout (a FATAL: the connection is gone).
+  // A cursor stream sets that limit on its own transaction, see
+  // query/stream-idle.ts, so this is how a frozen process's stream ends.
+  '25P03', // idle_in_transaction_session_timeout
   // Node driver-level socket errors (surface on err.code too)
   'ECONNREFUSED',
   'ECONNRESET',
@@ -1360,6 +1570,14 @@ const PG_CONNECTION_LOSS_MESSAGES = new Set<string>([
   'Connection terminated',
   'Connection terminated due to connection timeout',
 ]);
+
+/** pg-pool's own words for a checkout that waited longer than `connectionTimeoutMillis`. */
+const PG_POOL_CHECKOUT_TIMEOUT_MESSAGE = 'timeout exceeded when trying to connect';
+
+const POOL_CHECKOUT_TIMEOUT_HINT =
+  "Timed out waiting for a free connection from the pool. Something is holding connections for longer than the pool's " +
+  'connection timeout: long transactions or streams, or a query on the outer client inside a `$transaction` ' +
+  'callback, which needs a second connection (use `tx` there). Raise the pool size if the load is genuine.';
 
 /** The follow-on errors pg raises for a query sent to a client already known to be dead. */
 const PG_NOT_QUERYABLE_MESSAGES = new Set<string>([
@@ -1422,6 +1640,13 @@ const CONNECTION_LOSS_HINT =
   'The server or the network closed it (a restart, failover, idle timeout, compute suspend, or ' +
   'pg_terminate_backend). The pool discards the connection, so retrying the operation opens a fresh one.';
 
+const PREPARED_STATEMENT_POOLER_HINT =
+  'A named prepared statement met a server connection that did not prepare it, or that already holds it. A ' +
+  'transaction-pooling endpoint (PgBouncer in transaction mode, a managed "-pooler" host, port 6432 or 6543) ' +
+  'gives each transaction to a different server connection, which is the usual cause. Connect to the direct ' +
+  'endpoint, set `preparedStatements: false`, or turn on prepared-statement support in the pooler (PgBouncer ' +
+  '1.21 or later, `max_prepared_statements` above 0).';
+
 /**
  * Actionable next step per connection-class code, appended to the driver's own
  * message. The driver message states WHAT happened ("password authentication
@@ -1431,6 +1656,8 @@ const CONNECTION_LOSS_HINT =
  * A code with no entry here simply gets no hint appended.
  */
 const CONNECTION_ERROR_HINTS: Readonly<Record<string, string>> = {
+  '42P05': PREPARED_STATEMENT_POOLER_HINT,
+  '26000': PREPARED_STATEMENT_POOLER_HINT,
   '28P01':
     'The server rejected the credentials. Check the password in your connection string (or DATABASE_URL), including any URL-encoding of special characters.',
   '28000':
@@ -1439,6 +1666,12 @@ const CONNECTION_ERROR_HINTS: Readonly<Record<string, string>> = {
     'The database named in the connection string does not exist. Check the path segment after the host, and create the database if needed.',
   '53300': "The server has no free connection slots. Lower `poolSize` or raise the server's max_connections.",
   '57P03': 'The server is still starting up (or shutting down) and is not accepting connections yet.',
+  '25P03':
+    'The server ended the session because it sat idle inside an open transaction for longer than ' +
+    '`idle_in_transaction_session_timeout`. A cursor stream sets that limit to its idle timeout plus 10 s, so for ' +
+    'a stream this means the process ran nothing for that long (a frozen serverless instance, a blocked event ' +
+    'loop); for a transaction, that the callback awaited something else for longer than the server allows. The ' +
+    'connection is discarded and the pool opens a fresh one.',
   ECONNREFUSED: 'Nothing is listening on that host and port. Check the server is running and the port is right.',
   ENOTFOUND:
     'The host in the connection string could not be resolved. Check the host name, and that the connection string itself is well formed.',
@@ -1706,9 +1939,13 @@ function scrubUnclassifiedServerError(err: object, code: string): unknown {
  *   23P01 (exclusion_violation)   -> ExclusionConstraintError
  *   40P01 (deadlock_detected)     -> DeadlockError       (retryable)
  *   40001 (serialization_failure) -> SerializationFailureError (retryable)
+ *   55P03 (lock_not_available)    -> LockNotAvailableError (retryable, E013); also
+ *                                    MySQL 3572 / 1205 and SQL Server 1222
  *   57014 (query_canceled)        -> TimeoutError (server-side statement_timeout)
  *   28P01 / 28000 (auth refused)  -> ConnectionError, with a remediation hint
  *   3D000 (no such database)      -> ConnectionError, with a remediation hint
+ *   42P05 / 26000 (prepared statement name clash or miss, a transaction-mode
+ *                                    pooler) -> ConnectionError, with a remediation hint
  *   connection-class codes        -> ConnectionError (see CONNECTION_ERROR_CODES)
  *   22xxx (data exception)        -> ValidationError naming the column (when the
  *                                    server did) and the SQLSTATE; driver text
@@ -1736,7 +1973,33 @@ export function wrapPgError(err: unknown): unknown {
     if (err instanceof Error && PG_CONNECTION_LOSS_MESSAGES.has(err.message)) {
       return new ConnectionError(`Database connection lost: ${err.message}. ${CONNECTION_LOSS_HINT}`, { cause: err });
     }
+    // pg-pool's checkout timeout carries no code either. A pool Turbine owns
+    // types it at checkout (checkout.ts); this covers a caller's own pg.Pool.
+    if (err instanceof Error && err.message === PG_POOL_CHECKOUT_TIMEOUT_MESSAGE) {
+      return new ConnectionError(POOL_CHECKOUT_TIMEOUT_HINT, { cause: err });
+    }
     return err;
+  }
+
+  if (isReadOnlyTransactionError(err, e.code)) {
+    const pgMessage = typeof e.message === 'string' && e.message.length > 0 ? e.message : 'write refused';
+    return new ReadOnlyError(`${pgMessage} (SQLSTATE 25006).`, { cause: err, reason: 'transaction' });
+  }
+
+  if (isLockNotAvailableError(err, e.code)) return new LockNotAvailableError({ cause: err });
+
+  // A protocol violation answered with ERROR rather than FATAL concerns one
+  // message, and the connection stays usable. The common cause is a Buffer
+  // bound to a column that is not bytea: node-postgres sends a Buffer as
+  // binary data, which the server cannot read as an integer or a date.
+  if (e.code === '08P01' && e.severity === 'ERROR') {
+    return wrapValueBearingPgError(
+      err,
+      e,
+      'Invalid input',
+      'a bound value could not be read as the type the statement expects',
+      ' A Buffer is sent as binary data and fits only a bytea column; pass a number, string or Date for any other type.',
+    );
   }
 
   switch (e.code) {
@@ -1783,13 +2046,31 @@ export function wrapPgError(err: unknown): unknown {
         cause: err,
       });
     case '57014':
-      // query_canceled: a server-side statement_timeout cancelled the query.
-      // Turbine did not set the deadline (that lives in Postgres config), so
-      // there is no client-side budget to report → timeoutMs = 0.
+      // query_canceled: the statement was stopped, so it made no change. A
+      // cancel request (what Turbine sends when a query or transaction
+      // `timeout` expires) reads "due to user request"; anything else is the
+      // server's own statement_timeout.
       return new TimeoutError(0, 'Query', {
-        message: 'Query canceled by server-side statement_timeout',
+        message:
+          typeof e.message === 'string' && /user request/i.test(e.message)
+            ? 'Query cancelled on the server by a cancel request, which Turbine sends when a query or ' +
+              'transaction `timeout` expires. It made no change.'
+            : 'Query canceled by server-side statement_timeout',
         cause: err,
+        outcome: 'not-executed',
       });
+    case '25P02':
+      // in_failed_sql_transaction: a statement sent after an earlier one failed. Turbine's own
+      // transactions refuse it first, with the failure attached (transaction-state.ts); this is
+      // the driver's answer on a path that sent it anyway (a connection used outside Turbine).
+      return new TransactionRolledBackError(
+        'A statement was sent after an earlier statement in the same transaction failed. PostgreSQL ignores ' +
+          'every statement after a failure until the transaction, or the savepoint it ran in, is rolled back, ' +
+          'so nothing more can be saved in it. Catching the error does not undo the abort: let it leave the ' +
+          'transaction, or run the statement that can fail in its own nested `tx.$transaction(...)`, which ' +
+          'rolls back only that savepoint. The earlier failure is the error that statement threw.',
+        { cause: err },
+      );
     default:
       if (CONNECTION_ERROR_CODES.has(e.code)) {
         const pgMessage = typeof e.message === 'string' && e.message.length > 0 ? e.message : undefined;
@@ -1811,6 +2092,17 @@ export function wrapPgError(err: unknown): unknown {
           ? DATA_EXCEPTION_PHRASES[e.code]!
           : DATA_EXCEPTION_FALLBACK;
         return wrapValueBearingPgError(err, e, subject, phrase);
+      }
+      // 42883: no operator or function for these argument types, e.g. a bigint
+      // column compared with text. PostgreSQL's message names types, never
+      // values, so it is kept in both modes.
+      if (e.code === '42883') {
+        const pgMessage = typeof e.message === 'string' && e.message.length > 0 ? `${e.message} ` : '';
+        return new ValidationError(
+          `${pgMessage}(SQLSTATE 42883). A value of one type was compared with or passed to something that takes ` +
+            "another, usually a value bound to a column of a different type. Pass a value of the column's type.",
+          { cause: err, sqlstate: e.code },
+        );
       }
       // 42601 is any syntax error. Only the to_tsquery parse failure is a
       // caller-input problem Turbine can name (the `search` operator), so the

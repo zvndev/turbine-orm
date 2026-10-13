@@ -147,9 +147,38 @@ function noPooler(target: ConnectionTarget): PoolerDetection {
  * blocks a legitimate database, so precision wins and the caller is expected to
  * offer an override.
  */
-export function detectPooler(connectionString: string): PoolerDetection {
-  const target = parseConnectionTarget(connectionString);
+export function detectPooler(connectionString: string, environment?: PgEnvironmentTarget): PoolerDetection {
+  const parsed = parseConnectionTarget(connectionString);
+  return detectPoolerTarget(environment === undefined ? parsed : fillTargetFromEnvironment(parsed, environment));
+}
 
+/**
+ * The `PGHOST` / `PGPORT` values a connection target falls back to. node-postgres
+ * reads a field from the connection string or the config first and the
+ * environment only when that leaves it unset, so a string that names no port (or
+ * no host) is still connecting to wherever these point.
+ */
+export interface PgEnvironmentTarget {
+  readonly host?: string | undefined;
+  readonly port?: string | undefined;
+}
+
+/** `target` with the host and port it leaves unset taken from `environment`, the way node-postgres does. */
+export function fillTargetFromEnvironment(
+  target: ConnectionTarget,
+  environment: PgEnvironmentTarget,
+): ConnectionTarget {
+  const host = target.host ?? (environment.host ? environment.host.trim().toLowerCase() || null : null);
+  let port = target.port;
+  if (port === null && environment.port) {
+    const parsed = Number.parseInt(environment.port, 10);
+    port = Number.isInteger(parsed) ? parsed : null;
+  }
+  return { host, port };
+}
+
+/** {@link detectPooler} for a target that is already parsed. */
+export function detectPoolerTarget(target: ConnectionTarget): PoolerDetection {
   if (target.host !== null) {
     for (const label of target.host.split('.')) {
       for (const token of label.split(/[-_]/)) {
@@ -214,7 +243,30 @@ export interface PoolerRefusalOptions {
   command: string;
   /** The flag that overrides the refusal, e.g. `--allow-pooler`. */
   allowFlag: string;
+  /**
+   * Why THIS command cannot use a pooler, in place of the default paragraph
+   * (written for `doctor`: session state, session-scoped views, the read bound).
+   * Lines are printed as given, between the endpoint and the advice to use the
+   * direct endpoint.
+   */
+  explanation?: readonly string[];
 }
+
+/** Why `turbine doctor` refuses a pooler; the paragraph {@link poolerRefusalMessage} prints by default. */
+const DEFAULT_POOLER_EXPLANATION: readonly string[] = [
+  'A transaction pooler (PgBouncer, a Neon "-pooler" endpoint, Supabase\'s pooler) does not',
+  'give a client its own server backend. It multiplexes many clients onto a few shared',
+  'backends and reuses one as soon as a transaction ends, so:',
+  '',
+  '  1. Session state is not private. Anything this command sets on the session can be left',
+  '     behind for another client, and whatever an earlier client left behind can be in',
+  '     force for this one. That is how a "read-only guardrail" becomes an outage.',
+  '  2. Session-scoped views describe the wrong session. pg_prepared_statements, which this',
+  '     report tells you to read to confirm a cached plan, belongs to whichever backend',
+  '     answered, not to your application.',
+  '  3. The read bounds may not apply. This command asks for its statement_timeout as a',
+  '     connection parameter, and a pooler is free to drop or reject one.',
+];
 
 /**
  * The lines a command prints when it refuses a pooler endpoint.
@@ -235,18 +287,7 @@ export function poolerRefusalMessage(detection: PoolerDetection, options: Pooler
     `  Endpoint: ${where}${detection.port === null ? '' : `:${detection.port}`}`,
     `  Detected: ${what}`,
     '',
-    'A transaction pooler (PgBouncer, a Neon "-pooler" endpoint, Supabase\'s pooler) does not',
-    'give a client its own server backend. It multiplexes many clients onto a few shared',
-    'backends and reuses one as soon as a transaction ends, so:',
-    '',
-    '  1. Session state is not private. Anything this command sets on the session can be left',
-    '     behind for another client, and whatever an earlier client left behind can be in',
-    '     force for this one. That is how a "read-only guardrail" becomes an outage.',
-    '  2. Session-scoped views describe the wrong session. pg_prepared_statements, which this',
-    '     report tells you to read to confirm a cached plan, belongs to whichever backend',
-    '     answered, not to your application.',
-    '  3. The read bounds may not apply. This command asks for its statement_timeout as a',
-    '     connection parameter, and a pooler is free to drop or reject one.',
+    ...(options.explanation ?? DEFAULT_POOLER_EXPLANATION),
     '',
     'Use the DIRECT (non-pooled) endpoint for the same database instead.',
   ];
@@ -312,14 +353,38 @@ export function withStatementTimeoutOption(
   config: ConnectionOptionsConfig,
   statementTimeoutMs: number,
 ): ConnectionOptionsConfig {
-  if (!Number.isSafeInteger(statementTimeoutMs) || statementTimeoutMs < 0) return config;
-  // No unit suffix: statement_timeout's default unit IS milliseconds, which is
-  // what `SET statement_timeout = <n>` meant before this replaced it.
-  const setting = `-c statement_timeout=${statementTimeoutMs}`;
+  const setting = statementTimeoutSetting(statementTimeoutMs);
+  return setting === null ? config : withStartupSetting(config, setting);
+}
 
-  const merged = mergeConnectionStringOptions(config.connectionString, setting);
+/**
+ * The `-c statement_timeout=<ms>` startup setting, or `null` when the value is
+ * not a non-negative safe integer (see the injection note on
+ * {@link withStatementTimeoutOption}). No unit suffix: the GUC's default unit
+ * is milliseconds.
+ */
+export function statementTimeoutSetting(statementTimeoutMs: number): string | null {
+  if (!Number.isSafeInteger(statementTimeoutMs) || statementTimeoutMs < 0) return null;
+  return `-c statement_timeout=${statementTimeoutMs}`;
+}
+
+/**
+ * `config` with one `-c name=value` startup setting appended to its libpq
+ * `options`, in whichever place pg will read them from: an `options` query
+ * parameter already on the connection string wins over the `options` field,
+ * and the field falls back to `PGOPTIONS` only while it is unset, so both are
+ * read first and appended to rather than replaced.
+ *
+ * `setting` is emitted verbatim. The caller must have built it from a closed
+ * set or a narrowed number: the `options` string is split on whitespace, so a
+ * caller-controlled value could carry a second `-c`.
+ */
+export function withStartupSetting<T extends { connectionString?: string; options?: string }>(
+  config: T,
+  setting: string,
+): T & { options?: string } {
+  const merged = config.connectionString ? mergeConnectionStringOptions(config.connectionString, setting) : null;
   if (merged !== null) return { ...config, connectionString: merged };
-
   const existing = config.options || (typeof process !== 'undefined' ? process.env?.PGOPTIONS : undefined);
   return { ...config, options: existing ? `${existing} ${setting}` : setting };
 }
@@ -336,22 +401,12 @@ export function withStatementTimeoutOption(
  * password is not parseable by pg either, so there is no shape this handles
  * differently from the driver.
  *
- * Shared with `client.ts`, which needs the identical merge for
- * `plan_cache_mode`. It was duplicated there until 2026-08-16, and the reason
- * is worth keeping because it was wrong in an instructive way: importing it
- * from `client.ts` adds an import edge from a module ~100 test processes load,
- * and this file's merged coverage read 40% while measuring 100% in isolation,
- * which moved the aggregate gate 75.48% -> 75.03% against a 75% floor. The
- * conclusion drawn was that the refactor cost the gate's headroom.
+ * Used by {@link withStartupSetting} (the client's pool configuration) and
+ * {@link withSearchPathOption}.
  *
- * The 40% was a c8 merge defect, not an import cost: c8's V8-level merge is not
- * monotonic, and once the report merges at the istanbul level instead this file
- * reads 100% with the edge in place (see `//merge-bug` in .c8rc.json). So the
- * duplication was paying for an artifact, and the two copies are now one.
- *
- * Keep this module import-free regardless. That part was never about coverage:
- * `query/` and `cli/` both reach it, and an edge back to `client.ts` would be
- * the cycle `scripts/check-import-cycles.mjs` exists to refuse.
+ * Keep this module import-free: `query/` and `cli/` both reach it, and an
+ * edge back to `client.ts` would be the cycle `scripts/check-import-cycles.mjs`
+ * exists to refuse.
  */
 export function mergeConnectionStringOptions(connectionString: string, setting: string): string | null {
   const q = connectionString.indexOf('?');

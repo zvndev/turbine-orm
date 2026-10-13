@@ -221,11 +221,20 @@ function lineAt(src: string, offset: number): number {
 // Attribute-argument tokenizer
 // ---------------------------------------------------------------------------
 
-/** Unquote a `"..."` literal, resolving the escapes Prisma supports. */
+const QUOTED_ESCAPES: Record<string, string> = { '"': '"', '\\': '\\', n: '\n', t: '\t' };
+
+/**
+ * Unquote a `"..."` literal, resolving the escapes Prisma supports.
+ *
+ * ONE left-to-right pass, because the escapes are not independent: after `\\`
+ * has become a backslash, that backslash must not be read again as the start of
+ * `\n` or `\t`. A chain of `.replace` calls does exactly that, so the literal
+ * `"C:\\new"` came out as `C:` + newline + `ew`.
+ */
 function unquote(raw: string): string {
   const s = raw.trim();
   if (s.length >= 2 && s[0] === '"' && s[s.length - 1] === '"') {
-    return s.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\').replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+    return s.slice(1, -1).replace(/\\(["\\nt])/g, (_, escaped: string) => QUOTED_ESCAPES[escaped] as string);
   }
   return s;
 }
@@ -573,7 +582,7 @@ function parseFieldLine(text: string, line: number, warnings: string[]): PrismaF
   }
 
   for (const attr of attrs) {
-    const note = NOTED_FIELD_ATTRS[attr.name];
+    const note = Object.hasOwn(NOTED_FIELD_ATTRS, attr.name) ? NOTED_FIELD_ATTRS[attr.name] : undefined;
     if (note) warnings.push(`Line ${line}: field "${name}": ${note}`);
   }
 
@@ -612,7 +621,7 @@ function parseModelBody(
           // @@index and anything else: recorded in blockAttrs, unused. The
           // few that change what the model MEANS get a warning rather than
           // silence (see NOTED_BLOCK_ATTRS).
-          const note = NOTED_BLOCK_ATTRS[attr.name];
+          const note = Object.hasOwn(NOTED_BLOCK_ATTRS, attr.name) ? NOTED_BLOCK_ATTRS[attr.name] : undefined;
           if (note) warnings.push(`Line ${line}: model "${block.name}": ${note}`);
         }
       }

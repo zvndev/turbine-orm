@@ -35,11 +35,21 @@ export interface TurbineCliConfig {
    */
   relationNames?: Record<string, Record<string, string>>;
   /**
-   * Extension for the generated `index.ts` sibling imports (F3):
-   * `'js'` (`./types.js`), `'none'` (`./types`), or `'auto'` (default:
-   * tsconfig-detected, falling back to `'js'`).
+   * TypeScript type overrides for generated row and input types, as
+   * `{ '<table>.<column>': '<type>' }` with database names. The main use is a
+   * `json` / `jsonb` column, which otherwise generates as `unknown`:
+   * `{ 'users.settings': '{ theme: string; beta?: boolean }' }`. The type text
+   * is emitted verbatim. A key naming no table or column is an error, not a
+   * silent no-op. A code-first column's `tsType` feeds the same map.
    */
-  importExtension?: 'js' | 'none' | 'auto';
+  columnTypes?: Record<string, string>;
+  /**
+   * Extension for the generated `index.ts` sibling imports (F3):
+   * `'js'` (`./types.js`), `'ts'` (`./types.ts`, for Node's native type
+   * stripping), `'none'` (`./types`), or `'auto'` (default: tsconfig-detected,
+   * falling back to `'js'`; never picks `'ts'`).
+   */
+  importExtension?: 'js' | 'ts' | 'none' | 'auto';
   /**
    * Keep raw database column names as generated field names (snake_case)
    * instead of camelCase (F4). Opt-in; default `false`.
@@ -64,7 +74,11 @@ export interface TurbineCliConfig {
    * are set.
    */
   seed?: string;
-  /** Schema builder file path (for push command) */
+  /**
+   * The `defineSchema()` file (default `./turbine/schema.ts`): what `push` applies,
+   * and where `generate` reads the `pii` / `updatedAt` / `maxLength` tags the
+   * database cannot store.
+   */
   schemaFile?: string;
   /**
    * Database adapter for PostgreSQL-compatible databases that need
@@ -274,14 +288,22 @@ export interface ResolvedConfig {
   migrationsDir: string;
   seedFile?: string;
   schemaFile: string;
+  /**
+   * True when `--schema-file` or the config `schemaFile` key named the file, as
+   * opposed to the `./turbine/schema.ts` default. A named file that is missing is
+   * an error; a missing default just means a database-first project.
+   */
+  schemaFileConfigured?: boolean;
   /** Resolved generator import-extension mode (F3). */
-  importExtension: 'js' | 'none' | 'auto';
+  importExtension: 'js' | 'ts' | 'none' | 'auto';
   /** Resolved keep-column-names generator flag (F4). */
   keepColumnNames: boolean;
   /** Resolved opt-out of the unique-FK → hasOne introspection flip (F2). */
   legacyToManyUniques: boolean;
   /** Resolved derived-relation rename map, or undefined when none is declared. */
   relationNames?: Record<string, Record<string, string>>;
+  /** Column type overrides for the generator, or undefined when none is declared. */
+  columnTypes?: Record<string, string>;
 }
 
 export interface CliOverrides {
@@ -292,9 +314,22 @@ export interface CliOverrides {
   schemaFile?: string;
   include?: string[];
   exclude?: string[];
-  importExtension?: 'js' | 'none' | 'auto';
+  importExtension?: 'js' | 'ts' | 'none' | 'auto';
   keepColumnNames?: boolean;
   legacyToManyUniques?: boolean;
+}
+
+/**
+ * The first candidate that is a non-blank string. An empty or whitespace-only
+ * value counts as unset, because an exported-but-empty variable (`DATABASE_URL=`
+ * in a shell profile or a `.env` template) is how "not configured" is usually
+ * spelled, and `??` would let it beat a real value further down the chain.
+ */
+export function firstNonEmpty(...candidates: Array<string | undefined>): string | undefined {
+  for (const value of candidates) {
+    if (typeof value === 'string' && value.trim() !== '') return value;
+  }
+  return undefined;
 }
 
 /**
@@ -303,17 +338,19 @@ export interface CliOverrides {
  */
 export function resolveConfig(fileConfig: TurbineCliConfig, overrides: CliOverrides): ResolvedConfig {
   return {
-    url: overrides.url ?? process.env.DATABASE_URL ?? fileConfig.url ?? '',
+    url: firstNonEmpty(overrides.url, process.env.DATABASE_URL, fileConfig.url) ?? '',
     out: overrides.out ?? fileConfig.out ?? './generated/turbine',
     schema: overrides.schema ?? fileConfig.schema ?? 'public',
     include: overrides.include ?? fileConfig.include ?? [],
     relationNames: fileConfig.relationNames,
+    columnTypes: fileConfig.columnTypes,
     exclude: overrides.exclude ?? fileConfig.exclude ?? [],
     migrationsDir: fileConfig.migrationsDir ?? './turbine/migrations',
     // `seedFile` is canonical (what the docs and `turbine init` use); `seed` is a
     // back-compat alias kept working for configs scaffolded before 0.50.
     seedFile: fileConfig.seedFile ?? fileConfig.seed,
     schemaFile: overrides.schemaFile ?? fileConfig.schemaFile ?? './turbine/schema.ts',
+    schemaFileConfigured: (overrides.schemaFile ?? fileConfig.schemaFile) !== undefined,
     importExtension: overrides.importExtension ?? fileConfig.importExtension ?? 'auto',
     keepColumnNames: overrides.keepColumnNames ?? fileConfig.keepColumnNames ?? false,
     legacyToManyUniques: overrides.legacyToManyUniques ?? fileConfig.legacyToManyUniques ?? false,

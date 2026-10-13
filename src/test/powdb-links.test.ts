@@ -266,8 +266,8 @@ describe('powdb links: schema links populates relations', () => {
       return baseExec([ACCOUNT_LINK])(powql);
     };
     const meta = await introspectPowdbDatabase(exec, { capabilities: noLinkPaths });
-    assert.deepEqual(meta.tables.order!.relations, {});
-    assert.deepEqual(meta.tables.account!.relations, {});
+    assert.deepEqual({ ...meta.tables.order!.relations }, {});
+    assert.deepEqual({ ...meta.tables.account!.relations }, {});
     assert.equal(listed, false, '`schema links` not issued without linkIntrospection');
   });
 
@@ -338,8 +338,8 @@ describe('powdb links: schema links populates relations', () => {
 
   it('an empty catalog yields relations {} without error', async () => {
     const meta = await introspectPowdbDatabase(baseExec([]), { capabilities: withLinkPaths });
-    assert.deepEqual(meta.tables.order!.relations, {});
-    assert.deepEqual(meta.tables.account!.relations, {});
+    assert.deepEqual({ ...meta.tables.order!.relations }, {});
+    assert.deepEqual({ ...meta.tables.account!.relations }, {});
   });
 });
 

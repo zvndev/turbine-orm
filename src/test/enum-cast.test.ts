@@ -111,10 +111,14 @@ describe('Postgres enum write casts', () => {
     assert.doesNotMatch(d.sql, /::"FieldType"/);
   });
 
-  it('non-postgresql dialects never emit the cast even with enums metadata', () => {
-    // Same SQL surface as Postgres but a different dialect name, the gate is
-    // the name, so no enum cast may appear.
-    const fakeDialect = { ...postgresDialect, name: 'sqlite' } as unknown as Dialect;
+  it('a dialect without named enum types never emits the cast, even with enums metadata', () => {
+    // Same SQL surface as Postgres; the gate is `capabilities.namedEnumTypes`,
+    // so with it off no enum cast may appear.
+    const fakeDialect = {
+      ...postgresDialect,
+      name: 'sqlite',
+      capabilities: { ...postgresDialect.capabilities, namedEnumTypes: false },
+    } as unknown as Dialect;
     const q = makeQuery('fields', buildSchema(), { dialect: fakeDialect });
     const d = q.buildCreate({ data: { title: 'Name', type: 'TEXT' } as never });
     assert.doesNotMatch(d.sql, /::"FieldType"/);

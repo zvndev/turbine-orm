@@ -34,7 +34,11 @@ npx turbine migrate down --step 2
 npx turbine migrate status
 ```
 
+Migration filenames are stamped in UTC, so two people in different time zones get comparable stamps. Files stamped in local time by an earlier version keep working: the runner reads any 14-digit prefix.
+
 **`create --auto`** writes a starting-point migration from the diff between your `defineSchema` output and the live database. It is a draft; read it before committing. **`create --from-diff`** does the same but flags destructive statements inline (see [below](#flagging-destructive-statements-with---from-diff)).
+
+Both refuse while the migrations folder holds files the database has not applied yet, listing them. The diff reads the live database, so it would repeat whatever those files already do. Run `turbine migrate up` first, or pass `--allow-pending` when the pending files do not touch what the schema file describes (a data migration, say).
 
 **`up`** applies every pending migration in timestamp order. It is the interactive command: if any pending file contains a destructive statement, it stops and asks you to confirm before running anything (see [the destructive gate](#the-destructive-gate)).
 
@@ -45,7 +49,8 @@ npx turbine migrate status
 - **Per-migration transactions.** Each migration runs inside its own `BEGIN` / `COMMIT`. If its SQL fails, that migration rolls back and nothing from it is recorded in `_turbine_migrations`.
 - **Stop on first error, partial apply.** A batch is processed in order and stops at the first failure. Migrations that already succeeded stay applied and recorded; the failing one and everything after it do not run. Fix the offending migration and re-run to continue.
 - **SHA-256 checksums.** Every applied migration's file is hashed. If an already-applied file changes on disk, `status` reports **drift** and `up` refuses to run until you reconcile (or pass `--allow-drift` when intentionally rewriting history).
-- **Advisory lock.** The runner takes a per-database Postgres advisory lock before applying, so two concurrent runs cannot race; the second exits cleanly instead of double-applying.
+- **Advisory lock.** The runner takes a per-database Postgres advisory lock before applying, so two concurrent runs cannot race; the second exits with an error instead of double-applying. `migrate deploy --wait` waits for the lock instead (300 seconds by default, `--wait=600` to choose), then applies whatever is still pending, so two deploys started together both succeed. The wait polls the same non-blocking lock call, so it needs no session setting.
+- **Direct endpoint only.** The advisory lock belongs to one database session, and a transaction pooler can take it on one backend and release it on another. So `migrate up`, `migrate deploy` and `migrate down` refuse a pooler connection string (a `pooler` or `pgbouncer` hostname, or port 6543 or 6432) before connecting. Use the direct endpoint, or pass `--allow-pooler` if you know the pooler runs in session mode. `--dry-run`, `status` and `create` are not refused.
 - **Configured schema.** With `schema` set in `turbine.config.ts` (or `--schema`), `migrate up` / `down` / `deploy` / `status` and `seed` connect with `search_path` pinned to that schema as a connection **startup parameter** (`options=-c search_path="<schema>",...`, never a session `SET`), so a migration's unqualified DDL and the `_turbine_migrations` table itself land in the schema `push`, `generate` and `doctor` already read. Since 0.78.0 that includes `public`, which used to be exempt: a role whose own path led with another schema had `push` and `migrate` writing to two different places.
 
   The pin **extends** the connection's own path rather than replacing it. The configured schema goes first, which is what an unqualified `CREATE` uses, and the names the connection already had follow, so an extension type installed in an `extensions` schema still resolves. Turbine reads those names by connecting once unpinned and asking `SHOW search_path`, because a startup parameter cannot read the path it overrides. Each inherited name must be a plain identifier to be re-emitted and is dropped otherwise; nothing is escaped into the value.
@@ -87,19 +92,24 @@ Turbine tracks migrations by name, not by a monotonic sequence number, so **any 
 npx turbine migrate down --allow-destructive
 ```
 
+`migrate down` warns when a rolled-back `DOWN` section ran no SQL (only comments, such as an `IRREVERSIBLE` note), since the migration is unrecorded but nothing was undone.
+
 ## What `--auto` can and cannot do
 
 `create --auto` is a diff tool, not a schema-migration planner. It compares columns and types and emits the obvious DDL; it has no notion of intent or history. Its blind spots:
 
-- **Type changes get a blind cast.** A changed column type emits `ALTER COLUMN "col" TYPE <newtype> USING "col"::<newtype>`. The `USING` cast is unconditional, with no transformation hook. It works for widening casts (`int` to `bigint`, `text` to `varchar`) but **fails at apply time on data the cast cannot handle** (`text` to `integer` on non-numeric rows). For anything non-trivial, use the [two-phase recipe](#changing-a-column-type-with-existing-data).
+- **Type changes get a blind cast.** A changed column type emits `ALTER COLUMN "col" TYPE <newtype> USING "col"::<newtype>`. The `USING` cast is unconditional, with no transformation hook. It works for widening casts but **fails at apply time on data the cast cannot handle** (`text` to `integer` on non-numeric rows). For anything non-trivial, use the [two-phase recipe](#changing-a-column-type-with-existing-data).
+- **Lossless widenings are not destructive.** `int` to `bigint`, `varchar(50)` to `varchar(100)` or `text`, growing `numeric` precision and similar changes cannot lose a value, so `push` and `migrate up` apply them without asking for `--allow-destructive`. A generated file marks each one with a `-- turbine:widening <from> -> <to>` comment above the statement. The runner honors the marker only when the pair really is a widening and the statement below it matches; a narrowing is still refused.
 - **Renames are not detected.** The differ cannot know `full_name` was renamed from `name`. It sees one column gone and one added, so it produces an add-new plus orphan-old, and **the data does not move**. Write renames by hand as `ALTER TABLE ... RENAME COLUMN`.
 - **`SET NOT NULL` has no backfill.** Making a nullable column `notNull` emits a bare `ALTER COLUMN "col" SET NOT NULL`, which fails on a populated table with any `NULL` in that column. Backfill first (see below).
-- **`varchar` length changes are not detected.** The differ compares the type name, not the length, so `varchar(50)` to `varchar(100)` produces no statement. Change the length by hand.
+- **Adding a `NOT NULL` column with no default warns.** It fails on a populated table, so the diff points at `--recipe backfill`.
+- **Enum values keep their declared order.** A new value is added with `BEFORE` / `AFTER`. Postgres cannot reorder existing values in place, so a reordered enum produces a warning rather than a statement.
+- **"In sync" means in sync.** `push` and `create --auto` print that the database is already in sync only when the diff has nothing else to say. Otherwise they list what the diff does not compare: indexes on tables that declare none, unnamed or unmatched `CHECK` constraints, sequence-backed defaults, primary keys and multi-column `UNIQUE` constraints. Turbine's own `_turbine_*` tables are never reported as extra.
 - **Drops are emitted flagged as destructive.** A table or column present in the database but absent from your schema produces a `DROP` flagged inline as destructive (a destructive-only diff produces a flagged migration, not "nothing to migrate"), and the [destructive gate](#the-destructive-gate) still refuses it until you confirm or pass `--allow-destructive`. `schemaDiff()` returns these in `drop` / the `alter` plan for programmatic callers.
 
 ## Flagging destructive statements with `--from-diff`
 
-`--from-diff` derives the same forward and reverse SQL as `--auto` (the diff into `-- UP`, the reverse into `-- DOWN`, with a commented "irreversible, write manually" placeholder when no reverse can be derived), and annotates anything that destroys data:
+`--from-diff` derives the same forward and reverse SQL as `--auto` (the diff into `-- UP`, the reverse into `-- DOWN`, with a commented "irreversible, write manually" placeholder when no reverse can be derived, and an `-- IRREVERSIBLE:` note for every dropped column, whose data no `DOWN` can bring back), and annotates anything that destroys data:
 
 - A lossy `ALTER COLUMN … TYPE` in UP, or a `DROP TABLE` / `DROP COLUMN` reverse in DOWN, is flagged inline with loud comments and a file-level banner.
 - The statement is left **intact**, so `migrate up` still refuses it by default until you confirm or pass `--allow-destructive`.
@@ -180,9 +190,26 @@ npx turbine migrate create widen_order_total --recipe backfill
 
 It generates a migration pre-filled with the expand/contract skeleton (the nullable add, a batched `UPDATE` backfill block, the `SET NOT NULL`, and commented swap/drop steps) with placeholders for the table, columns, and conversion expression. Review and adapt every placeholder before applying.
 
+## Checking for drift in CI
+
+Two commands take `--exit-code`, which makes them exit `2` on drift and `0` when everything matches. Without the flag their exit codes are unchanged.
+
+```bash
+# The database differs from the schema file, or the diff carries a warning
+npx turbine push --dry-run --exit-code
+
+# A migration is pending, an applied one was modified or is missing,
+# or a .sql file in the directory is misnamed (the output names it)
+npx turbine migrate status --exit-code
+```
+
+`push` fails the gate on a warning it cannot apply as well as on a statement: a declared `UNIQUE` index over a non-unique index of the same name, a removed enum label, an undeclared index on a table that manages its indexes. It stays at `0` for what the diff says it does not compare, and for a named `CHECK` whose stored text differs only because PostgreSQL rewrote the expression (the warning is still printed, so a real edit to a `CHECK` needs a reviewer).
+
+`--exit-code` is refused where it would do nothing (`push` without `--dry-run`, or any other command), and `--wait` is refused outside `migrate deploy`.
+
 ## The destructive gate
 
-Turbine treats data-destroying DDL (`DROP TABLE`, `DROP COLUMN`, and similar) as opt-in, never automatic. All three commands run the same scanner; what changes is what happens on a hit:
+Turbine treats data-destroying DDL (`DROP TABLE`, `DROP COLUMN`, and similar) as opt-in, never automatic. Since 0.90 the scanner also flags an `UPDATE` or `DELETE` whose `WHERE` is always true (`WHERE true`, `WHERE 1=1`), the body of a `PREPARE ... AS`, `ON CONFLICT DO UPDATE` without a `WHERE`, `DROP VIEW ... CASCADE` and `lo_unlink`, while leaving look-alikes inside string literals and comments alone. All three commands run the same scanner; what changes is what happens on a hit:
 
 | Command | On a destructive statement | Escape hatch |
 |---|---|---|

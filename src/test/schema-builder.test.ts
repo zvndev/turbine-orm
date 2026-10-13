@@ -11,6 +11,7 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { ValidationError } from '../errors.js';
 import { column, defineSchema, table } from '../schema-builder.js';
 import { schemaToSQL, schemaToSQLString } from '../schema-sql.js';
 
@@ -542,6 +543,34 @@ describe('defineSchema runtime type validation', () => {
         },
       });
     }, /Invalid column type/);
+  });
+
+  it('every malformed declaration is a ValidationError (E003), not a plain Error', () => {
+    const id = { type: 'serial', primaryKey: true } as const;
+    // biome-ignore lint/suspicious/noExplicitAny: each entry is deliberately malformed
+    const malformed: Record<string, any> = {
+      'an unknown column type': { t: { id, bad: { type: 'invalidtype' } } },
+      'an enum with no enumName': { t: { id, mood: { type: 'enum' } } },
+      'a vector with no dimensions': { t: { id, v: { type: 'vector' } } },
+      'indexes that is not an array': { t: { id, indexes: {} } },
+      'manyToMany that is not an array': { t: { id, manyToMany: {} } },
+      'checks that is not an array': { t: { id, checks: {} } },
+      'a primaryKey option that is not an array': { t: { id: { type: 'serial' }, primaryKey: 'id' } },
+      'a composite primaryKey naming no column': { t: { id: { type: 'serial' }, primaryKey: ['nope'] } },
+    };
+    for (const [shape, def] of Object.entries(malformed)) {
+      assert.throws(
+        () => defineSchema(def),
+        (err: unknown) => err instanceof ValidationError && err.code === 'TURBINE_E003',
+        `${shape} should throw ValidationError (E003)`,
+      );
+    }
+  });
+
+  it('the deprecated column proxy refuses an unknown type with ValidationError (E003)', () => {
+    // biome-ignore lint/suspicious/noExplicitAny: an unknown builder name is the point
+    const proxy = column as any;
+    assert.throws(() => proxy.notAType(), ValidationError);
   });
 
   it('should accept all valid column types without throwing', () => {

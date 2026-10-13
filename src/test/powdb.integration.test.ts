@@ -181,8 +181,8 @@ async function withDb(fn: (db: DB) => Promise<void>): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'powdb-it-'));
   const db: DB = await turbinePowDB({ embedded: dir }, schema, { warnOnUnlimited: false });
   try {
-    for (const t of Object.keys(schema.tables)) await db.raw([`drop ${t}`]).catch(() => {});
-    for (const stmt of powqlSchemaDDL(schema)) await db.raw([stmt]);
+    for (const t of Object.keys(schema.tables)) await db.rawUnsafe(`drop ${t}`).catch(() => {});
+    for (const stmt of powqlSchemaDDL(schema)) await db.rawUnsafe(stmt);
     await fn(db);
   } finally {
     await db.disconnect();
@@ -245,7 +245,7 @@ describe('powdb integration (embedded)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'powdb-it-close-'));
     const db: DB = await turbinePowDB({ embedded: dir }, schema, { warnOnUnlimited: false });
     try {
-      for (const stmt of powqlSchemaDDL(schema)) await db.raw([stmt]);
+      for (const stmt of powqlSchemaDDL(schema)) await db.rawUnsafe(stmt);
       await db.table('app_user').create({ data: { email: 'pre-close@x' } });
       await db.disconnect();
       await assert.rejects(() => db.table('app_user').count({}), ConnectionError);
@@ -258,7 +258,7 @@ describe('powdb integration (embedded)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'powdb-it-sync-'));
     const db: DB = await turbinePowDB({ embedded: dir, syncMode: 'normal' }, schema, { warnOnUnlimited: false });
     try {
-      for (const stmt of powqlSchemaDDL(schema)) await db.raw([stmt]);
+      for (const stmt of powqlSchemaDDL(schema)) await db.rawUnsafe(stmt);
       const u = await db.table('app_user').create({ data: { name: 'Norm', email: 'norm@x', age: 1, score: 1.5 } });
       assert.equal(u.email, 'norm@x');
       const found = await db.table('app_user').findUnique({ where: { email: 'norm@x' } });
@@ -336,7 +336,6 @@ describe('powdb integration (embedded)', () => {
         ],
       });
       const cases: Record<string, unknown>[] = [
-        { OR: [] },
         { AND: [] },
         { NOT: {} },
         {},
@@ -478,7 +477,7 @@ describe('powdb integration (embedded)', () => {
       transactionQueueTimeoutMs: 150,
     });
     try {
-      for (const stmt of powqlSchemaDDL(schema)) await db.raw([stmt]);
+      for (const stmt of powqlSchemaDDL(schema)) await db.rawUnsafe(stmt);
       const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
       const tx1 = db.$transaction(async (tx: DB) => {
         await tx.table('app_user').create({ data: { email: 'atomic-a@x', name: 'A' } });
@@ -546,8 +545,8 @@ describe('powdb integration (embedded)', () => {
     const dbA: DB = await turbinePowDB({ embedded: dirA }, schema, opts);
     const dbB: DB = await turbinePowDB({ embedded: dirB }, schema, opts);
     try {
-      for (const stmt of powqlSchemaDDL(schema)) await dbA.raw([stmt]);
-      for (const stmt of powqlSchemaDDL(schema)) await dbB.raw([stmt]);
+      for (const stmt of powqlSchemaDDL(schema)) await dbA.rawUnsafe(stmt);
+      for (const stmt of powqlSchemaDDL(schema)) await dbB.rawUnsafe(stmt);
       const start = Date.now();
       await assert.rejects(
         dbA.$transaction(async (txA: DB) => {
@@ -687,7 +686,7 @@ async function withPb(fn: (db: DB) => Promise<void>): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'powdb-pb-'));
   const db: DB = await turbinePowDB({ embedded: dir, syncMode: 'normal' }, pbSchema, { warnOnUnlimited: false });
   try {
-    for (const stmt of powqlSchemaDDL(pbSchema)) await db.raw([stmt]);
+    for (const stmt of powqlSchemaDDL(pbSchema)) await db.rawUnsafe(stmt);
     await fn(db);
   } finally {
     await db.disconnect();
@@ -876,8 +875,8 @@ async function withDocDb(fn: (db: DB) => Promise<void>): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'powdb-json-it-'));
   const db: DB = await turbinePowDB({ embedded: dir }, docSchema, { warnOnUnlimited: false });
   try {
-    await db.raw([`drop doc`]).catch(() => {});
-    for (const stmt of powqlSchemaDDL(docSchema)) await db.raw([stmt]);
+    await db.rawUnsafe(`drop doc`).catch(() => {});
+    for (const stmt of powqlSchemaDDL(docSchema)) await db.rawUnsafe(stmt);
     await fn(db);
   } finally {
     await db.disconnect();
@@ -888,9 +887,9 @@ async function withDocDb(fn: (db: DB) => Promise<void>): Promise<void> {
 /** Insert one doc row via raw PowQL, encoding `data` as a json document. */
 async function insertDoc(db: DB, id: string, data: PowdbJsonParam | null, s?: string | null): Promise<void> {
   if (s === undefined) {
-    await db.raw(['insert doc { id := ', ', data := ', ' } returning'], id, data);
+    await db.raw`insert doc { id := ${id}, data := ${data} } returning`;
   } else {
-    await db.raw(['insert doc { id := ', ', data := ', ', s := ', ' } returning'], id, data, s);
+    await db.raw`insert doc { id := ${id}, data := ${data}, s := ${s} } returning`;
   }
 }
 
@@ -994,27 +993,19 @@ describe('powdb integration (embedded): doc-field expression index DDL', () => {
       );
       assert.ok(ddl.some((s) => s === 'alter doc add unique (.data->"ext")'));
       // The real engine ACCEPTS every statement (a malformed path would throw).
-      for (const stmt of ddl) await db.raw([stmt]);
+      for (const stmt of ddl) await db.rawUnsafe(stmt);
 
       // Seed docs and query over the indexed path via raw PowQL (F1's ORM-level
       // JsonFilter lands separately; the index must not alter results either way).
-      await db.raw(
-        ['insert doc { id := ', ', data := ', ' } returning'],
-        'a',
-        new PowdbJsonParam({ ns: { value: 7 }, ext: 'x1' }),
-      );
-      await db.raw(
-        ['insert doc { id := ', ', data := ', ' } returning'],
-        'b',
-        new PowdbJsonParam({ ns: { value: 9 }, ext: 'x2' }),
-      );
+      await db.raw`insert doc { id := ${'a'}, data := ${new PowdbJsonParam({ ns: { value: 7 }, ext: 'x1' })} } returning`;
+      await db.raw`insert doc { id := ${'b'}, data := ${new PowdbJsonParam({ ns: { value: 9 }, ext: 'x2' })} } returning`;
 
-      const hit = (await db.raw(['doc filter .data->"ns"->"value" = 7 { .id }'])) as { id: string }[];
+      const hit = (await db.rawUnsafe('doc filter .data->"ns"->"value" = 7 { .id }')) as { id: string }[];
       assert.deepEqual(
         hit.map((r) => r.id),
         ['a'],
       );
-      const miss = (await db.raw(['doc filter .data->"ns"->"value" = 8 { .id }'])) as { id: string }[];
+      const miss = (await db.rawUnsafe('doc filter .data->"ns"->"value" = 8 { .id }')) as { id: string }[];
       assert.deepEqual(miss, []);
 
       // The unique doc-field index is enforced by the engine: a duplicate `ext`
@@ -1022,13 +1013,13 @@ describe('powdb integration (embedded): doc-field expression index DDL', () => {
       // message maps to UniqueConstraintError (E008) like the regular
       // "unique constraint violation" wording.
       await assert.rejects(
-        () => db.raw(['insert doc { id := ', ', data := ', ' } returning'], 'c', new PowdbJsonParam({ ext: 'x1' })),
+        () => db.raw`insert doc { id := ${'c'}, data := ${new PowdbJsonParam({ ext: 'x1' })} } returning`,
         (err: Error & { code?: string }) => err.code === 'TURBINE_E008',
       );
 
       // The drop path works (design mentions `alter … drop index`).
-      await db.raw(['alter doc drop index (.data->"ns"->"value")']);
-      const stillHit = (await db.raw(['doc filter .data->"ns"->"value" = 9 { .id }'])) as { id: string }[];
+      await db.rawUnsafe('alter doc drop index (.data->"ns"->"value")');
+      const stillHit = (await db.rawUnsafe('doc filter .data->"ns"->"value" = 9 { .id }')) as { id: string }[];
       assert.deepEqual(
         stillHit.map((r) => r.id),
         ['b'],
@@ -1071,8 +1062,8 @@ async function withJsonDb(fn: (db: DB) => Promise<void>): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'powdb-json2-it-'));
   const db: DB = await turbinePowDB({ embedded: dir }, jsonSchema, { warnOnUnlimited: false });
   try {
-    for (const t of ['jdoc', 'owner', 'item']) await db.raw([`drop ${t}`]).catch(() => {});
-    for (const stmt of powqlSchemaDDL(jsonSchema)) await db.raw([stmt]);
+    for (const t of ['jdoc', 'owner', 'item']) await db.rawUnsafe(`drop ${t}`).catch(() => {});
+    for (const stmt of powqlSchemaDDL(jsonSchema)) await db.rawUnsafe(stmt);
     await fn(db);
   } finally {
     await db.disconnect();
@@ -1297,9 +1288,9 @@ describe('powdb integration (embedded): describe-based introspection', () => {
     const dir = mkdtempSync(join(tmpdir(), 'powdb-introspect-it-'));
     const db: DB = await turbinePowDB({ embedded: dir }, wSchema, { warnOnUnlimited: false });
     try {
-      for (const stmt of powqlSchemaDDL(wSchema)) await db.raw([stmt]);
+      for (const stmt of powqlSchemaDDL(wSchema)) await db.rawUnsafe(stmt);
 
-      const exec = async (powql: string) => ({ rows: await db.raw([powql]) });
+      const exec = async (powql: string) => ({ rows: await db.rawUnsafe(powql) });
       const meta = await introspectPowdbDatabase(exec);
 
       const widget = meta.tables.widget!;
@@ -1326,7 +1317,7 @@ describe('powdb integration (embedded): describe-based introspection', () => {
       // Every `unique` column is a singleton unique set (id + label).
       assert.deepEqual(widget.uniqueColumns.map((u) => u[0]).sort(), ['id', 'label']);
       // Relations are always empty (PowDB has no declared FKs).
-      assert.deepEqual(widget.relations, {});
+      assert.deepEqual({ ...widget.relations }, {});
       // The doc-field expression index is invisible to `describe` → absent.
       assert.ok(!widget.indexes.some((i) => i.docPath), 'expression indexes do not round-trip');
       // The two column-level unique indexes (id, label) DO appear.
@@ -1353,10 +1344,10 @@ describe('powdb integration (embedded): describe-based introspection', () => {
     const db1: DB = await turbinePowDB({ embedded: dir1 }, wSchema, { warnOnUnlimited: false });
     let meta: SchemaMetadata;
     try {
-      for (const stmt of powqlSchemaDDL(wSchema)) await db1.raw([stmt]);
+      for (const stmt of powqlSchemaDDL(wSchema)) await db1.rawUnsafe(stmt);
       // Introspect the live database into fresh metadata (no rows needed; the
       // catalog shape is what drives the generated client).
-      meta = await introspectPowdbDatabase(async (q: string) => ({ rows: await db1.raw([q]) }));
+      meta = await introspectPowdbDatabase(async (q: string) => ({ rows: await db1.rawUnsafe(q) }));
     } finally {
       await db1.disconnect();
     }
@@ -1365,26 +1356,10 @@ describe('powdb integration (embedded): describe-based introspection', () => {
     const db2: DB = await turbinePowDB({ embedded: dir2 }, meta, { warnOnUnlimited: false });
     try {
       // 1) The introspected metadata provisions the schema (json column + PK).
-      for (const stmt of powqlSchemaDDL(meta)) await db2.raw([stmt]);
+      for (const stmt of powqlSchemaDDL(meta)) await db2.rawUnsafe(stmt);
       // 2) Seed via raw PowQL (the ORM-level json write path lands with F1); the
       //    json column rides in a PowdbJsonParam the embedded pool materializes.
-      await db2.raw(
-        [
-          'insert widget { id := ',
-          ', label := ',
-          ', qty := ',
-          ', score := ',
-          ', active := ',
-          ', data := ',
-          ' } returning',
-        ],
-        'w1',
-        'Ada',
-        5,
-        1.5,
-        true,
-        new PowdbJsonParam({ k: 1 }),
-      );
+      await db2.raw`insert widget { id := ${'w1'}, label := ${'Ada'}, qty := ${5}, score := ${1.5}, active := ${true}, data := ${new PowdbJsonParam({ k: 1 })} } returning`;
       // 3) Query through the TurbineClient built on the introspected metadata.
       const rows = await db2.table('widget').findMany({ where: { id: 'w1' } });
       assert.equal(rows.length, 1);
@@ -1443,7 +1418,7 @@ describe('powdb integration (networked): F1 param-in-segment JSON filters over T
     };
     const liveDb: DB = await turbinePowDB(powdbUrl!, liveSchema, { warnOnUnlimited: false });
     try {
-      for (const stmt of powqlSchemaDDL(liveSchema)) await liveDb.raw([stmt]);
+      for (const stmt of powqlSchemaDDL(liveSchema)) await liveDb.rawUnsafe(stmt);
       await liveDb.table(t).create({ data: { id: 'a', data: { ns: { value: 7 } } } });
       await liveDb.table(t).create({ data: { id: 'b', data: { ns: { value: 9 } } } });
       const hit = await liveDb.table(t).findMany({ where: { data: { path: ['ns', 'value'], equals: 7 } } });
@@ -1461,7 +1436,7 @@ describe('powdb integration (networked): F1 param-in-segment JSON filters over T
         ['b', 'a'],
       );
     } finally {
-      await liveDb.raw([`drop ${t}`]).catch(() => {});
+      await liveDb.rawUnsafe(`drop ${t}`).catch(() => {});
       await liveDb.disconnect();
       await db.disconnect();
     }
@@ -1483,11 +1458,11 @@ describe('powdb integration (networked): F2/F3 native-wire shapes', () => {
     const liveSchema: SchemaMetadata = { enums: {}, tables: { [t]: makeTable(t, cols) } };
     const db: DB = await turbinePowDB(powdbUrl!, liveSchema, { warnOnUnlimited: false });
     try {
-      await db.raw([`drop ${t}`]).catch(() => {});
-      for (const stmt of powqlSchemaDDL(liveSchema)) await db.raw([stmt]);
+      await db.rawUnsafe(`drop ${t}`).catch(() => {});
+      for (const stmt of powqlSchemaDDL(liveSchema)) await db.rawUnsafe(stmt);
       await fn(db, t);
     } finally {
-      await db.raw([`drop ${t}`]).catch(() => {});
+      await db.rawUnsafe(`drop ${t}`).catch(() => {});
       await db.disconnect();
     }
   }
@@ -1584,7 +1559,7 @@ describe('powdb integration (networked): F2/F3 native-wire shapes', () => {
         col('label', 'label', 'string', 'text', { nullable: true }),
       ],
       async (db, t) => {
-        const exec = async (q: string) => ({ rows: await db.raw([q]) });
+        const exec = async (q: string) => ({ rows: await db.rawUnsafe(q) });
         const meta = await introspectPowdbDatabase(exec, { include: [t] });
         assert.deepEqual(Object.keys(meta.tables), [t]);
         assert.ok(meta.tables[t]!.columns.some((c) => c.name === 'label'));
@@ -1621,9 +1596,9 @@ describe('powdb integration (networked): F2/F3 native-wire shapes', () => {
     };
     const db: DB = await turbinePowDB(powdbUrl!, dtSchema, { warnOnUnlimited: false });
     try {
-      await db.raw([`drop ${sName}`]).catch(() => {});
-      await db.raw([`drop ${eName}`]).catch(() => {});
-      for (const stmt of powqlSchemaDDL(dtSchema)) await db.raw([stmt]);
+      await db.rawUnsafe(`drop ${sName}`).catch(() => {});
+      await db.rawUnsafe(`drop ${eName}`).catch(() => {});
+      for (const stmt of powqlSchemaDDL(dtSchema)) await db.rawUnsafe(stmt);
       const s0 = await db.table(sName).create({ data: { at: new Date('2024-01-01T00:00:00.000Z') } });
       const s1 = await db.table(sName).create({ data: { at: new Date('2024-06-15T12:30:00.000Z') } });
       await db.table(eName).createMany({
@@ -1640,8 +1615,8 @@ describe('powdb integration (networked): F2/F3 native-wire shapes', () => {
       assert.equal(viaJoin[0].events.length, 2);
       assert.equal(viaJoin[1].events.length, 1);
     } finally {
-      await db.raw([`drop ${sName}`]).catch(() => {});
-      await db.raw([`drop ${eName}`]).catch(() => {});
+      await db.rawUnsafe(`drop ${sName}`).catch(() => {});
+      await db.rawUnsafe(`drop ${eName}`).catch(() => {});
       await db.disconnect();
     }
   });
@@ -1713,7 +1688,7 @@ describe('powdb integration (networked): F2/F3 native-wire shapes', () => {
         await db.table(t).create({ data: { id: 1, total: 5, label: 'a' } });
         await db.table(t).create({ data: { id: 2, total: 15, label: 'b' } });
         // Row 3 omits label (a missing value; SQL-NULL-equivalent).
-        await db.raw([`insert ${t} { id := 3, total := 25 }`]);
+        await db.rawUnsafe(`insert ${t} { id := 3, total := 25 }`);
         const ids = (rows: { id: number }[]) => rows.map((r) => Number(r.id)).sort((a, b) => a - b);
         assert.deepEqual(ids(await db.table(t).findMany({ where: { label: { not: 'a' } } })), [2]);
         assert.deepEqual(ids(await db.table(t).findMany({ where: { label: { notIn: ['a'] } } })), [2]);
@@ -1752,8 +1727,8 @@ async function withNativeDb(fn: (db: DB) => Promise<void>): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'powdb-native-it-'));
   const db: DB = await turbinePowDB({ embedded: dir }, nativeSchema, { warnOnUnlimited: false });
   try {
-    await db.raw(['drop app_user']).catch(() => {});
-    for (const stmt of powqlSchemaDDL(nativeSchema)) await db.raw([stmt]);
+    await db.rawUnsafe('drop app_user').catch(() => {});
+    for (const stmt of powqlSchemaDDL(nativeSchema)) await db.rawUnsafe(stmt);
     await fn(db);
   } finally {
     await db.disconnect();
@@ -1850,7 +1825,7 @@ describe('powdb integration (embedded): F3 read-only target', () => {
       // 1) Seed the directory with a writable handle, then close it so the WAL
       //    is flushed (openReadOnly refuses a directory with a non-empty WAL).
       const writable: DB = await turbinePowDB({ embedded: dir }, nativeSchema, { warnOnUnlimited: false });
-      for (const stmt of powqlSchemaDDL(nativeSchema)) await writable.raw([stmt]);
+      for (const stmt of powqlSchemaDDL(nativeSchema)) await writable.rawUnsafe(stmt);
       await writable.table('app_user').create({ data: { id: 'u1', name: 'Ada', age: 30 } });
       await writable.disconnect();
 
@@ -1873,7 +1848,7 @@ describe('powdb integration (embedded): F3 read-only target', () => {
         // A raw injected write bypasses any client-side classification and hits
         // the engine directly, its refusal still maps to ReadOnlyError (E018).
         await assert.rejects(
-          () => ro.raw(['insert app_user { id := "u3", name := "Cy" } returning']),
+          () => ro.rawUnsafe('insert app_user { id := "u3", name := "Cy" } returning'),
           (err: Error & { code?: string }) => err instanceof ReadOnlyError && err.code === 'TURBINE_E018',
         );
 
@@ -1922,7 +1897,7 @@ describe('powdb integration (embedded): NUL bytes in non-unique indexed strings 
     const dir = mkdtempSync(join(tmpdir(), 'powdb-nul-it-'));
     const db: DB = await turbinePowDB({ embedded: dir }, nulIdxSchema, { warnOnUnlimited: false });
     try {
-      for (const stmt of powqlSchemaDDL(nulIdxSchema)) await db.raw([stmt]);
+      for (const stmt of powqlSchemaDDL(nulIdxSchema)) await db.rawUnsafe(stmt);
 
       const tags = ['A', 'A\u0000', 'A\u0000B', 'B'];
       for (const [i, tag] of tags.entries()) await db.tagged.create({ data: { tag, n: i } });
@@ -2048,7 +2023,7 @@ async function withNestedDb(fn: (db: DB, sqls: string[]) => Promise<void>): Prom
   const sqls: string[] = [];
   db.$on('query', (e: { sql: string }) => sqls.push(e.sql));
   try {
-    for (const stmt of powqlSchemaDDL(nestedSchema)) await db.raw([stmt]);
+    for (const stmt of powqlSchemaDDL(nestedSchema)) await db.rawUnsafe(stmt);
     // Ada: three posts + a profile; Bob: none of either.
     await db.nUser.create({ data: { id: 'u1', name: 'Ada', joinedAt: new Date('2026-01-02T03:04:05Z') } });
     await db.nUser.create({ data: { id: 'u2', name: 'Bob' } });
@@ -2196,11 +2171,11 @@ async function withLinkDb(fn: (db: DB) => Promise<void>): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'powdb-links-it-'));
   const db: DB = await turbinePowDB({ embedded: dir }, linkSchema, { warnOnUnlimited: false });
   try {
-    for (const stmt of powqlSchemaDDL(linkSchema)) await db.raw([stmt]);
+    for (const stmt of powqlSchemaDDL(linkSchema)) await db.rawUnsafe(stmt);
     // Links are declared via raw PowQL: powqlSchemaDDL deliberately does NOT emit
     // `link` DDL this round (declaring one one-way-upgrades the catalog to v7).
-    await db.raw(['link l_order.user -> l_user on user_id = id']);
-    await db.raw(['link l_user.orders -> l_order on id = user_id']);
+    await db.rawUnsafe('link l_order.user -> l_user on user_id = id');
+    await db.rawUnsafe('link l_user.orders -> l_order on id = user_id');
     await fn(db);
   } finally {
     await db.disconnect();
@@ -2215,18 +2190,21 @@ describe('powdb integration (embedded): entity links (0.19 catalog v7)', () => {
       await db.lOrder.create({ data: { id: 1, userId: 1, total: 9.5, label: 'a' } });
       await db.lOrder.create({ data: { id: 2, userId: 1, total: 20.25, label: 'b' } });
       // A NULL FK order traverses to an empty scalar, never dropping the row.
-      await db.raw(['insert l_order { id := 3, total := 1.0 }']);
+      await db.rawUnsafe('insert l_order { id := 3, total := 1.0 }');
 
       // Scalar to-one hop: `o.user.name` (aliased form; the published 0.19.0 bare
       // dotted-path is buggy, so turbine's future adoption would alias-qualify too).
-      const scalar = (await db.raw(['l_order as o { o.id, o.user.name } order o.id asc'])) as Record<string, unknown>[];
+      const scalar = (await db.rawUnsafe('l_order as o { o.id, o.user.name } order o.id asc')) as Record<
+        string,
+        unknown
+      >[];
       assert.equal(scalar.length, 3, 'null / dangling FK rows are not dropped by the hop');
       assert.equal(Number(scalar[0]!['o.id']), 1);
       assert.equal(scalar[0]!['o.user.name'], 'alice');
       assert.equal(scalar[2]!['o.user.name'], null, 'the NULL-FK order hops to an empty target');
 
       // To-many block traversal: `u.orders { total }` returns a per-parent array.
-      const block = (await db.raw(['l_user as u { u.name, orders: u.orders { total } } order u.id asc'])) as Record<
+      const block = (await db.rawUnsafe('l_user as u { u.name, orders: u.orders { total } } order u.id asc')) as Record<
         string,
         unknown
       >[];
@@ -2244,14 +2222,14 @@ describe('powdb integration (embedded): entity links (0.19 catalog v7)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'powdb-links-reopen-'));
     let db: DB = await turbinePowDB({ embedded: dir }, linkSchema, { warnOnUnlimited: false });
     try {
-      for (const stmt of powqlSchemaDDL(linkSchema)) await db.raw([stmt]);
-      await db.raw(['link l_order.user -> l_user on user_id = id']);
+      for (const stmt of powqlSchemaDDL(linkSchema)) await db.rawUnsafe(stmt);
+      await db.rawUnsafe('link l_order.user -> l_user on user_id = id');
       await db.lUser.create({ data: { id: 1, name: 'alice' } });
       await db.lOrder.create({ data: { id: 1, userId: 1, total: 9.5, label: 'a' } });
       await db.disconnect();
       // Reopen the SAME data directory: the v7 catalog (and its link) must survive.
       db = await turbinePowDB({ embedded: dir }, linkSchema, { warnOnUnlimited: false });
-      const scalar = (await db.raw(['l_order as o { o.id, o.user.name }'])) as Record<string, unknown>[];
+      const scalar = (await db.rawUnsafe('l_order as o { o.id, o.user.name }')) as Record<string, unknown>[];
       assert.equal(scalar.length, 1);
       assert.equal(scalar[0]!['o.user.name'], 'alice', 'the link survived a reopen without re-declaration');
     } finally {
@@ -2269,7 +2247,7 @@ describe('powdb integration (embedded): entity links (0.19 catalog v7)', () => {
         await db.lOrder.create({ data: { id: 2, userId: 1, total: 15, label: 'b' } });
         // Row 3 OMITS label entirely (a missing value). SQL treats it as NULL, so it
         // is excluded from `not`, `notIn`, and `gt` results.
-        await db.raw(['insert l_order { id := 3, user_id := 1, total := 25 }']);
+        await db.rawUnsafe('insert l_order { id := 3, user_id := 1, total := 25 }');
         const ids = (rows: { id: number }[]) => rows.map((r) => Number(r.id)).sort((a, b) => a - b);
 
         // not 'a' EXCLUDES the missing-label row (row 3), matching SQL (the whole
@@ -2341,10 +2319,10 @@ async function withLinkPathDb(fn: (db: DB) => Promise<void>, declareLinks = true
   const dir = mkdtempSync(join(tmpdir(), 'powdb-linkpath-it-'));
   const db: DB = await turbinePowDB({ embedded: dir }, linkPathSchema, { warnOnUnlimited: false });
   try {
-    for (const stmt of powqlSchemaDDL(linkPathSchema)) await db.raw([stmt]);
+    for (const stmt of powqlSchemaDDL(linkPathSchema)) await db.rawUnsafe(stmt);
     if (declareLinks) {
-      await db.raw(['link lp_order.account -> lp_account on account_id = id']);
-      await db.raw(['link lp_account.orders -> lp_order on id = account_id']);
+      await db.rawUnsafe('link lp_order.account -> lp_account on account_id = id');
+      await db.rawUnsafe('link lp_account.orders -> lp_order on id = account_id');
     }
     await fn(db);
   } finally {
@@ -2356,7 +2334,7 @@ async function withLinkPathDb(fn: (db: DB) => Promise<void>, declareLinks = true
 describe('powdb integration (embedded): 0.19.1 link introspection + scalar link paths', () => {
   link11It('describe drops link rows; schema links populates SchemaMetadata.relations', async () => {
     await withLinkPathDb(async (db) => {
-      const exec = async (q: string) => ({ rows: await db.raw([q]) });
+      const exec = async (q: string) => ({ rows: await db.rawUnsafe(q) });
       // A big enough balance to prove the native bigint wire (beyond 2^53).
       await db.lpAccount.create({ data: { id: 1, name: 'acme', balance: 9007199254740993n } });
       const caps = capabilitiesFromVersion('0.19.1');
@@ -2380,7 +2358,7 @@ describe('powdb integration (embedded): 0.19.1 link introspection + scalar link 
       await db.lpAccount.create({ data: { id: 1, name: 'acme', balance: 9007199254740993n } });
       await db.lpOrder.create({ data: { id: 1, accountId: 1, total: 9.5 } });
       // A NULL-FK order: its to-one account is absent on both paths.
-      await db.raw(['insert lp_order { id := 2, total := 1.0 }']);
+      await db.rawUnsafe('insert lp_order { id := 2, total := 1.0 }');
 
       // Loader path (explicit batched) vs the default (link path, since the child
       // carries a bigint the JSON block cannot). Both must be identical.
@@ -2401,7 +2379,7 @@ describe('powdb integration (embedded): 0.19.1 link introspection + scalar link 
   link11It('applyPowdbLinks is idempotent: second run declares nothing', async () => {
     // Do NOT pre-declare links: applyPowdbLinks should create them, then skip.
     await withLinkPathDb(async (db) => {
-      const exec = async (q: string) => ({ rows: await db.raw([q]) });
+      const exec = async (q: string) => ({ rows: await db.rawUnsafe(q) });
       const first = await applyPowdbLinks(exec, linkPathSchema);
       assert.ok(first.length >= 1, 'first apply creates the missing links');
       const second = await applyPowdbLinks(exec, linkPathSchema);
@@ -2413,14 +2391,14 @@ describe('powdb integration (embedded): 0.19.1 link introspection + scalar link 
     await withLinkPathDb(async (db) => {
       // Bare dotted projection path (not alias-qualified) → parse error with hint.
       await assert.rejects(
-        db.raw(['lp_order { .account.name }']),
+        db.rawUnsafe('lp_order { .account.name }'),
         (e: unknown) => e instanceof ValidationError,
         'bare dotted link path is a ValidationError',
       );
       // Aggregate OVER a link projection → rejected (the aggregate would ignore
       // the projection and count parent rows; the engine refuses).
       await assert.rejects(
-        db.raw(['count(lp_order as o { o.account.name })']),
+        db.rawUnsafe('count(lp_order as o { o.account.name })'),
         (e: unknown) => e instanceof ValidationError,
         'aggregate over a link projection is a ValidationError',
       );
@@ -2486,10 +2464,10 @@ async function withDatetimeDb(fn: (db: DB) => Promise<void>): Promise<void> {
   try {
     // Raw DDL: `powqlSchemaDDL` would emit `ts: int` (Turbine never writes the
     // datetime type), and an int column would not exercise the bug at all.
-    await db.raw(['type dt_event {\n required unique id: int,\n ts: datetime,\n n: int,\n label: str\n}']);
+    await db.rawUnsafe('type dt_event {\n required unique id: int,\n ts: datetime,\n n: int,\n label: str\n}');
     await db.dtEvent.create({ data: { id: 1, ts: DT_EARLY, n: DT_EARLY.getTime() * 1000, label: 'early' } });
     await db.dtEvent.create({ data: { id: 2, ts: DT_LATE, n: DT_LATE.getTime() * 1000, label: 'late' } });
-    await db.raw(['insert dt_event { id := 3 }']); // no ts, no n, no label: a missing value
+    await db.rawUnsafe('insert dt_event { id := 3 }'); // no ts, no n, no label: a missing value
     await fn(db);
   } finally {
     await db.disconnect();
@@ -2576,8 +2554,8 @@ describe('powdb integration (embedded): 0.20 datetime comparisons', () => {
       // identical list against the int control column answers correctly. When
       // upstream extends the 0.20 fix to the list forms this test FAILS, which is
       // the signal to drop the expansion (and its term cap) above.
-      const dtRows = await db.raw([`dt_event filter .ts in (${micros.join(', ')}) { .id }`]);
-      const intRows = await db.raw([`dt_event filter .n in (${micros.join(', ')}) { .id }`]);
+      const dtRows = await db.rawUnsafe(`dt_event filter .ts in (${micros.join(', ')}) { .id }`);
+      const intRows = await db.rawUnsafe(`dt_event filter .n in (${micros.join(', ')}) { .id }`);
       assert.equal(intRows.length, 2, 'the int control column matches both rows');
       assert.equal(dtRows.length, 0, 'upstream: a datetime `in` list still matches nothing');
     });
@@ -2594,7 +2572,7 @@ describe('powdb integration (embedded): 0.20 datetime comparisons', () => {
       assumeEngineVersion: '0.19.1',
     });
     try {
-      await db.raw(['type dt_event {\n required unique id: int,\n ts: datetime,\n n: int,\n label: str\n}']);
+      await db.rawUnsafe('type dt_event {\n required unique id: int,\n ts: datetime,\n n: int,\n label: str\n}');
       // ONE gate covers the whole family, whatever spelling reached it: the `in`
       // form is an equality chain by the time it would run, so it is refused by
       // the same rule rather than by a separate `in`-only one.
@@ -2648,9 +2626,9 @@ describe('powdb integration (embedded): 0.20 behavior changes', () => {
       assumeEngineVersion: '0.19.1',
     });
     try {
-      await db.raw(['type dt_event {\n required unique id: int,\n ts: datetime,\n n: int,\n label: str\n}']);
-      await db.raw(['insert dt_event { id := 1, label := "a" }']);
-      await db.raw(['insert dt_event { id := 2 }']);
+      await db.rawUnsafe('type dt_event {\n required unique id: int,\n ts: datetime,\n n: int,\n label: str\n}');
+      await db.rawUnsafe('insert dt_event { id := 1, label := "a" }');
+      await db.rawUnsafe('insert dt_event { id := 2 }');
       await assert.rejects(
         db.dtEvent.aggregate({ _count: { label: true } }),
         (e: unknown) =>
@@ -2695,14 +2673,14 @@ describe('powdb integration (embedded): 0.20 behavior changes', () => {
       // made `filter .agee = null` match EVERY row, into an error). Turbine
       // validates its own metadata first, so reach the engine through raw PowQL.
       await assert.rejects(
-        db.raw(['dt_event filter .agee = 1 { .id }']),
+        db.rawUnsafe('dt_event filter .agee = 1 { .id }'),
         (e: unknown) => e instanceof ValidationError && /"agee"/.test((e as Error).message),
         'unknown column is a ValidationError naming the column',
       );
       // Type-mismatched comparison (0.20 turned this from "true for every row"
       // into an error).
       await assert.rejects(
-        db.raw(['dt_event filter .label > 25 { .id }']),
+        db.rawUnsafe('dt_event filter .label > 25 { .id }'),
         (e: unknown) => e instanceof ValidationError && /"label"/.test((e as Error).message),
         'type-mismatched comparison is a ValidationError naming the column',
       );
@@ -2711,14 +2689,14 @@ describe('powdb integration (embedded): 0.20 behavior changes', () => {
       // has to say what to do about it.
       const chain = Array.from({ length: 200 }, (_, i) => `.id = ${i + 1}`).join(' or ');
       await assert.rejects(
-        db.raw([`dt_event filter ${chain} { .id }`]),
+        db.rawUnsafe(`dt_event filter ${chain} { .id }`),
         (e: unknown) => e instanceof ValidationError && /Split a large `OR` \/ `AND` array/.test((e as Error).message),
         'a too-long operator chain is a ValidationError with a split-it hint',
       );
       // A literal `in` list is ONE flat node, not a chain, so the same term count
       // is accepted. This is what keeps Turbine's relation-key chunking safe.
       const list = Array.from({ length: 200 }, (_, i) => i + 1).join(', ');
-      assert.equal((await db.raw([`dt_event filter .id in (${list}) { .id }`])).length, 3);
+      assert.equal((await db.rawUnsafe(`dt_event filter .id in (${list}) { .id }`)).length, 3);
     });
   });
 });
@@ -2763,8 +2741,8 @@ async function withDatetimeRelDb(fn: (db: DB) => Promise<void>): Promise<void> {
   const dir = mkdtempSync(join(tmpdir(), 'powdb-dtrel-it-'));
   const db: DB = await turbinePowDB({ embedded: dir }, dtRelSchema, { warnOnUnlimited: false });
   try {
-    await db.raw(['type dt_parent {\n required unique id: int,\n ts: datetime\n}']);
-    await db.raw(['type dt_kid {\n required unique id: int,\n pts: datetime,\n cts: datetime,\n tag: str\n}']);
+    await db.rawUnsafe('type dt_parent {\n required unique id: int,\n ts: datetime\n}');
+    await db.rawUnsafe('type dt_kid {\n required unique id: int,\n pts: datetime,\n cts: datetime,\n tag: str\n}');
     await db.dtParent.create({ data: { id: 1, ts: DT_EARLY } });
     await db.dtParent.create({ data: { id: 2, ts: DT_LATE } });
     await db.dtKid.create({ data: { id: 10, pts: DT_EARLY, cts: DT_MID, tag: 'k' } });

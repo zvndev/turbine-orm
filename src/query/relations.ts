@@ -14,14 +14,23 @@
  */
 
 import type { JsonWireRule } from '../dialect.js';
-import { CircularRelationError, RelationError, UnsupportedFeatureError, ValidationError } from '../errors.js';
+import {
+  CircularRelationError,
+  InvariantError,
+  RelationError,
+  UnsupportedFeatureError,
+  ValidationError,
+} from '../errors.js';
 import { missingIndexForRelation } from '../index-advisor.js';
+import { logTo } from '../logger.js';
 import type { RelationDef, TableMetadata } from '../schema.js';
 import { normalizeKeyColumns, snakeToCamel } from '../schema.js';
-import { resolveCountRelations } from './batched-loader.js';
+import { resolveCountRelations, stitchOnlyFields } from './batched-loader.js';
 import {
+  describeOperand,
   isJsonPathOrderBy,
   isOrderBySpec,
+  isPlainRecord,
   isRelationPickOrderBy,
   isVectorOrderBy,
   MAX_NAMED_ORDER_KEYS,
@@ -50,6 +59,7 @@ import {
   resolveRelationDef,
   selectNamesNothingMessage,
   selectOmitExclusiveMessage,
+  suggestKey,
   unknownFieldMessage,
 } from './utils.js';
 import { hasWarnedOnce, shouldWarnOnce, WARN_NS } from './warn-registry.js';
@@ -96,6 +106,22 @@ function projectionColumn(table: string, meta: TableMetadata, field: string, cla
   if (resolveRelationDef(meta.relations, field))
     throw new ValidationError(relationInProjectionMessage(table, field, clause));
   throw new ValidationError(unknownFieldMessage(table, field, meta));
+}
+
+/**
+ * The E003 text for a PII-tagged column named in `select` without
+ * `includePii: UNSAFE`. Shared by every projection path through
+ * {@link resolveProjection}, so a top-level read, a `with` relation (join,
+ * batched, flatten and positional alike) and a single-row write refuse in the
+ * same words. The write path is named because it cannot pass the opt-in at all.
+ */
+export function piiSelectRefusedMessage(table: string, field: string): string {
+  return (
+    `\`select\` on "${table}" names "${field}", which is tagged PII. A PII column is returned only by a read that ` +
+    'passes `includePii: UNSAFE` (import { UNSAFE } from "turbine-orm"); naming it in `select` does not unlock it, ' +
+    'because `select` can arrive in request data and must not be able to. A write never returns a PII column, so ' +
+    `read the row back with \`includePii: UNSAFE\`, or remove "${field}" from \`select\`.`
+  );
 }
 
 /**
@@ -176,8 +202,15 @@ export function resolveProjection(
         `"select" must be an object mapping field names to true ` + `(e.g. { id: true, name: true }), not an array.`,
       );
     }
-    // Only include columns where value is true. An explicit `select` naming a
-    // PII column IS the opt-in: it comes back regardless of `includePii`.
+    // Only include columns where value is true.
+    //
+    // A PII-tagged column named here needs `includePii: UNSAFE`, exactly like
+    // the default-projection path below. `select` is ordinary request data (a
+    // parsed query string is a `select` object), and the `UNSAFE` symbol is the
+    // one thing a request cannot produce, so letting a bare `select: { ssn: true }`
+    // unlock the column would make the privilege option decorative. The one
+    // exemption is a key the batched loader added to stitch rows together
+    // (STITCH_ONLY_FIELDS), which it strips before the caller sees any entity.
     //
     // Emitted in the TABLE's column order, not the caller's key order, which is
     // the same order the `omit` and default branches below produce. Two reasons,
@@ -205,11 +238,19 @@ export function resolveProjection(
     // keys are all derived from it, so they move together. The one observable
     // consequence is that a projected row's KEY INSERTION order now follows the
     // table rather than the `select` literal.
+    const piiCols = includePii ? undefined : writesMod.piiColumns(qi, meta);
+    const stitchOnly = piiCols && piiCols.size > 0 ? stitchOnlyFields(select) : undefined;
     return canonicalColumnOrder(
       meta,
       Object.entries(select)
         .filter(([, v]) => v)
-        .map(([k]) => projectionColumn(table, meta, k, 'select')),
+        .map(([k]) => {
+          const column = projectionColumn(table, meta, k, 'select');
+          if (piiCols?.has(column) && !stitchOnly?.has(k)) {
+            throw new ValidationError(piiSelectRefusedMessage(table, meta.reverseColumnMap[column] ?? column));
+          }
+          return column;
+        }),
     );
   }
   // Default / omit-only projection: PII-tagged columns are excluded unless the
@@ -292,6 +333,104 @@ export function relationOptions(spec: true | WithOptions): WithOptions {
   return spec === true ? EMPTY_WITH_OPTIONS : spec;
 }
 
+/** The options a relation in `with` reads; any other key is ignored by every relation strategy. */
+const WITH_OPTION_KEYS: ReadonlySet<string> = new Set([
+  'with',
+  'where',
+  'orderBy',
+  'limit',
+  'offset',
+  'take',
+  'skip',
+  'select',
+  'omit',
+]);
+
+/**
+ * Check one relation's `with` options. The fingerprint walk reads every level
+ * of every `with` on every call, whichever strategy then loads it, so this is
+ * the one place that sees them all. `lock` is refused: the row lock compiles to
+ * `FOR <mode> OF "<table>"` on the query's own table, so a lock written on a
+ * relation locked nothing and said nothing. Any other key no relation reads
+ * (`wehre`, `cursor`, `distinct`) is named once in the advice log.
+ */
+function checkWithOptions(qi: BuilderCtx, table: string, relName: string, opts: WithOptions): void {
+  for (const key in opts) {
+    if (WITH_OPTION_KEYS.has(key)) continue;
+    const value = (opts as Record<string, unknown>)[key];
+    if (value === undefined) continue;
+    if (key === 'lock') {
+      throw new ValidationError(
+        `\`lock\` is not an option of a relation in \`with\` (\`${relName}\` on "${table}"): a row lock applies to ` +
+          "the rows of the query's own table only, so the related rows would not be locked. Lock them with a " +
+          'locking read on their own table, in the same transaction.',
+      );
+    }
+    const advice = whereMod.adviceLogger(qi);
+    if (!advice || !shouldWarnOnce(WARN_NS.unknownQueryOption, `${table}.with.${relName}.${key}`)) continue;
+    const suggestion = suggestKey(key, WITH_OPTION_KEYS);
+    logTo(
+      advice,
+      'warn',
+      `unknown option "${key}" on relation "${relName}" in \`with\` on ${table}, it is ignored.` +
+        (suggestion ? ` Did you mean "${suggestion}"?` : ''),
+      { code: 'unknown-query-option', table, operation: 'with', key },
+    );
+  }
+}
+
+/**
+ * `_count` in `with` takes `true` (every relation) or an object naming
+ * relations with `true`. Anything else under a relation, `{ where }` in
+ * particular, was read as `true` and counted every related row.
+ */
+function assertWithCount(table: string, count: unknown): void {
+  if (count === true) return;
+  if (!isPlainRecord(count)) {
+    throw new ValidationError(
+      `\`_count\` in \`with\` on "${table}" takes true or an object naming relations, for example ` +
+        `\`_count: { posts: true }\`; received ${describeOperand(count)}.`,
+    );
+  }
+  for (const rel of Object.keys(count)) {
+    const value = count[rel];
+    if (value === undefined || typeof value === 'boolean') continue;
+    throw new ValidationError(
+      `\`_count.${rel}\` in \`with\` on "${table}" takes true; received ${describeOperand(value)}. ` +
+        '`_count` counts every related row. To count only the rows that match a filter, use ' +
+        `\`count({ where })\` on the related table.`,
+    );
+  }
+}
+
+/**
+ * A to-many relation's `offset` (`skip` is folded into it at the args seam by
+ * `normalizeWithPagination`, which also refuses it on a to-one relation).
+ */
+export function relationOffset(opts: WithOptions): unknown {
+  return (opts as { offset?: unknown }).offset;
+}
+
+/**
+ * The LIMIT / OFFSET tail of a to-many relation's inner row query. Binds the
+ * limit, then the offset, the order {@link collectRelationSubqueryParams}
+ * mirrors. Without an offset the tail is the plain ` LIMIT $n` it has always
+ * been; with one it goes through the dialect's pagination hook, which knows
+ * how to write an offset with no limit.
+ */
+function relationPagination(
+  qi: BuilderCtx,
+  limit: unknown,
+  offset: unknown,
+  params: unknown[],
+  hasOrder: boolean,
+): string {
+  const limitRef = limit === undefined ? undefined : qi.paginationRef(limit, params, 'relation limit');
+  if (offset === undefined) return limitRef === undefined ? '' : ` LIMIT ${limitRef}`;
+  const offsetRef = qi.paginationRef(offset, params, 'relation offset');
+  return qi.buildPagination(limitRef, offsetRef, hasOrder);
+}
+
 /**
  * Produce a fingerprint for a `with` clause tree. Recursion mirrors
  * buildSelectWithRelations / buildRelationSubquery.
@@ -312,6 +451,7 @@ export function withFingerprint(qi: BuilderCtx, withClause: WithClause | undefin
     // Reserved `_count` key, fingerprint by the selected relation set so
     // `_count: true` and `_count: { posts: true }` never share a cache entry.
     if (relName === '_count') {
+      assertWithCount(meta.name, spec);
       const c = spec as unknown as WithCount;
       parts.push(
         c === true
@@ -331,6 +471,7 @@ export function withFingerprint(qi: BuilderCtx, withClause: WithClause | undefin
     }
 
     const opts = relationOptions(spec);
+    if (opts !== EMPTY_WITH_OPTIONS) checkWithOptions(qi, meta.name, relName, opts);
     const subParts: string[] = [];
 
     // select/omit shape
@@ -370,6 +511,10 @@ export function withFingerprint(qi: BuilderCtx, withClause: WithClause | undefin
     // `{limit:3}` and `{limit:5}` would share one cached statement.
     if (opts.limit !== undefined) {
       subParts.push(qi.dialect.inlineLimitOffset ? `l=${opts.limit}` : 'l=1');
+    }
+    const offset = relationOffset(opts);
+    if (offset !== undefined) {
+      subParts.push(qi.dialect.inlineLimitOffset ? `off=${offset}` : 'off=1');
     }
 
     // nested with (recurse)
@@ -461,6 +606,10 @@ export function collectRelationSubqueryParams(
     if (opts.limit !== undefined && !qi.dialect.inlineLimitOffset) {
       params.push(qi.paginationValue(opts.limit, 'relation limit'));
     }
+    const m2mOffset = relationOffset(opts);
+    if (m2mOffset !== undefined && !qi.dialect.inlineLimitOffset) {
+      params.push(qi.paginationValue(m2mOffset, 'relation offset'));
+    }
     if (opts.with) {
       for (const [nestedRelName, nestedSpec] of sortedEntries(opts.with)) {
         const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
@@ -474,7 +623,8 @@ export function collectRelationSubqueryParams(
   // Mirrors buildRelationSubquery's willWrap: `orderBy: {}` is treated as absent.
   const relOrderEntries = opts.orderBy ? orderByEntries(opts.orderBy).filter(([, dir]) => dir !== undefined) : [];
   const hasOrder = relOrderEntries.length > 0;
-  const willWrap = relDef.type === 'hasMany' && (opts.limit !== undefined || hasOrder);
+  const offset = relationOffset(opts);
+  const willWrap = relDef.type === 'hasMany' && (opts.limit !== undefined || offset !== undefined || hasOrder);
 
   // Non-wrapped path: nested relations BEFORE where/limit
   if (!willWrap && opts.with) {
@@ -507,6 +657,9 @@ export function collectRelationSubqueryParams(
   // `limit: 0` pushes (LIMIT 0 is honored), so check !== undefined.
   if (relDef.type === 'hasMany' && opts.limit !== undefined && !qi.dialect.inlineLimitOffset) {
     params.push(qi.paginationValue(opts.limit, 'relation limit'));
+  }
+  if (relDef.type === 'hasMany' && offset !== undefined && !qi.dialect.inlineLimitOffset) {
+    params.push(qi.paginationValue(offset, 'relation offset'));
   }
 
   // Wrapped path: nested relations AFTER where/limit (inside inner subquery)
@@ -686,13 +839,13 @@ export function isRelationOrderByValue(_qi: BuilderCtx, value: unknown): boolean
 
 /**
  * Render the ` NULLS FIRST` / ` NULLS LAST` suffix for a column ordering.
- * Only PostgreSQL and SQLite support the `NULLS FIRST/LAST` grammar, on any
- * other engine a caller asking for explicit nulls placement gets a clear
- * {@link UnsupportedFeatureError} (E017) instead of broken SQL.
+ * On an engine without the `NULLS FIRST/LAST` grammar (`nullsOrderingClause`:
+ * PostgreSQL and SQLite have it) a caller asking for explicit nulls placement
+ * gets a clear {@link UnsupportedFeatureError} (E017) instead of broken SQL.
  */
 export function nullsSuffix(qi: BuilderCtx, nulls: 'first' | 'last' | undefined): string {
   if (!nulls) return '';
-  if (qi.dialect.name !== 'postgresql' && qi.dialect.name !== 'sqlite') {
+  if (!qi.dialect.capabilities.nullsOrderingClause) {
     throw new UnsupportedFeatureError(
       'NULLS FIRST/LAST ordering',
       qi.dialect.name,
@@ -795,7 +948,7 @@ export function buildJsonPathOrderEntry(
   // the grammar gate matches nullsSuffix.
   const nullsSql = spec.nulls
     ? nullsSuffix(qi, spec.nulls)
-    : qi.dialect.name === 'postgresql' || qi.dialect.name === 'sqlite'
+    : qi.dialect.capabilities.nullsOrderingClause
       ? ' NULLS LAST'
       : '';
   return `${lhs} ${dir}${nullsSql}`;
@@ -1050,6 +1203,25 @@ export function buildRelationOrderBy(
 }
 
 /**
+ * Param-collect mirror of a TO-ONE relation orderBy entry, done by running
+ * {@link buildRelationOrderBy} and discarding its SQL. The build pushes the
+ * target's global filter once per ordered column and, for a chained
+ * `{ author: { org: { name } } }` ordering, once more per hop table, in hop
+ * order. A hand-written mirror that pushed one filter per column bound too few
+ * params (and in the wrong order) as soon as a hop table had a filter, so this
+ * mirror is the build itself and cannot drift from it.
+ */
+export function collectToOneRelationOrderParams(
+  qi: BuilderCtx,
+  relName: string,
+  value: Record<string, unknown>,
+  params: unknown[],
+  ctx?: { meta: TableMetadata; table: string; parentRef: string },
+): void {
+  buildRelationOrderBy(qi, relName, value, 'ord0', params, ctx);
+}
+
+/**
  * Validate a {@link RelationPickOrderBy} entry's scope and shape. Shared by
  * the SQL-build path ({@link buildRelationPickOrderBy}) and the cache-hit
  * param-collect mirror ({@link collectRelationPickOrderParams}) so both
@@ -1187,7 +1359,7 @@ export function buildRelationPickOrderBy(
   // the caller set `nulls` explicitly; the grammar gate matches nullsSuffix.
   const nullsSql = spec.nulls
     ? nullsSuffix(qi, spec.nulls)
-    : qi.dialect.name === 'postgresql' || qi.dialect.name === 'sqlite'
+    : qi.dialect.capabilities.nullsOrderingClause
       ? ' NULLS LAST'
       : '';
 
@@ -1409,13 +1581,17 @@ export function collectRelationOrderParams(
       if (isRelationPickOrderBy(dirValue)) {
         throw pickOrderNestedError(qi, key);
       }
-      const relDef = ownLookup(targetMeta.relations, key);
+      // resolveRelationDef, as buildRelationOrderBy resolves it, so a relation
+      // written in its table spelling binds its params on a cache hit too.
+      const relDef = resolveRelationDef(targetMeta.relations, key);
       if (relDef && (relDef.type === 'hasMany' || relDef.type === 'manyToMany')) {
         collectRelationCountParams(qi, relDef, params);
       } else if (relDef) {
-        for (const _col of Object.keys(dirValue as Record<string, unknown>)) {
-          whereMod.collectTargetGlobalFilterAlias(qi, relDef.to, params);
-        }
+        collectToOneRelationOrderParams(qi, key, dirValue as Record<string, unknown>, params, {
+          meta: targetMeta,
+          table: targetTable,
+          parentRef: targetTable,
+        });
       }
       continue;
     }
@@ -1482,29 +1658,32 @@ export function manyToManyTargetGlobalFilterExists(
   jalias: string,
   params: unknown[],
 ): string {
-  const gf = whereMod.resolveGlobalFilter(qi, relDef.to);
-  if (!gf || !relDef.through) return '';
+  const through = relDef.through;
+  if (!through) return '';
   const tMeta = qi.schema.tables[relDef.to];
   if (!tMeta || tMeta.primaryKey.length === 0) return '';
-  const talias = `${alias}t`;
-  const targetKeys = normalizeKeyColumns(relDef.through.targetKey);
+  const targetKeys = normalizeKeyColumns(through.targetKey);
   const pk = tMeta.primaryKey;
   if (targetKeys.length !== pk.length) return '';
-  const join = targetKeys.map((jc, i) => `${talias}.${qi.q(pk[i]!)} = ${jalias}.${qi.q(jc)}`).join(' AND ');
-  const gfClause = whereMod.buildAliasWhere(qi, relDef.to, tMeta, talias, gf, params);
-  const gfAnd = gfClause ? ` AND ${gfClause}` : '';
-  return `EXISTS (SELECT 1 FROM ${qi.q(relDef.to)} ${talias} WHERE ${join}${gfAnd})`;
+  return whereMod.withTargetGlobalFilter(qi, relDef.to, '', (gf) => {
+    const talias = `${alias}t`;
+    const join = targetKeys.map((jc, i) => `${talias}.${qi.q(pk[i]!)} = ${jalias}.${qi.q(jc)}`).join(' AND ');
+    const gfClause = whereMod.buildAliasWhere(qi, relDef.to, tMeta, talias, gf, params);
+    const gfAnd = gfClause ? ` AND ${gfClause}` : '';
+    return `EXISTS (SELECT 1 FROM ${qi.q(relDef.to)} ${talias} WHERE ${join}${gfAnd})`;
+  });
 }
 
 /** Param-collect mirror of {@link manyToManyTargetGlobalFilterExists}. */
 export function collectManyToManyTargetGlobalFilter(qi: BuilderCtx, relDef: RelationDef, params: unknown[]): void {
-  const gf = whereMod.resolveGlobalFilter(qi, relDef.to);
-  if (!gf || !relDef.through) return;
+  if (!relDef.through) return;
   const tMeta = qi.schema.tables[relDef.to];
   if (!tMeta || tMeta.primaryKey.length === 0) return;
   const targetKeys = normalizeKeyColumns(relDef.through.targetKey);
   if (targetKeys.length !== tMeta.primaryKey.length) return;
-  whereMod.collectAliasWhereParams(qi, relDef.to, tMeta, gf, params);
+  whereMod.withTargetGlobalFilter(qi, relDef.to, false, (gf) =>
+    whereMod.collectAliasWhereParams(qi, relDef.to, tMeta, gf, params),
+  );
 }
 
 /**
@@ -1646,17 +1825,21 @@ export function parseNestedRow(
         // find it.
         //
         // The warn is gated and deduped because this sits in parseNestedRow's
-        // per-relation loop: one 10,000-row page was 10,000 console.warn calls.
-        if (
-          process.env.NODE_ENV !== 'production' &&
-          shouldWarnOnce(WARN_NS.relationParseFailure, `${qi.table}.${relName}`)
-        ) {
-          console.warn(
-            `[turbine] Relation "${relName}" on "${qi.table}" returned a payload that is not valid JSON. ` +
+        // per-relation loop: one 10,000-row page was 10,000 warnings. The
+        // parse error stays out of the entry: its message quotes the payload,
+        // which is row data.
+        const log = whereMod.adviceLogger(qi);
+        if (log && shouldWarnOnce(WARN_NS.relationParseFailure, `${qi.table}.${relName}`)) {
+          logTo(
+            log,
+            'warn',
+            `Relation "${relName}" on "${qi.table}" returned a payload that is not valid JSON. ` +
               `This is a bug; please report it with the emitted SQL.`,
+            { code: 'relation-payload-json', table: qi.table, relation: relName },
           );
         }
-        throw new ValidationError(
+        throw new InvariantError(
+          'relation-payload-json',
           `Relation "${relName}" on table "${qi.table}" returned a payload that could not be parsed as JSON.`,
           { cause: err },
         );
@@ -2299,7 +2482,7 @@ function flattenNodeSignature(node: FlattenNode): string {
 }
 
 /**
- * Dev-only, once-per-(table, relation, reason) note that an explicitly
+ * Per-query advice, once per (table, relation, reason): an explicitly
  * requested `relationLoadStrategy: 'flatten'` did NOT engage for a relation.
  *
  * Worth its own warning because the fallback is otherwise INVISIBLE: the query
@@ -2308,19 +2491,24 @@ function flattenNodeSignature(node: FlattenNode): string {
  * Silence there is indistinguishable from the strategy being a no-op, which is
  * exactly the shape of thing that gets filed as a bug.
  *
- * Suppressed in production like the other planner notes, and deduped through
- * the shared registry so a hot query logs once rather than per call. Note that
- * a flatten plan is recomputed on the build, param-collect and row-assembly
- * paths for the same query; the registry is what keeps that to one line.
+ * Off when `diagnostics` turn advice off, like the other planner notes, and
+ * deduped through the shared registry so a hot query logs once rather than per
+ * call. Note that a flatten plan is recomputed on the build, param-collect and
+ * row-assembly paths for the same query; the registry is what keeps that to
+ * one line.
  */
-function warnFlattenFallback(table: string, rejects: readonly FlattenReject[]): void {
+function warnFlattenFallback(qi: BuilderCtx, table: string, rejects: readonly FlattenReject[]): void {
   if (rejects.length === 0) return;
-  if (process.env.NODE_ENV === 'production') return;
+  const log = whereMod.adviceLogger(qi);
+  if (!log) return;
   for (const { relation, reason } of rejects) {
     if (!shouldWarnOnce(WARN_NS.flattenFallback, `${table}.${relation}|${reason}`)) continue;
-    console.warn(
-      `[turbine] relationLoadStrategy: 'flatten' did not engage for relation "${relation}" on "${table}": ` +
+    logTo(
+      log,
+      'warn',
+      `relationLoadStrategy: 'flatten' did not engage for relation "${relation}" on "${table}": ` +
         `${reason}. It loads via the correlated subquery instead (same rows, same values, different plan).`,
+      { code: 'flatten-fallback', table, relation, reason },
     );
   }
 }
@@ -2356,7 +2544,7 @@ export function planFlattenWith(
     if (node) nodes[relName] = node;
   }
 
-  warnFlattenFallback(table, rejects);
+  warnFlattenFallback(qi, table, rejects);
 
   if (Object.keys(nodes).length === 0) return null;
 
@@ -2367,7 +2555,7 @@ export function planFlattenWith(
   const reserved = new Set<string>([...meta.allColumns, ...Object.keys(withClause)]);
   for (const alias of aliases) {
     if (reserved.has(alias)) {
-      warnFlattenFallback(table, [
+      warnFlattenFallback(qi, table, [
         {
           relation: Object.keys(nodes).join(', '),
           reason: `the projected alias "${alias}" collides with a column or relation name on "${table}"`,
@@ -2711,11 +2899,12 @@ export function buildSelectWithRelations(
   const meta = qi.schema.tables[table];
   if (!meta) throw new ValidationError(`Unknown table "${table}"`);
 
-  // Positional JSON encoding is Postgres-only in v1. Gate here, the single
-  // entry point for every `with` clause, so no engine ever emits the
-  // json_build_array shape its dialect can't produce (and mssql's FOR JSON
-  // override path is never reached with positional active).
-  if (qi.jsonEncoding === 'positional' && qi.dialect.name !== 'postgresql') {
+  // Positional JSON encoding needs `positionalJson`, the flag the default in
+  // builder.ts reads too, so the default never picks an encoding refused here.
+  // Gate here, the single entry point for every `with` clause, so no engine
+  // ever emits the json_build_array shape its dialect can't produce (and
+  // mssql's FOR JSON override path is never reached with positional active).
+  if (qi.jsonEncoding === 'positional' && !qi.dialect.capabilities.positionalJson) {
     throw new UnsupportedFeatureError(
       "jsonEncoding: 'positional'",
       qi.dialect.name,
@@ -2895,12 +3084,13 @@ export function buildRelationSubquery(
   // RelationSubqueryContext is a published contract.
   const opts = relationOptions(spec);
 
-  // Dev-only: correlated relation loading probes the child table once per parent
-  // row, so a missing FK index multiplies into per-parent full-table scans (a
-  // batched-loader ORM pays the same missing index only once, which is why
-  // schemas migrated from one often lack these). Name the exact index to create
-  // instead of letting the slowness look like an ORM problem.
-  if (process.env.NODE_ENV !== 'production') {
+  // Per-query advice: correlated relation loading probes the child table once
+  // per parent row, so a missing FK index multiplies into per-parent full-table
+  // scans (a batched-loader ORM pays the same missing index only once, which is
+  // why schemas migrated from one often lack these). Name the exact index to
+  // create instead of letting the slowness look like an ORM problem.
+  const log = whereMod.adviceLogger(qi);
+  if (log) {
     const warnKey = `${relDef.from}.${relDef.name}`;
     // Compute the (potentially costly) probe only for a key not yet warned, and
     // claim the key through the process-wide registry ONLY when we actually warn,
@@ -2909,11 +3099,20 @@ export function buildRelationSubquery(
     if (!hasWarnedOnce(WARN_NS.unindexedRelation, warnKey)) {
       const miss = missingIndexForRelation(qi.schema, relDef);
       if (miss && shouldWarnOnce(WARN_NS.unindexedRelation, warnKey)) {
-        console.warn(
-          `[turbine] Relation "${relDef.name}" on "${relDef.from}" probes ` +
+        logTo(
+          log,
+          'warn',
+          `Relation "${relDef.name}" on "${relDef.from}" probes ` +
             `"${miss.table}"(${miss.columns.join(', ')}) which has no covering index, ` +
             `each parent row scans the full table. Fix: ${miss.createSql}; ` +
             'or run `npx turbine doctor` for a full report.',
+          {
+            code: 'unindexed-relation',
+            table: relDef.from,
+            relation: relDef.name,
+            probeTable: miss.table,
+            columns: miss.columns,
+          },
         );
       }
     }
@@ -2997,7 +3196,9 @@ export function buildRelationSubquery(
   // it must neither trigger the wrap (dropping nested relations) nor render a
   // dangling `ORDER BY `. `limit: 0` is meaningful (LIMIT 0) and DOES wrap.
   const relOrderEntries = opts.orderBy ? orderByEntries(opts.orderBy).filter(([, dir]) => dir !== undefined) : [];
-  const willWrap = relDef.type === 'hasMany' && (opts.limit !== undefined || relOrderEntries.length > 0);
+  const offset = relationOffset(opts);
+  const willWrap =
+    relDef.type === 'hasMany' && (opts.limit !== undefined || offset !== undefined || relOrderEntries.length > 0);
 
   // manyToMany takes a dedicated JOIN-through-junction path. Nested relations,
   // where, orderBy, and select/omit are handled there (the target alias is the
@@ -3103,8 +3304,8 @@ export function buildRelationSubquery(
   // (and shifts every later placeholder by one). To-one relations ignore limit.
   // `limit: 0` is honored (LIMIT 0 → empty array), so check !== undefined.
   let limitClause = '';
-  if (relDef.type === 'hasMany' && opts.limit !== undefined) {
-    limitClause = ` LIMIT ${qi.paginationRef(opts.limit, params, 'relation limit')}`;
+  if (relDef.type === 'hasMany') {
+    limitClause = relationPagination(qi, opts.limit, offset, params, relOrderEntries.length > 0);
   }
 
   if (relDef.type === 'hasMany') {
@@ -3270,11 +3471,8 @@ export function buildManyToManySubquery(
   const gfExtra = whereMod.targetGlobalFilterAlias(qi, targetTable, talias, params);
   if (gfExtra) whereClause += ` AND ${gfExtra}`;
 
-  // LIMIT, `limit: 0` is honored (LIMIT 0 → empty array)
-  let limitClause = '';
-  if (opts.limit !== undefined) {
-    limitClause = ` LIMIT ${qi.paginationRef(opts.limit, params, 'relation limit')}`;
-  }
+  // LIMIT / OFFSET, `limit: 0` is honored (LIMIT 0 → empty array)
+  const limitClause = relationPagination(qi, opts.limit, relationOffset(opts), params, relOrderEntries.length > 0);
 
   const fromJoin = `FROM ${qTarget} ${talias} JOIN ${qJunction} ${jalias} ON ${joinOn}`;
 

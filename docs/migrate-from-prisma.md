@@ -79,7 +79,7 @@ These are all supported today, so don't infer absence from a missing example:
 - **Nested writes**, `create` / `connect` / `connectOrCreate` on create, plus `disconnect` / `set` / `delete` / `update` / `upsert` on update, in one transaction (depth cap 10). On a **many-to-many** relation the supported set is `connect` / `disconnect` / `set` (Turbine writes the junction rows); the rest throw `ValidationError` (`TURBINE_E003`) naming that set. The compat client also exposes an accessor per implicit junction table, so link rows can be written by hand inside the same `$transaction`.
 - **Relation `_count`**, `with: { _count: { posts: true } }` counts to-many relations without loading them.
 - **`distinct`**, compiles to `DISTINCT ON`.
-- **`cursor`**, keyset pagination (exclusive; drop any `skip: 1`).
+- **`cursor`**, keyset pagination (exclusive; drop any `skip: 1`). It must name one row by a unique key, and the page follows `orderBy` completed by the primary key.
 - **Deterministic pages**: a compat `findMany` with `take` / `skip` and no `orderBy` is ordered by the model's primary key ascending, as Prisma does, so ported pagination cannot repeat or skip a row. Core keeps the bare `LIMIT` unless you set `implicitPkOrdering: true`.
 - **`groupBy`** and **`aggregate`**, `_count` / `_sum` / `_avg` / `_min` / `_max`.
 - **Typed raw SQL**, `` db.raw`...` `` and the typed `` db.sql<T>`...` `` (Prisma's TypedSQL replacement).

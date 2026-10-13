@@ -87,10 +87,24 @@ export interface ColumnMetadata {
   pgTypeSchema?: string;
   /** TypeScript type string (e.g. 'number', 'string', 'Date') */
   tsType: string;
+  /**
+   * The TypeScript type a `defineSchema()` file declared for this column, WITHOUT
+   * `| null`. Only `turbine generate` reads it. Every engine branches on
+   * {@link tsType}, which stays the type mapped from the database type (MySQL
+   * boolean normalization and PowDB column types depend on that). Absent for
+   * introspected metadata and for columns that declare no type.
+   */
+  declaredTsType?: string;
   /** Whether the column allows NULL */
   nullable: boolean;
   /** Whether the column has a DEFAULT, is serial, or is generated */
   hasDefault: boolean;
+  /**
+   * The column's declared DEFAULT expression as SQL text (for example `now()`, `'active'`, `0`), when the
+   * metadata source knows it. defineSchema records it; engines with no server-side defaults (PowDB) apply it
+   * client-side. Absent for introspected metadata.
+   */
+  defaultValue?: string | null;
   /**
    * Whether the **database server** generates this column's value on insert -
    * a `serial`/`BIGSERIAL` sequence, an `IDENTITY` column, or PowDB's `auto`
@@ -122,10 +136,10 @@ export interface ColumnMetadata {
    * True when this column holds personally identifiable information (PII).
    * Tagged in `defineSchema` (`pii: true`) and carried through generated
    * metadata. A PII column is EXCLUDED from default projections: it comes back
-   * only when explicitly named in `select` or when the query passes
-   * `includePii: UNSAFE` (full opt-in, the imported sentinel symbol, since a
-   * literal `true` is what a stray JSON body deserializes to). Studio redacts
-   * PII cells by default.
+   * only from a read that passes `includePii: UNSAFE` (the imported sentinel
+   * symbol, since a literal `true` is what a stray JSON body deserializes to).
+   * Naming it in `select` without that flag throws (E003), and a write never
+   * returns it. Studio redacts PII cells by default.
    * Optional / defaults to `false`; untagged schemas behave exactly as before.
    * Introspection never auto-tags PII (it is a code-first declaration).
    */
@@ -251,6 +265,19 @@ export interface IndexMetadata {
 // Type mapping: Postgres → TypeScript
 // ---------------------------------------------------------------------------
 
+/**
+ * The TypeScript row types below describe what a READ returns, which is what
+ * the pg driver's text parsers produce (plus the parsers TurbineClient
+ * registers), not what the type is called. A nested relation read reproduces
+ * the same value through `JSON_WIRE_COERCION_OIDS` in query/utils.ts.
+ * `src/test/types-runtime-parity.integration.test.ts` reads every type live and
+ * compares it with this table.
+ */
+const PG_INTERVAL_TS =
+  '{ years?: number; months?: number; days?: number; hours?: number; minutes?: number; seconds?: number; milliseconds?: number }';
+const PG_POINT_TS = '{ x: number; y: number }';
+const PG_CIRCLE_TS = '{ x: number; y: number; radius: number }';
+
 const PG_TO_TS: Record<string, string> = {
   // Integers
   int2: 'number',
@@ -282,7 +309,9 @@ const PG_TO_TS: Record<string, string> = {
   date: 'Date',
   time: 'string',
   timetz: 'string',
-  interval: 'string',
+  // The driver parses an interval into an object (postgres-interval). Zero
+  // fields are absent, so every field is optional.
+  interval: PG_INTERVAL_TS,
   // JSON
   json: 'unknown',
   jsonb: 'unknown',
@@ -292,17 +321,34 @@ const PG_TO_TS: Record<string, string> = {
   inet: 'string',
   cidr: 'string',
   macaddr: 'string',
-  // Geometric
-  point: 'string',
+  macaddr8: 'string',
+  // Geometric: the driver parses point and circle; the others stay text.
+  point: PG_POINT_TS,
   line: 'string',
   lseg: 'string',
   box: 'string',
   path: 'string',
   polygon: 'string',
-  circle: 'string',
+  circle: PG_CIRCLE_TS,
+  // Bit strings come back as their text form ('1010').
+  bit: 'string',
+  varbit: 'string',
   // TSVector
   tsvector: 'string',
   tsquery: 'string',
+  // Ranges and multiranges come back as their text form ('[1,5)').
+  int4range: 'string',
+  int8range: 'string',
+  numrange: 'string',
+  tsrange: 'string',
+  tstzrange: 'string',
+  daterange: 'string',
+  int4multirange: 'string',
+  int8multirange: 'string',
+  nummultirange: 'string',
+  tsmultirange: 'string',
+  tstzmultirange: 'string',
+  datemultirange: 'string',
   // pgvector, embeddings. Mapped to `number[]` for DX (the natural shape an app
   // passes when inserting / comparing embeddings). NOTE: like `numeric` above,
   // there is a runtime caveat, pg has no built-in parser for the `vector` type,
@@ -313,6 +359,37 @@ const PG_TO_TS: Record<string, string> = {
   // orderBy, distance WHERE) always bind the query vector as a `$n::vector`
   // param, so writing/comparing is unaffected by the read-side caveat.
   vector: 'number[]',
+};
+
+/**
+ * Array types whose element type is NOT the scalar's row type. The driver's
+ * `bigint[]` parser returns every element as a string (the scalar int8 parser
+ * TurbineClient registers does not apply to arrays), so `bigint[]` reads as
+ * `string[]` while `bigint` reads as `number`. The driver has no `circle[]`
+ * parser, so its elements stay text (`'<(1,2),3>'`) where a scalar circle is an
+ * object.
+ */
+const PG_ARRAY_TO_TS: Record<string, string> = {
+  _int8: 'string[]',
+  _circle: 'string[]',
+};
+
+/**
+ * Types whose WRITE input differs from the row type. Each entry is what the
+ * write path accepts, checked live:
+ *   - int8: a `number`, a decimal string (what a large value reads back as) or
+ *     a `bigint`.
+ *   - numeric: the exact string, or a `number`.
+ *   - interval / point / circle: the text form. The parsed object a read
+ *     returns is not accepted for point and circle, and a plain object is read
+ *     as an update operator, so the object form is not part of the input type.
+ */
+const PG_TO_TS_INPUT: Record<string, string> = {
+  int8: 'number | string | bigint',
+  numeric: 'string | number',
+  interval: 'string',
+  point: 'string',
+  circle: 'string',
 };
 
 const DATE_TYPES = new Set(['timestamptz', 'timestamp', 'date']);
@@ -394,23 +471,54 @@ const PG_TO_ARRAY: Record<string, string> = {
   vector: 'vector[]',
 };
 
-/** Map a Postgres type to its TypeScript equivalent */
+/** Map a Postgres type to the TypeScript type a read returns for it. */
 export function pgTypeToTs(pgType: string, nullable: boolean): string {
-  // Array types: udt_name starts with '_'
-  if (pgType.startsWith('_')) {
-    const elementType = pgTypeToTs(pgType.slice(1), false);
-    const tsType = `${elementType}[]`;
-    return nullable ? `${tsType} | null` : tsType;
+  let tsType: string;
+  if (Object.hasOwn(PG_ARRAY_TO_TS, pgType)) {
+    tsType = PG_ARRAY_TO_TS[pgType]!;
+  } else if (pgType.startsWith('_')) {
+    // Array types: udt_name starts with '_'
+    tsType = arrayOf(pgTypeToTs(pgType.slice(1), false));
+  } else {
+    tsType = Object.hasOwn(PG_TO_TS, pgType) ? PG_TO_TS[pgType]! : 'unknown';
   }
-
-  const tsType = PG_TO_TS[pgType] ?? 'unknown';
   return nullable ? `${tsType} | null` : tsType;
+}
+
+/**
+ * Map a Postgres type to the TypeScript type the write path accepts for it
+ * (the generated `*Create` / `*Update` field types). Wider than
+ * {@link pgTypeToTs} where the runtime takes more than one spelling, narrower
+ * where the parsed read value cannot be written back (see `PG_TO_TS_INPUT`).
+ */
+export function pgTypeToTsInput(pgType: string, nullable: boolean): string {
+  let tsType: string;
+  if (pgType.startsWith('_')) {
+    const element = pgType.slice(1);
+    tsType = Object.hasOwn(PG_TO_TS_INPUT, element) ? arrayOf(PG_TO_TS_INPUT[element]!) : pgTypeToTs(pgType, false);
+  } else {
+    tsType = Object.hasOwn(PG_TO_TS_INPUT, pgType) ? PG_TO_TS_INPUT[pgType]! : pgTypeToTs(pgType, false);
+  }
+  return nullable ? `${tsType} | null` : tsType;
+}
+
+/** `T[]`, parenthesized when `T` is a union. */
+function arrayOf(element: string): string {
+  return element.includes('|') ? `(${element})[]` : `${element}[]`;
 }
 
 /** Check if a Postgres type is a date/timestamp that needs Date parsing */
 export function isDateType(pgType: string): boolean {
   return DATE_TYPES.has(pgType);
 }
+
+/**
+ * A precision suffix with the whitespace around it: `(6)` in `time(6)` or
+ * `time (6) with time zone`. Every quantifier is bounded, because a leading
+ * `\s*` retried from each position of a long whitespace run is quadratic in
+ * the type name's length; no real type name comes near the bounds.
+ */
+const TYPE_PRECISION = /\s{0,32}\(\s{0,32}\d{1,9}\s{0,32}\)\s{0,32}/;
 
 /**
  * Classify a column type as a TIME-OF-DAY type (`time` / `timetz`), or `null`
@@ -436,7 +544,7 @@ export function timeOfDayKind(dbType: string | undefined): 'time' | 'timetz' | n
     .toLowerCase()
     // Precision can sit at the end (`time(6)`) or mid-spelling
     // (`time(6) with time zone`), so strip it wherever it appears.
-    .replace(/\s*\(\s*\d+\s*\)\s*/, ' ')
+    .replace(TYPE_PRECISION, ' ')
     .trim();
   if (t === 'time' || t === 'time without time zone') return 'time';
   if (t === 'timetz' || t === 'time with time zone') return 'timetz';
@@ -469,7 +577,7 @@ export function localDateTimeKind(dbType: string | undefined): 'date' | 'timesta
     .toLowerCase()
     // Precision can sit at the end (`timestamp(3)`) or mid-spelling
     // (`timestamp(3) without time zone`), so strip it wherever it appears.
-    .replace(/\s*\(\s*\d+\s*\)\s*/, ' ')
+    .replace(TYPE_PRECISION, ' ')
     .trim();
   if (t === 'date') return 'date';
   if (t === 'timestamp' || t === 'timestamp without time zone') return 'timestamp';
@@ -478,7 +586,7 @@ export function localDateTimeKind(dbType: string | undefined): 'date' | 'timesta
 
 /** Get the Postgres array cast type for UNNEST batch inserts */
 export function pgArrayType(pgType: string): string {
-  return PG_TO_ARRAY[pgType] ?? 'text[]';
+  return Object.hasOwn(PG_TO_ARRAY, pgType) ? PG_TO_ARRAY[pgType]! : 'text[]';
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +595,10 @@ export function pgArrayType(pgType: string): string {
 
 /** snake_case → camelCase */
 export function snakeToCamel(s: string): string {
+  // The pattern needs an underscore, so a name without one is returned as-is
+  // without running the regex. Hot: every where/orderBy key goes through
+  // resolveRelation, which calls this for each non-relation key.
+  if (s.indexOf('_') === -1) return s;
   return s.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
 }
 

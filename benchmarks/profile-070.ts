@@ -197,7 +197,7 @@ function bucketize(frames: Frame[]): Record<string, number> {
   };
   for (const f of frames) {
     const k = `${f.fn} ${f.file}`;
-    if (/JSON|parse$/i.test(f.fn) && /json/i.test(f.fn)) b['JSON.parse']! += f.selfMs;
+    if (/(?:JSON|parse$)/i.test(f.fn) && /json/i.test(f.fn)) b['JSON.parse']! += f.selfMs;
     else if (/parseRow|parseNestedRow|decodeJsonWireRow|buildRowDecodePlan|rowPlanMatches|decodeTemporalCell|transform/i.test(f.fn))
       b['turbine parse']! += f.selfMs;
     else if (/Date|parseDbDate|utc/i.test(k)) b['Date/temporal']! += f.selfMs;

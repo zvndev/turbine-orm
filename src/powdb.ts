@@ -55,13 +55,15 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import {
+  type DisconnectOptions,
+  type DisconnectResult,
   type PgCompatPool,
   type PgCompatPoolClient,
   type PgCompatQueryResult,
   TurbineClient,
   type TurbineConfig,
 } from './client.js';
-import { type Dialect, postgresDialect } from './dialect.js';
+import { type Dialect, type EngineCapabilities, postgresDialect } from './dialect.js';
 import type { EngineClientConfig } from './engine-config.js';
 import {
   ConnectionError,
@@ -73,6 +75,7 @@ import {
   UnsupportedFeatureError,
   ValidationError,
 } from './errors.js';
+import { consoleLogger, logTo, type TurbineLogger } from './logger.js';
 import importOptionalPeer from './optional-peer-import.cjs';
 import type { PowdbExec } from './powdb-introspect.js';
 import {
@@ -87,7 +90,7 @@ import {
   quotePowqlIdent,
   requireCapability,
 } from './powdb-shared.js';
-import type { QueryInterface, QueryInterfaceOptions } from './query/index.js';
+import type { QueryInterfaceOptions } from './query/index.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
 import { type ColumnMetadata, type IndexMetadata, normalizeKeyColumns, type SchemaMetadata } from './schema.js';
 
@@ -140,6 +143,48 @@ export {
 export const powdbDialect: Dialect = {
   ...postgresDialect,
   name: 'powdb',
+  // PowqlInterface compiles PowQL itself and refuses what PowDB lacks; these
+  // answer for the client paths a PowDB client shares (transactions, raw
+  // queries, `tx.$connection()`) and keep every SQL-only feature off.
+  capabilities: Object.freeze({
+    distinctOn: false,
+    positionalJson: false,
+    nullsOrderingClause: false,
+    nullsSortHigh: false,
+    insensitiveInList: false,
+    jsonDocumentEquality: 'text',
+    jsonExtractTyped: false,
+    jsonExactNumericCast: false,
+    numericTextComparison: false,
+    // PowDB has no foreign keys: declared relations are not enforced, and its
+    // own mass-mutation guard already folds with foreignKeys: false.
+    enforcesForeignKeys: false,
+    partitionLimitPushdown: false,
+    utcTimestampRewrite: false,
+    paramTypeCasts: false,
+    namedEnumTypes: false,
+    structuredValueColumns: 'scalars',
+    maxBindParameters: Number.POSITIVE_INFINITY,
+    maxInsertRows: Number.POSITIVE_INFINITY,
+    upsertConflictTarget: 'explicit',
+    setClauseOrder: 'snapshot',
+    reselectLocksRows: false,
+    integerDivision: '/',
+    updateExpressions: false,
+    bulkUpsertAppliesRepeatedKeys: false,
+    readOnlyTransactions: false,
+    connectionParameters: false,
+    backendCancel: false,
+    idleTransactionTimeout: false,
+    abortsTransactionOnError: false,
+    connectionDriver: 'none',
+    preparesEveryStatement: false,
+    statementSyntax: null,
+    // No foreign keys to declare, inline or otherwise; PowQL DDL comes from
+    // powqlSchemaDDL, which never reads this.
+    inlineForeignKeys: false,
+    unboundedTextKeys: true,
+  } satisfies EngineCapabilities),
   // `resultStrategy` is decorative for PowDB, PowqlInterface owns its own write
   // path and never reads it. Set to 'returning' for honesty: writes use PowDB
   // 0.7.0's trailing `returning` keyword (upsert excepted, see PowqlInterface).
@@ -157,6 +202,11 @@ export const powdbDialect: Dialect = {
   // earlier, this override keeps the flag truthful if a future path consults it.
   supportsLateralJoin: false,
   supportsPlanCacheMode: false,
+  // PowqlInterface reads none of these (it refuses each feature itself); they
+  // are set so the flags stay truthful if a shared path consults them.
+  rowLockModes: [],
+  supportsPercentileAggregates: false,
+  supportsBulkUpsert: false,
   beginStatement: () => 'begin',
   commitStatement: () => 'commit',
   rollbackStatement: () => 'rollback',
@@ -402,6 +452,8 @@ export function capabilitiesFromVersion(
  */
 export interface PowqlSchemaDDLOptions {
   capabilities?: PowdbCapabilities;
+  /** Where a skipped-link warning goes. Defaults to the console logger. */
+  logger?: TurbineLogger;
   /**
    * Emit `link Owner.name -> Target on local = target` declarations (PowDB entity
    * links, >= 0.19) for every single-column hasMany / hasOne / belongsTo relation
@@ -519,7 +571,7 @@ export function powqlSchemaDDL(schema: SchemaMetadata, opts: PowqlSchemaDDLOptio
       new Set(idx.columns).size === pkSet.size &&
       idx.columns.every((c) => pkSet.has(c));
     const fields = meta.columns.map((col) => {
-      const powqlType = powqlColumnType(col);
+      const powqlType = powqlColumnType(col, schema.enums);
       // Gate `json` columns behind the engine's jsonDocs capability when a
       // caller supplied one, an old engine has no `json` type and would reject
       // the DDL. Pure-function callers (no opts) emit unconditionally.
@@ -597,9 +649,12 @@ export function powqlSchemaDDL(schema: SchemaMetadata, opts: PowqlSchemaDDLOptio
     if (caps) requireCapability(caps, 'entityLinks', 'entity link DDL (`emitLinks`)');
     const links = deriveDesiredLinks(schema, (owner, name) => {
       if (shouldWarnOnce(WARN_NS.powdbLinks, `collide:${owner}.${name}`)) {
-        console.warn(
-          `[turbine] powqlSchemaDDL(emitLinks): relation "${name}" on "${owner}" collides with a column of the ` +
+        logTo(
+          opts.logger ?? consoleLogger,
+          'warn',
+          `powqlSchemaDDL(emitLinks): relation "${name}" on "${owner}" collides with a column of the ` +
             'same name; skipping its link declaration (PowDB hard-errors on a link that shadows a column).',
+          { code: 'powdb-link-collision', table: owner, relation: name, operation: 'powqlSchemaDDL' },
         );
       }
     });
@@ -629,9 +684,10 @@ export function powqlSchemaDDL(schema: SchemaMetadata, opts: PowqlSchemaDDLOptio
 export async function applyPowdbLinks(
   exec: PowdbExec,
   schema: SchemaMetadata,
-  options: { capabilities?: PowdbCapabilities } = {},
+  options: { capabilities?: PowdbCapabilities; logger?: TurbineLogger } = {},
 ): Promise<string[]> {
   const caps = options.capabilities;
+  const logger = options.logger ?? consoleLogger;
   if (caps) {
     requireCapability(caps, 'entityLinks', 'entity link DDL (`applyPowdbLinks`)');
     requireCapability(caps, 'linkIntrospection', 'PowDB `schema links` introspection');
@@ -640,9 +696,12 @@ export async function applyPowdbLinks(
   const byOwnerName = new Map(existing.map((l) => [`${l.owner}\u0000${l.name}`, l]));
   const desired = deriveDesiredLinks(schema, (owner, name) => {
     if (shouldWarnOnce(WARN_NS.powdbLinks, `collide:${owner}.${name}`)) {
-      console.warn(
-        `[turbine] applyPowdbLinks: relation "${name}" on "${owner}" collides with a column of the same name; ` +
+      logTo(
+        logger,
+        'warn',
+        `applyPowdbLinks: relation "${name}" on "${owner}" collides with a column of the same name; ` +
           'skipping its link (PowDB hard-errors on a link that shadows a column).',
+        { code: 'powdb-link-collision', table: owner, relation: name, operation: 'applyPowdbLinks' },
       );
     }
   });
@@ -653,10 +712,13 @@ export async function applyPowdbLinks(
       const same =
         found.target === link.target && found.localKey === link.localKey && found.targetKey === link.targetKey;
       if (!same && shouldWarnOnce(WARN_NS.powdbLinks, `drift:${link.owner}.${link.name}`)) {
-        console.warn(
-          `[turbine] applyPowdbLinks: link "${link.name}" on "${link.owner}" is already declared with different ` +
+        logTo(
+          logger,
+          'warn',
+          `applyPowdbLinks: link "${link.name}" on "${link.owner}" is already declared with different ` +
             `endpoints (have ${found.target} on ${found.localKey} = ${found.targetKey}, want ${link.target} on ` +
             `${link.localKey} = ${link.targetKey}); leaving it untouched (PowDB has no drop-link DDL).`,
+          { code: 'powdb-link-drift', table: link.owner, relation: link.name, operation: 'applyPowdbLinks' },
         );
       }
       continue; // identical → idempotent skip; drift → warned skip
@@ -923,7 +985,9 @@ export function wrapPowdbError(err: unknown): Error {
   // evaluate true for every row. Runs before the generic `type mismatch` regex
   // below so the column name and the fix survive into the message.
   {
-    const m = /type mismatch for column '([^']+)': expected ([^,]+), got (\w+)/i.exec(msg);
+    // Every group is bounded: `[^,]+` retried from each "expected " in a long
+    // message made this quadratic in the message length.
+    const m = /type mismatch for column '([^']{1,256})': expected ([^,]{1,64}), got (\w{1,32})/i.exec(msg);
     if (m) {
       return new ValidationError(
         `PowDB rejected a comparison on column "${m[1]}": the column is ${m[2]} but the bound value is ` +
@@ -1089,6 +1153,24 @@ function reentrantTransactionError(): UnsupportedFeatureError {
   );
 }
 
+/**
+ * The error for a plain statement issued through the CLIENT (not the `tx`
+ * client) from inside that client's own open transaction callback, on the
+ * embedded engine. Its one handle carries one transaction, so the statement
+ * could only run inside the transaction (and be rolled back with it) or wait
+ * for the transaction to finish, which is itself waiting on this statement.
+ */
+function statementInsideTransactionError(): UnsupportedFeatureError {
+  return new UnsupportedFeatureError(
+    'A statement on the client while its own transaction is open',
+    'powdb',
+    'This call was made through the client, not the `tx` client, from inside an open $transaction callback. The ' +
+      'embedded engine has one handle and one transaction, so the call would either join that transaction (and be ' +
+      'rolled back with it) or wait for it forever. Use the `tx` client the callback receives, or make the call ' +
+      'after the transaction completes.',
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Single-writer transaction gate, FIFO queueing + re-entrancy detection
 // ---------------------------------------------------------------------------
@@ -1202,8 +1284,15 @@ interface PowdbTxHold {
 class PowdbTxGate {
   /** Tail of the FIFO queue, resolves once every earlier transaction has finished. */
   private tail: Promise<void> = Promise.resolve();
+  /** Holds taken and not yet finished, queued ones included. */
+  private outstanding = 0;
 
   constructor(private readonly queueTimeoutMs: number) {}
+
+  /** True while any transaction holds the gate or waits for it. */
+  get busy(): boolean {
+    return this.outstanding > 0;
+  }
 
   /**
    * Take a place in the transaction queue. The prologue walks the caller's
@@ -1213,7 +1302,7 @@ class PowdbTxGate {
    * the returned hold carries the fresh marker (`hold.ctx`) for
    * `wrapTransactionCallback` to scope around the user callback.
    */
-  async acquire(): Promise<PowdbTxHold> {
+  async acquire(reentrantError: () => Error = reentrantTransactionError): Promise<PowdbTxHold> {
     // Walk the WHOLE marker chain, not just the innermost marker: with two
     // pools, dbA-tx → dbB-tx → dbA-begin leaves dbB's marker innermost, but
     // the dbA ancestor is still open, queueing the inner dbA begin behind it
@@ -1225,7 +1314,7 @@ class PowdbTxGate {
     while (parent?.done) parent = parent.parent;
     for (let c: PowdbTxContext | undefined = parent; c !== undefined; c = c.parent) {
       if (c.gate === this && !c.done) {
-        throw reentrantTransactionError();
+        throw reentrantError();
       }
     }
     const ctx: PowdbTxContext = { gate: this, done: false, parent };
@@ -1237,11 +1326,13 @@ class PowdbTxGate {
     const ahead = this.tail;
     this.tail = ahead.then(() => finished);
 
+    this.outstanding++;
     const hold: PowdbTxHold = {
       ctx,
       finish: () => {
         if (ctx.done) return;
         ctx.done = true;
+        this.outstanding--;
         handOff();
       },
     };
@@ -2009,6 +2100,30 @@ export class PowdbEmbeddedPool implements PgCompatPool {
         throw new ConnectionError('The PowDB embedded pool is closed: disconnect() was already called on this client.');
       }
     }
+    if (ctl === null && holdRef.hold === null && this.txGate.busy) {
+      // A statement from OUTSIDE the open transaction. The engine is one
+      // handle, so running it now would put it inside that transaction: it
+      // would read uncommitted rows, and a write would be rolled back with the
+      // transaction after being reported as done. It takes its FIFO turn on the
+      // gate instead, as a one-statement transaction of its own would. From
+      // inside the transaction's own callback that wait could never end, so the
+      // gate refuses it there.
+      const hold = await this.txGate.acquire(statementInsideTransactionError);
+      try {
+        if (this.closed) {
+          throw new ConnectionError(
+            'The PowDB embedded pool is closed: disconnect() was already called on this client.',
+          );
+        }
+        try {
+          return this.exec(powql, params);
+        } catch (err) {
+          throw wrapPowdbError(err);
+        }
+      } finally {
+        hold.finish();
+      }
+    }
     if ((ctl === 'commit' || ctl === 'rollback') && holdRef.hold === null) {
       // This context never acquired the gate, its `begin` never ran (the
       // gate timed out / threw re-entrant E017, or no begin was issued at
@@ -2350,27 +2465,56 @@ async function openEmbeddedPool(
     if (err instanceof ConnectionError) throw err;
     throw new ConnectionError(`PowDB embedded could not open data dir "${dir}": ${(err as Error).message}`);
   }
-  if (syncMode !== undefined) {
-    if (typeof db.setSyncMode !== 'function') {
-      throw new ConnectionError(
-        'embedded `syncMode` requires @zvndev/powdb-embedded ≥ 0.7.1 (the installed addon has no setSyncMode).',
-      );
+  try {
+    if (syncMode !== undefined) {
+      if (typeof db.setSyncMode !== 'function') {
+        throw new ConnectionError(
+          'embedded `syncMode` requires @zvndev/powdb-embedded ≥ 0.7.1 (the installed addon has no setSyncMode).',
+        );
+      }
+      db.setSyncMode(syncMode);
     }
-    db.setSyncMode(syncMode);
+    // Native typed wire is feature-detected on the OPENED handle: an addon ≥ 0.14
+    // exposes `queryWithParams`, so nativeRaw turns on (server-gate ≥ 0.13 still
+    // applies via the version); an older addon has no such method → false.
+    const capabilities = capabilitiesFromVersion(assumeEngineVersion ?? resolveEmbeddedVersion(), {
+      hasNativeRaw: typeof db.queryWithParams === 'function',
+    });
+    // A read-only target forces the pool's readonly flag; otherwise honor whatever
+    // `poolOptions` (threaded from `options.readonly`) carried.
+    return new PowdbEmbeddedPool(db, {
+      ...poolOptions,
+      capabilities,
+      readonly: Boolean(readonly) || Boolean(poolOptions.readonly),
+    });
+  } catch (err) {
+    // The caller never receives this handle, so nothing else can close it.
+    try {
+      db.close?.();
+    } catch {
+      // The failure being reported is the useful one.
+    }
+    throw err;
   }
-  // Native typed wire is feature-detected on the OPENED handle: an addon ≥ 0.14
-  // exposes `queryWithParams`, so nativeRaw turns on (server-gate ≥ 0.13 still
-  // applies via the version); an older addon has no such method → false.
-  const capabilities = capabilitiesFromVersion(assumeEngineVersion ?? resolveEmbeddedVersion(), {
-    hasNativeRaw: typeof db.queryWithParams === 'function',
-  });
-  // A read-only target forces the pool's readonly flag; otherwise honor whatever
-  // `poolOptions` (threaded from `options.readonly`) carried.
-  return new PowdbEmbeddedPool(db, {
-    ...poolOptions,
-    capabilities,
-    readonly: Boolean(readonly) || Boolean(poolOptions.readonly),
-  });
+}
+
+/**
+ * Probe a networked pool Turbine just built and wrap it. The pool is closed
+ * when the probe or the wrapper refuses, because the caller never sees it
+ * and its idle sockets would otherwise keep the process alive.
+ */
+async function wrapOwnedClientPool(
+  clientPool: PowdbClientPool,
+  poolOptions: PowdbPoolOptions,
+  assumeEngineVersion: string | undefined,
+): Promise<PowdbPool> {
+  try {
+    const capabilities = await assertNetworkedVersion(clientPool, assumeEngineVersion);
+    return new PowdbPool(clientPool, undefined, { ...poolOptions, capabilities });
+  } catch (err) {
+    await clientPool.close().catch(() => {});
+    throw err;
+  }
 }
 
 /**
@@ -2407,9 +2551,11 @@ export async function turbinePowDB(
 
   if (typeof target === 'string') {
     const mod = options.powdbClientModule ?? (await loadPowdb());
-    const clientPool = new mod.Pool({ ...parsePowdbUrl(target), max });
-    const capabilities = await assertNetworkedVersion(clientPool, options.assumeEngineVersion);
-    pool = new PowdbPool(clientPool, undefined, { ...poolOptions, capabilities });
+    pool = await wrapOwnedClientPool(
+      new mod.Pool({ ...parsePowdbUrl(target), max }),
+      poolOptions,
+      options.assumeEngineVersion,
+    );
     owns = true;
   } else if (target instanceof PowdbPool) {
     // An injected PowdbPool carries its own PowdbPoolOptions (incl. capabilities).
@@ -2425,48 +2571,59 @@ export async function turbinePowDB(
     pool = new PowdbPool(target, undefined, { ...poolOptions, capabilities });
   } else {
     const mod = options.powdbClientModule ?? (await loadPowdb());
-    const clientPool = new mod.Pool({ ...(target as PowdbConnOptions), max });
-    const capabilities = await assertNetworkedVersion(clientPool, options.assumeEngineVersion);
-    pool = new PowdbPool(clientPool, undefined, { ...poolOptions, capabilities });
+    pool = await wrapOwnedClientPool(
+      new mod.Pool({ ...(target as PowdbConnOptions), max }),
+      poolOptions,
+      options.assumeEngineVersion,
+    );
     owns = true;
   }
 
-  // The PowQL generator is loaded here to keep client.ts free of any PowDB import.
-  const { PowqlInterface } = await import('./powql.js');
-  const queryInterfaceFactory: NonNullable<QueryInterfaceOptions['queryInterfaceFactory']> = (
-    p,
-    table,
-    sch,
-    middlewares,
-    opts,
-  ) =>
-    new PowqlInterface(p as unknown as PowdbPool, table, sch, middlewares, opts) as unknown as QueryInterface<object>;
+  let client: TurbineClient;
+  try {
+    // The PowQL generator is loaded here to keep client.ts free of any PowDB import.
+    const { PowqlInterface } = await import('./powql.js');
+    const queryInterfaceFactory: NonNullable<QueryInterfaceOptions['queryInterfaceFactory']> = (
+      p,
+      table,
+      sch,
+      middlewares,
+      opts,
+    ) => new PowqlInterface(p as unknown as PowdbPool, table, sch, middlewares, opts);
 
-  // Forward every client-level option EXCEPT the ones this factory owns (they
-  // configure the pool / transport above, and TurbineClient warns on a config
-  // key it does not recognize). Destructured rather than hand-listed on the way
-  // IN: an allowlist is how `globalFilters` came to be accepted and ignored.
-  const {
-    connectionLimit: _connectionLimit,
-    transactionQueueTimeoutMs: _transactionQueueTimeoutMs,
-    retryStaleReads: _retryStaleReads,
-    assumeEngineVersion: _assumeEngineVersion,
-    readonly: _readonly,
-    powdbClientModule: _powdbClientModule,
-    powdbEmbeddedModule: _powdbEmbeddedModule,
-    ...clientConfig
-  } = options;
+    // Forward every client-level option EXCEPT the ones this factory owns (they
+    // configure the pool / transport above, and TurbineClient warns on a config
+    // key it does not recognize). Destructured rather than hand-listed on the way
+    // IN: an allowlist is how `globalFilters` came to be accepted and ignored.
+    const {
+      connectionLimit: _connectionLimit,
+      transactionQueueTimeoutMs: _transactionQueueTimeoutMs,
+      retryStaleReads: _retryStaleReads,
+      assumeEngineVersion: _assumeEngineVersion,
+      readonly: _readonly,
+      powdbClientModule: _powdbClientModule,
+      powdbEmbeddedModule: _powdbEmbeddedModule,
+      ...clientConfig
+    } = options;
 
-  const client = new TurbineClient(
-    {
-      ...clientConfig,
-      pool,
-      preparedStatements: false,
-      dialect: powdbDialect,
-      queryInterfaceFactory,
-    } as TurbineConfig & { queryInterfaceFactory: typeof queryInterfaceFactory },
-    schema,
-  );
+    client = new TurbineClient(
+      {
+        ...clientConfig,
+        pool,
+        preparedStatements: false,
+        dialect: powdbDialect,
+        queryInterfaceFactory,
+      } as TurbineConfig & { queryInterfaceFactory: typeof queryInterfaceFactory },
+      schema,
+    );
+  } catch (err) {
+    // A failed factory hands the caller nothing to close, so a pool or embedded
+    // handle it BUILT is closed here (the client constructor refuses a bad
+    // config, a static global filter naming no table for one). A pool the
+    // caller supplied is the caller's and stays open.
+    if (owns) await pool.end().catch(() => {});
+    throw err;
+  }
 
   if (owns) {
     // Turbine built this pool / embedded handle, so disconnect()/end() must
@@ -2476,16 +2633,19 @@ export async function turbinePowDB(
     // open until powdb-server's idle timeout (~300s) closed them. Consistent
     // with turbineMssql's owned-pool patch.
     const baseDisconnect = client.disconnect.bind(client);
-    const close = async (): Promise<void> => {
-      await baseDisconnect();
+    const close = async (options?: DisconnectOptions): Promise<DisconnectResult | undefined> => {
+      const result = options === undefined ? await baseDisconnect() : await baseDisconnect(options);
       await pool.end();
+      return result ?? undefined;
     };
-    const patch = client as unknown as { disconnect: () => Promise<void>; end: () => Promise<void> };
+    const patch = client as unknown as { disconnect: typeof close; end: typeof close };
     patch.disconnect = close;
     patch.end = close;
   } else {
     // Injected pool, the caller owns its lifecycle.
-    (client as { disconnect: () => Promise<void> }).disconnect = async () => {};
+    (
+      client as unknown as { disconnect: (options?: DisconnectOptions) => Promise<DisconnectResult | undefined> }
+    ).disconnect = async (options) => (options === undefined ? undefined : { timedOut: false, forcedConnections: 0 });
   }
   return client;
 }

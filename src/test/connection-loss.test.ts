@@ -316,8 +316,12 @@ describe('$listen connection loss (fake pool)', () => {
   it('without onError, reports the loss on stderr rather than silently', async () => {
     const { pool, clients } = fakePool();
     const lines: string[] = [];
+    // A loss it will retry is a warning; console.warn and console.error both
+    // write to stderr.
     const original = console.error;
+    const originalWarn = console.warn;
     console.error = (msg: unknown) => void lines.push(String(msg));
+    console.warn = (msg: unknown) => void lines.push(String(msg));
     try {
       const sub = await createSubscription(
         pool,
@@ -331,6 +335,7 @@ describe('$listen connection loss (fake pool)', () => {
       await sub.unsubscribe();
     } finally {
       console.error = original;
+      console.warn = originalWarn;
     }
     assert.equal(lines.length, 1);
     assert.match(lines[0] as string, /\$listen "c".*connection lost.*reconnecting/i);

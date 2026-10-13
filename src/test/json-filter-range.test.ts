@@ -93,9 +93,9 @@ describe('JsonFilter range operators', () => {
     const d = q.buildFindMany({
       where: { payload: { path: ['score'], equals: '3', gt: 1 } } as never,
     });
-    assert.match(d.sql, /"payload" #>> \$1::text\[\] = \$2/);
+    assert.match(d.sql, /\("payload" #> \$1::text\[\]\)::jsonb = \$2::jsonb/);
     assert.match(d.sql, /\("payload" #>> \$1::text\[\]\)::numeric > \$3/);
-    assert.deepEqual(d.params, [['score'], '3', 1]);
+    assert.deepEqual(d.params, [['score'], '"3"', 1]);
   });
 
   it('range op without path throws a clear ValidationError', () => {

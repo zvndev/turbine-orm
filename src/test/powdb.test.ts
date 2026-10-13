@@ -51,6 +51,7 @@ import {
 import { MAX_POWQL_DATETIME_TERMS, PowqlInterface } from '../powql.js';
 import type { DeferredQuery } from '../query/index.js';
 import { UNSAFE } from '../query/index.js';
+import { resetWarnOnce, WARN_NS } from '../query/warn-registry.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 
 // ---------------------------------------------------------------------------
@@ -156,7 +157,7 @@ function mockPool(caps: PowdbCapabilities = ALL_POWDB_CAPABILITIES) {
       // upsert (no `returning`) and bulk update/delete return an affected count.
       if (/\breturning$/.test(powql)) return Promise.resolve({ rows: nextRows, rowCount: nextRows.length });
       if (head.startsWith('upsert')) return Promise.resolve({ rows: [], rowCount: 1 });
-      if (/ update \{| delete$/.test(powql)) return Promise.resolve({ rows: [], rowCount: 1 });
+      if (/(?: update \{| delete$)/.test(powql)) return Promise.resolve({ rows: [], rowCount: 1 });
       if (/^(count|sum|avg|min|max)\(/.test(head))
         return Promise.resolve({ rows: [{ value: nextScalar }], rowCount: 1 });
       return Promise.resolve({ rows: nextRows, rowCount: nextRows.length });
@@ -621,7 +622,7 @@ describe('powdb: findMany generation', () => {
     const { powql, params } = m.last();
     assert.match(
       powql,
-      /^app_user filter \.age >= \$1 order \.name asc limit \$2 offset \$3 \{ \.id, \.name, \.age, \.score, \.active, \.created_at \}$/,
+      /^app_user filter \.age >= \$1 order \.name asc, \.id asc limit \$2 offset \$3 \{ \.id, \.name, \.age, \.score, \.active, \.created_at \}$/,
     );
     assert.deepEqual(params, [30, 10, 5]);
   });
@@ -1014,7 +1015,6 @@ describe('powdb: write generation', () => {
     // These pass the old shape-based check (they HAVE keys) but compile to an
     // empty PowQL filter, so they must be rejected and emit no write.
     const cases: Record<string, unknown>[] = [
-      { OR: [] },
       { AND: [] },
       { NOT: {} },
       { id: undefined },
@@ -2088,6 +2088,8 @@ describe('powdb: warnOnUnlimited per-table map', () => {
   };
 
   async function warningsFor(warnOnUnlimited?: boolean | Record<string, boolean>): Promise<string[]> {
+    // The warning is said once per table per process, so each case starts clean.
+    resetWarnOnce(WARN_NS.unlimitedFindMany);
     const mock = mockPool();
     const q = new PowqlInterface(mock.pool, 'user_profiles', profilesSchema, [], { warnOnUnlimited });
     const captured: string[] = [];
@@ -2197,7 +2199,7 @@ describe('powdb: reserved-word identifiers are backtick-quoted in bare positions
     await kwQi(m).findMany({ where: { type: 'news' }, orderBy: { limit: 'asc' }, limit: 5 });
     assert.match(
       m.last().powql,
-      /^`order` filter \.type = \$1 order \.limit asc limit \$2 \{ \.id, \.type, \.limit, \.name \}$/,
+      /^`order` filter \.type = \$1 order \.limit asc, \.id asc limit \$2 \{ \.id, \.type, \.limit, \.name \}$/,
     );
   });
 });
@@ -2316,7 +2318,7 @@ describe('powdb: owned-pool disconnect() closes every driver client (socket-leak
       },
     );
     assert.ok(fake.clients.length >= 1, 'the version probe checked out a client');
-    await db.raw(['note work'] as never);
+    await db.rawUnsafe('note work');
     await db.$transaction(async () => 'tx-work');
     await db.disconnect();
     assert.ok(fake.closeCalled(), 'disconnect() must close the OWNED driver pool (was skipped entirely)');
@@ -2332,7 +2334,7 @@ describe('powdb: owned-pool disconnect() closes every driver client (socket-leak
         powdbClientModule: fake.mod,
       },
     );
-    await db.raw(['note work'] as never);
+    await db.rawUnsafe('note work');
     await db.end(); // the end() alias must be patched too
     assert.equal(fake.live(), 0);
   });
@@ -2361,7 +2363,7 @@ describe('powdb: owned-pool disconnect() closes every driver client (socket-leak
     const FakePool = (fake.mod as unknown as { Pool: new (o: unknown) => unknown }).Pool;
     const driverPool = new FakePool({});
     const db = await turbinePowDB(driverPool as never, { tables: {}, enums: {} });
-    await db.raw(['note work'] as never);
+    await db.rawUnsafe('note work');
     await db.disconnect();
     assert.ok(!fake.closeCalled(), 'injected pool must NOT be closed by disconnect()');
   });
@@ -2705,7 +2707,7 @@ describe('powdb: introspectPowdbDatabase gating + mis-shaped exec guard', () => 
   it('an empty database (zero schema rows) returns an empty schema, not an error', async () => {
     const exec = async () => ({ rows: [] as Record<string, unknown>[] });
     const meta = await introspectPowdbDatabase(exec);
-    assert.deepEqual(meta, { tables: {}, enums: {} });
+    assert.deepEqual({ tables: { ...meta.tables }, enums: { ...meta.enums } }, { tables: {}, enums: {} });
   });
 });
 
@@ -3133,7 +3135,7 @@ describe('powdb F1: JsonFilter → PowQL path filters', () => {
       where: { OR: [{ data: { path: ['a'], equals: 1 } }, { NOT: { data: { path: ['b'], gt: 2 } } }] },
       limit: 1,
     });
-    assert.match(m.last().powql, /\(\.data->\$1 = \$2 or not \(\.data->\$3 > \$4\)\)/);
+    assert.match(m.last().powql, /\(\.data->\$1 = \$2 or \(\.data is not null and not \(\.data->\$3 > \$4\)\)\)/);
   });
 
   it('contains → E017 (PowQL has no containment operator)', async () => {
@@ -3231,7 +3233,7 @@ describe('powdb F2: JSON-path orderBy', () => {
   it('path order → `order .data->$n asc`', async () => {
     const m = mockPool();
     await qi(m, 'doc').findMany({ orderBy: { data: { path: ['k'] } } as never, limit: 1 });
-    assert.match(m.last().powql, / order \.data->\$1 asc /);
+    assert.match(m.last().powql, / order \.data->\$1 asc, \.id asc /);
   });
 
   it('desc + numeric cast', async () => {
@@ -3240,13 +3242,13 @@ describe('powdb F2: JSON-path orderBy', () => {
       orderBy: { data: { path: ['n'], direction: 'desc', type: 'numeric' } } as never,
       limit: 1,
     });
-    assert.match(m.last().powql, / order cast\(\.data->\$1, "float"\) desc /);
+    assert.match(m.last().powql, / order cast\(\.data->\$1, "float"\) desc, \.id asc /);
   });
 
   it('nulls:last accepted (no-op); nulls:first → E017', async () => {
     const m = mockPool();
     await qi(m, 'doc').findMany({ orderBy: { data: { path: ['k'], nulls: 'last' } } as never, limit: 1 });
-    assert.match(m.last().powql, / order \.data->\$1 asc /);
+    assert.match(m.last().powql, / order \.data->\$1 asc, \.id asc /);
     await assert.rejects(
       qi(mockPool(), 'doc').findMany({ orderBy: { data: { path: ['k'], nulls: 'first' } } as never, limit: 1 }),
       (e: unknown) => e instanceof UnsupportedFeatureError && /NULLS FIRST/i.test((e as Error).message),
@@ -3256,7 +3258,7 @@ describe('powdb F2: JSON-path orderBy', () => {
   it('OrderBySpec { sort, nulls:last } accepted; nulls:first → E017', async () => {
     const m = mockPool();
     await qi(m, 'doc').findMany({ orderBy: { region: { sort: 'desc', nulls: 'last' } } as never, limit: 1 });
-    assert.match(m.last().powql, / order \.region desc /);
+    assert.match(m.last().powql, / order \.region desc, \.id desc /);
     await assert.rejects(
       qi(mockPool(), 'doc').findMany({ orderBy: { region: { sort: 'asc', nulls: 'first' } } as never, limit: 1 }),
       (e: unknown) => e instanceof UnsupportedFeatureError && /NULLS FIRST/i.test((e as Error).message),
@@ -3538,7 +3540,7 @@ describe('powdb hook: groupBy result cells go through the same native coercion a
       { gk_0: true, agg_0: 1n },
       { gk_0: null, agg_0: 3n },
     ]);
-    const out = await qi(m, 'doc').groupBy({ by: [{ field: 'data', path: ['k'] }] as never });
+    const out = (await qi(m, 'doc').groupBy({ by: [{ field: 'data', path: ['k'] }] as never })) as { k?: unknown }[];
     assert.equal(out[0]!.k, '7'); // not 7n
     assert.equal(out[1]!.k, 'true');
     assert.equal(out[2]!.k, null);
@@ -3937,7 +3939,7 @@ describe('powdb: per-field _count gate (0.20)', () => {
     // already answered this correctly and the call must keep working. This is
     // the whole install base turbine-orm 0.51.0 shipped against.
     mock.setScalar('4');
-    const notNull = await q.aggregate({ _count: { name: true } } as never);
+    const notNull = (await q.aggregate({ _count: { name: true } } as never)) as { _count: unknown };
     assert.deepEqual(notNull._count, { name: 4 });
     assert.match(mock.last().powql, /^count\(app_user \{ \.name \}\)$/);
     // A mixed request is refused for the nullable member, and refused BEFORE any
@@ -3947,7 +3949,7 @@ describe('powdb: per-field _count gate (0.20)', () => {
       (e: unknown) => e instanceof UnsupportedFeatureError && /nullable column "age"/.test((e as Error).message),
     );
     mock.setScalar('7');
-    const rows = await q.aggregate({ _count: true } as never);
+    const rows = (await q.aggregate({ _count: true } as never)) as { _count: unknown };
     assert.equal(rows._count, 7);
     assert.match(mock.last().powql, /^count\(app_user\)$/);
   });
@@ -3955,7 +3957,7 @@ describe('powdb: per-field _count gate (0.20)', () => {
   it('gates nothing at all on a 0.20 engine', async () => {
     const mock = mockPool(capabilitiesFromVersion('0.20.0'));
     mock.setScalar('4');
-    const res = await qi(mock).aggregate({ _count: { age: true, name: true } } as never);
+    const res = (await qi(mock).aggregate({ _count: { age: true, name: true } } as never)) as { _count: unknown };
     assert.deepEqual(res._count, { age: 4, name: 4 });
   });
 

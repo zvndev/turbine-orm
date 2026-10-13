@@ -139,14 +139,19 @@ export function schemaToSQL(schema: SchemaDef, options?: SchemaSqlOptions): stri
   }
 
   // CREATE TYPE for every schema-level enum, before the tables that use them.
-  for (const [enumName, labels] of Object.entries(schema.enums ?? {})) {
-    statements.push(generateCreateEnumType(enumName, labels, dialect));
+  // Only where enums are named types (PostgreSQL): every other engine declares
+  // the labels on the column itself (see `enumColumnType`), and has no CREATE
+  // TYPE to run.
+  if (dialect.capabilities.namedEnumTypes) {
+    for (const [enumName, labels] of Object.entries(schema.enums ?? {})) {
+      statements.push(generateCreateEnumType(enumName, labels, dialect));
+    }
   }
 
   // Generate CREATE TABLE statements
   for (const tableName of sorted) {
     const table = schema.tables[tableName]!;
-    statements.push(generateCreateTable(table, resolveRef, dialect));
+    statements.push(generateCreateTable(table, resolveRef, dialect, schema.enums));
   }
 
   // Generate CREATE INDEX for foreign key columns
@@ -264,14 +269,25 @@ function generateCreateTable(
   table: TableDef,
   resolveRef?: (raw: string) => string,
   dialect: Dialect = postgresDialect,
+  enums?: Readonly<Record<string, readonly string[]>>,
 ): string {
   const tableName = table.name;
   const columnDefs: string[] = [];
   const compositePk = table.primaryKey && table.primaryKey.length > 0 ? table.primaryKey : null;
 
+  const keyed = keyedColumnNames(table);
+  const inline = dialect.capabilities.inlineForeignKeys;
+  const foreignKeys: string[] = [];
   for (const [fieldName, config] of Object.entries(table.columns)) {
-    columnDefs.push(generateColumnDef(fieldName, config, resolveRef, dialect));
+    columnDefs.push(
+      generateColumnDef(fieldName, config, resolveRef, dialect, keyed.has(camelToSnake(fieldName)), inline, enums),
+    );
+    if (!inline) {
+      const fk = generateForeignKeyConstraint(fieldName, config, resolveRef, dialect);
+      if (fk) foreignKeys.push(fk);
+    }
   }
+  columnDefs.push(...foreignKeys);
 
   // Append a table-level PRIMARY KEY constraint when a composite PK is set.
   if (compositePk) {
@@ -298,15 +314,103 @@ function generateCreateTable(
 }
 
 /**
+ * The snake_case names of the columns of `table` that sit in a key: a primary
+ * key (single or composite), a UNIQUE column, a foreign key (Turbine indexes
+ * those), or a member of a declared index.
+ */
+function keyedColumnNames(table: TableDef): Set<string> {
+  const keyed = new Set<string>();
+  for (const [fieldName, config] of Object.entries(table.columns)) {
+    if (config.isPrimaryKey || config.isUnique || config.referencesTarget) keyed.add(camelToSnake(fieldName));
+  }
+  for (const pk of table.primaryKey ?? []) keyed.add(camelToSnake(pk));
+  for (const idx of table.indexes ?? []) {
+    if (isDocFieldIndexDef(idx)) continue;
+    for (const col of idx.columns) keyed.add(camelToSnake(col));
+  }
+  return keyed;
+}
+
+/** A table-level `FOREIGN KEY` clause for a column's `references`, or null. */
+function generateForeignKeyConstraint(
+  fieldName: string,
+  config: ColumnConfig,
+  resolveRef: ((raw: string) => string) | undefined,
+  dialect: Dialect,
+): string | null {
+  if (!config.referencesTarget) return null;
+  const refParts = config.referencesTarget.split('.');
+  if (refParts.length !== 2) return null;
+  const refTable = resolveRef ? resolveRef(refParts[0]!) : refParts[0]!;
+  let clause = `FOREIGN KEY (${dialect.quoteIdentifier(camelToSnake(fieldName))}) REFERENCES ${dialect.quoteIdentifier(refTable)}(${dialect.quoteIdentifier(refParts[1]!)})`;
+  if (config.onDelete) clause += ` ON DELETE ${referentialActionToSql(config.onDelete)}`;
+  if (config.onUpdate) clause += ` ON UPDATE ${referentialActionToSql(config.onUpdate)}`;
+  return clause;
+}
+
+/**
+ * The type (and CHECK) of an enum column on an engine with no named enum type,
+ * from the dialect's `buildEnumColumn`, or null on PostgreSQL, where the column
+ * names the `CREATE TYPE`. The labels come from the schema's `enums`: off
+ * PostgreSQL there is no existing type a column could name instead.
+ */
+function enumColumnType(
+  config: ColumnConfig,
+  dialect: Dialect,
+  column: string,
+  enums: Readonly<Record<string, readonly string[]>> | undefined,
+): { type: string; maxLength?: number | null; check?: string } | null {
+  if (!config.enumName || dialect.capabilities.namedEnumTypes) return null;
+  if (!dialect.buildEnumColumn) {
+    throw new UnsupportedFeatureError(
+      'enum columns',
+      dialect.name,
+      `Column "${column}" is of enum type "${config.enumName}". Declare it as text with a CHECK constraint instead.`,
+    );
+  }
+  if (config.isArray) {
+    throw new UnsupportedFeatureError(
+      'enum array columns',
+      dialect.name,
+      `Column "${column}" is an array of enum "${config.enumName}"; ${dialect.name} has no array columns.`,
+    );
+  }
+  const labels = enums?.[config.enumName];
+  if (!labels) {
+    throw new ValidationError(
+      `Column "${column}" is of enum type "${config.enumName}", which the schema does not declare. ` +
+        `${dialect.name} has no enum type to refer to, so the labels must be in the schema: ` +
+        `defineSchema(tables, { enums: { ${JSON.stringify(config.enumName)}: ['a', 'b'] } }).`,
+    );
+  }
+  if (labels.length === 0) {
+    throw new ValidationError(
+      `Enum "${config.enumName}" declares no labels, so column "${column}" could hold nothing.`,
+    );
+  }
+  return dialect.buildEnumColumn(dialect.quoteIdentifier(column), labels);
+}
+
+/**
  * Generate a single column definition line (e.g. "id BIGSERIAL PRIMARY KEY").
+ *
+ * `keyed` marks a column that sits in a key (see {@link keyedColumnNames}); it
+ * only matters to dialects that cannot key an unbounded text type. `inlineReferences`
+ * is false for a dialect that declares foreign keys at table level instead.
+ * `enums` is the schema's enum declarations, needed off PostgreSQL to declare
+ * an enum column's labels on the column itself.
  */
 function generateColumnDef(
   fieldName: string,
   config: ColumnConfig,
   resolveRef?: (raw: string) => string,
   dialect: Dialect = postgresDialect,
+  keyed = false,
+  inlineReferences = true,
+  enums?: Readonly<Record<string, readonly string[]>>,
 ): string {
   const snakeName = camelToSnake(fieldName);
+  const enumColumn = enumColumnType(config, dialect, snakeName, enums);
 
   // NOT NULL, serial types are implicitly NOT NULL, but explicit is fine.
   // A column is NOT NULL if:
@@ -318,16 +422,14 @@ function generateColumnDef(
   const implicitNotNull = isSerial || config.isPrimaryKey;
   const notNull = config.isNotNull && !implicitNotNull;
 
-  // DEFAULT
-  let defaultValue: string | undefined;
-  if (config.defaultValue != null) {
-    defaultValue = normalizeDefault(config.defaultValue);
-  }
+  // DEFAULT, normalized here and spelled for the dialect once the column's
+  // final type is known (a MySQL default depends on it).
+  const normalizedDefault = config.defaultValue != null ? normalizeDefault(config.defaultValue) : undefined;
 
   // REFERENCES, resolve the raw table name through the optional resolver so
   // both camelCase accessor names and snake_case DDL names work.
   let references: { table: string; column: string } | undefined;
-  if (config.referencesTarget) {
+  if (config.referencesTarget && inlineReferences) {
     const refParts = config.referencesTarget.split('.');
     if (refParts.length === 2) {
       const rawTable = refParts[0]!;
@@ -339,15 +441,42 @@ function generateColumnDef(
     }
   }
 
-  // Resolve the DDL type (enum name / vector(n) / scalar, plus [] for arrays).
-  // Passed as a fully-formed `type` token with no maxLength so the dialect
-  // doesn't re-apply VARCHAR(n) on top of it.
-  const ddlType = resolveDdlType(config, dialect, snakeName);
+  // The type is mapped ONCE, by the dialect's own `buildColumnDefinition`. A
+  // column that is a plain scalar hands it the schema-level token (`SERIAL`,
+  // `VARCHAR` + maxLength, `TEXT`), because every non-Postgres dialect keeps
+  // its auto-increment / identity marker, its length and its bounded string
+  // type INSIDE that mapping. Handing it the already-mapped token (`INT
+  // AUTO_INCREMENT`, `VARCHAR(12)`) made the dialect map the output of its own
+  // mapper, which turned `INT AUTO_INCREMENT` into `INT`, `VARCHAR(12)` into
+  // `VARCHAR(255)` and `NVARCHAR(MAX)` into `NVARCHAR(255)`. An enum name, a
+  // `vector(n)` and an array are Postgres tokens with no schema-level spelling,
+  // so they are passed through resolved.
+  const plainScalar = !config.enumName && config.vectorDimensions == null && !config.isArray;
+  let typeInput: { type: string; maxLength: number | null };
+  if (enumColumn) {
+    typeInput = { type: enumColumn.type, maxLength: enumColumn.maxLength ?? null };
+  } else if (!plainScalar) {
+    typeInput = { type: resolveDdlType(config, dialect, snakeName), maxLength: null };
+  } else if (keyed && config.type === 'TEXT' && !dialect.capabilities.unboundedTextKeys) {
+    // A keyed text / bytea column takes the dialect's bounded type
+    // (`VARCHAR(255)` / `NVARCHAR(255)`, `VARBINARY(255)`) where an unbounded
+    // one cannot be a key, or its own `maxLength` when it declares one.
+    typeInput = { type: 'VARCHAR', maxLength: config.maxLength };
+  } else if (keyed && config.type === 'BYTEA' && !dialect.capabilities.unboundedTextKeys) {
+    typeInput = { type: 'VARBINARY', maxLength: config.maxLength };
+  } else {
+    typeInput = { type: config.type, maxLength: config.maxLength };
+  }
+
+  const defaultValue =
+    normalizedDefault === undefined
+      ? undefined
+      : dialectDefault(normalizedDefault, dialect, dialect.name === 'mysql' ? dialect.buildColumnType(typeInput) : '');
 
   let def = dialect.buildColumnDefinition({
     name: dialect.quoteIdentifier(snakeName),
-    type: ddlType,
-    maxLength: null,
+    type: typeInput.type,
+    maxLength: typeInput.maxLength,
     primaryKey: config.isPrimaryKey,
     unique: config.isUnique,
     notNull,
@@ -367,6 +496,10 @@ function generateColumnDef(
   // parameterize a boolean expression); never build it from untrusted input.
   if (config.check) {
     def += ` CHECK (${config.check})`;
+  }
+  // The enum's labels, on an engine whose column type does not hold them.
+  if (enumColumn?.check) {
+    def += ` CHECK (${enumColumn.check})`;
   }
 
   return def;
@@ -400,16 +533,131 @@ function normalizeDefault(val: string): string {
     return val.trim();
   }
 
-  // Simple single-quoted string literals (no semicolons, no SQL statement keywords)
-  if (/^'[^']*'$/.test(val.trim())) {
-    const inner = val.trim().slice(1, -1);
+  // Single-quoted string literals, a quote inside written doubled (`'it''s'`),
+  // optionally followed by a PostgreSQL cast as the catalog prints a default
+  // (`'x'::text`, `'{}'::jsonb`). The cast is dropped: the literal is assigned
+  // to the column, which converts it to the column's type on every engine,
+  // and the other engines have no `::`. No semicolons, no statement keywords.
+  const literal = defaultStringLiteral(val.trim());
+  if (literal !== null) {
+    const inner = literal.slice(1, -1);
     if (/[;]/.test(inner) || /\b(DROP|ALTER|CREATE|INSERT|UPDATE|DELETE|GRANT|REVOKE|TRUNCATE)\b/i.test(inner)) {
-      throw new Error(`Suspicious default value: ${val}. String literals must not contain SQL statements.`);
+      throw new ValidationError(`Suspicious default value: ${val}. String literals must not contain SQL statements.`);
     }
-    return val.trim();
+    return literal;
   }
 
-  throw new Error(`Unsupported default value: ${val}. Use a SQL function, numeric, string literal, or NULL.`);
+  throw new ValidationError(
+    `Unsupported default value: ${val}. Use a SQL function, numeric, string literal (a quote inside it written ` +
+      `twice, as in 'it''s'), or NULL.`,
+  );
+}
+
+/**
+ * The string literal a default is, with any trailing PostgreSQL cast removed,
+ * or null when it is not one. Both patterns are linear: `[^']` and `''` cannot
+ * match the same text, and a cast's words are separated by single spaces.
+ */
+function defaultStringLiteral(val: string): string | null {
+  const cast = /^('(?:[^']|'')*')::[a-z_][a-z0-9_]*(?: [a-z_][a-z0-9_]*)*(?:\(\d+(?:, ?\d+)?\))?(?:\[\])?$/i.exec(val);
+  if (cast) return cast[1]!;
+  return /^'(?:[^']|'')*'$/.test(val) ? val : null;
+}
+
+/**
+ * MySQL column types that accept no literal default: a default has to be written
+ * as an expression, in parentheses (8.0.13+), even when its value is a constant.
+ */
+const MYSQL_EXPRESSION_DEFAULT_TYPES = /^(TINY|MEDIUM|LONG)?(TEXT|BLOB)\b|^JSON\b/i;
+
+/**
+ * A MySQL expression default for a string literal, as its UTF-8 bytes in hex:
+ * `(X'...')` on a BLOB column, `(CONVERT(X'...' USING utf8mb4))` on a TEXT or
+ * JSON one. `normalized` is a single-quoted literal with its quotes doubled.
+ */
+function mysqlHexDefault(normalized: string, columnType: string): string {
+  const value = normalized.slice(1, -1).replace(/''/g, "'");
+  let hex = '';
+  for (const byte of new TextEncoder().encode(value)) hex += byte.toString(16).padStart(2, '0');
+  return /BLOB/i.test(columnType) ? `(X'${hex}')` : `(CONVERT(X'${hex}' USING utf8mb4))`;
+}
+
+/** What a clock default means on a MySQL date or time column. */
+function mysqlClockDefault(key: string, ddlType: string): string | null {
+  const isClock = key === 'NOW()' || key === 'CURRENT_TIMESTAMP' || key === 'CURRENT_DATE' || key === 'CURRENT_TIME';
+  if (!isClock) return null;
+  const datetime = /^(?:DATETIME|TIMESTAMP)(?:\((\d)\))?$/i.exec(ddlType);
+  if (datetime) {
+    // MySQL 8 rejects a default whose fractional precision differs from the
+    // column's, and a bare CURRENT_DATE / CURRENT_TIME is not a valid default
+    // for a DATETIME (only the parenthesized expression is).
+    if (key === 'NOW()' || key === 'CURRENT_TIMESTAMP') {
+      return datetime[1] ? `CURRENT_TIMESTAMP(${datetime[1]})` : 'CURRENT_TIMESTAMP';
+    }
+    return `(${key})`;
+  }
+  // DATE and TIME columns accept neither NOW() nor a bare CURRENT_*, so the
+  // default is the matching clock function as an expression.
+  if (/^DATE$/i.test(ddlType)) return '(CURRENT_DATE)';
+  if (/^TIME(?:\(\d\))?$/i.test(ddlType)) return '(CURRENT_TIME)';
+  return null;
+}
+
+/**
+ * The spelling of an already-normalized default for `dialect`. The schema
+ * vocabulary (`now()`, `true`, `gen_random_uuid()`) is Postgres's, and some of
+ * it is not SQL on the other engines: SQLite has no `NOW()` default, SQLite and
+ * MySQL have no `GEN_RANDOM_UUID()`, and SQL Server has none of `NOW()`, boolean
+ * literals or `CURRENT_DATE`. A literal (number, string, NULL) is the same
+ * everywhere and passes through, except on a MySQL TEXT, BLOB or JSON column,
+ * where it has to be an expression. `columnType` is the column's MySQL type as
+ * the dialect spells it (`DATETIME(3)`, `TEXT`); other dialects ignore it.
+ */
+function dialectDefault(normalized: string, dialect: Dialect, columnType = ''): string {
+  const key = normalized.toUpperCase();
+  switch (dialect.name) {
+    case 'sqlite':
+      if (key === 'NOW()') return 'CURRENT_TIMESTAMP';
+      if (key === 'GEN_RANDOM_UUID()') {
+        return "(lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4' || substr(hex(randomblob(2)), 2) || '-' || substr('89ab', abs(random()) % 4 + 1, 1) || substr(hex(randomblob(2)), 2) || '-' || hex(randomblob(6))))";
+      }
+      return normalized;
+    case 'mysql': {
+      if (key === 'GEN_RANDOM_UUID()') return '(UUID())';
+      const clock = mysqlClockDefault(key, columnType);
+      if (clock) return clock;
+      // `DEFAULT NULL` is the one default these types accept as a literal.
+      const expression = key !== 'NULL' && MYSQL_EXPRESSION_DEFAULT_TYPES.test(columnType);
+      if (normalized.startsWith("'") && /['\\]/.test(normalized.slice(1, -1))) {
+        // A quote or a backslash inside the literal. Whether `\` escapes depends
+        // on the session's NO_BACKSLASH_ESCAPES, which Turbine's own connections
+        // set and other clients do not. An EXPRESSION default is worse: MySQL
+        // stores it re-escaped with backslashes and parses it again on every
+        // insert under the inserting session's mode, so `('it''s')` created
+        // fine and then failed every insert on a Turbine connection (measured
+        // on MySQL 8). Spelled as hex bytes, the value has no quote or
+        // backslash to read either way.
+        if (expression) return mysqlHexDefault(normalized, columnType);
+        if (normalized.includes('\\')) {
+          throw new ValidationError(
+            `The default ${normalized} holds a backslash, which MySQL reads differently with and without ` +
+              'NO_BACKSLASH_ESCAPES. Use a default without one.',
+          );
+        }
+      }
+      if (expression) return `(${normalized})`;
+      return normalized;
+    }
+    case 'mssql':
+      if (key === 'NOW()') return 'CURRENT_TIMESTAMP';
+      if (key === 'GEN_RANDOM_UUID()') return 'NEWID()';
+      if (key === 'TRUE') return '1';
+      if (key === 'FALSE') return '0';
+      if (key === 'CURRENT_DATE') return '(CAST(SYSDATETIME() AS DATE))';
+      return normalized;
+    default:
+      return normalized;
+  }
 }
 
 /**
@@ -626,6 +874,47 @@ export interface DiffResult {
    * removal/reorder, etc.). Never executed, surfaced for the operator.
    */
   warnings?: string[];
+  /**
+   * The members of `warnings` the diff cannot decide are real. Postgres rewrites
+   * a CHECK expression when it stores it, so a named check whose text differs
+   * from the schema's is usually the same constraint. They are printed like any
+   * other warning, but {@link driftWarnings} leaves them out, so a gate does not
+   * fail forever on a database that was just pushed.
+   */
+  inexactWarnings?: string[];
+  /**
+   * Type changes in `statements` that can never lose a value (see
+   * {@link isLosslessWidening}). The destructive gate skips exactly these
+   * statements; every other `ALTER COLUMN ... TYPE` is still flagged.
+   */
+  widenings?: TypeWidening[];
+  /**
+   * Parts of the database this diff did NOT compare, as sentences. "Already in
+   * sync" is only a claim about what was compared, so a caller that says it
+   * lists these beside it.
+   */
+  notCompared?: string[];
+}
+
+/**
+ * The warnings in a diff that report a real difference between the database and
+ * the schema file: everything in `warnings` except the entries the diff marked
+ * as possibly cosmetic ({@link DiffResult.inexactWarnings}). `push --dry-run
+ * --exit-code` fails on these.
+ */
+export function driftWarnings(diff: Pick<DiffResult, 'warnings' | 'inexactWarnings'>): string[] {
+  const inexact = new Set(diff.inexactWarnings ?? []);
+  return (diff.warnings ?? []).filter((w) => !inexact.has(w));
+}
+
+/** One lossless `ALTER COLUMN ... TYPE` in a {@link DiffResult}. */
+export interface TypeWidening {
+  /** The exact statement, as it appears in `DiffResult.statements`. */
+  statement: string;
+  /** The column's current type, as SQL. */
+  from: string;
+  /** The type the statement changes it to, as SQL. */
+  to: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -704,10 +993,18 @@ export function diffReferentialAction(
 }
 
 /**
- * Compute append-only enum value changes. Returns `ALTER TYPE ... ADD VALUE`
- * statements for labels present in the schema but not the DB (in order), plus a
- * destructive warning for any DB label the schema dropped or any reorder -
- * Postgres cannot remove or reorder enum values without recreating the type.
+ * Compute the enum changes needed to make the database's labels match the
+ * schema's, KEEPING THE DECLARED ORDER.
+ *
+ * An enum's order is observable: it decides `ORDER BY`, `<` and `MIN`/`MAX` on
+ * the column. A new label therefore goes where the schema declares it, not
+ * wherever the end of the type happens to be: `ADD VALUE 'x' AFTER 'prev'`, or
+ * `BEFORE 'next'` when it leads. A label that belongs at the end emits the bare
+ * `ADD VALUE`, which is what every earlier version emitted for it.
+ *
+ * Postgres cannot remove or reorder values in place, so a database label the
+ * schema dropped, and a declared order the database does not already have, are
+ * warnings (never statements): the type has to be recreated by hand.
  */
 export function diffEnumValues(
   enumName: string,
@@ -717,18 +1014,50 @@ export function diffEnumValues(
 ): { statements: string[]; warnings: string[] } {
   const statements: string[] = [];
   const warnings: string[] = [];
-  const dbSet = new Set(dbLabels);
-  for (const label of schemaLabels) {
-    if (!dbSet.has(label)) {
-      statements.push(`ALTER TYPE ${dialect.quoteIdentifier(enumName)} ADD VALUE ${quoteEnumLabel(label)};`);
+  const type = dialect.quoteIdentifier(enumName);
+
+  // The type's label order as the statements below will leave it.
+  const order = [...dbLabels];
+  const schemaIndex = schemaLabels.map((label, i) => ({ label, i }));
+  for (const { label, i } of schemaIndex) {
+    if (order.includes(label)) continue;
+    const previous = i > 0 ? schemaLabels[i - 1] : undefined;
+    const next = schemaLabels.slice(i + 1).find((l) => order.includes(l));
+    const prevAt = previous === undefined ? -1 : order.indexOf(previous);
+    if (previous !== undefined && prevAt !== -1) {
+      if (prevAt === order.length - 1) {
+        statements.push(`ALTER TYPE ${type} ADD VALUE ${quoteEnumLabel(label)};`);
+        order.push(label);
+      } else {
+        statements.push(`ALTER TYPE ${type} ADD VALUE ${quoteEnumLabel(label)} AFTER ${quoteEnumLabel(previous)};`);
+        order.splice(prevAt + 1, 0, label);
+      }
+    } else if (next !== undefined) {
+      statements.push(`ALTER TYPE ${type} ADD VALUE ${quoteEnumLabel(label)} BEFORE ${quoteEnumLabel(next)};`);
+      order.splice(order.indexOf(next), 0, label);
+    } else {
+      statements.push(`ALTER TYPE ${type} ADD VALUE ${quoteEnumLabel(label)};`);
+      order.push(label);
     }
   }
+
   const schemaSet = new Set(schemaLabels);
   const removed = dbLabels.filter((l) => !schemaSet.has(l));
   if (removed.length > 0) {
     warnings.push(
       `Enum "${enumName}": labels [${removed.join(', ')}] exist in the database but not the schema. ` +
         `Postgres cannot remove enum values in place, recreate the type manually if intended.`,
+    );
+  }
+
+  // After the adds, the labels both sides share must already be in declared
+  // order; if not, no ADD VALUE can fix it.
+  const shared = order.filter((l) => schemaSet.has(l));
+  if (shared.some((label, i) => label !== schemaLabels[i])) {
+    warnings.push(
+      `Enum "${enumName}": the schema declares the order [${schemaLabels.join(', ')}] but the database has ` +
+        `[${shared.join(', ')}]. Postgres cannot reorder enum values in place, recreate the type manually if the ` +
+        `order matters (it decides ORDER BY and comparisons on the column).`,
     );
   }
   return { statements, warnings };
@@ -1025,7 +1354,17 @@ export async function schemaDiff(
     // Build a set of DDL-facing snake_case table names that the schema defines.
     const schemaDdlNames = new Set<string>();
     for (const def of Object.values(schema.tables)) schemaDdlNames.add(def.name);
-    const result: DiffResult = { create: [], alter: [], drop: [], statements: [], reverseStatements: [], warnings: [] };
+    const result: DiffResult = {
+      create: [],
+      alter: [],
+      drop: [],
+      statements: [],
+      reverseStatements: [],
+      warnings: [],
+      inexactWarnings: [],
+      widenings: [],
+      notCompared: [],
+    };
     const resolveRef = makeRefResolver(schema);
 
     // --- Enums: CREATE TYPE for new enums (before tables), ADD VALUE for grown
@@ -1061,9 +1400,10 @@ export async function schemaDiff(
       }
     }
 
-    // Tables to drop (in DB but not in schema)
+    // Tables to drop (in DB but not in schema). Turbine's own bookkeeping tables
+    // (`_turbine_migrations`, ...) are never the user's to drop.
     for (const existingTable of existingTables) {
-      if (!schemaDdlNames.has(existingTable)) {
+      if (!schemaDdlNames.has(existingTable) && !existingTable.startsWith('_turbine_')) {
         result.drop.push(existingTable);
         // We don't auto-generate DROP statements for safety
       }
@@ -1078,6 +1418,7 @@ export async function schemaDiff(
       const dbCols = dbColumns[tableName] ?? {};
       const tableUniques = dbUniques[tableName] ?? {};
       const alterDef: AlterDef = { table: tableName, columns: [] };
+      const sequenceDefaults: string[] = [];
 
       for (const [fieldName, config] of Object.entries(tableDef.columns)) {
         const snakeName = camelToSnake(fieldName);
@@ -1091,6 +1432,15 @@ export async function schemaDiff(
           alterDef.columns.push({ column: snakeName, action: 'add', sql, reverseSql });
           result.statements.push(sql);
           result.reverseStatements.unshift(reverseSql);
+          // NOT NULL with nothing to fill existing rows with: Postgres runs the
+          // statement fine on an empty table and rejects it on any other.
+          if ((config.isNotNull || config.isPrimaryKey) && !isSerialType(config.type) && config.defaultValue == null) {
+            result.warnings!.push(
+              `column "${tableName}"."${snakeName}" is added NOT NULL with no default: the ALTER fails on a table ` +
+                `that already has rows. Give it a default, add it nullable first and backfill it, or scaffold the ` +
+                `two-phase pattern with \`npx turbine migrate create <name> --recipe backfill\`.`,
+            );
+          }
           continue;
         }
 
@@ -1134,6 +1484,9 @@ export async function schemaDiff(
           alterDef.columns.push({ column: snakeName, action: 'alter_type', sql, reverseSql });
           result.statements.push(sql);
           result.reverseStatements.unshift(reverseSql);
+          if (!typePlan.needsUsing && !typePlan.loss && isLosslessWidening(oldSqlType, sqlType)) {
+            result.widenings!.push({ statement: sql, from: oldSqlType, to: sqlType });
+          }
           // The destructive gate sees the statement and refuses by default; its
           // label is necessarily generic ("cast may truncate or fail"). This
           // warning names what THIS conversion does to THESE rows.
@@ -1166,6 +1519,7 @@ export async function schemaDiff(
         if (!isSerial) {
           const schemaDefault = config.defaultValue ? normalizeDefault(config.defaultValue) : null;
           const dbDefault = dbCol.columnDefault;
+          if (dbDefault && isSequenceDefault(dbDefault)) sequenceDefaults.push(snakeName);
 
           if (schemaDefault && !dbDefault) {
             // Schema has default, DB doesn't
@@ -1226,17 +1580,24 @@ export async function schemaDiff(
       // gate, not by hiding the statement: withholding it here previously made
       // `push` report "already in sync" for a destructive-only diff and print a
       // false "Altered" for a mixed one, since the 0.36 guard never received it.
-      // No reverse is emitted (a dropped column and its data cannot be recreated
-      // automatically), so diff-generated migrations fall back to the documented
-      // irreversible-DOWN placeholder for this change.
+      // A dropped column and its data cannot be recreated automatically, so the
+      // reverse is irreversibleDropPlaceholder: an IRREVERSIBLE note in the DOWN
+      // section describing the column, never SQL that pretends to restore it.
       for (const dbColName of Object.keys(dbCols)) {
         const hasField = Object.entries(tableDef.columns).some(([fieldName]) => camelToSnake(fieldName) === dbColName);
         if (!hasField) {
           const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} DROP COLUMN ${dialect.quoteIdentifier(dbColName)};`;
-          const reverseSql = `-- Cannot auto-reverse DROP COLUMN for "${dbColName}"; add it back manually`;
+          const reverseSql = irreversibleDropPlaceholder(tableName, dbColName, dbCols[dbColName]!, dialect);
           alterDef.columns.push({ column: dbColName, action: 'drop', sql, reverseSql });
           result.statements.push(sql);
+          result.reverseStatements.unshift(reverseSql);
         }
+      }
+      if (sequenceDefaults.length > 0) {
+        result.notCompared!.push(
+          `sequence-backed defaults on "${tableName}" (${sequenceDefaults.join(', ')}): the database default is a ` +
+            `sequence, which is never compared or changed`,
+        );
       }
 
       if (alterDef.columns.length > 0) {
@@ -1280,6 +1641,21 @@ export async function schemaDiff(
         .map((c) => ({ name: c.name, expression: c.expression }));
       const tableDbChecks = dbChecks[tableName] ?? [];
       const dbCheckByName = new Map(tableDbChecks.map((c) => [c.name, c]));
+      const namedCheckNames = new Set(namedSchemaChecks.map((c) => c.name));
+      const unmatchedChecks = tableDbChecks.filter((c) => !namedCheckNames.has(c.name)).map((c) => c.name);
+      if (unmatchedChecks.length > 0) {
+        result.notCompared!.push(
+          `CHECK constraints on "${tableName}" (${unmatchedChecks.join(', ')}): the schema does not name them, so ` +
+            `they are not compared and never dropped`,
+        );
+      }
+      const unnamedSchemaChecks = (tableDef.checks ?? []).filter((c) => !c.name).length;
+      if (unnamedSchemaChecks > 0) {
+        result.notCompared!.push(
+          `${unnamedSchemaChecks} unnamed CHECK constraint(s) declared on "${tableName}": with no name there is nothing ` +
+            `to match them against the database`,
+        );
+      }
       const normExpr = (e: string) => e.replace(/\s+/g, ' ').trim();
       for (const sc of namedSchemaChecks) {
         const existing = dbCheckByName.get(sc.name);
@@ -1291,11 +1667,12 @@ export async function schemaDiff(
           result.statements.push(addSql);
           result.reverseStatements.unshift(dropSql);
         } else if (normExpr(existing.expression) !== normExpr(sc.expression)) {
-          result.warnings!.push(
+          const checkWarning =
             `check constraint "${sc.name}" on "${tableName}": stored expression differs from the schema text ` +
-              `(Postgres canonicalizes CHECK expressions, so this is usually cosmetic). ` +
-              `To intentionally replace it, rename the constraint or drop/re-add it in a manual migration.`,
-          );
+            `(Postgres canonicalizes CHECK expressions, so this is usually cosmetic). ` +
+            `To intentionally replace it, rename the constraint or drop/re-add it in a manual migration.`;
+          result.warnings!.push(checkWarning);
+          result.inexactWarnings!.push(checkWarning);
         }
       }
 
@@ -1313,6 +1690,19 @@ export async function schemaDiff(
       // worth surfacing. Deleting the last declared index must NOT silence the
       // warning pass. Tables with no `indexes` key stay silent (not managed).
       const declaredPlain = (tableDef.indexes ?? []).filter((i): i is ColumnIndexDef => !isDocFieldIndexDef(i));
+      if (tableDef.indexes === undefined) {
+        const dbIdxNames = [...(dbIndexes[tableName]?.keys() ?? [])];
+        const recognized = new Set<string>(Object.values(dbUniques[tableName] ?? {}));
+        for (const [fieldName, config] of Object.entries(tableDef.columns)) {
+          if (config.referencesTarget) recognized.add(`idx_${tableName}_${camelToSnake(fieldName)}`);
+        }
+        const unmanaged = dbIdxNames.filter((n) => !recognized.has(n) && !n.endsWith('_pkey'));
+        if (unmanaged.length > 0) {
+          result.notCompared!.push(
+            `indexes on "${tableName}" (${unmanaged.join(', ')}): the table declares no \`indexes\`, so they are not compared`,
+          );
+        }
+      }
       if (tableDef.indexes !== undefined) {
         const dbIdx = dbIndexes[tableName] ?? new Map<string, string>();
         const dbIdxNames = new Set(dbIdx.keys());
@@ -1360,10 +1750,40 @@ export async function schemaDiff(
       }
     }
 
+    result.notCompared!.push(NEVER_COMPARED);
     return result;
   } finally {
     await client.end();
   }
+}
+
+/**
+ * What {@link schemaDiff} never looks at, whatever the database holds. Kept
+ * beside the diff so the sentence cannot outlive the code it describes.
+ */
+export const NEVER_COMPARED =
+  'primary keys, multi-column UNIQUE constraints, and whether a foreign key exists on an existing column ' +
+  '(only the referential actions of foreign keys that already exist are compared)';
+
+/**
+ * The DOWN-side stand-in for a `DROP COLUMN`: a comment block, because the data
+ * the column held cannot be put back by any statement. It names the column and
+ * its old type so the person writing the real rollback has the facts, and it is
+ * a comment rather than SQL so a rollback never invents a column of NULLs and
+ * calls it restored.
+ */
+function irreversibleDropPlaceholder(
+  table: string,
+  column: string,
+  dbCol: DbColumn,
+  dialect: Dialect = postgresDialect,
+): string {
+  const q = (name: string) => dialect.quoteIdentifier(name);
+  return [
+    `-- IRREVERSIBLE: this migration drops ${q(table)}.${q(column)}, and the data in it cannot be restored automatically.`,
+    '-- To roll back, restore the data from a backup and re-add the column by hand, for example:',
+    `-- ALTER TABLE ${q(table)} ADD COLUMN ${q(column)} ${udtToSqlType(dbCol)};`,
+  ].join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -1716,6 +2136,96 @@ export function planTypeChange(config: ColumnConfig, dbCol: DbColumnType, column
   return { kind: 'none' };
 }
 
+// ---------------------------------------------------------------------------
+// Lossless widening
+// ---------------------------------------------------------------------------
+
+/** A column type as the widening check reads it: base name, modifiers, array flag. */
+interface ParsedSqlType {
+  base: 'varchar' | 'text' | 'int2' | 'int4' | 'int8' | 'numeric';
+  /** `varchar(n)` length, or the `numeric(p, s)` precision. Null when unbounded. */
+  a: number | null;
+  /** `numeric(p, s)` scale (0 when only a precision is given). Null when unbounded. */
+  b: number | null;
+  array: boolean;
+}
+
+const WIDENING_BASES: Record<string, ParsedSqlType['base']> = {
+  VARCHAR: 'varchar',
+  'CHARACTER VARYING': 'varchar',
+  TEXT: 'text',
+  SMALLINT: 'int2',
+  INT2: 'int2',
+  INTEGER: 'int4',
+  INT: 'int4',
+  INT4: 'int4',
+  BIGINT: 'int8',
+  INT8: 'int8',
+  NUMERIC: 'numeric',
+  DECIMAL: 'numeric',
+};
+
+/** Digits an integer type can hold, for the integer-to-numeric(p, s) rule. */
+const INTEGER_DIGITS: Record<string, number> = { int2: 5, int4: 10, int8: 19 };
+
+/** Parse a SQL type string, or null for any type outside the widening vocabulary. */
+function parseSqlType(raw: string): ParsedSqlType | null {
+  const m = /^([A-Za-z][A-Za-z0-9 ]*?)\s*(?:\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\))?\s*(\[\])?$/.exec(
+    raw.trim().replace(/\s+/g, ' '),
+  );
+  if (!m) return null;
+  const base = WIDENING_BASES[m[1]!.toUpperCase()];
+  if (!base) return null;
+  const a = m[2] === undefined ? null : Number(m[2]);
+  const b = m[3] === undefined ? (a === null ? null : 0) : Number(m[3]);
+  if ((base === 'text' || base.startsWith('int')) && a !== null) return null;
+  if (base === 'varchar' && m[3] !== undefined) return null;
+  return { base, a, b: base === 'numeric' ? b : null, array: m[4] !== undefined };
+}
+
+/**
+ * True when changing a column from `from` to `to` can never lose, round,
+ * truncate or reject a value: every value of the old type is representable
+ * unchanged in the new one. The vocabulary is deliberately small, and anything
+ * outside it answers false (the destructive gate then treats the statement as
+ * it always has):
+ *
+ *   - `varchar(n)` to `varchar(m)` with m >= n, to bare `varchar`, to `text`
+ *   - `smallint` to `integer` to `bigint`
+ *   - any integer type to `numeric`, or to `numeric(p, s)` when it still holds
+ *     the integer's digits
+ *   - `numeric(p, s)` to a numeric with at least as many integer digits and at
+ *     least as many decimal places (a bare `numeric` has no bound)
+ *   - arrays of the above, element by element
+ *
+ * Not a widening, on purpose: `text` to `varchar(n)`, anything to a smaller
+ * type, `timestamp` to `timestamptz` (re-reads the value in the session zone),
+ * `real` to `double precision` (the stored digits change when printed), and
+ * `json` to `jsonb` (drops duplicate keys).
+ */
+export function isLosslessWidening(from: string, to: string): boolean {
+  const f = parseSqlType(from);
+  const t = parseSqlType(to);
+  if (!f || !t || f.array !== t.array) return false;
+  if (f.base === 'varchar') {
+    if (t.base === 'text') return true;
+    if (t.base !== 'varchar') return false;
+    return t.a === null || (f.a !== null && t.a >= f.a);
+  }
+  if (f.base === 'text') return t.base === 'text';
+  if (f.base === 'numeric') {
+    if (t.base !== 'numeric') return false;
+    if (t.a === null) return true;
+    if (f.a === null) return false;
+    return t.b! >= f.b! && t.a - t.b! >= f.a - f.b!;
+  }
+  // Integer source.
+  const digits = INTEGER_DIGITS[f.base]!;
+  if (t.base === 'numeric') return t.a === null || t.a - t.b! >= digits;
+  if (!t.base.startsWith('int')) return false;
+  return INTEGER_DIGITS[t.base]! >= digits;
+}
+
 /**
  * Map a schema column type to its expected PostgreSQL UDT name.
  */
@@ -1841,9 +2351,19 @@ function defaultsMatch(schemaDefault: string, dbDefault: string): boolean {
  * `ALTER COLUMN ... TYPE` cast, exactly the kind of silent data loss `push`
  * must never apply without an explicit opt-in.
  */
-export function findDestructivePushStatements(statements: readonly string[]): DestructiveStatement[] {
+export function findDestructivePushStatements(
+  statements: readonly string[],
+  widenings: readonly TypeWidening[] = [],
+): DestructiveStatement[] {
+  // A lossless widening is the one `ALTER COLUMN ... TYPE` that destroys nothing.
+  // It is skipped by statement identity, so a hand-edited or look-alike
+  // statement is still scanned.
+  const lossless = new Set(widenings.map((w) => w.statement));
   const hits: DestructiveStatement[] = [];
-  for (const stmt of statements) hits.push(...scanDestructiveSql(stmt));
+  for (const stmt of statements) {
+    if (lossless.has(stmt)) continue;
+    hits.push(...scanDestructiveSql(stmt));
+  }
   return hits;
 }
 
@@ -2014,7 +2534,7 @@ export async function schemaPush(
 
   // Destructive-statement gate: refuse silent data loss unless opted in.
   if (!options.allowDestructive) {
-    const destructive = findDestructivePushStatements(diff.statements);
+    const destructive = findDestructivePushStatements(diff.statements, diff.widenings);
     if (destructive.length > 0) {
       throw new DestructivePushRefusal(destructive);
     }

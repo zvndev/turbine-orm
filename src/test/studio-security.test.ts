@@ -26,7 +26,6 @@ import assert from 'node:assert/strict';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import http from 'node:http';
 import net from 'node:net';
-import { tmpdir } from 'node:os';
 import { describe, it } from 'node:test';
 import type pg from 'pg';
 import {
@@ -39,6 +38,9 @@ import {
 } from '../cli/studio.js';
 import type { SchemaMetadata } from '../schema.js';
 import { mockTable, skipGate } from './helpers.js';
+import { studioTestStateDir } from './studio-test-state.js';
+
+const STATE_DIR = studioTestStateDir();
 
 // ---------------------------------------------------------------------------
 // Mock HTTP req/res + mock pg.Pool (same pattern as studio.test.ts) so the
@@ -156,7 +158,7 @@ const MUTATING = /\b(INSERT|UPDATE|DELETE|DROP|TRUNCATE|ALTER|CREATE|GRANT|REVOK
 describe('Studio security, read-only transaction guarantee (DB-less)', () => {
   it('apiBuilder opens BEGIN READ ONLY, commits, and emits no write', async () => {
     const { pool, calls } = makePool();
-    const ctx = makeCtx(pool, tmpdir());
+    const ctx = makeCtx(pool, STATE_DIR);
     const req = makeReq({ table: 'users', args: { where: { name: 'Alice' }, limit: 10 } });
     const { res, done } = makeRes();
 
@@ -177,7 +179,7 @@ describe('Studio security, read-only transaction guarantee (DB-less)', () => {
 
   it('apiTableRows opens BEGIN READ ONLY, commits, and emits no write', async () => {
     const { pool, calls } = makePool();
-    const ctx = makeCtx(pool, tmpdir());
+    const ctx = makeCtx(pool, STATE_DIR);
     const { res, done } = makeRes();
 
     await apiTableRows(res, ctx, 'users', new URLSearchParams());

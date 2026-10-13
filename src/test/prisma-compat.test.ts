@@ -280,68 +280,62 @@ describe('prisma-compat, take/skip', () => {
 });
 
 describe('prisma-compat, cursor translation', () => {
-  it('cursor + skip:1 → exclusive cursor + offset 0 (idiomatic exact match)', () => {
+  // A Prisma cursor is INCLUSIVE and `skip` counts from the cursor row, so the
+  // translation is core's cursor flagged inclusive plus `offset: skip`, for
+  // every cursor shape. Core places and orders the page (see
+  // builder-seams-cursor.test.ts for the SQL and the page walks).
+  const inclusive = Symbol.for('turbine-orm.cursorInclusive');
+
+  it('cursor + skip:1 → inclusive cursor + offset 1 (the cursor row is the one skipped)', () => {
     const { schema, map } = fixture();
     const { db, calls } = spyDb(schema);
     const compat = mkCompat(db, map);
     built(compat.Post.findMany({ cursor: { id: 100 }, skip: 1, take: 5, orderBy: { id: 'asc' } }));
     const args = lastArgs(calls);
     assert.deepEqual(args.cursor, { id: 100 });
-    assert.equal(args.offset, 0);
+    assert.equal(args[inclusive], true);
+    assert.equal(args.offset, 1);
     assert.equal(args.limit, 5);
   });
 
-  it('cursor + skip:3 → exclusive cursor + offset 2', () => {
+  it('cursor + skip:3 → inclusive cursor + offset 3', () => {
     const { schema, map } = fixture();
     const { db, calls } = spyDb(schema);
     const compat = mkCompat(db, map);
     built(compat.Post.findMany({ cursor: { id: 100 }, skip: 3, orderBy: { id: 'asc' } }));
     const args = lastArgs(calls);
     assert.deepEqual(args.cursor, { id: 100 });
-    assert.equal(args.offset, 2);
+    assert.equal(args.offset, 3);
   });
 
-  it('bare inclusive cursor on the single-column PK (no orderBy) → gte keyset merged into where', () => {
+  it('a bare cursor is the inclusive cursor with no offset, and leaves where and orderBy alone', () => {
     const { schema, map } = fixture();
     const { db, calls } = spyDb(schema);
     const compat = mkCompat(db, map);
-    built(compat.Post.findMany({ cursor: { id: 100 } }));
+    built(compat.Post.findMany({ cursor: { id: 100 }, orderBy: { title: 'desc' } }));
     const args = lastArgs(calls);
-    assert.equal(args.cursor, undefined, 'no exclusive cursor for inclusive form');
-    assert.deepEqual(args.where, { id: { gte: 100 } });
-    assert.deepEqual(args.orderBy, { id: 'asc' });
+    assert.deepEqual(args.cursor, { id: 100 });
+    assert.equal(args[inclusive], true);
+    assert.equal(args.offset, undefined);
+    assert.equal(args.where, undefined, 'no keyset is merged into where');
+    assert.deepEqual(args.orderBy, { title: 'desc' });
   });
 
-  it('bare inclusive cursor whose field IS the single orderBy field → gte (asc) / lte (desc)', () => {
+  it('cursor fields rename through the map', () => {
     const { schema, map } = fixture();
     const { db, calls } = spyDb(schema);
     const compat = mkCompat(db, map);
-    built(compat.Post.findMany({ cursor: { id: 100 }, orderBy: { id: 'desc' } }));
-    assert.deepEqual(lastArgs(calls).where, { id: { lte: 100 } });
-  });
-
-  it('bare inclusive cursor whose field renames through the map still keysets correctly', () => {
-    const { schema, map } = fixture();
-    const { db, calls } = spyDb(schema);
-    const compat = mkCompat(db, map);
-    // Prisma cursor field `email` → turbine `emailAddress`; matching orderBy.
+    // Prisma cursor field `email` → turbine `emailAddress`.
     built(compat.User.findMany({ cursor: { email: 'z@x.com' }, orderBy: { email: 'asc' } }));
-    assert.deepEqual(lastArgs(calls).where, { emailAddress: { gte: 'z@x.com' } });
+    assert.deepEqual(lastArgs(calls).cursor, { emailAddress: 'z@x.com' });
   });
 
-  it('THROWS when a bare inclusive cursor field is not the sort key (avoids a wrong page)', () => {
+  it('a request body cannot set the inclusive flag: it is a symbol, never a JSON key', () => {
     const { schema, map } = fixture();
-    const compat = mkCompat(spyDb(schema).db, map);
-    assert.throws(
-      () => built(compat.Post.findMany({ cursor: { id: 100 }, orderBy: { title: 'asc' } })),
-      /cursor field .* single orderBy field|not the sort key/,
-    );
-  });
-
-  it('THROWS when a bare inclusive cursor field is not the PK and no orderBy is given', () => {
-    const { schema, map } = fixture();
-    const compat = mkCompat(spyDb(schema).db, map);
-    assert.throws(() => built(compat.Post.findMany({ cursor: { title: 'x' } })), /primary key|single orderBy/);
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    built(compat.Post.findMany(JSON.parse('{"cursorInclusive": true, "take": 1}')));
+    assert.equal(lastArgs(calls)[inclusive], undefined);
   });
 });
 
@@ -372,12 +366,21 @@ describe('prisma-compat, compound unique selectors', () => {
 // ---------------------------------------------------------------------------
 
 describe('prisma-compat, nested include limits', () => {
-  it('throws on skip inside a nested relation include (no offset in with)', () => {
+  it('skip inside a nested relation include pages each parent (offset in with)', () => {
+    const { schema, map } = fixture();
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    built(compat.User.findMany({ include: { posts: { skip: 2, take: 3 } } }));
+    assert.equal(lastArgs(calls).with.posts.offset, 2);
+    assert.equal(lastArgs(calls).with.posts.limit, 3);
+  });
+
+  it('throws on a cursor inside a nested relation include (no cursor in with)', () => {
     const { schema, map } = fixture();
     const compat = mkCompat(spyDb(schema).db, map);
     assert.throws(
-      () => built(compat.User.findMany({ include: { posts: { skip: 2 } } })),
-      /skip \(offset\) on a nested relation/,
+      () => built(compat.User.findMany({ include: { posts: { cursor: { id: 1 } } } })),
+      /cursor on a nested relation include/,
     );
   });
 });
@@ -1496,21 +1499,18 @@ describe('prisma-compat, implicit primary-key ordering', () => {
 
   // --- ordering of the two translation steps (see translateReadArgs) --------
 
-  it('cursor decisions are made against the user’s own orderBy', () => {
-    // Guard for a load-bearing statement order: `translateCursor` runs BEFORE
-    // `applyImplicitPkOrder`. A bare inclusive cursor on a non-PK field with no
-    // orderBy must still hit the no-orderBy branch and name the primary key in
-    // its message. Swap the two calls and the injected `{ id: 'asc' }` sends it
-    // down the has-orderBy branch, throwing a DIFFERENT error.
+  it('a cursor findFirst keeps the inclusive cursor and gets the primary-key ordering', () => {
     const { schema, map } = fixture();
-    const compat = mkCompat(spyDb(schema).db, map);
-    // findFirst is the sharp case: it is ordered unconditionally, so a swap
-    // hands the cursor an orderBy the caller never wrote.
-    assert.throws(() => built(compat.Post.findFirst({ cursor: { title: 'x' } })), /single-column primary key/);
-    assert.throws(() => built(compat.Post.findMany({ cursor: { title: 'x' }, take: 5 })), /single-column primary key/);
+    const { db, calls } = spyDb(schema);
+    const compat = mkCompat(db, map);
+    built(compat.Post.findFirst({ cursor: { title: 'x' } }));
+    const args = lastArgs(calls);
+    assert.deepEqual(args.cursor, { title: 'x' });
+    assert.equal(args[Symbol.for('turbine-orm.cursorInclusive')], true);
+    assert.deepEqual(args.orderBy, { id: 'asc' });
   });
 
-  it('an exclusive cursor page still gets the primary-key ordering', () => {
+  it('a cursor + skip page still gets the primary-key ordering', () => {
     const { schema, map } = fixture();
     const { db, calls } = spyDb(schema);
     const compat = mkCompat(db, map);

@@ -41,6 +41,7 @@
 import type { PgCompatPool } from './client.js';
 import { type CheckoutGuard, guardCheckout } from './connection-guard.js';
 import { ConnectionError, ValidationError, wrapPgError } from './errors.js';
+import { consoleLogger, logTo, type TurbineLogger } from './logger.js';
 
 // ---------------------------------------------------------------------------
 // Identifier validation
@@ -107,8 +108,10 @@ export interface ListenOptions {
   reconnect?: boolean | ListenReconnectOptions;
   /**
    * Called when the connection is lost and after each failed reconnect
-   * attempt. Defaults to one `console.error` line per event. The subscription
-   * keeps retrying unless `reconnect` is `false`; call `unsubscribe()` to stop.
+   * attempt. Defaults to one line per event through the client's `logger`: a
+   * `warn` (code `'listen-reconnecting'`) while the subscription retries, an
+   * `error` (code `'listen-lost'`) when it does not. The subscription keeps
+   * retrying unless `reconnect` is `false`; call `unsubscribe()` to stop.
    */
   onError?: (err: Error) => void;
   /**
@@ -229,6 +232,7 @@ async function openListenConnection(
  * @param onClosed    invoked when the subscription ends, so the client can
  *                    drop it from its active-subscription registry
  * @param options     reconnect policy and loss/reconnect callbacks
+ * @param logger      where a loss is reported when `options.onError` is unset
  */
 export async function createSubscription(
   pool: PgCompatPool,
@@ -237,6 +241,7 @@ export async function createSubscription(
   handler: NotificationHandler,
   onClosed: (sub: ActiveSubscription) => void,
   options: ListenOptions = {},
+  logger: TurbineLogger = consoleLogger,
 ): Promise<ActiveSubscription> {
   const backoff =
     options.reconnect === false
@@ -245,7 +250,15 @@ export async function createSubscription(
   const reportError =
     options.onError ??
     ((err: Error): void => {
-      console.error(`[turbine] $listen "${channel}": ${err.message}${backoff && !closed ? ', reconnecting' : ''}`);
+      if (backoff && !closed) {
+        logTo(logger, 'warn', `$listen "${channel}": ${err.message}, reconnecting`, {
+          code: 'listen-reconnecting',
+          channel,
+          error: err,
+        });
+      } else {
+        logTo(logger, 'error', `$listen "${channel}": ${err.message}`, { code: 'listen-lost', channel, error: err });
+      }
     });
 
   let closed = false;

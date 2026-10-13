@@ -23,6 +23,7 @@ import pg from '#pg';
 import { PipelineError, TimeoutError, wrapPgError } from './errors.js';
 import type { PgCompatQueryResult } from './pg-types.js';
 import type { DeferredQuery } from './query/index.js';
+import { rolledBackError } from './transaction-state.js';
 
 // Read off pg's own module object (`pg.Result` IS `pg/lib/result`, `pg.utils`
 // IS `pg/lib/utils`) rather than imported by subpath, so the whole driver comes
@@ -126,6 +127,12 @@ export interface PipelineRunOptions {
    * Whether to wrap the pipeline in BEGIN/COMMIT (default: true).
    * When true, all queries execute atomically. On error, ROLLBACK is sent.
    * When false, each query gets its own Sync message for error isolation.
+   *
+   * A transactional batch that may write holds its COMMIT until every
+   * query's transform has run, so a transform that throws (a `...OrThrow`
+   * miss, an optimistic-lock conflict) rolls the writes back instead of
+   * rejecting after they committed. That costs a second round trip; a batch
+   * of plain SELECTs has nothing to undo and keeps the single one.
    */
   transactional?: boolean;
 
@@ -168,6 +175,18 @@ function restoreListeners(emitter: EventEmitter, snapshot: ListenerMap): void {
 // Core pipeline execution
 // ---------------------------------------------------------------------------
 
+/** A statement that only reads: its transform may run after COMMIT, since there is nothing to undo. */
+const READ_ONLY_STATEMENT = /^\s*select\b/i;
+
+/**
+ * Whether a transactional batch must hold its COMMIT until the transforms have
+ * run. Anything that is not a plain SELECT counts as a write, so a statement
+ * this cannot classify costs a round trip rather than correctness.
+ */
+export function batchMayWrite(queries: readonly DeferredQuery<unknown>[]): boolean {
+  return queries.some((q) => !READ_ONLY_STATEMENT.test(q.sql));
+}
+
 /**
  * Execute multiple queries using the Postgres extended-query pipeline protocol.
  *
@@ -202,11 +221,23 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
     // -----------------------------------------------------------------------
 
     /**
-     * Total expected commandComplete events:
-     * - Transactional: BEGIN + N queries + COMMIT = N + 2
-     * - Non-transactional: N queries
+     * True when the batch is sent as BEGIN + queries + Sync and the COMMIT
+     * follows only once every transform has succeeded (see
+     * {@link PipelineRunOptions.transactional}).
      */
-    const totalCommands = transactional ? queries.length + 2 : queries.length;
+    const holdCommit = transactional && batchMayWrite(queries);
+
+    /**
+     * Where the exchange is: the batch itself, or the single follow-up
+     * statement (the held COMMIT, or the recovery ROLLBACK) sent after it.
+     */
+    let phase: 'batch' | 'commit' | 'rollback' = 'batch';
+
+    /** The command tag the held COMMIT came back with (`ROLLBACK` when the server rolled back). */
+    let commitTag: string | undefined;
+
+    /** Transformed results, computed before a held COMMIT is sent. */
+    let transformed: unknown[] | undefined;
 
     /**
      * Expected readyForQuery events:
@@ -242,20 +273,16 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
     /** Transaction status reported by the most recent ReadyForQuery. */
     let txStatus: TransactionStatus;
 
-    /** Whether the recovery ROLLBACK has already been sent (it is sent at most once). */
-    let rollbackSent = false;
-
     /**
      * Map commandComplete index to the corresponding results[] index.
      * In transactional mode: index 0 = BEGIN, 1..N = queries, N+1 = COMMIT
-     * In non-transactional mode: index maps 1:1
+     * (absent when the COMMIT is held). In non-transactional mode: 1:1.
+     * Follow-up statements belong to no query.
      */
     function commandToQueryIndex(cmdIdx: number): number | null {
-      if (transactional) {
-        if (cmdIdx === 0 || cmdIdx === totalCommands - 1) return null;
-        return cmdIdx - 1;
-      }
-      return cmdIdx;
+      if (phase !== 'batch') return null;
+      const qIdx = transactional ? cmdIdx - 1 : cmdIdx;
+      return qIdx >= 0 && qIdx < queries.length ? qIdx : null;
     }
 
     /** Get the current query-results index for row data */
@@ -320,28 +347,55 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
       // ever a test double.
       if (txStatus === 'I') return true;
       if (txStatus === undefined && !(transactional && pipelineError)) return true;
-      if (!transactional || rollbackSent) {
-        // Either nothing to roll back (non-transactional mode opens no
-        // transaction of its own), or the rollback already ran and did not
-        // clear the status. Hand the client back marked for disposal.
-        if (txStatus === 'E' || txStatus === 'T') {
-          Object.defineProperty(client, PIPELINE_DISCARD, { value: true, enumerable: false, configurable: true });
+      if (!transactional) {
+        // Non-transactional mode opens no transaction of its own, so there is
+        // nothing to roll back. Hand the client back marked for disposal.
+        markDiscardIfInTransaction();
+        return true;
+      }
+      return !sendFollowUp('ROLLBACK', 'rollback');
+    }
+
+    /** Mark the client for disposal when the backend still reports an open or failed transaction. */
+    function markDiscardIfInTransaction(): void {
+      if (txStatus === 'E' || txStatus === 'T') {
+        Object.defineProperty(client, PIPELINE_DISCARD, { value: true, enumerable: false, configurable: true });
+      }
+    }
+
+    /**
+     * Send one statement after the batch (the held COMMIT or the recovery
+     * ROLLBACK) with its own Sync; its ReadyForQuery finishes the exchange.
+     * Returns false when the socket would not take it, in which case the
+     * connection is marked for disposal, since it cannot be repaired from here.
+     */
+    function sendFollowUp(text: 'COMMIT' | 'ROLLBACK', next: 'commit' | 'rollback'): boolean {
+      phase = next;
+      try {
+        connection.stream.cork?.();
+        try {
+          connection.parse({ text, name: '' });
+          connection.bind({ portal: '', statement: '', values: [], valueMapper: prepareValue });
+          connection.execute({ portal: '', rows: 0 });
+          connection.sync();
+        } finally {
+          connection.stream.uncork?.();
         }
         return true;
-      }
-      rollbackSent = true;
-      try {
-        connection.parse({ text: 'ROLLBACK', name: '' });
-        connection.bind({ portal: '', statement: '', values: [], valueMapper: prepareValue });
-        connection.execute({ portal: '', rows: 0 });
-        connection.sync();
-        return false;
-      } catch {
-        // The socket would not take the rollback, so this connection cannot be
-        // repaired from here. Mark it and let the caller drop it.
+      } catch (err) {
         Object.defineProperty(client, PIPELINE_DISCARD, { value: true, enumerable: false, configurable: true });
-        return true;
+        if (!pipelineError) pipelineError = err instanceof Error ? err : new Error(String(err));
+        return false;
       }
+    }
+
+    /** Run every query's transform, in order; the first throw propagates. */
+    function transformAll(): unknown[] {
+      const out: unknown[] = [];
+      for (let i = 0; i < queries.length; i++) {
+        out.push(queries[i]!.transform(results[i]! as unknown as PgCompatQueryResult));
+      }
+      return out;
     }
 
     function finalize(): void {
@@ -389,14 +443,14 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
         return;
       }
 
-      // All succeeded, transform results
-      try {
-        const transformed: unknown[] = [];
-        for (let i = 0; i < queries.length; i++) {
-          const q = queries[i]!;
-          transformed.push(q.transform(results[i]! as unknown as PgCompatQueryResult));
-        }
+      // All succeeded. A held COMMIT ran the transforms before committing;
+      // a read-only batch runs them now (there is nothing to undo).
+      if (transformed) {
         resolve(transformed);
+        return;
+      }
+      try {
+        resolve(transformAll());
       } catch (err) {
         reject(err);
       }
@@ -435,6 +489,7 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
     }
 
     function onCommandComplete(msg: { text?: string; command?: string }): void {
+      if (phase === 'commit') commitTag = msg.command ?? msg.text;
       const qIdx = currentQueryIndex();
       if (qIdx !== null && qIdx >= 0 && qIdx < results.length) {
         results[qIdx]!.addCommandComplete(msg);
@@ -485,14 +540,36 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
 
     function onReadyForQuery(msg?: { status?: string }): void {
       txStatus = msg?.status as TransactionStatus;
-      // The recovery ROLLBACK's own ReadyForQuery is not one of the batch's, so
+      // A follow-up statement's own ReadyForQuery is not one of the batch's, so
       // it must not advance the counter that decides when the batch is done.
-      if (rollbackSent) {
+      if (phase === 'rollback') {
+        markDiscardIfInTransaction();
+        finalize();
+        return;
+      }
+      if (phase === 'commit') {
+        // PostgreSQL answers COMMIT in a failed transaction with the tag
+        // ROLLBACK and no error. Nothing here sends COMMIT after an error, but
+        // the answer is checked rather than assumed.
+        if (!pipelineError && commitTag === 'ROLLBACK') pipelineError = rolledBackError(undefined, 'transaction');
+        markDiscardIfInTransaction();
         finalize();
         return;
       }
       rfqCount++;
       if (rfqCount < expectedRfq) return;
+      if (holdCommit && !pipelineError && txStatus !== 'E') {
+        try {
+          transformed = transformAll();
+        } catch (err) {
+          // A transform refused its result: roll the batch's writes back.
+          pipelineError = err instanceof Error ? err : new Error(String(err));
+          if (!sendFollowUp('ROLLBACK', 'rollback')) finalize();
+          return;
+        }
+        if (!sendFollowUp('COMMIT', 'commit')) finalize();
+        return;
+      }
       if (settleTransactionState()) finalize();
     }
 
@@ -545,7 +622,8 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
       if (transactional) {
         // ---- Transactional mode ----
         // BEGIN + N×(parse+bind+describe+execute) + COMMIT + sync
-        // One sync = one ReadyForQuery
+        // One sync = one ReadyForQuery. A batch that may write leaves the
+        // COMMIT out here and sends it after the transforms (holdCommit).
 
         // BEGIN
         connection.parse({ text: 'BEGIN', name: '' });
@@ -565,10 +643,11 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
           connection.execute({ portal: '', rows: 0 });
         }
 
-        // COMMIT
-        connection.parse({ text: 'COMMIT', name: '' });
-        connection.bind({ portal: '', statement: '', values: [], valueMapper: prepareValue });
-        connection.execute({ portal: '', rows: 0 });
+        if (!holdCommit) {
+          connection.parse({ text: 'COMMIT', name: '' });
+          connection.bind({ portal: '', statement: '', values: [], valueMapper: prepareValue });
+          connection.execute({ portal: '', rows: 0 });
+        }
 
         // Single Sync
         connection.sync();

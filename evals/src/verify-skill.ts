@@ -18,7 +18,7 @@
 import { deepStrictEqual } from 'node:assert';
 import { readFileSync } from 'node:fs';
 import pg from 'pg';
-import { TurbineError, type SchemaMetadata } from 'turbine-orm';
+import { col, expr, TurbineError, type SchemaMetadata } from 'turbine-orm';
 import { assertEvalDatabase, EVAL_DATABASE_URL } from './config.js';
 import { closeClient, evalClient } from './execute.js';
 import { evalSchema } from './schema-meta.js';
@@ -123,6 +123,38 @@ const same = (table: string, method: string, a: Args, b: Args) => async (db: Db)
   deepStrictEqual(ra, rb);
 };
 
+/**
+ * Run `fn` inside a transaction that is always rolled back, so a claim about a
+ * write can execute the write without changing the seeded eval data. The
+ * sentinel is the only error swallowed; a real failure inside `fn` propagates.
+ */
+const ROLLBACK = Symbol('verify-skill rollback');
+async function inRolledBackTx(db: Db, fn: (tx: Db) => Promise<void>): Promise<void> {
+  try {
+    await db.$transaction(async (tx) => {
+      await fn(tx as unknown as Db);
+      throw ROLLBACK;
+    });
+  } catch (err) {
+    if (err !== ROLLBACK) throw err;
+  }
+}
+
+/** Expect `fn` to throw a Turbine error with `code`, inside a rolled-back transaction. */
+async function throwsInTx(db: Db, code: string, fn: (tx: Db) => Promise<unknown>): Promise<void> {
+  let thrown: unknown = null;
+  await inRolledBackTx(db, async (tx) => {
+    try {
+      await fn(tx);
+    } catch (err) {
+      thrown = err;
+    }
+  });
+  if (thrown instanceof TurbineError && thrown.code === code) return;
+  if (thrown === null) throw new Error(`expected ${code}, but the call was accepted`);
+  throw new Error(`expected ${code}, got ${thrown instanceof Error ? `${thrown.name}: ${thrown.message}` : String(thrown)}`);
+}
+
 async function call(db: Db, table: string, method: string, args: Args): Promise<unknown> {
   const qi = db.table(table) as unknown as Record<string, (a?: unknown) => Promise<unknown>>;
   const fn = qi[method];
@@ -168,6 +200,22 @@ const CLAIMS: Claim[] = [
   {
     says: '`delete` requires a `where` that identifies one row.',
     run: throws('TURBINE_E003', 'cheese_wheels', 'delete', { where: { status: 'graded' } }),
+  },
+  {
+    says: '`updateMany` and `deleteMany` take no `limit`, `take`, `offset` or `skip` (`TURBINE_E003`).',
+    run: async (db) => {
+      // `where: { id: -1 }` matches no row, so a broken guard writes nothing; the
+      // phrase check keeps an unrelated E003 from passing the claim.
+      await throwsSaying('TURBINE_E003', 'is not supported on updateMany', 'cheese_wheels', 'updateMany', {
+        where: { id: -1 },
+        data: { status: 'graded' },
+        take: 1,
+      })(db);
+      await throwsSaying('TURBINE_E003', 'is not supported on deleteMany', 'cheese_wheels', 'deleteMany', {
+        where: { id: -1 },
+        skip: 1,
+      })(db);
+    },
   },
   {
     says: "an upsert's `where` names the row to update (the `ON CONFLICT` target when `create` agrees), so a non-unique one is refused, not sent.",
@@ -482,26 +530,25 @@ const CLAIMS: Claim[] = [
     },
   },
   {
-    says: 'aggregate() has no JSON-path form: a { field, path } object is read as `true`, so the whole column reaches the database as avg(jsonb) and fails there with a DATABASE error, not a Turbine code.',
+    says: 'aggregate() has no JSON-path form: a { field, path } object is read as `true`, so the whole column reaches the database as avg(jsonb), which the database refuses; that surfaces as TURBINE_E003 with sqlstate 42883, not a Turbine check naming the path.',
     run: async (db) => {
       try {
         await call(db, 'cheese_wheels', 'aggregate', {
           _avg: { tastingNotes: { field: 'tastingNotes', path: ['panel', 'score'] } },
         });
       } catch (err) {
-        if (err instanceof TurbineError) {
+        // 42883 undefined_function, `function avg(jsonb) does not exist`, which
+        // wrapPgError types as ValidationError keeping the SQLSTATE. A Turbine
+        // check that refused the path itself would carry no sqlstate.
+        if (!(err instanceof TurbineError) || err.code !== 'TURBINE_E003') {
           throw new Error(
-            `expected a raw database error, got ${err.code}: ${err.message.split('\n')[0]}; the aggregate() sentence is now wrong`,
+            `expected TURBINE_E003 from the database's 42883, got ${err instanceof Error ? `${err.name}: ${err.message.split('\n')[0]}` : String(err)}`,
           );
         }
-        // 42883 undefined_function, `function avg(jsonb) does not exist`. Read
-        // off the error or its cause, so a safe-mode wrapper that redacts the
-        // driver's message and keeps the driver error on .cause still identifies it.
-        const sqlstate = (err as { code?: string }).code ?? (err as { cause?: { code?: string } }).cause?.code;
+        const sqlstate = (err as { sqlstate?: string }).sqlstate;
         if (sqlstate !== '42883') {
           throw new Error(
-            `expected SQLSTATE 42883 (avg(jsonb) does not exist), got ${String(sqlstate)}: ` +
-              `${err instanceof Error ? err.message.split('\n')[0] : String(err)}`,
+            `expected sqlstate 42883 (avg(jsonb) does not exist), got ${String(sqlstate)}: ${err.message.split('\n')[0]}; the aggregate() sentence is now wrong`,
           );
         }
         return;
@@ -604,6 +651,186 @@ const CLAIMS: Claim[] = [
       const n = await call(db, 'cheese_wheels', 'count', { where: { status: 'graded' } });
       if (typeof n !== 'number') throw new Error(`count returned ${typeof n}`);
     },
+  },
+  // ---- 0.90 additions (proposed rows) ---------------------------------------
+  {
+    says: '`not` also takes an operator object: `givenName: { not: { contains: \'Roux\' } }`.',
+    run: async (db) => {
+      const all = (await call(db, 'affineurs', 'findMany', { select: { id: true }, where: { givenName: { not: null } } })) as unknown[];
+      const hit = (await call(db, 'affineurs', 'findMany', { select: { id: true }, where: { givenName: { contains: 'Roux' } } })) as unknown[];
+      const neg = (await call(db, 'affineurs', 'findMany', { select: { id: true }, where: { givenName: { not: { contains: 'Roux' } } } })) as unknown[];
+      if (hit.length === 0) throw new Error('fixture has no Roux, the claim tests nothing');
+      if (neg.length + hit.length !== all.length) throw new Error(`not-contains ${neg.length} + contains ${hit.length} != ${all.length}`);
+    },
+  },
+  {
+    says: 'To compare two columns, wrap the other one in `col()`: `rindScore: { gt: col(\'aromaScore\') }`.',
+    run: async (db) => {
+      const rows = (await call(db, 'ripening_checks', 'findMany', {
+        select: { rindScore: true, aromaScore: true },
+        where: { rindScore: { gt: col('aromaScore') } },
+      })) as Array<{ rindScore: number; aromaScore: number }>;
+      if (rows.length === 0) throw new Error('no rows, the claim tests nothing');
+      for (const r of rows) if (!(r.rindScore > r.aromaScore)) throw new Error(`row ${JSON.stringify(r)} violates gt`);
+    },
+  },
+  {
+    says: 'A plain `{ col: \'x\' }` object is refused with `TURBINE_E003`.',
+    run: throws('TURBINE_E003', 'ripening_checks', 'findMany', { where: { rindScore: { gt: { col: 'aromaScore' } } } }),
+  },
+  {
+    says: 'an operand that does not fit its operator, such as an array for `equals`, is refused with `TURBINE_E003`.',
+    run: throws('TURBINE_E003', 'cheese_wheels', 'findMany', { where: { wheelCount: { equals: [1, 2] } } }),
+  },
+  {
+    says: 'an operand that does not fit its operator, such as `null` for `gt`, is refused with `TURBINE_E003`.',
+    run: throws('TURBINE_E003', 'cheese_wheels', 'findMany', { where: { wheelCount: { gt: null } } }),
+  },
+  {
+    says: 'A key whose value is `undefined` is left out, as in Prisma.',
+    run: same('cheese_wheels', 'findMany', { select: { id: true }, where: { status: 'graded', batchRef: undefined }, orderBy: { id: 'asc' }, limit: 20 },
+      { select: { id: true }, where: { status: 'graded' }, orderBy: { id: 'asc' }, limit: 20 }),
+  },
+  {
+    says: 'When that empties the whole `where`, `findFirst` throws `TURBINE_E003`.',
+    run: throws('TURBINE_E003', 'cheese_wheels', 'findFirst', { where: { batchRef: undefined } }),
+  },
+  {
+    says: 'A cursor names the last row by a unique key; the page excludes that row and continues in the query\'s `orderBy`, with the primary key added as a tiebreaker.',
+    run: async (db) => {
+      const page = (await call(db, 'cheese_wheels', 'findMany', {
+        select: { id: true, pressedOn: true }, orderBy: { pressedOn: 'desc' }, limit: 40,
+      })) as Array<{ id: number }>;
+      const anchor = page[9]!;
+      const next = (await call(db, 'cheese_wheels', 'findMany', {
+        select: { id: true, pressedOn: true }, orderBy: { pressedOn: 'desc' }, cursor: { id: anchor.id }, limit: 5,
+      })) as Array<{ id: number }>;
+      if (next.some((r) => r.id === anchor.id)) throw new Error('cursor row was included');
+      const full = (await call(db, 'cheese_wheels', 'findMany', {
+        select: { id: true, pressedOn: true }, orderBy: [{ pressedOn: 'desc' }, { id: 'desc' }],
+      })) as Array<{ id: number }>;
+      const at = full.findIndex((r) => r.id === anchor.id);
+      deepStrictEqual(next.map((r) => r.id), full.slice(at + 1, at + 6).map((r) => r.id));
+    },
+  },
+  {
+    says: '`equals` at a path compares JSON values, so `equals: null` matches a JSON `null` and not the string `"null"`.',
+    run: accepts('affineurs', 'findMany', { select: { id: true }, where: { credentialBlob: { path: ['tier'], equals: null } } }),
+  },
+  {
+    says: 'Without a `path`, `equals` compares the whole document exactly.',
+    run: async (db) => {
+      const one = (await call(db, 'affineurs', 'findFirst', {
+        select: { id: true, credentialBlob: true }, where: { credentialBlob: { not: null } }, orderBy: { id: 'asc' },
+      })) as { id: number; credentialBlob: Record<string, unknown> } | null;
+      if (!one) throw new Error('no JSON document in the fixture');
+      const keys = Object.keys(one.credentialBlob);
+      if (keys.length < 2) throw new Error('document too small to test containment vs equality');
+      const partial = { [keys[0]!]: one.credentialBlob[keys[0]!] };
+      const exact = (await call(db, 'affineurs', 'findMany', { select: { id: true }, where: { id: one.id, credentialBlob: { equals: one.credentialBlob } } })) as unknown[];
+      const sub = (await call(db, 'affineurs', 'findMany', { select: { id: true }, where: { id: one.id, credentialBlob: { equals: partial } } })) as unknown[];
+      if (exact.length !== 1) throw new Error('whole document did not match itself');
+      if (sub.length !== 0) throw new Error('a sub-document matched: equals is still containment');
+    },
+  },
+  // ---- 0.90 Wave C (proposed rows) -------------------------------------------
+  {
+    says: '`_percentile: { aromaScore: { p: 0.9 } }` returns the 90th percentile, on PostgreSQL only.',
+    run: async (db) => {
+      const r = (await call(db, 'ripening_checks', 'aggregate', {
+        _percentile: { aromaScore: { p: 0.9 } }, _min: { aromaScore: true }, _max: { aromaScore: true },
+      })) as { _percentile: { aromaScore: number }; _min: { aromaScore: number }; _max: { aromaScore: number } };
+      const v = r._percentile.aromaScore;
+      if (typeof v !== 'number') throw new Error(`percentile is ${typeof v}, not a number`);
+      if (v < r._min.aromaScore || v > r._max.aromaScore) throw new Error(`percentile ${v} outside [${r._min.aromaScore}, ${r._max.aromaScore}]`);
+    },
+  },
+  {
+    says: '`p` may be an array of fractions, and the result is then an array in the same order.',
+    run: async (db) => {
+      const r = (await call(db, 'ripening_checks', 'aggregate', {
+        _percentile: { aromaScore: { p: [0.1, 0.5, 0.9] } },
+      })) as { _percentile: { aromaScore: number[] } };
+      const v = r._percentile.aromaScore;
+      if (!Array.isArray(v) || v.length !== 3) throw new Error(`expected an array of 3, got ${JSON.stringify(v)}`);
+      if (!(v[0]! <= v[1]! && v[1]! <= v[2]!)) throw new Error(`not in fraction order: ${JSON.stringify(v)}`);
+    },
+  },
+  {
+    says: "The default `method: 'cont'` interpolates and is refused on a date column with `TURBINE_E003`; use `method: 'disc'` there.",
+    run: async (db) => {
+      await throwsSaying('TURBINE_E003', "method: 'disc'", 'cheese_wheels', 'aggregate', { _percentile: { pressedOn: { p: 0.5 } } })(db);
+      const r = (await call(db, 'cheese_wheels', 'aggregate', { _percentile: { pressedOn: { p: 0.5, method: 'disc' } } })) as {
+        _percentile: { pressedOn: unknown };
+      };
+      if (!(r._percentile.pressedOn instanceof Date)) throw new Error(`disc on a date returned ${typeof r._percentile.pressedOn}`);
+    },
+  },
+  {
+    says: 'To set a column from the row\'s own values, build the value with `expr` and `col()`.',
+    run: (db) =>
+      inRolledBackTx(db, async (tx) => {
+        const before = (await call(tx, 'cheese_wheels', 'findUnique', { where: { id: 7 }, select: { wheelCount: true } })) as { wheelCount: number };
+        const after = (await call(tx, 'cheese_wheels', 'update', {
+          where: { id: 7 }, data: { wheelCount: expr.add(col('wheelCount'), 1) }, select: { wheelCount: true },
+        })) as { wheelCount: number };
+        if (after.wheelCount !== before.wheelCount + 1) throw new Error(`${before.wheelCount} + 1 gave ${after.wheelCount}`);
+      }),
+  },
+  {
+    says: 'A plain object shaped like an expression (`{ kind: \'add\', args: [1, 2] }`) is refused with `TURBINE_E003`.',
+    run: (db) => throwsInTx(db, 'TURBINE_E003', (tx) =>
+      call(tx, 'cheese_wheels', 'update', { where: { id: 7 }, data: { wheelCount: { kind: 'add', args: [1, 2] } } })),
+  },
+  {
+    says: 'and so is an expression in `create` data.',
+    run: (db) => throwsInTx(db, 'TURBINE_E003', (tx) =>
+      call(tx, 'ripening_checks', 'create', {
+        data: { cheeseWheelId: 7, affineurId: 1, checkedOn: new Date('2026-01-01'), rindScore: expr.add(1, 2), aromaScore: 1 },
+      })),
+  },
+  {
+    says: '`createMany` with `onConflict` inserts the new keys and updates the rows that already exist.',
+    run: (db) =>
+      inRolledBackTx(db, async (tx) => {
+        const row = (await call(tx, 'cheese_wheels', 'findUnique', { where: { id: 7 } })) as Record<string, unknown>;
+        const { id: _id, ...rest } = row;
+        const total = (await call(tx, 'cheese_wheels', 'count', {})) as number;
+        const fresh = { ...rest, batchRef: 'VERIFY-SKILL-NEW', status: 'verify-new' };
+        const out = (await call(tx, 'cheese_wheels', 'createMany', {
+          data: [{ ...rest, status: 'verify-upserted' }, fresh],
+          onConflict: { target: ['guildId', 'batchRef'], update: ['status'] },
+        })) as Array<{ id: number; status: string; batchRef: string }>;
+        const updated = out.find((r) => r.id === 7);
+        if (!updated || updated.status !== 'verify-upserted') throw new Error(`existing row not updated: ${JSON.stringify(out)}`);
+        if (!out.some((r) => r.batchRef === 'VERIFY-SKILL-NEW')) throw new Error('new key not inserted');
+        const after = (await call(tx, 'cheese_wheels', 'count', {})) as number;
+        if (after !== total + 1) throw new Error(`count went ${total} -> ${after}, expected +1`);
+      }),
+  },
+  {
+    says: 'The target must be the primary key or one whole unique key; any other column list is refused with `TURBINE_E003`.',
+    run: (db) => throwsInTx(db, 'TURBINE_E003', async (tx) => {
+      const row = (await call(tx, 'cheese_wheels', 'findUnique', { where: { id: 7 } })) as Record<string, unknown>;
+      const { id: _id, ...rest } = row;
+      return call(tx, 'cheese_wheels', 'createMany', { data: [rest], onConflict: { target: ['batchRef'], update: ['status'] } });
+    }),
+  },
+  {
+    says: "`lock: 'update'` on `findMany`, `findFirst` or `findUnique` locks the rows it returns; it must run on the `tx` inside `db.$transaction`.",
+    run: (db) =>
+      inRolledBackTx(db, async (tx) => {
+        const r = (await call(tx, 'cheese_wheels', 'findFirst', { where: { status: 'graded' }, orderBy: { id: 'asc' }, lock: 'update' })) as { id: number } | null;
+        if (!r) throw new Error('no row, the claim tests nothing');
+        const held = (await (tx as unknown as { rawUnsafe: (t: string) => Promise<Array<{ n: number }>> }).rawUnsafe(
+          "SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'transactionid' AND pid = pg_backend_pid()",
+        ))[0]!.n;
+        if (held < 1) throw new Error('FOR UPDATE took no transaction lock');
+      }),
+  },
+  {
+    says: 'on `db` it throws `TURBINE_E003`.',
+    run: throws('TURBINE_E003', 'cheese_wheels', 'findFirst', { orderBy: { id: 'asc' }, lock: 'update' }),
   },
 ];
 

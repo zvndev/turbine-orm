@@ -120,9 +120,11 @@ describe('turbine-orm/mysql, dialect conformance (no Postgres leakage)', () => {
     assert.equal(mysqlDialect.escapeStringLiteral("o'b\\"), "o''b\\\\");
     // Ordinary keys are untouched (JSON_OBJECT output stays byte-identical).
     assert.equal(mysqlDialect.escapeStringLiteral('createdAt'), 'createdAt');
-    // And the escaped key stays inside its literal in real emitted SQL.
+    // JSON_OBJECT does not use it for a key holding a backslash: the doubled
+    // backslash reads as two under NO_BACKSLASH_ESCAPES, which Turbine-built
+    // pools set, so such a key is written as its UTF-8 bytes in hex instead.
     const json = mysqlDialect.buildJsonObject([["we'ird\\", 't0.x']]);
-    assert.equal(json, "JSON_OBJECT('we''ird\\\\', t0.x)");
+    assert.equal(json, "JSON_OBJECT(CONVERT(X'7765276972645c' USING utf8mb4), t0.x)");
   });
 
   it('nested with → JSON_OBJECT / JSON_ARRAYAGG / CAST(... AS JSON) wrap, no json_agg', () => {
@@ -150,10 +152,11 @@ describe('turbine-orm/mysql, dialect conformance (no Postgres leakage)', () => {
     assert.doesNotMatch(sql, FORBIDDEN);
   });
 
-  it('IN list → JSON_TABLE single-placeholder (length-stable), no = ANY', () => {
+  it('IN list → one builder param (length-stable SQL), expanded per element by the shim, no = ANY', () => {
     const d = q().buildFindMany({ where: { role: { in: ['admin', 'editor'] } } });
-    assert.match(d.sql, /`role` IN \(SELECT `v` FROM JSON_TABLE\(:p\d, '\$\[\*\]'/);
-    assert.deepEqual(d.params, ['["admin","editor"]']);
+    assert.match(d.sql, /`role` IN \(:p1\)/);
+    assert.equal(d.params.length, 1);
+    assert.deepEqual({ ...(d.params[0] as object) }, { values: ['admin', 'editor'] });
     assert.doesNotMatch(d.sql, FORBIDDEN);
   });
 
@@ -298,6 +301,13 @@ function fakeMysql2(
   return { pool, calls };
 }
 
+/** The statements a reselect write sent, after checking they ran in one transaction. */
+function inTransaction(calls: MockCall[], end: 'COMMIT' | 'ROLLBACK' = 'COMMIT'): MockCall[] {
+  assert.equal(calls[0]?.sql, 'START TRANSACTION', 'the write and its re-read share one transaction');
+  assert.equal(calls[calls.length - 1]?.sql, end);
+  return calls.slice(1, -1);
+}
+
 function reselectQuery(pool: MysqlPool): QueryInterface<Record<string, unknown>> {
   return new QueryInterface<Record<string, unknown>>(
     // biome-ignore lint/suspicious/noExplicitAny: MysqlPool stands in for pg.Pool
@@ -347,10 +357,11 @@ describe('turbine-orm/mysql, MysqlPool binds NAMED placeholders', () => {
 
 describe('turbine-orm/mysql, reselect result strategy (mock driver)', () => {
   it('create: INSERT (no RETURNING) then SELECT by primary key, NAMED params bound', async () => {
-    const { pool, calls } = fakeMysql2({ rowsFor: () => [{ id: 1, name: 'Ada' }] });
+    const { pool, calls: sent } = fakeMysql2({ rowsFor: () => [{ id: 1, name: 'Ada' }] });
     const created = await reselectQuery(new MysqlPool(pool)).create({ data: { id: 1, name: 'Ada' } });
 
     assert.deepEqual(created, { id: 1, name: 'Ada' });
+    const calls = inTransaction(sent);
     assert.equal(calls.length, 2, 'write + reselect SELECT');
     assert.match(calls[0]!.sql, /^INSERT INTO `users`/);
     assert.doesNotMatch(calls[0]!.sql, /RETURNING/);
@@ -360,19 +371,21 @@ describe('turbine-orm/mysql, reselect result strategy (mock driver)', () => {
   });
 
   it('create without a PK falls back to the driver insertId for the re-SELECT', async () => {
-    const { pool, calls } = fakeMysql2({ rowsFor: () => [{ id: 42, name: 'Hopper' }], insertId: 42 });
+    const { pool, calls: sent } = fakeMysql2({ rowsFor: () => [{ id: 42, name: 'Hopper' }], insertId: 42 });
     const created = await reselectQuery(new MysqlPool(pool)).create({ data: { name: 'Hopper' } });
 
     assert.deepEqual(created, { id: 42, name: 'Hopper' });
+    const calls = inTransaction(sent);
     assert.equal(calls.length, 2);
     assert.deepEqual(calls[1]!.binding, { p1: 42 }, 're-SELECT binds mysql2 insertId');
   });
 
   it('update: UPDATE then SELECT by the same where', async () => {
-    const { pool, calls } = fakeMysql2({ rowsFor: () => [{ id: 1, name: 'Ada L.' }] });
+    const { pool, calls: sent } = fakeMysql2({ rowsFor: () => [{ id: 1, name: 'Ada L.' }] });
     const updated = await reselectQuery(new MysqlPool(pool)).update({ where: { id: 1 }, data: { name: 'Ada L.' } });
 
     assert.deepEqual(updated, { id: 1, name: 'Ada L.' });
+    const calls = inTransaction(sent);
     assert.equal(calls.length, 2);
     assert.match(calls[0]!.sql, /^UPDATE `users` SET/);
     assert.doesNotMatch(calls[0]!.sql, /RETURNING/);
@@ -380,12 +393,17 @@ describe('turbine-orm/mysql, reselect result strategy (mock driver)', () => {
   });
 
   it('delete: SELECT the row first, then DELETE (row is gone after)', async () => {
-    const { pool, calls } = fakeMysql2({ rowsFor: () => [{ id: 1, name: 'Ada' }] });
+    const { pool, calls: sent } = fakeMysql2({ rowsFor: () => [{ id: 1, name: 'Ada' }] });
     const deleted = await reselectQuery(new MysqlPool(pool)).delete({ where: { id: 1 } });
 
     assert.deepEqual(deleted, { id: 1, name: 'Ada' });
+    const calls = inTransaction(sent);
     assert.equal(calls.length, 2);
-    assert.equal(calls[0]!.sql, 'SELECT * FROM `users` WHERE `id` = :p1', 'pre-SELECT before DELETE');
+    assert.equal(
+      calls[0]!.sql,
+      'SELECT * FROM `users` WHERE `id` = :p1 FOR UPDATE',
+      'locking pre-SELECT before DELETE',
+    );
     assert.match(calls[1]!.sql, /^DELETE FROM `users`/);
   });
 
@@ -406,7 +424,10 @@ describe('turbine-orm/mysql, reselect result strategy (mock driver)', () => {
       },
       enums: {},
     };
-    const { pool, calls } = fakeMysql2({ affectedRows: 0, rowsFor: () => [{ id: 1, name: 'stale', version: 8 }] });
+    const { pool, calls: sent } = fakeMysql2({
+      affectedRows: 0,
+      rowsFor: () => [{ id: 1, name: 'stale', version: 8 }],
+    });
     const qi = new QueryInterface<Record<string, unknown>>(
       // biome-ignore lint/suspicious/noExplicitAny: MysqlPool stands in for pg.Pool
       new MysqlPool(pool) as any,
@@ -420,6 +441,7 @@ describe('turbine-orm/mysql, reselect result strategy (mock driver)', () => {
       (e: unknown) => e instanceof OptimisticLockError && e.versionField === 'version' && e.expectedVersion === 7,
     );
     // Only the version-checked UPDATE ran; the stale re-SELECT must NOT be issued.
+    const calls = inTransaction(sent, 'ROLLBACK');
     assert.equal(calls.length, 1, 'no re-SELECT after a detected conflict');
     assert.match(calls[0]!.sql, /^UPDATE `users` SET/);
   });
@@ -480,6 +502,12 @@ describe('turbine-orm/mysql, introspector (mock executor)', () => {
     assert.deepEqual(Object.keys(meta.tables).sort(), ['organizations', 'post_tags', 'posts', 'tags', 'users']);
     assert.deepEqual(meta.tables.users!.primaryKey, ['id']);
     assert.deepEqual(meta.tables.post_tags!.primaryKey, ['post_id', 'tag_id']);
+    // An AUTO_INCREMENT key is server-numbered, which is what lets a create
+    // re-read its row by the insert id; an ordinary column is not.
+    const usersId = meta.tables.users!.columns.find((c) => c.name === 'id');
+    const postTagsPost = meta.tables.post_tags!.columns.find((c) => c.name === 'post_id');
+    assert.equal(usersId?.isGenerated, true);
+    assert.equal(postTagsPost?.isGenerated, false);
     assert.equal(meta.tables.users!.reverseColumnMap.org_id, 'orgId');
     assert.ok(meta.tables.users!.dateColumns.has('created_at'));
     // relations
@@ -756,7 +784,7 @@ describe('turbine-orm/mysql, integration (real MySQL 8)', () => {
     assert.equal(admins[0].name, 'Alice Admin');
   });
 
-  gate.it('comparison + IN operators (JSON_TABLE)', async () => {
+  gate.it('comparison + IN operators', async () => {
     const hot = await client.table('posts').findMany({ where: { viewCount: { gt: 50 } } });
     assert.deepEqual(hot.map((p: PostRow) => p.id).sort(), [1, 2, 5]);
     const staff = await client

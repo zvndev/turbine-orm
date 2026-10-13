@@ -4,11 +4,15 @@
  * Split from builder.ts so the class file focuses on SQL assembly / execution.
  */
 
+import type { DiagnosticsConfig } from '../diagnostics.js';
 import type { Dialect } from '../dialect.js';
+import type { TurbineLogger } from '../logger.js';
 import type { PgCompatPool, PgCompatQueryResult } from '../pg-types.js';
 import type { SchemaMetadata } from '../schema.js';
 // Forward-declared to avoid a runtime cycle with builder.ts. Type-only.
 import type { QueryInterface } from './builder.js';
+import type { SqlCommenter, SqlCommentOptions } from './sql-comment.js';
+import type { TableClient } from './table-client.js';
 import type { GlobalFilters, JsonEncoding, RelationLoadStrategy } from './types.js';
 
 /**
@@ -38,6 +42,13 @@ export interface DeferredQuery<T> {
    * rows), so the PostgreSQL path never allocates or consults it.
    */
   reselect?: (exec: ReselectExecutor) => Promise<PgCompatQueryResult>;
+  /**
+   * Set when the statement is a locking read (`lock`). Its locks last until
+   * the transaction ends, so a runner that executes it outside a transaction
+   * (an autocommit pipeline) must refuse it: the rows would be unlocked again
+   * before the caller saw them.
+   */
+  rowLock?: true;
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +126,14 @@ export interface QueryEvent {
    */
   batch?: 'pipeline' | 'transaction';
   /**
+   * The `sqlComment` this statement was sent with, exactly as appended
+   * (`/*action='findMany',model='users'*\/`). `sql` stays the commentless
+   * text, so events for one statement shape compare equal whatever the
+   * comment; the text on the wire was `${sql} ${comment}`. Absent when the
+   * statement carried none (no `sqlComment`, raw SQL, transaction control).
+   */
+  comment?: string;
+  /**
    * Set on a READ that failed because its connection had already been closed
    * by the server, and that Turbine therefore sent once more on a fresh one.
    * This event carries that first attempt's `error`; the retry reports its own
@@ -175,21 +194,15 @@ export interface QueryInterfaceOptions {
    *
    * Default: `true`. Set to `false` as a nuclear kill switch.
    *
-   * Dev-mode safety net: when `NODE_ENV !== 'production'`, every cache HIT is
+   * Safety net: {@link diagnostics}' `cacheCheck` decides whether a cache HIT is
    * cross-checked by rebuilding the SQL + params fresh and comparing them
    * against the cache-hit result, catching any drift between the fingerprint,
    * SQL-build, and param-collect paths (which has silently corrupted results
-   * before). A mismatch throws a `ValidationError` (E003). This runs only
-   * outside production, so it never touches the production hot path. Set the
-   * env var `TURBINE_DISABLE_CACHE_CHECK=1` to opt out when dev traffic is
-   * perf-sensitive.
-   *
-   * Production sampling: the check is off in production by default. Set
-   * `TURBINE_CACHE_CHECK_SAMPLE` to a float in `(0,1]` to re-verify that
-   * fraction of cache hits under real load (e.g. `0.001` for one in a
-   * thousand). A sampled mismatch logs `console.error` once per distinct
-   * fingerprint AND throws the same `ValidationError` (E003). `0`, unset, or an
-   * unparseable value keeps the check fully off.
+   * before). Every hit in development, none in production, or a sampled
+   * fraction (`{ sample: 0.001 }`); a sampled mismatch is logged once per
+   * distinct fingerprint as well as thrown. Independently of that, every MISS
+   * compares the built and collected params and every HIT checks the param
+   * count, in every mode; any mismatch is an `InvariantError` (E020).
    */
   sqlCache?: boolean;
   /**
@@ -203,6 +216,12 @@ export interface QueryInterfaceOptions {
    * per table).
    */
   sqlCacheSize?: number;
+  /**
+   * The client's `streamIdleTimeoutMs`: how long a cursor stream may wait for
+   * its consumer before Turbine closes it. Default 300000; `0` disables. See
+   * `FindManyStreamArgs.idleTimeoutMs`, which overrides it per call.
+   */
+  streamIdleTimeoutMs?: number;
   /** SQL dialect implementation. Defaults to PostgreSQL. */
   dialect?: Dialect;
   /**
@@ -296,6 +315,25 @@ export interface QueryInterfaceOptions {
    * {@link GlobalFilters}.
    */
   globalFilters?: GlobalFilters;
+  /**
+   * `diagnostics`: per-query advice and the SQL-cache self-check. TurbineClient
+   * resolves it once and hands the same resolved object to every interface it
+   * builds (resolving that again returns it by reference). An interface
+   * constructed directly may pass any `diagnostics` config, or none, and
+   * resolves it at construction, never per call.
+   */
+  diagnostics?: DiagnosticsConfig;
+  /** Where this interface's log lines go. Defaults to the console logger. */
+  logger?: TurbineLogger;
+  /**
+   * `sqlComment`: sqlcommenter key/values appended to every statement this
+   * interface sends (see `TurbineConfig.sqlComment`), resolved at
+   * construction. TurbineClient resolves it once instead and hands every
+   * interface the same commenter as `_sqlCommenter`.
+   */
+  sqlComment?: SqlCommentOptions;
+  /** @internal The client's resolved `sqlComment`, shared by its accessors; wins over `sqlComment`. */
+  _sqlCommenter?: SqlCommenter;
   /** @internal Set by TransactionClient, signals that this QI runs inside an active transaction. */
   _txScoped?: boolean;
   /** @internal Callback from TurbineClient for query event emission. */
@@ -303,8 +341,8 @@ export interface QueryInterfaceOptions {
   /**
    * @internal Factory that builds the per-table query interface. Defaults to
    * `new QueryInterface` (the SQL path). Non-SQL backends (PowDB) supply a
-   * factory returning a structurally-compatible interface that generates their
-   * own query language instead of SQL. The SQL dialects never set this, so their
+   * factory returning a {@link TableClient}, which generates their own query
+   * language instead of SQL. The SQL dialects never set this, so their
    * `table()` behavior is byte-identical.
    */
   queryInterfaceFactory?: (
@@ -313,5 +351,5 @@ export interface QueryInterfaceOptions {
     schema: SchemaMetadata,
     middlewares: MiddlewareFn[],
     options: QueryInterfaceOptions,
-  ) => QueryInterface<object>;
+  ) => TableClient<object>;
 }

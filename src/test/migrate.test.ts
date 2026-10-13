@@ -10,7 +10,7 @@
 
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
@@ -494,8 +494,10 @@ describe('findTransactionControlStatements', () => {
 });
 
 describe('assertNoEmbeddedTransactions', () => {
-  const dir = join(tmpdir(), `turbine-embedded-tx-${Date.now()}`);
-  before(() => mkdirSync(dir, { recursive: true }));
+  let dir = '';
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), 'turbine-embedded-tx-'));
+  });
   after(() => rmSync(dir, { recursive: true, force: true }));
 
   function write(name: string, content: string): { filename: string; path: string; name: string; timestamp: string } {
@@ -617,13 +619,13 @@ describe('formatTimestamp', () => {
   it('formats a date as YYYYMMDDHHMMSS', () => {
     const date = new Date('2026-03-27T14:05:09.000Z');
     const result = formatTimestamp(date);
-    // Note: result depends on timezone, so we just check format
-    assert.match(result, /^\d{14}$/);
+    // UTC digits, whatever the process time zone is.
+    assert.equal(result, '20260327140509');
   });
 
   it('pads single-digit months and days', () => {
-    // Use a specific UTC date and check via the Date constructor
-    const date = new Date(2026, 0, 5, 3, 7, 2); // Jan 5, 03:07:02 local time
+    // Stamps are UTC, so the instant is built in UTC and the digits are the same in every time zone.
+    const date = new Date(Date.UTC(2026, 0, 5, 3, 7, 2)); // Jan 5, 03:07:02 UTC
     const result = formatTimestamp(date);
     assert.match(result, /^\d{14}$/);
     // Year should be 2026
@@ -692,10 +694,10 @@ describe('parseMigrationFilename', () => {
 // ---------------------------------------------------------------------------
 
 describe('listMigrationFiles', () => {
-  const testDir = join(tmpdir(), `turbine-test-migrations-${Date.now()}`);
+  let testDir = '';
 
   before(() => {
-    mkdirSync(testDir, { recursive: true });
+    testDir = mkdtempSync(join(tmpdir(), 'turbine-test-migrations-'));
     // Create test migration files (out of order to test sorting)
     writeFileSync(join(testDir, '20260327140500_create_users.sql'), '-- UP\n-- DOWN\n');
     writeFileSync(join(testDir, '20260327140600_create_posts.sql'), '-- UP\n-- DOWN\n');
@@ -740,8 +742,7 @@ describe('listMigrationFiles', () => {
   });
 
   it('returns empty array for empty directory', () => {
-    const emptyDir = join(tmpdir(), `turbine-test-empty-${Date.now()}`);
-    mkdirSync(emptyDir, { recursive: true });
+    const emptyDir = mkdtempSync(join(tmpdir(), 'turbine-test-empty-'));
     const files = listMigrationFiles(emptyDir);
     assert.deepEqual(files, []);
     rmSync(emptyDir, { recursive: true, force: true });
@@ -753,10 +754,10 @@ describe('listMigrationFiles', () => {
 // ---------------------------------------------------------------------------
 
 describe('getPendingMigrations', () => {
-  const testDir = join(tmpdir(), `turbine-test-pending-${Date.now()}`);
+  let testDir = '';
 
   before(() => {
-    mkdirSync(testDir, { recursive: true });
+    testDir = mkdtempSync(join(tmpdir(), 'turbine-test-pending-'));
     writeFileSync(join(testDir, '20260326100000_init.sql'), '-- UP\n-- DOWN\n');
     writeFileSync(join(testDir, '20260327140500_create_users.sql'), '-- UP\n-- DOWN\n');
     writeFileSync(join(testDir, '20260327140600_create_posts.sql'), '-- UP\n-- DOWN\n');
@@ -798,7 +799,11 @@ describe('getPendingMigrations', () => {
 // ---------------------------------------------------------------------------
 
 describe('createMigration', () => {
-  const testDir = join(tmpdir(), `turbine-test-create-${Date.now()}`);
+  let testDir = '';
+
+  before(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'turbine-test-create-'));
+  });
 
   after(() => {
     rmSync(testDir, { recursive: true, force: true });
@@ -857,8 +862,9 @@ describe('createMigration', () => {
   const INJECTION = 'evil\n-- turbine:no-transaction\n-- UP\nDROP TABLE users;\n-- x';
 
   it('cannot be made to inject SQL or a directive through the migration name', () => {
-    for (const options of [undefined, { recipe: 'backfill' }]) {
-      const result = createMigration(testDir, INJECTION, undefined, options);
+    for (const [i, options] of [undefined, { recipe: 'backfill' }].entries()) {
+      // A directory per call: same name in the same second is refused, not overwritten.
+      const result = createMigration(join(testDir, `inject-${i}`), INJECTION, undefined, options);
       const content = readFileSync(result.path, 'utf-8');
       const parsed = parseMigrationContent(content);
 
@@ -870,7 +876,7 @@ describe('createMigration', () => {
   });
 
   it('cannot be made to inject through the name on the auto-generated template', () => {
-    const result = createMigration(testDir, INJECTION, { up: 'SELECT 1;', down: 'SELECT 2;' });
+    const result = createMigration(join(testDir, 'inject-auto'), INJECTION, { up: 'SELECT 1;', down: 'SELECT 2;' });
     const parsed = parseMigrationContent(readFileSync(result.path, 'utf-8'));
     assert.equal(parsed.noTransaction, false);
     assert.equal(parsed.up, 'SELECT 1;');
@@ -892,12 +898,12 @@ function legacyHash(content: string): string {
 }
 
 describe('legacy checksum auto-upgrade', () => {
-  const dir = join(tmpdir(), `turbine-legacy-checksum-${Date.now()}`);
+  let dir = '';
   const NAME = '20260101000000_create_users';
   const CONTENT = '-- UP\nCREATE TABLE users (id SERIAL PRIMARY KEY);\n\n-- DOWN\nDROP TABLE users;\n';
 
   before(() => {
-    mkdirSync(dir, { recursive: true });
+    dir = mkdtempSync(join(tmpdir(), 'turbine-legacy-checksum-'));
     writeFileSync(join(dir, `${NAME}.sql`), CONTENT, 'utf-8');
   });
   after(() => rmSync(dir, { recursive: true, force: true }));
@@ -1152,10 +1158,12 @@ describe('runMigrationInTransaction', () => {
 // ---------------------------------------------------------------------------
 
 describe('rollbackMigrations', () => {
-  const dir = join(tmpdir(), `turbine-rollback-batch-${Date.now()}`);
+  let dir = '';
   const DELETE_APPLIED = 'DELETE FROM _turbine_migrations WHERE name = $1';
 
-  before(() => mkdirSync(dir, { recursive: true }));
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), 'turbine-rollback-batch-'));
+  });
   after(() => rmSync(dir, { recursive: true, force: true }));
 
   /** Write a migration file and return its MigrationFile record. */
@@ -1290,8 +1298,10 @@ describe('rollbackMigrations', () => {
 // ---------------------------------------------------------------------------
 
 describe('assertUpHasStatements', () => {
-  const dir = join(tmpdir(), `turbine-empty-up-${process.pid}-${Date.now()}`);
-  before(() => mkdirSync(dir, { recursive: true }));
+  let dir = '';
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), 'turbine-empty-up-'));
+  });
   after(() => rmSync(dir, { recursive: true, force: true }));
 
   const withFile = (name: string, content: string): MigrationFile => {
@@ -1349,9 +1359,9 @@ describe('assertUpHasStatements', () => {
 // ---------------------------------------------------------------------------
 
 describe('listIgnoredSqlFiles', () => {
-  const dir = join(tmpdir(), `turbine-ignored-sql-${process.pid}-${Date.now()}`);
+  let dir = '';
   before(() => {
-    mkdirSync(dir, { recursive: true });
+    dir = mkdtempSync(join(tmpdir(), 'turbine-ignored-sql-'));
     writeFileSync(join(dir, '20260101000001_ok.sql'), '-- UP\nSELECT 1;\n-- DOWN\n');
     writeFileSync(join(dir, 'add_thing.sql'), '-- UP\nSELECT 1;\n-- DOWN\n');
     writeFileSync(join(dir, '2026090100017_short_ts.sql'), '-- UP\nSELECT 1;\n-- DOWN\n');
@@ -1381,13 +1391,13 @@ describe('listIgnoredSqlFiles', () => {
 // ---------------------------------------------------------------------------
 
 describe('rebaselineChecksums', () => {
-  const dir = join(tmpdir(), `turbine-rebaseline-${process.pid}-${Date.now()}`);
+  let dir = '';
   const NAME = '20260101000001_init';
   const CURRENT = '-- UP\nCREATE TABLE t (id int);\n-- DOWN\nDROP TABLE t;\n';
   const currentHash = createHash('sha256').update(CURRENT, 'utf-8').digest('hex');
 
   before(() => {
-    mkdirSync(dir, { recursive: true });
+    dir = mkdtempSync(join(tmpdir(), 'turbine-rebaseline-'));
     writeFileSync(join(dir, `${NAME}.sql`), CURRENT);
   });
   after(() => rmSync(dir, { recursive: true, force: true }));

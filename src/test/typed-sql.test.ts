@@ -109,7 +109,9 @@ describe('typed-sql parameterization (unit)', () => {
   it('buildTypedSql rejects a segment/value count mismatch (direct misuse)', () => {
     // The tagged-template API can't produce this, but buildTypedSql is exported,
     // so guard the directly-callable surface against placeholder/param desync.
-    const fakeSegments = ['a', 'b'] as unknown as TemplateStringsArray;
+    const fakeSegments = Object.freeze(
+      Object.assign(['a', 'b'], { raw: Object.freeze(['a', 'b']) }),
+    ) as unknown as TemplateStringsArray;
     assert.throws(() => buildTypedSql(fakeSegments, [10, 20, 30]), /segment\/value count mismatch/);
   });
 

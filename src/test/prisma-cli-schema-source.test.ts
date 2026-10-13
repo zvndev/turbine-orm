@@ -17,7 +17,7 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
@@ -47,9 +47,7 @@ function runCli(cwd: string, args: string[]): { code: number; output: string } {
 
 /** A throwaway cwd, removed by the caller. */
 function tempDir(tag: string): string {
-  const dir = join(tmpdir(), `turbine-mfp-${tag}-${process.pid}-${Date.now().toString(36)}`);
-  mkdirSync(dir, { recursive: true });
-  return dir;
+  return mkdtempSync(join(tmpdir(), `turbine-mfp-${tag}-`));
 }
 
 // ---------------------------------------------------------------------------

@@ -776,6 +776,19 @@ const BEHAVIOR: Record<string, Check> = {
       );
       return;
     }
+    if (op === 'createMany') {
+      // A t1-scoped client upserting id 5, which belongs to t2: the filter
+      // guards the conflict update, and the opt-out lifts that guard.
+      const args = {
+        data: [{ id: 5, name: 'taken', tenantId: 't1', qty: 1, secret: 'sz', email: 'over@x.test' }],
+        onConflict: { target: ['id'], update: ['name'] },
+      };
+      await run(tenantDb, 'createMany', args);
+      assert.equal((await widgetRows()).find((x) => x.id === 5)?.name, 'echo', 'the filter must guard the update');
+      await run(tenantDb, 'createMany', { ...args, skipGlobalFilters: UNSAFE });
+      assert.equal((await widgetRows()).find((x) => x.id === 5)?.name, 'taken', 'the opt-out must lift the guard');
+      return;
+    }
     if (op === 'update' || op === 'delete') {
       // Addressing a row outside the filter must not find it.
       await assert.rejects(() =>
@@ -949,6 +962,51 @@ const BEHAVIOR: Record<string, Check> = {
     } finally {
       await blocker.query('ROLLBACK');
       blocker.release();
+    }
+  },
+  lock: async (op) => {
+    await reseed();
+    // Outside a transaction the lock would be gone before the call returns, so
+    // it is refused rather than run.
+    await assert.rejects(() => run(db, op, { lock: 'update' }), ValidationError);
+    // Inside one, the rows it returned stay locked until the transaction ends:
+    // another connection's NOWAIT fails on them and succeeds on a row it did not
+    // return.
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let ready!: () => void;
+    const locked = new Promise<void>((resolve) => {
+      ready = resolve;
+    });
+    const where = op === 'findMany' ? { where: { id: { in: [1, 2] } } } : {};
+    const tx = db.$transaction(async (t) => {
+      const table = t.table(W) as unknown as Record<string, (a: Args) => Promise<unknown>>;
+      await table[op]!.call(table, { ...BASELINE[op], ...where, lock: 'update' });
+      ready();
+      await held;
+    });
+    await Promise.race([locked, tx]);
+    const probe = await (
+      raw as unknown as { connect(): Promise<{ query(q: string): Promise<{ rows: unknown[] }>; release(): void }> }
+    ).connect();
+    try {
+      await probe.query('BEGIN');
+      await assert.rejects(
+        () => probe.query(`SELECT id FROM ${W} WHERE id = 1 FOR UPDATE NOWAIT`),
+        (err: { code?: string }) => err.code === '55P03',
+        'a row the locking read returned must be locked',
+      );
+      await probe.query('ROLLBACK');
+      await probe.query('BEGIN');
+      const free = await probe.query(`SELECT id FROM ${W} WHERE id = 3 FOR UPDATE NOWAIT`);
+      assert.equal(free.rows.length, 1, 'a row it did not return must not be locked');
+    } finally {
+      await probe.query('ROLLBACK');
+      probe.release();
+      release();
+      await tx;
     }
   },
   warnOnUnlimited: async () => {

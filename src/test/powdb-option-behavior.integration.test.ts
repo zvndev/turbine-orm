@@ -131,7 +131,7 @@ async function withDb(fn: (db: DB) => Promise<void>, options: Record<string, unk
   const dir = mkdtempSync(join(tmpdir(), 'powdb-optbeh-'));
   const db: DB = await turbinePowDB({ embedded: dir }, schema, { warnOnUnlimited: false, ...options });
   try {
-    for (const stmt of powqlSchemaDDL(schema)) await db.raw([stmt]);
+    for (const stmt of powqlSchemaDDL(schema)) await db.rawUnsafe(stmt);
     for (const r of ROWS) await db.table('widget').create({ data: r });
     for (const k of KIDS) await db.table('gadget').create({ data: k });
     await fn(db);

@@ -63,13 +63,13 @@ import { dedupeOrderEntries, isOrderBySpec, isRelationPickOrderBy, orderByEntrie
 import type { SkipGlobalFilters, Unsafe, WithClause, WithCount, WithOptions } from './types.js';
 import {
   availableClause,
+  boundedPreparedName,
   type ColumnNameSource,
   markInternalCombinator,
   ownLookup,
   resolveColumnName,
   selectNamesNothingMessage,
   selectOmitExclusiveMessage,
-  sqlToPreparedName,
 } from './utils.js';
 
 /**
@@ -336,14 +336,42 @@ export function defaultProjectionFields(
 }
 
 /**
- * Adjust a `select`/`omit` pair so that `fields` are guaranteed present in the
- * query result, returning the adjusted projection plus the list of fields that
- * were added ONLY for stitching and must be stripped from the final entities.
+ * Key under which {@link includeKeysForBatching} records the fields IT added to
+ * a `select`, as a `ReadonlySet<string>` of field names.
  *
- * Used both for the base query (parent keys) and each follow-up query (child
- * keys) so a caller's `select: { title: true }` on a relation still stitches even
- * though the FK was not requested, and the FK never appears in the output.
+ * Why it exists: naming a PII-tagged column in `select` is refused unless the
+ * query passes `includePii: UNSAFE` (see `resolveProjection`), and the loader
+ * has to project a correlation or ordering column that may itself be tagged.
+ * That column is stripped from every entity before the caller sees it, so it is
+ * the one legitimate way a PII name reaches a `select` without the caller
+ * writing it. The marker is a symbol key: `Object.keys`, `Object.entries`,
+ * spreads of a parsed body and `JSON.stringify` never see one, and
+ * `JSON.parse` cannot produce one, so request data cannot forge the exemption.
  */
+export const STITCH_ONLY_FIELDS: unique symbol = Symbol.for('turbine.stitchOnlyFields');
+
+/** The fields the batched loader (not the caller) added to this `select`, if any. */
+export function stitchOnlyFields(select: object | undefined): ReadonlySet<string> | undefined {
+  if (!select) return undefined;
+  const marked = (select as { [STITCH_ONLY_FIELDS]?: unknown })[STITCH_ONLY_FIELDS];
+  return marked instanceof Set ? (marked as ReadonlySet<string>) : undefined;
+}
+
+/** Record `fields` on `select` as added by an engine loader, not by the caller. Returns `select`. */
+export function markStitchOnly(select: Record<string, boolean>, fields: readonly string[]): Record<string, boolean> {
+  // Non-enumerable, like the other engine-written markers: the select object is
+  // passed by reference from here to the child build, and an enumerable symbol
+  // would show up in deep-equality comparisons of the projection.
+  if (fields.length > 0) {
+    Object.defineProperty(select, STITCH_ONLY_FIELDS, {
+      value: new Set(fields),
+      enumerable: false,
+      configurable: true,
+    });
+  }
+  return select;
+}
+
 /**
  * The two projection SHAPE rules from `resolveProjection`, checked on the RAW
  * caller args BEFORE `includeKeysForBatching` adjusts them. The adjustment
@@ -369,6 +397,16 @@ export function assertProjectionShape(
   }
 }
 
+/**
+ * Adjust a `select`/`omit` pair so that `fields` are guaranteed present in the
+ * query result, returning the adjusted projection plus the list of fields that
+ * were added ONLY for stitching and must be stripped from the final entities.
+ *
+ * Used both for the base query (parent keys) and each follow-up query (child
+ * keys) so a caller's `select: { title: true }` on a relation still stitches even
+ * though the FK was not requested, and the FK never appears in the output. A
+ * returned `select` carries {@link STITCH_ONLY_FIELDS} for the fields added here.
+ */
 export function includeKeysForBatching(
   /**
    * The table the projection is compiled against. `select` / `omit` keys are
@@ -423,7 +461,7 @@ export function includeKeysForBatching(
       next[f] = true;
       strip.push(f); // not requested by the caller, added only to stitch
     }
-    return { select: next, omit, strip };
+    return { select: markStitchOnly(next, strip), omit, strip };
   }
   if (omit) {
     const next = { ...omit };
@@ -447,7 +485,7 @@ export function includeKeysForBatching(
     const explicit: Record<string, boolean> = {};
     for (const f of defaultProjection.visible) explicit[f] = true;
     for (const f of hiddenKeys) explicit[f] = true;
-    return { select: explicit, omit: undefined, strip: hiddenKeys };
+    return { select: markStitchOnly(explicit, hiddenKeys), omit: undefined, strip: hiddenKeys };
   }
   return { select, omit, strip: [] };
 }
@@ -531,8 +569,20 @@ export function resolveCountRelations(parentMeta: TableMetadata, countSpec: With
   return out;
 }
 
-/** Stringified stitch key, robust to number/uuid/bigint type drift across a join. */
+/**
+ * Stringified stitch key, robust to number/uuid/bigint type drift across a join.
+ * A binary key is keyed by its bytes: `String()` of a Buffer decodes it as
+ * UTF-8, which maps different invalid sequences to the same replacement text.
+ * A Date by its instant, which `String()` truncates to the second.
+ */
 function keyOf(value: unknown): string {
+  if (value instanceof Uint8Array) {
+    // No Buffer: this module runs on edge runtimes too.
+    let hex = '\u0000bytes:';
+    for (const byte of value) hex += byte.toString(16).padStart(2, '0');
+    return hex;
+  }
+  if (value instanceof Date) return `\u0000date:${value.getTime()}`;
   return String(value);
 }
 
@@ -721,6 +771,34 @@ function seedRelationKeys(
 }
 
 /**
+ * A to-many relation's per-parent page (`skip` / `take` are folded into
+ * `offset` / `limit` at the args seam), validated as the join plan validates
+ * it: a non-negative integer, numeric strings coerced. Checked before anything
+ * runs, so both strategies accept and refuse the same values.
+ */
+function relationPage(options: WithOptions, table: string): { limit?: number; offset?: number } {
+  const check = (value: unknown, arg: string): number | undefined => {
+    if (value === undefined) return undefined;
+    const n = Number(value);
+    if (!Number.isSafeInteger(n) || n < 0) {
+      throw new ValidationError(`${arg} on "${table}" must be a non-negative integer, received: ${String(value)}`);
+    }
+    return n;
+  };
+  return {
+    limit: check(options.limit, 'relation limit'),
+    offset: check((options as { offset?: unknown }).offset, 'relation offset'),
+  };
+}
+
+/** One parent's window of its own related rows. */
+function pageOf<R>(rows: R[], page: { limit?: number; offset?: number }): R[] {
+  if (page.limit === undefined && !page.offset) return rows;
+  const start = page.offset ?? 0;
+  return rows.slice(start, page.limit === undefined ? undefined : start + page.limit);
+}
+
+/**
  * hasMany / hasOne / belongsTo: one follow-up `SELECT ... WHERE childKey = ANY($1)`
  * (chunked), grouped by the correlation key and attached (array vs single-or-null).
  */
@@ -756,6 +834,7 @@ async function loadToOneOrMany(
   assertCorrelationKeyProjected(parents, parentKeyField, relName, ctx.parentMeta.name);
   const keys = uniqueKeys(parents, parentKeyField);
   const single = rel.type === 'belongsTo' || rel.type === 'hasOne';
+  const page = single ? {} : relationPage(options, ctx.parentMeta.name);
 
   // The follow-up must project the child correlation key even if the caller's
   // select/omit excluded it; strip it back off afterwards so the shape matches join.
@@ -775,7 +854,7 @@ async function loadToOneOrMany(
   // again afterwards). `null` means this relation keeps the client-side slice,
   // which is the case for every shape whose ordering does not force WHICH rows
   // the limit keeps. See {@link partitionOrderBy} and {@link boundedChildQuery}.
-  const windowOrder = single || options.limit === undefined ? null : partitionOrderBy(targetMeta, options.orderBy);
+  const windowOrder = single || page.limit === undefined ? null : partitionOrderBy(targetMeta, options.orderBy);
   const pushDownLimit = windowOrder !== null && ctx.buildPartitionLimit !== undefined;
   // THE ONE PII EXCEPTION IN THE READ PATH, recorded here because the contract
   // in schema.ts says a PII column is excluded from every default projection
@@ -834,7 +913,8 @@ async function loadToOneOrMany(
     chunks.map(async (chunk) => {
       const deferred = buildChunk(chunk);
       const bounded = pushDownLimit
-        ? boundedChildQuery(ctx, deferred, childKeyCol, windowOrder ?? [], options.limit as number)
+        ? // The first offset + limit rows of each parent; the slice below drops the offset.
+          boundedChildQuery(ctx, deferred, childKeyCol, windowOrder ?? [], (page.offset ?? 0) + (page.limit as number))
         : deferred;
       const result = await ctx.exec(bounded.sql, bounded.params, bounded.preparedName);
       if (bounded !== deferred) stripRankColumn(result);
@@ -865,13 +945,12 @@ async function loadToOneOrMany(
   // what was true of the parent side until this week.
   assertCorrelationKeyProjected(allChildren, childKeyField, relName, targetMeta.name);
   const byKey = groupBy(allChildren, childKeyField);
-  const limit = options.limit;
   for (const parent of parents) {
     const bucket = byKey.get(keyOf(parent[parentKeyField])) ?? [];
     if (single) {
       parent[relName] = bucket[0] ?? null;
     } else {
-      parent[relName] = limit !== undefined ? bucket.slice(0, limit) : bucket;
+      parent[relName] = pageOf(bucket, page);
     }
   }
 
@@ -939,7 +1018,7 @@ function boundedChildQuery(
   return {
     sql,
     params: [...deferred.params, limit],
-    preparedName: deferred.preparedName ? sqlToPreparedName(sql) : deferred.preparedName,
+    preparedName: deferred.preparedName ? boundedPreparedName(sql) : deferred.preparedName,
     transform: deferred.transform,
   };
 }
@@ -993,6 +1072,7 @@ async function loadManyToMany(
   const targetPkCol = targetMeta.primaryKey[0]!;
   const parentRefField = ctx.parentMeta.reverseColumnMap[sourceRefCol] ?? sourceRefCol;
   const targetPkField = targetMeta.reverseColumnMap[targetPkCol] ?? targetPkCol;
+  const page = relationPage(options, ctx.parentMeta.name);
 
   assertCorrelationKeyProjected(parents, parentRefField, relName, ctx.parentMeta.name);
   // No early return on zero parent keys: the code below flows through
@@ -1103,7 +1183,7 @@ async function loadManyToMany(
   // link, which spends exactly the bytes the pushdown exists to save; and the
   // bound would still have to respect a `limit` measured per parent, not per
   // fetched row. So the m2m loader keeps the slice below, on every engine.
-  const limit = options.limit;
+  const end = page.limit === undefined ? undefined : (page.offset ?? 0) + page.limit;
   for (const parent of parents) {
     const linked = new Set((targetsBySource.get(keyOf(parent[parentRefField])) ?? []).map(keyOf));
     if (linked.size === 0) {
@@ -1112,12 +1192,11 @@ async function loadManyToMany(
     }
     const out: Record<string, unknown>[] = [];
     for (const t of targetsInOrder) {
-      if (linked.has(keyOf(t[targetPkField]))) {
-        out.push(t);
-        if (limit !== undefined && out.length >= limit) break;
-      }
+      // Checked before the push, so `limit: 0` keeps nothing.
+      if (end !== undefined && out.length >= end) break;
+      if (linked.has(keyOf(t[targetPkField]))) out.push(t);
     }
-    parent[relName] = out;
+    parent[relName] = pageOf(out, { offset: page.offset });
   }
 
   stripFields(targetsInOrder, proj.strip);

@@ -7,7 +7,8 @@
  */
 
 import { ValidationError } from './errors.js';
-import type { WithOptions } from './query/types.js';
+import type { TurbineLogger } from './logger.js';
+import type { RowLockMode, WithOptions } from './query/types.js';
 import { coerceJsonWireValue, jsonWireCoercionOid } from './query/utils.js';
 import { pgArrayType, pgTypeToTs, type RelationDef, type SchemaMetadata, type TableMetadata } from './schema.js';
 
@@ -60,6 +61,36 @@ export interface BulkInsertStatementInput {
   requireRowValues?: boolean;
 }
 
+/**
+ * The rendered references a multi-row upsert's conflict-UPDATE reads through:
+ * the existing row (`"daily_stats"`, SQL Server's MERGE alias `T`) and the
+ * proposed row (`EXCLUDED`, `excluded`, MySQL's row alias, `S`). The
+ * statement hook names them, because it is the statement that declares them.
+ */
+export interface BulkUpsertRefs {
+  readonly target: string;
+  readonly incoming: string;
+}
+
+/** The compiled conflict-UPDATE of a multi-row upsert. */
+export interface BulkUpsertUpdate {
+  /** `col = expr` assignments, columns bare on the left. */
+  readonly setClauses: string[];
+  /** A predicate on the existing row (no `WHERE` keyword), or `null`. */
+  readonly where: string | null;
+}
+
+export interface BulkUpsertStatementInput extends BulkInsertStatementInput {
+  /** SQL-ready quoted conflict-target columns (a primary key or one unique key). */
+  conflictColumns: string[];
+  /**
+   * Compile the conflict-UPDATE. Called once, AFTER the row values are bound,
+   * with the statement's params so its own placeholders continue after them.
+   * `null` skips conflicting rows instead (`DO NOTHING`).
+   */
+  update: ((params: unknown[], refs: BulkUpsertRefs) => BulkUpsertUpdate) | null;
+}
+
 export interface DefaultValuesInsertStatementInput {
   /** SQL-ready quoted table name. */
   table: string;
@@ -73,6 +104,38 @@ export interface DefaultValuesInsertStatementInput {
   skipDuplicates?: boolean;
   /** Optional SQL-ready RETURNING selection. */
   returning?: ReturningSelection;
+}
+
+/**
+ * Input for {@link Dialect.buildJsonPathEquals}. The hook runs on the SQL build
+ * AND on the cache-hit param-collect pass with the same `value`, so it binds
+ * the same parameters in the same order on both; on the collect pass `bind`
+ * returns an empty string and the returned SQL is discarded.
+ */
+export interface JsonPathEqualsInput {
+  /** The qualified JSON column expression. */
+  readonly column: string;
+  /**
+   * Placeholder of the already-bound JSONPath for `path` (see `encodePath`),
+   * or `undefined` for a whole-document `equals` (no `path`), which compares
+   * the column itself.
+   */
+  readonly pathRef: string | undefined;
+  /** The path segments as the caller wrote them; empty for a whole-document `equals`. */
+  readonly path: readonly (string | number)[];
+  /**
+   * The operand: a string, number, boolean, bigint, null, array or object.
+   * A Date arrives as its ISO string (the form JSON stores it in); functions,
+   * symbols, column references and non-finite numbers are refused before the
+   * hook runs.
+   */
+  readonly value: unknown;
+  /** The column as it should read in an error message. */
+  readonly label: string;
+  /** Bind one parameter and return its placeholder. */
+  bind(value: unknown): string;
+  /** The engine's JSONPath string for a path, the same encoding `pathRef` carries. */
+  encodePath(path: readonly (string | number)[]): string;
 }
 
 /**
@@ -292,8 +355,9 @@ export interface PartitionLimitInput {
  * dialect. **Param-push ordering contract:** the override MUST push values to
  * {@link params} in the same order the builder's collect path expects so the SQL
  * cache and pipeline batching stay in sync -
- *   - to-many with `limit`/`orderBy` (the "wrap" path) and manyToMany:
- *     `buildWhere(...)` → push `limit` → `recurse(...)` for each nested relation;
+ *   - to-many with `limit`/`offset`/`orderBy` (the "wrap" path) and manyToMany:
+ *     `buildWhere(...)` → push `limit` → push `offset` → `recurse(...)` for each
+ *     nested relation;
  *   - everything else (to-one, unordered/unlimited to-many): `recurse(...)` for each
  *     nested relation → `buildWhere(...)` (no limit param).
  */
@@ -332,9 +396,267 @@ export interface RelationSubqueryContext {
   recurse(relDef: RelationDef, spec: true | WithOptions, parentRef: string, depth: number, path: string[]): string;
 }
 
+/**
+ * What an engine can do, stated in full by every engine dialect.
+ *
+ * Every engine dialect is built by spreading `postgresDialect`, so a flag or
+ * hook added to PostgreSQL is inherited by every engine that does not override
+ * it (the inheritance trap). This object closes the trap for the questions it
+ * answers: each engine dialect sets its OWN `capabilities` as a fresh object
+ * literal checked with `satisfies EngineCapabilities`, so adding a key here is
+ * a compile error in every engine file until each one decides, and a unit test
+ * refuses an engine whose `capabilities` is inherited or shared.
+ *
+ * Code asks these questions instead of testing `dialect.name`; a source scan
+ * (src/test/capabilities-guard.test.ts) refuses a new engine-name comparison
+ * outside a short, commented allowlist. Rendering differences are not
+ * capabilities: they belong in the dialect's hooks (a few still switch on the
+ * name, allowlisted, until engines stop spreading `postgresDialect`).
+ */
+export interface EngineCapabilities {
+  // ---- Query shape ------------------------------------------------------
+
+  /** `SELECT DISTINCT ON (...)`: findMany `distinct` and groupBy `distinctOn`. Else E017. */
+  readonly distinctOn: boolean;
+
+  /**
+   * The positional relation encoding (`json_build_array`, see
+   * {@link Dialect.buildJsonArray}). One flag answers both questions about it:
+   * it is the default `jsonEncoding` where true, and refused (E017) where
+   * false, so the default can never pick an encoding the builder refuses.
+   */
+  readonly positionalJson: boolean;
+
+  /** The `NULLS FIRST` / `NULLS LAST` ordering clause. Explicit `nulls` placement is E017 without it. */
+  readonly nullsOrderingClause: boolean;
+
+  /**
+   * NULL sorts after every value in an ascending order (PostgreSQL), rather
+   * than before it (SQLite, MySQL, SQL Server). A cursor seek places NULL keys
+   * where the engine sorts them.
+   */
+  readonly nullsSortHigh: boolean;
+
+  /** `mode: 'insensitive'` on `in` / `notIn`, which folds every list element in SQL. Else E017. */
+  readonly insensitiveInList: boolean;
+
+  /**
+   * How two whole JSON documents compare:
+   *  - `'jsonb'`: as jsonb, in the where compiler's own PostgreSQL form
+   *    (`::jsonb = $1::jsonb`, `#>` path equality); the dialect takes no
+   *    {@link Dialect.buildJsonPathEquals}.
+   *  - `'exact'`: exactly, key order and whitespace aside, through the
+   *    dialect's `buildJsonPathEquals` (MySQL).
+   *  - `'text'`: not exactly (SQLite, SQL Server), so a bare array operand and
+   *    a document `not` are refused (E017) rather than compared as text. A
+   *    path `equals` still uses the dialect's `buildJsonPathEquals` when it
+   *    has one.
+   */
+  readonly jsonDocumentEquality: 'jsonb' | 'exact' | 'text';
+
+  /**
+   * JSON path extraction returns SQL-typed values: a JSON number as a number,
+   * `true` / `false` as 1 / 0 (SQLite). A path `equals` then binds a number as
+   * a number and refuses a boolean.
+   */
+  readonly jsonExtractTyped: boolean;
+
+  /**
+   * A JSON path range filter (`gt`, `lte`, ...) casts the extracted value to an
+   * exact `numeric` (`(expr)::numeric`, PostgreSQL); without it the cast is the
+   * dialect's float {@link Dialect.castAggregate}.
+   */
+  readonly jsonExactNumericCast: boolean;
+
+  /**
+   * A number compared with a text column converts the stored TEXT to a number
+   * (MySQL: `'0zz' = 0` is true), so a number, bigint or boolean bound against
+   * a text column binds as its text instead.
+   */
+  readonly numericTextComparison: boolean;
+
+  /**
+   * Declared foreign keys are always enforced, so the mass-mutation guard may
+   * trust that a non-null foreign key points at a row. SQLite enforces them
+   * only when the connection turned `foreign_keys` on.
+   */
+  readonly enforcesForeignKeys: boolean;
+
+  /**
+   * The batched relation loader pushes a per-parent `limit` into its follow-up
+   * query through {@link Dialect.buildPartitionLimit}. Without it the loader
+   * fetches every matching child and slices client-side.
+   */
+  readonly partitionLimitPushdown: boolean;
+
+  // ---- Values -----------------------------------------------------------
+
+  /**
+   * The `utcTimestamps` rewrite covers zone-less `timestamp` columns and raw
+   * `Date` parameters, as well as `date` columns (which take the UTC day on
+   * every SQL engine). PostgreSQL only: MySQL reads a zone-less literal in the
+   * session time zone. A table with untyped columns is reported where true.
+   */
+  readonly utcTimestampRewrite: boolean;
+
+  /**
+   * Bound values inside an update expression carry a `::type` cast (the target
+   * column's type, `::numeric`, `::int8`), because the driver sends parameters
+   * untyped and the server would infer `text`. PostgreSQL only.
+   */
+  readonly paramTypeCasts: boolean;
+
+  /**
+   * An enum is a named database type: `CREATE TYPE ... AS ENUM` in DDL and a
+   * `::"EnumName"` cast on writes and filters. Elsewhere an enum column is
+   * declared with its labels on the column ({@link Dialect.buildEnumColumn}).
+   */
+  readonly namedEnumTypes: boolean;
+
+  /**
+   * Which columns refuse a plain object or an array written to them (E003):
+   *  - `'pg-scalars'`: PostgreSQL's scalar types by their PostgreSQL names,
+   *    text types included.
+   *  - `'scalars-and-text'`: every non-text scalar type and the text types,
+   *    for an engine with a JSON column type (MySQL).
+   *  - `'scalars'`: non-text scalar types only; a text column holds
+   *    serialized JSON on an engine with no JSON type (SQLite, SQL Server).
+   */
+  readonly structuredValueColumns: 'pg-scalars' | 'scalars-and-text' | 'scalars';
+
+  // ---- Writes -----------------------------------------------------------
+
+  /**
+   * The most bind parameters one statement may carry; `Infinity` for no
+   * known limit. Past PostgreSQL's 65535 node-postgres does not refuse: the
+   * count wraps and the server answers with a protocol error that reads like
+   * a lost connection.
+   */
+  readonly maxBindParameters: number;
+
+  /**
+   * The most rows one plain `INSERT ... VALUES` may carry; `Infinity` for no
+   * limit beyond the bind-parameter one (SQL Server: 1000, error 10738 past
+   * it). An `onConflict` statement that reads its rows as a derived table is
+   * not bound by it.
+   */
+  readonly maxInsertRows: number;
+
+  /**
+   * What a single-statement upsert conflicts on. `'explicit'`: the conflict
+   * target it names. `'any-unique-key'`: whichever unique key collides first
+   * (MySQL `ON DUPLICATE KEY UPDATE`), so a `create` that can collide on a key
+   * `where` does not pin is looked up first, and a multi-row upsert must target
+   * the only key its rows can violate.
+   */
+  readonly upsertConflictTarget: 'explicit' | 'any-unique-key';
+
+  /**
+   * How an UPDATE's SET list reads columns. `'snapshot'`: every expression
+   * reads the row as it was. `'left-to-right'` (MySQL): a later expression
+   * reads an earlier assignment, so Turbine orders the clauses.
+   */
+  readonly setClauseOrder: 'snapshot' | 'left-to-right';
+
+  /** The reads inside a reselect write's transaction take `FOR UPDATE`, so a concurrent write waits. */
+  readonly reselectLocksRows: boolean;
+
+  /**
+   * The operator that divides an integer by an integer with truncation: `/`
+   * (PostgreSQL, SQLite, SQL Server) or `DIV` (MySQL, whose `/` is decimal).
+   */
+  readonly integerDivision: '/' | 'DIV';
+
+  /** Update expressions (`expr.*`, `col()` in update data) compile here. Else E017. */
+  readonly updateExpressions: boolean;
+
+  /**
+   * One multi-row upsert statement applies two rows whose keys are equal only
+   * under the column's collation as an insert and an update of one row,
+   * rather than refusing (PostgreSQL 21000, SQL Server 8672). Turbine detects
+   * it afterwards, so the statement runs in a transaction it can roll back.
+   */
+  readonly bulkUpsertAppliesRepeatedKeys: boolean;
+
+  // ---- Connection and transactions --------------------------------------
+
+  /** `$transaction({ readOnly: true })`: `READ ONLY` after the dialect's BEGIN. Else E017. */
+  readonly readOnlyTransactions: boolean;
+
+  /**
+   * Server settings as connection parameters (`options=-c name=value`), which
+   * is how `statementTimeoutMs` is applied. Else E017.
+   */
+  readonly connectionParameters: boolean;
+
+  /**
+   * A timed-out statement can be cancelled on the server with a protocol
+   * cancel request (node-postgres pools), so a timeout can report
+   * `outcome: 'not-executed'`.
+   */
+  readonly backendCancel: boolean;
+
+  /**
+   * A transaction can bound its own idle time on the server
+   * (`idle_in_transaction_session_timeout`), which a cursor stream's BEGIN sets
+   * as the backstop for its idle timeout.
+   */
+  readonly idleTransactionTimeout: boolean;
+
+  /**
+   * A failed statement aborts the whole transaction until it rolls back
+   * (PostgreSQL), so the next statement is refused locally rather than sent.
+   */
+  readonly abortsTransactionOnError: boolean;
+
+  /**
+   * What connection object backs a transaction, for `tx.$connection()` and
+   * Turbine's own type parsers: `'pg-compatible'` (a node-postgres client or a
+   * driver with its interface), `'engine-driver'` (the engine's own driver
+   * behind Turbine's pool shim), or `'none'` (no driver connection, E017).
+   */
+  readonly connectionDriver: 'pg-compatible' | 'engine-driver' | 'none';
+
+  /**
+   * The engine prepares every distinct statement text on the server, under a
+   * server-wide cap (MySQL's `max_prepared_stmt_count`), so per-statement text
+   * such as `sqlComment.dynamic` would exhaust it. Else allowed.
+   */
+  readonly preparesEveryStatement: boolean;
+
+  /**
+   * The SQL grammar the engine's statements are written in, which picks the
+   * lexer that screens raw SQL for transaction control (`COMMIT` inside
+   * `$transaction` and the rest). `null` is no SQL lexer (PowDB speaks PowQL),
+   * so nothing is screened.
+   */
+  readonly statementSyntax: 'postgresql' | 'mysql' | 'sqlite' | 'mssql' | null;
+
+  // ---- DDL --------------------------------------------------------------
+
+  /**
+   * A column's inline `REFERENCES` creates a foreign key. MySQL parses one and
+   * ignores it, so its foreign keys are table-level `FOREIGN KEY` clauses.
+   */
+  readonly inlineForeignKeys: boolean;
+
+  /**
+   * An unbounded text or binary column can be a key (primary, unique, index,
+   * foreign). MySQL and SQL Server refuse that, so a keyed `text` / `bytea`
+   * column is declared with a bounded type there.
+   */
+  readonly unboundedTextKeys: boolean;
+}
+
 export interface Dialect {
   /** Dialect identifier. */
   readonly name: DialectName;
+
+  /**
+   * What this engine can do. Every engine dialect sets its OWN object, never
+   * PostgreSQL's by inheritance; see {@link EngineCapabilities}.
+   */
+  readonly capabilities: EngineCapabilities;
 
   /**
    * How write statements surface their affected rows. PostgreSQL uses
@@ -367,9 +689,9 @@ export interface Dialect {
    * `jsonEncoding: 'positional'` mode. Emitting `json_build_array(v1, v2, …)`
    * instead of `json_build_object('k1', v1, …)` drops every repeated key name
    * from every nested object of every row (the decode side maps positions back
-   * to keys via a build-time shape descriptor). Postgres-only in v1, other
-   * engines never reach this because the builder gates positional encoding to
-   * `dialect.name === 'postgresql'`, so the method is optional on the contract.
+   * to keys via a build-time shape descriptor). Reached only on an engine
+   * whose {@link EngineCapabilities.positionalJson} is true (PostgreSQL), so
+   * the method is optional on the contract.
    */
   buildJsonArray?(exprs: string[]): string;
 
@@ -526,6 +848,43 @@ export interface Dialect {
   readonly supportsLateralJoin?: boolean;
 
   /**
+   * The row-lock strengths a locking read (`lock`) may use on this dialect.
+   * The builder appends `FOR <mode> OF <table>` after pagination for a mode in
+   * this list and throws {@link UnsupportedFeatureError} (E017) for any other.
+   * Optional: absent means none.
+   *
+   * Every engine dialect sets this as its OWN property, never by inheritance:
+   * each one spreads `postgresDialect`, which allows all four, so an engine
+   * that forgot it would silently emit PostgreSQL's locking clause. A unit test
+   * asserts `Object.hasOwn` for every engine.
+   */
+  readonly rowLockModes?: readonly RowLockMode[];
+
+  /**
+   * Whether `_percentile` aggregates compile here (`percentile_cont` /
+   * `percentile_disc ... WITHIN GROUP (ORDER BY ...)`). Optional: absent means
+   * E017. Set as an own property on every engine dialect, like
+   * {@link rowLockModes}.
+   */
+  readonly supportsPercentileAggregates?: boolean;
+
+  /**
+   * Whether `createMany({ onConflict })` (a multi-row upsert on one named
+   * unique key) compiles here. Optional: absent means E017. Set as an own
+   * property on every engine dialect, like {@link rowLockModes}.
+   */
+  readonly supportsBulkUpsert?: boolean;
+
+  /**
+   * The alias this dialect's upsert statement gives its target table (SQL
+   * Server's `MERGE ... AS T`), which the conflict-UPDATE's column references
+   * must use. Absent: the statement names the table directly and references
+   * are qualified with the table name. Set only by an engine whose upsert
+   * aliases its target, so no other engine can inherit it.
+   */
+  readonly upsertTargetAlias?: string;
+
+  /**
    * How this dialect surfaces a query plan for a compiled SELECT. When present,
    * `QueryInterface.explain()` prepends `prefix` (plus a single space) to the
    * compiled findMany SQL and runs it as a read, returning the plan text lines.
@@ -569,6 +928,16 @@ export interface Dialect {
   /** Build an upsert statement. Inputs are SQL-ready quoted fragments. */
   buildUpsertStatement(input: UpsertStatementInput): string;
 
+  /**
+   * Build a multi-row upsert (`createMany({ onConflict })`): insert the rows
+   * and, for each row whose conflict key already exists, run `input.update`'s
+   * assignments or skip it. Returns the statement and its params, the row
+   * values first. Reached only when {@link supportsBulkUpsert} is true, and
+   * every engine that sets that flag implements this itself (each one's
+   * grammar differs), so the PostgreSQL version is never inherited by use.
+   */
+  buildBulkUpsertStatement?(input: BulkUpsertStatementInput): BuiltStatement;
+
   /** Whether native ILIKE is supported. */
   readonly supportsILike: boolean;
 
@@ -591,12 +960,36 @@ export interface Dialect {
    * of the ENGINE's pattern grammar, not of the SQL text, which is why it is a
    * dialect hook rather than a branch in the where builder.
    *
-   * Whatever a dialect returns MUST be escaped for the same `ESCAPE '\'`
-   * clause, i.e. a backslash prefix, and MUST be identical on the SQL-build and
-   * the cache-hit param-collect paths (both call this one hook, so they cannot
-   * drift).
+   * Whatever a dialect returns MUST be escaped for the character its
+   * {@link likeEscapeCharacter} names (a backslash when that is absent), and
+   * MUST be identical on the SQL-build and the cache-hit param-collect paths
+   * (both call this one hook, so they cannot drift). A dialect that sets
+   * `likeEscapeCharacter` must define this hook too: the shared default
+   * escapes with a backslash.
    */
   escapeLikePattern?(value: string): string;
+
+  /**
+   * The character the emitted `LIKE ... ESCAPE '<c>'` clause names, which
+   * {@link escapeLikePattern} prefixes to every metacharacter it escapes.
+   * Optional: absent means `\`, the clause every other engine emits, and it is
+   * absent on `postgresDialect`, so a dialect built by spreading it inherits
+   * nothing.
+   *
+   * MySQL sets it because a backslash cannot be written as a string literal
+   * that means the same thing in every session. With the server default
+   * `sql_mode`, `\` escapes inside a literal and `ESCAPE '\'` is an
+   * unterminated string (a syntax error); with `NO_BACKSLASH_ESCAPES` it is one
+   * backslash. Turbine sets that mode on the connections it opens, but a pool
+   * the caller supplies keeps the caller's mode, and changing a session mode on
+   * a connection Turbine does not own would change how the caller's own SQL
+   * parses. A character with no meaning inside a string literal reads the same
+   * in both modes.
+   *
+   * It must be one character that needs no escaping inside a single-quoted
+   * literal (never `'` or `\`) and is not itself a LIKE metacharacter.
+   */
+  readonly likeEscapeCharacter?: string;
 
   /** JSON operator support level for this dialect. */
   readonly jsonPathSupport: 'native' | 'function' | 'limited';
@@ -606,6 +999,20 @@ export interface Dialect {
 
   /** Build a JSON path text extraction expression. */
   buildJsonPathExtract(column: string, pathParamRef: string): string;
+
+  /**
+   * `{ path, equals }` (and a whole-document `equals`, see
+   * {@link JsonPathEqualsInput.pathRef}) as a TYPED comparison: the JSON value
+   * equals the operand as JSON, so `5` and `"5"` differ and `true` does not
+   * match `1`.
+   * Throws `UnsupportedFeatureError` (E017) for an operand the engine cannot
+   * compare exactly. OPTIONAL and deliberately absent on `postgresDialect`
+   * (the where compiler owns the PostgreSQL form, read when
+   * {@link EngineCapabilities.jsonDocumentEquality} is `'jsonb'`), so no engine
+   * inherits it by spreading; an engine without it compares the text its
+   * `buildJsonPathExtract` returns.
+   */
+  buildJsonPathEquals?(input: JsonPathEqualsInput): string;
 
   /** Build a correlation clause across single or composite keys. */
   buildCorrelation(
@@ -638,6 +1045,20 @@ export interface Dialect {
    */
   jsonWireRule?(columnType: string): JsonWireRule | undefined;
 
+  /**
+   * How a value the driver hands back for a column of `columnType` (a schema
+   * type, e.g. `jsonb`) becomes the value PostgreSQL returns for it, or
+   * `undefined` when the driver's value already is that. The row parser applies
+   * it to top-level and nested rows alike, so the two cannot disagree.
+   *
+   * For an engine whose STORAGE differs from the declared type in a way only
+   * the schema knows: SQL Server has no JSON column type (2016 to 2022), so a
+   * json/jsonb column is NVARCHAR text on every read path. The decode must be
+   * safe to apply to exactly what the driver and the engine's JSON builder
+   * produce, once. Optional, and absent on PostgreSQL.
+   */
+  decodeColumnValue?(columnType: string): ((value: unknown) => unknown) | undefined;
+
   /** Optional type mapping hook for code generation/introspection. */
   typeToTypeScript?(dialectType: string, nullable: boolean): string;
 
@@ -652,23 +1073,72 @@ export interface Dialect {
   castAggregate?(expr: string, target: 'int' | 'float'): string;
 
   /**
+   * The argument `AVG` takes for a column of `columnType`, given the column
+   * reference, or `undefined` to average the column as it is. PostgreSQL's
+   * `avg` over an integer column is an exact fraction (`avg(int4)` is
+   * `numeric`), while SQL Server averages an INT as an INT (56.4 becomes 56)
+   * and MySQL as a DECIMAL with four more digits of scale (4/3 becomes
+   * 1.3333). An engine like that widens the input instead. Optional, and
+   * absent on PostgreSQL, so its SQL is unchanged.
+   */
+  averageArgument?(columnRef: string, columnType: string): string | undefined;
+
+  /**
    * Build a membership (`IN` / `NOT IN`) predicate from a column/expression and
    * a single bound parameter reference. PostgreSQL binds the whole list as one
    * array param (`expr = ANY($n)` / `expr != ALL($n)`), so the placeholder count
    * stays independent of the list length and the SQL cache remains valid.
-   * Engines without array parameters (SQLite) override this together with
-   * {@link inClauseParam} to use a length-independent single-placeholder form
-   * (e.g. `expr IN (SELECT value FROM json_each(?))`). Optional: the query
-   * builder falls back to the PostgreSQL `ANY`/`ALL` form when absent.
+   * Engines without array parameters override this together with
+   * {@link inClauseParam}: SQLite and SQL Server unpack one bound JSON list in a
+   * subquery, and MySQL emits `expr IN (:pN)`, which its pool shim expands into
+   * one placeholder per element. The builder's text stays length-independent
+   * either way. Optional: the query builder falls back to the PostgreSQL
+   * `ANY`/`ALL` form when absent.
    */
   buildInClause?(expr: string, paramRef: string, negated: boolean): string;
 
   /**
    * The single bound value for an `IN` list (paired with {@link buildInClause}).
-   * PostgreSQL passes the array through unchanged; SQLite serializes it to a
-   * JSON string consumed by `json_each`. Optional: defaults to the array itself.
+   * PostgreSQL passes the array through unchanged; SQLite and SQL Server
+   * serialize it to JSON, element by element as the scalar binds; MySQL wraps it
+   * for its shim to expand. Optional: defaults to the array itself.
    */
   inClauseParam?(values: unknown[]): unknown;
+
+  /**
+   * Check a string about to be written to a column: return the refusal
+   * message, or `undefined` to bind the string as is. `columnType` is the
+   * column's declared (PostgreSQL-flavored) type. The write path throws the
+   * message as a ValidationError (E003) before any SQL runs.
+   *
+   * Optional, and absent on every engine whose server refuses text its column
+   * cannot hold (PostgreSQL, MySQL in strict mode, SQL Server), where the
+   * server's error is the refusal. SQLite defines it, because its type affinity
+   * stores such text in a numeric column instead of refusing it. Only the
+   * SQLite dialect sets it and no dialect spreads SQLite's, so testing for its
+   * presence is sound (unlike a hook on `postgresDialect`, which every engine
+   * inherits).
+   */
+  checkTextWrite?(table: string, column: string, columnType: string, value: string): string | undefined;
+
+  /**
+   * How `schemaToSQL` declares a column of a schema-level enum on an engine
+   * with no named enum type. Returns the column's type as an input to this
+   * dialect's own `buildColumnType`, and optionally a CHECK expression over
+   * `column` (already quoted) that admits exactly the labels. Throws E003 for a
+   * label the engine cannot declare.
+   *
+   * PostgreSQL does not use it: it declares the type with `CREATE TYPE ... AS
+   * ENUM` and the column names the type. `schemaToSQL` decides that by
+   * {@link EngineCapabilities.namedEnumTypes}, not by this hook's absence; an
+   * engine without named enum types that does not define the hook gets an
+   * UnsupportedFeatureError (E017) for an enum column instead of PostgreSQL's
+   * DDL.
+   */
+  buildEnumColumn?(
+    column: string,
+    labels: readonly string[],
+  ): { type: string; maxLength?: number | null; check?: string };
 
   /** Optional array-cast hook for bulk insert implementations. */
   arrayType?(baseType: string): string;
@@ -754,8 +1224,9 @@ export interface Dialect {
 
   /**
    * Schema introspector for this engine. `introspect()` routes through it so
-   * engines can override the catalog SQL. PostgreSQL wraps the
-   * information_schema / pg_catalog reader in `introspect.ts`.
+   * engines can override the catalog SQL. Absent on PostgreSQL, whose
+   * information_schema / pg_catalog reader in `introspect.ts` is what
+   * `introspect()` uses when a dialect has no introspector.
    */
   readonly introspector?: DialectIntrospector;
 
@@ -809,8 +1280,10 @@ export interface Dialect {
    * correct but unbounded in bytes over the wire (200 parents x ~505 children
    * with `limit: 3` measured 101,000 rows fetched to keep 600, +52.9 MB peak
    * heap against +0.5 MB for the join plan), which is why PostgreSQL
-   * implements it. Only PostgreSQL does in this release; the other engines keep
-   * the client-side slice, so their emitted SQL is byte-identical to before.
+   * implements it. The loader uses it only where
+   * {@link EngineCapabilities.partitionLimitPushdown} is true (PostgreSQL in
+   * this release), since every engine inherits this hook by spreading; the
+   * other engines keep the client-side slice.
    *
    * The client-side slice is NOT removed when a dialect implements this: it
    * stays as the belt-and-braces bound, and is a no-op once the engine has
@@ -833,6 +1306,12 @@ export interface IntrospectOptions {
   schema?: string;
   include?: string[];
   exclude?: string[];
+  /**
+   * Where relation-naming notes go (a renamed or shadowing relation). Absent
+   * means the console logger. `introspect()` hands an engine introspector its
+   * whole options object, so this is the caller's `IntrospectOptions.logger`.
+   */
+  logger?: TurbineLogger;
 }
 
 /**
@@ -847,9 +1326,104 @@ export interface DialectMigrator {
   releaseLock(lockId: number): Promise<void>;
 }
 
+/** The bind-parameter limit for one statement on this dialect, or `undefined` when it has none. */
+export function maxBindParameters(dialect: Pick<Dialect, 'capabilities'>): number | undefined {
+  const limit = dialect.capabilities.maxBindParameters;
+  return Number.isFinite(limit) ? limit : undefined;
+}
+
+/**
+ * PostgreSQL's multi-row `INSERT INTO t (cols) ...` with no conflict clause and
+ * no RETURNING: the shared body of `createMany` and its `onConflict` form.
+ *
+ * The default is `SELECT * FROM UNNEST($1::text[], ...)`, one bound array per
+ * COLUMN. The row-major form (`requireRowValues`) is required when a target
+ * column is itself array-typed, because the UNNEST transpose flattens nested
+ * arrays: one placeholder per cell instead of per column.
+ */
+function pgBulkInsertBody(dialect: Dialect, input: BulkInsertStatementInput): BuiltStatement {
+  if (!input.columnArrayTypes || input.columnArrayTypes.length !== input.columns.length) {
+    throw new ValidationError(
+      `createMany bulk insert into "${input.table}": columnArrayTypes must supply one UNNEST cast ` +
+        `per column, got ${input.columnArrayTypes?.length ?? 0} for ${input.columns.length} columns ` +
+        `(${input.columns.join(', ')}). Schema metadata is missing a pgType for at least one column; ` +
+        'regenerate it with `npx turbine generate`.',
+    );
+  }
+  if (input.requireRowValues) {
+    const params: unknown[] = [];
+    const tuples = input.rowValues.map((row) => {
+      const cells = input.columns.map((_, i) => {
+        params.push(row[i]);
+        // No cast: PostgreSQL infers each parameter's type from the INSERT
+        // target column, which is what single-row `create` already relies on
+        // and is what makes arrays and enums both work here. The casts in
+        // `columnArrayTypes` are ARRAY-OF-column-type, correct for the
+        // UNNEST transpose but wrong for an individual cell.
+        return dialect.paramPlaceholder(params.length);
+      });
+      return `(${cells.join(', ')})`;
+    });
+    return { sql: `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES ${tuples.join(', ')}`, params };
+  }
+  const columnArrays = input.columns.map((_, columnIndex) => input.rowValues.map((row) => row[columnIndex]));
+  const unnestArgs = input.columns.map((_, i) => `${dialect.paramPlaceholder(i + 1)}::${input.columnArrayTypes![i]}`);
+  return {
+    sql: `INSERT INTO ${input.table} (${input.columns.join(', ')}) SELECT * FROM UNNEST(${unnestArgs.join(', ')})`,
+    params: columnArrays,
+  };
+}
+
+/**
+ * `DO NOTHING`, or `DO UPDATE SET ... [WHERE ...]`: the action of an
+ * `ON CONFLICT (target)` clause, shared by PostgreSQL and SQLite, whose
+ * grammars agree here. The update compiles after the row values are bound.
+ */
+export function onConflictAction(input: BulkUpsertStatementInput, params: unknown[], refs: BulkUpsertRefs): string {
+  if (!input.update) return 'DO NOTHING';
+  const update = input.update(params, refs);
+  return `DO UPDATE SET ${update.setClauses.join(', ')}${update.where ? ` WHERE ${update.where}` : ''}`;
+}
+
 /** PostgreSQL implementation of the dialect contract. */
 export const postgresDialect: Dialect = {
   name: 'postgresql',
+  capabilities: Object.freeze({
+    distinctOn: true,
+    positionalJson: true,
+    nullsOrderingClause: true,
+    nullsSortHigh: true,
+    insensitiveInList: true,
+    jsonDocumentEquality: 'jsonb',
+    jsonExtractTyped: false,
+    jsonExactNumericCast: true,
+    numericTextComparison: false,
+    enforcesForeignKeys: true,
+    partitionLimitPushdown: true,
+    utcTimestampRewrite: true,
+    paramTypeCasts: true,
+    namedEnumTypes: true,
+    structuredValueColumns: 'pg-scalars',
+    // Counted in a 16-bit field.
+    maxBindParameters: 65535,
+    maxInsertRows: Number.POSITIVE_INFINITY,
+    upsertConflictTarget: 'explicit',
+    setClauseOrder: 'snapshot',
+    reselectLocksRows: false,
+    integerDivision: '/',
+    updateExpressions: true,
+    bulkUpsertAppliesRepeatedKeys: false,
+    readOnlyTransactions: true,
+    connectionParameters: true,
+    backendCancel: true,
+    idleTransactionTimeout: true,
+    abortsTransactionOnError: true,
+    connectionDriver: 'pg-compatible',
+    preparesEveryStatement: false,
+    statementSyntax: 'postgresql',
+    inlineForeignKeys: true,
+    unboundedTextKeys: true,
+  } satisfies EngineCapabilities),
   resultStrategy: 'returning',
   supportsReturning: true,
   supportsUpsertUpdateWhere: true,
@@ -867,6 +1441,9 @@ export const postgresDialect: Dialect = {
   supportsAdvisoryLock: true,
   supportsPlanCacheMode: true,
   supportsLateralJoin: true,
+  rowLockModes: ['update', 'noKeyUpdate', 'share', 'keyShare'],
+  supportsPercentileAggregates: true,
+  supportsBulkUpsert: true,
   explainQuery: { prefix: 'EXPLAIN' },
 
   paramPlaceholder(index: number): string {
@@ -929,42 +1506,23 @@ export const postgresDialect: Dialect = {
   },
 
   buildBulkInsertStatement(input: BulkInsertStatementInput): BuiltStatement {
-    if (!input.columnArrayTypes || input.columnArrayTypes.length !== input.columns.length) {
-      throw new ValidationError(
-        `createMany bulk insert into "${input.table}": columnArrayTypes must supply one UNNEST cast ` +
-          `per column, got ${input.columnArrayTypes?.length ?? 0} for ${input.columns.length} columns ` +
-          `(${input.columns.join(', ')}). Schema metadata is missing a pgType for at least one column; ` +
-          'regenerate it with `npx turbine generate`.',
-      );
-    }
+    const body = pgBulkInsertBody(this, input);
+    const conflict = input.skipDuplicates ? ' ON CONFLICT DO NOTHING' : '';
+    return { sql: `${body.sql}${conflict}${this.buildReturningClause(input.returning)}`, params: body.params };
+  },
 
-    // Row-major form: required when a target column is itself array-typed,
-    // because the UNNEST transpose below flattens nested arrays (see
-    // `requireRowValues`). One placeholder per cell instead of per column.
-    if (input.requireRowValues) {
-      const params: unknown[] = [];
-      const tuples = input.rowValues.map((row) => {
-        const cells = input.columns.map((_, i) => {
-          params.push(row[i]);
-          // No cast: PostgreSQL infers each parameter's type from the INSERT
-          // target column, which is what single-row `create` already relies on
-          // and is what makes arrays and enums both work here. The casts in
-          // `columnArrayTypes` are ARRAY-OF-column-type, correct for the
-          // UNNEST transpose below but wrong for an individual cell.
-          return this.paramPlaceholder(params.length);
-        });
-        return `(${cells.join(', ')})`;
-      });
-      let rowSql = `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES ${tuples.join(', ')}`;
-      if (input.skipDuplicates) rowSql += ' ON CONFLICT DO NOTHING';
-      return { sql: `${rowSql}${this.buildReturningClause(input.returning)}`, params };
-    }
-
-    const columnArrays = input.columns.map((_, columnIndex) => input.rowValues.map((row) => row[columnIndex]));
-    const unnestArgs = input.columns.map((_, i) => `${this.paramPlaceholder(i + 1)}::${input.columnArrayTypes![i]}`);
-    let sql = `INSERT INTO ${input.table} (${input.columns.join(', ')}) SELECT * FROM UNNEST(${unnestArgs.join(', ')})`;
-    if (input.skipDuplicates) sql += ' ON CONFLICT DO NOTHING';
-    return { sql: `${sql}${this.buildReturningClause(input.returning)}`, params: columnArrays };
+  buildBulkUpsertStatement(input: BulkUpsertStatementInput): BuiltStatement {
+    // `INSERT ... SELECT * FROM UNNEST(...) ON CONFLICT ... DO UPDATE ... WHERE
+    // ... RETURNING` is valid as is: PostgreSQL has no parse ambiguity between
+    // the SELECT and the conflict clause.
+    const body = pgBulkInsertBody(this, input);
+    return {
+      sql:
+        `${body.sql} ON CONFLICT (${input.conflictColumns.join(', ')}) ` +
+        onConflictAction(input, body.params, { target: input.table, incoming: 'EXCLUDED' }) +
+        this.buildReturningClause(input.returning),
+      params: body.params,
+    };
   },
 
   buildDefaultValuesInsertStatement(input: DefaultValuesInsertStatementInput): string {
@@ -1229,13 +1787,10 @@ export const postgresDialect: Dialect = {
     }
   },
 
-  // Postgres introspection wraps the information_schema / pg_catalog reader in
-  // introspect.ts. A dynamic import keeps the static graph acyclic (introspect.ts
-  // imports postgresDialect) and calls the raw catalog reader (never the router).
-  introspector: {
-    async introspect(options) {
-      const { introspectPostgresCatalog } = await import('./introspect.js');
-      return introspectPostgresCatalog(options);
-    },
-  },
+  // No `introspector`: `introspect()` reads the PostgreSQL catalog itself when a
+  // dialect has none. A field here would have to reach introspect.ts through a
+  // dynamic import (introspect.ts imports this dialect), and a bundler without
+  // code splitting inlines that import WHOLE, which put the entire catalog
+  // reader into the serverless entry and every engine entry (4 to 6 kB brotli
+  // each) for a function none of them call at runtime.
 };

@@ -138,7 +138,7 @@ await db.$transaction(async (tx) => {
 });
 ```
 
-Nested `$transaction` calls become SAVEPOINTs. Isolation levels, timeouts, and `sessionContext` (transaction-local GUCs for Postgres RLS) are options. `tx` deliberately exposes a smaller surface than `db`; reaching for a client-only member is a compile error, not a production surprise. Reference: [turbineorm.dev/transactions](https://turbineorm.dev/transactions).
+Nested `$transaction` calls become SAVEPOINTs. Isolation levels, timeouts, and `sessionContext` (transaction-local GUCs for Postgres RLS) are options. A transaction PostgreSQL rolled back (a statement failed and the callback caught it) rejects instead of reporting a commit, and a `tx` used after its callback settles throws rather than running outside the transaction. `tx` deliberately exposes a smaller surface than `db`; reaching for a client-only member is a compile error, not a production surprise. Reference: [turbineorm.dev/transactions](https://turbineorm.dev/transactions).
 
 ### Pipelining, at the protocol level
 
@@ -191,7 +191,7 @@ const db = turbine({
 });
 ```
 
-A global filter is a `WhereClause` that is AND-merged into every query on a table: reads, relation subqueries targeting it, and the predicates of `update` / `delete` / `upsert`. Values are parameterized. Details: [turbineorm.dev/global-filters](https://turbineorm.dev/global-filters).
+A global filter is a `WhereClause` that is AND-merged into every query on a table: reads, relation subqueries targeting it, and the predicates of `update` / `delete` / `upsert`. Values are parameterized. Keys may be table names or client accessors and are checked when the client is built, and a function filter that returns `undefined` throws instead of running unfiltered. Details: [turbineorm.dev/global-filters](https://turbineorm.dev/global-filters).
 
 ### The UNSAFE symbol
 
@@ -217,7 +217,7 @@ try {
 }
 ```
 
-Every error Turbine raises extends `TurbineError` with a stable code (`TURBINE_E001` through `E018`) and a `docsUrl`; a driver error whose SQLSTATE Turbine does not map stays the driver's own error, carrying that SQLSTATE on `.code`. Error messages carry keys, never values: a `NotFoundError` says `where: { id, email }` without printing the email, so errors are safe to forward to a tracker without a scrubbing rule. Retryable failures (`DeadlockError`, `SerializationFailureError`) expose `isRetryable: true` as a typed const. `err.code` is the check that survives a mixed ESM/CJS module graph, where two copies of the package hold two copies of every class; since 0.78 `instanceof` works across copies too, through a cross-copy brand on every error. Full table: [turbineorm.dev/errors](https://turbineorm.dev/errors).
+Every error Turbine raises extends `TurbineError` with a stable code (`TURBINE_E001` through `E020`) and a `docsUrl`; a driver error whose SQLSTATE Turbine does not map stays the driver's own error, carrying that SQLSTATE on `.code`. Error messages carry keys, never values: a `NotFoundError` says `where: { id, email }` without printing the email, so errors are safe to forward to a tracker without a scrubbing rule. Retryable failures (`DeadlockError`, `SerializationFailureError` and its subclass `LockNotAvailableError`) expose `isRetryable: true` as a typed const. `err.code` is the check that survives a mixed ESM/CJS module graph, where two copies of the package hold two copies of every class; since 0.78 `instanceof` works across copies too, through a cross-copy brand on every error. Full table: [turbineorm.dev/errors](https://turbineorm.dev/errors).
 
 ## Built for agents
 
@@ -254,7 +254,7 @@ The rest of the agent story is structural: query args are fully typed, so a wron
 
 **Destructive migrations need consent.** `migrate up`, `migrate down`, and `push` scan for `DROP TABLE`, `DROP COLUMN`, `TRUNCATE`, unqualified `DELETE` / `UPDATE`, and `ALTER COLUMN ... TYPE`, print an itemized report, and refuse. Interactively you type `destroy my data`, then `yes`; in CI you pass `--allow-destructive`. A refused batch applies nothing. Migrations are SQL files, checksummed with SHA-256, applied under `pg_try_advisory_lock()`.
 
-**PII stays in the database.** Tag a column `pii: true` in the schema and it is excluded from every default projection at the SQL level: `RETURNING "id", "name"` instead of `RETURNING *`. It is also refused as a `groupBy` key and a `_min` / `_max` target. Reading it back takes `includePii: UNSAFE`, per query. A schema with no tagged column emits byte-identical SQL.
+**PII stays in the database.** Tag a column `pii: true` in the schema and it is excluded from every default projection at the SQL level: `RETURNING "id", "name"` instead of `RETURNING *`. It is also refused as a `groupBy` key and a `_min` / `_max` target. Reading it back takes `includePii: UNSAFE`, per query, and naming it in `select` without that throws. A schema with no tagged column emits byte-identical SQL.
 
 **Studio is read-only by default.** `npx turbine studio` binds loopback, authenticates with a per-process token, runs every read inside `BEGIN READ ONLY`, and has no raw-SQL surface: queries are composed in a builder validated identifier by identifier. Without `--write`, the write endpoints do not exist in the router. PII cells are redacted server-side. Try it with no database: `npx turbine-orm@latest studio --demo` boots a seeded in-memory sample. Docs: [turbineorm.dev/studio](https://turbineorm.dev/studio).
 
@@ -272,7 +272,7 @@ Going deep on one database means the parts other ORMs push to raw SQL are typed 
 
 ## Serverless and edge
 
-The core is driver-agnostic: hand any pg-compatible pool to `turbineHttp()` and Turbine runs on Vercel Edge, Cloudflare Workers, Deno Deploy, or anywhere else without TCP. The main entry's import graph is held under **93 kB brotli** (edge entry under **74 kB**) with `pg` external, enforced by `size-limit` in CI at those exact numbers; run `npm run size` for the current figure.
+The core is driver-agnostic: hand any pg-compatible pool to `turbineHttp()` and Turbine runs on Vercel Edge, Cloudflare Workers, Deno Deploy, or anywhere else without TCP. The main entry's import graph is held under **147 kB brotli** (edge entry under **116 kB**) with `pg` external, enforced by `size-limit` in CI at those exact numbers; run `npm run size` for the current figure.
 
 ```typescript
 import { Pool } from '@neondatabase/serverless';
@@ -329,7 +329,7 @@ const schema = defineSchema({
 
 const db = turbineSqlite(':memory:', schemaDefToMetadata(schema));
 for (const stmt of schemaToSQL(schema, { dialect: sqliteDialect })) {
-  await db.raw([stmt] as never);
+  await db.rawUnsafe(stmt);
 }
 
 const users = await db
@@ -355,24 +355,24 @@ It is also built to be extended rather than wrapped. All SQL generation routes t
 
 ## Comparison
 
-| | **Turbine** | **Prisma** | **Drizzle** | **Kysely** |
-|---|---|---|---|---|
-| **Engine / runtime** | No engine binary (`pg` only) | Client + TS/WASM query compiler | No engine | No engine |
-| **Runtime deps** | 1 (`pg`) | `@prisma/client` + required driver adapter | 0 | 0 |
-| **Main bundle (brotli)** | under 93 kB import graph (CI-enforced), `pg` external | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small |
-| **Studio** | Read-only by default | Full CRUD, cloud-hosted | Full CRUD; [Gateway](https://gateway.drizzle.team/) self-hosted, free | None |
-| **Error PII safety** | Keys only by default | Values in messages | Raw pg errors | Raw pg errors |
-| **Migrations** | SQL-first, SHA-256 checksums | DSL-generated, shadow DB | SQL or Drizzle Kit | None |
-| **Edge runtime** | One import swap, under 74 kB brotli (CI-enforced) | Driver adapter + WASM compiler | Native | Native |
-| **Pipeline batching** | Parse/Bind/Execute protocol | Sequential in txn | Sequential | Manual |
-| **Typed errors** | `isRetryable` discriminant | Error codes only | None | None |
-| **Nested relations** | 1 query, deep type inference | 1 query per relation by default; single-query `relationJoins` is Preview | 1 query, `relations()` re-declaration | Manual (`jsonArrayFrom`) |
-| **Index advice** | `turbine doctor`, offline, `--fix` | Optimize retired March 2026 (cloud Query Insights) | None | None |
-| **MCP server for agents** | 11 read-only tools, PII-redacted | Official MCP server | `drizzle-kit mcp` | None |
-| **Vector search** | Built-in `distance` / KNN | Preview / raw | Extension API | Manual |
-| **LISTEN/NOTIFY** | `$listen` / `$notify` | None | None | None |
+| | **Turbine** | **Prisma** | **Drizzle** | **Kysely** | **MikroORM** |
+|---|---|---|---|---|---|
+| **Engine / runtime** | No engine binary (`pg` only) | Client + TS/WASM query compiler | No engine | No engine | Kysely as query runner; SQL built by MikroORM (v7) |
+| **Runtime deps** | 1 (`pg`) | `@prisma/client` + required driver adapter | 0 | 0 | `@mikro-orm/core` (0 deps) + a driver package |
+| **Main bundle (brotli)** | under 147 kB import graph (CI-enforced), `pg` external | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small | |
+| **Studio** | Read-only by default | Full CRUD, cloud-hosted | Full CRUD; [Gateway](https://gateway.drizzle.team/) self-hosted, free | None | AdminJS integration guide (CRUD panel) |
+| **Error PII safety** | Keys only by default | Values in messages | Raw pg errors | Raw pg errors | |
+| **Migrations** | SQL-first, SHA-256 checksums | DSL-generated, shadow DB | SQL or Drizzle Kit | None | Generated by diffing entities against a snapshot or the database; TS/JS classes |
+| **Edge runtime** | One import swap, under 116 kB brotli (CI-enforced) | Driver adapter + WASM compiler | Native | Native | Cloudflare Workers and Deno (v7) |
+| **Pipeline batching** | Parse/Bind/Execute protocol | Sequential in txn | Sequential | Manual | `flush()` runs queued changes in one transaction |
+| **Typed errors** | `isRetryable` discriminant | Error codes only | None | None | `DriverException` subclasses (`UniqueConstraintViolationException`, ...) |
+| **Nested relations** | 1 query, deep type inference | 1 query per relation by default; single-query `relationJoins` is Preview | 1 query, `relations()` re-declaration | Manual (`jsonArrayFrom`) | `populate`; default `balanced`: joins to-one, one query per to-many relation |
+| **Index advice** | `turbine doctor`, offline, `--fix` | Optimize retired March 2026 (cloud Query Insights) | None | None | |
+| **MCP server for agents** | 11 read-only tools, PII-redacted | Official MCP server | `drizzle-kit mcp` | None | |
+| **Vector search** | Built-in `distance` / KNN | Preview / raw | Extension API | Manual | |
+| **LISTEN/NOTIFY** | `$listen` / `$notify` | None | None | None | |
 
-Competitor columns last checked 2026-08-22, against Prisma 7 and Drizzle 0.45 (the current `latest`; 1.0 is at rc.4). Cells that make a claim about someone else's pricing or licensing carry a link to that vendor's own page, because those are the cells that go stale silently: this table said Drizzle's Gateway was paid, which was true of the old Drizzle Studio subscription and is not true of Gateway, and nothing in the repo would have caught it. Features marked Preview may change; bundle sizes move release to release. The longer version of this argument, including what is not a reason to switch: [turbineorm.dev/why-turbine](https://turbineorm.dev/why-turbine).
+Competitor columns last checked 2026-08-22, against Prisma 7 and Drizzle 0.45 (the current `latest`; 1.0 is at rc.4). The MikroORM column was checked 2026-10-13 against its 7.2 documentation; a blank cell is one that documentation does not settle. Cells that make a claim about someone else's pricing or licensing carry a link to that vendor's own page, because those are the cells that go stale silently: this table said Drizzle's Gateway was paid, which was true of the old Drizzle Studio subscription and is not true of Gateway, and nothing in the repo would have caught it. Features marked Preview may change; bundle sizes move release to release. The longer version of this argument, including what is not a reason to switch: [turbineorm.dev/why-turbine](https://turbineorm.dev/why-turbine).
 
 ## Limitations
 
@@ -388,13 +388,14 @@ Stated so you do not find out three weeks in:
 | Postgres | TypeScript | Notes |
 |---|---|---|
 | `int2`, `int4`, `float4`, `float8` | `number` | |
-| `int8` / `bigint` | `number` | Values above `Number.MAX_SAFE_INTEGER` come back as `string` to avoid precision loss |
+| `int8` / `bigint` | `number` | Values above `Number.MAX_SAFE_INTEGER` come back as `string` to avoid precision loss; `bigint[]` reads as `string[]` |
 | `numeric`, `money` | `string` | Arbitrary precision, kept exact |
 | `text`, `varchar`, `uuid`, `citext` | `string` | |
 | `timestamptz`, `timestamp`, `date` | `Date` | Zone-less columns read and write as UTC by default (`utcTimestamps`); the full temporal semantics, including `temporalInfinity`, are at [turbineorm.dev/schema](https://turbineorm.dev/schema#zone-less-columns-timestamp-and-date-read-as-utc) |
 | `boolean` | `boolean` | |
 | `json`, `jsonb` | `unknown` | |
 | `bytea` | `Buffer` | |
+| `interval`, `point`, `circle` | object | The driver's parsed form, for example `{ x, y }` for a point |
 | Array types | `T[]` | |
 
 ## Examples

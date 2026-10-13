@@ -13,10 +13,13 @@
 
 import { acquireConnection, type Checkout, openCheckout } from '../checkout.js';
 import { settleEventLoop } from '../connection-guard.js';
+import { type ResolvedDiagnostics, resolveDiagnostics } from '../diagnostics.js';
 import type { Dialect, StreamableConnection } from '../dialect.js';
 import { postgresDialect } from '../dialect.js';
 import {
   explainConnectionLoss,
+  INVARIANT_REPORT_HINT,
+  InvariantError,
   isStaleConnectionError,
   NotFoundError,
   TimeoutError,
@@ -25,6 +28,7 @@ import {
   wrapPgError,
 } from '../errors.js';
 import { missingIndexForRelation, schemaHasIndexInfo } from '../index-advisor.js';
+import { consoleLogger, logTo, type TurbineLogger } from '../logger.js';
 import {
   executeNestedCreate,
   executeNestedUpdate,
@@ -35,6 +39,7 @@ import {
 import type { PgCompatPool, PgCompatQueryConfig, PgCompatQueryResult } from '../pg-types.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { normalizeKeyColumns, snakeToCamel } from '../schema.js';
+import { type TransactionState, transactionStateOf, withSavepoint } from '../transaction-state.js';
 import * as aggMod from './aggregates.js';
 import {
   assertProjectionShape,
@@ -52,28 +57,59 @@ import {
   assertMutationWhereIdentifiesOneRow,
   assertWhereIdentifiesOneRow,
   expandCompoundUniqueWhere,
+  uniqueKeyNames,
+  whereIdentifiesOneRow,
 } from './compound-unique.js';
+import { resolveExcludedFromCreate } from './expr.js';
 import {
+  cursorFieldValue,
   dedupeColumnList,
   dedupeOrderEntries,
   isEmptyOrderBy,
   isJsonPathOrderBy,
-  isOrderBySpec,
   isRelationPickOrderBy,
   isVectorOrderBy,
-  isWhereOperator,
+  normalizeOrderBy,
+  operandColumnKind,
   orderByEntries,
   sortedEntries,
 } from './filters.js';
+import {
+  assertCursorNotEmptied,
+  assertCursorWritten,
+  assertWhereNotEmptiedByPruning,
+  hasCursor,
+  isCursorInclusive,
+  pruneUndefinedArgs,
+} from './normalize-args.js';
 import { warnUnknownQueryOptions } from './option-surface.js';
-import { applyStableRelationOrderTo, normalizeWithClause } from './relation-names.js';
+import { applyStableRelationOrderTo, normalizeWithClause, normalizeWithPagination } from './relation-names.js';
 import * as relationsMod from './relations.js';
+import {
+  lockOnStreamMessage,
+  lockOutsideTransactionMessage,
+  lockWithDistinctMessage,
+  type ResolvedRowLock,
+  resolveRowLock,
+} from './row-lock.js';
+import { resolveSqlComment, type SqlCommenter } from './sql-comment.js';
+import {
+  DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+  newStreamIdleState,
+  resolveStreamIdleTimeout,
+  StreamIdleGuard,
+  type StreamIdleState,
+  streamBackstopStatement,
+  streamIdleExpiredError,
+  watchStreamConnection,
+} from './stream-idle.js';
 import type {
   AggregateArgs,
-  AggregateResult,
+  AggregateResultOf,
   CountArgs,
   CreateArgs,
   CreateManyArgs,
+  DefaultInputTypes,
   DeleteArgs,
   DeleteManyArgs,
   FieldResult,
@@ -86,11 +122,14 @@ import type {
   JsonEncoding,
   JsonPathOrderBy,
   OrderByClause,
+  OrderBySpec,
+  OrderDirection,
   QueryResult,
   RelationLoadStrategy,
   RelationPickOrderBy,
   ResolvedSkipGlobalFilters,
   SkipGlobalFilters,
+  TableInputTypes,
   TypedWithClause,
   UpdateArgs,
   UpdateManyArgs,
@@ -102,110 +141,80 @@ import type {
 } from './types.js';
 import { resolveSkipGlobalFilters, resolveUnsafeFlag, UNSAFE, type Unsafe } from './types.js';
 import {
+  assertMiddlewareArgsKept,
   availableClause,
+  boundedPreparedName,
+  canCancelBackend,
+  isNodePostgresPool,
   isTemporalInfinity,
   LRUCache,
   normalizePagination,
   ownLookup,
   parseDbDate,
+  readJsonFloat,
+  readJsonFloatArray,
+  readOnlyMiddlewareParams,
+  readTextArray,
   resolveColumnName,
   resolveRelation,
   resolveRelationDef,
   type SqlCacheEntry,
+  sendCancelRequest,
   sqlToPreparedName,
   unknownFieldMessage,
   warnRedundantSortTerm,
 } from './utils.js';
-import { shouldWarnOnce, WARN_NS } from './warn-registry.js';
+import { resetWarnOnce, shouldWarnOnce, WARN_NS } from './warn-registry.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
 import type { WhereHost } from './where-compile.js';
 import * as writesMod from './writes.js';
 
 /**
- * SQL-cache lockstep cross-check gate.
+ * SQL-cache lockstep cross-check.
  *
  * The SQL template cache requires three code paths to enumerate where-clause
  * keys identically: `fingerprintWhere` (builds the cache key),
  * `buildWhereClause` (builds SQL + `$N` params on a MISS), and
  * `collectWhereParams` (re-collects params on a HIT without rebuilding). Since
  * 0.36 all three consume ONE shared where-key walk (see `where-compile.ts`), so
- * enumeration drift is structurally eliminated; this check remains as a
+ * enumeration drift is structurally eliminated; these checks remain as a
  * tripwire in case a future leaf builder or its collect mirror falls out of
- * step. It rebuilds the SQL + params fresh on a cache HIT and compares them
- * against what the cache-hit path produced.
+ * step. Every failure is an {@link InvariantError} (E020), thrown before the
+ * statement is sent.
  *
- * Modes (decided per HIT; env read inline, not captured once, so tests and
- * perf-sensitive traffic can toggle per process):
- * - `'dev'`: `NODE_ENV !== 'production'` and `TURBINE_DISABLE_CACHE_CHECK !== '1'`
- *   (always checks; the historical default, the whole unit suite runs under it).
- * - `'off'`: dev with `TURBINE_DISABLE_CACHE_CHECK=1`, OR production with no
- *   sampling configured (the hot path is untouched).
- * - `'sampled'`: production with `TURBINE_CACHE_CHECK_SAMPLE` set to a float in
- *   `(0,1]`, re-verify that fraction of cache hits (per-hit `Math.random()`;
- *   `>= 1` checks every hit). A mismatch logs once per distinct fingerprint AND
- *   throws, same as dev. `0`, unset, or an unparseable value means never check.
+ * Two checks always run, whatever the diagnostics mode, because each costs one
+ * array compare and the alternative is executing parameters known to be wrong:
+ * - On a MISS, the params the build closure pushed are compared with the params
+ *   the collect path produced (`sql-cache-lockstep`). The miss already paid
+ *   for both walks, and a shape run once per instance is otherwise never
+ *   compared at all.
+ * - On a HIT, the collected param count must equal the count the entry was
+ *   built with (`sql-cache-param-count`). Otherwise the server would reject
+ *   the statement with a bind error that reads like a connection problem.
+ *
+ * The full rebuild-and-compare on a HIT follows the client's
+ * `diagnostics.cacheCheck`, resolved once at construction (see diagnostics.ts;
+ * the legacy `TURBINE_DISABLE_CACHE_CHECK` / `TURBINE_CACHE_CHECK_SAMPLE`
+ * variables are read there and nowhere else):
+ * - `'every-hit'` (the development default): every hit is compared, and a
+ *   mismatch throws.
+ * - `{ sample }`: that fraction of hits is compared (per-hit `Math.random()`;
+ *   a sample of 1 compares every hit). A mismatch is logged at `error` once
+ *   per distinct fingerprint, then throws.
+ * - `'off'` (the production default): never rebuilt on a hit.
  */
-function cacheCrossCheckMode(): 'dev' | 'sampled' | 'off' {
-  const env = crossCheckEnv ?? readCrossCheckEnv();
-  if (env.mode !== 'sampled') return env.mode;
-  // The SAMPLING decision, and only it, is genuinely per hit.
-  return env.rate >= 1 || Math.random() < env.rate ? 'sampled' : 'off';
-}
 
 /**
- * The env-derived half of {@link cacheCrossCheckMode}, resolved ONCE per
- * process and memoized.
- *
- * `process.env` is not a plain object: every property read crosses a C++
- * interceptor. Measured at 112.7 ns per read against 3.6 ns for a module-level
- * constant, and this function ran TWO reads on every cache hit, which put it
- * at the top of the SQL-build CPU profile (12.53% self time, with a further
- * ~12% inside the interceptor) for a value that does not change.
- *
- * It is memoized rather than hoisted to a `const` because the toggle IS
- * observed at runtime, contrary to what a quick look suggests: the
- * cross-check and sampling suites flip `NODE_ENV` /
- * `TURBINE_DISABLE_CACHE_CHECK` / `TURBINE_CACHE_CHECK_SAMPLE` around a
- * synchronous block in-process, not at spawn. So the read is deferred to first
- * use and {@link resetCacheCrossCheckEnv} re-arms it; that is the entire
- * contract, and the only thing lost versus reading every time is that a
- * process which mutates these variables mid-run must say so.
+ * Warn-once namespace for the sampled cross-check's mismatch log, so a hot
+ * mismatch logs exactly once per table and shape instead of flooding the log.
+ * `'every-hit'` does not log (it throws immediately), so only the sampled path
+ * records here. Keyed on the TABLE as well as the fingerprint: the fingerprint
+ * alone carries no table, so a mismatch on one table used to silence the same
+ * shape's mismatch on every other table. The shared registry also bounds the
+ * set (`WARN_ONCE_CAP`) and is what `resetWarnOnce` clears.
  */
-let crossCheckEnv: { mode: 'dev' | 'off' } | { mode: 'sampled'; rate: number } | undefined;
-
-function readCrossCheckEnv(): { mode: 'dev' | 'off' } | { mode: 'sampled'; rate: number } {
-  let resolved: { mode: 'dev' | 'off' } | { mode: 'sampled'; rate: number };
-  if (process.env.NODE_ENV !== 'production') {
-    resolved = { mode: process.env.TURBINE_DISABLE_CACHE_CHECK === '1' ? 'off' : 'dev' };
-  } else {
-    const raw = process.env.TURBINE_CACHE_CHECK_SAMPLE;
-    const rate = raw === undefined ? Number.NaN : Number.parseFloat(raw);
-    resolved = !Number.isFinite(rate) || rate <= 0 ? { mode: 'off' } : { mode: 'sampled', rate };
-  }
-  crossCheckEnv = resolved;
-  return resolved;
-}
-
-/**
- * Discard the memoized cross-check environment so the next cache hit re-reads
- * `process.env`.
- *
- * @internal Exposed for the tests that toggle these variables in-process (see
- * {@link crossCheckEnv}). Production code sets them before the first query and
- * never again.
- */
-export function resetCacheCrossCheckEnv(): void {
-  crossCheckEnv = undefined;
-}
-
-/**
- * Distinct cache-mismatch fingerprints already logged by the sampled production
- * cross-check, so a hot mismatch logs `console.error` exactly once per shape
- * instead of flooding the log. Dev mode does not log (it throws immediately),
- * so this set is only ever touched on the `'sampled'` path.
- */
-const loggedCacheMismatchFingerprints = new Set<string>();
+const CACHE_MISMATCH_WARN_NS = 'cacheMismatch';
 
 /**
  * Marginal cost of keeping a to-one relation on the JOIN plan, per parent row.
@@ -365,6 +374,38 @@ interface AutoEngaged {
   miss?: { table: string; columns: string[]; createSql: string };
 }
 
+/** One column of a cursor page's effective order, while it is being planned. */
+interface CursorTerm {
+  column: string;
+  /** The key written into the rewritten orderBy (the caller's own, or the field name). */
+  key: string;
+  desc: boolean;
+  nulls: 'first' | 'last' | undefined;
+  nullable: boolean;
+  /** Whether the NULL placement was written out by the planner. */
+  pin?: boolean;
+}
+
+/** One column of a planned cursor seek. */
+interface CursorKeysetTerm {
+  column: string;
+  desc: boolean;
+  nullsFirst: boolean;
+  nullable: boolean;
+}
+
+/** A planned `cursor` page (see `planCursor`). */
+interface CursorPlan {
+  mode: 'values' | 'row';
+  terms: CursorKeysetTerm[];
+  /** `values` mode: the coerced cursor value per term, `null` for SQL NULL. */
+  values: unknown[];
+  /** `row` mode: the cursor's own fields, which name one row. */
+  lookup: { column: string; value: unknown }[];
+  inclusive: boolean;
+  fingerprint: string;
+}
+
 /** The `'auto'` per-relation partition of one `with` clause. */
 interface AutoSplit {
   joinWith: WithClause;
@@ -399,7 +440,31 @@ const STREAM_SPECULATION_MAX_BATCH = 1000;
 interface RowDecodePlan {
   readonly cols: readonly string[];
   readonly fields: readonly string[];
-  readonly dates: readonly boolean[];
+  readonly kinds: readonly number[];
+}
+
+/** Per-cell decode work in a {@link RowDecodePlan}. */
+const CELL_PLAIN = 0;
+const CELL_TEMPORAL = 1;
+const CELL_FLOAT = 2;
+const CELL_FLOAT_ARRAY = 3;
+const CELL_TEXT_ARRAY = 4;
+/** The dialect's own decode for a type whose storage differs (see `Dialect.decodeColumnValue`). */
+const CELL_DIALECT = 5;
+
+const FLOAT_TYPES = new Set(['float4', 'float8', 'real', 'double precision']);
+const FLOAT_ARRAY_TYPES = new Set(['_float4', '_float8', 'float4[]', 'float8[]', 'real[]', 'double precision[]']);
+
+/**
+ * The decode a column of `pgType` needs beyond the driver's, other than
+ * temporal: a float can arrive from JSON as "NaN" / "Infinity", and an enum
+ * array, which the driver has no parser for, as array text.
+ */
+function cellKindOf(pgType: string, enums: Readonly<Record<string, unknown>> | undefined): number {
+  if (FLOAT_TYPES.has(pgType)) return CELL_FLOAT;
+  if (FLOAT_ARRAY_TYPES.has(pgType)) return CELL_FLOAT_ARRAY;
+  const element = pgType.startsWith('_') ? pgType.slice(1) : pgType.endsWith('[]') ? pgType.slice(0, -2) : undefined;
+  return element !== undefined && enums !== undefined && Object.hasOwn(enums, element) ? CELL_TEXT_ARRAY : CELL_PLAIN;
 }
 
 /**
@@ -533,36 +598,124 @@ export function unlockNestedWriteTx<X extends { table(name: string): Record<stri
 // Moved to ./filters.ts in 0.74.0 so PowqlInterface consumes the SAME
 // predicate rather than a second copy of it. See applyStableRelationOrderTo.
 
+/**
+ * Marks `findMany` args built for a `findFirst`: one row, not a page, so
+ * {@link QueryInterface.completePageOrder} leaves its order as written. A
+ * symbol, so it survives the spreads at the args seam and no JSON body can
+ * set it. Set through {@link firstRowOnly} only.
+ */
+const FIRST_ROW_ONLY: unique symbol = Symbol('turbine.firstRowOnly');
+
+/**
+ * The {@link FIRST_ROW_ONLY} mark for a read the caller bounded with neither
+ * `limit` nor `offset`. An `offset` makes the row depend on which tied rows it
+ * skipped, so `findFirst({ orderBy, offset })` is a page of one and gets the
+ * page tiebreaker like any other page.
+ */
+function firstRowOnly(args: { limit?: unknown; offset?: unknown } | undefined): { [FIRST_ROW_ONLY]?: true } {
+  return args?.limit === undefined && args?.offset === undefined ? { [FIRST_ROW_ONLY]: true } : {};
+}
+
+/** The largest delay `setTimeout` honours; Node fires anything larger after 1 ms. */
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/** The accepted `relationLoadStrategy` values. */
+const RELATION_LOAD_STRATEGIES: readonly RelationLoadStrategy[] = Object.freeze([
+  'join',
+  'batched',
+  'auto',
+  'flatten',
+] as const);
+
+/** A per-query `timeout`: milliseconds up to {@link MAX_TIMEOUT_MS}, or 0 for none (the same rule as `$transaction`). */
+function isValidTimeout(value: unknown): boolean {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= MAX_TIMEOUT_MS;
+}
+
+/** A short, value-safe rendering of a rejected option value. */
+function describeOptionValue(value: unknown): string {
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  if (typeof value === 'string') return JSON.stringify(value.length > 40 ? `${value.slice(0, 40)}...` : value);
+  return value === null ? 'null' : `a value of type ${typeof value}`;
+}
+
+function relationLoadStrategyMessage(value: unknown): string {
+  return (
+    `\`relationLoadStrategy\` must be one of ${RELATION_LOAD_STRATEGIES.map((v) => `'${v}'`).join(', ')} ` +
+    `(received ${describeOptionValue(value)}).`
+  );
+}
+
+/** A value the findUnique simple path may bind as it is: a primitive, Date or Buffer. */
+function isFastPathScalar(value: unknown): boolean {
+  switch (typeof value) {
+    case 'string':
+    case 'number':
+    case 'bigint':
+    case 'boolean':
+      return true;
+    case 'object':
+      return value instanceof Date || (value !== null && ArrayBuffer.isView(value));
+    default:
+      return false;
+  }
+}
+
+/** Resolves a race when a deadline passes first. */
+const TIMED_OUT: unique symbol = Symbol('timedOut');
+
+/**
+ * How long a statement that outlived its `timeout` gets, after the cancel
+ * request is sent, to answer before its connection is destroyed instead of
+ * reused. A cancel normally lands within a round trip or two.
+ */
+const CANCEL_GRACE_MS = 2000;
+
+/** How a statement in flight ended. */
+type Settled = { result: PgCompatQueryResult } | { error: unknown };
+
+/**
+ * One statement as it goes out: `sql` is the commentless text (what events
+ * report and the template cache holds), `text` what is sent, which carries the
+ * `sqlComment` when there is one, and `name` the prepared-statement name it is
+ * sent under (see {@link QueryInterface.outgoing}).
+ */
+interface Outgoing {
+  readonly sql: string;
+  readonly text: string;
+  readonly name: string | undefined;
+  readonly comment: string | undefined;
+}
+
+/** Whether `err` is PostgreSQL's query_canceled (57014), as the driver raised it or as Turbine wrapped it. */
+function isQueryCanceled(err: unknown): boolean {
+  const e = err as { code?: unknown; cause?: { code?: unknown } | null } | null;
+  return e?.code === '57014' || e?.cause?.code === '57014';
+}
+
+/** The {@link DeferredQuery.rowLock} marker for a locking read, or nothing. */
+function rowLockMarker(rowLock: ResolvedRowLock | undefined): { rowLock?: true } {
+  return rowLock ? { rowLock: true } : {};
+}
+
 /** The two accepted {@link JsonEncoding} values, frozen so the check is total. */
 const JSON_ENCODINGS: readonly JsonEncoding[] = Object.freeze(['object', 'positional'] as const);
 
 /**
  * The relation JSON encoding a client on `dialect` gets when it names none.
  *
- * `'positional'` (`json_build_array`) on PostgreSQL, `'object'`
- * (`json_build_object`) everywhere else. The positional form drops the repeated
- * key names from every relation row: measured on a 50-parent / ~10-child read
- * against local PostgreSQL 17, server time 0.685 ms → 0.350 ms and 152 KB →
- * 100 KB on the wire, returning byte-identical parsed rows.
+ * `'positional'` (`json_build_array`) where the engine has it (PostgreSQL),
+ * `'object'` (`json_build_object`) everywhere else. The positional form drops
+ * the repeated key names from every relation row: measured on a 50-parent /
+ * ~10-child read against local PostgreSQL 17, server time 0.685 ms → 0.350 ms
+ * and 152 KB → 100 KB on the wire, returning byte-identical parsed rows.
  *
- * ## Why the test is `dialect.name`, not "does the dialect have buildJsonArray"
- *
- * Because a presence test does not distinguish engines HERE. `buildJsonArray`
- * is declared on `postgresDialect`, and sqlite.ts / mysql.ts / mssql.ts /
- * powdb.ts each build their dialect by SPREADING it, so every engine inherits
- * the hook and an "is it absent" fallback never fires. That is the documented
- * inheritance trap (see `buildPartitionLimit` in {@link
- * QueryInterface.batchedContext} and the `distinct` gate in
- * {@link QueryInterface.buildFindMany}), and it is exactly the shape that
- * silently turned the partition-limit window on for SQLite.
- *
- * A new capability flag would work, but only if every engine set it
- * explicitly, and it would be a SECOND authority on the same question:
- * `buildSelectWithRelations` (relations.ts) already refuses `'positional'` with
- * E017 on `dialect.name !== 'postgresql'`. Deriving the default from the
- * identical predicate is what makes it impossible for the default to select an
- * encoding the builder then refuses. A flag could drift from that refusal; this
- * cannot.
+ * Read from `capabilities.positionalJson`, never from whether the dialect has
+ * `buildJsonArray`: that hook is on `postgresDialect` and every engine inherits
+ * it by spreading, so a presence test would hand every engine the positional
+ * default. `buildSelectWithRelations` (relations.ts) refuses `'positional'` on
+ * the SAME flag, so the default can never select an encoding the builder then
+ * refuses: one authority, not two.
  *
  * A wire-compatible engine that reaches this on `postgresDialect` itself
  * (CockroachDB, YugabyteDB, AlloyDB, Timescale, all of which are ADAPTERS over
@@ -570,7 +723,7 @@ const JSON_ENCODINGS: readonly JsonEncoding[] = Object.freeze(['object', 'positi
  * which is correct: they speak `json_build_array`.
  */
 function defaultJsonEncoding(dialect: Dialect): JsonEncoding {
-  return dialect.name === 'postgresql' ? 'positional' : 'object';
+  return dialect.capabilities.positionalJson ? 'positional' : 'object';
 }
 
 // ---------------------------------------------------------------------------
@@ -595,8 +748,12 @@ import type {
   TemporalInfinityReading,
 } from './deferred.js';
 
-// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", intentional for untyped table access
-export class QueryInterface<T extends object, R extends object = {}> {
+export class QueryInterface<
+  T extends object,
+  // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", intentional for untyped table access
+  R extends object = {},
+  M extends TableInputTypes = DefaultInputTypes<T, R>,
+> {
   private readonly tableMeta: TableMetadata;
   /**
    * SQL template cache: cacheKey → SqlCacheEntry (sql + prepared statement name).
@@ -614,6 +771,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private lastCacheHit = false;
   /**
+   * The params the build closure pushed on the most recent MISS, held until
+   * {@link crossCheckCache} compares them with the collected params and clears
+   * them. `undefined` after a hit. Same single-flag reasoning as
+   * {@link lastCacheHit}.
+   */
+  private lastMissParams: unknown[] | undefined;
+  /**
    * Set while a build closure runs when the statement's WHERE (or HAVING)
    * carries a caller-written `AND`/`OR` combinator array, i.e. when its SQL text
    * is a function of an arity the caller chose. Read (and reset) by
@@ -624,6 +788,21 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private variableArityShape = false;
   private readonly middlewares: MiddlewareFn[];
+  /** The client's resolved `diagnostics` (see diagnostics.ts), fixed for this instance's life. */
+  private readonly diagnostics: ResolvedDiagnostics;
+  /** `streamIdleTimeoutMs`: how long a cursor stream may wait for its consumer. `0` disables. */
+  private readonly streamIdleTimeoutMs: number;
+  /** `sqlComment`, resolved; `undefined` when statements carry no comment (one falsy check per send). */
+  private readonly sqlCommenter: SqlCommenter | undefined;
+  /** Where this instance's log lines go: the client's `logger`, else the console logger. */
+  private readonly logger: TurbineLogger;
+  /**
+   * {@link logger} when `diagnostics.advice` is on, else `undefined`. Every
+   * per-query advice site starts with `const log = this.advice; if (!log)
+   * return;`, so with advice off a site costs one property read and builds no
+   * message.
+   */
+  private readonly advice: TurbineLogger | undefined;
   private readonly defaultLimit?: number;
   private readonly warnOnUnlimited: boolean;
   private readonly scopedConnect: boolean;
@@ -725,7 +904,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * the audit's "Set<string>" guidance and leaves room for future
    * cross-table sharing.
    */
-  private readonly warnedTables = new Set<string>();
 
   /** Cache hit/miss counters for diagnostics */
   private cacheHits = 0;
@@ -749,6 +927,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * to Date as well (otherwise nested dates leak through as strings).
    */
   private readonly camelDateFieldCache = new Map<string, Set<string>>();
+
+  /** Per-table memo of {@link cellKindOf}, keyed by column name and field name. */
+  private readonly cellKindCache = new Map<string, Map<string, number>>();
+  /** The dialect decode of each {@link CELL_DIALECT} column, by table, then by column and field name. */
+  private readonly dialectDecodeCache = new Map<string, Map<string, (value: unknown) => unknown>>();
 
   /**
    * Per-table memo of `Object.entries(meta.relations)`, consumed by the nested
@@ -838,7 +1021,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
     }
     this.tableMeta = meta;
     this.middlewares = middlewares ?? [];
+    // Resolved by the client once; a QueryInterface built directly (tests,
+    // tooling) resolves here, at construction, never per call.
+    this.diagnostics = resolveDiagnostics(options?.diagnostics);
+    this.logger = options?.logger ?? consoleLogger;
+    this.advice = this.diagnostics.advice ? this.logger : undefined;
     this.defaultLimit = options?.defaultLimit;
+    this.streamIdleTimeoutMs =
+      resolveStreamIdleTimeout(options?.streamIdleTimeoutMs, 'streamIdleTimeoutMs') ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS;
     // Default to ON: surfacing accidental full-table scans is more valuable
     // than the (small) risk of noisy logs. Callers opt out globally with
     // `warnOnUnlimited: false`, per table with `warnOnUnlimited: { users:
@@ -877,6 +1067,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
       sqlCacheSize !== undefined && sqlCacheSize > 0 ? Math.floor(sqlCacheSize) : 1000,
     );
     this.dialect = options?.dialect ?? postgresDialect;
+    this.sqlCommenter =
+      options?._sqlCommenter ??
+      resolveSqlComment(options?.sqlComment, this.logger, {
+        dialect: this.dialect.name,
+        preparesEveryStatement: this.dialect.capabilities.preparesEveryStatement,
+        buildsSql: true,
+      });
+    if (
+      options?.relationLoadStrategy !== undefined &&
+      !RELATION_LOAD_STRATEGIES.includes(options.relationLoadStrategy as never)
+    ) {
+      throw new ValidationError(relationLoadStrategyMessage(options.relationLoadStrategy));
+    }
     this.relationLoadStrategy = options?.relationLoadStrategy ?? 'auto';
     this.stableRelationOrder = options?.stableRelationOrder === true;
     this.implicitPkOrdering = options?.implicitPkOrdering === true;
@@ -944,6 +1147,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // per `build*` call, so it is exposed as a LIVE getter (not a copied value).
     const self = this;
     this.ctx = {
+      diagnostics: this.diagnostics,
+      logger: this.logger,
       dialect: this.dialect,
       table: this.table,
       schema: this.schema,
@@ -1013,7 +1218,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
-   * Dev-only, once per table: the columns whose database type is absent from
+   * Advice (`diagnostics.advice`), once per table: the columns whose database type is absent from
    * BOTH the column entry and the table-level type maps, the residual case
    * after the two-source resolution above.
    *
@@ -1038,22 +1243,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
    *     Postgres rejects with `22007 invalid input syntax for type time`.
    *   - `timestamptz` and every non-temporal type: unaffected.
    *
-   * PostgreSQL only: the UTC bind rewrite is Postgres-gated (see
-   * `utcDateTimeWrites` in writes.ts), so on the other engines a missing type
-   * changes nothing about how a `Date` is bound. Suppressed under
-   * `NODE_ENV=production` like the other dev diagnostics and deduped through
-   * the shared registry, so a hot table logs one line for the process.
+   * PostgreSQL only: the zone-less `timestamp` rewrite is Postgres-gated (see
+   * `utcDateTimeRewrite` in where.ts), so on the other engines a missing type
+   * costs only the `date` rewrite. Silent when `diagnostics.advice` is off
+   * (the production default) like the other advice, and deduped through the
+   * shared registry, so a hot table logs one line for the process.
    *
    * Cannot throw on odd metadata: it walks `tableMeta.columns`, the array the
    * constructor loop above has already iterated (and that client.ts validates
    * as an array), never `dateColumns`, which is a `Set` in every first-party
    * metadata path but arrives as a plain object from JSON-round-tripped
-   * metadata. A dev-only diagnostic that crashes a shape production would serve
+   * metadata. An advisory diagnostic that crashes a shape production would serve
    * is worse than the bug it reports.
    */
   private warnUntypedColumns(): void {
-    if (process.env.NODE_ENV === 'production') return;
-    if (this.dialect.name !== 'postgresql') return;
+    const log = this.advice;
+    if (!log) return;
+    if (!this.dialect.capabilities.utcTimestampRewrite) return;
     const untyped: string[] = [];
     for (const col of this.tableMeta.columns) {
       if (this.columnPgTypeMap.get(col.name) === undefined) untyped.push(col.name);
@@ -1065,8 +1271,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const MAX_NAMED = 12;
     const named = untyped.slice(0, MAX_NAMED).join(', ');
     const rest = untyped.length > MAX_NAMED ? ` (+${untyped.length - MAX_NAMED} more)` : '';
-    console.warn(
-      `[turbine] table "${this.table}": no database type in metadata for column(s) ${named}${rest} (neither the ` +
+    logTo(
+      log,
+      'warn',
+      `table "${this.table}": no database type in metadata for column(s) ${named}${rest} (neither the ` +
         "column entry's `dialectType`/`pgType` nor the table-level `dialectTypes`/`pgTypes` map). Turbine cannot " +
         'tell which of them are zone-less, so it skips the UTC bind rewrite and a `Date` goes to the driver ' +
         "as-is: right for `timestamptz`, but a zone-less `date`/`timestamp` then stores the PROCESS's local " +
@@ -1074,6 +1282,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         '`time`/`timetz` column rejects the value outright (`22007 invalid input syntax for type time`). ' +
         'Columns whose type IS resolved, every `timestamptz` among them, are unaffected. Fix: regenerate with ' +
         '`npx turbine generate`, or set the column types in `defineSchema`.',
+      { code: 'untyped-columns', table: this.table, columns: untyped },
     );
   }
 
@@ -1254,25 +1463,65 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * applied ONCE here rather than at each of the six `with` walkers are in
    * query/relation-names.ts.
    */
-  private withDeclaredRelationNames<A extends { with?: unknown } | undefined>(args: A): A {
-    if (!args?.with) return args;
-    const normalized = normalizeWithClause(this.schema, this.table, args.with as WithClause);
-    return normalized === args.with ? args : ({ ...args, with: normalized } as A);
+  private withDeclaredRelationNames<A extends object | undefined>(args: A): A {
+    const withClause = (args as { with?: unknown } | undefined)?.with;
+    if (!withClause) return args;
+    const normalized = normalizeWithClause(this.schema, this.table, withClause as WithClause);
+    return normalized === withClause ? args : ({ ...args, with: normalized } as A);
   }
 
   /**
-   * Caller args in canonical form: declared relation spellings, and the Prisma
-   * pagination aliases folded into `limit` / `offset`.
-   *
-   * ONE method rather than two calls at each seam, because the two
-   * normalizations have the same requirement and the same failure mode: both
-   * must happen before `withFingerprint` / the cache key, and a seam that
-   * applies one but not the other is a seam where the alias survives into a
-   * fingerprint. Both return their input by reference when there was nothing to
-   * change, so the common path still allocates nothing.
+   * `args` with `take` / `skip` folded into `limit` / `offset` at every `with`
+   * level (see `normalizeWithPagination` in query/relation-names.ts). Runs after
+   * the relation-name pass, so it resolves the declared spelling.
    */
-  private normalizeArgs<A extends { with?: unknown } | undefined>(args: A): A {
-    return normalizePagination(this.withDeclaredRelationNames(args));
+  private withRelationPagination<A extends object | undefined>(args: A): A {
+    const withClause = (args as { with?: unknown } | undefined)?.with;
+    if (!withClause) return args;
+    const normalized = normalizeWithPagination(this.schema, this.table, withClause as WithClause);
+    return normalized === withClause ? args : ({ ...args, with: normalized } as A);
+  }
+
+  /**
+   * Caller args in canonical form: `undefined` pruned (query/normalize-args.ts),
+   * declared relation spellings, and the Prisma pagination aliases folded into
+   * `limit` / `offset`, with `take` / `skip` folded inside every `with` level too.
+   *
+   * Called at the seam of EVERY public operation and its `build*` twin, so the
+   * guards, the fingerprint, the build and the collect all read one shape. Each
+   * step returns its input by reference when there was nothing to change, so a
+   * second call on already-normalized args is free and the common path
+   * allocates nothing.
+   *
+   * `refuseEmptiedWhere` names the single-row read (`findFirst`,
+   * `findFirstOrThrow`) that refuses a `where` whose every key was `undefined`.
+   */
+  private normalizeArgs<A extends object | undefined>(args: A, refuseEmptiedWhere?: string): A {
+    const pruned = pruneUndefinedArgs(this.schema, this.table, args);
+    if (pruned !== args) {
+      if (refuseEmptiedWhere) assertWhereNotEmptiedByPruning(this.table, refuseEmptiedWhere, args, pruned);
+      assertCursorNotEmptied(this.table, args, pruned);
+    }
+    if (pruned) this.assertQueryOptions(pruned);
+    return normalizePagination(this.withRelationPagination(this.withDeclaredRelationNames(pruned)));
+  }
+
+  /**
+   * Validate the per-query options whose bad values used to be ignored or
+   * misread: `timeout` (Node clamps a non-positive, non-finite or oversized
+   * delay to 1 ms) and `relationLoadStrategy`.
+   */
+  private assertQueryOptions(args: object): void {
+    const { timeout, relationLoadStrategy } = args as { timeout?: unknown; relationLoadStrategy?: unknown };
+    if (timeout !== undefined && !isValidTimeout(timeout)) {
+      throw new ValidationError(
+        `\`timeout\` on ${this.table} must be a positive number of milliseconds up to ${MAX_TIMEOUT_MS}, or 0 for ` +
+          `no timeout (received ${describeOptionValue(timeout)}). Leave it out for no timeout.`,
+      );
+    }
+    if (relationLoadStrategy !== undefined && !RELATION_LOAD_STRATEGIES.includes(relationLoadStrategy as never)) {
+      throw new ValidationError(relationLoadStrategyMessage(relationLoadStrategy));
+    }
   }
 
   /**
@@ -1282,6 +1531,30 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private assertFindUniqueKey(where: Record<string, unknown> | undefined): void {
     assertWhereIdentifiesOneRow(this.tableMeta, this.table, where);
+  }
+
+  /**
+   * Refuse a locking read that is not inside a transaction, at the execute
+   * entry of each find method and before any strategy runs. The `build*`
+   * methods accept `lock` (the SQL is right wherever it runs); executing it
+   * in autocommit releases the lock before the caller sees the rows.
+   *
+   * The value is validated first, so an engine with no row locks answers
+   * E017 rather than asking for a transaction it would also refuse.
+   * "Inside a transaction" is `_txScoped`: the accessors a TransactionClient
+   * hands out, at any nesting depth.
+   */
+  private assertLockInTransaction(args: { lock?: unknown } | undefined, operation: string): void {
+    if (args?.lock === undefined) return;
+    resolveRowLock(args.lock, this.dialect, this.table);
+    if (!this.txScoped) throw new ValidationError(lockOutsideTransactionMessage(this.table, operation));
+  }
+
+  /** Refuse `lock` on a streaming read (a cursor is not a locking read). */
+  private assertNoStreamLock(args: object | undefined, operation: string): void {
+    if ((args as { lock?: unknown } | undefined)?.lock !== undefined) {
+      throw new ValidationError(lockOnStreamMessage(this.table, operation));
+    }
   }
 
   /**
@@ -1318,150 +1591,336 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return fields.length === 1 ? { [fields[0]!]: 'asc' } : fields.map((f) => ({ [f]: 'asc' as const }));
   }
 
+  /** Memo for {@link totalOrderKeys}; table metadata is immutable. */
+  private totalOrderKeysMemo: string[][] | undefined;
+
   /**
-   * The field names a `cursor` actually seeks on (its own keys with a defined
-   * value), in canonical sorted order. This is the diagnostic / implicit-
-   * ordering view; the seek itself orders the fields by their `orderBy`
-   * precedence (see {@link cursorSeekEntries}). Empty for a missing cursor or
-   * one whose every value is `undefined` (which emits no seek condition at
-   * all, so it does not paginate).
+   * The unique keys whose columns are all NOT NULL, primary key first: the
+   * column sets that make an order total (no two rows can tie on them).
    */
-  private cursorFields(cursor: unknown): string[] {
-    if (!cursor || typeof cursor !== 'object') return [];
-    return Object.entries(cursor as Record<string, unknown>)
-      .filter(([, v]) => v !== undefined)
-      .map(([k]) => k)
-      .sort();
+  private totalOrderKeys(): string[][] {
+    if (this.totalOrderKeysMemo) return this.totalOrderKeysMemo;
+    const meta = this.tableMeta;
+    const nullable = (column: string): boolean =>
+      !meta.primaryKey.includes(column) && meta.columns.find((c) => c.name === column)?.nullable === true;
+    this.totalOrderKeysMemo = uniqueKeyNames(meta).filter((cols) => cols.every((c) => !nullable(c)));
+    return this.totalOrderKeysMemo;
   }
 
   /**
-   * The ascending ordering implied by a `cursor`, or `undefined` when the shape
-   * is too ambiguous to order safely.
-   *
-   * A cursor seek compares against the cursor's own field(s) (`col > $n`, `<`
-   * when the orderBy says desc), so the ONLY ordering coherent with it is on
-   * those fields: ordering a seek on column X by column Y walks the table in an
-   * order the seek does not follow, which skips and repeats rows just as badly
-   * as no order at all. That is why this orders on the cursor field rather than
-   * blindly on the primary key when the two differ.
-   *
-   * Returns `undefined` (warn, inject nothing) for two shapes:
-   *  - a MULTI-field cursor. The seek is a proper keyset predicate, but its
-   *    column PRECEDENCE comes from the `orderBy` ({@link cursorSeekEntries}),
-   *    and with no orderBy there is nothing to derive it from: the cursor
-   *    object's key order is canonicalized away, so `(a asc, b asc)` would be a
-   *    guess at which key the caller meant to lead. The caller must state the
-   *    order, and the unordered-page warning says so.
-   *  - a field that does not resolve to a real column. Column validation belongs
-   *    to the normal build path, which raises a precise error; synthesizing an
-   *    ORDER BY on it here would only change which error the caller sees.
+   * THE tiebreaker rule, shared by cursor pages ({@link planCursor}) and the
+   * pages before them ({@link completePageOrder}), so every page of one walk
+   * is cut from the same total order: the columns to append to an order over
+   * `ordered` so that no two rows tie. `[]` when the order already contains a
+   * unique NOT NULL key; the first such key's missing columns otherwise;
+   * `undefined` when the table has none.
    */
-  private cursorOrderBy(cursor: unknown): WithOrderByObject | undefined {
-    const fields = this.cursorFields(cursor);
-    if (fields.length !== 1) return undefined;
-    const field = fields[0]!;
-    try {
-      this.toColumn(field);
-    } catch {
-      return undefined;
-    }
-    return { [field]: 'asc' };
+  private tiebreakColumns(ordered: ReadonlySet<string>): string[] | undefined {
+    const keys = this.totalOrderKeys();
+    if (keys.some((cols) => cols.every((c) => ordered.has(c)))) return [];
+    return keys[0]?.filter((c) => !ordered.has(c));
   }
 
   /**
-   * The fields a `cursor` seeks on, in KEYSET order with their seek direction.
-   * THE single authority the cache fingerprint (`cur=`), the SQL build and the
-   * cache-hit param collect all consume, so the three cannot disagree about
-   * which value binds to which `$n`.
+   * A paginated `findMany` (`limit` / `offset`) whose `orderBy` can tie gets
+   * the tiebreaker appended, in the last term's direction, so a page boundary
+   * cannot fall between tied rows in a different order on each page (skipping
+   * or repeating one), and the first page of a cursor walk uses the order its
+   * cursor pages use. Returns `args` itself when the order is already total,
+   * the query is not paginated, or it pages by `cursor` or `distinct`, which
+   * order themselves. A `findFirst` with no `offset` is one row, not a page,
+   * and is left alone.
    *
-   * Keyset order is the `orderBy` precedence: the predicate for
-   * `orderBy: [{ viewCount }, { id }]` must test `view_count` first and `id`
-   * only within equal `view_count`, whatever order the caller wrote the cursor
-   * object in (its keys are canonicalized for the cache anyway). A cursor field
-   * the orderBy does not name trails the named ones in sorted key order and
-   * seeks ascending, the same default a single-field cursor with no orderBy has
-   * always had.
-   *
-   * Directions are indexed by the RESOLVED COLUMN, never the caller's key: both
-   * `cursor` and `orderBy` take either spelling, so a cursor written
-   * `{ created_at }` against `orderBy: { createdAt: 'desc' }` used to miss the
-   * lookup, default to ascending, and seek the wrong side of the page. The
-   * `{ sort, nulls }` spec form is normalized for the same reason. A relation /
-   * JSON-path / vector orderBy key resolves to no column and is skipped.
-   *
-   * An unknown cursor field throws the same E003 here that the build path
-   * threw before this helper existed; the fingerprint simply meets it first.
+   * An order containing a vector distance gets no tiebreaker: a KNN index
+   * serves only `ORDER BY <distance> LIMIT k`, a compound order turns that
+   * into a scan and sort of the whole table, and two equal distances are
+   * rare. A `cursor` still refuses such an order (see {@link planCursor}).
    */
-  private cursorSeekEntries(
-    cursor: Record<string, unknown>,
-    orderBy: unknown,
-  ): { column: string; value: unknown; desc: boolean }[] {
-    const orderPos = new Map<string, number>();
-    const orderDesc = new Map<string, boolean>();
-    for (const [ok, od] of orderByEntries(orderBy)) {
-      const ocol = resolveColumnName(this.tableMeta, ok);
-      if (ocol === undefined) continue;
-      if (!orderPos.has(ocol)) orderPos.set(ocol, orderPos.size);
-      // Last wins, matching object-key semantics (duplicates are refused
-      // upstream anyway, so in practice there is exactly one).
-      orderDesc.set(ocol, isOrderBySpec(od) ? od.sort === 'desc' : od === 'desc');
+  private completePageOrder<
+    A extends { orderBy?: unknown; limit?: unknown; offset?: unknown; cursor?: unknown; distinct?: unknown[] },
+  >(args: A): A {
+    if (args.orderBy === undefined || (args.limit === undefined && args.offset === undefined)) return args;
+    if (hasCursor(args.cursor) || (args.distinct && args.distinct.length > 0)) return args;
+    if ((args as { [FIRST_ROW_ONLY]?: true })[FIRST_ROW_ONLY]) return args;
+    const entries = orderByEntries(args.orderBy).filter(([, d]) => d !== undefined);
+    if (entries.some(([, d]) => isVectorOrderBy(d))) return args;
+    const ordered = new Set<string>();
+    let lastDesc = false;
+    for (const [key, dir] of entries) {
+      lastDesc = false;
+      if (isVectorOrderBy(dir) || isJsonPathOrderBy(dir) || this.isRelationOrderByValue(dir)) continue;
+      const column = resolveColumnName(this.tableMeta, key);
+      if (column === undefined) continue;
+      ordered.add(column);
+      lastDesc = normalizeOrderBy(dir as OrderDirection | OrderBySpec).dir === 'DESC';
     }
-    const entries = sortedEntries(cursor)
-      .filter(([, v]) => v !== undefined)
-      .map(([k, value]) => {
-        const column = this.toColumn(k);
-        return { column, value, desc: orderDesc.get(column) === true };
+    const missing = this.tiebreakColumns(ordered);
+    if (!missing || missing.length === 0) return args;
+    const dir: OrderDirection = lastDesc ? 'desc' : 'asc';
+    const field = (column: string): string => this.tableMeta.reverseColumnMap[column] ?? column;
+    return {
+      ...args,
+      orderBy: [...entries.map(([k, v]) => ({ [k]: v })), ...missing.map((c) => ({ [field(c)]: dir }))],
+    };
+  }
+
+  /**
+   * Plan a `cursor` page: THE single authority the cache key, the SQL build and
+   * the cache-hit param collect all read, so the three cannot disagree.
+   *
+   * The page is ordered by the EFFECTIVE order: the caller's `orderBy` plus a
+   * tiebreaker (the primary key, else a unique key on NOT NULL columns) when
+   * the orderBy does not already end in one, in the last term's direction. A
+   * cursor query is always ordered, because a seek over rows the engine may
+   * return in any order skips and repeats rows. `args.orderBy` is rewritten to
+   * that order (by reference when nothing changes).
+   *
+   * Two ways to place the page, picked from what the cursor carries:
+   *  - VALUES: the cursor has a value for every column of the effective order,
+   *    so the seek compares against them directly (`col > $1`, expanded to a
+   *    keyset across several columns). Extra cursor fields are ignored.
+   *  - ROW: otherwise the cursor must identify one row by a unique key (the
+   *    findUnique rule), and the seek reads that row's ordered values in
+   *    scalar subqueries, guarded by `EXISTS` so a deleted cursor row gives an
+   *    empty page rather than a wrong one.
+   * Anything else is refused (E003) naming the missing fields.
+   *
+   * NULL sort keys are placed where the engine sorts them (PostgreSQL: last
+   * ascending, first descending; SQLite / MySQL / SQL Server: NULL is smallest)
+   * or where an explicit `nulls` puts them, and each row is visited exactly
+   * once. On PostgreSQL a nullable ordered column has its placement written
+   * out, so a Postgres-compatible engine with a different default reads the
+   * same order the seek assumes.
+   */
+  private planCursor<A extends { cursor?: unknown; orderBy?: unknown }>(
+    args: A,
+  ): { args: A; plan: CursorPlan | undefined } {
+    const raw = args.cursor;
+    if (!hasCursor(raw)) return { args, plan: undefined };
+    const meta = this.tableMeta;
+    const field = (column: string): string => meta.reverseColumnMap[column] ?? column;
+    const nullableColumn = (column: string): boolean =>
+      !meta.primaryKey.includes(column) && meta.columns.find((c) => c.name === column)?.nullable === true;
+
+    // The cursor's own values, by resolved column (either spelling, or a
+    // compound-unique selector, is accepted). Each is a row's value, checked
+    // by the rule every engine shares (cursorFieldValue).
+    const flat = expandCompoundUniqueWhere(meta, raw as Record<string, unknown>);
+    const cursorValues = new Map<string, unknown>();
+    for (const [key, written] of sortedEntries(flat)) {
+      if (written === undefined) continue;
+      const column = this.toColumn(key);
+      const value = cursorFieldValue(key, written, {
+        column,
+        table: this.table,
+        kind: operandColumnKind(this.getColumnPgType(column)),
+        nullable: nullableColumn(column),
       });
-    // Stable sort over the canonical (sorted-key) list: orderBy precedence
-    // first, unnamed fields after it in their sorted order.
-    return entries.sort(
-      (a, b) =>
-        (orderPos.get(a.column) ?? Number.MAX_SAFE_INTEGER) - (orderPos.get(b.column) ?? Number.MAX_SAFE_INTEGER),
-    );
+      cursorValues.set(column, value);
+    }
+    if (cursorValues.size === 0) return { args, plan: undefined };
+
+    // The caller's order, plain columns only: a relation, JSON-path or vector
+    // ordering has no value a seek can compare against.
+    const terms: CursorTerm[] = [];
+    const orderEntries = orderByEntries(args.orderBy).filter(([, d]) => d !== undefined);
+    for (const [key, dir] of orderEntries) {
+      if (isVectorOrderBy(dir) || isJsonPathOrderBy(dir) || this.isRelationOrderByValue(dir)) {
+        throw new ValidationError(
+          `findMany on "${this.table}" refused: \`cursor\` cannot page past the orderBy entry "${key}", which ` +
+            'orders by a relation, a JSON path or a vector distance rather than a column. Order the cursor ' +
+            'query by columns only, or page it with `offset`.',
+        );
+      }
+      const column = this.toColumn(key);
+      if (terms.some((t) => t.column === column)) continue;
+      const { dir: d, nulls } = normalizeOrderBy(dir as OrderDirection | OrderBySpec);
+      terms.push({ column, key, desc: d === 'DESC', nulls, nullable: nullableColumn(column) });
+    }
+
+    // Tiebreaker, the same one a first page gets (see tiebreakColumns).
+    const tiebreak = this.tiebreakColumns(new Set(terms.map((t) => t.column)));
+    if (!tiebreak) {
+      throw new ValidationError(
+        `findMany on "${this.table}" refused: a \`cursor\` page needs an order with no ties, and "${this.table}" ` +
+          'has no primary key or unique key on NOT NULL columns to break them. Add a primary key, or page ' +
+          'this table with `offset`.',
+      );
+    }
+    const desc = terms.length > 0 ? terms[terms.length - 1]!.desc : false;
+    for (const column of tiebreak) {
+      terms.push({ column, key: field(column), desc, nulls: undefined, nullable: false });
+    }
+    const appended = tiebreak.length > 0;
+
+    // Where NULLs sort, per term. Where the engine sorts them high (PostgreSQL)
+    // a nullable column's placement is written out, so a Postgres-compatible
+    // engine with a different default reads the order the seek assumes.
+    const { nullsSortHigh, nullsOrderingClause } = this.dialect.capabilities;
+    const pinNulls = nullsSortHigh && nullsOrderingClause;
+    let pinned = false;
+    for (const t of terms) {
+      if (t.nulls === undefined && t.nullable && pinNulls) {
+        t.nulls = t.desc ? 'first' : 'last';
+        t.pin = true;
+        pinned = true;
+      }
+    }
+    const nullsFirst = (t: CursorTerm): boolean =>
+      t.nulls !== undefined ? t.nulls === 'first' : nullsSortHigh ? t.desc : !t.desc;
+
+    let nextArgs = args;
+    if (appended || pinned) {
+      const orderBy = terms.map((t) => {
+        const dir = t.desc ? 'desc' : 'asc';
+        const original = orderEntries.find(([k]) => k === t.key)?.[1];
+        return { [t.key]: t.pin ? { sort: dir, nulls: t.nulls } : (original ?? dir) };
+      });
+      nextArgs = { ...args, orderBy };
+    }
+
+    const inclusive = isCursorInclusive(args);
+    const coerce = (column: string, value: unknown): unknown =>
+      whereMod.coerceWhereOperand(this.ctx, meta, column, value);
+    const keysetTerms: CursorKeysetTerm[] = terms.map((t) => ({
+      column: t.column,
+      desc: t.desc,
+      nullsFirst: nullsFirst(t),
+      nullable: t.nullable,
+    }));
+
+    // An inclusive cursor (prisma-compat) names a ROW, as Prisma's does, so it
+    // always reads that row: a deleted cursor row gives an empty page, never a
+    // page placed where the row used to be.
+    const namesRow = inclusive && whereIdentifiesOneRow(meta, flat);
+    if (!namesRow && terms.every((t) => cursorValues.has(t.column))) {
+      const values = terms.map((t) => {
+        const v = cursorValues.get(t.column);
+        return v === null ? null : coerce(t.column, v);
+      });
+      const fp =
+        `v:${keysetTerms.map((t, i) => `${t.column}:${t.desc ? 'd' : 'a'}${t.nullable ? (t.nullsFirst ? 'f' : 'l') : ''}${values[i] === null ? '0' : ''}`).join(',')}` +
+        (inclusive ? ':i' : '');
+      return {
+        args: nextArgs,
+        plan: { mode: 'values', terms: keysetTerms, values, lookup: [], inclusive, fingerprint: fp },
+      };
+    }
+
+    if (!whereIdentifiesOneRow(meta, flat)) {
+      const missing = terms.filter((t) => !cursorValues.has(t.column)).map((t) => `"${field(t.column)}"`);
+      const order = terms.map((t) => `${field(t.column)} ${t.desc ? 'desc' : 'asc'}`).join(', ');
+      const keys = uniqueKeyNames(meta).map((cols) =>
+        cols.length === 1 ? `{ ${field(cols[0]!)} }` : `{ ${cols.map(field).join(', ')} }`,
+      );
+      throw new ValidationError(
+        `findMany on "${this.table}" refused: the \`cursor\` has no value for ${missing.join(', ')}, which the ` +
+          `page order (${order}) needs, and it does not name one row by a unique key. Give the cursor a value ` +
+          `for every ordered field, or name the cursor row by ${keys.length > 0 ? keys.join(' or ') : 'a unique key'}.`,
+      );
+    }
+    const lookup = [...cursorValues].map(([column, v]) => ({ column, value: v === null ? null : coerce(column, v) }));
+    const fp =
+      `r:${keysetTerms.map((t) => `${t.column}:${t.desc ? 'd' : 'a'}${t.nullable ? (t.nullsFirst ? 'f' : 'l') : ''}`).join(',')}` +
+      `|k=${lookup.map((l) => `${l.column}${l.value === null ? '0' : ''}`).join(',')}` +
+      (inclusive ? ':i' : '');
+    return {
+      args: nextArgs,
+      plan: { mode: 'row', terms: keysetTerms, values: [], lookup, inclusive, fingerprint: fp },
+    };
   }
 
   /**
-   * The keyset predicate for cursor terms in keyset order.
+   * Render a {@link CursorPlan}'s seek predicate, pushing its params. Run by
+   * the build AND by the cache-hit collect (which discards the SQL), so the two
+   * cannot bind different params.
    *
-   * One field is the plain `col > $1` (byte-identical to every single-field
-   * cursor ever emitted). Two or more expand to
-   * `(c1 > $1 OR (c1 = $1 AND c2 > $2) OR (c1 = $1 AND c2 = $2 AND c3 > $3))`,
-   * with `<` for a `desc` field: the row-value form `(c1, c2) > ($1, $2)` is
-   * shorter, but it cannot express a MIXED direction at all and SQL Server has
-   * no row-value comparison, so the expanded form is the one path every engine
-   * and every direction set share. Each value is bound ONCE and its `$n` is
-   * referenced by every branch that needs it (legal on every supported
-   * placeholder syntax), which is what keeps the param count equal to the field
-   * count on both the build and the collect side.
-   *
-   * The former `c1 > $1 AND c2 > $2` was a conjunction, not a seek: it skipped
-   * every row whose leading key EQUALED the cursor's, so a table with few
-   * distinct leading values lost most of its rows across a page walk, silently.
+   * Each value is bound once and referenced by every branch that needs it. One
+   * non-null column is the plain `col > $1`; several expand to
+   * `(c1 > $1 OR (c1 = $1 AND c2 > $2) OR ...)`, with `<` for a descending
+   * column (a row-value comparison cannot mix directions, and SQL Server has
+   * none). A nullable column gets NULL-aware equality and "after" terms.
    */
-  private keysetPredicate(terms: { column: string; placeholder: string; desc: boolean }[]): string {
-    const compare = (t: { column: string; placeholder: string; desc: boolean }) =>
-      `${t.column} ${t.desc ? '<' : '>'} ${t.placeholder}`;
-    if (terms.length === 1) return compare(terms[0]!);
-    const branches = terms.map((term, i) => {
-      if (i === 0) return compare(term);
-      const prefix = terms.slice(0, i).map((t) => `${t.column} = ${t.placeholder}`);
-      return `(${[...prefix, compare(term)].join(' AND ')})`;
-    });
-    return `(${branches.join(' OR ')})`;
+  private renderCursorPredicate(plan: CursorPlan, params: unknown[]): string {
+    const qt = this.q(this.table);
+    const col = (t: CursorKeysetTerm) => `${qt}.${this.q(t.column)}`;
+    let ref: (i: number) => string | null;
+    let guard = '';
+    if (plan.mode === 'values') {
+      const refs = plan.values.map((v) => {
+        if (v === null) return null;
+        params.push(v);
+        return this.p(params.length);
+      });
+      ref = (i) => refs[i] ?? null;
+    } else {
+      const alias = 'cursor_row';
+      const conds = plan.lookup.map((l) => {
+        if (l.value === null) return `${alias}.${this.q(l.column)} IS NULL`;
+        params.push(l.value);
+        return `${alias}.${this.q(l.column)} = ${this.p(params.length)}`;
+      });
+      const gf = whereMod.targetGlobalFilterAlias(this.ctx, this.table, alias, params);
+      if (gf) conds.push(gf);
+      const from = `FROM ${qt} ${alias} WHERE ${conds.join(' AND ')}`;
+      ref = (i) => `(SELECT ${alias}.${this.q(plan.terms[i]!.column)} ${from})`;
+      guard = `EXISTS (SELECT 1 ${from})`;
+    }
+
+    // Value mode knows each value; row mode knows only whether the column can
+    // hold NULL, so its comparisons stay NULL-aware for nullable columns.
+    const rowMode = plan.mode === 'row';
+    const eq = (i: number): string => {
+      const t = plan.terms[i]!;
+      const r = ref(i);
+      if (r === null) return `${col(t)} IS NULL`;
+      if (rowMode && t.nullable) return `(${col(t)} = ${r} OR (${col(t)} IS NULL AND ${r} IS NULL))`;
+      return `${col(t)} = ${r}`;
+    };
+    const after = (i: number, orEqual: boolean): string | null => {
+      const t = plan.terms[i]!;
+      const r = ref(i);
+      const op = `${t.desc ? '<' : '>'}${orEqual ? '=' : ''}`;
+      if (r === null) return t.nullsFirst ? `${col(t)} IS NOT NULL` : null;
+      if (!t.nullable) return `${col(t)} ${op} ${r}`;
+      if (rowMode) {
+        return t.nullsFirst
+          ? `((${r} IS NULL AND ${col(t)} IS NOT NULL) OR ${col(t)} ${op} ${r})`
+          : `(${r} IS NOT NULL AND (${col(t)} ${op} ${r} OR ${col(t)} IS NULL))`;
+      }
+      return t.nullsFirst ? `${col(t)} ${op} ${r}` : `(${col(t)} ${op} ${r} OR ${col(t)} IS NULL)`;
+    };
+
+    const n = plan.terms.length;
+    const last = n - 1;
+    // An inclusive page folds "equal on every column" into the last branch when
+    // that column is NOT NULL and its value known non-null (`>=`); otherwise it
+    // is its own branch.
+    const foldEqual = plan.inclusive && !plan.terms[last]!.nullable && ref(last) !== null;
+    const branches: string[] = [];
+    for (let i = 0; i < n; i++) {
+      const a = after(i, foldEqual && i === last);
+      if (a === null) continue;
+      if (i === 0) branches.push(a);
+      else branches.push(`(${[...plan.terms.slice(0, i).map((_, j) => eq(j)), a].join(' AND ')})`);
+    }
+    if (plan.inclusive && !foldEqual) {
+      branches.push(n === 1 ? eq(0) : `(${plan.terms.map((_, j) => eq(j)).join(' AND ')})`);
+    }
+    const keyset =
+      branches.length === 0 ? '1 = 0' : branches.length === 1 ? branches[0]! : `(${branches.join(' OR ')})`;
+    return guard ? `(${guard} AND ${keyset})` : keyset;
   }
 
   /**
-   * Whether a findMany paginates (`limit` / `take` / `offset` / `cursor`) but
-   * declares no ordering, which makes the returned page NON-DETERMINISTIC:
-   * Postgres is free to return different rows for the same unordered `LIMIT`
-   * once the heap changes underneath it, so a row can appear on two pages or on
-   * none.
+   * Whether a findMany paginates (`limit` / `take` / `offset`) but declares no
+   * ordering, which makes the returned page NON-DETERMINISTIC: Postgres is
+   * free to return different rows for the same unordered `LIMIT` once the heap
+   * changes underneath it, so a row can appear on two pages or on none.
    *
-   * `cursor` counts, and is the worst case rather than an exception: a keyset
-   * seek with no ORDER BY is exactly this bug (`WHERE id > $1 LIMIT $2` walks
-   * the heap in whatever order the plan happens to produce). An empty orderBy
-   * (`[]`, or an object whose every value is `undefined`) counts as absent,
-   * because it emits no ordering.
+   * A `cursor` page never counts: it is always ordered by its effective order
+   * (see {@link planCursor}). An empty orderBy (`[]`, or an object whose every
+   * value is `undefined`) counts as absent, because it emits no ordering.
    *
    * `distinct` is still excluded: that path re-orders in an outer wrapper around
    * a `DISTINCT ON` whose ordering picks the representative row, so an implicit
@@ -1476,9 +1935,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }): boolean {
     if (!args) return false;
     if (args.distinct !== undefined) return false;
+    if (hasCursor(args.cursor)) return false;
     if (!isEmptyOrderBy(args.orderBy)) return false;
-    if (args.limit !== undefined || args.offset !== undefined) return true;
-    return this.cursorFields(args.cursor).length > 0;
+    return args.limit !== undefined || args.offset !== undefined;
   }
 
   /**
@@ -1487,18 +1946,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
    *
    * OFF by default in CORE, deliberately: turning it on would add an `ORDER BY`
    * to SQL that existing applications already emit, changing both the rows a
-   * given page returns and the plan the engine picks. That is a breaking change
-   * in everything but the type signature, so it waits for a major. The
+   * given page returns and the plan the engine picks. The
    * `turbine-orm/prisma-compat` layer defaults it ON instead, because reproducing
    * Prisma's semantics is that layer's whole contract.
    *
    * An explicit `orderBy` always wins, a PK-less table is left alone (nothing
    * stable to order by), and a composite PK orders on every column in
-   * declaration order. A `cursor` query orders on the CURSOR's field instead
-   * (see {@link cursorOrderBy}), and is left alone when that shape is ambiguous.
+   * declaration order. A `cursor` page is ordered by its own plan, not here, and
    * `distinct` shapes are skipped (see {@link isUnorderedPage}). With the flag
-   * off this returns `undefined` before touching anything, so the emitted SQL is
-   * byte-identical to before.
+   * off this returns `undefined` before touching anything.
    */
   private implicitPkOrderBy(args?: {
     limit?: number;
@@ -1509,26 +1965,24 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }): WithOrderByObject | WithOrderByObject[] | undefined {
     if (!this.implicitPkOrdering) return undefined;
     if (!this.isUnorderedPage(args)) return undefined;
-    if (this.cursorFields(args?.cursor).length > 0) return this.cursorOrderBy(args?.cursor);
     return this.pkOrderBy();
   }
 
   /**
-   * Dev-only, once per query shape: an unordered paginating findMany returns a
+   * Advice (`diagnostics.advice`), once per query shape: an unordered paginating findMany returns a
    * non-deterministic page (see {@link isUnorderedPage}), and on real data it is
    * also usually the slower plan (an unordered `LIMIT` can discard tens of
    * thousands of heap rows that an index scan on the key would have skipped).
    *
-   * Gated exactly like the other dev diagnostics (silent under
-   * `NODE_ENV=production`) and consistent with `warnOnUnlimited`: a per-call
+   * Gated exactly like the other advice (silent when `diagnostics.advice` is
+   * off) and consistent with `warnOnUnlimited`: a per-call
    * `warnOnUnlimited: false` silences it, `true` forces it past a config-level
    * opt-out, and a config/per-table `warnOnUnlimited: false` silences it. Deduped
    * process-wide through the shared warn registry, so it can never spam.
    *
    * Suppressed only when `implicitPkOrdering` will ACTUALLY order this query.
-   * The flag being on is not enough: a PK-less table and an ambiguous
-   * multi-field cursor both get no injected ordering, and those are precisely
-   * the shapes that still need saying out loud.
+   * The flag being on is not enough: a PK-less table gets no injected
+   * ordering, and that is precisely the shape that still needs saying out loud.
    */
   private maybeWarnUnorderedPage(args?: {
     limit?: number;
@@ -1538,39 +1992,28 @@ export class QueryInterface<T extends object, R extends object = {}> {
     distinct?: unknown;
     warnOnUnlimited?: boolean;
   }): void {
-    if (process.env.NODE_ENV === 'production') return;
+    const log = this.advice;
+    if (!log) return;
     if (this.implicitPkOrdering && this.implicitPkOrderBy(args) !== undefined) return;
     const perCall = args?.warnOnUnlimited;
     if (perCall === false) return;
     if (perCall === undefined && !this.warnOnUnlimited) return;
     if (!this.isUnorderedPage(args)) return;
-    const cursorFields = this.cursorFields(args?.cursor);
-    const shape = [
-      cursorFields.length > 0 ? 'cursor' : '',
-      args?.limit !== undefined ? 'limit' : '',
-      args?.offset !== undefined ? 'offset' : '',
-    ]
+    const shape = [args?.limit !== undefined ? 'limit' : '', args?.offset !== undefined ? 'offset' : '']
       .filter(Boolean)
       .join('+');
     if (!shouldWarnOnce(WARN_NS.unorderedPage, `${this.table}|${shape}`)) return;
-    const asOrderBy = (fields: string[]) =>
-      fields.length === 1 ? `{ ${fields[0]}: 'asc' }` : `[${fields.map((f) => `{ ${f}: 'asc' }`).join(', ')}]`;
     const pk = (this.tableMeta.primaryKey ?? []).map((c) => this.tableMeta.reverseColumnMap[c] ?? c);
-    // A cursor seeks on its own field, so that is the ordering to recommend:
-    // the primary key would be the wrong advice whenever the two differ.
-    const orderFields = cursorFields.length > 0 ? cursorFields : pk;
-    const suggestion =
-      orderFields.length > 0 ? `Add \`orderBy: ${asOrderBy(orderFields)}\`` : 'Add an `orderBy` on a unique column';
-    const seek =
-      cursorFields.length > 0
-        ? 'a `cursor` seek with no orderBy compares against rows the engine is free to return in any order, so ' +
-          'paging with it skips and repeats rows: '
-        : '';
-    console.warn(
-      `[turbine] findMany on "${this.table}" paginates (${shape}) with no orderBy: ${seek}the page is NOT ` +
+    const asOrderBy = pk.length === 1 ? `{ ${pk[0]}: 'asc' }` : `[${pk.map((f) => `{ ${f}: 'asc' }`).join(', ')}]`;
+    const suggestion = pk.length > 0 ? `Add \`orderBy: ${asOrderBy}\`` : 'Add an `orderBy` on a unique column';
+    logTo(
+      log,
+      'warn',
+      `findMany on "${this.table}" paginates (${shape}) with no orderBy: the page is NOT ` +
         'deterministic (the same query can return different rows as the table changes, so a row may appear ' +
         `on two pages or on none). ${suggestion}, or set \`implicitPkOrdering: true\` in the client config ` +
-        'to order paginated queries automatically (by the cursor field, or by the primary key).',
+        'to order paginated queries by the primary key automatically.',
+      { code: 'unordered-page', table: this.table, operation: 'findMany', paging: shape },
     );
   }
 
@@ -1812,7 +2255,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
-   * Dev-only once-per-relation note that `'auto'` engaged the batched fallback.
+   * Advice, once per relation: `'auto'` engaged the batched fallback.
    *
    * Both lines follow the same four parts: the CONDITION that tripped the rule,
    * the MECHANISM (which plan shape was replaced by which, and what that costs),
@@ -1821,12 +2264,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * as a bug, so the mechanism sentence is not optional.
    */
   private emitAutoNotes(engaged: AutoEngaged[]): void {
-    if (process.env.NODE_ENV === 'production') return;
+    const log = this.advice;
+    if (!log) return;
     for (const e of engaged) {
       if (!shouldWarnOnce(WARN_NS.autoStrategy, `${this.table}.${e.relation}`)) continue;
       if (e.reason === 'to-one-cardinality') {
-        console.warn(
-          `[turbine] auto strategy: to-one relation "${e.relation}" on "${this.table}" loads batched ` +
+        logTo(
+          log,
+          'warn',
+          `auto strategy: to-one relation "${e.relation}" on "${this.table}" loads batched ` +
             `(the query is unbounded or its limit exceeds ${this.autoToOneThreshold()} rows). On the join plan ` +
             'a to-one relation is a correlated subquery the engine re-evaluates once per parent row, a per-row ' +
             'cost that stands even on a unique index; batched replaces it with ONE follow-up statement ' +
@@ -1834,6 +2280,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
             'trip. Bound the query with a smaller `limit`, tune `autoToOneJoinMaxRows` (the break-even is ' +
             "round-trip time / per-row cost), or set `relationLoadStrategy: 'join'` to force the " +
             'single-statement plan.',
+          { code: 'auto-strategy', table: this.table, relation: e.relation, reason: e.reason },
         );
         continue;
       }
@@ -1853,10 +2300,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
           : ' On the join plan that relation is a correlated subquery re-evaluated once per parent row, so an ' +
             `unindexed probe is one full scan of "${child}" per parent row; the batched follow-up scans it ` +
             'once for the whole page.';
-      console.warn(
-        `[turbine] auto strategy: relation "${e.relation}" on "${this.table}" loads batched (${probe}).${why} ` +
+      logTo(
+        log,
+        'warn',
+        `auto strategy: relation "${e.relation}" on "${this.table}" loads batched (${probe}).${why} ` +
           "Create the covering index (or set `relationLoadStrategy: 'join'` to force the single-statement " +
           'plan); run `npx turbine doctor` for the exact CREATE INDEX SQL.',
+        { code: 'auto-strategy', table: this.table, relation: e.relation, reason: e.reason },
       );
     }
   }
@@ -1979,17 +2429,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // a closure rather than passing `this.dialect` so the loader keeps
       // needing nothing else from the dialect.
       //
-      // The `dialect.name` test is NOT redundant with the hook's presence, and
-      // this is the same trap the `distinct` gate documents: every engine
-      // dialect is built by SPREADING `postgresDialect`, so an optional hook
-      // added there is INHERITED by sqlite / mysql / mssql, whose "absent"
-      // fallback would then never be taken. The wrapper is not portable as
-      // written either (T-SQL rejects an ORDER BY inside a derived table
-      // without TOP/OFFSET, and the compiled child query carries one), so the
-      // pushdown stays with the dialect that owns the implementation until
-      // another engine ships its own and asserts it.
+      // The capability is NOT redundant with the hook's presence: every engine
+      // dialect is built by SPREADING `postgresDialect`, so the hook is
+      // INHERITED by sqlite / mysql / mssql, whose "absent" fallback would then
+      // never be taken. The wrapper is not portable as written either (T-SQL
+      // rejects an ORDER BY inside a derived table without TOP/OFFSET, and the
+      // compiled child query carries one), so the pushdown stays with the
+      // dialect that owns the implementation until another engine ships its own
+      // and asserts it.
       buildPartitionLimit:
-        this.dialect.name === 'postgresql' && this.dialect.buildPartitionLimit
+        this.dialect.capabilities.partitionLimitPushdown && this.dialect.buildPartitionLimit
           ? (input) => this.dialect.buildPartitionLimit!(input)
           : undefined,
       skipGlobalFilters: skip,
@@ -2159,15 +2608,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
    *
    * When `sqlCache` is disabled, always calls `build()` without caching.
    *
-   * `build` receives a fresh `$N` param scratch array. On a miss those params
-   * are discarded (the returned params come from each call site's dedicated
-   * collect path); the array exists so the build path can number placeholders
-   * via `params.length` exactly as it does today. On a HIT, `build` is skipped
-   * here but re-run by {@link crossCheckCache} (dev only) with a fresh array to
-   * verify the collect path stayed in lockstep with the build path.
+   * `build` receives a fresh `$N` param scratch array. The executed params
+   * always come from each call site's dedicated collect path; on a miss the
+   * scratch params are kept in {@link lastMissParams} so `crossCheckCache` can
+   * compare the two. On a HIT, `build` is skipped here and re-run by
+   * {@link crossCheckCache} only when `diagnostics.cacheCheck` asks for it.
    *
-   * Sets {@link lastCacheHit} so the caller's `crossCheckCache` knows whether a
-   * cross-check is warranted.
+   * Sets {@link lastCacheHit} so the caller's `crossCheckCache` knows which
+   * comparison applies.
    */
   private acquireSql(cacheKey: string, build: (params: unknown[]) => string): SqlCacheEntry {
     if (!this.sqlCacheEnabled) {
@@ -2179,6 +2627,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (cached) {
       this.cacheHits++;
       this.lastCacheHit = true;
+      this.lastMissParams = undefined;
       return cached;
     }
 
@@ -2210,32 +2659,44 @@ export class QueryInterface<T extends object, R extends object = {}> {
    */
   private buildCacheEntry(build: (params: unknown[]) => string): SqlCacheEntry {
     this.variableArityShape = false;
-    const sql = build([]);
+    this.lastMissParams = undefined;
+    const built: unknown[] = [];
+    const sql = build(built);
     const variableArity = this.variableArityShape;
     this.variableArityShape = false;
     this.cacheMisses++;
-    return { sql, name: variableArity ? '' : sqlToPreparedName(sql) };
+    this.lastMissParams = built;
+    // With `sqlComment` putting a comment on every statement, the template's own
+    // name is never sent (the execute seam sends a `c_` name derived from it),
+    // so it is not claimed from the budget: only names that reach the wire do.
+    const name = variableArity
+      ? ''
+      : this.sqlCommenter?.alwaysComments
+        ? sqlToPreparedName(sql)
+        : boundedPreparedName(sql);
+    return { sql, name, paramCount: built.length };
   }
 
   /**
-   * Dev-mode SQL-cache lockstep cross-check (see {@link cacheCrossCheckEnabled}).
+   * The SQL-cache lockstep checks (see the comment above `CACHE_MISMATCH_WARN_NS`).
    *
-   * Runs only when the most recent {@link acquireSql} was a cache HIT and the
-   * check is enabled. Rebuilds the SQL + `$N` params fresh via the same `build`
-   * closure the caller passed to `acquireSql`, then compares:
+   * On a MISS: the collected params must equal the params the build pushed.
+   * On a HIT: the collected param count must equal the entry's, always; then,
+   * when `diagnostics.cacheCheck` selects this hit, the SQL and params are
+   * rebuilt fresh through the same closure and compared:
    *   (a) the cached SQL string byte-for-byte against the fresh SQL, and
-   *   (b) the params the cache-hit collect path produced against the fresh
-   *       build-path params (length and element-wise strict deep-equal).
+   *   (b) the collected params against the fresh build-path params (length
+   *       and element-wise strict deep-equal).
    *
    * A mismatch means the fingerprint / build / collect paths have drifted out
    * of lockstep (the exact class of bug that has silently corrupted results
-   * before), so it throws a {@link ValidationError} (E003) naming the
-   * fingerprint, the operation, and both SQL strings (truncated). Failing loud
-   * in dev/test is the point. Production never reaches the comparison.
+   * before), so it throws an {@link InvariantError} (E020) naming the
+   * fingerprint, the operation, and both SQL strings (truncated), never a
+   * parameter value.
    *
    * @param op human label of the calling build method (for the error message).
-   * @param cacheKey the cache fingerprint that HIT.
-   * @param entry the cached SQL entry that will be executed.
+   * @param cacheKey the cache fingerprint.
+   * @param entry the SQL entry that will be executed.
    * @param build the same closure passed to `acquireSql`; re-run here to
    *   capture the fresh build-path SQL + params.
    * @param collectedParams the params the caller's collect path produced.
@@ -2247,9 +2708,32 @@ export class QueryInterface<T extends object, R extends object = {}> {
     build: (params: unknown[]) => string,
     collectedParams: unknown[],
   ): void {
-    if (!this.lastCacheHit) return;
-    const mode = cacheCrossCheckMode();
-    if (mode === 'off') return;
+    if (!this.lastCacheHit) {
+      const built = this.lastMissParams;
+      this.lastMissParams = undefined;
+      if (built === undefined || cacheParamsEqual(collectedParams, built)) return;
+      throw this.lockstepError(
+        op,
+        cacheKey,
+        [
+          `built params and collected params diverge on a cache miss (collected ${collectedParams.length}, built ${built.length})`,
+        ],
+        false,
+      );
+    }
+    if (entry.paramCount !== undefined && collectedParams.length !== entry.paramCount) {
+      throw new InvariantError(
+        'sql-cache-param-count',
+        `SQL cache param count mismatch on ${op} (fingerprint "${cacheKey}"): the cached statement has ` +
+          `${entry.paramCount} placeholders but the cache hit collected ${collectedParams.length} params, so ` +
+          'the statement was not sent.',
+      );
+    }
+    const check = this.diagnostics.cacheCheck;
+    if (check === 'off') return;
+    const sampled = typeof check === 'object';
+    // The sampling decision, and only it, is per hit.
+    if (sampled && check.sample < 1 && Math.random() >= check.sample) return;
 
     const freshParams: unknown[] = [];
     const freshSql = build(freshParams);
@@ -2269,32 +2753,40 @@ export class QueryInterface<T extends object, R extends object = {}> {
         `cache-hit params and freshly-built params diverge (collected ${collectedParams.length}, built ${freshParams.length})`,
       );
     }
-    const message =
-      `SQL cache lockstep violation on ${op} (fingerprint "${cacheKey}"). ` +
-      `This is a Turbine internal invariant violation, please report it at ` +
-      `https://github.com/zvndev/turbine-orm/issues. The fingerprint, SQL-build, and ` +
-      `param-collect paths must enumerate where-clause keys identically.\n${details.join('\n')}`;
-    // Sampled production path: log once per distinct fingerprint so the failure
-    // is durably recorded in the server log before the throw unwinds the query.
-    // (Dev mode throws straight away; its behavior is unchanged.)
-    if (mode === 'sampled' && !loggedCacheMismatchFingerprints.has(cacheKey)) {
-      loggedCacheMismatchFingerprints.add(cacheKey);
-      console.error(message);
-    }
-    throw new ValidationError(message);
+    throw this.lockstepError(op, cacheKey, details, sampled);
   }
 
   /**
-   * Reset the per-instance unlimited-query warning dedupe set.
-   * Exposed for tests so a single test process can verify the warning fires
-   * exactly once per table without bleeding state between assertions.
+   * The `sql-cache-lockstep` {@link InvariantError}. When `log` is set (the
+   * sampled hit path) the failure is also logged once per table and shape, so
+   * it is durably recorded in the server log before the throw unwinds the
+   * query; the other paths throw straight away.
+   */
+  private lockstepError(op: string, cacheKey: string, details: string[], log: boolean): InvariantError {
+    const err = new InvariantError(
+      'sql-cache-lockstep',
+      `SQL cache lockstep violation on ${op} (fingerprint "${cacheKey}"). The fingerprint, SQL-build, and ` +
+        `param-collect paths must enumerate where-clause keys identically. ${INVARIANT_REPORT_HINT}\n` +
+        details.join('\n'),
+    );
+    if (log && shouldWarnOnce(CACHE_MISMATCH_WARN_NS, `${this.table}|${cacheKey}`)) {
+      logTo(this.logger, 'error', err.message, { code: 'cache-mismatch', table: this.table, operation: op });
+    }
+    return err;
+  }
+
+  /**
+   * Reset the unlimited-query warning dedupe, which is process-wide (see
+   * {@link maybeWarnUnlimited}). Exposed for tests so a single test process can
+   * verify the warning fires once per table without bleeding state between
+   * assertions.
    */
   resetUnlimitedWarnings(): void {
-    this.warnedTables.clear();
+    resetWarnOnce(WARN_NS.unlimitedFindMany);
   }
 
   private emitQueryEvent(
-    sql: string,
+    out: Outgoing,
     params: unknown[],
     duration: number,
     action: string,
@@ -2306,7 +2798,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (!onQuery) return;
     try {
       onQuery({
-        sql,
+        sql: out.sql,
         params,
         duration,
         model: this.table,
@@ -2316,10 +2808,26 @@ export class QueryInterface<T extends object, R extends object = {}> {
         error,
         strategy: this.currentStrategyTag,
         ...(retried ? { retried: true as const } : {}),
+        ...(out.comment === undefined ? {} : { comment: out.comment }),
       });
     } catch {
       // Listener errors must never crash a query
     }
+  }
+
+  /**
+   * The statement `sql` as it goes out under `preparedName`: with the
+   * `sqlComment` appended, and under the name that comment calls for (see
+   * query/sql-comment.ts). This is the one place a comment is added, at the
+   * execute seam and after the SQL-template cache, so the cache, its keys and
+   * its lockstep checks only ever see commentless text. Without `sqlComment`
+   * it is the statement unchanged.
+   */
+  private outgoing(sql: string, preparedName: string | undefined, action: string): Outgoing {
+    const commenter = this.sqlCommenter;
+    const c = commenter?.commentFor(this.table, action);
+    if (commenter === undefined || c === undefined) return { sql, text: sql, name: preparedName, comment: undefined };
+    return { sql, text: `${sql} ${c.comment}`, name: commenter.preparedName(preparedName, c), comment: c.comment };
   }
 
   /**
@@ -2427,19 +2935,38 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   /**
    * Execute a pool.query with an optional timeout.
-   * If timeout is set, races the query against a timer and rejects on expiry.
+   *
+   * On a node-postgres pool outside a transaction the timeout is enforced on
+   * the SERVER ({@link queryCancellable}). Anywhere else (a transaction's
+   * connection, an engine shim, an HTTP pool) it races the query against a
+   * timer: the call rejects on time but the statement keeps running, so the
+   * error's `outcome` is `'unknown'`.
+   *
    * pg driver errors are translated to typed Turbine errors via wrapPgError.
    * `retryIfStale` is {@link readWithTimeout}'s; nothing else sets it.
    */
   private async queryWithTimeout(
     sql: string,
     params: unknown[],
-    timeout?: number,
+    requestedTimeout?: number,
     preparedName?: string,
     retryIfStale = false,
+    pool: PgCompatPool = this.pool,
   ): Promise<PgCompatQueryResult> {
-    let start = performance.now();
     const action = this.currentAction;
+    const out = this.outgoing(sql, preparedName, action);
+    // 0 is no timeout, as it is for `$transaction`'s option and the server's statement_timeout.
+    const timeout = requestedTimeout === 0 ? undefined : requestedTimeout;
+    if (timeout !== undefined && pool === this.pool && this.cancelsOnTimeout()) {
+      return this.queryCancellable(out, params, timeout, retryIfStale, action);
+    }
+    if (timeout !== undefined && pool === this.pool && this.txScoped && this.dialect.capabilities.backendCancel) {
+      const state = transactionStateOf(this.pool);
+      if (state !== undefined && canCancelBackend(state.client)) {
+        return this.queryCancellableInTransaction(out, params, timeout, state, action);
+      }
+    }
+    let start = performance.now();
     // Build the query argument, use object form with `name` for prepared
     // statements, or the plain (text, values) form otherwise.
     //
@@ -2447,20 +2974,20 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // pool shims only speak `(text, values)`), so it is reached through a
     // cast. Guarded at runtime by `preparedStatementsEnabled`, which only the
     // drivers that accept it turn on.
-    const usePrepared = preparedName && this.preparedStatementsEnabled;
+    const usePrepared = out.name && this.preparedStatementsEnabled;
     const send = (): Promise<PgCompatQueryResult> =>
       usePrepared
-        ? (this.pool as unknown as { query(config: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query({
-            name: preparedName,
-            text: sql,
+        ? (pool as unknown as { query(config: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query({
+            name: out.name,
+            text: out.text,
             values: params,
           })
-        : this.pool.query(sql, params);
+        : pool.query(out.text, params);
     let exec = send();
     // Set when the caller's timeout has already answered, so a first attempt
     // that fails AFTER that does not send a retry nobody is waiting for.
     let abandoned = false;
-    if (retryIfStale && !this.txScoped) {
+    if (retryIfStale && !this.txScoped && pool === this.pool) {
       exec = exec.catch(async (err: unknown) => {
         if (abandoned || !isStaleConnectionError(err)) throw err;
         // The failed attempt is reported as its own event, marked `retried`,
@@ -2468,7 +2995,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         // CALLS can skip it. The final event below times the retry alone.
         const wrapped = wrapPgError(err);
         this.emitQueryEvent(
-          sql,
+          out,
           params,
           performance.now() - start,
           action,
@@ -2486,12 +3013,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (!timeout) {
       try {
         const result = await exec;
-        this.emitQueryEvent(sql, params, performance.now() - start, action, result.rowCount ?? 0);
+        this.emitQueryEvent(out, params, performance.now() - start, action, result.rowCount ?? 0);
         return result;
       } catch (err) {
         const wrapped = wrapPgError(err);
         this.emitQueryEvent(
-          sql,
+          out,
           params,
           performance.now() - start,
           action,
@@ -2505,17 +3032,24 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const timeoutPromise = new Promise<never>((_, reject) => {
       timer = setTimeout(() => {
         abandoned = true;
-        reject(new TimeoutError(timeout));
+        reject(
+          new TimeoutError(timeout, 'Query', {
+            outcome: 'unknown',
+            message:
+              `Query timed out after ${timeout}ms. It could not be cancelled on the server and may still ` +
+              'complete, so a write may have been applied: check before retrying it.',
+          }),
+        );
       }, timeout);
     });
     try {
       const result = await Promise.race([exec, timeoutPromise]);
-      this.emitQueryEvent(sql, params, performance.now() - start, action, result.rowCount ?? 0);
+      this.emitQueryEvent(out, params, performance.now() - start, action, result.rowCount ?? 0);
       return result;
     } catch (err) {
       const wrapped = wrapPgError(err);
       this.emitQueryEvent(
-        sql,
+        out,
         params,
         performance.now() - start,
         action,
@@ -2525,6 +3059,249 @@ export class QueryInterface<T extends object, R extends object = {}> {
       throw wrapped;
     } finally {
       clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Whether a timed statement can be stopped on the server: an engine with a
+   * protocol cancel (PostgreSQL) on a node-postgres pool, outside a transaction
+   * (inside one, the connection belongs to the transaction and is not this
+   * method's to cancel or destroy).
+   */
+  private cancelsOnTimeout(): boolean {
+    return !this.txScoped && this.dialect.capabilities.backendCancel && isNodePostgresPool(this.pool);
+  }
+
+  /**
+   * {@link queryWithTimeout} with a timeout the server enforces. The statement
+   * runs on a connection checked out for it, so when the deadline passes the
+   * backend running it is known and gets a protocol cancel request.
+   *
+   * The call then waits, at most {@link CANCEL_GRACE_MS}, for the statement to
+   * answer, and the answer decides the result:
+   *   - cancelled (57014): TimeoutError, `outcome: 'not-executed'`;
+   *   - finished first: the result, returned late, because reporting a write
+   *     that committed as a timeout invites a retry that applies it twice;
+   *   - failed: that error;
+   *   - no answer: TimeoutError, `outcome: 'unknown'`, and the connection is
+   *     destroyed rather than handed to the next caller still busy.
+   * A deadline that passes while still waiting for a connection sends nothing
+   * (`'not-executed'`). Either way the connection goes back to the pool only
+   * once its backend is idle, so timed-out statements cannot hold the pool.
+   */
+  private async queryCancellable(
+    out: Outgoing,
+    params: unknown[],
+    timeout: number,
+    retryIfStale: boolean,
+    action: string,
+  ): Promise<PgCompatQueryResult> {
+    let start = performance.now();
+    const config =
+      out.name && this.preparedStatementsEnabled ? { name: out.name, text: out.text, values: params } : null;
+    const report = (err: unknown, retried?: boolean): unknown => {
+      const wrapped = err instanceof TimeoutError ? err : wrapPgError(err);
+      const error = wrapped instanceof Error ? wrapped : undefined;
+      this.emitQueryEvent(out, params, performance.now() - start, action, 0, error, retried);
+      return wrapped;
+    };
+    let expired = false;
+    let expire: (value: typeof TIMED_OUT) => void = () => {};
+    const deadline = new Promise<typeof TIMED_OUT>((resolve) => {
+      expire = resolve;
+    });
+    const timer = setTimeout(() => {
+      expired = true;
+      expire(TIMED_OUT);
+    }, timeout);
+    const neverSent = (): TimeoutError =>
+      new TimeoutError(timeout, 'Query', {
+        outcome: 'not-executed',
+        message: `Query timed out after ${timeout}ms before it reached the server. It made no change.`,
+      });
+    try {
+      for (let attempt = 0; ; attempt++) {
+        const checkingOut = acquireConnection(this.pool);
+        let held: Checkout | typeof TIMED_OUT;
+        try {
+          held = await Promise.race([checkingOut, deadline]);
+        } catch (err) {
+          throw report(err);
+        }
+        if (held === TIMED_OUT) {
+          checkingOut.then(
+            (late) => late.checkout.release(),
+            () => {},
+          );
+          throw report(neverSent());
+        }
+        const { client, checkout } = held;
+        const running: Promise<Settled> = (
+          config
+            ? (client as unknown as { query(c: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query(config)
+            : client.query(out.text, params)
+        ).then(
+          (result) => ({ result }),
+          (error: unknown) => ({ error }),
+        );
+        const first = await Promise.race([running, deadline]);
+        const settled = first === TIMED_OUT ? await this.cancelTimedOut(held, running, timeout) : first;
+        if ('result' in settled) {
+          if (first !== TIMED_OUT) checkout.release();
+          this.emitQueryEvent(out, params, performance.now() - start, action, settled.result.rowCount ?? 0);
+          return settled.result;
+        }
+        if ('timeout' in settled) throw report(settled.timeout);
+        const err = settled.error;
+        if (first === TIMED_OUT) throw report(err);
+        checkout.release(err instanceof Error ? err : true);
+        if (!(retryIfStale && attempt === 0 && isStaleConnectionError(err))) throw report(err);
+        report(err, true);
+        await settleEventLoop();
+        if (expired) throw report(neverSent());
+        start = performance.now();
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * A timed statement inside a transaction, cancelled on the server when the
+   * deadline passes, on the transaction's own connection.
+   *
+   * A cancelled statement made no change, but PostgreSQL aborts the
+   * transaction it ran in, so the timeout ends the transaction too: it is
+   * marked to roll back ({@link TransactionState.abort}), which also covers a
+   * cancel that arrived after the statement finished. The error is
+   * `outcome: 'not-executed'` either way, because nothing it did can commit.
+   * A statement that finishes before the deadline is returned as usual.
+   */
+  private async queryCancellableInTransaction(
+    out: Outgoing,
+    params: unknown[],
+    timeout: number,
+    state: TransactionState,
+    action: string,
+  ): Promise<PgCompatQueryResult> {
+    const start = performance.now();
+    const running: Promise<Settled> = (
+      out.name && this.preparedStatementsEnabled
+        ? (this.pool as unknown as { query(c: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query({
+            name: out.name,
+            text: out.text,
+            values: params,
+          })
+        : this.pool.query(out.text, params)
+    ).then(
+      (result) => ({ result }),
+      (error: unknown) => ({ error }),
+    );
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<typeof TIMED_OUT>((resolve) => {
+      timer = setTimeout(() => resolve(TIMED_OUT), timeout);
+    });
+    let settled: Settled | { timeout: TimeoutError };
+    try {
+      const first = await Promise.race([running, deadline]);
+      settled = first === TIMED_OUT ? await this.cancelInTransaction(state, running, timeout) : first;
+    } finally {
+      clearTimeout(timer);
+    }
+    if ('result' in settled) {
+      this.emitQueryEvent(out, params, performance.now() - start, action, settled.result.rowCount ?? 0);
+      return settled.result;
+    }
+    const err = 'timeout' in settled ? settled.timeout : wrapPgError(settled.error);
+    this.emitQueryEvent(out, params, performance.now() - start, action, 0, err instanceof Error ? err : undefined);
+    throw err;
+  }
+
+  /** Cancel a timed-out statement in a transaction and end the transaction. See {@link queryCancellableInTransaction}. */
+  private async cancelInTransaction(
+    state: TransactionState,
+    running: Promise<Settled>,
+    timeout: number,
+  ): Promise<Settled | { timeout: TimeoutError }> {
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    const graceOver = new Promise<typeof TIMED_OUT>((resolve) => {
+      graceTimer = setTimeout(() => resolve(TIMED_OUT), CANCEL_GRACE_MS);
+    });
+    try {
+      await Promise.race([sendCancelRequest(state.client, CANCEL_GRACE_MS), graceOver]);
+      const answer = await Promise.race([running, graceOver]);
+      if (answer !== TIMED_OUT && 'result' in answer) return answer;
+      const cancelled = answer !== TIMED_OUT && isQueryCanceled(answer.error);
+      if (answer !== TIMED_OUT && !cancelled) return answer;
+      const error = new TimeoutError(timeout, 'Query', {
+        outcome: 'not-executed',
+        ...(cancelled ? { cause: answer.error } : {}),
+        message:
+          (cancelled
+            ? `Query timed out after ${timeout}ms and was cancelled on the server, so it made no change. `
+            : `Query timed out after ${timeout}ms, and the server did not confirm its cancellation within ` +
+              `${CANCEL_GRACE_MS}ms. `) +
+          'The transaction it ran in is over: it rolls back instead of committing, and no statement in it is ' +
+          'kept. Let this error leave the transaction callback and retry the whole transaction, or run a ' +
+          'statement that may time out in a nested `tx.$transaction(...)`, which rolls back only that block.',
+      });
+      state.abort(error);
+      return { timeout: error };
+    } finally {
+      clearTimeout(graceTimer);
+    }
+  }
+
+  /**
+   * Cancel a statement that outlived its timeout, wait for it to answer, and
+   * release its connection accordingly. See {@link queryCancellable}.
+   */
+  private async cancelTimedOut(
+    held: Checkout,
+    running: Promise<Settled>,
+    timeout: number,
+  ): Promise<Settled | { timeout: TimeoutError }> {
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    const graceOver = new Promise<typeof TIMED_OUT>((resolve) => {
+      graceTimer = setTimeout(() => resolve(TIMED_OUT), CANCEL_GRACE_MS);
+    });
+    try {
+      const delivered = await Promise.race([sendCancelRequest(held.client, CANCEL_GRACE_MS), graceOver]);
+      const answer = await Promise.race([running, graceOver]);
+      if (answer === TIMED_OUT) {
+        held.checkout.release(new Error('the statement did not stop after a cancel request'));
+        return {
+          timeout: new TimeoutError(timeout, 'Query', {
+            outcome: 'unknown',
+            message:
+              `Query timed out after ${timeout}ms and the server did not confirm its cancellation within ` +
+              `${CANCEL_GRACE_MS}ms, so it may still complete and a write may have been applied: check before ` +
+              'retrying it. The connection was closed.',
+          }),
+        };
+      }
+      // A cancel that was sent but not confirmed could still land on the NEXT
+      // statement this connection runs, so such a connection is not reused.
+      const reusable = delivered === true;
+      if ('result' in answer) {
+        held.checkout.release(reusable ? undefined : true);
+        return answer;
+      }
+      const err = answer.error;
+      if (reusable && (err as { code?: unknown } | null)?.code === '57014') {
+        held.checkout.release();
+        return {
+          timeout: new TimeoutError(timeout, 'Query', {
+            outcome: 'not-executed',
+            cause: err,
+            message: `Query timed out after ${timeout}ms and was cancelled on the server. It made no change.`,
+          }),
+        };
+      }
+      held.checkout.release(err instanceof Error ? err : true);
+      return answer;
+    } finally {
+      clearTimeout(graceTimer);
     }
   }
 
@@ -2542,14 +3319,117 @@ export class QueryInterface<T extends object, R extends object = {}> {
    *     write and a follow-up SELECT; the SELECT's rows feed the transform.
    */
   private async executeMutation<V>(deferred: DeferredQuery<V>, timeout?: number): Promise<V> {
-    if (this.dialect.resultStrategy === 'reselect' && deferred.reselect) {
-      const exec: ReselectExecutor = (sql, params, preparedName) =>
-        this.queryWithTimeout(sql, params, timeout, preparedName);
-      const result = await deferred.reselect(exec);
-      return deferred.transform(result);
+    const reselect = deferred.reselect;
+    if (this.dialect.resultStrategy === 'reselect' && reselect) {
+      // One transaction, so the row returned is the row this call wrote, and
+      // the transform runs before COMMIT so a refusal it raises writes nothing.
+      return this.inOneTransaction(
+        async (exec) => deferred.transform(await reselect(exec)),
+        timeout,
+        `A ${this.dialect.name} write`,
+        'Pass a pool that can check out a connection.',
+      );
     }
     const result = await this.queryWithTimeout(deferred.sql, deferred.params, timeout, deferred.preparedName);
     return deferred.transform(result);
+  }
+
+  /**
+   * The executor for a write's statements, sharing one deadline: each one gets
+   * what is left of `timeout`, so a chunked `createMany` or a lock, write and
+   * re-read cannot run for N times the timeout. A statement due past the
+   * deadline is not sent. `onClient` routes them to a held connection.
+   */
+  private deadlineExec(timeout: number | undefined, onClient?: PgCompatPool): ReselectExecutor {
+    const deadline = timeout ? performance.now() + timeout : undefined;
+    return async (sql, params, preparedName) => {
+      let left = timeout;
+      if (deadline !== undefined) {
+        left = Math.ceil(deadline - performance.now());
+        if (left <= 0) {
+          throw new TimeoutError(timeout as number, 'Query', {
+            outcome: 'not-executed',
+            message:
+              `Query timed out after ${timeout}ms: the write's statements share one deadline, and it passed ` +
+              'before the next one was sent. Its earlier statements are rolled back, so it makes no change.',
+          });
+        }
+      }
+      return onClient
+        ? this.queryWithTimeout(sql, params, left, preparedName, false, onClient)
+        : this.queryWithTimeout(sql, params, left, preparedName);
+    };
+  }
+
+  /**
+   * Run a write that takes several statements as one transaction on one
+   * connection: the caller's transaction when there is one, else one opened
+   * here. A statement that times out is cancelled where the engine allows it,
+   * and its connection is closed rather than rolled back (a ROLLBACK would wait
+   * behind it); the transaction never commits, so the write made no change.
+   * `timeout` is one deadline for every statement (see {@link deadlineExec}).
+   */
+  private async inOneTransaction<V>(
+    work: (exec: ReselectExecutor) => Promise<V>,
+    timeout: number | undefined,
+    operation: string,
+    alternative: string,
+  ): Promise<V> {
+    if (this.txScoped) {
+      // In the caller's transaction, a savepoint keeps the write whole: a later
+      // statement that fails and is caught cannot leave the earlier ones behind.
+      return withSavepoint(this.pool, () => work(this.deadlineExec(timeout)));
+    }
+    if (typeof (this.pool as { connect?: unknown }).connect !== 'function') {
+      throw new UnsupportedFeatureError(
+        `${operation} on a pool without connect()`,
+        this.dialect.name,
+        `${operation} runs several statements in one transaction, which needs a connection of its own, and ` +
+          `this pool cannot check one out (a stateless HTTP driver). ${alternative}`,
+      );
+    }
+    const { client, checkout } = await openCheckout(this.pool, (c) => c.query(this.dialect.beginStatement()));
+    const onClient = {
+      query: (text: string | PgCompatQueryConfig, values?: unknown[]) =>
+        typeof text === 'string'
+          ? client.query(text, values)
+          : (client as unknown as { query(c: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query(text),
+    } as unknown as PgCompatPool;
+    try {
+      const value = await work(this.deadlineExec(timeout, onClient));
+      await client.query(this.dialect.commitStatement());
+      checkout.release();
+      return value;
+    } catch (err) {
+      if (err instanceof TimeoutError) {
+        if (await sendCancelRequest(client, CANCEL_GRACE_MS)) {
+          checkout.release(err);
+        } else {
+          // No cancel reached the server (or the engine has none), so the
+          // statement may still be running. The ROLLBACK queues behind it on
+          // this connection, and the connection goes back to the pool only
+          // after it: never with the transaction still open.
+          client.query(this.dialect.rollbackStatement()).then(
+            () => checkout.release(),
+            (e: unknown) => checkout.release(e instanceof Error ? e : true),
+          );
+        }
+        throw new TimeoutError(err.timeoutMs, 'Query', {
+          outcome: 'not-executed',
+          cause: err,
+          message:
+            `Query timed out after ${err.timeoutMs}ms. Its transaction is rolled back rather than committed, ` +
+            'so it makes no change.',
+        });
+      }
+      try {
+        await client.query(this.dialect.rollbackStatement());
+      } catch {
+        // Best effort: the connection may be gone.
+      }
+      checkout.release();
+      throw explainConnectionLoss(wrapPgError(err), checkout.lostWith);
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -2559,7 +3439,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
   buildCreate<
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: CreateArgs<T, R, S, O>): DeferredQuery<FieldResult<T, S, O>> {
+  >(args: CreateArgs<T, R, S, O, M['create']>): DeferredQuery<FieldResult<T, S, O>> {
+    args = this.normalizeArgs(args);
     return writesMod.buildCreate(
       this.ctx,
       args as CreateArgs<T>,
@@ -2590,14 +3471,24 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return { columns };
   }
 
-  buildCreateMany(args: CreateManyArgs<T>): DeferredQuery<T[]> {
-    return writesMod.buildCreateMany(this.ctx, args);
+  buildCreateMany<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: CreateManyArgs<T, M['createMany'], S, O>): DeferredQuery<FieldResult<T, S, O>[]> {
+    args = this.normalizeArgs(args);
+    return writesMod.buildCreateMany(
+      this.ctx,
+      args as unknown as CreateManyArgs<T>,
+      'refuse',
+      this.resolveWriteProjection(args),
+    ) as unknown as DeferredQuery<FieldResult<T, S, O>[]>;
   }
 
   buildUpdate<
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: UpdateArgs<T, R, S, O>): DeferredQuery<FieldResult<T, S, O>> {
+  >(args: UpdateArgs<T, R, S, O, M['update']>): DeferredQuery<FieldResult<T, S, O>> {
+    args = this.normalizeArgs(args);
     return writesMod.buildUpdate(
       this.ctx,
       args as UpdateArgs<T>,
@@ -2609,6 +3500,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args: DeleteArgs<T, R, S, O>): DeferredQuery<FieldResult<T, S, O>> {
+    args = this.normalizeArgs(args);
     return writesMod.buildDelete(
       this.ctx,
       args as DeleteArgs<T>,
@@ -2619,7 +3511,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
   buildUpsert<
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: UpsertArgs<T, R, S, O>): DeferredQuery<FieldResult<T, S, O>> {
+  >(
+    args: UpsertArgs<T, R, S, O, M['whereUnique'], M['createMany'], M['updateMany']>,
+  ): DeferredQuery<FieldResult<T, S, O>> {
+    args = this.normalizeArgs(args);
     return writesMod.buildUpsert(
       this.ctx,
       args as UpsertArgs<T>,
@@ -2627,12 +3522,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
     ) as unknown as DeferredQuery<FieldResult<T, S, O>>;
   }
 
-  buildUpdateMany(args: UpdateManyArgs<T>): DeferredQuery<{ count: number }> {
-    return writesMod.buildUpdateMany(this.ctx, args);
+  buildUpdateMany(args: UpdateManyArgs<T, R, M['updateMany']>): DeferredQuery<{ count: number }> {
+    return writesMod.buildUpdateMany(this.ctx, this.normalizeArgs(args));
   }
 
-  buildDeleteMany(args: DeleteManyArgs<T>): DeferredQuery<{ count: number }> {
-    return writesMod.buildDeleteMany(this.ctx, args);
+  buildDeleteMany(args: DeleteManyArgs<T, R>): DeferredQuery<{ count: number }> {
+    return writesMod.buildDeleteMany(this.ctx, this.normalizeArgs(args));
   }
 
   /**
@@ -2650,11 +3545,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * If no middlewares are registered, executes directly.
    *
    * Middleware can inspect and log query parameters, measure timing, and
-   * transform the result returned by `next()`. Note: query SQL is generated
-   * BEFORE middleware runs, `params.args` is a read-only snapshot, and
-   * mutating it does NOT change the executed SQL. Cross-cutting filters
-   * (e.g. soft deletes) belong in the query itself: pass an explicit
-   * `where: { deletedAt: null }` or wrap the table accessor in a small helper.
+   * transform the result returned by `next()`. `params.args` is a plain copy
+   * (see `readOnlyMiddlewareParams`): the query is compiled from the caller's
+   * args, so `next()` throws a TypeError when the copy was changed. Cross-cutting
+   * filters (e.g. soft deletes) belong in the query itself, or in `globalFilters`.
    */
   private async executeWithMiddleware<R>(
     action: string,
@@ -2667,16 +3561,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // can be complete. Putting it in each method instead would mean fifteen
     // sites and a new one every time an operation is added, which is precisely
     // how the surface it checks came to need checking.
-    warnUnknownQueryOptions(this.table, action, args);
+    warnUnknownQueryOptions(this.table, action, args, this.advice ?? null);
     if (this.middlewares.length === 0) {
       return executor();
     }
 
-    const params = { model: this.table, action, args: { ...args } };
+    // A copy: the query is compiled from `args`, not from what middleware
+    // sees, so `next()` throws on a changed copy rather than doing nothing.
+    const params = readOnlyMiddlewareParams(this.table, action, args);
 
     // Build middleware chain
     let index = 0;
     const next = async (p: { model: string; action: string; args: Record<string, unknown> }): Promise<unknown> => {
+      assertMiddlewareArgsKept(params, p);
       if (index < this.middlewares.length) {
         const mw = this.middlewares[index++]!;
         return mw(p, next);
@@ -2697,7 +3594,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     W extends TypedWithClause<R> = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: FindUniqueArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O> | null> {
+  >(args: FindUniqueArgs<T, R, W, S, O, M['whereUnique']>): Promise<QueryResult<T, R, W, S, O> | null> {
     // BEFORE the strategy branch, not only inside the builders, so the
     // join-vs-batched decision and its dev warning see the same declared name
     // every other stage does. `planAuto` splits `with` on the caller's keys and
@@ -2707,6 +3604,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // nothing else). It is here so the invariant holds at the seam rather than
     // depending on every consumer to re-establish it.
     args = this.normalizeArgs(args);
+    this.assertLockInTransaction(args, 'findUnique');
     return this.executeWithMiddleware('findUnique', args as unknown as Record<string, unknown>, async () => {
       if (args.with) {
         const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
@@ -2787,7 +3685,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     W extends TypedWithClause<R> = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: FindUniqueArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O> | null> {
+  >(args: FindUniqueArgs<T, R, W, S, O, M['whereUnique']>): DeferredQuery<QueryResult<T, R, W, S, O> | null> {
+    // Canonical args FIRST: the empty-where guard and the unique-key rule below
+    // must read the pruned `where`, never one still carrying `undefined` keys.
+    args = this.normalizeArgs(args);
     this.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
     // Pinned before the cache key, which carries it (see buildFindMany).
     const jsonEncoding = this.resolveJsonEncoding(args.jsonEncoding);
@@ -2809,9 +3710,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // deliberately so: a tenant filter is not a unique selector, and letting it
     // satisfy this would still hand back an arbitrary row from inside the tenant.
     //
-    // `findFirst` is intentionally NOT guarded. "The first row matching an
-    // optional filter" is its whole contract and Prisma's `findFirst` behaves
-    // the same way; ask for one row by identity with `findUnique`.
+    // `findFirst` takes no such guard: "the first row matching an optional
+    // filter" is its contract, and `where: {}` or no `where` asks for any row.
+    // It refuses only a `where` that was emptied by `undefined` values (see
+    // normalizeArgs), which never meant "any row".
     if (whereMod.userPredicateIsEmpty(this.ctx, (args.where ?? {}) as Record<string, unknown>)) {
       throw new ValidationError(
         `findUnique on "${this.table}" refused: the \`where\` clause has no predicate, ` +
@@ -2833,9 +3735,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // a global filter is not an identity, and letting one satisfy this would
     // hand back an arbitrary row from inside the tenant.
     this.assertFindUniqueKey(args.where as Record<string, unknown>);
-    // Declared relation spellings first, before stable-order and the
-    // fingerprint (see buildFindMany).
-    args = this.normalizeArgs(args);
+    // The locking clause, read by the cache key and all three SQL paths below.
+    const rowLock = resolveRowLock(args.lock, this.dialect, this.table);
+    const lockSql = rowLock?.sql ?? '';
     // Stable relation order (opt-in): fill PK-asc orderBy into unordered to-many
     // relations before fingerprinting (see buildFindMany).
     if (args.with && this.resolveStableOrder(args.stableRelationOrder)) {
@@ -2864,7 +3766,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // `|je=`: same rule and same hazard as in buildFindMany. findUnique is never
     // flatten-planned, so this is the only plan-shape segment it needs.
     const encodingFp = `|je=${jsonEncoding === 'positional' ? 'p' : 'o'}`;
-    const ck = `fu:${whereFingerprint}|c=${colKey}|w=${withFp}|pii=${includePii ? 1 : 0}${encodingFp}${this.globalFilterCacheSegment()}`;
+    // Empty without a lock, so every unlocked key is unchanged.
+    const lockFp = rowLock ? `|lk=${rowLock.fp}` : '';
+    const ck = `fu:${whereFingerprint}|c=${colKey}|w=${withFp}|pii=${includePii ? 1 : 0}${encodingFp}${lockFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
@@ -2874,15 +3778,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
     const whereKeys = Object.keys(whereObj)
       .filter((k) => whereObj[k] !== undefined)
       .sort();
+    // Only a scalar the general path would accept as it is (a primitive, Date
+    // or Buffer) on a non-JSON column takes the simple path, so no operand
+    // reaches SQL without the general path's validation. Resolved, not looked
+    // up: a relation filter spelled the snake_case way must not read as a
+    // plain equality.
     const isSimpleWhere =
       !whereObj.OR &&
       !whereObj.AND &&
       !whereObj.NOT &&
       whereKeys.every((k) => {
-        const v = whereObj[k];
-        // Resolved, not looked up: a relation filter spelled the snake_case
-        // way must not read as a plain equality and take the simple path.
-        return v !== null && !isWhereOperator(v) && !resolveRelationDef(this.tableMeta.relations, k);
+        if (!isFastPathScalar(whereObj[k]) || resolveRelationDef(this.tableMeta.relations, k)) return false;
+        const column = resolveColumnName(this.tableMeta, k);
+        return column !== undefined && !this.isJsonColumnType(this.getColumnPgType(column));
       });
 
     // Simple path: plain equality, no operators/null/OR.
@@ -2905,7 +3813,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         });
         const whereSql = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
         const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${this.q(c)}`).join(', ') : `${qt}.*`;
-        return `SELECT ${selectExpr} FROM ${qt}${whereSql}${this.limitOneClause()}`;
+        return `SELECT ${selectExpr} FROM ${qt}${whereSql}${this.limitOneClause()}${lockSql}`;
       };
       const entry = this.acquireSql(ck, buildSql);
 
@@ -2924,6 +3832,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         },
         tag: `${this.table}.findUnique`,
         preparedName: entry.name,
+        ...rowLockMarker(rowLock),
       };
     }
 
@@ -2934,7 +3843,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         const whereSql = clause ? ` WHERE ${clause}` : '';
         const qt = this.q(this.table);
         const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${this.q(c)}`).join(', ') : `${qt}.*`;
-        return `SELECT ${selectExpr} FROM ${qt}${whereSql}${this.limitOneClause()}`;
+        return `SELECT ${selectExpr} FROM ${qt}${whereSql}${this.limitOneClause()}${lockSql}`;
       };
       const entry = this.acquireSql(ck, buildSql);
 
@@ -2951,6 +3860,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         },
         tag: `${this.table}.findUnique`,
         preparedName: entry.name,
+        ...rowLockMarker(rowLock),
       };
     }
 
@@ -2971,7 +3881,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         undefined,
         includePii,
       );
-      return `SELECT ${selectClause} FROM ${this.q(this.table)}${whereSql}${this.limitOneClause()}`;
+      return `SELECT ${selectClause} FROM ${this.q(this.table)}${whereSql}${this.limitOneClause()}${lockSql}`;
     };
     const entry = this.acquireSql(ck, buildSql);
 
@@ -2991,6 +3901,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
       },
       tag: `${this.table}.findUnique`,
       preparedName: entry.name,
+      ...rowLockMarker(rowLock),
     };
   }
 
@@ -3013,22 +3924,26 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // nothing else). It is here so the invariant holds at the seam rather than
     // depending on every consumer to re-establish it.
     args = this.normalizeArgs(args);
+    this.assertLockInTransaction(args, 'findMany');
     this.maybeWarnUnlimited(args);
     this.maybeWarnUnorderedPage(args);
 
-    // Dev-only: warn on deeply nested with clauses
-    if (process.env.NODE_ENV !== 'production') {
-      if (args?.with) {
-        const depth = this.measureWithDepth(args.with as WithClause);
-        if (depth > 5 && shouldWarnOnce(WARN_NS.deepWith, this.table)) {
-          console.warn(
-            `[turbine] Deep with clause (depth ${depth}) on "${this.tableMeta.name}": every level is a ` +
-              'correlated subquery the engine re-evaluates once per row of the level above, so the work ' +
-              'multiplies down the tree and the whole subtree is built as JSON inside each parent row. Split ' +
-              "into separate queries, or use `relationLoadStrategy: 'batched'` (one flat statement per " +
-              'relation, no per-parent re-evaluation). Dev-only: silent under `NODE_ENV=production`.',
-          );
-        }
+    // Advice: warn on deeply nested with clauses.
+    const advice = this.advice;
+    if (advice && args?.with) {
+      const depth = this.measureWithDepth(args.with as WithClause);
+      if (depth > 5 && shouldWarnOnce(WARN_NS.deepWith, this.table)) {
+        logTo(
+          advice,
+          'warn',
+          `Deep with clause (depth ${depth}) on "${this.tableMeta.name}": every level is a ` +
+            'correlated subquery the engine re-evaluates once per row of the level above, so the work ' +
+            'multiplies down the tree and the whole subtree is built as JSON inside each parent row. Split ' +
+            "into separate queries, or use `relationLoadStrategy: 'batched'` (one flat statement per " +
+            'relation, no per-parent re-evaluation). Advice: silent when `diagnostics.advice` is off, as it ' +
+            'is by default in production.',
+          { code: 'deep-with', table: this.table, operation: 'findMany', depth },
+        );
       }
     }
 
@@ -3122,11 +4037,13 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
-   * Emit a one-time `console.warn` when {@link findMany} is called without an
+   * Emit a one-time warning when {@link findMany} is called without an
    * explicit `limit`/`take` and `warnOnUnlimited` has not been disabled.
    *
-   * Deduped per QueryInterface instance via {@link warnedTables} so a busy
-   * loop calling `db.users.findMany()` thousands of times only logs once.
+   * Said once per table per process (`WARN_NS.unlimitedFindMany`), so a busy
+   * loop calling `db.users.findMany()` thousands of times logs once, and so
+   * does the same call inside every `$transaction`, which builds its own
+   * query interfaces.
    * Suppressed when `defaultLimit` is configured (the caller has already
    * opted in to a bounded query) and when the user passed an explicit
    * `limit`, `take`, or `cursor`. A per-call `warnOnUnlimited` overrides the
@@ -3139,17 +4056,19 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (perCall === false) return;
     if (perCall === undefined && !this.warnOnUnlimited) return;
     if (this.defaultLimit !== undefined) return;
-    const hasExplicitLimit = args?.limit !== undefined || args?.cursor !== undefined;
+    const hasExplicitLimit = args?.limit !== undefined || hasCursor(args?.cursor);
     if (hasExplicitLimit) return;
     if (this.whereMatchesAtMostOneRow((args as { where?: unknown } | undefined)?.where)) return;
-    if (this.warnedTables.has(this.table)) return;
-    this.warnedTables.add(this.table);
-    console.warn(
-      `[turbine] warning: findMany on "${this.table}" has no limit: the statement is emitted with no row limit, ` +
+    if (!shouldWarnOnce(WARN_NS.unlimitedFindMany, this.table)) return;
+    logTo(
+      this.logger,
+      'warn',
+      `warning: findMany on "${this.table}" has no limit: the statement is emitted with no row limit, ` +
         'so the engine returns every matching row and the driver materializes all of them as objects before ' +
         'this call resolves (the cost grows with the table, not with the rows you use). Pass `limit`/`take`, ' +
         'or set `defaultLimit` in the client config; silence with `warnOnUnlimited: false` (per call, per ' +
         'table, or in config).',
+      { code: 'unlimited-find-many', table: this.table, operation: 'findMany' },
     );
   }
 
@@ -3198,7 +4117,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
 
   /**
    * Recursively measure the maximum depth of a `with` clause tree.
-   * Used by the dev-only deep-with warning guard.
+   * Used by the deep-with advice.
    */
   private measureWithDepth(withClause: WithClause): number {
     let maxDepth = 1;
@@ -3254,7 +4173,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (args?.orderBy !== undefined) {
       const deduped = dedupeOrderEntries(this.tableMeta, orderByEntries(args.orderBy), this.table);
       if (deduped) {
-        warnRedundantSortTerm(this.table, 'orderBy', deduped.dropped);
+        warnRedundantSortTerm(this.advice, this.table, 'orderBy', deduped.dropped);
         args = {
           ...args,
           orderBy: deduped.entries.map(([k, v]) => ({ [k]: v })) as NonNullable<typeof args>['orderBy'],
@@ -3264,7 +4183,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (args?.distinct && args.distinct.length > 0) {
       const deduped = dedupeColumnList(this.tableMeta, args.distinct as string[]);
       if (deduped) {
-        warnRedundantSortTerm(this.table, 'distinct', deduped.dropped);
+        warnRedundantSortTerm(this.advice, this.table, 'distinct', deduped.dropped);
         args = { ...args, distinct: deduped.columns as NonNullable<typeof args>['distinct'] };
       }
     }
@@ -3274,32 +4193,41 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // `implicitPkOrdering` is enabled (see implicitPkOrderBy).
     const implicitOrder = this.implicitPkOrderBy(args);
     if (implicitOrder) args = { ...args, orderBy: implicitOrder as NonNullable<typeof args>['orderBy'] };
+    // A `cursor` that names no row (`null`, `{}`) is refused before either
+    // reader below asks whether there is one.
+    assertCursorWritten(this.table, 'findMany', args?.cursor);
+    // A page whose order can tie gets the cursor tiebreaker (completePageOrder),
+    // before fingerprinting, so the cache key carries it.
+    if (args) args = this.completePageOrder(args as NonNullable<typeof args>);
+    // A cursor page is planned (and its orderBy completed to the effective
+    // order) BEFORE fingerprinting, so the key, the SQL and the param collect
+    // all read one plan. See planCursor.
+    let cursorPlan: CursorPlan | undefined;
+    if (hasCursor(args?.cursor)) ({ args, plan: cursorPlan } = this.planCursor(args as NonNullable<typeof args>));
     // `distinct` compiles to `SELECT DISTINCT ON (...)`, which is PostgreSQL
     // syntax and nothing else's. Every other engine parsed it as far as the
     // word `ON` and answered with a RAW driver error carrying no TURBINE_ code
     // (SQLite: `near "ON": syntax error`; MySQL: ER_PARSE_ERROR), i.e. the one
     // shape the typed-error surface exists to prevent. Refused with the same
-    // E017 the OTHER spelling of this feature already used, `groupBy({
-    // distinctOn })` in aggregates.ts, which was gated correctly all along.
-    //
-    // `dialect.name` rather than a new capability flag, deliberately, and this
-    // is the exception to the "capability flags, not engine names" rule the
-    // rest of the dialect follows: every engine dialect is built by SPREADING
-    // `postgresDialect`, so a flag defaulting to `true` would be inherited by
-    // all of them (which is the bug) and one defaulting to `false` would have
-    // to be re-declared on Postgres-compatible dialects that already work.
-    // The established precedent for exactly this feature is the `dialect.name`
-    // test in `buildDistinctOnSource`.
+    // E017, on the same `distinctOn` capability, as the OTHER spelling of this
+    // feature, `groupBy({ distinctOn })` in aggregates.ts.
     //
     // Before the cache, like the two guards below, so a warmed template cannot
     // serve the query the cold path refuses.
-    if (args?.distinct && args.distinct.length > 0 && this.dialect.name !== 'postgresql') {
+    if (args?.distinct && args.distinct.length > 0 && !this.dialect.capabilities.distinctOn) {
       throw new UnsupportedFeatureError(
         'DISTINCT ON (findMany distinct)',
         this.dialect.name,
         'findMany({ distinct }) requires PostgreSQL: SELECT DISTINCT ON is not portable. Group in ' +
           'application code, or use groupBy({ by }) for one row per combination.',
       );
+    }
+    // The locking clause, validated and rendered once: the cache key and the
+    // SQL both read this value. PostgreSQL refuses a lock on a DISTINCT query
+    // (0A000), so that pair is refused here, before the cache.
+    const rowLock = resolveRowLock(args?.lock, this.dialect, this.table);
+    if (rowLock && args?.distinct && args.distinct.length > 0) {
+      throw new ValidationError(lockWithDistinctMessage(this.table));
     }
     // `distinct` + relation orderBy is refused up front (E003): the distinct
     // path re-orders in an outer wrapper (`... AS "<table>_distinct" ORDER BY
@@ -3350,14 +4278,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
           })
           .join(',')
       : '';
-    // Keyset order AND per-field direction: a multi-field cursor's predicate
-    // is one OR-branch per field in orderBy precedence, and `<` / `>` are SQL
-    // text, so `asc` and `desc` (or two precedences) can never share a template.
-    const cursorFp = args?.cursor
-      ? this.cursorSeekEntries(args.cursor as Record<string, unknown>, args.orderBy)
-          .map((e) => `${e.column}:${e.desc ? 'd' : 'a'}`)
-          .join(',')
-      : '';
+    // Mode, keyset order, directions, NULL placement and which values are
+    // NULL all change the predicate's SQL text (see planCursor).
+    const cursorFp = cursorPlan?.fingerprint ?? '';
     // distinct must fingerprint in USER order: the SQL emits `DISTINCT ON` in
     // the caller's column order, so a permuted array rebuilds different SQL and
     // must not collapse onto the same cache entry (would trip the cross-check).
@@ -3400,7 +4323,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // happens to be.
     const encodingFp = `|je=${jsonEncoding === 'positional' ? 'p' : 'o'}`;
 
-    const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}|pii=${includePii ? 1 : 0}${flattenFp}${encodingFp}${this.globalFilterCacheSegment()}`;
+    // Empty without a lock, so every unlocked key is unchanged.
+    const lockFp = rowLock ? `|lk=${rowLock.fp}` : '';
+
+    const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}|pii=${includePii ? 1 : 0}${flattenFp}${encodingFp}${lockFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
@@ -3480,18 +4406,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // WHERE + cursor conditions accumulate into `tail`, pushing params in
       // where → cursor order (the collect path mirrors this exactly).
       let tail = freshWhereSql;
-      if (args?.cursor) {
-        // Keyset order (orderBy precedence), MUST match cursorFp and the
-        // cache-hit collect below: both go through cursorSeekEntries.
-        const seek = this.cursorSeekEntries(args.cursor as Record<string, unknown>, args.orderBy);
-        if (seek.length > 0) {
-          const terms = seek.map((e) => {
-            freshParams.push(e.value);
-            return { column: `${qt}.${this.q(e.column)}`, placeholder: this.p(freshParams.length), desc: e.desc };
-          });
-          const predicate = this.keysetPredicate(terms);
-          tail += freshWhereSql ? ` AND ${predicate}` : ` WHERE ${predicate}`;
-        }
+      if (cursorPlan) {
+        const predicate = this.renderCursorPredicate(cursorPlan, freshParams);
+        tail += freshWhereSql ? ` AND ${predicate}` : ` WHERE ${predicate}`;
       }
 
       // ORDER BY is built AFTER the cursor pushes (param order
@@ -3565,6 +4482,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
         offsetPh = this.paginationRef(args.offset, freshParams, 'skip/offset');
       }
       sql += this.buildPagination(limitPh, offsetPh, !!args?.orderBy);
+      // The locking clause follows pagination and binds nothing.
+      if (rowLock) sql += rowLock.sql;
 
       return sql;
     };
@@ -3579,13 +4498,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (args?.with) {
       this.collectWithParams(args.with as WithClause, params, undefined, flattenPlan);
     }
-    // 3. Cursor params, keyset order, matching cursorFp and the build path
-    //    (each value binds ONCE; the expanded predicate re-references its `$n`).
-    if (args?.cursor) {
-      for (const e of this.cursorSeekEntries(args.cursor as Record<string, unknown>, args.orderBy)) {
-        params.push(e.value);
-      }
-    }
+    // 3. Cursor params: the build's own renderer, SQL discarded.
+    if (cursorPlan) this.renderCursorPredicate(cursorPlan, params);
     // 4. ORDER BY params (vector KNN ordering binds a `$n::vector` query vector).
     //    Mirrors buildOrderBy's push order, between cursor and LIMIT.
     if (args?.orderBy) {
@@ -3618,6 +4532,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         ),
       tag: `${this.table}.findMany`,
       preparedName: entry.name,
+      ...rowLockMarker(rowLock),
     };
   }
 
@@ -3694,21 +4609,24 @@ export class QueryInterface<T extends object, R extends object = {}> {
   >(
     args: FindManyStreamArgs<T, R, W, S, O> | undefined,
     action: string,
+    idle: StreamIdleState,
+    unit: string,
   ): AsyncGenerator<Record<string, unknown>[], void, undefined> {
-    // Pagination aliases folded BEFORE the speculative build below, which
-    // spreads `args` and overrides `limit`. A surviving `take` would reach that
-    // spread alongside the override and be read as two different values for one
-    // bound. Relation names are left to `buildFindMany`, which both branches go
-    // through.
-    args = normalizePagination(args);
+    // Canonical args BEFORE the speculative build below, which spreads `args`
+    // and sets its own `limit`: a surviving `take` would reach that spread
+    // beside it and be read as a second value for one bound.
+    args = this.normalizeArgs(args);
     const batchSize = Math.max(1, Math.floor(Number(args?.batchSize ?? 1000)));
+    // Validated on every path, so a bad value is refused whether or not this
+    // stream turns out to need a cursor.
+    const idleTimeoutMs = resolveStreamIdleTimeout(args?.idleTimeoutMs, 'idleTimeoutMs') ?? this.streamIdleTimeoutMs;
 
     this.currentAction = action;
     // The two streaming methods do NOT go through `executeWithMiddleware`, so
     // the unknown-key diagnostic has to be hung here as well or a stream would
     // be the one read that silently drops an `include`. Both public methods
     // reach this, and each passes its own name.
-    warnUnknownQueryOptions(this.table, action, args);
+    warnUnknownQueryOptions(this.table, action, args, this.advice ?? null);
     // Streaming is ALREADY immune to the generic-plan cliff: the speculative
     // fetch has never passed a prepared name, and the cursor path runs through
     // DECLARE, so neither statement enters the plan cache. `preparedNameFor` is
@@ -3746,9 +4664,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // four round trips on a drain that would have fit, never any transferred
     // rows.
     if (batchSize <= STREAM_SPECULATION_MAX_BATCH) {
+      // The caller's bound (or the client's `defaultLimit`, exactly as findMany
+      // applies it) caps the speculative fetch. When the bound fits in a batch
+      // the speculative fetch IS the whole answer; otherwise `rows <= batchSize`
+      // still means fewer rows exist than either bound, and an overflow goes to
+      // the cursor, whose statement carries the caller's own LIMIT.
+      const callerLimit = args?.limit ?? this.defaultLimit;
+      const bound = callerLimit === undefined ? undefined : this.paginationValue(callerLimit, 'limit');
       const speculativeDeferred = this.buildFindMany({
         ...args,
-        limit: batchSize + 1,
+        limit: bound !== undefined && bound <= batchSize ? bound : batchSize + 1,
+        // Only the caller's own bound makes this a page (completePageOrder).
+        ...firstRowOnly(args),
       } as FindManyArgs<
         T,
         R,
@@ -3786,20 +4713,113 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // transaction control of its own (`ambientTransaction`).
     const held = this.txScoped ? null : await this.acquireConnection();
     const client = held?.client ?? null;
-    const conn: StreamableConnection = client ?? {
+    const base: StreamableConnection = client ?? {
       query: async (text: string, values?: unknown[]) =>
         (await this.pool.query(text, values)) as { rows: Record<string, unknown>[] },
     };
+    // The idle guard watches only a stream that holds a connection of its own
+    // between pulls. Inside a caller's transaction the connection is theirs and
+    // their transaction's timeout bounds it. On PostgreSQL the stream's BEGIN
+    // also carries the server-side limit (see streamBackstopStatement), and the
+    // guard keeps a live consumer's transaction from looking idle to it.
+    const watched = held !== null && idleTimeoutMs > 0;
+    const backstop = watched && this.dialect.capabilities.idleTransactionTimeout;
+    let guard: StreamIdleGuard | undefined;
+    const conn = watched
+      ? watchStreamConnection(
+          base,
+          () => guard,
+          backstop
+            ? { begin: this.dialect.beginStatement(), statement: streamBackstopStatement(idleTimeoutMs) }
+            : undefined,
+        )
+      : base;
+    // The cursor's statement carries the `sqlComment` like any other (the
+    // speculative fetch above got it at the execute seam). Never named: a
+    // cursor is declared by text.
+    const streamSql = this.outgoing(deferred.sql, undefined, action).text;
+    const stream = this.dialect.openStream(conn, streamSql, deferred.params, batchSize, {
+      ambientTransaction: this.txScoped,
+    });
+    if (watched) {
+      guard = new StreamIdleGuard(
+        idle,
+        idleTimeoutMs,
+        () => streamIdleExpiredError(action, this.table, idleTimeoutMs, unit),
+        () => this.expireIdleStream(stream, held, action, idleTimeoutMs, idle, unit),
+        backstop ? () => base.query('SELECT 1') : undefined,
+      );
+    }
     try {
-      yield* this.dialect.openStream(conn, deferred.sql, deferred.params, batchSize, {
-        ambientTransaction: this.txScoped,
-      });
+      // Driven by hand rather than `yield*`, so an expired stream's cleanup can
+      // run from the timer while this generator is suspended.
+      while (true) {
+        const step = await stream.next();
+        if (step.done) break;
+        yield step.value;
+        if (idle.expired) throw idle.expired;
+      }
     } catch (err) {
+      if (err === idle.expired) throw err;
       // Wrap pg constraint errors so streaming surfaces typed errors like the rest of the API
       throw explainConnectionLoss(wrapPgError(err), held?.checkout.lostWith);
     } finally {
-      held?.checkout.release();
+      guard?.stop();
+      if (guard?.expiry) {
+        // The timer already closed the stream and released the connection;
+        // wait for that so the connection is never handed back mid-cleanup.
+        await guard.expiry;
+      } else {
+        try {
+          // An early exit (`break`) closes the cursor here; after a full drain
+          // or an error the dialect's generator has finished and this is a no-op.
+          await stream.return(undefined);
+        } catch (err) {
+          // Only an early exit can reach this throw: after an error or a full
+          // drain the dialect's generator has finished and return() resolves.
+          // A failed CLOSE / COMMIT on an early exit must reach the caller, as
+          // it did when this loop was a `yield*`.
+          // biome-ignore lint/correctness/noUnsafeFinally: it replaces only an early-exit return, see above
+          throw explainConnectionLoss(wrapPgError(err), held?.checkout.lostWith);
+        } finally {
+          held?.checkout.release();
+        }
+      }
     }
+  }
+
+  /**
+   * Close a stream whose consumer asked for nothing within its idle timeout:
+   * run the dialect's own cleanup (PostgreSQL: CLOSE, COMMIT), release the
+   * connection (with the cleanup's error, if any, so the pool discards it), and
+   * log `stream-idle-timeout`. The log line matters: an abandoned consumer
+   * never pulls again, so it never sees the E002 waiting for it.
+   */
+  private async expireIdleStream(
+    stream: AsyncGenerator<Record<string, unknown>[], void, undefined>,
+    held: Checkout,
+    action: string,
+    timeoutMs: number,
+    idle: StreamIdleState,
+    unit: string,
+  ): Promise<void> {
+    let failure: unknown;
+    try {
+      await stream.return(undefined);
+    } catch (err) {
+      failure = err;
+    } finally {
+      held.checkout.release(failure === undefined ? undefined : failure instanceof Error ? failure : true);
+    }
+    logTo(
+      this.logger,
+      'warn',
+      `${action} on "${this.table}" had no ${unit} requested for ${timeoutMs} ms, so Turbine closed its cursor ` +
+        `and released its connection (${idle.rows} ${idle.rows === 1 ? 'row' : 'rows'} handed out before that). ` +
+        'An iterator that is kept and never finished, or a response stream torn down without calling return(), ' +
+        'leaves a stream like this. The next request on it throws TimeoutError (E002).',
+      { code: 'stream-idle-timeout', table: this.table, operation: action, timeoutMs, rows: idle.rows },
+    );
   }
 
   /**
@@ -3842,13 +4862,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyStreamArgs<T, R, W, S, O>): AsyncGenerator<QueryResult<T, R, W, S, O>[], void, undefined> {
+    args = this.normalizeArgs(args);
+    this.assertNoStreamLock(args, 'findManyStreamBatches');
     const parse = this.makeStreamRowParser<W, S, O>(args);
-    for await (const batch of this.streamRaw<W, S, O>(args, 'findManyStreamBatches')) {
+    const idle = newStreamIdleState();
+    for await (const batch of this.streamRaw<W, S, O>(args, 'findManyStreamBatches', idle, 'batch')) {
       const parsed = new Array<QueryResult<T, R, W, S, O>>(batch.length);
       for (let i = 0; i < batch.length; i++) {
         parsed[i] = parse(batch[i]!) as QueryResult<T, R, W, S, O>;
       }
+      idle.rows += parsed.length;
+      // `suspended` and `pulls` are the idle guard's whole view of the
+      // consumer: two writes per yield, no timer work.
+      idle.suspended = true;
       yield parsed;
+      idle.suspended = false;
+      idle.pulls++;
+      if (idle.expired) throw idle.expired;
     }
   }
 
@@ -3893,14 +4923,24 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyStreamArgs<T, R, W, S, O>): AsyncGenerator<QueryResult<T, R, W, S, O>, void, undefined> {
+    args = this.normalizeArgs(args);
+    this.assertNoStreamLock(args, 'findManyStream');
     const parse = this.makeStreamRowParser<W, S, O>(args);
     // Parsed one row at a time, INSIDE the yield loop rather than a batch ahead
     // of it, so a consumer that breaks early still pays only for the rows it
     // took. That laziness is the reason this loop is not written over
     // `findManyStreamBatches`.
-    for await (const batch of this.streamRaw<W, S, O>(args, 'findManyStream')) {
+    const idle = newStreamIdleState();
+    for await (const batch of this.streamRaw<W, S, O>(args, 'findManyStream', idle, 'row')) {
       for (let i = 0; i < batch.length; i++) {
-        yield parse(batch[i]!) as QueryResult<T, R, W, S, O>;
+        const row = parse(batch[i]!) as QueryResult<T, R, W, S, O>;
+        idle.rows++;
+        // See findManyStreamBatches: the idle guard's view of the consumer.
+        idle.suspended = true;
+        yield row;
+        idle.suspended = false;
+        idle.pulls++;
+        if (idle.expired) throw idle.expired;
       }
     }
   }
@@ -3915,21 +4955,21 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O> | null> {
-    // BEFORE the strategy branch, not only inside the builders, so the
-    // join-vs-batched decision and its dev warning see the same declared name
-    // every other stage does. `planAuto` splits `with` on the caller's keys and
-    // `runAutoSplit` carries them onward; each downstream consumer normalizes
-    // too, so this is not load-bearing for correctness (measured: removing it
-    // changes the warning text from the declared name back to the caller's and
-    // nothing else). It is here so the invariant holds at the seam rather than
-    // depending on every consumer to re-establish it.
-    args = this.normalizeArgs(args);
+    // BEFORE the strategy branch, so the batched and auto paths below read the
+    // same canonical args the builders do, and so an all-undefined `where` is
+    // refused before anything runs (see normalizeArgs).
+    args = this.normalizeArgs(args, 'findFirst');
+    this.assertLockInTransaction(args, 'findFirst');
     return this.executeWithMiddleware('findFirst', (args ?? {}) as Record<string, unknown>, async () => {
       if (args?.with) {
         const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
         // findFirst is findMany + LIMIT 1: batch the single base row, then load.
         if (strategy === 'batched') {
-          const rows = await this.runFindManyBatched({ ...args, limit: 1 } as unknown as FindManyArgs<T>);
+          const rows = await this.runFindManyBatched({
+            ...args,
+            limit: 1,
+            ...firstRowOnly(args),
+          } as unknown as FindManyArgs<T>);
           return (rows[0] ?? null) as QueryResult<T, R, W, S, O> | null;
         }
         if (strategy === 'auto') {
@@ -3937,7 +4977,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
           const split = this.planAuto(args.with as WithClause, args.stableRelationOrder, false, 1);
           if (split) {
             const rows = (await this.runAutoSplit(
-              { ...args, limit: 1 } as unknown as FindManyArgs<T>,
+              { ...args, limit: 1, ...firstRowOnly(args) } as unknown as FindManyArgs<T>,
               split,
               false,
             )) as Record<string, unknown>[];
@@ -3962,8 +5002,25 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O> | null> {
+    return this.buildFindFirstAs<W, S, O>(args, 'findFirst');
+  }
+
+  /**
+   * findFirst / findFirstOrThrow over findMany's builder with `LIMIT 1`.
+   * `operation` names the method in the refusal of an all-undefined `where`.
+   */
+  private buildFindFirstAs<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(
+    args: FindManyArgs<T, R, W, S, O> | undefined,
+    operation: string,
+  ): DeferredQuery<QueryResult<T, R, W, S, O> | null> {
+    args = this.normalizeArgs(args, operation);
     // Reuse findMany's SQL builder but force LIMIT 1
-    const findManyArgs = { ...args, limit: 1 } as FindManyArgs<T, R, W, S, O>;
+    const findManyArgs = { ...args, limit: 1, ...firstRowOnly(args) } as FindManyArgs<T, R, W, S, O>;
     const deferred = this.buildFindMany<W, S, O>(findManyArgs);
 
     return {
@@ -3974,6 +5031,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         return rows.length > 0 ? rows[0]! : null;
       },
       tag: `${this.table}.findFirst`,
+      ...(deferred.rowLock ? { rowLock: true as const } : {}),
     };
   }
 
@@ -3987,6 +5045,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O>> {
+    args = this.normalizeArgs(args, 'findFirstOrThrow');
+    this.assertLockInTransaction(args, 'findFirstOrThrow');
     return this.executeWithMiddleware('findFirstOrThrow', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildFindFirstOrThrow(args);
       const result = await this.readWithTimeout(
@@ -4005,7 +5065,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O>> {
-    const inner = this.buildFindFirst(args);
+    args = this.normalizeArgs(args, 'findFirstOrThrow');
+    const inner = this.buildFindFirstAs<W, S, O>(args, 'findFirstOrThrow');
 
     return {
       sql: inner.sql,
@@ -4022,6 +5083,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         return row;
       },
       tag: `${this.table}.findFirstOrThrow`,
+      ...(inner.rowLock ? { rowLock: true as const } : {}),
     };
   }
 
@@ -4034,7 +5096,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     W extends TypedWithClause<R> = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: FindUniqueArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O>> {
+  >(args: FindUniqueArgs<T, R, W, S, O, M['whereUnique']>): Promise<QueryResult<T, R, W, S, O>> {
+    args = this.normalizeArgs(args);
+    this.assertLockInTransaction(args, 'findUniqueOrThrow');
     return this.executeWithMiddleware('findUniqueOrThrow', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildFindUniqueOrThrow(args);
       const result = await this.readWithTimeout(
@@ -4052,7 +5116,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     W extends TypedWithClause<R> = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: FindUniqueArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O>> {
+  >(args: FindUniqueArgs<T, R, W, S, O, M['whereUnique']>): DeferredQuery<QueryResult<T, R, W, S, O>> {
+    args = this.normalizeArgs(args);
     const inner = this.buildFindUnique(args);
 
     return {
@@ -4070,6 +5135,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         return row;
       },
       tag: `${this.table}.findUniqueOrThrow`,
+      ...(inner.rowLock ? { rowLock: true as const } : {}),
     };
   }
 
@@ -4080,7 +5146,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async create<
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: CreateArgs<T, R, S, O>): Promise<FieldResult<T, S, O>> {
+  >(args: CreateArgs<T, R, S, O, M['create']>): Promise<FieldResult<T, S, O>> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('create', args as unknown as Record<string, unknown>, async () => {
       if (hasRelationFields(args.data as Record<string, unknown>, this.tableMeta)) {
         return this.nestedCreate(args) as Promise<FieldResult<T, S, O>>;
@@ -4094,11 +5161,57 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // createMany, uses UNNEST for performance
   // -------------------------------------------------------------------------
 
-  async createMany(args: CreateManyArgs<T>): Promise<T[]> {
+  async createMany<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: CreateManyArgs<T, M['createMany'], S, O>): Promise<FieldResult<T, S, O>[]> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('createMany', args as unknown as Record<string, unknown>, async () => {
-      const deferred = this.buildCreateMany(args);
-      const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
-      return deferred.transform(result);
+      const projection = this.resolveWriteProjection(args);
+      const base = args as unknown as CreateManyArgs<T>;
+      // One statement when the rows fit the engine's per-statement limits,
+      // else chunks that do, all in one transaction so the rows land together
+      // or not at all. (`buildCreateMany`, one statement for a pipeline,
+      // refuses instead.)
+      const { chunks, rowsPerChunk } = writesMod.planCreateMany(this.ctx, base, projection);
+      const run = async (): Promise<FieldResult<T, S, O>[]> => {
+        // An engine that applies two rows whose onConflict keys are equal only
+        // under the column's collation (SQLite's NOCASE) as an insert and an
+        // update of one row, in one statement, is caught by the transform (the
+        // row comes back twice), so the statement runs in a transaction that
+        // refusal rolls back. A reselect write already runs in one.
+        const appliesRepeatedKeys =
+          base.onConflict !== undefined &&
+          this.dialect.capabilities.bulkUpsertAppliesRepeatedKeys &&
+          this.dialect.resultStrategy !== 'reselect';
+        if (chunks.length === 1 && !appliesRepeatedKeys) {
+          return this.executeMutation(chunks[0]!, args.timeout) as Promise<FieldResult<T, S, O>[]>;
+        }
+        const reselects = this.dialect.resultStrategy === 'reselect';
+        return this.inOneTransaction(
+          async (exec) => {
+            const rows: FieldResult<T, S, O>[] = [];
+            for (const chunk of chunks) {
+              const result =
+                reselects && chunk.reselect
+                  ? await chunk.reselect(exec)
+                  : await exec(chunk.sql, chunk.params, chunk.preparedName);
+              rows.push(...(chunk.transform(result) as unknown as FieldResult<T, S, O>[]));
+            }
+            return rows;
+          },
+          args.timeout,
+          `createMany of ${base.data.length} rows`,
+          `Insert at most ${rowsPerChunk} rows per call, which fits one statement, or pass a pool that can check ` +
+            'out a connection.',
+        );
+      };
+      if (base.onConflict === undefined) return run();
+      try {
+        return await run();
+      } catch (err) {
+        throw writesMod.explainConflictKeyCollision(this.ctx, base, err);
+      }
     });
   }
 
@@ -4109,7 +5222,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async update<
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: UpdateArgs<T, R, S, O>): Promise<FieldResult<T, S, O>> {
+  >(args: UpdateArgs<T, R, S, O, M['update']>): Promise<FieldResult<T, S, O>> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('update', args as unknown as Record<string, unknown>, async () => {
       if (hasRelationFields(args.data as Record<string, unknown>, this.tableMeta)) {
         return this.nestedUpdate(args) as Promise<FieldResult<T, S, O>>;
@@ -4242,6 +5356,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args: DeleteArgs<T, R, S, O>): Promise<FieldResult<T, S, O>> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('delete', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildDelete(args);
       return this.executeMutation(deferred, args.timeout);
@@ -4255,8 +5370,12 @@ export class QueryInterface<T extends object, R extends object = {}> {
   async upsert<
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: UpsertArgs<T, R, S, O>): Promise<FieldResult<T, S, O>> {
+  >(args: UpsertArgs<T, R, S, O, M['whereUnique'], M['createMany'], M['updateMany']>): Promise<FieldResult<T, S, O>> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('upsert', args as unknown as Record<string, unknown>, async () => {
+      // First: the nested-write branch below decides before upsertLookupReason
+      // would have refused it.
+      writesMod.assertNoOptimisticLock(this.ctx, args, 'upsert');
       if (this.upsertNeedsLookup(args)) {
         return this.upsertLookupFirst(args) as Promise<FieldResult<T, S, O>>;
       }
@@ -4274,6 +5393,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   upsertNeedsLookup(
     args: UpsertArgs<T, R, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
   ): boolean {
+    args = this.normalizeArgs(args);
     return (
       hasRelationFields((args.create ?? {}) as Record<string, unknown>, this.tableMeta) ||
       hasRelationFields((args.update ?? {}) as Record<string, unknown>, this.tableMeta) ||
@@ -4307,7 +5427,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
   ): Promise<T> {
     const where = (args.where ?? {}) as Record<string, unknown>;
     const create = (args.create ?? {}) as Record<string, unknown>;
-    const update = (args.update ?? {}) as Record<string, unknown>;
+    // `expr.excluded(field)` in `update` reads the incoming row, which here is
+    // `create`: resolved to create's value before the update compiles, as the
+    // single-statement path does.
+    const update = (resolveExcludedFromCreate(this.ctx, (args.update ?? {}) as Record<string, unknown>, create) ??
+      {}) as Record<string, unknown>;
     assertMutationWhereIdentifiesOneRow(
       this.tableMeta,
       this.table,
@@ -4346,7 +5470,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // updateMany, UPDATE ... WHERE ... returning count
   // -------------------------------------------------------------------------
 
-  async updateMany(args: UpdateManyArgs<T, R>): Promise<{ count: number }> {
+  async updateMany(args: UpdateManyArgs<T, R, M['updateMany']>): Promise<{ count: number }> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('updateMany', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildUpdateMany(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
@@ -4359,6 +5484,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // -------------------------------------------------------------------------
 
   async deleteMany(args: DeleteManyArgs<T, R>): Promise<{ count: number }> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('deleteMany', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildDeleteMany(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
@@ -4371,6 +5497,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // -------------------------------------------------------------------------
 
   async count(args?: CountArgs<T, R>): Promise<number> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('count', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildCount(args);
       const result = await this.readWithTimeout(
@@ -4383,7 +5510,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     });
   }
 
-  buildCount(args?: CountArgs<T>): DeferredQuery<number> {
+  buildCount(args?: CountArgs<T, R>): DeferredQuery<number> {
+    args = this.normalizeArgs(args);
     this.currentSkip = resolveSkipGlobalFilters(args?.skipGlobalFilters);
     const effWhere = this.mergeGlobalFilter(args?.where as Record<string, unknown> | undefined);
     const hasWhere = effWhere !== undefined;
@@ -4427,6 +5555,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * that cannot be typed, so those columns are not projected onto the row type.
    */
   async groupBy<A extends GroupByArgs<T, R>>(args: A): Promise<GroupByResult<T, A>[]> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('groupBy', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildGroupBy(args);
       const result = await this.readWithTimeout(
@@ -4443,19 +5572,22 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // Aggregate / groupBy compilation (extracted to aggregates.ts).
   // ---------------------------------------------------------------------------
 
-  buildGroupBy(args: GroupByArgs<T>): DeferredQuery<Record<string, unknown>[]> {
-    return aggMod.buildGroupBy(this.ctx, args);
+  buildGroupBy<A extends GroupByArgs<T, R>>(args: A): DeferredQuery<GroupByResult<T, A>[]> {
+    return aggMod.buildGroupBy(this.ctx, this.normalizeArgs(args)) as unknown as DeferredQuery<GroupByResult<T, A>[]>;
   }
 
-  buildAggregate(args: AggregateArgs<T>): DeferredQuery<AggregateResult<T>> {
-    return aggMod.buildAggregate(this.ctx, args);
+  buildAggregate<A extends AggregateArgs<T, R>>(args: A): DeferredQuery<AggregateResultOf<T, A>> {
+    return aggMod.buildAggregate(this.ctx, this.normalizeArgs(args)) as unknown as DeferredQuery<
+      AggregateResultOf<T, A>
+    >;
   }
 
   // -------------------------------------------------------------------------
   // aggregate, standalone aggregation without groupBy
   // -------------------------------------------------------------------------
 
-  async aggregate(args: AggregateArgs<T, R>): Promise<AggregateResult<T>> {
+  async aggregate<A extends AggregateArgs<T, R>>(args: A): Promise<AggregateResultOf<T, A>> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('aggregate', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildAggregate(args);
       const result = await this.readWithTimeout(
@@ -4643,13 +5775,17 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return relationsMod.planFlattenWith(this.ctx, this.table, withClause, includePii);
   }
 
-  /** Dev-only once-only note that `'flatten'` was refused for the whole query. */
+  /** Advice, once per reason: `'flatten'` was refused for the whole query. */
   private warnFlattenBlocked(reason: string): void {
-    if (process.env.NODE_ENV === 'production') return;
+    const log = this.advice;
+    if (!log) return;
     if (!shouldWarnOnce(WARN_NS.flattenFallback, `${this.table}|query|${reason}`)) return;
-    console.warn(
-      `[turbine] relationLoadStrategy: 'flatten' did not engage on "${this.table}": ${reason}. ` +
+    logTo(
+      log,
+      'warn',
+      `relationLoadStrategy: 'flatten' did not engage on "${this.table}": ${reason}. ` +
         'Every relation loads via the correlated subquery instead (same rows, same values, different plan).',
+      { code: 'flatten-blocked', table: this.table, reason },
     );
   }
 
@@ -4810,8 +5946,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // To-many relation orderBy (`{ posts: { _count } }`) uses the same count
       // subquery as `_count`: mirror its global-filter params. Pick-row
       // ordering mirrors its full param chain (by-path / global filter /
-      // pick.where / pick.orderBy paths). To-one relation orderBy carries the
-      // target's global filter once per ordered column.
+      // pick.where / pick.orderBy paths). To-one relation orderBy is mirrored
+      // by running its build (see collectToOneRelationOrderParams).
       if (this.isRelationOrderByValue(dir)) {
         // Mirrors the build path's resolution, so a cache HIT binds params for
         // the same relation the cached SQL was built from.
@@ -4822,9 +5958,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         } else if (relDef && (relDef.type === 'hasMany' || relDef.type === 'manyToMany')) {
           this.collectRelationCountParams(relDef, params);
         } else if (relDef) {
-          for (const _col of Object.keys(dir as Record<string, unknown>)) {
-            this.collectTargetGlobalFilterAlias(relDef.to, params);
-          }
+          relationsMod.collectToOneRelationOrderParams(this.ctx, key, dir as Record<string, unknown>, params);
         }
       }
     }
@@ -4903,10 +6037,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * one, is the acknowledgement, and the warning exists to surface an
    * unacknowledged trade rather than to nag.
    *
-   * NOT DEV-ONLY, unlike every other warning in this codebase, and deliberately
-   * so. Production is exactly where a destructive write commits and where the
-   * row cannot be recovered afterwards, so a warning that goes quiet under
-   * `NODE_ENV=production` is silent in the only place it matters. The cost is
+   * NOT ADVICE: it fires whatever `diagnostics` says, deliberately. Production
+   * is exactly where a destructive write commits and where the row cannot be
+   * recovered afterwards, so a warning that goes quiet in production mode is
+   * silent in the only place it matters. The cost is
    * bounded to the point of irrelevance: once per process per field, and only
    * on a row that actually held an infinity.
    *
@@ -4917,8 +6051,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
   private warnTemporalInfinity(table: string, field: string): void {
     if (!this.warnTemporalInfinityUnset) return;
     if (!shouldWarnOnce(WARN_NS.temporalInfinity, `${table}.${field}`)) return;
-    console.warn(
-      `[turbine] ${table}.${field} holds the Postgres value \`infinity\` (or \`-infinity\`). JavaScript has ` +
+    logTo(
+      this.logger,
+      'warn',
+      `${table}.${field} holds the Postgres value \`infinity\` (or \`-infinity\`). JavaScript has ` +
         'no Date for it, so it reads as the JS number `Infinity` / `-Infinity` on a field the generated ' +
         'types declare as `Date`: `.toISOString()` and `.getTime()` throw a TypeError on these rows, and ' +
         '`JSON.stringify` still renders them null because JSON has no infinity literal. The number is the ' +
@@ -4929,6 +6065,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         "reading and silence the warning, or `'null'` to read null instead, accepting that a stored " +
         'infinity then looks exactly like a stored NULL and a read-modify-write over a nullable column ' +
         'stores SQL NULL, destroying the value with no error.',
+      { code: 'temporal-infinity', table, field },
     );
   }
 
@@ -5008,6 +6145,64 @@ export class QueryInterface<T extends object, R extends object = {}> {
     return this.utcTimestamps ? parseDbDate(String(value)) : new Date(value as string);
   }
 
+  /** The non-temporal decode kinds of `table`'s columns, by column and by field name. */
+  private getCellKinds(table: string, meta: TableMetadata): Map<string, number> {
+    let kinds = this.cellKindCache.get(table);
+    if (!kinds) {
+      kinds = new Map();
+      for (const column of meta.columns) {
+        // Metadata may carry the type on the column or only in the table map.
+        const pgType = column.pgType ?? meta.pgTypes?.[column.name];
+        if (typeof pgType !== 'string') continue;
+        let kind = cellKindOf(pgType, this.schema.enums);
+        const decode = kind === CELL_PLAIN ? this.dialect.decodeColumnValue?.(pgType) : undefined;
+        if (decode !== undefined) {
+          kind = CELL_DIALECT;
+          let decoders = this.dialectDecodeCache.get(table);
+          if (!decoders) {
+            decoders = new Map();
+            this.dialectDecodeCache.set(table, decoders);
+          }
+          decoders.set(column.name, decode);
+          decoders.set(column.field, decode);
+        }
+        if (kind === CELL_PLAIN) continue;
+        kinds.set(column.name, kind);
+        kinds.set(column.field, kind);
+      }
+      this.cellKindCache.set(table, kinds);
+    }
+    return kinds;
+  }
+
+  /** One cell's decode, for every kind but {@link CELL_PLAIN}. */
+  private decodeCell(kind: number, value: unknown, table: string, field: string): unknown {
+    switch (kind) {
+      case CELL_TEMPORAL:
+        return this.decodeTemporalCell(value, table, field);
+      case CELL_FLOAT:
+        return readJsonFloat(value);
+      case CELL_FLOAT_ARRAY:
+        return readJsonFloatArray(value);
+      case CELL_TEXT_ARRAY:
+        return readTextArray(value);
+      case CELL_DIALECT:
+        return this.decodeDialectCell(value, table, field);
+      default:
+        return value;
+    }
+  }
+
+  /**
+   * A {@link CELL_DIALECT} cell: the dialect's decode for the column's declared
+   * type, recorded by {@link getCellKinds} when it classified the column.
+   */
+  private decodeDialectCell(value: unknown, table: string, field: string): unknown {
+    if (value === null || value === undefined) return value;
+    const decode = this.dialectDecodeCache.get(table)?.get(field);
+    return decode ? decode(value) : value;
+  }
+
   /**
    * Build the decode plan for one exact column list, and remember it as this
    * table's most recent shape so the next row of the same result set hits the
@@ -5031,16 +6226,21 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // camelCase-keyed date fields, so nested json_build_object rows (whose
       // keys are already camelCase) get the same Date coercion as top-level rows.
       const camelDateFields = this.getCamelDateFields(table, meta);
+      const cellKinds = this.getCellKinds(table, meta);
       const cols = keys.slice();
       const fields: string[] = [];
-      const dates: boolean[] = [];
+      const kinds: number[] = [];
       for (const col of cols) {
         const field = reverseMap[col] ?? col; // fall back to raw col name, not regex
         fields.push(field);
         // Top-level rows are snake_case (dateCols); nested rows are camelCase.
-        dates.push(dateCols.has(col) || camelDateFields.has(field));
+        kinds.push(
+          dateCols.has(col) || camelDateFields.has(field)
+            ? CELL_TEMPORAL
+            : (cellKinds.get(col) ?? cellKinds.get(field) ?? CELL_PLAIN),
+        );
       }
-      plan = { cols, fields, dates };
+      plan = { cols, fields, kinds };
       this.rowPlanCache.set(shapeKey, plan);
     }
     this.rowPlanLast.set(table, plan);
@@ -5087,11 +6287,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
           ? last
           : this.buildRowDecodePlan(table, meta, keys);
 
-      const { cols, fields, dates } = plan;
+      const { cols, fields, kinds } = plan;
       for (let i = 0; i < cols.length; i++) {
         const field = fields[i]!;
         const value = row[cols[i]!];
-        parsed[field] = dates[i] ? this.decodeTemporalCell(value, table, field) : value;
+        const kind = kinds[i]!;
+        // A float from the driver is already a number; only JSON's strings need reading.
+        parsed[field] =
+          kind === CELL_PLAIN || (kind === CELL_FLOAT && typeof value !== 'string')
+            ? value
+            : this.decodeCell(kind, value, table, field);
       }
     } else {
       // Fallback: no metadata, use regex conversion

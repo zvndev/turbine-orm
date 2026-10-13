@@ -13,6 +13,8 @@
  * yields a parse-only report (every item `parsed`, no map) for `--no-db`.
  */
 
+import { nullRecord } from '../introspect.js';
+import { ownLookup } from '../query/utils.js';
 import { camelToSnake, type PrismaCompatMap, type SchemaMetadata, snakeToCamel, withDbFieldNames } from '../schema.js';
 import type { PrismaModel, PrismaSchemaAst } from './prisma-schema.js';
 
@@ -213,7 +215,9 @@ export function resolvePrismaSchema(
   const result: ResolutionResult = {
     models: [],
     enums: [],
-    map: { models: {}, enums: {} },
+    // Prototype-less: models, fields, relations and enums are keyed by names the
+    // Prisma schema chose, and `__proto__` / `constructor` are legal names there.
+    map: { models: nullRecord(), enums: nullRecord() },
     hasUnresolved: false,
     parseWarnings: ast.warnings,
     noDb,
@@ -223,7 +227,7 @@ export function resolvePrismaSchema(
   for (const model of ast.models) {
     const rt = modelTable.get(model.name)!;
     const table = rt.table;
-    const tableMeta = table && resolvedSchema ? resolvedSchema.tables[table] : undefined;
+    const tableMeta = table && resolvedSchema ? ownLookup(resolvedSchema.tables, table) : undefined;
     const accessor = table ? snakeToCamel(table) : null;
 
     const status: ResolveStatus = noDb ? 'parsed' : table ? 'resolved' : 'unresolved';
@@ -271,21 +275,21 @@ export function resolvePrismaSchema(
 
     // Build the verified map entry (skip in --no-db and for unresolved tables).
     if (!noDb && table && accessor) {
-      const fields: Record<string, string> = {};
+      const fields = nullRecord<string>();
       for (const f of resolved.fields) {
         if (f.status === 'resolved' && f.turbineField) fields[f.prismaName] = f.turbineField;
       }
-      const relations: Record<string, { name: string; cardinality: 'one' | 'many' }> = {};
+      const relations = nullRecord<{ name: string; cardinality: 'one' | 'many' }>();
       for (const r of resolved.relations) {
         if (r.status === 'resolved' && r.turbineName && r.cardinality) {
           relations[r.prismaName] = { name: r.turbineName, cardinality: r.cardinality };
         }
       }
-      const compoundUniques: Record<string, string[]> = {};
+      const compoundUniques = nullRecord<string[]>();
       for (const c of resolved.compoundUniques) {
         if (c.status === 'resolved' && c.turbineFields) compoundUniques[c.selector] = c.turbineFields;
       }
-      const clientDefaults = collectClientDefaults(model, fields, resolvedSchema?.tables[table]);
+      const clientDefaults = collectClientDefaults(model, fields, ownLookup(resolvedSchema?.tables ?? {}, table));
       result.map.models[model.name] = {
         table,
         accessor,
@@ -394,7 +398,7 @@ function resolveScalarField(
   if (noDb || !tableMeta) {
     return { prismaName: fieldName, turbineField: null, column: null, status: noDb ? 'parsed' : 'unresolved' };
   }
-  const turbineField = tableMeta.reverseColumnMap[column];
+  const turbineField = ownLookup(tableMeta.reverseColumnMap, column);
   if (turbineField) {
     return { prismaName: fieldName, turbineField, column, status: 'resolved' };
   }
@@ -444,9 +448,9 @@ function collectClientDefaults(
   tableMeta: SchemaMetadata['tables'][string] | undefined,
 ): Record<string, 'uuid' | 'cuid' | 'now' | 'updatedAt'> | undefined {
   if (!tableMeta) return undefined;
-  const out: Record<string, 'uuid' | 'cuid' | 'now' | 'updatedAt'> = {};
+  const out = nullRecord<'uuid' | 'cuid' | 'now' | 'updatedAt'>();
   for (const field of model.fields) {
-    const turbineField = resolvedFields[field.name];
+    const turbineField = ownLookup(resolvedFields, field.name);
     if (!turbineField) continue;
     const col = tableMeta.columns.find((c) => c.field === turbineField || c.name === turbineField);
     if (field.attrs.some((a) => a.name === 'updatedAt')) {
@@ -628,11 +632,11 @@ function resolveCompoundUnique(
   if (noDb || !tableMeta) return base;
 
   const columns = key.fields.map((f) => fieldColumn(model, f));
-  const missing = columns.filter((c) => !tableMeta.reverseColumnMap[c]);
+  const missing = columns.filter((c) => !ownLookup(tableMeta.reverseColumnMap, c));
   if (missing.length > 0) {
     return { ...base, reason: `column(s) not found: ${missing.join(', ')}` };
   }
-  const turbineFields = columns.map((c) => tableMeta.reverseColumnMap[c]!);
+  const turbineFields = columns.map((c) => ownLookup(tableMeta.reverseColumnMap, c)!);
 
   const want = [...columns].sort().join(',');
   const matches = (setList: string[][]) => setList.some((s) => [...s].sort().join(',') === want);

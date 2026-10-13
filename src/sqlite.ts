@@ -19,18 +19,24 @@
  * - `RETURNING` + `ON CONFLICT … DO UPDATE` (SQLite ≥ 3.35) → create / upsert /
  *   update / delete return real rows in a single statement (`resultStrategy =
  *   'returning'`, same as Postgres).
- * - **Single-writer:** one connection / one write transaction at a time;
- *   concurrent writers get `SQLITE_BUSY` (treated as retryable). `journal_mode =
- *   WAL` is enabled for file databases to allow concurrent readers.
+ * - **Single-writer:** one connection / one transaction at a time. On one
+ *   client, statements from other callers wait (FIFO, up to `busyTimeoutMs`)
+ *   while a transaction is open instead of running inside it; another
+ *   process's writer gets `SQLITE_BUSY`. Both surface as the retryable
+ *   `SerializationFailureError`. `journal_mode = WAL` is enabled for file
+ *   databases to allow concurrent readers across connections.
  * - **Unsupported (throw `UnsupportedFeatureError`):** pgvector distance ops,
  *   LISTEN/NOTIFY (`$listen` / `$notify`), RLS `sessionContext`. Advisory-lock
  *   migration locking is unavailable, SQLite is single-writer, so migrations
  *   serialize naturally.
- * - **Type affinity caveats:** SQLite has no native `BOOLEAN` (0/1 integers) or
- *   `DATE` (TEXT/INTEGER). Booleans bind as 1/0; `Date` values bind as ISO-8601
- *   text; columns declared `TIMESTAMP`/`DATETIME`/`DATE` are coerced back to
- *   `Date`. Integers wider than `Number.MAX_SAFE_INTEGER` come back as strings
- *   (the same safe-int policy Turbine uses for Postgres `int8`).
+ * - **Type affinity caveats:** SQLite has no native `BOOLEAN` (0/1 integers),
+ *   `JSON` (text) or `DATE` (TEXT/INTEGER). Booleans bind as 1/0; `Date` values
+ *   bind as ISO-8601 text; an integral JS number binds as INTEGER. A column the
+ *   schema declares boolean or json/jsonb reads back as a boolean or a parsed
+ *   value on every path; date/time columns are coerced back to `Date`.
+ *   Integers wider than `Number.MAX_SAFE_INTEGER` come back as strings (the
+ *   same safe-int policy Turbine uses for Postgres `int8`). `numeric` has no
+ *   exact storage: it reads back as a JS number.
  * - **Case-insensitive matching** uses `COLLATE NOCASE`, which is **ASCII-only**
  *   (no Unicode case folding).
  *
@@ -68,7 +74,7 @@
  *
  * const db = turbineSqlite(':memory:', schemaDefToMetadata(schema));
  * for (const stmt of schemaToSQL(schema, { dialect: sqliteDialect })) {
- *   await db.raw([stmt] as never);
+ *   await db.rawUnsafe(stmt);
  * }
  *
  * // `db.table(...)`, not `db.users`: the typed property accessors are emitted
@@ -78,11 +84,20 @@
  * ```
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createRequire } from 'node:module';
 import type { DatabaseSync } from 'node:sqlite';
-import { type PgCompatPool, type PgCompatPoolClient, TurbineClient } from './client.js';
 import {
+  type DisconnectOptions,
+  type DisconnectResult,
+  type PgCompatPool,
+  type PgCompatPoolClient,
+  TurbineClient,
+} from './client.js';
+import {
+  type BuiltStatement,
   type BulkInsertStatementInput,
+  type BulkUpsertStatementInput,
   type ColumnDefinitionInput,
   type ColumnTypeInput,
   type CreateIndexStatementInput,
@@ -90,27 +105,38 @@ import {
   type DefaultValuesInsertStatementInput,
   type Dialect,
   type DialectIntrospector,
+  type EngineCapabilities,
   type InsertStatementInput,
   type IntrospectOptions,
   type JsonWireRule,
   type LimitOffsetInput,
+  onConflictAction,
   postgresDialect,
   type ReturningSelection,
   type StreamableConnection,
   type UpsertStatementInput,
 } from './dialect.js';
 import type { EngineClientConfig } from './engine-config.js';
-import { ConnectionError, UnsupportedFeatureError, ValidationError } from './errors.js';
-import { applyTableFilters, deriveEngineRelations } from './introspect.js';
+import { ConnectionError, SerializationFailureError, UnsupportedFeatureError, ValidationError } from './errors.js';
+import {
+  applyTableFilters,
+  assertDistinctColumnFields,
+  deriveEngineRelations,
+  nullRecord,
+  printableCatalogName,
+} from './introspect.js';
+import { withoutTrailingComment } from './query/sql-comment.js';
 import { LRUCache } from './query/utils.js';
 import {
   type ColumnMetadata,
   type IndexMetadata,
   isDateType,
+  type RelationDef,
   type SchemaMetadata,
   snakeToCamel,
   type TableMetadata,
 } from './schema.js';
+import { rewritePositionalPlaceholders } from './sql-placeholders.js';
 
 // ---------------------------------------------------------------------------
 // Driver constructor, lazily loaded
@@ -167,7 +193,8 @@ type SqliteParam = null | number | bigint | string | Uint8Array;
  * Coerce an arbitrary JS value into something `node:sqlite` can bind.
  *
  * `node:sqlite` throws on `boolean`, `undefined`, `Date`, and plain objects, so
- * we normalize: booleans → 1/0, `undefined`/`null` → NULL, `Date` → ISO text,
+ * we normalize: booleans → 1/0, a safe integer → INTEGER (see below),
+ * `undefined`/`null` → NULL, `Date` → ISO text,
  * `Uint8Array`/`Buffer` → BLOB, and any remaining object/array → JSON text
  * (matches how Turbine already pre-serializes JSON filter params).
  */
@@ -177,6 +204,12 @@ function toSqliteParam(value: unknown): SqliteParam {
     case 'boolean':
       return value ? 1 : 0;
     case 'number':
+      // `node:sqlite` binds every JS number as REAL, so `views / 2` divided as
+      // floats (75 / 2 = 37.5, stored in an INTEGER column) and an integral
+      // number written to a TEXT column was stored as '3.0'. Binding a safe
+      // integer as an INTEGER gives the arithmetic and text PostgreSQL gives.
+      // -0 stays REAL: as an integer it would lose its sign.
+      return Number.isSafeInteger(value) && !Object.is(value, -0) ? BigInt(value) : value;
     case 'bigint':
     case 'string':
       return value;
@@ -184,6 +217,41 @@ function toSqliteParam(value: unknown): SqliteParam {
   if (value instanceof Date) return value.toISOString();
   if (value instanceof Uint8Array) return value; // also covers Buffer
   return JSON.stringify(value);
+}
+
+/**
+ * The JSON text an `in` / `notIn` list binds as, element by element in the
+ * form {@link toSqliteParam} would bind it, so a list element compares exactly
+ * as the same value given to `equals` does. A bigint is written as a JSON
+ * integer (exact to 64 bits; `JSON.stringify` refuses one), an infinity as the
+ * overflowing literal SQLite's JSON parser reads as one, and a binary value as
+ * `{"b": "<hex>"}`, which {@link sqliteDialect.buildInClause} turns back into a
+ * BLOB. Any other object binds as its JSON text, as it would on its own.
+ */
+function sqliteInListJson(values: readonly unknown[]): string {
+  const parts = values.map((value): string => {
+    if (value === undefined || value === null) return 'null';
+    switch (typeof value) {
+      case 'boolean':
+        return value ? '1' : '0';
+      case 'number':
+        if (Number.isFinite(value)) return JSON.stringify(value);
+        if (Number.isNaN(value)) return 'null';
+        return value > 0 ? '9e999' : '-9e999';
+      case 'bigint':
+        return value.toString();
+      case 'string':
+        return JSON.stringify(value);
+    }
+    if (value instanceof Uint8Array) {
+      let hex = '';
+      for (const byte of value) hex += byte.toString(16).padStart(2, '0');
+      return `{"b":"${hex}"}`;
+    }
+    const bound = toSqliteParam(value);
+    return JSON.stringify(bound);
+  });
+  return `[${parts.join(',')}]`;
 }
 
 /**
@@ -201,64 +269,180 @@ function normalizeValue(value: null | number | bigint | string | Uint8Array): un
   return value;
 }
 
+/** A result column's decode beyond the safe-integer policy (see {@link resultColumnDecoders}). */
+type ColumnDecode = 'boolean' | 'json';
+
 /**
- * Convert a `node:sqlite` null-prototype row into a normalized plain object.
- *
- * `booleanKeys`, when present, names the result columns whose ORIGIN column is
- * declared with a boolean affinity; their 1/0 storage is turned back into
- * `true`/`false` (see {@link booleanResultColumns}). Anything else in such a
- * column, and every column not listed, passes through untouched.
+ * The decode a column of `type` needs on SQLite, or `undefined`. `type` is a
+ * declared SQLite type or a schema type (`bool`, `jsonb`). The ONE answer both
+ * read paths use: the driver shim for direct reads and {@link sqliteDialect}'s
+ * `jsonWireRule` for `with` rows, so the two cannot disagree about a column.
  */
-function normalizeRow(
-  row: Record<string, null | number | bigint | string | Uint8Array>,
-  booleanKeys?: ReadonlySet<string>,
-): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const key of Object.keys(row)) {
-    const value = normalizeValue(row[key] as null | number | bigint | string | Uint8Array);
-    out[key] = booleanKeys?.has(key) && (value === 1 || value === 0) ? value === 1 : value;
+function sqliteValueDecode(type: string): ColumnDecode | undefined {
+  const t = type.toUpperCase();
+  if (t.includes('BOOL')) return 'boolean';
+  if (t === 'JSON' || t === 'JSONB') return 'json';
+  return undefined;
+}
+
+/**
+ * `table NUL column -> decode` for every schema column whose stored form is not
+ * its declared JS type: a boolean (stored 1/0) or a json/jsonb column (stored as
+ * JSON text). `null` when the schema has none.
+ */
+type DeclaredDecoders = ReadonlyMap<string, ColumnDecode> | null;
+
+function declaredDecoders(schema: SchemaMetadata | undefined): DeclaredDecoders {
+  if (!schema) return null;
+  let out: Map<string, ColumnDecode> | null = null;
+  for (const [table, meta] of Object.entries(schema.tables)) {
+    for (const column of meta.columns) {
+      const type = column.pgType ?? meta.pgTypes?.[column.name];
+      const decode = typeof type === 'string' ? sqliteValueDecode(type) : undefined;
+      if (decode === undefined) continue;
+      if (out === null) out = new Map();
+      out.set(`${table}\u0000${column.name}`, decode);
+    }
   }
   return out;
 }
 
 /**
- * The result columns of a prepared statement whose ORIGIN column is declared
- * boolean, or `null` when there are none (the overwhelmingly common case).
+ * A decimal integer or float as SQLite prints it (`printf('%!.17g')` / `CAST(... AS TEXT)`).
  *
- * WHY THIS EXISTS. SQLite has no boolean storage class: a `BOOLEAN` column
- * holds 1/0 integers. Turbine still generates `ok: boolean` for it
- * ({@link sqliteTypeToTs} maps `/bool/` to `boolean`), so `row.ok === true` was
- * false, `JSON.stringify(row)` emitted `1`, and a value the ORM itself wrote as
- * `true` came back as a number. The declared type is the ONLY thing that says
- * "this integer is a boolean", and it lives in the schema, not in the value.
- *
- * The decltype comes from the driver rather than from Turbine's metadata
- * because the driver knows which TABLE each result column came from.
- * `StatementSync.columns()` reports `type` as `sqlite3_column_decltype`, which
- * is non-null only for a direct table-column reference and null for any
- * expression, so a computed column can never be coerced by accident.
- *
- * Node gained `columns()` in 22.13 / 23.4 while this engine's floor is 22.5, so
- * it is feature-detected: on the narrow band without it, booleans keep reading
- * back as 1/0 exactly as before rather than the engine refusing to run.
+ * Linear by construction: the fraction's digits can only follow a literal `.`,
+ * so a run of digits has exactly one way to match. The earlier `\d+\.?\d*`
+ * could split a dot-less run between its two quantifiers in every possible
+ * place, which made a long non-numeric cell take seconds to reject (quadratic:
+ * 40,000 digits and an `x` took 0.8 s, a million take 1.5 ms now).
  */
-function booleanResultColumns(stmt: ReturnType<DatabaseSync['prepare']>): Set<string> | null {
-  const columnsFn = (stmt as { columns?: () => { name?: unknown; type?: unknown }[] }).columns;
+const SQLITE_NUMBER_TEXT = /^-?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i;
+
+/**
+ * The text SQLite's INTEGER, REAL and NUMERIC affinities convert to a number,
+ * measured against SQLite 3.51: an optional sign, a decimal integer or float,
+ * an optional exponent, and ASCII whitespace around it. Anything else
+ * (`'abc'`, `''`, `'Infinity'`, `'0x10'`, `'1_000'`) is stored as TEXT in the
+ * numeric column. Linear for the same reason as {@link SQLITE_NUMBER_TEXT}.
+ */
+const SQLITE_NUMERIC_LITERAL = /^[ \t\n\v\f\r]*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?[ \t\n\v\f\r]*$/i;
+
+/**
+ * Declared column types whose SQLite affinity is numeric (INTEGER, REAL or
+ * NUMERIC), boolean included (stored 1/0). Matched whole, not by SQLite's own
+ * "contains INT" rule: the type a schema records for a column can be an enum's
+ * name (`point_kind`), which that rule reads as INTEGER while the column is
+ * TEXT. A type this misses is written as SQLite always wrote it, so a miss
+ * costs a refusal, never a wrong one.
+ */
+const SQLITE_NUMERIC_COLUMN_TYPE =
+  /^(?:(?:tiny|small|medium|big)?int(?:eger)?|int[248]|(?:small|big)?serial|unsigned big int|real|float[48]?|double(?: precision)?|numeric|decimal|money|bool(?:ean)?)(?:\(\s*\d+\s*(?:,\s*\d+\s*)?\))?$/i;
+
+/**
+ * Decode a REAL / NUMERIC cell carried as text through a `with` join back to
+ * the value a direct read returns: an integer by the safe-integer policy, a
+ * double as the number its 17 digits name, `Inf` / `-Inf` as infinities.
+ */
+function decodeRealText(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  if (/^-?\d+$/.test(value)) {
+    const asNumber = Number(value);
+    return Number.isSafeInteger(asNumber) ? asNumber : value;
+  }
+  if (value === 'Inf') return Number.POSITIVE_INFINITY;
+  if (value === '-Inf') return Number.NEGATIVE_INFINITY;
+  return SQLITE_NUMBER_TEXT.test(value) ? Number(value) : value;
+}
+
+/** Read a JSON column's stored text as its value; text that is not JSON is returned as stored. */
+function parseJsonCell(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+/**
+ * Convert a `node:sqlite` null-prototype row into a normalized plain object.
+ *
+ * `decoders`, when present, names the result columns whose ORIGIN column is a
+ * boolean or a JSON column (see {@link resultColumnDecoders}): 1/0 becomes
+ * `true`/`false`, JSON text becomes its value. Anything else in such a column,
+ * and every column not listed, passes through untouched.
+ */
+function normalizeRow(
+  row: Record<string, null | number | bigint | string | Uint8Array>,
+  decoders?: ReadonlyMap<string, ColumnDecode>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(row)) {
+    const value = normalizeValue(row[key] as null | number | bigint | string | Uint8Array);
+    const decode = decoders?.get(key);
+    out[key] =
+      decode === undefined
+        ? value
+        : decode === 'json'
+          ? parseJsonCell(value)
+          : value === 1 || value === 0
+            ? value === 1
+            : value;
+  }
+  return out;
+}
+
+/**
+ * The result columns of a prepared statement that need decoding, or `null`
+ * when there are none (the overwhelmingly common case).
+ *
+ * WHY THIS EXISTS. SQLite has no boolean or JSON storage class: a boolean is
+ * stored as 1/0 and a JSON document as text. Turbine still generates
+ * `ok: boolean` and a JSON value for those columns, and PostgreSQL returns
+ * exactly that, so a value the ORM itself wrote as `true` or `{ a: 1 }` came
+ * back as `1` or `'{"a":1}'`.
+ *
+ * Two sources name such a column, both read from the driver's per-column
+ * description, because only the driver knows which TABLE a result column came
+ * from. `StatementSync.columns()` reports the declared type
+ * (`sqlite3_column_decltype`) and the origin table and column, all of which are
+ * null for an expression, so a computed column is never decoded by accident.
+ *  - A declared type naming a boolean (`BOOLEAN`), as before.
+ *  - The client's schema: an origin column declared boolean or json/jsonb there.
+ *    Turbine's own DDL stores those as INTEGER and TEXT, so the declared type
+ *    alone missed every table Turbine created.
+ *
+ * Node gained `columns()` in 22.16 / 23.11 while this engine's floor is 22.5, so
+ * it is feature-detected: on the narrow band without it, these columns keep
+ * reading back as stored rather than the engine refusing to run.
+ */
+function resultColumnDecoders(
+  stmt: ReturnType<DatabaseSync['prepare']>,
+  declared: DeclaredDecoders,
+): Map<string, ColumnDecode> | null {
+  const columnsFn = (
+    stmt as { columns?: () => { name?: unknown; type?: unknown; table?: unknown; column?: unknown }[] }
+  ).columns;
   if (typeof columnsFn !== 'function') return null;
-  let described: { name?: unknown; type?: unknown }[];
+  let described: { name?: unknown; type?: unknown; table?: unknown; column?: unknown }[];
   try {
     described = columnsFn.call(stmt);
   } catch {
     // A statement the driver cannot describe (some PRAGMA forms) is not worth
-    // failing a query over; skip the coercion for it.
+    // failing a query over; skip the decoding for it.
     return null;
   }
-  let out: Set<string> | null = null;
+  let out: Map<string, ColumnDecode> | null = null;
   for (const c of described) {
-    if (typeof c.name !== 'string' || typeof c.type !== 'string') continue;
-    if (!/bool/i.test(c.type)) continue;
-    if (out === null) out = new Set();
-    out.add(c.name);
+    if (typeof c.name !== 'string') continue;
+    let decode: ColumnDecode | undefined;
+    if (typeof c.type === 'string' && sqliteValueDecode(c.type) === 'boolean') decode = 'boolean';
+    else if (declared !== null && typeof c.table === 'string' && typeof c.column === 'string') {
+      decode = declared.get(`${c.table}\u0000${c.column}`);
+    }
+    if (decode === undefined) continue;
+    if (out === null) out = new Map();
+    out.set(c.name, decode);
   }
   return out;
 }
@@ -274,11 +458,11 @@ let cachedSqliteNamespace: { StatementSync?: { prototype?: { columns?: unknown }
 /**
  * Can the driver report a result column's DECLARED type?
  *
- * This is the same capability {@link booleanResultColumns} feature-detects, and
+ * This is the same capability {@link resultColumnDecoders} feature-detects, and
  * the two have to be asked the SAME question or they split: that helper is what
  * turns 1/0 into `true`/`false` on every direct read, and the boolean
  * `jsonWireRule` is what does it on the join path. On the Node band with
- * `node:sqlite` but without `StatementSync.columns()` (>= 22.5, < 22.13 / 23.4)
+ * `node:sqlite` but without `StatementSync.columns()` (>= 22.5, < 22.16 / 23.11)
  * the helper returns `null` and every direct read keeps 1/0, so a join that
  * still converted would produce exactly the strategy-dependent type flip the
  * rule exists to prevent, on the one runtime where nothing else can catch it.
@@ -310,7 +494,12 @@ const ROW_RETURNING_HEAD = /^\s*(?:select|with|pragma|explain|values)\b/i;
  * A `RETURNING` clause turns any write into a row-producing statement.
  */
 function statementReturnsRows(sql: string): boolean {
-  return ROW_RETURNING_HEAD.test(sql) || /\breturning\b/i.test(sql);
+  // A `sqlComment` (query/sql-comment.ts) sits after the statement and its
+  // values are data, so the RETURNING test reads the statement without it: a
+  // value such as `orders-returning` must not turn a write into a row read
+  // and its change count into 0.
+  const code = withoutTrailingComment(sql);
+  return ROW_RETURNING_HEAD.test(code) || /\breturning\b/i.test(code);
 }
 
 /**
@@ -383,16 +572,33 @@ function augmentSqliteError(err: unknown): unknown {
       target.code = '23514';
       return err;
     default:
-      // SQLITE_BUSY (5) / SQLITE_LOCKED (6) / SQLITE_BUSY_SNAPSHOT (261) etc.
-      if (primary === 5 || primary === 6) {
-        // Map to serialization_failure so withRetry()/$retry() retry it.
-        target.code = '40001';
-        return err;
-      }
+      // SQLITE_BUSY (5) / SQLITE_LOCKED (6) and their extended codes
+      // (SQLITE_BUSY_SNAPSHOT 517, SQLITE_LOCKED_SHAREDCACHE 262, ...). Built as
+      // the typed retryable error HERE rather than annotated, because the raw
+      // paths (`db.transaction(client => ...)`, `db.pool.query`) never pass
+      // through `wrapPgError` and would otherwise hand back the driver error.
+      if (primary === 5 || primary === 6) return sqliteBusyError(e.errcode, message, err);
       // SQLITE_ERROR (1): the statement itself is wrong. See the note above.
       if (primary === 1) return sqliteLogicError(message, err);
       return err;
   }
+}
+
+/**
+ * A `SQLITE_BUSY` / `SQLITE_LOCKED` failure as the retryable typed error, so
+ * `withRetry` / `$retry` and `err.isRetryable` handle it on every path.
+ * `busy_timeout` does not apply to a deferred transaction that read first and
+ * then tried to write (SQLITE_BUSY_SNAPSHOT): only retrying the WHOLE
+ * transaction can succeed, which is what the hint says.
+ */
+function sqliteBusyError(errcode: number, message: string, cause: unknown): SerializationFailureError {
+  const kind = (errcode & 0xff) === 5 ? 'SQLITE_BUSY' : 'SQLITE_LOCKED';
+  return new SerializationFailureError({
+    message:
+      `SQLite database is busy (${kind}, code ${errcode}): ${message}. Another connection holds the lock it needs. ` +
+      'Retry the whole transaction (withRetry does), or raise busyTimeoutMs.',
+    cause,
+  });
 }
 
 /**
@@ -413,7 +619,7 @@ function sqliteLogicError(message: string, cause?: unknown): ValidationError {
   const missingTable = /^no such table:\s*(\S+)/i.exec(message);
   if (missingTable) {
     return new ValidationError(
-      `SQLite has no table "${missingTable[1]}": ${message}. ` +
+      `SQLite has no table "${printableCatalogName(missingTable[1]!)}": ${printableCatalogName(message)}. ` +
         'Create it first (run your migrations, or execute the CREATE TABLE statements for this schema); ' +
         'an in-memory database starts empty on every connection.',
       { cause },
@@ -422,13 +628,13 @@ function sqliteLogicError(message: string, cause?: unknown): ValidationError {
   const missingColumn = /^no such column:\s*(\S+)/i.exec(message);
   if (missingColumn) {
     return new ValidationError(
-      `SQLite has no column "${missingColumn[1]}": ${message}. ` +
+      `SQLite has no column "${printableCatalogName(missingColumn[1]!)}": ${printableCatalogName(message)}. ` +
         'Check the spelling against the table as it exists in this database, ' +
         'and re-run `turbine generate` if the schema has changed.',
       { cause },
     );
   }
-  return new ValidationError(`SQLite rejected the statement: ${message}`, { cause });
+  return new ValidationError(`SQLite rejected the statement: ${printableCatalogName(message)}`, { cause });
 }
 
 // ---------------------------------------------------------------------------
@@ -466,13 +672,22 @@ function toNamedBinding(values: unknown[]): Record<string, SqliteParam> | undefi
   return named;
 }
 
+/** The refusal for a placeholder the shim cannot bind (see rewritePositionalPlaceholders). */
+function refusePlaceholder(message: string): never {
+  throw new ValidationError(message);
+}
+
 function runStatement(
   db: DatabaseSync,
-  sql: string,
+  text: string,
   values: unknown[],
-  booleanCache?: LRUCache<string, Set<string> | null>,
+  decoderCache?: LRUCache<string, Map<string, ColumnDecode> | null>,
+  declared: DeclaredDecoders = null,
 ) {
   const binding = toNamedBinding(values);
+  // `$n` is the spelling `rawUnsafe` documents for every engine; SQLite would
+  // read `$1` as a parameter NAMED "1", which the `{ p1, ... }` binding lacks.
+  const sql = rewritePositionalPlaceholders(text, 'sqlite', values.length, (i) => `:p${i}`, refusePlaceholder);
   let stmt: ReturnType<DatabaseSync['prepare']>;
   try {
     stmt = db.prepare(sql);
@@ -482,16 +697,16 @@ function runStatement(
   stmt.setReadBigInts(true);
   try {
     if (statementReturnsRows(sql)) {
-      // Describe each distinct statement ONCE. `null` (no boolean column) is a
+      // Describe each distinct statement ONCE. `null` (nothing to decode) is a
       // cached answer too, so the ordinary query pays a single Map hit per call
       // and nothing per row.
-      let booleanKeys = booleanCache?.get(sql);
-      if (booleanKeys === undefined) {
-        booleanKeys = booleanResultColumns(stmt);
-        booleanCache?.set(sql, booleanKeys);
+      let decoders = decoderCache?.get(sql);
+      if (decoders === undefined) {
+        decoders = resultColumnDecoders(stmt, declared);
+        decoderCache?.set(sql, decoders);
       }
       const rows = (binding ? stmt.all(binding) : stmt.all()).map((r) =>
-        normalizeRow(r as Record<string, null | number | bigint | string | Uint8Array>, booleanKeys ?? undefined),
+        normalizeRow(r as Record<string, null | number | bigint | string | Uint8Array>, decoders ?? undefined),
       );
       return { rows, rowCount: rows.length };
     }
@@ -504,45 +719,146 @@ function runStatement(
   }
 }
 
+/** Default wait, in ms, for a transaction another caller holds open on the handle. */
+const DEFAULT_BUSY_TIMEOUT_MS = 5000;
+
+/**
+ * Marker planted around a `$transaction` callback (see `wrapTransactionCallback`
+ * below), so a statement issued through the CLIENT from inside that callback is
+ * recognized instead of queueing behind the transaction it is part of.
+ */
+interface SqliteTxMarker {
+  readonly pool: SqlitePool;
+  readonly owner: object;
+  /** The marker that was in scope when this one was planted (another pool's transaction, say). */
+  readonly parent: SqliteTxMarker | undefined;
+}
+
+const sqliteTxStorage = new AsyncLocalStorage<SqliteTxMarker>();
+
+/** A caller waiting for the handle; `owner` is installed the moment it is granted. */
+interface HandleWaiter {
+  readonly owner: object;
+  readonly grant: () => void;
+  settled: boolean;
+}
+
+/** Statement heads that leave the handle inside a transaction when they succeed. */
+const TX_OPEN_HEAD = /^\s*(?:begin|savepoint)\b/i;
+/** Statement heads that end the transaction (not `ROLLBACK TO`, which keeps it open). */
+const TX_CLOSE_HEAD = /^\s*(?:commit|end|rollback(?!\s+(?:transaction\s+)?to\b))\b/i;
+
+/**
+ * The one statement the pool can never run: something on the handle while the
+ * transaction that owns it is waiting for that very statement.
+ */
+function statementInsideTransactionError(): UnsupportedFeatureError {
+  return new UnsupportedFeatureError(
+    'A statement on the client while its own transaction is open',
+    'sqlite',
+    'This call was made through the client, not the `tx` client, from inside an open $transaction callback. ' +
+      'SQLite has one connection here, so the call would either join that transaction (and be rolled back with ' +
+      'it) or wait for it forever. Use the `tx` client the callback receives, or make the call after the ' +
+      'transaction completes.',
+  );
+}
+
+/** The error a caller gets when an open transaction holds the handle past `busyTimeoutMs`. */
+function handleBusyError(timeoutMs: number): SerializationFailureError {
+  return new SerializationFailureError({
+    message:
+      `SQLite database is busy: a transaction on this client held it for longer than busyTimeoutMs (${timeoutMs} ms). ` +
+      'Retry the operation (withRetry does), keep transactions short, or raise busyTimeoutMs.',
+  });
+}
+
+/** Options for {@link SqlitePool}. */
+export interface SqlitePoolOptions {
+  /**
+   * How long, in ms, a statement waits for a transaction another caller has
+   * open on this handle before failing with a retryable
+   * `SerializationFailureError`. Default: 5000, the same bound as
+   * `PRAGMA busy_timeout`.
+   */
+  busyTimeoutMs?: number;
+  /**
+   * The client's schema. A column it declares boolean or json/jsonb is read
+   * back as a boolean or a parsed value, whatever its SQLite declared type.
+   * `turbineSqlite` passes the schema it was given.
+   */
+  schema?: SchemaMetadata;
+}
+
 /**
  * A `PgCompatPool` backed by a single `node:sqlite` `DatabaseSync` connection.
  * SQLite is single-connection by nature (a `:memory:` database is per-handle),
- * so `connect()` hands back a client over the **same** handle, transactions
- * (`BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT` nesting) just run on it. Queries are
- * serialized; this is the documented single-writer model.
+ * so `connect()` hands back a client over the **same** handle.
+ *
+ * One handle carries one transaction, so the pool decides who may use it. A
+ * caller whose statement opens a transaction OWNS the handle until that
+ * transaction ends; every other caller's statements, plain queries included,
+ * wait their turn in FIFO order (bounded by `busyTimeoutMs`) instead of running
+ * inside it. Without that, a write issued outside an open transaction joined
+ * it, reported success, and was rolled back with it, and reads saw its
+ * uncommitted rows. A checkout that does not open a transaction (a stream, a
+ * connectivity check) holds nothing, so other callers keep running beside it.
  */
 export class SqlitePool implements PgCompatPool {
   /** The underlying `node:sqlite` handle, exposed as an escape hatch (seed/DDL). */
   readonly db: DatabaseSync;
   private closed = false;
   /**
-   * `sql -> declared-boolean result columns` (or `null` for none). Bounded like
+   * `sql -> result columns to decode` (or `null` for none). Bounded like
    * the query builder's SQL-template cache, since a caller can generate
    * unbounded distinct statements (raw SQL, an IN-list that inlines).
    */
-  private readonly booleanCache = new LRUCache<string, Set<string> | null>(1000);
+  private readonly decoderCache = new LRUCache<string, Map<string, ColumnDecode> | null>(1000);
+  /** Schema columns whose stored form is not their declared JS type (see {@link declaredDecoders}). */
+  private readonly declared: DeclaredDecoders;
+  private readonly busyTimeoutMs: number;
+  /** Who may run statements on the handle right now; `null` when nobody holds it. */
+  private owner: object | null = null;
+  private readonly waiters: HandleWaiter[] = [];
+  /** The owner for statements sent through `pool.query()` rather than a checkout. */
+  private readonly poolOwner = {};
+  /** Transaction state when the driver cannot report it (`isTransaction` arrived in Node 22.16). */
+  private trackedTransaction = false;
 
-  constructor(db: DatabaseSync) {
+  constructor(db: DatabaseSync, options: SqlitePoolOptions = {}) {
     this.db = db;
+    const t = Number(options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS);
+    this.busyTimeoutMs = Number.isFinite(t) && t >= 0 ? t : DEFAULT_BUSY_TIMEOUT_MS;
+    this.declared = declaredDecoders(options.schema);
   }
 
   // biome-ignore lint/suspicious/noExplicitAny: pg-compat query is generic over the row shape; runStatement returns plain objects.
   async query(text: QueryArg, values?: unknown[]): Promise<any> {
     const { text: sql, params } = normalizeQueryArgs(text, values);
-    return runStatement(this.db, sql, params, this.booleanCache);
+    return this.runAs(this.poolOwner, sql, params);
   }
 
   async connect(): Promise<PgCompatPoolClient> {
-    const db = this.db;
-    const booleanCache = this.booleanCache;
+    if (this.closed) throw new ConnectionError('This SQLite client has been disconnected.');
+    const owner = {};
+    let released = false;
     return {
       // biome-ignore lint/suspicious/noExplicitAny: see query() above.
       query: async (text: QueryArg, values?: unknown[]): Promise<any> => {
+        if (released) {
+          throw new ConnectionError(
+            'This SQLite connection was released (its transaction ended or timed out); ' +
+              'run the statement through the client or a new transaction.',
+          );
+        }
         const { text: sql, params } = normalizeQueryArgs(text, values);
-        return runStatement(db, sql, params, booleanCache);
+        return this.runAs(owner, sql, params);
       },
+      wrapTransactionCallback: <R>(fn: () => Promise<R>): Promise<R> =>
+        sqliteTxStorage.run({ pool: this, owner, parent: sqliteTxStorage.getStore() }, fn),
       release: () => {
-        // Single shared connection, nothing to return to a pool.
+        if (released) return;
+        released = true;
+        this.releaseOwner(owner);
       },
     };
   }
@@ -551,6 +867,95 @@ export class SqlitePool implements PgCompatPool {
     if (this.closed) return;
     this.closed = true;
     this.db.close();
+  }
+
+  /** Is the handle inside a transaction right now? */
+  private inTransaction(): boolean {
+    const reported = (this.db as { isTransaction?: unknown }).isTransaction;
+    return typeof reported === 'boolean' ? reported : this.trackedTransaction;
+  }
+
+  /** Run one statement for `owner`, waiting first if another caller's transaction holds the handle. */
+  private async runAs(owner: object, sql: string, params: unknown[]) {
+    if (this.closed) throw new ConnectionError('This SQLite client has been disconnected.');
+    if (this.owner !== owner) {
+      if (this.owner !== null || this.waiters.length > 0) {
+        if (this.calledFromOwnersCallback()) throw statementInsideTransactionError();
+        await this.waitForHandle(owner);
+      } else {
+        this.owner = owner;
+      }
+    }
+    try {
+      const result = runStatement(this.db, sql, params, this.decoderCache, this.declared);
+      if (TX_OPEN_HEAD.test(sql)) this.trackedTransaction = true;
+      else if (TX_CLOSE_HEAD.test(sql)) this.trackedTransaction = false;
+      return result;
+    } finally {
+      // A statement that leaves no transaction open hands the handle on.
+      if (this.owner === owner && !this.inTransaction()) this.handOff();
+    }
+  }
+
+  /** True when the current async context is the callback of the transaction that owns the handle. */
+  private calledFromOwnersCallback(): boolean {
+    for (let m = sqliteTxStorage.getStore(); m; m = m.parent) {
+      if (m.pool === this && m.owner === this.owner) return true;
+    }
+    return false;
+  }
+
+  private waitForHandle(owner: object): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const waiter: HandleWaiter = {
+        owner,
+        settled: false,
+        grant: () => {
+          if (timer) clearTimeout(timer);
+          resolve();
+        },
+      };
+      this.waiters.push(waiter);
+      timer = setTimeout(() => {
+        if (waiter.settled) return;
+        waiter.settled = true;
+        const at = this.waiters.indexOf(waiter);
+        if (at >= 0) this.waiters.splice(at, 1);
+        reject(handleBusyError(this.busyTimeoutMs));
+      }, this.busyTimeoutMs);
+    });
+  }
+
+  /** Give the handle to the next waiter, which runs its statement as soon as it resumes. */
+  private handOff(): void {
+    this.owner = null;
+    while (this.waiters.length > 0) {
+      const next = this.waiters.shift()!;
+      if (next.settled) continue;
+      next.settled = true;
+      this.owner = next.owner;
+      next.grant();
+      return;
+    }
+  }
+
+  /**
+   * A checkout ended. If it still holds an open transaction (a timed-out or
+   * abandoned callback), roll it back first, so the next caller does not
+   * start inside it.
+   */
+  private releaseOwner(owner: object): void {
+    if (this.owner !== owner) return;
+    if (this.inTransaction() && !this.closed) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // Nothing left to roll back.
+      }
+      this.trackedTransaction = false;
+    }
+    this.handOff();
   }
 }
 
@@ -612,6 +1017,44 @@ function sqliteColumnAffinity(type: string): string {
 export const sqliteDialect: Dialect = {
   ...postgresDialect,
   name: 'sqlite',
+  capabilities: Object.freeze({
+    distinctOn: false,
+    positionalJson: false,
+    // NULLS FIRST / LAST since 3.30; NULL is the smallest value.
+    nullsOrderingClause: true,
+    nullsSortHigh: false,
+    insensitiveInList: false,
+    jsonDocumentEquality: 'text',
+    jsonExtractTyped: true,
+    jsonExactNumericCast: false,
+    numericTextComparison: false,
+    // Enforced only on a connection that turned `foreign_keys` on.
+    enforcesForeignKeys: false,
+    partitionLimitPushdown: false,
+    utcTimestampRewrite: false,
+    paramTypeCasts: false,
+    namedEnumTypes: false,
+    structuredValueColumns: 'scalars',
+    // The default SQLITE_MAX_VARIABLE_NUMBER.
+    maxBindParameters: 32766,
+    maxInsertRows: Number.POSITIVE_INFINITY,
+    upsertConflictTarget: 'explicit',
+    setClauseOrder: 'snapshot',
+    reselectLocksRows: false,
+    integerDivision: '/',
+    updateExpressions: true,
+    bulkUpsertAppliesRepeatedKeys: true,
+    readOnlyTransactions: false,
+    connectionParameters: false,
+    backendCancel: false,
+    idleTransactionTimeout: false,
+    abortsTransactionOnError: false,
+    connectionDriver: 'engine-driver',
+    preparesEveryStatement: false,
+    statementSyntax: 'sqlite',
+    inlineForeignKeys: true,
+    unboundedTextKeys: true,
+  } satisfies EngineCapabilities),
   resultStrategy: 'returning', // SQLite ≥ 3.35 has RETURNING
   supportsReturning: true,
   supportsILike: false,
@@ -628,6 +1071,13 @@ export const sqliteDialect: Dialect = {
   // No FROM-clause LATERAL: the opt-in lateral pick plan is Postgres-only.
   supportsLateralJoin: false,
   supportsPlanCacheMode: false,
+  // No row locks: a write transaction locks the whole database.
+  rowLockModes: [],
+  // percentile_cont / percentile_disc exist only in builds compiled with
+  // SQLITE_ENABLE_PERCENTILE, which node:sqlite cannot be assumed to have.
+  supportsPercentileAggregates: false,
+  // INSERT ... ON CONFLICT (cols) DO UPDATE ... RETURNING (3.24 + 3.35).
+  supportsBulkUpsert: true,
   // SQLite explains a compiled query with `EXPLAIN QUERY PLAN` (four columns:
   // id, parent, notused, detail), overriding the inherited Postgres `EXPLAIN`.
   explainQuery: { prefix: 'EXPLAIN QUERY PLAN' },
@@ -698,7 +1148,7 @@ export const sqliteDialect: Dialect = {
 
     // A declared-boolean column is 1/0 in storage, and the driver shim turns
     // that back into true/false on every direct read (see
-    // booleanResultColumns). `json_object` sees the raw integer and has no
+    // resultColumnDecoders). `json_object` sees the raw integer and has no
     // decltype to consult, so the join strategy alone would have kept handing
     // back 1/0 while the top-level read, the batched loader and the flatten
     // plan returned booleans, which is the same strategy-dependent type flip
@@ -710,7 +1160,8 @@ export const sqliteDialect: Dialect = {
     // driverReportsDeclaredTypes). Without it the shim cannot name a boolean
     // result column, so 1/0 is the answer everywhere; converting here alone
     // would put the flip back, pointing the other way.
-    if (t.includes('BOOL') && driverReportsDeclaredTypes()) {
+    const decode = sqliteValueDecode(columnType);
+    if (decode === 'boolean' && driverReportsDeclaredTypes()) {
       return {
         // Carried as TEXT because that is how the decode half is reached at
         // all: the parser only runs `decode` on a string cell, so a rule that
@@ -721,6 +1172,32 @@ export const sqliteDialect: Dialect = {
         // driver would have returned it, rather than being stringified.
         sql: (ref) => `CASE WHEN ${ref} IN (0, 1) THEN CAST(${ref} AS TEXT) ELSE ${ref} END`,
         decode: (value) => (value === '1' ? true : value === '0' ? false : value),
+      };
+    }
+
+    // A json/jsonb column is JSON text in storage, which the shim parses on
+    // every direct read (see resultColumnDecoders). `json_object` embeds the
+    // same text as a JSON string, so the decode is the same parse. No cast: the
+    // column reference already yields the text. Gated like the boolean rule,
+    // since the direct-read half needs the same driver capability.
+    if (decode === 'json' && driverReportsDeclaredTypes()) {
+      return { sql: (ref) => ref, decode: parseJsonCell };
+    }
+
+    // `json_object` renders a REAL with 15 significant digits on the SQLite
+    // that Node 22 and 24 bundle (3.47 to 3.51; 3.53 renders 17), so 0.1 + 0.2
+    // came back 0.3 through a join and a NUMERIC past 15 digits was rounded
+    // again on top of its REAL storage, while the top-level read and the
+    // batched loader return the stored double. `printf('%!.17g')` prints every
+    // double with enough digits to rebuild it, on every version; an INTEGER in
+    // the same column is carried as its text and decoded by the safe-integer
+    // policy above; text and NULL pass through as stored.
+    if (/REAL|FLOA|DOUB|NUMERIC|DECIMAL|MONEY/.test(t)) {
+      return {
+        sql: (ref) =>
+          `CASE typeof(${ref}) WHEN 'real' THEN printf('%!.17g', ${ref}) ` +
+          `WHEN 'integer' THEN CAST(${ref} AS TEXT) ELSE ${ref} END`,
+        decode: decodeRealText,
       };
     }
 
@@ -758,12 +1235,39 @@ export const sqliteDialect: Dialect = {
   // No `= ANY(array)` in SQLite. `json_each` expands a single JSON-array param
   // into a row set, keeping ONE placeholder (so the SQL cache stays valid
   // regardless of list length) and handling the empty-list case correctly.
+  // `x IN (SELECT ...)` compares like `x = ?`: the column's affinity and
+  // collation apply to each element, as they do to a bound operand. JSON has no
+  // bytes, so a binary element travels as `{"b": "<hex>"}` and is decoded back
+  // to a BLOB here (see sqliteInListJson).
   buildInClause(expr: string, paramRef: string, negated: boolean): string {
-    return `${expr} ${negated ? 'NOT IN' : 'IN'} (SELECT value FROM json_each(${paramRef}))`;
+    return (
+      `${expr} ${negated ? 'NOT IN' : 'IN'} ` +
+      `(SELECT CASE WHEN type = 'object' THEN unhex(json_extract(value, '$.b')) ELSE value END ` +
+      `FROM json_each(${paramRef}))`
+    );
   },
 
   inClauseParam(values: unknown[]): unknown {
-    return JSON.stringify(values ?? []);
+    return sqliteInListJson(Array.isArray(values) ? values : []);
+  },
+
+  /**
+   * A string written to a numeric or boolean column. SQLite's type affinity
+   * keeps text it cannot convert as TEXT in that column, where PostgreSQL
+   * refuses it at the server: `'abc'` in an INTEGER column, or `'true'` in a
+   * boolean one (stored 1/0), which `{ flag: true }` then never matches. A
+   * string that is a number (`'12.5'`, `'9007199254740993'`, `' 7 '`) is
+   * accepted and converted by SQLite, as before.
+   */
+  checkTextWrite(table: string, column: string, columnType: string, value: string): string | undefined {
+    if (!SQLITE_NUMERIC_COLUMN_TYPE.test(columnType.trim())) return undefined;
+    if (SQLITE_NUMERIC_LITERAL.test(value)) return undefined;
+    const boolean = /BOOL/i.test(columnType);
+    return (
+      `The string written to "${column}" on "${table}", a column of type ${columnType}, is not a number, so SQLite ` +
+      `would store it as text in that column; PostgreSQL refuses it. ` +
+      (boolean ? 'Write true or false.' : 'Write a number, or a string holding one, such as "12.5".')
+    );
   },
 
   buildReturningClause(selection: ReturningSelection = '*'): string {
@@ -793,6 +1297,23 @@ export const sqliteDialect: Dialect = {
     };
   },
 
+  buildBulkUpsertStatement(input: BulkUpsertStatementInput): BuiltStatement {
+    // VALUES, not `INSERT ... SELECT`: after a SELECT, SQLite cannot tell a
+    // trailing `ON CONFLICT` from the SELECT's own clauses. The rest is the
+    // PostgreSQL grammar (3.24 upsert, 3.35 RETURNING), `excluded` included.
+    let n = 0;
+    const tuples = input.rowValues.map((row) => `(${row.map(() => this.paramPlaceholder(++n)).join(', ')})`).join(', ');
+    const params = input.rowValues.flat();
+    return {
+      sql:
+        `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES ${tuples} ` +
+        `ON CONFLICT (${input.conflictColumns.join(', ')}) ` +
+        onConflictAction(input, params, { target: input.table, incoming: 'excluded' }) +
+        this.buildReturningClause(input.returning),
+      params,
+    };
+  },
+
   buildDefaultValuesInsertStatement(input: DefaultValuesInsertStatementInput): string {
     // SQLite's `DEFAULT VALUES` inserts exactly one row and the engine accepts
     // neither `VALUES (DEFAULT, …)` nor MySQL's empty `VALUES ()` tuple, so
@@ -819,6 +1340,13 @@ export const sqliteDialect: Dialect = {
       (input.updateWhere ? ` WHERE ${input.updateWhere}` : '') +
       this.buildReturningClause(input.returning)
     );
+  },
+
+  // A SQLite transaction is always SERIALIZABLE, which satisfies every level
+  // `$transaction({ isolationLevel })` can ask for, and the inherited
+  // `BEGIN ISOLATION LEVEL ...` is a syntax error here.
+  beginStatement(): string {
+    return 'BEGIN';
   },
 
   buildInsensitiveLike(column: string, paramRef: string): string {
@@ -855,6 +1383,12 @@ export const sqliteDialect: Dialect = {
 
   buildColumnType(input: ColumnTypeInput): string {
     return sqliteColumnAffinity(input.type);
+  },
+
+  /** SQLite has no enum type: a TEXT column, and a CHECK that admits only the labels (compared exactly, BINARY collation). */
+  buildEnumColumn(column: string, labels: readonly string[]): { type: string; check: string } {
+    const literals = labels.map((label) => `'${label.replace(/'/g, "''")}'`);
+    return { type: 'TEXT', check: `${column} IN (${literals.join(', ')})` };
   },
 
   buildColumnDefinition(input: ColumnDefinitionInput): string {
@@ -977,7 +1511,10 @@ function pragma<T>(db: DatabaseSync, sql: string): T[] {
  * Exposed directly so callers (and tests) can introspect an in-process
  * `:memory:` database without round-tripping through a file path.
  */
-export function introspectSqliteDatabase(db: DatabaseSync, options: { include?: string[]; exclude?: string[] } = {}) {
+export function introspectSqliteDatabase(
+  db: DatabaseSync,
+  options: Pick<IntrospectOptions, 'include' | 'exclude' | 'logger'> = {},
+) {
   // ----- Tables (skip SQLite internal + the migration tracking table) -----
   const candidateTables = pragma<{ name: string }>(
     db,
@@ -1089,17 +1626,19 @@ export function introspectSqliteDatabase(db: DatabaseSync, options: { include?: 
   // same logical schema, legacy-first naming, per-column disambiguation,
   // collision resolution against scalar column fields, and the conservative
   // pure-junction manyToMany auto-detection included.
-  const relationsByTable = deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable);
+  // One field per column, as the PostgreSQL introspector requires.
+  for (const [tableName, cols] of columnsByTable) assertDistinctColumnFields(tableName, cols);
+  const relationsByTable = deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable, options.logger);
 
   // ----- Assemble TableMetadata -----
-  const tables: Record<string, TableMetadata> = {};
+  const tables: Record<string, TableMetadata> = nullRecord<TableMetadata>();
   for (const tableName of tableNames) {
     const columns = columnsByTable.get(tableName) ?? [];
-    const columnMap: Record<string, string> = {};
-    const reverseColumnMap: Record<string, string> = {};
+    const columnMap: Record<string, string> = nullRecord<string>();
+    const reverseColumnMap: Record<string, string> = nullRecord<string>();
     const dateColumns = new Set<string>();
-    const dialectTypes: Record<string, string> = {};
-    const pgTypes: Record<string, string> = {};
+    const dialectTypes: Record<string, string> = nullRecord<string>();
+    const pgTypes: Record<string, string> = nullRecord<string>();
     const allColumns: string[] = [];
 
     for (const col of columns) {
@@ -1122,7 +1661,7 @@ export function introspectSqliteDatabase(db: DatabaseSync, options: { include?: 
       allColumns,
       primaryKey: pkByTable.get(tableName) ?? [],
       uniqueColumns: uniqueByTable.get(tableName) ?? [],
-      relations: relationsByTable.get(tableName) ?? {},
+      relations: relationsByTable.get(tableName) ?? nullRecord<RelationDef>(),
       indexes: indexesByTable.get(tableName) ?? [],
     };
   }
@@ -1150,7 +1689,7 @@ export async function introspectSqlite(options: IntrospectOptions): Promise<Sche
     );
   }
   try {
-    return introspectSqliteDatabase(db, { include: options.include, exclude: options.exclude });
+    return introspectSqliteDatabase(db, { include: options.include, exclude: options.exclude, logger: options.logger });
   } finally {
     db.close();
   }
@@ -1171,7 +1710,11 @@ export interface TurbineSqliteOptions extends EngineClientConfig {
    * Ignored for `':memory:'`. Default: `true`.
    */
   wal?: boolean;
-  /** `PRAGMA busy_timeout` in ms, how long a writer waits on `SQLITE_BUSY`. Default: 5000. */
+  /**
+   * How long, in ms, a statement waits for the database: `PRAGMA busy_timeout`
+   * for another process's lock, and the wait behind a transaction another
+   * caller has open on this client. Default: 5000.
+   */
   busyTimeoutMs?: number;
   /** Enable `PRAGMA foreign_keys` enforcement. Default: `true`. */
   foreignKeys?: boolean;
@@ -1185,8 +1728,15 @@ function openSqliteDatabase(target: string, options: TurbineSqliteOptions): Data
   } catch (err) {
     throw new ConnectionError(`Failed to open SQLite database "${target}": ${(err as Error).message}`);
   }
-  db.exec(`PRAGMA busy_timeout = ${Number(options.busyTimeoutMs ?? 5000)}`);
-  if (options.foreignKeys !== false) db.exec('PRAGMA foreign_keys = ON');
+  try {
+    db.exec(`PRAGMA busy_timeout = ${Number(options.busyTimeoutMs ?? 5000)}`);
+    if (options.foreignKeys !== false) db.exec('PRAGMA foreign_keys = ON');
+  } catch (err) {
+    // Opened here and about to be unreachable: close it rather than leave the
+    // file handle to the garbage collector.
+    db.close();
+    throw err;
+  }
   if (target !== ':memory:' && options.wal !== false) {
     try {
       db.exec('PRAGMA journal_mode = WAL');
@@ -1221,19 +1771,49 @@ export function turbineSqlite(
   schema: SchemaMetadata,
   options: TurbineSqliteOptions = {},
 ): TurbineClient {
-  const db = typeof target === 'string' ? openSqliteDatabase(target, options) : target;
-  const pool = new SqlitePool(db);
-  // Everything that is not a SQLite pragma is client config and rides through
-  // untouched, so a new TurbineConfig option works here the day it lands. The
-  // engine-owned keys come last, so no caller can unbind the dialect.
-  const { wal: _wal, busyTimeoutMs: _busyTimeoutMs, foreignKeys: _foreignKeys, ...clientConfig } = options;
-  return new TurbineClient(
-    {
-      ...clientConfig,
-      pool,
-      dialect: sqliteDialect,
-      preparedStatements: false,
-    },
-    schema,
-  );
+  const owns = typeof target === 'string';
+  const db = owns ? openSqliteDatabase(target, options) : target;
+  let pool: SqlitePool;
+  let client: TurbineClient;
+  try {
+    pool = new SqlitePool(db, { busyTimeoutMs: options.busyTimeoutMs, schema });
+    // Everything that is not a SQLite pragma is client config and rides through
+    // untouched, so a new TurbineConfig option works here the day it lands. The
+    // engine-owned keys come last, so no caller can unbind the dialect.
+    const { wal: _wal, busyTimeoutMs: _busyTimeoutMs, foreignKeys: _foreignKeys, ...clientConfig } = options;
+    client = new TurbineClient(
+      {
+        ...clientConfig,
+        pool,
+        dialect: sqliteDialect,
+        preparedStatements: false,
+      },
+      schema,
+    );
+  } catch (err) {
+    // A failed factory hands the caller nothing to close, so a handle it
+    // OPENED is closed here (the client constructor refuses a bad config, a
+    // static global filter naming no table or column for one). A handle the
+    // caller passed in is the caller's and stays open.
+    if (owns) db.close();
+    throw err;
+  }
+
+  if (owns) {
+    // Turbine opened this handle, so disconnect()/end() must close it, as the
+    // other engine factories close a pool they built: the client sees
+    // `TurbineConfig.pool` as external and would otherwise leave it open, still
+    // answering queries after disconnect(). A handle the caller passed in stays
+    // the caller's (disconnect() is a no-op for it).
+    const baseDisconnect = client.disconnect.bind(client);
+    const close = async (options?: DisconnectOptions): Promise<DisconnectResult | undefined> => {
+      const result = options === undefined ? await baseDisconnect() : await baseDisconnect(options);
+      await pool.end();
+      return result ?? undefined;
+    };
+    const patch = client as unknown as { disconnect: typeof close; end: typeof close };
+    patch.disconnect = close;
+    patch.end = close;
+  }
+  return client;
 }

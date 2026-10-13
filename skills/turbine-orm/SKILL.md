@@ -101,6 +101,16 @@ Operators: `equals`, `not`, `gt`, `gte`, `lt`, `lte`, `in`, `notIn`, `contains`,
 `startsWith`, `endsWith`, plus `mode: 'insensitive'`. `AND`, `OR` and `NOT` nest
 at any depth; `AND` and `OR` take arrays.
 
+`not` also takes an operator object: `givenName: { not: { contains: 'Roux' } }`.
+To compare two columns, wrap the other one in `col()`, imported from
+`turbine-orm`: `rindScore: { gt: col('aromaScore') }`. A plain `{ col: 'x' }`
+object is refused with `TURBINE_E003`, and so is an operand that does not fit
+its operator, such as an array for `equals` or `null` for `gt`.
+
+A key whose value is `undefined` is left out, as in Prisma. When that empties
+the whole `where`, `findFirst` throws `TURBINE_E003` instead of returning an
+arbitrary row.
+
 Values are always bound as parameters, and `contains` / `startsWith` /
 `endsWith` escape LIKE wildcards for you. There is no code path in the typed API
 that concatenates a value into SQL.
@@ -160,7 +170,10 @@ them. Passing both spellings of one bound with different values throws.
 { take: 20, skip: 40 }
 ```
 
-For deep pages, prefer a `cursor` over a large `offset`.
+For deep pages, prefer a `cursor` over a large `offset`. A cursor names the
+last row you have by a unique key, `cursor: { id: 41 }`; the page excludes that
+row and continues in the query's `orderBy`, with the primary key added as a
+tiebreaker.
 
 ## JSON columns
 
@@ -174,8 +187,11 @@ where: { credentialBlob: { path: ['tier'], equals: 'master' } }
 A path takes a DIFFERENT operator set from a plain column: `equals`, `gt`,
 `gte`, `lt`, `lte`, `hasKey`, `contains`, `stringContains`, `stringStartsWith`,
 `stringEndsWith`, plus `mode` (which applies to the three `string*` operators).
-`contains` on a JSON column is containment (`@>`, a whole sub-document such as
-`{ contains: { panel: { seats: 4 } } }`), NOT a substring test; the substring
+`equals` at a path compares JSON values, so `equals: null` matches a JSON
+`null` and not the string `"null"`. Without a `path`, `equals` compares the
+whole document exactly. `contains` on a JSON column is containment (`@>`, a
+whole sub-document such as `{ contains: { panel: { seats: 4 } } }`), NOT a
+substring test; the substring
 operators on a path are `stringContains`, `stringStartsWith` and
 `stringEndsWith`. `not`, `in`, `notIn`, `startsWith` and `endsWith` are refused
 with `TURBINE_E003` listing the accepted set (the last two point at their
@@ -189,8 +205,9 @@ comes back as `_sum.score`. `_sum` / `_avg` cast the value to numeric; `_min` /
 `_max` compare as text unless `type: 'numeric'`. **`aggregate()` has no JSON-path
 form**: every key there must be a column (anything else is `TURBINE_E003`) and
 every value `true`; an object value is read as `true`, so the whole column
-reaches the database as `avg(jsonb)` and fails there with a database error, not
-a Turbine code. **`_count` never takes a path**, in `groupBy` or `aggregate()`:
+reaches the database as `avg(jsonb)`, which the database refuses. That surfaces
+as `TURBINE_E003` with `sqlstate` `42883`, not as a Turbine check naming the
+path. **`_count` never takes a path**, in `groupBy` or `aggregate()`:
 an object under a `_count` key is read as `true` (a count of that column's
 non-null values) and any path in it is ignored. To count per JSON value, group
 by the path and read `_count`.
@@ -210,6 +227,11 @@ await db.ripeningChecks.aggregate({
 PostgreSQL's exact text as a **string** (every value, not only large ones; `AVG`
 is not float-cast there); over `int4` / `float` columns and over a JSON path they
 return a number. `_min` / `_max` return the column's own type.
+
+`_percentile: { aromaScore: { p: 0.9 } }` returns the 90th percentile, on
+PostgreSQL only. `p` may be an array of fractions, and the result is then an
+array in the same order. The default `method: 'cont'` interpolates and is
+refused on a date column with `TURBINE_E003`; use `method: 'disc'` there.
 
 ## groupBy and having
 
@@ -247,7 +269,35 @@ the `ON CONFLICT` target when `create` carries the same values, so a non-unique
 predicate is refused rather than sent. When `create` does not carry them (a
 `create` that leaves `id` to its sequence, say), `upsert` looks the row up by
 `where` first, inside a transaction. Use `updateMany` and `deleteMany` for
-"every row matching a filter".
+"every row matching a filter". They take no `limit`, `take`, `offset` or `skip`
+(`TURBINE_E003`): to write a bounded batch, `findMany` the ids first, then pass
+`where: { id: { in: ids } }`.
+
+## Computed updates and bulk upserts
+
+To set a column from the row's own values, build the value with `expr` and
+`col()`, both imported from `turbine-orm`:
+
+```ts
+await db.cheeseWheels.update({
+  where: { id: 7 },
+  data: { wheelCount: expr.add(col('wheelCount'), 1) },
+});
+```
+
+A plain object shaped like an expression (`{ kind: 'add', args: [1, 2] }`) is
+refused with `TURBINE_E003`, and so is an expression in `create` data.
+
+`createMany` with `onConflict: { target: ['guildId', 'batchRef'], update:
+['status'] }` inserts the new keys and updates the rows that already exist. The
+target must be the primary key or one whole unique key; any other column list
+is refused with `TURBINE_E003`.
+
+## Locking rows
+
+`lock: 'update'` on `findMany`, `findFirst` or `findUnique` locks the rows it
+returns until the transaction ends. It must run on the `tx` inside
+`db.$transaction(async (tx) => ...)`; on `db` it throws `TURBINE_E003`.
 
 ## `distinct`
 

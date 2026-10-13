@@ -9,7 +9,7 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
@@ -95,16 +95,14 @@ describe('CLI config', () => {
 
   describe('findConfigFile()', () => {
     it('returns null when no config file exists', () => {
-      const emptyDir = join(tmpdir(), `turbine-cli-test-noconfig-${Date.now()}`);
-      mkdirSync(emptyDir, { recursive: true });
+      const emptyDir = mkdtempSync(join(tmpdir(), 'turbine-cli-test-noconfig-'));
       const result = findConfigFile(emptyDir);
       assert.equal(result, null);
       rmSync(emptyDir, { recursive: true, force: true });
     });
 
     it('finds turbine.config.ts first (highest priority)', () => {
-      const dir = join(tmpdir(), `turbine-cli-test-priority-${Date.now()}`);
-      mkdirSync(dir, { recursive: true });
+      const dir = mkdtempSync(join(tmpdir(), 'turbine-cli-test-priority-'));
       writeFileSync(join(dir, 'turbine.config.ts'), 'export default {};');
       writeFileSync(join(dir, 'turbine.config.js'), 'module.exports = {};');
       const result = findConfigFile(dir);
@@ -114,8 +112,7 @@ describe('CLI config', () => {
     });
 
     it('falls back to turbine.config.js when .ts is absent', () => {
-      const dir = join(tmpdir(), `turbine-cli-test-js-${Date.now()}`);
-      mkdirSync(dir, { recursive: true });
+      const dir = mkdtempSync(join(tmpdir(), 'turbine-cli-test-js-'));
       writeFileSync(join(dir, 'turbine.config.js'), 'module.exports = {};');
       const result = findConfigFile(dir);
       assert.ok(result !== null);
@@ -124,8 +121,7 @@ describe('CLI config', () => {
     });
 
     it('finds turbine.config.mjs', () => {
-      const dir = join(tmpdir(), `turbine-cli-test-mjs-${Date.now()}`);
-      mkdirSync(dir, { recursive: true });
+      const dir = mkdtempSync(join(tmpdir(), 'turbine-cli-test-mjs-'));
       writeFileSync(join(dir, 'turbine.config.mjs'), 'export default {};');
       const result = findConfigFile(dir);
       assert.ok(result !== null);
@@ -140,16 +136,14 @@ describe('CLI config', () => {
 
   describe('loadConfig()', () => {
     it('returns empty object when no config file exists', async () => {
-      const emptyDir = join(tmpdir(), `turbine-cli-test-loadconfig-${Date.now()}`);
-      mkdirSync(emptyDir, { recursive: true });
+      const emptyDir = mkdtempSync(join(tmpdir(), 'turbine-cli-test-loadconfig-'));
       const config = await loadConfig(emptyDir);
       assert.deepEqual(config, {});
       rmSync(emptyDir, { recursive: true, force: true });
     });
 
     it('loads a .mjs config file', async () => {
-      const dir = join(tmpdir(), `turbine-cli-test-loadmjs-${Date.now()}`);
-      mkdirSync(dir, { recursive: true });
+      const dir = mkdtempSync(join(tmpdir(), 'turbine-cli-test-loadmjs-'));
       writeFileSync(join(dir, 'turbine.config.mjs'), `export default { out: './custom-output', schema: 'myschema' };`);
       const config = await loadConfig(dir);
       assert.equal(config.out, './custom-output');
@@ -158,8 +152,7 @@ describe('CLI config', () => {
     });
 
     it('surfaces a load error (via loadConfigResult) instead of swallowing it', async () => {
-      const dir = join(tmpdir(), `turbine-cli-test-loaderr-${Date.now()}`);
-      mkdirSync(dir, { recursive: true });
+      const dir = mkdtempSync(join(tmpdir(), 'turbine-cli-test-loaderr-'));
       // A .mjs with a hard syntax error fails to import.
       writeFileSync(join(dir, 'turbine.config.mjs'), `export default { this is not valid javascript`);
       const result = await loadConfigResult(dir);
@@ -378,24 +371,21 @@ describe('CLI config', () => {
 
   describe('detectConsumerModuleType()', () => {
     it('returns "module" for an ESM package.json', () => {
-      const dir = join(tmpdir(), `turbine-cli-test-esm-${Date.now()}`);
-      mkdirSync(dir, { recursive: true });
+      const dir = mkdtempSync(join(tmpdir(), 'turbine-cli-test-esm-'));
       writeFileSync(join(dir, 'package.json'), JSON.stringify({ type: 'module' }));
       assert.equal(detectConsumerModuleType(dir), 'module');
       rmSync(dir, { recursive: true, force: true });
     });
 
     it('returns "commonjs" when the type field is absent (npm init -y default)', () => {
-      const dir = join(tmpdir(), `turbine-cli-test-cjs-${Date.now()}`);
-      mkdirSync(dir, { recursive: true });
+      const dir = mkdtempSync(join(tmpdir(), 'turbine-cli-test-cjs-'));
       writeFileSync(join(dir, 'package.json'), JSON.stringify({ name: 'x' }));
       assert.equal(detectConsumerModuleType(dir), 'commonjs');
       rmSync(dir, { recursive: true, force: true });
     });
 
     it('returns "none" when there is no package.json', () => {
-      const dir = join(tmpdir(), `turbine-cli-test-nopkg-${Date.now()}`);
-      mkdirSync(dir, { recursive: true });
+      const dir = mkdtempSync(join(tmpdir(), 'turbine-cli-test-nopkg-'));
       assert.equal(detectConsumerModuleType(dir), 'none');
       rmSync(dir, { recursive: true, force: true });
     });
@@ -911,8 +901,7 @@ describe('CLI TypeScript loader', () => {
       // cwd in a finally block.
       _resetTsLoaderStateForTests();
       const originalCwd = process.cwd();
-      const isolated = join(tmpdir(), `turbine-loader-missing-${Date.now()}`);
-      mkdirSync(isolated, { recursive: true });
+      const isolated = mkdtempSync(join(tmpdir(), 'turbine-loader-missing-'));
       try {
         process.chdir(isolated);
         const status = await registerTsLoader();
@@ -965,8 +954,7 @@ describe('turbine generate, empty-client guard (#28)', () => {
   }
 
   it('errors (exit 1) when `schema` is set to a schema FILE path', { skip: !haveTsx }, () => {
-    const dir = join(tmpdir(), `turbine-gen-guard-${Date.now()}`);
-    mkdirSync(dir, { recursive: true });
+    const dir = mkdtempSync(join(tmpdir(), 'turbine-gen-guard-'));
     try {
       const { code, output } = runGenerate(dir, [
         '--url',
@@ -983,8 +971,7 @@ describe('turbine generate, empty-client guard (#28)', () => {
   });
 
   it('--allow-empty bypasses the file-path guard (then fails on connection, not the guard)', { skip: !haveTsx }, () => {
-    const dir = join(tmpdir(), `turbine-gen-allow-${Date.now()}`);
-    mkdirSync(dir, { recursive: true });
+    const dir = mkdtempSync(join(tmpdir(), 'turbine-gen-allow-'));
     try {
       const { output } = runGenerate(dir, [
         '--url',

@@ -224,9 +224,11 @@ describe('stale prisma-map warning', () => {
     });
   });
 
-  it('is silent in production even when the map is stale', async () => {
+  it('warns in production too: a stale map loses models there as well', async () => {
     await withEnv('production', async () => {
-      assert.deepEqual(await run({ path: stalePath, hash: 'v1:ffffffffffffffff' }, 'silence'), []);
+      const warned = await run({ path: stalePath, hash: 'v1:ffffffffffffffff' }, 'warning');
+      assert.equal(warned.length, 1);
+      assert.match(warned[0]!, /fingerprint-schema-stale\.prisma has changed/);
     });
   });
 

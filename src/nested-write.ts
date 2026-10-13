@@ -21,6 +21,8 @@ import {
   ValidationError,
 } from './errors.js';
 import { markInternalRowSelector } from './query/compound-unique.js';
+import { resolveExcludedFromCreate } from './query/expr.js';
+import { isPlainRecord, setOwn } from './query/filters.js';
 import { markInternalCombinator, resolveColumnName } from './query/utils.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
 import { normalizeKeyColumns } from './schema.js';
@@ -80,6 +82,7 @@ export interface NestedWriteContext {
       deleteMany(args: { where: Record<string, unknown> }): Promise<{ count: number }>;
       findMany(args: { where: Record<string, unknown>; warnOnUnlimited?: boolean }): Promise<T[]>;
       findUnique(args: { where: Record<string, unknown>; with?: Record<string, unknown> }): Promise<T | null>;
+      findFirst(args: { where: Record<string, unknown> }): Promise<T | null>;
     };
   };
 }
@@ -111,7 +114,7 @@ export function extractRelationFields(data: Record<string, unknown>, tableMeta: 
     ) {
       relations[key] = value as Record<string, unknown>;
     } else {
-      scalars[key] = value;
+      setOwn(scalars, key, value);
     }
   }
 
@@ -298,24 +301,71 @@ function keyOf(value: unknown): string {
   return String(value);
 }
 
+/** The operations that point a to-one relation's foreign key at a row: at most one per write. */
+const BELONGS_TO_POINTER_OPS = ['create', 'connect', 'connectOrCreate', 'disconnect', 'delete'] as const;
+
 /**
  * Validate that all operation keys in a nested write are recognized and
- * allowed for the current context (create vs update).
+ * allowed for the current context (create vs update) and relation.
+ *
+ * A belongsTo relation is one row the parent points at, so it takes Prisma's
+ * to-one operations: no `set` (a to-many operation), and at most one of the
+ * operations that decide what the parent points at, since one write cannot
+ * honor two. An operation whose value is `undefined` is absent, as everywhere
+ * else in a query; only its name is still checked, so a misspelled operation
+ * is reported whatever it holds.
  */
-function validateOps(relationName: string, ops: Record<string, unknown>, isUpdate: boolean): void {
+function validateOps(relationName: string, ops: Record<string, unknown>, isUpdate: boolean, rel?: RelationDef): void {
+  const belongsTo = rel?.type === 'belongsTo';
   for (const opName of Object.keys(ops)) {
+    const absent = ops[opName] === undefined;
     if (!CREATE_ONLY_OPS.has(opName) && !UPDATE_ONLY_OPS.has(opName)) {
+      const updateOps = belongsTo
+        ? ', disconnect, delete, update, upsert'
+        : ', disconnect, set, delete, update, upsert';
       throw new ValidationError(
         `Unknown nested write operation "${opName}" on relation "${relationName}". ` +
-          `Valid operations: create, connect, connectOrCreate${isUpdate ? ', disconnect, set, delete, update, upsert' : ''}.`,
+          `Valid operations: create, connect, connectOrCreate${isUpdate ? updateOps : ''}.`,
       );
     }
+    if (absent) continue;
     if (!isUpdate && UPDATE_ONLY_OPS.has(opName)) {
       throw new ValidationError(
         `Operation "${opName}" on relation "${relationName}" is only valid inside update(), not create().`,
       );
     }
+    if (belongsTo && opName === 'set') {
+      throw new ValidationError(
+        `Nested set on "${relationName}" is not supported: "${relationName}" is a single "${rel.to}" row this ` +
+          `record points at, and set replaces a to-many list. Use connect to point at a different "${rel.to}", ` +
+          'or disconnect to clear it.',
+      );
+    }
   }
+  if (belongsTo) {
+    const given = BELONGS_TO_POINTER_OPS.filter((op) => ops[op] !== undefined && ops[op] !== false);
+    if (given.length > 1) {
+      throw new ValidationError(
+        `Nested write on "${relationName}" combines ${given.join(' and ')}. "${relationName}" is a single ` +
+          `"${rel.to}" row, so one write can create, connect, connectOrCreate, disconnect or delete it, not ` +
+          'several. Split the write in two if both are intended.',
+      );
+    }
+  }
+}
+
+/**
+ * The single item a to-one operation names. A one-element array is accepted
+ * for compatibility; an empty or longer one is refused, since only one row can
+ * be pointed at and keeping one of several would drop the rest silently.
+ */
+function singleToOneItem<T>(value: T | T[], op: string, relName: string, rel: RelationDef): T {
+  if (!Array.isArray(value)) return value;
+  if (value.length === 1) return value[0]!;
+  throw new ValidationError(
+    `Nested ${op} on "${relName}" received ${value.length} items, but "${relName}" is a single "${rel.to}" ` +
+      `row. Pass one object, for example \`${op}: { ... }\`.`,
+  );
 }
 
 /**
@@ -323,12 +373,11 @@ function validateOps(relationName: string, ops: Record<string, unknown>, isUpdat
  *
  * Built from the DATA, recursively: a relation whose payload itself contains
  * relation writes is requested as `{ rel: { with: { ... } } }` rather than
- * `{ rel: true }`. It used to be the top-level keys alone, so a depth-3 create
- * wrote all three levels and returned an object whose grandchildren were
- * missing entirely, which a caller reads as "there are none".
+ * `{ rel: true }`. Requesting the top-level keys alone would return a depth-3
+ * create without its grandchildren, which a caller reads as "there are none".
  *
  * Only relations that were actually WRITTEN are requested, so a create with no
- * nested data still reads back exactly what it did before. The walk is capped
+ * nested data reads back just the row. The walk is capped
  * at {@link MAX_DEPTH}, the cap the write walk itself uses, and the builder's
  * own relation-depth guard is the backstop below that.
  */
@@ -376,11 +425,6 @@ function readBackWith(
   }
 
   return Object.keys(clause).length > 0 ? clause : undefined;
-}
-
-/** A plain object (not an array, Date or null), the shape nested payloads take. */
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value) && !(value instanceof Date);
 }
 
 /**
@@ -1060,6 +1104,19 @@ function notRelatedToParent(op: string, relName: string, rel: RelationDef, targe
   });
 }
 
+/** A belongsTo `delete` (or a `disconnect` naming fields) on a parent whose foreign key is NULL. */
+function nothingConnected(op: string, relName: string, rel: RelationDef, target: unknown): NotFoundError {
+  return new NotFoundError({
+    table: rel.to,
+    where: target,
+    operation: `nested ${op}`,
+    message:
+      `Nested ${op} on relation "${relName}": nothing is connected (this record's foreign key to "${rel.to}" ` +
+      `is NULL), so there is no "${rel.to}" row to ${op}.` +
+      (op === 'disconnect' ? ' Use `disconnect: true` to clear the relation whatever it points at.' : ''),
+  });
+}
+
 /** Re-tag a NotFoundError from a scoped child write as a relation-scoped miss. */
 function rethrowAsNotRelated(err: unknown, op: string, relName: string, rel: RelationDef, target: unknown): never {
   if (err instanceof NotFoundError) {
@@ -1123,7 +1180,7 @@ export async function executeNestedCreate(
           `Available relations: ${Object.keys(tableMeta.relations).join(', ') || '(none)'}.`,
       );
     }
-    validateOps(relName, ops, false);
+    validateOps(relName, ops, false, rel);
   }
 
   // belongsTo relations put the foreign key on the PARENT row, so they must be
@@ -1220,7 +1277,7 @@ export async function executeNestedUpdate(
           `Available relations: ${Object.keys(tableMeta.relations).join(', ') || '(none)'}.`,
       );
     }
-    validateOps(relName, ops, true);
+    validateOps(relName, ops, true, rel);
   }
 
   // Update parent row with scalar data (may be empty if only relation ops)
@@ -1279,27 +1336,12 @@ export async function executeNestedUpdate(
         await processBelongsToUpsert(ctx, rel, ops.upsert, parentRow, tableName);
       }
 
-      if (ops.disconnect !== undefined) {
-        // For belongsTo disconnect, null out the FK on the parent
-        const fks = normalizeKeyColumns(rel.foreignKey);
-        const nullable = fks.every((fk) => {
-          const col = tableMeta.columns.find((c) => c.name === fk);
-          return col?.nullable ?? false;
-        });
-        if (!nullable) {
-          throw new ValidationError(
-            `Cannot disconnect "${relName}": foreign key column(s) ${fks.join(', ')} are NOT NULL. Use delete instead.`,
-          );
-        }
-        const updateData: Record<string, unknown> = {};
-        for (const fk of fks) {
-          const field = tableMeta.reverseColumnMap[fk] ?? fk;
-          updateData[field] = null;
-        }
-        await ctx.tx.table(tableName).update({
-          where: pkWhere(tableMeta, parentRow),
-          data: updateData,
-        });
+      if (ops.disconnect !== undefined && ops.disconnect !== false) {
+        await processBelongsToDisconnect(ctx, rel, ops.disconnect, relName, parentRow, tableName, 'disconnect');
+      }
+
+      if (ops.delete !== undefined && ops.delete !== false) {
+        await processBelongsToDisconnect(ctx, rel, ops.delete, relName, parentRow, tableName, 'delete');
       }
     } else {
       await processManyToMany(ctx, rel, relName, ops, parentRow);
@@ -1402,56 +1444,87 @@ async function resolveBelongsToForCreate(
   path: string[],
   relName: string,
 ): Promise<Record<string, unknown>> {
-  const fks = normalizeKeyColumns(rel.foreignKey);
-  const refs = normalizeKeyColumns(rel.referenceKey);
-  const parentMeta = ctx.schema.tables[parentTable]!;
-  const relatedTable = ctx.schema.tables[rel.to];
-
-  let relatedRow: Record<string, unknown> | null = null;
-
-  if (ops.create !== undefined) {
-    const items = toArray(ops.create as Record<string, unknown> | Record<string, unknown>[]);
-    if (items.length > 0) {
-      relatedRow = (await executeNestedCreate(ctx, rel.to, items[0]!, depth + 1, [...path, relName])) as Record<
-        string,
-        unknown
-      >;
-    }
-  } else if (ops.connect !== undefined) {
-    const items = toArray(ops.connect as Record<string, unknown> | Record<string, unknown>[]);
-    if (items.length > 0) {
-      const target = items[0]!;
-      relatedRow = (await ctx.tx.table(rel.to).findUnique({ where: target })) as Record<string, unknown> | null;
-      if (!relatedRow) {
-        throw new ValidationError(
-          `connect on "${relName}": no ${rel.to} row found matching ${describeTargetForMessage(target)}.`,
-        );
-      }
-    }
-  } else if (ops.connectOrCreate !== undefined) {
-    const items = toArray(ops.connectOrCreate as Record<string, unknown> | Record<string, unknown>[]);
-    if (items.length > 0) {
-      const op = items[0] as { where: Record<string, unknown>; create: Record<string, unknown> };
-      relatedRow = (await ctx.tx.table(rel.to).findUnique({ where: op.where })) as Record<string, unknown> | null;
-      if (!relatedRow) {
-        // For belongsTo the FK lives on the parent, so the related row is
-        // created plainly (no FK injection) and we read its reference key.
-        relatedRow = (await ctx.tx.table(rel.to).create({ data: op.create })) as Record<string, unknown>;
-      }
-    }
-  }
-
-  const fkScalars: Record<string, unknown> = {};
-  if (relatedRow) {
-    for (let i = 0; i < fks.length; i++) {
-      const fkField = parentMeta.reverseColumnMap[fks[i]!] ?? fks[i]!;
-      const refField = relatedTable?.reverseColumnMap[refs[i]!] ?? refs[i]!;
-      fkScalars[fkField] = relatedRow[refField];
-    }
-  }
-  return fkScalars;
+  const relatedRow = await resolveBelongsToTarget(ctx, rel, ops, depth, path, relName);
+  return relatedRow ? belongsToKeyData(ctx, rel, parentTable, relatedRow) : {};
 }
 
+/**
+ * The row a belongsTo create / connect / connectOrCreate points the parent at,
+ * or null when the write names none of the three. Shared by the create path
+ * (which folds the key into the parent INSERT) and the update path (which
+ * UPDATEs the parent's key), so the two cannot disagree about any of them.
+ */
+async function resolveBelongsToTarget(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  ops: Record<string, unknown>,
+  depth: number,
+  path: string[],
+  relName: string,
+): Promise<Record<string, unknown> | null> {
+  if (ops.create !== undefined) {
+    const item = singleToOneItem<Record<string, unknown>>(
+      ops.create as Record<string, unknown>,
+      'create',
+      relName,
+      rel,
+    );
+    return (await executeNestedCreate(ctx, rel.to, item, depth + 1, [...path, relName])) as Record<string, unknown>;
+  }
+  if (ops.connect !== undefined) {
+    const target = singleToOneItem<Record<string, unknown>>(
+      ops.connect as Record<string, unknown>,
+      'connect',
+      relName,
+      rel,
+    );
+    const found = (await ctx.tx.table(rel.to).findUnique({ where: target })) as Record<string, unknown> | null;
+    if (!found) {
+      throw new ValidationError(
+        `connect on "${relName}": no ${rel.to} row found matching ${describeTargetForMessage(target)}.`,
+      );
+    }
+    return found;
+  }
+  if (ops.connectOrCreate !== undefined) {
+    const op = singleToOneItem(
+      ops.connectOrCreate as { where: Record<string, unknown>; create: Record<string, unknown> },
+      'connectOrCreate',
+      relName,
+      rel,
+    );
+    if (!isPlainRecord(op?.where) || !isPlainRecord(op?.create)) {
+      throw new ValidationError(`Nested connectOrCreate on "${relName}" requires "where" and "create" fields.`);
+    }
+    const found = (await ctx.tx.table(rel.to).findUnique({ where: op.where })) as Record<string, unknown> | null;
+    // For belongsTo the FK lives on the parent, so the related row is created
+    // plainly (no FK injection) and its reference key is read back.
+    return found ?? ((await ctx.tx.table(rel.to).create({ data: op.create })) as Record<string, unknown>);
+  }
+  return null;
+}
+
+/** The parent's own field values that point it at `relatedRow`. */
+function belongsToKeyData(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  parentTable: string,
+  relatedRow: Record<string, unknown> | null,
+): Record<string, unknown> {
+  const fks = normalizeKeyColumns(rel.foreignKey);
+  const refs = normalizeKeyColumns(rel.referenceKey);
+  const parentMeta = ctx.schema.tables[parentTable];
+  const relatedTable = ctx.schema.tables[rel.to];
+  const data: Record<string, unknown> = {};
+  for (let i = 0; i < fks.length; i++) {
+    const fkField = parentMeta?.reverseColumnMap[fks[i]!] ?? fks[i]!;
+    const refField = relatedTable?.reverseColumnMap[refs[i]!] ?? refs[i]!;
+    data[fkField] = relatedRow === null ? null : relatedRow[refField];
+  }
+  return data;
+}
+
+/** Update path: create / connect / connectOrCreate the related row, then point the parent at it. */
 async function processBelongsToCreate(
   ctx: NestedWriteContext,
   rel: RelationDef,
@@ -1462,56 +1535,69 @@ async function processBelongsToCreate(
   path: string[],
   relName: string,
 ): Promise<void> {
+  const relatedRow = await resolveBelongsToTarget(ctx, rel, ops, depth, path, relName);
+  if (!relatedRow) return;
+  await ctx.tx.table(parentTable).update({
+    where: pkWhere(ctx.schema.tables[parentTable]!, parentRow),
+    data: belongsToKeyData(ctx, rel, parentTable, relatedRow),
+  });
+}
+
+/**
+ * `disconnect` / `delete` on a belongsTo relation, with Prisma's semantics:
+ * both clear the parent's foreign key, and `delete` then deletes the row it
+ * pointed at. `true` (or `{}`) means the connected row; an object with fields
+ * additionally requires the connected row to match it. Both need a nullable
+ * foreign key: with a NOT NULL one the parent cannot exist pointing at nothing.
+ *
+ * `disconnect: true` when nothing is connected is a no-op: the parent already
+ * points at nothing, which is what was asked. A `delete`, or a `disconnect`
+ * that names fields, asks about a row that is not there, so it is E001.
+ */
+async function processBelongsToDisconnect(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  arg: unknown,
+  relName: string,
+  parentRow: Record<string, unknown>,
+  parentTable: string,
+  op: 'disconnect' | 'delete',
+): Promise<void> {
+  const parentMeta = ctx.schema.tables[parentTable]!;
   const fks = normalizeKeyColumns(rel.foreignKey);
-  const refs = normalizeKeyColumns(rel.referenceKey);
-
-  // create, insert the related row, then update parent's FK
-  if (ops.create !== undefined) {
-    const items = toArray(ops.create as Record<string, unknown> | Record<string, unknown>[]);
-    if (items.length > 0) {
-      const relatedRow = (await executeNestedCreate(ctx, rel.to, items[0]!, depth + 1, [...path, relName])) as Record<
-        string,
-        unknown
-      >;
-      const updateData: Record<string, unknown> = {};
-      const relatedTable = ctx.schema.tables[rel.to];
-      for (let i = 0; i < fks.length; i++) {
-        const fkField = ctx.schema.tables[parentTable]?.reverseColumnMap[fks[i]!] ?? fks[i]!;
-        const refField = relatedTable?.reverseColumnMap[refs[i]!] ?? refs[i]!;
-        updateData[fkField] = relatedRow[refField];
-      }
-      const parentMeta = ctx.schema.tables[parentTable]!;
-      await ctx.tx.table(parentTable).update({
-        where: pkWhere(parentMeta, parentRow),
-        data: updateData,
-      });
-    }
+  const nullable = fks.every((fk) => parentMeta.columns.find((c) => c.name === fk)?.nullable ?? false);
+  if (!nullable) {
+    throw new ValidationError(
+      `Cannot ${op} "${relName}": foreign key column(s) ${fks.join(', ')} on "${parentTable}" are NOT NULL, so ` +
+        `every "${parentTable}" row must point at a "${rel.to}". Connect it to a different "${rel.to}" instead` +
+        `${op === 'delete' ? `, or delete the "${rel.to}" row directly once nothing points at it` : ''}.`,
+    );
   }
+  const item = singleToOneItem<Record<string, unknown> | true>(arg as Record<string, unknown> | true, op, relName, rel);
+  // `{}` is the documented to-one spelling of `true` (the connected row). An
+  // object whose keys are all undefined is still refused below: that is the
+  // shape of a missing request field, not a choice.
+  const target = isPlainRecord(item) && Object.keys(item).length === 0 ? true : item;
+  assertTargetSelectsSomething(target, op, relName, rel);
+  const correlation = belongsToCorrelationWhere(ctx, rel, parentRow, parentTable);
+  if (!correlation) {
+    if (op === 'disconnect' && target === true) return;
+    throw nothingConnected(op, relName, rel, target);
+  }
+  const related = (await ctx.tx.table(rel.to).findFirst({ where: scopeWhereToParent(target, correlation) })) as Record<
+    string,
+    unknown
+  > | null;
+  if (!related) throw notRelatedToParent(op, relName, rel, target);
 
-  // connect, validate existence, update parent's FK
-  if (ops.connect !== undefined) {
-    const items = toArray(ops.connect as Record<string, unknown> | Record<string, unknown>[]);
-    if (items.length > 0) {
-      const target = items[0]!;
-      const existing = await ctx.tx.table(rel.to).findUnique({ where: target });
-      if (!existing) {
-        throw new ValidationError(
-          `connect on "${relName}": no ${rel.to} row found matching ${describeTargetForMessage(target)}.`,
-        );
-      }
-      const updateData: Record<string, unknown> = {};
-      const relatedTable = ctx.schema.tables[rel.to];
-      for (let i = 0; i < fks.length; i++) {
-        const fkField = ctx.schema.tables[parentTable]?.reverseColumnMap[fks[i]!] ?? fks[i]!;
-        const refField = relatedTable?.reverseColumnMap[refs[i]!] ?? refs[i]!;
-        updateData[fkField] = (existing as Record<string, unknown>)[refField];
-      }
-      const parentMeta = ctx.schema.tables[parentTable]!;
-      await ctx.tx.table(parentTable).update({
-        where: pkWhere(parentMeta, parentRow),
-        data: updateData,
-      });
-    }
+  await ctx.tx.table(parentTable).update({
+    where: pkWhere(parentMeta, parentRow),
+    data: belongsToKeyData(ctx, rel, parentTable, null),
+  });
+  if (op === 'delete') {
+    // Any other row still pointing at it makes this a foreign-key violation
+    // (E009), which rolls the whole write back.
+    await ctx.tx.table(rel.to).delete({ where: pkWhere(ctx.schema.tables[rel.to]!, related) });
   }
 }
 
@@ -1785,11 +1871,12 @@ async function processNestedUpsert(
       throw new ValidationError(`Nested upsert on "${rel.name}" requires "where", "create", and "update" fields.`);
     }
     assertTargetSelectsSomething(item.where, 'upsert', relName, rel);
+    const update = upsertUpdateData(ctx, rel, item);
     const scoped = correlation ? scopeWhereToParent(item.where, correlation) : null;
     const existing = scoped ? await ctx.tx.table(rel.to).findUnique({ where: scoped }) : null;
     if (existing && scoped) {
       try {
-        await ctx.tx.table(rel.to).update({ where: scoped, data: item.update });
+        await ctx.tx.table(rel.to).update({ where: scoped, data: update });
       } catch (err) {
         rethrowAsNotRelated(err, 'upsert', relName, rel, item.where);
       }
@@ -1798,6 +1885,23 @@ async function processNestedUpsert(
       await ctx.tx.table(rel.to).create({ data: injected });
     }
   }
+}
+
+/**
+ * A nested upsert's `update`, with each `expr.excluded(f)` resolved to the
+ * value its `create` supplies: the incoming row of a one-row upsert is
+ * `create`, as it is for a top-level `upsert()`. Resolved before the lookup,
+ * so a reference `create` cannot satisfy is refused whether or not the row
+ * exists.
+ */
+function upsertUpdateData(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  item: { create: Record<string, unknown>; update: Record<string, unknown> },
+): Record<string, unknown> {
+  const tableMeta = ctx.schema.tables[rel.to];
+  if (!tableMeta) return item.update;
+  return resolveExcludedFromCreate({ table: rel.to, tableMeta }, item.update, item.create) ?? item.update;
 }
 
 async function processBelongsToUpdate(
@@ -1859,6 +1963,7 @@ async function processBelongsToUpsert(
   // hasMany/hasOne nested upsert makes: an upsert whose target is out of the
   // relation creates a row owned by this parent rather than rewriting a
   // stranger's.
+  const update = upsertUpdateData(ctx, rel, item);
   const correlation = belongsToCorrelationWhere(ctx, rel, parentRow, parentTable);
   // findMany, not findUnique: the scoped where ANDs a non-unique-looking
   // correlation onto the caller's selector. The correlation targets the
@@ -1875,7 +1980,7 @@ async function processBelongsToUpsert(
     : null;
   if (existing) {
     const relatedMeta = ctx.schema.tables[rel.to]!;
-    await ctx.tx.table(rel.to).update({ where: pkWhere(relatedMeta, existing), data: item.update });
+    await ctx.tx.table(rel.to).update({ where: pkWhere(relatedMeta, existing), data: update });
   } else {
     // Create the related row, then update parent's FK to point at it
     const createdRow = (await ctx.tx.table(rel.to).create({ data: item.create })) as Record<string, unknown>;

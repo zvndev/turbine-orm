@@ -13,8 +13,8 @@
  * shape the SQL introspectors produce, so a code-first PowDB database can be
  * introspected for bootstrap/verification. It is transport-agnostic: the caller
  * supplies an `exec(powql)` that returns row objects **keyed by column name**.
- *   - Embedded / owned pool: `exec = async (q) => ({ rows: await db.raw([q]) })`
- *     using a live `turbinePowDB` client's `raw` tagged template.
+ *   - Embedded / owned pool: `exec = async (q) => ({ rows: await db.rawUnsafe(q) })`
+ *     using a live `turbinePowDB` client.
  *   - Networked: the raw `@zvndev/powdb-client` returns POSITIONAL rows
  *     (`{ columns: string[], rows: string[][] }`), so zip them into records.
  *     A bare `(await client.query(q)).rows` would hand this function `string[][]`
@@ -68,7 +68,8 @@
  */
 
 import { ValidationError } from './errors.js';
-import { applyTableFilters } from './introspect.js';
+import { applyTableFilters, assertDistinctColumnFields, nullRecord, printableCatalogName } from './introspect.js';
+import { consoleLogger, logTo, type TurbineLogger } from './logger.js';
 import { type PowdbCapabilities, quotePowqlIdent, requireCapability } from './powdb-shared.js';
 import type { ColumnMetadata, IndexMetadata, RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
 import { singularize, snakeToCamel } from './schema.js';
@@ -90,6 +91,8 @@ export interface PowdbIntrospectOptions {
    * to run ungated; the pool paths that know the version pass it through.
    */
   capabilities?: PowdbCapabilities;
+  /** Where a table without a usable primary key is reported. Defaults to the console logger. */
+  logger?: TurbineLogger;
 }
 
 /** One row of a `describe <T>` result, after string-coercing each cell. */
@@ -175,7 +178,9 @@ export async function introspectPowdbDatabase(
   // include / exclude + default bookkeeping-table exclusions (F12).
   const tableNames = applyTableFilters(candidateTables, options);
 
-  const tables: Record<string, TableMetadata> = {};
+  // Keyed by catalog names, so prototype-less: a table or column named
+  // `__proto__`, `constructor` or `toString` is data, never a prototype member.
+  const tables: Record<string, TableMetadata> = nullRecord<TableMetadata>();
 
   for (const tableName of tableNames) {
     // `describe` needs the table name in bare-identifier position → quote it so
@@ -198,11 +203,11 @@ export async function introspectPowdbDatabase(
       }));
 
     const columns: ColumnMetadata[] = [];
-    const columnMap: Record<string, string> = {};
-    const reverseColumnMap: Record<string, string> = {};
+    const columnMap: Record<string, string> = nullRecord<string>();
+    const reverseColumnMap: Record<string, string> = nullRecord<string>();
     const dateColumns = new Set<string>();
-    const dialectTypes: Record<string, string> = {};
-    const pgTypes: Record<string, string> = {};
+    const dialectTypes: Record<string, string> = nullRecord<string>();
+    const pgTypes: Record<string, string> = nullRecord<string>();
     const allColumns: string[] = [];
     const uniqueColumns: string[][] = [];
     const indexes: IndexMetadata[] = [];
@@ -252,15 +257,21 @@ export async function introspectPowdbDatabase(
       }
     }
 
+    // Two columns resolving to one field would fold into one property on read.
+    assertDistinctColumnFields(tableName, columns);
+
     // Primary key: first non-nullable unique column, preferring one named `id`.
     let primaryKey: string[] = [];
     if (pkCandidates.length > 0) {
       primaryKey = [pkCandidates.includes('id') ? 'id' : pkCandidates[0]!];
     } else {
-      console.warn(
-        `[turbine] PowDB introspection: table "${tableName}" has no non-nullable unique column; ` +
+      logTo(
+        options.logger ?? consoleLogger,
+        'warn',
+        `PowDB introspection: table "${printableCatalogName(tableName)}" has no non-nullable unique column; ` +
           'primaryKey is [] (single-row operations will fail). Supply a primary key via code-first ' +
           '`defineSchema` metadata if this table needs findUnique/update/delete by id.',
+        { code: 'powdb-introspect-no-primary-key', table: tableName },
       );
     }
 
@@ -278,7 +289,7 @@ export async function introspectPowdbDatabase(
       // Populated below from `schema links` when the engine supports link
       // introspection (>= 0.19.1); stays `{}` otherwise (PowDB has no declared
       // foreign keys, so pre-link introspection reports no relations).
-      relations: {},
+      relations: nullRecord<RelationDef>(),
       indexes,
     };
   }
@@ -290,7 +301,7 @@ export async function introspectPowdbDatabase(
     await introspectPowdbLinks(exec, tables);
   }
 
-  return { tables, enums: {} };
+  return { tables, enums: nullRecord() };
 }
 
 /** One row of the `schema links` listing, after string-coercing each cell. */
@@ -337,8 +348,8 @@ async function introspectPowdbLinks(exec: PowdbExec, tables: Record<string, Tabl
   }));
 
   for (const link of linkRows) {
-    const owner = tables[link.owner];
-    const target = tables[link.target];
+    const owner = Object.hasOwn(tables, link.owner) ? tables[link.owner] : undefined;
+    const target = Object.hasOwn(tables, link.target) ? tables[link.target] : undefined;
     // A link referencing a filtered-out (include/exclude) table is skipped: we
     // cannot describe the target, so the relation would be unusable.
     if (!owner || !target) continue;
@@ -384,13 +395,13 @@ async function introspectPowdbLinks(exec: PowdbExec, tables: Record<string, Tabl
 
 /** True when `name` already names a relation OR a column field/name on `meta`. */
 function relationNameTaken(meta: TableMetadata, name: string): boolean {
-  if (meta.relations[name]) return true;
+  if (Object.hasOwn(meta.relations, name)) return true;
   return meta.columns.some((c) => c.field === name || c.name === name);
 }
 
 /** Add a relation to a table's relations map (keyed by its camelCase name). */
 function addRelation(meta: TableMetadata, rel: RelationDef): void {
-  if (meta.relations[rel.name]) return; // never clobber an existing relation
+  if (Object.hasOwn(meta.relations, rel.name)) return; // never clobber an existing relation
   meta.relations[rel.name] = rel;
 }
 

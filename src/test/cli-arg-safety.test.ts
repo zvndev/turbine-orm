@@ -331,7 +331,7 @@ describe('the flag table and the parser cannot drift apart', () => {
       for (const flag of flags.own) {
         // Help lines render a flag either alone or with its alias attached
         // (`cyan('--step, -n')`), so match the opening of the cyan() call.
-        const documented = new RegExp(`cyan\\('${flag.replace(/-/g, '-')}(,|')`);
+        const documented = new RegExp(`cyan\\('${flag}(,|')`);
         assert.ok(documented.test(CLI_SOURCE), `${flag} (${command}) is accepted but documented nowhere`);
       }
     }

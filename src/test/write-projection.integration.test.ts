@@ -86,9 +86,13 @@ describe('write select / omit against PostgreSQL', () => {
     assert.deepEqual(Object.keys(row).sort(), ['id', 'kind']);
   });
 
-  it('create: an explicit select of a PII field returns it', async () => {
-    const row = await inbox().create({ data: { kind: 'c', secret: 'shh' }, select: { id: true, secret: true } });
-    assert.equal(row.secret, 'shh');
+  it('create: a select naming a PII field is refused and nothing is inserted', async () => {
+    const before = await inbox().count({ where: { kind: 'c' } });
+    await assert.rejects(
+      () => inbox().create({ data: { kind: 'c', secret: 'shh' }, select: { id: true, secret: true } }),
+      /names "secret", which is tagged PII/,
+    );
+    assert.equal(await inbox().count({ where: { kind: 'c' } }), before, 'the refusal happens before the INSERT runs');
   });
 
   it('update, delete and upsert narrow the same way', async () => {

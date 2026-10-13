@@ -264,20 +264,21 @@ describe('pick-row lateral plan: SQL generation', () => {
     assert.match(sql, /t0\."id" = "instances"\."owner_id"/); // with subquery correlation
   });
 
-  it('lateral pick + cursor + limit + offset: qualified cursor condition, pagination params last', () => {
+  it('lateral pick + cursor: refused, a cursor cannot seek past a relation ordering', () => {
+    // A seek compares column values; a pick-row ordering sorts by a value from
+    // another table, so `"instances"."id" > $1` under that ORDER BY skipped and
+    // repeated rows. Page a pick ordering with limit / offset instead.
     const q = makeQuery('instances', schema());
-    const { sql, params } = q.buildFindMany({
-      cursor: { id: 50 },
-      orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title', plan: 'lateral' } },
-      limit: 5,
-      offset: 2,
-    } as never);
-    // Cursor condition is qualified and sits after the join, before ORDER BY.
-    assert.match(
-      sql,
-      /ord0 ON true WHERE "instances"\."id" > \$1 ORDER BY ord0\."__turbine_pick" ASC NULLS LAST LIMIT \$2 OFFSET \$3$/,
+    assert.throws(
+      () =>
+        q.buildFindMany({
+          cursor: { id: 50 },
+          orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title', plan: 'lateral' } },
+          limit: 5,
+          offset: 2,
+        } as never),
+      /`cursor` cannot page past the orderBy entry "versions"/,
     );
-    assert.deepEqual(params, [50, 5, 2]);
   });
 
   it('findFirst with a lateral pick appends LIMIT 1', () => {
@@ -345,7 +346,8 @@ describe('pick-row lateral plan: byte-identical default-plan SQL (buildSql restr
     {
       name: 'pagination',
       args: { limit: 10, offset: 5, orderBy: { name: 'asc' } },
-      sql: 'SELECT "instances".* FROM "instances" ORDER BY "name" ASC LIMIT $1 OFFSET $2',
+      // A page over a column that can tie ends in the primary key.
+      sql: 'SELECT "instances".* FROM "instances" ORDER BY "name" ASC, "id" ASC LIMIT $1 OFFSET $2',
       params: [10, 5],
     },
     {

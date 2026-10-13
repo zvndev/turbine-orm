@@ -342,7 +342,9 @@ describe('groupBy having, AND / OR / NOT', () => {
     assert.throws(
       // biome-ignore lint/suspicious/noExplicitAny: deliberately invalid combinator payload
       () => q().buildGroupBy({ by: ['bucket'], having: { OR: ['bucket'] as any } }),
-      (err: unknown) => err instanceof ValidationError && /having "OR"/.test((err as Error).message),
+      (err: unknown) =>
+        err instanceof ValidationError &&
+        /`OR` in the having clause .* element 0 is a string/.test((err as Error).message),
     );
   });
 });

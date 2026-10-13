@@ -124,17 +124,18 @@ describe('generateTypes: *Create optionality follows defaults and generation, no
 
   it('a serial PK stays optional as auto-generated', () => {
     const block = typeBlock(types, 'UserCreate');
-    assert.match(block, /\/\*\* Optional: auto-generated \*\/\n {2}id\?: number;/);
+    assert.match(block, /\/\*\* Optional: auto-generated \*\/\n {2}id\?: number \| undefined;/);
   });
 
   it('an IDENTITY PK (generated, no reported default) stays optional as auto-generated', () => {
     const block = typeBlock(types, 'EventCreate');
-    assert.match(block, /\/\*\* Optional: auto-generated \*\/\n {2}id\?: number;/);
+    // A bigint key: the write path takes a number, a decimal string or a bigint.
+    assert.match(block, /\/\*\* Optional: auto-generated \*\/\n {2}id\?: number \| string \| bigint \| undefined;/);
   });
 
   it('a PK with a default expression is optional with the reason "has default"', () => {
     const block = typeBlock(types, 'PostCreate');
-    assert.match(block, /\/\*\* Optional: has default \*\/\n {2}id\?: string;/);
+    assert.match(block, /\/\*\* Optional: has default \*\/\n {2}id\?: string \| undefined;/);
   });
 
   it('a composite PK of two plain integers is required on both columns', () => {
@@ -146,7 +147,7 @@ describe('generateTypes: *Create optionality follows defaults and generation, no
 
   it('nullable and defaulted non-PK columns are unchanged', () => {
     const block = typeBlock(types, 'TagCreate');
-    assert.match(block, /\/\*\* Optional: nullable \*\/\n {2}note\?: string \| null;/);
+    assert.match(block, /\/\*\* Optional: nullable \*\/\n {2}note\?: string \| null \| undefined;/);
     assert.match(block, /^ {2}label: string;$/m);
   });
 

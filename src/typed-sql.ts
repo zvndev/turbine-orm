@@ -19,7 +19,9 @@
  *     impossible to string-concatenate a value into the query through this API.
  *     This is the whole point of the tagged-template shape: the literal segments
  *     are frozen by the compiler (`TemplateStringsArray`), and the only way to
- *     get a runtime value into the query is via `${...}`, which we bind.
+ *     get a runtime value into the query is via `${...}`, which we bind. A
+ *     plain array passed where the template belongs is refused at runtime
+ *     ({@link assertTemplateStrings}).
  *
  *  3. **Rows are returned as-is (no snake→camel mapping).** This matches the
  *     existing `client.raw()` behavior: a typed raw query is a literal escape
@@ -51,6 +53,7 @@
 import type { PgCompatPool } from './client.js';
 import { type Dialect, postgresDialect } from './dialect.js';
 import { ValidationError, wrapPgError } from './errors.js';
+import { consoleLogger, logTo, type TurbineLogger } from './logger.js';
 import type { QueryEvent } from './query/deferred.js';
 import { rawIdentity, runReportedStatement } from './query-events.js';
 
@@ -69,11 +72,11 @@ export function buildTypedSql(
   strings: TemplateStringsArray,
   values: readonly unknown[],
   dialect: Pick<Dialect, 'paramPlaceholder'> = postgresDialect,
+  api = 'sql',
 ): { sql: string; params: unknown[] } {
-  // The tagged-template API guarantees `strings.length === values.length + 1`.
-  // Guard the directly-callable (exported) surface so a mismatched call can't
-  // silently desync placeholders from params (pg would reject it, but fail
-  // loudly here instead).
+  assertTemplateStrings(strings, api);
+  // A tagged template always has `strings.length === values.length + 1`; a
+  // hand-built frozen one may not, and would desync placeholders from params.
   if (strings.length !== values.length + 1) {
     throw new ValidationError(
       `sql template segment/value count mismatch: ${strings.length} segments, ${values.length} values.`,
@@ -87,6 +90,105 @@ export function buildTypedSql(
     }
   }
   return { sql, params: values.slice() };
+}
+
+/**
+ * Refuse a "template" that did not come from a tagged-template call.
+ *
+ * Only the static segments of a template reach the SQL text, and that is safe
+ * because the compiler wrote them. A plain array passed in their place (a
+ * JSON-parsed request field, a string split by hand) puts its text into the
+ * SQL with nothing escaped. A real `TemplateStringsArray` is frozen and carries
+ * a frozen `raw` array of the same length; `JSON.parse` and array literals
+ * produce neither.
+ *
+ * `unsafeApi` names the method that takes statement text instead, for the
+ * error message.
+ */
+export function assertTemplateStrings(
+  strings: unknown,
+  api: string,
+  unsafeApi = 'rawUnsafe',
+): asserts strings is TemplateStringsArray {
+  if (Array.isArray(strings) && Object.isFrozen(strings)) {
+    const raw = (strings as { raw?: unknown }).raw;
+    if (Array.isArray(raw) && Object.isFrozen(raw) && raw.length === strings.length) {
+      if (strings.every((s) => typeof s === 'string')) return;
+      throw new ValidationError(
+        `${api}: a segment of the template contains an invalid escape sequence, so it has no text. ` +
+          'Fix the escape (write a literal backslash as `\\\\`).',
+      );
+    }
+  }
+  const received = Array.isArray(strings) ? 'a plain array' : strings === null ? 'null' : typeof strings;
+  throw new ValidationError(
+    `${api} must be called as a tagged template, for example ${api}\`SELECT * FROM users WHERE id = \${id}\`, ` +
+      `so that every interpolated value is sent as a bound parameter. It received ${received} instead, whose ` +
+      'text would reach the SQL unescaped. To run statement text built at runtime (DDL, a migration file), use ' +
+      `\`${unsafeApi}(text, ...values)\` and keep untrusted input out of the text.`,
+  );
+}
+
+/**
+ * A `Date` in the form node-postgres sends under `parseInputDatesAsUTC`:
+ * `YYYY-MM-DDTHH:MM:SS.mmm+00:00`, with ` BC` for years before 1.
+ */
+function utcDateText(date: Date): string {
+  const pad = (n: number, width = 2) => String(n).padStart(width, '0');
+  let year = date.getUTCFullYear();
+  const bc = year < 1;
+  if (bc) year = 1 - year;
+  return (
+    `${pad(year, 4)}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())}` +
+    `T${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}` +
+    `.${pad(date.getUTCMilliseconds(), 3)}+00:00${bc ? ' BC' : ''}`
+  );
+}
+
+function utcDateValue(value: unknown, api: string, position: number, nested: boolean): unknown {
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) {
+      throw new ValidationError(
+        `${api}: parameter $${position} ${nested ? 'contains' : 'is'} an Invalid Date, which has no SQL value. ` +
+          'Pass a valid Date, or null for SQL NULL.',
+      );
+    }
+    return utcDateText(value);
+  }
+  if (!Array.isArray(value)) return value;
+  let out: unknown[] | undefined;
+  for (let i = 0; i < value.length; i++) {
+    const converted = utcDateValue(value[i], api, position, true);
+    if (converted !== value[i]) {
+      out ??= value.slice();
+      out[i] = converted;
+    }
+  }
+  return out ?? value;
+}
+
+/**
+ * Raw-statement params with every `Date` (in arrays too) bound as UTC text,
+ * for a client reading zone-less temporal types as UTC (`utcTimestamps`).
+ *
+ * node-postgres renders a Date in the process's zone with its offset. A
+ * `timestamptz` keeps the instant either way, but a `timestamp` or `date`
+ * drops the offset and stores the local wall time, which then reads back
+ * shifted by the process offset. UTC text stores the instant's UTC fields,
+ * which is what a UTC read returns. Returns `params` itself when it holds no
+ * Date. An Invalid Date is refused (E003) instead of reaching the server as
+ * unparseable text.
+ */
+export function utcDateParams(params: unknown[], api: string): unknown[] {
+  let out: unknown[] | undefined;
+  for (let i = 0; i < params.length; i++) {
+    const converted = utcDateValue(params[i], api, i + 1, false);
+    if (converted !== params[i]) {
+      out ??= params.slice();
+      out[i] = converted;
+    }
+  }
+  return out ?? params;
 }
 
 /**
@@ -125,13 +227,15 @@ export class TypedSqlQuery<T extends Record<string, unknown>> implements Promise
      * built outside a client, which then emits nothing, as before.
      */
     private readonly onQuery?: (event: QueryEvent) => void,
+    /** Where the `logging` preview line goes. Defaults to the console logger. */
+    private readonly logger: TurbineLogger = consoleLogger,
   ) {}
 
   /** Execute and return all rows. Internal; powers `then`, `one`, and `scalar`. */
   private run(): Promise<T[]> {
     return this.runScoped(async () => {
       if (this.logging) {
-        console.log(`[turbine] Typed SQL: ${this.sql.trim().substring(0, 120)}...`);
+        logTo(this.logger, 'debug', `Typed SQL: ${this.sql.trim().substring(0, 120)}...`, { code: 'typed-sql' });
       }
       const result = await runReportedStatement(
         this.onQuery,

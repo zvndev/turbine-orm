@@ -178,7 +178,7 @@ await db.$transaction(async (tx) => {
 | Feature | Drizzle | Turbine |
 |---|---|---|
 | Single-query nested relations | Yes, relational queries (RQBv2) | Yes, via `json_agg`, typed and date-coerced at any depth |
-| Typed errors with codes | Generic Error (raw pg errors) | Typed error classes (`TURBINE_E001`-`E018`) with SQLSTATE mapping |
+| Typed errors with codes | Generic Error (raw pg errors) | Typed error classes (`TURBINE_E001`-`E020`) with SQLSTATE mapping |
 | Optimistic locking | Manual | Built-in `optimisticLock: { field, expected }` |
 | Retry with backoff | Manual | `withRetry()` + `isRetryable` errors |
 | Full-text search | Raw SQL | `{ search: 'query' }` operator |

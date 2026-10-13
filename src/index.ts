@@ -38,6 +38,9 @@ export type { DatabaseAdapter, IntrospectionOverrides } from './adapters/index.j
 export { alloydb, cockroachdb, postgresql, timescale, yugabytedb } from './adapters/index.js';
 // Client
 export {
+  type ConnectionLostEvent,
+  type DisconnectOptions,
+  type DisconnectResult,
   type Middleware,
   type MiddlewareNext,
   type MiddlewareParams,
@@ -45,6 +48,9 @@ export {
   type PgCompatPoolClient,
   type PgCompatQueryResult,
   type PlanCacheMode,
+  type PoolErrorEvent,
+  type PoolEvent,
+  type PoolEventOrigin,
   type RetryOptions,
   TransactionClient,
   type TransactionOptions,
@@ -53,6 +59,14 @@ export {
   type TurbineDriver,
   withRetry,
 } from './client.js';
+// Diagnostics: per-query advice and the SQL-cache self-check, one switch
+export type {
+  CacheCheckMode,
+  DiagnosticsConfig,
+  DiagnosticsMode,
+  DiagnosticsOptions,
+  ResolvedDiagnostics,
+} from './diagnostics.js';
 // Dialect contract
 export type {
   BuiltStatement,
@@ -65,6 +79,7 @@ export type {
   DialectIntrospector,
   DialectMigrator,
   DialectName,
+  EngineCapabilities,
   InsertStatementInput,
   IntrospectOptions as DialectIntrospectOptions,
   ResultStrategy,
@@ -82,6 +97,8 @@ export {
   ExclusionConstraintError,
   ForeignKeyError,
   getErrorMessageMode,
+  InvariantError,
+  LockNotAvailableError,
   MigrationError,
   NotFoundError,
   NotNullViolationError,
@@ -90,10 +107,13 @@ export {
   type PipelineResultSlot,
   REDACTED_DETAIL,
   ReadOnlyError,
+  type ReadOnlyReason,
   RelationError,
   SerializationFailureError,
   setErrorMessageMode,
   TimeoutError,
+  type TimeoutOutcome,
+  TransactionRolledBackError,
   TurbineError,
   TurbineErrorCode,
   UniqueConstraintError,
@@ -105,6 +125,8 @@ export {
 export { type GenerateOptions, generate } from './generate.js';
 // Introspection
 export { type IntrospectOptions, introspect } from './introspect.js';
+// Logging: where Turbine's log lines go
+export type { TurbineLogCode, TurbineLogEntry, TurbineLogger, TurbineLogLevel } from './logger.js';
 // Nested writes
 export {
   executeNestedCreate,
@@ -128,6 +150,8 @@ export {
 export { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
 // Prisma-schema fingerprint (provenance on a generated PRISMA_MAP)
 export { fingerprintPrismaSchema } from './prisma-schema-fingerprint.js';
+// Update expressions: `expr.add(col('n'), 1)`, `expr.excluded('name')`, ...
+export { type CaseArm, type ExprOperand, expr, type NumericOperand } from './query/expr.js';
 // Query builder
 // The privilege sentinel. `skipGlobalFilters` / `includePii` /
 // `allowFullTableScan` are unlocked by THIS VALUE and nothing else, so a
@@ -148,6 +172,7 @@ export {
   type CreateArgs,
   type CreateDataInput,
   type CreateManyArgs,
+  col,
   type DeferredQuery,
   type DeleteArgs,
   type DeleteManyArgs,
@@ -166,6 +191,8 @@ export {
   type JsonPathAggregateTarget,
   type JsonPathGroupKey,
   type JsonPathOrderBy,
+  type JsonValue,
+  jsonValue,
   type MiddlewareFn,
   type NestedCreateOp,
   type NestedUpdateOp,
@@ -214,6 +241,28 @@ export {
   type WithOrderByObject,
   type WithResult,
 } from './query/index.js';
+// sqlComment: sqlcommenter key/values appended to each statement
+export type { SqlCommentOptions } from './query/sql-comment.js';
+export type {
+  AggregateResultOf,
+  ConflictTarget,
+  ConflictUpdateData,
+  CreateManyOnConflict,
+  DefaultInputTypes,
+  ExcludedRef,
+  GlobalFilter,
+  NestedToOneCreateOp,
+  NestedToOneUpdateOp,
+  OptionalInput,
+  PercentileMethod,
+  PercentileSpec,
+  RelationKind,
+  RowLock,
+  RowLockMode,
+  SqlExpr,
+  SqlExprKind,
+  TableInputTypes,
+} from './query/types.js';
 // $on('query') event metadata: raw-statement model name, $tag() label limit
 export { MAX_QUERY_TAG_LENGTH, RAW_QUERY_MODEL } from './query-events.js';
 // Realtime, LISTEN/NOTIFY pub/sub

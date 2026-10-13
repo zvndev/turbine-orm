@@ -80,6 +80,42 @@ export function absorbCheckedOutErrors(pool: unknown): void {
   });
 }
 
+/** The pg-pool events {@link watchCheckouts} reads. */
+interface CheckoutEmitter {
+  on?(event: string, listener: (...args: never[]) => void): unknown;
+}
+
+export interface CheckoutWatch {
+  /** Connections currently checked out of the pool, in checkout order. */
+  readonly checkedOut: ReadonlySet<object>;
+}
+
+/**
+ * Track which connections of a pool Turbine owns are checked out, from
+ * pg-pool's public `acquire` / `release` / `remove` events, and call `onLost`
+ * once per connection that fails WHILE checked out (an idle connection's
+ * failure is pg-pool's own `'error'` event). Used for the client's
+ * `connectionLost` event and for force-closing what `disconnect({ timeoutMs })`
+ * is still waiting on. A pool without those events is left alone.
+ */
+export function watchCheckouts(pool: unknown, onLost?: (err: Error) => void): CheckoutWatch {
+  const checkedOut = new Set<object>();
+  const emitter = pool as CheckoutEmitter;
+  if (typeof emitter.on !== 'function') return { checkedOut };
+  const reported = new WeakSet<object>();
+  emitter.on('acquire', (client: object) => checkedOut.add(client));
+  emitter.on('release', (_err: unknown, client: object) => checkedOut.delete(client));
+  emitter.on('remove', (client: object) => checkedOut.delete(client));
+  emitter.on('connect', (client: ErrorEmitter & object) => {
+    client.on?.('error', (err) => {
+      if (!checkedOut.has(client) || reported.has(client)) return;
+      reported.add(client);
+      onLost?.(err);
+    });
+  });
+  return { checkedOut };
+}
+
 /**
  * Guard a connection for as long as the caller holds it. Use {@link guardCheckout}
  * for a pooled checkout; this form is for a client whose whole lifetime the

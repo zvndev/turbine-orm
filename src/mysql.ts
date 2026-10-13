@@ -63,10 +63,17 @@
  * ```
  */
 
-import { type PgCompatPool, type PgCompatPoolClient, TurbineClient } from './client.js';
+import {
+  type DisconnectOptions,
+  type DisconnectResult,
+  type PgCompatPool,
+  type PgCompatPoolClient,
+  TurbineClient,
+} from './client.js';
 import {
   type BuiltStatement,
   type BulkInsertStatementInput,
+  type BulkUpsertStatementInput,
   type ColumnDefinitionInput,
   type ColumnTypeInput,
   type CreateIndexStatementInput,
@@ -74,8 +81,10 @@ import {
   type DefaultValuesInsertStatementInput,
   type Dialect,
   type DialectIntrospector,
+  type EngineCapabilities,
   type InsertStatementInput,
   type IntrospectOptions,
+  type JsonPathEqualsInput,
   type JsonWireRule,
   type LimitOffsetInput,
   postgresDialect,
@@ -88,8 +97,9 @@ import {
   malformedConnectionStringMessage,
   markValueBearingMessage,
   UnsupportedFeatureError,
+  ValidationError,
 } from './errors.js';
-import { applyTableFilters, deriveEngineRelations } from './introspect.js';
+import { applyTableFilters, assertDistinctColumnFields, deriveEngineRelations, nullRecord } from './introspect.js';
 import importOptionalPeer from './optional-peer-import.cjs';
 import {
   type ColumnMetadata,
@@ -100,6 +110,7 @@ import {
   snakeToCamel,
   type TableMetadata,
 } from './schema.js';
+import { rewritePositionalPlaceholders, scanPlaceholders } from './sql-placeholders.js';
 
 // ---------------------------------------------------------------------------
 // Minimal structural typing for the mysql2 surface we touch
@@ -147,7 +158,7 @@ interface Mysql2Header {
  * 1/0 (MySQL has no boolean type; `TINYINT(1)` stores 1/0), `undefined`/`null`
  * → NULL, `Date`/`Uint8Array` pass through (mysql2 formats them), and any
  * remaining object/array → JSON text (matches how Turbine already pre-serializes
- * JSON filter / `IN`-list params).
+ * JSON filter params). An `in` list element binds through here too, one by one.
  */
 function toMysqlParam(value: unknown): MysqlParam {
   if (value === undefined || value === null) return null;
@@ -155,29 +166,140 @@ function toMysqlParam(value: unknown): MysqlParam {
     case 'boolean':
       return value ? 1 : 0;
     case 'number':
+      // MySQL has no NaN or Infinity: the server stored NaN as 0 without a
+      // word, and refused Infinity with a raw driver error.
+      if (!Number.isFinite(value)) {
+        throw new ValidationError(
+          `MySQL cannot store or compare ${value}: a bound number must be finite. Pass a finite number, or null.`,
+        );
+      }
+      return value;
     case 'bigint':
     case 'string':
       return value;
   }
-  if (value instanceof Date) return value;
+  if (value instanceof Date) {
+    // mysql2 renders an Invalid Date as '0000-00-00 00:00:00.000', which the
+    // server then reports as that value instead of the caller's mistake.
+    if (Number.isNaN(value.getTime())) {
+      throw new ValidationError('MySQL cannot bind an Invalid Date. Pass a valid Date, or null.');
+    }
+    return value;
+  }
   if (value instanceof Uint8Array) return value; // also covers Buffer
   return JSON.stringify(value);
 }
 
 /**
- * Bind the positional `params[]` (in 1-indexed generation order) to the named
- * `:p1`, `:p2`, … placeholders the dialect emits. Mapping by NAME makes binding
- * independent of where each placeholder lands in the SQL text, the same
- * guarantee Postgres' numbered `$N` gives. Returns `undefined` for parameter-less
- * statements (BEGIN/COMMIT/DDL) so they bind nothing.
+ * An `in` / `notIn` list, as the builder hands it to the shim: ONE param, so
+ * the SQL text and its cache entry stay independent of the list's length (see
+ * {@link mysqlDialect.buildInClause}). The shim expands it into one placeholder
+ * per element, each bound exactly as an equality operand is, which is what
+ * makes `{ in: [v] }` match the rows `{ equals: v }` matches on every column
+ * type: a `JSON_TABLE` list compared JSON values, so a boolean, a date or time,
+ * a binary value, a decimal or bigint written as a string, and every
+ * case-folded string missed, and `notIn` then matched every row.
  */
-function toNamedBinding(values: unknown[]): Record<string, MysqlParam> | undefined {
-  if (values.length === 0) return undefined;
+class MysqlInList {
+  constructor(readonly values: readonly unknown[]) {}
+}
+
+/** MySQL's limit on placeholders in one prepared statement. */
+const MYSQL_MAX_PLACEHOLDERS = 65_535;
+
+/** A list of `n` elements is sent padded to the next power of two (by repeating its last element). */
+function paddedListLength(n: number): number {
+  return n <= 1 ? n : 2 ** Math.ceil(Math.log2(n));
+}
+
+/** The refusal for a placeholder the shim cannot bind (see rewritePositionalPlaceholders). */
+function refusePlaceholder(message: string): never {
+  throw new ValidationError(message);
+}
+
+/**
+ * The statement text and named binding for one execution: `$n` placeholders
+ * (the spelling `rawUnsafe` documents) rewritten to `:pN`, every
+ * {@link MysqlInList} expanded, and every other value bound by name. Mapping by
+ * NAME makes binding independent of where each placeholder lands in the SQL
+ * text, the same guarantee Postgres' numbered `$N` gives. `binding` is
+ * `undefined` when nothing is bound, so parameter-less statements (BEGIN,
+ * COMMIT, DDL) run through `.query()`.
+ */
+function bindStatement(
+  sql: string,
+  values: unknown[],
+): { sql: string; binding: Record<string, MysqlParam> | undefined } {
+  if (values.length === 0) return { sql, binding: undefined };
+  const text = rewritePositionalPlaceholders(sql, 'mysql', values.length, (i) => `:p${i}`, refusePlaceholder);
   const named: Record<string, MysqlParam> = {};
+  let lists: Map<string, MysqlInList> | undefined;
   for (let i = 0; i < values.length; i++) {
-    named[`p${i + 1}`] = toMysqlParam(values[i]);
+    const value = values[i];
+    if (value instanceof MysqlInList) {
+      lists ??= new Map();
+      lists.set(`p${i + 1}`, value);
+    } else {
+      named[`p${i + 1}`] = toMysqlParam(value);
+    }
   }
-  return named;
+  if (lists === undefined) return { sql: text, binding: named };
+  const expanded = expandInLists(text, lists, named);
+  return { sql: expanded, binding: Object.keys(named).length > 0 ? named : undefined };
+}
+
+/**
+ * Replace each list placeholder (`:p3`) with one placeholder per element
+ * (`:p3_0, :p3_1, ...`), binding each element into `named`. An empty list
+ * becomes a subquery with no rows, so `IN` is false and `NOT IN` true, as
+ * Postgres answers `= ANY('{}')` and `!= ALL('{}')`.
+ *
+ * Padding to a power of two bounds the statement texts a caller can produce
+ * (mysql2 prepares and caches one server-side statement per distinct text and
+ * connection, and the server caps the total across every client at
+ * `max_prepared_stmt_count`): about seventeen lengths per list instead of one
+ * per length. A repeated element changes neither `IN` nor `NOT IN`.
+ */
+function expandInLists(sql: string, lists: Map<string, MysqlInList>, named: Record<string, MysqlParam>): string {
+  const tokens = scanPlaceholders(sql, 'mysql');
+  const listTokens = tokens.filter((t) => t.kind === 'named' && lists.has(t.name));
+  const others = tokens.length - listTokens.length;
+  let padded = 0;
+  let exact = 0;
+  for (const t of listTokens) {
+    const n = lists.get(t.name)!.values.length;
+    padded += paddedListLength(n);
+    exact += n;
+  }
+  if (others + exact > MYSQL_MAX_PLACEHOLDERS) {
+    throw new ValidationError(
+      `An \`in\` / \`notIn\` list on MySQL binds one placeholder per element, and this statement needs ` +
+        `${others + exact} where MySQL allows ${MYSQL_MAX_PLACEHOLDERS}. Split the list across several queries.`,
+    );
+  }
+  const pad = others + padded <= MYSQL_MAX_PLACEHOLDERS;
+  for (const [name, list] of lists) {
+    list.values.forEach((v, j) => {
+      named[`${name}_${j}`] = toMysqlParam(v);
+    });
+  }
+  let out = '';
+  let last = 0;
+  for (const t of listTokens) {
+    const n = lists.get(t.name)!.values.length;
+    let replacement: string;
+    if (n === 0) {
+      replacement = 'SELECT NULL FROM DUAL WHERE FALSE';
+    } else {
+      const parts: string[] = [];
+      const length = pad ? paddedListLength(n) : n;
+      for (let j = 0; j < length; j++) parts.push(`:${t.name}_${Math.min(j, n - 1)}`);
+      replacement = parts.join(', ');
+    }
+    out += sql.slice(last, t.start) + replacement;
+    last = t.end;
+  }
+  return out + sql.slice(last);
 }
 
 // ---------------------------------------------------------------------------
@@ -319,9 +441,48 @@ function augmentMysqlError(err: unknown): unknown {
     case 1205:
       target.code = '40001';
       return err;
-    default:
+    default: {
+      // Data exceptions (a bound value that does not fit the column) take the
+      // SQLSTATE class 22 path in `wrapPgError`, which builds a ValidationError
+      // naming the column and redacts the value-bearing message in 'safe' mode.
+      const sqlstate = mysqlDataExceptionState(e.errno, (e as { sqlState?: unknown }).sqlState, msg);
+      if (sqlstate === undefined) return err;
+      target.code = sqlstate;
+      // "... for column 'name' at row 1", or "... in value for column 't.meta'."
+      const column = /for column '([^']+)'/i.exec(msg)?.[1];
+      if (column) target.column = column.slice(column.lastIndexOf('.') + 1);
       return err;
+    }
   }
+}
+
+/**
+ * The SQLSTATE a MySQL data exception maps to, or `undefined` when `errno` is
+ * not one. MySQL reports several of these under the generic `HY000`, so the
+ * common ones are mapped by errno to the code PostgreSQL uses for the same
+ * failure; anything else MySQL itself files under class 22 keeps its own code.
+ */
+function mysqlDataExceptionState(errno: number, sqlState: unknown, message: string): string | undefined {
+  switch (errno) {
+    case 1406: // ER_DATA_TOO_LONG
+      return '22001';
+    case 1264: // ER_WARN_DATA_OUT_OF_RANGE
+    case 1690: // ER_DATA_OUT_OF_RANGE
+      return '22003';
+    case 1366: // ER_TRUNCATED_WRONG_VALUE_FOR_FIELD: "Incorrect integer value: 'abc' for column ..."
+    case 1265: // WARN_DATA_TRUNCATED: a value outside an ENUM, a malformed DECIMAL
+      return '22P02';
+    case 1292: // ER_TRUNCATED_WRONG_VALUE: an invalid datetime, or a non-numeric string compared as a number
+    case 1411: // ER_WRONG_VALUE_FOR_TYPE
+      return /\b(?:date|time|datetime|timestamp)\b/i.test(message) ? '22007' : '22P02';
+    case 1365: // ER_DIVISION_BY_ZERO
+      return '22012';
+    case 3140: // ER_INVALID_JSON_TEXT
+    case 3141: // ER_INVALID_JSON_TEXT_IN_PARAM
+    case 3144: // ER_INVALID_JSON_CHARSET
+      return '22032';
+  }
+  return typeof sqlState === 'string' && /^22[0-9A-Z]{3}$/.test(sqlState) ? sqlState : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -348,9 +509,10 @@ async function execOne(
   sql: string,
   params: unknown[],
 ): Promise<ReturnType<typeof shapeResult>> {
-  const binding = toNamedBinding(params);
+  const bound = bindStatement(sql, params);
+  const binding = bound.binding;
   try {
-    const [result, fields] = binding ? await runner.execute(sql, binding) : await runner.query(sql);
+    const [result, fields] = binding ? await runner.execute(bound.sql, binding) : await runner.query(bound.sql);
     return shapeResult(result, fields);
   } catch (err) {
     throw augmentMysqlError(err);
@@ -465,6 +627,19 @@ export function mysqlTypeToTs(dialectType: string, nullable: boolean, columnType
  */
 const MYSQL_BOOLEAN_TYPE = 'tinyint(1)';
 
+/** Integer column types narrower than 64 bits, in MySQL and code-first (PostgreSQL) spellings. */
+const SMALL_INTEGER_TYPES: ReadonlySet<string> = new Set([
+  'tinyint',
+  'smallint',
+  'mediumint',
+  'int',
+  'integer',
+  'int2',
+  'int4',
+  'serial',
+  'smallserial',
+]);
+
 /**
  * Rewrite every boolean column's recorded dialect type to
  * {@link MYSQL_BOOLEAN_TYPE}, returning a schema that is safe to key
@@ -518,6 +693,10 @@ function isMysqlDateType(dialectType: string): boolean {
 
 /** Map a schema-builder (Postgres-flavored) column type to MySQL DDL. */
 function mysqlColumnType(type: string, maxLength?: number | null): string {
+  // An enum column's type from `buildEnumColumn`, already spelled for MySQL. It
+  // returns first: its labels are free text, and one named `int` or `date`
+  // would otherwise match a pattern below.
+  if (/^ENUM\(/.test(type)) return type;
   const t = type.toUpperCase();
   if (/BIGSERIAL/.test(t)) return 'BIGINT AUTO_INCREMENT';
   if (/SERIAL/.test(t)) return 'INT AUTO_INCREMENT';
@@ -530,10 +709,14 @@ function mysqlColumnType(type: string, maxLength?: number | null): string {
   if (/NUMERIC|DECIMAL|MONEY/.test(t)) return 'DECIMAL(65,30)';
   if (/JSONB|JSON/.test(t)) return 'JSON';
   if (/UUID/.test(t)) return 'CHAR(36)';
-  if (/TIMESTAMPTZ|TIMESTAMP|DATETIME/.test(t)) return 'DATETIME';
+  // DATETIME(3), not bare DATETIME: the bare type has zero fractional digits and
+  // rounds a JS Date's milliseconds away on write.
+  if (/TIMESTAMPTZ|TIMESTAMP|DATETIME/.test(t)) return 'DATETIME(3)';
   if (/\bDATE\b/.test(t)) return 'DATE';
   if (/\bTIME\b/.test(t)) return 'TIME';
-  if (/BYTEA|BLOB/.test(t)) return 'BLOB';
+  // A bounded binary column is VARBINARY(n): a BLOB cannot be a key.
+  if (/VARBINARY/.test(t)) return `VARBINARY(${maxLength ?? 255})`;
+  if (/BYTEA|BLOB/.test(t)) return maxLength != null ? `VARBINARY(${maxLength})` : 'BLOB';
   if (/VARCHAR/.test(t)) return maxLength != null ? `VARCHAR(${maxLength})` : 'VARCHAR(255)';
   if (/CHAR/.test(t)) return maxLength != null ? `CHAR(${maxLength})` : 'CHAR(255)';
   if (/TEXT|CLOB/.test(t)) return 'TEXT';
@@ -544,6 +727,33 @@ function mysqlColumnType(type: string, maxLength?: number | null): string {
 // ---------------------------------------------------------------------------
 // mysqlDialect, the full Dialect contract for MySQL 8
 // ---------------------------------------------------------------------------
+
+/** The row alias a multi-row upsert gives its incoming rows (`AS ... ON DUPLICATE KEY UPDATE`). */
+const MYSQL_INCOMING_ALIAS = '`turbine_excluded`';
+
+/**
+ * The LIKE escape character on MySQL (see `mysqlDialect.likeEscapeCharacter`).
+ * One character, nothing special inside a single-quoted literal in either
+ * `sql_mode`, and not a LIKE metacharacter.
+ */
+const MYSQL_LIKE_ESCAPE = '!';
+/** The LIKE metacharacters under {@link MYSQL_LIKE_ESCAPE}: itself, `%` and `_`. */
+const MYSQL_LIKE_META_G = /[!%_]/g;
+
+/**
+ * A `JSON_OBJECT` key as SQL text that reads the same in every `sql_mode`.
+ * A key without a backslash is a plain quoted literal. A backslash has no
+ * literal spelling that both modes agree on (`'a\\b'` is one backslash by
+ * default and two under `NO_BACKSLASH_ESCAPES`, which Turbine's own
+ * connections set and a caller-supplied pool may not), so such a key is
+ * written as its UTF-8 bytes in hex, which no mode re-reads.
+ */
+function mysqlKeyLiteral(key: string, dialect: Pick<Dialect, 'escapeStringLiteral'>): string {
+  if (!key.includes('\\')) return `'${dialect.escapeStringLiteral(key)}'`;
+  let hex = '';
+  for (const byte of new TextEncoder().encode(key)) hex += byte.toString(16).padStart(2, '0');
+  return `CONVERT(X'${hex}' USING utf8mb4)`;
+}
 
 /**
  * MySQL 8 implementation of the {@link Dialect} contract. Backtick identifier
@@ -556,6 +766,47 @@ function mysqlColumnType(type: string, maxLength?: number | null): string {
 export const mysqlDialect: Dialect = {
   ...postgresDialect,
   name: 'mysql',
+  capabilities: Object.freeze({
+    distinctOn: false,
+    positionalJson: false,
+    nullsOrderingClause: false,
+    nullsSortHigh: false,
+    insensitiveInList: false,
+    jsonDocumentEquality: 'exact',
+    jsonExtractTyped: false,
+    jsonExactNumericCast: false,
+    numericTextComparison: true,
+    enforcesForeignKeys: true,
+    partitionLimitPushdown: false,
+    // A zone-less literal reads in the session time zone; only `date` columns rewrite.
+    utcTimestampRewrite: false,
+    paramTypeCasts: false,
+    namedEnumTypes: false,
+    structuredValueColumns: 'scalars-and-text',
+    // Counted in a 16-bit field.
+    maxBindParameters: 65535,
+    maxInsertRows: Number.POSITIVE_INFINITY,
+    upsertConflictTarget: 'any-unique-key',
+    setClauseOrder: 'left-to-right',
+    reselectLocksRows: true,
+    integerDivision: 'DIV',
+    updateExpressions: true,
+    // Caught by the onConflict re-read, which runs in the reselect transaction.
+    bulkUpsertAppliesRepeatedKeys: true,
+    readOnlyTransactions: true,
+    connectionParameters: false,
+    backendCancel: false,
+    idleTransactionTimeout: false,
+    abortsTransactionOnError: false,
+    connectionDriver: 'engine-driver',
+    // mysql2 execute() prepares each statement text; max_prepared_stmt_count caps them server-wide.
+    preparesEveryStatement: true,
+    statementSyntax: 'mysql',
+    // An inline REFERENCES is parsed and ignored.
+    inlineForeignKeys: false,
+    // TEXT / BLOB need a prefix length in a key (ER_BLOB_KEY_WITHOUT_LENGTH).
+    unboundedTextKeys: false,
+  } satisfies EngineCapabilities),
   // No RETURNING → run the write, then re-SELECT by PK/where (Phase-0 reselect).
   resultStrategy: 'reselect',
   supportsReturning: false,
@@ -576,6 +827,13 @@ export const mysqlDialect: Dialect = {
   // Postgres-only in this release (flipping it on is a one-line change + tests).
   supportsLateralJoin: false,
   supportsPlanCacheMode: false,
+  // FOR UPDATE / FOR SHARE (8.0); there is no NO KEY UPDATE or KEY SHARE.
+  rowLockModes: ['update', 'share'],
+  // No percentile_cont / percentile_disc.
+  supportsPercentileAggregates: false,
+  // INSERT ... AS alias ON DUPLICATE KEY UPDATE, with the refusals that
+  // keyless conflict resolution needs.
+  supportsBulkUpsert: true,
   // GET_LOCK / RELEASE_LOCK exist (used by a future migrate adapter).
   supportsAdvisoryLock: true,
   // Plain `EXPLAIN` (one row of tabular plan columns) works on every supported
@@ -611,16 +869,19 @@ export const mysqlDialect: Dialect = {
    * `NO_BACKSLASH_ESCAPES`, `\` is an escape character inside a string literal,
    * so doubling only `'` (the inherited Postgres rule) leaves a value ending in
    * a backslash able to escape its own closing quote. Escape the backslash
-   * first, then the quote; every other byte is safe raw. The only caller is
-   * `buildJsonObject` (relation / column names from schema metadata), so this
-   * is defence in depth rather than a user-value path.
+   * first, then the quote; every other byte is safe raw.
+   *
+   * That is right for the server's default `sql_mode` only: under
+   * `NO_BACKSLASH_ESCAPES` (which Turbine sets on the connections it opens) the
+   * doubled backslash reads as two. So `buildJsonObject`, the one caller, never
+   * hands it a key holding a backslash (see {@link mysqlKeyLiteral}).
    */
   escapeStringLiteral(value: string): string {
     return value.replace(/\\/g, '\\\\').replace(/'/g, "''");
   },
 
   buildJsonObject(pairs: [key: string, expr: string][]): string {
-    const args = pairs.map(([key, expr]) => `'${this.escapeStringLiteral(key)}', ${expr}`);
+    const args = pairs.map(([key, expr]) => `${mysqlKeyLiteral(key, this)}, ${expr}`);
     return `JSON_OBJECT(${args.join(', ')})`;
   },
 
@@ -654,7 +915,9 @@ export const mysqlDialect: Dialect = {
     // came back 9007199254740992, and DECIMAL '1000.50' came back 1000.5.
     // mysql2 hands both back as STRINGS at top level (supportBigNumbers, and
     // DECIMAL is always a string), so carry the text and keep it.
-    if (t === 'bigint') {
+    // `int8` is the spelling a code-first (`defineSchema`) schema records for
+    // the same BIGINT column, so it needs the same rule.
+    if (t === 'bigint' || t === 'int8') {
       return {
         sql: (ref) => `CAST(${ref} AS CHAR)`,
         decode: (value) => {
@@ -710,9 +973,9 @@ export const mysqlDialect: Dialect = {
     // parsed value. It is also what `pg` returns for json/jsonb, so this is
     // Postgres parity rather than a MySQL convention.
     //
-    // Contrast SQLite and SQL Server, which return TEXT for the same schema:
-    // neither has a JSON column type, so the value there really is a string in
-    // a text column and there is nothing to parse it back from.
+    // Contrast SQLite, which has no JSON column type and stores the document as
+    // text: its driver shim parses the text back for a column the schema
+    // declares json/jsonb, and its own rule does the same through a join.
 
     // Binary columns are worse than lossy: JSON_OBJECT emits MySQL's internal
     // `base64:type15:…` marker string, so the caller got that text instead of
@@ -729,6 +992,15 @@ export const mysqlDialect: Dialect = {
 
   castAggregate(expr: string, target: 'int' | 'float'): string {
     return `CAST(${expr} AS ${target === 'int' ? 'SIGNED' : 'DECIMAL(65,30)'})`;
+  },
+
+  // AVG over an integer column is a DECIMAL with only four more digits of
+  // scale (div_precision_increment), so 4/3 came back 1.3333 where PostgreSQL
+  // returns 1.3333333333333333. Adding a DOUBLE zero averages in DOUBLE (the
+  // `CAST(... AS DOUBLE)` spelling needs 8.0.17; the engine floor is 8.0.0).
+  // BIGINT keeps its exact DECIMAL average, like PostgreSQL's numeric one.
+  averageArgument(columnRef: string, columnType: string): string | undefined {
+    return SMALL_INTEGER_TYPES.has(columnType.toLowerCase()) ? `(${columnRef} + 0E0)` : undefined;
   },
 
   // MySQL has no bare OFFSET: the grammar requires a LIMIT for OFFSET to
@@ -748,18 +1020,17 @@ export const mysqlDialect: Dialect = {
     return s;
   },
 
-  // No array params in MySQL. JSON_TABLE expands a single JSON-array param into a
-  // row set, keeping ONE placeholder (so the SQL cache stays valid regardless of
-  // list length) and handling the empty-list case (zero rows). MySQL coerces the
-  // non-JSON `expr` to JSON for the comparison, so this works for numbers AND
-  // strings. JSON_TABLE requires MySQL 8.0+.
+  // No array params in MySQL. The list is ONE builder param (a MysqlInList),
+  // so the SQL text and its cache entry do not depend on the list's length; the
+  // shim expands the placeholder into one per element when the statement runs
+  // (see expandInLists). Each element binds as an equality operand does, so the
+  // list compares under the column's own type and collation rules.
   buildInClause(expr: string, paramRef: string, negated: boolean): string {
-    const inner = `SELECT \`v\` FROM JSON_TABLE(${paramRef}, '$[*]' COLUMNS (\`v\` JSON PATH '$')) AS \`jt\``;
-    return `${expr} ${negated ? 'NOT IN' : 'IN'} (${inner})`;
+    return `${expr} ${negated ? 'NOT IN' : 'IN'} (${paramRef})`;
   },
 
   inClauseParam(values: unknown[]): unknown {
-    return JSON.stringify(values ?? []);
+    return new MysqlInList(Array.isArray(values) ? values : []);
   },
 
   // No RETURNING, resultStrategy 'reselect' re-fetches the row.
@@ -784,6 +1055,38 @@ export const mysqlDialect: Dialect = {
     return {
       sql: `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES ${placeholders}${conflict}`,
       params: input.rowValues.flat(),
+    };
+  },
+
+  buildBulkUpsertStatement(input: BulkUpsertStatementInput): BuiltStatement {
+    // 8.0.19's row alias (`VALUES(col)` is deprecated since 8.0.20). There is
+    // no conflict target: ON DUPLICATE KEY UPDATE fires on whichever unique key
+    // a row violates, which is why the builder refuses a table where another
+    // key's columns are in the data, and why it refuses `ignore` and a
+    // conflict predicate (this grammar has no slot for one).
+    if (!input.update) {
+      throw new UnsupportedFeatureError(
+        'createMany onConflict { ignore: true }',
+        'mysql',
+        'MySQL cannot tell the inserted rows from the skipped ones afterwards; use onConflict: { target, update }.',
+      );
+    }
+    let n = 0;
+    const tuples = input.rowValues.map((row) => `(${row.map(() => this.paramPlaceholder(++n)).join(', ')})`).join(', ');
+    const params = input.rowValues.flat();
+    const update = input.update(params, { target: input.table, incoming: MYSQL_INCOMING_ALIAS });
+    if (update.where) {
+      throw new UnsupportedFeatureError(
+        'A predicate on createMany onConflict',
+        'mysql',
+        'ON DUPLICATE KEY UPDATE has no WHERE slot.',
+      );
+    }
+    return {
+      sql:
+        `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES ${tuples} AS ${MYSQL_INCOMING_ALIAS} ` +
+        `ON DUPLICATE KEY UPDATE ${update.setClauses.join(', ')}`,
+      params,
     };
   },
 
@@ -823,12 +1126,42 @@ export const mysqlDialect: Dialect = {
     return `LOWER(${column}) LIKE LOWER(${paramRef})`;
   },
 
+  /**
+   * `!`, not `\`: with the server's default `sql_mode` a backslash escapes
+   * inside a string literal, so the `ESCAPE '\'` every other engine emits is an
+   * unterminated string here, and only a session running with
+   * `NO_BACKSLASH_ESCAPES` reads it as one backslash. Turbine sets that mode on
+   * the connections it opens, never on a pool the caller supplies (it would
+   * change how the caller's own SQL parses), so the clause has to mean the same
+   * thing in both modes, and `'!'` does. The operand is bound, so a backslash in
+   * the VALUE is a plain character under this escape.
+   */
+  likeEscapeCharacter: MYSQL_LIKE_ESCAPE,
+
+  /** Prefix `%`, `_` and the escape character itself with {@link MYSQL_LIKE_ESCAPE}. */
+  escapeLikePattern(value: string): string {
+    return value.replace(MYSQL_LIKE_META_G, `${MYSQL_LIKE_ESCAPE}$&`);
+  },
+
   buildJsonContains(column: string, paramRef: string): string {
     return `JSON_CONTAINS(${column}, ${paramRef})`;
   },
 
   buildJsonPathExtract(column: string, pathParamRef: string): string {
     return `JSON_UNQUOTE(JSON_EXTRACT(${column}, ${pathParamRef}))`;
+  },
+
+  // MySQL compares two JSON values by JSON type and value, so binding the
+  // operand as JSON text makes `{ path, equals }` exact for every shape:
+  // 5 vs "5" and true vs 1 differ, 5 equals 5.0, null matches JSON null, and
+  // arrays and objects compare structurally (object key order does not matter).
+  // A missing path extracts SQL NULL, which matches nothing. With no path the
+  // whole document is compared.
+  buildJsonPathEquals(input: JsonPathEqualsInput): string {
+    const { value } = input;
+    const text = typeof value === 'bigint' ? value.toString() : JSON.stringify(value);
+    const lhs = input.pathRef === undefined ? input.column : `JSON_EXTRACT(${input.column}, ${input.pathRef})`;
+    return `${lhs} = CAST(${input.bind(text)} AS JSON)`;
   },
 
   // ---- Type mapping -------------------------------------------------------
@@ -845,6 +1178,27 @@ export const mysqlDialect: Dialect = {
 
   buildColumnType(input: ColumnTypeInput): string {
     return mysqlColumnType(input.type, input.maxLength);
+  },
+
+  /**
+   * MySQL declares an enum's labels on the column, `ENUM('a', 'b')`, which
+   * refuses any other value in strict mode. A label's quotes are doubled. A
+   * label holding a backslash is refused: whether `\` escapes in a string
+   * literal depends on the session's NO_BACKSLASH_ESCAPES (Turbine's own
+   * connections set it, other clients do not), so the same DDL would declare
+   * a different label depending on what runs it.
+   */
+  buildEnumColumn(column: string, labels: readonly string[]): { type: string } {
+    const literals = labels.map((label) => {
+      if (label.includes('\\')) {
+        throw new ValidationError(
+          `The enum label ${JSON.stringify(label)} on column ${column} holds a backslash, which MySQL reads ` +
+            'differently with and without NO_BACKSLASH_ESCAPES. Use a label without one.',
+        );
+      }
+      return `'${label.replace(/'/g, "''")}'`;
+    });
+    return { type: `ENUM(${literals.join(', ')})` };
   },
 
   buildColumnDefinition(input: ColumnDefinitionInput): string {
@@ -997,8 +1351,9 @@ function buildRelationsFromForeignKeys(
   foreignKeys: FKEntry[],
   pkByTable: Map<string, string[]>,
   columnsByTable: Map<string, ColumnMetadata[]>,
+  logger: IntrospectOptions['logger'],
 ): Map<string, Record<string, RelationDef>> {
-  return deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable);
+  return deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable, logger);
 }
 
 /**
@@ -1008,12 +1363,13 @@ function buildRelationsFromForeignKeys(
  *
  * @param exec    Runs a parameterized (`:p1`, `:p2`, …) query and returns rows.
  * @param schema  The MySQL database (schema) name to introspect.
- * @param options Optional include / exclude table-name filters.
+ * @param options Optional include / exclude table-name filters, and the logger
+ *                that receives relation-naming notes (console when absent).
  */
 export async function introspectMysqlWith(
   exec: MysqlRowExecutor,
   schema: string,
-  options: { include?: string[]; exclude?: string[] } = {},
+  options: Pick<IntrospectOptions, 'include' | 'exclude' | 'logger'> = {},
 ): Promise<SchemaMetadata> {
   // ----- Tables -----
   const candidateTables = (
@@ -1035,7 +1391,7 @@ export async function introspectMysqlWith(
   )) as unknown as InfoColumn[];
 
   const columnsByTable = new Map<string, ColumnMetadata[]>();
-  const enums: Record<string, string[]> = {};
+  const enums: Record<string, string[]> = nullRecord<string[]>();
   for (const c of columnRows) {
     if (!tableSet.has(c.TABLE_NAME)) continue;
     const nullable = c.IS_NULLABLE === 'YES' && c.COLUMN_KEY !== 'PRI';
@@ -1064,6 +1420,8 @@ export async function introspectMysqlWith(
       tsType: mysqlTypeToTs(dataType, nullable, c.COLUMN_TYPE),
       nullable,
       hasDefault: c.COLUMN_DEFAULT !== null || /auto_increment/i.test(c.EXTRA),
+      // The server numbers it, so a create's re-read can use the insert id.
+      isGenerated: /auto_increment/i.test(c.EXTRA),
       isArray: false,
       arrayType: undefined,
       pgArrayType: 'text[]',
@@ -1149,17 +1507,25 @@ export async function introspectMysqlWith(
   }
 
   // ----- Relations -----
-  const relationsByTable = buildRelationsFromForeignKeys(tableNames, foreignKeys, pkByTable, columnsByTable);
+  // One field per column, as the PostgreSQL introspector requires.
+  for (const [tableName, cols] of columnsByTable) assertDistinctColumnFields(tableName, cols);
+  const relationsByTable = buildRelationsFromForeignKeys(
+    tableNames,
+    foreignKeys,
+    pkByTable,
+    columnsByTable,
+    options.logger,
+  );
 
   // ----- Assemble TableMetadata -----
-  const tables: Record<string, TableMetadata> = {};
+  const tables: Record<string, TableMetadata> = nullRecord<TableMetadata>();
   for (const tableName of tableNames) {
     const columns = columnsByTable.get(tableName) ?? [];
-    const columnMap: Record<string, string> = {};
-    const reverseColumnMap: Record<string, string> = {};
+    const columnMap: Record<string, string> = nullRecord<string>();
+    const reverseColumnMap: Record<string, string> = nullRecord<string>();
     const dateColumns = new Set<string>();
-    const dialectTypes: Record<string, string> = {};
-    const pgTypes: Record<string, string> = {};
+    const dialectTypes: Record<string, string> = nullRecord<string>();
+    const pgTypes: Record<string, string> = nullRecord<string>();
     const allColumns: string[] = [];
 
     for (const col of columns) {
@@ -1182,7 +1548,7 @@ export async function introspectMysqlWith(
       allColumns,
       primaryKey: pkByTable.get(tableName) ?? [],
       uniqueColumns: uniqueByTable.get(tableName) ?? [],
-      relations: relationsByTable.get(tableName) ?? {},
+      relations: relationsByTable.get(tableName) ?? nullRecord<RelationDef>(),
       indexes: indexesByTable.get(tableName) ?? [],
     };
   }
@@ -1216,7 +1582,11 @@ export async function introspectMysql(options: IntrospectOptions): Promise<Schem
     // try/finally runs the finally BEFORE the promise settles, so `pool.end()`
     // closed the pool out from under every introspection query and the whole
     // call failed with mysql2's "Pool is closed".
-    return await introspectMysqlWith(exec, schemaName, { include: options.include, exclude: options.exclude });
+    return await introspectMysqlWith(exec, schemaName, {
+      include: options.include,
+      exclude: options.exclude,
+      logger: options.logger,
+    });
   } finally {
     await pool.end();
   }
@@ -1228,7 +1598,7 @@ export async function introspectMysql(options: IntrospectOptions): Promise<Schem
 
 /** mysql2 connection flags Turbine pins for correct behavior. */
 const MYSQL_DRIVER_FLAGS = {
-  // Named placeholders (`:pN`), see paramPlaceholder + toNamedBinding.
+  // Named placeholders (`:pN`), see paramPlaceholder + bindStatement.
   namedPlaceholders: true,
   // Safe-int policy matching Postgres int8: number when it fits, decimal string
   // otherwise. DECIMAL always comes back as a string. No global state mutated.
@@ -1386,11 +1756,15 @@ export async function turbineMysql(
       connectionLimit: options.connectionLimit ?? 10,
       ...MYSQL_DRIVER_FLAGS,
     });
-    // Every NEW physical connection: disable backslash string escaping so the
-    // builder's `LIKE … ESCAPE '\'` clause (a single literal backslash) is valid
-    // MySQL, by default MySQL would parse `'\'` as an escaped quote (syntax
-    // error). This also makes string-literal semantics match Postgres. Turbine
-    // parameterizes every value, so no behavior depends on backslash escaping.
+    // Every NEW physical connection: disable backslash string escaping, so a
+    // string literal in raw SQL on a Turbine-owned pool reads the way it does
+    // on PostgreSQL. Nothing Turbine GENERATES depends on it any more: the LIKE
+    // clause names `!` (see mysqlDialect.likeEscapeCharacter), a JSON_OBJECT
+    // key holding a backslash is written in hex (mysqlKeyLiteral), and every
+    // value is a bound parameter, so the SQL means the same thing on a pool
+    // the caller supplies, which keeps the caller's own mode. This stays
+    // because removing it would change how raw SQL already written against an
+    // owned pool parses.
     //
     // NOTE: even on a `mysql2/promise` pool, the 'connection' event yields the
     // *raw* (callback-style) connection, its `.query()` returns a non-thenable
@@ -1404,38 +1778,50 @@ export async function turbineMysql(
     owns = true;
   }
 
-  // Probe the server version (fail fast on MySQL < 8.0 / MariaDB).
-  const versionRows = (await pool.query('SELECT VERSION() AS v')).rows as { v?: string }[];
-  assertSupportedVersion(String(versionRows[0]?.v ?? ''));
+  let client: TurbineClient;
+  try {
+    // Probe the server version (fail fast on MySQL < 8.0 / MariaDB).
+    const versionRows = (await pool.query('SELECT VERSION() AS v')).rows as { v?: string }[];
+    assertSupportedVersion(String(versionRows[0]?.v ?? ''));
 
-  // Everything that is not a pool-construction option is client config and
-  // rides through untouched, so a new TurbineConfig option works here the day
-  // it lands. The engine-owned keys come last, so no caller can unbind the
-  // dialect.
-  const { connectionLimit: _connectionLimit, ...clientConfig } = options;
-  const client = new TurbineClient(
-    {
-      ...clientConfig,
-      pool,
-      dialect: mysqlDialect,
-      preparedStatements: false,
-    },
-    // The join strategy is the only read path that consults a recorded dialect
-    // type, so a schema that spells a boolean any other way would read 1/0
-    // there and `true`/`false` everywhere else.
-    normalizeBooleanDialectTypes(schema),
-  );
+    // Everything that is not a pool-construction option is client config and
+    // rides through untouched, so a new TurbineConfig option works here the day
+    // it lands. The engine-owned keys come last, so no caller can unbind the
+    // dialect.
+    const { connectionLimit: _connectionLimit, ...clientConfig } = options;
+    client = new TurbineClient(
+      {
+        ...clientConfig,
+        pool,
+        dialect: mysqlDialect,
+        preparedStatements: false,
+      },
+      // The join strategy is the only read path that consults a recorded dialect
+      // type, so a schema that spells a boolean any other way would read 1/0
+      // there and `true`/`false` everywhere else.
+      normalizeBooleanDialectTypes(schema),
+    );
+  } catch (err) {
+    // A failed factory hands the caller nothing to close, so a pool it BUILT
+    // is closed here: the version probe's connection would otherwise keep the
+    // process alive (the client constructor refuses a bad config, a static
+    // global filter naming no table or column for one). A pool the caller
+    // supplied is the caller's and stays open.
+    if (owns) await pool.end().catch(() => {});
+    throw err;
+  }
 
   if (owns) {
     // Turbine built this pool, so disconnect()/end() must close it. External
     // pools (injection) stay the caller's responsibility (disconnect() no-op),
     // consistent with turbineHttp / turbineSqlite.
     const baseDisconnect = client.disconnect.bind(client);
-    const close = async (): Promise<void> => {
-      await baseDisconnect();
+    const close = async (options?: DisconnectOptions): Promise<DisconnectResult | undefined> => {
+      const result = options === undefined ? await baseDisconnect() : await baseDisconnect(options);
       await pool.end();
+      return result ?? undefined;
     };
-    const patch = client as unknown as { disconnect: () => Promise<void>; end: () => Promise<void> };
+    const patch = client as unknown as { disconnect: typeof close; end: typeof close };
     patch.disconnect = close;
     patch.end = close;
   }

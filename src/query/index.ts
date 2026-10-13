@@ -97,6 +97,10 @@ export type {
   UpsertStatementInput,
 } from '../dialect.js';
 export { postgresDialect } from '../dialect.js';
+// Column references: `col('field')` builds the branded operand that compares
+// two columns of one row. `jsonValue(v)` marks a value to store as JSON.
+export { col } from './column-ref.js';
+export { type JsonValue, jsonValue } from './json-value.js';
 export type { OptionKind, OptionTable } from './option-surface.js';
 export {
   AGGREGATE_OPTIONS,

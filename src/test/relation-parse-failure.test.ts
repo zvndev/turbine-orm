@@ -19,7 +19,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
-import { ValidationError } from '../errors.js';
+import { InvariantError } from '../errors.js';
 import { QueryInterface } from '../query/index.js';
 import { resetWarnOnce, WARN_NS } from '../query/warn-registry.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
@@ -116,15 +116,16 @@ function parseMalformed(
 // ---------------------------------------------------------------------------
 
 describe('relation parse failure behaviour', () => {
-  it('throws a ValidationError instead of substituting the raw value', () => {
+  it('throws an InvariantError instead of substituting the raw value', () => {
     resetWarnOnce(WARN_NS.relationParseFailure);
     const { thrown } = parseMalformed(makeInterface());
 
-    assert.ok(thrown instanceof ValidationError, 'a payload that will not parse must be an error, not a row');
-    assert.equal((thrown as ValidationError).code, 'TURBINE_E003');
-    assert.match((thrown as ValidationError).message, /"posts"/, 'the message must name the relation');
-    assert.match((thrown as ValidationError).message, /"users"/, 'the message must name the table');
-    assert.ok((thrown as ValidationError).cause instanceof Error, 'the underlying parse error is kept as the cause');
+    assert.ok(thrown instanceof InvariantError, 'a payload that will not parse must be an error, not a row');
+    assert.equal((thrown as InvariantError).code, 'TURBINE_E020');
+    assert.equal((thrown as InvariantError).invariant, 'relation-payload-json');
+    assert.match((thrown as InvariantError).message, /"posts"/, 'the message must name the relation');
+    assert.match((thrown as InvariantError).message, /"users"/, 'the message must name the table');
+    assert.ok((thrown as InvariantError).cause instanceof Error, 'the underlying parse error is kept as the cause');
   });
 
   it('warns once for a page of many failing rows, not once per row', () => {
@@ -145,7 +146,7 @@ describe('relation parse failure behaviour', () => {
 
     // Every call still threw; dedupe suppresses the diagnostic, never the error.
     for (const run of [first, second, third]) {
-      assert.ok(run.thrown instanceof ValidationError);
+      assert.ok(run.thrown instanceof InvariantError);
     }
   });
 
@@ -156,7 +157,7 @@ describe('relation parse failure behaviour', () => {
     try {
       const { warnings, thrown } = parseMalformed(makeInterface());
       assert.equal(warnings.length, 0, 'a production process must not be told once per page either');
-      assert.ok(thrown instanceof ValidationError, 'the refusal is not a dev-only diagnostic');
+      assert.ok(thrown instanceof InvariantError, 'the refusal is not a dev-only diagnostic');
     } finally {
       if (prev === undefined) delete process.env.NODE_ENV;
       else process.env.NODE_ENV = prev;
@@ -202,7 +203,7 @@ describe('relation parse failure behaviour', () => {
 describe('relation parse failure handling', () => {
   const src = readFileSync(new URL('../query/relations.ts', import.meta.url), 'utf8');
 
-  it('gates the parse-failure warn on NODE_ENV and dedupes it', () => {
+  it('gates the parse-failure warn on the advice switch and dedupes it', () => {
     // The warn sits inside parseNestedRow's per-relation loop, which runs once
     // per row per relation. Ungated and undeduped, one page of 10,000 rows is
     // 10,000 console.warn calls in production.
@@ -210,8 +211,8 @@ describe('relation parse failure handling', () => {
     assert.notEqual(anchor, -1, 'the parse-failure warn namespace must be used in relations.ts');
     const catchBlock = src.slice(anchor - 600, anchor + 900);
     assert.match(catchBlock, /shouldWarnOnce\(WARN_NS\.relationParseFailure/, 'warn must be deduped');
-    assert.match(catchBlock, /NODE_ENV/, 'warn must be gated on NODE_ENV');
-    assert.match(catchBlock, /throw new ValidationError/, 'the failure must propagate, not be swallowed');
+    assert.match(catchBlock, /adviceLogger\(qi\)/, 'warn must be gated on the diagnostics advice switch');
+    assert.match(catchBlock, /throw new InvariantError/, 'the failure must propagate, not be swallowed');
   });
 
   it('does not silently substitute the raw value for a parsed relation', () => {

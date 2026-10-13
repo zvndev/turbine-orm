@@ -161,15 +161,15 @@ describe('create: Date on a time column', () => {
 
   it('REGRESSION: a non-temporal column binds its value by identity', () => {
     const buf = Buffer.from('x');
-    const arr = [1, 2, 3];
-    const d = q().buildCreate({ data: { label: buf as unknown as string, id: arr as unknown as number } });
+    const big = 9007199254740993n;
+    const d = q().buildCreate({ data: { label: buf as unknown as string, id: big as unknown as number } });
     // Params follow the TABLE's column order (`id` is declared before `label`),
     // not the order the keys were written: a write's column list is SQL text,
     // and letting the caller pick it mints a permanent server-side prepared
     // statement per permutation. See `canonicalWriteEntries` in query/utils.ts.
     // What this test is actually about is untouched: both values arrive by
     // identity, whichever slot they land in.
-    assert.equal(d.params[0], arr);
+    assert.equal(d.params[0], big);
     assert.equal(d.params[1], buf);
   });
 
@@ -500,12 +500,16 @@ describe('zone-less rewrite scoping', () => {
     assert.equal(coerceTemporalValue('timestamp', invalid), invalid);
   });
 
-  it('a non-PostgreSQL dialect keeps the driver Date binding for date / timestamp', () => {
-    // MySQL/SQL Server read a zone-less literal through their own session
-    // rules, so only PostgreSQL (whose read path pins UTC) gets the rewrite.
+  it('a non-PostgreSQL dialect keeps the driver Date binding for timestamp, and binds the UTC date for date', () => {
+    // MySQL/SQL Server read a zone-less timestamp literal through their own
+    // session rules, so only PostgreSQL (whose read path pins UTC) rewrites a
+    // timestamp. A date has no time zone to misread: every engine stores the
+    // UTC date part, as PostgreSQL does.
     const qi = makeQuery('report_schedules', buildSchema(), { dialect: sqliteDialect });
     const d = qi.buildCreate({ data: { createdAt: A_TIMESTAMP, onDate: A_TIMESTAMP } });
-    for (const p of d.params) assert.equal(p, A_TIMESTAMP);
+    assert.equal(d.params.length, 2);
+    assert.ok(d.params.includes(A_TIMESTAMP));
+    assert.ok(d.params.includes('2026-07-25'));
     assert.deepEqual(qi.buildCreate({ data: { time: NINE_AM_UTC } }).params, ['09:00:00']);
   });
 });

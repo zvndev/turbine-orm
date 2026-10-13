@@ -735,16 +735,24 @@ describe('TurbineClient DATABASE_URL fallback', () => {
     });
   });
 
-  it('falls back to localhost defaults when neither config nor DATABASE_URL is set', async () => {
-    await withDatabaseUrl(undefined, async () => {
-      const db = new TurbineClient({}, buildSchema());
-      try {
-        const opts = poolOptions(db);
-        assert.equal(opts.connectionString, undefined);
-        assert.equal(opts.host, 'localhost');
-      } finally {
-        await db.disconnect();
-      }
-    });
+  it('names the missing DATABASE_URL at the first query when nothing names a database', async () => {
+    const pgVars = ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER'] as const;
+    const saved = pgVars.map((k) => process.env[k]);
+    for (const k of pgVars) delete process.env[k];
+    try {
+      await withDatabaseUrl(undefined, async () => {
+        const db = new TurbineClient({}, buildSchema());
+        try {
+          await assert.rejects(db.table('users').count(), /No database configured.*DATABASE_URL/s);
+        } finally {
+          await db.disconnect();
+        }
+      });
+    } finally {
+      pgVars.forEach((k, i) => {
+        if (saved[i] === undefined) delete process.env[k];
+        else process.env[k] = saved[i];
+      });
+    }
   });
 });

@@ -241,27 +241,30 @@ describe('generator: *Relations interface output', () => {
   const out = generateTypes(SCHEMA);
 
   it('imports RelationDescriptor from turbine-orm', () => {
-    assert.match(out, /import type \{ RelationDescriptor, UpdateOperatorInput \} from 'turbine-orm';/);
+    assert.match(
+      out,
+      /import type \{ ColumnRef, RelationDescriptor, SqlExpr, UpdateOperatorInput \} from 'turbine-orm';/,
+    );
   });
 
   it('emits hasMany relations as RelationDescriptor<Target, "many", TargetRelations>', () => {
     const userRelations = extractInterfaceBody(out, 'UserRelations');
     // users.posts → Post[], target Post has its own relations
-    assert.match(userRelations, /posts: RelationDescriptor<Post, 'many', PostRelations>;/);
+    assert.match(userRelations, /posts: RelationDescriptor<Post, 'many', PostRelations, 'hasMany'>;/);
 
     const postRelations = extractInterfaceBody(out, 'PostRelations');
     // posts.comments → Comment[], target Comment has NO relations → uses {}
-    assert.match(postRelations, /comments: RelationDescriptor<Comment, 'many', \{\}>;/);
+    assert.match(postRelations, /comments: RelationDescriptor<Comment, 'many', \{\}, 'hasMany'>;/);
   });
 
   it('emits belongsTo / hasOne relations as RelationDescriptor<Target, "one", TargetRelations>', () => {
     const postRelations = extractInterfaceBody(out, 'PostRelations');
-    // posts.author → User | null, target User has its own relations
-    assert.match(postRelations, /author: RelationDescriptor<User, 'one', UserRelations>;/);
+    // posts.author → User (author_id is NOT NULL), target User has its own relations
+    assert.match(postRelations, /author: RelationDescriptor<User, 'one', UserRelations, 'belongsTo', false>;/);
 
     const userRelations = extractInterfaceBody(out, 'UserRelations');
     // users.profile → Profile | null, target Profile has NO relations → uses {}
-    assert.match(userRelations, /profile: RelationDescriptor<Profile, 'one', \{\}>;/);
+    assert.match(userRelations, /profile: RelationDescriptor<Profile, 'one', \{\}, 'hasOne'>;/);
   });
 
   it('does NOT emit the legacy bare-shape inside *Relations interfaces', () => {

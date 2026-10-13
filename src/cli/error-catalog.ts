@@ -138,11 +138,13 @@ const CATALOG: Record<TurbineErrorCode, ErrorExplanationBody> = {
       'TLS: a self-signed or expired certificate, or a hostname the certificate does not cover.',
       'The connection string is malformed, or points at a pooler port the server is not on.',
       'The server closed an idle pooled connection (proxy idle timeout, restart, failover).',
+      'A transaction-pooling endpoint (PgBouncer in transaction mode, a managed `-pooler` host, port 6432 or 6543) with named prepared statements: sqlstate 42P05 or 26000.',
     ],
     howToFix: [
       'Read `err.sqlstate` and the hint in the message: each driver code carries its own next step.',
       'Check the host, port and database name; for TLS, supply the CA via `ssl: { ca }` rather than disabling verification.',
       'For a serverless driver, pass the external pool on `TurbineConfig.pool` instead of a connection string.',
+      'For 42P05 / 26000 behind a pooler, connect to the direct endpoint, set `preparedStatements: false`, or run PgBouncer 1.21+ with `max_prepared_statements` above 0.',
     ],
     properties: ['sqlstate'],
   },
@@ -380,6 +382,42 @@ const CATALOG: Record<TurbineErrorCode, ErrorExplanationBody> = {
       'For `rbac`, grant the role the privilege, or connect as one that has it.',
     ],
     properties: ['reason'],
+  },
+  TURBINE_E019: {
+    className: 'TransactionRolledBackError',
+    retryable: false,
+    origin: 'turbine',
+    whenThrown:
+      'A transaction callback returned or committed after work inside it had already failed, so the server rolled the transaction back.',
+    likelyCauses: [
+      'The callback caught an error from a statement (a unique violation, a timeout) and carried on, then returned. PostgreSQL refuses every later statement in an aborted transaction and answers COMMIT with ROLLBACK.',
+      'A query inside `$transaction` hit its per-query `timeout`; the transaction cannot continue after the cancel.',
+      'Raw `transaction()`: a statement failed and the code returned without a SAVEPOINT around it.',
+    ],
+    howToFix: [
+      'Let the first error propagate so the whole transaction fails with its own class, or wrap the step that may fail in a nested `tx.$transaction` (a SAVEPOINT) and catch around that.',
+      'On raw `transaction()`, issue `SAVEPOINT` before the statement that may fail and `ROLLBACK TO SAVEPOINT` when it does.',
+      'Deadlock, serialization and lock-not-available failures keep their own classes and stay retryable; E019 is not, because retrying the same callback repeats the same swallowed failure.',
+    ],
+    properties: [],
+  },
+  TURBINE_E020: {
+    className: 'InvariantError',
+    retryable: false,
+    origin: 'turbine',
+    whenThrown:
+      'Turbine caught a bug in itself before sending a statement it knew was wrong: two internal paths that must agree did not, or a branch no argument can reach was reached.',
+    likelyCauses: [
+      '`invariant: "sql-cache-lockstep"`: the SQL-template cache built a statement whose parameters, or whose cached text, disagree with what a fresh build of the same query produces.',
+      '`invariant: "sql-cache-param-count"`: a cached statement was about to run with a different number of parameters than its placeholders.',
+      'Any other `invariant` id names one internal rule; the message says which two things disagreed.',
+    ],
+    howToFix: [
+      'Report it at https://github.com/zvndev/turbine-orm/issues with the message and `err.invariant`. The message carries the query shape and no row or parameter value.',
+      'Nothing in the call is wrong, so rewriting the arguments is a workaround at best. There is no option that turns these checks off: each one fires only where Turbine would otherwise have sent the wrong SQL or the wrong parameters.',
+      'Do not retry: the same call fails the same way.',
+    ],
+    properties: ['invariant'],
   },
 };
 

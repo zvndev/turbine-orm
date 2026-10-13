@@ -59,6 +59,7 @@ const sections: NavSection[] = [
     title: 'Reference',
     items: [
       { href: '/benchmarks', label: 'Benchmarks' },
+      { href: '/upgrading-to-0-90', label: 'Upgrading to 0.90' },
       { href: '/changelog', label: 'Changelog' },
     ],
   },

@@ -19,6 +19,7 @@
  * Hyperdrive), mock pools in tests, and any pool that doesn't expose pg internals.
  */
 
+import { acquireConnection } from './checkout.js';
 import { type CheckoutGuard, guardCheckout } from './connection-guard.js';
 import { type Dialect, postgresDialect } from './dialect.js';
 import { explainConnectionLoss, PipelineError, type PipelineResultSlot, TurbineError, wrapPgError } from './errors.js';
@@ -30,6 +31,7 @@ import {
   supportsExtendedPipeline,
 } from './pipeline-submittable.js';
 import type { DeferredQuery } from './query/index.js';
+import { commitTransaction } from './transaction-state.js';
 
 // ---------------------------------------------------------------------------
 // Pipeline options (public)
@@ -60,6 +62,16 @@ export interface PipelineOptions {
 interface SequentialClient {
   query(text: string, values?: unknown[]): Promise<PgCompatQueryResult>;
   release(err?: Error | boolean): void;
+}
+
+/**
+ * Run one deferred query on the batch's connection. An engine without
+ * RETURNING (MySQL) attaches a `reselect` plan that runs the write and then
+ * fetches its row; sending `q.sql` alone would hand the transform a row-less
+ * result, which a single-row write reads as "not found".
+ */
+function runOne(client: SequentialClient, q: DeferredQuery<unknown>): Promise<PgCompatQueryResult> {
+  return q.reselect ? q.reselect((sql, params) => client.query(sql, params)) : client.query(q.sql, q.params);
 }
 
 /**
@@ -97,18 +109,16 @@ async function runSequential<T extends readonly DeferredQuery<unknown>[]>(
     for (const q of queries) {
       let raw: PgCompatQueryResult;
       try {
-        raw = await client.query(q.sql, q.params);
+        raw = await runOne(client, q);
       } catch (err) {
         throw wrapPgError(err);
       }
+      // Transformed BEFORE the COMMIT, so a transform that refuses its result
+      // (a `...OrThrow` miss, an optimistic-lock conflict) rolls the batch back.
       results.push(q.transform(raw));
     }
 
-    try {
-      await client.query(dialect.commitStatement());
-    } catch (err) {
-      throw wrapPgError(err);
-    }
+    await commitTransaction(client, dialect.commitStatement());
 
     return results as PipelineResults<T>;
   } catch (err) {
@@ -193,7 +203,7 @@ async function runIndependent<T extends readonly DeferredQuery<unknown>[]>(
     const q = queries[i]!;
     let raw: PgCompatQueryResult;
     try {
-      raw = await client.query(q.sql, q.params);
+      raw = await runOne(client, q);
     } catch (err) {
       const wrapped = wrapPgError(err);
       fail(i, wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
@@ -246,23 +256,11 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
     return [] as unknown as PipelineResults<T>;
   }
 
-  // Acquire a single client, reused for both capability check and execution.
-  // The checkout is wrapped because a connection-level failure (28P01 wrong
-  // password, an unverifiable TLS cert, ECONNREFUSED) happens HERE, before any
-  // query runs. Unwrapped it escapes as a raw pg DatabaseError whose `.code`
-  // holds a SQLSTATE, which is the same property Turbine puts TURBINE_E0NN in,
-  // so a caller switching on `.code` silently receives a value from a foreign
-  // namespace. The transaction and nested-write checkouts were wrapped for this
-  // reason; this was the last sibling still bare.
-  let client: PgCompatPoolClient;
-  try {
-    client = await pool.connect();
-  } catch (err) {
-    throw wrapPgError(err);
-  }
-  // Guarded for the checkout window, see connection-guard.ts: a connection that
-  // dies mid-batch emits 'error', which with no listener exits the process.
-  const checkout = guardCheckout(client);
+  // One client, reused for both capability check and execution. The shared
+  // checkout types a connection-level failure (wrong password, TLS, refused,
+  // an exhausted pool) and guards the checkout window: a connection that dies
+  // mid-batch emits 'error', which with no listener exits the process.
+  const { client, checkout }: { client: PgCompatPoolClient; checkout: CheckoutGuard } = await acquireConnection(pool);
 
   try {
     if (supportsExtendedPipeline(client)) {

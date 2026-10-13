@@ -80,7 +80,15 @@ src/
     batched-loader.ts, relationLoadStrategy: 'batched'
     compound-unique.ts, Compound-unique selectors and the findUnique identity rule
     relation-names.ts, The relation-name resolution rule
+    normalize-args.ts, Args-seam undefined pruning and the inclusive-cursor flag
+    column-ref.ts    , The branded col() column reference
+    json-value.ts    , The jsonValue() wrapper for literal JSON values
+    expr.ts          , Branded update expressions (expr.greatest, expr.case, ...)
     option-surface.ts, The query-arg option surface as runtime data
+    row-lock.ts      , The lock read option: FOR UPDATE OF "t" and its refusals
+    sql-comment.ts   , sqlComment: sqlcommenter key/values appended at the execute seam
+    stream-idle.ts   , The abandoned-stream idle guard and its server-side limit
+    table-client.ts  , The accessor contract (TableClient) every engine implements
     warn-registry.ts , Process-wide once-only dev-warn registry
     deferred.ts      , DeferredQuery and option types
     index.ts         , Barrel re-export
@@ -96,7 +104,7 @@ src/
   observe.ts       , Observability / query metrics
   serverless.ts    , Edge/serverless driver binding (turbineHttp)
   adapters/        , Dialect adapters (CockroachDB, YugabyteDB, …)
-  errors.ts        , Typed TurbineError hierarchy (E001-E018)
+  errors.ts        , Typed TurbineError hierarchy (E001-E020)
   cli/             , CLI commands (init, generate, migrate, studio, etc.)
 ```
 

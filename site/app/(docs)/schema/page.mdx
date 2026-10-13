@@ -41,14 +41,53 @@ export default defineSchema({
     userId: { type: 'bigint', notNull: true, references: 'users.id' },
     title: { type: 'text', notNull: true },
     content: { type: 'text' },
-    published: { type: 'boolean', notNull: true, default: 'false' },
-    viewCount: { type: 'integer', notNull: true, default: '0' },
+    published: { type: 'boolean', notNull: true, default: false },
+    viewCount: { type: 'integer', notNull: true, default: 0 },
     createdAt: { type: 'timestamp', default: 'now()' },
   },
 });
 ```
 
-Two things the example does not show. `type: 'timestamp'` emits `TIMESTAMPTZ`: the alias is kept for back-compat and means the same as `'timestamptz'`, so there is no code-first spelling for a zone-less `TIMESTAMP` column (declare one in a SQL migration and `generate` picks it up; the [type mapping](#type-mapping) below describes how such a column reads). And `varchar` takes its bound as `maxLength` (`{ type: 'varchar', maxLength: 200 }`); `defineSchema` does not validate column option names, so a misspelt option such as `length` is ignored and an unbounded `VARCHAR` is emitted.
+Two things the example does not show. `type: 'timestamp'` emits `TIMESTAMPTZ`: the alias is kept for back-compat and means the same as `'timestamptz'`, so there is no code-first spelling for a zone-less `TIMESTAMP` column (declare one in a SQL migration and `generate` picks it up; the [type mapping](#type-mapping) below describes how such a column reads). And `varchar` takes its bound as `maxLength` (`{ type: 'varchar', maxLength: 200 }`).
+
+A `default` is SQL text (`"'member'"`, `'now()'`), a number, or a boolean. `default: 0` emits `DEFAULT 0` and `default: false` emits `DEFAULT FALSE`; the string forms `'0'` and `'false'` still work. Any other value, such as an object, throws `TURBINE_E003`.
+
+### Unknown keys throw
+
+`defineSchema` refuses a key it does not know. A misspelt column, table, index, `references`, check, `manyToMany` or options key throws `ValidationError` ([`TURBINE_E003`](/errors#e003)) naming the key, where it sits, and the nearest valid key:
+
+```ts
+defineSchema({
+  users: {
+    id: { type: 'serial', primaryKey: true },
+    role: { type: 'text', defaultValue: "'member'" },
+  },
+});
+// TURBINE_E003: defineSchema: unknown key "defaultValue" in column "users.role". Did you mean "default"?
+```
+
+In a TypeScript object literal the same key is also a compile error. Before 0.90 such a key was ignored, so the DDL silently lacked what it asked for: a misspelt `default` emitted no `DEFAULT`, and `uniq` on an index emitted a non-unique one.
+
+Two more shapes throw the same error: a table or column named `__proto__` (JavaScript reads that key as the prototype setter, so the column could not be stored or queried), and an index that declares both `columns` and `docField` (declare two indexes instead).
+
+Names are checked too. An index naming a column the table does not have throws, with the nearest column name. So do two fields that map to one database column (`userId` and `user_id`) and two tables that map to one table name. A column may still be called `name` or `columns`.
+
+### Typing a JSON column, `tsType`
+
+A `json` / `jsonb` column generates as `unknown`. Give it a type with `tsType`, in the object form or on the fluent builder:
+
+```ts
+export default defineSchema({
+  users: {
+    id: { type: 'serial', primaryKey: true },
+    settings: { type: 'jsonb', tsType: '{ theme: string; beta?: boolean }' },
+  },
+});
+
+// fluent: column.jsonb().tsType('{ theme: string; beta?: boolean }')
+```
+
+`turbine generate` uses it for the column's row, create and update types. The text is emitted verbatim, so it may name any type the generated file can see (`import('../src/types.js').Settings`). `| null` is still added for a nullable column. It must be one TypeScript type on one line, or `defineSchema` throws `ValidationError` (`TURBINE_E003`) naming the text: no comments, no `;` or `,` outside brackets, balanced brackets, no template literal types and no backticks. Object types, generics, unions, function types and `import('...').T` are fine; give anything else a type alias and import it. A declared type changes only the generated TypeScript: the runtime metadata keeps the column's mapped type, so the engines read and write the column as its database type. The same override can live in `turbine.config.ts` as [`columnTypes`](/cli#typing-columns-columntypes); when both name one column, the config entry wins.
 
 ### Composite primary keys
 
@@ -67,7 +106,13 @@ memberships: {
 
 ### Foreign keys and referential actions
 
-The short `references: 'table.column'` form emits a plain foreign key. To attach `ON DELETE` / `ON UPDATE` actions, pass an object:
+The short `references: 'table.column'` form emits a plain foreign key. A reference to a table in the same schema is checked:
+
+- It must have exactly one dot. `references: 'users'` throws `TURBINE_E003`, since no foreign key would be created.
+- The column must exist on that table, written as the field name (`authors.displayName`) or the column name (`authors.display_name`). Turbine emits the column name. An unknown column throws `TURBINE_E003` listing the table's columns.
+- A table outside the schema is not checked, so a reference to a table another migration owns still works.
+
+To attach `ON DELETE` / `ON UPDATE` actions, pass an object:
 
 ```ts
 posts: {
@@ -99,7 +144,7 @@ export default defineSchema(
 );
 ```
 
-DDL emits `CREATE TYPE "post_status" AS ENUM ('draft', 'published', 'archived')` before the tables that use it, and the column is typed `"post_status"`. Enum columns generate a string-literal union in `types.ts` (`'draft' | 'published' | 'archived'`).
+On PostgreSQL, DDL emits `CREATE TYPE "post_status" AS ENUM ('draft', 'published', 'archived')` before the tables that use it, and the column is typed `"post_status"`. The other engines have no enum type, so since 0.90 `schemaToSQL` declares the column inline: `ENUM('draft', 'published', 'archived')` on MySQL, `TEXT` with a `CHECK` over the labels on SQLite, and `NVARCHAR` with the same `CHECK` on SQL Server. There the enum must be declared in `enums` with at least one label (`TURBINE_E003` otherwise), an enum array is `TURBINE_E017`, and a MySQL label holding a backslash is `TURBINE_E003`. Enum columns generate a string-literal union in `types.ts` (`'draft' | 'published' | 'archived'`).
 
 Writes to an enum column get an explicit `::"post_status"` cast on every write path (`create`, `createMany`, `update`, `upsert`), schema-qualified so it is safe across schemas. This avoids the `column is of type post_status but expression is of type text` error `createMany` can otherwise hit.
 
@@ -178,18 +223,28 @@ users: {
 }
 ```
 
-A PII column is **excluded from every default projection**. It comes back in two ways: name it explicitly in `select`, or pass `includePii: UNSAFE`, a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol) unlocked only by the imported symbol (a literal `true` throws `TURBINE_E003`). See [includePii on reads](/queries#pii-fields-includepii).
+A PII column is **excluded from every default projection**. It comes back only with `includePii: UNSAFE`, a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol) unlocked only by the imported symbol (a literal `true` throws `TURBINE_E003`). Naming a PII column in `select` without it throws `ValidationError` (`TURBINE_E003`); with it, `select` narrows the row as usual. See [includePii on reads](/queries#pii-fields-includepii).
 
 The rest of the policy:
 
-- **Writes are unaffected.** You can write PII fields freely. The returned row applies the same read policy: the value is persisted, just absent from the returned object unless you re-read with an opt-in.
+- **Writes are unaffected.** You can write PII fields freely. The returned row never carries them: the value is persisted, just absent from the returned object, and a write's `select` that names a PII column throws. Re-read with `includePii: UNSAFE` when you need it back.
 - **`where`, `orderBy`, and `having` are always allowed.** They narrow, sort, or filter rows and return no PII value.
 - **Two aggregate shapes are gated** behind the same `includePii: UNSAFE`, because they return stored values: a PII column as a `groupBy` `by` key (including a JSON-path key), and `_min` / `_max` over a PII column in `groupBy` or `aggregate` (including JSON-path targets). Without the opt-in they throw `ValidationError` (`TURBINE_E003`).
 - **`_count`, `_sum`, and `_avg` stay allowed.** None of them hands back a stored cell.
 
 **Tag sensitive data, not keys.** A PII-tagged column that is part of the primary key is returned anyway, on every read and write path, because a row that comes back without part of its own key is unaddressable: feeding it into an `update` builds a partial predicate that matches more rows than intended. If a key column is genuinely sensitive, use a surrogate key, not a tag.
 
-The tag flows through the stack: [`turbine studio`](/studio) redacts PII cells by default (reveal with `--show-pii`), and `turbine generate` marks each PII field optional in the emitted entity type, since it is absent by default. Studio and the [MCP server](/mcp) introspect the live database, which carries no tags, so they read them from the generated metadata in your `out` directory: run `turbine generate` after tagging, or they have nothing to redact. Introspection never auto-tags a column; `pii` is a code-first declaration you make in `defineSchema`.
+The tag flows through the stack: [`turbine studio`](/studio) redacts PII cells by default (reveal with `--show-pii`), and `turbine generate` marks each PII field optional in the emitted entity type, since it is absent by default. The field's doc comment reads `(PII: absent unless the read passes includePii: UNSAFE)`. Studio and the [MCP server](/mcp) introspect the live database, which carries no tags, so they read them from the generated metadata in your `out` directory: run `turbine generate` after tagging, or they have nothing to redact. Introspection never auto-tags a column; `pii` is a code-first declaration you make in `defineSchema`.
+
+#### How `generate` picks up the tags
+
+`turbine generate` introspects the database, and the database has no column for `pii` or `updatedAt`. So `generate` also reads your schema file (`--schema-file`, or `schemaFile` in `turbine.config.ts`, default `turbine/schema.ts`) and overlays its `pii`, `updatedAt`, `maxLength` and `tsType` declarations onto what it introspected, printing a line such as `Applied column tags from turbine/schema.ts: 2 pii, 1 updatedAt, 1 tsType`. Before 0.90 it did not, so a generated client returned tagged columns by default and never stamped `updatedAt`. Regenerate after upgrading.
+
+The overlay fails rather than generating an unprotected client:
+
+- A schema file you named that is missing, or any schema file that cannot be loaded, fails the command. Only a missing file at the default path is skipped, which is a database-first project with no schema file.
+- A `pii` or `updatedAt` tag on a table or column the database does not have fails the command, listing every such name with the closest match. Run `turbine push` first, or fix the name. A table you left out with `exclude` is not an error.
+- A `.ts` schema file needs a TypeScript loader, as `turbine push` does; install `tsx` as a dev dependency.
 
 ### Auto-updated timestamps, `updatedAt`
 
@@ -211,7 +266,7 @@ await db.posts.update({ where: { id: 1 }, data: { title: 'new title' } });
 await db.posts.update({ where: { id: 1 }, data: { title: 'x', updatedAt: pinned } });
 ```
 
-The timestamp is generated client-side (as Prisma does), so it flows through the same UTC coercion as any other bound `Date` on every engine. It applies to `update` and `updateMany`, never to `create`, where a column default is the right tool.
+The timestamp is generated client-side (as Prisma does), so it flows through the same UTC coercion as any other bound `Date` on every engine. It applies to `update`, `updateMany` and the update half of `upsert` (whether it runs as one conflict statement or as a lookup followed by an update), never to `create` or an `upsert` that inserts, where a column default is the right tool. An `upsert` with an empty `update` leaves the row it finds untouched, timestamp included.
 
 Like `pii`, this is a code-first declaration and never inferred from a column's name, so an application that already manages its own `updated_at` is not silently changed by an upgrade. A schema with no tagged column emits byte-identical SQL.
 
@@ -274,6 +329,8 @@ await schemaPush(schema, url, { dryRun: true });
 `schemaPush(schema, connectionString, options?)` accepts `{ dryRun, allowDestructive, precomputedDiff }`. If the computed diff contains a data-destroying statement (a lossy `ALTER COLUMN ... TYPE` and similar), it **throws** a `DestructivePushRefusal` (a `ValidationError` subclass carrying the offending statements on `.destructive`) and applies nothing, unless you pass `allowDestructive: true`. This is the same gate `turbine push` puts behind an interactive confirmation. `precomputedDiff` lets a caller diff once, show the plan, confirm, and then apply exactly the statements it displayed, rather than re-diffing.
 
 `schemaPush` and `schemaDiff` connect through `pg` and are **Postgres-only**. `schemaToSQL` has no connection and is not.
+
+With `{ dialect: mysqlDialect }`, `schemaToSQL` writes defaults the way MySQL accepts them. A non-`NULL` default on a `TEXT`, `BLOB` or `JSON` column becomes an expression (`DEFAULT ('member')`, `DEFAULT ('{}')`), a clock default on a `DATE` or `TIME` column becomes `(CURRENT_DATE)` or `(CURRENT_TIME)`, and on a `DATETIME(n)` it follows the column's precision (`CURRENT_TIMESTAMP(3)`). Before 0.90 MySQL rejected those statements. PostgreSQL, SQLite and SQL Server DDL is unchanged.
 
 ## SQL-first migrations
 
@@ -383,23 +440,31 @@ Turbine maps Postgres types to TypeScript:
 | Postgres | TypeScript | Notes |
 |---|---|---|
 | `int2`, `int4`, `float4`, `float8` | `number` | Standard numeric types |
-| `int8` / `bigint` | `number` | Values > `Number.MAX_SAFE_INTEGER` are returned as `string` to avoid precision loss |
-| `numeric`, `money` | `string` | Arbitrary precision, kept as string to avoid JS float issues |
+| `int8` / `bigint` | `number` | Values > `Number.MAX_SAFE_INTEGER` are returned as `string` to avoid precision loss. Writes also accept a `string` or `bigint` |
+| `numeric`, `money` | `string` | Arbitrary precision, kept as string to avoid JS float issues. A `numeric` write also accepts a `number` |
 | `text`, `varchar`, `uuid`, `citext` | `string` | |
 | `timestamptz` | `Date` | Carries a zone on the wire, so the instant is unambiguous |
 | `timestamp`, `date` | `Date` | Zone-less. Read as UTC, not as the process's local zone. See [Zone-less columns](#zone-less-columns-timestamp-and-date-read-as-utc) |
 | `time`, `timetz` | `string` on read, `string \| Date` on write | No date part, so never coerced to a `Date` on read. See [Time-of-day columns](#time-of-day-columns-time-and-timetz) |
-| `interval` | `string` | |
+| `interval` | `{ years?, months?, days?, hours?, minutes?, seconds?, milliseconds? }` | The driver's parsed object; a zero field is absent. Writes take the text form (`'1 day 02:00:00'`) |
+| `point`, `circle` | `{ x, y }`, `{ x, y, radius }` | Parsed by the driver; writes take the text form. Other geometric types stay `string` |
+| `macaddr8`, `bit`, `varbit`, ranges, multiranges | `string` | The text form, `'[1,5)'` for a range |
 | `boolean` | `boolean` | |
-| `json`, `jsonb` | `unknown` | |
+| `json`, `jsonb` | `unknown` | Give it a type with [`tsType`](#typing-a-json-column-tstype) or `columnTypes` |
 | `bytea` | `Buffer` | |
-| Array types | `T[]` | `_text` → `string[]`. `date[]` and `timestamp[]` follow their scalar forms |
+| Array types | `T[]` | `_text` → `string[]`. `date[]` and `timestamp[]` follow their scalar forms. `bigint[]` is `string[]` (the driver's array parser does not apply the scalar `int8` rule), and `circle[]` is `string[]` |
 
 ### Zone-less columns: `timestamp` and `date` read as UTC
 
 A `timestamptz` carries its offset on the wire. A `timestamp` (without time zone) and a `date` do not: the database hands over `2026-07-21 09:30:00` or `2026-07-21`, and something has to choose which instant that is. The pg driver's default is the process's local zone, which makes the same stored row a different `Date` in every deployment region. Turbine reads UTC instead, the same convention Prisma, Rails and Django use.
 
 The read half is a set of pg type parsers on OIDs 1114 (`timestamp`), 1082 (`date`) and their array forms 1115 / 1182, also applied to the dates coerced out of nested-relation JSON, so every read path agrees, and scalar and array columns cannot settle differently. The write half matches: binding a `Date` to a zone-less column renders its **UTC** components. Reading in the local zone against a UTC write is what made a read-modify-write cycle on a `date` walk the stored day backward east of UTC, and let `where: { runOn: row.runOn }` match nothing.
+
+SQLite, MySQL and SQL Server follow the same write rule since 0.90: a `Date` written to or compared with a `date` column binds its UTC day (`YYYY-MM-DD`). MySQL used to round `23:59:59.999` into the next day, and SQLite stored the full ISO text. On SQLite, rows written before 0.90 hold that ISO text and stop matching an equality on the column until you rewrite them:
+
+```sql
+UPDATE events SET run_on = substr(run_on, 1, 10) WHERE length(run_on) > 10;
+```
 
 ```ts
 // Stored: date '2026-07-21'. Process running in Europe/Berlin (UTC+2).
