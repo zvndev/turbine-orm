@@ -310,8 +310,10 @@ export class SqlCommenter {
  *
  *   - a backend that builds no SQL (PowDB, which injects its own query
  *     interface) has nothing to comment;
- *   - `dynamic` on MySQL: the MySQL engine sends each parameterized statement
- *     through mysql2's `execute()`, which keeps one SERVER-side prepared
+ *   - `dynamic` on an engine that prepares every statement text
+ *     (`preparesEveryStatement`), which is MySQL: the MySQL engine sends each
+ *     parameterized statement through mysql2's `execute()`, which keeps one
+ *     SERVER-side prepared
  *     statement per distinct text per connection (up to 16,000 each), and the
  *     server caps the total across every client at `max_prepared_stmt_count`
  *     (16,382 by default). A value unique per request makes every text
@@ -321,7 +323,7 @@ export class SqlCommenter {
 export function resolveSqlComment(
   value: unknown,
   logger: TurbineLogger,
-  engine: { readonly dialect: string; readonly buildsSql: boolean },
+  engine: { readonly dialect: string; readonly preparesEveryStatement: boolean; readonly buildsSql: boolean },
 ): SqlCommenter | undefined {
   if (value === undefined) return undefined;
   if (!isPlainObject(value)) {
@@ -398,7 +400,7 @@ export function resolveSqlComment(
       'This engine does not run SQL, so there is no statement to carry a comment. Remove the option for this client.',
     );
   }
-  if (dynamic !== undefined && engine.dialect === 'mysql') {
+  if (dynamic !== undefined && engine.preparesEveryStatement) {
     throw new UnsupportedFeatureError(
       'sqlComment.dynamic',
       engine.dialect,

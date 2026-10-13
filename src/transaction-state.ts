@@ -67,7 +67,7 @@ export type TransactionApi = '$transaction' | 'transaction';
 
 type SavepointDialect = Pick<
   Dialect,
-  'name' | 'savepointStatement' | 'releaseSavepointStatement' | 'rollbackToSavepointStatement'
+  'capabilities' | 'savepointStatement' | 'releaseSavepointStatement' | 'rollbackToSavepointStatement'
 >;
 
 /**
@@ -162,8 +162,8 @@ export class TransactionState {
     };
     this.savepointWrites = options.userTransaction === true && dialectHasSavepoints(dialect);
     this.api = options.api ?? '$transaction';
-    this.abortsOnError = dialect.name === 'postgresql';
-    this.controlSyntax = controlSyntaxFor(dialect.name);
+    this.abortsOnError = dialect.capabilities.abortsTransactionOnError;
+    this.controlSyntax = dialect.capabilities.statementSyntax ?? undefined;
     this.endedSignal = new Promise<void>((resolve) => {
       this.signalEnded = resolve;
     });
@@ -755,13 +755,6 @@ function transactionControlError(statement: ControlStatement, api: TransactionAp
         'Use a nested `tx.$transaction(async (inner) => { ... })`, which sets, releases and rolls back its own savepoint.';
   }
   return new ValidationError(`${statement.label} cannot be sent ${where}: ${reason}. ${advice}`);
-}
-
-/** The lexical rules for `dialectName`, or undefined when no SQL lexer applies (PowDB speaks PowQL). */
-function controlSyntaxFor(dialectName: string): ControlSyntax | undefined {
-  return dialectName === 'postgresql' || dialectName === 'mysql' || dialectName === 'sqlite' || dialectName === 'mssql'
-    ? dialectName
-    : undefined;
 }
 
 /**

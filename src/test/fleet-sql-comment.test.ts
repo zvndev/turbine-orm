@@ -240,7 +240,10 @@ describe('sqlComment: refused at construction', () => {
       () => new QueryInterface(null as never, 'users', schema(), [], { sqlComment: { static: { A: 'x' } } }),
       ValidationError,
     );
-    assert.equal(resolveSqlComment(undefined, {}, { dialect: 'postgresql', buildsSql: true }), undefined);
+    assert.equal(
+      resolveSqlComment(undefined, {}, { dialect: 'postgresql', preparesEveryStatement: false, buildsSql: true }),
+      undefined,
+    );
   });
 });
 

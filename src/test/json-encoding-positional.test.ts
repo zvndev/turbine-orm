@@ -319,10 +319,15 @@ test('wide (>50-column) relation target chunks into jsonb_build_array concatenat
   }
 });
 
-test('positional on a non-postgres dialect with a `with` clause throws E017', () => {
-  // Fully-functional dialect whose only difference is a non-PG name; the gate
-  // keys on dialect.name, so every other method still works up to the throw.
-  const nonPgDialect = { ...postgresDialect, name: 'sqlite' as const };
+test('positional on a dialect without positionalJson with a `with` clause throws E017', () => {
+  // Fully-functional PostgreSQL dialect whose only difference is the
+  // capability; the gate is `capabilities.positionalJson`, so every other
+  // method still works up to the throw.
+  const nonPgDialect = {
+    ...postgresDialect,
+    name: 'sqlite' as const,
+    capabilities: { ...postgresDialect.capabilities, positionalJson: false },
+  };
   const q = makeQuery('users', schema, { jsonEncoding: 'positional', warnOnUnlimited: false, dialect: nonPgDialect });
   assert.throws(() => q.buildFindMany({ with: { posts: true } } as never), /TURBINE_E017|positional/);
 });

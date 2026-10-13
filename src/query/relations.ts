@@ -839,13 +839,13 @@ export function isRelationOrderByValue(_qi: BuilderCtx, value: unknown): boolean
 
 /**
  * Render the ` NULLS FIRST` / ` NULLS LAST` suffix for a column ordering.
- * Only PostgreSQL and SQLite support the `NULLS FIRST/LAST` grammar, on any
- * other engine a caller asking for explicit nulls placement gets a clear
- * {@link UnsupportedFeatureError} (E017) instead of broken SQL.
+ * On an engine without the `NULLS FIRST/LAST` grammar (`nullsOrderingClause`:
+ * PostgreSQL and SQLite have it) a caller asking for explicit nulls placement
+ * gets a clear {@link UnsupportedFeatureError} (E017) instead of broken SQL.
  */
 export function nullsSuffix(qi: BuilderCtx, nulls: 'first' | 'last' | undefined): string {
   if (!nulls) return '';
-  if (qi.dialect.name !== 'postgresql' && qi.dialect.name !== 'sqlite') {
+  if (!qi.dialect.capabilities.nullsOrderingClause) {
     throw new UnsupportedFeatureError(
       'NULLS FIRST/LAST ordering',
       qi.dialect.name,
@@ -948,7 +948,7 @@ export function buildJsonPathOrderEntry(
   // the grammar gate matches nullsSuffix.
   const nullsSql = spec.nulls
     ? nullsSuffix(qi, spec.nulls)
-    : qi.dialect.name === 'postgresql' || qi.dialect.name === 'sqlite'
+    : qi.dialect.capabilities.nullsOrderingClause
       ? ' NULLS LAST'
       : '';
   return `${lhs} ${dir}${nullsSql}`;
@@ -1359,7 +1359,7 @@ export function buildRelationPickOrderBy(
   // the caller set `nulls` explicitly; the grammar gate matches nullsSuffix.
   const nullsSql = spec.nulls
     ? nullsSuffix(qi, spec.nulls)
-    : qi.dialect.name === 'postgresql' || qi.dialect.name === 'sqlite'
+    : qi.dialect.capabilities.nullsOrderingClause
       ? ' NULLS LAST'
       : '';
 
@@ -2899,11 +2899,12 @@ export function buildSelectWithRelations(
   const meta = qi.schema.tables[table];
   if (!meta) throw new ValidationError(`Unknown table "${table}"`);
 
-  // Positional JSON encoding is Postgres-only in v1. Gate here, the single
-  // entry point for every `with` clause, so no engine ever emits the
-  // json_build_array shape its dialect can't produce (and mssql's FOR JSON
-  // override path is never reached with positional active).
-  if (qi.jsonEncoding === 'positional' && qi.dialect.name !== 'postgresql') {
+  // Positional JSON encoding needs `positionalJson`, the flag the default in
+  // builder.ts reads too, so the default never picks an encoding refused here.
+  // Gate here, the single entry point for every `with` clause, so no engine
+  // ever emits the json_build_array shape its dialect can't produce (and
+  // mssql's FOR JSON override path is never reached with positional active).
+  if (qi.jsonEncoding === 'positional' && !qi.dialect.capabilities.positionalJson) {
     throw new UnsupportedFeatureError(
       "jsonEncoding: 'positional'",
       qi.dialect.name,

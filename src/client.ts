@@ -1470,6 +1470,21 @@ function resolveNonNegativeInteger(value: unknown, name: string, unit: string): 
 }
 
 /**
+ * Refuse a dialect with no `capabilities` object (E003): every code path asks
+ * it what the engine can do, so a hand-built dialect without one would fail on
+ * its first query with a TypeError instead of here.
+ */
+function assertDialectCapabilities(dialect: Dialect): void {
+  const capabilities = (dialect as { capabilities?: unknown }).capabilities;
+  if (typeof capabilities === 'object' && capabilities !== null) return;
+  throw new ValidationError(
+    `The dialect "${String(dialect.name)}" has no \`capabilities\` object, which says what the engine can do. ` +
+      'Build it from an engine dialect (`{ ...postgresDialect, name, capabilities: { ... } }`) and state every ' +
+      'EngineCapabilities key.',
+  );
+}
+
+/**
  * The statement that opens a transaction, read-only when asked. PostgreSQL and
  * MySQL both accept `READ ONLY` after their own BEGIN form (`BEGIN [ISOLATION
  * LEVEL x] READ ONLY`, `[SET TRANSACTION ISOLATION LEVEL x; ]START TRANSACTION
@@ -1478,7 +1493,7 @@ function resolveNonNegativeInteger(value: unknown, name: string, unit: string): 
 function beginStatementFor(dialect: Dialect, isolationSql: string | undefined, readOnly: boolean): string {
   const begin = dialect.beginStatement(isolationSql);
   if (!readOnly) return begin;
-  if (dialect.name === 'postgresql' || dialect.name === 'mysql') return `${begin} READ ONLY`;
+  if (dialect.capabilities.readOnlyTransactions) return `${begin} READ ONLY`;
   throw new UnsupportedFeatureError(
     '$transaction({ readOnly: true })',
     dialect.name,
@@ -1780,17 +1795,18 @@ export class TransactionClient {
     this.state.assertOpen();
     if (this.connectionHandle) return this.connectionHandle;
     const raw = rawClientOf(this.client);
-    if (this.dialect.name === 'powdb') {
+    const driver = this.dialect.capabilities.connectionDriver;
+    if (driver === 'none') {
       throw new UnsupportedFeatureError(
         'tx.$connection()',
-        'powdb',
+        this.dialect.name,
         'A PowDB transaction has no driver connection to hand out. Run PowQL inside it with `tx.rawUnsafe(text, ...values)`.',
       );
     }
-    if (this.dialect.name === 'postgresql' && typeof (raw as { on?: unknown }).on !== 'function') {
+    if (driver === 'pg-compatible' && typeof (raw as { on?: unknown }).on !== 'function') {
       throw new UnsupportedFeatureError(
         'tx.$connection()',
-        'postgresql',
+        this.dialect.name,
         'The pool returned a client with no event support, as a stateless HTTP driver does, so there is no ' +
           'connection to hand out. Use `tx.raw` / `tx.rawUnsafe`, or a TCP pool.',
       );
@@ -1897,7 +1913,7 @@ export class TransactionClient {
 
   /** Bound Dates as UTC text on a PostgreSQL client reading temporal types as UTC. */
   private rawParams(params: unknown[], api: string): unknown[] {
-    return this.dialect.name === 'postgresql' && this.queryOptions?.utcTimestamps !== false
+    return this.dialect.capabilities.utcTimestampRewrite && this.queryOptions?.utcTimestamps !== false
       ? utcDateParams(params, api)
       : params;
   }
@@ -2244,6 +2260,7 @@ export class TurbineClient {
     // settling the process-global parser mode and then rejecting the config
     // would poison the next, valid, TurbineClient with a phantom conflict.
     const dialect = config.dialect ?? postgresDialect;
+    assertDialectCapabilities(dialect);
     const planCacheMode = TurbineClient.resolvePlanCacheMode(config.planCacheMode, dialect);
     const statementTimeoutMs = TurbineClient.resolveStatementTimeout(config.statementTimeoutMs, dialect);
     const maxLifetimeSeconds = resolveNonNegativeInteger(config.maxLifetimeSeconds, 'maxLifetimeSeconds', 'seconds');
@@ -2252,6 +2269,7 @@ export class TurbineClient {
     // so there is nothing for a comment to ride on: refused, not ignored.
     const sqlComment = resolveSqlComment(config.sqlComment, logger, {
       dialect: dialect.name,
+      preparesEveryStatement: dialect.capabilities.preparesEveryStatement,
       buildsSql: (config as { queryInterfaceFactory?: unknown }).queryInterfaceFactory === undefined,
     });
     // Keyed by table name, with every key checked against the schema: a
@@ -2740,7 +2758,7 @@ export class TurbineClient {
    */
   private static resolveStatementTimeout(value: unknown, dialect: Dialect): number | undefined {
     const ms = resolveNonNegativeInteger(value, 'statementTimeoutMs', 'milliseconds');
-    if (ms !== undefined && dialect.name !== 'postgresql') {
+    if (ms !== undefined && !dialect.capabilities.connectionParameters) {
       throw new UnsupportedFeatureError(
         `The statementTimeoutMs option (statement_timeout = ${ms})`,
         dialect.name,
@@ -2807,7 +2825,7 @@ export class TurbineClient {
    * node-postgres. Any other pool is returned unchanged.
    */
   private typedPool(pool: PgCompatPool): PgCompatPool {
-    if (this.dialect.name !== 'postgresql') return pool;
+    if (this.dialect.capabilities.connectionDriver !== 'pg-compatible') return pool;
     return typedQueryPool(pool, this.queryOptions.utcTimestamps !== false) ?? pool;
   }
 
@@ -3530,7 +3548,7 @@ export class TurbineClient {
    * column instead and never come through here.
    */
   private rawParams(params: unknown[], api: string): unknown[] {
-    return this.dialect.name === 'postgresql' && this.queryOptions.utcTimestamps !== false
+    return this.dialect.capabilities.utcTimestampRewrite && this.queryOptions.utcTimestamps !== false
       ? utcDateParams(params, api)
       : params;
   }

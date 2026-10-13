@@ -1061,7 +1061,7 @@ export function userPredicateIsEmpty(qi: BuilderCtx, userWhere: Record<string, u
 function guardFoldOptions(qi: BuilderCtx): WhereFoldOptions {
   return {
     notNull: {
-      foreignKeys: qi.dialect.name !== 'sqlite',
+      foreignKeys: qi.dialect.capabilities.enforcesForeignKeys,
       hasGlobalFilter: (table) => qi.globalFilters !== undefined && Object.hasOwn(qi.globalFilters, table),
     },
   };
@@ -1296,13 +1296,13 @@ export function buildScalarClause(
  * bare array only ever refuses, so it changes no SQL).
  */
 function isBareJsonDocument(qi: BuilderCtx, pgType: string, value: unknown): boolean {
-  if (qi.dialect.name === 'postgresql' || operandColumnKind(pgType) !== 'json') return false;
+  if (qi.dialect.capabilities.jsonDocumentEquality === 'jsonb' || operandColumnKind(pgType) !== 'json') return false;
   return isPlainRecord(value) || (Array.isArray(value) && !comparesJsonDocuments(qi));
 }
 
 /** Whether the engine compares two whole JSON documents exactly (key order and whitespace aside). */
 function comparesJsonDocuments(qi: BuilderCtx): boolean {
-  return qi.dialect.name === 'postgresql' || qi.dialect.name === 'mysql';
+  return qi.dialect.capabilities.jsonDocumentEquality !== 'text';
 }
 
 /** A bind callback for the build passes: pushes the value and returns its placeholder. */
@@ -1969,7 +1969,9 @@ export function coerceWhereOperand(qi: BuilderCtx, meta: TableMetadata, column: 
     const coerced = coerceTemporalValue(dbType, value, utcDateTimeRewrite(qi, dbType));
     return Array.isArray(coerced) ? textComparedList(qi, dbType, coerced) : coerced;
   }
-  if (qi.dialect.name !== 'mysql' || typeof value === 'string' || typeof value === 'object') return value;
+  if (!qi.dialect.capabilities.numericTextComparison || typeof value === 'string' || typeof value === 'object') {
+    return value;
+  }
   return textComparedOperand(qi, pgTypeForColumn(qi, meta, column), value);
 }
 
@@ -2017,7 +2019,7 @@ export function textComparedOperand(
   columnType: string | undefined,
   value: unknown,
 ): unknown {
-  if (qi.dialect.name !== 'mysql') return value;
+  if (!qi.dialect.capabilities.numericTextComparison) return value;
   if (typeof value !== 'number' && typeof value !== 'bigint' && typeof value !== 'boolean') return value;
   if (columnType === undefined || !TEXT_COMPARED_TYPES.has(columnType.toLowerCase())) return value;
   return typeof value === 'boolean' ? (value ? '1' : '0') : String(value);
@@ -2025,7 +2027,7 @@ export function textComparedOperand(
 
 /** {@link textComparedOperand} for each element of an `in` / `notIn` list; the list itself when none changes. */
 function textComparedList(qi: BuilderCtx, columnType: string | undefined, list: unknown[]): unknown[] {
-  if (qi.dialect.name !== 'mysql') return list;
+  if (!qi.dialect.capabilities.numericTextComparison) return list;
   let out: unknown[] | undefined;
   for (let i = 0; i < list.length; i++) {
     const next = textComparedOperand(qi, columnType, list[i]);
@@ -2047,7 +2049,7 @@ function textComparedList(qi: BuilderCtx, columnType: string | undefined, list: 
  */
 export function utcDateTimeRewrite(qi: BuilderCtx, dbType: string | undefined): boolean {
   if (qi.utcTimestamps === false) return false;
-  return qi.dialect.name === 'postgresql' || localDateTimeKind(dbType) === 'date';
+  return qi.dialect.capabilities.utcTimestampRewrite || localDateTimeKind(dbType) === 'date';
 }
 
 /**
@@ -2060,13 +2062,13 @@ export function utcDateTimeRewrite(qi: BuilderCtx, dbType: string | undefined): 
  * value as text and Postgres refuses the implicit text→enum coercion
  * ("column X is of type Y but expression is of type text").
  *
- * Postgres-only by construction: gated on the active dialect being
- * `postgresql` AND on `schema.enums` having entries (only PG introspection
- * produces them, `defineSchema` and the other engines leave it empty), so
- * SQLite/MySQL/MSSQL/PowDB output is byte-identical.
+ * Postgres-only by construction: gated on the engine having named enum types
+ * (`namedEnumTypes`) AND on `schema.enums` having entries (only PG
+ * introspection produces them, `defineSchema` and the other engines leave it
+ * empty), so SQLite/MySQL/MSSQL/PowDB output is byte-identical.
  */
 export function enumTypeForColumn(qi: BuilderCtx, column: string): string | null {
-  if (qi.dialect.name !== 'postgresql') return null;
+  if (!qi.dialect.capabilities.namedEnumTypes) return null;
   const enums = qi.schema.enums;
   if (!enums) return null;
   // Cross-schema guard: introspection records pgTypeSchema ONLY when
@@ -2635,7 +2637,7 @@ function insensitiveInClause(
  * every other gate in this module.
  */
 function requireInsensitiveList(qi: BuilderCtx, column: string, operator: 'in' | 'notIn'): void {
-  if (qi.dialect.name === 'postgresql') return;
+  if (qi.dialect.capabilities.insensitiveInList) return;
   throw new UnsupportedFeatureError(
     `mode: 'insensitive' on \`${operator}\` (${column})`,
     qi.dialect.name,
@@ -2746,9 +2748,9 @@ function jsonPathEqualsValue(value: unknown, column: string): unknown {
   return scalar;
 }
 
-/** The engine's typed `{ path, equals }` hook; PostgreSQL's form lives here, so it never takes one. */
+/** The engine's typed `{ path, equals }` hook; the jsonb form lives here, so an engine using it never takes one. */
 function jsonPathEqualsHook(qi: BuilderCtx): Dialect['buildJsonPathEquals'] {
-  return qi.dialect.name === 'postgresql' ? undefined : qi.dialect.buildJsonPathEquals;
+  return qi.dialect.capabilities.jsonDocumentEquality === 'jsonb' ? undefined : qi.dialect.buildJsonPathEquals;
 }
 
 /** The hook input, identical on the build and collect passes but for `column`, `pathRef` and `bind`. */
@@ -2788,7 +2790,7 @@ function jsonDocumentEquals(
   bind: (value: unknown) => string,
 ): string {
   const v = jsonPathEqualsValue(value, label);
-  if (qi.dialect.name === 'postgresql') {
+  if (qi.dialect.capabilities.jsonDocumentEquality === 'jsonb') {
     return `${column}::jsonb = ${bind(typeof v === 'bigint' ? v.toString() : JSON.stringify(v))}::jsonb`;
   }
   const hook = qi.dialect.buildJsonPathEquals;
@@ -2861,7 +2863,7 @@ const NO_JSON_NEGATION: unique symbol = Symbol('no JSON negation');
  */
 export function jsonPathEqualsOperand(qi: BuilderCtx, value: unknown, column: string): unknown {
   const scalar = jsonPathEqualsValue(value, column);
-  if (qi.dialect.name === 'postgresql') {
+  if (qi.dialect.capabilities.jsonDocumentEquality === 'jsonb') {
     return typeof scalar === 'bigint' ? scalar.toString() : JSON.stringify(scalar);
   }
   if (scalar === null || typeof scalar === 'object') {
@@ -2872,7 +2874,7 @@ export function jsonPathEqualsOperand(qi: BuilderCtx, value: unknown, column: st
         'the comparison would match no row. Compare a scalar at a deeper path, or run the query on PostgreSQL.',
     );
   }
-  if (qi.dialect.name === 'sqlite') {
+  if (qi.dialect.capabilities.jsonExtractTyped) {
     if (typeof scalar === 'number') return scalar;
     if (typeof scalar === 'boolean') {
       throw new UnsupportedFeatureError(
@@ -2938,7 +2940,7 @@ export function buildJsonFilterClauses(
       const value = jsonPathEqualsOperand(qi, filter.equals, column);
       params.push(value);
       clauses.push(
-        qi.dialect.name === 'postgresql'
+        qi.dialect.capabilities.jsonDocumentEquality === 'jsonb'
           ? `(${column} #> ${ref}::text[])::jsonb = ${qi.p(params.length)}::jsonb`
           : `${qi.dialect.buildJsonPathExtract(column, ref)} = ${qi.p(params.length)}`,
       );
@@ -3023,7 +3025,7 @@ export function jsonPathParam(qi: BuilderCtx, path: readonly (string | number)[]
  * SQL Server have no `::` operator) as a float cast.
  */
 export function castJsonNumeric(qi: BuilderCtx, extract: string): string {
-  if (qi.dialect.name === 'postgresql') return `(${extract})::numeric`;
+  if (qi.dialect.capabilities.jsonExactNumericCast) return `(${extract})::numeric`;
   return qi.dialect.castAggregate ? qi.dialect.castAggregate(`(${extract})`, 'float') : `(${extract})::numeric`;
 }
 

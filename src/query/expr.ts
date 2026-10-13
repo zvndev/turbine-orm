@@ -618,10 +618,8 @@ export function compileSetExpr(env: ExprCompileEnv, value: SqlExpr | ColumnRef):
   return { sql: part.sql, fingerprint: part.fp, reads: state.reads };
 }
 
-const ENGINES: ReadonlySet<string> = new Set(['postgresql', 'mysql', 'sqlite', 'mssql']);
-
 function assertEngine(qi: BuilderCtx): void {
-  if (ENGINES.has(qi.dialect.name)) return;
+  if (qi.dialect.capabilities.updateExpressions) return;
   throw new UnsupportedFeatureError(
     'update expressions (expr / col() in update data)',
     qi.dialect.name,
@@ -708,11 +706,11 @@ function walkNode(state: WalkState, node: SqlExpr, inArithmetic: boolean, depth:
       }
       const [a, b] = node.args.map((arg) => walkOperand(state, arg, true, depth + 1)) as [Part, Part];
       const result = combineClasses([a.cls, b.cls]);
-      // MySQL's `/` is decimal division even between integers, so integer
-      // division is DIV there (truncating toward zero, like PostgreSQL's,
-      // SQLite's and SQL Server's `/` on integers).
+      // Integer division is the engine's truncating operator: DIV on MySQL,
+      // whose `/` is decimal division even between integers (truncating
+      // toward zero, like PostgreSQL's, SQLite's and SQL Server's `/`).
       const op =
-        node.kind === 'div' && result === 'int' && qi.dialect.name === 'mysql' ? 'DIV' : ARITHMETIC_SQL[node.kind];
+        node.kind === 'div' && result === 'int' ? qi.dialect.capabilities.integerDivision : ARITHMETIC_SQL[node.kind];
       return { sql: `(${a.sql} ${op} ${b.sql})`, fp: `${node.kind}(${a.fp},${b.fp})`, cls: result };
     }
     case 'coalesce': {

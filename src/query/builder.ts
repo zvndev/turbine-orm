@@ -704,30 +704,18 @@ const JSON_ENCODINGS: readonly JsonEncoding[] = Object.freeze(['object', 'positi
 /**
  * The relation JSON encoding a client on `dialect` gets when it names none.
  *
- * `'positional'` (`json_build_array`) on PostgreSQL, `'object'`
- * (`json_build_object`) everywhere else. The positional form drops the repeated
- * key names from every relation row: measured on a 50-parent / ~10-child read
- * against local PostgreSQL 17, server time 0.685 ms → 0.350 ms and 152 KB →
- * 100 KB on the wire, returning byte-identical parsed rows.
+ * `'positional'` (`json_build_array`) where the engine has it (PostgreSQL),
+ * `'object'` (`json_build_object`) everywhere else. The positional form drops
+ * the repeated key names from every relation row: measured on a 50-parent /
+ * ~10-child read against local PostgreSQL 17, server time 0.685 ms → 0.350 ms
+ * and 152 KB → 100 KB on the wire, returning byte-identical parsed rows.
  *
- * ## Why the test is `dialect.name`, not "does the dialect have buildJsonArray"
- *
- * Because a presence test does not distinguish engines HERE. `buildJsonArray`
- * is declared on `postgresDialect`, and sqlite.ts / mysql.ts / mssql.ts /
- * powdb.ts each build their dialect by SPREADING it, so every engine inherits
- * the hook and an "is it absent" fallback never fires. That is the documented
- * inheritance trap (see `buildPartitionLimit` in {@link
- * QueryInterface.batchedContext} and the `distinct` gate in
- * {@link QueryInterface.buildFindMany}), and it is exactly the shape that
- * silently turned the partition-limit window on for SQLite.
- *
- * A new capability flag would work, but only if every engine set it
- * explicitly, and it would be a SECOND authority on the same question:
- * `buildSelectWithRelations` (relations.ts) already refuses `'positional'` with
- * E017 on `dialect.name !== 'postgresql'`. Deriving the default from the
- * identical predicate is what makes it impossible for the default to select an
- * encoding the builder then refuses. A flag could drift from that refusal; this
- * cannot.
+ * Read from `capabilities.positionalJson`, never from whether the dialect has
+ * `buildJsonArray`: that hook is on `postgresDialect` and every engine inherits
+ * it by spreading, so a presence test would hand every engine the positional
+ * default. `buildSelectWithRelations` (relations.ts) refuses `'positional'` on
+ * the SAME flag, so the default can never select an encoding the builder then
+ * refuses: one authority, not two.
  *
  * A wire-compatible engine that reaches this on `postgresDialect` itself
  * (CockroachDB, YugabyteDB, AlloyDB, Timescale, all of which are ADAPTERS over
@@ -735,7 +723,7 @@ const JSON_ENCODINGS: readonly JsonEncoding[] = Object.freeze(['object', 'positi
  * which is correct: they speak `json_build_array`.
  */
 function defaultJsonEncoding(dialect: Dialect): JsonEncoding {
-  return dialect.name === 'postgresql' ? 'positional' : 'object';
+  return dialect.capabilities.positionalJson ? 'positional' : 'object';
 }
 
 // ---------------------------------------------------------------------------
@@ -1082,7 +1070,11 @@ export class QueryInterface<
     this.dialect = options?.dialect ?? postgresDialect;
     this.sqlCommenter =
       options?._sqlCommenter ??
-      resolveSqlComment(options?.sqlComment, this.logger, { dialect: this.dialect.name, buildsSql: true });
+      resolveSqlComment(options?.sqlComment, this.logger, {
+        dialect: this.dialect.name,
+        preparesEveryStatement: this.dialect.capabilities.preparesEveryStatement,
+        buildsSql: true,
+      });
     if (
       options?.relationLoadStrategy !== undefined &&
       !RELATION_LOAD_STRATEGIES.includes(options.relationLoadStrategy as never)
@@ -1268,7 +1260,7 @@ export class QueryInterface<
   private warnUntypedColumns(): void {
     const log = this.advice;
     if (!log) return;
-    if (this.dialect.name !== 'postgresql') return;
+    if (!this.dialect.capabilities.utcTimestampRewrite) return;
     const untyped: string[] = [];
     for (const col of this.tableMeta.columns) {
       if (this.columnPgTypeMap.get(col.name) === undefined) untyped.push(col.name);
@@ -1762,18 +1754,21 @@ export class QueryInterface<
     }
     const appended = tiebreak.length > 0;
 
-    // Where NULLs sort, per term; written out on PostgreSQL for a nullable column.
-    const pg = this.dialect.name === 'postgresql';
+    // Where NULLs sort, per term. Where the engine sorts them high (PostgreSQL)
+    // a nullable column's placement is written out, so a Postgres-compatible
+    // engine with a different default reads the order the seek assumes.
+    const { nullsSortHigh, nullsOrderingClause } = this.dialect.capabilities;
+    const pinNulls = nullsSortHigh && nullsOrderingClause;
     let pinned = false;
     for (const t of terms) {
-      if (t.nulls === undefined && t.nullable && pg) {
+      if (t.nulls === undefined && t.nullable && pinNulls) {
         t.nulls = t.desc ? 'first' : 'last';
         t.pin = true;
         pinned = true;
       }
     }
     const nullsFirst = (t: CursorTerm): boolean =>
-      t.nulls !== undefined ? t.nulls === 'first' : pg ? t.desc : !t.desc;
+      t.nulls !== undefined ? t.nulls === 'first' : nullsSortHigh ? t.desc : !t.desc;
 
     let nextArgs = args;
     if (appended || pinned) {
@@ -2435,17 +2430,16 @@ export class QueryInterface<
       // a closure rather than passing `this.dialect` so the loader keeps
       // needing nothing else from the dialect.
       //
-      // The `dialect.name` test is NOT redundant with the hook's presence, and
-      // this is the same trap the `distinct` gate documents: every engine
-      // dialect is built by SPREADING `postgresDialect`, so an optional hook
-      // added there is INHERITED by sqlite / mysql / mssql, whose "absent"
-      // fallback would then never be taken. The wrapper is not portable as
-      // written either (T-SQL rejects an ORDER BY inside a derived table
-      // without TOP/OFFSET, and the compiled child query carries one), so the
-      // pushdown stays with the dialect that owns the implementation until
-      // another engine ships its own and asserts it.
+      // The capability is NOT redundant with the hook's presence: every engine
+      // dialect is built by SPREADING `postgresDialect`, so the hook is
+      // INHERITED by sqlite / mysql / mssql, whose "absent" fallback would then
+      // never be taken. The wrapper is not portable as written either (T-SQL
+      // rejects an ORDER BY inside a derived table without TOP/OFFSET, and the
+      // compiled child query carries one), so the pushdown stays with the
+      // dialect that owns the implementation until another engine ships its own
+      // and asserts it.
       buildPartitionLimit:
-        this.dialect.name === 'postgresql' && this.dialect.buildPartitionLimit
+        this.dialect.capabilities.partitionLimitPushdown && this.dialect.buildPartitionLimit
           ? (input) => this.dialect.buildPartitionLimit!(input)
           : undefined,
       skipGlobalFilters: skip,
@@ -2966,7 +2960,7 @@ export class QueryInterface<
     if (timeout !== undefined && pool === this.pool && this.cancelsOnTimeout()) {
       return this.queryCancellable(out, params, timeout, retryIfStale, action);
     }
-    if (timeout !== undefined && pool === this.pool && this.txScoped && this.dialect.name === 'postgresql') {
+    if (timeout !== undefined && pool === this.pool && this.txScoped && this.dialect.capabilities.backendCancel) {
       const state = transactionStateOf(this.pool);
       if (state !== undefined && canCancelBackend(state.client)) {
         return this.queryCancellableInTransaction(out, params, timeout, state, action);
@@ -3069,12 +3063,13 @@ export class QueryInterface<
   }
 
   /**
-   * Whether a timed statement can be stopped on the server: PostgreSQL on a
-   * node-postgres pool, outside a transaction (inside one, the connection
-   * belongs to the transaction and is not this method's to cancel or destroy).
+   * Whether a timed statement can be stopped on the server: an engine with a
+   * protocol cancel (PostgreSQL) on a node-postgres pool, outside a transaction
+   * (inside one, the connection belongs to the transaction and is not this
+   * method's to cancel or destroy).
    */
   private cancelsOnTimeout(): boolean {
-    return !this.txScoped && this.dialect.name === 'postgresql' && isNodePostgresPool(this.pool);
+    return !this.txScoped && this.dialect.capabilities.backendCancel && isNodePostgresPool(this.pool);
   }
 
   /**
@@ -4213,21 +4208,12 @@ export class QueryInterface<
     // word `ON` and answered with a RAW driver error carrying no TURBINE_ code
     // (SQLite: `near "ON": syntax error`; MySQL: ER_PARSE_ERROR), i.e. the one
     // shape the typed-error surface exists to prevent. Refused with the same
-    // E017 the OTHER spelling of this feature already used, `groupBy({
-    // distinctOn })` in aggregates.ts, which was gated correctly all along.
-    //
-    // `dialect.name` rather than a new capability flag, deliberately, and this
-    // is the exception to the "capability flags, not engine names" rule the
-    // rest of the dialect follows: every engine dialect is built by SPREADING
-    // `postgresDialect`, so a flag defaulting to `true` would be inherited by
-    // all of them (which is the bug) and one defaulting to `false` would have
-    // to be re-declared on Postgres-compatible dialects that already work.
-    // The established precedent for exactly this feature is the `dialect.name`
-    // test in `buildDistinctOnSource`.
+    // E017, on the same `distinctOn` capability, as the OTHER spelling of this
+    // feature, `groupBy({ distinctOn })` in aggregates.ts.
     //
     // Before the cache, like the two guards below, so a warmed template cannot
     // serve the query the cold path refuses.
-    if (args?.distinct && args.distinct.length > 0 && this.dialect.name !== 'postgresql') {
+    if (args?.distinct && args.distinct.length > 0 && !this.dialect.capabilities.distinctOn) {
       throw new UnsupportedFeatureError(
         'DISTINCT ON (findMany distinct)',
         this.dialect.name,
@@ -4736,7 +4722,7 @@ export class QueryInterface<
     // also carries the server-side limit (see streamBackstopStatement), and the
     // guard keeps a live consumer's transaction from looking idle to it.
     const watched = held !== null && idleTimeoutMs > 0;
-    const backstop = watched && this.dialect.name === 'postgresql';
+    const backstop = watched && this.dialect.capabilities.idleTransactionTimeout;
     let guard: StreamIdleGuard | undefined;
     const conn = watched
       ? watchStreamConnection(
@@ -5188,11 +5174,16 @@ export class QueryInterface<
       // refuses instead.)
       const { chunks, rowsPerChunk } = writesMod.planCreateMany(this.ctx, base, projection);
       const run = async (): Promise<FieldResult<T, S, O>[]> => {
-        // SQLite applies two rows whose onConflict keys are equal only under the
-        // column's collation (NOCASE) as an insert and an update of one row, in
-        // one statement; the transform sees it (the row comes back twice) and
-        // refuses, so the statement runs in a transaction that refusal rolls back.
-        if (chunks.length === 1 && !(base.onConflict !== undefined && this.dialect.name === 'sqlite')) {
+        // An engine that applies two rows whose onConflict keys are equal only
+        // under the column's collation (SQLite's NOCASE) as an insert and an
+        // update of one row, in one statement, is caught by the transform (the
+        // row comes back twice), so the statement runs in a transaction that
+        // refusal rolls back. A reselect write already runs in one.
+        const appliesRepeatedKeys =
+          base.onConflict !== undefined &&
+          this.dialect.capabilities.bulkUpsertAppliesRepeatedKeys &&
+          this.dialect.resultStrategy !== 'reselect';
+        if (chunks.length === 1 && !appliesRepeatedKeys) {
           return this.executeMutation(chunks[0]!, args.timeout) as Promise<FieldResult<T, S, O>[]>;
         }
         const reselects = this.dialect.resultStrategy === 'reselect';

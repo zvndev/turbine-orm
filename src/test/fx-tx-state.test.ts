@@ -622,8 +622,12 @@ describe('raw SQL that ends or reshapes the transaction', () => {
 
   it('a stateless engine without SQL transaction control (no syntax) is not screened', async () => {
     const fake = fakeServer({ abortsOnError: false });
-    // A dialect name no lexer exists for: PowDB's PowQL has its own statements.
-    const db = clientOn(fake, { ...mysqlDialect, name: 'powdb' });
+    // No statement syntax, so no lexer: PowDB's PowQL has its own statements.
+    const db = clientOn(fake, {
+      ...mysqlDialect,
+      name: 'powdb',
+      capabilities: { ...mysqlDialect.capabilities, statementSyntax: null },
+    });
     await db
       .$transaction(async (tx) => {
         await tx.rawUnsafe('COMMIT');

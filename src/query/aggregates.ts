@@ -667,7 +667,7 @@ export function buildDistinctOnSource<T extends object>(
   whereSql: string,
   params: unknown[],
 ): string {
-  if (qi.dialect.name !== 'postgresql') {
+  if (!qi.dialect.capabilities.distinctOn) {
     throw new UnsupportedFeatureError(
       'DISTINCT ON row source (groupBy distinctOn)',
       qi.dialect.name,
