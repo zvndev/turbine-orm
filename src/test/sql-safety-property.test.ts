@@ -128,9 +128,11 @@ describe('SQL safety, adversarial injection corpus (table-driven)', () => {
       });
 
       assert.ok(!deferred.sql.includes(payload), `LIKE payload leaked: ${payload}`);
-      const paramWithEscape = deferred.params.find(
-        (p) => typeof p === 'string' && p.includes(payload.replace(/%/g, '\\%').replace(/_/g, '\\_')),
-      );
+      // The oracle escapes `\`, `%` and `_` in ONE pass, like the LIKE `ESCAPE '\'`
+      // clause the builder pairs with it; a chain of `.replace` calls that skips
+      // the backslash would accept a half-escaped operand.
+      const escaped = payload.replace(/[\\%_]/g, '\\$&');
+      const paramWithEscape = deferred.params.find((p) => p === `%${escaped}%`);
       assert.ok(paramWithEscape !== undefined, `Escaped payload should be in params for: ${payload}`);
     }
   });

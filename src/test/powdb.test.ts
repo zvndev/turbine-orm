@@ -156,7 +156,7 @@ function mockPool(caps: PowdbCapabilities = ALL_POWDB_CAPABILITIES) {
       // upsert (no `returning`) and bulk update/delete return an affected count.
       if (/\breturning$/.test(powql)) return Promise.resolve({ rows: nextRows, rowCount: nextRows.length });
       if (head.startsWith('upsert')) return Promise.resolve({ rows: [], rowCount: 1 });
-      if (/ update \{| delete$/.test(powql)) return Promise.resolve({ rows: [], rowCount: 1 });
+      if (/(?: update \{| delete$)/.test(powql)) return Promise.resolve({ rows: [], rowCount: 1 });
       if (/^(count|sum|avg|min|max)\(/.test(head))
         return Promise.resolve({ rows: [{ value: nextScalar }], rowCount: 1 });
       return Promise.resolve({ rows: nextRows, rowCount: nextRows.length });

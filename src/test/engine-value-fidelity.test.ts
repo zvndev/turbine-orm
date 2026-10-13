@@ -669,7 +669,8 @@ describe("errorMessages: 'safe' withholds row values that live in the driver mes
     // Still diagnostic: the constraint NAME survives, and so does the code.
     assert.equal((wrapped as { constraint?: string }).constraint, 'email');
     assert.equal((wrapped as { code?: string }).code, 'TURBINE_E008');
-    assert.match((wrapped.cause as Error).message, new RegExp(REDACTED_DETAIL.replace(/[[\]"]/g, '\\$&')));
+    const causeMessage = (wrapped.cause as Error).message;
+    assert.ok(causeMessage.includes(REDACTED_DETAIL), causeMessage);
   });
 
   it('SQL Server: no row value survives anywhere on the thrown error', async () => {

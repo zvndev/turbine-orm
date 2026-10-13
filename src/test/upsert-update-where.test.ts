@@ -43,6 +43,11 @@ function schema(): SchemaMetadata {
   };
 }
 
+/** Escape every regular-expression metacharacter, so a placeholder is matched literally. */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /**
  * Every placeholder the dialect can emit, indexed. Built from the dialect's own
  * `paramPlaceholder`, so `$1` / `:p1` / `@p1` are all covered without
@@ -53,7 +58,7 @@ function placeholderIndexes(dialect: Dialect, sql: string, upTo: number): Set<nu
   for (let i = 1; i <= upTo; i++) {
     const ph = dialect.paramPlaceholder(i);
     // A word boundary stops `:p1` from matching inside `:p10`.
-    if (new RegExp(`${ph.replace(/[$@]/g, '\\$&')}(?![0-9])`).test(sql)) found.add(i);
+    if (new RegExp(`${escapeRegExp(ph)}(?![0-9])`).test(sql)) found.add(i);
   }
   return found;
 }

@@ -180,7 +180,7 @@ function mockPool(opts: MockOptions = {}) {
     query(powql: string, params: unknown[]) {
       calls.push({ powql, params });
       if (/\breturning$/.test(powql)) return Promise.resolve({ rows, rowCount: rows.length });
-      if (/ update \{| delete$/.test(powql)) return Promise.resolve({ rows: [], rowCount: 1 });
+      if (/(?: update \{| delete$)/.test(powql)) return Promise.resolve({ rows: [], rowCount: 1 });
       return Promise.resolve({ rows, rowCount: rows.length });
     },
     connect() {
