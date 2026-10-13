@@ -336,7 +336,7 @@ src/
                       `createMany`: it validates every row once, then `rowsPerStatement`
                       measures the per-row parameter cost from one-row and two-row builds
                       and caps it by `maxBindParameters` and, for a plain INSERT,
-                      `dialect.maxInsertRows`, so chunks are sized before any statement is
+                      `capabilities.maxInsertRows`, so chunks are sized before any statement is
                       built and no engine's own per-statement check refuses one. The MySQL
                       reselect (0.90) re-reads a `create` only by a key whose value is known
                       EXACTLY (a supplied primary key, the driver's insert id for a
@@ -1086,7 +1086,7 @@ src/
                         (`begin/commit/rollback/savepoint/buildSetSessionConfig`).
                       • `capabilities: EngineCapabilities` (0.90), REQUIRED: what the engine
                         can do, one fresh frozen literal per engine
-                        (`Object.freeze({ ... } satisfies EngineCapabilities)`), 32 keys:
+                        (`Object.freeze({ ... } satisfies EngineCapabilities)`), 33 keys:
                         query shape (`distinctOn`, `positionalJson`, `nullsOrderingClause`,
                         `nullsSortHigh`, `insensitiveInList`), value semantics
                         (`jsonDocumentEquality`, `jsonExtractTyped`, `jsonExactNumericCast`,
@@ -1099,7 +1099,8 @@ src/
                         connections and transactions (`readOnlyTransactions`,
                         `connectionParameters`, `backendCancel`, `idleTransactionTimeout`,
                         `abortsTransactionOnError`, `connectionDriver`,
-                        `preparesEveryStatement`) and DDL (`inlineForeignKeys`,
+                        `preparesEveryStatement`, `statementSyntax`, which picks the lexer
+                        transaction-state.ts screens raw SQL with) and DDL (`inlineForeignKeys`,
                         `unboundedTextKeys`). Every site that asked `dialect.name ===
                         '<engine>'` a capability question reads its key instead, so a
                         dialect built from an engine dialect under another name gets that
@@ -1119,7 +1120,7 @@ src/
                         switch, `Set.has` or keyed lookup, and any comparison with an engine
                         name literal, outside a commented allowlist (expr.ts GREATEST /
                         LEAST / now() rendering, schema-sql.ts DEFAULT spelling, two
-                        error-hint lookups, the statement lexers); a stale allowlist entry
+                        error-hint lookups, grammar branches inside the statement lexers); a stale allowlist entry
                         fails too. The `supports*` flags below are still top-level and
                         inherited; moving them in is 0.91 work.
                       • Capability flags, `supportsReturning`, `supportsVector`,
@@ -1161,10 +1162,8 @@ src/
                         `dialectDecodeCache` as a `CELL_DIALECT` cell, so top-level and
                         nested rows decode the same way; it keys on the METADATA type, so a
                         schema introspected from SQL Server (`nvarchar`) still reads text.
-                        `maxInsertRows` (SQL Server: 1000) caps the rows of a plain
-                        `INSERT ... VALUES`, read by writes.ts `rowsPerStatement`; an
-                        `onConflict` MERGE reads its rows as a derived table and is not
-                        bound by it. `checkTextWrite(table, column, columnType, value)`
+                        (The SQL Server row cap of a plain `INSERT ... VALUES` is
+                        `capabilities.maxInsertRows`, above.) `checkTextWrite(table, column, columnType, value)`
                         (SQLite only) returns a refusal for a string SQLite's type affinity
                         would store as TEXT in a numeric or boolean column; writes.ts
                         `coerceWriteValue` throws it as E003. Presence-gated, which is sound
@@ -1173,7 +1172,7 @@ src/
                       • `buildEnumColumn(column, labels)` (0.90): MySQL inline `ENUM(...)`,
                         SQLite `TEXT` + CHECK, SQL Server `NVARCHAR` + CHECK over `N'...'`.
                         `schemaToSQL` emits `CREATE TYPE ... AS ENUM` only when
-                        `dialect.name === 'postgresql'`; any other engine without the hook
+                        `capabilities.namedEnumTypes`; any other engine without the hook
                         gets E017 for an enum column (the inheritance trap again). Off
                         PostgreSQL an undeclared enum or an empty label list is E003, an
                         enum array E017, and a MySQL label with a backslash E003.
@@ -1213,7 +1212,8 @@ src/
                         in bytes over the wire (measured, 200 parents x ~505 children
                         with `limit: 3`, 101,000 rows fetched to keep 600, +52.9 MB
                         peak heap against +0.5 MB for the join plan). PostgreSQL only
-                        in this release; the other engines' emitted SQL is unchanged.
+                        in this release (gated on `capabilities.partitionLimitPushdown`);
+                        the other engines' emitted SQL is unchanged.
                         The client-side slice is KEPT as the belt-and-braces bound and
                         is a no-op once the engine has already limited each partition.
                       • THE INHERITANCE TRAP, and the rule that follows from it: EVERY
@@ -1223,11 +1223,16 @@ src/
                         INHERITED by all of them and an "is the hook absent" fallback
                         NEVER FIRES. Hit live: the first `buildPartitionLimit` silently
                         enabled the window wrapper on SQLite. It is the same trap
-                        behind the `DISTINCT ON` blocker. So gate a Postgres-only hook
-                        on `dialect.name === 'postgresql'`, never on hook presence (see
-                        the `buildPartitionLimit` wiring in query/builder.ts); a
-                        capability FLAG that each engine sets explicitly is the other
-                        sound shape.
+                        behind the `DISTINCT ON` blocker. So ask a capability question
+                        of `dialect.capabilities` (add a key to `EngineCapabilities` and
+                        set it in every engine's literal), never of hook presence and
+                        never of `dialect.name`: a name test hands a PostgreSQL-compatible
+                        dialect under another name the non-PostgreSQL answer, and the
+                        capabilities guard test refuses a new one. `dialect.name` is left
+                        for RENDERING (which SQL text an engine spells), error text and
+                        the lexers, each allowlisted with its reason. Those rendering
+                        switches become per-engine hooks once engines stop spreading
+                        `postgresDialect` (0.91).
 
   sqlite.ts        , `turbine-orm/sqlite` engine. `turbineSqlite(path | ':memory:' |
                       DatabaseSync, schema, options?)`, synchronous, zero new dependency
@@ -1279,7 +1284,7 @@ src/
                       peer `mssql` (dynamic import). `mssqlDialect` uses `resultStrategy:
                       'output'` (`OUTPUT INSERTED.*` / `MERGE`), `FOR JSON PATH` nested
                       relations (`buildRelationSubquery` override), `OFFSET/FETCH` paging,
-                      and named `@pN` placeholders. 0.90: `maxInsertRows: 1000` (a larger
+                      and named `@pN` placeholders. 0.90: `capabilities.maxInsertRows: 1000` (a larger
                       `createMany` is chunked in one transaction instead of throwing),
                       `decodeColumnValue` parses json/jsonb, and `averageArgument` makes
                       `_avg` over an integer fractional (FLOAT, or DECIMAL(38,0) for BIGINT
