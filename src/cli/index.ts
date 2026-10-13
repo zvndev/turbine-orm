@@ -35,7 +35,6 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -1678,42 +1677,92 @@ DATABASE_URL=postgres://user:password@localhost:5432/database
  * @internal exported for tests.
  */
 export function scaffoldEnvForUrl(url: string): EnvScaffoldPlan {
+  // The plan is read from disk and the writes come after it, so a file can
+  // appear in between. Creation is exclusive (see createFileExclusive); when it
+  // loses, plan again from what is there now. The cap only ends the loop for a
+  // name that cannot be read but cannot be created either, a dangling symlink.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const plan = applyEnvScaffold(url);
+    if (plan) return plan;
+  }
+  throw new ValidationError(
+    'Could not write .env, .env.example and .gitignore: one of those names is taken by something that cannot be read ' +
+      '(a dangling symlink?). Remove it and run the command again.',
+  );
+}
+
+/** One planning pass plus its writes; undefined when a create found its name already taken. */
+function applyEnvScaffold(url: string): EnvScaffoldPlan | undefined {
   const envPath = '.env';
   const envExamplePath = '.env.example';
   const gitignorePath = '.gitignore';
 
-  const envExists = existsSync(envPath);
+  const env = readIfPresent(envPath);
+  const gitignore = readIfPresent(gitignorePath);
   const plan = planEnvScaffold({
-    envExists,
-    envHasDatabaseUrl: envExists ? /^\s*(export\s+)?DATABASE_URL\s*=/m.test(readFileSync(envPath, 'utf-8')) : false,
-    envExampleExists: existsSync(envExamplePath),
-    gitignoreExists: existsSync(gitignorePath),
-    gitignoreIgnoresEnv: existsSync(gitignorePath) ? gitignoreIgnoresEnv(readFileSync(gitignorePath, 'utf-8')) : false,
+    envExists: env !== undefined,
+    envHasDatabaseUrl: env !== undefined && /^\s*(export\s+)?DATABASE_URL\s*=/m.test(env),
+    envExampleExists: readIfPresent(envExamplePath) !== undefined,
+    gitignoreExists: gitignore !== undefined,
+    gitignoreIgnoresEnv: gitignore !== undefined && gitignoreIgnoresEnv(gitignore),
   });
 
   // .gitignore FIRST: the ignore rule has to exist before the file holding the
   // password does, or a `git add -A` in between commits it.
-  if (plan.gitignore === 'created') writeFileSync(gitignorePath, '# Local environment (secrets)\n.env\n', 'utf-8');
-  else if (plan.gitignore === 'appended') appendFileSync(gitignorePath, '\n# Local environment (secrets)\n.env\n');
-
-  if (plan.env === 'created') {
-    // 0600 on CREATION only. The whole point of this scaffold is moving a live
-    // password out of a committed file, and the default 0644 would leave it
-    // world-readable to every account on a shared box or CI runner. `mode` is
-    // applied by the OS only when the open() actually creates the file, so if
-    // one appeared since the existsSync above we write into it without widening
-    // or narrowing whatever mode its owner chose.
-    writeFileSync(envPath, `# Turbine database connection. Never commit this file.\nDATABASE_URL=${url}\n`, {
-      encoding: 'utf-8',
-      mode: 0o600,
-    });
-  } else if (plan.env === 'appended') {
-    appendFileSync(envPath, `\n# Added by turbine init\nDATABASE_URL=${url}\n`);
+  if (plan.gitignore === 'created') {
+    if (!createFileExclusive(gitignorePath, '# Local environment (secrets)\n.env\n')) return undefined;
+  } else if (plan.gitignore === 'appended') {
+    appendFileSync(gitignorePath, '\n# Local environment (secrets)\n.env\n');
   }
 
-  if (plan.envExample === 'created') writeFileSync(envExamplePath, ENV_EXAMPLE_TEMPLATE, 'utf-8');
+  // 0600 on CREATION only. The whole point of this scaffold is moving a live
+  // password out of a committed file, and the default 0644 would leave it
+  // world-readable to every account on a shared box or CI runner. `mode` is
+  // applied by the OS only when the open() actually creates the file, so a
+  // `.env` that exists keeps whatever mode its owner chose.
+  if (plan.env === 'created') {
+    const body = `# Turbine database connection. Never commit this file.\nDATABASE_URL=${url}\n`;
+    if (!createFileExclusive(envPath, body, 0o600)) return undefined;
+  } else if (plan.env === 'appended') {
+    appendFileSync(envPath, `\n# Added by turbine init\nDATABASE_URL=${url}\n`, { mode: 0o600 });
+  }
+
+  if (plan.envExample === 'created' && !createFileExclusive(envExamplePath, ENV_EXAMPLE_TEMPLATE)) return undefined;
 
   return plan;
+}
+
+/**
+ * A file's text, or undefined when there is no such file. One read in place of
+ * an existence check followed by a read, so there is no window between the two.
+ * A directory under that name counts as present: the write step then fails on
+ * it by name, which is the error that was always raised.
+ */
+function readIfPresent(path: string): string | undefined {
+  try {
+    return readFileSync(path, 'utf-8');
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT') return undefined;
+    if (code === 'EISDIR') return '';
+    throw err;
+  }
+}
+
+/**
+ * Create `path` only if nothing is there; false when the name is taken.
+ * `wx` is O_CREAT | O_EXCL: the kernel refuses (EEXIST) any existing name,
+ * a symlink included, so a file that appeared after the plan was made is never
+ * truncated and a link planted at the name is never written through.
+ */
+function createFileExclusive(path: string, body: string, mode?: number): boolean {
+  try {
+    writeFileSync(path, body, { encoding: 'utf-8', flag: 'wx', ...(mode === undefined ? {} : { mode }) });
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw err;
+  }
 }
 
 /** Say exactly what was written where, so nobody has to guess where the password went. */
@@ -1757,8 +1806,8 @@ function ensureInitScaffoldDirs(config: ResolvedConfig): void {
   }
 
   const gitignorePath = '.gitignore';
-  if (existsSync(gitignorePath)) {
-    const gitignoreContent = readFileSync(gitignorePath, 'utf-8');
+  const gitignoreContent = readIfPresent(gitignorePath);
+  if (gitignoreContent !== undefined) {
     const additions: string[] = [];
     if (!gitignoreContent.includes('generated/turbine')) additions.push('generated/turbine/');
     if (!gitignoreContent.includes('turbine.config.ts')) additions.push('turbine.config.ts');
@@ -2692,7 +2741,13 @@ export function resolveMigrateFromPrismaUrl(
  * concatenation, so each file is introduced by a comment naming it.
  */
 export function readPrismaSchemaSource(path: string): string {
-  if (!statSync(path).isDirectory()) return readFileSync(path, 'utf-8');
+  // Read first, ask what it is only if that fails: a stat followed by a read
+  // can disagree with itself when the path is replaced in between.
+  try {
+    return readFileSync(path, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EISDIR') throw err;
+  }
   const files = readdirSync(path)
     .filter((f) => f.endsWith('.prisma'))
     .sort();
@@ -6392,9 +6447,17 @@ function cmdSkill(args: CliArgs): void {
 
   const skillsDir = args.dir ?? join('.claude', 'skills');
   const target = resolve(process.cwd(), skillsDir, 'turbine-orm', 'SKILL.md');
-  const existed = existsSync(target);
   mkdirSync(dirname(target), { recursive: true });
-  writeFileSync(target, body);
+  // Exclusive create first: only the wording depends on whether the file was
+  // there, and asking separately would let the answer go stale before the write.
+  let existed = false;
+  try {
+    writeFileSync(target, body, { flag: 'wx' });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    existed = true;
+    writeFileSync(target, body);
+  }
 
   newline();
   success(`${existed ? 'Updated' : 'Installed'} the Turbine query skill`);

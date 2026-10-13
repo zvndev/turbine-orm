@@ -1000,7 +1000,18 @@ ${autoContent.down}
 `;
   }
 
-  writeFileSync(filePath, template, 'utf-8');
+  // `wx` (create, fail if the name exists): the name carries a one-second
+  // timestamp, so a second create with the same name in that second would
+  // otherwise silently replace the first file, edits included.
+  try {
+    writeFileSync(filePath, template, { encoding: 'utf-8', flag: 'wx' });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    throw new MigrationError(
+      `Migration file ${filename} already exists, and its name is timestamped to the second. ` +
+        'Wait a second and run the command again, or choose a different name.',
+    );
+  }
 
   return {
     filename,
