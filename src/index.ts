@@ -79,6 +79,7 @@ export type {
   DialectIntrospector,
   DialectMigrator,
   DialectName,
+  EngineCapabilities,
   InsertStatementInput,
   IntrospectOptions as DialectIntrospectOptions,
   ResultStrategy,

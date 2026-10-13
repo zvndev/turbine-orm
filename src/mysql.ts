@@ -81,6 +81,7 @@ import {
   type DefaultValuesInsertStatementInput,
   type Dialect,
   type DialectIntrospector,
+  type EngineCapabilities,
   type InsertStatementInput,
   type IntrospectOptions,
   type JsonPathEqualsInput,
@@ -765,6 +766,47 @@ function mysqlKeyLiteral(key: string, dialect: Pick<Dialect, 'escapeStringLitera
 export const mysqlDialect: Dialect = {
   ...postgresDialect,
   name: 'mysql',
+  capabilities: Object.freeze({
+    distinctOn: false,
+    positionalJson: false,
+    nullsOrderingClause: false,
+    nullsSortHigh: false,
+    insensitiveInList: false,
+    jsonDocumentEquality: 'exact',
+    jsonExtractTyped: false,
+    jsonExactNumericCast: false,
+    numericTextComparison: true,
+    enforcesForeignKeys: true,
+    partitionLimitPushdown: false,
+    // A zone-less literal reads in the session time zone; only `date` columns rewrite.
+    utcTimestampRewrite: false,
+    paramTypeCasts: false,
+    namedEnumTypes: false,
+    structuredValueColumns: 'scalars-and-text',
+    // Counted in a 16-bit field.
+    maxBindParameters: 65535,
+    maxInsertRows: Number.POSITIVE_INFINITY,
+    upsertConflictTarget: 'any-unique-key',
+    setClauseOrder: 'left-to-right',
+    reselectLocksRows: true,
+    integerDivision: 'DIV',
+    updateExpressions: true,
+    // Caught by the onConflict re-read, which runs in the reselect transaction.
+    bulkUpsertAppliesRepeatedKeys: true,
+    readOnlyTransactions: true,
+    connectionParameters: false,
+    backendCancel: false,
+    idleTransactionTimeout: false,
+    abortsTransactionOnError: false,
+    connectionDriver: 'engine-driver',
+    // mysql2 execute() prepares each statement text; max_prepared_stmt_count caps them server-wide.
+    preparesEveryStatement: true,
+    statementSyntax: 'mysql',
+    // An inline REFERENCES is parsed and ignored.
+    inlineForeignKeys: false,
+    // TEXT / BLOB need a prefix length in a key (ER_BLOB_KEY_WITHOUT_LENGTH).
+    unboundedTextKeys: false,
+  } satisfies EngineCapabilities),
   // No RETURNING → run the write, then re-SELECT by PK/where (Phase-0 reselect).
   resultStrategy: 'reselect',
   supportsReturning: false,

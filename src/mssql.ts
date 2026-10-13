@@ -109,6 +109,7 @@ import {
   type DeleteStatementInput,
   type Dialect,
   type DialectIntrospector,
+  type EngineCapabilities,
   type InsertStatementInput,
   type IntrospectOptions,
   type JsonPathEqualsInput,
@@ -722,7 +723,45 @@ function mssqlOutput(returning: ReturningSelection | undefined, alias: 'INSERTED
 export const mssqlDialect: Dialect = {
   ...postgresDialect,
   name: 'mssql',
-  maxInsertRows: MSSQL_MAX_INSERT_ROWS,
+  capabilities: Object.freeze({
+    distinctOn: false,
+    positionalJson: false,
+    nullsOrderingClause: false,
+    nullsSortHigh: false,
+    insensitiveInList: false,
+    jsonDocumentEquality: 'text',
+    jsonExtractTyped: false,
+    jsonExactNumericCast: false,
+    numericTextComparison: false,
+    enforcesForeignKeys: true,
+    partitionLimitPushdown: false,
+    utcTimestampRewrite: false,
+    paramTypeCasts: false,
+    namedEnumTypes: false,
+    // No JSON column type: json is NVARCHAR(MAX), so a text column holds JSON.
+    structuredValueColumns: 'scalars',
+    // The limit the driver can actually send (see MSSQL_MAX_PARAMS), not 2100.
+    maxBindParameters: MSSQL_MAX_PARAMS,
+    maxInsertRows: MSSQL_MAX_INSERT_ROWS,
+    upsertConflictTarget: 'explicit',
+    setClauseOrder: 'snapshot',
+    reselectLocksRows: false,
+    integerDivision: '/',
+    updateExpressions: true,
+    // MERGE refuses a target row matched twice (error 8672).
+    bulkUpsertAppliesRepeatedKeys: false,
+    readOnlyTransactions: false,
+    connectionParameters: false,
+    backendCancel: false,
+    idleTransactionTimeout: false,
+    abortsTransactionOnError: false,
+    connectionDriver: 'engine-driver',
+    preparesEveryStatement: false,
+    statementSyntax: 'mssql',
+    inlineForeignKeys: true,
+    // NVARCHAR(MAX) / VARBINARY(MAX) cannot be an index key column.
+    unboundedTextKeys: false,
+  } satisfies EngineCapabilities),
   // No RETURNING → the statement emits its rows via OUTPUT INSERTED.* in ONE
   // round-trip (Phase-0 'output' strategy, executed like 'returning').
   resultStrategy: 'output',
@@ -757,9 +796,6 @@ export const mssqlDialect: Dialect = {
   // Both MERGE forms alias the target `T` (and the incoming rows `S`), so the
   // conflict-UPDATE reads the existing row through `T.`, never the table name.
   upsertTargetAlias: 'T',
-  // Own property, so createMany's chunking and the bind-limit refusal use the
-  // limit the driver can actually send (see MSSQL_MAX_PARAMS), not 2100.
-  maxBindParameters: MSSQL_MAX_PARAMS,
   // sp_getapplock / sp_releaseapplock exist (used by a future migrate adapter).
   supportsAdvisoryLock: true,
   // No in-band EXPLAIN: SQL Server's SHOWPLAN is a session toggle

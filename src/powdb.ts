@@ -63,7 +63,7 @@ import {
   TurbineClient,
   type TurbineConfig,
 } from './client.js';
-import { type Dialect, postgresDialect } from './dialect.js';
+import { type Dialect, type EngineCapabilities, postgresDialect } from './dialect.js';
 import type { EngineClientConfig } from './engine-config.js';
 import {
   ConnectionError,
@@ -143,6 +143,44 @@ export {
 export const powdbDialect: Dialect = {
   ...postgresDialect,
   name: 'powdb',
+  // PowqlInterface compiles PowQL itself and refuses what PowDB lacks; these
+  // answer for the client paths a PowDB client shares (transactions, raw
+  // queries, `tx.$connection()`) and keep every SQL-only feature off.
+  capabilities: Object.freeze({
+    distinctOn: false,
+    positionalJson: false,
+    nullsOrderingClause: false,
+    nullsSortHigh: false,
+    insensitiveInList: false,
+    jsonDocumentEquality: 'text',
+    jsonExtractTyped: false,
+    jsonExactNumericCast: false,
+    numericTextComparison: false,
+    enforcesForeignKeys: true,
+    partitionLimitPushdown: false,
+    utcTimestampRewrite: false,
+    paramTypeCasts: false,
+    namedEnumTypes: false,
+    structuredValueColumns: 'scalars',
+    maxBindParameters: Number.POSITIVE_INFINITY,
+    maxInsertRows: Number.POSITIVE_INFINITY,
+    upsertConflictTarget: 'explicit',
+    setClauseOrder: 'snapshot',
+    reselectLocksRows: false,
+    integerDivision: '/',
+    updateExpressions: false,
+    bulkUpsertAppliesRepeatedKeys: false,
+    readOnlyTransactions: false,
+    connectionParameters: false,
+    backendCancel: false,
+    idleTransactionTimeout: false,
+    abortsTransactionOnError: false,
+    connectionDriver: 'none',
+    preparesEveryStatement: false,
+    statementSyntax: null,
+    inlineForeignKeys: true,
+    unboundedTextKeys: true,
+  } satisfies EngineCapabilities),
   // `resultStrategy` is decorative for PowDB, PowqlInterface owns its own write
   // path and never reads it. Set to 'returning' for honesty: writes use PowDB
   // 0.7.0's trailing `returning` keyword (upsert excepted, see PowqlInterface).

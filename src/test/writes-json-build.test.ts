@@ -12,7 +12,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { Dialect } from '../dialect.js';
-import { maxBindParameters } from '../dialect.js';
+import { maxBindParameters, postgresDialect } from '../dialect.js';
 import { ValidationError } from '../errors.js';
 import { mssqlDialect } from '../mssql.js';
 import { mysqlDialect } from '../mysql.js';
@@ -226,13 +226,14 @@ describe('optimisticLock is refused where it is not applied', () => {
 });
 
 describe('createMany past the bind-parameter limit', () => {
-  it('knows each engine limit, and none for an unknown dialect name', () => {
-    assert.equal(maxBindParameters({ name: 'postgresql' }), 65535);
-    assert.equal(maxBindParameters({ name: 'mysql' }), 65535);
-    assert.equal(maxBindParameters({ name: 'sqlite' }), 32766);
-    assert.equal(maxBindParameters({ name: 'mssql' }), 2098);
-    assert.equal(maxBindParameters({ name: 'toString' }), undefined);
-    assert.equal(maxBindParameters({ name: 'sqlite', maxBindParameters: 999 }), 999);
+  it('knows each engine limit, and none for an engine whose limit is Infinity', () => {
+    assert.equal(maxBindParameters(postgresDialect), 65535);
+    assert.equal(maxBindParameters(mysqlDialect), 65535);
+    assert.equal(maxBindParameters(sqliteDialect), 32766);
+    assert.equal(maxBindParameters(mssqlDialect), 2098);
+    const unlimited = { capabilities: { ...sqliteDialect.capabilities, maxBindParameters: Number.POSITIVE_INFINITY } };
+    assert.equal(maxBindParameters(unlimited), undefined);
+    assert.equal(maxBindParameters({ capabilities: { ...sqliteDialect.capabilities, maxBindParameters: 999 } }), 999);
   });
 
   it('PostgreSQL VALUES form (array column present) refuses with E003, limit and chunk size', () => {

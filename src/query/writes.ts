@@ -293,9 +293,10 @@ function baseColumnType(dbType: string): string {
 
 /** Whether this engine's column of `dbType` refuses a plain object or an array. */
 function refusesStructuredValue(qi: BuilderCtx, dbType: string): boolean {
-  if (qi.dialect.name === 'postgresql') return SCALAR_PG_TYPES.has(dbType.toLowerCase());
+  const columns = qi.dialect.capabilities.structuredValueColumns;
+  if (columns === 'pg-scalars') return SCALAR_PG_TYPES.has(dbType.toLowerCase());
   const t = baseColumnType(dbType);
-  return NON_TEXT_SCALAR_TYPES.has(t) || (qi.dialect.name === 'mysql' && MYSQL_TEXT_TYPES.has(t));
+  return NON_TEXT_SCALAR_TYPES.has(t) || (columns === 'scalars-and-text' && MYSQL_TEXT_TYPES.has(t));
 }
 
 /**
@@ -355,11 +356,11 @@ export function buildReselectByWhere(
 
 /**
  * Row-lock suffix for a read inside a reselect write's transaction, so a
- * concurrent write of the same row waits instead of interleaving. MySQL is the
- * one engine on the reselect strategy; elsewhere nothing is appended.
+ * concurrent write of the same row waits instead of interleaving. Appended
+ * where the engine's reselect locks rows (MySQL); elsewhere nothing is.
  */
 function forUpdate(qi: BuilderCtx): string {
-  return qi.dialect.name === 'mysql' ? ' FOR UPDATE' : '';
+  return qi.dialect.capabilities.reselectLocksRows ? ' FOR UPDATE' : '';
 }
 
 /**
@@ -1038,7 +1039,9 @@ function prepareCreateMany<T extends object>(
   if (conflict) {
     // Over every row, so a chunked call refuses before its first chunk is sent.
     assertNoDuplicateKeys(qi, conflict, columns, rowValues);
-    if (qi.dialect.name === 'mysql') assertMysqlBulkUpsert(qi, conflict, columns, rowValues);
+    if (qi.dialect.capabilities.upsertConflictTarget === 'any-unique-key') {
+      assertMysqlBulkUpsert(qi, conflict, columns, rowValues);
+    }
     identity = conflictIdentity(qi, conflict, projection);
   }
 
@@ -1136,7 +1139,7 @@ function emitCreateMany<T extends object>(
 function rowsPerStatement(qi: BuilderCtx, prepared: PreparedCreateMany): number {
   // An onConflict statement (SQL Server's MERGE) reads its rows as a derived
   // table, which the plain INSERT ... VALUES row cap does not bind.
-  const cap = qi.dialect.maxInsertRows !== undefined && !prepared.conflict ? qi.dialect.maxInsertRows : Infinity;
+  const cap = prepared.conflict ? Infinity : qi.dialect.capabilities.maxInsertRows;
   const limit = maxBindParameters(qi.dialect);
   const rows = prepared.rowValues;
   if (limit === undefined || rows.length < 2) return cap;
@@ -1493,7 +1496,7 @@ function assertMysqlBulkUpsert(
   rowValues: unknown[][],
 ): void {
   const fix = (why: string, hint: string) =>
-    new UnsupportedFeatureError(`createMany onConflict on "${qi.table}" ${why}`, 'mysql', hint);
+    new UnsupportedFeatureError(`createMany onConflict on "${qi.table}" ${why}`, qi.dialect.name, hint);
   if (conflict.update === null) {
     throw fix(
       'with ignore: true',
@@ -1999,8 +2002,12 @@ export function upsertLookupReason<T extends object>(qi: BuilderCtx, args: Upser
   const create = (args.create ?? {}) as Record<string, unknown>;
   if (!upsertWhereMatchesCreate(qi.tableMeta, where, create)) return 'where-differs';
   if (writeEntries(qi, (args.update ?? {}) as Record<string, unknown>).length === 0) return 'empty-update';
-  // By name, not by a hook: every engine dialect spreads postgresDialect.
-  if (qi.dialect.name === 'mysql' && upsertCreateCollidingKey(qi.tableMeta, where, create)) return 'other-unique-key';
+  if (
+    qi.dialect.capabilities.upsertConflictTarget === 'any-unique-key' &&
+    upsertCreateCollidingKey(qi.tableMeta, where, create)
+  ) {
+    return 'other-unique-key';
+  }
   if (!qi.dialect.supportsUpsertUpdateWhere) {
     qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
     const filter = whereMod.resolveGlobalFilter(qi, qi.table);
@@ -2579,16 +2586,17 @@ const ARITHMETIC_SQL: Readonly<Record<string, string>> = { increment: '+', decre
 /**
  * The SQL operator for one arithmetic update operator on one column.
  *
- * `divide` on a MySQL INTEGER column is `DIV`. MySQL's `/` is decimal
- * division, so `75 / 2` is 37.5 and the assignment back to an INT rounds it
- * to 38, where PostgreSQL's integer division truncates to 37. `DIV` truncates
- * toward zero, as PostgreSQL does. Decided by the COLUMN TYPE alone, never by
+ * `divide` on an INTEGER column is the engine's truncating integer division
+ * (`integerDivision`): `DIV` on MySQL, whose `/` is decimal division, so
+ * `75 / 2` is 37.5 and the assignment back to an INT rounds it to 38, where
+ * PostgreSQL's integer division truncates to 37. `DIV` truncates toward zero,
+ * as PostgreSQL does. Decided by the COLUMN TYPE alone, never by
  * the bound divisor: the SQL text must not depend on a value, or the template
  * cache would serve one shape to the other.
  */
 function arithmeticSql(qi: BuilderCtx, op: string, column: string): string {
-  if (op === 'divide' && qi.dialect.name === 'mysql' && isIntegerColumnType(qi.columnPgTypeMap.get(column))) {
-    return 'DIV';
+  if (op === 'divide' && isIntegerColumnType(qi.columnPgTypeMap.get(column))) {
+    return qi.dialect.capabilities.integerDivision;
   }
   return ARITHMETIC_SQL[op]!;
 }
@@ -2675,7 +2683,9 @@ function buildSetClauses(
   ctx: SetContext = UPDATE_SET,
 ): string[] {
   const compiled = entries.map(([k, v]) => compileSetEntry(qi, k, v, params, ctx));
-  return qi.dialect.name === 'mysql' ? orderForLeftToRightSet(qi, compiled) : compiled.map((c) => c.sql);
+  return qi.dialect.capabilities.setClauseOrder === 'left-to-right'
+    ? orderForLeftToRightSet(qi, compiled)
+    : compiled.map((c) => c.sql);
 }
 
 /**
@@ -2784,7 +2794,7 @@ const SAFE_CAST_TYPE = /^[A-Za-z_][A-Za-z0-9_]*( [A-Za-z_][A-Za-z0-9_]*)*(\(\d+(
  * bind typed values and get none.
  */
 function exprValueCast(qi: BuilderCtx, key: string): string {
-  if (qi.dialect.name !== 'postgresql') return '';
+  if (!qi.dialect.capabilities.paramTypeCasts) return '';
   const column = resolveColumnName(qi.tableMeta, key);
   if (column === undefined) return '';
   const enumCast = whereMod.enumCastSuffix(qi, column);
@@ -2803,7 +2813,7 @@ function exprValueCast(qi: BuilderCtx, key: string): string {
  * non-integer one is `numeric`. Other engines bind typed values and get none.
  */
 function arithmeticValueCast(qi: BuilderCtx, key: string, targetCast: string, cls: 'int' | 'dec'): string {
-  if (qi.dialect.name !== 'postgresql') return '';
+  if (!qi.dialect.capabilities.paramTypeCasts) return '';
   if (cls === 'dec') return '::numeric';
   const column = resolveColumnName(qi.tableMeta, key);
   return column !== undefined && targetCast !== '' && isIntegerColumnType(qi.columnPgTypeMap.get(column))

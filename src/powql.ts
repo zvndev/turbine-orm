@@ -2804,7 +2804,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     // dialect seam exists to prevent.
     //
     // Refused with the same E017 the other non-Postgres engines already raise
-    // (query/builder.ts's `dialect.name !== 'postgresql'` gate) and in the same
+    // (query/builder.ts's `distinctOn` capability gate) and in the same
     // words, so `distinct` now means one thing across every engine and matches
     // what the README documents. Refused BEFORE the column names are resolved,
     // matching that gate's position, so `distinct: ['nope']` reports the

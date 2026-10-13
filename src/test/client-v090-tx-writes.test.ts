@@ -43,6 +43,9 @@ const HAVE_NODE_SQLITE = (() => {
   }
 })();
 
+/** SQLite with a two-parameter statement limit, so a few rows need several chunks. */
+const twoParamSqlite = { ...sqliteDialect, capabilities: { ...sqliteDialect.capabilities, maxBindParameters: 2 } };
+
 async function sqliteClient(): Promise<{ db: TurbineClient; codes: () => string[] }> {
   const { DatabaseSync } = await import('node:sqlite');
   const handle = new DatabaseSync(':memory:');
@@ -50,7 +53,7 @@ async function sqliteClient(): Promise<{ db: TurbineClient; codes: () => string[
   handle.exec("INSERT INTO items (code) VALUES ('taken')");
   const db = new TurbineClient(
     // Two bound values per statement, so five rows insert in three chunks.
-    { pool: new SqlitePool(handle), dialect: { ...sqliteDialect, maxBindParameters: 2 }, preparedStatements: false },
+    { pool: new SqlitePool(handle), dialect: twoParamSqlite, preparedStatements: false },
     schema,
   );
   const codes = () =>
@@ -98,10 +101,7 @@ describe('a pool with no connect()', () => {
     err instanceof UnsupportedFeatureError && err.code === 'TURBINE_E017' && pattern.test(err.message);
 
   it('refuses a chunked createMany, naming the rows per call that fit one statement', async () => {
-    const db = new TurbineClient(
-      { pool: connectless(), dialect: { ...sqliteDialect, maxBindParameters: 2 }, preparedStatements: false },
-      schema,
-    );
+    const db = new TurbineClient({ pool: connectless(), dialect: twoParamSqlite, preparedStatements: false }, schema);
     await assert.rejects(
       db.table('items').createMany({ data: ['a', 'b', 'c'].map((code) => ({ code })) }),
       refused(/createMany of 3 rows on a pool without connect\(\)[\s\S]*Insert at most 2 rows per call/),

@@ -12,6 +12,8 @@ import { mockTable } from './helpers.js';
 const mysqlishDialect: Dialect = {
   ...postgresDialect,
   name: 'mysql',
+  // A MySQL stand-in answers MySQL's capability questions.
+  capabilities: mysqlDialect.capabilities,
   emptyJsonArrayLiteral: 'JSON_ARRAY()',
   nullJsonLiteral: 'NULL',
   supportsReturning: false,
@@ -256,6 +258,8 @@ describe('Dialect contract', () => {
 const sqliteishDialect: Dialect = {
   ...postgresDialect,
   name: 'sqlite',
+  // A SQLite stand-in answers SQLite's capability questions.
+  capabilities: sqliteDialect.capabilities,
   resultStrategy: 'returning', // SQLite ≥ 3.35 has RETURNING
   supportsReturning: true,
   supportsILike: false,

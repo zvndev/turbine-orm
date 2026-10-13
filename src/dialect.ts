@@ -396,9 +396,267 @@ export interface RelationSubqueryContext {
   recurse(relDef: RelationDef, spec: true | WithOptions, parentRef: string, depth: number, path: string[]): string;
 }
 
+/**
+ * What an engine can do, stated in full by every engine dialect.
+ *
+ * Every engine dialect is built by spreading `postgresDialect`, so a flag or
+ * hook added to PostgreSQL is inherited by every engine that does not override
+ * it (the inheritance trap). This object closes the trap for the questions it
+ * answers: each engine dialect sets its OWN `capabilities` as a fresh object
+ * literal checked with `satisfies EngineCapabilities`, so adding a key here is
+ * a compile error in every engine file until each one decides, and a unit test
+ * refuses an engine whose `capabilities` is inherited or shared.
+ *
+ * Code asks these questions instead of testing `dialect.name`; a source scan
+ * (src/test/capabilities-guard.test.ts) refuses a new engine-name comparison
+ * outside a short, commented allowlist. Rendering differences are not
+ * capabilities: they belong in the dialect's hooks (a few still switch on the
+ * name, allowlisted, until engines stop spreading `postgresDialect`).
+ */
+export interface EngineCapabilities {
+  // ---- Query shape ------------------------------------------------------
+
+  /** `SELECT DISTINCT ON (...)`: findMany `distinct` and groupBy `distinctOn`. Else E017. */
+  readonly distinctOn: boolean;
+
+  /**
+   * The positional relation encoding (`json_build_array`, see
+   * {@link Dialect.buildJsonArray}). One flag answers both questions about it:
+   * it is the default `jsonEncoding` where true, and refused (E017) where
+   * false, so the default can never pick an encoding the builder refuses.
+   */
+  readonly positionalJson: boolean;
+
+  /** The `NULLS FIRST` / `NULLS LAST` ordering clause. Explicit `nulls` placement is E017 without it. */
+  readonly nullsOrderingClause: boolean;
+
+  /**
+   * NULL sorts after every value in an ascending order (PostgreSQL), rather
+   * than before it (SQLite, MySQL, SQL Server). A cursor seek places NULL keys
+   * where the engine sorts them.
+   */
+  readonly nullsSortHigh: boolean;
+
+  /** `mode: 'insensitive'` on `in` / `notIn`, which folds every list element in SQL. Else E017. */
+  readonly insensitiveInList: boolean;
+
+  /**
+   * How two whole JSON documents compare:
+   *  - `'jsonb'`: as jsonb, in the where compiler's own PostgreSQL form
+   *    (`::jsonb = $1::jsonb`, `#>` path equality); the dialect takes no
+   *    {@link Dialect.buildJsonPathEquals}.
+   *  - `'exact'`: exactly, key order and whitespace aside, through the
+   *    dialect's `buildJsonPathEquals` (MySQL).
+   *  - `'text'`: not exactly (SQLite, SQL Server), so a bare array operand and
+   *    a document `not` are refused (E017) rather than compared as text. A
+   *    path `equals` still uses the dialect's `buildJsonPathEquals` when it
+   *    has one.
+   */
+  readonly jsonDocumentEquality: 'jsonb' | 'exact' | 'text';
+
+  /**
+   * JSON path extraction returns SQL-typed values: a JSON number as a number,
+   * `true` / `false` as 1 / 0 (SQLite). A path `equals` then binds a number as
+   * a number and refuses a boolean.
+   */
+  readonly jsonExtractTyped: boolean;
+
+  /**
+   * A JSON path range filter (`gt`, `lte`, ...) casts the extracted value to an
+   * exact `numeric` (`(expr)::numeric`, PostgreSQL); without it the cast is the
+   * dialect's float {@link Dialect.castAggregate}.
+   */
+  readonly jsonExactNumericCast: boolean;
+
+  /**
+   * A number compared with a text column converts the stored TEXT to a number
+   * (MySQL: `'0zz' = 0` is true), so a number, bigint or boolean bound against
+   * a text column binds as its text instead.
+   */
+  readonly numericTextComparison: boolean;
+
+  /**
+   * Declared foreign keys are always enforced, so the mass-mutation guard may
+   * trust that a non-null foreign key points at a row. SQLite enforces them
+   * only when the connection turned `foreign_keys` on.
+   */
+  readonly enforcesForeignKeys: boolean;
+
+  /**
+   * The batched relation loader pushes a per-parent `limit` into its follow-up
+   * query through {@link Dialect.buildPartitionLimit}. Without it the loader
+   * fetches every matching child and slices client-side.
+   */
+  readonly partitionLimitPushdown: boolean;
+
+  // ---- Values -----------------------------------------------------------
+
+  /**
+   * The `utcTimestamps` rewrite covers zone-less `timestamp` columns and raw
+   * `Date` parameters, as well as `date` columns (which take the UTC day on
+   * every SQL engine). PostgreSQL only: MySQL reads a zone-less literal in the
+   * session time zone. A table with untyped columns is reported where true.
+   */
+  readonly utcTimestampRewrite: boolean;
+
+  /**
+   * Bound values inside an update expression carry a `::type` cast (the target
+   * column's type, `::numeric`, `::int8`), because the driver sends parameters
+   * untyped and the server would infer `text`. PostgreSQL only.
+   */
+  readonly paramTypeCasts: boolean;
+
+  /**
+   * An enum is a named database type: `CREATE TYPE ... AS ENUM` in DDL and a
+   * `::"EnumName"` cast on writes and filters. Elsewhere an enum column is
+   * declared with its labels on the column ({@link Dialect.buildEnumColumn}).
+   */
+  readonly namedEnumTypes: boolean;
+
+  /**
+   * Which columns refuse a plain object or an array written to them (E003):
+   *  - `'pg-scalars'`: PostgreSQL's scalar types by their PostgreSQL names,
+   *    text types included.
+   *  - `'scalars-and-text'`: every non-text scalar type and the text types,
+   *    for an engine with a JSON column type (MySQL).
+   *  - `'scalars'`: non-text scalar types only; a text column holds
+   *    serialized JSON on an engine with no JSON type (SQLite, SQL Server).
+   */
+  readonly structuredValueColumns: 'pg-scalars' | 'scalars-and-text' | 'scalars';
+
+  // ---- Writes -----------------------------------------------------------
+
+  /**
+   * The most bind parameters one statement may carry; `Infinity` for no
+   * known limit. Past PostgreSQL's 65535 node-postgres does not refuse: the
+   * count wraps and the server answers with a protocol error that reads like
+   * a lost connection.
+   */
+  readonly maxBindParameters: number;
+
+  /**
+   * The most rows one plain `INSERT ... VALUES` may carry; `Infinity` for no
+   * limit beyond the bind-parameter one (SQL Server: 1000, error 10738 past
+   * it). An `onConflict` statement that reads its rows as a derived table is
+   * not bound by it.
+   */
+  readonly maxInsertRows: number;
+
+  /**
+   * What a single-statement upsert conflicts on. `'explicit'`: the conflict
+   * target it names. `'any-unique-key'`: whichever unique key collides first
+   * (MySQL `ON DUPLICATE KEY UPDATE`), so a `create` that can collide on a key
+   * `where` does not pin is looked up first, and a multi-row upsert must target
+   * the only key its rows can violate.
+   */
+  readonly upsertConflictTarget: 'explicit' | 'any-unique-key';
+
+  /**
+   * How an UPDATE's SET list reads columns. `'snapshot'`: every expression
+   * reads the row as it was. `'left-to-right'` (MySQL): a later expression
+   * reads an earlier assignment, so Turbine orders the clauses.
+   */
+  readonly setClauseOrder: 'snapshot' | 'left-to-right';
+
+  /** The reads inside a reselect write's transaction take `FOR UPDATE`, so a concurrent write waits. */
+  readonly reselectLocksRows: boolean;
+
+  /**
+   * The operator that divides an integer by an integer with truncation: `/`
+   * (PostgreSQL, SQLite, SQL Server) or `DIV` (MySQL, whose `/` is decimal).
+   */
+  readonly integerDivision: '/' | 'DIV';
+
+  /** Update expressions (`expr.*`, `col()` in update data) compile here. Else E017. */
+  readonly updateExpressions: boolean;
+
+  /**
+   * One multi-row upsert statement applies two rows whose keys are equal only
+   * under the column's collation as an insert and an update of one row,
+   * rather than refusing (PostgreSQL 21000, SQL Server 8672). Turbine detects
+   * it afterwards, so the statement runs in a transaction it can roll back.
+   */
+  readonly bulkUpsertAppliesRepeatedKeys: boolean;
+
+  // ---- Connection and transactions --------------------------------------
+
+  /** `$transaction({ readOnly: true })`: `READ ONLY` after the dialect's BEGIN. Else E017. */
+  readonly readOnlyTransactions: boolean;
+
+  /**
+   * Server settings as connection parameters (`options=-c name=value`), which
+   * is how `statementTimeoutMs` is applied. Else E017.
+   */
+  readonly connectionParameters: boolean;
+
+  /**
+   * A timed-out statement can be cancelled on the server with a protocol
+   * cancel request (node-postgres pools), so a timeout can report
+   * `outcome: 'not-executed'`.
+   */
+  readonly backendCancel: boolean;
+
+  /**
+   * A transaction can bound its own idle time on the server
+   * (`idle_in_transaction_session_timeout`), which a cursor stream's BEGIN sets
+   * as the backstop for its idle timeout.
+   */
+  readonly idleTransactionTimeout: boolean;
+
+  /**
+   * A failed statement aborts the whole transaction until it rolls back
+   * (PostgreSQL), so the next statement is refused locally rather than sent.
+   */
+  readonly abortsTransactionOnError: boolean;
+
+  /**
+   * What connection object backs a transaction, for `tx.$connection()` and
+   * Turbine's own type parsers: `'pg-compatible'` (a node-postgres client or a
+   * driver with its interface), `'engine-driver'` (the engine's own driver
+   * behind Turbine's pool shim), or `'none'` (no driver connection, E017).
+   */
+  readonly connectionDriver: 'pg-compatible' | 'engine-driver' | 'none';
+
+  /**
+   * The engine prepares every distinct statement text on the server, under a
+   * server-wide cap (MySQL's `max_prepared_stmt_count`), so per-statement text
+   * such as `sqlComment.dynamic` would exhaust it. Else allowed.
+   */
+  readonly preparesEveryStatement: boolean;
+
+  /**
+   * The SQL grammar the engine's statements are written in, which picks the
+   * lexer that screens raw SQL for transaction control (`COMMIT` inside
+   * `$transaction` and the rest). `null` is no SQL lexer (PowDB speaks PowQL),
+   * so nothing is screened.
+   */
+  readonly statementSyntax: 'postgresql' | 'mysql' | 'sqlite' | 'mssql' | null;
+
+  // ---- DDL --------------------------------------------------------------
+
+  /**
+   * A column's inline `REFERENCES` creates a foreign key. MySQL parses one and
+   * ignores it, so its foreign keys are table-level `FOREIGN KEY` clauses.
+   */
+  readonly inlineForeignKeys: boolean;
+
+  /**
+   * An unbounded text or binary column can be a key (primary, unique, index,
+   * foreign). MySQL and SQL Server refuse that, so a keyed `text` / `bytea`
+   * column is declared with a bounded type there.
+   */
+  readonly unboundedTextKeys: boolean;
+}
+
 export interface Dialect {
   /** Dialect identifier. */
   readonly name: DialectName;
+
+  /**
+   * What this engine can do. Every engine dialect sets its OWN object, never
+   * PostgreSQL's by inheritance; see {@link EngineCapabilities}.
+   */
+  readonly capabilities: EngineCapabilities;
 
   /**
    * How write statements surface their affected rows. PostgreSQL uses
@@ -431,9 +689,9 @@ export interface Dialect {
    * `jsonEncoding: 'positional'` mode. Emitting `json_build_array(v1, v2, …)`
    * instead of `json_build_object('k1', v1, …)` drops every repeated key name
    * from every nested object of every row (the decode side maps positions back
-   * to keys via a build-time shape descriptor). Postgres-only in v1, other
-   * engines never reach this because the builder gates positional encoding to
-   * `dialect.name === 'postgresql'`, so the method is optional on the contract.
+   * to keys via a build-time shape descriptor). Reached only on an engine
+   * whose {@link EngineCapabilities.positionalJson} is true (PostgreSQL), so
+   * the method is optional on the contract.
    */
   buildJsonArray?(exprs: string[]): string;
 
@@ -481,24 +739,6 @@ export interface Dialect {
    * absent is treated as `false`.
    */
   readonly supportsUpsertUpdateWhere?: boolean;
-
-  /**
-   * The most bind parameters one statement may carry, when it differs from
-   * the engine default in {@link maxBindParameters}. Not set on
-   * `postgresDialect`: every engine dialect spreads it, so a value there would
-   * be inherited by engines with a different limit.
-   */
-  readonly maxBindParameters?: number;
-
-  /**
-   * The most rows one plain `INSERT ... VALUES` statement may carry, when the
-   * engine limits it (SQL Server: 1000, error 10738 past it). `createMany` sizes
-   * its chunks below it; an `onConflict` statement that reads its rows as a
-   * derived table is not bound by it. Absent: no row limit beyond the
-   * bind-parameter one. Not set on `postgresDialect`, for the reason
-   * {@link maxBindParameters} gives.
-   */
-  readonly maxInsertRows?: number;
 
   /** Whether this dialect/engine supports pgvector distance ops (KNN / distance WHERE). */
   readonly supportsVector: boolean;
@@ -767,9 +1007,10 @@ export interface Dialect {
    * match `1`.
    * Throws `UnsupportedFeatureError` (E017) for an operand the engine cannot
    * compare exactly. OPTIONAL and deliberately absent on `postgresDialect`
-   * (the where compiler owns the PostgreSQL form, gated on the dialect name),
-   * so no engine inherits it by spreading; an engine without it compares the
-   * text its `buildJsonPathExtract` returns.
+   * (the where compiler owns the PostgreSQL form, read when
+   * {@link EngineCapabilities.jsonDocumentEquality} is `'jsonb'`), so no engine
+   * inherits it by spreading; an engine without it compares the text its
+   * `buildJsonPathExtract` returns.
    */
   buildJsonPathEquals?(input: JsonPathEqualsInput): string;
 
@@ -889,10 +1130,10 @@ export interface Dialect {
    *
    * PostgreSQL does not use it: it declares the type with `CREATE TYPE ... AS
    * ENUM` and the column names the type. `schemaToSQL` decides that by
-   * `dialect.name`, not by this hook's absence, because every engine spreads
-   * `postgresDialect`; an engine other than PostgreSQL that does not define the
-   * hook gets an UnsupportedFeatureError (E017) for an enum column instead of
-   * PostgreSQL's DDL.
+   * {@link EngineCapabilities.namedEnumTypes}, not by this hook's absence; an
+   * engine without named enum types that does not define the hook gets an
+   * UnsupportedFeatureError (E017) for an enum column instead of PostgreSQL's
+   * DDL.
    */
   buildEnumColumn?(
     column: string,
@@ -1039,8 +1280,10 @@ export interface Dialect {
    * correct but unbounded in bytes over the wire (200 parents x ~505 children
    * with `limit: 3` measured 101,000 rows fetched to keep 600, +52.9 MB peak
    * heap against +0.5 MB for the join plan), which is why PostgreSQL
-   * implements it. Only PostgreSQL does in this release; the other engines keep
-   * the client-side slice, so their emitted SQL is byte-identical to before.
+   * implements it. The loader uses it only where
+   * {@link EngineCapabilities.partitionLimitPushdown} is true (PostgreSQL in
+   * this release), since every engine inherits this hook by spreading; the
+   * other engines keep the client-side slice.
    *
    * The client-side slice is NOT removed when a dialect implements this: it
    * stays as the belt-and-braces bound, and is a no-op once the engine has
@@ -1083,30 +1326,10 @@ export interface DialectMigrator {
   releaseLock(lockId: number): Promise<void>;
 }
 
-/** PostgreSQL implementation of the dialect contract. */
-/**
- * Per-engine bind-parameter limits, keyed by dialect NAME rather than set on
- * `postgresDialect` (see THE INHERITANCE TRAP in the repo notes): PostgreSQL
- * and MySQL count parameters in a 16-bit field, SQLite's default
- * `SQLITE_MAX_VARIABLE_NUMBER` is 32766, and SQL Server allows 2100. Past the
- * PostgreSQL limit node-postgres does not refuse, the count wraps and the
- * server answers with a protocol error that reads like a lost connection.
- */
-const BIND_PARAMETER_LIMITS: Readonly<Record<string, number>> = {
-  postgresql: 65535,
-  mysql: 65535,
-  sqlite: 32766,
-  // The server allows 2100, but the driver binds two of its own (see
-  // MSSQL_MAX_PARAMS in mssql.ts): measured, 2098 runs and 2099 is refused.
-  mssql: 2098,
-};
-
-/** The bind-parameter limit for one statement on this dialect, if known. */
-export function maxBindParameters(dialect: Pick<Dialect, 'name' | 'maxBindParameters'>): number | undefined {
-  return (
-    dialect.maxBindParameters ??
-    (Object.hasOwn(BIND_PARAMETER_LIMITS, dialect.name) ? BIND_PARAMETER_LIMITS[dialect.name] : undefined)
-  );
+/** The bind-parameter limit for one statement on this dialect, or `undefined` when it has none. */
+export function maxBindParameters(dialect: Pick<Dialect, 'capabilities'>): number | undefined {
+  const limit = dialect.capabilities.maxBindParameters;
+  return Number.isFinite(limit) ? limit : undefined;
 }
 
 /**
@@ -1162,8 +1385,45 @@ export function onConflictAction(input: BulkUpsertStatementInput, params: unknow
   return `DO UPDATE SET ${update.setClauses.join(', ')}${update.where ? ` WHERE ${update.where}` : ''}`;
 }
 
+/** PostgreSQL implementation of the dialect contract. */
 export const postgresDialect: Dialect = {
   name: 'postgresql',
+  capabilities: Object.freeze({
+    distinctOn: true,
+    positionalJson: true,
+    nullsOrderingClause: true,
+    nullsSortHigh: true,
+    insensitiveInList: true,
+    jsonDocumentEquality: 'jsonb',
+    jsonExtractTyped: false,
+    jsonExactNumericCast: true,
+    numericTextComparison: false,
+    enforcesForeignKeys: true,
+    partitionLimitPushdown: true,
+    utcTimestampRewrite: true,
+    paramTypeCasts: true,
+    namedEnumTypes: true,
+    structuredValueColumns: 'pg-scalars',
+    // Counted in a 16-bit field.
+    maxBindParameters: 65535,
+    maxInsertRows: Number.POSITIVE_INFINITY,
+    upsertConflictTarget: 'explicit',
+    setClauseOrder: 'snapshot',
+    reselectLocksRows: false,
+    integerDivision: '/',
+    updateExpressions: true,
+    bulkUpsertAppliesRepeatedKeys: false,
+    readOnlyTransactions: true,
+    connectionParameters: true,
+    backendCancel: true,
+    idleTransactionTimeout: true,
+    abortsTransactionOnError: true,
+    connectionDriver: 'pg-compatible',
+    preparesEveryStatement: false,
+    statementSyntax: 'postgresql',
+    inlineForeignKeys: true,
+    unboundedTextKeys: true,
+  } satisfies EngineCapabilities),
   resultStrategy: 'returning',
   supportsReturning: true,
   supportsUpsertUpdateWhere: true,
