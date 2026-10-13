@@ -52,6 +52,12 @@
  * @module
  */
 
+// Runtime imports, and the only ones in this file: the unknown-key warning at
+// the bottom needs the diagnostics resolver, the logger, the once-per-process
+// registry and the name suggester. All are leaves that do not import this
+// module, so the type-only shape of everything above is unaffected.
+import { resolveDiagnostics } from '../diagnostics.js';
+import { consoleLogger, logTo, type TurbineLogger } from '../logger.js';
 import type {
   AggregateArgs,
   CountArgs,
@@ -67,10 +73,6 @@ import type {
   UpdateManyArgs,
   UpsertArgs,
 } from './types.js';
-// Runtime imports, and the only ones in this file: the unknown-key warning at
-// the bottom needs the once-per-process registry and the name suggester. Both
-// are leaves that do not import this module, so the type-only shape of
-// everything above is unaffected.
 import { suggestKey } from './utils.js';
 import { shouldWarnOnce, WARN_NS } from './warn-registry.js';
 
@@ -379,8 +381,13 @@ export const REFUSED_OPTION_KEYS: Readonly<Record<string, ReadonlySet<string>>> 
   findManyStreamBatches: new Set(['lock']),
 };
 
+/** The advice logger a caller without a client gets: the console logger when the environment's mode has advice on. */
+function adviceFromEnvironment(): TurbineLogger | null {
+  return resolveDiagnostics().advice ? consoleLogger : null;
+}
+
 /**
- * Dev-mode warning for a key that is not part of the operation's option
+ * Advice for a key that is not part of the operation's option
  * surface, and is therefore doing nothing.
  *
  * The motivating case is `include`. It is Prisma's word for `with`, it is what
@@ -397,11 +404,21 @@ export const REFUSED_OPTION_KEYS: Readonly<Record<string, ReadonlySet<string>>> 
  * working query start throwing. A warning costs a correct program nothing and
  * tells an incorrect one exactly what happened.
  *
- * Dev-only, once per `table.operation.key` per process, and total: the whole
- * body is wrapped, because a diagnostic must never be the reason a query fails.
+ * Advice: emitted only when the client's `diagnostics.advice` is on. The
+ * caller passes its advice logger, or `null` when advice is off. Once per
+ * `table.operation.key` per process, and total: the whole body is wrapped,
+ * because a diagnostic must never be the reason a query fails.
+ *
+ * Omitting `advice` resolves it from the environment on each call. Only the
+ * PowDB interface still does that, until it carries its client's logger.
  */
-export function warnUnknownQueryOptions(table: string, operation: string, args: unknown): void {
-  if (process.env.NODE_ENV === 'production') return;
+export function warnUnknownQueryOptions(
+  table: string,
+  operation: string,
+  args: unknown,
+  advice: TurbineLogger | null = adviceFromEnvironment(),
+): void {
+  if (!advice) return;
   if (args === null || typeof args !== 'object' || Array.isArray(args)) return;
   const known = OPERATION_TABLE[operation];
   if (!known) return;
@@ -418,9 +435,12 @@ export function warnUnknownQueryOptions(table: string, operation: string, args: 
       const prismaSpelling = PRISMA_SPELLING[key];
       const suggestion = prismaSpelling ?? suggestKey(key, Object.keys(known));
       const because = prismaSpelling ? ` Turbine spells this "${prismaSpelling}".` : '';
-      console.warn(
-        `[turbine] unknown option "${key}" in ${table}.${operation}(), it is ignored.${because}` +
+      logTo(
+        advice,
+        'warn',
+        `unknown option "${key}" in ${table}.${operation}(), it is ignored.${because}` +
           (!prismaSpelling && suggestion ? ` Did you mean "${suggestion}"?` : ''),
+        { code: 'unknown-query-option', table, operation, key },
       );
     }
   } catch {

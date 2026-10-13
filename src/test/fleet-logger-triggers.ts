@@ -29,6 +29,8 @@ export interface FleetModules {
   buildRelationsFromForeignKeys: Any;
   generateTypes: Any;
   warnParserOverwrite: Any;
+  /** The pre-0.90 cache-check env re-arm hook; present only when the harness runs the old build. */
+  resetCacheCrossCheckEnv?: () => void;
   resetWarnOnce: (ns?: string) => void;
   mockTable: (
     name: string,
@@ -109,11 +111,34 @@ function relationSchema(m: FleetModules): SchemaMetadata {
   return { enums: {}, tables: { users, posts } };
 }
 
-function relationInterface(m: FleetModules, logger: TurbineLogger | undefined): Any {
-  const qi = new m.QueryInterface(null, 'users', relationSchema(m), [], logger ? { logger } : {});
-  // PHASE-1 SHIM, removed when builder.ts hands the logger to its ctx.
-  if (logger && qi.ctx && qi.ctx.logger === undefined) qi.ctx.logger = logger;
-  return qi;
+function relationInterface(m: FleetModules, logger: TurbineLogger | undefined, pool: Any = null): Any {
+  return new m.QueryInterface(pool, 'users', relationSchema(m), [], logger ? { logger } : {});
+}
+
+/** A query interface over `items` (id, name) on a pool that answers every query with no rows. */
+function itemsInterface(m: FleetModules, logger: TurbineLogger | undefined, options: Any = {}): Any {
+  return new m.QueryInterface(fakePool(), 'items', itemsSchema(m), [], logger ? { ...options, logger } : options);
+}
+
+/** users -> posts -> author (users) -> ..., deep enough for the deep-with advice. */
+function deepWith(depth: number): Any {
+  let clause: Any = true;
+  for (let i = depth; i > 0; i--) clause = { with: { [i % 2 === 1 ? 'posts' : 'author']: clause } };
+  return clause.with;
+}
+
+/** relationSchema plus the back-reference posts.author, for a with tree of any depth. */
+function cyclicSchema(m: FleetModules): SchemaMetadata {
+  const schema = relationSchema(m);
+  schema.tables.posts!.relations.author = {
+    type: 'belongsTo',
+    name: 'author',
+    from: 'posts',
+    to: 'users',
+    foreignKey: 'user_id',
+    referenceKey: 'id',
+  } as never;
+  return schema;
 }
 
 const NO_ROWS = { command: 'SELECT', rowCount: 0, oid: 0, fields: [] };
@@ -204,6 +229,104 @@ const TAKEN_USER_FIELD = (): Map<string, Set<string>> =>
  * returns (an unawaited file read); the runner polls for it.
  */
 export const TRIGGERS: Record<string, { trigger: Trigger; async?: true }> = {
+  'untyped-columns': {
+    trigger: async (m, logger) => {
+      const items = m.mockTable('items', [
+        { name: 'id', field: 'id' },
+        { name: 'name', field: 'name', pgType: 'text' },
+      ]) as Any;
+      // `name` carries no database type anywhere in the metadata.
+      for (const col of items.columns) {
+        if (col.name !== 'name') continue;
+        delete col.pgType;
+        delete col.dialectType;
+      }
+      delete items.pgTypes.name;
+      delete items.dialectTypes.name;
+      new m.QueryInterface(null, 'items', { enums: {}, tables: { items } }, [], logger ? { logger } : {});
+    },
+  },
+  'unordered-page': {
+    trigger: async (m, logger) => {
+      await itemsInterface(m, logger).findMany({ limit: 5, offset: 5 });
+    },
+  },
+  'auto-strategy': {
+    trigger: async (m, logger) => {
+      await relationInterface(m, logger, fakePool()).findMany({ with: { posts: true }, limit: 1 });
+    },
+  },
+  'deep-with': {
+    trigger: async (m, logger) => {
+      const qi = new m.QueryInterface(fakePool(), 'users', cyclicSchema(m), [], logger ? { logger } : {});
+      await qi.findMany({ with: deepWith(6), limit: 1, relationLoadStrategy: 'join' });
+    },
+  },
+  'flatten-blocked': {
+    trigger: async (m, logger) => {
+      relationInterface(m, logger).buildFindMany({
+        with: { posts: true },
+        distinct: ['name'],
+        limit: 1,
+        relationLoadStrategy: 'flatten',
+        jsonEncoding: 'object',
+      });
+    },
+  },
+  'redundant-sort-term': {
+    trigger: async (m, logger) => {
+      itemsInterface(m, logger).buildFindMany({ orderBy: [{ id: 'asc' }, { id: 'desc' }], limit: 1 });
+    },
+  },
+  'unknown-query-option': {
+    trigger: async (m, logger) => {
+      await itemsInterface(m, logger).findMany({ include: { posts: true }, limit: 1 });
+    },
+  },
+  'unlimited-find-many': {
+    trigger: async (m, logger) => {
+      await itemsInterface(m, logger).findMany({ orderBy: { id: 'asc' } });
+    },
+  },
+  'temporal-infinity': {
+    trigger: async (m, logger) => {
+      const events = m.mockTable('events', [
+        { name: 'id', field: 'id' },
+        { name: 'starts_at', field: 'startsAt', pgType: 'timestamptz' },
+      ]) as Any;
+      events.dateColumns = new Set(['starts_at']);
+      const qi = new m.QueryInterface(null, 'events', { enums: {}, tables: { events } }, [], logger ? { logger } : {});
+      qi.buildFindMany({ limit: 1 }).transform({ ...NO_ROWS, rows: [{ id: 1, starts_at: 'infinity' }], rowCount: 1 });
+    },
+  },
+  'cache-mismatch': {
+    trigger: async (m, logger) => {
+      // The sampled check, on a cache entry corrupted after warming. The
+      // environment variables drive the pre-0.90 build; the option drives this one.
+      const saved = { NODE_ENV: process.env.NODE_ENV, SAMPLE: process.env.TURBINE_CACHE_CHECK_SAMPLE };
+      process.env.NODE_ENV = 'production';
+      process.env.TURBINE_CACHE_CHECK_SAMPLE = '1';
+      m.resetCacheCrossCheckEnv?.();
+      try {
+        const options = { diagnostics: { cacheCheck: { sample: 1 } }, ...(logger ? { logger } : {}) };
+        const qi = new m.QueryInterface(null, 'items', itemsSchema(m), [], options);
+        qi.buildFindMany({ where: { name: 'a' }, limit: 1 });
+        const cache = qi.sqlTemplateCache.cache as Map<string, { sql: string }>;
+        for (const entry of cache.values()) entry.sql = 'SELECT 1 -- corrupted';
+        try {
+          qi.buildFindMany({ where: { name: 'b' }, limit: 1 });
+        } catch {
+          // The throw is the check's other half; the log line is the point here.
+        }
+      } finally {
+        if (saved.NODE_ENV === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = saved.NODE_ENV;
+        if (saved.SAMPLE === undefined) delete process.env.TURBINE_CACHE_CHECK_SAMPLE;
+        else process.env.TURBINE_CACHE_CHECK_SAMPLE = saved.SAMPLE;
+        m.resetCacheCrossCheckEnv?.();
+      }
+    },
+  },
   'parser-overwrite': {
     trigger: async (m, logger) => {
       // Somebody else's parser on a temporal OID, then the check Turbine runs

@@ -16,7 +16,6 @@ import { describe, it } from 'node:test';
 import pg from 'pg';
 import { TurbineClient } from '../client.js';
 import { introspect } from '../introspect.js';
-import { resetCacheCrossCheckEnv } from '../query/builder.js';
 import { dropUndefinedKeys } from '../query/filters.js';
 import * as whereMod from '../query/where.js';
 import type { SchemaMetadata } from '../schema.js';
@@ -155,7 +154,6 @@ describe('live: a warmed template never serves a call whose bound is undefined',
     await runSql(DDL);
     schema = await introspect({ connectionString: DATABASE_URL!, include: ['wc_cache_items'] });
     process.env.NODE_ENV = 'production';
-    resetCacheCrossCheckEnv();
     cached = new TurbineClient({ connectionString: DATABASE_URL!, poolSize: 2, warnOnUnlimited: false }, schema);
     uncached = new TurbineClient(
       { connectionString: DATABASE_URL!, poolSize: 2, warnOnUnlimited: false, sqlCache: false },
@@ -165,7 +163,6 @@ describe('live: a warmed template never serves a call whose bound is undefined',
 
   live.after(async () => {
     process.env.NODE_ENV = savedEnv;
-    resetCacheCrossCheckEnv();
     await cached?.disconnect();
     await uncached?.disconnect();
     await runSql(['DROP TABLE IF EXISTS wc_cache_items']);

@@ -7,15 +7,17 @@
  * rebuilding). Drift between them has shipped silent wrong-results bugs before
  * (permuted where-key order; an orderBy fingerprint collision).
  *
- * When `NODE_ENV !== 'production'` (and `TURBINE_DISABLE_CACHE_CHECK !== '1'`),
- * every cache HIT is now cross-checked: the SQL + params are rebuilt fresh and
+ * Under `diagnostics.cacheCheck: 'every-hit'` (the development default, see
+ * diagnostics.ts), every cache HIT is cross-checked: the SQL + params are rebuilt fresh and
  * compared byte-for-byte (SQL) and element-wise (params) against the cache-hit
  * result. A mismatch throws a `ValidationError` (E003) naming the fingerprint.
  *
  * These tests prove:
  *   (a) legitimate permuted-key cache hits pass the check untouched,
  *   (b) a corrupted cache entry (bad params, or bad SQL) throws E003 loudly,
- *   (c) `TURBINE_DISABLE_CACHE_CHECK=1` and `NODE_ENV=production` skip it.
+ *   (c) `cacheCheck: 'off'`, `NODE_ENV=production` and the legacy
+ *       `TURBINE_DISABLE_CACHE_CHECK=1` skip it, each decided when the query
+ *       interface is constructed.
  *
  * The whole existing unit suite runs with this check live on every cache hit,
  * so a clean run is itself the strongest proof the invariant holds today.
@@ -24,7 +26,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { ValidationError } from '../errors.js';
-import { resetCacheCrossCheckEnv } from '../query/builder.js';
 import type { QueryInterface } from '../query/index.js';
 import type { SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
@@ -65,12 +66,8 @@ function withEnv(overrides: Record<string, string | undefined>, fn: () => void):
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
-  // The cross-check resolves these variables ONCE and memoizes the answer
-  // (`process.env` reads are a C++ interceptor call, and this ran twice on
-  // every cache hit). Flipping them mid-process is a thing only these suites
-  // do, so they are also the ones that have to re-arm the read, on the way in
-  // and again on the way out.
-  resetCacheCrossCheckEnv();
+  // The variables are read once, when a query interface is constructed (see
+  // diagnostics.ts), so a test builds its interface INSIDE the override.
   try {
     fn();
   } finally {
@@ -78,7 +75,6 @@ function withEnv(overrides: Record<string, string | undefined>, fn: () => void):
       if (saved[key] === undefined) delete process.env[key];
       else process.env[key] = saved[key];
     }
-    resetCacheCrossCheckEnv();
   }
 }
 
@@ -240,13 +236,22 @@ describe("cache cross-check: pick-row plan: 'lateral' path", () => {
 });
 
 describe('cache cross-check: escape hatches skip the check', () => {
-  it('TURBINE_DISABLE_CACHE_CHECK=1 skips the check even with a corrupted entry', () => {
-    const q = makeQuery('users', buildSchema());
+  /** Warm the cache, then corrupt the cached SQL so a cross-check would throw. */
+  function corrupted(q: QueryInterface<Record<string, unknown>>, sql: string): void {
     q.buildFindMany({ where: { age: 1 } } as never);
-    const entry = firstCacheEntry(q as unknown as QueryInterface<Record<string, unknown>>);
-    entry.sql = 'SELECT 1 -- corrupted but check disabled';
+    firstCacheEntry(q).sql = sql;
+  }
 
+  it("diagnostics: { cacheCheck: 'off' } skips the check even with a corrupted entry", () => {
+    const q = makeQuery('users', buildSchema(), { diagnostics: { cacheCheck: 'off' } });
+    corrupted(q, 'SELECT 1 -- corrupted but check off');
+    assert.equal(q.buildFindMany({ where: { age: 2 } } as never).sql, 'SELECT 1 -- corrupted but check off');
+  });
+
+  it('TURBINE_DISABLE_CACHE_CHECK=1 at construction skips the check even with a corrupted entry', () => {
     withEnv({ TURBINE_DISABLE_CACHE_CHECK: '1' }, () => {
+      const q = makeQuery('users', buildSchema());
+      corrupted(q, 'SELECT 1 -- corrupted but check disabled');
       // Corruption is present, but the disabled check must not fire: the stale
       // cached SQL is returned as-is.
       const result = q.buildFindMany({ where: { age: 2 } } as never);
@@ -254,31 +259,31 @@ describe('cache cross-check: escape hatches skip the check', () => {
     });
   });
 
-  it('NODE_ENV=production skips the check even with a corrupted entry', () => {
-    const q = makeQuery('users', buildSchema());
-    q.buildFindMany({ where: { age: 1 } } as never);
-    const entry = firstCacheEntry(q as unknown as QueryInterface<Record<string, unknown>>);
-    entry.sql = 'SELECT 1 -- corrupted but production';
-
+  it('NODE_ENV=production at construction skips the check even with a corrupted entry', () => {
     withEnv({ NODE_ENV: 'production', TURBINE_DISABLE_CACHE_CHECK: undefined }, () => {
+      const q = makeQuery('users', buildSchema());
+      corrupted(q, 'SELECT 1 -- corrupted but production');
       const result = q.buildFindMany({ where: { age: 2 } } as never);
       assert.equal(result.sql, 'SELECT 1 -- corrupted but production');
     });
   });
 
-  it('the check re-arms once the env override is removed', () => {
-    const q = makeQuery('users', buildSchema());
-    q.buildFindMany({ where: { age: 1 } } as never);
-    const entry = firstCacheEntry(q as unknown as QueryInterface<Record<string, unknown>>);
-    entry.sql = 'SELECT 1 -- corrupted';
-
-    withEnv({ NODE_ENV: 'production' }, () => {
-      assert.doesNotThrow(() => q.buildFindMany({ where: { age: 2 } } as never));
+  it('the mode is fixed at construction: a later NODE_ENV change does not move it', () => {
+    let built: QueryInterface<Record<string, unknown>> | undefined;
+    withEnv({ NODE_ENV: 'production', TURBINE_DISABLE_CACHE_CHECK: undefined }, () => {
+      built = makeQuery('users', buildSchema());
     });
-    // Back in the default (non-production) env the check fires again.
-    assert.throws(
-      () => q.buildFindMany({ where: { age: 3 } } as never),
-      (err: unknown) => err instanceof ValidationError && err.code === 'TURBINE_E003',
-    );
+    corrupted(built!, 'SELECT 1 -- built in production');
+    // Back in the default (non-production) env, the production-built interface still skips.
+    assert.doesNotThrow(() => built!.buildFindMany({ where: { age: 2 } } as never));
+
+    const dev = makeQuery('users', buildSchema());
+    corrupted(dev, 'SELECT 1 -- built in development');
+    withEnv({ NODE_ENV: 'production' }, () => {
+      assert.throws(
+        () => dev.buildFindMany({ where: { age: 3 } } as never),
+        (err: unknown) => err instanceof ValidationError && err.code === 'TURBINE_E003',
+      );
+    });
   });
 });

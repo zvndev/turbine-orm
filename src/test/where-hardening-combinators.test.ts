@@ -26,7 +26,6 @@ import pg from 'pg';
 import { TurbineClient } from '../client.js';
 import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
-import { resetCacheCrossCheckEnv } from '../query/builder.js';
 import type { GlobalFilters } from '../query/index.js';
 import { pruneUndefinedArgs } from '../query/normalize-args.js';
 import * as whereMod from '../query/where.js';
@@ -205,7 +204,6 @@ describe('OR: [] matches no row', () => {
   it('a warmed template never serves the other shape (production cache)', () => {
     const saved = process.env.NODE_ENV;
     process.env.NODE_ENV = 'production';
-    resetCacheCrossCheckEnv();
     try {
       for (const [first, second] of [
         [{ OR: [], age: 1 }, { age: 2 }],
@@ -220,7 +218,6 @@ describe('OR: [] matches no row', () => {
       }
     } finally {
       process.env.NODE_ENV = saved;
-      resetCacheCrossCheckEnv();
     }
   });
 });
@@ -435,7 +432,6 @@ describe('a relation filter takes the relation-filter keys only', () => {
   it('a warmed template for the valid shape never serves the typo (production cache)', () => {
     const saved = process.env.NODE_ENV;
     process.env.NODE_ENV = 'production';
-    resetCacheCrossCheckEnv();
     try {
       const q = accounts();
       q.buildFindMany({ where: { posts: { some: { title: 'a' } } } } as Any);
@@ -445,7 +441,6 @@ describe('a relation filter takes the relation-filter keys only', () => {
       );
     } finally {
       process.env.NODE_ENV = saved;
-      resetCacheCrossCheckEnv();
     }
   });
 

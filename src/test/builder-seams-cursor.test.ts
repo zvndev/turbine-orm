@@ -24,7 +24,6 @@ import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
 import { mssqlDialect } from '../mssql.js';
 import { mysqlDialect } from '../mysql.js';
-import { resetCacheCrossCheckEnv } from '../query/builder.js';
 import { CURSOR_INCLUSIVE } from '../query/normalize-args.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { introspectSqliteDatabase, sqliteDialect, turbineSqlite } from '../sqlite.js';
@@ -57,7 +56,6 @@ function schema(): SchemaMetadata {
 
 function production(): void {
   process.env.NODE_ENV = 'production';
-  resetCacheCrossCheckEnv();
 }
 let prevEnv: string | undefined;
 
@@ -259,7 +257,6 @@ describe('cursor: warm cache binds what the cold build binds (production mode)',
   afterEach(() => {
     if (prevEnv === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = prevEnv;
-    resetCacheCrossCheckEnv();
   });
 
   const shapes: [string, Record<string | symbol, unknown>, Record<string | symbol, unknown>][] = [

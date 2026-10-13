@@ -38,6 +38,18 @@ export const LOG_CODES = [
   'listen-lost',
   // query/utils.ts, a pg type parser replaced (client construction, always on)
   'parser-overwrite',
+  // query/builder.ts, query/utils.ts, query/option-surface.ts: per-query advice
+  'untyped-columns',
+  'unordered-page',
+  'auto-strategy',
+  'deep-with',
+  'flatten-blocked',
+  'redundant-sort-term',
+  'unknown-query-option',
+  // query/builder.ts, always on
+  'unlimited-find-many',
+  'temporal-infinity',
+  'cache-mismatch',
   // query/relations.ts, per-query advice
   'relation-payload-json',
   'flatten-fallback',

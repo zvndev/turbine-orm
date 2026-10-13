@@ -13,6 +13,7 @@
 
 import { acquireConnection, type Checkout, openCheckout } from '../checkout.js';
 import { settleEventLoop } from '../connection-guard.js';
+import { type ResolvedDiagnostics, resolveDiagnostics } from '../diagnostics.js';
 import type { Dialect, StreamableConnection } from '../dialect.js';
 import { postgresDialect } from '../dialect.js';
 import {
@@ -25,6 +26,7 @@ import {
   wrapPgError,
 } from '../errors.js';
 import { missingIndexForRelation, schemaHasIndexInfo } from '../index-advisor.js';
+import { consoleLogger, logTo, type TurbineLogger } from '../logger.js';
 import {
   executeNestedCreate,
   executeNestedUpdate,
@@ -155,7 +157,7 @@ import type { WhereHost } from './where-compile.js';
 import * as writesMod from './writes.js';
 
 /**
- * SQL-cache lockstep cross-check gate.
+ * SQL-cache lockstep cross-check.
  *
  * The SQL template cache requires three code paths to enumerate where-clause
  * keys identically: `fingerprintWhere` (builds the cache key),
@@ -167,77 +169,28 @@ import * as writesMod from './writes.js';
  * step. It rebuilds the SQL + params fresh on a cache HIT and compares them
  * against what the cache-hit path produced.
  *
- * Modes (decided per HIT; env read inline, not captured once, so tests and
- * perf-sensitive traffic can toggle per process):
- * - `'dev'`: `NODE_ENV !== 'production'` and `TURBINE_DISABLE_CACHE_CHECK !== '1'`
- *   (always checks; the historical default, the whole unit suite runs under it).
- * - `'off'`: dev with `TURBINE_DISABLE_CACHE_CHECK=1`, OR production with no
- *   sampling configured (the hot path is untouched).
- * - `'sampled'`: production with `TURBINE_CACHE_CHECK_SAMPLE` set to a float in
- *   `(0,1]`, re-verify that fraction of cache hits (per-hit `Math.random()`;
- *   `>= 1` checks every hit). A mismatch logs once per distinct fingerprint AND
- *   throws, same as dev. `0`, unset, or an unparseable value means never check.
+ * Whether it runs is the client's `diagnostics.cacheCheck`, resolved once at
+ * construction (see diagnostics.ts; the legacy `TURBINE_DISABLE_CACHE_CHECK` /
+ * `TURBINE_CACHE_CHECK_SAMPLE` variables are read there and nowhere else):
+ * - `'every-hit'` (the development default): every hit is compared, and a
+ *   mismatch throws.
+ * - `{ sample }`: that fraction of hits is compared (per-hit `Math.random()`;
+ *   a sample of 1 compares every hit). A mismatch is logged at `error` once
+ *   per distinct fingerprint, then throws.
+ * - `'off'` (the production default): never compared; the hot path is
+ *   untouched.
  */
-function cacheCrossCheckMode(): 'dev' | 'sampled' | 'off' {
-  const env = crossCheckEnv ?? readCrossCheckEnv();
-  if (env.mode !== 'sampled') return env.mode;
-  // The SAMPLING decision, and only it, is genuinely per hit.
-  return env.rate >= 1 || Math.random() < env.rate ? 'sampled' : 'off';
-}
 
 /**
- * The env-derived half of {@link cacheCrossCheckMode}, resolved ONCE per
- * process and memoized.
- *
- * `process.env` is not a plain object: every property read crosses a C++
- * interceptor. Measured at 112.7 ns per read against 3.6 ns for a module-level
- * constant, and this function ran TWO reads on every cache hit, which put it
- * at the top of the SQL-build CPU profile (12.53% self time, with a further
- * ~12% inside the interceptor) for a value that does not change.
- *
- * It is memoized rather than hoisted to a `const` because the toggle IS
- * observed at runtime, contrary to what a quick look suggests: the
- * cross-check and sampling suites flip `NODE_ENV` /
- * `TURBINE_DISABLE_CACHE_CHECK` / `TURBINE_CACHE_CHECK_SAMPLE` around a
- * synchronous block in-process, not at spawn. So the read is deferred to first
- * use and {@link resetCacheCrossCheckEnv} re-arms it; that is the entire
- * contract, and the only thing lost versus reading every time is that a
- * process which mutates these variables mid-run must say so.
+ * Warn-once namespace for the sampled cross-check's mismatch log, so a hot
+ * mismatch logs exactly once per table and shape instead of flooding the log.
+ * `'every-hit'` does not log (it throws immediately), so only the sampled path
+ * records here. Keyed on the TABLE as well as the fingerprint: the fingerprint
+ * alone carries no table, so a mismatch on one table used to silence the same
+ * shape's mismatch on every other table. The shared registry also bounds the
+ * set (`WARN_ONCE_CAP`) and is what `resetWarnOnce` clears.
  */
-let crossCheckEnv: { mode: 'dev' | 'off' } | { mode: 'sampled'; rate: number } | undefined;
-
-function readCrossCheckEnv(): { mode: 'dev' | 'off' } | { mode: 'sampled'; rate: number } {
-  let resolved: { mode: 'dev' | 'off' } | { mode: 'sampled'; rate: number };
-  if (process.env.NODE_ENV !== 'production') {
-    resolved = { mode: process.env.TURBINE_DISABLE_CACHE_CHECK === '1' ? 'off' : 'dev' };
-  } else {
-    const raw = process.env.TURBINE_CACHE_CHECK_SAMPLE;
-    const rate = raw === undefined ? Number.NaN : Number.parseFloat(raw);
-    resolved = !Number.isFinite(rate) || rate <= 0 ? { mode: 'off' } : { mode: 'sampled', rate };
-  }
-  crossCheckEnv = resolved;
-  return resolved;
-}
-
-/**
- * Discard the memoized cross-check environment so the next cache hit re-reads
- * `process.env`.
- *
- * @internal Exposed for the tests that toggle these variables in-process (see
- * {@link crossCheckEnv}). Production code sets them before the first query and
- * never again.
- */
-export function resetCacheCrossCheckEnv(): void {
-  crossCheckEnv = undefined;
-}
-
-/**
- * Distinct cache-mismatch fingerprints already logged by the sampled production
- * cross-check, so a hot mismatch logs `console.error` exactly once per shape
- * instead of flooding the log. Dev mode does not log (it throws immediately),
- * so this set is only ever touched on the `'sampled'` path.
- */
-const loggedCacheMismatchFingerprints = new Set<string>();
+const CACHE_MISMATCH_WARN_NS = 'cacheMismatch';
 
 /**
  * Marginal cost of keeping a to-one relation on the JOIN plan, per parent row.
@@ -803,6 +756,17 @@ export class QueryInterface<
    */
   private variableArityShape = false;
   private readonly middlewares: MiddlewareFn[];
+  /** The client's resolved `diagnostics` (see diagnostics.ts), fixed for this instance's life. */
+  private readonly diagnostics: ResolvedDiagnostics;
+  /** Where this instance's log lines go: the client's `logger`, else the console logger. */
+  private readonly logger: TurbineLogger;
+  /**
+   * {@link logger} when `diagnostics.advice` is on, else `undefined`. Every
+   * per-query advice site starts with `const log = this.advice; if (!log)
+   * return;`, so with advice off a site costs one property read and builds no
+   * message.
+   */
+  private readonly advice: TurbineLogger | undefined;
   private readonly defaultLimit?: number;
   private readonly warnOnUnlimited: boolean;
   private readonly scopedConnect: boolean;
@@ -1022,6 +986,11 @@ export class QueryInterface<
     }
     this.tableMeta = meta;
     this.middlewares = middlewares ?? [];
+    // Resolved by the client once; a QueryInterface built directly (tests,
+    // tooling) resolves here, at construction, never per call.
+    this.diagnostics = resolveDiagnostics(options?.diagnostics);
+    this.logger = options?.logger ?? consoleLogger;
+    this.advice = this.diagnostics.advice ? this.logger : undefined;
     this.defaultLimit = options?.defaultLimit;
     // Default to ON: surfacing accidental full-table scans is more valuable
     // than the (small) risk of noisy logs. Callers opt out globally with
@@ -1134,6 +1103,8 @@ export class QueryInterface<
     // per `build*` call, so it is exposed as a LIVE getter (not a copied value).
     const self = this;
     this.ctx = {
+      diagnostics: this.diagnostics,
+      logger: this.logger,
       dialect: this.dialect,
       table: this.table,
       schema: this.schema,
@@ -1203,7 +1174,7 @@ export class QueryInterface<
   }
 
   /**
-   * Dev-only, once per table: the columns whose database type is absent from
+   * Advice (`diagnostics.advice`), once per table: the columns whose database type is absent from
    * BOTH the column entry and the table-level type maps, the residual case
    * after the two-source resolution above.
    *
@@ -1230,19 +1201,20 @@ export class QueryInterface<
    *
    * PostgreSQL only: the zone-less `timestamp` rewrite is Postgres-gated (see
    * `utcDateTimeRewrite` in where.ts), so on the other engines a missing type
-   * costs only the `date` rewrite. Suppressed under
-   * `NODE_ENV=production` like the other dev diagnostics and deduped through
-   * the shared registry, so a hot table logs one line for the process.
+   * costs only the `date` rewrite. Silent when `diagnostics.advice` is off
+   * (the production default) like the other advice, and deduped through the
+   * shared registry, so a hot table logs one line for the process.
    *
    * Cannot throw on odd metadata: it walks `tableMeta.columns`, the array the
    * constructor loop above has already iterated (and that client.ts validates
    * as an array), never `dateColumns`, which is a `Set` in every first-party
    * metadata path but arrives as a plain object from JSON-round-tripped
-   * metadata. A dev-only diagnostic that crashes a shape production would serve
+   * metadata. An advisory diagnostic that crashes a shape production would serve
    * is worse than the bug it reports.
    */
   private warnUntypedColumns(): void {
-    if (process.env.NODE_ENV === 'production') return;
+    const log = this.advice;
+    if (!log) return;
     if (this.dialect.name !== 'postgresql') return;
     const untyped: string[] = [];
     for (const col of this.tableMeta.columns) {
@@ -1255,8 +1227,10 @@ export class QueryInterface<
     const MAX_NAMED = 12;
     const named = untyped.slice(0, MAX_NAMED).join(', ');
     const rest = untyped.length > MAX_NAMED ? ` (+${untyped.length - MAX_NAMED} more)` : '';
-    console.warn(
-      `[turbine] table "${this.table}": no database type in metadata for column(s) ${named}${rest} (neither the ` +
+    logTo(
+      log,
+      'warn',
+      `table "${this.table}": no database type in metadata for column(s) ${named}${rest} (neither the ` +
         "column entry's `dialectType`/`pgType` nor the table-level `dialectTypes`/`pgTypes` map). Turbine cannot " +
         'tell which of them are zone-less, so it skips the UTC bind rewrite and a `Date` goes to the driver ' +
         "as-is: right for `timestamptz`, but a zone-less `date`/`timestamp` then stores the PROCESS's local " +
@@ -1264,6 +1238,7 @@ export class QueryInterface<
         '`time`/`timetz` column rejects the value outright (`22007 invalid input syntax for type time`). ' +
         'Columns whose type IS resolved, every `timestamptz` among them, are unaffected. Fix: regenerate with ' +
         '`npx turbine generate`, or set the column types in `defineSchema`.',
+      { code: 'untyped-columns', table: this.table, columns: untyped },
     );
   }
 
@@ -1947,13 +1922,13 @@ export class QueryInterface<
   }
 
   /**
-   * Dev-only, once per query shape: an unordered paginating findMany returns a
+   * Advice (`diagnostics.advice`), once per query shape: an unordered paginating findMany returns a
    * non-deterministic page (see {@link isUnorderedPage}), and on real data it is
    * also usually the slower plan (an unordered `LIMIT` can discard tens of
    * thousands of heap rows that an index scan on the key would have skipped).
    *
-   * Gated exactly like the other dev diagnostics (silent under
-   * `NODE_ENV=production`) and consistent with `warnOnUnlimited`: a per-call
+   * Gated exactly like the other advice (silent when `diagnostics.advice` is
+   * off) and consistent with `warnOnUnlimited`: a per-call
    * `warnOnUnlimited: false` silences it, `true` forces it past a config-level
    * opt-out, and a config/per-table `warnOnUnlimited: false` silences it. Deduped
    * process-wide through the shared warn registry, so it can never spam.
@@ -1970,7 +1945,8 @@ export class QueryInterface<
     distinct?: unknown;
     warnOnUnlimited?: boolean;
   }): void {
-    if (process.env.NODE_ENV === 'production') return;
+    const log = this.advice;
+    if (!log) return;
     if (this.implicitPkOrdering && this.implicitPkOrderBy(args) !== undefined) return;
     const perCall = args?.warnOnUnlimited;
     if (perCall === false) return;
@@ -1983,11 +1959,14 @@ export class QueryInterface<
     const pk = (this.tableMeta.primaryKey ?? []).map((c) => this.tableMeta.reverseColumnMap[c] ?? c);
     const asOrderBy = pk.length === 1 ? `{ ${pk[0]}: 'asc' }` : `[${pk.map((f) => `{ ${f}: 'asc' }`).join(', ')}]`;
     const suggestion = pk.length > 0 ? `Add \`orderBy: ${asOrderBy}\`` : 'Add an `orderBy` on a unique column';
-    console.warn(
-      `[turbine] findMany on "${this.table}" paginates (${shape}) with no orderBy: the page is NOT ` +
+    logTo(
+      log,
+      'warn',
+      `findMany on "${this.table}" paginates (${shape}) with no orderBy: the page is NOT ` +
         'deterministic (the same query can return different rows as the table changes, so a row may appear ' +
         `on two pages or on none). ${suggestion}, or set \`implicitPkOrdering: true\` in the client config ` +
         'to order paginated queries by the primary key automatically.',
+      { code: 'unordered-page', table: this.table, operation: 'findMany', paging: shape },
     );
   }
 
@@ -2229,7 +2208,7 @@ export class QueryInterface<
   }
 
   /**
-   * Dev-only once-per-relation note that `'auto'` engaged the batched fallback.
+   * Advice, once per relation: `'auto'` engaged the batched fallback.
    *
    * Both lines follow the same four parts: the CONDITION that tripped the rule,
    * the MECHANISM (which plan shape was replaced by which, and what that costs),
@@ -2238,12 +2217,15 @@ export class QueryInterface<
    * as a bug, so the mechanism sentence is not optional.
    */
   private emitAutoNotes(engaged: AutoEngaged[]): void {
-    if (process.env.NODE_ENV === 'production') return;
+    const log = this.advice;
+    if (!log) return;
     for (const e of engaged) {
       if (!shouldWarnOnce(WARN_NS.autoStrategy, `${this.table}.${e.relation}`)) continue;
       if (e.reason === 'to-one-cardinality') {
-        console.warn(
-          `[turbine] auto strategy: to-one relation "${e.relation}" on "${this.table}" loads batched ` +
+        logTo(
+          log,
+          'warn',
+          `auto strategy: to-one relation "${e.relation}" on "${this.table}" loads batched ` +
             `(the query is unbounded or its limit exceeds ${this.autoToOneThreshold()} rows). On the join plan ` +
             'a to-one relation is a correlated subquery the engine re-evaluates once per parent row, a per-row ' +
             'cost that stands even on a unique index; batched replaces it with ONE follow-up statement ' +
@@ -2251,6 +2233,7 @@ export class QueryInterface<
             'trip. Bound the query with a smaller `limit`, tune `autoToOneJoinMaxRows` (the break-even is ' +
             "round-trip time / per-row cost), or set `relationLoadStrategy: 'join'` to force the " +
             'single-statement plan.',
+          { code: 'auto-strategy', table: this.table, relation: e.relation, reason: e.reason },
         );
         continue;
       }
@@ -2270,10 +2253,13 @@ export class QueryInterface<
           : ' On the join plan that relation is a correlated subquery re-evaluated once per parent row, so an ' +
             `unindexed probe is one full scan of "${child}" per parent row; the batched follow-up scans it ` +
             'once for the whole page.';
-      console.warn(
-        `[turbine] auto strategy: relation "${e.relation}" on "${this.table}" loads batched (${probe}).${why} ` +
+      logTo(
+        log,
+        'warn',
+        `auto strategy: relation "${e.relation}" on "${this.table}" loads batched (${probe}).${why} ` +
           "Create the covering index (or set `relationLoadStrategy: 'join'` to force the single-statement " +
           'plan); run `npx turbine doctor` for the exact CREATE INDEX SQL.',
+        { code: 'auto-strategy', table: this.table, relation: e.relation, reason: e.reason },
       );
     }
   }
@@ -2665,8 +2651,11 @@ export class QueryInterface<
     collectedParams: unknown[],
   ): void {
     if (!this.lastCacheHit) return;
-    const mode = cacheCrossCheckMode();
-    if (mode === 'off') return;
+    const check = this.diagnostics.cacheCheck;
+    if (check === 'off') return;
+    const sampled = typeof check === 'object';
+    // The sampling decision, and only it, is per hit.
+    if (sampled && check.sample < 1 && Math.random() >= check.sample) return;
 
     const freshParams: unknown[] = [];
     const freshSql = build(freshParams);
@@ -2691,12 +2680,11 @@ export class QueryInterface<
       `This is a Turbine internal invariant violation, please report it at ` +
       `https://github.com/zvndev/turbine-orm/issues. The fingerprint, SQL-build, and ` +
       `param-collect paths must enumerate where-clause keys identically.\n${details.join('\n')}`;
-    // Sampled production path: log once per distinct fingerprint so the failure
-    // is durably recorded in the server log before the throw unwinds the query.
-    // (Dev mode throws straight away; its behavior is unchanged.)
-    if (mode === 'sampled' && !loggedCacheMismatchFingerprints.has(cacheKey)) {
-      loggedCacheMismatchFingerprints.add(cacheKey);
-      console.error(message);
+    // Sampled path: log once per distinct fingerprint so the failure is
+    // durably recorded in the server log before the throw unwinds the query.
+    // ('every-hit' throws straight away; its behavior is unchanged.)
+    if (sampled && shouldWarnOnce(CACHE_MISMATCH_WARN_NS, `${this.table}|${cacheKey}`)) {
+      logTo(this.logger, 'error', message, { code: 'cache-mismatch', table: this.table, operation: op });
     }
     throw new ValidationError(message);
   }
@@ -3470,7 +3458,7 @@ export class QueryInterface<
     // can be complete. Putting it in each method instead would mean fifteen
     // sites and a new one every time an operation is added, which is precisely
     // how the surface it checks came to need checking.
-    warnUnknownQueryOptions(this.table, action, args);
+    warnUnknownQueryOptions(this.table, action, args, this.advice ?? null);
     if (this.middlewares.length === 0) {
       return executor();
     }
@@ -3837,19 +3825,22 @@ export class QueryInterface<
     this.maybeWarnUnlimited(args);
     this.maybeWarnUnorderedPage(args);
 
-    // Dev-only: warn on deeply nested with clauses
-    if (process.env.NODE_ENV !== 'production') {
-      if (args?.with) {
-        const depth = this.measureWithDepth(args.with as WithClause);
-        if (depth > 5 && shouldWarnOnce(WARN_NS.deepWith, this.table)) {
-          console.warn(
-            `[turbine] Deep with clause (depth ${depth}) on "${this.tableMeta.name}": every level is a ` +
-              'correlated subquery the engine re-evaluates once per row of the level above, so the work ' +
-              'multiplies down the tree and the whole subtree is built as JSON inside each parent row. Split ' +
-              "into separate queries, or use `relationLoadStrategy: 'batched'` (one flat statement per " +
-              'relation, no per-parent re-evaluation). Dev-only: silent under `NODE_ENV=production`.',
-          );
-        }
+    // Advice: warn on deeply nested with clauses.
+    const advice = this.advice;
+    if (advice && args?.with) {
+      const depth = this.measureWithDepth(args.with as WithClause);
+      if (depth > 5 && shouldWarnOnce(WARN_NS.deepWith, this.table)) {
+        logTo(
+          advice,
+          'warn',
+          `Deep with clause (depth ${depth}) on "${this.tableMeta.name}": every level is a ` +
+            'correlated subquery the engine re-evaluates once per row of the level above, so the work ' +
+            'multiplies down the tree and the whole subtree is built as JSON inside each parent row. Split ' +
+            "into separate queries, or use `relationLoadStrategy: 'batched'` (one flat statement per " +
+            'relation, no per-parent re-evaluation). Advice: silent when `diagnostics.advice` is off, as it ' +
+            'is by default in production.',
+          { code: 'deep-with', table: this.table, operation: 'findMany', depth },
+        );
       }
     }
 
@@ -3943,7 +3934,7 @@ export class QueryInterface<
   }
 
   /**
-   * Emit a one-time `console.warn` when {@link findMany} is called without an
+   * Emit a one-time warning when {@link findMany} is called without an
    * explicit `limit`/`take` and `warnOnUnlimited` has not been disabled.
    *
    * Deduped per QueryInterface instance via {@link warnedTables} so a busy
@@ -3965,12 +3956,15 @@ export class QueryInterface<
     if (this.whereMatchesAtMostOneRow((args as { where?: unknown } | undefined)?.where)) return;
     if (this.warnedTables.has(this.table)) return;
     this.warnedTables.add(this.table);
-    console.warn(
-      `[turbine] warning: findMany on "${this.table}" has no limit: the statement is emitted with no row limit, ` +
+    logTo(
+      this.logger,
+      'warn',
+      `warning: findMany on "${this.table}" has no limit: the statement is emitted with no row limit, ` +
         'so the engine returns every matching row and the driver materializes all of them as objects before ' +
         'this call resolves (the cost grows with the table, not with the rows you use). Pass `limit`/`take`, ' +
         'or set `defaultLimit` in the client config; silence with `warnOnUnlimited: false` (per call, per ' +
         'table, or in config).',
+      { code: 'unlimited-find-many', table: this.table, operation: 'findMany' },
     );
   }
 
@@ -4019,7 +4013,7 @@ export class QueryInterface<
 
   /**
    * Recursively measure the maximum depth of a `with` clause tree.
-   * Used by the dev-only deep-with warning guard.
+   * Used by the deep-with advice.
    */
   private measureWithDepth(withClause: WithClause): number {
     let maxDepth = 1;
@@ -4075,7 +4069,7 @@ export class QueryInterface<
     if (args?.orderBy !== undefined) {
       const deduped = dedupeOrderEntries(this.tableMeta, orderByEntries(args.orderBy), this.table);
       if (deduped) {
-        warnRedundantSortTerm(this.table, 'orderBy', deduped.dropped);
+        warnRedundantSortTerm(this.advice, this.table, 'orderBy', deduped.dropped);
         args = {
           ...args,
           orderBy: deduped.entries.map(([k, v]) => ({ [k]: v })) as NonNullable<typeof args>['orderBy'],
@@ -4085,7 +4079,7 @@ export class QueryInterface<
     if (args?.distinct && args.distinct.length > 0) {
       const deduped = dedupeColumnList(this.tableMeta, args.distinct as string[]);
       if (deduped) {
-        warnRedundantSortTerm(this.table, 'distinct', deduped.dropped);
+        warnRedundantSortTerm(this.advice, this.table, 'distinct', deduped.dropped);
         args = { ...args, distinct: deduped.columns as NonNullable<typeof args>['distinct'] };
       }
     }
@@ -4532,7 +4526,7 @@ export class QueryInterface<
     // the unknown-key diagnostic has to be hung here as well or a stream would
     // be the one read that silently drops an `include`. Both public methods
     // reach this, and each passes its own name.
-    warnUnknownQueryOptions(this.table, action, args);
+    warnUnknownQueryOptions(this.table, action, args, this.advice ?? null);
     // Streaming is ALREADY immune to the generic-plan cliff: the speculative
     // fetch has never passed a prepared name, and the cursor path runs through
     // DECLARE, so neither statement enters the plan cache. `preparedNameFor` is
@@ -5563,13 +5557,17 @@ export class QueryInterface<
     return relationsMod.planFlattenWith(this.ctx, this.table, withClause, includePii);
   }
 
-  /** Dev-only once-only note that `'flatten'` was refused for the whole query. */
+  /** Advice, once per reason: `'flatten'` was refused for the whole query. */
   private warnFlattenBlocked(reason: string): void {
-    if (process.env.NODE_ENV === 'production') return;
+    const log = this.advice;
+    if (!log) return;
     if (!shouldWarnOnce(WARN_NS.flattenFallback, `${this.table}|query|${reason}`)) return;
-    console.warn(
-      `[turbine] relationLoadStrategy: 'flatten' did not engage on "${this.table}": ${reason}. ` +
+    logTo(
+      log,
+      'warn',
+      `relationLoadStrategy: 'flatten' did not engage on "${this.table}": ${reason}. ` +
         'Every relation loads via the correlated subquery instead (same rows, same values, different plan).',
+      { code: 'flatten-blocked', table: this.table, reason },
     );
   }
 
@@ -5821,10 +5819,10 @@ export class QueryInterface<
    * one, is the acknowledgement, and the warning exists to surface an
    * unacknowledged trade rather than to nag.
    *
-   * NOT DEV-ONLY, unlike every other warning in this codebase, and deliberately
-   * so. Production is exactly where a destructive write commits and where the
-   * row cannot be recovered afterwards, so a warning that goes quiet under
-   * `NODE_ENV=production` is silent in the only place it matters. The cost is
+   * NOT ADVICE: it fires whatever `diagnostics` says, deliberately. Production
+   * is exactly where a destructive write commits and where the row cannot be
+   * recovered afterwards, so a warning that goes quiet in production mode is
+   * silent in the only place it matters. The cost is
    * bounded to the point of irrelevance: once per process per field, and only
    * on a row that actually held an infinity.
    *
@@ -5835,8 +5833,10 @@ export class QueryInterface<
   private warnTemporalInfinity(table: string, field: string): void {
     if (!this.warnTemporalInfinityUnset) return;
     if (!shouldWarnOnce(WARN_NS.temporalInfinity, `${table}.${field}`)) return;
-    console.warn(
-      `[turbine] ${table}.${field} holds the Postgres value \`infinity\` (or \`-infinity\`). JavaScript has ` +
+    logTo(
+      this.logger,
+      'warn',
+      `${table}.${field} holds the Postgres value \`infinity\` (or \`-infinity\`). JavaScript has ` +
         'no Date for it, so it reads as the JS number `Infinity` / `-Infinity` on a field the generated ' +
         'types declare as `Date`: `.toISOString()` and `.getTime()` throw a TypeError on these rows, and ' +
         '`JSON.stringify` still renders them null because JSON has no infinity literal. The number is the ' +
@@ -5847,6 +5847,7 @@ export class QueryInterface<
         "reading and silence the warning, or `'null'` to read null instead, accepting that a stored " +
         'infinity then looks exactly like a stored NULL and a read-modify-write over a nullable column ' +
         'stores SQL NULL, destroying the value with no error.',
+      { code: 'temporal-infinity', table, field },
     );
   }
 

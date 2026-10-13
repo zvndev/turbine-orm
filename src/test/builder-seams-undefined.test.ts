@@ -19,7 +19,6 @@ import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import type pg from 'pg';
 import { ValidationError } from '../errors.js';
-import { resetCacheCrossCheckEnv } from '../query/builder.js';
 import { QueryInterface } from '../query/index.js';
 import { pruneUndefinedArgs, whereEmptiedByPruning } from '../query/normalize-args.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
@@ -266,13 +265,11 @@ const PAIRS: Pair[] = [
 function inProduction(fn: () => void): void {
   const prev = process.env.NODE_ENV;
   process.env.NODE_ENV = 'production';
-  resetCacheCrossCheckEnv();
   try {
     fn();
   } finally {
     if (prev === undefined) delete process.env.NODE_ENV;
     else process.env.NODE_ENV = prev;
-    resetCacheCrossCheckEnv();
   }
 }
 

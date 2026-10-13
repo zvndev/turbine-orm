@@ -8,8 +8,11 @@
  * - The default logger's console output is the text Turbine printed before the
  *   logger existed. The `console` strings below were captured by running these
  *   same triggers against the build before this change, so they are a snapshot,
- *   not a transcription. The one deliberate difference: a `$listen` loss it will
- *   retry is now `console.warn` (level `warn`) rather than `console.error`.
+ *   not a transcription. Three deliberate differences: a `$listen` loss it will
+ *   retry is now `console.warn` (level `warn`) rather than `console.error`; the
+ *   sampled cache-mismatch line now carries the `[turbine]` prefix like every
+ *   other line; and the deep-with advice names `diagnostics.advice` instead of
+ *   `NODE_ENV=production` as its switch.
  * - `{}` silences Turbine; a logger that throws never fails the caller; no log
  *   line carries a bound parameter value, even with `logQueryParams: true`.
  */
@@ -67,6 +70,55 @@ const MODULES: FleetModules = {
 type Expectation = { level: TurbineLogLevel; console: string } | { level: TurbineLogLevel; integration: string };
 
 const EXPECT: Record<TurbineLogCode, Expectation> = {
+  'untyped-columns': {
+    level: 'warn',
+    console:
+      '[turbine] table "items": no database type in metadata for column(s) name (neither the column entry\'s `dialectType`/`pgType` nor the table-level `dialectTypes`/`pgTypes` map). Turbine cannot tell which of them are zone-less, so it skips the UTC bind rewrite and a `Date` goes to the driver as-is: right for `timestamptz`, but a zone-less `date`/`timestamp` then stores the PROCESS\'s local calendar fields rather than UTC (silently, since the read path shifts back by the same offset), and a `time`/`timetz` column rejects the value outright (`22007 invalid input syntax for type time`). Columns whose type IS resolved, every `timestamptz` among them, are unaffected. Fix: regenerate with `npx turbine generate`, or set the column types in `defineSchema`.',
+  },
+  'unordered-page': {
+    level: 'warn',
+    console:
+      '[turbine] findMany on "items" paginates (limit+offset) with no orderBy: the page is NOT deterministic (the same query can return different rows as the table changes, so a row may appear on two pages or on none). Add `orderBy: { id: \'asc\' }`, or set `implicitPkOrdering: true` in the client config to order paginated queries by the primary key automatically.',
+  },
+  'auto-strategy': {
+    level: 'warn',
+    console:
+      '[turbine] auto strategy: relation "posts" on "users" loads batched (probe "posts"(user_id) has no covering index). On the join plan that relation is a correlated subquery re-evaluated once per parent row, so an unindexed probe is one full scan of "posts" per parent row; the batched follow-up scans it once for the whole page. Create the covering index (or set `relationLoadStrategy: \'join\'` to force the single-statement plan); run `npx turbine doctor` for the exact CREATE INDEX SQL.',
+  },
+  'deep-with': {
+    level: 'warn',
+    console:
+      '[turbine] Deep with clause (depth 6) on "users": every level is a correlated subquery the engine re-evaluates once per row of the level above, so the work multiplies down the tree and the whole subtree is built as JSON inside each parent row. Split into separate queries, or use `relationLoadStrategy: \'batched\'` (one flat statement per relation, no per-parent re-evaluation). Advice: silent when `diagnostics.advice` is off, as it is by default in production.',
+  },
+  'flatten-blocked': {
+    level: 'warn',
+    console:
+      '[turbine] relationLoadStrategy: \'flatten\' did not engage on "users": the query uses `distinct`. Every relation loads via the correlated subquery instead (same rows, same values, different plan).',
+  },
+  'redundant-sort-term': {
+    level: 'warn',
+    console:
+      '[turbine] orderBy on table "items": "id" is named twice, so the later one was dropped. It could not have changed the result (the earlier term already orders those rows), and dropping it keeps the query on a shared prepared statement. Remove it to silence this.',
+  },
+  'unknown-query-option': {
+    level: 'warn',
+    console: '[turbine] unknown option "include" in items.findMany(), it is ignored. Turbine spells this "with".',
+  },
+  'unlimited-find-many': {
+    level: 'warn',
+    console:
+      '[turbine] warning: findMany on "items" has no limit: the statement is emitted with no row limit, so the engine returns every matching row and the driver materializes all of them as objects before this call resolves (the cost grows with the table, not with the rows you use). Pass `limit`/`take`, or set `defaultLimit` in the client config; silence with `warnOnUnlimited: false` (per call, per table, or in config).',
+  },
+  'temporal-infinity': {
+    level: 'warn',
+    console:
+      "[turbine] events.startsAt holds the Postgres value `infinity` (or `-infinity`). JavaScript has no Date for it, so it reads as the JS number `Infinity` / `-Infinity` on a field the generated types declare as `Date`: `.toISOString()` and `.getTime()` throw a TypeError on these rows, and `JSON.stringify` still renders them null because JSON has no infinity literal. The number is the lossless reading, though: it binds straight back, so writing a row you just read stores `infinity` again. Two more things this column can no longer do: `where: { col: null }` still means IS NULL and does NOT match these rows (filter them with `{ col: 'infinity' }`), and `groupBy` / `distinct` cannot tell infinity, -infinity and NULL apart. Set `temporalInfinity: 'preserve'` to confirm this reading and silence the warning, or `'null'` to read null instead, accepting that a stored infinity then looks exactly like a stored NULL and a read-modify-write over a nullable column stores SQL NULL, destroying the value with no error.",
+  },
+  'cache-mismatch': {
+    level: 'error',
+    console:
+      '[turbine] SQL cache lockstep violation on findMany (fingerprint "fm:name:eq|c=*|o=|l=1|off=0|cur=|d=|w=|pii=0|je=p"). This is a Turbine internal invariant violation, please report it at https://github.com/zvndev/turbine-orm/issues. The fingerprint, SQL-build, and param-collect paths must enumerate where-clause keys identically.\ncached SQL and freshly-built SQL diverge:\n  cached = <SELECT 1 -- corrupted>\n  fresh  = <SELECT "items".* FROM "items" WHERE "name" = $1 LIMIT $2>',
+  },
   'parser-overwrite': {
     level: 'warn',
     console:

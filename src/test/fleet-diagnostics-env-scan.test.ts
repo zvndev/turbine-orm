@@ -34,9 +34,6 @@ const CONSOLE_CALLERS = new Set(['logger.ts', 'seed.ts']);
  * file is converted its entry has to go.
  */
 const PENDING: Readonly<Record<string, string>> = {
-  'query/builder.ts': 'builder advice, cache self-check and no-limit warnings: logger lane phase 2',
-  'query/utils.ts': 'warnRedundantSortTerm: logger lane phase 2',
-  'query/option-surface.ts': 'warnUnknownQueryOptions: logger lane phase 2',
   'powql.ts': 'PowDB unknown-option and no-limit warnings: scheduled after the fix lanes release powql.ts',
 };
 

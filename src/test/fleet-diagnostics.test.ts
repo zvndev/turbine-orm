@@ -16,6 +16,8 @@ import { type DiagnosticsEnv, resolveDiagnostics } from '../diagnostics.js';
 import { ValidationError } from '../errors.js';
 import { CLIENT_LOG_CONTEXT, type ClientLogContext, type TurbineLogEntry, type TurbineLogger } from '../logger.js';
 import { createPrismaCompatClient } from '../prisma-compat.js';
+import { QueryInterface } from '../query/index.js';
+import { resetWarnOnce } from '../query/warn-registry.js';
 import type { SchemaMetadata } from '../schema.js';
 import { fakePool } from './fleet-logger-triggers.js';
 import { mockTable } from './helpers.js';
@@ -296,5 +298,91 @@ describe('diagnostics: the client', () => {
   it('$primary() shares the resolved value by reference', () => {
     const db = new TurbineClient({ pool: fakePool() as never, diagnostics: 'production' }, itemsSchema());
     assert.equal(logContext(db.$primary() as TurbineClient).diagnostics, logContext(db).diagnostics);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The query interface: advice and the cache self-check follow the option
+// ---------------------------------------------------------------------------
+
+/** A query interface over `items` on a pool that answers every query with no rows. */
+function itemsInterface(options: Record<string, unknown>): QueryInterface<Record<string, unknown>> {
+  return new QueryInterface(fakePool() as never, 'items', itemsSchema(), [], options as never);
+}
+
+/** Warm the cache, corrupt the cached SQL, and report whether the next hit was cross-checked. */
+function crossChecks(qi: QueryInterface<Record<string, unknown>>): boolean {
+  qi.buildFindMany({ where: { name: 'a' }, limit: 1 } as never);
+  const cache = (qi as unknown as { sqlTemplateCache: { cache: Map<string, { sql: string }> } }).sqlTemplateCache.cache;
+  for (const entry of cache.values()) entry.sql = 'SELECT 1 -- corrupted';
+  try {
+    qi.buildFindMany({ where: { name: 'b' }, limit: 1 } as never);
+    return false;
+  } catch (err) {
+    assert.match(String((err as Error).message), /SQL cache lockstep violation/);
+    return true;
+  }
+}
+
+/** Codes a query interface logs for an unknown option plus an unordered page. */
+async function queryAdvice(options: Record<string, unknown>): Promise<string[]> {
+  const { logger, codes } = recorder();
+  resetWarnOnce();
+  await itemsInterface({ ...options, logger }).findMany({
+    limit: 1,
+    [`fleetUnknown${Math.random().toString(36).slice(2)}`]: true,
+  } as never);
+  return codes.filter((c) => c === 'unknown-query-option' || c === 'unordered-page').sort();
+}
+
+describe('diagnostics: the query interface', () => {
+  it("'production' under NODE_ENV=development: no advice, no cache self-check", async () => {
+    await withNodeEnv('development', async () => {
+      assert.deepEqual(await queryAdvice({ diagnostics: 'production' }), []);
+      assert.equal(crossChecks(itemsInterface({ diagnostics: 'production' })), false);
+    });
+  });
+
+  it("'development' under NODE_ENV=production: advice and the cache self-check", async () => {
+    await withNodeEnv('production', async () => {
+      assert.deepEqual(await queryAdvice({ diagnostics: 'development' }), ['unknown-query-option', 'unordered-page']);
+      assert.equal(crossChecks(itemsInterface({ diagnostics: 'development' })), true);
+    });
+  });
+
+  it('per-part overrides: advice on with the check off, and the reverse', async () => {
+    assert.deepEqual(await queryAdvice({ diagnostics: { mode: 'production', advice: true } }), [
+      'unknown-query-option',
+      'unordered-page',
+    ]);
+    assert.equal(crossChecks(itemsInterface({ diagnostics: { mode: 'production', advice: true } })), false);
+    assert.deepEqual(await queryAdvice({ diagnostics: { advice: false } }), []);
+    assert.equal(crossChecks(itemsInterface({ diagnostics: { advice: false } })), true);
+  });
+
+  it('with no option, NODE_ENV at construction decides, and a later change does not move it', async () => {
+    const dev = await withNodeEnv('development', () => itemsInterface({}));
+    const prod = await withNodeEnv('production', () => itemsInterface({}));
+    await withNodeEnv('production', () => assert.equal(crossChecks(dev), true));
+    await withNodeEnv('development', () => assert.equal(crossChecks(prod), false));
+  });
+
+  it('a malformed option is E003 at construction', () => {
+    assert.throws(() => itemsInterface({ diagnostics: { cacheCheck: { sample: 2 } } }), isE003(/got 2/));
+  });
+
+  it("a client's diagnostics reach its table accessors", async () => {
+    const { logger, codes } = recorder();
+    resetWarnOnce();
+    const db = await withNodeEnv(
+      'development',
+      () => new TurbineClient({ pool: fakePool() as never, logger, diagnostics: 'production' }, itemsSchema()),
+    );
+    await db.table('items').findMany({ limit: 1, fleetUnknownOption: true } as never);
+    assert.deepEqual(
+      codes.filter((c) => c === 'unknown-query-option' || c === 'unordered-page'),
+      [],
+    );
+    await db.disconnect();
   });
 });

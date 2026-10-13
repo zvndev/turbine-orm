@@ -21,7 +21,6 @@ import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
 import { mssqlDialect } from '../mssql.js';
 import { mysqlDialect } from '../mysql.js';
-import { resetCacheCrossCheckEnv } from '../query/builder.js';
 import type { SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, sqliteDialect, turbineSqlite } from '../sqlite.js';
 import { makeQuery, mockTable, skipGate } from './helpers.js';
@@ -114,12 +113,10 @@ let prevEnv: string | undefined;
 function production(): void {
   prevEnv = process.env.NODE_ENV;
   process.env.NODE_ENV = 'production';
-  resetCacheCrossCheckEnv();
 }
 function restoreEnv(): void {
   if (prevEnv === undefined) delete process.env.NODE_ENV;
   else process.env.NODE_ENV = prevEnv;
-  resetCacheCrossCheckEnv();
 }
 
 describe('relation offset: join plan SQL (PostgreSQL)', () => {

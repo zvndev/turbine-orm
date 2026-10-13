@@ -502,7 +502,9 @@ export function buildGroupByOrderBy(
   const pushOrderTerm = (expr: string, label: string, value: OrderDirection | OrderBySpec): void => {
     const first = seen.get(expr);
     if (first !== undefined) {
-      warnRedundantSortTerm(qi.table, 'groupBy orderBy', [{ key: label, first, resolved: expr }]);
+      warnRedundantSortTerm(whereMod.adviceLogger(qi), qi.table, 'groupBy orderBy', [
+        { key: label, first, resolved: expr },
+      ]);
       return;
     }
     seen.set(expr, label);
@@ -649,7 +651,8 @@ export function buildDistinctOnSource<T extends object>(
   // keys come from an object, and the DISTINCT ON columns lead the ORDER BY, so
   // a key repeating one of them is already merged by `orderParts`' construction.
   const dedupedCols = dedupeColumnList(qi.tableMeta, distinctOn.columns, 'distinctOn.columns');
-  if (dedupedCols) warnRedundantSortTerm(qi.table, 'groupBy distinctOn.columns', dedupedCols.dropped);
+  if (dedupedCols)
+    warnRedundantSortTerm(whereMod.adviceLogger(qi), qi.table, 'groupBy distinctOn.columns', dedupedCols.dropped);
   const distinctCols = (dedupedCols?.columns ?? distinctOn.columns).map((c) => qi.q(qi.toColumn(c)));
   // DISTINCT ON expressions must lead the ORDER BY; the user's orderBy then
   // decides which row survives per combination.

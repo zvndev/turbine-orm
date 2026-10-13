@@ -59,6 +59,14 @@ export {
   type TurbineDriver,
   withRetry,
 } from './client.js';
+// Diagnostics: per-query advice and the SQL-cache self-check, one switch
+export type {
+  CacheCheckMode,
+  DiagnosticsConfig,
+  DiagnosticsMode,
+  DiagnosticsOptions,
+  ResolvedDiagnostics,
+} from './diagnostics.js';
 // Dialect contract
 export type {
   BuiltStatement,
@@ -115,6 +123,8 @@ export {
 export { type GenerateOptions, generate } from './generate.js';
 // Introspection
 export { type IntrospectOptions, introspect } from './introspect.js';
+// Logging: where Turbine's log lines go
+export type { TurbineLogCode, TurbineLogEntry, TurbineLogger, TurbineLogLevel } from './logger.js';
 // Nested writes
 export {
   executeNestedCreate,

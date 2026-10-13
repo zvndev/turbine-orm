@@ -1965,7 +1965,7 @@ export function relationInProjectionMessage(table: string, field: string, clause
 }
 
 /**
- * Dev-only advisory for a sort/grouping term Turbine dropped as redundant
+ * Advice (`diagnostics.advice`) for a sort/grouping term Turbine dropped as redundant
  * (`filters.ts` `dedupeOrderEntries` / `dedupeColumnList`).
  *
  * Deliberately a WARNING and not an error, and deliberately not silent either.
@@ -1974,29 +1974,34 @@ export function relationInProjectionMessage(table: string, field: string, clause
  * plus an unconditional primary-key tiebreak, which collide exactly when the
  * caller sorts by the primary key). But a caller who wrote the duplicate by
  * hand, or who believes a second key is doing something, should hear about it
- * once. Dev-only for the usual reason: it describes the QUERY the application
+ * once. Advice for the usual reason: it describes the QUERY the application
  * sends, which does not vary with the environment, so a production process
- * learns nothing from repeating it.
+ * learns nothing from repeating it. The caller passes its advice logger, or
+ * `undefined` when advice is off.
  *
  * Keyed per dropped key, so a sort assembled per request from the same UI says
  * it once rather than once per request.
  */
 export function warnRedundantSortTerm(
+  advice: TurbineLogger | undefined,
   table: string,
   clause: string,
   dropped: readonly { key: string; first: string; resolved: string }[],
 ): void {
-  if (process.env.NODE_ENV === 'production') return;
+  if (!advice) return;
   for (const d of dropped) {
     if (!shouldWarnOnce(WARN_NS.redundantSortTerm, `${table}|${clause}|${d.key}`)) continue;
     const how =
       d.first === d.key
         ? `"${d.key}" is named twice`
         : `"${d.key}" and the earlier "${d.first}" both target ${d.resolved}`;
-    console.warn(
-      `[turbine] ${clause} on table "${table}": ${how}, so the later one was dropped. It could not have ` +
+    logTo(
+      advice,
+      'warn',
+      `${clause} on table "${table}": ${how}, so the later one was dropped. It could not have ` +
         'changed the result (the earlier term already orders those rows), and dropping it keeps the query on ' +
         'a shared prepared statement. Remove it to silence this.',
+      { code: 'redundant-sort-term', table, clause, key: d.key },
     );
   }
 }

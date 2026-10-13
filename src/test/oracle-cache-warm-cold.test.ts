@@ -28,7 +28,6 @@
 import assert from 'node:assert/strict';
 import { describe } from 'node:test';
 import type pg from 'pg';
-import { resetCacheCrossCheckEnv } from '../query/builder.js';
 import { skipGate } from './helpers.js';
 import { DATABASE_URL, rngFor, SKIP, scaled } from './oracle/env.js';
 import { Failures } from './oracle/failures.js';
@@ -165,7 +164,6 @@ describe('oracle: warm SQL cache vs cold, production mode, undefined holes', () 
     // The dev cache cross-check throws on a poisoned hit; production does not.
     savedNodeEnv = process.env.NODE_ENV;
     process.env.NODE_ENV = 'production';
-    resetCacheCrossCheckEnv();
 
     await runScript(DATABASE_URL!, DDL + seedSql());
     schema = await introspectTables(DATABASE_URL!, [T_ORGS, T_USERS, T_POSTS], {
@@ -193,7 +191,6 @@ describe('oracle: warm SQL cache vs cold, production mode, undefined holes', () 
 
   after(async () => {
     process.env.NODE_ENV = savedNodeEnv;
-    resetCacheCrossCheckEnv();
     await warm?.disconnect();
     await cold?.disconnect();
     await reader?.end();

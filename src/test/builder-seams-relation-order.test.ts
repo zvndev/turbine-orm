@@ -16,7 +16,6 @@
 
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, describe, it } from 'node:test';
-import { resetCacheCrossCheckEnv } from '../query/builder.js';
 import type { SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
 
@@ -107,12 +106,10 @@ let prevEnv: string | undefined;
 beforeEach(() => {
   prevEnv = process.env.NODE_ENV;
   process.env.NODE_ENV = 'production';
-  resetCacheCrossCheckEnv();
 });
 afterEach(() => {
   if (prevEnv === undefined) delete process.env.NODE_ENV;
   else process.env.NODE_ENV = prevEnv;
-  resetCacheCrossCheckEnv();
 });
 
 describe('to-one relation orderBy: cold and warm bind the params the SQL references', () => {

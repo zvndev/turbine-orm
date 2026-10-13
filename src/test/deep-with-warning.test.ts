@@ -90,7 +90,7 @@ describe('deep-with dev advisory', () => {
     assert.match(line, /re-evaluates once per row of the level above/);
     assert.match(line, /multiplies down the tree/);
     assert.match(line, /relationLoadStrategy: 'batched'/);
-    assert.match(line, /NODE_ENV=production/);
+    assert.match(line, /diagnostics\.advice/);
   });
 
   it('stays quiet at depth 5 and once per table beyond it', async () => {
