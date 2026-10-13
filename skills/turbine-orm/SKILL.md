@@ -205,8 +205,9 @@ comes back as `_sum.score`. `_sum` / `_avg` cast the value to numeric; `_min` /
 `_max` compare as text unless `type: 'numeric'`. **`aggregate()` has no JSON-path
 form**: every key there must be a column (anything else is `TURBINE_E003`) and
 every value `true`; an object value is read as `true`, so the whole column
-reaches the database as `avg(jsonb)` and fails there with a database error, not
-a Turbine code. **`_count` never takes a path**, in `groupBy` or `aggregate()`:
+reaches the database as `avg(jsonb)`, which the database refuses. That surfaces
+as `TURBINE_E003` with `sqlstate` `42883`, not as a Turbine check naming the
+path. **`_count` never takes a path**, in `groupBy` or `aggregate()`:
 an object under a `_count` key is read as `true` (a count of that column's
 non-null values) and any path in it is ignored. To count per JSON value, group
 by the path and read `_count`.
@@ -263,7 +264,9 @@ the `ON CONFLICT` target when `create` carries the same values, so a non-unique
 predicate is refused rather than sent. When `create` does not carry them (a
 `create` that leaves `id` to its sequence, say), `upsert` looks the row up by
 `where` first, inside a transaction. Use `updateMany` and `deleteMany` for
-"every row matching a filter".
+"every row matching a filter". They take no `limit`, `take`, `offset` or `skip`
+(`TURBINE_E003`): to write a bounded batch, `findMany` the ids first, then pass
+`where: { id: { in: ids } }`.
 
 ## `distinct`
 

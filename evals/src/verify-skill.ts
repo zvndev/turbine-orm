@@ -170,6 +170,22 @@ const CLAIMS: Claim[] = [
     run: throws('TURBINE_E003', 'cheese_wheels', 'delete', { where: { status: 'graded' } }),
   },
   {
+    says: '`updateMany` and `deleteMany` take no `limit`, `take`, `offset` or `skip` (`TURBINE_E003`).',
+    run: async (db) => {
+      // `where: { id: -1 }` matches no row, so a broken guard writes nothing; the
+      // phrase check keeps an unrelated E003 from passing the claim.
+      await throwsSaying('TURBINE_E003', 'is not supported on updateMany', 'cheese_wheels', 'updateMany', {
+        where: { id: -1 },
+        data: { status: 'graded' },
+        take: 1,
+      })(db);
+      await throwsSaying('TURBINE_E003', 'is not supported on deleteMany', 'cheese_wheels', 'deleteMany', {
+        where: { id: -1 },
+        skip: 1,
+      })(db);
+    },
+  },
+  {
     says: "an upsert's `where` names the row to update (the `ON CONFLICT` target when `create` agrees), so a non-unique one is refused, not sent.",
     run: throwsSaying('TURBINE_E003', 'conflict target', 'cheese_wheels', 'upsert', {
       where: { status: 'graded' },
@@ -482,26 +498,25 @@ const CLAIMS: Claim[] = [
     },
   },
   {
-    says: 'aggregate() has no JSON-path form: a { field, path } object is read as `true`, so the whole column reaches the database as avg(jsonb) and fails there with a DATABASE error, not a Turbine code.',
+    says: 'aggregate() has no JSON-path form: a { field, path } object is read as `true`, so the whole column reaches the database as avg(jsonb), which the database refuses; that surfaces as TURBINE_E003 with sqlstate 42883, not a Turbine check naming the path.',
     run: async (db) => {
       try {
         await call(db, 'cheese_wheels', 'aggregate', {
           _avg: { tastingNotes: { field: 'tastingNotes', path: ['panel', 'score'] } },
         });
       } catch (err) {
-        if (err instanceof TurbineError) {
+        // 42883 undefined_function, `function avg(jsonb) does not exist`, which
+        // wrapPgError types as ValidationError keeping the SQLSTATE. A Turbine
+        // check that refused the path itself would carry no sqlstate.
+        if (!(err instanceof TurbineError) || err.code !== 'TURBINE_E003') {
           throw new Error(
-            `expected a raw database error, got ${err.code}: ${err.message.split('\n')[0]}; the aggregate() sentence is now wrong`,
+            `expected TURBINE_E003 from the database's 42883, got ${err instanceof Error ? `${err.name}: ${err.message.split('\n')[0]}` : String(err)}`,
           );
         }
-        // 42883 undefined_function, `function avg(jsonb) does not exist`. Read
-        // off the error or its cause, so a safe-mode wrapper that redacts the
-        // driver's message and keeps the driver error on .cause still identifies it.
-        const sqlstate = (err as { code?: string }).code ?? (err as { cause?: { code?: string } }).cause?.code;
+        const sqlstate = (err as { sqlstate?: string }).sqlstate;
         if (sqlstate !== '42883') {
           throw new Error(
-            `expected SQLSTATE 42883 (avg(jsonb) does not exist), got ${String(sqlstate)}: ` +
-              `${err instanceof Error ? err.message.split('\n')[0] : String(err)}`,
+            `expected sqlstate 42883 (avg(jsonb) does not exist), got ${String(sqlstate)}: ${err.message.split('\n')[0]}; the aggregate() sentence is now wrong`,
           );
         }
         return;
