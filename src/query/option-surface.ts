@@ -362,6 +362,24 @@ const PRISMA_SPELLING: Readonly<Record<string, string>> = {
 };
 
 /**
+ * Keys an operation does not declare but REFUSES by name with its own error
+ * (E003 naming the key and the alternative), rather than ignoring. Warning
+ * "it is ignored" about one of these would contradict the error that follows,
+ * so the warning skips them. Every entry must have a refusal behind it;
+ * `src/test/fix-where-option-warnings.test.ts` checks that each one throws.
+ */
+export const REFUSED_OPTION_KEYS: Readonly<Record<string, ReadonlySet<string>>> = {
+  // A bounded batch is not what these statements do (assertNoBulkWritePaging).
+  updateMany: new Set(['limit', 'take', 'offset', 'skip', 'optimisticLock']),
+  deleteMany: new Set(['limit', 'take', 'offset', 'skip']),
+  // `optimisticLock` is an `update` option (assertNoOptimisticLock).
+  upsert: new Set(['optimisticLock']),
+  // A streaming cursor cannot hold its rows locked across fetches.
+  findManyStream: new Set(['lock']),
+  findManyStreamBatches: new Set(['lock']),
+};
+
+/**
  * Dev-mode warning for a key that is not part of the operation's option
  * surface, and is therefore doing nothing.
  *
@@ -387,12 +405,15 @@ export function warnUnknownQueryOptions(table: string, operation: string, args: 
   if (args === null || typeof args !== 'object' || Array.isArray(args)) return;
   const known = OPERATION_TABLE[operation];
   if (!known) return;
+  const refused = REFUSED_OPTION_KEYS[operation];
   try {
     for (const key of Object.keys(args as Record<string, unknown>)) {
       // `{ ...maybeOptions }` routinely materializes keys with no value.
       // Nothing is being ignored when the value is undefined.
       if ((args as Record<string, unknown>)[key] === undefined) continue;
       if (Object.hasOwn(known, key)) continue;
+      // Refused with its own error, which is the diagnostic; not ignored.
+      if (refused?.has(key)) continue;
       if (!shouldWarnOnce(WARN_NS.unknownQueryOption, `${table}.${operation}.${key}`)) continue;
       const prismaSpelling = PRISMA_SPELLING[key];
       const suggestion = prismaSpelling ?? suggestKey(key, Object.keys(known));
