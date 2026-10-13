@@ -33,11 +33,42 @@
  * default: the conversion loop now runs once per (process x script) instead of
  * once per script, so it is slower and uses more memory. That is the correct
  * trade for a number a release gate reads.
+ *
+ * MEMORY. c8's `_loadReports()` parses every file in the temp directory into
+ * one array before anything is filtered, and each raw file carries every
+ * script the process loaded (node_modules, the test file itself) plus the
+ * process's whole source-map cache. Measured 2026-10-13 on the full suite:
+ * 1,505 files, 1.0 GB of JSON held at once, and the report step ran out of
+ * heap at 4.4 GB, on CI and locally, after every test had passed. Reading one
+ * file at a time and keeping only the scripts the config includes leaves the
+ * result unchanged (the same ScriptCovs reach the same loop in the same
+ * order) and lets each raw file be collected as soon as it is filtered. On
+ * that same data it peaks at 1.3 GB, and the old loader, given a 24 GB heap,
+ * peaked at 6.3 GB and wrote a byte-identical lcov.info and text report.
  */
+import { readdirSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { resolve } from 'node:path';
 
 const require = createRequire(import.meta.url);
 const createReport = require('c8/lib/report.js');
+
+/**
+ * Every process's coverage, parsed one file at a time. The same files, order
+ * and skip rule as c8's `_loadReports()` (an unparseable file is skipped), but
+ * a generator, so only one raw file is alive at a time.
+ */
+function* loadReportsOneByOne(tempDirectory) {
+  for (const file of readdirSync(tempDirectory)) {
+    let parsed;
+    try {
+      parsed = JSON.parse(readFileSync(resolve(tempDirectory, file), 'utf8'));
+    } catch {
+      continue;
+    }
+    yield parsed;
+  }
+}
 
 /** Build a c8 Report whose process-coverage merge is a concatenation. */
 export function createIstanbulMergeReport(options) {
@@ -46,7 +77,7 @@ export function createIstanbulMergeReport(options) {
   report._getMergedProcessCov = function _getMergedProcessCov() {
     const processCovs = [];
     const fileIndex = new Set();
-    for (const processCov of this._loadReports()) {
+    for (const processCov of loadReportsOneByOne(this.tempDirectory)) {
       if (!this._isCoverageObject(processCov)) continue;
       if (processCov['source-map-cache']) {
         Object.assign(this.sourceMapCache, this._normalizeSourceMapCache(processCov['source-map-cache']));
