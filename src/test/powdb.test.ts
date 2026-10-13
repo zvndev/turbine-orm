@@ -621,7 +621,7 @@ describe('powdb: findMany generation', () => {
     const { powql, params } = m.last();
     assert.match(
       powql,
-      /^app_user filter \.age >= \$1 order \.name asc limit \$2 offset \$3 \{ \.id, \.name, \.age, \.score, \.active, \.created_at \}$/,
+      /^app_user filter \.age >= \$1 order \.name asc, \.id asc limit \$2 offset \$3 \{ \.id, \.name, \.age, \.score, \.active, \.created_at \}$/,
     );
     assert.deepEqual(params, [30, 10, 5]);
   });
@@ -1014,7 +1014,6 @@ describe('powdb: write generation', () => {
     // These pass the old shape-based check (they HAVE keys) but compile to an
     // empty PowQL filter, so they must be rejected and emit no write.
     const cases: Record<string, unknown>[] = [
-      { OR: [] },
       { AND: [] },
       { NOT: {} },
       { id: undefined },
@@ -2197,7 +2196,7 @@ describe('powdb: reserved-word identifiers are backtick-quoted in bare positions
     await kwQi(m).findMany({ where: { type: 'news' }, orderBy: { limit: 'asc' }, limit: 5 });
     assert.match(
       m.last().powql,
-      /^`order` filter \.type = \$1 order \.limit asc limit \$2 \{ \.id, \.type, \.limit, \.name \}$/,
+      /^`order` filter \.type = \$1 order \.limit asc, \.id asc limit \$2 \{ \.id, \.type, \.limit, \.name \}$/,
     );
   });
 });
@@ -2705,7 +2704,7 @@ describe('powdb: introspectPowdbDatabase gating + mis-shaped exec guard', () => 
   it('an empty database (zero schema rows) returns an empty schema, not an error', async () => {
     const exec = async () => ({ rows: [] as Record<string, unknown>[] });
     const meta = await introspectPowdbDatabase(exec);
-    assert.deepEqual(meta, { tables: {}, enums: {} });
+    assert.deepEqual({ tables: { ...meta.tables }, enums: { ...meta.enums } }, { tables: {}, enums: {} });
   });
 });
 
@@ -3133,7 +3132,7 @@ describe('powdb F1: JsonFilter → PowQL path filters', () => {
       where: { OR: [{ data: { path: ['a'], equals: 1 } }, { NOT: { data: { path: ['b'], gt: 2 } } }] },
       limit: 1,
     });
-    assert.match(m.last().powql, /\(\.data->\$1 = \$2 or not \(\.data->\$3 > \$4\)\)/);
+    assert.match(m.last().powql, /\(\.data->\$1 = \$2 or \(\.data is not null and not \(\.data->\$3 > \$4\)\)\)/);
   });
 
   it('contains → E017 (PowQL has no containment operator)', async () => {
@@ -3231,7 +3230,7 @@ describe('powdb F2: JSON-path orderBy', () => {
   it('path order → `order .data->$n asc`', async () => {
     const m = mockPool();
     await qi(m, 'doc').findMany({ orderBy: { data: { path: ['k'] } } as never, limit: 1 });
-    assert.match(m.last().powql, / order \.data->\$1 asc /);
+    assert.match(m.last().powql, / order \.data->\$1 asc, \.id asc /);
   });
 
   it('desc + numeric cast', async () => {
@@ -3240,13 +3239,13 @@ describe('powdb F2: JSON-path orderBy', () => {
       orderBy: { data: { path: ['n'], direction: 'desc', type: 'numeric' } } as never,
       limit: 1,
     });
-    assert.match(m.last().powql, / order cast\(\.data->\$1, "float"\) desc /);
+    assert.match(m.last().powql, / order cast\(\.data->\$1, "float"\) desc, \.id asc /);
   });
 
   it('nulls:last accepted (no-op); nulls:first → E017', async () => {
     const m = mockPool();
     await qi(m, 'doc').findMany({ orderBy: { data: { path: ['k'], nulls: 'last' } } as never, limit: 1 });
-    assert.match(m.last().powql, / order \.data->\$1 asc /);
+    assert.match(m.last().powql, / order \.data->\$1 asc, \.id asc /);
     await assert.rejects(
       qi(mockPool(), 'doc').findMany({ orderBy: { data: { path: ['k'], nulls: 'first' } } as never, limit: 1 }),
       (e: unknown) => e instanceof UnsupportedFeatureError && /NULLS FIRST/i.test((e as Error).message),
@@ -3256,7 +3255,7 @@ describe('powdb F2: JSON-path orderBy', () => {
   it('OrderBySpec { sort, nulls:last } accepted; nulls:first → E017', async () => {
     const m = mockPool();
     await qi(m, 'doc').findMany({ orderBy: { region: { sort: 'desc', nulls: 'last' } } as never, limit: 1 });
-    assert.match(m.last().powql, / order \.region desc /);
+    assert.match(m.last().powql, / order \.region desc, \.id desc /);
     await assert.rejects(
       qi(mockPool(), 'doc').findMany({ orderBy: { region: { sort: 'asc', nulls: 'first' } } as never, limit: 1 }),
       (e: unknown) => e instanceof UnsupportedFeatureError && /NULLS FIRST/i.test((e as Error).message),

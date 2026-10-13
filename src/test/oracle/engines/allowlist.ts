@@ -350,30 +350,6 @@ export const SCENARIO_ENTRIES: readonly ScenarioEntry[] = [
     }),
   ),
   {
-    engine: 'powdb',
-    scenario: 'with/relation-count',
-    kind: 'bug',
-    note: '`with: { _count: {...} }` throws ValidationError E003 "Unknown relation _count"; it should run or refuse with E017.',
-  },
-  {
-    engine: 'powdb',
-    scenario: 'agg/sum-bigint',
-    kind: 'bug',
-    note: '`_sum` of a bigint column returns a JS number (Postgres returns the exact decimal string), so a sum past 2^53 loses precision.',
-  },
-  {
-    engine: 'powdb',
-    scenario: 'where/date-equals-iso-string',
-    kind: 'bug',
-    note: 'an ISO date string compared with a date column throws ValidationError E003; Postgres and the SQL engines accept it.',
-  },
-  {
-    engine: 'powdb',
-    scenario: 'write/update-set-null-and-json',
-    kind: 'bug',
-    note: 'an object written to a json column by `update` is read as an atomic operator and refused with E003 ("Unsupported update operator").',
-  },
-  {
     engine: 'sqlite',
     scenario: 'where/date-equals-iso-string',
     kind: 'bug',

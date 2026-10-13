@@ -336,7 +336,6 @@ describe('powdb integration (embedded)', () => {
         ],
       });
       const cases: Record<string, unknown>[] = [
-        { OR: [] },
         { AND: [] },
         { NOT: {} },
         {},
@@ -1318,7 +1317,7 @@ describe('powdb integration (embedded): describe-based introspection', () => {
       // Every `unique` column is a singleton unique set (id + label).
       assert.deepEqual(widget.uniqueColumns.map((u) => u[0]).sort(), ['id', 'label']);
       // Relations are always empty (PowDB has no declared FKs).
-      assert.deepEqual(widget.relations, {});
+      assert.deepEqual({ ...widget.relations }, {});
       // The doc-field expression index is invisible to `describe` → absent.
       assert.ok(!widget.indexes.some((i) => i.docPath), 'expression indexes do not round-trip');
       // The two column-level unique indexes (id, label) DO appear.

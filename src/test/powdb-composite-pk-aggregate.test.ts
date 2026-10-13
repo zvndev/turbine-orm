@@ -184,9 +184,10 @@ describe('PowDB aggregate(): several aggregates in one statement', () => {
         'agg_4: avg(.a), agg_5: avg(.b), agg_6: min(.a), agg_7: max(.b) }',
     );
     assert.deepEqual(m.calls[0]!.params, [1]);
+    // `a` is int8, whose SUM PostgreSQL returns as exact decimal text.
     assert.deepEqual(res, {
       _count: { id: 5, a: 4 },
-      _sum: { a: 30, b: 7.5 },
+      _sum: { a: '30', b: 7.5 },
       _avg: { a: 7.5, b: 2.5 },
       _min: { a: -3 },
       _max: { b: 9.25 },
