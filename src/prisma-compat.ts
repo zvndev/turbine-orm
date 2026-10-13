@@ -70,6 +70,19 @@
  * - **Negative `take`** (take-from-end) throws: Turbine has no reverse-take.
  *   A **`cursor` on a nested relation include** throws: `with` has no cursor
  *   (`take` / `skip` there page each parent's rows, as in Prisma).
+ * - **A filtered relation count** (`_count: { select: { posts: { where } } }`)
+ *   and **`distinct` on a nested include** throw `UnsupportedFeatureError`:
+ *   core counts and includes a relation whole, so honoring either would mean
+ *   returning a wrong number or duplicate rows. The message names the
+ *   alternative (a `count` / `findMany` on the related model).
+ * - **Nothing is accepted and dropped.** Every option on an included relation
+ *   and every key under `_count` is translated, refused by name (the two
+ *   above, `cursor`), or refused as unknown (`ValidationError`, with a
+ *   suggestion): a misspelled `wher`, a Turbine spelling like `limit`, a
+ *   relation `_count` does not know. The same holds for `$transaction` options
+ *   (`maxWait` is accepted, warned about once, and not applied: the pool's
+ *   `connectionTimeoutMs` bounds the wait) and for the keys of a nested write's
+ *   `{ where, data }` / `{ where, create, update }` payloads.
  * - **`limit` on `updateMany` / `deleteMany`** (Prisma 6.7+) throws. Turbine has
  *   no row-bounded mass mutation, and dropping a SAFETY BOUND with a warning
  *   would turn "change at most 10 rows" into "change every matching row".
@@ -213,7 +226,7 @@ export interface CompatTransactionClient {
 export interface CompatTurbineClient extends CompatTransactionClient {
   readonly schema: SchemaMetadata;
   $transaction<R>(fn: (tx: CompatTransactionClient) => Promise<R>, options?: unknown): Promise<R>;
-  $transaction(queries: readonly DeferredQuery<unknown>[]): Promise<unknown[]>;
+  $transaction(queries: readonly DeferredQuery<unknown>[], options?: unknown): Promise<unknown[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -907,9 +920,12 @@ function translateOrderBy(ctx: Ctx, mm: PrismaModelMap, ob: unknown, depth = 0):
   return out;
 }
 
-/** Map a Prisma `take` to a Turbine `limit`. Negative take is unsupported. */
-function mapTake(take: number): number {
-  if (take < 0) {
+/**
+ * Map a Prisma `take` to a Turbine `limit`. Negative take is unsupported. Any
+ * other value goes to core as written, which refuses a non-integer.
+ */
+function mapTake(take: unknown): unknown {
+  if (typeof take === 'number' && take < 0) {
     throw new UnsupportedFeatureError(
       'negative take (take-from-end pagination)',
       'prisma-compat',
@@ -994,7 +1010,7 @@ function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, 
     for (const [key, val] of Object.entries(include)) {
       if (val === false || val == null) continue;
       if (key === '_count') {
-        withClause._count = translateCountSelect(mm, val);
+        withClause._count = translateCountSelect(ctx, mm, val);
         hasWith = true;
         continue;
       }
@@ -1016,7 +1032,7 @@ function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, 
     for (const [key, val] of Object.entries(select)) {
       if (val === false || val == null) continue;
       if (key === '_count') {
-        withClause._count = translateCountSelect(mm, val);
+        withClause._count = translateCountSelect(ctx, mm, val);
         hasWith = true;
         continue;
       }
@@ -1199,8 +1215,68 @@ function applyWriteProjection(proj: WriteProjection, row: unknown): unknown {
   return row;
 }
 
+/** What a caller wrote, named for a message: `an array`, `null`, `a string`. */
+function describeValue(value: unknown): string {
+  if (value === undefined) return 'undefined';
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'an array';
+  return typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+}
+
+/** The Prisma spelling of a turbine relation name, for a message. */
+function prismaRelationName(ctx: Ctx, mm: PrismaModelMap, turbineRel: string): string {
+  return ownLookup(lookupsFor(ctx, mm).reverseRelations, turbineRel)?.prismaName ?? turbineRel;
+}
+
+/**
+ * The options Prisma takes on an included relation. `cursor` and `distinct` are
+ * here because they are Prisma's, and are refused by name (E017) rather than
+ * called unknown: Turbine's `with` clause cannot honor either.
+ */
+const NESTED_RELATION_KEYS: ReadonlySet<string> = new Set([
+  'where',
+  'orderBy',
+  'take',
+  'skip',
+  'cursor',
+  'distinct',
+  'select',
+  'include',
+  'omit',
+]);
+
+/**
+ * Refuse a key on an included relation's options that this layer does not
+ * translate. Every key it does not read used to be dropped, so a misspelled
+ * `wher` or a Turbine spelling (`limit`) returned unfiltered, unlimited rows
+ * with no signal. An `undefined` value is absent, as everywhere else.
+ */
+function assertNestedRelationKeys(label: string, opts: Record<string, unknown>): void {
+  for (const key of Object.keys(opts)) {
+    if (opts[key] === undefined || NESTED_RELATION_KEYS.has(key)) continue;
+    const alias = ALIAS_HINT[key];
+    if (alias) {
+      throw new ValidationError(
+        `prisma-compat: "${key}" in the options of relation "${label}" is Turbine's spelling and would be ignored. ` +
+          `prisma-compat takes Prisma's "${alias}".`,
+      );
+    }
+    const suggestion = suggestKey(key, NESTED_RELATION_KEYS);
+    throw new ValidationError(
+      `prisma-compat: unknown option "${key}" in the options of relation "${label}", it would be ignored.` +
+        (suggestion ? ` Did you mean "${suggestion}"?` : '') +
+        ` Valid options: ${[...NESTED_RELATION_KEYS].join(', ')}.`,
+    );
+  }
+}
+
 /**
  * Translate a Prisma relation include payload into a Turbine `WithOptions`.
+ *
+ * Every option the payload carries is either translated, refused by name, or
+ * refused as unknown: none is dropped. `cursor` and `distinct` are Prisma's
+ * and have no per-relation form in a `with` clause (E017); any other key is
+ * E003 (see {@link assertNestedRelationKeys}).
  *
  * `depth` is the relation hop count carried down from {@link translateProjection}
  * and is charged to the nested `where` / `orderBy` too, so a payload that pads
@@ -1209,12 +1285,18 @@ function applyWriteProjection(proj: WriteProjection, row: unknown): unknown {
  */
 function translateWithOption(ctx: Ctx, mm: PrismaModelMap, turbineRel: string, val: unknown, depth = 0): unknown {
   if (val === true) return true;
-  if (!isPlainRecord(val)) return true;
+  const label = `${modelName(ctx, mm)}.${prismaRelationName(ctx, mm, turbineRel)}`;
+  if (!isPlainRecord(val)) {
+    throw new ValidationError(
+      `prisma-compat: the value for relation "${label}" must be true or an options object, received ${describeValue(val)}.`,
+    );
+  }
+  assertNestedRelationKeys(label, val);
   const target = relTargetModel(ctx, mm, turbineRel);
   const opt: Record<string, unknown> = {};
   if (val.where !== undefined) opt.where = target ? translateWhere(ctx, target, val.where, depth) : val.where;
   if (val.orderBy !== undefined) opt.orderBy = target ? translateOrderBy(ctx, target, val.orderBy, depth) : val.orderBy;
-  if (val.take !== undefined) opt.limit = mapTake(val.take as number);
+  if (val.take !== undefined) opt.limit = mapTake(val.take);
   // Per parent, as in Prisma; core refuses it on a to-one relation.
   if (val.skip !== undefined) opt.offset = val.skip;
   if (val.cursor !== undefined) {
@@ -1225,7 +1307,25 @@ function translateWithOption(ctx: Ctx, mm: PrismaModelMap, turbineRel: string, v
         'findMany on the related model.',
     );
   }
-  if (target && (val.select !== undefined || val.include !== undefined || val.omit !== undefined)) {
+  // `distinct: []` names no field and removes nothing, so it is not a request.
+  if (val.distinct !== undefined && !(Array.isArray(val.distinct) && val.distinct.length === 0)) {
+    throw new UnsupportedFeatureError(
+      `distinct on a nested relation include ("${label}")`,
+      'prisma-compat',
+      "Turbine's `with` clause has no distinct. Run a separate findMany on the related model with the same " +
+        'where / orderBy / distinct, or de-duplicate the included rows in application code.',
+    );
+  }
+  if (val.select !== undefined || val.include !== undefined || val.omit !== undefined) {
+    // Without the target model there are no field names to translate with, and
+    // dropping the projection would return every column of the child rows.
+    if (!target) {
+      throw new ValidationError(
+        `prisma-compat: relation "${label}" points at a table that is not in the compat map, so its ` +
+          '`select` / `include` / `omit` cannot be translated. Regenerate the map with ' +
+          '`turbine migrate-from-prisma`, or drop the projection.',
+      );
+    }
     const proj = translateProjection(ctx, target, val, depth);
     if (proj.select) opt.select = proj.select;
     // Same silent drop as the top level: a nested `omit` names the sensitive
@@ -1236,23 +1336,115 @@ function translateWithOption(ctx: Ctx, mm: PrismaModelMap, turbineRel: string, v
   return opt;
 }
 
-/** Translate a Prisma `_count: { select: { rel: true } }` / `true` into Turbine `with._count`. */
-function translateCountSelect(mm: PrismaModelMap, val: unknown): unknown {
+/** A count `where` that filters nothing: absent, or an object with no defined key. */
+function isUnfilteredCountWhere(where: unknown): boolean {
+  return where === undefined || (isPlainRecord(where) && Object.values(where).every((v) => v === undefined));
+}
+
+/**
+ * Translate a Prisma `_count: { select: { rel: true } }` / `true` into Turbine
+ * `with._count`.
+ *
+ * Core counts a relation whole: `with._count` takes `true` or `{ rel: true }`.
+ * So a Prisma filtered count (`{ rel: { where } }`) is refused (E017) naming the
+ * alternative, a relation that is not on the model is E003, and so is any key
+ * but `select` under `_count` (a misspelled `selec` used to count EVERY relation,
+ * and a misspelled relation counted nothing, both without a word).
+ */
+function translateCountSelect(ctx: Ctx, mm: PrismaModelMap, val: unknown): unknown {
   if (val === true) return true;
-  if (isPlainRecord(val) && isPlainRecord(val.select)) {
-    const out: Record<string, boolean> = {};
-    for (const [key, v] of Object.entries(val.select)) {
-      if (!v) continue;
-      const rel = ownLookup(mm.relations, key);
-      if (rel) setOwn(out, rel.name, true);
-    }
-    return out;
+  const model = modelName(ctx, mm);
+  if (!isPlainRecord(val)) {
+    throw new ValidationError(
+      `prisma-compat: \`_count\` on model "${model}" takes true or { select: { <relation>: true } }, ` +
+        `received ${describeValue(val)}.`,
+    );
   }
-  return true;
+  for (const key of Object.keys(val)) {
+    if (key === 'select' || val[key] === undefined) continue;
+    const suggestion = suggestKey(key, ['select']);
+    throw new ValidationError(
+      `prisma-compat: unknown key "${key}" in \`_count\` on model "${model}", it would be ignored.` +
+        (suggestion ? ` Did you mean "${suggestion}"?` : '') +
+        ' The only key is "select".',
+    );
+  }
+  if (val.select === undefined) return true;
+  if (!isPlainRecord(val.select)) {
+    throw new ValidationError(
+      `prisma-compat: \`_count.select\` on model "${model}" takes { <relation>: true }, ` +
+        `received ${describeValue(val.select)}.`,
+    );
+  }
+  const out: Record<string, boolean> = {};
+  for (const [key, v] of Object.entries(val.select)) {
+    if (v === undefined || v === false || v === null) continue;
+    const rel = ownLookup(mm.relations, key);
+    if (!rel) {
+      const known = Object.keys(mm.relations);
+      const suggestion = suggestKey(key, known);
+      throw new ValidationError(
+        `prisma-compat: unknown relation "${key}" in \`_count.select\` on model "${model}", it would not be counted.` +
+          (suggestion ? ` Did you mean "${suggestion}"?` : '') +
+          ` Relations: ${known.join(', ') || '(none)'}.`,
+      );
+    }
+    if (v === true) {
+      setOwn(out, rel.name, true);
+      continue;
+    }
+    if (!isPlainRecord(v)) {
+      throw new ValidationError(
+        `prisma-compat: \`_count.select.${key}\` on model "${model}" takes true, false or { where }, ` +
+          `received ${describeValue(v)}.`,
+      );
+    }
+    for (const k of Object.keys(v)) {
+      if (k === 'where' || v[k] === undefined) continue;
+      const hint = suggestKey(k, ['where']);
+      throw new ValidationError(
+        `prisma-compat: unknown key "${k}" in \`_count.select.${key}\` on model "${model}", it would be ignored.` +
+          (hint ? ` Did you mean "${hint}"?` : '') +
+          ' The only key is "where".',
+      );
+    }
+    if (!isUnfilteredCountWhere(v.where)) {
+      const target = relTargetModel(ctx, mm, rel.name);
+      const targetName = target ? modelName(ctx, target) : undefined;
+      const delegate = targetName ? (prismaPropertyAlias(targetName) ?? targetName) : '<model>';
+      throw new UnsupportedFeatureError(
+        `a filtered relation count (\`_count.select.${key}.where\` on model "${model}")`,
+        'prisma-compat',
+        'Turbine counts every row of a relation, so the filter would be dropped and the number would be wrong. ' +
+          `Count the filtered rows through the related model instead: prisma.${delegate}.count({ where: ... }) ` +
+          `with the foreign key and your filter, or prisma.${delegate}.groupBy({ by: [<foreign key>], _count: true }) ` +
+          'for many parents at once.',
+      );
+    }
+    setOwn(out, rel.name, true);
+  }
+  return out;
 }
 
 function modelName(ctx: Ctx, mm: PrismaModelMap): string {
   return ctx.tableToModel.get(mm.table) ?? mm.table;
+}
+
+/**
+ * A Prisma field list that is written either as one name or as an array of
+ * names (`distinct`, groupBy `by`), renamed into turbine fields. Anything else
+ * is refused: a bare string used to be dropped (`distinct: 'status'` returned
+ * every row, and `by: 'status'` crashed with a TypeError).
+ */
+function translateFieldList(ctx: Ctx, mm: PrismaModelMap, option: string, val: unknown): string[] {
+  const names = typeof val === 'string' ? [val] : val;
+  if (!Array.isArray(names) || names.some((n) => typeof n !== 'string')) {
+    throw new ValidationError(
+      `prisma-compat: \`${option}\` on model "${modelName(ctx, mm)}" takes a field name or an array of field names, ` +
+        `received ${describeValue(val)}.`,
+    );
+  }
+  return (names as string[]).map((f) => renameField(mm, f));
 }
 
 /**
@@ -1291,9 +1483,7 @@ function translateReadArgs(
   if (proj.select) t.select = proj.select;
   if (proj.omit) t.omit = proj.omit;
   if (proj.with) t.with = proj.with;
-  if (Array.isArray(prismaArgs.distinct)) {
-    t.distinct = (prismaArgs.distinct as string[]).map((f) => renameField(mm, f));
-  }
+  if (prismaArgs.distinct !== undefined) t.distinct = translateFieldList(ctx, mm, 'distinct', prismaArgs.distinct);
   if (prismaArgs.relationLoadStrategy !== undefined) {
     t.relationLoadStrategy = mapRelationLoadStrategy(prismaArgs.relationLoadStrategy);
   }
@@ -1502,10 +1692,8 @@ function translateNestedWrite(
         break;
       case 'deleteMany':
       case 'updateMany':
-        out[op] = mapMaybeArray(payload, (p) => translateWhereDataPair(ctx, target, p, depth + 1));
-        break;
       case 'update':
-        out[op] = mapMaybeArray(payload, (p) => translateWhereDataPair(ctx, target, p, depth + 1));
+        out[op] = mapMaybeArray(payload, (p) => translateWhereDataPair(ctx, target, op, p, depth + 1));
         break;
       case 'connectOrCreate':
         out[op] = mapMaybeArray(payload, (p) => translateConnectOrCreate(ctx, target, p, depth + 1));
@@ -1524,10 +1712,34 @@ function mapMaybeArray(val: unknown, fn: (item: unknown) => unknown): unknown {
   return Array.isArray(val) ? val.map(fn) : fn(val);
 }
 
+/**
+ * Refuse a key on a nested write's `{ where, data }` / `{ where, create, update }`
+ * payload that this layer does not read: it was dropped, so the part of the
+ * write the caller meant never ran. An `undefined` value is absent.
+ */
+function assertNestedPayloadKeys(op: string, p: Record<string, unknown>, allowed: readonly string[]): void {
+  for (const key of Object.keys(p)) {
+    if (p[key] === undefined || allowed.includes(key)) continue;
+    const suggestion = suggestKey(key, allowed);
+    throw new ValidationError(
+      `prisma-compat: unknown key "${key}" in a nested ${op}, it would be ignored.` +
+        (suggestion ? ` Did you mean "${suggestion}"?` : '') +
+        ` Valid keys: ${allowed.join(', ')}.`,
+    );
+  }
+}
+
 /** A `{ where?, data }` pair (nested update/updateMany), or a bare data object. */
-function translateWhereDataPair(ctx: Ctx, target: PrismaModelMap | undefined, p: unknown, depth: number): unknown {
+function translateWhereDataPair(
+  ctx: Ctx,
+  target: PrismaModelMap | undefined,
+  op: string,
+  p: unknown,
+  depth: number,
+): unknown {
   if (!isPlainRecord(p)) return p;
   if ('data' in p || 'where' in p) {
+    assertNestedPayloadKeys(op, p, ['where', 'data']);
     const out: Record<string, unknown> = {};
     if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where, depth) : p.where;
     if (p.data !== undefined) out.data = target ? translateWriteData(ctx, target, p.data, depth) : p.data;
@@ -1538,6 +1750,7 @@ function translateWhereDataPair(ctx: Ctx, target: PrismaModelMap | undefined, p:
 
 function translateConnectOrCreate(ctx: Ctx, target: PrismaModelMap | undefined, p: unknown, depth: number): unknown {
   if (!isPlainRecord(p)) return p;
+  assertNestedPayloadKeys('connectOrCreate', p, ['where', 'create']);
   const out: Record<string, unknown> = {};
   if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where, depth) : p.where;
   if (p.create !== undefined) out.create = target ? translateWriteData(ctx, target, p.create, depth) : p.create;
@@ -1546,6 +1759,7 @@ function translateConnectOrCreate(ctx: Ctx, target: PrismaModelMap | undefined, 
 
 function translateUpsertNested(ctx: Ctx, target: PrismaModelMap | undefined, p: unknown, depth: number): unknown {
   if (!isPlainRecord(p)) return p;
+  assertNestedPayloadKeys('upsert', p, ['where', 'create', 'update']);
   const out: Record<string, unknown> = {};
   if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where, depth) : p.where;
   if (p.create !== undefined) out.create = target ? translateWriteData(ctx, target, p.create, depth) : p.create;
@@ -1590,12 +1804,17 @@ function translateAggregateArgs(
     if (args[block] !== undefined) t[block] = renameAggBlock(mm, args[block], false);
   }
   if (isGroupBy) {
-    if (Array.isArray(args.by)) t.by = (args.by as string[]).map((f) => renameField(mm, f));
+    if (args.by === undefined) {
+      throw new ValidationError(
+        `prisma-compat: groupBy on model "${modelName(ctx, mm)}" requires \`by\`, a field name or an array of field names.`,
+      );
+    }
+    t.by = translateFieldList(ctx, mm, 'by', args.by);
     if (args.orderBy !== undefined) t.orderBy = translateOrderBy(ctx, mm, args.orderBy);
     if (args.having !== undefined) t.having = renameHaving(mm, args.having);
     if (args.distinctOn !== undefined) t.distinctOn = translateDistinctOn(ctx, mm, args.distinctOn);
-    if (typeof args.take === 'number') t.limit = mapTake(args.take);
-    if (typeof args.skip === 'number') t.offset = args.skip;
+    if (args.take !== undefined) t.limit = mapTake(args.take);
+    if (args.skip !== undefined) t.offset = args.skip;
   }
   return t;
 }
@@ -1965,11 +2184,71 @@ export interface PrismaCompatClientBase<S extends Record<string, PrismaModelType
   $disconnect(): Promise<void>;
 }
 
-/** Options accepted by the callback form of `$transaction`. */
+/** Options accepted by `$transaction`, in its callback and array forms. */
 export interface PrismaCompatTxOptions {
   isolationLevel?: 'ReadUncommitted' | 'ReadCommitted' | 'RepeatableRead' | 'Serializable';
   timeout?: number;
+  /** Accepted for source compatibility and ignored; see `connectionTimeoutMs` on the client. */
   maxWait?: number;
+}
+
+/** Warn-once namespace for a `$transaction` option this layer accepts and does not apply. */
+const TX_OPTION_WARN_NS = 'prismaCompatTxOption';
+
+/**
+ * Every `$transaction` option this layer understands: Prisma's three, plus the
+ * Turbine-native ones it forwards to core as written.
+ */
+const TX_OPTION_KEYS: ReadonlySet<string> = new Set([
+  'isolationLevel',
+  'timeout',
+  'maxWait',
+  'sessionContext',
+  'allowBuiltinSettings',
+  'readOnly',
+]);
+
+/**
+ * Check a `$transaction` options object and drop the one key core has no use
+ * for. A key that is not an option used to be forwarded and ignored, so a
+ * misspelled `isolationLevl` ran the transaction at the default isolation.
+ * `maxWait` bounds how long Prisma waits for a pooled connection; here the
+ * pool's own `connectionTimeoutMs` does that, so it is accepted, warned about
+ * once, and not forwarded.
+ */
+function resolveTxOptions(log: ClientLogContext, options: unknown): PrismaCompatTxOptions | undefined {
+  if (options === undefined || options === null) return undefined;
+  if (!isPlainRecord(options)) {
+    throw new ValidationError(
+      `prisma-compat: $transaction options must be an object, received ${describeValue(options)}.`,
+    );
+  }
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(options)) {
+    if (value === undefined) continue;
+    if (!TX_OPTION_KEYS.has(key)) {
+      const suggestion = suggestKey(key, TX_OPTION_KEYS);
+      throw new ValidationError(
+        `prisma-compat: unknown $transaction option "${key}", it would be ignored.` +
+          (suggestion ? ` Did you mean "${suggestion}"?` : '') +
+          ` Valid options: ${[...TX_OPTION_KEYS].join(', ')}.`,
+      );
+    }
+    if (key === 'maxWait') {
+      if (log.diagnostics.advice && shouldWarnOnce(TX_OPTION_WARN_NS, key)) {
+        logTo(
+          log.logger,
+          'warn',
+          'prisma-compat: the $transaction option "maxWait" has no effect here. Waiting for a pooled connection ' +
+            "is bounded by the client's `connectionTimeoutMs` instead.",
+          { code: 'prisma-compat-unknown-option', operation: '$transaction', key },
+        );
+      }
+      continue;
+    }
+    out[key] = value;
+  }
+  return out as PrismaCompatTxOptions;
 }
 
 /**
@@ -2275,10 +2554,17 @@ function makeDelegate(
         'createMany',
         args,
         () => {
+          // Prisma takes one row object or an array of them. Anything else used
+          // to become zero rows, so the call "succeeded" with `count: 0`.
           const data = (args as Args).data;
-          const rows = Array.isArray(data)
-            ? data.map((d) => translateWriteData(ctx, mm, applyCreateDefaults(mm, d)))
-            : [];
+          const list = Array.isArray(data) ? data : isPlainRecord(data) ? [data] : undefined;
+          if (!list) {
+            throw new ValidationError(
+              `prisma-compat: createMany on model "${modelName(ctx, mm)}" requires \`data\`, a row object or an ` +
+                `array of them, received ${describeValue(data)}.`,
+            );
+          }
+          const rows = list.map((d) => translateWriteData(ctx, mm, applyCreateDefaults(mm, d)));
           const t: Args = { data: rows };
           applyNativeOptions(CREATE_MANY_OPTIONS, args as Args, t);
           if ((args as Args).skipDuplicates) t.skipDuplicates = true;
@@ -2951,7 +3237,14 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
 
     const base: PrismaCompatClientBase = {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      $transaction: ((arg: unknown, txOptions?: PrismaCompatTxOptions): Promise<unknown> => {
+      $transaction: ((arg: unknown, rawTxOptions?: PrismaCompatTxOptions): Promise<unknown> => {
+        // Rejected, never thrown: Prisma's $transaction is always thenable.
+        let txOptions: PrismaCompatTxOptions | undefined;
+        try {
+          txOptions = resolveTxOptions(ctx.log, rawTxOptions);
+        } catch (err) {
+          return Promise.reject(decorate(err, ctx.options.prismaErrorCodes));
+        }
         // Array (lazy batch) form. Wrapped so validation/build errors REJECT the
         // returned promise (Prisma's $transaction is always thenable) rather than
         // throwing synchronously.
@@ -2979,7 +3272,7 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
                 }, txOptions);
               }
               const deferreds = batchables.map((b) => b.build());
-              const results = (await db.$transaction(deferreds)) as unknown[];
+              const results = (await db.$transaction(deferreds, txOptions)) as unknown[];
               return results.map((raw, i) => batchables[i]!.reshape(raw));
             } catch (err) {
               throw decorate(err, ctx.options.prismaErrorCodes);
