@@ -419,7 +419,14 @@ export async function handleRequest(req: IncomingMessage, res: ServerResponse, c
     return;
   }
 
-  const url = new URL(req.url ?? '/', expectedOrigin);
+  // A request target that is not a URL (`GET //`) is a client error, not a 500.
+  let url: URL;
+  try {
+    url = new URL(req.url ?? '/', expectedOrigin);
+  } catch {
+    sendJson(res, 400, { error: 'malformed request target' });
+    return;
+  }
   const pathname = url.pathname;
 
   // The index route serves the HTML shell. Every other route requires the
@@ -2069,6 +2076,10 @@ function openUrl(url: string): void {
   const args = platform() === 'win32' ? ['/c', 'start', '', url] : [url];
   try {
     const child = spawn(cmd, args, { stdio: 'ignore', detached: true });
+    // A launcher that is not installed (no xdg-open on a headless machine) is
+    // reported as an 'error' EVENT, not a throw; with no listener Node turns it
+    // into an uncaught exception and Studio dies right after printing its URL.
+    child.on('error', () => {});
     child.unref();
   } catch {
     // Non-fatal: user can click the URL manually.

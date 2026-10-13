@@ -22,7 +22,10 @@
  */
 
 import assert from 'node:assert/strict';
+import childProcess from 'node:child_process';
+import { EventEmitter } from 'node:events';
 import http from 'node:http';
+import { syncBuiltinESMExports } from 'node:module';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { describe, it } from 'node:test';
@@ -726,6 +729,48 @@ describe('a real Studio server (demo store)', () => {
       assert.equal(after.status, 200);
     } finally {
       await handle.dispose();
+    }
+  });
+});
+
+describe('Studio: a malformed request target and a missing browser launcher', () => {
+  it('answers a request target that is not a URL with 400, not 500', async () => {
+    const ctx = demoCtx();
+    for (const target of ['//', 'http://']) {
+      const r = await studio(ctx, 'GET', target, authed);
+      assert.equal(r.status, 400, target);
+      assert.deepEqual(r.json, { error: 'malformed request target' }, target);
+    }
+  });
+
+  it('survives a launcher that is missing: the failure arrives as an event, not a crash', async () => {
+    const port = await freePort();
+    const children: EventEmitter[] = [];
+    const realSpawn = childProcess.spawn;
+    const realPlatform = Object.getOwnPropertyDescriptor(process, 'platform') as PropertyDescriptor;
+    (childProcess as { spawn: unknown }).spawn = () => {
+      const child = Object.assign(new EventEmitter(), { unref() {} });
+      children.push(child);
+      return child;
+    };
+    syncBuiltinESMExports();
+    // Linux on purpose: if the fake did not take effect, xdg-open fails
+    // harmlessly instead of opening this machine's browser.
+    Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
+    let handle: Awaited<ReturnType<typeof startStudio>> | undefined;
+    try {
+      handle = await startStudio({ ...options(), port, openBrowser: true });
+    } finally {
+      Object.defineProperty(process, 'platform', realPlatform);
+      (childProcess as { spawn: unknown }).spawn = realSpawn;
+      syncBuiltinESMExports();
+    }
+    try {
+      assert.equal(children.length, 1, 'the launcher is spawned once');
+      const missing = Object.assign(new Error('spawn xdg-open ENOENT'), { code: 'ENOENT' });
+      assert.doesNotThrow(() => children[0]?.emit('error', missing), 'a missing launcher must not throw');
+    } finally {
+      await handle?.dispose();
     }
   });
 });
