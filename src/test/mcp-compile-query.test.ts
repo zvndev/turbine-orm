@@ -431,6 +431,48 @@ describe('mcp compile_query: nothing is executed', () => {
     assert.throws(() => compileQueryPlan({ metadata, table, operation: 'findMany', args }), RangeError);
   });
 
+  it('reports a `take` bound and leaves `_count` out of the relation walk', () => {
+    const metadata = fixtureMetadata();
+    const table = metadata.tables.orgs;
+    assert.ok(table);
+    const report = compileQueryPlan({
+      metadata,
+      table,
+      operation: 'findMany',
+      args: { take: 2, with: { _count: { users: true }, users: { limit: 3 } } },
+    });
+    assert.equal(report.ok, true);
+    if (!report.ok) return;
+    assert.equal(report.plan.bounded, true);
+    assert.equal(report.plan.boundedBy, 'take');
+    assert.equal(report.plan.limit, 2);
+    // `_count` is an inline aggregate, not a relation node.
+    assert.deepEqual(
+      report.plan.relations.map((r) => [r.path, r.limit]),
+      [['users', 3]],
+    );
+  });
+
+  it('walks a `with` given as a class instance, because the builder loads it', () => {
+    const metadata = fixtureMetadata();
+    const table = metadata.tables.orgs;
+    assert.ok(table);
+    class WithSpec {
+      users = true;
+    }
+    // The builder reads a `with` by its own keys whatever its prototype, so the
+    // SQL loads `users` here; a report listing no relation would describe a
+    // different query than the one that runs.
+    const report = compileQueryPlan({ metadata, table, operation: 'findMany', args: { with: new WithSpec() } });
+    assert.equal(report.ok, true);
+    if (!report.ok) return;
+    assert.match(report.sql, /FROM "users" t0/);
+    assert.deepEqual(
+      report.plan.relations.map((r) => r.path),
+      ['users'],
+    );
+  });
+
   it('withholds a parameter it cannot serialize rather than throwing on it', () => {
     const metadata = fixtureMetadata();
     const table = metadata.tables.posts;

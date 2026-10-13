@@ -252,6 +252,12 @@ export interface CompiledQuerySuccess {
 // Compile
 // ---------------------------------------------------------------------------
 
+/**
+ * Any non-array object, class instances included. Deliberately NOT the shared
+ * `isPlainRecord`: the builder walks a `with` (and a `where`) by its own keys
+ * whatever its prototype, so a report that skipped a class-instance `with`
+ * would list no relation while the SQL loads one.
+ */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
