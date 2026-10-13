@@ -8,9 +8,13 @@
  * client (so a write that escaped a global filter is visible).
  *
  * Ids are stable: the allowlist keys on them. Keep them `area/what`.
+ *
+ * Every result must be fully ordered by the query itself (a unique tiebreaker,
+ * and an `orderBy` on every to-many `with`) and must not depend on the oracle
+ * database's collation, or the oracle's answer changes with the server.
  */
 
-import { UNSAFE } from '../../../query/index.js';
+import { jsonValue, UNSAFE } from '../../../query/index.js';
 import type { ClientConfig, Db } from './harness.js';
 
 export type TableName = 'oe_orgs' | 'oe_users' | 'oe_profiles' | 'oe_posts' | 'oe_comments';
@@ -120,21 +124,24 @@ const RELATION_READS: Scenario[] = [
   },
 ];
 
+// NULL placement is ordered on a nullable INTEGER, never on mixed-case text:
+// text order follows the oracle database's collation (`C` and `en_US` put
+// 'Ally' and 'ally' in opposite orders), which is not what these scenarios ask.
 const ORDER_READS: Scenario[] = [
   {
     id: 'order/nullable-asc',
     kind: 'read',
-    run: (db) => ids(users(db, { orderBy: [{ nickname: 'asc' }, { id: 'asc' }] })),
+    run: (db) => ids(users(db, { orderBy: [{ age: 'asc' }, { id: 'asc' }] })),
   },
   {
     id: 'order/nullable-desc',
     kind: 'read',
-    run: (db) => ids(users(db, { orderBy: [{ nickname: 'desc' }, { id: 'asc' }] })),
+    run: (db) => ids(users(db, { orderBy: [{ age: 'desc' }, { id: 'asc' }] })),
   },
   {
     id: 'order/nulls-first',
     kind: 'read',
-    run: (db) => ids(users(db, { orderBy: [{ nickname: { sort: 'asc', nulls: 'first' } }, { id: 'asc' }] })),
+    run: (db) => ids(users(db, { orderBy: [{ age: { sort: 'asc', nulls: 'first' } }, { id: 'asc' }] })),
   },
   {
     id: 'order/nulls-last-desc',
@@ -273,6 +280,22 @@ const AGGREGATE_READS: Scenario[] = [
         .groupBy({ by: ['userId'], _count: true, having: { views: { _sum: { gt: 60 } } }, orderBy: { userId: 'asc' } }),
   },
   {
+    id: 'agg/avg-int-repeating',
+    kind: 'read',
+    run: (db) => db.table(C).aggregate({ where: { id: { in: [1, 3, 5] } }, _avg: { likes: true } }),
+  },
+  {
+    id: 'agg/having-avg-int',
+    kind: 'read',
+    run: (db) =>
+      db.table(P).groupBy({
+        by: ['published'],
+        _count: true,
+        having: { views: { _avg: { gt: 56.2 } } },
+        orderBy: { published: 'asc' },
+      }),
+  },
+  {
     id: 'agg/group-by-boolean',
     kind: 'read',
     run: (db) =>
@@ -315,10 +338,41 @@ const NEW_USER = {
 const WRITES: Scenario[] = [
   { id: 'write/create-all-types', kind: 'write', state: [U], run: (db) => db.table(U).create({ data: NEW_USER }) },
   {
+    id: 'write/create-date-end-of-day',
+    kind: 'write',
+    state: [U],
+    run: (db) =>
+      db.table(U).create({
+        data: {
+          ...NEW_USER,
+          birthday: new Date('1999-12-31T23:59:59.999Z'),
+          createdAt: new Date('2026-12-31T23:59:59.999Z'),
+        },
+      }),
+  },
+  {
     id: 'write/create-json-array',
     kind: 'write',
     state: [U],
     run: (db) => db.table(U).create({ data: { ...NEW_USER, prefs: ['x', 2, false] } }),
+  },
+  {
+    // A JSON string document whose text looks like a number: decoding it twice
+    // turns "123" into 123, on any path that parses the JSON text again.
+    id: 'write/create-json-string-document',
+    kind: 'write',
+    state: [U],
+    run: async (db) => {
+      await db.table(U).create({ data: { ...NEW_USER, prefs: jsonValue('123') } });
+      const read = (strategy: 'join' | 'batched') =>
+        db.table(O).findMany({
+          where: { id: 3 },
+          relationLoadStrategy: strategy,
+          select: { id: true },
+          with: { oeUsers: { select: { id: true, prefs: true }, orderBy: { id: 'asc' } } },
+        });
+      return { join: await read('join'), batched: await read('batched') };
+    },
   },
   {
     id: 'write/create-many',
@@ -453,7 +507,8 @@ const GLOBAL_FILTER: Scenario[] = [
     id: 'gf/find-many-with',
     kind: 'read',
     config: TENANT,
-    run: (db) => users(db, { select: { id: true }, with: { oePosts: { select: { id: true } } } }),
+    run: (db) =>
+      users(db, { select: { id: true }, with: { oePosts: { select: { id: true }, orderBy: { id: 'asc' } } } }),
   },
   {
     id: 'gf/unfiltered-parent-with',
@@ -463,7 +518,10 @@ const GLOBAL_FILTER: Scenario[] = [
       db.table(O).findMany({
         ...byId,
         select: { id: true },
-        with: { oeUsers: { select: { id: true } }, oePosts: { select: { id: true } } },
+        with: {
+          oeUsers: { select: { id: true }, orderBy: { id: 'asc' } },
+          oePosts: { select: { id: true }, orderBy: { id: 'asc' } },
+        },
       }),
   },
   { id: 'gf/count', kind: 'read', config: TENANT, run: (db) => db.table(P).count() },

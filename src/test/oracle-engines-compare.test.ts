@@ -9,7 +9,13 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { REPRESENTATIONS, SCENARIO_ENTRIES } from './oracle/engines/allowlist.js';
+import {
+  BOOLEAN_FIELDS,
+  JSON_FIELDS,
+  REPRESENTATION_PREDICATES,
+  REPRESENTATIONS,
+  SCENARIO_ENTRIES,
+} from './oracle/engines/allowlist.js';
 import { Comparison, lastField, type ReprRule, tag } from './oracle/engines/compare.js';
 import { SCENARIOS } from './oracle/engines/scenarios.js';
 
@@ -43,7 +49,11 @@ describe('oracle-engines: type-tagged comparison', () => {
   });
 
   it('a representation entry accepts its pair only under its fields, and counts the use', () => {
-    const bool = rule('sqlite-boolean-as-integer');
+    const bool: ReprRule = {
+      id: 'boolean-as-integer',
+      fields: BOOLEAN_FIELDS,
+      accept: REPRESENTATION_PREDICATES.booleanAsInteger,
+    };
     const cmp = new Comparison([bool]);
     assert.ok(cmp.equal(tag({ active: true }), tag({ active: 1 })));
     assert.equal(cmp.used.get(bool.id), 1);
@@ -52,7 +62,7 @@ describe('oracle-engines: type-tagged comparison', () => {
   });
 
   it('json-as-text decodes the text and still compares it exactly', () => {
-    const json = rule('sqlite-json-as-text');
+    const json: ReprRule = { id: 'json-as-text', fields: JSON_FIELDS, accept: REPRESENTATION_PREDICATES.jsonAsText };
     assert.ok(new Comparison([json]).equal(tag({ prefs: { a: [1, 'x'] } }), tag({ prefs: '{"a":[1,"x"]}' })));
     assert.equal(new Comparison([json]).equal(tag({ prefs: { a: [1, 'x'] } }), tag({ prefs: '{"a":[1,"y"]}' })), false);
     assert.equal(new Comparison([json]).equal(tag({ prefs: [] }), tag({ prefs: '{}' })), false, '[] is not {}');

@@ -118,50 +118,40 @@ function tagJson(value: unknown): Tagged {
   return `num:${value}`;
 }
 
-const BOOLEAN_FIELDS = ['active', 'published'] as const;
-const JSON_FIELDS = ['prefs', 'meta'] as const;
-const NUMERIC_FIELDS = ['balance'] as const;
+export const BOOLEAN_FIELDS = ['active', 'published'] as const;
+export const JSON_FIELDS = ['prefs', 'meta'] as const;
+export const NUMERIC_FIELDS = ['balance'] as const;
+
+/**
+ * Every representation predicate, by name, including ones no entry uses right
+ * now, so the comparison's own tests do not depend on which defects are open.
+ */
+export const REPRESENTATION_PREDICATES = {
+  booleanAsInteger,
+  jsonAsText,
+  numericAsNumber,
+  numericPaddedScale,
+  bigintAsLossyNumber,
+  datetimeTick,
+  uuidUpperCase,
+} as const;
 
 export const REPRESENTATIONS: readonly RepresentationEntry[] = [
   {
     engine: 'sqlite',
-    id: 'sqlite-boolean-as-integer',
-    kind: 'bug',
-    fields: BOOLEAN_FIELDS,
-    accept: booleanAsInteger,
-    note: 'boolean columns read back as 0/1 on every read path, though the generated type is boolean.',
-  },
-  {
-    engine: 'sqlite',
-    id: 'sqlite-json-as-text',
-    kind: 'bug',
-    fields: JSON_FIELDS,
-    accept: jsonAsText,
-    note: 'json/jsonb columns read back as JSON text instead of the parsed value.',
-  },
-  {
-    engine: 'sqlite',
     id: 'sqlite-numeric-as-number',
-    kind: 'bug',
+    kind: 'difference',
     fields: NUMERIC_FIELDS,
     accept: numericAsNumber,
-    note: 'numeric columns read back as a JS number, so a value past double precision is rounded (Postgres returns the exact decimal string).',
+    note: 'SQLite has no exact decimal: a NUMERIC column stores an INTEGER or an 8-byte REAL, so it reads back as a JS number and a value past double precision is rounded on write (Postgres returns the exact decimal string).',
   },
   {
     engine: 'mysql',
     id: 'mysql-numeric-padded-scale',
-    kind: 'bug',
+    kind: 'difference',
     fields: NUMERIC_FIELDS,
     accept: numericPaddedScale,
-    note: 'numeric columns are created as DECIMAL(65,30), so every value reads back with 30 fractional digits (12.34 becomes 12.340000000000000000000000000000).',
-  },
-  {
-    engine: 'mysql',
-    id: 'mysql-nested-bigint-as-number',
-    kind: 'bug',
-    fields: ['big'],
-    accept: bigintAsLossyNumber,
-    note: 'a bigint read through a `with` relation arrives as a JS number, so 9007199254740993 reads back as 9007199254740992; top-level reads keep the exact string.',
+    note: 'MySQL DECIMAL has a fixed scale, so an unconstrained numeric is created as DECIMAL(65,30) and every value reads back with 30 fractional digits (12.34 becomes 12.340000000000000000000000000000). The value is exact.',
   },
   {
     engine: 'mssql',
@@ -174,26 +164,10 @@ export const REPRESENTATIONS: readonly RepresentationEntry[] = [
   {
     engine: 'mssql',
     id: 'mssql-numeric-as-number',
-    kind: 'bug',
+    kind: 'difference',
     fields: NUMERIC_FIELDS,
     accept: numericAsNumber,
-    note: 'numeric columns, and _sum/_min/_max over them, read back as a JS number, so a value past double precision is rounded.',
-  },
-  {
-    engine: 'mssql',
-    id: 'mssql-nested-bigint-as-number',
-    kind: 'bug',
-    fields: ['big'],
-    accept: bigintAsLossyNumber,
-    note: 'on the join strategy a bigint inside FOR JSON PATH is emitted as a JSON number, so 9007199254740993 reads back as 9007199254740992; top-level and batched reads keep the exact string.',
-  },
-  {
-    engine: 'mssql',
-    id: 'mssql-datetime-tick',
-    kind: 'bug',
-    fields: ['createdAt', 'publishedAt'],
-    accept: datetimeTick,
-    note: 'a JS Date is bound without a type, which the driver sends as DATETIME (1/300 s ticks), so milliseconds are rounded on write: 23:59:59.999 is stored as the next day 00:00:00.000.',
+    note: 'the mssql driver (tedious) decodes DECIMAL into a JS number and has no string mode, so numeric columns, and _sum/_min/_max over them, read back as a number and a value past double precision is rounded on read (the stored value is exact).',
   },
   {
     engine: 'mssql',
@@ -217,7 +191,37 @@ const nullOrder = (engine: Engine): ScenarioEntry[] =>
     note: 'default NULL placement differs from Postgres; pass `nulls` where the engine supports it.',
   }));
 
+// A JS Date written to a `date` column: PostgreSQL binds the UTC date
+// (`1999-12-31`), the other engines bind the full instant and each stores it
+// its own way. The UTC-date rendering is gated to PostgreSQL in the write path.
+const DATE_END_OF_DAY: readonly ScenarioEntry[] = [
+  {
+    engine: 'mysql',
+    scenario: 'write/create-date-end-of-day',
+    kind: 'bug',
+    note: 'a Date bound to a DATE column is sent as a DATETIME literal and MySQL ROUNDS it to the nearest day, so 1999-12-31T23:59:59.999Z is stored as 2000-01-01; Postgres stores 1999-12-31.',
+  },
+  {
+    engine: 'sqlite',
+    scenario: 'write/create-date-end-of-day',
+    kind: 'bug',
+    note: 'a Date bound to a date column is stored as its full ISO timestamp, so the time of day survives and reads back (1999-12-31T23:59:59.999Z); Postgres stores the UTC date 1999-12-31.',
+  },
+  {
+    engine: 'powdb',
+    scenario: 'write/create-date-end-of-day',
+    kind: 'bug',
+    note: 'a Date written to a date column keeps its time of day (1999-12-31T23:59:59.999Z); Postgres stores the UTC date 1999-12-31.',
+  },
+];
+
 export const SCENARIO_ENTRIES: readonly ScenarioEntry[] = [
+  {
+    engine: 'mssql',
+    scenario: 'write/create-json-string-document',
+    kind: 'bug',
+    note: 'the mssql-json-as-text defect for a JSON string document: the column reads back as its JSON text, quotes included, where Postgres returns the string 123.',
+  },
   // --- sqlite ---
   ...nullOrder('sqlite'),
   {
@@ -273,36 +277,6 @@ export const SCENARIO_ENTRIES: readonly ScenarioEntry[] = [
       note: "SQL Server's default collation compares text case-insensitively (accents still count).",
     }),
   ),
-  {
-    engine: 'mssql',
-    scenario: 'where/timestamp-range',
-    kind: 'bug',
-    note: 'the DATETIME rounding (mssql-datetime-tick) stores 2025-12-31T23:59:59.999Z as 2026-01-01T00:00:00.000Z, which moves the row inside the range.',
-  },
-  {
-    engine: 'mssql',
-    scenario: 'with/depth-2-options-join',
-    kind: 'bug',
-    note: 'an array-form orderBy inside a relation is refused on the join strategy with E003 naming field "0"; the batched strategy accepts the same query.',
-  },
-  {
-    engine: 'mssql',
-    scenario: 'agg/group-by-boolean',
-    kind: 'bug',
-    note: '`_avg` over an integer column truncates (AVG of INT is INT on SQL Server): 56 where Postgres returns 56.4.',
-  },
-  {
-    engine: 'mssql',
-    scenario: 'write/create-many-bigint-mixed',
-    kind: 'bug',
-    note: 'createMany binds a bigint past 2^53 as text and a small one as int; SQL Server types the VALUES column as int and fails with an unwrapped RequestError ("overflowed an int column").',
-  },
-  {
-    engine: 'mssql',
-    scenario: 'write/upsert-existing',
-    kind: 'bug',
-    note: 'upsert with an atomic `increment` in `update` emits an unqualified column in the MERGE and fails with an unwrapped RequestError ("Ambiguous column name").',
-  },
   // --- powdb ---
   ...[
     'where/numeric-gt',
@@ -355,12 +329,7 @@ export const SCENARIO_ENTRIES: readonly ScenarioEntry[] = [
     kind: 'bug',
     note: "a date column compared with an ISO date string ('2000-02-29') matches nothing: the column holds the bound Date's full ISO timestamp text.",
   },
-  {
-    engine: 'sqlite',
-    scenario: 'write/update-divide-int',
-    kind: 'bug',
-    note: 'integer divide stores a fraction (75 / 2 = 37.5) in an INTEGER column; Postgres truncates to 37.',
-  },
+  ...DATE_END_OF_DAY,
 ];
 
 export function scenarioEntry(engine: EngineName, scenario: string): ScenarioEntry | undefined {
