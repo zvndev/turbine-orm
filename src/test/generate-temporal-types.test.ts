@@ -129,9 +129,9 @@ describe('generateTypes, temporal column types', () => {
     const create = out.slice(out.indexOf('ReportScheduleCreate'), out.indexOf('ReportScheduleUpdate'));
     assert.match(create, /at_time: string \| Date;/);
     assert.match(create, /at_timetz: string \| Date;/);
-    assert.match(create, /maybe_time\?: string \| Date \| null;/);
+    assert.match(create, /maybe_time\?: string \| Date \| null \| undefined;/);
     const update = out.slice(out.indexOf('ReportScheduleUpdate'));
-    assert.match(update, /at_time\?: string \| Date;/);
+    assert.match(update, /at_time\?: string \| Date \| UpdateOperatorInput<string \| Date> \| undefined;/);
   });
 
   it('write inputs for timestamp / date columns are unchanged', () => {
@@ -202,12 +202,16 @@ describe('generateZod, temporal column types', () => {
       ['at_timestamp', 'z.coerce.date()'],
       ['at_timestamptz', 'z.coerce.date()'],
       ['at_date', 'z.coerce.date()'],
-      ['every', 'z.string()'],
-      ['id', 'z.number()'],
     ] as const) {
       assert.ok(row.includes(`${field}: ${expr}`), `row ${field}`);
       assert.ok(create.includes(`${field}: ${expr}`), `create ${field}`);
     }
+    // An interval reads as the driver's parsed object and is written as text.
+    assert.ok(row.includes('every: z.object({ years: z.number().optional(),'), 'row every');
+    assert.ok(create.includes('every: z.string()'), 'create every');
+    // A bigint reads as a number; the write path also takes its decimal string or a bigint.
+    assert.ok(row.includes('id: z.number()'), 'row id');
+    assert.ok(create.includes('id: z.union([z.number(), z.string(), z.bigint()])'), 'create id');
   });
 });
 
