@@ -23,6 +23,7 @@ import pg from 'pg';
 import { applyCodeFirstColumnTags, type CodeFirstTagMap, extractCodeFirstColumnTags } from '../cli/code-first-tags.js';
 import { TurbineClient } from '../client.js';
 import { introspect } from '../introspect.js';
+import { UNSAFE } from '../query/index.js';
 import type { ColumnMetadata, SchemaMetadata, TableMetadata } from '../schema.js';
 import { defineSchema } from '../schema-builder.js';
 import { makeProject, type Project, SRC } from './codegen-cli-fixture.js';
@@ -275,7 +276,7 @@ describe('turbine generate applies the schema file tags (live)', () => {
     assert.match(metadata, /updatedAt: true/);
   });
 
-  live.it('the generated client excludes the pii column by default and returns it when asked', async () => {
+  live.it('the generated client excludes the pii column by default and returns it under includePii', async () => {
     const db = await generatedClient();
     try {
       await pool.query(`INSERT INTO "${USERS}" (email, name, updated_at) VALUES ('a@example.test', 'A', '2000-01-01')`);
@@ -283,9 +284,15 @@ describe('turbine generate applies the schema file tags (live)', () => {
       const [row] = await users.findMany({ where: { name: 'A' }, limit: 10 });
       assert.ok(row, 'the inserted row was not found');
       assert.equal('email' in row, false, `the pii column was returned by default: ${JSON.stringify(row)}`);
+      // Naming the column in `select` is not enough: only the UNSAFE symbol unlocks it.
+      await assert.rejects(
+        () => users.findMany({ where: { name: 'A' }, select: { email: true, name: true }, limit: 10 }),
+        /names "email", which is tagged PII/,
+      );
       const [withEmail] = await users.findMany({
         where: { name: 'A' },
         select: { email: true, name: true },
+        includePii: UNSAFE,
         limit: 10,
       });
       assert.equal(withEmail?.email, 'a@example.test');

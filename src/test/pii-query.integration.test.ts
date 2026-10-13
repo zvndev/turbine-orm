@@ -132,9 +132,17 @@ async function assertPiiSemantics(db: DB, authorId: unknown): Promise<void> {
   assert.ok(!('email' in def), 'default read must exclude the str PII column');
   assert.ok(!('profile' in def), 'default read must exclude the json PII column');
 
-  // (2) explicit select of a PII column returns exactly it (+ the PK).
-  const sel = await db.table('app_user').findUnique({ where: { id: authorId }, select: { email: true } });
-  assert.equal(sel.email, 'ada@x.test', 'select naming the PII column returns it');
+  // (2) naming a PII column in `select` is refused unless the call passes
+  // includePii: UNSAFE (a `select` can arrive in request data; the symbol cannot).
+  await assert.rejects(
+    () => db.table('app_user').findUnique({ where: { id: authorId }, select: { email: true } }),
+    (err: Error) => /names "email", which is tagged PII/.test(err.message),
+    'select naming a PII column must be refused without includePii',
+  );
+  const sel = await db
+    .table('app_user')
+    .findUnique({ where: { id: authorId }, select: { email: true }, includePii: UNSAFE });
+  assert.equal(sel.email, 'ada@x.test', 'select naming the PII column returns it under includePii');
   assert.ok(!('name' in sel), 'select projects only the named column (+ PK)');
 
   // (3) includePii returns everything, including the json PII column. (The exact
@@ -162,13 +170,24 @@ async function assertPiiSemantics(db: DB, authorId: unknown): Promise<void> {
     assert.equal(typeof p.secret, 'string', 'child PII column present under includePii');
   }
 
-  // (6) a relation-level select naming the PII column returns it.
+  // (6) a relation-level select naming the PII column is refused the same way,
+  // and returns it under includePii.
+  await assert.rejects(
+    () =>
+      db.table('app_user').findUnique({
+        where: { id: authorId },
+        with: { posts: { orderBy: { title: 'asc' }, select: { secret: true } } },
+      }),
+    (err: Error) => /names "secret", which is tagged PII/.test(err.message),
+    'a relation select naming a PII column must be refused without includePii',
+  );
   const withPostsSelect = await db.table('app_user').findUnique({
     where: { id: authorId },
     with: { posts: { orderBy: { title: 'asc' }, select: { secret: true } } },
+    includePii: UNSAFE,
   });
   assert.ok(withPostsSelect.posts.length > 0, 'fixture must return child posts, or this step asserts nothing');
-  for (const p of withPostsSelect.posts) assert.ok('secret' in p, 'relation select opt-in returns child PII');
+  for (const p of withPostsSelect.posts) assert.ok('secret' in p, 'relation select under includePii returns child PII');
 }
 
 // ---------------------------------------------------------------------------
@@ -189,7 +208,7 @@ async function withPowdb(fn: (db: DB, authorId: unknown) => Promise<void>): Prom
   const dir = mkdtempSync(join(tmpdir(), 'powdb-pii-'));
   const db: DB = await turbinePowDB({ embedded: dir, syncMode: 'normal' }, s, { warnOnUnlimited: false });
   try {
-    for (const stmt of powqlSchemaDDL(s)) await db.raw([stmt]);
+    for (const stmt of powqlSchemaDDL(s)) await db.rawUnsafe(stmt);
     // Writes accept PII freely; the returned row drops it, so re-read for the id.
     const created = await db.table('app_user').create({
       data: { name: 'Ada', email: 'ada@x.test', profile: new PowdbJsonParam({ tier: 'gold' }) },
@@ -281,18 +300,18 @@ describe('pii integration (postgres)', () => {
     const db: DB = new TurbineClient({ connectionString: DATABASE_URL!, poolSize: 3, warnOnUnlimited: false }, s);
     await db.connect();
     try {
-      await db.raw(['DROP TABLE IF EXISTS pii_post']);
-      await db.raw(['DROP TABLE IF EXISTS pii_app_user']);
+      await db.rawUnsafe('DROP TABLE IF EXISTS pii_post');
+      await db.rawUnsafe('DROP TABLE IF EXISTS pii_app_user');
       // Real table names differ from the metadata names below via search_path?
       // Keep them aligned: create the exact tables the metadata references.
-      await db.raw(['DROP TABLE IF EXISTS post']);
-      await db.raw(['DROP TABLE IF EXISTS app_user']);
-      await db.raw([
+      await db.rawUnsafe('DROP TABLE IF EXISTS post');
+      await db.rawUnsafe('DROP TABLE IF EXISTS app_user');
+      await db.rawUnsafe(
         'CREATE TABLE app_user (id text PRIMARY KEY DEFAULT gen_random_uuid()::text, name text NOT NULL, email text NOT NULL, profile jsonb)',
-      ]);
-      await db.raw([
+      );
+      await db.rawUnsafe(
         'CREATE TABLE post (id text PRIMARY KEY DEFAULT gen_random_uuid()::text, author_id text NOT NULL, title text NOT NULL, secret text NOT NULL)',
-      ]);
+      );
 
       const created = await db.table('app_user').create({
         data: { name: 'Ada', email: 'ada@x.test', profile: { tier: 'gold' } },
@@ -303,7 +322,7 @@ describe('pii integration (postgres)', () => {
       // Live proof of the boundary: the value was WRITTEN (persisted) even though
       // the create() result omitted it: the write's RETURNING excludes PII at the
       // SQL level, it is not merely stripped client-side. Read it back with raw SQL.
-      const persisted = await db.raw(["SELECT email FROM app_user WHERE name = 'Ada'"]);
+      const persisted = await db.rawUnsafe("SELECT email FROM app_user WHERE name = 'Ada'");
       assert.equal(persisted[0]?.email, 'ada@x.test', 'PII persisted despite being excluded from the write return');
 
       const ada = await db.table('app_user').findFirst({ where: { name: 'Ada' } });
@@ -330,8 +349,8 @@ describe('pii integration (postgres)', () => {
         assert.ok(!('secret' in p), 'batched loader excludes the child PII column');
       }
     } finally {
-      await db.raw(['DROP TABLE IF EXISTS post']).catch(() => {});
-      await db.raw(['DROP TABLE IF EXISTS app_user']).catch(() => {});
+      await db.rawUnsafe('DROP TABLE IF EXISTS post').catch(() => {});
+      await db.rawUnsafe('DROP TABLE IF EXISTS app_user').catch(() => {});
       await db.disconnect();
     }
   });

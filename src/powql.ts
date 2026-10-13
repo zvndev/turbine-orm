@@ -74,6 +74,7 @@ import {
   rowToEntity,
 } from './powdb-shared.js';
 import { assertAggregatePiiOptIn } from './query/aggregates.js';
+import { markStitchOnly, stitchOnlyFields } from './query/batched-loader.js';
 import {
   assertMutationWhereIdentifiesOneRow,
   assertWhereIdentifiesOneRow,
@@ -86,6 +87,7 @@ import { isJsonValue } from './query/json-value.js';
 import { assertWhereNotEmptiedByPruning, pruneUndefinedArgs } from './query/normalize-args.js';
 import { warnUnknownQueryOptions } from './query/option-surface.js';
 import { applyStableRelationOrderTo, normalizeWithClause, normalizeWithPagination } from './query/relation-names.js';
+import { piiSelectRefusedMessage } from './query/relations.js';
 import type {
   AggregateArgs,
   AggregateResult,
@@ -1761,6 +1763,24 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const forcedPk: string[] = [];
     const hasSelect = select && Object.keys(select).length;
     if (hasSelect) {
+      // A PII column named in `select` is refused unless the read passes
+      // `includePii: UNSAFE`, as on the SQL engines. A key the loader added
+      // itself (a PII-tagged correlation column) carries the stitch-only mark.
+      if (!includePii) {
+        const pii = this.piiColumnNames();
+        if (pii.size) {
+          const stitchOnly = stitchOnlyFields(select);
+          for (const [key, on] of Object.entries(select)) {
+            if (!on || stitchOnly?.has(key)) continue;
+            const column = this.projectionColumn(key, 'select');
+            if (pii.has(column) && !pk.has(column)) {
+              throw new ValidationError(
+                piiSelectRefusedMessage(this.table, this.meta.reverseColumnMap[column] ?? column),
+              );
+            }
+          }
+        }
+      }
       const picked = new Set(
         Object.entries(select)
           .filter(([, v]) => v)
@@ -2565,7 +2585,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         if (userSelect) {
           fetchOptions = {
             ...options,
-            select: { ...userSelect, [childKeyField]: true },
+            select: markStitchOnly({ ...userSelect, [childKeyField]: true }, [childKeyField]),
           } as unknown as FindManyArgs<object>;
         } else if (userOmit) {
           const omitWithoutFk = { ...userOmit };
@@ -2731,7 +2751,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       if (userSelect) {
         fetchOptions = {
           ...options,
-          select: { ...userSelect, [targetPkField]: true },
+          select: markStitchOnly({ ...userSelect, [targetPkField]: true }, [targetPkField]),
         } as unknown as typeof fetchOptions;
       } else if (userOmit) {
         const omitWithoutPk = { ...userOmit };

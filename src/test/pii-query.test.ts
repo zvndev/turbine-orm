@@ -3,14 +3,15 @@
  *
  * The contract (from `ColumnMetadata.pii`'s JSDoc, which is normative): a
  * PII-tagged column is EXCLUDED from default projections. It comes back only
- * when it is named explicitly in `select`, or when the query passes
- * `includePii: UNSAFE` (which opts in at the top level AND every nested `with`
- * level). Untagged schemas behave byte-identically to before.
+ * when the query passes `includePii: UNSAFE` (which opts in at the top level AND
+ * every nested `with` level). Naming it in `select` does not unlock it: `select`
+ * is request data, and only the UNSAFE symbol is not. Untagged schemas behave
+ * byte-identically to before.
  *
  * These build-only tests assert the generated SQL and the write read-policy
  * without a database:
  *   - default findMany / findUnique omit the PII column from the SELECT list;
- *   - `select` naming it returns exactly it (explicitness IS the opt-in);
+ *   - `select` naming it is refused (E003) unless `includePii: UNSAFE` is passed;
  *   - `includePii` returns everything (`SELECT t.*`);
  *   - relation subqueries (join strategy) + the batched loader's child fetch
  *     apply the same exclusion, and `includePii` reaches nested levels;
@@ -174,9 +175,20 @@ describe('pii: default top-level projection excludes the PII column', () => {
   });
 });
 
-describe('pii: explicit select IS the opt-in', () => {
-  it('select naming email returns exactly it', () => {
-    const { sql } = usersQuery().buildFindMany({ select: { email: true } });
+describe('pii: naming a PII column in select needs includePii', () => {
+  it('select naming email is refused with E003 naming the column and the opt-in', () => {
+    assert.throws(
+      () => usersQuery().buildFindMany({ select: { email: true } }),
+      (err: unknown) =>
+        err instanceof Error &&
+        (err as { code?: string }).code === 'TURBINE_E003' &&
+        /names "email"/.test(err.message) &&
+        /includePii: UNSAFE/.test(err.message),
+    );
+  });
+
+  it('select naming email with includePii: UNSAFE returns exactly it', () => {
+    const { sql } = usersQuery().buildFindMany({ select: { email: true }, includePii: UNSAFE });
     assert.match(sql, /"users"\."email"/);
     assert.doesNotMatch(sql, /"users"\."name"/, 'only the selected column is projected');
   });
@@ -234,8 +246,12 @@ for (const jsonEncoding of ['object', 'positional'] as const) {
       assert.match(sql, relationColumn('secret'), 'includePii applies to nested with levels');
     });
 
-    it('relation select naming the PII column returns it (explicit opt-in per level)', () => {
-      const { sql } = q().buildFindMany({ with: { posts: { select: { secret: true } } } });
+    it('relation select naming the PII column is refused, and returned under includePii', () => {
+      assert.throws(
+        () => q().buildFindMany({ with: { posts: { select: { secret: true } } } }),
+        /names "secret", which is tagged PII/,
+      );
+      const { sql } = q().buildFindMany({ with: { posts: { select: { secret: true } } }, includePii: UNSAFE });
       assert.match(sql, relationColumn('secret'));
     });
 

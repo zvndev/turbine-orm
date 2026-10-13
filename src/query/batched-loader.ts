@@ -336,14 +336,42 @@ export function defaultProjectionFields(
 }
 
 /**
- * Adjust a `select`/`omit` pair so that `fields` are guaranteed present in the
- * query result, returning the adjusted projection plus the list of fields that
- * were added ONLY for stitching and must be stripped from the final entities.
+ * Key under which {@link includeKeysForBatching} records the fields IT added to
+ * a `select`, as a `ReadonlySet<string>` of field names.
  *
- * Used both for the base query (parent keys) and each follow-up query (child
- * keys) so a caller's `select: { title: true }` on a relation still stitches even
- * though the FK was not requested, and the FK never appears in the output.
+ * Why it exists: naming a PII-tagged column in `select` is refused unless the
+ * query passes `includePii: UNSAFE` (see `resolveProjection`), and the loader
+ * has to project a correlation or ordering column that may itself be tagged.
+ * That column is stripped from every entity before the caller sees it, so it is
+ * the one legitimate way a PII name reaches a `select` without the caller
+ * writing it. The marker is a symbol key: `Object.keys`, `Object.entries`,
+ * spreads of a parsed body and `JSON.stringify` never see one, and
+ * `JSON.parse` cannot produce one, so request data cannot forge the exemption.
  */
+export const STITCH_ONLY_FIELDS: unique symbol = Symbol.for('turbine.stitchOnlyFields');
+
+/** The fields the batched loader (not the caller) added to this `select`, if any. */
+export function stitchOnlyFields(select: object | undefined): ReadonlySet<string> | undefined {
+  if (!select) return undefined;
+  const marked = (select as { [STITCH_ONLY_FIELDS]?: unknown })[STITCH_ONLY_FIELDS];
+  return marked instanceof Set ? (marked as ReadonlySet<string>) : undefined;
+}
+
+/** Record `fields` on `select` as added by an engine loader, not by the caller. Returns `select`. */
+export function markStitchOnly(select: Record<string, boolean>, fields: readonly string[]): Record<string, boolean> {
+  // Non-enumerable, like the other engine-written markers: the select object is
+  // passed by reference from here to the child build, and an enumerable symbol
+  // would show up in deep-equality comparisons of the projection.
+  if (fields.length > 0) {
+    Object.defineProperty(select, STITCH_ONLY_FIELDS, {
+      value: new Set(fields),
+      enumerable: false,
+      configurable: true,
+    });
+  }
+  return select;
+}
+
 /**
  * The two projection SHAPE rules from `resolveProjection`, checked on the RAW
  * caller args BEFORE `includeKeysForBatching` adjusts them. The adjustment
@@ -369,6 +397,16 @@ export function assertProjectionShape(
   }
 }
 
+/**
+ * Adjust a `select`/`omit` pair so that `fields` are guaranteed present in the
+ * query result, returning the adjusted projection plus the list of fields that
+ * were added ONLY for stitching and must be stripped from the final entities.
+ *
+ * Used both for the base query (parent keys) and each follow-up query (child
+ * keys) so a caller's `select: { title: true }` on a relation still stitches even
+ * though the FK was not requested, and the FK never appears in the output. A
+ * returned `select` carries {@link STITCH_ONLY_FIELDS} for the fields added here.
+ */
 export function includeKeysForBatching(
   /**
    * The table the projection is compiled against. `select` / `omit` keys are
@@ -423,7 +461,7 @@ export function includeKeysForBatching(
       next[f] = true;
       strip.push(f); // not requested by the caller, added only to stitch
     }
-    return { select: next, omit, strip };
+    return { select: markStitchOnly(next, strip), omit, strip };
   }
   if (omit) {
     const next = { ...omit };
@@ -447,7 +485,7 @@ export function includeKeysForBatching(
     const explicit: Record<string, boolean> = {};
     for (const f of defaultProjection.visible) explicit[f] = true;
     for (const f of hiddenKeys) explicit[f] = true;
-    return { select: explicit, omit: undefined, strip: hiddenKeys };
+    return { select: markStitchOnly(explicit, hiddenKeys), omit: undefined, strip: hiddenKeys };
   }
   return { select, omit, strip: [] };
 }

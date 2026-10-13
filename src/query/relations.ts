@@ -18,7 +18,7 @@ import { CircularRelationError, RelationError, UnsupportedFeatureError, Validati
 import { missingIndexForRelation } from '../index-advisor.js';
 import type { RelationDef, TableMetadata } from '../schema.js';
 import { normalizeKeyColumns, snakeToCamel } from '../schema.js';
-import { resolveCountRelations } from './batched-loader.js';
+import { resolveCountRelations, stitchOnlyFields } from './batched-loader.js';
 import {
   isJsonPathOrderBy,
   isOrderBySpec,
@@ -99,6 +99,22 @@ function projectionColumn(table: string, meta: TableMetadata, field: string, cla
 }
 
 /**
+ * The E003 text for a PII-tagged column named in `select` without
+ * `includePii: UNSAFE`. Shared by every projection path through
+ * {@link resolveProjection}, so a top-level read, a `with` relation (join,
+ * batched, flatten and positional alike) and a single-row write refuse in the
+ * same words. The write path is named because it cannot pass the opt-in at all.
+ */
+export function piiSelectRefusedMessage(table: string, field: string): string {
+  return (
+    `\`select\` on "${table}" names "${field}", which is tagged PII. A PII column is returned only by a read that ` +
+    'passes `includePii: UNSAFE` (import { UNSAFE } from "turbine-orm"); naming it in `select` does not unlock it, ' +
+    'because `select` can arrive in request data and must not be able to. A write never returns a PII column, so ' +
+    `read the row back with \`includePii: UNSAFE\`, or remove "${field}" from \`select\`.`
+  );
+}
+
+/**
  * Resolve `select` / `omit` into a list of snake_case column names, for the
  * query's own table and for a relation target alike. `null` means "no
  * projection", i.e. all columns, which keeps the `*` fast path.
@@ -176,8 +192,15 @@ export function resolveProjection(
         `"select" must be an object mapping field names to true ` + `(e.g. { id: true, name: true }), not an array.`,
       );
     }
-    // Only include columns where value is true. An explicit `select` naming a
-    // PII column IS the opt-in: it comes back regardless of `includePii`.
+    // Only include columns where value is true.
+    //
+    // A PII-tagged column named here needs `includePii: UNSAFE`, exactly like
+    // the default-projection path below. `select` is ordinary request data (a
+    // parsed query string is a `select` object), and the `UNSAFE` symbol is the
+    // one thing a request cannot produce, so letting a bare `select: { ssn: true }`
+    // unlock the column would make the privilege option decorative. The one
+    // exemption is a key the batched loader added to stitch rows together
+    // (STITCH_ONLY_FIELDS), which it strips before the caller sees any entity.
     //
     // Emitted in the TABLE's column order, not the caller's key order, which is
     // the same order the `omit` and default branches below produce. Two reasons,
@@ -205,11 +228,19 @@ export function resolveProjection(
     // keys are all derived from it, so they move together. The one observable
     // consequence is that a projected row's KEY INSERTION order now follows the
     // table rather than the `select` literal.
+    const piiCols = includePii ? undefined : writesMod.piiColumns(qi, meta);
+    const stitchOnly = piiCols && piiCols.size > 0 ? stitchOnlyFields(select) : undefined;
     return canonicalColumnOrder(
       meta,
       Object.entries(select)
         .filter(([, v]) => v)
-        .map(([k]) => projectionColumn(table, meta, k, 'select')),
+        .map(([k]) => {
+          const column = projectionColumn(table, meta, k, 'select');
+          if (piiCols?.has(column) && !stitchOnly?.has(k)) {
+            throw new ValidationError(piiSelectRefusedMessage(table, meta.reverseColumnMap[column] ?? column));
+          }
+          return column;
+        }),
     );
   }
   // Default / omit-only projection: PII-tagged columns are excluded unless the
