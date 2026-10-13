@@ -116,6 +116,7 @@ import {
   createMigration,
   type DestructiveOffender,
   formatChecksumMismatchError,
+  formatPendingAutoRefusal,
   inspectMigrationDeploy,
   listIgnoredSqlFiles,
   listMigrationFiles,
@@ -127,8 +128,11 @@ import {
   migrateUp,
   type OutOfOrderApply,
   parseMigrationContent,
+  pendingMigrationFiles,
   planMigrationRollback,
   type RebaselinedChecksum,
+  rollbacksWithoutSql,
+  summarizeMigrationStatus,
 } from './migrate.js';
 import { startObserve } from './observe.js';
 import { formatPrismaReport, summaryLines } from './prisma-report.js';
@@ -206,6 +210,15 @@ export interface CliArgs {
   allowDrift?: boolean;
   allowEmpty?: boolean;
   allowDestructive?: boolean;
+  /** `migrate create --auto|--from-diff --allow-pending`: diff even while migrations are pending. */
+  allowPending?: boolean;
+  /**
+   * `push --dry-run --exit-code` / `migrate status --exit-code`: exit 2 when the
+   * database differs from the schema file / the migration history is not clean.
+   */
+  exitCode?: boolean;
+  /** `migrate deploy --wait[=seconds]`: seconds to wait for a concurrent deploy's lock. */
+  wait?: number;
   /** `migrate create --recipe <name>` scaffold selector. */
   recipe?: string;
   fix?: boolean;
@@ -285,6 +298,9 @@ export interface CliArgs {
   dir?: string;
 }
 
+/** How long a bare `migrate deploy --wait` waits for a concurrent deploy to finish. */
+export const DEFAULT_LOCK_WAIT_SECONDS = 300;
+
 /**
  * Fail an argument-parse error the way every other CLI failure looks: banner,
  * red error line, then indented hint lines. The flag validators used to call
@@ -351,7 +367,7 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
     '--allow-empty',
   ],
   'migrate-from-prisma': ['--no-db', '--if-db', '--allow-partial', '--no-timestamp'],
-  push: ['--schema-file', '--dry-run', '--allow-destructive'],
+  push: ['--schema-file', '--dry-run', '--exit-code', '--allow-destructive'],
   migrate: [
     '--schema-file',
     '--auto',
@@ -359,8 +375,11 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
     '--recipe',
     '--step',
     '--dry-run',
+    '--exit-code',
+    '--wait',
     '--allow-drift',
     '--allow-destructive',
+    '--allow-pending',
   ],
   seed: [],
   status: [],
@@ -546,6 +565,8 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
   const unknownFlags: string[] = [];
   /** The raw `--step` operand, judged after the loop. Absent means unset. */
   let stepRaw: string | undefined;
+  /** The raw `--wait` operand, judged after the loop: undefined absent, null bare `--wait`. */
+  let waitRaw: string | null | undefined;
 
   for (; i < args.length; i++) {
     const arg = args[i]!;
@@ -555,7 +576,14 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
     // (`--step -1`, `--host -x`) is consumed by its own case and never reaches
     // this test. A bare `-`-prefixed token that is not a flag reaches it and is
     // rejected: no command takes a negative-number positional.
-    if (accepted && arg.startsWith('-') && !accepted.has(arg)) unknownFlags.push(arg);
+    // `--wait=30` is the one flag whose value attaches with `=`, so it is
+    // matched by its name and handled here rather than by a `case` label.
+    const attachedWait = arg.startsWith('--wait=');
+    if (accepted && arg.startsWith('-') && !accepted.has(attachedWait ? '--wait' : arg)) unknownFlags.push(arg);
+    if (attachedWait) {
+      waitRaw = arg.slice('--wait='.length);
+      continue;
+    }
 
     switch (arg) {
       case '--url':
@@ -599,6 +627,22 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
       }
       case '--dry-run':
         result.dryRun = true;
+        break;
+      case '--exit-code':
+        result.exitCode = true;
+        break;
+      case '--allow-pending':
+        result.allowPending = true;
+        break;
+      case '--wait':
+        // `--wait 30` reads the next token only when it is all digits: `deploy`
+        // takes no positional, so a bare number after the flag is its value.
+        if (next !== undefined && /^\d+$/.test(next)) {
+          waitRaw = next;
+          i++;
+        } else {
+          waitRaw = null;
+        }
         break;
       case '--auto':
         result.auto = true;
@@ -785,6 +829,22 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
       );
     }
     result.step = parsed;
+  }
+
+  if (waitRaw !== undefined && accepted !== undefined) {
+    if (waitRaw === null) {
+      result.wait = DEFAULT_LOCK_WAIT_SECONDS;
+    } else {
+      const parsed = /^\d+$/.test(waitRaw.trim()) ? Number.parseInt(waitRaw, 10) : Number.NaN;
+      if (!Number.isSafeInteger(parsed) || parsed < 1) {
+        failArg(
+          `${cyan('--wait')} expects a positive whole number of seconds, got ${bold(waitRaw === '' ? '(nothing)' : `"${waitRaw}"`)}.`,
+          `Bare ${'--wait'} waits ${DEFAULT_LOCK_WAIT_SECONDS} seconds. To not wait at all, leave the flag off.`,
+          'Example: npx turbine migrate deploy --wait=120',
+        );
+      }
+      result.wait = parsed;
+    }
   }
 
   return result;
@@ -2763,9 +2823,29 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
 // Command: push
 // ---------------------------------------------------------------------------
 
+/**
+ * Print what a diff did NOT compare, under an "in sync" style message.
+ *
+ * "Already in sync" only means the compared surface matches. The rest is listed
+ * so the sentence is not read as a guarantee about the whole database.
+ */
+function printNotCompared(items: readonly string[] | undefined): void {
+  if (!items || items.length === 0) return;
+  console.log(`  ${dim('Not compared, so this says nothing about:')}`);
+  for (const item of items) console.log(`    ${dim(symbols.dot)} ${dim(item)}`);
+  newline();
+}
+
 async function cmdPush(args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
   refuseSchemaFilePath(config);
+  if (args.exitCode && !args.dryRun) {
+    failArg(
+      `${cyan('--exit-code')} needs ${cyan('--dry-run')} on push.`,
+      'It reports whether the database differs from the schema file (exit 2) without changing it.',
+      'Example: npx turbine push --dry-run --exit-code',
+    );
+  }
   const url = requireUrl(config);
 
   label('Database', redactUrl(url));
@@ -2781,8 +2861,19 @@ async function cmdPush(args: CliArgs, config: ResolvedConfig): Promise<void> {
   const diff = await schemaDiff(schemaDef, url, { schema: config.schema });
 
   if (diff.statements.length === 0 && diff.drop.length === 0) {
-    diffSpinner.succeed('Database is already in sync');
+    // "In sync" is a claim about everything the diff looked at, so it is made
+    // only when the diff also has nothing to say. A difference it cannot apply
+    // (an undeclared index, a reordered enum) is reported as exactly that.
+    const advisories = diff.warnings ?? [];
+    if (advisories.length === 0) {
+      diffSpinner.succeed('Database is already in sync');
+    } else {
+      diffSpinner.succeed('Nothing to apply, but the database is not fully in sync');
+    }
     newline();
+    for (const w of advisories) warn(w);
+    if (advisories.length > 0) newline();
+    printNotCompared(diff.notCompared);
     return;
   }
 
@@ -2846,6 +2937,11 @@ async function cmdPush(args: CliArgs, config: ResolvedConfig): Promise<void> {
   if (args.dryRun) {
     info('Dry run, no changes applied.');
     newline();
+    if (args.exitCode) {
+      warn(`The database differs from the schema file ${dim('(--exit-code: exiting 2)')}.`);
+      newline();
+      process.exit(2);
+    }
     return;
   }
 
@@ -2924,6 +3020,15 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
     console.log(`    ${cyan('--recipe <name>')}    Scaffold a sanctioned migration pattern`);
     console.log(`    ${cyan('--step, -n')}         Number of migrations to apply/rollback`);
     console.log(`    ${cyan('--dry-run')}          Show SQL without executing`);
+    console.log(
+      `    ${cyan('--exit-code')}        Exit 2 when ${cyan('status')} finds pending, modified or missing migrations`,
+    );
+    console.log(
+      `    ${cyan('--wait')}${dim('[=<seconds>]')}   Make ${cyan('deploy')} wait for a concurrent deploy's lock`,
+    );
+    console.log(
+      `    ${cyan('--allow-pending')}    Let ${cyan('--auto')} / ${cyan('--from-diff')} run with migrations pending`,
+    );
     console.log(`    ${cyan('--allow-destructive')} Run data-destroying statements without prompting`);
     console.log(
       `    ${cyan('--allow-drift')}      Re-baseline drifted checksums on ${cyan('up')} / ${cyan('deploy')} / ${cyan('down')} ${dim('(advanced)')}`,
@@ -2944,6 +3049,22 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
     console.log(`    ${dim('npx turbine migrate down --step 2')}`);
     newline();
     return;
+  }
+
+  // Flags that change what a subcommand does are refused where they do nothing,
+  // rather than accepted and ignored: a CI gate that silently never gates is
+  // worse than one that will not start.
+  if (args.exitCode && sub !== 'status' && sub !== 'list') {
+    failArg(
+      `${cyan('--exit-code')} only applies to ${cyan('migrate status')} (and ${cyan('push --dry-run')}).`,
+      'Example: npx turbine migrate status --exit-code',
+    );
+  }
+  if (args.wait !== undefined && sub !== 'deploy') {
+    failArg(
+      `${cyan('--wait')} only applies to ${cyan('migrate deploy')}.`,
+      'Example: npx turbine migrate deploy --wait=120',
+    );
   }
 
   switch (sub) {
@@ -2968,6 +3089,62 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
       errorLine(`${dim('Run')} ${cyan('npx turbine migrate help')} ${dim('for usage.')}`);
       process.exit(1);
   }
+}
+
+/**
+ * Stop `migrate create --auto` / `--from-diff` while migrations are pending.
+ *
+ * Both diff the schema file against the live database, and a pending migration
+ * is a change the file already describes and the database does not have yet. The
+ * new migration would repeat it and fail on the first database that runs the
+ * pending one first. See {@link formatPendingAutoRefusal}.
+ */
+async function refuseWhenMigrationsPending(
+  args: CliArgs,
+  config: ResolvedConfig,
+  url: string,
+  flag: string,
+): Promise<void> {
+  if (listMigrationFiles(config.migrationsDir).length === 0) return;
+  const pending = pendingMigrationFiles(await migrateStatus(url, config.migrationsDir, { schema: config.schema }));
+  if (pending.length === 0) return;
+  if (args.allowPending) {
+    warn(`--allow-pending is set: ${bold(String(pending.length))} pending migration(s) are NOT reflected in the diff.`);
+    newline();
+    return;
+  }
+  const [first, ...rest] = formatPendingAutoRefusal(pending, flag).split('\n');
+  error(first!);
+  for (const line of rest) errorLine(line);
+  errorLine();
+  process.exit(1);
+}
+
+/**
+ * Explain an empty `--auto` / `--from-diff` diff without claiming more than it
+ * knows: "in sync" only when nothing, extra tables and advisories included, was
+ * left over.
+ */
+function reportNothingToMigrate(diff: Awaited<ReturnType<typeof schemaDiff>>, spinner: Spinner): void {
+  const advisories = diff.warnings ?? [];
+  if (diff.drop.length === 0 && advisories.length === 0) {
+    spinner.succeed('Database is already in sync: nothing to migrate');
+    newline();
+    printNotCompared(diff.notCompared);
+    return;
+  }
+  spinner.succeed('Nothing to migrate: no statement to write, but the database is not fully in sync');
+  newline();
+  if (diff.drop.length > 0) {
+    warn(
+      `${bold(String(diff.drop.length))} table(s) exist in the database but not in the schema file ` +
+        `(${diff.drop.join(', ')}). A migration never drops a table on its own: write that one by hand.`,
+    );
+    newline();
+  }
+  for (const w of advisories) warn(w);
+  if (advisories.length > 0) newline();
+  printNotCompared(diff.notCompared);
 }
 
 async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<void> {
@@ -3001,6 +3178,13 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
     process.exit(1);
   }
 
+  if (args.allowPending && !args.auto && !args.fromDiff) {
+    failArg(
+      `${cyan('--allow-pending')} only applies to ${cyan('--auto')} and ${cyan('--from-diff')}.`,
+      'It lets a diff-generated migration proceed while earlier migrations are still pending.',
+    );
+  }
+
   if (args.auto) {
     // Auto-generate migration from schema diff
     const url = requireUrl(config);
@@ -3008,13 +3192,14 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
     label('Schema file', config.schemaFile);
     newline();
 
+    await refuseWhenMigrationsPending(args, config, url, '--auto');
+
     const schemaDef = await loadSchemaFile(config.schemaFile);
     const diffSpinner = new Spinner('Computing schema diff').start();
     const diff = await schemaDiff(schemaDef, url, { schema: config.schema });
 
     if (diff.statements.length === 0) {
-      diffSpinner.succeed('Database is already in sync: nothing to migrate');
-      newline();
+      reportNothingToMigrate(diff, diffSpinner);
       return;
     }
 
@@ -3075,7 +3260,9 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
       }
       newline();
       console.log(
-        `  ${dim('`migrate up` refuses destructive statements by default: confirm interactively or pass')} ${cyan('--allow-destructive')}${dim('.')}`,
+        body.destructiveUp.length > 0
+          ? `  ${dim('`migrate up` refuses destructive statements by default: confirm interactively or pass')} ${cyan('--allow-destructive')}${dim('.')}`
+          : `  ${dim('Only the DOWN section is destructive: `migrate up` runs this file without a prompt, `migrate down` asks first.')}`,
       );
       newline();
     }
@@ -3099,14 +3286,15 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
     label('Schema file', config.schemaFile);
     newline();
 
+    await refuseWhenMigrationsPending(args, config, url, '--from-diff');
+
     const schemaDef = await loadSchemaFile(config.schemaFile);
 
     const diffSpinner = new Spinner('Computing schema diff').start();
     const diff = await schemaDiff(schemaDef, url, { schema: config.schema });
 
     if (diff.statements.length === 0) {
-      diffSpinner.succeed('Database is already in sync: nothing to migrate');
-      newline();
+      reportNothingToMigrate(diff, diffSpinner);
       return;
     }
 
@@ -3162,7 +3350,9 @@ async function cmdMigrateCreate(args: CliArgs, config: ResolvedConfig): Promise<
       }
       newline();
       console.log(
-        `  ${dim('`migrate up` refuses destructive statements by default: confirm interactively or pass')} ${cyan('--allow-destructive')}${dim('.')}`,
+        body.destructiveUp.length > 0
+          ? `  ${dim('`migrate up` refuses destructive statements by default: confirm interactively or pass')} ${cyan('--allow-destructive')}${dim('.')}`
+          : `  ${dim('Only the DOWN section is destructive: `migrate up` runs this file without a prompt, `migrate down` asks first.')}`,
       );
       newline();
     }
@@ -3516,7 +3706,18 @@ async function cmdMigrateDeploy(args: CliArgs, config: ResolvedConfig): Promise<
   if (destructive.length > 0) printDestructiveNotice(destructive);
 
   const runSpinner = new Spinner('Deploying migrations').start();
-  const result = await migrateDeploy(url, config.migrationsDir, { allowDrift: args.allowDrift, schema: config.schema });
+  const result = await migrateDeploy(url, config.migrationsDir, {
+    allowDrift: args.allowDrift,
+    schema: config.schema,
+    lockWaitMs: args.wait !== undefined ? args.wait * 1000 : undefined,
+    onLockWait: () => {
+      runSpinner.stop();
+      warn(`Another migration holds the lock: waiting up to ${bold(String(args.wait))}s for it to finish.`);
+      console.log(`  ${dim('Whatever it applies is then no longer pending, so this run will skip it.')}`);
+      newline();
+      runSpinner.start();
+    },
+  });
 
   if (result.applied.length > 0) {
     runSpinner.succeed(`${bold(String(result.applied.length))} applied`);
@@ -3653,6 +3854,14 @@ async function cmdMigrateDown(args: CliArgs, config: ResolvedConfig): Promise<vo
     for (const file of result.rolledBack) {
       console.log(`    ${yellow(symbols.arrowRight)} ${file.filename}`);
     }
+    const noSql = rollbacksWithoutSql(result.rolledBack);
+    if (noSql.length > 0) {
+      newline();
+      warn(`${bold(String(noSql.length))} rolled-back migration(s) have a DOWN section that runs no SQL:`);
+      for (const file of noSql) console.log(`    ${yellow(symbols.dot)} ${file.filename}`);
+      console.log(`  ${dim('Their tracking rows are removed, but nothing they changed was undone (a dropped column')}`);
+      console.log(`  ${dim('cannot be restored automatically). Restore that data from a backup.')}`);
+    }
   } else if (result.errors.length === 0) {
     spinner.succeed('No migrations to roll back');
   }
@@ -3679,7 +3888,7 @@ async function cmdMigrateDown(args: CliArgs, config: ResolvedConfig): Promise<vo
   newline();
 }
 
-async function cmdMigrateStatus(_args: CliArgs, config: ResolvedConfig): Promise<void> {
+async function cmdMigrateStatus(args: CliArgs, config: ResolvedConfig): Promise<void> {
   banner();
   const url = requireUrl(config);
 
@@ -3688,7 +3897,9 @@ async function cmdMigrateStatus(_args: CliArgs, config: ResolvedConfig): Promise
   newline();
 
   const allFiles = listMigrationFiles(config.migrationsDir);
-  if (allFiles.length === 0) {
+  // A gate still has to ask the database when there are no files: applied
+  // migrations whose files are gone are exactly the drift it exists to catch.
+  if (allFiles.length === 0 && !args.exitCode) {
     warn('No migration files found.');
     console.log(`  ${dim('Create one with:')} ${cyan('npx turbine migrate create <name>')}`);
     newline();
@@ -3696,6 +3907,7 @@ async function cmdMigrateStatus(_args: CliArgs, config: ResolvedConfig): Promise
   }
 
   warnIgnoredMigrationFiles(config.migrationsDir);
+  if (allFiles.length === 0) warn('No migration files found.');
 
   const statuses = await migrateStatus(url, config.migrationsDir, { schema: config.schema });
 
@@ -3760,6 +3972,20 @@ async function cmdMigrateStatus(_args: CliArgs, config: ResolvedConfig): Promise
   if (pendingCount > 0) {
     console.log(`  ${dim('Run')} ${cyan('npx turbine migrate up')} ${dim('to apply pending migrations.')}`);
     newline();
+  }
+
+  if (args.exitCode) {
+    const health = summarizeMigrationStatus(statuses);
+    if (!health.ok) {
+      const parts = [
+        health.pending > 0 ? `${health.pending} pending` : '',
+        health.drifted > 0 ? `${health.drifted} modified after being applied` : '',
+        health.missing > 0 ? `${health.missing} missing from disk` : '',
+      ].filter(Boolean);
+      warn(`Migration history is not clean: ${parts.join(', ')} ${dim('(--exit-code: exiting 2)')}.`);
+      newline();
+      process.exit(2);
+    }
   }
 }
 
@@ -5550,6 +5776,9 @@ function showPushHelp(): void {
   );
   console.log(`    ${cyan('--dry-run')}          Show SQL without executing`);
   console.log(
+    `    ${cyan('--exit-code')}        With ${cyan('--dry-run')}: exit 2 when the database differs from the schema file, 0 when in sync ${dim('(CI)')}`,
+  );
+  console.log(
     `    ${cyan('--allow-destructive')} Skip the interactive confirmation for data-destroying statements ${dim('(CI)')}`,
   );
   console.log(`    ${cyan('--verbose, -v')}      Show detailed output`);
@@ -5585,6 +5814,15 @@ function showMigrateHelp(): void {
   console.log(`    ${cyan('--step, -n')} ${dim('<N>')}    Number of migrations to apply/rollback`);
   console.log(`    ${cyan('--dry-run')}         Show SQL without executing`);
   console.log(
+    `    ${cyan('--exit-code')}       Exit 2 when migrations are pending, modified or missing ${dim('(status only, CI)')}`,
+  );
+  console.log(
+    `    ${cyan('--wait')}${dim('[=<seconds>]')}  Wait for a concurrent deploy to release the lock, default ${DEFAULT_LOCK_WAIT_SECONDS}s ${dim('(deploy only)')}`,
+  );
+  console.log(
+    `    ${cyan('--allow-pending')}   Let ${cyan('--auto')} / ${cyan('--from-diff')} run while earlier migrations are still pending ${dim('(create only)')}`,
+  );
+  console.log(
     `    ${cyan('--allow-drift')}     Re-baseline drifted checksums, REWRITING history ${dim('(up / deploy / down)')}`,
   );
   console.log(
@@ -5602,8 +5840,10 @@ function showMigrateHelp(): void {
   console.log(`    ${dim('$')} npx turbine migrate create backfill_full_name --recipe backfill`);
   console.log(`    ${dim('$')} npx turbine migrate up`);
   console.log(`    ${dim('$')} npx turbine migrate deploy --dry-run`);
+  console.log(`    ${dim('$')} npx turbine migrate deploy --wait=120`);
   console.log(`    ${dim('$')} npx turbine migrate down --step 2`);
   console.log(`    ${dim('$')} npx turbine migrate status`);
+  console.log(`    ${dim('$')} npx turbine migrate status --exit-code`);
   newline();
 }
 
@@ -5882,6 +6122,13 @@ function showHelp(): void {
     `    ${cyan('--recipe')} ${dim('<name>')}       Scaffold a named migration recipe, e.g. backfill ${dim('(create)')}`,
   );
   console.log(`    ${cyan('--step, -n')} ${dim('<N>')}       Number of migrations to apply/rollback`);
+  console.log(`    ${cyan('--exit-code')}          Exit 2 on drift ${dim('(push --dry-run, migrate status)')}`);
+  console.log(
+    `    ${cyan('--wait')}${dim('[=<seconds>]')}     Wait for a concurrent deploy's lock instead of failing ${dim('(deploy)')}`,
+  );
+  console.log(
+    `    ${cyan('--allow-pending')}      Diff even while migrations are pending ${dim('(create --auto / --from-diff)')}`,
+  );
   console.log(
     `    ${cyan('--allow-destructive')}  Run data-destroying statements without prompting ${dim('(up/down/push)')}`,
   );

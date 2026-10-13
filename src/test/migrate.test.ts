@@ -617,13 +617,13 @@ describe('formatTimestamp', () => {
   it('formats a date as YYYYMMDDHHMMSS', () => {
     const date = new Date('2026-03-27T14:05:09.000Z');
     const result = formatTimestamp(date);
-    // Note: result depends on timezone, so we just check format
-    assert.match(result, /^\d{14}$/);
+    // UTC digits, whatever the process time zone is.
+    assert.equal(result, '20260327140509');
   });
 
   it('pads single-digit months and days', () => {
-    // Use a specific UTC date and check via the Date constructor
-    const date = new Date(2026, 0, 5, 3, 7, 2); // Jan 5, 03:07:02 local time
+    // Stamps are UTC, so the instant is built in UTC and the digits are the same in every time zone.
+    const date = new Date(Date.UTC(2026, 0, 5, 3, 7, 2)); // Jan 5, 03:07:02 UTC
     const result = formatTimestamp(date);
     assert.match(result, /^\d{14}$/);
     // Year should be 2026
