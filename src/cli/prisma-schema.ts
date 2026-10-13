@@ -573,7 +573,7 @@ function parseFieldLine(text: string, line: number, warnings: string[]): PrismaF
   }
 
   for (const attr of attrs) {
-    const note = NOTED_FIELD_ATTRS[attr.name];
+    const note = Object.hasOwn(NOTED_FIELD_ATTRS, attr.name) ? NOTED_FIELD_ATTRS[attr.name] : undefined;
     if (note) warnings.push(`Line ${line}: field "${name}": ${note}`);
   }
 
@@ -612,7 +612,7 @@ function parseModelBody(
           // @@index and anything else: recorded in blockAttrs, unused. The
           // few that change what the model MEANS get a warning rather than
           // silence (see NOTED_BLOCK_ATTRS).
-          const note = NOTED_BLOCK_ATTRS[attr.name];
+          const note = Object.hasOwn(NOTED_BLOCK_ATTRS, attr.name) ? NOTED_BLOCK_ATTRS[attr.name] : undefined;
           if (note) warnings.push(`Line ${line}: model "${block.name}": ${note}`);
         }
       }
