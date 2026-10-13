@@ -77,6 +77,7 @@ import {
 } from './powdb-shared.js';
 import { assertAggregatePiiOptIn } from './query/aggregates.js';
 import { markStitchOnly, resolveCountRelations, stitchOnlyFields } from './query/batched-loader.js';
+import { isColumnRef } from './query/column-ref.js';
 import {
   assertMutationWhereIdentifiesOneRow,
   assertWhereIdentifiesOneRow,
@@ -84,6 +85,7 @@ import {
   uniqueKeyNames,
   upsertWhereMatchesCreate,
 } from './query/compound-unique.js';
+import { exprNotAllowedMessage, isSqlExpr } from './query/expr.js';
 import {
   ARRAY_OPERATOR_KEYS,
   assertEqualityOperand,
@@ -617,6 +619,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * and coercion stays unambiguous. Non-finite floats are still rejected.
    */
   private writeRef(value: unknown, col: ColumnMetadata, params: unknown[]): string {
+    // A value position (create data, `{ set }`): the SQL engines' rule and message.
+    if (isSqlExpr(value) || isColumnRef(value)) {
+      throw new ValidationError(exprNotAllowedMessage(this.table, col.field, value));
+    }
     if (typeof value === 'number' && !Number.isFinite(value) && this.isFloatCol(col)) {
       throw new ValidationError(`Non-finite value for float column "${col.name}" on "${this.table}".`);
     }
@@ -4191,6 +4197,16 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   async createMany(args: CreateManyArgs<T>): Promise<T[]> {
     args = this.normalizeArgs(args);
     return this.withMiddleware('createMany', args as unknown as Record<string, unknown>, async () => {
+      if (args.onConflict !== undefined) {
+        throw new UnsupportedFeatureError(
+          'createMany({ onConflict })',
+          'powdb',
+          "PowQL's upsert statement takes one row. Call upsert() per row inside $transaction.",
+        );
+      }
+      // Validated as every engine validates it; it acts only on onConflict's
+      // update, which is refused above.
+      resolveSkipGlobalFilters(args.skipGlobalFilters);
       if (args.skipDuplicates) {
         // PowQL's `insert … returning` has no conflict clause, so there is no
         // faithful skip-duplicates form; refuse rather than silently insert.
@@ -4200,6 +4216,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           'PowQL insert has no ON CONFLICT DO NOTHING equivalent, filter duplicates before inserting.',
         );
       }
+      // Resolved before the write, so a bad projection writes nothing.
+      const plan = this.writeReturnPlan(args);
       const supplied = (args.data as Record<string, unknown>[]).map((d) => this.applyPkDefault(d));
       if (!supplied.length) return [];
       // Uniformity is judged on what the caller supplied, as the SQL engines
@@ -4218,7 +4236,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         args.timeout,
         'createMany',
       );
-      return this.shape(rows, native).map((r) => this.stripWritePii(r) as T);
+      return this.shape(rows, native).map((r) => this.shapeWriteRow(r, plan) as T);
     });
   }
 
@@ -4317,6 +4335,15 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           `relation "${field}", nested writes need create()/update()/upsert(), not updateMany()`,
         );
       }
+      // PowQL update assignments take values and the atomic operators only.
+      if (isSqlExpr(value) || isColumnRef(value)) {
+        throw new UnsupportedFeatureError(
+          `update expressions (expr / col() in update data, "${this.table}.${field}")`,
+          'powdb',
+          'Compute the value in JavaScript and write it as a plain value, or use the atomic operators ' +
+            '(increment, decrement, multiply, divide).',
+        );
+      }
       const colMeta = this.column(field);
       const ref = this.ref(field);
       const col = quotePowqlIdent(colMeta.name);
@@ -4325,7 +4352,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         parts.push(`${col} := ${this.writeRef((value as Record<string, unknown>).set, colMeta, params)}`);
       } else if (op !== null) {
         this.assertDecimalComparable(colMeta, `\`${op}\``);
-        // Same rule and message as the SQL engines' buildSetClause.
+        // Same rule and message as the SQL engines' buildSetClauses.
         const operand = (value as Record<string, unknown>)[op];
         if (typeof operand !== 'number' || !Number.isFinite(operand)) {
           throw new ValidationError(

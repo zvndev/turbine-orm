@@ -277,11 +277,14 @@ const OBSERVATION: Record<string, Observation> = {
   skipDuplicates: { how: 'compiled', value: true },
   optimisticLock: { how: 'compiled', value: { field: 'version', expected: 1 } },
   // createMany honors global filters only on the conflict-UPDATE, so the
-  // option is observable once there is one.
+  // option is observable once there is one. Every row must carry the target.
   'createMany.skipGlobalFilters': {
     how: 'compiled',
     value: UNSAFE,
-    needs: { onConflict: { target: ['email'], update: ['name'] } },
+    needs: {
+      data: [{ name: 'a', email: 'a@example.test' }],
+      onConflict: { target: ['email'], update: ['name'] },
+    },
   },
 
   // --- row locks -------------------------------------------------------------

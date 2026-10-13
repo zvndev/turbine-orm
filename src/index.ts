@@ -137,6 +137,8 @@ export {
 export { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
 // Prisma-schema fingerprint (provenance on a generated PRISMA_MAP)
 export { fingerprintPrismaSchema } from './prisma-schema-fingerprint.js';
+// Update expressions: `expr.add(col('n'), 1)`, `expr.excluded('name')`, ...
+export { type CaseArm, type ExprOperand, expr, type NumericOperand } from './query/expr.js';
 // Query builder
 // The privilege sentinel. `skipGlobalFilters` / `includePii` /
 // `allowFullTableScan` are unlocked by THIS VALUE and nothing else, so a
@@ -228,7 +230,11 @@ export {
 } from './query/index.js';
 export type {
   AggregateResultOf,
+  ConflictTarget,
+  ConflictUpdateData,
+  CreateManyOnConflict,
   DefaultInputTypes,
+  ExcludedRef,
   GlobalFilter,
   NestedToOneCreateOp,
   NestedToOneUpdateOp,
@@ -238,6 +244,8 @@ export type {
   RelationKind,
   RowLock,
   RowLockMode,
+  SqlExpr,
+  SqlExprKind,
   TableInputTypes,
 } from './query/types.js';
 // $on('query') event metadata: raw-statement model name, $tag() label limit

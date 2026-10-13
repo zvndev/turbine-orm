@@ -241,7 +241,10 @@ describe('generator: *Relations interface output', () => {
   const out = generateTypes(SCHEMA);
 
   it('imports RelationDescriptor from turbine-orm', () => {
-    assert.match(out, /import type \{ RelationDescriptor, UpdateOperatorInput \} from 'turbine-orm';/);
+    assert.match(
+      out,
+      /import type \{ ColumnRef, RelationDescriptor, SqlExpr, UpdateOperatorInput \} from 'turbine-orm';/,
+    );
   });
 
   it('emits hasMany relations as RelationDescriptor<Target, "many", TargetRelations>', () => {

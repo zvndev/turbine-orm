@@ -11,18 +11,31 @@
  * delegating methods and the async execute wrappers.
  */
 
-import { maxBindParameters, type ReturningSelection } from '../dialect.js';
+import { type BulkUpsertRefs, maxBindParameters, type ReturningSelection } from '../dialect.js';
 import { NotFoundError, OptimisticLockError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import type { TableMetadata } from '../schema.js';
 import { camelToSnake, snakeToCamel } from '../schema.js';
+import { isColumnRef } from './column-ref.js';
 import {
   assertMutationWhereIdentifiesOneRow,
   expandCompoundUniqueWhere,
+  uniqueKeyNames,
   upsertWhereMatchesCreate,
 } from './compound-unique.js';
 import type { DeferredQuery, ReselectExecutor } from './deferred.js';
-import { isUnmatchedPlainObject, UPDATE_OPERATOR_KEYS } from './filters.js';
+import {
+  compileSetExpr,
+  type ExprCompileEnv,
+  expr as exprBuilders,
+  exprNotAllowedMessage,
+  isPlainExprShape,
+  isSqlExpr,
+  plainExprShapeMessage,
+  resolveExcludedFromCreate,
+} from './expr.js';
+import { isPlainRecord, isUnmatchedPlainObject, UPDATE_OPERATOR_KEYS } from './filters.js';
 import { isJsonValue, serializeJsonValue } from './json-value.js';
+import { pruneUndefinedArgs } from './normalize-args.js';
 import type {
   CreateArgs,
   CreateManyArgs,
@@ -71,11 +84,19 @@ import * as whereMod from './where.js';
  * On PostgreSQL a plain object or an array bound to a known scalar column
  * (text, int, uuid, ...) is refused with E003; see {@link assertScalarBindable}.
  *
+ * Expressions (`expr.*`, `col()`) never bind as a value: the update paths
+ * compile them before reaching here, so one that arrives is in a position that
+ * takes values only (create data, `{ set }`) and is refused. An unbranded
+ * object shaped like one is refused on a non-JSON column on every engine.
+ *
  * Every other value is returned by identity, so a primitive costs one check
  * and no lookup.
  */
 export function coerceWriteValue(qi: BuilderCtx, key: string, value: unknown): unknown {
   if (value === null || typeof value !== 'object') return value;
+  if (isSqlExpr(value) || isColumnRef(value)) {
+    throw new ValidationError(exprNotAllowedMessage(qi.table, key, value));
+  }
   // THE key-resolution rule, shared with `toColumn` (the SQL side of this very
   // statement) so the two can never disagree about which column a key names.
   // Non-throwing, because this also runs on the cache-HIT param-collect path,
@@ -86,6 +107,9 @@ export function coerceWriteValue(qi: BuilderCtx, key: string, value: unknown): u
   if (isJsonValue(value)) return jsonText(qi, key, value.value);
   if (dbType !== undefined && whereMod.isJsonColumnType(qi, dbType)) {
     return Array.isArray(value) ? jsonText(qi, key, value) : value;
+  }
+  if (isPlainExprShape(value)) {
+    throw new ValidationError(plainExprShapeMessage(qi.table, key, String((value as { kind: unknown }).kind)));
   }
   assertScalarBindable(qi, key, dbType, value);
   if (!(value instanceof Date) && !Array.isArray(value)) return value;
@@ -508,8 +532,14 @@ export function buildCreateMany<T extends object>(
   qi: BuilderCtx,
   args: CreateManyArgs<T>,
   overBindLimit: 'refuse' | 'allow' = 'refuse',
+  projection?: WriteProjection,
 ): DeferredQuery<T[]> {
   const qt = qi.q(qi.table);
+  // Validated on every call (UNSAFE only); it acts on onConflict's update.
+  qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
+  // The data-independent half of onConflict is checked before the empty-data
+  // shortcut, so a call is never valid with no rows and invalid with some.
+  const conflict = args.onConflict === undefined ? null : resolveConflictPlan(qi, args);
   if (args.data.length === 0) {
     return {
       sql: `SELECT * FROM ${qt} WHERE false`,
@@ -526,20 +556,20 @@ export function buildCreateMany<T extends object>(
 
   const keys = definedKeys(qi, args.data[0] as Record<string, unknown>);
   assertUniformCreateManyRows(qi, args.data as Record<string, unknown>[], keys);
+  const columns = keys.map((k) => qi.toColumn(k));
+  if (conflict) assertConflictTargetSupplied(qi, conflict, columns);
 
   // No column named by the first row: every row is pure defaults (the bulk
   // counterpart of `create({ data: {} })`, see buildDefaultValuesInsert). The
   // uniformity check above has already established that EVERY row is empty.
   if (keys.length === 0) {
     return {
-      sql: buildDefaultValuesInsert(qi, args.data.length, args.skipDuplicates),
+      sql: buildDefaultValuesInsert(qi, args.data.length, args.skipDuplicates, projection),
       params: [],
-      transform: (result) => result.rows.map((row) => parseWriteRow(qi, row) as T),
+      transform: (result) => result.rows.map((row) => parseWriteRow(qi, row, projection) as T),
       tag: `${qi.table}.createMany`,
     };
   }
-
-  const columns = keys.map((k) => qi.toColumn(k));
 
   const rowValues = args.data.map((row) => {
     const record = row as Record<string, unknown>;
@@ -575,22 +605,389 @@ export function buildCreateMany<T extends object>(
   // serializes as one array element.
   const hasArrayColumn = columns.some((col) => (qi.columnPgTypeMap.get(col) ?? '').startsWith('_'));
 
-  const built = qi.dialect.buildBulkInsertStatement({
+  const insert = {
     table: qt,
     columns: quotedColumns,
     rowValues,
     columnArrayTypes: typeCasts,
     skipDuplicates: args.skipDuplicates,
-    returning: writeReturningColumns(qi),
+    returning: writeReturningColumns(qi, projection),
     requireRowValues: hasArrayColumn,
-  });
+  };
+  if (conflict) {
+    return buildBulkUpsert(qi, conflict, insert, columns, overBindLimit, projection) as DeferredQuery<T[]>;
+  }
+  const built = qi.dialect.buildBulkInsertStatement(insert);
   if (overBindLimit === 'refuse') assertWithinBindLimit(qi, built.params.length, args.data.length, keys.length);
 
   return {
     sql: built.sql,
     params: built.params,
-    transform: (result) => result.rows.map((row) => parseWriteRow(qi, row) as T),
+    transform: (result) => result.rows.map((row) => parseWriteRow(qi, row, projection) as T),
     tag: `${qi.table}.createMany`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// createMany({ onConflict }): the multi-row upsert
+// ---------------------------------------------------------------------------
+
+/** A `createMany` `onConflict`, validated against the table. */
+interface ConflictPlan {
+  /** The target's columns (unquoted): the primary key or one non-partial unique key. */
+  readonly target: readonly string[];
+  /** The conflict-UPDATE's data, or `null` to skip conflicting rows. */
+  readonly update: Record<string, unknown> | null;
+  /** A predicate on the EXISTING row limiting the update, or `null`. */
+  readonly where: Record<string, unknown> | null;
+}
+
+const ON_CONFLICT_KEYS: ReadonlySet<string> = new Set(['target', 'update', 'where', 'ignore']);
+
+/**
+ * Validate the data-independent half of `onConflict`: the engine supports it,
+ * its shape, its target names exactly one unique key, and its update and
+ * where are usable. Every refusal is E003 except an engine gap (E017).
+ */
+function resolveConflictPlan<T extends object>(qi: BuilderCtx, args: CreateManyArgs<T>): ConflictPlan {
+  const table = qi.table;
+  if (!qi.dialect.supportsBulkUpsert || typeof qi.dialect.buildBulkUpsertStatement !== 'function') {
+    throw new UnsupportedFeatureError(
+      'createMany onConflict',
+      qi.dialect.name,
+      'This engine has no multi-row upsert statement. Call upsert() per row inside $transaction.',
+    );
+  }
+  if (args.skipDuplicates) {
+    throw new ValidationError(
+      `createMany on "${table}": onConflict and skipDuplicates cannot be combined. skipDuplicates skips a ` +
+        'conflict on ANY unique key, onConflict names one; to skip conflicts on that key, use ' +
+        'onConflict: { target, ignore: true }.',
+    );
+  }
+  const oc = args.onConflict as unknown;
+  if (!isPlainRecord(oc)) {
+    throw new ValidationError(
+      `createMany on "${table}": onConflict must be { target, update } or { target, ignore: true }.`,
+    );
+  }
+  const unknownKey = Object.keys(oc).find((k) => !ON_CONFLICT_KEYS.has(k) && oc[k] !== undefined);
+  if (unknownKey !== undefined) {
+    throw new ValidationError(
+      `createMany on "${table}": onConflict has no option "${unknownKey}". It takes target, update, where and ignore.`,
+    );
+  }
+  const target = resolveConflictTarget(qi, oc.target);
+  if (oc.ignore !== undefined && oc.ignore !== true) {
+    throw new ValidationError(`createMany on "${table}": onConflict.ignore takes \`true\` only.`);
+  }
+  if (oc.ignore === true) {
+    if (oc.update !== undefined || oc.where !== undefined) {
+      throw new ValidationError(
+        `createMany on "${table}": onConflict takes either ignore: true or update (with an optional where), not both.`,
+      );
+    }
+    return { target, update: null, where: null };
+  }
+  return { target, update: resolveConflictUpdate(qi, oc.update), where: resolveConflictWhere(qi, oc.where) };
+}
+
+function resolveConflictTarget(qi: BuilderCtx, raw: unknown): string[] {
+  const table = qi.table;
+  if (!Array.isArray(raw) || raw.length === 0 || raw.some((f) => typeof f !== 'string')) {
+    throw new ValidationError(
+      `createMany on "${table}": onConflict.target must be a non-empty array of field names (the primary key or ` +
+        `one unique key), e.g. target: ['email']. Valid targets: ${describeConflictTargets(qi)}.`,
+    );
+  }
+  const columns: string[] = [];
+  for (const field of raw as string[]) {
+    const column = resolveColumnName(qi.tableMeta, field);
+    if (column === undefined) {
+      throw new ValidationError(
+        `createMany on "${table}": onConflict.target names "${field}", which is not a column. ` +
+          `Valid targets: ${describeConflictTargets(qi)}.`,
+      );
+    }
+    if (columns.includes(column)) {
+      throw new ValidationError(`createMany on "${table}": onConflict.target names "${field}" twice.`);
+    }
+    columns.push(column);
+  }
+  const wanted = new Set(columns);
+  const sameSet = (set: readonly string[]) => set.length === wanted.size && set.every((c) => wanted.has(c));
+  if (uniqueKeyNames(qi.tableMeta).some(sameSet)) return columns;
+  const partial = qi.tableMeta.indexes.some((idx) => idx.unique && idx.partial && sameSet(idx.columns));
+  throw new ValidationError(
+    `createMany on "${table}": onConflict.target (${columns.map((c) => fieldOf(qi, c)).join(', ')}) ` +
+      (partial
+        ? 'is a PARTIAL unique index, which a conflict clause can only use by restating its predicate. '
+        : 'is not the primary key or a unique key of the table, as the schema metadata knows it. ') +
+      `Valid targets: ${describeConflictTargets(qi)}.`,
+  );
+}
+
+function fieldOf(qi: BuilderCtx, column: string): string {
+  return qi.tableMeta.reverseColumnMap[column] ?? column;
+}
+
+function describeConflictTargets(qi: BuilderCtx): string {
+  const keys = uniqueKeyNames(qi.tableMeta);
+  if (keys.length === 0) return '(none: the table has no primary key or unique key in its metadata)';
+  return keys.map((cols) => `[${cols.map((c) => `'${fieldOf(qi, c)}'`).join(', ')}]`).join(', ');
+}
+
+/** The conflict-UPDATE's data: the field-list shorthand becomes `{ f: expr.excluded(f) }`. */
+function resolveConflictUpdate(qi: BuilderCtx, raw: unknown): Record<string, unknown> {
+  const empty = new ValidationError(
+    `createMany on "${qi.table}": onConflict.update is empty; use onConflict: { target, ignore: true } to skip ` +
+      'conflicting rows.',
+  );
+  if (Array.isArray(raw)) {
+    if (raw.length === 0) throw empty;
+    const update: Record<string, unknown> = {};
+    for (const field of raw) {
+      if (typeof field !== 'string') {
+        throw new ValidationError(
+          `createMany on "${qi.table}": onConflict.update as a list takes field names, got ${typeof field}.`,
+        );
+      }
+      if (Object.hasOwn(update, field)) {
+        throw new ValidationError(`createMany on "${qi.table}": onConflict.update names "${field}" twice.`);
+      }
+      update[field] = exprBuilders.excluded(field);
+    }
+    return update;
+  }
+  if (!isPlainRecord(raw)) {
+    throw new ValidationError(
+      `createMany on "${qi.table}": onConflict.update takes a list of field names or a { field: value } object.`,
+    );
+  }
+  if (!Object.values(raw).some((v) => v !== undefined)) throw empty;
+  assertNoGeneratedColumns(qi, raw, 'createMany');
+  return raw;
+}
+
+/**
+ * `onConflict.where`, with `undefined` keys pruned as in every `where`. One
+ * whose every key was `undefined` is refused: dropping it would update the
+ * rows it was written to protect.
+ */
+function resolveConflictWhere(qi: BuilderCtx, raw: unknown): Record<string, unknown> | null {
+  if (raw === undefined) return null;
+  if (!isPlainRecord(raw)) {
+    throw new ValidationError(`createMany on "${qi.table}": onConflict.where must be a where object.`);
+  }
+  const pruned = pruneUndefinedArgs(qi.schema, qi.table, { where: raw }).where as Record<string, unknown>;
+  if (Object.keys(pruned).length === 0) {
+    if (Object.keys(raw).length > 0) {
+      throw new ValidationError(
+        `createMany on "${qi.table}": every key in onConflict.where was undefined, so it would restrict nothing. ` +
+          'Check the values you meant to filter on, or leave where out to update every conflicting row.',
+      );
+    }
+    return null;
+  }
+  return pruned;
+}
+
+/** Every row must supply every target column: a row without its key cannot conflict on it. */
+function assertConflictTargetSupplied(qi: BuilderCtx, conflict: ConflictPlan, columns: string[]): void {
+  const missing = conflict.target.filter((c) => !columns.includes(c));
+  if (missing.length === 0) return;
+  throw new ValidationError(
+    `createMany onConflict on "${qi.table}": the target field ${missing.map((c) => `"${fieldOf(qi, c)}"`).join(', ')} ` +
+      'is missing from the rows. Every row must supply every target field; a key the database generates ' +
+      '(an identity or serial id it has not assigned yet) cannot be a conflict target.',
+  );
+}
+
+/** A byte-equality token for one coerced key value. */
+function keyToken(value: unknown): string {
+  let s: string;
+  if (value instanceof Date) s = value.toISOString();
+  else if (value instanceof Uint8Array) s = Array.from(value, (b) => b.toString(16).padStart(2, '0')).join('');
+  else s = String(value);
+  return `${s.length}:${s}`;
+}
+
+/**
+ * Refuse two rows of one call that share a conflict key, before any SQL. The
+ * engines disagree on it (PostgreSQL raises 21000, SQL Server's MERGE 8672,
+ * SQLite and MySQL apply the rows in sequence), and chunking at the bind
+ * limit would turn the error into "the second chunk updates the first chunk's
+ * row". Byte-equal on the coerced values, so a case-insensitive collation can
+ * still let two rows through. A row with NULL in the key never conflicts.
+ */
+function assertNoDuplicateKeys(
+  qi: BuilderCtx,
+  conflict: ConflictPlan,
+  columns: string[],
+  rowValues: unknown[][],
+): void {
+  const at = conflict.target.map((c) => columns.indexOf(c));
+  const seen = new Map<string, number>();
+  for (let i = 0; i < rowValues.length; i++) {
+    const row = rowValues[i]!;
+    const parts = at.map((j) => row[j]);
+    if (parts.some((v) => v === null || v === undefined)) continue;
+    const key = parts.map(keyToken).join('|');
+    const first = seen.get(key);
+    if (first !== undefined) {
+      throw new ValidationError(
+        `createMany onConflict on "${qi.table}": rows ${first} and ${i} share the conflict key ` +
+          `(${conflict.target.map((c) => fieldOf(qi, c)).join(', ')}). One statement cannot insert or update one ` +
+          'key twice; merge those rows first.',
+      );
+    }
+    seen.set(key, i);
+  }
+}
+
+/**
+ * MySQL's ON DUPLICATE KEY UPDATE has no conflict target: it fires on
+ * WHATEVER unique key a row violates, and with several matching keys it
+ * updates one row. So the target must be the only key a row can violate, and
+ * the shapes that need a predicate slot or a per-row outcome are refused.
+ */
+function assertMysqlBulkUpsert(
+  qi: BuilderCtx,
+  conflict: ConflictPlan,
+  columns: string[],
+  rowValues: unknown[][],
+): void {
+  const fix = (why: string, hint: string) =>
+    new UnsupportedFeatureError(`createMany onConflict on "${qi.table}" ${why}`, 'mysql', hint);
+  if (conflict.update === null) {
+    throw fix(
+      'with ignore: true',
+      'MySQL cannot tell the inserted rows from the skipped ones afterwards. Use onConflict: { target, update }.',
+    );
+  }
+  if (conflict.where !== null) {
+    throw fix('with a where', 'ON DUPLICATE KEY UPDATE has no predicate slot.');
+  }
+  const gf = whereMod.resolveGlobalFilter(qi, qi.table);
+  if (gf && whereMod.buildRenderedRefWhere(qi, qi.table, qi.tableMeta, qi.q(qi.table), gf, [])) {
+    throw fix(
+      'on a table with a global filter',
+      "ON DUPLICATE KEY UPDATE cannot carry the filter, so another tenant's row could be updated. Call upsert() " +
+        'per row, or pass skipGlobalFilters: UNSAFE.',
+    );
+  }
+  const target = new Set(conflict.target);
+  const present = new Set(columns);
+  for (const key of uniqueKeyNames(qi.tableMeta)) {
+    if (key.length === target.size && key.every((c) => target.has(c))) continue;
+    if (key.every((c) => present.has(c))) {
+      throw fix(
+        `with target (${conflict.target.map((c) => fieldOf(qi, c)).join(', ')})`,
+        `"${qi.table}" has another unique key (${key.map((c) => fieldOf(qi, c)).join(', ')}) whose columns are in ` +
+          "data, and MySQL's ON DUPLICATE KEY UPDATE cannot be limited to one key. Leave the other key's columns " +
+          'out of data, or use another engine.',
+      );
+    }
+  }
+  const at = conflict.target.map((c) => columns.indexOf(c));
+  if (rowValues.some((row) => at.some((j) => row[j] === null || row[j] === undefined))) {
+    throw fix(
+      'with a NULL in a target field',
+      'MySQL returns the written rows by re-reading them by key, and a NULL key reads back nothing. Supply every ' +
+        'target value.',
+    );
+  }
+}
+
+/** The SELECT that re-reads a MySQL multi-row upsert's rows by their conflict keys. */
+function buildKeyReselect(
+  qi: BuilderCtx,
+  conflict: ConflictPlan,
+  columns: string[],
+  rowValues: unknown[][],
+  projection: WriteProjection | undefined,
+): { sql: string; params: unknown[] } {
+  const at = conflict.target.map((c) => columns.indexOf(c));
+  const params: unknown[] = [];
+  const tuples = rowValues.map((row) => {
+    const refs = at.map((j) => {
+      params.push(row[j]);
+      return qi.p(params.length);
+    });
+    return refs.length === 1 ? refs[0] : `(${refs.join(', ')})`;
+  });
+  const keyCols = conflict.target.map((c) => qi.q(c));
+  const lhs = keyCols.length === 1 ? keyCols[0] : `(${keyCols.join(', ')})`;
+  return {
+    sql: `SELECT ${writeReselectSelection(qi, projection)} FROM ${qi.q(qi.table)} WHERE ${lhs} IN (${tuples.join(', ')})`,
+    params,
+  };
+}
+
+function buildBulkUpsert(
+  qi: BuilderCtx,
+  conflict: ConflictPlan,
+  insert: Omit<Parameters<NonNullable<typeof qi.dialect.buildBulkUpsertStatement>>[0], 'conflictColumns' | 'update'>,
+  columns: string[],
+  overBindLimit: 'refuse' | 'allow',
+  projection: WriteProjection | undefined,
+): DeferredQuery<Record<string, unknown>[]> {
+  const rowValues = insert.rowValues;
+  assertNoDuplicateKeys(qi, conflict, columns, rowValues);
+  if (qi.dialect.name === 'mysql') assertMysqlBulkUpsert(qi, conflict, columns, rowValues);
+  // `updatedAt` columns are stamped on the conflict-UPDATE as update() stamps
+  // them, unless the update names the column.
+  const updateData = conflict.update ? applyUpdatedAtColumns(qi, conflict.update) : null;
+  const insertColumns: ReadonlySet<string> = new Set(columns);
+  const gf = whereMod.resolveGlobalFilter(qi, qi.table);
+  const built = qi.dialect.buildBulkUpsertStatement!({
+    ...insert,
+    skipDuplicates: false,
+    conflictColumns: conflict.target.map((c) => qi.q(c)),
+    update: updateData
+      ? (params, refs: BulkUpsertRefs) => {
+          const setClauses = buildSetClauses(qi, writeEntries(qi, updateData), params, {
+            operation: 'createMany',
+            target: refs.target,
+            incoming: refs.incoming,
+            insertColumns,
+          });
+          // The caller's predicate and the global filter both read the EXISTING
+          // row, so a row they exclude is neither updated nor returned (and,
+          // its key being taken, not inserted either). Inserts are not filtered,
+          // as create() is not.
+          const predicates: string[] = [];
+          for (const where of [conflict.where, gf]) {
+            if (!where) continue;
+            const sql = whereMod.buildRenderedRefWhere(qi, qi.table, qi.tableMeta, refs.target, where, params);
+            if (sql) predicates.push(sql);
+          }
+          return {
+            setClauses,
+            where: predicates.length <= 1 ? (predicates[0] ?? null) : predicates.map((p) => `(${p})`).join(' AND '),
+          };
+        }
+      : null,
+  });
+  if (overBindLimit === 'refuse') {
+    assertWithinBindLimit(qi, built.params.length, rowValues.length, columns.length);
+  }
+  return {
+    sql: built.sql,
+    params: built.params,
+    // The rows written: inserted or updated. A row `ignore` skipped, or one the
+    // predicate or a global filter excluded, is not in the result, and the
+    // order is the engine's, not the input's.
+    transform: (result) => result.rows.map((row) => parseWriteRow(qi, row, projection)),
+    tag: `${qi.table}.createMany`,
+    reselect:
+      qi.dialect.resultStrategy === 'reselect'
+        ? async (exec) => {
+            await exec(built.sql, built.params);
+            const sel = buildKeyReselect(qi, conflict, columns, rowValues, projection);
+            return exec(sel.sql, sel.params);
+          }
+        : undefined,
   };
 }
 
@@ -663,8 +1060,7 @@ export function buildUpdate<T extends object>(
   const params: unknown[] = [];
 
   const buildSql = (freshParams: unknown[]): string => {
-    const setEntries = writeEntries(qi, dataObj);
-    const setClauses = setEntries.map(([k, v]) => buildSetClause(qi, k, v, freshParams));
+    const setClauses = buildSetClauses(qi, writeEntries(qi, dataObj), freshParams);
 
     if (lock) {
       const versionCol = qi.toSqlColumn(lock.field);
@@ -982,11 +1378,11 @@ export function buildUpsert<T extends object>(
   const conflictColumns = conflictKeys.map((k) => qi.toSqlColumn(k));
 
   // The conflict-UPDATE SET goes through the SAME operator-aware compiler as
-  // `update()` (buildSetClause), so `set` / `increment` / `decrement` /
+  // `update()` (buildSetClauses), so `set` / `increment` / `decrement` /
   // `multiply` / `divide` mean here what they mean there and a misspelled
   // operator gets the same E003. This branch used to bind each value directly,
   // which stored an operator OBJECT as the JSON text `{"set":"x"}` in a text
-  // column with no error at all. buildSetClause pushes onto `params` as it
+  // column with no error at all. buildSetClauses pushes onto `params` as it
   // goes, so the numbering continues after the create params exactly as the
   // hand-rolled `paramIdx` did. No SQL cache here (the statement is rebuilt per
   // call), so the fingerprint / collect mirrors update() keeps are not needed.
@@ -994,10 +1390,21 @@ export function buildUpsert<T extends object>(
   // lookup path's `update()` stamps them, so the column does not depend on
   // which path an upsert takes. (An empty `update` never reaches here: it is
   // a lookup that leaves the found row untouched, stamp included.)
-  const updateEntries = writeEntries(qi, applyUpdatedAtColumns(qi, args.update as Record<string, unknown>));
+  //
+  // `expr.excluded(f)` is `create`'s value for `f` (the incoming row of a
+  // one-row upsert IS `create`), resolved before compiling so this path and the
+  // lookup path's plain `update()` write the same row.
+  const update = resolveExcludedFromCreate(
+    qi,
+    args.update as Record<string, unknown>,
+    args.create as Record<string, unknown>,
+  ) as Record<string, unknown>;
+  const updateEntries = writeEntries(qi, applyUpdatedAtColumns(qi, update));
   const params: unknown[] = [...createParams];
-  const refQualifier = upsertReferenceQualifier(qi);
-  const setClauses = updateEntries.map(([k, v]) => buildSetClause(qi, k, v, params, refQualifier));
+  const setClauses = buildSetClauses(qi, updateEntries, params, {
+    operation: 'upsert',
+    target: upsertTargetRef(qi),
+  });
 
   // Global filter → restrict the conflict-UPDATE (soft-delete / tenancy) so an
   // upsert never resurrects a soft-deleted row or writes across tenants. Only
@@ -1074,8 +1481,8 @@ export function buildUpsert<T extends object>(
             // An update that changes a `where` column moves the row out of
             // `where`'s reach: lock it and re-read it by its key. An insert
             // matches `where` (this path requires `where` pinned to `create`).
-            const update = (args.update ?? {}) as Record<string, unknown>;
-            const key = dataMovesRow(qi, upsertWhere, update) ? await lockKeyOf(qi, exec, lookup, update) : undefined;
+            const moved = update ?? {};
+            const key = dataMovesRow(qi, upsertWhere, moved) ? await lockKeyOf(qi, exec, lookup, moved) : undefined;
             await exec(sql, params);
             const sel = buildReselectByWhere(qi, key ?? lookup, projection);
             return exec(sel.sql, sel.params);
@@ -1085,27 +1492,23 @@ export function buildUpsert<T extends object>(
 }
 
 /**
- * The qualifier an upsert's arithmetic SET operator reads its column through.
+ * The rendered reference to an upsert's TARGET row, which every column the
+ * conflict-UPDATE reads goes through (an arithmetic operator's column, an
+ * expression's `col()`, a case predicate).
  *
  * `INSERT ... ON CONFLICT DO UPDATE SET n = n + 1` is 42702 on PostgreSQL
  * because `n` could be the target row's or `excluded`'s, so the reference is
  * qualified with the table name on every engine whose upsert statement names
  * the table directly (PostgreSQL, SQLite, MySQL all accept `"t"."n"` there).
- * SQL Server is the exception and keeps the bare reference: its `MERGE`
- * aliases the target as `T`, so the TABLE NAME does not resolve there at all,
- * and the alias belongs to that dialect's own `buildUpsertStatement` rather
- * than to this module. An arithmetic operator in an mssql upsert may therefore
- * still be refused by the server as an ambiguous column; that shape has never
- * worked (it previously bound the operator OBJECT as the value), and the sound
- * fix is for the dialect to publish its target alias, which is a change to
- * `dialect.ts`. It fails loudly either way, so no wrong answer is possible.
+ * SQL Server's `MERGE` aliases its target, so the table name does not resolve
+ * there and the dialect publishes the alias ({@link Dialect.upsertTargetAlias}).
  * `set` and literal values reference no column and are unaffected everywhere.
  *
- * Gated on the dialect NAME, never on hook presence: every engine dialect
- * spreads `postgresDialect`, so a presence test would say yes for all of them.
+ * Read from a property only SQL Server sets, never inferred from a hook's
+ * presence: every engine dialect spreads `postgresDialect`.
  */
-function upsertReferenceQualifier(qi: BuilderCtx): string {
-  return qi.dialect.name === 'mssql' ? '' : `${qi.q(qi.table)}.`;
+function upsertTargetRef(qi: BuilderCtx): string {
+  return qi.dialect.upsertTargetAlias ?? qi.q(qi.table);
 }
 
 export function buildUpdateMany<T extends object>(
@@ -1148,8 +1551,7 @@ export function buildUpdateMany<T extends object>(
   const params: unknown[] = [];
 
   const buildSql = (freshParams: unknown[]): string => {
-    const setEntries = writeEntries(qi, dataObj);
-    const setClauses = setEntries.map(([k, v]) => buildSetClause(qi, k, v, freshParams));
+    const setClauses = buildSetClauses(qi, writeEntries(qi, dataObj), freshParams, { operation: 'updateMany' });
     const whereClause = whereMod.buildWhereClause(qi, whereObj, freshParams);
     const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
     return `UPDATE ${qi.q(qi.table)} SET ${setClauses.join(', ')}${whereSql}`;
@@ -1452,13 +1854,16 @@ const ARITHMETIC_SQL: Readonly<Record<string, string>> = { increment: '+', decre
  * collector, so the three cannot disagree about whether a value is an
  * operator.
  *
- * An operator is a plain object with EXACTLY one key from
+ * A branded expression or `col()` reference is checked FIRST and answers
+ * `'expr'`: it is a frozen plain object too, and must never reach the
+ * operator test below. An operator is a plain object with EXACTLY one key from
  * {@link UPDATE_OPERATOR_KEYS}. On a json/jsonb column only `set` is an
  * operator: an object there IS the JSON value, so `{ increment: 1 }` is the
  * document `{"increment":1}`, and `{ set: doc }` is the way to write a
  * document that is itself shaped like `{ set: ... }`.
  */
 export function setOperatorOf(qi: BuilderCtx, key: string, value: unknown): string | null {
+  if (isSqlExpr(value) || isColumnRef(value)) return 'expr';
   if (!isUnmatchedPlainObject(value)) return null;
   const keys = Object.keys(value as Record<string, unknown>);
   if (keys.length !== 1 || !UPDATE_OPERATOR_KEYS.has(keys[0]!)) return null;
@@ -1475,42 +1880,94 @@ function isJsonWriteColumn(qi: BuilderCtx, key: string): boolean {
 }
 
 /**
- * Build a single SET clause entry for update/updateMany.
+ * Where a SET list is compiled, which decides how its column references and
+ * its `expr.case` predicates are rendered.
+ */
+interface SetContext {
+  /** The operation, for messages. */
+  readonly operation: 'update' | 'updateMany' | 'upsert' | 'createMany';
+  /**
+   * The rendered reference to the target row (`"users"`, SQL Server's MERGE
+   * alias `T`), or `undefined` for a plain UPDATE, where a bare column has one
+   * table in scope. Inside an upsert the proposed row is in scope too, so a
+   * bare reference is ambiguous (42702 on PostgreSQL).
+   */
+  readonly target?: string | undefined;
+  /** The incoming row's reference (`EXCLUDED`, `S`), only where `expr.excluded` means something. */
+  readonly incoming?: string | undefined;
+  /** The columns the incoming rows carry. */
+  readonly insertColumns?: ReadonlySet<string> | undefined;
+}
+
+const UPDATE_SET: SetContext = { operation: 'update' };
+
+/** One compiled assignment, before MySQL reorders the list. */
+interface SetEntry {
+  readonly sql: string;
+  /** The column assigned. */
+  readonly column: string;
+  /** Other columns of the target row the right-hand side reads. */
+  readonly reads: ReadonlySet<string>;
+}
+
+const NO_READS: ReadonlySet<string> = new Set();
+
+/**
+ * Compile a SET list: one clause per entry, in the order given (the canonical
+ * column order of {@link writeEntries}), pushing params as it goes so later
+ * clauses (WHERE, version check) continue the numbering.
  *
- * Supports plain values and atomic operator objects ({ set, increment,
- * decrement, multiply, divide }), as decided by {@link setOperatorOf}.
+ * On MySQL the clause STRINGS are then reordered (see
+ * {@link orderForLeftToRightSet}). Params are not: MySQL binds by name
+ * (`:pN`), so a clause keeps its placeholders wherever it lands, and the
+ * cache-hit collector ({@link collectSetParams}) keeps pushing in canonical
+ * order.
+ */
+function buildSetClauses(
+  qi: BuilderCtx,
+  entries: [string, unknown][],
+  params: unknown[],
+  ctx: SetContext = UPDATE_SET,
+): string[] {
+  const compiled = entries.map(([k, v]) => compileSetEntry(qi, k, v, params, ctx));
+  return qi.dialect.name === 'mysql' ? orderForLeftToRightSet(qi, compiled) : compiled.map((c) => c.sql);
+}
+
+/**
+ * Build a single SET clause entry.
+ *
+ * Supports plain values, atomic operator objects ({ set, increment,
+ * decrement, multiply, divide }) and expressions (`expr.*`, `col()`), as
+ * decided by {@link setOperatorOf}.
  *
  * Returns the SQL fragment (e.g., `"view_count" = "view_count" + $3`) and
  * pushes any required params onto the shared params array so that WHERE
  * clause numbering continues correctly afterward.
  *
- * `refQualifier` prefixes the column REFERENCE an arithmetic operator reads
- * from (`"view_count" = <qualifier>"view_count" + $n`). A plain `UPDATE` has
- * one table in scope and passes nothing; `upsert` passes the table name,
- * because inside `ON CONFLICT ... DO UPDATE SET` the target table and
- * `excluded` are BOTH in scope and a bare reference is 42702 on PostgreSQL.
- * The assignment target on the left stays bare on every engine (it can only
- * ever be the target table's column), and `set` / literal values reference no
- * column at all, so their SQL is byte-identical with or without a qualifier.
+ * `ctx.target` qualifies the column REFERENCES the right-hand side reads
+ * (`"view_count" = "users"."view_count" + $n`): absent for a plain `UPDATE`,
+ * the table name in an upsert, because inside `ON CONFLICT ... DO UPDATE SET`
+ * the target table and `excluded` are BOTH in scope and a bare reference is
+ * 42702 on PostgreSQL. The assignment target on the left stays bare on every
+ * engine (it can only ever be the target table's column), and `set` / literal
+ * values reference no column at all, so their SQL is byte-identical with or
+ * without a qualifier.
  */
-export function buildSetClause(
-  qi: BuilderCtx,
-  key: string,
-  value: unknown,
-  params: unknown[],
-  refQualifier = '',
-): string {
+function compileSetEntry(qi: BuilderCtx, key: string, value: unknown, params: unknown[], ctx: SetContext): SetEntry {
   const col = qi.toSqlColumn(key);
-  const ref = `${refQualifier}${col}`;
+  const column = qi.toColumn(key);
+  const op = setOperatorOf(qi, key, value);
+  if (op === 'expr') {
+    const compiled = compileSetExpr(exprEnv(qi, key, params, ctx), value as Parameters<typeof compileSetExpr>[1]);
+    return { sql: `${col} = ${compiled.sql}`, column, reads: compiled.reads };
+  }
   // Enum columns get an explicit `::"EnumName"` cast on their value bind
   // (see enumTypeForColumn); `''` everywhere else. Value-invariant, so the
   // SQL cache and collectSetParams are unaffected.
-  const cast = whereMod.enumCastSuffix(qi, qi.toColumn(key));
-
-  const op = setOperatorOf(qi, key, value);
+  const cast = whereMod.enumCastSuffix(qi, column);
   if (op === 'set') {
     params.push(coerceWriteValue(qi, key, (value as Record<string, unknown>).set));
-    return `${col} = ${qi.p(params.length)}${cast}`;
+    return { sql: `${col} = ${qi.p(params.length)}${cast}`, column, reads: NO_READS };
   }
   if (op !== null) {
     const opValue = (value as Record<string, unknown>)[op];
@@ -1521,7 +1978,9 @@ export function buildSetClause(
       );
     }
     params.push(opValue);
-    return `${col} = ${ref} ${ARITHMETIC_SQL[op]} ${qi.p(params.length)}`;
+    const ref = ctx.target ? `${ctx.target}.${col}` : col;
+    // Reads only its own column, which no ordering needs to respect.
+    return { sql: `${col} = ${ref} ${ARITHMETIC_SQL[op]} ${qi.p(params.length)}`, column, reads: NO_READS };
   }
   // A misspelled operator gets its own E003 before the bind seam's general
   // shape check.
@@ -1529,11 +1988,120 @@ export function buildSetClause(
 
   // Plain value (including null, Date, Buffer, arrays, JSON objects)
   params.push(coerceWriteValue(qi, key, value));
-  return `${col} = ${qi.p(params.length)}${cast}`;
+  return { sql: `${col} = ${qi.p(params.length)}${cast}`, column, reads: NO_READS };
 }
 
 /**
- * Reject a `data` value that reached {@link buildSetClause}'s plain-value
+ * The environment one expression compiles in: how a value leaf binds, how a
+ * column of the target row and of the incoming row render, and how a case
+ * predicate compiles.
+ */
+function exprEnv(qi: BuilderCtx, key: string, params: unknown[], ctx: SetContext): ExprCompileEnv {
+  const cast = exprValueCast(qi, key);
+  const target = ctx.target;
+  const incoming = ctx.incoming;
+  return {
+    qi,
+    targetKey: key,
+    operation: ctx.operation,
+    bind: (value) => {
+      params.push(coerceWriteValue(qi, key, value));
+      return `${qi.p(params.length)}${cast}`;
+    },
+    column: (column) => (target ? `${target}.${qi.q(column)}` : qi.q(column)),
+    excluded: incoming ? (column) => `${incoming}.${qi.q(column)}` : undefined,
+    insertColumns: ctx.insertColumns,
+    predicate: (when) => {
+      const sql = target
+        ? whereMod.buildRenderedRefWhere(qi, qi.table, qi.tableMeta, target, when, params)
+        : whereMod.buildWhereClause(qi, when, params);
+      if (sql === null) {
+        throw new ValidationError(`expr.case() on "${qi.table}": an arm's when compiles to no predicate.`);
+      }
+      return sql;
+    },
+  };
+}
+
+/**
+ * A type token that is safe to write after `::` as is: a plain name, a
+ * multi-word built-in (`double precision`), optionally with a precision.
+ */
+const SAFE_CAST_TYPE = /^[A-Za-z_][A-Za-z0-9_]*( [A-Za-z_][A-Za-z0-9_]*)*(\(\d+( ?, ?\d+)?\))?$/;
+
+/**
+ * The cast every bound value inside an expression carries on PostgreSQL: the
+ * TARGET column's type. node-postgres sends parameters untyped, so in an
+ * expression whose operands are all bound values PostgreSQL infers `text` and
+ * fails (`CASE WHEN ... THEN $1 ELSE $2 END` into an int column is 42804, and
+ * `$1 + $2` is 42725). Enums use the quoted enum cast; a type the metadata
+ * does not name plainly, or one from another schema, gets none. Other engines
+ * bind typed values and get none.
+ */
+function exprValueCast(qi: BuilderCtx, key: string): string {
+  if (qi.dialect.name !== 'postgresql') return '';
+  const column = resolveColumnName(qi.tableMeta, key);
+  if (column === undefined) return '';
+  const enumCast = whereMod.enumCastSuffix(qi, column);
+  if (enumCast) return enumCast;
+  if (qi.crossSchemaTypeColumns.has(column)) return '';
+  const type = qi.columnPgTypeMap.get(column);
+  if (type === undefined || type.startsWith('_') || !SAFE_CAST_TYPE.test(type)) return '';
+  return `::${type}`;
+}
+
+/**
+ * MySQL evaluates a single-table UPDATE's SET list LEFT TO RIGHT, and a later
+ * assignment sees the NEW value of an earlier column; PostgreSQL, SQLite and
+ * SQL Server read old values. So `{ a: col('b'), b: col('a') }` swaps there
+ * and duplicates on MySQL. `ON DUPLICATE KEY UPDATE` behaves the same way.
+ *
+ * Order the list so every assignment that READS a column comes before the
+ * assignment that WRITES it: a stable topological sort that keeps the
+ * canonical order wherever the reads allow, so the order is a pure function of
+ * the data's shape and the SQL-cache key (which already captures that shape)
+ * stays sufficient. A cycle (a swap) has no such order and is refused.
+ */
+function orderForLeftToRightSet(qi: BuilderCtx, entries: SetEntry[]): string[] {
+  if (entries.every((e) => e.reads.size === 0)) return entries.map((e) => e.sql);
+  const writer = new Map<string, number>();
+  entries.forEach((e, i) => {
+    writer.set(e.column, i);
+  });
+  const before: number[][] = entries.map(() => []);
+  const pending = entries.map(() => 0);
+  entries.forEach((e, i) => {
+    for (const column of e.reads) {
+      const j = writer.get(column);
+      if (j === undefined || j === i) continue;
+      before[i]!.push(j);
+      pending[j]!++;
+    }
+  });
+  const ready = pending.flatMap((n, i) => (n === 0 ? [i] : []));
+  const order: number[] = [];
+  while (ready.length > 0) {
+    ready.sort((a, b) => a - b);
+    const i = ready.shift()!;
+    order.push(i);
+    for (const j of before[i]!) if (--pending[j]! === 0) ready.push(j);
+  }
+  if (order.length < entries.length) {
+    const stuck = entries
+      .filter((_, i) => pending[i]! > 0)
+      .map((e) => qi.tableMeta.reverseColumnMap[e.column] ?? e.column);
+    throw new UnsupportedFeatureError(
+      `An update on "${qi.table}" that reads ${stuck.map((f) => `"${f}"`).join(' and ')} while assigning them`,
+      qi.dialect.name,
+      "MySQL evaluates SET left to right, so a later assignment sees the earlier one's new value and this " +
+        'cannot be expressed. Split it into two updates.',
+    );
+  }
+  return order.map((i) => entries[i]!.sql);
+}
+
+/**
+ * Reject a `data` value that reached {@link buildSetClauses}'s plain-value
  * fallthrough as a plain object with exactly ONE key that is not a known
  * atomic operator. On a scalar column that shape can only be a misspelled
  * operator (`{ incremnt: 1 }`, `{ bogus: 'x' }`); binding it plainly writes the
@@ -1564,28 +2132,41 @@ export function assertBindableSetValue(qi: BuilderCtx, key: string, value: unkno
 
 /**
  * Fingerprint SET clauses for update/updateMany.
- * Captures key names + operator types (set/increment/etc) but not values.
+ * Captures key names + operator types (set/increment/etc) but not values. An
+ * expression contributes `k:expr(<shape>)` from the same walk that compiles
+ * it, so a statement without one keeps its key byte-identical.
  */
 export function fingerprintSet(qi: BuilderCtx, data: Record<string, unknown>): string {
   const entries = writeEntries(qi, data);
   const parts: string[] = [];
   for (const [k, v] of entries) {
-    parts.push(`${k}:${setOperatorOf(qi, k, v) ?? 'eq'}`);
+    const op = setOperatorOf(qi, k, v);
+    if (op === 'expr') {
+      const env = exprEnv(qi, k, [], UPDATE_SET);
+      parts.push(`${k}:expr(${compileSetExpr(env, v as Parameters<typeof compileSetExpr>[1]).fingerprint})`);
+      continue;
+    }
+    parts.push(`${k}:${op ?? 'eq'}`);
   }
   return parts.join(',');
 }
 
 /**
- * Collect SET params for update/updateMany. Mirrors buildSetClause param order.
+ * Collect SET params for update/updateMany. Mirrors buildSetClauses param order.
  */
 export function collectSetParams(qi: BuilderCtx, data: Record<string, unknown>, params: unknown[]): void {
   const entries = writeEntries(qi, data);
   for (const [k, v] of entries) {
     const op = setOperatorOf(qi, k, v);
+    if (op === 'expr') {
+      // The build's own walk: it binds the same leaves in the same order.
+      compileSetExpr(exprEnv(qi, k, params, UPDATE_SET), v as Parameters<typeof compileSetExpr>[1]);
+      continue;
+    }
     if (op !== null) {
       // `set` is the only operator that binds a user value of arbitrary type;
       // the arithmetic operators are finite numbers, which coerceWriteValue
-      // returns untouched. Mirrors buildSetClause.
+      // returns untouched. Mirrors buildSetClauses.
       params.push(coerceWriteValue(qi, k, (v as Record<string, unknown>)[op]));
       continue;
     }

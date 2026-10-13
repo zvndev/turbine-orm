@@ -86,7 +86,9 @@ import { createRequire } from 'node:module';
 import type { DatabaseSync } from 'node:sqlite';
 import { type PgCompatPool, type PgCompatPoolClient, TurbineClient } from './client.js';
 import {
+  type BuiltStatement,
   type BulkInsertStatementInput,
+  type BulkUpsertStatementInput,
   type ColumnDefinitionInput,
   type ColumnTypeInput,
   type CreateIndexStatementInput,
@@ -98,6 +100,7 @@ import {
   type IntrospectOptions,
   type JsonWireRule,
   type LimitOffsetInput,
+  onConflictAction,
   postgresDialect,
   type ReturningSelection,
   type StreamableConnection,
@@ -1006,6 +1009,23 @@ export const sqliteDialect: Dialect = {
         `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES ${placeholders}` +
         `${conflict}${this.buildReturningClause(input.returning)}`,
       params: input.rowValues.flat(),
+    };
+  },
+
+  buildBulkUpsertStatement(input: BulkUpsertStatementInput): BuiltStatement {
+    // VALUES, not `INSERT ... SELECT`: after a SELECT, SQLite cannot tell a
+    // trailing `ON CONFLICT` from the SELECT's own clauses. The rest is the
+    // PostgreSQL grammar (3.24 upsert, 3.35 RETURNING), `excluded` included.
+    let n = 0;
+    const tuples = input.rowValues.map((row) => `(${row.map(() => this.paramPlaceholder(++n)).join(', ')})`).join(', ');
+    const params = input.rowValues.flat();
+    return {
+      sql:
+        `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES ${tuples} ` +
+        `ON CONFLICT (${input.conflictColumns.join(', ')}) ` +
+        onConflictAction(input, params, { target: input.table, incoming: 'excluded' }) +
+        this.buildReturningClause(input.returning),
+      params,
     };
   },
 

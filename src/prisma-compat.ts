@@ -1401,6 +1401,17 @@ function translateWriteData(ctx: Ctx, mm: PrismaModelMap, data: unknown, depth =
   if (!isPlainRecord(data)) return data;
   const out: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(data)) {
+    if (isExpressionNode(val)) {
+      // The field names inside an expression are Turbine's, and this layer
+      // renames only the keys it can see, so one would be compiled against
+      // the wrong names wherever a Prisma field is mapped.
+      throw new UnsupportedFeatureError(
+        `an update expression (expr / col()) in "${key}" on model "${modelName(ctx, mm)}"`,
+        'prisma-compat',
+        'Expressions are a Turbine-native API: run this write through the Turbine client, where field names ' +
+          'are its own, or compute the value in JavaScript.',
+      );
+    }
     const rel = ownLookup(mm.relations, key);
     if (rel && isPlainRecord(val) && Object.keys(val).some((k) => NESTED_WRITE_OPS.has(k))) {
       const target = relTargetModel(ctx, mm, rel.name);
@@ -1410,6 +1421,18 @@ function translateWriteData(ctx: Ctx, mm: PrismaModelMap, data: unknown, depth =
     setOwn(out, renameField(mm, key), val);
   }
   return out;
+}
+
+/**
+ * An update expression (`expr.*`) or column reference (`col()`), read by the
+ * brands' registry keys so this shim imports neither builder module.
+ */
+function isExpressionNode(value: unknown): boolean {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    (Symbol.for('turbine-orm.sqlExpr') in value || Symbol.for('turbine-orm.columnRef') in value)
+  );
 }
 
 /**

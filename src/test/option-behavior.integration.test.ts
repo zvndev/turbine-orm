@@ -776,6 +776,19 @@ const BEHAVIOR: Record<string, Check> = {
       );
       return;
     }
+    if (op === 'createMany') {
+      // A t1-scoped client upserting id 5, which belongs to t2: the filter
+      // guards the conflict update, and the opt-out lifts that guard.
+      const args = {
+        data: [{ id: 5, name: 'taken', tenantId: 't1', qty: 1, secret: 'sz', email: 'over@x.test' }],
+        onConflict: { target: ['id'], update: ['name'] },
+      };
+      await run(tenantDb, 'createMany', args);
+      assert.equal((await widgetRows()).find((x) => x.id === 5)?.name, 'echo', 'the filter must guard the update');
+      await run(tenantDb, 'createMany', { ...args, skipGlobalFilters: UNSAFE });
+      assert.equal((await widgetRows()).find((x) => x.id === 5)?.name, 'taken', 'the opt-out must lift the guard');
+      return;
+    }
     if (op === 'update' || op === 'delete') {
       // Addressing a row outside the filter must not find it.
       await assert.rejects(() =>

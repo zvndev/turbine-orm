@@ -131,7 +131,10 @@ describe('generateTypes, temporal column types', () => {
     assert.match(create, /at_timetz: string \| Date;/);
     assert.match(create, /maybe_time\?: string \| Date \| null \| undefined;/);
     const update = out.slice(out.indexOf('ReportScheduleUpdate'));
-    assert.match(update, /at_time\?: string \| Date \| UpdateOperatorInput<string \| Date> \| undefined;/);
+    assert.match(
+      update,
+      /at_time\?: string \| Date \| UpdateOperatorInput<string \| Date> \| SqlExpr<string \| Date> \| ColumnRef \| undefined;/,
+    );
   });
 
   it('write inputs for timestamp / date columns are unchanged', () => {

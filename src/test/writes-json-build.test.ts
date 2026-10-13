@@ -229,7 +229,7 @@ describe('createMany past the bind-parameter limit', () => {
     assert.equal(maxBindParameters({ name: 'postgresql' }), 65535);
     assert.equal(maxBindParameters({ name: 'mysql' }), 65535);
     assert.equal(maxBindParameters({ name: 'sqlite' }), 32766);
-    assert.equal(maxBindParameters({ name: 'mssql' }), 2100);
+    assert.equal(maxBindParameters({ name: 'mssql' }), 2098);
     assert.equal(maxBindParameters({ name: 'toString' }), undefined);
     assert.equal(maxBindParameters({ name: 'sqlite', maxBindParameters: 999 }), 999);
   });

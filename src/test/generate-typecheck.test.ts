@@ -213,7 +213,7 @@ export type _many = AssertMany<ByCurrent>;
 // that a base-class signature change (return type, callback parameter type,
 // constructor arity) fails THIS test instead of a reader's `tsc`.
 const CALL_FORMS_USAGE = `
-import { TurbineClient as BaseTurbineClient } from 'turbine-orm';
+import { TurbineClient as BaseTurbineClient, col, expr } from 'turbine-orm';
 import { SCHEMA, TurbineClient, turbine } from './index.js';
 import type { TagCreate } from './types.js';
 
@@ -238,6 +238,12 @@ export const viaFactory = turbine({ connectionString: 'postgres://localhost/app'
 
 // A text primary key with no default and no identity is REQUIRED on create.
 export const tag: TagCreate = { slug: 'ts', label: 'TypeScript' };
+
+// Update data takes an expr.* expression or a col() reference, as on the base client.
+export async function bump(): Promise<void> {
+  await db.posts.update({ where: { id: 1 }, data: { userId: expr.add(col('userId'), 1) } });
+  await db.posts.update({ where: { id: 1 }, data: { title: col('title') } });
+}
 // @ts-expect-error slug has no default, so omitting it must not compile
 export const tagWithoutPk: TagCreate = { label: 'TypeScript' };
 `;

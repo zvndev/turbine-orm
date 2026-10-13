@@ -56,6 +56,7 @@ import {
   uniqueKeyNames,
   whereIdentifiesOneRow,
 } from './compound-unique.js';
+import { resolveExcludedFromCreate } from './expr.js';
 import {
   assertEqualityOperand,
   dedupeColumnList,
@@ -3362,8 +3363,17 @@ export class QueryInterface<
     return { columns };
   }
 
-  buildCreateMany(args: CreateManyArgs<T, M['createMany']>): DeferredQuery<T[]> {
-    return writesMod.buildCreateMany(this.ctx, this.normalizeArgs(args));
+  buildCreateMany<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: CreateManyArgs<T, M['createMany'], S, O>): DeferredQuery<FieldResult<T, S, O>[]> {
+    args = this.normalizeArgs(args);
+    return writesMod.buildCreateMany(
+      this.ctx,
+      args as unknown as CreateManyArgs<T>,
+      'refuse',
+      this.resolveWriteProjection(args),
+    ) as unknown as DeferredQuery<FieldResult<T, S, O>[]>;
   }
 
   buildUpdate<
@@ -4928,34 +4938,53 @@ export class QueryInterface<
   // createMany, uses UNNEST for performance
   // -------------------------------------------------------------------------
 
-  async createMany(args: CreateManyArgs<T, M['createMany']>): Promise<T[]> {
+  async createMany<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: CreateManyArgs<T, M['createMany'], S, O>): Promise<FieldResult<T, S, O>[]> {
     args = this.normalizeArgs(args);
     return this.executeWithMiddleware('createMany', args as unknown as Record<string, unknown>, async () => {
-      const deferred = writesMod.buildCreateMany(this.ctx, args, 'allow');
+      const projection = this.resolveWriteProjection(args);
+      const base = args as unknown as CreateManyArgs<T>;
+      const deferred = writesMod.buildCreateMany(this.ctx, base, 'allow', projection);
       const limit = maxBindParameters(this.dialect);
       if (limit === undefined || deferred.params.length <= limit) {
-        const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
-        return deferred.transform(result);
+        return this.executeMutation(deferred, args.timeout) as Promise<FieldResult<T, S, O>[]>;
       }
       // Over the engine's bind-parameter limit for one statement: insert in
       // chunks that fit, all in one transaction, so the rows land together or
       // not at all. (`buildCreateMany`, one statement for a pipeline, refuses.)
-      const perRow = Math.ceil(deferred.params.length / args.data.length);
-      const rowsPerChunk = Math.max(1, Math.floor(limit / perRow));
+      // A one-row build separates the per-row parameters from the ones bound
+      // once per statement (an onConflict update's values), so a chunk never
+      // goes over by the fixed part.
+      const one = writesMod.buildCreateMany(this.ctx, { ...base, data: base.data.slice(0, 1) }, 'allow', projection);
+      const perRow = Math.max(
+        1,
+        Math.ceil((deferred.params.length - one.params.length) / Math.max(1, base.data.length - 1)),
+      );
+      const fixed = Math.max(0, one.params.length - perRow);
+      const rowsPerChunk = Math.max(1, Math.floor((limit - fixed) / perRow));
+      const reselects = this.dialect.resultStrategy === 'reselect';
       return this.inOneTransaction(
         async (exec) => {
-          const rows: T[] = [];
-          for (let i = 0; i < args.data.length; i += rowsPerChunk) {
-            const chunk = writesMod.buildCreateMany(this.ctx, {
-              ...args,
-              data: args.data.slice(i, i + rowsPerChunk),
-            } as CreateManyArgs<T>);
-            rows.push(...chunk.transform(await exec(chunk.sql, chunk.params, chunk.preparedName)));
+          const rows: FieldResult<T, S, O>[] = [];
+          for (let i = 0; i < base.data.length; i += rowsPerChunk) {
+            const chunk = writesMod.buildCreateMany(
+              this.ctx,
+              { ...base, data: base.data.slice(i, i + rowsPerChunk) },
+              'refuse',
+              projection,
+            );
+            const result =
+              reselects && chunk.reselect
+                ? await chunk.reselect(exec)
+                : await exec(chunk.sql, chunk.params, chunk.preparedName);
+            rows.push(...(chunk.transform(result) as unknown as FieldResult<T, S, O>[]));
           }
           return rows;
         },
         args.timeout,
-        `createMany of ${args.data.length} rows`,
+        `createMany of ${base.data.length} rows`,
         `Insert at most ${rowsPerChunk} rows per call, which fits one statement, or pass a pool that can check ` +
           'out a connection.',
       );
@@ -5174,7 +5203,11 @@ export class QueryInterface<
   ): Promise<T> {
     const where = (args.where ?? {}) as Record<string, unknown>;
     const create = (args.create ?? {}) as Record<string, unknown>;
-    const update = (args.update ?? {}) as Record<string, unknown>;
+    // `expr.excluded(field)` in `update` reads the incoming row, which here is
+    // `create`: resolved to create's value before the update compiles, as the
+    // single-statement path does.
+    const update = (resolveExcludedFromCreate(this.ctx, (args.update ?? {}) as Record<string, unknown>, create) ??
+      {}) as Record<string, unknown>;
     assertMutationWhereIdentifiesOneRow(
       this.tableMeta,
       this.table,

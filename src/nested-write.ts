@@ -21,6 +21,7 @@ import {
   ValidationError,
 } from './errors.js';
 import { markInternalRowSelector } from './query/compound-unique.js';
+import { resolveExcludedFromCreate } from './query/expr.js';
 import { isPlainRecord, setOwn } from './query/filters.js';
 import { markInternalCombinator, resolveColumnName } from './query/utils.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
@@ -1870,11 +1871,12 @@ async function processNestedUpsert(
       throw new ValidationError(`Nested upsert on "${rel.name}" requires "where", "create", and "update" fields.`);
     }
     assertTargetSelectsSomething(item.where, 'upsert', relName, rel);
+    const update = upsertUpdateData(ctx, rel, item);
     const scoped = correlation ? scopeWhereToParent(item.where, correlation) : null;
     const existing = scoped ? await ctx.tx.table(rel.to).findUnique({ where: scoped }) : null;
     if (existing && scoped) {
       try {
-        await ctx.tx.table(rel.to).update({ where: scoped, data: item.update });
+        await ctx.tx.table(rel.to).update({ where: scoped, data: update });
       } catch (err) {
         rethrowAsNotRelated(err, 'upsert', relName, rel, item.where);
       }
@@ -1883,6 +1885,23 @@ async function processNestedUpsert(
       await ctx.tx.table(rel.to).create({ data: injected });
     }
   }
+}
+
+/**
+ * A nested upsert's `update`, with each `expr.excluded(f)` resolved to the
+ * value its `create` supplies: the incoming row of a one-row upsert is
+ * `create`, as it is for a top-level `upsert()`. Resolved before the lookup,
+ * so a reference `create` cannot satisfy is refused whether or not the row
+ * exists.
+ */
+function upsertUpdateData(
+  ctx: NestedWriteContext,
+  rel: RelationDef,
+  item: { create: Record<string, unknown>; update: Record<string, unknown> },
+): Record<string, unknown> {
+  const tableMeta = ctx.schema.tables[rel.to];
+  if (!tableMeta) return item.update;
+  return resolveExcludedFromCreate({ table: rel.to, tableMeta }, item.update, item.create) ?? item.update;
 }
 
 async function processBelongsToUpdate(
@@ -1944,6 +1963,7 @@ async function processBelongsToUpsert(
   // hasMany/hasOne nested upsert makes: an upsert whose target is out of the
   // relation creates a row owned by this parent rather than rewriting a
   // stranger's.
+  const update = upsertUpdateData(ctx, rel, item);
   const correlation = belongsToCorrelationWhere(ctx, rel, parentRow, parentTable);
   // findMany, not findUnique: the scoped where ANDs a non-unique-looking
   // correlation onto the caller's selector. The correlation targets the
@@ -1960,7 +1980,7 @@ async function processBelongsToUpsert(
     : null;
   if (existing) {
     const relatedMeta = ctx.schema.tables[rel.to]!;
-    await ctx.tx.table(rel.to).update({ where: pkWhere(relatedMeta, existing), data: item.update });
+    await ctx.tx.table(rel.to).update({ where: pkWhere(relatedMeta, existing), data: update });
   } else {
     // Create the related row, then update parent's FK to point at it
     const createdRow = (await ctx.tx.table(rel.to).create({ data: item.create })) as Record<string, unknown>;

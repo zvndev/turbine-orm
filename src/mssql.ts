@@ -52,7 +52,7 @@
  *   the row selection).
  * - **Result strategy `'output'`:** create/update/delete/upsert return their rows
  *   from the same statement. `createMany` returns the inserted rows via
- *   `OUTPUT INSERTED.*` on the multi-row VALUES insert (≤ 1000 rows / 2100 params
+ *   `OUTPUT INSERTED.*` on the multi-row VALUES insert (≤ 1000 rows / 2098 params
  *   per statement, exceeding either throws a clear `ValidationError`; chunk
  *   yourself or use single `create`s).
  * - **MERGE concurrency caveat:** `MERGE` is the upsert primitive; under high
@@ -98,7 +98,9 @@ import {
   TurbineClient,
 } from './client.js';
 import {
+  type BuiltStatement,
   type BulkInsertStatementInput,
+  type BulkUpsertStatementInput,
   type ColumnDefinitionInput,
   type ColumnTypeInput,
   type CreateIndexStatementInput,
@@ -147,8 +149,13 @@ import {
 // SQL Server / connection limits
 // ---------------------------------------------------------------------------
 
-/** Max bound parameters per SQL Server statement. */
-const MSSQL_MAX_PARAMS = 2100;
+/**
+ * Max bound parameters per SQL Server statement, as the driver sends them.
+ * The server's limit is 2100 per RPC call, and `mssql` runs a parameterized
+ * statement through `sp_executesql`, whose own `@stmt` and `@params` take two
+ * of them: measured, 2098 runs and 2099 is refused with error 8003.
+ */
+const MSSQL_MAX_PARAMS = 2098;
 /** Max rows per multi-row INSERT … VALUES statement. */
 const MSSQL_MAX_INSERT_ROWS = 1000;
 
@@ -636,6 +643,12 @@ export const mssqlDialect: Dialect = {
   supportsPercentileAggregates: false,
   // MERGE ... WITH (HOLDLOCK).
   supportsBulkUpsert: true,
+  // Both MERGE forms alias the target `T` (and the incoming rows `S`), so the
+  // conflict-UPDATE reads the existing row through `T.`, never the table name.
+  upsertTargetAlias: 'T',
+  // Own property, so createMany's chunking and the bind-limit refusal use the
+  // limit the driver can actually send (see MSSQL_MAX_PARAMS), not 2100.
+  maxBindParameters: MSSQL_MAX_PARAMS,
   // sp_getapplock / sp_releaseapplock exist (used by a future migrate adapter).
   supportsAdvisoryLock: true,
   // No in-band EXPLAIN: SQL Server's SHOWPLAN is a session toggle
@@ -763,7 +776,7 @@ export const mssqlDialect: Dialect = {
 
   buildBulkInsertStatement(input: BulkInsertStatementInput): { sql: string; params: unknown[] } {
     // No UNNEST in SQL Server, emit multi-row VALUES with flattened, named `@pN`
-    // placeholders. Enforce the engine's 1000-row / 2100-param statement limits.
+    // placeholders. Enforce the engine's 1000-row / 2098-param statement limits.
     const rowCount = input.rowValues.length;
     const paramCount = input.rowValues.reduce((n, row) => n + row.length, 0);
     if (rowCount > MSSQL_MAX_INSERT_ROWS) {
@@ -841,6 +854,37 @@ export const mssqlDialect: Dialect = {
       `WHEN NOT MATCHED THEN INSERT (${insertCols}) VALUES (${sourceVals})` +
       `${out};`
     );
+  },
+
+  buildBulkUpsertStatement(input: BulkUpsertStatementInput): BuiltStatement {
+    // MERGE, with HOLDLOCK: without it two concurrent MERGEs can both see "not
+    // matched" for one key and the second insert fails on the unique key. A
+    // NULL in a key column never matches (T.c = S.c is not true), so the row
+    // is inserted, as PostgreSQL's ON CONFLICT treats it. `ignore` drops the
+    // WHEN MATCHED arm, so only the inserted rows come back through OUTPUT.
+    // The bind-parameter limit (MSSQL_MAX_PARAMS) is enforced by the caller's chunking.
+    let n = 0;
+    const tuples = input.rowValues.map((row) => `(${row.map(() => this.paramPlaceholder(++n)).join(', ')})`).join(', ');
+    const params = input.rowValues.flat();
+    const alias = this.upsertTargetAlias ?? 'T';
+    const on = input.conflictColumns.map((c) => `${alias}.${c} = S.${c}`).join(' AND ');
+    const cols = input.columns.join(', ');
+    let matched = '';
+    if (input.update) {
+      const update = input.update(params, { target: alias, incoming: 'S' });
+      matched =
+        `WHEN MATCHED${update.where ? ` AND (${update.where})` : ''} ` +
+        `THEN UPDATE SET ${update.setClauses.join(', ')} `;
+    }
+    return {
+      sql:
+        `MERGE INTO ${input.table} WITH (HOLDLOCK) AS ${alias} ` +
+        `USING (VALUES ${tuples}) AS S (${cols}) ON (${on}) ` +
+        matched +
+        `WHEN NOT MATCHED THEN INSERT (${cols}) VALUES (${input.columns.map((c) => `S.${c}`).join(', ')})` +
+        `${mssqlOutput(input.returning, 'INSERTED')};`,
+      params,
+    };
   },
 
   // UPDATE/DELETE inject OUTPUT mid-statement (between SET and WHERE / FROM and

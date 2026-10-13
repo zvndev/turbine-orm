@@ -73,6 +73,7 @@ import {
 import {
   type BuiltStatement,
   type BulkInsertStatementInput,
+  type BulkUpsertStatementInput,
   type ColumnDefinitionInput,
   type ColumnTypeInput,
   type CreateIndexStatementInput,
@@ -609,6 +610,9 @@ function mysqlColumnType(type: string, maxLength?: number | null): string {
 // mysqlDialect, the full Dialect contract for MySQL 8
 // ---------------------------------------------------------------------------
 
+/** The row alias a multi-row upsert gives its incoming rows (`AS ... ON DUPLICATE KEY UPDATE`). */
+const MYSQL_INCOMING_ALIAS = '`turbine_excluded`';
+
 /**
  * MySQL 8 implementation of the {@link Dialect} contract. Backtick identifier
  * quoting, named `:pN` placeholders (NOT positional `?`, see the module
@@ -855,6 +859,38 @@ export const mysqlDialect: Dialect = {
     return {
       sql: `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES ${placeholders}${conflict}`,
       params: input.rowValues.flat(),
+    };
+  },
+
+  buildBulkUpsertStatement(input: BulkUpsertStatementInput): BuiltStatement {
+    // 8.0.19's row alias (`VALUES(col)` is deprecated since 8.0.20). There is
+    // no conflict target: ON DUPLICATE KEY UPDATE fires on whichever unique key
+    // a row violates, which is why the builder refuses a table where another
+    // key's columns are in the data, and why it refuses `ignore` and a
+    // conflict predicate (this grammar has no slot for one).
+    if (!input.update) {
+      throw new UnsupportedFeatureError(
+        'createMany onConflict { ignore: true }',
+        'mysql',
+        'MySQL cannot tell the inserted rows from the skipped ones afterwards; use onConflict: { target, update }.',
+      );
+    }
+    let n = 0;
+    const tuples = input.rowValues.map((row) => `(${row.map(() => this.paramPlaceholder(++n)).join(', ')})`).join(', ');
+    const params = input.rowValues.flat();
+    const update = input.update(params, { target: input.table, incoming: MYSQL_INCOMING_ALIAS });
+    if (update.where) {
+      throw new UnsupportedFeatureError(
+        'A predicate on createMany onConflict',
+        'mysql',
+        'ON DUPLICATE KEY UPDATE has no WHERE slot.',
+      );
+    }
+    return {
+      sql:
+        `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES ${tuples} AS ${MYSQL_INCOMING_ALIAS} ` +
+        `ON DUPLICATE KEY UPDATE ${update.setClauses.join(', ')}`,
+      params,
     };
   },
 

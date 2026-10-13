@@ -659,10 +659,11 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
   const overrides = resolveColumnTypeOverrides(schema, options?.columnTypes);
   const lines: string[] = [...generatedFileHeader(options)];
 
-  // UpdateOperatorInput lets the generated *Update types express atomic
-  // operators. RelationDescriptor is the brand that lets `WithResult` recurse
-  // through nested `with` clauses at any depth.
-  lines.push("import type { RelationDescriptor, UpdateOperatorInput } from 'turbine-orm';");
+  // UpdateOperatorInput, SqlExpr and ColumnRef let the generated *Update
+  // types express atomic operators, `expr.*` update expressions and `col()`.
+  // RelationDescriptor is the brand that lets `WithResult` recurse through
+  // nested `with` clauses at any depth.
+  lines.push("import type { ColumnRef, RelationDescriptor, SqlExpr, UpdateOperatorInput } from 'turbine-orm';");
   lines.push('');
 
   // Relations that can be surfaced in the type layer, computed once per table
@@ -1838,11 +1839,12 @@ function snakeToCamelStr(s: string): string {
 }
 
 /**
- * Build the update-input field type for a column: the plain value, or the
+ * Build the update-input field type for a column: the plain value, the
  * {@link UpdateOperatorInput} object (`{ set }` on every column, plus
  * `increment` / `decrement` / `multiply` / `divide` when the type includes
- * `number`), matching what `update()` accepts at runtime.
+ * `number`), an `expr.*` update expression or a `col()` reference, matching
+ * what `update()` accepts at runtime and the core `UpdateData` type.
  */
 function updateFieldType(tsType: string): string {
-  return `${tsType} | UpdateOperatorInput<${tsType}>`;
+  return `${tsType} | UpdateOperatorInput<${tsType}> | SqlExpr<${tsType}> | ColumnRef`;
 }

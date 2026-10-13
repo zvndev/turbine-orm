@@ -60,6 +60,36 @@ export interface BulkInsertStatementInput {
   requireRowValues?: boolean;
 }
 
+/**
+ * The rendered references a multi-row upsert's conflict-UPDATE reads through:
+ * the existing row (`"daily_stats"`, SQL Server's MERGE alias `T`) and the
+ * proposed row (`EXCLUDED`, `excluded`, MySQL's row alias, `S`). The
+ * statement hook names them, because it is the statement that declares them.
+ */
+export interface BulkUpsertRefs {
+  readonly target: string;
+  readonly incoming: string;
+}
+
+/** The compiled conflict-UPDATE of a multi-row upsert. */
+export interface BulkUpsertUpdate {
+  /** `col = expr` assignments, columns bare on the left. */
+  readonly setClauses: string[];
+  /** A predicate on the existing row (no `WHERE` keyword), or `null`. */
+  readonly where: string | null;
+}
+
+export interface BulkUpsertStatementInput extends BulkInsertStatementInput {
+  /** SQL-ready quoted conflict-target columns (a primary key or one unique key). */
+  conflictColumns: string[];
+  /**
+   * Compile the conflict-UPDATE. Called once, AFTER the row values are bound,
+   * with the statement's params so its own placeholders continue after them.
+   * `null` skips conflicting rows instead (`DO NOTHING`).
+   */
+  update: ((params: unknown[], refs: BulkUpsertRefs) => BulkUpsertUpdate) | null;
+}
+
 export interface DefaultValuesInsertStatementInput {
   /** SQL-ready quoted table name. */
   table: string;
@@ -595,6 +625,15 @@ export interface Dialect {
   readonly supportsBulkUpsert?: boolean;
 
   /**
+   * The alias this dialect's upsert statement gives its target table (SQL
+   * Server's `MERGE ... AS T`), which the conflict-UPDATE's column references
+   * must use. Absent: the statement names the table directly and references
+   * are qualified with the table name. Set only by an engine whose upsert
+   * aliases its target, so no other engine can inherit it.
+   */
+  readonly upsertTargetAlias?: string;
+
+  /**
    * How this dialect surfaces a query plan for a compiled SELECT. When present,
    * `QueryInterface.explain()` prepends `prefix` (plus a single space) to the
    * compiled findMany SQL and runs it as a read, returning the plan text lines.
@@ -637,6 +676,16 @@ export interface Dialect {
 
   /** Build an upsert statement. Inputs are SQL-ready quoted fragments. */
   buildUpsertStatement(input: UpsertStatementInput): string;
+
+  /**
+   * Build a multi-row upsert (`createMany({ onConflict })`): insert the rows
+   * and, for each row whose conflict key already exists, run `input.update`'s
+   * assignments or skip it. Returns the statement and its params, the row
+   * values first. Reached only when {@link supportsBulkUpsert} is true, and
+   * every engine that sets that flag implements this itself (each one's
+   * grammar differs), so the PostgreSQL version is never inherited by use.
+   */
+  buildBulkUpsertStatement?(input: BulkUpsertStatementInput): BuiltStatement;
 
   /** Whether native ILIKE is supported. */
   readonly supportsILike: boolean;
@@ -942,7 +991,9 @@ const BIND_PARAMETER_LIMITS: Readonly<Record<string, number>> = {
   postgresql: 65535,
   mysql: 65535,
   sqlite: 32766,
-  mssql: 2100,
+  // The server allows 2100, but the driver binds two of its own (see
+  // MSSQL_MAX_PARAMS in mssql.ts): measured, 2098 runs and 2099 is refused.
+  mssql: 2098,
 };
 
 /** The bind-parameter limit for one statement on this dialect, if known. */
@@ -951,6 +1002,59 @@ export function maxBindParameters(dialect: Pick<Dialect, 'name' | 'maxBindParame
     dialect.maxBindParameters ??
     (Object.hasOwn(BIND_PARAMETER_LIMITS, dialect.name) ? BIND_PARAMETER_LIMITS[dialect.name] : undefined)
   );
+}
+
+/**
+ * PostgreSQL's multi-row `INSERT INTO t (cols) ...` with no conflict clause and
+ * no RETURNING: the shared body of `createMany` and its `onConflict` form.
+ *
+ * The default is `SELECT * FROM UNNEST($1::text[], ...)`, one bound array per
+ * COLUMN. The row-major form (`requireRowValues`) is required when a target
+ * column is itself array-typed, because the UNNEST transpose flattens nested
+ * arrays: one placeholder per cell instead of per column.
+ */
+function pgBulkInsertBody(dialect: Dialect, input: BulkInsertStatementInput): BuiltStatement {
+  if (!input.columnArrayTypes || input.columnArrayTypes.length !== input.columns.length) {
+    throw new ValidationError(
+      `createMany bulk insert into "${input.table}": columnArrayTypes must supply one UNNEST cast ` +
+        `per column, got ${input.columnArrayTypes?.length ?? 0} for ${input.columns.length} columns ` +
+        `(${input.columns.join(', ')}). Schema metadata is missing a pgType for at least one column; ` +
+        'regenerate it with `npx turbine generate`.',
+    );
+  }
+  if (input.requireRowValues) {
+    const params: unknown[] = [];
+    const tuples = input.rowValues.map((row) => {
+      const cells = input.columns.map((_, i) => {
+        params.push(row[i]);
+        // No cast: PostgreSQL infers each parameter's type from the INSERT
+        // target column, which is what single-row `create` already relies on
+        // and is what makes arrays and enums both work here. The casts in
+        // `columnArrayTypes` are ARRAY-OF-column-type, correct for the
+        // UNNEST transpose but wrong for an individual cell.
+        return dialect.paramPlaceholder(params.length);
+      });
+      return `(${cells.join(', ')})`;
+    });
+    return { sql: `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES ${tuples.join(', ')}`, params };
+  }
+  const columnArrays = input.columns.map((_, columnIndex) => input.rowValues.map((row) => row[columnIndex]));
+  const unnestArgs = input.columns.map((_, i) => `${dialect.paramPlaceholder(i + 1)}::${input.columnArrayTypes![i]}`);
+  return {
+    sql: `INSERT INTO ${input.table} (${input.columns.join(', ')}) SELECT * FROM UNNEST(${unnestArgs.join(', ')})`,
+    params: columnArrays,
+  };
+}
+
+/**
+ * `DO NOTHING`, or `DO UPDATE SET ... [WHERE ...]`: the action of an
+ * `ON CONFLICT (target)` clause, shared by PostgreSQL and SQLite, whose
+ * grammars agree here. The update compiles after the row values are bound.
+ */
+export function onConflictAction(input: BulkUpsertStatementInput, params: unknown[], refs: BulkUpsertRefs): string {
+  if (!input.update) return 'DO NOTHING';
+  const update = input.update(params, refs);
+  return `DO UPDATE SET ${update.setClauses.join(', ')}${update.where ? ` WHERE ${update.where}` : ''}`;
 }
 
 export const postgresDialect: Dialect = {
@@ -1037,42 +1141,23 @@ export const postgresDialect: Dialect = {
   },
 
   buildBulkInsertStatement(input: BulkInsertStatementInput): BuiltStatement {
-    if (!input.columnArrayTypes || input.columnArrayTypes.length !== input.columns.length) {
-      throw new ValidationError(
-        `createMany bulk insert into "${input.table}": columnArrayTypes must supply one UNNEST cast ` +
-          `per column, got ${input.columnArrayTypes?.length ?? 0} for ${input.columns.length} columns ` +
-          `(${input.columns.join(', ')}). Schema metadata is missing a pgType for at least one column; ` +
-          'regenerate it with `npx turbine generate`.',
-      );
-    }
+    const body = pgBulkInsertBody(this, input);
+    const conflict = input.skipDuplicates ? ' ON CONFLICT DO NOTHING' : '';
+    return { sql: `${body.sql}${conflict}${this.buildReturningClause(input.returning)}`, params: body.params };
+  },
 
-    // Row-major form: required when a target column is itself array-typed,
-    // because the UNNEST transpose below flattens nested arrays (see
-    // `requireRowValues`). One placeholder per cell instead of per column.
-    if (input.requireRowValues) {
-      const params: unknown[] = [];
-      const tuples = input.rowValues.map((row) => {
-        const cells = input.columns.map((_, i) => {
-          params.push(row[i]);
-          // No cast: PostgreSQL infers each parameter's type from the INSERT
-          // target column, which is what single-row `create` already relies on
-          // and is what makes arrays and enums both work here. The casts in
-          // `columnArrayTypes` are ARRAY-OF-column-type, correct for the
-          // UNNEST transpose below but wrong for an individual cell.
-          return this.paramPlaceholder(params.length);
-        });
-        return `(${cells.join(', ')})`;
-      });
-      let rowSql = `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES ${tuples.join(', ')}`;
-      if (input.skipDuplicates) rowSql += ' ON CONFLICT DO NOTHING';
-      return { sql: `${rowSql}${this.buildReturningClause(input.returning)}`, params };
-    }
-
-    const columnArrays = input.columns.map((_, columnIndex) => input.rowValues.map((row) => row[columnIndex]));
-    const unnestArgs = input.columns.map((_, i) => `${this.paramPlaceholder(i + 1)}::${input.columnArrayTypes![i]}`);
-    let sql = `INSERT INTO ${input.table} (${input.columns.join(', ')}) SELECT * FROM UNNEST(${unnestArgs.join(', ')})`;
-    if (input.skipDuplicates) sql += ' ON CONFLICT DO NOTHING';
-    return { sql: `${sql}${this.buildReturningClause(input.returning)}`, params: columnArrays };
+  buildBulkUpsertStatement(input: BulkUpsertStatementInput): BuiltStatement {
+    // `INSERT ... SELECT * FROM UNNEST(...) ON CONFLICT ... DO UPDATE ... WHERE
+    // ... RETURNING` is valid as is: PostgreSQL has no parse ambiguity between
+    // the SELECT and the conflict clause.
+    const body = pgBulkInsertBody(this, input);
+    return {
+      sql:
+        `${body.sql} ON CONFLICT (${input.conflictColumns.join(', ')}) ` +
+        onConflictAction(input, body.params, { target: input.table, incoming: 'EXCLUDED' }) +
+        this.buildReturningClause(input.returning),
+      params: body.params,
+    };
   },
 
   buildDefaultValuesInsertStatement(input: DefaultValuesInsertStatementInput): string {
