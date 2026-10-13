@@ -30,7 +30,7 @@ import { TurbineClient } from '../client.js';
 import { col, expr, UNSAFE } from '../index.js';
 import { introspect } from '../introspect.js';
 import type { SchemaMetadata } from '../schema.js';
-import { skipGate } from './helpers.js';
+import { type GatedRunners, skipGate } from './helpers.js';
 
 // biome-ignore lint/suspicious/noExplicitAny: engine clients are TurbineClient subclasses loaded dynamically
 type Any = any;
@@ -76,7 +76,8 @@ type EngineName = keyof typeof DDL;
 
 interface Live {
   name: EngineName;
-  skip: string;
+  /** The suite's runners, skipped with a stated reason when the engine is not reachable. */
+  gate: GatedRunners;
   connect(): Promise<void>;
   /** The client the tests drive. */
   db(): Any;
@@ -97,7 +98,7 @@ function sqliteLive(): Live {
   let c: Any;
   return {
     name: 'sqlite',
-    skip: DatabaseSync ? '' : 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)',
+    gate: skipGate(!DatabaseSync, 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)'),
     async connect() {
       const { introspectSqliteDatabase, turbineSqlite } = await import('../sqlite.js');
       const db = new DatabaseSync!(':memory:');
@@ -121,7 +122,7 @@ function postgresLive(): Live {
   let c: TurbineClient;
   return {
     name: 'postgresql',
-    skip: DATABASE_URL ? '' : 'requires DATABASE_URL',
+    gate: skipGate(!DATABASE_URL, 'requires DATABASE_URL'),
     async connect() {
       raw = new pg.Client({ connectionString: DATABASE_URL });
       await raw.connect();
@@ -159,7 +160,7 @@ function mysqlLive(): Live {
   };
   return {
     name: 'mysql',
-    skip: MYSQL_URL ? '' : 'requires MYSQL_URL pointing at a MySQL 8.0.19+ database',
+    gate: skipGate(!MYSQL_URL, 'requires MYSQL_URL pointing at a MySQL 8.0.19+ database'),
     async connect() {
       const { createPool } = await import('mysql2/promise');
       const { MysqlPool, introspectMysqlWith, turbineMysql } = await import('../mysql.js');
@@ -208,7 +209,7 @@ function mssqlLive(): Live {
   };
   return {
     name: 'mssql',
-    skip: MSSQL_URL ? '' : 'requires MSSQL_URL pointing at a SQL Server 2016+ instance',
+    gate: skipGate(!MSSQL_URL, 'requires MSSQL_URL pointing at a SQL Server 2016+ instance'),
     async connect() {
       const specifier: string = 'mssql';
       const mod: Any = await import(specifier);
@@ -361,7 +362,7 @@ const FIELD: Record<string, string> = { outI: 'out_i', outT: 'out_t' };
 // ---------------------------------------------------------------------------
 
 for (const live of [sqliteLive(), postgresLive(), mysqlLive(), mssqlLive()]) {
-  const { it, before, after } = skipGate(Boolean(live.skip), live.skip || 'unreachable');
+  const { it, before, after } = live.gate;
 
   describe(`update expressions on ${live.name}`, () => {
     before(async () => {
