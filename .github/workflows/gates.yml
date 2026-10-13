@@ -323,6 +323,7 @@ jobs:
         env:
           DATABASE_URL: postgres://root@localhost:26257/turbine_test?sslmode=disable
           TURBINE_TEST_ENGINE: cockroachdb
+          TURBINE_REQUIRE_ENGINE: postgres
       - name: Run the NOWAIT and SKIP LOCKED row-lock tests against CockroachDB
         # Only the two tests whose semantics CockroachDB shares. The rest of the
         # file reads pg_locks and the PostgreSQL four-mode matrix.

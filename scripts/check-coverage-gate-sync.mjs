@@ -25,7 +25,8 @@
  *
  * The converse is checked too: a gate that names a file nobody collects
  * measures nothing and passes, which is the same failure wearing the other
- * face.
+ * face. So is a gate that `test:coverage:cli` never runs: it names a file and
+ * enforces nothing, so it cannot count as holding one.
  *
  * ## Fails closed
  *
@@ -89,6 +90,22 @@ if (collected.length === 0 || perFileGates.length === 0) {
 }
 
 const problems = [];
+
+// A gate only holds a file if the lane actually runs it.
+const LANE = 'test:coverage:cli';
+const invoked = new Set([...String(scripts[LANE] ?? '').matchAll(/npm run ([^\s&;|]+)/g)].map((m) => m[1]));
+if (invoked.size === 0) {
+  console.error(`check-coverage-gate-sync: "${LANE}" runs no npm scripts; the lane has been renamed. Refusing to pass.`);
+  process.exit(1);
+}
+for (const key of [COLLECT, AGGREGATE, ...perFileGates]) {
+  if (!invoked.has(key)) {
+    problems.push(
+      `"${key}" is never run by ${LANE}, so it enforces nothing and holds no file.\n` +
+        `      Fix: add "npm run ${key}" to ${LANE}, or delete it.`,
+    );
+  }
+}
 
 for (const file of collected) {
   const gate = perFileTargets.get(file);
