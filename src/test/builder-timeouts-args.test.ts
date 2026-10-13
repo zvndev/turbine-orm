@@ -193,23 +193,50 @@ describe('middleware sees read-only args', () => {
 describe('per-query options are validated', () => {
   const users = () => makeQuery('users', schema());
 
-  it('timeout must be a positive finite number of milliseconds up to 2147483647', () => {
-    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31, '100', null, true]) {
+  it('timeout is 0 (none) or a positive finite number of milliseconds up to 2147483647', () => {
+    for (const bad of [-1, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31, '100', null, true]) {
       assert.throws(
         () => users().buildFindMany({ timeout: bad as never, limit: 1 }),
-        (err: unknown) => isE003(err) && /`timeout` on users must be a positive number/.test((err as Error).message),
+        (err: unknown) =>
+          isE003(err) &&
+          /`timeout` on users must be a positive number of milliseconds up to 2147483647, or 0 for no timeout/.test(
+            (err as Error).message,
+          ),
         String(bad),
       );
     }
-    for (const good of [1, 0.5, 30_000, 2_147_483_647]) users().buildFindMany({ timeout: good, limit: 1 });
+    for (const good of [0, 1, 0.5, 30_000, 2_147_483_647]) users().buildFindMany({ timeout: good, limit: 1 });
   });
 
   it('timeout is validated on writes too', () => {
     assert.throws(() => users().buildCreate({ data: { email: 'a' }, timeout: -5 } as never), isE003);
     assert.throws(
-      () => users().buildUpdateMany({ where: { id: 1 }, data: { name: 'b' }, timeout: 0 } as never),
+      () => users().buildUpdateMany({ where: { id: 1 }, data: { name: 'b' }, timeout: -1 } as never),
       isE003,
     );
+    users().buildUpdateMany({ where: { id: 1 }, data: { name: 'b' }, timeout: 0 } as never);
+  });
+
+  it('timeout: 0 sets no timer, so a slow query completes; a short timeout still rejects', async () => {
+    const slow = (): QueryInterface<Record<string, unknown>> => {
+      const pool = {
+        query: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 80));
+          return { rows: [{ id: 1 }], rowCount: 1 };
+        },
+        connect: async () => {
+          throw new Error('this test pool hands out no connections');
+        },
+      };
+      return new QueryInterface(pool as unknown as PgCompatPool, 'users', schema(), []);
+    };
+    assert.deepEqual(await slow().findMany({ timeout: 0 }), [{ id: 1 }]);
+    await assert.rejects(slow().findMany({ timeout: 20 }), (err: unknown) => err instanceof TimeoutError);
+    await assert.rejects(
+      slow().update({ where: { id: 1 }, data: { name: 'b' }, timeout: 20 } as never),
+      (err: unknown) => err instanceof TimeoutError,
+    );
+    assert.deepEqual(await slow().update({ where: { id: 1 }, data: { name: 'b' }, timeout: 0 } as never), { id: 1 });
   });
 
   it('relationLoadStrategy must be one of the four strategies, per query and per client', () => {

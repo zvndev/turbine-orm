@@ -650,8 +650,9 @@ const RELATION_LOAD_STRATEGIES: readonly RelationLoadStrategy[] = Object.freeze(
   'flatten',
 ] as const);
 
+/** A per-query `timeout`: milliseconds up to {@link MAX_TIMEOUT_MS}, or 0 for none (the same rule as `$transaction`). */
 function isValidTimeout(value: unknown): boolean {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= MAX_TIMEOUT_MS;
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= MAX_TIMEOUT_MS;
 }
 
 /** A short, value-safe rendering of a rejected option value. */
@@ -1495,8 +1496,8 @@ export class QueryInterface<
     const { timeout, relationLoadStrategy } = args as { timeout?: unknown; relationLoadStrategy?: unknown };
     if (timeout !== undefined && !isValidTimeout(timeout)) {
       throw new ValidationError(
-        `\`timeout\` on ${this.table} must be a positive number of milliseconds up to ${MAX_TIMEOUT_MS} ` +
-          `(received ${describeOptionValue(timeout)}). Leave it out for no timeout.`,
+        `\`timeout\` on ${this.table} must be a positive number of milliseconds up to ${MAX_TIMEOUT_MS}, or 0 for ` +
+          `no timeout (received ${describeOptionValue(timeout)}). Leave it out for no timeout.`,
       );
     }
     if (relationLoadStrategy !== undefined && !RELATION_LOAD_STRATEGIES.includes(relationLoadStrategy as never)) {
@@ -2856,11 +2857,13 @@ export class QueryInterface<
   private async queryWithTimeout(
     sql: string,
     params: unknown[],
-    timeout?: number,
+    requestedTimeout?: number,
     preparedName?: string,
     retryIfStale = false,
     pool: PgCompatPool = this.pool,
   ): Promise<PgCompatQueryResult> {
+    // 0 is no timeout, as it is for `$transaction`'s option and the server's statement_timeout.
+    const timeout = requestedTimeout === 0 ? undefined : requestedTimeout;
     if (timeout !== undefined && pool === this.pool && this.cancelsOnTimeout()) {
       return this.queryCancellable(sql, params, timeout, preparedName, retryIfStale);
     }
@@ -3451,10 +3454,10 @@ export class QueryInterface<
    * If no middlewares are registered, executes directly.
    *
    * Middleware can inspect and log query parameters, measure timing, and
-   * transform the result returned by `next()`. `params.args` is read-only at
-   * every depth (see `readOnlyMiddlewareParams`): the query is compiled from
-   * the caller's args, so a rewrite throws a TypeError. Cross-cutting filters
-   * (e.g. soft deletes) belong in the query itself, or in `globalFilters`.
+   * transform the result returned by `next()`. `params.args` is a plain copy
+   * (see `readOnlyMiddlewareParams`): the query is compiled from the caller's
+   * args, so `next()` throws a TypeError when the copy was changed. Cross-cutting
+   * filters (e.g. soft deletes) belong in the query itself, or in `globalFilters`.
    */
   private async executeWithMiddleware<R>(
     action: string,
@@ -3472,8 +3475,8 @@ export class QueryInterface<
       return executor();
     }
 
-    // Read-only at every depth: the query is compiled from `args`, not from
-    // what middleware sees, so a rewrite throws rather than doing nothing.
+    // A copy: the query is compiled from `args`, not from what middleware
+    // sees, so `next()` throws on a changed copy rather than doing nothing.
     const params = readOnlyMiddlewareParams(this.table, action, args);
 
     // Build middleware chain

@@ -805,17 +805,17 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
   /**
    * The per-query `timeout` and `relationLoadStrategy`, checked with the SQL
    * engines' rule and message: a timeout is a positive number of ms up to
-   * {@link MAX_TIMEOUT_MS}, a strategy one of the SQL engines' values.
+   * {@link MAX_TIMEOUT_MS} (or 0 for none), a strategy one of the SQL engines' values.
    */
   private assertQueryOptions(args: object): void {
     const { timeout, relationLoadStrategy } = args as { timeout?: unknown; relationLoadStrategy?: unknown };
     if (
       timeout !== undefined &&
-      !(typeof timeout === 'number' && Number.isFinite(timeout) && timeout > 0 && timeout <= MAX_TIMEOUT_MS)
+      !(typeof timeout === 'number' && Number.isFinite(timeout) && timeout >= 0 && timeout <= MAX_TIMEOUT_MS)
     ) {
       throw new ValidationError(
-        `\`timeout\` on ${this.table} must be a positive number of milliseconds up to ${MAX_TIMEOUT_MS} ` +
-          `(received ${describeOptionValue(timeout)}). Leave it out for no timeout.`,
+        `\`timeout\` on ${this.table} must be a positive number of milliseconds up to ${MAX_TIMEOUT_MS}, or 0 for ` +
+          `no timeout (received ${describeOptionValue(timeout)}). Leave it out for no timeout.`,
       );
     }
     if (relationLoadStrategy !== undefined && !RELATION_LOAD_STRATEGIES.includes(relationLoadStrategy as string)) {
@@ -2430,8 +2430,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     // define them.
     warnUnknownQueryOptions(this.table, action, args);
     if (this.middlewares.length === 0) return executor();
-    // Read-only at every depth, as on the SQL engines: the statement is built
-    // from `args`, not from what middleware sees, so a rewrite throws rather
+    // A copy, as on the SQL engines: the statement is built from `args`, not
+    // from what middleware sees, so `next()` throws on a changed copy rather
     // than doing nothing.
     const params = readOnlyMiddlewareParams(this.table, action, args);
     let index = 0;

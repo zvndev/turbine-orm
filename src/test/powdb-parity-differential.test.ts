@@ -123,7 +123,11 @@ const ALL_USERS = [1, 2, 3, 4, 5, 6];
 //   comments likes: 1=3 2=NULL 3=0 4=10 5=1 6=NULL 7=2
 const CASES: Case[] = [
   // --- options, middleware and paging (builder parity) ---------------------
-  { id: 'timeout of zero', run: users({}, { timeout: 0 }), expect: E003 },
+  {
+    id: 'timeout of zero means no timeout',
+    run: users({}, { timeout: 0 }),
+    expect: ALL_USERS,
+  },
   { id: 'negative timeout', run: users({}, { timeout: -5 }), expect: E003 },
   { id: 'timeout past the timer range', run: users({}, { timeout: 3_000_000_000 }), expect: E003 },
   { id: 'timeout as a string', run: users({}, { timeout: '100' }), expect: E003 },
