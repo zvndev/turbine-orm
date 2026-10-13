@@ -106,7 +106,7 @@ const config: TurbineCliConfig = {
 };
 ```
 
-The type replaces the column's row, create and update types. Its text is emitted verbatim, so an `import()` type resolves from the generated directory, and `| null` is still added for a nullable column. A value must be one line. A key naming no table or column, a key not in `table.column` form, or a value with a line break throws `ValidationError` (`TURBINE_E003`) with the closest name. A key for a table that `include` / `exclude` leaves out is skipped.
+The type replaces the column's row, create and update types. Its text is emitted verbatim, so an `import()` type resolves from the generated directory, and `| null` is still added for a nullable column. A value must be one TypeScript type on one line, by the same rule as [`tsType`](/schema#typing-a-json-column-tstype). A key naming no table or column, a key not in `table.column` form, or a value that is not one type throws `ValidationError` (`TURBINE_E003`) with the closest name. A key for a table that `include` / `exclude` leaves out is skipped, but only when the database has that table: with `include` set, a misspelt table name is still refused with a suggestion, at the cost of one extra catalog read.
 
 A schema file can declare the same thing next to the column with [`tsType`](/schema#typing-a-json-column-tstype). When both name one column, `columnTypes` wins.
 
@@ -210,6 +210,8 @@ npx turbine push --dry-run               # Preview generated SQL without executi
 npx turbine push --dry-run --exit-code   # CI: exit 2 when the database differs, 0 when in sync
 ```
 
+`--exit-code` also exits 2 when the diff carries a warning it cannot apply, such as a declared `UNIQUE` index over a non-unique index of the same name, a removed enum label, or an undeclared index on a table that manages its indexes. Two things stay at 0: what the diff says it does not compare, and a named `CHECK` whose stored text differs only because PostgreSQL rewrites the expression it was given (the warning is still printed).
+
 `push` diffs `turbine/schema.ts` against the live database and executes the difference as a single transaction. Safe to re-run: it is a no-op when the schema already matches. For production deploys, use migrations instead.
 
 `push` reports "already in sync" only when the diff has nothing left to say; otherwise it lists what the diff does not compare (see [Migrations in Practice](/migrate#what---auto-can-and-cannot-do)).
@@ -275,6 +277,8 @@ npx turbine migrate up
 npx turbine migrate up --dry-run
 ```
 
+`migrate up`, `migrate deploy` and `migrate down` refuse a transaction-pooler connection string (a `pooler` or `pgbouncer` hostname, or port 6543 or 6432) before they connect, and exit 1. The advisory lock is session-level, so through a pooler it can be taken on one backend and released on another. Point them at the direct endpoint, or pass `--allow-pooler` to override. `--dry-run`, `migrate status` and `migrate create` are not refused.
+
 Checks for checksum mismatches before applying: if a previously-applied migration file has been edited, the command halts and reports the conflict. Pass `--allow-drift` to bypass that check when you are intentionally rewriting history. Use `--step N` to apply only the first `N` pending migrations.
 
 ### Destructive-migration guard
@@ -323,7 +327,7 @@ Show which migrations have been applied and which are pending.
 
 ```bash
 npx turbine migrate status
-npx turbine migrate status --exit-code   # CI: exit 2 on pending, modified or missing migrations
+npx turbine migrate status --exit-code   # CI: exit 2 on pending, modified, missing or misnamed migrations
 ```
 
 Example output:
@@ -390,7 +394,7 @@ npx turbine doctor --json
 
 Turbine loads `with` relations as correlated subqueries: the child table is probed once per parent row (`child.fk = parent.pk`). An unindexed probe column therefore costs a full table scan per parent. Schemas migrated from batched-loader ORMs routinely lack these indexes. `doctor` introspects the database, derives every column set relations will probe (hasMany/hasOne child FKs, belongsTo reference keys, many-to-many junction keys), and reads live Postgres statistics to score each finding.
 
-`doctor` reads session-scoped statistics, so it refuses a transaction-pooler endpoint (a `pooler`/`pgbouncer` hostname or a known pooling port; exit 1). Point it at the direct endpoint, or pass `--allow-pooler` to override.
+`doctor` reads session-scoped statistics, so it refuses a transaction-pooler endpoint (a `pooler`/`pgbouncer` hostname or a known pooling port; exit 1). Point it at the direct endpoint, or pass `--allow-pooler` to override. The migration commands that take the advisory lock refuse the same endpoints, see [`migrate up`](#turbine-migrate-up).
 
 ### Three-tier triage
 

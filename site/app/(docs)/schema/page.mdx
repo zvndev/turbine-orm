@@ -66,6 +66,8 @@ defineSchema({
 
 In a TypeScript object literal the same key is also a compile error. Before 0.90 such a key was ignored, so the DDL silently lacked what it asked for: a misspelt `default` emitted no `DEFAULT`, and `uniq` on an index emitted a non-unique one.
 
+Two more shapes throw the same error: a table or column named `__proto__` (JavaScript reads that key as the prototype setter, so the column could not be stored or queried), and an index that declares both `columns` and `docField` (declare two indexes instead).
+
 ### Typing a JSON column, `tsType`
 
 A `json` / `jsonb` column generates as `unknown`. Give it a type with `tsType`, in the object form or on the fluent builder:
@@ -81,7 +83,7 @@ export default defineSchema({
 // fluent: column.jsonb().tsType('{ theme: string; beta?: boolean }')
 ```
 
-`turbine generate` uses it for the column's row, create and update types. The text is emitted verbatim, so it may name any type the generated file can see (`import('../src/types.js').Settings`). `| null` is still added for a nullable column. It must be one line: text that is empty or contains a line break or other control character throws. The same override can live in `turbine.config.ts` as [`columnTypes`](/cli#typing-columns-columntypes); when both name one column, the config entry wins.
+`turbine generate` uses it for the column's row, create and update types. The text is emitted verbatim, so it may name any type the generated file can see (`import('../src/types.js').Settings`). `| null` is still added for a nullable column. It must be one TypeScript type on one line, or `defineSchema` throws `ValidationError` (`TURBINE_E003`) naming the text: no comments, no `;` or `,` outside brackets, balanced brackets, no template literal types and no backticks. Object types, generics, unions, function types and `import('...').T` are fine; give anything else a type alias and import it. A declared type changes only the generated TypeScript: the runtime metadata keeps the column's mapped type, so the engines read and write the column as its database type. The same override can live in `turbine.config.ts` as [`columnTypes`](/cli#typing-columns-columntypes); when both name one column, the config entry wins.
 
 ### Composite primary keys
 
@@ -317,6 +319,8 @@ await schemaPush(schema, url, { dryRun: true });
 `schemaPush(schema, connectionString, options?)` accepts `{ dryRun, allowDestructive, precomputedDiff }`. If the computed diff contains a data-destroying statement (a lossy `ALTER COLUMN ... TYPE` and similar), it **throws** a `DestructivePushRefusal` (a `ValidationError` subclass carrying the offending statements on `.destructive`) and applies nothing, unless you pass `allowDestructive: true`. This is the same gate `turbine push` puts behind an interactive confirmation. `precomputedDiff` lets a caller diff once, show the plan, confirm, and then apply exactly the statements it displayed, rather than re-diffing.
 
 `schemaPush` and `schemaDiff` connect through `pg` and are **Postgres-only**. `schemaToSQL` has no connection and is not.
+
+With `{ dialect: mysqlDialect }`, `schemaToSQL` writes defaults the way MySQL accepts them. A non-`NULL` default on a `TEXT`, `BLOB` or `JSON` column becomes an expression (`DEFAULT ('member')`, `DEFAULT ('{}')`), a clock default on a `DATE` or `TIME` column becomes `(CURRENT_DATE)` or `(CURRENT_TIME)`, and on a `DATETIME(n)` it follows the column's precision (`CURRENT_TIMESTAMP(3)`). Before 0.90 MySQL rejected those statements. PostgreSQL, SQLite and SQL Server DDL is unchanged.
 
 ## SQL-first migrations
 

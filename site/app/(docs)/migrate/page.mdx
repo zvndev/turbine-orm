@@ -49,7 +49,8 @@ Both refuse while the migrations folder holds files the database has not applied
 - **Per-migration transactions.** Each migration runs inside its own `BEGIN` / `COMMIT`. If its SQL fails, that migration rolls back and nothing from it is recorded in `_turbine_migrations`.
 - **Stop on first error, partial apply.** A batch is processed in order and stops at the first failure. Migrations that already succeeded stay applied and recorded; the failing one and everything after it do not run. Fix the offending migration and re-run to continue.
 - **SHA-256 checksums.** Every applied migration's file is hashed. If an already-applied file changes on disk, `status` reports **drift** and `up` refuses to run until you reconcile (or pass `--allow-drift` when intentionally rewriting history).
-- **Advisory lock.** The runner takes a per-database Postgres advisory lock before applying, so two concurrent runs cannot race; the second exits with an error instead of double-applying. `migrate deploy --wait` waits for the lock instead (300 seconds by default, `--wait=600` to choose), then applies whatever is still pending, so two deploys started together both succeed. The wait polls the same non-blocking lock call, so it needs no session setting and is safe behind a pooler.
+- **Advisory lock.** The runner takes a per-database Postgres advisory lock before applying, so two concurrent runs cannot race; the second exits with an error instead of double-applying. `migrate deploy --wait` waits for the lock instead (300 seconds by default, `--wait=600` to choose), then applies whatever is still pending, so two deploys started together both succeed. The wait polls the same non-blocking lock call, so it needs no session setting.
+- **Direct endpoint only.** The advisory lock belongs to one database session, and a transaction pooler can take it on one backend and release it on another. So `migrate up`, `migrate deploy` and `migrate down` refuse a pooler connection string (a `pooler` or `pgbouncer` hostname, or port 6543 or 6432) before connecting. Use the direct endpoint, or pass `--allow-pooler` if you know the pooler runs in session mode. `--dry-run`, `status` and `create` are not refused.
 - **Configured schema.** With `schema` set in `turbine.config.ts` (or `--schema`), `migrate up` / `down` / `deploy` / `status` and `seed` connect with `search_path` pinned to that schema as a connection **startup parameter** (`options=-c search_path="<schema>",...`, never a session `SET`), so a migration's unqualified DDL and the `_turbine_migrations` table itself land in the schema `push`, `generate` and `doctor` already read. Since 0.78.0 that includes `public`, which used to be exempt: a role whose own path led with another schema had `push` and `migrate` writing to two different places.
 
   The pin **extends** the connection's own path rather than replacing it. The configured schema goes first, which is what an unqualified `CREATE` uses, and the names the connection already had follow, so an extension type installed in an `extensions` schema still resolves. Turbine reads those names by connecting once unpinned and asking `SHOW search_path`, because a startup parameter cannot read the path it overrides. Each inherited name must be a plain identifier to be re-emitted and is dropped otherwise; nothing is escaped into the value.
@@ -194,12 +195,15 @@ It generates a migration pre-filled with the expand/contract skeleton (the nulla
 Two commands take `--exit-code`, which makes them exit `2` on drift and `0` when everything matches. Without the flag their exit codes are unchanged.
 
 ```bash
-# The database differs from the schema file
+# The database differs from the schema file, or the diff carries a warning
 npx turbine push --dry-run --exit-code
 
-# A migration is pending, or an applied one was modified or is missing
+# A migration is pending, an applied one was modified or is missing,
+# or a .sql file in the directory is misnamed (the output names it)
 npx turbine migrate status --exit-code
 ```
+
+`push` fails the gate on a warning it cannot apply as well as on a statement: a declared `UNIQUE` index over a non-unique index of the same name, a removed enum label, an undeclared index on a table that manages its indexes. It stays at `0` for what the diff says it does not compare, and for a named `CHECK` whose stored text differs only because PostgreSQL rewrote the expression (the warning is still printed, so a real edit to a `CHECK` needs a reviewer).
 
 `--exit-code` is refused where it would do nothing (`push` without `--dry-run`, or any other command), and `--wait` is refused outside `migrate deploy`.
 
