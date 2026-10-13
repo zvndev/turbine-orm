@@ -87,6 +87,14 @@ export interface ColumnMetadata {
   pgTypeSchema?: string;
   /** TypeScript type string (e.g. 'number', 'string', 'Date') */
   tsType: string;
+  /**
+   * The TypeScript type a `defineSchema()` file declared for this column, WITHOUT
+   * `| null`. Only `turbine generate` reads it. Every engine branches on
+   * {@link tsType}, which stays the type mapped from the database type (MySQL
+   * boolean normalization and PowDB column types depend on that). Absent for
+   * introspected metadata and for columns that declare no type.
+   */
+  declaredTsType?: string;
   /** Whether the column allows NULL */
   nullable: boolean;
   /** Whether the column has a DEFAULT, is serial, or is generated */

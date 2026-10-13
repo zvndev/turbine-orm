@@ -220,9 +220,9 @@ export interface CodeFirstColumnTags {
   maxLength?: number;
   /**
    * The declared TypeScript type, WITHOUT nullability. On metadata built by
-   * {@link schemaDefToMetadata} it becomes the column's `tsType` (with
-   * `| null` added for a nullable column); `turbine generate` passes it to the
-   * generator as a `columnTypes` entry.
+   * {@link schemaDefToMetadata} it is the column's `declaredTsType`, never its
+   * `tsType`; `turbine generate` passes it to the generator as a `columnTypes`
+   * entry.
    */
   tsType?: string;
 }
@@ -433,6 +433,7 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
       // PK members and serials are NOT NULL in Postgres regardless of flags.
       const nullable = !(config.isPrimaryKey || config.isNotNull || serial);
 
+      const { tsType: declaredTsType, ...declaredTags } = declaredTagsOf(config);
       const col: ColumnMetadata = {
         name,
         field,
@@ -452,15 +453,10 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
         // through so query-layer projection, the updatedAt stamp and Studio
         // redaction can honor them. Only set when declared, keeping output
         // byte-stable for untagged schemas.
-        ...declaredTagsOf(config),
-        // After the tags: a declared `tsType` is the bare type, and the
-        // column's nullability still applies to it.
-        tsType:
-          config.tsType != null
-            ? nullable
-              ? `${config.tsType} | null`
-              : config.tsType
-            : pgTypeToTs(wireType, nullable),
+        ...declaredTags,
+        // Always the mapped type. A declared `tsType` rides along separately.
+        tsType: pgTypeToTs(wireType, nullable),
+        ...(declaredTsType !== undefined ? { declaredTsType } : {}),
       };
       columns.push(col);
 

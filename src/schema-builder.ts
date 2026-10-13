@@ -264,20 +264,67 @@ function resolveColumn(def: ColumnDef): ColumnConfig {
   };
 }
 
-/** Characters a declared `tsType` may not contain (the generator refuses the same set). */
+/** Characters a declared type may not contain (the generator refuses the same set). */
 // biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is this pattern's purpose
 const UNSAFE_TS_TYPE_TEXT = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
+/** Characters a type expression uses outside a string literal and a bracket. */
+const TS_TYPE_CHAR = /^[\p{L}\p{N}_$.:?|&!+\-= \t]$/u;
+
+const TS_TYPE_CLOSER: Readonly<Record<string, string>> = { '(': ')', '[': ']', '{': '}', '<': '>' };
+
 /**
- * A `tsType` is emitted verbatim into generated source, so it must be one line
- * of type text: a control or line-separator character could end the type and
- * start a statement.
+ * Why `text` cannot be written into a generated file as a TypeScript type, or
+ * null when it can. The text lands verbatim as a member type or an alias body,
+ * so what has to hold is that it stays ONE type: brackets balance, nothing at
+ * the top level ends the member (`;` or `,`), and it holds no comment, template
+ * literal or character a type does not use. A `//` would swallow the rest of the
+ * line and a stray `}` would close the interface and start a statement.
+ *
+ * It does not check that the type is well formed or that its names exist; the
+ * compiler of the generated file does that.
+ */
+export function tsTypeTextProblem(text: string): string | null {
+  if (text.trim() === '') return 'it is empty';
+  if (UNSAFE_TS_TYPE_TEXT.test(text)) return 'it contains a control or line-separator character';
+  const chars = Array.from(text);
+  const open: string[] = [];
+  for (let i = 0; i < chars.length; i++) {
+    const c = chars[i]!;
+    if (c === "'" || c === '"') {
+      let end = i + 1;
+      while (end < chars.length && chars[end] !== c) end += chars[end] === '\\' ? 2 : 1;
+      if (end >= chars.length) return `a ${c} string literal is not closed`;
+      if (chars.slice(i, end).join('').includes('*/')) return 'a string literal contains "*/"';
+      i = end;
+    } else if (c === '=' && chars[i + 1] === '>') {
+      i++;
+    } else if (TS_TYPE_CLOSER[c] !== undefined) {
+      open.push(TS_TYPE_CLOSER[c]!);
+    } else if (c === ')' || c === ']' || c === '}' || c === '>') {
+      if (open.pop() !== c) return `"${c}" closes a bracket that was never opened`;
+    } else if (c === ';' || c === ',') {
+      if (open.length === 0) return `"${c}" outside any brackets would end the type`;
+    } else if (c === '`') {
+      return 'a template literal type is not supported here, name it with a type alias and use import()';
+    } else if (!TS_TYPE_CHAR.test(c)) {
+      return `"${c}" cannot appear in a type${c === '/' ? ' (no comments)' : ''}`;
+    }
+  }
+  return open.length > 0 ? 'a bracket is not closed' : null;
+}
+
+/**
+ * A `tsType` is emitted verbatim into generated source, so it must be one type
+ * on one line (see {@link tsTypeTextProblem}).
  */
 function checkedTsType(tsType: string | undefined): string | null {
   if (tsType === undefined) return null;
-  if (typeof tsType !== 'string' || tsType.trim() === '' || UNSAFE_TS_TYPE_TEXT.test(tsType)) {
-    throw new Error(
-      `Invalid column "tsType" ${JSON.stringify(tsType)}: give a non-empty TypeScript type on one line, with no control characters.`,
+  const problem = typeof tsType === 'string' ? tsTypeTextProblem(tsType) : 'it is not a string';
+  if (problem !== null) {
+    throw new ValidationError(
+      `Invalid column "tsType" ${JSON.stringify(tsType)}: ${problem}. ` +
+        `Give one TypeScript type on one line, for example '{ theme: string }' or "import('../src/types.js').Settings".`,
     );
   }
   return tsType;
@@ -596,6 +643,38 @@ type TableKeyCheck<T> = T extends TableDef
 /** Rejects, in a literal, every key {@link defineSchema} would refuse at runtime. */
 export type SchemaKeyCheck<S> = { [A in keyof S]: TableKeyCheck<S[A]> };
 
+/**
+ * Refuse `__proto__` as a table or column name. `JSON.parse` can produce it as
+ * an own key, but assigning to it on a record sets the record's prototype
+ * instead of adding a key, so the column would vanish without a word.
+ */
+function assertOrdinaryName(name: string, what: string): void {
+  if (name === '__proto__') {
+    throw new ValidationError(
+      `defineSchema: ${what} is named "__proto__", which JavaScript treats as the prototype setter rather than a ` +
+        `property name, so it could not be stored or queried. Rename it.`,
+    );
+  }
+}
+
+/**
+ * An index is either a column index (`columns`) or a document-field index
+ * (`docField` and `path`), never both. A declaration carrying both was taken
+ * for the document-field kind, which only PowDB creates, so the SQL engines
+ * skipped it without saying so.
+ */
+function assertIndexKinds(list: readonly unknown[], accessor: string): void {
+  list.forEach((item, i) => {
+    if (typeof item === 'object' && item !== null && 'columns' in item && 'docField' in item) {
+      throw new ValidationError(
+        `defineSchema: index ${i} of table "${accessor}" declares both "columns" and "docField". ` +
+          `Use "columns" for a column index, or "docField" with "path" for an index into a json document. ` +
+          `Declare two indexes if you need both.`,
+      );
+    }
+  });
+}
+
 /** Check if a value is a TableDef (from legacy table() builder) */
 function isTableDef(v: unknown): v is TableDef {
   return typeof v === 'object' && v !== null && 'columns' in v && 'name' in v;
@@ -628,6 +707,7 @@ export function defineSchema<S extends SchemaInput>(
   if (options !== undefined) assertKnownKeys(options, SCHEMA_OPTION_KEYS, 'the defineSchema options');
 
   for (const [accessor, value] of Object.entries(input)) {
+    assertOrdinaryName(accessor, `table "${accessor}"`);
     // The user-facing key is the camelCase JS accessor; the DDL-facing
     // table name is its snake_case form (e.g. `postTags` → `post_tags`).
     const dbName = camelToSnakeLocal(accessor);
@@ -654,6 +734,7 @@ export function defineSchema<S extends SchemaInput>(
               throw new Error(`Table "${accessor}": "indexes" must be an array of index declarations`);
             }
             assertKnownElementKeys(def, INDEX_KEYS, `table "${accessor}" indexes`);
+            assertIndexKinds(def, accessor);
             indexes = def as readonly SchemaIndexDef[];
           }
           continue;
@@ -701,6 +782,7 @@ export function defineSchema<S extends SchemaInput>(
               (suggestion ? ` Did you mean "${suggestion}"?` : ''),
           );
         }
+        assertOrdinaryName(fieldName, `column "${accessor}.${fieldName}"`);
         if (typeof def === 'object' && def !== null) {
           assertKnownKeys(def, COLUMN_KEYS, `column "${accessor}.${fieldName}"`);
           const ref = (def as ColumnDef).references;

@@ -27,6 +27,7 @@ import {
   timeOfDayKind,
   withDbFieldNames,
 } from './schema.js';
+import { tsTypeTextProblem } from './schema-builder.js';
 
 /** Get the TypeScript type name for a table (singularized PascalCase) */
 function entityName(tableName: string): string {
@@ -135,10 +136,11 @@ export function resolveColumnTypeOverrides(
           `${hint ? `. Did you mean "${printableCatalogName(`${tableName}.${hint}`)}"?` : '.'}`,
       );
     }
-    if (typeof tsType !== 'string' || tsType.trim() === '' || UNSAFE_TYPE_TEXT.test(tsType)) {
+    const problem = typeof tsType === 'string' ? tsTypeTextProblem(tsType) : 'it is not a string';
+    if (problem !== null) {
       throw new ValidationError(
-        `columnTypes[${printableCatalogName(JSON.stringify(key))}] must be a one-line TypeScript type, for example ` +
-          `"import('../src/types.js').Settings".`,
+        `columnTypes[${printableCatalogName(JSON.stringify(key))}] must be one TypeScript type on one line, for example ` +
+          `"import('../src/types.js').Settings", but ${problem}: ${printableCatalogName(JSON.stringify(tsType))}.`,
       );
     }
     let perTable = out.get(tableName);
@@ -150,14 +152,6 @@ export function resolveColumnTypeOverrides(
   }
   return out;
 }
-
-/**
- * Characters a `columnTypes` value may not contain. The value is the user's own
- * config and is emitted as written, but it must stay on one line: a line
- * break would end the member it is emitted into.
- */
-// biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is this pattern's purpose
-const UNSAFE_TYPE_TEXT = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
 /**
  * Characters that must never reach generated source verbatim: the two that end
@@ -586,6 +580,38 @@ function requireEmittable(derived: string, subject: string, role: string): void 
 /** Table accessors the generated `TurbineClient` class cannot declare as members. */
 const RESERVED_ACCESSORS: ReadonlySet<string> = new Set(['constructor', '__proto__']);
 
+/** The type a defineSchema file declared for a column (bare, no `| null`), if any. */
+function declaredTsTypeOf(col: ColumnMetadata): string | undefined {
+  return col.declaredTsType;
+}
+
+/**
+ * The metadata `types.ts` is written from. A column whose schema file declared a
+ * TypeScript type takes it, with `| null` for a nullable column, in place of the
+ * type mapped from its database type. The runtime keeps the mapped type
+ * (`metadata.ts` is written from the input), because the engines branch on it.
+ * Returns `schema` itself when no column declared one.
+ */
+function withDeclaredTypes(schema: SchemaMetadata): SchemaMetadata {
+  let declaredAny = false;
+  const tables: Record<string, TableMetadata> = Object.create(null);
+  for (const [name, table] of Object.entries(schema.tables)) {
+    if (!table.columns.some((c) => declaredTsTypeOf(c) !== undefined)) {
+      tables[name] = table;
+      continue;
+    }
+    declaredAny = true;
+    tables[name] = {
+      ...table,
+      columns: table.columns.map((col) => {
+        const declared = declaredTsTypeOf(col);
+        return declared === undefined ? col : { ...col, tsType: col.nullable ? `${declared} | null` : declared };
+      }),
+    };
+  }
+  return declaredAny ? { ...schema, tables } : schema;
+}
+
 /**
  * Refuse a schema whose names cannot be emitted as TypeScript identifiers.
  *
@@ -619,16 +645,19 @@ export function assertEmittableSchema(schema: SchemaMetadata): void {
     // introspect.ts's; re-asserting it here covers a hand-built or
     // engine-introspected schema that never went through that path.
     assertDistinctColumnFields(table.name, table.columns);
-    // A column's tsType is emitted verbatim. Introspection only produces mapped
+    // A column's type is emitted verbatim. Introspection only produces mapped
     // types, but hand-built or code-first metadata (`tsType` on defineSchema)
-    // can carry anything, and a line break would end the type and start a
-    // statement in the generated file.
+    // can carry anything, and a line break or a stray bracket would end the type
+    // and start a statement in the generated file.
     for (const col of table.columns) {
-      if (UNSAFE_TYPE_TEXT.test(col.tsType)) {
-        throw new ValidationError(
-          `Cannot generate code for column "${printableCatalogName(col.name)}" on table "${printableCatalogName(table.name)}": ` +
-            'its TypeScript type contains a control or line-separator character. Give the type on one line.',
-        );
+      for (const text of [col.tsType, declaredTsTypeOf(col)]) {
+        const problem = text === undefined ? null : tsTypeTextProblem(text);
+        if (problem !== null) {
+          throw new ValidationError(
+            `Cannot generate code for column "${printableCatalogName(col.name)}" on table "${printableCatalogName(table.name)}": ` +
+              `its TypeScript type ${printableCatalogName(JSON.stringify(text))} cannot be emitted, because ${problem}. Give one type on one line.`,
+          );
+        }
       }
     }
     // Only the relations that reach the TYPE layer: a relation shadowing a
@@ -654,8 +683,9 @@ export function assertEmittableSchema(schema: SchemaMetadata): void {
  * *Relations brand-field interfaces, and the write input types). Exported so
  * tests can pin the generator output without writing files to disk.
  */
-export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOptions): string {
-  assertEmittableSchema(schema);
+export function generateTypes(input: SchemaMetadata, options?: GenerateFileOptions): string {
+  assertEmittableSchema(input);
+  const schema = withDeclaredTypes(input);
   const overrides = resolveColumnTypeOverrides(schema, options?.columnTypes);
   const lines: string[] = [...generatedFileHeader(options)];
 
