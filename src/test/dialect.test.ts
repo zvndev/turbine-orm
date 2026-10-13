@@ -223,7 +223,7 @@ describe('Dialect contract', () => {
     assert.match(sql, /CREATE TABLE `organizations`/);
     // `serial` now emits SERIAL (int4); the dialect translates it to INT AUTO_INCREMENT.
     assert.match(sql, /`id` INT AUTO_INCREMENT PRIMARY KEY/);
-    assert.match(sql, /`created_at` DATETIME NOT NULL DEFAULT NOW\(\)/);
+    assert.match(sql, /`created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP\(3\)/);
     assert.match(sql, /`profile` JSON/);
     assert.match(sql, /REFERENCES `organizations`\(`id`\)/);
     assert.match(sql, /CREATE INDEX `idx_users_org_id` ON `users`\(`org_id`\);/);

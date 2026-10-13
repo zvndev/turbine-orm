@@ -586,7 +586,9 @@ function mysqlColumnType(type: string, maxLength?: number | null): string {
   if (/NUMERIC|DECIMAL|MONEY/.test(t)) return 'DECIMAL(65,30)';
   if (/JSONB|JSON/.test(t)) return 'JSON';
   if (/UUID/.test(t)) return 'CHAR(36)';
-  if (/TIMESTAMPTZ|TIMESTAMP|DATETIME/.test(t)) return 'DATETIME';
+  // DATETIME(3), not bare DATETIME: the bare type has zero fractional digits and
+  // rounds a JS Date's milliseconds away on write.
+  if (/TIMESTAMPTZ|TIMESTAMP|DATETIME/.test(t)) return 'DATETIME(3)';
   if (/\bDATE\b/.test(t)) return 'DATE';
   if (/\bTIME\b/.test(t)) return 'TIME';
   if (/BYTEA|BLOB/.test(t)) return 'BLOB';
