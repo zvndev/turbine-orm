@@ -14,7 +14,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { describe } from 'node:test';
+import { describe, it } from 'node:test';
 import { TurbineClient } from '../client.js';
 import { UnsupportedFeatureError } from '../errors.js';
 import { mssqlDialect } from '../mssql.js';
@@ -27,7 +27,6 @@ const DATABASE_URL = process.env.DATABASE_URL ?? '';
 const MYSQL_URL = process.env.MYSQL_URL ?? process.env.MYSQL_TEST_URL ?? '';
 const pg = skipGate(!DATABASE_URL, 'requires DATABASE_URL');
 const my = skipGate(!MYSQL_URL, 'requires MYSQL_URL / MYSQL_TEST_URL pointing at a MySQL 8 server');
-const { it } = skipGate(false, '');
 
 const TABLE = 'sqle_json_docs';
 

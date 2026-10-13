@@ -9,7 +9,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { describe } from 'node:test';
+import { describe, it } from 'node:test';
 import type { TurbineClient } from '../client.js';
 import { TurbineError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { mssqlDialect } from '../mssql.js';
@@ -19,7 +19,6 @@ import { makeQuery, mockTable, skipGate } from './helpers.js';
 
 const MYSQL_URL = process.env.MYSQL_URL ?? process.env.MYSQL_TEST_URL ?? '';
 const gate = skipGate(!MYSQL_URL, 'requires MYSQL_URL / MYSQL_TEST_URL pointing at a MySQL 8 server');
-const { it } = skipGate(false, '');
 
 const TABLES = ['sqle_events', 'sqle_docs', 'sqle_owners'];
 const DDL = [
