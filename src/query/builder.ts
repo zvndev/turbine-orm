@@ -14,7 +14,7 @@
 import { acquireConnection, type Checkout, openCheckout } from '../checkout.js';
 import { settleEventLoop } from '../connection-guard.js';
 import type { Dialect, StreamableConnection } from '../dialect.js';
-import { maxBindParameters, postgresDialect } from '../dialect.js';
+import { postgresDialect } from '../dialect.js';
 import {
   explainConnectionLoss,
   isStaleConnectionError,
@@ -3237,11 +3237,39 @@ export class QueryInterface<
   }
 
   /**
+   * The executor for a write's statements, sharing one deadline: each one gets
+   * what is left of `timeout`, so a chunked `createMany` or a lock, write and
+   * re-read cannot run for N times the timeout. A statement due past the
+   * deadline is not sent. `onClient` routes them to a held connection.
+   */
+  private deadlineExec(timeout: number | undefined, onClient?: PgCompatPool): ReselectExecutor {
+    const deadline = timeout ? performance.now() + timeout : undefined;
+    return async (sql, params, preparedName) => {
+      let left = timeout;
+      if (deadline !== undefined) {
+        left = Math.ceil(deadline - performance.now());
+        if (left <= 0) {
+          throw new TimeoutError(timeout as number, 'Query', {
+            outcome: 'not-executed',
+            message:
+              `Query timed out after ${timeout}ms: the write's statements share one deadline, and it passed ` +
+              'before the next one was sent. Its earlier statements are rolled back, so it makes no change.',
+          });
+        }
+      }
+      return onClient
+        ? this.queryWithTimeout(sql, params, left, preparedName, false, onClient)
+        : this.queryWithTimeout(sql, params, left, preparedName);
+    };
+  }
+
+  /**
    * Run a write that takes several statements as one transaction on one
    * connection: the caller's transaction when there is one, else one opened
    * here. A statement that times out is cancelled where the engine allows it,
    * and its connection is closed rather than rolled back (a ROLLBACK would wait
    * behind it); the transaction never commits, so the write made no change.
+   * `timeout` is one deadline for every statement (see {@link deadlineExec}).
    */
   private async inOneTransaction<V>(
     work: (exec: ReselectExecutor) => Promise<V>,
@@ -3252,9 +3280,7 @@ export class QueryInterface<
     if (this.txScoped) {
       // In the caller's transaction, a savepoint keeps the write whole: a later
       // statement that fails and is caught cannot leave the earlier ones behind.
-      return withSavepoint(this.pool, () =>
-        work((sql, params, preparedName) => this.queryWithTimeout(sql, params, timeout, preparedName)),
-      );
+      return withSavepoint(this.pool, () => work(this.deadlineExec(timeout)));
     }
     if (typeof (this.pool as { connect?: unknown }).connect !== 'function') {
       throw new UnsupportedFeatureError(
@@ -3272,9 +3298,7 @@ export class QueryInterface<
           : (client as unknown as { query(c: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query(text),
     } as unknown as PgCompatPool;
     try {
-      const value = await work((sql, params, preparedName) =>
-        this.queryWithTimeout(sql, params, timeout, preparedName, false, onClient),
-      );
+      const value = await work(this.deadlineExec(timeout, onClient));
       await client.query(this.dialect.commitStatement());
       checkout.release();
       return value;
@@ -4935,48 +4959,40 @@ export class QueryInterface<
     return this.executeWithMiddleware('createMany', args as unknown as Record<string, unknown>, async () => {
       const projection = this.resolveWriteProjection(args);
       const base = args as unknown as CreateManyArgs<T>;
-      const deferred = writesMod.buildCreateMany(this.ctx, base, 'allow', projection);
-      const limit = maxBindParameters(this.dialect);
-      if (limit === undefined || deferred.params.length <= limit) {
-        return this.executeMutation(deferred, args.timeout) as Promise<FieldResult<T, S, O>[]>;
+      // One statement when the rows fit the engine's per-statement limits,
+      // else chunks that do, all in one transaction so the rows land together
+      // or not at all. (`buildCreateMany`, one statement for a pipeline,
+      // refuses instead.)
+      const { chunks, rowsPerChunk } = writesMod.planCreateMany(this.ctx, base, projection);
+      const run = async (): Promise<FieldResult<T, S, O>[]> => {
+        if (chunks.length === 1) {
+          return this.executeMutation(chunks[0]!, args.timeout) as Promise<FieldResult<T, S, O>[]>;
+        }
+        const reselects = this.dialect.resultStrategy === 'reselect';
+        return this.inOneTransaction(
+          async (exec) => {
+            const rows: FieldResult<T, S, O>[] = [];
+            for (const chunk of chunks) {
+              const result =
+                reselects && chunk.reselect
+                  ? await chunk.reselect(exec)
+                  : await exec(chunk.sql, chunk.params, chunk.preparedName);
+              rows.push(...(chunk.transform(result) as unknown as FieldResult<T, S, O>[]));
+            }
+            return rows;
+          },
+          args.timeout,
+          `createMany of ${base.data.length} rows`,
+          `Insert at most ${rowsPerChunk} rows per call, which fits one statement, or pass a pool that can check ` +
+            'out a connection.',
+        );
+      };
+      if (base.onConflict === undefined) return run();
+      try {
+        return await run();
+      } catch (err) {
+        throw writesMod.explainConflictKeyCollision(this.ctx, base, err);
       }
-      // Over the engine's bind-parameter limit for one statement: insert in
-      // chunks that fit, all in one transaction, so the rows land together or
-      // not at all. (`buildCreateMany`, one statement for a pipeline, refuses.)
-      // A one-row build separates the per-row parameters from the ones bound
-      // once per statement (an onConflict update's values), so a chunk never
-      // goes over by the fixed part.
-      const one = writesMod.buildCreateMany(this.ctx, { ...base, data: base.data.slice(0, 1) }, 'allow', projection);
-      const perRow = Math.max(
-        1,
-        Math.ceil((deferred.params.length - one.params.length) / Math.max(1, base.data.length - 1)),
-      );
-      const fixed = Math.max(0, one.params.length - perRow);
-      const rowsPerChunk = Math.max(1, Math.floor((limit - fixed) / perRow));
-      const reselects = this.dialect.resultStrategy === 'reselect';
-      return this.inOneTransaction(
-        async (exec) => {
-          const rows: FieldResult<T, S, O>[] = [];
-          for (let i = 0; i < base.data.length; i += rowsPerChunk) {
-            const chunk = writesMod.buildCreateMany(
-              this.ctx,
-              { ...base, data: base.data.slice(i, i + rowsPerChunk) },
-              'refuse',
-              projection,
-            );
-            const result =
-              reselects && chunk.reselect
-                ? await chunk.reselect(exec)
-                : await exec(chunk.sql, chunk.params, chunk.preparedName);
-            rows.push(...(chunk.transform(result) as unknown as FieldResult<T, S, O>[]));
-          }
-          return rows;
-        },
-        args.timeout,
-        `createMany of ${base.data.length} rows`,
-        `Insert at most ${rowsPerChunk} rows per call, which fits one statement, or pass a pool that can check ` +
-          'out a connection.',
-      );
     });
   }
 

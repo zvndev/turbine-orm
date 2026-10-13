@@ -191,22 +191,9 @@ const nullOrder = (engine: Engine): ScenarioEntry[] =>
     note: 'default NULL placement differs from Postgres; pass `nulls` where the engine supports it.',
   }));
 
-// A JS Date written to a `date` column: PostgreSQL binds the UTC date
-// (`1999-12-31`), the other engines bind the full instant and each stores it
-// its own way. The UTC-date rendering is gated to PostgreSQL in the write path.
+// A JS Date written to a `date` column: the SQL engines bind the UTC date
+// (`1999-12-31`), as PostgreSQL does. PowDB binds the full instant.
 const DATE_END_OF_DAY: readonly ScenarioEntry[] = [
-  {
-    engine: 'mysql',
-    scenario: 'write/create-date-end-of-day',
-    kind: 'bug',
-    note: 'a Date bound to a DATE column is sent as a DATETIME literal and MySQL ROUNDS it to the nearest day, so 1999-12-31T23:59:59.999Z is stored as 2000-01-01; Postgres stores 1999-12-31.',
-  },
-  {
-    engine: 'sqlite',
-    scenario: 'write/create-date-end-of-day',
-    kind: 'bug',
-    note: 'a Date bound to a date column is stored as its full ISO timestamp, so the time of day survives and reads back (1999-12-31T23:59:59.999Z); Postgres stores the UTC date 1999-12-31.',
-  },
   {
     engine: 'powdb',
     scenario: 'write/create-date-end-of-day',
@@ -253,12 +240,6 @@ export const SCENARIO_ENTRIES: readonly ScenarioEntry[] = [
       note: "MySQL's default collation (utf8mb4_0900_ai_ci) compares text case- and accent-insensitively.",
     }),
   ),
-  {
-    engine: 'mysql',
-    scenario: 'write/update-divide-int',
-    kind: 'bug',
-    note: 'integer divide rounds half away from zero on an INT column (75 / 2 = 38); Postgres truncates to 37.',
-  },
   // --- mssql ---
   ...nullOrder('mssql'),
   ...['order/nulls-first', 'order/nulls-last-desc'].map(
@@ -323,12 +304,6 @@ export const SCENARIO_ENTRIES: readonly ScenarioEntry[] = [
       note: 'PowDB orders NULLs last in both directions; Postgres puts them first when descending.',
     }),
   ),
-  {
-    engine: 'sqlite',
-    scenario: 'where/date-equals-iso-string',
-    kind: 'bug',
-    note: "a date column compared with an ISO date string ('2000-02-29') matches nothing: the column holds the bound Date's full ISO timestamp text.",
-  },
   ...DATE_END_OF_DAY,
 ];
 

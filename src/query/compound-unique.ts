@@ -508,6 +508,71 @@ export function upsertWhereMatchesCreate(
   return keys > 0;
 }
 
+/**
+ * A unique key, other than the ones in `pinned`, that a new row could collide
+ * on, or `undefined` when there is none.
+ *
+ * The question MySQL's `ON DUPLICATE KEY UPDATE` raises: it has no conflict
+ * target and updates the row whichever unique key collides first, so a row
+ * that also collides on another key can update a row the caller did not name.
+ * A key collides only when every member holds a value, so a key is ruled out
+ * when a member is NULL (written as null, or absent with no default), when
+ * none of its members is set (defaults are server-generated values in
+ * practice), or when it contains a pinned key (it then collides only where the
+ * pinned key does, on the same row). `undefined` is the safe answer only for
+ * shapes that can never collide; anything uncertain returns the key.
+ */
+export function otherCollidingUniqueKey(
+  meta: TableMetadata,
+  pinned: readonly (readonly string[])[],
+  stateOf: (column: string) => 'value' | 'null' | 'absent',
+): string[] | undefined {
+  for (const key of uniqueKeyNames(meta)) {
+    if (pinned.some((p) => p.every((c) => key.includes(c)))) continue;
+    let sets = false;
+    let nullMember = false;
+    for (const column of key) {
+      const state = stateOf(column);
+      if (state === 'value') sets = true;
+      else if (state === 'null' || defaultsToNull(meta, column)) nullMember = true;
+    }
+    if (sets && !nullMember) return key;
+  }
+  return undefined;
+}
+
+/** A nullable column with no default: absent from an INSERT, it is NULL. */
+function defaultsToNull(meta: TableMetadata, column: string): boolean {
+  const col = meta.columns.find((c) => c.name === column);
+  return col?.nullable === true && !col.hasDefault;
+}
+
+/**
+ * {@link otherCollidingUniqueKey} for a single-row upsert: the keys `where`
+ * pins, against the values `create` inserts. Read only after
+ * {@link upsertWhereMatchesCreate} holds, so every `where` key is a column.
+ */
+export function upsertCreateCollidingKey(
+  meta: TableMetadata,
+  where: Record<string, unknown>,
+  create: Record<string, unknown>,
+): string[] | undefined {
+  const whereColumns = new Set<string>();
+  for (const [key, value] of Object.entries(expandCompoundUniqueWhere(meta, where))) {
+    if (value === undefined) continue;
+    const column = resolveColumnName(meta, key);
+    if (column !== undefined) whereColumns.add(column);
+  }
+  const pinned = uniqueKeyNames(meta).filter((key) => key.every((c) => whereColumns.has(c)));
+  const createState = new Map<string, 'value' | 'null'>();
+  for (const [key, value] of Object.entries(create)) {
+    if (value === undefined) continue;
+    const column = resolveColumnName(meta, key);
+    if (column !== undefined) createState.set(column, value === null ? 'null' : 'value');
+  }
+  return otherCollidingUniqueKey(meta, pinned, (c) => createState.get(c) ?? 'absent');
+}
+
 /** `{ equals: v }` and nothing else (a `mode` beside it changes the match). */
 function isBareEquals(value: unknown): boolean {
   return isPlainRecord(value) && Object.keys(value).length === 1 && 'equals' in value;

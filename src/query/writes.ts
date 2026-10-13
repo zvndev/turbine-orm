@@ -11,15 +11,23 @@
  * delegating methods and the async execute wrappers.
  */
 
-import { type BulkUpsertRefs, maxBindParameters, type ReturningSelection } from '../dialect.js';
+import {
+  type BulkInsertStatementInput,
+  type BulkUpsertRefs,
+  maxBindParameters,
+  type ReturningSelection,
+} from '../dialect.js';
 import { NotFoundError, OptimisticLockError, UnsupportedFeatureError, ValidationError } from '../errors.js';
+import type { PgCompatQueryResult } from '../pg-types.js';
 import type { TableMetadata } from '../schema.js';
-import { camelToSnake, snakeToCamel } from '../schema.js';
+import { camelToSnake } from '../schema.js';
 import { isColumnRef } from './column-ref.js';
 import {
   assertMutationWhereIdentifiesOneRow,
   expandCompoundUniqueWhere,
+  otherCollidingUniqueKey,
   uniqueKeyNames,
+  upsertCreateCollidingKey,
   upsertWhereMatchesCreate,
 } from './compound-unique.js';
 import type { DeferredQuery, ReselectExecutor } from './deferred.js';
@@ -114,7 +122,10 @@ export function coerceWriteValue(qi: BuilderCtx, key: string, value: unknown): u
   assertScalarBindable(qi, key, dbType, value);
   if (!(value instanceof Date) && !Array.isArray(value)) return value;
   // A column missing from the type map resolves to undefined → no coercion.
-  return coerceTemporalValue(dbType, value, utcDateTimeWrites(qi));
+  // The gate is where.ts's, so a written Date and a compared Date take the
+  // same form: a `date` column the UTC date part on every SQL engine, a
+  // zone-less `timestamp` the UTC literal on PostgreSQL only.
+  return coerceTemporalValue(dbType, value, whereMod.utcDateTimeRewrite(qi, dbType));
 }
 
 /** `JSON.stringify(value)` for a JSON column, or E003 when it has no JSON form. */
@@ -207,19 +218,6 @@ function assertScalarBindable(qi: BuilderCtx, key: string, dbType: string | unde
 }
 
 /**
- * Whether the zone-less `date` / `timestamp` UTC rewrite applies.
- *
- * PostgreSQL only: MySQL's `TIMESTAMP`/`DATETIME` and SQL Server's
- * `datetime2` are converted or bound by their own drivers, and MySQL in
- * particular reads a zone-less literal in the SESSION time zone, so a UTC
- * literal would be misread there. `utcTimestamps: false` opts out, it is the
- * same switch that turns off the UTC READ parsing, so the two stay symmetric.
- */
-function utcDateTimeWrites(qi: BuilderCtx): boolean {
-  return qi.dialect.name === 'postgresql' && qi.utcTimestamps !== false;
-}
-
-/**
  * Build a `SELECT * ... WHERE <predicate>` that re-fetches the row(s) matched
  * by a write's `where` clause. Used by the `'reselect'` result strategy to
  * return rows from non-RETURNING engines. Reuses the same parameterized WHERE
@@ -250,53 +248,152 @@ function forUpdate(qi: BuilderCtx): string {
 }
 
 /**
- * Whether `data` sets a column the top level of `where` names, so the written
- * row may no longer match `where` and must be re-read by its primary key.
+ * Whether a write that sets `columns` may move a row out of `whereObj`, so the
+ * row must be re-read by its key rather than by `where`: a soft delete under a
+ * `deletedAt: null` global filter, `NOT: { status: 'done' }` with `status:
+ * 'done'`, a key change.
+ *
+ * Read off the compiled predicate, where every column it reads is quoted at
+ * any depth (`NOT`, `OR`, a relation filter's correlation, a column reference,
+ * the global filter), so no where shape is missed. A column of another table
+ * with the same name answers true, which costs one locking read and is never
+ * wrong.
  */
-function dataMovesRow(qi: BuilderCtx, where: Record<string, unknown>, data: Record<string, unknown>): boolean {
-  const set = new Set<string>();
-  for (const key of Object.keys(data)) {
-    if (data[key] === undefined) continue;
-    const column = resolveColumnName(qi.tableMeta, key);
-    if (column !== undefined) set.add(column);
-  }
-  if (set.size === 0) return false;
-  return Object.keys(where).some((key) => {
-    const column = resolveColumnName(qi.tableMeta, key);
-    return column !== undefined && set.has(column);
-  });
+function writeMayMoveRow(qi: BuilderCtx, whereObj: Record<string, unknown>, columns: ReadonlySet<string>): boolean {
+  if (columns.size === 0) return false;
+  const clause = whereMod.buildWhereClause(qi, whereObj, []);
+  if (!clause) return false;
+  for (const column of columns) if (clause.includes(qi.q(column))) return true;
+  return false;
 }
 
 /**
- * Lock the row `where` names and return its primary key as a `where`, with any
- * key column `data` assigns (a plain value or `{ set }`) replaced by its new
- * value. `null` when no row matched, `undefined` when `data` moves the key in a
- * way that cannot be read off it (an arithmetic operator).
+ * The columns that identify a row after a write: the primary key, else the
+ * first unique key, else none.
  */
-async function lockKeyOf(
+function identityColumns(qi: BuilderCtx): readonly string[] {
+  return qi.tableMeta.primaryKey.length > 0 ? qi.tableMeta.primaryKey : (uniqueKeyNames(qi.tableMeta)[0] ?? []);
+}
+
+/**
+ * Lock the row(s) `whereObj` matches and return the first one's identity key as
+ * a `where`, with every key column `data` assigns replaced by its new value, so
+ * the row can be re-read after the write moves it. `null` when no row matched.
+ *
+ * Refused (E017) before anything is written: a table with no key to re-read by,
+ * a key column assigned by something whose result is not known here (an
+ * expression, `divide`, a non-integer operand), and, unless the call is a
+ * full-table write, a `where` that matched more than one row, which only an
+ * engine comparing a key loosely produces.
+ */
+async function lockMovedRowKey(
   qi: BuilderCtx,
   exec: ReselectExecutor,
   whereObj: Record<string, unknown>,
   data: Record<string, unknown>,
-): Promise<Record<string, unknown> | null | undefined> {
-  const pk = qi.tableMeta.primaryKey;
+  operation: 'update' | 'upsert',
+  manyRows: boolean,
+): Promise<Record<string, unknown> | null> {
+  const identity = identityColumns(qi);
+  if (identity.length === 0) {
+    throw new UnsupportedFeatureError(
+      `${operation} on "${qi.table}" that changes a column its \`where\` reads`,
+      qi.dialect.name,
+      'The written row is read back by a key, and the table has no primary key or unique key. Give the table a ' +
+        'primary key, or leave the columns `where` reads out of data.',
+    );
+  }
+  const assigned = new Map<string, [string, unknown]>();
+  for (const [key, value] of writeEntries(qi, data)) {
+    const column = resolveColumnName(qi.tableMeta, key);
+    if (column !== undefined && identity.includes(column)) assigned.set(column, [key, value]);
+  }
   const params: unknown[] = [];
   const clause = whereMod.buildWhereClause(qi, whereObj, params);
-  const sql = `SELECT ${pk.map((c) => qi.q(c)).join(', ')} FROM ${qi.q(qi.table)}${clause ? ` WHERE ${clause}` : ''}${forUpdate(qi)}`;
-  const row = (await exec(sql, params)).rows[0];
+  const sql = `SELECT ${identity.map((c) => qi.q(c)).join(', ')} FROM ${qi.q(qi.table)}${clause ? ` WHERE ${clause}` : ''}${forUpdate(qi)}`;
+  const rows = (await exec(sql, params)).rows;
+  const row = rows[0];
   if (!row) return null;
+  if (!manyRows) assertOneRowByKey(qi, operation, identity, rows.length);
   const key: Record<string, unknown> = {};
-  for (const column of pk) {
-    const field = qi.tableMeta.reverseColumnMap[column] ?? column;
-    const assigned = data[field] !== undefined ? data[field] : data[column];
-    if (assigned === undefined) key[field] = row[column];
-    else if (assigned !== null && typeof assigned === 'object' && !(assigned instanceof Date)) {
-      const op = assigned as Record<string, unknown>;
-      if (Object.keys(op).length !== 1 || !('set' in op)) return undefined;
-      key[field] = op.set;
-    } else key[field] = assigned;
+  for (const column of identity) {
+    const entry = assigned.get(column);
+    const next = entry === undefined ? row[column] : movedKeyValue(qi, operation, entry[0], row[column], entry[1]);
+    key[fieldOf(qi, column)] = reselectKeyValue(qi, column, next);
   }
   return key;
+}
+
+/**
+ * The value a key column holds after `assigned` is written over `current`: a
+ * plain value or `{ set }` as given, and `increment` / `decrement` / `multiply`
+ * by an integer computed exactly on an integer key. Anything else is refused
+ * (E017) because its result, and so the row, cannot be known before the write.
+ */
+function movedKeyValue(
+  qi: BuilderCtx,
+  operation: 'update' | 'upsert',
+  key: string,
+  current: unknown,
+  assigned: unknown,
+): unknown {
+  const op = setOperatorOf(qi, key, assigned);
+  if (op === null) return assigned;
+  if (op === 'set') return (assigned as { set: unknown }).set;
+  const operand = op === 'expr' ? undefined : (assigned as Record<string, unknown>)[op];
+  const base = integerOf(current);
+  if (base !== undefined && typeof operand === 'number' && Number.isSafeInteger(operand) && op !== 'divide') {
+    const n = BigInt(operand);
+    const next = op === 'increment' ? base + n : op === 'decrement' ? base - n : base * n;
+    return typeof current === 'number' &&
+      next >= BigInt(Number.MIN_SAFE_INTEGER) &&
+      next <= BigInt(Number.MAX_SAFE_INTEGER)
+      ? Number(next)
+      : typeof current === 'bigint'
+        ? next
+        : next.toString();
+  }
+  throw new UnsupportedFeatureError(
+    `${operation} on "${qi.table}" that changes the key "${key}" with ${op === 'expr' ? 'an expression' : `\`${op}\``}`,
+    qi.dialect.name,
+    'The written row is read back by its key, and the new key is not known before the write. Read the row, then ' +
+      `write the new key with \`{ set: value }\`${op === 'expr' ? '' : ', or use an integer `increment`, `decrement` or `multiply`'}.`,
+  );
+}
+
+/** The columns the top level of `where` names, for a message. */
+function whereColumns(qi: BuilderCtx, where: Record<string, unknown>): string[] {
+  return Object.keys(where).flatMap((key) => {
+    const column = where[key] === undefined ? undefined : resolveColumnName(qi.tableMeta, key);
+    return column === undefined ? [] : [column];
+  });
+}
+
+/** An integer key value as a bigint, or `undefined` for anything else. */
+function integerOf(value: unknown): bigint | undefined {
+  if (typeof value === 'bigint') return value;
+  if (typeof value === 'number') return Number.isSafeInteger(value) ? BigInt(value) : undefined;
+  if (typeof value === 'string' && /^-?[0-9]+$/.test(value)) return BigInt(value);
+  return undefined;
+}
+
+/**
+ * `where` with each top-level key value bound as a reselect binds keys (see
+ * {@link TEXT_KEY_TYPES}), or `where` itself when nothing changes.
+ */
+function textSafeKeyWhere(qi: BuilderCtx, where: Record<string, unknown>): Record<string, unknown> {
+  let out: Record<string, unknown> | undefined;
+  for (const [key, value] of Object.entries(where)) {
+    const column = resolveColumnName(qi.tableMeta, key);
+    if (column === undefined) continue;
+    const plain = isPlainRecord(value) && Object.keys(value).length === 1 && 'equals' in value;
+    const raw = plain ? (value as { equals: unknown }).equals : value;
+    const bound = reselectKeyValue(qi, column, raw);
+    if (bound === raw) continue;
+    out ??= { ...where };
+    out[key] = plain ? { equals: bound } : bound;
+  }
+  return out ?? where;
 }
 
 /**
@@ -385,10 +482,10 @@ export function buildCreate<T extends object>(
 }
 
 /**
- * Build the `'reselect'` plan for {@link buildCreate}: run the INSERT, then
- * `SELECT * WHERE pk = ?`. Returns `undefined` (skipped) unless the active
- * dialect's result strategy is `'reselect'`, so the PostgreSQL/RETURNING path
- * pays nothing. Not yet wired to a real non-RETURNING engine.
+ * Build the `'reselect'` plan for {@link buildCreate} (MySQL): run the INSERT,
+ * then `SELECT ... WHERE <key> = ?` by a key whose value is known exactly
+ * (see {@link createReselectKey}). Returns `undefined` unless the dialect's
+ * result strategy is `'reselect'`, so the RETURNING engines pay nothing.
  */
 export function makeCreateReselect<T extends object>(
   qi: BuilderCtx,
@@ -398,22 +495,181 @@ export function makeCreateReselect<T extends object>(
   projection?: WriteProjection,
 ): DeferredQuery<T>['reselect'] {
   if (qi.dialect.resultStrategy !== 'reselect') return undefined;
+  const key = createReselectKey(qi, data);
   return async (exec) => {
     const writeResult = await exec(insertSql, insertParams);
-    const insertId = qi.mutationInsertId(writeResult);
-    const conds: string[] = [];
-    const selParams: unknown[] = [];
-    let idx = 1;
-    for (const pk of qi.tableMeta.primaryKey) {
-      const field = qi.tableMeta.reverseColumnMap[pk] ?? snakeToCamel(pk);
-      // Same rewrite the INSERT's own params got: a temporal PK re-fetched with
-      // a raw Date would not match the literal that was just written.
-      selParams.push(coerceWriteValue(qi, field, data[field] ?? data[pk] ?? insertId));
-      conds.push(`${qi.q(pk)} = ${qi.p(idx++)}`);
-    }
-    const where = conds.length > 0 ? ` WHERE ${conds.join(' AND ')}` : '';
-    return exec(`SELECT ${writeReselectSelection(qi, projection)} FROM ${qi.q(qi.table)}${where}`, selParams);
+    const params = key.values.map((value) => (value === INSERT_ID ? generatedKey(qi, writeResult, key) : value));
+    const where = key.columns.map((c, i) => `${qi.q(c)} = ${qi.p(i + 1)}`).join(' AND ');
+    const result = await exec(
+      `SELECT ${writeReselectSelection(qi, projection)} FROM ${qi.q(qi.table)} WHERE ${where}`,
+      params,
+    );
+    assertOneRowByKey(qi, 'create', key.columns, result.rows.length);
+    return result;
   };
+}
+
+/** Stands for the driver's generated insert id in a {@link ReselectKey}. */
+const INSERT_ID: unique symbol = Symbol('turbine.insertId');
+
+/** The key a `create` is re-read by: columns, and each one's value or {@link INSERT_ID}. */
+interface ReselectKey {
+  readonly columns: readonly string[];
+  readonly values: readonly unknown[];
+}
+
+/**
+ * The key that finds the row a `create` inserted, decided before the INSERT is
+ * sent. Without RETURNING, MySQL reports only the AUTO_INCREMENT value it
+ * assigned (`insertId`, 0 when there is none), so a key the server fills any
+ * other way (`DEFAULT (UUID())`) cannot be read back: re-reading by 0 matched
+ * every CHAR key MySQL converts to the number 0, other tenants' rows included.
+ *
+ * In order: the primary key, when `data` supplies every member or the one it
+ * omits is server-numbered ({@link isServerNumberedKey}); else the first unique
+ * key `data` supplies in full. Anything else is refused (E017) before the
+ * INSERT, naming the fix. A NULL never identifies a row, so it counts as absent.
+ */
+function createReselectKey(qi: BuilderCtx, data: Record<string, unknown>): ReselectKey {
+  const supplied = new Map<string, unknown>();
+  for (const [key, value] of writeEntries(qi, data)) {
+    const column = resolveColumnName(qi.tableMeta, key);
+    // Same rewrite the INSERT's own params got, then the text-key rule.
+    if (column !== undefined && value !== null) {
+      supplied.set(column, reselectKeyValue(qi, column, coerceWriteValue(qi, key, value)));
+    }
+  }
+  const pk = qi.tableMeta.primaryKey;
+  const missing = pk.filter((c) => !supplied.has(c));
+  if (pk.length > 0 && (missing.length === 0 || (missing.length === 1 && isServerNumberedKey(qi, missing[0]!)))) {
+    return { columns: pk, values: pk.map((c) => (supplied.has(c) ? supplied.get(c) : INSERT_ID)) };
+  }
+  for (const key of uniqueKeyNames(qi.tableMeta)) {
+    if (key.every((c) => supplied.has(c))) return { columns: key, values: key.map((c) => supplied.get(c)) };
+  }
+  const fields = (missing.length > 0 ? missing : pk).map((c) => `"${fieldOf(qi, c)}"`).join(', ');
+  throw new UnsupportedFeatureError(
+    pk.length > 0
+      ? `create on "${qi.table}" without ${fields} in data`
+      : `create on "${qi.table}", which has no primary key,`,
+    qi.dialect.name,
+    'The inserted row is read back by a key, and the engine reports a generated value only for an ' +
+      'AUTO_INCREMENT column. ' +
+      (pk.length > 0
+        ? `Pass ${fields} in data (for a UUID key, generate it client-side, e.g. crypto.randomUUID()), or make the key AUTO_INCREMENT.`
+        : 'Supply every column of a unique key in data, or give the table a primary key.'),
+  );
+}
+
+/**
+ * Whether the server numbers this key column itself, so the driver's insert id
+ * is its new value. `isGenerated` decides when the metadata records it;
+ * metadata that does not (hand-written, or an introspector that leaves it
+ * unset) counts an integer column with a default.
+ */
+function isServerNumberedKey(qi: BuilderCtx, column: string): boolean {
+  const col = qi.tableMeta.columns.find((c) => c.name === column);
+  if (!col) return false;
+  if (col.isGenerated !== undefined) return col.isGenerated;
+  return col.hasDefault && isIntegerColumnType(col.dialectType ?? col.pgType);
+}
+
+/**
+ * Whether a column's database type is an integer type, in the PostgreSQL,
+ * MySQL and code-first spellings. A MySQL display width or sign modifier
+ * (`int(11) unsigned`) is ignored, except that `tinyint(1)` is MySQL's
+ * BOOLEAN and is not counted.
+ */
+function isIntegerColumnType(dbType: string | undefined): boolean {
+  if (!dbType) return false;
+  const t = dbType.trim().toLowerCase();
+  if (t === 'tinyint(1)') return false;
+  const base = t
+    .replace(/\s+(unsigned|signed|zerofill)\b/g, '')
+    .replace(/\s*\(\s*\d+\s*\)$/, '')
+    .trim();
+  return INTEGER_COLUMN_TYPES.has(base);
+}
+
+const INTEGER_COLUMN_TYPES: ReadonlySet<string> = new Set([
+  'tinyint',
+  'smallint',
+  'mediumint',
+  'int',
+  'integer',
+  'bigint',
+  'int2',
+  'int4',
+  'int8',
+  'serial',
+  'bigserial',
+  'smallserial',
+]);
+
+/** The insert id of `result` as a key value, or E017 when the engine reported none. */
+function generatedKey(qi: BuilderCtx, result: PgCompatQueryResult, key: ReselectKey): unknown {
+  const id = qi.mutationInsertId(result);
+  const positive =
+    (typeof id === 'number' && Number.isSafeInteger(id) && id > 0) ||
+    (typeof id === 'bigint' && id > 0n) ||
+    (typeof id === 'string' && /^[1-9][0-9]*$/.test(id));
+  if (positive) return id;
+  const column = key.columns[key.values.indexOf(INSERT_ID)]!;
+  throw new UnsupportedFeatureError(
+    `create on "${qi.table}" without "${fieldOf(qi, column)}" in data`,
+    qi.dialect.name,
+    `The engine reported no generated value for "${fieldOf(qi, column)}", so the inserted row cannot be read back ` +
+      `and the insert is rolled back. Pass "${fieldOf(qi, column)}" in data, or make it AUTO_INCREMENT.`,
+  );
+}
+
+/**
+ * Column types MySQL compares with a NUMBER numerically, converting each stored
+ * text to a number: `'0zz' = 0` and `'abc' = 0` are both true. A number bound
+ * as a key there is sent as the text the INSERT stored instead.
+ */
+const TEXT_KEY_TYPES: ReadonlySet<string> = new Set([
+  'char',
+  'varchar',
+  'character',
+  'character varying',
+  'bpchar',
+  'nchar',
+  'nvarchar',
+  'text',
+  'tinytext',
+  'mediumtext',
+  'longtext',
+  'binary',
+  'varbinary',
+  'tinyblob',
+  'blob',
+  'mediumblob',
+  'longblob',
+  'uuid',
+  'citext',
+]);
+
+/** A key value as a reselect binds it (see {@link TEXT_KEY_TYPES}). */
+function reselectKeyValue(qi: BuilderCtx, column: string, value: unknown): unknown {
+  if (typeof value !== 'number' && typeof value !== 'bigint') return value;
+  const type = qi.columnPgTypeMap.get(column);
+  return type !== undefined && TEXT_KEY_TYPES.has(type.toLowerCase()) ? String(value) : value;
+}
+
+/**
+ * A re-read by a unique key finds one row. A second one means the engine
+ * matched the key loosely, so which row is the written one is unknown: refused
+ * (E017), which rolls the write back.
+ */
+function assertOneRowByKey(qi: BuilderCtx, operation: string, columns: readonly string[], rows: number): void {
+  if (rows <= 1) return;
+  throw new UnsupportedFeatureError(
+    `${operation} on "${qi.table}"`,
+    qi.dialect.name,
+    `Re-reading the written row by (${columns.map((c) => fieldOf(qi, c)).join(', ')}) matched ${rows} rows, so the ` +
+      'written one cannot be told apart and the write is rolled back. Pass each key value with its column type.',
+  );
 }
 
 /**
@@ -534,6 +790,60 @@ export function buildCreateMany<T extends object>(
   overBindLimit: 'refuse' | 'allow' = 'refuse',
   projection?: WriteProjection,
 ): DeferredQuery<T[]> {
+  const prepared = prepareCreateMany<T>(qi, args, projection);
+  if ('deferred' in prepared) return prepared.deferred;
+  return emitCreateMany<T>(qi, prepared, prepared.rowValues, overBindLimit);
+}
+
+/**
+ * `createMany()` as the statements it runs: one when the rows fit one
+ * statement, else consecutive chunks that each do. The whole call is validated
+ * once, before any chunk is built, so a refusal (a duplicate conflict key in
+ * the last chunk included) sends nothing, and the chunks are sized before any
+ * statement is built, so no engine's own per-statement check refuses one.
+ *
+ * Built eagerly and synchronously: the chunks read state the call set on the
+ * builder (`skipGlobalFilters`), which a concurrent call could change across
+ * an await.
+ */
+export function planCreateMany<T extends object>(
+  qi: BuilderCtx,
+  args: CreateManyArgs<T>,
+  projection?: WriteProjection,
+): { chunks: DeferredQuery<T[]>[]; rowsPerChunk: number } {
+  const prepared = prepareCreateMany<T>(qi, args, projection);
+  if ('deferred' in prepared) return { chunks: [prepared.deferred], rowsPerChunk: args.data.length };
+  const rows = prepared.rowValues;
+  const size = rowsPerStatement(qi, prepared);
+  if (rows.length <= size) return { chunks: [emitCreateMany<T>(qi, prepared, rows, 'allow')], rowsPerChunk: size };
+  const chunks: DeferredQuery<T[]>[] = [];
+  for (let i = 0; i < rows.length; i += size) {
+    chunks.push(emitCreateMany<T>(qi, prepared, rows.slice(i, i + size), 'refuse'));
+  }
+  return { chunks, rowsPerChunk: size };
+}
+
+/** A `createMany` validated against every row, ready to emit in one statement or several. */
+interface PreparedCreateMany {
+  readonly conflict: ConflictPlan | null;
+  /** The inserted columns (unquoted). */
+  readonly columns: string[];
+  readonly insert: Omit<BulkInsertStatementInput, 'rowValues'>;
+  /** Every row's coerced values, in `columns` order. */
+  readonly rowValues: unknown[][];
+  readonly projection: WriteProjection | undefined;
+}
+
+/**
+ * Everything `createMany` checks about the call, over every row, or the whole
+ * answer when no row-values statement is needed (no rows, or rows of pure
+ * defaults).
+ */
+function prepareCreateMany<T extends object>(
+  qi: BuilderCtx,
+  args: CreateManyArgs<T>,
+  projection: WriteProjection | undefined,
+): PreparedCreateMany | { deferred: DeferredQuery<T[]> } {
   const qt = qi.q(qi.table);
   // Validated on every call (UNSAFE only); it acts on onConflict's update.
   qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
@@ -542,10 +852,12 @@ export function buildCreateMany<T extends object>(
   const conflict = args.onConflict === undefined ? null : resolveConflictPlan(qi, args);
   if (args.data.length === 0) {
     return {
-      sql: `SELECT * FROM ${qt} WHERE false`,
-      params: [],
-      transform: () => [],
-      tag: `${qi.table}.createMany`,
+      deferred: {
+        sql: `SELECT * FROM ${qt} WHERE false`,
+        params: [],
+        transform: () => [],
+        tag: `${qi.table}.createMany`,
+      },
     };
   }
 
@@ -564,10 +876,12 @@ export function buildCreateMany<T extends object>(
   // uniformity check above has already established that EVERY row is empty.
   if (keys.length === 0) {
     return {
-      sql: buildDefaultValuesInsert(qi, args.data.length, args.skipDuplicates, projection),
-      params: [],
-      transform: (result) => result.rows.map((row) => parseWriteRow(qi, row, projection) as T),
-      tag: `${qi.table}.createMany`,
+      deferred: {
+        sql: buildDefaultValuesInsert(qi, args.data.length, args.skipDuplicates, projection),
+        params: [],
+        transform: (result) => result.rows.map((row) => parseWriteRow(qi, row, projection) as T),
+        tag: `${qi.table}.createMany`,
+      },
     };
   }
 
@@ -575,6 +889,11 @@ export function buildCreateMany<T extends object>(
     const record = row as Record<string, unknown>;
     return keys.map((key) => coerceWriteValue(qi, key, record[key]));
   });
+  if (conflict) {
+    // Over every row, so a chunked call refuses before its first chunk is sent.
+    assertNoDuplicateKeys(qi, conflict, columns, rowValues);
+    if (qi.dialect.name === 'mysql') assertMysqlBulkUpsert(qi, conflict, columns, rowValues);
+  }
 
   // Use actual Postgres types for array casts in the default PostgreSQL dialect.
   // Enum columns cast to `"EnumName"[]`, the generic text[] fallback would
@@ -605,20 +924,36 @@ export function buildCreateMany<T extends object>(
   // serializes as one array element.
   const hasArrayColumn = columns.some((col) => (qi.columnPgTypeMap.get(col) ?? '').startsWith('_'));
 
-  const insert = {
-    table: qt,
-    columns: quotedColumns,
+  return {
+    conflict,
+    columns,
+    insert: {
+      table: qt,
+      columns: quotedColumns,
+      columnArrayTypes: typeCasts,
+      skipDuplicates: args.skipDuplicates,
+      returning: writeReturningColumns(qi, projection),
+      requireRowValues: hasArrayColumn,
+    },
     rowValues,
-    columnArrayTypes: typeCasts,
-    skipDuplicates: args.skipDuplicates,
-    returning: writeReturningColumns(qi, projection),
-    requireRowValues: hasArrayColumn,
+    projection,
   };
+}
+
+/** One `createMany` statement over `rowValues` (all of a prepared call's rows, or a chunk of them). */
+function emitCreateMany<T extends object>(
+  qi: BuilderCtx,
+  prepared: PreparedCreateMany,
+  rowValues: unknown[][],
+  overBindLimit: 'refuse' | 'allow',
+): DeferredQuery<T[]> {
+  const { conflict, columns, projection } = prepared;
+  const insert = { ...prepared.insert, rowValues };
   if (conflict) {
     return buildBulkUpsert(qi, conflict, insert, columns, overBindLimit, projection) as DeferredQuery<T[]>;
   }
   const built = qi.dialect.buildBulkInsertStatement(insert);
-  if (overBindLimit === 'refuse') assertWithinBindLimit(qi, built.params.length, args.data.length, keys.length);
+  if (overBindLimit === 'refuse') assertWithinBindLimit(qi, built.params.length, rowValues.length, columns.length);
 
   return {
     sql: built.sql,
@@ -627,6 +962,33 @@ export function buildCreateMany<T extends object>(
     tag: `${qi.table}.createMany`,
   };
 }
+
+/**
+ * Rows one `createMany` statement may carry: the most that keep its bind
+ * parameters within the engine's limit and, on SQL Server, its rows within
+ * the 1000 a plain `INSERT ... VALUES` accepts. The parameter cost is measured
+ * from one-row and two-row builds, which separates the per-row parameters from
+ * the ones bound once per statement (an onConflict update's values); the
+ * PostgreSQL UNNEST form binds one array per column, so its rows never run out.
+ */
+function rowsPerStatement(qi: BuilderCtx, prepared: PreparedCreateMany): number {
+  const cap = qi.dialect.name === 'mssql' && !prepared.conflict ? MSSQL_MAX_INSERT_ROWS : Number.POSITIVE_INFINITY;
+  const limit = maxBindParameters(qi.dialect);
+  const rows = prepared.rowValues;
+  if (limit === undefined || rows.length < 2) return cap;
+  const one = emitCreateMany(qi, prepared, rows.slice(0, 1), 'allow').params.length;
+  const perRow = emitCreateMany(qi, prepared, rows.slice(0, 2), 'allow').params.length - one;
+  if (perRow <= 0) return cap;
+  const fixed = Math.max(0, one - perRow);
+  return Math.max(1, Math.min(cap, Math.floor((limit - fixed) / perRow)));
+}
+
+/**
+ * Rows SQL Server takes in one `INSERT ... VALUES` (error 10738 past it). Its
+ * `MERGE` (onConflict) reads the rows as a derived table, which has no such cap.
+ * mssql.ts refuses a larger statement itself; this sizes chunks below it.
+ */
+const MSSQL_MAX_INSERT_ROWS = 1000;
 
 // ---------------------------------------------------------------------------
 // createMany({ onConflict }): the multi-row upsert
@@ -846,6 +1208,49 @@ function assertNoDuplicateKeys(
 }
 
 /**
+ * The E003 for two rows of one `createMany({ onConflict })` that share a key
+ * only under the column's comparison rules (a case-insensitive collation, a
+ * `citext` column), which the byte-equality check above cannot see.
+ */
+function conflictKeySharedError(qi: BuilderCtx, target: readonly string[], cause?: unknown): ValidationError {
+  return new ValidationError(
+    `createMany onConflict on "${qi.table}": two rows in this call share the conflict key ` +
+      `(${target.map((c) => fieldOf(qi, c)).join(', ')}) under the column's comparison rules (a case-insensitive ` +
+      'collation, for example), so one statement would insert or update one row twice. Merge those rows first.',
+    cause === undefined ? undefined : { cause },
+  );
+}
+
+/**
+ * `err` from running a `createMany({ onConflict })`, with the engine's
+ * "one statement touched one row twice" errors (PostgreSQL 21000, SQL Server
+ * 8672) turned into the E003 that names the cause. Anything else is returned
+ * as it was.
+ */
+export function explainConflictKeyCollision(
+  qi: BuilderCtx,
+  args: { readonly onConflict?: unknown },
+  err: unknown,
+): unknown {
+  if (args.onConflict === undefined || !touchedRowTwice(err)) return err;
+  const raw = (args.onConflict as { target?: unknown }).target;
+  const target = Array.isArray(raw)
+    ? raw.map((f) => (typeof f === 'string' ? (resolveColumnName(qi.tableMeta, f) ?? f) : String(f)))
+    : [];
+  return conflictKeySharedError(qi, target, err);
+}
+
+/** PostgreSQL 21000 or SQL Server 8672 on `err` or a cause under it (Turbine wraps or scrubs driver errors). */
+function touchedRowTwice(err: unknown): boolean {
+  let e = err as { code?: unknown; sqlstate?: unknown; number?: unknown; cause?: unknown } | null | undefined;
+  for (let depth = 0; depth < 4 && e && typeof e === 'object'; depth++) {
+    if (e.code === '21000' || e.sqlstate === '21000' || e.number === 8672) return true;
+    e = e.cause as typeof e;
+  }
+  return false;
+}
+
+/**
  * MySQL's ON DUPLICATE KEY UPDATE has no conflict target: it fires on
  * WHATEVER unique key a row violates, and with several matching keys it
  * updates one row. So the target must be the only key a row can violate, and
@@ -876,18 +1281,17 @@ function assertMysqlBulkUpsert(
         'per row, or pass skipGlobalFilters: UNSAFE.',
     );
   }
-  const target = new Set(conflict.target);
+  // The single-row upsert's rule (otherCollidingUniqueKey), on column presence
+  // so the verdict does not depend on the rows' values.
   const present = new Set(columns);
-  for (const key of uniqueKeyNames(qi.tableMeta)) {
-    if (key.length === target.size && key.every((c) => target.has(c))) continue;
-    if (key.every((c) => present.has(c))) {
-      throw fix(
-        `with target (${conflict.target.map((c) => fieldOf(qi, c)).join(', ')})`,
-        `"${qi.table}" has another unique key (${key.map((c) => fieldOf(qi, c)).join(', ')}) whose columns are in ` +
-          "data, and MySQL's ON DUPLICATE KEY UPDATE cannot be limited to one key. Leave the other key's columns " +
-          'out of data, or use another engine.',
-      );
-    }
+  const other = otherCollidingUniqueKey(qi.tableMeta, [conflict.target], (c) => (present.has(c) ? 'value' : 'absent'));
+  if (other) {
+    throw fix(
+      `with target (${conflict.target.map((c) => fieldOf(qi, c)).join(', ')})`,
+      `"${qi.table}" has another unique key (${other.map((c) => fieldOf(qi, c)).join(', ')}) that a row in data can ` +
+        "collide on, and MySQL's ON DUPLICATE KEY UPDATE cannot be limited to one key, so it could update a row the " +
+        'target does not name. Call upsert() per row (it looks each row up first), or leave that key out of data.',
+    );
   }
   const at = conflict.target.map((c) => columns.indexOf(c));
   if (rowValues.some((row) => at.some((j) => row[j] === null || row[j] === undefined))) {
@@ -910,8 +1314,8 @@ function buildKeyReselect(
   const at = conflict.target.map((c) => columns.indexOf(c));
   const params: unknown[] = [];
   const tuples = rowValues.map((row) => {
-    const refs = at.map((j) => {
-      params.push(row[j]);
+    const refs = at.map((j, k) => {
+      params.push(reselectKeyValue(qi, conflict.target[k]!, row[j]));
       return qi.p(params.length);
     });
     return refs.length === 1 ? refs[0] : `(${refs.join(', ')})`;
@@ -932,9 +1336,8 @@ function buildBulkUpsert(
   overBindLimit: 'refuse' | 'allow',
   projection: WriteProjection | undefined,
 ): DeferredQuery<Record<string, unknown>[]> {
+  // The duplicate-key and MySQL checks ran over every row in prepareCreateMany.
   const rowValues = insert.rowValues;
-  assertNoDuplicateKeys(qi, conflict, columns, rowValues);
-  if (qi.dialect.name === 'mysql') assertMysqlBulkUpsert(qi, conflict, columns, rowValues);
   // `updatedAt` columns are stamped on the conflict-UPDATE as update() stamps
   // them, unless the update names the column.
   const updateData = conflict.update ? applyUpdatedAtColumns(qi, conflict.update) : null;
@@ -985,7 +1388,13 @@ function buildBulkUpsert(
         ? async (exec) => {
             await exec(built.sql, built.params);
             const sel = buildKeyReselect(qi, conflict, columns, rowValues, projection);
-            return exec(sel.sql, sel.params);
+            const result = await exec(sel.sql, sel.params);
+            // Every row was inserted or updated and byte-equal keys were
+            // refused up front, so fewer rows back means two rows' keys are
+            // equal under the column's collation and MySQL applied the second
+            // as an update of the first. Refused, which rolls the call back.
+            if (result.rows.length < rowValues.length) throw conflictKeySharedError(qi, conflict.target);
+            return result;
           }
         : undefined,
   };
@@ -1137,10 +1546,15 @@ export function buildUpdate<T extends object>(
     reselect:
       qi.dialect.resultStrategy === 'reselect'
         ? async (exec) => {
-            // Runs in one transaction (executeMutation). When `data` changes a
-            // column `where` names, the row is locked and re-read by its key,
-            // since `where` no longer finds it after the write.
-            const key = dataMovesRow(qi, userWhere, dataObj) ? await lockKeyOf(qi, exec, whereObj, dataObj) : undefined;
+            // Runs in one transaction (executeMutation), savepointed inside a
+            // caller's. When the write may move the row out of `where` (it sets
+            // a column `where` reads, the version column included), the row is
+            // locked and re-read by its key, since `where` no longer finds it.
+            const written = namedColumns(qi.tableMeta, dataObj);
+            if (lock) written.add(qi.toColumn(lock.field));
+            const key = writeMayMoveRow(qi, whereObj, written)
+              ? await lockMovedRowKey(qi, exec, whereObj, dataObj, 'update', allowFullTableScan)
+              : undefined;
             if (key === null) return { rows: [], rowCount: 0 };
             const writeResult = await exec(sql, params, preparedName);
             // Optimistic-lock conflict: the version-checked UPDATE matched no
@@ -1156,7 +1570,18 @@ export function buildUpdate<T extends object>(
               });
             }
             const sel = buildReselectByWhere(qi, key ?? whereObj, projection);
-            return exec(sel.sql, sel.params);
+            const result = await exec(sel.sql, sel.params);
+            // `update` writes one row; more than one here means the engine
+            // matched the where loosely, and the write is rolled back.
+            if (key || !allowFullTableScan) {
+              assertOneRowByKey(
+                qi,
+                'update',
+                key ? identityColumns(qi) : whereColumns(qi, userWhere),
+                result.rows.length,
+              );
+            }
+            return result;
           }
         : undefined,
   };
@@ -1230,6 +1655,9 @@ export function buildDelete<T extends object>(
             // concurrent deletes of one row exactly one reports it.
             const sel = buildReselectByWhere(qi, whereObj, projection, true);
             const pre = await exec(sel.sql, sel.params);
+            // `delete` removes one row; refused before the DELETE when the
+            // engine matched the where loosely.
+            if (!allowFullTableScan) assertOneRowByKey(qi, 'delete', whereColumns(qi, userWhere), pre.rows.length);
             const deleted = await exec(entry.sql, params, entry.name);
             return (deleted.rowCount ?? 0) === 0 ? { rows: [], rowCount: 0 } : pre;
           }
@@ -1287,6 +1715,11 @@ export function assertNoOptimisticLock(qi: BuilderCtx, args: object, operation: 
  * - `empty-update`: an `update` with no fields has no `DO UPDATE SET` to emit;
  *   every engine rejected the statement as a syntax error. Prisma reads it as
  *   "create it if it is missing", which the lookup answers.
+ * - `other-unique-key` (MySQL): `ON DUPLICATE KEY UPDATE` has no conflict
+ *   target and updates whichever row a unique key collides on first, so when
+ *   `create` could also collide on a unique key `where` does not pin (the
+ *   primary key included), it could update a row `where` does not name
+ *   (otherCollidingUniqueKey).
  * - `global-filter`: MySQL's `ON DUPLICATE KEY UPDATE` has no predicate slot
  *   and SQL Server's MERGE cannot take the builder's column references there,
  *   so the table's global filter cannot guard the conflict update. The lookup
@@ -1295,7 +1728,7 @@ export function assertNoOptimisticLock(qi: BuilderCtx, args: object, operation: 
  *
  * Reads `currentSkip`, so it resolves `skipGlobalFilters` itself first.
  */
-export type UpsertLookupReason = 'where-differs' | 'empty-update' | 'global-filter';
+export type UpsertLookupReason = 'where-differs' | 'empty-update' | 'other-unique-key' | 'global-filter';
 
 export function upsertLookupReason<T extends object>(qi: BuilderCtx, args: UpsertArgs<T>): UpsertLookupReason | null {
   assertNoOptimisticLock(qi, args, 'upsert');
@@ -1303,6 +1736,8 @@ export function upsertLookupReason<T extends object>(qi: BuilderCtx, args: Upser
   const create = (args.create ?? {}) as Record<string, unknown>;
   if (!upsertWhereMatchesCreate(qi.tableMeta, where, create)) return 'where-differs';
   if (writeEntries(qi, (args.update ?? {}) as Record<string, unknown>).length === 0) return 'empty-update';
+  // By name, not by a hook: every engine dialect spreads postgresDialect.
+  if (qi.dialect.name === 'mysql' && upsertCreateCollidingKey(qi.tableMeta, where, create)) return 'other-unique-key';
   if (!qi.dialect.supportsUpsertUpdateWhere) {
     qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
     const filter = whereMod.resolveGlobalFilter(qi, qi.table);
@@ -1314,8 +1749,22 @@ export function upsertLookupReason<T extends object>(qi: BuilderCtx, args: Upser
 }
 
 /** The refusal `buildUpsert` raises for each reason, naming the way forward. */
-function upsertStatementRefusal(qi: BuilderCtx, reason: UpsertLookupReason, where: Record<string, unknown>): Error {
+function upsertStatementRefusal(
+  qi: BuilderCtx,
+  reason: UpsertLookupReason,
+  where: Record<string, unknown>,
+  create: Record<string, unknown>,
+): Error {
   const call = 'Call `upsert()` unbatched: it looks the row up by `where` first.';
+  if (reason === 'other-unique-key') {
+    const key = upsertCreateCollidingKey(qi.tableMeta, where, create) ?? [];
+    return new UnsupportedFeatureError(
+      `a batched upsert on "${qi.table}" whose \`create\` also sets another unique key${key.length > 0 ? ` (${key.map((c) => fieldOf(qi, c)).join(', ')})` : ''},`,
+      qi.dialect.name,
+      'ON DUPLICATE KEY UPDATE updates whichever row a unique key collides on first, which may not be the row `where` names. ' +
+        call,
+    );
+  }
   if (reason === 'global-filter') {
     return new UnsupportedFeatureError(
       `a batched upsert on "${qi.table}", which has a global filter,`,
@@ -1365,7 +1814,9 @@ export function buildUpsert<T extends object>(
   // `upsert()` never reaches here with a reason (it looks the row up instead),
   // so this refuses only a batched upsert, which has no round trip to spare.
   const lookupReason = upsertLookupReason(qi, args);
-  if (lookupReason) throw upsertStatementRefusal(qi, lookupReason, upsertWhere);
+  if (lookupReason) {
+    throw upsertStatementRefusal(qi, lookupReason, upsertWhere, args.create as Record<string, unknown>);
+  }
   // Build the INSERT part from create data
   const createEntries = writeEntries(qi, args.create as Record<string, unknown>);
   const columns = createEntries.map(([k]) => qi.toSqlColumn(k));
@@ -1399,7 +1850,8 @@ export function buildUpsert<T extends object>(
     args.update as Record<string, unknown>,
     args.create as Record<string, unknown>,
   ) as Record<string, unknown>;
-  const updateEntries = writeEntries(qi, applyUpdatedAtColumns(qi, update));
+  const stampedUpdate = applyUpdatedAtColumns(qi, update);
+  const updateEntries = writeEntries(qi, stampedUpdate);
   const params: unknown[] = [...createParams];
   const setClauses = buildSetClauses(qi, updateEntries, params, {
     operation: 'upsert',
@@ -1477,15 +1929,27 @@ export function buildUpsert<T extends object>(
     reselect:
       qi.dialect.resultStrategy === 'reselect'
         ? async (exec) => {
-            const lookup = (whereMod.mergeGlobalFilter(qi, upsertWhere) ?? {}) as Record<string, unknown>;
-            // An update that changes a `where` column moves the row out of
+            const lookup = (whereMod.mergeGlobalFilter(qi, textSafeKeyWhere(qi, upsertWhere)) ?? {}) as Record<
+              string,
+              unknown
+            >;
+            // An update that sets a column `where` reads moves the row out of
             // `where`'s reach: lock it and re-read it by its key. An insert
-            // matches `where` (this path requires `where` pinned to `create`).
-            const moved = update ?? {};
-            const key = dataMovesRow(qi, upsertWhere, moved) ? await lockKeyOf(qi, exec, lookup, moved) : undefined;
+            // matches `where` (this path requires `where` pinned to `create`),
+            // so a row that is not there yet is re-read by `where`.
+            const key = writeMayMoveRow(qi, lookup, namedColumns(qi.tableMeta, stampedUpdate))
+              ? await lockMovedRowKey(qi, exec, lookup, stampedUpdate, 'upsert', false)
+              : undefined;
             await exec(sql, params);
             const sel = buildReselectByWhere(qi, key ?? lookup, projection);
-            return exec(sel.sql, sel.params);
+            const result = await exec(sel.sql, sel.params);
+            assertOneRowByKey(
+              qi,
+              'upsert',
+              key ? identityColumns(qi) : whereColumns(qi, upsertWhere),
+              result.rows.length,
+            );
+            return result;
           }
         : undefined,
   };
@@ -1849,6 +2313,23 @@ export function assertNoGeneratedColumns(qi: BuilderCtx, data: Record<string, un
 const ARITHMETIC_SQL: Readonly<Record<string, string>> = { increment: '+', decrement: '-', multiply: '*', divide: '/' };
 
 /**
+ * The SQL operator for one arithmetic update operator on one column.
+ *
+ * `divide` on a MySQL INTEGER column is `DIV`. MySQL's `/` is decimal
+ * division, so `75 / 2` is 37.5 and the assignment back to an INT rounds it
+ * to 38, where PostgreSQL's integer division truncates to 37. `DIV` truncates
+ * toward zero, as PostgreSQL does. Decided by the COLUMN TYPE alone, never by
+ * the bound divisor: the SQL text must not depend on a value, or the template
+ * cache would serve one shape to the other.
+ */
+function arithmeticSql(qi: BuilderCtx, op: string, column: string): string {
+  if (op === 'divide' && qi.dialect.name === 'mysql' && isIntegerColumnType(qi.columnPgTypeMap.get(column))) {
+    return 'DIV';
+  }
+  return ARITHMETIC_SQL[op]!;
+}
+
+/**
  * The atomic operator a SET value names, or `null` when it is a plain value.
  * THE one rule, read by the SET build, its fingerprint and its cache-hit param
  * collector, so the three cannot disagree about whether a value is an
@@ -1980,7 +2461,7 @@ function compileSetEntry(qi: BuilderCtx, key: string, value: unknown, params: un
     params.push(opValue);
     const ref = ctx.target ? `${ctx.target}.${col}` : col;
     // Reads only its own column, which no ordering needs to respect.
-    return { sql: `${col} = ${ref} ${ARITHMETIC_SQL[op]} ${qi.p(params.length)}`, column, reads: NO_READS };
+    return { sql: `${col} = ${ref} ${arithmeticSql(qi, op, column)} ${qi.p(params.length)}`, column, reads: NO_READS };
   }
   // A misspelled operator gets its own E003 before the bind seam's general
   // shape check.

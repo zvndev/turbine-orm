@@ -456,7 +456,8 @@ describe('MySQL refusals: ON DUPLICATE KEY UPDATE fires on any unique key and ha
     const statements: [string, unknown[]][] = [];
     await built.reselect(async (sql: string, params: unknown[]) => {
       statements.push([sql, params]);
-      return { rows: [], rowCount: 0 };
+      // One row per written key, as MySQL answers the re-read.
+      return { rows: [{}, {}], rowCount: 2 };
     });
     assert.equal(statements.length, 2);
     assert.deepEqual(statements[1], ['SELECT `key`, `hits` FROM `counters` WHERE `key` IN (:p1, :p2)', ['a', 'b']]);
@@ -489,13 +490,13 @@ describe('engines without a multi-row upsert', () => {
 // ---------------------------------------------------------------------------
 
 describe('createMany() past the bind-parameter limit', () => {
-  function recording(dialect: Dialect) {
+  function recording(dialect: Dialect, rows: Record<string, unknown>[] = [{ id: 1 }]) {
     const sent: { sql: string; params: number }[] = [];
     const query = async (text: unknown, values?: unknown[]) => {
       const sql = typeof text === 'string' ? text : (text as { text: string }).text;
       const params = typeof text === 'string' ? (values ?? []) : ((text as { values?: unknown[] }).values ?? []);
       sent.push({ sql, params: params.length });
-      return { rows: [{ id: 1 }], rowCount: 1 };
+      return { rows, rowCount: rows.length };
     };
     const qi: Any = new QueryInterface(
       { query, connect: async () => ({ query, release() {} }) } as Any,
@@ -550,7 +551,8 @@ describe('createMany() past the bind-parameter limit', () => {
   });
 
   it('MySQL: the write and its re-read run in one transaction', async () => {
-    const { qi, sent } = recording(mysqlDialect);
+    // The re-read answers one row per written key.
+    const { qi, sent } = recording(mysqlDialect, [{ id: 1 }, { id: 2 }]);
     await qi.createMany({ data: ROWS, onConflict: { target: ['key'], update: ['hits'] } });
     assert.deepEqual(
       sent.map((s) => s.sql.split(' ')[0]),
