@@ -15,10 +15,12 @@
  *
  * This module removes the drift BY CONSTRUCTION:
  *   - {@link walkWhere} is the ONE enumeration. It sorts keys canonically,
- *     skips `undefined`, dispatches the `OR`/`AND`/`NOT` combinators and
- *     relation filters, and yields a flat, ordered {@link WhereEvent} stream.
- *     All three consumers iterate this same stream, so their key order and
- *     combinator structure can never diverge again.
+ *     drops absent values (`undefined`, and objects made only of them, see
+ *     {@link isAbsentWhereValue}), dispatches the `OR`/`AND`/`NOT` combinators
+ *     and relation filters, and yields a flat, ordered {@link WhereEvent}
+ *     stream whose values are already pruned. All three consumers iterate this
+ *     same stream, so their key order, combinator structure and view of
+ *     `undefined` can never diverge.
  *   - {@link classifyScalarForSql} is the ONE scalar-shape decision the SQL
  *     paths use. `buildWhereClause` and `collectWhereParams` BOTH call it with
  *     the same `(rawColumn, value)`, so they always take the same branch and
@@ -37,17 +39,21 @@
 import { ValidationError } from '../errors.js';
 import type { RelationDef, TableMetadata } from '../schema.js';
 import {
+  dropAbsentKeys,
   findArrayUniqueKey,
   findJsonUniqueKey,
   fingerprintArrayFilterShape,
   fingerprintJsonFilterShape,
   fingerprintOperatorShape,
+  isAbsentWhereValue,
   isArrayFilter,
   isJsonFilter,
   isTextSearchFilter,
   isUnmatchedPlainObject,
   isVectorFilter,
   isWhereOperator,
+  pruneAbsentKeys,
+  RELATION_FILTER_WRAPPERS,
   sortedKeys,
   VECTOR_DISTANCE_COMPARATORS,
 } from './filters.js';
@@ -149,38 +155,43 @@ export type WhereEvent =
 
 /** True when a normalized relation filter carries at least one cardinality key. */
 function isRelationFilterObj(filterObj: WhereRecord): boolean {
-  return (
-    'some' in filterObj || 'every' in filterObj || 'none' in filterObj || 'is' in filterObj || 'isNot' in filterObj
-  );
+  return RELATION_FILTER_WRAPPERS.some((wrapper) => wrapper in filterObj);
+}
+
+/** `OR` / `AND` members with the absent ones removed (by reference when none are). */
+function presentConditions(arr: WhereRecord[]): WhereRecord[] {
+  return arr.some((cond) => isAbsentWhereValue(cond)) ? arr.filter((cond) => !isAbsentWhereValue(cond)) : arr;
 }
 
 /**
- * THE canonical WHERE enumeration. Yields events in sorted-key order (skipping
- * `undefined`), dispatching combinators and relation filters, so every consumer
- * (fingerprint, SQL build, param collect) walks identically.
+ * THE canonical WHERE enumeration. Yields events in sorted-key order, skipping
+ * absent values, dispatching combinators and relation filters, so every
+ * consumer (fingerprint, SQL build, param collect) walks identically.
  *
- * Combinator SKIP rules match the historical code exactly: an `OR`/`AND` whose
- * value is a non-array or an empty array is skipped entirely (it contributes
- * neither SQL, params, nor a fingerprint token); `NOT` is always emitted.
- * A key that names a relation but whose value is not a `{ some/every/none/is/
- * isNot }` filter falls through to the scalar path, exactly as before.
+ * `undefined` means absent at every key and depth, the same rule the args seam
+ * applies, and decided HERE so the three consumers cannot disagree about it: a
+ * key whose value is absent is skipped, an absent `OR` / `AND` member is
+ * dropped, a relation wrapper whose body is absent is dropped, and a scalar
+ * value reaches its consumer with its absent keys pruned
+ * ({@link pruneAbsentKeys}). An object written empty is left as written.
+ *
+ * Combinator SKIP rules: an `OR`/`AND` whose value is a non-array or an empty
+ * array (after absent members are dropped) is skipped entirely (it contributes
+ * neither SQL, params, nor a fingerprint token); a present `NOT` is always
+ * emitted. A key that names a relation but whose value is not a `{ some/every/
+ * none/is/isNot }` filter falls through to the scalar path.
  */
 export function walkWhere(host: WhereHost, where: WhereRecord): WhereEvent[] {
   const events: WhereEvent[] = [];
   for (const key of sortedKeys(where)) {
     const value = where[key];
-    if (value === undefined) continue;
+    if (isAbsentWhereValue(value)) continue;
 
-    if (key === 'OR') {
-      const arr = value as WhereRecord[];
-      if (!Array.isArray(arr) || arr.length === 0) continue;
-      events.push({ kind: 'or', conditions: arr });
-      continue;
-    }
-    if (key === 'AND') {
-      const arr = value as WhereRecord[];
-      if (!Array.isArray(arr) || arr.length === 0) continue;
-      events.push({ kind: 'and', conditions: arr });
+    if (key === 'OR' || key === 'AND') {
+      if (!Array.isArray(value)) continue;
+      const conditions = presentConditions(value as WhereRecord[]);
+      if (conditions.length === 0) continue;
+      events.push({ kind: key === 'OR' ? 'or' : 'and', conditions });
       continue;
     }
     if (key === 'NOT') {
@@ -195,14 +206,14 @@ export function walkWhere(host: WhereHost, where: WhereRecord): WhereEvent[] {
     // event carries the DECLARED name, which is what reaches the fingerprint.
     const resolvedRel = resolveRelation(host.tableMeta.relations, key);
     if (resolvedRel && typeof value === 'object' && value !== null && !Array.isArray(value)) {
-      const filterObj = host.normalizeRelationFilter(resolvedRel.def, value as WhereRecord);
+      const filterObj = host.normalizeRelationFilter(resolvedRel.def, dropAbsentKeys(value as WhereRecord));
       if (isRelationFilterObj(filterObj)) {
         events.push({ kind: 'relation', key: resolvedRel.name, relDef: resolvedRel.def, filterObj });
         continue;
       }
     }
 
-    events.push({ kind: 'scalar', key, value });
+    events.push({ kind: 'scalar', key, value: pruneAbsentKeys(value) });
   }
   return events;
 }

@@ -40,6 +40,7 @@ import { TurbineError } from '../errors.js';
 import { capabilitiesFromVersion, type PowdbPool } from '../powdb.js';
 import { PowqlInterface } from '../powql.js';
 import { includeKeysForBatching } from '../query/batched-loader.js';
+import { col } from '../query/column-ref.js';
 import { expandCompoundUniqueWhere } from '../query/compound-unique.js';
 import type { DeferredQuery } from '../query/deferred.js';
 import type { SchemaMetadata } from '../schema.js';
@@ -135,7 +136,7 @@ const SURFACES: Surface[] = [
   {
     name: 'where { col } reference',
     ...NUMERIC,
-    build: (n) => q().buildFindMany({ where: { viewCount: { gt: { col: n } } } } as never),
+    build: (n) => q().buildFindMany({ where: { viewCount: { gt: col(n) } } } as never),
   },
   {
     name: 'where (JSON path filter)',
@@ -199,7 +200,7 @@ const SURFACES: Surface[] = [
   { name: 'distinct', build: (n) => q().buildFindMany({ distinct: [n] } as never) },
   {
     name: 'cursor',
-    build: (n) => q().buildFindMany({ cursor: { [n]: 1 }, orderBy: { [n]: 'asc' } } as never),
+    build: (n) => q().buildFindMany({ cursor: { [n]: 1, id: 1 }, orderBy: { [n]: 'asc' } } as never),
   },
 
   // -- reads: aggregation ----------------------------------------------------
@@ -401,7 +402,11 @@ describe('column spelling symmetry: two arguments of one call may disagree on sp
         // spelled one column differently never matched: the lookup missed, the
         // seek defaulted to ascending, and the query emitted `col > $n` under
         // `ORDER BY col DESC`. No error, just the wrong page.
-        const d = q().buildFindMany({ cursor: { [cursor]: 1 }, orderBy: { [order]: 'desc' }, limit: 2 } as never);
+        const d = q().buildFindMany({
+          cursor: { [cursor]: 1, id: 1 },
+          orderBy: { [order]: 'desc' },
+          limit: 2,
+        } as never);
         assert.match(d.sql, /"created_at" < \$/, `cursor:${cursor} orderBy:${order} sought the wrong way`);
         assert.doesNotMatch(d.sql, /"created_at" > \$/);
       });
@@ -800,14 +805,15 @@ describe('column spelling symmetry: both spellings return the same ROWS', () => 
       // The compile arm pins the operator; this pins the rows it returns.
       name: 'cursor seek (descending)',
       table: 'articles',
-      camel: { cursor: { viewCount: 2 }, orderBy: { viewCount: 'desc' }, limit: 3 },
-      snake: { cursor: { view_count: 2 }, orderBy: { view_count: 'desc' }, limit: 3 },
+      // A cursor carries a value for every ordered column, the id tiebreaker too.
+      camel: { cursor: { viewCount: 2, id: 0 }, orderBy: { viewCount: 'desc' }, limit: 3 },
+      snake: { cursor: { view_count: 2, id: 0 }, orderBy: { view_count: 'desc' }, limit: 3 },
     },
     {
       name: 'cursor seek (ascending)',
       table: 'articles',
-      camel: { cursor: { viewCount: 0 }, orderBy: { viewCount: 'asc' }, limit: 3 },
-      snake: { cursor: { view_count: 0 }, orderBy: { view_count: 'asc' }, limit: 3 },
+      camel: { cursor: { viewCount: 0, id: Number.MAX_SAFE_INTEGER }, orderBy: { viewCount: 'asc' }, limit: 3 },
+      snake: { cursor: { view_count: 0, id: Number.MAX_SAFE_INTEGER }, orderBy: { view_count: 'asc' }, limit: 3 },
     },
     {
       name: 'relation with, child orderBy + select',

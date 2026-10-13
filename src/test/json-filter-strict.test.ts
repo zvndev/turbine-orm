@@ -152,7 +152,7 @@ describe('JSON filter: substring operators', () => {
   });
 
   it('does not disturb the existing operators', () => {
-    assert.deepEqual(q().buildFindMany({ where: { meta: { path: ['t'], equals: 'v' } } }).params, [['t'], 'v']);
+    assert.deepEqual(q().buildFindMany({ where: { meta: { path: ['t'], equals: 'v' } } }).params, [['t'], '"v"']);
     assert.deepEqual(q().buildFindMany({ where: { meta: { hasKey: 'k' } } }).params, ['k']);
     assert.match(q().buildFindMany({ where: { meta: { contains: { a: 1 } } } }).sql, /@>/);
   });

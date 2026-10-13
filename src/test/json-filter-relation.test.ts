@@ -6,7 +6,7 @@
  * `buildSubWhereForRelation` never checked `isJsonFilter`, so the filter
  * object fell through to the equality branch and bound as a jsonb equality
  * value, compiling to `t."data" = $N` (matches nothing) instead of the
- * `#>>` path extraction the identical top-level filter produces.
+ * path comparison the identical top-level filter produces.
  *
  * Also covers the SQL-cache lockstep requirement: the same findMany run
  * twice must produce byte-identical SQL AND identical params (the second run
@@ -88,12 +88,12 @@ const JSON_WHERE = {
 } as never;
 
 describe('JsonFilter inside relation filters', () => {
-  it('some: compiles the #>> path extraction (the exact repro)', () => {
+  it('some: compiles the typed path comparison (the exact repro)', () => {
     const q = makeQuery('documents', buildSchema());
     const d = q.buildFindMany({ where: JSON_WHERE });
     assert.match(d.sql, /EXISTS \(SELECT 1 FROM "document_versions"/);
-    assert.match(d.sql, /"document_versions"\."data" #>> \$1::text\[\] = \$2/);
-    assert.deepEqual(d.params, [['statusEnum', 'value'], 'live']);
+    assert.match(d.sql, /\("document_versions"\."data" #> \$1::text\[\]\)::jsonb = \$2::jsonb/);
+    assert.deepEqual(d.params, [['statusEnum', 'value'], '"live"']);
   });
 
   it('some: does NOT bind the filter object as a jsonb equality value', () => {
@@ -113,8 +113,8 @@ describe('JsonFilter inside relation filters', () => {
       where: { documentVersions: { none: { data: { path: ['a'], equals: 'x' } } } } as never,
     });
     assert.match(d.sql, /NOT EXISTS \(SELECT 1 FROM "document_versions"/);
-    assert.match(d.sql, /"document_versions"\."data" #>> \$1::text\[\] = \$2/);
-    assert.deepEqual(d.params, [['a'], 'x']);
+    assert.match(d.sql, /\("document_versions"\."data" #> \$1::text\[\]\)::jsonb = \$2::jsonb/);
+    assert.deepEqual(d.params, [['a'], '"x"']);
   });
 
   it('every: compiles the path extraction inside NOT EXISTS ... NOT (...)', () => {
@@ -123,8 +123,8 @@ describe('JsonFilter inside relation filters', () => {
       where: { documentVersions: { every: { data: { path: ['a'], equals: 'x' } } } } as never,
     });
     assert.match(d.sql, /NOT EXISTS \(SELECT 1 FROM "document_versions" WHERE .* AND NOT \(/);
-    assert.match(d.sql, /"document_versions"\."data" #>> \$1::text\[\] = \$2/);
-    assert.deepEqual(d.params, [['a'], 'x']);
+    assert.match(d.sql, /\("document_versions"\."data" #> \$1::text\[\]\)::jsonb = \$2::jsonb/);
+    assert.deepEqual(d.params, [['a'], '"x"']);
   });
 
   it('belongsTo (implicit is): JsonFilter on the parent target compiles', () => {
@@ -133,8 +133,8 @@ describe('JsonFilter inside relation filters', () => {
       where: { document: { settings: { path: ['theme'], equals: 'dark' } } } as never,
     });
     assert.match(d.sql, /EXISTS \(SELECT 1 FROM "documents"/);
-    assert.match(d.sql, /"documents"\."settings" #>> \$1::text\[\] = \$2/);
-    assert.deepEqual(d.params, [['theme'], 'dark']);
+    assert.match(d.sql, /\("documents"\."settings" #> \$1::text\[\]\)::jsonb = \$2::jsonb/);
+    assert.deepEqual(d.params, [['theme'], '"dark"']);
   });
 
   it('nested relation depth: JsonFilter two levels down compiles', () => {
@@ -146,8 +146,8 @@ describe('JsonFilter inside relation filters', () => {
         },
       } as never,
     });
-    assert.match(d.sql, /"approvals"\."meta" #>> \$1::text\[\] = \$2/);
-    assert.deepEqual(d.params, [['by'], 'qa']);
+    assert.match(d.sql, /\("approvals"\."meta" #> \$1::text\[\]\)::jsonb = \$2::jsonb/);
+    assert.deepEqual(d.params, [['by'], '"qa"']);
   });
 
   it('other JsonFilter ops compile too (contains, hasKey)', () => {
@@ -215,7 +215,7 @@ describe('JsonFilter inside relation filters', () => {
         } as never,
       });
       assert.equal(third.sql, first.sql, 'same shape must reuse the cached SQL');
-      assert.deepEqual(third.params, [['statusEnum', 'value'], 'archived']);
+      assert.deepEqual(third.params, [['statusEnum', 'value'], '"archived"']);
     });
 
     it('JsonFilter and plain-equality shapes never share a cache entry', () => {
@@ -242,7 +242,7 @@ describe('JsonFilter inside relation filters', () => {
       assert.equal(second.sql, first.sql);
       assert.deepEqual(second.params, first.params);
       // Sorted key order: data (json) before status (equality).
-      assert.deepEqual(first.params, [['statusEnum', 'value'], 'live', 'published']);
+      assert.deepEqual(first.params, [['statusEnum', 'value'], '"live"', 'published']);
     });
   });
 
@@ -254,8 +254,8 @@ describe('JsonFilter inside relation filters', () => {
           documentVersions: { where: { data: { path: ['statusEnum', 'value'], equals: 'live' } } },
         } as never,
       });
-      assert.match(d.sql, /t\d+\."data" #>> \$1::text\[\] = \$2/);
-      assert.deepEqual(d.params, [['statusEnum', 'value'], 'live']);
+      assert.match(d.sql, /\(t\d+\."data" #> \$1::text\[\]\)::jsonb = \$2::jsonb/);
+      assert.deepEqual(d.params, [['statusEnum', 'value'], '"live"']);
     });
 
     it('with.where JsonFilter run twice yields identical SQL and params', () => {

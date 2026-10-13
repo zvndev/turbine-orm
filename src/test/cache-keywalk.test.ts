@@ -22,6 +22,7 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { col } from '../query/column-ref.js';
 import type { QueryInterface } from '../query/index.js';
 import type { SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
@@ -356,7 +357,7 @@ describe('key-walk: distinct shapes do NOT collide on one fingerprint', () => {
   });
   it('a column-ref operand vs a literal differ', () => {
     const q = makeQuery('users', schema()) as unknown as QueryInterface<Record<string, unknown>>;
-    const ref = q.fingerprintWhere({ age: { equals: { col: 'score' } } } as never);
+    const ref = q.fingerprintWhere({ age: { equals: col('score') } } as never);
     const lit = q.fingerprintWhere({ age: { equals: 5 } } as never);
     assert.notEqual(ref, lit);
   });

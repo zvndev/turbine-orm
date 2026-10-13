@@ -7,9 +7,9 @@
  */
 
 import { ValidationError } from '../errors.js';
+import { isColumnRef, isPlainColumnRefShape, plainColumnRefMessage } from './column-ref.js';
 import type {
   ArrayFilter,
-  ColumnRef,
   JsonFilter,
   JsonPathOrderBy,
   OrderBySpec,
@@ -66,55 +66,394 @@ export const COLUMN_REF_OPERATORS = new Set<string>(['equals', 'not', 'gt', 'gte
  * THE relation-filter wrappers: the keys whose body is a clause against the
  * relation's TARGET table rather than against this one.
  *
- * One named list, here, because everything that walks a where clause has to
- * agree about them and the copies had already spread. It lived inlined in
- * `where-compile.ts` (`'some' in x || 'every' in x || …`, the SQL compiler's
- * own answer), again in `normalizeRelationFilter` (where.ts) as the negated
- * conjunction of the same five, again in `cli/pii-predicate-guard.ts`, and a
- * fourth time in `prisma-compat.ts` SPLIT across a
- * `RELATION_QUANTIFIERS` set (`some`/`every`/`none`) plus two inline
- * `k === 'is' || k === 'isNot'` tests, which is the copy most likely to drift
- * because half of it does not read as a list and a grep for the list does not
- * find it.
- *
- * The failure mode is not cosmetic: a wrapper the SQL compiler treats as a
- * relation filter but a WALKER does not is a wrapper whose body reaches the
- * builder unwalked. That is precisely the operand-position channel this
- * release closed elsewhere.
+ * Everything that walks a where clause has to agree about them: a wrapper the
+ * SQL compiler treats as a relation filter but a walker does not is a wrapper
+ * whose body reaches the builder unwalked. The SQL walk (`walkWhere` in
+ * where-compile.ts), the bare to-one normalization (`normalizeRelationFilter`
+ * in where.ts) and the PII predicate guard (`cli/pii-predicate-guard.ts`) all
+ * read this list. `prisma-compat.ts` still carries its own copy
+ * (`RELATION_QUANTIFIERS` plus inline `is` / `isNot` tests).
  *
  * `query/` is the right home rather than `cli/` because the direction of the
  * dependency is fixed: `cli/` and the prisma-compat shim may import from the
  * query path, and the query path may never import from `cli/`
  * (`scripts/check-import-cycles.mjs`).
- *
- * ## STATUS: a landing spot, not yet a deduplication. Read this before trusting it.
- *
- * NOTHING IMPORTS THIS YET. The three copies listed above are all still in
- * place and still hand-synced; declaring the canonical home did not by itself
- * move any of them onto it. It is kept, rather than deleted as unused, because
- * `cli/pii-predicate-guard.ts` names this module as where its own copy wants to
- * go, and deleting the destination is the one change that makes converging
- * harder. Wiring the copies up is a separate change: each one sits on a
- * different walk, so each has to be re-tested on its own.
- *
- * So do not read this constant as evidence that the walkers agree. The comment
- * on each copy is still the only thing holding them in step.
  */
 export const RELATION_FILTER_WRAPPERS = ['some', 'none', 'every', 'is', 'isNot'] as const;
 
 /** {@link RELATION_FILTER_WRAPPERS} as a membership set, for the walkers. */
 export const RELATION_FILTER_WRAPPER_SET: ReadonlySet<string> = new Set<string>(RELATION_FILTER_WRAPPERS);
 
+// The column-reference check lives with its constructor; re-exported so the
+// where modules keep one import site for every operand-shape guard.
+export { isColumnRef } from './column-ref.js';
+
+// ---------------------------------------------------------------------------
+// `undefined` means absent
+// ---------------------------------------------------------------------------
+
 /**
- * Check if an operator value is a column reference: a plain object whose ONLY
- * key is `col` with a string value. Anything else (extra keys, non-string
- * `col`) is treated as a plain value so JSON payloads that merely contain a
- * `col` property keep their equality meaning.
+ * Recursion bound for the two absence walks below. Past it a value is treated
+ * as present, which is the safe direction: the where walkers then reach their
+ * own depth cap and refuse the clause by name.
  */
-export function isColumnRef(value: unknown): value is ColumnRef {
-  if (typeof value !== 'object' || value === null || Array.isArray(value) || value instanceof Date) return false;
+const ABSENCE_MAX_DEPTH = 64;
+
+/** A plain object literal (not an array, Date, Buffer or class instance). */
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * THE `undefined` rule for every where position: a value is ABSENT when it is
+ * `undefined`, or when it is a non-empty plain object every one of whose
+ * values is absent (`{ gte: undefined }`, `{ email: undefined }`,
+ * `{ is: { email: undefined } }`). An object written empty (`{}`) is NOT
+ * absent: it keeps whatever meaning, or refusal, its position gives it.
+ *
+ * One predicate rather than a `!== undefined` test per walker, because the
+ * SQL-template cache needs the fingerprint, the SQL build and the cache-hit
+ * param collect to agree about every key. When the fingerprint counted a key
+ * holding `undefined` and the builders skipped it, `{ gte: from, lte: to }`
+ * warmed with `from` undefined served its `<=` statement to a later call with
+ * `to` undefined.
+ */
+export function isAbsentWhereValue(value: unknown, depth = 0): boolean {
+  if (value === undefined) return true;
+  if (depth > ABSENCE_MAX_DEPTH || !isPlainRecord(value)) return false;
   const keys = Object.keys(value);
-  return keys.length === 1 && keys[0] === 'col' && typeof (value as { col?: unknown }).col === 'string';
+  if (keys.length === 0) return false;
+  for (const key of keys) {
+    if (!isAbsentWhereValue(value[key], depth + 1)) return false;
+  }
+  return true;
+}
+
+/**
+ * `value` with every absent key ({@link isAbsentWhereValue}) removed, at every
+ * depth of nested plain objects. Returns the input BY REFERENCE when nothing
+ * is absent, so the common path allocates nothing. Arrays are not entered:
+ * an `undefined` list element is an operand error, not an absent key.
+ * Symbol-keyed properties (internal brands) survive a copy.
+ */
+export function pruneAbsentKeys<T>(value: T, depth = 0): T {
+  if (depth > ABSENCE_MAX_DEPTH || !isPlainRecord(value)) return value;
+  let out: Record<string, unknown> | undefined;
+  const keys = Object.keys(value);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i] as string;
+    const current = value[key];
+    const absent = isAbsentWhereValue(current, depth + 1);
+    const next = absent ? undefined : pruneAbsentKeys(current, depth + 1);
+    if (out === undefined && (absent || next !== current)) {
+      out = copySymbols(value);
+      for (let j = 0; j < i; j++) out[keys[j] as string] = value[keys[j] as string];
+    }
+    if (out !== undefined && !absent) out[key] = next;
+  }
+  return (out ?? value) as T;
+}
+
+/**
+ * Drop the absent keys of ONE object level and leave the values as they are.
+ * For relation-filter wrappers, whose bodies are where clauses that the walk
+ * prunes itself when it reaches them.
+ */
+export function dropAbsentKeys(value: Record<string, unknown>): Record<string, unknown> {
+  let out: Record<string, unknown> | undefined;
+  const keys = Object.keys(value);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i] as string;
+    if (isAbsentWhereValue(value[key])) {
+      if (out === undefined) {
+        out = copySymbols(value);
+        for (let j = 0; j < i; j++) out[keys[j] as string] = value[keys[j] as string];
+      }
+      continue;
+    }
+    if (out !== undefined) out[key] = value[key];
+  }
+  return out ?? value;
+}
+
+/** A fresh object carrying `source`'s own symbol-keyed properties (brands). */
+function copySymbols(source: object): Record<string, unknown> {
+  const out: Record<string, unknown> = Object.getPrototypeOf(source) === null ? Object.create(null) : {};
+  for (const sym of Object.getOwnPropertySymbols(source)) {
+    const descriptor = Object.getOwnPropertyDescriptor(source, sym);
+    if (descriptor) Object.defineProperty(out, sym, descriptor);
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Operand shapes
+// ---------------------------------------------------------------------------
+
+/**
+ * What a column's type allows at a value position. Decided from the column's
+ * type token: json/jsonb take JSON values, an array column (`_text`) takes
+ * arrays, a pgvector column takes a number array, and everything else takes a
+ * scalar.
+ */
+export type OperandColumnKind = 'scalar' | 'array' | 'vector' | 'json';
+
+/** {@link OperandColumnKind} for a column type token (case-insensitive). */
+export function operandColumnKind(columnType: string | undefined): OperandColumnKind {
+  if (columnType === undefined) return 'scalar';
+  const t = columnType.toLowerCase();
+  if (t === 'json' || t === 'jsonb') return 'json';
+  if (t.startsWith('_')) return 'array';
+  if (t === 'vector') return 'vector';
+  return 'scalar';
+}
+
+/**
+ * Built-in containers whose instances serialize to `{}` (or nothing useful)
+ * when a driver JSON-encodes them, so binding one compares against `'{}'`.
+ */
+const NON_SCALAR_BUILTINS: readonly (abstract new (...args: never[]) => object)[] = [
+  Map,
+  Set,
+  WeakMap,
+  WeakSet,
+  Promise,
+  RegExp,
+  Error,
+];
+
+/**
+ * A class instance the driver can bind as one value: one that says how to
+ * render itself (`toPostgres`, `toJSON`, or its own `toString`, as a Decimal
+ * or an interval wrapper does), and is not a built-in container.
+ */
+function isBindableInstance(value: object): boolean {
+  if (NON_SCALAR_BUILTINS.some((ctor) => value instanceof ctor)) return false;
+  const v = value as { toPostgres?: unknown; toJSON?: unknown; toString?: unknown };
+  return (
+    typeof v.toPostgres === 'function' ||
+    typeof v.toJSON === 'function' ||
+    (typeof v.toString === 'function' && v.toString !== Object.prototype.toString)
+  );
+}
+
+/**
+ * A value the driver binds as ONE scalar: a primitive, a Date, a Buffer or
+ * typed array, or a class instance that renders itself (see
+ * {@link isBindableInstance}). A plain object, an array, a Map or Set is not,
+ * and neither is a function, a symbol or `undefined`.
+ */
+function isBindableScalar(value: unknown): boolean {
+  switch (typeof value) {
+    case 'string':
+    case 'number':
+    case 'bigint':
+    case 'boolean':
+      return true;
+    case 'object':
+      break;
+    default:
+      return false;
+  }
+  if (value === null || Array.isArray(value)) return false;
+  if (value instanceof Date || ArrayBuffer.isView(value)) return true;
+  if (isColumnRef(value) || isPlainRecord(value)) return false;
+  return isBindableInstance(value);
+}
+
+/** A non-null value operand that fits a column of `kind`. */
+function fitsColumn(value: unknown, kind: OperandColumnKind): boolean {
+  if (isBindableScalar(value)) return true;
+  if (kind === 'json') {
+    if (value === undefined || typeof value === 'function' || typeof value === 'symbol') return false;
+    return !(typeof value === 'object' && value !== null && NON_SCALAR_BUILTINS.some((c) => value instanceof c));
+  }
+  if (kind === 'array' || kind === 'vector') {
+    return Array.isArray(value) && value.every((el) => el === null || isBindableScalar(el) || Array.isArray(el));
+  }
+  return false;
+}
+
+/** Short, value-free description of an operand for an error message. */
+function describeOperand(value: unknown): string {
+  if (value === null) return 'null';
+  if (value === undefined) return 'undefined';
+  if (Array.isArray(value)) return 'an array';
+  if (isColumnRef(value)) return 'a column reference';
+  if (isPlainRecord(value)) {
+    const keys = Object.keys(value);
+    return keys.length === 0 ? 'an empty object' : `an object with keys ${keys.map((k) => `"${k}"`).join(', ')}`;
+  }
+  if (typeof value === 'object') {
+    const name = (value as { constructor?: { name?: unknown } }).constructor?.name;
+    return typeof name === 'string' && name.length > 0 ? `a ${name} instance` : 'an object';
+  }
+  return `a ${typeof value}`;
+}
+
+const SCALAR_WORDS = 'a string, number, bigint, boolean, Date or Buffer';
+
+function acceptedFor(kind: OperandColumnKind): string {
+  if (kind === 'array') return `an array (or ${SCALAR_WORDS})`;
+  if (kind === 'vector') return 'an array of numbers';
+  if (kind === 'json') return 'a JSON value';
+  return SCALAR_WORDS;
+}
+
+/**
+ * Where an operand sits, for the refusal message and for the column kind it is
+ * checked against. `column` is the label the message prints (the column name,
+ * or the expression a groupBy JSON key compiles to).
+ */
+export interface OperandContext {
+  column: string;
+  table: string;
+  kind: OperandColumnKind;
+}
+
+const COMPARISON_OPERATOR_KEYS = [
+  'equals',
+  'not',
+  'gt',
+  'gte',
+  'lt',
+  'lte',
+  'in',
+  'notIn',
+  'contains',
+  'startsWith',
+  'endsWith',
+] as const;
+
+/**
+ * Validate every operand of an operator object against its column, and throw
+ * {@link ValidationError} (E003) naming the column, the operator, what was
+ * received and what is accepted.
+ *
+ * Called by the SQL build AND the cache-hit param collect with the same
+ * arguments, so a warmed template can never bind an operand the cold build
+ * refuses. Recurses into a `not` operator object. `depth` bounds that
+ * recursion the same way the where walk is bounded.
+ */
+export function assertOperatorOperands(op: Record<string, unknown>, ctx: OperandContext, depth = 0): void {
+  if (depth > ABSENCE_MAX_DEPTH) {
+    throw new ValidationError(`\`not\` operators on "${ctx.column}" nest too deeply; flatten the filter.`);
+  }
+  const where = `on "${ctx.column}" for table "${ctx.table}"`;
+  const mode = op.mode;
+  if (mode !== undefined && mode !== 'default' && mode !== 'insensitive') {
+    throw new ValidationError(
+      `Invalid mode ${typeof mode === 'string' ? JSON.stringify(mode) : describeOperand(mode)} ${where}. ` +
+        "Use 'insensitive' or 'default'.",
+    );
+  }
+  for (const key of COMPARISON_OPERATOR_KEYS) {
+    const value = op[key];
+    if (value === undefined) continue;
+    const refuse = (accepted: string): never => {
+      throw new ValidationError(
+        `Invalid operand for '${key}' ${where}: received ${describeOperand(value)}. '${key}' takes ${accepted}.`,
+      );
+    };
+    if (ctx.kind !== 'json' && COLUMN_REF_OPERATORS.has(key) && isPlainColumnRefShape(value)) {
+      throw new ValidationError(plainColumnRefMessage(value as { col: string }, key, ctx.column, ctx.table));
+    }
+    switch (key) {
+      case 'equals':
+      case 'not': {
+        if (value === null) break;
+        if (isColumnRef(value)) {
+          if (ctx.kind === 'json')
+            refuse(`${acceptedFor('json')}; column references are not supported on JSON columns`);
+          break;
+        }
+        if (key === 'not' && ctx.kind !== 'json' && isPlainRecord(value)) {
+          if (Object.keys(value).length === 0) {
+            refuse(`a value, null, a column reference or an operator object such as { contains: 'x' }`);
+          }
+          if (!isWhereOperator(value)) refuse(`${acceptedFor(ctx.kind)}, null, col('field'), or an operator object`);
+          assertOperatorOperands(value, ctx, depth + 1);
+          break;
+        }
+        if (!fitsColumn(value, ctx.kind)) {
+          refuse(
+            `${acceptedFor(ctx.kind)}, null, or col('field')` +
+              (isPlainRecord(value) ? ' (an object is a JSON value, accepted only on json/jsonb columns)' : ''),
+          );
+        }
+        break;
+      }
+      case 'gt':
+      case 'gte':
+      case 'lt':
+      case 'lte':
+        if (isColumnRef(value)) break;
+        if (value === null) {
+          refuse(
+            `${acceptedFor(ctx.kind)} or col('field'); a comparison with null matches no row, use equals: null or not: null`,
+          );
+        }
+        if (!fitsColumn(value, ctx.kind)) refuse(`${acceptedFor(ctx.kind)} or col('field')`);
+        break;
+      case 'in':
+      case 'notIn': {
+        if (!Array.isArray(value)) refuse(`an array of values`);
+        const elementKind: OperandColumnKind = ctx.kind === 'array' ? 'array' : ctx.kind;
+        for (const element of value as unknown[]) {
+          if (element === null) continue;
+          if (!fitsColumn(element, elementKind)) {
+            throw new ValidationError(
+              `Invalid element in '${key}' ${where}: received ${describeOperand(element)}. ` +
+                `Every element must be ${acceptedFor(elementKind)} (or null).`,
+            );
+          }
+        }
+        break;
+      }
+      default:
+        if (typeof value !== 'string') refuse('a string');
+    }
+  }
+}
+
+/**
+ * Validate a BARE value (implicit equality, `{ id: 5 }`) against its column.
+ * Shared by the build and collect paths of every where scope.
+ */
+export function assertEqualityOperand(value: unknown, ctx: OperandContext): void {
+  if (value === null) return;
+  const where = `on "${ctx.column}" for table "${ctx.table}"`;
+  if (isColumnRef(value)) {
+    throw new ValidationError(
+      `A column reference ${where} needs an operator: write { equals: col(${JSON.stringify(value.col)}) }` +
+        (ctx.kind === 'json' ? ', on a non-JSON column (references are not supported on JSON columns).' : '.'),
+    );
+  }
+  if (ctx.kind === 'json') {
+    if (typeof value === 'function' || typeof value === 'symbol') {
+      throw new ValidationError(`Invalid value ${where}: received ${describeOperand(value)}. Pass a JSON value.`);
+    }
+    return;
+  }
+  if (isPlainColumnRefShape(value)) {
+    throw new ValidationError(plainColumnRefMessage(value as { col: string }, 'equals', ctx.column, ctx.table));
+  }
+  if (isPlainRecord(value)) {
+    const keys = Object.keys(value);
+    throw new ValidationError(
+      keys.length === 0
+        ? `Empty filter object ${where}. Provide a value or an operator like { gt: 1 }.`
+        : `Unknown operator${keys.length > 1 ? 's' : ''} ${keys.map((k) => `"${k}"`).join(', ')} ${where}. ` +
+            `Supported operators: ${[...OPERATOR_KEYS].join(', ')}.`,
+    );
+  }
+  if (fitsColumn(value, ctx.kind)) return;
+  throw new ValidationError(
+    `Invalid value ${where}: received ${describeOperand(value)}. A bare value takes ${acceptedFor(ctx.kind)}` +
+      (Array.isArray(value) ? '; to match any of several values use { in: [...] }.' : '.'),
+  );
 }
 
 /**
@@ -124,42 +463,32 @@ export function isColumnRef(value: unknown): value is ColumnRef {
  * warmed by `{ not: 5 }` would serve `{ not: null }` with a desynced param list.
  *
  * Column references ({@link ColumnRef}) compile the referenced column into the
- * SQL TEXT (no param bound), so the referenced field name is part of the shape
- *: `{ equals: { col: 'a' } }` and `{ equals: { col: 'b' } }` must never share
- * a cache entry. The name is JSON-encoded so exotic field names cannot collide
+ * SQL TEXT (no param bound), so the referenced field name is part of the
+ * shape: `{ equals: col('a') }` and `{ equals: col('b') }` must never share a
+ * cache entry. The name is JSON-encoded so exotic field names cannot collide
  * with other fingerprint tokens.
+ *
+ * A `not` operator object compiles to `NOT (<inner>)`, so its whole inner shape
+ * is part of the token, with the inner object's EFFECTIVE mode (its own, else
+ * the inherited one). Absent keys are skipped exactly as the builders skip them.
  */
-export function fingerprintOperatorShape(value: WhereOperator): string {
+export function fingerprintOperatorShape(value: WhereOperator, inheritedMode?: unknown, depth = 0): string {
   const obj = value as Record<string, unknown>;
+  const effectiveMode = obj.mode !== undefined ? obj.mode : inheritedMode;
   const opKeys = Object.keys(obj)
-    .filter((k) => k !== 'mode')
+    .filter((k) => k !== 'mode' && !isAbsentWhereValue(obj[k]))
     .map((k) => {
       const v = obj[k];
       if ((k === 'equals' || k === 'not') && v === null) return `${k}:null`;
       if (COLUMN_REF_OPERATORS.has(k) && isColumnRef(v)) return `${k}:col(${JSON.stringify(v.col)})`;
+      if (k === 'not' && depth < ABSENCE_MAX_DEPTH && isWhereOperator(v)) {
+        return `not:${fingerprintOperatorShape(v, effectiveMode, depth + 1)}`;
+      }
       return k;
     })
     .sort();
-  const modeStr = value.mode === 'insensitive' ? ':i' : '';
+  const modeStr = effectiveMode === 'insensitive' ? ':i' : '';
   return `op(${opKeys.join(',')}${modeStr})`;
-}
-
-/**
- * Guard for the value of an `equals` operator reaching the plain-equality
- * operator path. A plain object literal can only legitimately be an equality
- * value on a json/jsonb column, and those route to the JSONB filter branch
- * BEFORE the operator branch, so any plain object that reaches here is a
- * mistake (e.g. `{ equals: { foo: 1 } }` on a text column). Shared by the
- * SQL-build path and the cache-hit param-collect path so a warmed cache can
- * never skip the check.
- */
-export function assertBindableEqualsOperand(value: unknown, column: string): void {
-  if (!isUnmatchedPlainObject(value)) return;
-  throw new ValidationError(
-    `Plain-object value for operator 'equals' on ${column}: ` +
-      `objects are only valid 'equals' values on JSON (json/jsonb) columns, ` +
-      `where 'equals' is the JSONB containment filter.`,
-  );
 }
 
 /**
@@ -334,7 +663,9 @@ export const ARRAY_UNIQUE_KEYS = new Set<string>(['has', 'hasEvery', 'hasSome', 
  * concrete value is part of the shape; the other operators are value-invariant.
  */
 export function fingerprintArrayFilterShape(filter: ArrayFilter): string {
-  const keys = Object.keys(filter).sort();
+  const keys = Object.keys(filter)
+    .filter((k) => !isAbsentWhereValue((filter as Record<string, unknown>)[k]))
+    .sort();
   const suffix = filter.isEmpty === undefined ? '' : `:empty=${filter.isEmpty ? 'true' : 'false'}`;
   return `${keys.join(',')}${suffix}`;
 }

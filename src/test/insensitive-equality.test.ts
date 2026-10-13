@@ -30,6 +30,7 @@ import pg from 'pg';
 import { TurbineClient } from '../client.js';
 import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
+import { col } from '../query/column-ref.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { makeQuery, mockTable, skipGate } from './helpers.js';
 
@@ -162,7 +163,7 @@ describe('mode: insensitive on the equality family (build-only)', () => {
   it('a column reference beside mode: insensitive is still refused', () => {
     const q = makeQuery('users', buildSchema());
     assert.throws(
-      () => q.buildFindMany({ where: { name: { equals: { col: 'email' }, mode: 'insensitive' } } as never }),
+      () => q.buildFindMany({ where: { name: { equals: col('email'), mode: 'insensitive' } } as never }),
       ValidationError,
     );
   });

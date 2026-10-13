@@ -125,8 +125,8 @@ describe('equals operator (plain equality)', () => {
   it('still routes path + equals on a jsonb column to path extraction', () => {
     const q = makeQuery('users', buildSchema());
     const d = q.buildFindMany({ where: { settings: { path: ['theme'], equals: 'dark' } } as never });
-    assert.match(d.sql, /#>>/);
-    assert.deepEqual(d.params, [['theme'], 'dark']);
+    assert.match(d.sql, /\("settings" #> \$1::text\[\]\)::jsonb = \$2::jsonb/);
+    assert.deepEqual(d.params, [['theme'], '"dark"']);
     assertParamsAligned(d.sql, d.params);
   });
 

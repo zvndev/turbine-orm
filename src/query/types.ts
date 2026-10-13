@@ -9,6 +9,7 @@
  */
 
 import { ValidationError } from '../errors.js';
+import type { ColumnRef } from './column-ref.js';
 
 // ---------------------------------------------------------------------------
 // The privilege sentinel
@@ -273,40 +274,26 @@ export type OrderDirection = 'asc' | 'desc';
  */
 export type RelationLoadStrategy = 'join' | 'batched' | 'auto' | 'flatten';
 
-/**
- * Reference to ANOTHER COLUMN of the same table inside a where operator,
- * enabling column-to-column comparison:
- *
- * ```ts
- * where: { currentVersionId: { equals: { col: 'publishedVersionId' } } }
- * // → WHERE "current_version_id" = "published_version_id"
- * ```
- *
- * Accepted by `equals`, `not`, `gt`, `gte`, `lt`, and `lte`. The referenced
- * field resolves through the table's columnMap (camelCase accepted, same as a
- * where key) and compiles to a quoted identifier: NO parameter is bound.
- * An unknown referenced field throws {@link ValidationError} (E003).
- *
- * Notes:
- *  - `mode: 'insensitive'` cannot be combined with a column reference: it
- *    throws E003 (use `client.sql` for `lower(a) = lower(b)`).
- *  - On json/jsonb columns `equals` routes to the JSONB containment filter
- *    first, so `{ equals: { col } }` there is treated as a JSON value, not a
- *    column reference.
- *
- * `F` narrows the referenced name to the table's field names when the
- * surrounding {@link WhereClause} knows the entity type.
- */
-export interface ColumnRef<F extends string = string> {
-  col: F;
-}
+// Column references (`col()`): the branded operand type lives with its
+// constructor in column-ref.ts and is re-exported here with the other where
+// types.
+export type { ColumnRef } from './column-ref.js';
 
-/** Operator object for advanced where filtering */
+/**
+ * Operator object for advanced where filtering.
+ *
+ * Every value operand is checked against the column before any SQL is built:
+ * on a non-JSON column it must be a string, number, bigint, boolean, Date or
+ * Buffer (or `null` for `equals` / `not`), `in` / `notIn` take an array of
+ * those, and the LIKE operators take a string. An object at a value position
+ * throws `ValidationError` (E003) instead of being bound, so a request body
+ * cannot turn a value into an operator.
+ */
 export interface WhereOperator<V = unknown, F extends string = string> {
   /**
    * Explicit equality: `{ equals: value }` → `column = $n`.
    * `{ equals: null }` → `column IS NULL`.
-   * `{ equals: { col: 'otherField' } }` → `column = "other_field"` ({@link ColumnRef}).
+   * `{ equals: col('otherField') }` → `column = "other_field"` ({@link ColumnRef}).
    * On json/jsonb columns `equals` routes to the JSONB containment filter
    * ({@link JsonFilter}) instead.
    */
@@ -315,7 +302,18 @@ export interface WhereOperator<V = unknown, F extends string = string> {
   gte?: V | ColumnRef<F>;
   lt?: V | ColumnRef<F>;
   lte?: V | ColumnRef<F>;
-  not?: V | ColumnRef<F> | null;
+  /**
+   * `{ not: value }` → `column != $n`, `{ not: null }` → `column IS NOT NULL`,
+   * `{ not: col('other') }` → `column != "other"`.
+   *
+   * An operator object negates the whole inner filter, as in Prisma:
+   * `{ not: { contains: 'x' } }` → `NOT (column LIKE '%x%')`. The inner object
+   * inherits this object's `mode` unless it sets its own. SQL three-valued
+   * logic applies: a row whose column is NULL matches neither the inner filter
+   * nor its negation. Add `{ OR: [{ col: { not: ... } }, { col: null }] }` to
+   * keep NULL rows.
+   */
+  not?: V | ColumnRef<F> | WhereOperator<V, F> | null;
   in?: V[];
   notIn?: V[];
   contains?: string;
@@ -336,7 +334,8 @@ export interface WhereOperator<V = unknown, F extends string = string> {
  * - A plain value (equality: column = $N)
  * - null (column IS NULL)
  * - An operator object ({ gt: 5, lte: 10 })
- * - A JSONB filter object ({ contains, equals, path, hasKey })
+ * - A JSONB filter object ({ contains, equals, path, hasKey }), on a column
+ *   whose type is not a plain scalar (json columns are typed `unknown`)
  * - An array filter object ({ has, hasEvery, hasSome, isEmpty })
  * - A text search filter object ({ search, config? })
  * - A vector distance filter object ({ distance: { to, metric, lt } }) for pgvector columns
@@ -350,11 +349,16 @@ export type WhereValue<V = unknown, F extends string = string> =
           ? V | TypedToOneFilter<V> | WhereClause<V> // to-one relation → is/isNot or bare where (implicit is)
           : V)
   | WhereOperator<V, F>
-  | JsonFilter
+  // Not offered on a scalar-typed column: `JsonFilter.equals` is `unknown`, so
+  // it would accept any object there, including an unbranded `{ col }`.
+  | ([V] extends [ScalarWhereType] ? never : JsonFilter)
   | ArrayFilter
   | TextSearchFilter
   | VectorFilter
   | null;
+
+/** Column value types that are never JSON documents. */
+type ScalarWhereType = string | number | bigint | boolean | Date | null | undefined;
 
 /**
  * Relation filter on a to-many relation property.
@@ -453,6 +457,11 @@ type StrictWhereClause<T, R extends object> = {
  * multi-tenancy. A function value is evaluated at query-build time (per query),
  * so a closure over per-request state (e.g. the current tenant id) enables
  * request-scoped filters. `create`/`createMany` are never filtered.
+ *
+ * Fail closed: a filter that resolves to `undefined`, or holds `undefined` at
+ * any depth (`{ tenantId: undefined }` when the tenant context is missing),
+ * throws `ValidationError` (E003) instead of being dropped. Return `null` or
+ * `{}` to apply no filter on purpose, or pass `skipGlobalFilters: UNSAFE`.
  */
 export type GlobalFilters = {
   // biome-ignore lint/suspicious/noExplicitAny: filters are keyed by table name; per-table entity types are not known here
@@ -1880,16 +1889,24 @@ export interface RelationFilter {
 /**
  * JSONB query operators for where clauses.
  *
- * PowDB (`turbine-orm/powdb`) semantic deltas. The PowDB engine evaluates
- * `->` path filters with full type knowledge, so a few behaviours differ from
- * the Postgres `#>>`-text driver (documented, never silently wrong):
+ * `{ path, equals }` compares the JSON VALUE at `path`, typed:
+ *   - PostgreSQL: `(col #> path)::jsonb = $v::jsonb`, so `equals: 7` matches a
+ *     JSON number 7 and not the string `"7"`, `equals: null` matches a JSON
+ *     null (not a missing key), and arrays and objects compare as JSON.
+ *   - SQLite: `json_extract` keeps numbers and strings apart; `equals` with a
+ *     boolean, null, array or object throws `UnsupportedFeatureError` (E017),
+ *     because SQLite extracts JSON booleans as 1 / 0 and null, arrays and
+ *     objects have no comparable form there.
+ *   - MySQL and SQL Server compare the extracted TEXT, so `equals: 7` also
+ *     matches `"7"`; null, arrays and objects throw E017.
+ *
+ * PowDB (`turbine-orm/powdb`) evaluates `->` path filters with full type
+ * knowledge:
  *   - `{ path, equals: null }` matches JSON null OR a MISSING key on PowDB
- *     (compiles to `is null`), whereas the PG driver compares extracted text
- *     against the string `'null'` and matches only a JSON string `"null"`.
- *   - equality is TYPE-STRICT on PowDB: `{ path, equals: 7 }` matches a stored
- *     JSON int `7` but not `7.0` or the JSON string `"7"` (PG text-extraction
- *     matches `equals: 7` against the string `"7"`). Range ops (`gt`/`lt`/…)
- *     still coerce int/float numerically.
+ *     (compiles to `is null`); PostgreSQL matches JSON null only.
+ *   - equality is TYPE-STRICT: `{ path, equals: 7 }` matches a stored JSON int
+ *     `7` but not `7.0` or the JSON string `"7"`. Range ops (`gt`/`lt`/…) still
+ *     coerce int/float numerically.
  *   - a digit-only path segment (`path: ['tags', '0']`) is an ARRAY INDEX on
  *     both PowDB and the SQL engines (a json object key that is literally `"0"`
  *     is likewise addressed by index).
@@ -1899,11 +1916,15 @@ export interface RelationFilter {
  */
 export interface JsonFilter {
   /**
-   * Access nested path via `#>>` operator (Postgres) / `->` path (PowDB). A
+   * Access a nested path (`#>` / `#>>` on Postgres, `->` on PowDB). A
    * digit-only segment (`'0'`) is treated as an array index on every engine.
    */
   path?: string[];
-  /** Exact match: `column @> value::jsonb` (containment). On PowDB, requires `path` and compares the typed value (throws E017 without `path`). */
+  /**
+   * With `path`: the JSON value at the path equals this value (typed on
+   * PostgreSQL, see {@link JsonFilter}). Without `path`: containment,
+   * `column @> value::jsonb` (E017 on PowDB).
+   */
   equals?: unknown;
   /** Containment check: `column @> value::jsonb`. Unsupported on PowDB (E017: PowQL has no containment operator). */
   contains?: unknown;

@@ -14,13 +14,16 @@ import type { TableMetadata } from '../schema.js';
 import { snakeToCamel } from '../schema.js';
 import type { DeferredQuery } from './deferred.js';
 import {
+  assertEqualityOperand,
   dedupeColumnList,
+  isAbsentWhereValue,
   isJsonPathOrderBy,
   isUnmatchedPlainObject,
   isVectorOrderBy,
   isWhereOperator,
   normalizeOrderBy,
   orderByEntries,
+  pruneAbsentKeys,
 } from './filters.js';
 import type {
   AggregateArgs,
@@ -718,8 +721,11 @@ export function buildHavingClauses<T extends object>(
   assertWhereDepth(depth, 'having');
   const clauses: string[] = [];
 
-  for (const [key, value] of Object.entries(having)) {
-    if (value === undefined) continue;
+  for (const [key, raw] of Object.entries(having)) {
+    // Same `undefined` rule as every where walk (`walkWhere`): an absent value
+    // is skipped and a present one loses its absent keys.
+    if (isAbsentWhereValue(raw)) continue;
+    const value = pruneAbsentKeys(raw);
 
     // Top-level `_count` (no field) → COUNT(*) for the whole group.
     if (key === '_count') {
@@ -909,6 +915,7 @@ function buildHavingScalarClauses(
           .join(', ')} on ${ref.label} in having for table "${qi.table}".`,
     );
   } else {
+    assertEqualityOperand(value, { column: ref.label, table: qi.table, kind: 'scalar' });
     params.push(value);
     clauses.push(`${ref.expr} = ${qi.p(params.length)}`);
   }

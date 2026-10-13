@@ -156,10 +156,21 @@ describe('upsert conflict-UPDATE predicate: SQL and params agree', () => {
   it('a filter that compiles to nothing does not refuse', () => {
     const q = makeQuery('users', schema(), {
       dialect: mysqlDialect,
-      globalFilters: { users: () => ({ tenantId: undefined }) },
+      globalFilters: { users: () => ({}) },
     });
     assert.doesNotThrow(() =>
       q.buildUpsert({ where: { id: 1 }, create: { id: 1, name: 'x' } as never, update: { name: 'y' } as never }),
+    );
+  });
+
+  it('a filter whose value is undefined is refused, never treated as absent', () => {
+    const q = makeQuery('users', schema(), {
+      dialect: mysqlDialect,
+      globalFilters: { users: () => ({ tenantId: undefined }) },
+    });
+    assert.throws(
+      () => q.buildUpsert({ where: { id: 1 }, create: { id: 1, name: 'x' } as never, update: { name: 'y' } as never }),
+      /Global filter for "users" has an undefined value at "tenantId"/,
     );
   });
 

@@ -165,10 +165,13 @@ describe('powdb global filters', () => {
     assert.deepEqual(b.first().params, ['t2']);
   });
 
-  it('an all-undefined filter contributes nothing', async () => {
+  it('a filter holding undefined is refused, never treated as absent', async () => {
     const r = rec();
-    await qi(r.pool, { app_user: { tenantId: undefined } }).findMany({});
-    assert.doesNotMatch(r.first().powql, /filter/);
+    await assert.rejects(
+      () => qi(r.pool, { app_user: { tenantId: undefined } }).findMany({}),
+      /Global filter for "app_user" has an undefined value at "tenantId"/,
+    );
+    assert.equal(r.calls.length, 0, 'nothing reached the engine');
   });
 
   it('a table with no configured filter is untouched', async () => {

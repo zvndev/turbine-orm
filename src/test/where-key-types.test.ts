@@ -32,6 +32,7 @@
  */
 
 import { describe, it } from 'node:test';
+import { col } from '../query/column-ref.js';
 import type { QueryInterface, RelationDescriptor, WhereClause } from '../query/index.js';
 
 interface Comment {
@@ -148,7 +149,10 @@ async function legitimateShapes(): Promise<void> {
     },
   });
 
-  // Column references.
+  // Column references are built with col(); the plain object form is refused
+  // at runtime and no longer typechecks.
+  await posts.findMany({ where: { userId: { equals: col('id') } } });
+  // @ts-expect-error, an unbranded { col } is not a column reference
   await posts.findMany({ where: { userId: { equals: { col: 'id' } } } });
 
   // Combinators, nested arbitrarily.
