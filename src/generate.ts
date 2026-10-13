@@ -12,7 +12,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { ValidationError } from './errors.js';
-import { assertDistinctColumnFields } from './introspect.js';
+import { assertDistinctColumnFields, printableCatalogName } from './introspect.js';
 import {
   type ColumnMetadata,
   type PrismaCompatMap,
@@ -162,6 +162,10 @@ export interface GenerateOptions {
    *
    *   - `'js'`: always `./types.js` (required by NodeNext `tsc` and by
    *     tsc-compiled ESM run on Node; the pre-0.41 behavior).
+   *   - `'ts'`: always `./types.ts`, so Node's native type stripping can run the
+   *     generated files directly (`node app.ts`). A type checker needs
+   *     `allowImportingTsExtensions` or `rewriteRelativeImportExtensions` to
+   *     accept it. `'auto'` never picks this.
    *   - `'none'`: always `./types` (correct for bundlers / `moduleResolution
    *     bundler | node10`: webpack, Next.js/SWC, Vite/esbuild).
    *   - `'auto'` (default): walk up from `outDir` to the nearest `tsconfig.json`
@@ -170,7 +174,7 @@ export interface GenerateOptions {
    *     neither is, and fall back to `'.js'` when the tsconfig is missing,
    *     unparseable, or ambiguous (so NodeNext consumers can never regress).
    */
-  importExtension?: 'js' | 'none' | 'auto';
+  importExtension?: 'js' | 'ts' | 'none' | 'auto';
   /**
    * Rewrite generated column FIELD names to the raw database column names
    * (snake_case) instead of camelCase (F4). Opt-in; when unset the output is
@@ -187,7 +191,7 @@ export interface GenerateFileOptions {
   /** Omit the `Generated at:` header line for reproducible output. */
   noTimestamp?: boolean;
   /**
-   * Resolved sibling-import extension for `generateIndex` (`'.js'` or `''`).
+   * Resolved sibling-import extension for `generateIndex` (`'.js'`, `'.ts'` or `''`).
    * Defaults to `'.js'` when unset so direct callers stay byte-stable.
    */
   importExt?: string;
@@ -256,6 +260,7 @@ export function generate(options: GenerateOptions): { outDir: string; files: str
  * mode label for the generated comment.
  *
  *   - `'js'`   → `.js`
+ *   - `'ts'`   → `.ts`
  *   - `'none'` → `''`
  *   - `'auto'` → tsconfig-driven ({@link detectTsconfigExtension}); falls back
  *     to `.js` (the pre-0.41 default) when detection is uncertain, so NodeNext
@@ -263,9 +268,10 @@ export function generate(options: GenerateOptions): { outDir: string; files: str
  */
 export function resolveImportExtension(
   outDir: string,
-  requested: 'js' | 'none' | 'auto',
+  requested: 'js' | 'ts' | 'none' | 'auto',
 ): { ext: string; mode: string } {
   if (requested === 'js') return { ext: '.js', mode: 'js' };
+  if (requested === 'ts') return { ext: '.ts', mode: 'ts' };
   if (requested === 'none') return { ext: '', mode: 'none' };
   const detected = detectTsconfigExtension(resolve(outDir));
   if (detected === 'js') return { ext: '.js', mode: 'auto (nodenext → .js)' };
@@ -420,8 +426,10 @@ function typeSafeRelations(table: TableMetadata, warn = true): [string, Relation
     if (columnFields.has(relName)) {
       if (warn) {
         console.warn(
-          `[turbine] Relation "${relName}" on table "${table.name}" shadows a column field of the same name, ` +
-            `omitting it from the generated types. Rename the relation (or the column) to expose it.`,
+          printableCatalogName(
+            `[turbine] Relation "${relName}" on table "${table.name}" shadows a column field of the same name, ` +
+              `omitting it from the generated types. Rename the relation (or the column) to expose it.`,
+          ),
         );
       }
       continue;
@@ -462,11 +470,14 @@ export function isEmittableIdentifier(name: string): boolean {
 function requireEmittable(derived: string, subject: string, role: string): void {
   if (isEmittableIdentifier(derived)) return;
   throw new ValidationError(
-    `Cannot generate code for ${subject}: it produces ${JSON.stringify(derived)} as ${role}, ` +
+    `Cannot generate code for ${printableCatalogName(subject)}: it produces ${printableCatalogName(JSON.stringify(derived))} as ${role}, ` +
       `which is not a valid TypeScript identifier. Rename the database object, or exclude it from generation ` +
       `(introspect \`exclude\`).`,
   );
 }
+
+/** Table accessors the generated `TurbineClient` class cannot declare as members. */
+const RESERVED_ACCESSORS: ReadonlySet<string> = new Set(['constructor', '__proto__']);
 
 /**
  * Refuse a schema whose names cannot be emitted as TypeScript identifiers.
@@ -489,6 +500,13 @@ export function assertEmittableSchema(schema: SchemaMetadata): void {
   for (const table of Object.values(schema.tables)) {
     requireEmittable(entityName(table.name), `table "${table.name}"`, 'the generated entity type name');
     requireEmittable(snakeToCamelStr(table.name), `table "${table.name}"`, 'the generated client accessor');
+    if (RESERVED_ACCESSORS.has(snakeToCamelStr(table.name))) {
+      throw new ValidationError(
+        `Cannot generate code for table "${printableCatalogName(table.name)}": its client accessor ` +
+          `"${snakeToCamelStr(table.name)}" is a reserved class member name, so the generated class could not declare it. ` +
+          'Rename the table, or exclude it from generation (introspect `exclude`).',
+      );
+    }
     // Two columns on one field would emit a duplicate interface member (TS2300
     // in the consumer's build) and a `columnMap` missing a column. The rule is
     // introspect.ts's; re-asserting it here covers a hand-built or
@@ -900,7 +918,7 @@ export function generateZod(schema: SchemaMetadata, options?: GenerateFileOption
     for (const col of table.columns) {
       let expr = zodBaseType(col, schema.enums);
       if (col.nullable) expr += '.nullable()';
-      lines.push(`  ${quoteIfNeeded(col.field)}: ${expr},`);
+      lines.push(`  ${objectKey(col.field)}: ${expr},`);
     }
     lines.push('});');
     lines.push('');
@@ -915,7 +933,7 @@ export function generateZod(schema: SchemaMetadata, options?: GenerateFileOption
       let expr = zodBaseType(col, schema.enums, true);
       if (col.nullable) expr += '.nullable()';
       if (col.isGenerated === true || col.hasDefault || col.nullable) expr += '.optional()';
-      lines.push(`  ${quoteIfNeeded(col.field)}: ${expr},`);
+      lines.push(`  ${objectKey(col.field)}: ${expr},`);
     }
     lines.push('});');
     lines.push('');
@@ -929,7 +947,7 @@ export function generateZod(schema: SchemaMetadata, options?: GenerateFileOption
       let expr = zodBaseType(col, schema.enums, true);
       if (col.nullable) expr += '.nullable()';
       expr += '.optional()';
-      lines.push(`  ${quoteIfNeeded(col.field)}: ${expr},`);
+      lines.push(`  ${objectKey(col.field)}: ${expr},`);
     }
     lines.push('});');
     lines.push('');
@@ -956,7 +974,7 @@ export function generateMetadata(schema: SchemaMetadata, options?: GenerateFileO
   ];
 
   for (const table of Object.values(schema.tables)) {
-    lines.push(`    ${quoteIfNeeded(table.name)}: {`);
+    lines.push(`    ${objectKey(table.name)}: {`);
     lines.push(`      name: '${escSQ(table.name)}',`);
 
     // columns
@@ -969,14 +987,14 @@ export function generateMetadata(schema: SchemaMetadata, options?: GenerateFileO
     // columnMap
     lines.push('      columnMap: {');
     for (const [field, col] of Object.entries(table.columnMap)) {
-      lines.push(`        ${quoteIfNeeded(field)}: '${escSQ(col)}',`);
+      lines.push(`        ${objectKey(field)}: '${escSQ(col)}',`);
     }
     lines.push('      },');
 
     // reverseColumnMap
     lines.push('      reverseColumnMap: {');
     for (const [col, field] of Object.entries(table.reverseColumnMap)) {
-      lines.push(`        ${quoteIfNeeded(col)}: '${escSQ(field)}',`);
+      lines.push(`        ${objectKey(col)}: '${escSQ(field)}',`);
     }
     lines.push('      },');
 
@@ -988,12 +1006,12 @@ export function generateMetadata(schema: SchemaMetadata, options?: GenerateFileO
     const dialectTypes = table.dialectTypes ?? table.pgTypes;
     lines.push('      dialectTypes: {');
     for (const [col, dialectType] of Object.entries(dialectTypes)) {
-      lines.push(`        ${quoteIfNeeded(col)}: '${escSQ(dialectType)}',`);
+      lines.push(`        ${objectKey(col)}: '${escSQ(dialectType)}',`);
     }
     lines.push('      },');
     lines.push('      pgTypes: {');
     for (const [col, pgType] of Object.entries(table.pgTypes)) {
-      lines.push(`        ${quoteIfNeeded(col)}: '${escSQ(pgType)}',`);
+      lines.push(`        ${objectKey(col)}: '${escSQ(pgType)}',`);
     }
     lines.push('      },');
 
@@ -1030,7 +1048,7 @@ export function generateMetadata(schema: SchemaMetadata, options?: GenerateFileO
           `targetKey: ${keyLiteral(rel.through.targetKey)} }`;
       }
       lines.push(
-        `        ${quoteIfNeeded(relName)}: { type: '${escSQ(rel.type)}', name: '${escSQ(rel.name)}', from: '${escSQ(rel.from)}', to: '${escSQ(rel.to)}', foreignKey: ${fkLiteral}, referenceKey: ${refLiteral}${throughLiteral} },`,
+        `        ${objectKey(relName)}: { type: '${escSQ(rel.type)}', name: '${escSQ(rel.name)}', from: '${escSQ(rel.from)}', to: '${escSQ(rel.to)}', foreignKey: ${fkLiteral}, referenceKey: ${refLiteral}${throughLiteral} },`,
       );
     }
     lines.push('      },');
@@ -1071,7 +1089,7 @@ export function generateMetadata(schema: SchemaMetadata, options?: GenerateFileO
   // enums
   lines.push('  enums: {');
   for (const [enumName, labels] of Object.entries(schema.enums)) {
-    lines.push(`    ${quoteIfNeeded(enumName)}: [${labels.map((l) => `'${escSQ(l)}'`).join(', ')}],`);
+    lines.push(`    ${objectKey(enumName)}: [${labels.map((l) => `'${escSQ(l)}'`).join(', ')}],`);
   }
   lines.push('  },');
 
@@ -1284,13 +1302,13 @@ export function generatePrismaMap(map: PrismaCompatMap, options?: GenerateFileOp
   ];
 
   for (const [modelName, model] of Object.entries(map.models)) {
-    lines.push(`    ${quoteIfNeeded(modelName)}: {`);
+    lines.push(`    ${objectKey(modelName)}: {`);
     lines.push(`      table: '${escSQ(model.table)}',`);
     lines.push(`      accessor: '${escSQ(model.accessor)}',`);
     lines.push(`      fields: ${serializeStringRecord(model.fields)},`);
     lines.push('      relations: {');
     for (const [rel, r] of Object.entries(model.relations)) {
-      lines.push(`        ${quoteIfNeeded(rel)}: { name: '${escSQ(r.name)}', cardinality: '${r.cardinality}' },`);
+      lines.push(`        ${objectKey(rel)}: { name: '${escSQ(r.name)}', cardinality: '${r.cardinality}' },`);
     }
     lines.push('      },');
     lines.push(`      compoundUniques: ${serializeStringArrayRecord(model.compoundUniques)},`);
@@ -1316,14 +1334,14 @@ export function generatePrismaMap(map: PrismaCompatMap, options?: GenerateFileOp
 function serializeStringRecord(rec: Record<string, string>): string {
   const entries = Object.entries(rec);
   if (entries.length === 0) return '{}';
-  return `{ ${entries.map(([k, v]) => `${quoteIfNeeded(k)}: '${escSQ(v)}'`).join(', ')} }`;
+  return `{ ${entries.map(([k, v]) => `${objectKey(k)}: '${escSQ(v)}'`).join(', ')} }`;
 }
 
 /** Serialize a `Record<string, string[]>` as an inline object literal. */
 function serializeStringArrayRecord(rec: Record<string, string[]>): string {
   const entries = Object.entries(rec);
   if (entries.length === 0) return '{}';
-  return `{ ${entries.map(([k, v]) => `${quoteIfNeeded(k)}: [${v.map((s) => `'${escSQ(s)}'`).join(', ')}]`).join(', ')} }`;
+  return `{ ${entries.map(([k, v]) => `${objectKey(k)}: [${v.map((s) => `'${escSQ(s)}'`).join(', ')}]`).join(', ')} }`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1400,15 +1418,23 @@ const BARE_KEY_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
  * return `'${s}'` verbatim, so a name containing a quote closed the key and
  * reopened in expression position.
  *
- * KNOWN LIMIT, deliberately not handled here: a database object named
- * `__proto__` still sets the emitted object literal's PROTOTYPE rather than
- * adding a property, because the object-literal special case applies to the
- * quoted spelling too. Quoting is not a fix for it, so there is no branch for
- * it; the consequence is a metadata map that silently omits that one entry, not
- * code execution.
+ * A name of `__proto__` is safe in an interface but not in an object literal;
+ * see {@link objectKey}.
  */
 function quoteIfNeeded(s: string): string {
   return BARE_KEY_RE.test(s) ? s : `'${escSQ(s)}'`;
+}
+
+/**
+ * {@link quoteIfNeeded} for a key in an OBJECT LITERAL that is evaluated at
+ * runtime (metadata.ts, the Prisma map). `{ '__proto__': v }` sets the literal's
+ * prototype instead of defining a property, quoted or not, so that one name is
+ * emitted as a computed key, whose string literal is just as inert and which does
+ * define the property. Interface members (types.ts) have no such rule and keep
+ * using {@link quoteIfNeeded}.
+ */
+function objectKey(s: string): string {
+  return s === '__proto__' ? "['__proto__']" : quoteIfNeeded(s);
 }
 
 function snakeToCamelStr(s: string): string {

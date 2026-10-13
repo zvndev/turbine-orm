@@ -444,12 +444,14 @@ describe('code generation refuses names it cannot emit as identifiers', () => {
 // ---------------------------------------------------------------------------
 
 describe('assertSafeCatalogSchema: control characters are refused at the source', () => {
+  // The message prints the name escaped (a literal backslash and n), so a
+  // hostile name cannot drive the terminal the error is printed to.
   const cases: { what: string; schema: () => SchemaMetadata; names: RegExp }[] = [
-    { what: 'a table name', schema: () => schemaWithHostile('table', 'a\nb'), names: /table "a\nb"/ },
-    { what: 'a column name', schema: () => schemaWithHostile('column', 'a\nb'), names: /column "a\nb"/ },
-    { what: 'an enum type name', schema: () => schemaWithHostile('enumType', 'a\nb'), names: /enum type "a\nb"/ },
+    { what: 'a table name', schema: () => schemaWithHostile('table', 'a\nb'), names: /table "a\\nb"/ },
+    { what: 'a column name', schema: () => schemaWithHostile('column', 'a\nb'), names: /column "a\\nb"/ },
+    { what: 'an enum type name', schema: () => schemaWithHostile('enumType', 'a\nb'), names: /enum type "a\\nb"/ },
     { what: 'an enum label', schema: () => schemaWithHostile('enumLabel', 'a\nb'), names: /enum type "mood"/ },
-    { what: 'a relation name', schema: () => schemaWithHostile('relation', 'a\nb'), names: /relation "a\nb"/ },
+    { what: 'a relation name', schema: () => schemaWithHostile('relation', 'a\nb'), names: /relation "a\\nb"/ },
   ];
 
   for (const { what, schema, names } of cases) {

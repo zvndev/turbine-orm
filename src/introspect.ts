@@ -437,6 +437,63 @@ export interface IntrospectOptions {
 const UNSAFE_CATALOG_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
 /**
+ * Characters that must not reach a terminal or a log verbatim: everything in
+ * {@link UNSAFE_CATALOG_CHARS} (an ESC starts an ANSI sequence, a carriage
+ * return overwrites the line), plus the bidirectional controls that reorder how
+ * a name is displayed without changing what it is.
+ */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: neutralizing control characters is this pattern's purpose
+const TERMINAL_UNSAFE_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+
+/**
+ * A catalog name made safe to PRINT. Every diagnostic that quotes a table,
+ * column, enum, relation or constraint name goes through this, because Postgres
+ * lets anyone with CREATE privilege pick any characters for those, and an
+ * unescaped name in an error message is a way to write escape sequences to the
+ * developer's terminal. Control and bidi characters become visible escapes
+ * (`\n`, `\u001b`); everything else, including non-ASCII letters, is untouched.
+ */
+export function printableCatalogName(name: string): string {
+  return name.replace(TERMINAL_UNSAFE_CHARS, (ch) => {
+    if (ch === '\n') return '\\n';
+    if (ch === '\r') return '\\r';
+    if (ch === '\t') return '\\t';
+    return `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`;
+  });
+}
+
+/**
+ * An empty record for something keyed by catalog names. Prototype-less on
+ * purpose: a plain `{}` turns a table named `__proto__` into a prototype
+ * assignment (the table silently disappears), and makes `enums['constructor']`
+ * truthy before any enum was ever added.
+ */
+export function nullRecord<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
+}
+
+/**
+ * The TypeScript type for a catalog type name. A user-defined type can be named
+ * after an `Object.prototype` member (`toString`, `constructor`, `valueOf`),
+ * which a plain-object type table answers with a function instead of nothing, so
+ * that case is pinned to `unknown` here, before any type table is consulted,
+ * rather than emitted as function source. `lookup` is the dialect's own mapping
+ * for every other name.
+ */
+function tsTypeForCatalogType(
+  typeName: string,
+  nullable: boolean,
+  lookup: (typeName: string, nullable: boolean) => string = pgTypeToTs,
+): string {
+  const isArray = typeName.startsWith('_');
+  if ((isArray ? typeName.slice(1) : typeName) in Object.prototype) {
+    const unknownType = isArray ? 'unknown[]' : 'unknown';
+    return nullable ? `${unknownType} | null` : unknownType;
+  }
+  return lookup(typeName, nullable);
+}
+
+/**
  * Refuse one catalog identifier carrying a character from
  * {@link UNSAFE_CATALOG_CHARS}. `subject` names the object in the error.
  */
@@ -445,7 +502,7 @@ export function assertSafeCatalogIdentifier(name: string, subject: string): void
   if (match === null) return;
   const code = match[0].charCodeAt(0).toString(16).padStart(4, '0');
   throw new ValidationError(
-    `Refusing to introspect ${subject}: its name contains the control character U+${code.toUpperCase()} ` +
+    `Refusing to introspect ${printableCatalogName(subject)}: its name contains the control character U+${code.toUpperCase()} ` +
       `at position ${match.index}. Such a name cannot be safely emitted into generated code, SQL comments, or ` +
       `tooling output. Rename the database object, or exclude it from introspection.`,
   );
@@ -545,23 +602,23 @@ export function applyRelationRenames(
   schema: SchemaMetadata,
   renames: Record<string, Record<string, string>>,
 ): SchemaMetadata {
-  const tables: Record<string, TableMetadata> = { ...schema.tables };
+  const tables: Record<string, TableMetadata> = Object.assign(nullRecord<TableMetadata>(), schema.tables);
 
   for (const [table, mapping] of Object.entries(renames)) {
-    const meta = tables[table];
+    const meta = Object.hasOwn(tables, table) ? tables[table] : undefined;
     if (!meta) {
       throw new ValidationError(
-        `relationNames: unknown table "${table}". Known tables: ${Object.keys(tables).join(', ')}.`,
+        `relationNames: unknown table "${printableCatalogName(table)}". Known tables: ${Object.keys(tables).map(printableCatalogName).join(', ')}.`,
       );
     }
-    const relations: Record<string, RelationDef> = { ...meta.relations };
+    const relations: Record<string, RelationDef> = Object.assign(nullRecord<RelationDef>(), meta.relations);
     const columnFields = new Set(Object.values(meta.columnMap));
 
     for (const [from, to] of Object.entries(mapping)) {
       if (!Object.hasOwn(relations, from)) {
         throw new ValidationError(
-          `relationNames: table "${table}" has no relation "${from}". ` +
-            `Derived relations: ${Object.keys(relations).join(', ') || '(none)'}.`,
+          `relationNames: table "${printableCatalogName(table)}" has no relation "${printableCatalogName(from)}". ` +
+            `Derived relations: ${Object.keys(relations).map(printableCatalogName).join(', ') || '(none)'}.`,
         );
       }
       if (from === to) continue;
@@ -618,13 +675,15 @@ export function assertDistinctColumnFields(tableName: string, columns: readonly 
   const collisions: string[] = [];
   for (const [field, names] of columnsByField) {
     if (names.length < 2) continue;
-    const quoted = names.map((n) => `"${n}"`);
+    const quoted = names.map((n) => `"${printableCatalogName(n)}"`);
     const list = `${quoted.slice(0, -1).join(', ')} and ${quoted[quoted.length - 1]}`;
-    collisions.push(`columns ${list} ${names.length === 2 ? 'both' : 'all'} resolve to the field "${field}"`);
+    collisions.push(
+      `columns ${list} ${names.length === 2 ? 'both' : 'all'} resolve to the field "${printableCatalogName(field)}"`,
+    );
   }
   if (collisions.length === 0) return;
   throw new ValidationError(
-    `Field collision on table "${tableName}": ${collisions.join('; ')}. A client addresses one column per field, ` +
+    `Field collision on table "${printableCatalogName(tableName)}": ${collisions.join('; ')}. A client addresses one column per field, ` +
       'so reads would fold the colliding columns into one property and a write to that field would reach only ' +
       'one of them. Rename one of the columns, or set `keepColumnNames: true` in turbine.config.ts ' +
       '(`turbine generate --keep-column-names`) so every field is its raw column name.',
@@ -711,9 +770,11 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
         field: options.keepColumnNames ? row.column_name : snakeToCamel(row.column_name),
         dialectType,
         pgType: dialectType,
-        tsType:
-          dialect.typeToTypeScript?.(isArray ? dialectType : baseType, isNullable) ??
-          pgTypeToTs(isArray ? dialectType : baseType, isNullable),
+        tsType: tsTypeForCatalogType(
+          isArray ? dialectType : baseType,
+          isNullable,
+          dialect.typeToTypeScript?.bind(dialect) ?? pgTypeToTs,
+        ),
         nullable: isNullable,
         hasDefault: row.column_default !== null,
         // Server-generated = a sequence default (serial/BIGSERIAL → nextval(…))
@@ -810,9 +871,9 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
     }
 
     // ----- Collect enums -----
-    const enums: Record<string, string[]> = {};
+    const enums: Record<string, string[]> = nullRecord<string[]>();
     for (const row of enumResult.rows) {
-      if (!enums[row.typname]) enums[row.typname] = [];
+      if (!Object.hasOwn(enums, row.typname)) enums[row.typname] = [];
       enums[row.typname]!.push(row.enumlabel);
     }
 
@@ -860,8 +921,8 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
 
     if (crossSchemaRefs.length > 0) {
       console.warn(
-        `[turbine] Skipped ${crossSchemaRefs.length} foreign key(s) referencing a table outside schema "${schema}": ` +
-          `${crossSchemaRefs.join(', ')}. Generated clients address tables by bare name within one schema, so no ` +
+        `[turbine] Skipped ${crossSchemaRefs.length} foreign key(s) referencing a table outside schema "${printableCatalogName(schema)}": ` +
+          `${crossSchemaRefs.map(printableCatalogName).join(', ')}. Generated clients address tables by bare name within one schema, so no ` +
           `relation is emitted for these. Introspect the other schema separately, or add the target table to this one.`,
       );
     }
@@ -901,15 +962,15 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
     });
 
     // ----- Assemble TableMetadata for each table -----
-    const tables: Record<string, TableMetadata> = {};
+    const tables: Record<string, TableMetadata> = nullRecord<TableMetadata>();
 
     for (const tableName of tableNames) {
       const columns = columnsByTable.get(tableName) ?? [];
-      const columnMap: Record<string, string> = {};
-      const reverseColumnMap: Record<string, string> = {};
+      const columnMap: Record<string, string> = nullRecord<string>();
+      const reverseColumnMap: Record<string, string> = nullRecord<string>();
       const dateColumns = new Set<string>();
-      const dialectTypes: Record<string, string> = {};
-      const pgTypes: Record<string, string> = {};
+      const dialectTypes: Record<string, string> = nullRecord<string>();
+      const pgTypes: Record<string, string> = nullRecord<string>();
       const allColumns: string[] = [];
 
       for (const col of columns) {
@@ -936,7 +997,7 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
         allColumns,
         primaryKey: pkByTable.get(tableName) ?? [],
         uniqueColumns: uniqueByTable.get(tableName) ?? [],
-        relations: relationsByTable.get(tableName) ?? {},
+        relations: relationsByTable.get(tableName) ?? nullRecord<RelationDef>(),
         indexes: indexesByTable.get(tableName) ?? [],
         checks: checksByTable.get(tableName) ?? [],
         ...(viewNameSet.has(tableName) ? { isView: true } : {}),
@@ -1334,7 +1395,9 @@ function resolveRelationNameCollision(candidate: string, taken: Set<string>, tab
   let name = `${candidate}Rel`;
   for (let i = 2; taken.has(name); i++) name = `${candidate}Rel${i}`;
   console.warn(
-    `[turbine] Relation name "${candidate}" on table "${table}" (from ${source}) collides with an existing column or relation, using "${name}" instead.`,
+    printableCatalogName(
+      `[turbine] Relation name "${candidate}" on table "${table}" (from ${source}) collides with an existing column or relation, using "${name}" instead.`,
+    ),
   );
   return name;
 }
@@ -1427,9 +1490,11 @@ export function buildRelationsFromForeignKeys(
     // typeSafeRelations() keeps the generated type layer sound.
     if (!assignedFor(table).has(legacy) && unknownTypedFieldsByTable?.get(table)?.has(legacy)) {
       console.warn(
-        `[turbine] Relation "${legacy}" on table "${table}" (from ${source}) shadows the json/jsonb column ` +
-          `"${legacy}", keeping the historical name for runtime compatibility; the relation is omitted from ` +
-          `the generated types. Rename the column to expose it.`,
+        printableCatalogName(
+          `[turbine] Relation "${legacy}" on table "${table}" (from ${source}) shadows the json/jsonb column ` +
+            `"${legacy}", keeping the historical name for runtime compatibility; the relation is omitted from ` +
+            `the generated types. Rename the column to expose it.`,
+        ),
       );
       return legacy;
     }
@@ -1487,7 +1552,7 @@ export function buildRelationsFromForeignKeys(
     if (actions?.onDelete && actions.onDelete !== 'no action') actionFields.onDelete = actions.onDelete;
     if (actions?.onUpdate && actions.onUpdate !== 'no action') actionFields.onUpdate = actions.onUpdate;
 
-    if (!relationsByTable.has(fk.sourceTable)) relationsByTable.set(fk.sourceTable, {});
+    if (!relationsByTable.has(fk.sourceTable)) relationsByTable.set(fk.sourceTable, nullRecord<RelationDef>());
     relationsByTable.get(fk.sourceTable)![belongsToName] = {
       type: 'belongsTo',
       name: belongsToName,
@@ -1532,7 +1597,7 @@ export function buildRelationsFromForeignKeys(
     takenFor(fk.targetTable).add(reverseName);
     assignedFor(fk.targetTable).add(reverseName);
 
-    if (!relationsByTable.has(fk.targetTable)) relationsByTable.set(fk.targetTable, {});
+    if (!relationsByTable.has(fk.targetTable)) relationsByTable.set(fk.targetTable, nullRecord<RelationDef>());
     relationsByTable.get(fk.targetTable)![reverseName] = {
       type: reverseType,
       name: reverseName,
@@ -1624,18 +1689,20 @@ export function addAutoManyToManyRelations(
       const sourceTbl = self.targetTable; // A
       const targetTbl = other.targetTable; // B
       let relName = snakeToCamel(targetTbl); // plural table name → e.g. "tags"
-      if (!relationsByTable.has(sourceTbl)) relationsByTable.set(sourceTbl, {});
+      if (!relationsByTable.has(sourceTbl)) relationsByTable.set(sourceTbl, nullRecord<RelationDef>());
       const existing = relationsByTable.get(sourceTbl)!;
       // Additive-only: never clobber an existing relation name.
-      if (existing[relName]) return;
+      if (Object.hasOwn(existing, relName)) return;
       const columnFields = columnFieldsByTable?.get(sourceTbl);
       if (columnFields?.has(relName)) {
         if (unknownTypedFieldsByTable?.get(sourceTbl)?.has(relName)) {
           // Historical json/jsonb shadow, worked at runtime, compiled fine.
           console.warn(
-            `[turbine] Relation "${relName}" on table "${sourceTbl}" (junction ${tableName}) shadows the ` +
-              `json/jsonb column "${relName}", keeping the historical name for runtime compatibility; ` +
-              `the relation is omitted from the generated types.`,
+            printableCatalogName(
+              `[turbine] Relation "${relName}" on table "${sourceTbl}" (junction ${tableName}) shadows the ` +
+                `json/jsonb column "${relName}", keeping the historical name for runtime compatibility; ` +
+                `the relation is omitted from the generated types.`,
+            ),
           );
         } else {
           const taken = new Set([...columnFields, ...Object.keys(existing)]);
