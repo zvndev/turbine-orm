@@ -170,6 +170,7 @@ import {
   selectNamesNothingMessage,
   selectOmitExclusiveMessage,
 } from './query/utils.js';
+import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
 import {
   assertJsonFilterKeys,
   emptyMutationWhereMessage,
@@ -494,7 +495,6 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
   private readonly defaultLimit?: number;
   private readonly warnOnUnlimited: boolean;
   private readonly onQuery?: (event: QueryEvent) => void;
-  private warnedUnlimited = false;
   /** Where this interface's log lines go: the client's logger, else the console. */
   private readonly logger: TurbineLogger;
   /** The logger for advice lines, or `undefined` when `diagnostics` turns advice off. */
@@ -2898,8 +2898,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     const order = this.buildOrder(args.orderBy, params, alias);
     const limit = this.effectiveLimit(args);
     this.assertPagination(limit, args.offset, 'findMany');
-    if (limit === undefined && this.warnOnUnlimited && !this.warnedUnlimited) {
-      this.warnedUnlimited = true;
+    // Once per table per process, as on the SQL engines: a transaction builds
+    // its own interfaces, so a per-interface flag repeated it in each one.
+    if (limit === undefined && this.warnOnUnlimited && shouldWarnOnce(WARN_NS.unlimitedFindMany, this.table)) {
       logTo(this.logger, 'warn', `findMany on "${this.table}" has no limit: this scans the whole table.`, {
         code: 'unlimited-find-many',
         table: this.table,

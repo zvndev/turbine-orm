@@ -529,6 +529,7 @@ async function consoleCalls(fn: () => Promise<void>): Promise<number> {
 
 describe('PowDB lines go through the client logger', () => {
   it('the no-limit warning reaches the logger with its code, and never the console', async () => {
+    resetWarnOnce(WARN_NS.unlimitedFindMany);
     const { logger, lines } = recorder();
     const printed = await consoleCalls(() =>
       withDb({ logger, warnOnUnlimited: true }, async (db) => {
@@ -538,7 +539,7 @@ describe('PowDB lines go through the client logger', () => {
     );
     assert.equal(printed, 0);
     const unlimited = lines.filter((l) => l.entry.code === 'unlimited-find-many');
-    assert.equal(unlimited.length, 1, 'once per interface');
+    assert.equal(unlimited.length, 1, 'once per table');
     assert.equal(unlimited[0]!.level, 'warn');
     assert.deepEqual(
       { table: unlimited[0]!.entry.table, operation: unlimited[0]!.entry.operation },

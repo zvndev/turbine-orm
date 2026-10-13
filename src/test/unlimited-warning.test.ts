@@ -11,9 +11,10 @@
  */
 
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
+import { beforeEach, describe, it } from 'node:test';
 import type pg from 'pg';
 import { QueryInterface } from '../query/index.js';
+import { resetWarnOnce, WARN_NS } from '../query/warn-registry.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { mockTable } from './helpers.js';
 
@@ -23,6 +24,7 @@ function buildSchema(): SchemaMetadata {
     { name: 'id', field: 'id' },
     { name: 'email', field: 'email', pgType: 'text' },
   ]);
+  tables.posts = mockTable('posts', [{ name: 'id', field: 'id' }]);
   return { tables, enums: {} };
 }
 
@@ -52,6 +54,9 @@ async function captureWarnings(fn: () => Promise<unknown>): Promise<string[]> {
 function unlimitedOnly(warnings: string[]): string[] {
   return warnings.filter((w) => /has no limit/.test(w));
 }
+
+// The dedupe is process-wide, so each test starts from a clean slate.
+beforeEach(() => resetWarnOnce(WARN_NS.unlimitedFindMany));
 
 describe('findMany unlimited-query warning', () => {
   it('warns when limit is omitted (default behaviour)', async () => {
@@ -91,7 +96,7 @@ describe('findMany unlimited-query warning', () => {
     assert.equal(unlimitedOnly(warnings).length, 0);
   });
 
-  it('dedupes, warns at most once per table per QueryInterface', async () => {
+  it('dedupes, warns at most once per table', async () => {
     const q = new QueryInterface(stubPool(), 'users', buildSchema());
     const warnings = await captureWarnings(async () => {
       await q.findMany();
@@ -99,6 +104,15 @@ describe('findMany unlimited-query warning', () => {
       await q.findMany();
     });
     assert.equal(warnings.length, 1, 'expected dedupe to suppress repeats');
+  });
+
+  it('does not repeat for a new query interface on the same table, as each $transaction builds', async () => {
+    const warnings = await captureWarnings(async () => {
+      for (let i = 0; i < 3; i++) await new QueryInterface(stubPool(), 'users', buildSchema()).findMany();
+    });
+    assert.equal(warnings.length, 1, 'one warning per table per process, not one per interface');
+    const other = await captureWarnings(() => new QueryInterface(stubPool(), 'posts', buildSchema()).findMany());
+    assert.equal(unlimitedOnly(other).length, 1, 'another table still warns');
   });
 
   it('opt-out: passing warnOnUnlimited: false silences the warning', async () => {

@@ -188,4 +188,11 @@ export const WARN_NS = {
    * warn sits in the per-relation loop, which runs once per row per relation.
    */
   relationParseFailure: 'relationParseFailure',
+  /**
+   * `findMany` with no row limit (builder.ts `maybeWarnUnlimited`, powql.ts).
+   * Keyed on the table and process-wide: every `$transaction` builds its own
+   * query interfaces, so a dedupe held on the interface said it again in
+   * every transaction.
+   */
+  unlimitedFindMany: 'unlimitedFindMany',
 } as const;

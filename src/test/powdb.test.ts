@@ -51,6 +51,7 @@ import {
 import { MAX_POWQL_DATETIME_TERMS, PowqlInterface } from '../powql.js';
 import type { DeferredQuery } from '../query/index.js';
 import { UNSAFE } from '../query/index.js';
+import { resetWarnOnce, WARN_NS } from '../query/warn-registry.js';
 import type { ColumnMetadata, RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 
 // ---------------------------------------------------------------------------
@@ -2087,6 +2088,8 @@ describe('powdb: warnOnUnlimited per-table map', () => {
   };
 
   async function warningsFor(warnOnUnlimited?: boolean | Record<string, boolean>): Promise<string[]> {
+    // The warning is said once per table per process, so each case starts clean.
+    resetWarnOnce(WARN_NS.unlimitedFindMany);
     const mock = mockPool();
     const q = new PowqlInterface(mock.pool, 'user_profiles', profilesSchema, [], { warnOnUnlimited });
     const captured: string[] = [];

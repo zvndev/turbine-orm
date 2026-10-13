@@ -164,7 +164,7 @@ import {
   unknownFieldMessage,
   warnRedundantSortTerm,
 } from './utils.js';
-import { shouldWarnOnce, WARN_NS } from './warn-registry.js';
+import { resetWarnOnce, shouldWarnOnce, WARN_NS } from './warn-registry.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
 import type { WhereHost } from './where-compile.js';
@@ -904,7 +904,6 @@ export class QueryInterface<
    * the audit's "Set<string>" guidance and leaves room for future
    * cross-table sharing.
    */
-  private readonly warnedTables = new Set<string>();
 
   /** Cache hit/miss counters for diagnostics */
   private cacheHits = 0;
@@ -2777,12 +2776,13 @@ export class QueryInterface<
   }
 
   /**
-   * Reset the per-instance unlimited-query warning dedupe set.
-   * Exposed for tests so a single test process can verify the warning fires
-   * exactly once per table without bleeding state between assertions.
+   * Reset the unlimited-query warning dedupe, which is process-wide (see
+   * {@link maybeWarnUnlimited}). Exposed for tests so a single test process can
+   * verify the warning fires once per table without bleeding state between
+   * assertions.
    */
   resetUnlimitedWarnings(): void {
-    this.warnedTables.clear();
+    resetWarnOnce(WARN_NS.unlimitedFindMany);
   }
 
   private emitQueryEvent(
@@ -4040,8 +4040,10 @@ export class QueryInterface<
    * Emit a one-time warning when {@link findMany} is called without an
    * explicit `limit`/`take` and `warnOnUnlimited` has not been disabled.
    *
-   * Deduped per QueryInterface instance via {@link warnedTables} so a busy
-   * loop calling `db.users.findMany()` thousands of times only logs once.
+   * Said once per table per process (`WARN_NS.unlimitedFindMany`), so a busy
+   * loop calling `db.users.findMany()` thousands of times logs once, and so
+   * does the same call inside every `$transaction`, which builds its own
+   * query interfaces.
    * Suppressed when `defaultLimit` is configured (the caller has already
    * opted in to a bounded query) and when the user passed an explicit
    * `limit`, `take`, or `cursor`. A per-call `warnOnUnlimited` overrides the
@@ -4057,8 +4059,7 @@ export class QueryInterface<
     const hasExplicitLimit = args?.limit !== undefined || hasCursor(args?.cursor);
     if (hasExplicitLimit) return;
     if (this.whereMatchesAtMostOneRow((args as { where?: unknown } | undefined)?.where)) return;
-    if (this.warnedTables.has(this.table)) return;
-    this.warnedTables.add(this.table);
+    if (!shouldWarnOnce(WARN_NS.unlimitedFindMany, this.table)) return;
     logTo(
       this.logger,
       'warn',
