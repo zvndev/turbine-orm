@@ -211,7 +211,7 @@
     "@size-limit/esbuild": "^12.1.0",
     "@size-limit/file": "^12.1.0",
     "@swc/core": "1.16.2",
-    "@types/node": "^26.1.0",
+    "@types/node": "^22.20.4",
     "@types/pg": "^8.11.11",
     "@zvndev/powdb-client": "^0.20.0",
     "@zvndev/powdb-embedded": "^0.20.0",
