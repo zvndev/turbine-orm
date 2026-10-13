@@ -479,15 +479,19 @@ export function listMigrationFiles(migrationsDir: string): MigrationFile[] {
 /**
  * `.sql` files in `migrationsDir` that the runner NEVER sees, because their
  * name lacks the `YYYYMMDDHHMMSS_<name>.sql` shape {@link listMigrationFiles}
- * requires (a hand-written `add_thing.sql`, a 13-digit prefix). Such a file
- * used to be skipped in silence by `status`, `up` and `deploy` alike, so a
- * misnamed migration simply never ran and nothing said so. The CLI prints one
- * warning per entry.
+ * requires (a hand-written `add_thing.sql`, a 13-digit prefix, an upper-case
+ * `.SQL` extension). Such a file used to be skipped in silence by `status`,
+ * `up` and `deploy` alike, so a misnamed migration simply never ran and
+ * nothing said so. The CLI prints one warning per entry.
+ *
+ * The extension is matched in any case here and only in lower case by the
+ * runner: `20260101000000_init.SQL` is a migration somebody meant to run, so
+ * it is reported rather than ignored like a `.txt` file.
  */
 export function listIgnoredSqlFiles(migrationsDir: string): string[] {
   if (!existsSync(migrationsDir)) return [];
   return readdirSync(migrationsDir)
-    .filter((f) => f.endsWith('.sql') && parseMigrationFilename(f) === null)
+    .filter((f) => /\.sql$/i.test(f) && parseMigrationFilename(f) === null)
     .sort();
 }
 

@@ -103,6 +103,7 @@ import {
   unwrapModuleDefault,
 } from './config.js';
 import { DESTRUCTIVE_KIND_LABEL } from './destructive.js';
+import { errorText } from './error-text.js';
 import { canResolveTsx, getTsLoaderError, needsTsLoader, registerTsLoader } from './loader.js';
 import { runMcpServer } from './mcp.js';
 import {
@@ -1158,7 +1159,7 @@ export function loadDotEnvForCli(
       loaded: false,
       unsupported: false,
       databaseUrlProvenance: shellOrNone,
-      loadError: err instanceof Error ? err.message : String(err),
+      loadError: errorText(err),
     };
   }
 
@@ -1901,7 +1902,7 @@ async function runInitGenerate(config: ResolvedConfig, url: string): Promise<Ini
     return { tableCount: tableNames.length, sampleAccessor: first ? snakeToCamel(first) : undefined };
   } catch (err) {
     spinner.fail('Could not generate client');
-    if (err instanceof Error) errorLine(dim(redactUrl(err.message)));
+    errorLine(dim(redactUrl(errorText(err))));
     info(`Run generation later with: ${cyan('npx turbine generate')}`);
     return { tableCount: null };
   }
@@ -1921,7 +1922,7 @@ async function runInitSeed(config: ResolvedConfig): Promise<void> {
     if (!outcome.confirmed) warn(UNCONFIRMED_SEED_NOTICE);
   } catch (err) {
     spinner.fail('Seed failed');
-    if (err instanceof Error) console.log(`  ${dim(redactUrl(err.message))}`);
+    console.log(`  ${dim(redactUrl(errorText(err)))}`);
   }
 }
 
@@ -2730,7 +2731,7 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
   } catch (err) {
     newline();
     error(`Could not read ${cyan(prismaPath)}`);
-    errorLine(`${red(err instanceof Error ? err.message : String(err))}`);
+    errorLine(`${red(errorText(err))}`);
     errorLine();
     process.exit(1);
   }
@@ -4282,9 +4283,7 @@ async function cmdSeed(_args: CliArgs, config: ResolvedConfig): Promise<void> {
     if (!outcome.confirmed) warn(UNCONFIRMED_SEED_NOTICE);
   } catch (err) {
     spinner.fail('Seed failed');
-    if (err instanceof Error) {
-      console.log(`  ${dim(redactUrl(err.message))}`);
-    }
+    console.log(`  ${dim(redactUrl(errorText(err)))}`);
     newline();
     process.exit(1);
   }
@@ -4553,7 +4552,7 @@ async function cmdDoctor(args: CliArgs, config: ResolvedConfig): Promise<void> {
       tables: {},
       indexes: [],
       nullFrac: {},
-      notices: [`statistics collection failed: ${err instanceof Error ? err.message : String(err)}`],
+      notices: [`statistics collection failed: ${errorText(err)}`],
     };
   }
 
@@ -5524,7 +5523,7 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
     });
     spinner.succeed(demo ? 'Demo Studio is running' : 'Studio is running');
   } catch (err) {
-    spinner.fail(`Failed to start Studio: ${err instanceof Error ? err.message : String(err)}`);
+    spinner.fail(`Failed to start Studio: ${errorText(err)}`);
     process.exit(1);
   }
 
@@ -5684,7 +5683,7 @@ async function cmdObserve(args: CliArgs): Promise<void> {
     handle = await startObserve({ url, port, host, openBrowser });
     spinner.succeed('Observe dashboard is running');
   } catch (err) {
-    spinner.fail(`Failed to start Observe: ${err instanceof Error ? err.message : String(err)}`);
+    spinner.fail(`Failed to start Observe: ${errorText(err)}`);
     process.exit(1);
   }
 
@@ -6459,7 +6458,7 @@ async function main() {
     // expected here; anything that does arrive is a bug in the parser rather
     // than in the caller's command line, and printing it beats swallowing it.
     errorLine();
-    error(err instanceof Error ? err.message : String(err));
+    error(errorText(err));
     errorLine();
     process.exit(1);
   }
@@ -6608,6 +6607,9 @@ async function main() {
     }
   } catch (err) {
     if (err instanceof Error) {
+      // `errorText`, not `message`: a refused `localhost` is an
+      // AggregateError with an empty message (see cli/error-text.ts).
+      const message = errorText(err);
       // TYPE first, message second. These branches sniff for substrings, and
       // `ValidationError` beat them by accident: a refused `--schema` value says
       // "used as a connection parameter", which contains "connection", so a bad
@@ -6615,31 +6617,31 @@ async function main() {
       // firewall hints. A typed error already knows what it is.
       if (err instanceof ValidationError) {
         errorLine();
-        error(redactUrl(err.message));
+        error(redactUrl(message));
         if (args.verbose && err.stack) {
           errorLine();
           console.error(dim(redactUrl(err.stack)));
         }
-      } else if (err.message.includes('ECONNREFUSED') || err.message.includes('connection')) {
+      } else if (message.includes('ECONNREFUSED') || message.includes('connection')) {
         errorLine();
         error(`Could not connect to database`);
-        errorLine(`${dim(redactUrl(err.message))}`);
+        errorLine(`${dim(redactUrl(message))}`);
         errorLine();
         errorLine(`${dim('Check that:')}`);
         errorLine(`  ${dim('1.')} Your database is running`);
         errorLine(`  ${dim('2.')} The connection string is correct`);
         errorLine(`  ${dim('3.')} Network/firewall allows the connection`);
-      } else if (err.message.includes('authentication')) {
+      } else if (message.includes('authentication')) {
         errorLine();
         error(`Authentication failed`);
-        errorLine(`${dim(redactUrl(err.message))}`);
-      } else if (err.message.includes('does not exist')) {
+        errorLine(`${dim(redactUrl(message))}`);
+      } else if (message.includes('does not exist')) {
         errorLine();
         error(`Database or schema not found`);
-        errorLine(`${dim(redactUrl(err.message))}`);
+        errorLine(`${dim(redactUrl(message))}`);
       } else {
         errorLine();
-        error(redactUrl(err.message));
+        error(redactUrl(message));
         if (args.verbose && err.stack) {
           errorLine();
           console.error(dim(redactUrl(err.stack)));
