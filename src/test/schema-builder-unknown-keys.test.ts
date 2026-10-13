@@ -34,8 +34,8 @@ const id = { type: 'serial', primaryKey: true } as const;
 
 describe('defineSchema: an unknown key is refused, in the type and at runtime', () => {
   it('a column option, including the metadata spelling of a real one', () => {
-    // @ts-expect-error `defaultValue` is ColumnConfig's name; the option is `default`
     refuses(
+      // @ts-expect-error `defaultValue` is ColumnConfig's name; the option is `default`
       () => defineSchema({ a: { id, role: { type: 'text', defaultValue: "'member'" } } }),
       'defaultValue',
       'default',
