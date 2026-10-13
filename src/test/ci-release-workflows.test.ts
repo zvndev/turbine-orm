@@ -149,7 +149,8 @@ describe('release publishes the tarball the gates tested', () => {
   const text = publish.join('\n');
 
   it('publish never builds or packs from the checkout', () => {
-    assert.doesNotMatch(text, /npm run build|run: npm pack\s*$/m);
+    assert.doesNotMatch(text, /npm run build/);
+    assert.doesNotMatch(text, /run: npm pack\s*$/m);
   });
 
   it('lifecycle scripts are off for the whole publish job', () => {

@@ -13,7 +13,7 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -87,8 +87,10 @@ async function closedPort(): Promise<number> {
 }
 
 describe('a refused localhost connection names its reason (CLI, end to end)', () => {
-  const dir = join(tmpdir(), `turbine-fx-eng-cli-${process.pid}-${Date.now()}`);
-  before(() => mkdirSync(dir, { recursive: true }));
+  let dir = '';
+  before(() => {
+    dir = mkdtempSync(join(tmpdir(), 'turbine-fx-eng-cli-'));
+  });
   after(() => rmSync(dir, { recursive: true, force: true }));
 
   it('`turbine status` reports a refused connection with the address that refused it', async () => {
@@ -101,9 +103,9 @@ describe('a refused localhost connection names its reason (CLI, end to end)', ()
 });
 
 describe('`migrate status --exit-code` reports a migration whose extension is upper case', () => {
-  const dir = join(tmpdir(), `turbine-fx-eng-sql-case-${process.pid}-${Date.now()}`);
+  let dir = '';
   before(() => {
-    mkdirSync(dir, { recursive: true });
+    dir = mkdtempSync(join(tmpdir(), 'turbine-fx-eng-sql-case-'));
     writeFileSync(join(dir, '20260101000001_ok.sql'), '-- UP\nSELECT 1;\n-- DOWN\n');
     writeFileSync(join(dir, '20260101000002_shouting.SQL'), '-- UP\nSELECT 1;\n-- DOWN\n');
     writeFileSync(join(dir, '20260101000003_mixed.Sql'), '-- UP\nSELECT 1;\n-- DOWN\n');

@@ -41,13 +41,15 @@ const pool = {
 const construct = (globalFilters: unknown) =>
   new TurbineClient({ pool, globalFilters: globalFilters as GlobalFilters }, schema);
 
+/** Escape every regular-expression metacharacter, so the text is matched literally. */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function refused(at: string, pattern: RegExp) {
   return (err: unknown): boolean => {
     assert.ok(err instanceof ValidationError, `expected ValidationError, got ${String(err)}`);
-    assert.match(
-      err.message,
-      new RegExp(`globalFilters\\["blogPosts"\\]: "${at.replace(/[[\]]/g, '\\$&')}" is refused`),
-    );
+    assert.match(err.message, new RegExp(`globalFilters\\["blogPosts"\\]: "${escapeRegExp(at)}" is refused`));
     assert.match(err.message, pattern, err.message);
     assert.equal(err.message.match(/TURBINE_E003/g)?.length, 1, 'the code tag appears once');
     return true;

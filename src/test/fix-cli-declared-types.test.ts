@@ -61,6 +61,11 @@ const def = defineSchema({
   },
 });
 
+/** Escape every regular-expression metacharacter, so the text is matched literally. */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 describe('a declared tsType in the metadata', () => {
   const meta = schemaDefToMetadata(def);
   const items = meta.tables.fcd_items;
@@ -86,9 +91,9 @@ describe('a declared tsType in the metadata', () => {
 
   it('types.ts uses the declared types and adds | null for a nullable column', () => {
     const out = generateTypes(meta, { noTimestamp: true });
-    assert.match(out, new RegExp(`\\n {2}ref: ${ID.replace(/[().]/g, '\\$&')};`));
-    assert.match(out, new RegExp(`\\n {2}seenAt: ${WHEN.replace(/[().]/g, '\\$&')} \\| null;`));
-    assert.match(out, new RegExp(`\\n {2}active: ${FLAG.replace(/[().]/g, '\\$&')};`));
+    assert.match(out, new RegExp(`\\n {2}ref: ${escapeRegExp(ID)};`));
+    assert.match(out, new RegExp(`\\n {2}seenAt: ${escapeRegExp(WHEN)} \\| null;`));
+    assert.match(out, new RegExp(`\\n {2}active: ${escapeRegExp(FLAG)};`));
     assert.match(out, /\n {2}settings: \{ theme: string \} \| null;/);
     assert.match(out, /\n {2}label: string \| null;/);
   });
