@@ -1089,6 +1089,24 @@ function reentrantTransactionError(): UnsupportedFeatureError {
   );
 }
 
+/**
+ * The error for a plain statement issued through the CLIENT (not the `tx`
+ * client) from inside that client's own open transaction callback, on the
+ * embedded engine. Its one handle carries one transaction, so the statement
+ * could only run inside the transaction (and be rolled back with it) or wait
+ * for the transaction to finish, which is itself waiting on this statement.
+ */
+function statementInsideTransactionError(): UnsupportedFeatureError {
+  return new UnsupportedFeatureError(
+    'A statement on the client while its own transaction is open',
+    'powdb',
+    'This call was made through the client, not the `tx` client, from inside an open $transaction callback. The ' +
+      'embedded engine has one handle and one transaction, so the call would either join that transaction (and be ' +
+      'rolled back with it) or wait for it forever. Use the `tx` client the callback receives, or make the call ' +
+      'after the transaction completes.',
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Single-writer transaction gate, FIFO queueing + re-entrancy detection
 // ---------------------------------------------------------------------------
@@ -1202,8 +1220,15 @@ interface PowdbTxHold {
 class PowdbTxGate {
   /** Tail of the FIFO queue, resolves once every earlier transaction has finished. */
   private tail: Promise<void> = Promise.resolve();
+  /** Holds taken and not yet finished, queued ones included. */
+  private outstanding = 0;
 
   constructor(private readonly queueTimeoutMs: number) {}
+
+  /** True while any transaction holds the gate or waits for it. */
+  get busy(): boolean {
+    return this.outstanding > 0;
+  }
 
   /**
    * Take a place in the transaction queue. The prologue walks the caller's
@@ -1213,7 +1238,7 @@ class PowdbTxGate {
    * the returned hold carries the fresh marker (`hold.ctx`) for
    * `wrapTransactionCallback` to scope around the user callback.
    */
-  async acquire(): Promise<PowdbTxHold> {
+  async acquire(reentrantError: () => Error = reentrantTransactionError): Promise<PowdbTxHold> {
     // Walk the WHOLE marker chain, not just the innermost marker: with two
     // pools, dbA-tx → dbB-tx → dbA-begin leaves dbB's marker innermost, but
     // the dbA ancestor is still open, queueing the inner dbA begin behind it
@@ -1225,7 +1250,7 @@ class PowdbTxGate {
     while (parent?.done) parent = parent.parent;
     for (let c: PowdbTxContext | undefined = parent; c !== undefined; c = c.parent) {
       if (c.gate === this && !c.done) {
-        throw reentrantTransactionError();
+        throw reentrantError();
       }
     }
     const ctx: PowdbTxContext = { gate: this, done: false, parent };
@@ -1237,11 +1262,13 @@ class PowdbTxGate {
     const ahead = this.tail;
     this.tail = ahead.then(() => finished);
 
+    this.outstanding++;
     const hold: PowdbTxHold = {
       ctx,
       finish: () => {
         if (ctx.done) return;
         ctx.done = true;
+        this.outstanding--;
         handOff();
       },
     };
@@ -2007,6 +2034,30 @@ export class PowdbEmbeddedPool implements PgCompatPool {
         holdRef.hold.finish();
         holdRef.hold = null;
         throw new ConnectionError('The PowDB embedded pool is closed: disconnect() was already called on this client.');
+      }
+    }
+    if (ctl === null && holdRef.hold === null && this.txGate.busy) {
+      // A statement from OUTSIDE the open transaction. The engine is one
+      // handle, so running it now would put it inside that transaction: it
+      // would read uncommitted rows, and a write would be rolled back with the
+      // transaction after being reported as done. It takes its FIFO turn on the
+      // gate instead, as a one-statement transaction of its own would. From
+      // inside the transaction's own callback that wait could never end, so the
+      // gate refuses it there.
+      const hold = await this.txGate.acquire(statementInsideTransactionError);
+      try {
+        if (this.closed) {
+          throw new ConnectionError(
+            'The PowDB embedded pool is closed: disconnect() was already called on this client.',
+          );
+        }
+        try {
+          return this.exec(powql, params);
+        } catch (err) {
+          throw wrapPowdbError(err);
+        }
+      } finally {
+        hold.finish();
       }
     }
     if ((ctl === 'commit' || ctl === 'rollback') && holdRef.hold === null) {
