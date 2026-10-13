@@ -59,13 +59,6 @@ export async function startObserve(options: ObserveOptions): Promise<ObserveServ
   });
   absorbCheckedOutErrors(pool);
 
-  const probe = await pool.connect();
-  try {
-    await probe.query('SELECT 1');
-  } finally {
-    probe.release();
-  }
-
   const authToken = randomBytes(24).toString('hex');
   const ticketGate = createTicketGate();
   const rateLimiter = new Map<string, { count: number; resetAt: number }>();
@@ -76,13 +69,28 @@ export async function startObserve(options: ObserveOptions): Promise<ObserveServ
     });
   });
 
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(options.port, options.host, () => {
-      server.off('error', reject);
-      resolve();
+  try {
+    const probe = await pool.connect();
+    try {
+      await probe.query('SELECT 1');
+    } finally {
+      probe.release();
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(options.port, options.host, () => {
+        server.off('error', reject);
+        resolve();
+      });
     });
-  });
+  } catch (err) {
+    // A start that fails (probe refused, port taken) must not leave the probe
+    // connection idling in a pool nobody holds: it would keep a database session
+    // open and the process alive until the idle timeout.
+    await pool.end().catch(() => {});
+    throw err;
+  }
 
   const hostPart = options.host.includes(':') && !options.host.startsWith('[') ? `[${options.host}]` : options.host;
   const url = `http://${hostPart}:${options.port}/?token=${ticketGate.token}`;
@@ -131,7 +139,14 @@ export async function handleRequest(
     return;
   }
 
-  const url = new URL(req.url ?? '/', expectedOrigin);
+  // A request target that is not a URL (`GET //`) is a client error, not a 500.
+  let url: URL;
+  try {
+    url = new URL(req.url ?? '/', expectedOrigin);
+  } catch {
+    sendJson(res, 400, { error: 'malformed request target' });
+    return;
+  }
   const pathname = url.pathname;
 
   if (pathname === '/' || pathname === '/index.html') {
@@ -383,10 +398,15 @@ function sendText(res: ServerResponse, status: number, text: string): void {
 
 function openUrl(url: string): void {
   const { platform: os } = process;
+  const [command, args]: [string, string[]] =
+    os === 'darwin' ? ['open', [url]] : os === 'win32' ? ['cmd', ['/c', 'start', '', url]] : ['xdg-open', [url]];
   try {
-    if (os === 'darwin') spawn('open', [url], { stdio: 'ignore', detached: true }).unref();
-    else if (os === 'win32') spawn('cmd', ['/c', 'start', '', url], { stdio: 'ignore', detached: true }).unref();
-    else spawn('xdg-open', [url], { stdio: 'ignore', detached: true }).unref();
+    const child = spawn(command, args, { stdio: 'ignore', detached: true });
+    // A launcher that is not installed (no xdg-open on a headless machine) is
+    // reported as an 'error' EVENT, not a throw; with no listener Node turns it
+    // into an uncaught exception and the dashboard dies right after printing its URL.
+    child.on('error', () => {});
+    child.unref();
   } catch {
     // Best effort
   }
