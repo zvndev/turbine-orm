@@ -52,21 +52,24 @@ import {
   assertMutationWhereIdentifiesOneRow,
   assertWhereIdentifiesOneRow,
   expandCompoundUniqueWhere,
+  uniqueKeyNames,
+  whereIdentifiesOneRow,
 } from './compound-unique.js';
 import {
   dedupeColumnList,
   dedupeOrderEntries,
   isEmptyOrderBy,
   isJsonPathOrderBy,
-  isOrderBySpec,
   isRelationPickOrderBy,
   isVectorOrderBy,
   isWhereOperator,
+  normalizeOrderBy,
   orderByEntries,
   sortedEntries,
 } from './filters.js';
+import { assertWhereNotEmptiedByPruning, isCursorInclusive, pruneUndefinedArgs } from './normalize-args.js';
 import { warnUnknownQueryOptions } from './option-surface.js';
-import { applyStableRelationOrderTo, normalizeWithClause } from './relation-names.js';
+import { applyStableRelationOrderTo, normalizeWithClause, normalizeWithPagination } from './relation-names.js';
 import * as relationsMod from './relations.js';
 import type {
   AggregateArgs,
@@ -86,6 +89,8 @@ import type {
   JsonEncoding,
   JsonPathOrderBy,
   OrderByClause,
+  OrderBySpec,
+  OrderDirection,
   QueryResult,
   RelationLoadStrategy,
   RelationPickOrderBy,
@@ -363,6 +368,38 @@ interface AutoEngaged {
    */
   reason: 'unindexed' | 'to-one-cardinality';
   miss?: { table: string; columns: string[]; createSql: string };
+}
+
+/** One column of a cursor page's effective order, while it is being planned. */
+interface CursorTerm {
+  column: string;
+  /** The key written into the rewritten orderBy (the caller's own, or the field name). */
+  key: string;
+  desc: boolean;
+  nulls: 'first' | 'last' | undefined;
+  nullable: boolean;
+  /** Whether the NULL placement was written out by the planner. */
+  pin?: boolean;
+}
+
+/** One column of a planned cursor seek. */
+interface CursorKeysetTerm {
+  column: string;
+  desc: boolean;
+  nullsFirst: boolean;
+  nullable: boolean;
+}
+
+/** A planned `cursor` page (see `planCursor`). */
+interface CursorPlan {
+  mode: 'values' | 'row';
+  terms: CursorKeysetTerm[];
+  /** `values` mode: the coerced cursor value per term, `null` for SQL NULL. */
+  values: unknown[];
+  /** `row` mode: the cursor's own fields, which name one row. */
+  lookup: { column: string; value: unknown }[];
+  inclusive: boolean;
+  fingerprint: string;
 }
 
 /** The `'auto'` per-relation partition of one `with` clause. */
@@ -1254,25 +1291,45 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * applied ONCE here rather than at each of the six `with` walkers are in
    * query/relation-names.ts.
    */
-  private withDeclaredRelationNames<A extends { with?: unknown } | undefined>(args: A): A {
-    if (!args?.with) return args;
-    const normalized = normalizeWithClause(this.schema, this.table, args.with as WithClause);
-    return normalized === args.with ? args : ({ ...args, with: normalized } as A);
+  private withDeclaredRelationNames<A extends object | undefined>(args: A): A {
+    const withClause = (args as { with?: unknown } | undefined)?.with;
+    if (!withClause) return args;
+    const normalized = normalizeWithClause(this.schema, this.table, withClause as WithClause);
+    return normalized === withClause ? args : ({ ...args, with: normalized } as A);
   }
 
   /**
-   * Caller args in canonical form: declared relation spellings, and the Prisma
-   * pagination aliases folded into `limit` / `offset`.
-   *
-   * ONE method rather than two calls at each seam, because the two
-   * normalizations have the same requirement and the same failure mode: both
-   * must happen before `withFingerprint` / the cache key, and a seam that
-   * applies one but not the other is a seam where the alias survives into a
-   * fingerprint. Both return their input by reference when there was nothing to
-   * change, so the common path still allocates nothing.
+   * `args` with `take` / `skip` folded into `limit` / `offset` at every `with`
+   * level (see `normalizeWithPagination` in query/relation-names.ts). Runs after
+   * the relation-name pass, so it resolves the declared spelling.
    */
-  private normalizeArgs<A extends { with?: unknown } | undefined>(args: A): A {
-    return normalizePagination(this.withDeclaredRelationNames(args));
+  private withRelationPagination<A extends object | undefined>(args: A): A {
+    const withClause = (args as { with?: unknown } | undefined)?.with;
+    if (!withClause) return args;
+    const normalized = normalizeWithPagination(this.schema, this.table, withClause as WithClause);
+    return normalized === withClause ? args : ({ ...args, with: normalized } as A);
+  }
+
+  /**
+   * Caller args in canonical form: `undefined` pruned (query/normalize-args.ts),
+   * declared relation spellings, and the Prisma pagination aliases folded into
+   * `limit` / `offset`, with `take` / `skip` folded inside every `with` level too.
+   *
+   * Called at the seam of EVERY public operation and its `build*` twin, so the
+   * guards, the fingerprint, the build and the collect all read one shape. Each
+   * step returns its input by reference when there was nothing to change, so a
+   * second call on already-normalized args is free and the common path
+   * allocates nothing.
+   *
+   * `refuseEmptiedWhere` names the single-row read (`findFirst`,
+   * `findFirstOrThrow`) that refuses a `where` whose every key was `undefined`.
+   */
+  private normalizeArgs<A extends object | undefined>(args: A, refuseEmptiedWhere?: string): A {
+    const pruned = pruneUndefinedArgs(this.schema, this.table, args);
+    if (refuseEmptiedWhere && pruned !== args) {
+      assertWhereNotEmptiedByPruning(this.table, refuseEmptiedWhere, args, pruned);
+    }
+    return normalizePagination(this.withRelationPagination(this.withDeclaredRelationNames(pruned)));
   }
 
   /**
@@ -1319,12 +1376,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
-   * The field names a `cursor` actually seeks on (its own keys with a defined
-   * value), in canonical sorted order. This is the diagnostic / implicit-
-   * ordering view; the seek itself orders the fields by their `orderBy`
-   * precedence (see {@link cursorSeekEntries}). Empty for a missing cursor or
-   * one whose every value is `undefined` (which emits no seek condition at
-   * all, so it does not paginate).
+   * The field names a `cursor` carries (its own keys with a defined value), in
+   * canonical sorted order. Empty for a missing cursor or one whose every value
+   * was `undefined` (pruned at the args seam, so it does not paginate).
    */
   private cursorFields(cursor: unknown): string[] {
     if (!cursor || typeof cursor !== 'object') return [];
@@ -1335,133 +1389,255 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   /**
-   * The ascending ordering implied by a `cursor`, or `undefined` when the shape
-   * is too ambiguous to order safely.
+   * Plan a `cursor` page: THE single authority the cache key, the SQL build and
+   * the cache-hit param collect all read, so the three cannot disagree.
    *
-   * A cursor seek compares against the cursor's own field(s) (`col > $n`, `<`
-   * when the orderBy says desc), so the ONLY ordering coherent with it is on
-   * those fields: ordering a seek on column X by column Y walks the table in an
-   * order the seek does not follow, which skips and repeats rows just as badly
-   * as no order at all. That is why this orders on the cursor field rather than
-   * blindly on the primary key when the two differ.
+   * The page is ordered by the EFFECTIVE order: the caller's `orderBy` plus a
+   * tiebreaker (the primary key, else a unique key on NOT NULL columns) when
+   * the orderBy does not already end in one, in the last term's direction. A
+   * cursor query is always ordered, because a seek over rows the engine may
+   * return in any order skips and repeats rows. `args.orderBy` is rewritten to
+   * that order (by reference when nothing changes).
    *
-   * Returns `undefined` (warn, inject nothing) for two shapes:
-   *  - a MULTI-field cursor. The seek is a proper keyset predicate, but its
-   *    column PRECEDENCE comes from the `orderBy` ({@link cursorSeekEntries}),
-   *    and with no orderBy there is nothing to derive it from: the cursor
-   *    object's key order is canonicalized away, so `(a asc, b asc)` would be a
-   *    guess at which key the caller meant to lead. The caller must state the
-   *    order, and the unordered-page warning says so.
-   *  - a field that does not resolve to a real column. Column validation belongs
-   *    to the normal build path, which raises a precise error; synthesizing an
-   *    ORDER BY on it here would only change which error the caller sees.
+   * Two ways to place the page, picked from what the cursor carries:
+   *  - VALUES: the cursor has a value for every column of the effective order,
+   *    so the seek compares against them directly (`col > $1`, expanded to a
+   *    keyset across several columns). Extra cursor fields are ignored.
+   *  - ROW: otherwise the cursor must identify one row by a unique key (the
+   *    findUnique rule), and the seek reads that row's ordered values in
+   *    scalar subqueries, guarded by `EXISTS` so a deleted cursor row gives an
+   *    empty page rather than a wrong one.
+   * Anything else is refused (E003) naming the missing fields.
+   *
+   * NULL sort keys are placed where the engine sorts them (PostgreSQL: last
+   * ascending, first descending; SQLite / MySQL / SQL Server: NULL is smallest)
+   * or where an explicit `nulls` puts them, and each row is visited exactly
+   * once. On PostgreSQL a nullable ordered column has its placement written
+   * out, so a Postgres-compatible engine with a different default reads the
+   * same order the seek assumes.
    */
-  private cursorOrderBy(cursor: unknown): WithOrderByObject | undefined {
-    const fields = this.cursorFields(cursor);
-    if (fields.length !== 1) return undefined;
-    const field = fields[0]!;
-    try {
-      this.toColumn(field);
-    } catch {
-      return undefined;
-    }
-    return { [field]: 'asc' };
-  }
+  private planCursor<A extends { cursor?: unknown; orderBy?: unknown }>(
+    args: A,
+  ): { args: A; plan: CursorPlan | undefined } {
+    const raw = args.cursor;
+    if (!raw || typeof raw !== 'object') return { args, plan: undefined };
+    const meta = this.tableMeta;
+    const field = (column: string): string => meta.reverseColumnMap[column] ?? column;
+    const nullableColumn = (column: string): boolean =>
+      !meta.primaryKey.includes(column) && meta.columns.find((c) => c.name === column)?.nullable === true;
 
-  /**
-   * The fields a `cursor` seeks on, in KEYSET order with their seek direction.
-   * THE single authority the cache fingerprint (`cur=`), the SQL build and the
-   * cache-hit param collect all consume, so the three cannot disagree about
-   * which value binds to which `$n`.
-   *
-   * Keyset order is the `orderBy` precedence: the predicate for
-   * `orderBy: [{ viewCount }, { id }]` must test `view_count` first and `id`
-   * only within equal `view_count`, whatever order the caller wrote the cursor
-   * object in (its keys are canonicalized for the cache anyway). A cursor field
-   * the orderBy does not name trails the named ones in sorted key order and
-   * seeks ascending, the same default a single-field cursor with no orderBy has
-   * always had.
-   *
-   * Directions are indexed by the RESOLVED COLUMN, never the caller's key: both
-   * `cursor` and `orderBy` take either spelling, so a cursor written
-   * `{ created_at }` against `orderBy: { createdAt: 'desc' }` used to miss the
-   * lookup, default to ascending, and seek the wrong side of the page. The
-   * `{ sort, nulls }` spec form is normalized for the same reason. A relation /
-   * JSON-path / vector orderBy key resolves to no column and is skipped.
-   *
-   * An unknown cursor field throws the same E003 here that the build path
-   * threw before this helper existed; the fingerprint simply meets it first.
-   */
-  private cursorSeekEntries(
-    cursor: Record<string, unknown>,
-    orderBy: unknown,
-  ): { column: string; value: unknown; desc: boolean }[] {
-    const orderPos = new Map<string, number>();
-    const orderDesc = new Map<string, boolean>();
-    for (const [ok, od] of orderByEntries(orderBy)) {
-      const ocol = resolveColumnName(this.tableMeta, ok);
-      if (ocol === undefined) continue;
-      if (!orderPos.has(ocol)) orderPos.set(ocol, orderPos.size);
-      // Last wins, matching object-key semantics (duplicates are refused
-      // upstream anyway, so in practice there is exactly one).
-      orderDesc.set(ocol, isOrderBySpec(od) ? od.sort === 'desc' : od === 'desc');
+    // The cursor's own values, by resolved column (either spelling, or a
+    // compound-unique selector, is accepted).
+    const flat = expandCompoundUniqueWhere(meta, raw as Record<string, unknown>);
+    const cursorValues = new Map<string, unknown>();
+    for (const [key, value] of sortedEntries(flat)) {
+      if (value === undefined) continue;
+      cursorValues.set(this.toColumn(key), value);
     }
-    const entries = sortedEntries(cursor)
-      .filter(([, v]) => v !== undefined)
-      .map(([k, value]) => {
-        const column = this.toColumn(k);
-        return { column, value, desc: orderDesc.get(column) === true };
+    if (cursorValues.size === 0) return { args, plan: undefined };
+
+    // The caller's order, plain columns only: a relation, JSON-path or vector
+    // ordering has no value a seek can compare against.
+    const terms: CursorTerm[] = [];
+    const orderEntries = orderByEntries(args.orderBy).filter(([, d]) => d !== undefined);
+    for (const [key, dir] of orderEntries) {
+      if (isVectorOrderBy(dir) || isJsonPathOrderBy(dir) || this.isRelationOrderByValue(dir)) {
+        throw new ValidationError(
+          `findMany on "${this.table}" refused: \`cursor\` cannot page past the orderBy entry "${key}", which ` +
+            'orders by a relation, a JSON path or a vector distance rather than a column. Order the cursor ' +
+            'query by columns only, or page it with `offset`.',
+        );
+      }
+      const column = this.toColumn(key);
+      if (terms.some((t) => t.column === column)) continue;
+      const { dir: d, nulls } = normalizeOrderBy(dir as OrderDirection | OrderBySpec);
+      terms.push({ column, key, desc: d === 'DESC', nulls, nullable: nullableColumn(column) });
+    }
+
+    // Tiebreaker, unless the order already contains a unique key on NOT NULL
+    // columns (then no two rows can tie on the whole order).
+    const ordered = new Set(terms.map((t) => t.column));
+    const uniqueSets = uniqueKeyNames(meta).filter((cols) => cols.every((c) => !nullableColumn(c)));
+    const total = uniqueSets.some((cols) => cols.every((c) => ordered.has(c)));
+    let appended = false;
+    if (!total) {
+      const tiebreak = uniqueSets[0];
+      if (!tiebreak) {
+        throw new ValidationError(
+          `findMany on "${this.table}" refused: a \`cursor\` page needs an order with no ties, and "${this.table}" ` +
+            'has no primary key or unique key on NOT NULL columns to break them. Add a primary key, or page ' +
+            'this table with `offset`.',
+        );
+      }
+      const desc = terms.length > 0 ? terms[terms.length - 1]!.desc : false;
+      for (const column of tiebreak) {
+        if (ordered.has(column)) continue;
+        terms.push({ column, key: field(column), desc, nulls: undefined, nullable: false });
+        appended = true;
+      }
+    }
+
+    // Where NULLs sort, per term; written out on PostgreSQL for a nullable column.
+    const pg = this.dialect.name === 'postgresql';
+    let pinned = false;
+    for (const t of terms) {
+      if (t.nulls === undefined && t.nullable && pg) {
+        t.nulls = t.desc ? 'first' : 'last';
+        t.pin = true;
+        pinned = true;
+      }
+    }
+    const nullsFirst = (t: CursorTerm): boolean =>
+      t.nulls !== undefined ? t.nulls === 'first' : pg ? t.desc : !t.desc;
+
+    let nextArgs = args;
+    if (appended || pinned) {
+      const orderBy = terms.map((t) => {
+        const dir = t.desc ? 'desc' : 'asc';
+        const original = orderEntries.find(([k]) => k === t.key)?.[1];
+        return { [t.key]: t.pin ? { sort: dir, nulls: t.nulls } : (original ?? dir) };
       });
-    // Stable sort over the canonical (sorted-key) list: orderBy precedence
-    // first, unnamed fields after it in their sorted order.
-    return entries.sort(
-      (a, b) =>
-        (orderPos.get(a.column) ?? Number.MAX_SAFE_INTEGER) - (orderPos.get(b.column) ?? Number.MAX_SAFE_INTEGER),
-    );
+      nextArgs = { ...args, orderBy };
+    }
+
+    const inclusive = isCursorInclusive(args);
+    const coerce = (column: string, value: unknown): unknown =>
+      whereMod.coerceWhereOperand(this.ctx, meta, column, value);
+    const keysetTerms: CursorKeysetTerm[] = terms.map((t) => ({
+      column: t.column,
+      desc: t.desc,
+      nullsFirst: nullsFirst(t),
+      nullable: t.nullable,
+    }));
+
+    if (terms.every((t) => cursorValues.has(t.column))) {
+      const values = terms.map((t) => {
+        const v = cursorValues.get(t.column);
+        return v === null ? null : coerce(t.column, v);
+      });
+      const fp =
+        `v:${keysetTerms.map((t, i) => `${t.column}:${t.desc ? 'd' : 'a'}${t.nullable ? (t.nullsFirst ? 'f' : 'l') : ''}${values[i] === null ? '0' : ''}`).join(',')}` +
+        (inclusive ? ':i' : '');
+      return {
+        args: nextArgs,
+        plan: { mode: 'values', terms: keysetTerms, values, lookup: [], inclusive, fingerprint: fp },
+      };
+    }
+
+    if (!whereIdentifiesOneRow(meta, flat)) {
+      const missing = terms.filter((t) => !cursorValues.has(t.column)).map((t) => `"${field(t.column)}"`);
+      const order = terms.map((t) => `${field(t.column)} ${t.desc ? 'desc' : 'asc'}`).join(', ');
+      const keys = uniqueKeyNames(meta).map((cols) =>
+        cols.length === 1 ? `{ ${field(cols[0]!)} }` : `{ ${cols.map(field).join(', ')} }`,
+      );
+      throw new ValidationError(
+        `findMany on "${this.table}" refused: the \`cursor\` has no value for ${missing.join(', ')}, which the ` +
+          `page order (${order}) needs, and it does not name one row by a unique key. Give the cursor a value ` +
+          `for every ordered field, or name the cursor row by ${keys.length > 0 ? keys.join(' or ') : 'a unique key'}.`,
+      );
+    }
+    const lookup = [...cursorValues].map(([column, v]) => ({ column, value: v === null ? null : coerce(column, v) }));
+    const fp =
+      `r:${keysetTerms.map((t) => `${t.column}:${t.desc ? 'd' : 'a'}${t.nullable ? (t.nullsFirst ? 'f' : 'l') : ''}`).join(',')}` +
+      `|k=${lookup.map((l) => `${l.column}${l.value === null ? '0' : ''}`).join(',')}` +
+      (inclusive ? ':i' : '');
+    return {
+      args: nextArgs,
+      plan: { mode: 'row', terms: keysetTerms, values: [], lookup, inclusive, fingerprint: fp },
+    };
   }
 
   /**
-   * The keyset predicate for cursor terms in keyset order.
+   * Render a {@link CursorPlan}'s seek predicate, pushing its params. Run by
+   * the build AND by the cache-hit collect (which discards the SQL), so the two
+   * cannot bind different params.
    *
-   * One field is the plain `col > $1` (byte-identical to every single-field
-   * cursor ever emitted). Two or more expand to
-   * `(c1 > $1 OR (c1 = $1 AND c2 > $2) OR (c1 = $1 AND c2 = $2 AND c3 > $3))`,
-   * with `<` for a `desc` field: the row-value form `(c1, c2) > ($1, $2)` is
-   * shorter, but it cannot express a MIXED direction at all and SQL Server has
-   * no row-value comparison, so the expanded form is the one path every engine
-   * and every direction set share. Each value is bound ONCE and its `$n` is
-   * referenced by every branch that needs it (legal on every supported
-   * placeholder syntax), which is what keeps the param count equal to the field
-   * count on both the build and the collect side.
-   *
-   * The former `c1 > $1 AND c2 > $2` was a conjunction, not a seek: it skipped
-   * every row whose leading key EQUALED the cursor's, so a table with few
-   * distinct leading values lost most of its rows across a page walk, silently.
+   * Each value is bound once and referenced by every branch that needs it. One
+   * non-null column is the plain `col > $1`; several expand to
+   * `(c1 > $1 OR (c1 = $1 AND c2 > $2) OR ...)`, with `<` for a descending
+   * column (a row-value comparison cannot mix directions, and SQL Server has
+   * none). A nullable column gets NULL-aware equality and "after" terms.
    */
-  private keysetPredicate(terms: { column: string; placeholder: string; desc: boolean }[]): string {
-    const compare = (t: { column: string; placeholder: string; desc: boolean }) =>
-      `${t.column} ${t.desc ? '<' : '>'} ${t.placeholder}`;
-    if (terms.length === 1) return compare(terms[0]!);
-    const branches = terms.map((term, i) => {
-      if (i === 0) return compare(term);
-      const prefix = terms.slice(0, i).map((t) => `${t.column} = ${t.placeholder}`);
-      return `(${[...prefix, compare(term)].join(' AND ')})`;
-    });
-    return `(${branches.join(' OR ')})`;
+  private renderCursorPredicate(plan: CursorPlan, params: unknown[]): string {
+    const qt = this.q(this.table);
+    const col = (t: CursorKeysetTerm) => `${qt}.${this.q(t.column)}`;
+    let ref: (i: number) => string | null;
+    let guard = '';
+    if (plan.mode === 'values') {
+      const refs = plan.values.map((v) => {
+        if (v === null) return null;
+        params.push(v);
+        return this.p(params.length);
+      });
+      ref = (i) => refs[i] ?? null;
+    } else {
+      const alias = 'cursor_row';
+      const conds = plan.lookup.map((l) => {
+        if (l.value === null) return `${alias}.${this.q(l.column)} IS NULL`;
+        params.push(l.value);
+        return `${alias}.${this.q(l.column)} = ${this.p(params.length)}`;
+      });
+      const gf = whereMod.targetGlobalFilterAlias(this.ctx, this.table, alias, params);
+      if (gf) conds.push(gf);
+      const from = `FROM ${qt} ${alias} WHERE ${conds.join(' AND ')}`;
+      ref = (i) => `(SELECT ${alias}.${this.q(plan.terms[i]!.column)} ${from})`;
+      guard = `EXISTS (SELECT 1 ${from})`;
+    }
+
+    // Value mode knows each value; row mode knows only whether the column can
+    // hold NULL, so its comparisons stay NULL-aware for nullable columns.
+    const rowMode = plan.mode === 'row';
+    const eq = (i: number): string => {
+      const t = plan.terms[i]!;
+      const r = ref(i);
+      if (r === null) return `${col(t)} IS NULL`;
+      if (rowMode && t.nullable) return `(${col(t)} = ${r} OR (${col(t)} IS NULL AND ${r} IS NULL))`;
+      return `${col(t)} = ${r}`;
+    };
+    const after = (i: number, orEqual: boolean): string | null => {
+      const t = plan.terms[i]!;
+      const r = ref(i);
+      const op = `${t.desc ? '<' : '>'}${orEqual ? '=' : ''}`;
+      if (r === null) return t.nullsFirst ? `${col(t)} IS NOT NULL` : null;
+      if (!t.nullable) return `${col(t)} ${op} ${r}`;
+      if (rowMode) {
+        return t.nullsFirst
+          ? `((${r} IS NULL AND ${col(t)} IS NOT NULL) OR ${col(t)} ${op} ${r})`
+          : `(${r} IS NOT NULL AND (${col(t)} ${op} ${r} OR ${col(t)} IS NULL))`;
+      }
+      return t.nullsFirst ? `${col(t)} ${op} ${r}` : `(${col(t)} ${op} ${r} OR ${col(t)} IS NULL)`;
+    };
+
+    const n = plan.terms.length;
+    const last = n - 1;
+    // An inclusive page folds "equal on every column" into the last branch when
+    // that column is NOT NULL and its value known non-null (`>=`); otherwise it
+    // is its own branch.
+    const foldEqual = plan.inclusive && !plan.terms[last]!.nullable && ref(last) !== null;
+    const branches: string[] = [];
+    for (let i = 0; i < n; i++) {
+      const a = after(i, foldEqual && i === last);
+      if (a === null) continue;
+      if (i === 0) branches.push(a);
+      else branches.push(`(${[...plan.terms.slice(0, i).map((_, j) => eq(j)), a].join(' AND ')})`);
+    }
+    if (plan.inclusive && !foldEqual) {
+      branches.push(n === 1 ? eq(0) : `(${plan.terms.map((_, j) => eq(j)).join(' AND ')})`);
+    }
+    const keyset =
+      branches.length === 0 ? '1 = 0' : branches.length === 1 ? branches[0]! : `(${branches.join(' OR ')})`;
+    return guard ? `(${guard} AND ${keyset})` : keyset;
   }
 
   /**
-   * Whether a findMany paginates (`limit` / `take` / `offset` / `cursor`) but
-   * declares no ordering, which makes the returned page NON-DETERMINISTIC:
-   * Postgres is free to return different rows for the same unordered `LIMIT`
-   * once the heap changes underneath it, so a row can appear on two pages or on
-   * none.
+   * Whether a findMany paginates (`limit` / `take` / `offset`) but declares no
+   * ordering, which makes the returned page NON-DETERMINISTIC: Postgres is
+   * free to return different rows for the same unordered `LIMIT` once the heap
+   * changes underneath it, so a row can appear on two pages or on none.
    *
-   * `cursor` counts, and is the worst case rather than an exception: a keyset
-   * seek with no ORDER BY is exactly this bug (`WHERE id > $1 LIMIT $2` walks
-   * the heap in whatever order the plan happens to produce). An empty orderBy
-   * (`[]`, or an object whose every value is `undefined`) counts as absent,
-   * because it emits no ordering.
+   * A `cursor` page never counts: it is always ordered by its effective order
+   * (see {@link planCursor}). An empty orderBy (`[]`, or an object whose every
+   * value is `undefined`) counts as absent, because it emits no ordering.
    *
    * `distinct` is still excluded: that path re-orders in an outer wrapper around
    * a `DISTINCT ON` whose ordering picks the representative row, so an implicit
@@ -1476,9 +1652,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }): boolean {
     if (!args) return false;
     if (args.distinct !== undefined) return false;
+    if (this.cursorFields(args.cursor).length > 0) return false;
     if (!isEmptyOrderBy(args.orderBy)) return false;
-    if (args.limit !== undefined || args.offset !== undefined) return true;
-    return this.cursorFields(args.cursor).length > 0;
+    return args.limit !== undefined || args.offset !== undefined;
   }
 
   /**
@@ -1487,18 +1663,15 @@ export class QueryInterface<T extends object, R extends object = {}> {
    *
    * OFF by default in CORE, deliberately: turning it on would add an `ORDER BY`
    * to SQL that existing applications already emit, changing both the rows a
-   * given page returns and the plan the engine picks. That is a breaking change
-   * in everything but the type signature, so it waits for a major. The
+   * given page returns and the plan the engine picks. The
    * `turbine-orm/prisma-compat` layer defaults it ON instead, because reproducing
    * Prisma's semantics is that layer's whole contract.
    *
    * An explicit `orderBy` always wins, a PK-less table is left alone (nothing
    * stable to order by), and a composite PK orders on every column in
-   * declaration order. A `cursor` query orders on the CURSOR's field instead
-   * (see {@link cursorOrderBy}), and is left alone when that shape is ambiguous.
+   * declaration order. A `cursor` page is ordered by its own plan, not here, and
    * `distinct` shapes are skipped (see {@link isUnorderedPage}). With the flag
-   * off this returns `undefined` before touching anything, so the emitted SQL is
-   * byte-identical to before.
+   * off this returns `undefined` before touching anything.
    */
   private implicitPkOrderBy(args?: {
     limit?: number;
@@ -1509,7 +1682,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }): WithOrderByObject | WithOrderByObject[] | undefined {
     if (!this.implicitPkOrdering) return undefined;
     if (!this.isUnorderedPage(args)) return undefined;
-    if (this.cursorFields(args?.cursor).length > 0) return this.cursorOrderBy(args?.cursor);
     return this.pkOrderBy();
   }
 
@@ -1526,9 +1698,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * process-wide through the shared warn registry, so it can never spam.
    *
    * Suppressed only when `implicitPkOrdering` will ACTUALLY order this query.
-   * The flag being on is not enough: a PK-less table and an ambiguous
-   * multi-field cursor both get no injected ordering, and those are precisely
-   * the shapes that still need saying out loud.
+   * The flag being on is not enough: a PK-less table gets no injected
+   * ordering, and that is precisely the shape that still needs saying out loud.
    */
   private maybeWarnUnorderedPage(args?: {
     limit?: number;
@@ -1544,33 +1715,18 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (perCall === false) return;
     if (perCall === undefined && !this.warnOnUnlimited) return;
     if (!this.isUnorderedPage(args)) return;
-    const cursorFields = this.cursorFields(args?.cursor);
-    const shape = [
-      cursorFields.length > 0 ? 'cursor' : '',
-      args?.limit !== undefined ? 'limit' : '',
-      args?.offset !== undefined ? 'offset' : '',
-    ]
+    const shape = [args?.limit !== undefined ? 'limit' : '', args?.offset !== undefined ? 'offset' : '']
       .filter(Boolean)
       .join('+');
     if (!shouldWarnOnce(WARN_NS.unorderedPage, `${this.table}|${shape}`)) return;
-    const asOrderBy = (fields: string[]) =>
-      fields.length === 1 ? `{ ${fields[0]}: 'asc' }` : `[${fields.map((f) => `{ ${f}: 'asc' }`).join(', ')}]`;
     const pk = (this.tableMeta.primaryKey ?? []).map((c) => this.tableMeta.reverseColumnMap[c] ?? c);
-    // A cursor seeks on its own field, so that is the ordering to recommend:
-    // the primary key would be the wrong advice whenever the two differ.
-    const orderFields = cursorFields.length > 0 ? cursorFields : pk;
-    const suggestion =
-      orderFields.length > 0 ? `Add \`orderBy: ${asOrderBy(orderFields)}\`` : 'Add an `orderBy` on a unique column';
-    const seek =
-      cursorFields.length > 0
-        ? 'a `cursor` seek with no orderBy compares against rows the engine is free to return in any order, so ' +
-          'paging with it skips and repeats rows: '
-        : '';
+    const asOrderBy = pk.length === 1 ? `{ ${pk[0]}: 'asc' }` : `[${pk.map((f) => `{ ${f}: 'asc' }`).join(', ')}]`;
+    const suggestion = pk.length > 0 ? `Add \`orderBy: ${asOrderBy}\`` : 'Add an `orderBy` on a unique column';
     console.warn(
-      `[turbine] findMany on "${this.table}" paginates (${shape}) with no orderBy: ${seek}the page is NOT ` +
+      `[turbine] findMany on "${this.table}" paginates (${shape}) with no orderBy: the page is NOT ` +
         'deterministic (the same query can return different rows as the table changes, so a row may appear ' +
         `on two pages or on none). ${suggestion}, or set \`implicitPkOrdering: true\` in the client config ` +
-        'to order paginated queries automatically (by the cursor field, or by the primary key).',
+        'to order paginated queries by the primary key automatically.',
     );
   }
 
@@ -2560,6 +2716,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args: CreateArgs<T, R, S, O>): DeferredQuery<FieldResult<T, S, O>> {
+    args = this.normalizeArgs(args);
     return writesMod.buildCreate(
       this.ctx,
       args as CreateArgs<T>,
@@ -2591,13 +2748,14 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildCreateMany(args: CreateManyArgs<T>): DeferredQuery<T[]> {
-    return writesMod.buildCreateMany(this.ctx, args);
+    return writesMod.buildCreateMany(this.ctx, this.normalizeArgs(args));
   }
 
   buildUpdate<
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args: UpdateArgs<T, R, S, O>): DeferredQuery<FieldResult<T, S, O>> {
+    args = this.normalizeArgs(args);
     return writesMod.buildUpdate(
       this.ctx,
       args as UpdateArgs<T>,
@@ -2609,6 +2767,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args: DeleteArgs<T, R, S, O>): DeferredQuery<FieldResult<T, S, O>> {
+    args = this.normalizeArgs(args);
     return writesMod.buildDelete(
       this.ctx,
       args as DeleteArgs<T>,
@@ -2620,6 +2779,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args: UpsertArgs<T, R, S, O>): DeferredQuery<FieldResult<T, S, O>> {
+    args = this.normalizeArgs(args);
     return writesMod.buildUpsert(
       this.ctx,
       args as UpsertArgs<T>,
@@ -2628,11 +2788,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildUpdateMany(args: UpdateManyArgs<T>): DeferredQuery<{ count: number }> {
-    return writesMod.buildUpdateMany(this.ctx, args);
+    return writesMod.buildUpdateMany(this.ctx, this.normalizeArgs(args));
   }
 
   buildDeleteMany(args: DeleteManyArgs<T>): DeferredQuery<{ count: number }> {
-    return writesMod.buildDeleteMany(this.ctx, args);
+    return writesMod.buildDeleteMany(this.ctx, this.normalizeArgs(args));
   }
 
   /**
@@ -2788,6 +2948,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args: FindUniqueArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O> | null> {
+    // Canonical args FIRST: the empty-where guard and the unique-key rule below
+    // must read the pruned `where`, never one still carrying `undefined` keys.
+    args = this.normalizeArgs(args);
     this.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
     // Pinned before the cache key, which carries it (see buildFindMany).
     const jsonEncoding = this.resolveJsonEncoding(args.jsonEncoding);
@@ -2809,9 +2972,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // deliberately so: a tenant filter is not a unique selector, and letting it
     // satisfy this would still hand back an arbitrary row from inside the tenant.
     //
-    // `findFirst` is intentionally NOT guarded. "The first row matching an
-    // optional filter" is its whole contract and Prisma's `findFirst` behaves
-    // the same way; ask for one row by identity with `findUnique`.
+    // `findFirst` takes no such guard: "the first row matching an optional
+    // filter" is its contract, and `where: {}` or no `where` asks for any row.
+    // It refuses only a `where` that was emptied by `undefined` values (see
+    // normalizeArgs), which never meant "any row".
     if (whereMod.userPredicateIsEmpty(this.ctx, (args.where ?? {}) as Record<string, unknown>)) {
       throw new ValidationError(
         `findUnique on "${this.table}" refused: the \`where\` clause has no predicate, ` +
@@ -2833,9 +2997,6 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // a global filter is not an identity, and letting one satisfy this would
     // hand back an arbitrary row from inside the tenant.
     this.assertFindUniqueKey(args.where as Record<string, unknown>);
-    // Declared relation spellings first, before stable-order and the
-    // fingerprint (see buildFindMany).
-    args = this.normalizeArgs(args);
     // Stable relation order (opt-in): fill PK-asc orderBy into unordered to-many
     // relations before fingerprinting (see buildFindMany).
     if (args.with && this.resolveStableOrder(args.stableRelationOrder)) {
@@ -3274,6 +3435,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // `implicitPkOrdering` is enabled (see implicitPkOrderBy).
     const implicitOrder = this.implicitPkOrderBy(args);
     if (implicitOrder) args = { ...args, orderBy: implicitOrder as NonNullable<typeof args>['orderBy'] };
+    // A cursor page is planned (and its orderBy completed to the effective
+    // order) BEFORE fingerprinting, so the key, the SQL and the param collect
+    // all read one plan. See planCursor.
+    let cursorPlan: CursorPlan | undefined;
+    if (args?.cursor !== undefined) ({ args, plan: cursorPlan } = this.planCursor(args));
     // `distinct` compiles to `SELECT DISTINCT ON (...)`, which is PostgreSQL
     // syntax and nothing else's. Every other engine parsed it as far as the
     // word `ON` and answered with a RAW driver error carrying no TURBINE_ code
@@ -3350,14 +3516,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
           })
           .join(',')
       : '';
-    // Keyset order AND per-field direction: a multi-field cursor's predicate
-    // is one OR-branch per field in orderBy precedence, and `<` / `>` are SQL
-    // text, so `asc` and `desc` (or two precedences) can never share a template.
-    const cursorFp = args?.cursor
-      ? this.cursorSeekEntries(args.cursor as Record<string, unknown>, args.orderBy)
-          .map((e) => `${e.column}:${e.desc ? 'd' : 'a'}`)
-          .join(',')
-      : '';
+    // Mode, keyset order, directions, NULL placement and which values are
+    // NULL all change the predicate's SQL text (see planCursor).
+    const cursorFp = cursorPlan?.fingerprint ?? '';
     // distinct must fingerprint in USER order: the SQL emits `DISTINCT ON` in
     // the caller's column order, so a permuted array rebuilds different SQL and
     // must not collapse onto the same cache entry (would trip the cross-check).
@@ -3480,18 +3641,9 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // WHERE + cursor conditions accumulate into `tail`, pushing params in
       // where → cursor order (the collect path mirrors this exactly).
       let tail = freshWhereSql;
-      if (args?.cursor) {
-        // Keyset order (orderBy precedence), MUST match cursorFp and the
-        // cache-hit collect below: both go through cursorSeekEntries.
-        const seek = this.cursorSeekEntries(args.cursor as Record<string, unknown>, args.orderBy);
-        if (seek.length > 0) {
-          const terms = seek.map((e) => {
-            freshParams.push(e.value);
-            return { column: `${qt}.${this.q(e.column)}`, placeholder: this.p(freshParams.length), desc: e.desc };
-          });
-          const predicate = this.keysetPredicate(terms);
-          tail += freshWhereSql ? ` AND ${predicate}` : ` WHERE ${predicate}`;
-        }
+      if (cursorPlan) {
+        const predicate = this.renderCursorPredicate(cursorPlan, freshParams);
+        tail += freshWhereSql ? ` AND ${predicate}` : ` WHERE ${predicate}`;
       }
 
       // ORDER BY is built AFTER the cursor pushes (param order
@@ -3579,13 +3731,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     if (args?.with) {
       this.collectWithParams(args.with as WithClause, params, undefined, flattenPlan);
     }
-    // 3. Cursor params, keyset order, matching cursorFp and the build path
-    //    (each value binds ONCE; the expanded predicate re-references its `$n`).
-    if (args?.cursor) {
-      for (const e of this.cursorSeekEntries(args.cursor as Record<string, unknown>, args.orderBy)) {
-        params.push(e.value);
-      }
-    }
+    // 3. Cursor params: the build's own renderer, SQL discarded.
+    if (cursorPlan) this.renderCursorPredicate(cursorPlan, params);
     // 4. ORDER BY params (vector KNN ordering binds a `$n::vector` query vector).
     //    Mirrors buildOrderBy's push order, between cursor and LIMIT.
     if (args?.orderBy) {
@@ -3695,12 +3842,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     args: FindManyStreamArgs<T, R, W, S, O> | undefined,
     action: string,
   ): AsyncGenerator<Record<string, unknown>[], void, undefined> {
-    // Pagination aliases folded BEFORE the speculative build below, which
-    // spreads `args` and overrides `limit`. A surviving `take` would reach that
-    // spread alongside the override and be read as two different values for one
-    // bound. Relation names are left to `buildFindMany`, which both branches go
-    // through.
-    args = normalizePagination(args);
+    // Canonical args BEFORE the speculative build below, which spreads `args`
+    // and sets its own `limit`: a surviving `take` would reach that spread
+    // beside it and be read as a second value for one bound.
+    args = this.normalizeArgs(args);
     const batchSize = Math.max(1, Math.floor(Number(args?.batchSize ?? 1000)));
 
     this.currentAction = action;
@@ -3746,9 +3891,16 @@ export class QueryInterface<T extends object, R extends object = {}> {
     // four round trips on a drain that would have fit, never any transferred
     // rows.
     if (batchSize <= STREAM_SPECULATION_MAX_BATCH) {
+      // The caller's bound (or the client's `defaultLimit`, exactly as findMany
+      // applies it) caps the speculative fetch. When the bound fits in a batch
+      // the speculative fetch IS the whole answer; otherwise `rows <= batchSize`
+      // still means fewer rows exist than either bound, and an overflow goes to
+      // the cursor, whose statement carries the caller's own LIMIT.
+      const callerLimit = args?.limit ?? this.defaultLimit;
+      const bound = callerLimit === undefined ? undefined : this.paginationValue(callerLimit, 'limit');
       const speculativeDeferred = this.buildFindMany({
         ...args,
-        limit: batchSize + 1,
+        limit: bound !== undefined && bound <= batchSize ? bound : batchSize + 1,
       } as FindManyArgs<
         T,
         R,
@@ -3842,6 +3994,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyStreamArgs<T, R, W, S, O>): AsyncGenerator<QueryResult<T, R, W, S, O>[], void, undefined> {
+    args = this.normalizeArgs(args);
     const parse = this.makeStreamRowParser<W, S, O>(args);
     for await (const batch of this.streamRaw<W, S, O>(args, 'findManyStreamBatches')) {
       const parsed = new Array<QueryResult<T, R, W, S, O>>(batch.length);
@@ -3893,6 +4046,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyStreamArgs<T, R, W, S, O>): AsyncGenerator<QueryResult<T, R, W, S, O>, void, undefined> {
+    args = this.normalizeArgs(args);
     const parse = this.makeStreamRowParser<W, S, O>(args);
     // Parsed one row at a time, INSIDE the yield loop rather than a batch ahead
     // of it, so a consumer that breaks early still pays only for the rows it
@@ -3915,15 +4069,10 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O> | null> {
-    // BEFORE the strategy branch, not only inside the builders, so the
-    // join-vs-batched decision and its dev warning see the same declared name
-    // every other stage does. `planAuto` splits `with` on the caller's keys and
-    // `runAutoSplit` carries them onward; each downstream consumer normalizes
-    // too, so this is not load-bearing for correctness (measured: removing it
-    // changes the warning text from the declared name back to the caller's and
-    // nothing else). It is here so the invariant holds at the seam rather than
-    // depending on every consumer to re-establish it.
-    args = this.normalizeArgs(args);
+    // BEFORE the strategy branch, so the batched and auto paths below read the
+    // same canonical args the builders do, and so an all-undefined `where` is
+    // refused before anything runs (see normalizeArgs).
+    args = this.normalizeArgs(args, 'findFirst');
     return this.executeWithMiddleware('findFirst', (args ?? {}) as Record<string, unknown>, async () => {
       if (args?.with) {
         const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
@@ -3962,6 +4111,23 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O> | null> {
+    return this.buildFindFirstAs<W, S, O>(args, 'findFirst');
+  }
+
+  /**
+   * findFirst / findFirstOrThrow over findMany's builder with `LIMIT 1`.
+   * `operation` names the method in the refusal of an all-undefined `where`.
+   */
+  private buildFindFirstAs<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(
+    args: FindManyArgs<T, R, W, S, O> | undefined,
+    operation: string,
+  ): DeferredQuery<QueryResult<T, R, W, S, O> | null> {
+    args = this.normalizeArgs(args, operation);
     // Reuse findMany's SQL builder but force LIMIT 1
     const findManyArgs = { ...args, limit: 1 } as FindManyArgs<T, R, W, S, O>;
     const deferred = this.buildFindMany<W, S, O>(findManyArgs);
@@ -3987,6 +4153,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O>> {
+    args = this.normalizeArgs(args, 'findFirstOrThrow');
     return this.executeWithMiddleware('findFirstOrThrow', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildFindFirstOrThrow(args);
       const result = await this.readWithTimeout(
@@ -4005,7 +4172,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O>> {
-    const inner = this.buildFindFirst(args);
+    args = this.normalizeArgs(args, 'findFirstOrThrow');
+    const inner = this.buildFindFirstAs<W, S, O>(args, 'findFirstOrThrow');
 
     return {
       sql: inner.sql,
@@ -4035,6 +4203,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args: FindUniqueArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O>> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('findUniqueOrThrow', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildFindUniqueOrThrow(args);
       const result = await this.readWithTimeout(
@@ -4053,6 +4222,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args: FindUniqueArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O>> {
+    args = this.normalizeArgs(args);
     const inner = this.buildFindUnique(args);
 
     return {
@@ -4081,6 +4251,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args: CreateArgs<T, R, S, O>): Promise<FieldResult<T, S, O>> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('create', args as unknown as Record<string, unknown>, async () => {
       if (hasRelationFields(args.data as Record<string, unknown>, this.tableMeta)) {
         return this.nestedCreate(args) as Promise<FieldResult<T, S, O>>;
@@ -4095,6 +4266,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // -------------------------------------------------------------------------
 
   async createMany(args: CreateManyArgs<T>): Promise<T[]> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('createMany', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildCreateMany(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
@@ -4110,6 +4282,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args: UpdateArgs<T, R, S, O>): Promise<FieldResult<T, S, O>> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('update', args as unknown as Record<string, unknown>, async () => {
       if (hasRelationFields(args.data as Record<string, unknown>, this.tableMeta)) {
         return this.nestedUpdate(args) as Promise<FieldResult<T, S, O>>;
@@ -4242,6 +4415,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args: DeleteArgs<T, R, S, O>): Promise<FieldResult<T, S, O>> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('delete', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildDelete(args);
       return this.executeMutation(deferred, args.timeout);
@@ -4256,6 +4430,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
   >(args: UpsertArgs<T, R, S, O>): Promise<FieldResult<T, S, O>> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('upsert', args as unknown as Record<string, unknown>, async () => {
       if (this.upsertNeedsLookup(args)) {
         return this.upsertLookupFirst(args) as Promise<FieldResult<T, S, O>>;
@@ -4274,6 +4449,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   upsertNeedsLookup(
     args: UpsertArgs<T, R, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
   ): boolean {
+    args = this.normalizeArgs(args);
     return (
       hasRelationFields((args.create ?? {}) as Record<string, unknown>, this.tableMeta) ||
       hasRelationFields((args.update ?? {}) as Record<string, unknown>, this.tableMeta) ||
@@ -4347,6 +4523,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // -------------------------------------------------------------------------
 
   async updateMany(args: UpdateManyArgs<T, R>): Promise<{ count: number }> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('updateMany', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildUpdateMany(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
@@ -4359,6 +4536,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // -------------------------------------------------------------------------
 
   async deleteMany(args: DeleteManyArgs<T, R>): Promise<{ count: number }> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('deleteMany', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildDeleteMany(args);
       const result = await this.queryWithTimeout(deferred.sql, deferred.params, args.timeout, deferred.preparedName);
@@ -4371,6 +4549,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // -------------------------------------------------------------------------
 
   async count(args?: CountArgs<T, R>): Promise<number> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('count', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildCount(args);
       const result = await this.readWithTimeout(
@@ -4384,6 +4563,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   }
 
   buildCount(args?: CountArgs<T>): DeferredQuery<number> {
+    args = this.normalizeArgs(args);
     this.currentSkip = resolveSkipGlobalFilters(args?.skipGlobalFilters);
     const effWhere = this.mergeGlobalFilter(args?.where as Record<string, unknown> | undefined);
     const hasWhere = effWhere !== undefined;
@@ -4427,6 +4607,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
    * that cannot be typed, so those columns are not projected onto the row type.
    */
   async groupBy<A extends GroupByArgs<T, R>>(args: A): Promise<GroupByResult<T, A>[]> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('groupBy', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildGroupBy(args);
       const result = await this.readWithTimeout(
@@ -4444,11 +4625,11 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // ---------------------------------------------------------------------------
 
   buildGroupBy(args: GroupByArgs<T>): DeferredQuery<Record<string, unknown>[]> {
-    return aggMod.buildGroupBy(this.ctx, args);
+    return aggMod.buildGroupBy(this.ctx, this.normalizeArgs(args));
   }
 
   buildAggregate(args: AggregateArgs<T>): DeferredQuery<AggregateResult<T>> {
-    return aggMod.buildAggregate(this.ctx, args);
+    return aggMod.buildAggregate(this.ctx, this.normalizeArgs(args));
   }
 
   // -------------------------------------------------------------------------
@@ -4456,6 +4637,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
   // -------------------------------------------------------------------------
 
   async aggregate(args: AggregateArgs<T, R>): Promise<AggregateResult<T>> {
+    args = this.normalizeArgs(args);
     return this.executeWithMiddleware('aggregate', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildAggregate(args);
       const result = await this.readWithTimeout(
@@ -4810,8 +4992,8 @@ export class QueryInterface<T extends object, R extends object = {}> {
       // To-many relation orderBy (`{ posts: { _count } }`) uses the same count
       // subquery as `_count`: mirror its global-filter params. Pick-row
       // ordering mirrors its full param chain (by-path / global filter /
-      // pick.where / pick.orderBy paths). To-one relation orderBy carries the
-      // target's global filter once per ordered column.
+      // pick.where / pick.orderBy paths). To-one relation orderBy is mirrored
+      // by running its build (see collectToOneRelationOrderParams).
       if (this.isRelationOrderByValue(dir)) {
         // Mirrors the build path's resolution, so a cache HIT binds params for
         // the same relation the cached SQL was built from.
@@ -4822,9 +5004,7 @@ export class QueryInterface<T extends object, R extends object = {}> {
         } else if (relDef && (relDef.type === 'hasMany' || relDef.type === 'manyToMany')) {
           this.collectRelationCountParams(relDef, params);
         } else if (relDef) {
-          for (const _col of Object.keys(dir as Record<string, unknown>)) {
-            this.collectTargetGlobalFilterAlias(relDef.to, params);
-          }
+          relationsMod.collectToOneRelationOrderParams(this.ctx, key, dir as Record<string, unknown>, params);
         }
       }
     }

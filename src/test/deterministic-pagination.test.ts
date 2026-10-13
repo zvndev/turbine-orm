@@ -100,22 +100,13 @@ describe('unordered-page warning', () => {
     assert.equal(warnings.length, 0);
   });
 
-  it('fires for a cursor seek with no orderBy, naming the cursor field', async () => {
+  it('does not fire for a cursor page with no orderBy: a cursor page is always ordered', async () => {
     const q = new QueryInterface(stubPool(), 'users', schema(), []);
-    const warnings = await captureWarnings(() => q.findMany({ limit: 5, cursor: { email: 'a@b.c' } as never }));
-    assert.equal(warnings.length, 1);
-    assert.match(warnings[0]!, /paginates \(cursor\+limit\)/);
-    assert.match(warnings[0]!, /`cursor` seek with no orderBy/);
-    // Recommends the CURSOR field, not the primary key, when the two differ.
-    assert.match(warnings[0]!, /orderBy: \{ email: 'asc' \}/);
-    assert.doesNotMatch(warnings[0]!, /\{ id: 'asc' \}/);
-  });
-
-  it('fires for a bare cursor with no limit (a seek is itself pagination)', async () => {
-    const q = new QueryInterface(stubPool(), 'users', schema(), []);
-    const warnings = await captureWarnings(() => q.findMany({ cursor: { id: 1 } as never }));
-    assert.equal(warnings.length, 1);
-    assert.match(warnings[0]!, /paginates \(cursor\)/);
+    const warnings = await captureWarnings(async () => {
+      await q.findMany({ limit: 5, cursor: { id: 1 } as never });
+      await q.findMany({ cursor: { id: 1 } as never });
+    });
+    assert.equal(warnings.length, 0);
   });
 
   it('does not fire for a cursor with an explicit orderBy', async () => {
@@ -177,14 +168,6 @@ describe('unordered-page warning', () => {
     // non-deterministic and the caller needs to hear about it.
     const noPk = new QueryInterface(stubPool(), 'logs', schema(), [], { implicitPkOrdering: true });
     assert.equal((await captureWarnings(() => noPk.findMany({ limit: 10 }))).length, 1);
-
-    resetWarnOnce(WARN_NS.unorderedPage);
-    // Multi-field cursor: `a > $1 AND b > $2` is not a composite keyset seek, so
-    // no ordering is injected (see cursorOrderBy) and the warning stands.
-    const events = new QueryInterface(stubPool(), 'events', schema(), [], { implicitPkOrdering: true });
-    const warnings = await captureWarnings(() => events.findMany({ limit: 10, cursor: { orgId: 1, seq: 2 } as never }));
-    assert.equal(warnings.length, 1);
-    assert.match(warnings[0]!, /paginates \(cursor\+limit\)/);
   });
 });
 
@@ -218,25 +201,26 @@ describe('implicitPkOrdering (opt-in)', () => {
     assert.doesNotMatch(q.buildFindMany({}).sql, /ORDER BY/);
   });
 
-  it('orders a cursor seek on the CURSOR field, not the primary key', () => {
-    const q = makeQuery('users', schema(), { implicitPkOrdering: true });
-    // A seek on `email` ordered by `id` would walk the table in an order the
-    // seek does not follow, so the injected order matches the cursor field.
-    const sql = q.buildFindMany({ limit: 10, cursor: { email: 'a@b.c' } as never }).sql;
-    assert.match(sql, /WHERE "users"\."email" > \$1 ORDER BY "email" ASC LIMIT \$2/);
-    assert.doesNotMatch(sql, /"id" ASC/);
-    // Cursor on the PK: same field either way.
-    assert.match(
-      q.buildFindMany({ limit: 10, cursor: { id: 1 } as never }).sql,
-      /WHERE "users"\."id" > \$1 ORDER BY "id" ASC LIMIT \$2/,
-    );
+  it('a cursor page is ordered by its own effective order, whatever the flag says', () => {
+    for (const implicitPkOrdering of [true, false]) {
+      const q = makeQuery('users', schema(), { implicitPkOrdering });
+      assert.match(
+        q.buildFindMany({ limit: 10, cursor: { id: 1 } as never }).sql,
+        /WHERE "users"\."id" > \$1 ORDER BY "id" ASC LIMIT \$2/,
+      );
+      // A cursor on a non-unique field with no orderBy places the page nowhere
+      // definite: refused rather than seeking in an order the page does not use.
+      assert.throws(() => q.buildFindMany({ limit: 10, cursor: { email: 'a@b.c' } as never }), /cursor/);
+    }
   });
 
-  it('injects nothing for an ambiguous multi-field cursor', () => {
+  it('a multi-field cursor over a composite PK seeks the keyset and orders by it', () => {
     const q = makeQuery('events', schema(), { implicitPkOrdering: true });
-    // `org_id > $1 AND seq > $2` is a conjunction, not `(org_id, seq) > (...)`:
-    // no ORDER BY makes that seek sound, so none is invented.
-    assert.doesNotMatch(q.buildFindMany({ limit: 10, cursor: { orgId: 1, seq: 2 } as never }).sql, /ORDER BY/);
+    const sql = q.buildFindMany({ limit: 10, cursor: { orgId: 1, seq: 2 } as never }).sql;
+    assert.match(
+      sql,
+      /WHERE \("events"\."org_id" > \$1 OR \("events"\."org_id" = \$1 AND "events"\."seq" > \$2\)\) ORDER BY "org_id" ASC, "seq" ASC/,
+    );
   });
 
   it('an explicit orderBy still wins over a cursor seek', () => {
@@ -273,14 +257,15 @@ describe('implicitPkOrdering (opt-in)', () => {
       }
     }
     // Cursor shapes too (users only: the other fixtures have no such columns).
+    // A cursor page is ordered either way, so the flag changes nothing there.
     const plainUsers = makeQuery('users', schema());
     const offUsers = makeQuery('users', schema(), { implicitPkOrdering: false });
-    for (const args of [{ limit: 5, cursor: { id: 1 } }, { cursor: { email: 'a@b.c' } }]) {
+    for (const args of [{ limit: 5, cursor: { id: 1 } }, { cursor: { id: 2 } }]) {
       const a = plainUsers.buildFindMany(args as never);
       const b = offUsers.buildFindMany(args as never);
       assert.equal(b.sql, a.sql, JSON.stringify(args));
       assert.deepEqual(b.params, a.params);
-      assert.doesNotMatch(a.sql, /ORDER BY/);
+      assert.match(a.sql, /ORDER BY "id" ASC/);
     }
   });
 });

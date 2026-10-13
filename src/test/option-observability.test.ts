@@ -226,7 +226,9 @@ const OBSERVATION: Record<string, Observation> = {
   offset: { how: 'compiled', value: 3 },
   take: { how: 'compiled', value: 7 },
   skip: { how: 'compiled', value: 3 },
-  cursor: { how: 'compiled', value: { id: 5 }, needs: { orderBy: { id: 'asc' } } },
+  // A cursor carries a value for every column of its page order, which on the
+  // composite-key table includes the `tenantId` tiebreaker.
+  cursor: { how: 'compiled', value: { id: 5, tenantId: 't1' }, needs: { orderBy: { id: 'asc' } } },
   distinct: { how: 'compiled', value: ['name'] },
   distinctOn: { how: 'compiled', value: { columns: ['name'], orderBy: { id: 'desc' } } },
 
