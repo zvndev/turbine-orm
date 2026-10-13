@@ -221,11 +221,20 @@ function lineAt(src: string, offset: number): number {
 // Attribute-argument tokenizer
 // ---------------------------------------------------------------------------
 
-/** Unquote a `"..."` literal, resolving the escapes Prisma supports. */
+const QUOTED_ESCAPES: Record<string, string> = { '"': '"', '\\': '\\', n: '\n', t: '\t' };
+
+/**
+ * Unquote a `"..."` literal, resolving the escapes Prisma supports.
+ *
+ * ONE left-to-right pass, because the escapes are not independent: after `\\`
+ * has become a backslash, that backslash must not be read again as the start of
+ * `\n` or `\t`. A chain of `.replace` calls does exactly that, so the literal
+ * `"C:\\new"` came out as `C:` + newline + `ew`.
+ */
 function unquote(raw: string): string {
   const s = raw.trim();
   if (s.length >= 2 && s[0] === '"' && s[s.length - 1] === '"') {
-    return s.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, '\\').replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+    return s.slice(1, -1).replace(/\\(["\\nt])/g, (_, escaped: string) => QUOTED_ESCAPES[escaped] as string);
   }
   return s;
 }
