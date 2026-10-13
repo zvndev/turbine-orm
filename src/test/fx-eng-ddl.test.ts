@@ -230,6 +230,9 @@ const mysql = skipGate(!MYSQL_URL, 'requires MYSQL_URL / MYSQL_TEST_URL pointing
 describe('enum columns and defaults on a MySQL server', () => {
   let pool: Any;
   let db: Any;
+  let admin: Any;
+  /** Dropped again in `after` only when this file created it. */
+  let createdDatabase = false;
   before(async () => {
     if (!MYSQL_URL) return;
     const { createPool } = await import('mysql2/promise');
@@ -240,9 +243,14 @@ describe('enum columns and defaults on a MySQL server', () => {
       user: decodeURIComponent(url.username),
       password: decodeURIComponent(url.password),
     };
-    const admin = createPool(base);
-    await admin.query(`CREATE DATABASE IF NOT EXISTS \`${MYSQL_DATABASE}\``);
-    await admin.end();
+    admin = createPool(base);
+    const [existing] = await admin.query('SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?', [
+      MYSQL_DATABASE,
+    ]);
+    if (existing.length === 0) {
+      await admin.query(`CREATE DATABASE \`${MYSQL_DATABASE}\``);
+      createdDatabase = true;
+    }
     pool = createPool({ ...base, database: MYSQL_DATABASE });
     await pool.query('DROP TABLE IF EXISTS `fxe_ddl_accounts`');
     for (const stmt of schemaToSQL(def, { dialect: mysqlDialect })) await pool.query(stmt);
@@ -254,6 +262,8 @@ describe('enum columns and defaults on a MySQL server', () => {
     await db?.disconnect();
     await pool?.query('DROP TABLE IF EXISTS `fxe_ddl_accounts`');
     await pool?.end();
+    if (createdDatabase) await admin.query(`DROP DATABASE \`${MYSQL_DATABASE}\``);
+    await admin?.end();
   });
 
   mysql.it('creates the table, stores the labels and defaults, and refuses another label', async () => {

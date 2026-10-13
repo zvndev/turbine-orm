@@ -29,7 +29,7 @@ type Any = any;
 
 const MYSQL_URL = process.env.MYSQL_URL ?? process.env.MYSQL_TEST_URL ?? '';
 /** Its own database: test files run in parallel. Only `fxe_` tables are created and dropped in it. */
-const DATABASE = process.env.TURBINE_IN_LIST_MYSQL_DB ?? 'turbine_in_list';
+const DATABASE = process.env.TURBINE_IN_LIST_MYSQL_DB ?? 'turbine_dev_fx_eng_in_list';
 
 type Case = readonly [label: string, field: string, value: unknown];
 
@@ -58,6 +58,9 @@ const MYSQL_TABLES = ['fxe_bin_kids', 'fxe_bin_parents', 'fxe_big_kids', 'fxe_bi
 
 describe('in / notIn match equality on every MySQL column type (live)', () => {
   let rawPool: Any;
+  let admin: Any;
+  /** Dropped again in `after` only when this file created it. */
+  let createdDatabase = false;
   let db: TurbineClient & Any;
   let schema: SchemaMetadata;
 
@@ -70,9 +73,12 @@ describe('in / notIn match equality on every MySQL column type (live)', () => {
       user: decodeURIComponent(url.username),
       password: decodeURIComponent(url.password),
     };
-    const admin = createPool(server);
-    await admin.query(`CREATE DATABASE IF NOT EXISTS \`${DATABASE}\``);
-    await admin.end();
+    admin = createPool(server);
+    const [existing] = await admin.query('SELECT 1 FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?', [DATABASE]);
+    if (existing.length === 0) {
+      await admin.query(`CREATE DATABASE \`${DATABASE}\``);
+      createdDatabase = true;
+    }
     rawPool = createPool({
       ...server,
       database: DATABASE,
@@ -127,9 +133,12 @@ describe('in / notIn match equality on every MySQL column type (live)', () => {
     db = (await turbineMysql(pool, schema, { warnOnUnlimited: false })) as Any;
   });
   mysql.after(async () => {
-    if (!rawPool) return;
-    for (const t of MYSQL_TABLES) await rawPool.query(`DROP TABLE IF EXISTS ${t}`);
-    await rawPool.end();
+    if (rawPool) {
+      for (const t of MYSQL_TABLES) await rawPool.query(`DROP TABLE IF EXISTS ${t}`);
+      await rawPool.end();
+    }
+    if (createdDatabase) await admin.query(`DROP DATABASE \`${DATABASE}\``);
+    await admin?.end();
   });
 
   const CASES: Case[] = [
