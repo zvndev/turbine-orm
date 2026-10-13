@@ -175,18 +175,19 @@ describe('generator emission keeps `where` key-checkable', () => {
     // Both directions plus the self-relation, each carrying the
     // RelationDescriptor brand that `WhereClause<T, R>` reads.
     assert.match(types, /export interface AuthorRelations \{/);
-    assert.match(types, /books: RelationDescriptor<Book, 'many', BookRelations>;/);
+    assert.match(types, /books: RelationDescriptor<Book, 'many', BookRelations, 'hasMany'>;/);
     assert.match(
       types,
-      /author: RelationDescriptor<Author, 'one', AuthorRelations>;\n {2}authors: RelationDescriptor<Author, 'many', AuthorRelations>;/,
+      /author: RelationDescriptor<Author, 'one', AuthorRelations, 'belongsTo'>;\n {2}authors: RelationDescriptor<Author, 'many', AuthorRelations, 'hasMany'>;/,
     );
     assert.match(types, /export interface BookRelations \{/);
-    assert.match(types, /author: RelationDescriptor<Author, 'one', AuthorRelations>;/);
+    // books.author_id is NOT NULL, so the loaded author is never null.
+    assert.match(types, /author: RelationDescriptor<Author, 'one', AuthorRelations, 'belongsTo', false>;/);
 
     // The relations map must reach the table accessor's second type argument -
     // that is the ONLY thing that makes `where` keys checkable.
-    assert.match(index, /readonly authors: QueryInterface<Author, AuthorRelations>/);
-    assert.match(index, /readonly books: QueryInterface<Book, BookRelations>/);
+    assert.match(index, /readonly authors: QueryInterface<Author, AuthorRelations, AuthorInputs>/);
+    assert.match(index, /readonly books: QueryInterface<Book, BookRelations, BookInputs>/);
   });
 
   it('tsc --noEmit rejects `where` typos in the generated client (and accepts every real shape)', () => {

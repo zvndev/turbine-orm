@@ -13,10 +13,12 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { ValidationError } from './errors.js';
 import { assertDistinctColumnFields, printableCatalogName } from './introspect.js';
+import { closestName } from './query/utils.js';
 import {
   type ColumnMetadata,
   type PrismaCompatMap,
   pgTypeToTs,
+  pgTypeToTsInput,
   type RelationDef,
   type SchemaMetadata,
   singularize,
@@ -32,12 +34,25 @@ function entityName(tableName: string): string {
 }
 
 /**
+ * Per-column TypeScript overrides from {@link GenerateOptions.columnTypes},
+ * keyed by database table name, then database column name.
+ */
+type ColumnTypeOverrides = ReadonlyMap<string, ReadonlyMap<string, string>>;
+
+/** The override for one column, or `undefined`. */
+function overrideFor(overrides: ColumnTypeOverrides | undefined, table: string, column: string): string | undefined {
+  return overrides?.get(table)?.get(column);
+}
+
+/**
  * Resolve the TypeScript type for a column, mapping enum-typed columns to their
  * generated string-literal union (PascalCase enum name) instead of the
- * `unknown` that {@link pgTypeToTs} yields for user-defined types. Falls back to
- * the introspected `col.tsType` for every non-enum column.
+ * `unknown` that {@link pgTypeToTs} yields for user-defined types. A
+ * `columnTypes` override replaces the type outright (nullability is still
+ * added). Falls back to the introspected `col.tsType` for everything else.
  */
-function columnTsType(col: ColumnMetadata, enums: Record<string, string[]>): string {
+export function columnTsType(col: ColumnMetadata, enums: Record<string, string[]>, override?: string): string {
+  if (override !== undefined) return col.nullable ? `${override} | null` : override;
   const dt = col.dialectType ?? col.pgType;
   const isArray = col.isArray || dt.startsWith('_');
   const base = isArray && dt.startsWith('_') ? dt.slice(1) : dt;
@@ -51,27 +66,98 @@ function columnTsType(col: ColumnMetadata, enums: Record<string, string[]>): str
 
 /**
  * Resolve the TypeScript type a column accepts on the WRITE path (the `*Create`
- * / `*Update` input types), which is wider than the row type for time-of-day
- * columns.
+ * / `*Update` input types). It differs from the row type where the runtime
+ * accepts more than one spelling or cannot take the parsed read value back
+ * ({@link pgTypeToTsInput}), and for time-of-day columns.
  *
  * A `time` / `timetz` column reads back as a `string` (`'09:00:00'`), so the
  * row type stays `string`. On write the runtime also accepts a JS `Date` and
  * narrows it to its UTC time of day (see `coerceWriteValue` in
  * query/writes.ts), matching Prisma, which types a `DateTime @db.Time(6)`
- * field as a `Date`. Consumers porting from Prisma pass Dates, so the input
- * type has to admit them. Every other column is unchanged.
+ * field as a `Date`.
  */
-function writeColumnTsType(col: ColumnMetadata, enums: Record<string, string[]>): string {
-  const tsType = columnTsType(col, enums);
+function writeColumnTsType(col: ColumnMetadata, enums: Record<string, string[]>, override?: string): string {
+  const tsType = columnTsType(col, enums, override);
+  if (override !== undefined) return tsType;
   const dt = col.dialectType ?? col.pgType;
   const isArray = col.isArray || dt.startsWith('_');
   const base = isArray && dt.startsWith('_') ? dt.slice(1) : dt;
-  if (!timeOfDayKind(base)) return tsType;
-  // A `time[]` column accepts a Date per element (the bind rewrite runs
-  // element-wise, see coerceTemporalValue in query/utils.ts).
-  const widened = isArray ? '(string | Date)[]' : 'string | Date';
-  return col.nullable ? `${widened} | null` : widened;
+  if (Object.hasOwn(enums, base)) return tsType;
+  if (timeOfDayKind(base)) {
+    // A `time[]` column accepts a Date per element (the bind rewrite runs
+    // element-wise, see coerceTemporalValue in query/utils.ts).
+    const widened = isArray ? '(string | Date)[]' : 'string | Date';
+    return col.nullable ? `${widened} | null` : widened;
+  }
+  // Only rewrite a type the read map produced: hand-built or engine metadata
+  // carrying its own tsType keeps it.
+  const pgType = isArray && !dt.startsWith('_') ? `_${dt}` : dt;
+  const read = pgTypeToTs(pgType, col.nullable);
+  const input = pgTypeToTsInput(pgType, col.nullable);
+  return input !== read && tsType === read ? input : tsType;
 }
+
+/**
+ * Validate {@link GenerateOptions.columnTypes} against the schema and index it.
+ * A key naming no table or column is a `ValidationError`, not a silent no-op,
+ * since an override that applies to nothing leaves the column typed `unknown`.
+ */
+export function resolveColumnTypeOverrides(
+  schema: SchemaMetadata,
+  columnTypes: Readonly<Record<string, string>> | undefined,
+): ColumnTypeOverrides | undefined {
+  if (columnTypes === undefined) return undefined;
+  const out = new Map<string, Map<string, string>>();
+  for (const [key, tsType] of Object.entries(columnTypes)) {
+    const dot = key.lastIndexOf('.');
+    const tableName = dot > 0 ? key.slice(0, dot) : '';
+    const columnName = dot > 0 ? key.slice(dot + 1) : '';
+    if (!tableName || !columnName) {
+      throw new ValidationError(
+        `columnTypes key ${printableCatalogName(JSON.stringify(key))} must be "<table>.<column>", using database names, ` +
+          'for example "users.settings".',
+      );
+    }
+    const table = Object.hasOwn(schema.tables, tableName) ? schema.tables[tableName] : undefined;
+    if (!table) {
+      const hint = closestName(tableName, Object.keys(schema.tables));
+      throw new ValidationError(
+        `columnTypes key ${printableCatalogName(JSON.stringify(key))} names no table${hint ? `. Did you mean "${printableCatalogName(hint)}"?` : '.'}`,
+      );
+    }
+    if (!table.columns.some((c) => c.name === columnName)) {
+      const hint = closestName(
+        columnName,
+        table.columns.map((c) => c.name),
+      );
+      throw new ValidationError(
+        `columnTypes key ${printableCatalogName(JSON.stringify(key))} names no column of "${printableCatalogName(tableName)}"` +
+          `${hint ? `. Did you mean "${printableCatalogName(`${tableName}.${hint}`)}"?` : '.'}`,
+      );
+    }
+    if (typeof tsType !== 'string' || tsType.trim() === '' || UNSAFE_TYPE_TEXT.test(tsType)) {
+      throw new ValidationError(
+        `columnTypes[${printableCatalogName(JSON.stringify(key))}] must be a one-line TypeScript type, for example ` +
+          `"import('../src/types.js').Settings".`,
+      );
+    }
+    let perTable = out.get(tableName);
+    if (!perTable) {
+      perTable = new Map();
+      out.set(tableName, perTable);
+    }
+    perTable.set(columnName, tsType.trim());
+  }
+  return out;
+}
+
+/**
+ * Characters a `columnTypes` value may not contain. The value is the user's own
+ * config and is emitted as written, but it must stay on one line: a line
+ * break would end the member it is emitted into.
+ */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is this pattern's purpose
+const UNSAFE_TYPE_TEXT = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
 /**
  * Characters that must never reach generated source verbatim: the two that end
@@ -184,6 +270,20 @@ export interface GenerateOptions {
    * names are unaffected.
    */
   keepColumnNames?: boolean;
+  /**
+   * TypeScript types for specific columns, keyed `"<table>.<column>"` with
+   * database names. The value is emitted as written into the row type and the
+   * `*Create` / `*Update` input types (`| null` is added for a nullable
+   * column), so a json/jsonb column can carry its real shape instead of
+   * `unknown`:
+   *
+   *   columnTypes: { 'users.settings': "import('../src/settings.js').Settings" }
+   *
+   * A relative `import()` resolves from the output directory. The type is a
+   * compile-time claim: nothing checks stored values against it. A key naming
+   * no table or column is an error.
+   */
+  columnTypes?: Readonly<Record<string, string>>;
 }
 
 /** Per-file generator options (subset of {@link GenerateOptions} the emitters need). */
@@ -197,6 +297,8 @@ export interface GenerateFileOptions {
   importExt?: string;
   /** Human-readable resolved import mode, recorded as a comment in `index.ts`. */
   importMode?: string;
+  /** {@link GenerateOptions.columnTypes}; validated against the schema by the emitter. */
+  columnTypes?: Readonly<Record<string, string>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -223,7 +325,12 @@ export function generate(options: GenerateOptions): { outDir: string; files: str
   const { ext: importExt, mode: importMode } = resolveImportExtension(outDir, options.importExtension ?? 'auto');
 
   const files: string[] = [];
-  const fileOptions: GenerateFileOptions = { noTimestamp: options.noTimestamp, importExt, importMode };
+  const fileOptions: GenerateFileOptions = {
+    noTimestamp: options.noTimestamp,
+    importExt,
+    importMode,
+    ...(options.columnTypes !== undefined ? { columnTypes: options.columnTypes } : {}),
+  };
 
   // Generate types.ts
   const typesContent = generateTypes(schema, fileOptions);
@@ -426,10 +533,10 @@ function typeSafeRelations(table: TableMetadata, warn = true): [string, Relation
     if (columnFields.has(relName)) {
       if (warn) {
         console.warn(
-          printableCatalogName(
-            `[turbine] Relation "${relName}" on table "${table.name}" shadows a column field of the same name, ` +
-              `omitting it from the generated types. Rename the relation (or the column) to expose it.`,
-          ),
+          `[turbine] ${printableCatalogName(
+            `Relation "${relName}" on table "${table.name}" shadows a column field of the same name, ` +
+              'omitting it from the generated types. Rename the relation (or the column) to expose it.',
+          )}`,
         );
       }
       continue;
@@ -512,6 +619,18 @@ export function assertEmittableSchema(schema: SchemaMetadata): void {
     // introspect.ts's; re-asserting it here covers a hand-built or
     // engine-introspected schema that never went through that path.
     assertDistinctColumnFields(table.name, table.columns);
+    // A column's tsType is emitted verbatim. Introspection only produces mapped
+    // types, but hand-built or code-first metadata (`tsType` on defineSchema)
+    // can carry anything, and a line break would end the type and start a
+    // statement in the generated file.
+    for (const col of table.columns) {
+      if (UNSAFE_TYPE_TEXT.test(col.tsType)) {
+        throw new ValidationError(
+          `Cannot generate code for column "${printableCatalogName(col.name)}" on table "${printableCatalogName(table.name)}": ` +
+            'its TypeScript type contains a control or line-separator character. Give the type on one line.',
+        );
+      }
+    }
     // Only the relations that reach the TYPE layer: a relation shadowing a
     // column field is already dropped from types.ts, so refusing on its name
     // would refuse a schema that generates fine.
@@ -532,29 +651,20 @@ export function assertEmittableSchema(schema: SchemaMetadata): void {
 
 /**
  * Generate the contents of `types.ts` (entity interfaces, *Create / *Update,
- * and *Relations brand-field interfaces). Exported so tests can pin the
- * generator output without writing files to disk.
+ * *Relations brand-field interfaces, and the write input types). Exported so
+ * tests can pin the generator output without writing files to disk.
  */
 export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOptions): string {
   assertEmittableSchema(schema);
+  const overrides = resolveColumnTypeOverrides(schema, options?.columnTypes);
   const lines: string[] = [...generatedFileHeader(options)];
 
-  // We import UpdateOperatorInput so generated *Update types can express
-  // atomic increment / decrement / multiply / divide / set operators on
-  // numeric columns (TASK-3.4).
-  //
-  // RelationDescriptor is the brand-field interface that lets `WithResult`
-  // recurse through nested `with` clauses at any depth. The generator emits
-  // each `*Relations` member as a `RelationDescriptor<Target, Cardinality,
-  // TargetRelations>` so users get full deep `with`-clause type inference
-  // out of the box (TASK-2.1).
+  // UpdateOperatorInput lets the generated *Update types express atomic
+  // operators. RelationDescriptor is the brand that lets `WithResult` recurse
+  // through nested `with` clauses at any depth.
   lines.push("import type { RelationDescriptor, UpdateOperatorInput } from 'turbine-orm';");
   lines.push('');
 
-  // Pre-compute which tables have relations so we know whether to thread
-  // `${TargetType}Relations` (for deep inference) or `{}` (the no-relations
-  // default) into each `RelationDescriptor`. Built once up-front because
-  // relations can point at tables we haven't iterated to yet.
   // Relations that can be surfaced in the type layer, computed once per table
   // (relations that would shadow a scalar column field are excluded + warned).
   const safeRelationsByTable = new Map<string, [string, RelationDef][]>();
@@ -565,6 +675,10 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
   for (const t of Object.values(schema.tables)) {
     if ((safeRelationsByTable.get(t.name) ?? []).length > 0) tablesWithRelations.add(t.name);
   }
+  const rowType = (table: TableMetadata, col: ColumnMetadata): string =>
+    columnTsType(col, schema.enums, overrideFor(overrides, table.name, col.name));
+  const writeType = (table: TableMetadata, col: ColumnMetadata): string =>
+    writeColumnTsType(col, schema.enums, overrideFor(overrides, table.name, col.name));
 
   // Generate enum types
   for (const [enumName, labels] of Object.entries(schema.enums)) {
@@ -585,12 +699,13 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
       const pkNote = table.primaryKey.includes(col.name) ? ' (primary key)' : '';
       const nullNote = col.nullable ? ' (nullable)' : '';
       // PII columns are excluded from default projections, so the field is
-      // absent unless the query names it in `select` or passes `includePii`.
-      // The emitted type marks it optional so it tells the truth about absence.
-      const piiNote = col.pii ? ' (PII: absent unless selected or includePii)' : '';
+      // absent unless the read passes `includePii: UNSAFE` (a `select` naming
+      // it without the flag throws, and a write never returns it). The emitted
+      // type marks it optional so it tells the truth about absence.
+      const piiNote = col.pii ? ' (PII: absent unless the read passes includePii: UNSAFE)' : '';
       const optional = col.pii ? '?' : '';
       lines.push(`  /** Column: ${docSafe(col.name)}, ${docSafe(col.pgType)}${pkNote}${nullNote}${piiNote} */`);
-      lines.push(`  ${quoteIfNeeded(col.field)}${optional}: ${columnTsType(col, schema.enums)};`);
+      lines.push(`  ${quoteIfNeeded(col.field)}${optional}: ${rowType(table, col)};`);
     }
     lines.push('}');
     lines.push('');
@@ -598,50 +713,44 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
     // --- Create input type ---
     // Optional: server-generated columns (serial / identity), columns with a
     // default, and nullable columns (default to NULL). Everything else is
-    // required, PRIMARY KEY MEMBERSHIP INCLUDED. A text natural key, a
+    // required, PRIMARY KEY MEMBERSHIP INCLUDED: a text natural key, a
     // client-supplied uuid with no default, or a composite key of plain
-    // integers must be supplied, and the database rejects the row otherwise
-    // (E010). Marking every PK column optional let `create({ data: {} })` on
-    // a junction table typecheck and fail at runtime, which is the opposite of
-    // what a generated type is for.
+    // integers must be supplied, or the database rejects the row (E010).
     lines.push(`/** Input type for creating a row in \`${docSafe(table.name)}\` */`);
     lines.push(`export type ${typeName}Create = {`);
     for (const col of table.columns) {
       // STORED generated columns are computed by the database, never writable.
       if (col.isGeneratedStored) continue;
-      const isGenerated = col.isGenerated === true;
-      const isOptional = isGenerated || col.hasDefault || col.nullable;
-      if (isOptional) {
-        const reason = isGenerated ? 'auto-generated' : col.hasDefault ? 'has default' : 'nullable';
+      if (isOptionalOnCreate(col)) {
+        const reason = col.isGenerated === true ? 'auto-generated' : col.hasDefault ? 'has default' : 'nullable';
         lines.push(`  /** Optional: ${reason} */`);
-        lines.push(`  ${quoteIfNeeded(col.field)}?: ${writeColumnTsType(col, schema.enums)};`);
+        lines.push(`  ${quoteIfNeeded(col.field)}?: ${writeType(table, col)} | undefined;`);
       } else {
-        lines.push(`  ${quoteIfNeeded(col.field)}: ${writeColumnTsType(col, schema.enums)};`);
+        lines.push(`  ${quoteIfNeeded(col.field)}: ${writeType(table, col)};`);
       }
     }
     lines.push('};');
     lines.push('');
 
     // --- Update input type (all fields optional except PK) ---
-    // Numeric columns additionally accept `UpdateOperatorInput<number>` so
-    // users can write `{ viewCount: { increment: 1 } }` without an `as any`.
+    // Every field also takes `{ set: value }`, and numeric fields the atomic
+    // operators (`{ viewCount: { increment: 1 } }`).
     const nonPkCols = table.columns.filter((c) => !table.primaryKey.includes(c.name) && !c.isGeneratedStored);
     lines.push(`/** Input type for updating a row in \`${docSafe(table.name)}\` */`);
     lines.push(`export type ${typeName}Update = {`);
     for (const col of nonPkCols) {
-      lines.push(`  ${quoteIfNeeded(col.field)}?: ${updateFieldType(writeColumnTsType(col, schema.enums))};`);
+      lines.push(`  ${quoteIfNeeded(col.field)}?: ${updateFieldType(writeType(table, col))} | undefined;`);
     }
     lines.push('};');
     lines.push('');
 
     // --- Relations map (for type-safe `with` clauses) ---
     //
-    // Each relation is emitted as a `RelationDescriptor<Target, Cardinality,
-    // TargetRelations>` brand-field interface. This is what enables the
-    // recursive `WithResult` type to walk through nested `with` clauses at
-    // any depth, `RelationRelations<R[K]>` reads the third type parameter
-    // and threads it into the next recursion step. If the target table has
-    // no relations of its own, the descriptor uses `{}` (the default).
+    // Each relation is a `RelationDescriptor<Target, Cardinality,
+    // TargetRelations, Kind, Nullable>`. `WithResult` reads the third
+    // parameter to recurse into nested `with` clauses and the fifth to type a
+    // to-one relation whose foreign key is NOT NULL as never null; the write
+    // input types read the kind.
     const safeRelations = safeRelationsByTable.get(table.name) ?? [];
     const hasRelations = safeRelations.length > 0;
     if (hasRelations) {
@@ -650,10 +759,11 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
       for (const [relName, rel] of safeRelations) {
         const targetType = entityName(rel.to);
         // manyToMany is a collection too → 'many' cardinality (same as hasMany).
-        const cardinality = rel.type === 'hasMany' || rel.type === 'manyToMany' ? "'many'" : "'one'";
+        const cardinality = isToMany(rel) ? "'many'" : "'one'";
         const targetRelations = tablesWithRelations.has(rel.to) ? `${targetType}Relations` : '{}';
+        const notNull = isRequiredBelongsTo(table, rel) ? ', false' : '';
         lines.push(
-          `  ${quoteIfNeeded(relName)}: RelationDescriptor<${targetType}, ${cardinality}, ${targetRelations}>;`,
+          `  ${quoteIfNeeded(relName)}: RelationDescriptor<${targetType}, ${cardinality}, ${targetRelations}, '${escSQ(rel.type)}'${notNull}>;`,
         );
       }
       lines.push('}');
@@ -662,175 +772,403 @@ export function generateTypes(schema: SchemaMetadata, options?: GenerateFileOpti
       // --- Legacy per-relation interfaces (kept for backward compatibility) ---
       for (const [relName, rel] of safeRelations) {
         const targetType = entityName(rel.to);
-        if (rel.type === 'hasMany' || rel.type === 'manyToMany') {
-          lines.push(
-            `/** ${typeName} with \`${docSafe(relName)}\` relation loaded (${rel.type}: ${docSafe(rel.to)}) */`,
-          );
-          lines.push(`export interface ${typeName}With${snakeToPascal(relName)} extends ${typeName} {`);
-          lines.push(`  ${quoteIfNeeded(relName)}: ${targetType}[];`);
-          lines.push('}');
-        } else {
-          lines.push(
-            `/** ${typeName} with \`${docSafe(relName)}\` relation loaded (${rel.type}: ${docSafe(rel.to)}) */`,
-          );
-          lines.push(`export interface ${typeName}With${snakeToPascal(relName)} extends ${typeName} {`);
-          lines.push(`  ${quoteIfNeeded(relName)}: ${targetType} | null;`);
-          lines.push('}');
-        }
+        const loaded = isToMany(rel)
+          ? `${targetType}[]`
+          : isRequiredBelongsTo(table, rel)
+            ? targetType
+            : `${targetType} | null`;
+        lines.push(`/** ${typeName} with \`${docSafe(relName)}\` relation loaded (${rel.type}: ${docSafe(rel.to)}) */`);
+        lines.push(`export interface ${typeName}With${snakeToPascal(relName)} extends ${typeName} {`);
+        lines.push(`  ${quoteIfNeeded(relName)}: ${loaded};`);
+        lines.push('}');
         lines.push('');
       }
     }
   }
 
   // ---------------------------------------------------------------------------
-  // Nested write types (WhereUnique, NestedCreateInput, NestedUpdateInput,
-  // ConnectOrCreate, CreateInput, UpdateInput)
+  // Write input types: WhereUnique, CreateInput, UpdateInput, the nested
+  // relation write inputs, and the per-table Inputs map the client accessor
+  // takes.
   // ---------------------------------------------------------------------------
 
   for (const table of Object.values(schema.tables)) {
-    const typeName = entityName(table.name);
-    const safeRelations = safeRelationsByTable.get(table.name) ?? [];
-    const hasRels = safeRelations.length > 0;
-
-    // WhereUnique, union of unique constraint shapes, deduplicating PK
-    const seen = new Set<string>();
-    const uniqueSets: string[][] = [];
-
-    // Always include the primary key first
-    const pkKey = table.primaryKey.join(',');
-    seen.add(pkKey);
-    uniqueSets.push(table.primaryKey);
-
-    // Add unique indexes that aren't duplicates of the PK
-    for (const uc of table.uniqueColumns) {
-      const ucKey = uc.join(',');
-      if (!seen.has(ucKey)) {
-        seen.add(ucKey);
-        uniqueSets.push(uc);
-      }
-    }
-
-    if (uniqueSets.length > 0) {
-      const memberType = (colName: string): { field: string; tsType: string } => {
-        const col = table.columns.find((c) => c.name === colName);
-        return { field: col?.field ?? colName, tsType: col?.tsType ?? 'unknown' };
-      };
-      // Flat branches: one object per unique constraint carrying its columns.
-      const flatBranches = uniqueSets.map((cols) => {
-        const fields = cols.map((colName) => {
-          const m = memberType(colName);
-          return `${quoteIfNeeded(m.field)}: ${m.tsType}`;
-        });
-        return `{ ${fields.join('; ')} }`;
-      });
-
-      // Prisma-style compound-unique SELECTOR branches: a synthetic key
-      // (`orgId_userId`) whose value holds the member columns, emitted for every
-      // COMPOSITE unique (PK, composite UNIQUE constraint, or composite UNIQUE
-      // index). Runtime expansion lives in query/compound-unique.ts.
-      const compoundSeen = new Set<string>();
-      const compoundSets: string[][] = [];
-      const addCompound = (cols: string[]): void => {
-        if (cols.length < 2) return;
-        const key = cols.join(',');
-        if (compoundSeen.has(key)) return;
-        compoundSeen.add(key);
-        compoundSets.push(cols);
-      };
-      addCompound(table.primaryKey);
-      for (const uc of table.uniqueColumns) addCompound(uc);
-      for (const idx of table.indexes) {
-        // A partial unique index does not guarantee table-wide row uniqueness,
-        // so it must not become a compound-unique selector (matches the runtime
-        // exclusion in query/compound-unique.ts).
-        if (idx.unique && !idx.docPath && !idx.partial) addCompound(idx.columns);
-      }
-
-      const selectorEntries = compoundSets.map((cols) => {
-        const members = cols.map(memberType);
-        return {
-          // The selector NAME is the underscore-join of the member FIELD names.
-          // It is normally a valid identifier (`orgId_userId`), but a
-          // junction-style column that is not a valid identifier (e.g. a quoted
-          // uppercase `"A"` / `"B"`) would join into a broken object key. Emit
-          // any non-identifier name as ONE quoted string-literal key so the
-          // generated types.ts always parses; the runtime selector map in
-          // query/compound-unique.ts registers the same name spelling.
-          selectorName: quoteIfNeeded(members.map((m) => m.field).join('_')),
-          memberType: `{ ${members.map((m) => `${quoteIfNeeded(m.field)}: ${m.tsType}`).join('; ')} }`,
-        };
-      });
-
-      // Named helper type for annotating a compound selector by hand (Prisma parity).
-      if (selectorEntries.length > 0) {
-        const cuFields = selectorEntries.map((e) => `${e.selectorName}: ${e.memberType}`);
-        lines.push(`export type ${typeName}CompoundUniques = { ${cuFields.join('; ')} };`);
-      }
-
-      const selectorBranches = selectorEntries.map((e) => `{ ${e.selectorName}: ${e.memberType} }`);
-      const branches = [...flatBranches, ...selectorBranches];
-      lines.push(`export type ${typeName}WhereUnique = ${branches.join(' | ')};`);
-      lines.push('');
-    }
-
-    // CreateInput / UpdateInput, extends base type with optional relation fields
-    if (hasRels) {
-      lines.push(`export type ${typeName}CreateInput = ${typeName}Create & {`);
-      for (const [relName, rel] of safeRelations) {
-        const targetType = entityName(rel.to);
-        lines.push(`  ${quoteIfNeeded(relName)}?: ${targetType}NestedCreateInput;`);
-      }
-      lines.push('};');
-      lines.push('');
-
-      lines.push(`export type ${typeName}UpdateInput = ${typeName}Update & {`);
-      for (const [relName, rel] of safeRelations) {
-        const targetType = entityName(rel.to);
-        if (rel.type === 'hasMany') {
-          lines.push(`  ${quoteIfNeeded(relName)}?: ${targetType}NestedUpdateInput;`);
-        } else {
-          lines.push(`  ${quoteIfNeeded(relName)}?: ${targetType}NestedCreateInput;`);
-        }
-      }
-      lines.push('};');
-      lines.push('');
-    }
+    emitWhereUnique(lines, table, (col) => rowType(table, { ...col, nullable: false, tsType: stripNull(col.tsType) }));
   }
 
-  // Emit NestedCreateInput, NestedUpdateInput, ConnectOrCreate for every table
+  const variantsByTable = createVariantsByTable(schema, safeRelationsByTable);
   for (const table of Object.values(schema.tables)) {
-    const typeName = entityName(table.name);
-    const hasRels = (safeRelationsByTable.get(table.name) ?? []).length > 0;
-
-    // NestedCreateInput uses *CreateInput (which includes relation fields) when
-    // the table has relations, otherwise falls back to the plain *Create type.
-    const createRefType = hasRels ? `${typeName}CreateInput` : `${typeName}Create`;
-
-    lines.push(`export interface ${typeName}NestedCreateInput {`);
-    lines.push(`  create?: ${createRefType} | ${createRefType}[];`);
-    lines.push(`  connect?: ${typeName}WhereUnique | ${typeName}WhereUnique[];`);
-    lines.push(`  connectOrCreate?: ${typeName}ConnectOrCreate | ${typeName}ConnectOrCreate[];`);
-    lines.push('}');
-    lines.push('');
-
-    lines.push(`export interface ${typeName}NestedUpdateInput {`);
-    lines.push(`  create?: ${createRefType} | ${createRefType}[];`);
-    lines.push(`  connect?: ${typeName}WhereUnique | ${typeName}WhereUnique[];`);
-    lines.push(`  connectOrCreate?: ${typeName}ConnectOrCreate | ${typeName}ConnectOrCreate[];`);
-    lines.push(`  disconnect?: ${typeName}WhereUnique | ${typeName}WhereUnique[];`);
-    lines.push(`  set?: ${typeName}WhereUnique[];`);
-    lines.push(`  delete?: ${typeName}WhereUnique | ${typeName}WhereUnique[];`);
-    lines.push('}');
-    lines.push('');
-
-    lines.push(`export interface ${typeName}ConnectOrCreate {`);
-    lines.push(`  where: ${typeName}WhereUnique;`);
-    lines.push(`  create: ${createRefType};`);
-    lines.push('}');
-    lines.push('');
+    emitWriteInputs(lines, schema, table, safeRelationsByTable.get(table.name) ?? [], variantsByTable, (col) =>
+      writeType(table, col),
+    );
   }
 
   return lines.join('\n');
+}
+
+/** A to-many relation (an array on the row). */
+function isToMany(rel: RelationDef): boolean {
+  return rel.type === 'hasMany' || rel.type === 'manyToMany';
+}
+
+/** Whether a column may be omitted on create. */
+function isOptionalOnCreate(col: ColumnMetadata): boolean {
+  return col.isGenerated === true || col.hasDefault || col.nullable;
+}
+
+/** `T | null` -> `T`. */
+function stripNull(tsType: string): string {
+  return tsType.replace(/\s*\|\s*null$/, '');
+}
+
+/** The foreign-key columns of a relation, as columns of `table` (the side that holds them). */
+function fkColumns(table: TableMetadata, rel: RelationDef): ColumnMetadata[] {
+  const out: ColumnMetadata[] = [];
+  for (const name of Array.isArray(rel.foreignKey) ? rel.foreignKey : [rel.foreignKey]) {
+    const col = table.columns.find((c) => c.name === name);
+    if (col) out.push(col);
+  }
+  return out;
+}
+
+/**
+ * A belongsTo relation whose foreign key is NOT NULL, so a row always points
+ * at a target row and reading the relation never yields null (absent a
+ * per-relation `where` or a global filter on the target, see
+ * `RelationDescriptor`).
+ */
+function isRequiredBelongsTo(table: TableMetadata, rel: RelationDef): boolean {
+  if (rel.type !== 'belongsTo') return false;
+  const fks = fkColumns(table, rel);
+  return fks.length > 0 && fks.length === normalizeFk(rel).length && fks.every((c) => !c.nullable);
+}
+
+function normalizeFk(rel: RelationDef): string[] {
+  return Array.isArray(rel.foreignKey) ? rel.foreignKey : [rel.foreignKey];
+}
+
+/**
+ * The keys a nested create through `rel` (a hasMany / hasOne on `parent`) must
+ * NOT require from the child: the child's foreign-key fields, which the
+ * runtime fills from the parent row, and the child's matching belongsTo
+ * relation, which would point the row at a second parent.
+ */
+function suppliedByParent(schema: SchemaMetadata, rel: RelationDef): string[] {
+  if (rel.type !== 'hasMany' && rel.type !== 'hasOne') return [];
+  const child = Object.hasOwn(schema.tables, rel.to) ? schema.tables[rel.to]! : undefined;
+  if (!child) return [];
+  const fks = normalizeFk(rel);
+  const keys = fkColumns(child, rel).map((c) => c.field);
+  const fkKey = [...fks].sort().join(',');
+  for (const [name, back] of Object.entries(child.relations)) {
+    if (back.type === 'belongsTo' && back.to === rel.from && [...normalizeFk(back)].sort().join(',') === fkKey) {
+      keys.push(name);
+    }
+  }
+  return keys;
+}
+
+/**
+ * One shape of a table's create data. The full shape (`suffix` `''`) is
+ * `XCreateInput`; a nested create through a parent's hasMany / hasOne leaves
+ * out the keys that parent supplies ({@link suppliedByParent}) and is emitted
+ * as its own concrete type, `XCreateWithout<Relation>Input` (Prisma's naming).
+ * Concrete types rather than one generic `Omit<..., Omitted>` alias: the
+ * generic form cost about 760 type instantiations per table just to compile
+ * the generated file.
+ */
+interface CreateVariant {
+  readonly omitted: ReadonlySet<string>;
+  readonly suffix: string;
+}
+
+const FULL_CREATE_VARIANT: CreateVariant = { omitted: new Set(), suffix: '' };
+
+function variantKey(omitted: readonly string[]): string {
+  return JSON.stringify([...omitted].sort());
+}
+
+/** A PascalCase identifier fragment for a type name, or `''`. */
+function identifierPart(name: string): string {
+  return snakeToPascal(name).replace(/[^A-Za-z0-9_$]/g, '');
+}
+
+/**
+ * Every create shape each table needs: the full one, plus one per distinct
+ * set of parent-supplied keys among the hasMany / hasOne relations pointing at
+ * it. Keyed by table name, then by {@link variantKey}.
+ */
+function createVariantsByTable(
+  schema: SchemaMetadata,
+  relationsByTable: ReadonlyMap<string, readonly [string, RelationDef][]>,
+): Map<string, Map<string, CreateVariant>> {
+  const out = new Map<string, Map<string, CreateVariant>>();
+  for (const table of Object.values(schema.tables)) {
+    out.set(table.name, new Map([[variantKey([]), FULL_CREATE_VARIANT]]));
+  }
+  for (const table of Object.values(schema.tables)) {
+    for (const [, rel] of relationsByTable.get(table.name) ?? []) {
+      const omitted = suppliedByParent(schema, rel);
+      const variants = out.get(rel.to);
+      if (omitted.length === 0 || !variants) continue;
+      const key = variantKey(omitted);
+      if (variants.has(key)) continue;
+      const child = schema.tables[rel.to];
+      // Name the variant after the child's relation back to the parent when
+      // there is one (`PostCreateWithoutAuthorInput`), else after the keys.
+      const back = omitted.find((k) => child !== undefined && Object.hasOwn(child.relations, k));
+      const base = `Without${identifierPart(back ?? omitted.join('_')) || 'Parent'}`;
+      const taken = new Set([...variants.values()].map((v) => v.suffix));
+      let suffix = base;
+      for (let n = 2; taken.has(suffix); n++) suffix = `${base}${n}`;
+      variants.set(key, { omitted: new Set(omitted), suffix });
+    }
+  }
+  return out;
+}
+
+/**
+ * Required belongsTo relations beyond this many keep their foreign keys
+ * optional on create instead of becoming an either-or union: TypeScript
+ * multiplies an intersection of unions out, so N either-or pairs are 2^N
+ * object types for every create on the table.
+ */
+const MAX_FK_CHOICES = 4;
+
+/** `XWhereUnique`: one object per unique key, plus compound selector branches. */
+function emitWhereUnique(lines: string[], table: TableMetadata, memberTs: (col: ColumnMetadata) => string): void {
+  const typeName = entityName(table.name);
+  // Union of unique constraint shapes, deduplicating PK
+  const seen = new Set<string>();
+  const uniqueSets: string[][] = [];
+  const pkKey = table.primaryKey.join(',');
+  seen.add(pkKey);
+  uniqueSets.push(table.primaryKey);
+  for (const uc of table.uniqueColumns) {
+    const ucKey = uc.join(',');
+    if (!seen.has(ucKey)) {
+      seen.add(ucKey);
+      uniqueSets.push(uc);
+    }
+  }
+
+  const memberType = (colName: string): { field: string; tsType: string } => {
+    const col = table.columns.find((c) => c.name === colName);
+    return { field: col?.field ?? colName, tsType: col ? memberTs(col) : 'unknown' };
+  };
+  // Flat branches: one object per unique constraint carrying its columns.
+  const flatBranches = uniqueSets.map((cols) => {
+    const fields = cols.map((colName) => {
+      const m = memberType(colName);
+      return `${quoteIfNeeded(m.field)}: ${m.tsType}`;
+    });
+    return `{ ${fields.join('; ')} }`;
+  });
+
+  // Prisma-style compound-unique SELECTOR branches: a synthetic key
+  // (`orgId_userId`) whose value holds the member columns, emitted for every
+  // COMPOSITE unique (PK, composite UNIQUE constraint, or composite UNIQUE
+  // index). Runtime expansion lives in query/compound-unique.ts.
+  const compoundSeen = new Set<string>();
+  const compoundSets: string[][] = [];
+  const addCompound = (cols: string[]): void => {
+    if (cols.length < 2) return;
+    const key = cols.join(',');
+    if (compoundSeen.has(key)) return;
+    compoundSeen.add(key);
+    compoundSets.push(cols);
+  };
+  addCompound(table.primaryKey);
+  for (const uc of table.uniqueColumns) addCompound(uc);
+  for (const idx of table.indexes) {
+    // A partial unique index does not guarantee table-wide row uniqueness,
+    // so it must not become a compound-unique selector (matches the runtime
+    // exclusion in query/compound-unique.ts).
+    if (idx.unique && !idx.docPath && !idx.partial) addCompound(idx.columns);
+  }
+
+  const selectorEntries = compoundSets.map((cols) => {
+    const members = cols.map(memberType);
+    return {
+      // The selector NAME is the underscore-join of the member FIELD names.
+      // A junction-style column that is not a valid identifier would join
+      // into a broken object key, so a non-identifier name is emitted as ONE
+      // quoted key; query/compound-unique.ts registers the same spelling.
+      selectorName: quoteIfNeeded(members.map((m) => m.field).join('_')),
+      memberType: `{ ${members.map((m) => `${quoteIfNeeded(m.field)}: ${m.tsType}`).join('; ')} }`,
+    };
+  });
+
+  // Named helper type for annotating a compound selector by hand (Prisma parity).
+  if (selectorEntries.length > 0) {
+    const cuFields = selectorEntries.map((e) => `${e.selectorName}: ${e.memberType}`);
+    lines.push(`export type ${typeName}CompoundUniques = { ${cuFields.join('; ')} };`);
+  }
+
+  const selectorBranches = selectorEntries.map((e) => `{ ${e.selectorName}: ${e.memberType} }`);
+  const branches = [...flatBranches, ...selectorBranches];
+  lines.push(`export type ${typeName}WhereUnique = ${branches.join(' | ')};`);
+  lines.push('');
+}
+
+/**
+ * The write inputs for one table:
+ *
+ *   - `XCreateInput`: the create data. A required belongsTo is an either-or:
+ *     give the foreign key, or the relation (`connect` / `create` /
+ *     `connectOrCreate`).
+ *   - `XCreateWithout<Relation>Input`: the same data for a row created through
+ *     a parent's hasMany / hasOne, without the keys that parent supplies (see
+ *     {@link CreateVariant}).
+ *   - `XUpdateInput`: update data, scalars plus nested relation writes.
+ *   - `XNestedCreateInput` / `XNestedUpdateInput` / `XConnectOrCreate` (and
+ *     their `Without<Relation>` forms): the ops a to-many (or hasOne) relation
+ *     pointing at X takes.
+ *   - `XNestedToOneCreateInput` / `XNestedToOneUpdateInput`: the ops a
+ *     belongsTo relation pointing at X takes. Single objects; `disconnect` and
+ *     `delete` take `true` for the connected row.
+ *   - `XInputs`: the map the generated client hands to `QueryInterface`.
+ */
+function emitWriteInputs(
+  lines: string[],
+  schema: SchemaMetadata,
+  table: TableMetadata,
+  relations: readonly [string, RelationDef][],
+  variantsByTable: ReadonlyMap<string, ReadonlyMap<string, CreateVariant>>,
+  writeTs: (col: ColumnMetadata) => string,
+): void {
+  const typeName = entityName(table.name);
+  const relationField = (rel: RelationDef, update: boolean): string => {
+    const target = entityName(rel.to);
+    if (rel.type === 'belongsTo') return `${target}NestedToOne${update ? 'Update' : 'Create'}Input`;
+    const variant = variantsByTable.get(rel.to)?.get(variantKey(suppliedByParent(schema, rel))) ?? FULL_CREATE_VARIANT;
+    return `${target}Nested${update ? 'Update' : 'Create'}${variant.suffix}Input`;
+  };
+
+  // Required belongsTo relations whose foreign keys are themselves required on
+  // create become either-or choices.
+  const choices: { relName: string; rel: RelationDef; fks: ColumnMetadata[] }[] = [];
+  const relaxed: ColumnMetadata[] = [];
+  for (const [relName, rel] of relations) {
+    if (!isRequiredBelongsTo(table, rel)) continue;
+    const fks = fkColumns(table, rel).filter((c) => !c.isGeneratedStored && !isOptionalOnCreate(c));
+    if (fks.length === 0) continue;
+    if (choices.length < MAX_FK_CHOICES) choices.push({ relName, rel, fks });
+    else relaxed.push(...fks);
+  }
+  const choiceFields = new Set(choices.flatMap((c) => c.fks).map((c) => c.field));
+  const relaxedFields = new Set(relaxed.map((c) => c.field));
+
+  const where = `${typeName}WhereUnique`;
+  const filter = `${typeName}WhereUnique | Partial<${typeName}>`;
+  const variants = [...(variantsByTable.get(table.name)?.values() ?? [FULL_CREATE_VARIANT])];
+
+  for (const { omitted, suffix } of variants) {
+    // --- CreateInput (one concrete type per variant) ---
+    const members: string[] = [];
+    for (const col of table.columns) {
+      if (col.isGeneratedStored || choiceFields.has(col.field) || omitted.has(col.field)) continue;
+      const optional = isOptionalOnCreate(col) || relaxedFields.has(col.field);
+      members.push(
+        optional
+          ? `${quoteIfNeeded(col.field)}?: ${writeTs(col)} | undefined`
+          : `${quoteIfNeeded(col.field)}: ${writeTs(col)}`,
+      );
+    }
+    for (const [relName, rel] of relations) {
+      if (omitted.has(relName)) continue;
+      members.push(`${quoteIfNeeded(relName)}?: ${relationField(rel, false)} | undefined`);
+    }
+    const parts = [members.length > 0 ? `{ ${members.join('; ')} }` : 'Record<string, never>'];
+    for (const { relName, rel, fks } of choices) {
+      if (omitted.has(relName) || fks.every((c) => omitted.has(c.field))) continue;
+      const viaKey = fks.map((c) => `${quoteIfNeeded(c.field)}: ${writeTs(c)}`).join('; ');
+      const viaRelation = [
+        ...fks.map((c) => `${quoteIfNeeded(c.field)}?: ${writeTs(c)} | undefined`),
+        `${quoteIfNeeded(relName)}: ${relationField(rel, false)}`,
+      ].join('; ');
+      parts.push(`({ ${viaKey} } | { ${viaRelation} })`);
+    }
+    const supplied = [...omitted].map((k) => `\`${docSafe(k)}\``).join(', ');
+    lines.push(
+      suffix === ''
+        ? `/** Data for creating a \`${docSafe(table.name)}\` row */`
+        : `/** Data for creating a \`${docSafe(table.name)}\` row through a parent relation, which supplies ${supplied} */`,
+    );
+    lines.push(`export type ${typeName}Create${suffix}Input = ${parts.join(' & ')};`);
+    lines.push('');
+
+    // --- Ops a to-many (or hasOne) relation pointing AT this table takes ---
+    const create = `${typeName}Create${suffix}Input`;
+    const connectOrCreate = `${typeName}ConnectOrCreate${suffix}`;
+    lines.push(`export interface ${typeName}NestedCreate${suffix}Input {`);
+    lines.push(`  create?: ${create} | ${create}[] | undefined;`);
+    lines.push(`  connect?: ${where} | ${where}[] | undefined;`);
+    lines.push(`  connectOrCreate?: ${connectOrCreate} | ${connectOrCreate}[] | undefined;`);
+    lines.push('}');
+    lines.push('');
+
+    lines.push(
+      `export interface ${typeName}NestedUpdate${suffix}Input extends ${typeName}NestedCreate${suffix}Input {`,
+    );
+    lines.push(`  disconnect?: ${filter} | (${filter})[] | undefined;`);
+    lines.push(`  set?: ${where}[] | undefined;`);
+    lines.push(`  delete?: ${filter} | (${filter})[] | undefined;`);
+    const updateItem = `{ where: ${filter}; data: ${typeName}UpdateInput }`;
+    lines.push(`  update?: ${updateItem} | ${updateItem}[] | undefined;`);
+    const upsertItem = `{ where: ${filter}; create: ${create}; update: ${typeName}UpdateInput }`;
+    lines.push(`  upsert?: ${upsertItem} | ${upsertItem}[] | undefined;`);
+    lines.push('}');
+    lines.push('');
+
+    lines.push(`export interface ${connectOrCreate} {`);
+    lines.push(`  where: ${where};`);
+    lines.push(`  create: ${create};`);
+    lines.push('}');
+    lines.push('');
+  }
+
+  // --- UpdateInput ---
+  if (relations.length > 0) {
+    lines.push(`export type ${typeName}UpdateInput = ${typeName}Update & {`);
+    for (const [relName, rel] of relations) {
+      lines.push(`  ${quoteIfNeeded(relName)}?: ${relationField(rel, true)} | undefined;`);
+    }
+    lines.push('};');
+  } else {
+    lines.push(`export type ${typeName}UpdateInput = ${typeName}Update;`);
+  }
+  lines.push('');
+
+  // A belongsTo points at ONE row: single objects, no `set`, and `true` (or
+  // `{}`) for "the connected row" on disconnect / delete.
+  const connected = `boolean | Record<string, never> | ${where}`;
+  lines.push(`export interface ${typeName}NestedToOneCreateInput {`);
+  lines.push(`  create?: ${typeName}CreateInput | undefined;`);
+  lines.push(`  connect?: ${where} | undefined;`);
+  lines.push(`  connectOrCreate?: ${typeName}ConnectOrCreate | undefined;`);
+  lines.push('}');
+  lines.push('');
+  lines.push(`export interface ${typeName}NestedToOneUpdateInput extends ${typeName}NestedToOneCreateInput {`);
+  lines.push(`  disconnect?: ${connected} | undefined;`);
+  lines.push(`  delete?: ${connected} | undefined;`);
+  lines.push(`  update?: { data: ${typeName}UpdateInput } | undefined;`);
+  lines.push(
+    `  upsert?: { where: ${filter}; create: ${typeName}CreateInput; update: ${typeName}UpdateInput } | undefined;`,
+  );
+  lines.push('}');
+  lines.push('');
+
+  // --- The accessor's input map ---
+  lines.push(`/** Write and lookup input types for the \`${docSafe(table.name)}\` client accessor */`);
+  lines.push(`export interface ${typeName}Inputs {`);
+  lines.push(`  create: ${typeName}CreateInput;`);
+  lines.push(`  createMany: ${typeName}Create;`);
+  lines.push(`  update: ${typeName}UpdateInput;`);
+  lines.push(`  updateMany: ${typeName}Update;`);
+  lines.push(`  whereUnique: ${where};`);
+  lines.push('}');
+  lines.push('');
 }
 
 // ---------------------------------------------------------------------------
@@ -860,6 +1198,19 @@ function zodScalar(ts: string): string {
     case 'number[]':
       // pgvector, `pgTypeToTs('vector')` yields `number[]`.
       return 'z.array(z.number())';
+    case 'number | string | bigint':
+      // int8 write input.
+      return 'z.union([z.number(), z.string(), z.bigint()])';
+    case 'string | number':
+      // numeric write input.
+      return 'z.union([z.string(), z.number()])';
+    case '{ x: number; y: number }':
+      return 'z.object({ x: z.number(), y: z.number() })';
+    case '{ x: number; y: number; radius: number }':
+      return 'z.object({ x: z.number(), y: z.number(), radius: z.number() })';
+    case '{ years?: number; months?: number; days?: number; hours?: number; minutes?: number; seconds?: number; milliseconds?: number }':
+      // interval: the driver's parsed object, zero fields absent.
+      return `z.object({ ${['years', 'months', 'days', 'hours', 'minutes', 'seconds', 'milliseconds'].map((f) => `${f}: z.number().optional()`).join(', ')} })`;
     default:
       // json/jsonb and any unmapped user-defined type.
       return 'z.unknown()';
@@ -888,7 +1239,13 @@ function zodBaseType(col: ColumnMetadata, enums: Record<string, string[]>, forWr
   } else if (forWrite && timeOfDayKind(base)) {
     expr = 'z.union([z.string(), z.date()])';
   } else {
-    expr = zodScalar(pgTypeToTs(base, false));
+    // The read (or write) map decides the element type, which for an array
+    // is not always the scalar's (`bigint[]` reads as strings).
+    const full = (forWrite ? pgTypeToTsInput : pgTypeToTs)(isArray ? `_${base}` : base, false);
+    const element = isArray && full.endsWith('[]') ? full.slice(0, -2).replace(/^\((.*)\)$/, '$1') : full;
+    expr = zodScalar(element);
+    if (isArray) expr += '.array()';
+    return expr;
   }
   if (isArray) expr += '.array()';
   return expr;
@@ -1124,7 +1481,7 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
     // drove it, so direct generateIndex() callers stay byte-identical).
     ...(options?.importMode ? [`// Sibling imports resolved with importExtension: ${options.importMode}.`, ''] : []),
     "import { TurbineClient as BaseTurbineClient, TransactionClient as BaseTransactionClient, QueryInterface } from 'turbine-orm';",
-    "import type { TurbineConfig, TransactionOptions, DeferredQuery, PipelineResults } from 'turbine-orm';",
+    "import type { TurbineConfig, TransactionOptions, DeferredQuery, PipelineResults, WhereClause } from 'turbine-orm';",
     `import { SCHEMA } from './metadata${ext}';`,
   ];
 
@@ -1135,8 +1492,35 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
     if (hasSafeRelations.get(t.name)) {
       typeImports.push(`${entityName(t.name)}Relations`);
     }
+    typeImports.push(`${entityName(t.name)}Inputs`);
   }
   lines.push(`import type { ${typeImports.join(', ')} } from './types${ext}';`);
+  lines.push('');
+
+  // Global filters keyed by table, each checked against its own row type, so a
+  // misspelled table or column is a compile error. A table is keyed by its
+  // client accessor, and also by its database name when the two differ, the
+  // two spellings the runtime accepts.
+  lines.push('/** `globalFilters` for this schema: a where clause (or a function returning one) per table. */');
+  lines.push('export interface TurbineGlobalFilters {');
+  for (const table of tableEntries) {
+    const typeName = entityName(table.name);
+    const where = `WhereClause<${typeName}${hasSafeRelations.get(table.name) ? `, ${typeName}Relations` : ''}>`;
+    // `null` (or a function returning it) applies no filter on purpose.
+    const filter = `${where} | null | (() => ${where} | null)`;
+    const accessor = snakeToCamelStr(table.name);
+    lines.push(`  ${quoteIfNeeded(accessor)}?: ${filter} | undefined;`);
+    if (accessor !== table.name) lines.push(`  ${quoteIfNeeded(table.name)}?: ${filter} | undefined;`);
+  }
+  lines.push('}');
+  lines.push('');
+  // Each field also admits an explicit `undefined` (read as unset), so
+  // `turbine({ connectionString: process.env.DATABASE_URL })` compiles under
+  // exactOptionalPropertyTypes.
+  lines.push('/** Client configuration with `globalFilters` typed against this schema. */');
+  lines.push('export type TypedTurbineConfig = {');
+  lines.push("  [K in Exclude<keyof TurbineConfig, 'globalFilters'>]?: TurbineConfig[K] | undefined;");
+  lines.push('} & { globalFilters?: TurbineGlobalFilters | undefined };');
   lines.push('');
 
   // -------------------------------------------------------------------------
@@ -1156,22 +1540,23 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
     const typeName = entityName(table.name);
     const accessor = snakeToCamelStr(table.name);
     const hasRelations = hasSafeRelations.get(table.name) === true;
-    const genericArgs = hasRelations ? `${typeName}, ${typeName}Relations` : typeName;
+    const genericArgs = `${typeName}, ${hasRelations ? `${typeName}Relations` : '{}'}, ${typeName}Inputs`;
     lines.push(`  /** Query interface for the \`${docSafe(table.name)}\` table (transaction-scoped) */`);
     lines.push(`  declare readonly ${accessor}: ${accessorType(table, genericArgs)};`);
   }
-  lines.push('}');
+  // The nested `$transaction` (SAVEPOINT) hands its callback a typed client.
+  // Declared as a real overriding method rather than through a same-named
+  // interface (declaration merging), which strict lint configs reject
+  // (no-unsafe-declaration-merging). It only narrows the callback's type:
+  // the body is the base method.
   lines.push('');
-  // Augment the class with a typed `$transaction` overload via interface
-  // merging. This adds an additional callable signature whose callback
-  // parameter is narrowed to `TypedTransactionClient`, while the base
-  // signature (callback parameter `BaseTransactionClient`) remains valid.
-  lines.push('export interface TypedTransactionClient {');
   lines.push('  /**');
   lines.push('   * Nested transaction via SAVEPOINT. The callback receives a typed');
   lines.push('   * `TypedTransactionClient` so all table accessors auto-complete.');
   lines.push('   */');
-  lines.push('  $transaction<R>(fn: (tx: TypedTransactionClient) => Promise<R>): Promise<R>;');
+  lines.push('  override $transaction<R>(fn: (tx: TypedTransactionClient) => Promise<R>): Promise<R> {');
+  lines.push('    return super.$transaction(fn as (tx: BaseTransactionClient) => Promise<R>);');
+  lines.push('  }');
   lines.push('}');
   lines.push('');
 
@@ -1199,37 +1584,30 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
     const typeName = entityName(table.name);
     const accessor = snakeToCamelStr(table.name);
     const hasRelations = hasSafeRelations.get(table.name) === true;
-    const genericArgs = hasRelations ? `${typeName}, ${typeName}Relations` : typeName;
+    const genericArgs = `${typeName}, ${hasRelations ? `${typeName}Relations` : '{}'}, ${typeName}Inputs`;
     lines.push(`  /** Query interface for the \`${docSafe(table.name)}\` table */`);
     lines.push(`  declare readonly ${accessor}: ${accessorType(table, genericArgs)};`);
   }
   lines.push('');
-  lines.push('  constructor(config?: TurbineConfig) {');
-  lines.push('    super(config, SCHEMA);');
+  lines.push('  constructor(config?: TypedTurbineConfig) {');
+  lines.push('    super(config as TurbineConfig | undefined, SCHEMA);');
   lines.push('  }');
-  lines.push('}');
-  lines.push('');
-  // Augment TurbineClient via interface merging with typed $transaction and
-  // $withSession overloads. The callback parameter is narrowed to
-  // `TypedTransactionClient` so users get autocomplete on `tx.users`,
-  // `tx.posts`, etc. $withSession is the RLS shorthand for
-  // `$transaction(fn, { sessionContext })`; it used to be left out, so its
-  // callback stayed the untyped base `TransactionClient` and the documented
-  // `tx.<table>.findMany()` did not compile on a generated client.
+  // Typed `$transaction` / `$withSession`: the callback parameter is narrowed
+  // to `TypedTransactionClient`, so `tx.users` etc. autocomplete. Real
+  // overriding methods whose bodies are the base methods, NOT a same-named
+  // interface merged onto the class: strict lint configs reject that merge
+  // (no-unsafe-declaration-merging), and generated code must pass them.
   //
-  // IMPORTANT: each merged member must be compatible with the base class's
-  // member ON ITS OWN (TS2415), since v0.26 the base $transaction also has a
-  // batch-array overload (`$transaction([...queries])`), so the merged
-  // interface must redeclare BOTH signatures. Emitting only the callback form
-  // makes every generated client fail `tsc` with "incorrectly extends". The
-  // $withSession overload mirrors the base parameter list exactly for the same
-  // reason; src/test/generate-typecheck.test.ts compiles the result.
-  lines.push('export interface TurbineClient {');
+  // Each overload must stay compatible with the base class's (TS2416): the
+  // base `$transaction` has a callback form AND a batch-array form, so both
+  // are redeclared, and `$withSession` mirrors the base parameter list.
+  // src/test/generate-typecheck.test.ts compiles the result.
+  lines.push('');
   lines.push('  /**');
   lines.push('   * Run a callback inside a transaction. The callback receives a typed');
   lines.push('   * `TypedTransactionClient` with autocompletion for every table accessor.');
   lines.push('   */');
-  lines.push('  $transaction<R>(');
+  lines.push('  override $transaction<R>(');
   lines.push('    fn: (tx: TypedTransactionClient) => Promise<R>,');
   lines.push('    options?: TransactionOptions,');
   lines.push('  ): Promise<R>;');
@@ -1237,18 +1615,32 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
   lines.push('   * Batch form: run several deferred queries in one transaction and get');
   lines.push('   * their results as a tuple (same as the base client).');
   lines.push('   */');
-  lines.push('  $transaction<T extends readonly DeferredQuery<unknown>[]>(');
+  lines.push('  override $transaction<T extends readonly DeferredQuery<unknown>[]>(');
   lines.push('    queries: readonly [...T],');
+  lines.push('    options?: TransactionOptions,');
   lines.push('  ): Promise<PipelineResults<T>>;');
+  lines.push('  override $transaction(');
+  lines.push(
+    '    fnOrQueries: ((tx: TypedTransactionClient) => Promise<unknown>) | readonly DeferredQuery<unknown>[],',
+  );
+  lines.push('    options?: TransactionOptions,');
+  lines.push('  ): Promise<unknown> {');
+  lines.push(
+    "    return super.$transaction(fnOrQueries as Parameters<BaseTurbineClient['$transaction']>[0], options);",
+  );
+  lines.push('  }');
+  lines.push('');
   lines.push('  /**');
   lines.push('   * Run a callback inside a transaction with the given session GUCs applied');
   lines.push('   * via `set_config(..., true)` (the RLS / multi-tenant shorthand). The');
   lines.push('   * callback receives a typed `TypedTransactionClient`, same as `$transaction`.');
   lines.push('   */');
-  lines.push('  $withSession<R>(');
+  lines.push('  override $withSession<R>(');
   lines.push('    context: Record<string, string | number | boolean>,');
   lines.push('    fn: (tx: TypedTransactionClient) => Promise<R>,');
-  lines.push('  ): Promise<R>;');
+  lines.push('  ): Promise<R> {');
+  lines.push('    return super.$withSession(context, fn as (tx: BaseTransactionClient) => Promise<R>);');
+  lines.push('  }');
   lines.push('}');
   lines.push('');
 
@@ -1260,7 +1652,7 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
   lines.push(' *   fields) to fall back to the `DATABASE_URL` environment variable.');
   lines.push(' * @returns A fully-typed TurbineClient with table accessors.');
   lines.push(' */');
-  lines.push('export function turbine(config?: TurbineConfig): TurbineClient {');
+  lines.push('export function turbine(config?: TypedTurbineConfig): TurbineClient {');
   lines.push('  return new TurbineClient(config);');
   lines.push('}');
   lines.push('');
@@ -1392,6 +1784,10 @@ function serializeColumn(col: ColumnMetadata): string {
   if (col.pii) parts.push(`pii: true`);
   if (col.updatedAt) parts.push(`updatedAt: true`);
   if (col.maxLength !== undefined) parts.push(`maxLength: ${col.maxLength}`);
+  // The default expression, so an engine without column defaults (PowDB) can
+  // apply it on create. Arbitrary SQL text, so written as a JSON string
+  // literal, which escapes every quote, backslash and line break.
+  if (col.defaultValue != null) parts.push(`defaultValue: ${JSON.stringify(col.defaultValue)}`);
   return `{ ${parts.join(', ')} }`;
 }
 
@@ -1442,31 +1838,11 @@ function snakeToCamelStr(s: string): string {
 }
 
 /**
- * Build the update-input field type for a column. Numeric columns become
- * `T | UpdateOperatorInput<number> | null?` so users can write atomic
- * operators (`{ increment: 1 }`, `{ multiply: 2 }`, etc.) without casts.
- *
- * The check is purely structural, if the column's TS type contains
- * `'number'` (e.g. `number`, `number | null`), it's eligible. Other
- * scalar types (`string`, `boolean`, `Date`, `unknown`, `Buffer`,
- * `Date | null`, etc.) pass through unchanged.
+ * Build the update-input field type for a column: the plain value, or the
+ * {@link UpdateOperatorInput} object (`{ set }` on every column, plus
+ * `increment` / `decrement` / `multiply` / `divide` when the type includes
+ * `number`), matching what `update()` accepts at runtime.
  */
 function updateFieldType(tsType: string): string {
-  // Strip parens for the regex check; preserve the original string in the output.
-  if (containsNumberType(tsType)) {
-    return `${tsType} | UpdateOperatorInput<number>`;
-  }
-  return tsType;
-}
-
-/**
- * Detect whether a TypeScript type expression contains the `number` primitive
- * as a top-level union member. Conservative on purpose, only matches
- * `number`, `number | null`, `null | number`, etc., not `number[]` or
- * `Record<string, number>`.
- */
-function containsNumberType(tsType: string): boolean {
-  // Tokenize on `|` and check each member.
-  const parts = tsType.split('|').map((p) => p.trim());
-  return parts.some((p) => p === 'number');
+  return `${tsType} | UpdateOperatorInput<${tsType}>`;
 }

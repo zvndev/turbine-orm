@@ -373,14 +373,14 @@ assertTrue<Equals<DeclaredOmitWithHasEmail, false>>();
 // ---------------------------------------------------------------------------
 // 12. Relation `_count` in `with` (WS-A / A4)
 //
-//     `_count: true` types the result's `_count` as an open Record<string,
-//     number>; the record form narrows it to exactly the selected relations.
+//     `_count: true` types the result's `_count` as one number per to-many
+//     relation; the record form narrows it to exactly the selected relations.
 //     `_count` coexists with real relation inclusions.
 // ---------------------------------------------------------------------------
 
-// --- _count: true → open record of numbers ---
+// --- _count: true → one number per to-many relation ---
 type CountAll = WithResult<User, UserRelations, { _count: true }>;
-assertTrue<Equals<CountAll['_count'], Record<string, number>>>();
+assertTrue<Equals<CountAll['_count'], { posts: number }>>();
 
 // --- _count: { posts: true } → { posts: number } ---
 type CountPosts = WithResult<User, UserRelations, { _count: { posts: true } }>;
@@ -405,7 +405,7 @@ async function countCallSite() {
 
     const countAll = await users.findMany({ with: { _count: true } });
     type CountAllItem = (typeof countAll)[number];
-    assertTrue<Equals<CountAllItem['_count'], Record<string, number>>>();
+    assertTrue<Equals<CountAllItem['_count'], { posts: number }>>();
   }
 }
 void countCallSite;

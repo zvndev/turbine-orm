@@ -157,7 +157,8 @@ describe('H1, generateZod()', () => {
   it('Create keeps the PK optional; Update omits the PK', () => {
     const createBlock = out.slice(out.indexOf('PostCreateSchema'), out.indexOf('PostUpdateSchema'));
     const updateBlock = out.slice(out.indexOf('PostUpdateSchema'));
-    assert.match(createBlock, /id: z\.number\(\)\.optional\(\)/);
+    // A bigint key is written as a number, a decimal string or a bigint.
+    assert.match(createBlock, /id: z\.union\(\[z\.number\(\), z\.string\(\), z\.bigint\(\)\]\)\.optional\(\)/);
     assert.doesNotMatch(updateBlock, /\bid: z\./);
   });
 

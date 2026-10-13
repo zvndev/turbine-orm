@@ -141,7 +141,13 @@ describe('generate nested input types', () => {
     const output = generateTypes(schema);
     assert.ok(output.includes('export type UserCreateInput ='));
     assert.ok(output.includes('posts?:'));
-    assert.ok(output.includes('PostNestedCreateInput'));
+    // The nested posts do not ask for the key the parent supplies.
+    assert.ok(output.includes('posts?: PostNestedCreateWithoutAuthorInput | undefined'));
+    assert.ok(
+      output.includes(
+        'export type PostCreateWithoutAuthorInput = { id?: number | string | bigint | undefined; title: string; slug?: string | undefined };',
+      ),
+    );
   });
 
   it('emits UpdateInput type with full nested operations', () => {
@@ -161,9 +167,10 @@ describe('generate nested input types', () => {
   it('emits NestedUpdateInput with disconnect, set, delete', () => {
     const output = generateTypes(schema);
     assert.ok(output.includes('export interface PostNestedUpdateInput'));
-    assert.ok(output.includes('disconnect?: PostWhereUnique | PostWhereUnique[]'));
+    // disconnect / delete take a unique selector or any filter on the related rows.
+    assert.ok(output.includes('disconnect?: PostWhereUnique | Partial<Post> | (PostWhereUnique | Partial<Post>)[]'));
     assert.ok(output.includes('set?: PostWhereUnique[]'));
-    assert.ok(output.includes('delete?: PostWhereUnique | PostWhereUnique[]'));
+    assert.ok(output.includes('delete?: PostWhereUnique | Partial<Post> | (PostWhereUnique | Partial<Post>)[]'));
   });
 
   it('emits ConnectOrCreate type', () => {
@@ -181,21 +188,22 @@ describe('generate nested input types', () => {
     assert.ok(updateInputStart >= 0);
     // Find the posts field within the next few lines
     const slice = lines.slice(updateInputStart, updateInputStart + 5).join('\n');
-    assert.ok(slice.includes('PostNestedUpdateInput'));
+    // The variant without the keys the parent supplies.
+    assert.ok(slice.includes('PostNestedUpdateWithoutAuthorInput'));
   });
 
-  it('emits belongsTo relations with NestedCreateInput in CreateInput', () => {
+  it('emits belongsTo relations with the to-one nested input in CreateInput', () => {
     const output = generateTypes(schema);
-    // Post has belongsTo author, so CreateInput should use UserNestedCreateInput
+    // Post has belongsTo author, so CreateInput uses the single-row UserNestedToOneCreateInput
     assert.ok(output.includes('export type PostCreateInput ='));
     const lines = output.split('\n');
     const createInputStart = lines.findIndex((l) => l.includes('export type PostCreateInput'));
     assert.ok(createInputStart >= 0);
     const slice = lines.slice(createInputStart, createInputStart + 5).join('\n');
-    assert.ok(slice.includes('UserNestedCreateInput'));
+    assert.ok(slice.includes('UserNestedToOneCreateInput'));
   });
 
-  it('emits types for tables without relations (leaf tables get WhereUnique only)', () => {
+  it('emits types for tables without relations (leaf tables get the plain input types)', () => {
     // Both users and posts have relations in this schema. Create a minimal
     // schema with a leaf table to test that WhereUnique is still emitted.
     const leafSchema: SchemaMetadata = {
@@ -244,8 +252,12 @@ describe('generate nested input types', () => {
     assert.ok(output.includes('export interface TagNestedCreateInput'));
     assert.ok(output.includes('export interface TagNestedUpdateInput'));
     assert.ok(output.includes('export interface TagConnectOrCreate'));
-    // But should NOT emit CreateInput/UpdateInput (no relations to add)
-    assert.ok(!output.includes('export type TagCreateInput ='));
-    assert.ok(!output.includes('export type TagUpdateInput ='));
+    // CreateInput / UpdateInput are the row inputs with nothing added: the
+    // accessor's input types name them for every table.
+    assert.ok(
+      output.includes('export type TagCreateInput = { id?: number | string | bigint | undefined; label: string };'),
+    );
+    assert.ok(output.includes('export type TagUpdateInput = TagUpdate;'));
+    assert.ok(output.includes('export interface TagInputs'));
   });
 });
