@@ -18,7 +18,7 @@ import { ValidationError } from './errors.js';
 import { isPlainRecord, setOwn } from './query/filters.js';
 import type { GlobalFilters } from './query/index.js';
 import { resolveColumnName, resolveRelation } from './query/utils.js';
-import { type CombinatorKey, combinatorBranches } from './query/where-compile.js';
+import { type CombinatorKey, combinatorBranches, foldWhereFor } from './query/where-compile.js';
 import type { SchemaMetadata, TableMetadata } from './schema.js';
 
 /** The accessor a table gets on the client (`blog_posts` -> `blogPosts`). The one place it is derived. */
@@ -127,6 +127,14 @@ export function normalizeGlobalFilters(
       );
     }
     assertFilterNamesExist(value, schema.tables[table]!, key, '');
+    // The whole clause shape at every depth (relation quantifier values among
+    // it), checked here rather than at the first query that reads this table.
+    try {
+      foldWhereFor(schema.tables, table, value);
+    } catch (err) {
+      if (err instanceof ValidationError) throw new ValidationError(`globalFilters["${key}"]: ${err.message}`);
+      throw err;
+    }
     setOwn(normalized as Record<string, unknown>, table, value);
   }
   return normalized;

@@ -121,6 +121,16 @@ describe('globalFilters: keys are checked against the schema at construction', (
     );
   });
 
+  it('a static filter whose relation filter value is not a where object is refused at construction', () => {
+    // Without the construction-time check this would be refused only by the first
+    // query on the table, i.e. by a request rather than by startup.
+    assert.throws(() => client({ blogPosts: { author: { is: 5 } } }), refused(/globalFilters\["blogPosts"\]: .*`is`/s));
+    assert.throws(
+      () => client({ blogPosts: { AND: [{ deletedAt: null }, { author: { isNot: 'x' } }] } }),
+      refused(/globalFilters\["blogPosts"\]: .*`isNot`/s),
+    );
+  });
+
   it('columns by either spelling, relations, and combinators are accepted', () => {
     assert.doesNotThrow(() =>
       client({
