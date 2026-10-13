@@ -23,7 +23,7 @@
  */
 
 import pg from '#pg';
-import { openCheckout } from './checkout.js';
+import { openCheckout, typeCheckoutTimeouts } from './checkout.js';
 import { absorbCheckedOutErrors, settleLongIdleCheckouts } from './connection-guard.js';
 import { mergeConnectionStringOptions } from './connection-url.js';
 import { type Dialect, postgresDialect } from './dialect.js';
@@ -41,6 +41,8 @@ import {
   ValidationError,
   wrapPgError,
 } from './errors.js';
+import { normalizeGlobalFilters } from './global-filters-config.js';
+import { hasRelationFields } from './nested-write.js';
 import { type ObserveConfig, ObserveEngine, type ObserveHandle } from './observe.js';
 import type { PgCompatPool, PgCompatPoolClient, PgCompatQueryResult } from './pg-types.js';
 import { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
@@ -81,7 +83,8 @@ import {
   type Subscription,
   validateChannel,
 } from './realtime.js';
-import type { SchemaMetadata } from './schema.js';
+import type { SchemaMetadata, TableMetadata } from './schema.js';
+import { commitTransaction, TRANSACTION_STATE, TransactionState } from './transaction-state.js';
 import { buildTypedSql, TypedSqlQuery } from './typed-sql.js';
 
 // ---------------------------------------------------------------------------
@@ -981,12 +984,101 @@ const ISOLATION_LEVELS: Record<string, string> = Object.assign(Object.create(nul
  * loops, and a loop keyed on it would never fire for the commit-time conflicts
  * that are the main reason to run SERIALIZABLE at all.
  */
-async function runTxControl(client: PgCompatPoolClient, sql: string): Promise<void> {
+async function runTxControl(client: PgCompatPoolClient, sql: string, params?: unknown[]): Promise<void> {
   try {
-    await client.query(sql);
+    await client.query(sql, params);
   } catch (err) {
     throw wrapPgError(err);
   }
+}
+
+/**
+ * Refuse anything in a batch that is not a deferred query, before any of it
+ * runs.
+ *
+ * The array forms take the descriptors `build*()` returns. Prisma's array form
+ * takes promises instead, so code ported from it passes `db.users.create(...)`,
+ * whose query has ALREADY started on its own connection, outside any
+ * transaction, by the time the array exists. That cannot be undone here, so
+ * the error says so and names the builder to use instead. The promise's own
+ * rejection is observed, so this refusal is the error the caller sees rather
+ * than an unhandled rejection from a query nobody awaits.
+ */
+function assertDeferredQueries(queries: readonly unknown[], api: string, unit: 'transaction' | 'pipeline'): void {
+  queries.forEach((q, i) => {
+    if (
+      q !== null &&
+      (typeof q === 'object' || typeof q === 'function') &&
+      typeof (q as PromiseLike<unknown>).then === 'function'
+    ) {
+      Promise.resolve(q).catch(() => {});
+      throw new ValidationError(
+        `${api}: item ${i} is a Promise. Its query started running on its own the moment it was created, ` +
+          `outside this ${unit}, and may already have committed. Pass the deferred form instead, built with ` +
+          '`build*()`: `db.users.buildCreate(...)` rather than `db.users.create(...)` (likewise `buildUpdate`, ' +
+          '`buildDelete`, `buildUpsert`, `buildFindMany`).' +
+          (unit === 'transaction' ? ' Or use the callback form, `$transaction(async (tx) => { ... })`.' : ''),
+      );
+    }
+    const dq = q as Partial<DeferredQuery<unknown>> | null;
+    if (!dq || typeof dq !== 'object' || typeof dq.sql !== 'string' || typeof dq.transform !== 'function') {
+      throw new ValidationError(
+        `${api}: item ${i} is not a deferred query. Build each item with a \`build*()\` method, ` +
+          'for example `db.users.buildCreate({ data })` or `db.posts.buildCount({ where })`.',
+      );
+    }
+  });
+}
+
+/** The PG* variables pg reads for a connection target when its config leaves the field unset. */
+const PG_ENV_TARGETS = ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER'] as const;
+
+/** A non-empty environment variable, or undefined (also where `process` does not exist). */
+function pgEnv(name: string): string | undefined {
+  return (typeof process !== 'undefined' ? process.env?.[name] : undefined) || undefined;
+}
+
+/**
+ * Whether an owned pool's config names a database at all: a connection
+ * string, any host setting, DATABASE_URL (unless an explicit, empty
+ * `connectionString` suppresses it, as the pool branch does), or a PG*
+ * variable pg will read.
+ */
+function hasDatabaseTarget(config: TurbineConfig): boolean {
+  if (config.connectionString) return true;
+  if (
+    config.host != null ||
+    config.port != null ||
+    config.database != null ||
+    config.user != null ||
+    config.password != null
+  ) {
+    return true;
+  }
+  if (config.connectionString == null && pgEnv('DATABASE_URL')) return true;
+  return PG_ENV_TARGETS.some((name) => pgEnv(name) !== undefined);
+}
+
+/**
+ * The pool of a client that was given no database: every query and checkout
+ * rejects with a {@link ConnectionError} naming the fix, and `disconnect()`
+ * succeeds. Building SQL never touches the pool, so it still works.
+ */
+function unconfiguredPool(emptyConnectionString: boolean): PgCompatPool {
+  const fail = (): Promise<never> =>
+    Promise.reject(
+      new ConnectionError(
+        'No database configured: ' +
+          (emptyConnectionString
+            ? "`connectionString` is an empty string, which names no database (often `process.env.DATABASE_URL ?? ''` " +
+              'evaluated before DATABASE_URL was loaded). '
+            : 'this client was given no `connectionString`, `pool` or host settings, and the DATABASE_URL environment ' +
+              'variable is not set. ') +
+          'turbine-orm does not read `.env` files: load yours before the app starts (`node --env-file=.env app.js`, ' +
+          'or `process.loadEnvFile()` on Node 20.12 and later), or pass `connectionString` explicitly.',
+      ),
+    );
+  return { query: fail, connect: fail, end: async () => {}, on: () => {} } as unknown as PgCompatPool;
 }
 
 function resolveIsolationLevel(level: string | undefined): string | undefined {
@@ -1059,12 +1151,17 @@ interface PrimaryViewSeed {
  * A transaction-scoped client that provides the same table accessor API as TurbineClient.
  * All queries run on a dedicated connection within a BEGIN/COMMIT block.
  * Supports nested transactions via SAVEPOINTs.
+ *
+ * Closed when its transaction settles (commit, rollback, timeout, error): every
+ * later call through it throws `ValidationError` (E003) instead of running on a
+ * connection that is back in the pool and may belong to another request.
  */
 export class TransactionClient {
   private readonly tableCache = new Map<string, QueryInterface<object>>();
-  private savepointCounter = 0;
   /** Active SQL dialect, owns savepoint keywords and raw-SQL placeholders. */
   private readonly dialect: Dialect;
+  /** Open/closed state, first failure and savepoint blocks, shared by everything this client hands out. */
+  private readonly state: TransactionState;
 
   constructor(
     private readonly client: PgCompatPoolClient,
@@ -1081,8 +1178,15 @@ export class TransactionClient {
      * for a plain pg pool leave the proxy unchanged.
      */
     private readonly sourcePool?: { readonly readonly?: boolean; readonly capabilities?: unknown },
+    /**
+     * The state of the transaction this client belongs to. `$transaction`
+     * passes the one it opened, which also turns on per-write savepoints for
+     * multi-statement writes. Omitted for Turbine's own implicit transactions.
+     */
+    state?: TransactionState,
   ) {
     this.dialect = queryOptions?.dialect ?? postgresDialect;
+    this.state = state ?? new TransactionState(client, this.dialect);
     // Auto-create typed table accessors for all tables in the schema
     for (const tableName of Object.keys(schema.tables)) {
       const camelName = tableName.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
@@ -1109,6 +1213,7 @@ export class TransactionClient {
       qi = txOpts.queryInterfaceFactory
         ? txOpts.queryInterfaceFactory(txPool, name, this.schema, this.middlewares, txOpts)
         : new QueryInterface<object>(txPool, name, this.schema, this.middlewares, txOpts);
+      if (this.state.savepointWrites) savepointMultiStatementWrites(qi, this.schema.tables[name], this.state);
       this.tableCache.set(name, qi);
     }
     return qi as QueryInterface<T>;
@@ -1116,19 +1221,14 @@ export class TransactionClient {
 
   /**
    * Execute a nested transaction via SAVEPOINT.
-   * If the inner function throws, only the savepoint is rolled back.
+   *
+   * If the inner function throws, only the savepoint is rolled back. Blocks
+   * started side by side (`Promise.all`) run one after another, because
+   * savepoints are a stack on the connection and a rollback in one would
+   * otherwise undo a sibling that already reported success.
    */
   async $transaction<R>(fn: (tx: TransactionClient) => Promise<R>): Promise<R> {
-    const savepointName = `sp_${++this.savepointCounter}`;
-    await this.client.query(this.dialect.savepointStatement(savepointName));
-    try {
-      const result = await fn(this);
-      await this.client.query(this.dialect.releaseSavepointStatement(savepointName));
-      return result;
-    } catch (err) {
-      await this.client.query(this.dialect.rollbackToSavepointStatement(savepointName));
-      throw err;
-    }
+    return this.state.withSavepoint(() => fn(this));
   }
 
   /**
@@ -1145,13 +1245,15 @@ export class TransactionClient {
         sql += this.dialect.paramPlaceholder(i + 1);
       }
     });
-    const result = await runReportedStatement(
-      this.queryOptions?._onQuery,
-      rawIdentity('raw'),
-      sql,
-      values,
-      () => this.client.query(sql, values),
-      wrapPgError,
+    const result = await this.state.run(() =>
+      runReportedStatement(
+        this.queryOptions?._onQuery,
+        rawIdentity('raw'),
+        sql,
+        values,
+        () => this.client.query(sql, values),
+        wrapPgError,
+      ),
     );
     return result.rows as T[];
   }
@@ -1187,13 +1289,15 @@ export class TransactionClient {
     params: readonly unknown[] = [],
     action = 'rawQuery',
   ): Promise<{ rows: T[]; rowCount: number | null }> {
-    const result = await runReportedStatement(
-      this.queryOptions?._onQuery,
-      rawIdentity(action),
-      text,
-      params as unknown[],
-      () => this.client.query(text, params as unknown[]),
-      wrapPgError,
+    const result = await this.state.run(() =>
+      runReportedStatement(
+        this.queryOptions?._onQuery,
+        rawIdentity(action),
+        text,
+        params as unknown[],
+        () => this.client.query(text, params as unknown[]),
+        wrapPgError,
+      ),
     );
     return { rows: result.rows as T[], rowCount: result.rowCount };
   }
@@ -1205,14 +1309,14 @@ export class TransactionClient {
    *
    * pg driver errors thrown by queries are translated into typed Turbine
    * errors via wrapPgError so transaction-scoped queries surface the same
-   * typed errors as pool-scoped queries.
+   * typed errors as pool-scoped queries. Every statement passes through the
+   * transaction state, which refuses it once the transaction has settled.
    */
   private createTxPool(): PgCompatPool {
     const client = this.client;
-    // Return a minimal pool-compatible object that routes queries
-    // through the transaction client
-    const txPool: Record<string, unknown> = {
-      query: async (textOrConfig: string | { name?: string; text: string; values?: unknown[] }, values?: unknown[]) => {
+    const state = this.state;
+    const query = (textOrConfig: string | { name?: string; text: string; values?: unknown[] }, values?: unknown[]) =>
+      state.run(async () => {
         try {
           if (typeof textOrConfig === 'string') {
             return await client.query(textOrConfig, values);
@@ -1226,8 +1330,20 @@ export class TransactionClient {
         } catch (err) {
           throw wrapPgError(err);
         }
+      });
+    // Return a minimal pool-compatible object that routes queries
+    // through the transaction client
+    const txPool: Record<PropertyKey, unknown> = {
+      query,
+      // The transaction's connection is not this pool's to lend: a "checkout"
+      // runs on it through the same guarded `query`, and releasing it is a
+      // no-op, so nothing reached through the pool can hand the connection back
+      // to the real pool while the transaction still holds it.
+      connect: async () => {
+        state.assertOpen();
+        return { query, release: () => {} };
       },
-      connect: () => Promise.resolve(client),
+      [TRANSACTION_STATE]: state,
     };
     // Carry the parent pool's PowDB-only flags through so a transaction-scoped
     // PowqlInterface reads the same read-only guard and capabilities it would
@@ -1236,6 +1352,54 @@ export class TransactionClient {
     if (this.sourcePool?.capabilities !== undefined) txPool.capabilities = this.sourcePool.capabilities;
     return txPool as unknown as PgCompatPool;
   }
+}
+
+/**
+ * Give each multi-statement write on a transaction-scoped accessor its own
+ * savepoint: `create` / `update` carrying nested relation writes, and an
+ * `upsert` that looks the row up first.
+ *
+ * Inside the caller's transaction these used to join it statement by
+ * statement. A failure raised part way through (a nested `connect` that finds
+ * nothing, a validation error found mid-walk) left the statements before it in
+ * place, so a caller that caught the error and went on committed half of the
+ * write. In its own savepoint the write is all or nothing again, and the
+ * caller's transaction continues either way.
+ *
+ * Installed as own methods on the accessor this transaction created and owns,
+ * so a single-statement write pays one property lookup and a shape check.
+ */
+function savepointMultiStatementWrites(
+  qi: QueryInterface<object>,
+  meta: TableMetadata | undefined,
+  state: TransactionState,
+): void {
+  if (!meta) return;
+  const target = qi as unknown as Record<string, (args: Record<string, unknown> | undefined) => Promise<unknown>>;
+  const nestedData = (args: Record<string, unknown> | undefined): boolean => {
+    const data = args?.data;
+    return data !== null && typeof data === 'object' && hasRelationFields(data as Record<string, unknown>, meta);
+  };
+  const lookupUpsert = (args: Record<string, unknown> | undefined): boolean => {
+    const needsLookup = (qi as unknown as { upsertNeedsLookup?: (a: unknown) => boolean }).upsertNeedsLookup;
+    return typeof needsLookup === 'function' && args !== undefined && needsLookup.call(qi, args);
+  };
+  const wrap = (
+    method: 'create' | 'update' | 'upsert',
+    multiStatement: (args: Record<string, unknown> | undefined) => boolean,
+  ) => {
+    const original = target[method];
+    if (typeof original !== 'function') return;
+    Object.defineProperty(qi, method, {
+      value: (args: Record<string, unknown> | undefined) =>
+        multiStatement(args) ? state.withSavepoint(() => original.call(qi, args)) : original.call(qi, args),
+      configurable: true,
+      writable: true,
+    });
+  };
+  wrap('create', nestedData);
+  wrap('update', nestedData);
+  wrap('upsert', lookupUpsert);
 }
 
 // ---------------------------------------------------------------------------
@@ -1404,6 +1568,9 @@ export class TurbineClient {
     // would poison the next, valid, TurbineClient with a phantom conflict.
     const dialect = config.dialect ?? postgresDialect;
     const planCacheMode = TurbineClient.resolvePlanCacheMode(config.planCacheMode, dialect);
+    // Keyed by table name, with every key checked against the schema: a
+    // filter under a name that matches no table would never be applied.
+    const globalFilters = normalizeGlobalFilters(config.globalFilters, schema);
     // Refuse a connection string that cannot address a database, before it
     // reaches pg's permissive parser and comes back one query later as a DNS
     // error about a fragment of itself. Only the strings this client will
@@ -1526,7 +1693,7 @@ export class TurbineClient {
       autoToOneJoinMaxRows: config.autoToOneJoinMaxRows,
       autoRoundTripMs: config.autoRoundTripMs,
       jsonEncoding: config.jsonEncoding,
-      globalFilters: config.globalFilters,
+      globalFilters,
       preparedStatements: envDisablePrepared ? false : (config.preparedStatements ?? !config.pool),
       // Forwarded so a per-query `forceCustomPlan` can refuse the combination
       // this client's own connections would silently defeat, see the
@@ -1580,6 +1747,13 @@ export class TurbineClient {
       if (this.logging) {
         console.log(`[turbine] Using external pool, ${Object.keys(schema.tables).length} tables`);
       }
+    } else if (!hasDatabaseTarget(config)) {
+      // Nothing names a database: no pool, connection string, host settings,
+      // DATABASE_URL or PG* variable. The first query fails with the fix,
+      // which beats connecting to a guessed localhost. Failing here instead
+      // would break every build step that imports the client without a database.
+      this.pool = unconfiguredPool(config.connectionString === '');
+      this.ownsPool = true;
     } else {
       const poolConfig: pg.PoolConfig = {
         max: config.poolSize ?? config.max ?? 10,
@@ -1607,10 +1781,12 @@ export class TurbineClient {
       } else if (!hasExplicitConnection && process.env.DATABASE_URL) {
         poolConfig.connectionString = process.env.DATABASE_URL;
       } else {
-        poolConfig.host = config.host ?? 'localhost';
-        poolConfig.port = config.port ?? 5432;
-        poolConfig.database = config.database ?? 'postgres';
-        poolConfig.user = config.user ?? 'postgres';
+        // A default filled in here would override the PG* variable pg reads
+        // for the same field, so a field the environment sets is left to pg.
+        poolConfig.host = config.host ?? (pgEnv('PGHOST') ? undefined : 'localhost');
+        poolConfig.port = config.port ?? (pgEnv('PGPORT') ? undefined : 5432);
+        poolConfig.database = config.database ?? (pgEnv('PGDATABASE') ? undefined : 'postgres');
+        poolConfig.user = config.user ?? (pgEnv('PGUSER') ? undefined : 'postgres');
         poolConfig.password = config.password;
       }
 
@@ -1630,6 +1806,9 @@ export class TurbineClient {
       // loop turn before reusing a long-idle connection, so the pool has read
       // any close the server sent meanwhile. See connection-guard.ts.
       settleLongIdleCheckouts(ownPool);
+      // An exhausted pool rejects a checkout with an untyped pg-pool error;
+      // make it a ConnectionError on every path, `pool.query` included.
+      typeCheckoutTimeouts(ownPool);
       this.pool = ownPool;
       this.ownsPool = true;
 
@@ -1664,6 +1843,7 @@ export class TurbineClient {
         });
         absorbCheckedOutErrors(replicaPool);
         settleLongIdleCheckouts(replicaPool);
+        typeCheckoutTimeouts(replicaPool);
         this.replicaPools.push(replicaPool);
         this.ownedReplicaPools.push(replicaPool);
       } else {
@@ -2199,14 +2379,10 @@ export class TurbineClient {
     let queries: T;
     let options: PipelineOptions | undefined;
 
-    // Detect which overload was used
-    if (
-      args.length > 0 &&
-      Array.isArray(args[0]) &&
-      (args[0] as unknown[]).every(
-        (item) => item && typeof item === 'object' && 'sql' in (item as Record<string, unknown>),
-      )
-    ) {
+    // Detect which overload was used. A deferred query is never an array, so
+    // an array first argument is the array form whatever it contains; its
+    // items are checked below like the rest form's.
+    if (args.length > 0 && Array.isArray(args[0])) {
       // Array form: pipeline([q1, q2], opts?)
       queries = args[0] as unknown as T;
       options = args[1] as PipelineOptions | undefined;
@@ -2214,6 +2390,7 @@ export class TurbineClient {
       // Rest-param form: pipeline(q1, q2, q3)
       queries = args as unknown as T;
     }
+    assertDeferredQueries(queries, 'pipeline', 'pipeline');
 
     if (this.logging) {
       console.log(`[turbine] Pipeline: ${queries.length} queries, ${queries.map((q) => q.tag).join(', ')}`);
@@ -2475,7 +2652,10 @@ export class TurbineClient {
       const wrap = (client as unknown as PgCompatPoolClient).wrapTransactionCallback;
       // `.call` erases the generic, so the callback's Promise<T> is re-asserted.
       const result = wrap ? ((await wrap.call(client, () => fn(client))) as T) : await fn(client);
-      await runTxControl(client, this.dialect.commitStatement());
+      // A COMMIT answered with ROLLBACK (a statement failed and the callback
+      // caught it) rejects. The raw client is the caller's, so no failure was
+      // observed here to attach as the cause.
+      await commitTransaction(client, this.dialect.commitStatement());
       return result;
     } catch (err) {
       try {
@@ -2536,7 +2716,10 @@ export class TurbineClient {
    * ]);
    * ```
    */
-  $transaction<T extends readonly DeferredQuery<unknown>[]>(queries: readonly [...T]): Promise<PipelineResults<T>>;
+  $transaction<T extends readonly DeferredQuery<unknown>[]>(
+    queries: readonly [...T],
+    options?: TransactionOptions,
+  ): Promise<PipelineResults<T>>;
   async $transaction(
     fnOrQueries: ((tx: TransactionClient) => Promise<unknown>) | readonly DeferredQuery<unknown>[],
     options?: TransactionOptions,
@@ -2552,14 +2735,50 @@ export class TurbineClient {
     options?: TransactionOptions,
   ): Promise<unknown> {
     // Batch overload: an array of DeferredQuery objects runs atomically inside
-    // one BEGIN…COMMIT, reusing the raw transaction machinery below.
+    // one BEGIN…COMMIT, through the same lifecycle (and options) as a callback.
     if (Array.isArray(fnOrQueries)) {
-      return this.transactionBatch(fnOrQueries);
+      assertDeferredQueries(fnOrQueries, '$transaction([...])', 'transaction');
+      if (fnOrQueries.length === 0) {
+        resolveIsolationLevel(options?.isolationLevel);
+        this.resolveSessionContext(options?.sessionContext);
+        return [];
+      }
+      return this.runInTransaction(options, (client) => this.runBatch(client, fnOrQueries));
+    }
+    if (typeof fnOrQueries !== 'function') {
+      throw new ValidationError(
+        '$transaction expects a callback, `async (tx) => { ... }`, or an array of deferred queries built with ' +
+          `\`build*()\`, but received ${fnOrQueries === null ? 'null' : typeof fnOrQueries}.`,
+      );
     }
     const fn = fnOrQueries as (tx: TransactionClient) => Promise<unknown>;
-    // Resolve the isolation level BEFORE taking a pool slot: a bad argument is
-    // the caller's bug and should not cost a connection to discover.
+    // Pass the parent pool so its read-only guard + PowDB capabilities flow
+    // into the transaction-scoped proxy pool (see TransactionClient.createTxPool).
+    const sourcePool = this.pool as unknown as { readonly?: boolean; capabilities?: unknown };
+    return this.runInTransaction(options, (client, state) =>
+      fn(new TransactionClient(client, this.schema, this.middlewares, this.queryOptions, sourcePool, state)),
+    );
+  }
+
+  /**
+   * The one transaction lifecycle both `$transaction` forms share, so an option
+   * one form honours is honoured by the other: BEGIN (with the isolation
+   * level) -> `sessionContext` GUCs -> body, raced against `timeout` -> COMMIT,
+   * and ROLLBACK on any failure.
+   *
+   * The transaction state is ended as soon as the body settles, BEFORE the
+   * COMMIT, so a `tx` that leaked out of the callback can never slip a
+   * statement in ahead of the COMMIT or onto the connection after it.
+   */
+  private async runInTransaction<R>(
+    options: TransactionOptions | undefined,
+    body: (client: PgCompatPoolClient, state: TransactionState) => Promise<R>,
+  ): Promise<R> {
+    // Every option is checked BEFORE taking a pool slot: a bad argument is the
+    // caller's bug and should not cost a connection to discover.
     const isolationSql = resolveIsolationLevel(options?.isolationLevel);
+    const sessionConfig = this.resolveSessionContext(options?.sessionContext);
+    const timeout = options?.timeout;
     // BEGIN with optional isolation level, the dialect owns the keyword and
     // BEGIN+isolation composition (Postgres appends ` ISOLATION LEVEL …`). It
     // runs inside openCheckout, which sends it once more on a fresh connection
@@ -2569,7 +2788,7 @@ export class TurbineClient {
     const { client, checkout } = await openCheckout(this.pool, (c) =>
       runTxControl(c, this.dialect.beginStatement(isolationSql)),
     );
-    const timeout = options?.timeout;
+    const state = new TransactionState(client, this.dialect, { userTransaction: true });
 
     /**
      * Track whether the connection has already been released so the finally
@@ -2590,76 +2809,34 @@ export class TurbineClient {
     let timedOut = false;
 
     try {
-      // Apply transaction-local session context (RLS / multi-tenant GUCs).
-      // Order matters: BEGIN -> isolation level (above) -> set_config loop ->
-      // user fn. Any error here propagates to the catch below and rolls back
-      // like any other transaction failure. We use set_config(name, value,
-      // is_local=true), the parameterizable, transaction-scoped equivalent of
-      // SET LOCAL, so both name and value are BOUND params, never interpolated.
-      if (options?.sessionContext) {
-        if (!this.dialect.supportsRLS) {
-          throw new UnsupportedFeatureError(
-            'sessionContext (RLS session GUCs)',
-            this.dialect.name,
-            'set_config-based row-level-security context requires PostgreSQL.',
-          );
-        }
-        for (const [name, value] of Object.entries(options.sessionContext)) {
-          if (!GUC_NAME_REGEX.test(name)) {
-            throw new ValidationError(
-              `Invalid session-context GUC name "${name}", must match ` +
-                '/^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)?$/ (optionally namespaced, e.g. "app.current_tenant")',
-            );
-          }
-          const cfg = this.dialect.buildSetSessionConfig(name, String(value));
-          await client.query(cfg.sql, cfg.params);
-        }
-      }
-
-      // Create the transaction client with typed table accessors. Pass the
-      // parent pool so its read-only guard + PowDB capabilities flow into the
-      // transaction-scoped proxy pool (see TransactionClient.createTxPool).
-      const tx = new TransactionClient(
-        client,
-        this.schema,
-        this.middlewares,
-        this.queryOptions,
-        this.pool as unknown as { readonly?: boolean; capabilities?: unknown },
-      );
-
-      // Dynamically attach table accessors to tx
-      for (const tableName of Object.keys(this.schema.tables)) {
-        const camelName = tableName.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
-        if (!(camelName in tx)) {
-          Object.defineProperty(tx, camelName, {
-            get: () => tx.table(tableName),
-            enumerable: true,
-          });
-        }
-      }
-
-      let result: unknown;
+      // Transaction-local session context (RLS / multi-tenant GUCs), applied
+      // after BEGIN and before the body via set_config(name, value,
+      // is_local=true), so both name and value are BOUND params.
+      for (const cfg of sessionConfig) await runTxControl(client, cfg.sql, cfg.params);
 
       // Engine seam: when the checked-out connection exposes
-      // wrapTransactionCallback (single-writer engines such as PowDB), run the user
-      // callback through it so the engine can scope its re-entrancy marker to
-      // the callback's async subtree. All other drivers: plain fn(tx).
+      // wrapTransactionCallback (single-writer engines such as PowDB), run the
+      // body through it so the engine can scope its re-entrancy marker to the
+      // body's async subtree. All other drivers: plain body().
       const wrap = (client as unknown as PgCompatPoolClient).wrapTransactionCallback;
-      const runCallback = (): Promise<unknown> => (wrap ? wrap.call(client, () => fn(tx)) : fn(tx));
+      const runBody = (): Promise<R> =>
+        wrap ? (wrap.call(client, () => body(client, state)) as Promise<R>) : body(client, state);
 
+      let result: R;
       if (timeout) {
-        // Race between the function and a timeout. If the timeout fires we
-        // need to actually abort the in-flight query, otherwise the backend
-        // keeps running until pg's own timeout, holding a pool slot the whole
-        // time. The simplest reliable cancellation is to destroy the
-        // connection: passing a truthy argument to client.release() tells the
-        // pg pool to discard the client (its socket is closed, which causes
-        // Postgres to abort the active query and roll back the transaction).
-        // The pool will spin up a fresh connection on the next checkout.
+        // Race between the body and a timeout. If the timeout fires we need
+        // to actually abort the in-flight query, otherwise the backend keeps
+        // running until pg's own timeout, holding a pool slot the whole time.
+        // The simplest reliable cancellation is to destroy the connection:
+        // passing a truthy argument to client.release() tells the pg pool to
+        // discard the client (its socket is closed, which causes Postgres to
+        // abort the active query and roll back the transaction). The pool will
+        // spin up a fresh connection on the next checkout.
         let timer: ReturnType<typeof setTimeout> | undefined;
         const timeoutPromise = new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
             timedOut = true;
+            state.end('timed out');
             // Destroy the connection to abort the in-flight backend query.
             // We do this BEFORE rejecting so the socket is gone by the time
             // the caller's catch block runs.
@@ -2668,15 +2845,17 @@ export class TurbineClient {
           }, timeout);
         });
         try {
-          result = await Promise.race([runCallback(), timeoutPromise]);
+          result = await Promise.race([runBody(), timeoutPromise]);
         } finally {
           clearTimeout(timer);
         }
       } else {
-        result = await runCallback();
+        result = await runBody();
       }
 
-      await runTxControl(client, this.dialect.commitStatement());
+      state.end('has ended');
+      await commitTransaction(client, this.dialect.commitStatement(), state.firstFailure);
+      state.end('committed');
 
       if (this.logging) {
         console.log('[turbine] Transaction committed');
@@ -2689,6 +2868,7 @@ export class TurbineClient {
       // released". Skip the rollback in that case (the backend rolled back
       // when its socket was closed). A BEGIN that failed never gets here, see
       // openCheckout above, so there is always a transaction to roll back.
+      if (!timedOut) state.end('was rolled back');
       if (!timedOut && !released) {
         try {
           await client.query(this.dialect.rollbackStatement());
@@ -2706,10 +2886,52 @@ export class TurbineClient {
   }
 
   /**
-   * Execute a batch of {@link DeferredQuery} objects atomically inside one
-   * transaction. Backs the `$transaction([...])` array overload. Reuses the raw
-   * {@link transaction} machinery (BEGIN/COMMIT/ROLLBACK + connection release);
-   * each result is passed through its query's `transform`.
+   * Validate `sessionContext` and build its `set_config` statements, before
+   * any connection is taken.
+   *
+   * A value that is not a string, number or boolean is refused. `String()`
+   * used to turn `undefined` into the text `'undefined'` (and an object into
+   * `'[object Object]'`), so a missing tenant id reached the row-level
+   * security policy as a real-looking setting instead of failing.
+   */
+  private resolveSessionContext(
+    context: TransactionOptions['sessionContext'],
+  ): Array<{ sql: string; params: unknown[] }> {
+    if (!context) return [];
+    if (!this.dialect.supportsRLS) {
+      throw new UnsupportedFeatureError(
+        'sessionContext (RLS session GUCs)',
+        this.dialect.name,
+        'set_config-based row-level-security context requires PostgreSQL.',
+      );
+    }
+    const statements: Array<{ sql: string; params: unknown[] }> = [];
+    for (const [name, value] of Object.entries(context)) {
+      if (!GUC_NAME_REGEX.test(name)) {
+        throw new ValidationError(
+          `Invalid session-context GUC name "${name}", must match ` +
+            '/^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)?$/ (optionally namespaced, e.g. "app.current_tenant")',
+        );
+      }
+      const kind = typeof value;
+      if (kind !== 'string' && kind !== 'number' && kind !== 'boolean') {
+        throw new ValidationError(
+          `sessionContext["${name}"] is ${value === null ? 'null' : kind}. A session setting is text, and ` +
+            `${value === undefined ? 'a missing value' : 'this value'} would reach your row-level security ` +
+            `policies as the string "${String(value)}". Pass a string, number or boolean, and check the value ` +
+            'your request context supplies.',
+        );
+      }
+      statements.push(this.dialect.buildSetSessionConfig(name, String(value)));
+    }
+    return statements;
+  }
+
+  /**
+   * Run a batch of {@link DeferredQuery} objects on a transaction's connection.
+   * Backs the `$transaction([...])` array overload; the transaction itself
+   * (BEGIN/COMMIT/ROLLBACK, options, release) is {@link runInTransaction}'s.
+   * Each result is passed through its query's `transform`.
    *
    * Execution strategy on the single transaction connection:
    *   - **Sequential (default).** Await each statement's reply before sending
@@ -2730,10 +2952,10 @@ export class TurbineClient {
    * rethrowing, which keeps the connection's request/reply pairing intact and
    * means ROLLBACK is only issued once no statement is still in flight.
    */
-  private async transactionBatch<T extends readonly DeferredQuery<unknown>[]>(queries: T): Promise<PipelineResults<T>> {
-    if (queries.length === 0) {
-      return [] as unknown as PipelineResults<T>;
-    }
+  private async runBatch<T extends readonly DeferredQuery<unknown>[]>(
+    client: PgCompatPoolClient,
+    queries: T,
+  ): Promise<PipelineResults<T>> {
     // One `$on('query')` event per statement, `batch: 'transaction'`, only
     // when someone is listening; each statement is timed on its own.
     const sink = this.queryListeners.size > 0 ? this.queryOptions._onQuery : undefined;
@@ -2746,43 +2968,41 @@ export class TurbineClient {
         run,
         wrapPgError,
       );
-    return this.transaction(async (client) => {
-      const pipelined =
-        (client as unknown as PgCompatPoolClient).supportsPipelining === true &&
-        this.dialect.resultStrategy !== 'reselect';
+    const pipelined =
+      (client as unknown as PgCompatPoolClient).supportsPipelining === true &&
+      this.dialect.resultStrategy !== 'reselect';
 
-      if (pipelined) {
-        // Dispatch every statement before awaiting any reply. The driver's
-        // FIFO guarantee makes settled[i] the reply to queries[i]. Each
-        // statement is timed from its dispatch to its own reply.
-        const settled = await Promise.allSettled(
-          queries.map((dq) => reported(dq, () => client.query(dq.sql, dq.params))),
-        );
-        const results: unknown[] = [];
-        for (let i = 0; i < settled.length; i++) {
-          const outcome = settled[i]!;
-          if (outcome.status === 'rejected') {
-            throw wrapPgError(outcome.reason);
-          }
-          results.push(queries[i]!.transform(outcome.value));
-        }
-        return results as PipelineResults<T>;
-      }
-
+    if (pipelined) {
+      // Dispatch every statement before awaiting any reply. The driver's
+      // FIFO guarantee makes settled[i] the reply to queries[i]. Each
+      // statement is timed from its dispatch to its own reply.
+      const settled = await Promise.allSettled(
+        queries.map((dq) => reported(dq, () => client.query(dq.sql, dq.params))),
+      );
       const results: unknown[] = [];
-      for (const dq of queries) {
-        // Non-RETURNING engines (resultStrategy 'reselect', e.g. MySQL) attach a
-        // reselect plan that runs the write plus a follow-up SELECT; running
-        // dq.sql alone would transform a row-less write result.
-        const raw = await reported(dq, () =>
-          this.dialect.resultStrategy === 'reselect' && dq.reselect
-            ? dq.reselect((sql, params) => client.query(sql, params))
-            : client.query(dq.sql, dq.params),
-        );
-        results.push(dq.transform(raw));
+      for (let i = 0; i < settled.length; i++) {
+        const outcome = settled[i]!;
+        if (outcome.status === 'rejected') {
+          throw wrapPgError(outcome.reason);
+        }
+        results.push(queries[i]!.transform(outcome.value));
       }
       return results as PipelineResults<T>;
-    });
+    }
+
+    const results: unknown[] = [];
+    for (const dq of queries) {
+      // Non-RETURNING engines (resultStrategy 'reselect', e.g. MySQL) attach a
+      // reselect plan that runs the write plus a follow-up SELECT; running
+      // dq.sql alone would transform a row-less write result.
+      const raw = await reported(dq, () =>
+        this.dialect.resultStrategy === 'reselect' && dq.reselect
+          ? dq.reselect((sql, params) => client.query(sql, params))
+          : client.query(dq.sql, dq.params),
+      );
+      results.push(dq.transform(raw));
+    }
+    return results as PipelineResults<T>;
   }
 
   /**
