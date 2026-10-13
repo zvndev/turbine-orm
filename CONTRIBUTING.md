@@ -80,6 +80,9 @@ src/
     batched-loader.ts, relationLoadStrategy: 'batched'
     compound-unique.ts, Compound-unique selectors and the findUnique identity rule
     relation-names.ts, The relation-name resolution rule
+    normalize-args.ts, Args-seam undefined pruning and the inclusive-cursor flag
+    column-ref.ts    , The branded col() column reference
+    json-value.ts    , The jsonValue() wrapper for literal JSON values
     option-surface.ts, The query-arg option surface as runtime data
     warn-registry.ts , Process-wide once-only dev-warn registry
     deferred.ts      , DeferredQuery and option types
