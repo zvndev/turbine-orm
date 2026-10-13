@@ -943,7 +943,9 @@ export function wrapPowdbError(err: unknown): Error {
   // evaluate true for every row. Runs before the generic `type mismatch` regex
   // below so the column name and the fix survive into the message.
   {
-    const m = /type mismatch for column '([^']+)': expected ([^,]+), got (\w+)/i.exec(msg);
+    // Every group is bounded: `[^,]+` retried from each "expected " in a long
+    // message made this quadratic in the message length.
+    const m = /type mismatch for column '([^']{1,256})': expected ([^,]{1,64}), got (\w{1,32})/i.exec(msg);
     if (m) {
       return new ValidationError(
         `PowDB rejected a comparison on column "${m[1]}": the column is ${m[2]} but the bound value is ` +
@@ -2421,27 +2423,56 @@ async function openEmbeddedPool(
     if (err instanceof ConnectionError) throw err;
     throw new ConnectionError(`PowDB embedded could not open data dir "${dir}": ${(err as Error).message}`);
   }
-  if (syncMode !== undefined) {
-    if (typeof db.setSyncMode !== 'function') {
-      throw new ConnectionError(
-        'embedded `syncMode` requires @zvndev/powdb-embedded ≥ 0.7.1 (the installed addon has no setSyncMode).',
-      );
+  try {
+    if (syncMode !== undefined) {
+      if (typeof db.setSyncMode !== 'function') {
+        throw new ConnectionError(
+          'embedded `syncMode` requires @zvndev/powdb-embedded ≥ 0.7.1 (the installed addon has no setSyncMode).',
+        );
+      }
+      db.setSyncMode(syncMode);
     }
-    db.setSyncMode(syncMode);
+    // Native typed wire is feature-detected on the OPENED handle: an addon ≥ 0.14
+    // exposes `queryWithParams`, so nativeRaw turns on (server-gate ≥ 0.13 still
+    // applies via the version); an older addon has no such method → false.
+    const capabilities = capabilitiesFromVersion(assumeEngineVersion ?? resolveEmbeddedVersion(), {
+      hasNativeRaw: typeof db.queryWithParams === 'function',
+    });
+    // A read-only target forces the pool's readonly flag; otherwise honor whatever
+    // `poolOptions` (threaded from `options.readonly`) carried.
+    return new PowdbEmbeddedPool(db, {
+      ...poolOptions,
+      capabilities,
+      readonly: Boolean(readonly) || Boolean(poolOptions.readonly),
+    });
+  } catch (err) {
+    // The caller never receives this handle, so nothing else can close it.
+    try {
+      db.close?.();
+    } catch {
+      // The failure being reported is the useful one.
+    }
+    throw err;
   }
-  // Native typed wire is feature-detected on the OPENED handle: an addon ≥ 0.14
-  // exposes `queryWithParams`, so nativeRaw turns on (server-gate ≥ 0.13 still
-  // applies via the version); an older addon has no such method → false.
-  const capabilities = capabilitiesFromVersion(assumeEngineVersion ?? resolveEmbeddedVersion(), {
-    hasNativeRaw: typeof db.queryWithParams === 'function',
-  });
-  // A read-only target forces the pool's readonly flag; otherwise honor whatever
-  // `poolOptions` (threaded from `options.readonly`) carried.
-  return new PowdbEmbeddedPool(db, {
-    ...poolOptions,
-    capabilities,
-    readonly: Boolean(readonly) || Boolean(poolOptions.readonly),
-  });
+}
+
+/**
+ * Probe a networked pool Turbine just built and wrap it. The pool is closed
+ * when the probe or the wrapper refuses, because the caller never sees it
+ * and its idle sockets would otherwise keep the process alive.
+ */
+async function wrapOwnedClientPool(
+  clientPool: PowdbClientPool,
+  poolOptions: PowdbPoolOptions,
+  assumeEngineVersion: string | undefined,
+): Promise<PowdbPool> {
+  try {
+    const capabilities = await assertNetworkedVersion(clientPool, assumeEngineVersion);
+    return new PowdbPool(clientPool, undefined, { ...poolOptions, capabilities });
+  } catch (err) {
+    await clientPool.close().catch(() => {});
+    throw err;
+  }
 }
 
 /**
@@ -2478,9 +2509,11 @@ export async function turbinePowDB(
 
   if (typeof target === 'string') {
     const mod = options.powdbClientModule ?? (await loadPowdb());
-    const clientPool = new mod.Pool({ ...parsePowdbUrl(target), max });
-    const capabilities = await assertNetworkedVersion(clientPool, options.assumeEngineVersion);
-    pool = new PowdbPool(clientPool, undefined, { ...poolOptions, capabilities });
+    pool = await wrapOwnedClientPool(
+      new mod.Pool({ ...parsePowdbUrl(target), max }),
+      poolOptions,
+      options.assumeEngineVersion,
+    );
     owns = true;
   } else if (target instanceof PowdbPool) {
     // An injected PowdbPool carries its own PowdbPoolOptions (incl. capabilities).
@@ -2496,47 +2529,59 @@ export async function turbinePowDB(
     pool = new PowdbPool(target, undefined, { ...poolOptions, capabilities });
   } else {
     const mod = options.powdbClientModule ?? (await loadPowdb());
-    const clientPool = new mod.Pool({ ...(target as PowdbConnOptions), max });
-    const capabilities = await assertNetworkedVersion(clientPool, options.assumeEngineVersion);
-    pool = new PowdbPool(clientPool, undefined, { ...poolOptions, capabilities });
+    pool = await wrapOwnedClientPool(
+      new mod.Pool({ ...(target as PowdbConnOptions), max }),
+      poolOptions,
+      options.assumeEngineVersion,
+    );
     owns = true;
   }
 
-  // The PowQL generator is loaded here to keep client.ts free of any PowDB import.
-  const { PowqlInterface } = await import('./powql.js');
-  const queryInterfaceFactory: NonNullable<QueryInterfaceOptions['queryInterfaceFactory']> = (
-    p,
-    table,
-    sch,
-    middlewares,
-    opts,
-  ) => new PowqlInterface(p as unknown as PowdbPool, table, sch, middlewares, opts);
+  let client: TurbineClient;
+  try {
+    // The PowQL generator is loaded here to keep client.ts free of any PowDB import.
+    const { PowqlInterface } = await import('./powql.js');
+    const queryInterfaceFactory: NonNullable<QueryInterfaceOptions['queryInterfaceFactory']> = (
+      p,
+      table,
+      sch,
+      middlewares,
+      opts,
+    ) => new PowqlInterface(p as unknown as PowdbPool, table, sch, middlewares, opts);
 
-  // Forward every client-level option EXCEPT the ones this factory owns (they
-  // configure the pool / transport above, and TurbineClient warns on a config
-  // key it does not recognize). Destructured rather than hand-listed on the way
-  // IN: an allowlist is how `globalFilters` came to be accepted and ignored.
-  const {
-    connectionLimit: _connectionLimit,
-    transactionQueueTimeoutMs: _transactionQueueTimeoutMs,
-    retryStaleReads: _retryStaleReads,
-    assumeEngineVersion: _assumeEngineVersion,
-    readonly: _readonly,
-    powdbClientModule: _powdbClientModule,
-    powdbEmbeddedModule: _powdbEmbeddedModule,
-    ...clientConfig
-  } = options;
+    // Forward every client-level option EXCEPT the ones this factory owns (they
+    // configure the pool / transport above, and TurbineClient warns on a config
+    // key it does not recognize). Destructured rather than hand-listed on the way
+    // IN: an allowlist is how `globalFilters` came to be accepted and ignored.
+    const {
+      connectionLimit: _connectionLimit,
+      transactionQueueTimeoutMs: _transactionQueueTimeoutMs,
+      retryStaleReads: _retryStaleReads,
+      assumeEngineVersion: _assumeEngineVersion,
+      readonly: _readonly,
+      powdbClientModule: _powdbClientModule,
+      powdbEmbeddedModule: _powdbEmbeddedModule,
+      ...clientConfig
+    } = options;
 
-  const client = new TurbineClient(
-    {
-      ...clientConfig,
-      pool,
-      preparedStatements: false,
-      dialect: powdbDialect,
-      queryInterfaceFactory,
-    } as TurbineConfig & { queryInterfaceFactory: typeof queryInterfaceFactory },
-    schema,
-  );
+    client = new TurbineClient(
+      {
+        ...clientConfig,
+        pool,
+        preparedStatements: false,
+        dialect: powdbDialect,
+        queryInterfaceFactory,
+      } as TurbineConfig & { queryInterfaceFactory: typeof queryInterfaceFactory },
+      schema,
+    );
+  } catch (err) {
+    // A failed factory hands the caller nothing to close, so a pool or embedded
+    // handle it BUILT is closed here (the client constructor refuses a bad
+    // config, a static global filter naming no table for one). A pool the
+    // caller supplied is the caller's and stays open.
+    if (owns) await pool.end().catch(() => {});
+    throw err;
+  }
 
   if (owns) {
     // Turbine built this pool / embedded handle, so disconnect()/end() must
