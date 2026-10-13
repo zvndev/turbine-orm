@@ -640,9 +640,13 @@ describe('$connection() hands out a connection the callback cannot take away', (
     const db = clientOn(fake);
     await db.$transaction(async (tx) => {
       const conn = tx.$connection() as unknown as Record<string, unknown>;
-      assert.throws(() => (conn.end as () => void)(), /must not end its client/);
-      assert.throws(() => (conn.connect as () => void)(), /must not connect its client/);
-      assert.throws(() => (conn.release as () => void)(), /must not release its client/);
+      // Named for the API the caller used, not the raw `transaction()` API.
+      assert.throws(
+        () => (conn.end as () => void)(),
+        /\$connection\(\): the \$transaction callback must not end its client/,
+      );
+      assert.throws(() => (conn.connect as () => void)(), /\$connection\(\): .* must not connect its client/);
+      assert.throws(() => (conn.release as () => void)(), /\$connection\(\): .* must not release its client/);
       assert.equal(conn.connection, undefined);
       assert.equal('connection' in conn, false);
     });

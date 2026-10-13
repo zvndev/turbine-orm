@@ -1510,7 +1510,11 @@ function closableRawClient(
   client: PgCompatPoolClient,
   state: TransactionState,
   scope: TransactionScope = state.rootScope,
+  api: 'transaction()' | '$connection()' = 'transaction()',
 ): PgCompatPoolClient {
+  // The refusals name the API the caller used: a `tx.$connection()` caller
+  // never called `transaction()`.
+  const who = api === 'transaction()' ? 'transaction(): the callback' : '$connection(): the $transaction callback';
   const target = client as unknown as Record<PropertyKey, unknown>;
   const send = target.query as (...args: unknown[]) => unknown;
   const query = (...args: unknown[]): unknown => {
@@ -1530,13 +1534,13 @@ function closableRawClient(
   };
   const release = (): never => {
     throw new ValidationError(
-      'transaction(): the callback must not release its client; the transaction releases it after COMMIT or ROLLBACK.',
+      `${who} must not release its client; the transaction releases it after COMMIT or ROLLBACK.`,
     );
   };
   const refuse = (verb: string): (() => never) => {
     return () => {
       throw new ValidationError(
-        `transaction(): the callback must not ${verb} its client; the transaction owns the connection and ` +
+        `${who} must not ${verb} its client; the transaction owns the connection and ` +
           'returns it to the pool after COMMIT or ROLLBACK.',
       );
     };
@@ -1729,7 +1733,7 @@ export class TransactionClient {
           'connection to hand out. Use `tx.raw` / `tx.rawUnsafe`, or a TCP pool.',
       );
     }
-    this.connectionHandle = closableRawClient(raw, this.state, this.scope);
+    this.connectionHandle = closableRawClient(raw, this.state, this.scope, '$connection()');
     return this.connectionHandle;
   }
 
