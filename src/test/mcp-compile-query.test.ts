@@ -764,13 +764,13 @@ describe('mcp compile_query: the PII guard', () => {
       await h.dispose();
     }));
 
-  it('allows a hidden column in select, which returns no value here at all', async () =>
+  it('reports the library refusal for a PII column in select, since includePii cannot be passed', async () =>
     quietStderr(async () => {
       await withMetadataDir(TAGGED_METADATA(), async (metadataDir) => {
         const h = createHarness({ metadataDir });
         const result = payload(await compile(h, 'users', { select: { id: true, email: true }, limit: 1 }));
-        assert.equal(result.ok, true);
-        assert.match(result.sql as string, /"email"/);
+        assert.equal(result.ok, false);
+        assert.match(JSON.stringify(result), /names \\?"email\\?", which is tagged PII/);
         await h.dispose();
       });
     }));

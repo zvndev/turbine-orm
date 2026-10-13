@@ -38,7 +38,7 @@
  */
 
 import { spawn } from 'node:child_process';
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { platform } from 'node:os';
@@ -48,23 +48,44 @@ import type { PgCompatPool } from '../client.js';
 import { absorbCheckedOutErrors } from '../connection-guard.js';
 import type { Dialect } from '../dialect.js';
 import { ValidationError } from '../errors.js';
-import { introspect } from '../introspect.js';
+import { introspect, printableCatalogName } from '../introspect.js';
 import type { CreateArgs, DeleteArgs, FindManyArgs, UpdateArgs } from '../query/index.js';
-import { QueryInterface, quoteIdent } from '../query/index.js';
+import { QueryInterface, quoteIdent, UNSAFE } from '../query/index.js';
 // `ownLookup` and `resolveRelation` are not re-exported from the query barrel,
 // so they are imported from their defining leaf module rather than duplicated
 // here. `resolveRelation` in particular MUST be the compiler's own copy: it is
 // what decides that `blog_posts` and `blogPosts` name the same relation, and a
 // redaction walk that answered that differently would redact a different query
 // than the one that ran.
-import { escapeLike, ownLookup, registerUtcTemporalParsers, resolveRelation } from '../query/utils.js';
+import {
+  escapeLike,
+  ownLookup,
+  registerUtcTemporalParsers,
+  resolveColumnName as resolveBuilderColumn,
+  resolveRelation,
+} from '../query/utils.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
+import {
+  constantTimeEqual,
+  createLoginGate,
+  isAllowedHostHeader,
+  type LoginGate,
+  redeemLogin,
+} from './local-server-guard.js';
 import { assertNoPiiPredicates as assertNoPiiPredicatesShared } from './pii-predicate-guard.js';
 import { applyPiiTags, loadPiiTags } from './pii-tags.js';
 import { callerKey, checkRateLimit } from './rate-limit.js';
 import { createDemoContext } from './studio-demo.js';
 import { STUDIO_HTML } from './studio-ui.generated.js';
 import { redactUrl } from './ui.js';
+
+/**
+ * A name made safe to quote in a message. Catalog names (and any name echoed from
+ * a request) can carry control or bidi characters, and a message can end up in a
+ * terminal, a log or the UI's error box. Same helper `generate`, `status` and
+ * `doctor` print through.
+ */
+const shown = printableCatalogName;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -116,9 +137,13 @@ export interface StudioHandle {
    * know that rather than assume protection.
    */
   piiTags: { path: string; applied: number } | null;
-  /** Random per-process session token the UI sends via cookie. */
+  /** Random per-process session token the UI sends via cookie. Never part of `url`. */
   authToken: string;
-  /** Full URL including `?token=...`, safe to print for the user. */
+  /**
+   * Full URL including a ONE-TIME `?token=...` login ticket, safe to print for
+   * the user. The first GET that carries it is exchanged for the session cookie;
+   * the ticket is refused afterwards and is not the session credential.
+   */
   url: string;
 }
 
@@ -173,6 +198,11 @@ export interface StudioContext {
    * `--show-pii` is on.
    */
   piiScanFailed?: { path: string; reason: string; columns: number };
+  /**
+   * The one-time login ticket behind the printed URL. Absent on a hand-built
+   * context, which then gets a gate whose ticket is `authToken` on first use.
+   */
+  login?: LoginGate;
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +330,7 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
   }
 
   const authToken = randomBytes(24).toString('hex');
+  const login = createLoginGate();
   const stateDir = pathResolve(options.stateDir ?? '.turbine');
   const rateLimiter = new Map<string, { count: number; resetAt: number }>();
   const ctx: StudioContext = {
@@ -307,6 +338,7 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
     metadata,
     options,
     authToken,
+    login,
     stateDir,
     statementTimeout,
     rateLimiter,
@@ -336,7 +368,7 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
     });
   });
 
-  const url = buildStudioUrl(options.host, options.port, authToken);
+  const url = buildStudioUrl(options.host, options.port, login.token);
 
   if (options.openBrowser) {
     openUrl(url);
@@ -373,6 +405,13 @@ function originFor(host: string, port: number): string {
 
 export async function handleRequest(req: IncomingMessage, res: ServerResponse, ctx: StudioContext): Promise<void> {
   const expectedOrigin = originFor(ctx.options.host, ctx.options.port);
+  // DNS rebinding: a page on another domain that re-resolves to this loopback
+  // port still sends ITS hostname in `Host`. Checked first, before any route or
+  // token logic, so nothing about this server is observable to such a page.
+  if (!isAllowedHostHeader(req.headers.host, ctx.options.host, ctx.options.port)) {
+    sendJson(res, 403, { error: 'host not allowed: open Studio at the address printed in the terminal' });
+    return;
+  }
   // CORS: not needed, same-origin only. Explicitly refuse cross-origin.
   const origin = req.headers.origin;
   if (origin && origin !== expectedOrigin) {
@@ -383,23 +422,40 @@ export async function handleRequest(req: IncomingMessage, res: ServerResponse, c
   const url = new URL(req.url ?? '/', expectedOrigin);
   const pathname = url.pathname;
 
-  // The index route serves the HTML shell and embeds the auth token.
-  // All other routes require the token in the `x-turbine-token` header
-  // or the `token` cookie.
+  // The index route serves the HTML shell. Every other route requires the
+  // session token in the `x-turbine-token` header or the `turbine_studio_token`
+  // cookie. The printed URL's `?token=` is a ONE-TIME login ticket, not that
+  // token: the first GET carrying it is exchanged for the cookie, and the ticket
+  // is dead afterwards, so a copy left in browser history, `ps` output or a log
+  // opens nothing.
   if (pathname === '/' || pathname === '/index.html') {
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       sendText(res, 405, 'Method Not Allowed');
       return;
     }
     const queryToken = url.searchParams.get('token');
-    // If the URL includes a token, validate then set a cookie and redirect.
-    if (queryToken && constantTimeEqual(queryToken, ctx.authToken)) {
-      res.writeHead(302, {
-        Location: '/',
-        'Set-Cookie': `turbine_studio_token=${ctx.authToken}; Path=/; HttpOnly; SameSite=Strict`,
-      });
-      res.end();
-      return;
+    if (queryToken) {
+      ctx.login ??= createLoginGate(ctx.authToken);
+      // HEAD must not spend the ticket: only the navigation that sets the cookie may.
+      const outcome = req.method === 'GET' ? redeemLogin(ctx.login, queryToken) : 'invalid';
+      if (outcome === 'granted') {
+        res.writeHead(302, {
+          Location: '/',
+          'Set-Cookie': `turbine_studio_token=${ctx.authToken}; Path=/; HttpOnly; SameSite=Strict`,
+        });
+        res.end();
+        return;
+      }
+      if (outcome === 'used') {
+        if (isAuthorized(req, ctx.authToken)) {
+          // Already signed in (a reload of the printed URL): drop the ticket from the address bar.
+          res.writeHead(302, { Location: '/' });
+          res.end();
+        } else {
+          sendText(res, 403, 'This login link was already used. Restart Studio to get a new one.');
+        }
+        return;
+      }
     }
     sendHtml(res, 200, STUDIO_HTML, cspNonce());
     return;
@@ -434,6 +490,29 @@ export async function handleRequest(req: IncomingMessage, res: ServerResponse, c
     return;
   }
 
+  try {
+    await routeAuthorized(req, res, ctx, url, origin, expectedOrigin);
+  } catch (err) {
+    // A bad request body is the caller's mistake and gets its own status; every
+    // other failure is still the dispatcher's 500.
+    if (err instanceof RequestError) {
+      sendJson(res, err.status, { error: err.message });
+      return;
+    }
+    throw err;
+  }
+}
+
+/** The routes behind the auth gate. */
+async function routeAuthorized(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: StudioContext,
+  url: URL,
+  origin: string | undefined,
+  expectedOrigin: string,
+): Promise<void> {
+  const pathname = url.pathname;
   if (pathname === '/api/schema' && req.method === 'GET') {
     return apiSchema(res, ctx);
   }
@@ -533,26 +612,17 @@ function isAuthorized(req: IncomingMessage, expectedToken: string): boolean {
   return false;
 }
 
-function constantTimeEqual(a: string, b: string): boolean {
-  // Hash both inputs to fixed-length 32-byte SHA-256 digests before comparing.
-  // This makes the comparison constant-length (timingSafeEqual never throws on a
-  // length mismatch) and leaks neither length nor content via timing.
-  const ah = createHash('sha256').update(a).digest();
-  const bh = createHash('sha256').update(b).digest();
-  return timingSafeEqual(ah, bh);
-}
-
 /**
  * Build a helpful "unknown table" error that lists the available tables so the
  * caller can spot a typo or schema mismatch immediately.
  */
 function unknownTableMessage(name: string, ctx: StudioContext): string {
-  const available = Object.keys(ctx.metadata.tables);
+  const available = Object.keys(ctx.metadata.tables).map(shown);
   const list = available.length ? available.join(', ') : '(none)';
   // turbine-prefix-ok: every caller passes this straight to sendJson as an HTTP
   // body, never to a TurbineError, so nothing prepends a `[TURBINE_EXXX]` tag
   // and the prefix is the browser's only signal of who produced the message.
-  return `[turbine] Unknown table "${name}" in schema "${ctx.options.schema}". Available: ${list}`;
+  return `[turbine] Unknown table "${shown(name)}" in schema "${shown(ctx.options.schema)}". Available: ${list}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -990,14 +1060,16 @@ function parseTableFilters(raw: string | null, table: TableMetadata, redactedPii
     const f = item as Record<string, unknown>;
     const col = typeof f.column === 'string' ? resolveColumnName(table, f.column) : null;
     if (!col) {
-      throw new Error(`unknown filter column "${String(f.column)}" on table "${table.name}"`);
+      throw new Error(`unknown filter column "${shown(String(f.column))}" on table "${shown(table.name)}"`);
     }
     if (redactedPii.has(col)) {
-      throw new Error(`column "${col}" is PII-redacted; filtering on it is disabled (run with --show-pii to enable)`);
+      throw new Error(
+        `column "${shown(col)}" is PII-redacted; filtering on it is disabled (run with --show-pii to enable)`,
+      );
     }
     const op = typeof f.op === 'string' ? f.op : '';
     if (!FILTER_OP_NAMES.has(op)) {
-      throw new Error(`unknown filter op "${op}" (expected one of: ${[...FILTER_OP_NAMES].join(', ')})`);
+      throw new Error(`unknown filter op "${shown(String(op))}" (expected one of: ${[...FILTER_OP_NAMES].join(', ')})`);
     }
     if (op === 'isNull' || op === 'notNull') {
       out.push({ column: col, op });
@@ -1006,12 +1078,14 @@ function parseTableFilters(raw: string | null, table: TableMetadata, redactedPii
     const value = f.value;
     const t = typeof value;
     if (value === null || value === undefined || (t !== 'string' && t !== 'number' && t !== 'boolean')) {
-      throw new Error(`filter on "${col}" needs a scalar value (use isNull/notNull for null checks)`);
+      throw new Error(`filter on "${shown(col)}" needs a scalar value (use isNull/notNull for null checks)`);
     }
     if (op === 'contains') {
       const colMeta = table.columns.find((c) => c.name === col);
       if (!colMeta || !isTextishType(colMeta.pgType)) {
-        throw new Error(`contains only applies to text columns ("${col}" is ${colMeta?.pgType ?? 'unknown'})`);
+        throw new Error(
+          `contains only applies to text columns ("${shown(col)}" is ${shown(colMeta?.pgType ?? 'unknown')})`,
+        );
       }
     }
     out.push({ column: col, op, value });
@@ -1060,7 +1134,7 @@ function assertNoPiiPredicates(
     hiddenReason: (table, column) => (isRedactedColumn(table, column, showPii) ? 'is PII-tagged and redacted' : null),
     refuseColumn: (table, column, reason) => {
       throw new ValidationError(
-        `Column "${column}" on "${table.name}" ${reason}, so it cannot be used ` +
+        `Column "${shown(column)}" on "${shown(table.name)}" ${reason}, so it cannot be used ` +
           `in a where, orderBy, cursor, or distinct: filtering, sorting, paging, or de-duplicating on a hidden ` +
           `value reveals it. Restart Studio with --show-pii to query it.`,
       );
@@ -1074,12 +1148,66 @@ function assertNoPiiPredicates(
     },
     refuseShape: (table, key) => {
       throw new ValidationError(
-        `Studio does not recognize "${key}" in a query on "${table.name}", so it cannot prove the ` +
+        `Studio does not recognize "${shown(key)}" in a query on "${shown(table.name)}", so it cannot prove the ` +
           `query does not filter or sort on a PII-tagged and redacted column, and refuses it rather than ` +
           `guessing. Remove it, or restart Studio with --show-pii.`,
       );
     },
   });
+}
+
+/** Most rows one Query-tab request returns, however large its `limit` or however absent. */
+export const MAX_BUILDER_ROWS = 1000;
+
+/**
+ * The args with `limit` / `take` held to {@link MAX_BUILDER_ROWS}, and a `limit`
+ * supplied when neither was. The Query tab renders every row it is sent, so an
+ * unlimited `findMany` on a large table would load the whole table into this
+ * process and then into the browser.
+ */
+function capBuilderRows(args: Record<string, unknown>): { args: Record<string, unknown>; effectiveLimit: number } {
+  const next: Record<string, unknown> = { ...args };
+  for (const key of ['limit', 'take'] as const) {
+    const value = next[key];
+    if (typeof value === 'number' && value > MAX_BUILDER_ROWS) next[key] = MAX_BUILDER_ROWS;
+  }
+  if (next.limit === undefined && next.take === undefined) next.limit = MAX_BUILDER_ROWS;
+  const asked = typeof next.limit === 'number' ? next.limit : typeof next.take === 'number' ? next.take : undefined;
+  return { args: next, effectiveLimit: asked ?? MAX_BUILDER_ROWS };
+}
+
+/**
+ * Does a `select` anywhere in these args name a PII-tagged column? Walks the
+ * top-level `select` and every `with` level against its own target table.
+ *
+ * Why it exists: core refuses a PII column named in `select` unless the call
+ * passes `includePii: UNSAFE`, because `select` is ordinary request data. Studio
+ * is the one caller that may say yes to it, since every row it serves is
+ * redacted server-side before it leaves (see {@link redactBuilderRows}), so the
+ * flag is passed exactly when the query asks for such a column.
+ *
+ * It errs toward NOT finding one: past the depth cap, or on a shape it does not
+ * recognize, it answers false and core's own refusal reaches the user, which is
+ * a failed query and never a leaked column.
+ */
+function selectNamesPii(args: unknown, table: TableMetadata, metadata: SchemaMetadata, depth = 0): boolean {
+  if (depth > 10 || args === null || typeof args !== 'object') return false;
+  const { select, with: withClause } = args as { select?: unknown; with?: unknown };
+  if (select && typeof select === 'object' && !Array.isArray(select)) {
+    for (const [key, wanted] of Object.entries(select as Record<string, unknown>)) {
+      if (!wanted) continue;
+      const column = resolveBuilderColumn(table, key);
+      if (column !== undefined && table.columns.some((c) => c.name === column && c.pii === true)) return true;
+    }
+  }
+  if (withClause && typeof withClause === 'object' && !Array.isArray(withClause)) {
+    for (const [relKey, spec] of Object.entries(withClause as Record<string, unknown>)) {
+      const resolved = resolveRelation(table.relations, relKey);
+      const target = resolved ? ownLookup(metadata.tables, resolved.def.to) : undefined;
+      if (target && selectNamesPii(spec, target, metadata, depth + 1)) return true;
+    }
+  }
+  return false;
 }
 
 export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx: StudioContext): Promise<void> {
@@ -1089,6 +1217,10 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
 
   if (!tableName || !ownLookup(ctx.metadata.tables, tableName)) {
     sendJson(res, 400, { error: unknownTableMessage(tableName, ctx) });
+    return;
+  }
+  if (args === null || typeof args !== 'object' || Array.isArray(args)) {
+    sendJson(res, 400, { error: '`args` must be an object of findMany options' });
     return;
   }
 
@@ -1119,13 +1251,14 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
   if (target && !ctx.showPii && args.select === undefined && target.columns.every((c) => c.pii === true)) {
     sendJson(res, 400, {
       error:
-        `Every column of "${tableName}" is PII-tagged, so the default projection is empty. Name the columns you ` +
+        `Every column of "${shown(tableName)}" is PII-tagged, so the default projection is empty. Name the columns you ` +
         'want in `select`, or run Studio with --show-pii.',
     });
     return;
   }
 
   let deferred: ReturnType<QueryInterface<Record<string, unknown>>['buildFindMany']>;
+  let effectiveLimit = MAX_BUILDER_ROWS;
   try {
     const qi = new QueryInterface<Record<string, unknown>>(
       ctx.pool as unknown as pg.Pool,
@@ -1142,7 +1275,12 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
       },
     );
     assertNoPiiPredicates(args as Record<string, unknown>, tableName, ctx.metadata, ctx.showPii === true);
-    deferred = qi.buildFindMany(args);
+    const capped = capBuilderRows(args as Record<string, unknown>);
+    effectiveLimit = capped.effectiveLimit;
+    // The flag is the request's own `includePii` untouched unless the query names a PII
+    // column in a `select`, in which case Studio (which redacts every row) grants it.
+    const grant = target && selectNamesPii(args, target, ctx.metadata) ? { includePii: UNSAFE } : {};
+    deferred = qi.buildFindMany({ ...capped.args, ...grant } as FindManyArgs<Record<string, unknown>>);
   } catch (err) {
     sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
     return;
@@ -1201,6 +1339,9 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
       rows: redactedRows.map((r) => serializeRow(r)),
       rowCount: result.rowCount ?? result.rows.length,
       elapsedMs,
+      // True when the row cap, not the query, may be what ended the list.
+      truncated: effectiveLimit >= MAX_BUILDER_ROWS && redactedRows.length >= MAX_BUILDER_ROWS,
+      rowLimit: MAX_BUILDER_ROWS,
     });
   } catch (err) {
     if (!ctx.demo) {
@@ -1251,7 +1392,7 @@ export async function apiRowWrite(
     return;
   }
   if (table.isView) {
-    sendJson(res, 400, { error: `[turbine] "${tableName}" is a view; Studio cannot write to it.` });
+    sendJson(res, 400, { error: `[turbine] "${shown(tableName)}" is a view; Studio cannot write to it.` });
     return;
   }
 
@@ -1293,7 +1434,9 @@ export async function apiRowWrite(
       const rec = rowData as Record<string, unknown>;
       const badKey = firstUnknownColumn(table, rec);
       if (badKey) {
-        sendJson(res, 400, { error: `[turbine] unknown column "${badKey}" on table "${tableName}"${rowLabel}` });
+        sendJson(res, 400, {
+          error: `[turbine] unknown column "${shown(badKey)}" on table "${shown(tableName)}"${rowLabel}`,
+        });
         return;
       }
       if (!Object.keys(rec).some((k) => rec[k] !== undefined)) {
@@ -1307,7 +1450,7 @@ export async function apiRowWrite(
   if (op === 'update' || op === 'delete') {
     if (table.primaryKey.length === 0) {
       sendJson(res, 400, {
-        error: `[turbine] "${tableName}" has no primary key; single-row writes require one.`,
+        error: `[turbine] "${shown(tableName)}" has no primary key; single-row writes require one.`,
       });
       return;
     }
@@ -1336,7 +1479,7 @@ export async function apiRowWrite(
   if (op === 'update') {
     const badKey = firstUnknownColumn(table, data);
     if (badKey) {
-      sendJson(res, 400, { error: `[turbine] unknown column "${badKey}" on table "${tableName}"` });
+      sendJson(res, 400, { error: `[turbine] unknown column "${shown(badKey)}" on table "${shown(tableName)}"` });
       return;
     }
     if (!Object.keys(data).some((k) => data[k] !== undefined)) {
@@ -1466,11 +1609,11 @@ function extractPkWhere(
   const pkWhere: Record<string, unknown> = {};
   for (const pkCol of table.primaryKey) {
     if (!resolved.has(pkCol)) {
-      return { error: `\`where\` must fully cover the primary key (missing "${pkCol}")` };
+      return { error: `\`where\` must fully cover the primary key (missing "${shown(pkCol)}")` };
     }
     const v = resolved.get(pkCol);
     if (v === undefined || v === null || typeof v === 'object') {
-      return { error: `primary key "${pkCol}" must be a scalar value in \`where\`` };
+      return { error: `primary key "${shown(pkCol)}" must be a scalar value in \`where\`` };
     }
     const field = table.reverseColumnMap[pkCol] ?? pkCol;
     pkWhere[field] = v;
@@ -1553,6 +1696,9 @@ export function apiListSavedQueries(res: ServerResponse, ctx: StudioContext, par
   sendJson(res, 200, { queries: filtered });
 }
 
+/** Most saved queries Studio will keep; each is bounded by the 1 MB body limit. */
+const MAX_SAVED_QUERIES = 500;
+
 export async function apiCreateSavedQuery(
   req: IncomingMessage,
   res: ServerResponse,
@@ -1577,6 +1723,12 @@ export async function apiCreateSavedQuery(
   }
 
   const data = loadSavedQueries(ctx);
+  if (data.queries.length >= MAX_SAVED_QUERIES) {
+    sendJson(res, 400, {
+      error: `Studio keeps at most ${MAX_SAVED_QUERIES} saved queries. Delete one before saving another.`,
+    });
+    return;
+  }
   const entry: SavedQuery = {
     id: randomUUID(),
     table,
@@ -1801,23 +1953,73 @@ function serializeRow(row: Record<string, unknown>): Record<string, unknown> {
   return out;
 }
 
+/** A request the caller got wrong, carrying the HTTP status it deserves. */
+class RequestError extends Error {
+  constructor(
+    readonly status: 400 | 413,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'RequestError';
+  }
+}
+
+/** Largest JSON request body Studio will read. */
+const MAX_BODY_BYTES = 1 << 20;
+
+/**
+ * How much of an oversized body Studio will read and throw away before it gives
+ * up and drops the connection. A client that is still sending when the server
+ * answers and closes gets a TCP reset instead of the response, so the 413 would
+ * be lost; discarding the rest first lets it arrive. Bounded so a body of
+ * unbounded length cannot hold the connection open.
+ */
+const MAX_DISCARD_BYTES = 16 * 1024 * 1024;
+
+/**
+ * Read a JSON request body, refusing one over {@link MAX_BODY_BYTES} (413) or
+ * malformed (400). Nothing past the limit is ever buffered: an oversized body,
+ * whether declared by `Content-Length` or discovered while streaming, is counted
+ * and discarded chunk by chunk, then answered with 413.
+ */
 async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+  const declared = Number(req.headers?.['content-length']);
+  let tooBig = Number.isFinite(declared) && declared > MAX_BODY_BYTES;
   const chunks: Buffer[] = [];
   let total = 0;
-  const MAX = 1 << 20; // 1 MB cap on query payloads
-  for await (const chunk of req) {
-    const buf = chunk as Buffer;
+  // destroyOnReturn: false, because destroying a half-read request tears down
+  // its socket and the response with it.
+  const source: AsyncIterable<unknown> =
+    typeof req.iterator === 'function' ? req.iterator({ destroyOnReturn: false }) : req;
+  const iterator = source[Symbol.asyncIterator]();
+  for (;;) {
+    const next = await iterator.next();
+    if (next.done) break;
+    const buf = next.value as Buffer;
     total += buf.length;
-    if (total > MAX) throw new Error('request body too large');
-    chunks.push(buf);
+    if (!tooBig && total > MAX_BODY_BYTES) {
+      tooBig = true;
+      chunks.length = 0;
+    }
+    if (!tooBig) chunks.push(buf);
+    else if (total > MAX_DISCARD_BYTES) {
+      req.destroy?.();
+      break;
+    }
   }
+  if (tooBig) throw new RequestError(413, `request body too large (limit ${MAX_BODY_BYTES} bytes)`);
   const raw = Buffer.concat(chunks).toString('utf8');
   if (!raw) return {};
+  let parsed: unknown;
   try {
-    return JSON.parse(raw) as Record<string, unknown>;
+    parsed = JSON.parse(raw);
   } catch {
-    throw new Error('invalid json body');
+    throw new RequestError(400, 'invalid json body');
   }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new RequestError(400, 'request body must be a JSON object');
+  }
+  return parsed as Record<string, unknown>;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {

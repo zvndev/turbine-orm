@@ -324,11 +324,15 @@ describe('mcp explain_query: planner estimates are not an extraction oracle', ()
     });
   });
 
-  it('allows naming a PII column in select, which returns no values', async () => {
+  it('refuses naming a PII column in select, with the library own error', async () => {
+    // The library will not return a PII column for a bare `select`, and
+    // `includePii: UNSAFE` cannot arrive over JSON-RPC, so this tool reports
+    // exactly what the application's own query would do.
     await withMetadataDir(TAGGED_METADATA(), async (metadataDir) => {
       const h = createHarness({ metadataDir });
-      const result = payload(await h.call('explain_query', { table: 'users', select: { email: true } }));
-      assert.ok(result.plan);
+      const reply = await h.call('explain_query', { table: 'users', select: { email: true } });
+      assert.equal(reply.result, undefined);
+      assert.match(String(reply.error?.message), /names "email", which is tagged PII/);
       await h.dispose();
     });
   });

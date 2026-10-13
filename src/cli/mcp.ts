@@ -6,7 +6,13 @@ import pg from 'pg';
 import { absorbCheckedOutErrors } from '../connection-guard.js';
 import { findMissingRelationIndexes } from '../index-advisor.js';
 import { formatBytes, type TableStats } from '../index-stats.js';
-import { deriveCatalogRelations, type ForeignKeyEntry, indexKeyColumn, parseIndexKeyEntries } from '../introspect.js';
+import {
+  deriveCatalogRelations,
+  type ForeignKeyEntry,
+  indexKeyColumn,
+  parseIndexKeyEntries,
+  printableCatalogName,
+} from '../introspect.js';
 import type { PgCompatPool, PgCompatPoolClient } from '../pg-types.js';
 import type { FindManyArgs } from '../query/index.js';
 import { QueryInterface, quoteIdent } from '../query/index.js';
@@ -69,6 +75,13 @@ function readOwnVersion(): string {
 const PROTOCOL_VERSION = '2025-06-18';
 const STATEMENT_TIMEOUT = '30s';
 const TRACKING_TABLE = '_turbine_migrations';
+
+/**
+ * A name made safe to quote in a message. Catalog names can carry control or
+ * bidi characters, and an error message or stderr line can reach a terminal or
+ * a log. Same helper `generate`, `status` and `doctor` print through.
+ */
+const shown = printableCatalogName;
 
 export interface McpServerOptions {
   url: string;
@@ -164,36 +177,93 @@ const REDACTED = '•• redacted ••';
 /**
  * Column names that look like they hold a credential.
  *
- * Anchored to IDENTIFIER SEGMENT boundaries (start, end, or an underscore), not
- * a bare substring. Unanchored, `secret` matched `secretary_id` and `token`
- * matched a perfectly ordinary `token_count`, so the guard refused legitimate
- * queries: a false refusal is not free here, it degrades the tool and trains
- * people to route around it.
+ * A name is split into WORDS (see {@link secretNameWords}) and tested by word
+ * membership, never by substring. Unanchored, `secret` matched `secretary_id`
+ * and `token` matched a perfectly ordinary `token_count`, so the guard refused
+ * legitimate queries: a false refusal is not free here, it degrades the tool
+ * and trains people to route around it. Word splitting reads snake_case,
+ * kebab-case, camelCase, PascalCase and SCREAMING_CASE the same way, which the
+ * earlier underscore-anchored pattern did not: on a camelCase database (the
+ * default naming of a Prisma-created one) it caught `apiKey` only by accident
+ * of the whole name being a listed word and returned `refreshToken`,
+ * `passwordHash` and `clientSecret` verbatim.
  *
  * Deliberately still conservative in the other direction. A column whose name
- * genuinely carries a segment like `token` or `secret` is refused even when it
+ * genuinely carries a word like `token` or `secret` is refused even when it
  * holds nothing sensitive, because this gate decides whether raw bytes, or a
  * row-count oracle over them, reach an LLM context. Renaming the column is a
  * cheaper fix than the disclosure it prevents.
  */
-const SECRET_WORDS = [
+const SECRET_WORDS = new Set([
   'passwd',
   'password',
+  'passphrase',
+  'passcode',
   'secret',
   'token',
   'apikey',
-  'api_key',
   'privatekey',
-  'private_key',
+  'accesskey',
   'credential',
-  'credentials',
   'sessionid',
-  'session_id',
   'otp',
   'mfa',
   'totp',
-];
-const SECRET_NAME_PATTERN = new RegExp(`(^|_)(${SECRET_WORDS.join('|')})(_|$)`, 'i');
+  'jwt',
+  'salt',
+]);
+
+/** Word pairs that are secret only together (`api` + `key`), as one joined string. */
+const SECRET_WORD_PAIRS = new Set(['apikey', 'privatekey', 'accesskey', 'sessionid']);
+
+/**
+ * Suffixes and prefixes for a name that arrives as ONE lowercase word
+ * (`refreshtoken`, `passwordhash`), where there is no boundary left to split
+ * on. Suffix-only for the short, common words so `secretary` and `tokenizer`
+ * stay unflagged; the prefix list is limited to words nothing else starts with.
+ */
+const SECRET_SUFFIXES = ['token', 'secret', 'password', 'passwd', 'passphrase', 'apikey', 'privatekey', 'sessionid'];
+const SECRET_PREFIXES = ['password', 'passwd', 'passphrase', 'apikey', 'privatekey', 'accesskey'];
+
+/**
+ * Split an identifier into lowercase words on separators, case changes
+ * (`refreshToken`), acronym edges (`APIKey` -> `api`, `key`) and letter/digit
+ * edges (`token2`).
+ */
+export function secretNameWords(name: string): string[] {
+  return name
+    .replace(/([a-z\d])([A-Z])/g, '$1 $2')
+    .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
+    .replace(/([A-Za-z])(\d)/g, '$1 $2')
+    .replace(/(\d)([A-Za-z])/g, '$1 $2')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((word) => word !== '');
+}
+
+function isSecretWord(word: string): boolean {
+  if (SECRET_WORDS.has(word)) return true;
+  // Plural (`tokens`, `api_keys` via the pair join, `credentials`).
+  return word.length > 3 && word.endsWith('s') && SECRET_WORDS.has(word.slice(0, -1));
+}
+
+/** True when `name` looks like it holds a credential. See {@link SECRET_WORDS}. */
+export function looksLikeSecretName(name: string): boolean {
+  const words = secretNameWords(name);
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i]!;
+    if (isSecretWord(word)) return true;
+    const next = words[i + 1];
+    if (next !== undefined && SECRET_WORD_PAIRS.has(`${word}${next.replace(/s$/, '')}`)) return true;
+    // One unsplittable lowercase word: only worth a second look when it is long
+    // enough to be a compound, and only against the safe suffix/prefix lists.
+    if (word.length > 5 && /^[a-z]+$/.test(word)) {
+      if (SECRET_SUFFIXES.some((suffix) => word.length > suffix.length && word.endsWith(suffix))) return true;
+      if (SECRET_PREFIXES.some((prefix) => word.length > prefix.length && word.startsWith(prefix))) return true;
+    }
+  }
+  return false;
+}
 
 /**
  * What the PII tag load produced, carried alongside the introspected metadata.
@@ -265,7 +335,7 @@ const TOOLS: ToolDefinition[] = [
   {
     name: 'explain_query',
     description:
-      'Run EXPLAIN (FORMAT JSON) for a schema-validated findMany query. Pass table + optional where/orderBy/limit/select, free-form SQL is rejected. A where or orderBy on a PII-tagged or secret-named column is refused: the planner row estimate would leak the value. Naming such a column in select is allowed, since EXPLAIN returns no rows.',
+      'Run EXPLAIN (FORMAT JSON) for a schema-validated findMany query. Pass table + optional where/orderBy/limit/select, free-form SQL is rejected. A where or orderBy on a PII-tagged or secret-named column is refused: the planner row estimate would leak the value. Naming a PII-tagged column in select is refused, as it is in the library without includePii: UNSAFE, which this server cannot pass.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -966,7 +1036,7 @@ async function explainQuery(ctx: McpContext, args: JsonObject): Promise<unknown>
 
 /**
  * Refuse an `explain_query` that filters or sorts on a hidden column: one that
- * is PII-tagged, or one whose NAME matches {@link SECRET_NAME_PATTERN}.
+ * is PII-tagged, or one whose NAME matches {@link looksLikeSecretName}.
  *
  * The name half is not a second-best approximation of the tag half, it is the
  * same rule `sample_rows` applies, applied to the other value-bearing path.
@@ -992,8 +1062,10 @@ async function explainQuery(ctx: McpContext, args: JsonObject): Promise<unknown>
  * What stays here is the part that is genuinely the MCP server's: the two
  * reasons a column is hidden, and a JSON-RPC refusal.
  *
- * `select` is NOT refused: explain returns no rows, and naming a column reveals
- * nothing about its contents.
+ * `select` is not judged HERE: explain returns no rows, and naming a column reveals
+ * nothing about its contents. The library itself refuses a PII-tagged column in
+ * `select` without `includePii: UNSAFE`, which no JSON-RPC caller can supply, so
+ * the builder's own E003 reaches the caller as an invalid-params error.
  *
  * FAILS CLOSED when the tag scan failed: with no trustworthy tag list, no
  * column can be shown to be safe, so every where/orderBy is refused rather than
@@ -1015,7 +1087,7 @@ async function explainQuery(ctx: McpContext, args: JsonObject): Promise<unknown>
  */
 function hiddenColumnReason(owner: TableMetadata, column: string): string | null {
   if (owner.columns.some((col) => col.name === column && col.pii === true)) return 'is PII-tagged';
-  if (SECRET_NAME_PATTERN.test(column)) return 'has a secret-looking name';
+  if (looksLikeSecretName(column)) return 'has a secret-looking name';
   return null;
 }
 
@@ -1041,7 +1113,7 @@ function assertNoPiiPredicates(
     refuseColumn: (owner, column, why) => {
       throw jsonRpcError(
         -32602,
-        `Column "${column}" on "${owner.name}" ${why}, so it cannot be used in a where or orderBy here: ` +
+        `Column "${shown(column)}" on "${shown(owner.name)}" ${why}, so it cannot be used in a where or orderBy here: ` +
           `EXPLAIN reports the planner's row estimate, and the estimate for a predicate on a hidden value ` +
           `reveals that value one character at a time. Filter on a visible column instead.`,
       );
@@ -1056,7 +1128,7 @@ function assertNoPiiPredicates(
     refuseShape: (owner, key) => {
       throw jsonRpcError(
         -32602,
-        `The PII guard does not recognize "${key}" in a query on "${owner.name}", so it cannot prove the ` +
+        `The PII guard does not recognize "${shown(key)}" in a query on "${shown(owner.name)}", so it cannot prove the ` +
           `query does not filter or sort on a hidden column, and refuses it rather than guessing. ` +
           `Remove it and explain the query without it.`,
       );
@@ -1206,7 +1278,7 @@ function assertCompileHidesNothing(
     refuseColumn: (owner, column, why) => {
       throw jsonRpcError(
         -32602,
-        `Column "${column}" on "${owner.name}" ${why}, so compile_query will not build a statement that filters, ` +
+        `Column "${shown(column)}" on "${shown(owner.name)}" ${why}, so compile_query will not build a statement that filters, ` +
           `sorts, pages or groups on it. This server does not author queries that interrogate a hidden value, ` +
           `wherever that statement would eventually run. Use a visible column.`,
       );
@@ -1221,7 +1293,7 @@ function assertCompileHidesNothing(
     refuseShape: (owner, key) => {
       throw jsonRpcError(
         -32602,
-        `The PII guard does not recognize "${key}" in a query on "${owner.name}", so it cannot prove the query ` +
+        `The PII guard does not recognize "${shown(key)}" in a query on "${shown(owner.name)}", so it cannot prove the query ` +
           `does not name a hidden column, and refuses it rather than guessing. Remove it and compile without it.`,
       );
     },
@@ -1243,7 +1315,7 @@ function assertCompileHidesNothing(
     if (!why) continue;
     throw jsonRpcError(
       -32602,
-      `Column "${column}" on "${table.name}" ${why}, so it cannot be used as a group key, an aggregate target, a ` +
+      `Column "${shown(column)}" on "${shown(table.name)}" ${why}, so it cannot be used as a group key, an aggregate target, a ` +
         `HAVING term or an ordering in compile_query. _count over the table is unaffected; group and aggregate on ` +
         `a visible column instead.`,
     );
@@ -1311,7 +1383,7 @@ function classifyHiddenColumns(
       ? 'tags-unreadable'
       : col.pii === true
         ? 'pii'
-        : SECRET_NAME_PATTERN.test(col.name)
+        : looksLikeSecretName(col.name)
           ? 'secret-name'
           : null;
     if (reason) {
@@ -1730,7 +1802,7 @@ async function findJoinPath(ctx: McpContext, args: JsonObject): Promise<unknown>
         paths,
         pathsTruncated: false,
         notes: [
-          `"${fromTable.name}" is both ends of this query, so no join is needed to read its own columns.`,
+          `"${shown(fromTable.name)}" is both ends of this query, so no join is needed to read its own columns.`,
           paths.length > 0
             ? 'The paths below are its SELF-relations: a relation whose target is the same table, which is the only way to join it to itself.'
             : 'It declares no self-relation, so there is nothing to join it to itself through.',
@@ -1759,12 +1831,12 @@ async function findJoinPath(ctx: McpContext, args: JsonObject): Promise<unknown>
         pathsTruncated: false,
         searchExhausted: exhausted,
         reason: exhausted
-          ? `The search for a chain from "${fromTable.name}" to "${toTable.name}" hit this tool's node budget before ` +
+          ? `The search for a chain from "${shown(fromTable.name)}" to "${shown(toTable.name)}" hit this tool's node budget before ` +
             `it finished, so this is NOT an answer that they are unconnected. Lower maxDepth (it is ${maxDepth}) to ` +
-            `bound the search, or call relation_graph on "${fromTable.name}" and walk it a hop at a time.`
-          : `No relation chain connects "${fromTable.name}" to "${toTable.name}" within ${maxDepth} hop(s). Either the ` +
+            `bound the search, or call relation_graph on "${shown(fromTable.name)}" and walk it a hop at a time.`
+          : `No relation chain connects "${shown(fromTable.name)}" to "${shown(toTable.name)}" within ${maxDepth} hop(s). Either the ` +
             `schema declares no foreign key path between them, or the path is longer than the search depth. Raise ` +
-            `maxDepth, or call relation_graph on "${fromTable.name}" to see what it does reach.`,
+            `maxDepth, or call relation_graph on "${shown(fromTable.name)}" to see what it does reach.`,
         notes: exhausted
           ? ['The search did not complete. Do not report these tables as unconnected on the strength of this reply.']
           : [
@@ -2383,8 +2455,8 @@ function estimatedRowCount(stats: TableStats | undefined): number {
 function requireTable(metadata: SchemaMetadata, tableName: string): TableMetadata {
   const table = ownLookup(metadata.tables, tableName);
   if (!table) {
-    const available = Object.keys(metadata.tables).join(', ') || '(none)';
-    throw jsonRpcError(-32602, `Unknown table "${tableName}". Available: ${available}`);
+    const available = Object.keys(metadata.tables).map(shown).join(', ') || '(none)';
+    throw jsonRpcError(-32602, `Unknown table "${shown(tableName)}". Available: ${available}`);
   }
   return table;
 }

@@ -5037,7 +5037,8 @@
           return;
         }
         header.textContent =
-          'Results · ' + formatNumber(r.rowCount) + (r.rowCount === 1 ? ' row · ' : ' rows · ') + r.elapsedMs + 'ms';
+          'Results · ' + formatNumber(r.rowCount) + (r.rowCount === 1 ? ' row · ' : ' rows · ') + r.elapsedMs + 'ms' +
+          (r.truncated ? ' · capped at ' + formatNumber(r.rowLimit) + ' rows, narrow it with a where' : '');
         host.innerHTML = '';
         if (!r.rows || !r.rows.length) {
           host.appendChild(el('div', { class: 'empty', text: 'No rows.' }));

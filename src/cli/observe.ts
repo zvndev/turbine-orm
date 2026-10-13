@@ -6,11 +6,19 @@
  * random token, HttpOnly cookie, CSP headers, read-only transactions.
  */
 
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import pg from 'pg';
 import { absorbCheckedOutErrors } from '../connection-guard.js';
 import type { PgCompatPool } from '../pg-types.js';
+import {
+  constantTimeEqual,
+  createLoginGate,
+  isAllowedHostHeader,
+  type LoginGate,
+  redeemLogin,
+} from './local-server-guard.js';
 import { OBSERVE_HTML } from './observe-ui.js';
 import { callerKey, checkRateLimit } from './rate-limit.js';
 import { redactUrl } from './ui.js';
@@ -28,7 +36,9 @@ export interface ObserveOptions {
 
 export interface ObserveServerHandle {
   dispose: () => Promise<void>;
+  /** The session credential (header or cookie). Never part of `url`. */
   authToken: string;
+  /** Printable URL carrying a ONE-TIME login ticket, exchanged for the session cookie on first load. */
   url: string;
 }
 
@@ -57,10 +67,11 @@ export async function startObserve(options: ObserveOptions): Promise<ObserveServ
   }
 
   const authToken = randomBytes(24).toString('hex');
+  const login = createLoginGate();
   const rateLimiter = new Map<string, { count: number; resetAt: number }>();
 
   const server = createServer((req, res) => {
-    handleRequest(req, res, pool, options, authToken, rateLimiter).catch((err) => {
+    handleRequest(req, res, pool, options, authToken, rateLimiter, login).catch((err) => {
       sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
     });
   });
@@ -74,7 +85,7 @@ export async function startObserve(options: ObserveOptions): Promise<ObserveServ
   });
 
   const hostPart = options.host.includes(':') && !options.host.startsWith('[') ? `[${options.host}]` : options.host;
-  const url = `http://${hostPart}:${options.port}/?token=${authToken}`;
+  const url = `http://${hostPart}:${options.port}/?token=${login.token}`;
 
   if (options.openBrowser) {
     openUrl(url);
@@ -101,9 +112,18 @@ export async function handleRequest(
   options: ObserveOptions,
   authToken: string,
   rateLimiter: Map<string, { count: number; resetAt: number }>,
+  /** The one-time login ticket. Absent on a hand-built call: the ticket is then `authToken` itself. */
+  login: LoginGate = gateFor(authToken),
 ): Promise<void> {
   const hostPart = options.host.includes(':') && !options.host.startsWith('[') ? `[${options.host}]` : options.host;
   const expectedOrigin = `http://${hostPart}:${options.port}`;
+
+  // DNS rebinding: a page on another domain that re-resolves to this port still
+  // sends its own hostname in `Host`. Checked before any route or token logic.
+  if (!isAllowedHostHeader(req.headers.host, options.host, options.port)) {
+    sendJson(res, 403, { error: 'host not allowed: open Observe at the address printed in the terminal' });
+    return;
+  }
 
   const origin = req.headers.origin;
   if (origin && origin !== expectedOrigin) {
@@ -120,13 +140,27 @@ export async function handleRequest(
       return;
     }
     const queryToken = url.searchParams.get('token');
-    if (queryToken && constantTimeEqual(queryToken, authToken)) {
-      res.writeHead(302, {
-        Location: '/',
-        'Set-Cookie': `turbine_observe_token=${authToken}; Path=/; HttpOnly; SameSite=Strict`,
-      });
-      res.end();
-      return;
+    if (queryToken) {
+      // The printed URL's token is a ONE-TIME ticket, exchanged here for the
+      // session cookie by the first GET that carries it. HEAD never spends it.
+      const outcome = req.method === 'GET' ? redeemLogin(login, queryToken) : 'invalid';
+      if (outcome === 'granted') {
+        res.writeHead(302, {
+          Location: '/',
+          'Set-Cookie': `turbine_observe_token=${authToken}; Path=/; HttpOnly; SameSite=Strict`,
+        });
+        res.end();
+        return;
+      }
+      if (outcome === 'used') {
+        if (isAuthorized(req, authToken)) {
+          res.writeHead(302, { Location: '/' });
+          res.end();
+        } else {
+          sendText(res, 403, 'This login link was already used. Restart Observe to get a new one.');
+        }
+        return;
+      }
     }
     sendHtml(res, 200, OBSERVE_HTML, cspNonce());
     return;
@@ -180,13 +214,18 @@ function isAuthorized(req: IncomingMessage, expectedToken: string): boolean {
   return false;
 }
 
-function constantTimeEqual(a: string, b: string): boolean {
-  // Hash both inputs to fixed-length 32-byte SHA-256 digests before comparing.
-  // This makes the comparison constant-length (timingSafeEqual never throws on a
-  // length mismatch) and leaks neither length nor content via timing.
-  const ah = createHash('sha256').update(a).digest();
-  const bh = createHash('sha256').update(b).digest();
-  return timingSafeEqual(ah, bh);
+/**
+ * The ticket for a caller that passed none (a hand-built dispatch): `authToken`
+ * itself, remembered per token so it is still spent exactly once.
+ */
+const FALLBACK_GATES = new Map<string, LoginGate>();
+function gateFor(authToken: string): LoginGate {
+  let gate = FALLBACK_GATES.get(authToken);
+  if (!gate) {
+    gate = createLoginGate(authToken);
+    FALLBACK_GATES.set(authToken, gate);
+  }
+  return gate;
 }
 
 // ---------------------------------------------------------------------------
@@ -344,7 +383,6 @@ function sendText(res: ServerResponse, status: number, text: string): void {
 
 function openUrl(url: string): void {
   const { platform: os } = process;
-  const { spawn } = require('node:child_process') as typeof import('node:child_process');
   try {
     if (os === 'darwin') spawn('open', [url], { stdio: 'ignore', detached: true }).unref();
     else if (os === 'win32') spawn('cmd', ['/c', 'start', '', url], { stdio: 'ignore', detached: true }).unref();
