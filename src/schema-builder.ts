@@ -26,6 +26,8 @@
 // Type-only import, erased at runtime, so it cannot introduce a circular
 // runtime dependency (the local `camelToSnakeLocal` copy avoids that for the
 // value-level helper).
+import { ValidationError } from './errors.js';
+import { suggestKey } from './query/utils.js';
 import type { ReferentialAction, RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
 
 export type { ReferentialAction } from './schema.js';
@@ -152,6 +154,15 @@ export interface ColumnDef {
    * {@link import('./schema.js').ColumnMetadata.updatedAt}.
    */
   updatedAt?: boolean;
+  /**
+   * The TypeScript type `turbine generate` emits for this column, replacing
+   * the one derived from `type`. Mainly for `json` / `jsonb`, which otherwise
+   * generate as `unknown`: `{ type: 'jsonb', tsType: '{ theme: string }' }`.
+   * Emitted verbatim (nullability is still added), so it may name any type
+   * the generated file can see. The same override as the generator's
+   * `columnTypes` option, declared next to the column.
+   */
+  tsType?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +215,8 @@ export interface ColumnConfig {
   pii: boolean;
   /** Whether this column is auto-set to the current time on update. */
   updatedAt: boolean;
+  /** Generated TypeScript type override ({@link ColumnDef.tsType}), or null / absent. */
+  tsType?: string | null;
 }
 
 /** Convert a user-facing ColumnDef to the internal ColumnConfig */
@@ -247,7 +260,27 @@ function resolveColumn(def: ColumnDef): ColumnConfig {
     check: def.check ?? null,
     pii: def.pii ?? false,
     updatedAt: def.updatedAt ?? false,
+    tsType: checkedTsType(def.tsType),
   };
+}
+
+/** Characters a declared `tsType` may not contain (the generator refuses the same set). */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: refusing control characters is this pattern's purpose
+const UNSAFE_TS_TYPE_TEXT = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+
+/**
+ * A `tsType` is emitted verbatim into generated source, so it must be one line
+ * of type text: a control or line-separator character could end the type and
+ * start a statement.
+ */
+function checkedTsType(tsType: string | undefined): string | null {
+  if (tsType === undefined) return null;
+  if (typeof tsType !== 'string' || tsType.trim() === '' || UNSAFE_TS_TYPE_TEXT.test(tsType)) {
+    throw new Error(
+      `Invalid column "tsType" ${JSON.stringify(tsType)}: give a non-empty TypeScript type on one line, with no control characters.`,
+    );
+  }
+  return tsType;
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +465,137 @@ export interface DefineSchemaOptions {
 /** Input format: table name -> column defs (object format) or TableDef (legacy builder) */
 type SchemaInput = Record<string, Record<string, ColumnDef> | TableDef | TableInput>;
 
+// ---------------------------------------------------------------------------
+// Known keys: one table per declaration shape
+// ---------------------------------------------------------------------------
+//
+// A schema is static code, and a key `defineSchema` does not know is not
+// harmless: it is an option the caller meant and did not get (`defaultValue`
+// for `default` emits a column with no DEFAULT, `uniq` for `unique` a
+// non-unique index). So an unknown key is refused, at compile time in a
+// literal and at runtime for JSON or plain JS.
+//
+// Each table is a `Record<keyof Shape, true>`: adding an option to the shape
+// without listing it here fails the build, and listing a key the shape does
+// not have fails as an excess property. The compile-time check types below
+// and the runtime refusal both read these, so they cannot disagree.
+
+const COLUMN_KEYS: Record<keyof ColumnDef, true> = {
+  type: true,
+  primaryKey: true,
+  notNull: true,
+  nullable: true,
+  unique: true,
+  default: true,
+  references: true,
+  maxLength: true,
+  enumName: true,
+  dimensions: true,
+  array: true,
+  check: true,
+  pii: true,
+  updatedAt: true,
+  tsType: true,
+};
+
+const REFERENCE_KEYS: Record<keyof ReferenceDef, true> = { target: true, onDelete: true, onUpdate: true };
+const CHECK_KEYS: Record<keyof CheckDef, true> = { name: true, expression: true };
+const MANY_TO_MANY_KEYS: Record<keyof ManyToManyDef, true> = {
+  name: true,
+  target: true,
+  through: true,
+  sourceKey: true,
+  targetKey: true,
+  references: true,
+};
+const INDEX_KEYS: Record<keyof ColumnIndexDef | keyof DocFieldIndexDef, true> = {
+  columns: true,
+  docField: true,
+  path: true,
+  unique: true,
+  name: true,
+};
+/** The table-level options of {@link TableInput}; every other key is a column. */
+type TableOptionKey = 'primaryKey' | 'manyToMany' | 'checks' | 'indexes';
+const TABLE_OPTION_KEYS: Record<TableOptionKey, true> = {
+  primaryKey: true,
+  manyToMany: true,
+  checks: true,
+  indexes: true,
+};
+const SCHEMA_OPTION_KEYS: Record<keyof DefineSchemaOptions, true> = { enums: true };
+
+/**
+ * Refuse every key of `value` that `known` does not list (E003), naming where
+ * it sits and the key it most likely meant.
+ */
+function assertKnownKeys(value: object, known: Readonly<Record<string, true>>, where: string): void {
+  for (const key of Object.keys(value)) {
+    if (Object.hasOwn(known, key)) continue;
+    // suggestKey covers typos and the metadata spellings (`defaultValue`,
+    // `isUnique`) alike: the second pass matches a key that adds words.
+    const suggestion = suggestKey(key, Object.keys(known));
+    throw new ValidationError(
+      `defineSchema: unknown key "${key}" in ${where}.` +
+        (suggestion ? ` Did you mean "${suggestion}"?` : '') +
+        ` Valid keys: ${Object.keys(known).join(', ')}.`,
+    );
+  }
+}
+
+/** Each element of an option array, checked as `what` (non-objects are left to the consumer's own checks). */
+function assertKnownElementKeys(list: readonly unknown[], known: Readonly<Record<string, true>>, where: string): void {
+  list.forEach((item, i) => {
+    if (typeof item === 'object' && item !== null) assertKnownKeys(item, known, `${where}[${i}]`);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Compile-time key checks for a literal schema
+// ---------------------------------------------------------------------------
+//
+// `TableInput`'s index signature has to admit the array-valued table options
+// under ANY key (TypeScript requires named members to fit the signature), so
+// `primarykey: ['id']` type-checked. And once `defineSchema` is generic over
+// its input, the excess-property check that used to catch a misspelled column
+// option no longer applies (the inferred type has the key). These types put
+// both back: an unknown key's expected type becomes a message string, so the
+// literal fails at that key with the message in the diagnostic.
+
+/** The expected type an unknown key is given, so the compile error names it. */
+type UnknownKey<Where extends string, K> = `unknown key "${K & string}" in ${Where}`;
+/** Every key of every member of a union (`keyof` of a union is only the shared keys). */
+type AllKeys<T> = T extends unknown ? keyof T : never;
+type KnownKeys<T, Allowed, Where extends string> = T extends readonly unknown[]
+  ? unknown
+  : T extends object
+    ? { [K in AllKeys<T>]?: K extends Allowed ? unknown : UnknownKey<Where, K> }
+    : unknown;
+type KnownElementKeys<A, Allowed, Where extends string> = A extends readonly (infer E)[]
+  ? readonly KnownKeys<E, Allowed, Where>[]
+  : unknown;
+type ColumnKeyCheck<C> = KnownKeys<C, keyof ColumnDef, 'a column'> &
+  (C extends { references: infer R } ? { references?: KnownKeys<R, keyof ReferenceDef, 'references'> } : unknown);
+type TableKeyCheck<T> = T extends TableDef
+  ? unknown
+  : string extends keyof T
+    ? unknown
+    : {
+        [K in keyof T]: K extends 'indexes'
+          ? KnownElementKeys<T[K], keyof ColumnIndexDef | keyof DocFieldIndexDef, 'an index'>
+          : K extends 'checks'
+            ? KnownElementKeys<T[K], keyof CheckDef, 'a check'>
+            : K extends 'manyToMany'
+              ? KnownElementKeys<T[K], keyof ManyToManyDef, 'a manyToMany relation'>
+              : K extends TableOptionKey
+                ? unknown
+                : T[K] extends readonly unknown[]
+                  ? UnknownKey<'a table (not a table option, and an array is not a column)', K>
+                  : ColumnKeyCheck<T[K]>;
+      };
+/** Rejects, in a literal, every key {@link defineSchema} would refuse at runtime. */
+export type SchemaKeyCheck<S> = { [A in keyof S]: TableKeyCheck<S[A]> };
+
 /** Check if a value is a TableDef (from legacy table() builder) */
 function isTableDef(v: unknown): v is TableDef {
   return typeof v === 'object' && v !== null && 'columns' in v && 'name' in v;
@@ -456,8 +620,12 @@ function isTableDef(v: unknown): v is TableDef {
  * });
  * ```
  */
-export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions): SchemaDef {
+export function defineSchema<S extends SchemaInput>(
+  input: S & SchemaKeyCheck<S>,
+  options?: DefineSchemaOptions,
+): SchemaDef {
   const tables: Record<string, TableDef> = {};
+  if (options !== undefined) assertKnownKeys(options, SCHEMA_OPTION_KEYS, 'the defineSchema options');
 
   for (const [accessor, value] of Object.entries(input)) {
     // The user-facing key is the camelCase JS accessor; the DDL-facing
@@ -485,6 +653,7 @@ export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions):
             if (!Array.isArray(def)) {
               throw new Error(`Table "${accessor}": "indexes" must be an array of index declarations`);
             }
+            assertKnownElementKeys(def, INDEX_KEYS, `table "${accessor}" indexes`);
             indexes = def as readonly SchemaIndexDef[];
           }
           continue;
@@ -494,6 +663,7 @@ export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions):
             if (!Array.isArray(def)) {
               throw new Error(`Table "${accessor}": "manyToMany" must be an array of relation declarations`);
             }
+            assertKnownElementKeys(def, MANY_TO_MANY_KEYS, `table "${accessor}" manyToMany`);
             m2m = def as readonly ManyToManyDef[];
           }
           continue;
@@ -503,6 +673,7 @@ export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions):
             if (!Array.isArray(def)) {
               throw new Error(`Table "${accessor}": "checks" must be an array of { name?, expression } objects`);
             }
+            assertKnownElementKeys(def, CHECK_KEYS, `table "${accessor}" checks`);
             checks = def as readonly CheckDef[];
           }
           continue;
@@ -519,7 +690,24 @@ export function defineSchema(input: SchemaInput, options?: DefineSchemaOptions):
           }
           continue;
         }
-        // Anything else is a ColumnDef
+        // Anything else is a ColumnDef. An array here is a table option under a
+        // name defineSchema does not know (`primarykey`, `index`): refuse it by
+        // that name rather than as a column with no type.
+        if (Array.isArray(def)) {
+          const suggestion = suggestKey(fieldName, Object.keys(TABLE_OPTION_KEYS));
+          throw new ValidationError(
+            `defineSchema: table "${accessor}" has an array under "${fieldName}", which is not a table option ` +
+              `(${Object.keys(TABLE_OPTION_KEYS).join(', ')}) and cannot be a column.` +
+              (suggestion ? ` Did you mean "${suggestion}"?` : ''),
+          );
+        }
+        if (typeof def === 'object' && def !== null) {
+          assertKnownKeys(def, COLUMN_KEYS, `column "${accessor}.${fieldName}"`);
+          const ref = (def as ColumnDef).references;
+          if (typeof ref === 'object' && ref !== null) {
+            assertKnownKeys(ref, REFERENCE_KEYS, `the references of column "${accessor}.${fieldName}"`);
+          }
+        }
         columns[fieldName] = resolveColumn(def as ColumnDef);
       }
 
@@ -595,6 +783,7 @@ export class ColumnBuilder {
       check: null,
       pii: false,
       updatedAt: false,
+      tsType: null,
     };
   }
 
@@ -694,6 +883,8 @@ export class ColumnBuilder {
     return this;
   }
   references(target: string, opts?: { onDelete?: ReferentialAction; onUpdate?: ReferentialAction }): this {
+    if (opts !== undefined)
+      assertKnownKeys(opts, { onDelete: true, onUpdate: true }, `references("${target}") options`);
     this._config.referencesTarget = target;
     this._config.onDelete = opts?.onDelete ?? null;
     this._config.onUpdate = opts?.onUpdate ?? null;
@@ -710,6 +901,11 @@ export class ColumnBuilder {
   /** Auto-set this column to the current time on every update. Prisma's `@updatedAt`. */
   updatedAt(): this {
     this._config.updatedAt = true;
+    return this;
+  }
+  /** The TypeScript type `turbine generate` emits for this column. See {@link ColumnDef.tsType}. */
+  tsType(type: string): this {
+    this._config.tsType = checkedTsType(type);
     return this;
   }
   array(): this {
