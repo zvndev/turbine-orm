@@ -27,6 +27,13 @@ export interface Scenario {
   run(db: Db): Promise<unknown>;
   /** Write scenarios: tables whose final rows are compared too. */
   state?: readonly TableName[];
+  /**
+   * The error Postgres is expected to throw, as `Class:CODE`. Without it the
+   * oracle must return a value: two engines that both throw agree, and a
+   * scenario whose oracle throws by accident would otherwise pass while
+   * comparing nothing.
+   */
+  throws?: string;
 }
 
 const U = 'oe_users';

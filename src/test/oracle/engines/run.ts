@@ -68,6 +68,22 @@ function judge(
   const entry = scenarioEntry(engine, s.id);
   const equal = cmp.equal(oracle.tagged, got.tagged);
   const where = `${engine} ${s.id}`;
+  const expected = s.throws === undefined ? undefined : `error:${s.throws}`;
+  if (oracle.ok) {
+    assert.ok(
+      expected === undefined,
+      `${where}: declares throws "${s.throws}" but Postgres returned a value. Fix the scenario.\n${repro}`,
+    );
+  } else {
+    assert.ok(
+      oracle.tagged === expected,
+      expected === undefined
+        ? `${where}: Postgres itself threw, so the scenario compares nothing. Fix it, or declare the ` +
+            `refusal with \`throws: '${errorTag(oracle.error).slice('error:'.length)}'\` if the refusal is the point.\n` +
+            `${explain(oracle, got, cmp)}\n${repro}`
+        : `${where}: Postgres threw ${errorTag(oracle.error)}, expected ${expected}\n${explain(oracle, got, cmp)}\n${repro}`,
+    );
+  }
   if (!entry) {
     if (equal) return undefined;
     assert.fail(`${where}: the engine disagrees with Postgres\n${explain(oracle, got, cmp)}\n${repro}`);
