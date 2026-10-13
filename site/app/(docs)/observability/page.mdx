@@ -219,7 +219,7 @@ Turbine imports nothing from `@opentelemetry/*` and adds no dependency. Two hook
 ```ts
 import { context, trace, SpanKind, SpanStatusCode } from '@opentelemetry/api';
 import { RAW_QUERY_MODEL } from 'turbine-orm';
-import { db } from './db';
+import { db } from './db.js';
 
 const DB_SYSTEM = 'postgresql'; // 'mysql', 'sqlite' or 'microsoft.sql_server' on the other engines
 const tracer = trace.getTracer('turbine-orm');
