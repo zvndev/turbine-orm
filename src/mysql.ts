@@ -1208,6 +1208,8 @@ export async function introspectMysqlWith(
       tsType: mysqlTypeToTs(dataType, nullable, c.COLUMN_TYPE),
       nullable,
       hasDefault: c.COLUMN_DEFAULT !== null || /auto_increment/i.test(c.EXTRA),
+      // The server numbers it, so a create's re-read can use the insert id.
+      isGenerated: /auto_increment/i.test(c.EXTRA),
       isArray: false,
       arrayType: undefined,
       pgArrayType: 'text[]',

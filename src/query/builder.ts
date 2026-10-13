@@ -1227,9 +1227,9 @@ export class QueryInterface<
    *     Postgres rejects with `22007 invalid input syntax for type time`.
    *   - `timestamptz` and every non-temporal type: unaffected.
    *
-   * PostgreSQL only: the UTC bind rewrite is Postgres-gated (see
-   * `utcDateTimeWrites` in writes.ts), so on the other engines a missing type
-   * changes nothing about how a `Date` is bound. Suppressed under
+   * PostgreSQL only: the zone-less `timestamp` rewrite is Postgres-gated (see
+   * `utcDateTimeRewrite` in where.ts), so on the other engines a missing type
+   * costs only the `date` rewrite. Suppressed under
    * `NODE_ENV=production` like the other dev diagnostics and deduped through
    * the shared registry, so a hot table logs one line for the process.
    *

@@ -499,6 +499,12 @@ describe('turbine-orm/mysql, introspector (mock executor)', () => {
     assert.deepEqual(Object.keys(meta.tables).sort(), ['organizations', 'post_tags', 'posts', 'tags', 'users']);
     assert.deepEqual(meta.tables.users!.primaryKey, ['id']);
     assert.deepEqual(meta.tables.post_tags!.primaryKey, ['post_id', 'tag_id']);
+    // An AUTO_INCREMENT key is server-numbered, which is what lets a create
+    // re-read its row by the insert id; an ordinary column is not.
+    const usersId = meta.tables.users!.columns.find((c) => c.name === 'id');
+    const postTagsPost = meta.tables.post_tags!.columns.find((c) => c.name === 'post_id');
+    assert.equal(usersId?.isGenerated, true);
+    assert.equal(postTagsPost?.isGenerated, false);
     assert.equal(meta.tables.users!.reverseColumnMap.org_id, 'orgId');
     assert.ok(meta.tables.users!.dateColumns.has('created_at'));
     // relations

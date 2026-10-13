@@ -972,7 +972,9 @@ function emitCreateMany<T extends object>(
  * PostgreSQL UNNEST form binds one array per column, so its rows never run out.
  */
 function rowsPerStatement(qi: BuilderCtx, prepared: PreparedCreateMany): number {
-  const cap = qi.dialect.name === 'mssql' && !prepared.conflict ? MSSQL_MAX_INSERT_ROWS : Number.POSITIVE_INFINITY;
+  // An onConflict statement (SQL Server's MERGE) reads its rows as a derived
+  // table, which the plain INSERT ... VALUES row cap does not bind.
+  const cap = qi.dialect.maxInsertRows !== undefined && !prepared.conflict ? qi.dialect.maxInsertRows : Infinity;
   const limit = maxBindParameters(qi.dialect);
   const rows = prepared.rowValues;
   if (limit === undefined || rows.length < 2) return cap;
@@ -982,13 +984,6 @@ function rowsPerStatement(qi: BuilderCtx, prepared: PreparedCreateMany): number 
   const fixed = Math.max(0, one - perRow);
   return Math.max(1, Math.min(cap, Math.floor((limit - fixed) / perRow)));
 }
-
-/**
- * Rows SQL Server takes in one `INSERT ... VALUES` (error 10738 past it). Its
- * `MERGE` (onConflict) reads the rows as a derived table, which has no such cap.
- * mssql.ts refuses a larger statement itself; this sizes chunks below it.
- */
-const MSSQL_MAX_INSERT_ROWS = 1000;
 
 // ---------------------------------------------------------------------------
 // createMany({ onConflict }): the multi-row upsert

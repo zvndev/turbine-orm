@@ -666,6 +666,7 @@ function mssqlOutput(returning: ReturningSelection | undefined, alias: 'INSERTED
 export const mssqlDialect: Dialect = {
   ...postgresDialect,
   name: 'mssql',
+  maxInsertRows: MSSQL_MAX_INSERT_ROWS,
   // No RETURNING → the statement emits its rows via OUTPUT INSERTED.* in ONE
   // round-trip (Phase-0 'output' strategy, executed like 'returning').
   resultStrategy: 'output',

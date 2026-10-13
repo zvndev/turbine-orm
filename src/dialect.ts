@@ -489,6 +489,16 @@ export interface Dialect {
    */
   readonly maxBindParameters?: number;
 
+  /**
+   * The most rows one plain `INSERT ... VALUES` statement may carry, when the
+   * engine limits it (SQL Server: 1000, error 10738 past it). `createMany` sizes
+   * its chunks below it; an `onConflict` statement that reads its rows as a
+   * derived table is not bound by it. Absent: no row limit beyond the
+   * bind-parameter one. Not set on `postgresDialect`, for the reason
+   * {@link maxBindParameters} gives.
+   */
+  readonly maxInsertRows?: number;
+
   /** Whether this dialect/engine supports pgvector distance ops (KNN / distance WHERE). */
   readonly supportsVector: boolean;
 
