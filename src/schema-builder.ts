@@ -222,13 +222,13 @@ export interface ColumnConfig {
 /** Convert a user-facing ColumnDef to the internal ColumnConfig */
 function resolveColumn(def: ColumnDef): ColumnConfig {
   if (!(def.type in TYPE_MAP)) {
-    throw new Error(`Invalid column type "${def.type}". Valid types: ${Object.keys(TYPE_MAP).join(', ')}`);
+    throw new ValidationError(`Invalid column type "${def.type}". Valid types: ${Object.keys(TYPE_MAP).join(', ')}`);
   }
   if (def.type === 'enum' && !def.enumName) {
-    throw new Error(`Column of type "enum" requires an "enumName" (the CREATE TYPE name).`);
+    throw new ValidationError(`Column of type "enum" requires an "enumName" (the CREATE TYPE name).`);
   }
   if (def.type === 'vector' && (def.dimensions == null || def.dimensions <= 0)) {
-    throw new Error(`Column of type "vector" requires a positive "dimensions" count.`);
+    throw new ValidationError(`Column of type "vector" requires a positive "dimensions" count.`);
   }
 
   // `references` is either the "table.column" string or a { target, onDelete, onUpdate } object.
@@ -731,7 +731,7 @@ export function defineSchema<S extends SchemaInput>(
         if (fieldName === 'indexes') {
           if (def !== undefined) {
             if (!Array.isArray(def)) {
-              throw new Error(`Table "${accessor}": "indexes" must be an array of index declarations`);
+              throw new ValidationError(`Table "${accessor}": "indexes" must be an array of index declarations`);
             }
             assertKnownElementKeys(def, INDEX_KEYS, `table "${accessor}" indexes`);
             assertIndexKinds(def, accessor);
@@ -742,7 +742,7 @@ export function defineSchema<S extends SchemaInput>(
         if (fieldName === 'manyToMany') {
           if (def !== undefined) {
             if (!Array.isArray(def)) {
-              throw new Error(`Table "${accessor}": "manyToMany" must be an array of relation declarations`);
+              throw new ValidationError(`Table "${accessor}": "manyToMany" must be an array of relation declarations`);
             }
             assertKnownElementKeys(def, MANY_TO_MANY_KEYS, `table "${accessor}" manyToMany`);
             m2m = def as readonly ManyToManyDef[];
@@ -752,7 +752,9 @@ export function defineSchema<S extends SchemaInput>(
         if (fieldName === 'checks') {
           if (def !== undefined) {
             if (!Array.isArray(def)) {
-              throw new Error(`Table "${accessor}": "checks" must be an array of { name?, expression } objects`);
+              throw new ValidationError(
+                `Table "${accessor}": "checks" must be an array of { name?, expression } objects`,
+              );
             }
             assertKnownElementKeys(def, CHECK_KEYS, `table "${accessor}" checks`);
             checks = def as readonly CheckDef[];
@@ -763,7 +765,7 @@ export function defineSchema<S extends SchemaInput>(
           // Top-level composite primary key declaration
           if (def !== undefined) {
             if (!Array.isArray(def)) {
-              throw new Error(
+              throw new ValidationError(
                 `Table "${accessor}": top-level "primaryKey" must be an array of column names (string[])`,
               );
             }
@@ -800,7 +802,7 @@ export function defineSchema<S extends SchemaInput>(
       if (pk && pk.length > 0) {
         for (const colName of pk) {
           if (!(colName in columns)) {
-            throw new Error(
+            throw new ValidationError(
               `Table "${accessor}": composite primaryKey references unknown column "${colName}". ` +
                 `Known columns: ${Object.keys(columns).join(', ') || '(none)'}`,
             );
@@ -1059,7 +1061,7 @@ export const column: ColumnProxy = new Proxy({} as ColumnProxy, {
       };
     }
     return () => {
-      throw new Error(`Unknown column type: ${prop}`);
+      throw new ValidationError(`Unknown column type: ${prop}`);
     };
   },
 });
