@@ -421,6 +421,56 @@ src/
                       first runtime import (warn-registry + utils, both leaves that do not
                       import it back), so everything above it stays type-only.
 
+    normalize-args.ts, `undefined` means absent, decided ONCE (0.90). `pruneUndefinedArgs`
+                      runs at the args seam of every public operation and its `build*` twin,
+                      before the empty-where guards, the fingerprint, the build and the param
+                      collect read anything. A key whose value is `undefined` is removed, and so
+                      is an object or combinator array that BECOMES empty because of it, so
+                      `{ user: { email: undefined } }` is exactly `{}`. Never prunes `data` /
+                      `create` / `update`, an operand value, or an object written empty. Also
+                      carries prisma-compat's inclusive-cursor flag through the prune.
+
+    column-ref.ts  , `col('field')`, a column compared against another column of the same
+                      row (`{ equals: col('b') }` emits `"a" = "b"`). BRANDED with a
+                      `Symbol.for` key: a plain `{ col: 'id' }` is exactly what `JSON.parse`
+                      makes from a request body, and if that shape were a reference,
+                      `delete({ where: { id: body.id } })` could compile to `"id" = "id"`.
+                      Same reasoning as `UNSAFE`.
+
+    json-value.ts  , `jsonValue(v)`, the explicit JSON write: a JS string written to a json
+                      column is raw JSON TEXT, so without the wrapper there is no way to store
+                      the JSON string `"hello"` or JSON `null`. Branded the same way.
+
+    expr.ts        , Update expressions (0.90): `expr.add/sub/mul/div/coalesce/greatest/
+                      least/case/now/excluded`, accepted in `update`, `updateMany`, upsert
+                      `update`, nested update data and `createMany`'s `onConflict.update`;
+                      refused in create data. Nodes are frozen and carry a `Symbol.for` brand,
+                      so a JSON look-alike `{ kind, args }` is a VALUE (refused on a non-JSON
+                      column). `compileSetExpr` is the ONE traversal producing the SQL, the
+                      params and the fingerprint together, the where-cache lesson applied
+                      before it could bite. Rendering is chosen by `dialect.name`: GREATEST /
+                      LEAST ignore NULLs on every engine, `now()` follows the UTC read path
+                      per column type. A `case`, or a variadic with more than two operands,
+                      makes the statement UNNAMED (its arity is in the text, the 0.66
+                      variable-arity rule). `resolveExcludedFromCreate` turns
+                      `expr.excluded(field)` into `create`'s value on the lookup-first upsert
+                      path and in nested upserts. PowDB refuses expressions (E017).
+
+    row-lock.ts    , The `lock` read option (0.90). `resolveRowLock` is the one place a lock
+                      value is validated and rendered; the SQL and the `|lk=` cache-key
+                      segment both read it, and an unlocked key is byte-identical to before.
+                      The clause is `FOR <mode> OF "<table>"` after pagination: `OF` keeps the
+                      lock on the queried table's rows only, on every relation strategy, and
+                      without it PostgreSQL refuses the flatten plan. Modes come from the
+                      `dialect.rowLockModes` flag each engine sets explicitly (PostgreSQL all
+                      four, MySQL 'update' and 'share', the rest none, so E017). Refused: a
+                      locking read outside a transaction (E003, autocommit would release the
+                      lock before the caller saw the rows; "inside" is `txScoped`), on a stream,
+                      with `distinct`, and in an autocommit pipeline (`DeferredQuery.rowLock`,
+                      checked in client.ts `pipeline()`). Studio and MCP refuse `lock` by name
+                      (`findRowLockOption` in cli/pii-predicate-guard.ts). A lock that cannot be
+                      taken is `LockNotAvailableError` (E013, see the error table).
+
     index.ts       , Barrel re-export. All imports use `./query/index.js`.
 
   index-advisor.ts , Missing-FK-index advisor. Derives every column set relations probe
@@ -582,6 +632,37 @@ src/
                       checked against reflection. Live net:
                       stale-connection.integration.test.ts freezes the loop for real (a
                       worker terminates backends while the main thread is in Atomics.wait).
+
+  transaction-state.ts, The state one open transaction shares (0.90): whether it is still
+                      open (a `tx` captured by an un-awaited promise or a timer is refused once
+                      the transaction settles, because its connection may already serve another
+                      request), the FIRST statement failure, and the savepoint stack. Blocks
+                      that share a parent run one at a time, since two open savepoints on one
+                      connection would roll each other back. `commitTransaction` refuses to
+                      report success when PostgreSQL answers COMMIT with the `ROLLBACK` command
+                      tag (an aborted transaction, no error), and `rolledBackError` builds the
+                      error that carries the first failure as `cause`; a retryable first
+                      failure keeps its class so `$retry` still retries. A callback that returns
+                      with work still running rolls back (`unawaitedWorkError`, E003). Shared
+                      by `$transaction`, nested blocks and raw `transaction()`.
+
+  global-filters-config.ts, `globalFilters` checked at CONSTRUCTION (0.90). The config is
+                      keyed by client ACCESSOR (`blogPosts`) while the builder looks filters
+                      up by TABLE name, so a key that names neither was a filter applied to
+                      nothing, which for a tenancy boundary is the worst way to fail.
+                      `normalizeGlobalFilters` maps every key to its table, refuses an unknown
+                      key and a static filter naming no column or relation, and returns the
+                      map the builder reads. `tableAccessorName` is the ONE place the accessor
+                      name is derived. Function filters are checked per query by the resolver.
+
+  supplied-pool-types.ts, Turbine's column readings on a pool the CALLER supplied (0.90).
+                      On an owned pool the int8 / UTC-temporal parsers are registered on the
+                      pg module; a supplied pool keeps the caller's parser table, so Turbine
+                      attaches its parsers to each of its OWN queries as a query-level `types`
+                      (node-postgres reads it in place of the connection's). Every type
+                      Turbine does not govern falls through to the table the query would have
+                      used, so the caller's own parsers still apply, and the caller's own
+                      queries on that pool are untouched.
 
   client.ts        , TurbineClient wraps a pg.Pool and auto-creates typed table accessors
                       via Object.defineProperty. Manages middleware ($use), transactions
@@ -1290,7 +1371,7 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 | E010 | `NotNullViolationError` | pg 23502, via `wrapPgError()` |
 | E011 | `CheckConstraintError` | pg 23514, via `wrapPgError()` |
 | E012 | `DeadlockError` | pg 40P01, `isRetryable = true as const` |
-| E013 | `SerializationFailureError` | pg 40001, `isRetryable = true as const` |
+| E013 | `SerializationFailureError` | pg 40001, `isRetryable = true as const`. Subclass `LockNotAvailableError` (same code, retryable): a `lock` read with `noWait`, or a lock wait past the server's lock timeout (pg 55P03, MySQL 3572 / 1205, SQL Server 1222); on PostgreSQL it aborts the transaction, so take the lock in a nested `tx.$transaction` to recover |
 | E014 | `PipelineError` | One or more queries in a pipeline batch failed |
 | E015 | `OptimisticLockError` | Version mismatch on `optimisticLock` update |
 | E016 | `ExclusionConstraintError` | pg 23P01, via `wrapPgError()` |
@@ -1320,7 +1401,7 @@ which exists because the previous copy asserted a snake_case column name was rej
 
 **UI module** (`cli/ui.ts`): Terminal formatting helpers, colors, spinners, tables, boxes. Imported throughout CLI but never by library code.
 
-**Other CLI leaves**: `cli/loader.ts` registers a TypeScript loader (prefers `tsx/esm/api`'s `register()`, probed from the user's CWD) before the CLI `import()`s a user-supplied `turbine.config.ts` / schema file, which plain Node rejects with `ERR_UNKNOWN_FILE_EXTENSION`. `cli/pii-tags.ts` reads `ColumnMetadata.pii` out of the generated `metadata.ts` and applies it to a LIVE introspected schema: `pii` is a code-first declaration that `introspect.ts` never sets, so without this Studio's and the MCP server's redaction would be inert against a real database; it distinguishes "this file declares no PII" from "this file could not be parsed" (`PiiScan.ok === false`), and the latter fails closed by tagging every column. `cli/rate-limit.ts` is the fixed-window limiter (100 requests / 60s) both local servers share. `cli/observe.ts` is the read-only metrics dashboard over the `_turbine_metrics` table written by `observe.ts`, with Studio's security model (loopback, random token, HttpOnly cookie, CSP, read-only transactions); its UI is the hand-authored embedded HTML in `cli/observe-ui.ts` (same pattern as `studio-ui.generated.ts` but with no build step).
+**Other CLI leaves**: `cli/loader.ts` registers a TypeScript loader (prefers `tsx/esm/api`'s `register()`, probed from the user's CWD) before the CLI `import()`s a user-supplied `turbine.config.ts` / schema file, which plain Node rejects with `ERR_UNKNOWN_FILE_EXTENSION`. `cli/pii-tags.ts` reads `ColumnMetadata.pii` out of the generated `metadata.ts` and applies it to a LIVE introspected schema: `pii` is a code-first declaration that `introspect.ts` never sets, so without this Studio's and the MCP server's redaction would be inert against a real database; it distinguishes "this file declares no PII" from "this file could not be parsed" (`PiiScan.ok === false`), and the latter fails closed by tagging every column. `cli/rate-limit.ts` is the fixed-window limiter (100 requests / 60s) both local servers share. `cli/local-server-guard.ts` holds the rest of the perimeter both local servers share: the `Host` allowlist that stops DNS rebinding, the ONE-TIME login ticket printed in the terminal (a URL that lands in history or a log is a spent ticket, not a standing key), and the one constant-time token comparison. `cli/code-first-tags.ts` overlays the `defineSchema()`-only tags (`pii`, `updatedAt`, `maxLength`, `tsType`) onto an introspected schema for `turbine generate`, since the database has no column for any of them. `cli/observe.ts` is the read-only metrics dashboard over the `_turbine_metrics` table written by `observe.ts`, with Studio's security model (loopback, random token, HttpOnly cookie, CSP, read-only transactions); its UI is the hand-authored embedded HTML in `cli/observe-ui.ts` (same pattern as `studio-ui.generated.ts` but with no build step).
 
 ## Testing
 
