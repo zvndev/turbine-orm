@@ -15,7 +15,7 @@ import { acquireConnection, type Checkout, openCheckout } from '../checkout.js';
 import { settleEventLoop } from '../connection-guard.js';
 import { type ResolvedDiagnostics, resolveDiagnostics } from '../diagnostics.js';
 import type { Dialect, StreamableConnection } from '../dialect.js';
-import { postgresDialect } from '../dialect.js';
+import { assertDialectCapabilities, postgresDialect } from '../dialect.js';
 import {
   explainConnectionLoss,
   INVARIANT_REPORT_HINT,
@@ -1067,6 +1067,7 @@ export class QueryInterface<
       sqlCacheSize !== undefined && sqlCacheSize > 0 ? Math.floor(sqlCacheSize) : 1000,
     );
     this.dialect = options?.dialect ?? postgresDialect;
+    assertDialectCapabilities(this.dialect);
     this.sqlCommenter =
       options?._sqlCommenter ??
       resolveSqlComment(options?.sqlComment, this.logger, {

@@ -8,7 +8,7 @@
 import pg from 'pg';
 import { DESTRUCTIVE_KIND_LABEL, type DestructiveStatement, scanDestructiveSql } from './cli/destructive.js';
 import { guardConnection } from './connection-guard.js';
-import { type Dialect, postgresDialect } from './dialect.js';
+import { assertDialectCapabilities, type Dialect, postgresDialect } from './dialect.js';
 import { UnsupportedFeatureError, ValidationError } from './errors.js';
 import { pgConfActionToReferential, stripCheckWrapper } from './introspect.js';
 import { camelToSnake, type ReferentialAction } from './schema.js';
@@ -118,6 +118,7 @@ function resolveDdlType(config: ColumnConfig, dialect: Dialect, columnName: stri
  */
 export function schemaToSQL(schema: SchemaDef, options?: SchemaSqlOptions): string[] {
   const dialect = options?.dialect ?? postgresDialect;
+  assertDialectCapabilities(dialect);
   const extensions = options?.extensions ?? 'auto';
   const statements: string[] = [];
 

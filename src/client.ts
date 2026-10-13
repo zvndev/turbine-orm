@@ -39,7 +39,7 @@ import {
   withStartupSetting,
 } from './connection-url.js';
 import { type DiagnosticsConfig, type ResolvedDiagnostics, resolveDiagnostics } from './diagnostics.js';
-import { type Dialect, postgresDialect } from './dialect.js';
+import { assertDialectCapabilities, type Dialect, postgresDialect } from './dialect.js';
 import {
   ConnectionError,
   type ErrorMessageMode,
@@ -1467,21 +1467,6 @@ function resolveNonNegativeInteger(value: unknown, name: string, unit: string): 
     );
   }
   return value;
-}
-
-/**
- * Refuse a dialect with no `capabilities` object (E003): every code path asks
- * it what the engine can do, so a hand-built dialect without one would fail on
- * its first query with a TypeError instead of here.
- */
-function assertDialectCapabilities(dialect: Dialect): void {
-  const capabilities = (dialect as { capabilities?: unknown }).capabilities;
-  if (typeof capabilities === 'object' && capabilities !== null) return;
-  throw new ValidationError(
-    `The dialect "${String(dialect.name)}" has no \`capabilities\` object, which says what the engine can do. ` +
-      'Build it from an engine dialect (`{ ...postgresDialect, name, capabilities: { ... } }`) and state every ' +
-      'EngineCapabilities key.',
-  );
 }
 
 /**

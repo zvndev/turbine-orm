@@ -10,6 +10,7 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+import { type Dialect, postgresDialect } from '../dialect.js';
 import { UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { defineSchema } from '../schema-builder.js';
 import { schemaToSQL, schemaToSQLString } from '../schema-sql.js';
@@ -145,8 +146,9 @@ describe('B4, vector columns', () => {
     const schema = defineSchema({
       docs: { id: { type: 'serial', primaryKey: true }, embedding: { type: 'vector', dimensions: 3 } },
     });
-    const fakeDialect = { supportsVector: false, name: 'sqlite' } as never;
-    assert.throws(() => schemaToSQL(schema, { dialect: fakeDialect }), UnsupportedFeatureError);
+    // Only the flag differs from PostgreSQL, so the flag is what refuses it.
+    const noVector = { ...postgresDialect, name: 'no-vector', supportsVector: false } as unknown as Dialect;
+    assert.throws(() => schemaToSQL(schema, { dialect: noVector }), UnsupportedFeatureError);
   });
 });
 

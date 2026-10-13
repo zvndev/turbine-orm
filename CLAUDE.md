@@ -1112,17 +1112,28 @@ src/
                         `capabilities.maxBindParameters` (`Infinity` is no limit), and
                         writes.ts `rowsPerStatement` reads `capabilities.maxInsertRows` (SQL
                         Server 1000; an `onConflict` MERGE is not bound by it).
-                        `TurbineClient` refuses a dialect with no `capabilities` (E003).
+                        A dialect with no `capabilities` is refused with one E003 by
+                        `assertDialectCapabilities` (dialect.ts), which every public entry
+                        point that takes a dialect calls: `TurbineClient` (and so
+                        `turbineHttp`), `QueryInterface`, `schemaToSQL` and `introspect`.
                         `src/test/capabilities-guard.test.ts` pins every value per engine,
                         requires each engine's object to be its OWN and frozen, builds the
                         same ops under a renamed copy of each engine dialect and requires
-                        identical SQL, and SCANS `src/` for any `dialect.name` comparison,
-                        switch, `Set.has` or keyed lookup, and any comparison with an engine
-                        name literal, outside a commented allowlist (expr.ts GREATEST /
-                        LEAST / now() rendering, schema-sql.ts DEFAULT spelling, two
-                        error-hint lookups, grammar branches inside the statement lexers); a stale allowlist entry
-                        fails too. The `supports*` flags below are still top-level and
-                        inherited; moving them in is 0.91 work.
+                        identical SQL and the same `$transaction({ readOnly: true })`, and
+                        SCANS `src/` (whole files, so a wrapped test is found) for every
+                        way of testing the name: a comparison or `Object.is`, a switch,
+                        `.has` / `.includes` / `.get` / `Object.hasOwn` / `in`, a keyed
+                        lookup, a value read off the name, the name destructured or
+                        aliased, a dialect bound to a name not ending in `dialect`, and a
+                        comparison with, or a collection of, engine-name literals. The
+                        allowlist (expr.ts GREATEST / LEAST / now() rendering, schema-sql.ts
+                        DEFAULT spelling, error-hint lookups and their keyed maps, three
+                        names passed on as error text, two dialects read for transaction
+                        keywords, grammar branches inside the statement lexers) pins each
+                        entry to a rule and an EXACT site count, so a new site in an exempt
+                        file fails, and so does an entry whose sites are gone. The
+                        `supports*` flags below are still top-level and inherited; moving
+                        them in is 0.91 work.
                       • Capability flags, `supportsReturning`, `supportsVector`,
                         `supportsListenNotify`, `supportsRLS`, `supportsAdvisoryLock`,
                         `supportsILike`, `aggSupportsInlineOrderBy`, `jsonPathSupport`,
