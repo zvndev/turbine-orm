@@ -236,6 +236,7 @@ const live = skipGate(!DATABASE_URL, 'requires DATABASE_URL');
 
 const SUFFIX = `${process.pid}_${Date.now().toString(36)}`;
 const USERS = `cgcli_users_${SUFFIX}`;
+const NOT_INCLUDED = `cgcli_not_included_${SUFFIX}`;
 
 const SCHEMA_FILE = `
 import { defineSchema } from ${JSON.stringify(SRC.schemaBuilder)};
@@ -259,14 +260,17 @@ describe('turbine generate applies the schema file tags (live)', () => {
   before(async () => {
     if (!DATABASE_URL) return;
     pool = new pg.Pool({ connectionString: DATABASE_URL, max: 2 });
+    await pool.query(`CREATE TABLE IF NOT EXISTS "${NOT_INCLUDED}" (id int PRIMARY KEY, data text)`);
     project = makeProject('code-first-tags', { databaseUrl: DATABASE_URL });
     project.write('turbine/schema.ts', SCHEMA_FILE);
     project.write(
       'turbine.config.js',
       `export default { include: [${JSON.stringify(USERS)}], out: './generated/turbine', columnTypes: ${JSON.stringify({
         [`${USERS}.meta`]: 'Record<string, number>',
-        // A table the include filter leaves out: dropped, not an unknown-table error.
-        'cgcli_not_included.data': 'string',
+        // A table the database has but the include filter leaves out: dropped, not an
+        // unknown-table error. A key naming a table the database does NOT have is a
+        // typo and is refused (fix-cli-commands.test.ts).
+        [`${NOT_INCLUDED}.data`]: 'string',
       })} };\n`,
     );
     const push = project.cli(['push']);
@@ -277,6 +281,7 @@ describe('turbine generate applies the schema file tags (live)', () => {
   after(async () => {
     if (!pool) return;
     await pool.query(`DROP TABLE IF EXISTS "${USERS}" CASCADE`);
+    await pool.query(`DROP TABLE IF EXISTS "${NOT_INCLUDED}"`);
     await pool.end();
     project?.cleanup();
   });
