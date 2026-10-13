@@ -312,14 +312,38 @@ export function withStatementTimeoutOption(
   config: ConnectionOptionsConfig,
   statementTimeoutMs: number,
 ): ConnectionOptionsConfig {
-  if (!Number.isSafeInteger(statementTimeoutMs) || statementTimeoutMs < 0) return config;
-  // No unit suffix: statement_timeout's default unit IS milliseconds, which is
-  // what `SET statement_timeout = <n>` meant before this replaced it.
-  const setting = `-c statement_timeout=${statementTimeoutMs}`;
+  const setting = statementTimeoutSetting(statementTimeoutMs);
+  return setting === null ? config : withStartupSetting(config, setting);
+}
 
-  const merged = mergeConnectionStringOptions(config.connectionString, setting);
+/**
+ * The `-c statement_timeout=<ms>` startup setting, or `null` when the value is
+ * not a non-negative safe integer (see the injection note on
+ * {@link withStatementTimeoutOption}). No unit suffix: the GUC's default unit
+ * is milliseconds.
+ */
+export function statementTimeoutSetting(statementTimeoutMs: number): string | null {
+  if (!Number.isSafeInteger(statementTimeoutMs) || statementTimeoutMs < 0) return null;
+  return `-c statement_timeout=${statementTimeoutMs}`;
+}
+
+/**
+ * `config` with one `-c name=value` startup setting appended to its libpq
+ * `options`, in whichever place pg will read them from: an `options` query
+ * parameter already on the connection string wins over the `options` field,
+ * and the field falls back to `PGOPTIONS` only while it is unset, so both are
+ * read first and appended to rather than replaced.
+ *
+ * `setting` is emitted verbatim. The caller must have built it from a closed
+ * set or a narrowed number: the `options` string is split on whitespace, so a
+ * caller-controlled value could carry a second `-c`.
+ */
+export function withStartupSetting<T extends { connectionString?: string; options?: string }>(
+  config: T,
+  setting: string,
+): T & { options?: string } {
+  const merged = config.connectionString ? mergeConnectionStringOptions(config.connectionString, setting) : null;
   if (merged !== null) return { ...config, connectionString: merged };
-
   const existing = config.options || (typeof process !== 'undefined' ? process.env?.PGOPTIONS : undefined);
   return { ...config, options: existing ? `${existing} ${setting}` : setting };
 }
@@ -336,22 +360,12 @@ export function withStatementTimeoutOption(
  * password is not parseable by pg either, so there is no shape this handles
  * differently from the driver.
  *
- * Shared with `client.ts`, which needs the identical merge for
- * `plan_cache_mode`. It was duplicated there until 2026-08-16, and the reason
- * is worth keeping because it was wrong in an instructive way: importing it
- * from `client.ts` adds an import edge from a module ~100 test processes load,
- * and this file's merged coverage read 40% while measuring 100% in isolation,
- * which moved the aggregate gate 75.48% -> 75.03% against a 75% floor. The
- * conclusion drawn was that the refactor cost the gate's headroom.
+ * Used by {@link withStartupSetting} (the client's pool configuration) and
+ * {@link withSearchPathOption}.
  *
- * The 40% was a c8 merge defect, not an import cost: c8's V8-level merge is not
- * monotonic, and once the report merges at the istanbul level instead this file
- * reads 100% with the edge in place (see `//merge-bug` in .c8rc.json). So the
- * duplication was paying for an artifact, and the two copies are now one.
- *
- * Keep this module import-free regardless. That part was never about coverage:
- * `query/` and `cli/` both reach it, and an edge back to `client.ts` would be
- * the cycle `scripts/check-import-cycles.mjs` exists to refuse.
+ * Keep this module import-free: `query/` and `cli/` both reach it, and an
+ * edge back to `client.ts` would be the cycle `scripts/check-import-cycles.mjs`
+ * exists to refuse.
  */
 export function mergeConnectionStringOptions(connectionString: string, setting: string): string | null {
   const q = connectionString.indexOf('?');
