@@ -145,6 +145,7 @@ import {
   snakeToCamel,
   type TableMetadata,
 } from './schema.js';
+import { rewritePositionalPlaceholders } from './sql-placeholders.js';
 
 // ---------------------------------------------------------------------------
 // SQL Server / connection limits
@@ -246,7 +247,7 @@ interface MssqlModule {
  * booleans directly; `undefined`/`null` → NULL; `bigint` follows the safe-int
  * policy (number when it fits in 2^53, else a decimal string, no precision
  * loss); `Date`/`Uint8Array` pass through; any remaining object/array → JSON text
- * (matches how Turbine already pre-serializes JSON filter / `IN`-list params).
+ * (matches how Turbine already pre-serializes JSON filter params).
  */
 function toMssqlParam(value: unknown): MssqlParam {
   if (value === undefined || value === null) return null;
@@ -263,6 +264,42 @@ function toMssqlParam(value: unknown): MssqlParam {
   if (value instanceof Date) return value;
   if (value instanceof Uint8Array) return value; // Buffer is a Uint8Array subclass
   return JSON.stringify(value);
+}
+
+/**
+ * The JSON text an `in` / `notIn` list binds as. OPENJSON hands each element
+ * back as NVARCHAR text, and SQL Server converts that text to the compared
+ * column's type, so each element is written as the text that converts to the
+ * value `equals` would bind: a bigint as its digits (`JSON.stringify` refuses
+ * one) and a Date as its UTC date and time with no zone (the driver binds a
+ * Date as DATETIME2 in UTC; `JSON.stringify` adds a `Z`). No text converts to
+ * bytes, so a binary element is refused with the spelling that works.
+ */
+function mssqlInListJson(values: readonly unknown[]): string {
+  const parts = values.map((value): string => {
+    if (typeof value === 'bigint') return value.toString();
+    if (value instanceof Date) {
+      if (Number.isNaN(value.getTime())) {
+        throw new ValidationError(
+          'SQL Server cannot bind an Invalid Date in an `in` list. Pass a valid Date, or null.',
+        );
+      }
+      return JSON.stringify(value.toISOString().slice(0, 23));
+    }
+    if (value instanceof Uint8Array) {
+      throw new UnsupportedFeatureError(
+        'a binary value in an `in` / `notIn` list',
+        'mssql',
+        'SQL Server receives the list as JSON text, which cannot carry bytes. Write the list as branches: ' +
+          '`{ OR: [{ field: value1 }, { field: value2 }] }`, or use the default `join` relation strategy for ' +
+          'a relation keyed on a binary column.',
+      );
+    }
+    if (value === undefined) return 'null';
+    const bound = toMssqlParam(value);
+    return JSON.stringify(bound);
+  });
+  return `[${parts.join(',')}]`;
 }
 
 // ---------------------------------------------------------------------------
@@ -421,18 +458,29 @@ function bindParam(request: MssqlRequest, name: string, value: unknown, types: M
   request.input(name, toMssqlParam(value));
 }
 
-/** Bind positional `params[]` to `@p1`, `@p2`, … inputs and run the statement. */
+/** The refusal for a placeholder the shim cannot bind (see rewritePositionalPlaceholders). */
+function refusePlaceholder(message: string): never {
+  throw new ValidationError(message);
+}
+
+/**
+ * Bind positional `params[]` to `@p1`, `@p2`, … inputs and run the statement.
+ * A `$n` (the spelling `rawUnsafe` documents for every engine) is rewritten to
+ * `@pN` first: T-SQL reads `$1` as a MONEY literal, so it would run, compare
+ * against the number 1, and bind nothing.
+ */
 async function runRequest(
   request: MssqlRequest,
   text: string,
   params: unknown[],
   types?: MssqlModule,
 ): Promise<ReturnType<typeof shapeResult>> {
+  const sql = rewritePositionalPlaceholders(text, 'mssql', params.length, (i) => `@p${i}`, refusePlaceholder);
   for (let i = 0; i < params.length; i++) {
     bindParam(request, `p${i + 1}`, params[i], types);
   }
   try {
-    const result = await request.query(text);
+    const result = await request.query(sql);
     return shapeResult(result);
   } catch (err) {
     throw augmentMssqlError(err);
@@ -628,7 +676,9 @@ function mssqlColumnType(type: string, maxLength?: number | null): string {
   if (/TIMESTAMP|DATETIME/.test(t)) return 'DATETIME2';
   if (/\bDATE\b/.test(t)) return 'DATE';
   if (/\bTIME\b/.test(t)) return 'TIME';
-  if (/BYTEA|BLOB/.test(t)) return 'VARBINARY(MAX)';
+  // A bounded binary column is VARBINARY(n): VARBINARY(MAX) cannot be a key.
+  if (/VARBINARY/.test(t)) return `VARBINARY(${maxLength ?? 255})`;
+  if (/BYTEA|BLOB/.test(t)) return maxLength != null ? `VARBINARY(${maxLength})` : 'VARBINARY(MAX)';
   if (/VARCHAR/.test(t)) return maxLength != null ? `NVARCHAR(${maxLength})` : 'NVARCHAR(255)';
   if (/CHAR/.test(t)) return maxLength != null ? `NCHAR(${maxLength})` : 'NCHAR(255)';
   if (/TEXT|CLOB/.test(t)) return 'NVARCHAR(MAX)';
@@ -832,14 +882,15 @@ export const mssqlDialect: Dialect = {
   // No array params. OPENJSON expands a single JSON-array param into a row set,
   // keeping ONE placeholder (so the SQL cache stays valid regardless of list
   // length) and handling the empty list (OPENJSON('[]') → zero rows). SQL Server
-  // implicitly converts the nvarchar `value` to the column's type, so this works
-  // for numbers AND strings. OPENJSON requires SQL Server 2016+.
+  // implicitly converts the nvarchar `value` to the column's type, and
+  // mssqlInListJson writes each element as the text that converts to the value
+  // `equals` binds. OPENJSON requires SQL Server 2016+.
   buildInClause(expr: string, paramRef: string, negated: boolean): string {
     return `${expr} ${negated ? 'NOT IN' : 'IN'} (SELECT [value] FROM OPENJSON(${paramRef}))`;
   },
 
   inClauseParam(values: unknown[]): unknown {
-    return JSON.stringify(values ?? []);
+    return mssqlInListJson(Array.isArray(values) ? values : []);
   },
 
   // OUTPUT replaces RETURNING, injected mid-statement by the statement builders,
@@ -1067,6 +1118,19 @@ export const mssqlDialect: Dialect = {
 
   buildColumnType(input: ColumnTypeInput): string {
     return mssqlColumnType(input.type, input.maxLength);
+  },
+
+  /**
+   * SQL Server has no enum type: an NVARCHAR column long enough for the
+   * longest label (at least 255), and a CHECK that admits only the labels.
+   * The CHECK compares under the column's collation, so on a case-insensitive
+   * default collation `'ACTIVE'` passes for a label `'active'`, as it does in
+   * every other text comparison there.
+   */
+  buildEnumColumn(column: string, labels: readonly string[]): { type: string; maxLength: number; check: string } {
+    const literals = labels.map((label) => `N'${label.replace(/'/g, "''")}'`);
+    const longest = Math.max(255, ...labels.map((label) => label.length));
+    return { type: 'VARCHAR', maxLength: longest, check: `${column} IN (${literals.join(', ')})` };
   },
 
   buildColumnDefinition(input: ColumnDefinitionInput): string {

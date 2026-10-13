@@ -150,10 +150,11 @@ describe('turbine-orm/mysql, dialect conformance (no Postgres leakage)', () => {
     assert.doesNotMatch(sql, FORBIDDEN);
   });
 
-  it('IN list → JSON_TABLE single-placeholder (length-stable), no = ANY', () => {
+  it('IN list → one builder param (length-stable SQL), expanded per element by the shim, no = ANY', () => {
     const d = q().buildFindMany({ where: { role: { in: ['admin', 'editor'] } } });
-    assert.match(d.sql, /`role` IN \(SELECT `v` FROM JSON_TABLE\(:p\d, '\$\[\*\]'/);
-    assert.deepEqual(d.params, ['["admin","editor"]']);
+    assert.match(d.sql, /`role` IN \(:p1\)/);
+    assert.equal(d.params.length, 1);
+    assert.deepEqual({ ...(d.params[0] as object) }, { values: ['admin', 'editor'] });
     assert.doesNotMatch(d.sql, FORBIDDEN);
   });
 
@@ -781,7 +782,7 @@ describe('turbine-orm/mysql, integration (real MySQL 8)', () => {
     assert.equal(admins[0].name, 'Alice Admin');
   });
 
-  gate.it('comparison + IN operators (JSON_TABLE)', async () => {
+  gate.it('comparison + IN operators', async () => {
     const hot = await client.table('posts').findMany({ where: { viewCount: { gt: 50 } } });
     assert.deepEqual(hot.map((p: PostRow) => p.id).sort(), [1, 2, 5]);
     const staff = await client

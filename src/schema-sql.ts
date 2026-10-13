@@ -139,14 +139,18 @@ export function schemaToSQL(schema: SchemaDef, options?: SchemaSqlOptions): stri
   }
 
   // CREATE TYPE for every schema-level enum, before the tables that use them.
-  for (const [enumName, labels] of Object.entries(schema.enums ?? {})) {
-    statements.push(generateCreateEnumType(enumName, labels, dialect));
+  // PostgreSQL only: every other engine declares the labels on the column
+  // itself (see `enumColumnType`), and has no CREATE TYPE to run.
+  if (dialect.name === 'postgresql') {
+    for (const [enumName, labels] of Object.entries(schema.enums ?? {})) {
+      statements.push(generateCreateEnumType(enumName, labels, dialect));
+    }
   }
 
   // Generate CREATE TABLE statements
   for (const tableName of sorted) {
     const table = schema.tables[tableName]!;
-    statements.push(generateCreateTable(table, resolveRef, dialect));
+    statements.push(generateCreateTable(table, resolveRef, dialect, schema.enums));
   }
 
   // Generate CREATE INDEX for foreign key columns
@@ -264,6 +268,7 @@ function generateCreateTable(
   table: TableDef,
   resolveRef?: (raw: string) => string,
   dialect: Dialect = postgresDialect,
+  enums?: Readonly<Record<string, readonly string[]>>,
 ): string {
   const tableName = table.name;
   const columnDefs: string[] = [];
@@ -274,7 +279,7 @@ function generateCreateTable(
   const foreignKeys: string[] = [];
   for (const [fieldName, config] of Object.entries(table.columns)) {
     columnDefs.push(
-      generateColumnDef(fieldName, config, resolveRef, dialect, keyed.has(camelToSnake(fieldName)), inline),
+      generateColumnDef(fieldName, config, resolveRef, dialect, keyed.has(camelToSnake(fieldName)), inline, enums),
     );
     if (!inline) {
       const fk = generateForeignKeyConstraint(fieldName, config, resolveRef, dialect);
@@ -308,11 +313,13 @@ function generateCreateTable(
 }
 
 /**
- * Dialects whose unbounded text type cannot be a key. MySQL rejects `TEXT` in a
- * PRIMARY KEY / UNIQUE / INDEX / FOREIGN KEY without a prefix length
- * (`ER_BLOB_KEY_WITHOUT_LENGTH`), and SQL Server refuses `NVARCHAR(MAX)` as an
- * index key column. A text column in key position is emitted as the dialect's
- * bounded string type instead (`VARCHAR(255)` / `NVARCHAR(255)`).
+ * Dialects whose unbounded text and binary types cannot be a key. MySQL rejects
+ * `TEXT` and `BLOB` in a PRIMARY KEY / UNIQUE / INDEX / FOREIGN KEY without a
+ * prefix length (`ER_BLOB_KEY_WITHOUT_LENGTH`), and SQL Server refuses
+ * `NVARCHAR(MAX)` and `VARBINARY(MAX)` as an index key column. A text or bytea
+ * column in key position is emitted as the dialect's bounded type instead
+ * (`VARCHAR(255)` / `NVARCHAR(255)`, `VARBINARY(255)`), or with its own
+ * `maxLength` when it declares one.
  */
 const UNBOUNDED_TEXT_CANNOT_BE_KEY: ReadonlySet<string> = new Set(['mysql', 'mssql']);
 
@@ -360,11 +367,56 @@ function generateForeignKeyConstraint(
 }
 
 /**
+ * The type (and CHECK) of an enum column on an engine with no named enum type,
+ * from the dialect's `buildEnumColumn`, or null on PostgreSQL, where the column
+ * names the `CREATE TYPE`. The labels come from the schema's `enums`: off
+ * PostgreSQL there is no existing type a column could name instead.
+ */
+function enumColumnType(
+  config: ColumnConfig,
+  dialect: Dialect,
+  column: string,
+  enums: Readonly<Record<string, readonly string[]>> | undefined,
+): { type: string; maxLength?: number | null; check?: string } | null {
+  if (!config.enumName || dialect.name === 'postgresql') return null;
+  if (!dialect.buildEnumColumn) {
+    throw new UnsupportedFeatureError(
+      'enum columns',
+      dialect.name,
+      `Column "${column}" is of enum type "${config.enumName}". Declare it as text with a CHECK constraint instead.`,
+    );
+  }
+  if (config.isArray) {
+    throw new UnsupportedFeatureError(
+      'enum array columns',
+      dialect.name,
+      `Column "${column}" is an array of enum "${config.enumName}"; ${dialect.name} has no array columns.`,
+    );
+  }
+  const labels = enums?.[config.enumName];
+  if (!labels) {
+    throw new ValidationError(
+      `Column "${column}" is of enum type "${config.enumName}", which the schema does not declare. ` +
+        `${dialect.name} has no enum type to refer to, so the labels must be in the schema: ` +
+        `defineSchema(tables, { enums: { ${JSON.stringify(config.enumName)}: ['a', 'b'] } }).`,
+    );
+  }
+  if (labels.length === 0) {
+    throw new ValidationError(
+      `Enum "${config.enumName}" declares no labels, so column "${column}" could hold nothing.`,
+    );
+  }
+  return dialect.buildEnumColumn(dialect.quoteIdentifier(column), labels);
+}
+
+/**
  * Generate a single column definition line (e.g. "id BIGSERIAL PRIMARY KEY").
  *
  * `keyed` marks a column that sits in a key (see {@link keyedColumnNames}); it
  * only matters to dialects that cannot key an unbounded text type. `inlineReferences`
  * is false for a dialect that declares foreign keys at table level instead.
+ * `enums` is the schema's enum declarations, needed off PostgreSQL to declare
+ * an enum column's labels on the column itself.
  */
 function generateColumnDef(
   fieldName: string,
@@ -373,8 +425,10 @@ function generateColumnDef(
   dialect: Dialect = postgresDialect,
   keyed = false,
   inlineReferences = true,
+  enums?: Readonly<Record<string, readonly string[]>>,
 ): string {
   const snakeName = camelToSnake(fieldName);
+  const enumColumn = enumColumnType(config, dialect, snakeName, enums);
 
   // NOT NULL, serial types are implicitly NOT NULL, but explicit is fine.
   // A column is NOT NULL if:
@@ -417,10 +471,14 @@ function generateColumnDef(
   // so they are passed through resolved.
   const plainScalar = !config.enumName && config.vectorDimensions == null && !config.isArray;
   let typeInput: { type: string; maxLength: number | null };
-  if (!plainScalar) {
+  if (enumColumn) {
+    typeInput = { type: enumColumn.type, maxLength: enumColumn.maxLength ?? null };
+  } else if (!plainScalar) {
     typeInput = { type: resolveDdlType(config, dialect, snakeName), maxLength: null };
   } else if (keyed && config.type === 'TEXT' && UNBOUNDED_TEXT_CANNOT_BE_KEY.has(dialect.name)) {
     typeInput = { type: 'VARCHAR', maxLength: config.maxLength };
+  } else if (keyed && config.type === 'BYTEA' && UNBOUNDED_TEXT_CANNOT_BE_KEY.has(dialect.name)) {
+    typeInput = { type: 'VARBINARY', maxLength: config.maxLength };
   } else {
     typeInput = { type: config.type, maxLength: config.maxLength };
   }
@@ -454,6 +512,10 @@ function generateColumnDef(
   if (config.check) {
     def += ` CHECK (${config.check})`;
   }
+  // The enum's labels, on an engine whose column type does not hold them.
+  if (enumColumn?.check) {
+    def += ` CHECK (${enumColumn.check})`;
+  }
 
   return def;
 }
@@ -486,16 +548,35 @@ function normalizeDefault(val: string): string {
     return val.trim();
   }
 
-  // Simple single-quoted string literals (no semicolons, no SQL statement keywords)
-  if (/^'[^']*'$/.test(val.trim())) {
-    const inner = val.trim().slice(1, -1);
+  // Single-quoted string literals, a quote inside written doubled (`'it''s'`),
+  // optionally followed by a PostgreSQL cast as the catalog prints a default
+  // (`'x'::text`, `'{}'::jsonb`). The cast is dropped: the literal is assigned
+  // to the column, which converts it to the column's type on every engine,
+  // and the other engines have no `::`. No semicolons, no statement keywords.
+  const literal = defaultStringLiteral(val.trim());
+  if (literal !== null) {
+    const inner = literal.slice(1, -1);
     if (/[;]/.test(inner) || /\b(DROP|ALTER|CREATE|INSERT|UPDATE|DELETE|GRANT|REVOKE|TRUNCATE)\b/i.test(inner)) {
-      throw new Error(`Suspicious default value: ${val}. String literals must not contain SQL statements.`);
+      throw new ValidationError(`Suspicious default value: ${val}. String literals must not contain SQL statements.`);
     }
-    return val.trim();
+    return literal;
   }
 
-  throw new Error(`Unsupported default value: ${val}. Use a SQL function, numeric, string literal, or NULL.`);
+  throw new ValidationError(
+    `Unsupported default value: ${val}. Use a SQL function, numeric, string literal (a quote inside it written ` +
+      `twice, as in 'it''s'), or NULL.`,
+  );
+}
+
+/**
+ * The string literal a default is, with any trailing PostgreSQL cast removed,
+ * or null when it is not one. Both patterns are linear: `[^']` and `''` cannot
+ * match the same text, and a cast's words are separated by single spaces.
+ */
+function defaultStringLiteral(val: string): string | null {
+  const cast = /^('(?:[^']|'')*')::[a-z_][a-z0-9_]*(?: [a-z_][a-z0-9_]*)*(?:\(\d+(?:, ?\d+)?\))?(?:\[\])?$/i.exec(val);
+  if (cast) return cast[1]!;
+  return /^'(?:[^']|'')*'$/.test(val) ? val : null;
 }
 
 /**
@@ -503,6 +584,18 @@ function normalizeDefault(val: string): string {
  * as an expression, in parentheses (8.0.13+), even when its value is a constant.
  */
 const MYSQL_EXPRESSION_DEFAULT_TYPES = /^(TINY|MEDIUM|LONG)?(TEXT|BLOB)\b|^JSON\b/i;
+
+/**
+ * A MySQL expression default for a string literal, as its UTF-8 bytes in hex:
+ * `(X'...')` on a BLOB column, `(CONVERT(X'...' USING utf8mb4))` on a TEXT or
+ * JSON one. `normalized` is a single-quoted literal with its quotes doubled.
+ */
+function mysqlHexDefault(normalized: string, columnType: string): string {
+  const value = normalized.slice(1, -1).replace(/''/g, "'");
+  let hex = '';
+  for (const byte of new TextEncoder().encode(value)) hex += byte.toString(16).padStart(2, '0');
+  return /BLOB/i.test(columnType) ? `(X'${hex}')` : `(CONVERT(X'${hex}' USING utf8mb4))`;
+}
 
 /** What a clock default means on a MySQL date or time column. */
 function mysqlClockDefault(key: string, ddlType: string): string | null {
@@ -549,7 +642,25 @@ function dialectDefault(normalized: string, dialect: Dialect, columnType = ''): 
       const clock = mysqlClockDefault(key, columnType);
       if (clock) return clock;
       // `DEFAULT NULL` is the one default these types accept as a literal.
-      if (key !== 'NULL' && MYSQL_EXPRESSION_DEFAULT_TYPES.test(columnType)) return `(${normalized})`;
+      const expression = key !== 'NULL' && MYSQL_EXPRESSION_DEFAULT_TYPES.test(columnType);
+      if (normalized.startsWith("'") && /['\\]/.test(normalized.slice(1, -1))) {
+        // A quote or a backslash inside the literal. Whether `\` escapes depends
+        // on the session's NO_BACKSLASH_ESCAPES, which Turbine's own connections
+        // set and other clients do not. An EXPRESSION default is worse: MySQL
+        // stores it re-escaped with backslashes and parses it again on every
+        // insert under the inserting session's mode, so `('it''s')` created
+        // fine and then failed every insert on a Turbine connection (measured
+        // on MySQL 8). Spelled as hex bytes, the value has no quote or
+        // backslash to read either way.
+        if (expression) return mysqlHexDefault(normalized, columnType);
+        if (normalized.includes('\\')) {
+          throw new ValidationError(
+            `The default ${normalized} holds a backslash, which MySQL reads differently with and without ` +
+              'NO_BACKSLASH_ESCAPES. Use a default without one.',
+          );
+        }
+      }
+      if (expression) return `(${normalized})`;
       return normalized;
     }
     case 'mssql':

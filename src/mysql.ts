@@ -109,6 +109,7 @@ import {
   snakeToCamel,
   type TableMetadata,
 } from './schema.js';
+import { rewritePositionalPlaceholders, scanPlaceholders } from './sql-placeholders.js';
 
 // ---------------------------------------------------------------------------
 // Minimal structural typing for the mysql2 surface we touch
@@ -156,7 +157,7 @@ interface Mysql2Header {
  * 1/0 (MySQL has no boolean type; `TINYINT(1)` stores 1/0), `undefined`/`null`
  * → NULL, `Date`/`Uint8Array` pass through (mysql2 formats them), and any
  * remaining object/array → JSON text (matches how Turbine already pre-serializes
- * JSON filter / `IN`-list params).
+ * JSON filter params). An `in` list element binds through here too, one by one.
  */
 function toMysqlParam(value: unknown): MysqlParam {
   if (value === undefined || value === null) return null;
@@ -189,19 +190,115 @@ function toMysqlParam(value: unknown): MysqlParam {
 }
 
 /**
- * Bind the positional `params[]` (in 1-indexed generation order) to the named
- * `:p1`, `:p2`, … placeholders the dialect emits. Mapping by NAME makes binding
- * independent of where each placeholder lands in the SQL text, the same
- * guarantee Postgres' numbered `$N` gives. Returns `undefined` for parameter-less
- * statements (BEGIN/COMMIT/DDL) so they bind nothing.
+ * An `in` / `notIn` list, as the builder hands it to the shim: ONE param, so
+ * the SQL text and its cache entry stay independent of the list's length (see
+ * {@link mysqlDialect.buildInClause}). The shim expands it into one placeholder
+ * per element, each bound exactly as an equality operand is, which is what
+ * makes `{ in: [v] }` match the rows `{ equals: v }` matches on every column
+ * type: a `JSON_TABLE` list compared JSON values, so a boolean, a date or time,
+ * a binary value, a decimal or bigint written as a string, and every
+ * case-folded string missed, and `notIn` then matched every row.
  */
-function toNamedBinding(values: unknown[]): Record<string, MysqlParam> | undefined {
-  if (values.length === 0) return undefined;
+class MysqlInList {
+  constructor(readonly values: readonly unknown[]) {}
+}
+
+/** MySQL's limit on placeholders in one prepared statement. */
+const MYSQL_MAX_PLACEHOLDERS = 65_535;
+
+/** A list of `n` elements is sent padded to the next power of two (by repeating its last element). */
+function paddedListLength(n: number): number {
+  return n <= 1 ? n : 2 ** Math.ceil(Math.log2(n));
+}
+
+/** The refusal for a placeholder the shim cannot bind (see rewritePositionalPlaceholders). */
+function refusePlaceholder(message: string): never {
+  throw new ValidationError(message);
+}
+
+/**
+ * The statement text and named binding for one execution: `$n` placeholders
+ * (the spelling `rawUnsafe` documents) rewritten to `:pN`, every
+ * {@link MysqlInList} expanded, and every other value bound by name. Mapping by
+ * NAME makes binding independent of where each placeholder lands in the SQL
+ * text, the same guarantee Postgres' numbered `$N` gives. `binding` is
+ * `undefined` when nothing is bound, so parameter-less statements (BEGIN,
+ * COMMIT, DDL) run through `.query()`.
+ */
+function bindStatement(
+  sql: string,
+  values: unknown[],
+): { sql: string; binding: Record<string, MysqlParam> | undefined } {
+  if (values.length === 0) return { sql, binding: undefined };
+  const text = rewritePositionalPlaceholders(sql, 'mysql', values.length, (i) => `:p${i}`, refusePlaceholder);
   const named: Record<string, MysqlParam> = {};
+  let lists: Map<string, MysqlInList> | undefined;
   for (let i = 0; i < values.length; i++) {
-    named[`p${i + 1}`] = toMysqlParam(values[i]);
+    const value = values[i];
+    if (value instanceof MysqlInList) {
+      lists ??= new Map();
+      lists.set(`p${i + 1}`, value);
+    } else {
+      named[`p${i + 1}`] = toMysqlParam(value);
+    }
   }
-  return named;
+  if (lists === undefined) return { sql: text, binding: named };
+  const expanded = expandInLists(text, lists, named);
+  return { sql: expanded, binding: Object.keys(named).length > 0 ? named : undefined };
+}
+
+/**
+ * Replace each list placeholder (`:p3`) with one placeholder per element
+ * (`:p3_0, :p3_1, ...`), binding each element into `named`. An empty list
+ * becomes a subquery with no rows, so `IN` is false and `NOT IN` true, as
+ * Postgres answers `= ANY('{}')` and `!= ALL('{}')`.
+ *
+ * Padding to a power of two bounds the statement texts a caller can produce
+ * (mysql2 prepares and caches one server-side statement per distinct text and
+ * connection, and the server caps the total across every client at
+ * `max_prepared_stmt_count`): about seventeen lengths per list instead of one
+ * per length. A repeated element changes neither `IN` nor `NOT IN`.
+ */
+function expandInLists(sql: string, lists: Map<string, MysqlInList>, named: Record<string, MysqlParam>): string {
+  const tokens = scanPlaceholders(sql, 'mysql');
+  const listTokens = tokens.filter((t) => t.kind === 'named' && lists.has(t.name));
+  const others = tokens.length - listTokens.length;
+  let padded = 0;
+  let exact = 0;
+  for (const t of listTokens) {
+    const n = lists.get(t.name)!.values.length;
+    padded += paddedListLength(n);
+    exact += n;
+  }
+  if (others + exact > MYSQL_MAX_PLACEHOLDERS) {
+    throw new ValidationError(
+      `An \`in\` / \`notIn\` list on MySQL binds one placeholder per element, and this statement needs ` +
+        `${others + exact} where MySQL allows ${MYSQL_MAX_PLACEHOLDERS}. Split the list across several queries.`,
+    );
+  }
+  const pad = others + padded <= MYSQL_MAX_PLACEHOLDERS;
+  for (const [name, list] of lists) {
+    list.values.forEach((v, j) => {
+      named[`${name}_${j}`] = toMysqlParam(v);
+    });
+  }
+  let out = '';
+  let last = 0;
+  for (const t of listTokens) {
+    const n = lists.get(t.name)!.values.length;
+    let replacement: string;
+    if (n === 0) {
+      replacement = 'SELECT NULL FROM DUAL WHERE FALSE';
+    } else {
+      const parts: string[] = [];
+      const length = pad ? paddedListLength(n) : n;
+      for (let j = 0; j < length; j++) parts.push(`:${t.name}_${Math.min(j, n - 1)}`);
+      replacement = parts.join(', ');
+    }
+    out += sql.slice(last, t.start) + replacement;
+    last = t.end;
+  }
+  return out + sql.slice(last);
 }
 
 // ---------------------------------------------------------------------------
@@ -411,9 +508,10 @@ async function execOne(
   sql: string,
   params: unknown[],
 ): Promise<ReturnType<typeof shapeResult>> {
-  const binding = toNamedBinding(params);
+  const bound = bindStatement(sql, params);
+  const binding = bound.binding;
   try {
-    const [result, fields] = binding ? await runner.execute(sql, binding) : await runner.query(sql);
+    const [result, fields] = binding ? await runner.execute(bound.sql, binding) : await runner.query(bound.sql);
     return shapeResult(result, fields);
   } catch (err) {
     throw augmentMysqlError(err);
@@ -594,6 +692,10 @@ function isMysqlDateType(dialectType: string): boolean {
 
 /** Map a schema-builder (Postgres-flavored) column type to MySQL DDL. */
 function mysqlColumnType(type: string, maxLength?: number | null): string {
+  // An enum column's type from `buildEnumColumn`, already spelled for MySQL. It
+  // returns first: its labels are free text, and one named `int` or `date`
+  // would otherwise match a pattern below.
+  if (/^ENUM\(/.test(type)) return type;
   const t = type.toUpperCase();
   if (/BIGSERIAL/.test(t)) return 'BIGINT AUTO_INCREMENT';
   if (/SERIAL/.test(t)) return 'INT AUTO_INCREMENT';
@@ -611,7 +713,9 @@ function mysqlColumnType(type: string, maxLength?: number | null): string {
   if (/TIMESTAMPTZ|TIMESTAMP|DATETIME/.test(t)) return 'DATETIME(3)';
   if (/\bDATE\b/.test(t)) return 'DATE';
   if (/\bTIME\b/.test(t)) return 'TIME';
-  if (/BYTEA|BLOB/.test(t)) return 'BLOB';
+  // A bounded binary column is VARBINARY(n): a BLOB cannot be a key.
+  if (/VARBINARY/.test(t)) return `VARBINARY(${maxLength ?? 255})`;
+  if (/BYTEA|BLOB/.test(t)) return maxLength != null ? `VARBINARY(${maxLength})` : 'BLOB';
   if (/VARCHAR/.test(t)) return maxLength != null ? `VARCHAR(${maxLength})` : 'VARCHAR(255)';
   if (/CHAR/.test(t)) return maxLength != null ? `CHAR(${maxLength})` : 'CHAR(255)';
   if (/TEXT|CLOB/.test(t)) return 'TEXT';
@@ -847,18 +951,17 @@ export const mysqlDialect: Dialect = {
     return s;
   },
 
-  // No array params in MySQL. JSON_TABLE expands a single JSON-array param into a
-  // row set, keeping ONE placeholder (so the SQL cache stays valid regardless of
-  // list length) and handling the empty-list case (zero rows). MySQL coerces the
-  // non-JSON `expr` to JSON for the comparison, so this works for numbers AND
-  // strings. JSON_TABLE requires MySQL 8.0+.
+  // No array params in MySQL. The list is ONE builder param (a MysqlInList),
+  // so the SQL text and its cache entry do not depend on the list's length; the
+  // shim expands the placeholder into one per element when the statement runs
+  // (see expandInLists). Each element binds as an equality operand does, so the
+  // list compares under the column's own type and collation rules.
   buildInClause(expr: string, paramRef: string, negated: boolean): string {
-    const inner = `SELECT \`v\` FROM JSON_TABLE(${paramRef}, '$[*]' COLUMNS (\`v\` JSON PATH '$')) AS \`jt\``;
-    return `${expr} ${negated ? 'NOT IN' : 'IN'} (${inner})`;
+    return `${expr} ${negated ? 'NOT IN' : 'IN'} (${paramRef})`;
   },
 
   inClauseParam(values: unknown[]): unknown {
-    return JSON.stringify(values ?? []);
+    return new MysqlInList(Array.isArray(values) ? values : []);
   },
 
   // No RETURNING, resultStrategy 'reselect' re-fetches the row.
@@ -989,6 +1092,27 @@ export const mysqlDialect: Dialect = {
 
   buildColumnType(input: ColumnTypeInput): string {
     return mysqlColumnType(input.type, input.maxLength);
+  },
+
+  /**
+   * MySQL declares an enum's labels on the column, `ENUM('a', 'b')`, which
+   * refuses any other value in strict mode. A label's quotes are doubled. A
+   * label holding a backslash is refused: whether `\` escapes in a string
+   * literal depends on the session's NO_BACKSLASH_ESCAPES (Turbine's own
+   * connections set it, other clients do not), so the same DDL would declare
+   * a different label depending on what runs it.
+   */
+  buildEnumColumn(column: string, labels: readonly string[]): { type: string } {
+    const literals = labels.map((label) => {
+      if (label.includes('\\')) {
+        throw new ValidationError(
+          `The enum label ${JSON.stringify(label)} on column ${column} holds a backslash, which MySQL reads ` +
+            'differently with and without NO_BACKSLASH_ESCAPES. Use a label without one.',
+        );
+      }
+      return `'${label.replace(/'/g, "''")}'`;
+    });
+    return { type: `ENUM(${literals.join(', ')})` };
   },
 
   buildColumnDefinition(input: ColumnDefinitionInput): string {
@@ -1376,7 +1500,7 @@ export async function introspectMysql(options: IntrospectOptions): Promise<Schem
 
 /** mysql2 connection flags Turbine pins for correct behavior. */
 const MYSQL_DRIVER_FLAGS = {
-  // Named placeholders (`:pN`), see paramPlaceholder + toNamedBinding.
+  // Named placeholders (`:pN`), see paramPlaceholder + bindStatement.
   namedPlaceholders: true,
   // Safe-int policy matching Postgres int8: number when it fits, decimal string
   // otherwise. DECIMAL always comes back as a string. No global state mutated.

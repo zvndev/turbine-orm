@@ -569,8 +569,20 @@ export function resolveCountRelations(parentMeta: TableMetadata, countSpec: With
   return out;
 }
 
-/** Stringified stitch key, robust to number/uuid/bigint type drift across a join. */
+/**
+ * Stringified stitch key, robust to number/uuid/bigint type drift across a join.
+ * A binary key is keyed by its bytes: `String()` of a Buffer decodes it as
+ * UTF-8, which maps different invalid sequences to the same replacement text.
+ * A Date by its instant, which `String()` truncates to the second.
+ */
 function keyOf(value: unknown): string {
+  if (value instanceof Uint8Array) {
+    // No Buffer: this module runs on edge runtimes too.
+    let hex = '\u0000bytes:';
+    for (const byte of value) hex += byte.toString(16).padStart(2, '0');
+    return hex;
+  }
+  if (value instanceof Date) return `\u0000date:${value.getTime()}`;
   return String(value);
 }
 

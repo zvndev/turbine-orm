@@ -822,19 +822,57 @@ export interface Dialect {
    * a single bound parameter reference. PostgreSQL binds the whole list as one
    * array param (`expr = ANY($n)` / `expr != ALL($n)`), so the placeholder count
    * stays independent of the list length and the SQL cache remains valid.
-   * Engines without array parameters (SQLite) override this together with
-   * {@link inClauseParam} to use a length-independent single-placeholder form
-   * (e.g. `expr IN (SELECT value FROM json_each(?))`). Optional: the query
-   * builder falls back to the PostgreSQL `ANY`/`ALL` form when absent.
+   * Engines without array parameters override this together with
+   * {@link inClauseParam}: SQLite and SQL Server unpack one bound JSON list in a
+   * subquery, and MySQL emits `expr IN (:pN)`, which its pool shim expands into
+   * one placeholder per element. The builder's text stays length-independent
+   * either way. Optional: the query builder falls back to the PostgreSQL
+   * `ANY`/`ALL` form when absent.
    */
   buildInClause?(expr: string, paramRef: string, negated: boolean): string;
 
   /**
    * The single bound value for an `IN` list (paired with {@link buildInClause}).
-   * PostgreSQL passes the array through unchanged; SQLite serializes it to a
-   * JSON string consumed by `json_each`. Optional: defaults to the array itself.
+   * PostgreSQL passes the array through unchanged; SQLite and SQL Server
+   * serialize it to JSON, element by element as the scalar binds; MySQL wraps it
+   * for its shim to expand. Optional: defaults to the array itself.
    */
   inClauseParam?(values: unknown[]): unknown;
+
+  /**
+   * Check a string about to be written to a column: return the refusal
+   * message, or `undefined` to bind the string as is. `columnType` is the
+   * column's declared (PostgreSQL-flavored) type. The write path throws the
+   * message as a ValidationError (E003) before any SQL runs.
+   *
+   * Optional, and absent on every engine whose server refuses text its column
+   * cannot hold (PostgreSQL, MySQL in strict mode, SQL Server), where the
+   * server's error is the refusal. SQLite defines it, because its type affinity
+   * stores such text in a numeric column instead of refusing it. Only the
+   * SQLite dialect sets it and no dialect spreads SQLite's, so testing for its
+   * presence is sound (unlike a hook on `postgresDialect`, which every engine
+   * inherits).
+   */
+  checkTextWrite?(table: string, column: string, columnType: string, value: string): string | undefined;
+
+  /**
+   * How `schemaToSQL` declares a column of a schema-level enum on an engine
+   * with no named enum type. Returns the column's type as an input to this
+   * dialect's own `buildColumnType`, and optionally a CHECK expression over
+   * `column` (already quoted) that admits exactly the labels. Throws E003 for a
+   * label the engine cannot declare.
+   *
+   * PostgreSQL does not use it: it declares the type with `CREATE TYPE ... AS
+   * ENUM` and the column names the type. `schemaToSQL` decides that by
+   * `dialect.name`, not by this hook's absence, because every engine spreads
+   * `postgresDialect`; an engine other than PostgreSQL that does not define the
+   * hook gets an UnsupportedFeatureError (E017) for an enum column instead of
+   * PostgreSQL's DDL.
+   */
+  buildEnumColumn?(
+    column: string,
+    labels: readonly string[],
+  ): { type: string; maxLength?: number | null; check?: string };
 
   /** Optional array-cast hook for bulk insert implementations. */
   arrayType?(baseType: string): string;

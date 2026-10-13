@@ -62,9 +62,13 @@ describe('a Date against a date column binds its UTC date part', () => {
       // Same shape again: the cache-hit collect rewrites the same way.
       assert.deepEqual(q.buildFindMany({ where: { birthday: LEAP } }).params, ['2000-02-29']);
       assert.deepEqual(q.buildFindMany({ where: { birthday: { lt: LATE } } }).params, ['1999-12-31']);
-      // Engines differ in how a list binds (an array, a JSON array, one param each).
+      // Engines differ in how a list binds (an array, a JSON array, a list the shim expands).
       const list = (q.buildFindMany({ where: { birthday: { in: [LATE, LEAP] } } }).params as unknown[]).flatMap((p) =>
-        typeof p === 'string' && p.startsWith('[') ? JSON.parse(p) : p,
+        typeof p === 'string' && p.startsWith('[')
+          ? JSON.parse(p)
+          : p !== null && typeof p === 'object' && !Array.isArray(p) && 'values' in p
+            ? (p as { values: unknown[] }).values
+            : p,
       );
       assert.deepEqual(list, ['1999-12-31', '2000-02-29']);
     });

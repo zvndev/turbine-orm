@@ -128,6 +128,7 @@ import {
   snakeToCamel,
   type TableMetadata,
 } from './schema.js';
+import { rewritePositionalPlaceholders } from './sql-placeholders.js';
 
 // ---------------------------------------------------------------------------
 // Driver constructor, lazily loaded
@@ -211,6 +212,41 @@ function toSqliteParam(value: unknown): SqliteParam {
 }
 
 /**
+ * The JSON text an `in` / `notIn` list binds as, element by element in the
+ * form {@link toSqliteParam} would bind it, so a list element compares exactly
+ * as the same value given to `equals` does. A bigint is written as a JSON
+ * integer (exact to 64 bits; `JSON.stringify` refuses one), an infinity as the
+ * overflowing literal SQLite's JSON parser reads as one, and a binary value as
+ * `{"b": "<hex>"}`, which {@link sqliteDialect.buildInClause} turns back into a
+ * BLOB. Any other object binds as its JSON text, as it would on its own.
+ */
+function sqliteInListJson(values: readonly unknown[]): string {
+  const parts = values.map((value): string => {
+    if (value === undefined || value === null) return 'null';
+    switch (typeof value) {
+      case 'boolean':
+        return value ? '1' : '0';
+      case 'number':
+        if (Number.isFinite(value)) return JSON.stringify(value);
+        if (Number.isNaN(value)) return 'null';
+        return value > 0 ? '9e999' : '-9e999';
+      case 'bigint':
+        return value.toString();
+      case 'string':
+        return JSON.stringify(value);
+    }
+    if (value instanceof Uint8Array) {
+      let hex = '';
+      for (const byte of value) hex += byte.toString(16).padStart(2, '0');
+      return `{"b":"${hex}"}`;
+    }
+    const bound = toSqliteParam(value);
+    return JSON.stringify(bound);
+  });
+  return `[${parts.join(',')}]`;
+}
+
+/**
  * Normalize a single column value read from SQLite. With `setReadBigInts(true)`
  * every integer column comes back as a `bigint`; apply the same safe-integer
  * policy Turbine uses for Postgres `int8`, number when it fits in a JS safe
@@ -263,8 +299,36 @@ function declaredDecoders(schema: SchemaMetadata | undefined): DeclaredDecoders 
   return out;
 }
 
-/** A decimal integer or float as SQLite prints it (`printf('%!.17g')` / `CAST(... AS TEXT)`). */
-const SQLITE_NUMBER_TEXT = /^-?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i;
+/**
+ * A decimal integer or float as SQLite prints it (`printf('%!.17g')` / `CAST(... AS TEXT)`).
+ *
+ * Linear by construction: the fraction's digits can only follow a literal `.`,
+ * so a run of digits has exactly one way to match. The earlier `\d+\.?\d*`
+ * could split a dot-less run between its two quantifiers in every possible
+ * place, which made a long non-numeric cell take seconds to reject (quadratic:
+ * 40,000 digits and an `x` took 0.8 s, a million take 1.5 ms now).
+ */
+const SQLITE_NUMBER_TEXT = /^-?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i;
+
+/**
+ * The text SQLite's INTEGER, REAL and NUMERIC affinities convert to a number,
+ * measured against SQLite 3.51: an optional sign, a decimal integer or float,
+ * an optional exponent, and ASCII whitespace around it. Anything else
+ * (`'abc'`, `''`, `'Infinity'`, `'0x10'`, `'1_000'`) is stored as TEXT in the
+ * numeric column. Linear for the same reason as {@link SQLITE_NUMBER_TEXT}.
+ */
+const SQLITE_NUMERIC_LITERAL = /^[ \t\n\v\f\r]*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?[ \t\n\v\f\r]*$/i;
+
+/**
+ * Declared column types whose SQLite affinity is numeric (INTEGER, REAL or
+ * NUMERIC), boolean included (stored 1/0). Matched whole, not by SQLite's own
+ * "contains INT" rule: the type a schema records for a column can be an enum's
+ * name (`point_kind`), which that rule reads as INTEGER while the column is
+ * TEXT. A type this misses is written as SQLite always wrote it, so a miss
+ * costs a refusal, never a wrong one.
+ */
+const SQLITE_NUMERIC_COLUMN_TYPE =
+  /^(?:(?:tiny|small|medium|big)?int(?:eger)?|int[248]|(?:small|big)?serial|unsigned big int|real|float[48]?|double(?: precision)?|numeric|decimal|money|bool(?:ean)?)(?:\(\s*\d+\s*(?:,\s*\d+\s*)?\))?$/i;
 
 /**
  * Decode a REAL / NUMERIC cell carried as text through a `with` join back to
@@ -595,14 +659,22 @@ function toNamedBinding(values: unknown[]): Record<string, SqliteParam> | undefi
   return named;
 }
 
+/** The refusal for a placeholder the shim cannot bind (see rewritePositionalPlaceholders). */
+function refusePlaceholder(message: string): never {
+  throw new ValidationError(message);
+}
+
 function runStatement(
   db: DatabaseSync,
-  sql: string,
+  text: string,
   values: unknown[],
   decoderCache?: LRUCache<string, Map<string, ColumnDecode> | null>,
   declared: DeclaredDecoders = null,
 ) {
   const binding = toNamedBinding(values);
+  // `$n` is the spelling `rawUnsafe` documents for every engine; SQLite would
+  // read `$1` as a parameter NAMED "1", which the `{ p1, ... }` binding lacks.
+  const sql = rewritePositionalPlaceholders(text, 'sqlite', values.length, (i) => `:p${i}`, refusePlaceholder);
   let stmt: ReturnType<DatabaseSync['prepare']>;
   try {
     stmt = db.prepare(sql);
@@ -1112,12 +1184,39 @@ export const sqliteDialect: Dialect = {
   // No `= ANY(array)` in SQLite. `json_each` expands a single JSON-array param
   // into a row set, keeping ONE placeholder (so the SQL cache stays valid
   // regardless of list length) and handling the empty-list case correctly.
+  // `x IN (SELECT ...)` compares like `x = ?`: the column's affinity and
+  // collation apply to each element, as they do to a bound operand. JSON has no
+  // bytes, so a binary element travels as `{"b": "<hex>"}` and is decoded back
+  // to a BLOB here (see sqliteInListJson).
   buildInClause(expr: string, paramRef: string, negated: boolean): string {
-    return `${expr} ${negated ? 'NOT IN' : 'IN'} (SELECT value FROM json_each(${paramRef}))`;
+    return (
+      `${expr} ${negated ? 'NOT IN' : 'IN'} ` +
+      `(SELECT CASE WHEN type = 'object' THEN unhex(json_extract(value, '$.b')) ELSE value END ` +
+      `FROM json_each(${paramRef}))`
+    );
   },
 
   inClauseParam(values: unknown[]): unknown {
-    return JSON.stringify(values ?? []);
+    return sqliteInListJson(Array.isArray(values) ? values : []);
+  },
+
+  /**
+   * A string written to a numeric or boolean column. SQLite's type affinity
+   * keeps text it cannot convert as TEXT in that column, where PostgreSQL
+   * refuses it at the server: `'abc'` in an INTEGER column, or `'true'` in a
+   * boolean one (stored 1/0), which `{ flag: true }` then never matches. A
+   * string that is a number (`'12.5'`, `'9007199254740993'`, `' 7 '`) is
+   * accepted and converted by SQLite, as before.
+   */
+  checkTextWrite(table: string, column: string, columnType: string, value: string): string | undefined {
+    if (!SQLITE_NUMERIC_COLUMN_TYPE.test(columnType.trim())) return undefined;
+    if (SQLITE_NUMERIC_LITERAL.test(value)) return undefined;
+    const boolean = /BOOL/i.test(columnType);
+    return (
+      `The string written to "${column}" on "${table}", a column of type ${columnType}, is not a number, so SQLite ` +
+      `would store it as text in that column; PostgreSQL refuses it. ` +
+      (boolean ? 'Write true or false.' : 'Write a number, or a string holding one, such as "12.5".')
+    );
   },
 
   buildReturningClause(selection: ReturningSelection = '*'): string {
@@ -1233,6 +1332,12 @@ export const sqliteDialect: Dialect = {
 
   buildColumnType(input: ColumnTypeInput): string {
     return sqliteColumnAffinity(input.type);
+  },
+
+  /** SQLite has no enum type: a TEXT column, and a CHECK that admits only the labels (compared exactly, BINARY collation). */
+  buildEnumColumn(column: string, labels: readonly string[]): { type: string; check: string } {
+    const literals = labels.map((label) => `'${label.replace(/'/g, "''")}'`);
+    return { type: 'TEXT', check: `${column} IN (${literals.join(', ')})` };
   },
 
   buildColumnDefinition(input: ColumnDefinitionInput): string {
