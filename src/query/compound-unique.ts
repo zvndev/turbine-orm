@@ -518,18 +518,43 @@ function sameKeyValue(a: unknown, b: unknown): boolean {
   return a != null && (a instanceof Date && b instanceof Date ? a.getTime() === b.getTime() : a === b);
 }
 
-/** A bare value, or an operator object whose `equals` is a value. */
+/**
+ * A bare scalar, or `{ equals: <scalar> }` (optionally with `mode: 'default'`).
+ *
+ * Nothing else pins a column, and the refusals are the point. A column
+ * reference (`{ equals: col('id') }`, or the plain `{ col }` a request body
+ * carries) compiles to `"id" = "id"`, which every row satisfies, so a
+ * `delete({ where: { id: body.id } })` would delete the table. A plain object
+ * is a relation filter or a sub-where, `mode: 'insensitive'` matches every
+ * casing of the value, and a JSON / array / vector filter narrows rather than
+ * identifies.
+ */
 function isPinnedToOneValue(value: unknown): boolean {
-  if (value === undefined || value === null) return false;
-  if (isWhereOperator(value)) {
-    const eq = (value as { equals?: unknown }).equals;
-    return eq !== undefined && eq !== null;
+  if (isIdentityScalar(value)) return true;
+  if (!isPlainObject(value)) return false;
+  const keys = Object.keys(value as object).filter((k) => (value as Record<string, unknown>)[k] !== undefined);
+  const op = value as { equals?: unknown; mode?: unknown };
+  return (
+    keys.every((k) => k === 'equals' || (k === 'mode' && op.mode === 'default')) &&
+    keys.includes('equals') &&
+    isIdentityScalar(op.equals)
+  );
+}
+
+/** A non-null scalar a unique index compares by value. */
+function isIdentityScalar(value: unknown): boolean {
+  switch (typeof value) {
+    case 'string':
+    case 'bigint':
+    case 'boolean':
+      return true;
+    case 'number':
+      return !Number.isNaN(value);
+    case 'object':
+      return value instanceof Date || ArrayBuffer.isView(value);
+    default:
+      return false;
   }
-  // A JSON / array / vector filter narrows, it does not identify.
-  if (isJsonFilter(value) || isArrayFilter(value) || isVectorFilter(value)) return false;
-  // Anything else that is a plain object is a relation filter or a sub-where,
-  // neither of which pins a column. Dates, Buffers and primitives are values.
-  return !isPlainObject(value);
 }
 
 function isPlainObject(value: unknown): boolean {
