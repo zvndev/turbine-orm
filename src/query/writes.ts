@@ -494,7 +494,7 @@ function integerOf(value: unknown): bigint | undefined {
 
 /**
  * `where` with each top-level key value bound as a reselect binds keys (see
- * {@link TEXT_KEY_TYPES}), or `where` itself when nothing changes.
+ * {@link whereMod.TEXT_COMPARED_TYPES}), or `where` itself when nothing changes.
  */
 function textSafeKeyWhere(qi: BuilderCtx, where: Record<string, unknown>): Record<string, unknown> {
   let out: Record<string, unknown> | undefined;
@@ -779,37 +779,15 @@ function generatedKey(qi: BuilderCtx, result: PgCompatQueryResult, key: Reselect
 }
 
 /**
- * Column types MySQL compares with a NUMBER numerically, converting each stored
- * text to a number: `'0zz' = 0` and `'abc' = 0` are both true. A number bound
- * as a key there is sent as the text the INSERT stored instead.
+ * A key value as a reselect binds it: a number or bigint for a text-class
+ * column ({@link whereMod.TEXT_COMPARED_TYPES}) is sent as the text the INSERT
+ * stored, since MySQL compares `'0zz' = 0` as true. Converted on every engine,
+ * not only MySQL, because one caller (the identity read) is not MySQL-only.
  */
-const TEXT_KEY_TYPES: ReadonlySet<string> = new Set([
-  'char',
-  'varchar',
-  'character',
-  'character varying',
-  'bpchar',
-  'nchar',
-  'nvarchar',
-  'text',
-  'tinytext',
-  'mediumtext',
-  'longtext',
-  'binary',
-  'varbinary',
-  'tinyblob',
-  'blob',
-  'mediumblob',
-  'longblob',
-  'uuid',
-  'citext',
-]);
-
-/** A key value as a reselect binds it (see {@link TEXT_KEY_TYPES}). */
 function reselectKeyValue(qi: BuilderCtx, column: string, value: unknown): unknown {
   if (typeof value !== 'number' && typeof value !== 'bigint') return value;
   const type = qi.columnPgTypeMap.get(column);
-  return type !== undefined && TEXT_KEY_TYPES.has(type.toLowerCase()) ? String(value) : value;
+  return type !== undefined && whereMod.TEXT_COMPARED_TYPES.has(type.toLowerCase()) ? String(value) : value;
 }
 
 /**
