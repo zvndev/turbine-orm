@@ -389,7 +389,7 @@ jobs:
           INI
           pgbouncer -d "$RUNNER_TEMP/pgbouncer.ini"
       - name: Run the pooler suite through PgBouncer
-        run: npx tsx --test src/test/client-v090-pgbouncer.integration.test.ts
+        run: npx tsx --test src/test/client-v090-pgbouncer.integration.test.ts src/test/fix-txerr-pooler.integration.test.ts
         env:
           PGBOUNCER_URL: postgres://test@127.0.0.1:6432/turbine_test
           TURBINE_REQUIRE_ENGINE: pgbouncer

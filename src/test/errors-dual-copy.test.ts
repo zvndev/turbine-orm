@@ -51,6 +51,7 @@ const CONSTRUCT: Record<string, (m: ErrorsModule) => Error> = {
   ExclusionConstraintError: (m) => new m.ExclusionConstraintError(),
   UnsupportedFeatureError: (m) => new m.UnsupportedFeatureError('vector', 'sqlite'),
   ReadOnlyError: (m) => new m.ReadOnlyError('refused.'),
+  TransactionRolledBackError: (m) => new m.TransactionRolledBackError('rolled back.'),
 };
 
 /** Every exported class that is TurbineError or extends it, in export order. */
@@ -79,8 +80,8 @@ describe('errors module, two copies loaded', () => {
   });
 
   it('anti-vacuous: the enumeration found every class and every class has a constructor entry', () => {
-    // 19 = TurbineError plus the 18 coded classes; a new class raises this.
-    assert.ok(classes2.length >= 19, `expected at least 19 error classes, enumerated ${classes2.length}`);
+    // 20 = TurbineError plus the 19 coded classes; a new class raises this.
+    assert.ok(classes2.length >= 20, `expected at least 20 error classes, enumerated ${classes2.length}`);
     const names = classes2.map(([name]) => name);
     for (const name of names) {
       assert.ok(Object.hasOwn(CONSTRUCT, name), `add a CONSTRUCT entry for the exported error class ${name}`);

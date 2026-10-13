@@ -28,7 +28,14 @@
 
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { Dialect } from './dialect.js';
-import { DeadlockError, SerializationFailureError, ValidationError, wrapPgError } from './errors.js';
+import {
+  DeadlockError,
+  LockNotAvailableError,
+  SerializationFailureError,
+  TransactionRolledBackError,
+  ValidationError,
+  wrapPgError,
+} from './errors.js';
 import type { PgCompatPoolClient, PgCompatQueryResult } from './pg-types.js';
 
 /** The key a transaction-scoped pool carries its {@link TransactionState} under. */
@@ -400,10 +407,11 @@ export function commitWasRolledBack(result: { command?: string } | null | undefi
  * The error for work that was rolled back although the caller expected it to
  * commit (a transaction) or be kept (a savepoint block).
  *
- * A retryable first failure (deadlock, serialization conflict) keeps its class,
- * so `$retry` and `isRetryable` checks retry the whole transaction, which is
- * the documented response to both. Anything else is E003: the call was refused
- * because it went on after a failure that had already ended the transaction.
+ * A retryable first failure (deadlock, serialization conflict, lock not
+ * available) keeps its class, so `$retry` and `isRetryable` checks retry the
+ * whole transaction, which is the documented response to all three. Anything
+ * else is a {@link TransactionRolledBackError} (E019) with the first failure as
+ * `cause`: nothing was committed, and the server did the rolling back.
  */
 export function rolledBackError(
   firstFailure: unknown,
@@ -425,11 +433,12 @@ export function rolledBackError(
       ? 'run the statement that can fail in its own nested `tx.$transaction(...)`, which rolls back only that savepoint.'
       : 'send `SAVEPOINT s` before the statement that can fail and `ROLLBACK TO SAVEPOINT s` when it does, which ' +
         'undoes only that statement.');
+  if (firstFailure instanceof LockNotAvailableError) return new LockNotAvailableError({ message, cause: firstFailure });
   if (firstFailure instanceof SerializationFailureError) {
     return new SerializationFailureError({ message, cause: firstFailure });
   }
   if (firstFailure instanceof DeadlockError) return new DeadlockError({ message, cause: firstFailure });
-  return new ValidationError(message, firstFailure !== undefined ? { cause: firstFailure } : undefined);
+  return new TransactionRolledBackError(message, firstFailure !== undefined ? { cause: firstFailure } : undefined);
 }
 
 /** The error for a statement sent through a transaction that has settled. */

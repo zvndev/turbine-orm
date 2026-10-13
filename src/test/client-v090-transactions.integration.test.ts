@@ -22,12 +22,21 @@ import assert from 'node:assert/strict';
 import { describe, beforeEach as eachTest } from 'node:test';
 import pg from 'pg';
 import type { PgCompatPoolClient, TransactionClient, TurbineClient } from '../client.js';
-import { TimeoutError, ValidationError } from '../errors.js';
+import { TimeoutError, TransactionRolledBackError, ValidationError } from '../errors.js';
 import { skipGate } from './helpers.js';
 import { DATABASE_URL, openFixture, sleep, type TxFixture } from './transactions-fixture.js';
 
 const { it, before, after } = skipGate(!DATABASE_URL, 'DATABASE_URL not set');
 const beforeEach: typeof eachTest = DATABASE_URL ? eachTest : () => {};
+
+function e019(pattern: RegExp) {
+  return (err: unknown): boolean => {
+    assert.ok(err instanceof TransactionRolledBackError, `expected TransactionRolledBackError, got ${String(err)}`);
+    assert.equal(err.code, 'TURBINE_E019');
+    assert.match(err.message, pattern, err.message);
+    return true;
+  };
+}
 
 function e003(pattern: RegExp) {
   return (err: unknown): boolean => {
@@ -190,7 +199,7 @@ describe('transaction lifecycle (live Postgres)', () => {
             'the transaction whose callback caught the timeout',
           ),
           (err: unknown) => {
-            e003(/rolled back, not committed/)(err);
+            e019(/rolled back, not committed/)(err);
             assert.equal((err as Error).cause, caught);
             return true;
           },
@@ -349,7 +358,7 @@ describe('transaction lifecycle (live Postgres)', () => {
         await client.query('SELECT 1/0').catch(() => {});
       }),
       (err: unknown) => {
-        e003(/rolled back, not committed[\s\S]*ROLLBACK TO SAVEPOINT/)(err);
+        e019(/rolled back, not committed[\s\S]*ROLLBACK TO SAVEPOINT/)(err);
         assert.doesNotMatch((err as Error).message, /tx\.\$transaction/);
         return true;
       },

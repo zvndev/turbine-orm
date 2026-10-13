@@ -407,8 +407,12 @@ describe('TurbineErrorCode', () => {
     assert.equal(TurbineErrorCode.READ_ONLY, 'TURBINE_E018');
   });
 
-  it('has exactly 18 error codes', () => {
-    assert.equal(Object.keys(TurbineErrorCode).length, 18);
+  it('has TRANSACTION_ROLLED_BACK = TURBINE_E019', () => {
+    assert.equal(TurbineErrorCode.TRANSACTION_ROLLED_BACK, 'TURBINE_E019');
+  });
+
+  it('has exactly 19 error codes', () => {
+    assert.equal(Object.keys(TurbineErrorCode).length, 19);
   });
 });
 

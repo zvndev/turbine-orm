@@ -16,7 +16,7 @@
 import assert from 'node:assert/strict';
 import { describe, beforeEach as eachTest } from 'node:test';
 import type { TurbineClient } from '../client.js';
-import { SerializationFailureError, UniqueConstraintError, ValidationError } from '../errors.js';
+import { SerializationFailureError, TransactionRolledBackError, UniqueConstraintError } from '../errors.js';
 import { skipGate } from './helpers.js';
 import { DATABASE_URL, openFixture, type TxFixture } from './transactions-fixture.js';
 
@@ -70,14 +70,14 @@ describe('transactions: COMMIT answered with ROLLBACK rejects (live Postgres)', 
     assert.equal(await fx.count(fx.t.users, "email = 'k1@x'"), 0, 'the earlier insert is gone, so success was false');
   });
 
-  it('interactive: the rejection is E003 when the first failure is not retryable', async () => {
+  it('interactive: the rejection is E019 when the first failure is not retryable', async () => {
     await assert.rejects(
       db.$transaction(async (tx) => {
         try {
           await tx.raw`SELECT 1/0`;
         } catch {}
       }),
-      (err: unknown) => err instanceof ValidationError && err.code === 'TURBINE_E003',
+      (err: unknown) => err instanceof TransactionRolledBackError && err.code === 'TURBINE_E019',
     );
   });
 

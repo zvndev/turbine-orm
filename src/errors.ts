@@ -27,6 +27,7 @@ export const TurbineErrorCode = {
   EXCLUSION_VIOLATION: 'TURBINE_E016',
   UNSUPPORTED_FEATURE: 'TURBINE_E017',
   READ_ONLY: 'TURBINE_E018',
+  TRANSACTION_ROLLED_BACK: 'TURBINE_E019',
 } as const;
 
 export type TurbineErrorCode = (typeof TurbineErrorCode)[keyof typeof TurbineErrorCode];
@@ -1385,6 +1386,39 @@ const READ_ONLY_HINTS: Readonly<Record<ReadOnlyReason, string>> = {
 };
 
 /**
+ * Thrown when work the caller expected to be saved was rolled back instead:
+ * a `$transaction` or `transaction()` whose COMMIT the server answered with
+ * ROLLBACK, a transaction that cannot commit because a statement inside it was
+ * cut short by its `timeout`, or a nested `tx.$transaction(...)` block that
+ * could not be kept for the same reasons.
+ *
+ * PostgreSQL aborts a transaction at its first error. Catching that error
+ * inside the callback does not undo the abort, so the callback returns, the
+ * COMMIT ends as a ROLLBACK, and none of the transaction's writes are saved.
+ * The first failure is attached as `cause`. Nothing was committed, so the
+ * whole transaction can be run again once the cause is dealt with; to keep the
+ * rest of the work after an expected failure, run the statement that can fail
+ * in its own nested `tx.$transaction(...)`.
+ *
+ * NOT retryable on its own: the failure that caused it is not known to be
+ * transient. When that first failure WAS a deadlock or a serialization
+ * conflict, the retryable class (`DeadlockError`, `SerializationFailureError`)
+ * is thrown instead, so `$retry` re-runs the transaction.
+ */
+export class TransactionRolledBackError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.TRANSACTION_ROLLED_BACK;
+
+  /**
+   * @param message what was rolled back and how to keep the work next time.
+   * @param options the first failure inside the transaction, as `cause`.
+   */
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(TurbineErrorCode.TRANSACTION_ROLLED_BACK, message, options);
+    this.name = 'TransactionRolledBackError';
+  }
+}
+
+/**
  * A write refused because its transaction is read-only: PostgreSQL SQLSTATE
  * 25006, or MySQL's error 1792 (which carries the same SQLSTATE).
  */
@@ -1425,6 +1459,11 @@ const CONNECTION_ERROR_CODES = new Set<string>([
   '08006', // connection_failure
   '08007', // transaction_resolution_unknown
   '08P01', // protocol_violation
+  // A named prepared statement met a server connection that did not prepare it
+  // (26000) or already holds it (42P05). Turbine names its own statements, so
+  // the usual cause is a transaction-pooling endpoint switching backends.
+  '42P05', // duplicate_prepared_statement
+  '26000', // invalid_sql_statement_name
   // pg SQLSTATE class 28: the server answered and REFUSED us. These are the
   // most common first-run failures there are (wrong password, a pg_hba rule
   // that does not cover this user/host), and they used to fall through
@@ -1554,6 +1593,13 @@ const CONNECTION_LOSS_HINT =
   'The server or the network closed it (a restart, failover, idle timeout, compute suspend, or ' +
   'pg_terminate_backend). The pool discards the connection, so retrying the operation opens a fresh one.';
 
+const PREPARED_STATEMENT_POOLER_HINT =
+  'A named prepared statement met a server connection that did not prepare it, or that already holds it. A ' +
+  'transaction-pooling endpoint (PgBouncer in transaction mode, a managed "-pooler" host, port 6432 or 6543) ' +
+  'gives each transaction to a different server connection, which is the usual cause. Connect to the direct ' +
+  'endpoint, set `preparedStatements: false`, or turn on prepared-statement support in the pooler (PgBouncer ' +
+  '1.21 or later, `max_prepared_statements` above 0).';
+
 /**
  * Actionable next step per connection-class code, appended to the driver's own
  * message. The driver message states WHAT happened ("password authentication
@@ -1563,6 +1609,8 @@ const CONNECTION_LOSS_HINT =
  * A code with no entry here simply gets no hint appended.
  */
 const CONNECTION_ERROR_HINTS: Readonly<Record<string, string>> = {
+  '42P05': PREPARED_STATEMENT_POOLER_HINT,
+  '26000': PREPARED_STATEMENT_POOLER_HINT,
   '28P01':
     'The server rejected the credentials. Check the password in your connection string (or DATABASE_URL), including any URL-encoding of special characters.',
   '28000':
@@ -1843,6 +1891,8 @@ function scrubUnclassifiedServerError(err: object, code: string): unknown {
  *   57014 (query_canceled)        -> TimeoutError (server-side statement_timeout)
  *   28P01 / 28000 (auth refused)  -> ConnectionError, with a remediation hint
  *   3D000 (no such database)      -> ConnectionError, with a remediation hint
+ *   42P05 / 26000 (prepared statement name clash or miss, a transaction-mode
+ *                                    pooler) -> ConnectionError, with a remediation hint
  *   connection-class codes        -> ConnectionError (see CONNECTION_ERROR_CODES)
  *   22xxx (data exception)        -> ValidationError naming the column (when the
  *                                    server did) and the SQLSTATE; driver text

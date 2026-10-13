@@ -15,9 +15,10 @@
  */
 
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 import { describe, it } from 'node:test';
 import { type PgCompatPool, TurbineClient } from '../client.js';
-import { TimeoutError, UniqueConstraintError, UnsupportedFeatureError, ValidationError } from '../errors.js';
+import { TimeoutError, TransactionRolledBackError, UniqueConstraintError, UnsupportedFeatureError } from '../errors.js';
 import { mysqlDialect } from '../mysql.js';
 import type { SchemaMetadata } from '../schema.js';
 import { SqlitePool, sqliteDialect } from '../sqlite.js';
@@ -32,6 +33,15 @@ const schema: SchemaMetadata = {
   },
   enums: {},
 };
+
+const HAVE_NODE_SQLITE = (() => {
+  try {
+    createRequire(process.cwd())('node:sqlite');
+    return true;
+  } catch {
+    return false;
+  }
+})();
 
 async function sqliteClient(): Promise<{ db: TurbineClient; codes: () => string[] }> {
   const { DatabaseSync } = await import('node:sqlite');
@@ -48,7 +58,9 @@ async function sqliteClient(): Promise<{ db: TurbineClient; codes: () => string[
   return { db, codes };
 }
 
-describe('chunked createMany inside $transaction', () => {
+describe('chunked createMany inside $transaction', {
+  skip: HAVE_NODE_SQLITE ? false : 'node:sqlite unavailable',
+}, () => {
   it('keeps none of its chunks when a later one fails and the caller commits anyway', async () => {
     const { db, codes } = await sqliteClient();
     let caught: unknown;
@@ -156,7 +168,7 @@ describe('a timed statement in a transaction whose cancel is not confirmed', () 
           await new Promise((resolve) => setTimeout(resolve, 500));
         }),
         (err: unknown) =>
-          err instanceof ValidationError && /nested `\$transaction` block was rolled back/.test(err.message),
+          err instanceof TransactionRolledBackError && /nested `\$transaction` block was rolled back/.test(err.message),
       );
     });
     assert.ok(caught instanceof TimeoutError, String(caught));
@@ -183,7 +195,9 @@ describe('a timed statement in a transaction whose cancel is not confirmed', () 
         return 'done';
       }),
       (err: unknown) =>
-        err instanceof ValidationError && /rolled back, not committed/.test(err.message) && err.cause === caught,
+        err instanceof TransactionRolledBackError &&
+        /rolled back, not committed/.test(err.message) &&
+        err.cause === caught,
     );
     assert.ok(caught instanceof TimeoutError, String(caught));
     assert.equal(caught.outcome, 'not-executed');

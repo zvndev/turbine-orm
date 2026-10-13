@@ -50,6 +50,7 @@ const KNOWN_ERRORS = new Set([
   'ExclusionConstraintError',
   'UnsupportedFeatureError',
   'ReadOnlyError',
+  'TransactionRolledBackError',
   // Typed subclasses of the above defined outside errors.ts:
   // DestructivePushRefusal (schema-sql.ts) extends ValidationError so callers
   // can `instanceof` the refusal instead of sniffing message text.

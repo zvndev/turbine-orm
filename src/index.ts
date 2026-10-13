@@ -103,6 +103,7 @@ export {
   setErrorMessageMode,
   TimeoutError,
   type TimeoutOutcome,
+  TransactionRolledBackError,
   TurbineError,
   TurbineErrorCode,
   UniqueConstraintError,
