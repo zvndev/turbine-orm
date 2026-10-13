@@ -14,7 +14,13 @@
  */
 
 import type { JsonWireRule } from '../dialect.js';
-import { CircularRelationError, RelationError, UnsupportedFeatureError, ValidationError } from '../errors.js';
+import {
+  CircularRelationError,
+  InvariantError,
+  RelationError,
+  UnsupportedFeatureError,
+  ValidationError,
+} from '../errors.js';
 import { missingIndexForRelation } from '../index-advisor.js';
 import { logTo } from '../logger.js';
 import type { RelationDef, TableMetadata } from '../schema.js';
@@ -1832,7 +1838,8 @@ export function parseNestedRow(
             { code: 'relation-payload-json', table: qi.table, relation: relName },
           );
         }
-        throw new ValidationError(
+        throw new InvariantError(
+          'relation-payload-json',
           `Relation "${relName}" on table "${qi.table}" returned a payload that could not be parsed as JSON.`,
           { cause: err },
         );

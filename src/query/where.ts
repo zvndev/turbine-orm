@@ -13,7 +13,7 @@
 
 import { type ResolvedDiagnostics, resolveDiagnostics } from '../diagnostics.js';
 import type { Dialect, JsonPathEqualsInput } from '../dialect.js';
-import { getErrorMessageMode, UnsupportedFeatureError, ValidationError } from '../errors.js';
+import { getErrorMessageMode, InvariantError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { assertSkipListNames, skipListNamesTable } from '../global-filters-config.js';
 import { consoleLogger, type TurbineLogger } from '../logger.js';
 import type { PgCompatQueryResult } from '../pg-types.js';
@@ -1383,9 +1383,10 @@ export function relationWhereScope(
  */
 export function aliasWhereScope(qi: BuilderCtx, targetTable: string, meta: TableMetadata, alias: string): WhereScope {
   if (alias.includes('"')) {
-    throw new ValidationError(
-      `Internal: aliasWhereScope was given the rendered reference ${alias} for table "${targetTable}", ` +
-        'but it takes a bare alias and quotes it itself. Use renderedRefWhereScope for an already-quoted reference.',
+    throw new InvariantError(
+      'where-scope-reference',
+      `aliasWhereScope was given the rendered reference ${alias} for table "${targetTable}", but it takes a ` +
+        'bare alias and quotes it itself. Use renderedRefWhereScope for an already-quoted reference.',
     );
   }
   return {

@@ -12,7 +12,7 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { ValidationError } from '../errors.js';
+import { InvariantError } from '../errors.js';
 import { QueryInterface } from '../query/index.js';
 import { resetWarnOnce, WARN_NS } from '../query/warn-registry.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
@@ -771,7 +771,7 @@ describe('parseNestedRow: short-circuit optimizations', () => {
             fields: [],
           }),
         (err: unknown) => {
-          assert.ok(err instanceof ValidationError, 'a payload that will not parse must be an error');
+          assert.ok(err instanceof InvariantError, 'a payload that will not parse must be an error');
           assert.match(err.message, /"posts"/, 'the message must name the relation');
           assert.match(err.message, /"users"/, 'the message must name the table');
           return true;
