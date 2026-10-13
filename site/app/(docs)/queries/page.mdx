@@ -42,7 +42,7 @@ Under `relationLoadStrategy: 'join'` the whole graph resolves in one SQL stateme
 
 ### Silencing the unlimited-query warning
 
-When `warnOnUnlimited` is enabled, a `findMany` with no `limit` / `take` / `cursor` logs a warning once per table (a `where` that pins the primary key or a unique column set is exempt, since that query is bounded by the constraint, and so is a client with a `defaultLimit`). This warning is **not** gated on `NODE_ENV`: it fires in production too, because an unbounded read is a production cost. Silence it for a query you know is bounded:
+When `warnOnUnlimited` is enabled, a `findMany` with no `limit` / `take` / `cursor` logs a warning once per table (a `where` that pins the primary key or a unique column set is exempt, since that query is bounded by the constraint, and so is a client with a `defaultLimit`). This warning does **not** depend on `NODE_ENV` or [`diagnostics`](/observability#diagnostics-diagnostics): it fires in production too, because an unbounded read is a production cost. It goes through the client's `logger` with code `unlimited-find-many`. Silence it for a query you know is bounded:
 
 ```ts
 // This one is fine, a tiny lookup table
@@ -53,7 +53,7 @@ You can also set it per table on the client: `warnOnUnlimited: { userProfiles: f
 
 ### Deterministic pages: the unordered-pagination warning
 
-An unordered `LIMIT` is not stable: Postgres is free to return different rows for the same `LIMIT` once the heap changes underneath it, so paging with no `orderBy` can hand you the same row twice or skip one entirely. A `findMany` that paginates (`limit` / `take` / `offset`) with no `orderBy` therefore logs a one-time dev warning naming the table, the pagination shape, and the exact `orderBy` to add:
+An unordered `LIMIT` is not stable: Postgres is free to return different rows for the same `LIMIT` once the heap changes underneath it, so paging with no `orderBy` can hand you the same row twice or skip one entirely. A `findMany` that paginates (`limit` / `take` / `offset`) with no `orderBy` therefore logs a one-time warning (code `unordered-page`) naming the table, the pagination shape, and the exact `orderBy` to add:
 
 ```ts
 // warns: the page is not deterministic
@@ -63,7 +63,7 @@ const page = await db.users.findMany({ limit: 20, offset: 40 });
 const page = await db.users.findMany({ orderBy: { id: 'asc' }, limit: 20, offset: 40 });
 ```
 
-`distinct` queries are exempt (`DISTINCT ON` imposes its own ordering), and so is a `cursor` page: since 0.90 a cursor page is always ordered (see [cursor](#pagination-limit--take-offset--skip-cursor)), so it never warns. The warning is gated exactly like `warnOnUnlimited` (per-call, per-table, global) and deduped per table and shape, but unlike `warnOnUnlimited` it is silent under `NODE_ENV=production`.
+`distinct` queries are exempt (`DISTINCT ON` imposes its own ordering), and so is a `cursor` page: since 0.90 a cursor page is always ordered (see [cursor](#pagination-limit--take-offset--skip-cursor)), so it never warns. The warning is gated exactly like `warnOnUnlimited` (per-call, per-table, global) and deduped per table and shape, but unlike `warnOnUnlimited` it is advice: silent while the client's [`diagnostics`](/observability#diagnostics-diagnostics) advice is off, which is the default under `NODE_ENV=production`.
 
 To fix it globally instead of per query, set **`implicitPkOrdering: true`** on the client. Turbine then adds `ORDER BY <primary key> ASC` (every column of a composite key, in declaration order) to any paginating `findMany` that declares no `orderBy`, and the warning stops firing. An explicit `orderBy` always wins, and a table with no primary key is left alone. The flag does not change a `cursor` page, which is ordered by its own rule either way.
 
@@ -601,7 +601,7 @@ await db.pageViews.createMany({
 - **`where`** limits which existing rows are updated. A conflicting row that does not match is left alone and is not returned. Inserted rows are not filtered, as with `create`.
 - **`ignore: true`** (instead of `update`) leaves every existing row untouched.
 
-Two rows in one call with the same key throw `TURBINE_E003` before any SQL runs: one statement cannot insert or update a key twice, so merge them first. An active [global filter](/global-filters) applies to the conflict update, as `where` does. [`updatedAt`](#updatedat-columns) columns are stamped on the update unless `update` names them. The result holds the rows inserted or updated, in no guaranteed order.
+Two rows in one call with the same key throw `TURBINE_E003` before any SQL runs: one statement cannot insert or update a key twice, so merge them first. Two keys that differ in JavaScript but are equal under the column's comparison rules (`'bob'` and `'BOB'` under a case-insensitive collation, `citext`, or SQLite's `COLLATE NOCASE`) also throw `TURBINE_E003`, on every engine and across the statements of a chunked call. The call is rolled back, so no row it wrote stays. An active [global filter](/global-filters) applies to the conflict update, as `where` does. [`updatedAt`](#updatedat-columns) columns are stamped on the update unless `update` names them. The result holds the rows inserted or updated, in no guaranteed order.
 
 | Engine | Support |
 |---|---|
@@ -678,11 +678,11 @@ await db.posts.update({
 
 | Builder | SQL | Notes |
 |---|---|---|
-| `expr.add(a, b)`, `sub`, `mul`, `div` | `a + b`, `a - b`, `a * b`, `a / b` | Numeric operands only. `div` truncates integers on PostgreSQL, SQLite and SQL Server, and gives a decimal on MySQL, as the `divide` operator does |
+| `expr.add(a, b)`, `sub`, `mul`, `div` | `a + b`, `a - b`, `a * b`, `a / b` | Numeric operands only. Between integers (integer numbers and integer columns) the arithmetic is integer arithmetic on every engine, and `div` truncates toward zero: `75 / 2` is `37`, also when the result goes into a float column. With a non-integer operand it is decimal arithmetic, and writing that result to an integer column throws `TURBINE_E003`. For a decimal half, write `expr.mul(col('n'), 0.5)` into a float column |
 | `expr.coalesce(a, b, ...)` | `COALESCE(...)` | 2 to 8 operands |
 | `expr.greatest(a, b, ...)`, `expr.least(...)` | `GREATEST(...)`, `LEAST(...)` | 2 to 8 operands. NULLs are ignored on every engine, as on PostgreSQL: the result is NULL only when every operand is |
 | `expr.case(arms, otherwise?)` | `CASE WHEN ... THEN ... ELSE ... END` | 1 to 16 arms of `{ when, then }`. `when` is a filter on the row's own columns, written like `where` (no relation filters). The first matching arm wins; without `otherwise` an unmatched row gets NULL |
-| `expr.now()` | The server's current time | Temporal columns only. Stored in the zone convention Turbine reads with, so a zone-less `timestamp` gets the UTC wall clock. On PostgreSQL it is the transaction's start time |
+| `expr.now()` | The server's current time | Temporal columns only. Stored in the zone convention Turbine reads with, so a zone-less `timestamp` gets the UTC wall clock and a `date` column gets the UTC day, SQLite included. On PostgreSQL it is the transaction's start time |
 | `expr.excluded('field')` | The incoming row's value | Only in `upsert`'s `update` and `createMany`'s [`onConflict.update`](#multi-row-upsert-onconflict) |
 
 An operand is a JavaScript value, `col('field')` for the current row's column, or another expression, so expressions nest: `expr.add(col('a'), expr.mul(col('b'), 2))`. A client generated by 0.90 types expressions in its update inputs; regenerate an older one.
@@ -1547,15 +1547,17 @@ const db = turbine({
 | `poolSize` | `10` | Maximum pooled connections. pg-style alias: `max`. |
 | `idleTimeoutMs` | `30000` | Close a pooled connection after this long idle. pg-style alias: `idleTimeoutMillis`. |
 | `connectionTimeoutMs` | `5000` | Give up acquiring a connection after this long, with a `ConnectionError` (`TURBINE_E004`) naming the pool size and the usual cause. pg-style alias: `connectionTimeoutMillis`. |
-| `preparedStatements` | `true` for Turbine-owned pools; `false` for external pools and for a connection that names a pooler | Submit queries as `{ name, text, values }` so Postgres caches the parse and plan per backend connection. A connection string, `host` or `port` that names a pooler (a `pooler` or `pgbouncer` host, or port 6432 or 6543) defaults to `false`; an explicit `true` there is honored with a one-time dev warning. |
-| `statementTimeoutMs` | unset (Turbine sends nothing) | **Postgres only.** A server-side ceiling on every statement this client's connections run (`statement_timeout`), in milliseconds. A statement that runs longer is cancelled by the server and rejects with `TimeoutError` (`outcome: 'not-executed'`). It also bounds what a per-query `timeout` cannot reach, such as a stream's `FETCH`. Sent as a connection parameter on pools Turbine opens, never as a `SET`. `0` disables a timeout the server or role would apply. Must be a non-negative whole number (`TURBINE_E003`); `TURBINE_E017` on other engines. A no-op with a dev warning on an external pool. A pooler may refuse connection parameters; set it on the role there (`ALTER ROLE app SET statement_timeout = '30s'`). |
-| `maxLifetimeSeconds` | `1800` on pools Turbine opens | Close a pooled connection once it is this old, when it is next idle, and open a fresh one on demand. Bounds what a long-lived server session accumulates and moves connections to a new server after a failover. A checked-out connection is never closed under its holder. `0` keeps connections indefinitely, the behaviour before 0.90. Ignored, with a dev warning, on an external pool. |
+| `preparedStatements` | `true` for Turbine-owned pools; `false` for external pools and for a connection that names a pooler | Submit queries as `{ name, text, values }` so Postgres caches the parse and plan per backend connection. A connection string, `host` or `port` that names a pooler (a `pooler` or `pgbouncer` host, or port 6432 or 6543) defaults to `false`; an explicit `true` there is honored with a warning, printed once per process in every mode. |
+| `statementTimeoutMs` | unset (Turbine sends nothing) | **Postgres only.** A server-side ceiling on every statement this client's connections run (`statement_timeout`), in milliseconds. A statement that runs longer is cancelled by the server and rejects with `TimeoutError` (`outcome: 'not-executed'`). It also bounds what a per-query `timeout` cannot reach, such as a stream's `FETCH`. Sent as a connection parameter on pools Turbine opens, never as a `SET`. `0` disables a timeout the server or role would apply. Must be a non-negative whole number (`TURBINE_E003`); `TURBINE_E017` on other engines. A no-op on an external pool, with a warning printed once per process. A pooler may refuse connection parameters; set it on the role there (`ALTER ROLE app SET statement_timeout = '30s'`). |
+| `maxLifetimeSeconds` | `1800` on pools Turbine opens | Close a pooled connection once it is this old, when it is next idle, and open a fresh one on demand. Bounds what a long-lived server session accumulates and moves connections to a new server after a failover. A checked-out connection is never closed under its holder. `0` keeps connections indefinitely, the behaviour before 0.90. Ignored on an external pool, with a warning printed once per process. |
 | `sqlCache` | `true` | The per-table SQL template cache. Setting `false` is the kill switch. |
 | `sqlCacheSize` | `1000` | How many distinct query **shapes** each table's LRU retains. Values are parameterized, so they never fragment the cache. `0` is equivalent to `sqlCache: false`; a negative value falls back to the default. |
 | `implicitPkOrdering` | `false` | Order a paginating `findMany` that declares no `orderBy` by the primary key ascending, making its pages [deterministic](#deterministic-pages-the-unordered-pagination-warning). An explicit `orderBy` wins; PK-less tables and `distinct` shapes are untouched. A `cursor` page is [always ordered](#pagination-limit--take-offset--skip-cursor), with or without the flag. |
 | `planCacheMode` | unset (Turbine sends nothing) | **Postgres only.** Pin `plan_cache_mode` on every connection this client opens: `'auto'`, `'force_custom_plan'`, `'force_generic_plan'`. The remedy for [the generic-plan cliff](/relations#the-generic-plan-cliff-plancachemode). Any other value throws `ValidationError` at construction; a non-Postgres engine throws `UnsupportedFeatureError` (`TURBINE_E017`). |
 | `utcTimestamps` | `true` | Read and write zone-less `timestamp` / `date` columns as UTC rather than in the process's local zone. Process-wide, not per client. See [Zone-less columns](/schema#zone-less-columns-timestamp-and-date-read-as-utc). |
 | `temporalInfinity` | `'preserve'` | How a Postgres temporal `infinity` / `-infinity` is handed back: `'preserve'` (the round-trip-safe JS numbers `Infinity` / `-Infinity`, so `.toISOString()` throws on those rows) or `'null'` (serializes cleanly, but indistinguishable from a stored `NULL`). Leaving it unset selects `'preserve'` and a one-time warning the first time a stored infinity is read. See [`infinity` and `-infinity`](/schema#infinity-and--infinity). |
+| `logger` | `console` | Where Turbine's log lines go: an object with optional `debug`, `info`, `warn` and `error` methods, each called with `(message, entry)`. `{}` silences Turbine. See [Log output](/observability#log-output-logger). |
+| `diagnostics` | from `NODE_ENV`, read at construction | `'development'` or `'production'`, or an object overriding `advice` and `cacheCheck`. Decides per-query advice and the SQL-cache self-check. See [Diagnostics](/observability#diagnostics-diagnostics). |
 | `autoToOneJoinMaxRows` | `1000` | Parent-row ceiling for the [`'auto'` strategy's to-one rule](/relations#load-strategy-auto-join-batched-flatten): a `belongsTo` / `hasOne` include stays in the single-statement join when the query's `limit` bounds the parent set at or under this value, and loads batched when the query is unbounded or bounded above it. Only consulted under `'auto'`. |
 
 Where a pg-style alias exists, the explicit Turbine field wins when both are set.
@@ -1570,7 +1572,7 @@ Every key on the config object is checked against the config surface, and an unr
 [turbine] Unknown option "logParams" in the config passed to TurbineClient, it is ignored. Did you mean "logQueryParams"?
 ```
 
-The suggestion covers plain typos and a guess that leaves out a whole word (`logParams` names the same words as `logQueryParams`). It is a warning, never an error, so an app that passes an option from a newer Turbine keeps running; it fires once per key name per process and is silent under `NODE_ENV=production`. `url` and `schema` never warn, since `turbine.config.*` files carry both for the CLI.
+The suggestion covers plain typos and a guess that leaves out a whole word (`logParams` names the same words as `logQueryParams`). It is a warning, never an error, so an app that passes an option from a newer Turbine keeps running; it fires once per key name per process, through the client's [`logger`](/observability#log-output-logger) with code `unknown-config-key`. Since 0.90 it fires in production too: a misspelled option is a production hazard. `url` and `schema` never warn, since `turbine.config.*` files carry both for the CLI.
 
 <Callout type="note" title="planCacheMode: when a query gets slower on its sixth execution">
   PostgreSQL promotes a **named** prepared statement to a generic plan after

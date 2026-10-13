@@ -96,6 +96,7 @@ export {
   ExclusionConstraintError,
   ForeignKeyError,
   getErrorMessageMode,
+  InvariantError,
   LockNotAvailableError,
   MigrationError,
   NotFoundError,

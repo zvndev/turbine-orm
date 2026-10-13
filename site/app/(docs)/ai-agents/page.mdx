@@ -112,7 +112,7 @@ The practical effect: an agent can propose a query, run the type checker, and kn
 
 ## Why coded errors suit agents
 
-Every Turbine error extends `TurbineError` and carries a stable `code` (`TURBINE_E001` through `E019`). Agents branch on the class or code, which is stable across versions, instead of scraping a driver's error text.
+Every Turbine error extends `TurbineError` and carries a stable `code` (`TURBINE_E001` through `E020`). Agents branch on the class or code, which is stable across versions, instead of scraping a driver's error text.
 
 ```ts
 import { SerializationFailureError, UniqueConstraintError } from 'turbine-orm';
@@ -177,7 +177,7 @@ Safety
 - Wrap multi-step writes in `db.$transaction(async (tx) => { ... })`.
 
 Errors
-- Catch typed errors and branch on the class/code (TURBINE_E001..E019), not the message.
+- Catch typed errors and branch on the class/code (TURBINE_E001..E020), not the message.
 - Retry only when `err.isRetryable` is true (DeadlockError E012, SerializationFailureError E013).
 
 Migrations
@@ -191,5 +191,5 @@ Migrations
 - **[MCP Server](/mcp)**, a read-only MCP server that grounds an agent in your live schema, plans, and sample rows.
 - **[Quick Start](/quickstart)**, the fastest path from install to first typed query.
 - **[API Reference](/queries)**, every method, operator, and option the snippet above refers to.
-- **[Typed Errors](/errors)**, the full E001-E019 table and retry patterns.
+- **[Typed Errors](/errors)**, the full E001-E020 table and retry patterns.
 - **[Schema & Migrations](/schema)**, code-first schemas and the migration workflow.

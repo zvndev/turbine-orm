@@ -41,14 +41,16 @@ export default defineSchema({
     userId: { type: 'bigint', notNull: true, references: 'users.id' },
     title: { type: 'text', notNull: true },
     content: { type: 'text' },
-    published: { type: 'boolean', notNull: true, default: 'false' },
-    viewCount: { type: 'integer', notNull: true, default: '0' },
+    published: { type: 'boolean', notNull: true, default: false },
+    viewCount: { type: 'integer', notNull: true, default: 0 },
     createdAt: { type: 'timestamp', default: 'now()' },
   },
 });
 ```
 
 Two things the example does not show. `type: 'timestamp'` emits `TIMESTAMPTZ`: the alias is kept for back-compat and means the same as `'timestamptz'`, so there is no code-first spelling for a zone-less `TIMESTAMP` column (declare one in a SQL migration and `generate` picks it up; the [type mapping](#type-mapping) below describes how such a column reads). And `varchar` takes its bound as `maxLength` (`{ type: 'varchar', maxLength: 200 }`).
+
+A `default` is SQL text (`"'member'"`, `'now()'`), a number, or a boolean. `default: 0` emits `DEFAULT 0` and `default: false` emits `DEFAULT FALSE`; the string forms `'0'` and `'false'` still work. Any other value, such as an object, throws `TURBINE_E003`.
 
 ### Unknown keys throw
 
@@ -67,6 +69,8 @@ defineSchema({
 In a TypeScript object literal the same key is also a compile error. Before 0.90 such a key was ignored, so the DDL silently lacked what it asked for: a misspelt `default` emitted no `DEFAULT`, and `uniq` on an index emitted a non-unique one.
 
 Two more shapes throw the same error: a table or column named `__proto__` (JavaScript reads that key as the prototype setter, so the column could not be stored or queried), and an index that declares both `columns` and `docField` (declare two indexes instead).
+
+Names are checked too. An index naming a column the table does not have throws, with the nearest column name. So do two fields that map to one database column (`userId` and `user_id`) and two tables that map to one table name. A column may still be called `name` or `columns`.
 
 ### Typing a JSON column, `tsType`
 
@@ -102,7 +106,13 @@ memberships: {
 
 ### Foreign keys and referential actions
 
-The short `references: 'table.column'` form emits a plain foreign key. To attach `ON DELETE` / `ON UPDATE` actions, pass an object:
+The short `references: 'table.column'` form emits a plain foreign key. A reference to a table in the same schema is checked:
+
+- It must have exactly one dot. `references: 'users'` throws `TURBINE_E003`, since no foreign key would be created.
+- The column must exist on that table, written as the field name (`authors.displayName`) or the column name (`authors.display_name`). Turbine emits the column name. An unknown column throws `TURBINE_E003` listing the table's columns.
+- A table outside the schema is not checked, so a reference to a table another migration owns still works.
+
+To attach `ON DELETE` / `ON UPDATE` actions, pass an object:
 
 ```ts
 posts: {

@@ -52,6 +52,7 @@ const CONSTRUCT: Record<string, (m: ErrorsModule) => Error> = {
   UnsupportedFeatureError: (m) => new m.UnsupportedFeatureError('vector', 'sqlite'),
   ReadOnlyError: (m) => new m.ReadOnlyError('refused.'),
   TransactionRolledBackError: (m) => new m.TransactionRolledBackError('rolled back.'),
+  InvariantError: (m) => new m.InvariantError('probe', 'two internal paths disagreed.'),
 };
 
 /** Every exported class that is TurbineError or extends it, in export order. */

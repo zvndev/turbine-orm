@@ -172,7 +172,7 @@ so any model, field, relation or compound-unique added or renamed since then is 
 from the compat client. Re-run: turbine migrate-from-prisma
 ```
 
-It is a development aid: skipped under `NODE_ENV=production`, silent when `schema.prisma` is missing or there is no filesystem, asynchronous and unawaited, printed at most once per process, and unable to fail your app or your build. A map without a fingerprint (pre-0.60, or assembled by hand) is skipped.
+It is always on, in production too, since a stale map loses models there as well. In production mode the file is read once per path per process, so a client built per request does not read it per request. It is silent when `schema.prisma` is missing or there is no filesystem, asynchronous and unawaited, printed at most once per process through the client's `logger` (code `prisma-map-stale`), and unable to fail your app or your build. A map without a fingerprint (pre-0.60, or assembled by hand) is skipped.
 
 The fingerprint ignores exactly the differences a checkout can introduce on its own:
 
@@ -245,7 +245,16 @@ await prisma.$transaction(async (tx) => {
 
 A junction name that collides with a real Prisma model, or with a table a model already maps to, is skipped: the model wins its own key. The delegates are real at runtime but absent from the generated `PrismaCompatClient` type (there is no Prisma model to type them from), hence the cast above. The report's junction-tables section lists each junction's columns.
 
-**What it translates:** `include` to `with`; `select` split into scalar selection plus relations; field and relation renames in both directions; `take`/`skip` to `limit`/`offset`; cursor pagination; compound-unique selectors including custom `@@unique(name:)` names; `$transaction` in both the callback and lazy-array-batching forms; `$queryRaw` / `$executeRaw` and their `Unsafe` variants with `Prisma.sql`-style fragment flattening; `createMany({ skipDuplicates })` to `ON CONFLICT DO NOTHING`; `_count` objects keyed back to Prisma relation names; to-one relations surfaced as `object | null`; Prisma's client-side defaults emulated on write (see [Behaviors that match Prisma](#behaviors-that-match-prisma)).
+**What it translates:** `include` to `with`; `select` split into scalar selection plus relations; field and relation renames in both directions; `take`/`skip` to `limit`/`offset`; cursor pagination; compound-unique selectors including custom `@@unique(name:)` names; `$transaction` in both the callback and lazy-array-batching forms; `$queryRaw` / `$executeRaw` and their `Unsafe` variants with `Prisma.sql`-style fragment flattening; `createMany({ skipDuplicates })` to `ON CONFLICT DO NOTHING`; `_count` objects keyed back to Prisma relation names; to-one relations surfaced as `object | null`; Prisma's client-side defaults emulated on write (see [Behaviors that match Prisma](#behaviors-that-match-prisma)); `distinct: 'field'` and `groupBy({ by: 'field' })` with one field name; `createMany({ data: { ... } })` with one row.
+
+**Nothing is accepted and then dropped.** An argument the adapter cannot honor throws instead of being ignored:
+
+- `UnsupportedFeatureError` (`TURBINE_E017`): a filtered relation count (`_count: { select: { posts: { where } } }`), and `cursor` or `distinct` on an included relation. Count through the related model (`prisma.post.count({ where: { userId } })`) or with `groupBy`.
+- `ValidationError` (`TURBINE_E003`): an unknown key on an included relation, including Turbine's own `limit`, `offset` and `with` (the message names the Prisma spelling); an unknown key or relation under `_count`; a `select`, `include` or `omit` on a relation whose model is not in the map; an unread key in a nested `update`, `updateMany`, `connectOrCreate` or `upsert` payload; a `createMany` with no `data`, or `data` that is not an object or an array; and an unknown `$transaction` option.
+
+`$transaction` options (`isolationLevel`, `timeout`, and Turbine's `sessionContext`, `allowBuiltinSettings` and `readOnly`) apply in both the callback and the array form. Prisma's `maxWait` is accepted and has no effect: the pool's `connectionTimeoutMs` bounds the wait for a connection. It logs a warning once while advice is on.
+
+An unknown option at the top level of a query still warns rather than throws, see below.
 
 **Inside `$transaction`, the `tx` client carries the raw-SQL surface too.** `tx.$queryRaw`, `tx.$executeRaw` and their `Unsafe` variants run on the transaction's own connection, so a migrated block that mixes ORM calls with raw statements stays atomic. If the underlying transaction client cannot execute raw SQL, the adapter throws `ValidationError` rather than falling back to a pool connection outside the transaction. `tx` also exposes delegates under both spellings (`tx.User`, `tx.user`); the lowercase alias is skipped when it would shadow a real model name.
 
@@ -344,14 +353,14 @@ The option surface is runtime data (`src/query/option-surface.ts`) checked again
 
 ### Unknown query options warn
 
-A key that is neither a Prisma argument nor a Turbine option logs one dev-only line per model, operation and key:
+A key that is neither a Prisma argument nor a Turbine option logs one line per model, operation and key while the client's [`diagnostics`](/observability#diagnostics-diagnostics) advice is on:
 
 ```txt
 [turbine] prisma-compat: unknown option "customPlan" in User.findMany(), it is ignored. Did you mean "forceCustomPlan"?
 [turbine] prisma-compat: "limit" is Turbine's spelling and is ignored here; prisma-compat takes Prisma's "take". (User.findMany)
 ```
 
-The second form covers Turbine's spelling written into a Prisma-shaped call (`limit`/`with`/`offset` for `take`/`include`/`skip`). It is a warning, never a throw, silent under `NODE_ENV=production`, once per key per process; every legitimate Prisma argument is on the known set, including ones Prisma itself accepts and ignores (`count({ take })`).
+The second form covers Turbine's spelling written into a Prisma-shaped call (`limit`/`with`/`offset` for `take`/`include`/`skip`). It is a warning, never a throw, once per key per process, through the client's `logger` (codes `prisma-compat-unknown-option` and `prisma-compat-native-spelling`). It follows the client's [`diagnostics`](/observability#diagnostics-diagnostics) advice setting, which is off by default under `NODE_ENV=production`; every legitimate Prisma argument is on the known set, including ones Prisma itself accepts and ignores (`count({ take })`).
 
 ### What the adapter does *not* do
 
@@ -436,7 +445,7 @@ The full mapping for a native port. Skip to [Side-by-side](#side-by-side) to see
 | `where: { name: { contains: 'a' } }` | `where: { name: { contains: 'a' } }` | All operators ported. |
 | `where: { posts: { some: ... } }` | `where: { posts: { some: ... } }` | Relation filters: `some` / `every` / `none`. |
 | `data: { posts: { create: [...] } }` | `data: { posts: { create: [...] } }` | Nested writes map unchanged on to-one and one-to-many relations, in one transaction with a depth cap of 10. Many-to-many supports `connect` / `disconnect` / `set` since 0.50; the rest throw `ValidationError`. See [Nested writes](/nested-writes#many-to-many-relations). |
-| `include: { _count: { select: { posts: true } } }` | `with: { _count: { posts: true } }` | No `select` wrapper. `_count: true` counts every to-many relation. |
+| `include: { _count: { select: { posts: true } } }` | `with: { _count: { posts: true } }` | No `select` wrapper. `_count: true` counts every to-many relation. A per-relation `where` inside `_count` throws `TURBINE_E017` through prisma-compat; count through the related model instead. |
 | `prisma.$queryRaw` | ``db.raw`...` `` | Typed form: ``db.sql<T>`...` `` returns `T[]` with `.one()` / `.scalar()`. |
 | `take: 10` | `take: 10` | Works as-is, `take` is an alias for `limit`. |
 | `cursor: { id: 99 }` | `cursor: { id: 99 }` | Keyset pagination, same shape, but Turbine's cursor is **exclusive**: drop any `skip: 1` and audit cursors that had none (see [Cursor pagination](#cursor-pagination)). |
@@ -593,7 +602,7 @@ const active = await db.users.findMany({
 ## Notable differences
 
 - **No `schema.prisma`.** Code-first `defineSchema()` in a TypeScript module. `npx turbine push` (fast path) or `migrate create --auto` (generates SQL).
-- **`include` → `with`, `skip` → `offset`.** That's the full lexical diff. `take`, `skip`, `cursor`, and `distinct` work as-is at the top level (`take` and `skip` are aliases for `limit` and `offset`); inside a nested `with`, `take` / `skip` (or `limit` / `offset`) page each parent's rows.
+- **`include` → `with`, `skip` → `offset`.** That's the full lexical diff. `take`, `skip`, `cursor`, and `distinct` work as-is at the top level (`take` and `skip` are aliases for `limit` and `offset`); inside a nested `with`, `take` / `skip` (or `limit` / `offset`) page each parent's rows. Through prisma-compat, a nested `include` takes Prisma's `take` / `skip` only: Turbine's `limit`, `offset` and `with` there throw `TURBINE_E003`, and a nested `cursor` or `distinct` throws `TURBINE_E017`.
 - **Atomic update operators are first-class.** `set`, `increment`, `decrement`, `multiply`, `divide`. All compile to in-place SQL.
 - **Typed errors with codes.** `UniqueConstraintError` / `ForeignKeyError` / `NotNullViolationError` / `CheckConstraintError` carry `code` (`TURBINE_E008`–`E011`) and `cause`. `findUniqueOrThrow` throws `NotFoundError` (`TURBINE_E001`) with the `where` attached. `DeadlockError` / `SerializationFailureError` have `readonly isRetryable = true as const`.
 - **Driver-agnostic edge support.** Pass any pg-compatible pool to `turbineHttp(pool, SCHEMA)` and the same API runs on Neon, Vercel, Cloudflare Hyperdrive, Supabase. No extra adapter package.

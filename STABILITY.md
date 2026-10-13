@@ -21,9 +21,10 @@ These are the surfaces we intend to carry to 1.0 and beyond. We will not break t
 |---|---|
 | **Query API** | `findMany`, `findUnique`, `findFirst`, `findUniqueOrThrow`, `findFirstOrThrow`, `create`, `createMany`, `update`, `updateMany`, `delete`, `deleteMany`, `upsert`, `count`, `aggregate`, `groupBy`, including their `where`, `with`, `orderBy`, `select`, `omit`, and `limit`/cursor arguments and the types they return. |
 | **`with`-clause type inference** | The compile-time return types produced by `with`, `select`, and `omit`. We treat a regression in inference as a bug, not a free minor change. |
-| **Typed errors** | The `TurbineError` hierarchy and the **error codes** (`TURBINE_E001`–`TURBINE_E019`). A code, once assigned, keeps its meaning. Structured fields on errors (`.code`, `.docsUrl`, `.columns`, `.constraint`, `.where`, `.cause`) are stable; human-readable `.message` *text* is not (see below). |
+| **Typed errors** | The `TurbineError` hierarchy and the **error codes** (`TURBINE_E001`–`TURBINE_E020`). A code, once assigned, keeps its meaning. Structured fields on errors (`.code`, `.docsUrl`, `.columns`, `.constraint`, `.where`, `.cause`) are stable; human-readable `.message` *text* is not (see below). |
 | **CLI commands** | `init`, `generate` / `pull`, `push`, `migrate create\|up\|down\|deploy\|status`, `seed`, `status`, `doctor`, `studio`, `mcp`. The migration file format (`-- UP` / `-- DOWN`, timestamp-prefixed `.sql`, SHA-256 checksums in `_turbine_migrations`) is stable. `observe`, `migrate-from-prisma` and `skill` are tiered Experimental below. |
 | **Client configuration** | `TurbineConfig` fields and the `$transaction`, `$use`, `$on`/`$off`, `pipeline`, and raw-SQL tagged-template APIs on `TurbineClient`. |
+| **Log output** | The `logger` and `diagnostics` client options: the logger's four optional methods and their `(message, entry)` arguments, the diagnostics modes and overrides, and each log entry's `code`. A code, once assigned, keeps its meaning. The message text is not stable (see below). |
 
 ### Experimental surfaces
 
@@ -49,6 +50,10 @@ Two consequences for stability:
 
 - The **wording** of `.message` may change between any two releases. Do not parse it. Branch on `err.code` and read structured fields instead. Messages are prefixed with the stable code tag (e.g. `[TURBINE_E008] …`) for log greppability; that tag mirrors `.code` and is the only substring that is intentionally stable.
 - The **values** in `.message` may change. As of [0.17.0](./docs/releases/v0.17.0.md), constraint errors no longer append Postgres's raw `detail` (which could contain row data) in the default `safe` mode. If you relied on the old behavior, opt in with `errorMessages: 'verbose'` when constructing the client. Full detail is always available programmatically via `.columns`, `.constraint`, `.where`, and `.cause`, regardless of mode.
+
+## Log message text is not part of the contract
+
+The same rule holds for log lines. Each line Turbine writes carries a `code` (`'unknown-config-key'`, `'pool-error'`, and so on) in the entry passed to your `logger`. The code is stable; the message text may change in any release. Match on `entry.code`, never on the message. No log line carries a bound parameter value.
 
 ## Deprecation policy
 

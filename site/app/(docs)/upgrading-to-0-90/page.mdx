@@ -15,7 +15,7 @@ A smaller set changes results with no error at all. They come first on this page
 
 - **No schema change is required.** Nothing in 0.90 needs a migration.
 - **Regenerate, then type-check.** `turbine generate` emits stricter types in 0.90 (see [Generated types](#generated-types-are-stricter)), and `tsc --noEmit` then finds those call sites and the [column reference](#column-references-are-built-with-col) change on its own.
-- **Run your tests outside production mode.** Several checks below are development warnings, silent under `NODE_ENV=production`.
+- **Run your tests outside production mode.** Several checks below are development warnings, silent under `NODE_ENV=production` (see [Diagnostics replaces NODE_ENV](#diagnostics-replaces-node_env)).
 - **Search for the error codes.** A refusal is `ValidationError` (`TURBINE_E003`), an engine gap is `UnsupportedFeatureError` (`TURBINE_E017`), and a connection problem is `ConnectionError` (`TURBINE_E004`). Every message names the fix. Middleware that rewrites its arguments gets a plain `TypeError`, see [Middleware cannot change the arguments](#middleware-cannot-change-the-arguments).
 
 ## Results that change without an error
@@ -426,9 +426,9 @@ await db.posts.findMany({ cursor: { id: req.query.after }, take: 20 });
 // `after` missing: TURBINE_E003, rather than page 1 again
 ```
 
-### `optimisticLock` on `upsert` and `updateMany`
+### `optimisticLock` outside `update`
 
-Both ignored `optimisticLock`, so stale writes went through. Both now throw `TURBINE_E003`.
+`upsert`, `updateMany`, `delete` and `deleteMany` ignored `optimisticLock`, so stale writes and deletes went through. All four now throw `TURBINE_E003`. Only `update` takes it.
 
 ```ts
 // updateMany: put the version check in the query itself
@@ -450,6 +450,16 @@ await db.$transaction(async (tx) => {
 ```
 
 The `upsert` refusal also covers an `upsert` whose `create` or `update` carries nested relation data, which runs on another code path and used to skip the check.
+
+For a delete, put the expected version in `where` beside the key:
+
+```ts
+await db.posts.delete({ where: { id, version: expected } });
+// A row at another version is not deleted, and delete throws NotFoundError.
+
+await db.posts.deleteMany({ where: { authorId, version: expected } });
+// The count is the number of rows that were still at that version.
+```
 
 ### Middleware cannot change the arguments
 
@@ -494,6 +504,14 @@ defineSchema({ users: { id: { type: 'serial', primaryKey: true }, role: { type: 
 
 `defineSchema` also refuses a table or column named `__proto__` and an index that declares both `columns` and `docField`.
 
+It also refuses names it cannot resolve, each with `TURBINE_E003`:
+
+- a `references` that is not `table.column` (`references: 'users'` emitted no foreign key), or that names a column its target table in the schema does not have;
+- an index naming a column the table does not have;
+- two fields that map to one database column (`userId` and `user_id`), and two tables that map to one table name.
+
+A `references` to a table outside the schema is not checked. A `default` may now be a number or a boolean (`default: 0`, `default: false`); it used to crash with a `TypeError`.
+
 Such keys used to be ignored, which silently changed the DDL: a misspelt `default` or `unique` emitted a column without it, and `uniq` on an index emitted a non-unique index. Rename the key the error names, then run `turbine push --dry-run` or `turbine migrate create --auto` and review the difference, because the database may lack what the schema now says.
 
 ### Error classes that changed
@@ -507,9 +525,14 @@ Such keys used to be ignored, which silently changed the DDL: a misspelt `defaul
 - A lock wait that hit the server's lock timeout (MySQL error 1205, SQL Server error 1222) is `LockNotAvailableError`. It was a plain `SerializationFailureError`. The code (`TURBINE_E013`), `isRetryable` and `instanceof SerializationFailureError` are unchanged; only a check of `err.name` or `err.constructor` sees the difference.
 - A transaction PostgreSQL rolled back instead of committing is `TransactionRolledBackError` (`TURBINE_E019`), new in 0.90, see [Transactions](#transactions).
 
-### An object written to a scalar PostgreSQL column
+### An object written to a scalar column
 
-On PostgreSQL, a plain object or an array written to a built-in scalar column (text, numeric, boolean, temporal, uuid and similar) now throws `TURBINE_E003`. It used to store JSON text or a Postgres array literal without a word. Domains, extension types and array columns are not affected.
+A plain object or an array written to a built-in scalar column now throws `TURBINE_E003`. It used to be stored in some form without a word.
+
+- **PostgreSQL:** text, numeric, boolean, temporal, uuid and similar columns. It stored JSON text or a Postgres array literal. Domains, extension types and array columns are not affected.
+- **MySQL:** numeric, boolean, date and time, binary and text columns.
+- **SQLite and SQL Server:** numeric, boolean, date and time, uuid and binary columns. A text column still takes an object as JSON text, because that is how those engines store `json`.
+- **Every engine:** a `Map` or a `Set` throws on every column, `json` included. It was written as `{}`. Convert it first: `Object.fromEntries(map)`, `[...set]`.
 
 ```ts
 await db.users.create({ data: { settings: { theme: 'dark' } } });
@@ -548,6 +571,20 @@ await db.$transaction(async (tx) => {
 });
 ```
 
+**The statement after a failure is refused.** On PostgreSQL, once a statement inside the transaction fails, the next one is not sent. It rejects with the first failure's class when that was a deadlock, serialization conflict or unavailable lock, so `withRetry` retries it, and with `TransactionRolledBackError` (`TURBINE_E019`, the failure on `cause`) otherwise. It used to reach the server and come back as an untyped `25P02` error, which lost the first failure and was never retried. A nested `tx.$transaction` that recovers a failure still works.
+
+**A nested block has its own handle.** The callback of `tx.$transaction(fn)` receives its own handle, not the outer `tx`. A statement through the outer `tx` while that block is open throws `TURBINE_E003`. It used to run inside the block's savepoint, so a failing block silently undid writes the caller thought were outside it. Use the handle the block's callback receives.
+
+```ts
+await db.$transaction(async (tx) => {
+  await tx.$transaction(async (inner) => {
+    await inner.audit.create({ data: entry }); // not tx.audit
+  });
+});
+```
+
+**Transaction-control SQL is refused inside a transaction.** `COMMIT`, `ROLLBACK`, `BEGIN`, `SAVEPOINT`, `RELEASE`, `ROLLBACK TO`, `SET TRANSACTION` and the like, sent through `tx.raw`, `tx.rawUnsafe`, `tx.sql` or `tx.$connection().query`, throw `TURBINE_E003`. A hand-written `COMMIT` ended the transaction early, and every later write autocommitted. Return from the callback to commit, throw to roll back, and use `tx.$transaction` for a savepoint. The raw `transaction()` client still accepts `SAVEPOINT`, `RELEASE` and `ROLLBACK TO`. `tx.$connection()` also refuses `end()` and `connect()` and no longer exposes the driver's `.connection`.
+
 **A settled `tx` throws.** A `tx` used after its transaction committed, rolled back or timed out throws `TURBINE_E003` instead of running on a connection that may belong to another request. The usual causes are a missing `await`, an `async` callback passed to `forEach` (use `for ... of`), or a `tx` stored for later.
 
 **Un-awaited work rolls the transaction back.** A `$transaction` or `transaction()` callback that returns while a query it started is still running now rolls back and rejects with `TURBINE_E003`. It used to commit whatever part of the work had finished. Await every query (`for ... of`, `await Promise.all(...)`).
@@ -556,7 +593,7 @@ await db.$transaction(async (tx) => {
 
 **A transaction timeout stops the work on the server.** On expiry, `$transaction` cancels the running statement and rolls the transaction back before it rejects, so its locks are released at that moment. `timeout` must be a positive number of milliseconds below 2^31, or `0` for none; anything else throws `TURBINE_E003`.
 
-**A per-query timeout inside `$transaction` rolls the transaction back.** On PostgreSQL the statement is cancelled on the transaction's connection and the call rejects with `TimeoutError` (`outcome: 'not-executed'`). A callback that catches it and returns gets `TransactionRolledBackError`; in a nested `tx.$transaction`, only that block rolls back. Retry the whole transaction, or put the timed statement in its own nested block.
+**A per-query timeout inside `$transaction` rolls the transaction back.** On PostgreSQL the statement is cancelled on the transaction's connection and the call rejects with `TimeoutError` (`outcome: 'not-executed'`). A callback that catches it and returns gets `TransactionRolledBackError`; in a nested `tx.$transaction`, only that block rolls back. Retry the whole transaction, or put the timed statement in its own nested block. A statement sent after the caught `TimeoutError` is refused with `TransactionRolledBackError`, the timeout on `cause`.
 
 **`sessionContext` names need a dot.** A name without one (`role`, `search_path`, `statement_timeout`) is one of PostgreSQL's own settings and throws `TURBINE_E003`. Namespace custom settings (`app.tenant`), or list a built-in setting your code sets on purpose with `allowBuiltinSettings: ['search_path']`.
 
@@ -584,14 +621,18 @@ await db.$transaction(async (tx) => {
 
 **`$on` and `$off` check the event name.** A name other than `'query'`, `'poolError'` or `'connectionLost'` throws `TURBINE_E003`.
 
-**`PGHOST`, `PGPORT`, `PGDATABASE` and `PGUSER` are honoured.** Turbine's own `localhost` / `postgres` defaults used to override them. If your shell sets `PGUSER` for `psql` and the app relied on the `postgres` default, set `user` explicitly.
+**`PGHOST`, `PGPORT`, `PGDATABASE` and `PGUSER` are honoured.** Turbine's own `localhost` / `postgres` defaults used to override them. `PGHOST` and `PGPORT` also count when Turbine decides whether it is talking to a pooler, so a pooler named only by the environment gets unnamed statements too. If your shell sets `PGUSER` for `psql` and the app relied on the `postgres` default, set `user` explicitly.
 
 ### prisma-compat
 
 - `take`, `skip` and `cursor` on `count` and `aggregate` throw `TURBINE_E017`. They were ignored, so the number covered every matching row. Fetch the page with `findMany` and compute from it.
 - `count({ select })` returns Prisma's per-field object (`{ _all, title }`) instead of a number.
 - Every cursor shape now matches Prisma: the page starts at the cursor row in the query's order and `skip: 1` drops it. The shapes that threw `TURBINE_E017` before now work, and `cursor` plus `skip` under an `orderBy` on another field returns the right rows.
-- `skip` in a nested `include` maps to the relation offset. A nested `cursor` throws `TURBINE_E017`; it was dropped.
+- `skip` in a nested `include` maps to the relation offset. A nested `cursor` throws `TURBINE_E017`; it was dropped. A nested `distinct` throws `TURBINE_E017`; it returned duplicate rows.
+- A filtered relation count (`_count: { select: { posts: { where } } }`) throws `TURBINE_E017`. It returned the unfiltered count. Count through the related model.
+- An option the adapter does not translate throws `TURBINE_E003` instead of being ignored: an unknown key on an included relation (including Turbine's `limit`, `offset` and `with`), an unknown key under `_count`, an unknown `$transaction` option, and an unread key in a nested write payload. See [what it translates](/migrate-from-prisma).
+- `createMany` with no `data`, or `data` that is neither an object nor an array, throws `TURBINE_E003`. It inserted nothing and returned `count: 0`.
+- The array form `$transaction([...], options)` applies `isolationLevel` and `timeout`. They were ignored.
 - A cursor always reads the row it names, so a cursor whose row was deleted since the last page gives an empty page, as in Prisma.
 
 ### SQLite
@@ -606,7 +647,7 @@ await db.$transaction(async (tx) => {
 - Data errors (too long, out of range, bad value, bad date, division by zero, invalid JSON) are `ValidationError` with `column` and `sqlstate`, instead of a plain driver error.
 - `create` on a table whose new key the engine cannot report back (a UUID or other default the server does not number, or no primary key) throws `TURBINE_E017` before the `INSERT`. It used to re-read by a guessed key and could return another row, another tenant's included. Pass the key in `data` (`crypto.randomUUID()` for a UUID key), or make it `AUTO_INCREMENT`.
 - A single-row `update`, `delete` or `upsert` whose re-read or lock matches more than one row (a number compared with a text key) throws `TURBINE_E017` and is rolled back. Pass key values with the column's type.
-- A `createMany` with `onConflict` whose rows share the conflict key only under the column's collation (`'bob'` and `'BOB'`) throws `TURBINE_E003`. MySQL used to merge the two rows. PostgreSQL (`citext`, a case-insensitive collation) and SQL Server raise the same error.
+- A `createMany` with `onConflict` (new in 0.90) whose rows share the conflict key only under the column's collation (`'bob'` and `'BOB'`) throws `TURBINE_E003`, across the statements of a chunked call too. Every engine raises the same error, SQLite (`COLLATE NOCASE`) included, see [Multi-row upsert](/queries#multi-row-upsert-onconflict).
 
 ### PowDB
 
@@ -628,6 +669,34 @@ These change results on PowDB without an error:
 - An unknown relation in `with` is `RelationError` (`TURBINE_E005`), as on the SQL engines. It was `TURBINE_E003`, and it is now refused even when the base query matches no row.
 - An object written to a `json` column by `update`, `updateMany` or `upsert` is stored as the document. It was read as an atomic operator and refused. Only `{ set: ... }` is an operator on a `json` column.
 - `with: { _count: { rel: true } }` returns relation counts. It threw `Unknown relation _count`.
+
+## Logging and diagnostics
+
+### Diagnostics replaces NODE_ENV
+
+A new client option, [`diagnostics`](/observability#diagnostics-diagnostics), decides whether Turbine prints per-query advice and runs its SQL-cache self-check. When you do not set it, it follows `NODE_ENV` as before, with two differences:
+
+- It is read once, when the client is constructed. Changing `NODE_ENV` afterwards does not affect that client.
+- A runtime with no `process` defaults to production mode. A runtime that has a `process` but no `NODE_ENV` (some workers) defaults to development mode, so set `diagnostics: 'production'` there.
+
+On PowDB, the unknown-option advice still reads `NODE_ENV` directly in this release, see [Observability](/observability#log-output-logger).
+
+### Construction warnings are always on
+
+These warnings used to be silent under `NODE_ENV=production`. They now fire once per process in every mode, because each describes a production hazard:
+
+- an unknown key in the client config (code `unknown-config-key`);
+- `planCacheMode` on a pool Turbine does not own (code `plan-cache-mode-ignored`);
+- prisma-compat's check that the map is older than `schema.prisma` (code `prisma-map-stale`).
+
+The warnings new in 0.90 about prepared statements sent through a pooler (`prepared-statements-on-pooler`) and a connection option an external pool ignores (`connection-option-ignored`) are always on too.
+
+Fix the cause, or route Turbine's output with the new [`logger`](/observability#log-output-logger) option. `logger: {}` silences everything.
+
+### Smaller output changes
+
+- A `$listen` connection that is reconnecting is logged at `warn` (`console.warn`), not `error`. The final loss is still `error`.
+- Every line now carries a stable `code` when it goes through a `logger`. Match on the code; the message text is not stable.
 
 ## Tooling
 
@@ -679,7 +748,8 @@ Writes to `int8` also accept a `string` or `bigint`, and writes to `numeric` a `
 `schemaToSQL` and `schemaPush` used to map a column type twice on the other engines, losing what the dialect's own mapping said. The PostgreSQL output is unchanged. Elsewhere, regenerate the DDL and review it before applying it to an existing database:
 
 - `AUTO_INCREMENT` (MySQL), `AUTOINCREMENT` (SQLite) and `IDENTITY` (SQL Server) stay on serial keys, and declared `VARCHAR` lengths stay.
-- SQL Server `text` and `json` stay `NVARCHAR(MAX)` instead of being cut to 255; `timestamptz` stays `DATETIMEOFFSET`.
+- SQL Server `text` and `json` stay `NVARCHAR(MAX)` instead of being cut to 255.
+- **SQL Server `timestamp` and `timestamptz` columns are `DATETIMEOFFSET`.** Both were `DATETIME2`. In `defineSchema`, `timestamp` means `timestamptz`, so every code-first timestamp column changes type. Existing tables keep `DATETIME2` until you alter them.
 - MySQL foreign keys are emitted at table level, so they now exist. MySQL 8 parses and ignores an inline `REFERENCES`.
 - Text in a key position (primary key, unique, foreign key, declared index) is `VARCHAR(255)` on MySQL and `NVARCHAR(255)` on SQL Server. A longer key needs an explicit `varchar` with `maxLength`.
 - Defaults are translated per dialect (`now()`, `gen_random_uuid()`, `true` / `false`, `current_date`). On MySQL a non-`NULL` default on a `TEXT`, `BLOB` or `JSON` column is written as an expression (`DEFAULT ('member')`), a clock default on a `DATE` or `TIME` column as `(CURRENT_DATE)` or `(CURRENT_TIME)`, and a `DATETIME(n)` default follows the column's precision. MySQL rejected the old forms.
@@ -703,7 +773,8 @@ None of these change existing code. Each is opt-in:
 
 - **[Row locks](/queries#row-locks):** `lock: 'update'` and the other modes on `findMany` / `findFirst` / `findUnique`, with `noWait` and `skipLocked`, inside `$transaction`.
 - **[Percentiles](/queries#percentiles-_percentile):** `_percentile` on `aggregate` and `groupBy` (PostgreSQL).
-- **[Update expressions](/queries#update-expressions-expr):** `expr.add(col('views'), 1)`, `expr.greatest`, `expr.case`, `expr.now()` and more in update data.
+- **[Update expressions](/queries#update-expressions-expr):** `expr.add(col('views'), 1)`, `expr.greatest`, `expr.case`, `expr.now()` and more in update data. They store the same value on every engine: arithmetic between integers is integer arithmetic, and a non-integer result is refused on an integer column.
+- **[Logging](/observability#log-output-logger):** a `logger` option for every line Turbine writes, each with a stable `code`.
 - **[Multi-row upsert](/queries#multi-row-upsert-onconflict):** `createMany({ data, onConflict: { target, update } })`, and `select` / `omit` on `createMany`.
 - **Client options:** [`statementTimeoutMs`](/queries#client-configuration) (PostgreSQL), `maxLifetimeSeconds`, and on `$transaction`, [`readOnly` and `allowBuiltinSettings`](/transactions#transaction-options).
 - **Inside a transaction:** [`tx.sql`, `tx.rawUnsafe` and `tx.$connection()`](/transactions#what-tx-has).

@@ -119,10 +119,13 @@ src/
                       per-target-table WhereHost and drives ONE `buildScopedWhere` /
                       `collectScopedWhereParams` / `fingerprintScopedWhere` trio (over a
                       small `WhereScope` = column qualifier + meta + correlation parent), so
-                      no walker is hand-mirrored anymore. cacheCrossCheckMode() in
-                      builder.ts: 'dev' (always-on NODE_ENV guard) | 'sampled'
-                      (TURBINE_CACHE_CHECK_SAMPLE env, rate in (0,1], log-once-per-
-                      fingerprint then throw) | 'off'.
+                      no walker is hand-mirrored anymore. The cache cross-check in
+                      builder.ts reads the client's resolved `diagnostics.cacheCheck`
+                      (0.90; no env read on the hot path): 'every-hit' (development
+                      default, throw on mismatch) | `{ sample }` (rate in (0,1], log
+                      `cache-mismatch` once per fingerprint then throw) | 'off'
+                      (production default). The legacy TURBINE_* variables are read
+                      only by diagnostics.ts.
                       0.90 adds two rules here. `relationFilterValueProblem` /
                       `assertRelationFilterValues`: a quantifier (`some` / `none` / `every`)
                       must be a where object and `is` / `isNot` a where object or `null`;
@@ -387,7 +390,8 @@ src/
                       client-side. Rows are byte-identical to the join strategy's.
                       Eligibility is per relation and every refusal falls back to the
                       default correlated subquery SILENTLY and byte-identically (with a
-                      once-only dev warning, WARN_NS.flattenFallback): to-one only, a
+                      once-only warning gated on `diagnostics.advice`, WARN_NS.flattenFallback,
+                      code `flatten-fallback`): to-one only, a
                       PROVABLY UNIQUE target key, no per-relation `limit` / `orderBy`, no
                       `_count` in the nested `with`, no alias collision or over-length alias,
                       and depth < FLATTEN_MAX_DEPTH (10, mirroring the join cap). Four
@@ -479,7 +483,7 @@ src/
                       unordered-page, PowDB link DDL skips, 'flatten' fallbacks, and
                       unknownConfigKey (0.53: client.ts warnUnknownConfigKeys checks every
                       key on the config object against TURBINE_CONFIG_KEYS and warns once
-                      per key name outside production, with suggestConfigKey's correction,
+                      per key name (always on since 0.90), with suggestConfigKey's correction,
                       closestName first then a camel-word-subsequence pass so `logParams`
                       still suggests `logQueryParams`; `url`/`schema`/queryInterfaceFactory
                       are exempt, and the whole check is try/caught so a diagnostic can
@@ -554,6 +558,10 @@ src/
                       variable-arity rule). `resolveExcludedFromCreate` turns
                       `expr.excluded(field)` into `create`'s value on the lookup-first upsert
                       path and in nested upserts. PowDB refuses expressions (E017).
+                      Arithmetic is typed from its operands: integer between integers (DIV on
+                      MySQL, so `expr.div` truncates toward zero everywhere, float target
+                      included), and a result that can be non-integer is refused on an integer
+                      column (E003). A bound value's class is in the fingerprint.
 
     row-lock.ts    , The `lock` read option (0.90). `resolveRowLock` is the one place a lock
                       value is validated and rendered; the SQL and the `|lk=` cache-key
@@ -670,7 +678,9 @@ src/
                       was attempted and failed its own out-of-sample prediction.
 
   connection-url.ts, Zero-import leaf (0.71) owning everything that reads or rewrites a
-                      CONNECTION STRING. Three jobs. (1) `detectPooler` +
+                      CONNECTION STRING. Three jobs. (1) `detectPooler(connectionString,
+                      environment?)` (0.90: `fillTargetFromEnvironment` fills an unset host /
+                      port from PGHOST / PGPORT, `detectPoolerTarget` judges the result) +
                       `poolerRefusalMessage`: `turbine doctor` REFUSES a transaction-pooling
                       endpoint before opening a connection (`--allow-pooler` overrides;
                       default is refusal). A pooler multiplexes backends, so both the session
@@ -752,6 +762,29 @@ src/
                       COMMIT-answered-with-ROLLBACK path goes through the same function. A callback that returns
                       with work still running rolls back (`unawaitedWorkError`, E003). Shared
                       by `$transaction`, nested blocks and raw `transaction()`.
+                      Also tracks whether PostgreSQL has ABORTED the transaction (per
+                      savepoint tick): the next statement is refused locally with the first
+                      failure's class (retryable) or E019, never sent to come back as an
+                      untyped 25P02; a successful `ROLLBACK TO` ends the abort. Each nested
+                      `tx.$transaction` gets its own `TransactionScope` handle (`withBlock`);
+                      a statement through an outer handle while an inner block is open is
+                      E003. `withSavepoint` is the handle-less savepoint one multi-statement
+                      write runs in. `runRaw` / `screenRaw` refuse transaction-control SQL on
+                      the raw paths (via transaction-control.ts); raw `transaction()` keeps
+                      SAVEPOINT / RELEASE / ROLLBACK TO.
+
+  transaction-control.ts, Zero-import leaf (0.90): `findTransactionControl(sql, syntax)`
+                      finds BEGIN / COMMIT / ROLLBACK / SAVEPOINT / RELEASE / SET
+                      TRANSACTION / PREPARE TRANSACTION and the rest at statement STARTS,
+                      with per-engine lexical rules (`ControlSyntax`: postgresql, mysql,
+                      sqlite, mssql), so a word in a comment, literal or quoted identifier is
+                      never a statement. Ambiguity reads as quoted (a missed statement goes
+                      through as before; an invented one would refuse a valid query). NOT a
+                      second splitter: `src/test/fx-tx-control.test.ts` holds it to
+                      `cli/sql-statements.ts` over an adversarial corpus. Kept out of cli/
+                      because library code imports one CLI file only (schema-sql.ts ->
+                      `cli/destructive.ts`), and the CLI tokenizer would land in every engine
+                      and edge bundle.
 
   global-filters-config.ts, `globalFilters` checked at CONSTRUCTION (0.90). The config is
                       keyed by client ACCESSOR (`blogPosts`) while the builder looks filters
@@ -774,6 +807,50 @@ src/
                       Turbine does not govern falls through to the table the query would have
                       used, so the caller's own parsers still apply, and the caller's own
                       queries on that pool are untouched.
+
+  diagnostics.ts   , The `diagnostics` client option (0.90): `resolveDiagnostics(config, env)`
+                      returns a frozen `{ mode, advice, cacheCheck }`. Mode defaults to
+                      'production' when NODE_ENV is 'production' OR there is no `process`
+                      (edge), else 'development'; resolved ONCE at construction and handed to
+                      every query interface the client builds. Also reads the legacy
+                      TURBINE_DISABLE_CACHE_CHECK / TURBINE_CACHE_CHECK_SAMPLE. E003 on an
+                      unknown mode or key, a non-boolean `advice`, a sample outside (0, 1].
+                      Imports only errors.ts. The ONE NODE_ENV reader in the library except
+                      powql.ts, whose unknown-option advice (via option-surface's
+                      `adviceFromEnvironment`) and no-limit warning still go to console;
+                      that file is the env-scan test's only PENDING entry. `advice` gates
+                      the builder's advice (`this.advice`), the relations.ts advice
+                      (`whereMod.adviceLogger(qi)`), option-surface's unknown-option
+                      warning, utils.ts's redundant sort term and prisma-compat's option
+                      advice; `cacheCheck` drives the builder's cache cross-check. Explicit
+                      `cacheCheck` beats the legacy variables, which beat the mode default;
+                      `TURBINE_DISABLE_CACHE_CHECK=1` wins over the sample variable.
+
+  logger.ts        , The pluggable logger (0.90). `TurbineLogger` has optional
+                      debug/info/warn/error methods called as `(message, entry)`, a missing
+                      method drops the level (`{}` silences Turbine), a throwing method is
+                      ignored, and `this` is kept. `TurbineLogEntry` = `{ code, table?,
+                      operation?, error?, ... }`. `consoleLogger` prints `[turbine] message`
+                      (plus the error when the message ends with ':'), looking `console` up
+                      per call. `resolveLogger` is the E003 validator; `logTo` the one send
+                      path. No line carries a bound value, whatever `logQueryParams` says.
+                      Warn-once dedup is process-wide (a second client's logger does not see
+                      a line the first already emitted). `CLIENT_LOG_CONTEXT`
+                      (`Symbol.for('turbine-orm.clientLogContext')`) hands the client's
+                      logger + diagnostics to prisma-compat. Only this module and seed.ts
+                      call `console` directly by design. The types (`TurbineLogger`,
+                      `TurbineLogEntry`, `TurbineLogCode`, `TurbineLogLevel`) and the
+                      diagnostics types are exported from the package root; the runtime
+                      `LOG_CODES` array is not. `src/test/fleet-diagnostics-env-scan.test.ts`
+                      enforces both rules (one NODE_ENV reader, one console caller) over
+                      `src/` minus `test/` and `cli/`, with a PENDING allowlist (now only
+                      powql.ts) whose entries must still have a hit.
+
+  log-codes.ts     , `LOG_CODES`, the closed list of every log `code` (48 at 0.90). The
+                      CODE is the stable contract, the message text is not (STABILITY.md).
+                      Library code imports it as a TYPE only (`TurbineLogCode`), so an
+                      emitter cannot invent a code; the tests import the array, one test per
+                      code plus a scan that fails on a code nothing emits.
 
   client.ts        , TurbineClient wraps a pg.Pool and auto-creates typed table accessors
                       via Object.defineProperty. Manages middleware ($use), transactions
@@ -857,9 +934,21 @@ src/
                       param, so the closed enum IS the injection boundary, and the emitted
                       literal is the matched MEMBER, never the caller's string), gated on the
                       `supportsPlanCacheMode` dialect flag (E017), owned pools + owned string
-                      `replicas` only (external pool = no-op + one dev warning). ALL config
+                      `replicas` only (external pool = no-op + one always-on warning). ALL config
                       validation now runs BEFORE any process-global side effect, so a throwing
-                      constructor cannot leave the parser mode settled.
+                      constructor cannot leave the parser mode settled. `logger` and
+                      `diagnostics` (0.90) are validated FIRST in the constructor; every line
+                      the client writes goes through `logTo(this.logger, ...)` with a code from
+                      log-codes.ts. Construction warnings (unknown config key, planCacheMode
+                      ignored, prepared statements on a pooler, connection option ignored on
+                      an external pool) are ALWAYS ON, whatever `diagnostics` says; `logging:
+                      true` lifecycle lines go to `debug`. `$listen` reconnect lines moved from
+                      console.error to warn (`listen-reconnecting`). A nested
+                      `tx.$transaction` callback receives its own `TransactionClient`;
+                      `poolerEndpoint` fills an unset host and port from PGHOST / PGPORT
+                      before pooler detection; `closableRawClient` (the `$connection()` and
+                      raw `transaction()` client) refuses `end` / `connect` and hides
+                      `connection`.
 
   adapters/        , Database adapter layer for Postgres-compatible engines.
                       cockroachdb.ts + yugabytedb.ts override the operations with
@@ -1195,7 +1284,7 @@ src/
                       names.
 
   errors.ts        , Error hierarchy rooted at TurbineError. Each error has a code
-                      (TURBINE_E001-E019). wrapPgError() translates pg driver errors
+                      (TURBINE_E001-E020). wrapPgError() translates pg driver errors
                       (23505, 23503, 23502, 23514, 23P01, 40P01, 40001) into typed
                       Turbine errors. 0.90: 42P05 and 26000 (a named prepared statement
                       the server connection already holds, or never prepared, which is
@@ -1205,7 +1294,9 @@ src/
                       with `max_prepared_statements` above 0). `TimeoutError.outcome` is
                       `'not-executed'` (never sent, or the server confirmed the cancel:
                       safe to retry) or `'unknown'` (the default, the only answer never
-                      wrong); see the timeout note under builder.ts. UnsupportedFeatureError (E017) is thrown directly
+                      wrong); see the timeout note under builder.ts. 25P02 (in failed
+                      transaction) maps to `TransactionRolledBackError` (E019) as a fallback;
+                      the transaction state normally refuses that statement before it is sent. UnsupportedFeatureError (E017) is thrown directly
                       (not via wrapPgError) when a non-Postgres engine hits a Postgres-only
                       feature. 0.65: every TurbineError carries `.docsUrl`
                       (`https://turbineorm.dev/errors#eNNN` via docsUrlForCode) and
@@ -1289,6 +1380,12 @@ src/
                       and `docField`, and a `tsType` that is not one TypeScript type on one
                       line (`tsTypeTextProblem`, which generate.ts also applies to
                       `columnTypes`, since the text is emitted verbatim into source).
+                      An integrity pass (0.90) refuses names it cannot resolve: a `references`
+                      not in `table.column` form, or naming a column its in-schema target
+                      lacks (a field name resolves to its column; a table outside the schema
+                      is left alone), an index naming an unknown column, and two fields or
+                      two tables mapping to one database name. `default` takes a number or
+                      boolean as a literal; any other non-string default is E003.
 
   schema-metadata.ts, `defineSchema()` -> `SchemaMetadata` bridge (`schemaDefToMetadata`).
                       The pure-function equivalent of introspect + generate, for the paths
@@ -1397,6 +1494,15 @@ src/
                       A `client` member shadowing a delegate or CLIENT_RESERVED_KEYS, or a
                       `model` key naming no model, throws E003. `Prisma.getExtensionContext`
                       is the identity function; `$name` is runtime-only, not on the type.
+                      Nothing is accepted and dropped (0.90): a filtered `_count` and a nested
+                      `distinct` / `cursor` are E017; an unknown nested option (Turbine's
+                      `limit` / `offset` / `with` included), an unknown `_count` key, an
+                      unknown `$transaction` option, an unread nested-write key, and a
+                      projection on a relation outside the map are E003. The array-form
+                      `$transaction` forwards its options; `maxWait` is accepted, not
+                      forwarded, and warned once. Its advice goes through the client's
+                      logger via CLIENT_LOG_CONTEXT, gated on `diagnostics.advice`; the
+                      stale-map check is always on.
                       Pure shim: zero new deps, never imported by core.
 
   errorMessages scoping, `errorMessages: 'safe' | 'verbose'` is a property of the
@@ -1561,7 +1667,8 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 | E016 | `ExclusionConstraintError` | pg 23P01, via `wrapPgError()` |
 | E017 | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) invoked on an engine whose capability flag reports it unsupported, thrown directly, not via `wrapPgError()` |
 | E018 | `ReadOnlyError` | A write refused because the database is read-only, `reason: 'snapshot'` (PowDB snapshot serving / client-level `readonly: true` fail-fast) or `'rbac'` (read-only role). Thrown locally by the PowDB readonly guard and via `wrapPowdbError()` message families |
-| E019 | `TransactionRolledBackError` | A transaction PostgreSQL rolled back instead of committing (the callback caught a failed statement, or a per-query timeout cancelled one); the first failure is `cause`. Deadlock, serialization and lock-not-available first failures keep their own class. Built by `rolledBackError` in transaction-state.ts, not via `wrapPgError()` |
+| E019 | `TransactionRolledBackError` | A transaction PostgreSQL rolled back instead of committing (the callback caught a failed statement, or a per-query timeout cancelled one); the first failure is `cause`. Deadlock, serialization and lock-not-available first failures keep their own class. Built by `rolledBackError` in transaction-state.ts; pg 25P02 also maps here via `wrapPgError()` as a fallback |
+| E020 | `InvariantError` | Turbine caught a bug in itself before sending a statement it knew was wrong: two internal paths that must agree did not (the SQL-template cache vs a fresh build, `invariant: 'sql-cache-lockstep'`; a cached entry whose param count differs from the params collected, `'sql-cache-param-count'`). Thrown by the always-on cache prechecks in query/builder.ts. Not retryable, not caused by the arguments; the message names the query shape and no value |
 
 `wrapPgError(err)` inspects the pg driver error's `.code` field and wraps it in the appropriate typed error, preserving the original as `.cause`. It is called in `client.ts` (raw queries, transaction pool proxy) and at query execution boundaries in `query/builder.ts`.
 

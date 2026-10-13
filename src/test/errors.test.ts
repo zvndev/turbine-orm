@@ -411,8 +411,12 @@ describe('TurbineErrorCode', () => {
     assert.equal(TurbineErrorCode.TRANSACTION_ROLLED_BACK, 'TURBINE_E019');
   });
 
-  it('has exactly 19 error codes', () => {
-    assert.equal(Object.keys(TurbineErrorCode).length, 19);
+  it('has INVARIANT_VIOLATION = TURBINE_E020', () => {
+    assert.equal(TurbineErrorCode.INVARIANT_VIOLATION, 'TURBINE_E020');
+  });
+
+  it('has exactly 20 error codes', () => {
+    assert.equal(Object.keys(TurbineErrorCode).length, 20);
   });
 });
 

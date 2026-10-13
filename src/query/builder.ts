@@ -18,6 +18,8 @@ import type { Dialect, StreamableConnection } from '../dialect.js';
 import { postgresDialect } from '../dialect.js';
 import {
   explainConnectionLoss,
+  INVARIANT_REPORT_HINT,
+  InvariantError,
   isStaleConnectionError,
   NotFoundError,
   TimeoutError,
@@ -164,21 +166,31 @@ import * as writesMod from './writes.js';
  * `buildWhereClause` (builds SQL + `$N` params on a MISS), and
  * `collectWhereParams` (re-collects params on a HIT without rebuilding). Since
  * 0.36 all three consume ONE shared where-key walk (see `where-compile.ts`), so
- * enumeration drift is structurally eliminated; this check remains as a
+ * enumeration drift is structurally eliminated; these checks remain as a
  * tripwire in case a future leaf builder or its collect mirror falls out of
- * step. It rebuilds the SQL + params fresh on a cache HIT and compares them
- * against what the cache-hit path produced.
+ * step. Every failure is an {@link InvariantError} (E020), thrown before the
+ * statement is sent.
  *
- * Whether it runs is the client's `diagnostics.cacheCheck`, resolved once at
- * construction (see diagnostics.ts; the legacy `TURBINE_DISABLE_CACHE_CHECK` /
- * `TURBINE_CACHE_CHECK_SAMPLE` variables are read there and nowhere else):
+ * Two checks always run, whatever the diagnostics mode, because each costs one
+ * array compare and the alternative is executing parameters known to be wrong:
+ * - On a MISS, the params the build closure pushed are compared with the params
+ *   the collect path produced (`sql-cache-lockstep`). The miss already paid
+ *   for both walks, and a shape run once per instance is otherwise never
+ *   compared at all.
+ * - On a HIT, the collected param count must equal the count the entry was
+ *   built with (`sql-cache-param-count`). Otherwise the server would reject
+ *   the statement with a bind error that reads like a connection problem.
+ *
+ * The full rebuild-and-compare on a HIT follows the client's
+ * `diagnostics.cacheCheck`, resolved once at construction (see diagnostics.ts;
+ * the legacy `TURBINE_DISABLE_CACHE_CHECK` / `TURBINE_CACHE_CHECK_SAMPLE`
+ * variables are read there and nowhere else):
  * - `'every-hit'` (the development default): every hit is compared, and a
  *   mismatch throws.
  * - `{ sample }`: that fraction of hits is compared (per-hit `Math.random()`;
  *   a sample of 1 compares every hit). A mismatch is logged at `error` once
  *   per distinct fingerprint, then throws.
- * - `'off'` (the production default): never compared; the hot path is
- *   untouched.
+ * - `'off'` (the production default): never rebuilt on a hit.
  */
 
 /**
@@ -745,6 +757,13 @@ export class QueryInterface<
    * inline, not through the top-level cache).
    */
   private lastCacheHit = false;
+  /**
+   * The params the build closure pushed on the most recent MISS, held until
+   * {@link crossCheckCache} compares them with the collected params and clears
+   * them. `undefined` after a hit. Same single-flag reasoning as
+   * {@link lastCacheHit}.
+   */
+  private lastMissParams: unknown[] | undefined;
   /**
    * Set while a build closure runs when the statement's WHERE (or HAVING)
    * carries a caller-written `AND`/`OR` combinator array, i.e. when its SQL text
@@ -2562,15 +2581,14 @@ export class QueryInterface<
    *
    * When `sqlCache` is disabled, always calls `build()` without caching.
    *
-   * `build` receives a fresh `$N` param scratch array. On a miss those params
-   * are discarded (the returned params come from each call site's dedicated
-   * collect path); the array exists so the build path can number placeholders
-   * via `params.length` exactly as it does today. On a HIT, `build` is skipped
-   * here but re-run by {@link crossCheckCache} (dev only) with a fresh array to
-   * verify the collect path stayed in lockstep with the build path.
+   * `build` receives a fresh `$N` param scratch array. The executed params
+   * always come from each call site's dedicated collect path; on a miss the
+   * scratch params are kept in {@link lastMissParams} so `crossCheckCache` can
+   * compare the two. On a HIT, `build` is skipped here and re-run by
+   * {@link crossCheckCache} only when `diagnostics.cacheCheck` asks for it.
    *
-   * Sets {@link lastCacheHit} so the caller's `crossCheckCache` knows whether a
-   * cross-check is warranted.
+   * Sets {@link lastCacheHit} so the caller's `crossCheckCache` knows which
+   * comparison applies.
    */
   private acquireSql(cacheKey: string, build: (params: unknown[]) => string): SqlCacheEntry {
     if (!this.sqlCacheEnabled) {
@@ -2582,6 +2600,7 @@ export class QueryInterface<
     if (cached) {
       this.cacheHits++;
       this.lastCacheHit = true;
+      this.lastMissParams = undefined;
       return cached;
     }
 
@@ -2613,32 +2632,36 @@ export class QueryInterface<
    */
   private buildCacheEntry(build: (params: unknown[]) => string): SqlCacheEntry {
     this.variableArityShape = false;
-    const sql = build([]);
+    this.lastMissParams = undefined;
+    const built: unknown[] = [];
+    const sql = build(built);
     const variableArity = this.variableArityShape;
     this.variableArityShape = false;
     this.cacheMisses++;
-    return { sql, name: variableArity ? '' : boundedPreparedName(sql) };
+    this.lastMissParams = built;
+    return { sql, name: variableArity ? '' : boundedPreparedName(sql), paramCount: built.length };
   }
 
   /**
-   * Dev-mode SQL-cache lockstep cross-check (see {@link cacheCrossCheckEnabled}).
+   * The SQL-cache lockstep checks (see the comment above `CACHE_MISMATCH_WARN_NS`).
    *
-   * Runs only when the most recent {@link acquireSql} was a cache HIT and the
-   * check is enabled. Rebuilds the SQL + `$N` params fresh via the same `build`
-   * closure the caller passed to `acquireSql`, then compares:
+   * On a MISS: the collected params must equal the params the build pushed.
+   * On a HIT: the collected param count must equal the entry's, always; then,
+   * when `diagnostics.cacheCheck` selects this hit, the SQL and params are
+   * rebuilt fresh through the same closure and compared:
    *   (a) the cached SQL string byte-for-byte against the fresh SQL, and
-   *   (b) the params the cache-hit collect path produced against the fresh
-   *       build-path params (length and element-wise strict deep-equal).
+   *   (b) the collected params against the fresh build-path params (length
+   *       and element-wise strict deep-equal).
    *
    * A mismatch means the fingerprint / build / collect paths have drifted out
    * of lockstep (the exact class of bug that has silently corrupted results
-   * before), so it throws a {@link ValidationError} (E003) naming the
-   * fingerprint, the operation, and both SQL strings (truncated). Failing loud
-   * in dev/test is the point. Production never reaches the comparison.
+   * before), so it throws an {@link InvariantError} (E020) naming the
+   * fingerprint, the operation, and both SQL strings (truncated), never a
+   * parameter value.
    *
    * @param op human label of the calling build method (for the error message).
-   * @param cacheKey the cache fingerprint that HIT.
-   * @param entry the cached SQL entry that will be executed.
+   * @param cacheKey the cache fingerprint.
+   * @param entry the SQL entry that will be executed.
    * @param build the same closure passed to `acquireSql`; re-run here to
    *   capture the fresh build-path SQL + params.
    * @param collectedParams the params the caller's collect path produced.
@@ -2650,7 +2673,27 @@ export class QueryInterface<
     build: (params: unknown[]) => string,
     collectedParams: unknown[],
   ): void {
-    if (!this.lastCacheHit) return;
+    if (!this.lastCacheHit) {
+      const built = this.lastMissParams;
+      this.lastMissParams = undefined;
+      if (built === undefined || cacheParamsEqual(collectedParams, built)) return;
+      throw this.lockstepError(
+        op,
+        cacheKey,
+        [
+          `built params and collected params diverge on a cache miss (collected ${collectedParams.length}, built ${built.length})`,
+        ],
+        false,
+      );
+    }
+    if (entry.paramCount !== undefined && collectedParams.length !== entry.paramCount) {
+      throw new InvariantError(
+        'sql-cache-param-count',
+        `SQL cache param count mismatch on ${op} (fingerprint "${cacheKey}"): the cached statement has ` +
+          `${entry.paramCount} placeholders but the cache hit collected ${collectedParams.length} params, so ` +
+          'the statement was not sent.',
+      );
+    }
     const check = this.diagnostics.cacheCheck;
     if (check === 'off') return;
     const sampled = typeof check === 'object';
@@ -2675,18 +2718,26 @@ export class QueryInterface<
         `cache-hit params and freshly-built params diverge (collected ${collectedParams.length}, built ${freshParams.length})`,
       );
     }
-    const message =
-      `SQL cache lockstep violation on ${op} (fingerprint "${cacheKey}"). ` +
-      `This is a Turbine internal invariant violation, please report it at ` +
-      `https://github.com/zvndev/turbine-orm/issues. The fingerprint, SQL-build, and ` +
-      `param-collect paths must enumerate where-clause keys identically.\n${details.join('\n')}`;
-    // Sampled path: log once per distinct fingerprint so the failure is
-    // durably recorded in the server log before the throw unwinds the query.
-    // ('every-hit' throws straight away; its behavior is unchanged.)
-    if (sampled && shouldWarnOnce(CACHE_MISMATCH_WARN_NS, `${this.table}|${cacheKey}`)) {
-      logTo(this.logger, 'error', message, { code: 'cache-mismatch', table: this.table, operation: op });
+    throw this.lockstepError(op, cacheKey, details, sampled);
+  }
+
+  /**
+   * The `sql-cache-lockstep` {@link InvariantError}. When `log` is set (the
+   * sampled hit path) the failure is also logged once per table and shape, so
+   * it is durably recorded in the server log before the throw unwinds the
+   * query; the other paths throw straight away.
+   */
+  private lockstepError(op: string, cacheKey: string, details: string[], log: boolean): InvariantError {
+    const err = new InvariantError(
+      'sql-cache-lockstep',
+      `SQL cache lockstep violation on ${op} (fingerprint "${cacheKey}"). The fingerprint, SQL-build, and ` +
+        `param-collect paths must enumerate where-clause keys identically. ${INVARIANT_REPORT_HINT}\n` +
+        details.join('\n'),
+    );
+    if (log && shouldWarnOnce(CACHE_MISMATCH_WARN_NS, `${this.table}|${cacheKey}`)) {
+      logTo(this.logger, 'error', err.message, { code: 'cache-mismatch', table: this.table, operation: op });
     }
-    throw new ValidationError(message);
+    return err;
   }
 
   /**

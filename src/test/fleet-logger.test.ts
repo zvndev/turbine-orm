@@ -117,7 +117,7 @@ const EXPECT: Record<TurbineLogCode, Expectation> = {
   'cache-mismatch': {
     level: 'error',
     console:
-      '[turbine] SQL cache lockstep violation on findMany (fingerprint "fm:name:eq|c=*|o=|l=1|off=0|cur=|d=|w=|pii=0|je=p"). This is a Turbine internal invariant violation, please report it at https://github.com/zvndev/turbine-orm/issues. The fingerprint, SQL-build, and param-collect paths must enumerate where-clause keys identically.\ncached SQL and freshly-built SQL diverge:\n  cached = <SELECT 1 -- corrupted>\n  fresh  = <SELECT "items".* FROM "items" WHERE "name" = $1 LIMIT $2>',
+      '[turbine] [TURBINE_E020] SQL cache lockstep violation on findMany (fingerprint "fm:name:eq|c=*|o=|l=1|off=0|cur=|d=|w=|pii=0|je=p"). The fingerprint, SQL-build, and param-collect paths must enumerate where-clause keys identically. This is a bug in turbine-orm, not in your code. Please report it at https://github.com/zvndev/turbine-orm/issues with this message.\ncached SQL and freshly-built SQL diverge:\n  cached = <SELECT 1 -- corrupted>\n  fresh  = <SELECT "items".* FROM "items" WHERE "name" = $1 LIMIT $2> (https://turbineorm.dev/errors#e020)',
   },
   'parser-overwrite': {
     level: 'warn',

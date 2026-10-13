@@ -39,7 +39,7 @@ interface QueryEvent {
 }
 ```
 
-A listener that throws never breaks the query; the error is swallowed (logged when `logging: true`).
+A listener that throws never breaks the query. The error is swallowed, and with `logging: true` it is logged at `error` level with code `query-listener-error` (see [Log output](#log-output-logger)).
 
 ### What emits an event
 
@@ -101,6 +101,111 @@ Only `event.params` changes; SQL, timing, model, action, and row count are ident
 <Callout type="note" title="Relationship to `errorMessages`">
 [`errorMessages: 'verbose'`](/errors#safe-error-messages) also reveals params, and still works. The two resolve to a single value: when `logQueryParams` is set it decides; when unset, `errorMessages` decides. `logQueryParams: true` with the default `errorMessages: 'safe'` gives real values in query events while error messages stay redacted.
 </Callout>
+
+## Log output, `logger`
+
+Every line Turbine writes about itself goes through one logger. By default that is `console`, and each line starts with `[turbine]`. Pass your own with the `logger` option:
+
+```ts
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  logger: {
+    warn: (message, entry) => appLog.warn(message, entry),
+    error: (message, entry) => appLog.error(message, entry),
+  },
+});
+```
+
+Each method receives a message and an entry. The entry carries a `code`, plus `table`, `operation` or `error` when the line is about one. The message text can change in any release. The `code` is stable, so match on it.
+
+The types are exported from the package root:
+
+```ts
+import type { TurbineLogCode, TurbineLogEntry, TurbineLogger } from 'turbine-orm';
+
+const logger: TurbineLogger = {
+  warn(message: string, entry: TurbineLogEntry) {
+    if ((entry.code as TurbineLogCode) === 'unordered-page') return; // known and accepted
+    appLog.warn(message, entry);
+  },
+};
+```
+
+- Every method (`debug`, `info`, `warn`, `error`) is optional. A missing method drops that level, so `logger: {}` silences Turbine.
+- A logger method that throws is ignored. Logging never fails the operation that logged.
+- A `console` or winston object works as it is, because both take the message first. pino and bunyan take the object first, so wrap them:
+
+```ts
+logger: {
+  warn: (message, entry) => pinoLog.warn(entry, message),
+  error: (message, entry) => pinoLog.error(entry, message),
+}
+```
+
+- No log line carries a bound parameter value, whatever `logQueryParams` says. That option governs `$on('query')` events only.
+- A warning that fires once per process is deduplicated across the whole process. If one client already emitted it, a second client's logger does not see it.
+- A `logger` that is not an object, or whose level members are not functions, throws `ValidationError` (E003) when the client is constructed.
+
+`logging: true` adds lifecycle lines (pool created, raw SQL preview, transaction committed, and so on) at the `debug` level. With the default logger, `debug` prints through `console.log`.
+
+`introspect()` and `generate()` take the same `logger` in their options, for the relation-naming warnings they print.
+
+### Log codes
+
+| Codes | Level | When |
+|---|---|---|
+| `unknown-config-key`, `plan-cache-mode-ignored`, `prepared-statements-on-pooler`, `connection-option-ignored`, `parser-overwrite` | `warn` | Client construction, once per process. Always on, whatever `diagnostics` says. |
+| `pool-error` | `error` | A pool connection failed while no `$on('poolError')` listener is registered. Always on. |
+| `query-listener-error`, `pool-listener-error`, `replica-close-error` | `error` | A listener threw, or a replica pool failed to close. Only with `logging: true`. |
+| `external-pool`, `pool-created`, `replicas-configured`, `connection-verified`, `pipeline`, `raw-sql`, `typed-sql`, `transaction-committed`, `transaction-rolled-back`, `listen`, `notify`, `disconnect-skipped`, `pool-disconnected` | `debug` | Lifecycle lines. Only with `logging: true`. |
+| `listen-reconnecting` | `warn` | A `$listen` connection was lost and is reconnecting. Not logged when you pass `onError`. |
+| `listen-lost` | `error` | A `$listen` connection was lost for good. Not logged when you pass `onError`. |
+| `untyped-columns`, `unordered-page`, `auto-strategy`, `deep-with`, `flatten-blocked`, `redundant-sort-term`, `unknown-query-option` | `warn` | Per-query advice from the query builder, each printed once. Only while `diagnostics` advice is on. |
+| `unindexed-relation`, `flatten-fallback`, `relation-payload-json` | `warn` | Per-query relation advice, each printed once. Only while `diagnostics` advice is on. |
+| `unlimited-find-many` | `warn` | A `findMany` with no limit, when you turned on `warnOnUnlimited`. In every mode. |
+| `temporal-infinity` | `warn` | A stored `infinity` was read while `temporalInfinity` is unset. In every mode. |
+| `cache-mismatch` | `error` | The sampled SQL-cache self-check found a mismatch. The query also throws. |
+| `prisma-compat-unknown-option`, `prisma-compat-native-spelling` | `warn` | [prisma-compat](/migrate-from-prisma) option advice. Only while `diagnostics` advice is on. |
+| `prisma-map-stale`, `prisma-compat-junction-collision` | `warn` | prisma-compat found its map out of date with `schema.prisma`, or two junction models claiming one table. |
+| `powdb-link-collision`, `powdb-link-drift`, `powdb-introspect-no-primary-key` | `warn` | PowDB link DDL and introspection. |
+| `introspect-cross-schema-fk`, `introspect-relation-renamed`, `introspect-relation-shadows-json`, `generate-relation-shadows-column` | `warn` | Introspection and code generation. |
+
+Two lines bypass `logger` in this release, both on [PowDB](/engines). Its unknown-option advice prints through `console` and follows `NODE_ENV` rather than `diagnostics`. Its `warnOnUnlimited` warning prints through `console`. Every other engine sends both through `logger`. Separately, introspecting a SQLite, MySQL or SQL Server database prints its relation-naming warnings through the default console logger, since those introspectors take no `logger` yet.
+
+## Diagnostics, `diagnostics`
+
+One option decides what Turbine checks and says about itself while queries run: per-query advice, and the SQL-cache self-check.
+
+```ts
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  diagnostics: 'production',
+});
+```
+
+| Mode | Advice | Cache self-check |
+|---|---|---|
+| `'development'` | on | every cache hit |
+| `'production'` | off | off |
+
+When you do not set it, the mode is `'production'` if `NODE_ENV` is `'production'`, or if there is no `process` at all (an edge runtime). Otherwise it is `'development'`. It is read once, when the client is constructed, so changing `NODE_ENV` later has no effect on that client.
+
+Set it explicitly where `NODE_ENV` is not set, such as a worker or a serverless function. Without it, such a runtime runs in development mode, with advice and the self-check on.
+
+An object overrides one part and keeps the mode's default for the other:
+
+```ts
+diagnostics: { mode: 'production', advice: true }
+diagnostics: { mode: 'production', cacheCheck: { sample: 0.001 } }
+```
+
+- `advice` is a boolean.
+- `cacheCheck` is `'every-hit'`, `'off'`, or `{ sample }` with `sample` in `(0, 1]`. The self-check rebuilds the SQL on a cache hit and compares it with the cached text. A mismatch is a Turbine bug, and the query throws.
+- An unknown mode or key, a non-boolean `advice`, or a sample outside `(0, 1]` throws `ValidationError` (E003) at construction.
+
+The environment variables still work when `cacheCheck` is not set. `TURBINE_DISABLE_CACHE_CHECK=1` turns the self-check off in any mode. In production mode, `TURBINE_CACHE_CHECK_SAMPLE` sets a sample rate. When both are set, the disable variable wins. An explicit `cacheCheck` wins over both.
+
+Construction warnings do not depend on `diagnostics`. A misspelled config key, an option an external pool ignores, or prepared statements behind a pooler are production hazards, so those warnings fire once per process in every mode.
 
 ## Metrics, `db.$observe()`
 

@@ -401,6 +401,24 @@ const CATALOG: Record<TurbineErrorCode, ErrorExplanationBody> = {
     ],
     properties: [],
   },
+  TURBINE_E020: {
+    className: 'InvariantError',
+    retryable: false,
+    origin: 'turbine',
+    whenThrown:
+      'Turbine caught a bug in itself before sending a statement it knew was wrong: two internal paths that must agree did not, or a branch no argument can reach was reached.',
+    likelyCauses: [
+      '`invariant: "sql-cache-lockstep"`: the SQL-template cache built a statement whose parameters, or whose cached text, disagree with what a fresh build of the same query produces.',
+      '`invariant: "sql-cache-param-count"`: a cached statement was about to run with a different number of parameters than its placeholders.',
+      'Any other `invariant` id names one internal rule; the message says which two things disagreed.',
+    ],
+    howToFix: [
+      'Report it at https://github.com/zvndev/turbine-orm/issues with the message and `err.invariant`. The message carries the query shape and no row or parameter value.',
+      'Nothing in the call is wrong, so rewriting the arguments is a workaround at best. There is no option that turns these checks off: each one fires only where Turbine would otherwise have sent the wrong SQL or the wrong parameters.',
+      'Do not retry: the same call fails the same way.',
+    ],
+    properties: ['invariant'],
+  },
 };
 
 /** Every code in the catalog, in code order. */

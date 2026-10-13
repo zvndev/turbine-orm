@@ -205,6 +205,7 @@ Every error extends `TurbineError` and carries a `code`. Branch on the class/cod
 - E017 UnsupportedFeatureError, a Postgres-only feature invoked on an engine that lacks it
 - E018 ReadOnlyError, a write refused on a read-only database, role or transaction (`reason`: 'snapshot' | 'rbac' | 'transaction')
 - E019 TransactionRolledBackError, a transaction PostgreSQL rolled back instead of committing (a statement inside it failed or timed out); the first failure is `cause`
+- E020 InvariantError, Turbine caught a bug in itself (two internal paths that must agree did not) before sending the statement; exposes `invariant`, not retryable, report it
 
 ```ts
 import { SerializationFailureError } from 'turbine-orm';

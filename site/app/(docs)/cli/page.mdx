@@ -521,9 +521,9 @@ The report prints how many columns were scored, split by indexed and unindexed, 
 - Each divergence finding carries a `branch` (`'sparse-value'` or `'unindexed-filter'`), and branch-shaped fields are optional rather than zero-filled: `crossoverRows`, `crossoverRowsWide`, `valuesBelowCrossover`, `walkPages`, `walkFraction` and `approxAmplification` are absent on an `unindexed-filter` finding; `tuplesWalked`, `worstCaseAmplification`, `orderColumnCorrelation` and `heapNearlyOrdered` are present only there. Branch on `branch`.
 - The `unused`, `redundant`, `audit`, and `invalid` arrays are always present (empty when the scan did not run), and a `subtraction` object reports which scans ran (`unusedRan`, `auditRan`, `minScans`), so the key set never varies by flag. Each unused-index entry carries a structured `shape` (`kinds`, `accessMethod`, `definition`) alongside the `caveat` string.
 
-### Dev-mode warning
+### Runtime warning
 
-In non-production (`NODE_ENV !== 'production'`), the first query that builds a relation subquery over an unindexed FK logs a one-time warning naming the relation, the table and columns, and the exact `CREATE INDEX` statement. It only fires when the schema metadata carries index information (introspected or generated clients), so `defineSchema`-only setups see no false positives.
+While the client's [`diagnostics`](/observability#diagnostics-diagnostics) advice is on (the default outside `NODE_ENV=production`), the first query that builds a relation subquery over an unindexed FK logs a one-time warning naming the relation, the table and columns, and the exact `CREATE INDEX` statement. It goes through the client's `logger` at `warn` level with code `unindexed-relation`. It only fires when the schema metadata carries index information (introspected or generated clients), so `defineSchema`-only setups see no false positives.
 
 ## `turbine migrate-from-prisma`
 
@@ -577,7 +577,7 @@ A stale `prisma-map.ts` fails silently: the adapter goes on translating the name
 
 `--if-db` is what makes that safe: an `npm ci` in a build image with no `DATABASE_URL` prints one line and exits 0 instead of failing the install.
 
-The emitted map also records a fingerprint of the `schema.prisma` it was generated from, and `createPrismaCompatClient` warns once at startup, in development only, when the file on disk no longer matches. See [Keeping the map current](/migrate-from-prisma#keeping-the-map-current).
+The emitted map also records a fingerprint of the `schema.prisma` it was generated from, and `createPrismaCompatClient` warns once at startup, in production too, when the file on disk no longer matches. See [Keeping the map current](/migrate-from-prisma#keeping-the-map-current).
 
 ### The `--out` directory guard
 

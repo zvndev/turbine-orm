@@ -216,7 +216,7 @@ const capabilities = [
   {
     title: 'Typed errors with stable codes',
     description:
-      'Every error carries a code (TURBINE_E001..E019) and a docs link. Retryable failures expose isRetryable: true as a typed const, so a retry loop is compiler-checked.',
+      'Every error carries a code (TURBINE_E001..E020) and a docs link. Retryable failures expose isRetryable: true as a typed const, so a retry loop is compiler-checked.',
     href: '/errors',
     cta: 'Error reference',
   },

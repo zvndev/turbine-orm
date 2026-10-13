@@ -10,11 +10,11 @@
  * Under `diagnostics.cacheCheck: 'every-hit'` (the development default, see
  * diagnostics.ts), every cache HIT is cross-checked: the SQL + params are rebuilt fresh and
  * compared byte-for-byte (SQL) and element-wise (params) against the cache-hit
- * result. A mismatch throws a `ValidationError` (E003) naming the fingerprint.
+ * result. A mismatch throws an `InvariantError` (E020) naming the fingerprint.
  *
  * These tests prove:
  *   (a) legitimate permuted-key cache hits pass the check untouched,
- *   (b) a corrupted cache entry (bad params, or bad SQL) throws E003 loudly,
+ *   (b) a corrupted cache entry (bad params, or bad SQL) throws E020 loudly,
  *   (c) `cacheCheck: 'off'`, `NODE_ENV=production` and the legacy
  *       `TURBINE_DISABLE_CACHE_CHECK=1` skip it, each decided when the query
  *       interface is constructed.
@@ -25,7 +25,7 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { ValidationError } from '../errors.js';
+import { InvariantError } from '../errors.js';
 import type { QueryInterface } from '../query/index.js';
 import type { SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
@@ -106,7 +106,7 @@ describe('cache cross-check: legitimate hits pass', () => {
   });
 });
 
-describe('cache cross-check: corrupted entries throw E003', () => {
+describe('cache cross-check: corrupted entries throw E020', () => {
   it('a param-collect path that drifts out of lockstep throws with the invariant message', () => {
     const q = makeQuery('users', buildSchema());
 
@@ -129,10 +129,11 @@ describe('cache cross-check: corrupted entries throw E003', () => {
     assert.throws(
       () => q.buildFindMany({ where: { age: 10, score: 20 } } as never),
       (err: unknown) =>
-        err instanceof ValidationError &&
-        err.code === 'TURBINE_E003' &&
+        err instanceof InvariantError &&
+        err.code === 'TURBINE_E020' &&
+        err.invariant === 'sql-cache-lockstep' &&
         /SQL cache lockstep violation on findMany/.test(err.message) &&
-        /internal invariant violation/.test(err.message) &&
+        /This is a bug in turbine-orm, not in your code/.test(err.message) &&
         /params .* diverge/.test(err.message),
     );
   });
@@ -149,8 +150,9 @@ describe('cache cross-check: corrupted entries throw E003', () => {
     assert.throws(
       () => q.buildFindMany({ where: { age: 2 } } as never),
       (err: unknown) =>
-        err instanceof ValidationError &&
-        err.code === 'TURBINE_E003' &&
+        err instanceof InvariantError &&
+        err.code === 'TURBINE_E020' &&
+        err.invariant === 'sql-cache-lockstep' &&
         /SQL cache lockstep violation on findMany/.test(err.message) &&
         /cached SQL and freshly-built SQL diverge/.test(err.message) &&
         err.message.includes('corrupted cache entry'),
@@ -208,12 +210,12 @@ describe("cache cross-check: pick-row plan: 'lateral' path", () => {
     } as never;
     // First call warms; the cross-check only runs on HITs, so a second call is
     // what exercises it. The lateral join text and its params must rebuild
-    // byte-identically or crossCheckCache throws E003.
+    // byte-identically or crossCheckCache throws E020.
     q.buildFindMany(args);
     assert.doesNotThrow(() => q.buildFindMany(args));
   });
 
-  it('a corrupted cached SQL string on a lateral pick throws E003 on the next HIT', () => {
+  it('a corrupted cached SQL string on a lateral pick throws E020 on the next HIT', () => {
     const q = makeQuery('instances', buildPickSchema());
     const args = {
       orderBy: { versions: { pick: { orderBy: { createdAt: 'desc' } }, by: 'title', plan: 'lateral' } },
@@ -226,8 +228,9 @@ describe("cache cross-check: pick-row plan: 'lateral' path", () => {
     assert.throws(
       () => q.buildFindMany(args),
       (err: unknown) =>
-        err instanceof ValidationError &&
-        err.code === 'TURBINE_E003' &&
+        err instanceof InvariantError &&
+        err.code === 'TURBINE_E020' &&
+        err.invariant === 'sql-cache-lockstep' &&
         /SQL cache lockstep violation on findMany/.test(err.message) &&
         /cached SQL and freshly-built SQL diverge/.test(err.message) &&
         err.message.includes('corrupted lateral entry'),
@@ -282,7 +285,7 @@ describe('cache cross-check: escape hatches skip the check', () => {
     withEnv({ NODE_ENV: 'production' }, () => {
       assert.throws(
         () => dev.buildFindMany({ where: { age: 3 } } as never),
-        (err: unknown) => err instanceof ValidationError && err.code === 'TURBINE_E003',
+        (err: unknown) => err instanceof InvariantError && err.code === 'TURBINE_E020',
       );
     });
   });

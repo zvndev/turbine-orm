@@ -627,7 +627,7 @@ await db.sessions.deleteMany({
 
 ## 7. Transactions
 
-Callback form. Throw to rollback. Every query on `tx` must finish inside the callback: a `tx` used after the callback settles throws `ValidationError`, and a callback that returns while a query it started is still running rolls the transaction back. A statement that fails inside the callback aborts the transaction even when the callback catches the error, and `$transaction` then rejects with `TransactionRolledBackError` (E019) instead of reporting a commit; wrap a statement that may fail in a nested `tx.$transaction` to recover from it.
+Callback form. Throw to rollback. Every query on `tx` must finish inside the callback: a `tx` used after the callback settles throws `ValidationError`, and a callback that returns while a query it started is still running rolls the transaction back. A statement that fails inside the callback aborts the transaction even when the callback catches the error, and `$transaction` then rejects with `TransactionRolledBackError` (E019) instead of reporting a commit; wrap a statement that may fail in a nested `tx.$transaction` to recover from it. A nested block's callback gets its own handle (`inner` below); a statement through the outer `tx` while the block is open throws `ValidationError`. `COMMIT`, `ROLLBACK`, `SAVEPOINT` and the other transaction-control statements are refused on `tx`'s raw SQL paths.
 
 ```ts
 await db.$transaction(async (tx) => {

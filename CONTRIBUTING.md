@@ -102,7 +102,7 @@ src/
   observe.ts       , Observability / query metrics
   serverless.ts    , Edge/serverless driver binding (turbineHttp)
   adapters/        , Dialect adapters (CockroachDB, YugabyteDB, …)
-  errors.ts        , Typed TurbineError hierarchy (E001-E019)
+  errors.ts        , Typed TurbineError hierarchy (E001-E020)
   cli/             , CLI commands (init, generate, migrate, studio, etc.)
 ```
 

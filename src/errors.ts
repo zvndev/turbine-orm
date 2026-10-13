@@ -28,6 +28,7 @@ export const TurbineErrorCode = {
   UNSUPPORTED_FEATURE: 'TURBINE_E017',
   READ_ONLY: 'TURBINE_E018',
   TRANSACTION_ROLLED_BACK: 'TURBINE_E019',
+  INVARIANT_VIOLATION: 'TURBINE_E020',
 } as const;
 
 export type TurbineErrorCode = (typeof TurbineErrorCode)[keyof typeof TurbineErrorCode];
@@ -1415,6 +1416,47 @@ export class TransactionRolledBackError extends TurbineError {
   constructor(message: string, options?: { cause?: unknown }) {
     super(TurbineErrorCode.TRANSACTION_ROLLED_BACK, message, options);
     this.name = 'TransactionRolledBackError';
+  }
+}
+
+/**
+ * The sentence every {@link InvariantError} message ends with, before the docs
+ * link. Exported so a test can assert it without restating it.
+ */
+export const INVARIANT_REPORT_HINT =
+  'This is a bug in turbine-orm, not in your code. Please report it at ' +
+  'https://github.com/zvndev/turbine-orm/issues with this message.';
+
+/**
+ * Turbine detected a bug in itself: a branch that no argument can reach was
+ * reached, or two internal paths that must agree did not (the SQL-template
+ * cache's build and param-collect paths, for example).
+ *
+ * Not caused by the arguments, so rewriting the call is not the fix, and not
+ * retryable: the same call fails the same way. `invariant` is a stable id for
+ * the broken rule (`'sql-cache-lockstep'`, `'sql-cache-param-count'`, ...), so
+ * a report or an alert can group on it. The message names no row or parameter
+ * value.
+ *
+ * Thrown in place of executing a statement Turbine knows is wrong, which is
+ * what makes the checks behind it safe to run in production.
+ */
+export class InvariantError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.INVARIANT_VIOLATION;
+  /** Stable id of the broken invariant, e.g. `'sql-cache-lockstep'`. */
+  readonly invariant: string;
+
+  /**
+   * @param invariant stable id of the broken rule.
+   * @param message what disagreed, with no row or parameter value in it. The
+   *   report hint is appended once.
+   * @param options the error that exposed the broken rule, as `cause`.
+   */
+  constructor(invariant: string, message: string, options?: { cause?: unknown }) {
+    const body = message.includes(INVARIANT_REPORT_HINT) ? message : `${message} ${INVARIANT_REPORT_HINT}`;
+    super(TurbineErrorCode.INVARIANT_VIOLATION, body, options);
+    this.name = 'InvariantError';
+    this.invariant = invariant;
   }
 }
 

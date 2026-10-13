@@ -60,6 +60,8 @@ await db.$transaction(async (tx) => {
 
 PostgreSQL aborts a transaction at its first failed statement. Catching that error inside the callback does not undo the abort: the `COMMIT` that follows is answered with a `ROLLBACK`, and nothing the transaction wrote is saved. `$transaction` rejects in that case rather than reporting a commit. The error is a `TransactionRolledBackError` ([`TURBINE_E019`](/errors#e019)) carrying the statement that failed first as `cause`. A deadlock or a serialization conflict keeps its own class instead (`DeadlockError`, `SerializationFailureError`, `LockNotAvailableError`), so a retry of the whole block still works.
 
+The next statement after the caught error is not sent at all. PostgreSQL would ignore it, so Turbine refuses it locally with the same error: a deadlock, serialization conflict or unavailable lock keeps its class, and any other failure becomes `TransactionRolledBackError` with the first failure as `cause`. A `25P02` that does reach the server ("current transaction is aborted") is also `TransactionRolledBackError`.
+
 To recover from an expected failure and keep the rest of the work, run the statement that can fail in a [nested `$transaction`](#nested-transactions-real-savepoints), which rolls back only its own savepoint:
 
 ```ts
@@ -97,7 +99,7 @@ const [user, postCount] = await db.$transaction([
 // user: User | null, postCount: number, all-or-nothing
 ```
 
-Use the batch form when a fixed set of independent statements must succeed or fail together and you don't need a callback's control flow. It takes the same options object as the callback form (`isolationLevel`, `timeout`, `sessionContext`) as its second argument. An empty array resolves to `[]` without opening a transaction, after validating those options. `$transaction` accepts either form.
+Use the batch form when a fixed set of independent statements must succeed or fail together and you don't need a callback's control flow. It takes the same options object as the callback form (`isolationLevel`, `timeout`, `sessionContext`) as its second argument, through [prisma-compat](/migrate-from-prisma) as well. An empty array resolves to `[]` without opening a transaction, after validating those options. `$transaction` accepts either form.
 
 Each item must be a deferred query. Passing a promise (`db.users.create(...)` instead of `db.users.buildCreate(...)`, the shape Prisma's array form takes) throws `ValidationError` (`TURBINE_E003`) before anything in the batch runs, because that query already started on its own connection, outside the transaction, the moment it was created.
 
@@ -344,14 +346,16 @@ The `tx` handed to your `$transaction` callback is a `TransactionClient`, and it
 |---|---|---|
 | Table accessors | `tx.users`, `tx.orderItems`, ... | Same `QueryInterface` API as `db.users`. Accessor names are the camelCase form of each table name in the schema, defined at construction. |
 | `tx.table<T>(name)` | `(name: string) => QueryInterface<T>` | Escape hatch for a table not present in the generated types. Same instance is reused for repeated calls. |
-| `tx.$transaction(fn)` | `(fn: (tx: TransactionClient) => Promise<R>) => Promise<R>` | Nested block via `SAVEPOINT sp_1`, `sp_2`, ... Releases the savepoint on success, rolls back **to the savepoint only** on throw, then rethrows. **Takes no options object**: isolation level, timeout and `sessionContext` are properties of the outer transaction and cannot be changed part way through. `fn` receives the *same* `tx`, not a child object. |
+| `tx.$transaction(fn)` | `(fn: (tx: TransactionClient) => Promise<R>) => Promise<R>` | Nested block via `SAVEPOINT sp_1`, `sp_2`, ... Releases the savepoint on success, rolls back **to the savepoint only** on throw, then rethrows. **Takes no options object**: isolation level, timeout and `sessionContext` are properties of the outer transaction and cannot be changed part way through. `fn` receives its own handle, so name it (`inner`) and use it for the block's work. A statement through the outer `tx` while the block is open throws `ValidationError` (`TURBINE_E003`), because it would run inside the block's savepoint and be undone with it. |
 | `tx.raw` | ``tx.raw<T>`SELECT ... ${value}` `` | Tagged template, the one to reach for in application code. Every `${value}` becomes a placeholder bound by the driver, so a value cannot end up concatenated into the SQL text. Returns the rows. Driver errors are translated by `wrapPgError`, so you get the same typed errors as ORM queries. Only a real tagged template is accepted: an array passed in its place throws `ValidationError` (`TURBINE_E003`). |
 | `tx.sql<T>` | ``tx.sql<T>`SELECT ... ${value}` `` | Typed SQL on the transaction's connection, the same `TypedSqlQuery` as [`db.sql`](/queries#typed-raw-sql-dbsqlt): await it for `T[]`, or call `.one()` / `.scalar()`. |
 | `tx.rawUnsafe` | `(text: string, ...values: unknown[]) => Promise<T[]>` | SQL text built at runtime, with values as `$1`, `$2`, ... Nothing in `text` is escaped, so it must never contain untrusted input. |
-| `tx.$connection()` | `() => PgCompatPoolClient` | The driver connection the transaction runs on, for another library's query function or a driver feature Turbine does not wrap. Statements sent on it run inside the transaction. It closes with the transaction, `release()` on it is refused, and it uses the driver's own type parsers. Do not send `COMMIT`, `ROLLBACK` or `SAVEPOINT` on it. Throws `UnsupportedFeatureError` (`TURBINE_E017`) on PowDB and on a stateless HTTP driver, which have no connection to hand out. |
+| `tx.$connection()` | `() => PgCompatPoolClient` | The driver connection the transaction runs on, for another library's query function or a driver feature Turbine does not wrap. Statements sent on it run inside the transaction. It closes with the transaction and uses the driver's own type parsers. `release()`, `end()` and `connect()` on it throw `TURBINE_E003`, transaction-control statements on it are refused (see below), and the underlying driver `connection` is not exposed. Throws `UnsupportedFeatureError` (`TURBINE_E017`) on PowDB and on a stateless HTTP driver, which have no connection to hand out. |
 | `tx.schema` | `SchemaMetadata` | The metadata the transaction was built from. |
 
 Once the transaction has settled, every query through `tx` (accessors, `raw`, `rawUnsafe`, `sql`, `$connection()`) is refused with `ValidationError` (`TURBINE_E003`).
+
+While it is open, `raw`, `rawUnsafe`, `sql` and `$connection().query` refuse transaction-control statements with `TURBINE_E003`: `BEGIN`, `START TRANSACTION`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`, `SAVEPOINT`, `RELEASE`, `ROLLBACK TO`, `SET TRANSACTION` and `PREPARE TRANSACTION`. A `COMMIT` sent by hand ended the transaction early, so every later write autocommitted and survived a rollback. Return from the callback to commit, throw to roll back, and use `tx.$transaction` for a savepoint. The check reads each engine's comments and string literals, so `SELECT 1 -- COMMIT` is not refused.
 
 <Callout type="note">
 **Raw SQL inside a transaction runs no middleware.** `tx.raw`, `tx.rawUnsafe` and `tx.sql` go straight to the transaction's connection. Each emits one `$on('query')` event (model `'$raw'`, `action` set to the method name), but no `$use` middleware runs for them. Table-scoped calls inside the same transaction (`tx.users.findMany(...)`) run middleware exactly as they do outside one.
@@ -408,7 +412,7 @@ await db.$transaction(
 
 Prefer `$transaction`; reach for this only when you want to issue hand-written SQL on the transaction's own connection.
 
-The client is closed once the callback settles: a statement sent on it afterwards throws `ValidationError` (`TURBINE_E003`), and so does `release()` at any time, because the transaction returns the connection itself. A callback that returns while a statement it sent is still running rolls the transaction back, as [`$transaction` does](#every-query-finishes-inside-the-callback).
+The client is closed once the callback settles: a statement sent on it afterwards throws `ValidationError` (`TURBINE_E003`), and so does `release()` at any time, because the transaction returns the connection itself. While the callback runs, `SAVEPOINT`, `RELEASE` and `ROLLBACK TO` are allowed on the client; `BEGIN`, `COMMIT`, `ROLLBACK` and the other transaction-control statements throw `TURBINE_E003`. A callback that returns while a statement it sent is still running rolls the transaction back, as [`$transaction` does](#every-query-finishes-inside-the-callback).
 
 ## See also
 

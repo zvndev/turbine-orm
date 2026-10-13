@@ -394,6 +394,14 @@ export interface SqlCacheEntry {
    * a warmed template cannot regain one. See `buildCacheEntry` in builder.ts.
    */
   name: string;
+  /**
+   * How many params the build pushed, i.e. the statement's placeholder count.
+   * A cache hit whose collect path produces a different count is refused with
+   * an InvariantError before anything is sent. Optional so an entry built
+   * outside the cache (a test fixture) still type-checks; such an entry skips
+   * the count check.
+   */
+  paramCount?: number;
 }
 
 /**
