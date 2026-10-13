@@ -139,9 +139,10 @@ export function schemaToSQL(schema: SchemaDef, options?: SchemaSqlOptions): stri
   }
 
   // CREATE TYPE for every schema-level enum, before the tables that use them.
-  // PostgreSQL only: every other engine declares the labels on the column
-  // itself (see `enumColumnType`), and has no CREATE TYPE to run.
-  if (dialect.name === 'postgresql') {
+  // Only where enums are named types (PostgreSQL): every other engine declares
+  // the labels on the column itself (see `enumColumnType`), and has no CREATE
+  // TYPE to run.
+  if (dialect.capabilities.namedEnumTypes) {
     for (const [enumName, labels] of Object.entries(schema.enums ?? {})) {
       statements.push(generateCreateEnumType(enumName, labels, dialect));
     }
@@ -275,7 +276,7 @@ function generateCreateTable(
   const compositePk = table.primaryKey && table.primaryKey.length > 0 ? table.primaryKey : null;
 
   const keyed = keyedColumnNames(table);
-  const inline = !FOREIGN_KEYS_ARE_TABLE_LEVEL.has(dialect.name);
+  const inline = dialect.capabilities.inlineForeignKeys;
   const foreignKeys: string[] = [];
   for (const [fieldName, config] of Object.entries(table.columns)) {
     columnDefs.push(
@@ -313,17 +314,6 @@ function generateCreateTable(
 }
 
 /**
- * Dialects whose unbounded text and binary types cannot be a key. MySQL rejects
- * `TEXT` and `BLOB` in a PRIMARY KEY / UNIQUE / INDEX / FOREIGN KEY without a
- * prefix length (`ER_BLOB_KEY_WITHOUT_LENGTH`), and SQL Server refuses
- * `NVARCHAR(MAX)` and `VARBINARY(MAX)` as an index key column. A text or bytea
- * column in key position is emitted as the dialect's bounded type instead
- * (`VARCHAR(255)` / `NVARCHAR(255)`, `VARBINARY(255)`), or with its own
- * `maxLength` when it declares one.
- */
-const UNBOUNDED_TEXT_CANNOT_BE_KEY: ReadonlySet<string> = new Set(['mysql', 'mssql']);
-
-/**
  * The snake_case names of the columns of `table` that sit in a key: a primary
  * key (single or composite), a UNIQUE column, a foreign key (Turbine indexes
  * those), or a member of a declared index.
@@ -340,14 +330,6 @@ function keyedColumnNames(table: TableDef): Set<string> {
   }
   return keyed;
 }
-
-/**
- * Dialects that must declare a foreign key as its own table-level
- * `FOREIGN KEY (...) REFERENCES ...` clause. MySQL parses an inline column
- * `REFERENCES` and ignores it (documented for 8.0), so a schema written that way
- * runs without error and has no foreign keys at all.
- */
-const FOREIGN_KEYS_ARE_TABLE_LEVEL: ReadonlySet<string> = new Set(['mysql']);
 
 /** A table-level `FOREIGN KEY` clause for a column's `references`, or null. */
 function generateForeignKeyConstraint(
@@ -378,7 +360,7 @@ function enumColumnType(
   column: string,
   enums: Readonly<Record<string, readonly string[]>> | undefined,
 ): { type: string; maxLength?: number | null; check?: string } | null {
-  if (!config.enumName || dialect.name === 'postgresql') return null;
+  if (!config.enumName || dialect.capabilities.namedEnumTypes) return null;
   if (!dialect.buildEnumColumn) {
     throw new UnsupportedFeatureError(
       'enum columns',
@@ -475,9 +457,12 @@ function generateColumnDef(
     typeInput = { type: enumColumn.type, maxLength: enumColumn.maxLength ?? null };
   } else if (!plainScalar) {
     typeInput = { type: resolveDdlType(config, dialect, snakeName), maxLength: null };
-  } else if (keyed && config.type === 'TEXT' && UNBOUNDED_TEXT_CANNOT_BE_KEY.has(dialect.name)) {
+  } else if (keyed && config.type === 'TEXT' && !dialect.capabilities.unboundedTextKeys) {
+    // A keyed text / bytea column takes the dialect's bounded type
+    // (`VARCHAR(255)` / `NVARCHAR(255)`, `VARBINARY(255)`) where an unbounded
+    // one cannot be a key, or its own `maxLength` when it declares one.
     typeInput = { type: 'VARCHAR', maxLength: config.maxLength };
-  } else if (keyed && config.type === 'BYTEA' && UNBOUNDED_TEXT_CANNOT_BE_KEY.has(dialect.name)) {
+  } else if (keyed && config.type === 'BYTEA' && !dialect.capabilities.unboundedTextKeys) {
     typeInput = { type: 'VARBINARY', maxLength: config.maxLength };
   } else {
     typeInput = { type: config.type, maxLength: config.maxLength };

@@ -129,8 +129,12 @@ describe('enum columns: DDL per dialect', () => {
     assert.match(schemaToSQL(backslash, { dialect: sqliteDialect }).join('\n'), /IN \('a\\b'\)/);
   });
 
-  it('an engine other than PostgreSQL without the hook refuses an enum column instead of emitting CREATE TYPE', () => {
-    const inheriting = { ...postgresDialect, name: 'inheriting' } as typeof postgresDialect;
+  it('an engine without named enum types or the hook refuses an enum column instead of emitting CREATE TYPE', () => {
+    const inheriting = {
+      ...postgresDialect,
+      name: 'inheriting',
+      capabilities: { ...postgresDialect.capabilities, namedEnumTypes: false },
+    } as typeof postgresDialect;
     assert.throws(
       () => schemaToSQL(def, { dialect: inheriting }),
       (err) => err instanceof UnsupportedFeatureError && /enum columns/.test(err.message),
