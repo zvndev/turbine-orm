@@ -1395,9 +1395,9 @@ function resolveRelationNameCollision(candidate: string, taken: Set<string>, tab
   let name = `${candidate}Rel`;
   for (let i = 2; taken.has(name); i++) name = `${candidate}Rel${i}`;
   console.warn(
-    printableCatalogName(
-      `[turbine] Relation name "${candidate}" on table "${table}" (from ${source}) collides with an existing column or relation, using "${name}" instead.`,
-    ),
+    `[turbine] ${printableCatalogName(
+      `Relation name "${candidate}" on table "${table}" (from ${source}) collides with an existing column or relation, using "${name}" instead.`,
+    )}`,
   );
   return name;
 }
@@ -1485,16 +1485,17 @@ export function buildRelationsFromForeignKeys(
   const resolveName = (legacy: string, modern: string | null, table: string, source: string): string => {
     const taken = takenFor(table);
     if (!taken.has(legacy)) return legacy;
-    // Historical json/jsonb shadow: previously worked at runtime AND compiled
-    // (tsType `unknown` absorbs the relation payload). Keep the name, warn -
-    // typeSafeRelations() keeps the generated type layer sound.
+    // A relation named like a json/jsonb column keeps that name: it works at
+    // runtime and compiles (the column's `unknown` type absorbs the relation
+    // payload). Keep it and warn; typeSafeRelations() keeps the generated types
+    // sound.
     if (!assignedFor(table).has(legacy) && unknownTypedFieldsByTable?.get(table)?.has(legacy)) {
       console.warn(
-        printableCatalogName(
-          `[turbine] Relation "${legacy}" on table "${table}" (from ${source}) shadows the json/jsonb column ` +
+        `[turbine] ${printableCatalogName(
+          `Relation "${legacy}" on table "${table}" (from ${source}) shadows the json/jsonb column ` +
             `"${legacy}", keeping the historical name for runtime compatibility; the relation is omitted from ` +
             `the generated types. Rename the column to expose it.`,
-        ),
+        )}`,
       );
       return legacy;
     }
@@ -1696,13 +1697,13 @@ export function addAutoManyToManyRelations(
       const columnFields = columnFieldsByTable?.get(sourceTbl);
       if (columnFields?.has(relName)) {
         if (unknownTypedFieldsByTable?.get(sourceTbl)?.has(relName)) {
-          // Historical json/jsonb shadow, worked at runtime, compiled fine.
+          // Same json/jsonb shadow as above: keep the name and warn.
           console.warn(
-            printableCatalogName(
-              `[turbine] Relation "${relName}" on table "${sourceTbl}" (junction ${tableName}) shadows the ` +
+            `[turbine] ${printableCatalogName(
+              `Relation "${relName}" on table "${sourceTbl}" (junction ${tableName}) shadows the ` +
                 `json/jsonb column "${relName}", keeping the historical name for runtime compatibility; ` +
                 `the relation is omitted from the generated types.`,
-            ),
+            )}`,
           );
         } else {
           const taken = new Set([...columnFields, ...Object.keys(existing)]);
