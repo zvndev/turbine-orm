@@ -101,17 +101,17 @@ An explicit `'join'`, `'batched'` or `'flatten'` (at the client or on a single q
 
 ## Silent value differences: check these first
 
-Five differences hand back a value of a different shape or a different row set without throwing. Everything else on this page either errors loudly or changes a type your compiler catches. They apply on both migration paths; grep for them before you port.
+Three differences hand back a value of a different shape or a different row set without throwing. Everything else on this page either errors loudly or changes a type your compiler catches. They apply on both migration paths; grep for them before you port.
 
 | What | Prisma returns | Turbine returns | Why it bites |
 |---|---|---|---|
 | `Decimal` / `numeric` column | a `Decimal` instance (decimal.js) | a **`string`** | `total.plus(x)`, `.toNumber()`, and `Number(total) * qty` all change meaning. Arithmetic on the string silently coerces through JS floats, the thing `numeric` exists to prevent. |
 | `BigInt` / `int8` column | a JS `bigint` | a **`number`**, or a `string` above `Number.MAX_SAFE_INTEGER` | The type is a union in practice. `id + 1n` breaks at the type level (loud); `id > cutoff` compares a `string` lexicographically past 2^53 (silent). |
 | `select` / `include` on a **write** (`create`, `update`, `upsert`, `delete`) | only the selected fields, plus the included relations | the **full row**, no relations | Dropped without error. Extra columns leak into anything that spreads the result into a response body; re-read with `findUnique` if you need a projection. |
-| `aggregate()` with `orderBy`, `take`, `skip`, or `cursor` | applies them | **ignores them** (they are honored on `groupBy`, not on `aggregate`) | An aggregate over what you thought was a 10-row window is an aggregate over the whole matching set. |
-| `where` on a JSON column with a pathless `equals` | strict deep equality | **containment** (`@>`) | `{ meta: { equals: { plan: 'pro' } } }` also matches `{ plan: 'pro', seats: 5 }`; `equals` on JSON is the same operator as `contains`. Add a `path` for exact scalar equality, or filter in application code for whole-document equality. |
 
 Take the two column-type rows seriously in a billing, ledger, or metering schema: both are deliberate, and neither necessarily surfaces in a test suite.
+
+Two rows left this table in 0.90. A pathless JSON `equals` now compares the whole document, as Prisma does, on PostgreSQL and MySQL; SQLite and SQL Server refuse it with `UnsupportedFeatureError` (`TURBINE_E017`) rather than approximate it. And `take`, `skip` or `cursor` on `count` or `aggregate` now throws `UnsupportedFeatureError` in the adapter instead of being ignored, because Prisma computes those over one page of rows and Turbine has no paged count; fetch the page with `findMany` and compute from the rows. On the native port they were never accepted: core's `AggregateArgs` has no such keys.
 
 ## The migration toolkit
 
@@ -359,13 +359,13 @@ The second form covers Turbine's spelling written into a Prisma-shaped call (`li
 
 **Present but inert.** `$connect()` and `$disconnect()` resolve immediately without doing anything. The `TurbineClient` owns the pool, so shut down with `db.disconnect()`; a migration that relies on `$disconnect()` closing connections (tests, serverless teardown) will leak the pool.
 
-**`count()` forwards only `where`**, plus the Turbine-native options above. Prisma's `select`, `cursor`, `take`, `skip`, `orderBy`, and `distinct` on `count` are dropped without error, so `count({ take: 10 })` returns the count of *all* matching rows; rewrite those calls.
+**`count()` forwards `where` and `select`**, plus the Turbine-native options above. `count({ select: { _all: true, email: true } })` returns Prisma's per-field object. `take`, `skip` and `cursor` throw `UnsupportedFeatureError`, since Prisma counts one page of rows and Turbine has no paged count; `aggregate()` does the same. An `orderBy` changes no count and is accepted. `distinct` is not a `count` key and only draws a development warning, so `count({ distinct })` counts every matching row; rewrite those calls.
 
-**Throws rather than guessing.** Three shapes raise `UnsupportedFeatureError` instead of returning a subtly wrong result:
+**Throws rather than guessing.** These shapes raise `UnsupportedFeatureError` instead of returning a subtly wrong result:
 
-- **A bare inclusive cursor whose field is not the sort key.** Translating it exactly needs the anchor row's sort-key value; see [Cursor pagination](#cursor-pagination) for which shapes translate and which throw.
 - **Negative `take`** (take-from-end). Turbine's `limit` has no reverse form.
-- **`skip` inside a nested relation `include`.** Turbine's `with` clause has no per-relation offset.
+- **`cursor` inside a nested relation `include`.** Turbine's `with` clause has no cursor; page the relation with `take` / `skip`, which since 0.90 map to the relation's `limit` / `offset` and page each parent's rows, as in Prisma. A `skip` on a to-one relation is refused with `ValidationError`.
+- **`take`, `skip` or `cursor` on `count` and `aggregate`** (see above).
 
 **Not attempted.** Fluent relation chaining (`prisma.user.findUnique(...).posts()`); `instanceof PrismaClientKnownRequestError` identity and byte-identical error messages; `Prisma.join` / `Prisma.raw` composition beyond plain fragment flattening; Accelerate, Pulse, and the driver-adapter preview features; the MongoDB API; the `prisma migrate` / `prisma db` CLI family (Turbine ships its own migrations). `createMany({ skipDuplicates })` throws `UnsupportedFeatureError` on the SQL Server and PowDB engines.
 
@@ -593,7 +593,7 @@ const active = await db.users.findMany({
 ## Notable differences
 
 - **No `schema.prisma`.** Code-first `defineSchema()` in a TypeScript module. `npx turbine push` (fast path) or `migrate create --auto` (generates SQL).
-- **`include` → `with`, `skip` → `offset`.** That's the full lexical diff. `take`, `cursor`, and `distinct` work as-is at the top level (`take` is an alias for `limit`); inside a nested `with`, the per-relation limit is spelled `limit`.
+- **`include` → `with`, `skip` → `offset`.** That's the full lexical diff. `take`, `skip`, `cursor`, and `distinct` work as-is at the top level (`take` and `skip` are aliases for `limit` and `offset`); inside a nested `with`, `take` / `skip` (or `limit` / `offset`) page each parent's rows.
 - **Atomic update operators are first-class.** `set`, `increment`, `decrement`, `multiply`, `divide`. All compile to in-place SQL.
 - **Typed errors with codes.** `UniqueConstraintError` / `ForeignKeyError` / `NotNullViolationError` / `CheckConstraintError` carry `code` (`TURBINE_E008`–`E011`) and `cause`. `findUniqueOrThrow` throws `NotFoundError` (`TURBINE_E001`) with the `where` attached. `DeadlockError` / `SerializationFailureError` have `readonly isRetryable = true as const`.
 - **Driver-agnostic edge support.** Pass any pg-compatible pool to `turbineHttp(pool, SCHEMA)` and the same API runs on Neon, Vercel, Cloudflare Hyperdrive, Supabase. No extra adapter package.
@@ -603,20 +603,21 @@ const active = await db.users.findMany({
 
 ### Cursor pagination
 
-Turbine's cursor is **exclusive**: the anchor row is not returned. That is keyset semantics (`WHERE pk > $cursor`) and removes Prisma's `skip: 1` boilerplate. The two paths handle the difference differently, so read the one you are on.
+Turbine's cursor is **exclusive**: the anchor row is not returned, and the page continues from it in the query's `orderBy`. It names one row by a unique key, and the page order is completed with the primary key, so the cursor can always place itself (see [Pagination](/queries#pagination-limit--take-offset--skip-cursor)). That removes Prisma's `skip: 1` boilerplate. The two paths handle the difference differently, so read the one you are on.
 
 #### On the native port
 
 - **Prisma `cursor: { id }` + `skip: 1`** (the common exclusive idiom) becomes just `cursor: { id }`. Drop the `skip`.
 - **Prisma `cursor: { id }` with no `skip`** is *inclusive*. Ported verbatim it silently loses the anchor row; nothing warns you. If you relied on it, fetch the anchor separately or start the cursor at the previous row.
+- **The cursor must identify one row.** `cursor: { id }` works under any `orderBy`. A cursor that names only a non-unique field, such as `cursor: { createdAt }`, throws `ValidationError` (`TURBINE_E003`) naming the key it is missing.
 
 #### On `turbine-orm/prisma-compat`
 
-The adapter either reproduces Prisma's inclusive semantics exactly or refuses the call; it never silently drops the anchor row.
+Since 0.90 the adapter reproduces Prisma's cursor for every order shape. A Prisma `cursor` becomes core's cursor in an inclusive mode the adapter sets internally, plus `offset: skip`: the page starts **at** the cursor row, in the query's order, and `skip` counts from there, so the `skip: 1` idiom drops the anchor row exactly as in Prisma. Core places the page from the row the cursor names by a unique key and completes the order with a primary-key tiebreaker, so a cursor whose field is not the sort key, or a multi-field cursor, no longer throws.
 
-- **`cursor` + `skip: n`** translates exactly, to an exclusive cursor plus `offset: n - 1`.
-- **A bare inclusive `cursor`** translates exactly (an inclusive `gte` / `lte` keyset predicate merged into the `where`) when it names a **single field** that is either the single `orderBy` field or, with no `orderBy` at all, the single-column primary key: the shapes where the anchor's sort-key value is known from the cursor itself.
-- **Every other bare inclusive cursor throws [`UnsupportedFeatureError`](/errors) (`TURBINE_E017`)**: a multi-field cursor, a cursor field that is not the sort key, a cursor on a non-PK field with no `orderBy`. Translating those needs the anchor row's sort-key value, which the adapter does not have. The fix is in the message: order by the cursor field, or pair the cursor with `skip: 1`.
+Before 0.90 the adapter translated `cursor` + `skip` to an exclusive keyset predicate, which returned the wrong rows under an `orderBy` on another field, and refused most bare inclusive cursors with `TURBINE_E017`.
+
+{/* TODO(v090): where-hardening lane (F1): confirm what a compat cursor whose row was deleted returns once that lane lands. */}
 
 ### Relation array order
 
@@ -625,7 +626,7 @@ Relation arrays have no guaranteed order unless the `with` block passes `orderBy
 ## Behaviors that match Prisma
 
 - **`timestamp` and `date` columns are UTC on both sides.** Turbine reads zone-less `timestamp` and `date` as UTC (Prisma's convention) and, since v0.52, writes the `Date` values bound by writes and filters as UTC too, so a migrated app gets identical instants. `date` joined the UTC read half in v0.54; earlier versions read it at the process's local midnight. `utcTimestamps: false` opts out, per process rather than per client: the first client settles the pg type parsers, and a later client asking for the opposite throws `ValidationError` (`TURBINE_E003`) at construction. Full detail, including external pools and what changes on upgrade: [Zone-less columns](/schema#zone-less-columns-timestamp-and-date-read-as-utc).
-- **Paginated reads are ordered by the primary key.** Prisma appends an implicit `ORDER BY <primary key> ASC` to a `findMany` with `take` / `skip`; since 0.50 the adapter does the same (every column of a composite key, in declaration order). An explicit `orderBy` wins, a model with no primary key is left alone, and there is no off switch: matching Prisma is the adapter's contract. Turbine core still emits a bare `LIMIT` unless you set [`implicitPkOrdering: true`](/queries#deterministic-pages-the-unordered-pagination-warning).
+- **Paginated reads are ordered by the primary key.** Prisma appends an implicit `ORDER BY <primary key> ASC` to a `findMany` with `take` / `skip`; since 0.50 the adapter does the same (every column of a composite key, in declaration order). An explicit `orderBy` wins, a model with no primary key is left alone, and there is no off switch: matching Prisma is the adapter's contract. Turbine core still emits a bare `LIMIT` unless you set [`implicitPkOrdering: true`](/queries#deterministic-pages-the-unordered-pagination-warning); a `cursor` page is always ordered.
 - **Bare to-one relation filters work without `is`.** `where: { vendor: { name: { contains: 'x' } } }` works exactly like Prisma; `is: null` / `isNot: null` compile to `NOT EXISTS` / `EXISTS`.
 - **`time` columns through the compat adapter.** Postgres `time` values surface as a `Date` on 1970-01-01 UTC, Prisma's epoch-day convention, so `.getHours()`-style call sites keep working; Turbine core keeps the driver's raw `HH:MM:SS` string.
 - **Client-side defaults are emulated.** Prisma fills `@default(uuid())`, `@default(cuid())`, and `@updatedAt` in the client, so those columns usually have no database default. The map records them (`clientDefaults`); the adapter fills them on `create`/`createMany` and touches `@updatedAt` on `update`/`updateMany`/`upsert`. `@default(now())` is carried only when introspection finds no database default.

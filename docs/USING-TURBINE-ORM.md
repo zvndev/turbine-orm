@@ -321,8 +321,12 @@ where: {
   id: { in: [1, 2, 3] },
   status: { notIn: ['archived', 'deleted'] },
 
-  // Negation
+  // Negation (a value, or any operator object)
   role: { not: 'banned' },
+  email: { not: { contains: '@test.' } },
+
+  // Column to column (import { col } from 'turbine-orm')
+  updatedAt: { gt: col('createdAt') },
 
   // Combinators
   OR: [{ role: 'admin' }, { orgId: 1 }],
@@ -335,13 +339,18 @@ where: {
   posts: { none: {} },
 
   // JSON / JSONB
-  metadata: { path: ['tags'], array_contains: 'featured' },
+  metadata: { path: ['plan'], equals: 'pro' },       // typed JSON value at a path
+  metadata: { equals: { plan: 'pro' } },              // the whole document, exactly
+  metadata: { contains: { plan: 'pro' } },            // containment (@>)
 
-  // Arrays
-  tags: { array_contains: ['new', 'hot'] },
-  tags: { array_contains_any: ['sale'] },
+  // Postgres arrays
+  tags: { has: 'new' },
+  tags: { hasEvery: ['new', 'hot'] },
+  tags: { hasSome: ['sale'] },
 }
 ```
+
+Operands are checked against the operator and the column: an object for `equals` on a scalar column, an array where `in` is meant, or `null` for `gt` throws `ValidationError` (`TURBINE_E003`). A key whose value is `undefined` is left out, as in Prisma; `findFirst` throws when that empties its `where`, and `findUnique` needs a plain value or `{ equals }` on a unique key.
 
 **Port note for PowDB:** PowQL uses a different filter syntax (`filter .age > 25`). The *user-facing* `where` object shape is worth keeping, it's what Prisma / Drizzle / Turbine users expect. Translate the object into PowQL pipelines under the hood. Don't expose PowQL syntax at the TS layer.
 
@@ -523,6 +532,8 @@ Available relation operations depend on the write:
 - **On `create`:** `create`, `connect`, `connectOrCreate`.
 - **On `update`:** all of the above plus `disconnect`, `set`, `delete`, `update`, `upsert`.
 
+A `belongsTo` relation is one row, so it follows Prisma's to-one rules: no `set`, at most one of `create` / `connect` / `connectOrCreate` / `disconnect` / `delete` per write, one item per operation, and `delete` clears the foreign key and then deletes the row it pointed at (which needs a nullable foreign key, as `disconnect` does).
+
 Beyond the depth cap Turbine throws `CircularRelationError` (`TURBINE_E007`) with the full relation path.
 
 On a **many-to-many** relation the supported nested operations are `connect` (create and update), plus `disconnect` and `set` (update only): Turbine writes the junction rows itself, inside the same transaction. `connect` is idempotent, `disconnect` is scoped by both the parent and the named targets, and `set: []` clears the parent's links. The remaining operations (`create`, `connectOrCreate`, `update`, `upsert`, `delete`) would have to write the target row as well, so they throw `ValidationError` (`TURBINE_E003`) naming the supported set: write the target row on its own table and link it with `connect`, or write junction rows directly through the junction accessor, in the same `$transaction`. Composite junction keys are refused rather than partially written.
@@ -534,7 +545,7 @@ Three query options remove a safety boundary rather than change a result:
 | Option | What it removes | Where it applies |
 |---|---|---|
 | `skipGlobalFilters` | the configured tenant / soft-delete predicate | reads and mutations |
-| `includePii` | the exclusion of `pii: true` columns from the projection | reads, `groupBy`, `aggregate` |
+| `includePii` | the exclusion of `pii: true` columns from the projection, and the refusal to name one in `select` | reads, `groupBy`, `aggregate` |
 | `allowFullTableScan` | the empty-`where` guard | `update`, `updateMany`, `delete`, `deleteMany` |
 
 Each is enabled by **one** value, a symbol exported from the package. There is no boolean form:
@@ -572,7 +583,7 @@ await db.sessions.deleteMany({
 
 ## 7. Transactions
 
-Callback form. Throw to rollback.
+Callback form. Throw to rollback. Every query on `tx` must finish inside the callback: a `tx` used after the callback settles throws `ValidationError`. A statement that fails inside the callback aborts the transaction even when the callback catches the error, and `$transaction` then rejects instead of reporting a commit; wrap a statement that may fail in a nested `tx.$transaction` to recover from it.
 
 ```ts
 await db.$transaction(async (tx) => {
@@ -587,8 +598,8 @@ await db.$transaction(async (tx) => {
 await db.$transaction(
   async (tx) => { /* ... */ },
   {
-    isolationLevel: 'serializable',   // 'read committed' | 'repeatable read' | 'serializable'
-    timeoutMs: 5_000,
+    isolationLevel: 'Serializable',   // 'ReadUncommitted' | 'ReadCommitted' | 'RepeatableRead' | 'Serializable'
+    timeout: 5_000,                   // ms
   },
 );
 ```

@@ -1,0 +1,496 @@
+export const metadata = {
+  title: 'Upgrading to 0.90',
+  description:
+    'Every breaking change in Turbine ORM 0.90, ordered by how likely it is to change your results without an error, with before and after code and how to find each affected call site.',
+  alternates: { canonical: '/upgrading-to-0-90' },
+};
+
+# Upgrading to 0.90
+
+0.90 is a correctness release. Most of its breaking changes are refusals: a query shape that used to return the wrong rows, write the wrong value, or drop a filter now throws a typed error that names the fix. Those are easy to find, because your tests fail on them.
+
+A smaller set changes results with no error at all. They come first on this page, ordered by how likely they are to affect you. Read that section even if your suite passes.
+
+{/* TODO(v090): add the in-flight lanes once they land: builder and timeouts (createMany chunking, timeout outcome, cursor page 1 tiebreaker, cursor value validation), client (statementTimeoutMs, maxLifetimeSeconds, raw() template check, sessionContext names, tx.sql, unawaited work), generated types group A (required create columns, unique-key selectors, belongsTo operation and nullability types, _count typing, TypedTurbineConfig). */}
+
+## Before you start
+
+- **No schema change is required.** Nothing in 0.90 needs a migration.
+- **Type-check first.** `tsc --noEmit` finds the [column reference](#column-references-are-built-with-col) change on its own.
+- **Run your tests outside production mode.** Several checks below are development warnings, silent under `NODE_ENV=production`.
+- **Search for the error codes.** A refusal is `ValidationError` (`TURBINE_E003`), an engine gap is `UnsupportedFeatureError` (`TURBINE_E017`), and a connection problem is `ConnectionError` (`TURBINE_E004`). Every message names the fix.
+
+## Results that change without an error
+
+### Pathless JSON `equals` compares the whole document
+
+On a `json` / `jsonb` column, `equals` without a `path` used to compile to containment (`@>`), so it also matched every document that held the operand plus other keys. It is now exact document equality: `"meta"::jsonb = $1::jsonb` on PostgreSQL (key order and whitespace do not matter), `meta = CAST(? AS JSON)` on MySQL. A `deleteMany` with the old meaning deleted the supersets too.
+
+```ts
+// Stored: { plan: 'pro' } and { plan: 'pro', seats: 5 }
+await db.accounts.findMany({ where: { meta: { equals: { plan: 'pro' } } } });
+// 0.81: both rows. 0.90: only { plan: 'pro' }.
+
+// Meant containment? Say so:
+await db.accounts.findMany({ where: { meta: { contains: { plan: 'pro' } } } });
+```
+
+On a JSON column, `not: <document>` and `not: { equals: <document> }` now mean "not this exact document" on PostgreSQL and MySQL. For "does not contain", wrap `contains` in `NOT`:
+
+```ts
+await db.accounts.findMany({ where: { NOT: { meta: { contains: { plan: 'pro' } } } } });
+```
+
+SQL Server now refuses a pathless `equals` with `TURBINE_E017`, since it stores the document as text and whitespace or key order would decide the match. SQLite already refused it.
+
+**Find it:** nothing warns on PostgreSQL or MySQL. Search for `equals` and `not` operands that are objects, and check which of those columns are JSON:
+
+```bash
+grep -rnE "(equals|not):\s*\{" src/
+```
+
+### `globalFilters` keyed by accessor now apply
+
+`globalFilters` keys are matched to tables. A key spelled as the client accessor (`blogPosts` for the `blog_posts` table), the spelling the configuration docs showed, matched nothing and applied no filter. Both spellings now resolve to the table, so a multi-word table's soft-delete or tenant filter starts filtering.
+
+```ts
+const db = turbine({
+  globalFilters: {
+    blogPosts: { deletedAt: null }, // 0.81: ignored. 0.90: applied to blog_posts.
+  },
+});
+```
+
+A key that names no table, two keys for one table, and a static filter naming a column the table lacks now throw `TURBINE_E003` at construction, with a did-you-mean.
+
+**Find it:** list your `globalFilters` keys. Any key whose accessor differs from its table name (any multi-word table) was inert before.
+
+### `OR: []` matches no row
+
+An empty `OR` list used to add no predicate, so `where: { OR: [] }` returned every row and `deleteMany({ where: { OR: [] } })` was refused by the empty-where guard. It now matches no row, as in Prisma, on reads and mutations alike. `AND: []`, `NOT: {}` and `NOT: []` still add no predicate.
+
+```ts
+const picked = selectedRoles.map((role) => ({ role }));
+// 0.81: every user when nothing was picked. 0.90: no users.
+await db.users.findMany({ where: { OR: picked } });
+// To keep "nothing picked means everyone", leave OR out:
+await db.users.findMany({ where: picked.length ? { OR: picked } : {} });
+```
+
+In a `groupBy` `having`, `NOT: [a, b]` now means `NOT a AND NOT b`, as it does in `where`; it used to mean `NOT (a AND b)`. Write `NOT: { AND: [a, b] }` for the old meaning.
+
+**Find it:** `grep -rnE "OR:\s*[a-zA-Z_]" src/` for lists built at runtime, and `grep -rn "having" src/` for `NOT` arrays.
+
+### Generated clients carry `pii` and `updatedAt` from your schema file
+
+`turbine generate` introspects the live database, which carries no code-first tags, so a client generated that way returned `pii: true` columns and never stamped `updatedAt` columns. `generate` now reads your `defineSchema` file (`schemaFile`, default `./turbine/schema.ts`) and applies `pii`, `updatedAt` and `maxLength` to the introspected schema.
+
+After regenerating, a PII-tagged column is absent from default reads, and `update` / `updateMany` stamp `updatedAt` columns.
+
+```ts
+// email is tagged pii: true in turbine/schema.ts
+const user = await db.users.findFirst({ where: { id: 1 } });
+user.email; // 0.81 (generated client): the address. 0.90: undefined.
+```
+
+**Find it:** `turbine generate` prints `applied column tags from <file>: N pii, N updatedAt`. The generated entity type marks each PII field optional, so `tsc` flags code that assumed it is present. To read the value, see [PII in `select`](#a-pii-column-in-select-needs-includepii-unsafe).
+
+### JSON path `equals` compares JSON values
+
+`{ path, equals }` used to compare the text extracted at the path, so `equals: 5` matched the string `"5"` too and `equals: null` matched only the string `"null"`. It now compares JSON to JSON on PostgreSQL (`(col #> path)::jsonb = $v::jsonb`) and on MySQL (`JSON_EXTRACT(...) = CAST(? AS JSON)`).
+
+```ts
+// Stored: { n: 5 } and { n: "5" }
+await db.docs.findMany({ where: { data: { path: ['n'], equals: 5 } } });
+// 0.81: both rows. 0.90: only { n: 5 }.
+
+await db.docs.findMany({ where: { data: { path: ['n'], equals: null } } });
+// 0.90: matches a stored JSON null. A missing key is not a JSON null.
+```
+
+Arrays and objects at a path compare as JSON on PostgreSQL and MySQL. On SQL Server, numbers compare as numbers and strings case-sensitively, and an array or object operand throws `TURBINE_E017`. SQLite refuses `null`, arrays, objects and booleans with `TURBINE_E017`, because it extracts JSON `true` as the integer `1`.
+
+**Find it:** pass the value with the JSON type you stored. Search for `path:` filters that bind a number against string data or a string against numeric data.
+
+### `not` takes an operator object
+
+`not: { lt: 4 }` used to bind the object `{"lt":4}` as a value, so the filter matched nearly every row. It now compiles to `NOT ("score" < $1)`, as in Prisma.
+
+```ts
+await db.reviews.deleteMany({ where: { score: { not: { lt: 4 } } } });
+// 0.81: deleted almost every row. 0.90: deletes rows with score >= 4.
+```
+
+A row whose column is `NULL` matches neither the filter nor its negation (SQL three-valued logic). Add `OR: [{ score: null }, ...]` if you want those rows too.
+
+**Find it:** `grep -rnE "not:\s*\{" src/` and read each operand.
+
+### A cursor page is always ordered
+
+A `findMany` with a `cursor` now always emits `ORDER BY`: your `orderBy` plus the primary key as a tiebreaker, unless the order already ends in a unique key. A cursor with no `orderBy` is ordered by the primary key. It used to run unordered, so pages could skip and repeat rows.
+
+```ts
+await db.posts.findMany({ cursor: { id: 40 }, limit: 20 });
+// 0.81: WHERE "id" > $1 LIMIT $2 (no ORDER BY)
+// 0.90: WHERE "id" > $1 ORDER BY "id" ASC LIMIT $2
+```
+
+A cursor that names a row by its key under another order (`orderBy: { createdAt: 'desc' }, cursor: { id }`) used to seek on `id` while sorting by `createdAt`, which returned the wrong rows. It now reads the cursor row's `createdAt` and seeks from there. `implicitPkOrdering` no longer orders a single-field cursor by its own field: every cursor page uses the order above, flag or not.
+
+**Find it:** nothing warns. Pages now come back in a stable order, which can differ from the order your code happened to see.
+
+### Streams and `with` honour every pagination key
+
+`findManyStream({ limit: 3 })` and `findManyStreamBatches` streamed every matching row whenever the result fit one batch. They now stop at `limit` / `take` and start at `offset`.
+
+Inside `with`, `skip` was ignored. `take`, `skip` and `offset` now page each parent's related rows, on the `join` and `batched` strategies alike.
+
+```ts
+await db.users.findMany({ with: { posts: { orderBy: { id: 'asc' }, take: 5, skip: 5 } } });
+// 0.81: the first 5 posts per user. 0.90: posts 6 to 10 per user.
+```
+
+`offset` or `skip` on a to-one relation throws `TURBINE_E003`: there is nothing to skip.
+
+**Find it:** search for `findManyStream` calls that pass `limit` or `take`, and for `skip` inside `with`.
+
+### `upsert` stamps `updatedAt` on every path
+
+The single-statement `upsert` path (`INSERT ... ON CONFLICT DO UPDATE`) left `updatedAt` columns unchanged. Its conflict `UPDATE` now stamps them, as `update` and the lookup path already did. An explicit value in `update` still wins.
+
+**Find it:** `upsert` calls on tables with an `updatedAt` column.
+
+### belongsTo nested writes follow to-one rules
+
+A `belongsTo` relation is one row the parent points at, and nested writes on it now behave that way.
+
+| Shape | 0.81 | 0.90 |
+|---|---|---|
+| `delete: true` (or `{}`) | did nothing | clears the foreign key, then deletes the connected row |
+| `disconnect: false` | disconnected | does nothing |
+| `disconnect: { id: 7 }` | disconnected without checking | must match the connected row, else `NotFoundError` (`TURBINE_E001`) |
+| `connectOrCreate` inside `update()` | ignored | connects or creates |
+| `set` | accepted | `TURBINE_E003`: use `connect` or `disconnect` |
+| two of `create` / `connect` / `connectOrCreate` / `disconnect` / `delete` | one of them ran | `TURBINE_E003` |
+| an array of several items | the first ran | `TURBINE_E003`; a one-item array is still accepted |
+
+`disconnect` and `delete` need a nullable foreign key. A `NOT NULL` one throws `TURBINE_E003` naming `connect` as the fix.
+
+With nothing connected, `disconnect: true` is a no-op, as in Prisma, while `delete: true` and a `disconnect` naming fields throw `NotFoundError` (`TURBINE_E001`).
+
+**Find it:** `grep -rnE "(disconnect|delete):\s*(false|true|\{)" src/` inside `update` data.
+
+### Writes inside `$transaction` are all-or-nothing per call
+
+A nested write, or an `upsert` that looks the row up first, is several statements. Inside your `$transaction`, each such call now runs in its own savepoint, so a failure you catch no longer leaves half of it behind.
+
+A writing `pipeline()` (transactional by default) holds its `COMMIT` until every result has been checked. A `findUniqueOrThrow` miss or an optimistic-lock conflict inside the batch now rolls the whole batch back, where it used to commit the writes and then reject. Such a batch takes two round trips; a read-only batch still takes one.
+
+`$transaction([...], options)` now applies `isolationLevel`, `sessionContext` and `timeout`. They were ignored on the array form.
+
+**Find it:** array-form `$transaction` calls that pass options, and `try` / `catch` around nested writes inside a transaction.
+
+### JSON arrays are stored as arrays
+
+A JS array written to a `json` / `jsonb` column was sent as a Postgres array literal: `[]` stored `{}`, `['a']` failed, and `createMany` inserted one extra row per array element. Arrays are now stored as JSON arrays on every write path.
+
+A string written to a JSON column still means raw JSON text, so `JSON.stringify(value)` keeps working. To store a JSON string or a JSON `null`, use `jsonValue`:
+
+```ts
+import { jsonValue } from 'turbine-orm';
+
+await db.docs.create({ data: { data: [1, 2, 3] } });            // stores [1, 2, 3]
+await db.docs.create({ data: { data: '{"a":1}' } });            // stores { "a": 1 }
+await db.docs.create({ data: { data: jsonValue('hello') } });   // stores the string "hello"
+await db.docs.create({ data: { data: jsonValue(null) } });      // stores JSON null, not SQL NULL
+```
+
+**Find it:** rows written with array values before the upgrade may hold `{}`. Check them with `jsonb_typeof(col)`.
+
+### `{ increment }` on a JSON column is a document
+
+In `update` data, `{ increment: 1 }` (and `decrement`, `multiply`, `divide`) on a `json` / `jsonb` column is now the JSON document it looks like. Only `{ set: value }` is unwrapped there, which is also how to store a document shaped like `{ set: ... }`. On PostgreSQL the old form failed; on SQLite it silently stored the number `1`.
+
+### PowDB: filters reach every relation
+
+On PowDB, global filters now apply on every relation load path (nested projections, native joins, batched loaders, link hops), and `skipGlobalFilters` reaches relations. A relation could return another tenant's rows before.
+
+The relation filters `is`, `isNot`, a bare to-one filter, `is: null` and `isNot: null` now filter. They matched every row, `updateMany` and `deleteMany` included. `none`, `every` and `not: { ... }` follow SQL `NULL` semantics, `in` / `notIn` on a float column match whole numbers, `startsWith` / `endsWith` treat `%`, `_` and `\` literally, and `_min` / `_max` return the column's own type.
+
+### SQLite: other callers wait for an open transaction
+
+SQLite has one handle. A statement from outside an open `$transaction` used to run inside it, could read its uncommitted rows, and was rolled back with it. It now waits for the transaction to end, for up to `busyTimeoutMs`, then fails with a retryable `SerializationFailureError` (`TURBINE_E013`).
+
+## Shapes that now throw
+
+### Column references are built with `col()`
+
+A column-to-column comparison used to be the plain object `{ col: 'x' }`. That is exactly what `JSON.parse` produces from a request body, so request data could name a column: `delete({ where: { id: body.id } })` with `{"equals":{"col":"id"}}` compiled to `WHERE "id" = "id"`. References now carry a symbol brand, and only `col()` builds one.
+
+```ts
+// 0.81
+where: { currentVersionId: { not: { col: 'publishedVersionId' } } }
+
+// 0.90
+import { col } from 'turbine-orm';
+where: { currentVersionId: { not: col('publishedVersionId') } }
+```
+
+**Find it:** `tsc --noEmit` rejects the plain object literal. At runtime it throws `TURBINE_E003`, naming `col()`.
+
+### `where` operands must fit the column
+
+On a non-JSON column, an object, an array or `{}` at a value position, `gt` / `gte` / `lt` / `lte: null`, a non-string `contains` / `startsWith` / `endsWith`, a non-array `in` / `notIn`, a `Map` or `Set`, and an unknown `mode` now throw `TURBINE_E003`. They were bound as JSON text and matched nothing, or the wrong rows.
+
+```ts
+await db.users.findMany({ where: { id: [1, 2] } });      // TURBINE_E003: use { in: [1, 2] }
+await db.users.findMany({ where: { score: { gt: null } } }); // TURBINE_E003: use equals: null or not: null
+```
+
+### Combinators and filter keys the query cannot read
+
+Each of these used to compile to no condition at all, which inside a relation filter or a global filter matched every row. They now throw `TURBINE_E003` naming the fix:
+
+- `OR` given an object instead of an array (wrap it: `OR: [{ ... }]`), or any combinator given `null`, a scalar or a non-object member. `AND` and `NOT` still take one object or an array.
+- An operator object naming no operator, `{ name: { mode: 'insensitive' } }`. One emptied by `undefined`, `{ contains: search, mode: 'insensitive' }` with `search` undefined, is still no filter.
+- A relation filter key other than `some`, `every`, `none`, `is` and `isNot` beside them, `{ posts: { some: { ... }, published: true } }`.
+- A `distinct` element that is not a field-name string.
+- A `__proto__` key arriving from parsed input, which used to replace the argument object's prototype and drop the filter.
+
+### A PII column in `select` needs `includePii: UNSAFE`
+
+Naming a `pii: true` column in `select` used to be the opt-in that returned it. `select` often comes from request data, so that was a way for a request to read PII. A read now returns a PII column only with `includePii: UNSAFE`, at the top level and at every `with` depth.
+
+```ts
+import { UNSAFE } from 'turbine-orm';
+
+await db.users.findMany({ select: { id: true, email: true } });
+// TURBINE_E003: "email" is tagged PII
+
+await db.users.findMany({ select: { id: true, email: true }, includePii: UNSAFE });
+```
+
+A write never returns a PII column. A write `select` that names one throws `TURBINE_E003`; read the row back with `includePii: UNSAFE`. `omit`, `where`, `orderBy` and `having` on PII columns are unchanged. The rule applies on every engine, PowDB included, and through prisma-compat (pass `includePii: UNSAFE` as a native option).
+
+**Find it:** `TURBINE_E003` with the text `is tagged PII`.
+
+### Global filters fail closed
+
+A function filter that returned `undefined`, or an object holding `undefined` at any depth, was dropped, so a missing tenant id read and wrote every tenant's rows. It now throws `TURBINE_E003` naming the table.
+
+```ts
+globalFilters: { orders: () => ({ tenantId: currentTenant() }) }
+// currentTenant() is undefined outside a request:
+// 0.81: no filter, every tenant's orders. 0.90: TURBINE_E003.
+
+// No filter on purpose: return null or {}.
+globalFilters: { orders: () => (isAdminJob() ? null : { tenantId: currentTenant() }) }
+```
+
+`null` and `{}` are the explicit "no filter" values, static or returned. For a query that must see every row, pass `skipGlobalFilters: UNSAFE`.
+
+**Find it:** `TURBINE_E003` with the text `Global filter for`.
+
+### `findFirst` refuses a `where` emptied by `undefined`
+
+`findFirst({ where: { resetToken: token } })` with `token` undefined used to return an arbitrary row. `findFirst` and `findFirstOrThrow` now throw `TURBINE_E003` when every key of a non-empty `where` was `undefined`. `findMany` and `count` keep treating an all-`undefined` `where` as no filter.
+
+```ts
+const user = await db.users.findFirst({ where: { resetToken: req.query.token } });
+// 0.81, token missing: some user. 0.90: TURBINE_E003.
+```
+
+To ask for any row on purpose, omit `where` or pass `where: {}`. Mutations already refused an empty `where`; they now also refuse one emptied inside a relation filter, such as `deleteMany({ where: { user: { email: undefined } } })`.
+
+### One-row lookups take a plain value or `{ equals }`
+
+`findUnique`, `update`, `delete` and `upsert` identify a row by a unique key pinned to a plain value or `{ equals: value }`. A column reference, `mode: 'insensitive'`, a list, a range, or another operator beside `equals` in the same key object can match many rows, and is now refused with `TURBINE_E003`.
+
+```ts
+await db.users.findUnique({ where: { email: { equals: input, mode: 'insensitive' } } }); // TURBINE_E003
+await db.users.findFirst({ where: { email: { equals: input, mode: 'insensitive' } } });  // use this
+```
+
+### A cursor must place the page
+
+A cursor must carry a value for every column of the page order (your `orderBy` plus the tiebreaker), or name one row by a unique key. Anything else throws `TURBINE_E003` naming the missing fields and the keys that would work. A cursor beside a relation, JSON-path or vector `orderBy` throws too; page those with `offset`.
+
+```ts
+// 0.90: TURBINE_E003, the cursor has no value for "id"
+await db.posts.findMany({ orderBy: { createdAt: 'desc' }, cursor: { createdAt: last.createdAt }, limit: 20 });
+
+// Either of these works:
+await db.posts.findMany({ orderBy: { createdAt: 'desc' }, cursor: { createdAt: last.createdAt, id: last.id }, limit: 20 });
+await db.posts.findMany({ orderBy: { createdAt: 'desc' }, cursor: { id: last.id }, limit: 20 });
+```
+
+{/* TODO(v090): builder lane is adding the tiebreaker to page 1 (a limited findMany with a non-unique orderBy), validating cursor values as operands, and refusing a cursor emptied by undefined. Document once committed. */}
+
+### `optimisticLock` on `upsert` and `updateMany`
+
+Both ignored `optimisticLock`, so stale writes went through. Both now throw `TURBINE_E003`.
+
+```ts
+// updateMany: put the version check in the query itself
+await db.posts.updateMany({
+  where: { id: { in: ids }, version: expected },
+  data: { status: 'archived', version: { increment: 1 } },
+});
+// The returned count is the number of rows still at that version.
+
+// upsert: read, then update with optimisticLock or create, in one transaction
+await db.$transaction(async (tx) => {
+  const row = await tx.posts.findUnique({ where: { slug } });
+  if (row) {
+    await tx.posts.update({ where: { slug }, data, optimisticLock: { field: 'version', expected: row.version } });
+  } else {
+    await tx.posts.create({ data: { slug, ...data } });
+  }
+});
+```
+
+{/* TODO(v090): at 3cf0414 an upsert whose create or update carries nested relation data skips the refusal; the builder lane adds it. */}
+
+### An object written to a scalar PostgreSQL column
+
+On PostgreSQL, a plain object or an array written to a built-in scalar column (text, numeric, boolean, temporal, uuid and similar) now throws `TURBINE_E003`. It used to store JSON text or a Postgres array literal without a word. Domains, extension types and array columns are not affected.
+
+```ts
+await db.users.create({ data: { settings: { theme: 'dark' } } });
+// settings is text: TURBINE_E003
+
+await db.users.create({ data: { settings: JSON.stringify({ theme: 'dark' }) } }); // or jsonValue(...)
+```
+
+`create({ data: { name: { set: 'x' } } })` is refused for the same reason: atomic operators belong in `update` data.
+
+### Transactions
+
+**A rolled-back `COMMIT` rejects.** When a statement inside a transaction fails and your callback catches the error, PostgreSQL ends the transaction with a `ROLLBACK` when you `COMMIT`. `$transaction`, `$withSession`, `transaction()` and the array form used to resolve as if they had committed. They now reject with `ValidationError` (`TURBINE_E003`), the failed statement on `cause`. A deadlock or serialization failure keeps its retryable class (`TURBINE_E012` / `TURBINE_E013`), so `withRetry` still retries it.
+
+```ts
+import { UniqueConstraintError } from 'turbine-orm';
+
+// 0.81: resolved, and nothing was saved. 0.90: rejects.
+await db.$transaction(async (tx) => {
+  await tx.audit.create({ data: entry });
+  try {
+    await tx.users.create({ data: { email } }); // unique violation
+  } catch {}
+});
+
+// Recover from an expected failure in its own savepoint:
+await db.$transaction(async (tx) => {
+  await tx.audit.create({ data: entry });
+  try {
+    await tx.$transaction(async (inner) => {
+      await inner.users.create({ data: { email } });
+    });
+  } catch (err) {
+    if (!(err instanceof UniqueConstraintError)) throw err;
+  }
+});
+```
+
+{/* TODO(v090): PM decision pending to give the rolled-back COMMIT its own error class; it is ValidationError (E003) at 3cf0414. */}
+
+**A settled `tx` throws.** A `tx` used after its transaction committed, rolled back or timed out throws `TURBINE_E003` instead of running on a connection that may belong to another request. The usual causes are a missing `await`, an `async` callback passed to `forEach` (use `for ... of`), or a `tx` stored for later.
+
+**`sessionContext` values are strings, numbers or booleans.** `undefined`, `null` and objects throw `TURBINE_E003` before a connection is taken. `undefined` used to reach your row-level security policies as the text `'undefined'`.
+
+**A Promise in `$transaction([...])` or `pipeline([...])` throws `TURBINE_E003`.** The query in it already ran on its own. Pass `build*()` results (`db.users.buildCreate(...)`), or use the callback form.
+
+**Nested blocks started together run one after another.** `Promise.all([tx.$transaction(a), tx.$transaction(b)])` shared one connection before, so the blocks were never parallel; they now run in order instead of interleaving.
+
+### Connections
+
+**An exhausted pool is `ConnectionError` (`TURBINE_E004`).** A checkout that timed out used to reject with pg-pool's plain `Error: timeout exceeded when trying to connect`. It now names the pool size, the waiting callers, and the usual cause: a query on `db` inside a `$transaction` callback, which needs a second connection. Catch `ConnectionError` or `err.code === 'TURBINE_E004'`.
+
+**A client with no database configured rejects its first query.** With no `connectionString`, pool, host settings, `DATABASE_URL` or `PG*` variables, Turbine used to connect to `postgres@localhost`. The client still constructs and builds SQL, but every query rejects with `TURBINE_E004` explaining that Turbine does not read `.env` files (`node --env-file=.env`, or `process.loadEnvFile()`). An empty `connectionString` is named as the cause.
+
+**`PGHOST`, `PGPORT`, `PGDATABASE` and `PGUSER` are honoured.** Turbine's own `localhost` / `postgres` defaults used to override them. If your shell sets `PGUSER` for `psql` and the app relied on the `postgres` default, set `user` explicitly.
+
+### prisma-compat
+
+- `take`, `skip` and `cursor` on `count` and `aggregate` throw `TURBINE_E017`. They were ignored, so the number covered every matching row. Fetch the page with `findMany` and compute from it.
+- `count({ select })` returns Prisma's per-field object (`{ _all, title }`) instead of a number.
+- Every cursor shape now matches Prisma: the page starts at the cursor row in the query's order and `skip: 1` drops it. The shapes that threw `TURBINE_E017` before now work, and `cursor` plus `skip` under an `orderBy` on another field returns the right rows.
+- `skip` in a nested `include` maps to the relation offset. A nested `cursor` throws `TURBINE_E017`; it was dropped.
+
+### SQLite
+
+- Calling the client (not `tx`) from inside its own `$transaction` callback, or opening a nested `db.$transaction` there, throws `TURBINE_E017` instead of deadlocking. Use the `tx` argument.
+- `SQLITE_BUSY` and `SQLITE_LOCKED` are `SerializationFailureError` (`TURBINE_E013`, retryable) on every path, `db.pool.query` and `db.transaction()` included.
+- `isolationLevel` is accepted. SQLite transactions are serializable, and it used to produce a syntax error.
+
+### MySQL
+
+- `NaN`, `Infinity` and an Invalid Date as a bound value throw `TURBINE_E003`. MySQL stored them as `0`.
+- Data errors (too long, out of range, bad value, bad date, division by zero, invalid JSON) are `ValidationError` with `column` and `sqlstate`, instead of a plain driver error.
+
+### PowDB
+
+These used to return wrong rows and now throw:
+
+- `contains` with `%` or `_` throws `TURBINE_E017`: PowQL's `like` has no escape character. `startsWith` and `endsWith` match literally.
+- Comparisons, ordering, aggregates and arithmetic on a `numeric` / `decimal` column (stored as text) throw `TURBINE_E017`. Reads, writes and null checks are unchanged.
+- A relation filter matching more than 10,000 distinct keys throws `TURBINE_E017`.
+- A malformed relation filter shape throws `TURBINE_E003`.
+- Embedded: calling the client from inside its own `$transaction` callback throws `TURBINE_E017` naming `tx`. A statement from outside an open transaction waits its turn.
+- `optimisticLock` on `upsert` / `updateMany` and a PII column in `select` follow the SQL engines' rules above.
+
+## Tooling
+
+### `turbine generate`
+
+- **It needs `tsx` when `turbine/schema.ts` exists**, because it now loads the schema file to read its tags. Install it as a dev dependency.
+- **It fails rather than generating an untagged client.** A named `--schema-file` or config `schemaFile` that is missing or cannot be loaded exits 1, and so does a `pii` or `updatedAt` tag on a table or column the database lacks. Run `turbine push` first, or fix the tag. A project with no `./turbine/schema.ts` is unaffected.
+- **A table whose accessor would be `constructor` or `__proto__` is refused**, with the fix named.
+- `introspect()` returns null-prototype objects for `tables`, `enums`, the column maps and relations. An `assert.deepEqual` against a plain object needs a spread.
+
+### Generated row types follow the driver
+
+Regenerate your client. A few column types were declared as `string` while the driver returns something else:
+
+- `interval` is the driver's parsed object, `{ years?, months?, days?, hours?, minutes?, seconds?, milliseconds? }`.
+- `point` is `{ x, y }` and `circle` is `{ x, y, radius }`.
+- `bigint[]` is `string[]`: the driver's array parser does not apply the scalar `int8` rule.
+- `macaddr8`, `bit`, `varbit`, ranges and multiranges stay `string`.
+
+Writes to `int8` also accept a `string` or `bigint`, and writes to `numeric` a `number`. Code that treated an `interval` or `point` as a string now gets a compile error where it used to get an object at runtime.
+
+### Migrations
+
+- **`migrate create --auto` and `--from-diff` refuse while migrations are pending.** The diff reads the live database, so it would repeat what the unapplied files do. Run `turbine migrate up` first, or pass `--allow-pending` when the pending files do not touch what the schema file describes.
+- **Migration filenames are stamped in UTC.** Existing local-time files keep working; the runner reads any 14-digit prefix. A file created after upgrading can sort before one a colleague created earlier the same day in a zone ahead of UTC, which the runner applies as an [out-of-order migration](/migrate#out-of-order-migrations).
+- **Lossless widenings are no longer destructive.** `int` to `bigint`, a longer `varchar` and similar changes apply without `--allow-destructive`. A narrowing is still refused.
+- **New CI flags.** `push --dry-run --exit-code` and `migrate status --exit-code` exit 2 on drift, and `migrate deploy --wait[=seconds]` waits for a concurrent deploy's lock. See [Checking for drift in CI](/migrate#checking-for-drift-in-ci).
+
+### Generated DDL for MySQL, SQLite and SQL Server
+
+`schemaToSQL` and `schemaPush` used to map a column type twice on the other engines, losing what the dialect's own mapping said. The PostgreSQL output is unchanged. Elsewhere, regenerate the DDL and review it before applying it to an existing database:
+
+- `AUTO_INCREMENT` (MySQL), `AUTOINCREMENT` (SQLite) and `IDENTITY` (SQL Server) stay on serial keys, and declared `VARCHAR` lengths stay.
+- SQL Server `text` and `json` stay `NVARCHAR(MAX)` instead of being cut to 255; `timestamptz` stays `DATETIMEOFFSET`.
+- MySQL foreign keys are emitted at table level, so they now exist. MySQL 8 parses and ignores an inline `REFERENCES`.
+- Text in a key position (primary key, unique, foreign key, declared index) is `VARCHAR(255)` on MySQL and `NVARCHAR(255)` on SQL Server. A longer key needs an explicit `varchar` with `maxLength`.
+- Defaults are translated per dialect (`now()`, `gen_random_uuid()`, `true` / `false`, `current_date`).
+- **MySQL timestamps are `DATETIME(3)`**, with a `CURRENT_TIMESTAMP(3)` default, so milliseconds are stored instead of rounded away. Existing tables keep bare `DATETIME` until you run `ALTER TABLE ... MODIFY col DATETIME(3)`.
+
+### The destructive-migration guard flags more
+
+`migrate up`, `migrate down` and `push` now also stop on an `UPDATE` whose `WHERE` is constant-true (`WHERE true`, `WHERE 1=1`, `x OR true`), a destructive statement inside `PREPARE ... AS`, `INSERT ... ON CONFLICT DO UPDATE` with no restricting `WHERE` (`overwrite-on-conflict`), `lo_unlink` (`large-object-unlink`), `DROP VIEW ... CASCADE`, and quoted table names such as `UPDATE "t"` that were missed. `migrate deploy` still proceeds and prints a notice. For an idempotent upsert, add `WHERE t.col IS DISTINCT FROM EXCLUDED.col`.
+
+### Studio and Observe
+
+The URL Studio and Observe print carries a one-time ticket, not the session credential. The first visit exchanges it for a cookie; a second use gets `403`, or a redirect to `/` when you are already signed in. Scripts that reused the printed URL as a token must use the cookie. Both servers answer `403` to a `Host` that is not loopback or the bound host. Studio also answers `413` to a request body over 1 MiB and `400` to malformed JSON, returns at most 1,000 rows from the Query tab, and keeps at most 500 saved queries.
+
+### MCP server
+
+The secret-name rule now splits camelCase, PascalCase and kebab-case names, so `apiKey`, `accessToken` and `PasswordHash` are hidden from `sample_rows` and refused in `explain_query` alongside the underscore forms.
+
+## See also
+
+- **[Changelog](/changelog)**, the full list of fixes and additions in 0.90.
+- **[API Reference](/queries)**, the rules above in context.
+- **[Typed Errors](/errors)**, every error code.

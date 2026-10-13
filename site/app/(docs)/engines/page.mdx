@@ -53,7 +53,7 @@ If pgvector, realtime, or RLS is core to your app, stay on Postgres. The engines
 | Array-column filters (`has`, `hasEvery`, …) | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
 | `groupBy({ distinctOn })` | ✓ | ✗ E017 | ✗ E017 | ✗ E017 |
 
-¹ SQLite is single-writer: one write transaction at a time, and concurrent writers get `SQLITE_BUSY` (treated as retryable). WAL mode is enabled for file databases so readers do not block.
+¹ SQLite runs on one connection. While a `$transaction` is open, every other caller (plain `pool.query` included) waits its turn, bounded by `busyTimeoutMs`, then fails with a retryable `SerializationFailureError` (`TURBINE_E013`). `SQLITE_BUSY` and `SQLITE_LOCKED` surface as that same error on every path. WAL mode is enabled for file databases.
 
 ² Each engine ships a `DialectIntrospector`, so `introspect({ dialect })` reads the engine's own catalog (`PRAGMA` for SQLite, `information_schema` / `sys.*` for MySQL and SQL Server); the `turbine generate` CLI itself is Postgres-only, so point an engine factory at a programmatically introspected or hand-written `SCHEMA`.
 
@@ -75,6 +75,20 @@ A nested relation is assembled as JSON by the database, and a JSON number is an 
 | SQL Server | `BIGINT`, `VARBINARY` | ints rounded, binary as base64 text |
 
 Postgres was fixed in 0.50 and the other three in 0.51; upgrading across those versions changes the values such reads return, to the correct ones.
+
+### Behaviour that differs by engine
+
+Some results follow the engine rather than Turbine, and no error marks the difference:
+
+| | PostgreSQL | SQLite | MySQL 8 | SQL Server |
+|---|---|---|---|---|
+| String `=` | case-sensitive | case-sensitive | follows the collation: the default `utf8mb4_0900_ai_ci` ignores case and accents | follows the collation |
+| `contains` / `startsWith` / `endsWith` | case-sensitive | ASCII case-insensitive (`LIKE`) | follows the collation | follows the collation |
+| `NULL` in ascending order | last | first | first | first |
+| Integer `divide`, `5 / 2` | `2` (truncates) | stores `2.5` | `3` (rounds half away from zero) | `2` (truncates) |
+| Pathless JSON `equals` | document equality | `TURBINE_E017` | document equality | `TURBINE_E017` |
+
+On MySQL the default collation also decides unique constraints, `findUnique`, the row an `update` or `upsert` targets, `groupBy` and string `ORDER BY`: `'bob'`, `'BOB'` and `'Bob'` are one value, and so are `'jose'` and `'José'`. Trailing spaces are significant. Use a binary or `_as_cs` collation on columns where case must count. An explicit `nulls` placement in `orderBy` throws `TURBINE_E017` on MySQL and SQL Server.
 
 ### Zone-less `date` and `timestamp` agree across engines
 
@@ -118,13 +132,15 @@ await db.disconnect();
 `turbineSqlite(target, schema, options?)` is **synchronous** and returns a `TurbineClient`. Pass a file path, `':memory:'`, or an open `DatabaseSync` (so you can seed and introspect it first, then reuse the same connection). Options:
 
 - `wal`, enable WAL journal mode for file databases (default `true`; ignored for `':memory:'`).
-- `busyTimeoutMs`, how long a writer waits on `SQLITE_BUSY` (default `5000`).
+- `busyTimeoutMs`, how long a caller waits on `SQLITE_BUSY`, and for another caller's open transaction to finish (default `5000`).
 - `foreignKeys`, enable `PRAGMA foreign_keys` enforcement (default `true`).
 - plus the client options below.
 
 <Callout type="note" title="Engine factories forward the whole client config">
 All three SQL engine factories take every `TurbineConfig` field **except** the connection and dialect plumbing they own (`pool`, `dialect`, `preparedStatements`, the pg connection / pool-tuning fields, `replicas`). The set is defined by exclusion, so a new client option works on every engine the day it lands. Postgres-only-by-capability options (`jsonEncoding: 'positional'`) are forwarded too and throw `TURBINE_E017` at the point of use.
 </Callout>
+
+**One connection.** A `DatabaseSync` handle is a single connection, so a `$transaction` owns it until it commits or rolls back. Statements from other callers wait for it (see `busyTimeoutMs`) instead of running inside the open transaction, where they used to be rolled back with it and could read its uncommitted rows. Inside the callback, use `tx`: calling the client itself, or opening a nested `db.$transaction`, throws `TURBINE_E017` instead of deadlocking. `isolationLevel` is accepted and ignored, since SQLite transactions are serializable.
 
 **Driver:** `node:sqlite` `DatabaseSync` is the primary driver (Node ≥ 22.5; it emits a harmless `ExperimentalWarning`). For older Node, wrap a `better-sqlite3` handle in the same pool shape (documented fallback, not bundled).
 
@@ -147,7 +163,9 @@ const db = await turbineMysql('mysql://user:pass@localhost:3306/app', SCHEMA);
 
 `turbineMysql(target, schema, options?)` is **async** and resolves to a `TurbineClient`. `target` may be a connection string, a `mysql2` config object, or an existing `mysql2` pool (injection: you own its lifecycle and `disconnect()` becomes a no-op). When Turbine builds the pool it pins the correct `mysql2` flags (named placeholders, safe bignum, UTC dates, JSON-as-string) and probes `SELECT VERSION()` to reject MariaDB and any MySQL older than 8.0 (5.7 lacks `JSON_ARRAYAGG`). The only MySQL-specific option is `connectionLimit` (default `10`), on top of the forwarded client config described [above](#sqlite).
 
-**Caveats:** writes use the `reselect` strategy (no `RETURNING`), so **`createMany` returns `[]`**, see above. Nested relations use `JSON_OBJECT` / `JSON_ARRAYAGG`; since `JSON_ARRAYAGG` has no inline `ORDER BY`, every ordered to-many relation goes through the inner-subquery rewrite. Case-insensitive matching uses `LOWER(col) LIKE LOWER(ref)`, which can defeat an index unless a functional/generated index exists, and `mode: 'insensitive'` on `in` / `notIn` is refused with `TURBINE_E017` (PostgreSQL only among the SQL engines, see [Queries](/queries#where-operators)).
+**Caveats:** writes use the `reselect` strategy (no `RETURNING`), so **`createMany` returns `[]`**, see above. Nested relations use `JSON_OBJECT` / `JSON_ARRAYAGG`; since `JSON_ARRAYAGG` has no inline `ORDER BY`, every ordered to-many relation goes through the inner-subquery rewrite. Case-insensitive matching uses `LOWER(col) LIKE LOWER(ref)`, which can defeat an index unless a functional/generated index exists, and `mode: 'insensitive'` on `in` / `notIn` is refused with `TURBINE_E017` (PostgreSQL only among the SQL engines, see [Queries](/queries#where-operators)). The default collation makes plain `=` case- and accent-insensitive too; see [Behaviour that differs by engine](#behaviour-that-differs-by-engine).
+
+**Values and errors.** `NaN`, `Infinity` and an Invalid Date as a bound value throw `ValidationError` (`TURBINE_E003`); MySQL would store `0`. Data errors (a value too long or out of range, a malformed number or date, division by zero, invalid JSON) are `ValidationError` carrying `column` and `sqlstate`. A `DATETIME` column keeps milliseconds only when declared `DATETIME(3)`, which is what `schemaToSQL` emits for a timestamp since 0.90; a bare `DATETIME` rounds them away. JSON path `equals` compares JSON values, including `null`, arrays and objects.
 
 ## SQL Server
 
@@ -167,6 +185,10 @@ const db = await turbineMssql('mssql://sa:Passw0rd!@localhost:1433/app', SCHEMA)
 `turbineMssql(target, schema, options?)` is **async** and resolves to a `TurbineClient`. `target` may be a connection string, an `mssql` config object, or an existing pool (injection: `disconnect()` is a no-op). When Turbine builds the pool it probes `SERVERPROPERTY('ProductMajorVersion')` to reject any SQL Server older than 2016. The `schema` option sets the introspection / DDL schema (default `dbo`), on top of the forwarded client config described [above](#sqlite).
 
 **Caveats:** writes return rows via `OUTPUT INSERTED.*` / `MERGE … OUTPUT` (see above); nested relations use a dedicated `FOR JSON PATH` correlated-subquery generator (no `json_agg`), wrapping to-many results in `ISNULL(…, '[]')` and embedding nested objects with `JSON_QUERY`. Paging is `ORDER BY … OFFSET … FETCH NEXT` (a stable order is injected when a query has none). `createMany` is capped at 1000 rows / 2100 parameters per statement (exceeding either throws a `ValidationError`; chunk it yourself). `MERGE` is not a substitute for a unique constraint, so keep the upsert conflict target backed by a real `UNIQUE` / `PK` index; the loser of a race surfaces as a typed `UniqueConstraintError`. Case-insensitive matching follows the column's collation, and `mode: 'insensitive'` on `in` / `notIn` is refused with `TURBINE_E017` (PostgreSQL only among the SQL engines, see [Queries](/queries#where-operators)).
+
+{/* TODO(v090): builder lane (B1): if createMany chunks past the parameter limit, replace "chunk it yourself" above. */}
+
+**JSON.** Path `equals` compares typed values: numbers as numbers, strings case-sensitively (whatever the column's collation), booleans and `null` by JSON type. An array or object operand, and pathless `equals`, throw `TURBINE_E017`; use `contains` or a path to a scalar. A `with` relation's `offset` / `skip` binds inside the `FOR JSON` subquery.
 
 ## PowDB
 
@@ -353,6 +375,22 @@ The chain sits behind the same engine ≥ 0.20 gate as `=` and `>`, so every rel
 
 **Operator-chain budget.** A flat `OR` / `AND` chain costs one level per term against the same 64-level budget as nested parentheses: roughly 63 terms at the top level, fewer inside a nested `with` block. Turbine maps the engine's refusal to a `ValidationError` telling you to split the array or use an `in` list (the true remaining budget depends on where the predicate sits, so there is no client-side pre-check). A literal `in (…)` list is a single flat node and does not count against the budget, so the 1,000-key relation chunking is unaffected.
 
+### Filter semantics match PostgreSQL (Turbine 0.90)
+
+PowDB resolves filters through its own query language, and several shapes used to return different rows from the SQL engines. Since 0.90 they match:
+
+- **Global filters reach every relation path**: nested projections, native joins, batched loaders and link hops, and `skipGlobalFilters` covers relations and relation filters too. A relation used to be able to return rows the filter hides.
+- **To-one relation filters filter.** `is`, `isNot`, a bare to-one where, `is: null` and `isNot: null` used to match every row, including in `updateMany` and `deleteMany`.
+- **`none`, `every` and `not: { ... }` follow SQL `NULL` semantics.**
+- **`startsWith` and `endsWith` match `%`, `_` and `\` literally.**
+- **Float columns compare whole numbers.** `in`, `notIn`, `NOT` and `OR` with an integer operand on a `float` column used to match nothing (or, for `notIn`, everything).
+- **`_min` and `_max` return the column's type**: text stays text, and a large `int8` keeps its digits.
+- **Column defaults are applied on write.** PowDB has no column defaults, so Turbine fills an omitted defaulted column on `create`, `createMany` and `upsert`, evaluated per row. `defineSchema` records the defaults it can evaluate: literals, `now()`, `current_date` and `gen_random_uuid()`. Any other default, or metadata that marks a column defaulted without carrying the expression, throws `TURBINE_E017` naming the column, so supply the field explicitly.
+- **Embedded transactions queue outside callers.** A statement issued from outside an open `$transaction` waits for it instead of joining it.
+- **The shared rules hold**: `undefined` filter values, `take` / `skip` inside `with`, `jsonValue`, a PII column in `select`, and `optimisticLock` on `upsert` / `updateMany` behave as on the SQL engines.
+
+Top-level `NOT: { col: value }` is still PowQL's two-valued complement, so a row whose `col` is `NULL` matches it where SQL would exclude it.
+
 ### explain() and index guidance
 
 Every table accessor has `explain(args)`: it runs the exact query `findMany` would compile through the engine's plan explainer and returns the plan lines (see [Queries](/queries#explain)). PowDB's planner picks indexes greedily using per-index statistics (engine ≥ 0.15), so **index the most selective column of your common conjunctions** and verify with `explain` that the intended index drives the scan. Plan text is diagnostic output, not a stable API.
@@ -365,6 +403,10 @@ Beyond the Postgres-only trio every non-Postgres engine throws on (pgvector, LIS
 - **Composite keys via subqueries:** composite-key relation filters, composite-key nested reads, and composite-junction many-to-many; PowQL has no tuple-`in`. (A single-row `findUnique`/`upsert` on a composite PK works.)
 - **Writes:** nested writes inside `createMany` (use `create`).
 - **Reads:** cursor pagination and `findManyStream` (no server-side cursor; page with `findMany({ limit, offset })`).
+- **Patterns PowQL cannot escape:** `contains` with `%` or `_` in the operand. PowQL's `like` has no escape character, so it used to match other rows.
+- **Numeric text columns:** comparisons, ordering, aggregates and arithmetic on a `numeric` / `decimal` column, which PowDB stores as text, so they would compare as strings (an `increment` used to write `NULL`). Reads, writes and null checks work.
+- **Oversized relation filters:** a relation filter whose inner predicate matches more than 10,000 distinct keys. Filter the related table first, or narrow the predicate.
+- **Re-entrant calls (embedded):** calling the client, not `tx`, from inside its own `$transaction` callback; the error names `tx`.
 - **Version-gated correctness (engine < 0.20):** comparisons on a PowDB-native `datetime` column, including `in` / `notIn`, and per-field `_count` of a **nullable** column. See the [correctness round](#correctness-round-powdb-020).
 
 Everything else works: the `findMany` family, every write including composite-PK `upsert`, atomic update operators, `count` / `aggregate` / `groupBy`, `where` operators, `orderBy` / `select` / `omit`, `with` for every cardinality **including many-to-many**, relation filters (`some` / `none` / `every`), and nested writes in `create` / `update`. That includes `mode: 'insensitive'` on **every** operator it applies to, `in` and `notIn` among them, which the three non-Postgres SQL engines refuse: PowQL's list form takes an expression per element, so the same `lower(...)` covers the column and every operand.

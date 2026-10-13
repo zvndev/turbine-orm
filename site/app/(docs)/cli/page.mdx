@@ -83,6 +83,16 @@ Reads `information_schema` + `pg_catalog` and writes three files to the output d
 - `metadata.ts`, runtime `SchemaMetadata` constant (column maps, relations, indexes)
 - `index.ts`, typed `TurbineClient` subclass + `turbine()` factory
 
+### Column tags from the schema file
+
+The database has no column for the code-first `pii` and `updatedAt` tags, so `generate` also reads your `defineSchema()` file (`--schema-file <path>`, or `schemaFile` in the config, default `./turbine/schema.ts`) and overlays its `pii`, `updatedAt` and `maxLength` tags onto the introspected schema. It prints what it applied, for example `Applied column tags from ./turbine/schema.ts: 2 pii, 1 updatedAt`.
+
+```bash
+npx turbine generate --schema-file ./db/schema.ts
+```
+
+A schema file you named that is missing, a schema file that fails to load, and a `pii` or `updatedAt` tag on a table or column the database lacks all fail the command, because carrying on would generate a client that returns the columns the tags hide. Only a missing file at the default path is skipped. A `.ts` file needs `tsx` installed as a dev dependency. See [How generate picks up the tags](/schema#how-generate-picks-up-the-tags).
+
 ### `--zod`
 
 Emit a fourth file, `zod.ts`, with a Zod schema per table (`XSchema`, `XCreateSchema`, `XUpdateSchema`). The generated file imports the user-side `zod` dependency; the Turbine runtime never does.
@@ -127,9 +137,12 @@ Controls the extension on the sibling imports between the generated files (`type
 
 ```bash
 npx turbine generate --import-ext js     # './types.js'  (NodeNext / ESM resolution)
+npx turbine generate --import-ext ts     # './types.ts'  (Node type stripping)
 npx turbine generate --import-ext none   # './types'     (bundler / classic resolution)
 npx turbine generate --import-ext auto   # detect from tsconfig (default)
 ```
+
+`ts` is for running the generated client directly with Node's type stripping (`node app.ts` on Node 22.18+ or 23.6+; earlier 22.x releases need `--experimental-strip-types`). A type checker then needs `allowImportingTsExtensions` or `rewriteRelativeImportExtensions` in `tsconfig.json`. The config key is `importExtension: 'ts'`.
 
 `auto` walks up from the output directory to the nearest `tsconfig.json` and picks the spelling its module resolution requires. Set it explicitly if your build resolves differently.
 
@@ -175,11 +188,14 @@ export default {
 Apply your `defineSchema()` output directly to the database. The fast path for local development.
 
 ```bash
-npx turbine push              # Apply schema changes
-npx turbine push --dry-run    # Preview generated SQL without executing
+npx turbine push                         # Apply schema changes
+npx turbine push --dry-run               # Preview generated SQL without executing
+npx turbine push --dry-run --exit-code   # CI: exit 2 when the database differs, 0 when in sync
 ```
 
 `push` diffs `turbine/schema.ts` against the live database and executes the difference as a single transaction. Safe to re-run: it is a no-op when the schema already matches. For production deploys, use migrations instead.
+
+`push` reports "already in sync" only when the diff has nothing left to say; otherwise it lists what the diff does not compare (see [Migrations in Practice](/migrate#what---auto-can-and-cannot-do)).
 
 `push` runs the same destructive scanner as `migrate up`. If the diff contains a data-destroying statement (`DROP TABLE` / `DROP COLUMN`, a lossy `ALTER COLUMN … TYPE`, and similar), `push` refuses to run, prints an itemized report, and applies nothing. To proceed, confirm interactively (type `destroy my data`, then `yes`) or pass `--allow-destructive`:
 
@@ -202,7 +218,9 @@ npx turbine migrate create add_email_index --auto
 npx turbine migrate create sync_schema --from-diff
 ```
 
-Writes `turbine/migrations/<timestamp>_<name>.sql` with `-- UP` and `-- DOWN` sections. Auto mode populates both sections from the schema diff. Blank mode gives you empty sections to fill in.
+Writes `turbine/migrations/<timestamp>_<name>.sql` with `-- UP` and `-- DOWN` sections; the timestamp is UTC. Auto mode populates both sections from the schema diff. Blank mode gives you empty sections to fill in.
+
+`--auto` and `--from-diff` refuse while migrations in the folder are pending, because the diff reads the live database and would repeat what those files do. Apply them first, or pass `--allow-pending` when they do not touch what the schema file describes.
 
 ### `--from-diff`
 
@@ -244,7 +262,7 @@ Checks for checksum mismatches before applying: if a previously-applied migratio
 
 ### Destructive-migration guard
 
-`migrate up` and `migrate down` scan the SQL they are about to run for statements that destroy data (`DROP TABLE`, `DROP SCHEMA`, `DROP COLUMN`, `TRUNCATE`, `DELETE FROM`, `UPDATE` without a `WHERE`, `ALTER COLUMN … TYPE`). Comments and string literals are ignored; structure-only drops (`DROP INDEX`, `DROP CONSTRAINT`, `DROP TRIGGER`) are not flagged.
+`migrate up` and `migrate down` scan the SQL they are about to run for statements that destroy data (`DROP TABLE`, `DROP SCHEMA`, `DROP COLUMN`, `DROP VIEW ... CASCADE`, `TRUNCATE`, `DELETE FROM`, an `UPDATE` without a `WHERE` or with one that is always true such as `WHERE 1=1`, `ON CONFLICT DO UPDATE` without a `WHERE`, `lo_unlink`, the same shapes inside a `PREPARE ... AS` body, and `ALTER COLUMN … TYPE`). A lossless widening carrying a matching `-- turbine:widening` marker is not flagged. Comments and string literals are ignored; structure-only drops (`DROP INDEX`, `DROP CONSTRAINT`, `DROP TRIGGER`) are not flagged.
 
 On a hit, Turbine refuses to run anything and prints an itemized report. To proceed, confirm interactively (type the literal phrase `destroy my data`, then `yes`) or pass `--allow-destructive` (required in CI and other non-interactive shells). Programmatic callers of `migrateUp`/`migrateDown` opt in with `allowDestructive: true`.
 
@@ -255,7 +273,11 @@ Apply pending migrations non-interactively, the command for CI/CD and production
 ```bash
 npx turbine migrate deploy
 npx turbine migrate deploy --dry-run   # list pending migrations without applying
+npx turbine migrate deploy --wait      # wait up to 300 s for a concurrent deploy's lock
+npx turbine migrate deploy --wait=120  # ... or up to 120 s
 ```
+
+Without `--wait`, a deploy that finds the advisory lock held by another run fails (exit 1). With it, the deploy waits for the lock, then applies whatever is still pending, which is usually nothing.
 
 `deploy` uses the same advisory-lock and per-migration-transaction machinery as `migrate up`. It applies files as written: the destructive guard runs when you author a migration, not at deploy time. Before applying anything destructive, it prints a one-line NOTICE listing the statements, then proceeds.
 
@@ -276,7 +298,7 @@ npx turbine migrate down            # roll back the last migration
 npx turbine migrate down --step 2   # roll back the last 2 migrations
 ```
 
-Pass `--step N` (or `-n N`) to roll back the last `N` applied migrations. A `-- DOWN` that drops a column is destructive and hits the same [destructive gate](#destructive-migration-guard) as `migrate up`.
+Pass `--step N` (or `-n N`) to roll back the last `N` applied migrations. A `-- DOWN` that drops a column is destructive and hits the same [destructive gate](#destructive-migration-guard) as `migrate up`. A `-- DOWN` that ran no SQL (only comments, such as an `IRREVERSIBLE` note) is reported with a warning.
 
 ## `turbine migrate status`
 
@@ -284,6 +306,7 @@ Show which migrations have been applied and which are pending.
 
 ```bash
 npx turbine migrate status
+npx turbine migrate status --exit-code   # CI: exit 2 on pending, modified or missing migrations
 ```
 
 Example output:

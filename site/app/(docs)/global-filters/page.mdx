@@ -16,7 +16,7 @@ Global filters are configured once on the client and are `AND`-merged into the c
 
 ## Configuration
 
-Pass `globalFilters` to the client, keyed by table accessor (`db.<table>`). Each value is a `WhereClause`, or a function that returns one:
+Pass `globalFilters` to the client, keyed by table accessor (`db.blogPosts`) or by table name (`blog_posts`); both spellings apply. Each value is a `WhereClause`, or a function that returns one:
 
 ```ts
 import { turbine } from './generated/turbine/index.js';
@@ -35,6 +35,15 @@ const db = turbine({
 ```
 
 With this in place, `db.posts.findMany()` compiles to `... WHERE "deleted_at" IS NULL`, no `where` needed.
+
+The map is checked when the client is constructed, because a filter that silently applies to nothing returns the very rows it was meant to hide. Each of these throws `ValidationError` ([`TURBINE_E003`](/errors#e003)) from the constructor, naming the bad key and the closest valid one:
+
+- a key that names no table (a typo, or a table that was renamed);
+- two keys for one table (`blogPosts` and `blog_posts`); combine them with `AND: [...]`;
+- a static filter whose keys name no column or relation of that table;
+- a value that is neither a where object nor a function, including `undefined`.
+
+A static `null` is accepted and means "no filter for this table".
 
 ```ts
 const posts = await db.posts.findMany();
@@ -59,6 +68,18 @@ const db = turbine({
 // Later, inside a request handler where getCurrentTenantId() returns 't-42':
 const orders = await db.orders.findMany();
 // SELECT ... FROM "orders" WHERE "tenant_id" = $1   -- params: ['t-42']
+```
+
+A function filter fails closed. If it returns `undefined`, or a filter holding `undefined` at any depth (`{ tenantId: undefined }` when the request carries no tenant), the query throws `ValidationError` (`TURBINE_E003`) instead of running unfiltered. Return `null` or `{}` to apply no filter on purpose:
+
+```ts
+globalFilters: {
+  // Throws when no tenant is set, rather than reading every tenant's orders.
+  orders: () => ({ tenantId: getCurrentTenantId() }),
+
+  // An admin context opts out explicitly.
+  invoices: () => (isAdmin() ? null : { tenantId: getCurrentTenantId() }),
+},
 ```
 
 The filter's **shape** participates in the SQL cache, and its **values** are re-collected on every build, so two requests with different tenant ids reuse the same cached SQL but bind their own parameters. A filter that changes shape (say, `{ deletedAt: null }` one call and `{ tenantId: 't' }` the next) never collides on a single cache entry.
@@ -121,6 +142,8 @@ const some = await db.users.findMany({
   skipGlobalFilters: [UNSAFE, 'posts'],
 });
 ```
+
+{/* TODO(v090): client lane (B6): document whether the array form accepts table names as well as accessors, and whether an unknown name throws, once it lands. */}
 
 `skipGlobalFilters: true` and `skipGlobalFilters: ['posts']` throw a `ValidationError` ([`TURBINE_E003`](/errors)). See [Privilege options](#privilege-options-and-the-unsafe-symbol) below for why, and for the upgrade path if you are passing `true` today.
 

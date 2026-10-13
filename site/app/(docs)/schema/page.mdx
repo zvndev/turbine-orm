@@ -178,11 +178,11 @@ users: {
 }
 ```
 
-A PII column is **excluded from every default projection**. It comes back in two ways: name it explicitly in `select`, or pass `includePii: UNSAFE`, a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol) unlocked only by the imported symbol (a literal `true` throws `TURBINE_E003`). See [includePii on reads](/queries#pii-fields-includepii).
+A PII column is **excluded from every default projection**. It comes back only with `includePii: UNSAFE`, a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol) unlocked only by the imported symbol (a literal `true` throws `TURBINE_E003`). Naming a PII column in `select` without it throws `ValidationError` (`TURBINE_E003`); with it, `select` narrows the row as usual. See [includePii on reads](/queries#pii-fields-includepii).
 
 The rest of the policy:
 
-- **Writes are unaffected.** You can write PII fields freely. The returned row applies the same read policy: the value is persisted, just absent from the returned object unless you re-read with an opt-in.
+- **Writes are unaffected.** You can write PII fields freely. The returned row never carries them: the value is persisted, just absent from the returned object, and a write's `select` that names a PII column throws. Re-read with `includePii: UNSAFE` when you need it back.
 - **`where`, `orderBy`, and `having` are always allowed.** They narrow, sort, or filter rows and return no PII value.
 - **Two aggregate shapes are gated** behind the same `includePii: UNSAFE`, because they return stored values: a PII column as a `groupBy` `by` key (including a JSON-path key), and `_min` / `_max` over a PII column in `groupBy` or `aggregate` (including JSON-path targets). Without the opt-in they throw `ValidationError` (`TURBINE_E003`).
 - **`_count`, `_sum`, and `_avg` stay allowed.** None of them hands back a stored cell.
@@ -190,6 +190,18 @@ The rest of the policy:
 **Tag sensitive data, not keys.** A PII-tagged column that is part of the primary key is returned anyway, on every read and write path, because a row that comes back without part of its own key is unaddressable: feeding it into an `update` builds a partial predicate that matches more rows than intended. If a key column is genuinely sensitive, use a surrogate key, not a tag.
 
 The tag flows through the stack: [`turbine studio`](/studio) redacts PII cells by default (reveal with `--show-pii`), and `turbine generate` marks each PII field optional in the emitted entity type, since it is absent by default. Studio and the [MCP server](/mcp) introspect the live database, which carries no tags, so they read them from the generated metadata in your `out` directory: run `turbine generate` after tagging, or they have nothing to redact. Introspection never auto-tags a column; `pii` is a code-first declaration you make in `defineSchema`.
+
+{/* TODO(v090): types and codegen lane (B3): confirm the wording of the generated PII field (optional, and how the type comment describes the opt-in). */}
+
+#### How `generate` picks up the tags
+
+`turbine generate` introspects the database, and the database has no column for `pii` or `updatedAt`. So `generate` also reads your schema file (`--schema-file`, or `schemaFile` in `turbine.config.ts`, default `turbine/schema.ts`) and overlays its `pii`, `updatedAt` and `maxLength` tags onto what it introspected, printing a line such as `Applied column tags from turbine/schema.ts: 2 pii, 1 updatedAt`. Before 0.90 it did not, so a generated client returned tagged columns by default and never stamped `updatedAt`. Regenerate after upgrading.
+
+The overlay fails rather than generating an unprotected client:
+
+- A schema file you named that is missing, or any schema file that cannot be loaded, fails the command. Only a missing file at the default path is skipped, which is a database-first project with no schema file.
+- A `pii` or `updatedAt` tag on a table or column the database does not have fails the command, listing every such name with the closest match. Run `turbine push` first, or fix the name. A table you left out with `exclude` is not an error.
+- A `.ts` schema file needs a TypeScript loader, as `turbine push` does; install `tsx` as a dev dependency.
 
 ### Auto-updated timestamps, `updatedAt`
 
@@ -211,7 +223,7 @@ await db.posts.update({ where: { id: 1 }, data: { title: 'new title' } });
 await db.posts.update({ where: { id: 1 }, data: { title: 'x', updatedAt: pinned } });
 ```
 
-The timestamp is generated client-side (as Prisma does), so it flows through the same UTC coercion as any other bound `Date` on every engine. It applies to `update` and `updateMany`, never to `create`, where a column default is the right tool.
+The timestamp is generated client-side (as Prisma does), so it flows through the same UTC coercion as any other bound `Date` on every engine. It applies to `update`, `updateMany` and the update half of `upsert` (whether it runs as one conflict statement or as a lookup followed by an update), never to `create` or an `upsert` that inserts, where a column default is the right tool. An `upsert` with an empty `update` leaves the row it finds untouched, timestamp included.
 
 Like `pii`, this is a code-first declaration and never inferred from a column's name, so an application that already manages its own `updated_at` is not silently changed by an upgrade. A schema with no tagged column emits byte-identical SQL.
 
@@ -383,17 +395,19 @@ Turbine maps Postgres types to TypeScript:
 | Postgres | TypeScript | Notes |
 |---|---|---|
 | `int2`, `int4`, `float4`, `float8` | `number` | Standard numeric types |
-| `int8` / `bigint` | `number` | Values > `Number.MAX_SAFE_INTEGER` are returned as `string` to avoid precision loss |
-| `numeric`, `money` | `string` | Arbitrary precision, kept as string to avoid JS float issues |
+| `int8` / `bigint` | `number` | Values > `Number.MAX_SAFE_INTEGER` are returned as `string` to avoid precision loss. Writes also accept a `string` or `bigint` |
+| `numeric`, `money` | `string` | Arbitrary precision, kept as string to avoid JS float issues. A `numeric` write also accepts a `number` |
 | `text`, `varchar`, `uuid`, `citext` | `string` | |
 | `timestamptz` | `Date` | Carries a zone on the wire, so the instant is unambiguous |
 | `timestamp`, `date` | `Date` | Zone-less. Read as UTC, not as the process's local zone. See [Zone-less columns](#zone-less-columns-timestamp-and-date-read-as-utc) |
 | `time`, `timetz` | `string` on read, `string \| Date` on write | No date part, so never coerced to a `Date` on read. See [Time-of-day columns](#time-of-day-columns-time-and-timetz) |
-| `interval` | `string` | |
+| `interval` | `{ years?, months?, days?, hours?, minutes?, seconds?, milliseconds? }` | The driver's parsed object; a zero field is absent. Writes take the text form (`'1 day 02:00:00'`) |
+| `point`, `circle` | `{ x, y }`, `{ x, y, radius }` | Parsed by the driver; writes take the text form. Other geometric types stay `string` |
+| `macaddr8`, `bit`, `varbit`, ranges, multiranges | `string` | The text form, `'[1,5)'` for a range |
 | `boolean` | `boolean` | |
 | `json`, `jsonb` | `unknown` | |
 | `bytea` | `Buffer` | |
-| Array types | `T[]` | `_text` → `string[]`. `date[]` and `timestamp[]` follow their scalar forms |
+| Array types | `T[]` | `_text` → `string[]`. `date[]` and `timestamp[]` follow their scalar forms. `bigint[]` is `string[]` (the driver's array parser does not apply the scalar `int8` rule), and `circle[]` is `string[]` |
 
 ### Zone-less columns: `timestamp` and `date` read as UTC
 

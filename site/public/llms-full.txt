@@ -53,7 +53,7 @@ const users = await db.users.findMany({
 ```
 
 - `select` / `omit`, pick or drop columns (one or the other, not both): `select: { id: true, email: true }`.
-- Pagination: `limit`/`take` + `offset`/`skip`, or keyset `cursor` (pass the last row's ordered column values; the cursor row is excluded). `take` and `skip` are Prisma-compatible aliases folded into `limit` and `offset`; passing both spellings of one bound with different values throws E003.
+- Pagination: `limit`/`take` + `offset`/`skip`, or keyset `cursor` (name the last row by a unique key such as `{ id }`; the cursor row is excluded, the page follows `orderBy` completed by the primary key, and a cursor that cannot identify one row throws E003). `take` and `skip` are Prisma-compatible aliases folded into `limit` and `offset`; passing both spellings of one bound with different values throws E003.
 - `distinct: ['userId']`, DISTINCT ON; which row survives per group is governed by `orderBy`.
 - `orderBy`, `{ field: 'asc' | 'desc' }`, or a spec `{ field: { sort: 'desc', nulls: 'last' } }`. Order by a to-many relation's `_count` (`orderBy: { posts: { _count: 'desc' } }`) or a to-one relation's column (`orderBy: { author: { name: 'asc' } }`).
 - `warnOnUnlimited: false` silences the unlimited-query warning per call.
@@ -80,14 +80,14 @@ Compiles the exact statement `findMany(args)` would run and returns the engine p
 
 ## WHERE operators
 
-Equality: bare literal (`{ email: 'a@b.com' }`), `equals`, `not` (also `not: null` for IS NOT NULL).
+Equality: bare literal (`{ email: 'a@b.com' }`), `equals`, `not` (also `not: null` for IS NOT NULL, and `not: { contains: 'x' }` to negate any operator object). An operand that does not fit its operator or column (an object for `equals` on a scalar, an array where `in` is meant, `null` for `gt`) throws E003. A key whose value is `undefined` is omitted; `findFirst` throws E003 when that empties its `where`.
 Sets: `in`, `notIn`.
 Comparison: `gt`, `gte`, `lt`, `lte`.
 String: `contains`, `startsWith`, `endsWith`, and `mode: 'insensitive'` (switches to ILIKE). Wildcards in input are escaped.
 Array columns: `has`, `hasEvery`, `hasSome`.
 Full-text: `search` (with optional `config`, default 'english').
-JSON (`json`/`jsonb`): `path` (drill into keys), `equals`, `contains` (containment @>), `hasKey`, and `gt`/`gte`/`lt`/`lte` (require `path`).
-Column-to-column: `{ col: 'otherField' }` inside `equals`/`not`/`gt`/`gte`/`lt`/`lte`.
+JSON (`json`/`jsonb`): `path` (drill into keys), `equals`, `contains` (containment @>), `hasKey`, and `gt`/`gte`/`lt`/`lte` (require `path`). Pathless `equals` compares the whole document (PostgreSQL, MySQL; E017 on SQLite and SQL Server); path `equals` compares JSON values, so `equals: null` matches a JSON null, not the string "null". Use `contains` for containment.
+Column-to-column: `col('otherField')` (imported from `turbine-orm`) inside `equals`/`not`/`gt`/`gte`/`lt`/`lte`. A plain `{ col: 'x' }` object throws E003.
 Relation filters: `some`, `every`, `none` (any operator composes inside them).
 Combinators: `AND`, `OR`, `NOT`.
 
@@ -125,7 +125,7 @@ Nested writes: relation fields in `create`/`update` `data` support `create`, `co
 Three query options remove a safety boundary rather than change a result:
 
 - `skipGlobalFilters`, drops the configured tenant / soft-delete predicate for that call.
-- `includePii`, returns columns tagged `pii: true` in `defineSchema`, which are otherwise excluded from every default projection at the SQL level (and refused as a `groupBy` key or a `_min`/`_max` target).
+- `includePii`, returns columns tagged `pii: true` in `defineSchema`, which are otherwise excluded from every default projection at the SQL level (and refused as a `groupBy` key or a `_min`/`_max` target). Naming a PII column in `select` without it throws E003, and a write never returns one.
 - `allowFullTableScan`, drops the empty-`where` guard on `update`/`delete`/`updateMany`/`deleteMany`.
 
 Each is enabled by ONE value, a symbol exported from the package. This is the whole API; there is no boolean form.
@@ -153,7 +153,7 @@ await db.$transaction(async (tx) => {
   await tx.posts.create({ data: { userId: user.id, /* ... */ } });
 }, { isolationLevel: 'Serializable', timeout: 5000 });
 ```
-`tx` has the same typed accessors as `db`. Nested `$transaction` calls become SAVEPOINTs. Isolation levels: `ReadCommitted`, `RepeatableRead`, `Serializable`.
+`tx` has the same typed accessors as `db`. Nested `$transaction` calls become SAVEPOINTs. Isolation levels: `ReadCommitted`, `RepeatableRead`, `Serializable`. Every query on `tx` must finish inside the callback (a `tx` used after it settles throws E003). Catching a failed statement does not save the transaction: PostgreSQL rolls it back at COMMIT and `$transaction` rejects; wrap a statement that may fail in a nested `tx.$transaction` to recover. The array form `$transaction([...builds], options)` takes deferred `build*()` queries, never promises.
 
 Pipeline, N independent queries in one round-trip via the Postgres extended-query pipeline protocol:
 ```ts
@@ -206,7 +206,7 @@ catch (err) {
 
 ## Migrations
 
-SQL-first migration files (timestamp-prefixed, `-- UP` / `-- DOWN` sections) tracked in `_turbine_migrations` with SHA-256 checksums and a `pg_try_advisory_lock()`. Each runs in its own transaction; modified files are detected by checksum. Destructive statements need a typed confirmation or `--allow-destructive`. For fast local iteration use `turbine push` (applies `defineSchema` directly); prefer SQL migrations for production.
+SQL-first migration files (UTC timestamp-prefixed, `-- UP` / `-- DOWN` sections) tracked in `_turbine_migrations` with SHA-256 checksums and a `pg_try_advisory_lock()`. Each runs in its own transaction; modified files are detected by checksum. Destructive statements need a typed confirmation or `--allow-destructive`. For fast local iteration use `turbine push` (applies `defineSchema` directly); prefer SQL migrations for production. In CI, `push --dry-run --exit-code` and `migrate status --exit-code` exit 2 on drift, and `migrate deploy --wait` waits for a concurrent deploy's lock.
 
 ## Engines
 

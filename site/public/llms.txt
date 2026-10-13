@@ -48,6 +48,7 @@ Common mistakes to avoid when generating Turbine code:
 - [Zod Schemas](https://turbineorm.dev/zod): Generating Zod validators from the introspected schema.
 - [Read Replicas](https://turbineorm.dev/read-replicas): Round-robin read routing and the $primary() escape hatch.
 - [Typed Errors](https://turbineorm.dev/errors): Every error code (E001-E018) and the retry patterns.
+- [Upgrading to 0.90](https://turbineorm.dev/upgrading-to-0-90): Every breaking change in 0.90, results that change without an error first, with before/after code and how to find affected call sites.
 - [CLI](https://turbineorm.dev/cli): init, generate/pull, push, migrate, seed, doctor, studio, mcp, observe.
 - [CLI Config Module](https://turbineorm.dev/cli-module): The importable turbine-orm/cli subpath: TurbineCliConfig, config discovery and loading, resolveConfig precedence, seed-file resolution.
 - [Database Engines](https://turbineorm.dev/engines): SQLite, MySQL, SQL Server, and PowDB behind the same typed API, and which features stay Postgres-only.

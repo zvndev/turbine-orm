@@ -19,8 +19,8 @@ Every error also carries `readonly docsUrl` (e.g. `https://turbineorm.dev/errors
 |---|---|---|
 | <a id="e001" /> `TURBINE_E001` | `NotFoundError` | `findUniqueOrThrow`, `findFirstOrThrow`, update/delete against a non-matching row |
 | <a id="e002" /> `TURBINE_E002` | `TimeoutError` | Query or transaction exceeds its configured timeout |
-| <a id="e003" /> `TURBINE_E003` | `ValidationError` | Unknown column, invalid operator, empty-where guard on update/delete, PII aggregate without `includePii`, a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol) passed a plain `true` instead of the `UNSAFE` symbol, a `createMany` whose first data row names no column while a later row does |
-| <a id="e004" /> `TURBINE_E004` | `ConnectionError` | A connection could not be opened, or an open one was closed by the server (restart, failover, idle timeout, compute suspend). See [lost connections](/transactions#lost-connections) for what Turbine retries |
+| <a id="e003" /> `TURBINE_E003` | `ValidationError` | Unknown column, invalid operator, empty-where guard on update/delete, PII aggregate without `includePii`, a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol) passed a plain `true` instead of the `UNSAFE` symbol, a `createMany` whose first data row names no column while a later row does. Since 0.90 also: an operand that does not fit its operator or column, a plain `{ col }` object where `col()` is needed, a PII column in `select` without `includePii: UNSAFE`, a `globalFilters` key or filter that names nothing, or a function filter that returns `undefined`, a query on a `tx` whose transaction has settled, a `$transaction` PostgreSQL rolled back instead of committing, and a `cursor` that cannot place its page |
+| <a id="e004" /> `TURBINE_E004` | `ConnectionError` | A connection could not be opened, or an open one was closed by the server (restart, failover, idle timeout, compute suspend), or none came free within `connectionTimeoutMs` (the message names the pool size), or the client was built with no database to connect to (raised by the first query). See [lost connections](/transactions#lost-connections) for what Turbine retries |
 | <a id="e005" /> `TURBINE_E005` | `RelationError` | Unknown relation name in a `with` clause |
 | <a id="e006" /> `TURBINE_E006` | `MigrationError` | Checksum mismatch, migration-lock contention, or a failure while applying a migration |
 | <a id="e007" /> `TURBINE_E007` | `CircularRelationError` | Relation nesting depth exceeds 10 |
@@ -29,7 +29,7 @@ Every error also carries `readonly docsUrl` (e.g. `https://turbineorm.dev/errors
 | <a id="e010" /> `TURBINE_E010` | `NotNullViolationError` | pg 23502, translated via `wrapPgError()` |
 | <a id="e011" /> `TURBINE_E011` | `CheckConstraintError` | pg 23514, translated via `wrapPgError()` |
 | <a id="e012" /> `TURBINE_E012` | `DeadlockError` | pg 40P01, **retryable**, exposes `isRetryable: true` |
-| <a id="e013" /> `TURBINE_E013` | `SerializationFailureError` | pg 40001, **retryable**, exposes `isRetryable: true` |
+| <a id="e013" /> `TURBINE_E013` | `SerializationFailureError` | pg 40001, **retryable**, exposes `isRetryable: true`. Also SQLite `SQLITE_BUSY` / `SQLITE_LOCKED`, and a SQLite caller that waited `busyTimeoutMs` for another caller's open transaction. A `$transaction` whose first failure was a serialization conflict keeps this class when its `COMMIT` is rolled back |
 | <a id="e014" /> `TURBINE_E014` | `PipelineError` | Non-transactional pipeline has partial failures |
 | <a id="e015" /> `TURBINE_E015` | `OptimisticLockError` | Version mismatch on an `optimisticLock` update, the row was modified by another transaction |
 | <a id="e016" /> `TURBINE_E016` | `ExclusionConstraintError` | pg 23P01, translated via `wrapPgError()` |

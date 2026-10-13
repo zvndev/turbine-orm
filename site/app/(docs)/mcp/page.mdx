@@ -35,7 +35,7 @@ Eleven tools. The first seven answer "what is here"; the last four exist because
 
 **Can:** learn the relation names a `with` clause accepts (`relation_graph`), get the query from `orders` to `organizations` written for it (`find_join_path`), check a table's size before writing a query that would scan it (`table_stats`), verify a plan (`explain_query`), and look at real rows (`sample_rows`).
 
-**Cannot:** write anything (every access is inside `BEGIN READ ONLY`), run arbitrary SQL (no tool accepts SQL text), or read PII. `sample_rows` never fetches PII-tagged or secret-named columns and lists exactly what was hidden. `explain_query` refuses a `where` or `orderBy` on such a column, because a planner row estimate can leak whether a value exists. Column *names* are returned everywhere, since a name is schema shape, not data.
+**Cannot:** write anything (every access is inside `BEGIN READ ONLY`), run arbitrary SQL (no tool accepts SQL text), or read PII. `sample_rows` never fetches PII-tagged or secret-named columns and lists exactly what was hidden. `explain_query` refuses a `where` or `orderBy` on such a column, because a planner row estimate can leak whether a value exists. Column *names* are returned everywhere, since a name is schema shape, not data. A column counts as secret-named when one of its words is a secret word, with names split on underscores, dashes and case changes alike, so `api_key`, `apiKey`, `api-key` and `PasswordHash` are all caught.
 
 PII tags are a code-first declaration (introspection never infers one), so the server reads them from the generated metadata in your `out` directory. With no generated metadata there is nothing to redact, and the server says so rather than implying protection it cannot apply.
 

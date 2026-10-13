@@ -138,7 +138,7 @@ await db.$transaction(async (tx) => {
 });
 ```
 
-Nested `$transaction` calls become SAVEPOINTs. Isolation levels, timeouts, and `sessionContext` (transaction-local GUCs for Postgres RLS) are options. `tx` deliberately exposes a smaller surface than `db`; reaching for a client-only member is a compile error, not a production surprise. Reference: [turbineorm.dev/transactions](https://turbineorm.dev/transactions).
+Nested `$transaction` calls become SAVEPOINTs. Isolation levels, timeouts, and `sessionContext` (transaction-local GUCs for Postgres RLS) are options. A transaction PostgreSQL rolled back (a statement failed and the callback caught it) rejects instead of reporting a commit, and a `tx` used after its callback settles throws rather than running outside the transaction. `tx` deliberately exposes a smaller surface than `db`; reaching for a client-only member is a compile error, not a production surprise. Reference: [turbineorm.dev/transactions](https://turbineorm.dev/transactions).
 
 ### Pipelining, at the protocol level
 
@@ -191,7 +191,7 @@ const db = turbine({
 });
 ```
 
-A global filter is a `WhereClause` that is AND-merged into every query on a table: reads, relation subqueries targeting it, and the predicates of `update` / `delete` / `upsert`. Values are parameterized. Details: [turbineorm.dev/global-filters](https://turbineorm.dev/global-filters).
+A global filter is a `WhereClause` that is AND-merged into every query on a table: reads, relation subqueries targeting it, and the predicates of `update` / `delete` / `upsert`. Values are parameterized. Keys may be table names or client accessors and are checked when the client is built, and a function filter that returns `undefined` throws instead of running unfiltered. Details: [turbineorm.dev/global-filters](https://turbineorm.dev/global-filters).
 
 ### The UNSAFE symbol
 
@@ -254,7 +254,7 @@ The rest of the agent story is structural: query args are fully typed, so a wron
 
 **Destructive migrations need consent.** `migrate up`, `migrate down`, and `push` scan for `DROP TABLE`, `DROP COLUMN`, `TRUNCATE`, unqualified `DELETE` / `UPDATE`, and `ALTER COLUMN ... TYPE`, print an itemized report, and refuse. Interactively you type `destroy my data`, then `yes`; in CI you pass `--allow-destructive`. A refused batch applies nothing. Migrations are SQL files, checksummed with SHA-256, applied under `pg_try_advisory_lock()`.
 
-**PII stays in the database.** Tag a column `pii: true` in the schema and it is excluded from every default projection at the SQL level: `RETURNING "id", "name"` instead of `RETURNING *`. It is also refused as a `groupBy` key and a `_min` / `_max` target. Reading it back takes `includePii: UNSAFE`, per query. A schema with no tagged column emits byte-identical SQL.
+**PII stays in the database.** Tag a column `pii: true` in the schema and it is excluded from every default projection at the SQL level: `RETURNING "id", "name"` instead of `RETURNING *`. It is also refused as a `groupBy` key and a `_min` / `_max` target. Reading it back takes `includePii: UNSAFE`, per query, and naming it in `select` without that throws. A schema with no tagged column emits byte-identical SQL.
 
 **Studio is read-only by default.** `npx turbine studio` binds loopback, authenticates with a per-process token, runs every read inside `BEGIN READ ONLY`, and has no raw-SQL surface: queries are composed in a builder validated identifier by identifier. Without `--write`, the write endpoints do not exist in the router. PII cells are redacted server-side. Try it with no database: `npx turbine-orm@latest studio --demo` boots a seeded in-memory sample. Docs: [turbineorm.dev/studio](https://turbineorm.dev/studio).
 
@@ -388,13 +388,14 @@ Stated so you do not find out three weeks in:
 | Postgres | TypeScript | Notes |
 |---|---|---|
 | `int2`, `int4`, `float4`, `float8` | `number` | |
-| `int8` / `bigint` | `number` | Values above `Number.MAX_SAFE_INTEGER` come back as `string` to avoid precision loss |
+| `int8` / `bigint` | `number` | Values above `Number.MAX_SAFE_INTEGER` come back as `string` to avoid precision loss; `bigint[]` reads as `string[]` |
 | `numeric`, `money` | `string` | Arbitrary precision, kept exact |
 | `text`, `varchar`, `uuid`, `citext` | `string` | |
 | `timestamptz`, `timestamp`, `date` | `Date` | Zone-less columns read and write as UTC by default (`utcTimestamps`); the full temporal semantics, including `temporalInfinity`, are at [turbineorm.dev/schema](https://turbineorm.dev/schema#zone-less-columns-timestamp-and-date-read-as-utc) |
 | `boolean` | `boolean` | |
 | `json`, `jsonb` | `unknown` | |
 | `bytea` | `Buffer` | |
+| `interval`, `point`, `circle` | object | The driver's parsed form, for example `{ x, y }` for a point |
 | Array types | `T[]` | |
 
 ## Examples

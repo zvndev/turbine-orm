@@ -48,7 +48,7 @@ await db.organizations.createMany({
 await db.disconnect();
 ```
 
-Either file runs the same way: `npx turbine seed`.
+Either file runs the same way: `npx turbine seed`. A TypeScript seed that does not call `defineSeed`, like the second one, runs to completion and exits `0` with a notice that Turbine cannot confirm what it wrote. Before 0.90 it failed the command.
 
 ## JavaScript and SQL seeds
 

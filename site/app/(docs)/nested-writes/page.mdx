@@ -31,13 +31,13 @@ The examples below assume this shape:
 | `connectOrCreate` | create + update | belongsTo / hasOne / hasMany | Connect the row matching `where`, else create it |
 | `disconnect` | update only | all, incl. manyToMany | Unlink: null the FK, or drop the junction row |
 | `set` | update only | hasOne / hasMany / manyToMany | Replace the whole set: unlink current, link listed |
-| `delete` | update only | belongsTo / hasOne / hasMany | Delete the related row(s) matching `where` |
+| `delete` | update only | belongsTo / hasOne / hasMany | Delete the related row(s) matching `where`; for belongsTo, clear the FK and delete the row it pointed at |
 | `update` | update only | belongsTo / hasOne / hasMany | Update the related row(s) (`where` is optional for belongsTo) |
 | `upsert` | update only | belongsTo / hasOne / hasMany | Update the row matching `where`, else create it |
 
 `create`, `connect`, and `connectOrCreate` are valid in both `create()` and `update()`. The other five are **update-only**: using them inside `create()` throws `ValidationError` ([E003](/errors)). An unknown operation name throws too.
 
-Many-to-many relations support `connect`, `disconnect`, and `set` only; the full rules are in [Many-to-many relations](#many-to-many-relations) below.
+Many-to-many relations support `connect`, `disconnect`, and `set` only; the full rules are in [Many-to-many relations](#many-to-many-relations) below. A `belongsTo` relation is a single row, so it takes no `set` and at most one pointer operation per write; see [belongsTo is one row](#belongsto-is-one-row).
 
 ## Create context
 
@@ -238,10 +238,38 @@ For a `belongsTo` relation, `disconnect` nulls the FK on the parent row instead 
 await db.users.update({
   where: { id: 1 },
   data: {
-    organization: { disconnect: {} }, // users.org_id = NULL
+    organization: { disconnect: true }, // users.org_id = NULL; `{}` means the same
   },
 });
 ```
+
+### belongsTo is one row
+
+A `belongsTo` relation is the single row the record points at, so it follows Prisma's to-one rules:
+
+- **`disconnect: true`** (or `{}`) clears the foreign key. An object with fields, `{ disconnect: { id: 3 } }`, additionally requires the connected row to match it.
+- **`delete: true`** clears the foreign key and then deletes the row it pointed at. If any other row still points at that row, the foreign-key violation ([E009](/errors#e009)) rolls the whole write back.
+- Both need a **nullable** foreign key. With a `NOT NULL` one the record cannot point at nothing, so they throw `ValidationError` ([E003](/errors#e003)); connect it to a different row instead.
+- **`connectOrCreate`** works in `update()` as it does in `create()`: it points the record at the matching row, or at a newly created one.
+- **One pointer operation per write.** `create`, `connect`, `connectOrCreate`, `disconnect` and `delete` each decide what the record points at, so combining two of them throws `ValidationError`. Split the write in two if both are intended. `update` and `upsert` modify the connected row and can sit beside them.
+- **One item.** Each operation takes one object. A one-element array is accepted; an empty or longer one throws, rather than silently using the first item.
+- **No `set`.** It replaces a to-many list; use `connect` or `disconnect`.
+
+```ts
+await db.users.update({
+  where: { id: 1 },
+  data: {
+    organization: {
+      connectOrCreate: {
+        where: { slug: 'acme' },
+        create: { slug: 'acme', name: 'Acme' },
+      },
+    },
+  },
+});
+```
+
+When nothing is connected (the foreign key is already `NULL`), `disconnect: true` is a no-op, since what it asks for already holds. `delete: true`, or a `disconnect` naming fields, throws `NotFoundError` ([E001](/errors#e001)) saying nothing is connected. An operation whose value is `undefined` (`connect: orgId ? { id: orgId } : undefined`) is treated as absent, like any other `undefined` key.
 
 ### set, replace the whole collection
 
@@ -396,8 +424,8 @@ Since 0.50 the [prisma-compat](/migrate-from-prisma) client exposes the same jun
 - **Atomic.** Every statement runs inside a single transaction. A failure anywhere rolls the whole tree back.
 - **Ordered correctly.** `belongsTo` targets are resolved before the parent insert (so `NOT NULL` FKs hold); `hasMany`/`hasOne` children are written after the parent exists.
 - **Depth-capped at 10.** Deeper trees throw `CircularRelationError` ([E007](/errors)) with the full relation path.
-- **Validated.** Update-only ops in `create()`, unknown op names, non-nullable `disconnect`, missing `connect` targets, and the unsupported many-to-many ops (`create`, `connectOrCreate`, `update`, `upsert`, `delete`) all throw `ValidationError` ([E003](/errors)) before anything commits. An unsupported many-to-many op is refused *before* the parent row is written, so a refused create leaves nothing behind.
-- **Scoped to the parent.** `delete` / `update` / `disconnect` / `upsert` can only touch rows that actually belong to the parent being written: the relation correlation is ANDed onto your `where`, and a target outside the relation reports `NotFoundError` ([E001](/errors)) instead of modifying a row owned by someone else. A selector that binds nothing (`{}`, or a field that is `undefined`) is refused rather than widened to the whole relation.
+- **Validated.** Update-only ops in `create()`, unknown op names, non-nullable `disconnect`, missing `connect` targets, two pointer operations or a multi-item array on one `belongsTo`, and the unsupported many-to-many ops (`create`, `connectOrCreate`, `update`, `upsert`, `delete`) all throw `ValidationError` ([E003](/errors)) before anything commits. An unsupported many-to-many op is refused *before* the parent row is written, so a refused create leaves nothing behind.
+- **Scoped to the parent.** `delete` / `update` / `disconnect` / `upsert` can only touch rows that actually belong to the parent being written: the relation correlation is ANDed onto your `where`, and a target outside the relation reports `NotFoundError` ([E001](/errors)) instead of modifying a row owned by someone else. A selector that binds nothing (`{}`, or a field that is `undefined`) is refused rather than widened to the whole relation. The one exception is `{}` on a `belongsTo` `disconnect` or `delete`, which names the single connected row.
 - **Read back.** The return value is the parent row with the touched relations loaded via Turbine's `json_agg` machinery.
 
 ## See also

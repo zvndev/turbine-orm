@@ -33,7 +33,56 @@ const result = await db.$transaction(async (tx) => {
 // result is the User returned by the callback
 ```
 
-The `tx` client has the same surface as `db`, every table accessor, every method. Queries *must* use `tx`, not `db`, or they'll run on a different connection outside the transaction.
+The `tx` client has the same table accessors as `db` (the [reference](#transactionclient-reference) below lists what else it has). Queries *must* use `tx`, not `db`, or they'll run on a different connection outside the transaction.
+
+### Every query finishes inside the callback
+
+Once the callback settles, `tx` is closed. Its connection goes back to the pool and may already be running another request's transaction, so a query issued through `tx` afterwards throws `ValidationError` ([`TURBINE_E003`](/errors#e003)) instead of being sent. The usual causes are a missing `await`, an `async` callback passed to `forEach`, or a `tx` kept in a variable or a timer:
+
+```ts
+await db.$transaction(async (tx) => {
+  // ❌ forEach does not wait: these run after the callback returns, and throw.
+  ids.forEach(async (id) => {
+    await tx.posts.update({ where: { id }, data: { published: true } });
+  });
+
+  // ✅ Awaited, so every update runs inside the transaction.
+  for (const id of ids) {
+    await tx.posts.update({ where: { id }, data: { published: true } });
+  }
+});
+```
+
+{/* TODO(v090): client lane (B6): if work left un-awaited by the callback now rolls the transaction back, say so here. */}
+
+### A caught error still rolls the transaction back
+
+PostgreSQL aborts a transaction at its first failed statement. Catching that error inside the callback does not undo the abort: the `COMMIT` that follows is answered with a `ROLLBACK`, and nothing the transaction wrote is saved. `$transaction` rejects in that case rather than reporting a commit. The error is a `ValidationError` (`TURBINE_E003`) carrying the statement that failed first as `cause`, except when that failure was a deadlock or a serialization conflict, which keep their class (`DeadlockError`, `SerializationFailureError`) so a retry of the whole block still works.
+
+To recover from an expected failure and keep the rest of the work, run the statement that can fail in a [nested `$transaction`](#nested-transactions-real-savepoints), which rolls back only its own savepoint:
+
+```ts
+import { UniqueConstraintError } from 'turbine-orm';
+
+await db.$transaction(async (tx) => {
+  const user = await tx.users.create({ data: { email } });
+
+  try {
+    await tx.$transaction((inner) =>
+      inner.subscriptions.create({ data: { userId: user.id, plan: 'trial' } }),
+    );
+  } catch (err) {
+    if (!(err instanceof UniqueConstraintError)) throw err;
+    // Only the savepoint rolled back; the user row still commits.
+  }
+});
+```
+
+{/* TODO(v090): PM decision: if a rolled-back COMMIT gets its own error class, replace "ValidationError (TURBINE_E003)" above. */}
+
+### Multi-statement writes stay whole
+
+A single call that issues several statements (a nested create or update, a lookup-first `upsert`) runs inside its own savepoint when you call it on `tx`. If it fails part way through, the statements it already ran are rolled back and your transaction carries on as if the call had never started, rather than committing half of it later.
 
 > **Note:** If the opening `BEGIN` itself fails, Turbine does not fire a best-effort `ROLLBACK` afterward: on single-handle engines like embedded PowDB, a stray rollback could tear down an unrelated open transaction. A `BEGIN` that failed because its connection was already closed is sent once more on a fresh connection first, see [Lost connections](#lost-connections).
 
@@ -49,7 +98,9 @@ const [user, postCount] = await db.$transaction([
 // user: User | null, postCount: number, all-or-nothing
 ```
 
-Use the batch form when a fixed set of independent statements must succeed or fail together and you don't need a callback's control flow. An empty array resolves to `[]` without opening a transaction. `$transaction` accepts either form.
+Use the batch form when a fixed set of independent statements must succeed or fail together and you don't need a callback's control flow. It takes the same options object as the callback form (`isolationLevel`, `timeout`, `sessionContext`) as its second argument. An empty array resolves to `[]` without opening a transaction, after validating those options. `$transaction` accepts either form.
+
+Each item must be a deferred query. Passing a promise (`db.users.create(...)` instead of `db.users.buildCreate(...)`, the shape Prisma's array form takes) throws `ValidationError` (`TURBINE_E003`) before anything in the batch runs, because that query already started on its own connection, outside the transaction, the moment it was created.
 
 > **Batch form vs pipeline:** both take `DeferredQuery[]`. The [pipeline](#pipeline-n-queries-1-round-trip) optimizes for latency (one round-trip, **not** atomic); the batch `$transaction` optimizes for atomicity.
 
@@ -111,6 +162,10 @@ await db.$transaction(async (tx) => {
 
 SAVEPOINT names are auto-generated with a counter, so nesting is safe.
 
+Savepoints are a stack on the one connection, so nested blocks that share a parent run one at a time, even when you start them together with `Promise.all`. Without that, rolling back the first block would also discard a second block that opened inside it and had already reported success. A block started from inside another block's callback nests under it and does not wait.
+
+A nested block whose callback swallowed a statement failure rejects with the same rolled-back error described [above](#a-caught-error-still-rolls-the-transaction-back), carrying the failure as `cause`, and the outer transaction stays usable.
+
 ## Multi-tenant queries with RLS session context
 
 Set transaction-local Postgres settings (GUCs) so PostgreSQL Row-Level Security policies that call `current_setting()` filter rows for you: the database enforces the tenant boundary, not your application code.
@@ -126,7 +181,9 @@ const rows = await db.$transaction(
 // Only this tenant's documents come back, the policy did the filtering
 ```
 
-Each entry is applied as `SELECT set_config(name, value, true)` right after `BEGIN`, so the setting is scoped to the transaction and resets automatically on commit or rollback. Values may be strings, numbers, or booleans (numbers and booleans are coerced to strings, since GUCs are text). An invalid setting name throws `ValidationError` and rolls the transaction back *before* any query runs.
+Each entry is applied as `SELECT set_config(name, value, true)` right after `BEGIN`, so the setting is scoped to the transaction and resets automatically on commit or rollback. Values may be strings, numbers, or booleans; numbers and booleans are converted to text, since a setting is text. Any other value, including `undefined` and `null`, throws `ValidationError` (`TURBINE_E003`): a missing tenant id used to reach the policy as the string `"undefined"`. An invalid setting name throws the same error. Both are checked before a connection is taken, so nothing runs.
+
+{/* TODO(v090): client lane (B6): document the rule for setting names without a dot once it lands. */}
 
 ### $withSession shorthand
 
@@ -204,7 +261,9 @@ Pass `{ transactional: false }` when you want each query independent, a failure 
 const results = await db.pipeline(queries, { transactional: false });
 ```
 
-On that path a partial failure rejects with a `PipelineError` (TURBINE_E014) carrying a per-slot `.results` array, so you can see which queries succeeded. The transactional default never produces a `PipelineError`; it rethrows the underlying typed error after the rollback.
+A transactional batch also rolls back when a `transform` rejects its result: a `buildFindUniqueOrThrow` that finds nothing, or an update that loses its `optimisticLock` check. A batch that may write therefore holds its `COMMIT` until every transform has accepted, which costs one extra round trip; a read-only batch still takes one. This matches `$transaction([...])` on the same input.
+
+With `transactional: false`, a partial failure rejects with a `PipelineError` (TURBINE_E014) carrying a per-slot `.results` array, so you can see which queries succeeded. The transactional default never produces a `PipelineError`; it rethrows the underlying typed error after the rollback.
 
 ```ts
 const [user, posts, commentCount, orgs, latestLogin] = await db.pipeline([
@@ -277,6 +336,8 @@ The `tx` handed to your `$transaction` callback is a `TransactionClient`, and it
 
 `tx.rawQuery(text, params)` is marked `@internal` and is **not** application API. It is the seam `turbine-orm/prisma-compat` detects by shape (`typeof tx.rawQuery === 'function'`) so it can run compat raw SQL on the transaction's own connection instead of falling back to a pool connection outside the transaction. It takes the SQL as a plain string, which moves the escaping discipline to the caller, the property `tx.raw` exists to remove. It still exists at runtime and still typechecks, so existing callers keep working; use `tx.raw`.
 
+{/* TODO(v090): client lane (B6): if `tx.sql` lands, move it from the table below into "What `tx` has". */}
+
 ### What `tx` does not have
 
 Reaching for any of these is a **compile error** (`TS2339: Property '<x>' does not exist on type 'TransactionClient'`). `TransactionClient` declares exactly the members above, the table accessors are installed at construction and typed by the generated `TypedTransactionClient` subclass (one property per table), and neither class has an index signature, so nothing below type-checks.
@@ -315,11 +376,15 @@ await db.$transaction(
 
 - **`isolationLevel`**: one of `'ReadUncommitted'`, `'ReadCommitted'`, `'RepeatableRead'`, `'Serializable'`. Composed into the `BEGIN` statement by the active dialect. Under `Serializable` or `RepeatableRead`, expect `SerializationFailureError` (`TURBINE_E013`) and retry the whole block.
 - **`timeout`**: milliseconds. When it fires, the transaction is rolled back and the connection is destroyed rather than returned to the pool, so the in-flight backend query is actually aborted rather than left running. You get a `TimeoutError` (`TURBINE_E002`).
-- **`sessionContext`**: a record of transaction-local Postgres GUCs, applied as `SELECT set_config($1, $2, true)` immediately after `BEGIN` and before your callback. Both the name and the value are bound parameters, and the name is additionally checked against a strict identifier pattern, so a malformed name throws `ValidationError` and rolls back before any query runs. `is_local = true` means the setting resets on `COMMIT` or `ROLLBACK` and never leaks onto the pooled connection. Postgres-only: on an engine whose dialect reports no RLS support it throws `UnsupportedFeatureError` (`TURBINE_E017`). `db.$withSession(context, fn)` is the shorthand.
+- **`sessionContext`**: a record of transaction-local Postgres GUCs, applied as `SELECT set_config($1, $2, true)` immediately after `BEGIN` and before your callback. Both the name and the value are bound parameters. The name is additionally checked against a strict identifier pattern and the value must be a string, number or boolean, so a malformed entry throws `ValidationError` before a connection is taken. `is_local = true` means the setting resets on `COMMIT` or `ROLLBACK` and never leaks onto the pooled connection. Postgres-only: on an engine whose dialect reports no RLS support it throws `UnsupportedFeatureError` (`TURBINE_E017`). `db.$withSession(context, fn)` is the shorthand.
 
 ### The raw transaction API
 
-`db.transaction(fn)` (no `$`) is the older, lower-level form: your callback receives a raw `pg.PoolClient` rather than a `TransactionClient`, with the same `BEGIN` / `COMMIT` / rollback-on-throw handling and no typed table accessors. Prefer `$transaction`; reach for this only when you want to issue hand-written SQL on the transaction's own connection.
+`db.transaction(fn)` (no `$`) is the older, lower-level form: your callback receives a raw `pg.PoolClient` rather than a `TransactionClient`, with the same `BEGIN` / `COMMIT` / rollback-on-throw handling and no typed table accessors. A `COMMIT` that PostgreSQL answers with `ROLLBACK` rejects here too.
+
+Prefer `$transaction`; reach for this only when you want to issue hand-written SQL on the transaction's own connection.
+
+{/* TODO(v090): client lane (B6): document whether the raw client is closed once the callback settles. */}
 
 ## See also
 
