@@ -666,7 +666,7 @@ describe('column spelling symmetry: PowDB (PowQL) answers the same question the 
   it('groupBy returns its group key under the canonical field name, matching the SQL engines', async () => {
     for (const spelling of [CAMEL, SNAKE]) {
       const mock = powqlMock([{ created_at: 0, agg_0: 3 }]);
-      const rows = await mock.qi().groupBy({ by: [spelling] } as never);
+      const rows = (await mock.qi().groupBy({ by: [spelling] } as never)) as object[];
       assert.deepEqual(Object.keys(rows[0] as object).sort(), ['_count', 'createdAt'], `by: ['${spelling}']`);
     }
   });

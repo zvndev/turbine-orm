@@ -9,6 +9,7 @@ import type { PgCompatPool, PgCompatQueryResult } from '../pg-types.js';
 import type { SchemaMetadata } from '../schema.js';
 // Forward-declared to avoid a runtime cycle with builder.ts. Type-only.
 import type { QueryInterface } from './builder.js';
+import type { TableClient } from './table-client.js';
 import type { GlobalFilters, JsonEncoding, RelationLoadStrategy } from './types.js';
 
 /**
@@ -310,8 +311,8 @@ export interface QueryInterfaceOptions {
   /**
    * @internal Factory that builds the per-table query interface. Defaults to
    * `new QueryInterface` (the SQL path). Non-SQL backends (PowDB) supply a
-   * factory returning a structurally-compatible interface that generates their
-   * own query language instead of SQL. The SQL dialects never set this, so their
+   * factory returning a {@link TableClient}, which generates their own query
+   * language instead of SQL. The SQL dialects never set this, so their
    * `table()` behavior is byte-identical.
    */
   queryInterfaceFactory?: (
@@ -320,5 +321,5 @@ export interface QueryInterfaceOptions {
     schema: SchemaMetadata,
     middlewares: MiddlewareFn[],
     options: QueryInterfaceOptions,
-  ) => QueryInterface<object>;
+  ) => TableClient<object>;
 }

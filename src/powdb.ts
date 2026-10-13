@@ -89,7 +89,7 @@ import {
   quotePowqlIdent,
   requireCapability,
 } from './powdb-shared.js';
-import type { QueryInterface, QueryInterfaceOptions } from './query/index.js';
+import type { QueryInterfaceOptions } from './query/index.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
 import { type ColumnMetadata, type IndexMetadata, normalizeKeyColumns, type SchemaMetadata } from './schema.js';
 
@@ -2497,8 +2497,7 @@ export async function turbinePowDB(
     sch,
     middlewares,
     opts,
-  ) =>
-    new PowqlInterface(p as unknown as PowdbPool, table, sch, middlewares, opts) as unknown as QueryInterface<object>;
+  ) => new PowqlInterface(p as unknown as PowdbPool, table, sch, middlewares, opts);
 
   // Forward every client-level option EXCEPT the ones this factory owns (they
   // configure the pool / transport above, and TurbineClient warns on a config

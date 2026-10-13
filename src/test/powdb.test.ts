@@ -3537,7 +3537,7 @@ describe('powdb hook: groupBy result cells go through the same native coercion a
       { gk_0: true, agg_0: 1n },
       { gk_0: null, agg_0: 3n },
     ]);
-    const out = await qi(m, 'doc').groupBy({ by: [{ field: 'data', path: ['k'] }] as never });
+    const out = (await qi(m, 'doc').groupBy({ by: [{ field: 'data', path: ['k'] }] as never })) as { k?: unknown }[];
     assert.equal(out[0]!.k, '7'); // not 7n
     assert.equal(out[1]!.k, 'true');
     assert.equal(out[2]!.k, null);
@@ -3936,7 +3936,7 @@ describe('powdb: per-field _count gate (0.20)', () => {
     // already answered this correctly and the call must keep working. This is
     // the whole install base turbine-orm 0.51.0 shipped against.
     mock.setScalar('4');
-    const notNull = await q.aggregate({ _count: { name: true } } as never);
+    const notNull = (await q.aggregate({ _count: { name: true } } as never)) as { _count: unknown };
     assert.deepEqual(notNull._count, { name: 4 });
     assert.match(mock.last().powql, /^count\(app_user \{ \.name \}\)$/);
     // A mixed request is refused for the nullable member, and refused BEFORE any
@@ -3946,7 +3946,7 @@ describe('powdb: per-field _count gate (0.20)', () => {
       (e: unknown) => e instanceof UnsupportedFeatureError && /nullable column "age"/.test((e as Error).message),
     );
     mock.setScalar('7');
-    const rows = await q.aggregate({ _count: true } as never);
+    const rows = (await q.aggregate({ _count: true } as never)) as { _count: unknown };
     assert.equal(rows._count, 7);
     assert.match(mock.last().powql, /^count\(app_user\)$/);
   });
@@ -3954,7 +3954,7 @@ describe('powdb: per-field _count gate (0.20)', () => {
   it('gates nothing at all on a 0.20 engine', async () => {
     const mock = mockPool(capabilitiesFromVersion('0.20.0'));
     mock.setScalar('4');
-    const res = await qi(mock).aggregate({ _count: { age: true, name: true } } as never);
+    const res = (await qi(mock).aggregate({ _count: { age: true, name: true } } as never)) as { _count: unknown };
     assert.deepEqual(res._count, { age: 4, name: 4 });
   });
 

@@ -113,24 +113,31 @@ import {
 import { warnUnknownQueryOptions } from './query/option-surface.js';
 import { applyStableRelationOrderTo, normalizeWithClause, normalizeWithPagination } from './query/relation-names.js';
 import { piiSelectRefusedMessage } from './query/relations.js';
+import type { TableClient } from './query/table-client.js';
 import type {
   AggregateArgs,
   AggregateResult,
+  AggregateResultOf,
   CountArgs,
   CreateArgs,
   CreateManyArgs,
   DeleteArgs,
   DeleteManyArgs,
+  FieldResult,
   FindManyArgs,
   FindUniqueArgs,
   GroupByArgs,
   GroupByOrderBy,
+  GroupByResult,
   JsonFilter,
   JsonPathAggregateTarget,
   JsonPathGroupKey,
   JsonPathOrderBy,
+  OptionalInput,
   OrderByClause,
   OrderBySpec,
+  QueryResult,
+  TypedWithClause,
   UpdateArgs,
   UpdateManyArgs,
   UpsertArgs,
@@ -455,12 +462,20 @@ function rejectUnsupportedFilter(value: Record<string, unknown>, field: string):
   }
 }
 
+/** The relations type argument of an untyped accessor: none known. */
+// biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matching QueryInterface's default
+type NoRelations = {};
+
 /**
  * The PowQL query interface. Constructed by `turbinePowDB` via the
- * `queryInterfaceFactory` seam and cast to `QueryInterface<object>` so
- * `TurbineClient.table()` can return it transparently.
+ * `queryInterfaceFactory` seam. `implements TableClient` makes a method the SQL
+ * accessor has and this class lacks, or one whose signature differs, a build
+ * error. Where a method's result is narrowed by `select` / `omit` / `with`, a
+ * public overload signature carries the SQL accessor's typing and the
+ * implementation below it is typed on the plain row; both return the same
+ * projected, relation-loaded rows at run time.
  */
-export class PowqlInterface<T extends object = Record<string, unknown>> {
+export class PowqlInterface<T extends object = Record<string, unknown>> implements TableClient<T> {
   private readonly meta: TableMetadata;
   private readonly defaultLimit?: number;
   private readonly warnOnUnlimited: boolean;
@@ -2443,6 +2458,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   // Reads
   // -------------------------------------------------------------------------
 
+  findMany<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args?: FindManyArgs<T, NoRelations, W, S, O>): Promise<QueryResult<T, NoRelations, W, S, O>[]>;
   async findMany(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T[]> {
     this.assertNoForceCustomPlan(args);
     this.assertNoRowLock(args);
@@ -2673,6 +2694,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       .filter((line) => line.length > 0);
   }
 
+  findUnique<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: FindUniqueArgs<T, NoRelations, W, S, O>): Promise<QueryResult<T, NoRelations, W, S, O> | null>;
   async findUnique(args: FindUniqueArgs<T>): Promise<T | null> {
     this.assertNoForceCustomPlan(args);
     this.assertNoRowLock(args);
@@ -2714,6 +2741,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     });
   }
 
+  findFirst<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args?: FindManyArgs<T, NoRelations, W, S, O>): Promise<QueryResult<T, NoRelations, W, S, O> | null>;
   async findFirst(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T | null> {
     args = this.normalizeArgs(args, 'findFirst');
     this.assertNoForceCustomPlan(args);
@@ -2746,12 +2779,24 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     });
   }
 
+  findUniqueOrThrow<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: FindUniqueArgs<T, NoRelations, W, S, O>): Promise<QueryResult<T, NoRelations, W, S, O>>;
   async findUniqueOrThrow(args: FindUniqueArgs<T>): Promise<T> {
     const row = await this.findUnique(args);
     if (!row) throw new NotFoundError({ table: this.table, where: args.where as Record<string, unknown> });
     return row;
   }
 
+  findFirstOrThrow<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args?: FindManyArgs<T, NoRelations, W, S, O>): Promise<QueryResult<T, NoRelations, W, S, O>>;
   async findFirstOrThrow(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T> {
     args = this.normalizeArgs(args, 'findFirstOrThrow');
     const row = await this.findFirst(args);
@@ -4118,6 +4163,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return quotePowqlIdent(this.table);
   }
 
+  create<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: CreateArgs<T, NoRelations, S, O>): Promise<FieldResult<T, S, O>>;
   async create(args: CreateArgs<T>): Promise<T> {
     args = this.normalizeArgs(args);
     return this.withMiddleware('create', args as unknown as Record<string, unknown>, async () => {
@@ -4191,6 +4240,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     }
   }
 
+  createMany<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: CreateManyArgs<T, OptionalInput<T>, S, O>): Promise<FieldResult<T, S, O>[]>;
   async createMany(args: CreateManyArgs<T>): Promise<T[]> {
     args = this.normalizeArgs(args);
     return this.withMiddleware('createMany', args as unknown as Record<string, unknown>, async () => {
@@ -4237,6 +4290,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     });
   }
 
+  update<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: UpdateArgs<T, NoRelations, S, O>): Promise<FieldResult<T, S, O>>;
   async update(args: UpdateArgs<T>): Promise<T> {
     args = this.normalizeArgs(args);
     return this.withMiddleware('update', args as unknown as Record<string, unknown>, async () => {
@@ -4507,6 +4564,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return { schema: this.schema, tx: tx as unknown as NestedWriteContext['tx'] };
   }
 
+  delete<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: DeleteArgs<T, NoRelations, S, O>): Promise<FieldResult<T, S, O>>;
   async delete(args: DeleteArgs<T>): Promise<T> {
     args = this.normalizeArgs(args);
     return this.withMiddleware('delete', args as unknown as Record<string, unknown>, async () => {
@@ -4552,6 +4613,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     });
   }
 
+  upsert<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+  >(args: UpsertArgs<T, NoRelations, S, O>): Promise<FieldResult<T, S, O>>;
   async upsert(args: UpsertArgs<T>): Promise<T> {
     args = this.normalizeArgs(args);
     this.assertNoOptimisticLock(args, 'upsert');
@@ -4757,6 +4822,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return sem !== null && atLeastVersion(sem, 0, 20);
   }
 
+  aggregate<A extends AggregateArgs<T>>(args: A): Promise<AggregateResultOf<T, A>>;
   async aggregate(args: AggregateArgs<T>): Promise<AggregateResult<T>> {
     this.assertNoForceCustomPlan(args);
     this.assertNoPercentile(args);
@@ -4881,6 +4947,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     });
   }
 
+  groupBy<A extends GroupByArgs<T>>(args: A): Promise<GroupByResult<T, A>[]>;
   async groupBy(args: GroupByArgs<T>): Promise<Record<string, unknown>[]> {
     this.assertNoForceCustomPlan(args);
     this.assertNoPercentile(args);
@@ -5348,7 +5415,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   // -------------------------------------------------------------------------
 
   // biome-ignore lint/correctness/useYield: intentionally throws before yielding, PowDB has no server cursor.
-  async *findManyStream(): AsyncGenerator<T> {
+  async *findManyStream(): AsyncGenerator<never, void, undefined> {
     throw new UnsupportedFeatureError(
       'cursor streaming (findManyStream)',
       'PowDB',
@@ -5356,18 +5423,93 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     );
   }
 
-  // The batch-yielding sibling needs its OWN stub. `PowqlInterface` is a
-  // parallel implementation of QueryInterface's surface rather than a subclass,
-  // so a method that exists on one and not the other is not a type error here:
-  // it is `undefined` at runtime, and the caller gets `TypeError: not a
-  // function` instead of the typed E017 that tells them what to do instead.
   // biome-ignore lint/correctness/useYield: intentionally throws before yielding, PowDB has no server cursor.
-  async *findManyStreamBatches(): AsyncGenerator<T[]> {
+  async *findManyStreamBatches(): AsyncGenerator<never, void, undefined> {
     throw new UnsupportedFeatureError(
       'cursor streaming (findManyStreamBatches)',
       'PowDB',
       'PowDB has no server-side cursor; page with findMany({ limit, offset }) instead',
     );
+  }
+
+  // Deferred queries. `db.pipeline()` and `$transaction([...])` take a
+  // prebuilt statement, and a PowDB read is several round trips (relation
+  // filters resolve first, loaders run after), so there is no single statement
+  // to hand over. Each stub throws the typed refusal when called, which is
+  // before the pipeline or transaction starts.
+
+  private deferredUnsupported(method: string): never {
+    throw new UnsupportedFeatureError(
+      `deferred query (${method})`,
+      'PowDB',
+      'db.pipeline() and $transaction([...]) take deferred queries; run the calls inside ' +
+        'db.$transaction(async (tx) => ...) instead',
+    );
+  }
+
+  buildFindMany(_args?: unknown): never {
+    return this.deferredUnsupported('buildFindMany');
+  }
+
+  buildFindFirst(_args?: unknown): never {
+    return this.deferredUnsupported('buildFindFirst');
+  }
+
+  buildFindFirstOrThrow(_args?: unknown): never {
+    return this.deferredUnsupported('buildFindFirstOrThrow');
+  }
+
+  buildFindUnique(_args?: unknown): never {
+    return this.deferredUnsupported('buildFindUnique');
+  }
+
+  buildFindUniqueOrThrow(_args?: unknown): never {
+    return this.deferredUnsupported('buildFindUniqueOrThrow');
+  }
+
+  buildCount(_args?: unknown): never {
+    return this.deferredUnsupported('buildCount');
+  }
+
+  buildAggregate(_args?: unknown): never {
+    return this.deferredUnsupported('buildAggregate');
+  }
+
+  buildGroupBy(_args?: unknown): never {
+    return this.deferredUnsupported('buildGroupBy');
+  }
+
+  buildCreate(_args?: unknown): never {
+    return this.deferredUnsupported('buildCreate');
+  }
+
+  buildCreateMany(_args?: unknown): never {
+    return this.deferredUnsupported('buildCreateMany');
+  }
+
+  buildUpdate(_args?: unknown): never {
+    return this.deferredUnsupported('buildUpdate');
+  }
+
+  buildUpdateMany(_args?: unknown): never {
+    return this.deferredUnsupported('buildUpdateMany');
+  }
+
+  buildDelete(_args?: unknown): never {
+    return this.deferredUnsupported('buildDelete');
+  }
+
+  buildDeleteMany(_args?: unknown): never {
+    return this.deferredUnsupported('buildDeleteMany');
+  }
+
+  buildUpsert(_args?: unknown): never {
+    return this.deferredUnsupported('buildUpsert');
+  }
+
+  /** SQL template cache counters. PowDB keeps no statement cache, so every counter is zero. */
+  cacheStats(): { hits: number; misses: number; hitRate: number; size: number } {
+    return { hits: 0, misses: 0, hitRate: 0, size: 0 };
   }
 
   // -------------------------------------------------------------------------

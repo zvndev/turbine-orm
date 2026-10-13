@@ -63,6 +63,7 @@ import {
   type TemporalInfinityReading,
 } from './query/index.js';
 import { assertNoLockInAutocommitPipeline } from './query/row-lock.js';
+import { asQueryInterface, TABLE_METHODS } from './query/table-client.js';
 import {
   ownLookup,
   quoteIdent,
@@ -1450,34 +1451,22 @@ function closableRawClient(client: PgCompatPoolClient, state: TransactionState):
 }
 
 /**
- * The read-only `QueryInterface` operations that a read-replica setup may route
- * to a replica pool. Every other method (all writes, plus internals) stays on
- * the primary. Kept as a Set so the routing proxy's `get` trap is O(1).
- */
-/**
- * Operations that may be served by a read replica.
+ * Operations that may be served by a read replica: the `read` entries of
+ * {@link TABLE_METHODS}. Every other method (writes, `build*`, internals) stays
+ * on the primary. A Set so the routing proxy's `get` trap is O(1).
  *
- * This is a hand-maintained list of names, so it drifts the moment a read
- * method is added to `QueryInterface` and not added here. The failure is
- * SILENT and directional: the missing operation keeps working, it just runs on
- * the PRIMARY, so no test fails and no user sees an error, only a busier
- * primary. `findManyStreamBatches` was added and missed exactly this way.
- * `src/test/read-operations-drift.test.ts` closes the loop mechanically.
+ * Derived, not listed, because a hand-kept list drifts SILENTLY: a read method
+ * missing here keeps working on the primary, so no test fails. A new public
+ * QueryInterface method cannot compile until it is classified in TABLE_METHODS.
+ * `src/test/read-operations-drift.test.ts` is the run-time check.
  *
  * Exported for that test only.
  */
-export const READ_OPERATIONS: ReadonlySet<string> = new Set([
-  'findMany',
-  'findFirst',
-  'findUnique',
-  'findFirstOrThrow',
-  'findUniqueOrThrow',
-  'count',
-  'aggregate',
-  'groupBy',
-  'findManyStream',
-  'findManyStreamBatches',
-]);
+export const READ_OPERATIONS: ReadonlySet<string> = new Set(
+  Object.entries(TABLE_METHODS)
+    .filter(([, kind]) => kind === 'read')
+    .map(([name]) => name),
+);
 
 /**
  * Internal marker on the config object that tells the `TurbineClient`
@@ -1561,7 +1550,7 @@ export class TransactionClient {
       const txPool = this.createTxPool();
       const txOpts = { ...this.queryOptions, _txScoped: true };
       qi = txOpts.queryInterfaceFactory
-        ? txOpts.queryInterfaceFactory(txPool, name, this.schema, this.middlewares, txOpts)
+        ? asQueryInterface(txOpts.queryInterfaceFactory(txPool, name, this.schema, this.middlewares, txOpts))
         : new QueryInterface<object>(txPool, name, this.schema, this.middlewares, txOpts);
       if (this.state.savepointWrites) savepointMultiStatementWrites(qi, this.schema.tables[name], this.state);
       this.tableCache.set(name, qi);
@@ -2905,7 +2894,9 @@ export class TurbineClient {
   /** Construct a QueryInterface bound to `pool` (honoring any injected factory). */
   private buildTableQI(pool: PgCompatPool, name: string): QueryInterface<object> {
     return this.queryOptions?.queryInterfaceFactory
-      ? this.queryOptions.queryInterfaceFactory(pool, name, this.schema, this.middlewares, this.queryOptions)
+      ? asQueryInterface(
+          this.queryOptions.queryInterfaceFactory(pool, name, this.schema, this.middlewares, this.queryOptions),
+        )
       : new QueryInterface<object>(pool, name, this.schema, this.middlewares, this.queryOptions);
   }
 
