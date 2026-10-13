@@ -6,7 +6,6 @@
  * random token, HttpOnly cookie, CSP headers, read-only transactions.
  */
 
-import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import pg from 'pg';
@@ -19,6 +18,7 @@ import {
   redeemTicket,
   type TicketGate,
 } from './local-server-guard.js';
+import { openInBrowser, responseErrorText } from './local-server-output.js';
 import { OBSERVE_HTML } from './observe-ui.js';
 import { callerKey, checkRateLimit } from './rate-limit.js';
 import { redactUrl } from './ui.js';
@@ -65,7 +65,7 @@ export async function startObserve(options: ObserveOptions): Promise<ObserveServ
 
   const server = createServer((req, res) => {
     handleRequest(req, res, pool, options, authToken, rateLimiter, ticketGate).catch((err) => {
-      sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+      sendJson(res, 500, { error: responseErrorText(err) });
     });
   });
 
@@ -96,7 +96,7 @@ export async function startObserve(options: ObserveOptions): Promise<ObserveServ
   const url = `http://${hostPart}:${options.port}/?token=${ticketGate.token}`;
 
   if (options.openBrowser) {
-    openUrl(url);
+    openInBrowser(url);
   }
 
   return {
@@ -294,7 +294,7 @@ async function apiLatency(res: ServerResponse, pool: PgCompatPool, params: URLSe
       // this server writes no log of its own, so the HTTP response is the only
       // channel either error could reach. Same shape as cli/studio.ts.
     }
-    sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+    sendJson(res, 500, { error: responseErrorText(err) });
   } finally {
     client.release();
   }
@@ -337,7 +337,7 @@ async function apiModels(res: ServerResponse, pool: PgCompatPool, params: URLSea
       // this server writes no log of its own, so the HTTP response is the only
       // channel either error could reach. Same shape as cli/studio.ts.
     }
-    sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+    sendJson(res, 500, { error: responseErrorText(err) });
   } finally {
     client.release();
   }
@@ -390,24 +390,4 @@ function sendHtml(res: ServerResponse, status: number, html: string, nonce: stri
 function sendText(res: ServerResponse, status: number, text: string): void {
   res.writeHead(status, { ...SECURITY_HEADERS, 'Content-Security-Policy': JSON_CSP, 'Content-Type': 'text/plain' });
   res.end(text);
-}
-
-// ---------------------------------------------------------------------------
-// Browser open
-// ---------------------------------------------------------------------------
-
-function openUrl(url: string): void {
-  const { platform: os } = process;
-  const [command, args]: [string, string[]] =
-    os === 'darwin' ? ['open', [url]] : os === 'win32' ? ['cmd', ['/c', 'start', '', url]] : ['xdg-open', [url]];
-  try {
-    const child = spawn(command, args, { stdio: 'ignore', detached: true });
-    // A launcher that is not installed (no xdg-open on a headless machine) is
-    // reported as an 'error' EVENT, not a throw; with no listener Node turns it
-    // into an uncaught exception and the dashboard dies right after printing its URL.
-    child.on('error', () => {});
-    child.unref();
-  } catch {
-    // Best effort
-  }
 }

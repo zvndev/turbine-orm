@@ -734,11 +734,11 @@ describe('Observe CLI: error paths', () => {
       assert.equal(pool.releases, 1);
     });
 
-    it(`${route}: a thrown non-Error is reported as its string form`, async () => {
+    it(`${route}: a thrown non-Error gets a fixed sentence, never its own rendering`, async () => {
       const pool = new FakePool({ failOn: { SELECT: 'plain string failure' } });
       const r = await dispatch(route, { headers: AUTH, pool });
       assert.equal(r.status, 500);
-      assert.deepEqual(r.json, { error: 'plain string failure' });
+      assert.deepEqual(r.json, { error: 'unexpected error' });
     });
 
     it(`${route}: a pool that cannot hand out a connection rejects to the server's 500 handler`, async () => {

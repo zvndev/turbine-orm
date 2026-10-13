@@ -37,11 +37,9 @@
  * CLI or migrate for schema changes and true bulk operations.
  */
 
-import { spawn } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { platform } from 'node:os';
 import { dirname, resolve as pathResolve } from 'node:path';
 import pg from 'pg';
 import type { PgCompatPool } from '../client.js';
@@ -72,6 +70,7 @@ import {
   redeemTicket,
   type TicketGate,
 } from './local-server-guard.js';
+import { openInBrowser, responseErrorText } from './local-server-output.js';
 import {
   assertNoPiiPredicates as assertNoPiiPredicatesShared,
   findRowLockOption,
@@ -360,7 +359,7 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
 
   const server = createServer((req, res) => {
     handleRequest(req, res, ctx).catch((err) => {
-      sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+      sendJson(res, 500, { error: responseErrorText(err) });
     });
   });
 
@@ -375,7 +374,7 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
   const url = buildStudioUrl(options.host, options.port, ticketGate.token);
 
   if (options.openBrowser) {
-    openUrl(url);
+    openInBrowser(url);
   }
 
   return {
@@ -898,7 +897,7 @@ export async function apiTableRows(
   try {
     filters = parseTableFilters(params.get('filters'), table, redactedPii);
   } catch (err) {
-    sendJson(res, 400, { error: `[turbine] ${err instanceof Error ? err.message : String(err)}` });
+    sendJson(res, 400, { error: `[turbine] ${responseErrorText(err)}` });
     return;
   }
 
@@ -1303,7 +1302,7 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
     const grant = target && selectNamesPii(args, target, ctx.metadata) ? { includePii: UNSAFE } : {};
     deferred = qi.buildFindMany({ ...capped.args, ...grant } as FindManyArgs<Record<string, unknown>>);
   } catch (err) {
-    sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+    sendJson(res, 400, { error: responseErrorText(err) });
     return;
   }
 
@@ -1372,7 +1371,7 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
         /* ignore */
       }
     }
-    sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+    sendJson(res, 400, { error: responseErrorText(err) });
   } finally {
     client.release();
   }
@@ -1532,7 +1531,7 @@ export async function apiRowWrite(
       deferreds = wheres.map((where) => qi.buildDelete({ where } as DeleteArgs<Record<string, unknown>>));
     }
   } catch (err) {
-    sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+    sendJson(res, 400, { error: responseErrorText(err) });
     return;
   }
 
@@ -1593,7 +1592,7 @@ export async function apiRowWrite(
     } catch {
       /* ignore */
     }
-    sendJson(res, 400, { error: err instanceof Error ? err.message : String(err) });
+    sendJson(res, 400, { error: responseErrorText(err) });
   } finally {
     client.release();
   }
@@ -2083,19 +2082,4 @@ function sendHtml(res: ServerResponse, status: number, template: string, nonce: 
     'Content-Security-Policy': `default-src 'none'; script-src 'self' 'nonce-${nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'`,
   });
   res.end(body);
-}
-
-function openUrl(url: string): void {
-  const cmd = platform() === 'darwin' ? 'open' : platform() === 'win32' ? 'cmd' : 'xdg-open';
-  const args = platform() === 'win32' ? ['/c', 'start', '', url] : [url];
-  try {
-    const child = spawn(cmd, args, { stdio: 'ignore', detached: true });
-    // A launcher that is not installed (no xdg-open on a headless machine) is
-    // reported as an 'error' EVENT, not a throw; with no listener Node turns it
-    // into an uncaught exception and Studio dies right after printing its URL.
-    child.on('error', () => {});
-    child.unref();
-  } catch {
-    // Non-fatal: user can click the URL manually.
-  }
 }
