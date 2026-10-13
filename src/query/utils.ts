@@ -472,7 +472,7 @@ function argsRewriteError(model: string, action: string, path: string): TypeErro
   );
 }
 
-/** Plain objects and arrays are wrapped; a Date, Buffer, class instance or branded value is not. */
+/** Plain objects and arrays are copied; a Date, Buffer, class instance or other value is shared as it is. */
 function isPlainContainer(value: unknown): value is object {
   if (value === null || typeof value !== 'object') return false;
   if (Array.isArray(value)) return true;
@@ -480,63 +480,170 @@ function isPlainContainer(value: unknown): value is object {
   return proto === Object.prototype || proto === null;
 }
 
+/** Nesting past this is shared, not copied, so a cyclic object cannot recurse without end. */
+const MIDDLEWARE_ARGS_MAX_DEPTH = 100;
+
 /**
- * The `params` a middleware sees, with `args` read-only at every depth: any
- * write, delete or replacement throws a TypeError naming the path, instead of
- * being silently ignored (or, for a nested object shared with the caller,
- * applied to some statements and not others). `params.result`-style
- * transforms of what `next()` returns are untouched.
+ * A copy of `value` that middleware may read, spread, serialize or
+ * `structuredClone`: plain objects and arrays are copied at every depth, and
+ * everything else (Date, Buffer, bigint, symbol, class instance) is shared.
+ * Symbol-keyed properties are copied by descriptor, so the markers the
+ * pipeline reads (the internal-combinator brand, the inclusive-cursor flag,
+ * column and expression brands) are on the copy exactly as on the original,
+ * non-enumerable ones included.
+ */
+function copyArgs(value: unknown, depth: number): unknown {
+  if (depth > MIDDLEWARE_ARGS_MAX_DEPTH || !isPlainContainer(value)) return value;
+  let out: Record<PropertyKey, unknown>;
+  if (Array.isArray(value)) {
+    const items: unknown[] = new Array(value.length);
+    // A long list of ids is the common big argument; keep its scalars off the call path.
+    for (let i = 0; i < value.length; i++) {
+      const item: unknown = value[i];
+      items[i] = item !== null && typeof item === 'object' ? copyArgs(item, depth + 1) : item;
+    }
+    out = items as unknown as Record<PropertyKey, unknown>;
+  } else {
+    out = Object.getPrototypeOf(value) === null ? Object.create(null) : {};
+    for (const key of Object.keys(value)) {
+      const item = (value as Record<string, unknown>)[key];
+      const copied = item !== null && typeof item === 'object' ? copyArgs(item, depth + 1) : item;
+      // `__proto__` from JSON.parse is an own key; assigning it would set the prototype.
+      if (key === '__proto__')
+        Object.defineProperty(out, key, { value: copied, enumerable: true, writable: true, configurable: true });
+      else out[key] = copied;
+    }
+  }
+  for (const sym of Object.getOwnPropertySymbols(value)) {
+    Object.defineProperty(out, sym, Object.getOwnPropertyDescriptor(value, sym) as PropertyDescriptor);
+  }
+  return out;
+}
+
+/**
+ * Where `b` first differs from `a`, as a path suffix (`.where.id`, or `''` for
+ * the values themselves), or undefined when they are structurally equal. The
+ * suffix is built on the way back out, so an equal pair costs no string work.
+ */
+function argsDifference(a: unknown, b: unknown, depth: number): string | undefined {
+  if (Object.is(a, b)) return undefined;
+  if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return '';
+  if (a instanceof Date || b instanceof Date) {
+    return a instanceof Date && b instanceof Date && Object.is(a.getTime(), b.getTime()) ? undefined : '';
+  }
+  if (ArrayBuffer.isView(a) || ArrayBuffer.isView(b)) {
+    if (!(ArrayBuffer.isView(a) && ArrayBuffer.isView(b)) || a.byteLength !== b.byteLength) return '';
+    const x = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+    const y = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+    for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return '';
+    return undefined;
+  }
+  if (a instanceof RegExp || b instanceof RegExp) return String(a) === String(b) ? undefined : '';
+  if (a instanceof Map || a instanceof Set || b instanceof Map || b instanceof Set) return '';
+  if (Array.isArray(a) !== Array.isArray(b) || depth > MIDDLEWARE_ARGS_MAX_DEPTH) return '';
+  if (Array.isArray(a)) {
+    const other = b as unknown[];
+    const shared = Math.min(a.length, other.length);
+    for (let i = 0; i < shared; i++) {
+      if (Object.is(a[i], other[i])) continue;
+      const inner = argsDifference(a[i], other[i], depth + 1);
+      if (inner !== undefined) return `.${i}${inner}`;
+    }
+    return a.length === other.length ? undefined : `.${shared}`;
+  }
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  for (const key of Object.keys(left)) {
+    if (!Object.hasOwn(right, key)) return `.${key}`;
+    const inner = argsDifference(left[key], right[key], depth + 1);
+    if (inner !== undefined) return `.${key}${inner}`;
+  }
+  for (const key of Object.keys(right)) if (!Object.hasOwn(left, key)) return `.${key}`;
+  return undefined;
+}
+
+/** What {@link readOnlyMiddlewareParams} remembers about the `params` it handed out. */
+interface MiddlewareArgsState {
+  readonly model: string;
+  readonly action: string;
+  /** The caller's args: what the query is compiled from. */
+  readonly original: Record<string, unknown>;
+  /** The copy middleware reads, made on the first read of `params.args`. */
+  copy: Record<string, unknown> | undefined;
+}
+
+const MIDDLEWARE_ARGS = new WeakMap<object, MiddlewareArgsState>();
+
+/** The key Node's `util.inspect` looks for, from the global registry so no `node:` import is needed. */
+const NODE_INSPECT = Symbol.for('nodejs.util.inspect.custom');
+
+/** Makes `console.log(params)` show the values rather than an accessor. Not own, so a spread of `params` never carries it. */
+const MIDDLEWARE_PARAMS_PROTOTYPE = Object.defineProperty({}, NODE_INSPECT, {
+  value(
+    this: MiddlewareParams,
+    _depth: number,
+    options: unknown,
+    inspect: (value: unknown, options?: unknown) => string,
+  ) {
+    return inspect({ model: this.model, action: this.action, args: this.args }, options);
+  },
+});
+
+/**
+ * The `params` a middleware receives. `params.args` is a plain copy of the
+ * caller's args, made when it is first read, so middleware can read it, spread
+ * it, serialize it and `structuredClone` it, and one that never reads it pays
+ * nothing.
  *
- * `next(p)` hands the returned value to {@link assertMiddlewareArgsKept}.
+ * It is a copy because the query is compiled from the caller's args, not from
+ * what middleware sees. A change to the copy would never reach the query, so
+ * {@link assertMiddlewareArgsKept} refuses it, naming the path, when the
+ * middleware calls `next`. That check compares contents, which is why the copy
+ * is not frozen: a frozen object ignores a write silently in a script that is
+ * not in strict mode, and a filter added there would be dropped without a word.
+ * Assigning to `params.args` itself throws at once.
  */
 export function readOnlyMiddlewareParams(
   model: string,
   action: string,
   args: Record<string, unknown>,
 ): MiddlewareParams {
-  const views = new WeakMap<object, object>();
-  const view = <V>(value: V, path: string): V => {
-    if (!isPlainContainer(value)) return value;
-    const known = views.get(value);
-    if (known) return known as V;
-    const refuse = (key: PropertyKey): never => {
-      throw argsRewriteError(model, action, `${path}.${String(key)}`);
-    };
-    const proxy = new Proxy(value, {
-      get(target, key, receiver) {
-        const inner = Reflect.get(target, key, receiver);
-        const d = Reflect.getOwnPropertyDescriptor(target, key);
-        // A frozen property must read back as itself (a proxy invariant).
-        if (d && !d.configurable && !d.writable) return inner;
-        return typeof key === 'string' ? view(inner, `${path}.${key}`) : inner;
-      },
-      set: (_t, key) => refuse(key),
-      deleteProperty: (_t, key) => refuse(key),
-      defineProperty: (_t, key) => refuse(key),
-      setPrototypeOf: () => refuse('__proto__'),
-    });
-    views.set(value, proxy);
-    return proxy as V;
-  };
-  const frozenArgs = view(args, 'args');
-  const params: MiddlewareParams = { model, action, args: frozenArgs };
-  return new Proxy(params, {
-    set(target, key, value) {
-      if (key === 'args' || key === 'model' || key === 'action') throw argsRewriteError(model, action, String(key));
-      return Reflect.set(target, key, value);
+  const state: MiddlewareArgsState = { model, action, original: args, copy: undefined };
+  const params: MiddlewareParams = {
+    __proto__: MIDDLEWARE_PARAMS_PROTOTYPE,
+    model,
+    action,
+    get args(): Record<string, unknown> {
+      if (state.copy === undefined) state.copy = copyArgs(args, 0) as Record<string, unknown>;
+      return state.copy;
     },
-  });
+    set args(_replacement: Record<string, unknown>) {
+      throw argsRewriteError(model, action, 'args');
+    },
+  } as MiddlewareParams;
+  MIDDLEWARE_ARGS.set(params, state);
+  return params;
 }
 
 /**
- * Refuse a `next(p)` whose `p.args` is not the read-only view this operation
- * handed out (a middleware that built a new args object, which would be
- * ignored).
+ * Refuse a `next(p)` whose `p.args` is not the caller's args: one that
+ * middleware changed in place, or replaced with an object that differs from
+ * them. A copy that is structurally equal passes (`structuredClone(params.args)`,
+ * `{ ...params.args }`), because nothing it would change is lost. Throws a
+ * TypeError naming the first path that differs.
  */
 export function assertMiddlewareArgsKept(handedOut: MiddlewareParams, passed: { args?: unknown } | undefined): void {
-  if (passed?.args !== handedOut.args) {
-    throw argsRewriteError(handedOut.model, handedOut.action, 'args');
+  const state = MIDDLEWARE_ARGS.get(handedOut) as MiddlewareArgsState;
+  if (passed === handedOut) {
+    if (handedOut.model !== state.model) throw argsRewriteError(state.model, state.action, 'model');
+    if (handedOut.action !== state.action) throw argsRewriteError(state.model, state.action, 'action');
+    // Nothing has read the args, so nothing could have changed them.
+    if (state.copy === undefined) return;
   }
+  const given = passed?.args;
+  if (given === state.original) return;
+  const changed = argsDifference(state.original, given, 0);
+  if (changed !== undefined) throw argsRewriteError(state.model, state.action, `args${changed}`);
 }
 
 /** The fields of a connected node-postgres client a cancel request needs. */
