@@ -327,7 +327,8 @@ jobs:
       - name: Run the NOWAIT and SKIP LOCKED row-lock tests against CockroachDB
         # Only the two tests whose semantics CockroachDB shares. The rest of the
         # file reads pg_locks and the PostgreSQL four-mode matrix.
-        run: npx tsx --test --test-name-pattern "skipLocked|noWait: LockNotAvailableError" src/test/wave-c-locks-pg.integration.test.ts
+        run: |
+          npx tsx --test --test-name-pattern "skipLocked|noWait: LockNotAvailableError" src/test/wave-c-locks-pg.integration.test.ts
         env:
           DATABASE_URL: postgres://root@localhost:26257/turbine_test?sslmode=disable
           TURBINE_REQUIRE_ENGINE: postgres

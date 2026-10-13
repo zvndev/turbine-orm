@@ -135,6 +135,55 @@ describe('release.yml: publish runs only behind the gates', () => {
   });
 });
 
+/**
+ * `key: value` lines whose unquoted value holds `: `, which YAML refuses
+ * ("mapping values are not allowed here"). GitHub then rejects the whole
+ * workflow before any job starts, so every gate in it silently stops running.
+ * Block-scalar bodies (`run: |`) are skipped: anything is legal there.
+ */
+function plainScalarsWithColon(lines: string[]): string[] {
+  const bad: string[] = [];
+  let blockIndent = -1;
+  lines.forEach((line, i) => {
+    const indent = line.length - line.trimStart().length;
+    if (blockIndent >= 0) {
+      if (line.trim() === '' || indent > blockIndent) return;
+      blockIndent = -1;
+    }
+    if (line.trimStart().startsWith('#')) return;
+    const m = /^(\s*)(- )?[A-Za-z0-9_.-]+: (.+)$/.exec(line);
+    if (!m) return;
+    const value = (m[3] as string).replace(/\s+#.*$/, '');
+    if (/^[|>][-+]?\d?$/.test(value)) {
+      blockIndent = indent + (m[2] ? 2 : 0);
+      return;
+    }
+    if (/^['"[{&*!|>]/.test(value)) return;
+    if (value.includes(': ')) bad.push(`line ${i + 1}: ${line.trim()}`);
+  });
+  return bad;
+}
+
+describe('every workflow is valid YAML in the one way a line edit breaks it', () => {
+  it('the check finds an unquoted value holding ": " (anti-vacuous)', () => {
+    assert.deepEqual(plainScalarsWithColon(['      - run: npx tsx --test --test-name-pattern "a: b" x.ts']), [
+      'line 1: - run: npx tsx --test --test-name-pattern "a: b" x.ts',
+    ]);
+    assert.deepEqual(plainScalarsWithColon(['      - run: |', '          echo "a: b"', '        env:']), []);
+  });
+
+  for (const file of ['ci.yml', 'gates.yml', 'release.yml', 'nightly.yml', 'codeql.yml']) {
+    it(`${file}: no unquoted value holds ": "`, () => {
+      assert.deepEqual(
+        plainScalarsWithColon(workflow(file)),
+        [],
+        `${file} has a plain YAML value containing ": ", so GitHub rejects the file and none of its jobs run. ` +
+          'Quote the value or move it into a `run: |` block.',
+      );
+    });
+  }
+});
+
 describe('gates.yml: a test step that points at a database requires that engine', () => {
   const URL_ENV = /^ {10}(DATABASE_URL|MYSQL_URL|MSSQL_URL|PGBOUNCER_URL):/;
   const RUNS_TESTS = /(tsx --test|npm run test|npm test)\b/;
