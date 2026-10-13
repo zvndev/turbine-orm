@@ -121,6 +121,7 @@ import type { TurbineClient } from './client.js';
 import { TurbineError, TurbineErrorCode, UnsupportedFeatureError, ValidationError, wrapPgError } from './errors.js';
 import { createManyShapeRuns } from './nested-write.js';
 import { fingerprintPrismaSchema } from './prisma-schema-fingerprint.js';
+import { isPlainRecord, RELATION_FILTER_WRAPPER_SET, setOwn } from './query/filters.js';
 import {
   AGGREGATE_OPTIONS,
   applyNativeOptions,
@@ -141,7 +142,7 @@ import {
   UPSERT_OPTIONS,
 } from './query/index.js';
 import { CURSOR_INCLUSIVE } from './query/normalize-args.js';
-import { markInternalCombinator, suggestKey } from './query/utils.js';
+import { ownLookup, suggestKey } from './query/utils.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
 import { assertWhereDepth, MAX_WHERE_DEPTH } from './query/where-compile.js';
 import type { PrismaCompatMap, PrismaModelMap, RelationDef, SchemaMetadata } from './schema.js';
@@ -387,18 +388,20 @@ function timeStringToDate(v: string): Date | null {
 }
 
 function buildLookups(ctx: Ctx, mm: PrismaModelMap): ModelLookups {
-  const reverseFields: Record<string, string> = {};
+  // Keyed by field and relation names, so prototype-less: a field called
+  // `constructor` is an own key here, never Object.prototype's member.
+  const reverseFields: Record<string, string> = Object.create(null);
   let identityFields = true;
   for (const [prismaField, turbineField] of Object.entries(mm.fields)) {
     reverseFields[turbineField] = prismaField;
     if (prismaField !== turbineField) identityFields = false;
   }
-  const reverseRelations: Record<string, { prismaName: string; cardinality: 'one' | 'many' }> = {};
+  const reverseRelations: Record<string, { prismaName: string; cardinality: 'one' | 'many' }> = Object.create(null);
   for (const [prismaRel, rel] of Object.entries(mm.relations)) {
     reverseRelations[rel.name] = { prismaName: prismaRel, cardinality: rel.cardinality };
   }
   const timeFields = new Set<string>();
-  for (const col of ctx.schema.tables[mm.table]?.columns ?? []) {
+  for (const col of ownLookup(ctx.schema.tables, mm.table)?.columns ?? []) {
     if (TIME_PG_TYPES.has(col.pgType)) timeFields.add(col.field);
   }
   return { reverseFields, identityFields, reverseRelations, timeFields };
@@ -414,41 +417,12 @@ function lookupsFor(ctx: Ctx, mm: PrismaModelMap): ModelLookups {
 }
 
 /** Resolve a turbine relation's target Prisma model map (for nested translation). */
-/**
- * A `where` fragment no row satisfies, for Prisma's empty `OR`.
- *
- * `{ <key>: { in: [] } }`, which core compiles to `= ANY($n)` with an empty
- * array: false for every row, NULL-valued ones included, and one ordinary bound
- * param rather than a literal spliced into the SQL. The column is the first
- * primary-key column, else the table's first column, so it is always a real
- * column of this table and the predicate stays a plain scalar comparison the
- * cache fingerprints like any other.
- *
- * A table this layer cannot name a column of THROWS. The fallback used to be
- * `{}`, an empty `where` fragment - which is not "no rows" but its exact
- * opposite, EVERY row, and it would have been merged in silently beside the
- * caller's other predicates. A sentinel builder that cannot build a sentinel
- * has not succeeded, and the one shape it exists to compile is the one where
- * answering "all of them" instead of "none of them" is worst.
- */
-function matchNothing(ctx: Ctx, mm: PrismaModelMap): Record<string, unknown> {
-  const meta = ctx.schema.tables[mm.table];
-  const column = meta?.primaryKey?.[0] ?? meta?.allColumns?.[0];
-  if (!meta || !column) {
-    throw new ValidationError(
-      `An empty \`OR\` on model ${mm.table} means "no rows", and compiling that needs one real column ` +
-        `of the table, but the schema metadata for "${mm.table}" lists none. Regenerate the client ` +
-        '(`npx turbine generate`) so the table carries its columns, or drop the empty `OR`.',
-    );
-  }
-  return { [meta.reverseColumnMap?.[column] ?? column]: { in: [] } };
-}
-
 function relTargetModel(ctx: Ctx, mm: PrismaModelMap, turbineRel: string): PrismaModelMap | undefined {
-  const rd: RelationDef | undefined = ctx.schema.tables[mm.table]?.relations?.[turbineRel];
+  const relations = ownLookup(ctx.schema.tables, mm.table)?.relations;
+  const rd: RelationDef | undefined = relations ? ownLookup(relations, turbineRel) : undefined;
   if (!rd) return undefined;
   const modelName = ctx.tableToModel.get(rd.to);
-  return modelName ? ctx.map.models[modelName] : undefined;
+  return modelName ? ownLookup(ctx.map.models, modelName) : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -456,25 +430,6 @@ function relTargetModel(ctx: Ctx, mm: PrismaModelMap, turbineRel: string): Prism
 // ---------------------------------------------------------------------------
 
 const COMBINATORS = new Set(['AND', 'OR', 'NOT']);
-
-/**
- * The to-many half of the relation-filter wrapper list.
- *
- * DRIFT RISK, and this is the third copy of that list in the tree. The canonical
- * NAMED one is `RELATION_FILTER_WRAPPERS` in `cli/pii-predicate-guard.ts`
- * (`some`/`none`/`every`/`is`/`isNot`), and a second is inlined in
- * `query/where-compile.ts` as `'some' in x || 'every' in x || …`. This copy is
- * the worst of the three because it is SPLIT: the to-many quantifiers are here,
- * and `is` / `isNot` are two inline `k === …` tests in
- * {@link translateRelationFilter}, so half of it does not read as a list and a
- * grep for the list will not find it. A wrapper the compiler learns and this set
- * does not is a relation body that reaches core untranslated, i.e. with Prisma
- * field names still in it.
- *
- * The fix is an export from `query/filters.ts` that all three import; until that
- * exists, these comments are what hold them in step.
- */
-const RELATION_QUANTIFIERS = new Set(['some', 'every', 'none']);
 
 /**
  * The caller-supplied arg trees this layer walks recursively, named for the
@@ -523,19 +478,8 @@ function assertTranslateDepth(depth: number, clause: TranslateClause): void {
   );
 }
 
-/** Whether a value is a plain object usable as a compound-unique selector. */
-function isPlainObject(v: unknown): v is Record<string, unknown> {
-  return (
-    typeof v === 'object' &&
-    v !== null &&
-    !Array.isArray(v) &&
-    !(v instanceof Date) &&
-    !(typeof Buffer !== 'undefined' && Buffer.isBuffer(v))
-  );
-}
-
 function renameField(mm: PrismaModelMap, prismaField: string): string {
-  return mm.fields[prismaField] ?? prismaField;
+  return ownLookup(mm.fields, prismaField) ?? prismaField;
 }
 
 // ---------------------------------------------------------------------------
@@ -715,7 +659,7 @@ const KNOWN_KEYS: Record<CompatOperation, ReadonlySet<string>> = (() => {
  */
 function warnUnknownQueryOptions(model: string, op: CompatOperation, args: unknown): void {
   if (process.env.NODE_ENV === 'production') return;
-  if (!isPlainObject(args)) return;
+  if (!isPlainRecord(args)) return;
   try {
     const known = KNOWN_KEYS[op];
     const table = OPERATION_TABLES[op];
@@ -801,7 +745,7 @@ function warnStalePrismaMap(map: PrismaCompatMap): void {
  * bound turns "change at most 10 rows" into "change every row".
  */
 function refuseRowLimit(model: string, op: 'updateMany' | 'deleteMany', args: unknown): void {
-  if (!isPlainObject(args) || args.limit === undefined) return;
+  if (!isPlainRecord(args) || args.limit === undefined) return;
   throw new UnsupportedFeatureError(
     `\`limit\` on ${op} (row-bounded mass mutation)`,
     'prisma-compat',
@@ -840,32 +784,10 @@ function mapRelationLoadStrategy(value: unknown): unknown {
  */
 function translateWhere(ctx: Ctx, mm: PrismaModelMap, where: unknown, depth = 0): Record<string, unknown> | undefined {
   assertTranslateDepth(depth, 'where');
-  if (!isPlainObject(where)) return where as undefined;
+  if (!isPlainRecord(where)) return where as undefined;
   const out: Record<string, unknown> = {};
-  // The empty-`OR` sentinel, held aside rather than merged into `out`. At most
-  // one per level, since `OR` is a single object key.
-  let matchNone: Record<string, unknown> | undefined;
   for (const [key, val] of Object.entries(where)) {
     if (COMBINATORS.has(key)) {
-      // An EMPTY `OR` is false in Prisma (no branch can match), while an empty
-      // `AND` / `NOT` is true. Core drops an empty combinator entirely, so the
-      // same call returned EVERY row here: the classic trigger is
-      // `OR: ids.map(...)` over a selection that turned out to be empty, i.e.
-      // "none of these" answered with "all of them". Compiled to a predicate
-      // that matches nothing so this layer keeps Prisma's meaning; core's own
-      // semantics are unchanged and documented separately.
-      //
-      // Held aside, NOT `Object.assign`ed onto `out`: the sentinel is keyed on
-      // a real column of the table, so merging it made two predicates on one
-      // key collide and JavaScript's key ORDER decided which survived.
-      // `{ OR: [], id: 5 }` kept the caller's `id = 5` and dropped the
-      // sentinel (returning the row Prisma excludes); `{ id: 5, OR: [] }` kept
-      // the sentinel and dropped the caller's `id = 5`. Same query, same
-      // meaning, opposite predicate.
-      if (key === 'OR' && Array.isArray(val) && val.length === 0) {
-        matchNone = matchNothing(ctx, mm);
-        continue;
-      }
       // An `AND` / `OR` array of N conditions is ONE level, not N: the elements
       // are siblings, so they all translate at the same incremented depth.
       out[key] = Array.isArray(val)
@@ -874,17 +796,17 @@ function translateWhere(ctx: Ctx, mm: PrismaModelMap, where: unknown, depth = 0)
       continue;
     }
     // Compound-unique selector (custom or default Prisma name).
-    const compound = mm.compoundUniques[key];
-    if (compound && isPlainObject(val) && !mm.fields[key] && !mm.relations[key]) {
+    const compound = ownLookup(mm.compoundUniques, key);
+    if (compound && isPlainRecord(val) && !ownLookup(mm.fields, key) && !ownLookup(mm.relations, key)) {
       const inner: Record<string, unknown> = {};
-      for (const [pk, pv] of Object.entries(val)) inner[renameField(mm, pk)] = pv;
+      for (const [pk, pv] of Object.entries(val)) setOwn(inner, renameField(mm, pk), pv);
       // Turbine's core derives the selector name from the underscore-join of the
       // member FIELD names, so re-key custom names onto that canonical form.
-      out[compound.join('_')] = inner;
+      setOwn(out, compound.join('_'), inner);
       continue;
     }
     // Relation filter.
-    const rel = mm.relations[key];
+    const rel = ownLookup(mm.relations, key);
     if (rel) {
       // Prisma spells "this to-one relation has no related row" as a bare
       // `null` on the relation key; core spells it `{ is: null }` and answers a
@@ -894,42 +816,28 @@ function translateWhere(ctx: Ctx, mm: PrismaModelMap, where: unknown, depth = 0)
       // has no bare-null shape there, so core still refuses them by name rather
       // than this layer inventing a meaning.
       if (val === null && rel.cardinality === 'one') {
-        out[rel.name] = { is: null };
+        setOwn(out, rel.name, { is: null });
         continue;
       }
       const target = relTargetModel(ctx, mm, rel.name);
-      out[rel.name] = translateRelationFilter(ctx, target, val, depth + 1);
+      setOwn(out, rel.name, translateRelationFilter(ctx, target, val, depth + 1));
       continue;
     }
     // Scalar field, key renamed, value (literal or operator object) passes
     // through unchanged (Prisma operator names match Turbine's).
-    out[renameField(mm, key)] = val;
+    setOwn(out, renameField(mm, key), val);
   }
-  if (!matchNone) return out;
-  // Nothing else at this level: the sentinel IS the where, no wrapper needed.
-  if (Object.keys(out).length === 0) return matchNone;
-  // Otherwise conjoin, so neither half can overwrite the other whatever order
-  // the caller wrote the keys in. BRANDED, because an `AND` array is the shape
-  // that makes a statement unnamed (a caller-written combinator has a
-  // caller-sized arity); this one is Turbine's, with a fixed arity of two, and
-  // an unbranded wrapper here would quietly take every compat query carrying an
-  // empty `OR` off named prepared statements. The caller's own combinators sit
-  // INSIDE `out` and are walked at the next level with their own brand check,
-  // so they still count.
-  return markInternalCombinator({ AND: [out, matchNone] });
+  return out;
 }
 
 function translateRelationFilter(ctx: Ctx, target: PrismaModelMap | undefined, val: unknown, depth: number): unknown {
-  if (!isPlainObject(val)) return val;
+  if (!isPlainRecord(val)) return val;
   const keys = Object.keys(val);
-  const hasQuantifier = keys.some((k) => RELATION_QUANTIFIERS.has(k) || k === 'is' || k === 'isNot');
+  const hasQuantifier = keys.some((k) => RELATION_FILTER_WRAPPER_SET.has(k));
   if (hasQuantifier) {
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(val)) {
-      out[k] =
-        target && (RELATION_QUANTIFIERS.has(k) || k === 'is' || k === 'isNot')
-          ? translateWhere(ctx, target, v, depth + 1)
-          : v;
+      setOwn(out, k, target && RELATION_FILTER_WRAPPER_SET.has(k) ? translateWhere(ctx, target, v, depth + 1) : v);
     }
     return out;
   }
@@ -953,21 +861,21 @@ function translateRelationFilter(ctx: Ctx, target: PrismaModelMap | undefined, v
 function translateOrderBy(ctx: Ctx, mm: PrismaModelMap, ob: unknown, depth = 0): unknown {
   assertTranslateDepth(depth, 'orderBy');
   if (Array.isArray(ob)) return ob.map((o) => translateOrderBy(ctx, mm, o, depth + 1));
-  if (!isPlainObject(ob)) return ob;
+  if (!isPlainRecord(ob)) return ob;
   const out: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(ob)) {
     if (key === '_count') {
       out._count = val;
       continue;
     }
-    const rel = mm.relations[key];
+    const rel = ownLookup(mm.relations, key);
     if (rel) {
       const target = relTargetModel(ctx, mm, rel.name);
       out[rel.name] =
-        isPlainObject(val) && !('_count' in val) && target ? translateOrderBy(ctx, target, val, depth + 1) : val;
+        isPlainRecord(val) && !('_count' in val) && target ? translateOrderBy(ctx, target, val, depth + 1) : val;
       continue;
     }
-    out[renameField(mm, key)] = val;
+    setOwn(out, renameField(mm, key), val);
   }
   return out;
 }
@@ -1013,13 +921,13 @@ function translateOmit(
   let any = false;
   for (const [key, val] of Object.entries(omit)) {
     if (val === false || val == null) continue;
-    if (mm.relations[key]) {
+    if (ownLookup(mm.relations, key)) {
       throw new ValidationError(
         `prisma-compat: \`omit\` on model "${modelName(ctx, mm)}" takes scalar fields, but "${key}" ` +
           'is a relation. Leave the relation out of `include` instead.',
       );
     }
-    out[renameField(mm, key)] = true;
+    setOwn(out, renameField(mm, key), true);
     any = true;
   }
   return any ? out : undefined;
@@ -1063,13 +971,13 @@ function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, 
         hasWith = true;
         continue;
       }
-      const rel = mm.relations[key];
+      const rel = ownLookup(mm.relations, key);
       if (!rel) {
         throw new ValidationError(
           `prisma-compat: unknown relation "${key}" in include on model "${modelName(ctx, mm)}".`,
         );
       }
-      withClause[rel.name] = translateWithOption(ctx, mm, rel.name, val, depth + 1);
+      setOwn(withClause, rel.name, translateWithOption(ctx, mm, rel.name, val, depth + 1));
       hasWith = true;
     }
     return { omit, with: hasWith ? withClause : undefined };
@@ -1085,13 +993,13 @@ function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, 
         hasWith = true;
         continue;
       }
-      const rel = mm.relations[key];
+      const rel = ownLookup(mm.relations, key);
       if (rel) {
-        withClause[rel.name] = translateWithOption(ctx, mm, rel.name, val, depth + 1);
+        setOwn(withClause, rel.name, translateWithOption(ctx, mm, rel.name, val, depth + 1));
         hasWith = true;
         continue;
       }
-      scalar[renameField(mm, key)] = true;
+      setOwn(scalar, renameField(mm, key), true);
       hasScalar = true;
     }
     return { select: hasScalar ? scalar : undefined, with: hasWith ? withClause : undefined };
@@ -1197,7 +1105,7 @@ function resolveWriteProjection(
     const pick = new Set<string>();
     for (const [key, val] of Object.entries(select)) {
       if (val === false || val == null) continue;
-      if (key === '_count' || mm.relations[key]) {
+      if (key === '_count' || ownLookup(mm.relations, key)) {
         throw new UnsupportedFeatureError(
           `select of "${key}" on ${op}`,
           'prisma-compat',
@@ -1217,7 +1125,7 @@ function resolveWriteProjection(
     const omit = new Set<string>();
     for (const [key, val] of Object.entries(omitArg)) {
       if (val === false || val == null) continue;
-      if (mm.relations[key]) {
+      if (ownLookup(mm.relations, key)) {
         throw new ValidationError(
           `prisma-compat: \`omit\` on model "${modelName(ctx, mm)}" takes scalar fields, but "${key}" ` +
             'is a relation.',
@@ -1248,11 +1156,11 @@ function coreWriteProjection(mm: PrismaModelMap, proj: WriteProjection): Args {
 
 /** Apply a {@link WriteProjection} to one already-reshaped write result row. */
 function applyWriteProjection(proj: WriteProjection, row: unknown): unknown {
-  if (!isPlainObject(row)) return row;
+  if (!isPlainRecord(row)) return row;
   if (proj.pick) {
     const out: Record<string, unknown> = {};
     for (const key of proj.pick) {
-      if (key in row) out[key] = row[key];
+      if (Object.hasOwn(row, key)) setOwn(out, key, row[key]);
     }
     return out;
   }
@@ -1274,7 +1182,7 @@ function applyWriteProjection(proj: WriteProjection, row: unknown): unknown {
  */
 function translateWithOption(ctx: Ctx, mm: PrismaModelMap, turbineRel: string, val: unknown, depth = 0): unknown {
   if (val === true) return true;
-  if (!isPlainObject(val)) return true;
+  if (!isPlainRecord(val)) return true;
   const target = relTargetModel(ctx, mm, turbineRel);
   const opt: Record<string, unknown> = {};
   if (val.where !== undefined) opt.where = target ? translateWhere(ctx, target, val.where, depth) : val.where;
@@ -1304,12 +1212,12 @@ function translateWithOption(ctx: Ctx, mm: PrismaModelMap, turbineRel: string, v
 /** Translate a Prisma `_count: { select: { rel: true } }` / `true` into Turbine `with._count`. */
 function translateCountSelect(mm: PrismaModelMap, val: unknown): unknown {
   if (val === true) return true;
-  if (isPlainObject(val) && isPlainObject(val.select)) {
+  if (isPlainRecord(val) && isPlainRecord(val.select)) {
     const out: Record<string, boolean> = {};
     for (const [key, v] of Object.entries(val.select)) {
       if (!v) continue;
-      const rel = mm.relations[key];
-      if (rel) out[rel.name] = true;
+      const rel = ownLookup(mm.relations, key);
+      if (rel) setOwn(out, rel.name, true);
     }
     return out;
   }
@@ -1418,7 +1326,7 @@ function applyImplicitPkOrder(ctx: Ctx, mm: PrismaModelMap, t: Record<string, un
   if (t.orderBy !== undefined) return;
   if (t.distinct !== undefined) return;
   if (kind === 'many' && t.limit === undefined && t.offset === undefined) return;
-  const meta = ctx.schema.tables[mm.table];
+  const meta = ownLookup(ctx.schema.tables, mm.table);
   const pk = meta?.primaryKey ?? [];
   if (pk.length === 0) return;
   const fields = pk.map((col) => meta?.reverseColumnMap?.[col] ?? col);
@@ -1434,9 +1342,9 @@ function applyImplicitPkOrder(ctx: Ctx, mm: PrismaModelMap, t: Record<string, un
  *   `offset: skip`. That is Prisma's definition exactly: the page starts AT the
  *   cursor row, in the query's order (core completes it with a primary-key
  *   tiebreaker), and `skip` counts from there, so the `skip: 1` idiom drops the
- *   cursor row. Core places the page from the cursor's values when they cover
- *   the order, else from the row the cursor names by a unique key, which is
- *   what a Prisma cursor always is.
+ *   cursor row. Core places the page from the row the cursor names by a unique
+ *   key, which is what a Prisma cursor always is, so a cursor whose row has
+ *   been deleted gives an empty page, as it does in Prisma.
  */
 function translateCursor(
   _ctx: Ctx,
@@ -1455,11 +1363,11 @@ function translateCursor(
   const tcursor: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(cursor)) {
     if (val === undefined) continue;
-    const compound = mm.compoundUniques[key];
-    if (compound && isPlainObject(val)) {
-      for (const [pk, pv] of Object.entries(val)) tcursor[renameField(mm, pk)] = pv;
+    const compound = ownLookup(mm.compoundUniques, key);
+    if (compound && isPlainRecord(val)) {
+      for (const [pk, pv] of Object.entries(val)) setOwn(tcursor, renameField(mm, pk), pv);
     } else {
-      tcursor[renameField(mm, key)] = val;
+      setOwn(tcursor, renameField(mm, key), val);
     }
   }
   t.cursor = tcursor;
@@ -1490,16 +1398,16 @@ const NESTED_WRITE_OPS = new Set([
  */
 function translateWriteData(ctx: Ctx, mm: PrismaModelMap, data: unknown, depth = 0): unknown {
   assertTranslateDepth(depth, 'data');
-  if (!isPlainObject(data)) return data;
+  if (!isPlainRecord(data)) return data;
   const out: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(data)) {
-    const rel = mm.relations[key];
-    if (rel && isPlainObject(val) && Object.keys(val).some((k) => NESTED_WRITE_OPS.has(k))) {
+    const rel = ownLookup(mm.relations, key);
+    if (rel && isPlainRecord(val) && Object.keys(val).some((k) => NESTED_WRITE_OPS.has(k))) {
       const target = relTargetModel(ctx, mm, rel.name);
-      out[rel.name] = translateNestedWrite(ctx, target, val, depth + 1);
+      setOwn(out, rel.name, translateNestedWrite(ctx, target, val, depth + 1));
       continue;
     }
-    out[renameField(mm, key)] = val;
+    setOwn(out, renameField(mm, key), val);
   }
   return out;
 }
@@ -1548,7 +1456,7 @@ function translateNestedWrite(
         out[op] = mapMaybeArray(payload, (p) => translateUpsertNested(ctx, target, p, depth + 1));
         break;
       default:
-        out[op] = payload;
+        setOwn(out, op, payload);
     }
   }
   return out;
@@ -1560,7 +1468,7 @@ function mapMaybeArray(val: unknown, fn: (item: unknown) => unknown): unknown {
 
 /** A `{ where?, data }` pair (nested update/updateMany), or a bare data object. */
 function translateWhereDataPair(ctx: Ctx, target: PrismaModelMap | undefined, p: unknown, depth: number): unknown {
-  if (!isPlainObject(p)) return p;
+  if (!isPlainRecord(p)) return p;
   if ('data' in p || 'where' in p) {
     const out: Record<string, unknown> = {};
     if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where, depth) : p.where;
@@ -1571,7 +1479,7 @@ function translateWhereDataPair(ctx: Ctx, target: PrismaModelMap | undefined, p:
 }
 
 function translateConnectOrCreate(ctx: Ctx, target: PrismaModelMap | undefined, p: unknown, depth: number): unknown {
-  if (!isPlainObject(p)) return p;
+  if (!isPlainRecord(p)) return p;
   const out: Record<string, unknown> = {};
   if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where, depth) : p.where;
   if (p.create !== undefined) out.create = target ? translateWriteData(ctx, target, p.create, depth) : p.create;
@@ -1579,7 +1487,7 @@ function translateConnectOrCreate(ctx: Ctx, target: PrismaModelMap | undefined, 
 }
 
 function translateUpsertNested(ctx: Ctx, target: PrismaModelMap | undefined, p: unknown, depth: number): unknown {
-  if (!isPlainObject(p)) return p;
+  if (!isPlainRecord(p)) return p;
   const out: Record<string, unknown> = {};
   if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where, depth) : p.where;
   if (p.create !== undefined) out.create = target ? translateWriteData(ctx, target, p.create, depth) : p.create;
@@ -1642,7 +1550,7 @@ function translateAggregateArgs(
  * silently wrong on one with a `@map`.
  */
 function translateDistinctOn(ctx: Ctx, mm: PrismaModelMap, val: unknown): unknown {
-  if (!isPlainObject(val)) return val;
+  if (!isPlainRecord(val)) return val;
   const out: Record<string, unknown> = { ...val };
   if (Array.isArray(val.columns)) out.columns = (val.columns as string[]).map((f) => renameField(mm, f));
   if (val.orderBy !== undefined) out.orderBy = translateOrderBy(ctx, mm, val.orderBy);
@@ -1651,14 +1559,14 @@ function translateDistinctOn(ctx: Ctx, mm: PrismaModelMap, val: unknown): unknow
 
 /** Rename field keys inside an aggregate block; `_count`'s `_all` passes through. */
 function renameAggBlock(mm: PrismaModelMap, block: unknown, isCount: boolean): unknown {
-  if (block === true || !isPlainObject(block)) return block;
+  if (block === true || !isPlainRecord(block)) return block;
   const out: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(block)) {
     if (isCount && key === '_all') {
       out._all = val;
       continue;
     }
-    out[renameField(mm, key)] = val;
+    setOwn(out, renameField(mm, key), val);
   }
   return out;
 }
@@ -1674,7 +1582,7 @@ function renameAggBlock(mm: PrismaModelMap, block: unknown, isCount: boolean): u
  */
 function renameHaving(mm: PrismaModelMap, having: unknown, depth = 0): unknown {
   assertTranslateDepth(depth, 'having');
-  if (!isPlainObject(having)) return having;
+  if (!isPlainRecord(having)) return having;
   const out: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(having)) {
     if (COMBINATORS.has(key)) {
@@ -1685,7 +1593,7 @@ function renameHaving(mm: PrismaModelMap, having: unknown, depth = 0): unknown {
       out._count = val;
       continue;
     }
-    out[renameField(mm, key)] = val;
+    setOwn(out, renameField(mm, key), val);
   }
   return out;
 }
@@ -1703,7 +1611,7 @@ function reshapeRowOrNull(ctx: Ctx, mm: PrismaModelMap, row: unknown): unknown {
 }
 
 function reshapeRow(ctx: Ctx, mm: PrismaModelMap, row: unknown): unknown {
-  if (!isPlainObject(row)) return row;
+  if (!isPlainRecord(row)) return row;
   const l = lookupsFor(ctx, mm);
   const out: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(row)) {
@@ -1711,7 +1619,7 @@ function reshapeRow(ctx: Ctx, mm: PrismaModelMap, row: unknown): unknown {
       out._count = reshapeCount(l, val);
       continue;
     }
-    const rel = l.reverseRelations[key];
+    const rel = ownLookup(l.reverseRelations, key);
     if (rel) {
       const target = relTargetModel(ctx, mm, key);
       let rv: unknown;
@@ -1720,39 +1628,39 @@ function reshapeRow(ctx: Ctx, mm: PrismaModelMap, row: unknown): unknown {
         // To-one guard: legacy 'many' metadata may still surface an array; the
         // map's cardinality is authoritative → first element or null.
         rv = rel.cardinality === 'one' ? (mapped.length ? mapped[0] : null) : mapped;
-      } else if (isPlainObject(val)) {
+      } else if (isPlainRecord(val)) {
         rv = target ? reshapeRow(ctx, target, val) : val;
       } else {
         rv = val; // null to-one
       }
-      out[rel.prismaName] = rv;
+      setOwn(out, rel.prismaName, rv);
       continue;
     }
     let sv = val;
     if (typeof sv === 'string' && l.timeFields.has(key)) {
       sv = timeStringToDate(sv) ?? sv;
     }
-    out[l.identityFields ? key : (l.reverseFields[key] ?? key)] = sv;
+    setOwn(out, l.identityFields ? key : (ownLookup(l.reverseFields, key) ?? key), sv);
   }
   return out;
 }
 
 function reshapeCount(l: ModelLookups, count: unknown): unknown {
-  if (!isPlainObject(count)) return count;
+  if (!isPlainRecord(count)) return count;
   const out: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(count)) {
     if (key === '_all') {
       out._all = val;
       continue;
     }
-    out[l.reverseRelations[key]?.prismaName ?? key] = val;
+    setOwn(out, ownLookup(l.reverseRelations, key)?.prismaName ?? key, val);
   }
   return out;
 }
 
 /** Reshape an aggregate result: field keys inside blocks → prisma names. */
 function reshapeAggregate(ctx: Ctx, mm: PrismaModelMap, res: unknown): unknown {
-  if (!isPlainObject(res)) return res;
+  if (!isPlainRecord(res)) return res;
   const l = lookupsFor(ctx, mm);
   const out: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(res)) {
@@ -1768,27 +1676,27 @@ function reshapeAggregate(ctx: Ctx, mm: PrismaModelMap, res: unknown): unknown {
     if (typeof sv === 'string' && l.timeFields.has(key)) {
       sv = timeStringToDate(sv) ?? sv;
     }
-    out[l.identityFields ? key : (l.reverseFields[key] ?? key)] = sv;
+    setOwn(out, l.identityFields ? key : (ownLookup(l.reverseFields, key) ?? key), sv);
   }
   return out;
 }
 
 function reshapeAggFieldBlock(l: ModelLookups, block: unknown, isCount: boolean): unknown {
-  if (!isPlainObject(block)) return block;
+  if (!isPlainRecord(block)) return block;
   const out: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(block)) {
     if (isCount && key === '_all') {
       out._all = val;
       continue;
     }
-    out[l.reverseFields[key] ?? key] = val;
+    setOwn(out, ownLookup(l.reverseFields, key) ?? key, val);
   }
   return out;
 }
 
 /** Reshape a groupBy row: by-field keys + aggregate blocks → prisma names. */
 function reshapeGroupRow(ctx: Ctx, mm: PrismaModelMap, row: unknown): unknown {
-  if (!isPlainObject(row)) return row;
+  if (!isPlainRecord(row)) return row;
   const l = lookupsFor(ctx, mm);
   const out: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(row)) {
@@ -1804,7 +1712,7 @@ function reshapeGroupRow(ctx: Ctx, mm: PrismaModelMap, row: unknown): unknown {
     if (typeof sv === 'string' && l.timeFields.has(key)) {
       sv = timeStringToDate(sv) ?? sv;
     }
-    out[l.identityFields ? key : (l.reverseFields[key] ?? key)] = sv;
+    setOwn(out, l.identityFields ? key : (ownLookup(l.reverseFields, key) ?? key), sv);
   }
   return out;
 }
@@ -2085,7 +1993,7 @@ function clientDefaultValue(kind: 'uuid' | 'cuid' | 'now' | 'updatedAt'): unknow
 /** Fill missing create-side client defaults (uuid / cuid / now / updatedAt), by Prisma field name. */
 function applyCreateDefaults(mm: PrismaModelMap, data: unknown): unknown {
   const cd = mm.clientDefaults;
-  if (!cd || !isPlainObject(data)) return data;
+  if (!cd || !isPlainRecord(data)) return data;
   let out = data;
   for (const [field, kind] of Object.entries(cd)) {
     if (out[field] === undefined) {
@@ -2099,7 +2007,7 @@ function applyCreateDefaults(mm: PrismaModelMap, data: unknown): unknown {
 /** Touch @updatedAt fields on the update side (Prisma sets them on every update). */
 function applyUpdateTouch(mm: PrismaModelMap, data: unknown): unknown {
   const cd = mm.clientDefaults;
-  if (!cd || !isPlainObject(data)) return data;
+  if (!cd || !isPlainRecord(data)) return data;
   let out = data;
   for (const [field, kind] of Object.entries(cd)) {
     if (kind === 'updatedAt' && out[field] === undefined) {
@@ -2112,8 +2020,8 @@ function applyUpdateTouch(mm: PrismaModelMap, data: unknown): unknown {
 
 /** Whether TRANSLATED write data carries relation keys (nested-write shapes). */
 function hasNestedKeys(ctx: Ctx, mm: PrismaModelMap, data: unknown): boolean {
-  const rels = ctx.schema.tables[mm.table]?.relations;
-  if (!rels || !isPlainObject(data)) return false;
+  const rels = ownLookup(ctx.schema.tables, mm.table)?.relations;
+  if (!rels || !isPlainRecord(data)) return false;
   return Object.keys(data).some((k) => {
     if (!Object.hasOwn(rels, k)) return false;
     const v = data[k];
@@ -2354,7 +2262,7 @@ function makeDelegate(
           // `optimisticLock.field` is a FIELD NAME, so it is renamed rather than
           // copied: a blind passthrough would send the Prisma spelling into core
           // and break on any model whose column is `@map`ped.
-          if (isPlainObject(a.optimisticLock)) {
+          if (isPlainRecord(a.optimisticLock)) {
             t.optimisticLock = {
               ...a.optimisticLock,
               field: renameField(mm, String(a.optimisticLock.field)),
@@ -2460,7 +2368,7 @@ function makeDelegate(
       const a = args as Args;
       // `count({ select })` answers per field (`{ _all, title }`, a non-null
       // count per field), which is core's aggregate `_count` record form.
-      if (isPlainObject(a.select)) {
+      if (isPlainRecord(a.select)) {
         const countOf = (raw: unknown) => (reshapeAggregate(ctx, mm, raw) as Record<string, unknown>)._count;
         return defer(
           'count',
@@ -2670,7 +2578,7 @@ function junctionModels(ctx: Ctx, map: PrismaCompatMap, tableToModel: Map<string
     for (const rel of Object.values(table.relations ?? {})) {
       if (rel.type !== 'manyToMany') continue;
       const name = rel.through?.table;
-      if (!name || !ctx.schema.tables[name] || tableToModel.has(name)) continue;
+      if (!name || !ownLookup(ctx.schema.tables, name) || tableToModel.has(name)) continue;
       if (registered.has(name)) continue;
       if (seen.has(name)) {
         if (process.env.NODE_ENV !== 'production' && shouldWarnOnce(JUNCTION_WARN_NS, name)) {
@@ -3014,19 +2922,23 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
         return db.$transaction((tx: CompatTransactionClient) => {
           const txDelegates: Record<string, PrismaModelDelegate<PrismaModelTypes>> = {};
           for (const [prismaModel, mm] of delegateModels) {
-            txDelegates[prismaModel] = extendDelegate(
-              makeDelegate(
-                ctx,
-                mm,
-                () => tx.table(mm.table),
-                (fn) => fn((n) => tx.table(n)),
-              ),
+            setOwn(
+              txDelegates,
               prismaModel,
-              exts,
+              extendDelegate(
+                makeDelegate(
+                  ctx,
+                  mm,
+                  () => tx.table(mm.table),
+                  (fn) => fn((n) => tx.table(n)),
+                ),
+                prismaModel,
+                exts,
+              ),
             );
             const alias = prismaPropertyAlias(prismaModel);
-            if (alias && !(alias in map.models) && !(alias in txDelegates)) {
-              txDelegates[alias] = txDelegates[prismaModel]!;
+            if (alias && !Object.hasOwn(map.models, alias) && !Object.hasOwn(txDelegates, alias)) {
+              setOwn(txDelegates, alias, ownLookup(txDelegates, prismaModel));
             }
           }
           // Raw SQL on the transaction's own connection. Prisma's tx client
@@ -3054,12 +2966,12 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
     // client-level base methods. A plain object suffices, every model is a known
     // key from the map, so no dynamic-access proxy is needed.
     const result: Record<string, unknown> = { ...base };
-    for (const [prismaModel, delegate] of delegates) result[prismaModel] = delegate;
+    for (const [prismaModel, delegate] of delegates) setOwn(result, prismaModel, delegate);
     // Prisma-spelling aliases (`prisma.user` for `model User`). Skipped when the
     // lowercased name is itself a model or already taken (never shadow a real key).
     for (const [prismaModel, delegate] of delegates) {
       const alias = prismaPropertyAlias(prismaModel);
-      if (alias && !(alias in result)) result[alias] = delegate;
+      if (alias && !Object.hasOwn(result, alias)) setOwn(result, alias, delegate);
     }
     // Extension `client` members last: every name was checked against the real
     // client keys in applyExtension, so this can never overwrite a delegate.
