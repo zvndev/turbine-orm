@@ -731,6 +731,30 @@ function mysqlColumnType(type: string, maxLength?: number | null): string {
 const MYSQL_INCOMING_ALIAS = '`turbine_excluded`';
 
 /**
+ * The LIKE escape character on MySQL (see `mysqlDialect.likeEscapeCharacter`).
+ * One character, nothing special inside a single-quoted literal in either
+ * `sql_mode`, and not a LIKE metacharacter.
+ */
+const MYSQL_LIKE_ESCAPE = '!';
+/** The LIKE metacharacters under {@link MYSQL_LIKE_ESCAPE}: itself, `%` and `_`. */
+const MYSQL_LIKE_META_G = /[!%_]/g;
+
+/**
+ * A `JSON_OBJECT` key as SQL text that reads the same in every `sql_mode`.
+ * A key without a backslash is a plain quoted literal. A backslash has no
+ * literal spelling that both modes agree on (`'a\\b'` is one backslash by
+ * default and two under `NO_BACKSLASH_ESCAPES`, which Turbine's own
+ * connections set and a caller-supplied pool may not), so such a key is
+ * written as its UTF-8 bytes in hex, which no mode re-reads.
+ */
+function mysqlKeyLiteral(key: string, dialect: Pick<Dialect, 'escapeStringLiteral'>): string {
+  if (!key.includes('\\')) return `'${dialect.escapeStringLiteral(key)}'`;
+  let hex = '';
+  for (const byte of new TextEncoder().encode(key)) hex += byte.toString(16).padStart(2, '0');
+  return `CONVERT(X'${hex}' USING utf8mb4)`;
+}
+
+/**
  * MySQL 8 implementation of the {@link Dialect} contract. Backtick identifier
  * quoting, named `:pN` placeholders (NOT positional `?`, see the module
  * docstring), `JSON_OBJECT` / `JSON_ARRAYAGG` for the single-query nested
@@ -803,16 +827,19 @@ export const mysqlDialect: Dialect = {
    * `NO_BACKSLASH_ESCAPES`, `\` is an escape character inside a string literal,
    * so doubling only `'` (the inherited Postgres rule) leaves a value ending in
    * a backslash able to escape its own closing quote. Escape the backslash
-   * first, then the quote; every other byte is safe raw. The only caller is
-   * `buildJsonObject` (relation / column names from schema metadata), so this
-   * is defence in depth rather than a user-value path.
+   * first, then the quote; every other byte is safe raw.
+   *
+   * That is right for the server's default `sql_mode` only: under
+   * `NO_BACKSLASH_ESCAPES` (which Turbine sets on the connections it opens) the
+   * doubled backslash reads as two. So `buildJsonObject`, the one caller, never
+   * hands it a key holding a backslash (see {@link mysqlKeyLiteral}).
    */
   escapeStringLiteral(value: string): string {
     return value.replace(/\\/g, '\\\\').replace(/'/g, "''");
   },
 
   buildJsonObject(pairs: [key: string, expr: string][]): string {
-    const args = pairs.map(([key, expr]) => `'${this.escapeStringLiteral(key)}', ${expr}`);
+    const args = pairs.map(([key, expr]) => `${mysqlKeyLiteral(key, this)}, ${expr}`);
     return `JSON_OBJECT(${args.join(', ')})`;
   },
 
@@ -1057,6 +1084,23 @@ export const mysqlDialect: Dialect = {
     return `LOWER(${column}) LIKE LOWER(${paramRef})`;
   },
 
+  /**
+   * `!`, not `\`: with the server's default `sql_mode` a backslash escapes
+   * inside a string literal, so the `ESCAPE '\'` every other engine emits is an
+   * unterminated string here, and only a session running with
+   * `NO_BACKSLASH_ESCAPES` reads it as one backslash. Turbine sets that mode on
+   * the connections it opens, never on a pool the caller supplies (it would
+   * change how the caller's own SQL parses), so the clause has to mean the same
+   * thing in both modes, and `'!'` does. The operand is bound, so a backslash in
+   * the VALUE is a plain character under this escape.
+   */
+  likeEscapeCharacter: MYSQL_LIKE_ESCAPE,
+
+  /** Prefix `%`, `_` and the escape character itself with {@link MYSQL_LIKE_ESCAPE}. */
+  escapeLikePattern(value: string): string {
+    return value.replace(MYSQL_LIKE_META_G, `${MYSQL_LIKE_ESCAPE}$&`);
+  },
+
   buildJsonContains(column: string, paramRef: string): string {
     return `JSON_CONTAINS(${column}, ${paramRef})`;
   },
@@ -1265,8 +1309,9 @@ function buildRelationsFromForeignKeys(
   foreignKeys: FKEntry[],
   pkByTable: Map<string, string[]>,
   columnsByTable: Map<string, ColumnMetadata[]>,
+  logger: IntrospectOptions['logger'],
 ): Map<string, Record<string, RelationDef>> {
-  return deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable);
+  return deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable, logger);
 }
 
 /**
@@ -1276,12 +1321,13 @@ function buildRelationsFromForeignKeys(
  *
  * @param exec    Runs a parameterized (`:p1`, `:p2`, …) query and returns rows.
  * @param schema  The MySQL database (schema) name to introspect.
- * @param options Optional include / exclude table-name filters.
+ * @param options Optional include / exclude table-name filters, and the logger
+ *                that receives relation-naming notes (console when absent).
  */
 export async function introspectMysqlWith(
   exec: MysqlRowExecutor,
   schema: string,
-  options: { include?: string[]; exclude?: string[] } = {},
+  options: Pick<IntrospectOptions, 'include' | 'exclude' | 'logger'> = {},
 ): Promise<SchemaMetadata> {
   // ----- Tables -----
   const candidateTables = (
@@ -1421,7 +1467,13 @@ export async function introspectMysqlWith(
   // ----- Relations -----
   // One field per column, as the PostgreSQL introspector requires.
   for (const [tableName, cols] of columnsByTable) assertDistinctColumnFields(tableName, cols);
-  const relationsByTable = buildRelationsFromForeignKeys(tableNames, foreignKeys, pkByTable, columnsByTable);
+  const relationsByTable = buildRelationsFromForeignKeys(
+    tableNames,
+    foreignKeys,
+    pkByTable,
+    columnsByTable,
+    options.logger,
+  );
 
   // ----- Assemble TableMetadata -----
   const tables: Record<string, TableMetadata> = nullRecord<TableMetadata>();
@@ -1488,7 +1540,11 @@ export async function introspectMysql(options: IntrospectOptions): Promise<Schem
     // try/finally runs the finally BEFORE the promise settles, so `pool.end()`
     // closed the pool out from under every introspection query and the whole
     // call failed with mysql2's "Pool is closed".
-    return await introspectMysqlWith(exec, schemaName, { include: options.include, exclude: options.exclude });
+    return await introspectMysqlWith(exec, schemaName, {
+      include: options.include,
+      exclude: options.exclude,
+      logger: options.logger,
+    });
   } finally {
     await pool.end();
   }
@@ -1658,11 +1714,15 @@ export async function turbineMysql(
       connectionLimit: options.connectionLimit ?? 10,
       ...MYSQL_DRIVER_FLAGS,
     });
-    // Every NEW physical connection: disable backslash string escaping so the
-    // builder's `LIKE … ESCAPE '\'` clause (a single literal backslash) is valid
-    // MySQL, by default MySQL would parse `'\'` as an escaped quote (syntax
-    // error). This also makes string-literal semantics match Postgres. Turbine
-    // parameterizes every value, so no behavior depends on backslash escaping.
+    // Every NEW physical connection: disable backslash string escaping, so a
+    // string literal in raw SQL on a Turbine-owned pool reads the way it does
+    // on PostgreSQL. Nothing Turbine GENERATES depends on it any more: the LIKE
+    // clause names `!` (see mysqlDialect.likeEscapeCharacter), a JSON_OBJECT
+    // key holding a backslash is written in hex (mysqlKeyLiteral), and every
+    // value is a bound parameter, so the SQL means the same thing on a pool
+    // the caller supplies, which keeps the caller's own mode. This stays
+    // because removing it would change how raw SQL already written against an
+    // owned pool parses.
     //
     // NOTE: even on a `mysql2/promise` pool, the 'connection' event yields the
     // *raw* (callback-style) connection, its `.query()` returns a non-thenable
@@ -1676,27 +1736,38 @@ export async function turbineMysql(
     owns = true;
   }
 
-  // Probe the server version (fail fast on MySQL < 8.0 / MariaDB).
-  const versionRows = (await pool.query('SELECT VERSION() AS v')).rows as { v?: string }[];
-  assertSupportedVersion(String(versionRows[0]?.v ?? ''));
+  let client: TurbineClient;
+  try {
+    // Probe the server version (fail fast on MySQL < 8.0 / MariaDB).
+    const versionRows = (await pool.query('SELECT VERSION() AS v')).rows as { v?: string }[];
+    assertSupportedVersion(String(versionRows[0]?.v ?? ''));
 
-  // Everything that is not a pool-construction option is client config and
-  // rides through untouched, so a new TurbineConfig option works here the day
-  // it lands. The engine-owned keys come last, so no caller can unbind the
-  // dialect.
-  const { connectionLimit: _connectionLimit, ...clientConfig } = options;
-  const client = new TurbineClient(
-    {
-      ...clientConfig,
-      pool,
-      dialect: mysqlDialect,
-      preparedStatements: false,
-    },
-    // The join strategy is the only read path that consults a recorded dialect
-    // type, so a schema that spells a boolean any other way would read 1/0
-    // there and `true`/`false` everywhere else.
-    normalizeBooleanDialectTypes(schema),
-  );
+    // Everything that is not a pool-construction option is client config and
+    // rides through untouched, so a new TurbineConfig option works here the day
+    // it lands. The engine-owned keys come last, so no caller can unbind the
+    // dialect.
+    const { connectionLimit: _connectionLimit, ...clientConfig } = options;
+    client = new TurbineClient(
+      {
+        ...clientConfig,
+        pool,
+        dialect: mysqlDialect,
+        preparedStatements: false,
+      },
+      // The join strategy is the only read path that consults a recorded dialect
+      // type, so a schema that spells a boolean any other way would read 1/0
+      // there and `true`/`false` everywhere else.
+      normalizeBooleanDialectTypes(schema),
+    );
+  } catch (err) {
+    // A failed factory hands the caller nothing to close, so a pool it BUILT
+    // is closed here: the version probe's connection would otherwise keep the
+    // process alive (the client constructor refuses a bad config, a static
+    // global filter naming no table or column for one). A pool the caller
+    // supplied is the caller's and stays open.
+    if (owns) await pool.end().catch(() => {});
+    throw err;
+  }
 
   if (owns) {
     // Turbine built this pool, so disconnect()/end() must close it. External

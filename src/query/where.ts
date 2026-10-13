@@ -2549,7 +2549,11 @@ export function getArrayElementType(_qi: BuilderCtx, pgType: string): string {
  */
 /**
  * One LIKE comparison, honoring `mode: 'insensitive'` through the dialect and
- * always carrying the `ESCAPE '\'` clause that pairs with {@link escapeLike}.
+ * always carrying the `ESCAPE` clause that pairs with {@link likeOperand}: the
+ * dialect's `likeEscapeCharacter`, else `\` (the character {@link escapeLike}
+ * escapes with). MySQL names `!`, because `'\'` is a syntax error there unless
+ * the session runs with `NO_BACKSLASH_ESCAPES`, which a caller-supplied pool
+ * need not.
  *
  * Shared by the scalar `contains` / `startsWith` / `endsWith` operators and by
  * the JSON substring operators, so the two can never drift into escaping their
@@ -2557,7 +2561,7 @@ export function getArrayElementType(_qi: BuilderCtx, pgType: string): string {
  */
 function buildLikeClause(qi: BuilderCtx, column: string, paramRef: string, insensitive: boolean): string {
   const base = insensitive ? qi.dialect.buildInsensitiveLike(column, paramRef) : `${column} LIKE ${paramRef}`;
-  return `${base} ESCAPE '\\'`;
+  return `${base} ESCAPE '${qi.dialect.likeEscapeCharacter ?? '\\'}'`;
 }
 
 /**
@@ -2616,11 +2620,12 @@ function insensitiveInClause(
  * on that engine.
  *
  * Folding the elements in SQL instead is not reachable from here for the other
- * dialects: each unpacks a bound IN list in a subquery of its OWN shape
- * (`json_each` / `JSON_TABLE` / `OPENJSON`) whose projection is written by the
- * dialect, not by this module, and the length-independence the SQL-template
- * cache depends on rules out the other portable form, one placeholder per
- * element. Restoring the operator on those engines means a dialect hook that
+ * dialects: each unpacks a bound IN list in its OWN way (`json_each` on SQLite,
+ * `OPENJSON` on SQL Server, one placeholder per element expanded by the MySQL
+ * pool shim after the statement leaves the builder), that shape is the
+ * dialect's and not this module's, and the length-independence the
+ * SQL-template cache depends on rules out emitting one placeholder per element
+ * here. Restoring the operator on those engines means a dialect hook that
  * projects the folded element, one correct implementation per engine. Until
  * then a typed refusal is the honest outcome. `equals`, `not` and the LIKE
  * operators are unaffected: they fold a single operand the engine can reach.

@@ -87,7 +87,13 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createRequire } from 'node:module';
 import type { DatabaseSync } from 'node:sqlite';
-import { type PgCompatPool, type PgCompatPoolClient, TurbineClient } from './client.js';
+import {
+  type DisconnectOptions,
+  type DisconnectResult,
+  type PgCompatPool,
+  type PgCompatPoolClient,
+  TurbineClient,
+} from './client.js';
 import {
   type BuiltStatement,
   type BulkInsertStatementInput,
@@ -1460,7 +1466,10 @@ function pragma<T>(db: DatabaseSync, sql: string): T[] {
  * Exposed directly so callers (and tests) can introspect an in-process
  * `:memory:` database without round-tripping through a file path.
  */
-export function introspectSqliteDatabase(db: DatabaseSync, options: { include?: string[]; exclude?: string[] } = {}) {
+export function introspectSqliteDatabase(
+  db: DatabaseSync,
+  options: Pick<IntrospectOptions, 'include' | 'exclude' | 'logger'> = {},
+) {
   // ----- Tables (skip SQLite internal + the migration tracking table) -----
   const candidateTables = pragma<{ name: string }>(
     db,
@@ -1574,7 +1583,7 @@ export function introspectSqliteDatabase(db: DatabaseSync, options: { include?: 
   // pure-junction manyToMany auto-detection included.
   // One field per column, as the PostgreSQL introspector requires.
   for (const [tableName, cols] of columnsByTable) assertDistinctColumnFields(tableName, cols);
-  const relationsByTable = deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable);
+  const relationsByTable = deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable, options.logger);
 
   // ----- Assemble TableMetadata -----
   const tables: Record<string, TableMetadata> = nullRecord<TableMetadata>();
@@ -1635,7 +1644,7 @@ export async function introspectSqlite(options: IntrospectOptions): Promise<Sche
     );
   }
   try {
-    return introspectSqliteDatabase(db, { include: options.include, exclude: options.exclude });
+    return introspectSqliteDatabase(db, { include: options.include, exclude: options.exclude, logger: options.logger });
   } finally {
     db.close();
   }
@@ -1674,8 +1683,15 @@ function openSqliteDatabase(target: string, options: TurbineSqliteOptions): Data
   } catch (err) {
     throw new ConnectionError(`Failed to open SQLite database "${target}": ${(err as Error).message}`);
   }
-  db.exec(`PRAGMA busy_timeout = ${Number(options.busyTimeoutMs ?? 5000)}`);
-  if (options.foreignKeys !== false) db.exec('PRAGMA foreign_keys = ON');
+  try {
+    db.exec(`PRAGMA busy_timeout = ${Number(options.busyTimeoutMs ?? 5000)}`);
+    if (options.foreignKeys !== false) db.exec('PRAGMA foreign_keys = ON');
+  } catch (err) {
+    // Opened here and about to be unreachable: close it rather than leave the
+    // file handle to the garbage collector.
+    db.close();
+    throw err;
+  }
   if (target !== ':memory:' && options.wal !== false) {
     try {
       db.exec('PRAGMA journal_mode = WAL');
@@ -1710,19 +1726,49 @@ export function turbineSqlite(
   schema: SchemaMetadata,
   options: TurbineSqliteOptions = {},
 ): TurbineClient {
-  const db = typeof target === 'string' ? openSqliteDatabase(target, options) : target;
-  const pool = new SqlitePool(db, { busyTimeoutMs: options.busyTimeoutMs, schema });
-  // Everything that is not a SQLite pragma is client config and rides through
-  // untouched, so a new TurbineConfig option works here the day it lands. The
-  // engine-owned keys come last, so no caller can unbind the dialect.
-  const { wal: _wal, busyTimeoutMs: _busyTimeoutMs, foreignKeys: _foreignKeys, ...clientConfig } = options;
-  return new TurbineClient(
-    {
-      ...clientConfig,
-      pool,
-      dialect: sqliteDialect,
-      preparedStatements: false,
-    },
-    schema,
-  );
+  const owns = typeof target === 'string';
+  const db = owns ? openSqliteDatabase(target, options) : target;
+  let pool: SqlitePool;
+  let client: TurbineClient;
+  try {
+    pool = new SqlitePool(db, { busyTimeoutMs: options.busyTimeoutMs, schema });
+    // Everything that is not a SQLite pragma is client config and rides through
+    // untouched, so a new TurbineConfig option works here the day it lands. The
+    // engine-owned keys come last, so no caller can unbind the dialect.
+    const { wal: _wal, busyTimeoutMs: _busyTimeoutMs, foreignKeys: _foreignKeys, ...clientConfig } = options;
+    client = new TurbineClient(
+      {
+        ...clientConfig,
+        pool,
+        dialect: sqliteDialect,
+        preparedStatements: false,
+      },
+      schema,
+    );
+  } catch (err) {
+    // A failed factory hands the caller nothing to close, so a handle it
+    // OPENED is closed here (the client constructor refuses a bad config, a
+    // static global filter naming no table or column for one). A handle the
+    // caller passed in is the caller's and stays open.
+    if (owns) db.close();
+    throw err;
+  }
+
+  if (owns) {
+    // Turbine opened this handle, so disconnect()/end() must close it, as the
+    // other engine factories close a pool they built: the client sees
+    // `TurbineConfig.pool` as external and would otherwise leave it open, still
+    // answering queries after disconnect(). A handle the caller passed in stays
+    // the caller's (disconnect() is a no-op for it).
+    const baseDisconnect = client.disconnect.bind(client);
+    const close = async (options?: DisconnectOptions): Promise<DisconnectResult | undefined> => {
+      const result = options === undefined ? await baseDisconnect() : await baseDisconnect(options);
+      await pool.end();
+      return result ?? undefined;
+    };
+    const patch = client as unknown as { disconnect: typeof close; end: typeof close };
+    patch.disconnect = close;
+    patch.end = close;
+  }
+  return client;
 }

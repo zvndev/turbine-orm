@@ -1560,8 +1560,9 @@ function buildRelationsFromForeignKeys(
   foreignKeys: FKEntry[],
   pkByTable: Map<string, string[]>,
   columnsByTable: Map<string, ColumnMetadata[]>,
+  logger: IntrospectOptions['logger'],
 ): Map<string, Record<string, RelationDef>> {
-  return deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable);
+  return deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable, logger);
 }
 
 /**
@@ -1573,11 +1574,13 @@ function buildRelationsFromForeignKeys(
  *
  * @param exec   Runs a parameterized (`@p1`, `@p2`, …) query and returns rows.
  * @param schema The SQL Server schema to introspect (default `dbo`).
+ * @param options Optional include / exclude table-name filters, and the logger
+ *               that receives relation-naming notes (console when absent).
  */
 export async function introspectMssqlWith(
   exec: MssqlRowExecutor,
   schema = 'dbo',
-  options: { include?: string[]; exclude?: string[] } = {},
+  options: Pick<IntrospectOptions, 'include' | 'exclude' | 'logger'> = {},
 ): Promise<SchemaMetadata> {
   // ----- Tables -----
   const candidateTables = (
@@ -1733,7 +1736,13 @@ export async function introspectMssqlWith(
   // ----- Relations -----
   // One field per column, as the PostgreSQL introspector requires.
   for (const [tableName, cols] of columnsByTable) assertDistinctColumnFields(tableName, cols);
-  const relationsByTable = buildRelationsFromForeignKeys(tableNames, foreignKeys, pkByTable, columnsByTable);
+  const relationsByTable = buildRelationsFromForeignKeys(
+    tableNames,
+    foreignKeys,
+    pkByTable,
+    columnsByTable,
+    options.logger,
+  );
 
   // ----- Assemble TableMetadata -----
   const tables: Record<string, TableMetadata> = nullRecord<TableMetadata>();
@@ -1794,6 +1803,7 @@ export async function introspectMssql(options: IntrospectOptions): Promise<Schem
     return await introspectMssqlWith(exec, options.schema ?? 'dbo', {
       include: options.include,
       exclude: options.exclude,
+      logger: options.logger,
     });
   } finally {
     await pool.close();
@@ -1940,31 +1950,41 @@ export async function turbineMssql(
     }
   }
 
-  // Probe the server version (fail fast on SQL Server < 2016).
+  let client: TurbineClient;
   try {
-    const rows = (await pool.query("SELECT CAST(SERVERPROPERTY('ProductMajorVersion') AS INT) AS v")).rows as {
-      v?: number;
-    }[];
-    assertSupportedVersion(Number(rows[0]?.v ?? 0));
-  } catch (err) {
-    if (err instanceof ConnectionError) throw err;
-    // A non-version probe failure (permissions, etc.) should not block startup.
-  }
+    // Probe the server version (fail fast on SQL Server < 2016).
+    try {
+      const rows = (await pool.query("SELECT CAST(SERVERPROPERTY('ProductMajorVersion') AS INT) AS v")).rows as {
+        v?: number;
+      }[];
+      assertSupportedVersion(Number(rows[0]?.v ?? 0));
+    } catch (err) {
+      if (err instanceof ConnectionError) throw err;
+      // A non-version probe failure (permissions, etc.) should not block startup.
+    }
 
-  // Everything that is not a SQL Server introspection option is client config
-  // and rides through untouched, so a new TurbineConfig option works here the
-  // day it lands. The engine-owned keys come last, so no caller can unbind the
-  // dialect.
-  const { schema: _dbSchema, ...clientConfig } = options;
-  const client = new TurbineClient(
-    {
-      ...clientConfig,
-      pool,
-      dialect: mssqlDialect,
-      preparedStatements: false,
-    },
-    schema,
-  );
+    // Everything that is not a SQL Server introspection option is client config
+    // and rides through untouched, so a new TurbineConfig option works here the
+    // day it lands. The engine-owned keys come last, so no caller can unbind the
+    // dialect.
+    const { schema: _dbSchema, ...clientConfig } = options;
+    client = new TurbineClient(
+      {
+        ...clientConfig,
+        pool,
+        dialect: mssqlDialect,
+        preparedStatements: false,
+      },
+      schema,
+    );
+  } catch (err) {
+    // A failed factory hands the caller nothing to close, so a pool it BUILT
+    // (already connected) is closed here rather than left holding the process
+    // open; the client constructor refuses a bad config, a static global filter
+    // naming no table or column for one. A pool the caller supplied stays open.
+    if (owns) await pool.end().catch(() => {});
+    throw err;
+  }
 
   if (owns) {
     // Turbine built this pool, so disconnect()/end() must close it. External pools

@@ -120,9 +120,11 @@ describe('turbine-orm/mysql, dialect conformance (no Postgres leakage)', () => {
     assert.equal(mysqlDialect.escapeStringLiteral("o'b\\"), "o''b\\\\");
     // Ordinary keys are untouched (JSON_OBJECT output stays byte-identical).
     assert.equal(mysqlDialect.escapeStringLiteral('createdAt'), 'createdAt');
-    // And the escaped key stays inside its literal in real emitted SQL.
+    // JSON_OBJECT does not use it for a key holding a backslash: the doubled
+    // backslash reads as two under NO_BACKSLASH_ESCAPES, which Turbine-built
+    // pools set, so such a key is written as its UTF-8 bytes in hex instead.
     const json = mysqlDialect.buildJsonObject([["we'ird\\", 't0.x']]);
-    assert.equal(json, "JSON_OBJECT('we''ird\\\\', t0.x)");
+    assert.equal(json, "JSON_OBJECT(CONVERT(X'7765276972645c' USING utf8mb4), t0.x)");
   });
 
   it('nested with → JSON_OBJECT / JSON_ARRAYAGG / CAST(... AS JSON) wrap, no json_agg', () => {

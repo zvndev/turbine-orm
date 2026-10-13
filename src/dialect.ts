@@ -7,6 +7,7 @@
  */
 
 import { ValidationError } from './errors.js';
+import type { TurbineLogger } from './logger.js';
 import type { RowLockMode, WithOptions } from './query/types.js';
 import { coerceJsonWireValue, jsonWireCoercionOid } from './query/utils.js';
 import { pgArrayType, pgTypeToTs, type RelationDef, type SchemaMetadata, type TableMetadata } from './schema.js';
@@ -719,12 +720,36 @@ export interface Dialect {
    * of the ENGINE's pattern grammar, not of the SQL text, which is why it is a
    * dialect hook rather than a branch in the where builder.
    *
-   * Whatever a dialect returns MUST be escaped for the same `ESCAPE '\'`
-   * clause, i.e. a backslash prefix, and MUST be identical on the SQL-build and
-   * the cache-hit param-collect paths (both call this one hook, so they cannot
-   * drift).
+   * Whatever a dialect returns MUST be escaped for the character its
+   * {@link likeEscapeCharacter} names (a backslash when that is absent), and
+   * MUST be identical on the SQL-build and the cache-hit param-collect paths
+   * (both call this one hook, so they cannot drift). A dialect that sets
+   * `likeEscapeCharacter` must define this hook too: the shared default
+   * escapes with a backslash.
    */
   escapeLikePattern?(value: string): string;
+
+  /**
+   * The character the emitted `LIKE ... ESCAPE '<c>'` clause names, which
+   * {@link escapeLikePattern} prefixes to every metacharacter it escapes.
+   * Optional: absent means `\`, the clause every other engine emits, and it is
+   * absent on `postgresDialect`, so a dialect built by spreading it inherits
+   * nothing.
+   *
+   * MySQL sets it because a backslash cannot be written as a string literal
+   * that means the same thing in every session. With the server default
+   * `sql_mode`, `\` escapes inside a literal and `ESCAPE '\'` is an
+   * unterminated string (a syntax error); with `NO_BACKSLASH_ESCAPES` it is one
+   * backslash. Turbine sets that mode on the connections it opens, but a pool
+   * the caller supplies keeps the caller's mode, and changing a session mode on
+   * a connection Turbine does not own would change how the caller's own SQL
+   * parses. A character with no meaning inside a string literal reads the same
+   * in both modes.
+   *
+   * It must be one character that needs no escaping inside a single-quoted
+   * literal (never `'` or `\`) and is not itself a LIKE metacharacter.
+   */
+  readonly likeEscapeCharacter?: string;
 
   /** JSON operator support level for this dialect. */
   readonly jsonPathSupport: 'native' | 'function' | 'limited';
@@ -1038,6 +1063,12 @@ export interface IntrospectOptions {
   schema?: string;
   include?: string[];
   exclude?: string[];
+  /**
+   * Where relation-naming notes go (a renamed or shadowing relation). Absent
+   * means the console logger. `introspect()` hands an engine introspector its
+   * whole options object, so this is the caller's `IntrospectOptions.logger`.
+   */
+  logger?: TurbineLogger;
 }
 
 /**
