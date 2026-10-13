@@ -293,6 +293,34 @@ export function relationOptions(spec: true | WithOptions): WithOptions {
 }
 
 /**
+ * A to-many relation's `offset` (`skip` is folded into it at the args seam by
+ * `normalizeWithPagination`, which also refuses it on a to-one relation).
+ */
+export function relationOffset(opts: WithOptions): unknown {
+  return (opts as { offset?: unknown }).offset;
+}
+
+/**
+ * The LIMIT / OFFSET tail of a to-many relation's inner row query. Binds the
+ * limit, then the offset, the order {@link collectRelationSubqueryParams}
+ * mirrors. Without an offset the tail is the plain ` LIMIT $n` it has always
+ * been; with one it goes through the dialect's pagination hook, which knows
+ * how to write an offset with no limit.
+ */
+function relationPagination(
+  qi: BuilderCtx,
+  limit: unknown,
+  offset: unknown,
+  params: unknown[],
+  hasOrder: boolean,
+): string {
+  const limitRef = limit === undefined ? undefined : qi.paginationRef(limit, params, 'relation limit');
+  if (offset === undefined) return limitRef === undefined ? '' : ` LIMIT ${limitRef}`;
+  const offsetRef = qi.paginationRef(offset, params, 'relation offset');
+  return qi.buildPagination(limitRef, offsetRef, hasOrder);
+}
+
+/**
  * Produce a fingerprint for a `with` clause tree. Recursion mirrors
  * buildSelectWithRelations / buildRelationSubquery.
  *
@@ -370,6 +398,10 @@ export function withFingerprint(qi: BuilderCtx, withClause: WithClause | undefin
     // `{limit:3}` and `{limit:5}` would share one cached statement.
     if (opts.limit !== undefined) {
       subParts.push(qi.dialect.inlineLimitOffset ? `l=${opts.limit}` : 'l=1');
+    }
+    const offset = relationOffset(opts);
+    if (offset !== undefined) {
+      subParts.push(qi.dialect.inlineLimitOffset ? `off=${offset}` : 'off=1');
     }
 
     // nested with (recurse)
@@ -461,6 +493,10 @@ export function collectRelationSubqueryParams(
     if (opts.limit !== undefined && !qi.dialect.inlineLimitOffset) {
       params.push(qi.paginationValue(opts.limit, 'relation limit'));
     }
+    const m2mOffset = relationOffset(opts);
+    if (m2mOffset !== undefined && !qi.dialect.inlineLimitOffset) {
+      params.push(qi.paginationValue(m2mOffset, 'relation offset'));
+    }
     if (opts.with) {
       for (const [nestedRelName, nestedSpec] of sortedEntries(opts.with)) {
         const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
@@ -474,7 +510,8 @@ export function collectRelationSubqueryParams(
   // Mirrors buildRelationSubquery's willWrap: `orderBy: {}` is treated as absent.
   const relOrderEntries = opts.orderBy ? orderByEntries(opts.orderBy).filter(([, dir]) => dir !== undefined) : [];
   const hasOrder = relOrderEntries.length > 0;
-  const willWrap = relDef.type === 'hasMany' && (opts.limit !== undefined || hasOrder);
+  const offset = relationOffset(opts);
+  const willWrap = relDef.type === 'hasMany' && (opts.limit !== undefined || offset !== undefined || hasOrder);
 
   // Non-wrapped path: nested relations BEFORE where/limit
   if (!willWrap && opts.with) {
@@ -507,6 +544,9 @@ export function collectRelationSubqueryParams(
   // `limit: 0` pushes (LIMIT 0 is honored), so check !== undefined.
   if (relDef.type === 'hasMany' && opts.limit !== undefined && !qi.dialect.inlineLimitOffset) {
     params.push(qi.paginationValue(opts.limit, 'relation limit'));
+  }
+  if (relDef.type === 'hasMany' && offset !== undefined && !qi.dialect.inlineLimitOffset) {
+    params.push(qi.paginationValue(offset, 'relation offset'));
   }
 
   // Wrapped path: nested relations AFTER where/limit (inside inner subquery)
@@ -1050,6 +1090,25 @@ export function buildRelationOrderBy(
 }
 
 /**
+ * Param-collect mirror of a TO-ONE relation orderBy entry, done by running
+ * {@link buildRelationOrderBy} and discarding its SQL. The build pushes the
+ * target's global filter once per ordered column and, for a chained
+ * `{ author: { org: { name } } }` ordering, once more per hop table, in hop
+ * order. A hand-written mirror that pushed one filter per column bound too few
+ * params (and in the wrong order) as soon as a hop table had a filter, so this
+ * mirror is the build itself and cannot drift from it.
+ */
+export function collectToOneRelationOrderParams(
+  qi: BuilderCtx,
+  relName: string,
+  value: Record<string, unknown>,
+  params: unknown[],
+  ctx?: { meta: TableMetadata; table: string; parentRef: string },
+): void {
+  buildRelationOrderBy(qi, relName, value, 'ord0', params, ctx);
+}
+
+/**
  * Validate a {@link RelationPickOrderBy} entry's scope and shape. Shared by
  * the SQL-build path ({@link buildRelationPickOrderBy}) and the cache-hit
  * param-collect mirror ({@link collectRelationPickOrderParams}) so both
@@ -1409,13 +1468,17 @@ export function collectRelationOrderParams(
       if (isRelationPickOrderBy(dirValue)) {
         throw pickOrderNestedError(qi, key);
       }
-      const relDef = ownLookup(targetMeta.relations, key);
+      // resolveRelationDef, as buildRelationOrderBy resolves it, so a relation
+      // written in its table spelling binds its params on a cache hit too.
+      const relDef = resolveRelationDef(targetMeta.relations, key);
       if (relDef && (relDef.type === 'hasMany' || relDef.type === 'manyToMany')) {
         collectRelationCountParams(qi, relDef, params);
       } else if (relDef) {
-        for (const _col of Object.keys(dirValue as Record<string, unknown>)) {
-          whereMod.collectTargetGlobalFilterAlias(qi, relDef.to, params);
-        }
+        collectToOneRelationOrderParams(qi, key, dirValue as Record<string, unknown>, params, {
+          meta: targetMeta,
+          table: targetTable,
+          parentRef: targetTable,
+        });
       }
       continue;
     }
@@ -2936,6 +2999,14 @@ export function buildRelationSubquery(
   // which mirrors collectRelationSubqueryParams so the SQL cache / pipeline stay
   // in sync.
   if (qi.dialect.buildRelationSubquery) {
+    if (relationOffset(opts) !== undefined) {
+      throw new UnsupportedFeatureError(
+        'relation offset',
+        qi.dialect.name,
+        `On relation "${relDef.name}", use relationLoadStrategy: 'batched', which applies the offset per parent, ` +
+          'or drop `offset` / `skip`.',
+      );
+    }
     return qi.dialect.buildRelationSubquery({
       relDef,
       spec,
@@ -2997,7 +3068,9 @@ export function buildRelationSubquery(
   // it must neither trigger the wrap (dropping nested relations) nor render a
   // dangling `ORDER BY `. `limit: 0` is meaningful (LIMIT 0) and DOES wrap.
   const relOrderEntries = opts.orderBy ? orderByEntries(opts.orderBy).filter(([, dir]) => dir !== undefined) : [];
-  const willWrap = relDef.type === 'hasMany' && (opts.limit !== undefined || relOrderEntries.length > 0);
+  const offset = relationOffset(opts);
+  const willWrap =
+    relDef.type === 'hasMany' && (opts.limit !== undefined || offset !== undefined || relOrderEntries.length > 0);
 
   // manyToMany takes a dedicated JOIN-through-junction path. Nested relations,
   // where, orderBy, and select/omit are handled there (the target alias is the
@@ -3103,8 +3176,8 @@ export function buildRelationSubquery(
   // (and shifts every later placeholder by one). To-one relations ignore limit.
   // `limit: 0` is honored (LIMIT 0 → empty array), so check !== undefined.
   let limitClause = '';
-  if (relDef.type === 'hasMany' && opts.limit !== undefined) {
-    limitClause = ` LIMIT ${qi.paginationRef(opts.limit, params, 'relation limit')}`;
+  if (relDef.type === 'hasMany') {
+    limitClause = relationPagination(qi, opts.limit, offset, params, relOrderEntries.length > 0);
   }
 
   if (relDef.type === 'hasMany') {
@@ -3270,11 +3343,8 @@ export function buildManyToManySubquery(
   const gfExtra = whereMod.targetGlobalFilterAlias(qi, targetTable, talias, params);
   if (gfExtra) whereClause += ` AND ${gfExtra}`;
 
-  // LIMIT, `limit: 0` is honored (LIMIT 0 → empty array)
-  let limitClause = '';
-  if (opts.limit !== undefined) {
-    limitClause = ` LIMIT ${qi.paginationRef(opts.limit, params, 'relation limit')}`;
-  }
+  // LIMIT / OFFSET, `limit: 0` is honored (LIMIT 0 → empty array)
+  const limitClause = relationPagination(qi, opts.limit, relationOffset(opts), params, relOrderEntries.length > 0);
 
   const fromJoin = `FROM ${qTarget} ${talias} JOIN ${qJunction} ${jalias} ON ${joinOn}`;
 
