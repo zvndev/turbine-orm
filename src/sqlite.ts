@@ -19,9 +19,12 @@
  * - `RETURNING` + `ON CONFLICT … DO UPDATE` (SQLite ≥ 3.35) → create / upsert /
  *   update / delete return real rows in a single statement (`resultStrategy =
  *   'returning'`, same as Postgres).
- * - **Single-writer:** one connection / one write transaction at a time;
- *   concurrent writers get `SQLITE_BUSY` (treated as retryable). `journal_mode =
- *   WAL` is enabled for file databases to allow concurrent readers.
+ * - **Single-writer:** one connection / one transaction at a time. On one
+ *   client, statements from other callers wait (FIFO, up to `busyTimeoutMs`)
+ *   while a transaction is open instead of running inside it; another
+ *   process's writer gets `SQLITE_BUSY`. Both surface as the retryable
+ *   `SerializationFailureError`. `journal_mode = WAL` is enabled for file
+ *   databases to allow concurrent readers across connections.
  * - **Unsupported (throw `UnsupportedFeatureError`):** pgvector distance ops,
  *   LISTEN/NOTIFY (`$listen` / `$notify`), RLS `sessionContext`. Advisory-lock
  *   migration locking is unavailable, SQLite is single-writer, so migrations
@@ -68,7 +71,7 @@
  *
  * const db = turbineSqlite(':memory:', schemaDefToMetadata(schema));
  * for (const stmt of schemaToSQL(schema, { dialect: sqliteDialect })) {
- *   await db.raw([stmt] as never);
+ *   await db.rawUnsafe(stmt);
  * }
  *
  * // `db.table(...)`, not `db.users`: the typed property accessors are emitted
@@ -78,6 +81,7 @@
  * ```
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createRequire } from 'node:module';
 import type { DatabaseSync } from 'node:sqlite';
 import { type PgCompatPool, type PgCompatPoolClient, TurbineClient } from './client.js';
@@ -100,13 +104,20 @@ import {
   type UpsertStatementInput,
 } from './dialect.js';
 import type { EngineClientConfig } from './engine-config.js';
-import { ConnectionError, UnsupportedFeatureError, ValidationError } from './errors.js';
-import { applyTableFilters, deriveEngineRelations } from './introspect.js';
+import { ConnectionError, SerializationFailureError, UnsupportedFeatureError, ValidationError } from './errors.js';
+import {
+  applyTableFilters,
+  assertDistinctColumnFields,
+  deriveEngineRelations,
+  nullRecord,
+  printableCatalogName,
+} from './introspect.js';
 import { LRUCache } from './query/utils.js';
 import {
   type ColumnMetadata,
   type IndexMetadata,
   isDateType,
+  type RelationDef,
   type SchemaMetadata,
   snakeToCamel,
   type TableMetadata,
@@ -383,16 +394,33 @@ function augmentSqliteError(err: unknown): unknown {
       target.code = '23514';
       return err;
     default:
-      // SQLITE_BUSY (5) / SQLITE_LOCKED (6) / SQLITE_BUSY_SNAPSHOT (261) etc.
-      if (primary === 5 || primary === 6) {
-        // Map to serialization_failure so withRetry()/$retry() retry it.
-        target.code = '40001';
-        return err;
-      }
+      // SQLITE_BUSY (5) / SQLITE_LOCKED (6) and their extended codes
+      // (SQLITE_BUSY_SNAPSHOT 517, SQLITE_LOCKED_SHAREDCACHE 262, ...). Built as
+      // the typed retryable error HERE rather than annotated, because the raw
+      // paths (`db.transaction(client => ...)`, `db.pool.query`) never pass
+      // through `wrapPgError` and would otherwise hand back the driver error.
+      if (primary === 5 || primary === 6) return sqliteBusyError(e.errcode, message, err);
       // SQLITE_ERROR (1): the statement itself is wrong. See the note above.
       if (primary === 1) return sqliteLogicError(message, err);
       return err;
   }
+}
+
+/**
+ * A `SQLITE_BUSY` / `SQLITE_LOCKED` failure as the retryable typed error, so
+ * `withRetry` / `$retry` and `err.isRetryable` handle it on every path.
+ * `busy_timeout` does not apply to a deferred transaction that read first and
+ * then tried to write (SQLITE_BUSY_SNAPSHOT): only retrying the WHOLE
+ * transaction can succeed, which is what the hint says.
+ */
+function sqliteBusyError(errcode: number, message: string, cause: unknown): SerializationFailureError {
+  const kind = (errcode & 0xff) === 5 ? 'SQLITE_BUSY' : 'SQLITE_LOCKED';
+  return new SerializationFailureError({
+    message:
+      `SQLite database is busy (${kind}, code ${errcode}): ${message}. Another connection holds the lock it needs. ` +
+      'Retry the whole transaction (withRetry does), or raise busyTimeoutMs.',
+    cause,
+  });
 }
 
 /**
@@ -413,7 +441,7 @@ function sqliteLogicError(message: string, cause?: unknown): ValidationError {
   const missingTable = /^no such table:\s*(\S+)/i.exec(message);
   if (missingTable) {
     return new ValidationError(
-      `SQLite has no table "${missingTable[1]}": ${message}. ` +
+      `SQLite has no table "${printableCatalogName(missingTable[1]!)}": ${printableCatalogName(message)}. ` +
         'Create it first (run your migrations, or execute the CREATE TABLE statements for this schema); ' +
         'an in-memory database starts empty on every connection.',
       { cause },
@@ -422,13 +450,13 @@ function sqliteLogicError(message: string, cause?: unknown): ValidationError {
   const missingColumn = /^no such column:\s*(\S+)/i.exec(message);
   if (missingColumn) {
     return new ValidationError(
-      `SQLite has no column "${missingColumn[1]}": ${message}. ` +
+      `SQLite has no column "${printableCatalogName(missingColumn[1]!)}": ${printableCatalogName(message)}. ` +
         'Check the spelling against the table as it exists in this database, ' +
         'and re-run `turbine generate` if the schema has changed.',
       { cause },
     );
   }
-  return new ValidationError(`SQLite rejected the statement: ${message}`, { cause });
+  return new ValidationError(`SQLite rejected the statement: ${printableCatalogName(message)}`, { cause });
 }
 
 // ---------------------------------------------------------------------------
@@ -504,12 +532,83 @@ function runStatement(
   }
 }
 
+/** Default wait, in ms, for a transaction another caller holds open on the handle. */
+const DEFAULT_BUSY_TIMEOUT_MS = 5000;
+
+/**
+ * Marker planted around a `$transaction` callback (see `wrapTransactionCallback`
+ * below), so a statement issued through the CLIENT from inside that callback is
+ * recognized instead of queueing behind the transaction it is part of.
+ */
+interface SqliteTxMarker {
+  readonly pool: SqlitePool;
+  readonly owner: object;
+  /** The marker that was in scope when this one was planted (another pool's transaction, say). */
+  readonly parent: SqliteTxMarker | undefined;
+}
+
+const sqliteTxStorage = new AsyncLocalStorage<SqliteTxMarker>();
+
+/** A caller waiting for the handle; `owner` is installed the moment it is granted. */
+interface HandleWaiter {
+  readonly owner: object;
+  readonly grant: () => void;
+  settled: boolean;
+}
+
+/** Statement heads that leave the handle inside a transaction when they succeed. */
+const TX_OPEN_HEAD = /^\s*(?:begin|savepoint)\b/i;
+/** Statement heads that end the transaction (not `ROLLBACK TO`, which keeps it open). */
+const TX_CLOSE_HEAD = /^\s*(?:commit|end|rollback(?!\s+(?:transaction\s+)?to\b))\b/i;
+
+/**
+ * The one statement the pool can never run: something on the handle while the
+ * transaction that owns it is waiting for that very statement.
+ */
+function statementInsideTransactionError(): UnsupportedFeatureError {
+  return new UnsupportedFeatureError(
+    'A statement on the client while its own transaction is open',
+    'sqlite',
+    'This call was made through the client, not the `tx` client, from inside an open $transaction callback. ' +
+      'SQLite has one connection here, so the call would either join that transaction (and be rolled back with ' +
+      'it) or wait for it forever. Use the `tx` client the callback receives, or make the call after the ' +
+      'transaction completes.',
+  );
+}
+
+/** The error a caller gets when an open transaction holds the handle past `busyTimeoutMs`. */
+function handleBusyError(timeoutMs: number): SerializationFailureError {
+  return new SerializationFailureError({
+    message:
+      `SQLite database is busy: a transaction on this client held it for longer than busyTimeoutMs (${timeoutMs} ms). ` +
+      'Retry the operation (withRetry does), keep transactions short, or raise busyTimeoutMs.',
+  });
+}
+
+/** Options for {@link SqlitePool}. */
+export interface SqlitePoolOptions {
+  /**
+   * How long, in ms, a statement waits for a transaction another caller has
+   * open on this handle before failing with a retryable
+   * `SerializationFailureError`. Default: 5000, the same bound as
+   * `PRAGMA busy_timeout`.
+   */
+  busyTimeoutMs?: number;
+}
+
 /**
  * A `PgCompatPool` backed by a single `node:sqlite` `DatabaseSync` connection.
  * SQLite is single-connection by nature (a `:memory:` database is per-handle),
- * so `connect()` hands back a client over the **same** handle, transactions
- * (`BEGIN`/`COMMIT`/`ROLLBACK`, `SAVEPOINT` nesting) just run on it. Queries are
- * serialized; this is the documented single-writer model.
+ * so `connect()` hands back a client over the **same** handle.
+ *
+ * One handle carries one transaction, so the pool decides who may use it. A
+ * caller whose statement opens a transaction OWNS the handle until that
+ * transaction ends; every other caller's statements, plain queries included,
+ * wait their turn in FIFO order (bounded by `busyTimeoutMs`) instead of running
+ * inside it. Without that, a write issued outside an open transaction joined
+ * it, reported success, and was rolled back with it, and reads saw its
+ * uncommitted rows. A checkout that does not open a transaction (a stream, a
+ * connectivity check) holds nothing, so other callers keep running beside it.
  */
 export class SqlitePool implements PgCompatPool {
   /** The underlying `node:sqlite` handle, exposed as an escape hatch (seed/DDL). */
@@ -521,28 +620,49 @@ export class SqlitePool implements PgCompatPool {
    * unbounded distinct statements (raw SQL, an IN-list that inlines).
    */
   private readonly booleanCache = new LRUCache<string, Set<string> | null>(1000);
+  private readonly busyTimeoutMs: number;
+  /** Who may run statements on the handle right now; `null` when nobody holds it. */
+  private owner: object | null = null;
+  private readonly waiters: HandleWaiter[] = [];
+  /** The owner for statements sent through `pool.query()` rather than a checkout. */
+  private readonly poolOwner = {};
+  /** Transaction state when the driver cannot report it (`isTransaction` arrived in Node 22.16). */
+  private trackedTransaction = false;
 
-  constructor(db: DatabaseSync) {
+  constructor(db: DatabaseSync, options: SqlitePoolOptions = {}) {
     this.db = db;
+    const t = Number(options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS);
+    this.busyTimeoutMs = Number.isFinite(t) && t >= 0 ? t : DEFAULT_BUSY_TIMEOUT_MS;
   }
 
   // biome-ignore lint/suspicious/noExplicitAny: pg-compat query is generic over the row shape; runStatement returns plain objects.
   async query(text: QueryArg, values?: unknown[]): Promise<any> {
     const { text: sql, params } = normalizeQueryArgs(text, values);
-    return runStatement(this.db, sql, params, this.booleanCache);
+    return this.runAs(this.poolOwner, sql, params);
   }
 
   async connect(): Promise<PgCompatPoolClient> {
-    const db = this.db;
-    const booleanCache = this.booleanCache;
+    if (this.closed) throw new ConnectionError('This SQLite client has been disconnected.');
+    const owner = {};
+    let released = false;
     return {
       // biome-ignore lint/suspicious/noExplicitAny: see query() above.
       query: async (text: QueryArg, values?: unknown[]): Promise<any> => {
+        if (released) {
+          throw new ConnectionError(
+            'This SQLite connection was released (its transaction ended or timed out); ' +
+              'run the statement through the client or a new transaction.',
+          );
+        }
         const { text: sql, params } = normalizeQueryArgs(text, values);
-        return runStatement(db, sql, params, booleanCache);
+        return this.runAs(owner, sql, params);
       },
+      wrapTransactionCallback: <R>(fn: () => Promise<R>): Promise<R> =>
+        sqliteTxStorage.run({ pool: this, owner, parent: sqliteTxStorage.getStore() }, fn),
       release: () => {
-        // Single shared connection, nothing to return to a pool.
+        if (released) return;
+        released = true;
+        this.releaseOwner(owner);
       },
     };
   }
@@ -551,6 +671,95 @@ export class SqlitePool implements PgCompatPool {
     if (this.closed) return;
     this.closed = true;
     this.db.close();
+  }
+
+  /** Is the handle inside a transaction right now? */
+  private inTransaction(): boolean {
+    const reported = (this.db as { isTransaction?: unknown }).isTransaction;
+    return typeof reported === 'boolean' ? reported : this.trackedTransaction;
+  }
+
+  /** Run one statement for `owner`, waiting first if another caller's transaction holds the handle. */
+  private async runAs(owner: object, sql: string, params: unknown[]) {
+    if (this.closed) throw new ConnectionError('This SQLite client has been disconnected.');
+    if (this.owner !== owner) {
+      if (this.owner !== null || this.waiters.length > 0) {
+        if (this.calledFromOwnersCallback()) throw statementInsideTransactionError();
+        await this.waitForHandle(owner);
+      } else {
+        this.owner = owner;
+      }
+    }
+    try {
+      const result = runStatement(this.db, sql, params, this.booleanCache);
+      if (TX_OPEN_HEAD.test(sql)) this.trackedTransaction = true;
+      else if (TX_CLOSE_HEAD.test(sql)) this.trackedTransaction = false;
+      return result;
+    } finally {
+      // A statement that leaves no transaction open hands the handle on.
+      if (this.owner === owner && !this.inTransaction()) this.handOff();
+    }
+  }
+
+  /** True when the current async context is the callback of the transaction that owns the handle. */
+  private calledFromOwnersCallback(): boolean {
+    for (let m = sqliteTxStorage.getStore(); m; m = m.parent) {
+      if (m.pool === this && m.owner === this.owner) return true;
+    }
+    return false;
+  }
+
+  private waitForHandle(owner: object): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const waiter: HandleWaiter = {
+        owner,
+        settled: false,
+        grant: () => {
+          if (timer) clearTimeout(timer);
+          resolve();
+        },
+      };
+      this.waiters.push(waiter);
+      timer = setTimeout(() => {
+        if (waiter.settled) return;
+        waiter.settled = true;
+        const at = this.waiters.indexOf(waiter);
+        if (at >= 0) this.waiters.splice(at, 1);
+        reject(handleBusyError(this.busyTimeoutMs));
+      }, this.busyTimeoutMs);
+    });
+  }
+
+  /** Give the handle to the next waiter, which runs its statement as soon as it resumes. */
+  private handOff(): void {
+    this.owner = null;
+    while (this.waiters.length > 0) {
+      const next = this.waiters.shift()!;
+      if (next.settled) continue;
+      next.settled = true;
+      this.owner = next.owner;
+      next.grant();
+      return;
+    }
+  }
+
+  /**
+   * A checkout ended. If it still holds an open transaction (a timed-out or
+   * abandoned callback), roll it back first, so the next caller does not
+   * start inside it.
+   */
+  private releaseOwner(owner: object): void {
+    if (this.owner !== owner) return;
+    if (this.inTransaction() && !this.closed) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // Nothing left to roll back.
+      }
+      this.trackedTransaction = false;
+    }
+    this.handOff();
   }
 }
 
@@ -821,6 +1030,13 @@ export const sqliteDialect: Dialect = {
     );
   },
 
+  // A SQLite transaction is always SERIALIZABLE, which satisfies every level
+  // `$transaction({ isolationLevel })` can ask for, and the inherited
+  // `BEGIN ISOLATION LEVEL ...` is a syntax error here.
+  beginStatement(): string {
+    return 'BEGIN';
+  },
+
   buildInsensitiveLike(column: string, paramRef: string): string {
     // COLLATE NOCASE is ASCII-only (no Unicode case folding), documented limit.
     return `${column} LIKE ${paramRef} COLLATE NOCASE`;
@@ -1089,17 +1305,19 @@ export function introspectSqliteDatabase(db: DatabaseSync, options: { include?: 
   // same logical schema, legacy-first naming, per-column disambiguation,
   // collision resolution against scalar column fields, and the conservative
   // pure-junction manyToMany auto-detection included.
+  // One field per column, as the PostgreSQL introspector requires.
+  for (const [tableName, cols] of columnsByTable) assertDistinctColumnFields(tableName, cols);
   const relationsByTable = deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable);
 
   // ----- Assemble TableMetadata -----
-  const tables: Record<string, TableMetadata> = {};
+  const tables: Record<string, TableMetadata> = nullRecord<TableMetadata>();
   for (const tableName of tableNames) {
     const columns = columnsByTable.get(tableName) ?? [];
-    const columnMap: Record<string, string> = {};
-    const reverseColumnMap: Record<string, string> = {};
+    const columnMap: Record<string, string> = nullRecord<string>();
+    const reverseColumnMap: Record<string, string> = nullRecord<string>();
     const dateColumns = new Set<string>();
-    const dialectTypes: Record<string, string> = {};
-    const pgTypes: Record<string, string> = {};
+    const dialectTypes: Record<string, string> = nullRecord<string>();
+    const pgTypes: Record<string, string> = nullRecord<string>();
     const allColumns: string[] = [];
 
     for (const col of columns) {
@@ -1122,7 +1340,7 @@ export function introspectSqliteDatabase(db: DatabaseSync, options: { include?: 
       allColumns,
       primaryKey: pkByTable.get(tableName) ?? [],
       uniqueColumns: uniqueByTable.get(tableName) ?? [],
-      relations: relationsByTable.get(tableName) ?? {},
+      relations: relationsByTable.get(tableName) ?? nullRecord<RelationDef>(),
       indexes: indexesByTable.get(tableName) ?? [],
     };
   }
@@ -1171,7 +1389,11 @@ export interface TurbineSqliteOptions extends EngineClientConfig {
    * Ignored for `':memory:'`. Default: `true`.
    */
   wal?: boolean;
-  /** `PRAGMA busy_timeout` in ms, how long a writer waits on `SQLITE_BUSY`. Default: 5000. */
+  /**
+   * How long, in ms, a statement waits for the database: `PRAGMA busy_timeout`
+   * for another process's lock, and the wait behind a transaction another
+   * caller has open on this client. Default: 5000.
+   */
   busyTimeoutMs?: number;
   /** Enable `PRAGMA foreign_keys` enforcement. Default: `true`. */
   foreignKeys?: boolean;
@@ -1222,7 +1444,7 @@ export function turbineSqlite(
   options: TurbineSqliteOptions = {},
 ): TurbineClient {
   const db = typeof target === 'string' ? openSqliteDatabase(target, options) : target;
-  const pool = new SqlitePool(db);
+  const pool = new SqlitePool(db, { busyTimeoutMs: options.busyTimeoutMs });
   // Everything that is not a SQLite pragma is client config and rides through
   // untouched, so a new TurbineConfig option works here the day it lands. The
   // engine-owned keys come last, so no caller can unbind the dialect.
