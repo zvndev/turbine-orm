@@ -2006,6 +2006,18 @@ export function wrapPgError(err: unknown): unknown {
         cause: err,
         outcome: 'not-executed',
       });
+    case '25P02':
+      // in_failed_sql_transaction: a statement sent after an earlier one failed. Turbine's own
+      // transactions refuse it first, with the failure attached (transaction-state.ts); this is
+      // the driver's answer on a path that sent it anyway (a connection used outside Turbine).
+      return new TransactionRolledBackError(
+        'A statement was sent after an earlier statement in the same transaction failed. PostgreSQL ignores ' +
+          'every statement after a failure until the transaction, or the savepoint it ran in, is rolled back, ' +
+          'so nothing more can be saved in it. Catching the error does not undo the abort: let it leave the ' +
+          'transaction, or run the statement that can fail in its own nested `tx.$transaction(...)`, which ' +
+          'rolls back only that savepoint. The earlier failure is the error that statement threw.',
+        { cause: err },
+      );
     default:
       if (CONNECTION_ERROR_CODES.has(e.code)) {
         const pgMessage = typeof e.message === 'string' && e.message.length > 0 ? e.message : undefined;

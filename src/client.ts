@@ -30,7 +30,14 @@ import {
   settleLongIdleCheckouts,
   watchCheckouts,
 } from './connection-guard.js';
-import { detectPooler, statementTimeoutSetting, withStartupSetting } from './connection-url.js';
+import {
+  type ConnectionTarget,
+  detectPoolerTarget,
+  fillTargetFromEnvironment,
+  parseConnectionTarget,
+  statementTimeoutSetting,
+  withStartupSetting,
+} from './connection-url.js';
 import { type DiagnosticsConfig, type ResolvedDiagnostics, resolveDiagnostics } from './diagnostics.js';
 import { type Dialect, postgresDialect } from './dialect.js';
 import {
@@ -98,6 +105,7 @@ import {
   commitTransaction,
   rolledBackError,
   TRANSACTION_STATE,
+  type TransactionScope,
   TransactionState,
   unawaitedWorkError,
 } from './transaction-state.js';
@@ -1272,7 +1280,7 @@ function resolveIsolationLevel(level: string | undefined): string | undefined {
   const sql = ownLookup(ISOLATION_LEVELS, level);
   if (sql === undefined) {
     throw new ValidationError(
-      `$transaction: unknown isolationLevel ${JSON.stringify(level)}. ` +
+      `$transaction: unknown isolationLevel ${describeValue(level)}. ` +
         `Expected one of: ${Object.keys(ISOLATION_LEVELS).join(', ')} (case-sensitive).`,
     );
   }
@@ -1299,6 +1307,29 @@ const TX_ABORT_GRACE_MS = 2000;
 const DEFAULT_MAX_LIFETIME_SECONDS = 1800;
 
 /**
+ * A value as an error message should quote it. `JSON.stringify` writes `NaN` and
+ * `Infinity` as `null`, throws on a bigint, and returns `undefined` for a symbol
+ * or a function, so a message built from it can name a value the caller never
+ * passed.
+ */
+function describeValue(value: unknown): string {
+  switch (typeof value) {
+    case 'string':
+      return JSON.stringify(value);
+    case 'bigint':
+      return `${value}n`;
+    case 'symbol':
+      return value.toString();
+    case 'function':
+      return 'a function';
+    case 'object':
+      return value === null ? 'null' : Array.isArray(value) ? 'an array' : 'an object';
+    default:
+      return String(value);
+  }
+}
+
+/**
  * `allowBuiltinSettings` as a lower-cased set (PostgreSQL folds setting names).
  * Each entry must be a plain un-dotted setting name; anything else is E003.
  */
@@ -1313,7 +1344,7 @@ function resolveBuiltinSettingsAllowlist(value: unknown): ReadonlySet<string> {
   for (const name of value) {
     if (typeof name !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
       throw new ValidationError(
-        `$transaction: allowBuiltinSettings entry ${JSON.stringify(name)} is not a PostgreSQL setting name ` +
+        `$transaction: allowBuiltinSettings entry ${describeValue(name)} is not a PostgreSQL setting name ` +
           '(a plain identifier such as "statement_timeout"). Namespaced custom settings need no entry.',
       );
     }
@@ -1322,13 +1353,24 @@ function resolveBuiltinSettingsAllowlist(value: unknown): ReadonlySet<string> {
   return names;
 }
 
-/** SQLSTATEs with which the server refuses a `set_config`, and what each means for the caller. */
-const SESSION_SETTING_REFUSALS: Readonly<Record<string, string>> = Object.assign(Object.create(null), {
-  '22023': 'the value is not valid for this setting (for `role`, the role must exist)',
-  '42704': 'the server has no setting by that name',
-  '42501': 'the database role is not allowed to change it',
-  '55P02': 'it cannot be changed after the connection has started',
-});
+/**
+ * SQLSTATEs with which the server refuses a `set_config`, and what each means
+ * for the caller. A function of the setting where the cause depends on it: the
+ * same SQLSTATE says "no such role" for `role` and "unreadable duration" for
+ * `statement_timeout`.
+ */
+const SESSION_SETTING_REFUSALS: Readonly<Record<string, (setting: string) => string>> = Object.assign(
+  Object.create(null),
+  {
+    '22023': (setting: string) =>
+      setting === 'role' || setting === 'session_authorization'
+        ? 'the value is not valid for this setting (the role must exist)'
+        : 'the value is not valid for this setting',
+    '42704': () => 'the server has no setting by that name',
+    '42501': () => 'the database role is not allowed to change it',
+    '55P02': () => 'it cannot be changed after the connection has started',
+  },
+);
 
 /**
  * Apply one `sessionContext` entry. A refusal by the server names the setting
@@ -1343,10 +1385,10 @@ async function applySessionSetting(
     await client.query(setting.sql, setting.params);
   } catch (err) {
     const code = (err as { code?: unknown } | null)?.code;
-    const reason = typeof code === 'string' ? SESSION_SETTING_REFUSALS[code] : undefined;
-    if (reason === undefined) throw wrapPgError(err);
+    const describe = typeof code === 'string' ? SESSION_SETTING_REFUSALS[code] : undefined;
+    if (describe === undefined) throw wrapPgError(err);
     throw new ValidationError(
-      `sessionContext["${setting.name}"] was refused by the server: ${reason} (SQLSTATE ${code}). ` +
+      `sessionContext["${setting.name}"] was refused by the server: ${describe(setting.name.toLowerCase())} (SQLSTATE ${code}). ` +
         'The transaction was rolled back before your callback ran.',
       { cause: err },
     );
@@ -1387,7 +1429,7 @@ function beginStatementFor(dialect: Dialect, isolationSql: string | undefined, r
 function resolveReadOnly(value: unknown): boolean {
   if (value === undefined || value === false) return false;
   if (value === true) return true;
-  throw new ValidationError(`$transaction: readOnly must be true or false, received ${JSON.stringify(value)}.`);
+  throw new ValidationError(`$transaction: readOnly must be true or false, received ${describeValue(value)}.`);
 }
 
 /** Whether `pending` settles (either way) within `ms`. */
@@ -1452,35 +1494,68 @@ function assertSqlText(text: unknown, api: string): asserts text is string {
 }
 
 /**
- * The connection `transaction(fn)` hands its callback: the checked-out client,
- * with every statement routed through the transaction's state, so one issued
- * after the transaction settled is refused rather than run on a connection
- * that is back in the pool. `release` is refused too: the transaction returns
- * the connection itself. Everything else is the driver client's own.
+ * The connection `transaction(fn)` and `tx.$connection()` hand out: the
+ * checked-out client, with every statement routed through the transaction's
+ * state, so one issued after the transaction settled is refused rather than
+ * run on a connection that is back in the pool, and transaction-control SQL
+ * (`COMMIT`, `BEGIN`, ...) is refused rather than ending the transaction behind
+ * the state that tracks it.
+ *
+ * What would take the connection away is refused too: `release` (the
+ * transaction returns it itself), `end` and `connect`, and the driver's
+ * `connection` (the wire-level object, whose writes bypass every check here) is
+ * hidden. Everything else is the driver client's own.
  */
-function closableRawClient(client: PgCompatPoolClient, state: TransactionState): PgCompatPoolClient {
+function closableRawClient(
+  client: PgCompatPoolClient,
+  state: TransactionState,
+  scope: TransactionScope = state.rootScope,
+): PgCompatPoolClient {
   const target = client as unknown as Record<PropertyKey, unknown>;
   const send = target.query as (...args: unknown[]) => unknown;
   const query = (...args: unknown[]): unknown => {
-    const first = args[0] as { submit?: unknown } | null;
+    const first = args[0] as { submit?: unknown; text?: unknown } | string | null;
+    const text = typeof first === 'string' ? first : first?.text;
     // Callback form and submittables (cursors, COPY streams) answer through
     // their own channel, not a promise: checked, then passed straight through.
-    if (typeof args[args.length - 1] === 'function' || typeof first?.submit === 'function') {
+    if (
+      typeof args[args.length - 1] === 'function' ||
+      typeof (first as { submit?: unknown } | null)?.submit === 'function'
+    ) {
       state.assertOpen();
+      state.screenRaw(text);
       return send.apply(client, args);
     }
-    return state.run(() => send.apply(client, args) as Promise<unknown>);
+    return state.runRaw(text, () => send.apply(client, args) as Promise<unknown>, scope);
   };
   const release = (): never => {
     throw new ValidationError(
       'transaction(): the callback must not release its client; the transaction releases it after COMMIT or ROLLBACK.',
     );
   };
+  const refuse = (verb: string): (() => never) => {
+    return () => {
+      throw new ValidationError(
+        `transaction(): the callback must not ${verb} its client; the transaction owns the connection and ` +
+          'returns it to the pool after COMMIT or ROLLBACK.',
+      );
+    };
+  };
+  const refused = new Map<PropertyKey, () => never>([
+    ['end', refuse('end')],
+    ['connect', refuse('connect')],
+  ]);
   const bound = new Map<PropertyKey, unknown>();
   return new Proxy(target, {
+    has(t, prop) {
+      return prop === 'connection' ? false : Reflect.has(t, prop);
+    },
     get(t, prop) {
       if (prop === 'query') return query;
       if (prop === 'release') return release;
+      if (prop === 'connection') return undefined;
+      const refusal = refused.get(prop);
+      if (refusal !== undefined) return refusal;
       const value = Reflect.get(t, prop, t);
       if (typeof value !== 'function') return value;
       let fn = bound.get(prop);
@@ -1542,6 +1617,13 @@ export class TransactionClient {
   private readonly dialect: Dialect;
   /** Open/closed state, first failure and savepoint blocks, shared by everything this client hands out. */
   private readonly state: TransactionState;
+  /**
+   * Where in the transaction this handle sits: the transaction itself, or the
+   * nested block whose callback received it. Statements carry it, so one issued
+   * through an outer handle from inside a block can be told from one issued
+   * through the block's own.
+   */
+  private readonly scope: TransactionScope;
   /** What {@link $connection} hands out, built on first use. */
   private connectionHandle?: PgCompatPoolClient;
 
@@ -1566,9 +1648,12 @@ export class TransactionClient {
      * multi-statement writes. Omitted for Turbine's own implicit transactions.
      */
     state?: TransactionState,
+    /** The nested block this handle belongs to; omitted for the transaction's own handle. */
+    scope?: TransactionScope,
   ) {
     this.dialect = queryOptions?.dialect ?? postgresDialect;
     this.state = state ?? new TransactionState(client, this.dialect);
+    this.scope = scope ?? this.state.rootScope;
     // Auto-create typed table accessors for all tables in the schema
     for (const tableName of Object.keys(schema.tables)) {
       const camelName = tableAccessorName(tableName);
@@ -1610,9 +1695,12 @@ export class TransactionClient {
    *   ROLLBACK is refused with `ValidationError` (E003) instead of running on a
    *   connection that is back in the pool.
    * - `release()` is refused. The transaction returns the connection.
-   * - Do not send COMMIT, ROLLBACK or SAVEPOINT on it. The transaction ends
-   *   itself, and Turbine would then commit or roll back a transaction that is
-   *   no longer open. Use `tx.$transaction` for a savepoint.
+   * - COMMIT, ROLLBACK, BEGIN, SAVEPOINT, RELEASE and SET TRANSACTION are
+   *   refused with `ValidationError` (E003): the transaction ends itself, and
+   *   Turbine would then commit or roll back a transaction that is no longer
+   *   open. Use `tx.$transaction` for a savepoint.
+   * - `end()` and `connect()` are refused like `release()`, and the driver's
+   *   `connection` object is not reachable through it.
    * - Its queries use the driver's own parsers. On a pool you supplied, that is
    *   your parser configuration, not Turbine's int8 and UTC readings.
    *
@@ -1641,7 +1729,7 @@ export class TransactionClient {
           'connection to hand out. Use `tx.raw` / `tx.rawUnsafe`, or a TCP pool.',
       );
     }
-    this.connectionHandle = closableRawClient(raw, this.state);
+    this.connectionHandle = closableRawClient(raw, this.state, this.scope);
     return this.connectionHandle;
   }
 
@@ -1652,9 +1740,27 @@ export class TransactionClient {
    * started side by side (`Promise.all`) run one after another, because
    * savepoints are a stack on the connection and a rollback in one would
    * otherwise undo a sibling that already reported success.
+   *
+   * The callback receives a `tx` of its own, bound to the block. Use it for the
+   * work inside the block: a statement through the OUTER `tx` from inside the
+   * block would run in the block's savepoint and be undone with it, so it is
+   * refused with `ValidationError` (E003).
    */
   async $transaction<R>(fn: (tx: TransactionClient) => Promise<R>): Promise<R> {
-    return this.state.withSavepoint(() => fn(this));
+    return this.state.withBlock((scope) => fn(this.inScope(scope)), this.scope);
+  }
+
+  /** A handle on the same transaction bound to nested block `scope`. */
+  private inScope(scope: TransactionScope): TransactionClient {
+    return new TransactionClient(
+      this.client,
+      this.schema,
+      this.middlewares,
+      this.queryOptions,
+      this.sourcePool,
+      this.state,
+      scope,
+    );
   }
 
   /**
@@ -1698,23 +1804,27 @@ export class TransactionClient {
     const params = this.rawParams(bound, 'sql');
     const state = this.state;
     const client = this.client;
+    const scope = this.scope;
     const pool = {
-      query: (text: string, vals?: unknown[]) => state.run(() => client.query(text, vals)),
+      query: (text: string, vals?: unknown[]) => state.runRaw(text, () => client.query(text, vals), scope),
     } as unknown as PgCompatPool;
     return new TypedSqlQuery<T>(pool, sql, params, false, undefined, this.queryOptions?._onQuery);
   }
 
   private async runRaw<T>(sql: string, values: unknown[], action: string): Promise<T[]> {
     const params = this.rawParams(values, action);
-    const result = await this.state.run(() =>
-      runReportedStatement(
-        this.queryOptions?._onQuery,
-        rawIdentity(action),
-        sql,
-        params,
-        () => this.client.query(sql, params),
-        wrapPgError,
-      ),
+    const result = await this.state.runRaw(
+      sql,
+      () =>
+        runReportedStatement(
+          this.queryOptions?._onQuery,
+          rawIdentity(action),
+          sql,
+          params,
+          () => this.client.query(sql, params),
+          wrapPgError,
+        ),
+      this.scope,
     );
     return result.rows as T[];
   }
@@ -1758,15 +1868,18 @@ export class TransactionClient {
     action = 'rawQuery',
   ): Promise<{ rows: T[]; rowCount: number | null }> {
     const bound = this.rawParams(params as unknown[], action);
-    const result = await this.state.run(() =>
-      runReportedStatement(
-        this.queryOptions?._onQuery,
-        rawIdentity(action),
-        text,
-        bound,
-        () => this.client.query(text, bound),
-        wrapPgError,
-      ),
+    const result = await this.state.runRaw(
+      text,
+      () =>
+        runReportedStatement(
+          this.queryOptions?._onQuery,
+          rawIdentity(action),
+          text,
+          bound,
+          () => this.client.query(text, bound),
+          wrapPgError,
+        ),
+      this.scope,
     );
     return { rows: result.rows as T[], rowCount: result.rowCount };
   }
@@ -1784,6 +1897,7 @@ export class TransactionClient {
   private createTxPool(): PgCompatPool {
     const client = this.client;
     const state = this.state;
+    const scope = this.scope;
     const query = (textOrConfig: string | { name?: string; text: string; values?: unknown[] }, values?: unknown[]) =>
       state.run(async () => {
         try {
@@ -1799,7 +1913,7 @@ export class TransactionClient {
         } catch (err) {
           throw wrapPgError(err);
         }
-      });
+      }, scope);
     // Return a minimal pool-compatible object that routes queries
     // through the transaction client
     const txPool: Record<PropertyKey, unknown> = {
@@ -2554,7 +2668,8 @@ export class TurbineClient {
    * The first connection target this client opens that names a connection
    * pooler (see `detectPooler`), as `host:port`, or `undefined`. Covers the
    * connection string, the DATABASE_URL fallback, host/port settings, and
-   * string replicas.
+   * string replicas, each read the way node-postgres reads it: a host or port
+   * the target leaves unset is `PGHOST` / `PGPORT`.
    */
   private static poolerEndpoint(config: TurbineConfig): string | undefined {
     const explicit =
@@ -2564,15 +2679,21 @@ export class TurbineClient {
       config.database != null ||
       config.user != null ||
       config.password != null;
-    const targets: string[] = [];
-    if (config.connectionString) targets.push(config.connectionString);
-    else if (!explicit && process.env.DATABASE_URL) targets.push(process.env.DATABASE_URL);
-    else if (config.host != null || config.port != null) {
-      targets.push(`postgresql://${config.host ?? 'localhost'}:${config.port ?? 5432}/`);
+    const targets: ConnectionTarget[] = [];
+    if (config.connectionString) targets.push(parseConnectionTarget(config.connectionString));
+    else if (!explicit && process.env.DATABASE_URL) targets.push(parseConnectionTarget(process.env.DATABASE_URL));
+    else {
+      targets.push({
+        host: config.host ? config.host.toLowerCase() : null,
+        port: typeof config.port === 'number' ? config.port : null,
+      });
     }
-    for (const replica of config.replicas ?? []) if (typeof replica === 'string' && replica) targets.push(replica);
+    for (const replica of config.replicas ?? []) {
+      if (typeof replica === 'string' && replica) targets.push(parseConnectionTarget(replica));
+    }
+    const environment = { host: pgEnv('PGHOST'), port: pgEnv('PGPORT') };
     for (const target of targets) {
-      const found = detectPooler(target);
+      const found = detectPoolerTarget(fillTargetFromEnvironment(target, environment));
       if (found.pooled) return `${found.host ?? 'localhost'}:${found.port ?? 5432}`;
     }
     return undefined;
@@ -3553,7 +3674,7 @@ export class TurbineClient {
     const timeout = options?.timeout;
     if (timeout !== undefined && timeout !== 0 && !(typeof timeout === 'number' && timeout > 0 && timeout < 2 ** 31)) {
       throw new ValidationError(
-        `$transaction: timeout must be a positive number of milliseconds (or 0 for none), received ${JSON.stringify(timeout)}.`,
+        `$transaction: timeout must be a positive number of milliseconds (or 0 for none), received ${describeValue(timeout)}.`,
       );
     }
     return { begin, sessionConfig, timeout: timeout || undefined };

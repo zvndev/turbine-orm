@@ -147,9 +147,38 @@ function noPooler(target: ConnectionTarget): PoolerDetection {
  * blocks a legitimate database, so precision wins and the caller is expected to
  * offer an override.
  */
-export function detectPooler(connectionString: string): PoolerDetection {
-  const target = parseConnectionTarget(connectionString);
+export function detectPooler(connectionString: string, environment?: PgEnvironmentTarget): PoolerDetection {
+  const parsed = parseConnectionTarget(connectionString);
+  return detectPoolerTarget(environment === undefined ? parsed : fillTargetFromEnvironment(parsed, environment));
+}
 
+/**
+ * The `PGHOST` / `PGPORT` values a connection target falls back to. node-postgres
+ * reads a field from the connection string or the config first and the
+ * environment only when that leaves it unset, so a string that names no port (or
+ * no host) is still connecting to wherever these point.
+ */
+export interface PgEnvironmentTarget {
+  readonly host?: string | undefined;
+  readonly port?: string | undefined;
+}
+
+/** `target` with the host and port it leaves unset taken from `environment`, the way node-postgres does. */
+export function fillTargetFromEnvironment(
+  target: ConnectionTarget,
+  environment: PgEnvironmentTarget,
+): ConnectionTarget {
+  const host = target.host ?? (environment.host ? environment.host.trim().toLowerCase() || null : null);
+  let port = target.port;
+  if (port === null && environment.port) {
+    const parsed = Number.parseInt(environment.port, 10);
+    port = Number.isInteger(parsed) ? parsed : null;
+  }
+  return { host, port };
+}
+
+/** {@link detectPooler} for a target that is already parsed. */
+export function detectPoolerTarget(target: ConnectionTarget): PoolerDetection {
   if (target.host !== null) {
     for (const label of target.host.split('.')) {
       for (const token of label.split(/[-_]/)) {

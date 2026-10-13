@@ -170,8 +170,13 @@ describe('lock: live PostgreSQL', () => {
           }
         }),
       );
-      // An unmapped SQLSTATE reaches the caller as the driver's error.
-      assert.equal((after as { code?: string }).code, '25P02', 'in failed SQL transaction');
+      // The aborted transaction refuses the next statement locally, with the
+      // first failure's class, so a retry wrapper still sees a retryable error
+      // instead of the server's untyped 25P02.
+      assert.ok(after instanceof LockNotAvailableError, `expected LockNotAvailableError, got ${String(after)}`);
+      assert.equal(after.isRetryable, true);
+      // The first failure rides along as the cause.
+      assert.ok(lockNotAvailable(after.cause), 'the cause is the noWait failure itself');
 
       const claimed = await db.$transaction(async (tx) => {
         await assert.rejects(
