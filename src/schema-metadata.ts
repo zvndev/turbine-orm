@@ -210,6 +210,31 @@ function mapIndexes(tableDef: TableDef, declared: readonly SchemaIndexDef[] | un
 }
 
 // ---------------------------------------------------------------------------
+// Code-first column tags (pii, updatedAt, maxLength)
+// ---------------------------------------------------------------------------
+
+/** The code-first-only flags a column can declare. */
+export interface CodeFirstColumnTags {
+  pii?: true;
+  updatedAt?: true;
+  maxLength?: number;
+}
+
+/**
+ * The tags a column declares, as the fields they take on {@link ColumnMetadata}.
+ * The one place the tag set is listed, so `schemaDefToMetadata` and the CLI's
+ * overlay of these tags onto an introspected schema (`cli/code-first-tags.ts`)
+ * cannot disagree about what counts as one.
+ */
+export function declaredTagsOf(config: ColumnConfig): CodeFirstColumnTags {
+  return {
+    ...(config.pii ? { pii: true as const } : {}),
+    ...(config.updatedAt ? { updatedAt: true as const } : {}),
+    ...(config.maxLength != null ? { maxLength: config.maxLength } : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // The converter
 // ---------------------------------------------------------------------------
 
@@ -412,11 +437,11 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
         arrayType: pgArrayType(base),
         pgArrayType: pgArrayType(base),
         ...(serial ? { isGenerated: true } : {}),
-        // PII is a code-first declaration; carry it through so query-layer
-        // default-projection exclusion and Studio redaction can honor it.
-        // Only set when true, keeping output byte-stable for untagged schemas.
-        ...(config.pii ? { pii: true } : {}),
-        ...(config.maxLength != null ? { maxLength: config.maxLength } : {}),
+        // PII, updatedAt and maxLength are code-first declarations; carry them
+        // through so query-layer projection, the updatedAt stamp and Studio
+        // redaction can honor them. Only set when declared, keeping output
+        // byte-stable for untagged schemas.
+        ...declaredTagsOf(config),
       };
       columns.push(col);
 
@@ -446,7 +471,7 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
       allColumns,
       primaryKey: pk,
       uniqueColumns,
-      relations: relationsByTable.get(tableDef.name) ?? {},
+      relations: { ...relationsByTable.get(tableDef.name) },
       // Declared `indexes` (plain column + doc-field expression) carry through;
       // an undeclared table gets `[]`, which keeps schemaHasIndexInfo() false so
       // the index advisor stays silent. Doc-field (docPath) indexes are ignored

@@ -74,7 +74,7 @@ import {
   type TableHeatResult,
   type UnusedIndex,
 } from '../index-stats.js';
-import { introspect } from '../introspect.js';
+import { applyTableFilters, introspect, printableCatalogName } from '../introspect.js';
 import {
   collectDivergenceCandidateColumns,
   collectDivergenceOrderColumns,
@@ -89,6 +89,7 @@ import { closestName } from '../query/utils.js';
 import { type SchemaMetadata, snakeToCamel } from '../schema.js';
 import type { SchemaDef } from '../schema-builder.js';
 import { DestructivePushRefusal, schemaDiff, schemaPush } from '../schema-sql.js';
+import { type AppliedColumnTags, applyCodeFirstColumnTags, extractCodeFirstColumnTags } from './code-first-tags.js';
 import type { CliOverrides, ConfigLoadError, ResolvedConfig, TurbineCliConfig } from './config.js';
 import {
   configTemplate,
@@ -246,8 +247,8 @@ export interface CliArgs {
   includeViews?: boolean;
   /** Omit the `Generated at:` header line for reproducible (diff-stable) output. */
   noTimestamp?: boolean;
-  /** `generate --import-ext <js|none|auto>`: sibling-import extension mode (F3). */
-  importExtension?: 'js' | 'none' | 'auto';
+  /** `generate --import-ext <js|ts|none|auto>`: sibling-import extension mode (F3). */
+  importExtension?: 'js' | 'ts' | 'none' | 'auto';
   /** `generate --keep-column-names`: keep raw DB column names as field names (F4). */
   keepColumnNames?: boolean;
   /** `generate --legacy-to-many-uniques`: opt out of the unique-FK → hasOne flip (F2). */
@@ -340,6 +341,7 @@ const GLOBAL_FLAGS = [
 const COMMAND_FLAGS: Record<string, readonly string[]> = {
   init: ['--yes', '--schema-file', '--skip-schema', '--with-schema', '--skip-seed', '--skip-push', '--skip-generate'],
   generate: [
+    '--schema-file',
     '--zod',
     '--include-views',
     '--no-timestamp',
@@ -680,10 +682,10 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         break;
       case '--import-ext':
       case '--import-extension':
-        if (next !== 'js' && next !== 'none' && next !== 'auto') {
+        if (next !== 'js' && next !== 'ts' && next !== 'none' && next !== 'auto') {
           failArg(
-            `${cyan('--import-ext')} requires one of: js, none, auto ${dim(`(got ${next ?? 'nothing'})`)}`,
-            'Example: npx turbine generate --import-ext none',
+            `${cyan('--import-ext')} requires one of: js, ts, none, auto ${dim(`(got ${next ?? 'nothing'})`)}`,
+            'Example: npx turbine generate --import-ext ts',
           );
         }
         result.importExtension = next;
@@ -1070,6 +1072,11 @@ export function loadDotEnvForCli(
   if (!fileExists(envPath)) {
     return { fileExists: false, loaded: false, unsupported: false, databaseUrlProvenance: shellOrNone };
   }
+
+  // An exported-but-empty `DATABASE_URL=` means "not configured", and the loader
+  // never overrides a variable that is already set, so it would otherwise block
+  // the value in the `.env` for good.
+  if (env.DATABASE_URL === '') delete env.DATABASE_URL;
 
   const loader =
     deps.loadEnvFile !== undefined
@@ -1811,8 +1818,19 @@ async function runInitGenerate(config: ResolvedConfig, url: string): Promise<Ini
     const tableNames = Object.keys(schema.tables);
     spinner.succeed(`Found ${bold(String(tableNames.length))} tables`);
 
+    // The schema file init just pushed is where `pii` / `updatedAt` live.
+    const appliedTags = await overlayCodeFirstTags(schema, config);
+    if (appliedTags && describeAppliedTags(appliedTags)) {
+      info(`Applied column tags from ${cyan(config.schemaFile)}: ${describeAppliedTags(appliedTags)}`);
+    }
+
     const genSpinner = new Spinner('Generating TypeScript client').start();
-    const result = generate({ schema, outDir: config.out, connectionString: url });
+    const result = generate({
+      schema,
+      outDir: config.out,
+      connectionString: url,
+      importExtension: config.importExtension,
+    });
     genSpinner.succeed(`Generated ${bold(String(result.files.length))} files to ${cyan(`${config.out}/`)}`);
     // The accessor name the generator emits is snakeToCamel of the table name
     // (generate.ts, generateIndex), so this is the spelling that autocompletes.
@@ -1835,8 +1853,9 @@ async function runInitSeed(config: ResolvedConfig): Promise<void> {
   }
   const spinner = new Spinner('Running seed file').start();
   try {
-    await runSeedPlan(getSeedExecutionPlan(seedFile), config);
+    const outcome = await runSeedPlan(getSeedExecutionPlan(seedFile), config);
     spinner.succeed('Seed completed');
+    if (!outcome.confirmed) warn(UNCONFIRMED_SEED_NOTICE);
   } catch (err) {
     spinner.fail('Seed failed');
     if (err instanceof Error) console.log(`  ${dim(redactUrl(err.message))}`);
@@ -2202,7 +2221,7 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
       `  ${dim('Nothing to connect to yet?')} ${cyan('npx turbine studio --demo')} ${dim('needs no database.')}`,
     );
   } else {
-    const accessor = generated.sampleAccessor ?? 'users';
+    const accessor = shown(generated.sampleAccessor ?? 'users');
     console.log(`  ${dim('1.')} Import the generated client:`);
     console.log(`     ${cyan(generatedClientImport(config))}`);
     newline();
@@ -2259,7 +2278,7 @@ export function refuseSchemaFilePath(
   errorLine(`${dim('Or set it once in')} ${cyan('turbine.config.ts')}${dim(':')}`);
   errorLine(`  ${green('schema:')} ${cyan("'public'")}${dim(",       // or omit, reads the 'public' schema")}`);
   errorLine(
-    `  ${green('schemaFile:')} ${cyan(`'${config.schema}'`)}${dim(', // your defineSchema() file (used by `turbine push`)')}`,
+    `  ${green('schemaFile:')} ${cyan(`'${config.schema}'`)}${dim(', // your defineSchema() file (read by push and generate)')}`,
   );
   if (options.escapeHatch) {
     errorLine();
@@ -2267,6 +2286,55 @@ export function refuseSchemaFilePath(
   }
   errorLine();
   process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// Code-first column tags
+// ---------------------------------------------------------------------------
+
+/**
+ * Overlay the column tags the defineSchema() file declares (`pii`, `updatedAt`,
+ * `maxLength`) onto an introspected schema, before it is generated.
+ *
+ * Introspection reads the database, and the database has no column for these
+ * flags, so a client generated from introspection alone returns PII by default,
+ * never stamps `updatedAt`, and leaves Studio and the MCP server with nothing to
+ * redact. The schema file is the only place the tags exist.
+ *
+ * Loaded when the file was named (`--schema-file` / config `schemaFile`) or sits
+ * at the default path. A named file that is missing, or any file that cannot be
+ * loaded, fails the command: carrying on would generate the unredacted client
+ * this exists to prevent. Only a missing DEFAULT file is skipped, which is a
+ * database-first project with no schema file at all.
+ *
+ * Returns what was applied, or `null` when there was no schema file to read.
+ *
+ * @internal exported for tests.
+ */
+export async function overlayCodeFirstTags(
+  schema: SchemaMetadata,
+  config: Pick<ResolvedConfig, 'schemaFile' | 'schemaFileConfigured' | 'include' | 'exclude'>,
+): Promise<AppliedColumnTags | null> {
+  if (config.schemaFileConfigured !== true && !existsSync(resolve(config.schemaFile))) return null;
+  const def = await loadSchemaFile(config.schemaFile);
+  const filters = {
+    include: config.include.length ? config.include : undefined,
+    exclude: config.exclude.length ? config.exclude : undefined,
+  };
+  return applyCodeFirstColumnTags(schema, extractCodeFirstColumnTags(def), {
+    source: config.schemaFile,
+    // A table the caller filtered out of the client has no client to tag.
+    inScope: (table) => applyTableFilters([table], filters).length > 0,
+  });
+}
+
+/** "2 pii, 1 updatedAt" for the line that reports an {@link overlayCodeFirstTags} result. */
+function describeAppliedTags(applied: AppliedColumnTags): string {
+  const parts: string[] = [];
+  if (applied.pii > 0) parts.push(`${applied.pii} pii`);
+  if (applied.updatedAt > 0) parts.push(`${applied.updatedAt} updatedAt`);
+  if (applied.maxLength > 0) parts.push(`${applied.maxLength} maxLength`);
+  return parts.join(', ');
 }
 
 // ---------------------------------------------------------------------------
@@ -2318,6 +2386,13 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
     console.log(`    ${dim(`${symbols.teeEnd} skipped internal table ${t} (add it to include to keep it)`)}`);
   }
 
+  const appliedTags = await overlayCodeFirstTags(schema, config);
+  if (appliedTags && describeAppliedTags(appliedTags)) {
+    console.log(
+      `    ${dim(`${symbols.teeEnd} applied column tags from ${config.schemaFile}: ${describeAppliedTags(appliedTags)}`)}`,
+    );
+  }
+
   // Guard: zero tables means the generated client would be empty. That is almost
   // always a misconfiguration (wrong `schema`, an include/exclude that filtered
   // everything, or a database with no tables yet) rather than intent. Fail loudly
@@ -2352,14 +2427,14 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
       const relCount = Object.keys(tbl.relations).length;
       const pk = tbl.primaryKey.join(', ') || '(none)';
       console.log(
-        `  ${symbols.tee} ${bold(tbl.name)} ${dim(`${tbl.columns.length} cols, PK: ${pk}`)}${relCount > 0 ? dim(`, ${relCount} rels`) : ''}`,
+        `  ${symbols.tee} ${bold(shown(tbl.name))} ${dim(`${tbl.columns.length} cols, PK: ${shown(pk)}`)}${relCount > 0 ? dim(`, ${relCount} rels`) : ''}`,
       );
     }
     newline();
   }
 
   if (Object.keys(schema.enums).length > 0) {
-    info(`Enums: ${Object.keys(schema.enums).join(', ')}`);
+    info(`Enums: ${Object.keys(schema.enums).map(shown).join(', ')}`);
   }
 
   // Generate
@@ -2392,7 +2467,16 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
   console.log(`  ${dim('const db = turbine({ connectionString: process.env.DATABASE_URL });')}`);
   // Name a table the client just emitted rather than a hardcoded `users`.
   const sampleAccessor = snakeToCamel(tableNames[0] ?? 'users');
-  console.log(`  ${dim(`const row = await db.${sampleAccessor}.findFirst();`)}`);
+  console.log(`  ${dim(`const row = await db.${shown(sampleAccessor)}.findFirst();`)}`);
+  if (config.importExtension === 'ts') {
+    newline();
+    console.log(
+      `  ${dim('Run it with Node type stripping:')} ${cyan('node --env-file=.env app.ts')} ${dim('(Node 22.18+ or 23.6+; earlier 22.x needs --experimental-strip-types)')}`,
+    );
+    console.log(
+      `  ${dim('A type checker needs')} ${cyan('allowImportingTsExtensions')} ${dim('(or')} ${cyan('rewriteRelativeImportExtensions')}${dim(') in tsconfig.json.')}`,
+    );
+  }
   newline();
 }
 
@@ -3745,7 +3829,22 @@ async function seedConnectionString(config: ResolvedConfig): Promise<string> {
   return connectionStringForSchema(config.url, schema, inherited);
 }
 
-async function runSeedPlan(plan: SeedExecutionPlan, config: ResolvedConfig): Promise<void> {
+/** What a finished seed run can say about itself. */
+interface SeedRunOutcome {
+  /**
+   * False only for a TypeScript seed that exited cleanly and never mentions
+   * `defineSeed`: it ran to completion, but Turbine cannot tell whether it
+   * wrote anything.
+   */
+  confirmed: boolean;
+}
+
+/** The notice for a {@link SeedRunOutcome} that could not be confirmed. */
+const UNCONFIRMED_SEED_NOTICE =
+  'The seed file ran to completion, but it does not call defineSeed(), so Turbine cannot tell whether it wrote anything. ' +
+  'Wrap the work in defineSeed(async (db) => { ... }) to have it confirmed.';
+
+async function runSeedPlan(plan: SeedExecutionPlan, config: ResolvedConfig): Promise<SeedRunOutcome> {
   const oldDatabaseUrl = process.env.DATABASE_URL;
   // The seed connects through DATABASE_URL, whichever way it runs: `defineSeed`
   // reads it in the tsx child and in the in-process `import()`, and the `.sql`
@@ -3764,9 +3863,11 @@ async function runSeedPlan(plan: SeedExecutionPlan, config: ResolvedConfig): Pro
       }
       // The seed runs in a child process, so we cannot observe its callback
       // directly. Hand it a sentinel path: `defineSeed`'s runner writes the file
-      // only after a callback executes to completion. If the child exits cleanly
-      // but the sentinel never appears, the seed module loaded without running
-      // anything: a silent no-op we must report as a failure, not success.
+      // only after a callback executes to completion. A non-zero exit is a
+      // failure. A clean exit with no sentinel is a script that did its work at
+      // the top level (a typed-client seed), which succeeds and says so, unless
+      // the file names `defineSeed`: then its callback was expected to run and
+      // did not, which is a no-op to report as a failure.
       const sentinelDir = mkdtempSync(join(tmpdir(), 'turbine-seed-'));
       const sentinel = join(sentinelDir, 'ran');
       const { execFileSync } = await import('node:child_process');
@@ -3779,16 +3880,18 @@ async function runSeedPlan(plan: SeedExecutionPlan, config: ResolvedConfig): Pro
             TURBINE_SEED_SENTINEL: sentinel,
           },
         });
-        if (!existsSync(sentinel)) {
+        if (existsSync(sentinel)) return { confirmed: true };
+        const seedFile = plan.args[plan.args.length - 1] ?? '';
+        if (/\bdefineSeed\b/.test(readFileSync(seedFile, 'utf-8'))) {
           throw new Error(
             'The seed file completed without running a seed callback. ' +
               'Make sure it calls defineSeed(async (db) => { ... }) at the top level.',
           );
         }
+        return { confirmed: false };
       } finally {
         rmSync(sentinelDir, { recursive: true, force: true });
       }
-      return;
     }
 
     if (plan.kind === 'js') {
@@ -3800,7 +3903,7 @@ async function runSeedPlan(plan: SeedExecutionPlan, config: ResolvedConfig): Pro
         );
       }
       await mod.default();
-      return;
+      return { confirmed: true };
     }
 
     // `seedUrl` is already pinned and already schema-checked; `requireUrl` is
@@ -3816,6 +3919,7 @@ async function runSeedPlan(plan: SeedExecutionPlan, config: ResolvedConfig): Pro
     } finally {
       await client.end();
     }
+    return { confirmed: true };
   } finally {
     if (oldDatabaseUrl === undefined) {
       delete process.env.DATABASE_URL;
@@ -3846,8 +3950,9 @@ async function cmdSeed(_args: CliArgs, config: ResolvedConfig): Promise<void> {
   const spinner = new Spinner('Running seed file').start();
 
   try {
-    await runSeedPlan(getSeedExecutionPlan(seedFile), config);
+    const outcome = await runSeedPlan(getSeedExecutionPlan(seedFile), config);
     spinner.succeed('Seed completed');
+    if (!outcome.confirmed) warn(UNCONFIRMED_SEED_NOTICE);
   } catch (err) {
     spinner.fail('Seed failed');
     if (err instanceof Error) {
@@ -3892,7 +3997,7 @@ async function cmdStatus(_args: CliArgs, config: ResolvedConfig): Promise<void> 
     const relCount = Object.keys(tbl.relations).length;
     const _pk = tbl.primaryKey.join(', ') || dim('(none)');
 
-    console.log(`  ${bold(cyan(tbl.name))}`);
+    console.log(`  ${bold(cyan(shown(tbl.name)))}`);
 
     for (let i = 0; i < tbl.columns.length; i++) {
       const col = tbl.columns[i]!;
@@ -3902,7 +4007,7 @@ async function cmdStatus(_args: CliArgs, config: ResolvedConfig): Promise<void> 
       const def = col.hasDefault ? dim(' (default)') : '';
       const pkLabel = tbl.primaryKey.includes(col.name) ? ` ${magenta('PK')}` : '';
       console.log(
-        `    ${dim(prefix)} ${col.field}${nullable}: ${green(col.tsType)}${pkLabel}${def}  ${gray(`${symbols.arrow} ${col.pgType}`)}`,
+        `    ${dim(prefix)} ${shown(col.field)}${nullable}: ${green(shown(col.tsType))}${pkLabel}${def}  ${gray(`${symbols.arrow} ${shown(col.pgType)}`)}`,
       );
     }
 
@@ -3915,7 +4020,7 @@ async function cmdStatus(_args: CliArgs, config: ResolvedConfig): Promise<void> 
         const relColor = rel.type === 'hasMany' ? blue : yellow;
         const fkDisplay = Array.isArray(rel.foreignKey) ? rel.foreignKey.join(', ') : rel.foreignKey;
         console.log(
-          `    ${dim(prefix)} ${relColor(relName)} ${dim(symbols.arrow)} ${rel.to} ${dim(`(${rel.type}, FK: ${fkDisplay})`)}`,
+          `    ${dim(prefix)} ${relColor(shown(relName))} ${dim(symbols.arrow)} ${shown(rel.to)} ${dim(`(${rel.type}, FK: ${shown(fkDisplay)})`)}`,
         );
       }
     }
@@ -3926,7 +4031,7 @@ async function cmdStatus(_args: CliArgs, config: ResolvedConfig): Promise<void> 
   if (Object.keys(schema.enums).length > 0) {
     console.log(`  ${bold('Enums:')}`);
     for (const [enumName, labels] of Object.entries(schema.enums)) {
-      console.log(`    ${cyan(enumName)}: ${labels.map((l) => green(`'${l}'`)).join(dim(' | '))}`);
+      console.log(`    ${cyan(shown(enumName))}: ${labels.map((l) => green(`'${shown(l)}'`)).join(dim(' | '))}`);
     }
     newline();
   }
@@ -4394,6 +4499,13 @@ function renderUnusedCaveats(minScans: number | undefined, snapshot: StatsSnapsh
   newline();
 }
 
+/**
+ * Catalog names go to the terminal through this. A database lets its creator
+ * pick any characters for a table or index name, and a raw ESC or bidi control
+ * in one rewrites the line it is printed on.
+ */
+const shown = printableCatalogName;
+
 /** doctor --unused: never-scanned indexes with DROP suggestions (report-only). */
 function renderUnusedIndexes(unused: UnusedIndex[], minScans: number | undefined, snapshot: StatsSnapshot): void {
   if (unused.length === 0) return;
@@ -4402,12 +4514,12 @@ function renderUnusedIndexes(unused: UnusedIndex[], minScans: number | undefined
   renderUnusedCaveats(minScans, snapshot);
   for (const u of unused) {
     console.log(
-      `  ${yellow(symbols.warning)} ${bold(cyan(u.table))} ${dim(`(${u.columns.join(', ') || '?'})`)}  ${gray(`${u.indexName} · ${u.idxScan} scans · ${formatBytes(u.sizeBytes)}`)}`,
+      `  ${yellow(symbols.warning)} ${bold(cyan(shown(u.table)))} ${dim(`(${shown(u.columns.join(', ') || '?')})`)}  ${gray(`${shown(u.indexName)} · ${u.idxScan} scans · ${formatBytes(u.sizeBytes)}`)}`,
     );
     // A functional / partial / non-btree index is not a plain `(col)` rebuild:
     // say what it actually is before anyone runs the DROP.
     if (u.caveat) console.log(`    ${dim(symbols.tee)} ${yellow(u.caveat)}`);
-    console.log(`    ${dim(symbols.teeEnd)} ${green(u.dropSql)}`);
+    console.log(`    ${dim(symbols.teeEnd)} ${green(shown(u.dropSql))}`);
     newline();
   }
 }
@@ -4423,10 +4535,12 @@ function renderRedundantIndexes(redundant: RedundantIndex[]): void {
   newline();
   for (const r of redundant) {
     console.log(
-      `  ${yellow(symbols.warning)} ${bold(cyan(r.table))} ${dim(`(${r.columns.join(', ')})`)}  ${gray(`${r.indexName} · ${formatBytes(r.sizeBytes)}`)}`,
+      `  ${yellow(symbols.warning)} ${bold(cyan(shown(r.table)))} ${dim(`(${shown(r.columns.join(', '))})`)}  ${gray(`${shown(r.indexName)} · ${formatBytes(r.sizeBytes)}`)}`,
     );
-    console.log(`    ${dim(symbols.tee)} covered by ${blue(r.coveredBy)} ${dim(`(${r.coveredByColumns.join(', ')})`)}`);
-    console.log(`    ${dim(symbols.teeEnd)} ${green(r.dropSql)}`);
+    console.log(
+      `    ${dim(symbols.tee)} covered by ${blue(shown(r.coveredBy))} ${dim(`(${shown(r.coveredByColumns.join(', '))})`)}`,
+    );
+    console.log(`    ${dim(symbols.teeEnd)} ${green(shown(r.dropSql))}`);
     newline();
   }
 }
@@ -4445,7 +4559,7 @@ function renderDoctorAudit(audit: DoctorIndexAudit[], minScans: number | undefin
   for (const a of audit) {
     const tag = a.ambiguous ? red(' [ambiguous: truncated name collides with another column set]') : '';
     console.log(
-      `  ${yellow(symbols.warning)} ${bold(cyan(a.table))} ${dim(`(${a.columns.join(', ') || '?'})`)}  ${gray(`${a.indexName} · ${a.idxScan} scans · ${formatBytes(a.sizeBytes)}`)}${tag}`,
+      `  ${yellow(symbols.warning)} ${bold(cyan(shown(a.table)))} ${dim(`(${shown(a.columns.join(', ') || '?')})`)}  ${gray(`${shown(a.indexName)} · ${a.idxScan} scans · ${formatBytes(a.sizeBytes)}`)}${tag}`,
     );
     if (a.ambiguous) {
       console.log(
@@ -4458,7 +4572,7 @@ function renderDoctorAudit(audit: DoctorIndexAudit[], minScans: number | undefin
       );
       console.log(`      ${dim('reappear as a missing-index finding in this same report.')}`);
     } else if (a.dropSql) {
-      console.log(`    ${dim(symbols.teeEnd)} ${green(a.dropSql)}`);
+      console.log(`    ${dim(symbols.teeEnd)} ${green(shown(a.dropSql))}`);
     }
     newline();
   }
@@ -4530,12 +4644,12 @@ function divergenceAmplificationLines(d: PlanDivergenceFinding): string[] {
   const corr = d.orderColumnCorrelation;
   const corrLabel =
     corr === null || corr === undefined
-      ? `no pg_stats correlation available for "${d.orderColumn}"`
-      : `correlation ${corr.toFixed(5)} on "${d.orderColumn}"`;
+      ? `no pg_stats correlation available for "${shown(d.orderColumn)}"`
+      : `correlation ${corr.toFixed(5)} on "${shown(d.orderColumn)}"`;
   if (d.heapNearlyOrdered === true) {
     return [
       `The size of that flip turns on the heap's physical order, and THIS heap is in near-exact`,
-      `"${d.orderColumn}" order (${corrLabel}), so consecutive index entries hit the`,
+      `"${shown(d.orderColumn)}" order (${corrLabel}), so consecutive index entries hit the`,
       `same pinned page: measured ~1x, not the ~${amp}x an unordered heap reads. Most likely this`,
       `one is not costing you anything today. It is also one sampled statistic away from the`,
       `much worse reading, so measure rather than assume in either direction.`,
@@ -4544,7 +4658,7 @@ function divergenceAmplificationLines(d: PlanDivergenceFinding): string[] {
   return [
     `That costs ~${amp}x the buffers of the seq scan, because each index entry is its own heap`,
     `fetch (${corrLabel}). The one shape that reads ~1x instead is a heap`,
-    `in near-exact "${d.orderColumn}" order; two pages of local disorder already reads ~41x.`,
+    `in near-exact "${shown(d.orderColumn)}" order; two pages of local disorder already reads ~41x.`,
   ];
 }
 
@@ -4560,7 +4674,7 @@ function renderDivergenceEvidence(d: PlanDivergenceFinding): void {
     `      ${dim(`Without the index the good plan is a seq scan (${divInt(d.pages)} pages); a promoted generic`)}`,
   );
   console.log(
-    `      ${dim(`plan cannot see the value is rare, keeps the ordered "${d.orderColumn}" walk, and reads`)}`,
+    `      ${dim(`plan cannot see the value is rare, keeps the ordered "${shown(d.orderColumn)}" walk, and reads`)}`,
   );
   console.log(`      ${dim(`up to ~${tuples} tuples before it fills the LIMIT.`)}`);
   console.log(`      ${dim('Postgres promotes this shape exactly when the workload keeps asking for the rare')}`);
@@ -4569,7 +4683,7 @@ function renderDivergenceEvidence(d: PlanDivergenceFinding): void {
   for (const line of divergenceAmplificationLines(d)) console.log(`      ${dim(line)}`);
   console.log(`      ${dim('Adding the index above is the fix. Confirm first if you want to:')}`);
   for (const line of d.diagnosticSql.split('\n')) {
-    console.log(`        ${green(line)}`);
+    console.log(`        ${green(shown(line))}`);
   }
   console.log(`      ${dim('After adding this index, re-run doctor. This column is expected to reappear as a')}`);
   console.log(`      ${dim('sparse-value finding in the cached-plan section. That later finding is exposure, not')}`);
@@ -4647,10 +4761,10 @@ function renderFinding(
   const rowsLabel = rows !== null ? `~${rows.toLocaleString()} rows` : 'row count unknown';
   const sizeLabel = f.score.metrics.sizeBytes !== null ? `, ${formatBytes(f.score.metrics.sizeBytes)}` : '';
   console.log(
-    `  ${yellow(symbols.warning)} ${bold(cyan(m.table))} ${dim(`(${m.columns.join(', ')})`)}  ${gray(`${rowsLabel}${sizeLabel}`)}`,
+    `  ${yellow(symbols.warning)} ${bold(cyan(shown(m.table)))} ${dim(`(${shown(m.columns.join(', '))})`)}  ${gray(`${rowsLabel}${sizeLabel}`)}`,
   );
   for (const p of m.probes) {
-    console.log(`    ${dim(symbols.tee)} probed by ${p.from}.${blue(p.relation)} ${dim(`(${p.type})`)}`);
+    console.log(`    ${dim(symbols.tee)} probed by ${shown(p.from)}.${blue(shown(p.relation))} ${dim(`(${p.type})`)}`);
   }
   if (opts.withReasons) {
     for (const reason of f.score.reasons) {
@@ -4658,7 +4772,7 @@ function renderFinding(
     }
   }
   const last = opts.divergence ? symbols.tee : symbols.teeEnd;
-  console.log(`    ${dim(last)} ${green(doctorCreateSql(f, { concurrently: opts.concurrently }))}`);
+  console.log(`    ${dim(last)} ${green(shown(doctorCreateSql(f, { concurrently: opts.concurrently })))}`);
   if (opts.divergence) renderDivergenceEvidence(opts.divergence);
   newline();
 }
@@ -4671,9 +4785,9 @@ function renderInvalidIndexes(invalid: ReturnType<typeof findInvalidIndexes>): v
   newline();
   for (const idx of invalid) {
     console.log(
-      `  ${red(symbols.warning)} ${bold(cyan(idx.table))} ${dim(`(${idx.columns.join(', ') || '?'})`)}  ${gray(idx.indexName)}`,
+      `  ${red(symbols.warning)} ${bold(cyan(shown(idx.table)))} ${dim(`(${shown(idx.columns.join(', ') || '?')})`)}  ${gray(shown(idx.indexName))}`,
     );
-    console.log(`    ${dim(symbols.teeEnd)} ${green(idx.dropSql)}`);
+    console.log(`    ${dim(symbols.teeEnd)} ${green(shown(idx.dropSql))}`);
     newline();
   }
 }
@@ -4788,16 +4902,16 @@ function renderPlanDivergence(divergence: PlanDivergenceReport, attached: Attach
       // expression, or non-btree). The remedy is still an index, not a
       // plan-cache setting, so this entry never suggests forceCustomPlan.
       console.log(
-        `  ${yellow(symbols.warning)} ${bold(cyan(`${f.table}.${f.column}`))}  ${gray('UNINDEXED-FILTER FLIP')}`,
+        `  ${yellow(symbols.warning)} ${bold(cyan(`${shown(f.table)}.${shown(f.column)}`))}  ${gray('UNINDEXED-FILTER FLIP')}`,
       );
       console.log(
         `    ${dim(symbols.tee)} ${divInt(f.rows)} rows in ${divInt(f.pages)} pages, rarest value ~${bold(divInt(f.rarestBucket))} rows, below the assumed LIMIT ${f.assumedLimit}`,
       );
       console.log(
-        `    ${dim(symbols.tee)} no index serves ${f.column} = $1, so the good plan is a seq scan (${divInt(f.pages)} pages);`,
+        `    ${dim(symbols.tee)} no index serves ${shown(f.column)} = $1, so the good plan is a seq scan (${divInt(f.pages)} pages);`,
       );
       console.log(
-        `      ${dim(`a promoted generic plan keeps the ordered "${f.orderColumn}" walk and reads up to ~${divInt(f.tuplesWalked ?? f.rows)} tuples`)}`,
+        `      ${dim(`a promoted generic plan keeps the ordered "${shown(f.orderColumn)}" walk and reads up to ~${divInt(f.tuplesWalked ?? f.rows)} tuples`)}`,
       );
       console.log(`      ${dim('before it fills the LIMIT.')}`);
       for (const line of divergenceAmplificationLines(f)) console.log(`      ${dim(line)}`);
@@ -4817,7 +4931,9 @@ function renderPlanDivergence(divergence: PlanDivergenceReport, attached: Attach
       continue;
     }
 
-    console.log(`  ${yellow(symbols.warning)} ${bold(cyan(`${f.table}.${f.column}`))}  ${gray('SPARSE-VALUE FLIP')}`);
+    console.log(
+      `  ${yellow(symbols.warning)} ${bold(cyan(`${shown(f.table)}.${shown(f.column)}`))}  ${gray('SPARSE-VALUE FLIP')}`,
+    );
     console.log(
       `    ${dim(symbols.tee)} generic estimate ${bold(divInt(f.genericEstimate))} rows ${dim(`(${divInt(f.rows)} rows / ${divInt(f.distinctValues)} distinct values)`)}`,
     );
@@ -4833,7 +4949,9 @@ function renderPlanDivergence(divergence: PlanDivergenceReport, attached: Attach
     console.log(
       `    ${dim(symbols.tee)} for such a value the generic plan walks ~${bold(divInt(f.walkPages ?? 0))} of ${divInt(f.pages)} pages ${dim(`(${Math.round((f.walkFraction ?? 0) * 100)}% of the table)`)}`,
     );
-    console.log(`      ${dim(`for reads shaped WHERE ${f.column} = $1 ORDER BY ${f.orderColumn} LIMIT $n,`)}`);
+    console.log(
+      `      ${dim(`for reads shaped WHERE ${shown(f.column)} = $1 ORDER BY ${shown(f.orderColumn)} LIMIT $n,`)}`,
+    );
     console.log(`      ${dim("where the custom plan reads only that value's own rows.")}`);
     console.log(
       `    ${dim(symbols.tee)} ${dim('No amplification figure is printed, deliberately. This models how many rows a')}`,
@@ -4902,7 +5020,9 @@ function renderPlanDivergence(divergence: PlanDivergenceReport, attached: Attach
       );
       console.log(`       ${dim("Turbine's client-level `planCacheMode` and to a SET or ALTER ROLE applied outside")}`);
       console.log(`       ${dim('Turbine.')}`);
-      console.log(`    5. A composite index on (${first.column}, ${first.orderColumn}) makes the GOOD plan better. It`);
+      console.log(
+        `    5. A composite index on (${shown(first.column)}, ${shown(first.orderColumn)}) makes the GOOD plan better. It`,
+      );
       console.log(
         `       ${dim('does NOT stop the generic plan from choosing the other one, and it can widen the gap.')}`,
       );
@@ -4934,7 +5054,7 @@ function renderPlanDivergence(divergence: PlanDivergenceReport, attached: Attach
   if (notices.length > 0) {
     console.log(`  ${dim('Not scored for cached-plan divergence (statistics missing):')}`);
     for (const n of notices) {
-      console.log(`    ${dim(`- ${n.table}.${n.column}: ${n.reason}`)}`);
+      console.log(`    ${dim(`- ${shown(n.table)}.${shown(n.column)}: ${n.reason}`)}`);
     }
     newline();
   }
@@ -5340,6 +5460,9 @@ function showGenerateHelp(): void {
   console.log(`    ${cyan('--include')} ${dim('<tables>')}    Comma-separated tables to include`);
   console.log(`    ${cyan('--exclude')} ${dim('<tables>')}    Comma-separated tables to exclude`);
   console.log(
+    `    ${cyan('--schema-file')} ${dim('<path>')}  Your ${cyan('defineSchema()')} file, whose ${cyan('pii')} / ${cyan('updatedAt')} tags are applied ${dim('(default: ./turbine/schema.ts)')}`,
+  );
+  console.log(
     `    ${cyan('--zod')}                 Also emit ${cyan('zod.ts')} validation schemas ${dim('(needs the zod dep)')}`,
   );
   console.log(`    ${cyan('--include-views')}       Include views + materialized views as read-only entities`);
@@ -5347,7 +5470,10 @@ function showGenerateHelp(): void {
     `    ${cyan('--no-timestamp')}        Omit the ${dim('Generated at:')} header line ${dim('(reproducible, diff-stable output)')}`,
   );
   console.log(
-    `    ${cyan('--import-ext')} ${dim('<mode>')}    Sibling-import extension: ${cyan('js')} / ${cyan('none')} / ${cyan('auto')} ${dim('(default: auto)')}`,
+    `    ${cyan('--import-ext')} ${dim('<mode>')}    Sibling-import extension: ${cyan('js')} / ${cyan('ts')} / ${cyan('none')} / ${cyan('auto')} ${dim('(default: auto)')}`,
+  );
+  console.log(
+    `                           ${dim('ts emits ./types.ts so')} ${cyan('node app.ts')} ${dim('can run the client with native type stripping')}`,
   );
   console.log(
     `    ${cyan('--keep-column-names')}   Keep raw DB column names as field names ${dim('(snake_case, not camelCase)')}`,
