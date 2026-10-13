@@ -545,7 +545,10 @@ src/
                       the query runs, returns rows, and the relation is absent from every
                       one of them; it gets its own message rather than a nearest-name guess.
                       A WARNING and never an error, because `findMany({ ...optionsBag })` is
-                      ordinary code and the surface grows between minors. This is the file's
+                      ordinary code and the surface grows between minors. Since 0.90 the
+                      caller's advice logger (or `null`) is a REQUIRED parameter and the
+                      module reads no environment: an omitted logger used to fall back to
+                      the console whatever the client's `diagnostics` said. This is the file's
                       first runtime import (warn-registry + utils, both leaves that do not
                       import it back), so everything above it stays type-only.
 
@@ -984,16 +987,15 @@ src/
                       time 0.685ms -> 0.350ms and 152 KB -> 100 KB on the L2 shape, which is
                       the whole of the nested-read gap. Rows are byte-identical, and the
                       value-fidelity `::text` casts survive because `buildJsonRow` drops only
-                      the KEYS and passes each expression verbatim. THE DEFAULT IS DERIVED
-                      FROM `dialect.name === 'postgresql'`, deliberately NOT from a
-                      capability flag and NOT from `buildJsonArray` being present: every
-                      engine spreads `postgresDialect` so a presence test hands them all
-                      positional (THE INHERITANCE TRAP, see dialect.ts), and
-                      `buildSelectWithRelations` ALREADY refuses positional on that same
-                      predicate with E017, so deriving the default from the identical
-                      predicate makes it structurally impossible for the default to select an
-                      encoding the builder then refuses. A flag would be a second authority
-                      on one question, free to drift. The `fm:` and `fu:` cache keys carry a
+                      the KEYS and passes each expression verbatim. THE DEFAULT AND THE
+                      REFUSAL READ ONE CAPABILITY, `dialect.capabilities.positionalJson`
+                      (0.90; both read `dialect.name === 'postgresql'` before), deliberately
+                      NOT `buildJsonArray` being present: every engine spreads
+                      `postgresDialect`, so a presence test hands them all positional (THE
+                      INHERITANCE TRAP, see dialect.ts). `buildSelectWithRelations` refuses
+                      positional with E017 on that same key, so the default can never select
+                      an encoding the builder then refuses; a second question for either
+                      would be a second authority, free to drift. The `fm:` and `fu:` cache keys carry a
                       `|je=` segment emitted for BOTH values (never only the non-default one,
                       so the key cannot depend on what the client default happens to be):
                       serving a positional template to an object-expecting parser is SILENT
@@ -1082,6 +1084,44 @@ src/
                         pool shim (`SqlitePool`/`MysqlPool`/`MssqlPool`) plus
                         `paramPlaceholder`, `quoteIdentifier`, and tx-keyword hooks
                         (`begin/commit/rollback/savepoint/buildSetSessionConfig`).
+                      • `capabilities: EngineCapabilities` (0.90), REQUIRED: what the engine
+                        can do, one fresh frozen literal per engine
+                        (`Object.freeze({ ... } satisfies EngineCapabilities)`), 32 keys:
+                        query shape (`distinctOn`, `positionalJson`, `nullsOrderingClause`,
+                        `nullsSortHigh`, `insensitiveInList`), value semantics
+                        (`jsonDocumentEquality`, `jsonExtractTyped`, `jsonExactNumericCast`,
+                        `numericTextComparison`, `enforcesForeignKeys`,
+                        `utcTimestampRewrite`, `paramTypeCasts`, `namedEnumTypes`,
+                        `structuredValueColumns`), writes (`maxBindParameters`,
+                        `maxInsertRows`, `upsertConflictTarget`, `setClauseOrder`,
+                        `reselectLocksRows`, `integerDivision`, `updateExpressions`,
+                        `bulkUpsertAppliesRepeatedKeys`, `partitionLimitPushdown`),
+                        connections and transactions (`readOnlyTransactions`,
+                        `connectionParameters`, `backendCancel`, `idleTransactionTimeout`,
+                        `abortsTransactionOnError`, `connectionDriver`,
+                        `preparesEveryStatement`) and DDL (`inlineForeignKeys`,
+                        `unboundedTextKeys`). Every site that asked `dialect.name ===
+                        '<engine>'` a capability question reads its key instead, so a
+                        dialect built from an engine dialect under another name gets that
+                        engine's answers rather than whichever side of a name test its name
+                        fell on. A required key is the inverse of an optional hook: adding
+                        one fails the build in all five engine files until each states its
+                        value, and the spread cannot supply it because each literal is the
+                        engine's own. `maxBindParameters(dialect)` reads
+                        `capabilities.maxBindParameters` (`Infinity` is no limit), and
+                        writes.ts `rowsPerStatement` reads `capabilities.maxInsertRows` (SQL
+                        Server 1000; an `onConflict` MERGE is not bound by it).
+                        `TurbineClient` refuses a dialect with no `capabilities` (E003).
+                        `src/test/capabilities-guard.test.ts` pins every value per engine,
+                        requires each engine's object to be its OWN and frozen, builds the
+                        same ops under a renamed copy of each engine dialect and requires
+                        identical SQL, and SCANS `src/` for any `dialect.name` comparison,
+                        switch, `Set.has` or keyed lookup, and any comparison with an engine
+                        name literal, outside a commented allowlist (expr.ts GREATEST /
+                        LEAST / now() rendering, schema-sql.ts DEFAULT spelling, two
+                        error-hint lookups, the statement lexers); a stale allowlist entry
+                        fails too. The `supports*` flags below are still top-level and
+                        inherited; moving them in is 0.91 work.
                       • Capability flags, `supportsReturning`, `supportsVector`,
                         `supportsListenNotify`, `supportsRLS`, `supportsAdvisoryLock`,
                         `supportsILike`, `aggSupportsInlineOrderBy`, `jsonPathSupport`,
@@ -1212,9 +1252,10 @@ src/
                       `'3'`. Since 0.90 `disconnect()` / `end()` close a handle the factory
                       OPENED (path or `':memory:'`; a later query is E004), and the factory
                       closes it if the constructor or the open-time PRAGMAs throw; a
-                      `DatabaseSync` the caller passed is never closed. `turbineMysql` and
-                      `turbineMssql` likewise `end()` a pool they built when a later step
-                      throws (version refusal, constructor refusal).
+                      `DatabaseSync` the caller passed is never closed. `turbineMysql`,
+                      `turbineMssql` and `turbinePowDB` likewise close a pool (or embedded
+                      handle) they built when a later step throws (version refusal, an
+                      embedded `syncMode` the addon cannot apply, constructor refusal).
 
   mysql.ts         , `turbine-orm/mysql` engine. `await turbineMysql(url | config |
                       mysql2-pool, schema, options?)`, MySQL 8.0+ via the optional peer
@@ -1817,7 +1858,7 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 | E017 | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) invoked on an engine whose capability flag reports it unsupported, thrown directly, not via `wrapPgError()` |
 | E018 | `ReadOnlyError` | A write refused because the database is read-only, `reason: 'snapshot'` (PowDB snapshot serving / client-level `readonly: true` fail-fast) or `'rbac'` (read-only role). Thrown locally by the PowDB readonly guard and via `wrapPowdbError()` message families |
 | E019 | `TransactionRolledBackError` | A transaction PostgreSQL rolled back instead of committing (the callback caught a failed statement, or a per-query timeout cancelled one); the first failure is `cause`. Deadlock, serialization and lock-not-available first failures keep their own class. Built by `rolledBackError` in transaction-state.ts; pg 25P02 also maps here via `wrapPgError()` as a fallback |
-| E020 | `InvariantError` | Turbine caught a bug in itself before sending a statement it knew was wrong: two internal paths that must agree did not (the SQL-template cache vs a fresh build, `invariant: 'sql-cache-lockstep'`; a cached entry whose param count differs from the params collected, `'sql-cache-param-count'`; a where scope built from an already-quoted reference, `'where-scope-reference'`; a relation payload that does not parse as JSON, `'relation-payload-json'`, both formerly E003). Thrown by the always-on cache prechecks in query/builder.ts, `aliasWhereScope` in where.ts and `parseNestedRow` in relations.ts. Not retryable, not caused by the arguments; the message names the query shape and no value |
+| E020 | `InvariantError` | Turbine caught a bug in itself before sending a statement it knew was wrong: two internal paths that must agree did not (the SQL-template cache vs a fresh build, `invariant: 'sql-cache-lockstep'`; a cached entry whose param count differs from the params collected, `'sql-cache-param-count'`; a where scope built from an already-quoted reference, `'where-scope-reference'`; a relation payload that does not parse as JSON, `'relation-payload-json'`, both formerly E003; and in powql.ts a relation filter reaching `buildWhere` unresolved, `'powql-relation-filter-unresolved'`, a JSON string operator with no PowQL spelling, `'powql-json-operator'`, and a JSON filter that compiled to no condition, `'powql-json-filter-empty'`, formerly E003 with an `internal:` prefix). Thrown by the always-on cache prechecks in query/builder.ts, `aliasWhereScope` in where.ts, `parseNestedRow` in relations.ts and the three PowQL generator sites. Not retryable, not caused by the arguments; the message names the query shape and no value |
 
 `wrapPgError(err)` inspects the pg driver error's `.code` field and wraps it in the appropriate typed error, preserving the original as `.cause`. It is called in `client.ts` (raw queries, transaction pool proxy) and at query execution boundaries in `query/builder.ts`.
 

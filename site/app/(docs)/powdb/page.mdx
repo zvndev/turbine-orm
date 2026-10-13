@@ -57,6 +57,8 @@ The two injected-pool shapes are not equivalent. A raw client `Pool` is wrapped 
 
 A networked target probes `serverVersion` on connect and throws `ConnectionError` on anything below `MIN_POWDB_VERSION` (`'0.7.0'`).
 
+When the factory fails after it opened something, it closes what it opened before it throws. That covers a server below the version floor, an embedded `syncMode` the installed addon cannot apply, and a client option refused at construction, such as a `globalFilters` key naming no table. A client `Pool` or `PowdbPool` you pass in is never closed. Before 0.90 the pool or handle stayed open, and an idle socket kept the process alive.
+
 ### Options
 
 `TurbinePowdbOptions` extends **every** client-level field of `TurbineConfig` (`globalFilters`, `errorMessages`, `logging`, `defaultLimit`, `warnOnUnlimited`, `relationLoadStrategy`, and the rest), minus the connection and pool plumbing the factory owns, plus the transport options below.
