@@ -212,6 +212,137 @@ npx turbine observe --port 5000 --no-open
 
 It binds `127.0.0.1:4984` by default and shares [Studio's security model](/studio#security-model): loopback by default, non-loopback refused without `--allow-remote`, a one-time ticket in the printed URL exchanged for a session cookie, `403` for a `Host` that is not loopback or the bound host, and security headers on every response. It reads metrics only; it never connects to your application database.
 
+## OpenTelemetry
+
+Turbine imports nothing from `@opentelemetry/*` and adds no dependency. Two hooks you already have are enough: [`$use`](/queries#middleware) opens a span for each operation, and `$on('query')` records a span for each SQL statement. Install `@opentelemetry/api` and an SDK yourself; the recipe needs OpenTelemetry's context manager (without one, `context.active()` is always the root context), which the SDK normally provides.
+
+```ts
+import { context, trace, SpanKind, SpanStatusCode } from '@opentelemetry/api';
+import { RAW_QUERY_MODEL } from 'turbine-orm';
+import { db } from './db';
+
+const DB_SYSTEM = 'postgresql'; // 'mysql', 'sqlite' or 'microsoft.sql_server' on the other engines
+const tracer = trace.getTracer('turbine-orm');
+
+// One span per Turbine operation. The statements it runs become its children.
+db.$use((params, next) =>
+  tracer.startActiveSpan(`${params.model}.${params.action}`, { kind: SpanKind.INTERNAL }, async (span) => {
+    try {
+      return await next(params);
+    } catch (err) {
+      span.recordException(err as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR });
+      throw err;
+    } finally {
+      span.end();
+    }
+  }),
+);
+
+// One span per SQL statement, back-dated from the event's duration.
+db.$on('query', (e) => {
+  const end = e.timestamp.getTime();
+  const table = e.model === RAW_QUERY_MODEL ? undefined : e.model;
+  const span = tracer.startSpan(
+    table ? `${e.action} ${table}` : e.action,
+    {
+      kind: SpanKind.CLIENT,
+      startTime: end - e.duration,
+      attributes: {
+        'db.system.name': DB_SYSTEM,
+        'db.operation.name': e.action,
+        'db.query.text': e.sql,
+        ...(table ? { 'db.collection.name': table } : {}),
+        ...(e.tag ? { 'turbine.tag': e.tag } : {}),
+        ...(e.batch ? { 'turbine.batch': e.batch } : {}),
+        ...(e.retried ? { 'turbine.retried': true } : {}),
+      },
+    },
+    context.active(),
+  );
+  if (e.error) {
+    span.setAttribute('error.type', e.error.name);
+    span.setStatus({ code: SpanStatusCode.ERROR, message: e.error.message });
+  }
+  span.end(end);
+});
+```
+
+A request that creates an order produces this tree, with your own span at the top:
+
+```
+POST /orders                 your span
+  orders.create              INTERNAL, from $use
+    create orders            CLIENT, from $on('query')
+```
+
+The operation span is `INTERNAL` and the statement span is `CLIENT`, so a backend that counts database calls counts each statement once. The operation span is wider than its statements: it also covers SQL generation and turning rows into objects.
+
+### Why the tree comes out right
+
+A query event is delivered in the async context of the code that awaited the statement. `context.active()` inside the listener is therefore the span that was active at that `await`: the operation span for a model call, or your own span for a statement that has no operation span. Nothing has to be passed through Turbine for this to work.
+
+`$use` wraps model methods only, so these statements get no operation span. They appear as statement spans directly under whichever span is active where you await them:
+
+| Statement | `db.operation.name` | `turbine.batch` |
+|---|---|---|
+| `db.pipeline(...)` | each statement's method | `pipeline` |
+| `db.$transaction([...])` | each statement's method | `transaction` |
+| `findManyStream`, `findManyStreamBatches` | the stream method | none |
+| `db.raw`, `db.sql`, `db.rawUnsafe`, `tx.raw`, `tx.rawQuery` | the entry point, such as `raw` or `sql` | none |
+
+Four consequences:
+
+- **A lazy `db.sql` builder executes where it is awaited, not where it was built.** A `db.sql` query created in one request and awaited in another puts its statement under the second.
+- **A transaction adds no span of its own.** `BEGIN`, `COMMIT` and savepoints are not reported, and each statement inside `db.$transaction(async (tx) => ...)` nests under its operation. Wrap the transaction in your own span if you want one.
+- **Batched relation loads stay under one operation.** With `relationLoadStrategy: 'batched'`, and with the `'auto'` fallback (events tagged `strategy: 'auto-batched'`), the base statement and every follow-up are children of the same operation span. A follow-up event carries the model of the query that asked for it, not the table it read, so take the table from `db.query.text`.
+- **Raw statements have no table.** `RAW_QUERY_MODEL` (`'$raw'`) is left out of the span name and of `db.collection.name`.
+
+### What the attributes mean
+
+The `db.*` and `error.type` names follow the [OpenTelemetry database semantic conventions](https://opentelemetry.io/docs/specs/semconv/db/database-spans/). The conventions reached stable in v1.33.0, which renamed `db.system` to `db.system.name` and `db.statement` to `db.query.text`, and some values are still marked in development, such as the one for SQLite. Pin the version of the conventions your backend expects. `turbine.tag`, `turbine.batch` and `turbine.retried` are Turbine's own.
+
+| Attribute | Value |
+|---|---|
+| `db.system.name` | The `DB_SYSTEM` you set for your engine. |
+| `db.operation.name` | The Turbine method, such as `findMany`, `create` or `raw`. |
+| `db.collection.name` | The table. Absent for raw SQL. |
+| `db.query.text` | The SQL text with placeholders (`$1`, `$2`). |
+| `error.type` | The error class name, such as `UniqueConstraintError`. Set on failure only. |
+| `turbine.tag` | The enclosing [`db.$tag()`](#attributing-queries-to-a-feature-dbtag) label. |
+| `turbine.batch` | `pipeline` or `transaction` for statements that ran as part of a batch. |
+| `turbine.retried` | `true` on the failed first attempt of a read that Turbine re-sent after the server had closed its connection. |
+
+Timing, parameters and failures:
+
+- **`duration` is measured around the driver call.** It covers the round trip and, on a pooled client, the wait for a free connection. It does not cover SQL generation, row parsing or middleware, which is why the operation span is longer. Each span ends at the event's `timestamp` and starts `duration` earlier.
+- **A pipeline's per-statement duration is the batch time divided evenly.** The pipeline sends every statement in one round trip, so the spans share the batch's wall time equally. The total is exact and the per-statement split is not. Statements in `$transaction([...])` are timed individually.
+- **Parameter values stay out of the span.** Turbine binds every value, so `db.query.text` carries placeholders and never values. The one exception is [`db.rawUnsafe`](/queries), where you write the text yourself. The values are in `e.params`, which holds `'[REDACTED]'` for each entry unless [`logQueryParams`](#seeing-the-parameter-values-logqueryparams) is on. The recipe does not record them. If you add them, the conventions treat `db.query.parameter.<key>` as opt-in because values can carry personal data.
+- **A retried read shows as two statement spans.** The first carries `turbine.retried` and an error status, the second times the retry alone. Alert on the operation span's status to count failed calls rather than failed attempts. Writes and statements inside a transaction are never retried.
+- **`recordException` sends the error's message and stack to your backend.** See [`errorMessages`](/errors#safe-error-messages) for what a message may contain.
+
+{/* PENDING sqlComment (lane B4): the part below documents sqlComment, which has not landed. Publish it
+once the sqlComment option and its dynamic hook exist, and re-verify every sentence against that code.
+
+### Carrying the trace into the database
+
+Add the active span's `traceparent` to each statement as a trailing SQL comment, so `pg_stat_activity`, the server log and database-side APM can be joined to your traces.
+
+```ts
+const db = turbine({
+  sqlComment: {
+    dynamic: () => {
+      const ctx = trace.getActiveSpan()?.spanContext();
+      if (!ctx || (ctx.traceFlags & 1) === 0) return undefined; // unsampled: keep prepared statements
+      return { traceparent: `00-${ctx.traceId}-${ctx.spanId}-${ctx.traceFlags.toString(16).padStart(2, '0')}` };
+    },
+  },
+});
+```
+
+State here, once verified: a statement carrying a dynamic comment is sent unnamed (it is not a reusable prepared statement), which is why the hook returns nothing for unsampled spans; the measured cost from the design was about 7 us on a point read and 55 us on a nested read on localhost; PowDB refuses sqlComment; pg_stat_statements is not split by comments.
+*/}
+
 ## See also
 
 - **[Studio](/studio)**, the read-only database UI with the same local security posture.
