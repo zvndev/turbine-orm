@@ -58,8 +58,10 @@ import {
   atLeastVersion,
   baseTsType,
   coerceNativeValue,
+  coerceValue,
   isJsonColumn,
   isPowdbDatetimeColumn,
+  isPowdbDecimalTextColumn,
   isStaleFramePowdbError,
   type PowdbCapabilities,
   PowdbFloatParam,
@@ -80,8 +82,10 @@ import {
 } from './query/compound-unique.js';
 import { ARRAY_OPERATOR_KEYS, isJsonFilter, isRelationPickOrderBy, orderByEntries } from './query/filters.js';
 import type { MiddlewareFn, QueryEvent, QueryInterfaceOptions } from './query/index.js';
+import { isJsonValue } from './query/json-value.js';
+import { assertWhereNotEmptiedByPruning, pruneUndefinedArgs } from './query/normalize-args.js';
 import { warnUnknownQueryOptions } from './query/option-surface.js';
-import { applyStableRelationOrderTo, normalizeWithClause } from './query/relation-names.js';
+import { applyStableRelationOrderTo, normalizeWithClause, normalizeWithPagination } from './query/relation-names.js';
 import type {
   AggregateArgs,
   AggregateResult,
@@ -112,7 +116,6 @@ import type {
 import { assertDirectionToken, resolveSkipGlobalFilters, resolveUnsafeFlag, UNSAFE } from './query/types.js';
 import {
   availableClause,
-  escapeLike,
   normalizePagination,
   ownLookup,
   relationInProjectionMessage,
@@ -121,7 +124,13 @@ import {
   selectNamesNothingMessage,
   selectOmitExclusiveMessage,
 } from './query/utils.js';
-import { assertJsonFilterKeys, jsonStringEntries, resolveGlobalFilterFrom } from './query/where.js';
+import {
+  assertJsonFilterKeys,
+  jsonStringEntries,
+  normalizeRelationFilter,
+  resolveGlobalFilterFrom,
+} from './query/where.js';
+import { assertNoOptimisticLock } from './query/writes.js';
 import {
   type ColumnMetadata,
   normalizeKeyColumns,
@@ -310,6 +319,52 @@ const POWQL_HAVING_AGG_FNS = new Map<string, string>([
   ['_count', 'count'],
 ]);
 
+/**
+ * Max distinct keys one client-side relation filter may resolve to.
+ *
+ * A relation filter becomes a literal `in (…)` list on the local key, and the
+ * engine evaluates that list per row, so the cost grows with rows times keys
+ * (measured on the 0.20 addon over 100k rows: about 0.3 s per 1,000 keys).
+ * Past this bound the filter is refused with a typed error naming the bound,
+ * instead of building a statement whose cost has no ceiling.
+ */
+export const MAX_RELATION_FILTER_KEYS = 10_000;
+
+/** The relation-filter keys the SQL engines accept, in their compile order. */
+const RELATION_FILTER_KEYS = ['some', 'none', 'every', 'is', 'isNot'] as const;
+type RelationFilterKey = (typeof RELATION_FILTER_KEYS)[number];
+
+/**
+ * True for a branded column reference (`col('x')`). PowQL has no column-to-column
+ * operand form in a filter, so a reference is refused rather than bound as data.
+ * The brand is read by its registry key so this needs no import of the module
+ * that creates it.
+ */
+function isColumnReference(value: unknown): boolean {
+  return typeof value === 'object' && value !== null && Symbol.for('turbine-orm.columnRef') in value;
+}
+
+/** A value a non-JSON column can be compared against. */
+function isScalarOperand(value: unknown): boolean {
+  const t = typeof value;
+  return (
+    t === 'string' ||
+    t === 'number' ||
+    t === 'bigint' ||
+    t === 'boolean' ||
+    value instanceof Date ||
+    value instanceof Uint8Array
+  );
+}
+
+/** Short, data-free description of an operand for an error message. */
+function describeOperand(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'an array';
+  if (typeof value === 'object') return 'an object';
+  return typeof value;
+}
+
 /** Filters that have no PowDB representation and must throw E017. */
 function rejectUnsupportedFilter(value: Record<string, unknown>, field: string): void {
   if ('distance' in value || 'metric' in value) {
@@ -476,7 +531,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    */
   private param(value: unknown, params: unknown[], col?: ColumnMetadata): string {
     let tagged: unknown = value;
-    if (col && typeof value === 'number' && this.isFloatCol(col)) {
+    if (isJsonValue(value)) {
+      // `jsonValue(v)`: serialized with JSON.stringify, as on the SQL engines.
+      tagged = new PowdbJsonParam(value.value, col?.name);
+    } else if (col && typeof value === 'number' && this.isFloatCol(col)) {
       // Float column: force a float-form literal even for an integer value.
       tagged = new PowdbFloatParam(value);
     } else if (col && value !== null && typeof value === 'object' && !(value instanceof Date) && isJsonColumn(col)) {
@@ -610,15 +668,6 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   /**
-   * Caller args in canonical form: declared relation spellings, and `take` /
-   * `skip` folded into `limit` / `offset`.
-   *
-   * Same composition as `QueryInterface.normalizeArgs` and here for the same
-   * reason the method above is here: nothing about a parallel implementation
-   * makes a core rule arrive on its own, and an engine that reads `take` but
-   * not `skip` pages differently from one that reads both.
-   */
-  /**
    * Fill in the deterministic per-relation ordering `stableRelationOrder` asks
    * for, through the shared transform the SQL engines use.
    *
@@ -627,6 +676,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * option whose entire purpose is that they do not. Same resolution as
    * QueryInterface: a per-query flag wins, else the client-level default.
    */
+  /** `take` / `skip` inside every `with` level folded into `limit` / `offset` (shared rule). */
+  private withRelationPagination<A extends { with?: unknown }>(args: A): A {
+    if (!args?.with) return args;
+    const normalized = normalizeWithPagination(this.schema, this.table, args.with as WithClause);
+    return normalized === args.with ? args : ({ ...args, with: normalized } as A);
+  }
+
   private withStableRelationOrder<A extends { with?: unknown; stableRelationOrder?: boolean }>(args: A): A {
     if (!args?.with) return args;
     const on = args.stableRelationOrder ?? this.options.stableRelationOrder === true;
@@ -635,8 +691,25 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     return ordered === args.with ? args : ({ ...args, with: ordered } as A);
   }
 
-  private normalizeArgs<A extends { with?: unknown; stableRelationOrder?: boolean }>(args: A): A {
-    return normalizePagination(this.withStableRelationOrder(this.withDeclaredRelationNames(args)));
+  /**
+   * Caller args in canonical form: `undefined` pruned (query/normalize-args.ts),
+   * declared relation spellings, stable relation order, and `take` / `skip`
+   * folded into `limit` / `offset` at the top level and inside `with`. Same composition as
+   * `QueryInterface.normalizeArgs`, run at the top of every public operation,
+   * so the two engines agree about what each argument means.
+   *
+   * `refuseEmptiedWhere` names the single-row read (`findFirst`,
+   * `findFirstOrThrow`) that refuses a `where` whose every key was `undefined`.
+   */
+  private normalizeArgs<A extends object>(args: A, refuseEmptiedWhere?: string): A {
+    const pruned = pruneUndefinedArgs(this.schema, this.table, args);
+    if (refuseEmptiedWhere && pruned !== args) {
+      assertWhereNotEmptiedByPruning(this.table, refuseEmptiedWhere, args, pruned);
+    }
+    const shaped = pruned as A & { with?: unknown; stableRelationOrder?: boolean };
+    return normalizePagination(
+      this.withStableRelationOrder(this.withRelationPagination(this.withDeclaredRelationNames(shaped))),
+    );
   }
 
   /**
@@ -653,6 +726,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       'PowDB',
       'PowQL emits no JSON row encoding for relations, so there is nothing to select; omit the option',
     );
+  }
+
+  /** `optimisticLock` is an `update` option; the shared refusal and message from query/writes.ts. */
+  private assertNoOptimisticLock(args: object, operation: 'upsert' | 'updateMany'): void {
+    // The shared check reads only the table name from its builder context.
+    assertNoOptimisticLock({ table: this.table } as Parameters<typeof assertNoOptimisticLock>[0], args, operation);
   }
 
   private assertNoForceCustomPlan(args: { forceCustomPlan?: boolean } | undefined): void {
@@ -802,14 +881,52 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     );
   }
 
+  /**
+   * Refuse a value comparison on a `numeric` / `decimal` column. PowDB stores
+   * those as `str` (it has no decimal type, and `float` would lose digits), so
+   * every comparison, ordering and aggregate the engine could run on them is a
+   * TEXT comparison: `'7.50' > '7.5'`, `'10' < '9'`, and `'7.5' = '7.50'` is
+   * false; arithmetic on a `str` yields NULL. Null checks, reads and plain
+   * writes are unaffected.
+   */
+  private assertDecimalComparable(col: ColumnMetadata, what: string): void {
+    if (!isPowdbDecimalTextColumn(col)) return;
+    throw new UnsupportedFeatureError(
+      `${what} on the numeric column "${col.name}" of "${this.table}"`,
+      'PowDB',
+      'PowDB stores numeric/decimal values as text, so the engine would compare, order and aggregate them as ' +
+        "strings ('10' < '9', '7.5' != '7.50') and arithmetic on them yields NULL. Reading, writing and `null` " +
+        'checks work. To compare, aggregate or do arithmetic, store the value as an integer of minor units ' +
+        '(cents) or as a float, or do it in application code.',
+    );
+  }
+
+  /** The E003 for an operand that is not a comparable value for its column. */
+  private operandError(field: string, opName: string, value: unknown, expected: string): ValidationError {
+    const position = opName === '=' ? `"${field}"` : `\`${opName}\` on "${field}"`;
+    return new ValidationError(
+      `Invalid operand for ${position} on "${this.table}": expected ${expected}, got ${describeOperand(value)}. ` +
+        'A column is compared against a string, number, bigint, boolean or Date; pass an operator object ' +
+        '(`{ gt: 5 }`, `{ in: [1, 2] }`) to choose the comparison.',
+    );
+  }
+
   /** Build a single `field: value | operator` condition. */
   private buildFieldCondition(field: string, value: unknown, params: unknown[], alias?: string): string {
     const colMeta = this.column(field);
     const ref = this.ref(field, alias);
     if (value === null) return `${ref} is null`;
-    if (value instanceof Date || typeof value !== 'object') {
+    if (isColumnReference(value)) {
+      throw new UnsupportedFeatureError(
+        'Column references in a filter',
+        'PowDB',
+        `field "${field}": PowQL has no column-to-column operand in a filter. Compare in application code.`,
+      );
+    }
+    if (isScalarOperand(value)) {
+      this.assertDecimalComparable(colMeta, 'Equality');
       this.assertDatetimePredicateSupported(colMeta);
-      return `${ref} = ${this.param(value, params, colMeta)}`;
+      return `${ref} = ${this.filterOperand(value, params, colMeta)}`;
     }
     const op = value as Record<string, unknown>;
     // JSON path / key filters on a json document column compile to PowQL `->`
@@ -820,9 +937,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       requireCapability(this.capabilities, 'jsonDocs', 'JSON path filters');
       return this.buildJsonPathCondition(colMeta, value, params, alias);
     }
-    rejectUnsupportedFilter(op, field);
-    if (!Object.keys(op).some((k) => OPERATOR_KEYS.has(k))) {
-      // A bare object that is not an operator set, equality by value.
+    if (!Array.isArray(op)) rejectUnsupportedFilter(op, field);
+    if (Array.isArray(op) || !Object.keys(op).some((k) => OPERATOR_KEYS.has(k))) {
+      // A json document column compares a whole document by value. Any other
+      // column has no object or array value, so binding one as data compared
+      // against nothing meaningful; it is refused, as on the SQL engines.
+      if (!isJsonColumn(colMeta)) throw this.operandError(field, '=', value, 'a scalar or an operator object');
       this.assertDatetimePredicateSupported(colMeta);
       return `${ref} = ${this.param(value, params)}`;
     }
@@ -831,6 +951,25 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const conds: string[] = [];
     for (const [opName, opVal] of Object.entries(op)) {
       if (opVal === undefined || opName === 'mode') continue;
+      if (opName === 'not' && opVal !== null && !isScalarOperand(opVal) && !isColumnReference(opVal)) {
+        // `not` takes an operator object, as on the SQL engines: the rows where
+        // the inner condition is FALSE (a NULL column is neither, so it is
+        // excluded, which PowQL's two-valued `not` alone would not do).
+        if (Array.isArray(opVal) || Object.keys(opVal as object).length === 0) {
+          throw this.operandError(field, 'not', opVal, 'a scalar, null, or a non-empty operator object');
+        }
+        const inner = { ...(op.mode !== undefined ? { mode: op.mode } : {}), ...(opVal as object) };
+        const negated = this.buildWhere(this.sqlFalseWhere({ [field]: inner } as WhereClause<T>), params, alias);
+        conds.push(negated || this.alwaysFalse());
+        continue;
+      }
+      if (opName === 'in' || opName === 'notIn') {
+        if (!Array.isArray(opVal) || opVal.some((v) => v !== null && !isScalarOperand(v))) {
+          throw this.operandError(field, opName, opVal, 'an array of scalars');
+        }
+      } else if (opVal !== null && !isScalarOperand(opVal)) {
+        throw this.operandError(field, opName, opVal, 'a scalar');
+      }
       // Every operator below compares the column against a bound literal, which
       // is the shape a PowDB `datetime` column can only answer from engine 0.20
       // (see assertDatetimePredicateSupported; `in`/`notIn` reach the engine as
@@ -841,29 +980,34 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const comparesNothing =
         (opVal === null && (opName === 'equals' || opName === 'not')) ||
         ((opName === 'in' || opName === 'notIn') && Array.isArray(opVal) && opVal.length === 0);
-      if (!comparesNothing) this.assertDatetimePredicateSupported(colMeta);
+      if (!comparesNothing) {
+        this.assertDecimalComparable(colMeta, `\`${opName}\``);
+        this.assertDatetimePredicateSupported(colMeta);
+      }
       switch (opName) {
         case 'equals':
-          conds.push(opVal === null ? `${ref} is null` : `${lhs} = ${this.bind(opVal, params, insensitive)}`);
+          conds.push(opVal === null ? `${ref} is null` : `${lhs} = ${this.bind(opVal, params, insensitive, colMeta)}`);
           break;
         case 'not':
           // Spell as `lhs != $N` (not `not (lhs = $N)`) so a missing-value row is
           // EXCLUDED, matching SQL null semantics on PowDB >= 0.18.2. Behavior-neutral
           // on older engines (pre-0.18.2 `!=` MATCHED missing rows exactly like the
           // old `not (...)` spelling), so no capability gate is needed.
-          conds.push(opVal === null ? `${ref} is not null` : `${lhs} != ${this.bind(opVal, params, insensitive)}`);
+          conds.push(
+            opVal === null ? `${ref} is not null` : `${lhs} != ${this.bind(opVal, params, insensitive, colMeta)}`,
+          );
           break;
         case 'gt':
-          conds.push(`${lhs} > ${this.bind(opVal, params, insensitive)}`);
+          conds.push(`${lhs} > ${this.bind(opVal, params, insensitive, colMeta)}`);
           break;
         case 'gte':
-          conds.push(`${lhs} >= ${this.bind(opVal, params, insensitive)}`);
+          conds.push(`${lhs} >= ${this.bind(opVal, params, insensitive, colMeta)}`);
           break;
         case 'lt':
-          conds.push(`${lhs} < ${this.bind(opVal, params, insensitive)}`);
+          conds.push(`${lhs} < ${this.bind(opVal, params, insensitive, colMeta)}`);
           break;
         case 'lte':
-          conds.push(`${lhs} <= ${this.bind(opVal, params, insensitive)}`);
+          conds.push(`${lhs} <= ${this.bind(opVal, params, insensitive, colMeta)}`);
           break;
         case 'in':
           conds.push(this.buildInList(lhs, opVal as unknown[], params, insensitive, false, colMeta));
@@ -872,13 +1016,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           conds.push(this.buildInList(lhs, opVal as unknown[], params, insensitive, true, colMeta));
           break;
         case 'contains':
-          conds.push(`${lhs} like ${this.bindLike(`%${escapeLike(String(opVal))}%`, params, insensitive)}`);
-          break;
         case 'startsWith':
-          conds.push(`${lhs} like ${this.bindLike(`${escapeLike(String(opVal))}%`, params, insensitive)}`);
-          break;
         case 'endsWith':
-          conds.push(`${lhs} like ${this.bindLike(`%${escapeLike(String(opVal))}`, params, insensitive)}`);
+          conds.push(this.buildStringMatch(opName, ref, String(opVal), params, insensitive, `"${field}"`));
           break;
         default:
           throw new ValidationError(`Unsupported operator "${opName}" on PowDB.`);
@@ -996,11 +1136,17 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     }
 
     // Substring comparisons against the text at `path`, in the same fixed
-    // order as the SQL path. PowQL has `like`, so these compile natively.
-    for (const { pattern, value } of jsonStringEntries(filter, col.name)) {
+    // order as the SQL path, through the same literal matcher as a column.
+    const stringOps: Record<string, 'contains' | 'startsWith' | 'endsWith'> = {
+      stringContains: 'contains',
+      stringStartsWith: 'startsWith',
+      stringEndsWith: 'endsWith',
+    };
+    for (const { op, value } of jsonStringEntries(filter, col.name)) {
       const insensitive = filter.mode === 'insensitive';
-      const lhs = insensitive ? `lower(${pathP()})` : pathP();
-      conds.push(`${lhs} like ${this.bindLike(pattern(escapeLike(value)), params, insensitive)}`);
+      const kind = stringOps[op];
+      if (!kind) throw new ValidationError(`internal: unknown JSON string operator "${op}" on "${col.name}".`);
+      conds.push(this.buildStringMatch(kind, pathP(), value, params, insensitive, `the JSON path on "${col.name}"`));
     }
 
     // Every reachable shape now emits a condition or throws: assertJsonFilterKeys
@@ -1016,15 +1162,60 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   /** Bind a value, lowercasing for case-insensitive comparisons. */
-  private bind(value: unknown, params: unknown[], insensitive: boolean): string {
-    const ph = this.param(value, params);
+  private bind(value: unknown, params: unknown[], insensitive: boolean, col?: ColumnMetadata): string {
+    const ph = this.filterOperand(value, params, col);
     return insensitive ? `lower(${ph})` : ph;
   }
 
-  /** Bind a LIKE pattern (already escaped), lowercasing for insensitive mode. */
-  private bindLike(pattern: string, params: unknown[], insensitive: boolean): string {
-    const ph = this.param(pattern, params);
-    return insensitive ? `lower(${ph})` : ph;
+  /**
+   * A bound filter operand. An integral number compared with a float column is
+   * cast to float in the statement: the typed wire carries an integral number as
+   * an int, and the engine compares int with float by type tag inside `not`,
+   * `or` and `in` (on 0.20 `not (.rating = 4)` matches the 4.0 row and
+   * `.rating in (4, 5)` matches nothing).
+   */
+  private filterOperand(value: unknown, params: unknown[], col?: ColumnMetadata): string {
+    const ph = this.param(value, params, col);
+    return col && typeof value === 'number' && Number.isInteger(value) && this.isFloatCol(col) ? `(${ph} + 0.0)` : ph;
+  }
+
+  /**
+   * `contains` / `startsWith` / `endsWith` against `expr` (a column or a JSON
+   * path), matching `value` literally.
+   *
+   * PowQL's `like` has NO escape character: `%` and `_` in the pattern are
+   * always wildcards and `\` is an ordinary character. So a prefix or suffix
+   * test never goes through `like`: it compares the leading or trailing
+   * `length($v)` characters with `substring`, which is exact for every value
+   * on every engine version (and sidesteps the pre-0.27 matcher, which missed
+   * text containing a literal `%`). `contains` has no such form, since PowQL
+   * has no position function, so a value carrying `%` or `_` is refused rather
+   * than sent as a pattern that means something else.
+   */
+  private buildStringMatch(
+    op: 'contains' | 'startsWith' | 'endsWith',
+    expr: string,
+    value: string,
+    params: unknown[],
+    insensitive: boolean,
+    target: string,
+  ): string {
+    const fold = (e: string): string => (insensitive ? `lower(${e})` : e);
+    if (op === 'contains') {
+      if (/[%_]/.test(value)) {
+        throw new UnsupportedFeatureError(
+          '`contains` with a value containing `%` or `_`',
+          'PowDB',
+          `${target} on "${this.table}": PowQL's \`like\` has no escape character, so those characters would act ` +
+            'as wildcards and match other rows. `startsWith` and `endsWith` match such values exactly; for a ' +
+            'substring, filter in application code.',
+        );
+      }
+      return `${fold(expr)} like ${fold(this.param(`%${value}%`, params))}`;
+    }
+    const ph = this.param(value, params);
+    const start = op === 'startsWith' ? '1' : `length(${expr}) - length(${ph}) + 1`;
+    return `(length(${expr}) >= length(${ph}) and ${fold(`substring(${expr}, ${start}, length(${ph}))`)} = ${fold(ph)})`;
   }
 
   /**
@@ -1047,7 +1238,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       return negate ? '(1 = 1)' : this.alwaysFalse();
     }
     if (col && isPowdbDatetimeColumn(col)) return this.buildDatetimeInList(lhs, values, params, negate, col);
-    const items = values.map((v) => this.bind(v, params, insensitive)).join(', ');
+    const items = values.map((v) => this.bind(v, params, insensitive, col)).join(', ');
     if (negate) {
       // PowQL `not in` matches missing-value rows, so append `and lhs is not null`
       // for SQL null-semantics parity (non-empty list only, per the empty-list note above).
@@ -1141,23 +1332,27 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   /**
-   * Pre-resolve every relation filter (`some`/`none`/`every`) in a where clause
-   * into a plain scalar `in`/`notIn` condition on the **local key**, by running
-   * the inner predicate as its own query and materializing the matching keys as
-   * a literal list. The compiled where is then relation-free and `buildWhere`
-   * emits only `in (<literal list>)`.
+   * Pre-resolve every relation filter in a where clause into a plain scalar
+   * condition on the **local key**, by running the inner predicate as its own
+   * query and materializing the matching keys as a literal list. The compiled
+   * where is then relation-free and `buildWhere` emits only `in (<literal list>)`.
    *
    * Why not an IN-subquery (`.k in (Target filter <e> { .fk })`)? PowDB's
    * executor caches a subquery's result by **plan shape, ignoring the literal**,
    * so a second subquery of the same shape with a different value returns the
    * first one's stale rows (reproduced live on the embedded engine; the
    * single-statement literal `in (list)` form is always correct). Resolving
-   * client-side trades extra round-trips for correctness, and recurses, nested
+   * client-side trades extra round-trips for correctness, and recurses: nested
    * relation filters in the inner predicate resolve when the target query runs.
+   *
+   * `skip` is the query's `skipGlobalFilters`, forwarded to every target query
+   * so the target's global filter bounds the related rows exactly as the SQL
+   * engines' EXISTS does, and an opt-out reaches the targets as it does there.
    */
   private async resolveRelationFilters(
     where: WhereClause<T> | undefined,
     timeout?: number,
+    skip?: unknown,
   ): Promise<WhereClause<T> | undefined> {
     if (!where) return where;
     const scalar: Record<string, unknown> = {};
@@ -1165,41 +1360,151 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     for (const [key, value] of Object.entries(where)) {
       if (value === undefined) continue;
       if (key === 'AND' || key === 'OR') {
-        scalar[key] = await Promise.all(
-          (value as WhereClause<T>[]).map((w) => this.resolveRelationFilters(w, timeout)),
-        );
-      } else if (key === 'NOT') {
-        scalar[key] = await this.resolveRelationFilters(value as WhereClause<T>, timeout);
-      } else if (resolveRelationDef(this.meta.relations, key)) {
-        relConds.push(
-          await this.resolveRelationCondition(
-            resolveRelationDef(this.meta.relations, key)!,
-            value as Record<string, unknown>,
-            timeout,
-          ),
-        );
-      } else {
-        scalar[key] = value;
+        scalar[key] = Array.isArray(value)
+          ? await Promise.all((value as WhereClause<T>[]).map((w) => this.resolveRelationFilters(w, timeout, skip)))
+          : value;
+        continue;
       }
+      if (key === 'NOT') {
+        scalar[key] = await this.resolveRelationFilters(value as WhereClause<T>, timeout, skip);
+        continue;
+      }
+      const rel = resolveRelationDef(this.meta.relations, key);
+      if (!rel) {
+        scalar[key] = value;
+        continue;
+      }
+      const cond = await this.resolveRelationCondition(rel, key, value, timeout, skip);
+      if (cond) relConds.push(cond);
     }
     if (!relConds.length) return scalar as WhereClause<T>;
     const hasScalar = Object.keys(scalar).length > 0;
     return { AND: [...(hasScalar ? [scalar] : []), ...relConds] } as WhereClause<T>;
   }
 
-  /** Resolve one hasMany/hasOne/belongsTo filter to `{ localField: { in|notIn: [...] } }`. */
+  /**
+   * Resolve one relation filter to a relation-free condition on the local key,
+   * with the SQL engines' meaning for every branch:
+   *
+   *   some / is      EXISTS a related row matching the inner where
+   *   none / isNot   NOT EXISTS such a row (true for a NULL local key)
+   *   every          NOT EXISTS a related row for which the inner where is FALSE
+   *   is: null       NOT EXISTS any related row
+   *   isNot: null    EXISTS a related row
+   *
+   * A bare object on a to-one relation is an implicit `is` (the shared
+   * {@link normalizeRelationFilter} rule). Branches combine with AND. A shape
+   * that names no branch, or names something else, is refused: compiling it to
+   * nothing would match every row, and a mutation carrying it would write them.
+   * Returns `null` when every branch key is `undefined` (an absent filter).
+   */
   private async resolveRelationCondition(
     rel: RelationDef,
-    filter: Record<string, unknown>,
+    key: string,
+    value: unknown,
     timeout?: number,
-  ): Promise<Record<string, unknown>> {
-    const mode = filter.some ? 'some' : filter.none ? 'none' : filter.every ? 'every' : null;
-    if (!mode) return {};
-    const innerWhere = filter[mode] as Record<string, unknown> | undefined;
-    const innerEmpty = !innerWhere || Object.keys(innerWhere).length === 0;
-    if (rel.type === 'manyToMany') {
-      return this.resolveManyToManyCondition(rel, mode, innerWhere, innerEmpty, timeout);
+    skip?: unknown,
+  ): Promise<Record<string, unknown> | null> {
+    const shapeError = (detail: string): ValidationError =>
+      new ValidationError(
+        `Invalid relation filter "${key}" on "${this.table}": ${detail}. ` +
+          (rel.type === 'belongsTo' || rel.type === 'hasOne'
+            ? `A to-one relation takes \`{ is: {...} }\`, \`{ isNot: {...} }\`, a bare where object, or \`is: null\`.`
+            : 'A to-many relation takes `{ some: {...} }`, `{ none: {...} }` or `{ every: {...} }`.'),
+      );
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+      throw shapeError(`expected an object, got ${describeOperand(value)}`);
     }
+    // The shared rule; its first parameter is unused, so it needs no SQL builder context.
+    const filter = normalizeRelationFilter(undefined as never, rel, value as Record<string, unknown>);
+    const keys = Object.keys(filter);
+    if (keys.length === 0) throw shapeError('the filter object is empty');
+    const unknown = keys.filter((k) => !(RELATION_FILTER_KEYS as readonly string[]).includes(k));
+    if (unknown.length) throw shapeError(`unrecognized key ${unknown.map((k) => `"${k}"`).join(', ')}`);
+    if (keys.every((k) => filter[k] === undefined)) return null;
+
+    const conds: Record<string, unknown>[] = [];
+    for (const branch of RELATION_FILTER_KEYS) {
+      const inner = filter[branch];
+      if (inner === undefined) continue;
+      if (inner !== null && (typeof inner !== 'object' || Array.isArray(inner))) {
+        throw shapeError(`\`${branch}\` takes a where object, got ${describeOperand(inner)}`);
+      }
+      const where = inner as Record<string, unknown> | null;
+      const isEmpty = where !== null && Object.keys(where).every((k) => where[k] === undefined);
+      switch (branch as RelationFilterKey) {
+        case 'some':
+          if (where !== null) conds.push(await this.relationMatch(rel, where, true, timeout, skip));
+          break;
+        case 'none':
+          if (where !== null) conds.push(await this.relationMatch(rel, where, false, timeout, skip));
+          break;
+        case 'every': {
+          // `every: {}` holds for every parent, as in SQL. Otherwise the parent
+          // fails when one related row makes the predicate FALSE; a row that
+          // leaves it unknown (a NULL column) does not count against it.
+          if (where === null || isEmpty) break;
+          const targetQi = this.relationTargetQi(rel);
+          const violates = targetQi.sqlFalseWhere(where as WhereClause<object>) as Record<string, unknown>;
+          conds.push(await this.relationMatch(rel, violates, false, timeout, skip));
+          break;
+        }
+        case 'is':
+          conds.push(await this.relationMatch(rel, where ?? {}, where !== null, timeout, skip));
+          break;
+        case 'isNot':
+          conds.push(await this.relationMatch(rel, where ?? {}, where === null, timeout, skip));
+          break;
+      }
+    }
+    if (conds.length === 0) return {};
+    return conds.length === 1 ? conds[0]! : { AND: conds };
+  }
+
+  /** A fresh interface over a relation's target table, for an internal fetch. */
+  private relationTargetQi(rel: RelationDef): PowqlInterface<object> {
+    if (!this.schema.tables[rel.to]) {
+      throw new ValidationError(`Relation "${rel.name}" targets unknown table "${rel.to}".`);
+    }
+    return new PowqlInterface<object>(this.pool, rel.to, this.schema, [], this.loaderChildOptions());
+  }
+
+  /**
+   * `EXISTS` (or `NOT EXISTS`, when `exists` is false) a related row matching
+   * `inner`, as a condition on this table's local key.
+   *
+   * The NOT EXISTS form keeps a NULL local key: such a row has no related row,
+   * so it qualifies. PowQL's `not in` alone would drop it.
+   */
+  private async relationMatch(
+    rel: RelationDef,
+    inner: Record<string, unknown>,
+    exists: boolean,
+    timeout?: number,
+    skip?: unknown,
+  ): Promise<Record<string, unknown>> {
+    const { localField, keys } =
+      rel.type === 'manyToMany'
+        ? await this.manyToManySourceKeys(rel, inner, timeout, skip)
+        : await this.directRelationKeys(rel, inner, timeout, skip);
+    if (exists) return { [localField]: { in: keys } };
+    const localCol = this.column(localField);
+    if (!localCol.nullable) return { [localField]: { notIn: keys } };
+    return { OR: [{ [localField]: null }, { [localField]: { notIn: keys } }] };
+  }
+
+  /**
+   * hasMany / hasOne / belongsTo: the local field, and the distinct correlation
+   * keys of the target rows matching `inner` (inside the target's global filter).
+   * hasMany/hasOne: local = our referenceKey, collected = the child's foreignKey.
+   * belongsTo:      local = our foreignKey,   collected = the target's referenceKey.
+   */
+  private async directRelationKeys(
+    rel: RelationDef,
+    inner: Record<string, unknown>,
+    timeout?: number,
+    skip?: unknown,
+  ): Promise<{ localField: string; keys: unknown[] }> {
     const fk = normalizeKeyColumns(rel.foreignKey);
     const rk = normalizeKeyColumns(rel.referenceKey);
     if (fk.length > 1 || rk.length > 1) {
@@ -1209,45 +1514,73 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         `relation "${rel.name}" uses a composite key, PowQL has no tuple-\`in\` to express it`,
       );
     }
-    const targetMeta = this.schema.tables[rel.to];
-    if (!targetMeta) throw new ValidationError(`Relation "${rel.name}" targets unknown table "${rel.to}".`);
-    // hasMany/hasOne: localKey = our referenceKey, collect the child's foreignKey.
-    // belongsTo:      localKey = our foreignKey,   collect the target's referenceKey.
+    const targetQi = this.relationTargetQi(rel);
     const localCol = rel.type === 'belongsTo' ? fk[0]! : rk[0]!;
     const childCol = rel.type === 'belongsTo' ? rk[0]! : fk[0]!;
     const localField = this.meta.reverseColumnMap[localCol] ?? localCol;
-    const childField = targetMeta.reverseColumnMap[childCol] ?? childCol;
-    const targetQi = new PowqlInterface(this.pool, rel.to, this.schema, [], this.loaderChildOptions());
-    const collect = async (w: Record<string, unknown> | undefined): Promise<unknown[]> => {
-      const rows = await targetQi.findMany({
-        where: w as WhereClause<object> | undefined,
-        select: { [childField]: true },
-        timeout,
-      } as unknown as FindManyArgs<object>);
-      return [...new Set(rows.map((r) => (r as Record<string, unknown>)[childField]).filter((v) => v != null))];
-    };
-    if (mode === 'some') return { [localField]: { in: await collect(innerWhere) } };
-    if (mode === 'none') return { [localField]: { notIn: await collect(innerWhere) } };
-    // every: a parent qualifies unless it has a child FAILING the predicate.
-    if (innerEmpty) return {}; // every:{} ⇒ trivially true for all parents
-    return { [localField]: { notIn: await collect({ NOT: innerWhere }) } };
+    const childField = targetQi.meta.reverseColumnMap[childCol] ?? childCol;
+    const keys = await targetQi.collectRelationKeys(inner, childField, rel.name, timeout, skip);
+    return { localField, keys };
   }
 
-  /** Resolve a manyToMany filter through the junction to `{ sourceRefField: { in|notIn: [...] } }`. */
-  private async resolveManyToManyCondition(
-    rel: RelationDef,
-    mode: 'some' | 'none' | 'every',
-    innerWhere: Record<string, unknown> | undefined,
-    innerEmpty: boolean,
+  /**
+   * The distinct non-null values of `field` over this table's rows matching
+   * `where` (inside this table's global filter, honouring `skip`), refused
+   * past {@link MAX_RELATION_FILTER_KEYS}.
+   */
+  private async collectRelationKeys(
+    where: Record<string, unknown> | undefined,
+    field: string,
+    relName: string,
     timeout?: number,
-  ): Promise<Record<string, unknown>> {
+    skip?: unknown,
+  ): Promise<unknown[]> {
+    const rows = await this.findMany({
+      where: where as WhereClause<T> | undefined,
+      select: { [field]: true },
+      timeout,
+      ...(skip !== undefined ? { skipGlobalFilters: skip } : {}),
+    } as unknown as FindManyArgs<T>);
+    return this.distinctKeys(
+      rows.map((r) => (r as Record<string, unknown>)[field]),
+      relName,
+    );
+  }
+
+  /** Dedupe correlation keys by value (a Date or bigint by its value, not identity) and enforce the cap. */
+  private distinctKeys(values: Iterable<unknown>, relName: string): unknown[] {
+    const byKey = new Map<string, unknown>();
+    for (const v of values) {
+      const k = this.joinKey(v);
+      if (k !== null && !byKey.has(k)) byKey.set(k, v);
+    }
+    if (byKey.size > MAX_RELATION_FILTER_KEYS) {
+      throw new UnsupportedFeatureError(
+        `A relation filter on "${relName}" matching ${byKey.size} distinct keys`,
+        'PowDB',
+        `PowDB resolves a relation filter into a literal list of keys, which the engine checks row by row, so ` +
+          `the cost grows with rows times keys; Turbine refuses lists over ${MAX_RELATION_FILTER_KEYS}. Narrow the ` +
+          'inner predicate, or query from the related side instead (filter the related table and load the parent ' +
+          'with `with`).',
+      );
+    }
+    return [...byKey.values()];
+  }
+
+  /** manyToMany: the source key field, and the source keys linked (through the junction) to targets matching `inner`. */
+  private async manyToManySourceKeys(
+    rel: RelationDef,
+    inner: Record<string, unknown>,
+    timeout?: number,
+    skip?: unknown,
+  ): Promise<{ localField: string; keys: unknown[] }> {
     const through = rel.through;
     if (!through) throw new ValidationError(`manyToMany relation "${rel.name}" is missing its junction (\`through\`).`);
     const sourceJ = normalizeKeyColumns(through.sourceKey);
     const targetJ = normalizeKeyColumns(through.targetKey);
     const sourceRef = normalizeKeyColumns(rel.referenceKey);
-    const targetMeta = this.schema.tables[rel.to];
-    if (!targetMeta) throw new ValidationError(`Relation "${rel.name}" targets unknown table "${rel.to}".`);
+    const targetQi = this.relationTargetQi(rel);
+    const targetMeta = targetQi.meta;
     if (sourceJ.length > 1 || targetJ.length > 1 || sourceRef.length > 1 || targetMeta.primaryKey.length > 1) {
       throw new UnsupportedFeatureError(
         'composite-key manyToMany filters',
@@ -1259,52 +1592,95 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const targetJCol = targetJ[0]!;
     const sourceRefCol = sourceRef[0]!;
     const targetPkCol = targetMeta.primaryKey[0]!;
-    const sourceRefField = this.meta.reverseColumnMap[sourceRefCol] ?? sourceRefCol;
+    const localField = this.meta.reverseColumnMap[sourceRefCol] ?? sourceRefCol;
     const sourceRefColMeta = this.meta.columns.find((c) => c.name === sourceRefCol);
     const targetPkField = targetMeta.reverseColumnMap[targetPkCol] ?? targetPkCol;
-    const targetQi = new PowqlInterface(this.pool, rel.to, this.schema, [], this.loaderChildOptions());
-    const collectTargetPks = async (w: Record<string, unknown> | undefined): Promise<unknown[]> => {
-      const rows = await targetQi.findMany({
-        where: w as WhereClause<object> | undefined,
-        select: { [targetPkField]: true },
-        timeout,
-      } as unknown as FindManyArgs<object>);
-      return [...new Set(rows.map((r) => (r as Record<string, unknown>)[targetPkField]).filter((v) => v != null))];
-    };
-    // Junction source keys linking any of `targetPks` (literal IN-list, never a subquery).
+    const targetPks = await targetQi.collectRelationKeys(inner, targetPkField, rel.name, timeout, skip);
+    if (!targetPks.length) return { localField, keys: [] };
+    // Junction source keys linking any of the targets (literal in-lists, never a subquery).
     const junctionMeta = this.schema.tables[through.table];
     const targetJColMeta = junctionMeta?.columns.find((c) => c.name === targetJCol);
     const junctionChunk = this.keyChunkSize(junctionMeta, targetJCol);
-    const sourcesForTargets = async (targetPks: unknown[]): Promise<unknown[]> => {
-      if (!targetPks.length) return [];
-      const out = new Set<unknown>();
-      for (let i = 0; i < targetPks.length; i += junctionChunk) {
-        const chunk = targetPks.slice(i, i + junctionChunk);
-        const params: unknown[] = [];
-        const keyClause = this.inClause(this.colRefName(targetJCol), chunk, params, targetJColMeta);
-        const { rows } = await this.exec(
-          `${quotePowqlIdent(through.table)} filter ${keyClause} { ${this.colRefName(sourceJCol)} }`,
-          params,
-          timeout,
-          'findMany',
-        );
-        for (const r of rows) {
-          const v = r[sourceJCol];
-          if (v != null) out.add(sourceRefColMeta ? coerceScalar(String(v), sourceRefColMeta.tsType) : v);
-        }
+    const sources: unknown[] = [];
+    for (let i = 0; i < targetPks.length; i += junctionChunk) {
+      const chunk = targetPks.slice(i, i + junctionChunk);
+      const params: unknown[] = [];
+      const keyClause = this.inClause(this.colRefName(targetJCol), chunk, params, targetJColMeta);
+      const { rows } = await this.exec(
+        `${quotePowqlIdent(through.table)} filter ${keyClause} { ${this.colRefName(sourceJCol)} }`,
+        params,
+        timeout,
+        'findMany',
+      );
+      for (const r of rows) {
+        const v = r[sourceJCol];
+        if (v != null) sources.push(sourceRefColMeta ? coerceScalar(String(v), sourceRefColMeta.tsType) : v);
       }
-      return [...out];
-    };
-    if (mode === 'some') {
-      return { [sourceRefField]: { in: await sourcesForTargets(await collectTargetPks(innerWhere)) } };
     }
-    if (mode === 'none') {
-      return { [sourceRefField]: { notIn: await sourcesForTargets(await collectTargetPks(innerWhere)) } };
+    return { localField, keys: this.distinctKeys(sources, rel.name) };
+  }
+
+  /**
+   * Rows where `where` is TRUE under SQL three-valued logic. PowQL's own
+   * evaluation already excludes a NULL from every comparison, so this differs
+   * from `where` only under `NOT`, where PowQL takes the plain complement and
+   * SQL keeps a NULL comparison unknown.
+   */
+  private sqlTrueWhere(where: WhereClause<T>): WhereClause<T> {
+    const parts: Record<string, unknown>[] = [];
+    for (const [key, value] of Object.entries(where)) {
+      if (value === undefined) continue;
+      if (key === 'AND' || key === 'OR') {
+        if (!Array.isArray(value) || value.length === 0) continue;
+        parts.push({ [key]: (value as WhereClause<T>[]).map((w) => this.sqlTrueWhere(w)) });
+      } else if (key === 'NOT') {
+        parts.push(this.sqlFalseWhere(value as WhereClause<T>) as Record<string, unknown>);
+      } else {
+        parts.push({ [key]: value });
+      }
     }
-    // every: exclude parents that link a target FAILING the predicate.
-    if (innerEmpty) return {}; // every:{} ⇒ trivially true
-    const failing = await sourcesForTargets(await collectTargetPks({ NOT: innerWhere }));
-    return { [sourceRefField]: { notIn: failing } };
+    if (parts.length === 0) return {} as WhereClause<T>;
+    return (parts.length === 1 ? parts[0] : { AND: parts }) as WhereClause<T>;
+  }
+
+  /**
+   * Rows where `where` is FALSE under SQL three-valued logic, the complement
+   * PowQL's two-valued `not` cannot express: a comparison against a NULL
+   * column is unknown, which is neither TRUE nor FALSE, so the row belongs to
+   * neither set. Relation filters (EXISTS) are two-valued and negate plainly.
+   */
+  private sqlFalseWhere(where: WhereClause<T>): WhereClause<T> {
+    const parts: Record<string, unknown>[] = [];
+    for (const [key, value] of Object.entries(where)) {
+      if (value === undefined) continue;
+      if (key === 'AND' || key === 'OR') {
+        // An empty combinator contributes nothing (TRUE), so it is never FALSE.
+        if (!Array.isArray(value) || value.length === 0) continue;
+        const negated = (value as WhereClause<T>[]).map((w) => this.sqlFalseWhere(w));
+        parts.push(key === 'AND' ? { OR: negated } : { AND: negated });
+      } else if (key === 'NOT') {
+        parts.push(this.sqlTrueWhere(value as WhereClause<T>) as Record<string, unknown>);
+      } else if (resolveRelationDef(this.meta.relations, key)) {
+        parts.push({ NOT: { [key]: value } });
+      } else {
+        // A column leaf is FALSE when the column is non-null and the leaf does
+        // not hold; on a NULL column only an explicit `not: null` (or an empty
+        // `in`) makes it FALSE, every other comparison is unknown there.
+        const op = value !== null && typeof value === 'object' ? (value as Record<string, unknown>) : undefined;
+        const falseAtNull = op !== undefined && (op.not === null || (Array.isArray(op.in) && op.in.length === 0));
+        const branch = { AND: [{ [key]: { not: null } }, { NOT: { [key]: value } }] };
+        parts.push(falseAtNull ? { OR: [branch, { [key]: null }] } : branch);
+      }
+    }
+    // A where with no condition is TRUE for every row, so FALSE for none.
+    if (parts.length === 0) return this.falseWhere();
+    return (parts.length === 1 ? parts[0] : { OR: parts }) as WhereClause<T>;
+  }
+
+  /** A where clause that matches no row (an empty `in` on the primary key). */
+  private falseWhere(): WhereClause<T> {
+    const pk = this.meta.primaryKey[0] ?? this.meta.columns[0]?.name ?? 'id';
+    return { [this.meta.reverseColumnMap[pk] ?? pk]: { in: [] } } as WhereClause<T>;
   }
 
   // -------------------------------------------------------------------------
@@ -1581,6 +1957,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
               `field "${field}": PowDB orders NULLs / missing keys LAST in both directions`,
             );
           }
+          this.assertDecimalComparable(this.column(field), 'Ordering');
           return `${this.ref(field, alias)} ${this.dirKeyword(spec.sort, `orderBy on "${field}"`)}`;
         }
         // Name the actual feature in the refusal, a pick-row ordering
@@ -1597,6 +1974,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
                 : 'object-valued ordering';
         throw new UnsupportedFeatureError(feature, 'PowDB', `field "${field}"`);
       }
+      this.assertDecimalComparable(this.column(field), 'Ordering');
       return `${this.ref(field, alias)} ${this.dirKeyword(dir, `orderBy on "${field}"`)}`;
     });
     return ` order ${parts.join(', ')}`;
@@ -1800,6 +2178,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           0,
           { args, resolvedWhere },
           resolveUnsafeFlag(args.includePii, 'includePii'),
+          args.skipGlobalFilters,
         );
       }
       // LAST: every consumer of the internally-forced PK (relation stitching,
@@ -1860,7 +2239,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           'Group in application code, or use groupBy({ by }) for one row per combination.',
       );
     }
-    const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
+    const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout, args.skipGlobalFilters);
     const { cols, forcedPk } = this.projectionPlan(
       args.select as Record<string, boolean> | undefined,
       args.omit as Record<string, boolean> | undefined,
@@ -1905,6 +2284,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
                 resolveUnsafeFlag(args.includePii, 'includePii'),
                 cols,
                 linkPlans.length + 1,
+                args.skipGlobalFilters,
               )
             : null;
         if (linkPlan) linkPlans.push(linkPlan);
@@ -1934,7 +2314,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const aliasCtr = { n: 1 };
       const parts = cols.map((c) => `${quotePowqlIdent(c)}: t0.${quotePowqlIdent(c)}`);
       for (const plan of nestedPlans) {
-        parts.push(await this.buildNestedBlock(plan, 't0', aliasCtr, params, args.timeout));
+        parts.push(await this.buildNestedBlock(plan, 't0', aliasCtr, params, args.timeout, args.skipGlobalFilters));
       }
       // Scalar link-path hops (flat native-typed fields; never a JSON block).
       for (const plan of linkPlans) parts.push(...this.linkPathFields(plan, 't0'));
@@ -2028,6 +2408,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           0,
           undefined,
           resolveUnsafeFlag(args.includePii, 'includePii'),
+          args.skipGlobalFilters,
         );
       // See findMany: the strip is last, after every consumer of the key.
       this.stripForcedPk(entities, forcedPk);
@@ -2036,7 +2417,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   async findFirst(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T | null> {
-    args = this.normalizeArgs(args);
+    args = this.normalizeArgs(args, 'findFirst');
     this.assertNoForceCustomPlan(args);
     return this.withMiddleware('findFirst', args as unknown as Record<string, unknown>, async () => {
       const { rows, native, nestedPlans, linkPlans, residualWith, forcedPk } = await this.runFind(
@@ -2055,6 +2436,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           0,
           undefined,
           resolveUnsafeFlag(args.includePii, 'includePii'),
+          args.skipGlobalFilters,
         );
       // See findMany: the strip is last, after every consumer of the key.
       this.stripForcedPk(entities, forcedPk);
@@ -2069,6 +2451,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   async findFirstOrThrow(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T> {
+    args = this.normalizeArgs(args, 'findFirstOrThrow');
     const row = await this.findFirst(args);
     if (!row) throw new NotFoundError({ table: this.table, where: (args.where ?? {}) as Record<string, unknown> });
     return row;
@@ -2096,6 +2479,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     depth = 0,
     parent?: PowqlParentContext<T>,
     includePii = false,
+    skip?: unknown,
   ): Promise<void> {
     if (depth >= 10) {
       throw new ValidationError(`Nested 'with' on PowDB exceeded depth 10 (relation cycle?).`);
@@ -2113,7 +2497,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       if (!rel) throw new ValidationError(`Unknown relation "${relName}" on "${this.table}".`);
       if (strategyIsJoin && parent && this.joinEligible(rel, opt, parent.args)) {
         if (this.capabilities.serverJoins) {
-          await this.loadRelationViaJoin(parents, rel, relName, opt, parent, timeout, includePii);
+          await this.loadRelationViaJoin(parents, rel, relName, opt, parent, timeout, includePii, skip);
           continue;
         }
         // An otherwise-eligible relation the engine cannot join: a PER-QUERY
@@ -2125,7 +2509,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         }
       }
       if (rel.type === 'manyToMany') {
-        await this.loadManyToMany(parents, rel, relName, opt, timeout, includePii);
+        await this.loadManyToMany(parents, rel, relName, opt, timeout, includePii, skip);
         continue;
       }
       const fk = normalizeKeyColumns(rel.foreignKey);
@@ -2213,6 +2597,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           // Re-entering the public findMany, so the opt-in has to be spelled
           // in its PUBLIC form (the sentinel); a plain `true` is refused there.
           includePii: includePii ? UNSAFE : undefined,
+          // The query's opt-out reaches the related table, as on the SQL engines;
+          // without one the target's own global filter applies inside findMany.
+          ...(skip !== undefined ? { skipGlobalFilters: skip } : {}),
         } as FindManyArgs<object>)) as T[];
         for (const child of children) {
           const k = this.joinKey((child as Record<string, unknown>)[childKeyField]);
@@ -2254,6 +2641,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     opt: unknown,
     timeout?: number,
     includePii = false,
+    skip?: unknown,
   ): Promise<void> {
     const through = rel.through;
     if (!through) throw new ValidationError(`manyToMany relation "${relName}" is missing its junction (\`through\`).`);
@@ -2377,6 +2765,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         timeout: options.timeout ?? timeout,
         // Public findMany, so the sentinel form. See loadRelation above.
         includePii: includePii ? UNSAFE : undefined,
+        ...(skip !== undefined ? { skipGlobalFilters: skip } : {}),
       } as FindManyArgs<object>)) as T[];
       for (const t of targets) {
         const pk = String((t as Record<string, unknown>)[targetPkField]);
@@ -2519,9 +2908,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     parent: PowqlParentContext<T>,
     timeout?: number,
     includePii = false,
+    skip?: unknown,
   ): Promise<void> {
     if (rel.type === 'manyToMany') {
-      await this.loadManyToManyViaJoin(parents, rel, relName, opt, parent, timeout, includePii);
+      await this.loadManyToManyViaJoin(parents, rel, relName, opt, parent, timeout, includePii, skip);
       return;
     }
     const options = (opt === true ? {} : opt) as FindManyArgs<object>;
@@ -2547,6 +2937,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       'c',
       params,
       options.timeout ?? timeout,
+      skip,
     );
     const order = targetQi.buildOrder(options.orderBy, params, 'c');
     // No limit/offset clause: on the join they would bound the TOTAL child
@@ -2584,6 +2975,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     parent: PowqlParentContext<T>,
     timeout?: number,
     includePii = false,
+    skip?: unknown,
   ): Promise<void> {
     const through = rel.through;
     if (!through) throw new ValidationError(`manyToMany relation "${relName}" is missing its junction (\`through\`).`);
@@ -2606,6 +2998,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       't',
       params,
       options.timeout ?? timeout,
+      skip,
     );
     const proj = this.joinProjection(childCols, `j.${quotePowqlIdent(sourceJCol)}`, 't');
     const powql =
@@ -2665,6 +3058,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * to literal in-lists before the base query ran); the relation where is resolved
    * on the target the same way before qualifying, so a nested relation filter in
    * the relation `where` never reaches the join unresolved. Params bind in order.
+   * Each side carries its own table's global filter under the query's `skip`,
+   * so the join returns exactly the rows the loaders would.
    */
   private async joinFilter(
     targetQi: PowqlInterface<object>,
@@ -2673,12 +3068,18 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     childAlias: string,
     params: unknown[],
     timeout?: number,
+    skip?: unknown,
   ): Promise<string> {
     const parts: string[] = [];
-    const pw = this.buildWhere(parentResolvedWhere, params, 'p');
+    const pw = this.applyGlobalFilter(this.buildWhere(parentResolvedWhere, params, 'p'), params, skip, 'p');
     if (pw) parts.push(pw);
-    const relResolved = await targetQi.resolveRelationFilters(relWhere, timeout);
-    const rw = targetQi.buildWhere(relResolved, params, childAlias);
+    const relResolved = await targetQi.resolveRelationFilters(relWhere, timeout, skip);
+    const rw = targetQi.applyGlobalFilter(
+      targetQi.buildWhere(relResolved, params, childAlias),
+      params,
+      skip,
+      childAlias,
+    );
     if (rw) parts.push(rw);
     return parts.length ? ` filter ${parts.join(' and ')}` : '';
   }
@@ -2822,6 +3223,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * Aliases share the parent statement's counter, so arbitrarily deep and
    * self-referential trees stay collision-free (the same discipline as the SQL
    * engine's json_agg subqueries).
+   *
+   * The target's global filter is ANDed into the block's filter at every level,
+   * under the query's `skip`, exactly as the SQL engines AND it into each
+   * relation subquery: a block that omitted it handed back another tenant's rows.
    */
   private async buildNestedBlock(
     plan: NestedRelationPlan,
@@ -2829,6 +3234,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     aliasCtr: { n: number },
     params: unknown[],
     timeout?: number,
+    skip?: unknown,
   ): Promise<string> {
     const { rel, relName, targetQi, options, single } = plan;
     const alias = `t${aliasCtr.n++}`;
@@ -2840,8 +3246,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     // child where chains behind it as a parenthesized `and` group, which the
     // grammar accepts even when the group itself contains `or`.
     const correlation = `${alias}.${quotePowqlIdent(childKeyCol)} = ${parentAlias}.${quotePowqlIdent(parentKeyCol)}`;
-    const resolved = await targetQi.resolveRelationFilters(options.where as WhereClause<object>, timeout);
-    const childWhere = targetQi.buildWhere(resolved, params, alias);
+    const resolved = await targetQi.resolveRelationFilters(options.where as WhereClause<object>, timeout, skip);
+    const childWhere = targetQi.applyGlobalFilter(targetQi.buildWhere(resolved, params, alias), params, skip, alias);
     const filter = childWhere ? `${correlation} and (${childWhere})` : correlation;
     const order = targetQi.buildOrder(options.orderBy, params, alias);
     const limitClause = single
@@ -2852,7 +3258,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     const offsetClause = !single && options.offset ? ` offset ${this.param(options.offset, params)}` : '';
     const parts = plan.cols.map((c) => `${quotePowqlIdent(c)}: ${alias}.${quotePowqlIdent(c)}`);
     for (const child of plan.children) {
-      parts.push(await targetQi.buildNestedBlock(child, alias, aliasCtr, params, timeout));
+      parts.push(await targetQi.buildNestedBlock(child, alias, aliasCtr, params, timeout, skip));
     }
     return (
       `${quotePowqlIdent(relName)}: ${targetQi.qt} as ${alias} ` +
@@ -2974,7 +3380,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
    * link path would regress a hot path for no gain. Requires: single-column
    * belongsTo; no relation `with` / `where` / `distinct` / `orderBy` /
    * `limit` / `offset` (a scalar path has no per-hop filter/order and cannot
-   * reproduce those, such inputs stay on the loader for exact parity); a link
+   * reproduce those, such inputs stay on the loader for exact parity); no
+   * global filter on the target, for the same reason; a link
    * name and all projected columns that are bare identifiers (a quoted segment in
    * a dotted link path is outside the verified spelling, fall back); and a
    * DECLARED link that verifiably matches (`findMatchingLink`).
@@ -2986,6 +3393,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     includePii: boolean,
     parentCols: string[],
     index: number,
+    skip?: unknown,
   ): Promise<LinkPathPlan | null> {
     if (!this.capabilities.linkPaths) return null;
     if (rel.type !== 'belongsTo') return null;
@@ -2999,6 +3407,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     if (options.orderBy || options.limit !== undefined || options.offset) return null;
 
     const targetQi = new PowqlInterface<object>(this.pool, rel.to, this.schema, [], this.options);
+    // A link hop has no per-hop filter, so it cannot carry the target's global
+    // filter; such a relation stays on the loaders, which apply it.
+    if (targetQi.applyGlobalFilter('', [], skip) !== '') return null;
     // `projectionPlan`, not `projectedColumns`: the plan is what carries
     // `forcedPk`, and reading the column LIST alone is what made this path's
     // strip dead. See the pkProjected line below.
@@ -3142,6 +3553,45 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   /**
+   * Fill every omitted column that declares a default, since PowDB has no
+   * column defaults of its own (its only generated value is `auto`, which is
+   * left to the engine). Without this an omitted defaulted column was written
+   * as NULL, silently, or failed NOT NULL where every SQL engine applied the
+   * default.
+   *
+   * "Omitted" means absent or `undefined` under BOTH spellings, exactly the
+   * columns a SQL insert leaves to the database; an explicit `null` stays
+   * `null`. The value comes from the column's declared default expression,
+   * evaluated per row (`now()` is the insert time). An expression this cannot
+   * evaluate faithfully, or metadata that does not carry the expression, is
+   * refused rather than guessed.
+   */
+  private applyColumnDefaults(data: Record<string, unknown>): Record<string, unknown> {
+    let out: Record<string, unknown> | undefined;
+    for (const col of this.meta.columns) {
+      if (!col.hasDefault || col.isGenerated || this.meta.primaryKey.includes(col.name)) continue;
+      if (data[col.field] !== undefined || data[col.name] !== undefined) continue;
+      const expr = (col as ColumnMetadata & { defaultValue?: string | null }).defaultValue;
+      const value = expr == null ? NO_DEFAULT : emulateColumnDefault(expr, col);
+      if (value === NO_DEFAULT) {
+        throw new UnsupportedFeatureError(
+          `The default of column "${col.name}" on "${this.table}"`,
+          'PowDB',
+          (expr == null
+            ? 'The schema metadata marks the column as defaulted but does not carry the default expression'
+            : `The default expression \`${expr}\` has no client-side equivalent`) +
+            ', and PowDB has no column defaults, so the value cannot be applied. Supply the field explicitly ' +
+            'on create (or build the metadata with defineSchema, which records literal, now(), current_date and ' +
+            'gen_random_uuid() defaults).',
+        );
+      }
+      out ??= { ...data };
+      out[col.field] = value;
+    }
+    return out ?? data;
+  }
+
+  /**
    * The table name as a PowQL type reference, backtick-quoted when it is a
    * reserved word (e.g. a table named `order`). Used in every emitted
    * statement; plain `this.table` stays in error messages.
@@ -3151,12 +3601,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   async create(args: CreateArgs<T>): Promise<T> {
+    args = this.normalizeArgs(args);
     return this.withMiddleware('create', args as unknown as Record<string, unknown>, async () => {
       const plan = this.writeReturnPlan(args);
       if (hasRelationFields(args.data as Record<string, unknown>, this.meta)) {
         return this.nestedCreate(args);
       }
-      const data = this.applyPkDefault(args.data as Record<string, unknown>);
+      const data = this.applyColumnDefaults(this.applyPkDefault(args.data as Record<string, unknown>));
       const assigns = this.scalarData(data);
       const params: unknown[] = [];
       const body = assigns
@@ -3223,6 +3674,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   async createMany(args: CreateManyArgs<T>): Promise<T[]> {
+    args = this.normalizeArgs(args);
     return this.withMiddleware('createMany', args as unknown as Record<string, unknown>, async () => {
       if (args.skipDuplicates) {
         // PowQL's `insert … returning` has no conflict clause, so there is no
@@ -3233,9 +3685,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           'PowQL insert has no ON CONFLICT DO NOTHING equivalent, filter duplicates before inserting.',
         );
       }
-      const inputs = (args.data as Record<string, unknown>[]).map((d) => this.applyPkDefault(d));
-      if (!inputs.length) return [];
-      this.assertUniformCreateManyRows(inputs);
+      const supplied = (args.data as Record<string, unknown>[]).map((d) => this.applyPkDefault(d));
+      if (!supplied.length) return [];
+      // Uniformity is judged on what the caller supplied, as the SQL engines
+      // judge it; defaults are then filled per row.
+      this.assertUniformCreateManyRows(supplied);
+      const inputs = supplied.map((d) => this.applyColumnDefaults(d));
       const params: unknown[] = [];
       const tuples = inputs.map((d) => {
         const assigns = this.scalarData(d);
@@ -3253,6 +3708,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   async update(args: UpdateArgs<T>): Promise<T> {
+    args = this.normalizeArgs(args);
     return this.withMiddleware('update', args as unknown as Record<string, unknown>, async () => {
       const plan = this.writeReturnPlan(args);
       if (hasRelationFields(args.data as Record<string, unknown>, this.meta)) {
@@ -3266,7 +3722,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       // counts as the key it is (engine parity with the SQL buildUpdate).
       const userWhere = this.expandedWhere(args.where);
       const params: unknown[] = [];
-      const resolvedWhere = await this.resolveRelationFilters(userWhere, args.timeout);
+      const resolvedWhere = await this.resolveRelationFilters(userWhere, args.timeout, args.skipGlobalFilters);
       let where = this.buildWhere(resolvedWhere, params);
       // `false` here refused an empty where even WITH the opt-in, while every
       // SQL engine accepted it: verified by probe on buildUpdate/buildDelete.
@@ -3313,9 +3769,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   async updateMany(args: UpdateManyArgs<T>): Promise<{ count: number }> {
+    args = this.normalizeArgs(args);
+    this.assertNoOptimisticLock(args, 'updateMany');
     return this.withMiddleware('updateMany', args as unknown as Record<string, unknown>, async () => {
       const params: unknown[] = [];
-      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
+      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout, args.skipGlobalFilters);
       let where = this.buildWhere(resolvedWhere, params);
       this.assertCompiledWhere(where, resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'), 'updateMany');
       where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
@@ -3346,8 +3804,19 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const colMeta = this.column(field);
       const ref = this.ref(field);
       const col = quotePowqlIdent(colMeta.name);
-      if (value !== null && typeof value === 'object' && !(value instanceof Date)) {
+      if (value !== null && typeof value === 'object' && !(value instanceof Date) && !isJsonValue(value)) {
         const opObj = value as Record<string, unknown>;
+        const arith = (['increment', 'decrement', 'multiply', 'divide'] as const).find((k) => k in opObj);
+        if (arith && !('set' in opObj)) {
+          this.assertDecimalComparable(colMeta, `\`${arith}\``);
+          // Same rule and message as the SQL engines' buildSetClause.
+          const operand = opObj[arith];
+          if (typeof operand !== 'number' || !Number.isFinite(operand)) {
+            throw new ValidationError(
+              `update operator "${arith}" on "${this.table}.${field}" requires a finite number, got ${typeof operand}`,
+            );
+          }
+        }
         if ('set' in opObj) parts.push(`${col} := ${this.writeRef(opObj.set, colMeta, params)}`);
         else if ('increment' in opObj)
           parts.push(`${col} := ${ref} + ${this.writeRef(opObj.increment, colMeta, params)}`);
@@ -3469,12 +3938,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   async delete(args: DeleteArgs<T>): Promise<T> {
+    args = this.normalizeArgs(args);
     return this.withMiddleware('delete', args as unknown as Record<string, unknown>, async () => {
       const plan = this.writeReturnPlan(args);
       const allowFullTableScan = resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan');
       const userWhere = this.expandedWhere(args.where);
       const params: unknown[] = [];
-      const resolvedWhere = await this.resolveRelationFilters(userWhere, args.timeout);
+      const resolvedWhere = await this.resolveRelationFilters(userWhere, args.timeout, args.skipGlobalFilters);
       let where = this.buildWhere(resolvedWhere, params);
       this.assertCompiledWhere(where, allowFullTableScan, 'delete');
       this.assertMutationIdentifiesOneRow(userWhere, allowFullTableScan, 'delete');
@@ -3493,9 +3963,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   async deleteMany(args: DeleteManyArgs<T>): Promise<{ count: number }> {
+    args = this.normalizeArgs(args);
     return this.withMiddleware('deleteMany', args as unknown as Record<string, unknown>, async () => {
       const params: unknown[] = [];
-      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
+      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout, args.skipGlobalFilters);
       let where = this.buildWhere(resolvedWhere, params);
       this.assertCompiledWhere(where, resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'), 'deleteMany');
       where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
@@ -3506,6 +3977,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   }
 
   async upsert(args: UpsertArgs<T>): Promise<T> {
+    args = this.normalizeArgs(args);
+    this.assertNoOptimisticLock(args, 'upsert');
     return this.withMiddleware('upsert', args as unknown as Record<string, unknown>, async () => {
       // The single-row rule for `upsert`, shared with the SQL engines through
       // query/compound-unique.ts. PowqlInterface is a PARALLEL implementation,
@@ -3516,7 +3989,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       const upsertWhere = (this.expandedWhere(args.where) ?? {}) as Record<string, unknown>;
       this.assertMutationIdentifiesOneRow(upsertWhere as WhereClause<T>, false, 'upsert');
       const plan = this.writeReturnPlan(args);
-      const createData = this.applyPkDefault(args.create as Record<string, unknown>);
+      const createData = this.applyColumnDefaults(this.applyPkDefault(args.create as Record<string, unknown>));
       const pkCol = this.meta.primaryKey[0];
       const conflictColumns = Object.keys(upsertWhere)
         .filter((k) => upsertWhere[k] !== undefined)
@@ -3638,9 +4111,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async count(args: CountArgs<T> = {}): Promise<number> {
     this.assertNoForceCustomPlan(args);
+    args = this.normalizeArgs(args);
     return this.withMiddleware('count', (args ?? {}) as unknown as Record<string, unknown>, async () => {
       const params: unknown[] = [];
-      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
+      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout, args.skipGlobalFilters);
       let where = this.buildWhere(resolvedWhere, params);
       where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
       const filter = where ? ` filter ${where}` : '';
@@ -3709,10 +4183,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async aggregate(args: AggregateArgs<T>): Promise<AggregateResult<T>> {
     this.assertNoForceCustomPlan(args);
+    args = this.normalizeArgs(args);
     return this.withMiddleware('aggregate', args as unknown as Record<string, unknown>, async () => {
       const result: AggregateResult<T> = {};
       const filterParams: unknown[] = [];
-      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
+      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout, args.skipGlobalFilters);
       let where = this.buildWhere(resolvedWhere, filterParams);
       where = this.applyGlobalFilter(where, filterParams, args.skipGlobalFilters);
       const filter = where ? ` filter ${where}` : '';
@@ -3723,7 +4198,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       // the same aggregate: the standalone scalar statement and the inner
       // expression of the one-statement form. `result`'s buckets are created
       // here, in the order the result has always had.
-      type Planned = { scalar: string; inner: string; assign: (v: number | null) => void };
+      // `col` is set for `_min` / `_max`, which return a stored cell and decode
+      // through that column's own coercion; every other aggregate is a number.
+      type Planned = { scalar: string; inner: string; col?: ColumnMetadata; assign: (v: unknown) => void };
       const plan: Planned[] = [];
       if (args._count) {
         if (args._count === true) {
@@ -3731,7 +4208,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
             scalar: `count(${this.qt}${filter})`,
             inner: 'count(*)',
             assign: (v) => {
-              result._count = v ?? 0;
+              result._count = (v as number | null) ?? 0;
             },
           });
         } else {
@@ -3744,7 +4221,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
               scalar: `count(${this.qt}${filter} { ${ref} })`,
               inner: `count(${ref})`,
               assign: (v) => {
-                counts[field] = v ?? 0;
+                counts[field] = (v as number | null) ?? 0;
               },
             });
           }
@@ -3753,10 +4230,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       for (const fn of ['_sum', '_avg', '_min', '_max'] as const) {
         const spec = args[fn];
         if (!spec) continue;
-        const acc: Record<string, number | null> = {};
+        const acc: Record<string, unknown> = {};
         (result as Record<string, unknown>)[fn] = acc;
         const powfn = fn.slice(1); // sum/avg/min/max
         for (const field of Object.keys(spec).filter((f) => (spec as Record<string, boolean>)[f])) {
+          this.assertDecimalComparable(this.column(field), `\`${fn}\``);
           // Same PII contract as the SQL engines: _min/_max return a stored cell.
           if (fn === '_min' || fn === '_max') {
             assertAggregatePiiOptIn(
@@ -3772,6 +4250,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           plan.push({
             scalar: `${powfn}(${this.qt}${filter} { ${ref} })`,
             inner: `${powfn}(${ref})`,
+            ...(fn === '_min' || fn === '_max' ? { col: this.column(field) } : {}),
             assign: (v) => {
               acc[field] = v;
             },
@@ -3781,11 +4260,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
       // A scalar cell and a grouped cell decode through the same wire decoder,
       // so one coercion serves both forms.
-      const toNumber = (v: unknown): number | null => (v == null || v === 'null' ? null : Number(v));
+      const decode = (p: Planned, cell: unknown, native: boolean): unknown =>
+        p.col ? decodeAggregateCell(cell, p.col, native) : cell == null || cell === 'null' ? null : Number(cell);
 
       if (plan.length > 1 && this.groupsAggregatesInOneStatement) {
         const proj = plan.map((p, i) => `agg_${i}: ${p.inner}`).join(', ');
-        const { rows } = await this.exec(
+        const { rows, native } = await this.exec(
           `${this.qt}${filter} group 1 { ${proj} }`,
           [...filterParams],
           args.timeout,
@@ -3798,13 +4278,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         // whose answer this method has always returned.
         const row = rows.length === 1 ? rows[0] : undefined;
         if (row) {
-          for (const [i, p] of plan.entries()) p.assign(toNumber(row[`agg_${i}`]));
+          for (const [i, p] of plan.entries()) p.assign(decode(p, row[`agg_${i}`], native));
           return result;
         }
       }
       for (const p of plan) {
-        const { rows } = await this.exec(p.scalar, [...filterParams], args.timeout, 'aggregate');
-        p.assign(toNumber(rows[0]?.value));
+        const { rows, native } = await this.exec(p.scalar, [...filterParams], args.timeout, 'aggregate');
+        p.assign(decode(p, rows[0]?.value, native));
       }
       return result;
     });
@@ -3812,6 +4292,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async groupBy(args: GroupByArgs<T>): Promise<Record<string, unknown>[]> {
     this.assertNoForceCustomPlan(args);
+    args = this.normalizeArgs(args);
     return this.withMiddleware('groupBy', args as unknown as Record<string, unknown>, async () => {
       // DISTINCT ON has no PowQL equivalent (no DISTINCT ON row source).
       if (args.distinctOn) {
@@ -3834,7 +4315,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       // a per-call legacy fallback on a native-capable pool still decodes right.
       const emitNative = Boolean(this.capabilities.nativeRaw);
       const params: unknown[] = [];
-      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout);
+      const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout, args.skipGlobalFilters);
       let where = this.buildWhere(resolvedWhere, params);
       where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
       const filter = where ? ` filter ${where}` : '';
@@ -3868,6 +4349,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       for (const entry of args.by as ((keyof T & string) | JsonPathGroupKey)[]) {
         if (typeof entry === 'string') {
           const col = this.column(entry);
+          // Text grouping would put '7.5' and '7.50' in different groups.
+          this.assertDecimalComparable(col, 'A groupBy key');
           assertAggregatePiiOptIn(
             this.table,
             this.meta,
@@ -3926,7 +4409,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
       // Aggregates: `agg_N` internal aliases (PowQL rejects reserved-word
       // aliases like `count:`). `aggInner` lets HAVING re-emit the exact inner
       // expression by user key; `aggOrderExprs` lets orderBy reference the alias.
-      const aggReaders: { alias: string; outKey: string; numeric: boolean }[] = [];
+      // `col` is set for a column `_min` / `_max`: a stored cell, decoded by its column.
+      const aggReaders: { alias: string; outKey: string; numeric: boolean; col?: ColumnMetadata }[] = [];
       const aggOrderExprs = new Map<string, string>();
       const aggInner = new Map<string, string>();
       let aggN = 0;
@@ -3986,6 +4470,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
           const alias = `agg_${aggN++}`;
           if (target === true) {
             const col = this.column(key);
+            this.assertDecimalComparable(col, `\`${fn}\``);
             if (fn === '_min' || fn === '_max') {
               assertAggregatePiiOptIn(
                 this.table,
@@ -4001,7 +4486,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
             proj.push(`${alias}: ${powfn}(${inner})`);
             // Canonical field, so the result bucket and the keys `orderBy` /
             // `having` accept are the same whichever spelling was requested.
-            aggReaders.push({ alias, outKey: `${fn}:${col.field}`, numeric: true });
+            aggReaders.push({
+              alias,
+              outKey: `${fn}:${col.field}`,
+              numeric: fn === '_sum' || fn === '_avg',
+              ...(fn === '_min' || fn === '_max' ? { col } : {}),
+            });
             aggOrderExprs.set(`${fn}:${col.field}`, `.${alias}`);
             aggInner.set(col.field, inner);
           } else {
@@ -4076,7 +4566,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         }
         for (const a of aggReaders) {
           const cell = raw[a.alias];
-          const v = cell == null || cell === 'null' ? null : a.numeric ? Number(cell) : cell;
+          const v = a.col
+            ? decodeAggregateCell(cell, a.col, resultNative)
+            : cell == null || cell === 'null'
+              ? null
+              : a.numeric
+                ? Number(cell)
+                : cell;
           if (a.outKey === '_count') out._count = (v as number) ?? 0;
           else {
             const [bucket, field] = a.outKey.split(':') as [string, string];
@@ -4152,6 +4648,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
             );
           }
           const inner = this.lookupGroupKey(aggInner, key) ?? this.ref(key);
+          const column = this.meta.columns.find((c) => c.field === key || c.name === key);
+          if (column && fn !== 'count') this.assertDecimalComparable(column, `\`${aggKey}\` in having`);
           conds.push(cmp(`${fn}(${inner})`, filter));
         }
       }
@@ -4339,6 +4837,92 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
         'or check that your filter values are defined.',
     );
   }
+}
+
+/** Marks a default expression {@link emulateColumnDefault} cannot evaluate. */
+const NO_DEFAULT = Symbol('turbine.powdb.noDefault');
+
+/**
+ * Evaluate a column's SQL default expression client-side, for one insert.
+ *
+ * Covers what `defineSchema` accepts (NULL, TRUE / FALSE, numeric and quoted
+ * string literals, now() / current_timestamp, current_date, gen_random_uuid())
+ * plus the trailing `::type` cast and wrapping parentheses introspection adds.
+ * Anything else returns {@link NO_DEFAULT}: a guessed value would be a silent
+ * divergence from the engine the schema was written for.
+ */
+function emulateColumnDefault(expr: string, col: ColumnMetadata): unknown {
+  let e = expr.trim();
+  for (;;) {
+    const unwrapped = e.replace(/::[a-z_][a-z0-9_ ]*(\(\d+(,\s*\d+)?\))?(\[\])?$/i, '').trim();
+    const stripped = /^\((.*)\)$/s.test(unwrapped) ? unwrapped.slice(1, -1).trim() : unwrapped;
+    if (stripped === e) break;
+    e = stripped;
+  }
+  const ts = baseTsType(col.tsType);
+  const upper = e.toUpperCase();
+  if (upper === 'NULL') return null;
+  if (upper === 'TRUE' || upper === 'FALSE') return ts === 'boolean' ? upper === 'TRUE' : NO_DEFAULT;
+  if (
+    ['NOW()', 'CURRENT_TIMESTAMP', 'LOCALTIMESTAMP', 'TRANSACTION_TIMESTAMP()', 'STATEMENT_TIMESTAMP()'].includes(upper)
+  ) {
+    return ts === 'Date' ? new Date() : NO_DEFAULT;
+  }
+  if (upper === 'CURRENT_DATE') {
+    if (ts !== 'Date') return NO_DEFAULT;
+    const now = new Date();
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  }
+  if (upper === 'GEN_RANDOM_UUID()' || upper === 'UUID_GENERATE_V4()')
+    return ts === 'string' ? randomUUID() : NO_DEFAULT;
+  const quoted = /^'((?:[^']|'')*)'$/s.exec(e);
+  const literal = quoted ? quoted[1]!.replace(/''/g, "'") : /^-?\d+(\.\d+)?$/.test(e) ? e : undefined;
+  if (literal === undefined) return NO_DEFAULT;
+  if (isJsonColumn(col)) {
+    try {
+      return JSON.parse(literal);
+    } catch {
+      return NO_DEFAULT;
+    }
+  }
+  switch (ts) {
+    case 'string':
+      return literal;
+    case 'number': {
+      const n = Number(literal);
+      return literal.trim() !== '' && Number.isFinite(n) ? n : NO_DEFAULT;
+    }
+    case 'bigint':
+      return /^-?\d+$/.test(literal) ? BigInt(literal) : NO_DEFAULT;
+    case 'boolean': {
+      const b = literal.toLowerCase();
+      if (['t', 'true', 'y', 'yes', 'on', '1'].includes(b)) return true;
+      if (['f', 'false', 'n', 'no', 'off', '0'].includes(b)) return false;
+      return NO_DEFAULT;
+    }
+    case 'Date': {
+      // A zone-less literal is UTC, as Turbine reads a zone-less timestamp.
+      const zoned = /^\d{4}-\d\d-\d\d$/.test(literal) || /([zZ]|[+-]\d\d(:?\d\d)?)$/.test(literal);
+      const d = new Date(zoned ? literal : `${literal.replace(' ', 'T')}Z`);
+      return quoted && !Number.isNaN(d.getTime()) ? d : NO_DEFAULT;
+    }
+    default:
+      return NO_DEFAULT;
+  }
+}
+
+/**
+ * Decode a `_min` / `_max` cell, which is a stored value of `col`, through the
+ * same per-column coercion a row read uses: a string stays a string, a Date
+ * column's micros become a Date, a bigint keeps its digits. Reading it as a
+ * number turned every text minimum into null and every date into micros.
+ */
+function decodeAggregateCell(cell: unknown, col: ColumnMetadata, native: boolean): unknown {
+  if (cell === undefined || cell === null) return null;
+  if (native) return coerceNativeValue(cell, col);
+  // Legacy string wire: an aggregate over no rows renders the bareword `null`.
+  if (typeof cell !== 'string') return cell;
+  return cell === 'null' ? null : coerceValue(cell, col);
 }
 
 /** Coerce a group-key scalar string by the column's TS type (numbers/bools). */

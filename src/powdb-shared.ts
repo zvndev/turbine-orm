@@ -405,6 +405,19 @@ export function powqlColumnType(col: ColumnMetadata): PowqlType {
   return 'str';
 }
 
+/**
+ * Is this a `numeric` / `decimal` / `money` column that PowDB stores as `str`?
+ *
+ * A Postgres-sourced decimal surfaces as a JS string (so its digits survive),
+ * and PowDB has no decimal type, so the column is DDL'd as PowQL `str`. Every
+ * comparison, ordering and aggregate the engine runs on it is then a TEXT
+ * operation, which is why the query generator refuses those on such a column.
+ */
+export function isPowdbDecimalTextColumn(col: ColumnMetadata): boolean {
+  if (col.isArray || isJsonColumn(col) || baseTsType(col.tsType) !== 'string') return false;
+  return /numeric|decimal|money/.test((col.dialectType ?? col.pgType ?? '').toLowerCase());
+}
+
 /** Heuristic: does this numeric column hold fractional values (→ PowQL `float`)? */
 function isFloatColumn(col: ColumnMetadata): boolean {
   const t = (col.dialectType ?? col.pgType ?? '').toLowerCase();
