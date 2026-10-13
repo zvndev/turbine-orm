@@ -275,9 +275,16 @@ export function canonicalWriteEntries(meta: ColumnNameSource, entries: [string, 
  */
 export const INTERNAL_COMBINATOR = Symbol.for('turbine.internalCombinator');
 
+/** Shared by every brand: a frozen descriptor saves an allocation per branded where. */
+const INTERNAL_COMBINATOR_DESCRIPTOR: PropertyDescriptor = Object.freeze({
+  value: true,
+  enumerable: false,
+  configurable: true,
+});
+
 /** Tag `where` as carrying a Turbine-synthesized combinator, and return it. */
 export function markInternalCombinator<T extends object>(where: T): T {
-  Object.defineProperty(where, INTERNAL_COMBINATOR, { value: true, enumerable: false, configurable: true });
+  Object.defineProperty(where, INTERNAL_COMBINATOR, INTERNAL_COMBINATOR_DESCRIPTOR);
   return where;
 }
 
@@ -296,12 +303,18 @@ export function escSingleQuote(s: string): string {
   return s.replace(/'/g, "''");
 }
 
+const LIKE_META = /[\\%_]/;
+const LIKE_META_G = /[\\%_]/g;
+
 /**
  * Escape LIKE pattern metacharacters: %, _, and \.
  * Must be used with `ESCAPE '\'` in the LIKE clause.
  */
 export function escapeLike(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+  // One pass, and none at all for the common operand with no metacharacter.
+  // Identical output to escaping `\` then `%` then `_` in turn: the backslashes
+  // the first step adds are never `%` or `_`, so the steps never interact.
+  return LIKE_META.test(value) ? value.replace(LIKE_META_G, '\\$&') : value;
 }
 
 // ---------------------------------------------------------------------------

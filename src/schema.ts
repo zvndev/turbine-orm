@@ -587,6 +587,10 @@ export function pgArrayType(pgType: string): string {
 
 /** snake_case → camelCase */
 export function snakeToCamel(s: string): string {
+  // The pattern needs an underscore, so a name without one is returned as-is
+  // without running the regex. Hot: every where/orderBy key goes through
+  // resolveRelation, which calls this for each non-relation key.
+  if (s.indexOf('_') === -1) return s;
   return s.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
 }
 

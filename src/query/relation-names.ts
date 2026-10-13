@@ -67,27 +67,34 @@ export function normalizeWithClause(
   const meta = schema.tables[table];
   if (!meta) return withClause;
 
-  let changed = false;
-  const out: Record<string, unknown> = {};
-
-  for (const [key, spec] of Object.entries(withClause)) {
+  // The copy is allocated only once something changes (the common call
+  // spells every relation the declared way and allocates nothing); the keys
+  // before that point are copied in order, so the result is the same object
+  // the eager version built.
+  let out: Record<string, unknown> | undefined;
+  const source = withClause as Record<string, unknown>;
+  const keys = Object.keys(source);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i] as string;
+    const spec = source[key];
+    let name = key;
+    let nextSpec: unknown;
     if (key === '_count') {
-      const nextCount = normalizeCount(meta, spec as WithCount);
-      if (nextCount !== spec) changed = true;
-      out[key] = nextCount;
-      continue;
+      nextSpec = normalizeCount(meta, spec as WithCount);
+    } else {
+      const resolved = resolveRelation(meta.relations, key);
+      // Unknown key: keep it verbatim and let the builder raise E005 by name.
+      name = resolved?.name ?? key;
+      nextSpec = resolved ? normalizeSpec(schema, resolved.def.to, spec, depth) : spec;
     }
-    const resolved = resolveRelation(meta.relations, key);
-    // Unknown key: keep it verbatim and let the builder raise E005 by name.
-    const name = resolved?.name ?? key;
-    if (name !== key) changed = true;
-
-    const nextSpec = resolved ? normalizeSpec(schema, resolved.def.to, spec, depth) : spec;
-    if (nextSpec !== spec) changed = true;
-    out[name] = nextSpec;
+    if (out === undefined && (name !== key || nextSpec !== spec)) {
+      out = {};
+      for (let j = 0; j < i; j++) out[keys[j] as string] = source[keys[j] as string];
+    }
+    if (out !== undefined) out[name] = nextSpec;
   }
 
-  return changed ? (out as WithClause) : withClause;
+  return (out as WithClause | undefined) ?? withClause;
 }
 
 /** A relation's `with` options, normalizing its nested `with` against the TARGET table. */
@@ -209,7 +216,11 @@ export function normalizeWithPagination(
   const meta = schema.tables[table];
   if (!meta) return withClause;
   let out: Record<string, unknown> | undefined;
-  for (const [key, spec] of Object.entries(withClause)) {
+  // Object.keys, not Object.entries: no [key, value] pair allocated per key.
+  const keys = Object.keys(withClause);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i] as string;
+    const spec = (withClause as Record<string, unknown>)[key];
     if (key === '_count' || spec === null || typeof spec !== 'object') continue;
     const rel = resolveRelation(meta.relations, key);
     if (!rel) continue; // unknown relation: the builder raises E005 by name
