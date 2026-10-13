@@ -50,6 +50,7 @@ export const LOG_CODES = [
   'unlimited-find-many',
   'temporal-infinity',
   'cache-mismatch',
+  'stream-idle-timeout',
   // query/relations.ts, per-query advice
   'relation-payload-json',
   'flatten-fallback',

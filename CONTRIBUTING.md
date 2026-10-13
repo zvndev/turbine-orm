@@ -86,6 +86,7 @@ src/
     expr.ts          , Branded update expressions (expr.greatest, expr.case, ...)
     option-surface.ts, The query-arg option surface as runtime data
     row-lock.ts      , The lock read option: FOR UPDATE OF "t" and its refusals
+    stream-idle.ts   , The abandoned-stream idle guard and its server-side limit
     table-client.ts  , The accessor contract (TableClient) every engine implements
     warn-registry.ts , Process-wide once-only dev-warn registry
     deferred.ts      , DeferredQuery and option types

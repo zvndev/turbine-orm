@@ -119,6 +119,11 @@ const EXPECT: Record<TurbineLogCode, Expectation> = {
     console:
       '[turbine] [TURBINE_E020] SQL cache lockstep violation on findMany (fingerprint "fm:name:eq|c=*|o=|l=1|off=0|cur=|d=|w=|pii=0|je=p"). The fingerprint, SQL-build, and param-collect paths must enumerate where-clause keys identically. This is a bug in turbine-orm, not in your code. Please report it at https://github.com/zvndev/turbine-orm/issues with this message.\ncached SQL and freshly-built SQL diverge:\n  cached = <SELECT 1 -- corrupted>\n  fresh  = <SELECT "items".* FROM "items" WHERE "name" = $1 LIMIT $2> (https://turbineorm.dev/errors#e020)',
   },
+  'stream-idle-timeout': {
+    level: 'warn',
+    console:
+      '[turbine] findManyStream on "items" had no row requested for 20 ms, so Turbine closed its cursor and released its connection (1 row handed out before that). An iterator that is kept and never finished, or a response stream torn down without calling return(), leaves a stream like this. The next request on it throws TimeoutError (E002).',
+  },
   'parser-overwrite': {
     level: 'warn',
     console:

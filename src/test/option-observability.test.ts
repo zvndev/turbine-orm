@@ -409,10 +409,11 @@ describe('the option matrix itself', () => {
     // `lock` is the one deliberate omission: a cursor cannot hold its rows
     // locked across fetches, so streams refuse it. Pinned by name.
     assert.deepEqual(missing, ['lock'], 'the streaming reads dropped a findMany option');
-    // `batchSize` is the one legitimate addition: findManyStreamBatches yields
-    // T[] and needs to be told how big a batch is. Pinned by name so a SECOND
-    // divergence cannot hide behind it.
-    assert.deepEqual(extra, ['batchSize'], 'the streaming table grew an unexpected option');
+    // The two legitimate additions, pinned by name so a THIRD divergence cannot
+    // hide behind them: `batchSize` (findManyStreamBatches yields T[] and needs
+    // to be told how big a batch is) and `idleTimeoutMs` (how long a cursor may
+    // wait for its consumer, which a one-shot read never does).
+    assert.deepEqual(extra, ['batchSize', 'idleTimeoutMs'], 'the streaming table grew an unexpected option');
   });
 
   it('the matrix is not vacuous', () => {

@@ -72,6 +72,7 @@ import {
   type TemporalInfinityReading,
 } from './query/index.js';
 import { assertNoLockInAutocommitPipeline } from './query/row-lock.js';
+import { resolveStreamIdleTimeout } from './query/stream-idle.js';
 import { asQueryInterface, TABLE_METHODS } from './query/table-client.js';
 import {
   ownLookup,
@@ -507,6 +508,28 @@ export interface TurbineConfig {
    */
   maxLifetimeSeconds?: number | undefined;
   /**
+   * Close a cursor stream (`findManyStream`, `findManyStreamBatches`) and
+   * release its connection once its consumer has asked for nothing for this
+   * many milliseconds. Default `300000` (five minutes); `0` disables. A stream
+   * call's own `idleTimeoutMs` overrides it.
+   *
+   * A consumer that stops pulling without calling `return()` (an iterator that
+   * is stored and forgotten, a response stream torn down without propagating)
+   * would otherwise hold a pooled connection forever and, on PostgreSQL, an
+   * open transaction whose snapshot holds back vacuum for the whole database.
+   * On expiry Turbine closes the cursor, releases the connection, and logs
+   * `stream-idle-timeout`; the next pull, if one comes, throws `TimeoutError`
+   * (E002). Only streams that hold a connection between pulls are watched.
+   *
+   * On PostgreSQL the stream's own transaction also gets a server-side limit,
+   * `idle_in_transaction_session_timeout` at this value plus 10 seconds
+   * (transaction-local, never a session `SET`; a stricter setting already in
+   * force is kept), so a process that stops running timers (frozen between
+   * serverless invocations) cannot hold the transaction open either. Must be a
+   * whole number of milliseconds (E003).
+   */
+  streamIdleTimeoutMs?: number | undefined;
+  /**
    * Refuse a nested `connect` / `connectOrCreate` that would re-parent a
    * to-many child already owned by a different parent. Off by default,
    * because it changes the outcome of writes that currently succeed.
@@ -783,6 +806,7 @@ const TURBINE_CONFIG_KEYS: Record<keyof TurbineConfig, true> = {
   planCacheMode: true,
   statementTimeoutMs: true,
   maxLifetimeSeconds: true,
+  streamIdleTimeoutMs: true,
   scopedConnect: true,
   relationLoadStrategy: true,
   stableRelationOrder: true,
@@ -2181,6 +2205,7 @@ export class TurbineClient {
     const planCacheMode = TurbineClient.resolvePlanCacheMode(config.planCacheMode, dialect);
     const statementTimeoutMs = TurbineClient.resolveStatementTimeout(config.statementTimeoutMs, dialect);
     const maxLifetimeSeconds = resolveNonNegativeInteger(config.maxLifetimeSeconds, 'maxLifetimeSeconds', 'seconds');
+    const streamIdleTimeoutMs = resolveStreamIdleTimeout(config.streamIdleTimeoutMs, 'streamIdleTimeoutMs');
     // Keyed by table name, with every key checked against the schema: a
     // filter under a name that matches no table would never be applied.
     // A non-SQL backend (PowDB) injects its own query interface and checks
@@ -2323,6 +2348,7 @@ export class TurbineClient {
       planCacheMode,
       sqlCache: config.sqlCache ?? true,
       sqlCacheSize: config.sqlCacheSize,
+      streamIdleTimeoutMs,
       dialect: config.dialect,
       diagnostics,
       logger,

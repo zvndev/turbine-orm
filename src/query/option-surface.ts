@@ -167,9 +167,10 @@ const { lock: _streamsTakeNoLock, ...FIND_MANY_STREAM_BASE } = FIND_MANY_OPTIONS
 
 export const FIND_MANY_STREAM_OPTIONS: OptionTable<FindManyStreamArgs<Row>> = {
   ...FIND_MANY_STREAM_BASE,
-  // No streaming delegate exists on the compat surface, so this is not a known
-  // key there and passing it is reported rather than quietly ignored.
+  // No streaming delegate exists on the compat surface, so these are not known
+  // keys there and passing one is reported rather than quietly ignored.
   batchSize: 'internal',
+  idleTimeoutMs: 'internal',
 };
 
 export const CREATE_OPTIONS: OptionTable<CreateArgs<Row>> = {

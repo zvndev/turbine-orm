@@ -327,6 +327,32 @@ export const TRIGGERS: Record<string, { trigger: Trigger; async?: true }> = {
       }
     },
   },
+  'stream-idle-timeout': {
+    trigger: async (m, logger) => {
+      // A stream that overflows one batch takes the cursor path; its consumer
+      // takes one row and walks away. The line is logged once the guard has
+      // closed the stream and released the connection.
+      let released = false;
+      const conn = Object.assign(new EventEmitter(), {
+        query: async (sql: string) => ({ rows: String(sql).startsWith('FETCH') ? [{ id: 1 }, { id: 2 }] : [] }),
+        release: () => {
+          released = true;
+        },
+      });
+      const pool = { query: async () => ({ rows: [{ id: 1 }, { id: 2 }, { id: 3 }] }), connect: async () => conn };
+      const qi = new m.QueryInterface(
+        pool,
+        'items',
+        itemsSchema(m),
+        [],
+        withLogger(logger, { warnOnUnlimited: false }),
+      );
+      const it = qi.findManyStream({ batchSize: 2, idleTimeoutMs: 20 })[Symbol.asyncIterator]();
+      await it.next();
+      const deadline = Date.now() + 2000;
+      while (!released && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    },
+  },
   'parser-overwrite': {
     trigger: async (m, logger) => {
       // Somebody else's parser on a temporal OID, then the check Turbine runs

@@ -1308,6 +1308,21 @@ export interface FindManyStreamArgs<
    * using a speculative `SELECT ... LIMIT batchSize+1` first.
    */
   batchSize?: number | undefined;
+  /**
+   * Close this stream's cursor and release its connection once the consumer
+   * has asked for nothing for this many milliseconds (no row from
+   * `findManyStream`, no batch from `findManyStreamBatches`). Overrides the
+   * client's `streamIdleTimeoutMs` (default 300000, five minutes). `0`
+   * disables it for this call.
+   *
+   * Only a stream that holds a connection between pulls is watched: one that
+   * fit in a single batch holds nothing, and one inside `$transaction` rides
+   * the caller's connection, which the transaction's own timeout bounds. On
+   * expiry Turbine logs `stream-idle-timeout` and the next pull, if one comes,
+   * throws `TimeoutError` (E002). Time Turbine spends fetching does not count.
+   * A whole number of milliseconds (E003 otherwise).
+   */
+  idleTimeoutMs?: number | undefined;
 }
 
 export interface CreateArgs<

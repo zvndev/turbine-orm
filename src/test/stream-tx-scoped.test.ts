@@ -125,7 +125,7 @@ describe('findManyStream: cursor path inside a transaction', () => {
     assert.equal(harness.connects.count, 0, 'must not check out a connection inside a transaction');
     assert.equal(harness.releases.count, 0, "must not release the caller's transaction connection");
     assert.equal(
-      harness.queries.filter((q) => q === 'BEGIN' || q === 'COMMIT' || q === 'ROLLBACK').length,
+      harness.queries.filter((q) => /^(BEGIN|COMMIT|ROLLBACK)\b/.test(q)).length,
       0,
       "the stream must not open or end the caller's transaction",
     );
@@ -184,7 +184,7 @@ describe('findManyStream: cursor path inside a transaction', () => {
       `early exit must close the cursor, got: ${harness.queries.join(' | ')}`,
     );
     assert.equal(
-      harness.queries.filter((q) => q === 'BEGIN' || q === 'COMMIT' || q === 'ROLLBACK').length,
+      harness.queries.filter((q) => /^(BEGIN|COMMIT|ROLLBACK)\b/.test(q)).length,
       0,
       "an early exit must still not end the caller's transaction",
     );
@@ -203,7 +203,10 @@ describe('findManyStream: cursor path inside a transaction', () => {
     assert.equal(rows.length, 3);
     assert.equal(harness.connects.count, 1, 'pool-scoped streaming keeps its dedicated connection');
     assert.equal(harness.releases.count, 1, 'and releases it');
-    assert.ok(harness.queries.includes('BEGIN'), 'and still wraps the cursor in its own transaction');
+    assert.ok(
+      harness.queries.some((q) => q.startsWith('BEGIN')),
+      'and still wraps the cursor in its own transaction',
+    );
     assert.ok(harness.queries.includes('COMMIT'));
   });
 

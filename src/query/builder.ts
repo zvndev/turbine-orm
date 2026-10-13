@@ -92,6 +92,16 @@ import {
   type ResolvedRowLock,
   resolveRowLock,
 } from './row-lock.js';
+import {
+  DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+  newStreamIdleState,
+  resolveStreamIdleTimeout,
+  StreamIdleGuard,
+  type StreamIdleState,
+  streamBackstopStatement,
+  streamIdleExpiredError,
+  watchStreamConnection,
+} from './stream-idle.js';
 import type {
   AggregateArgs,
   AggregateResultOf,
@@ -777,6 +787,8 @@ export class QueryInterface<
   private readonly middlewares: MiddlewareFn[];
   /** The client's resolved `diagnostics` (see diagnostics.ts), fixed for this instance's life. */
   private readonly diagnostics: ResolvedDiagnostics;
+  /** `streamIdleTimeoutMs`: how long a cursor stream may wait for its consumer. `0` disables. */
+  private readonly streamIdleTimeoutMs: number;
   /** Where this instance's log lines go: the client's `logger`, else the console logger. */
   private readonly logger: TurbineLogger;
   /**
@@ -1011,6 +1023,8 @@ export class QueryInterface<
     this.logger = options?.logger ?? consoleLogger;
     this.advice = this.diagnostics.advice ? this.logger : undefined;
     this.defaultLimit = options?.defaultLimit;
+    this.streamIdleTimeoutMs =
+      resolveStreamIdleTimeout(options?.streamIdleTimeoutMs, 'streamIdleTimeoutMs') ?? DEFAULT_STREAM_IDLE_TIMEOUT_MS;
     // Default to ON: surfacing accidental full-table scans is more valuable
     // than the (small) risk of noisy logs. Callers opt out globally with
     // `warnOnUnlimited: false`, per table with `warnOnUnlimited: { users:
@@ -4565,12 +4579,17 @@ export class QueryInterface<
   >(
     args: FindManyStreamArgs<T, R, W, S, O> | undefined,
     action: string,
+    idle: StreamIdleState,
+    unit: string,
   ): AsyncGenerator<Record<string, unknown>[], void, undefined> {
     // Canonical args BEFORE the speculative build below, which spreads `args`
     // and sets its own `limit`: a surviving `take` would reach that spread
     // beside it and be read as a second value for one bound.
     args = this.normalizeArgs(args);
     const batchSize = Math.max(1, Math.floor(Number(args?.batchSize ?? 1000)));
+    // Validated on every path, so a bad value is refused whether or not this
+    // stream turns out to need a cursor.
+    const idleTimeoutMs = resolveStreamIdleTimeout(args?.idleTimeoutMs, 'idleTimeoutMs') ?? this.streamIdleTimeoutMs;
 
     this.currentAction = action;
     // The two streaming methods do NOT go through `executeWithMiddleware`, so
@@ -4664,20 +4683,109 @@ export class QueryInterface<
     // transaction control of its own (`ambientTransaction`).
     const held = this.txScoped ? null : await this.acquireConnection();
     const client = held?.client ?? null;
-    const conn: StreamableConnection = client ?? {
+    const base: StreamableConnection = client ?? {
       query: async (text: string, values?: unknown[]) =>
         (await this.pool.query(text, values)) as { rows: Record<string, unknown>[] },
     };
+    // The idle guard watches only a stream that holds a connection of its own
+    // between pulls. Inside a caller's transaction the connection is theirs and
+    // their transaction's timeout bounds it. On PostgreSQL the stream's BEGIN
+    // also carries the server-side limit (see streamBackstopStatement), and the
+    // guard keeps a live consumer's transaction from looking idle to it.
+    const watched = held !== null && idleTimeoutMs > 0;
+    const backstop = watched && this.dialect.name === 'postgresql';
+    let guard: StreamIdleGuard | undefined;
+    const conn = watched
+      ? watchStreamConnection(
+          base,
+          () => guard,
+          backstop
+            ? { begin: this.dialect.beginStatement(), statement: streamBackstopStatement(idleTimeoutMs) }
+            : undefined,
+        )
+      : base;
+    const stream = this.dialect.openStream(conn, deferred.sql, deferred.params, batchSize, {
+      ambientTransaction: this.txScoped,
+    });
+    if (watched) {
+      guard = new StreamIdleGuard(
+        idle,
+        idleTimeoutMs,
+        () => streamIdleExpiredError(action, this.table, idleTimeoutMs, unit),
+        () => this.expireIdleStream(stream, held, action, idleTimeoutMs, idle, unit),
+        backstop ? () => base.query('SELECT 1') : undefined,
+      );
+    }
     try {
-      yield* this.dialect.openStream(conn, deferred.sql, deferred.params, batchSize, {
-        ambientTransaction: this.txScoped,
-      });
+      // Driven by hand rather than `yield*`, so an expired stream's cleanup can
+      // run from the timer while this generator is suspended.
+      while (true) {
+        const step = await stream.next();
+        if (step.done) break;
+        yield step.value;
+        if (idle.expired) throw idle.expired;
+      }
     } catch (err) {
+      if (err === idle.expired) throw err;
       // Wrap pg constraint errors so streaming surfaces typed errors like the rest of the API
       throw explainConnectionLoss(wrapPgError(err), held?.checkout.lostWith);
     } finally {
-      held?.checkout.release();
+      guard?.stop();
+      if (guard?.expiry) {
+        // The timer already closed the stream and released the connection;
+        // wait for that so the connection is never handed back mid-cleanup.
+        await guard.expiry;
+      } else {
+        try {
+          // An early exit (`break`) closes the cursor here; after a full drain
+          // or an error the dialect's generator has finished and this is a no-op.
+          await stream.return(undefined);
+        } catch (err) {
+          // Only an early exit can reach this throw: after an error or a full
+          // drain the dialect's generator has finished and return() resolves.
+          // A failed CLOSE / COMMIT on an early exit must reach the caller, as
+          // it did when this loop was a `yield*`.
+          // biome-ignore lint/correctness/noUnsafeFinally: it replaces only an early-exit return, see above
+          throw explainConnectionLoss(wrapPgError(err), held?.checkout.lostWith);
+        } finally {
+          held?.checkout.release();
+        }
+      }
     }
+  }
+
+  /**
+   * Close a stream whose consumer asked for nothing within its idle timeout:
+   * run the dialect's own cleanup (PostgreSQL: CLOSE, COMMIT), release the
+   * connection (with the cleanup's error, if any, so the pool discards it), and
+   * log `stream-idle-timeout`. The log line matters: an abandoned consumer
+   * never pulls again, so it never sees the E002 waiting for it.
+   */
+  private async expireIdleStream(
+    stream: AsyncGenerator<Record<string, unknown>[], void, undefined>,
+    held: Checkout,
+    action: string,
+    timeoutMs: number,
+    idle: StreamIdleState,
+    unit: string,
+  ): Promise<void> {
+    let failure: unknown;
+    try {
+      await stream.return(undefined);
+    } catch (err) {
+      failure = err;
+    } finally {
+      held.checkout.release(failure === undefined ? undefined : failure instanceof Error ? failure : true);
+    }
+    logTo(
+      this.logger,
+      'warn',
+      `${action} on "${this.table}" had no ${unit} requested for ${timeoutMs} ms, so Turbine closed its cursor ` +
+        `and released its connection (${idle.rows} ${idle.rows === 1 ? 'row' : 'rows'} handed out before that). ` +
+        'An iterator that is kept and never finished, or a response stream torn down without calling return(), ' +
+        'leaves a stream like this. The next request on it throws TimeoutError (E002).',
+      { code: 'stream-idle-timeout', table: this.table, operation: action, timeoutMs, rows: idle.rows },
+    );
   }
 
   /**
@@ -4723,12 +4831,20 @@ export class QueryInterface<
     args = this.normalizeArgs(args);
     this.assertNoStreamLock(args, 'findManyStreamBatches');
     const parse = this.makeStreamRowParser<W, S, O>(args);
-    for await (const batch of this.streamRaw<W, S, O>(args, 'findManyStreamBatches')) {
+    const idle = newStreamIdleState();
+    for await (const batch of this.streamRaw<W, S, O>(args, 'findManyStreamBatches', idle, 'batch')) {
       const parsed = new Array<QueryResult<T, R, W, S, O>>(batch.length);
       for (let i = 0; i < batch.length; i++) {
         parsed[i] = parse(batch[i]!) as QueryResult<T, R, W, S, O>;
       }
+      idle.rows += parsed.length;
+      // `suspended` and `pulls` are the idle guard's whole view of the
+      // consumer: two writes per yield, no timer work.
+      idle.suspended = true;
       yield parsed;
+      idle.suspended = false;
+      idle.pulls++;
+      if (idle.expired) throw idle.expired;
     }
   }
 
@@ -4780,9 +4896,17 @@ export class QueryInterface<
     // of it, so a consumer that breaks early still pays only for the rows it
     // took. That laziness is the reason this loop is not written over
     // `findManyStreamBatches`.
-    for await (const batch of this.streamRaw<W, S, O>(args, 'findManyStream')) {
+    const idle = newStreamIdleState();
+    for await (const batch of this.streamRaw<W, S, O>(args, 'findManyStream', idle, 'row')) {
       for (let i = 0; i < batch.length; i++) {
-        yield parse(batch[i]!) as QueryResult<T, R, W, S, O>;
+        const row = parse(batch[i]!) as QueryResult<T, R, W, S, O>;
+        idle.rows++;
+        // See findManyStreamBatches: the idle guard's view of the consumer.
+        idle.suspended = true;
+        yield row;
+        idle.suspended = false;
+        idle.pulls++;
+        if (idle.expired) throw idle.expired;
       }
     }
   }

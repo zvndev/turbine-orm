@@ -1525,6 +1525,11 @@ const CONNECTION_ERROR_CODES = new Set<string>([
   '57P01', // admin_shutdown
   '57P02', // crash_shutdown
   '57P03', // cannot_connect_now
+  // The server ended a session that sat idle inside an open transaction past
+  // idle_in_transaction_session_timeout (a FATAL: the connection is gone).
+  // A cursor stream sets that limit on its own transaction, see
+  // query/stream-idle.ts, so this is how a frozen process's stream ends.
+  '25P03', // idle_in_transaction_session_timeout
   // Node driver-level socket errors (surface on err.code too)
   'ECONNREFUSED',
   'ECONNRESET',
@@ -1661,6 +1666,12 @@ const CONNECTION_ERROR_HINTS: Readonly<Record<string, string>> = {
     'The database named in the connection string does not exist. Check the path segment after the host, and create the database if needed.',
   '53300': "The server has no free connection slots. Lower `poolSize` or raise the server's max_connections.",
   '57P03': 'The server is still starting up (or shutting down) and is not accepting connections yet.',
+  '25P03':
+    'The server ended the session because it sat idle inside an open transaction for longer than ' +
+    '`idle_in_transaction_session_timeout`. A cursor stream sets that limit to its idle timeout plus 10 s, so for ' +
+    'a stream this means the process ran nothing for that long (a frozen serverless instance, a blocked event ' +
+    'loop); for a transaction, that the callback awaited something else for longer than the server allows. The ' +
+    'connection is discarded and the pool opens a fresh one.',
   ECONNREFUSED: 'Nothing is listening on that host and port. Check the server is running and the port is right.',
   ENOTFOUND:
     'The host in the connection string could not be resolved. Check the host name, and that the connection string itself is well formed.',

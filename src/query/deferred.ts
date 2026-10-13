@@ -191,7 +191,9 @@ export interface QueryInterfaceOptions {
    * SQL-build, and param-collect paths (which has silently corrupted results
    * before). Every hit in development, none in production, or a sampled
    * fraction (`{ sample: 0.001 }`); a sampled mismatch is logged once per
-   * distinct fingerprint as well as thrown.
+   * distinct fingerprint as well as thrown. Independently of that, every MISS
+   * compares the built and collected params and every HIT checks the param
+   * count, in every mode; any mismatch is an `InvariantError` (E020).
    */
   sqlCache?: boolean;
   /**
@@ -205,6 +207,12 @@ export interface QueryInterfaceOptions {
    * per table).
    */
   sqlCacheSize?: number;
+  /**
+   * The client's `streamIdleTimeoutMs`: how long a cursor stream may wait for
+   * its consumer before Turbine closes it. Default 300000; `0` disables. See
+   * `FindManyStreamArgs.idleTimeoutMs`, which overrides it per call.
+   */
+  streamIdleTimeoutMs?: number;
   /** SQL dialect implementation. Defaults to PostgreSQL. */
   dialect?: Dialect;
   /**

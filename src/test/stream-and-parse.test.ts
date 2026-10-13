@@ -183,7 +183,7 @@ describe('findManyStream: speculative fast-path', () => {
     assert.equal(rows.length, 5, 'should yield all 5 rows');
     // Verify no cursor queries were issued
     const hasDeclare = harness.queries.some((q) => q.includes('DECLARE'));
-    const hasBegin = harness.queries.some((q) => q === 'BEGIN');
+    const hasBegin = harness.queries.some((q) => q.startsWith('BEGIN'));
     assert.equal(hasDeclare, false, 'should NOT issue DECLARE CURSOR');
     assert.equal(hasBegin, false, 'should NOT issue BEGIN');
 
@@ -293,7 +293,7 @@ describe('findManyStream: speculative fast-path', () => {
 
     // Verify cursor path was used
     assert.ok(
-      harness.queries.some((q) => q === 'BEGIN'),
+      harness.queries.some((q) => q.startsWith('BEGIN')),
       'should issue BEGIN for cursor path',
     );
     assert.ok(
