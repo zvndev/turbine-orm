@@ -20,7 +20,7 @@ import {
   expandCompoundUniqueWhere,
   upsertWhereMatchesCreate,
 } from './compound-unique.js';
-import type { DeferredQuery } from './deferred.js';
+import type { DeferredQuery, ReselectExecutor } from './deferred.js';
 import { isUnmatchedPlainObject, UPDATE_OPERATOR_KEYS } from './filters.js';
 import { isJsonValue, serializeJsonValue } from './json-value.js';
 import type {
@@ -205,11 +205,74 @@ export function buildReselectByWhere(
   qi: BuilderCtx,
   whereObj: Record<string, unknown>,
   projection?: WriteProjection,
+  lockRows = false,
 ): { sql: string; params: unknown[] } {
   const params: unknown[] = [];
   const clause = whereMod.buildWhereClause(qi, whereObj, params);
   const where = clause ? ` WHERE ${clause}` : '';
-  return { sql: `SELECT ${writeReselectSelection(qi, projection)} FROM ${qi.q(qi.table)}${where}`, params };
+  return {
+    sql: `SELECT ${writeReselectSelection(qi, projection)} FROM ${qi.q(qi.table)}${where}${lockRows ? forUpdate(qi) : ''}`,
+    params,
+  };
+}
+
+/**
+ * Row-lock suffix for a read inside a reselect write's transaction, so a
+ * concurrent write of the same row waits instead of interleaving. MySQL is the
+ * one engine on the reselect strategy; elsewhere nothing is appended.
+ */
+function forUpdate(qi: BuilderCtx): string {
+  return qi.dialect.name === 'mysql' ? ' FOR UPDATE' : '';
+}
+
+/**
+ * Whether `data` sets a column the top level of `where` names, so the written
+ * row may no longer match `where` and must be re-read by its primary key.
+ */
+function dataMovesRow(qi: BuilderCtx, where: Record<string, unknown>, data: Record<string, unknown>): boolean {
+  const set = new Set<string>();
+  for (const key of Object.keys(data)) {
+    if (data[key] === undefined) continue;
+    const column = resolveColumnName(qi.tableMeta, key);
+    if (column !== undefined) set.add(column);
+  }
+  if (set.size === 0) return false;
+  return Object.keys(where).some((key) => {
+    const column = resolveColumnName(qi.tableMeta, key);
+    return column !== undefined && set.has(column);
+  });
+}
+
+/**
+ * Lock the row `where` names and return its primary key as a `where`, with any
+ * key column `data` assigns (a plain value or `{ set }`) replaced by its new
+ * value. `null` when no row matched, `undefined` when `data` moves the key in a
+ * way that cannot be read off it (an arithmetic operator).
+ */
+async function lockKeyOf(
+  qi: BuilderCtx,
+  exec: ReselectExecutor,
+  whereObj: Record<string, unknown>,
+  data: Record<string, unknown>,
+): Promise<Record<string, unknown> | null | undefined> {
+  const pk = qi.tableMeta.primaryKey;
+  const params: unknown[] = [];
+  const clause = whereMod.buildWhereClause(qi, whereObj, params);
+  const sql = `SELECT ${pk.map((c) => qi.q(c)).join(', ')} FROM ${qi.q(qi.table)}${clause ? ` WHERE ${clause}` : ''}${forUpdate(qi)}`;
+  const row = (await exec(sql, params)).rows[0];
+  if (!row) return null;
+  const key: Record<string, unknown> = {};
+  for (const column of pk) {
+    const field = qi.tableMeta.reverseColumnMap[column] ?? column;
+    const assigned = data[field] !== undefined ? data[field] : data[column];
+    if (assigned === undefined) key[field] = row[column];
+    else if (assigned !== null && typeof assigned === 'object' && !(assigned instanceof Date)) {
+      const op = assigned as Record<string, unknown>;
+      if (Object.keys(op).length !== 1 || !('set' in op)) return undefined;
+      key[field] = op.set;
+    } else key[field] = assigned;
+  }
+  return key;
 }
 
 /**
@@ -441,7 +504,11 @@ function assertWithinBindLimit(qi: BuilderCtx, paramCount: number, rowCount: num
   );
 }
 
-export function buildCreateMany<T extends object>(qi: BuilderCtx, args: CreateManyArgs<T>): DeferredQuery<T[]> {
+export function buildCreateMany<T extends object>(
+  qi: BuilderCtx,
+  args: CreateManyArgs<T>,
+  overBindLimit: 'refuse' | 'allow' = 'refuse',
+): DeferredQuery<T[]> {
   const qt = qi.q(qi.table);
   if (args.data.length === 0) {
     return {
@@ -517,7 +584,7 @@ export function buildCreateMany<T extends object>(qi: BuilderCtx, args: CreateMa
     returning: writeReturningColumns(qi),
     requireRowValues: hasArrayColumn,
   });
-  assertWithinBindLimit(qi, built.params.length, args.data.length, keys.length);
+  if (overBindLimit === 'refuse') assertWithinBindLimit(qi, built.params.length, args.data.length, keys.length);
 
   return {
     sql: built.sql,
@@ -674,6 +741,11 @@ export function buildUpdate<T extends object>(
     reselect:
       qi.dialect.resultStrategy === 'reselect'
         ? async (exec) => {
+            // Runs in one transaction (executeMutation). When `data` changes a
+            // column `where` names, the row is locked and re-read by its key,
+            // since `where` no longer finds it after the write.
+            const key = dataMovesRow(qi, userWhere, dataObj) ? await lockKeyOf(qi, exec, whereObj, dataObj) : undefined;
+            if (key === null) return { rows: [], rowCount: 0 };
             const writeResult = await exec(sql, params, preparedName);
             // Optimistic-lock conflict: the version-checked UPDATE matched no
             // row. The re-fetch below uses `where` WITHOUT the version
@@ -687,7 +759,7 @@ export function buildUpdate<T extends object>(
                 expectedVersion: lock.expected,
               });
             }
-            const sel = buildReselectByWhere(qi, whereObj, projection);
+            const sel = buildReselectByWhere(qi, key ?? whereObj, projection);
             return exec(sel.sql, sel.params);
           }
         : undefined,
@@ -757,13 +829,33 @@ export function buildDelete<T extends object>(
     reselect:
       qi.dialect.resultStrategy === 'reselect'
         ? async (exec) => {
-            const sel = buildReselectByWhere(qi, whereObj, projection);
+            // In one transaction (executeMutation): the row is locked while it
+            // is read, and returned only if THIS delete removed it, so of two
+            // concurrent deletes of one row exactly one reports it.
+            const sel = buildReselectByWhere(qi, whereObj, projection, true);
             const pre = await exec(sel.sql, sel.params);
-            await exec(entry.sql, params, entry.name);
-            return pre;
+            const deleted = await exec(entry.sql, params, entry.name);
+            return (deleted.rowCount ?? 0) === 0 ? { rows: [], rowCount: 0 } : pre;
           }
         : undefined,
   };
+}
+
+/**
+ * Refuse `limit` / `take` / `offset` / `skip` on `updateMany` / `deleteMany`.
+ * No engine applies them to a bulk write here, so `deleteMany({ where, limit:
+ * 1000 })` used to touch every matching row. Shared with the PowDB engine.
+ */
+export function assertNoBulkWritePaging(table: string, operation: 'updateMany' | 'deleteMany', args: object): void {
+  const a = args as Record<string, unknown>;
+  const key = (['limit', 'take', 'offset', 'skip'] as const).find((k) => a[k] !== undefined);
+  if (key === undefined) return;
+  throw new ValidationError(
+    `\`${key}\` is not supported on ${operation} for "${table}": it would apply to every row the \`where\` ` +
+      `matches, not ${key === 'limit' || key === 'take' ? 'only the first ones' : 'skip any'}. To ${operation === 'deleteMany' ? 'delete' : 'update'} a bounded batch, ` +
+      'select the ids first (`findMany({ where, select: { id: true }, orderBy, limit })`), then pass ' +
+      '`where: { id: { in: ids } }`.',
+  );
 }
 
 /**
@@ -978,12 +1070,14 @@ export function buildUpsert<T extends object>(
     reselect:
       qi.dialect.resultStrategy === 'reselect'
         ? async (exec) => {
+            const lookup = (whereMod.mergeGlobalFilter(qi, upsertWhere) ?? {}) as Record<string, unknown>;
+            // An update that changes a `where` column moves the row out of
+            // `where`'s reach: lock it and re-read it by its key. An insert
+            // matches `where` (this path requires `where` pinned to `create`).
+            const update = (args.update ?? {}) as Record<string, unknown>;
+            const key = dataMovesRow(qi, upsertWhere, update) ? await lockKeyOf(qi, exec, lookup, update) : undefined;
             await exec(sql, params);
-            const sel = buildReselectByWhere(
-              qi,
-              (whereMod.mergeGlobalFilter(qi, upsertWhere) ?? {}) as Record<string, unknown>,
-              projection,
-            );
+            const sel = buildReselectByWhere(qi, key ?? lookup, projection);
             return exec(sel.sql, sel.params);
           }
         : undefined,
@@ -1019,6 +1113,7 @@ export function buildUpdateMany<T extends object>(
   args: UpdateManyArgs<T>,
 ): DeferredQuery<{ count: number }> {
   assertWritable(qi, 'updateMany');
+  assertNoBulkWritePaging(qi.table, 'updateMany', args);
   assertNoOptimisticLock(qi, args, 'updateMany');
   qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
   const dataObj = applyUpdatedAtColumns(qi, args.data as Record<string, unknown>);
@@ -1079,6 +1174,7 @@ export function buildDeleteMany<T extends object>(
   args: DeleteManyArgs<T>,
 ): DeferredQuery<{ count: number }> {
   assertWritable(qi, 'deleteMany');
+  assertNoBulkWritePaging(qi.table, 'deleteMany', args);
   qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
   whereMod.assertMutationHasPredicate(
     qi,
@@ -1117,8 +1213,8 @@ export function buildDeleteMany<T extends object>(
 /**
  * The snake_case names of a table's PII-tagged (`defineSchema` `pii: true`)
  * columns. PII columns are excluded from default projections (findMany /
- * findUnique / relation subqueries / batched loads) unless the query opts in
- * via `includePii` or names the column explicitly in `select`. Returns an
+ * findUnique / relation subqueries / batched loads) unless a read passes
+ * `includePii: UNSAFE`; naming one in `select` without it is E003. Returns an
  * empty set for any table with no PII column, so untagged schemas keep their
  * byte-identical SQL.
  */
@@ -1151,8 +1247,8 @@ export function piiColumns(_qi: BuilderCtx, meta: TableMetadata): Set<string> {
  * The camelCase field names of a table's PII-tagged columns: the read-side
  * counterpart of {@link piiColumns} applied to already-parsed entities.
  * Used to strip PII from a write's RETURNING/reselect row (writes accept no
- * `includePii`/`select`, so their returned row always applies the default
- * exclusion; you may still write PII fields freely).
+ * `includePii`, and a PII column named in a write's `select` is E003, so their
+ * returned row never carries one; you may still write PII fields freely).
  */
 export function piiFields(_qi: BuilderCtx, meta: TableMetadata): string[] {
   const out: string[] = [];
@@ -1176,9 +1272,10 @@ export function piiFields(_qi: BuilderCtx, meta: TableMetadata): string[] {
  * resolve to a column or the call throws E003, a relation name gets its own
  * message, `select` must name something, `select` and `omit` are exclusive, the
  * list is in TABLE order (a caller's key order must not mint distinct
- * statements), and an explicit `select` of a PII column is the opt-in that
- * returns it while `omit` leaves PII excluded. (builder.ts rather than this
- * module because relations.ts already imports this one.)
+ * statements), and PII is never returned: a write takes no `includePii`, so a
+ * PII column named in `select` is E003 and `omit` leaves PII excluded.
+ * (builder.ts rather than this module because relations.ts already imports
+ * this one.)
  *
  * The point is bytes: `RETURNING *` sends back every column, a large JSON
  * payload included, on every insert. Measured with a 3.1 KB jsonb column at
@@ -1209,8 +1306,9 @@ export function writeProjectionCacheSegment(projection: WriteProjection | undefi
  * column so the PII values never leave the database on a write. A PII-tagged
  * PRIMARY KEY column is kept in the projection regardless (the returned row
  * must stay addressable): tag sensitive data, not keys, a PII PK is
- * documented out of scope for stripping. Writes accept no `select`/`includePii`
- * (unlike reads), so this is the whole write-return policy at the SQL level;
+ * documented out of scope for stripping. Writes accept no `includePii` and
+ * their `select` cannot name a PII column, so this is the whole write-return
+ * policy at the SQL level;
  * {@link parseWriteRow} remains as a defense-in-depth strip (a no-op once the
  * SQL already excludes the columns). Derived purely from static per-table
  * schema metadata, so the write SQL cache needs no extra key segment.
@@ -1299,8 +1397,8 @@ export function parseWriteRow(
   projection?: WriteProjection,
 ): Record<string, unknown> {
   const parsed = qi.parseRow(row, qi.table);
-  // A column the caller named in `select` is the opt-in (see WriteProjection),
-  // so the strip spares exactly the projected columns and nothing else.
+  // A write's projection never names a PII column (E003, see WriteProjection),
+  // so for PII this strip spares nothing; it stays as defense in depth.
   const pii = piiColumns(qi, qi.tableMeta);
   if (pii.size === 0) return parsed;
   const requested = projection ? new Set(projection.columns) : undefined;

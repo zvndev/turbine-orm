@@ -346,7 +346,8 @@ describe('pick-row lateral plan: byte-identical default-plan SQL (buildSql restr
     {
       name: 'pagination',
       args: { limit: 10, offset: 5, orderBy: { name: 'asc' } },
-      sql: 'SELECT "instances".* FROM "instances" ORDER BY "name" ASC LIMIT $1 OFFSET $2',
+      // A page over a column that can tie ends in the primary key.
+      sql: 'SELECT "instances".* FROM "instances" ORDER BY "name" ASC, "id" ASC LIMIT $1 OFFSET $2',
       params: [10, 5],
     },
     {

@@ -412,6 +412,224 @@ export function sqlToPreparedName(sql: string): string {
   return `t_${fnv1a64Hex(sql)}`;
 }
 
+/**
+ * How many distinct statement names one process hands out. Every connection
+ * keeps each named statement it has prepared, at 9 to 45 KB of server memory
+ * apiece, until the connection closes, so the number of names is what bounds
+ * that memory. A statement past the budget is sent unnamed: parsed on every
+ * execution and never kept, which costs a few microseconds on a cheap query.
+ */
+export const PREPARED_STATEMENT_BUDGET = 200;
+
+/** `Symbol.for` so the ESM and CJS copies of this module share one budget. */
+const PREPARED_NAMES = Symbol.for('turbine.preparedStatementNames');
+
+function preparedNames(): Set<string> {
+  const holder = globalThis as { [PREPARED_NAMES]?: Set<string> };
+  let names = holder[PREPARED_NAMES];
+  if (!names) {
+    names = new Set();
+    holder[PREPARED_NAMES] = names;
+  }
+  return names;
+}
+
+/**
+ * The prepared-statement name for `sql`, or `''` (send it unnamed) once the
+ * process has named {@link PREPARED_STATEMENT_BUDGET} other statements.
+ *
+ * The first shapes a process runs keep their names for its lifetime, which in
+ * practice are its hot shapes. A server-side `DEALLOCATE` cannot replace this:
+ * a pooled query does not know which connection it will run on, and a
+ * connection keeps every name it ever prepared.
+ */
+export function boundedPreparedName(sql: string): string {
+  const name = sqlToPreparedName(sql);
+  const names = preparedNames();
+  if (names.has(name)) return name;
+  if (names.size >= PREPARED_STATEMENT_BUDGET) return '';
+  names.add(name);
+  return name;
+}
+
+/** @internal Tests only: forget every name handed out. */
+export function resetPreparedNameBudget(): void {
+  preparedNames().clear();
+}
+
+/** The `params` object a middleware receives. */
+export interface MiddlewareParams {
+  model: string;
+  action: string;
+  args: Record<string, unknown>;
+}
+
+function argsRewriteError(model: string, action: string, path: string): TypeError {
+  return new TypeError(
+    `[turbine] middleware cannot change \`params.${path}\` on ${model}.${action}: the query is compiled from the ` +
+      'arguments the caller passed, so a change made in middleware would not reliably reach it. Put the ' +
+      'condition in the query itself, or use `globalFilters` for a filter that applies to every query.',
+  );
+}
+
+/** Plain objects and arrays are wrapped; a Date, Buffer, class instance or branded value is not. */
+function isPlainContainer(value: unknown): value is object {
+  if (value === null || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return true;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+/**
+ * The `params` a middleware sees, with `args` read-only at every depth: any
+ * write, delete or replacement throws a TypeError naming the path, instead of
+ * being silently ignored (or, for a nested object shared with the caller,
+ * applied to some statements and not others). `params.result`-style
+ * transforms of what `next()` returns are untouched.
+ *
+ * `next(p)` hands the returned value to {@link assertMiddlewareArgsKept}.
+ */
+export function readOnlyMiddlewareParams(
+  model: string,
+  action: string,
+  args: Record<string, unknown>,
+): MiddlewareParams {
+  const views = new WeakMap<object, object>();
+  const view = <V>(value: V, path: string): V => {
+    if (!isPlainContainer(value)) return value;
+    const known = views.get(value);
+    if (known) return known as V;
+    const refuse = (key: PropertyKey): never => {
+      throw argsRewriteError(model, action, `${path}.${String(key)}`);
+    };
+    const proxy = new Proxy(value, {
+      get(target, key, receiver) {
+        const inner = Reflect.get(target, key, receiver);
+        const d = Reflect.getOwnPropertyDescriptor(target, key);
+        // A frozen property must read back as itself (a proxy invariant).
+        if (d && !d.configurable && !d.writable) return inner;
+        return typeof key === 'string' ? view(inner, `${path}.${key}`) : inner;
+      },
+      set: (_t, key) => refuse(key),
+      deleteProperty: (_t, key) => refuse(key),
+      defineProperty: (_t, key) => refuse(key),
+      setPrototypeOf: () => refuse('__proto__'),
+    });
+    views.set(value, proxy);
+    return proxy as V;
+  };
+  const frozenArgs = view(args, 'args');
+  const params: MiddlewareParams = { model, action, args: frozenArgs };
+  return new Proxy(params, {
+    set(target, key, value) {
+      if (key === 'args' || key === 'model' || key === 'action') throw argsRewriteError(model, action, String(key));
+      return Reflect.set(target, key, value);
+    },
+  });
+}
+
+/**
+ * Refuse a `next(p)` whose `p.args` is not the read-only view this operation
+ * handed out (a middleware that built a new args object, which would be
+ * ignored).
+ */
+export function assertMiddlewareArgsKept(handedOut: MiddlewareParams, passed: { args?: unknown } | undefined): void {
+  if (passed?.args !== handedOut.args) {
+    throw argsRewriteError(handedOut.model, handedOut.action, 'args');
+  }
+}
+
+/** The fields of a connected node-postgres client a cancel request needs. */
+interface CancelTarget {
+  processID?: unknown;
+  secretKey?: unknown;
+  host?: unknown;
+  port?: unknown;
+  ssl?: unknown;
+  sslNegotiation?: unknown;
+}
+
+/** The part of node-postgres' `Connection` a cancel request uses. */
+interface CancelConnection {
+  on(event: string, listener: (...args: unknown[]) => void): unknown;
+  connect(portOrPath: number | string, host?: string): void;
+  requestSsl(): void;
+  cancel(processID: number, secretKey: number): void;
+  stream?: { destroy?(): void };
+}
+
+/** Whether `pool` is a node-postgres `Pool`, whose checkouts are real backend connections. */
+export function isNodePostgresPool(pool: unknown): boolean {
+  const Pool = (pg as { Pool?: unknown }).Pool;
+  return typeof Pool === 'function' && pool instanceof (Pool as new (...args: never[]) => object);
+}
+
+/** Whether `client` is a node-postgres connection a cancel request can reach. */
+export function canCancelBackend(client: unknown): boolean {
+  const c = client as CancelTarget | null;
+  return (
+    typeof (pg as { Connection?: unknown }).Connection === 'function' &&
+    !!c &&
+    typeof c.processID === 'number' &&
+    typeof c.secretKey === 'number' &&
+    (typeof c.port === 'number' || typeof c.port === 'string')
+  );
+}
+
+/**
+ * Ask the server to cancel whatever `client`'s backend is running, with the
+ * protocol's CancelRequest: a separate short connection carrying the backend's
+ * process id and secret key. No login, no session state, and a pooler forwards
+ * it to the right server backend, which `pg_cancel_backend(pid)` through a
+ * pooler would not.
+ *
+ * Resolves `true` once the server has closed the cancel connection, i.e. has
+ * signalled the backend; `false` when the request could not be delivered
+ * within `waitMs`. A cancel that arrives after the statement finished is
+ * ignored by the server.
+ */
+export function sendCancelRequest(client: unknown, waitMs: number): Promise<boolean> {
+  if (!canCancelBackend(client)) return Promise.resolve(false);
+  const target = client as CancelTarget;
+  const Connection = (pg as unknown as { Connection: new (options: object) => CancelConnection }).Connection;
+  return new Promise((resolve) => {
+    let con: CancelConnection | undefined;
+    let sent = false;
+    let done = false;
+    const finish = (delivered: boolean): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try {
+        con?.stream?.destroy?.();
+      } catch {
+        // already closed
+      }
+      resolve(delivered);
+    };
+    const timer = setTimeout(() => finish(false), waitMs);
+    try {
+      con = new Connection({ ssl: target.ssl, sslNegotiation: target.sslNegotiation });
+      const send = (): void => {
+        sent = true;
+        con?.cancel(target.processID as number, target.secretKey as number);
+      };
+      con.on('error', () => finish(false));
+      con.on('end', () => finish(sent));
+      con.on('connect', () => {
+        if (!target.ssl) send();
+        else if (target.sslNegotiation !== 'direct') con?.requestSsl();
+      });
+      con.on('sslconnect', send);
+      const host = typeof target.host === 'string' ? target.host : undefined;
+      if (host?.startsWith('/')) con.connect(`${host}/.s.PGSQL.${String(target.port)}`);
+      else con.connect(target.port as number, host);
+    } catch {
+      finish(false);
+    }
+  });
+}
+
 /** Known operator keys, used to detect operator objects vs plain values */
 export const OPERATOR_KEYS = new Set<string>([
   'equals',
@@ -585,6 +803,13 @@ const TZ_SUFFIX_RE = /(?:Z|[+-]\d{2}(?::?\d{2})?)$/;
  * as-is.
  */
 export function parseDbDate(value: string): Date {
+  const date = parseDbDateCommon(value);
+  // The shapes JS cannot parse (a BC year, an offset with seconds, a year past
+  // 9999) come out invalid; only those pay for the general parse.
+  return Number.isNaN(date.getTime()) ? (parseDbDateGeneral(value) ?? date) : date;
+}
+
+function parseDbDateCommon(value: string): Date {
   // Date-only values (`2026-07-07`, from `date` columns in json_agg output)
   // have no time to zone-pin, and their `-07` tail must not be read as an
   // offset. JS parses bare ISO dates as UTC midnight already.
@@ -597,6 +822,79 @@ export function parseDbDate(value: string): Date {
   }
   // normalize `YYYY-MM-DD HH:MM:SS` (driver form) to ISO before pinning UTC
   return new Date(`${value.replace(' ', 'T')}Z`);
+}
+
+const DB_DATE_GENERAL_RE =
+  /^(\d{4,})-(\d\d)-(\d\d)(?:[T ](\d\d):(\d\d):(\d\d)(\.\d+)?)?(?:(Z)|([+-])(\d\d)(?::?(\d\d))?(?::?(\d\d))?)?( BC)?$/;
+
+/**
+ * The Postgres renderings JS `Date` cannot parse: a ` BC` suffix, a
+ * local-mean-time offset with seconds (`-04:56:02`, any zone before about
+ * 1900), and years of five or more digits. Offset-less text is read as UTC,
+ * as in {@link parseDbDate}. `undefined` when the text is none of these.
+ */
+function parseDbDateGeneral(value: string): Date | undefined {
+  const m = DB_DATE_GENERAL_RE.exec(value);
+  if (!m) return undefined;
+  let year = Number(m[1]);
+  if (m[13]) year = 1 - year;
+  const month = Number(m[2]) - 1;
+  const ms = m[7] ? Math.trunc(1000 * Number(`0${m[7]}`)) : 0;
+  const date = new Date(
+    Date.UTC(2000, month, Number(m[3]), Number(m[4] ?? 0), Number(m[5] ?? 0), Number(m[6] ?? 0), ms),
+  );
+  // setUTCFullYear, not Date.UTC: Date.UTC reads years 0-99 as 1900-1999.
+  date.setUTCFullYear(year, month, Number(m[3]));
+  if (m[9]) {
+    const offset = Number(m[10]) * 3600 + Number(m[11] ?? 0) * 60 + Number(m[12] ?? 0);
+    return new Date(date.getTime() - (m[9] === '-' ? -offset : offset) * 1000);
+  }
+  return date;
+}
+
+/**
+ * A float column's value as the driver reads it. JSON has no NaN or infinity,
+ * so `json_build_object` renders them as the strings "NaN", "Infinity" and
+ * "-Infinity"; every other value passes through.
+ */
+export function readJsonFloat(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  if (value === 'NaN') return Number.NaN;
+  if (value === 'Infinity') return Number.POSITIVE_INFINITY;
+  if (value === '-Infinity') return Number.NEGATIVE_INFINITY;
+  return value;
+}
+
+/** {@link readJsonFloat} over a float array (at any depth); the input when nothing changes. */
+export function readJsonFloatArray(value: unknown): unknown {
+  if (!Array.isArray(value)) return value;
+  let out: unknown[] | undefined;
+  for (let i = 0; i < value.length; i++) {
+    const el = value[i];
+    const read = Array.isArray(el) ? readJsonFloatArray(el) : readJsonFloat(el);
+    if (read !== el) {
+      out ??= value.slice();
+      out[i] = read;
+    }
+  }
+  return out ?? value;
+}
+
+let textArrayParser: ((text: string) => unknown[] | null) | undefined;
+
+/**
+ * An array column the driver has no parser for (an enum array) arrives as
+ * Postgres array text, `{ok,sad}`; read it into an array of strings, as the
+ * same column reads through a relation. The input when it cannot be parsed.
+ */
+export function readTextArray(value: unknown): unknown {
+  if (typeof value !== 'string' || value.charCodeAt(0) !== 123) return value;
+  try {
+    textArrayParser ??= createPgArrayParser((text) => text);
+    return textArrayParser(value) ?? value;
+  } catch {
+    return value;
+  }
 }
 
 /**
@@ -1392,7 +1690,11 @@ function nameCloseness(input: string, candidate: string): number {
   const a = input.toLowerCase();
   const b = candidate.toLowerCase();
   if (a === b) return 1000;
-  if (a.includes(b) || b.includes(a)) return 500 + Math.min(a.length, b.length);
+  // Containment only between names of 3+ characters: `id` sits inside almost
+  // any name, so `tenentId` must reach `tenantId` by edit distance instead.
+  if (Math.min(a.length, b.length) >= 3 && (a.includes(b) || b.includes(a))) {
+    return 500 + Math.min(a.length, b.length);
+  }
   // Levenshtein, bounded: only near-misses are worth suggesting.
   const rows = a.length + 1;
   const cols = b.length + 1;

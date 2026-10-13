@@ -634,12 +634,15 @@ function renderWhereForMessage(where: unknown, mode: ErrorMessageMode): string {
  *   `[TURBINE_E001] findUniqueOrThrow on "users" found no record matching where: {"id":1}`
  *
  * The full `where` object, `table`, and `operation` are always available as
- * structured properties on the error instance regardless of mode.
+ * structured properties on the error instance regardless of mode. `where`
+ * carries the caller's raw values, so under 'safe' it is NON-ENUMERABLE:
+ * `err.where` reads it, while `JSON.stringify`, `util.inspect` and error
+ * serializers that copy own enumerable fields leave it out.
  */
 export class NotFoundError extends TurbineError {
   static override readonly CODE = TurbineErrorCode.NOT_FOUND;
   readonly table?: string;
-  readonly where?: unknown;
+  declare readonly where?: unknown;
   readonly operation?: string;
 
   constructor(
@@ -678,15 +681,35 @@ export class NotFoundError extends TurbineError {
     super(TurbineErrorCode.NOT_FOUND, message, { cause });
     this.name = 'NotFoundError';
     this.table = table;
-    this.where = where;
+    Object.defineProperty(this, 'where', {
+      value: where,
+      enumerable: currentErrorMessageMode() === 'verbose',
+      writable: false,
+      configurable: true,
+    });
     this.operation = operation;
   }
 }
+
+/**
+ * What a {@link TimeoutError} says about the statement it interrupted.
+ *
+ *   - `'not-executed'`: the statement made no change. It was never sent (the
+ *     deadline passed while waiting for a connection), or the server confirmed
+ *     it was cancelled. Safe to retry.
+ *   - `'unknown'`: the statement may still have completed. A write retried on
+ *     this outcome can be applied twice; check the database first.
+ *
+ * A read changes nothing whatever this says, so a read is always safe to retry.
+ */
+export type TimeoutOutcome = 'not-executed' | 'unknown';
 
 /** Thrown when a query or transaction exceeds the configured timeout */
 export class TimeoutError extends TurbineError {
   static override readonly CODE = TurbineErrorCode.TIMEOUT;
   readonly timeoutMs: number;
+  /** Whether the interrupted statement can have taken effect. See {@link TimeoutOutcome}. */
+  readonly outcome: TimeoutOutcome;
 
   /**
    * @param timeoutMs the client-side timeout budget in ms. Pass `0` when the
@@ -694,12 +717,18 @@ export class TimeoutError extends TurbineError {
    *   surfaced via `wrapPgError`, where Turbine did not set the deadline).
    * @param context human label for the operation ("Query", "Transaction").
    * @param options optional `message` override and pg `cause` to preserve, used
-   *   when wrapping a driver error rather than a client-side timer expiry.
+   *   when wrapping a driver error rather than a client-side timer expiry, and
+   *   the `outcome` (default `'unknown'`, the only answer that is never wrong).
    */
-  constructor(timeoutMs: number, context = 'Query', options?: { message?: string; cause?: unknown }) {
+  constructor(
+    timeoutMs: number,
+    context = 'Query',
+    options?: { message?: string; cause?: unknown; outcome?: TimeoutOutcome },
+  ) {
     super(TurbineErrorCode.TIMEOUT, options?.message ?? `${context} timed out after ${timeoutMs}ms`, options);
     this.name = 'TimeoutError';
     this.timeoutMs = timeoutMs;
+    this.outcome = options?.outcome ?? 'unknown';
   }
 }
 
@@ -1251,23 +1280,48 @@ export class ReadOnlyError extends TurbineError {
    * fail-fast flag), so NOTHING can write here and writes must route to the
    * primary. `'rbac'`: the database is writable but THIS connection's role may
    * not write (per-connection permission), so re-authenticating may suffice.
+   * `'transaction'`: the transaction is read-only (`$transaction({ readOnly:
+   * true })`, `BEGIN READ ONLY`, or a read replica, where every transaction
+   * is), so the write belongs in a read-write transaction on the primary.
    */
-  readonly reason: 'snapshot' | 'rbac';
+  readonly reason: ReadOnlyReason;
 
   /**
    * @param detail human-readable description of the refused write (the engine
-   *   message, or a local fail-fast description). A "route writes to a writable
-   *   primary" hint is always appended.
+   *   message, or a local fail-fast description). A hint naming where the
+   *   write belongs is always appended.
    * @param options optional driver `cause` to preserve when wrapping a refusal,
    *   and the refusal `reason` (default `'snapshot'`).
    */
-  constructor(detail: string, options?: { cause?: unknown; reason?: 'snapshot' | 'rbac' }) {
-    super(TurbineErrorCode.READ_ONLY, `${detail} Route writes to a writable primary.`, {
+  constructor(detail: string, options?: { cause?: unknown; reason?: ReadOnlyReason }) {
+    const reason = options?.reason ?? 'snapshot';
+    super(TurbineErrorCode.READ_ONLY, `${detail} ${READ_ONLY_HINTS[reason]}`, {
       cause: options?.cause,
     });
     this.name = 'ReadOnlyError';
-    this.reason = options?.reason ?? 'snapshot';
+    this.reason = reason;
   }
+}
+
+/** Why a {@link ReadOnlyError} write was refused. */
+export type ReadOnlyReason = 'snapshot' | 'rbac' | 'transaction';
+
+const READ_ONLY_HINTS: Readonly<Record<ReadOnlyReason, string>> = {
+  snapshot: 'Route writes to a writable primary.',
+  rbac: 'Route writes to a writable primary.',
+  transaction:
+    'Run the write in a read-write transaction (not `readOnly: true` or BEGIN READ ONLY) on the primary, ' +
+    'not a read replica.',
+};
+
+/**
+ * A write refused because its transaction is read-only: PostgreSQL SQLSTATE
+ * 25006, or MySQL's error 1792 (which carries the same SQLSTATE).
+ */
+function isReadOnlyTransactionError(err: object, code: string): boolean {
+  if (code === '25006' || code === 'ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION') return true;
+  const e = err as { errno?: unknown; sqlState?: unknown };
+  return e.errno === 1792 && e.sqlState === '25006';
 }
 
 /**
@@ -1360,6 +1414,14 @@ const PG_CONNECTION_LOSS_MESSAGES = new Set<string>([
   'Connection terminated',
   'Connection terminated due to connection timeout',
 ]);
+
+/** pg-pool's own words for a checkout that waited longer than `connectionTimeoutMillis`. */
+const PG_POOL_CHECKOUT_TIMEOUT_MESSAGE = 'timeout exceeded when trying to connect';
+
+const POOL_CHECKOUT_TIMEOUT_HINT =
+  "Timed out waiting for a free connection from the pool. Something is holding connections for longer than the pool's " +
+  'connection timeout: long transactions or streams, or a query on the outer client inside a `$transaction` ' +
+  'callback, which needs a second connection (use `tx` there). Raise the pool size if the load is genuine.';
 
 /** The follow-on errors pg raises for a query sent to a client already known to be dead. */
 const PG_NOT_QUERYABLE_MESSAGES = new Set<string>([
@@ -1736,7 +1798,31 @@ export function wrapPgError(err: unknown): unknown {
     if (err instanceof Error && PG_CONNECTION_LOSS_MESSAGES.has(err.message)) {
       return new ConnectionError(`Database connection lost: ${err.message}. ${CONNECTION_LOSS_HINT}`, { cause: err });
     }
+    // pg-pool's checkout timeout carries no code either. A pool Turbine owns
+    // types it at checkout (checkout.ts); this covers a caller's own pg.Pool.
+    if (err instanceof Error && err.message === PG_POOL_CHECKOUT_TIMEOUT_MESSAGE) {
+      return new ConnectionError(POOL_CHECKOUT_TIMEOUT_HINT, { cause: err });
+    }
     return err;
+  }
+
+  if (isReadOnlyTransactionError(err, e.code)) {
+    const pgMessage = typeof e.message === 'string' && e.message.length > 0 ? e.message : 'write refused';
+    return new ReadOnlyError(`${pgMessage} (SQLSTATE 25006).`, { cause: err, reason: 'transaction' });
+  }
+
+  // A protocol violation answered with ERROR rather than FATAL concerns one
+  // message, and the connection stays usable. The common cause is a Buffer
+  // bound to a column that is not bytea: node-postgres sends a Buffer as
+  // binary data, which the server cannot read as an integer or a date.
+  if (e.code === '08P01' && e.severity === 'ERROR') {
+    return wrapValueBearingPgError(
+      err,
+      e,
+      'Invalid input',
+      'a bound value could not be read as the type the statement expects',
+      ' A Buffer is sent as binary data and fits only a bytea column; pass a number, string or Date for any other type.',
+    );
   }
 
   switch (e.code) {
@@ -1783,12 +1869,18 @@ export function wrapPgError(err: unknown): unknown {
         cause: err,
       });
     case '57014':
-      // query_canceled: a server-side statement_timeout cancelled the query.
-      // Turbine did not set the deadline (that lives in Postgres config), so
-      // there is no client-side budget to report → timeoutMs = 0.
+      // query_canceled: the statement was stopped, so it made no change. A
+      // cancel request (what Turbine sends when a query or transaction
+      // `timeout` expires) reads "due to user request"; anything else is the
+      // server's own statement_timeout.
       return new TimeoutError(0, 'Query', {
-        message: 'Query canceled by server-side statement_timeout',
+        message:
+          typeof e.message === 'string' && /user request/i.test(e.message)
+            ? 'Query cancelled on the server by a cancel request, which Turbine sends when a query or ' +
+              'transaction `timeout` expires. It made no change.'
+            : 'Query canceled by server-side statement_timeout',
         cause: err,
+        outcome: 'not-executed',
       });
     default:
       if (CONNECTION_ERROR_CODES.has(e.code)) {
@@ -1811,6 +1903,17 @@ export function wrapPgError(err: unknown): unknown {
           ? DATA_EXCEPTION_PHRASES[e.code]!
           : DATA_EXCEPTION_FALLBACK;
         return wrapValueBearingPgError(err, e, subject, phrase);
+      }
+      // 42883: no operator or function for these argument types, e.g. a bigint
+      // column compared with text. PostgreSQL's message names types, never
+      // values, so it is kept in both modes.
+      if (e.code === '42883') {
+        const pgMessage = typeof e.message === 'string' && e.message.length > 0 ? `${e.message} ` : '';
+        return new ValidationError(
+          `${pgMessage}(SQLSTATE 42883). A value of one type was compared with or passed to something that takes ` +
+            "another, usually a value bound to a column of a different type. Pass a value of the column's type.",
+          { cause: err, sqlstate: e.code },
+        );
       }
       // 42601 is any syntax error. Only the to_tsquery parse failure is a
       // caller-input problem Turbine can name (the `search` operator), so the

@@ -2229,10 +2229,11 @@ testFn('turbine integration tests', () => {
       await mwDb.disconnect();
     });
 
-    it('middleware can modify args before passing to next', async () => {
+    it('middleware that rewrites args is refused with a TypeError', async () => {
       const mwDb = new TurbineClient({ connectionString: DATABASE_URL, poolSize: 2 }, schema);
 
-      // Middleware that forces a limit of 1 on all findMany queries
+      // The query is compiled from the caller's args, so a rewrite in
+      // middleware would be ignored. It throws instead of doing nothing.
       mwDb.$use(async (params, next) => {
         if (params.action === 'findMany') {
           params.args = { ...params.args, limit: 1 };
@@ -2240,15 +2241,14 @@ testFn('turbine integration tests', () => {
         return next(params);
       });
 
-      // Note: the middleware modifies args, but since QueryInterface has already
-      // built the deferred query by the time middleware runs, this test verifies
-      // the args object is mutable. The actual SQL won't change because the
-      // executor closure captured the original args. This tests the middleware API.
       const users = mwDb.table<{ id: number }>('users');
-      const result = await users.findMany({ limit: 100 });
-      // The middleware modified args, but the executor was already built.
-      // This just verifies middleware CAN modify args without throwing.
-      assert.ok(Array.isArray(result));
+      await assert.rejects(users.findMany({ limit: 100 }), (err: unknown) => {
+        assert.ok(err instanceof TypeError);
+        assert.match(err.message, /cannot change `params\.args` on users\.findMany/);
+        return true;
+      });
+      // Other actions pass through untouched.
+      assert.equal(typeof (await users.count()), 'number');
 
       await mwDb.disconnect();
     });
