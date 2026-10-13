@@ -384,6 +384,7 @@ function assertObjectEqualityOperand(key: string, value: object, ctx: OperandCon
     return;
   }
   if (ctx.kind === 'json') {
+    if (key === 'not') assertJsonNotOperand(value, ctx);
     if (!fitsColumn(value, 'json')) refuseOperand(key, value, ctx, `${acceptedFor('json')} or null`);
     return;
   }
@@ -414,6 +415,29 @@ function assertObjectEqualityOperand(key: string, value: object, ctx: OperandCon
         (isPlainRecord(value) ? ' (an object is a JSON value, accepted only on json/jsonb columns)' : ''),
     );
   }
+}
+
+/**
+ * On a JSON column `not` takes a JSON VALUE (`not: { a: 1 }` compares
+ * documents), so `not: { contains: {...} }` was compared as the literal document
+ * `{"contains": ...}` and matched nearly every row, while the same spelling on a
+ * text column negates the filter. An object made only of filter-operator keys
+ * is therefore refused, except `not: { equals: X }`, which negates the
+ * whole-document equality. A literal document with such keys stays expressible.
+ * Every engine runs it (PowDB too), so the spelling means one thing everywhere.
+ */
+export function assertJsonNotOperand(value: unknown, ctx: OperandContext): void {
+  if (!isPlainRecord(value)) return;
+  const keys = Object.keys(value).filter((k) => value[k] !== undefined);
+  if (keys.length === 0 || (keys.length === 1 && keys[0] === 'equals')) return;
+  if (!keys.every((k) => JSON_FILTER_KEYS.has(k) || OPERATOR_KEYS.has(k))) return;
+  const named = keys.map((k) => `"${k}"`).join(', ');
+  throw new ValidationError(
+    `Invalid \`not\` ${operandSite(ctx)}, a JSON column: an object whose keys are all filter operators (${named}) ` +
+      'would be compared as a literal JSON document and match nearly every row. To negate the filter, write ' +
+      `\`NOT: { ${ctx.column}: { ${keys[0]}: ... } }\`. To compare against a document that has these keys, ` +
+      'pass it as `not: jsonValue({ ... })` or `not: { equals: { ... } }`.',
+  );
 }
 
 /** `in` / `notIn`: an array whose elements fit the column (or are null). */
@@ -465,6 +489,50 @@ export function assertEqualityOperand(value: unknown, ctx: OperandContext): void
     `Invalid value ${where}: received ${describeOperand(value)}. A bare value takes ${acceptedFor(ctx.kind)}` +
       (Array.isArray(value) ? '; to match any of several values use { in: [...] }.' : '.'),
   );
+}
+
+/** `{ equals: v }` written as an object literal with that one key. */
+function isEqualsWrapper(value: unknown): value is { equals: unknown } {
+  if (!isPlainRecord(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length === 1 && keys[0] === 'equals';
+}
+
+/**
+ * One `cursor` field's value, checked and unwrapped. A cursor value is the
+ * value the last row holds in that column, so it takes the bare-equality rule
+ * (`{ equals: v }` is the same as `v`); an operator object, a list on a scalar
+ * column or a column reference is refused (E003) in terms of cursors, not
+ * filters. NULL is a row's value only in a column that can hold it: in a NOT
+ * NULL column (the primary key included) no row has it, so it is refused
+ * rather than placing the page nowhere. Shared by every engine's cursor path.
+ */
+export function cursorFieldValue(
+  field: string,
+  written: unknown,
+  ctx: OperandContext & { nullable: boolean },
+): unknown {
+  const value = isEqualsWrapper(written) ? written.equals : written;
+  const site = `\`cursor\` field "${field}" on table "${ctx.table}"`;
+  if (value === null) {
+    if (ctx.nullable) return null;
+    throw new ValidationError(
+      `Invalid ${site}: null. "${ctx.column}" is NOT NULL, so no row holds null there and the cursor names no ` +
+        "position. Pass the last row's value, or leave `cursor` out for the first page.",
+    );
+  }
+  const columnRef = isColumnRef(value) || isPlainColumnRefShape(value);
+  const operatorShaped = isPlainRecord(value) && ctx.kind !== 'json';
+  const list = Array.isArray(value) && ctx.kind === 'scalar';
+  if (columnRef || operatorShaped || list) {
+    throw new ValidationError(
+      `Invalid ${site}: received ${describeOperand(value)}. A cursor value is the value the last row holds in ` +
+        `"${field}" (for example \`cursor: { ${field}: 42 }\`), written bare or as \`{ equals: 42 }\`. ` +
+        'To filter rows, use `where`.',
+    );
+  }
+  assertEqualityOperand(value, ctx);
+  return value;
 }
 
 /**

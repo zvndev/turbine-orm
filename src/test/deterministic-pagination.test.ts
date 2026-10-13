@@ -95,7 +95,6 @@ describe('unordered-page warning', () => {
     const warnings = await captureWarnings(async () => {
       await q.findMany();
       await q.findMany({ limit: 5, distinct: ['email'] as never });
-      await q.findMany({ cursor: {} as never }); // no defined key: emits no seek at all
     });
     assert.equal(warnings.length, 0);
   });

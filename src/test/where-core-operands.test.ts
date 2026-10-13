@@ -135,9 +135,13 @@ describe('not with an operator object', () => {
     );
   });
 
-  it('on a JSON column an object after not is still a JSON value', () => {
-    // The negated whole-document equality, never a `>` comparison.
-    const out = compileWhere({ meta: { not: { gt: 1 } } });
+  it('on a JSON column an object of operators after not is refused, and a document is compared', () => {
+    // Read as a document it matched nearly every row; read as a filter it
+    // would mean something else on a text column. Neither: E003.
+    assert.throws(() => compileWhere({ meta: { not: { gt: 1 } } }), /a JSON column.*NOT: \{ meta/);
+    // A document with operator-named keys stays expressible: the negated
+    // whole-document equality, never a `>` comparison.
+    const out = compileWhere({ meta: { not: { equals: { gt: 1 } } } });
     assert.equal(out.sql, 'NOT ("meta"::jsonb = $1::jsonb)');
     assert.deepEqual(out.buildParams, ['{"gt":1}']);
     assert.deepEqual(out.collectParams, out.buildParams);

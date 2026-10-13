@@ -16,7 +16,7 @@ import { getErrorMessageMode, UnsupportedFeatureError, ValidationError } from '.
 import { assertSkipListNames, skipListNamesTable } from '../global-filters-config.js';
 import type { PgCompatQueryResult } from '../pg-types.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
-import { camelToSnake, normalizeKeyColumns } from '../schema.js';
+import { camelToSnake, localDateTimeKind, normalizeKeyColumns } from '../schema.js';
 import type { TemporalInfinityReading } from './deferred.js';
 import {
   assertEqualityOperand,
@@ -26,13 +26,13 @@ import {
   isArrayFilter,
   isColumnRef,
   isJsonFilter,
+  isPlainRecord,
   isWhereOperator,
   JSON_FILTER_KEYS,
   JSON_RANGE_OPERATORS,
   JSON_STRING_OPERATORS,
   type OperandContext,
   operandColumnKind,
-  RELATION_FILTER_WRAPPERS,
   VECTOR_DISTANCE_COMPARATORS,
   VECTOR_METRIC_OPERATORS,
   validateTextSearchConfig,
@@ -63,6 +63,8 @@ import {
   assertWhereDepth,
   classifyScalarForSql,
   fingerprintScalarToken,
+  foldWhere,
+  normalizeToOneRelationFilter,
   type WhereHost,
   type WhereRecord,
   walkWhere,
@@ -376,10 +378,11 @@ export function fingerprintWhere(qi: BuilderCtx, where: Record<string, unknown>,
 
 /**
  * Fingerprint the present branches of a normalized relation filter, in the
- * fixed order some→every→none→is→isNot. A `null` branch tokenizes as
- * `<branch>(null)`; a present branch recurses through
+ * fixed order some→every→none→is→isNot. A present branch recurses through
  * {@link fingerprintRelFilter} so the FULL inner shape is captured (two
- * different sub-wheres must never collide on one cached SQL text).
+ * different sub-wheres must never collide on one cached SQL text). `is: null`
+ * and `isNot: null` tokenize as `<branch>(null)`; the where walk refuses any
+ * other non-object value before this runs.
  */
 export function fingerprintRelationParts(
   qi: BuilderCtx,
@@ -389,23 +392,13 @@ export function fingerprintRelationParts(
 ): string[] {
   const relParts: string[] = [];
   if (filterObj.some !== undefined)
-    relParts.push(
-      filterObj.some === null
-        ? 'some(null)'
-        : `some(${fingerprintRelFilter(qi, relDef.to, filterObj.some as Record<string, unknown>, depth + 1)})`,
-    );
+    relParts.push(`some(${fingerprintRelFilter(qi, relDef.to, filterObj.some as Record<string, unknown>, depth + 1)})`);
   if (filterObj.every !== undefined)
     relParts.push(
-      filterObj.every === null
-        ? 'every(null)'
-        : `every(${fingerprintRelFilter(qi, relDef.to, filterObj.every as Record<string, unknown>, depth + 1)})`,
+      `every(${fingerprintRelFilter(qi, relDef.to, filterObj.every as Record<string, unknown>, depth + 1)})`,
     );
   if (filterObj.none !== undefined)
-    relParts.push(
-      filterObj.none === null
-        ? 'none(null)'
-        : `none(${fingerprintRelFilter(qi, relDef.to, filterObj.none as Record<string, unknown>, depth + 1)})`,
-    );
+    relParts.push(`none(${fingerprintRelFilter(qi, relDef.to, filterObj.none as Record<string, unknown>, depth + 1)})`);
   if (filterObj.is !== undefined)
     relParts.push(
       filterObj.is === null
@@ -511,13 +504,19 @@ export function collectScalarParams(qi: BuilderCtx, key: string, value: unknown,
         pgType: getColumnPgType(qi, rawColumn),
       });
       return;
-    default:
+    default: {
       // 'equality' | 'jsonThrow' | 'arrayThrow': same strict validation as
       // the build path, so a cache hit can never silently bind a
       // misspelled-operator object.
-      assertBindableEqualityValue(qi, rawColumn, value, getColumnPgType(qi, rawColumn), qi.table);
+      const pgType = getColumnPgType(qi, rawColumn);
+      assertBindableEqualityValue(qi, rawColumn, value, pgType, qi.table);
+      if (isBareJsonDocument(qi, pgType, value)) {
+        jsonDocumentEquals(qi, '', rawColumn, value, collectOnly(params));
+        return;
+      }
       params.push(coerceWhereOperand(qi, qi.tableMeta, rawColumn, value));
       return;
+    }
   }
 }
 
@@ -539,15 +538,15 @@ export function collectRelationFilterParams(
   depth = 0,
 ): void {
   const target = relDef.to;
-  if (filterObj.some !== undefined && filterObj.some !== null) {
+  if (filterObj.some !== undefined) {
     collectRelFilterParams(qi, target, filterObj.some as Record<string, unknown>, params, depth + 1);
     collectTargetGlobalFilterExists(qi, target, params);
   }
-  if (filterObj.none !== undefined && filterObj.none !== null) {
+  if (filterObj.none !== undefined) {
     collectRelFilterParams(qi, target, filterObj.none as Record<string, unknown>, params, depth + 1);
     collectTargetGlobalFilterExists(qi, target, params);
   }
-  if (filterObj.every !== undefined && filterObj.every !== null) {
+  if (filterObj.every !== undefined) {
     // gf is only emitted (build) when the `every` sub-where compiles to a
     // filter, otherwise `every` is trivially true and no subquery is built.
     if (
@@ -957,16 +956,26 @@ export function globalFilterCacheSegment(qi: BuilderCtx): string {
 }
 
 /**
- * True when the USER-supplied `where` compiles to no predicate (`{}`,
- * `{ id: undefined }`, `{ OR: [{ a: undefined }] }`, …). This is the exact
- * signal the empty-`where` guard needs, the compiled emptiness, NOT the
- * fingerprint (which is non-empty for an all-undefined `OR`/`AND`). It ignores
- * any configured global filter, so a global filter never lets an unguarded
- * mass mutation through.
+ * True when the USER-supplied `where` narrows no row: it compiles to no
+ * predicate (`{}`, `{ id: undefined }`, `{ OR: [{ a: undefined }] }`, …), or
+ * to one that is TRUE for every row (`{ NOT: { OR: [] } }`,
+ * `{ id: { notIn: [] } }`, see {@link foldWhere}). Either way a mutation
+ * guarded by it would write every row. It reads the compiled emptiness, NOT
+ * the fingerprint (which is non-empty for an all-undefined `OR`/`AND`), and it
+ * ignores any configured global filter, so a global filter never lets an
+ * unguarded mass mutation through.
  */
 export function userPredicateIsEmpty(qi: BuilderCtx, userWhere: Record<string, unknown>): boolean {
   const throwaway: unknown[] = [];
-  return buildWhereClause(qi, userWhere, throwaway) === null;
+  if (buildWhereClause(qi, userWhere, throwaway) === null) return true;
+  return foldWhere(qi.whereHost, userWhere, (table) => tableWhereHost(qi, table)) === 'true';
+}
+
+/** The where host of `table` in this client's schema, or `undefined` when the schema has no such table. */
+function tableWhereHost(qi: BuilderCtx, table: string): WhereHost | undefined {
+  const meta = ownLookup(qi.schema.tables, table);
+  if (!meta) return undefined;
+  return meta.name === qi.tableMeta.name ? qi.whereHost : scopedWhereHost(qi, meta);
 }
 
 export function assertMutationHasPredicate(
@@ -981,10 +990,20 @@ export function assertMutationHasPredicate(
 ): void {
   if (whereSql.length > 0) return;
   if (allowFullTableScan === true) return;
-  throw new ValidationError(
-    `${operation} on "${qi.table}" refused: the \`where\` clause is empty. ` +
-      "Pass `allowFullTableScan: UNSAFE` to opt in (import { UNSAFE } from 'turbine-orm'), " +
-      'or check that your filter values are defined.',
+  throw new ValidationError(emptyMutationWhereMessage(operation, qi.table));
+}
+
+/**
+ * The mass-mutation refusal, one text for every engine. "Empty" covers a where
+ * that is always true (see {@link userPredicateIsEmpty}), which writes every
+ * row just the same.
+ */
+export function emptyMutationWhereMessage(operation: string, table: string): string {
+  return (
+    `${operation} on "${table}" refused: the \`where\` clause is empty or always true ` +
+    '(for example `NOT: { OR: [] }` or `{ id: { notIn: [] } }`), so it would apply to every row. ' +
+    "Pass `allowFullTableScan: UNSAFE` to opt in (import { UNSAFE } from 'turbine-orm'), " +
+    'or check that your filter values are defined and your lists are not empty.'
   );
 }
 
@@ -1109,15 +1128,41 @@ export function buildScalarClause(
         }),
       );
       return;
-    default:
+    default: {
       // 'equality': a plain object literal that matched no known filter shape
       // is almost always a misspelled operator (`startWith` for `startsWith`);
       // the guard also runs on the cache-hit param-collect path.
-      assertBindableEqualityValue(qi, rawColumn, value, getColumnPgType(qi, rawColumn), qi.table);
+      const pgType = getColumnPgType(qi, rawColumn);
+      assertBindableEqualityValue(qi, rawColumn, value, pgType, qi.table);
+      if (isBareJsonDocument(qi, pgType, value)) {
+        andClauses.push(jsonDocumentEquals(qi, column, rawColumn, value, bindInto(qi, params)));
+        return;
+      }
       params.push(coerceWhereOperand(qi, qi.tableMeta, rawColumn, value));
       andClauses.push(`${column} = ${qi.p(params.length)}`);
       return;
+    }
   }
+}
+
+/**
+ * A bare object on a JSON column is a whole-document equality, the same thing
+ * `equals` is. PostgreSQL's `jsonb = $1` already reads it so. MySQL compared
+ * the column with the bound TEXT, which matched no row (and its `NOT` every
+ * row), so there it compiles to the typed comparison `equals` uses. Decided
+ * from the dialect, the column and the value's shape, all of which the cache
+ * key already carries (a bare object fingerprints as `obj(...)`).
+ */
+function isBareJsonDocument(qi: BuilderCtx, pgType: string, value: unknown): boolean {
+  return qi.dialect.name === 'mysql' && isPlainRecord(value) && operandColumnKind(pgType) === 'json';
+}
+
+/** A bind callback for the build passes: pushes the value and returns its placeholder. */
+function bindInto(qi: BuilderCtx, params: unknown[]): (value: unknown) => string {
+  return (value) => {
+    params.push(value);
+    return qi.p(params.length);
+  };
 }
 
 /**
@@ -1377,7 +1422,12 @@ export function buildScopedScalarClause(
     return;
   }
 
-  assertBindableEqualityValue(qi, col, value, pgTypeForColumn(qi, meta, col), scope.table);
+  const pgType = pgTypeForColumn(qi, meta, col);
+  assertBindableEqualityValue(qi, col, value, pgType, scope.table);
+  if (isBareJsonDocument(qi, pgType, value)) {
+    clauses.push(jsonDocumentEquals(qi, qCol, col, value, bindInto(qi, params)));
+    return;
+  }
   params.push(coerceWhereOperand(qi, meta, col, value));
   clauses.push(`${qCol} = ${qi.p(params.length)}`);
 }
@@ -1460,7 +1510,12 @@ export function collectScopedScalarParams(
     return;
   }
 
-  assertBindableEqualityValue(qi, col, value, pgTypeForColumn(qi, meta, col), scope.table);
+  const pgType = pgTypeForColumn(qi, meta, col);
+  assertBindableEqualityValue(qi, col, value, pgType, scope.table);
+  if (isBareJsonDocument(qi, pgType, value)) {
+    jsonDocumentEquals(qi, '', col, value, collectOnly(params));
+    return;
+  }
   params.push(coerceWhereOperand(qi, meta, col, value));
 }
 
@@ -1637,10 +1692,9 @@ export function buildRelationFilter(
   };
 
   // "some": EXISTS (SELECT 1 FROM target WHERE correlation AND filter AND gf)
-  // A `null` branch is skipped (never reaches buildSubWhereForRelation, which
-  // would throw on Object.keys(null)), matching collectRelationFilterParams,
-  // which also skips null. Unreachable via normalization today, guarded anyway.
-  if (filterObj.some !== undefined && filterObj.some !== null) {
+  // `some` / `none` / `every` hold a where object here: the where walk refuses
+  // any other value (relationFilterValueProblem), so none compiles to nothing.
+  if (filterObj.some !== undefined) {
     const subWhere = filterObj.some as Record<string, unknown>;
     const filterClause = buildSubWhereForRelation(qi, targetTable, qt, subWhere, params, depth + 1);
     const filterAnd = filterClause ? ` AND ${filterClause}` : '';
@@ -1648,7 +1702,7 @@ export function buildRelationFilter(
   }
 
   // "none": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND filter AND gf)
-  if (filterObj.none !== undefined && filterObj.none !== null) {
+  if (filterObj.none !== undefined) {
     const subWhere = filterObj.none as Record<string, unknown>;
     const filterClause = buildSubWhereForRelation(qi, targetTable, qt, subWhere, params, depth + 1);
     const filterAnd = filterClause ? ` AND ${filterClause}` : '';
@@ -1656,7 +1710,7 @@ export function buildRelationFilter(
   }
 
   // "every": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND gf AND NOT (filter))
-  if (filterObj.every !== undefined && filterObj.every !== null) {
+  if (filterObj.every !== undefined) {
     const subWhere = filterObj.every as Record<string, unknown>;
     const filterClause = buildSubWhereForRelation(qi, targetTable, qt, subWhere, params, depth + 1);
     if (filterClause) {
@@ -1740,14 +1794,22 @@ export function pgTypeForColumn(_qi: BuilderCtx, meta: TableMetadata, column: st
  */
 export function coerceWhereOperand(qi: BuilderCtx, meta: TableMetadata, column: string, value: unknown): unknown {
   if (!(value instanceof Date) && !Array.isArray(value)) return value;
-  return coerceTemporalValue(
-    pgTypeForColumn(qi, meta, column),
-    value,
-    // Same PostgreSQL + `utcTimestamps` gate as the write path (see
-    // `utcDateTimeWrites` in writes.ts): only the read/write-symmetric engine
-    // gets the zone-less rewrite. Time-of-day always rewrites.
-    qi.dialect.name === 'postgresql' && qi.utcTimestamps !== false,
-  );
+  const dbType = pgTypeForColumn(qi, meta, column);
+  return coerceTemporalValue(dbType, value, utcDateTimeRewrite(qi, dbType));
+}
+
+/**
+ * Whether a `Date` bound against `dbType` gets the zone-less UTC rewrite (the
+ * write path's gate). A `date` column takes the UTC date part on every SQL
+ * engine: the write path stores `YYYY-MM-DD` there, and a full timestamp
+ * compared with that text matches nothing. A zone-less `timestamp` is
+ * rewritten on PostgreSQL only, because MySQL reads a zone-less literal in the
+ * session time zone. `utcTimestamps: false` turns both off. Time-of-day
+ * columns always rewrite.
+ */
+export function utcDateTimeRewrite(qi: BuilderCtx, dbType: string | undefined): boolean {
+  if (qi.utcTimestamps === false) return false;
+  return qi.dialect.name === 'postgresql' || localDateTimeKind(dbType) === 'date';
 }
 
 /**
@@ -2084,10 +2146,7 @@ export function requireFullTextSearch(qi: BuilderCtx): void {
  */
 export function requireJsonContains(qi: BuilderCtx, clause: 'contains' | 'equals'): void {
   if (qi.dialect.supportsJsonContains) return;
-  const what =
-    clause === 'equals'
-      ? 'whole-document JSON comparison, which a pathless `equals` is'
-      : "JSON containment, PostgreSQL's `@>`";
+  const what = clause === 'equals' ? 'way to compare two whole JSON documents' : "JSON containment (PostgreSQL's `@>`)";
   throw new UnsupportedFeatureError(
     clause === 'equals'
       ? 'JSON document equality (`equals` without `path`)'
@@ -2201,13 +2260,7 @@ export function normalizeRelationFilter(
   relDef: RelationDef,
   filterObj: Record<string, unknown>,
 ): Record<string, unknown> {
-  if (
-    (relDef.type === 'belongsTo' || relDef.type === 'hasOne') &&
-    !RELATION_FILTER_WRAPPERS.some((wrapper) => wrapper in filterObj)
-  ) {
-    return { is: filterObj };
-  }
-  return filterObj;
+  return normalizeToOneRelationFilter(relDef, filterObj);
 }
 
 /**
@@ -2545,8 +2598,8 @@ function jsonPathEqualsInput(
  * collect pass the returned SQL is discarded). PostgreSQL compares jsonb, which
  * ignores object key order and whitespace; the cast makes a `json` column
  * comparable too (it has no `=` operator). MySQL compares through its typed
- * hook; an engine without one refuses (E017), SQLite with its containment
- * message.
+ * hook; an engine without one refuses (E017) through
+ * {@link requireJsonContains}.
  */
 function jsonDocumentEquals(
   qi: BuilderCtx,

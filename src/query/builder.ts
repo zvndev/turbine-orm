@@ -58,7 +58,7 @@ import {
 } from './compound-unique.js';
 import { resolveExcludedFromCreate } from './expr.js';
 import {
-  assertEqualityOperand,
+  cursorFieldValue,
   dedupeColumnList,
   dedupeOrderEntries,
   isEmptyOrderBy,
@@ -70,7 +70,14 @@ import {
   orderByEntries,
   sortedEntries,
 } from './filters.js';
-import { assertWhereNotEmptiedByPruning, isCursorInclusive, pruneUndefinedArgs } from './normalize-args.js';
+import {
+  assertCursorNotEmptied,
+  assertCursorWritten,
+  assertWhereNotEmptiedByPruning,
+  hasCursor,
+  isCursorInclusive,
+  pruneUndefinedArgs,
+} from './normalize-args.js';
 import { warnUnknownQueryOptions } from './option-surface.js';
 import { applyStableRelationOrderTo, normalizeWithClause, normalizeWithPagination } from './relation-names.js';
 import * as relationsMod from './relations.js';
@@ -616,9 +623,19 @@ export function unlockNestedWriteTx<X extends { table(name: string): Record<stri
  * Marks `findMany` args built for a `findFirst`: one row, not a page, so
  * {@link QueryInterface.completePageOrder} leaves its order as written. A
  * symbol, so it survives the spreads at the args seam and no JSON body can
- * set it.
+ * set it. Set through {@link firstRowOnly} only.
  */
 const FIRST_ROW_ONLY: unique symbol = Symbol('turbine.firstRowOnly');
+
+/**
+ * The {@link FIRST_ROW_ONLY} mark for a read the caller bounded with neither
+ * `limit` nor `offset`. An `offset` makes the row depend on which tied rows it
+ * skipped, so `findFirst({ orderBy, offset })` is a page of one and gets the
+ * page tiebreaker like any other page.
+ */
+function firstRowOnly(args: { limit?: unknown; offset?: unknown } | undefined): { [FIRST_ROW_ONLY]?: true } {
+  return args?.limit === undefined && args?.offset === undefined ? { [FIRST_ROW_ONLY]: true } : {};
+}
 
 /** The largest delay `setTimeout` honours; Node fires anything larger after 1 ms. */
 const MAX_TIMEOUT_MS = 2_147_483_647;
@@ -662,13 +679,6 @@ function isFastPathScalar(value: unknown): boolean {
     default:
       return false;
   }
-}
-
-/** `{ equals: v }` and nothing else. */
-function isEqualsWrapper(value: unknown): value is { equals: unknown } {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
-  const keys = Object.keys(value);
-  return keys.length === 1 && keys[0] === 'equals' && Object.getPrototypeOf(value) === Object.prototype;
 }
 
 /** Resolves a race when a deadline passes first. */
@@ -1466,26 +1476,10 @@ export class QueryInterface<
     const pruned = pruneUndefinedArgs(this.schema, this.table, args);
     if (pruned !== args) {
       if (refuseEmptiedWhere) assertWhereNotEmptiedByPruning(this.table, refuseEmptiedWhere, args, pruned);
-      this.assertCursorNotEmptied(args, pruned);
+      assertCursorNotEmptied(this.table, args, pruned);
     }
     if (pruned) this.assertQueryOptions(pruned);
     return normalizePagination(this.withRelationPagination(this.withDeclaredRelationNames(pruned)));
-  }
-
-  /**
-   * Refuse a `cursor` whose every field was `undefined`. Read as absent it
-   * would restart the walk at the first page, so a pager whose last-row value
-   * went missing would re-read page one forever. `cursor: {}` as written still
-   * means no cursor.
-   */
-  private assertCursorNotEmptied(original: object | undefined, pruned: object | undefined): void {
-    const before = (original as { cursor?: unknown } | undefined)?.cursor;
-    if (!before || typeof before !== 'object' || Object.keys(before).length === 0) return;
-    if (this.cursorFields((pruned as { cursor?: unknown } | undefined)?.cursor).length > 0) return;
-    throw new ValidationError(
-      `findMany on "${this.table}" refused: every field of \`cursor\` was undefined, so the page would ` +
-        "restart at the first row. Pass the last row's values, or leave `cursor` out for the first page.",
-    );
   }
 
   /**
@@ -1573,19 +1567,6 @@ export class QueryInterface<
     return fields.length === 1 ? { [fields[0]!]: 'asc' } : fields.map((f) => ({ [f]: 'asc' as const }));
   }
 
-  /**
-   * The field names a `cursor` carries (its own keys with a defined value), in
-   * canonical sorted order. Empty for a missing cursor or one whose every value
-   * was `undefined` (pruned at the args seam, so it does not paginate).
-   */
-  private cursorFields(cursor: unknown): string[] {
-    if (!cursor || typeof cursor !== 'object') return [];
-    return Object.entries(cursor as Record<string, unknown>)
-      .filter(([, v]) => v !== undefined)
-      .map(([k]) => k)
-      .sort();
-  }
-
   /** Memo for {@link totalOrderKeys}; table metadata is immutable. */
   private totalOrderKeysMemo: string[][] | undefined;
 
@@ -1623,15 +1604,22 @@ export class QueryInterface<
    * or repeating one), and the first page of a cursor walk uses the order its
    * cursor pages use. Returns `args` itself when the order is already total,
    * the query is not paginated, or it pages by `cursor` or `distinct`, which
-   * order themselves. A `findFirst` is not a page and is left alone.
+   * order themselves. A `findFirst` with no `offset` is one row, not a page,
+   * and is left alone.
+   *
+   * An order containing a vector distance gets no tiebreaker: a KNN index
+   * serves only `ORDER BY <distance> LIMIT k`, a compound order turns that
+   * into a scan and sort of the whole table, and two equal distances are
+   * rare. A `cursor` still refuses such an order (see {@link planCursor}).
    */
   private completePageOrder<
     A extends { orderBy?: unknown; limit?: unknown; offset?: unknown; cursor?: unknown; distinct?: unknown[] },
   >(args: A): A {
     if (args.orderBy === undefined || (args.limit === undefined && args.offset === undefined)) return args;
-    if (args.cursor !== undefined || (args.distinct && args.distinct.length > 0)) return args;
+    if (hasCursor(args.cursor) || (args.distinct && args.distinct.length > 0)) return args;
     if ((args as { [FIRST_ROW_ONLY]?: true })[FIRST_ROW_ONLY]) return args;
     const entries = orderByEntries(args.orderBy).filter(([, d]) => d !== undefined);
+    if (entries.some(([, d]) => isVectorOrderBy(d))) return args;
     const ordered = new Set<string>();
     let lastDesc = false;
     for (const [key, dir] of entries) {
@@ -1684,27 +1672,25 @@ export class QueryInterface<
     args: A,
   ): { args: A; plan: CursorPlan | undefined } {
     const raw = args.cursor;
-    if (!raw || typeof raw !== 'object') return { args, plan: undefined };
+    if (!hasCursor(raw)) return { args, plan: undefined };
     const meta = this.tableMeta;
     const field = (column: string): string => meta.reverseColumnMap[column] ?? column;
     const nullableColumn = (column: string): boolean =>
       !meta.primaryKey.includes(column) && meta.columns.find((c) => c.name === column)?.nullable === true;
 
     // The cursor's own values, by resolved column (either spelling, or a
-    // compound-unique selector, is accepted).
+    // compound-unique selector, is accepted). Each is a row's value, checked
+    // by the rule every engine shares (cursorFieldValue).
     const flat = expandCompoundUniqueWhere(meta, raw as Record<string, unknown>);
     const cursorValues = new Map<string, unknown>();
     for (const [key, written] of sortedEntries(flat)) {
       if (written === undefined) continue;
       const column = this.toColumn(key);
-      // A cursor value is a row's value, so it takes the bare-equality rule
-      // (`{ equals: v }` is accepted as the same thing): an operator object,
-      // array or column reference would otherwise be bound as JSON text.
-      const value = isEqualsWrapper(written) ? written.equals : written;
-      assertEqualityOperand(value, {
+      const value = cursorFieldValue(key, written, {
         column,
         table: this.table,
         kind: operandColumnKind(this.getColumnPgType(column)),
+        nullable: nullableColumn(column),
       });
       cursorValues.set(column, value);
     }
@@ -1922,7 +1908,7 @@ export class QueryInterface<
   }): boolean {
     if (!args) return false;
     if (args.distinct !== undefined) return false;
-    if (this.cursorFields(args.cursor).length > 0) return false;
+    if (hasCursor(args.cursor)) return false;
     if (!isEmptyOrderBy(args.orderBy)) return false;
     return args.limit !== undefined || args.offset !== undefined;
   }
@@ -3943,7 +3929,7 @@ export class QueryInterface<
     if (perCall === false) return;
     if (perCall === undefined && !this.warnOnUnlimited) return;
     if (this.defaultLimit !== undefined) return;
-    const hasExplicitLimit = args?.limit !== undefined || args?.cursor !== undefined;
+    const hasExplicitLimit = args?.limit !== undefined || hasCursor(args?.cursor);
     if (hasExplicitLimit) return;
     if (this.whereMatchesAtMostOneRow((args as { where?: unknown } | undefined)?.where)) return;
     if (this.warnedTables.has(this.table)) return;
@@ -4078,6 +4064,9 @@ export class QueryInterface<
     // `implicitPkOrdering` is enabled (see implicitPkOrderBy).
     const implicitOrder = this.implicitPkOrderBy(args);
     if (implicitOrder) args = { ...args, orderBy: implicitOrder as NonNullable<typeof args>['orderBy'] };
+    // A `cursor` that names no row (`null`, `{}`) is refused before either
+    // reader below asks whether there is one.
+    assertCursorWritten(this.table, 'findMany', args?.cursor);
     // A page whose order can tie gets the cursor tiebreaker (completePageOrder),
     // before fingerprinting, so the cache key carries it.
     if (args) args = this.completePageOrder(args as NonNullable<typeof args>);
@@ -4085,7 +4074,7 @@ export class QueryInterface<
     // order) BEFORE fingerprinting, so the key, the SQL and the param collect
     // all read one plan. See planCursor.
     let cursorPlan: CursorPlan | undefined;
-    if (args?.cursor !== undefined) ({ args, plan: cursorPlan } = this.planCursor(args));
+    if (hasCursor(args?.cursor)) ({ args, plan: cursorPlan } = this.planCursor(args as NonNullable<typeof args>));
     // `distinct` compiles to `SELECT DISTINCT ON (...)`, which is PostgreSQL
     // syntax and nothing else's. Every other engine parsed it as far as the
     // word `ON` and answered with a RAW driver error carrying no TURBINE_ code
@@ -4561,7 +4550,7 @@ export class QueryInterface<
         ...args,
         limit: bound !== undefined && bound <= batchSize ? bound : batchSize + 1,
         // Only the caller's own bound makes this a page (completePageOrder).
-        ...(args?.limit === undefined ? { [FIRST_ROW_ONLY]: true } : {}),
+        ...firstRowOnly(args),
       } as FindManyArgs<
         T,
         R,
@@ -4745,7 +4734,7 @@ export class QueryInterface<
           const rows = await this.runFindManyBatched({
             ...args,
             limit: 1,
-            [FIRST_ROW_ONLY]: true,
+            ...firstRowOnly(args),
           } as unknown as FindManyArgs<T>);
           return (rows[0] ?? null) as QueryResult<T, R, W, S, O> | null;
         }
@@ -4754,7 +4743,7 @@ export class QueryInterface<
           const split = this.planAuto(args.with as WithClause, args.stableRelationOrder, false, 1);
           if (split) {
             const rows = (await this.runAutoSplit(
-              { ...args, limit: 1, [FIRST_ROW_ONLY]: true } as unknown as FindManyArgs<T>,
+              { ...args, limit: 1, ...firstRowOnly(args) } as unknown as FindManyArgs<T>,
               split,
               false,
             )) as Record<string, unknown>[];
@@ -4797,7 +4786,7 @@ export class QueryInterface<
   ): DeferredQuery<QueryResult<T, R, W, S, O> | null> {
     args = this.normalizeArgs(args, operation);
     // Reuse findMany's SQL builder but force LIMIT 1
-    const findManyArgs = { ...args, limit: 1, [FIRST_ROW_ONLY]: true } as FindManyArgs<T, R, W, S, O>;
+    const findManyArgs = { ...args, limit: 1, ...firstRowOnly(args) } as FindManyArgs<T, R, W, S, O>;
     const deferred = this.buildFindMany<W, S, O>(findManyArgs);
 
     return {

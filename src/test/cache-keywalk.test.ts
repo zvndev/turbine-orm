@@ -365,31 +365,23 @@ describe('key-walk: distinct shapes do NOT collide on one fingerprint', () => {
   });
 });
 
-describe('I-4: null relation-filter branch is skipped symmetrically (build == collect)', () => {
-  // `{ some: null }` is unreachable via normalization today, but a raw null
-  // branch must be SKIPPED on the build path (buildRelationFilter) exactly as
-  // the collect path (collectRelationFilterParams) already skips it, never
-  // reaching buildSubWhereForRelation, which would throw on Object.keys(null).
-  it('where: { posts: { some: null } } compiles without throwing on the build path', () => {
-    assert.doesNotThrow(() => fresh({ where: { posts: { some: null } } }));
+describe('I-4: a null relation-filter quantifier is refused on the build and collect paths alike', () => {
+  // `{ some: null }` used to compile to no condition (every row matched). The
+  // shared where walk now refuses it before either path runs, so a warmed
+  // cache can never serve it either.
+  it('where: { posts: { some: null } } is E003 on a fresh build', () => {
+    assert.throws(() => fresh({ where: { posts: { some: null } } }), /`some` takes a where object, got null/);
   });
 
-  it('build and collect (cache-hit) paths agree: no clause, no params, neither throws', () => {
-    let hot!: { sql: string; params: unknown[] };
-    // warmThenHit runs the collect path on the HIT under the live dev cross-check.
-    assert.doesNotThrow(() => {
-      hot = warmThenHit({ where: { posts: { some: null } } }, { where: { posts: { some: null } } });
-    });
-    const cold = fresh({ where: { posts: { some: null } } });
-    assert.equal(hot.sql, cold.sql, 'cache-hit SQL must equal a fresh build');
-    assert.deepEqual(hot.params, cold.params, 'cache-hit params must equal a fresh build');
-    // A null branch emits no EXISTS subquery and binds no params on either path.
-    assert.equal(hot.params.length, 0);
-    assert.ok(!hot.sql.includes('EXISTS'));
+  it('is E003 on the cache-hit path too (a warmed entry never serves it)', () => {
+    assert.throws(
+      () => warmThenHit({ where: { posts: { some: {} } } }, { where: { posts: { some: null } } }),
+      /`some` takes a where object, got null/,
+    );
   });
 
-  it('none and every null branches are likewise skipped without throwing', () => {
-    assert.doesNotThrow(() => fresh({ where: { posts: { none: null } } }));
-    assert.doesNotThrow(() => fresh({ where: { posts: { every: null } } }));
+  it('none and every null branches are likewise refused', () => {
+    assert.throws(() => fresh({ where: { posts: { none: null } } }), /`none` takes a where object, got null/);
+    assert.throws(() => fresh({ where: { posts: { every: null } } }), /`every` takes a where object, got null/);
   });
 });

@@ -1358,11 +1358,19 @@ function translateCursor(
   if (take !== undefined) t.limit = mapTake(take);
   if (skip !== undefined) t.offset = skip;
   if (cursor === undefined) return;
+  // A cursor that is not an object (`null`) reaches core as written, which
+  // refuses it: read as "no cursor" it would return the first page.
+  if (!isPlainRecord(cursor)) {
+    t.cursor = cursor;
+    return;
+  }
 
   // Translate cursor field names (and expand a compound-unique selector cursor).
+  // An `undefined` value is carried through rather than dropped, so a cursor
+  // whose every value was `undefined` reaches core's args seam as one and is
+  // refused there (E003), instead of becoming `{}` and paging from the start.
   const tcursor: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(cursor)) {
-    if (val === undefined) continue;
     const compound = ownLookup(mm.compoundUniques, key);
     if (compound && isPlainRecord(val)) {
       for (const [pk, pv] of Object.entries(val)) setOwn(tcursor, renameField(mm, pk), pv);

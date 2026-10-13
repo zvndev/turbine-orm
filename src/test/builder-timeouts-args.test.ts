@@ -378,14 +378,15 @@ describe('cursor values', () => {
     assert.deepEqual(rowWrapped.params, rowBare.params);
   });
 
-  it('a cursor emptied by undefined values is refused; cursor: {} still means none', () => {
+  it('a cursor emptied by undefined values is refused, and so is cursor: {}', () => {
     assert.throws(
       () => users().buildFindMany({ orderBy: { id: 'asc' }, limit: 5, cursor: { id: undefined } }),
       (err: unknown) => isE003(err) && /every field of `cursor` was undefined/.test(String(err)),
     );
-    const none = users().buildFindMany({ orderBy: { id: 'asc' }, limit: 5, cursor: {} });
-    const plain = users().buildFindMany({ orderBy: { id: 'asc' }, limit: 5 });
-    assert.equal(none.sql, plain.sql);
+    assert.throws(
+      () => users().buildFindMany({ orderBy: { id: 'asc' }, limit: 5, cursor: {} }),
+      (err: unknown) => isE003(err) && /`cursor: \{\}` names no row/.test(String(err)),
+    );
   });
 });
 

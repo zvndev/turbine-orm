@@ -193,6 +193,48 @@ function assertRelationFilterKeys(table: string, key: string, rel: RelationDef, 
   }
 }
 
+/**
+ * Why a relation-filter key's value cannot be read, or `null` when it can.
+ * `some` / `none` / `every` take a where object; `is` / `isNot` take a where
+ * object or `null`. Any other value (`null` on a quantifier, a scalar, an
+ * array) used to compile to no condition at all, so a filter, or a tenant
+ * global filter, built from a missing value matched every row. Shared with the
+ * PowDB engine so both refuse the same values in the same words.
+ */
+export function relationFilterValueProblem(wrapper: string, value: unknown): string | null {
+  if (value === undefined || isPlainRecord(value)) return null;
+  const toOne = wrapper === 'is' || wrapper === 'isNot';
+  if (toOne && value === null) return null;
+  return (
+    `\`${wrapper}\` takes a where object${toOne ? ' or null' : ''}, got ${describeOperand(value)}` +
+    (value === null ? '; `some: {}` matches rows with a related row, `none: {}` rows with none' : '')
+  );
+}
+
+/** Throws unless every relation-filter key holds a value the compiler reads (see {@link relationFilterValueProblem}). */
+function assertRelationFilterValues(table: string, key: string, rel: RelationDef, filterObj: WhereRecord): void {
+  for (const wrapper of RELATION_FILTER_WRAPPERS) {
+    const problem = relationFilterValueProblem(wrapper, filterObj[wrapper]);
+    if (problem !== null) throw relationFilterShapeError(table, key, rel, problem);
+  }
+}
+
+/**
+ * A bare where object on a to-one relation is an implicit `is`
+ * (`{ author: { name: 'x' } }` is `{ author: { is: { name: 'x' } } }`). To-many
+ * relations still require a quantifier. The one rule, used by the SQL engines'
+ * hosts and by PowDB.
+ */
+export function normalizeToOneRelationFilter(relDef: RelationDef, filterObj: WhereRecord): WhereRecord {
+  if (
+    (relDef.type === 'belongsTo' || relDef.type === 'hasOne') &&
+    !RELATION_FILTER_WRAPPERS.some((wrapper) => wrapper in filterObj)
+  ) {
+    return { is: filterObj };
+  }
+  return filterObj;
+}
+
 /** The where combinators. */
 export type CombinatorKey = 'AND' | 'OR' | 'NOT';
 
@@ -294,9 +336,10 @@ function matchNothingEvent(host: WhereHost): WhereEvent {
  * ({@link matchNothingEvent}). A `NOT` array negates each branch (`NOT a AND
  * NOT b`), as Prisma does; a `NOT` object negates the object as a whole. A key
  * that names a relation takes only the relation-filter keys (a to-one relation
- * also takes a bare where object, read as `is`), and any other key is refused
- * (E003). Only when the key also names a column, and its object names no
- * relation-filter key, is it that column's filter.
+ * also takes a bare where object, read as `is`), each holding a value the
+ * compiler reads ({@link relationFilterValueProblem}), and anything else is
+ * refused (E003). Only when the key also names a column, and its object names
+ * no relation-filter key, is it that column's filter.
  */
 export function walkWhere(host: WhereHost, where: WhereRecord): WhereEvent[] {
   const events: WhereEvent[] = [];
@@ -337,6 +380,7 @@ export function walkWhere(host: WhereHost, where: WhereRecord): WhereEvent[] {
       const filterObj = host.normalizeRelationFilter(resolvedRel.def, present);
       if (isRelationFilterObj(filterObj)) {
         assertRelationFilterKeys(host.tableMeta.name, key, resolvedRel.def, filterObj);
+        assertRelationFilterValues(host.tableMeta.name, key, resolvedRel.def, filterObj);
         events.push({ kind: 'relation', key: resolvedRel.name, relDef: resolvedRel.def, filterObj });
         continue;
       }
@@ -352,6 +396,176 @@ export function walkWhere(host: WhereHost, where: WhereRecord): WhereEvent[] {
     events.push({ kind: 'scalar', key, value });
   }
   return events;
+}
+
+/**
+ * What a where clause is for every row, read from the SQL it compiles to:
+ *
+ *   - `'empty'`: it compiles to no SQL (`{}`, `AND: []`, `NOT: {}`, `OR: [{}]`);
+ *   - `'true'` / `'false'`: a constant whatever the row holds, NULLs included
+ *     (`NOT: { OR: [] }` is TRUE, `OR: []` is FALSE);
+ *   - `'row'`: it depends on the row.
+ *
+ * The mass-mutation guard reads it: a where that is `'true'` writes every row
+ * exactly as an empty one does. It mirrors the compiler rather than ideal
+ * logic, branch for branch: a branch that compiles to nothing is dropped from
+ * an `OR` (so `OR: [{}, { id: 1 }]` is the row filter `id = 1`) and is not
+ * negated by `NOT`, as in the SQL. Only shapes whose SQL is a constant fold;
+ * anything else is `'row'`, so folding never refuses a filter that narrows.
+ * Constants come from three places only: an empty `in` list (FALSE), an empty
+ * `notIn` list (TRUE), and an `EXISTS` / `NOT EXISTS` over a sub-where that
+ * is itself constant.
+ *
+ * `hostFor` gives the host of a relation's target table, or `undefined` when
+ * the schema has no such table (the compiler emits nothing for it).
+ */
+export type WhereFold = 'empty' | 'true' | 'false' | 'row';
+
+export function foldWhere(
+  host: WhereHost,
+  where: WhereRecord,
+  hostFor: (table: string) => WhereHost | undefined,
+  depth = 0,
+): WhereFold {
+  assertWhereDepth(depth);
+  const parts: WhereFold[] = [];
+  for (const event of walkWhere(host, where)) {
+    switch (event.kind) {
+      case 'or':
+        parts.push(foldAny(event.conditions.map((cond) => foldWhere(host, cond, hostFor, depth + 1))));
+        break;
+      case 'and':
+        for (const cond of event.conditions) parts.push(foldWhere(host, cond, hostFor, depth + 1));
+        break;
+      case 'not':
+        parts.push(negateFold(foldWhere(host, event.condition, hostFor, depth + 1)));
+        break;
+      case 'relation':
+        parts.push(foldRelationFilter(event.relDef, event.filterObj, hostFor, depth + 1));
+        break;
+      case 'scalar':
+        parts.push(foldScalar(host, event.key, event.value));
+        break;
+    }
+  }
+  return foldAll(parts);
+}
+
+/** AND of folded parts; an `'empty'` part contributes no SQL and is skipped. */
+function foldAll(parts: readonly WhereFold[]): WhereFold {
+  let out: WhereFold = 'empty';
+  for (const part of parts) {
+    if (part === 'false') return 'false';
+    if (part === 'row') out = 'row';
+    else if (part === 'true' && out === 'empty') out = 'true';
+  }
+  return out;
+}
+
+/** OR of folded branches; a branch that compiles to nothing is dropped, as the compiler drops it. */
+function foldAny(parts: readonly WhereFold[]): WhereFold {
+  let out: WhereFold = 'empty';
+  for (const part of parts) {
+    if (part === 'true') return 'true';
+    if (part === 'row') out = 'row';
+    else if (part === 'false' && out === 'empty') out = 'false';
+  }
+  return out;
+}
+
+function negateFold(fold: WhereFold): WhereFold {
+  return fold === 'true' ? 'false' : fold === 'false' ? 'true' : fold;
+}
+
+/**
+ * A relation filter's branches, as the compiler emits them: `some` / `is` is
+ * EXISTS over the sub-where, `none` / `isNot` NOT EXISTS, and `every` NOT
+ * EXISTS over its negation (nothing at all when its sub-where is empty).
+ */
+function foldRelationFilter(
+  relDef: RelationDef,
+  filterObj: WhereRecord,
+  hostFor: (table: string) => WhereHost | undefined,
+  depth: number,
+): WhereFold {
+  const target = hostFor(relDef.to);
+  if (!target) return 'empty';
+  const sub = (wrapper: string): WhereFold => foldWhere(target, filterObj[wrapper] as WhereRecord, hostFor, depth);
+  const parts: WhereFold[] = [];
+  for (const wrapper of RELATION_FILTER_WRAPPERS) {
+    const value = filterObj[wrapper];
+    if (value === undefined) continue;
+    if (value === null) {
+      parts.push('row');
+      continue;
+    }
+    const inner = sub(wrapper);
+    if (wrapper === 'some' || wrapper === 'is') parts.push(inner === 'false' ? 'false' : 'row');
+    else if (wrapper === 'none' || wrapper === 'isNot') parts.push(inner === 'false' ? 'true' : 'row');
+    else parts.push(inner === 'empty' || inner === 'true' ? inner : 'row');
+  }
+  return foldAll(parts);
+}
+
+/** A column's filter folds only as an operator object holding an empty `in` / `notIn` list. */
+function foldScalar(host: WhereHost, key: string, value: unknown): WhereFold {
+  if (!isPlainRecord(value)) return 'row';
+  const column = resolveColumnName(host.tableMeta, key);
+  if (column === undefined || classifyScalarForSql(host, column, value).kind !== 'operator') return 'row';
+  return foldOperator(value, operandColumnKind(host.getColumnPgType(column)) === 'json', 0);
+}
+
+/**
+ * The operator object's clauses, ANDed: `in: []` is FALSE and `notIn: []` TRUE
+ * on every engine (an empty `= ANY` / `IN (subquery)` is false even for a NULL
+ * column), and a `not` operator object (non-JSON columns) negates its fold.
+ */
+function foldOperator(op: Record<string, unknown>, json: boolean, depth: number): WhereFold {
+  const parts: WhereFold[] = [];
+  for (const key of Object.keys(op)) {
+    const value = op[key];
+    if (value === undefined || key === 'mode') continue;
+    if ((key === 'in' || key === 'notIn') && Array.isArray(value) && value.length === 0) {
+      parts.push(key === 'in' ? 'false' : 'true');
+    } else if (key === 'not' && !json && depth < MAX_WHERE_DEPTH && isWhereOperator(value)) {
+      parts.push(negateFold(foldOperator(value as Record<string, unknown>, json, depth + 1)));
+    } else {
+      parts.push('row');
+    }
+  }
+  return foldAll(parts);
+}
+
+/**
+ * A {@link WhereHost} over plain table metadata, for callers with no SQL
+ * builder (PowDB, construction-time checks). Same column-type and to-one rules
+ * as the SQL engines' scoped hosts.
+ */
+export function metadataWhereHost(meta: TableMetadata): WhereHost {
+  return {
+    tableMeta: meta,
+    normalizeRelationFilter: normalizeToOneRelationFilter,
+    getColumnPgType: (column) => meta.dialectTypes?.[column] ?? meta.pgTypes?.[column] ?? 'text',
+    isJsonColumnType: (colType) => operandColumnKind(colType) === 'json',
+  };
+}
+
+/**
+ * {@link foldWhere} for `table` in `tables`, with plain metadata hosts. Also
+ * validates the whole clause shape at every depth (combinators, relation-filter
+ * keys and values), so a construction-time check can run it on a static filter.
+ */
+export function foldWhereFor(
+  tables: Readonly<Record<string, TableMetadata>>,
+  table: string,
+  where: WhereRecord,
+): WhereFold {
+  const hostFor = (name: string): WhereHost | undefined => {
+    const meta = Object.hasOwn(tables, name) ? tables[name] : undefined;
+    return meta ? metadataWhereHost(meta) : undefined;
+  };
+  const host = hostFor(table);
+  return host ? foldWhere(host, where, hostFor) : 'row';
 }
 
 /**

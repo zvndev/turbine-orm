@@ -469,6 +469,60 @@ export function assertWhereNotEmptiedByPruning(
 }
 
 /**
+ * THE "has a cursor" test: a plain object holding at least one defined value.
+ * The page-order completion and the cursor planner both ask it (on PowDB too),
+ * so a page cannot be a cursor page to one and not to the other. A `cursor`
+ * written in a shape that names no row never reaches it as "no cursor": see
+ * {@link assertCursorWritten} and {@link assertCursorNotEmptied}.
+ */
+export function hasCursor(cursor: unknown): boolean {
+  if (!isPlainRecord(cursor)) return false;
+  for (const key of Object.keys(cursor)) {
+    if (cursor[key] !== undefined) return true;
+  }
+  return false;
+}
+
+/**
+ * Refuse a `cursor` that is written but names no row: `null`, a value that is
+ * not an object, or `{}`. Read as "no cursor", such a page skipped both the
+ * cursor and the page tiebreaker, so a pager written as
+ * `cursor: last ? { id: last.id } : {}` cut its first page from a different
+ * order than every later page and skipped rows.
+ */
+export function assertCursorWritten(table: string, operation: string, cursor: unknown): void {
+  if (cursor === undefined) return;
+  if (!isPlainRecord(cursor)) {
+    throw new ValidationError(
+      `${operation} on "${table}" refused: \`cursor\` takes an object naming the row to page after ` +
+        `(for example \`cursor: { id: lastRow.id }\`), received ${cursor === null ? 'null' : Array.isArray(cursor) ? 'an array' : `a ${typeof cursor}`}. ` +
+        'Leave `cursor` out for the first page.',
+    );
+  }
+  if (hasNoKeys(cursor)) {
+    throw new ValidationError(
+      `${operation} on "${table}" refused: \`cursor: {}\` names no row. Leave \`cursor\` out for the first page, ` +
+        "or pass the last row's values (for example `cursor: { id: lastRow.id }`).",
+    );
+  }
+}
+
+/**
+ * Refuse a `cursor` whose every field was `undefined`. Read as absent it would
+ * restart the walk at the first page, so a pager whose last-row value went
+ * missing would re-read page one forever. Same rule and message on every engine.
+ */
+export function assertCursorNotEmptied(table: string, original: unknown, pruned: unknown): void {
+  const before = isPlainRecord(original) ? original.cursor : undefined;
+  if (!isPlainRecord(before) || hasNoKeys(before)) return;
+  if (hasCursor(isPlainRecord(pruned) ? pruned.cursor : undefined)) return;
+  throw new ValidationError(
+    `findMany on "${table}" refused: every field of \`cursor\` was undefined, so the page would ` +
+      "restart at the first row. Pass the last row's values, or leave `cursor` out for the first page.",
+  );
+}
+
+/**
  * Internal findMany flag: the page STARTS AT the cursor row instead of after
  * it. Prisma's cursor is inclusive (its `skip: 1` idiom drops the cursor row),
  * so `turbine-orm/prisma-compat` sets this; core's own `cursor` stays

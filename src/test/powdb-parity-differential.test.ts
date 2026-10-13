@@ -190,7 +190,8 @@ const CASES: Case[] = [
     run: users({}, { cursor: { id: undefined }, limit: 2 }),
     expect: E003,
   },
-  { id: 'cursor: {} means no cursor', run: users({}, { cursor: {}, limit: 2 }), expect: [1, 2] },
+  { id: 'cursor: {} names no row', run: users({}, { cursor: {}, limit: 2 }), expect: E003 },
+  { id: 'cursor: null names no row', run: users({}, { cursor: null, limit: 2 }), expect: E003 },
   {
     id: 'a valid cursor',
     run: users({}, { cursor: { id: 2 }, limit: 2 }),
