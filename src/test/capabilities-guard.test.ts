@@ -57,7 +57,7 @@ const EXPECTED: { [K in keyof EngineCapabilities]: readonly EngineCapabilities[K
   jsonExtractTyped: [false, true, false, false, false],
   jsonExactNumericCast: [true, false, false, false, false],
   numericTextComparison: [false, false, true, false, false],
-  enforcesForeignKeys: [true, false, true, true, true],
+  enforcesForeignKeys: [true, false, true, true, false],
   partitionLimitPushdown: [true, false, false, false, false],
   utcTimestampRewrite: [true, false, false, false, false],
   paramTypeCasts: [true, false, false, false, false],
@@ -79,7 +79,7 @@ const EXPECTED: { [K in keyof EngineCapabilities]: readonly EngineCapabilities[K
   connectionDriver: ['pg-compatible', 'engine-driver', 'engine-driver', 'engine-driver', 'none'],
   preparesEveryStatement: [false, false, true, false, false],
   statementSyntax: ['postgresql', 'sqlite', 'mysql', 'mssql', null],
-  inlineForeignKeys: [true, true, false, true, true],
+  inlineForeignKeys: [true, true, false, true, false],
   unboundedTextKeys: [true, true, false, false, true],
 };
 

@@ -156,7 +156,9 @@ export const powdbDialect: Dialect = {
     jsonExtractTyped: false,
     jsonExactNumericCast: false,
     numericTextComparison: false,
-    enforcesForeignKeys: true,
+    // PowDB has no foreign keys: declared relations are not enforced, and its
+    // own mass-mutation guard already folds with foreignKeys: false.
+    enforcesForeignKeys: false,
     partitionLimitPushdown: false,
     utcTimestampRewrite: false,
     paramTypeCasts: false,
@@ -178,7 +180,9 @@ export const powdbDialect: Dialect = {
     connectionDriver: 'none',
     preparesEveryStatement: false,
     statementSyntax: null,
-    inlineForeignKeys: true,
+    // No foreign keys to declare, inline or otherwise; PowQL DDL comes from
+    // powqlSchemaDDL, which never reads this.
+    inlineForeignKeys: false,
     unboundedTextKeys: true,
   } satisfies EngineCapabilities),
   // `resultStrategy` is decorative for PowDB, PowqlInterface owns its own write
