@@ -2179,7 +2179,15 @@ export class TurbineClient {
     const maxLifetimeSeconds = resolveNonNegativeInteger(config.maxLifetimeSeconds, 'maxLifetimeSeconds', 'seconds');
     // Keyed by table name, with every key checked against the schema: a
     // filter under a name that matches no table would never be applied.
-    const globalFilters = normalizeGlobalFilters(config.globalFilters, schema);
+    // A non-SQL backend (PowDB) injects its own query interface and checks
+    // its own filters; every SQL engine compiles each static filter here once,
+    // with this client's dialect, so a value the compiler refuses fails now.
+    const factory = (config as { queryInterfaceFactory?: unknown }).queryInterfaceFactory;
+    const globalFilters = normalizeGlobalFilters(
+      config.globalFilters,
+      schema,
+      factory === undefined ? { QueryInterface, dialect, utcTimestamps: config.utcTimestamps } : undefined,
+    );
     // Refuse a connection string that cannot address a database, before it
     // reaches pg's permissive parser and comes back one query later as a DNS
     // error about a fragment of itself. Only the strings this client will
