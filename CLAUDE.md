@@ -180,7 +180,18 @@ src/
                       protect. The honest cost: a genuinely fixed two-branch `OR` (a
                       search box over name and email) loses its name too, because the
                       builder sees one call and cannot know whether the length varies
-                      across calls.
+                      across calls. A second bound sits under all of this:
+                      `boundedPreparedName` (utils.ts) hands out at most
+                      `PREPARED_STATEMENT_BUDGET` (200) distinct names per PROCESS (a
+                      `Symbol.for` registry, so the ESM and CJS copies share it), and a
+                      statement past the budget is sent unnamed. The first shapes a process
+                      runs keep their names, which in practice are its hot ones; a
+                      server-side DEALLOCATE cannot do this job, because a pooled query does
+                      not know which connection it will run on. Behind a pooler,
+                      `preparedStatements` defaults to `false` (client.ts: a connection
+                      string, `host` or `port` that `detectPooler` recognizes, on a pool
+                      Turbine builds; an explicit `true` there warns), and
+                      `TURBINE_DISABLE_PREPARED=1` turns names off everywhere.
     deferred.ts    , DeferredQuery, QueryInterfaceOptions, middleware/event types.
                       `queryInterfaceFactory` returns a `TableClient` (see below).
     table-client.ts, The table-accessor contract every engine implements (0.90).
@@ -220,6 +231,22 @@ src/
                       bound method members. Each module's functions are `export function
                       f(qi: BuilderCtx, …)` and import each other directly; the class holds a
                       `private readonly ctx: BuilderCtx`.
+                      TIMEOUTS (0.90): a per-query `timeout` is a number of ms up to
+                      2^31-1, or `0` for NO timeout (the pre-0.90 meaning, and the same word
+                      `$transaction`'s `timeout` takes); `queryWithTimeout` maps 0 to no
+                      timer, which is load-bearing, since without it the cancellable path
+                      armed a 0 ms timer. Negative, NaN or a string is E003 (PowDB's twin
+                      check in powql.ts says the same). On PostgreSQL through a
+                      node-postgres pool outside a transaction (`cancelsOnTimeout`),
+                      `queryCancellable` runs the statement on its own checkout and, at the
+                      deadline, sends a protocol cancel (`sendCancelRequest`, utils.ts), then
+                      waits at most `CANCEL_GRACE_MS` (2 s): cancelled is `TimeoutError`
+                      `outcome: 'not-executed'`; a statement that finished first returns its
+                      result late, because reporting a committed write as a timeout invites
+                      a double apply; no answer is `'unknown'` and the connection is destroyed
+                      rather than pooled busy. Inside `$transaction` the cancel goes to the
+                      transaction's connection and the transaction is marked rolled back.
+                      Every other engine and pool answers `'unknown'`.
     where.ts        - The whole WHERE web: the top-level and table-scoped
                       build/collect/fingerprint trios, leaf JSON/array/vector/text-search
                       clause builders, operator-clause + column-reference compilation, and
@@ -718,7 +745,11 @@ src/
                       report success when PostgreSQL answers COMMIT with the `ROLLBACK` command
                       tag (an aborted transaction, no error), and `rolledBackError` builds the
                       error that carries the first failure as `cause`; a retryable first
-                      failure keeps its class so `$retry` still retries. A callback that returns
+                      failure keeps its class so `$retry` still retries (a `LockNotAvailableError`
+                      included, which used to collapse to `SerializationFailureError`); any
+                      other first failure is `TransactionRolledBackError` (E019), for the
+                      transaction and a rolled-back savepoint block alike, and the pipeline
+                      COMMIT-answered-with-ROLLBACK path goes through the same function. A callback that returns
                       with work still running rolls back (`unawaitedWorkError`, E003). Shared
                       by `$transaction`, nested blocks and raw `transaction()`.
 
@@ -1164,9 +1195,17 @@ src/
                       names.
 
   errors.ts        , Error hierarchy rooted at TurbineError. Each error has a code
-                      (TURBINE_E001-E018). wrapPgError() translates pg driver errors
+                      (TURBINE_E001-E019). wrapPgError() translates pg driver errors
                       (23505, 23503, 23502, 23514, 23P01, 40P01, 40001) into typed
-                      Turbine errors. UnsupportedFeatureError (E017) is thrown directly
+                      Turbine errors. 0.90: 42P05 and 26000 (a named prepared statement
+                      the server connection already holds, or never prepared, which is
+                      what a transaction-pooling endpoint produces) are `ConnectionError`
+                      (E004) carrying `sqlstate` and `PREPARED_STATEMENT_POOLER_HINT`
+                      (direct endpoint, `preparedStatements: false`, or PgBouncer 1.21+
+                      with `max_prepared_statements` above 0). `TimeoutError.outcome` is
+                      `'not-executed'` (never sent, or the server confirmed the cancel:
+                      safe to retry) or `'unknown'` (the default, the only answer never
+                      wrong); see the timeout note under builder.ts. UnsupportedFeatureError (E017) is thrown directly
                       (not via wrapPgError) when a non-Postgres engine hits a Postgres-only
                       feature. 0.65: every TurbineError carries `.docsUrl`
                       (`https://turbineorm.dev/errors#eNNN` via docsUrlForCode) and
@@ -1505,9 +1544,9 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 | Code | Class | When |
 |---|---|---|
 | E001 | `NotFoundError` | `findUniqueOrThrow`, `findFirstOrThrow`, missing row |
-| E002 | `TimeoutError` | Query or transaction exceeds timeout |
+| E002 | `TimeoutError` | Query or transaction exceeds timeout. Carries `outcome`: `'not-executed'` or `'unknown'` (0.90) |
 | E003 | `ValidationError` | Unknown column, invalid operator, empty where guard |
-| E004 | `ConnectionError` | Pool connection failure |
+| E004 | `ConnectionError` | Pool connection failure. Since 0.90 also pg 42P05 / 26000, a named prepared statement behind a transaction pooler, with the pooler advice |
 | E005 | `RelationError` | Unknown relation name in `with` clause |
 | E006 | `MigrationError` | Migration file parse error, checksum mismatch |
 | E007 | `CircularRelationError` | Nesting depth exceeds 10 |
@@ -1522,6 +1561,7 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 | E016 | `ExclusionConstraintError` | pg 23P01, via `wrapPgError()` |
 | E017 | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) invoked on an engine whose capability flag reports it unsupported, thrown directly, not via `wrapPgError()` |
 | E018 | `ReadOnlyError` | A write refused because the database is read-only, `reason: 'snapshot'` (PowDB snapshot serving / client-level `readonly: true` fail-fast) or `'rbac'` (read-only role). Thrown locally by the PowDB readonly guard and via `wrapPowdbError()` message families |
+| E019 | `TransactionRolledBackError` | A transaction PostgreSQL rolled back instead of committing (the callback caught a failed statement, or a per-query timeout cancelled one); the first failure is `cause`. Deadlock, serialization and lock-not-available first failures keep their own class. Built by `rolledBackError` in transaction-state.ts, not via `wrapPgError()` |
 
 `wrapPgError(err)` inspects the pg driver error's `.code` field and wraps it in the appropriate typed error, preserving the original as `.cause`. It is called in `client.ts` (raw queries, transaction pool proxy) and at query execution boundaries in `query/builder.ts`.
 
@@ -1568,7 +1608,7 @@ which exists because the previous copy asserted a snake_case column name was rej
 - `LRUCache` bounds the SQL template cache at 1,000 entries (Map insertion order for O(1) eviction)
 - Module has no side effects, `setTypeParser` for int8 is gated behind a static flag in the TurbineClient constructor
 - ESM source with `.js` extensions (NodeNext resolution), CJS output via separate `tsconfig.cjs.json`
-- Middleware runs after SQL generation, it can inspect/log params and transform results, but cannot modify the SQL itself
+- Middleware runs around execution: it can read and log params, time the call and transform the result, but it cannot change the query. `params.args` is a plain copy of the caller's args made on first read (`readOnlyMiddlewareParams`, utils.ts), so reading, spreading, `JSON.stringify` and `structuredClone` work; `next()` compares what it is passed against the caller's original (`assertMiddlewareArgsKept`) and throws a `TypeError` naming the first differing path (`params.args.where.role`), and assigning `params.args` throws at once. A structurally equal copy passes. Deliberately NOT a frozen object: a frozen object ignores writes silently in sloppy-mode code, so a tenant or soft-delete filter written in place would be dropped without a word, which is fail-open
 
 ## Common Tasks
 
