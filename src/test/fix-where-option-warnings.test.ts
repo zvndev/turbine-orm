@@ -51,6 +51,9 @@ async function run(qi: Any, operation: string, extra: Record<string, unknown>): 
     case 'updateMany':
       await qi.updateMany({ where: { id: 1 }, data: { name: 'x' }, ...extra });
       return;
+    case 'delete':
+      await qi.delete({ where: { id: 1 }, ...extra });
+      return;
     case 'deleteMany':
       await qi.deleteMany({ where: { id: 1 }, ...extra });
       return;

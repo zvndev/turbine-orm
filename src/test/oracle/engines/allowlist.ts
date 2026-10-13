@@ -192,12 +192,6 @@ const DATE_END_OF_DAY: readonly ScenarioEntry[] = [
     kind: 'bug',
     note: 'a Date written to a date column keeps its time of day (1999-12-31T23:59:59.999Z); Postgres stores the UTC date 1999-12-31.',
   },
-  {
-    engine: 'powdb',
-    scenario: 'with/bigint-keys-batched',
-    kind: 'bug',
-    note: 'the batched loader drops every relation on bigint keys: children get a null parent and parents no children. Fixed in the PowDB loader change that forces correlation keys into the parent fetch; delete this entry with it.',
-  },
 ];
 
 export const SCENARIO_ENTRIES: readonly ScenarioEntry[] = [

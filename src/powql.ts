@@ -77,6 +77,7 @@ import {
 } from './powdb-shared.js';
 import { assertAggregatePiiOptIn } from './query/aggregates.js';
 import { markStitchOnly, resolveCountRelations, stitchOnlyFields } from './query/batched-loader.js';
+import { unlockNestedWriteTx } from './query/builder.js';
 import { isColumnRef } from './query/column-ref.js';
 import {
   assertMutationWhereIdentifiesOneRow,
@@ -84,6 +85,7 @@ import {
   expandCompoundUniqueWhere,
   uniqueKeyNames,
   upsertWhereMatchesCreate,
+  whereIdentifiesOneRow,
 } from './query/compound-unique.js';
 import { exprNotAllowedMessage, isSqlExpr } from './query/expr.js';
 import {
@@ -93,9 +95,11 @@ import {
   cursorFieldValue,
   dedupeColumnList,
   isJsonFilter,
+  isJsonPathOrderBy,
   isOrderBySpec,
   isRelationPickOrderBy,
   isUnmatchedPlainObject,
+  isVectorOrderBy,
   normalizeOrderBy,
   operandColumnKind,
   orderByEntries,
@@ -172,6 +176,7 @@ import {
   type CombinatorKey,
   combinatorBranches,
   foldWhereFor,
+  relationCardinalityProblem,
   relationFilterValueProblem,
 } from './query/where-compile.js';
 import { assertNoBulkWritePaging, assertNoOptimisticLock } from './query/writes.js';
@@ -191,6 +196,9 @@ import {
  * before grouping. Mirrors the chunking the parity matrix documents.
  */
 const MAX_RELATION_KEYS = 1000;
+
+/** A predicate that holds for every row (an empty `notIn`, an `OR` with an empty branch). */
+const ALWAYS_TRUE = '(1 = 1)';
 
 /**
  * Max values one `in` / `notIn` on a PowDB-native `datetime` column may carry.
@@ -618,6 +626,22 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       // Date text against a Date column: the epoch micros the column stores,
       // as PostgreSQL reads the same text against a date / timestamp.
       tagged = isoTextMicros(value, col, this.table);
+    } else if (
+      col &&
+      isDateColumn(col) &&
+      (typeof value === 'number' || typeof value === 'bigint' || typeof value === 'boolean')
+    ) {
+      // The column holds epoch MICROseconds, so a number bound as-is names a
+      // different instant (a millisecond count lands in 1970) and matches
+      // nothing. PostgreSQL refuses a number against a date / timestamp too.
+      throw new ValidationError(
+        `Invalid value for the Date column "${col.name}" on "${this.table}": expected a Date or ISO 8601 text, ` +
+          `got ${describeOperand(value)}. Pass \`new Date(ms)\` for a millisecond timestamp.`,
+      );
+    } else if (col && typeof value === 'string' && this.isIntegerCol(col)) {
+      // Integer text against an integer column, as PostgreSQL reads it; an int8
+      // value past 2^53 keeps every digit as a bigint.
+      tagged = integerTextValue(value, col, this.table);
     } else if (col && typeof value === 'number' && this.isFloatCol(col)) {
       // Float column: force a float-form literal even for an integer value.
       tagged = new PowdbFloatParam(value);
@@ -650,6 +674,22 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       throw new ValidationError(`Non-finite value for float column "${col.name}" on "${this.table}".`);
     }
     return this.param(value, params, col);
+  }
+
+  /**
+   * A PowQL `int` column declared as an integer type (not a Date, which is
+   * stored as int micros, and not a column whose declared type is something
+   * else).
+   */
+  private isIntegerCol(col: ColumnMetadata): boolean {
+    if (isDateColumn(col)) return false;
+    const declared = (col.dialectType ?? col.pgType ?? '').toLowerCase();
+    if (declared !== '' && !/int|serial/.test(declared)) return false;
+    try {
+      return powqlColumnType(col) === 'int';
+    } catch {
+      return false;
+    }
   }
 
   private isFloatCol(col: ColumnMetadata): boolean {
@@ -849,6 +889,63 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
   }
 
   /**
+   * The SQL engines' cursor placement rule (query/builder.ts `planCursor`),
+   * so a cursor they refuse is the same E003 here and only a cursor they would
+   * serve reaches PowDB's E017. The page order is `orderBy` plus the
+   * tiebreaker; the cursor must carry a value for every column of it, or name
+   * one row by a unique key (the shared findUnique rule).
+   */
+  private assertCursorPlaceable(cursor: Record<string, unknown>, orderBy: unknown): void {
+    const meta = this.meta;
+    const field = (column: string): string => meta.reverseColumnMap[column] ?? column;
+    const flat = expandCompoundUniqueWhere(meta, cursor);
+    const valued = new Set<string>();
+    for (const [key, value] of Object.entries(flat)) {
+      if (value !== undefined) valued.add(this.column(key).name);
+    }
+    const terms: { column: string; desc: boolean }[] = [];
+    for (const [key, dir] of orderByEntries(orderBy).filter(([, d]) => d !== undefined)) {
+      if (isVectorOrderBy(dir) || isJsonPathOrderBy(dir) || (typeof dir !== 'string' && !isOrderBySpec(dir))) {
+        throw new ValidationError(
+          `findMany on "${this.table}" refused: \`cursor\` cannot page past the orderBy entry "${key}", which ` +
+            'orders by a relation, a JSON path or a vector distance rather than a column. Order the cursor ' +
+            'query by columns only, or page it with `offset`.',
+        );
+      }
+      const column = this.column(key).name;
+      if (terms.some((t) => t.column === column)) continue;
+      terms.push({ column, desc: normalizeOrderBy(dir as Parameters<typeof normalizeOrderBy>[0]).dir === 'DESC' });
+    }
+    const nullable = (column: string): boolean =>
+      !meta.primaryKey.includes(column) && meta.columns.find((c) => c.name === column)?.nullable === true;
+    const keys = uniqueKeyNames(meta).filter((cols) => cols.every((c) => !nullable(c)));
+    const ordered = new Set(terms.map((t) => t.column));
+    const tiebreak = keys.some((cols) => cols.every((c) => ordered.has(c)))
+      ? []
+      : keys[0]?.filter((c) => !ordered.has(c));
+    if (!tiebreak) {
+      throw new ValidationError(
+        `findMany on "${this.table}" refused: a \`cursor\` page needs an order with no ties, and "${this.table}" ` +
+          'has no primary key or unique key on NOT NULL columns to break them. Add a primary key, or page ' +
+          'this table with `offset`.',
+      );
+    }
+    const desc = terms.length > 0 ? terms[terms.length - 1]!.desc : false;
+    for (const column of tiebreak) terms.push({ column, desc });
+    if (terms.every((t) => valued.has(t.column)) || whereIdentifiesOneRow(meta, flat)) return;
+    const missing = terms.filter((t) => !valued.has(t.column)).map((t) => `"${field(t.column)}"`);
+    const order = terms.map((t) => `${field(t.column)} ${t.desc ? 'desc' : 'asc'}`).join(', ');
+    const named = uniqueKeyNames(meta).map((cols) =>
+      cols.length === 1 ? `{ ${field(cols[0]!)} }` : `{ ${cols.map(field).join(', ')} }`,
+    );
+    throw new ValidationError(
+      `findMany on "${this.table}" refused: the \`cursor\` has no value for ${missing.join(', ')}, which the ` +
+        `page order (${order}) needs, and it does not name one row by a unique key. Give the cursor a value ` +
+        `for every ordered field, or name the cursor row by ${named.length > 0 ? named.join(' or ') : 'a unique key'}.`,
+    );
+  }
+
+  /**
    * A paginated `findMany` (`limit` / `offset`) whose `orderBy` can tie gets
    * a tiebreaker appended in the last term's direction (the primary key, else
    * the first unique key on NOT NULL columns), as on the SQL engines, so a page
@@ -903,7 +1000,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
   }
 
   /** `optimisticLock` is an `update` option; the shared refusal and message from query/writes.ts. */
-  private assertNoOptimisticLock(args: object, operation: 'upsert' | 'updateMany'): void {
+  private assertNoOptimisticLock(args: object, operation: 'upsert' | 'updateMany' | 'delete' | 'deleteMany'): void {
     // The shared check reads only the table name from its builder context.
     assertNoOptimisticLock({ table: this.table } as Parameters<typeof assertNoOptimisticLock>[0], args, operation);
   }
@@ -1023,7 +1120,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
           parts.push(this.alwaysFalse());
           continue;
         }
-        const sub = branches.map((w) => this.buildWhere(w as WhereClause<T>, params, alias)).filter(Boolean);
+        const built = branches.map((w) => this.buildWhere(w as WhereClause<T>, params, alias));
+        // A branch with no condition is TRUE, so the whole `OR` is: a constant
+        // condition rather than none, so a `NOT` around it matches no row.
+        if (key === 'OR' && built.some((c) => !c)) {
+          parts.push(ALWAYS_TRUE);
+          continue;
+        }
+        const sub = built.filter(Boolean);
         if (!sub.length) continue;
         if (key === 'OR') parts.push(`(${sub.join(' or ')})`);
         else if (key === 'AND') parts.push(`(${sub.join(' and ')})`);
@@ -1149,8 +1253,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       // column has no object or array value, so binding one as data compared
       // against nothing meaningful; it is refused, as on the SQL engines.
       if (!isJsonColumn(colMeta)) throw this.operandError(field, '=', value, 'a scalar or an operator object');
-      this.assertDatetimePredicateSupported(colMeta);
-      return `${ref} = ${this.param(value, params)}`;
+      throw jsonDocumentEqualityUnsupported(colMeta);
     }
     // The SQL engines' operand rules and messages, so the engines agree on
     // which operator objects are valid; one naming no comparison
@@ -1312,13 +1415,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       );
     }
     if (filter.equals !== undefined) {
-      if (filter.path === undefined || filter.path.length === 0) {
-        throw new UnsupportedFeatureError(
-          'JSON document equality (equals without path)',
-          'PowDB',
-          `column "${col.name}": pass a \`path\` to compare a specific json value; PowQL has no whole-document comparison`,
-        );
-      }
+      if (filter.path === undefined || filter.path.length === 0) throw jsonDocumentEqualityUnsupported(col);
       conds.push(filter.equals === null ? `${pathP()} is null` : `${pathP()} = ${this.param(filter.equals, params)}`);
     }
     if (filter.hasKey !== undefined) {
@@ -1453,7 +1550,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     if (!Array.isArray(values) || values.length === 0) {
       // `in []` matches nothing; `not in []` matches everything (SQL parity requires a
       // missing-value row to match `notIn []`, so NO presence guard is appended here).
-      return negate ? '(1 = 1)' : this.alwaysFalse();
+      return negate ? ALWAYS_TRUE : this.alwaysFalse();
     }
     if (col && isPowdbDatetimeColumn(col)) return this.buildDatetimeInList(lhs, values, params, negate, col);
     const items = values.map((v) => this.bind(v, params, insensitive, col)).join(', ');
@@ -1661,6 +1758,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       const problem = relationFilterValueProblem(branch, filter[branch]);
       if (problem !== null) throw shapeError(problem);
     }
+    // The shared cardinality rule: `is` / `isNot` on a to-many relation.
+    const cardinality = relationCardinalityProblem(rel, filter);
+    if (cardinality !== null) throw shapeError(cardinality);
     const conds: Record<string, unknown>[] = [];
     for (const branch of RELATION_FILTER_KEYS) {
       const inner = filter[branch];
@@ -1912,7 +2012,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
           continue;
         }
         const live = branches.filter((w) => !this.compilesToNothing(w));
-        if (live.length === 0) continue;
+        // An `OR` with a branch that has no condition is TRUE: FALSE for no row.
+        if (live.length === 0 || (key === 'OR' && live.length < branches.length)) continue;
         if (key === 'AND') parts.push({ OR: live.map((w) => this.sqlFalseWhere(w as WhereClause<T>)) });
         else if (key === 'OR') parts.push({ AND: live.map((w) => this.sqlFalseWhere(w as WhereClause<T>)) });
         else for (const w of live) parts.push(this.sqlTrueWhere(w as WhereClause<T>) as Record<string, unknown>);
@@ -1935,9 +2036,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
 
   /**
    * Whether a where compiles to no condition, as {@link buildWhere} and the
-   * SQL where walk both read it: only absent keys, and combinators whose
-   * branches all compile to nothing (`AND: []`, `NOT: [{}]`, `OR: [{}]`).
-   * `OR: []` is a condition (no row), and so is any column or relation key.
+   * SQL where walk both read it: only absent keys, and `AND` / `NOT` whose
+   * branches all compile to nothing (`AND: []`, `NOT: [{}]`). Any `OR` is a
+   * condition: `OR: []` matches no row, and an `OR` with a branch that has no
+   * condition is constant TRUE (`OR: [{}]`), which `NOT` negates. So is any
+   * column or relation key.
    */
   private compilesToNothing(where: unknown): boolean {
     if (where === null || typeof where !== 'object' || Array.isArray(where)) return false;
@@ -1946,7 +2049,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       if (!isCombinatorKey(key)) return false;
       const branches = combinatorBranches(key, value, this.table);
       if (branches === null) continue;
-      if (key === 'OR' && branches.length === 0) return false;
+      if (key === 'OR') return false;
       if (!branches.every((w) => this.compilesToNothing(w))) return false;
     }
     return true;
@@ -2112,6 +2215,31 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    * every consumer of the key (relation stitching, reselect) has finished with
    * it. A no-op, and free, when nothing was forced.
    */
+  /**
+   * The columns of this table that the post-fetch relation loaders read off
+   * each parent row for `withClause`: a belongsTo's foreign key, a hasMany /
+   * hasOne / manyToMany's reference key, and the same for every relation a
+   * `_count` names. An unknown name contributes nothing; the loader raises its
+   * E005.
+   */
+  private loaderParentKeyColumns(withClause: Record<string, unknown>): string[] {
+    const out = new Set<string>();
+    const add = (rel: RelationDef): void => {
+      const cols = rel.type === 'belongsTo' ? rel.foreignKey : rel.referenceKey;
+      for (const c of normalizeKeyColumns(cols)) out.add(c);
+    };
+    for (const [relName, opt] of Object.entries(withClause)) {
+      if (!opt) continue;
+      if (relName === '_count') {
+        for (const rel of resolveCountRelations(this.meta, opt as WithCount)) add(rel);
+        continue;
+      }
+      const rel = ownLookup(this.meta.relations, relName);
+      if (rel) add(rel);
+    }
+    return [...out];
+  }
+
   private stripForcedPk(entities: object[], forcedPk: string[]): void {
     if (forcedPk.length === 0 || entities.length === 0) return;
     const fields = forcedPk.map((c) => this.meta.reverseColumnMap[c] ?? c);
@@ -2523,12 +2651,18 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     nestedPlans: NestedRelationPlan[];
     linkPlans: LinkPathPlan[];
     residualWith: Record<string, unknown> | undefined;
-    /** PK columns fetched for internal use only, see {@link projectionPlan}. */
+    /**
+     * Columns fetched for internal use only, stripped before the caller sees
+     * the rows: the PK (see {@link projectionPlan}) and the parent keys the
+     * relation loaders correlate on.
+     */
     forcedPk: string[];
   }> {
     // A cursor is checked with the SQL engines' rules first, so an invalid one
     // is E003 on every engine; a valid one is an engine gap (E017).
-    if (this.cursorCarriesValues((args as { cursor?: unknown }).cursor)) {
+    const cursor = (args as { cursor?: unknown }).cursor;
+    if (this.cursorCarriesValues(cursor)) {
+      this.assertCursorPlaceable(cursor as Record<string, unknown>, args.orderBy);
       throw new UnsupportedFeatureError('cursor pagination', 'PowDB', 'use limit/offset instead');
     }
     // `distinct` names COLUMNS: Postgres compiles it to `SELECT DISTINCT ON
@@ -2610,11 +2744,27 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       }
       residualWith = Object.keys(residue).length ? residue : undefined;
     }
+    // The loaders (and the native join) read each parent's correlation key off
+    // the fetched row, so a `select` / `omit` that leaves it out would stitch
+    // nothing. Fetch it anyway and take it back off afterwards, as the SQL
+    // engines' batched loader does.
+    if (residualWith) {
+      for (const column of this.loaderParentKeyColumns(residualWith)) {
+        if (cols.includes(column)) continue;
+        cols.push(column);
+        forcedPk.push(column);
+      }
+    }
 
     const nest = nestedPlans.length > 0 || linkPlans.length > 0;
     const alias = nest ? 't0' : undefined;
     let where = this.buildWhere(resolvedWhere, params, alias);
-    where = this.applyGlobalFilter(where, params, args.skipGlobalFilters, alias);
+    where = this.applyGlobalFilter(
+      where,
+      params,
+      await this.globalFilterWhere(args.skipGlobalFilters, args.timeout),
+      alias,
+    );
     const filter = where ? ` filter ${where}` : '';
     const order = this.buildOrder(args.orderBy, params, alias);
     const limit = this.effectiveLimit(args);
@@ -3634,13 +3784,15 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     skip?: unknown,
   ): Promise<string> {
     const parts: string[] = [];
-    const pw = this.applyGlobalFilter(this.buildWhere(parentResolvedWhere, params, 'p'), params, skip, 'p');
+    const parentGf = await this.globalFilterWhere(skip, timeout);
+    const pw = this.applyGlobalFilter(this.buildWhere(parentResolvedWhere, params, 'p'), params, parentGf, 'p');
     if (pw) parts.push(pw);
     const relResolved = await targetQi.resolveRelationFilters(relWhere, timeout, skip);
+    const targetGf = await targetQi.globalFilterWhere(skip, timeout);
     const rw = targetQi.applyGlobalFilter(
       targetQi.buildWhere(relResolved, params, childAlias),
       params,
-      skip,
+      targetGf,
       childAlias,
     );
     if (rw) parts.push(rw);
@@ -3810,7 +3962,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     // grammar accepts even when the group itself contains `or`.
     const correlation = `${alias}.${quotePowqlIdent(childKeyCol)} = ${parentAlias}.${quotePowqlIdent(parentKeyCol)}`;
     const resolved = await targetQi.resolveRelationFilters(options.where as WhereClause<object>, timeout, skip);
-    const childWhere = targetQi.applyGlobalFilter(targetQi.buildWhere(resolved, params, alias), params, skip, alias);
+    const targetGf = await targetQi.globalFilterWhere(skip, timeout);
+    const childWhere = targetQi.applyGlobalFilter(
+      targetQi.buildWhere(resolved, params, alias),
+      params,
+      targetGf,
+      alias,
+    );
     const filter = childWhere ? `${correlation} and (${childWhere})` : correlation;
     const order = targetQi.buildOrder(options.orderBy, params, alias);
     const limitClause = single
@@ -3972,7 +4130,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     const targetQi = new PowqlInterface<object>(this.pool, rel.to, this.schema, [], this.options);
     // A link hop has no per-hop filter, so it cannot carry the target's global
     // filter; such a relation stays on the loaders, which apply it.
-    if (targetQi.applyGlobalFilter('', [], skip) !== '') return null;
+    if (targetQi.hasGlobalFilter(skip)) return null;
     // `projectionPlan`, not `projectedColumns`: the plan is what carries
     // `forcedPk`, and reading the column LIST alone is what made this path's
     // strip dead. See the pkProjected line below.
@@ -4315,7 +4473,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       // SQL engine accepted it: verified by probe on buildUpdate/buildDelete.
       this.assertCompiledWhere(where, allowFullTableScan, 'update', userWhere);
       this.assertMutationIdentifiesOneRow(userWhere, allowFullTableScan, 'update');
-      where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
+      where = this.applyGlobalFilter(where, params, await this.globalFilterWhere(args.skipGlobalFilters, args.timeout));
       let setClause = this.buildUpdateAssignments(args.data as Record<string, unknown>, params);
       // Optimistic locking, matching the SQL engines exactly: bump the version
       // column in the SET, add `version = expected` to the filter, and treat
@@ -4369,7 +4527,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
         'updateMany',
         args.where,
       );
-      where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
+      where = this.applyGlobalFilter(where, params, await this.globalFilterWhere(args.skipGlobalFilters, args.timeout));
       const setClause = this.buildUpdateAssignments(args.data as Record<string, unknown>, params);
       const filter = where ? ` filter ${where}` : '';
       const { rowCount } = await this.exec(
@@ -4525,7 +4683,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       );
       const ctx: NestedWriteContext = {
         schema: this.schema,
-        tx: tx as unknown as NestedWriteContext['tx'],
+        // The nested engine's internal `updateMany` for `set` reaches the
+        // privilege sentinel through the same seam the SQL engines use.
+        tx: unlockNestedWriteTx(
+          tx as unknown as { table(name: string): Record<string, unknown> },
+        ) as unknown as NestedWriteContext['tx'],
         scopedConnect: this.options?.scopedConnect === true,
       };
       // Plant the single-writer re-entrancy marker for the implicit tx's
@@ -4559,9 +4721,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     const opts = { ...this.options, _txScoped: true } as QueryInterfaceOptions;
     const tx = {
       table: <U extends object>(name: string) =>
-        new PowqlInterface<U>(this.pool, name, this.schema, this.middlewares, opts),
+        new PowqlInterface<U>(this.pool, name, this.schema, this.middlewares, opts) as unknown as Record<
+          string,
+          unknown
+        >,
     };
-    return { schema: this.schema, tx: tx as unknown as NestedWriteContext['tx'] };
+    return { schema: this.schema, tx: unlockNestedWriteTx(tx) as unknown as NestedWriteContext['tx'] };
   }
 
   delete<
@@ -4570,6 +4735,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
   >(args: DeleteArgs<T, NoRelations, S, O>): Promise<FieldResult<T, S, O>>;
   async delete(args: DeleteArgs<T>): Promise<T> {
     args = this.normalizeArgs(args);
+    this.assertNoOptimisticLock(args, 'delete');
     return this.withMiddleware('delete', args as unknown as Record<string, unknown>, async () => {
       const plan = this.writeReturnPlan(args);
       const allowFullTableScan = resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan');
@@ -4579,7 +4745,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       let where = this.buildWhere(resolvedWhere, params);
       this.assertCompiledWhere(where, allowFullTableScan, 'delete', userWhere);
       this.assertMutationIdentifiesOneRow(userWhere, allowFullTableScan, 'delete');
-      where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
+      where = this.applyGlobalFilter(where, params, await this.globalFilterWhere(args.skipGlobalFilters, args.timeout));
       // `returning` hands back the deleted row(s), no separate pre-image reselect needed.
       const { rows, native } = await this.exec(
         `${this.qt} filter ${where} delete returning`,
@@ -4596,6 +4762,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
   async deleteMany(args: DeleteManyArgs<T>): Promise<{ count: number }> {
     args = this.normalizeArgs(args);
     assertNoBulkWritePaging(this.table, 'deleteMany', args);
+    this.assertNoOptimisticLock(args, 'deleteMany');
     return this.withMiddleware('deleteMany', args as unknown as Record<string, unknown>, async () => {
       const params: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout, args.skipGlobalFilters);
@@ -4606,7 +4773,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
         'deleteMany',
         args.where,
       );
-      where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
+      where = this.applyGlobalFilter(where, params, await this.globalFilterWhere(args.skipGlobalFilters, args.timeout));
       const filter = where ? ` filter ${where}` : '';
       const { rowCount } = await this.exec(`${this.qt}${filter} delete`, params, args.timeout, 'deleteMany');
       return { count: rowCount };
@@ -4650,16 +4817,20 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       // as a NotFoundError. The lookup runs its find and its update through the
       // filtered interface, so another tenant's row is invisible to it: the
       // insert then collides on the key and fails, and nothing is overwritten.
-      const filtered = this.applyGlobalFilter('', [], args.skipGlobalFilters) !== '';
+      const filtered = this.hasGlobalFilter(args.skipGlobalFilters);
+      // The shape the SQL engines answer with ONE conflict statement (`where`
+      // pinned to `create`, a non-empty scalar update).
+      const conflictShape =
+        upsertWhereMatchesCreate(this.meta, upsertWhere, (args.create ?? {}) as Record<string, unknown>) &&
+        !hasRelationFields(args.create as Record<string, unknown>, this.meta) &&
+        !hasRelationFields(updateData, this.meta) &&
+        Object.values(updateData).some((v) => v !== undefined);
       const native =
         this.meta.primaryKey.length === 1 &&
         pkCol !== undefined &&
         conflictColumns.length === 1 &&
         conflictColumns[0] === pkCol &&
-        upsertWhereMatchesCreate(this.meta, upsertWhere, (args.create ?? {}) as Record<string, unknown>) &&
-        !hasRelationFields(args.create as Record<string, unknown>, this.meta) &&
-        !hasRelationFields(updateData, this.meta) &&
-        Object.values(updateData).some((v) => v !== undefined) &&
+        conflictShape &&
         !filtered;
       if (!native) {
         return this.upsertLookupFirst(upsertWhere, createData, updateData, {
@@ -4667,6 +4838,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
           omit: args.omit,
           skipGlobalFilters: args.skipGlobalFilters,
           timeout: args.timeout,
+          // That statement carries the global filter on its conflict branch, so a
+          // key held by a row the filter hides writes nothing there (E001).
+          hiddenConflictIsNotFound: conflictShape && filtered,
         });
       }
       const params: unknown[] = [];
@@ -4724,9 +4898,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       omit?: Record<string, boolean>;
       skipGlobalFilters?: unknown;
       timeout?: number;
+      hiddenConflictIsNotFound?: boolean;
     },
   ): Promise<T> {
-    const { skipGlobalFilters, timeout, ...projection } = shape;
+    const { skipGlobalFilters, timeout, hiddenConflictIsNotFound, ...projection } = shape;
     const skip = skipGlobalFilters === undefined ? {} : { skipGlobalFilters };
     const time = timeout === undefined ? {} : { timeout };
     this.scalarData(extractRelationFields(createData, this.meta).scalars);
@@ -4740,6 +4915,22 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
         // An empty `update` means "leave it as it is": the row found is the answer.
         if (updateIsEmpty) return existing as T;
         return (await tbl.update({ where, data: updateData, ...projection, ...skip, ...time } as never)) as T;
+      }
+      if (hiddenConflictIsNotFound) {
+        // `where` is pinned to `create`, so the insert below collides exactly
+        // when the global filter is what hid the row: say so, as the SQL engines do.
+        const hidden = await tbl.findUnique({ where, skipGlobalFilters: UNSAFE, ...time } as never);
+        if (hidden) {
+          throw new NotFoundError({
+            table: this.table,
+            where,
+            operation: 'upsert',
+            message:
+              `upsert on "${this.table}" wrote nothing: the row that conflicts on the given key is excluded by the ` +
+              `configured global filter for "${this.table}", so it was neither updated (the filter hides it) nor ` +
+              'inserted (the key is taken). Pass `skipGlobalFilters: UNSAFE` to address it anyway.',
+          });
+        }
       }
       return (await tbl.create({ data: createData as Partial<T>, ...projection, ...time } as never)) as T;
     };
@@ -4757,7 +4948,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       const params: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout, args.skipGlobalFilters);
       let where = this.buildWhere(resolvedWhere, params);
-      where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
+      where = this.applyGlobalFilter(where, params, await this.globalFilterWhere(args.skipGlobalFilters, args.timeout));
       const filter = where ? ` filter ${where}` : '';
       const { rows } = await this.exec(`count(${this.qt}${filter})`, params, args.timeout, 'count');
       return Number((rows[0]?.value ?? rows[0]?.count ?? 0) as string | number);
@@ -4832,7 +5023,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       const filterParams: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout, args.skipGlobalFilters);
       let where = this.buildWhere(resolvedWhere, filterParams);
-      where = this.applyGlobalFilter(where, filterParams, args.skipGlobalFilters);
+      where = this.applyGlobalFilter(
+        where,
+        filterParams,
+        await this.globalFilterWhere(args.skipGlobalFilters, args.timeout),
+      );
       const filter = where ? ` filter ${where}` : '';
 
       // Plan every requested aggregate before any statement runs, so every
@@ -4976,7 +5171,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       const params: unknown[] = [];
       const resolvedWhere = await this.resolveRelationFilters(args.where, args.timeout, args.skipGlobalFilters);
       let where = this.buildWhere(resolvedWhere, params);
-      where = this.applyGlobalFilter(where, params, args.skipGlobalFilters);
+      where = this.applyGlobalFilter(where, params, await this.globalFilterWhere(args.skipGlobalFilters, args.timeout));
       const filter = where ? ` filter ${where}` : '';
 
       // Result-key namespace, mirroring the SQL builder's `claimResultKey`
@@ -5553,18 +5748,81 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    * `alias` is forwarded so the nested/native-join paths qualify the filter's
    * column references the same way they qualify the user's.
    */
-  private applyGlobalFilter(compiledUserWhere: string, params: unknown[], skip: unknown, alias?: string): string {
+  private applyGlobalFilter(
+    compiledUserWhere: string,
+    params: unknown[],
+    gf: WhereClause<T> | undefined,
+    alias?: string,
+  ): string {
+    if (!gf) return compiledUserWhere;
+    const gfWhere = this.buildWhere(gf, params, alias);
+    if (!gfWhere) return compiledUserWhere;
+    if (!compiledUserWhere) return gfWhere;
+    return `(${compiledUserWhere}) and (${gfWhere})`;
+  }
+
+  /**
+   * Tables whose global filter is being resolved by an operation above this
+   * interface. A relation filter inside a global filter runs its own query on
+   * the related table, which applies THAT table's filter, so two filters that
+   * reach each other through relations would resolve forever; each table's
+   * filter applies once per chain instead.
+   */
+  private get globalFilterStack(): readonly string[] {
+    return (this.options as { _globalFilterStack?: readonly string[] })._globalFilterStack ?? [];
+  }
+
+  /** Whether this table's global filter constrains an operation under `skip`. */
+  private hasGlobalFilter(skip: unknown): boolean {
+    if (this.globalFilterStack.includes(this.table)) return false;
     const gf = resolveGlobalFilterFrom(
       this.options.globalFilters,
       this.table,
       resolveSkipGlobalFilters(skip),
       this.schema.tables,
     );
-    if (!gf) return compiledUserWhere;
-    const gfWhere = this.buildWhere(this.sqlTrueWhere(gf as WhereClause<T>), params, alias);
-    if (!gfWhere) return compiledUserWhere;
-    if (!compiledUserWhere) return gfWhere;
-    return `(${compiledUserWhere}) and (${gfWhere})`;
+    return gf != null && !this.compilesToNothing(gf);
+  }
+
+  /**
+   * This table's global filter for one operation, ready for
+   * {@link applyGlobalFilter}: read under SQL three-valued logic, with every
+   * relation filter in it (`posts: { some: ... }`, `user: { is: ... }`)
+   * resolved to a literal key list by the same client-side resolution a
+   * caller's `where` gets. The related table's own global filter bounds those
+   * lookups, as on the SQL engines, and `skip` reaches them too.
+   */
+  private async globalFilterWhere(skip: unknown, timeout?: number): Promise<WhereClause<T> | undefined> {
+    const stack = this.globalFilterStack;
+    if (stack.includes(this.table)) return undefined;
+    const gf = resolveGlobalFilterFrom(
+      this.options.globalFilters,
+      this.table,
+      resolveSkipGlobalFilters(skip),
+      this.schema.tables,
+    ) as WhereClause<T> | null | undefined;
+    if (!gf) return undefined;
+    if (!this.namesRelation(gf)) return this.sqlTrueWhere(gf);
+    const scoped = new PowqlInterface<T>(this.pool, this.table, this.schema, [], {
+      ...this.loaderChildOptions(),
+      _globalFilterStack: [...stack, this.table],
+    } as QueryInterfaceOptions);
+    return scoped.resolveRelationFilters(gf, timeout, skip);
+  }
+
+  /** Whether `where` holds a relation filter at any combinator depth. */
+  private namesRelation(where: unknown): boolean {
+    if (where === null || typeof where !== 'object' || Array.isArray(where)) return false;
+    for (const [key, value] of Object.entries(where)) {
+      if (value === undefined) continue;
+      if (isCombinatorKey(key)) {
+        const branches = combinatorBranches(key, value, this.table);
+        if (branches?.some((w) => this.namesRelation(w))) return true;
+      } else if (resolveRelationDef(this.meta.relations, key)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /**
@@ -5647,7 +5905,9 @@ function emulateColumnDefault(expr: string, col: ColumnMetadata): unknown {
       return literal;
     case 'number': {
       const n = Number(literal);
-      return literal.trim() !== '' && Number.isFinite(n) ? n : NO_DEFAULT;
+      if (literal.trim() === '' || !Number.isFinite(n)) return NO_DEFAULT;
+      // An int8 default past 2^53 keeps every digit, as the column does.
+      return isInt8Column(col) && /^-?\d+$/.test(literal) && !Number.isSafeInteger(n) ? BigInt(literal) : n;
     }
     case 'bigint':
       return /^-?\d+$/.test(literal) ? BigInt(literal) : NO_DEFAULT;
@@ -5698,6 +5958,46 @@ function exactIntegerSumCell(cell: unknown): string | null {
   if (typeof cell === 'bigint') return cell.toString();
   if (typeof cell === 'number' && Number.isInteger(cell)) return BigInt(cell).toString();
   return String(cell);
+}
+
+/**
+ * Whole-document equality on a json column (a bare object or array, or
+ * `equals` with no `path`): PowQL has no document comparison, so it is an
+ * engine gap (E017) on every spelling, never a value bound as data.
+ */
+function jsonDocumentEqualityUnsupported(col: ColumnMetadata): UnsupportedFeatureError {
+  return new UnsupportedFeatureError(
+    'JSON document equality (equals without path)',
+    'PowDB',
+    `column "${col.name}": pass a \`path\` to compare a specific json value; PowQL has no whole-document comparison`,
+  );
+}
+
+const INT64_MIN = -(2n ** 63n);
+const INT64_MAX = 2n ** 63n - 1n;
+
+/**
+ * The value integer text names for an integer column: a number when it is a
+ * safe integer, else a bigint, so an int8 past 2^53 keeps every digit. Text
+ * that is not an integer is refused (E003), as PostgreSQL refuses it.
+ */
+function integerTextValue(text: string, col: ColumnMetadata, table: string): number | bigint {
+  const trimmed = text.trim();
+  const shown = JSON.stringify(text.length > 40 ? `${text.slice(0, 40)}...` : text);
+  if (!/^[+-]?\d+$/.test(trimmed)) {
+    throw new ValidationError(
+      `Invalid value ${shown} for the integer column "${col.name}" on "${table}": expected an integer. ` +
+        "Pass a number, a bigint, or integer text such as '42'.",
+    );
+  }
+  const big = BigInt(trimmed);
+  if (big < INT64_MIN || big > INT64_MAX) {
+    throw new ValidationError(
+      `Invalid value ${shown} for the integer column "${col.name}" on "${table}": it is outside the 64-bit range.`,
+    );
+  }
+  const n = Number(big);
+  return Number.isSafeInteger(n) ? n : big;
 }
 
 /** ISO 8601 date or date-time text: date, optional time and fraction, optional zone. */

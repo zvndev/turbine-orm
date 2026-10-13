@@ -714,8 +714,14 @@ export function rowToEntity(
       out[field] = value;
     } else if (native) {
       out[field] = coerceNativeValue(value, col);
+    } else if (typeof value === 'string') {
+      out[field] = coerceValue(value, col);
+    } else if ((typeof value === 'number' || typeof value === 'bigint') && isDateColumn(col)) {
+      // A Date column's micros as a number cell: the Date it stores, as on the
+      // other wires, never the raw count (which a filter would then refuse).
+      out[field] = new Date(Number(value) / 1000);
     } else {
-      out[field] = typeof value === 'string' ? coerceValue(value, col) : value;
+      out[field] = value;
     }
   }
   return out;

@@ -249,7 +249,7 @@ const CASES: Case[] = [
   { id: 'NOT: [] applies no condition', run: users({ NOT: [] }), expect: ALL_USERS },
   { id: 'NOT over an empty object applies no condition', run: users({ NOT: {} }), expect: ALL_USERS },
   { id: 'NOT over AND: [] applies no condition', run: users({ NOT: { AND: [] } }), expect: ALL_USERS },
-  { id: 'NOT over OR: [{}] applies no condition', run: users({ NOT: { OR: [{}] } }), expect: ALL_USERS },
+  { id: 'NOT over OR: [{}] matches no row', run: users({ NOT: { OR: [{}] } }), expect: [] },
   {
     id: 'NOT array with an empty branch',
     run: users({ NOT: [{}, { age: 34 }] }),
@@ -266,7 +266,7 @@ const CASES: Case[] = [
     expect: [3, 6],
   },
   { id: 'AND written as an object', run: users({ AND: { age: 34 } }), expect: [1, 4] },
-  { id: 'OR with an empty member', run: users({ OR: [{}, { age: 34 }] }), expect: [1, 4] },
+  { id: 'OR with an empty member matches every row', run: users({ OR: [{}, { age: 34 }] }), expect: ALL_USERS },
   {
     id: 'NOT array negates each branch',
     run: users({ NOT: [{ age: 34 }, { nickname: 'ally' }] }),

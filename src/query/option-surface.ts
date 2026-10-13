@@ -373,9 +373,10 @@ const PRISMA_SPELLING: Readonly<Record<string, string>> = {
 export const REFUSED_OPTION_KEYS: Readonly<Record<string, ReadonlySet<string>>> = {
   // A bounded batch is not what these statements do (assertNoBulkWritePaging).
   updateMany: new Set(['limit', 'take', 'offset', 'skip', 'optimisticLock']),
-  deleteMany: new Set(['limit', 'take', 'offset', 'skip']),
+  deleteMany: new Set(['limit', 'take', 'offset', 'skip', 'optimisticLock']),
   // `optimisticLock` is an `update` option (assertNoOptimisticLock).
   upsert: new Set(['optimisticLock']),
+  delete: new Set(['optimisticLock']),
   // A streaming cursor cannot hold its rows locked across fetches.
   findManyStream: new Set(['lock']),
   findManyStreamBatches: new Set(['lock']),
