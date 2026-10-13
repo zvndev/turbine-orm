@@ -103,6 +103,7 @@ import {
 } from './realtime.js';
 import type { SchemaMetadata, TableMetadata } from './schema.js';
 import { parseInt8, rawClientOf, typedQueryPool } from './supplied-pool-types.js';
+import { registerTransactionClient } from './transaction-client-slot.js';
 import {
   commitTransaction,
   rolledBackError,
@@ -2003,6 +2004,11 @@ export class TransactionClient {
     return txPool as unknown as PgCompatPool;
   }
 }
+
+// query/builder.ts opens an implicit transaction with this class but sits
+// below this module in the import graph, so the class is handed over here,
+// once, when this module is evaluated (see transaction-client-slot.ts).
+registerTransactionClient(TransactionClient);
 
 /**
  * Give each multi-statement write on a transaction-scoped accessor its own

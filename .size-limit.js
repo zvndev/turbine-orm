@@ -369,12 +369,35 @@ const nodePlatform = (config) => {
 // other entry follows the 5% convention at the top of this file: sqlite 128,
 // mysql 128, mssql 130, powdb 151, prisma-compat 20, the tree-shaken client
 // 120; cli and adapters are unchanged.
+// EVERY SQL ENTRY LOWERED 2026-10-13, for 0.90.1: the first reduction this file
+// records that is not a feature removal. query/builder.ts reached
+// TransactionClient through `await import('../client.js')`, and a bundler that
+// does not split code (esbuild, so this measurement) inlines the target and
+// wraps client.ts and its whole static graph in lazy-init closures to keep it
+// lazy. client.ts now registers the class in src/transaction-client-slot.ts when
+// it is evaluated, and the import-cycle check refuses a dynamic import of
+// client.ts from query/ or cli/. Measured in two scratch copies of the same
+// commit, `npm run build` then `npx size-limit`, before -> after: main
+// 145.79 -> 144.51, the tree-shaken client 114.05 -> 112.85, serverless
+// 114.15 -> 112.95, sqlite 121.29 -> 120.29, mysql 121.86 -> 120.73, mssql
+// 123.21 -> 121.96, prisma-compat 18.38 -> 18.09, cli and adapters flat.
+// powdb dropped once powql.ts read the same slot and powdb.ts imported
+// powql.js statically (it already re-exported it): 143.50 -> 142.20. The
+// import-cycle check now refuses a dynamic import of any of the package's own
+// modules from library code, so no entry can grow the wrappers back.
+//
+// main and serverless are published claims and move with README.md (three
+// places), site/app/page.tsx (prose, stat card and table) and the serverless /
+// batadb / neon docs pages, on the 0.90.0 rule (measured, rounded up, plus
+// 1 kB): main 146, serverless 114. The rest follow the 5% convention: the
+// tree-shaken client 119, sqlite 127, mysql 127, mssql 129, powdb 150.
+// prisma-compat stays at 20 (its 1 kB minimum headroom rounds to 20).
 export default [
   {
     name: "main entry, the whole 'turbine-orm' barrel",
     path: 'dist/index.js',
     // Same number as the README's claim, on purpose. See the note above.
-    limit: '147 kB',
+    limit: '146 kB',
     ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },
@@ -387,7 +410,7 @@ export default [
     // tooling. Added 2026-10-13, see the 0.90.0 note above.
     path: 'dist/index.js',
     import: '{ TurbineClient }',
-    limit: '120 kB',
+    limit: '119 kB',
     ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },
@@ -398,21 +421,21 @@ export default [
     // pagination dialect-hook dispatch). These are tiny and engine-neutral, but
     // the edge bundle includes the query builder, so the budget gets a small bump.
     path: 'dist/serverless.js',
-    limit: '116 kB',
+    limit: '114 kB',
     ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },
   {
     name: 'sqlite entry, turbine-orm/sqlite (node:sqlite + client graph)',
     path: 'dist/sqlite.js',
-    limit: '128 kB',
+    limit: '127 kB',
     ignore: [...PG, 'node:sqlite'],
     modifyEsbuildConfig: nodePlatform,
   },
   {
     name: 'mysql entry, turbine-orm/mysql (client graph; mysql2 lazy-loaded)',
     path: 'dist/mysql.js',
-    limit: '128 kB',
+    limit: '127 kB',
     // mysql2 is an optional peer loaded via a dynamic import in the factory, so
     // it is never in the static graph, exclude it (and pg) from the footprint.
     ignore: [...PG, 'mysql2', 'mysql2/promise'],
@@ -423,7 +446,7 @@ export default [
     path: 'dist/mssql.js',
     // Slightly larger than the other engines: the FOR JSON PATH relation generator
     // and the INFORMATION_SCHEMA/sys introspector add real code (no extra deps).
-    limit: '130 kB',
+    limit: '129 kB',
     // mssql is an optional peer loaded via a dynamic import in the factory, so it
     // is never in the static graph, exclude it (and pg) from the footprint.
     ignore: [...PG, 'mssql'],
@@ -434,7 +457,7 @@ export default [
     // The largest entry: it carries the whole client/query graph AND powql.ts,
     // a second, parallel query generator for a non-SQL language.
     path: 'dist/powdb.js',
-    limit: '151 kB',
+    limit: '150 kB',
     // Both PowDB drivers are optional peers behind dynamic imports (the
     // networked client and the embedded napi addon), so neither is in the
     // static graph.

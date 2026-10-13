@@ -14,6 +14,10 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
+// Loads client.ts, which registers the TransactionClient the implicit
+// transaction is built with (see transaction-client-slot.ts). Nothing else this
+// file imports reaches client.ts.
+import '../client.js';
 import { ReadOnlyError } from '../errors.js';
 import { PowqlInterface } from '../powql.js';
 import { QueryInterface } from '../query/index.js';

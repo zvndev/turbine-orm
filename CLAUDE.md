@@ -757,6 +757,12 @@ src/
                       moves with the table since it is a cost comparison; a closed-form gate
                       was attempted and failed its own out-of-sample prediction.
 
+  transaction-client-slot.ts, Where the implicit-transaction path finds `TransactionClient`
+                      (0.90.1). client.ts calls `registerTransactionClient` once at module
+                      evaluation; query/builder.ts and powql.ts read `transactionClientFor(...)`
+                      before checking out a connection. Replaced their dynamic imports of
+                      client.ts (see the "Don't import client.ts" rule at the end of this file).
+
   connection-url.ts, Zero-import leaf (0.71) owning everything that reads or rewrites a
                       CONNECTION STRING. Three jobs. (1) `detectPooler(connectionString,
                       environment?)` (0.90: `fillTargetFromEnvironment` fills an unset host /
@@ -1957,5 +1963,5 @@ which exists because the previous copy asserted a snake_case column name was rej
 - Don't reference internal project names, client names, the applications findings were reported from, or internal planning documents in ANY tracked file, code comments, test names, CHANGELOG, release notes, commit messages, site. This repo is public. Describe changes by what they do, never by who asked for them or where feedback came from. `docs/internal/` and `AGENTS.md` are gitignored (local-only); the pre-commit hook enforces a private blocklist via `scripts/check-private-terms.mjs` + `.private-terms`.
 - Don't break the Prisma-like API (`findMany`, `findUnique`, `with`, `where`)
 - Don't put user values in SQL strings, always use `$N` parameterization
-- Don't import `client.ts` from `query/` or `cli/` (would create a circular dependency). Since 0.65 this is machine-enforced by `scripts/check-import-cycles.mjs` (`npm run check:cycles`, in CI's lint job and prepublishOnly): no STATIC VALUE import; `import type` and the one sanctioned dynamic `await import('../client.js')` in query/builder.ts (interactive transactions need TransactionClient at call time) are allowed.
+- Don't import `client.ts` from `query/` or `cli/` (would create a circular dependency). Since 0.65 this is machine-enforced by `scripts/check-import-cycles.mjs` (`npm run check:cycles`, in CI's lint job and prepublishOnly): no value import, static OR dynamic (`await import('../client.js')` fails too since 0.90.1: a non-splitting bundler wraps the whole client graph in lazy-init closures for one, about 1 kB brotli per entry); `import type` and type-position `import('../client.js').X` are allowed. A runtime value query/ needs from client.ts is REGISTERED by client.ts when it is evaluated: `src/transaction-client-slot.ts` is how query/builder.ts gets `TransactionClient` for the implicit transaction of a nested write or lookup-first upsert. One slot per package copy (deliberately not `Symbol.for`: a builder must construct its own copy's class), and an empty slot (client.ts never loaded, e.g. a deep-imported `QueryInterface`) is E003 on that path only, before any checkout. The same script's pass 1b refuses a dynamic value import of ANY of the package's own modules from library code (src/ minus test/ and cli/), for the same size reason; optional peers load through `importOptionalPeer` with a bare specifier and are not matched.
 - Don't register type parsers outside the TurbineClient constructor

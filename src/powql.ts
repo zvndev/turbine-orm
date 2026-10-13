@@ -194,6 +194,7 @@ import {
   snakeToCamel,
   type TableMetadata,
 } from './schema.js';
+import { transactionClientFor } from './transaction-client-slot.js';
 
 /**
  * Max parent keys per relation-loader `in (…)` query. A `with` over a large
@@ -4806,6 +4807,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     // Route tx keywords through the dialect (like the SQL path) so this never
     // drifts from `powdbDialect`; falls back to the literal lowercase keywords.
     const d = this.options.dialect;
+    // Read before the checkout, so an empty slot (client.ts never loaded in this
+    // copy of the package) refuses with no connection taken and no `begin` sent.
+    const TransactionClient = transactionClientFor(`A nested write or lookup-first upsert on "${this.table}"`);
     const client = await this.pool.connect();
     // A no-op today (PowDB checkouts have no event surface), kept so this path
     // cannot become the one unguarded checkout if a transport ever emits 'error'.
@@ -4814,7 +4818,6 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     try {
       await client.query(d?.beginStatement?.() ?? 'begin');
       began = true;
-      const { TransactionClient } = await import('./client.js');
       const tx = new TransactionClient(
         client as unknown as never,
         this.schema,

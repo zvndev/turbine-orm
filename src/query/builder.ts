@@ -39,6 +39,7 @@ import {
 import type { PgCompatPool, PgCompatQueryConfig, PgCompatQueryResult } from '../pg-types.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { normalizeKeyColumns, snakeToCamel } from '../schema.js';
+import { transactionClientFor } from '../transaction-client-slot.js';
 import { type TransactionState, transactionStateOf, withSavepoint } from '../transaction-state.js';
 import * as aggMod from './aggregates.js';
 import {
@@ -5288,6 +5289,11 @@ export class QueryInterface<
   }
 
   private async runInImplicitTx<R>(fn: (ctx: NestedWriteContext) => Promise<R>): Promise<R> {
+    // client.ts registers TransactionClient when it is evaluated (it cannot be
+    // imported from here, see transaction-client-slot.ts). Read before the
+    // checkout, so a program that never loaded client.ts gets a typed error
+    // without a connection having been touched.
+    const TransactionClient = transactionClientFor(`A nested write or lookup-first upsert on "${this.table}"`);
     // BEGIN runs inside openCheckout, which sends it once more on a fresh
     // connection when the first one turns out to be dead and releases the
     // connection itself when BEGIN fails for good. The catch below therefore
@@ -5295,7 +5301,6 @@ export class QueryInterface<
     // a connection that opened none.
     const { client, checkout } = await openCheckout(this.pool, (c) => c.query(this.dialect.beginStatement()));
     try {
-      const { TransactionClient } = await import('../client.js');
       const tx = new TransactionClient(
         // biome-ignore lint/suspicious/noExplicitAny: MiddlewareFn and Middleware are structurally identical
         client as any,
