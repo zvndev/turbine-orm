@@ -615,7 +615,14 @@ export interface WithOptions<NestedR extends object = Record<never, never>, Nest
    * element order is the authoritative multi-key sort precedence).
    */
   orderBy?: TypedOrderByClause<NestedT, NestedR>;
+  /** Keep at most this many of each parent's related rows. */
   limit?: number;
+  /** Skip this many of each parent's related rows. To-many relations only; refused on a to-one relation. */
+  offset?: number;
+  /** Prisma's spelling of `limit`, folded into it at the args seam. */
+  take?: number;
+  /** Prisma's spelling of `offset`, folded into it at the args seam. */
+  skip?: number;
   /** Only include these fields from the relation. Key-checked against the target when it is known. */
   select?: WithFieldFlags<NestedT>;
   /** Exclude these fields from the relation. Key-checked against the target when it is known. */
