@@ -123,10 +123,29 @@ src/
                       builder.ts: 'dev' (always-on NODE_ENV guard) | 'sampled'
                       (TURBINE_CACHE_CHECK_SAMPLE env, rate in (0,1], log-once-per-
                       fingerprint then throw) | 'off'.
+                      0.90 adds two rules here. `relationFilterValueProblem` /
+                      `assertRelationFilterValues`: a quantifier (`some` / `none` / `every`)
+                      must be a where object and `is` / `isNot` a where object or `null`;
+                      anything else is E003 at every depth, global filters and `with`
+                      wheres included, because `posts: { some: null }` used to compile to
+                      nothing and a deleteMany carrying it deleted the table. And
+                      `foldWhere` (`foldWhereFor` for plain metadata): what a where IS for
+                      every row, `'empty'` / `'true'` / `'false'` / `'row'`, read from the
+                      SQL the compiler would emit, branch for branch (a branch that compiles
+                      to nothing is dropped from an `OR` and not negated by `NOT`). Constants
+                      come from exactly three places: an empty `in` (FALSE), an empty
+                      `notIn` (TRUE), and an `EXISTS` over a constant sub-where. The
+                      mass-mutation guard (`userPredicateIsEmpty` in where.ts) refuses
+                      `'true'` exactly as it refuses `'empty'`, so `NOT: { OR: [] }` and
+                      `{ id: { notIn: [] } }` no longer write every row; anything not
+                      provably constant is `'row'`, so folding never refuses a filter that
+                      narrows. global-filters-config.ts runs the same fold at construction.
 
     prepared-statement naming, A where (or having) clause containing a
                       CALLER-WRITTEN `AND` / `OR` ARRAY produces an UNNAMED prepared
-                      statement (0.66). Load-bearing for `acquireSql`, not an
+                      statement (0.66). `AND: { ... }` written as ONE object is one branch
+                      whatever the caller sends, so walkWhere tags it `fixedArity` and it
+                      keeps its name. Load-bearing for `acquireSql`, not an
                       implementation detail: a named statement is never deallocated and
                       each pooled connection accumulates its own, which is fine while
                       the set of SQL texts is fixed by the application's code. A
@@ -163,6 +182,28 @@ src/
                       builder sees one call and cannot know whether the length varies
                       across calls.
     deferred.ts    , DeferredQuery, QueryInterfaceOptions, middleware/event types.
+                      `queryInterfaceFactory` returns a `TableClient` (see below).
+    table-client.ts, The table-accessor contract every engine implements (0.90).
+                      `TABLE_METHODS` classifies each of QueryInterface's 34 public accessor
+                      methods as `read` / `write` / `deferred` (the 15 `build*`) /
+                      `primary` (`explain`, `cacheStats`), and `satisfies` a partial record
+                      of QueryInterface's keys, so naming a method the class lacks fails to
+                      compile. A type-only exhaustiveness check
+                      (`EveryQueryInterfaceMemberClassified`) fails the build, NAMING the
+                      member, when QueryInterface gains a public member that is neither in
+                      `TABLE_METHODS` nor in `SqlInternalMember` (the five SQL-only
+                      internals: collectWhereParams, fingerprintWhere, withFingerprint,
+                      upsertNeedsLookup, resetUnlimitedWarnings). `TableClient<T, R, M>` is
+                      `Pick<QueryInterface, TableMethod>`. `PowqlInterface implements` it,
+                      so a missing or mistyped PowDB method is a compile error rather than
+                      `undefined` at runtime; PowDB's `build*` throw E017 (it has no
+                      deferred query, so `db.pipeline()` / `$transaction([...])` were a
+                      `TypeError`) and its `cacheStats()` answers zeros. client.ts's
+                      `READ_OPERATIONS` is DERIVED from the `read` entries.
+                      `asQueryInterface` is the ONE cast from `TableClient` back to
+                      `QueryInterface`, used by both factory call sites in client.ts
+                      (`TransactionClient.table`, `TurbineClient.buildTableQI`); it sits next
+                      to the check that makes it sound. Type-only imports, so no cycle.
     builder.ts      - QueryInterface class + the execute FACADE. Owns the
                       constructor, connection/middleware/timeout execution, the SQL-template
                       cache (acquireSql + crossCheckCache), findMany/findUnique/findFirst +
@@ -219,12 +260,36 @@ src/
                       `upsertLookupReason` (0.81) is the one authority on when `upsert()`
                       looks the row up instead of running `buildUpsert`'s statement
                       (`where` not pinned to `create`, an empty `update`, a global filter
-                      on an engine without `supportsUpsertUpdateWhere`); `buildUpsert`
+                      on an engine without `supportsUpsertUpdateWhere`, and since 0.90
+                      `other-unique-key` on MySQL: `ON DUPLICATE KEY UPDATE` has no
+                      conflict target and updates whichever unique key collides first, so
+                      a `create` that can collide on a key `where` does not pin, the
+                      primary key included, could update a row `where` does not name);
+                      `buildUpsert`
                       REFUSES the same shapes, since a batched DeferredQuery has no round
                       trip for a lookup. The lookup itself is `upsertLookupFirst` in
                       builder.ts, which also takes nested relation writes and compiles both
                       halves BEFORE the lookup so validity never depends on whether the row
-                      exists.
+                      exists. `planCreateMany` (0.90) is the one sizing authority for
+                      `createMany`: it validates every row once, then `rowsPerStatement`
+                      measures the per-row parameter cost from one-row and two-row builds
+                      and caps it by `maxBindParameters` and, for a plain INSERT,
+                      `dialect.maxInsertRows`, so chunks are sized before any statement is
+                      built and no engine's own per-statement check refuses one. The MySQL
+                      reselect (0.90) re-reads a `create` only by a key whose value is known
+                      EXACTLY (a supplied primary key, the driver's insert id for a
+                      server-numbered key, decided by `isGenerated` when the metadata
+                      records it, else a unique key supplied in full) and refuses with E017
+                      before the INSERT when there is none: it used to re-read by a guessed
+                      key and could return another tenant's row. A write that moves its row
+                      out of its own `where` locks by `where` and re-reads by key
+                      (`lockMovedRowKey`), and a re-read or lock matching more than one row
+                      is E017 and rolls back. A multi-statement write runs in
+                      `inOneTransaction` (builder.ts) on one deadline (`deadlineExec`), so
+                      `timeout` bounds the whole call. `divide` on a MySQL integer column
+                      compiles to `DIV` (truncates, as PostgreSQL does), and a `Date`
+                      written to a `date` column binds its UTC day on every SQL engine
+                      through the same `utcDateTimeRewrite` gate the where side uses.
     relations.ts    - Relation + orderBy compilation: the json_agg nested-relation
                       machinery (buildSelectWithRelations, buildRelationSubquery,
                       buildManyToManySubquery), the positional-encoding shapes + nested-row
@@ -429,6 +494,13 @@ src/
                       `{ user: { email: undefined } }` is exactly `{}`. Never prunes `data` /
                       `create` / `update`, an operand value, or an object written empty. Also
                       carries prisma-compat's inclusive-cursor flag through the prune.
+                      The cursor refusals sit beside it (0.90, every engine): `assertCursorWritten`
+                      refuses `cursor: null`, a non-object and `{}` (each used to mean "no
+                      cursor", so `cursor: last ? { id: last.id } : {}` cut page one from a
+                      different order than every later page), and `assertCursorNotEmptied`
+                      a cursor whose every field was `undefined`. A NULL cursor value on a
+                      NOT NULL or primary-key column is refused by the cursor value check in
+                      filters.ts.
 
     column-ref.ts  , `col('field')`, a column compared against another column of the same
                       row (`{ equals: col('b') }` emits `"a" = "b"`). BRANDED with a
@@ -583,7 +655,11 @@ src/
                       not caught; ports are 6543 AND 6432 (PgBouncer's documented default
                       `listen_port`, included because the errors are asymmetric: a false
                       positive costs one flag on an interactive command, a false negative is
-                      the hazard itself). (2) `withStatementTimeoutOption`: index-stats.ts
+                      the hazard itself). Since 0.90 `migrate up` / `deploy` / `down` refuse
+                      the same way (`--allow-pooler` overrides; `--dry-run`, `status` and
+                      `create` are not refused), because the migration lock is a
+                      SESSION-level advisory lock a pooler can take on one backend and
+                      release on another. (2) `withStatementTimeoutOption`: index-stats.ts
                       used to issue a SESSION-LEVEL `SET statement_timeout` on a pool built
                       from a connection string, which through a pooler poisons a SHARED
                       backend that is not DISCARDed on release. It now goes in the
@@ -651,8 +727,12 @@ src/
                       up by TABLE name, so a key that names neither was a filter applied to
                       nothing, which for a tenancy boundary is the worst way to fail.
                       `normalizeGlobalFilters` maps every key to its table, refuses an unknown
-                      key and a static filter naming no column or relation, and returns the
-                      map the builder reads. `tableAccessorName` is the ONE place the accessor
+                      key and a static filter naming no column or relation, runs each static
+                      filter through `foldWhereFor` so its WHOLE shape is checked at every
+                      depth (a relation filter value like `author: { is: 5 }` used to pass
+                      construction and fail the first query on that table, i.e. a request),
+                      prefixes any E003 with `globalFilters["<key>"]`, and returns the map
+                      the builder reads. `tableAccessorName` is the ONE place the accessor
                       name is derived. Function filters are checked per query by the resolver.
 
   supplied-pool-types.ts, Turbine's column readings on a pool the CALLER supplied (0.90).
@@ -791,7 +871,30 @@ src/
                         `LIMIT -1` / `LIMIT 2^64-1` respectively), `buildUpdateStatement`/
                         `buildDeleteStatement` (mid-statement `OUTPUT`), and
                         `buildRelationSubquery` (SQL Server's `FOR JSON PATH` override).
-                        `openStream()` and the `DialectIntrospector` round out the seam.
+                        `openStream()` and the engines' `DialectIntrospector` round out the
+                        seam. `postgresDialect` has NO `introspector` since 0.90:
+                        `introspect()` reads the PostgreSQL catalog itself when a dialect
+                        has none, and the field reached introspect.ts through a dynamic
+                        import that a non-splitting bundler inlines WHOLE, so the catalog
+                        reader rode in the serverless entry and every engine entry (about
+                        4 to 6 kB brotli each) for a function none of them call.
+                      • Value-parity hooks (0.90), each ABSENT on `postgresDialect`, so the
+                        spread that builds every engine dialect inherits nothing and a
+                        presence test is sound (the inverse of the trap below: an engine
+                        opts in by defining the hook on its own dialect, and PostgreSQL's
+                        SQL is unchanged). `averageArgument(ref, type)` widens the `AVG`
+                        input (MySQL and SQL Server; used by SELECT and HAVING alike in
+                        aggregates.ts), because SQL Server averages an INT as an INT and
+                        MySQL as a DECIMAL with four more digits. `decodeColumnValue(type)`
+                        (SQL Server: json/jsonb, stored as NVARCHAR) is resolved once per
+                        column in the row parser's `getCellKinds` and cached per table in
+                        `dialectDecodeCache` as a `CELL_DIALECT` cell, so top-level and
+                        nested rows decode the same way; it keys on the METADATA type, so a
+                        schema introspected from SQL Server (`nvarchar`) still reads text.
+                        `maxInsertRows` (SQL Server: 1000) caps the rows of a plain
+                        `INSERT ... VALUES`, read by writes.ts `rowsPerStatement`; an
+                        `onConflict` MERGE reads its rows as a derived table and is not
+                        bound by it.
                       • `escapeLikePattern` (0.66), per-engine LIKE metacharacter
                         escaping for a bound `contains` / `startsWith` / `endsWith`
                         operand, defaulting to the shared `escapeLike` (the
@@ -840,21 +943,46 @@ src/
                       documented fallback). `sqliteDialect` uses `resultStrategy:
                       'returning'`, `json_group_array(json(...))` nested relations, and
                       `COLLATE NOCASE` (ASCII-only) for insensitive matching. The
-                      in-process test / edge / "try it in 10 seconds" engine.
+                      in-process test / edge / "try it in 10 seconds" engine. Since 0.90 a
+                      column the SCHEMA declares boolean or json/jsonb reads back as a
+                      boolean / parsed value on every read path. The direct-read half is
+                      `resultColumnDecoders`, which reads `StatementSync.columns()` (declared
+                      type plus origin table and column, all null for an expression, so a
+                      computed column is never decoded) and so needs Node 22.16+ / 23.11+;
+                      it is feature-detected, and on the band without it the columns keep
+                      reading as stored. The join half is the boolean / json `jsonWireRule`,
+                      gated on `driverReportsDeclaredTypes()`, the SAME capability question,
+                      so the two halves cannot split into a strategy-dependent type flip.
+                      REAL / NUMERIC through a join are carried as `printf('%!.17g')` text
+                      and rebuilt (`json_object` rounds to 15 digits on SQLite 3.47 to 3.51).
+                      A safe integer binds as INTEGER (node:sqlite binds every JS number as
+                      REAL), so integer `divide` truncates and `3` written to TEXT is
+                      `'3'`.
 
   mysql.ts         , `turbine-orm/mysql` engine. `await turbineMysql(url | config |
                       mysql2-pool, schema, options?)`, MySQL 8.0+ via the optional peer
                       `mysql2` (loaded by dynamic import; never a root dep). `mysqlDialect`
                       uses `resultStrategy: 'reselect'` (no RETURNING, write then re-SELECT
                       by PK/where), `JSON_ARRAYAGG`/`JSON_OBJECT` nested relations, and
-                      named `:pN` placeholders. `createMany` returns `[]` (count-not-rows).
+                      named `:pN` placeholders. A plain `createMany` returns `[]`
+                      (count-not-rows); one with `onConflict` re-reads its rows by the
+                      conflict key. A `create` re-reads by an exactly known key or is
+                      refused with E017 before the INSERT (see writes.ts), and introspection
+                      marks an `AUTO_INCREMENT` column `isGenerated` (0.90), so the insert id
+                      is used even when another column also has a default. `averageArgument`
+                      gives `_avg` over a non-BIGINT integer full double precision
+                      (`+ 0E0`); BIGINT keeps its exact DECIMAL average.
 
   mssql.ts         , `turbine-orm/mssql` engine. `await turbineMssql(url | config |
                       mssql-pool, schema, options?)`, SQL Server 2016+ via the optional
                       peer `mssql` (dynamic import). `mssqlDialect` uses `resultStrategy:
                       'output'` (`OUTPUT INSERTED.*` / `MERGE`), `FOR JSON PATH` nested
                       relations (`buildRelationSubquery` override), `OFFSET/FETCH` paging,
-                      and named `@pN` placeholders.
+                      and named `@pN` placeholders. 0.90: `maxInsertRows: 1000` (a larger
+                      `createMany` is chunked in one transaction instead of throwing),
+                      `decodeColumnValue` parses json/jsonb, and `averageArgument` makes
+                      `_avg` over an integer fractional (FLOAT, or DECIMAL(38,0) for BIGINT
+                      so the average stays exact).
 
   powdb.ts +       , `turbine-orm/powdb` engine (PowDB **≥ 0.7.1**).
   powql.ts            `await turbinePowDB(url | connOpts | pool | { embedded: dir, syncMode?, memoryLimit? }, schema, options?)`
@@ -867,7 +995,8 @@ src/
                       `import()`, `npm i turbine-orm` still pulls only `pg`. PowQL shares no
                       surface with `SELECT…FROM…WHERE`, so this is NOT a `Dialect`: powql.ts ships
                       a parallel `PowqlInterface` (PowQL generator with the same public method
-                      surface as `QueryInterface`) wired in via the `queryInterfaceFactory`
+                      surface as `QueryInterface`, enforced since 0.90 by `implements
+                      TableClient`, see query/table-client.ts) wired in via the `queryInterfaceFactory`
                       option on `QueryInterfaceOptions`, `TurbineClient.table()` calls that
                       factory when present, else `new QueryInterface` (SQL engines untouched).
                       powdb.ts holds the driver shims (`PowdbPool` over the client `Pool`;
@@ -1102,9 +1231,25 @@ src/
                       pii-tagged column is unaffected by ANY of the above and emits
                       byte-identical SQL (tested). TableMetadata.checks round-trips named check
                       constraints through generate (emitted into metadata.ts).
+                      `ColumnMetadata.declaredTsType` (0.90) carries a `defineSchema` `tsType`
+                      (without `| null`) and ONLY `turbine generate` reads it; `tsType` stays
+                      the type mapped from the database type, because every engine branches
+                      on it. A declared type used to replace `tsType` in the metadata the
+                      engines read, so embedded PowDB created integer, timestamptz and
+                      boolean columns as strings and MySQL read a nested boolean as `1`.
 
   schema-builder.ts, defineSchema() API for code-first schema definitions. Produces
-                      SchemaDef objects consumed by schema-sql.ts for DDL generation.
+                      SchemaDef objects consumed by schema-sql.ts for DDL generation. Every
+                      refusal of a malformed declaration is `ValidationError` (E003) since
+                      0.90 (nine threw a plain `Error`: an unknown column type, an enum
+                      with no `enumName`, a vector with no `dimensions`, a non-array
+                      `indexes` / `manyToMany` / `checks` / `primaryKey`, a composite
+                      primary key naming no column, an unknown type on the deprecated
+                      `column` proxy). It also refuses an unknown key naming the nearest
+                      valid one, a `__proto__` table or column, an index with both `columns`
+                      and `docField`, and a `tsType` that is not one TypeScript type on one
+                      line (`tsTypeTextProblem`, which generate.ts also applies to
+                      `columnTypes`, since the text is emitted verbatim into source).
 
   schema-metadata.ts, `defineSchema()` -> `SchemaMetadata` bridge (`schemaDefToMetadata`).
                       The pure-function equivalent of introspect + generate, for the paths
@@ -1342,7 +1487,7 @@ The core of Turbine's single-query strategy lives in `buildRelationSubquery()` (
 
 **Query arg types** (query/types.ts): `WhereClause<T>` supports equality, null checks, operators (`gt`, `gte`, `lt`, `lte`, `not`, `in`, `notIn`, `contains`, `startsWith`, `endsWith`), `mode: 'insensitive'` for ILIKE, `OR`/`AND`/`NOT` combinators, and relation filters (`some`/`every`/`none`). `WithClause` maps relation names to `true | WithOptions`. `WithOptions` supports nested `with`, `where`, `orderBy`, `limit`, `select`, and `omit`.
 
-**Atomic updates** (query/types.ts): `UpdateOperatorInput<V>` supports `set`, `increment`, `decrement`, `multiply`, `divide` for numeric fields. These generate `col = col + $n` style SQL for concurrent safety.
+**Atomic updates** (query/types.ts): `UpdateOperatorInput<V>` supports `set`, `increment`, `decrement`, `multiply`, `divide` for numeric fields. These generate `col = col + $n` style SQL for concurrent safety. `divide` on an integer column truncates on every engine (0.90: MySQL emits `DIV`, and SQLite binds a safe integer as INTEGER).
 
 **Generated types** (generate.ts): The code generator emits three files:
 - `types.ts`, Entity interfaces (singularized PascalCase), `*Create` types (optional for PK/default/nullable fields), `*Update` types (all non-PK fields optional), and `*With*` interfaces for each relation.
@@ -1393,7 +1538,7 @@ which exists because the previous copy asserted a snake_case column name was rej
 
 **Config resolution** (`cli/config.ts`): Searches for `turbine.config.ts` / `.mts` / `.js` / `.mjs`, merges with `--url`/`--out`/`--schema` flags and `DATABASE_URL` env var.
 
-**Migration system** (`cli/migrate.ts`): SQL-first migrations stored as timestamp-prefixed `.sql` files with `-- UP` and `-- DOWN` sections. Tracked in a `_turbine_migrations` table with SHA-256 checksums. Uses `pg_try_advisory_lock()` to prevent concurrent migration runs. Each migration runs in its own transaction. Checksum validation detects modified migration files. Destructive statements (both `migrate up`/`down` and, since 0.36, `push`) require a two-step typed confirmation (`destroy my data` then `yes`) or `--allow-destructive`. `migrate create <name> --recipe backfill` (0.36) scaffolds the sanctioned two-phase type-change pattern from the MIGRATION_RECIPES registry (fully commented: nullable add → batched keyed UPDATE → SET NOT NULL → atomic rename swap); `--recipe` without a name errors.
+**Migration system** (`cli/migrate.ts`): SQL-first migrations stored as timestamp-prefixed `.sql` files with `-- UP` and `-- DOWN` sections. CI gates (0.90): `push --dry-run --exit-code` exits 2 on a statement OR on a drift warning it cannot apply (`driftWarnings`: a declared UNIQUE index over a non-unique one of that name, a removed enum label, an undeclared index on a table that manages its indexes), while disclosed not-compared items and a named CHECK that differs only by PostgreSQL's rewrite of the expression stay 0; `migrate status --exit-code` exits 2 on a pending, modified, missing or MISNAMED migration file. `generate` refuses a `columnTypes` key naming no table with a did-you-mean, and with `include` set it reads the table list once (`generatorColumnTypesFor`) so a typo is not mistaken for a table the filter left out. Tracked in a `_turbine_migrations` table with SHA-256 checksums. Uses `pg_try_advisory_lock()` to prevent concurrent migration runs. Each migration runs in its own transaction. Checksum validation detects modified migration files. Destructive statements (both `migrate up`/`down` and, since 0.36, `push`) require a two-step typed confirmation (`destroy my data` then `yes`) or `--allow-destructive`. `migrate create <name> --recipe backfill` (0.36) scaffolds the sanctioned two-phase type-change pattern from the MIGRATION_RECIPES registry (fully commented: nullable add → batched keyed UPDATE → SET NOT NULL → atomic rename swap); `--recipe` without a name errors.
 
 **Studio** (`cli/studio.ts`): Local web UI served over Node's built-in `http` module, no new runtime deps, read-only by default. ORM-native since v0.19: there is NO raw-SQL surface. The Query tab (default) is a visual `findMany` builder; `POST /api/builder` validates every identifier (table/relation/field/orderBy) against the introspected schema and compiles the args with `QueryInterface.buildFindMany` (`sqlCache: false`, all values as `$N` params). Saved queries are builder-kind only, legacy raw-SQL entries are dropped on load with a console notice. Binds `127.0.0.1` by default (warns loudly on non-loopback hosts), authenticates via a random 24-byte hex token (constant-time check on every `/api/*` route), per-session rate limiting (100 req/60s), refuses cross-origin requests, and ships nonce-based CSP + security headers (`script-src 'self' 'nonce-...'`, no unsafe-inline in script-src since 0.36; style-src keeps it; `X-Content-Type-Options`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`). Every read runs inside `BEGIN READ ONLY` with `SELECT set_config('statement_timeout', $1, true)` (NOT `SET LOCAL ... = $1`, which Postgres rejects, that was the 0.17.0 critical bug) and `set_config('search_path', $1, true)` pinned to the configured `--schema`. **Write mode (0.36, `--write`; bulk since 0.38):** `/api/row/update|insert|delete` POST routes exist ONLY when writable (404 otherwise, deliberately not 403); each rebuilds the predicate from the FULL primary key alone via `extractPkWhere` (extra where keys dropped, operator objects refused, PK-addressed by construction), validates table/columns against metadata, compiles via buildUpdate/buildCreate/buildDelete (`sqlCache: false`), runs in a plain BEGIN txn with the same parameterized timeout + search_path, and requires a matching `Origin` (absent OR mismatched → 403). insert/delete also accept `rows: [...]` (MAX_BULK_ROWS=500): per-row validation up front, one statement per row in ONE all-or-nothing txn (any no-match → ROLLBACK + 404); bulk update refused; predicate-based mutations never exist. Views and PK-less tables refused. Loud startup warning + persistent red WRITE MODE banner. **PII redaction:** PII-tagged cells are redacted SERVER-SIDE ("•• redacted ••") before serialization, table rows, builder rows, nested `with` rows (redactBuilderRows walks the tree against each relation's target table), and the post-write echo; redacted columns are also excluded from the Data-tab ILIKE search OR-set, orderBy, AND the per-column `filters` param (even isNull, null-ness is an oracle too; parseTableFilters 400s). The Data tab's `filters` (JSON array, max 10, ops equals/not/contains/gt/gte/lt/lte/isNull/notNull) compile via a param-counter buildWhere shared with search, engine-aware placeholders. `--show-pii` reveals (terminal warning + persistent PII SHOWN banner). DB-less perimeter tests drive the exported `handleRequest` (src/test/studio-write.test.ts). **Temporal parity (0.54):** Studio builds a RAW pg pool and never constructs a TurbineClient, so it used to keep the driver's local-zone parsers and render a `date` cell as the previous evening east of UTC, which in `--write` is also the value an edit echoes BACK into the column; the Postgres path (never demo, which is sqlite) now calls `registerUtcTemporalParsers()` from query/utils.ts, the same helper client.ts uses. `cli/mcp.ts` does the same for its sampled rows. **Demo mode (0.37, `--demo`):** boots with NO DATABASE_URL against a seeded in-memory store (`cli/studio-demo.ts`: DEMO_SCHEMA users/posts/comments/orgs with pii-tagged email/phone + deterministic seed) backed by the sqlite engine over `node:sqlite` `:memory:` (Node >= 22.5, dynamic import with a clear error). `StudioContext.demo` + `dialect` branch the few PG-isms (pg_class counts → COUNT(*), ILIKE → LOWER LIKE, no BEGIN READ ONLY/set_config/search_path, `:pN` placeholders, `parseDemoRelationRows` re-parses sqlite's JSON-string relation columns); `POST /api/demo/mode` (demo-only, token+Origin gated) flips ctx.writable/ctx.showPii live for the UI's two toggle pills; boots read-only + redacted; each launch pristine, nothing persisted (saved queries too: demo routes them to ctx.memorySavedQueries, never .turbine/studio-queries.json, and never reads the real file). Postgres path byte-identical when off; tests in src/test/studio-demo.test.ts drive the REAL in-memory store through handleRequest. UI is an embedded single-file HTML/CSS/JS (`studio-ui.html`, prebuilt into `studio-ui.generated.ts` by `npm run gen:studio`) with Query / Data / Schema tabs matching the turbineorm.dev dark theme.
 
@@ -1414,12 +1559,12 @@ which exists because the previous copy asserted a snake_case column name was rej
 ## Key Patterns
 
 - **Streaming has TWO public shapes (0.71).** `findManyStream` yields rows; `findManyStreamBatches` yields `T[]`. They are not stylistic alternatives: `yield parseRow(row)` per row means 50,000 rows is 50,000 promise resolutions and microtask turns, measured at **~7 ms / ~139 ns per row** over a 50K drain, which was the largest single component of the streaming gap. Both share ONE parser-selection site (`makeStreamRowParser`) and one database path (`streamRaw`), so the flatten / positional / PII decisions cannot diverge between them. `findManyStream` deliberately does NOT delegate to the batch method: doing so would parse a batch ahead of the consumer, so a `break` after row 1 would pay for 999 more rows. Its laziness is pinned by a test.
-- **Adding a read method to `QueryInterface` means TWO hand-maintained lists, and both fail SILENTLY.** `READ_OPERATIONS` in client.ts decides what a read replica may serve, so a missing name keeps working and just runs on the PRIMARY, with no error and no failing test. `PowqlInterface` is a PARALLEL implementation rather than a subclass, so TypeScript does not require it to have the method, and a missing one is `undefined` at runtime: the PowDB user gets `TypeError: not a function` instead of the typed E017 telling them to page with `findMany`. `findManyStreamBatches` hit both. `src/test/read-operations-drift.test.ts` closes it MECHANICALLY (a name starting with `find`, or count/aggregate/groupBy, is a read; writes match none of it), so a new read method is covered the day it is written with no edit to the test, and it carries an anti-vacuous assertion because reflection returning `[]` would make every check pass while testing nothing.
+- **Adding a public method to `QueryInterface` fails the build until it is classified (0.90).** It must go in `TABLE_METHODS` (query/table-client.ts) as `read` / `write` / `deferred` / `primary`, or in `SqlInternalMember`, and `PowqlInterface`, which `implements TableClient`, must then have it with a matching signature. `READ_OPERATIONS` in client.ts, which decides what a read replica may serve, is derived from the `read` entries. Both used to be hand-maintained lists that failed SILENTLY: a read missing from `READ_OPERATIONS` just ran on the PRIMARY, and a method missing from `PowqlInterface` was `undefined` at runtime (`findManyStreamBatches` hit both; PowDB's `build*` and `cacheStats` were a `TypeError` until 0.90). `src/test/read-operations-drift.test.ts` stays as the run-time check (a name starting with `find`, or count/aggregate/groupBy, is a read; writes match none of it), with its anti-vacuous assertion, because reflection returning `[]` would make every check pass while testing nothing.
 - **Never write a literal NUL byte into source.** `query/builder.ts`'s row-decode cache key uses NUL as its delimiter, correctly, because it is the one byte a Postgres identifier cannot contain even quoted, so no table or column name can forge a collision. Write it as the `\u0000` ESCAPE. A raw NUL makes byte-oriented tools classify the file as binary, and `grep` then reports ZERO matches for a term that is present rather than saying it declined to look. `query/builder.ts` is the largest file under `src/query/` and that silent empty result sent more than one search down the wrong path.
 - All SQL identifiers quoted via `quoteIdent()`, doubles internal `"` chars per Postgres rules
 - All user values parameterized (`$1, $2, ...`), never string-interpolated
 - LIKE patterns escaped via `escapeLike()`, escapes `%`, `_`, `\`
-- Empty-where guard blocks accidental mass mutations: update/delete with `{}` or all-undefined where throws `ValidationError` unless `allowFullTableScan: true`
+- Empty-where guard blocks accidental mass mutations: update/delete with `{}`, an all-undefined where, or one that folds to always-true (`NOT: { OR: [] }`, `{ id: { notIn: [] } }`, see `foldWhere`) throws `ValidationError` unless `allowFullTableScan: UNSAFE` (a literal `true` throws)
 - `LRUCache` bounds the SQL template cache at 1,000 entries (Map insertion order for O(1) eviction)
 - Module has no side effects, `setTypeParser` for int8 is gated behind a static flag in the TurbineClient constructor
 - ESM source with `.js` extensions (NodeNext resolution), CJS output via separate `tsconfig.cjs.json`
