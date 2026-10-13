@@ -79,6 +79,28 @@ In a `groupBy` `having`, `NOT: [a, b]` now means `NOT a AND NOT b`, as it does i
 
 **Find it:** `grep -rnE "OR:\s*[a-zA-Z_]" src/` for lists built at runtime, and `grep -rn "having" src/` for `NOT` arrays.
 
+### An `OR` branch with no condition matches every row
+
+A branch that applies no condition, such as `{}` or `{ AND: [] }`, makes its `OR` true for every row, as `OR: [{}]` already was. A branch emptied by `undefined` (`{ email: undefined }`) is still removed from the list before this rule applies. The branch used to be dropped, so `OR: [{ id: 1 }, {}]` matched only row 1, its `NOT` matched every other row, and a `deleteMany` over that `NOT` deleted most of the table. A mutation whose `where` is always true this way is now refused (see [below](#mutations-refuse-a-where-that-is-always-true)). The rule holds on every engine, PowDB included. `OR: [{}]` now compiles to `(1 = 1)`, which shows in logged or snapshotted SQL.
+
+```ts
+const branches = [{ id: 1 }, filterFor(input)]; // filterFor returns {} for a blank input
+// 0.81: users with id 1. 0.90: every user.
+await db.users.findMany({ where: { OR: branches } });
+// Leave the empty branch out of the list:
+await db.users.findMany({ where: { OR: branches.filter((b) => Object.keys(b).length > 0) } });
+```
+
+**Find it:** `OR` lists whose members are built by helpers that can return `{}`.
+
+### MySQL compares a number with a text column as text
+
+On MySQL a number or boolean compared with a text column binds as text, in `where`, in `in` / `notIn` lists and in `having` `_min` / `_max`. MySQL compared the two as numbers, so `{ resetToken: 0 }` matched every token that does not start with a digit, and `having: { token: { _min: 0 } }` matched a group whose smallest token was `'abc'`. Pass the value with the column's type (`'0'` for a text column).
+
+### JSON path keys with special characters find their value
+
+On MySQL, SQLite and SQL Server a JSON path key holding a backslash, a quote or a newline is written as a JSON string literal. Such a key used to find nothing.
+
 ### Generated clients carry `pii` and `updatedAt` from your schema file
 
 `turbine generate` introspects the live database, which carries no code-first tags, so a client generated that way returned `pii: true` columns and never stamped `updatedAt` columns. `generate` now reads your `defineSchema` file (`schemaFile`, default `./turbine/schema.ts`) and applies `pii`, `updatedAt` and `maxLength` to the introspected schema.
@@ -183,6 +205,10 @@ Several engines returned a different value than PostgreSQL for the same column a
 - **MySQL: integer `divide` truncates** like PostgreSQL (`75 / 2` is `37`, was `38`).
 - **SQL Server: `json` columns read back parsed.** A column your schema declares `json` or `jsonb` reads back as the parsed value, at top level and inside `with` rows. It used to read back as JSON text.
 - **MySQL: a bare JSON document in a `where` is compared as a document.** `{ data: { a: 1 } }` used to be compared as a string, so it matched nothing and its `NOT` matched every row.
+- **MySQL: `in` and `notIn` match what `equals` and `not` match.** The list was compared as JSON values, so a boolean, a date or time, a binary value, a decimal or bigint written as a string, and text under a case-insensitive collation never matched, and `notIn` matched every row: `deleteMany({ where: { published: { notIn: [true] } } })` deleted the published rows too.
+- **SQLite and SQL Server: list elements bind as the scalar does.** SQLite takes a bigint past 2^53 (it threw a `TypeError`) and binary values (they matched nothing). SQL Server takes bigint and `Date` elements.
+- **MySQL and SQLite: `batched` relations with binary or bigint keys** attach children to the right parent, as the join strategy does. They went to the wrong parent or to none.
+- **MySQL: `_avg` over a `decimal` or `bigint` column** has the same value as PostgreSQL with a different number of digits (the input's scale plus 4, against PostgreSQL's 16 significant digits), and rounds a repeating quotient at a different digit. This is not changed in 0.90; compare averages numerically.
 
 **Find it:** SQLite code that compares a boolean to `1` / `0` or calls `JSON.parse` on a JSON column, the same `JSON.parse` on SQL Server, code that rounds or compensates for `_avg` on SQL Server or MySQL, and MySQL `divide` on integer columns.
 
@@ -293,6 +319,8 @@ In `update` data, `{ increment: 1 }` (and `decrement`, `multiply`, `divide`) on 
 
 On PowDB, global filters now apply on every relation load path (nested projections, native joins, batched loaders, link hops), and `skipGlobalFilters` reaches relations. A relation could return another tenant's rows before.
 
+A global filter holding a relation filter (`users: { posts: { some: { ... } } }`, `posts: { user: { is: { ... } } }`, function filters too) applies on every read, write and relation load. Every query on the table threw `TURBINE_E003`. A `batched` or `join` read whose `select` or `omit` leaves out a foreign key returns the related row instead of `null`, and nested `set` works instead of throwing `TURBINE_E003`.
+
 The relation filters `is`, `isNot`, a bare to-one filter, `is: null` and `isNot: null` now filter. They matched every row, `updateMany` and `deleteMany` included. `none`, `every` and `not: { ... }` follow SQL `NULL` semantics, `in` / `notIn` on a float column match whole numbers, `startsWith` / `endsWith` treat `%`, `_` and `\` literally, and `_min` / `_max` return the column's own type.
 
 ### SQLite: other callers wait for an open transaction
@@ -336,6 +364,11 @@ Each of these used to compile to no condition at all, which inside a relation fi
 - On a JSON column, a `not` whose object has only filter-operator keys (`not: { gt: 1 }`). It was compared as the literal document `{"gt":1}` and matched nearly every row. Write `NOT: { data: { ... } }` to negate a filter, or `not: jsonValue({ ... })` to compare against such a document.
 - A `distinct` element that is not a field-name string.
 - A `__proto__` key arriving from parsed input, which used to replace the argument object's prototype and drop the filter.
+- `is` / `isNot` on a to-many relation. Write `some`, `every` or `none`; the message names them.
+- An Invalid Date anywhere in a `where`, on every engine.
+- In an array filter, an unknown key or an `isEmpty` that is not a boolean.
+- In a relation's `with` options, `lock` (a locking read locks the queried table's rows only), and a `_count` relation entry other than `true`. An unknown `with` option is named once in the advice log.
+- A groupBy `by` that is missing, a string, an empty array or holds `null`. Write `by: ['name']`; for one group over every row, use `aggregate()`.
 
 ### A PII column in `select` needs `includePii: UNSAFE`
 
@@ -373,6 +406,8 @@ globalFilters: { orders: () => (isAdminJob() ? null : { tenantId: currentTenant(
 
 Three more `globalFilters` shapes throw at construction. A static `OR: { ... }` (an object where an array belongs) or a combinator holding a scalar or `null` throws `TURBINE_E003`; write `OR: [{ ... }]`. A static relation filter that is not a where object (`author: { is: 5 }`, `posts: { some: null }`) throws there too, instead of on the first query. A `skipGlobalFilters: [UNSAFE, ...]` entry that names no table throws `TURBINE_E003` with a suggestion. Entries may be table names (`blog_posts`) or accessors (`blogPosts`).
 
+Each static filter is also compiled at construction, so anything a query would refuse in it throws from the constructor, naming `globalFilters["key"]`: a bad operand, a plain `{ col }` object, an operator object with no operator, a misspelled column inside a relation filter, or an `undefined` value. So does a static filter that reaches its own table through relation filters, directly or through another table's filter; the message names the chain. Such a filter used to make every query on the table throw `RangeError`. An app that builds a client with a broken static filter and never queries that table now fails to start. Function filters that reach each other apply [once per chain](/global-filters#filters-flow-into-relations).
+
 ### Mutations refuse a `where` that is always true
 
 `update`, `updateMany`, `delete` and `deleteMany` refuse a `where` that is always true with the same `TURBINE_E003` as an empty `where`. These compiled to SQL that matched every row:
@@ -380,7 +415,11 @@ Three more `globalFilters` shapes throw at construction. A static `OR: { ... }` 
 ```ts
 await db.users.deleteMany({ where: { id: { notIn: excludedIds } } }); // excludedIds = []: TURBINE_E003
 await db.users.deleteMany({ where: { NOT: { OR: [] } } });            // TURBINE_E003
+await db.users.deleteMany({ where: { OR: [{ id: 1 }, {}] } });         // TURBINE_E003
+await db.users.deleteMany({ where: { email: { contains: '' } } });     // TURBINE_E003, email is NOT NULL
 ```
+
+The guard reads which columns are NOT NULL. On such a column `contains: ''` (and `startsWith` / `endsWith`), `not: null`, a comparison of the column with itself and `hasEvery: []` are always true, and so is a bare to-one relation filter (`{ author: {} }`) over a NOT NULL foreign key, except on SQLite and when the target table has a global filter. Reads with these shapes are unchanged.
 
 An always-false `where` (`{ id: { in: [] } }`, `OR: []`) is not refused; it matches nothing.
 
@@ -524,6 +563,7 @@ Such keys used to be ignored, which silently changed the DDL: a misspelt `defaul
 - `TimeoutError` carries `outcome`, see [above](#a-timed-out-query-is-cancelled-on-the-server).
 - A lock wait that hit the server's lock timeout (MySQL error 1205, SQL Server error 1222) is `LockNotAvailableError`. It was a plain `SerializationFailureError`. The code (`TURBINE_E013`), `isRetryable` and `instanceof SerializationFailureError` are unchanged; only a check of `err.name` or `err.constructor` sees the difference.
 - A transaction PostgreSQL rolled back instead of committing is `TransactionRolledBackError` (`TURBINE_E019`), new in 0.90, see [Transactions](#transactions).
+- A failed SQL-cache self-check is [`InvariantError`](/errors#e020) (`TURBINE_E020`), new in 0.90, with `invariant` set to `'sql-cache-lockstep'` or `'sql-cache-param-count'`. It was `ValidationError` (`TURBINE_E003`). It marks a Turbine bug, not a bad argument; report it. Two cheap forms of the check now run in every mode, production included (see [Observability](/observability#diagnostics-diagnostics)).
 
 ### An object written to a scalar column
 
@@ -640,10 +680,14 @@ await db.$transaction(async (tx) => {
 - Calling the client (not `tx`) from inside its own `$transaction` callback, or opening a nested `db.$transaction` there, throws `TURBINE_E017` instead of deadlocking. Use the `tx` argument.
 - `SQLITE_BUSY` and `SQLITE_LOCKED` are `SerializationFailureError` (`TURBINE_E013`, retryable) on every path, `db.pool.query` and `db.transaction()` included.
 - `isolationLevel` is accepted. SQLite transactions are serializable, and it used to produce a syntax error.
+- A string that is not a number, written to a numeric or boolean column, throws `TURBINE_E003`, as on PostgreSQL. SQLite stored it as text, so `{ flag: true }` never matched a `'true'` written to a boolean column. Surrounding whitespace is accepted, as SQLite converts it (`' 12 '` is stored as `12`).
+- A whole JSON document as a `where` value, and `not: <document>`, throw `TURBINE_E017`, as a pathless `equals` already did. SQLite compared JSON text, so key order decided the match. SQL Server refuses the same shapes.
+- `rawUnsafe` placeholders are `$1`, `$2` and so on, on SQLite, MySQL and SQL Server alike. A `?` placeholder, or a `$n` past the values given, throws `TURBINE_E003`. SQLite read `$1` as a parameter named `$1`, MySQL rejected it, and SQL Server read it as a money literal.
 
 ### MySQL
 
 - `NaN`, `Infinity` and an Invalid Date as a bound value throw `TURBINE_E003`. MySQL stored them as `0`.
+- An `in` / `notIn` list that takes the statement past MySQL's 65,535 placeholders throws `TURBINE_E003`, because each element is now its own placeholder. Split the list across several queries.
 - Data errors (too long, out of range, bad value, bad date, division by zero, invalid JSON) are `ValidationError` with `column` and `sqlstate`, instead of a plain driver error.
 - `create` on a table whose new key the engine cannot report back (a UUID or other default the server does not number, or no primary key) throws `TURBINE_E017` before the `INSERT`. It used to re-read by a guessed key and could return another row, another tenant's included. Pass the key in `data` (`crypto.randomUUID()` for a UUID key), or make it `AUTO_INCREMENT`.
 - A single-row `update`, `delete` or `upsert` whose re-read or lock matches more than one row (a number compared with a text key) throws `TURBINE_E017` and is rolled back. Pass key values with the column's type.
@@ -669,6 +713,16 @@ These change results on PowDB without an error:
 - An unknown relation in `with` is `RelationError` (`TURBINE_E005`), as on the SQL engines. It was `TURBINE_E003`, and it is now refused even when the base query matches no row.
 - An object written to a `json` column by `update`, `updateMany` or `upsert` is stored as the document. It was read as an atomic operator and refused. Only `{ set: ... }` is an operator on a `json` column.
 - `with: { _count: { rel: true } }` returns relation counts. It threw `Unknown relation _count`.
+- An `OR` with a branch that applies no condition (`OR: [{}, x]`) matches every row, and its `NOT` matches none, as on the SQL engines. `NOT: { OR: [x, {}] }` matched every row but `x`.
+- A bigint default past 2^53 keeps its digits.
+
+These also changed on PowDB in this release:
+
+- A number, bigint or boolean compared with or written to a `Date` column throws `TURBINE_E003`, as on PostgreSQL. It was bound as raw microseconds, so a filter matched nothing and a write stored the wrong instant. Pass `new Date(ms)` or ISO text.
+- A whole JSON document in a `where` (`{ meta: { a: 1 } }`, `not: doc`) throws `TURBINE_E017`, as a pathless `equals` already did. It was `TURBINE_E003`.
+- A `cursor` that names no row throws `TURBINE_E003` with the SQL engines' message. A valid cursor is still `TURBINE_E017`.
+- An `upsert` onto a key a global filter hides throws `NotFoundError` (`TURBINE_E001`), as on PostgreSQL, and writes nothing. It was `TURBINE_E008`.
+- Integer text such as `'9007199254740993'` is accepted for an integer column in writes and filters; other text is `TURBINE_E003` naming the column.
 
 ## Logging and diagnostics
 
@@ -740,7 +794,7 @@ Writes to `int8` also accept a `string` or `bigint`, and writes to `numeric` a `
 - **`migrate create --auto` and `--from-diff` refuse while migrations are pending.** The diff reads the live database, so it would repeat what the unapplied files do. Run `turbine migrate up` first, or pass `--allow-pending` when the pending files do not touch what the schema file describes.
 - **Migration filenames are stamped in UTC.** Existing local-time files keep working; the runner reads any 14-digit prefix. A file created after upgrading can sort before one a colleague created earlier the same day in a zone ahead of UTC, which the runner applies as an [out-of-order migration](/migrate#out-of-order-migrations).
 - **Lossless widenings are no longer destructive.** `int` to `bigint`, a longer `varchar` and similar changes apply without `--allow-destructive`. A narrowing is still refused.
-- **New CI flags.** `push --dry-run --exit-code` and `migrate status --exit-code` exit 2 on drift, and `migrate deploy --wait[=seconds]` waits for a concurrent deploy's lock. See [Checking for drift in CI](/migrate#checking-for-drift-in-ci). `push` also exits 2 when the diff carries a warning (a declared `UNIQUE` index over a non-unique one of that name, a removed enum label, an undeclared index on a table that manages its indexes), and `migrate status` when the directory holds a misnamed `.sql` file.
+- **New CI flags.** `push --dry-run --exit-code` and `migrate status --exit-code` exit 2 on drift, and `migrate deploy --wait[=seconds]` waits for a concurrent deploy's lock. See [Checking for drift in CI](/migrate#checking-for-drift-in-ci). `push` also exits 2 when the diff carries a warning (a declared `UNIQUE` index over a non-unique one of that name, a removed enum label, an undeclared index on a table that manages its indexes), and `migrate status` when the directory holds a misnamed `.sql` file or one with an upper-case `.SQL` extension, which the runner never runs.
 - **`migrate up`, `migrate deploy` and `migrate down` refuse a transaction-pooler URL** (a `pooler` or `pgbouncer` hostname, or port 6543 or 6432), because the session-level advisory lock can be taken on one backend and released on another. Use the direct endpoint, or pass `--allow-pooler`. Neon and Supabase projects often run migrations through the pooled `DATABASE_URL`, so expect this on the first deploy after upgrading. `--dry-run`, `status` and `create` are not refused.
 
 ### Generated DDL for MySQL, SQLite and SQL Server
@@ -753,6 +807,9 @@ Writes to `int8` also accept a `string` or `bigint`, and writes to `numeric` a `
 - MySQL foreign keys are emitted at table level, so they now exist. MySQL 8 parses and ignores an inline `REFERENCES`.
 - Text in a key position (primary key, unique, foreign key, declared index) is `VARCHAR(255)` on MySQL and `NVARCHAR(255)` on SQL Server. A longer key needs an explicit `varchar` with `maxLength`.
 - Defaults are translated per dialect (`now()`, `gen_random_uuid()`, `true` / `false`, `current_date`). On MySQL a non-`NULL` default on a `TEXT`, `BLOB` or `JSON` column is written as an expression (`DEFAULT ('member')`), a clock default on a `DATE` or `TIME` column as `(CURRENT_DATE)` or `(CURRENT_TIME)`, and a `DATETIME(n)` default follows the column's precision. MySQL rejected the old forms.
+- **Enum columns are declared on every engine.** `schemaToSQL` emitted PostgreSQL's `CREATE TYPE ... AS ENUM` everywhere. MySQL now gets `ENUM(...)`, SQLite a `TEXT` column with a `CHECK` over the labels, and SQL Server an `NVARCHAR` column with the same `CHECK`. Off PostgreSQL the enum must be declared in `defineSchema`'s `enums` and have at least one label (`TURBINE_E003` otherwise), an enum array is `TURBINE_E017`, and a MySQL label holding a backslash is `TURBINE_E003`.
+- **A `bytea` key is `VARBINARY(255)`** on MySQL and SQL Server (`VARBINARY(n)` with `maxLength`). `BLOB` and `VARBINARY(MAX)` cannot be a key, so such a table could not be created.
+- **Defaults accept `'it''s'` and a PostgreSQL cast** (`'x'::text`, the cast is dropped) on every engine. A default `schemaToSQL` cannot write is `ValidationError` (`TURBINE_E003`) instead of a plain `Error`. On MySQL a `TEXT`, `BLOB` or `JSON` default holding a quote or a backslash is written as hex bytes; as a literal it created fine and then failed every insert through Turbine's connections. A backslash in any other MySQL default is `TURBINE_E003`.
 - **MySQL timestamps are `DATETIME(3)`**, with a `CURRENT_TIMESTAMP(3)` default, so milliseconds are stored instead of rounded away. Existing tables keep bare `DATETIME` until you run `ALTER TABLE ... MODIFY col DATETIME(3)`.
 
 ### The destructive-migration guard flags more

@@ -308,6 +308,8 @@ const byRole = await db.users.groupBy({
 // [{ role: 'member', _count: 42, _sum: { viewCount: 9001 } }, { role: 'admin', _count: 3, _sum: { viewCount: 120 } }]
 ```
 
+`by` must be a non-empty array of field names: a missing, string or empty `by`, or a `null` entry, throws E003. For one group over every row, use `aggregate()`.
+
 ---
 
 ## 4. `where` clauses
@@ -507,7 +509,7 @@ await db.posts.updateMany({
 });
 ```
 
-**Empty-where guard.** `updateMany({ data, where: {} })`, an all-undefined `where`, or one that is always true (`NOT: { OR: [] }`, `{ id: { notIn: [] } }`) throws `ValidationError` (TURBINE_E003). To mass-mutate on purpose, import the `UNSAFE` symbol and pass it:
+**Empty-where guard.** `updateMany({ data, where: {} })`, an all-undefined `where`, or one that is always true (`NOT: { OR: [] }`, `{ id: { notIn: [] } }`, an `OR` with an empty branch, or on a NOT NULL column `contains: ''` and `not: null`) throws `ValidationError` (TURBINE_E003). To mass-mutate on purpose, import the `UNSAFE` symbol and pass it:
 
 ```ts
 import { UNSAFE } from 'turbine-orm';
@@ -758,6 +760,8 @@ Only a real tagged template is accepted: `db.raw([text])` throws E003. For SQL t
 ```ts
 await db.rawUnsafe('SELECT * FROM audit_2026 WHERE actor_id = $1', actorId);
 ```
+
+Write `$1`, `$2` and so on on every engine; SQLite, MySQL and SQL Server rewrite them to their own form. A `?`, or a `$n` with no value, throws E003.
 
 Inside a transaction, `tx.raw`, `tx.sql` and `tx.rawUnsafe` run on the transaction's connection:
 

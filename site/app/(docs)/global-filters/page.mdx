@@ -44,6 +44,10 @@ The map is checked when the client is constructed, because a filter that silentl
 - a static `AND` / `OR` / `NOT` that cannot be read as written: `OR: { ... }` (an object where an array belongs; write `OR: [{ ... }]`), or a combinator holding a scalar or `null`;
 - a static relation filter whose value is not a where object, such as `author: { is: 5 }` or `posts: { some: null }`, the same shapes a query refuses (see [Relation filters](/queries#relation-filters));
 - a value that is neither a where object nor a function, including `undefined`.
+- since 0.90, anything a query with that `where` would refuse, because each static filter is compiled once at construction: an operand that does not fit its operator or column, a plain `{ col }` object where `col()` is needed, an operator object with no operator (`{ name: { mode: 'insensitive' } }`), a misspelled column inside a relation filter, or an `undefined` value. The message starts with `globalFilters["<key>"]:`;
+- a static filter that reaches its own table through relation filters, such as `users: { posts: { some: {} } }` beside `posts: { author: { is: { active: true } } }`, where each filter applies inside the other's relation filter. The message names the chain. Before 0.90 such a filter made every query on the table throw `RangeError`.
+
+A broken static filter now stops the client from being built, even when the table is never queried.
 
 A static `null` is accepted and means "no filter for this table".
 
@@ -108,6 +112,8 @@ A target-table filter is applied to:
 - Relation `_count` and relation `orderBy: { posts: { _count: 'desc' } }`
 
 So a soft-delete filter on `posts` means a user's post `_count` counts only live posts, and `where: { posts: { some: {...} } }` matches only live posts.
+
+A filter can itself hold a relation filter, such as `posts: { author: { is: { active: true } } }`. The `users` filter then applies inside it, as it does inside any relation filter. Function filters that reach each other this way, or one that reaches its own table, apply once per chain: while a table's filter is being compiled, a relation that leads back to that table reads its rows unfiltered, which ends the chain. Static filters that form such a cycle are refused when the client is built (see above). Before 0.90 either kind made every query on the table throw `RangeError`, and on PowDB a filter holding any relation filter made every query on the table throw `TURBINE_E003`.
 
 ## Mutations and the empty-where guard
 

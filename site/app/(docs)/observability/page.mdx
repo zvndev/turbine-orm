@@ -164,7 +164,7 @@ logger: {
 | `unindexed-relation`, `flatten-fallback`, `relation-payload-json` | `warn` | Per-query relation advice, each printed once. Only while `diagnostics` advice is on. |
 | `unlimited-find-many` | `warn` | A `findMany` with no limit, when you turned on `warnOnUnlimited`. In every mode. |
 | `temporal-infinity` | `warn` | A stored `infinity` was read while `temporalInfinity` is unset. In every mode. |
-| `cache-mismatch` | `error` | The sampled SQL-cache self-check found a mismatch. The query also throws. |
+| `cache-mismatch` | `error` | The sampled SQL-cache self-check found a mismatch. The line is the error's message, and the query throws [`InvariantError`](/errors#e020) (`TURBINE_E020`). |
 | `prisma-compat-unknown-option`, `prisma-compat-native-spelling` | `warn` | [prisma-compat](/migrate-from-prisma) option advice. Only while `diagnostics` advice is on. |
 | `prisma-map-stale`, `prisma-compat-junction-collision` | `warn` | prisma-compat found its map out of date with `schema.prisma`, or two junction models claiming one table. |
 | `powdb-link-collision`, `powdb-link-drift`, `powdb-introspect-no-primary-key` | `warn` | PowDB link DDL and introspection. |
@@ -200,7 +200,8 @@ diagnostics: { mode: 'production', cacheCheck: { sample: 0.001 } }
 ```
 
 - `advice` is a boolean.
-- `cacheCheck` is `'every-hit'`, `'off'`, or `{ sample }` with `sample` in `(0, 1]`. The self-check rebuilds the SQL on a cache hit and compares it with the cached text. A mismatch is a Turbine bug, and the query throws.
+- `cacheCheck` is `'every-hit'`, `'off'`, or `{ sample }` with `sample` in `(0, 1]`. The self-check rebuilds the SQL on a cache hit and compares it with the cached text. A mismatch is a Turbine bug, and the query throws [`InvariantError`](/errors#e020) (`TURBINE_E020`, `invariant: 'sql-cache-lockstep'`) before anything is sent.
+- Two cheaper checks run in every mode, including production, `cacheCheck: 'off'` and `sqlCache: false`. On a cache miss, the parameters the cache will collect for later calls must equal the ones the build produced (`'sql-cache-lockstep'`). On a hit, the number of collected parameters must match the cached statement (`'sql-cache-param-count'`). Neither depends on `cacheCheck`, and neither message carries a bound value.
 - An unknown mode or key, a non-boolean `advice`, or a sample outside `(0, 1]` throws `ValidationError` (E003) at construction.
 
 The environment variables still work when `cacheCheck` is not set. `TURBINE_DISABLE_CACHE_CHECK=1` turns the self-check off in any mode. In production mode, `TURBINE_CACHE_CHECK_SAMPLE` sets a sample rate. When both are set, the disable variable wins. An explicit `cacheCheck` wins over both.

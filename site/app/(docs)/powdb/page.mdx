@@ -143,7 +143,7 @@ for (const stmt of powqlSchemaDDL(SCHEMA)) {
 
 `PowqlSchemaDDLOptions` carries `emitLinks` (also emit link DDL for the schema's relations, gated on the `entityLinks` capability) and a `capabilities` set, so a statement an older engine cannot parse is refused at build time rather than at the wire.
 
-Type mapping is deliberately narrow: `powqlColumnType(col)` maps a Turbine column to one of `'str' | 'int' | 'float' | 'bool' | 'json'` (`PowqlType`). It never emits `uuid`, `datetime` or `bytes`, because PowQL has no such types; a `Date` binds as integer microseconds. `isJsonColumn(col)` is the predicate behind the `json` mapping.
+Type mapping is deliberately narrow: `powqlColumnType(col)` maps a Turbine column to one of `'str' | 'int' | 'float' | 'bool' | 'json'` (`PowqlType`). It never emits `uuid`, `datetime` or `bytes`, because PowQL has no such types; a `Date` binds as integer microseconds. Since 0.90 a number, bigint or boolean compared with or written to a `Date` column throws `ValidationError` (`TURBINE_E003`), as on PostgreSQL; pass `new Date(ms)` or ISO text. Before, the number was bound as raw microseconds, so a filter matched nothing and a write stored the wrong instant. `isJsonColumn(col)` is the predicate behind the `json` mapping.
 
 Two column kinds have no mapping at all and throw `ValidationError` (`TURBINE_E003`) naming the column, rather than being coerced into something wrong:
 
@@ -158,7 +158,7 @@ A composite primary key's own index (`<table>_pkey` in introspected metadata) is
 
 ## Upsert and aggregates
 
-`upsert` updates the row its `where` names, or inserts `create`, as on the SQL engines. PowQL's native `upsert … on .col` statement is used for the one shape it expresses: a single-column primary key whose `where` value is the one `create` carries, a non-empty `update`, and no global filter on the table. Every other shape looks the row up by `where` first, then updates it or inserts `create`, in one transaction. That covers a unique non-key column, a composite key, nested writes, an empty `update`, and a table under a [global filter](/global-filters), where the lookup and the update carry the filter so another tenant's row is never overwritten.
+`upsert` updates the row its `where` names, or inserts `create`, as on the SQL engines. PowQL's native `upsert … on .col` statement is used for the one shape it expresses: a single-column primary key whose `where` value is the one `create` carries, a non-empty `update`, and no global filter on the table. Every other shape looks the row up by `where` first, then updates it or inserts `create`, in one transaction. That covers a unique non-key column, a composite key, nested writes, an empty `update`, and a table under a [global filter](/global-filters), where the lookup and the update carry the filter so another tenant's row is never overwritten. When `where` carries the same key as `create` and the lookup misses only because the filter hides that row, the upsert throws `NotFoundError` (`TURBINE_E001`) and writes nothing, as on PostgreSQL; before 0.90 it was `UniqueConstraintError` (`TURBINE_E008`).
 
 Before 0.80 the native statement was used for all of them, so an upsert by email never found the existing row and a tenant-scoped upsert could update another tenant's. Before 0.81 the lookup used `create`'s values rather than `where`'s, so `where: { id: 1 }` with a `create` carrying another key missed row 1.
 

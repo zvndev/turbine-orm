@@ -144,7 +144,7 @@ export default defineSchema(
 );
 ```
 
-DDL emits `CREATE TYPE "post_status" AS ENUM ('draft', 'published', 'archived')` before the tables that use it, and the column is typed `"post_status"`. Enum columns generate a string-literal union in `types.ts` (`'draft' | 'published' | 'archived'`).
+On PostgreSQL, DDL emits `CREATE TYPE "post_status" AS ENUM ('draft', 'published', 'archived')` before the tables that use it, and the column is typed `"post_status"`. The other engines have no enum type, so since 0.90 `schemaToSQL` declares the column inline: `ENUM('draft', 'published', 'archived')` on MySQL, `TEXT` with a `CHECK` over the labels on SQLite, and `NVARCHAR` with the same `CHECK` on SQL Server. There the enum must be declared in `enums` with at least one label (`TURBINE_E003` otherwise), an enum array is `TURBINE_E017`, and a MySQL label holding a backslash is `TURBINE_E003`. Enum columns generate a string-literal union in `types.ts` (`'draft' | 'published' | 'archived'`).
 
 Writes to an enum column get an explicit `::"post_status"` cast on every write path (`create`, `createMany`, `update`, `upsert`), schema-qualified so it is safe across schemas. This avoids the `column is of type post_status but expression is of type text` error `createMany` can otherwise hit.
 

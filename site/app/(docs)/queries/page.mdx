@@ -717,7 +717,11 @@ await db.users.deleteMany({
 
 `delete` returns the deleted row and takes [`select` / `omit`](#returning-fewer-columns) to narrow it. `deleteMany` returns `{ count }`, and refuses `limit` / `take` / `offset` / `skip` as [`updateMany`](#update--updatemany) does.
 
-An empty `where` (`{}`, or one whose every value is `undefined`) throws `ValidationError`: Turbine blocks accidental mass deletes. So does a `where` that is always true, such as `NOT: { OR: [] }`, `{ id: { notIn: [] } }` or `{ posts: { none: { OR: [] } } }`, which would compile to SQL matching every row. An always-false `where` (`{ id: { in: [] } }`, `OR: []`) is not refused; it matches nothing. To really mean it, import the sentinel and pass `allowFullTableScan: UNSAFE` alongside it:
+An empty `where` (`{}`, or one whose every value is `undefined`) throws `ValidationError`: Turbine blocks accidental mass deletes. So does a `where` that is always true, such as `NOT: { OR: [] }`, `{ id: { notIn: [] } }`, `{ posts: { none: { OR: [] } } }` or an `OR` with a branch that applies no condition (`OR: [{ id: 1 }, {}]`), which would compile to SQL matching every row.
+
+Since 0.90 the guard also reads which columns are NOT NULL, so these are refused too on a NOT NULL column: `contains: ''` (and `startsWith: ''` / `endsWith: ''`), `not: null`, a column compared with itself (`{ equals: col('email') }` on `email`), and `hasEvery: []` on an array column. A bare to-one relation filter (`{ author: {} }` or `{ author: { is: {} } }`) over a NOT NULL foreign key is refused as well, except on SQLite, where a row can point at a row that does not exist when the connection's `foreign_keys` pragma is off, and when the target table has a global filter. Reads with these shapes are unchanged.
+
+An always-false `where` (`{ id: { in: [] } }`, `OR: []`) is not refused; it matches nothing. To really mean it, import the sentinel and pass `allowFullTableScan: UNSAFE` alongside it:
 
 ```ts
 import { UNSAFE } from 'turbine-orm';
@@ -831,6 +835,8 @@ const postsByUser = await db.posts.groupBy({
 // If `score` were numeric (or bigint), _avg would be the exact string PostgreSQL
 // renders, e.g. _avg: { score: '4.2000000000000000' }; see the type note below.
 ```
+
+`by` must be a non-empty array of field names. A missing `by`, a string (write `by: ['name']`), an empty array or a `null` entry throws `TURBINE_E003` naming `by`; for one group over every row, use [`aggregate()`](#aggregate). Before 0.90 these were a `TypeError`, an "Unknown field" per character, or SQL the server rejected.
 
 Grouping **by** a PII-tagged column, or `_min` / `_max` over one, requires
 `includePii: UNSAFE`; `where` / `orderBy` / `having` stay unrestricted. See
@@ -978,6 +984,8 @@ const lateAlphabetically = await db.posts.groupBy({
 });
 // ... HAVING MIN("title") > $1
 ```
+
+Each `_min` / `_max` operand, and each `in` / `notIn` element, binds the way a `where` operand on that column does. On MySQL a number compared with a text column therefore binds as text: before 0.90 `having: { token: { _min: 0 } }` also matched a group whose smallest token was `'abc'`, because MySQL compared the two as numbers.
 
 #### Filtering on the grouped value
 
@@ -1163,6 +1171,10 @@ An object you write empty is left as written and keeps its own rule (`{ id: {} }
 
 `mode: 'insensitive'` applies to `equals`, `not`, `in` and `notIn` on string columns as well as to the substring operators; see [String](#string). Before 0.78 it was read only by `contains` / `startsWith` / `endsWith` and silently ignored beside the others. On `in` / `notIn` it is PostgreSQL-only **among the SQL engines**: SQLite, MySQL and SQL Server refuse it with `TURBINE_E017`, for the reason given in the table below. PowDB supports it, because PowQL's list form takes an expression per element and can fold each one in the engine.
 
+On every engine `in` / `notIn` match exactly the rows `equals` / `not` match for each element, whatever the column type. Before 0.90 MySQL compared the list as JSON values, so a boolean, a date or time, a binary value, a decimal or bigint written as a string, and text under a case-insensitive collation never matched, and `notIn` matched every row: `deleteMany({ where: { published: { notIn: [true] } } })` deleted the published rows too. MySQL now binds each element as its own placeholder, and a list that takes the statement past MySQL's 65,535 placeholders throws `TURBINE_E003`; split it across several queries. SQLite takes a bigint past 2^53 and binary values in a list. SQL Server takes bigint and `Date` elements, and refuses a binary element with `TURBINE_E017`; write that list as `OR` branches.
+
+On MySQL a number or boolean compared with a text column binds as text, so `{ resetToken: 0 }` matches only the text `'0'`. Before 0.90 MySQL compared the two as numbers, and `0` matched every token that does not start with a digit.
+
 ### Comparison
 
 | Operator | Description | Example |
@@ -1249,6 +1261,8 @@ The other engines cannot compare every shape exactly, and refuse what they canno
 | PostgreSQL, MySQL | every JSON value | exact document equality |
 | SQL Server | numbers compare as numbers, strings case-sensitively; arrays and objects `E017` | `E017` |
 | SQLite | numbers and strings; `null`, arrays, objects and booleans `E017` (SQLite extracts `true` as `1`) | `E017` |
+
+SQL Server and SQLite also refuse a bare document as the value (`{ data: { a: 1 } }`) and `not: <document>` with `TURBINE_E017`, as they refuse a pathless `equals`; before 0.90 they compared JSON text, so key order decided the match. PowDB refuses all three the same way. On MySQL, SQLite and SQL Server a path key holding a backslash, a quote or a newline is written as a JSON string literal, so it finds its value.
 
 Before 0.90 a path `equals` compared the extracted text (`equals: 5` also matched `"5"`) and a pathless one was containment. See [Upgrading to 0.90](/upgrading-to-0-90#pathless-json-equals-compares-the-whole-document).
 The three substring operators are the JSON counterpart of the scalar `contains` / `startsWith` / `endsWith`, and they all require `path`. They are deliberately **not** spelled `contains`, because on a JSON column `contains` already means whole-document jsonb containment (`@>`). The operand is LIKE-escaped, so `%` and `_` match literally.
@@ -1340,7 +1354,7 @@ Filter parent rows by predicates on their child rows.
 
 Any operator above, including JSON filters, composes inside `some` / `every` / `none`. A relation filter takes only `some`, `every`, `none`, `is` and `isNot` (or, on a to-one relation, a bare where object); any other key beside them throws `TURBINE_E003` naming it, where it used to be dropped and widen the filter.
 
-A quantifier takes a where object. `some: null`, `none: null`, `every: null`, a scalar or an array throws `TURBINE_E003`, at every depth (in global filters and `with` wheres too). Before 0.90 such a value was dropped, so the query matched every row and a `deleteMany` deleted every row. Write `some: {}` for "has a related row" and `none: {}` for "has none". On a to-one relation `is` / `isNot` take a where object or `null`; `is: null` and `isNot: null` work as before, and a scalar or an array throws `TURBINE_E003`.
+A quantifier takes a where object. `some: null`, `none: null`, `every: null`, a scalar or an array throws `TURBINE_E003`, at every depth (in global filters and `with` wheres too). Before 0.90 such a value was dropped, so the query matched every row and a `deleteMany` deleted every row. Write `some: {}` for "has a related row" and `none: {}` for "has none". On a to-one relation `is` / `isNot` take a where object or `null`; `is: null` and `isNot: null` work as before, and a scalar or an array throws `TURBINE_E003`. `is` / `isNot` on a to-many relation throws `TURBINE_E003` naming `some` / `every` / `none`; before 0.90 an untyped caller's `is` there ran. `some` / `every` / `none` on a to-one relation still work.
 
 ```ts
 // Users who own at least one product rated 4+
@@ -1778,6 +1792,8 @@ const rows = await db.rawUnsafe(`SELECT * FROM ${table} WHERE actor_id = $1`, ac
 ```
 
 Nothing in the text passed to `rawUnsafe` is escaped, so it must never contain untrusted input. Values go in the trailing arguments.
+
+Write placeholders as `$1`, `$2` and so on on every engine. On SQLite, MySQL and SQL Server Turbine rewrites them to the engine's own form, skipping string literals, quoted identifiers and comments. A `?` placeholder, or a `$n` past the values given, throws `TURBINE_E003`. Before 0.90 the text went through unchanged: SQLite read `$1` as a parameter named `$1`, MySQL rejected it, and SQL Server read it as a money literal. With no values the text is sent as written.
 
 On PostgreSQL, a `Date` passed to `raw`, `rawUnsafe` or `sql` binds as its UTC fields under [`utcTimestamps`](/schema#zone-less-columns-timestamp-and-date-read-as-utc), as Turbine's own queries do. An Invalid Date throws `TURBINE_E003`. Raw SQL emits a `$on('query')` event but runs no `$use` middleware.
 

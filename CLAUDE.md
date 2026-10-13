@@ -125,7 +125,14 @@ src/
                       default, throw on mismatch) | `{ sample }` (rate in (0,1], log
                       `cache-mismatch` once per fingerprint then throw) | 'off'
                       (production default). The legacy TURBINE_* variables are read
-                      only by diagnostics.ts.
+                      only by diagnostics.ts. A mismatch is `InvariantError` (E020,
+                      `invariant: 'sql-cache-lockstep'`), not E003. Two cheaper prechecks in
+                      `crossCheckCache` run in EVERY mode (production, 'off' and
+                      `sqlCache: false` included): on a miss the collected params must equal
+                      the build's (`lastMissParams`, cleared once compared, so no bound
+                      value outlives the call), and on a hit the collected count must equal
+                      `SqlCacheEntry.paramCount` (`'sql-cache-param-count'`), before anything
+                      is sent.
                       0.90 adds two rules here. `relationFilterValueProblem` /
                       `assertRelationFilterValues`: a quantifier (`some` / `none` / `every`)
                       must be a where object and `is` / `isNot` a where object or `null`;
@@ -143,6 +150,19 @@ src/
                       `{ id: { notIn: [] } }` no longer write every row; anything not
                       provably constant is `'row'`, so folding never refuses a filter that
                       narrows. global-filters-config.ts runs the same fold at construction.
+                      An `OR` branch that applies no condition (`{}`, `{ AND: [] }`) is TRUE
+                      for its `OR`, as `OR: [{}]` always was (it used to be dropped, so its
+                      `NOT` matched every other row); `OR: [{}]` compiles to `(1 = 1)`. A
+                      branch emptied by `undefined` is still pruned before this rule. With
+                      `options.notNull` (the guard only, via `guardFoldOptions` in where.ts)
+                      the fold also reads NOT NULL columns: `not: null`, an empty
+                      `contains` / `startsWith` / `endsWith`, a column compared with itself
+                      and `hasEvery: []` are TRUE, and a bare to-one filter over a NOT NULL
+                      foreign key is TRUE except on SQLite (orphans possible with
+                      `foreign_keys` off) and when the target has a global filter. Reads never
+                      consult it. `relationCardinalityProblem` refuses `is` / `isNot` on a
+                      to-many (E003 naming `some` / `every` / `none`); PowDB calls the same
+                      function.
 
     prepared-statement naming, A where (or having) clause containing a
                       CALLER-WRITTEN `AND` / `OR` ARRAY produces an UNNAMED prepared
@@ -256,6 +276,12 @@ src/
                       the client-level global-filter helpers. Owns the `BuilderCtx`
                       interface. Depends on nothing else in query/ (relation filters build
                       EXISTS inline), so it is the base module the others build on.
+                      `textComparedOperand` (0.90) is THE MySQL rule for a value bound
+                      against a text column: a number or bigint binds as its decimal text and
+                      a boolean as `'1'` / `'0'`, because MySQL compares a number with text
+                      numerically (`{ resetToken: 0 }` matched every non-digit token). The
+                      where compiler applies it to each operand and list element, writes to
+                      the keys they re-read by, and aggregates.ts to having `_min` / `_max`.
     aggregates.ts   - buildAggregate + buildGroupBy and helpers: HAVING clauses,
                       groupBy ordering, DISTINCT-ON sources, JSON-path aggregate targets.
                       Reuses where.ts for WHERE compilation; shared orderBy / row-parse
@@ -274,6 +300,12 @@ src/
                       buildHavingCombinator does AND/OR/NOT recursively, mirroring
                       buildWhereClause's shapes. buildHavingNumericClauses is
                       operand-type-agnostic now (equals/not/gt/gte/lt/lte/in/notIn).
+                      0.90: a `_min` / `_max` operand (and each `in` / `notIn` element) goes
+                      through `whereMod.textComparedOperand`, since it compares a stored
+                      cell; `_count` / `_sum` / `_avg` keep theirs. `assertGroupByKeys` runs
+                      before anything reads `by`: missing, a string, an empty array or a
+                      `null` entry is E003 naming `by` (the empty case points at
+                      `aggregate()`).
     writes.ts       - Mutation SQL builders: create / createMany / update /
                       delete / upsert / updateMany / deleteMany plus the write-projection
                       helpers (writeReturningColumns / writeReselectSelection / parseWriteRow,
@@ -786,6 +818,22 @@ src/
                       `cli/destructive.ts`), and the CLI tokenizer would land in every engine
                       and edge bundle.
 
+  sql-placeholders.ts, Zero-import leaf (0.90) every non-PostgreSQL engine entry shares.
+                      `scanPlaceholders(sql, 'mysql' | 'sqlite' | 'mssql')` finds placeholders
+                      outside string literals, quoted identifiers and comments under THAT
+                      engine's lexical rules, and `rewritePositionalPlaceholders` maps `$n` to
+                      `:pN` (SQLite, MySQL) or `@pN` (SQL Server), so `rawUnsafe(text, ...values)`
+                      takes `$1..$n` on every engine (SQLite read `$1` as a parameter NAMED
+                      `$1`, MySQL rejected it, SQL Server read it as a MONEY literal). A `?`, or a
+                      `$n` past the values given, is E003; with no values the text is untouched.
+                      MySQL's pool shim also expands a list bound as one `IN (:pN)` into one
+                      placeholder per element, padded to the next power of two by repeating the
+                      last element (at most 17 texts per base statement), refusing a statement
+                      whose placeholders, list elements included, pass 65,535 (E003). Deliberately NOT `cli/sql-statements.ts`: that lexer is
+                      PostgreSQL's grammar (dollar quotes, `E''`, nesting comments) and has no
+                      backtick / bracket identifiers, `#` comments or MySQL backslash escapes;
+                      different grammars, not a second lexer for one. Ambiguity reads as quoted.
+
   global-filters-config.ts, `globalFilters` checked at CONSTRUCTION (0.90). The config is
                       keyed by client ACCESSOR (`blogPosts`) while the builder looks filters
                       up by TABLE name, so a key that names neither was a filter applied to
@@ -797,7 +845,17 @@ src/
                       construction and fail the first query on that table, i.e. a request),
                       prefixes any E003 with `globalFilters["<key>"]`, and returns the map
                       the builder reads. `tableAccessorName` is the ONE place the accessor
-                      name is derived. Function filters are checked per query by the resolver.
+                      name is derived. `assertStaticFiltersCompile` then compiles every static
+                      filter through a real `QueryInterface.buildFindMany` with the client's
+                      dialect (first each table alone, so an error names the filter that holds
+                      it, then all together), so any value a query would refuse throws from the
+                      constructor. `assertNoFilterCycle` refuses static filters that reach their
+                      own table through relation filters, directly or via another table's
+                      filter, naming the chain (it was a `RangeError` on every query). Function
+                      filters are never called at construction: they are checked per query by
+                      the resolver, and where.ts's `filtersBeingApplied` stack applies each
+                      table's filter once per chain (a relation leading back to a table whose
+                      filter is being compiled reads unfiltered).
 
   supplied-pool-types.ts, Turbine's column readings on a pool the CALLER supplied (0.90).
                       On an owned pool the int8 / UTC-temporal parsers are registered on the
@@ -1014,7 +1072,19 @@ src/
                         `maxInsertRows` (SQL Server: 1000) caps the rows of a plain
                         `INSERT ... VALUES`, read by writes.ts `rowsPerStatement`; an
                         `onConflict` MERGE reads its rows as a derived table and is not
-                        bound by it.
+                        bound by it. `checkTextWrite(table, column, columnType, value)`
+                        (SQLite only) returns a refusal for a string SQLite's type affinity
+                        would store as TEXT in a numeric or boolean column; writes.ts
+                        `coerceWriteValue` throws it as E003. Presence-gated, which is sound
+                        here because no dialect spreads SQLite's. The type match is anchored
+                        on whole type names, since a recorded type can be an enum's name.
+                      • `buildEnumColumn(column, labels)` (0.90): MySQL inline `ENUM(...)`,
+                        SQLite `TEXT` + CHECK, SQL Server `NVARCHAR` + CHECK over `N'...'`.
+                        `schemaToSQL` emits `CREATE TYPE ... AS ENUM` only when
+                        `dialect.name === 'postgresql'`; any other engine without the hook
+                        gets E017 for an enum column (the inheritance trap again). Off
+                        PostgreSQL an undeclared enum or an empty label list is E003, an
+                        enum array E017, and a MySQL label with a backslash E003.
                       • `escapeLikePattern` (0.66), per-engine LIKE metacharacter
                         escaping for a bound `contains` / `startsWith` / `endsWith`
                         operand, defaulting to the shared `escapeLike` (the
@@ -1127,7 +1197,7 @@ src/
                       `$listen`/`$notify`/RLS/pgvector throw E017). PowDB realities shaping it:
                       writes use the trailing **`returning`** keyword (create/createMany/update/
                       delete), `upsert` reselects by PK (its statement rejects `returning`; a
-                      **upsert** follows the shared `upsertWhereMatchesCreate` rule; only a single-column-PK `where` pinned to `create`'s value, with a non-empty `update`, no nested writes and no global filter, uses the native statement. Every other shape looks the row up BY `where` in one flat txn via `upsertLookupFirst` (0.81: it used to take the values from `create`), which is also what keeps a tenant-scoped upsert off another tenant's row).
+                      **upsert** follows the shared `upsertWhereMatchesCreate` rule; only a single-column-PK `where` pinned to `create`'s value, with a non-empty `update`, no nested writes and no global filter, uses the native statement. Every other shape looks the row up BY `where` in one flat txn via `upsertLookupFirst` (0.81: it used to take the values from `create`), which is also what keeps a tenant-scoped upsert off another tenant's row; since 0.90, when `where` is pinned to `create` and the lookup misses only because the global filter hides the row, `hiddenConflictIsNotFound` makes it E001 and writes nothing, as on the SQL engines, instead of E008).
                       **PKs: server-assigned `auto` int OR client UUID**, `isGenerated` columns emit
                       PowDB's `auto` modifier (`powqlSchemaDDL`) and let the engine assign the id;
                       otherwise a defaulted string PK gets a client UUID (`applyPkDefault`). No
@@ -1144,7 +1214,12 @@ src/
                       literal `in (list)`), NEVER an IN-subquery: PowDB's executor caches a subquery
                       result by plan shape ignoring the literal → a repeated `in (<subquery>)` returns
                       stale rows (a real engine bug, reproduced on the raw addon; it had silently
-                      broken the 0.22.0 hasMany/belongsTo filters). **Nested writes** (relation ops in
+                      broken the 0.22.0 hasMany/belongsTo filters). Since 0.90 relation filters
+                      INSIDE a global filter resolve the same way (`globalFilterWhere`), function
+                      filters that reach each other once per chain; they used to make every query
+                      on the table E003. A number, bigint or boolean against a Date column is E003
+                      (it bound as raw micros), and a whole JSON document in a `where` is E017.
+                      **Nested writes** (relation ops in
                       create/update data) route to the shared `executeNestedCreate/Update` engine via
                       `runInImplicitTx` (one flat top-level txn; same hasMany/hasOne/belongsTo coverage
                       as SQL; m2m nested writes unhandled on every backend). Composite-PK columns are
@@ -1693,7 +1768,7 @@ which exists because the previous copy asserted a snake_case column name was rej
 
 **UI module** (`cli/ui.ts`): Terminal formatting helpers, colors, spinners, tables, boxes. Imported throughout CLI but never by library code.
 
-**Other CLI leaves**: `cli/loader.ts` registers a TypeScript loader (prefers `tsx/esm/api`'s `register()`, probed from the user's CWD) before the CLI `import()`s a user-supplied `turbine.config.ts` / schema file, which plain Node rejects with `ERR_UNKNOWN_FILE_EXTENSION`. `cli/pii-tags.ts` reads `ColumnMetadata.pii` out of the generated `metadata.ts` and applies it to a LIVE introspected schema: `pii` is a code-first declaration that `introspect.ts` never sets, so without this Studio's and the MCP server's redaction would be inert against a real database; it distinguishes "this file declares no PII" from "this file could not be parsed" (`PiiScan.ok === false`), and the latter fails closed by tagging every column. `cli/rate-limit.ts` is the fixed-window limiter (100 requests / 60s) both local servers share. `cli/local-server-guard.ts` holds the rest of the perimeter both local servers share: the `Host` allowlist that stops DNS rebinding, the ONE-TIME login ticket printed in the terminal (a URL that lands in history or a log is a spent ticket, not a standing key), and the one constant-time token comparison. `cli/code-first-tags.ts` overlays the `defineSchema()`-only tags (`pii`, `updatedAt`, `maxLength`, `tsType`) onto an introspected schema for `turbine generate`, since the database has no column for any of them. `cli/observe.ts` is the read-only metrics dashboard over the `_turbine_metrics` table written by `observe.ts`, with Studio's security model (loopback, random token, HttpOnly cookie, CSP, read-only transactions); its UI is the hand-authored embedded HTML in `cli/observe-ui.ts` (same pattern as `studio-ui.generated.ts` but with no build step).
+**Other CLI leaves**: `cli/loader.ts` registers a TypeScript loader (prefers `tsx/esm/api`'s `register()`, probed from the user's CWD) before the CLI `import()`s a user-supplied `turbine.config.ts` / schema file, which plain Node rejects with `ERR_UNKNOWN_FILE_EXTENSION`. `cli/pii-tags.ts` reads `ColumnMetadata.pii` out of the generated `metadata.ts` and applies it to a LIVE introspected schema: `pii` is a code-first declaration that `introspect.ts` never sets, so without this Studio's and the MCP server's redaction would be inert against a real database; it distinguishes "this file declares no PII" from "this file could not be parsed" (`PiiScan.ok === false`), and the latter fails closed by tagging every column. `cli/error-text.ts` (`errorText`, zero imports, 0.90) is how every CLI catch site reads an error: the message, else each aggregated error's message once, else the cause, else the code, else the name. A refused `localhost` rejects with an `AggregateError` whose message is EMPTY, so commands printed a bare prefix; a source scan keeps `cli/index.ts` on it. `cli/rate-limit.ts` is the fixed-window limiter (100 requests / 60s) both local servers share. `cli/local-server-guard.ts` holds the rest of the perimeter both local servers share: the `Host` allowlist that stops DNS rebinding, the ONE-TIME login ticket printed in the terminal (a URL that lands in history or a log is a spent ticket, not a standing key), and the one constant-time token comparison. `cli/code-first-tags.ts` overlays the `defineSchema()`-only tags (`pii`, `updatedAt`, `maxLength`, `tsType`) onto an introspected schema for `turbine generate`, since the database has no column for any of them. `cli/observe.ts` is the read-only metrics dashboard over the `_turbine_metrics` table written by `observe.ts`, with Studio's security model (loopback, random token, HttpOnly cookie, CSP, read-only transactions); its UI is the hand-authored embedded HTML in `cli/observe-ui.ts` (same pattern as `studio-ui.generated.ts` but with no build step).
 
 ## Testing
 
@@ -1711,7 +1786,7 @@ which exists because the previous copy asserted a snake_case column name was rej
 - All SQL identifiers quoted via `quoteIdent()`, doubles internal `"` chars per Postgres rules
 - All user values parameterized (`$1, $2, ...`), never string-interpolated
 - LIKE patterns escaped via `escapeLike()`, escapes `%`, `_`, `\`
-- Empty-where guard blocks accidental mass mutations: update/delete with `{}`, an all-undefined where, or one that folds to always-true (`NOT: { OR: [] }`, `{ id: { notIn: [] } }`, see `foldWhere`) throws `ValidationError` unless `allowFullTableScan: UNSAFE` (a literal `true` throws)
+- Empty-where guard blocks accidental mass mutations: update/delete with `{}`, an all-undefined where, or one that folds to always-true (`NOT: { OR: [] }`, `{ id: { notIn: [] } }`, an `OR` with an empty branch, `contains: ''` on a NOT NULL column, see `foldWhere`) throws `ValidationError` unless `allowFullTableScan: UNSAFE` (a literal `true` throws)
 - `LRUCache` bounds the SQL template cache at 1,000 entries (Map insertion order for O(1) eviction)
 - Module has no side effects, `setTypeParser` for int8 is gated behind a static flag in the TurbineClient constructor
 - ESM source with `.js` extensions (NodeNext resolution), CJS output via separate `tsconfig.cjs.json`
