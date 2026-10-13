@@ -27,6 +27,9 @@ import {
 } from '../cli/studio.js';
 import type { SchemaMetadata } from '../schema.js';
 import { mockTable } from './helpers.js';
+import { studioTestStateDir } from './studio-test-state.js';
+
+const STATE_DIR = studioTestStateDir();
 
 // ---------------------------------------------------------------------------
 // Small helpers for exercising Studio's helper functions
@@ -286,7 +289,7 @@ describe('Studio, apiBuilder', () => {
       },
       { rows: [] }, // COMMIT
     ]);
-    const ctx = makeCtx(pool, tmpdir());
+    const ctx = makeCtx(pool, STATE_DIR);
     const req = makeReq({ table: 'users', args: { where: { name: 'Alice' }, limit: 10 } });
     const { res, done } = makeRes();
 
@@ -308,7 +311,7 @@ describe('Studio, apiBuilder', () => {
 
   it('rejects unknown tables with 400', async () => {
     const { pool } = makePool();
-    const ctx = makeCtx(pool, tmpdir());
+    const ctx = makeCtx(pool, STATE_DIR);
     const req = makeReq({ table: 'ghost', args: {} });
     const { res, done } = makeRes();
 
@@ -322,7 +325,7 @@ describe('Studio, apiBuilder', () => {
 
   it('returns 400 when the builder rejects invalid args (e.g. bogus field)', async () => {
     const { pool } = makePool();
-    const ctx = makeCtx(pool, tmpdir());
+    const ctx = makeCtx(pool, STATE_DIR);
     const req = makeReq({ table: 'users', args: { where: { notARealField: 'x' } } });
     const { res, done } = makeRes();
 
@@ -348,7 +351,7 @@ describe('Studio, apiTableRows with search', () => {
       { rows: [{ count: '1' }] }, // count
       { rows: [] }, // COMMIT
     ]);
-    const ctx = makeCtx(pool, tmpdir());
+    const ctx = makeCtx(pool, STATE_DIR);
     const { res, done } = makeRes();
 
     const params = new URLSearchParams({ search: 'ali' });
@@ -386,7 +389,7 @@ describe('Studio, apiTableRows with search', () => {
       { rows: [{ count: '0' }] }, // count
       { rows: [] }, // COMMIT
     ]);
-    const ctx = makeCtx(pool, tmpdir());
+    const ctx = makeCtx(pool, STATE_DIR);
     const { res, done } = makeRes();
 
     await apiTableRows(res, ctx, 'users', new URLSearchParams());

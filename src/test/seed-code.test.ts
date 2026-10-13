@@ -6,7 +6,7 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
@@ -26,8 +26,7 @@ describe('seed-as-code config resolution', () => {
   });
 
   it('resolves default seed.ts, seed.js, seed.sql candidates in order', () => {
-    const dir = join(tmpdir(), `turbine-seed-resolve-${Date.now()}`);
-    mkdirSync(dir, { recursive: true });
+    const dir = mkdtempSync(join(tmpdir(), 'turbine-seed-resolve-'));
     try {
       writeFileSync(join(dir, 'seed.sql'), 'SELECT 1;');
       writeFileSync(join(dir, 'seed.js'), 'export default async function seed() {}');
@@ -41,8 +40,7 @@ describe('seed-as-code config resolution', () => {
   });
 
   it('uses explicit config seed path even when the file does not exist yet', () => {
-    const dir = join(tmpdir(), `turbine-seed-explicit-${Date.now()}`);
-    mkdirSync(dir, { recursive: true });
+    const dir = mkdtempSync(join(tmpdir(), 'turbine-seed-explicit-'));
     try {
       assert.equal(resolveSeedFile({ seed: './custom/seed.ts' }, dir), resolve(dir, './custom/seed.ts'));
     } finally {
@@ -148,9 +146,9 @@ describe('defineSeed self-run detection (spawned entry)', () => {
         [
           `import { writeFileSync } from 'node:fs';`,
           `import { defineSeed } from ${JSON.stringify(SEED_SRC)};`,
-          `export default defineSeed(async () => { writeFileSync(${JSON.stringify(probe)}, 'ran'); });`,
+          `export default defineSeed(async () => { writeFileSync(process.env.TURBINE_SEED_PROBE as string, 'ran'); });`,
         ].join('\n'),
-        { TURBINE_SEED_SENTINEL: sentinel },
+        { TURBINE_SEED_SENTINEL: sentinel, TURBINE_SEED_PROBE: probe },
       );
       assert.equal(res.status, 0, `seed exited non-zero: ${res.stderr}`);
       assert.ok(existsSync(probe), 'the defineSeed callback did not execute when run as the entry');
@@ -173,7 +171,7 @@ describe('defineSeed self-run detection (spawned entry)', () => {
         [
           `import { writeFileSync } from 'node:fs';`,
           `import { defineSeed } from ${JSON.stringify(SEED_SRC)};`,
-          `export const run = defineSeed(async () => { writeFileSync(${JSON.stringify(probe)}, 'ran'); });`,
+          `export const run = defineSeed(async () => { writeFileSync(process.env.TURBINE_SEED_PROBE as string, 'ran'); });`,
         ].join('\n'),
       );
       writeFileSync(entry, `import './lib.js';\nconsole.log('imported');`);
@@ -182,7 +180,7 @@ describe('defineSeed self-run detection (spawned entry)', () => {
           cwd: REPO_ROOT,
           encoding: 'utf-8',
           stdio: ['ignore', 'pipe', 'pipe'],
-          env: childEnv({}),
+          env: childEnv({ TURBINE_SEED_PROBE: probe }),
         });
         assert.match(out, /imported/);
         assert.ok(!existsSync(probe), 'imported defineSeed module auto-ran its callback (should not)');

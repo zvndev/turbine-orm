@@ -27,7 +27,6 @@ import { EventEmitter } from 'node:events';
 import http from 'node:http';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import type { AddressInfo } from 'node:net';
-import { tmpdir } from 'node:os';
 import { describe, it } from 'node:test';
 import type pg from 'pg';
 import { createTicketGate, isAllowedHostHeader, redeemTicket } from '../cli/local-server-guard.js';
@@ -43,6 +42,9 @@ import {
 import { createDemoContext } from '../cli/studio-demo.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { mockTable, skipGate } from './helpers.js';
+import { studioTestStateDir } from './studio-test-state.js';
+
+const STATE_DIR = studioTestStateDir();
 
 /** Studio's demo store runs on the built-in node:sqlite engine (Node >= 22.5). */
 const NO_SQLITE = (() => {
@@ -213,7 +215,7 @@ function options(): StudioOptions {
     port: PORT,
     host: HOST,
     openBrowser: false,
-    stateDir: tmpdir(),
+    stateDir: STATE_DIR,
     demo: true,
   };
 }
@@ -225,7 +227,7 @@ function demoCtx(extra: Partial<StudioContext> = {}): StudioContext {
     metadata: demo.metadata,
     options: options(),
     authToken: SESSION,
-    stateDir: tmpdir(),
+    stateDir: STATE_DIR,
     statementTimeout: { sql: 'SELECT 1', params: [] },
     rateLimiter: new Map(),
     writable: false,
@@ -478,7 +480,7 @@ function pgCtx(pool: pg.Pool, metadata: SchemaMetadata): StudioContext {
     metadata,
     options: { ...options(), demo: false },
     authToken: SESSION,
-    stateDir: tmpdir(),
+    stateDir: STATE_DIR,
     statementTimeout: { sql: `SELECT set_config('statement_timeout', $1, true)`, params: ['30s'] },
     rateLimiter: new Map(),
     writable: false,

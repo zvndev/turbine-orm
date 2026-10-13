@@ -14,12 +14,14 @@
 
 import assert from 'node:assert/strict';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { tmpdir } from 'node:os';
 import { describe, it } from 'node:test';
 import type pg from 'pg';
 import { handleRequest, PII_REDACTED, type StudioContext, type StudioOptions } from '../cli/studio.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { mockTable } from './helpers.js';
+import { studioTestStateDir } from './studio-test-state.js';
+
+const STATE_DIR = studioTestStateDir();
 
 // ---------------------------------------------------------------------------
 // Mock req / res / pool
@@ -245,7 +247,7 @@ function makeCtx(pool: pg.Pool, opts: { writable?: boolean; showPii?: boolean } 
     port: PORT,
     host: HOST,
     openBrowser: false,
-    stateDir: tmpdir(),
+    stateDir: STATE_DIR,
     write: opts.writable,
     showPii: opts.showPii,
   };
@@ -254,7 +256,7 @@ function makeCtx(pool: pg.Pool, opts: { writable?: boolean; showPii?: boolean } 
     metadata: buildSchema(),
     options,
     authToken: TOKEN,
-    stateDir: tmpdir(),
+    stateDir: STATE_DIR,
     statementTimeout: { sql: `SELECT set_config('statement_timeout', $1, true)`, params: ['30s'] },
     rateLimiter: new Map(),
     writable: opts.writable === true,

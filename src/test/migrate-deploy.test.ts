@@ -8,7 +8,7 @@
 
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it } from 'node:test';
@@ -42,8 +42,7 @@ describe('turbine migrate deploy', () => {
   });
 
   it('plans pending migrations and checksum failures before deploy', () => {
-    const dir = join(tmpdir(), `turbine-deploy-plan-${Date.now()}`);
-    mkdirSync(dir, { recursive: true });
+    const dir = mkdtempSync(join(tmpdir(), 'turbine-deploy-plan-'));
     try {
       const appliedSql = '-- UP\nSELECT 1;\n-- DOWN\nSELECT 0;\n';
       writeFileSync(join(dir, '20260708000000_applied.sql'), appliedSql);
@@ -65,8 +64,7 @@ describe('turbine migrate deploy', () => {
   });
 
   it('reports missing applied migration files as deploy-blocking drift', () => {
-    const dir = join(tmpdir(), `turbine-deploy-missing-${Date.now()}`);
-    mkdirSync(dir, { recursive: true });
+    const dir = mkdtempSync(join(tmpdir(), 'turbine-deploy-missing-'));
     try {
       const applied: AppliedMigration[] = [
         { id: 1, name: '20260708000000_missing', applied_at: new Date(), checksum: sha256('gone') },

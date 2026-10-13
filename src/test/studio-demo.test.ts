@@ -21,6 +21,9 @@ import { join } from 'node:path';
 import { describe, it as nodeIt } from 'node:test';
 import { handleRequest, PII_REDACTED, type StudioContext, type StudioOptions } from '../cli/studio.js';
 import { createDemoContext } from '../cli/studio-demo.js';
+import { studioTestStateDir } from './studio-test-state.js';
+
+const STATE_DIR = studioTestStateDir();
 
 const hasSqlite: boolean = (() => {
   try {
@@ -113,7 +116,7 @@ function makeDemoCtx(): StudioContext {
     port: PORT,
     host: HOST,
     openBrowser: false,
-    stateDir: tmpdir(),
+    stateDir: STATE_DIR,
     demo: true,
   };
   return {
@@ -121,7 +124,7 @@ function makeDemoCtx(): StudioContext {
     metadata: demo.metadata,
     options,
     authToken: TOKEN,
-    stateDir: tmpdir(),
+    stateDir: STATE_DIR,
     statementTimeout: { sql: 'SELECT 1', params: [] },
     rateLimiter: new Map(),
     writable: false,

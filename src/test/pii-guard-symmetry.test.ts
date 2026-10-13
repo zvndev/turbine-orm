@@ -49,7 +49,6 @@
 
 import assert from 'node:assert/strict';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { tmpdir } from 'node:os';
 import { describe, it } from 'node:test';
 import type pg from 'pg';
 import { COLUMN_NAMING_ARG_KEYS } from '../cli/compile-query.js';
@@ -60,6 +59,9 @@ import { ALL_OPTION_TABLES } from '../query/option-surface.js';
 import { resolveRelation } from '../query/utils.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
+import { studioTestStateDir } from './studio-test-state.js';
+
+const STATE_DIR = studioTestStateDir();
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -583,7 +585,7 @@ function makeCtx(pool: pg.Pool, showPii = false): StudioContext {
     port: 0,
     host: HOST,
     openBrowser: false,
-    stateDir: tmpdir(),
+    stateDir: STATE_DIR,
     showPii,
   };
   return {
@@ -591,7 +593,7 @@ function makeCtx(pool: pg.Pool, showPii = false): StudioContext {
     metadata: buildSchema(),
     options,
     authToken: TOKEN,
-    stateDir: tmpdir(),
+    stateDir: STATE_DIR,
     statementTimeout: { sql: `SELECT set_config('statement_timeout', $1, true)`, params: ['30s'] },
     rateLimiter: new Map(),
     writable: false,

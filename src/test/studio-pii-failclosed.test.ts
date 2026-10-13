@@ -36,6 +36,9 @@ import {
   type StudioOptions,
 } from '../cli/studio.js';
 import { createDemoContext } from '../cli/studio-demo.js';
+import { studioTestStateDir } from './studio-test-state.js';
+
+const STATE_DIR = studioTestStateDir();
 
 const hasSqlite: boolean = (() => {
   try {
@@ -131,7 +134,7 @@ function failClosedCtx(): { ctx: StudioContext; forced: number } {
     port: 0,
     host: HOST,
     openBrowser: false,
-    stateDir: tmpdir(),
+    stateDir: STATE_DIR,
     demo: true,
   };
   return {
@@ -141,7 +144,7 @@ function failClosedCtx(): { ctx: StudioContext; forced: number } {
       metadata,
       options,
       authToken: TOKEN,
-      stateDir: tmpdir(),
+      stateDir: STATE_DIR,
       statementTimeout: { sql: 'SELECT 1', params: [] },
       rateLimiter: new Map(),
       writable: false,
@@ -263,7 +266,7 @@ describe('Studio: an unreadable PII tag scan is not "no PII"', () => {
       port: 0,
       host: HOST,
       openBrowser: false,
-      stateDir: tmpdir(),
+      stateDir: STATE_DIR,
       demo: true,
     };
     const ctx: StudioContext = {
@@ -271,7 +274,7 @@ describe('Studio: an unreadable PII tag scan is not "no PII"', () => {
       metadata: demo.metadata,
       options,
       authToken: TOKEN,
-      stateDir: tmpdir(),
+      stateDir: STATE_DIR,
       statementTimeout: { sql: 'SELECT 1', params: [] },
       rateLimiter: new Map(),
       writable: false,
