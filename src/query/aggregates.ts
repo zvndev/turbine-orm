@@ -87,10 +87,48 @@ export function assertAggregatePiiOptIn(
   );
 }
 
+/**
+ * `by` is required, and must be a non-empty array of field names and
+ * `{ field, path }` JSON keys. Checked before anything reads it: a missing
+ * `by` was a TypeError ("args.by is not iterable"), a string was iterated
+ * character by character ("Unknown field \"n\""), an empty array emitted
+ * `GROUP BY ` with nothing after it for the server to reject, and a `null`
+ * entry was a TypeError. Exported for PowqlInterface, whose groupBy takes
+ * the same `by`.
+ */
+export function assertGroupByKeys(table: string, by: unknown): void {
+  if (!Array.isArray(by)) {
+    const example = typeof by === 'string' ? `, for example \`by: [${JSON.stringify(by)}]\`` : '';
+    throw new ValidationError(
+      `groupBy on table "${table}" requires \`by\`, an array of field names${example}; got ${describeByValue(by)}.`,
+    );
+  }
+  if (by.length === 0) {
+    throw new ValidationError(
+      `groupBy on table "${table}" requires at least one \`by\` key. To aggregate every row as one group, use aggregate().`,
+    );
+  }
+  for (const entry of by) {
+    if (typeof entry !== 'string' && (typeof entry !== 'object' || entry === null || Array.isArray(entry))) {
+      throw new ValidationError(
+        `groupBy \`by\` on table "${table}" takes field names and { field, path } JSON keys; got ${describeByValue(entry)}.`,
+      );
+    }
+  }
+}
+
+/** The kind of a bad `by` value, never the value itself. */
+function describeByValue(value: unknown): string {
+  if (value === null || value === undefined) return String(value);
+  if (Array.isArray(value)) return 'an array';
+  return typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+}
+
 export function buildGroupBy<T extends object>(
   qi: BuilderCtx,
   args: GroupByArgs<T>,
 ): DeferredQuery<Record<string, unknown>[]> {
+  assertGroupByKeys(qi.table, args.by);
   const meta = qi.schema.tables[qi.table];
   // Up-front, so a bad `by` key is reported before anything else in the call,
   // and through `qi.toColumn` (the ONE `resolveColumnName` rule) rather than
