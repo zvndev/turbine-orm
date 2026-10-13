@@ -16,7 +16,7 @@ const oracleGate = skipGate(!DATABASE_URL, 'requires DATABASE_URL (Postgres is t
 const engineGate = skipGate(!MSSQL_URL, 'requires MSSQL_URL pointing at a SQL Server 2016+ database');
 
 registerEngineBattery({
-  engine: mssqlHarness(MSSQL_URL),
+  engine: mssqlHarness(MSSQL_URL || 'mssql://unset@unset/unset'),
   oracle: postgresHarness(DATABASE_URL || 'postgres://unset/unset', 'oe_mssql'),
   runners: DATABASE_URL ? engineGate : oracleGate,
   repro: 'DATABASE_URL=... MSSQL_URL=... npx tsx --test src/test/oracle-engines-mssql.test.ts',

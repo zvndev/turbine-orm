@@ -16,7 +16,7 @@ const oracleGate = skipGate(!DATABASE_URL, 'requires DATABASE_URL (Postgres is t
 const engineGate = skipGate(!MYSQL_URL, 'requires MYSQL_URL pointing at a MySQL 8+ database');
 
 registerEngineBattery({
-  engine: mysqlHarness(MYSQL_URL),
+  engine: mysqlHarness(MYSQL_URL || 'mysql://unset@unset/unset'),
   oracle: postgresHarness(DATABASE_URL || 'postgres://unset/unset', 'oe_mysql'),
   runners: DATABASE_URL ? engineGate : oracleGate,
   repro: 'DATABASE_URL=... MYSQL_URL=... npx tsx --test src/test/oracle-engines-mysql.test.ts',
