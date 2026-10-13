@@ -15,6 +15,11 @@
  * `setStatus`, `recordException`, `end`) built on AsyncLocalStorage, which is
  * what OpenTelemetry's Node context manager uses.
  *
+ * The optional `sqlComment` part of the recipe (a W3C `traceparent` on each
+ * statement, for sampled traces only) runs the same way: its exact text sits
+ * between `traceparent:begin` and `traceparent:end`, and the spans carry the
+ * span context (`traceId`, `spanId`, `traceFlags`) that @opentelemetry/api's do.
+ *
  * Two lanes, one set of scenarios:
  *   - the in-process SQLite engine, which needs node:sqlite (Node >= 22.5) and no server;
  *   - a live PostgreSQL server (DATABASE_URL), against two scratch tables it creates and drops.
@@ -30,6 +35,7 @@ import { TurbineClient } from '../client.js';
 import { UniqueConstraintError } from '../errors.js';
 import { introspect } from '../introspect.js';
 import type { QueryEvent, QueryEventListener } from '../query/deferred.js';
+import type { SqlCommentOptions } from '../query/sql-comment.js';
 import { RAW_QUERY_MODEL } from '../query-events.js';
 import type { SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, turbineSqlite } from '../sqlite.js';
@@ -50,6 +56,21 @@ interface FakeContext {
 
 const nowMs = (): number => performance.timeOrigin + performance.now();
 
+/** `bytes` random bytes as lower-case hex, the way trace and span ids are written. */
+const randomHex = (bytes: number): string =>
+  Array.from({ length: bytes }, () =>
+    Math.floor(Math.random() * 256)
+      .toString(16)
+      .padStart(2, '0'),
+  ).join('');
+
+/** What @opentelemetry/api's `Span.spanContext()` returns, minus the fields the recipe does not read. */
+interface FakeSpanContext {
+  traceId: string;
+  spanId: string;
+  traceFlags: number;
+}
+
 class FakeSpan {
   readonly kind?: number;
   readonly attributes: Record<string, unknown>;
@@ -57,14 +78,26 @@ class FakeSpan {
   readonly exceptions: Error[] = [];
   endTime?: number;
   status?: { code: number; message?: string };
+  private readonly context: FakeSpanContext;
   constructor(
     readonly name: string,
     options: SpanOptions,
     readonly parent?: FakeSpan,
+    rootFlags = 1,
   ) {
     this.kind = options.kind;
     this.attributes = { ...options.attributes };
     this.startTime = options.startTime ?? nowMs();
+    // A child joins its parent's trace and inherits its sampling decision.
+    const inherited = parent?.spanContext();
+    this.context = {
+      traceId: inherited?.traceId ?? randomHex(16),
+      spanId: randomHex(8),
+      traceFlags: inherited?.traceFlags ?? rootFlags,
+    };
+  }
+  spanContext(): FakeSpanContext {
+    return this.context;
   }
   setAttribute(key: string, value: unknown): this {
     this.attributes[key] = value;
@@ -83,13 +116,14 @@ class FakeSpan {
   }
 }
 
-function createFakeOtel() {
+/** `sampled: false` makes every root span (and so every trace) unsampled. */
+function createFakeOtel({ sampled = true }: { sampled?: boolean } = {}) {
   const store = new AsyncLocalStorage<FakeSpan>();
   const spans: FakeSpan[] = [];
   const context = { active: (): FakeContext => ({ span: store.getStore() }) };
   const tracer = {
     startSpan(name: string, options: SpanOptions = {}, parent?: FakeContext): FakeSpan {
-      const span = new FakeSpan(name, options, parent?.span);
+      const span = new FakeSpan(name, options, parent?.span, sampled ? 1 : 0);
       spans.push(span);
       return span;
     },
@@ -101,7 +135,8 @@ function createFakeOtel() {
   const trace = { getTracer: (_name: string) => tracer, getActiveSpan: () => store.getStore() };
   const SpanKind = { INTERNAL: 0, SERVER: 1, CLIENT: 2 } as const;
   const SpanStatusCode = { UNSET: 0, OK: 1, ERROR: 2 } as const;
-  return { spans, store, tracer, context, trace, SpanKind, SpanStatusCode };
+  const TraceFlags = { NONE: 0, SAMPLED: 1 } as const;
+  return { spans, store, tracer, context, trace, SpanKind, SpanStatusCode, TraceFlags };
 }
 type FakeOtel = ReturnType<typeof createFakeOtel>;
 
@@ -156,6 +191,22 @@ function installRecipe(db: Hooks, otel: FakeOtel, DB_SYSTEM: string): void {
     span.end(end);
   });
   // recipe:end
+}
+
+/** The `sqlComment` option of the recipe: a W3C traceparent on each statement of a sampled trace. */
+function traceparentComment(otel: FakeOtel): SqlCommentOptions {
+  const { trace, TraceFlags } = otel;
+  // traceparent:begin
+  const sqlComment: SqlCommentOptions = {
+    dynamic: () => {
+      const ctx = trace.getActiveSpan()?.spanContext();
+      // Unsampled: add nothing, so the statement keeps its prepared statement.
+      if (!ctx || (ctx.traceFlags & TraceFlags.SAMPLED) === 0) return undefined;
+      return { traceparent: `00-${ctx.traceId}-${ctx.spanId}-${ctx.traceFlags.toString(16).padStart(2, '0')}` };
+    },
+  };
+  // traceparent:end
+  return sqlComment;
 }
 
 /** Install the recipe on `db`, optionally delivering events from outside the caller's async scope. */
@@ -249,7 +300,10 @@ const nodeSqlite: { DatabaseSync: new (path: string) => import('node:sqlite').Da
 
 const sqliteGate = skipGate(!nodeSqlite, 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)');
 
-async function openSqlite(): Promise<Opened> {
+/** Client options a scenario adds (the traceparent scenarios pass `sqlComment`). */
+type ClientExtra = { sqlComment?: SqlCommentOptions };
+
+async function openSqlite(extra: ClientExtra = {}): Promise<Opened> {
   const sqlite = new (nodeSqlite as NonNullable<typeof nodeSqlite>).DatabaseSync(':memory:');
   sqlite.exec(`
     CREATE TABLE otel_owner (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
@@ -259,7 +313,7 @@ async function openSqlite(): Promise<Opened> {
     INSERT INTO otel_item (owner_id, label) VALUES (1, 'x'), (1, 'y'), (2, 'z');
   `);
   const schema = introspectSqliteDatabase(sqlite);
-  const db = turbineSqlite(sqlite, schema, { warnOnUnlimited: false });
+  const db = turbineSqlite(sqlite, schema, { warnOnUnlimited: false, ...extra });
   return { db, itemsRel: relationTo(schema, 'otel_owner', 'otel_item'), close: () => db.disconnect() };
 }
 
@@ -290,9 +344,12 @@ async function preparePostgres(): Promise<void> {
   pgSchema = await introspect({ connectionString: DATABASE_URL! });
 }
 
-async function openPostgres(): Promise<Opened> {
+async function openPostgres(extra: ClientExtra = {}): Promise<Opened> {
   const schema = pgSchema as SchemaMetadata;
-  const db = new TurbineClient({ connectionString: DATABASE_URL!, poolSize: 4, warnOnUnlimited: false }, schema);
+  const db = new TurbineClient(
+    { connectionString: DATABASE_URL!, poolSize: 4, warnOnUnlimited: false, ...extra },
+    schema,
+  );
   await db.connect();
   return { db, itemsRel: relationTo(schema, 'otel_owner', 'otel_item'), close: () => db.disconnect() };
 }
@@ -317,9 +374,77 @@ async function withClient<T>(
   }
 }
 
-function defineScenarios(gate: Gate, open: () => Promise<Opened>, dbSystem: string): void {
+/**
+ * {@link withClient} for the traceparent part of the recipe: the tracer exists
+ * before the client, because the client's `sqlComment` reads it.
+ */
+async function withTraceparent<T>(
+  open: (extra: ClientExtra) => Promise<Opened>,
+  dbSystem: string,
+  sampled: boolean,
+  fn: (c: Opened & FakeOtel & { events: QueryEvent[] }) => Promise<T>,
+): Promise<T> {
+  const otel = createFakeOtel({ sampled });
+  const opened = await open({ sqlComment: traceparentComment(otel) });
+  const events: QueryEvent[] = [];
+  opened.db.$on('query', (e) => events.push(e));
+  installRecipe(opened.db, otel, dbSystem);
+  try {
+    return await fn(Object.assign(opened, otel, { events }));
+  } finally {
+    await opened.close();
+  }
+}
+
+/** The comment the recipe's `sqlComment` gives a statement run while `span` is active. */
+function traceparentOf(span: FakeSpan): string {
+  const { traceId, spanId } = span.spanContext();
+  return `/*traceparent='00-${traceId}-${spanId}-01'*/`;
+}
+
+function defineScenarios(gate: Gate, open: (extra?: ClientExtra) => Promise<Opened>, dbSystem: string): void {
   const run = <T>(fn: (c: Opened & FakeOtel & { events: QueryEvent[] }) => Promise<T>, detach = false) =>
     withClient(open, dbSystem, fn, detach);
+
+  gate.it('traceparent: each statement of a sampled trace names the span that ran it', async () => {
+    await withTraceparent(open, dbSystem, true, async (c) => {
+      await inRequest(c, () => c.db.table('otel_owner').findMany({ where: { name: 'owner-a' } }));
+      const op = spanNamed(c, 'otel_owner.findMany');
+      assert.equal(c.events.length, 1);
+      const event = c.events[0] as QueryEvent;
+      // The operation span was active where the statement was sent, so the database sees it as the parent.
+      assert.equal(event.comment, traceparentOf(op));
+      assert.match(String(event.comment), /^\/\*traceparent='00-[0-9a-f]{32}-[0-9a-f]{16}-01'\*\/$/);
+      assert.equal(op.spanContext().traceId, spanNamed(c, 'request').spanContext().traceId, 'one trace');
+      assert.ok(!event.sql.includes('/*'), 'the event and db.query.text keep the commentless text');
+      assert.equal(spanNamed(c, 'findMany otel_owner').attributes['db.query.text'], event.sql);
+
+      // A pipeline bypasses middleware, so its statements name the caller's span.
+      await inRequest(
+        c,
+        () => c.db.pipeline(c.db.table('otel_owner').buildFindMany({}), c.db.table('otel_item').buildCount({})),
+        'batch',
+      );
+      const batch = spanNamed(c, 'batch');
+      assert.deepEqual(
+        c.events.slice(1).map((e) => e.comment),
+        [traceparentOf(batch), traceparentOf(batch)],
+      );
+    });
+  });
+
+  gate.it('traceparent: an unsampled trace, or no trace, adds nothing to the statement', async () => {
+    await withTraceparent(open, dbSystem, false, async (c) => {
+      await inRequest(c, () => c.db.table('otel_owner').findMany({}));
+      await c.db.table('otel_item').count();
+      assert.equal(c.events.length, 2);
+      for (const event of c.events) assert.equal(event.comment, undefined);
+    });
+    await withTraceparent(open, dbSystem, true, async (c) => {
+      await c.db.raw`SELECT 1 AS one`;
+      assert.equal(c.events[0]?.comment, undefined, 'raw SQL never carries a comment');
+    });
+  });
 
   gate.it('a findMany with a nested with: one operation span, one statement span under it', async () => {
     await run(async (c) => {
@@ -590,6 +715,27 @@ describe('OpenTelemetry recipe, documentation', () => {
       squash(documented),
       squash(tested),
       'the recipe on site/app/(docs)/observability/page.mdx differs from the code src/test/otel-recipe.test.ts runs',
+    );
+  });
+
+  it('the traceparent option on the observability page is the code this file runs', () => {
+    const region = own.slice(
+      own.indexOf('// traceparent:begin') + '// traceparent:begin'.length,
+      own.indexOf('// traceparent:end'),
+    );
+    const block = (otelSection(page).match(/```ts\n[\s\S]*?```/g) ?? []).find((b) => b.includes('traceparent'));
+    assert.ok(block, 'no code block in the OpenTelemetry section sets the traceparent comment');
+    // The imports and the client construction are the only lines the test supplies differently.
+    const documented = block
+      .replace(/^```ts\n|```$/g, '')
+      .split('\n')
+      .filter((line) => !line.startsWith('import ') && !line.startsWith('const db = '))
+      .join('\n');
+    assert.ok(squash(region).length > 150, 'the extracted traceparent option is implausibly short');
+    assert.equal(
+      squash(documented),
+      squash(region),
+      'the traceparent option on site/app/(docs)/observability/page.mdx differs from the code src/test/otel-recipe.test.ts runs',
     );
   });
 

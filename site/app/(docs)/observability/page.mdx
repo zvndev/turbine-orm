@@ -165,6 +165,8 @@ logger: {
 | `unlimited-find-many` | `warn` | A `findMany` with no limit, when you turned on `warnOnUnlimited`. In every mode. |
 | `temporal-infinity` | `warn` | A stored `infinity` was read while `temporalInfinity` is unset. In every mode. |
 | `cache-mismatch` | `error` | The sampled SQL-cache self-check found a mismatch. The line is the error's message, and the query throws [`InvariantError`](/errors#e020) (`TURBINE_E020`). |
+| `stream-idle-timeout` | `warn` | A cursor stream's consumer asked for nothing within its idle timeout, so Turbine closed the stream and released its connection. In every mode. |
+| `sql-comment-dropped` | `warn` | A [`sqlComment.dynamic`](#sql-comments-sqlcomment) key or value could not be used and was left out of the comment, once per key and reason. In every mode. |
 | `prisma-compat-unknown-option`, `prisma-compat-native-spelling` | `warn` | [prisma-compat](/migrate-from-prisma) option advice. Only while `diagnostics` advice is on. |
 | `prisma-map-stale`, `prisma-compat-junction-collision` | `warn` | prisma-compat found its map out of date with `schema.prisma`, or two junction models claiming one table. |
 | `powdb-link-collision`, `powdb-link-drift`, `powdb-introspect-no-primary-key` | `warn` | PowDB link DDL and introspection. |
@@ -207,6 +209,43 @@ diagnostics: { mode: 'production', cacheCheck: { sample: 0.001 } }
 The environment variables still work when `cacheCheck` is not set. `TURBINE_DISABLE_CACHE_CHECK=1` turns the self-check off in any mode. In production mode, `TURBINE_CACHE_CHECK_SAMPLE` sets a sample rate. When both are set, the disable variable wins. An explicit `cacheCheck` wins over both.
 
 Construction warnings do not depend on `diagnostics`. A misspelled config key, an option an external pool ignores, or prepared statements behind a pooler are production hazards, so those warnings fire once per process in every mode.
+
+## SQL comments, `sqlComment`
+
+`sqlComment` appends [sqlcommenter](https://google.github.io/sqlcommenter/) key/values to each statement Turbine builds, so `pg_stat_activity`, the server log, `auto_explain` and database APM tools can tell which service, model, feature or trace a statement came from.
+
+```ts
+const db = turbine({
+  connectionString: process.env.DATABASE_URL,
+  sqlComment: {
+    static: { application: 'billing' }, // the same pairs on every statement
+    model: true, // the table and the method
+    tag: true, // the label of the innermost db.$tag()
+  },
+});
+
+await db.$tag('checkout', () => db.users.findUnique({ where: { id: 1 } }));
+```
+
+```sql
+SELECT "users".* FROM "users" WHERE "id" = $1 LIMIT 1 /*action='findUnique',application='billing',model='users',tag='checkout'*/
+```
+
+| Option | Adds |
+|---|---|
+| `static` | The same key/values on every statement. |
+| `model` | `model` (the table) and `action` (the method, such as `findMany` or `update`). |
+| `tag` | `tag`, the label of the innermost [`db.$tag()`](#attributing-queries-to-a-feature-dbtag). No tag scope, no key. |
+| `dynamic` | A function called for each statement, in your async context, returning key/values or `undefined`. A key whose value is `undefined` is left out. See [Carrying the trace into the database](#carrying-the-trace-into-the-database). |
+
+The format is the sqlcommenter one: keys sorted, each value URL-encoded and then `'` escaped as `\'`, pairs joined by commas, the comment after the statement.
+
+- **A value cannot break out of the comment.** URL encoding turns `/` into `%2F`, so no value can end the comment or open a nested one, and it also encodes `$`, `?`, `:`, `@` and `;`. Keys must be lower-case letters, digits and underscores, starting with a letter, which also keeps a comment from opening MySQL's `/*!` or `/*+` forms.
+- **Bad input.** A malformed `static` key or value, a value over 256 characters, an unknown option key or a wrong type throws `ValidationError` (E003) when the client is constructed. A bad `dynamic` key or value is left out of that statement's comment and logged once as `sql-comment-dropped`; a `dynamic` function that throws, or returns something other than an object, is logged the same way and adds nothing. Neither fails the query.
+- **What carries a comment.** Statements a model method builds: reads, writes, streams, `db.pipeline(...)` and `db.$transaction([...])` batches, and statements inside `$transaction`. Raw SQL (`db.raw`, `db.sql`, `db.rawUnsafe`), `BEGIN`, `COMMIT`, savepoints and session settings carry none.
+- **Caching and events are unchanged.** The comment is added after the SQL template cache, so cache keys and hit rates do not change. `$on('query')` events keep `sql` without the comment and carry it in `e.comment`.
+- **Prepared statements.** A statement whose comment comes from `static`, `model` and `tag` is still prepared, under a name of its own that counts against the same budget as every other prepared statement. A statement carrying any `dynamic` value is sent unnamed and parsed and planned on every execution, because a value that changes per request would otherwise leave a new prepared statement on every pooled connection.
+- **Engines.** PostgreSQL, MySQL, SQLite and SQL Server. `dynamic` is refused on MySQL (`UnsupportedFeatureError`, E017): the MySQL engine prepares each distinct statement text on the server, and a per-request value would run the server into its `max_prepared_stmt_count` limit. PowDB does not run SQL, so `sqlComment` is refused there.
 
 ## Metrics, `db.$observe()`
 
@@ -427,27 +466,36 @@ Timing, parameters and failures:
 - **A retried read shows as two statement spans.** The first carries `turbine.retried` and an error status, the second times the retry alone. Alert on the operation span's status to count failed calls rather than failed attempts. Writes and statements inside a transaction are never retried.
 - **`recordException` sends the error's message and stack to your backend.** See [`errorMessages`](/errors#safe-error-messages) for what a message may contain.
 
-{/* PENDING sqlComment (lane B4): the part below documents sqlComment, which has not landed. Publish it
-once the sqlComment option and its dynamic hook exist, and re-verify every sentence against that code.
-
 ### Carrying the trace into the database
 
-Add the active span's `traceparent` to each statement as a trailing SQL comment, so `pg_stat_activity`, the server log and database-side APM can be joined to your traces.
+To join a statement in `pg_stat_activity`, the server log or a database APM tool back to its trace, add the active span's [W3C `traceparent`](https://www.w3.org/TR/trace-context/) to each statement as a comment, with [`sqlComment`](#sql-comments-sqlcomment):
 
 ```ts
-const db = turbine({
-  sqlComment: {
-    dynamic: () => {
-      const ctx = trace.getActiveSpan()?.spanContext();
-      if (!ctx || (ctx.traceFlags & 1) === 0) return undefined; // unsampled: keep prepared statements
-      return { traceparent: `00-${ctx.traceId}-${ctx.spanId}-${ctx.traceFlags.toString(16).padStart(2, '0')}` };
-    },
+import { trace, TraceFlags } from '@opentelemetry/api';
+import type { SqlCommentOptions } from 'turbine-orm';
+
+const sqlComment: SqlCommentOptions = {
+  dynamic: () => {
+    const ctx = trace.getActiveSpan()?.spanContext();
+    // Unsampled: add nothing, so the statement keeps its prepared statement.
+    if (!ctx || (ctx.traceFlags & TraceFlags.SAMPLED) === 0) return undefined;
+    return { traceparent: `00-${ctx.traceId}-${ctx.spanId}-${ctx.traceFlags.toString(16).padStart(2, '0')}` };
   },
-});
+};
+
+const db = turbine({ sqlComment });
 ```
 
-State here, once verified: a statement carrying a dynamic comment is sent unnamed (it is not a reusable prepared statement), which is why the hook returns nothing for unsampled spans; the measured cost from the design was about 7 us on a point read and 55 us on a nested read on localhost; PowDB refuses sqlComment; pg_stat_statements is not split by comments.
-*/}
+Each statement of a sampled trace then ends with a comment naming the span that was active where it was sent: the operation span for a model call, your own span for a pipeline, a `$transaction([...])` batch, a stream or raw SQL.
+
+```sql
+SELECT "orders".* FROM "orders" WHERE "id" = $1 LIMIT 1 /*traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01'*/
+```
+
+- **A sampled statement is sent unnamed.** A value that changes per request makes every statement's text unique, and a connection keeps each prepared statement until it closes, so a statement carrying any `dynamic` value is parsed and planned on every execution instead. That costs tens of microseconds per statement on a local server, more for nested reads. Returning `undefined` for unsampled spans keeps every other statement on its prepared statement.
+- **`db.query.text` stays the same.** The event's `sql` is the statement without its comment, and the comment is in `e.comment`.
+- **`pg_stat_statements` keeps one row per statement.** PostgreSQL computes a statement's query id from its parse tree, which a comment is not part of, so traced and untraced runs of one statement share a row.
+- **Raw SQL carries no comment,** and `dynamic` is refused on MySQL and PowDB (see [`sqlComment`](#sql-comments-sqlcomment)).
 
 ## See also
 
