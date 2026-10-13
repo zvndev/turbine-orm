@@ -29,11 +29,14 @@
  *   LISTEN/NOTIFY (`$listen` / `$notify`), RLS `sessionContext`. Advisory-lock
  *   migration locking is unavailable, SQLite is single-writer, so migrations
  *   serialize naturally.
- * - **Type affinity caveats:** SQLite has no native `BOOLEAN` (0/1 integers) or
- *   `DATE` (TEXT/INTEGER). Booleans bind as 1/0; `Date` values bind as ISO-8601
- *   text; columns declared `TIMESTAMP`/`DATETIME`/`DATE` are coerced back to
- *   `Date`. Integers wider than `Number.MAX_SAFE_INTEGER` come back as strings
- *   (the same safe-int policy Turbine uses for Postgres `int8`).
+ * - **Type affinity caveats:** SQLite has no native `BOOLEAN` (0/1 integers),
+ *   `JSON` (text) or `DATE` (TEXT/INTEGER). Booleans bind as 1/0; `Date` values
+ *   bind as ISO-8601 text; an integral JS number binds as INTEGER. A column the
+ *   schema declares boolean or json/jsonb reads back as a boolean or a parsed
+ *   value on every path; date/time columns are coerced back to `Date`.
+ *   Integers wider than `Number.MAX_SAFE_INTEGER` come back as strings (the
+ *   same safe-int policy Turbine uses for Postgres `int8`). `numeric` has no
+ *   exact storage: it reads back as a JS number.
  * - **Case-insensitive matching** uses `COLLATE NOCASE`, which is **ASCII-only**
  *   (no Unicode case folding).
  *
@@ -181,7 +184,8 @@ type SqliteParam = null | number | bigint | string | Uint8Array;
  * Coerce an arbitrary JS value into something `node:sqlite` can bind.
  *
  * `node:sqlite` throws on `boolean`, `undefined`, `Date`, and plain objects, so
- * we normalize: booleans → 1/0, `undefined`/`null` → NULL, `Date` → ISO text,
+ * we normalize: booleans → 1/0, a safe integer → INTEGER (see below),
+ * `undefined`/`null` → NULL, `Date` → ISO text,
  * `Uint8Array`/`Buffer` → BLOB, and any remaining object/array → JSON text
  * (matches how Turbine already pre-serializes JSON filter params).
  */
@@ -191,6 +195,12 @@ function toSqliteParam(value: unknown): SqliteParam {
     case 'boolean':
       return value ? 1 : 0;
     case 'number':
+      // `node:sqlite` binds every JS number as REAL, so `views / 2` divided as
+      // floats (75 / 2 = 37.5, stored in an INTEGER column) and an integral
+      // number written to a TEXT column was stored as '3.0'. Binding a safe
+      // integer as an INTEGER gives the arithmetic and text PostgreSQL gives.
+      // -0 stays REAL: as an integer it would lose its sign.
+      return Number.isSafeInteger(value) && !Object.is(value, -0) ? BigInt(value) : value;
     case 'bigint':
     case 'string':
       return value;
@@ -215,64 +225,152 @@ function normalizeValue(value: null | number | bigint | string | Uint8Array): un
   return value;
 }
 
+/** A result column's decode beyond the safe-integer policy (see {@link resultColumnDecoders}). */
+type ColumnDecode = 'boolean' | 'json';
+
+/**
+ * The decode a column of `type` needs on SQLite, or `undefined`. `type` is a
+ * declared SQLite type or a schema type (`bool`, `jsonb`). The ONE answer both
+ * read paths use: the driver shim for direct reads and {@link sqliteDialect}'s
+ * `jsonWireRule` for `with` rows, so the two cannot disagree about a column.
+ */
+function sqliteValueDecode(type: string): ColumnDecode | undefined {
+  const t = type.toUpperCase();
+  if (t.includes('BOOL')) return 'boolean';
+  if (t === 'JSON' || t === 'JSONB') return 'json';
+  return undefined;
+}
+
+/**
+ * `table NUL column -> decode` for every schema column whose stored form is not
+ * its declared JS type: a boolean (stored 1/0) or a json/jsonb column (stored as
+ * JSON text). `null` when the schema has none.
+ */
+type DeclaredDecoders = ReadonlyMap<string, ColumnDecode> | null;
+
+function declaredDecoders(schema: SchemaMetadata | undefined): DeclaredDecoders {
+  if (!schema) return null;
+  let out: Map<string, ColumnDecode> | null = null;
+  for (const [table, meta] of Object.entries(schema.tables)) {
+    for (const column of meta.columns) {
+      const type = column.pgType ?? meta.pgTypes?.[column.name];
+      const decode = typeof type === 'string' ? sqliteValueDecode(type) : undefined;
+      if (decode === undefined) continue;
+      if (out === null) out = new Map();
+      out.set(`${table}\u0000${column.name}`, decode);
+    }
+  }
+  return out;
+}
+
+/** A decimal integer or float as SQLite prints it (`printf('%!.17g')` / `CAST(... AS TEXT)`). */
+const SQLITE_NUMBER_TEXT = /^-?(?:\d+\.?\d*|\.\d+)(?:e[+-]?\d+)?$/i;
+
+/**
+ * Decode a REAL / NUMERIC cell carried as text through a `with` join back to
+ * the value a direct read returns: an integer by the safe-integer policy, a
+ * double as the number its 17 digits name, `Inf` / `-Inf` as infinities.
+ */
+function decodeRealText(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  if (/^-?\d+$/.test(value)) {
+    const asNumber = Number(value);
+    return Number.isSafeInteger(asNumber) ? asNumber : value;
+  }
+  if (value === 'Inf') return Number.POSITIVE_INFINITY;
+  if (value === '-Inf') return Number.NEGATIVE_INFINITY;
+  return SQLITE_NUMBER_TEXT.test(value) ? Number(value) : value;
+}
+
+/** Read a JSON column's stored text as its value; text that is not JSON is returned as stored. */
+function parseJsonCell(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
 /**
  * Convert a `node:sqlite` null-prototype row into a normalized plain object.
  *
- * `booleanKeys`, when present, names the result columns whose ORIGIN column is
- * declared with a boolean affinity; their 1/0 storage is turned back into
- * `true`/`false` (see {@link booleanResultColumns}). Anything else in such a
- * column, and every column not listed, passes through untouched.
+ * `decoders`, when present, names the result columns whose ORIGIN column is a
+ * boolean or a JSON column (see {@link resultColumnDecoders}): 1/0 becomes
+ * `true`/`false`, JSON text becomes its value. Anything else in such a column,
+ * and every column not listed, passes through untouched.
  */
 function normalizeRow(
   row: Record<string, null | number | bigint | string | Uint8Array>,
-  booleanKeys?: ReadonlySet<string>,
+  decoders?: ReadonlyMap<string, ColumnDecode>,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   for (const key of Object.keys(row)) {
     const value = normalizeValue(row[key] as null | number | bigint | string | Uint8Array);
-    out[key] = booleanKeys?.has(key) && (value === 1 || value === 0) ? value === 1 : value;
+    const decode = decoders?.get(key);
+    out[key] =
+      decode === undefined
+        ? value
+        : decode === 'json'
+          ? parseJsonCell(value)
+          : value === 1 || value === 0
+            ? value === 1
+            : value;
   }
   return out;
 }
 
 /**
- * The result columns of a prepared statement whose ORIGIN column is declared
- * boolean, or `null` when there are none (the overwhelmingly common case).
+ * The result columns of a prepared statement that need decoding, or `null`
+ * when there are none (the overwhelmingly common case).
  *
- * WHY THIS EXISTS. SQLite has no boolean storage class: a `BOOLEAN` column
- * holds 1/0 integers. Turbine still generates `ok: boolean` for it
- * ({@link sqliteTypeToTs} maps `/bool/` to `boolean`), so `row.ok === true` was
- * false, `JSON.stringify(row)` emitted `1`, and a value the ORM itself wrote as
- * `true` came back as a number. The declared type is the ONLY thing that says
- * "this integer is a boolean", and it lives in the schema, not in the value.
+ * WHY THIS EXISTS. SQLite has no boolean or JSON storage class: a boolean is
+ * stored as 1/0 and a JSON document as text. Turbine still generates
+ * `ok: boolean` and a JSON value for those columns, and PostgreSQL returns
+ * exactly that, so a value the ORM itself wrote as `true` or `{ a: 1 }` came
+ * back as `1` or `'{"a":1}'`.
  *
- * The decltype comes from the driver rather than from Turbine's metadata
- * because the driver knows which TABLE each result column came from.
- * `StatementSync.columns()` reports `type` as `sqlite3_column_decltype`, which
- * is non-null only for a direct table-column reference and null for any
- * expression, so a computed column can never be coerced by accident.
+ * Two sources name such a column, both read from the driver's per-column
+ * description, because only the driver knows which TABLE a result column came
+ * from. `StatementSync.columns()` reports the declared type
+ * (`sqlite3_column_decltype`) and the origin table and column, all of which are
+ * null for an expression, so a computed column is never decoded by accident.
+ *  - A declared type naming a boolean (`BOOLEAN`), as before.
+ *  - The client's schema: an origin column declared boolean or json/jsonb there.
+ *    Turbine's own DDL stores those as INTEGER and TEXT, so the declared type
+ *    alone missed every table Turbine created.
  *
- * Node gained `columns()` in 22.13 / 23.4 while this engine's floor is 22.5, so
- * it is feature-detected: on the narrow band without it, booleans keep reading
- * back as 1/0 exactly as before rather than the engine refusing to run.
+ * Node gained `columns()` in 22.16 / 23.11 while this engine's floor is 22.5, so
+ * it is feature-detected: on the narrow band without it, these columns keep
+ * reading back as stored rather than the engine refusing to run.
  */
-function booleanResultColumns(stmt: ReturnType<DatabaseSync['prepare']>): Set<string> | null {
-  const columnsFn = (stmt as { columns?: () => { name?: unknown; type?: unknown }[] }).columns;
+function resultColumnDecoders(
+  stmt: ReturnType<DatabaseSync['prepare']>,
+  declared: DeclaredDecoders,
+): Map<string, ColumnDecode> | null {
+  const columnsFn = (
+    stmt as { columns?: () => { name?: unknown; type?: unknown; table?: unknown; column?: unknown }[] }
+  ).columns;
   if (typeof columnsFn !== 'function') return null;
-  let described: { name?: unknown; type?: unknown }[];
+  let described: { name?: unknown; type?: unknown; table?: unknown; column?: unknown }[];
   try {
     described = columnsFn.call(stmt);
   } catch {
     // A statement the driver cannot describe (some PRAGMA forms) is not worth
-    // failing a query over; skip the coercion for it.
+    // failing a query over; skip the decoding for it.
     return null;
   }
-  let out: Set<string> | null = null;
+  let out: Map<string, ColumnDecode> | null = null;
   for (const c of described) {
-    if (typeof c.name !== 'string' || typeof c.type !== 'string') continue;
-    if (!/bool/i.test(c.type)) continue;
-    if (out === null) out = new Set();
-    out.add(c.name);
+    if (typeof c.name !== 'string') continue;
+    let decode: ColumnDecode | undefined;
+    if (typeof c.type === 'string' && sqliteValueDecode(c.type) === 'boolean') decode = 'boolean';
+    else if (declared !== null && typeof c.table === 'string' && typeof c.column === 'string') {
+      decode = declared.get(`${c.table}\u0000${c.column}`);
+    }
+    if (decode === undefined) continue;
+    if (out === null) out = new Map();
+    out.set(c.name, decode);
   }
   return out;
 }
@@ -288,11 +386,11 @@ let cachedSqliteNamespace: { StatementSync?: { prototype?: { columns?: unknown }
 /**
  * Can the driver report a result column's DECLARED type?
  *
- * This is the same capability {@link booleanResultColumns} feature-detects, and
+ * This is the same capability {@link resultColumnDecoders} feature-detects, and
  * the two have to be asked the SAME question or they split: that helper is what
  * turns 1/0 into `true`/`false` on every direct read, and the boolean
  * `jsonWireRule` is what does it on the join path. On the Node band with
- * `node:sqlite` but without `StatementSync.columns()` (>= 22.5, < 22.13 / 23.4)
+ * `node:sqlite` but without `StatementSync.columns()` (>= 22.5, < 22.16 / 23.11)
  * the helper returns `null` and every direct read keeps 1/0, so a join that
  * still converted would produce exactly the strategy-dependent type flip the
  * rule exists to prevent, on the one runtime where nothing else can catch it.
@@ -501,7 +599,8 @@ function runStatement(
   db: DatabaseSync,
   sql: string,
   values: unknown[],
-  booleanCache?: LRUCache<string, Set<string> | null>,
+  decoderCache?: LRUCache<string, Map<string, ColumnDecode> | null>,
+  declared: DeclaredDecoders = null,
 ) {
   const binding = toNamedBinding(values);
   let stmt: ReturnType<DatabaseSync['prepare']>;
@@ -513,16 +612,16 @@ function runStatement(
   stmt.setReadBigInts(true);
   try {
     if (statementReturnsRows(sql)) {
-      // Describe each distinct statement ONCE. `null` (no boolean column) is a
+      // Describe each distinct statement ONCE. `null` (nothing to decode) is a
       // cached answer too, so the ordinary query pays a single Map hit per call
       // and nothing per row.
-      let booleanKeys = booleanCache?.get(sql);
-      if (booleanKeys === undefined) {
-        booleanKeys = booleanResultColumns(stmt);
-        booleanCache?.set(sql, booleanKeys);
+      let decoders = decoderCache?.get(sql);
+      if (decoders === undefined) {
+        decoders = resultColumnDecoders(stmt, declared);
+        decoderCache?.set(sql, decoders);
       }
       const rows = (binding ? stmt.all(binding) : stmt.all()).map((r) =>
-        normalizeRow(r as Record<string, null | number | bigint | string | Uint8Array>, booleanKeys ?? undefined),
+        normalizeRow(r as Record<string, null | number | bigint | string | Uint8Array>, decoders ?? undefined),
       );
       return { rows, rowCount: rows.length };
     }
@@ -597,6 +696,12 @@ export interface SqlitePoolOptions {
    * `PRAGMA busy_timeout`.
    */
   busyTimeoutMs?: number;
+  /**
+   * The client's schema. A column it declares boolean or json/jsonb is read
+   * back as a boolean or a parsed value, whatever its SQLite declared type.
+   * `turbineSqlite` passes the schema it was given.
+   */
+  schema?: SchemaMetadata;
 }
 
 /**
@@ -618,11 +723,13 @@ export class SqlitePool implements PgCompatPool {
   readonly db: DatabaseSync;
   private closed = false;
   /**
-   * `sql -> declared-boolean result columns` (or `null` for none). Bounded like
+   * `sql -> result columns to decode` (or `null` for none). Bounded like
    * the query builder's SQL-template cache, since a caller can generate
    * unbounded distinct statements (raw SQL, an IN-list that inlines).
    */
-  private readonly booleanCache = new LRUCache<string, Set<string> | null>(1000);
+  private readonly decoderCache = new LRUCache<string, Map<string, ColumnDecode> | null>(1000);
+  /** Schema columns whose stored form is not their declared JS type (see {@link declaredDecoders}). */
+  private readonly declared: DeclaredDecoders;
   private readonly busyTimeoutMs: number;
   /** Who may run statements on the handle right now; `null` when nobody holds it. */
   private owner: object | null = null;
@@ -636,6 +743,7 @@ export class SqlitePool implements PgCompatPool {
     this.db = db;
     const t = Number(options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS);
     this.busyTimeoutMs = Number.isFinite(t) && t >= 0 ? t : DEFAULT_BUSY_TIMEOUT_MS;
+    this.declared = declaredDecoders(options.schema);
   }
 
   // biome-ignore lint/suspicious/noExplicitAny: pg-compat query is generic over the row shape; runStatement returns plain objects.
@@ -694,7 +802,7 @@ export class SqlitePool implements PgCompatPool {
       }
     }
     try {
-      const result = runStatement(this.db, sql, params, this.booleanCache);
+      const result = runStatement(this.db, sql, params, this.decoderCache, this.declared);
       if (TX_OPEN_HEAD.test(sql)) this.trackedTransaction = true;
       else if (TX_CLOSE_HEAD.test(sql)) this.trackedTransaction = false;
       return result;
@@ -917,7 +1025,7 @@ export const sqliteDialect: Dialect = {
 
     // A declared-boolean column is 1/0 in storage, and the driver shim turns
     // that back into true/false on every direct read (see
-    // booleanResultColumns). `json_object` sees the raw integer and has no
+    // resultColumnDecoders). `json_object` sees the raw integer and has no
     // decltype to consult, so the join strategy alone would have kept handing
     // back 1/0 while the top-level read, the batched loader and the flatten
     // plan returned booleans, which is the same strategy-dependent type flip
@@ -929,7 +1037,8 @@ export const sqliteDialect: Dialect = {
     // driverReportsDeclaredTypes). Without it the shim cannot name a boolean
     // result column, so 1/0 is the answer everywhere; converting here alone
     // would put the flip back, pointing the other way.
-    if (t.includes('BOOL') && driverReportsDeclaredTypes()) {
+    const decode = sqliteValueDecode(columnType);
+    if (decode === 'boolean' && driverReportsDeclaredTypes()) {
       return {
         // Carried as TEXT because that is how the decode half is reached at
         // all: the parser only runs `decode` on a string cell, so a rule that
@@ -940,6 +1049,32 @@ export const sqliteDialect: Dialect = {
         // driver would have returned it, rather than being stringified.
         sql: (ref) => `CASE WHEN ${ref} IN (0, 1) THEN CAST(${ref} AS TEXT) ELSE ${ref} END`,
         decode: (value) => (value === '1' ? true : value === '0' ? false : value),
+      };
+    }
+
+    // A json/jsonb column is JSON text in storage, which the shim parses on
+    // every direct read (see resultColumnDecoders). `json_object` embeds the
+    // same text as a JSON string, so the decode is the same parse. No cast: the
+    // column reference already yields the text. Gated like the boolean rule,
+    // since the direct-read half needs the same driver capability.
+    if (decode === 'json' && driverReportsDeclaredTypes()) {
+      return { sql: (ref) => ref, decode: parseJsonCell };
+    }
+
+    // `json_object` renders a REAL with 15 significant digits on the SQLite
+    // that Node 22 and 24 bundle (3.47 to 3.51; 3.53 renders 17), so 0.1 + 0.2
+    // came back 0.3 through a join and a NUMERIC past 15 digits was rounded
+    // again on top of its REAL storage, while the top-level read and the
+    // batched loader return the stored double. `printf('%!.17g')` prints every
+    // double with enough digits to rebuild it, on every version; an INTEGER in
+    // the same column is carried as its text and decoded by the safe-integer
+    // policy above; text and NULL pass through as stored.
+    if (/REAL|FLOA|DOUB|NUMERIC|DECIMAL|MONEY/.test(t)) {
+      return {
+        sql: (ref) =>
+          `CASE typeof(${ref}) WHEN 'real' THEN printf('%!.17g', ${ref}) ` +
+          `WHEN 'integer' THEN CAST(${ref} AS TEXT) ELSE ${ref} END`,
+        decode: decodeRealText,
       };
     }
 
@@ -1471,7 +1606,7 @@ export function turbineSqlite(
   options: TurbineSqliteOptions = {},
 ): TurbineClient {
   const db = typeof target === 'string' ? openSqliteDatabase(target, options) : target;
-  const pool = new SqlitePool(db, { busyTimeoutMs: options.busyTimeoutMs });
+  const pool = new SqlitePool(db, { busyTimeoutMs: options.busyTimeoutMs, schema });
   // Everything that is not a SQLite pragma is client config and rides through
   // untouched, so a new TurbineConfig option works here the day it lands. The
   // engine-owned keys come last, so no caller can unbind the dialect.
