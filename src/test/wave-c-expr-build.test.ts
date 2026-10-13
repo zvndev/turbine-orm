@@ -154,7 +154,8 @@ const RENDERED: [string, () => Record<string, unknown>, Record<string, string>][
       postgresql:
         'UPDATE "stats" SET "hits" = (("hits" * $1::int4) - ("bonus" / $2::int4)) WHERE "id" = $3 RETURNING *',
       sqlite: 'UPDATE "stats" SET "hits" = (("hits" * :p1) - ("bonus" / :p2)) WHERE "id" = :p3 RETURNING *',
-      mysql: 'UPDATE `stats` SET `hits` = ((`hits` * :p1) - (`bonus` / :p2)) WHERE `id` = :p3',
+      // Integer division between integers is DIV on MySQL, whose `/` is decimal.
+      mysql: 'UPDATE `stats` SET `hits` = ((`hits` * :p1) - (`bonus` DIV :p2)) WHERE `id` = :p3',
       mssql: 'UPDATE [stats] SET [hits] = (([hits] * @p1) - ([bonus] / @p2)) OUTPUT INSERTED.* WHERE [id] = @p3',
     },
   ],
@@ -249,7 +250,7 @@ const RENDERED: [string, () => Record<string, unknown>, Record<string, string>][
     () => ({ day: expr.now() }),
     {
       postgresql: `UPDATE "stats" SET "day" = (now() AT TIME ZONE 'UTC')::date WHERE "id" = $1 RETURNING *`,
-      sqlite: `UPDATE "stats" SET "day" = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE "id" = :p1 RETURNING *`,
+      sqlite: `UPDATE "stats" SET "day" = strftime('%Y-%m-%d', 'now') WHERE "id" = :p1 RETURNING *`,
       mysql: 'UPDATE `stats` SET `day` = UTC_DATE() WHERE `id` = :p1',
       mssql: 'UPDATE [stats] SET [day] = CAST(SYSUTCDATETIME() AS date) OUTPUT INSERTED.* WHERE [id] = @p1',
     },

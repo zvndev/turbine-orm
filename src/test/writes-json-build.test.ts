@@ -190,14 +190,15 @@ describe('objects and arrays bound to a scalar column', () => {
     qi.buildCreate({ data: { mood: { custom: true } } }); // enum/domain/extension type: not refused
   });
 
-  it('is PostgreSQL-only: SQLite, MySQL and SQL Server keep JSON-in-text', () => {
-    for (const dialect of [sqliteDialect, mysqlDialect, mssqlDialect]) {
+  it('SQLite and SQL Server keep JSON-in-text; MySQL, which has a JSON type, refuses like PostgreSQL', () => {
+    for (const dialect of [sqliteDialect, mssqlDialect]) {
       const built = q(dialect).buildCreate({ data: { title: { a: 1 } } });
       assert.ok(
         built.params.some((p) => typeof p === 'object'),
         `${dialect.name} binds the object`,
       );
     }
+    assert.throws(() => q(mysqlDialect).buildCreate({ data: { title: { a: 1 } } }), ValidationError);
   });
 });
 

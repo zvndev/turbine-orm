@@ -257,8 +257,10 @@ export const expr = Object.freeze({
     return arithmetic<V>('mul', a, b);
   },
   /**
-   * `a / b`. Integer division truncates on PostgreSQL, SQLite and SQL Server and
-   * gives a decimal on MySQL, as the `divide` update operator does.
+   * `a / b`. When both operands are integers (an integer column, an integer
+   * number or bigint, or an integer expression) the division truncates toward
+   * zero on every engine, as the `divide` update operator does on an integer
+   * column. With a non-integer operand it is a decimal division.
    */
   div<V extends number | bigint | string = number>(a: NumericOperand, b: NumericOperand): SqlExpr<V> {
     return arithmetic<V>('div', a, b);
@@ -365,6 +367,14 @@ export function exprNotAllowedMessage(table: string, key: string, value: SqlExpr
 // ---------------------------------------------------------------------------
 
 type ColumnClass = 'numeric' | 'temporal' | 'json' | 'array' | 'other' | 'unknown';
+/**
+ * The arithmetic class of an expression or operand, which decides what every
+ * engine computes and stores (see {@link compileSetExpr}): `int` for integer
+ * columns, integer numbers and bigints; `dec` for any other numeric column or
+ * number; `null` for SQL NULL, which takes the class of what it meets;
+ * `unknown` for a column with no known type; `other` for everything else.
+ */
+type NumClass = 'int' | 'dec' | 'null' | 'unknown' | 'other';
 type TemporalKind = 'tz' | 'timestamp' | 'date' | 'time';
 
 const NUMERIC_TYPES: ReadonlySet<string> = new Set([
@@ -393,6 +403,22 @@ const NUMERIC_TYPES: ReadonlySet<string> = new Set([
   'money',
   'smallmoney',
   'number',
+]);
+
+/** The integer subset of {@link NUMERIC_TYPES}. */
+const INTEGER_TYPES: ReadonlySet<string> = new Set([
+  'int2',
+  'int4',
+  'int8',
+  'smallint',
+  'integer',
+  'int',
+  'bigint',
+  'tinyint',
+  'mediumint',
+  'serial',
+  'bigserial',
+  'smallserial',
 ]);
 
 const TEMPORAL_TYPES: Readonly<Record<string, TemporalKind>> = {
@@ -429,6 +455,35 @@ function columnClass(dbType: string | undefined): ColumnClass {
   if (NUMERIC_TYPES.has(t)) return 'numeric';
   if (Object.hasOwn(TEMPORAL_TYPES, t)) return 'temporal';
   return 'other';
+}
+
+/** The {@link NumClass} of a column of this type. */
+function numClassOfType(dbType: string | undefined): NumClass {
+  if (dbType === undefined) return 'unknown';
+  const t = normalizeType(dbType);
+  if (INTEGER_TYPES.has(t)) return 'int';
+  return NUMERIC_TYPES.has(t) ? 'dec' : 'other';
+}
+
+/** The {@link NumClass} of a bound value. */
+function numClassOfValue(value: unknown): NumClass {
+  if (value === null) return 'null';
+  if (typeof value === 'bigint') return 'int';
+  if (typeof value === 'number') return Number.isInteger(value) ? 'int' : 'dec';
+  return 'other';
+}
+
+/**
+ * The class of a result computed from these operands: anything non-numeric
+ * wins, then a non-integer, then an untyped column; NULL is neutral.
+ */
+function combineClasses(classes: readonly NumClass[]): NumClass {
+  let out: NumClass = 'null';
+  for (const c of classes) {
+    if (c === 'other') return 'other';
+    if (c === 'dec' || (c === 'unknown' && out !== 'dec') || (c === 'int' && out === 'null')) out = c;
+  }
+  return out;
 }
 
 function temporalKind(dbType: string | undefined): TemporalKind | undefined {
@@ -486,8 +541,13 @@ export interface ExprCompileEnv {
   readonly targetKey: string;
   /** The operation, for messages: `update`, `updateMany`, `upsert`, `createMany`. */
   readonly operation: string;
-  /** Bind one value leaf (coerced for the target column) and return its placeholder, cast included. */
-  bind(value: unknown): string;
+  /**
+   * Bind one value leaf (coerced for the target column) and return its
+   * placeholder, cast included. `arithmetic` is the leaf's class when it is an
+   * arithmetic operand, where PostgreSQL types it from its own value rather than
+   * from the target column.
+   */
+  bind(value: unknown, arithmetic?: 'int' | 'dec'): string;
   /** Render a column of the target row. */
   column(column: string): string;
   /** Render the incoming row's column, or absent where `expr.excluded` has no meaning. */
@@ -514,6 +574,7 @@ export interface CompiledSetExpr {
 interface Part {
   sql: string;
   fp: string;
+  cls: NumClass;
 }
 
 interface WalkState {
@@ -526,6 +587,17 @@ interface WalkState {
  * Compile one expression (or `col()` reference) assigned to `env.targetKey`.
  * The single traversal: SQL, params (through `env.bind`, in emission order)
  * and fingerprint come out of one walk.
+ *
+ * What an expression stores is the same on every engine, by one rule:
+ * arithmetic is integer arithmetic when both operands are integers (integer
+ * columns, integer numbers, bigints, integer expressions), and integer
+ * division truncates toward zero, as `{ divide }` does on an integer column.
+ * Any other numeric operand makes it decimal. A non-integer result is refused
+ * on an integer column, because the engines disagree on converting one (round
+ * half away from zero, round half to even, truncate, or store it unconverted).
+ * The class is decided from the operands' types and the bound values' kinds,
+ * both part of the fingerprint, so the SQL text never depends on anything the
+ * cache key does not capture.
  */
 export function compileSetExpr(env: ExprCompileEnv, value: SqlExpr | ColumnRef): CompiledSetExpr {
   const { qi } = env;
@@ -533,6 +605,16 @@ export function compileSetExpr(env: ExprCompileEnv, value: SqlExpr | ColumnRef):
   const column = assertExprTarget(qi, env.targetKey, value, env.operation);
   const state: WalkState = { env, targetType: columnType(qi, column), reads: new Set() };
   const part = walkOperand(state, value, false, 0);
+  if (part.cls === 'dec' && numClassOfType(state.targetType) === 'int') {
+    const what = isColumnRef(value) ? `col(${JSON.stringify(value.col)})` : `expr.${(value as SqlExpr).kind}()`;
+    throw new ValidationError(
+      `${what} in ${env.operation} data on "${qi.table}.${env.targetKey}" computes a non-integer value (an operand ` +
+        `is a non-integer number or a non-integer column), and "${env.targetKey}" is an integer column ` +
+        `(${state.targetType}). Engines convert such a value differently, so it is refused. Use integer operands ` +
+        "(expr.div truncates: expr.div(expr.mul(col('n'), 3), 2) is n * 1.5 truncated), or compute the value in " +
+        'JavaScript.',
+    );
+  }
   return { sql: part.sql, fingerprint: part.fp, reads: state.reads };
 }
 
@@ -554,7 +636,7 @@ function walkOperand(state: WalkState, value: unknown, inArithmetic: boolean, de
   if (isColumnRef(value)) {
     const column = resolveOperandColumn(state, value.col, 'col', inArithmetic);
     state.reads.add(column);
-    return { sql: state.env.column(column), fp: `c:${column}` };
+    return { sql: state.env.column(column), fp: `c:${column}`, cls: numClassOfType(columnType(state.env.qi, column)) };
   }
   if (isSqlExpr(value)) return walkNode(state, value, inArithmetic, depth);
   // A value leaf. Its shape was validated when the node was built; the bind
@@ -572,7 +654,12 @@ function walkOperand(state: WalkState, value: unknown, inArithmetic: boolean, de
         'Arithmetic takes numbers, bigints, col() of a numeric column, or numeric expressions.',
     );
   }
-  return { sql: state.env.bind(value), fp: '?' };
+  // The class is part of the fingerprint: it decides PostgreSQL's cast on an
+  // arithmetic operand and MySQL's DIV, so two calls differing only in it must
+  // not share a cached statement.
+  const cls = numClassOfValue(value);
+  const arithmetic = inArithmetic ? (cls === 'dec' ? 'dec' : 'int') : undefined;
+  return { sql: state.env.bind(value, arithmetic), fp: `?${cls}`, cls };
 }
 
 /** Resolve a field an operand names, refusing columns no expression may read. */
@@ -620,7 +707,13 @@ function walkNode(state: WalkState, node: SqlExpr, inArithmetic: boolean, depth:
         );
       }
       const [a, b] = node.args.map((arg) => walkOperand(state, arg, true, depth + 1)) as [Part, Part];
-      return { sql: `(${a.sql} ${ARITHMETIC_SQL[node.kind]} ${b.sql})`, fp: `${node.kind}(${a.fp},${b.fp})` };
+      const result = combineClasses([a.cls, b.cls]);
+      // MySQL's `/` is decimal division even between integers, so integer
+      // division is DIV there (truncating toward zero, like PostgreSQL's,
+      // SQLite's and SQL Server's `/` on integers).
+      const op =
+        node.kind === 'div' && result === 'int' && qi.dialect.name === 'mysql' ? 'DIV' : ARITHMETIC_SQL[node.kind];
+      return { sql: `(${a.sql} ${op} ${b.sql})`, fp: `${node.kind}(${a.fp},${b.fp})`, cls: result };
     }
     case 'coalesce': {
       if (node.args.length > MIN_VARIADIC) qi.markVariableArity();
@@ -628,6 +721,7 @@ function walkNode(state: WalkState, node: SqlExpr, inArithmetic: boolean, depth:
       return {
         sql: `COALESCE(${parts.map((p) => p.sql).join(', ')})`,
         fp: `coalesce(${parts.map((p) => p.fp).join(',')})`,
+        cls: combineClasses(parts.map((p) => p.cls)),
       };
     }
     case 'greatest':
@@ -641,6 +735,7 @@ function walkNode(state: WalkState, node: SqlExpr, inArithmetic: boolean, depth:
           parts.map((p) => p.sql),
         ),
         fp: `${node.kind}(${parts.map((p) => p.fp).join(',')})`,
+        cls: combineClasses(parts.map((p) => p.cls)),
       };
     }
     case 'case':
@@ -650,7 +745,7 @@ function walkNode(state: WalkState, node: SqlExpr, inArithmetic: boolean, depth:
         throw new ValidationError('expr.now() cannot be an arithmetic operand: date arithmetic is not supported.');
       }
       const rendered = renderNow(state);
-      return { sql: rendered, fp: `now:${rendered}` };
+      return { sql: rendered, fp: `now:${rendered}`, cls: 'other' };
     }
     case 'excluded': {
       const field = (node as ExcludedRef).field;
@@ -672,7 +767,7 @@ function walkNode(state: WalkState, node: SqlExpr, inArithmetic: boolean, depth:
             'Add it to every row of data, or read the existing value with col() instead.',
         );
       }
-      return { sql: env.excluded(column), fp: `x:${column}` };
+      return { sql: env.excluded(column), fp: `x:${column}`, cls: numClassOfType(columnType(qi, column)) };
     }
     default:
       throw new ValidationError(`Unknown expression kind "${String(node.kind)}".`);
@@ -687,18 +782,22 @@ function walkCase(state: WalkState, node: CaseExpr, inArithmetic: boolean, depth
   qi.markVariableArity();
   const sqlParts: string[] = [];
   const fpParts: string[] = [];
+  const classes: NumClass[] = [];
   node.args.forEach((arm, i) => {
     const when = caseWhen(state, arm.when, i);
     const predicate = env.predicate(when);
     const then = walkOperand(state, arm.then, inArithmetic, depth + 1);
     sqlParts.push(`WHEN ${predicate} THEN ${then.sql}`);
+    classes.push(then.cls);
     fpParts.push(`w:${fingerprintWhere(qi, when)}=>${then.fp}`);
   });
   const hasElse = node.else !== undefined;
   const otherwise = hasElse ? walkOperand(state, node.else, inArithmetic, depth + 1) : undefined;
+  if (otherwise) classes.push(otherwise.cls);
   return {
     sql: `CASE ${sqlParts.join(' ')}${otherwise ? ` ELSE ${otherwise.sql}` : ''} END`,
     fp: `case(${fpParts.join(';')}|e:${otherwise ? otherwise.fp : '-'})`,
+    cls: combineClasses(classes),
   };
 }
 
@@ -799,7 +898,8 @@ function renderExtreme(qi: BuilderCtx, kind: 'greatest' | 'least', args: string[
  * path uses. Zone-less `timestamp` / `date` columns take the UTC wall clock
  * (PostgreSQL with `utcTimestamps: false` takes the session's local time, which
  * is what that setting reads back), `timestamptz` takes the instant, and on
- * SQLite, where Turbine binds a Date as ISO-8601 UTC text, the same text.
+ * SQLite, where Turbine binds a Date as ISO-8601 UTC text, the same text (the
+ * `YYYY-MM-DD` UTC day on a date column).
  */
 function renderNow(state: WalkState): string {
   const { qi, targetKey, operation } = state.env;
@@ -820,7 +920,8 @@ function renderNow(state: WalkState): string {
     case 'mysql':
       return kind === 'date' ? 'UTC_DATE()' : 'UTC_TIMESTAMP(3)';
     case 'sqlite':
-      return "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
+      // The text a bound Date takes on SQLite: the UTC day on a date column.
+      return kind === 'date' ? "strftime('%Y-%m-%d', 'now')" : "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
     default:
       if (kind === 'tz') return 'SYSDATETIMEOFFSET()';
       if (kind === 'date') return 'CAST(SYSUTCDATETIME() AS date)';
