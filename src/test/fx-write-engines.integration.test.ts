@@ -350,7 +350,7 @@ describe('write rules on SQLite (live, in memory)', () => {
     ];
     const conflict = { target: ['email'], update: ['name'] };
     assertE003(await thrown(() => db.table('fxw_ci').createMany({ data, onConflict: conflict })), SHARED_KEY);
-    raw.exec('DELETE FROM fxw_ci');
+    assert.equal(raw.prepare('SELECT COUNT(*) AS n FROM fxw_ci').get().n, 0, 'the refused statement is rolled back');
     // Inside a transaction the refusal rolls the statement back.
     assertE003(
       await thrown(() => db.$transaction((tx: Any) => tx.table('fxw_ci').createMany({ data, onConflict: conflict }))),

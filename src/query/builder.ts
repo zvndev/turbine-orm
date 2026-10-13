@@ -4966,7 +4966,11 @@ export class QueryInterface<
       // refuses instead.)
       const { chunks, rowsPerChunk } = writesMod.planCreateMany(this.ctx, base, projection);
       const run = async (): Promise<FieldResult<T, S, O>[]> => {
-        if (chunks.length === 1) {
+        // SQLite applies two rows whose onConflict keys are equal only under the
+        // column's collation (NOCASE) as an insert and an update of one row, in
+        // one statement; the transform sees it (the row comes back twice) and
+        // refuses, so the statement runs in a transaction that refusal rolls back.
+        if (chunks.length === 1 && !(base.onConflict !== undefined && this.dialect.name === 'sqlite')) {
           return this.executeMutation(chunks[0]!, args.timeout) as Promise<FieldResult<T, S, O>[]>;
         }
         const reselects = this.dialect.resultStrategy === 'reselect';
