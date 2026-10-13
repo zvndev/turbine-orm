@@ -85,23 +85,19 @@ const def: SchemaDef = defineSchema({
   },
 } as never);
 
-/**
- * The metadata with each column's default expression attached, the input the
- * PowDB engine needs to apply a default it has no DDL for.
- */
-function withDefaultExpressions(meta: SchemaMetadata): SchemaMetadata {
-  for (const table of Object.values(def.tables)) {
-    const tm = meta.tables[table.name]!;
-    for (const [field, config] of Object.entries(table.columns)) {
-      if (config.defaultValue == null) continue;
-      const col = tm.columns.find((c) => c.field === field)!;
-      (col as { defaultValue?: string }).defaultValue = config.defaultValue;
-    }
-  }
-  return meta;
-}
+// defineSchema metadata carries each column's default expression
+// (`ColumnMetadata.defaultValue`), which is what lets PowDB, an engine with no
+// column defaults, apply one on create.
+const SCHEMA = schemaDefToMetadata(def);
 
-const SCHEMA = withDefaultExpressions(schemaDefToMetadata(def));
+/** The same metadata with the default expressions removed, as a source that does not record them would give. */
+function withoutDefaultExpressions(meta: SchemaMetadata): SchemaMetadata {
+  const out = structuredClone(meta);
+  for (const table of Object.values(out.tables)) {
+    for (const col of table.columns) delete col.defaultValue;
+  }
+  return out;
+}
 
 const USERS = [
   { orgId: 1, managerId: null, tenantId: 1, email: 'alice@x', score: 10, balance: '12.34', big: 9007199254740993n },
@@ -908,8 +904,14 @@ describe('powdb v0.90: column defaults', () => {
     });
   });
 
+  it('takes the default expressions from defineSchema metadata as built', () => {
+    const users = SCHEMA.tables.users!.columns;
+    assert.equal(users.find((c) => c.name === 'role')?.defaultValue, "'member'");
+    assert.equal(SCHEMA.tables.posts!.columns.find((c) => c.name === 'created_at')?.defaultValue, 'now()');
+  });
+
   it('refuses rather than writing NULL when the metadata does not carry the default', async () => {
-    const bare = schemaDefToMetadata(def);
+    const bare = withoutDefaultExpressions(SCHEMA);
     const db = await openPow({}, bare);
     try {
       await assert.rejects(

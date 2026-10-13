@@ -35,6 +35,15 @@ export interface TurbineCliConfig {
    */
   relationNames?: Record<string, Record<string, string>>;
   /**
+   * TypeScript type overrides for generated row and input types, as
+   * `{ '<table>.<column>': '<type>' }` with database names. The main use is a
+   * `json` / `jsonb` column, which otherwise generates as `unknown`:
+   * `{ 'users.settings': '{ theme: string; beta?: boolean }' }`. The type text
+   * is emitted verbatim. A key naming no table or column is an error, not a
+   * silent no-op. A code-first column's `tsType` feeds the same map.
+   */
+  columnTypes?: Record<string, string>;
+  /**
    * Extension for the generated `index.ts` sibling imports (F3):
    * `'js'` (`./types.js`), `'ts'` (`./types.ts`, for Node's native type
    * stripping), `'none'` (`./types`), or `'auto'` (default: tsconfig-detected,
@@ -293,6 +302,8 @@ export interface ResolvedConfig {
   legacyToManyUniques: boolean;
   /** Resolved derived-relation rename map, or undefined when none is declared. */
   relationNames?: Record<string, Record<string, string>>;
+  /** Column type overrides for the generator, or undefined when none is declared. */
+  columnTypes?: Record<string, string>;
 }
 
 export interface CliOverrides {
@@ -332,6 +343,7 @@ export function resolveConfig(fileConfig: TurbineCliConfig, overrides: CliOverri
     schema: overrides.schema ?? fileConfig.schema ?? 'public',
     include: overrides.include ?? fileConfig.include ?? [],
     relationNames: fileConfig.relationNames,
+    columnTypes: fileConfig.columnTypes,
     exclude: overrides.exclude ?? fileConfig.exclude ?? [],
     migrationsDir: fileConfig.migrationsDir ?? './turbine/migrations',
     // `seedFile` is canonical (what the docs and `turbine init` use); `seed` is a

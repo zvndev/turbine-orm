@@ -81,6 +81,7 @@ describe('extractCodeFirstColumnTags', () => {
         email: { type: 'text', pii: true },
         updatedAt: { type: 'timestamptz', updatedAt: true },
         nick: { type: 'varchar', maxLength: 20 },
+        settings: { type: 'jsonb', tsType: '{ theme: string }' },
         plain: { type: 'text' },
       },
     });
@@ -90,6 +91,7 @@ describe('extractCodeFirstColumnTags', () => {
     assert.deepEqual(users?.get('email'), { pii: true });
     assert.deepEqual(users?.get('updated_at'), { updatedAt: true });
     assert.deepEqual(users?.get('nick'), { maxLength: 20 });
+    assert.deepEqual(users?.get('settings'), { tsType: '{ theme: string }' });
     assert.equal(users?.has('plain'), false, 'an untagged column must not appear');
     assert.equal(users?.has('id'), false);
   });
@@ -103,8 +105,9 @@ describe('extractCodeFirstColumnTags', () => {
 });
 
 describe('applyCodeFirstColumnTags', () => {
-  const tags = (spec: Record<string, Record<string, { pii?: true; updatedAt?: true; maxLength?: number }>>) =>
-    new Map(Object.entries(spec).map(([t, cols]) => [t, new Map(Object.entries(cols))])) as CodeFirstTagMap;
+  const tags = (
+    spec: Record<string, Record<string, { pii?: true; updatedAt?: true; maxLength?: number; tsType?: string }>>,
+  ) => new Map(Object.entries(spec).map(([t, cols]) => [t, new Map(Object.entries(cols))])) as CodeFirstTagMap;
 
   it('sets pii and updatedAt on the named columns and counts them', () => {
     const schema = introspected();
@@ -116,7 +119,7 @@ describe('applyCodeFirstColumnTags', () => {
     assert.equal(users.columns.find((c) => c.name === 'email')?.pii, true);
     assert.equal(users.columns.find((c) => c.name === 'updated_at')?.updatedAt, true);
     assert.equal(users.columns.find((c) => c.name === 'nick')?.pii, undefined);
-    assert.deepEqual(applied, { tables: 1, pii: 1, updatedAt: 1, maxLength: 0 });
+    assert.deepEqual(applied, { tables: 1, pii: 1, updatedAt: 1, maxLength: 0, columnTypes: {} });
   });
 
   it('maxLength only fills a gap: the length the database reported wins', () => {
@@ -191,7 +194,18 @@ describe('applyCodeFirstColumnTags', () => {
       schema,
       tags({ users: { gone: { maxLength: 5 } }, missing: { x: { maxLength: 5 } } }),
     );
-    assert.deepEqual(applied, { tables: 0, pii: 0, updatedAt: 0, maxLength: 0 });
+    assert.deepEqual(applied, { tables: 0, pii: 0, updatedAt: 0, maxLength: 0, columnTypes: {} });
+  });
+
+  it('returns a declared tsType as a generator columnTypes entry, without touching the column', () => {
+    const schema = introspected();
+    const applied = applyCodeFirstColumnTags(
+      schema,
+      tags({ users: { nick: { tsType: '{ first: string }' }, gone: { tsType: 'number' } } }),
+    );
+    assert.deepEqual(applied.columnTypes, { 'users.nick': '{ first: string }' });
+    assert.equal(applied.tables, 1);
+    assert.equal(schema.tables.users!.columns.find((c) => c.name === 'nick')?.tsType, 'string');
   });
 
   it('a table the caller filtered out of the client is skipped, not an error', () => {
@@ -231,6 +245,8 @@ export default defineSchema({
     email: { type: 'text', notNull: true, pii: true },
     name: { type: 'varchar', maxLength: 40, notNull: true },
     updatedAt: { type: 'timestamptz', notNull: true, default: 'now()', updatedAt: true },
+    settings: { type: 'jsonb', tsType: '{ theme: string; beta?: boolean }' },
+    meta: { type: 'jsonb' },
   },
 });
 `;
@@ -247,7 +263,11 @@ describe('turbine generate applies the schema file tags (live)', () => {
     project.write('turbine/schema.ts', SCHEMA_FILE);
     project.write(
       'turbine.config.js',
-      `export default { include: [${JSON.stringify(USERS)}], out: './generated/turbine' };\n`,
+      `export default { include: [${JSON.stringify(USERS)}], out: './generated/turbine', columnTypes: ${JSON.stringify({
+        [`${USERS}.meta`]: 'Record<string, number>',
+        // A table the include filter leaves out: dropped, not an unknown-table error.
+        'cgcli_not_included.data': 'string',
+      })} };\n`,
     );
     const push = project.cli(['push']);
     assert.equal(push.status, 0, `push failed:\n${push.output}`);
@@ -270,7 +290,11 @@ describe('turbine generate applies the schema file tags (live)', () => {
   live.it('generate reports the tags it applied and writes them into metadata.ts', () => {
     const run = project.cli(['generate']);
     assert.equal(run.status, 0, `generate failed:\n${run.output}`);
-    assert.match(run.output, /applied column tags from \.\/turbine\/schema\.ts: 1 pii, 1 updatedAt/);
+    assert.match(run.output, /applied column tags from \.\/turbine\/schema\.ts: 1 pii, 1 updatedAt, 1 tsType/);
+    // A schema-file tsType and a config columnTypes entry both reach the generated row type.
+    const types = readFileSync(join(project.dir, 'generated', 'turbine', 'types.ts'), 'utf-8');
+    assert.match(types, /settings: \{ theme: string; beta\?: boolean \} \| null;/);
+    assert.match(types, /meta: Record<string, number> \| null;/);
     const metadata = readFileSync(metadataPath, 'utf-8');
     assert.match(metadata, /pii: true/);
     assert.match(metadata, /updatedAt: true/);

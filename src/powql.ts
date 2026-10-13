@@ -3591,7 +3591,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     for (const col of this.meta.columns) {
       if (!col.hasDefault || col.isGenerated || this.meta.primaryKey.includes(col.name)) continue;
       if (data[col.field] !== undefined || data[col.name] !== undefined) continue;
-      const expr = (col as ColumnMetadata & { defaultValue?: string | null }).defaultValue;
+      const expr = col.defaultValue;
       const value = expr == null ? NO_DEFAULT : emulateColumnDefault(expr, col);
       if (value === NO_DEFAULT) {
         throw new UnsupportedFeatureError(

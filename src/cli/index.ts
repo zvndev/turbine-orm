@@ -1890,6 +1890,7 @@ async function runInitGenerate(config: ResolvedConfig, url: string): Promise<Ini
       outDir: config.out,
       connectionString: url,
       importExtension: config.importExtension,
+      columnTypes: generatorColumnTypes(appliedTags, config, schema),
     });
     genSpinner.succeed(`Generated ${bold(String(result.files.length))} files to ${cyan(`${config.out}/`)}`);
     // The accessor name the generator emits is snakeToCamel of the table name
@@ -2394,7 +2395,36 @@ function describeAppliedTags(applied: AppliedColumnTags): string {
   if (applied.pii > 0) parts.push(`${applied.pii} pii`);
   if (applied.updatedAt > 0) parts.push(`${applied.updatedAt} updatedAt`);
   if (applied.maxLength > 0) parts.push(`${applied.maxLength} maxLength`);
+  const tsTypes = Object.keys(applied.columnTypes).length;
+  if (tsTypes > 0) parts.push(`${tsTypes} tsType`);
   return parts.join(', ');
+}
+
+/**
+ * The generator's `columnTypes`: the schema file's `tsType` declarations, then
+ * the config file's `columnTypes`, which wins on the same key. A config key
+ * whose table the run's include / exclude filters leave out is dropped, since
+ * that table has no generated type to override; every other key goes to the
+ * generator, which rejects one naming no table or column.
+ *
+ * @internal exported for tests.
+ */
+export function generatorColumnTypes(
+  applied: Pick<AppliedColumnTags, 'columnTypes'> | null,
+  config: Pick<ResolvedConfig, 'columnTypes' | 'include' | 'exclude'>,
+  schema: Pick<SchemaMetadata, 'tables'>,
+): Record<string, string> | undefined {
+  const filters = {
+    include: config.include.length ? config.include : undefined,
+    exclude: config.exclude.length ? config.exclude : undefined,
+  };
+  const merged: Record<string, string> = { ...applied?.columnTypes };
+  for (const [key, type] of Object.entries(config.columnTypes ?? {})) {
+    const table = key.slice(0, key.lastIndexOf('.'));
+    if (!Object.hasOwn(schema.tables, table) && applyTableFilters([table], filters).length === 0) continue;
+    merged[key] = type;
+  }
+  return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -2508,6 +2538,7 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
     noTimestamp: args.noTimestamp,
     importExtension: config.importExtension,
     keepColumnNames: config.keepColumnNames,
+    columnTypes: generatorColumnTypes(appliedTags, config, schema),
   });
 
   genSpinner.succeed(`Generated ${bold(String(result.files.length))} files in ${elapsed(startTime)}`);
@@ -2785,6 +2816,8 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
       noTimestamp: args.noTimestamp,
       importExtension: config.importExtension,
       keepColumnNames: config.keepColumnNames,
+      // No schema file is read here, so only the config file's overrides apply.
+      columnTypes: generatorColumnTypes(null, config, schemaMeta),
     });
     for (const file of gen.files) {
       console.log(`  ${dim(symbols.teeEnd)} ${cyan(join(outDir, file))} ${dim('(client)')}`);

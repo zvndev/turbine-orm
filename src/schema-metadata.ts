@@ -210,7 +210,7 @@ function mapIndexes(tableDef: TableDef, declared: readonly SchemaIndexDef[] | un
 }
 
 // ---------------------------------------------------------------------------
-// Code-first column tags (pii, updatedAt, maxLength)
+// Code-first column tags (pii, updatedAt, maxLength, tsType)
 // ---------------------------------------------------------------------------
 
 /** The code-first-only flags a column can declare. */
@@ -218,6 +218,13 @@ export interface CodeFirstColumnTags {
   pii?: true;
   updatedAt?: true;
   maxLength?: number;
+  /**
+   * The declared TypeScript type, WITHOUT nullability. On metadata built by
+   * {@link schemaDefToMetadata} it becomes the column's `tsType` (with
+   * `| null` added for a nullable column); `turbine generate` passes it to the
+   * generator as a `columnTypes` entry.
+   */
+  tsType?: string;
 }
 
 /**
@@ -231,6 +238,7 @@ export function declaredTagsOf(config: ColumnConfig): CodeFirstColumnTags {
     ...(config.pii ? { pii: true as const } : {}),
     ...(config.updatedAt ? { updatedAt: true as const } : {}),
     ...(config.maxLength != null ? { maxLength: config.maxLength } : {}),
+    ...(config.tsType != null ? { tsType: config.tsType } : {}),
   };
 }
 
@@ -430,9 +438,12 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
         field,
         dialectType: wireType,
         pgType: wireType,
-        tsType: pgTypeToTs(wireType, nullable),
         nullable,
         hasDefault: config.defaultValue != null || serial,
+        // The expression itself, as written in the schema (`now()`, `'draft'`).
+        // Engines with no column defaults (PowDB) apply it client-side on
+        // create, which they cannot do from `hasDefault` alone.
+        ...(config.defaultValue != null ? { defaultValue: config.defaultValue } : {}),
         isArray: config.isArray,
         arrayType: pgArrayType(base),
         pgArrayType: pgArrayType(base),
@@ -442,6 +453,14 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
         // redaction can honor them. Only set when declared, keeping output
         // byte-stable for untagged schemas.
         ...declaredTagsOf(config),
+        // After the tags: a declared `tsType` is the bare type, and the
+        // column's nullability still applies to it.
+        tsType:
+          config.tsType != null
+            ? nullable
+              ? `${config.tsType} | null`
+              : config.tsType
+            : pgTypeToTs(wireType, nullable),
       };
       columns.push(col);
 

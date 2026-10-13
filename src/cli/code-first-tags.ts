@@ -1,11 +1,11 @@
 /**
  * Code-first column tags for `turbine generate`.
  *
- * `pii`, `updatedAt` and `maxLength` exist only in the `defineSchema()` file: the
- * database has no column for them, so a client generated from introspection
- * alone returns PII by default and never stamps `updatedAt`. `generate` reads
- * the schema file and overlays its tags onto the introspected schema with the
- * two functions here.
+ * `pii`, `updatedAt`, `maxLength` and `tsType` exist only in the `defineSchema()`
+ * file: the database has no column for them, so a client generated from
+ * introspection alone returns PII by default, never stamps `updatedAt`, and
+ * types a `jsonb` column as `unknown`. `generate` reads the schema file and
+ * overlays its tags onto the introspected schema with the two functions here.
  *
  * Lives under `cli/` because only the CLI uses it. `schemaDefToMetadata` (the
  * library path) shares the tag list through `declaredTagsOf`.
@@ -59,6 +59,13 @@ export interface AppliedColumnTags {
   pii: number;
   updatedAt: number;
   maxLength: number;
+  /**
+   * Declared `tsType`s, as generator `columnTypes` entries
+   * (`'<table>.<column>'` by database name). Returned rather than written onto
+   * the schema so they go through the generator's own key and type-text
+   * validation, the same as a `columnTypes` entry in the config file.
+   */
+  columnTypes: Record<string, string>;
 }
 
 /**
@@ -81,7 +88,7 @@ export function applyCodeFirstColumnTags(
   tags: CodeFirstTagMap,
   options: { source?: string; inScope?: (table: string) => boolean } = {},
 ): AppliedColumnTags {
-  const applied: AppliedColumnTags = { tables: 0, pii: 0, updatedAt: 0, maxLength: 0 };
+  const applied: AppliedColumnTags = { tables: 0, pii: 0, updatedAt: 0, maxLength: 0, columnTypes: {} };
   const problems: string[] = [];
 
   for (const [tableName, columns] of tags) {
@@ -124,6 +131,10 @@ export function applyCodeFirstColumnTags(
       if (declared.maxLength !== undefined && column.maxLength === undefined) {
         column.maxLength = declared.maxLength;
         applied.maxLength++;
+        touched = true;
+      }
+      if (declared.tsType !== undefined) {
+        applied.columnTypes[`${tableName}.${columnName}`] = declared.tsType;
         touched = true;
       }
     }
