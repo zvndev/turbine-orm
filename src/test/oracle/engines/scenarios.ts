@@ -14,10 +14,23 @@
  * database's collation, or the oracle's answer changes with the server.
  */
 
+import assert from 'node:assert/strict';
 import { jsonValue, UNSAFE } from '../../../query/index.js';
+import { tag } from './compare.js';
+import type { Capability } from './fixture.js';
 import type { ClientConfig, Db } from './harness.js';
 
-export type TableName = 'oe_orgs' | 'oe_users' | 'oe_profiles' | 'oe_posts' | 'oe_comments';
+export type TableName =
+  | 'oe_orgs'
+  | 'oe_users'
+  | 'oe_profiles'
+  | 'oe_posts'
+  | 'oe_comments'
+  | 'oe_big_parents'
+  | 'oe_big_kids'
+  | 'oe_tags'
+  | 'oe_bin_parents'
+  | 'oe_bin_kids';
 
 export interface Scenario {
   id: string;
@@ -25,6 +38,13 @@ export interface Scenario {
   /** A dedicated client built with this config (global filters, strategies). */
   config?: ClientConfig;
   run(db: Db): Promise<unknown>;
+  /**
+   * What Postgres runs instead of `run`, when the expected answer must not
+   * come from the code under test. The batched relation loader is shared by
+   * every engine, so an oracle that also ran it would agree with any engine
+   * about a loader bug; see {@link strategyPair}.
+   */
+  oracle?(db: Db): Promise<unknown>;
   /** Write scenarios: tables whose final rows are compared too. */
   state?: readonly TableName[];
   /**
@@ -34,6 +54,12 @@ export interface Scenario {
    * comparing nothing.
    */
   throws?: string;
+  /**
+   * A capability the scenario's tables need. On an engine that lacks it (see
+   * `gaps` in harness.ts) the scenario is not compared; the battery checks
+   * instead that the gap is still there.
+   */
+  needs?: Capability;
 }
 
 const U = 'oe_users';
@@ -63,9 +89,103 @@ const TENANT: ClientConfig = {
   globalFilters: { oe_users: { orgId: 1 }, oe_posts: { orgId: 1 }, oe_comments: { orgId: 1 } },
 };
 
-const SEED_READS: Scenario[] = (['oe_orgs', 'oe_users', 'oe_profiles', 'oe_posts', 'oe_comments'] as const).map(
-  (table) => ({ id: `seed/${table}`, kind: 'read', run: (db: Db) => db.table(table).findMany(byId) }),
-);
+const SEED_READS: Scenario[] = [
+  ...(['oe_orgs', 'oe_users', 'oe_profiles', 'oe_posts', 'oe_comments', 'oe_big_parents', 'oe_big_kids'] as const).map(
+    (table): Scenario => ({ id: `seed/${table}`, kind: 'read', run: (db: Db) => db.table(table).findMany(byId) }),
+  ),
+  { id: 'seed/oe_tags', kind: 'read', needs: 'enum', run: (db: Db) => db.table('oe_tags').findMany(byId) },
+  ...(['oe_bin_parents', 'oe_bin_kids'] as const).map(
+    (table): Scenario => ({
+      id: `seed/${table}`,
+      kind: 'read',
+      needs: 'binary',
+      // Ordered by a text column, not by the binary key.
+      run: (db: Db) => db.table(table).findMany({ orderBy: table === 'oe_bin_kids' ? { id: 'asc' } : { name: 'asc' } }),
+    }),
+  ),
+];
+
+/** The same 16-byte keys the fixture seeds `oe_bin_parents` with. */
+const binKey = (first: number) => new Uint8Array([first, ...Array.from({ length: 14 }, () => 0), 10]);
+
+/**
+ * A list operand must select exactly what the same value does as a scalar:
+ * `{ in: [v] }` the rows `{ equals: v }` selects, `{ notIn: [v] }` the rows
+ * `{ not: v }` does. An engine binds a list differently from a scalar (one
+ * JSON document, one array, one placeholder per element), so a column type
+ * whose list binding converts the value differently answers a different
+ * question while every scalar scenario still agrees. `others` makes a longer
+ * list, which on MySQL also exercises the padded placeholder count.
+ */
+const inList = (
+  id: string,
+  table: TableName,
+  field: string,
+  value: unknown,
+  others: readonly unknown[],
+  needs?: Capability,
+): Scenario => ({
+  id: `in-list/${id}`,
+  kind: 'read',
+  ...(needs ? { needs } : {}),
+  run: async (db) => {
+    const order = table === 'oe_bin_parents' ? { orderBy: { name: 'asc' } } : byId;
+    const pick = async (where: Record<string, unknown>) =>
+      (await db.table(table).findMany({ ...order, where })).map((r: Record<string, unknown>) =>
+        table === 'oe_bin_parents' ? r.name : r.id,
+      );
+    return {
+      equals: await pick({ [field]: value }),
+      in: await pick({ [field]: { in: [value] } }),
+      inLonger: await pick({ [field]: { in: [value, ...others] } }),
+      not: await pick({ [field]: { not: value } }),
+      notIn: await pick({ [field]: { notIn: [value] } }),
+      notInLonger: await pick({ [field]: { notIn: [value, ...others] } }),
+    };
+  },
+});
+
+const IN_LIST_READS: Scenario[] = [
+  inList('integer', U, 'age', 34, [19, 51]),
+  inList('integer-nullable-fk', P, 'userId', 1, [5]),
+  inList('double', U, 'score', 9.5, [-1, 0]),
+  inList('double-fraction', U, 'score', 7.25, [9.5]),
+  inList('numeric-text', U, 'balance', '7.50', ['100', '0.1']),
+  inList('numeric-fraction', U, 'balance', '0.1', ['12.34']),
+  inList('numeric-past-double', U, 'balance', '12345678901234567890.123456789', ['100']),
+  inList('bigint-past-2^53', U, 'big', 9007199254740993n, [-5n, 7n]),
+  inList('bigint-negative', U, 'big', -5n, [0n]),
+  inList('bigint-fk-past-2^53', 'oe_big_kids', 'parentId', 9007199254740993n, [5n]),
+  inList('boolean-true', U, 'active', true, [false]),
+  inList('boolean-false', U, 'active', false, [true]),
+  inList('timestamp', U, 'createdAt', new Date('2026-01-15T12:00:00.000Z'), [new Date('2024-02-29T00:00:00.000Z')]),
+  inList('timestamp-ms', U, 'createdAt', new Date('2025-12-31T23:59:59.999Z'), [new Date('2026-03-08T06:59:59.999Z')]),
+  inList('date', U, 'birthday', new Date('2000-02-29T00:00:00.000Z'), [new Date('1973-12-01T00:00:00.000Z')]),
+  inList('date-iso-string', U, 'birthday', '1990-01-31', ['1985-07-04']),
+  inList('uuid', U, 'token', 'f47ac10b-58cc-4372-a567-0e02b2c3d479', ['0b5e2c1a-9f3d-4c6e-8a7b-1d2e3f405162']),
+  inList('varchar', U, 'email', 'bob@example.com', ['erin@example.com']),
+  inList('text-metacharacters', U, 'name', 'Carol 50% off_now', ['back\\slash', 'Alice']),
+  inList('binary', 'oe_bin_parents', 'id', binKey(0xff), [binKey(0xfe)], 'binary'),
+  inList('enum', 'oe_tags', 'status', "it's", ['int'], 'enum'),
+  inList('enum-nullable', 'oe_tags', 'previous', 'paused', ['active'], 'enum'),
+  {
+    // Which rows a folded or accented value matches is the engine's collation,
+    // so this asks only that the list form agrees with the scalar form.
+    id: 'in-list/collation-agrees-with-scalar',
+    kind: 'read',
+    run: async (db) => {
+      const out: Record<string, boolean> = {};
+      for (const value of ['EMILE', 'Émile', 'BOB', 'alice']) {
+        const pick = (where: Record<string, unknown>) => ids(users(db, { where }));
+        const equals = await pick({ name: value });
+        const not = await pick({ name: { not: value } });
+        out[`${value} in`] = JSON.stringify(await pick({ name: { in: [value] } })) === JSON.stringify(equals);
+        out[`${value} notIn`] = JSON.stringify(await pick({ name: { notIn: [value] } })) === JSON.stringify(not);
+      }
+      return out;
+    },
+  },
+];
 
 const WHERE_READS: Scenario[] = [
   userWhere('where/equals-text', { name: 'Alice' }),
@@ -104,6 +224,13 @@ const WHERE_READS: Scenario[] = [
   userWhere('where/and-nested-or', { AND: [{ orgId: 1 }, { OR: [{ score: { gt: 9 } }, { age: null }] }] }),
   userWhere('where/json-path-string', { prefs: { path: ['theme'], equals: 'dark' } }),
   postWhere('where/json-path-number', { meta: { path: ['n'], equals: 3 } }),
+  {
+    id: 'where/enum-label-with-quote',
+    kind: 'read',
+    needs: 'enum',
+    run: (db) =>
+      ids(db.table('oe_tags').findMany({ ...byId, where: { OR: [{ status: "it's" }, { previous: "it's" }] } })),
+  },
 ];
 
 const RELATION_READS: Scenario[] = [
@@ -190,6 +317,37 @@ const PAGE_READS: Scenario[] = [
   { id: 'page/limit-zero', kind: 'read', run: (db) => ids(users(db, { limit: 0 })) },
 ];
 
+type Strategy = 'join' | 'batched';
+
+/**
+ * The same read under the `join` and the `batched` strategies. Both must equal
+ * Postgres's JOIN answer: the batched loader is engine-independent code, so for
+ * the batched scenario Postgres runs the join plan as the expected answer, and
+ * runs its own batched plan only to check that it agrees with it.
+ */
+const strategyPair = (
+  id: string,
+  read: (db: Db, strategy: Strategy) => Promise<unknown>,
+  extra: Partial<Scenario> = {},
+): Scenario[] => [
+  { id: `${id}-join`, kind: 'read', ...extra, run: (db) => read(db, 'join') },
+  {
+    id: `${id}-batched`,
+    kind: 'read',
+    ...extra,
+    run: (db) => read(db, 'batched'),
+    oracle: async (db) => {
+      const join = await read(db, 'join');
+      assert.deepEqual(
+        tag(await read(db, 'batched')),
+        tag(join),
+        'on Postgres the batched strategy disagrees with the join strategy, so it cannot be the expected answer',
+      );
+      return join;
+    },
+  },
+];
+
 const WITH_READS: Scenario[] = [
   {
     id: 'with/depth-2-full-rows',
@@ -200,24 +358,19 @@ const WITH_READS: Scenario[] = [
         with: { oeUsers: { orderBy: { id: 'asc' }, with: { oePosts: { orderBy: { id: 'asc' } } } } },
       }),
   },
-  ...(['join', 'batched'] as const).map(
-    (strategy): Scenario => ({
-      id: `with/depth-2-options-${strategy}`,
-      kind: 'read',
-      run: (db) =>
-        users(db, {
-          relationLoadStrategy: strategy,
-          select: { id: true, name: true },
-          with: {
-            oePosts: {
-              where: { published: true },
-              orderBy: [{ views: 'desc' }, { id: 'asc' }],
-              limit: 1,
-              with: { oeComments: { orderBy: { id: 'asc' }, select: { id: true, body: true, likes: true } } },
-            },
-            oeProfiles: { select: { bio: true } },
-          },
-        }),
+  ...strategyPair('with/depth-2-options', (db, strategy) =>
+    users(db, {
+      relationLoadStrategy: strategy,
+      select: { id: true, name: true },
+      with: {
+        oePosts: {
+          where: { published: true },
+          orderBy: [{ views: 'desc' }, { id: 'asc' }],
+          limit: 1,
+          with: { oeComments: { orderBy: { id: 'asc' }, select: { id: true, body: true, likes: true } } },
+        },
+        oeProfiles: { select: { bio: true } },
+      },
     }),
   ),
   {
@@ -234,6 +387,42 @@ const WITH_READS: Scenario[] = [
     kind: 'read',
     run: (db) => users(db, { select: { id: true }, with: { _count: { oePosts: true, oeComments: true } } }),
   },
+  // Relation keys a JS number cannot hold (bigint past 2^53) or a string
+  // cannot round-trip (bytes that are not UTF-8). The batched strategy stitches
+  // children to parents in JS, so a key that loses precision or collides
+  // attaches a child to the wrong parent.
+  ...strategyPair('with/bigint-keys', async (db, strategy) => ({
+    parents: await db.table('oe_big_parents').findMany({
+      orderBy: { name: 'asc' },
+      relationLoadStrategy: strategy,
+      select: { name: true },
+      with: { oeBigKids: { orderBy: { id: 'asc' }, select: { label: true } } },
+    }),
+    kids: await db.table('oe_big_kids').findMany({
+      ...byId,
+      relationLoadStrategy: strategy,
+      select: { label: true },
+      with: { oeBigParent: { select: { name: true } } },
+    }),
+  })),
+  ...strategyPair(
+    'with/binary-keys',
+    async (db, strategy) => ({
+      parents: await db.table('oe_bin_parents').findMany({
+        orderBy: { name: 'asc' },
+        relationLoadStrategy: strategy,
+        select: { name: true },
+        with: { oeBinKids: { orderBy: { id: 'asc' }, select: { label: true } } },
+      }),
+      kids: await db.table('oe_bin_kids').findMany({
+        ...byId,
+        relationLoadStrategy: strategy,
+        select: { label: true },
+        with: { oeBinParent: { select: { name: true } } },
+      }),
+    }),
+    { needs: 'binary' },
+  ),
   {
     id: 'with/to-many-full-row-types',
     kind: 'read',
@@ -343,6 +532,14 @@ const NEW_USER = {
 };
 
 const WRITES: Scenario[] = [
+  {
+    // The column's DEFAULT comes from each engine's own DDL.
+    id: 'write/enum-default',
+    kind: 'write',
+    needs: 'enum',
+    state: ['oe_tags'],
+    run: (db) => db.table('oe_tags').create({ data: { id: 5, previous: 'int' } }),
+  },
   { id: 'write/create-all-types', kind: 'write', state: [U], run: (db) => db.table(U).create({ data: NEW_USER }) },
   {
     id: 'write/create-date-end-of-day',
@@ -576,6 +773,7 @@ const GLOBAL_FILTER: Scenario[] = [
 export const SCENARIOS: readonly Scenario[] = [
   ...SEED_READS,
   ...WHERE_READS,
+  ...IN_LIST_READS,
   ...RELATION_READS,
   ...ORDER_READS,
   ...PAGE_READS,

@@ -29,9 +29,10 @@ function errorText(err: unknown): string {
   return message.split('\n')[0]?.slice(0, 240) ?? '';
 }
 
-async function outcome(h: EngineHarness, s: Scenario): Promise<Outcome> {
+async function outcome(h: EngineHarness, s: Scenario, asOracle = false): Promise<Outcome> {
+  const run = asOracle && s.oracle ? s.oracle : s.run;
   try {
-    const value = await h.withClient(s.config, (db) => s.run(db));
+    const value = await h.withClient(s.config, (db) => run(db));
     if (s.kind === 'read') return { ok: true, tagged: tag(value) };
     const state: Record<string, unknown> = {};
     for (const table of s.state ?? []) {
@@ -135,6 +136,7 @@ export function registerEngineBattery({ engine, oracle, runners, repro }: Batter
   const rules = representationRules(name);
   const ruleUses = new Map<string, number>();
   let compared = 0;
+  let notApplicable = 0;
 
   describe(`cross-engine oracle: ${name} against postgres`, () => {
     before(async () => {
@@ -150,11 +152,25 @@ export function registerEngineBattery({ engine, oracle, runners, repro }: Batter
 
     for (const s of SCENARIOS) {
       it(s.id, async (t) => {
+        const probe = s.needs === undefined ? undefined : engine.gaps?.[s.needs];
+        if (probe) {
+          // Not compared, but not silently skipped either: the gap must still be
+          // there, so closing it fails here until the scenario runs.
+          const gap = await probe();
+          assert.ok(
+            gap !== undefined,
+            `${name} ${s.id}: the harness lists "${s.needs}" as a gap on ${name}, but its probe no longer ` +
+              `finds one. Remove it from \`gaps\` in harness.ts so these scenarios run.`,
+          );
+          notApplicable++;
+          t.diagnostic(`not applicable on ${name}: ${gap.split('\n')[0]}`);
+          return;
+        }
         if (s.kind === 'write') {
           await oracle.reset();
           await engine.reset();
         }
-        const expected = await outcome(oracle, s);
+        const expected = await outcome(oracle, s, true);
         const got = await outcome(engine, s);
         compared++;
         const cmp = new Comparison(rules);
@@ -169,7 +185,13 @@ export function registerEngineBattery({ engine, oracle, runners, repro }: Batter
 
     it('every scenario ran, and every allowlist entry is real and still needed', (t) => {
       assert.ok(SCENARIOS.length >= 60, `only ${SCENARIOS.length} scenarios are defined`);
-      assert.equal(compared, SCENARIOS.length, `compared ${compared} of ${SCENARIOS.length} scenarios`);
+      assert.equal(
+        compared + notApplicable,
+        SCENARIOS.length,
+        `compared ${compared} and found ${notApplicable} not applicable, of ${SCENARIOS.length} scenarios`,
+      );
+      const gapped = SCENARIOS.filter((s) => s.needs !== undefined && engine.gaps?.[s.needs] !== undefined).length;
+      assert.equal(notApplicable, gapped, 'not-applicable count');
       const known = new Set(SCENARIOS.map((s) => s.id));
       assert.equal(known.size, SCENARIOS.length, 'two scenarios share an id');
       const orphans = SCENARIO_ENTRIES.filter((e) => e.engine === name && !known.has(e.scenario)).map(

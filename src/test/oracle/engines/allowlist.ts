@@ -192,6 +192,12 @@ const DATE_END_OF_DAY: readonly ScenarioEntry[] = [
     kind: 'bug',
     note: 'a Date written to a date column keeps its time of day (1999-12-31T23:59:59.999Z); Postgres stores the UTC date 1999-12-31.',
   },
+  {
+    engine: 'powdb',
+    scenario: 'with/bigint-keys-batched',
+    kind: 'bug',
+    note: 'the batched loader drops every relation on bigint keys: children get a null parent and parents no children. Fixed in the PowDB loader change that forces correlation keys into the parent fetch; delete this entry with it.',
+  },
 ];
 
 export const SCENARIO_ENTRIES: readonly ScenarioEntry[] = [
@@ -244,10 +250,23 @@ export const SCENARIO_ENTRIES: readonly ScenarioEntry[] = [
       note: "SQL Server's default collation compares text case-insensitively (accents still count).",
     }),
   ),
+  ...['in-list/binary', 'with/binary-keys-batched'].map(
+    (scenario): ScenarioEntry => ({
+      engine: 'mssql',
+      scenario,
+      kind: 'unsupported',
+      note:
+        'an `in` / `notIn` list binds as one OPENJSON document, and no JSON text converts to VARBINARY, ' +
+        "so a binary list (including the batched loader's key list) is refused.",
+    }),
+  ),
   // --- powdb ---
   ...[
     'where/numeric-gt',
     'where/numeric-equals-scale',
+    'in-list/numeric-text',
+    'in-list/numeric-fraction',
+    'in-list/numeric-past-double',
     'order/numeric',
     'agg/sum-numeric',
     'agg/min-max-numeric',

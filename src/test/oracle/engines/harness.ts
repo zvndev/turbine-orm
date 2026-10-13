@@ -28,7 +28,15 @@ import pg from 'pg';
 import { TurbineClient } from '../../../client.js';
 import { UNSAFE } from '../../../query/index.js';
 import { schemaToSQL } from '../../../schema-sql.js';
-import { DEF, SCHEMA, SEED, TABLES_CHILD_FIRST } from './fixture.js';
+import {
+  CAPABILITY_TABLES,
+  type Capability,
+  DEF,
+  fixtureWithout,
+  SCHEMA,
+  SEED,
+  TABLES_CHILD_FIRST,
+} from './fixture.js';
 
 // biome-ignore lint/suspicious/noExplicitAny: the battery drives tables by name, with no generated types
 export type Db = any;
@@ -40,6 +48,14 @@ export type ClientConfig = Record<string, unknown>;
 
 export interface EngineHarness {
   readonly name: EngineName;
+  /**
+   * The capabilities this engine lacks, each with a probe. A gap's tables are
+   * not created, and each scenario that needs them is checked as not
+   * applicable instead: the probe must still describe the gap (return text),
+   * so the day the engine closes it the battery asks for the scenarios to be
+   * turned on (the probe returns undefined).
+   */
+  readonly gaps?: Partial<Record<Capability, () => Promise<string | undefined>>>;
   /** Create the tables and open the main client. */
   setup(): Promise<void>;
   /** Delete every row and write the seed through Turbine. */
@@ -65,12 +81,13 @@ const BASE_CONFIG = { warnOnUnlimited: false } as const;
  * leaves a data directory that fails to reopen ("bad heap superblock magic"),
  * and the PowDB harness reopens its directory between scenarios.
  */
-async function reseed(db: Db, rowByRow = false): Promise<void> {
-  for (const table of TABLES_CHILD_FIRST) {
+async function reseed(db: Db, rowByRow = false, gaps: readonly Capability[] = []): Promise<void> {
+  const tables = TABLES_CHILD_FIRST.filter((t) => !gaps.some((gap) => CAPABILITY_TABLES[gap].has(t)));
+  for (const table of tables) {
     if ((await db.table(table).count()) === 0) continue;
     await db.table(table).deleteMany({ where: {}, allowFullTableScan: UNSAFE });
   }
-  for (const table of [...TABLES_CHILD_FIRST].reverse()) {
+  for (const table of [...tables].reverse()) {
     if (!rowByRow) {
       await db.table(table).createMany({ data: SEED[table] });
       continue;
@@ -324,19 +341,47 @@ export function mssqlHarness(url: string): EngineHarness {
 export function powdbHarness(): EngineHarness {
   let dir = '';
   let main: Db;
+  // PowDB gets the fixture without the tables of its gaps (see `gaps` below).
+  const GAPS: Capability[] = ['binary', 'enum'];
+  const { schema: fixture } = fixtureWithout(GAPS);
   const open = async (config: ClientConfig = {}) => {
     const { turbinePowDB } = await import('../../../powdb.js');
-    return turbinePowDB({ embedded: dir }, SCHEMA, { ...BASE_CONFIG, ...config });
+    return turbinePowDB({ embedded: dir }, fixture, { ...BASE_CONFIG, ...config });
+  };
+  /** The PowQL DDL for the full fixture's table `table`, or the error that refused it. */
+  const fullDdl = async (table: string): Promise<string | Error> => {
+    const { powqlSchemaDDL } = await import('../../../powdb.js');
+    try {
+      return powqlSchemaDDL(SCHEMA).find((stmt) => stmt.startsWith(`type ${table} `)) ?? '';
+    } catch (err) {
+      return err as Error;
+    }
   };
   return {
     name: 'powdb',
+    gaps: {
+      // No binary column type: declaring one is refused.
+      async binary() {
+        const ddl = await fullDdl('oe_bin_parents');
+        return ddl instanceof Error ? ddl.message : undefined;
+      },
+      // An enum column is declared as `json`, so writing a label fails with
+      // "invalid JSON". Gone when the column is declared as `str`.
+      async enum() {
+        const { powqlSchemaDDL } = await import('../../../powdb.js');
+        const ddl = powqlSchemaDDL(fixtureWithout(['binary']).schema).find((stmt) => stmt.startsWith('type oe_tags '));
+        return ddl && /status: json/.test(ddl)
+          ? `the enum column is declared as json: ${ddl.replace(/\s+/g, ' ')}`
+          : undefined;
+      },
+    },
     async setup() {
       const { powqlSchemaDDL } = await import('../../../powdb.js');
       dir = mkdtempSync(join(tmpdir(), 'turbine-oracle-engines-powdb-'));
       main = await open();
-      for (const stmt of powqlSchemaDDL(SCHEMA)) await main.rawUnsafe(stmt);
+      for (const stmt of powqlSchemaDDL(fixture)) await main.rawUnsafe(stmt);
     },
-    reset: () => reseed(main),
+    reset: () => reseed(main, false, GAPS),
     async withClient(config, fn) {
       if (!config) return fn(main);
       // The embedded engine holds one handle per directory, so the main client

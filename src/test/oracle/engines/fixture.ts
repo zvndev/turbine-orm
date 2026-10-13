@@ -15,14 +15,18 @@
  * The seed is chosen to make engines disagree where they can: NULLs in every
  * nullable column, duplicate sort keys, mixed case and non-ASCII text, LIKE
  * metacharacters, millisecond timestamps across a DST change, bigint past
- * 2^53, numerics past double precision, JSON objects and arrays.
+ * 2^53, numerics past double precision, JSON objects and arrays, relation keys
+ * that are bigints past 2^53, and binary keys that are not valid UTF-8.
+ *
+ * The binary-keyed tables and the enum table are created only on an engine
+ * that can hold them ({@link CAPABILITY_TABLES}); see `gaps` in harness.ts.
  */
 
 import type { SchemaMetadata } from '../../../schema.js';
 import { defineSchema, type SchemaDef } from '../../../schema-builder.js';
 import { schemaDefToMetadata } from '../../../schema-metadata.js';
 
-export const DEF: SchemaDef = defineSchema({
+const BASE_TABLES = {
   oe_orgs: {
     id: { type: 'integer', primaryKey: true },
     name: { type: 'text', notNull: true },
@@ -68,14 +72,92 @@ export const DEF: SchemaDef = defineSchema({
     body: { type: 'text', notNull: true },
     likes: { type: 'integer' },
   },
-} as never);
+  oe_big_parents: {
+    id: { type: 'bigint', primaryKey: true },
+    name: { type: 'text', notNull: true },
+  },
+  oe_big_kids: {
+    id: { type: 'integer', primaryKey: true },
+    parentId: { type: 'bigint', notNull: true, references: 'oe_big_parents.id' },
+    label: { type: 'text', notNull: true },
+  },
+};
 
-export const SCHEMA: SchemaMetadata = schemaDefToMetadata(DEF);
+const ENUM_TABLE_DEFS = {
+  oe_tags: {
+    id: { type: 'integer', primaryKey: true },
+    status: { type: 'enum', enumName: 'oe_status', notNull: true, default: "'active'" },
+    previous: { type: 'enum', enumName: 'oe_status' },
+  },
+};
+
+/**
+ * The battery's one enum. `it's` needs its quote doubled in every engine's
+ * DDL, and `int` is a label MySQL's type mapper would read as a type name.
+ * PostgreSQL declares it with CREATE TYPE; every other engine on the column.
+ */
+const ENUMS = { oe_status: ['active', 'paused', "it's", 'int'] } as const;
+
+const BINARY_TABLE_DEFS = {
+  oe_bin_parents: {
+    id: { type: 'bytea', primaryKey: true, maxLength: 16 },
+    name: { type: 'text', notNull: true },
+  },
+  oe_bin_kids: {
+    id: { type: 'integer', primaryKey: true },
+    parentId: { type: 'bytea', maxLength: 16, notNull: true, references: 'oe_bin_parents.id' },
+    label: { type: 'text', notNull: true },
+  },
+};
+
+/**
+ * A capability some engine lacks. Each one's tables are created only on an
+ * engine that has it; see `gaps` in harness.ts.
+ */
+export type Capability = 'binary' | 'enum';
+
+const CAPABILITY_TABLE_DEFS: Record<Capability, Record<string, unknown>> = {
+  binary: BINARY_TABLE_DEFS,
+  enum: ENUM_TABLE_DEFS,
+};
+
+/** The tables each capability adds. */
+export const CAPABILITY_TABLES: Readonly<Record<Capability, ReadonlySet<string>>> = {
+  binary: new Set(Object.keys(BINARY_TABLE_DEFS)),
+  enum: new Set(Object.keys(ENUM_TABLE_DEFS)),
+};
+
+/** The fixture without the tables of the given capabilities. */
+export function fixtureWithout(gaps: readonly Capability[]): { def: SchemaDef; schema: SchemaMetadata } {
+  const tables: Record<string, unknown> = { ...BASE_TABLES };
+  for (const [capability, defs] of Object.entries(CAPABILITY_TABLE_DEFS)) {
+    if (!gaps.includes(capability as Capability)) Object.assign(tables, defs);
+  }
+  const def = defineSchema(tables as never, { enums: ENUMS });
+  return { def, schema: schemaDefToMetadata(def) };
+}
+
+const FULL = fixtureWithout([]);
+export const DEF: SchemaDef = FULL.def;
+export const SCHEMA: SchemaMetadata = FULL.schema;
 
 /** Children first: the order a reset deletes in. Seeding walks it backwards. */
-export const TABLES_CHILD_FIRST = ['oe_comments', 'oe_posts', 'oe_profiles', 'oe_users', 'oe_orgs'] as const;
+export const TABLES_CHILD_FIRST = [
+  'oe_bin_kids',
+  'oe_bin_parents',
+  'oe_big_kids',
+  'oe_big_parents',
+  'oe_tags',
+  'oe_comments',
+  'oe_posts',
+  'oe_profiles',
+  'oe_users',
+  'oe_orgs',
+] as const;
 
 const at = (iso: string) => new Date(iso);
+/** A 16-byte key. These two differ only in a first byte that is not valid UTF-8 on its own. */
+const key = (first: number) => Buffer.from([first, ...Array.from({ length: 14 }, () => 0), 10]);
 
 export const SEED: Record<(typeof TABLES_CHILD_FIRST)[number], Record<string, unknown>[]> = {
   oe_orgs: [
@@ -273,5 +355,31 @@ export const SEED: Record<(typeof TABLES_CHILD_FIRST)[number], Record<string, un
     { id: 5, postId: 5, userId: null, orgId: 2, body: 'anonymous', likes: 1 },
     { id: 6, postId: 5, userId: 5, orgId: 2, body: 'thanks', likes: null },
     { id: 7, postId: 7, userId: 4, orgId: 2, body: 'reply', likes: 2 },
+  ],
+  oe_big_parents: [
+    { id: 9007199254740993n, name: 'snow' },
+    { id: 9007199254740992n, name: 'rain' },
+    { id: 5n, name: 'sun' },
+  ],
+  oe_big_kids: [
+    { id: 1, parentId: 9007199254740993n, label: 'k1' },
+    { id: 2, parentId: 9007199254740993n, label: 'k2' },
+    { id: 3, parentId: 9007199254740992n, label: 'k3' },
+    { id: 4, parentId: 5n, label: 'k4' },
+  ],
+  oe_tags: [
+    { id: 1, status: 'active', previous: null },
+    { id: 2, status: "it's", previous: 'paused' },
+    { id: 3, status: 'int', previous: 'active' },
+    { id: 4, status: 'paused', previous: "it's" },
+  ],
+  oe_bin_parents: [
+    { id: key(0xff), name: 'p1' },
+    { id: key(0xfe), name: 'p2' },
+  ],
+  oe_bin_kids: [
+    { id: 1, parentId: key(0xff), label: 'b1' },
+    { id: 2, parentId: key(0xfe), label: 'b2' },
+    { id: 3, parentId: key(0xfe), label: 'b3' },
   ],
 };
