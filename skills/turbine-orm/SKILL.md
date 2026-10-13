@@ -228,6 +228,11 @@ PostgreSQL's exact text as a **string** (every value, not only large ones; `AVG`
 is not float-cast there); over `int4` / `float` columns and over a JSON path they
 return a number. `_min` / `_max` return the column's own type.
 
+`_percentile: { aromaScore: { p: 0.9 } }` returns the 90th percentile, on
+PostgreSQL only. `p` may be an array of fractions, and the result is then an
+array in the same order. The default `method: 'cont'` interpolates and is
+refused on a date column with `TURBINE_E003`; use `method: 'disc'` there.
+
 ## groupBy and having
 
 `by` lists the grouping columns. The `having` shape is **column first, aggregate
@@ -267,6 +272,32 @@ predicate is refused rather than sent. When `create` does not carry them (a
 "every row matching a filter". They take no `limit`, `take`, `offset` or `skip`
 (`TURBINE_E003`): to write a bounded batch, `findMany` the ids first, then pass
 `where: { id: { in: ids } }`.
+
+## Computed updates and bulk upserts
+
+To set a column from the row's own values, build the value with `expr` and
+`col()`, both imported from `turbine-orm`:
+
+```ts
+await db.cheeseWheels.update({
+  where: { id: 7 },
+  data: { wheelCount: expr.add(col('wheelCount'), 1) },
+});
+```
+
+A plain object shaped like an expression (`{ kind: 'add', args: [1, 2] }`) is
+refused with `TURBINE_E003`, and so is an expression in `create` data.
+
+`createMany` with `onConflict: { target: ['guildId', 'batchRef'], update:
+['status'] }` inserts the new keys and updates the rows that already exist. The
+target must be the primary key or one whole unique key; any other column list
+is refused with `TURBINE_E003`.
+
+## Locking rows
+
+`lock: 'update'` on `findMany`, `findFirst` or `findUnique` locks the rows it
+returns until the transaction ends. It must run on the `tx` inside
+`db.$transaction(async (tx) => ...)`; on `db` it throws `TURBINE_E003`.
 
 ## `distinct`
 

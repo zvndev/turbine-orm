@@ -11,9 +11,11 @@ Turbine's edge entry (`turbine-orm/serverless`) is a thin shim that pulls in the
 
 When you pass an external pool, Turbine:
 
-- **Does not** call `pg.types.setTypeParser` (the host driver owns type parsing)
+- **Does not** call `pg.types.setTypeParser`, so the queries your own code sends on the pool keep the driver's parsing. Since 0.90, on a PostgreSQL pool Turbine's own queries still read `bigint` as a number and zone-less `timestamp` / `date` as UTC, as on a pool Turbine opens (`utcTimestamps: false` keeps the driver's temporal readings)
 - **Does not** own the pool's lifecycle, `db.disconnect()` becomes a no-op
 - **Does** keep every other feature: `with` inference, transactions, pipelines, middleware, typed errors, streaming
+
+A pool with no `connect()` (a stateless HTTP driver) runs each statement on its own. Work that needs one connection for several statements throws `UnsupportedFeatureError` (`TURBINE_E017`) there, naming the alternative: `$transaction`, `transaction()`, a pipeline sent as one batch, cursor streams, and a `createMany` large enough to be chunked. Before 0.90 these failed with a `TypeError`. Use a driver pool that can check out a connection for those.
 
 ## The pattern
 

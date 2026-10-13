@@ -67,7 +67,7 @@ The Query tab (the default) composes real Turbine queries, not SQL. You pick a t
 
 A live preview shows the exact `db.table.findMany({ ... })` call your builder state compiles to, and **Copy TS** puts it on your clipboard, so a query you prototype in Studio pastes straight into your codebase. After a run, **View SQL** shows the single statement the query compiled to, and **Copy SQL** copies it.
 
-Because the builder speaks ORM args instead of SQL, the server can validate everything: `POST /api/builder` checks every identifier (table, relation, field, orderBy column) against the introspected schema and compiles the query with the same `QueryInterface.buildFindMany` the library uses, every value bound as a `$N` parameter. There is no string of SQL anywhere in the request. A run returns at most 1,000 rows, whatever limit the builder asks for; a capped result says so.
+Because the builder speaks ORM args instead of SQL, the server can validate everything: `POST /api/builder` checks every identifier (table, relation, field, orderBy column) against the introspected schema and compiles the query with the same `QueryInterface.buildFindMany` the library uses, every value bound as a `$N` parameter. There is no string of SQL anywhere in the request. A run returns at most 1,000 rows, whatever limit the builder asks for; a capped result says so. A [`lock`](/queries#row-locks) option in the args is refused with `400` and a message pointing at `db.$transaction`: Studio runs reads in a read-only transaction, where a row lock cannot be taken.
 
 ## Data and Schema tabs
 

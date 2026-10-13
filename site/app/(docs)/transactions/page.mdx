@@ -37,11 +37,14 @@ The `tx` client has the same table accessors as `db` (the [reference](#transacti
 
 ### Every query finishes inside the callback
 
-Once the callback settles, `tx` is closed. Its connection goes back to the pool and may already be running another request's transaction, so a query issued through `tx` afterwards throws `ValidationError` ([`TURBINE_E003`](/errors#e003)) instead of being sent. The usual causes are a missing `await`, an `async` callback passed to `forEach`, or a `tx` kept in a variable or a timer:
+Once the callback settles, `tx` is closed. Its connection goes back to the pool and may already be running another request's transaction, so a query issued through `tx` afterwards throws `ValidationError` ([`TURBINE_E003`](/errors#e003)) instead of being sent. The usual causes are a missing `await`, an `async` callback passed to `forEach`, or a `tx` kept in a variable or a timer.
+
+If the callback returns while a query it started on `tx` is still running, the transaction is rolled back, not committed, and `$transaction` rejects with `ValidationError` (`TURBINE_E003`). Committing at that point would save whatever part of the work happened to finish first. The same rule applies to the raw [`transaction()`](#the-raw-transaction-api) client.
 
 ```ts
 await db.$transaction(async (tx) => {
-  // ❌ forEach does not wait: these run after the callback returns, and throw.
+  // ❌ forEach does not wait: the callback returns while these still run,
+  // so the transaction rolls back and $transaction rejects.
   ids.forEach(async (id) => {
     await tx.posts.update({ where: { id }, data: { published: true } });
   });
@@ -53,11 +56,9 @@ await db.$transaction(async (tx) => {
 });
 ```
 
-{/* TODO(v090): client lane (B6): if work left un-awaited by the callback now rolls the transaction back, say so here. */}
-
 ### A caught error still rolls the transaction back
 
-PostgreSQL aborts a transaction at its first failed statement. Catching that error inside the callback does not undo the abort: the `COMMIT` that follows is answered with a `ROLLBACK`, and nothing the transaction wrote is saved. `$transaction` rejects in that case rather than reporting a commit. The error is a `ValidationError` (`TURBINE_E003`) carrying the statement that failed first as `cause`, except when that failure was a deadlock or a serialization conflict, which keep their class (`DeadlockError`, `SerializationFailureError`) so a retry of the whole block still works.
+PostgreSQL aborts a transaction at its first failed statement. Catching that error inside the callback does not undo the abort: the `COMMIT` that follows is answered with a `ROLLBACK`, and nothing the transaction wrote is saved. `$transaction` rejects in that case rather than reporting a commit. The error is a `TransactionRolledBackError` ([`TURBINE_E019`](/errors#e019)) carrying the statement that failed first as `cause`. A deadlock or a serialization conflict keeps its own class instead (`DeadlockError`, `SerializationFailureError`, `LockNotAvailableError`), so a retry of the whole block still works.
 
 To recover from an expected failure and keep the rest of the work, run the statement that can fail in a [nested `$transaction`](#nested-transactions-real-savepoints), which rolls back only its own savepoint:
 
@@ -77,8 +78,6 @@ await db.$transaction(async (tx) => {
   }
 });
 ```
-
-{/* TODO(v090): PM decision made, code not landed: a rolled-back COMMIT gets its own class, TransactionRolledBackError (TURBINE_E019), with the first failure as `cause`; DeadlockError and SerializationFailureError keep their classes. Replace "ValidationError (TURBINE_E003)" above once the client lane commits it. */}
 
 ### Multi-statement writes stay whole
 
@@ -127,7 +126,7 @@ When `Serializable` detects a conflict, it throws `SerializationFailureError` (T
 
 ## Timeouts
 
-Per-transaction timeout in milliseconds, enforced client-side. If the callback exceeds `timeout`, Turbine destroys the connection (aborting any in-flight statement server-side), rolls back, and throws `TimeoutError` (TURBINE_E002):
+Per-transaction timeout in milliseconds, enforced client-side. If the callback exceeds `timeout`, Turbine cancels the statement the transaction is running on the server, rolls the transaction back, and only then rejects with `TimeoutError` (TURBINE_E002). The error's `outcome` is `'not-executed'`: nothing the transaction wrote was saved, and its locks are released by the time the call rejects. The connection goes back to the pool when the rollback is confirmed, and is closed only when it is not.
 
 ```ts
 await db.$transaction(
@@ -137,6 +136,10 @@ await db.$transaction(
   { timeout: 5_000 },
 );
 ```
+
+`timeout` must be a positive number of milliseconds below 2^31, or `0` for no timeout, the same rule a [per-query `timeout`](/queries#per-query-timeout) follows. Anything else throws `ValidationError` (`TURBINE_E003`) before a connection is taken.
+
+A per-query `timeout` on a statement inside `$transaction` works the same way on PostgreSQL: the statement is cancelled on the transaction's connection, the call rejects with `TimeoutError` (`outcome: 'not-executed'`), and the transaction is marked rolled back. If the callback catches that error and returns, `$transaction` rejects with `TransactionRolledBackError` ([`TURBINE_E019`](/errors#e019)) instead of committing. Inside a nested `tx.$transaction`, only that block rolls back. To keep going after a timed-out statement, run it in its own nested block.
 
 ## Nested transactions, real SAVEPOINTs
 
@@ -183,7 +186,21 @@ const rows = await db.$transaction(
 
 Each entry is applied as `SELECT set_config(name, value, true)` right after `BEGIN`, so the setting is scoped to the transaction and resets automatically on commit or rollback. Values may be strings, numbers, or booleans; numbers and booleans are converted to text, since a setting is text. Any other value, including `undefined` and `null`, throws `ValidationError` (`TURBINE_E003`): a missing tenant id used to reach the policy as the string `"undefined"`. An invalid setting name throws the same error. Both are checked before a connection is taken, so nothing runs.
 
-{/* TODO(v090): client lane (B6): document the rule for setting names without a dot once it lands. */}
+Names must be namespaced custom settings, with a dot (`app.current_tenant`). A name without a dot is one of PostgreSQL's own settings, such as `role`, `search_path` or `statement_timeout`. Those change who the transaction runs as or which limits it has, so they throw `ValidationError` (`TURBINE_E003`) unless your code lists them on purpose:
+
+```ts
+await db.$transaction(
+  async (tx) => tx.documents.findMany(),
+  {
+    sessionContext: { 'app.current_tenant': tenantId, statement_timeout: '5s' },
+    allowBuiltinSettings: ['statement_timeout'],
+  },
+);
+```
+
+List only names your own code chooses to set, never a name taken from a request. That way an application that maps request data into the context cannot be steered into setting `role`.
+
+When the server refuses a setting (an unknown name, an invalid value, a role that may not change it), the call throws `ValidationError` (`TURBINE_E003`) naming the setting and the reason, with the server's error as `cause`. The transaction is rolled back before your callback runs.
 
 ### $withSession shorthand
 
@@ -200,12 +217,15 @@ const rows = await db.$withSession(
 
 ## Retryable errors
 
-Two error classes carry `readonly isRetryable = true as const`, so TypeScript narrows them and you don't need a runtime field check.
+Three error classes carry `readonly isRetryable = true as const`, so TypeScript narrows them and you don't need a runtime field check.
 
-| Code | Class | SQLSTATE |
+| Code | Class | Raised for |
 |---|---|---|
-| E012 | `DeadlockError` | 40P01 |
-| E013 | `SerializationFailureError` | 40001 |
+| E012 | `DeadlockError` | PostgreSQL 40P01 |
+| E013 | `SerializationFailureError` | PostgreSQL 40001 |
+| E013 | `LockNotAvailableError` | A row lock that could not be taken: PostgreSQL 55P03, MySQL 3572 and 1205, SQL Server 1222 |
+
+`LockNotAvailableError` extends `SerializationFailureError`, so an existing `instanceof SerializationFailureError` check or E013 retry loop catches it too. See [Row locks](/queries#row-locks) for the `lock` option that raises it.
 
 Canonical retry loop, using the `withRetry` helper the package exports (or the identical `db.$retry`):
 
@@ -325,18 +345,21 @@ The `tx` handed to your `$transaction` callback is a `TransactionClient`, and it
 | Table accessors | `tx.users`, `tx.orderItems`, ... | Same `QueryInterface` API as `db.users`. Accessor names are the camelCase form of each table name in the schema, defined at construction. |
 | `tx.table<T>(name)` | `(name: string) => QueryInterface<T>` | Escape hatch for a table not present in the generated types. Same instance is reused for repeated calls. |
 | `tx.$transaction(fn)` | `(fn: (tx: TransactionClient) => Promise<R>) => Promise<R>` | Nested block via `SAVEPOINT sp_1`, `sp_2`, ... Releases the savepoint on success, rolls back **to the savepoint only** on throw, then rethrows. **Takes no options object**: isolation level, timeout and `sessionContext` are properties of the outer transaction and cannot be changed part way through. `fn` receives the *same* `tx`, not a child object. |
-| `tx.raw` | ``tx.raw<T>`SELECT ... ${value}` `` | Tagged template, the one to reach for in application code. Every `${value}` becomes a placeholder bound by the driver, so a value cannot end up concatenated into the SQL text. Returns the rows. Driver errors are translated by `wrapPgError`, so you get the same typed errors as ORM queries. |
+| `tx.raw` | ``tx.raw<T>`SELECT ... ${value}` `` | Tagged template, the one to reach for in application code. Every `${value}` becomes a placeholder bound by the driver, so a value cannot end up concatenated into the SQL text. Returns the rows. Driver errors are translated by `wrapPgError`, so you get the same typed errors as ORM queries. Only a real tagged template is accepted: an array passed in its place throws `ValidationError` (`TURBINE_E003`). |
+| `tx.sql<T>` | ``tx.sql<T>`SELECT ... ${value}` `` | Typed SQL on the transaction's connection, the same `TypedSqlQuery` as [`db.sql`](/queries#typed-raw-sql-dbsqlt): await it for `T[]`, or call `.one()` / `.scalar()`. |
+| `tx.rawUnsafe` | `(text: string, ...values: unknown[]) => Promise<T[]>` | SQL text built at runtime, with values as `$1`, `$2`, ... Nothing in `text` is escaped, so it must never contain untrusted input. |
+| `tx.$connection()` | `() => PgCompatPoolClient` | The driver connection the transaction runs on, for another library's query function or a driver feature Turbine does not wrap. Statements sent on it run inside the transaction. It closes with the transaction, `release()` on it is refused, and it uses the driver's own type parsers. Do not send `COMMIT`, `ROLLBACK` or `SAVEPOINT` on it. Throws `UnsupportedFeatureError` (`TURBINE_E017`) on PowDB and on a stateless HTTP driver, which have no connection to hand out. |
 | `tx.schema` | `SchemaMetadata` | The metadata the transaction was built from. |
 
+Once the transaction has settled, every query through `tx` (accessors, `raw`, `rawUnsafe`, `sql`, `$connection()`) is refused with `ValidationError` (`TURBINE_E003`).
+
 <Callout type="note">
-**Transaction-scoped raw SQL is not instrumented.** `tx.raw` (and the internal `tx.rawQuery` below) go straight to the transaction's connection: no `$on('query')` event, no middleware, no timing, so they never appear in query listeners or `$observe` metrics. Table-scoped calls inside the same transaction (`tx.users.findMany(...)`) are instrumented exactly as they are outside one. If you need a raw statement in your query log, log it at the call site.
+**Raw SQL inside a transaction runs no middleware.** `tx.raw`, `tx.rawUnsafe` and `tx.sql` go straight to the transaction's connection. Each emits one `$on('query')` event (model `'$raw'`, `action` set to the method name), but no `$use` middleware runs for them. Table-scoped calls inside the same transaction (`tx.users.findMany(...)`) run middleware exactly as they do outside one.
 </Callout>
 
 ### The one internal member
 
-`tx.rawQuery(text, params)` is marked `@internal` and is **not** application API. It is the seam `turbine-orm/prisma-compat` detects by shape (`typeof tx.rawQuery === 'function'`) so it can run compat raw SQL on the transaction's own connection instead of falling back to a pool connection outside the transaction. It takes the SQL as a plain string, which moves the escaping discipline to the caller, the property `tx.raw` exists to remove. It still exists at runtime and still typechecks, so existing callers keep working; use `tx.raw`.
-
-{/* TODO(v090): client lane (B6): if `tx.sql` lands, move it from the table below into "What `tx` has". */}
+`tx.rawQuery(text, params)` is marked `@internal` and is **not** application API. It is the seam `turbine-orm/prisma-compat` detects by shape (`typeof tx.rawQuery === 'function'`) so it can run compat raw SQL on the transaction's own connection instead of falling back to a pool connection outside the transaction. It takes the SQL as a plain string, which moves the escaping discipline to the caller, the property `tx.raw` exists to remove. It still exists at runtime and still typechecks, so existing callers keep working; use `tx.raw`, or `tx.rawUnsafe` for text built at runtime.
 
 ### What `tx` does not have
 
@@ -344,7 +367,6 @@ Reaching for any of these is a **compile error** (`TS2339: Property '<x>' does n
 
 | Missing | Use instead | Why |
 |---|---|---|
-| `tx.sql` | `tx.raw` inside, or `db.sql` outside | `db.sql` builds a `TypedSqlQuery` bound to the **pool**, so it would check out a second connection and run outside your transaction. `tx.raw` is the transaction-scoped equivalent; you lose `.one()` / `.scalar()` and type the rows yourself. |
 | `tx.pipeline` | `db.$transaction([...])` at the top level | See above: the pipeline protocol needs to own the connection. |
 | `tx.$use` | Register middleware on `db` before opening the transaction | The transaction inherits the client's middleware list at construction. There is no way to add one mid-transaction. |
 | `tx.$listen` / `tx.$notify` | `db.$listen` / `db.$notify` | `$listen` holds its own dedicated connection for the subscription's lifetime, which is not the transaction's connection. |
@@ -375,8 +397,10 @@ await db.$transaction(
 ```
 
 - **`isolationLevel`**: one of `'ReadUncommitted'`, `'ReadCommitted'`, `'RepeatableRead'`, `'Serializable'`. Composed into the `BEGIN` statement by the active dialect. Under `Serializable` or `RepeatableRead`, expect `SerializationFailureError` (`TURBINE_E013`) and retry the whole block.
-- **`timeout`**: milliseconds. When it fires, the transaction is rolled back and the connection is destroyed rather than returned to the pool, so the in-flight backend query is actually aborted rather than left running. You get a `TimeoutError` (`TURBINE_E002`).
-- **`sessionContext`**: a record of transaction-local Postgres GUCs, applied as `SELECT set_config($1, $2, true)` immediately after `BEGIN` and before your callback. Both the name and the value are bound parameters. The name is additionally checked against a strict identifier pattern and the value must be a string, number or boolean, so a malformed entry throws `ValidationError` before a connection is taken. `is_local = true` means the setting resets on `COMMIT` or `ROLLBACK` and never leaks onto the pooled connection. Postgres-only: on an engine whose dialect reports no RLS support it throws `UnsupportedFeatureError` (`TURBINE_E017`). `db.$withSession(context, fn)` is the shorthand.
+- **`timeout`**: milliseconds, a positive whole number below 2^31, or `0` for none. When it fires, the running statement is cancelled on the server and the transaction rolled back before the call rejects with `TimeoutError` (`TURBINE_E002`, `outcome: 'not-executed'`). See [Timeouts](#timeouts).
+- **`readOnly`**: `true` opens the transaction read-only (`BEGIN READ ONLY` on PostgreSQL, `START TRANSACTION READ ONLY` on MySQL), so the server refuses any write inside it with `ReadOnlyError` (`TURBINE_E018`). Pair it with `isolationLevel: 'RepeatableRead'` for several reads that must see one snapshot. Other engines throw `UnsupportedFeatureError` (`TURBINE_E017`).
+- **`sessionContext`**: a record of transaction-local Postgres GUCs, applied as `SELECT set_config($1, $2, true)` immediately after `BEGIN` and before your callback. Both the name and the value are bound parameters. The name is additionally checked against a strict identifier pattern and the value must be a string, number or boolean, so a malformed entry throws `ValidationError` before a connection is taken. Names need a dot (`app.current_tenant`); see [the rule for built-in settings](#multi-tenant-queries-with-rls-session-context). `is_local = true` means the setting resets on `COMMIT` or `ROLLBACK` and never leaks onto the pooled connection. Postgres-only: on an engine whose dialect reports no RLS support it throws `UnsupportedFeatureError` (`TURBINE_E017`). `db.$withSession(context, fn)` is the shorthand.
+- **`allowBuiltinSettings`**: an array of PostgreSQL setting names (`['statement_timeout']`) that `sessionContext` may set. List only names your own code sets, never one taken from a request.
 
 ### The raw transaction API
 
@@ -384,10 +408,10 @@ await db.$transaction(
 
 Prefer `$transaction`; reach for this only when you want to issue hand-written SQL on the transaction's own connection.
 
-{/* TODO(v090): client lane (B6): document whether the raw client is closed once the callback settles. */}
+The client is closed once the callback settles: a statement sent on it afterwards throws `ValidationError` (`TURBINE_E003`), and so does `release()` at any time, because the transaction returns the connection itself. A callback that returns while a statement it sent is still running rolls the transaction back, as [`$transaction` does](#every-query-finishes-inside-the-callback).
 
 ## See also
 
 - **[Relations](/relations)**, reads that fan out via `with` vs `pipeline`.
-- **[Typed Errors](/errors)**, `DeadlockError`, `SerializationFailureError`, `TimeoutError`, `PipelineError`.
+- **[Typed Errors](/errors)**, `DeadlockError`, `SerializationFailureError`, `LockNotAvailableError`, `TransactionRolledBackError`, `TimeoutError`, `PipelineError`.
 - **[Serverless](/serverless)**, why pipelines matter more on the edge.

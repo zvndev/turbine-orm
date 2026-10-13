@@ -207,7 +207,7 @@ db.$use(async (params, next) => {
 });
 ```
 
-Middleware runs *after* SQL generation, it sees the params, not the SQL, and can inspect/log/transform. Can't rewrite SQL: `params.args` is read-only, and writing to it (or calling `next()` with new args) throws a `TypeError`.
+Middleware wraps each operation: it sees the params, not the SQL, and can inspect/log/transform. Can't rewrite SQL: `params.args` is a plain copy of the caller's args, and if the copy is changed, or `next()` gets args that differ from the caller's, `next()` throws a `TypeError` naming the first differing path. Assigning `params.args` throws at once. Reading, spreading, `JSON.stringify` and `structuredClone` work.
 
 **Port note:** the `$use` lifecycle hook pattern is widely-understood (Prisma, Mongoose). Recommend porting. Run the middleware stack against the *parsed* query, not the generated wire command, so middleware is dialect-independent.
 
@@ -228,6 +228,19 @@ const users = await db.users.findMany({
   select: { id: true, email: true },  // or: omit
   with: { posts: true },
 });
+```
+
+Row locks (inside `$transaction` only; PostgreSQL all modes, MySQL `'update'` / `'share'`, E017 elsewhere):
+
+```ts
+await db.$transaction(async (tx) => {
+  const job = await tx.jobs.findFirst({
+    where: { status: 'queued' },
+    orderBy: { id: 'asc' },
+    lock: { mode: 'update', skipLocked: true }, // 'update' | 'noKeyUpdate' | 'share' | 'keyShare', noWait or skipLocked
+  });
+});
+// ... FOR UPDATE OF "jobs" SKIP LOCKED. Only the queried table is locked, never `with` relations.
 ```
 
 ### `findUnique` / `findUniqueOrThrow`
@@ -278,6 +291,8 @@ const stats = await db.posts.aggregate({
 });
 // stats._sum.viewCount, stats._avg.viewCount, ...
 ```
+
+Percentiles (PostgreSQL only): `_percentile: { latencyMs: { p: [0.5, 0.95] } }` on `aggregate` or `groupBy`. `method: 'cont'` (default) interpolates; `'disc'` returns a stored value and is the one to use on date/time columns.
 
 ### `groupBy`
 
@@ -423,14 +438,27 @@ const user = await db.users.create({
 ### `createMany`
 
 ```ts
-const { count } = await db.users.createMany({
+const users = await db.users.createMany({
   data: [
     { email: 'a@b.c', name: 'A' },
     { email: 'd@e.f', name: 'D' },
   ],
 });
-// Single INSERT ... UNNEST, one round-trip regardless of row count
+// Single INSERT ... UNNEST, one round-trip regardless of row count. Returns the rows
+// (MySQL returns [] here). Takes select / omit, like create.
 ```
+
+Multi-row upsert: new keys are inserted, existing rows updated, in one statement.
+
+```ts
+await db.users.createMany({
+  data: rows,
+  onConflict: { target: ['email'], update: ['name'] }, // or update: { ... }, where, or ignore: true
+});
+// INSERT ... ON CONFLICT ("email") DO UPDATE SET "name" = EXCLUDED."name"
+```
+
+`target` must be the primary key or one full unique key. Two rows sharing a key in one call throw E003. MySQL needs 8.0.19+; PowDB throws E017.
 
 ### `update`
 
@@ -454,6 +482,22 @@ await db.posts.update({
 // Generates: view_count = view_count + $1, race-free, no extra round-trip
 ```
 
+Update expressions, for a value computed from the row (PostgreSQL, MySQL, SQLite, SQL Server; PowDB throws E017):
+
+```ts
+import { col, expr } from 'turbine-orm';
+
+await db.posts.update({
+  where: { id: 1 },
+  data: {
+    viewCount: expr.add(col('viewCount'), 1),
+    peakViews: expr.greatest(col('peakViews'), col('viewCount')),
+    seenAt: expr.now(),
+  },
+});
+// also: sub, mul, div, coalesce, least, case([{ when, then }], otherwise), excluded('field') in upserts
+```
+
 ### `updateMany`
 
 ```ts
@@ -463,7 +507,7 @@ await db.posts.updateMany({
 });
 ```
 
-**Empty-where guard.** `updateMany({ data, where: {} })` or all-undefined `where` throws `ValidationError` (TURBINE_E003). To mass-mutate on purpose, import the `UNSAFE` symbol and pass it:
+**Empty-where guard.** `updateMany({ data, where: {} })`, an all-undefined `where`, or one that is always true (`NOT: { OR: [] }`, `{ id: { notIn: [] } }`) throws `ValidationError` (TURBINE_E003). To mass-mutate on purpose, import the `UNSAFE` symbol and pass it:
 
 ```ts
 import { UNSAFE } from 'turbine-orm';
@@ -583,7 +627,7 @@ await db.sessions.deleteMany({
 
 ## 7. Transactions
 
-Callback form. Throw to rollback. Every query on `tx` must finish inside the callback: a `tx` used after the callback settles throws `ValidationError`. A statement that fails inside the callback aborts the transaction even when the callback catches the error, and `$transaction` then rejects instead of reporting a commit; wrap a statement that may fail in a nested `tx.$transaction` to recover from it.
+Callback form. Throw to rollback. Every query on `tx` must finish inside the callback: a `tx` used after the callback settles throws `ValidationError`, and a callback that returns while a query it started is still running rolls the transaction back. A statement that fails inside the callback aborts the transaction even when the callback catches the error, and `$transaction` then rejects with `TransactionRolledBackError` (E019) instead of reporting a commit; wrap a statement that may fail in a nested `tx.$transaction` to recover from it.
 
 ```ts
 await db.$transaction(async (tx) => {
@@ -599,7 +643,9 @@ await db.$transaction(
   async (tx) => { /* ... */ },
   {
     isolationLevel: 'Serializable',   // 'ReadUncommitted' | 'ReadCommitted' | 'RepeatableRead' | 'Serializable'
-    timeout: 5_000,                   // ms
+    timeout: 5_000,                   // ms; on expiry the statement is cancelled and the transaction rolled back
+    readOnly: false,                  // true: BEGIN READ ONLY (PostgreSQL, MySQL)
+    sessionContext: { 'app.current_tenant': tenantId }, // dotted names; built-ins need allowBuiltinSettings
   },
 );
 ```
@@ -707,7 +753,13 @@ const rows = await db.raw<{ id: number; email: string }>`
 `;
 ```
 
-Inside a transaction:
+Only a real tagged template is accepted: `db.raw([text])` throws E003. For SQL text built at runtime (never from a request), use `rawUnsafe` with numbered placeholders:
+
+```ts
+await db.rawUnsafe('SELECT * FROM audit_2026 WHERE actor_id = $1', actorId);
+```
+
+Inside a transaction, `tx.raw`, `tx.sql` and `tx.rawUnsafe` run on the transaction's connection:
 
 ```ts
 await db.$transaction(async (tx) => {
@@ -737,11 +789,13 @@ All errors extend `TurbineError` with a `code: TurbineErrorCode` discriminant.
 | E010 | `NotNullViolationError` | PG 23502 |
 | E011 | `CheckConstraintError` | PG 23514 |
 | E012 | `DeadlockError` | PG 40P01, `isRetryable: true` |
-| E013 | `SerializationFailureError` | PG 40001, `isRetryable: true` |
+| E013 | `SerializationFailureError` | PG 40001, `isRetryable: true`. Subclass `LockNotAvailableError`: a row lock that could not be taken (PG 55P03, MySQL 3572 / 1205, SQL Server 1222) |
 | E014 | `PipelineError` | One or more pipeline queries failed |
 | E015 | `OptimisticLockError` | Version mismatch on an `optimisticLock` update |
 | E016 | `ExclusionConstraintError` | PG 23P01 |
 | E017 | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, `LISTEN`/`NOTIFY`, RLS `sessionContext`) invoked on an engine that does not support it |
+| E018 | `ReadOnlyError` | A write refused by a read-only database, role or transaction (`reason`) |
+| E019 | `TransactionRolledBackError` | A transaction PostgreSQL rolled back instead of committing; the first failure is `cause` |
 
 ### Canonical error handling
 
@@ -917,7 +971,7 @@ With Node's built-in `node:test`, pass `{ skip }` to each test instead. In this 
 
 - **Lazy loading.** Every field is explicit. If you want `user.posts` you write `with: { posts: true }`. This is a feature; it keeps query costs visible.
 - **Model classes.** Rows are plain objects. No `user.save()`, no `user.$prisma`, no decorators. Plays well with JSON, serializers, validation libraries.
-- **Automatic soft-delete.** Use `globalFilters` if you want it (`{ posts: { deletedAt: null } }`); middleware cannot add the condition, since its args are read-only. Baking it in would hide it.
+- **Automatic soft-delete.** Use `globalFilters` if you want it (`{ posts: { deletedAt: null } }`); middleware cannot add the condition, since a change to its args is refused. Baking it in would hide it.
 - **Multi-database at runtime.** One `TurbineClient` = one pool = one DB. For multi-tenancy, create multiple clients.
 - **Hooks on entity mutation.** Use middleware for cross-cutting concerns. Entity-lifecycle hooks encourage spaghetti.
 

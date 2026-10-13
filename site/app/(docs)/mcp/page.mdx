@@ -43,6 +43,8 @@ PII tags are a code-first declaration (introspection never infers one), so the s
 
 No free-form SQL. You pass a subset of `findMany` args; Turbine validates every identifier against the introspected schema, compiles parameterized SQL through the same builder your application uses, and runs `EXPLAIN (FORMAT JSON)` with bound params.
 
+A [`lock`](/queries#row-locks) option is refused by name (JSON-RPC error `-32602`), at the top level or on any `with` entry, by both `explain_query` and `compile_query`: the server is read-only, and a locking read belongs in a `db.$transaction` in your application. Compile the query without it. `compile_query` also refuses a `_percentile` when it cannot read the PII tag file, rather than compile a percentile over a column it cannot check.
+
 | Argument | Required | Description |
 |---|---|---|
 | `table` | yes | Table name; must exist in the live schema. |

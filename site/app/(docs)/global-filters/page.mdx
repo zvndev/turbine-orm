@@ -41,6 +41,8 @@ The map is checked when the client is constructed, because a filter that silentl
 - a key that names no table (a typo, or a table that was renamed);
 - two keys for one table (`blogPosts` and `blog_posts`); combine them with `AND: [...]`;
 - a static filter whose keys name no column or relation of that table;
+- a static `AND` / `OR` / `NOT` that cannot be read as written: `OR: { ... }` (an object where an array belongs; write `OR: [{ ... }]`), or a combinator holding a scalar or `null`;
+- a static relation filter whose value is not a where object, such as `author: { is: 5 }` or `posts: { some: null }`, the same shapes a query refuses (see [Relation filters](/queries#relation-filters));
 - a value that is neither a where object nor a function, including `undefined`.
 
 A static `null` is accepted and means "no filter for this table".
@@ -145,7 +147,7 @@ const some = await db.users.findMany({
 });
 ```
 
-{/* TODO(v090): client lane (B6): document whether the array form accepts table names as well as accessors, and whether an unknown name throws, once it lands. */}
+Each entry after `UNSAFE` names a table, by table name (`blog_posts`) or by client accessor (`blogPosts`): both skip the same filter. An entry that names no table throws `ValidationError` (`TURBINE_E003`), suggesting the nearest table name, since it would skip nothing. `[UNSAFE]` with no table after it throws for the same reason; pass `UNSAFE` alone to skip every filter.
 
 `skipGlobalFilters: true` and `skipGlobalFilters: ['posts']` throw a `ValidationError` ([`TURBINE_E003`](/errors)). See [Privilege options](#privilege-options-and-the-unsafe-symbol) below for why, and for the upgrade path if you are passing `true` today.
 

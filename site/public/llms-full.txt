@@ -53,10 +53,11 @@ const users = await db.users.findMany({
 ```
 
 - `select` / `omit`, pick or drop columns (one or the other, not both): `select: { id: true, email: true }`.
-- Pagination: `limit`/`take` + `offset`/`skip`, or keyset `cursor` (name the last row by a unique key such as `{ id }`; the cursor row is excluded, the page follows `orderBy` completed by the primary key, and a cursor that cannot identify one row throws E003). `take` and `skip` are Prisma-compatible aliases folded into `limit` and `offset`; passing both spellings of one bound with different values throws E003.
+- Pagination: `limit`/`take` + `offset`/`skip`, or keyset `cursor` (name the last row by a unique key such as `{ id }`; the cursor row is excluded, the page follows `orderBy` completed by the primary key, and a cursor that cannot identify one row throws E003; leave `cursor` out or `undefined` for the first page, since `cursor: null` and `cursor: {}` throw E003). `take` and `skip` are Prisma-compatible aliases folded into `limit` and `offset`; passing both spellings of one bound with different values throws E003.
 - `distinct: ['userId']`, DISTINCT ON; which row survives per group is governed by `orderBy`.
 - `orderBy`, `{ field: 'asc' | 'desc' }`, or a spec `{ field: { sort: 'desc', nulls: 'last' } }`. Order by a to-many relation's `_count` (`orderBy: { posts: { _count: 'desc' } }`) or a to-one relation's column (`orderBy: { author: { name: 'asc' } }`).
 - `warnOnUnlimited: false` silences the unlimited-query warning per call.
+- `lock` (also on findFirst / findUnique and their OrThrow forms): `'update'`, `'noKeyUpdate'`, `'share'`, `'keyShare'`, or `{ mode, noWait: true }` / `{ mode, skipLocked: true }`. Emits `FOR <MODE> OF "<table>"`, locking only the queried table's rows, never `with` relations. Must run inside `$transaction` (E003 outside), refused on streams and with `distinct`. PostgreSQL takes all four modes, MySQL `'update'` and `'share'`, other engines throw E017. A lock that cannot be taken throws `LockNotAvailableError` (E013, retryable).
 
 ### findUnique / findUniqueOrThrow
 Look up by primary key or any unique column. The `where` MUST identify one row (a PK, a single-column unique, or every column of a compound unique; extra predicates beside the key are fine, a null value never counts); anything else throws E003 naming the keys that would work, because it would otherwise return an arbitrary one of the matching rows. Use `findFirst` for "any row matching a filter". `findUnique` returns `T | null`; the `OrThrow` form throws `NotFoundError` (E001). Composite PKs pass all key columns: `where: { userId: 1, orgId: 2 }`.
@@ -73,7 +74,7 @@ await db.users.count({ where: { role: 'admin' } });
 await db.posts.aggregate({ where: { orgId: 1 }, _sum: { viewCount: true }, _avg: { score: true }, _count: true });
 await db.posts.groupBy({ by: ['userId'], _count: true, _sum: { viewCount: true }, having: { _count: { gt: 1 } } });
 ```
-Aggregate functions: `_count`, `_sum`, `_avg`, `_min`, `_max`. `groupBy` also supports `where` (filter rows before grouping), `having` (filter groups; operators gt/gte/lt/lte/in/notIn), `orderBy`, JSON-path group keys/targets, and Postgres-only `distinctOn`.
+Aggregate functions: `_count`, `_sum`, `_avg`, `_min`, `_max`, and (PostgreSQL only, E017 elsewhere) `_percentile: { field: { p: 0.95 } }` or `{ p: [0.5, 0.99], method: 'disc' }` ('cont', the default, interpolates and is refused on date/time columns; 'disc' returns a stored value). `groupBy` also supports `where` (filter rows before grouping), `having` (filter groups; operators gt/gte/lt/lte/in/notIn), `orderBy`, JSON-path group keys/targets, and Postgres-only `distinctOn`.
 
 ### explain(args)
 Compiles the exact statement `findMany(args)` would run and returns the engine plan as `string[]`. Use it to confirm the emitted query hits the index you expect.
@@ -88,7 +89,7 @@ Array columns: `has`, `hasEvery`, `hasSome`.
 Full-text: `search` (with optional `config`, default 'english').
 JSON (`json`/`jsonb`): `path` (drill into keys), `equals`, `contains` (containment @>), `hasKey`, and `gt`/`gte`/`lt`/`lte` (require `path`). Pathless `equals` compares the whole document (PostgreSQL, MySQL; E017 on SQLite and SQL Server); path `equals` compares JSON values, so `equals: null` matches a JSON null, not the string "null". Use `contains` for containment.
 Column-to-column: `col('otherField')` (imported from `turbine-orm`) inside `equals`/`not`/`gt`/`gte`/`lt`/`lte`. A plain `{ col: 'x' }` object throws E003.
-Relation filters: `some`, `every`, `none` (any operator composes inside them).
+Relation filters: `some`, `every`, `none` (any operator composes inside them), and `is` / `isNot` on a to-one relation. Each takes a where object: `some: null`, a scalar or an array throws E003. `some: {}` means "has a related row", `none: {}` "has none"; `is: null` / `isNot: null` test a to-one relation's presence.
 Combinators: `AND`, `OR`, `NOT`.
 
 ```ts
@@ -111,14 +112,18 @@ await db.users.deleteMany({ where: { createdAt: { lt: cutoff } } });
 await db.users.upsert({ where: { email: 'a@b.com' }, create: { /* ... */ }, update: { /* ... */ } });
 ```
 
-`updateMany` / `deleteMany` take no `limit` / `take` / `offset` / `skip` (E003): `findMany` the ids first, then write `where: { id: { in: ids } }`. A `createMany` past the engine's bind-parameter limit is split into chunks inside one transaction (not on SQL Server).
+`updateMany` / `deleteMany` take no `limit` / `take` / `offset` / `skip` (E003): `findMany` the ids first, then write `where: { id: { in: ids } }`. A `createMany` past the engine's bind-parameter limit is split into chunks inside one transaction (a plain `createMany` on SQL Server throws E003 instead). `createMany` takes `select` / `omit`.
+
+Multi-row upsert: `createMany({ data, onConflict: { target: ['email'], update: ['name'] } })` inserts new keys and updates existing rows in one statement. `target` is the primary key or one full unique key; `update` is a field list or a per-column object; `where` limits which existing rows are updated; `{ target, ignore: true }` skips them. Two rows with the same key in one call throw E003. MySQL needs 8.0.19+ and refuses `where`, `ignore` and a global filter (E017); PowDB refuses `onConflict` (E017).
 
 Atomic update operators on numeric columns (race-safe `col = col + $n`): `set`, `increment`, `decrement`, `multiply`, `divide`.
 ```ts
 await db.posts.update({ where: { id: 1 }, data: { viewCount: { increment: 1 } } });
 ```
 
-Safety: `update`/`delete` with an empty `where` (`{}` or all-undefined) throws `ValidationError` (E003). To mass-mutate on purpose, import the `UNSAFE` symbol and pass `{ allowFullTableScan: UNSAFE }`. A literal `true` throws, see Privilege options below.
+Update expressions, for a value computed from the row: `import { expr, col } from 'turbine-orm'`, then `data: { views: expr.add(col('views'), 1), peak: expr.greatest(col('peak'), col('views')), seenAt: expr.now() }`. Builders: `add`, `sub`, `mul`, `div`, `coalesce`, `greatest`, `least` (NULLs ignored on every engine), `case([{ when, then }], otherwise)`, `now()`, and `excluded('field')` (the incoming row, in upsert's `update` and `onConflict.update`). Accepted in `update`, `updateMany`, upsert's `update`, nested update data and `onConflict.update`; refused (E003) in create data and on json/array columns. A plain `{ kind, args }` object is never an expression. PowDB and prisma-compat throw E017.
+
+Safety: `update`/`delete` with an empty `where` (`{}` or all-undefined) or an always-true one (`NOT: { OR: [] }`, `{ id: { notIn: [] } }`) throws `ValidationError` (E003). To mass-mutate on purpose, import the `UNSAFE` symbol and pass `{ allowFullTableScan: UNSAFE }`. A literal `true` throws, see Privilege options below.
 
 Nested writes: relation fields in `create`/`update` `data` support `create`, `connect`, `connectOrCreate`, `disconnect`, `set`, `delete`, `update`, `upsert`, resolved in one transaction (depth-capped at 10).
 
@@ -141,7 +146,7 @@ await db.users.findFirst({ where: { id: 1 }, includePii: UNSAFE });
 await db.sessions.deleteMany({ where: {}, allowFullTableScan: UNSAFE });           // every row, on purpose
 ```
 
-`where` stays required on `delete` / `deleteMany` / `update` / `updateMany`; `allowFullTableScan` disarms the guard on an EMPTY `where`, it does not let you omit the key.
+`where` stays required on `delete` / `deleteMany` / `update` / `updateMany`; `allowFullTableScan` disarms the guard on an EMPTY or always-true `where`, it does not let you omit the key.
 
 Any other value that asks for the privilege, `true` and `['posts']` included, throws `ValidationError` (E003). The reason is that all three sit next to `where` on the same options object, so the idiomatic `db.users.findMany({ ...req.body })` used to let a request body drop the tenant predicate, the PII projection, or the mass-mutation guard. `JSON.parse` cannot produce a symbol, so no parsed input can put `UNSAFE` on an args object at all.
 
@@ -155,7 +160,7 @@ await db.$transaction(async (tx) => {
   await tx.posts.create({ data: { userId: user.id, /* ... */ } });
 }, { isolationLevel: 'Serializable', timeout: 5000 });
 ```
-`tx` has the same typed accessors as `db`. Nested `$transaction` calls become SAVEPOINTs. Isolation levels: `ReadCommitted`, `RepeatableRead`, `Serializable`. Every query on `tx` must finish inside the callback (a `tx` used after it settles throws E003). Catching a failed statement does not save the transaction: PostgreSQL rolls it back at COMMIT and `$transaction` rejects; wrap a statement that may fail in a nested `tx.$transaction` to recover. The array form `$transaction([...builds], options)` takes deferred `build*()` queries, never promises.
+`tx` has the same typed accessors as `db`. Nested `$transaction` calls become SAVEPOINTs. Isolation levels: `ReadCommitted`, `RepeatableRead`, `Serializable`. Every query on `tx` must finish inside the callback: a `tx` used after it settles throws E003, and a callback that returns while a query it started is still running rolls the transaction back (E003). Catching a failed statement does not save the transaction: PostgreSQL rolls it back at COMMIT and `$transaction` rejects with `TransactionRolledBackError` (E019, the first failure as `cause`); wrap a statement that may fail in a nested `tx.$transaction` to recover. Options: `isolationLevel`, `timeout` (on expiry the statement is cancelled on the server and the transaction rolled back), `readOnly` (PostgreSQL, MySQL), `sessionContext` (dotted names such as `app.tenant`; a built-in setting needs `allowBuiltinSettings`). `tx` also has `raw`, `rawUnsafe`, `sql` and `$connection()`. The array form `$transaction([...builds], options)` takes deferred `build*()` queries, never promises.
 
 Pipeline, N independent queries in one round-trip via the Postgres extended-query pipeline protocol:
 ```ts
@@ -171,9 +176,11 @@ Raw SQL, every `${value}` becomes a bound `$N` parameter (injection impossible):
 ```ts
 const rows = await db.raw<{ day: Date; count: number }>`SELECT ... WHERE org_id = ${orgId}`;
 const users = await db.sql<{ id: number; name: string }>`SELECT id, name FROM users WHERE id = ${42}`; // .one(), .scalar()
+await db.rawUnsafe('SELECT * FROM audit_2026 WHERE actor_id = $1', actorId); // text built at runtime: never from a request
 ```
+`raw` and `sql` take only a real tagged template; an array in its place throws E003.
 
-Middleware, `db.$use(fn)` runs after SQL generation: observe params/timing and transform results, but it cannot rewrite the query. `params.args` is read-only: writing to it, or calling `next()` with new args, throws a `TypeError`.
+Middleware, `db.$use(fn)` wraps every query: observe params/timing and transform results, but it cannot rewrite the query, which is compiled from the caller's args. `params.args` is a plain copy of the caller's args: reading, spreading, `JSON.stringify` and `structuredClone` work, but if the copy is changed, or `next()` gets args that differ from the caller's, `next()` throws a `TypeError` naming the first differing path (assigning `params.args` throws at once). A per-query `timeout` is ms up to 2147483647, or `0` for no timeout.
 
 ## Typed errors
 
@@ -182,7 +189,7 @@ Every error extends `TurbineError` and carries a `code`. Branch on the class/cod
 - E001 NotFoundError, OrThrow lookups
 - E002 TimeoutError, carries `outcome`: `'not-executed'` (made no change, safe to retry) or `'unknown'`
 - E003 ValidationError, unknown column, invalid operator, empty-where guard
-- E004 ConnectionError
+- E004 ConnectionError, including pg 42P05 / 26000 (a named prepared statement behind a transaction pooler, with advice: direct endpoint or `preparedStatements: false`)
 - E005 RelationError, unknown relation in `with`
 - E006 MigrationError
 - E007 CircularRelationError, `with` nesting depth > 10
@@ -191,12 +198,13 @@ Every error extends `TurbineError` and carries a `code`. Branch on the class/cod
 - E010 NotNullViolationError (23502)
 - E011 CheckConstraintError (23514)
 - E012 DeadlockError (40P01), `isRetryable = true`
-- E013 SerializationFailureError (40001), `isRetryable = true`
+- E013 SerializationFailureError (40001), `isRetryable = true`; its subclass LockNotAvailableError is a row lock that could not be taken (PostgreSQL 55P03, MySQL 3572 and 1205, SQL Server 1222)
 - E014 PipelineError
 - E015 OptimisticLockError
 - E016 ExclusionConstraintError (23P01)
 - E017 UnsupportedFeatureError, a Postgres-only feature invoked on an engine that lacks it
 - E018 ReadOnlyError, a write refused on a read-only database, role or transaction (`reason`: 'snapshot' | 'rbac' | 'transaction')
+- E019 TransactionRolledBackError, a transaction PostgreSQL rolled back instead of committing (a statement inside it failed or timed out); the first failure is `cause`
 
 ```ts
 import { SerializationFailureError } from 'turbine-orm';
@@ -208,7 +216,7 @@ catch (err) {
 
 ## Migrations
 
-SQL-first migration files (UTC timestamp-prefixed, `-- UP` / `-- DOWN` sections) tracked in `_turbine_migrations` with SHA-256 checksums and a `pg_try_advisory_lock()`. Each runs in its own transaction; modified files are detected by checksum. Destructive statements need a typed confirmation or `--allow-destructive`. For fast local iteration use `turbine push` (applies `defineSchema` directly); prefer SQL migrations for production. `defineSchema` throws E003 on a key it does not know, naming the nearest valid one; a column's `tsType` (or `columnTypes` in `turbine.config.ts`) sets its generated TypeScript type. In CI, `push --dry-run --exit-code` and `migrate status --exit-code` exit 2 on drift, and `migrate deploy --wait` waits for a concurrent deploy's lock.
+SQL-first migration files (UTC timestamp-prefixed, `-- UP` / `-- DOWN` sections) tracked in `_turbine_migrations` with SHA-256 checksums and a `pg_try_advisory_lock()`. Each runs in its own transaction; modified files are detected by checksum. Destructive statements need a typed confirmation or `--allow-destructive`. For fast local iteration use `turbine push` (applies `defineSchema` directly); prefer SQL migrations for production. `defineSchema` throws E003 on a key it does not know, naming the nearest valid one; a column's `tsType` (or `columnTypes` in `turbine.config.ts`) sets its generated TypeScript type and must be one TypeScript type on one line. In CI, `push --dry-run --exit-code` exits 2 on drift or a diff warning, `migrate status --exit-code` exits 2 on a pending, modified, missing or misnamed migration, and `migrate deploy --wait` waits for a concurrent deploy's lock. `migrate up` / `deploy` / `down` refuse a transaction-pooler URL unless `--allow-pooler` is passed.
 
 ## Engines
 

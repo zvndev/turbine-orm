@@ -217,7 +217,7 @@ try {
 }
 ```
 
-Every error Turbine raises extends `TurbineError` with a stable code (`TURBINE_E001` through `E018`) and a `docsUrl`; a driver error whose SQLSTATE Turbine does not map stays the driver's own error, carrying that SQLSTATE on `.code`. Error messages carry keys, never values: a `NotFoundError` says `where: { id, email }` without printing the email, so errors are safe to forward to a tracker without a scrubbing rule. Retryable failures (`DeadlockError`, `SerializationFailureError`) expose `isRetryable: true` as a typed const. `err.code` is the check that survives a mixed ESM/CJS module graph, where two copies of the package hold two copies of every class; since 0.78 `instanceof` works across copies too, through a cross-copy brand on every error. Full table: [turbineorm.dev/errors](https://turbineorm.dev/errors).
+Every error Turbine raises extends `TurbineError` with a stable code (`TURBINE_E001` through `E019`) and a `docsUrl`; a driver error whose SQLSTATE Turbine does not map stays the driver's own error, carrying that SQLSTATE on `.code`. Error messages carry keys, never values: a `NotFoundError` says `where: { id, email }` without printing the email, so errors are safe to forward to a tracker without a scrubbing rule. Retryable failures (`DeadlockError`, `SerializationFailureError` and its subclass `LockNotAvailableError`) expose `isRetryable: true` as a typed const. `err.code` is the check that survives a mixed ESM/CJS module graph, where two copies of the package hold two copies of every class; since 0.78 `instanceof` works across copies too, through a cross-copy brand on every error. Full table: [turbineorm.dev/errors](https://turbineorm.dev/errors).
 
 ## Built for agents
 
@@ -329,7 +329,7 @@ const schema = defineSchema({
 
 const db = turbineSqlite(':memory:', schemaDefToMetadata(schema));
 for (const stmt of schemaToSQL(schema, { dialect: sqliteDialect })) {
-  await db.raw([stmt] as never);
+  await db.rawUnsafe(stmt);
 }
 
 const users = await db
