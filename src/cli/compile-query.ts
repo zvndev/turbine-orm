@@ -120,6 +120,9 @@ export const COLUMN_NAMING_ARG_KEYS: readonly string[] = [
   '_avg',
   '_min',
   '_max',
+  // Keys are column names and the result is a stored value (or one equal to it),
+  // the same reason `_min` / `_max` are listed.
+  '_percentile',
 ];
 
 /**

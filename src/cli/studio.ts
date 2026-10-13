@@ -72,7 +72,11 @@ import {
   redeemTicket,
   type TicketGate,
 } from './local-server-guard.js';
-import { assertNoPiiPredicates as assertNoPiiPredicatesShared } from './pii-predicate-guard.js';
+import {
+  assertNoPiiPredicates as assertNoPiiPredicatesShared,
+  findRowLockOption,
+  rowLockRefusalMessage,
+} from './pii-predicate-guard.js';
 import { applyPiiTags, loadPiiTags } from './pii-tags.js';
 import { callerKey, checkRateLimit } from './rate-limit.js';
 import { createDemoContext } from './studio-demo.js';
@@ -1228,6 +1232,16 @@ export async function apiBuilder(req: IncomingMessage, res: ServerResponse, ctx:
   }
   if (args === null || typeof args !== 'object' || Array.isArray(args)) {
     sendJson(res, 400, { error: '`args` must be an object of findMany options' });
+    return;
+  }
+
+  // A locking read takes row locks, and every read here runs inside
+  // `BEGIN READ ONLY`, which PostgreSQL answers with a raw 25006. Refused by name
+  // instead, before anything else is judged: the verdict must not depend on the
+  // PII state (the walk below is skipped under --show-pii) or on the database.
+  const locked = findRowLockOption(args as Record<string, unknown>);
+  if (locked !== null) {
+    sendJson(res, 400, { error: rowLockRefusalMessage(shown(locked), "Studio's Query tab") });
     return;
   }
 

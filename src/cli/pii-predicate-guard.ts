@@ -124,6 +124,90 @@ const LEVEL_OBJECT_KEYS: ReadonlySet<string> = new Set([
 const RELATION_PICK_KEYS: ReadonlySet<string> = new Set(['pick', 'by', 'direction', 'nulls', 'plan']);
 
 /**
+ * One level of the `lock` search: a query level (the args, or one `with` entry's
+ * options) plus the link back to the level that contained it, so the path to a
+ * hit is built once, on a hit, instead of being extended at every level.
+ */
+interface LockSearchFrame {
+  level: Record<string, unknown>;
+  parent: LockSearchFrame | null;
+  /** The relation name this level sits under (empty at the root). */
+  relation: string;
+}
+
+/**
+ * Find a `lock` option anywhere a query level can carry one: the args
+ * themselves, or the options of any `with` entry at any depth. Returns the
+ * dotted path to the shallowest hit (`lock`, `with.posts.lock`), or `null`.
+ *
+ * WHY THIS IS NOT PART OF {@link assertNoPiiPredicates}. A locking read is not
+ * a hidden-column question, and the PII walk is conditional by design: Studio
+ * skips it under `--show-pii`, `explain_query` hands it an allowlisted subset
+ * of its arguments, and `compile_query` hands it only `where` for an aggregate.
+ * A read-only refusal has to hold in every one of those, so each surface calls
+ * this directly and unconditionally. It lives in this module because both
+ * surfaces already import it, which is what keeps the rule and its wording in
+ * one place.
+ *
+ * ANY VALUE other than `undefined` counts, `null` and `false` included. The
+ * builder treats exactly `undefined` as "no lock" and refuses every other
+ * non-lock value itself (E003), so answering "present" for all of them means
+ * the verdict here never depends on what the builder would have made of it.
+ *
+ * A `with` MAP is keyed by relation names, so a relation that happens to be
+ * called `lock` is a level to descend into and never a hit; only the option
+ * position on a level is read. A table column called `lock` is likewise safe:
+ * columns live under `where` / `orderBy` / `select`, which are not searched.
+ *
+ * Iterative and breadth-first, so a deeply nested payload costs time and no
+ * stack, and the shallowest hit is the one reported. The visited set makes it
+ * terminate on a cyclic object, which parsed JSON cannot produce but a caller
+ * of a pure helper can.
+ */
+export function findRowLockOption(args: Record<string, unknown>): string | null {
+  const queue: LockSearchFrame[] = [{ level: args, parent: null, relation: '' }];
+  const seen = new Set<object>();
+  for (let next = 0; next < queue.length; next++) {
+    const frame = queue[next] as LockSearchFrame;
+    if (seen.has(frame.level)) continue;
+    seen.add(frame.level);
+    if (frame.level.lock !== undefined) return lockPath(frame);
+    const withClause = frame.level.with;
+    if (!isPlainObject(withClause)) continue;
+    for (const [relation, spec] of Object.entries(withClause)) {
+      if (isPlainObject(spec)) queue.push({ level: spec, parent: frame, relation });
+    }
+  }
+  return null;
+}
+
+/** `lock`, `with.posts.lock`, `with.posts.with.author.lock`: the path from the root to a hit. */
+function lockPath(frame: LockSearchFrame): string {
+  const relations: string[] = [];
+  for (let at: LockSearchFrame | null = frame; at !== null && at.parent !== null; at = at.parent) {
+    relations.push(at.relation);
+  }
+  const parts: string[] = [];
+  for (let i = relations.length - 1; i >= 0; i--) parts.push('with', relations[i] as string);
+  parts.push('lock');
+  return parts.join('.');
+}
+
+/**
+ * The refusal text for a `lock` found by {@link findRowLockOption}, shared so
+ * the two surfaces cannot word the same rule two ways. `path` is interpolated
+ * as given: it can carry a caller-chosen relation name, so each surface passes
+ * it through its own printable-name escaping first.
+ */
+export function rowLockRefusalMessage(path: string, tool: string): string {
+  return (
+    `${tool} does not accept \`${path}\`: it is read-only, and a locking read takes row locks, which needs a ` +
+    'write-capable transaction in your application. Remove it from the query here (nothing else about the query ' +
+    'changes), and run the locking read inside db.$transaction(async (tx) => ...) in your code.'
+  );
+}
+
+/**
  * The two things Studio and the MCP server genuinely do differently, plus the
  * schema the walk resolves relation targets against.
  *

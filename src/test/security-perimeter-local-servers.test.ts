@@ -614,6 +614,127 @@ describe('Studio Query tab: a PII column in select is served redacted, never raw
 });
 
 // ---------------------------------------------------------------------------
+// Studio: a locking read is refused by name
+// ---------------------------------------------------------------------------
+
+describe('Studio Query tab refuses a locking read by name', () => {
+  /** A schema with a COLUMN literally called `lock`, which is not the option. */
+  function jobsSchema(): SchemaMetadata {
+    const jobs: TableMetadata = mockTable('jobs', [
+      { name: 'id', field: 'id' },
+      { name: 'lock', field: 'lock', pgType: 'text' },
+    ]);
+    return { enums: {}, tables: { jobs } };
+  }
+
+  const run = async (args: Record<string, unknown>, ctxExtra: Partial<StudioContext> = {}, table = 'widgets') => {
+    const { pool, calls } = recordingPool();
+    const schema = table === 'jobs' ? jobsSchema() : widgetSchema();
+    const r = await studio(
+      { ...pgCtx(pool, schema), ...ctxExtra },
+      'POST',
+      '/api/builder',
+      { ...authed, 'content-type': 'application/json' },
+      json({ table, args }),
+    );
+    return { r, calls, error: String((r.json as { error?: string } | null)?.error ?? '') };
+  };
+
+  // Every value shape: a mode string, the object form, and the two values the
+  // builder would reject on its own. The verdict must not depend on which.
+  const values: Array<[string, unknown]> = [
+    ['a mode string', 'update'],
+    ['a mode and a wait policy', { mode: 'update', skipLocked: true }],
+    ['null', null],
+    ['false', false],
+  ];
+  for (const [name, lock] of values) {
+    it(`answers 400 naming \`lock\` for ${name}, before any statement reaches the database`, async () => {
+      const { r, calls, error } = await run({ lock, limit: 1 });
+      assert.equal(r.status, 400, r.body);
+      assert.match(error, /Studio's Query tab does not accept `lock`/);
+      assert.match(error, /read-only/);
+      assert.match(error, /db\.\$transaction/, 'the message says where the locking read belongs');
+      assert.doesNotMatch(error, /25006|PII/, 'neither the raw PostgreSQL error nor the PII guard text');
+      assert.deepEqual(calls, [], 'no BEGIN READ ONLY, no SELECT: refused before the connection is used');
+    });
+  }
+
+  it('refuses it under --show-pii too, where the PII walk is skipped entirely', async () => {
+    const { r, calls, error } = await run({ lock: 'share', limit: 1 }, { showPii: true });
+    assert.equal(r.status, 400, r.body);
+    assert.match(error, /does not accept `lock`/);
+    assert.deepEqual(calls, []);
+  });
+
+  it('refuses it when the PII tag scan failed, so the verdict is not masked by that message', async () => {
+    const piiScanFailed = { path: 'metadata.ts', reason: 'no tables map', columns: 2 };
+    const { r, error } = await run({ lock: 'update' }, { piiScanFailed });
+    assert.equal(r.status, 400, r.body);
+    assert.match(error, /does not accept `lock`/);
+    assert.doesNotMatch(error, /PII tags could not be read/);
+  });
+
+  it('refuses `lock` on a `with` entry at any depth, naming the path', async () => {
+    for (const [args, path] of [
+      [{ with: { posts: { lock: 'update' } } }, 'with.posts.lock'],
+      [{ with: { posts: { lock: { mode: 'share' } } } }, 'with.posts.lock'],
+      [{ with: { posts: { with: { author: { lock: 'update' } } } } }, 'with.posts.with.author.lock'],
+    ] as const) {
+      const r = await studio(
+        demoCtx(),
+        'POST',
+        '/api/builder',
+        { ...authed },
+        json({ table: 'users', args: { ...args, limit: 1 } }),
+      );
+      assert.equal(r.status, 400, r.body);
+      const error = String((r.json as { error: string }).error);
+      assert.ok(error.includes(`does not accept \`${path}\``), `${path}: ${error}`);
+    }
+  });
+
+  it('escapes a caller-chosen relation name in the path it echoes', async () => {
+    const r = await studio(
+      demoCtx(),
+      'POST',
+      '/api/builder',
+      { ...authed },
+      json({ table: 'users', args: { with: { 'po\u001b[2Jsts\u202e': { lock: 'update' } } } }),
+    );
+    assert.equal(r.status, 400);
+    const error = String((r.json as { error: string }).error);
+    assert.equal(error.includes('\u001b'), false, 'no raw ESC');
+    assert.equal(error.includes('\u202e'), false, 'no raw bidi override');
+    assert.match(error, /po\\u001b\[2Jsts\\u202e/);
+  });
+
+  it('leaves a query without the option alone, which proves the refusal above is the option', async () => {
+    const { r, calls } = await run({ limit: 1 });
+    assert.equal(r.status, 200, r.body);
+    assert.ok(
+      calls.some((c) => /FROM "widgets"/.test(c.text)),
+      'the SELECT ran',
+    );
+  });
+
+  it('does not mistake a COLUMN called lock for the option', async () => {
+    for (const args of [
+      { where: { lock: 'held' } },
+      { select: { id: true, lock: true } },
+      { orderBy: { lock: 'asc' } },
+    ]) {
+      const { r, calls } = await run(args, {}, 'jobs');
+      assert.equal(r.status, 200, `${JSON.stringify(args)}: ${r.body}`);
+      assert.ok(
+        calls.some((c) => /FROM "jobs"/.test(c.text)),
+        JSON.stringify(args),
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Studio: messages escape names
 // ---------------------------------------------------------------------------
 

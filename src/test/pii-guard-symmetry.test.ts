@@ -52,9 +52,11 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { describe, it } from 'node:test';
 import type pg from 'pg';
-import { assertNoPiiPredicates } from '../cli/pii-predicate-guard.js';
+import { COLUMN_NAMING_ARG_KEYS } from '../cli/compile-query.js';
+import { assertNoPiiPredicates, findRowLockOption, rowLockRefusalMessage } from '../cli/pii-predicate-guard.js';
 import { handleRequest, PII_REDACTED, type StudioContext, type StudioOptions } from '../cli/studio.js';
 import type { DeferredQuery } from '../query/deferred.js';
+import { ALL_OPTION_TABLES } from '../query/option-surface.js';
 import { resolveRelation } from '../query/utils.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
@@ -667,5 +669,153 @@ describe('Studio /api/builder: nested PII is redacted under BOTH relation spelli
       });
       assert.equal(r.status, 200, `"${relName}" was refused for a visible column: ${r.body}`);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The read-only refusal of a locking read: the shared search and its wording
+// ---------------------------------------------------------------------------
+
+describe('findRowLockOption: where a `lock` option can sit', () => {
+  it('finds nothing in a query without the option', () => {
+    for (const args of [
+      {},
+      { where: { id: 1 }, limit: 3, with: { posts: true } },
+      { lock: undefined },
+      { with: { posts: { lock: undefined, limit: 1 } } },
+    ]) {
+      assert.equal(findRowLockOption(args), null, JSON.stringify(args));
+    }
+  });
+
+  it('treats ANY present value as the option, because only `undefined` means "no lock" to the builder', () => {
+    for (const lock of ['update', 'share', { mode: 'update', skipLocked: true }, null, false, 0, '', []]) {
+      assert.equal(findRowLockOption({ lock }), 'lock', JSON.stringify(lock));
+    }
+  });
+
+  it('reports the dotted path of a hit on a `with` entry at any depth', () => {
+    assert.equal(findRowLockOption({ with: { posts: { lock: 'update' } } }), 'with.posts.lock');
+    assert.equal(
+      findRowLockOption({ with: { posts: { with: { author: { lock: { mode: 'share' } } } } } }),
+      'with.posts.with.author.lock',
+    );
+  });
+
+  it('reports the SHALLOWEST hit, in key order, when several are present', () => {
+    assert.equal(
+      findRowLockOption({ with: { a: { with: { b: { lock: 'update' } } }, c: { lock: 'update' } } }),
+      'with.c.lock',
+    );
+    assert.equal(findRowLockOption({ lock: 'share', with: { a: { lock: 'update' } } }), 'lock');
+  });
+
+  it('does not mistake a column, or a relation, that is NAMED lock for the option', () => {
+    // Columns live under where / orderBy / select / cursor, none of which is searched.
+    assert.equal(
+      findRowLockOption({ where: { lock: 'held' }, select: { lock: true }, orderBy: { lock: 'asc' } }),
+      null,
+    );
+    // A `with` map is keyed by RELATION names: `lock` there is a level to descend into.
+    assert.equal(findRowLockOption({ with: { lock: true } }), null);
+    assert.equal(findRowLockOption({ with: { lock: { limit: 1 } } }), null);
+    assert.equal(findRowLockOption({ with: { lock: { lock: 'update' } } }), 'with.lock.lock');
+  });
+
+  it('ignores a `with` that is not a map of option objects, leaving that to the builder', () => {
+    for (const withClause of [true, null, 'posts', ['posts'], { posts: true }, { posts: null }, { posts: 'x' }]) {
+      assert.equal(findRowLockOption({ with: withClause }), null, JSON.stringify(withClause));
+    }
+  });
+
+  it('terminates on a cyclic or shared structure', () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.with = { self: cyclic };
+    assert.equal(findRowLockOption(cyclic), null);
+
+    const shared = { limit: 1 };
+    assert.equal(findRowLockOption({ with: { a: shared, b: shared } }), null);
+  });
+
+  it('walks a very deep chain without recursing, and still builds the path', () => {
+    const depth = 50_000;
+    let level: Record<string, unknown> = { lock: 'update' };
+    for (let i = 0; i < depth; i++) level = { with: { r: level } };
+    const path = findRowLockOption(level);
+    assert.equal(path, `${'with.r.'.repeat(depth)}lock`);
+  });
+});
+
+describe('rowLockRefusalMessage', () => {
+  it('names the tool and the path, says why, and says where the locking read belongs', () => {
+    const message = rowLockRefusalMessage('with.posts.lock', 'compile_query');
+    assert.match(message, /^compile_query does not accept `with\.posts\.lock`: it is read-only/);
+    assert.match(message, /row locks/);
+    assert.match(message, /write-capable transaction/);
+    assert.match(message, /db\.\$transaction/);
+    assert.equal(message.includes(String.fromCharCode(0x2014)), false, 'no em-dash in prose');
+  });
+});
+
+describe('every read option is classified for the local read-only tools', () => {
+  // THE MECHANISM, not a correction. Studio's Query tab and the MCP tools pass
+  // caller-supplied args to the builder, and each option on a read arg interface
+  // is one of three things to them. A new option fails this test until a human
+  // says which, instead of being passed through by default.
+  const NAMES_COLUMNS = new Set(COLUMN_NAMING_ARG_KEYS);
+  const REFUSED = new Set(['lock']);
+  const BENIGN = new Set([
+    // Return values or shape the result; the values are redacted or never returned.
+    'select',
+    'omit',
+    'with',
+    // Paging and ordering of relation levels.
+    'limit',
+    'offset',
+    'take',
+    'skip',
+    // Execution tuning that these tools never run, or that is inert on a build-only compile.
+    'timeout',
+    'relationLoadStrategy',
+    'stableRelationOrder',
+    'warnOnUnlimited',
+    'forceCustomPlan',
+    'jsonEncoding',
+    // Privilege options: refused by core unless the value is the UNSAFE symbol, which JSON cannot carry.
+    'skipGlobalFilters',
+    'includePii',
+  ]);
+  const READ_OPERATIONS = ['findUnique', 'findMany', 'count', 'aggregate', 'groupBy'];
+
+  it('has an owner for every key of every read arg table', () => {
+    const unclassified: string[] = [];
+    for (const operation of READ_OPERATIONS) {
+      const table = ALL_OPTION_TABLES[operation];
+      assert.ok(table, `no option table for ${operation}`);
+      assert.ok(Object.keys(table).length > 0, `${operation}: an empty table would make this test vacuous`);
+      for (const key of Object.keys(table)) {
+        if (!NAMES_COLUMNS.has(key) && !REFUSED.has(key) && !BENIGN.has(key)) unclassified.push(`${operation}.${key}`);
+      }
+    }
+    assert.deepEqual(
+      unclassified,
+      [],
+      'classify each new read option in this test: does it name a column (add it to COLUMN_NAMING_ARG_KEYS in ' +
+        'cli/compile-query.ts), take a row lock (refuse it by name), or neither',
+    );
+  });
+
+  it('refuses every option classified as refused, wherever the shared search looks', () => {
+    for (const key of REFUSED) {
+      assert.equal(findRowLockOption({ [key]: 'update' }), key);
+      assert.equal(findRowLockOption({ with: { rel: { [key]: 'update' } } }), `with.rel.${key}`);
+    }
+  });
+
+  it('keeps the three classes disjoint, so one option cannot be both refused and waved through', () => {
+    for (const key of REFUSED) {
+      assert.equal(NAMES_COLUMNS.has(key) || BENIGN.has(key), false, key);
+    }
+    for (const key of BENIGN) assert.equal(NAMES_COLUMNS.has(key), false, key);
   });
 });

@@ -38,7 +38,11 @@ import {
 } from './compile-query.js';
 import { CATALOGUED_ERROR_CODES, explainErrorCode } from './error-catalog.js';
 import { listMigrationFiles } from './migrate.js';
-import { assertNoPiiPredicates as assertNoPiiPredicatesShared } from './pii-predicate-guard.js';
+import {
+  assertNoPiiPredicates as assertNoPiiPredicatesShared,
+  findRowLockOption,
+  rowLockRefusalMessage,
+} from './pii-predicate-guard.js';
 import { applyPiiTags, loadPiiTags } from './pii-tags.js';
 import { redactUrl } from './ui.js';
 
@@ -335,7 +339,7 @@ const TOOLS: ToolDefinition[] = [
   {
     name: 'explain_query',
     description:
-      'Run EXPLAIN (FORMAT JSON) for a schema-validated findMany query. Pass table + optional where/orderBy/limit/select, free-form SQL is rejected. A where or orderBy on a PII-tagged or secret-named column is refused: the planner row estimate would leak the value. Naming a PII-tagged column in select is refused, as it is in the library without includePii: UNSAFE, which this server cannot pass.',
+      'Run EXPLAIN (FORMAT JSON) for a schema-validated findMany query. Pass table + optional where/orderBy/limit/select, free-form SQL is rejected. A where or orderBy on a PII-tagged or secret-named column is refused: the planner row estimate would leak the value. Naming a PII-tagged column in select is refused, as it is in the library without includePii: UNSAFE, which this server cannot pass. A `lock` option is refused: this server is read-only and a locking read needs a write-capable transaction in your application.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -361,7 +365,7 @@ const TOOLS: ToolDefinition[] = [
   {
     name: 'compile_query',
     description:
-      'Compile a Turbine read query to the EXACT SQL it would send, WITHOUT running it: no statement is executed and no row is read, so this is safe to call on production and safe to call in a loop. Use it before you write the query into code. Pass `table`, an `operation` (findMany / findUnique / findFirst / count / aggregate / groupBy, default findMany) and `args`, the same object you would pass to that method. Returns the SQL, the bound parameters, how many STATEMENTS the query costs at execution (a `with` clause can be one join or one follow-up per relation), which relation-load strategy it takes, whether it is bounded by a LIMIT or reads the whole table, the relation depth, and warnings such as a relation whose correlation column has no index. A query that FAILS to compile is a successful answer, not an error: an unknown column (TURBINE_E003), an unknown relation (TURBINE_E005) or the empty-where guard comes back as `ok: false` with the code, the message and how to fix it. READ OPERATIONS ONLY, deliberately: this server has no write surface and compiling one would be the first. A where or orderBy on a PII-tagged or secret-named column is refused, exactly as in explain_query.',
+      'Compile a Turbine read query to the EXACT SQL it would send, WITHOUT running it: no statement is executed and no row is read, so this is safe to call on production and safe to call in a loop. Use it before you write the query into code. Pass `table`, an `operation` (findMany / findUnique / findFirst / count / aggregate / groupBy, default findMany) and `args`, the same object you would pass to that method. Returns the SQL, the bound parameters, how many STATEMENTS the query costs at execution (a `with` clause can be one join or one follow-up per relation), which relation-load strategy it takes, whether it is bounded by a LIMIT or reads the whole table, the relation depth, and warnings such as a relation whose correlation column has no index. A query that FAILS to compile is a successful answer, not an error: an unknown column (TURBINE_E003), an unknown relation (TURBINE_E005) or the empty-where guard comes back as `ok: false` with the code, the message and how to fix it. READ OPERATIONS ONLY, deliberately: this server has no write surface and compiling one would be the first. A where or orderBy on a PII-tagged or secret-named column is refused, exactly as in explain_query, and so is a `lock` option (on the query or on any `with` entry): compile the query without it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -996,6 +1000,9 @@ async function explainQuery(ctx: McpContext, args: JsonObject): Promise<unknown>
   }
 
   const tableName = requiredString(args, 'table');
+  // Before the allowlist below, which would otherwise drop `lock` unseen and
+  // plan an UNLOCKED query for a caller who asked for a locking one.
+  assertNoLockingRead(args, 'explain_query');
   const findManyArgs = parseExplainFindManyArgs(args);
 
   return withReadOnly(ctx, async (client) => {
@@ -1181,6 +1188,10 @@ async function compileQuery(ctx: McpContext, args: JsonObject): Promise<unknown>
   const tableName = requiredString(args, 'table');
   const operation = parseCompileOperation(args.operation);
   const queryArgs = parseCompileArgs(args.args);
+  // Whatever the operation: count / aggregate / groupBy take no `lock`, and
+  // compiling them would drop it unseen, so the SQL shown would not be the
+  // query the caller wrote. Refused before the catalog read.
+  assertNoLockingRead(queryArgs, 'compile_query');
 
   const { metadata, piiTags } = await withReadOnly(ctx, (client) => loadSchemaMetadata(client, ctx.options));
   const table = requireTable(metadata, tableName);
@@ -1320,6 +1331,21 @@ function assertCompileHidesNothing(
         `a visible column instead.`,
     );
   }
+}
+
+/**
+ * Refuse a `lock` option, at the top level or on any `with` entry, by name.
+ *
+ * Both tools that take query args are read-only, and a locking read takes row
+ * locks, which needs a write-capable transaction in the application. The search
+ * and the wording are the shared ones in `cli/pii-predicate-guard.ts`, the same
+ * pair Studio's Query tab uses, so the rule is stated once. It runs on the RAW
+ * args, ahead of every parser and guard that might drop or reshape the key.
+ */
+function assertNoLockingRead(args: Record<string, unknown>, tool: string): void {
+  const locked = findRowLockOption(args);
+  if (locked === null) return;
+  throw jsonRpcError(-32602, rowLockRefusalMessage(shown(locked), tool));
 }
 
 /**

@@ -338,6 +338,51 @@ describe('mcp explain_query: planner estimates are not an extraction oracle', ()
   });
 });
 
+describe('mcp explain_query: a locking read is refused by name', () => {
+  // explain_query copies an ALLOWLIST of its arguments into the query it plans,
+  // so without a check ahead of that copy `lock` is dropped unseen and the plan
+  // returned is for an unlocked query the caller never asked about.
+  it('refuses a mode string and the object form before anything reaches the database', async () => {
+    const h = createHarness();
+    for (const lock of ['update', { mode: 'share', noWait: true }, null, false]) {
+      const reply = await h.call('explain_query', { table: 'users', where: { name: 'Ada' }, limit: 5, lock });
+      assert.equal(reply.result, undefined, `lock ${JSON.stringify(lock)} must not be planned`);
+      assert.equal(reply.error?.code, -32602);
+      assert.match(reply.error?.message ?? '', /explain_query does not accept `lock`: it is read-only/);
+      assert.match(reply.error?.message ?? '', /db\.\$transaction/);
+    }
+    assert.deepEqual(h.recorded, [], 'no catalog read and no EXPLAIN: refused before the database is used');
+    await h.dispose();
+  });
+
+  it('refuses `lock` on a `with` entry too, even though this tool takes no `with`', async () => {
+    const h = createHarness();
+    const reply = await h.call('explain_query', {
+      table: 'users',
+      with: { posts: { with: { author: { lock: 'update' } } } },
+    });
+    assert.equal(reply.error?.code, -32602);
+    assert.ok(
+      (reply.error?.message ?? '').includes('does not accept `with.posts.with.author.lock`'),
+      reply.error?.message,
+    );
+    assert.deepEqual(h.recorded, []);
+    await h.dispose();
+  });
+
+  it('plans the same query once the option is removed, so the refusal is the option', async () => {
+    const h = createHarness();
+    const result = payload(await h.call('explain_query', { table: 'users', where: { name: 'Ada' }, limit: 5 }));
+    assert.equal(result.table, 'users');
+    assert.ok(result.plan, 'the control query is planned');
+    assert.ok(
+      h.recorded.some((r) => r.sql.startsWith('EXPLAIN')),
+      'and the EXPLAIN did run',
+    );
+    await h.dispose();
+  });
+});
+
 describe('mcp PII tag loading: fails closed and says so', () => {
   it('reads tags out of a REFORMATTED metadata file', async () => {
     // The regression: emitted column lines are longer than this repo's own

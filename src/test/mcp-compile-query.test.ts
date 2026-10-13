@@ -863,6 +863,126 @@ describe('mcp compile_query: the PII guard', () => {
   });
 });
 
+describe('mcp compile_query: a locking read is refused by name', () => {
+  // One entry per operation, because count / aggregate / groupBy take no `lock`
+  // at all and compiling them would DROP it, showing SQL for a different query
+  // than the one the caller wrote.
+  const OPERATIONS: Array<[string, string, Record<string, unknown>]> = [
+    ['findMany', 'posts', { limit: 1 }],
+    ['findUnique', 'posts', { where: { id: 1 } }],
+    ['findFirst', 'posts', {}],
+    ['count', 'posts', {}],
+    ['aggregate', 'posts', { _count: true }],
+    ['groupBy', 'posts', { by: ['views'], _count: true }],
+  ];
+
+  for (const [operation, table, base] of OPERATIONS) {
+    it(`${operation}: a mode string and the object form are refused before any catalog read`, async () => {
+      const h = createHarness();
+      for (const lock of ['update', { mode: 'update', skipLocked: true }, null]) {
+        const reply = await compile(h, table, { ...base, lock }, operation);
+        assert.equal(reply.result, undefined, `${operation} ${JSON.stringify(lock)} must not compile`);
+        assert.equal(reply.error?.code, -32602);
+        assert.match(String(reply.error?.message), /compile_query does not accept `lock`: it is read-only/);
+        assert.match(String(reply.error?.message), /db\.\$transaction/);
+      }
+      assert.deepEqual(h.recorded, [], 'refused before the server touched the database at all');
+
+      // The same args without the option compile, so the refusal is the option.
+      const control = payload(await compile(h, table, base, operation));
+      assert.equal(control.ok, true);
+      await h.dispose();
+    });
+  }
+
+  it('refuses `lock` on a `with` entry at any depth, naming the path', async () => {
+    const h = createHarness();
+    for (const [args, path] of [
+      [{ with: { user: { lock: 'update' } } }, 'with.user.lock'],
+      [{ with: { user: { lock: { mode: 'share' } } } }, 'with.user.lock'],
+      [{ with: { user: { with: { org: { lock: 'update' } } } } }, 'with.user.with.org.lock'],
+    ] as const) {
+      const reply = await compile(h, 'posts', args as unknown as Record<string, unknown>);
+      assert.equal(reply.error?.code, -32602);
+      assert.ok(String(reply.error?.message).includes(`does not accept \`${path}\``), String(reply.error?.message));
+    }
+    assert.deepEqual(h.recorded, []);
+    await h.dispose();
+  });
+
+  it('escapes a caller-chosen relation name in the path it echoes', async () => {
+    const h = createHarness();
+    const reply = await compile(h, 'posts', { with: { 'po\u001b[2Jsts\u202e': { lock: 'update' } } });
+    assert.equal(reply.error?.code, -32602);
+    const message = String(reply.error?.message);
+    assert.equal(message.includes('\u001b'), false, 'no raw ESC');
+    assert.equal(message.includes('\u202e'), false, 'no raw bidi override');
+    assert.match(message, /po\\u001b\[2Jsts\\u202e/);
+    await h.dispose();
+  });
+
+  it('is judged before the PII guard, so an unreadable tag file does not change the verdict', async () =>
+    quietStderr(async () => {
+      await withMetadataDir(UNREADABLE_METADATA, async (metadataDir) => {
+        const h = createHarness({ metadataDir });
+        const reply = await compile(h, 'posts', { where: { views: 1 }, lock: 'update' });
+        assert.match(String(reply.error?.message), /does not accept `lock`/);
+        assert.doesNotMatch(String(reply.error?.message), /PII tags could not be read/);
+        await h.dispose();
+      });
+    }));
+
+  it('says so in the advertised description, so an agent learns it before it tries', async () => {
+    const h = createHarness();
+    const reply = (await h.rpc('tools/list')) as unknown as {
+      result: { tools: { name: string; description: string }[] };
+    };
+    for (const name of ['compile_query', 'explain_query']) {
+      const tool = reply.result.tools.find((entry) => entry.name === name);
+      assert.ok(tool, `${name} must be advertised`);
+      assert.match(tool.description, /`lock`/, `${name} should name the refused option`);
+    }
+    await h.dispose();
+  });
+});
+
+describe('mcp compile_query: _percentile is a column-naming arg', () => {
+  // `_percentile` returns a stored value (or one that equals it), exactly as
+  // `_min` / `_max` do. With the tag file unreadable no column can be shown to be
+  // untagged, so any compile that names one must be refused, `_percentile` too.
+  it('fails closed on an aggregate that names a column only through _percentile', async () =>
+    quietStderr(async () => {
+      await withMetadataDir(UNREADABLE_METADATA, async (metadataDir) => {
+        const h = createHarness({ metadataDir });
+        for (const [operation, args] of [
+          ['aggregate', { _percentile: { views: { p: 0.5 } } }],
+          ['groupBy', { by: [], _percentile: { views: { p: 0.5 } } }],
+        ] as const) {
+          const reply = await compile(h, 'posts', args as unknown as Record<string, unknown>, operation);
+          assert.equal(reply.result, undefined, `${operation} must be refused`);
+          assert.match(String(reply.error?.message), /PII tags could not be read/);
+        }
+        // A compile that names no column is still answerable.
+        const allowed = payload(await compile(h, 'posts', { limit: 1 }));
+        assert.equal(allowed.ok, true);
+        await h.dispose();
+      });
+    }));
+
+  it('refuses a percentile over a secret-named or PII-tagged column', async () =>
+    quietStderr(async () => {
+      await withMetadataDir(TAGGED_METADATA(), async (metadataDir) => {
+        const h = createHarness({ metadataDir });
+        for (const column of ['apiKey', 'email']) {
+          const reply = await compile(h, 'users', { _percentile: { [column]: { p: 0.5 } } }, 'aggregate');
+          assert.equal(reply.result, undefined, column);
+          assert.match(String(reply.error?.message), /cannot be used as a group key, an aggregate target/);
+        }
+        await h.dispose();
+      });
+    }));
+});
+
 describe('mcp compile_query: request surface', () => {
   it('is advertised by tools/list with a read-only, no-execution description', async () => {
     const h = createHarness();
