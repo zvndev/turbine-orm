@@ -13,6 +13,7 @@
 
 import type { Dialect, JsonPathEqualsInput } from '../dialect.js';
 import { getErrorMessageMode, UnsupportedFeatureError, ValidationError } from '../errors.js';
+import { assertSkipListNames, skipListNamesTable } from '../global-filters-config.js';
 import type { PgCompatQueryResult } from '../pg-types.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { camelToSnake, normalizeKeyColumns } from '../schema.js';
@@ -768,15 +769,24 @@ export function buildWhere<T extends object>(
  * and treating that as "no filter" read and wrote every tenant's rows. The
  * explicit values `null` and `{}` still mean "no filter for this call": neither
  * is what a missing value produces.
+ *
+ * A `skipGlobalFilters` list names tables by table name or client accessor,
+ * the two spellings `globalFilters` keys take. With `tables` (the schema's
+ * table map), an entry that names no table is refused (E003): it would skip
+ * nothing, so the caller who meant to lift a filter would silently keep it.
  */
 export function resolveGlobalFilterFrom(
   filters: GlobalFilters | undefined,
   table: string,
   skip: ResolvedSkipGlobalFilters | undefined,
+  tables?: Readonly<Record<string, unknown>>,
 ): Record<string, unknown> | null {
-  if (!filters) return null;
   if (skip === true) return null;
-  if (Array.isArray(skip) && skip.includes(table)) return null;
+  if (Array.isArray(skip)) {
+    if (tables !== undefined) assertSkipListNames(skip, tables);
+    if (skipListNamesTable(skip, table, tables)) return null;
+  }
+  if (!filters) return null;
   if (!Object.hasOwn(filters, table)) return null;
   const raw = filters[table];
   const resolved = typeof raw === 'function' ? raw() : raw;
@@ -837,7 +847,7 @@ export function resolveGlobalFilter(
   table: string,
   skip: ResolvedSkipGlobalFilters | undefined = qi.currentSkip,
 ): Record<string, unknown> | null {
-  return resolveGlobalFilterFrom(qi.globalFilters, table, skip);
+  return resolveGlobalFilterFrom(qi.globalFilters, table, skip, qi.schema.tables);
 }
 
 /**
@@ -1014,7 +1024,8 @@ export function buildWhereClause(
         break;
       }
       case 'and':
-        if (!internal) qi.markVariableArity();
+        // `AND: { ... }` is one branch whatever the caller sends (fixedArity).
+        if (!internal && !event.fixedArity) qi.markVariableArity();
         for (const andCond of event.conditions) {
           const sub = buildWhereClause(qi, andCond, params, depth + 1);
           if (sub) andClauses.push(sub);
@@ -1263,7 +1274,7 @@ export function buildScopedWhere(
       case 'and': {
         // Same variable-arity rule as the top level: a nested relation filter
         // or a relation `with` where can carry a caller-sized OR just as easily.
-        if (!internal) qi.markVariableArity();
+        if (!internal && !(event.kind === 'and' && event.fixedArity)) qi.markVariableArity();
         const parts = event.conditions
           .map((cond) => buildScopedWhere(qi, scope, cond, params, depth + 1))
           .filter((s): s is string => s !== null)
@@ -2054,9 +2065,8 @@ export function requireFullTextSearch(qi: BuilderCtx): void {
 }
 
 /**
- * Gate the pathless JSON containment filters (`contains`, and the `equals`
- * spelling that compiles to the same expression) on
- * {@link Dialect.supportsJsonContains}.
+ * Gate the pathless JSON filters, `contains` (containment) and `equals`
+ * (whole-document equality), on {@link Dialect.supportsJsonContains}.
  *
  * The engine this exists for is SQLite, whose emulation compares a decoded
  * `json_each.value` against a param bound as JSON TEXT and therefore matched
@@ -2074,14 +2084,18 @@ export function requireFullTextSearch(qi: BuilderCtx): void {
  */
 export function requireJsonContains(qi: BuilderCtx, clause: 'contains' | 'equals'): void {
   if (qi.dialect.supportsJsonContains) return;
+  const what =
+    clause === 'equals'
+      ? 'whole-document JSON comparison, which a pathless `equals` is'
+      : "JSON containment, PostgreSQL's `@>`";
   throw new UnsupportedFeatureError(
-    `JSON containment (\`${clause}\` without \`path\`)`,
+    clause === 'equals'
+      ? 'JSON document equality (`equals` without `path`)'
+      : 'JSON containment (`contains` without `path`)',
     qi.dialect.name,
-    `This engine has no equivalent of PostgreSQL's \`@>\`, and the emulation Turbine used for ` +
-      `\`${clause}\` matched no rows for any operand rather than failing, so it is refused instead. ` +
+    `This engine has no ${what}, so the filter is refused rather than emulated. ` +
       'Filter on the specific value instead: `{ path: [...], equals: ... }` compiles to a real JSON ' +
-      'extraction (`json_extract`) rather than an emulation. For structural containment, run the ' +
-      'query on PostgreSQL or MySQL.',
+      'extraction (`json_extract`). To compare or match whole documents, run the query on PostgreSQL or MySQL.',
   );
 }
 

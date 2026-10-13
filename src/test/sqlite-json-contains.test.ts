@@ -93,7 +93,7 @@ describe('sqlite: pathless JSON containment is refused', () => {
     // are far enough apart that naming the wrong one would send the reader to
     // the wrong line.
     const err = caught(() => engine(sqliteDialect).buildFindMany({ where: { meta: { equals: { a: 1 } } } } as never));
-    assert.match(err.message, /JSON containment \(`equals` without `path`\)/);
+    assert.match(err.message, /JSON document equality \(`equals` without `path`\)/);
   });
 
   it('the refusal survives a warm SQL cache', () => {
