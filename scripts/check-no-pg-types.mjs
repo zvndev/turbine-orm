@@ -19,9 +19,9 @@
  * The tripwire used to be an inline `grep` in a single CI job, which meant the
  * gate proving the change safe was not on the publish path at all: a tag push
  * or a local `npm publish` reached npm without ever asking the question. The
- * logic lives here now and is called by `npm run check:package-types`, which
- * `prepublishOnly`, ci.yml's `consumer-types` job and release.yml's
- * `consumer-types` job all run. A gate with one caller is a gate with one way
+ * logic lives here now: `prepublishOnly` runs it over the working tree through
+ * `npm run check:package-types`, and the `consumer-types` job in gates.yml
+ * (called by both ci.yml and release.yml) runs it over the tested tarball. A gate with one caller is a gate with one way
  * to be bypassed.
  *
  * This is the CHEAP half of the check. It names the offending file and line and
@@ -68,7 +68,10 @@ import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const distDir = resolve(repoRoot, 'dist');
+// Optional argument: the dist/ directory to scan. CI passes the dist/ of the
+// extracted tested tarball, so the gate reads the bytes that get published;
+// with no argument it reads the working tree's dist/ (prepublishOnly).
+const distDir = process.argv[2] ? resolve(process.argv[2]) : resolve(repoRoot, 'dist');
 
 /**
  * Every `.d.ts` under dist/, which is a superset of the published set: both
@@ -236,7 +239,7 @@ try {
 }
 if (!distExists) {
   console.error(
-    `::error file=package.json::check-no-pg-types: ${relative(repoRoot, distDir)} does not exist. This gate reads the BUILT declarations, so run \`npm run build\` first; passing without them would be vacuous.`,
+    `::error file=package.json::check-no-pg-types: ${distDir} does not exist. This gate reads the BUILT declarations, so run \`npm run build\` first; passing without them would be vacuous.`,
   );
   process.exit(1);
 }
@@ -246,13 +249,13 @@ let scanned = 0;
 for (const file of declarationFilesUnder(distDir)) {
   scanned += 1;
   for (const hit of findPgReferences(readFileSync(file, 'utf-8'))) {
-    violations.push({ file: relative(repoRoot, file), ...hit });
+    violations.push({ file: relative(process.cwd(), file), ...hit });
   }
 }
 
 if (scanned === 0) {
   console.error(
-    'check-no-pg-types: scanned zero declaration files under dist/; the build layout has moved, so this check would pass vacuously. Refusing to pass.',
+    `check-no-pg-types: scanned zero declaration files under ${distDir}; the build layout has moved, so this check would pass vacuously. Refusing to pass.`,
   );
   process.exit(1);
 }
@@ -271,4 +274,4 @@ if (violations.length > 0) {
   process.exit(1);
 }
 
-console.log(`check-no-pg-types: ${scanned} declaration files scanned under dist/, no pg-family type references`);
+console.log(`check-no-pg-types: ${scanned} declaration files scanned under ${distDir}, no pg-family type references`);

@@ -24,8 +24,8 @@
  *   node scripts/check-pg-floor.mjs [path/to/turbine-orm-x.y.z.tgz]
  *
  * With no argument it runs `npm pack` itself (dist/ must already be built).
- * Called from the pack-smoke job of both ci.yml and release.yml, so a tag push
- * asks the same question a pull request does.
+ * Called from the pack-smoke job in gates.yml, which ci.yml and release.yml
+ * both call, so a tag push asks the same question a pull request does.
  */
 
 import { execFileSync } from 'node:child_process';
