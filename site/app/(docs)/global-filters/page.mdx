@@ -45,6 +45,8 @@ The map is checked when the client is constructed, because a filter that silentl
 
 A static `null` is accepted and means "no filter for this table".
 
+With a generated client (0.90 and later), the same checks happen at compile time too: the generated `turbine()` and constructor take `TypedTurbineConfig`, whose `globalFilters` is typed per table, so a misspelt table or column in a static filter or a function's return value is a type error. Regenerate the client to get it.
+
 ```ts
 const posts = await db.posts.findMany();
 // SELECT ... FROM "posts" WHERE "deleted_at" IS NULL

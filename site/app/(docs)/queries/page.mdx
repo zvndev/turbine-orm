@@ -213,9 +213,16 @@ A multi-column order is a **keyset seek**, not a conjunction: for `orderBy: [{ v
 
 Before 0.90 a cursor with no `orderBy` ran unordered, and a cursor named by a key under another order sought on the key while sorting by the order, which returned the wrong rows. See [Upgrading to 0.90](/upgrading-to-0-90#a-cursor-page-is-always-ordered).
 
-{/* TODO(v090): the builder lane is adding the same tiebreaker to the first page (a limited findMany whose orderBy is not unique), so page 1 and the cursor pages share one total order; and validating cursor values as operands and refusing a cursor emptied by undefined. Until then: end the orderBy with a unique key, or pass the same orderBy plus the id on page 1. */}
+**Cursor values.** Each cursor value follows the one-row rule of `findUnique`: a plain value, or `{ equals: value }`. An operator object, an array, or a column reference throws `TURBINE_E003`. A cursor whose every field is `undefined` throws too, because it would quietly restart at the first row; leave `cursor` out for the first page (`cursor: {}` also means no cursor).
 
-End the `orderBy` with a unique column (or a unique combination) on the first page too, so the page before the first cursor breaks ties the same way.
+**The first page uses the same order.** A paginated `findMany` (`limit` / `take` / `offset` / `skip`) whose `orderBy` can tie gets the same tiebreaker appended, so the first page and the cursor pages after it are cut from one total order:
+
+```ts
+await db.users.findMany({ orderBy: { name: 'desc' }, take: 20 });
+// ORDER BY "name" DESC, "id" DESC LIMIT $1
+```
+
+An `orderBy` that already contains a unique NOT NULL key is left as written. `findFirst`, a query with no `limit` or `offset`, and a `distinct` query are unchanged, and a paginated query with no `orderBy` at all still gets only the warning above. Before 0.90 a tie at a page boundary could be broken differently on each page, so an offset walk could skip or repeat a row.
 
 ### distinct
 
@@ -493,7 +500,11 @@ Turbine therefore refuses the ragged call with a `ValidationError` (`TURBINE_E00
 
 A `json` / `jsonb` cell takes the same values as a single [JSON write](#writing-json-columns), and inserts exactly one row per element of `data` (before 0.90 an array cell could add rows on PostgreSQL).
 
-{/* TODO(v090): bind-parameter limit. At 3cf0414 a createMany needing more bind parameters than the engine allows throws E003 stating the limit and a chunk size; the builder lane is making createMany() chunk inside one transaction while buildCreateMany keeps the refusal. Document the final rule. */}
+**Large batches.** One statement takes a limited number of bind parameters: 65,535 on PostgreSQL and MySQL, 32,766 on SQLite. A `createMany` whose rows need more is split into chunks that fit, all inside one transaction, so the rows land together or not at all. PostgreSQL's `UNNEST` form binds one array per column and never gets near the limit; a table with an array column inserts row by row with `VALUES`, which can, and is chunked the same way. Before 0.90 an oversized call threw `TURBINE_E003`.
+
+- **SQL Server** does not chunk yet. Past 1,000 rows or 2,100 parameters it throws `TURBINE_E003`, so split the rows yourself.
+- **`buildCreateMany`** (one statement, for [`pipeline`](#pipeline) or `$transaction([...])`) still refuses an oversized batch with `TURBINE_E003`, naming the limit and a chunk size.
+- **Inside a `$transaction` callback** the chunks run on that transaction and commit or roll back with it. They have no savepoint of their own, so on MySQL and SQLite, where a failed statement leaves the transaction open, catching a failed chunk and committing keeps the chunks before it.
 
 ## update / updateMany
 
@@ -514,6 +525,13 @@ await db.users.updateMany({
 ```
 
 `update` returns the updated row and takes [`select` / `omit`](#returning-fewer-columns) to narrow it. `updateMany` returns `{ count }`.
+
+`limit`, `take`, `offset` and `skip` on `updateMany` or `deleteMany` throw `TURBINE_E003` on every engine. Before 0.90 they were ignored, so every matching row was written. To write a bounded batch, select the ids first:
+
+```ts
+const batch = await db.jobs.findMany({ where: { status: 'queued' }, select: { id: true }, orderBy: { id: 'asc' }, limit: 100 });
+await db.jobs.updateMany({ where: { id: { in: batch.map((j) => j.id) } }, data: { status: 'running' } });
+```
 
 ### Atomic update operators
 
@@ -554,7 +572,7 @@ await db.users.deleteMany({
 });
 ```
 
-`delete` returns the deleted row and takes [`select` / `omit`](#returning-fewer-columns) to narrow it. `deleteMany` returns `{ count }`.
+`delete` returns the deleted row and takes [`select` / `omit`](#returning-fewer-columns) to narrow it. `deleteMany` returns `{ count }`, and refuses `limit` / `take` / `offset` / `skip` as [`updateMany`](#update--updatemany) does.
 
 An empty `where` (`{}`, or one whose every value is `undefined`) throws `ValidationError`: Turbine blocks accidental mass deletes. To really mean it, import the sentinel and pass `allowFullTableScan: UNSAFE` alongside it:
 
@@ -1441,6 +1459,13 @@ The suggestion covers plain typos and a guess that leaves out a whole word (`log
   `db.<table>.cacheStats()` is the cheap way to notice: a `hitRate` near zero on
   a query you believe is repeated means its SHAPE is varying, which is the same
   condition.
+
+  Since 0.90 the total is also capped. A process names at most 200 distinct
+  statements; every shape after that is sent unnamed, parsed per execution and
+  never kept. The first shapes a process runs, in practice its hot ones, keep
+  their names for its lifetime. Measured on one connection with 2,000 distinct
+  `where` shapes run twice each: 2,001 named statements and +29.2 MB of backend
+  memory before the cap, 200 and +2.3 MB after.
 </Callout>
 
 ## Client escape hatches
@@ -1470,6 +1495,29 @@ db.users.cacheStats();
 // returns the same instance every time.
 ```
 
+## Per-query timeout
+
+Every operation takes `timeout`, in milliseconds. It must be a positive number up to 2,147,483,647; anything else (`0`, a negative number, a string) throws `TURBINE_E003`. Before 0.90 an out-of-range value was clamped by Node to 1 ms or ignored.
+
+```ts
+import { TimeoutError } from 'turbine-orm';
+
+try {
+  await db.orders.update({ where: { id }, data: { status: 'shipped' }, timeout: 2_000 });
+} catch (err) {
+  if (err instanceof TimeoutError && err.outcome === 'not-executed') {
+    // The statement made no change: safe to retry.
+  }
+}
+```
+
+A `TimeoutError` (`TURBINE_E002`) carries `outcome`, which says whether the statement could have taken effect:
+
+- **`'not-executed'`**: it made no change. On PostgreSQL through a node-postgres pool, outside a transaction, Turbine sends the server a cancel request when the deadline passes and waits up to two seconds for the statement to answer. A confirmed cancel, a deadline that passed while still waiting for a connection, and a write that ran in its own transaction (a chunked `createMany`, a MySQL single-row write) that was rolled back all report this. A retry applies once.
+- **`'unknown'`**: the statement may still complete, so a write may have been applied. This is the answer inside `$transaction`, on the other engines and on HTTP-style pools, and when the server did not confirm the cancel in time (Turbine then closes that connection instead of returning it to the pool). Check the database before retrying a write.
+
+If the statement finishes during that wait, its result is returned, late, rather than reported as a timeout: a write that committed must not invite a retry. A read changes nothing whatever `outcome` says. A transaction's own `timeout` is described under [Transactions](/transactions#timeouts).
+
 ## Middleware
 
 `db.$use(fn)` registers a middleware that wraps every query. It runs **after SQL generation**, so it can observe what's about to execute (`params.model`, `params.action`, `params.args`), measure timing, and transform the result returned by `next()`, but it cannot change the query itself.
@@ -1493,7 +1541,7 @@ db.$use(async (params, next) => {
 });
 ```
 
-> **Warning:** `params.args` is a read-only snapshot, mutating it does not change the executed SQL. The query is fully built and parameterized before middleware runs.
+> **Warning:** `params.args` is read-only. Assigning, deleting or redefining anything under it, replacing `params.args`, or calling `next()` with a rebuilt args object throws a `TypeError` naming the path. The query is compiled from the arguments the caller passed, so before 0.90 such a change was silently ignored. Reading `params.args`, and passing it on to another operation, still works.
 
 Because middleware cannot rewrite queries, cross-cutting filters like **soft deletes** belong in a [global filter](/global-filters), an explicit `where`, or a small scoped helper:
 

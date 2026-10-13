@@ -246,7 +246,7 @@ Not tried, and therefore unverified: pipeline batching, streaming / cursors, `$l
 | Default isolation | `serializable` | More retryable errors under contention |
 | `pg_class.reltuples` | **Always `NULL`**, before and after `ANALYZE`, on a table with exactly 1000 rows | Studio's schema sidebar shows `estimatedRows: 0` for every table. The Data tab is unaffected: it runs a real `COUNT(*)` and reported the correct total |
 | `crdb_internal` | Restricted: `42501 Access to crdb_internal and system is restricted`, even as `root` | The adapter's row-estimate override cannot work as written |
-| LISTEN / NOTIFY | **Unsupported.** `LISTEN` is a `42601` syntax error; `pg_notify()` is `42883` unknown function | `db.$listen` and `db.$notify` fail with a raw `DatabaseError`, not a typed `UnsupportedFeatureError`. See the capability callout |
+| LISTEN / NOTIFY | **Unsupported.** `LISTEN` is a `42601` syntax error; `pg_notify()` is `42883` unknown function | `db.$listen` fails with a raw `DatabaseError`, and since 0.90 `db.$notify` with a `ValidationError` (`TURBINE_E003`, `sqlstate` `42883`), not a typed `UnsupportedFeatureError`. See the capability callout |
 | `ivfflat` vector index | `42601 unrecognized access method: ivfflat` | Use `hnsw`, which works |
 | Pipeline batching, streaming, `flatten` strategy | **Untested** | Unverified in either direction |
 
@@ -303,6 +303,7 @@ Not tried, and therefore unverified: pipeline batching, streaming / cursors, `$l
   ```text
   db.$listen(…)  ->  DatabaseError 42601: at or near "listen": syntax error
   db.$notify(…)  ->  DatabaseError 42883: unknown function: pg_notify()
+                     (since 0.90: ValidationError TURBINE_E003, sqlstate 42883)
   ```
 
   `plan_cache_mode` is fine: v26.2.5 implements it as a real session variable,

@@ -11,14 +11,14 @@ export const metadata = {
 
 A smaller set changes results with no error at all. They come first on this page, ordered by how likely they are to affect you. Read that section even if your suite passes.
 
-{/* TODO(v090): add the in-flight lanes once they land: builder and timeouts (createMany chunking, timeout outcome, cursor page 1 tiebreaker, cursor value validation), client (statementTimeoutMs, maxLifetimeSeconds, raw() template check, sessionContext names, tx.sql, unawaited work), generated types group A (required create columns, unique-key selectors, belongsTo operation and nullability types, _count typing, TypedTurbineConfig). */}
+{/* TODO(v090): add the in-flight lanes once they land: client (statementTimeoutMs, maxLifetimeSeconds, raw() template check, sessionContext names, tx.sql, unawaited work, readOnly transactions, the pipeline tuple type), and Wave C (row locks, percentiles, update expressions, bulk upsert). */}
 
 ## Before you start
 
 - **No schema change is required.** Nothing in 0.90 needs a migration.
-- **Type-check first.** `tsc --noEmit` finds the [column reference](#column-references-are-built-with-col) change on its own.
+- **Regenerate, then type-check.** `turbine generate` emits stricter types in 0.90 (see [Generated types](#generated-types-are-stricter)), and `tsc --noEmit` then finds those call sites and the [column reference](#column-references-are-built-with-col) change on its own.
 - **Run your tests outside production mode.** Several checks below are development warnings, silent under `NODE_ENV=production`.
-- **Search for the error codes.** A refusal is `ValidationError` (`TURBINE_E003`), an engine gap is `UnsupportedFeatureError` (`TURBINE_E017`), and a connection problem is `ConnectionError` (`TURBINE_E004`). Every message names the fix.
+- **Search for the error codes.** A refusal is `ValidationError` (`TURBINE_E003`), an engine gap is `UnsupportedFeatureError` (`TURBINE_E017`), and a connection problem is `ConnectionError` (`TURBINE_E004`). Every message names the fix. Middleware that rewrites its arguments gets a plain `TypeError`, see [Middleware arguments are read-only](#middleware-arguments-are-read-only).
 
 ## Results that change without an error
 
@@ -138,6 +138,44 @@ await db.posts.findMany({ cursor: { id: 40 }, limit: 20 });
 A cursor that names a row by its key under another order (`orderBy: { createdAt: 'desc' }, cursor: { id }`) used to seek on `id` while sorting by `createdAt`, which returned the wrong rows. It now reads the cursor row's `createdAt` and seeks from there. `implicitPkOrdering` no longer orders a single-field cursor by its own field: every cursor page uses the order above, flag or not.
 
 **Find it:** nothing warns. Pages now come back in a stable order, which can differ from the order your code happened to see.
+
+### A paginated `findMany` gets the same tiebreaker
+
+The first page gets the cursor rule too. A `findMany` with `limit` / `take` / `offset` / `skip` whose `orderBy` can tie now ends its `ORDER BY` with the primary key, in the last term's direction, so page 1 and the cursor pages after it share one order and an offset walk visits every row once.
+
+```ts
+await db.users.findMany({ orderBy: { name: 'desc' }, take: 20 });
+// 0.81: ORDER BY "name" DESC LIMIT $1
+// 0.90: ORDER BY "name" DESC, "id" DESC LIMIT $1
+```
+
+An `orderBy` that already contains a unique NOT NULL key is unchanged, and so are `findFirst`, unpaginated queries and `distinct`.
+
+**Find it:** nothing warns. Rows that tie on the sort key can come back in a different order than before. An index on the sort column alone may no longer cover the `ORDER BY`; an index on `(sort column, id)` does.
+
+### Enum arrays read as arrays
+
+A column whose type is an array of a Postgres enum used to come back from a top-level read as the raw array text, `'{draft,live}'`, while the same column read through a relation was an array. It is now `['draft', 'live']` everywhere. Nested reads also decode BC timestamps, offsets with seconds, years past 9999, and float `NaN` / `Infinity` exactly as top-level reads do.
+
+**Find it:** search for code that parses `{...}` text from an enum-array column, and remove it.
+
+### A timed-out query is cancelled on the server
+
+A per-query `timeout` used to reject on the client while the statement kept running, so a timed-out write could still commit, and a retry applied it twice. On PostgreSQL through a node-postgres pool, outside a transaction, Turbine now sends the server a cancel request and waits for the statement to stop. `TimeoutError` gains `outcome`: `'not-executed'` when the statement made no change, `'unknown'` when it may still complete (inside `$transaction`, on the other engines, or when the server did not confirm in time). A statement that finishes while Turbine waits returns its result instead of a timeout. See [Per-query timeout](/queries#per-query-timeout).
+
+**Find it:** retry logic around `TimeoutError`. Retry a write on `outcome === 'not-executed'`; check the database first on `'unknown'`.
+
+### MySQL single-row writes run in a transaction
+
+MySQL has no `RETURNING`, so `update`, `delete` and `upsert` write and then read the row back. The two statements now run in one transaction with the row locked. Of several concurrent deletes of one row, exactly one returns it; an `update` that changes a column its `where` names returns the updated row; a timed-out write is rolled back. Each such call now takes a pooled connection for its transaction, so a fetch-style pool with no `connect()` cannot run it.
+
+**Find it:** MySQL code that counted on a `delete` returning the row to every caller.
+
+### `NotFoundError.where` is not enumerable in safe mode
+
+Under the default `errorMessages: 'safe'`, `err.where` is still readable but no longer enumerable, so `JSON.stringify(err)`, `{ ...err }` and loggers that walk own properties stop carrying the lookup values.
+
+**Find it:** code that spreads or serializes a `NotFoundError` and reads `where` from the copy. Read `err.where` directly.
 
 ### Streams and `with` honour every pagination key
 
@@ -324,7 +362,12 @@ await db.posts.findMany({ orderBy: { createdAt: 'desc' }, cursor: { createdAt: l
 await db.posts.findMany({ orderBy: { createdAt: 'desc' }, cursor: { id: last.id }, limit: 20 });
 ```
 
-{/* TODO(v090): builder lane is adding the tiebreaker to page 1 (a limited findMany with a non-unique orderBy), validating cursor values as operands, and refusing a cursor emptied by undefined. Document once committed. */}
+Each cursor value is a plain value or `{ equals: value }`. An operator object, an array or a column reference throws `TURBINE_E003`. A cursor whose every field is `undefined` throws too, because it would restart at the first row; leave `cursor` out (or pass `{}`) for the first page.
+
+```ts
+await db.posts.findMany({ cursor: { id: req.query.after }, take: 20 });
+// `after` missing: TURBINE_E003, rather than page 1 again
+```
 
 ### `optimisticLock` on `upsert` and `updateMany`
 
@@ -349,7 +392,56 @@ await db.$transaction(async (tx) => {
 });
 ```
 
-{/* TODO(v090): at 3cf0414 an upsert whose create or update carries nested relation data skips the refusal; the builder lane adds it. */}
+The `upsert` refusal also covers an `upsert` whose `create` or `update` carries nested relation data, which runs on another code path and used to skip the check.
+
+### Middleware arguments are read-only
+
+Middleware that assigns, deletes or redefines anything under `params.args`, replaces `params.args`, or calls `next()` with a rebuilt args object now throws a `TypeError` naming the path. The query is compiled from the caller's arguments, so such a change never reached the SQL (or reached some statements of a nested write and not others).
+
+```ts
+db.$use(async (params, next) => {
+  params.args.where = { ...params.args.where, deletedAt: null }; // 0.90: TypeError
+  return next(params);
+});
+```
+
+Put the condition in the query, or use [`globalFilters`](/global-filters) for a filter every query needs. Reading `params.args`, timing, and transforming the result of `next()` are unchanged.
+
+### `updateMany` and `deleteMany` refuse paging options
+
+`limit`, `take`, `offset` and `skip` on `updateMany` or `deleteMany` throw `TURBINE_E003` on every engine. They were ignored, so every matching row was written.
+
+```ts
+await db.jobs.deleteMany({ where: { status: 'done' }, take: 1000 }); // 0.81: deleted every done job
+// 0.90: select the ids, then write by id
+const ids = (await db.jobs.findMany({ where: { status: 'done' }, select: { id: true }, orderBy: { id: 'asc' }, take: 1000 })).map((j) => j.id);
+await db.jobs.deleteMany({ where: { id: { in: ids } } });
+```
+
+### `timeout` and `relationLoadStrategy` are validated
+
+A per-query `timeout` must be a positive number of milliseconds up to 2,147,483,647, and `relationLoadStrategy` one of `'join'`, `'batched'`, `'auto'` or `'flatten'`, on the client and per query. Anything else throws `TURBINE_E003`. An invalid `timeout` used to be clamped by Node to 1 ms or ignored.
+
+**Find it:** timeouts read from configuration or environment variables, which arrive as strings. Wrap them in `Number(...)`.
+
+### `defineSchema` refuses unknown keys
+
+A column, table, index, `references`, check, `manyToMany` or options key that `defineSchema` does not know throws `TURBINE_E003` naming the key and the nearest valid one. In an object literal it is also a compile error.
+
+```ts
+defineSchema({ users: { id: { type: 'serial', primaryKey: true }, role: { type: 'text', defaultValue: "'member'" } } });
+// TURBINE_E003: unknown key "defaultValue" in column "users.role". Did you mean "default"?
+```
+
+Such keys used to be ignored, which silently changed the DDL: a misspelt `default` or `unique` emitted a column without it, and `uniq` on an index emitted a non-unique index. Rename the key the error names, then run `turbine push --dry-run` or `turbine migrate create --auto` and review the difference, because the database may lack what the schema now says.
+
+### Error classes that changed
+
+- A write in a read-only transaction (PostgreSQL `25006`, MySQL error 1792) is `ReadOnlyError` (`TURBINE_E018`) with the new `reason: 'transaction'`. An exhaustive `switch` over `reason` needs the case.
+- A value the server could not read as its column's type at bind time, such as a `Buffer` bound to a column that is not `bytea`, is `ValidationError` (`TURBINE_E003`). It was `ConnectionError` (`TURBINE_E004`), though the connection was fine.
+- PostgreSQL `42883` (no operator for these argument types, for example a `bigint` column compared with text) is `ValidationError` (`TURBINE_E003`), keeping the type names.
+- pg-pool's checkout timeout on a pool you supplied is `ConnectionError` (`TURBINE_E004`), as it already was on a pool Turbine owns.
+- `TimeoutError` carries `outcome`, see [above](#a-timed-out-query-is-cancelled-on-the-server).
 
 ### An object written to a scalar PostgreSQL column
 
@@ -392,7 +484,7 @@ await db.$transaction(async (tx) => {
 });
 ```
 
-{/* TODO(v090): PM decision pending to give the rolled-back COMMIT its own error class; it is ValidationError (E003) at 3cf0414. */}
+{/* TODO(v090): PM decision made, code not landed: a rolled-back COMMIT gets its own class, TransactionRolledBackError (TURBINE_E019), with the first failure as `cause`; DeadlockError and SerializationFailureError keep their classes. Rewrite "ValidationError (TURBINE_E003)" above once the client lane commits it. */}
 
 **A settled `tx` throws.** A `tx` used after its transaction committed, rolled back or timed out throws `TURBINE_E003` instead of running on a connection that may belong to another request. The usual causes are a missing `await`, an `async` callback passed to `forEach` (use `for ... of`), or a `tx` stored for later.
 
@@ -416,6 +508,7 @@ await db.$transaction(async (tx) => {
 - `count({ select })` returns Prisma's per-field object (`{ _all, title }`) instead of a number.
 - Every cursor shape now matches Prisma: the page starts at the cursor row in the query's order and `skip: 1` drops it. The shapes that threw `TURBINE_E017` before now work, and `cursor` plus `skip` under an `orderBy` on another field returns the right rows.
 - `skip` in a nested `include` maps to the relation offset. A nested `cursor` throws `TURBINE_E017`; it was dropped.
+- A cursor always reads the row it names, so a cursor whose row was deleted since the last page gives an empty page, as in Prisma.
 
 ### SQLite
 
@@ -447,6 +540,19 @@ These used to return wrong rows and now throw:
 - **It fails rather than generating an untagged client.** A named `--schema-file` or config `schemaFile` that is missing or cannot be loaded exits 1, and so does a `pii` or `updatedAt` tag on a table or column the database lacks. Run `turbine push` first, or fix the tag. A project with no `./turbine/schema.ts` is unaffected.
 - **A table whose accessor would be `constructor` or `__proto__` is refused**, with the fix named.
 - `introspect()` returns null-prototype objects for `tables`, `enums`, the column maps and relations. An `assert.deepEqual` against a plain object needs a spread.
+
+### Generated types are stricter
+
+Regenerate your client, then run `tsc`. These are compile-time changes only; nothing changes at runtime, and most calls the new types reject already failed at runtime.
+
+- **`create` requires every required column.** A NOT NULL column with no default must be in `data`. A required `belongsTo` is satisfied by its foreign key or by the relation (`connect` / `create` / `connectOrCreate`), and a nested create under a parent does not ask for the keys the parent supplies. Before, the call compiled and failed at runtime with `TURBINE_E010`.
+- **`findUnique`, `findUniqueOrThrow`, `upsert` and nested `connect` take a unique key** (the generated `XWhereUnique`, such as `{ id } | { email }`). Extra predicates beside the key are still allowed. For a non-unique lookup use `findFirst`.
+- **A `belongsTo` relation whose foreign key is NOT NULL is typed non-null when loaded.** It is nullable again when the relation's `with` has a `where`. If a global filter on the target table can hide that row, keep treating it as nullable: the type cannot see the filter.
+- **`belongsTo` nested writes take the to-one operations.** `connect`, `create` and `connectOrCreate` take one object, `disconnect` and `delete` take `true` (or a unique key), `update` takes `{ data }`, and there is no `set`. Replace array forms with a single object.
+- **`_count: true` is one number per to-many relation** (`{ posts: number }`), not `Record<string, number>`.
+- **Accessors are `QueryInterface<T, TRelations, TInputs>`**, and the generated constructor and `turbine()` take `TypedTurbineConfig`, whose `globalFilters` is checked against your tables and columns. A hand-written `QueryInterface<T, R>` keeps working.
+
+Also new, and not breaking: nested `select` / `omit` narrow the related rows' type, `aggregate` results follow their arguments, update fields accept `{ set }` and the atomic operators, the generated client compiles under `exactOptionalPropertyTypes` and passes `@typescript-eslint/no-unsafe-declaration-merging`, and `json` columns can be typed with [`tsType`](/schema#typing-a-json-column-tstype) in the schema file or [`columnTypes`](/cli#typing-columns-columntypes) in `turbine.config.ts`.
 
 ### Generated row types follow the driver
 

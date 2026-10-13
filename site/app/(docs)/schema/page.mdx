@@ -48,7 +48,40 @@ export default defineSchema({
 });
 ```
 
-Two things the example does not show. `type: 'timestamp'` emits `TIMESTAMPTZ`: the alias is kept for back-compat and means the same as `'timestamptz'`, so there is no code-first spelling for a zone-less `TIMESTAMP` column (declare one in a SQL migration and `generate` picks it up; the [type mapping](#type-mapping) below describes how such a column reads). And `varchar` takes its bound as `maxLength` (`{ type: 'varchar', maxLength: 200 }`); `defineSchema` does not validate column option names, so a misspelt option such as `length` is ignored and an unbounded `VARCHAR` is emitted.
+Two things the example does not show. `type: 'timestamp'` emits `TIMESTAMPTZ`: the alias is kept for back-compat and means the same as `'timestamptz'`, so there is no code-first spelling for a zone-less `TIMESTAMP` column (declare one in a SQL migration and `generate` picks it up; the [type mapping](#type-mapping) below describes how such a column reads). And `varchar` takes its bound as `maxLength` (`{ type: 'varchar', maxLength: 200 }`).
+
+### Unknown keys throw
+
+`defineSchema` refuses a key it does not know. A misspelt column, table, index, `references`, check, `manyToMany` or options key throws `ValidationError` ([`TURBINE_E003`](/errors#e003)) naming the key, where it sits, and the nearest valid key:
+
+```ts
+defineSchema({
+  users: {
+    id: { type: 'serial', primaryKey: true },
+    role: { type: 'text', defaultValue: "'member'" },
+  },
+});
+// TURBINE_E003: defineSchema: unknown key "defaultValue" in column "users.role". Did you mean "default"?
+```
+
+In a TypeScript object literal the same key is also a compile error. Before 0.90 such a key was ignored, so the DDL silently lacked what it asked for: a misspelt `default` emitted no `DEFAULT`, and `uniq` on an index emitted a non-unique one.
+
+### Typing a JSON column, `tsType`
+
+A `json` / `jsonb` column generates as `unknown`. Give it a type with `tsType`, in the object form or on the fluent builder:
+
+```ts
+export default defineSchema({
+  users: {
+    id: { type: 'serial', primaryKey: true },
+    settings: { type: 'jsonb', tsType: '{ theme: string; beta?: boolean }' },
+  },
+});
+
+// fluent: column.jsonb().tsType('{ theme: string; beta?: boolean }')
+```
+
+`turbine generate` uses it for the column's row, create and update types. The text is emitted verbatim, so it may name any type the generated file can see (`import('../src/types.js').Settings`). `| null` is still added for a nullable column. It must be one line: text that is empty or contains a line break or other control character throws. The same override can live in `turbine.config.ts` as [`columnTypes`](/cli#typing-columns-columntypes); when both name one column, the config entry wins.
 
 ### Composite primary keys
 
@@ -189,13 +222,11 @@ The rest of the policy:
 
 **Tag sensitive data, not keys.** A PII-tagged column that is part of the primary key is returned anyway, on every read and write path, because a row that comes back without part of its own key is unaddressable: feeding it into an `update` builds a partial predicate that matches more rows than intended. If a key column is genuinely sensitive, use a surrogate key, not a tag.
 
-The tag flows through the stack: [`turbine studio`](/studio) redacts PII cells by default (reveal with `--show-pii`), and `turbine generate` marks each PII field optional in the emitted entity type, since it is absent by default. Studio and the [MCP server](/mcp) introspect the live database, which carries no tags, so they read them from the generated metadata in your `out` directory: run `turbine generate` after tagging, or they have nothing to redact. Introspection never auto-tags a column; `pii` is a code-first declaration you make in `defineSchema`.
-
-{/* TODO(v090): types and codegen lane (B3): confirm the wording of the generated PII field (optional, and how the type comment describes the opt-in). */}
+The tag flows through the stack: [`turbine studio`](/studio) redacts PII cells by default (reveal with `--show-pii`), and `turbine generate` marks each PII field optional in the emitted entity type, since it is absent by default. The field's doc comment reads `(PII: absent unless the read passes includePii: UNSAFE)`. Studio and the [MCP server](/mcp) introspect the live database, which carries no tags, so they read them from the generated metadata in your `out` directory: run `turbine generate` after tagging, or they have nothing to redact. Introspection never auto-tags a column; `pii` is a code-first declaration you make in `defineSchema`.
 
 #### How `generate` picks up the tags
 
-`turbine generate` introspects the database, and the database has no column for `pii` or `updatedAt`. So `generate` also reads your schema file (`--schema-file`, or `schemaFile` in `turbine.config.ts`, default `turbine/schema.ts`) and overlays its `pii`, `updatedAt` and `maxLength` tags onto what it introspected, printing a line such as `Applied column tags from turbine/schema.ts: 2 pii, 1 updatedAt`. Before 0.90 it did not, so a generated client returned tagged columns by default and never stamped `updatedAt`. Regenerate after upgrading.
+`turbine generate` introspects the database, and the database has no column for `pii` or `updatedAt`. So `generate` also reads your schema file (`--schema-file`, or `schemaFile` in `turbine.config.ts`, default `turbine/schema.ts`) and overlays its `pii`, `updatedAt`, `maxLength` and `tsType` declarations onto what it introspected, printing a line such as `Applied column tags from turbine/schema.ts: 2 pii, 1 updatedAt, 1 tsType`. Before 0.90 it did not, so a generated client returned tagged columns by default and never stamped `updatedAt`. Regenerate after upgrading.
 
 The overlay fails rather than generating an unprotected client:
 
@@ -405,7 +436,7 @@ Turbine maps Postgres types to TypeScript:
 | `point`, `circle` | `{ x, y }`, `{ x, y, radius }` | Parsed by the driver; writes take the text form. Other geometric types stay `string` |
 | `macaddr8`, `bit`, `varbit`, ranges, multiranges | `string` | The text form, `'[1,5)'` for a range |
 | `boolean` | `boolean` | |
-| `json`, `jsonb` | `unknown` | |
+| `json`, `jsonb` | `unknown` | Give it a type with [`tsType`](#typing-a-json-column-tstype) or `columnTypes` |
 | `bytea` | `Buffer` | |
 | Array types | `T[]` | `_text` → `string[]`. `date[]` and `timestamp[]` follow their scalar forms. `bigint[]` is `string[]` (the driver's array parser does not apply the scalar `int8` rule), and `circle[]` is `string[]` |
 

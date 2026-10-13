@@ -78,7 +78,7 @@ await db.$transaction(async (tx) => {
 });
 ```
 
-{/* TODO(v090): PM decision: if a rolled-back COMMIT gets its own error class, replace "ValidationError (TURBINE_E003)" above. */}
+{/* TODO(v090): PM decision made, code not landed: a rolled-back COMMIT gets its own class, TransactionRolledBackError (TURBINE_E019), with the first failure as `cause`; DeadlockError and SerializationFailureError keep their classes. Replace "ValidationError (TURBINE_E003)" above once the client lane commits it. */}
 
 ### Multi-statement writes stay whole
 

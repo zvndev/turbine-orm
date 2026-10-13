@@ -79,7 +79,7 @@ await db.$transaction(async (tx) => {
 });
 ```
 
-{/* TODO(v090): builder lane (B1): document the refusal of optimisticLock inside a nested upsert once it lands. */}
+The `upsert` refusal holds whatever the call carries. An `upsert` whose `create` or `update` includes nested relation data takes another code path, and before 0.90 that path skipped the check. It now throws the same `TURBINE_E003` before anything is read or written.
 
 ## Handling a conflict
 

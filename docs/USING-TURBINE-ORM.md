@@ -207,7 +207,7 @@ db.$use(async (params, next) => {
 });
 ```
 
-Middleware runs *after* SQL generation, it sees the params, not the SQL, and can inspect/log/transform. Can't rewrite SQL.
+Middleware runs *after* SQL generation, it sees the params, not the SQL, and can inspect/log/transform. Can't rewrite SQL: `params.args` is read-only, and writing to it (or calling `next()` with new args) throws a `TypeError`.
 
 **Port note:** the `$use` lifecycle hook pattern is widely-understood (Prisma, Mongoose). Recommend porting. Run the middleware stack against the *parsed* query, not the generated wire command, so middleware is dialect-independent.
 
@@ -917,7 +917,7 @@ With Node's built-in `node:test`, pass `{ skip }` to each test instead. In this 
 
 - **Lazy loading.** Every field is explicit. If you want `user.posts` you write `with: { posts: true }`. This is a feature; it keeps query costs visible.
 - **Model classes.** Rows are plain objects. No `user.save()`, no `user.$prisma`, no decorators. Plays well with JSON, serializers, validation libraries.
-- **Automatic soft-delete.** Use middleware if you want it, `$use` can rewrite `findMany` to add `deletedAt: null`. Baking it in would hide it.
+- **Automatic soft-delete.** Use `globalFilters` if you want it (`{ posts: { deletedAt: null } }`); middleware cannot add the condition, since its args are read-only. Baking it in would hide it.
 - **Multi-database at runtime.** One `TurbineClient` = one pool = one DB. For multi-tenancy, create multiple clients.
 - **Hooks on entity mutation.** Use middleware for cross-cutting concerns. Entity-lifecycle hooks encourage spaghetti.
 

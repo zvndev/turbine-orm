@@ -85,13 +85,30 @@ Reads `information_schema` + `pg_catalog` and writes three files to the output d
 
 ### Column tags from the schema file
 
-The database has no column for the code-first `pii` and `updatedAt` tags, so `generate` also reads your `defineSchema()` file (`--schema-file <path>`, or `schemaFile` in the config, default `./turbine/schema.ts`) and overlays its `pii`, `updatedAt` and `maxLength` tags onto the introspected schema. It prints what it applied, for example `Applied column tags from ./turbine/schema.ts: 2 pii, 1 updatedAt`.
+The database has no column for the code-first `pii` and `updatedAt` tags, so `generate` also reads your `defineSchema()` file (`--schema-file <path>`, or `schemaFile` in the config, default `./turbine/schema.ts`) and overlays its `pii`, `updatedAt`, `maxLength` and `tsType` declarations onto the introspected schema. It prints what it applied, for example `Applied column tags from ./turbine/schema.ts: 2 pii, 1 updatedAt, 1 tsType`.
 
 ```bash
 npx turbine generate --schema-file ./db/schema.ts
 ```
 
 A schema file you named that is missing, a schema file that fails to load, and a `pii` or `updatedAt` tag on a table or column the database lacks all fail the command, because carrying on would generate a client that returns the columns the tags hide. Only a missing file at the default path is skipped. A `.ts` file needs `tsx` installed as a dev dependency. See [How generate picks up the tags](/schema#how-generate-picks-up-the-tags).
+
+### Typing columns, `columnTypes`
+
+A `json` / `jsonb` column generates as `unknown`. `columnTypes` in `turbine.config.ts` replaces the generated type of any column. Keys are `"<table>.<column>"` with database names:
+
+```ts
+const config: TurbineCliConfig = {
+  columnTypes: {
+    'users.settings': '{ theme: string; beta?: boolean }',
+    'orders.meta': "import('../src/types.js').OrderMeta",
+  },
+};
+```
+
+The type replaces the column's row, create and update types. Its text is emitted verbatim, so an `import()` type resolves from the generated directory, and `| null` is still added for a nullable column. A value must be one line. A key naming no table or column, a key not in `table.column` form, or a value with a line break throws `ValidationError` (`TURBINE_E003`) with the closest name. A key for a table that `include` / `exclude` leaves out is skipped.
+
+A schema file can declare the same thing next to the column with [`tsType`](/schema#typing-a-json-column-tstype). When both name one column, `columnTypes` wins.
 
 ### `--zod`
 
@@ -650,6 +667,7 @@ const config: TurbineCliConfig = {
   migrationsDir: './turbine/migrations',
   seedFile: './turbine/seed.ts',
   schemaFile: './turbine/schema.ts',
+  columnTypes: { 'users.settings': '{ theme: string }' },
 };
 
 export default config;

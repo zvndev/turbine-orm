@@ -18,8 +18,8 @@ Every error also carries `readonly docsUrl` (e.g. `https://turbineorm.dev/errors
 | Code | Class | When thrown |
 |---|---|---|
 | <a id="e001" /> `TURBINE_E001` | `NotFoundError` | `findUniqueOrThrow`, `findFirstOrThrow`, update/delete against a non-matching row |
-| <a id="e002" /> `TURBINE_E002` | `TimeoutError` | Query or transaction exceeds its configured timeout |
-| <a id="e003" /> `TURBINE_E003` | `ValidationError` | Unknown column, invalid operator, empty-where guard on update/delete, PII aggregate without `includePii`, a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol) passed a plain `true` instead of the `UNSAFE` symbol, a `createMany` whose first data row names no column while a later row does. Since 0.90 also: an operand that does not fit its operator or column, a plain `{ col }` object where `col()` is needed, a PII column in `select` without `includePii: UNSAFE`, a `globalFilters` key or filter that names nothing, or a function filter that returns `undefined`, a query on a `tx` whose transaction has settled, a `$transaction` PostgreSQL rolled back instead of committing, and a `cursor` that cannot place its page |
+| <a id="e002" /> `TURBINE_E002` | `TimeoutError` | Query or transaction exceeds its configured timeout. Since 0.90 it carries `outcome`: `'not-executed'` when the statement made no change, `'unknown'` when it may still have. See [per-query timeout](/queries#per-query-timeout) |
+| <a id="e003" /> `TURBINE_E003` | `ValidationError` | Unknown column, invalid operator, empty-where guard on update/delete, PII aggregate without `includePii`, a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol) passed a plain `true` instead of the `UNSAFE` symbol, a `createMany` whose first data row names no column while a later row does. Since 0.90 also: an operand that does not fit its operator or column, a plain `{ col }` object where `col()` is needed, a PII column in `select` without `includePii: UNSAFE`, a `globalFilters` key or filter that names nothing, or a function filter that returns `undefined`, a query on a `tx` whose transaction has settled, a `$transaction` PostgreSQL rolled back instead of committing, a `cursor` that cannot place its page or carries an operator, an invalid per-query `timeout` or `relationLoadStrategy`, paging options on `updateMany` / `deleteMany`, `optimisticLock` on `upsert` or `updateMany`, an unknown key in `defineSchema`, a value the server could not read as its column's type at bind time (such as a `Buffer` bound to a non-`bytea` column, formerly `TURBINE_E004`), and pg 42883 (no operator for these argument types) |
 | <a id="e004" /> `TURBINE_E004` | `ConnectionError` | A connection could not be opened, or an open one was closed by the server (restart, failover, idle timeout, compute suspend), or none came free within `connectionTimeoutMs` (the message names the pool size), or the client was built with no database to connect to (raised by the first query). See [lost connections](/transactions#lost-connections) for what Turbine retries |
 | <a id="e005" /> `TURBINE_E005` | `RelationError` | Unknown relation name in a `with` clause |
 | <a id="e006" /> `TURBINE_E006` | `MigrationError` | Checksum mismatch, migration-lock contention, or a failure while applying a migration |
@@ -34,7 +34,9 @@ Every error also carries `readonly docsUrl` (e.g. `https://turbineorm.dev/errors
 | <a id="e015" /> `TURBINE_E015` | `OptimisticLockError` | Version mismatch on an `optimisticLock` update, the row was modified by another transaction |
 | <a id="e016" /> `TURBINE_E016` | `ExclusionConstraintError` | pg 23P01, translated via `wrapPgError()` |
 | <a id="e017" /> `TURBINE_E017` | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) invoked on a non-Postgres engine, exposes `feature` and `dialect` |
-| <a id="e018" /> `TURBINE_E018` | `ReadOnlyError` | A write refused because the database is read-only, exposes `reason: 'snapshot' \| 'rbac'` (PowDB snapshot serving / read-only role) |
+| <a id="e018" /> `TURBINE_E018` | `ReadOnlyError` | A write refused because the database, the role or the transaction is read-only, exposes `reason: 'snapshot' \| 'rbac' \| 'transaction'` (PowDB snapshot serving / read-only role / a read-only transaction or replica) |
+
+{/* TODO(v090): PM decision made, code not landed: a rolled-back COMMIT gets TransactionRolledBackError (TURBINE_E019). Add its row and anchor, and drop "a $transaction PostgreSQL rolled back instead of committing" from the E003 row, once the client lane commits it. */}
 
 ## Catching typed errors
 
@@ -221,6 +223,9 @@ Some gates append one more sentence naming a workaround. `err.feature` is the la
 
 - **`'snapshot'`**, the database itself is read-only: a PowDB `--readonly` snapshot server, an embedded `{ readonly: true }` open, or Turbine's own client-level `readonly: true` fail-fast flag. Nothing can write here; route the write to your primary.
 - **`'rbac'`**, the database is writable but this connection's role may not write (`permission denied: role …`). Re-authenticating with a writer role may suffice.
+- **`'transaction'`** (since 0.90), the transaction is read-only: one opened with `BEGIN READ ONLY` or `SET TRANSACTION READ ONLY`, or any transaction on a hot-standby read replica. PostgreSQL SQLSTATE `25006` and MySQL error 1792 map here; before 0.90 they surfaced as a generic database error. Run the write in a read-write transaction on the primary. An exhaustive `switch` over `reason` needs the new case.
+
+{/* TODO(v090): client lane (B6): if `$transaction({ readOnly: true })` lands, name it in the 'transaction' bullet above. */}
 
 ```ts
 import { ReadOnlyError } from 'turbine-orm';
@@ -244,7 +249,7 @@ By default, `NotFoundError` messages include only the **keys** of the `where` cl
 [TURBINE_E001] findUniqueOrThrow on "users" found no record matching where: { id, email }
 ```
 
-The full `where` object is always available as `err.where` for programmatic access, only the human-readable message is redacted. Opt into verbose messages (useful in local development) by setting `errorMessages: 'verbose'` in your `TurbineConfig`, or by calling `setErrorMessageMode('verbose')` at startup.
+The full `where` object is always available as `err.where` for programmatic access, only the human-readable message is redacted. Since 0.90 `where` is not enumerable in safe mode, so `JSON.stringify(err)` and error serializers that walk own properties do not carry it into logs; read `err.where` directly. Opt into verbose messages (useful in local development) by setting `errorMessages: 'verbose'` in your `TurbineConfig`, or by calling `setErrorMessageMode('verbose')` at startup.
 
 ```ts
 const db = turbine({

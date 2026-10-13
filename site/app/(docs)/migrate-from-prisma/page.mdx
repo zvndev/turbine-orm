@@ -355,7 +355,7 @@ The second form covers Turbine's spelling written into a Prisma-shaped call (`li
 
 ### What the adapter does *not* do
 
-**Absent entirely.** `$use` and `$on` are not implemented and not present on the returned object; calling one is a plain `TypeError`, not a typed Turbine error. Turbine's own middleware is `db.$use` on the underlying `TurbineClient`, with different semantics: it runs *after* SQL generation and cannot rewrite a query. `$extends` **is** implemented for two of Prisma's four components, see [Client extensions](#client-extensions-extends).
+**Absent entirely.** `$use` and `$on` are not implemented and not present on the returned object; calling one is a plain `TypeError`, not a typed Turbine error. Turbine's own middleware is `db.$use` on the underlying `TurbineClient`, with different semantics: it runs *after* SQL generation and cannot rewrite a query. A Prisma middleware that edits `params.args` throws a `TypeError` there; move the condition into `globalFilters` or the query. `$extends` **is** implemented for two of Prisma's four components, see [Client extensions](#client-extensions-extends).
 
 **Present but inert.** `$connect()` and `$disconnect()` resolve immediately without doing anything. The `TurbineClient` owns the pool, so shut down with `db.disconnect()`; a migration that relies on `$disconnect()` closing connections (tests, serverless teardown) will leak the pool.
 
@@ -617,7 +617,7 @@ Since 0.90 the adapter reproduces Prisma's cursor for every order shape. A Prism
 
 Before 0.90 the adapter translated `cursor` + `skip` to an exclusive keyset predicate, which returned the wrong rows under an `orderBy` on another field, and refused most bare inclusive cursors with `TURBINE_E017`.
 
-{/* TODO(v090): where-hardening lane (F1): confirm what a compat cursor whose row was deleted returns once that lane lands. */}
+A compat cursor always reads the row it names, even when it also carries every ordered field. So if that row has been deleted since the previous page, the next page is empty, as in Prisma. (The native exclusive cursor differs here: a cursor that carries a value for every ordered column is placed from those values, so the walk carries on past a deleted row.)
 
 ### Relation array order
 

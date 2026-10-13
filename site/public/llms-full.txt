@@ -111,6 +111,8 @@ await db.users.deleteMany({ where: { createdAt: { lt: cutoff } } });
 await db.users.upsert({ where: { email: 'a@b.com' }, create: { /* ... */ }, update: { /* ... */ } });
 ```
 
+`updateMany` / `deleteMany` take no `limit` / `take` / `offset` / `skip` (E003): `findMany` the ids first, then write `where: { id: { in: ids } }`. A `createMany` past the engine's bind-parameter limit is split into chunks inside one transaction (not on SQL Server).
+
 Atomic update operators on numeric columns (race-safe `col = col + $n`): `set`, `increment`, `decrement`, `multiply`, `divide`.
 ```ts
 await db.posts.update({ where: { id: 1 }, data: { viewCount: { increment: 1 } } });
@@ -171,14 +173,14 @@ const rows = await db.raw<{ day: Date; count: number }>`SELECT ... WHERE org_id 
 const users = await db.sql<{ id: number; name: string }>`SELECT id, name FROM users WHERE id = ${42}`; // .one(), .scalar()
 ```
 
-Middleware, `db.$use(fn)` runs after SQL generation: observe params/timing and transform results, but it cannot rewrite the query.
+Middleware, `db.$use(fn)` runs after SQL generation: observe params/timing and transform results, but it cannot rewrite the query. `params.args` is read-only: writing to it, or calling `next()` with new args, throws a `TypeError`.
 
 ## Typed errors
 
 Every error extends `TurbineError` and carries a `code`. Branch on the class/code, never on the message.
 
 - E001 NotFoundError, OrThrow lookups
-- E002 TimeoutError
+- E002 TimeoutError, carries `outcome`: `'not-executed'` (made no change, safe to retry) or `'unknown'`
 - E003 ValidationError, unknown column, invalid operator, empty-where guard
 - E004 ConnectionError
 - E005 RelationError, unknown relation in `with`
@@ -194,7 +196,7 @@ Every error extends `TurbineError` and carries a `code`. Branch on the class/cod
 - E015 OptimisticLockError
 - E016 ExclusionConstraintError (23P01)
 - E017 UnsupportedFeatureError, a Postgres-only feature invoked on an engine that lacks it
-- E018 ReadOnlyError, a write refused on a read-only database
+- E018 ReadOnlyError, a write refused on a read-only database, role or transaction (`reason`: 'snapshot' | 'rbac' | 'transaction')
 
 ```ts
 import { SerializationFailureError } from 'turbine-orm';
@@ -206,7 +208,7 @@ catch (err) {
 
 ## Migrations
 
-SQL-first migration files (UTC timestamp-prefixed, `-- UP` / `-- DOWN` sections) tracked in `_turbine_migrations` with SHA-256 checksums and a `pg_try_advisory_lock()`. Each runs in its own transaction; modified files are detected by checksum. Destructive statements need a typed confirmation or `--allow-destructive`. For fast local iteration use `turbine push` (applies `defineSchema` directly); prefer SQL migrations for production. In CI, `push --dry-run --exit-code` and `migrate status --exit-code` exit 2 on drift, and `migrate deploy --wait` waits for a concurrent deploy's lock.
+SQL-first migration files (UTC timestamp-prefixed, `-- UP` / `-- DOWN` sections) tracked in `_turbine_migrations` with SHA-256 checksums and a `pg_try_advisory_lock()`. Each runs in its own transaction; modified files are detected by checksum. Destructive statements need a typed confirmation or `--allow-destructive`. For fast local iteration use `turbine push` (applies `defineSchema` directly); prefer SQL migrations for production. `defineSchema` throws E003 on a key it does not know, naming the nearest valid one; a column's `tsType` (or `columnTypes` in `turbine.config.ts`) sets its generated TypeScript type. In CI, `push --dry-run --exit-code` and `migrate status --exit-code` exit 2 on drift, and `migrate deploy --wait` waits for a concurrent deploy's lock.
 
 ## Engines
 
