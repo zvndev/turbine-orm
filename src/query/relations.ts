@@ -3030,14 +3030,6 @@ export function buildRelationSubquery(
   // which mirrors collectRelationSubqueryParams so the SQL cache / pipeline stay
   // in sync.
   if (qi.dialect.buildRelationSubquery) {
-    if (relationOffset(opts) !== undefined) {
-      throw new UnsupportedFeatureError(
-        'relation offset',
-        qi.dialect.name,
-        `On relation "${relDef.name}", use relationLoadStrategy: 'batched', which applies the offset per parent, ` +
-          'or drop `offset` / `skip`.',
-      );
-    }
     return qi.dialect.buildRelationSubquery({
       relDef,
       spec,

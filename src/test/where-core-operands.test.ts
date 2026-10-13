@@ -136,8 +136,11 @@ describe('not with an operator object', () => {
   });
 
   it('on a JSON column an object after not is still a JSON value', () => {
+    // The negated whole-document equality, never a `>` comparison.
     const out = compileWhere({ meta: { not: { gt: 1 } } });
-    assert.ok(!(out.sql ?? '').includes('NOT ('), out.sql ?? '');
+    assert.equal(out.sql, 'NOT ("meta"::jsonb = $1::jsonb)');
+    assert.deepEqual(out.buildParams, ['{"gt":1}']);
+    assert.deepEqual(out.collectParams, out.buildParams);
   });
 });
 
@@ -184,13 +187,14 @@ describe('JSON path equals', () => {
     ['an array', [1]],
     ['an object', { a: 1 }],
   ] as const) {
-    it(`MySQL and SQLite refuse ${label} with E017 instead of matching nothing`, () => {
-      for (const q of [mysqlQ(), sqliteQ()]) {
-        assert.throws(
-          () => q.buildFindMany({ where: { meta: { path: ['v'], equals: value } } } as never),
-          UnsupportedFeatureError,
-        );
-      }
+    it(`SQLite refuses ${label} with E017 instead of matching nothing; MySQL compares it as JSON`, () => {
+      assert.throws(
+        () => sqliteQ().buildFindMany({ where: { meta: { path: ['v'], equals: value } } } as never),
+        UnsupportedFeatureError,
+      );
+      const { sql, params } = mysqlQ().buildFindMany({ where: { meta: { path: ['v'], equals: value } } } as never);
+      assert.match(sql, /JSON_EXTRACT\(`meta`, :p1\) = CAST\(:p2 AS JSON\)/);
+      assert.deepEqual(params.slice(0, 2), ['$."v"', JSON.stringify(value)]);
     });
   }
 

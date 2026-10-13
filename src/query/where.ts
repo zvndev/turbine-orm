@@ -11,7 +11,7 @@
  * primitives this module needs. See builder.ts for the thin delegating methods.
  */
 
-import type { Dialect } from '../dialect.js';
+import type { Dialect, JsonPathEqualsInput } from '../dialect.js';
 import { getErrorMessageMode, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import type { PgCompatQueryResult } from '../pg-types.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
@@ -629,7 +629,10 @@ function collectOperatorParamsChecked(
   if (op.lt !== undefined && !skipRef(op.lt)) params.push(cv(op.lt));
   if (op.lte !== undefined && !skipRef(op.lte)) params.push(cv(op.lte));
   if (op.not !== undefined && op.not !== null && !skipRef(op.not)) {
-    if (isNegatedOperatorObject(op.not, operand)) {
+    const negatedDocument = jsonNegatedDocument(qi, op.not, operand);
+    if (negatedDocument !== NO_JSON_NEGATION) {
+      jsonDocumentEquals(qi, '', column, negatedDocument, collectOnly(params));
+    } else if (isNegatedOperatorObject(op.not, operand)) {
       collectOperatorParamsChecked(qi, column, notOperand(op), params, refCtx, operand);
     } else {
       if (insensitive) assertInsensitiveOperand(op.not, 'not', column);
@@ -683,13 +686,16 @@ export function collectJsonFilterParams(qi: BuilderCtx, filter: JsonFilter, para
 
   if (filter.path !== undefined && filter.equals !== undefined) {
     pushPathOnce();
-    params.push(jsonPathEqualsOperand(qi, filter.equals, column));
+    const hook = jsonPathEqualsHook(qi);
+    if (hook) {
+      hook.call(qi.dialect, jsonPathEqualsInput(qi, filter, column, '', '', collectOnly(params)));
+    } else {
+      params.push(jsonPathEqualsOperand(qi, filter.equals, column));
+    }
   } else if (filter.equals !== undefined) {
-    // Mirrors the build path's refusal, and thrown before any param is pushed,
-    // like the text-search gate a few cases above. Not defensive: it is what
-    // stops a warmed template serving a shape the cold build refuses.
-    requireJsonContains(qi, 'equals');
-    params.push(JSON.stringify(filter.equals));
+    // Mirrors the build path, refusals included: a warmed template must never
+    // serve a shape the cold build refuses.
+    jsonDocumentEquals(qi, '', column, filter.equals, collectOnly(params));
   }
   if (filter.contains !== undefined) {
     requireJsonContains(qi, 'contains');
@@ -1923,7 +1929,6 @@ function buildOperatorClausesChecked(
   // the emitted SQL (and therefore the template cache) is untouched.
   const cv = (v: unknown): unknown => (refCtx ? coerceWhereOperand(qi, refCtx.meta, refCtx.rawColumn, v) : v);
   const insensitive = op.mode === 'insensitive';
-
   if (op.equals !== undefined) {
     if (op.equals === null) {
       clauses.push(`${column} IS NULL`);
@@ -1968,10 +1973,18 @@ function buildOperatorClausesChecked(
     }
   }
   if (op.not !== undefined) {
+    const negatedDocument =
+      op.not === null || isColumnRef(op.not) ? NO_JSON_NEGATION : jsonNegatedDocument(qi, op.not, operand);
     if (op.not === null) {
       clauses.push(`${column} IS NOT NULL`);
     } else if (isColumnRef(op.not)) {
       clauses.push(`${column} != ${columnRefSql(qi, op.not, refCtx, op.mode)}`);
+    } else if (negatedDocument !== NO_JSON_NEGATION) {
+      const equality = jsonDocumentEquals(qi, column, column, negatedDocument, (v) => {
+        params.push(v);
+        return qi.p(params.length);
+      });
+      clauses.push(`NOT (${equality})`);
     } else if (isNegatedOperatorObject(op.not, operand)) {
       const inner = buildOperatorClausesChecked(qi, column, notOperand(op), params, refCtx, operand);
       if (inner.length > 0) clauses.push(`NOT (${inner.join(' AND ')})`);
@@ -2468,22 +2481,12 @@ export function jsonRangeEntries(
 }
 
 /**
- * The bound operand of `{ path, equals }`, shared by the build and collect
- * paths so both bind (and refuse) identically.
- *
- * PostgreSQL compares JSON to JSON, so the operand is its JSON text: `5`,
- * `"5"`, `null`, `[1,2]` and `{"a":1}` each match only that JSON value at the
- * path (numbers compare numerically, so `5` also matches `5.0`). A Date is the
- * ISO string JSON would store, and a bigint is a JSON number.
- *
- * The other engines compare the TEXT their path extraction returns, so only a
- * value with a text form can match: a string, number, boolean, bigint or Date.
- * There a number and a numeric string match the same rows, except on SQLite,
- * whose extraction returns typed values: a number binds as a number there, and
- * a boolean is refused because SQLite reads `true` and `1` alike. `null`,
- * objects and arrays matched no row on those engines and are refused (E017).
+ * The `{ path, equals }` operand after the checks every engine shares: a
+ * function, symbol or column reference is refused, a non-finite number is
+ * refused (JSON.stringify would turn it into `null`, which matches JSON null),
+ * and a Date becomes the ISO string JSON stores it as.
  */
-export function jsonPathEqualsOperand(qi: BuilderCtx, value: unknown, column: string): unknown {
+function jsonPathEqualsValue(value: unknown, column: string): unknown {
   if (typeof value === 'function' || typeof value === 'symbol' || isColumnRef(value)) {
     throw new ValidationError(
       `JSON path 'equals' on ${column} takes a JSON value (string, number, boolean, null, array or object), ` +
@@ -2492,9 +2495,123 @@ export function jsonPathEqualsOperand(qi: BuilderCtx, value: unknown, column: st
   }
   const scalar = value instanceof Date ? value.toISOString() : value;
   if (typeof scalar === 'number' && !Number.isFinite(scalar)) {
-    // JSON.stringify turns NaN and Infinity into `null`, which would match JSON null.
     throw new ValidationError(`JSON path 'equals' on ${column} takes a finite number: JSON has no form for ${scalar}.`);
   }
+  return scalar;
+}
+
+/** The engine's typed `{ path, equals }` hook; PostgreSQL's form lives here, so it never takes one. */
+function jsonPathEqualsHook(qi: BuilderCtx): Dialect['buildJsonPathEquals'] {
+  return qi.dialect.name === 'postgresql' ? undefined : qi.dialect.buildJsonPathEquals;
+}
+
+/** The hook input, identical on the build and collect passes but for `column`, `pathRef` and `bind`. */
+function jsonPathEqualsInput(
+  qi: BuilderCtx,
+  filter: JsonFilter,
+  label: string,
+  column: string,
+  pathRef: string,
+  bind: (value: unknown) => string,
+): JsonPathEqualsInput {
+  return {
+    column,
+    pathRef,
+    path: filter.path!,
+    value: jsonPathEqualsValue(filter.equals, label),
+    label,
+    bind,
+    encodePath: (path) => jsonPathParam(qi, path) as string,
+  };
+}
+
+/**
+ * A whole-document JSON `equals` (no `path`): the column equals the operand as
+ * a JSON value, on the build and collect passes alike (`bind` pushes; on the
+ * collect pass the returned SQL is discarded). PostgreSQL compares jsonb, which
+ * ignores object key order and whitespace; the cast makes a `json` column
+ * comparable too (it has no `=` operator). MySQL compares through its typed
+ * hook; an engine without one refuses (E017), SQLite with its containment
+ * message.
+ */
+function jsonDocumentEquals(
+  qi: BuilderCtx,
+  column: string,
+  label: string,
+  value: unknown,
+  bind: (value: unknown) => string,
+): string {
+  const v = jsonPathEqualsValue(value, label);
+  if (qi.dialect.name === 'postgresql') {
+    return `${column}::jsonb = ${bind(typeof v === 'bigint' ? v.toString() : JSON.stringify(v))}::jsonb`;
+  }
+  const hook = qi.dialect.buildJsonPathEquals;
+  if (hook) {
+    return hook.call(qi.dialect, {
+      column,
+      pathRef: undefined,
+      path: [],
+      value: v,
+      label,
+      bind,
+      encodePath: (path) => jsonPathParam(qi, path) as string,
+    });
+  }
+  requireJsonContains(qi, 'equals');
+  throw new UnsupportedFeatureError(
+    `JSON \`equals\` on the whole document (${label})`,
+    qi.dialect.name,
+    'This engine has no exact comparison of JSON documents. Compare a value with `{ path: [...], equals }`.',
+  );
+}
+
+/** A bind callback for the collect passes: pushes the value, emits no SQL. */
+function collectOnly(params: unknown[]): (value: unknown) => string {
+  return (value) => {
+    params.push(value);
+    return '';
+  };
+}
+
+/**
+ * The operand of a `not` on a JSON column that negates a whole-document
+ * equality, or `NO_JSON_NEGATION` when the `not` keeps its bound-value form.
+ * `not: { equals: X }` is the negation of `equals: X` everywhere it compiles
+ * (an engine without an exact comparison refuses it rather than comparing a
+ * document `{"equals": X}`). A plain `not: X` means the same thing on the
+ * engines that compare whole documents exactly (PostgreSQL, MySQL); SQLite and
+ * SQL Server keep comparing the bound value as text, as before.
+ */
+function jsonNegatedDocument(qi: BuilderCtx, not: unknown, operand: OperandContext): unknown {
+  if (operand.kind !== 'json' || not === null || not === undefined || isColumnRef(not)) return NO_JSON_NEGATION;
+  if (isWhereOperator(not)) {
+    const keys = Object.keys(not).filter((k) => (not as Record<string, unknown>)[k] !== undefined);
+    if (keys.length === 1 && keys[0] === 'equals') return (not as { equals: unknown }).equals;
+  }
+  return qi.dialect.name === 'postgresql' || qi.dialect.name === 'mysql' ? not : NO_JSON_NEGATION;
+}
+const NO_JSON_NEGATION: unique symbol = Symbol('no JSON negation');
+
+/**
+ * The bound operand of `{ path, equals }`, shared by the build and collect
+ * paths so both bind (and refuse) identically.
+ *
+ * PostgreSQL compares JSON to JSON, so the operand is its JSON text: `5`,
+ * `"5"`, `null`, `[1,2]` and `{"a":1}` each match only that JSON value at the
+ * path (numbers compare numerically, so `5` also matches `5.0`). A Date is the
+ * ISO string JSON would store, and a bigint is a JSON number.
+ *
+ * MySQL and SQL Server compare typed through `Dialect.buildJsonPathEquals`
+ * and never reach this function. SQLite compares the value its path
+ * extraction returns, so only a value with a text form can match: a string,
+ * number, boolean, bigint or Date.
+ * There a number and a numeric string match the same rows, except on SQLite,
+ * whose extraction returns typed values: a number binds as a number there, and
+ * a boolean is refused because SQLite reads `true` and `1` alike. `null`,
+ * objects and arrays matched no row on those engines and are refused (E017).
+ */
+export function jsonPathEqualsOperand(qi: BuilderCtx, value: unknown, column: string): unknown {
+  const scalar = jsonPathEqualsValue(value, column);
   if (qi.dialect.name === 'postgresql') {
     return typeof scalar === 'bigint' ? scalar.toString() : JSON.stringify(scalar);
   }
@@ -2552,25 +2669,40 @@ export function buildJsonFilterClauses(
   if (filter.path !== undefined && filter.equals !== undefined) {
     // Path access + equals. PostgreSQL compares the JSON VALUE at the path,
     // typed: `(column #> $N::text[])::jsonb = $M::jsonb`, so 5 and "5" differ,
-    // and null, arrays and objects compare as JSON. Other engines compare the
-    // extracted text (see jsonPathEqualsOperand).
+    // and null, arrays and objects compare as JSON. MySQL and SQL Server bring
+    // their own typed form (Dialect.buildJsonPathEquals); SQLite compares the
+    // extracted value (see jsonPathEqualsOperand).
     const ref = pathRef();
-    const value = jsonPathEqualsOperand(qi, filter.equals, column);
-    params.push(value);
-    clauses.push(
-      qi.dialect.name === 'postgresql'
-        ? `(${column} #> ${ref}::text[])::jsonb = ${qi.p(params.length)}::jsonb`
-        : `${qi.dialect.buildJsonPathExtract(column, ref)} = ${qi.p(params.length)}`,
-    );
+    const hook = jsonPathEqualsHook(qi);
+    if (hook) {
+      // The engine's typed comparison (MySQL, SQL Server).
+      clauses.push(
+        hook.call(
+          qi.dialect,
+          jsonPathEqualsInput(qi, filter, column, column, ref, (v) => {
+            params.push(v);
+            return qi.p(params.length);
+          }),
+        ),
+      );
+    } else {
+      const value = jsonPathEqualsOperand(qi, filter.equals, column);
+      params.push(value);
+      clauses.push(
+        qi.dialect.name === 'postgresql'
+          ? `(${column} #> ${ref}::text[])::jsonb = ${qi.p(params.length)}::jsonb`
+          : `${qi.dialect.buildJsonPathExtract(column, ref)} = ${qi.p(params.length)}`,
+      );
+    }
   } else if (filter.equals !== undefined) {
-    // Containment equality: column @> $N::jsonb. A pathless `equals` compiles
-    // to the SAME containment expression `contains` does, so it inherits the
-    // same engine limitation and is refused under its own clause name (the two
-    // spellings are far enough apart that naming the wrong one would send the
-    // reader to the wrong line).
-    requireJsonContains(qi, 'equals');
-    params.push(JSON.stringify(filter.equals));
-    clauses.push(qi.dialect.buildJsonContains(column, qi.p(params.length)));
+    // Whole-document equality, NOT containment (`@>` matched every document
+    // holding the operand's keys).
+    clauses.push(
+      jsonDocumentEquals(qi, column, column, filter.equals, (v) => {
+        params.push(v);
+        return qi.p(params.length);
+      }),
+    );
   }
 
   if (filter.contains !== undefined) {

@@ -17,7 +17,7 @@ import { createRequire } from 'node:module';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import { TurbineClient } from '../client.js';
-import { UnsupportedFeatureError, ValidationError } from '../errors.js';
+import { ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
 import { mssqlDialect } from '../mssql.js';
 import { mysqlDialect } from '../mysql.js';
@@ -194,15 +194,11 @@ describe('relation offset: other dialects', () => {
     assert.match(b.sql, /LIMIT 2 OFFSET 3\)/);
   });
 
-  it('SQL Server refuses a relation offset on the join plan and names the batched alternative', () => {
+  it('SQL Server binds a relation offset inside its FOR JSON PATH subquery', () => {
     const q = makeQuery('users', schema(), { dialect: mssqlDialect, warnOnUnlimited: false });
-    assert.throws(
-      () => q.buildFindMany({ with: { posts: { orderBy: { id: 'asc' }, skip: 1 } } } as Any),
-      (err: unknown) =>
-        err instanceof UnsupportedFeatureError &&
-        /relation offset/.test(err.message) &&
-        /relationLoadStrategy: 'batched'/.test(err.message),
-    );
+    const built = q.buildFindMany({ with: { posts: { orderBy: { id: 'asc' }, skip: 1 } } } as Any);
+    assert.match(built.sql, /OFFSET @p\d+ ROWS/);
+    assert.ok(built.params.includes(1), `offset must be bound, got ${JSON.stringify(built.params)}`);
   });
 });
 

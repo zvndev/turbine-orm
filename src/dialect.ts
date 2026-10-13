@@ -76,6 +76,38 @@ export interface DefaultValuesInsertStatementInput {
 }
 
 /**
+ * Input for {@link Dialect.buildJsonPathEquals}. The hook runs on the SQL build
+ * AND on the cache-hit param-collect pass with the same `value`, so it binds
+ * the same parameters in the same order on both; on the collect pass `bind`
+ * returns an empty string and the returned SQL is discarded.
+ */
+export interface JsonPathEqualsInput {
+  /** The qualified JSON column expression. */
+  readonly column: string;
+  /**
+   * Placeholder of the already-bound JSONPath for `path` (see `encodePath`),
+   * or `undefined` for a whole-document `equals` (no `path`), which compares
+   * the column itself.
+   */
+  readonly pathRef: string | undefined;
+  /** The path segments as the caller wrote them; empty for a whole-document `equals`. */
+  readonly path: readonly (string | number)[];
+  /**
+   * The operand: a string, number, boolean, bigint, null, array or object.
+   * A Date arrives as its ISO string (the form JSON stores it in); functions,
+   * symbols, column references and non-finite numbers are refused before the
+   * hook runs.
+   */
+  readonly value: unknown;
+  /** The column as it should read in an error message. */
+  readonly label: string;
+  /** Bind one parameter and return its placeholder. */
+  bind(value: unknown): string;
+  /** The engine's JSONPath string for a path, the same encoding `pathRef` carries. */
+  encodePath(path: readonly (string | number)[]): string;
+}
+
+/**
  * The cast/decode pair for one JSON-divergent column type. See
  * {@link Dialect.jsonWireRule}. The two halves MUST agree: a cast with no
  * matching decode silently returns text where a value is expected.
@@ -292,8 +324,9 @@ export interface PartitionLimitInput {
  * dialect. **Param-push ordering contract:** the override MUST push values to
  * {@link params} in the same order the builder's collect path expects so the SQL
  * cache and pipeline batching stay in sync -
- *   - to-many with `limit`/`orderBy` (the "wrap" path) and manyToMany:
- *     `buildWhere(...)` → push `limit` → `recurse(...)` for each nested relation;
+ *   - to-many with `limit`/`offset`/`orderBy` (the "wrap" path) and manyToMany:
+ *     `buildWhere(...)` → push `limit` → push `offset` → `recurse(...)` for each
+ *     nested relation;
  *   - everything else (to-one, unordered/unlimited to-many): `recurse(...)` for each
  *     nested relation → `buildWhere(...)` (no limit param).
  */
@@ -614,6 +647,19 @@ export interface Dialect {
 
   /** Build a JSON path text extraction expression. */
   buildJsonPathExtract(column: string, pathParamRef: string): string;
+
+  /**
+   * `{ path, equals }` (and a whole-document `equals`, see
+   * {@link JsonPathEqualsInput.pathRef}) as a TYPED comparison: the JSON value
+   * equals the operand as JSON, so `5` and `"5"` differ and `true` does not
+   * match `1`.
+   * Throws `UnsupportedFeatureError` (E017) for an operand the engine cannot
+   * compare exactly. OPTIONAL and deliberately absent on `postgresDialect`
+   * (the where compiler owns the PostgreSQL form, gated on the dialect name),
+   * so no engine inherits it by spreading; an engine without it compares the
+   * text its `buildJsonPathExtract` returns.
+   */
+  buildJsonPathEquals?(input: JsonPathEqualsInput): string;
 
   /** Build a correlation clause across single or composite keys. */
   buildCorrelation(

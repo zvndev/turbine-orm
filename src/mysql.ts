@@ -76,6 +76,7 @@ import {
   type DialectIntrospector,
   type InsertStatementInput,
   type IntrospectOptions,
+  type JsonPathEqualsInput,
   type JsonWireRule,
   type LimitOffsetInput,
   postgresDialect,
@@ -88,8 +89,9 @@ import {
   malformedConnectionStringMessage,
   markValueBearingMessage,
   UnsupportedFeatureError,
+  ValidationError,
 } from './errors.js';
-import { applyTableFilters, deriveEngineRelations } from './introspect.js';
+import { applyTableFilters, assertDistinctColumnFields, deriveEngineRelations, nullRecord } from './introspect.js';
 import importOptionalPeer from './optional-peer-import.cjs';
 import {
   type ColumnMetadata,
@@ -155,11 +157,26 @@ function toMysqlParam(value: unknown): MysqlParam {
     case 'boolean':
       return value ? 1 : 0;
     case 'number':
+      // MySQL has no NaN or Infinity: the server stored NaN as 0 without a
+      // word, and refused Infinity with a raw driver error.
+      if (!Number.isFinite(value)) {
+        throw new ValidationError(
+          `MySQL cannot store or compare ${value}: a bound number must be finite. Pass a finite number, or null.`,
+        );
+      }
+      return value;
     case 'bigint':
     case 'string':
       return value;
   }
-  if (value instanceof Date) return value;
+  if (value instanceof Date) {
+    // mysql2 renders an Invalid Date as '0000-00-00 00:00:00.000', which the
+    // server then reports as that value instead of the caller's mistake.
+    if (Number.isNaN(value.getTime())) {
+      throw new ValidationError('MySQL cannot bind an Invalid Date. Pass a valid Date, or null.');
+    }
+    return value;
+  }
   if (value instanceof Uint8Array) return value; // also covers Buffer
   return JSON.stringify(value);
 }
@@ -319,9 +336,48 @@ function augmentMysqlError(err: unknown): unknown {
     case 1205:
       target.code = '40001';
       return err;
-    default:
+    default: {
+      // Data exceptions (a bound value that does not fit the column) take the
+      // SQLSTATE class 22 path in `wrapPgError`, which builds a ValidationError
+      // naming the column and redacts the value-bearing message in 'safe' mode.
+      const sqlstate = mysqlDataExceptionState(e.errno, (e as { sqlState?: unknown }).sqlState, msg);
+      if (sqlstate === undefined) return err;
+      target.code = sqlstate;
+      // "... for column 'name' at row 1", or "... in value for column 't.meta'."
+      const column = /for column '([^']+)'/i.exec(msg)?.[1];
+      if (column) target.column = column.slice(column.lastIndexOf('.') + 1);
       return err;
+    }
   }
+}
+
+/**
+ * The SQLSTATE a MySQL data exception maps to, or `undefined` when `errno` is
+ * not one. MySQL reports several of these under the generic `HY000`, so the
+ * common ones are mapped by errno to the code PostgreSQL uses for the same
+ * failure; anything else MySQL itself files under class 22 keeps its own code.
+ */
+function mysqlDataExceptionState(errno: number, sqlState: unknown, message: string): string | undefined {
+  switch (errno) {
+    case 1406: // ER_DATA_TOO_LONG
+      return '22001';
+    case 1264: // ER_WARN_DATA_OUT_OF_RANGE
+    case 1690: // ER_DATA_OUT_OF_RANGE
+      return '22003';
+    case 1366: // ER_TRUNCATED_WRONG_VALUE_FOR_FIELD: "Incorrect integer value: 'abc' for column ..."
+    case 1265: // WARN_DATA_TRUNCATED: a value outside an ENUM, a malformed DECIMAL
+      return '22P02';
+    case 1292: // ER_TRUNCATED_WRONG_VALUE: an invalid datetime, or a non-numeric string compared as a number
+    case 1411: // ER_WRONG_VALUE_FOR_TYPE
+      return /\b(?:date|time|datetime|timestamp)\b/i.test(message) ? '22007' : '22P02';
+    case 1365: // ER_DIVISION_BY_ZERO
+      return '22012';
+    case 3140: // ER_INVALID_JSON_TEXT
+    case 3141: // ER_INVALID_JSON_TEXT_IN_PARAM
+    case 3144: // ER_INVALID_JSON_CHARSET
+      return '22032';
+  }
+  return typeof sqlState === 'string' && /^22[0-9A-Z]{3}$/.test(sqlState) ? sqlState : undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -831,6 +887,19 @@ export const mysqlDialect: Dialect = {
     return `JSON_UNQUOTE(JSON_EXTRACT(${column}, ${pathParamRef}))`;
   },
 
+  // MySQL compares two JSON values by JSON type and value, so binding the
+  // operand as JSON text makes `{ path, equals }` exact for every shape:
+  // 5 vs "5" and true vs 1 differ, 5 equals 5.0, null matches JSON null, and
+  // arrays and objects compare structurally (object key order does not matter).
+  // A missing path extracts SQL NULL, which matches nothing. With no path the
+  // whole document is compared.
+  buildJsonPathEquals(input: JsonPathEqualsInput): string {
+    const { value } = input;
+    const text = typeof value === 'bigint' ? value.toString() : JSON.stringify(value);
+    const lhs = input.pathRef === undefined ? input.column : `JSON_EXTRACT(${input.column}, ${input.pathRef})`;
+    return `${lhs} = CAST(${input.bind(text)} AS JSON)`;
+  },
+
   // ---- Type mapping -------------------------------------------------------
 
   typeToTypeScript(dialectType: string, nullable: boolean): string {
@@ -1035,7 +1104,7 @@ export async function introspectMysqlWith(
   )) as unknown as InfoColumn[];
 
   const columnsByTable = new Map<string, ColumnMetadata[]>();
-  const enums: Record<string, string[]> = {};
+  const enums: Record<string, string[]> = nullRecord<string[]>();
   for (const c of columnRows) {
     if (!tableSet.has(c.TABLE_NAME)) continue;
     const nullable = c.IS_NULLABLE === 'YES' && c.COLUMN_KEY !== 'PRI';
@@ -1149,17 +1218,19 @@ export async function introspectMysqlWith(
   }
 
   // ----- Relations -----
+  // One field per column, as the PostgreSQL introspector requires.
+  for (const [tableName, cols] of columnsByTable) assertDistinctColumnFields(tableName, cols);
   const relationsByTable = buildRelationsFromForeignKeys(tableNames, foreignKeys, pkByTable, columnsByTable);
 
   // ----- Assemble TableMetadata -----
-  const tables: Record<string, TableMetadata> = {};
+  const tables: Record<string, TableMetadata> = nullRecord<TableMetadata>();
   for (const tableName of tableNames) {
     const columns = columnsByTable.get(tableName) ?? [];
-    const columnMap: Record<string, string> = {};
-    const reverseColumnMap: Record<string, string> = {};
+    const columnMap: Record<string, string> = nullRecord<string>();
+    const reverseColumnMap: Record<string, string> = nullRecord<string>();
     const dateColumns = new Set<string>();
-    const dialectTypes: Record<string, string> = {};
-    const pgTypes: Record<string, string> = {};
+    const dialectTypes: Record<string, string> = nullRecord<string>();
+    const pgTypes: Record<string, string> = nullRecord<string>();
     const allColumns: string[] = [];
 
     for (const col of columns) {
@@ -1182,7 +1253,7 @@ export async function introspectMysqlWith(
       allColumns,
       primaryKey: pkByTable.get(tableName) ?? [],
       uniqueColumns: uniqueByTable.get(tableName) ?? [],
-      relations: relationsByTable.get(tableName) ?? {},
+      relations: relationsByTable.get(tableName) ?? nullRecord<RelationDef>(),
       indexes: indexesByTable.get(tableName) ?? [],
     };
   }

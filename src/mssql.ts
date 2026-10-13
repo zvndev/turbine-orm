@@ -103,6 +103,7 @@ import {
   type DialectIntrospector,
   type InsertStatementInput,
   type IntrospectOptions,
+  type JsonPathEqualsInput,
   type JsonWireRule,
   type LimitOffsetInput,
   postgresDialect,
@@ -121,7 +122,7 @@ import {
   UnsupportedFeatureError,
   ValidationError,
 } from './errors.js';
-import { applyTableFilters, deriveEngineRelations } from './introspect.js';
+import { applyTableFilters, assertDistinctColumnFields, deriveEngineRelations, nullRecord } from './introspect.js';
 import importOptionalPeer from './optional-peer-import.cjs';
 import { availableClause } from './query/utils.js';
 import {
@@ -876,6 +877,46 @@ export const mssqlDialect: Dialect = {
     return `JSON_VALUE(${column}, ${pathParamRef})`;
   },
 
+  // `JSON_VALUE` returns the same text for 5 and "5", so `{ path, equals }`
+  // reads the value's JSON TYPE from OPENJSON over the parent of the path
+  // (type 0 null, 1 string, 2 number, 3 boolean) and compares within it.
+  // Every part is bound, so the SQL text is the same for every operand type.
+  // Numbers compare as float (5 equals 5.0; beyond 2^53 precision is lost);
+  // strings compare with a binary collation, i.e. case-sensitively, whatever
+  // the column's collation. Arrays and objects are refused: OPENJSON returns
+  // their stored text, so whitespace and key order would decide the match.
+  buildJsonPathEquals(input: JsonPathEqualsInput): string {
+    const { value, path } = input;
+    if (path.length === 0) {
+      throw new UnsupportedFeatureError(
+        `JSON \`equals\` on the whole document (${input.label})`,
+        'mssql',
+        'SQL Server stores the document as text, so whitespace and key order would decide the match. Compare a ' +
+          'scalar with `{ path: [...], equals }`, or run the query on PostgreSQL or MySQL.',
+      );
+    }
+    if (value !== null && typeof value === 'object') {
+      throw new UnsupportedFeatureError(
+        `JSON path \`equals\` with ${Array.isArray(value) ? 'an array' : 'an object'} (${input.label})`,
+        'mssql',
+        'SQL Server returns an array or object at a path as its stored text, so whitespace and key order would ' +
+          'decide the match. Compare a scalar at a deeper path, or run the query on PostgreSQL or MySQL.',
+      );
+    }
+    const type = value === null ? 0 : typeof value === 'string' ? 1 : typeof value === 'boolean' ? 3 : 2;
+    const text = value === null ? null : String(value);
+    const parent = input.bind(input.encodePath(path.slice(0, -1)));
+    const key = input.bind(String(path[path.length - 1]));
+    const typeRef = input.bind(type);
+    const v = input.bind(text);
+    return (
+      `EXISTS (SELECT 1 FROM OPENJSON(${input.column}, ${parent}) AS [jpe] ` +
+      `WHERE [jpe].[key] = ${key} AND [jpe].[type] = ${typeRef} AND ([jpe].[type] = 0 ` +
+      `OR ([jpe].[type] = 2 AND TRY_CONVERT(float, [jpe].[value]) = TRY_CONVERT(float, ${v})) ` +
+      `OR ([jpe].[type] <> 2 AND [jpe].[value] = ${v} COLLATE Latin1_General_BIN2)))`
+    );
+  },
+
   // ---- Type mapping -------------------------------------------------------
 
   typeToTypeScript(dialectType: string, nullable: boolean): string {
@@ -1025,7 +1066,7 @@ export const mssqlDialect: Dialect = {
  * as a string.
  *
  * **Param-push order** strictly mirrors `collectRelationSubqueryParams`:
- *   - manyToMany / to-many with limit|orderBy: `where` → `limit` → nested;
+ *   - manyToMany / to-many with limit|offset|orderBy: `where` → `limit` → `offset` → nested;
  *   - to-one / unordered-unlimited to-many: nested → `where` (no limit).
  */
 function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): string {
@@ -1038,6 +1079,22 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
     spec !== true && spec.orderBy ? Object.entries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
   const hasOrder = orderEntries.length > 0;
   const hasLimit = spec !== true && spec.limit !== undefined;
+  // `skip` arrives folded into `offset` (the args seam does that, and refuses
+  // it on a to-one relation).
+  const offset = spec === true ? undefined : (spec as { offset?: unknown }).offset;
+  const hasOffset = offset !== undefined;
+  /** Bind the relation offset after the limit, the order the param-collect mirror pushes them. */
+  const bindOffset = (): string | undefined => {
+    if (!hasOffset) return undefined;
+    const n = Number(offset);
+    if (!Number.isSafeInteger(n) || n < 0) {
+      throw new ValidationError(
+        `relation offset on "${targetTable}" must be a non-negative integer, received: ${String(offset)}`,
+      );
+    }
+    params.push(n);
+    return dialect.paramPlaceholder(params.length);
+  };
 
   /**
    * `<alias>.<col> AS [<field>]` selection for the FOR JSON object keys.
@@ -1076,7 +1133,10 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
   };
 
   /** ORDER BY + OFFSET/FETCH paging clause for a to-many FOR JSON subquery. */
-  const buildPaging = (a: string, limitPlaceholder: string | undefined): string => {
+  const buildPaging = (a: string, limitPlaceholder: string | undefined, offsetPlaceholder?: string): string => {
+    const offsetRows = `OFFSET ${offsetPlaceholder ?? '0'} ROWS`;
+    const fetch = limitPlaceholder !== undefined ? ` FETCH NEXT ${limitPlaceholder} ROWS ONLY` : '';
+    const paged = limitPlaceholder !== undefined || offsetPlaceholder !== undefined;
     if (hasOrder) {
       const orderBy = orderEntries
         .map(([k, dir]) => {
@@ -1117,20 +1177,16 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
           return `${a}.${q(col)} ${safeDir}`;
         })
         .join(', ');
-      // FOR JSON permits ORDER BY; OFFSET/FETCH is only needed to apply a LIMIT.
-      return limitPlaceholder !== undefined
-        ? ` ORDER BY ${orderBy} OFFSET 0 ROWS FETCH NEXT ${limitPlaceholder} ROWS ONLY`
-        : ` ORDER BY ${orderBy}`;
+      // FOR JSON permits ORDER BY; OFFSET/FETCH is only needed to page.
+      return paged ? ` ORDER BY ${orderBy} ${offsetRows}${fetch}` : ` ORDER BY ${orderBy}`;
     }
-    if (limitPlaceholder !== undefined) {
-      return ` ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT ${limitPlaceholder} ROWS ONLY`;
-    }
-    return '';
+    // OFFSET/FETCH requires an ORDER BY.
+    return paged ? ` ORDER BY (SELECT NULL) ${offsetRows}${fetch}` : '';
   };
 
   // ----- manyToMany: JOIN target through the junction table -----------------
   if (relDef.type === 'manyToMany') {
-    return buildForJsonManyToMany(dialect, ctx, { colSelect, buildNested, buildPaging, hasLimit });
+    return buildForJsonManyToMany(dialect, ctx, { colSelect, buildNested, buildPaging, bindOffset, hasLimit });
   }
 
   const isToOne = relDef.type === 'belongsTo' || relDef.type === 'hasOne';
@@ -1153,18 +1209,20 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
   }
 
   // ----- hasMany ------------------------------------------------------------
-  const willWrap = hasLimit || hasOrder;
+  const willWrap = hasLimit || hasOrder || hasOffset;
   let nestedCols: string[];
   let extra: string;
   let limitPlaceholder: string | undefined;
+  let offsetPlaceholder: string | undefined;
 
   if (willWrap) {
-    // Wrap order: where → limit → nested.
+    // Wrap order: where → limit → offset → nested.
     extra = ctx.buildWhere(alias);
     if (hasLimit) {
       params.push(Number((spec as { limit?: unknown }).limit));
       limitPlaceholder = dialect.paramPlaceholder(params.length);
     }
+    offsetPlaceholder = bindOffset();
     nestedCols = buildNested(alias);
   } else {
     // Non-wrap order: nested → where (no limit param).
@@ -1174,14 +1232,15 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
 
   const where = extra ? `${correlation} AND ${extra}` : correlation;
   const cols = [...colSelect(alias), ...nestedCols].join(', ');
-  const paging = buildPaging(alias, limitPlaceholder);
+  const paging = buildPaging(alias, limitPlaceholder, offsetPlaceholder);
   return `SELECT ISNULL((SELECT ${cols} FROM ${qTarget} ${alias} WHERE ${where}${paging} FOR JSON PATH, INCLUDE_NULL_VALUES), '[]')`;
 }
 
 interface ForJsonHelpers {
   colSelect(alias: string): string[];
   buildNested(parentAlias: string): string[];
-  buildPaging(alias: string, limitPlaceholder: string | undefined): string;
+  buildPaging(alias: string, limitPlaceholder: string | undefined, offsetPlaceholder?: string): string;
+  bindOffset(): string | undefined;
   hasLimit: boolean;
 }
 
@@ -1226,18 +1285,19 @@ function buildForJsonManyToMany(dialect: Dialect, ctx: RelationSubqueryContext, 
   }
   const correlation = sourceKeys.map((jcol, i) => `${jalias}.${q(jcol)} = ${qParent}.${q(refKeys[i]!)}`).join(' AND ');
 
-  // Param order mirrors collectRelationSubqueryParams: where → limit → nested.
+  // Param order mirrors collectRelationSubqueryParams: where → limit → offset → nested.
   const extra = ctx.buildWhere(alias);
   let limitPlaceholder: string | undefined;
   if (h.hasLimit) {
     params.push(Number((spec as { limit?: unknown }).limit));
     limitPlaceholder = dialect.paramPlaceholder(params.length);
   }
+  const offsetPlaceholder = h.bindOffset();
   const nestedCols = h.buildNested(alias);
 
   const where = extra ? `${correlation} AND ${extra}` : correlation;
   const cols = [...h.colSelect(alias), ...nestedCols].join(', ');
-  const paging = h.buildPaging(alias, limitPlaceholder);
+  const paging = h.buildPaging(alias, limitPlaceholder, offsetPlaceholder);
   return (
     `SELECT ISNULL((SELECT ${cols} FROM ${qTarget} ${alias} ` +
     `JOIN ${qJunction} ${jalias} ON ${joinOn} WHERE ${where}${paging} ` +
@@ -1467,17 +1527,19 @@ export async function introspectMssqlWith(
   }
 
   // ----- Relations -----
+  // One field per column, as the PostgreSQL introspector requires.
+  for (const [tableName, cols] of columnsByTable) assertDistinctColumnFields(tableName, cols);
   const relationsByTable = buildRelationsFromForeignKeys(tableNames, foreignKeys, pkByTable, columnsByTable);
 
   // ----- Assemble TableMetadata -----
-  const tables: Record<string, TableMetadata> = {};
+  const tables: Record<string, TableMetadata> = nullRecord<TableMetadata>();
   for (const tableName of tableNames) {
     const columns = columnsByTable.get(tableName) ?? [];
-    const columnMap: Record<string, string> = {};
-    const reverseColumnMap: Record<string, string> = {};
+    const columnMap: Record<string, string> = nullRecord<string>();
+    const reverseColumnMap: Record<string, string> = nullRecord<string>();
     const dateColumns = new Set<string>();
-    const dialectTypes: Record<string, string> = {};
-    const pgTypes: Record<string, string> = {};
+    const dialectTypes: Record<string, string> = nullRecord<string>();
+    const pgTypes: Record<string, string> = nullRecord<string>();
     const allColumns: string[] = [];
 
     for (const col of columns) {
@@ -1500,7 +1562,7 @@ export async function introspectMssqlWith(
       allColumns,
       primaryKey: pkByTable.get(tableName) ?? [],
       uniqueColumns: uniqueByTable.get(tableName) ?? [],
-      relations: relationsByTable.get(tableName) ?? {},
+      relations: relationsByTable.get(tableName) ?? nullRecord<RelationDef>(),
       indexes: indexesByTable.get(tableName) ?? [],
     };
   }

@@ -108,7 +108,7 @@ describe('a parsed { col } is refused at every operand position', () => {
 
   it('a JSON column still takes { col: "x" } as a JSON value', () => {
     const { sql, params } = accounts().buildFindMany({ where: { meta: { equals: { col: 'id' } } } } as never);
-    assert.match(sql, /"meta" @> \$1/);
+    assert.match(sql, /"meta"::jsonb = \$1::jsonb/);
     assert.deepEqual(params.slice(0, 1), ['{"col":"id"}']);
   });
 });
