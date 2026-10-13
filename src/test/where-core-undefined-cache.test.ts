@@ -1,14 +1,14 @@
 /**
- * `undefined` means absent at every where position, decided by ONE predicate
- * (`isAbsentWhereValue`) that the fingerprint, the SQL build and the cache-hit
- * param collect all read through `walkWhere`.
+ * `undefined` means absent at every where position. The args seam decides it
+ * (it removes the key, and any object that became empty because of it); below
+ * the seam the fingerprint, the SQL build and the cache-hit param collect all
+ * read `walkWhere`, which skips a key holding `undefined` and looks no deeper.
  *
- * The args seam prunes `undefined` before any of this runs, so these tests call
- * the where compiler directly: an internal caller that hands it an unpruned
- * where must still get one cache key per SQL text and a param list that matches
- * the placeholders. The live half drives the public API with the cache
- * cross-check OFF (NODE_ENV=production), which is where a poisoned template
- * would be served silently.
+ * These tests call the where compiler directly, below the seam: an internal
+ * caller that hands it an unpruned where must still get one cache key per SQL
+ * text and a param list that matches the placeholders. The live half drives
+ * the public API with the cache cross-check OFF (NODE_ENV=production), which is
+ * where a poisoned template would be served silently.
  */
 
 import assert from 'node:assert/strict';
@@ -17,44 +17,51 @@ import pg from 'pg';
 import { TurbineClient } from '../client.js';
 import { introspect } from '../introspect.js';
 import { resetCacheCrossCheckEnv } from '../query/builder.js';
-import { isAbsentWhereValue, pruneAbsentKeys } from '../query/filters.js';
+import { dropUndefinedKeys } from '../query/filters.js';
+import * as whereMod from '../query/where.js';
 import type { SchemaMetadata } from '../schema.js';
 import { skipGate } from './helpers.js';
-import { compileWhere, maxPlaceholder } from './where-core-fixture.js';
+import { accounts, compileWhere, ctxOf, maxPlaceholder } from './where-core-fixture.js';
 
 /**
  * [label, where holding undefined, the same where written without it, same
- * cache key]. The last flag is false where what remains compiles to nothing but
- * is still a written shape (a mode-only operator object, an emptied AND): it
- * keeps a cache key of its own. Two keys for one SQL text costs a cache slot;
- * one key for two SQL texts is the bug this suite exists for.
+ * cache key]. The last flag is false where what remains is still a written
+ * shape (an OR member emptied to `{}`): it keeps a cache key of its own. Two
+ * keys for one SQL text costs a cache slot; one key for two SQL texts is the
+ * bug this suite exists for.
  */
 const PAIRS: [string, Record<string, unknown>, Record<string, unknown>, boolean?][] = [
   ['top-level key', { age: undefined, name: 'a' }, { name: 'a' }],
   ['operator key beside a present one', { age: { gte: undefined, lt: 10 } }, { age: { lt: 10 } }],
-  ['operator object made only of undefined', { age: { gte: undefined }, name: 'a' }, { name: 'a' }],
-  [
-    'mode beside an undefined operand',
-    { name: { contains: undefined, mode: 'insensitive' }, age: 1 },
-    { age: 1 },
-    false,
-  ],
-  ['OR member that is all undefined', { OR: [{ age: undefined }, { name: 'a' }] }, { OR: [{ name: 'a' }] }],
-  ['AND member that is all undefined', { AND: [{ age: { gt: undefined } }, { name: 'a' }] }, { AND: [{ name: 'a' }] }],
+  ['OR member that is all undefined', { OR: [{ age: undefined }, { name: 'a' }] }, { OR: [{ name: 'a' }] }, false],
+  ['OR member that is undefined', { OR: [undefined, { name: 'a' }] }, { OR: [{ name: 'a' }] }],
   ['NOT body', { NOT: { age: undefined, name: 'a' } }, { NOT: { name: 'a' } }],
-  ['not operator object', { age: { not: { gt: undefined }, lt: 5 } }, { age: { lt: 5 } }],
   ['inside a not operator object', { age: { not: { gt: 3, lt: undefined } } }, { age: { not: { gt: 3 } } }],
   ['relation filter body', { posts: { some: { title: undefined, id: 1 } } }, { posts: { some: { id: 1 } } }],
-  ['relation filter made only of undefined', { posts: { some: { title: undefined } }, name: 'a' }, { name: 'a' }],
   [
     'relation wrapper beside a present one',
     { posts: { some: undefined, none: { id: 2 } } },
     { posts: { none: { id: 2 } } },
   ],
+  ['relation filter whose wrappers are all undefined', { posts: { some: undefined }, name: 'a' }, { name: 'a' }],
   ['bare to-one relation body', { profile: { bio: undefined, id: 4 } }, { profile: { id: 4 } }],
   ['JSON filter key', { meta: { path: ['a'], equals: 1, gt: undefined } }, { meta: { path: ['a'], equals: 1 } }],
   ['array filter key', { tags: { has: 'x', hasSome: undefined } }, { tags: { has: 'x' } }],
   ['nested combinators', { OR: [{ AND: [{ age: undefined }] }, { name: 'b' }] }, { OR: [{ name: 'b' }] }, false],
+];
+
+/**
+ * Shapes the args seam removes whole (an operator object, or a relation
+ * filter body, emptied by `undefined`). Below the seam the walk reads only
+ * `undefined` itself, so these keep a meaning of their own: an operator object
+ * naming no operator is refused, and an emptied relation body is the bare
+ * relation filter. Either way build, collect and fingerprint agree.
+ */
+const BELOW_SEAM_REFUSED: [string, Record<string, unknown>][] = [
+  ['operator object made only of undefined', { age: { gte: undefined }, name: 'a' }],
+  ['mode beside an undefined operand', { name: { contains: undefined, mode: 'insensitive' }, age: 1 }],
+  ['AND member holding an emptied operator object', { AND: [{ age: { gt: undefined } }, { name: 'a' }] }],
+  ['not operator object made only of undefined', { age: { not: { gt: undefined }, lt: 5 } }],
 ];
 
 describe('where compiler: undefined is absent at every position', () => {
@@ -80,8 +87,23 @@ describe('where compiler: undefined is absent at every position', () => {
     assert.deepEqual(highMissing.collectParams, [5]);
   });
 
+  for (const [label, where] of BELOW_SEAM_REFUSED) {
+    it(`${label}: refused below the seam, on build and on a cache-hit collect`, () => {
+      const ctx = ctxOf(accounts());
+      assert.throws(() => whereMod.buildWhereClause(ctx, where, []), /names no operator/);
+      assert.throws(() => whereMod.collectWhereParams(ctx, where, []), /names no operator/);
+    });
+  }
+
+  it('a relation body emptied by undefined is the bare relation filter, consistently', () => {
+    const a = compileWhere({ posts: { some: { title: undefined } }, name: 'a' });
+    assert.match(a.sql ?? '', /EXISTS/);
+    assert.deepEqual(a.collectParams, a.buildParams);
+    assert.equal(maxPlaceholder(a.sql), a.collectParams.length);
+    assert.notEqual(a.fingerprint, compileWhere({ name: 'a' }).fingerprint);
+  });
+
   it('an object written empty is not absent: it keeps its refusal', () => {
-    assert.equal(isAbsentWhereValue({}), false);
     assert.throws(() => compileWhere({ age: {} }), /Empty filter object on "age" for table "accounts"/);
   });
 
@@ -89,12 +111,12 @@ describe('where compiler: undefined is absent at every position', () => {
     assert.throws(() => compileWhere({ age: { in: [1, undefined] } }), /Invalid element in 'in' on "age"/);
   });
 
-  it('pruneAbsentKeys returns its input by reference when nothing is absent', () => {
+  it('dropUndefinedKeys returns its input by reference when nothing is undefined', () => {
     const where = { age: { gt: 1 }, OR: [{ name: 'a' }] };
-    assert.equal(pruneAbsentKeys(where), where);
+    assert.equal(dropUndefinedKeys(where), where);
     const brand = Symbol.for('where-core.test.brand');
     const branded = { age: 1, name: undefined, [brand]: true };
-    const pruned = pruneAbsentKeys(branded);
+    const pruned = dropUndefinedKeys(branded);
     assert.notEqual(pruned, branded);
     assert.deepEqual(Object.keys(pruned), ['age']);
     assert.equal((pruned as Record<symbol, unknown>)[brand], true, 'symbol brands survive the copy');

@@ -100,7 +100,7 @@ describe('operand validation: accepted', () => {
     ['null equality', { age: null }],
     ['equals null / not null', { age: { equals: null }, score: { not: null } }],
     ['in with a null element', { age: { in: [1, null] } }],
-    ['mode-only operator object (optional search)', { name: { mode: 'insensitive' } }],
+    ['mode beside an operator', { name: { contains: 'x', mode: 'insensitive' } }],
     ['JSON value on a JSON column', { meta: { a: 1 } }],
     ['array on an array column', { tags: ['a', 'b'] }],
     ['column reference', { age: { lte: col('score') } }],

@@ -380,12 +380,15 @@ describe('PII guard symmetry: distinct, string and nested-array forms', () => {
     assert.equal(authorsMeta.columnMap[key], HIDDEN_COL);
   });
 
-  it('both forms compile to byte-identical SQL naming the hidden column', () => {
+  it('the builder compiles the string form naming the hidden column and refuses the nested-array form', () => {
     const a = compile({ distinct: [HIDDEN] }, 'authors');
-    const b = compile({ distinct: [[HIDDEN]] }, 'authors');
     assert.match(a.sql, new RegExp(`DISTINCT ON \\("${HIDDEN_COL}"\\)`));
-    assert.equal(b.sql, a.sql, 'the nested-array form is the same query, so it must get the same verdict');
-    assert.deepEqual(b.params, a.params);
+    // A field list holds field names, so the builder refuses `[name]` (E003)
+    // rather than coercing it to `name`; the guard refuses it too (below).
+    assert.throws(
+      () => compile({ distinct: [[HIDDEN]] }, 'authors'),
+      /`distinct` on table "authors" takes field names, but element 0 is an array/,
+    );
   });
 
   it('refuses the string form', () => {

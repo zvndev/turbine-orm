@@ -15,10 +15,9 @@
  *
  * This module removes the drift BY CONSTRUCTION:
  *   - {@link walkWhere} is the ONE enumeration. It sorts keys canonically,
- *     drops absent values (`undefined`, and objects made only of them, see
- *     {@link isAbsentWhereValue}), dispatches the `OR`/`AND`/`NOT` combinators
- *     and relation filters, and yields a flat, ordered {@link WhereEvent}
- *     stream whose values are already pruned. All three consumers iterate this
+ *     skips `undefined` values, applies the one combinator-shape rule
+ *     ({@link combinatorBranches}), dispatches relation filters, and yields a
+ *     flat, ordered {@link WhereEvent} stream. All three consumers iterate this
  *     same stream, so their key order, combinator structure and view of
  *     `undefined` can never diverge.
  *   - {@link classifyScalarForSql} is the ONE scalar-shape decision the SQL
@@ -39,26 +38,28 @@
 import { ValidationError } from '../errors.js';
 import type { RelationDef, TableMetadata } from '../schema.js';
 import {
-  dropAbsentKeys,
+  describeOperand,
+  dropUndefinedKeys,
   findArrayUniqueKey,
   findJsonUniqueKey,
   fingerprintArrayFilterShape,
   fingerprintJsonFilterShape,
   fingerprintOperatorShape,
-  isAbsentWhereValue,
   isArrayFilter,
   isJsonFilter,
+  isPlainRecord,
   isTextSearchFilter,
   isUnmatchedPlainObject,
   isVectorFilter,
   isWhereOperator,
-  pruneAbsentKeys,
+  operandColumnKind,
+  RELATION_FILTER_WRAPPER_SET,
   RELATION_FILTER_WRAPPERS,
   sortedKeys,
   VECTOR_DISTANCE_COMPARATORS,
 } from './filters.js';
 import type { ArrayFilter, JsonFilter, TextSearchFilter, VectorFilter } from './types.js';
-import { resolveRelation } from './utils.js';
+import { resolveColumnName, resolveRelation } from './utils.js';
 
 /** A table-scoped WHERE object (or an `OR`/`AND`/`NOT` branch of one). */
 export type WhereRecord = Record<string, unknown>;
@@ -147,8 +148,13 @@ export type ScalarSqlClass =
  * as before.
  */
 export type WhereEvent =
-  | { kind: 'or'; conditions: WhereRecord[] }
-  | { kind: 'and'; conditions: WhereRecord[] }
+  | { kind: 'or'; conditions: readonly WhereRecord[] }
+  /**
+   * `fixedArity` marks an `AND` written as one object (`AND: { ... }`): its
+   * SQL has one branch whatever the caller sends, so it need not give up the
+   * prepared-statement name a caller-sized array does.
+   */
+  | { kind: 'and'; conditions: readonly WhereRecord[]; fixedArity?: true }
   | { kind: 'not'; condition: WhereRecord }
   | { kind: 'relation'; key: string; relDef: RelationDef; filterObj: WhereRecord }
   | { kind: 'scalar'; key: string; value: unknown };
@@ -158,44 +164,164 @@ function isRelationFilterObj(filterObj: WhereRecord): boolean {
   return RELATION_FILTER_WRAPPERS.some((wrapper) => wrapper in filterObj);
 }
 
-/** `OR` / `AND` members with the absent ones removed (by reference when none are). */
-function presentConditions(arr: WhereRecord[]): WhereRecord[] {
-  return arr.some((cond) => isAbsentWhereValue(cond)) ? arr.filter((cond) => !isAbsentWhereValue(cond)) : arr;
+/**
+ * The refusal for a relation filter not made of the relation-filter keys. The
+ * SQL is built from those keys alone, so anything else beside them (a typo such
+ * as `sum` for `some`, or `iz` for `is`) would be dropped and the filter would
+ * match more rows than written; inside a global filter that is a tenancy
+ * condition silently not applied. Same rule and wording as the PowDB engine.
+ */
+function relationFilterShapeError(table: string, key: string, rel: RelationDef, detail: string): ValidationError {
+  return new ValidationError(
+    `Invalid relation filter "${key}" on "${table}": ${detail}. ` +
+      (rel.type === 'belongsTo' || rel.type === 'hasOne'
+        ? 'A to-one relation takes `{ is: {...} }`, `{ isNot: {...} }`, a bare where object, or `is: null`.'
+        : 'A to-many relation takes `{ some: {...} }`, `{ none: {...} }` or `{ every: {...} }`.'),
+  );
+}
+
+function unrecognizedKeys(keys: string[]): string {
+  return `unrecognized key ${keys.map((k) => `"${k}"`).join(', ')}`;
+}
+
+/** Throws unless every key of a relation filter is a relation-filter key. */
+function assertRelationFilterKeys(table: string, key: string, rel: RelationDef, filterObj: WhereRecord): void {
+  for (const k in filterObj) {
+    if (RELATION_FILTER_WRAPPER_SET.has(k)) continue;
+    const unknown = Object.keys(filterObj).filter((name) => !RELATION_FILTER_WRAPPER_SET.has(name));
+    throw relationFilterShapeError(table, key, rel, unrecognizedKeys(unknown));
+  }
+}
+
+/** The where combinators. */
+export type CombinatorKey = 'AND' | 'OR' | 'NOT';
+
+/**
+ * THE combinator-shape rule, shared by every walker over a where (or having)
+ * clause: the SQL walk below, `having`, and the `globalFilters` check at
+ * construction. Returns the branches `value` stands for, or throws
+ * {@link ValidationError} (E003).
+ *
+ *   - `AND` and `NOT` take one where object (a single branch) or an array of
+ *     them; `OR` takes an array. This is Prisma's shape.
+ *   - Anything else is refused by name: `OR: { ... }`, a string, a number,
+ *     `null`, and an array holding one of those. A combinator the compiler
+ *     cannot read would compile to nothing, so a mistyped filter, or a
+ *     tenant filter built as `{ OR: { orgId } }`, would match every row.
+ *   - An `undefined` member is absent and is dropped. When every member was
+ *     `undefined` the combinator itself is absent and this returns `null`, the
+ *     same reading the args seam gives it.
+ *
+ * An array written empty is returned empty; what that means is the caller's
+ * rule (in a where clause: `OR: []` matches nothing, `AND: []` and `NOT: []`
+ * apply no condition). Returns the input array by reference when it holds no
+ * `undefined`, so the common path allocates nothing.
+ */
+export function combinatorBranches(
+  key: CombinatorKey,
+  value: unknown,
+  table: string,
+  clause: 'where' | 'having' = 'where',
+): readonly WhereRecord[] | null {
+  if (value === undefined) return null;
+  if (Array.isArray(value)) {
+    let holes = 0;
+    for (let i = 0; i < value.length; i++) {
+      const branch = value[i];
+      if (branch === undefined) holes++;
+      else if (!isPlainRecord(branch)) throw combinatorShapeError(key, table, clause, branch, i);
+    }
+    if (holes === 0) return value as WhereRecord[];
+    if (holes === value.length) return null;
+    return (value as unknown[]).filter((branch) => branch !== undefined) as WhereRecord[];
+  }
+  if (key !== 'OR' && isPlainRecord(value)) return [value];
+  throw combinatorShapeError(key, table, clause, value);
+}
+
+function combinatorShapeError(
+  key: CombinatorKey,
+  table: string,
+  clause: 'where' | 'having',
+  received: unknown,
+  index?: number,
+): ValidationError {
+  const takes = key === 'OR' ? `an array of ${clause} objects` : `a ${clause} object or an array of them`;
+  const got =
+    index === undefined ? `received ${describeOperand(received)}` : `element ${index} is ${describeOperand(received)}`;
+  const hint =
+    key === 'OR' && index === undefined && isPlainRecord(received)
+      ? ' Wrap the object in an array: `OR: [{ ... }]`.'
+      : ' A combinator the query cannot read would otherwise apply no condition at all.';
+  return new ValidationError(`\`${key}\` in the ${clause} clause on table "${table}" takes ${takes}; ${got}.${hint}`);
 }
 
 /**
- * THE canonical WHERE enumeration. Yields events in sorted-key order, skipping
- * absent values, dispatching combinators and relation filters, so every
- * consumer (fingerprint, SQL build, param collect) walks identically.
+ * The event `OR: []` compiles to: a predicate on the table's own key that no
+ * row satisfies (`<pk> IN ()`, bound as an empty list), so an `OR` built from
+ * an empty list matches nothing, as in Prisma, instead of everything. It
+ * reuses the `in` operator every engine already binds as one length-independent
+ * placeholder, so the statement keeps one fixed shape and the three consumers
+ * stay in step with no special case.
+ */
+function matchNothingEvent(host: WhereHost): WhereEvent {
+  const meta = host.tableMeta;
+  for (const column of [...(meta.primaryKey ?? []), ...(meta.allColumns ?? [])]) {
+    if (operandColumnKind(host.getColumnPgType(column)) !== 'scalar') continue;
+    return { kind: 'scalar', key: meta.reverseColumnMap?.[column] ?? column, value: { in: [] } };
+  }
+  throw new ValidationError(
+    `\`OR: []\` on table "${meta.name}" matches no row, and expressing that needs one plain column of the ` +
+      'table, but its schema metadata lists none. Regenerate the client (`npx turbine generate`), or leave ' +
+      'the empty `OR` out of the query.',
+  );
+}
+
+/**
+ * THE canonical WHERE enumeration. Yields events in sorted-key order,
+ * dispatching combinators and relation filters, so every consumer
+ * (fingerprint, SQL build, param collect) walks identically.
  *
- * `undefined` means absent at every key and depth, the same rule the args seam
- * applies, and decided HERE so the three consumers cannot disagree about it: a
- * key whose value is absent is skipped, an absent `OR` / `AND` member is
- * dropped, a relation wrapper whose body is absent is dropped, and a scalar
- * value reaches its consumer with its absent keys pruned
- * ({@link pruneAbsentKeys}). An object written empty is left as written.
+ * `undefined`: the args seam is the authority and removes it, with every
+ * object it emptied, before any of this runs. This walk is the backstop for
+ * callers below the seam and reads only `undefined` itself: a key holding it
+ * is skipped, a combinator member holding it is dropped, and a relation filter
+ * whose wrapper keys all hold it is absent. Values are never looked inside, so
+ * a JSON operand is data whatever its shape.
  *
- * Combinator SKIP rules: an `OR`/`AND` whose value is a non-array or an empty
- * array (after absent members are dropped) is skipped entirely (it contributes
- * neither SQL, params, nor a fingerprint token); a present `NOT` is always
- * emitted. A key that names a relation but whose value is not a `{ some/every/
- * none/is/isNot }` filter falls through to the scalar path.
+ * Combinators follow {@link combinatorBranches}. `AND` and `NOT` with no
+ * branches apply no condition; `OR` with none matches no row
+ * ({@link matchNothingEvent}). A `NOT` array negates each branch (`NOT a AND
+ * NOT b`), as Prisma does; a `NOT` object negates the object as a whole. A key
+ * that names a relation takes only the relation-filter keys (a to-one relation
+ * also takes a bare where object, read as `is`), and any other key is refused
+ * (E003). Only when the key also names a column, and its object names no
+ * relation-filter key, is it that column's filter.
  */
 export function walkWhere(host: WhereHost, where: WhereRecord): WhereEvent[] {
   const events: WhereEvent[] = [];
   for (const key of sortedKeys(where)) {
     const value = where[key];
-    if (isAbsentWhereValue(value)) continue;
+    if (value === undefined) continue;
 
-    if (key === 'OR' || key === 'AND') {
-      if (!Array.isArray(value)) continue;
-      const conditions = presentConditions(value as WhereRecord[]);
-      if (conditions.length === 0) continue;
-      events.push({ kind: key === 'OR' ? 'or' : 'and', conditions });
-      continue;
-    }
-    if (key === 'NOT') {
-      events.push({ kind: 'not', condition: value as WhereRecord });
+    if (key === 'OR' || key === 'AND' || key === 'NOT') {
+      const branches = combinatorBranches(key, value, host.tableMeta.name);
+      if (branches === null) continue;
+      if (key === 'OR') {
+        events.push(branches.length === 0 ? matchNothingEvent(host) : { kind: 'or', conditions: branches });
+      } else if (branches.length === 0) {
+        // `AND: []` and `NOT: []` apply no condition.
+      } else if (key === 'AND') {
+        events.push(
+          Array.isArray(value)
+            ? { kind: 'and', conditions: branches }
+            : { kind: 'and', conditions: branches, fixedArity: true },
+        );
+      } else if (!Array.isArray(value)) {
+        events.push({ kind: 'not', condition: branches[0]! });
+      } else {
+        events.push({ kind: 'and', conditions: branches.map((branch) => ({ NOT: branch })) });
+      }
       continue;
     }
 
@@ -205,15 +331,25 @@ export function walkWhere(host: WhereHost, where: WhereRecord): WhereEvent[] {
     // these events), so resolving here cannot drift between them; the emitted
     // event carries the DECLARED name, which is what reaches the fingerprint.
     const resolvedRel = resolveRelation(host.tableMeta.relations, key);
-    if (resolvedRel && typeof value === 'object' && value !== null && !Array.isArray(value)) {
-      const filterObj = host.normalizeRelationFilter(resolvedRel.def, dropAbsentKeys(value as WhereRecord));
+    if (resolvedRel && isPlainRecord(value)) {
+      const present = dropUndefinedKeys(value);
+      if (present !== value && Object.keys(present).length === 0) continue;
+      const filterObj = host.normalizeRelationFilter(resolvedRel.def, present);
       if (isRelationFilterObj(filterObj)) {
+        assertRelationFilterKeys(host.tableMeta.name, key, resolvedRel.def, filterObj);
         events.push({ kind: 'relation', key: resolvedRel.name, relDef: resolvedRel.def, filterObj });
         continue;
       }
+      // A to-many relation's object names none of its quantifiers. It is a
+      // column filter only when the key also names a column.
+      if (resolveColumnName(host.tableMeta, key) === undefined) {
+        const keys = Object.keys(filterObj);
+        const detail = keys.length === 0 ? 'the filter object is empty' : unrecognizedKeys(keys);
+        throw relationFilterShapeError(host.tableMeta.name, key, resolvedRel.def, detail);
+      }
     }
 
-    events.push({ kind: 'scalar', key, value: pruneAbsentKeys(value) });
+    events.push({ kind: 'scalar', key, value });
   }
   return events;
 }

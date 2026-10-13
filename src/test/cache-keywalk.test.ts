@@ -194,10 +194,12 @@ describe('key-walk: OR / AND / NOT nesting stays in lockstep', () => {
     );
   });
 
-  it('empty OR / AND arrays are skipped identically', () => {
-    assert.equal(fp({ OR: [], age: 1 }), fp({ age: 1 }));
+  it('an empty AND is skipped; an empty OR matches no row and keys apart', () => {
     assert.equal(fp({ AND: [], age: 1 }), fp({ age: 1 }));
-    assertCacheStable({ OR: [], age: 1 }, { AND: [], age: 2 });
+    assert.equal(fp({ NOT: [], age: 1 }), fp({ age: 1 }));
+    assertCacheStable({ NOT: [], age: 1 }, { AND: [], age: 2 });
+    assert.notEqual(fp({ OR: [], age: 1 }), fp({ age: 1 }));
+    assertCacheStable({ OR: [], age: 1 }, { OR: [], age: 2 });
   });
 });
 

@@ -1,67 +1,40 @@
 /**
  * `undefined` means absent, decided ONCE at the args seam.
  *
- * Every public operation (and its `build*` twin) runs its caller args through
+ * Every public operation (and its `build*` twin) runs its args through
  * {@link pruneUndefinedArgs} before anything else reads them: the empty-`where`
  * guards, the SQL-cache fingerprint, the SQL build and the param collect. A key
- * whose value is `undefined` is removed, and an object that BECOMES empty
- * because every key in it was `undefined` is removed too, recursively, so
- * `{ user: { email: undefined } }` is exactly `{}`.
+ * whose value is `undefined` is removed, and so is an object (or combinator
+ * array) that BECOMES empty because of it, recursively, so
+ * `{ user: { email: undefined } }` is exactly `{}`. One pass up front, because
+ * consumers that each decide what `undefined` means end up disagreeing: a cache
+ * key that counted `{ gte: undefined }` while the builder skipped it served a
+ * `<=` template to a `>=` call.
  *
- * Why one pass up front rather than a rule in each walker: the fingerprint, the
- * build and the collect each decided for themselves what an `undefined` operand
- * meant, and they disagreed. A fingerprint that counted `{ gte: undefined }` as
- * a `gte` and a builder that skipped it let a cached `<=` template serve a `>=`
- * call. A relation filter whose every value was `undefined` compiled to a bare
- * correlation `EXISTS`, which is non-empty, so the mutation guard let it through
- * as a predicate. After this pass none of those consumers ever sees an
- * `undefined` in a pruned position, so they cannot disagree about it.
+ * Pruned positions: `where` (combinators, relation filters, column operator
+ * objects including a nested `not`), `having`, `cursor`, `orderBy`, and every
+ * `with` relation's `where` / `orderBy`. Never `data` / `create` / `update`
+ * (a json column may legitimately receive `{}`), never an operand value (an
+ * `in` list, a JSON document, a vector), and never an object written empty
+ * (`{}`, `{ OR: [] }`), which keeps its own meaning. A column operator object
+ * left holding only modifiers (`mode`, `path`, `config`) is removed too:
+ * `{ contains: q, mode: 'insensitive' }` with `q` undefined is no filter.
  *
- * ## Positions pruned
- *
- * `where` (top level, `AND` / `OR` / `NOT`, relation filters `some` / `every` /
- * `none` / `is` / `isNot` and bare to-one relation objects, column operator
- * objects including a nested `not`), `having`, `cursor`, `orderBy` entries, and
- * every `with` relation's `where` / `orderBy` at any depth. Nothing else: `data`,
- * `create` and `update` keep their own "an undefined column is skipped" rule and
- * are never touched, because a json column may legitimately receive `{}`.
- *
- * ## What is NOT pruned
- *
- * An object that was ALREADY empty as written (`{}`, `{ user: {} }`,
- * `{ OR: [] }`) is left exactly as written, so the existing rules for those
- * shapes keep applying. Operand VALUES are never walked: `in: [...]`, an
- * `equals` JSON document, a vector, a path.
- *
- * A column operator object whose remaining keys are only modifiers (`mode`,
- * `path`, `config`) after stripping is removed as well: `{ contains: q, mode:
- * 'insensitive' }` with `q` undefined is an absent filter, not a modifier with
- * nothing to modify.
- *
- * ## Shape
- *
- * Returns the input BY REFERENCE when nothing was `undefined`, so the common
- * path allocates nothing. A top-level `where` / `having` that is emptied becomes
- * `{}` (every consumer reads that as "no predicate"); an emptied top-level
- * `cursor` or `orderBy` is removed.
- *
- * The PowDB engine runs the same function from `PowqlInterface.normalizeArgs`,
- * so the two engines cannot disagree about what `undefined` means.
+ * PowDB runs the same function from `PowqlInterface.normalizeArgs`, so the
+ * two engines cannot disagree about what `undefined` means.
  *
  * @module
  */
 
 import { ValidationError } from '../errors.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
+import { isPlainRecord, RELATION_FILTER_WRAPPER_SET } from './filters.js';
 import { resolveColumnName, resolveRelation } from './utils.js';
 import { MAX_WHERE_DEPTH } from './where-compile.js';
 
 /** Sentinel for "remove this key / element". Never escapes this module. */
 const REMOVE: unique symbol = Symbol('turbine.prune.remove');
 type Pruned<V> = V | typeof REMOVE;
-
-/** Relation filter keys whose value is a where clause on the relation's target. */
-const RELATION_FILTER_KEYS = new Set(['some', 'every', 'none', 'is', 'isNot']);
 
 /** Keys that qualify an operator rather than state one. */
 const MODIFIER_KEYS = new Set(['mode', 'path', 'config']);
@@ -73,13 +46,6 @@ const MODIFIER_KEYS = new Set(['mode', 'path', 'config']);
  * it never lets an unbounded walk through.
  */
 const PRUNE_DEPTH_LIMIT = MAX_WHERE_DEPTH + 2;
-
-/** A plain object literal: not an array, Date, Buffer, typed array or class instance. */
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) return false;
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
 
 function hasNoKeys(obj: Record<string, unknown>): boolean {
   for (const _ in obj) return false;
@@ -132,7 +98,7 @@ function pruneWhere(
       next = REMOVE;
     } else if (key === 'AND' || key === 'OR' || key === 'NOT') {
       next = pruneCombinator(schema, meta, value, depth + 1);
-    } else if (isPlainObject(value)) {
+    } else if (isPlainRecord(value)) {
       next = pruneField(schema, meta, key, value, depth + 1);
     }
     if (next !== value) out = withKey(out, where, key, next);
@@ -140,7 +106,11 @@ function pruneWhere(
   return out ?? where;
 }
 
-/** `AND` / `OR` / `NOT`: an object, or an array of objects. */
+/**
+ * `AND` / `OR` / `NOT`: an object, or an array of objects. An `undefined`
+ * member is removed like an emptied one; any other non-object member is left
+ * for the where walk, which refuses it by name (`combinatorBranches`).
+ */
 function pruneCombinator(
   schema: SchemaMetadata,
   meta: TableMetadata | undefined,
@@ -151,20 +121,21 @@ function pruneCombinator(
     let out: unknown[] | undefined;
     for (let i = 0; i < value.length; i++) {
       const element = value[i];
-      if (!isPlainObject(element)) {
-        out?.push(element);
-        continue;
+      let next: unknown = element;
+      if (element === undefined) {
+        next = REMOVE;
+      } else if (isPlainRecord(element)) {
+        const pruned = pruneWhere(schema, meta, element, depth);
+        next = pruned !== element && hasNoKeys(pruned) ? REMOVE : pruned;
       }
-      const next = pruneWhere(schema, meta, element, depth);
-      const emptied = next !== element && hasNoKeys(next);
       if (next !== element && !out) out = value.slice(0, i);
-      if (out && !emptied) out.push(next);
+      if (out && next !== REMOVE) out.push(next);
     }
     if (!out) return value;
-    // Every element was emptied: the combinator itself said nothing.
-    return out.length === 0 && value.length > 0 ? REMOVE : out;
+    // Every element was removed: the combinator itself said nothing.
+    return out.length === 0 ? REMOVE : out;
   }
-  if (isPlainObject(value)) {
+  if (isPlainRecord(value)) {
     const next = pruneWhere(schema, meta, value, depth);
     return next !== value && hasNoKeys(next) ? REMOVE : next;
   }
@@ -197,7 +168,7 @@ function pruneRelationFilter(
   const target = schema.tables[def.to];
   let hasCardinalityKey = false;
   for (const k of Object.keys(value)) {
-    if (RELATION_FILTER_KEYS.has(k)) {
+    if (RELATION_FILTER_WRAPPER_SET.has(k)) {
       hasCardinalityKey = true;
       break;
     }
@@ -213,7 +184,7 @@ function pruneRelationFilter(
     let next: unknown = v;
     if (v === undefined) {
       next = REMOVE;
-    } else if (RELATION_FILTER_KEYS.has(k) && isPlainObject(v)) {
+    } else if (RELATION_FILTER_WRAPPER_SET.has(k) && isPlainRecord(v)) {
       const pruned = pruneWhere(schema, target, v, depth);
       next = pruned !== v && hasNoKeys(pruned) ? REMOVE : pruned;
     }
@@ -237,16 +208,13 @@ function pruneOperatorObject(value: Record<string, unknown>, walkNot: boolean): 
     if (v === undefined) {
       next = REMOVE;
     } else if ((k === 'not' && walkNot) || k === 'distance') {
-      if (isPlainObject(v)) next = pruneOperatorObject(v, walkNot);
+      if (isPlainRecord(v)) next = pruneOperatorObject(v, walkNot);
     }
     if (next !== v) out = withKey(out, value, k, next);
   }
   if (!out) return value;
-  for (const k of Object.keys(out)) {
-    if (!MODIFIER_KEYS.has(k)) return out;
-  }
   // Nothing but modifiers (or nothing at all) survived.
-  return REMOVE;
+  return onlyModifiers(out) ? REMOVE : out;
 }
 
 // ---------------------------------------------------------------------------
@@ -255,32 +223,50 @@ function pruneOperatorObject(value: Record<string, unknown>, walkNot: boolean): 
 
 /**
  * Structural prune for positions whose values carry no JSON operands (`having`
- * aggregate filters, orderBy entries): strip `undefined` at every plain-object
- * level, drop emptied objects and emptied plain-object array elements. Arrays of
+ * filters, orderBy entries): strip `undefined` at every plain-object level,
+ * drop emptied objects and emptied (or `undefined`) array elements. Arrays of
  * scalars (a vector, a JSON path) are values and are left alone.
+ *
+ * `having` also drops an object stripped down to modifiers alone, the same
+ * rule `where` applies to a column operator object. orderBy does not: a
+ * JSON-path ordering is `{ path }` plus an optional direction.
  */
-function pruneStructural(value: unknown, depth: number): Pruned<unknown> {
+function pruneStructural(value: unknown, depth: number, dropModifierOnly: boolean): Pruned<unknown> {
   if (depth > PRUNE_DEPTH_LIMIT) return value;
   if (Array.isArray(value)) {
     let out: unknown[] | undefined;
     for (let i = 0; i < value.length; i++) {
       const element = value[i];
-      const next = isPlainObject(element) ? pruneStructural(element, depth + 1) : element;
+      const next =
+        element === undefined
+          ? REMOVE
+          : isPlainRecord(element)
+            ? pruneStructural(element, depth + 1, dropModifierOnly)
+            : element;
       if (next !== element && !out) out = value.slice(0, i);
       if (out && next !== REMOVE) out.push(next);
     }
     if (!out) return value;
-    return out.length === 0 && value.length > 0 ? REMOVE : out;
+    return out.length === 0 ? REMOVE : out;
   }
-  if (!isPlainObject(value)) return value;
+  if (!isPlainRecord(value)) return value;
   let out: Record<string, unknown> | undefined;
   for (const k of Object.keys(value)) {
     const v = value[k];
-    const next = v === undefined ? REMOVE : pruneStructural(v, depth + 1);
+    const next = v === undefined ? REMOVE : pruneStructural(v, depth + 1, dropModifierOnly);
     if (next !== v) out = withKey(out, value, k, next);
   }
   if (!out) return value;
-  return hasNoKeys(out) ? REMOVE : out;
+  if (hasNoKeys(out) || (dropModifierOnly && onlyModifiers(out))) return REMOVE;
+  return out;
+}
+
+/** True when every key left is a modifier. */
+function onlyModifiers(obj: Record<string, unknown>): boolean {
+  for (const k of Object.keys(obj)) {
+    if (!MODIFIER_KEYS.has(k)) return false;
+  }
+  return true;
 }
 
 /** A cursor's values are scalars: only its own keys are stripped. */
@@ -306,7 +292,7 @@ function pruneWith(
     let next: unknown = spec;
     if (spec === undefined) {
       next = REMOVE;
-    } else if (key !== '_count' && isPlainObject(spec)) {
+    } else if (key !== '_count' && isPlainRecord(spec)) {
       const relation = meta ? resolveRelation(meta.relations, key) : undefined;
       next = pruneWithOptions(schema, relation ? schema.tables[relation.def.to] : undefined, spec, depth + 1);
     }
@@ -328,12 +314,12 @@ function pruneWithOptions(
     let next: unknown = v;
     if (v === undefined) {
       next = REMOVE;
-    } else if (k === 'where' && isPlainObject(v)) {
+    } else if (k === 'where' && isPlainRecord(v)) {
       const pruned = pruneWhere(schema, target, v, depth);
       next = pruned !== v && hasNoKeys(pruned) ? REMOVE : pruned;
     } else if (k === 'orderBy') {
-      next = pruneStructural(v, depth);
-    } else if (k === 'with' && isPlainObject(v)) {
+      next = pruneStructural(v, depth, false);
+    } else if (k === 'with' && isPlainRecord(v)) {
       next = pruneWith(schema, target, v, depth);
     }
     if (next !== v) out = withKey(out, spec, k, next);
@@ -342,6 +328,57 @@ function pruneWithOptions(
   // still loads the relation, which is what `{ posts: { where: undefined } }`
   // asked for.
   return out ?? spec;
+}
+
+// ---------------------------------------------------------------------------
+// Pre-scan
+// ---------------------------------------------------------------------------
+
+/**
+ * Operand keys whose ARRAY value is a list of values (an `in` list, a JSON
+ * path, a vector). The prune never edits one, and they can be long, so the
+ * pre-scan does not read them. An object under one of these names is still
+ * scanned: it is a column called `to` or `path`, not an operand.
+ */
+const OPERAND_LIST_KEYS: ReadonlySet<string> = new Set(['in', 'notIn', 'has', 'hasSome', 'hasEvery', 'path', 'to']);
+
+/** Past this the pre-scan answers yes and lets the prune, which has its own bound, decide. */
+const SCAN_DEPTH_LIMIT = 4 * MAX_WHERE_DEPTH;
+
+/**
+ * Whether `value` holds an `undefined` the prune might remove. Read-only and
+ * schema-blind, so a call with nothing undefined (nearly every call) costs one
+ * pass and no allocation before {@link pruneUndefinedArgs} returns its input.
+ * It may answer yes for an `undefined` the prune leaves in place (inside a JSON
+ * document); that only costs the prune's own walk.
+ */
+function holdsUndefined(value: object, depth: number): boolean {
+  if (depth > SCAN_DEPTH_LIMIT) return true;
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const element: unknown = value[i];
+      if (element === undefined) return true;
+      if (typeof element === 'object' && element !== null && holdsUndefined(element, depth + 1)) return true;
+    }
+    return false;
+  }
+  // A class instance is a bound value, never walked (the isPlainRecord rule).
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return false;
+  const record = value as Record<string, unknown>;
+  for (const key in record) {
+    const v = record[key];
+    if (v === undefined) return true;
+    if (typeof v !== 'object' || v === null) continue;
+    if (Array.isArray(v) && OPERAND_LIST_KEYS.has(key)) continue;
+    if (holdsUndefined(v, depth + 1)) return true;
+  }
+  return false;
+}
+
+/** {@link holdsUndefined} for one top-level argument, which may be absent or a scalar. */
+function argHoldsUndefined(value: unknown): boolean {
+  return typeof value === 'object' && value !== null && holdsUndefined(value, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -356,33 +393,42 @@ function pruneWithOptions(
  * resolved against `schema` so each sub-where is pruned against its own target.
  */
 export function pruneUndefinedArgs<A>(schema: SchemaMetadata, table: string, args: A): A {
-  if (!isPlainObject(args)) return args;
-  const meta = schema.tables[table];
+  if (!isPlainRecord(args)) return args;
   const src = args as Record<string, unknown>;
+  if (
+    !argHoldsUndefined(src.where) &&
+    !argHoldsUndefined(src.having) &&
+    !argHoldsUndefined(src.cursor) &&
+    !argHoldsUndefined(src.orderBy) &&
+    !argHoldsUndefined(src.with)
+  ) {
+    return args;
+  }
+  const meta = schema.tables[table];
   let out: Record<string, unknown> | undefined;
 
   const where = src.where;
-  if (isPlainObject(where)) {
+  if (isPlainRecord(where)) {
     const next = pruneWhere(schema, meta, where, 0);
     if (next !== where) out = withKey(out, src, 'where', next);
   }
   const having = src.having;
-  if (isPlainObject(having)) {
-    const next = pruneStructural(having, 0);
+  if (isPlainRecord(having)) {
+    const next = pruneStructural(having, 0, true);
     if (next !== having) out = withKey(out, src, 'having', next === REMOVE ? {} : next);
   }
   const cursor = src.cursor;
-  if (isPlainObject(cursor)) {
+  if (isPlainRecord(cursor)) {
     const next = pruneCursor(cursor);
     if (next !== cursor) out = withKey(out, src, 'cursor', next);
   }
   const orderBy = src.orderBy;
-  if (orderBy !== undefined && (isPlainObject(orderBy) || Array.isArray(orderBy))) {
-    const next = pruneStructural(orderBy, 0);
+  if (orderBy !== undefined && (isPlainRecord(orderBy) || Array.isArray(orderBy))) {
+    const next = pruneStructural(orderBy, 0, false);
     if (next !== orderBy) out = withKey(out, src, 'orderBy', next);
   }
   const withClause = src.with;
-  if (isPlainObject(withClause)) {
+  if (isPlainRecord(withClause)) {
     const next = pruneWith(schema, meta, withClause, 0);
     if (next !== withClause) out = withKey(out, src, 'with', next);
   }
@@ -396,10 +442,10 @@ export function pruneUndefinedArgs<A>(schema: SchemaMetadata, table: string, arg
  */
 export function whereEmptiedByPruning(original: unknown, pruned: unknown): boolean {
   if (original === pruned) return false;
-  const before = isPlainObject(original) ? original.where : undefined;
-  const after = isPlainObject(pruned) ? pruned.where : undefined;
-  if (!isPlainObject(before) || hasNoKeys(before)) return false;
-  return before !== after && (!isPlainObject(after) || hasNoKeys(after));
+  const before = isPlainRecord(original) ? original.where : undefined;
+  const after = isPlainRecord(pruned) ? pruned.where : undefined;
+  if (!isPlainRecord(before) || hasNoKeys(before)) return false;
+  return before !== after && (!isPlainRecord(after) || hasNoKeys(after));
 }
 
 /**

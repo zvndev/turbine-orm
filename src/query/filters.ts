@@ -43,16 +43,39 @@ export function isWhereOperator(value: unknown): value is WhereOperator {
 }
 
 /**
- * True for a *plain object literal* that reached an equality fallthrough
- * without matching any known filter shape, the misspelled-operator case.
- * Class instances (Buffer for bytea, Decimal wrappers, ...) are legitimate
- * bind values and return false, as do arrays and Dates.
+ * THE plain-object test for argument trees: an object literal (or a
+ * prototype-less object), never an array, Date, Buffer, typed array or other
+ * class instance. Class instances are values a driver binds (a Decimal, an
+ * interval wrapper), so no walker over caller arguments may descend into one.
  */
-export function isUnmatchedPlainObject(value: unknown): boolean {
-  if (typeof value !== 'object' || value === null || Array.isArray(value) || value instanceof Date) return false;
-  if (typeof Buffer !== 'undefined' && Buffer.isBuffer(value)) return false;
+export function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const proto = Object.getPrototypeOf(value);
   return proto === Object.prototype || proto === null;
+}
+
+/**
+ * `target[key] = value`, always as an OWN property. A plain assignment of the
+ * key `__proto__` replaces the object's prototype instead, so a caller key
+ * spelled that way (`JSON.parse` produces it as an ordinary own key) would
+ * vanish from a rebuilt argument object rather than reach the check that
+ * refuses it, and a filter would silently stop filtering.
+ */
+export function setOwn(target: Record<string, unknown>, key: string, value: unknown): void {
+  if (key === '__proto__') {
+    Object.defineProperty(target, key, { value, writable: true, enumerable: true, configurable: true });
+  } else {
+    target[key] = value;
+  }
+}
+
+/**
+ * {@link isPlainRecord} read at an equality fallthrough: a plain object that
+ * matched no known filter shape is a misspelled operator, while a class
+ * instance (Buffer for bytea, a Decimal wrapper) is a legitimate bind value.
+ */
+export function isUnmatchedPlainObject(value: unknown): boolean {
+  return isPlainRecord(value);
 }
 
 /**
@@ -93,89 +116,32 @@ export { isColumnRef } from './column-ref.js';
 // ---------------------------------------------------------------------------
 
 /**
- * Recursion bound for the two absence walks below. Past it a value is treated
- * as present, which is the safe direction: the where walkers then reach their
- * own depth cap and refuse the clause by name.
+ * Recursion bound for nested `not` operator objects. Past it the operand walk
+ * refuses the filter by name instead of recursing further.
  */
-const ABSENCE_MAX_DEPTH = 64;
-
-/** A plain object literal (not an array, Date, Buffer or class instance). */
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
+const OPERATOR_MAX_DEPTH = 64;
 
 /**
- * THE `undefined` rule for every where position: a value is ABSENT when it is
- * `undefined`, or when it is a non-empty plain object every one of whose
- * values is absent (`{ gte: undefined }`, `{ email: undefined }`,
- * `{ is: { email: undefined } }`). An object written empty (`{}`) is NOT
- * absent: it keeps whatever meaning, or refusal, its position gives it.
+ * `value` without its `undefined`-valued keys, one level deep. Returns the
+ * input BY REFERENCE when there are none, so the common path allocates
+ * nothing. Symbol-keyed properties (internal brands) survive a copy.
  *
- * One predicate rather than a `!== undefined` test per walker, because the
- * SQL-template cache needs the fingerprint, the SQL build and the cache-hit
- * param collect to agree about every key. When the fingerprint counted a key
- * holding `undefined` and the builders skipped it, `{ gte: from, lte: to }`
- * warmed with `from` undefined served its `<=` statement to a later call with
- * `to` undefined.
+ * This is the where walkers' backstop only. The args seam
+ * (`pruneUndefinedArgs` in normalize-args.ts) is the authority on `undefined`:
+ * it removes undefined keys at every where position and objects that became
+ * empty because of them. The walkers see what the seam missed (internal
+ * callers below it), skip a key whose value is `undefined`, and never look
+ * inside a value, so a JSON operand is data however it is shaped.
  */
-export function isAbsentWhereValue(value: unknown, depth = 0): boolean {
-  if (value === undefined) return true;
-  if (depth > ABSENCE_MAX_DEPTH || !isPlainRecord(value)) return false;
+export function dropUndefinedKeys(value: Record<string, unknown>): Record<string, unknown> {
   const keys = Object.keys(value);
-  if (keys.length === 0) return false;
   for (const key of keys) {
-    if (!isAbsentWhereValue(value[key], depth + 1)) return false;
+    if (value[key] !== undefined) continue;
+    const out = copySymbols(value);
+    for (const k of keys) if (value[k] !== undefined) setOwn(out, k, value[k]);
+    return out;
   }
-  return true;
-}
-
-/**
- * `value` with every absent key ({@link isAbsentWhereValue}) removed, at every
- * depth of nested plain objects. Returns the input BY REFERENCE when nothing
- * is absent, so the common path allocates nothing. Arrays are not entered:
- * an `undefined` list element is an operand error, not an absent key.
- * Symbol-keyed properties (internal brands) survive a copy.
- */
-export function pruneAbsentKeys<T>(value: T, depth = 0): T {
-  if (depth > ABSENCE_MAX_DEPTH || !isPlainRecord(value)) return value;
-  let out: Record<string, unknown> | undefined;
-  const keys = Object.keys(value);
-  for (let i = 0; i < keys.length; i++) {
-    const key = keys[i] as string;
-    const current = value[key];
-    const absent = isAbsentWhereValue(current, depth + 1);
-    const next = absent ? undefined : pruneAbsentKeys(current, depth + 1);
-    if (out === undefined && (absent || next !== current)) {
-      out = copySymbols(value);
-      for (let j = 0; j < i; j++) out[keys[j] as string] = value[keys[j] as string];
-    }
-    if (out !== undefined && !absent) out[key] = next;
-  }
-  return (out ?? value) as T;
-}
-
-/**
- * Drop the absent keys of ONE object level and leave the values as they are.
- * For relation-filter wrappers, whose bodies are where clauses that the walk
- * prunes itself when it reaches them.
- */
-export function dropAbsentKeys(value: Record<string, unknown>): Record<string, unknown> {
-  let out: Record<string, unknown> | undefined;
-  const keys = Object.keys(value);
-  for (let i = 0; i < keys.length; i++) {
-    const key = keys[i] as string;
-    if (isAbsentWhereValue(value[key])) {
-      if (out === undefined) {
-        out = copySymbols(value);
-        for (let j = 0; j < i; j++) out[keys[j] as string] = value[keys[j] as string];
-      }
-      continue;
-    }
-    if (out !== undefined) out[key] = value[key];
-  }
-  return out ?? value;
+  return value;
 }
 
 /** A fresh object carrying `source`'s own symbol-keyed properties (brands). */
@@ -277,7 +243,7 @@ function fitsColumn(value: unknown, kind: OperandColumnKind): boolean {
 }
 
 /** Short, value-free description of an operand for an error message. */
-function describeOperand(value: unknown): string {
+export function describeOperand(value: unknown): string {
   if (value === null) return 'null';
   if (value === undefined) return 'undefined';
   if (Array.isArray(value)) return 'an array';
@@ -313,108 +279,153 @@ export interface OperandContext {
   kind: OperandColumnKind;
 }
 
-const COMPARISON_OPERATOR_KEYS = [
-  'equals',
-  'not',
-  'gt',
-  'gte',
-  'lt',
-  'lte',
-  'in',
-  'notIn',
-  'contains',
-  'startsWith',
-  'endsWith',
-] as const;
+/** `on "<column>" for table "<table>"`, for refusal messages. Built only on the throw path. */
+function operandSite(ctx: OperandContext): string {
+  return `on "${ctx.column}" for table "${ctx.table}"`;
+}
+
+function refuseOperand(key: string, value: unknown, ctx: OperandContext, accepted: string): never {
+  throw new ValidationError(
+    `Invalid operand for '${key}' ${operandSite(ctx)}: received ${describeOperand(value)}. '${key}' takes ${accepted}.`,
+  );
+}
 
 /**
  * Validate every operand of an operator object against its column, and throw
  * {@link ValidationError} (E003) naming the column, the operator, what was
  * received and what is accepted.
  *
+ * An operator object must state at least one comparison. One made only of
+ * `mode` (or of operators whose value is `undefined`) compares nothing, so it
+ * is refused rather than compiled to no predicate: inside a relation filter
+ * that silence turned `deleteMany` into a delete of every row. The args seam
+ * removes the object when `undefined` emptied it, so Prisma's optional-search
+ * idiom (`{ contains: q, mode: 'insensitive' }` with `q` undefined) still
+ * reads as "no filter".
+ *
  * Called by the SQL build AND the cache-hit param collect with the same
  * arguments, so a warmed template can never bind an operand the cold build
- * refuses. Recurses into a `not` operator object. `depth` bounds that
- * recursion the same way the where walk is bounded.
+ * refuses. Recurses into a `not` operator object, bounded by `depth`. Runs on
+ * every operator object of every query, so it reads only the keys present and
+ * builds a message only when it throws.
  */
 export function assertOperatorOperands(op: Record<string, unknown>, ctx: OperandContext, depth = 0): void {
-  if (depth > ABSENCE_MAX_DEPTH) {
+  if (depth > OPERATOR_MAX_DEPTH) {
     throw new ValidationError(`\`not\` operators on "${ctx.column}" nest too deeply; flatten the filter.`);
   }
-  const where = `on "${ctx.column}" for table "${ctx.table}"`;
   const mode = op.mode;
   if (mode !== undefined && mode !== 'default' && mode !== 'insensitive') {
     throw new ValidationError(
-      `Invalid mode ${typeof mode === 'string' ? JSON.stringify(mode) : describeOperand(mode)} ${where}. ` +
+      `Invalid mode ${typeof mode === 'string' ? JSON.stringify(mode) : describeOperand(mode)} ${operandSite(ctx)}. ` +
         "Use 'insensitive' or 'default'.",
     );
   }
-  for (const key of COMPARISON_OPERATOR_KEYS) {
+  // The classifier sends only operator keys here; `mode` was checked above.
+  let comparisons = 0;
+  for (const key of Object.keys(op)) {
     const value = op[key];
     if (value === undefined) continue;
-    const refuse = (accepted: string): never => {
-      throw new ValidationError(
-        `Invalid operand for '${key}' ${where}: received ${describeOperand(value)}. '${key}' takes ${accepted}.`,
-      );
-    };
-    if (ctx.kind !== 'json' && COLUMN_REF_OPERATORS.has(key) && isPlainColumnRefShape(value)) {
-      throw new ValidationError(plainColumnRefMessage(value as { col: string }, key, ctx.column, ctx.table));
-    }
     switch (key) {
       case 'equals':
-      case 'not': {
-        if (value === null) break;
-        if (isColumnRef(value)) {
-          if (ctx.kind === 'json')
-            refuse(`${acceptedFor('json')}; column references are not supported on JSON columns`);
-          break;
-        }
-        if (key === 'not' && ctx.kind !== 'json' && isPlainRecord(value)) {
-          if (Object.keys(value).length === 0) {
-            refuse(`a value, null, a column reference or an operator object such as { contains: 'x' }`);
-          }
-          if (!isWhereOperator(value)) refuse(`${acceptedFor(ctx.kind)}, null, col('field'), or an operator object`);
-          assertOperatorOperands(value, ctx, depth + 1);
-          break;
-        }
-        if (!fitsColumn(value, ctx.kind)) {
-          refuse(
-            `${acceptedFor(ctx.kind)}, null, or col('field')` +
-              (isPlainRecord(value) ? ' (an object is a JSON value, accepted only on json/jsonb columns)' : ''),
-          );
+      case 'not':
+        comparisons++;
+        if (value !== null && typeof value === 'object') assertObjectEqualityOperand(key, value, ctx, depth);
+        else if (value !== null && !fitsColumn(value, ctx.kind)) {
+          refuseOperand(key, value, ctx, `${acceptedFor(ctx.kind)}, null, or col('field')`);
         }
         break;
-      }
       case 'gt':
       case 'gte':
       case 'lt':
       case 'lte':
-        if (isColumnRef(value)) break;
+        comparisons++;
         if (value === null) {
-          refuse(
+          refuseOperand(
+            key,
+            value,
+            ctx,
             `${acceptedFor(ctx.kind)} or col('field'); a comparison with null matches no row, use equals: null or not: null`,
           );
         }
-        if (!fitsColumn(value, ctx.kind)) refuse(`${acceptedFor(ctx.kind)} or col('field')`);
+        if (isColumnRef(value)) break;
+        if (ctx.kind !== 'json' && isPlainColumnRefShape(value)) {
+          throw new ValidationError(plainColumnRefMessage(value as { col: string }, key, ctx.column, ctx.table));
+        }
+        if (!fitsColumn(value, ctx.kind)) refuseOperand(key, value, ctx, `${acceptedFor(ctx.kind)} or col('field')`);
         break;
       case 'in':
-      case 'notIn': {
-        if (!Array.isArray(value)) refuse(`an array of values`);
-        const elementKind: OperandColumnKind = ctx.kind === 'array' ? 'array' : ctx.kind;
-        for (const element of value as unknown[]) {
-          if (element === null) continue;
-          if (!fitsColumn(element, elementKind)) {
-            throw new ValidationError(
-              `Invalid element in '${key}' ${where}: received ${describeOperand(element)}. ` +
-                `Every element must be ${acceptedFor(elementKind)} (or null).`,
-            );
-          }
-        }
+      case 'notIn':
+        comparisons++;
+        assertListOperand(key, value, ctx);
         break;
-      }
-      default:
-        if (typeof value !== 'string') refuse('a string');
+      case 'contains':
+      case 'startsWith':
+      case 'endsWith':
+        comparisons++;
+        if (typeof value !== 'string') refuseOperand(key, value, ctx, 'a string');
+        break;
     }
+  }
+  if (comparisons === 0) {
+    throw new ValidationError(
+      `The ${depth > 0 ? '`not` operator object' : 'filter'} ${operandSite(ctx)} names no operator: received ` +
+        `${describeOperand(op)}. Add one (for example { contains: 'x', mode: 'insensitive' }), or leave ` +
+        `"${ctx.column}" out of the filter to apply no condition to it.`,
+    );
+  }
+}
+
+/** An object at `equals` / `not`: a column reference, or a `not` operator object to negate. */
+function assertObjectEqualityOperand(key: string, value: object, ctx: OperandContext, depth: number): void {
+  if (isColumnRef(value)) {
+    if (ctx.kind === 'json') {
+      refuseOperand(key, value, ctx, `${acceptedFor('json')}; column references are not supported on JSON columns`);
+    }
+    return;
+  }
+  if (ctx.kind === 'json') {
+    if (!fitsColumn(value, 'json')) refuseOperand(key, value, ctx, `${acceptedFor('json')} or null`);
+    return;
+  }
+  if (isPlainColumnRefShape(value)) {
+    throw new ValidationError(plainColumnRefMessage(value as { col: string }, key, ctx.column, ctx.table));
+  }
+  if (key === 'not' && isPlainRecord(value)) {
+    if (Object.keys(value).length === 0) {
+      refuseOperand(
+        key,
+        value,
+        ctx,
+        `a value, null, a column reference or an operator object such as { contains: 'x' }`,
+      );
+    }
+    if (!isWhereOperator(value)) {
+      refuseOperand(key, value, ctx, `${acceptedFor(ctx.kind)}, null, col('field'), or an operator object`);
+    }
+    assertOperatorOperands(value, ctx, depth + 1);
+    return;
+  }
+  if (!fitsColumn(value, ctx.kind)) {
+    refuseOperand(
+      key,
+      value,
+      ctx,
+      `${acceptedFor(ctx.kind)}, null, or col('field')` +
+        (isPlainRecord(value) ? ' (an object is a JSON value, accepted only on json/jsonb columns)' : ''),
+    );
+  }
+}
+
+/** `in` / `notIn`: an array whose elements fit the column (or are null). */
+function assertListOperand(key: string, value: unknown, ctx: OperandContext): void {
+  if (!Array.isArray(value)) refuseOperand(key, value, ctx, 'an array of values');
+  const elementKind: OperandColumnKind = ctx.kind === 'array' ? 'array' : ctx.kind;
+  for (const element of value) {
+    if (element === null || fitsColumn(element, elementKind)) continue;
+    throw new ValidationError(
+      `Invalid element in '${key}' ${operandSite(ctx)}: received ${describeOperand(element)}. ` +
+        `Every element must be ${acceptedFor(elementKind)} (or null).`,
+    );
   }
 }
 
@@ -470,18 +481,18 @@ export function assertEqualityOperand(value: unknown, ctx: OperandContext): void
  *
  * A `not` operator object compiles to `NOT (<inner>)`, so its whole inner shape
  * is part of the token, with the inner object's EFFECTIVE mode (its own, else
- * the inherited one). Absent keys are skipped exactly as the builders skip them.
+ * the inherited one). Keys holding `undefined` are skipped, as the builders skip them.
  */
 export function fingerprintOperatorShape(value: WhereOperator, inheritedMode?: unknown, depth = 0): string {
   const obj = value as Record<string, unknown>;
   const effectiveMode = obj.mode !== undefined ? obj.mode : inheritedMode;
   const opKeys = Object.keys(obj)
-    .filter((k) => k !== 'mode' && !isAbsentWhereValue(obj[k]))
+    .filter((k) => k !== 'mode' && obj[k] !== undefined)
     .map((k) => {
       const v = obj[k];
       if ((k === 'equals' || k === 'not') && v === null) return `${k}:null`;
       if (COLUMN_REF_OPERATORS.has(k) && isColumnRef(v)) return `${k}:col(${JSON.stringify(v.col)})`;
-      if (k === 'not' && depth < ABSENCE_MAX_DEPTH && isWhereOperator(v)) {
+      if (k === 'not' && depth < OPERATOR_MAX_DEPTH && isWhereOperator(v)) {
         return `not:${fingerprintOperatorShape(v, effectiveMode, depth + 1)}`;
       }
       return k;
@@ -664,7 +675,7 @@ export const ARRAY_UNIQUE_KEYS = new Set<string>(['has', 'hasEvery', 'hasSome', 
  */
 export function fingerprintArrayFilterShape(filter: ArrayFilter): string {
   const keys = Object.keys(filter)
-    .filter((k) => !isAbsentWhereValue((filter as Record<string, unknown>)[k]))
+    .filter((k) => (filter as Record<string, unknown>)[k] !== undefined)
     .sort();
   const suffix = filter.isEmpty === undefined ? '' : `:empty=${filter.isEmpty ? 'true' : 'false'}`;
   return `${keys.join(',')}${suffix}`;
@@ -1034,24 +1045,37 @@ function assertDroppedDirection(key: string, value: unknown, table: string | und
  * has a meaning that degrades as the list grows (every added column makes the
  * result strictly less distinct, converging on the plain query), so a long list
  * is self-limiting in a way a long sort is not.
+ *
+ * Every element must be a field name: anything else (an `undefined` hole, a
+ * number) is E003 here, the first place either caller reads the list.
  */
 export function dedupeColumnList(
   meta: ColumnNameSource | undefined,
   columns: readonly string[],
+  label = 'distinct',
 ): { columns: string[]; dropped: DroppedTerm[] } | null {
+  for (let i = 0; i < columns.length; i++) {
+    const key: unknown = columns[i];
+    if (typeof key === 'string' && key.length > 0) continue;
+    throw new ValidationError(
+      `\`${label}\`${meta?.name ? ` on table "${meta.name}"` : ''} takes field names, but element ${i} is ` +
+        `${key === undefined ? 'undefined' : describeOperand(key)}. Pass each field as a string, or leave the ` +
+        `list out to apply no ${label}.`,
+    );
+  }
   if (columns.length < 2) return null;
   const seen = new Map<string, string>();
   let dropped: DroppedTerm[] | undefined;
   const kept: string[] = [];
   for (const key of columns) {
-    const column = typeof key === 'string' ? resolvedOrderColumn(meta, key) : null;
-    const first = column === null ? undefined : seen.get(column);
-    if (first !== undefined && column !== null) {
+    const column = resolvedOrderColumn(meta, key);
+    const first = seen.get(column);
+    if (first !== undefined) {
       if (dropped === undefined) dropped = [];
       dropped.push({ key, first, resolved: column });
       continue;
     }
-    if (column !== null) seen.set(column, key);
+    seen.set(column, key);
     kept.push(key);
   }
   return dropped ? { columns: kept, dropped } : null;

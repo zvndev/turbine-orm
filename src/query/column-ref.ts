@@ -7,12 +7,12 @@
  * removes the bound value entirely.
  *
  * That is why it carries a brand. A plain `{ col: 'id' }` object is exactly
- * what `JSON.parse` produces from a request body, and when the plain shape was
- * the reference, `delete({ where: { id: body.id } })` with a body of
- * `{"id":{"equals":{"col":"id"}}}` compiled to `WHERE "id" = "id"` and deleted
- * every row. A symbol cannot come out of `JSON.parse`, a query string, a form
- * body or a `structuredClone` of parsed input, so only code can build one. Same
- * reasoning as the `UNSAFE` sentinel.
+ * what `JSON.parse` produces from a request body: were that shape a reference,
+ * `delete({ where: { id: body.id } })` with a body of
+ * `{"id":{"equals":{"col":"id"}}}` would compile to `WHERE "id" = "id"` and
+ * delete every row. A symbol cannot come out of `JSON.parse`, a query string, a
+ * form body or a `structuredClone` of parsed input, so only code can build one.
+ * Same reasoning as the `UNSAFE` sentinel.
  *
  * `Symbol.for` rather than `Symbol()` because the package ships dual ESM and
  * CJS builds: a reference built by one copy must be recognized by the other.
@@ -72,10 +72,10 @@ export function isColumnRef(value: unknown): value is ColumnRef {
 }
 
 /**
- * True for the UNBRANDED `{ col: '<name>' }` shape: the spelling a column
- * reference used to have, and what parsed request data produces. Callers
- * refuse it with {@link plainColumnRefMessage} rather than reading it as a
- * value, because the person who wrote it almost certainly meant a reference.
+ * True for the UNBRANDED `{ col: '<name>' }` shape, which is what parsed
+ * request data produces. Callers refuse it with {@link plainColumnRefMessage}
+ * rather than reading it as a value, because whoever wrote it almost certainly
+ * meant a reference.
  */
 export function isPlainColumnRefShape(value: unknown): boolean {
   if (typeof value !== 'object' || value === null || Array.isArray(value) || isColumnRef(value)) return false;

@@ -16,14 +16,13 @@ import type { DeferredQuery } from './deferred.js';
 import {
   assertEqualityOperand,
   dedupeColumnList,
-  isAbsentWhereValue,
   isJsonPathOrderBy,
   isUnmatchedPlainObject,
   isVectorOrderBy,
   isWhereOperator,
   normalizeOrderBy,
   orderByEntries,
-  pruneAbsentKeys,
+  setOwn,
 } from './filters.js';
 import type {
   AggregateArgs,
@@ -41,7 +40,7 @@ import { assertOrderDirection, resolveSkipGlobalFilters, resolveUnsafeFlag } fro
 import { isTemporalInfinity, ownLookup, parseDbDate, resolveColumnName, warnRedundantSortTerm } from './utils.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
-import { assertWhereDepth } from './where-compile.js';
+import { assertWhereDepth, combinatorBranches } from './where-compile.js';
 
 /**
  * Enforce the PII contract on the aggregate surface. A PII-tagged
@@ -635,7 +634,7 @@ export function buildDistinctOnSource<T extends object>(
   // twice (see `dedupeColumnList`). The orderBy below needs no equivalent: its
   // keys come from an object, and the DISTINCT ON columns lead the ORDER BY, so
   // a key repeating one of them is already merged by `orderParts`' construction.
-  const dedupedCols = dedupeColumnList(qi.tableMeta, distinctOn.columns);
+  const dedupedCols = dedupeColumnList(qi.tableMeta, distinctOn.columns, 'distinctOn.columns');
   if (dedupedCols) warnRedundantSortTerm(qi.table, 'groupBy distinctOn.columns', dedupedCols.dropped);
   const distinctCols = (dedupedCols?.columns ?? distinctOn.columns).map((c) => qi.q(qi.toColumn(c)));
   // DISTINCT ON expressions must lead the ORDER BY; the user's orderBy then
@@ -721,11 +720,10 @@ export function buildHavingClauses<T extends object>(
   assertWhereDepth(depth, 'having');
   const clauses: string[] = [];
 
-  for (const [key, raw] of Object.entries(having)) {
-    // Same `undefined` rule as every where walk (`walkWhere`): an absent value
-    // is skipped and a present one loses its absent keys.
-    if (isAbsentWhereValue(raw)) continue;
-    const value = pruneAbsentKeys(raw);
+  for (const [key, value] of Object.entries(having)) {
+    // Same `undefined` rule as the where walk (`walkWhere`): the args seam
+    // removes it, and a key still holding it here is skipped.
+    if (value === undefined) continue;
 
     // Top-level `_count` (no field) → COUNT(*) for the whole group.
     if (key === '_count') {
@@ -800,7 +798,7 @@ function splitHavingField(
           `Supported: ${Object.keys(HAVING_AGGREGATE_FNS).join(', ')}.`,
       );
     } else {
-      scalarKeys[k] = v;
+      setOwn(scalarKeys, k, v);
     }
   }
 
@@ -811,9 +809,11 @@ function splitHavingField(
 /**
  * Compile a `having` AND / OR / NOT branch. Each condition is a nested
  * {@link HavingClause}; its own clauses are ANDed (parenthesized when there is
- * more than one) before being combined. `AND` contributes its parts directly
- * (the caller ANDs them), mirroring {@link buildWhereClause}'s combinator
- * shapes so HAVING and WHERE read the same way.
+ * more than one) before being combined. The branch shapes are the WHERE
+ * combinator rule ({@link combinatorBranches}), so HAVING and WHERE accept and
+ * refuse the same values and mean the same thing by them: `AND` contributes its
+ * parts directly (the caller ANDs them), `OR: []` matches no group, a `NOT`
+ * object negates the object as a whole, and a `NOT` array negates each branch.
  */
 function buildHavingCombinator<T extends object>(
   qi: BuilderCtx,
@@ -824,7 +824,9 @@ function buildHavingCombinator<T extends object>(
   groupKeys?: Map<string, HavingGroupKey>,
   depth = 0,
 ): string[] {
-  const conditions = Array.isArray(value) ? value : [value];
+  const branches = combinatorBranches(key, value, qi.table, 'having');
+  if (branches === null) return [];
+  if (branches.length === 0) return key === 'OR' ? ['1 = 0'] : [];
   // Same variable-arity shape as the WHERE combinators: an ARRAY branch writes
   // one parenthesized condition per element into the SQL text, so a
   // caller-sized `having.OR` is a new statement per length.
@@ -836,22 +838,17 @@ function buildHavingCombinator<T extends object>(
   // them through the cache later cannot silently reopen the hole, and so the
   // rule reads the same in both clause compilers. The DEPTH cap above is the
   // half of this that bites here and now.
-  if (Array.isArray(value) && key !== 'NOT') qi.markVariableArity();
+  if (Array.isArray(value)) qi.markVariableArity();
   const parts: string[] = [];
-  for (const condition of conditions) {
-    if (!isUnmatchedPlainObject(condition)) {
-      throw new ValidationError(
-        `Invalid having "${key}" on table "${qi.table}": expected ` +
-          `${key === 'OR' ? 'an array of having objects' : 'a having object (or an array of them)'}.`,
-      );
-    }
-    const sub = buildHavingClauses(qi, condition as HavingClause<T>, params, jsonAggExprs, groupKeys, depth + 1);
+  for (const branch of branches) {
+    const sub = buildHavingClauses(qi, branch as HavingClause<T>, params, jsonAggExprs, groupKeys, depth + 1);
     if (sub.length === 0) continue;
     parts.push(sub.length === 1 ? sub[0]! : `(${sub.join(' AND ')})`);
   }
   if (parts.length === 0) return [];
   if (key === 'AND') return parts;
   if (key === 'OR') return [`(${parts.join(' OR ')})`];
+  if (Array.isArray(value)) return parts.map((part) => `NOT (${part})`);
   return [`NOT (${parts.join(' AND ')})`];
 }
 

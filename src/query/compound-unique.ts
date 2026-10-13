@@ -41,7 +41,7 @@
 
 import { ValidationError } from '../errors.js';
 import type { TableMetadata } from '../schema.js';
-import { isArrayFilter, isJsonFilter, isVectorFilter, isWhereOperator } from './filters.js';
+import { isArrayFilter, isJsonFilter, isPlainRecord, isVectorFilter, isWhereOperator } from './filters.js';
 import { isInternalCombinator, ownLookup, resolveColumnName, resolveRelationDef } from './utils.js';
 
 const syntheticKeyCache = new WeakMap<TableMetadata, Map<string, string[]>>();
@@ -510,7 +510,7 @@ export function upsertWhereMatchesCreate(
 
 /** `{ equals: v }` and nothing else (a `mode` beside it changes the match). */
 function isBareEquals(value: unknown): boolean {
-  return isPlainObject(value) && Object.keys(value as object).length === 1 && 'equals' in (value as object);
+  return isPlainRecord(value) && Object.keys(value).length === 1 && 'equals' in value;
 }
 
 /** Equal non-null key values; two Dates compare by instant, other objects by identity. */
@@ -531,8 +531,8 @@ function sameKeyValue(a: unknown, b: unknown): boolean {
  */
 function isPinnedToOneValue(value: unknown): boolean {
   if (isIdentityScalar(value)) return true;
-  if (!isPlainObject(value)) return false;
-  const keys = Object.keys(value as object).filter((k) => (value as Record<string, unknown>)[k] !== undefined);
+  if (!isPlainRecord(value)) return false;
+  const keys = Object.keys(value).filter((k) => value[k] !== undefined);
   const op = value as { equals?: unknown; mode?: unknown };
   return (
     keys.every((k) => k === 'equals' || (k === 'mode' && op.mode === 'default')) &&
@@ -555,10 +555,4 @@ function isIdentityScalar(value: unknown): boolean {
     default:
       return false;
   }
-}
-
-function isPlainObject(value: unknown): boolean {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
 }
