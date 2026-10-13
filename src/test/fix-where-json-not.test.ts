@@ -58,8 +58,10 @@ describe('JSON `not` with an operator-only object', () => {
     for (const operand of OPERATOR_OBJECTS) {
       it(`${name}: not: ${JSON.stringify(operand)} is refused on the build and on the cache-hit collect`, () => {
         const q = users(dialect);
-        // Warm a valid shape so a later call could take the cache path.
-        q.buildFindMany({ where: { data: { not: { a: 1 } } } });
+        // Warm a valid shape so a later call could take the cache path. SQLite
+        // compares no whole documents, so its `not: <document>` is refused (E017)
+        // and the valid shape there is a scalar.
+        q.buildFindMany({ where: { data: { not: name === 'sqlite' ? 1 : { a: 1 } } } });
         assert.throws(
           () => q.buildFindMany({ where: { data: { not: operand } } }),
           (err: unknown) => {

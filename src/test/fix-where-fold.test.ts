@@ -52,8 +52,9 @@ const FOLDS: [string, Record<string, unknown>, 'empty' | 'true' | 'false' | 'row
   ['fw_users', { OR: [{ NOT: { OR: [] } }, { id: 1 }] }, 'true'],
   ['fw_users', { AND: [{ NOT: { OR: [] } }, { id: 1 }] }, 'row'],
   ['fw_users', { AND: [{ OR: [] }, { id: 1 }] }, 'false'],
-  // An empty OR branch compiles to nothing and is dropped, so this is `id = 1`.
-  ['fw_users', { OR: [{}, { id: 1 }] }, 'row'],
+  // A branch that applies no condition is TRUE for every row, so the OR is TRUE.
+  ['fw_users', { OR: [{}, { id: 1 }] }, 'true'],
+  ['fw_users', { NOT: { OR: [{}, { id: 1 }] } }, 'false'],
   ['fw_users', { id: 1 }, 'row'],
   ['fw_users', { score: { not: null } }, 'row'],
   ['fw_users', { data: { not: { equals: { a: 1 } } } }, 'row'],

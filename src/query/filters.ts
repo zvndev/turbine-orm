@@ -224,7 +224,11 @@ function isBindableScalar(value: unknown): boolean {
       return false;
   }
   if (value === null || Array.isArray(value)) return false;
-  if (value instanceof Date || ArrayBuffer.isView(value)) return true;
+  // An Invalid Date has no SQL value: drivers send it as `NaN` text, a server
+  // error, a thrown RangeError or, inside a JSON-encoded list, `null`, which
+  // matched nothing and so negated to every row.
+  if (value instanceof Date) return !Number.isNaN(value.getTime());
+  if (ArrayBuffer.isView(value)) return true;
   if (isColumnRef(value) || isPlainRecord(value)) return false;
   return isBindableInstance(value);
 }
@@ -234,6 +238,7 @@ function fitsColumn(value: unknown, kind: OperandColumnKind): boolean {
   if (isBindableScalar(value)) return true;
   if (kind === 'json') {
     if (value === undefined || typeof value === 'function' || typeof value === 'symbol') return false;
+    if (value instanceof Date) return false;
     return !(typeof value === 'object' && value !== null && NON_SCALAR_BUILTINS.some((c) => value instanceof c));
   }
   if (kind === 'array' || kind === 'vector') {
@@ -248,6 +253,7 @@ export function describeOperand(value: unknown): string {
   if (value === undefined) return 'undefined';
   if (Array.isArray(value)) return 'an array';
   if (isColumnRef(value)) return 'a column reference';
+  if (value instanceof Date && Number.isNaN(value.getTime())) return 'an Invalid Date';
   if (isPlainRecord(value)) {
     const keys = Object.keys(value);
     return keys.length === 0 ? 'an empty object' : `an object with keys ${keys.map((k) => `"${k}"`).join(', ')}`;
@@ -1177,4 +1183,156 @@ export function isEmptyOrderBy(orderBy: unknown): boolean {
     return Object.values(orderBy as Record<string, unknown>).every((v) => v === undefined);
   }
   return orderBy === undefined || orderBy === null;
+}
+
+// ---------------------------------------------------------------------------
+// JSON and array filter keys, and `undefined` inside a filter
+// ---------------------------------------------------------------------------
+
+/**
+ * Refuse a {@link JsonFilter} carrying a key that is not a JSON operator, and
+ * refuse a filter that selects a `path` but never compares it.
+ *
+ * Both shapes used to compile to NOTHING. `buildJsonFilterClauses` only ever
+ * emitted a clause for a key it recognized, so `{ path: ['title'],
+ * string_contains: 'x' }`, the Prisma spelling, and an easy typo besides -
+ * produced an empty clause list, the predicate vanished, and the query
+ * returned EVERY row. Inside an `AND` it silently dropped that conjunct, so a
+ * tenant scope written this way widened to the whole table. The equivalent
+ * typo on a scalar column has always thrown; this closes the inconsistency.
+ *
+ * Called from both the SQL-build path and the cache-hit param-collect path, so
+ * a warmed SQL cache cannot skip the check.
+ */
+export function assertJsonFilterKeys(filter: JsonFilter, column: string): void {
+  const obj = filter as Record<string, unknown>;
+  const present = Object.keys(obj).filter((k) => obj[k] !== undefined);
+
+  for (const key of present) {
+    if (isColumnRef(obj[key])) {
+      throw new ValidationError(
+        `A column reference cannot be the '${key}' operand of a JSON filter on ${column}: on a json/jsonb ` +
+          'column the operand is a JSON value. Compare the column with col() only on non-JSON columns.',
+      );
+    }
+  }
+
+  for (const key of present) {
+    if (JSON_FILTER_KEYS.has(key)) continue;
+    const suggestion = JSON_PRISMA_SPELLINGS[key];
+    throw new ValidationError(
+      `Unknown JSON filter operator "${key}" on ${column}.` +
+        (suggestion ? ` Did you mean \`${suggestion}\`?` : '') +
+        ` Supported operators: ${[...JSON_FILTER_KEYS].sort().join(', ')}.`,
+    );
+  }
+
+  // `mode` and `path` are modifiers, not comparisons: a filter made only of
+  // those (or of keys holding `undefined`) compares nothing, which is exactly
+  // the silent no-op shape above.
+  if (present.length === 0) {
+    throw new ValidationError(
+      `JSON filter on ${column} names no comparison. Add one of: ${[...JSON_FILTER_KEYS]
+        .filter((k) => k !== 'path' && k !== 'mode')
+        .sort()
+        .join(', ')}.`,
+    );
+  }
+  if (present.every((k) => k === 'path' || k === 'mode')) {
+    throw new ValidationError(
+      `JSON filter on ${column} selects a \`path\` but has no comparison. ` +
+        `Add one of: ${[...JSON_FILTER_KEYS]
+          .filter((k) => k !== 'path' && k !== 'mode')
+          .sort()
+          .join(', ')}.`,
+    );
+  }
+}
+
+/**
+ * The Prisma spelling of each JSON operator, so a migrator who writes the
+ * name they already know gets told the turbine one instead of a bare list.
+ */
+const JSON_PRISMA_SPELLINGS: Record<string, string> = {
+  string_contains: 'stringContains',
+  string_starts_with: 'stringStartsWith',
+  string_ends_with: 'stringEndsWith',
+  array_contains: 'contains',
+  startsWith: 'stringStartsWith',
+  endsWith: 'stringEndsWith',
+};
+
+/**
+ * Whether {@link findUndefinedPath} would find anything, without building the
+ * path strings. Same walk, same leaves, same plain-object rule, same depth bound.
+ */
+export function holdsUndefinedValue(value: unknown, depth: number): boolean {
+  if (value === undefined) return true;
+  if (typeof value !== 'object' || value === null || depth > 64) return false;
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) if (holdsUndefinedValue(value[i], depth + 1)) return true;
+    return false;
+  }
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return false;
+  for (const key of Object.keys(value)) {
+    if (holdsUndefinedValue((value as Record<string, unknown>)[key], depth + 1)) return true;
+  }
+  return false;
+}
+
+/**
+ * The key path of the first `undefined` inside a where object (a global filter),
+ * or `null`.
+ * Walks plain objects and arrays; values of any other kind (Dates, Buffers,
+ * column references) are leaves. Key NAMES only, never values, so the path is
+ * safe in an error message.
+ */
+export function findUndefinedPath(value: unknown, path: string, depth: number): string | null {
+  if (value === undefined) return path || '(root)';
+  if (typeof value !== 'object' || value === null || depth > 64) return null;
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const hit = findUndefinedPath(value[i], `${path}[${i}]`, depth + 1);
+      if (hit !== null) return hit;
+    }
+    return null;
+  }
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return null;
+  for (const key of Object.keys(value)) {
+    const hit = findUndefinedPath((value as Record<string, unknown>)[key], path ? `${path}.${key}` : key, depth + 1);
+    if (hit !== null) return hit;
+  }
+  return null;
+}
+
+/**
+ * Refuse an {@link ArrayFilter} that would compile to less than it says: a key
+ * that is not an array operator (it would be dropped, so `{ has: 'a', hsa: 'b' }`
+ * filtered on `has` alone), an `isEmpty` that is not a boolean (it compiled to
+ * nothing), or no comparison at all. Called by the SQL build and the cache-hit
+ * param collect alike.
+ */
+export function assertArrayFilter(filter: ArrayFilter, column: string): void {
+  const obj = filter as Record<string, unknown>;
+  let comparisons = 0;
+  for (const key of Object.keys(obj)) {
+    const value = obj[key];
+    if (value === undefined) continue;
+    if (!ARRAY_OPERATOR_KEYS.has(key)) {
+      throw new ValidationError(
+        `Unknown array filter operator "${key}" on ${column}. Supported operators: ${[...ARRAY_OPERATOR_KEYS].join(', ')}.`,
+      );
+    }
+    if (key === 'isEmpty' && typeof value !== 'boolean') {
+      throw new ValidationError(`\`isEmpty\` on ${column} takes true or false, received ${describeOperand(value)}.`);
+    }
+    comparisons++;
+  }
+  if (comparisons === 0) {
+    throw new ValidationError(
+      `Array filter on ${column} names no comparison. Add one of: ${[...ARRAY_OPERATOR_KEYS].join(', ')}.`,
+    );
+  }
 }

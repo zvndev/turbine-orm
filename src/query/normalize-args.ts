@@ -511,14 +511,16 @@ export function assertCursorWritten(table: string, operation: string, cursor: un
  * Refuse a `cursor` whose every field was `undefined`. Read as absent it would
  * restart the walk at the first page, so a pager whose last-row value went
  * missing would re-read page one forever. Same rule and message on every engine.
+ * `operation` names the call in the message when the caller knows it; without
+ * it the message names no operation rather than a wrong one.
  */
-export function assertCursorNotEmptied(table: string, original: unknown, pruned: unknown): void {
+export function assertCursorNotEmptied(table: string, original: unknown, pruned: unknown, operation?: string): void {
   const before = isPlainRecord(original) ? original.cursor : undefined;
   if (!isPlainRecord(before) || hasNoKeys(before)) return;
   if (hasCursor(isPlainRecord(pruned) ? pruned.cursor : undefined)) return;
   throw new ValidationError(
-    `findMany on "${table}" refused: every field of \`cursor\` was undefined, so the page would ` +
-      "restart at the first row. Pass the last row's values, or leave `cursor` out for the first page.",
+    `${operation ? `${operation} on` : 'Query on'} "${table}" refused: every field of \`cursor\` was undefined, so ` +
+      "the page would restart at the first row. Pass the last row's values, or leave `cursor` out for the first page.",
   );
 }
 

@@ -21,8 +21,10 @@ import type { RelationDef, TableMetadata } from '../schema.js';
 import { normalizeKeyColumns, snakeToCamel } from '../schema.js';
 import { resolveCountRelations, stitchOnlyFields } from './batched-loader.js';
 import {
+  describeOperand,
   isJsonPathOrderBy,
   isOrderBySpec,
+  isPlainRecord,
   isRelationPickOrderBy,
   isVectorOrderBy,
   MAX_NAMED_ORDER_KEYS,
@@ -51,6 +53,7 @@ import {
   resolveRelationDef,
   selectNamesNothingMessage,
   selectOmitExclusiveMessage,
+  suggestKey,
   unknownFieldMessage,
 } from './utils.js';
 import { hasWarnedOnce, shouldWarnOnce, WARN_NS } from './warn-registry.js';
@@ -324,6 +327,76 @@ export function relationOptions(spec: true | WithOptions): WithOptions {
   return spec === true ? EMPTY_WITH_OPTIONS : spec;
 }
 
+/** The options a relation in `with` reads; any other key is ignored by every relation strategy. */
+const WITH_OPTION_KEYS: ReadonlySet<string> = new Set([
+  'with',
+  'where',
+  'orderBy',
+  'limit',
+  'offset',
+  'take',
+  'skip',
+  'select',
+  'omit',
+]);
+
+/**
+ * Check one relation's `with` options. The fingerprint walk reads every level
+ * of every `with` on every call, whichever strategy then loads it, so this is
+ * the one place that sees them all. `lock` is refused: the row lock compiles to
+ * `FOR <mode> OF "<table>"` on the query's own table, so a lock written on a
+ * relation locked nothing and said nothing. Any other key no relation reads
+ * (`wehre`, `cursor`, `distinct`) is named once in the advice log.
+ */
+function checkWithOptions(qi: BuilderCtx, table: string, relName: string, opts: WithOptions): void {
+  for (const key in opts) {
+    if (WITH_OPTION_KEYS.has(key)) continue;
+    const value = (opts as Record<string, unknown>)[key];
+    if (value === undefined) continue;
+    if (key === 'lock') {
+      throw new ValidationError(
+        `\`lock\` is not an option of a relation in \`with\` (\`${relName}\` on "${table}"): a row lock applies to ` +
+          "the rows of the query's own table only, so the related rows would not be locked. Lock them with a " +
+          'locking read on their own table, in the same transaction.',
+      );
+    }
+    const advice = whereMod.adviceLogger(qi);
+    if (!advice || !shouldWarnOnce(WARN_NS.unknownQueryOption, `${table}.with.${relName}.${key}`)) continue;
+    const suggestion = suggestKey(key, WITH_OPTION_KEYS);
+    logTo(
+      advice,
+      'warn',
+      `unknown option "${key}" on relation "${relName}" in \`with\` on ${table}, it is ignored.` +
+        (suggestion ? ` Did you mean "${suggestion}"?` : ''),
+      { code: 'unknown-query-option', table, operation: 'with', key },
+    );
+  }
+}
+
+/**
+ * `_count` in `with` takes `true` (every relation) or an object naming
+ * relations with `true`. Anything else under a relation, `{ where }` in
+ * particular, was read as `true` and counted every related row.
+ */
+function assertWithCount(table: string, count: unknown): void {
+  if (count === true) return;
+  if (!isPlainRecord(count)) {
+    throw new ValidationError(
+      `\`_count\` in \`with\` on "${table}" takes true or an object naming relations, for example ` +
+        `\`_count: { posts: true }\`; received ${describeOperand(count)}.`,
+    );
+  }
+  for (const rel of Object.keys(count)) {
+    const value = count[rel];
+    if (value === undefined || typeof value === 'boolean') continue;
+    throw new ValidationError(
+      `\`_count.${rel}\` in \`with\` on "${table}" takes true; received ${describeOperand(value)}. ` +
+        '`_count` counts every related row. To count only the rows that match a filter, use ' +
+        `\`count({ where })\` on the related table.`,
+    );
+  }
+}
+
 /**
  * A to-many relation's `offset` (`skip` is folded into it at the args seam by
  * `normalizeWithPagination`, which also refuses it on a to-one relation).
@@ -372,6 +445,7 @@ export function withFingerprint(qi: BuilderCtx, withClause: WithClause | undefin
     // Reserved `_count` key, fingerprint by the selected relation set so
     // `_count: true` and `_count: { posts: true }` never share a cache entry.
     if (relName === '_count') {
+      assertWithCount(meta.name, spec);
       const c = spec as unknown as WithCount;
       parts.push(
         c === true
@@ -391,6 +465,7 @@ export function withFingerprint(qi: BuilderCtx, withClause: WithClause | undefin
     }
 
     const opts = relationOptions(spec);
+    if (opts !== EMPTY_WITH_OPTIONS) checkWithOptions(qi, meta.name, relName, opts);
     const subParts: string[] = [];
 
     // select/omit shape
@@ -1577,29 +1652,32 @@ export function manyToManyTargetGlobalFilterExists(
   jalias: string,
   params: unknown[],
 ): string {
-  const gf = whereMod.resolveGlobalFilter(qi, relDef.to);
-  if (!gf || !relDef.through) return '';
+  const through = relDef.through;
+  if (!through) return '';
   const tMeta = qi.schema.tables[relDef.to];
   if (!tMeta || tMeta.primaryKey.length === 0) return '';
-  const talias = `${alias}t`;
-  const targetKeys = normalizeKeyColumns(relDef.through.targetKey);
+  const targetKeys = normalizeKeyColumns(through.targetKey);
   const pk = tMeta.primaryKey;
   if (targetKeys.length !== pk.length) return '';
-  const join = targetKeys.map((jc, i) => `${talias}.${qi.q(pk[i]!)} = ${jalias}.${qi.q(jc)}`).join(' AND ');
-  const gfClause = whereMod.buildAliasWhere(qi, relDef.to, tMeta, talias, gf, params);
-  const gfAnd = gfClause ? ` AND ${gfClause}` : '';
-  return `EXISTS (SELECT 1 FROM ${qi.q(relDef.to)} ${talias} WHERE ${join}${gfAnd})`;
+  return whereMod.withTargetGlobalFilter(qi, relDef.to, '', (gf) => {
+    const talias = `${alias}t`;
+    const join = targetKeys.map((jc, i) => `${talias}.${qi.q(pk[i]!)} = ${jalias}.${qi.q(jc)}`).join(' AND ');
+    const gfClause = whereMod.buildAliasWhere(qi, relDef.to, tMeta, talias, gf, params);
+    const gfAnd = gfClause ? ` AND ${gfClause}` : '';
+    return `EXISTS (SELECT 1 FROM ${qi.q(relDef.to)} ${talias} WHERE ${join}${gfAnd})`;
+  });
 }
 
 /** Param-collect mirror of {@link manyToManyTargetGlobalFilterExists}. */
 export function collectManyToManyTargetGlobalFilter(qi: BuilderCtx, relDef: RelationDef, params: unknown[]): void {
-  const gf = whereMod.resolveGlobalFilter(qi, relDef.to);
-  if (!gf || !relDef.through) return;
+  if (!relDef.through) return;
   const tMeta = qi.schema.tables[relDef.to];
   if (!tMeta || tMeta.primaryKey.length === 0) return;
   const targetKeys = normalizeKeyColumns(relDef.through.targetKey);
   if (targetKeys.length !== tMeta.primaryKey.length) return;
-  whereMod.collectAliasWhereParams(qi, relDef.to, tMeta, gf, params);
+  whereMod.withTargetGlobalFilter(qi, relDef.to, false, (gf) =>
+    whereMod.collectAliasWhereParams(qi, relDef.to, tMeta, gf, params),
+  );
 }
 
 /**

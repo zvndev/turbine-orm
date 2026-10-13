@@ -63,7 +63,9 @@ describe('what identifies one row', () => {
 });
 
 describe('the guard at each operation', () => {
-  const selfRef = { id: { equals: col('id') } };
+  // A column reference names no row. (`id = id` itself is now refused earlier,
+  // as always true on a NOT NULL key, so the reference is to another column.)
+  const selfRef = { id: { equals: col('age') } };
 
   it('findUnique', () => {
     assert.throws(

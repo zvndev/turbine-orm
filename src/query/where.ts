@@ -21,16 +21,19 @@ import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { camelToSnake, localDateTimeKind, normalizeKeyColumns } from '../schema.js';
 import type { TemporalInfinityReading } from './deferred.js';
 import {
+  assertArrayFilter,
   assertEqualityOperand,
+  assertJsonFilterKeys,
   assertOperatorOperands,
   findArrayUniqueKey,
   findJsonUniqueKey,
+  findUndefinedPath,
+  holdsUndefinedValue,
   isArrayFilter,
   isColumnRef,
   isJsonFilter,
   isPlainRecord,
   isWhereOperator,
-  JSON_FILTER_KEYS,
   JSON_RANGE_OPERATORS,
   JSON_STRING_OPERATORS,
   type OperandContext,
@@ -67,10 +70,15 @@ import {
   fingerprintScalarToken,
   foldWhere,
   normalizeToOneRelationFilter,
+  type WhereFoldOptions,
   type WhereHost,
   type WhereRecord,
   walkWhere,
 } from './where-compile.js';
+
+// The JSON filter key check lives with the other operand checks in filters.ts;
+// re-exported so the engines keep one import site for it.
+export { assertJsonFilterKeys } from './filters.js';
 
 /**
  * The privacy-preserving view of a {@link QueryInterface} instance passed as the
@@ -457,31 +465,45 @@ export function fingerprintRelFilter(
 /**
  * Walk a where clause and push ONLY values into `params`, in the EXACT same
  * order that `buildWhereClause` pushes them. Used on cache hit to fill params
- * without rebuilding SQL.
+ * without rebuilding SQL. Returns whether the clause compiles to a condition,
+ * i.e. whether `buildWhereClause` returns non-null for it.
  *
  * @internal Exposed as package-private for testing.
  */
-export function collectWhereParams(qi: BuilderCtx, where: Record<string, unknown>, params: unknown[], depth = 0): void {
+export function collectWhereParams(
+  qi: BuilderCtx,
+  where: Record<string, unknown>,
+  params: unknown[],
+  depth = 0,
+): boolean {
   assertWhereDepth(depth);
+  let emitted = false;
   // ONE canonical walk (shared with fingerprintWhere + buildWhereClause), so
   // the key order + combinator structure cannot drift out of lockstep.
   for (const event of walkWhere(qi.whereHost, where)) {
     switch (event.kind) {
       case 'or':
+        collectOrParams(event.conditions, params, (cond) => collectWhereParams(qi, cond, params, depth + 1));
+        emitted = true;
+        break;
       case 'and':
-        for (const cond of event.conditions) collectWhereParams(qi, cond, params, depth + 1);
+        for (const cond of event.conditions) {
+          if (collectWhereParams(qi, cond, params, depth + 1)) emitted = true;
+        }
         break;
       case 'not':
-        collectWhereParams(qi, event.condition, params, depth + 1);
+        if (collectWhereParams(qi, event.condition, params, depth + 1)) emitted = true;
         break;
       case 'relation':
-        collectRelationFilterParams(qi, event.relDef, event.filterObj, params, depth + 1);
+        if (collectRelationFilterParams(qi, event.relDef, event.filterObj, params, depth + 1)) emitted = true;
         break;
       case 'scalar':
         collectScalarParams(qi, event.key, event.value, params);
+        emitted = true;
         break;
     }
   }
+  return emitted;
 }
 
 /**
@@ -510,7 +532,7 @@ export function collectScalarParams(qi: BuilderCtx, key: string, value: unknown,
       collectJsonFilterParams(qi, value as JsonFilter, params, qi.q(rawColumn));
       return;
     case 'array':
-      collectArrayFilterParams(qi, value as ArrayFilter, params);
+      collectArrayFilterParams(qi, value as ArrayFilter, params, qi.q(rawColumn));
       return;
     case 'textsearch':
       // Same gate the build path applies, so the collect path never diverges
@@ -552,6 +574,7 @@ export function collectScalarParams(qi: BuilderCtx, key: string, value: unknown,
  * the gf calls are no-ops, so this stays byte-identical to the pre-0.28 path.
  * Shared by every collect site that mirrors buildRelationFilter
  * (collectWhereParams, collectRelFilterParams, collectAliasWhereParams).
+ * Returns whether {@link buildRelationFilter} emits a clause for it.
  */
 export function collectRelationFilterParams(
   qi: BuilderCtx,
@@ -559,51 +582,64 @@ export function collectRelationFilterParams(
   filterObj: Record<string, unknown>,
   params: unknown[],
   depth = 0,
-): void {
+): boolean {
   const target = relDef.to;
+  if (!qi.schema.tables[target]) return false;
+  let emitted = false;
   if (filterObj.some !== undefined) {
     collectRelFilterParams(qi, target, filterObj.some as Record<string, unknown>, params, depth + 1);
     collectTargetGlobalFilterExists(qi, target, params);
+    emitted = true;
   }
   if (filterObj.none !== undefined) {
     collectRelFilterParams(qi, target, filterObj.none as Record<string, unknown>, params, depth + 1);
     collectTargetGlobalFilterExists(qi, target, params);
+    emitted = true;
   }
-  if (filterObj.every !== undefined) {
-    // gf is only emitted (build) when the `every` sub-where compiles to a
-    // filter, otherwise `every` is trivially true and no subquery is built.
-    if (
-      buildSubWhereForRelation(qi, target, qi.q(target), filterObj.every as Record<string, unknown>, [], depth + 1) !==
-      null
-    ) {
-      collectRelFilterParams(qi, target, filterObj.every as Record<string, unknown>, params, depth + 1);
-      collectTargetGlobalFilterExists(qi, target, params);
-    }
+  // gf is only emitted (build) when the `every` sub-where compiles to a
+  // filter, otherwise `every` is trivially true and no subquery is built. A
+  // sub-where that compiles to nothing pushes nothing.
+  if (
+    filterObj.every !== undefined &&
+    collectRelFilterParams(qi, target, filterObj.every as Record<string, unknown>, params, depth + 1)
+  ) {
+    collectTargetGlobalFilterExists(qi, target, params);
+    emitted = true;
   }
   if (filterObj.is !== undefined) {
     if (filterObj.is !== null)
       collectRelFilterParams(qi, target, filterObj.is as Record<string, unknown>, params, depth + 1);
     collectTargetGlobalFilterExists(qi, target, params);
+    emitted = true;
   }
   if (filterObj.isNot !== undefined) {
     if (filterObj.isNot !== null)
       collectRelFilterParams(qi, target, filterObj.isNot as Record<string, unknown>, params, depth + 1);
     collectTargetGlobalFilterExists(qi, target, params);
+    emitted = true;
   }
+  return emitted;
 }
 
+/** Collect a relation sub-where's params; returns whether it compiles to a condition. */
 export function collectRelFilterParams(
   qi: BuilderCtx,
   targetTable: string,
   subWhere: Record<string, unknown>,
   params: unknown[],
   depth = 0,
-): void {
+): boolean {
   const meta = qi.schema.tables[targetTable];
-  if (!meta) return;
+  if (!meta) return false;
   // The FROM-item reference only shapes SQL text, never params, so the bare
   // name serves the collect mirror whether or not the build path aliased it.
-  collectScopedWhereParams(qi, relationWhereScope(qi, targetTable, meta, qi.q(targetTable)), subWhere, params, depth);
+  return collectScopedWhereParams(
+    qi,
+    relationWhereScope(qi, targetTable, meta, qi.q(targetTable)),
+    subWhere,
+    params,
+    depth,
+  );
 }
 
 /**
@@ -738,8 +774,9 @@ export function collectJsonFilterParams(qi: BuilderCtx, filter: JsonFilter, para
 }
 
 /** Collect params from array filter. Mirrors buildArrayFilterClauses. */
-export function collectArrayFilterParams(qi: BuilderCtx, filter: ArrayFilter, params: unknown[]): void {
+export function collectArrayFilterParams(qi: BuilderCtx, filter: ArrayFilter, params: unknown[], column: string): void {
   requireArrayColumns(qi);
+  assertArrayFilter(filter, column);
   if (filter.has !== undefined) params.push(filter.has);
   if (filter.hasEvery !== undefined) params.push(filter.hasEvery);
   if (filter.hasSome !== undefined) params.push(filter.hasSome);
@@ -820,7 +857,8 @@ export function resolveGlobalFilterFrom(
         `${Array.isArray(resolved) ? 'an array' : typeof resolved}.`,
     );
   }
-  const hole = findUndefinedPath(resolved, '', 0);
+  // The boolean scan allocates nothing; the path string is built only on the throw path.
+  const hole = holdsUndefinedValue(resolved, 0) ? findUndefinedPath(resolved, '', 0) : null;
   if (hole !== null) throw unresolvedGlobalFilter(table, `has an undefined value at "${hole}"`);
   return Object.keys(resolved).length === 0 ? null : (resolved as Record<string, unknown>);
 }
@@ -832,31 +870,6 @@ function unresolvedGlobalFilter(table: string, what: string): ValidationError {
       '(for example the current tenant) before this query runs, or pass `skipGlobalFilters: UNSAFE` ' +
       "(import { UNSAFE } from 'turbine-orm') on a query that must see every row.",
   );
-}
-
-/**
- * The key path of the first `undefined` inside a global filter, or `null`.
- * Walks plain objects and arrays; values of any other kind (Dates, Buffers,
- * column references) are leaves. Key NAMES only, never values, so the path is
- * safe in an error message.
- */
-function findUndefinedPath(value: unknown, path: string, depth: number): string | null {
-  if (value === undefined) return path || '(root)';
-  if (typeof value !== 'object' || value === null || depth > 64) return null;
-  if (Array.isArray(value)) {
-    for (let i = 0; i < value.length; i++) {
-      const hit = findUndefinedPath(value[i], `${path}[${i}]`, depth + 1);
-      if (hit !== null) return hit;
-    }
-    return null;
-  }
-  const proto = Object.getPrototypeOf(value);
-  if (proto !== Object.prototype && proto !== null) return null;
-  for (const key of Object.keys(value)) {
-    const hit = findUndefinedPath((value as Record<string, unknown>)[key], path ? `${path}.${key}` : key, depth + 1);
-    if (hit !== null) return hit;
-  }
-  return null;
 }
 
 /**
@@ -891,26 +904,70 @@ export function mergeGlobalFilter(
 }
 
 /**
+ * The tables whose global filter is being compiled right now, per builder
+ * context. A table's filter applies to every relation target a query reaches,
+ * the targets inside another table's filter included, so two filters that
+ * reach each other through relations (or one that reaches its own table) would
+ * apply each other without end. While a table's filter is being compiled, a
+ * relation that reaches that table again reads its rows unfiltered, which ends
+ * the chain. A static filter that forms such a cycle is refused when the client
+ * is built (`normalizeGlobalFilters`); this covers function filters, whose
+ * relations are known only per query. Compilation is synchronous, so the stack
+ * is pushed and popped around each application, on the build and the collect
+ * pass alike.
+ */
+const filtersBeingApplied = new WeakMap<object, string[]>();
+
+/**
+ * Apply `table`'s global filter as a relation target: `apply(gf)` with the
+ * table on the stack, or `none` when no filter applies or the table's filter
+ * is already being compiled further out (see {@link filtersBeingApplied}).
+ * Every target application goes through here, build and collect alike.
+ */
+export function withTargetGlobalFilter<T>(
+  qi: BuilderCtx,
+  table: string,
+  none: T,
+  apply: (gf: Record<string, unknown>) => T,
+): T {
+  let stack = filtersBeingApplied.get(qi);
+  if (stack?.includes(table)) return none;
+  const gf = resolveGlobalFilter(qi, table);
+  if (!gf) return none;
+  if (!stack) {
+    stack = [];
+    filtersBeingApplied.set(qi, stack);
+  }
+  stack.push(table);
+  try {
+    return apply(gf);
+  } finally {
+    stack.pop();
+  }
+}
+
+/**
  * SQL clause for `targetTable`'s global filter rendered against `alias`
  * (relation subqueries, `_count`, relation `orderBy`). Pushes its params to
  * `params`; returns `''` when no filter applies. Mirror:
  * {@link collectTargetGlobalFilterAlias}.
  */
 export function targetGlobalFilterAlias(qi: BuilderCtx, targetTable: string, alias: string, params: unknown[]): string {
-  const gf = resolveGlobalFilter(qi, targetTable);
-  if (!gf) return '';
   const meta = qi.schema.tables[targetTable];
   if (!meta) return '';
-  return buildAliasWhere(qi, targetTable, meta, alias, gf, params) ?? '';
+  return withTargetGlobalFilter(
+    qi,
+    targetTable,
+    '',
+    (gf) => buildAliasWhere(qi, targetTable, meta, alias, gf, params) ?? '',
+  );
 }
 
 /** Param-collect mirror of {@link targetGlobalFilterAlias}. */
 export function collectTargetGlobalFilterAlias(qi: BuilderCtx, targetTable: string, params: unknown[]): void {
-  const gf = resolveGlobalFilter(qi, targetTable);
-  if (!gf) return;
   const meta = qi.schema.tables[targetTable];
   if (!meta) return;
-  collectAliasWhereParams(qi, targetTable, meta, gf, params);
+  withTargetGlobalFilter(qi, targetTable, false, (gf) => collectAliasWhereParams(qi, targetTable, meta, gf, params));
 }
 
 /**
@@ -925,16 +982,17 @@ export function targetGlobalFilterExists(
   targetRef: string,
   params: unknown[],
 ): string {
-  const gf = resolveGlobalFilter(qi, targetTable);
-  if (!gf) return '';
-  return buildSubWhereForRelation(qi, targetTable, targetRef, gf, params) ?? '';
+  return withTargetGlobalFilter(
+    qi,
+    targetTable,
+    '',
+    (gf) => buildSubWhereForRelation(qi, targetTable, targetRef, gf, params) ?? '',
+  );
 }
 
 /** Param-collect mirror of {@link targetGlobalFilterExists}. */
 export function collectTargetGlobalFilterExists(qi: BuilderCtx, targetTable: string, params: unknown[]): void {
-  const gf = resolveGlobalFilter(qi, targetTable);
-  if (!gf) return;
-  collectRelFilterParams(qi, targetTable, gf, params);
+  withTargetGlobalFilter(qi, targetTable, false, (gf) => collectRelFilterParams(qi, targetTable, gf, params));
 }
 
 /**
@@ -982,7 +1040,8 @@ export function globalFilterCacheSegment(qi: BuilderCtx): string {
  * True when the USER-supplied `where` narrows no row: it compiles to no
  * predicate (`{}`, `{ id: undefined }`, `{ OR: [{ a: undefined }] }`, …), or
  * to one that is TRUE for every row (`{ NOT: { OR: [] } }`,
- * `{ id: { notIn: [] } }`, see {@link foldWhere}). Either way a mutation
+ * `{ id: { notIn: [] } }`, and on a NOT NULL column `{ email: { contains: '' } }`
+ * or `{ id: { not: null } }`, see {@link foldWhere}). Either way a mutation
  * guarded by it would write every row. It reads the compiled emptiness, NOT
  * the fingerprint (which is non-empty for an all-undefined `OR`/`AND`), and it
  * ignores any configured global filter, so a global filter never lets an
@@ -991,7 +1050,21 @@ export function globalFilterCacheSegment(qi: BuilderCtx): string {
 export function userPredicateIsEmpty(qi: BuilderCtx, userWhere: Record<string, unknown>): boolean {
   const throwaway: unknown[] = [];
   if (buildWhereClause(qi, userWhere, throwaway) === null) return true;
-  return foldWhere(qi.whereHost, userWhere, (table) => tableWhereHost(qi, table)) === 'true';
+  return foldWhere(qi.whereHost, userWhere, (table) => tableWhereHost(qi, table), 0, guardFoldOptions(qi)) === 'true';
+}
+
+/**
+ * The guard's fold reads NOT NULL columns, and trusts a declared foreign key
+ * except on SQLite, which enforces one only when the connection turned
+ * `foreign_keys` on, so a row there can point at a row that does not exist.
+ */
+function guardFoldOptions(qi: BuilderCtx): WhereFoldOptions {
+  return {
+    notNull: {
+      foreignKeys: qi.dialect.name !== 'sqlite',
+      hasGlobalFilter: (table) => qi.globalFilters !== undefined && Object.hasOwn(qi.globalFilters, table),
+    },
+  };
 }
 
 /** The where host of `table` in this client's schema, or `undefined` when the schema has no such table. */
@@ -1057,12 +1130,9 @@ export function buildWhereClause(
     switch (event.kind) {
       case 'or': {
         if (!internal) qi.markVariableArity();
-        const orClauses: string[] = [];
-        for (const orCond of event.conditions) {
-          const sub = buildWhereClause(qi, orCond, params, depth + 1);
-          if (sub) orClauses.push(sub);
-        }
-        if (orClauses.length > 0) andClauses.push(`(${orClauses.join(' OR ')})`);
+        andClauses.push(
+          buildOrClause(event.conditions, params, (cond) => buildWhereClause(qi, cond, params, depth + 1)),
+        );
         break;
       }
       case 'and':
@@ -1092,6 +1162,52 @@ export function buildWhereClause(
 
   if (andClauses.length === 0) return null;
   return andClauses.join(' AND ');
+}
+
+/**
+ * The SQL an `OR` compiles to when one of its branches compiles to nothing.
+ * Written out rather than left empty, because `NOT` of an empty clause applies
+ * no condition while `NOT` of this matches no row.
+ */
+const ALWAYS_TRUE_SQL = '(1 = 1)';
+
+/**
+ * Compile an `OR` from its branches. A branch with no condition (`{}`,
+ * `{ AND: [] }`) is TRUE for every row, so the whole `OR` is TRUE: the clause
+ * is {@link ALWAYS_TRUE_SQL} and the params the other branches pushed are
+ * taken back. Every branch is still built, so each is validated exactly as the
+ * param collect validates it. {@link collectOrParams} is the mirror.
+ */
+function buildOrClause(
+  branches: readonly WhereRecord[],
+  params: unknown[],
+  build: (branch: WhereRecord) => string | null,
+): string {
+  const mark = params.length;
+  const parts: string[] = [];
+  let alwaysTrue = false;
+  for (const branch of branches) {
+    const sub = build(branch);
+    if (sub === null) alwaysTrue = true;
+    else parts.push(sub);
+  }
+  if (!alwaysTrue) return `(${parts.join(' OR ')})`;
+  params.length = mark;
+  return ALWAYS_TRUE_SQL;
+}
+
+/** Param-collect mirror of {@link buildOrClause}; `collect` reports whether the branch compiled to a condition. */
+function collectOrParams(
+  branches: readonly WhereRecord[],
+  params: unknown[],
+  collect: (branch: WhereRecord) => boolean,
+): void {
+  const mark = params.length;
+  let alwaysTrue = false;
+  for (const branch of branches) {
+    if (!collect(branch)) alwaysTrue = true;
+  }
+  if (alwaysTrue) params.length = mark;
 }
 
 /**
@@ -1172,12 +1288,21 @@ export function buildScalarClause(
  * A bare object on a JSON column is a whole-document equality, the same thing
  * `equals` is. PostgreSQL's `jsonb = $1` already reads it so. MySQL compared
  * the column with the bound TEXT, which matched no row (and its `NOT` every
- * row), so there it compiles to the typed comparison `equals` uses. Decided
- * from the dialect, the column and the value's shape, all of which the cache
- * key already carries (a bare object fingerprints as `obj(...)`).
+ * row), so there it compiles to the typed comparison `equals` uses. SQLite and
+ * SQL Server compared the stored text, so key order and whitespace decided the
+ * match; they refuse it (E017) as they refuse `equals`, and a bare array with
+ * it. Decided from the dialect, the column and the value's shape, all of which
+ * the cache key already carries (a bare object fingerprints as `obj(...)`; a
+ * bare array only ever refuses, so it changes no SQL).
  */
 function isBareJsonDocument(qi: BuilderCtx, pgType: string, value: unknown): boolean {
-  return qi.dialect.name === 'mysql' && isPlainRecord(value) && operandColumnKind(pgType) === 'json';
+  if (qi.dialect.name === 'postgresql' || operandColumnKind(pgType) !== 'json') return false;
+  return isPlainRecord(value) || (Array.isArray(value) && !comparesJsonDocuments(qi));
+}
+
+/** Whether the engine compares two whole JSON documents exactly (key order and whitespace aside). */
+function comparesJsonDocuments(qi: BuilderCtx): boolean {
+  return qi.dialect.name === 'postgresql' || qi.dialect.name === 'mysql';
 }
 
 /** A bind callback for the build passes: pushes the value and returns its placeholder. */
@@ -1339,15 +1464,23 @@ export function buildScopedWhere(
   for (const event of walkWhere(scope.host, where)) {
     switch (event.kind) {
       case 'or':
-      case 'and': {
         // Same variable-arity rule as the top level: a nested relation filter
         // or a relation `with` where can carry a caller-sized OR just as easily.
-        if (!internal && !(event.kind === 'and' && event.fixedArity)) qi.markVariableArity();
+        if (!internal) qi.markVariableArity();
+        clauses.push(
+          buildOrClause(event.conditions, params, (cond) => {
+            const sub = buildScopedWhere(qi, scope, cond, params, depth + 1);
+            return sub === null ? null : `(${sub})`;
+          }),
+        );
+        break;
+      case 'and': {
+        if (!internal && !event.fixedArity) qi.markVariableArity();
         const parts = event.conditions
           .map((cond) => buildScopedWhere(qi, scope, cond, params, depth + 1))
           .filter((s): s is string => s !== null)
           .map((s) => `(${s})`);
-        if (parts.length > 0) clauses.push(`(${parts.join(event.kind === 'or' ? ' OR ' : ' AND ')})`);
+        if (parts.length > 0) clauses.push(`(${parts.join(' AND ')})`);
         break;
       }
       case 'not': {
@@ -1459,7 +1592,8 @@ export function buildScopedScalarClause(
  * Cache-hit param-collect mirror of {@link buildScopedWhere}: pushes the exact
  * same params in the exact same order (driven by the same {@link walkWhere}),
  * without rebuilding SQL. Serves both {@link collectRelFilterParams} and
- * {@link collectAliasWhereParams}.
+ * {@link collectAliasWhereParams}. Returns whether the clause compiles to a
+ * condition (`buildScopedWhere` non-null).
  */
 export function collectScopedWhereParams(
   qi: BuilderCtx,
@@ -1467,27 +1601,37 @@ export function collectScopedWhereParams(
   where: Record<string, unknown>,
   params: unknown[],
   depth = 0,
-): void {
+): boolean {
   assertWhereDepth(depth);
+  let emitted = false;
   for (const event of walkWhere(scope.host, where)) {
     switch (event.kind) {
       case 'or':
+        collectOrParams(event.conditions, params, (cond) =>
+          collectScopedWhereParams(qi, scope, cond, params, depth + 1),
+        );
+        emitted = true;
+        break;
       case 'and':
-        for (const cond of event.conditions) collectScopedWhereParams(qi, scope, cond, params, depth + 1);
+        for (const cond of event.conditions) {
+          if (collectScopedWhereParams(qi, scope, cond, params, depth + 1)) emitted = true;
+        }
         break;
       case 'not':
-        collectScopedWhereParams(qi, scope, event.condition, params, depth + 1);
+        if (collectScopedWhereParams(qi, scope, event.condition, params, depth + 1)) emitted = true;
         break;
       case 'relation':
         // Same some→none→every→is→isNot (each: sub-where params then target
         // global-filter params) as buildRelationFilter emits.
-        collectRelationFilterParams(qi, event.relDef, event.filterObj, params, depth);
+        if (collectRelationFilterParams(qi, event.relDef, event.filterObj, params, depth)) emitted = true;
         break;
       case 'scalar':
         collectScopedScalarParams(qi, scope, event.key, event.value, params);
+        emitted = true;
         break;
     }
   }
+  return emitted;
 }
 
 /** Param-collect mirror of {@link buildScopedScalarClause}. */
@@ -1517,7 +1661,7 @@ export function collectScopedScalarParams(
   if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
     const colType = pgTypeForColumn(qi, meta, col);
     if (colType.startsWith('_')) {
-      collectArrayFilterParams(qi, value, params);
+      collectArrayFilterParams(qi, value, params, `${qi.q(scope.table)}.${qi.q(col)}`);
       return;
     }
   }
@@ -1813,12 +1957,82 @@ export function pgTypeForColumn(_qi: BuilderCtx, meta: TableMetadata, column: st
  * SQL-template cache is unaffected, and it is applied on the cache-hit
  * param-collect path as well as the build path.
  *
+ * On MySQL a number, bigint or boolean compared with a text column binds as
+ * text ({@link textComparedOperand}), and so does each such element of a list.
+ *
  * `timestamptz` and every non-temporal column are returned by identity.
  */
 export function coerceWhereOperand(qi: BuilderCtx, meta: TableMetadata, column: string, value: unknown): unknown {
-  if (!(value instanceof Date) && !Array.isArray(value)) return value;
-  const dbType = pgTypeForColumn(qi, meta, column);
-  return coerceTemporalValue(dbType, value, utcDateTimeRewrite(qi, dbType));
+  if (value instanceof Date || Array.isArray(value)) {
+    const dbType = pgTypeForColumn(qi, meta, column);
+    const coerced = coerceTemporalValue(dbType, value, utcDateTimeRewrite(qi, dbType));
+    return Array.isArray(coerced) ? textComparedList(qi, dbType, coerced) : coerced;
+  }
+  if (qi.dialect.name !== 'mysql' || typeof value === 'string' || typeof value === 'object') return value;
+  return textComparedOperand(qi, pgTypeForColumn(qi, meta, column), value);
+}
+
+/**
+ * Column types MySQL compares with a NUMBER numerically, converting each
+ * stored text to a number: `'0zz' = 0` and `'abc' = 0` are both true, and a
+ * boolean is the number 1 or 0 there. A request body that carries `0` or
+ * `false` where a token string belongs would match the first row whose token
+ * does not start with a digit. Exported so the write path's re-read keys use
+ * this one list rather than a copy.
+ */
+export const TEXT_COMPARED_TYPES: ReadonlySet<string> = new Set([
+  'char',
+  'varchar',
+  'character',
+  'character varying',
+  'bpchar',
+  'nchar',
+  'nvarchar',
+  'text',
+  'tinytext',
+  'mediumtext',
+  'longtext',
+  'binary',
+  'varbinary',
+  'tinyblob',
+  'blob',
+  'mediumblob',
+  'longblob',
+  'uuid',
+  'citext',
+]);
+
+/**
+ * A value bound against a column of `columnType`, as MySQL must receive it to
+ * compare it as the value it is: a number or bigint becomes its decimal text
+ * and a boolean `'1'` / `'0'` (what MySQL stores when a boolean is written to
+ * a text column), so the comparison is text with text. Every other engine,
+ * value and column type is returned unchanged. THE rule for every value Turbine
+ * binds against a column on MySQL: the where compiler applies it to each
+ * operand, and the writes apply it to the keys they re-read a row by.
+ */
+export function textComparedOperand(
+  qi: Pick<BuilderCtx, 'dialect'>,
+  columnType: string | undefined,
+  value: unknown,
+): unknown {
+  if (qi.dialect.name !== 'mysql') return value;
+  if (typeof value !== 'number' && typeof value !== 'bigint' && typeof value !== 'boolean') return value;
+  if (columnType === undefined || !TEXT_COMPARED_TYPES.has(columnType.toLowerCase())) return value;
+  return typeof value === 'boolean' ? (value ? '1' : '0') : String(value);
+}
+
+/** {@link textComparedOperand} for each element of an `in` / `notIn` list; the list itself when none changes. */
+function textComparedList(qi: BuilderCtx, columnType: string | undefined, list: unknown[]): unknown[] {
+  if (qi.dialect.name !== 'mysql') return list;
+  let out: unknown[] | undefined;
+  for (let i = 0; i < list.length; i++) {
+    const next = textComparedOperand(qi, columnType, list[i]);
+    if (next === list[i]) continue;
+    out ??= list.slice();
+    out[i] = next;
+  }
+  return out ?? list;
 }
 
 /**
@@ -1922,10 +2136,10 @@ export function collectAliasWhereParams(
   targetMeta: TableMetadata,
   where: Record<string, unknown>,
   params: unknown[],
-): void {
+): boolean {
   // The alias identifier is irrelevant to param collection (it only shapes SQL
   // text), so reuse the relation scope's host binding for `targetMeta`.
-  collectScopedWhereParams(qi, aliasWhereScope(qi, targetTable, targetMeta, ''), where, params);
+  return collectScopedWhereParams(qi, aliasWhereScope(qi, targetTable, targetMeta, ''), where, params);
 }
 
 /**
@@ -2446,70 +2660,6 @@ function assertInsensitiveOperand(value: unknown, operator: 'equals' | 'not' | '
 }
 
 /**
- * Refuse a {@link JsonFilter} carrying a key that is not a JSON operator, and
- * refuse a filter that selects a `path` but never compares it.
- *
- * Both shapes used to compile to NOTHING. `buildJsonFilterClauses` only ever
- * emitted a clause for a key it recognized, so `{ path: ['title'],
- * string_contains: 'x' }`, the Prisma spelling, and an easy typo besides -
- * produced an empty clause list, the predicate vanished, and the query
- * returned EVERY row. Inside an `AND` it silently dropped that conjunct, so a
- * tenant scope written this way widened to the whole table. The equivalent
- * typo on a scalar column has always thrown; this closes the inconsistency.
- *
- * Called from both the SQL-build path and the cache-hit param-collect path, so
- * a warmed SQL cache cannot skip the check.
- */
-export function assertJsonFilterKeys(filter: JsonFilter, column: string): void {
-  const obj = filter as Record<string, unknown>;
-  const present = Object.keys(obj).filter((k) => obj[k] !== undefined);
-
-  for (const key of present) {
-    if (isColumnRef(obj[key])) {
-      throw new ValidationError(
-        `A column reference cannot be the '${key}' operand of a JSON filter on ${column}: on a json/jsonb ` +
-          'column the operand is a JSON value. Compare the column with col() only on non-JSON columns.',
-      );
-    }
-  }
-
-  for (const key of present) {
-    if (JSON_FILTER_KEYS.has(key)) continue;
-    const suggestion = JSON_PRISMA_SPELLINGS[key];
-    throw new ValidationError(
-      `Unknown JSON filter operator "${key}" on ${column}.` +
-        (suggestion ? ` Did you mean \`${suggestion}\`?` : '') +
-        ` Supported operators: ${[...JSON_FILTER_KEYS].sort().join(', ')}.`,
-    );
-  }
-
-  // `mode` and `path` are modifiers, not comparisons: a filter made only of
-  // those compares nothing, which is exactly the silent no-op shape above.
-  if (present.length > 0 && present.every((k) => k === 'path' || k === 'mode')) {
-    throw new ValidationError(
-      `JSON filter on ${column} selects a \`path\` but has no comparison. ` +
-        `Add one of: ${[...JSON_FILTER_KEYS]
-          .filter((k) => k !== 'path' && k !== 'mode')
-          .sort()
-          .join(', ')}.`,
-    );
-  }
-}
-
-/**
- * The Prisma spelling of each JSON operator, so a migrator who writes the
- * name they already know gets told the turbine one instead of a bare list.
- */
-const JSON_PRISMA_SPELLINGS: Record<string, string> = {
-  string_contains: 'stringContains',
-  string_starts_with: 'stringStartsWith',
-  string_ends_with: 'stringEndsWith',
-  array_contains: 'contains',
-  startsWith: 'stringStartsWith',
-  endsWith: 'stringEndsWith',
-};
-
-/**
  * Validate and enumerate the substring comparisons on a JSON filter, in the
  * fixed {@link JSON_STRING_OPERATORS} order. Shared by the build and collect
  * paths exactly like {@link jsonRangeEntries}, so both agree on the params
@@ -2669,8 +2819,10 @@ function collectOnly(params: unknown[]): (value: unknown) => string {
  * `not: { equals: X }` is the negation of `equals: X` everywhere it compiles
  * (an engine without an exact comparison refuses it rather than comparing a
  * document `{"equals": X}`). A plain `not: X` means the same thing on the
- * engines that compare whole documents exactly (PostgreSQL, MySQL); SQLite and
- * SQL Server keep comparing the bound value as text, as before.
+ * engines that compare whole documents exactly (PostgreSQL, MySQL). On SQLite
+ * and SQL Server a document (object or array) is refused the same way, since
+ * comparing it as text lets key order decide; a scalar keeps comparing as the
+ * bound value, as before.
  */
 function jsonNegatedDocument(qi: BuilderCtx, not: unknown, operand: OperandContext): unknown {
   if (operand.kind !== 'json' || not === null || not === undefined || isColumnRef(not)) return NO_JSON_NEGATION;
@@ -2678,7 +2830,8 @@ function jsonNegatedDocument(qi: BuilderCtx, not: unknown, operand: OperandConte
     const keys = Object.keys(not).filter((k) => (not as Record<string, unknown>)[k] !== undefined);
     if (keys.length === 1 && keys[0] === 'equals') return (not as { equals: unknown }).equals;
   }
-  return qi.dialect.name === 'postgresql' || qi.dialect.name === 'mysql' ? not : NO_JSON_NEGATION;
+  if (comparesJsonDocuments(qi)) return not;
+  return isPlainRecord(not) || Array.isArray(not) ? not : NO_JSON_NEGATION;
 }
 const NO_JSON_NEGATION: unique symbol = Symbol('no JSON negation');
 
@@ -2839,12 +2992,19 @@ export function buildJsonFilterClauses(
  * params) and fail at runtime with the engine's bad-JSON-path error. The
  * encoded path stays a bound parameter, never spliced into SQL text, so
  * the build/collect param mirrors stay in lockstep and injection-safe.
+ *
+ * A key segment is written as a JSON string literal (`JSON.stringify`), the
+ * form the engines' JSONPath grammars read a quoted key in: a backslash, a
+ * quote and a control character are each escaped. Escaping only the quote
+ * read a key holding a backslash as an escape sequence, so the key `a\b` was
+ * looked up as a different key and matched nothing, a key ending in a
+ * backslash was a bad path, and MySQL refused a key holding a newline.
  */
 export function jsonPathParam(qi: BuilderCtx, path: readonly (string | number)[], nativeForm?: unknown): unknown {
   if (qi.dialect.jsonPathSupport === 'native') return nativeForm ?? path.map(String);
   return `$${path
     .map((seg) =>
-      typeof seg === 'number' || /^\d+$/.test(String(seg)) ? `[${seg}]` : `."${String(seg).replace(/"/g, '\\"')}"`,
+      typeof seg === 'number' || /^\d+$/.test(String(seg)) ? `[${seg}]` : `.${JSON.stringify(String(seg))}`,
     )
     .join('')}`;
 }
@@ -2873,6 +3033,7 @@ export function buildArrayFilterClauses(
   pgType: string,
 ): string[] {
   requireArrayColumns(qi);
+  assertArrayFilter(filter, column);
   const clauses: string[] = [];
   const elementType = getArrayElementType(qi, pgType);
 

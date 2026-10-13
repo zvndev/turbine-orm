@@ -144,10 +144,16 @@ describe('whole-document JSON equals, build-only', () => {
       for (const where of [{ doc: { equals: { a: 1 } } }, { doc: { not: { equals: { a: 1 } } } }]) {
         assert.throws(() => q.buildFindMany({ where } as never), UnsupportedFeatureError, dialect.name);
       }
-      // A plain `not: <document>` keeps its bound-value comparison there.
-      const plain = q.buildFindMany({ where: { doc: { not: { a: 1 } } } } as never);
+      // A plain `not: <document>` and a bare document are the same document
+      // comparison, so they are refused too: compared as text, key order
+      // decided the match.
+      for (const where of [{ doc: { not: { a: 1 } } }, { doc: { a: 1 } }, { doc: { not: [1] } }]) {
+        assert.throws(() => q.buildFindMany({ where } as never), UnsupportedFeatureError, dialect.name);
+      }
+      // A scalar keeps its bound-value comparison.
+      const plain = q.buildFindMany({ where: { doc: { not: 5 } } } as never);
       assert.match(plain.sql, /!= (?:@p1|:p1)/, dialect.name);
-      assert.deepEqual(plain.params, [{ a: 1 }], dialect.name);
+      assert.deepEqual(plain.params, [5], dialect.name);
     }
   });
 });
