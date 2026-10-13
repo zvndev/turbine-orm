@@ -21,6 +21,7 @@ import {
   ValidationError,
 } from './errors.js';
 import { markInternalRowSelector } from './query/compound-unique.js';
+import { isPlainRecord, setOwn } from './query/filters.js';
 import { markInternalCombinator, resolveColumnName } from './query/utils.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
 import { normalizeKeyColumns } from './schema.js';
@@ -112,7 +113,7 @@ export function extractRelationFields(data: Record<string, unknown>, tableMeta: 
     ) {
       relations[key] = value as Record<string, unknown>;
     } else {
-      scalars[key] = value;
+      setOwn(scalars, key, value);
     }
   }
 
@@ -308,12 +309,15 @@ const BELONGS_TO_POINTER_OPS = ['create', 'connect', 'connectOrCreate', 'disconn
  *
  * A belongsTo relation is one row the parent points at, so it takes Prisma's
  * to-one operations: no `set` (a to-many operation), and at most one of the
- * operations that decide what the parent points at. Each of those used to be
- * accepted and then quietly reduced to one of them.
+ * operations that decide what the parent points at, since one write cannot
+ * honor two. An operation whose value is `undefined` is absent, as everywhere
+ * else in a query; only its name is still checked, so a misspelled operation
+ * is reported whatever it holds.
  */
 function validateOps(relationName: string, ops: Record<string, unknown>, isUpdate: boolean, rel?: RelationDef): void {
   const belongsTo = rel?.type === 'belongsTo';
   for (const opName of Object.keys(ops)) {
+    const absent = ops[opName] === undefined;
     if (!CREATE_ONLY_OPS.has(opName) && !UPDATE_ONLY_OPS.has(opName)) {
       const updateOps = belongsTo
         ? ', disconnect, delete, update, upsert'
@@ -323,6 +327,7 @@ function validateOps(relationName: string, ops: Record<string, unknown>, isUpdat
           `Valid operations: create, connect, connectOrCreate${isUpdate ? updateOps : ''}.`,
       );
     }
+    if (absent) continue;
     if (!isUpdate && UPDATE_ONLY_OPS.has(opName)) {
       throw new ValidationError(
         `Operation "${opName}" on relation "${relationName}" is only valid inside update(), not create().`,
@@ -351,7 +356,7 @@ function validateOps(relationName: string, ops: Record<string, unknown>, isUpdat
 /**
  * The single item a to-one operation names. A one-element array is accepted
  * for compatibility; an empty or longer one is refused, since only one row can
- * be pointed at and the rest used to be dropped without a word.
+ * be pointed at and keeping one of several would drop the rest silently.
  */
 function singleToOneItem<T>(value: T | T[], op: string, relName: string, rel: RelationDef): T {
   if (!Array.isArray(value)) return value;
@@ -367,12 +372,11 @@ function singleToOneItem<T>(value: T | T[], op: string, relName: string, rel: Re
  *
  * Built from the DATA, recursively: a relation whose payload itself contains
  * relation writes is requested as `{ rel: { with: { ... } } }` rather than
- * `{ rel: true }`. It used to be the top-level keys alone, so a depth-3 create
- * wrote all three levels and returned an object whose grandchildren were
- * missing entirely, which a caller reads as "there are none".
+ * `{ rel: true }`. Requesting the top-level keys alone would return a depth-3
+ * create without its grandchildren, which a caller reads as "there are none".
  *
  * Only relations that were actually WRITTEN are requested, so a create with no
- * nested data still reads back exactly what it did before. The walk is capped
+ * nested data reads back just the row. The walk is capped
  * at {@link MAX_DEPTH}, the cap the write walk itself uses, and the builder's
  * own relation-depth guard is the backstop below that.
  */
@@ -420,11 +424,6 @@ function readBackWith(
   }
 
   return Object.keys(clause).length > 0 ? clause : undefined;
-}
-
-/** A plain object (not an array, Date or null), the shape nested payloads take. */
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value) && !(value instanceof Date);
 }
 
 /**
@@ -1104,6 +1103,19 @@ function notRelatedToParent(op: string, relName: string, rel: RelationDef, targe
   });
 }
 
+/** A belongsTo `delete` (or a `disconnect` naming fields) on a parent whose foreign key is NULL. */
+function nothingConnected(op: string, relName: string, rel: RelationDef, target: unknown): NotFoundError {
+  return new NotFoundError({
+    table: rel.to,
+    where: target,
+    operation: `nested ${op}`,
+    message:
+      `Nested ${op} on relation "${relName}": nothing is connected (this record's foreign key to "${rel.to}" ` +
+      `is NULL), so there is no "${rel.to}" row to ${op}.` +
+      (op === 'disconnect' ? ' Use `disconnect: true` to clear the relation whatever it points at.' : ''),
+  });
+}
+
 /** Re-tag a NotFoundError from a scoped child write as a relation-scoped miss. */
 function rethrowAsNotRelated(err: unknown, op: string, relName: string, rel: RelationDef, target: unknown): never {
   if (err instanceof NotFoundError) {
@@ -1534,9 +1546,12 @@ async function processBelongsToCreate(
  * `disconnect` / `delete` on a belongsTo relation, with Prisma's semantics:
  * both clear the parent's foreign key, and `delete` then deletes the row it
  * pointed at. `true` (or `{}`) means the connected row; an object with fields
- * additionally requires the connected row to match it. Both need a nullable foreign key: with a
- * NOT NULL one the parent cannot exist pointing at nothing (and `delete` was
- * previously ignored outright).
+ * additionally requires the connected row to match it. Both need a nullable
+ * foreign key: with a NOT NULL one the parent cannot exist pointing at nothing.
+ *
+ * `disconnect: true` when nothing is connected is a no-op: the parent already
+ * points at nothing, which is what was asked. A `delete`, or a `disconnect`
+ * that names fields, asks about a row that is not there, so it is E001.
  */
 async function processBelongsToDisconnect(
   ctx: NestedWriteContext,
@@ -1564,7 +1579,10 @@ async function processBelongsToDisconnect(
   const target = isPlainRecord(item) && Object.keys(item).length === 0 ? true : item;
   assertTargetSelectsSomething(target, op, relName, rel);
   const correlation = belongsToCorrelationWhere(ctx, rel, parentRow, parentTable);
-  if (!correlation) throw notRelatedToParent(op, relName, rel, target);
+  if (!correlation) {
+    if (op === 'disconnect' && target === true) return;
+    throw nothingConnected(op, relName, rel, target);
+  }
   const related = (await ctx.tx.table(rel.to).findFirst({ where: scopeWhereToParent(target, correlation) })) as Record<
     string,
     unknown
