@@ -2,23 +2,33 @@
  * turbine-orm: `globalFilters` is checked against the schema at construction.
  *
  * A global filter is a tenancy or soft-delete boundary, so one that silently
- * applies to nothing returns exactly the rows it was meant to hide. Keys used
- * to be looked up by table name only: a typo, or the client accessor spelling
- * of a multi-word table (`blogPosts` for `blog_posts`, the spelling the config
- * docs show), was accepted and never applied. Now the accessor spelling
- * applies, and a key naming no table, or a static filter naming no column, is
- * refused with E003 and the closest valid name. Every engine factory builds a
- * TurbineClient, so the check covers them too (SQLite exercised here).
+ * applies to nothing returns exactly the rows it was meant to hide. The client
+ * accessor spelling of a multi-word table (`blogPosts` for `blog_posts`, the
+ * spelling the config docs show) applies, and a key naming no table, or a
+ * static filter naming no column, is refused with E003 and the closest valid
+ * name. Every engine factory builds a TurbineClient, so the check covers them
+ * too (SQLite exercised here, when `node:sqlite` exists).
  *
  * Build-only: no database.
  */
 
 import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
 import { describe, it } from 'node:test';
 import { type PgCompatPool, TurbineClient } from '../client.js';
 import { ValidationError } from '../errors.js';
 import type { SchemaMetadata } from '../schema.js';
-import { mockTable } from './helpers.js';
+import { mockTable, skipGate } from './helpers.js';
+
+const hasNodeSqlite = (() => {
+  try {
+    createRequire(process.cwd())('node:sqlite');
+    return true;
+  } catch {
+    return false;
+  }
+})();
+const sqlite = skipGate(!hasNodeSqlite, 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)');
 
 function schema(): SchemaMetadata {
   return {
@@ -127,7 +137,7 @@ describe('globalFilters: keys are checked against the schema at construction', (
     assert.doesNotThrow(() => client({ users: null }));
   });
 
-  it('engine factories get the same check', async () => {
+  sqlite.it('engine factories get the same check', async () => {
     const { turbineSqlite } = await import('../sqlite.js');
     assert.throws(
       () => turbineSqlite(':memory:', schema(), { globalFilters: { blogPost: { deletedAt: null } } }),

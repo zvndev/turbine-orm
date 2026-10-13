@@ -94,10 +94,24 @@ describe('generated sibling imports follow the import extension', () => {
 
 const [major = 0, minor = 0] = process.versions.node.split('.').map(Number);
 const nodeStripsTypes = major > 22 || (major === 22 && minor >= 6);
-const strip = skipGate(
-  !nodeStripsTypes,
-  `needs Node 22.6+ for native type stripping (running ${process.versions.node})`,
-);
+
+/**
+ * `it`, skipping every test with `reason` when one is given. For preconditions
+ * that are not a database engine (a Node version, a built `dist/`): no
+ * `TURBINE_REQUIRE_ENGINE` job can claim them, so they stay out of `skipGate`,
+ * which is for engine availability only.
+ */
+function itUnless(base: typeof it, reason: string | undefined): typeof it {
+  if (reason === undefined) return base;
+  return ((name: string) => base(name, { skip: reason }, () => {})) as typeof it;
+}
+
+const strip = {
+  it: itUnless(
+    it,
+    nodeStripsTypes ? undefined : `needs Node 22.6+ for native type stripping (running ${process.versions.node})`,
+  ),
+};
 
 /** Run `app.ts` with Node's type stripping on. Warnings are noise, so they go to stderr only. */
 function runStripped(cwd: string, env: Record<string, string> = {}) {
@@ -183,14 +197,17 @@ describe('Node runs a generated client directly (stub library, no database)', ()
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const built = existsSync(join(REPO_ROOT, 'dist', 'index.js'));
-const real = skipGate(
-  !DATABASE_URL || !built || !nodeStripsTypes,
-  !DATABASE_URL
-    ? 'requires DATABASE_URL'
-    : !built
+const database = skipGate(!DATABASE_URL, 'requires DATABASE_URL');
+const real = {
+  it: itUnless(
+    database.it,
+    !built
       ? 'requires a built dist/ (npm run build)'
-      : `needs Node 22.6+ (running ${process.versions.node})`,
-);
+      : nodeStripsTypes
+        ? undefined
+        : `needs Node 22.6+ (running ${process.versions.node})`,
+  ),
+};
 
 describe('Node runs a generated client against the real library and a database', () => {
   const table = `cgcli_ext_${process.pid}_${Date.now().toString(36)}`;
