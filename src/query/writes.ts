@@ -99,9 +99,15 @@ import * as whereMod from './where.js';
  * object shaped like one is refused on a non-JSON column on every engine.
  *
  * Every other value is returned by identity, so a primitive costs one check
- * and no lookup.
+ * and no lookup. The exception is a string on an engine that defines the
+ * dialect's `checkTextWrite` (SQLite), which is checked against its column's
+ * type first; see {@link checkTextWrite}.
  */
 export function coerceWriteValue(qi: BuilderCtx, key: string, value: unknown): unknown {
+  if (typeof value === 'string') {
+    if (qi.dialect.checkTextWrite !== undefined) checkTextWrite(qi, key, value);
+    return value;
+  }
   if (value === null || typeof value !== 'object') return value;
   if (isSqlExpr(value) || isColumnRef(value)) {
     throw new ValidationError(exprNotAllowedMessage(qi.table, key, value));
@@ -128,6 +134,20 @@ export function coerceWriteValue(qi: BuilderCtx, key: string, value: unknown): u
   // same form: a `date` column the UTC date part on every SQL engine, a
   // zone-less `timestamp` the UTC literal on PostgreSQL only.
   return coerceTemporalValue(dbType, value, whereMod.utcDateTimeRewrite(qi, dbType));
+}
+
+/**
+ * Ask the engine whether it stores `value` in the column `key` names as that
+ * column's type (the dialect's `checkTextWrite`); E003 when it would not.
+ * An unknown key is left to the build path's own error, as in
+ * {@link coerceWriteValue}.
+ */
+function checkTextWrite(qi: BuilderCtx, key: string, value: string): void {
+  const column = resolveColumnName(qi.tableMeta, key);
+  const columnType = column ? qi.columnPgTypeMap.get(column) : undefined;
+  if (!column || columnType === undefined) return;
+  const refusal = qi.dialect.checkTextWrite?.(qi.table, column, columnType, value);
+  if (refusal !== undefined) throw new ValidationError(refusal);
 }
 
 /** `JSON.stringify(value)` for a JSON column, or E003 when it has no JSON form. */
