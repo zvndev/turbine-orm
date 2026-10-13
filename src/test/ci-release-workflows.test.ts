@@ -177,7 +177,33 @@ describe('release publishes the tarball the gates tested', () => {
   it('npm publish runs in the staged package directory', () => {
     const pub = step(publish, 'Publish to npm');
     assert.match(pub, /working-directory: \$\{\{ runner\.temp \}\}\/release-package\/package/);
-    assert.match(pub, /run: npm publish --provenance --access public/);
+    assert.match(pub, /^ {10}npm publish --provenance --access public /m);
+  });
+
+  it('publish runs in the protected release environment', () => {
+    assert.ok(
+      publish.some((l) => /^ {4}environment: release\s*$/.test(l)),
+      'publish job is not in the `release` environment',
+    );
+  });
+
+  // npm tries trusted publishing (OIDC) before any token, but only from npm
+  // 11.5.1, and only when no setup-node .npmrc makes every npm command need
+  // NODE_AUTH_TOKEN. The npm that stages must be the npm that publishes.
+  it('publish uses an OIDC-capable npm, installed before the staging step', () => {
+    const names = steps(publish).map((s) => s.label);
+    const npmStep = names.indexOf('Use npm 11.20.0');
+    assert.ok(npmStep >= 0, 'no `Use npm 11.20.0` step');
+    assert.ok(npmStep < names.indexOf('Verify and stage the tested tarball'), 'npm is upgraded after staging');
+    assert.match(step(publish, 'Use npm 11.20.0'), /npm install -g npm@11\.20\.0/);
+    assert.doesNotMatch(publish.join('\n'), /^ +registry-url:/m);
+  });
+
+  it('the token is a fallback that never reaches disk', () => {
+    const pub = step(publish, 'Publish to npm');
+    assert.match(pub, /if \[ -n "\$\{NPM_TOKEN:-\}" \]; then/);
+    assert.match(pub, /printf '\/\/registry\.npmjs\.org\/:_authToken=\$\{NPM_TOKEN\}\\n'/);
+    assert.doesNotMatch(publish.join('\n'), /NODE_AUTH_TOKEN: \$\{\{/);
   });
 
   it('the registry copy is checked against the tested integrity', () => {

@@ -39,6 +39,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    # The same protected environment as release.yml's publish job (it admits
+    # only a `v*` tag or `main`).
+    environment: release
     # Only publish when a CI run on main SUCCEEDED. Not on the nightly schedule,
     # and never off a red, cancelled or skipped CI run. `head_branch` is checked
     # explicitly as well as in the trigger filter so a workflow_run replay from
@@ -55,10 +58,10 @@ jobs:
         with:
           ref: ${{ github.event.workflow_run.head_sha }}
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      # No `registry-url`, for the reason given in release.yml's publish job.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
-          registry-url: 'https://registry.npmjs.org'
           cache: npm
 
       - name: Install dependencies
@@ -85,10 +88,18 @@ jobs:
           npm version "$NEXT_VERSION" --no-git-tag-version
           echo "Publishing turbine-orm@${NEXT_VERSION} as @next"
 
+      # Publishes with the NPM_TOKEN secret. npm allows one trusted publisher per
+      # package and it belongs to release.yml, so this job cannot use OIDC. The
+      # token line names the variable, never its value, and is written only for
+      # this step (setup-node's `registry-url` would make every npm command in
+      # the job need NODE_AUTH_TOKEN).
       - name: Publish to npm with @next tag
-        run: npm publish --tag next --provenance --access public
+        run: |
+          set -euo pipefail
+          printf '//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n' > "$RUNNER_TEMP/publish.npmrc"
+          NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/publish.npmrc" npm publish --tag next --provenance --access public
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # Real YugabyteDB job, moved here from ci.yml. Same motivation as ci.yml's
   # CockroachDB job: prove the yugabytedb adapter's set_config() timeout SQL is
