@@ -128,10 +128,10 @@ export interface ColumnMetadata {
    * True when this column holds personally identifiable information (PII).
    * Tagged in `defineSchema` (`pii: true`) and carried through generated
    * metadata. A PII column is EXCLUDED from default projections: it comes back
-   * only when explicitly named in `select` or when the query passes
-   * `includePii: UNSAFE` (full opt-in, the imported sentinel symbol, since a
-   * literal `true` is what a stray JSON body deserializes to). Studio redacts
-   * PII cells by default.
+   * only from a read that passes `includePii: UNSAFE` (the imported sentinel
+   * symbol, since a literal `true` is what a stray JSON body deserializes to).
+   * Naming it in `select` without that flag throws (E003), and a write never
+   * returns it. Studio redacts PII cells by default.
    * Optional / defaults to `false`; untagged schemas behave exactly as before.
    * Introspection never auto-tags PII (it is a code-first declaration).
    */
