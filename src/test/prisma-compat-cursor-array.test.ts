@@ -145,12 +145,15 @@ describe('prisma-compat: a bare cursor beside an array orderBy', () => {
     assert.match(sql, /EXISTS \(SELECT 1 FROM "posts" cursor_row WHERE cursor_row\."id" = \$1\)/);
   });
 
-  it('a single-element array naming the cursor field is still the inclusive keyset', () => {
+  it('a single-element array naming the cursor field reads the cursor row too', () => {
     const compat = compatClient();
     const { sql, params } = sqlOf(
       compat.Post.findMany({ orderBy: [{ id: 'asc' }], cursor: { id: 239 }, take: 3 } as Any),
     );
-    assert.match(sql, /"id" >= \$1/, 'inclusive: gte, not a plain equality');
+    // A Prisma cursor names a row, so a deleted cursor row is an empty page
+    // even when the cursor already carries the only ordered value.
+    assert.match(sql, /EXISTS \(SELECT 1 FROM "posts" cursor_row WHERE cursor_row\."id" = \$1\)/);
+    assert.match(sql, /"posts"\."id" >= \(SELECT cursor_row\."id"/, 'inclusive: gte, not a plain equality');
     assert.match(sql, /ORDER BY "id" ASC/);
     assert.deepEqual(params, [239, 3]);
   });

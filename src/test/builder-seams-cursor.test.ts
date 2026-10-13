@@ -209,16 +209,21 @@ describe('cursor: NULL sort keys (build-only)', () => {
 });
 
 describe('cursor: inclusive (the prisma-compat flag)', () => {
-  it('folds equality into the last NOT NULL column', () => {
+  it('reads the row the cursor names even when its values cover the order, folding equality into the last column', () => {
     const q = makeQuery('items', schema());
     const one = q.buildFindMany({ cursor: { id: 7 }, [CURSOR_INCLUSIVE]: true } as Any);
-    assert.match(one.sql, /WHERE "items"\."id" >= \$1 ORDER BY "id" ASC$/);
+    assert.match(
+      one.sql,
+      /WHERE \(EXISTS \(SELECT 1 FROM "items" cursor_row WHERE cursor_row\."id" = \$1\) AND "items"\."id" >= \(SELECT cursor_row\."id" FROM "items" cursor_row WHERE cursor_row\."id" = \$1\)\) ORDER BY "id" ASC$/,
+    );
     const two = q.buildFindMany({
       cursor: { grp: 2, id: 7 },
       orderBy: { grp: 'asc' },
       [CURSOR_INCLUSIVE]: true,
     } as Any);
-    assert.match(two.sql, /\("items"\."grp" > \$1 OR \("items"\."grp" = \$1 AND "items"\."id" >= \$2\)\)/);
+    assert.match(two.sql, /\("items"\."grp" > \(SELECT cursor_row\."grp" [^)]+\) OR \("items"\."grp" = \(SELECT/);
+    assert.match(two.sql, /AND "items"\."id" >= \(SELECT cursor_row\."id" [^)]+\)\)\)\) ORDER BY "grp" ASC, "id" ASC$/);
+    assert.deepEqual(two.params, [2, 7]);
   });
 
   it('the flag survives the args seam copies (undefined pruning, take / skip folding)', () => {
@@ -229,7 +234,12 @@ describe('cursor: inclusive (the prisma-compat flag)', () => {
       skip: 1,
       [CURSOR_INCLUSIVE]: true,
     } as Any);
-    assert.equal(sql, 'SELECT "items".* FROM "items" WHERE "items"."id" >= $1 ORDER BY "id" ASC LIMIT $2 OFFSET $3');
+    assert.equal(
+      sql,
+      'SELECT "items".* FROM "items" WHERE (EXISTS (SELECT 1 FROM "items" cursor_row WHERE cursor_row."id" = $1) AND ' +
+        '"items"."id" >= (SELECT cursor_row."id" FROM "items" cursor_row WHERE cursor_row."id" = $1)) ' +
+        'ORDER BY "id" ASC LIMIT $2 OFFSET $3',
+    );
     assert.deepEqual(params, [3, 2, 1]);
   });
 
