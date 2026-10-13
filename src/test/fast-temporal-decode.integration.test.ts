@@ -346,7 +346,8 @@ describe('fast temporal decode against a live server, DateStyle and TimeZone var
         const res = await client.query<{ back: Date }>(`SELECT $1::timestamptz AS back`, [new Date(iso)]);
         return res.rows[0];
       });
-      assert.equal((row?.back as Date).toISOString(), iso, `round trip of ${iso}`);
+      assert.ok(row, `no row for ${iso}`);
+      assert.equal((row.back as Date).toISOString(), iso, `round trip of ${iso}`);
     }
   });
 
@@ -369,14 +370,18 @@ describe('fast temporal decode against a live server, DateStyle and TimeZone var
     const iso = '1850-01-01T00:00:00.000Z';
     const bound = await underGucs('ISO, MDY', 'UTC', async (client) => {
       const res = await client.query<{ back: Date }>(`SELECT $1::timestamptz AS back`, [new Date(iso)]);
-      return (res.rows[0]?.back as Date).toISOString();
+      const row = res.rows[0];
+      assert.ok(row, 'no row');
+      return (row.back as Date).toISOString();
     });
     // Sent as TEXT, bypassing the driver's Date serialiser, the same instant
     // round-trips exactly. That is the control proving the loss is on the way
     // in and not on the way out.
     const asText = await underGucs('ISO, MDY', 'UTC', async (client) => {
       const res = await client.query<{ back: Date }>(`SELECT $1::timestamptz AS back`, [iso]);
-      return (res.rows[0]?.back as Date).toISOString();
+      const row = res.rows[0];
+      assert.ok(row, 'no row');
+      return (row.back as Date).toISOString();
     });
     assert.equal(asText, iso, 'a text-bound pre-1900 instant round-trips exactly');
     const skewSeconds = Math.abs(Date.parse(bound) - Date.parse(iso)) / 1000;

@@ -1,17 +1,48 @@
 version: 2
+# Every ecosystem waits 14 days after a release before proposing it. That is
+# this repo's dependency-age rule: a compromised publish is usually caught and
+# pulled within days, and a cooldown keeps it out of a pull request until then.
 updates:
   - package-ecosystem: npm
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 14
     groups:
       dev-dependencies:
         dependency-type: development
+    ignore:
+      # The compiler major is a deliberate migration, not a weekly bump.
+      - dependency-name: typescript
+        update-types: ['version-update:semver-major']
+      # Tracks the oldest Node line in `engines`, not the newest Node.
+      - dependency-name: '@types/node'
+        update-types: ['version-update:semver-major']
+      # The PowDB engine is in maintenance mode: its test addons stay on the
+      # version the engine is verified against.
+      - dependency-name: '@zvndev/powdb-client'
+      - dependency-name: '@zvndev/powdb-embedded'
   - package-ecosystem: npm
     directory: /site
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 14
+    groups:
+      site:
+        patterns: ['*']
+    ignore:
+      - dependency-name: typescript
+        update-types: ['version-update:semver-major']
+      - dependency-name: '@types/node'
+        update-types: ['version-update:semver-major']
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 14
+    groups:
+      actions:
+        patterns: ['*']
