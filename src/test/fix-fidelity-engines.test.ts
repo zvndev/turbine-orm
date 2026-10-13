@@ -142,3 +142,37 @@ describe('SQL Server accepts the array form of a relation orderBy on the join st
     assert.match(sql, /ORDER BY t0\.\[views\] DESC, t0\.\[id\] ASC OFFSET 0 ROWS FETCH NEXT @p\d+ ROWS ONLY/);
   });
 });
+
+// --- SQL Server json columns, decoded by the row parser -----------------------
+
+describe('SQL Server json columns read back as the parsed value', () => {
+  // A json column is NVARCHAR(MAX) on SQL Server, so the driver hands back the
+  // document's text, and FOR JSON PATH embeds a nested row's json cell as a JSON
+  // string. `decodeColumnValue` is what turns both into PostgreSQL's value.
+  const parse = (dialect: typeof mssqlDialect | typeof postgresDialect, rows: Record<string, unknown>[]) =>
+    makeQuery('oe_users', SCHEMA, { dialect, warnOnUnlimited: false })
+      .buildFindMany({ relationLoadStrategy: 'join', with: { oePosts: true } } as never)
+      .transform({ rows, rowCount: rows.length } as never) as Record<string, unknown>[];
+
+  it('a top-level json cell and a nested one are parsed; NULL stays null', () => {
+    const nested = JSON.stringify([
+      { id: 7, meta: '{"pinned":true}' },
+      { id: 8, meta: null },
+    ]);
+    const [first, second] = parse(mssqlDialect, [
+      { id: 1, prefs: '{"theme":"dark","tags":["a","b"]}', oePosts: nested },
+      { id: 2, prefs: '"123"', oePosts: '[]' },
+    ]);
+    assert.deepEqual(first?.prefs, { theme: 'dark', tags: ['a', 'b'] });
+    const posts = first?.oePosts as Record<string, unknown>[];
+    assert.deepEqual(posts[0]?.meta, { pinned: true });
+    assert.equal(posts[1]?.meta, null);
+    assert.equal(second?.prefs, '123', 'a JSON string document reads as the string, not its quoted text');
+  });
+
+  it('PostgreSQL defines no decode, so a json value the driver already parsed passes through', () => {
+    assert.equal(postgresDialect.decodeColumnValue, undefined);
+    const [row] = parse(postgresDialect, [{ id: 1, prefs: { theme: 'dark' }, oePosts: [] }]);
+    assert.deepEqual(row?.prefs, { theme: 'dark' });
+  });
+});

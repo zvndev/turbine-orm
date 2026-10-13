@@ -155,14 +155,6 @@ export const REPRESENTATIONS: readonly RepresentationEntry[] = [
   },
   {
     engine: 'mssql',
-    id: 'mssql-json-as-text',
-    kind: 'bug',
-    fields: JSON_FIELDS,
-    accept: jsonAsText,
-    note: 'json columns are created as NVARCHAR(MAX) and read back as JSON text instead of the parsed value.',
-  },
-  {
-    engine: 'mssql',
     id: 'mssql-numeric-as-number',
     kind: 'difference',
     fields: NUMERIC_FIELDS,
@@ -203,12 +195,6 @@ const DATE_END_OF_DAY: readonly ScenarioEntry[] = [
 ];
 
 export const SCENARIO_ENTRIES: readonly ScenarioEntry[] = [
-  {
-    engine: 'mssql',
-    scenario: 'write/create-json-string-document',
-    kind: 'bug',
-    note: 'the mssql-json-as-text defect for a JSON string document: the column reads back as its JSON text, quotes included, where Postgres returns the string 123.',
-  },
   // --- sqlite ---
   ...nullOrder('sqlite'),
   {

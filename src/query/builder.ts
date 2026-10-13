@@ -472,6 +472,8 @@ const CELL_TEMPORAL = 1;
 const CELL_FLOAT = 2;
 const CELL_FLOAT_ARRAY = 3;
 const CELL_TEXT_ARRAY = 4;
+/** The dialect's own decode for a type whose storage differs (see `Dialect.decodeColumnValue`). */
+const CELL_DIALECT = 5;
 
 const FLOAT_TYPES = new Set(['float4', 'float8', 'real', 'double precision']);
 const FLOAT_ARRAY_TYPES = new Set(['_float4', '_float8', 'float4[]', 'float8[]', 'real[]', 'double precision[]']);
@@ -928,6 +930,8 @@ export class QueryInterface<
 
   /** Per-table memo of {@link cellKindOf}, keyed by column name and field name. */
   private readonly cellKindCache = new Map<string, Map<string, number>>();
+  /** The dialect decode of each {@link CELL_DIALECT} column, by table, then by column and field name. */
+  private readonly dialectDecodeCache = new Map<string, Map<string, (value: unknown) => unknown>>();
 
   /**
    * Per-table memo of `Object.entries(meta.relations)`, consumed by the nested
@@ -5928,7 +5932,18 @@ export class QueryInterface<
         // Metadata may carry the type on the column or only in the table map.
         const pgType = column.pgType ?? meta.pgTypes?.[column.name];
         if (typeof pgType !== 'string') continue;
-        const kind = cellKindOf(pgType, this.schema.enums);
+        let kind = cellKindOf(pgType, this.schema.enums);
+        const decode = kind === CELL_PLAIN ? this.dialect.decodeColumnValue?.(pgType) : undefined;
+        if (decode !== undefined) {
+          kind = CELL_DIALECT;
+          let decoders = this.dialectDecodeCache.get(table);
+          if (!decoders) {
+            decoders = new Map();
+            this.dialectDecodeCache.set(table, decoders);
+          }
+          decoders.set(column.name, decode);
+          decoders.set(column.field, decode);
+        }
         if (kind === CELL_PLAIN) continue;
         kinds.set(column.name, kind);
         kinds.set(column.field, kind);
@@ -5949,9 +5964,21 @@ export class QueryInterface<
         return readJsonFloatArray(value);
       case CELL_TEXT_ARRAY:
         return readTextArray(value);
+      case CELL_DIALECT:
+        return this.decodeDialectCell(value, table, field);
       default:
         return value;
     }
+  }
+
+  /**
+   * A {@link CELL_DIALECT} cell: the dialect's decode for the column's declared
+   * type, recorded by {@link getCellKinds} when it classified the column.
+   */
+  private decodeDialectCell(value: unknown, table: string, field: string): unknown {
+    if (value === null || value === undefined) return value;
+    const decode = this.dialectDecodeCache.get(table)?.get(field);
+    return decode ? decode(value) : value;
   }
 
   /**
