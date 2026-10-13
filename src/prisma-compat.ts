@@ -67,16 +67,9 @@
  * - Fluent relation chaining (`prisma.user.findUnique().posts()`).
  * - Accelerate / Pulse / driver-adapter preview features, the Mongo API, and the
  *   `prisma migrate`/`db` CLI family (Turbine ships its own migrations).
- * - **Inclusive bare cursors whose field is not the sort key**, see
- *   {@link translateCursor}. A bare Prisma cursor is inclusive; translating it
- *   correctly needs the anchor row's sort-key value. When the cursor field is
- *   the single `orderBy` field (or the cursor is the single-column PK with no
- *   `orderBy`) it compiles to a `gte`/`lte` keyset predicate; **otherwise it
- *   throws** an {@link UnsupportedFeatureError} rather than emit an off-by-one
- *   page. Pair the cursor with `skip: 1` (Prisma's idiom) for the exact
- *   exclusive-cursor + `offset` translation.
- * - **Negative `take`** (take-from-end) and **`skip` on a nested relation
- *   include** throw, Turbine's `with` clause has no offset and no reverse-take.
+ * - **Negative `take`** (take-from-end) throws: Turbine has no reverse-take.
+ *   A **`cursor` on a nested relation include** throws: `with` has no cursor
+ *   (`take` / `skip` there page each parent's rows, as in Prisma).
  * - **`limit` on `updateMany` / `deleteMany`** (Prisma 6.7+) throws. Turbine has
  *   no row-bounded mass mutation, and dropping a SAFETY BOUND with a warning
  *   would turn "change at most 10 rows" into "change every matching row".
@@ -87,9 +80,10 @@
  *   either (or any `include` on a write) THROWS, since a write returns its own
  *   row only. `omit` on READS is translated to core's own `omit`, see
  *   {@link translateOmit}.
- * - **`select` on `count`** and **`orderBy` / `cursor` / `take` / `skip` on
- *   `aggregate`** are accepted and IGNORED (they are legitimate Prisma, so they
- *   never warn); a plain number / the aggregate comes back.
+ * - **`take` / `skip` / `cursor` on `count` and `aggregate`** throw: Prisma
+ *   computes those over one page of rows and Turbine has no paged count. An
+ *   `orderBy` alone changes nothing there and is accepted. `count({ select })`
+ *   returns Prisma's per-field object (`{ _all, field }`).
  *
  * ## Type dependencies (0.41.0)
  *
@@ -146,6 +140,7 @@ import {
   UPDATE_OPTIONS,
   UPSERT_OPTIONS,
 } from './query/index.js';
+import { CURSOR_INCLUSIVE } from './query/normalize-args.js';
 import { markInternalCombinator, suggestKey } from './query/utils.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
 import { assertWhereDepth, MAX_WHERE_DEPTH } from './query/where-compile.js';
@@ -1285,11 +1280,14 @@ function translateWithOption(ctx: Ctx, mm: PrismaModelMap, turbineRel: string, v
   if (val.where !== undefined) opt.where = target ? translateWhere(ctx, target, val.where, depth) : val.where;
   if (val.orderBy !== undefined) opt.orderBy = target ? translateOrderBy(ctx, target, val.orderBy, depth) : val.orderBy;
   if (val.take !== undefined) opt.limit = mapTake(val.take as number);
-  if (val.skip !== undefined) {
+  // Per parent, as in Prisma; core refuses it on a to-one relation.
+  if (val.skip !== undefined) opt.offset = val.skip;
+  if (val.cursor !== undefined) {
     throw new UnsupportedFeatureError(
-      'skip (offset) on a nested relation include',
+      'cursor on a nested relation include',
       'prisma-compat',
-      "Turbine's `with` clause has no offset, page the relation with a separate query.",
+      "Turbine's `with` clause has no cursor. Page the relation with `take` / `skip`, or with a separate " +
+        'findMany on the related model.',
     );
   }
   if (target && (val.select !== undefined || val.include !== undefined || val.omit !== undefined)) {
@@ -1335,9 +1333,9 @@ function modelName(ctx: Ctx, mm: PrismaModelMap): string {
 type ReadKind = 'many' | 'first' | 'unique';
 
 /**
- * Assemble Turbine findMany-family args from Prisma read args. Order matters:
- * `where` / `orderBy` are translated first so the cursor step (which may inject
- * a keyset predicate) operates in the translated turbine-field space.
+ * Assemble Turbine findMany-family args from Prisma read args. `where` /
+ * `orderBy` are translated first, so the cursor step works in turbine-field
+ * space.
  */
 function translateReadArgs(
   ctx: Ctx,
@@ -1364,13 +1362,6 @@ function translateReadArgs(
   if (prismaArgs.relationLoadStrategy !== undefined) {
     t.relationLoadStrategy = mapRelationLoadStrategy(prismaArgs.relationLoadStrategy);
   }
-  // ORDER IS LOAD-BEARING: translateCursor MUST run BEFORE applyImplicitPkOrder.
-  // The cursor translation reads `t.orderBy` to decide the seek direction and to
-  // validate that a bare inclusive cursor names the sort key; it must see the
-  // USER's ordering, never an ordering this layer invented. Swap these two lines
-  // and a bare inclusive cursor on a non-PK field silently compiles against the
-  // injected primary-key order instead of throwing. See the guard test
-  // "cursor decisions are made against the user's own orderBy".
   translateCursor(ctx, mm, prismaArgs, t);
   applyImplicitPkOrder(ctx, mm, t, kind);
   return t;
@@ -1418,15 +1409,9 @@ function translateReadArgs(
  *   with `column "id" does not exist`. Injecting also lifts the `LIMIT` outside
  *   the `DISTINCT ON`, so the inner scan stops being limited. `distinct` reads
  *   keep the exact SQL they emitted before this ordering existed.
- * - `cursor`: NOT excluded here, unlike core. Core is a general-purpose layer
- *   whose cursor callers chose their own ordering; this layer's contract is
- *   Prisma parity, and Prisma pairs cursor pagination with the same implicit
- *   primary-key order. The injection is safe because it runs strictly AFTER
- *   {@link translateCursor}: the cursor comparison direction was already
- *   resolved from the user's own `orderBy` (ascending by default, matching an
- *   ascending primary key), and the bare-inclusive-cursor branch has already
- *   set or demanded an `orderBy`, so only the exclusive `cursor` + `skip`
- *   branch reaches here. It gains an `ORDER BY <pk> ASC` and nothing else.
+ * - `cursor`: not excluded, and harmless either way. Core orders every cursor
+ *   page itself (the caller's order plus a primary-key tiebreaker), and with no
+ *   `orderBy` that is exactly the `ORDER BY <pk> ASC` written here.
  */
 function applyImplicitPkOrder(ctx: Ctx, mm: PrismaModelMap, t: Record<string, unknown>, kind: ReadKind): void {
   if (kind === 'unique') return;
@@ -1440,33 +1425,21 @@ function applyImplicitPkOrder(ctx: Ctx, mm: PrismaModelMap, t: Record<string, un
   t.orderBy = fields.length === 1 ? { [fields[0]!]: 'asc' } : fields.map((f) => ({ [f]: 'asc' }));
 }
 
-/** turbine field names of the model's single-column primary key, if any. */
-function singleColumnPkField(ctx: Ctx, mm: PrismaModelMap): string | undefined {
-  const pk = ctx.schema.tables[mm.table]?.primaryKey;
-  if (pk && pk.length === 1) {
-    const col = pk[0]!;
-    return ctx.schema.tables[mm.table]?.reverseColumnMap?.[col] ?? col;
-  }
-  return undefined;
-}
-
 /**
  * Translate Prisma cursor + take/skip onto Turbine args (operating on already
  * translated `t.where` / `t.orderBy` in turbine-field space).
  *
  * - **No cursor:** `skip`→`offset`, `take`→`limit`.
- * - **Cursor + `skip: n` (n≥1):** the idiomatic exclusive-pagination case →
- *   Turbine's exclusive `cursor` + `offset: n-1` (skip:1 → offset 0, an exact
- *   match).
- * - **Bare inclusive cursor** (skip absent/0): a Prisma cursor is INCLUSIVE, so
- *   it needs the anchor's sort-key value. Compiled to a `gte`/`lte` keyset
- *   predicate merged into `where` ONLY when the cursor is single-field AND that
- *   field is the single `orderBy` field (or, with no `orderBy`, is the
- *   single-column PK). Any other shape THROWS rather than emit a wrong page -
- *   pair the cursor with `skip: 1` for the exact exclusive translation.
+ * - **Cursor:** core's cursor with the {@link CURSOR_INCLUSIVE} flag, plus
+ *   `offset: skip`. That is Prisma's definition exactly: the page starts AT the
+ *   cursor row, in the query's order (core completes it with a primary-key
+ *   tiebreaker), and `skip` counts from there, so the `skip: 1` idiom drops the
+ *   cursor row. Core places the page from the cursor's values when they cover
+ *   the order, else from the row the cursor names by a unique key, which is
+ *   what a Prisma cursor always is.
  */
 function translateCursor(
-  ctx: Ctx,
+  _ctx: Ctx,
   mm: PrismaModelMap,
   prismaArgs: Record<string, unknown>,
   t: Record<string, unknown>,
@@ -1475,11 +1448,8 @@ function translateCursor(
   const skip = prismaArgs.skip as number | undefined;
   const take = prismaArgs.take as number | undefined;
   if (take !== undefined) t.limit = mapTake(take);
-
-  if (cursor === undefined) {
-    if (skip !== undefined) t.offset = skip;
-    return;
-  }
+  if (skip !== undefined) t.offset = skip;
+  if (cursor === undefined) return;
 
   // Translate cursor field names (and expand a compound-unique selector cursor).
   const tcursor: Record<string, unknown> = {};
@@ -1492,95 +1462,8 @@ function translateCursor(
       tcursor[renameField(mm, key)] = val;
     }
   }
-  const cursorFields = Object.keys(tcursor);
-
-  if (skip !== undefined && skip >= 1) {
-    t.cursor = tcursor;
-    t.offset = skip - 1;
-    return;
-  }
-
-  // Bare inclusive cursor (skip absent or 0).
-  if (cursorFields.length !== 1) {
-    throw new UnsupportedFeatureError(
-      'inclusive multi-field cursor without skip',
-      'prisma-compat',
-      'Pair the cursor with `skip: 1` (the Prisma idiom) so it maps to an exact exclusive cursor.',
-    );
-  }
-  const field = cursorFields[0]!;
-  const value = tcursor[field];
-  const obEntries = orderByPairs(t.orderBy);
-  let desc = false;
-  if (obEntries.length === 0) {
-    const pkField = singleColumnPkField(ctx, mm);
-    if (!pkField || field !== pkField) {
-      throw new UnsupportedFeatureError(
-        'inclusive cursor without orderBy on a non-PK field',
-        'prisma-compat',
-        `A bare Prisma cursor is inclusive; translating it needs the cursor field "${field}" to be the single-column primary key, or to be the single orderBy field. Pair the cursor with \`skip: 1\`.`,
-      );
-    }
-    t.orderBy = { [field]: 'asc' };
-  } else {
-    if (obEntries.length !== 1 || obEntries[0]![0] !== field) {
-      throw new UnsupportedFeatureError(
-        'inclusive cursor whose field is not the sort key',
-        'prisma-compat',
-        `A bare Prisma cursor is inclusive; translating it needs the cursor field "${field}" to be the single orderBy field. Order by "${field}", or pair the cursor with \`skip: 1\`.`,
-      );
-    }
-    desc = obEntries[0]![1];
-  }
-  const op = desc ? 'lte' : 'gte';
-  t.where = mergeKeyset((t.where as Record<string, unknown>) ?? {}, field, op, value);
-}
-
-/**
- * Flatten a Turbine orderBy (object, or an array of them) into [field, isDesc]
- * pairs.
- *
- * EVERY array element is read. Reading only an array of length one returned
- * `[]` for a two-element array, and `[]` is also what "no orderBy at all"
- * returns, so {@link translateCursor} took its no-orderBy branch: it found a
- * bare cursor on the primary key, wrote `orderBy = { id: 'asc' }` over the
- * caller's array, and returned the rows following the anchor in PK order
- * instead of in the caller's order. The single-sort-key check downstream is
- * what refuses a shape a bare (inclusive) cursor cannot express, and it can
- * only fire if the pairs it counts are all there.
- */
-function orderByPairs(ob: unknown): [string, boolean][] {
-  const entries = Array.isArray(ob) ? ob : [ob];
-  const out: [string, boolean][] = [];
-  for (const entry of entries) {
-    if (!isPlainObject(entry)) continue;
-    for (const [k, v] of Object.entries(entry)) {
-      const dir = isPlainObject(v) ? (v.sort as string) : (v as string);
-      out.push([k, dir === 'desc']);
-    }
-  }
-  return out;
-}
-
-/** Merge a `{ field: { gte|lte: value } }` keyset predicate into a where object. */
-function mergeKeyset(
-  where: Record<string, unknown>,
-  field: string,
-  op: string,
-  value: unknown,
-): Record<string, unknown> {
-  const merged: Record<string, unknown> = { ...where };
-  const existing = merged[field];
-  if (isPlainObject(existing)) {
-    merged[field] = { ...existing, [op]: value };
-  } else if (existing !== undefined) {
-    const prevAnd = merged.AND;
-    const andList = Array.isArray(prevAnd) ? prevAnd : prevAnd !== undefined ? [prevAnd] : [];
-    merged.AND = [...andList, { [field]: { [op]: value } }];
-  } else {
-    merged[field] = { [op]: value };
-  }
-  return merged;
+  t.cursor = tcursor;
+  (t as Record<symbol, unknown>)[CURSOR_INCLUSIVE] = true;
 }
 
 // --- write-data translation (nested writes) -------------------------------
@@ -1708,6 +1591,24 @@ function translateUpsertNested(ctx: Ctx, target: PrismaModelMap | undefined, p: 
 
 const AGG_FIELD_BLOCKS = ['_sum', '_avg', '_min', '_max'] as const;
 
+/**
+ * Prisma's `count` and `aggregate` with `take` / `skip` / `cursor` compute over
+ * that PAGE of rows. Turbine has no paged count or aggregate, and answering
+ * over every matching row instead is a different number, so it is refused.
+ * `orderBy` on its own changes no count or aggregate and is accepted.
+ */
+function refusePagedAggregate(op: 'count' | 'aggregate', args: Args): void {
+  const paged = (['take', 'skip', 'cursor'] as const).filter((k) => args[k] !== undefined);
+  if (paged.length === 0) return;
+  throw new UnsupportedFeatureError(
+    `${paged.join(' / ')} on ${op}`,
+    'prisma-compat',
+    `Prisma computes this ${op} over one page of rows, and Turbine has no paged ${op}. Fetch the page with ` +
+      `findMany (same where / orderBy / ${paged.join(' / ')}) and compute it from the rows, or drop ` +
+      `${paged.join(' / ')} to ${op} every matching row.`,
+  );
+}
+
 function translateAggregateArgs(
   ctx: Ctx,
   mm: PrismaModelMap,
@@ -1715,6 +1616,7 @@ function translateAggregateArgs(
   isGroupBy: boolean,
 ): Record<string, unknown> {
   const t: Record<string, unknown> = {};
+  if (!isGroupBy) refusePagedAggregate('aggregate', args);
   applyNativeOptions(isGroupBy ? GROUP_BY_OPTIONS : AGGREGATE_OPTIONS, args, t);
   if (args.where !== undefined) t.where = translateWhere(ctx, mm, args.where);
   if (args._count !== undefined) t._count = renameAggBlock(mm, args._count, true);
@@ -2554,19 +2456,41 @@ function makeDelegate(
         },
       ) as unknown as Promise<PrismaModelTypes['Row']>;
     },
-    count: (args = {}) =>
-      defer(
+    count: (args = {}) => {
+      const a = args as Args;
+      // `count({ select })` answers per field (`{ _all, title }`, a non-null
+      // count per field), which is core's aggregate `_count` record form.
+      if (isPlainObject(a.select)) {
+        const countOf = (raw: unknown) => (reshapeAggregate(ctx, mm, raw) as Record<string, unknown>)._count;
+        return defer(
+          'count',
+          args,
+          () => {
+            refusePagedAggregate('count', a);
+            const t: Args = {};
+            applyNativeOptions(AGGREGATE_OPTIONS, a, t);
+            if (a.where !== undefined) t.where = translateWhere(ctx, mm, a.where);
+            t._count = renameAggBlock(mm, a.select, true);
+            return t;
+          },
+          (qi, t) => qi.aggregate(t).then(countOf),
+          { build: (qi, t) => qi.buildAggregate(t), reshape: countOf },
+        ) as unknown as Promise<number>;
+      }
+      return defer(
         'count',
         args,
         () => {
+          refusePagedAggregate('count', a);
           const t: Args = {};
-          applyNativeOptions(COUNT_OPTIONS, args as Args, t);
-          if ((args as Args).where !== undefined) t.where = translateWhere(ctx, mm, (args as Args).where);
+          applyNativeOptions(COUNT_OPTIONS, a, t);
+          if (a.where !== undefined) t.where = translateWhere(ctx, mm, a.where);
           return t;
         },
         (qi, t) => qi.count(t),
         { build: (qi, t) => qi.buildCount(t), reshape: (raw) => raw },
-      ) as unknown as Promise<number>,
+      ) as unknown as Promise<number>;
+    },
     aggregate: (args) =>
       defer(
         'aggregate',
