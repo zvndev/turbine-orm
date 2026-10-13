@@ -161,15 +161,15 @@ describe('create: Date on a time column', () => {
 
   it('REGRESSION: a non-temporal column binds its value by identity', () => {
     const buf = Buffer.from('x');
-    const arr = [1, 2, 3];
-    const d = q().buildCreate({ data: { label: buf as unknown as string, id: arr as unknown as number } });
+    const big = 9007199254740993n;
+    const d = q().buildCreate({ data: { label: buf as unknown as string, id: big as unknown as number } });
     // Params follow the TABLE's column order (`id` is declared before `label`),
     // not the order the keys were written: a write's column list is SQL text,
     // and letting the caller pick it mints a permanent server-side prepared
     // statement per permutation. See `canonicalWriteEntries` in query/utils.ts.
     // What this test is actually about is untouched: both values arrive by
     // identity, whichever slot they land in.
-    assert.equal(d.params[0], arr);
+    assert.equal(d.params[0], big);
     assert.equal(d.params[1], buf);
   });
 

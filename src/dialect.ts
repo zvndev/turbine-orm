@@ -418,6 +418,14 @@ export interface Dialect {
    */
   readonly supportsUpsertUpdateWhere?: boolean;
 
+  /**
+   * The most bind parameters one statement may carry, when it differs from
+   * the engine default in {@link maxBindParameters}. Not set on
+   * `postgresDialect`: every engine dialect spreads it, so a value there would
+   * be inherited by engines with a different limit.
+   */
+  readonly maxBindParameters?: number;
+
   /** Whether this dialect/engine supports pgvector distance ops (KNN / distance WHERE). */
   readonly supportsVector: boolean;
 
@@ -848,6 +856,29 @@ export interface DialectMigrator {
 }
 
 /** PostgreSQL implementation of the dialect contract. */
+/**
+ * Per-engine bind-parameter limits, keyed by dialect NAME rather than set on
+ * `postgresDialect` (see THE INHERITANCE TRAP in the repo notes): PostgreSQL
+ * and MySQL count parameters in a 16-bit field, SQLite's default
+ * `SQLITE_MAX_VARIABLE_NUMBER` is 32766, and SQL Server allows 2100. Past the
+ * PostgreSQL limit node-postgres does not refuse, the count wraps and the
+ * server answers with a protocol error that reads like a lost connection.
+ */
+const BIND_PARAMETER_LIMITS: Readonly<Record<string, number>> = {
+  postgresql: 65535,
+  mysql: 65535,
+  sqlite: 32766,
+  mssql: 2100,
+};
+
+/** The bind-parameter limit for one statement on this dialect, if known. */
+export function maxBindParameters(dialect: Pick<Dialect, 'name' | 'maxBindParameters'>): number | undefined {
+  return (
+    dialect.maxBindParameters ??
+    (Object.hasOwn(BIND_PARAMETER_LIMITS, dialect.name) ? BIND_PARAMETER_LIMITS[dialect.name] : undefined)
+  );
+}
+
 export const postgresDialect: Dialect = {
   name: 'postgresql',
   resultStrategy: 'returning',

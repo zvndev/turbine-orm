@@ -90,10 +90,12 @@ describe('update: shapes that must keep working', () => {
     assert.deepEqual(built.params[0], { theme: 'dark' });
   });
 
-  it('a multi-key object on a scalar column is untouched (never operator-shaped)', () => {
+  it('a multi-key object on a scalar column is refused by the value-shape check, not as an operator', () => {
     const q = makeQuery('users', schema());
-    const built = q.buildUpdate({ where: { id: 1 }, data: { name: { a: 1, b: 2 } } } as never);
-    assert.deepEqual(built.params[0], { a: 1, b: 2 });
+    assert.throws(
+      () => q.buildUpdate({ where: { id: 1 }, data: { name: { a: 1, b: 2 } } } as never),
+      (err) => err instanceof ValidationError && /an object to "users\.name" \(column type text\)/.test(err.message),
+    );
   });
 
   it('the real operators still compile', () => {
@@ -105,12 +107,15 @@ describe('update: shapes that must keep working', () => {
     assert.equal(set.params[0], 'Bob');
   });
 
-  it('Date, Buffer and array values still bind plainly', () => {
+  it('Date and Buffer values still bind plainly; an array on a scalar column is refused', () => {
     const q = makeQuery('users', schema());
     const d = new Date('2020-01-01T00:00:00Z');
     assert.equal(q.buildUpdate({ where: { id: 1 }, data: { name: d } } as never).params[0], d);
     const buf = Buffer.from('x');
     assert.equal(q.buildUpdate({ where: { id: 1 }, data: { name: buf } } as never).params[0], buf);
-    assert.deepEqual(q.buildUpdate({ where: { id: 1 }, data: { name: [1] } } as never).params[0], [1]);
+    assert.throws(
+      () => q.buildUpdate({ where: { id: 1 }, data: { name: [1] } } as never),
+      (err) => err instanceof ValidationError && /an array to "users\.name"/.test(err.message),
+    );
   });
 });
