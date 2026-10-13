@@ -172,7 +172,7 @@ logger: {
 | `powdb-link-collision`, `powdb-link-drift`, `powdb-introspect-no-primary-key` | `warn` | PowDB link DDL and introspection. |
 | `introspect-cross-schema-fk`, `introspect-relation-renamed`, `introspect-relation-shadows-json`, `generate-relation-shadows-column` | `warn` | Introspection and code generation. |
 
-Two lines bypass `logger` in this release, both on [PowDB](/engines). Its unknown-option advice prints through `console` and follows `NODE_ENV` rather than `diagnostics`. Its `warnOnUnlimited` warning prints through `console`. Every other engine sends both through `logger`. Separately, introspecting a SQLite, MySQL or SQL Server database prints its relation-naming warnings through the default console logger, since those introspectors take no `logger` yet.
+Every engine sends its lines through `logger`, PowDB included: its unknown-option advice and `warnOnUnlimited` warning follow the client's `logger` and `diagnostics`. Introspecting a SQLite, MySQL or SQL Server database sends its relation-naming notes to the `logger` passed to `introspect()`.
 
 ## Diagnostics, `diagnostics`
 

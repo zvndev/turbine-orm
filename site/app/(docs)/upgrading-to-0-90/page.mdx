@@ -209,6 +209,7 @@ Several engines returned a different value than PostgreSQL for the same column a
 - **SQLite and SQL Server: list elements bind as the scalar does.** SQLite takes a bigint past 2^53 (it threw a `TypeError`) and binary values (they matched nothing). SQL Server takes bigint and `Date` elements.
 - **MySQL and SQLite: `batched` relations with binary or bigint keys** attach children to the right parent, as the join strategy does. They went to the wrong parent or to none.
 - **MySQL: `_avg` over a `decimal` or `bigint` column** has the same value as PostgreSQL with a different number of digits (the input's scale plus 4, against PostgreSQL's 16 significant digits), and rounds a repeating quotient at a different digit. This is not changed in 0.90; compare averages numerically.
+- **MySQL: LIKE filters work on a pool you pass in.** `contains`, `startsWith`, `endsWith` and the JSON substring filters emitted `ESCAPE '\'`, which MySQL reads as an unterminated string unless the session runs with `NO_BACKSLASH_ESCAPES`, so on a `mysql2` pool in the server's default mode every one of them was a syntax error. MySQL now escapes with `!` (`ESCAPE '!'`); values stay bound, and your session's mode is never changed. Anything that matches emitted MySQL SQL text sees the new clause. A `JSON_OBJECT` key holding a backslash is written as its UTF-8 bytes, so it reads back the same in either mode.
 
 **Find it:** SQLite code that compares a boolean to `1` / `0` or calls `JSON.parse` on a JSON column, the same `JSON.parse` on SQL Server, code that rounds or compensates for `_avg` on SQL Server or MySQL, and MySQL `divide` on integer columns.
 
@@ -563,7 +564,8 @@ Such keys used to be ignored, which silently changed the DDL: a misspelt `defaul
 - `TimeoutError` carries `outcome`, see [above](#a-timed-out-query-is-cancelled-on-the-server).
 - A lock wait that hit the server's lock timeout (MySQL error 1205, SQL Server error 1222) is `LockNotAvailableError`. It was a plain `SerializationFailureError`. The code (`TURBINE_E013`), `isRetryable` and `instanceof SerializationFailureError` are unchanged; only a check of `err.name` or `err.constructor` sees the difference.
 - A transaction PostgreSQL rolled back instead of committing is `TransactionRolledBackError` (`TURBINE_E019`), new in 0.90, see [Transactions](#transactions).
-- A failed SQL-cache self-check is [`InvariantError`](/errors#e020) (`TURBINE_E020`), new in 0.90, with `invariant` set to `'sql-cache-lockstep'` or `'sql-cache-param-count'`. It was `ValidationError` (`TURBINE_E003`). It marks a Turbine bug, not a bad argument; report it. Two cheap forms of the check now run in every mode, production included (see [Observability](/observability#diagnostics-diagnostics)).
+- A failed SQL-cache self-check is [`InvariantError`](/errors#e020) (`TURBINE_E020`), new in 0.90, with `invariant` set to `'sql-cache-lockstep'` or `'sql-cache-param-count'`. It was `ValidationError` (`TURBINE_E003`). It marks a Turbine bug, not a bad argument; report it. Two cheap forms of the check now run in every mode, production included (see [Observability](/observability#diagnostics-diagnostics)). A relation payload the database returned that does not parse as JSON, and an internal where-scope misuse, were `TURBINE_E003` too; they are `InvariantError` with `invariant` `'relation-payload-json'` and `'where-scope-reference'`.
+- A session PostgreSQL ended for sitting idle in an open transaction (SQLSTATE `25P03`) is `ConnectionError` (`TURBINE_E004`), with a hint naming the limit. It was an unmapped driver error.
 
 ### An object written to a scalar column
 
@@ -645,6 +647,10 @@ await db.$transaction(async (tx) => {
 
 ### Connections
 
+**A stream idle for five minutes is closed.** A `findManyStream` / `findManyStreamBatches` that opened a cursor and whose consumer asks for nothing for `streamIdleTimeoutMs` (default 300,000 ms) is closed: the cursor is closed, its connection released, `stream-idle-timeout` logged, and the next pull throws `TimeoutError` (`TURBINE_E002`). A consumer that pauses longer between rows on purpose sets `idleTimeoutMs` on the call, or `streamIdleTimeoutMs: 0` on the client to turn it off. On PostgreSQL the stream's transaction also gets a transaction-local `idle_in_transaction_session_timeout` of the timeout plus 10 seconds. A session the server ends that way (SQLSTATE `25P03`) is `ConnectionError` (`TURBINE_E004`). See [Abandoned streams close themselves](/queries#abandoned-streams-close-themselves).
+
+**`turbineSqlite(path).disconnect()` closes the database.** It used to leave the handle Turbine opened open, and the client kept answering queries. After `disconnect()` a query now throws `ConnectionError` (`TURBINE_E004`). A `DatabaseSync` you pass in stays open.
+
 **An exhausted pool is `ConnectionError` (`TURBINE_E004`).** A checkout that timed out used to reject with pg-pool's plain `Error: timeout exceeded when trying to connect`. It now names the pool size, the waiting callers, and the usual cause: a query on `db` inside a `$transaction` callback, which needs a second connection. Catch `ConnectionError` or `err.code === 'TURBINE_E004'`.
 
 **A client with no database configured rejects its first query.** With no `connectionString`, pool, host settings, `DATABASE_URL` or `PG*` variables, Turbine used to connect to `postgres@localhost`. The client still constructs and builds SQL, but every query rejects with `TURBINE_E004` explaining that Turbine does not read `.env` files (`node --env-file=.env`, or `process.loadEnvFile()`). An empty `connectionString` is named as the cause.
@@ -723,6 +729,10 @@ These also changed on PowDB in this release:
 - A `cursor` that names no row throws `TURBINE_E003` with the SQL engines' message. A valid cursor is still `TURBINE_E017`.
 - An `upsert` onto a key a global filter hides throws `NotFoundError` (`TURBINE_E001`), as on PostgreSQL, and writes nothing. It was `TURBINE_E008`.
 - Integer text such as `'9007199254740993'` is accepted for an integer column in writes and filters; other text is `TURBINE_E003` naming the column.
+- An enum column is a `str` holding its label; it was declared `json`, and every write of a label failed. A value that is not a label is `TURBINE_E003`, ranges compare in declaration order, `contains` / `mode: 'insensitive'` / `_sum` / `_avg` on an enum are `TURBINE_E003`, and ordering by one (`orderBy`, `_min` / `_max`, groupBy ordering) is `TURBINE_E017`. See [PowDB](/powdb).
+- A groupBy `by` that is missing, a string, empty or names something it cannot group by throws `TURBINE_E003` with the SQL engines' message. It was a `TypeError` or an engine error.
+- `updateMany` / `deleteMany` whose `where` is `not: null` (or `NOT: { col: null }`) on a NOT NULL column is refused without `allowFullTableScan: UNSAFE`. It wrote every row.
+- The no-limit warning and the unknown-option advice go through the client's `logger` and follow `diagnostics`. They printed to the console whatever the client said.
 
 ## Logging and diagnostics
 
@@ -732,8 +742,6 @@ A new client option, [`diagnostics`](/observability#diagnostics-diagnostics), de
 
 - It is read once, when the client is constructed. Changing `NODE_ENV` afterwards does not affect that client.
 - A runtime with no `process` defaults to production mode. A runtime that has a `process` but no `NODE_ENV` (some workers) defaults to development mode, so set `diagnostics: 'production'` there.
-
-On PowDB, the unknown-option advice still reads `NODE_ENV` directly in this release, see [Observability](/observability#log-output-logger).
 
 ### Construction warnings are always on
 
@@ -792,10 +800,16 @@ Writes to `int8` also accept a `string` or `bigint`, and writes to `numeric` a `
 ### Migrations
 
 - **`migrate create --auto` and `--from-diff` refuse while migrations are pending.** The diff reads the live database, so it would repeat what the unapplied files do. Run `turbine migrate up` first, or pass `--allow-pending` when the pending files do not touch what the schema file describes.
+- **`migrate create` refuses to replace a file.** A second `migrate create` with the same name in the same second used to overwrite the first file, edits included. It now fails with `MigrationError` (`TURBINE_E006`); wait a second, or pick another name.
 - **Migration filenames are stamped in UTC.** Existing local-time files keep working; the runner reads any 14-digit prefix. A file created after upgrading can sort before one a colleague created earlier the same day in a zone ahead of UTC, which the runner applies as an [out-of-order migration](/migrate#out-of-order-migrations).
 - **Lossless widenings are no longer destructive.** `int` to `bigint`, a longer `varchar` and similar changes apply without `--allow-destructive`. A narrowing is still refused.
 - **New CI flags.** `push --dry-run --exit-code` and `migrate status --exit-code` exit 2 on drift, and `migrate deploy --wait[=seconds]` waits for a concurrent deploy's lock. See [Checking for drift in CI](/migrate#checking-for-drift-in-ci). `push` also exits 2 when the diff carries a warning (a declared `UNIQUE` index over a non-unique one of that name, a removed enum label, an undeclared index on a table that manages its indexes), and `migrate status` when the directory holds a misnamed `.sql` file or one with an upper-case `.SQL` extension, which the runner never runs.
 - **`migrate up`, `migrate deploy` and `migrate down` refuse a transaction-pooler URL** (a `pooler` or `pgbouncer` hostname, or port 6543 or 6432), because the session-level advisory lock can be taken on one backend and released on another. Use the direct endpoint, or pass `--allow-pooler`. Neon and Supabase projects often run migrations through the pooled `DATABASE_URL`, so expect this on the first deploy after upgrading. `--dry-run`, `status` and `create` are not refused.
+
+### `turbine init` and `migrate-from-prisma`
+
+- `turbine init --url` creates `.env`, `.env.example` and `.gitignore` exclusively: a file is created only if the name is still free at that moment, and an existing one is handled as before. A symlink at one of those names is refused instead of written through, and a `.env` that appears while the command runs is appended to rather than truncated.
+- `migrate-from-prisma` reads a string literal's escapes in one pass. A datasource URL, `@map` name or default holding an escaped backslash before `n` or `t` (`"C:\\new"`) was read as a newline or a tab.
 
 ### Generated DDL for MySQL, SQLite and SQL Server
 
@@ -835,6 +849,7 @@ None of these change existing code. Each is opt-in:
 - **[Multi-row upsert](/queries#multi-row-upsert-onconflict):** `createMany({ data, onConflict: { target, update } })`, and `select` / `omit` on `createMany`.
 - **Client options:** [`statementTimeoutMs`](/queries#client-configuration) (PostgreSQL), `maxLifetimeSeconds`, and on `$transaction`, [`readOnly` and `allowBuiltinSettings`](/transactions#transaction-options).
 - **Inside a transaction:** [`tx.sql`, `tx.rawUnsafe` and `tx.$connection()`](/transactions#what-tx-has).
+- **[SQL comments](/observability#sql-comments-sqlcomment):** `sqlComment` appends sqlcommenter key/values (static pairs, the model and method, the `$tag` label, per-statement values such as a trace's `traceparent`) to every statement a model call sends. Refused on PowDB; its `dynamic` option is refused on MySQL.
 - **Operations:** `db.$ping()`, `disconnect({ timeoutMs })`, and the `'poolError'` and `'connectionLost'` events, see [Client escape hatches](/queries#client-escape-hatches).
 - **Types:** `pipeline([...], options)` returns a typed tuple, as the rest-argument form does.
 

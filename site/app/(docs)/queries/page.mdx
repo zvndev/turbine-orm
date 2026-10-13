@@ -1074,6 +1074,26 @@ A stream honours `limit` / `take` and `offset` / `skip` exactly as `findMany` do
   streaming measurements.
 </Callout>
 
+### Abandoned streams close themselves
+
+A stream that holds a connection between pulls is closed when its consumer asks for nothing for five minutes. That is a stream that outgrew its first batch and opened a cursor; one that fit in a single batch holds nothing. An iterator that is kept and never finished, or a response stream torn down without calling `return()`, would otherwise hold a pooled connection forever, and on PostgreSQL an open transaction whose snapshot holds back vacuum.
+
+On expiry Turbine closes the cursor, releases the connection and logs `stream-idle-timeout`. The next pull, if one comes, throws `TimeoutError` (`TURBINE_E002`, `outcome: 'not-executed'`). Time Turbine spends fetching does not count, only time the consumer spends between pulls.
+
+```ts
+// Per call: a slow consumer that pauses longer than five minutes between rows
+for await (const row of db.events.findManyStream({ idleTimeoutMs: 30 * 60_000 })) {
+  await slowSink.write(row);
+}
+
+// Per client: streamIdleTimeoutMs, in milliseconds. 0 disables the timeout.
+const db = turbine({ connectionString: process.env.DATABASE_URL, streamIdleTimeoutMs: 0 });
+```
+
+Both take a whole number of milliseconds; anything else throws `TURBINE_E003`. The stream option is `idleTimeoutMs`; the client option of the same name is the pool's idle-connection timeout, so the client-level stream setting is spelled `streamIdleTimeoutMs`. A stream inside `$transaction` is not watched: it rides the transaction's connection, and the transaction's own timeout bounds it.
+
+On PostgreSQL the stream's transaction also carries a server-side `idle_in_transaction_session_timeout` of the idle timeout plus 10 seconds. It is transaction-local, never a session `SET`, and a stricter limit already in force is kept. So a process that stops running timers, such as a serverless instance frozen between invocations, cannot hold the transaction open either; its next pull is `ConnectionError` (`TURBINE_E004`). Until the stream expires, Turbine sends `SELECT 1` on its connection whenever half the timeout passes with no statement, so a consumer reading an already-fetched batch slowly never looks idle to the server, and the server limit acts only when timers cannot run.
+
 ## WHERE operators
 
 Every operator composes freely with `AND`, `OR`, `NOT`, and relation filters.
@@ -1563,6 +1583,8 @@ const db = turbine({
 | `connectionTimeoutMs` | `5000` | Give up acquiring a connection after this long, with a `ConnectionError` (`TURBINE_E004`) naming the pool size and the usual cause. pg-style alias: `connectionTimeoutMillis`. |
 | `preparedStatements` | `true` for Turbine-owned pools; `false` for external pools and for a connection that names a pooler | Submit queries as `{ name, text, values }` so Postgres caches the parse and plan per backend connection. A connection string, `host` or `port` that names a pooler (a `pooler` or `pgbouncer` host, or port 6432 or 6543) defaults to `false`; an explicit `true` there is honored with a warning, printed once per process in every mode. |
 | `statementTimeoutMs` | unset (Turbine sends nothing) | **Postgres only.** A server-side ceiling on every statement this client's connections run (`statement_timeout`), in milliseconds. A statement that runs longer is cancelled by the server and rejects with `TimeoutError` (`outcome: 'not-executed'`). It also bounds what a per-query `timeout` cannot reach, such as a stream's `FETCH`. Sent as a connection parameter on pools Turbine opens, never as a `SET`. `0` disables a timeout the server or role would apply. Must be a non-negative whole number (`TURBINE_E003`); `TURBINE_E017` on other engines. A no-op on an external pool, with a warning printed once per process. A pooler may refuse connection parameters; set it on the role there (`ALTER ROLE app SET statement_timeout = '30s'`). |
+| `streamIdleTimeoutMs` | `300000` (five minutes) | Close a cursor stream whose consumer has asked for nothing for this long, and release its connection. `0` disables. A stream call's `idleTimeoutMs` overrides it. See [Abandoned streams close themselves](#abandoned-streams-close-themselves). |
+| `sqlComment` | unset | Append [sqlcommenter](/observability#sql-comments-sqlcomment) key/values (static pairs, the model and method, the `$tag` label, per-statement values) to every statement a model call sends. |
 | `maxLifetimeSeconds` | `1800` on pools Turbine opens | Close a pooled connection once it is this old, when it is next idle, and open a fresh one on demand. Bounds what a long-lived server session accumulates and moves connections to a new server after a failover. A checked-out connection is never closed under its holder. `0` keeps connections indefinitely, the behaviour before 0.90. Ignored on an external pool, with a warning printed once per process. |
 | `sqlCache` | `true` | The per-table SQL template cache. Setting `false` is the kill switch. |
 | `sqlCacheSize` | `1000` | How many distinct query **shapes** each table's LRU retains. Values are parameterized, so they never fragment the cache. `0` is equivalent to `sqlCache: false`; a negative value falls back to the default. |

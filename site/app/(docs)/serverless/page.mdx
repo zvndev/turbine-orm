@@ -178,6 +178,8 @@ Turbine's edge entry does not import `pg`, does not register type parsers, does 
 
 `findManyStream` works with any pool that supports `DECLARE CURSOR`. That's all of Neon, Hyperdrive, Supabase. Edge functions typically don't want to stream (response needs to be bounded for the Worker runtime), but if you're writing to R2 / S3 / object storage *from* the stream, it's fine.
 
+A stream left open when an invocation freezes cannot hold its connection forever. On PostgreSQL its transaction carries a server-side idle limit of the stream's idle timeout (`streamIdleTimeoutMs`, five minutes by default) plus 10 seconds, so the server ends it, and the stream's next pull after a thaw is `ConnectionError` (`TURBINE_E004`). See [Abandoned streams close themselves](/queries#abandoned-streams-close-themselves).
+
 ## See also
 
 - **[Transactions & Pipelines](/transactions)**, pipelines are the highest-leverage edge optimization.

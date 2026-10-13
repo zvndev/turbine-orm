@@ -610,6 +610,51 @@ src/
                       (`findRowLockOption` in cli/pii-predicate-guard.ts). A lock that cannot be
                       taken is `LockNotAvailableError` (E013, see the error table).
 
+    stream-idle.ts , The abandoned-stream guard (0.90), a leaf importing errors.ts only.
+                      A cursor stream (`findManyStream` / `findManyStreamBatches`) that holds
+                      its OWN connection between pulls is watched (one that fit the speculative
+                      fetch holds nothing; one inside `$transaction` rides the caller's
+                      connection and is not watched). Client `streamIdleTimeoutMs` (default
+                      300000, `0` disables), per call `idleTimeoutMs`; `resolveStreamIdleTimeout`
+                      is the E003 validator (a whole number of ms). NOTE the client's plain
+                      `idleTimeoutMs` is the POOL's idle-connection timeout, a different thing.
+                      `StreamIdleGuard` is an unref'd interval ticking at min(timeout/4, 5 s):
+                      only time the consumer is suspended counts, never time Turbine spends
+                      fetching. On expiry `expireIdleStream` (builder.ts) runs the dialect's
+                      cleanup, releases the connection, logs `stream-idle-timeout` (always
+                      on), and the next pull throws `TimeoutError` (E002, `'not-executed'`).
+                      builder.ts drives the dialect's generator by hand (not `yield*`) so the
+                      timer can close it while the consumer is suspended. PostgreSQL only:
+                      `streamBackstopStatement` rides on the dialect's own BEGIN (matched by
+                      exact text in `watchStreamConnection`, one simple-protocol round trip)
+                      and sets `idle_in_transaction_session_timeout` TRANSACTION-LOCALLY
+                      (`set_config(..., true)`, never a session `SET`) to timeout + 10 s,
+                      reading `pg_settings` so a stricter existing limit is kept; a keepalive
+                      `SELECT 1` goes out when the connection has been quiet for half the
+                      timeout, so the server limit only fires when timers cannot run (a frozen
+                      process), which surfaces as 25P03 -> `ConnectionError` (E004).
+
+    sql-comment.ts , `sqlComment` (0.90): sqlcommenter key/values (`static`, `model` +
+                      `action`, `tag` from `$tag`, per-statement `dynamic`) on every
+                      statement a MODEL call sends, appended in `QueryInterface.outgoing()`
+                      AFTER the SQL-template cache, so cache keys and hit rates do not change
+                      and events keep commentless `sql` plus `e.comment`. `resolveSqlComment`
+                      validates at construction (E003 for bad keys/values/types; E017 on a
+                      backend that builds no SQL, i.e. PowDB, detected as
+                      `queryInterfaceFactory` present, and for `dynamic` on MySQL, whose
+                      mysql2 `execute()` keeps a server-side prepared statement per distinct
+                      text against the server-wide `max_prepared_stmt_count`). Prepared
+                      names: no comment keeps the template name; static/model/tag comments
+                      get a `c_<fnv1a64>` name from the shared process budget (the `t_`
+                      template name is not claimed when every statement is commented,
+                      `alwaysComments`); ANY dynamic value makes the statement unnamed. A bad
+                      dynamic key/value is dropped with one `sql-comment-dropped` warn and
+                      never fails the query. Batch paths (`pipeline`, `$transaction([...])`)
+                      go through `commentDeferred`. Raw SQL and transaction control get no
+                      comment. `withoutTrailingComment` is for engine shims that read
+                      statement text (sqlite.ts `statementReturnsRows`, so a value like
+                      `orders-returning` cannot turn a write into a row read).
+
     index.ts       , Barrel re-export. All imports use `./query/index.js`.
 
   index-advisor.ts , Missing-FK-index advisor. Derives every column set relations probe
@@ -873,10 +918,10 @@ src/
                       every query interface the client builds. Also reads the legacy
                       TURBINE_DISABLE_CACHE_CHECK / TURBINE_CACHE_CHECK_SAMPLE. E003 on an
                       unknown mode or key, a non-boolean `advice`, a sample outside (0, 1].
-                      Imports only errors.ts. The ONE NODE_ENV reader in the library except
-                      powql.ts, whose unknown-option advice (via option-surface's
-                      `adviceFromEnvironment`) and no-limit warning still go to console;
-                      that file is the env-scan test's only PENDING entry. `advice` gates
+                      Imports only errors.ts. The ONE NODE_ENV reader in the library, with no
+                      exceptions: powql.ts's unknown-option advice and no-limit warning go
+                      through the client's logger and `diagnostics` since 0.90, and the
+                      env-scan test's PENDING allowlist is empty. `advice` gates
                       the builder's advice (`this.advice`), the relations.ts advice
                       (`whereMod.adviceLogger(qi)`), option-surface's unknown-option
                       warning, utils.ts's redundant sort term and prisma-compat's option
@@ -901,10 +946,12 @@ src/
                       diagnostics types are exported from the package root; the runtime
                       `LOG_CODES` array is not. `src/test/fleet-diagnostics-env-scan.test.ts`
                       enforces both rules (one NODE_ENV reader, one console caller) over
-                      `src/` minus `test/` and `cli/`, with a PENDING allowlist (now only
-                      powql.ts) whose entries must still have a hit.
+                      `src/` minus `test/` and `cli/`, with a PENDING allowlist (now empty)
+                      whose entries must still have a hit. The engine introspectors (sqlite,
+                      mysql, mssql) take `IntrospectOptions.logger` and pass it to
+                      `deriveEngineRelations`.
 
-  log-codes.ts     , `LOG_CODES`, the closed list of every log `code` (48 at 0.90). The
+  log-codes.ts     , `LOG_CODES`, the closed list of every log `code` (50 at 0.90). The
                       CODE is the stable contract, the message text is not (STABILITY.md).
                       Library code imports it as a TYPE only (`TurbineLogCode`), so an
                       emitter cannot invent a code; the tests import the array, one test per
@@ -994,7 +1041,12 @@ src/
                       `supportsPlanCacheMode` dialect flag (E017), owned pools + owned string
                       `replicas` only (external pool = no-op + one always-on warning). ALL config
                       validation now runs BEFORE any process-global side effect, so a throwing
-                      constructor cannot leave the parser mode settled. `logger` and
+                      constructor cannot leave the parser mode settled. `streamIdleTimeoutMs`
+                      (see query/stream-idle.ts) and `sqlComment` (resolved after the other
+                      config validation and before any process-global side effect, handed to
+                      every query interface as `_sqlCommenter`; `pipeline()` and `runBatch`
+                      comment each deferred query with its own model and action, see
+                      query/sql-comment.ts) are client options since 0.90. `logger` and
                       `diagnostics` (0.90) are validated FIRST in the constructor; every line
                       the client writes goes through `logTo(this.logger, ...)` with a code from
                       log-codes.ts. Construction warnings (unknown config key, planCacheMode
@@ -1088,17 +1140,27 @@ src/
                       • `escapeLikePattern` (0.66), per-engine LIKE metacharacter
                         escaping for a bound `contains` / `startsWith` / `endsWith`
                         operand, defaulting to the shared `escapeLike` (the
-                        SQL-standard `\` `%` `_`, paired with the `ESCAPE '\'` clause
-                        the builders always emit). SQL Server overrides it because
+                        SQL-standard `\` `%` `_`, paired with the `ESCAPE` clause the
+                        builders always emit, which names `dialect.likeEscapeCharacter ?? '\'`). SQL Server overrides it because
                         T-SQL's `LIKE` ALSO treats `[` as opening a character class,
                         so `{ contains: '[draft]' }` silently means "contains any one
                         of d, r, a, f, t" there while every other engine reads the
                         value literally. Not injection (the operand stays bound), a
                         WRONG ANSWER, and a property of the engine's pattern grammar
                         rather than of the SQL text, which is what makes it a dialect
-                        hook. Whatever a dialect returns must be escaped for the same
-                        `ESCAPE '\'` clause; the build and cache-hit param-collect
+                        hook. Whatever a dialect returns must be escaped for its own
+                        `likeEscapeCharacter`; the build and cache-hit param-collect
                         paths call the one hook, so they cannot drift.
+                      • `likeEscapeCharacter` (0.90), the character `buildLikeClause`
+                        (where.ts) names in `ESCAPE '<c>'`; absent on `postgresDialect`,
+                        so nothing inherits it, and absent means `\`. MySQL names `!`:
+                        in MySQL's default `sql_mode` `'\'` never closes, so every LIKE
+                        filter was a syntax error on a caller-supplied pool without
+                        `NO_BACKSLASH_ESCAPES` (Turbine sets that mode only on pools it
+                        opens, and never runs a session `SET` on a caller's pool). A dialect
+                        that sets it must define `escapeLikePattern` for the same
+                        character. MySQL's `buildJsonObject` writes a key holding a
+                        backslash as `CONVERT(X'<hex>' USING utf8mb4)` for the same reason.
                       • `buildPartitionLimit` (0.66), the per-correlation-key row bound
                         the batched relation loader pushes DOWN into its follow-up
                         query. That follow-up is one flat `WHERE fk = ANY($1)` over
@@ -1147,7 +1209,12 @@ src/
                       and rebuilt (`json_object` rounds to 15 digits on SQLite 3.47 to 3.51).
                       A safe integer binds as INTEGER (node:sqlite binds every JS number as
                       REAL), so integer `divide` truncates and `3` written to TEXT is
-                      `'3'`.
+                      `'3'`. Since 0.90 `disconnect()` / `end()` close a handle the factory
+                      OPENED (path or `':memory:'`; a later query is E004), and the factory
+                      closes it if the constructor or the open-time PRAGMAs throw; a
+                      `DatabaseSync` the caller passed is never closed. `turbineMysql` and
+                      `turbineMssql` likewise `end()` a pool they built when a later step
+                      throws (version refusal, constructor refusal).
 
   mysql.ts         , `turbine-orm/mysql` engine. `await turbineMysql(url | config |
                       mysql2-pool, schema, options?)`, MySQL 8.0+ via the optional peer
@@ -1161,7 +1228,10 @@ src/
                       marks an `AUTO_INCREMENT` column `isGenerated` (0.90), so the insert id
                       is used even when another column also has a default. `averageArgument`
                       gives `_avg` over a non-BIGINT integer full double precision
-                      (`+ 0E0`); BIGINT keeps its exact DECIMAL average.
+                      (`+ 0E0`); BIGINT keeps its exact DECIMAL average. LIKE escapes with
+                      `!` (`likeEscapeCharacter`, see dialect.ts), so an injected pool works in
+                      any `sql_mode`; the owned pool still sets `NO_BACKSLASH_ESCAPES`, which
+                      only raw SQL now depends on.
 
   mssql.ts         , `turbine-orm/mssql` engine. `await turbineMssql(url | config |
                       mssql-pool, schema, options?)`, SQL Server 2016+ via the optional
@@ -1192,7 +1262,9 @@ src/
                       powdb.ts holds the driver shims (`PowdbPool` over the client `Pool`;
                       `PowdbEmbeddedPool` over a single `Database` handle), type mapping
                       (Turbine→PowQL `str/int/float/bool/json`; never emits `uuid/datetime/bytes`;
-                      `Date`→int micros), `powqlSchemaDDL`, `wrapPowdbError`, and `powdbDialect`
+                      `Date`→int micros; an enum column of `schema.enums` → `str` holding the
+                      label, via `powdbEnumLabels` in powdb-shared.ts: a non-label is E003,
+                      ranges compare in declaration order, ordering it is E017), `powqlSchemaDDL`, `wrapPowdbError`, and `powdbDialect`
                       (`supportsReturning: true`; the Postgres-only flags stay false →
                       `$listen`/`$notify`/RLS/pgvector throw E017). PowDB realities shaping it:
                       writes use the trailing **`returning`** keyword (create/createMany/update/
@@ -1371,6 +1443,8 @@ src/
                       safe to retry) or `'unknown'` (the default, the only answer never
                       wrong); see the timeout note under builder.ts. 25P02 (in failed
                       transaction) maps to `TransactionRolledBackError` (E019) as a fallback;
+                      25P03 (idle_in_transaction_session_timeout, which a cursor stream sets
+                      transaction-locally, see query/stream-idle.ts) is `ConnectionError` (E004);
                       the transaction state normally refuses that statement before it is sent. UnsupportedFeatureError (E017) is thrown directly
                       (not via wrapPgError) when a non-Postgres engine hits a Postgres-only
                       feature. 0.65: every TurbineError carries `.docsUrl`
@@ -1743,7 +1817,7 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 | E017 | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) invoked on an engine whose capability flag reports it unsupported, thrown directly, not via `wrapPgError()` |
 | E018 | `ReadOnlyError` | A write refused because the database is read-only, `reason: 'snapshot'` (PowDB snapshot serving / client-level `readonly: true` fail-fast) or `'rbac'` (read-only role). Thrown locally by the PowDB readonly guard and via `wrapPowdbError()` message families |
 | E019 | `TransactionRolledBackError` | A transaction PostgreSQL rolled back instead of committing (the callback caught a failed statement, or a per-query timeout cancelled one); the first failure is `cause`. Deadlock, serialization and lock-not-available first failures keep their own class. Built by `rolledBackError` in transaction-state.ts; pg 25P02 also maps here via `wrapPgError()` as a fallback |
-| E020 | `InvariantError` | Turbine caught a bug in itself before sending a statement it knew was wrong: two internal paths that must agree did not (the SQL-template cache vs a fresh build, `invariant: 'sql-cache-lockstep'`; a cached entry whose param count differs from the params collected, `'sql-cache-param-count'`). Thrown by the always-on cache prechecks in query/builder.ts. Not retryable, not caused by the arguments; the message names the query shape and no value |
+| E020 | `InvariantError` | Turbine caught a bug in itself before sending a statement it knew was wrong: two internal paths that must agree did not (the SQL-template cache vs a fresh build, `invariant: 'sql-cache-lockstep'`; a cached entry whose param count differs from the params collected, `'sql-cache-param-count'`; a where scope built from an already-quoted reference, `'where-scope-reference'`; a relation payload that does not parse as JSON, `'relation-payload-json'`, both formerly E003). Thrown by the always-on cache prechecks in query/builder.ts, `aliasWhereScope` in where.ts and `parseNestedRow` in relations.ts. Not retryable, not caused by the arguments; the message names the query shape and no value |
 
 `wrapPgError(err)` inspects the pg driver error's `.code` field and wraps it in the appropriate typed error, preserving the original as `.cause`. It is called in `client.ts` (raw queries, transaction pool proxy) and at query execution boundaries in `query/builder.ts`.
 
@@ -1768,7 +1842,7 @@ which exists because the previous copy asserted a snake_case column name was rej
 
 **UI module** (`cli/ui.ts`): Terminal formatting helpers, colors, spinners, tables, boxes. Imported throughout CLI but never by library code.
 
-**Other CLI leaves**: `cli/loader.ts` registers a TypeScript loader (prefers `tsx/esm/api`'s `register()`, probed from the user's CWD) before the CLI `import()`s a user-supplied `turbine.config.ts` / schema file, which plain Node rejects with `ERR_UNKNOWN_FILE_EXTENSION`. `cli/pii-tags.ts` reads `ColumnMetadata.pii` out of the generated `metadata.ts` and applies it to a LIVE introspected schema: `pii` is a code-first declaration that `introspect.ts` never sets, so without this Studio's and the MCP server's redaction would be inert against a real database; it distinguishes "this file declares no PII" from "this file could not be parsed" (`PiiScan.ok === false`), and the latter fails closed by tagging every column. `cli/error-text.ts` (`errorText`, zero imports, 0.90) is how every CLI catch site reads an error: the message, else each aggregated error's message once, else the cause, else the code, else the name. A refused `localhost` rejects with an `AggregateError` whose message is EMPTY, so commands printed a bare prefix; a source scan keeps `cli/index.ts` on it. `cli/rate-limit.ts` is the fixed-window limiter (100 requests / 60s) both local servers share. `cli/local-server-guard.ts` holds the rest of the perimeter both local servers share: the `Host` allowlist that stops DNS rebinding, the ONE-TIME login ticket printed in the terminal (a URL that lands in history or a log is a spent ticket, not a standing key), and the one constant-time token comparison. `cli/code-first-tags.ts` overlays the `defineSchema()`-only tags (`pii`, `updatedAt`, `maxLength`, `tsType`) onto an introspected schema for `turbine generate`, since the database has no column for any of them. `cli/observe.ts` is the read-only metrics dashboard over the `_turbine_metrics` table written by `observe.ts`, with Studio's security model (loopback, random token, HttpOnly cookie, CSP, read-only transactions); its UI is the hand-authored embedded HTML in `cli/observe-ui.ts` (same pattern as `studio-ui.generated.ts` but with no build step).
+**Other CLI leaves**: `cli/local-server-output.ts` is the leaf both local servers share for what they emit: `responseErrorText` (an `Error` gives its message only, with its aggregated messages, cause or code when the message is empty; a non-Error gets a fixed sentence, never `stack` or `String(err)`) and `openInBrowser`, which launches only a plain `http` URL of the exact shape the servers print, so `--host` cannot put shell syntax in front of `cmd /c start`. `cli/loader.ts` registers a TypeScript loader (prefers `tsx/esm/api`'s `register()`, probed from the user's CWD) before the CLI `import()`s a user-supplied `turbine.config.ts` / schema file, which plain Node rejects with `ERR_UNKNOWN_FILE_EXTENSION`. `cli/pii-tags.ts` reads `ColumnMetadata.pii` out of the generated `metadata.ts` and applies it to a LIVE introspected schema: `pii` is a code-first declaration that `introspect.ts` never sets, so without this Studio's and the MCP server's redaction would be inert against a real database; it distinguishes "this file declares no PII" from "this file could not be parsed" (`PiiScan.ok === false`), and the latter fails closed by tagging every column. `cli/error-text.ts` (`errorText`, zero imports, 0.90) is how every CLI catch site reads an error: the message, else each aggregated error's message once, else the cause, else the code, else the name. A refused `localhost` rejects with an `AggregateError` whose message is EMPTY, so commands printed a bare prefix; a source scan keeps `cli/index.ts` on it. `cli/rate-limit.ts` is the fixed-window limiter (100 requests / 60s) both local servers share. `cli/local-server-guard.ts` holds the rest of the perimeter both local servers share: the `Host` allowlist that stops DNS rebinding, the ONE-TIME login ticket printed in the terminal (a URL that lands in history or a log is a spent ticket, not a standing key), and the one constant-time token comparison. `cli/code-first-tags.ts` overlays the `defineSchema()`-only tags (`pii`, `updatedAt`, `maxLength`, `tsType`) onto an introspected schema for `turbine generate`, since the database has no column for any of them. `cli/observe.ts` is the read-only metrics dashboard over the `_turbine_metrics` table written by `observe.ts`, with Studio's security model (loopback, random token, HttpOnly cookie, CSP, read-only transactions); its UI is the hand-authored embedded HTML in `cli/observe-ui.ts` (same pattern as `studio-ui.generated.ts` but with no build step).
 
 ## Testing
 
