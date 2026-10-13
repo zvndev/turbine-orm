@@ -529,7 +529,7 @@ export function powqlSchemaDDL(schema: SchemaMetadata, opts: PowqlSchemaDDLOptio
       new Set(idx.columns).size === pkSet.size &&
       idx.columns.every((c) => pkSet.has(c));
     const fields = meta.columns.map((col) => {
-      const powqlType = powqlColumnType(col);
+      const powqlType = powqlColumnType(col, schema.enums);
       // Gate `json` columns behind the engine's jsonDocs capability when a
       // caller supplied one, an old engine has no `json` type and would reject
       // the DDL. Pure-function callers (no opts) emit unconditionally.

@@ -37,6 +37,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { guardCheckout } from './connection-guard.js';
+import { resolveDiagnostics } from './diagnostics.js';
 import {
   NotFoundError,
   OptimisticLockError,
@@ -46,6 +47,7 @@ import {
   UnsupportedFeatureError,
   ValidationError,
 } from './errors.js';
+import { consoleLogger, logTo, type TurbineLogger } from './logger.js';
 import {
   executeNestedCreate,
   executeNestedUpdate,
@@ -66,16 +68,18 @@ import {
   isPowdbDecimalTextColumn,
   isStaleFramePowdbError,
   type PowdbCapabilities,
+  type PowdbEnums,
   PowdbFloatParam,
   PowdbJsonParam,
   parsePowdbSemver,
+  powdbEnumLabels,
   powqlColumnType,
   quotePowqlDotted,
   quotePowqlIdent,
   requireCapability,
   rowToEntity,
 } from './powdb-shared.js';
-import { assertAggregatePiiOptIn } from './query/aggregates.js';
+import { assertAggregatePiiOptIn, assertGroupByKeys } from './query/aggregates.js';
 import { markStitchOnly, resolveCountRelations, stitchOnlyFields } from './query/batched-loader.js';
 import { unlockNestedWriteTx } from './query/builder.js';
 import { isColumnRef } from './query/column-ref.js';
@@ -178,6 +182,7 @@ import {
   foldWhereFor,
   relationCardinalityProblem,
   relationFilterValueProblem,
+  type WhereFoldOptions,
 } from './query/where-compile.js';
 import { assertNoBulkWritePaging, assertNoOptimisticLock } from './query/writes.js';
 import {
@@ -489,6 +494,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
   private readonly warnOnUnlimited: boolean;
   private readonly onQuery?: (event: QueryEvent) => void;
   private warnedUnlimited = false;
+  /** Where this interface's log lines go: the client's logger, else the console. */
+  private readonly logger: TurbineLogger;
+  /** The logger for advice lines, or `undefined` when `diagnostics` turns advice off. */
+  private readonly advice: TurbineLogger | undefined;
 
   constructor(
     private readonly pool: PowdbPool,
@@ -514,6 +523,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
         ? (warnOpt[table] ?? warnOpt[snakeToCamel(table)]) !== false
         : warnOpt !== false;
     this.onQuery = options._onQuery;
+    // Resolved by the client once and passed in; an interface built directly
+    // resolves here, at construction, as QueryInterface does.
+    this.logger = options.logger ?? consoleLogger;
+    this.advice = resolveDiagnostics(options.diagnostics).advice ? this.logger : undefined;
   }
 
   // -------------------------------------------------------------------------
@@ -619,7 +632,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    */
   private param(value: unknown, params: unknown[], col?: ColumnMetadata): string {
     let tagged: unknown = value;
-    if (isJsonValue(value)) {
+    const labels = col ? this.enumLabels(col) : undefined;
+    if (labels && value !== null && value !== undefined) {
+      // An enum column takes one of its labels, in a write and in a filter
+      // alike, as PostgreSQL does (22P02 there).
+      this.assertEnumLabel(col!, labels, value);
+    } else if (isJsonValue(value)) {
       // `jsonValue(v)`: serialized with JSON.stringify, as on the SQL engines.
       tagged = new PowdbJsonParam(value.value, col?.name);
     } else if (col && typeof value === 'string' && isDateColumn(col)) {
@@ -645,7 +663,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     } else if (col && typeof value === 'number' && this.isFloatCol(col)) {
       // Float column: force a float-form literal even for an integer value.
       tagged = new PowdbFloatParam(value);
-    } else if (col && value !== null && typeof value === 'object' && !(value instanceof Date) && isJsonColumn(col)) {
+    } else if (
+      col &&
+      value !== null &&
+      typeof value === 'object' &&
+      !(value instanceof Date) &&
+      isJsonColumn(col, this.schema.enums)
+    ) {
       // json document column: a JS object/array is serialized to canonical JSON
       // text and stored as a json document (a JS string passes through raw, same
       // contract as pg jsonb; `null` stays `null`).
@@ -686,7 +710,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     const declared = (col.dialectType ?? col.pgType ?? '').toLowerCase();
     if (declared !== '' && !/int|serial/.test(declared)) return false;
     try {
-      return powqlColumnType(col) === 'int';
+      return powqlColumnType(col, this.schema.enums) === 'int';
     } catch {
       return false;
     }
@@ -694,7 +718,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
 
   private isFloatCol(col: ColumnMetadata): boolean {
     try {
-      return powqlColumnType(col) === 'float';
+      return powqlColumnType(col, this.schema.enums) === 'float';
     } catch {
       return false;
     }
@@ -1200,7 +1224,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    * writes are unaffected.
    */
   private assertDecimalComparable(col: ColumnMetadata, what: string): void {
-    if (!isPowdbDecimalTextColumn(col)) return;
+    if (!isPowdbDecimalTextColumn(col, this.schema.enums)) return;
     throw new UnsupportedFeatureError(
       `${what} on the numeric column "${col.name}" of "${this.table}"`,
       'PowDB',
@@ -1208,6 +1232,62 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
         "strings ('10' < '9', '7.5' != '7.50') and arithmetic on them yields NULL. Reading, writing and `null` " +
         'checks work. To compare, aggregate or do arithmetic, store the value as an integer of minor units ' +
         '(cents) or as a float, or do it in application code.',
+    );
+  }
+
+  /** The labels of `col`'s enum type, or `undefined` when it is not an enum column. */
+  private enumLabels(col: ColumnMetadata): readonly string[] | undefined {
+    return powdbEnumLabels(col, this.schema.enums);
+  }
+
+  /**
+   * E003 unless `value` is one of the enum column's labels. PostgreSQL refuses
+   * any other value (22P02, which Turbine reports as E003) whether it is
+   * written or compared, and the label set is exact: case and spelling count.
+   * The value itself is not echoed, only its kind.
+   */
+  private assertEnumLabel(col: ColumnMetadata, labels: readonly string[], value: unknown): void {
+    if (typeof value === 'string' && labels.includes(value)) return;
+    const shown = labels.slice(0, 10).map((l) => JSON.stringify(l));
+    if (labels.length > shown.length) shown.push(`and ${labels.length - shown.length} more`);
+    throw new ValidationError(
+      `Invalid value for the enum column "${col.name}" on "${this.table}": expected one of its labels ` +
+        `(${shown.join(', ')}), got ${typeof value === 'string' ? 'a string that is not one of them' : describeOperand(value)}.`,
+    );
+  }
+
+  /**
+   * Refuse an ORDERING of an enum column (orderBy, `_min` / `_max`). PostgreSQL
+   * orders an enum by the position of its labels in the type's declaration;
+   * PowDB stores the label text and would order it alphabetically, a different
+   * answer with no error. Range filters (`gt` / `gte` / `lt` / `lte`) do not come
+   * here: they compile to the exact set of labels on that side of the operand.
+   */
+  private assertEnumOrderable(col: ColumnMetadata, what: string): void {
+    if (!this.enumLabels(col)) return;
+    throw new UnsupportedFeatureError(
+      `${what} on the enum column "${col.name}" of "${this.table}"`,
+      'PowDB',
+      'PostgreSQL orders an enum by the order its labels are declared in, and PowDB stores the label text, so ' +
+        'it would order the labels alphabetically. Equality, `in` / `notIn`, `gt` / `gte` / `lt` / `lte` and ' +
+        'groupBy keys work. Order by the label position in application code.',
+    );
+  }
+
+  /**
+   * An aggregate over an enum column: `_min` / `_max` order it (see
+   * {@link assertEnumOrderable}); `_sum` / `_avg` have no meaning on a label,
+   * which PostgreSQL refuses as E003 (42883, no such function).
+   */
+  private assertEnumAggregate(col: ColumnMetadata, fn: string): void {
+    if (!this.enumLabels(col)) return;
+    if (fn === '_min' || fn === '_max') {
+      this.assertEnumOrderable(col, `\`${fn}\``);
+      return;
+    }
+    throw new ValidationError(
+      `\`${fn}\` on the enum column "${col.name}" of "${this.table}": an enum label is not a number. ` +
+        'Use `_count`, or `_min` / `_max` on another engine.',
     );
   }
 
@@ -1243,7 +1323,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     // path filters (≥ 0.12). `isJsonFilter` matches `path`/`equals`/`contains`/
     // `hasKey`; on a NON-json column those fall through to the scalar operator
     // path below (e.g. `equals` stays a plain equality), exactly like SQL.
-    if (isJsonColumn(colMeta) && isJsonFilter(value)) {
+    if (isJsonColumn(colMeta, this.schema.enums) && isJsonFilter(value)) {
       requireCapability(this.capabilities, 'jsonDocs', 'JSON path filters');
       return this.buildJsonPathCondition(colMeta, value, params, alias);
     }
@@ -1252,7 +1332,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       // A json document column compares a whole document by value. Any other
       // column has no object or array value, so binding one as data compared
       // against nothing meaningful; it is refused, as on the SQL engines.
-      if (!isJsonColumn(colMeta)) throw this.operandError(field, '=', value, 'a scalar or an operator object');
+      if (!isJsonColumn(colMeta, this.schema.enums))
+        throw this.operandError(field, '=', value, 'a scalar or an operator object');
       throw jsonDocumentEqualityUnsupported(colMeta);
     }
     // The SQL engines' operand rules and messages, so the engines agree on
@@ -1263,15 +1344,23 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       table: this.table,
       kind: operandColumnKind(this.meta.pgTypes[colMeta.name]),
     };
-    if (!isJsonColumn(colMeta)) assertOperatorOperands(op, operand);
+    if (!isJsonColumn(colMeta, this.schema.enums)) assertOperatorOperands(op, operand);
     // On a JSON column a `not` object made only of filter operators is refused,
     // as on the SQL engines (one spelling, one meaning on every engine).
     else assertJsonNotOperand(op.not, operand);
     const insensitive = op.mode === 'insensitive';
     const lhs = insensitive ? `lower(${ref})` : ref;
+    const labels = this.enumLabels(colMeta);
     const conds: string[] = [];
     for (const [opName, opVal] of Object.entries(op)) {
       if (opVal === undefined || opName === 'mode') continue;
+      if (labels) {
+        const range = this.enumRangeCondition(colMeta, labels, ref, opName, opVal, insensitive, params);
+        if (range !== undefined) {
+          conds.push(range);
+          continue;
+        }
+      }
       if (opName === 'not' && opVal !== null && !isScalarOperand(opVal) && !isColumnReference(opVal)) {
         // `not` takes an operator object, as on the SQL engines: the rows where
         // the inner condition is FALSE (a NULL column is neither, so it is
@@ -1539,6 +1628,43 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    * A PowDB-native `datetime` column takes the expanded form instead (see
    * {@link buildDatetimeInList}): its `in` list is still broken upstream at 0.20.
    */
+  /**
+   * The enum-specific shapes of one operator on an enum column, or `undefined`
+   * for an operator compiled the ordinary way (equality, `in` / `notIn`, `not`,
+   * whose labels {@link param} checks).
+   *
+   * `gt` / `gte` / `lt` / `lte` compile to `in` over the labels on that side of
+   * the operand in DECLARATION order, which is what PostgreSQL compares; the
+   * text comparison PowDB would run is alphabetical, a different answer. A null
+   * operand matches no row, as `col > NULL` does. Case-insensitive matching and
+   * `contains` / `startsWith` / `endsWith` are E003: PostgreSQL has no `lower`
+   * or `LIKE` on an enum (42883).
+   */
+  private enumRangeCondition(
+    col: ColumnMetadata,
+    labels: readonly string[],
+    ref: string,
+    opName: string,
+    opVal: unknown,
+    insensitive: boolean,
+    params: unknown[],
+  ): string | undefined {
+    if (insensitive || opName === 'contains' || opName === 'startsWith' || opName === 'endsWith') {
+      throw new ValidationError(
+        `${insensitive ? "`mode: 'insensitive'`" : `\`${opName}\``} on the enum column "${col.name}" of ` +
+          `"${this.table}": an enum compares whole labels exactly. Use \`equals\`, \`in\` or \`notIn\` with its labels.`,
+      );
+    }
+    if (opName !== 'gt' && opName !== 'gte' && opName !== 'lt' && opName !== 'lte') return undefined;
+    if (opVal === null) return this.alwaysFalse();
+    this.assertEnumLabel(col, labels, opVal);
+    const at = labels.indexOf(opVal as string);
+    const side = labels.filter((_, i) =>
+      opName === 'gt' ? i > at : opName === 'gte' ? i >= at : opName === 'lt' ? i < at : i <= at,
+    );
+    return this.buildInList(ref, side, params, false, false, col);
+  }
+
   private buildInList(
     lhs: string,
     values: unknown[],
@@ -2387,6 +2513,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
             );
           }
           this.assertDecimalComparable(this.column(field), 'Ordering');
+          this.assertEnumOrderable(this.column(field), 'Ordering');
           return `${this.ref(field, alias)} ${this.dirKeyword(spec.sort, `orderBy on "${field}"`)}`;
         }
         // Name the actual feature in the refusal, a pick-row ordering
@@ -2404,6 +2531,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
         throw new UnsupportedFeatureError(feature, 'PowDB', `field "${field}"`);
       }
       this.assertDecimalComparable(this.column(field), 'Ordering');
+      this.assertEnumOrderable(this.column(field), 'Ordering');
       return `${this.ref(field, alias)} ${this.dirKeyword(dir, `orderBy on "${field}"`)}`;
     });
     return ` order ${parts.join(', ')}`;
@@ -2412,7 +2540,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
   /** Compile one {@link JsonPathOrderBy} entry to `order .col->$n asc` (+ optional numeric cast). */
   private buildJsonPathOrder(field: string, spec: JsonPathOrderBy, params: unknown[], alias?: string): string {
     const col = this.column(field);
-    if (!isJsonColumn(col)) {
+    if (!isJsonColumn(col, this.schema.enums)) {
       throw new UnsupportedFeatureError('JSON-path ordering', 'PowDB', `field "${field}" is not a json column`);
     }
     requireCapability(this.capabilities, 'jsonDocs', 'JSON path ordering');
@@ -2556,7 +2684,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     // `QueryInterface.executeWithMiddleware`. The option surface is the CORE
     // one because these args ARE core's args; PowDB reads them, it does not
     // define them.
-    warnUnknownQueryOptions(this.table, action, args);
+    warnUnknownQueryOptions(this.table, action, args, this.advice ?? null);
     if (this.middlewares.length === 0) return executor();
     // A copy, as on the SQL engines: the statement is built from `args`, not
     // from what middleware sees, so `next()` throws on a changed copy rather
@@ -2579,7 +2707,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    * coerces its string cells correctly. Defaults to the pool capability for the
    * rare caller with no per-result flag (hand-built test pools). */
   private shape(rows: Record<string, unknown>[], native = Boolean(this.capabilities.nativeRaw)): T[] {
-    return rows.map((r) => rowToEntity(r, this.meta, native) as T);
+    return rows.map((r) => rowToEntity(r, this.meta, native, this.schema.enums) as T);
   }
 
   // -------------------------------------------------------------------------
@@ -2771,7 +2899,11 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     this.assertPagination(limit, args.offset, 'findMany');
     if (limit === undefined && this.warnOnUnlimited && !this.warnedUnlimited) {
       this.warnedUnlimited = true;
-      console.warn(`[turbine] findMany on "${this.table}" has no limit: this scans the whole table.`);
+      logTo(this.logger, 'warn', `findMany on "${this.table}" has no limit: this scans the whole table.`, {
+        code: 'unlimited-find-many',
+        table: this.table,
+        operation: 'findMany',
+      });
     }
     const limitClause = limit !== undefined ? ` limit ${this.param(limit, params)}` : '';
     const offsetClause = args.offset ? ` offset ${this.param(args.offset, params)}` : '';
@@ -4012,7 +4144,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       }
     }
     const items = Array.isArray(value) ? value : [];
-    const shaped = items.map((o) => rowToEntity(o as Record<string, unknown>, plan.targetQi.meta, true));
+    const shaped = items.map((o) =>
+      rowToEntity(o as Record<string, unknown>, plan.targetQi.meta, true, this.schema.enums),
+    );
     for (const child of shaped) {
       for (const sub of plan.children) plan.targetQi.attachOneNested(child, sub);
     }
@@ -4214,7 +4348,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
           raw[c] = row[`${plan.keyPrefix}${c}`];
           delete row[`${plan.keyPrefix}${c}`];
         }
-        const child = rowToEntity(raw, plan.targetQi.meta, native);
+        const child = rowToEntity(raw, plan.targetQi.meta, native, this.schema.enums);
         if (child[pkField] == null) {
           row[plan.relName] = null;
           continue;
@@ -4293,7 +4427,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       if (!col.hasDefault || col.isGenerated || this.meta.primaryKey.includes(col.name)) continue;
       if (data[col.field] !== undefined || data[col.name] !== undefined) continue;
       const expr = col.defaultValue;
-      const value = expr == null ? NO_DEFAULT : emulateColumnDefault(expr, col);
+      const value = expr == null ? NO_DEFAULT : emulateColumnDefault(expr, col, this.schema.enums);
       if (value === NO_DEFAULT) {
         throw new UnsupportedFeatureError(
           `The default of column "${col.name}" on "${this.table}"`,
@@ -4599,7 +4733,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     const keys = Object.keys(value as Record<string, unknown>);
     if (keys.length !== 1 || !UPDATE_OPERATOR_KEYS.has(keys[0]!)) return null;
     const op = keys[0]!;
-    if (op !== 'set' && isJsonColumn(colMeta)) return null;
+    if (op !== 'set' && isJsonColumn(colMeta, this.schema.enums)) return null;
     return op;
   }
 
@@ -4609,7 +4743,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    * the SQL engines' message rather than stored as text.
    */
   private assertBindableSetValue(field: string, colMeta: ColumnMetadata, value: unknown): void {
-    if (!isUnmatchedPlainObject(value) || isJsonColumn(colMeta)) return;
+    if (!isUnmatchedPlainObject(value) || isJsonColumn(colMeta, this.schema.enums)) return;
     const keys = Object.keys(value as Record<string, unknown>);
     if (keys.length !== 1 || UPDATE_OPERATOR_KEYS.has(keys[0]!)) return;
     throw new ValidationError(
@@ -5080,6 +5214,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
         const powfn = fn.slice(1); // sum/avg/min/max
         for (const field of Object.keys(spec).filter((f) => (spec as Record<string, boolean>)[f])) {
           this.assertDecimalComparable(this.column(field), `\`${fn}\``);
+          this.assertEnumAggregate(this.column(field), fn);
           // Same PII contract as the SQL engines: _min/_max return a stored cell.
           if (fn === '_min' || fn === '_max') {
             assertAggregatePiiOptIn(
@@ -5108,7 +5243,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       // so one coercion serves both forms.
       const decode = (p: Planned, cell: unknown, native: boolean): unknown =>
         p.col
-          ? decodeAggregateCell(cell, p.col, native)
+          ? decodeAggregateCell(cell, p.col, native, this.schema.enums)
           : p.exact
             ? exactIntegerSumCell(cell)
             : cell == null || cell === 'null'
@@ -5144,6 +5279,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
 
   groupBy<A extends GroupByArgs<T>>(args: A): Promise<GroupByResult<T, A>[]>;
   async groupBy(args: GroupByArgs<T>): Promise<Record<string, unknown>[]> {
+    // The SQL engines' `by` refusals, before anything reads `by`.
+    assertGroupByKeys(this.table, (args as { by?: unknown } | undefined)?.by);
     this.assertNoForceCustomPlan(args);
     this.assertNoPercentile(args);
     args = this.normalizeArgs(args);
@@ -5226,7 +5363,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
           byReaders.push({ kind: 'plain', resultKey: col.field, rowKey: col.name, col });
         } else {
           const col = this.column(entry.field);
-          if (!isJsonColumn(col)) {
+          if (!isJsonColumn(col, this.schema.enums)) {
             throw new ValidationError(
               `groupBy JSON group key on "${entry.field}" (table "${this.table}") requires a json column.`,
             );
@@ -5331,6 +5468,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
           if (target === true) {
             const col = this.column(key);
             this.assertDecimalComparable(col, `\`${fn}\``);
+            this.assertEnumAggregate(col, fn);
             if (fn === '_min' || fn === '_max') {
               assertAggregatePiiOptIn(
                 this.table,
@@ -5357,7 +5495,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
             aggInner.set(col.field, inner);
           } else {
             const col = this.column(target.field);
-            if (!isJsonColumn(col)) {
+            if (!isJsonColumn(col, this.schema.enums)) {
               throw new ValidationError(
                 `groupBy ${fn} target "${key}" on "${target.field}" (table "${this.table}") requires a json column.`,
               );
@@ -5428,7 +5566,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
         for (const a of aggReaders) {
           const cell = raw[a.alias];
           const v = a.col
-            ? decodeAggregateCell(cell, a.col, resultNative)
+            ? decodeAggregateCell(cell, a.col, resultNative, this.schema.enums)
             : a.exact
               ? exactIntegerSumCell(cell)
               : cell == null || cell === 'null'
@@ -5513,6 +5651,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
           const inner = this.lookupGroupKey(aggInner, key) ?? this.ref(key);
           const column = this.meta.columns.find((c) => c.field === key || c.name === key);
           if (column && fn !== 'count') this.assertDecimalComparable(column, `\`${aggKey}\` in having`);
+          if (column && fn !== 'count') this.assertEnumAggregate(column, aggKey);
           conds.push(cmp(`${fn}(${inner})`, filter));
         }
       }
@@ -5584,6 +5723,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
           `Unknown field "${key}" in groupBy orderBy on table "${this.table}". Orderable keys: ${validKeys()}.`,
         );
       }
+      const keyColumn = this.meta.columns.find((c) => c.field === key || c.name === key);
+      if (keyColumn) this.assertEnumOrderable(keyColumn, 'Ordering a groupBy');
       parts.push(`${expr} ${this.groupOrderDir(value, key)}`);
     }
     return parts.length ? ` order ${parts.join(', ')}` : '';
@@ -5835,6 +5976,12 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    * writes every row just the same, so `userWhere`, the caller's where before
    * relation filters were resolved, is folded by the SQL engines' rule
    * (`foldWhereFor`) and refused too.
+   *
+   * The fold also reads the schema's NOT NULL columns, as the SQL guard does:
+   * `{ name: { not: null } }` or `NOT: { name: null }` on a NOT NULL column is
+   * TRUE for every row (PowDB's `required` holds the same guarantee). It does
+   * NOT trust foreign keys: PowDB declares none, so an orphan row is possible
+   * and a belongsTo `is: {}` stays a condition.
    */
   private assertCompiledWhere(
     compiledWhere: string,
@@ -5846,13 +5993,21 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     if (
       compiledWhere.length > 0 &&
       (userWhere === undefined ||
-        foldWhereFor(this.schema.tables, this.table, userWhere as Record<string, unknown>) !== 'true')
+        foldWhereFor(this.schema.tables, this.table, userWhere as Record<string, unknown>, POWDB_GUARD_FOLD) !== 'true')
     ) {
       return;
     }
     throw new ValidationError(emptyMutationWhereMessage(action, this.table));
   }
 }
+
+/**
+ * The mass-mutation guard's fold options on PowDB (see `assertCompiledWhere`):
+ * NOT NULL columns count, foreign keys do not (PowDB enforces none).
+ */
+const POWDB_GUARD_FOLD: WhereFoldOptions = {
+  notNull: { foreignKeys: false, hasGlobalFilter: () => true },
+};
 
 /** Marks a default expression {@link emulateColumnDefault} cannot evaluate. */
 const NO_DEFAULT = Symbol('turbine.powdb.noDefault');
@@ -5866,7 +6021,7 @@ const NO_DEFAULT = Symbol('turbine.powdb.noDefault');
  * Anything else returns {@link NO_DEFAULT}: a guessed value would be a silent
  * divergence from the engine the schema was written for.
  */
-function emulateColumnDefault(expr: string, col: ColumnMetadata): unknown {
+function emulateColumnDefault(expr: string, col: ColumnMetadata, enums: PowdbEnums | undefined): unknown {
   let e = expr.trim();
   for (;;) {
     const unwrapped = e.replace(/::[a-z_][a-z0-9_ ]*(\(\d+(,\s*\d+)?\))?(\[\])?$/i, '').trim();
@@ -5893,7 +6048,10 @@ function emulateColumnDefault(expr: string, col: ColumnMetadata): unknown {
   const quoted = /^'((?:[^']|'')*)'$/s.exec(e);
   const literal = quoted ? quoted[1]!.replace(/''/g, "'") : /^-?\d+(\.\d+)?$/.test(e) ? e : undefined;
   if (literal === undefined) return NO_DEFAULT;
-  if (isJsonColumn(col)) {
+  // An enum default is one of its labels, stored as the label text.
+  const labels = powdbEnumLabels(col, enums);
+  if (labels) return labels.includes(literal) ? literal : NO_DEFAULT;
+  if (isJsonColumn(col, enums)) {
     try {
       return JSON.parse(literal);
     } catch {
@@ -6059,12 +6217,17 @@ function isoTextMicros(text: string, col: ColumnMetadata, table: string): bigint
   return BigInt(ms) * 1000n + BigInt(fracMicros);
 }
 
-function decodeAggregateCell(cell: unknown, col: ColumnMetadata, native: boolean): unknown {
+function decodeAggregateCell(
+  cell: unknown,
+  col: ColumnMetadata,
+  native: boolean,
+  enums: PowdbEnums | undefined,
+): unknown {
   if (cell === undefined || cell === null) return null;
   if (native) return coerceNativeValue(cell, col);
   // Legacy string wire: an aggregate over no rows renders the bareword `null`.
   if (typeof cell !== 'string') return cell;
-  return cell === 'null' ? null : coerceValue(cell, col);
+  return cell === 'null' ? null : coerceValue(cell, col, enums);
 }
 
 /** Coerce a group-key scalar string by the column's TS type (numbers/bools). */

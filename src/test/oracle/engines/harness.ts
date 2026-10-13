@@ -342,7 +342,7 @@ export function powdbHarness(): EngineHarness {
   let dir = '';
   let main: Db;
   // PowDB gets the fixture without the tables of its gaps (see `gaps` below).
-  const GAPS: Capability[] = ['binary', 'enum'];
+  const GAPS: Capability[] = ['binary'];
   const { schema: fixture } = fixtureWithout(GAPS);
   const open = async (config: ClientConfig = {}) => {
     const { turbinePowDB } = await import('../../../powdb.js');
@@ -364,15 +364,6 @@ export function powdbHarness(): EngineHarness {
       async binary() {
         const ddl = await fullDdl('oe_bin_parents');
         return ddl instanceof Error ? ddl.message : undefined;
-      },
-      // An enum column is declared as `json`, so writing a label fails with
-      // "invalid JSON". Gone when the column is declared as `str`.
-      async enum() {
-        const { powqlSchemaDDL } = await import('../../../powdb.js');
-        const ddl = powqlSchemaDDL(fixtureWithout(['binary']).schema).find((stmt) => stmt.startsWith('type oe_tags '));
-        return ddl && /status: json/.test(ddl)
-          ? `the enum column is declared as json: ${ddl.replace(/\s+/g, ' ')}`
-          : undefined;
       },
     },
     async setup() {

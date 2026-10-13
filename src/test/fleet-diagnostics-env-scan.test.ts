@@ -33,9 +33,7 @@ const CONSOLE_CALLERS = new Set(['logger.ts', 'seed.ts']);
  * hit (the last test), so this list cannot outlive the work it excuses: when a
  * file is converted its entry has to go.
  */
-const PENDING: Readonly<Record<string, string>> = {
-  'powql.ts': 'PowDB unknown-option and no-limit warnings: scheduled after the fix lanes release powql.ts',
-};
+const PENDING: Readonly<Record<string, string>> = {};
 
 function librarySources(): string[] {
   const out: string[] = [];
