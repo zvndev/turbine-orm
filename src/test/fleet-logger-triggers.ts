@@ -353,6 +353,21 @@ export const TRIGGERS: Record<string, { trigger: Trigger; async?: true }> = {
       while (!released && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
     },
   },
+  'sql-comment-dropped': {
+    trigger: async (m, logger) => {
+      // A dynamic hook returning a key the comment format refuses: the
+      // statement still runs, with that key left out and one warning.
+      const pool = { query: async () => ({ rows: [], rowCount: 0 }) };
+      const qi = new m.QueryInterface(
+        pool,
+        'items',
+        itemsSchema(m),
+        [],
+        withLogger(logger, { warnOnUnlimited: false, sqlComment: { dynamic: () => ({ 'Trace-Id': 'abc' }) } }),
+      );
+      await qi.findMany({ limit: 1 });
+    },
+  },
   'parser-overwrite': {
     trigger: async (m, logger) => {
       // Somebody else's parser on a temporal OID, then the check Turbine runs

@@ -240,6 +240,8 @@ export {
   type WithOrderByObject,
   type WithResult,
 } from './query/index.js';
+// sqlComment: sqlcommenter key/values appended to each statement
+export type { SqlCommentOptions } from './query/sql-comment.js';
 export type {
   AggregateResultOf,
   ConflictTarget,

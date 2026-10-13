@@ -466,7 +466,16 @@ function preparedNames(): Set<string> {
  * connection keeps every name it ever prepared.
  */
 export function boundedPreparedName(sql: string): string {
-  const name = sqlToPreparedName(sql);
+  return claimPreparedName(sqlToPreparedName(sql));
+}
+
+/**
+ * Claim an already derived statement name from the same budget as
+ * {@link boundedPreparedName}: `name` itself, or `''` (send it unnamed) once
+ * the budget is spent. `sqlComment`'s `c_` names (query/sql-comment.ts) are
+ * claimed here, so a commented statement costs one slot like any other.
+ */
+export function claimPreparedName(name: string): string {
   const names = preparedNames();
   if (names.has(name)) return name;
   if (names.size >= PREPARED_STATEMENT_BUDGET) return '';

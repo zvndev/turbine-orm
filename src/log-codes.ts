@@ -51,6 +51,8 @@ export const LOG_CODES = [
   'temporal-infinity',
   'cache-mismatch',
   'stream-idle-timeout',
+  // query/sql-comment.ts, always on (a sqlComment.dynamic value left out)
+  'sql-comment-dropped',
   // query/relations.ts, per-query advice
   'relation-payload-json',
   'flatten-fallback',

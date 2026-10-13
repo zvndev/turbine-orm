@@ -11,6 +11,7 @@ import type { PgCompatPool, PgCompatQueryResult } from '../pg-types.js';
 import type { SchemaMetadata } from '../schema.js';
 // Forward-declared to avoid a runtime cycle with builder.ts. Type-only.
 import type { QueryInterface } from './builder.js';
+import type { SqlCommenter, SqlCommentOptions } from './sql-comment.js';
 import type { TableClient } from './table-client.js';
 import type { GlobalFilters, JsonEncoding, RelationLoadStrategy } from './types.js';
 
@@ -124,6 +125,14 @@ export interface QueryEvent {
    * batch statements are timed individually. Absent for everything else.
    */
   batch?: 'pipeline' | 'transaction';
+  /**
+   * The `sqlComment` this statement was sent with, exactly as appended
+   * (`/*action='findMany',model='users'*\/`). `sql` stays the commentless
+   * text, so events for one statement shape compare equal whatever the
+   * comment; the text on the wire was `${sql} ${comment}`. Absent when the
+   * statement carried none (no `sqlComment`, raw SQL, transaction control).
+   */
+  comment?: string;
   /**
    * Set on a READ that failed because its connection had already been closed
    * by the server, and that Turbine therefore sent once more on a fresh one.
@@ -316,6 +325,15 @@ export interface QueryInterfaceOptions {
   diagnostics?: DiagnosticsConfig;
   /** Where this interface's log lines go. Defaults to the console logger. */
   logger?: TurbineLogger;
+  /**
+   * `sqlComment`: sqlcommenter key/values appended to every statement this
+   * interface sends (see `TurbineConfig.sqlComment`), resolved at
+   * construction. TurbineClient resolves it once instead and hands every
+   * interface the same commenter as `_sqlCommenter`.
+   */
+  sqlComment?: SqlCommentOptions;
+  /** @internal The client's resolved `sqlComment`, shared by its accessors; wins over `sqlComment`. */
+  _sqlCommenter?: SqlCommenter;
   /** @internal Set by TransactionClient, signals that this QI runs inside an active transaction. */
   _txScoped?: boolean;
   /** @internal Callback from TurbineClient for query event emission. */

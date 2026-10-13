@@ -124,6 +124,7 @@ import {
   nullRecord,
   printableCatalogName,
 } from './introspect.js';
+import { withoutTrailingComment } from './query/sql-comment.js';
 import { LRUCache } from './query/utils.js';
 import {
   type ColumnMetadata,
@@ -492,7 +493,12 @@ const ROW_RETURNING_HEAD = /^\s*(?:select|with|pragma|explain|values)\b/i;
  * A `RETURNING` clause turns any write into a row-producing statement.
  */
 function statementReturnsRows(sql: string): boolean {
-  return ROW_RETURNING_HEAD.test(sql) || /\breturning\b/i.test(sql);
+  // A `sqlComment` (query/sql-comment.ts) sits after the statement and its
+  // values are data, so the RETURNING test reads the statement without it: a
+  // value such as `orders-returning` must not turn a write into a row read
+  // and its change count into 0.
+  const code = withoutTrailingComment(sql);
+  return ROW_RETURNING_HEAD.test(code) || /\breturning\b/i.test(code);
 }
 
 /**

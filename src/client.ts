@@ -72,6 +72,7 @@ import {
   type TemporalInfinityReading,
 } from './query/index.js';
 import { assertNoLockInAutocommitPipeline } from './query/row-lock.js';
+import { commentDeferred, resolveSqlComment, type SqlCommenter, type SqlCommentOptions } from './query/sql-comment.js';
 import { resolveStreamIdleTimeout } from './query/stream-idle.js';
 import { asQueryInterface, TABLE_METHODS } from './query/table-client.js';
 import {
@@ -530,6 +531,42 @@ export interface TurbineConfig {
    */
   streamIdleTimeoutMs?: number | undefined;
   /**
+   * Append sqlcommenter-style key/values to every statement this client builds,
+   * so `pg_stat_activity`, the server log, `auto_explain` and database APM
+   * tools can attribute a statement to a service, model, feature or trace:
+   *
+   * ```sql
+   * SELECT ... /*action='findMany',application='billing',model='users',tag='checkout'*\/
+   * ```
+   *
+   * `static` adds constant pairs, `model: true` the table and operation,
+   * `tag: true` the label of the innermost `db.$tag(label, fn)`, and `dynamic`
+   * per-statement pairs computed in the caller's async context (a W3C
+   * `traceparent`). Keys are lower-case `[a-z][a-z0-9_]*`; values are
+   * URL-encoded (so none can end or nest the comment) and at most 256
+   * characters. A malformed `static` key or value is E003 here; a bad
+   * `dynamic` one is left out with a `sql-comment-dropped` warning, never
+   * thrown.
+   *
+   * Model statements get it: reads, writes, streams, pipelines and
+   * `$transaction` batches. Raw SQL, transaction control and `set_config`
+   * calls do not. It is added after the SQL-template cache, so caching is
+   * unchanged, and `$on('query')` events keep `sql` commentless and carry the
+   * comment as `comment`.
+   *
+   * Prepared statements: a statement whose comment is static, model or tag is
+   * still prepared, under a name of its own (counted against the same budget
+   * as every other name). One carrying any `dynamic` value is sent unnamed,
+   * so it is parsed and planned on every execution (tens of microseconds per
+   * statement on a local PostgreSQL, more for nested reads): return dynamic
+   * values only when they are worth that, for example only for sampled traces.
+   *
+   * Refused (E017) on PowDB, which runs no SQL, and `dynamic` on MySQL, whose
+   * engine keeps a server-side prepared statement per distinct text and would
+   * exhaust the server's `max_prepared_stmt_count`.
+   */
+  sqlComment?: SqlCommentOptions | undefined;
+  /**
    * Refuse a nested `connect` / `connectOrCreate` that would re-parent a
    * to-many child already owned by a different parent. Off by default,
    * because it changes the outcome of writes that currently succeed.
@@ -807,6 +844,7 @@ const TURBINE_CONFIG_KEYS: Record<keyof TurbineConfig, true> = {
   statementTimeoutMs: true,
   maxLifetimeSeconds: true,
   streamIdleTimeoutMs: true,
+  sqlComment: true,
   scopedConnect: true,
   relationLoadStrategy: true,
   stableRelationOrder: true,
@@ -2079,6 +2117,10 @@ export class TurbineClient {
   private readonly middlewares: Middleware[] = [];
   private readonly queryListeners = new Set<QueryEventListener>();
   private queryOptions: QueryInterfaceOptions;
+  /** The resolved `sqlComment` every accessor shares, for the batch paths that bypass them. */
+  private get sqlCommenter(): SqlCommenter | undefined {
+    return this.queryOptions._sqlCommenter;
+  }
   private readonly errorMessagesSafe: boolean;
   /**
    * THIS client's error-message mode. Not the process default: see
@@ -2206,6 +2248,12 @@ export class TurbineClient {
     const statementTimeoutMs = TurbineClient.resolveStatementTimeout(config.statementTimeoutMs, dialect);
     const maxLifetimeSeconds = resolveNonNegativeInteger(config.maxLifetimeSeconds, 'maxLifetimeSeconds', 'seconds');
     const streamIdleTimeoutMs = resolveStreamIdleTimeout(config.streamIdleTimeoutMs, 'streamIdleTimeoutMs');
+    // A backend that injects its own query interface (PowDB) builds no SQL,
+    // so there is nothing for a comment to ride on: refused, not ignored.
+    const sqlComment = resolveSqlComment(config.sqlComment, logger, {
+      dialect: dialect.name,
+      buildsSql: (config as { queryInterfaceFactory?: unknown }).queryInterfaceFactory === undefined,
+    });
     // Keyed by table name, with every key checked against the schema: a
     // filter under a name that matches no table would never be applied.
     // A non-SQL backend (PowDB) injects its own query interface and checks
@@ -2349,6 +2397,7 @@ export class TurbineClient {
       sqlCache: config.sqlCache ?? true,
       sqlCacheSize: config.sqlCacheSize,
       streamIdleTimeoutMs,
+      _sqlCommenter: sqlComment,
       dialect: config.dialect,
       diagnostics,
       logger,
@@ -3285,9 +3334,26 @@ export class TurbineClient {
     // where VALUES as soon as any verbose client existed in the process. The
     // scope is established around the await, so every continuation of the batch
     // resolves this client's mode.
+    // Each statement carries the `sqlComment` its query interface would have
+    // given it, computed here in the caller's async context.
+    const comments = this.statementComments(queries);
+    const sent = comments ? (queries.map((q, i) => commentDeferred(q, comments[i])) as unknown as T) : queries;
     const sink = this.queryListeners.size > 0 ? this.queryOptions._onQuery : undefined;
-    if (!sink) return this.withErrorMode(() => executePipeline(this.queryPool, queries, options));
-    return this.withErrorMode(() => this.reportedPipeline(sink, queries, options));
+    if (!sink) return this.withErrorMode(() => executePipeline(this.queryPool, sent, options));
+    return this.withErrorMode(() => this.reportedPipeline(sink, queries, options, sent, comments));
+  }
+
+  /**
+   * The `sqlComment` of each deferred query, named by its own model and action
+   * (a pipeline can mix tables), or `undefined` when this client adds none.
+   */
+  private statementComments(queries: readonly DeferredQuery<unknown>[]): (string | undefined)[] | undefined {
+    const commenter = this.sqlCommenter;
+    if (commenter === undefined) return undefined;
+    return queries.map((q) => {
+      const { model, action } = deferredIdentity(q.tag);
+      return commenter.commentFor(model, action)?.comment;
+    });
   }
 
   /**
@@ -3303,9 +3369,11 @@ export class TurbineClient {
     sink: (event: QueryEvent) => void,
     queries: T,
     options: PipelineOptions | undefined,
+    sent: T,
+    comments: (string | undefined)[] | undefined,
   ): Promise<PipelineResults<T>> {
     const rowCounts: (number | undefined)[] = new Array(queries.length).fill(undefined);
-    const observed = queries.map((q, i) => ({
+    const observed = sent.map((q, i) => ({
       ...q,
       transform: (raw: PgCompatQueryResult) => {
         rowCounts[i] = resultRowCount(raw);
@@ -3340,6 +3408,7 @@ export class TurbineClient {
             ...deferredIdentity(q.tag),
             rows: rowCounts[i] ?? 0,
             batch: 'pipeline',
+            ...(comments?.[i] === undefined ? {} : { comment: comments[i] }),
             ...(failed ? { error: failure instanceof Error ? failure : new Error(String(failure)) } : {}),
           });
         }
@@ -3913,17 +3982,23 @@ export class TurbineClient {
     // statement goes through the transaction state, so a timeout can tell
     // what is still on the wire and stop it.
     const sink = this.queryListeners.size > 0 ? this.queryOptions._onQuery : undefined;
-    const reported = (dq: DeferredQuery<unknown>, run: () => Promise<PgCompatQueryResult>) =>
-      state.run(() =>
+    // Each statement is sent with its `sqlComment`; its event reports the
+    // commentless text and the comment beside it, as a model call's does.
+    const comments = this.statementComments(queries);
+    const reported = (i: number, run: (dq: DeferredQuery<unknown>) => Promise<PgCompatQueryResult>) => {
+      const dq = queries[i]!;
+      const comment = comments?.[i];
+      return state.run(() =>
         runReportedStatement(
           sink,
-          { ...deferredIdentity(dq.tag), batch: 'transaction' },
+          { ...deferredIdentity(dq.tag), batch: 'transaction', ...(comment === undefined ? {} : { comment }) },
           dq.sql,
           dq.params,
-          run,
+          () => run(commentDeferred(dq, comment)),
           wrapPgError,
         ),
       );
+    };
     const pipelined =
       (client as unknown as PgCompatPoolClient).supportsPipelining === true &&
       this.dialect.resultStrategy !== 'reselect';
@@ -3933,7 +4008,7 @@ export class TurbineClient {
       // FIFO guarantee makes settled[i] the reply to queries[i]. Each
       // statement is timed from its dispatch to its own reply.
       const settled = await Promise.allSettled(
-        queries.map((dq) => reported(dq, () => client.query(dq.sql, dq.params))),
+        queries.map((_, i) => reported(i, (dq) => client.query(dq.sql, dq.params))),
       );
       const results: unknown[] = [];
       for (let i = 0; i < settled.length; i++) {
@@ -3947,16 +4022,16 @@ export class TurbineClient {
     }
 
     const results: unknown[] = [];
-    for (const dq of queries) {
+    for (let i = 0; i < queries.length; i++) {
       // Non-RETURNING engines (resultStrategy 'reselect', e.g. MySQL) attach a
       // reselect plan that runs the write plus a follow-up SELECT; running
       // dq.sql alone would transform a row-less write result.
-      const raw = await reported(dq, () =>
+      const raw = await reported(i, (dq) =>
         this.dialect.resultStrategy === 'reselect' && dq.reselect
           ? dq.reselect((sql, params) => client.query(sql, params))
           : client.query(dq.sql, dq.params),
       );
-      results.push(dq.transform(raw));
+      results.push(queries[i]!.transform(raw));
     }
     return results as PipelineResults<T>;
   }

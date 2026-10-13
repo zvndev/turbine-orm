@@ -92,6 +92,7 @@ import {
   type ResolvedRowLock,
   resolveRowLock,
 } from './row-lock.js';
+import { resolveSqlComment, type SqlCommenter } from './sql-comment.js';
 import {
   DEFAULT_STREAM_IDLE_TIMEOUT_MS,
   newStreamIdleState,
@@ -159,6 +160,7 @@ import {
   resolveRelationDef,
   type SqlCacheEntry,
   sendCancelRequest,
+  sqlToPreparedName,
   unknownFieldMessage,
   warnRedundantSortTerm,
 } from './utils.js';
@@ -672,6 +674,19 @@ const CANCEL_GRACE_MS = 2000;
 /** How a statement in flight ended. */
 type Settled = { result: PgCompatQueryResult } | { error: unknown };
 
+/**
+ * One statement as it goes out: `sql` is the commentless text (what events
+ * report and the template cache holds), `text` what is sent, which carries the
+ * `sqlComment` when there is one, and `name` the prepared-statement name it is
+ * sent under (see {@link QueryInterface.outgoing}).
+ */
+interface Outgoing {
+  readonly sql: string;
+  readonly text: string;
+  readonly name: string | undefined;
+  readonly comment: string | undefined;
+}
+
 /** Whether `err` is PostgreSQL's query_canceled (57014), as the driver raised it or as Turbine wrapped it. */
 function isQueryCanceled(err: unknown): boolean {
   const e = err as { code?: unknown; cause?: { code?: unknown } | null } | null;
@@ -789,6 +804,8 @@ export class QueryInterface<
   private readonly diagnostics: ResolvedDiagnostics;
   /** `streamIdleTimeoutMs`: how long a cursor stream may wait for its consumer. `0` disables. */
   private readonly streamIdleTimeoutMs: number;
+  /** `sqlComment`, resolved; `undefined` when statements carry no comment (one falsy check per send). */
+  private readonly sqlCommenter: SqlCommenter | undefined;
   /** Where this instance's log lines go: the client's `logger`, else the console logger. */
   private readonly logger: TurbineLogger;
   /**
@@ -1063,6 +1080,9 @@ export class QueryInterface<
       sqlCacheSize !== undefined && sqlCacheSize > 0 ? Math.floor(sqlCacheSize) : 1000,
     );
     this.dialect = options?.dialect ?? postgresDialect;
+    this.sqlCommenter =
+      options?._sqlCommenter ??
+      resolveSqlComment(options?.sqlComment, this.logger, { dialect: this.dialect.name, buildsSql: true });
     if (
       options?.relationLoadStrategy !== undefined &&
       !RELATION_LOAD_STRATEGIES.includes(options.relationLoadStrategy as never)
@@ -2653,7 +2673,15 @@ export class QueryInterface<
     this.variableArityShape = false;
     this.cacheMisses++;
     this.lastMissParams = built;
-    return { sql, name: variableArity ? '' : boundedPreparedName(sql), paramCount: built.length };
+    // With `sqlComment` putting a comment on every statement, the template's own
+    // name is never sent (the execute seam sends a `c_` name derived from it),
+    // so it is not claimed from the budget: only names that reach the wire do.
+    const name = variableArity
+      ? ''
+      : this.sqlCommenter?.alwaysComments
+        ? sqlToPreparedName(sql)
+        : boundedPreparedName(sql);
+    return { sql, name, paramCount: built.length };
   }
 
   /**
@@ -2764,7 +2792,7 @@ export class QueryInterface<
   }
 
   private emitQueryEvent(
-    sql: string,
+    out: Outgoing,
     params: unknown[],
     duration: number,
     action: string,
@@ -2776,7 +2804,7 @@ export class QueryInterface<
     if (!onQuery) return;
     try {
       onQuery({
-        sql,
+        sql: out.sql,
         params,
         duration,
         model: this.table,
@@ -2786,10 +2814,26 @@ export class QueryInterface<
         error,
         strategy: this.currentStrategyTag,
         ...(retried ? { retried: true as const } : {}),
+        ...(out.comment === undefined ? {} : { comment: out.comment }),
       });
     } catch {
       // Listener errors must never crash a query
     }
+  }
+
+  /**
+   * The statement `sql` as it goes out under `preparedName`: with the
+   * `sqlComment` appended, and under the name that comment calls for (see
+   * query/sql-comment.ts). This is the one place a comment is added, at the
+   * execute seam and after the SQL-template cache, so the cache, its keys and
+   * its lockstep checks only ever see commentless text. Without `sqlComment`
+   * it is the statement unchanged.
+   */
+  private outgoing(sql: string, preparedName: string | undefined, action: string): Outgoing {
+    const commenter = this.sqlCommenter;
+    const c = commenter?.commentFor(this.table, action);
+    if (commenter === undefined || c === undefined) return { sql, text: sql, name: preparedName, comment: undefined };
+    return { sql, text: `${sql} ${c.comment}`, name: commenter.preparedName(preparedName, c), comment: c.comment };
   }
 
   /**
@@ -2915,19 +2959,20 @@ export class QueryInterface<
     retryIfStale = false,
     pool: PgCompatPool = this.pool,
   ): Promise<PgCompatQueryResult> {
+    const action = this.currentAction;
+    const out = this.outgoing(sql, preparedName, action);
     // 0 is no timeout, as it is for `$transaction`'s option and the server's statement_timeout.
     const timeout = requestedTimeout === 0 ? undefined : requestedTimeout;
     if (timeout !== undefined && pool === this.pool && this.cancelsOnTimeout()) {
-      return this.queryCancellable(sql, params, timeout, preparedName, retryIfStale);
+      return this.queryCancellable(out, params, timeout, retryIfStale, action);
     }
     if (timeout !== undefined && pool === this.pool && this.txScoped && this.dialect.name === 'postgresql') {
       const state = transactionStateOf(this.pool);
       if (state !== undefined && canCancelBackend(state.client)) {
-        return this.queryCancellableInTransaction(sql, params, timeout, preparedName, state);
+        return this.queryCancellableInTransaction(out, params, timeout, state, action);
       }
     }
     let start = performance.now();
-    const action = this.currentAction;
     // Build the query argument, use object form with `name` for prepared
     // statements, or the plain (text, values) form otherwise.
     //
@@ -2935,15 +2980,15 @@ export class QueryInterface<
     // pool shims only speak `(text, values)`), so it is reached through a
     // cast. Guarded at runtime by `preparedStatementsEnabled`, which only the
     // drivers that accept it turn on.
-    const usePrepared = preparedName && this.preparedStatementsEnabled;
+    const usePrepared = out.name && this.preparedStatementsEnabled;
     const send = (): Promise<PgCompatQueryResult> =>
       usePrepared
         ? (pool as unknown as { query(config: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query({
-            name: preparedName,
-            text: sql,
+            name: out.name,
+            text: out.text,
             values: params,
           })
-        : pool.query(sql, params);
+        : pool.query(out.text, params);
     let exec = send();
     // Set when the caller's timeout has already answered, so a first attempt
     // that fails AFTER that does not send a retry nobody is waiting for.
@@ -2956,7 +3001,7 @@ export class QueryInterface<
         // CALLS can skip it. The final event below times the retry alone.
         const wrapped = wrapPgError(err);
         this.emitQueryEvent(
-          sql,
+          out,
           params,
           performance.now() - start,
           action,
@@ -2974,12 +3019,12 @@ export class QueryInterface<
     if (!timeout) {
       try {
         const result = await exec;
-        this.emitQueryEvent(sql, params, performance.now() - start, action, result.rowCount ?? 0);
+        this.emitQueryEvent(out, params, performance.now() - start, action, result.rowCount ?? 0);
         return result;
       } catch (err) {
         const wrapped = wrapPgError(err);
         this.emitQueryEvent(
-          sql,
+          out,
           params,
           performance.now() - start,
           action,
@@ -3005,12 +3050,12 @@ export class QueryInterface<
     });
     try {
       const result = await Promise.race([exec, timeoutPromise]);
-      this.emitQueryEvent(sql, params, performance.now() - start, action, result.rowCount ?? 0);
+      this.emitQueryEvent(out, params, performance.now() - start, action, result.rowCount ?? 0);
       return result;
     } catch (err) {
       const wrapped = wrapPgError(err);
       this.emitQueryEvent(
-        sql,
+        out,
         params,
         performance.now() - start,
         action,
@@ -3050,20 +3095,19 @@ export class QueryInterface<
    * once its backend is idle, so timed-out statements cannot hold the pool.
    */
   private async queryCancellable(
-    sql: string,
+    out: Outgoing,
     params: unknown[],
     timeout: number,
-    preparedName: string | undefined,
     retryIfStale: boolean,
+    action: string,
   ): Promise<PgCompatQueryResult> {
-    const action = this.currentAction;
     let start = performance.now();
     const config =
-      preparedName && this.preparedStatementsEnabled ? { name: preparedName, text: sql, values: params } : null;
+      out.name && this.preparedStatementsEnabled ? { name: out.name, text: out.text, values: params } : null;
     const report = (err: unknown, retried?: boolean): unknown => {
       const wrapped = err instanceof TimeoutError ? err : wrapPgError(err);
       const error = wrapped instanceof Error ? wrapped : undefined;
-      this.emitQueryEvent(sql, params, performance.now() - start, action, 0, error, retried);
+      this.emitQueryEvent(out, params, performance.now() - start, action, 0, error, retried);
       return wrapped;
     };
     let expired = false;
@@ -3100,7 +3144,7 @@ export class QueryInterface<
         const running: Promise<Settled> = (
           config
             ? (client as unknown as { query(c: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query(config)
-            : client.query(sql, params)
+            : client.query(out.text, params)
         ).then(
           (result) => ({ result }),
           (error: unknown) => ({ error }),
@@ -3109,7 +3153,7 @@ export class QueryInterface<
         const settled = first === TIMED_OUT ? await this.cancelTimedOut(held, running, timeout) : first;
         if ('result' in settled) {
           if (first !== TIMED_OUT) checkout.release();
-          this.emitQueryEvent(sql, params, performance.now() - start, action, settled.result.rowCount ?? 0);
+          this.emitQueryEvent(out, params, performance.now() - start, action, settled.result.rowCount ?? 0);
           return settled.result;
         }
         if ('timeout' in settled) throw report(settled.timeout);
@@ -3139,22 +3183,21 @@ export class QueryInterface<
    * A statement that finishes before the deadline is returned as usual.
    */
   private async queryCancellableInTransaction(
-    sql: string,
+    out: Outgoing,
     params: unknown[],
     timeout: number,
-    preparedName: string | undefined,
     state: TransactionState,
+    action: string,
   ): Promise<PgCompatQueryResult> {
     const start = performance.now();
-    const action = this.currentAction;
     const running: Promise<Settled> = (
-      preparedName && this.preparedStatementsEnabled
+      out.name && this.preparedStatementsEnabled
         ? (this.pool as unknown as { query(c: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query({
-            name: preparedName,
-            text: sql,
+            name: out.name,
+            text: out.text,
             values: params,
           })
-        : this.pool.query(sql, params)
+        : this.pool.query(out.text, params)
     ).then(
       (result) => ({ result }),
       (error: unknown) => ({ error }),
@@ -3171,11 +3214,11 @@ export class QueryInterface<
       clearTimeout(timer);
     }
     if ('result' in settled) {
-      this.emitQueryEvent(sql, params, performance.now() - start, action, settled.result.rowCount ?? 0);
+      this.emitQueryEvent(out, params, performance.now() - start, action, settled.result.rowCount ?? 0);
       return settled.result;
     }
     const err = 'timeout' in settled ? settled.timeout : wrapPgError(settled.error);
-    this.emitQueryEvent(sql, params, performance.now() - start, action, 0, err instanceof Error ? err : undefined);
+    this.emitQueryEvent(out, params, performance.now() - start, action, 0, err instanceof Error ? err : undefined);
     throw err;
   }
 
@@ -4704,7 +4747,11 @@ export class QueryInterface<
             : undefined,
         )
       : base;
-    const stream = this.dialect.openStream(conn, deferred.sql, deferred.params, batchSize, {
+    // The cursor's statement carries the `sqlComment` like any other (the
+    // speculative fetch above got it at the execute seam). Never named: a
+    // cursor is declared by text.
+    const streamSql = this.outgoing(deferred.sql, undefined, action).text;
+    const stream = this.dialect.openStream(conn, streamSql, deferred.params, batchSize, {
       ambientTransaction: this.txScoped,
     });
     if (watched) {
