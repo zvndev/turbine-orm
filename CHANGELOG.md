@@ -1,5 +1,91 @@
 # Changelog
 
+## 0.90.1 (2026-10-13)
+
+A patch release. It fixes a PowDB filter that could write every row, gives a
+custom dialect without `capabilities` a typed error at every entry point,
+takes about 1 kB off every SQL and PowDB entry, and makes the release pipeline
+ready for npm trusted publishing. Apart from the PowDB refusals below, a
+`TurbineClient` application sees no change in behavior.
+
+### Fixed
+
+- **PowDB: a JSON filter that names no comparison could delete or update every
+  row.** `{ meta: { mode: 'insensitive' } }` compiled to a condition that
+  matched no row, so `NOT` around it matched every row with a value, and a
+  `deleteMany` or `updateMany` carrying it wrote all of them. PowDB now refuses
+  it with the `ValidationError` (E003) the SQL engines give, in the same words.
+  The same check now refuses, on a JSON column, `gt`, `gte`, `lt` or `lte`
+  against `null`, an unknown `mode`, and a non-string `startsWith` or
+  `endsWith`, as the SQL engines do. A field filter that still compiles to no
+  condition is an `InvariantError` (E020, `invariant: 'powql-filter-empty'`),
+  never a constant.
+- **A dialect with no `capabilities` gets E003 wherever it enters.**
+  `QueryInterface`, `schemaToSQL`, `schemaToSQLString` and `introspect` now
+  refuse it with the message `TurbineClient` gives. They used to throw a
+  `TypeError` ("cannot read properties of undefined"), and `introspect` opened a
+  connection first.
+
+### Changed
+
+- **Every SQL and PowDB entry is about 1 kB smaller.** `query/builder.ts` and the PowDB
+  generator reached `TransactionClient` through a dynamic import of
+  `client.ts`, and a bundler that does not split code (esbuild, Wrangler)
+  wrapped the whole client graph in lazy-init closures to keep that import
+  lazy. `client.ts` now registers the class when it loads. Brotli, `pg`
+  external, measured by `size-limit` on one machine, this release's tree
+  without and with the change:
+
+  | Entry | Before | After |
+  |---|---|---|
+  | `turbine-orm`, the whole barrel | 145.8 kB | 144.5 kB |
+  | `import { TurbineClient }`, tree-shaken | 114.1 kB | 112.9 kB |
+  | `turbine-orm/serverless` | 114.2 kB | 113.0 kB |
+  | `turbine-orm/sqlite` | 121.3 kB | 120.3 kB |
+  | `turbine-orm/mysql` | 121.9 kB | 120.7 kB |
+  | `turbine-orm/mssql` | 123.2 kB | 122.0 kB |
+  | `turbine-orm/powdb` | 143.5 kB | 142.2 kB |
+  | `turbine-orm/prisma-compat` | 18.4 kB | 18.1 kB |
+
+  The published claims move to 146 kB (barrel) and 114 kB (edge). One
+  consequence: a `QueryInterface` built directly, in a program that never loads
+  `TurbineClient` or an engine factory, now gets E003 for a nested write
+  outside a transaction instead of loading the client on demand. Run the write
+  inside `db.$transaction()`, or import `TurbineClient`.
+- **PowDB is in maintenance mode.** It receives bug and data-safety fixes, no
+  new features, and it is verified against the 0.20 PowDB packages.
+  [STABILITY.md](STABILITY.md) says how a deprecation would be announced.
+
+### Tooling / CI
+
+- A release publish tries npm trusted publishing (OIDC) first and falls back
+  to the `NPM_TOKEN` secret, and each run says which credential it used. It
+  uses npm 11.20.0, which repacks the tested tarball to the same integrity as
+  npm 10. npm allows one trusted publisher per package, so the `@next`
+  publish keeps using the token. Both publish jobs run in a protected
+  `release` environment that only a `v*` tag or `main` can deploy to.
+- Dependabot waits 14 days after a release before proposing it, which is this
+  repository's dependency-age rule, and groups the site and Actions updates.
+- Development dependencies, the site's dependencies and the pinned Actions are
+  updated to versions at least two weeks old. The site moves to shiki 4, which
+  renders all 505 highlighted code blocks byte-identically.
+
+### Tests
+
+- The engine-name guard now catches every way of testing a dialect's name:
+  `.includes`, `Object.hasOwn`, `in`, a destructured or aliased name, and a
+  dialect held under another name, besides comparisons, switches and keyed
+  lookups. Each exemption is pinned to an exact count of sites, so a new name
+  test in an exempt file fails. A dialect renamed from an engine dialect is
+  tested to run `$transaction({ readOnly: true })` exactly as that engine does.
+- The import-cycle check refuses a dynamic import of any of the package's own
+  modules from library code.
+- Two prisma-compat tests passed whatever their option did
+  (`warnOnUnlimited: false` and `allowFullTableScan`). Each now fails when its
+  option is dropped.
+- Workflow tests pin the publish job's environment, its npm version and the
+  token fallback.
+
 ## 0.90.0 (2026-10-13)
 
 A correctness release. Most of its breaking changes are refusals: a query
