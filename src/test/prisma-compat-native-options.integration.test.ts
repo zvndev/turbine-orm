@@ -28,8 +28,10 @@ import assert from 'node:assert/strict';
 import { describe } from 'node:test';
 import { TurbineClient } from '../client.js';
 import { TurbineError, TurbineErrorCode } from '../errors.js';
+import type { TurbineLogEntry, TurbineLogger } from '../logger.js';
 import { createPrismaCompatClient } from '../prisma-compat.js';
 import { UNSAFE } from '../query/index.js';
+import { resetWarnOnce, WARN_NS } from '../query/warn-registry.js';
 import type { PrismaCompatMap, SchemaMetadata } from '../schema.js';
 import { mockTable, skipGate } from './helpers.js';
 
@@ -138,6 +140,7 @@ const MAP: PrismaCompatMap = {
 interface ClientOptions {
   globalFilters?: Record<string, unknown>;
   warnOnUnlimited?: boolean;
+  logger?: TurbineLogger;
 }
 
 function turbine(opts: ClientOptions = {}): TurbineClient {
@@ -147,6 +150,7 @@ function turbine(opts: ClientOptions = {}): TurbineClient {
       poolSize: 1,
       warnOnUnlimited: opts.warnOnUnlimited ?? false,
       globalFilters: opts.globalFilters as Any,
+      logger: opts.logger,
     },
     buildSchema(),
   );
@@ -267,18 +271,22 @@ describe('prisma-compat, native query options at the wire', () => {
     const db = turbine();
     try {
       const compat = compatOf(db);
+      const total = await compat.Note.count();
+      assert.ok(total > 0, 'the fixture must hold rows for the mutation to touch');
       // An explicit empty `where` is exactly what the empty-where guard exists
       // to refuse, so it is the observable consequence of the option arriving.
       await assert.rejects(
-        () => compat.Event.updateMany({ where: {}, data: { payload: 'guarded' } }),
+        () => compat.Note.updateMany({ where: {}, data: { body: 'guarded' } }),
         (err: unknown) => err instanceof TurbineError && err.code === TurbineErrorCode.VALIDATION,
       );
-      const res = await compat.Event.updateMany({
-        where: { tenantId: DENSE_TENANT },
-        data: { payload: 'scoped' },
-        allowFullTableScan: UNSAFE,
-      });
-      assert.ok(res.count > 0);
+      assert.equal(await compat.Note.count({ where: { body: 'guarded' } }), 0, 'the refused mutation wrote nothing');
+      // The SAME unconditional call, with the option: it must run and touch
+      // every row. A scoped `where` would pass without the option, which is
+      // why this call is deliberately the empty one. The child table, not the
+      // 200k-row one, so the full-table write is 50 rows.
+      const res = await compat.Note.updateMany({ where: {}, data: { body: 'scanned' }, allowFullTableScan: UNSAFE });
+      assert.equal(res.count, total, 'the unconditional mutation must reach every row');
+      assert.equal(await compat.Note.count({ where: { body: 'scanned' } }), total);
     } finally {
       await db.disconnect();
     }
@@ -355,22 +363,43 @@ describe('prisma-compat, native query options at the wire', () => {
   });
 
   gate.it('warnOnUnlimited:false through compat silences the unbounded-read advisory', async () => {
-    const noisy = turbine({ warnOnUnlimited: true });
-    const lines: string[] = [];
-    const original = console.warn;
-    console.warn = (...parts: unknown[]) => {
-      lines.push(parts.join(' '));
+    // The advisory is `unlimited-find-many`: "findMany on "<table>" has no
+    // limit: ...". It is warn-once per table per process, so each phase resets
+    // the registry first, or the control would eat the one warning the
+    // silenced call is supposed to be tested against. A capturing logger, not
+    // console.warn, so the assertion reads the code and the table and cannot
+    // be satisfied by text that never appears.
+    const lines: { message: string; entry: TurbineLogEntry }[] = [];
+    const logger: TurbineLogger = {
+      warn(message, entry) {
+        lines.push({ message, entry });
+      },
     };
+    const unbounded = () => lines.filter((l) => l.entry.code === 'unlimited-find-many');
+    const noisy = turbine({ warnOnUnlimited: true, logger });
     try {
       const compat = compatOf(noisy);
+
+      // Control: the same call with the option left alone DOES warn.
+      resetWarnOnce(WARN_NS.unlimitedFindMany);
+      await compat.Event.findMany({ where: { tenantId: 59 } });
+      const control = unbounded();
+      assert.equal(control.length, 1, `expected the advisory without the option, got ${JSON.stringify(lines)}`);
+      assert.equal(control[0]!.entry.table, TABLE);
+      assert.equal(control[0]!.entry.operation, 'findMany');
+      assert.match(control[0]!.message, new RegExp(`findMany on "${TABLE}" has no limit`));
+
+      // With the option: nothing, from a clean registry.
+      lines.length = 0;
+      resetWarnOnce(WARN_NS.unlimitedFindMany);
       await compat.Event.findMany({ where: { tenantId: 59 }, warnOnUnlimited: false });
       assert.deepEqual(
-        lines.filter((l) => /without a `limit`|unbounded/i.test(l)),
+        unbounded(),
         [],
-        `expected no unbounded-read advisory, got:\n${lines.join('\n')}`,
+        `expected no unbounded-read advisory with warnOnUnlimited: false, got ${JSON.stringify(lines)}`,
       );
     } finally {
-      console.warn = original;
+      resetWarnOnce(WARN_NS.unlimitedFindMany);
       await noisy.disconnect();
     }
   });
