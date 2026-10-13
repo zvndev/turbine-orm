@@ -246,7 +246,8 @@ interface MssqlModule {
  * Coerce an arbitrary JS value into something `mssql` can bind. `BIT` accepts JS
  * booleans directly; `undefined`/`null` → NULL; `bigint` follows the safe-int
  * policy (number when it fits in 2^53, else a decimal string, no precision
- * loss); `Date`/`Uint8Array` pass through; any remaining object/array → JSON text
+ * loss); a `Date` passes through, a `Uint8Array` binds as a Buffer view (VARBINARY);
+ * any remaining object/array → JSON text
  * (matches how Turbine already pre-serializes JSON filter params).
  */
 function toMssqlParam(value: unknown): MssqlParam {
@@ -262,7 +263,12 @@ function toMssqlParam(value: unknown): MssqlParam {
         : value.toString();
   }
   if (value instanceof Date) return value;
-  if (value instanceof Uint8Array) return value; // Buffer is a Uint8Array subclass
+  // The driver infers VARBINARY only for a Buffer; any other Uint8Array was
+  // bound as NVARCHAR and refused ("Invalid string"). A Buffer view shares the
+  // bytes, so nothing is copied.
+  if (value instanceof Uint8Array) {
+    return Buffer.isBuffer(value) ? value : Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  }
   return JSON.stringify(value);
 }
 

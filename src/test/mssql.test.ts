@@ -389,6 +389,21 @@ describe('turbine-orm/mssql, MssqlPool binds @pN inputs', () => {
     assert.deepEqual(calls[0]!.inputs, { p1: true, p2: 3 });
   });
 
+  it('a Uint8Array binds as a Buffer over the same bytes, since the driver infers VARBINARY only for a Buffer', async () => {
+    const { pool, sqlNS, calls } = fakeMssql();
+    const mp = new MssqlPool(pool, sqlNS);
+    const whole = new Uint8Array([0xff, 0, 10]);
+    const slice = new Uint8Array([1, 2, 3, 4, 5]).subarray(1, 4);
+    const buffer = Buffer.from([7, 8]);
+    await mp.query('SELECT * FROM [t] WHERE [a] = @p1 AND [b] = @p2 AND [c] = @p3', [whole, slice, buffer]);
+    const { p1, p2, p3 } = calls[0]!.inputs;
+    assert.ok(Buffer.isBuffer(p1), 'a plain Uint8Array must reach the driver as a Buffer');
+    assert.deepEqual([...(p1 as Buffer)], [0xff, 0, 10]);
+    assert.ok(Buffer.isBuffer(p2));
+    assert.deepEqual([...(p2 as Buffer)], [2, 3, 4], 'a subarray keeps its own offset and length');
+    assert.equal(p3, buffer, 'a Buffer is passed through as itself');
+  });
+
   it('routes BEGIN/COMMIT through the mssql Transaction API with the mapped isolation level', async () => {
     const { pool, sqlNS, txEvents } = fakeMssql();
     const mp = new MssqlPool(pool, sqlNS);
