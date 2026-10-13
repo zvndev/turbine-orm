@@ -93,10 +93,14 @@ export interface StatementComment {
   readonly dynamic: boolean;
 }
 
-/** `value` URL-encoded with `'` escaped, or `undefined` when it cannot be encoded (a lone surrogate). */
+/**
+ * `value` URL-encoded with `'` escaped, or `undefined` when it cannot be encoded
+ * (a lone surrogate). `encodeURIComponent` leaves `'` as is and never emits a
+ * backslash; the escape covers both anyway, so it stays complete on its own.
+ */
 function encodeValue(value: string): string | undefined {
   try {
-    return encodeURIComponent(value).replace(/'/g, "\\'");
+    return encodeURIComponent(value).replace(/[\\']/g, '\\$&');
   } catch {
     return undefined;
   }
