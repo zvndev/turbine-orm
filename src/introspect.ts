@@ -11,6 +11,7 @@
 import pg from '#pg';
 import { type Dialect, postgresDialect } from './dialect.js';
 import { ValidationError } from './errors.js';
+import { consoleLogger, logTo, type TurbineLogger } from './logger.js';
 import {
   type CheckMetadata,
   type ColumnMetadata,
@@ -401,6 +402,11 @@ export interface IntrospectOptions {
    * here so `introspect()` works across databases.
    */
   dialect?: Dialect;
+  /**
+   * Where introspection notes go (a skipped cross-schema foreign key, a
+   * renamed or shadowing relation). Defaults to the console logger.
+   */
+  logger?: TurbineLogger;
 }
 
 // ---------------------------------------------------------------------------
@@ -921,10 +927,13 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
     const foreignKeys = Array.from(fkGroups.values());
 
     if (crossSchemaRefs.length > 0) {
-      console.warn(
-        `[turbine] Skipped ${crossSchemaRefs.length} foreign key(s) referencing a table outside schema "${printableCatalogName(schema)}": ` +
+      logTo(
+        options.logger ?? consoleLogger,
+        'warn',
+        `Skipped ${crossSchemaRefs.length} foreign key(s) referencing a table outside schema "${printableCatalogName(schema)}": ` +
           `${crossSchemaRefs.map(printableCatalogName).join(', ')}. Generated clients address tables by bare name within one schema, so no ` +
           `relation is emitted for these. Introspect the other schema separately, or add the target table to this one.`,
+        { code: 'introspect-cross-schema-fk', schema, references: crossSchemaRefs.length },
       );
     }
 
@@ -960,6 +969,7 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
       enums,
       fkActions,
       legacyToManyUniques: options.legacyToManyUniques,
+      ...(options.logger !== undefined ? { logger: options.logger } : {}),
     });
 
     // ----- Assemble TableMetadata for each table -----
@@ -1391,14 +1401,23 @@ export function detectUniqueForeignKeySets(
  * colliding name would otherwise shadow a column field and generate types
  * that fail `tsc --strict` (TS2430/TS2322).
  */
-function resolveRelationNameCollision(candidate: string, taken: Set<string>, table: string, source: string): string {
+function resolveRelationNameCollision(
+  candidate: string,
+  taken: Set<string>,
+  table: string,
+  source: string,
+  logger: TurbineLogger,
+): string {
   if (!taken.has(candidate)) return candidate;
   let name = `${candidate}Rel`;
   for (let i = 2; taken.has(name); i++) name = `${candidate}Rel${i}`;
-  console.warn(
-    `[turbine] ${printableCatalogName(
+  logTo(
+    logger,
+    'warn',
+    printableCatalogName(
       `Relation name "${candidate}" on table "${table}" (from ${source}) collides with an existing column or relation, using "${name}" instead.`,
-    )}`,
+    ),
+    { code: 'introspect-relation-renamed', table, relation: name, wanted: candidate },
   );
   return name;
 }
@@ -1448,6 +1467,7 @@ export function buildRelationsFromForeignKeys(
   fkActions?: Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>,
   unknownTypedFieldsByTable?: Map<string, Set<string>>,
   uniqueSetsByTable?: Map<string, string[][]>,
+  logger: TurbineLogger = consoleLogger,
 ): Map<string, Record<string, RelationDef>> {
   // Count FKs per (source, target) pair for disambiguation.
   const fkCounts = new Map<string, number>();
@@ -1491,17 +1511,20 @@ export function buildRelationsFromForeignKeys(
     // payload). Keep it and warn; typeSafeRelations() keeps the generated types
     // sound.
     if (!assignedFor(table).has(legacy) && unknownTypedFieldsByTable?.get(table)?.has(legacy)) {
-      console.warn(
-        `[turbine] ${printableCatalogName(
+      logTo(
+        logger,
+        'warn',
+        printableCatalogName(
           `Relation "${legacy}" on table "${table}" (from ${source}) shadows the json/jsonb column ` +
             `"${legacy}", keeping the historical name for runtime compatibility; the relation is omitted from ` +
             `the generated types. Rename the column to expose it.`,
-        )}`,
+        ),
+        { code: 'introspect-relation-shadows-json', table, relation: legacy },
       );
       return legacy;
     }
     if (modern !== null && modern !== legacy && !taken.has(modern)) return modern;
-    return resolveRelationNameCollision(modern ?? legacy, taken, table, source);
+    return resolveRelationNameCollision(modern ?? legacy, taken, table, source, logger);
   };
 
   for (const fk of foreignKeys) {
@@ -1649,6 +1672,7 @@ export function addAutoManyToManyRelations(
   columnFieldsByTable?: Map<string, Set<string>>,
   unknownTypedFieldsByTable?: Map<string, Set<string>>,
   uniqueIndexColsByTable?: Map<string, string[][]>,
+  logger: TurbineLogger = consoleLogger,
 ): void {
   for (const tableName of tableNames) {
     // FKs whose source is this table, both must be single-column.
@@ -1699,16 +1723,19 @@ export function addAutoManyToManyRelations(
       if (columnFields?.has(relName)) {
         if (unknownTypedFieldsByTable?.get(sourceTbl)?.has(relName)) {
           // Same json/jsonb shadow as above: keep the name and warn.
-          console.warn(
-            `[turbine] ${printableCatalogName(
+          logTo(
+            logger,
+            'warn',
+            printableCatalogName(
               `Relation "${relName}" on table "${sourceTbl}" (junction ${tableName}) shadows the ` +
                 `json/jsonb column "${relName}", keeping the historical name for runtime compatibility; ` +
                 `the relation is omitted from the generated types.`,
-            )}`,
+            ),
+            { code: 'introspect-relation-shadows-json', table: sourceTbl, relation: relName },
           );
         } else {
           const taken = new Set([...columnFields, ...Object.keys(existing)]);
-          relName = resolveRelationNameCollision(relName, taken, sourceTbl, `junction ${tableName}`);
+          relName = resolveRelationNameCollision(relName, taken, sourceTbl, `junction ${tableName}`, logger);
         }
       }
       existing[relName] = {
@@ -1754,6 +1781,8 @@ export interface CatalogRelationInputs {
   fkActions?: Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>;
   /** Opt out of the unique-FK → `hasOne` flip (F2), see {@link IntrospectOptions.legacyToManyUniques}. */
   legacyToManyUniques?: boolean;
+  /** Where relation-naming notes go. Defaults to the console logger. */
+  logger?: TurbineLogger;
 }
 
 /**
@@ -1802,12 +1831,14 @@ export function deriveCatalogRelations(inputs: CatalogRelationInputs): Map<strin
     ? undefined
     : detectUniqueForeignKeySets(pkByTable, uniqueByTable, indexesByTable);
 
+  const logger = inputs.logger ?? consoleLogger;
   const relationsByTable = buildRelationsFromForeignKeys(
     foreignKeys,
     columnFieldsByTable,
     inputs.fkActions,
     unknownTypedFieldsByTable,
     uniqueSetsByTable,
+    logger,
   );
 
   // Prisma's implicit m2m junctions have no primary key (just a two-column
@@ -1850,6 +1881,7 @@ export function deriveCatalogRelations(inputs: CatalogRelationInputs): Map<strin
     columnFieldsByTable,
     unknownTypedFieldsByTable,
     uniqueIndexColsByTable,
+    logger,
   );
   return relationsByTable;
 }
@@ -1868,6 +1900,7 @@ export function deriveEngineRelations(
   foreignKeys: ForeignKeyEntry[],
   pkByTable: Map<string, string[]>,
   columnsByTable: Map<string, Pick<ColumnMetadata, 'name' | 'field' | 'tsType'>[]>,
+  logger: TurbineLogger = consoleLogger,
 ): Map<string, Record<string, RelationDef>> {
   const tableSet = new Set(tableNames);
   const fks = foreignKeys.filter((fk) => tableSet.has(fk.sourceTable) && tableSet.has(fk.targetTable));
@@ -1884,6 +1917,8 @@ export function deriveEngineRelations(
     columnFieldsByTable,
     undefined,
     unknownTypedFieldsByTable,
+    undefined,
+    logger,
   );
   addAutoManyToManyRelations(
     tableNames,
@@ -1893,6 +1928,8 @@ export function deriveEngineRelations(
     relationsByTable,
     columnFieldsByTable,
     unknownTypedFieldsByTable,
+    undefined,
+    logger,
   );
   return relationsByTable;
 }

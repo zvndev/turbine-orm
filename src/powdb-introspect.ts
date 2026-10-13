@@ -69,6 +69,7 @@
 
 import { ValidationError } from './errors.js';
 import { applyTableFilters, assertDistinctColumnFields, nullRecord, printableCatalogName } from './introspect.js';
+import { consoleLogger, logTo, type TurbineLogger } from './logger.js';
 import { type PowdbCapabilities, quotePowqlIdent, requireCapability } from './powdb-shared.js';
 import type { ColumnMetadata, IndexMetadata, RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
 import { singularize, snakeToCamel } from './schema.js';
@@ -90,6 +91,8 @@ export interface PowdbIntrospectOptions {
    * to run ungated; the pool paths that know the version pass it through.
    */
   capabilities?: PowdbCapabilities;
+  /** Where a table without a usable primary key is reported. Defaults to the console logger. */
+  logger?: TurbineLogger;
 }
 
 /** One row of a `describe <T>` result, after string-coercing each cell. */
@@ -262,10 +265,13 @@ export async function introspectPowdbDatabase(
     if (pkCandidates.length > 0) {
       primaryKey = [pkCandidates.includes('id') ? 'id' : pkCandidates[0]!];
     } else {
-      console.warn(
-        `[turbine] PowDB introspection: table "${printableCatalogName(tableName)}" has no non-nullable unique column; ` +
+      logTo(
+        options.logger ?? consoleLogger,
+        'warn',
+        `PowDB introspection: table "${printableCatalogName(tableName)}" has no non-nullable unique column; ` +
           'primaryKey is [] (single-row operations will fail). Supply a primary key via code-first ' +
           '`defineSchema` metadata if this table needs findUnique/update/delete by id.',
+        { code: 'powdb-introspect-no-primary-key', table: tableName },
       );
     }
 

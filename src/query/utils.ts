@@ -6,6 +6,7 @@
 
 import pg from '#pg';
 import { ValidationError } from '../errors.js';
+import { consoleLogger, logTo, type TurbineLogger } from '../logger.js';
 import { camelToSnake, localDateTimeKind, snakeToCamel, timeOfDayKind } from '../schema.js';
 import { shouldWarnOnce, WARN_NS } from './warn-registry.js';
 
@@ -1565,7 +1566,7 @@ export function isDefaultTextParser(oid: number, parser: (text: string) => unkno
  * construction, and only when somebody else's non-default parser is actually
  * being replaced.
  */
-export function warnParserOverwrite(oid: number, typeName: string): void {
+export function warnParserOverwrite(oid: number, typeName: string, logger: TurbineLogger = consoleLogger): void {
   const getParser = pg.types.getTypeParser as unknown as (oid: number, format: 'text') => (value: string) => unknown;
   const current = getParser(oid, 'text');
   // Turbine's own earlier registration is not a third party's expectation.
@@ -1581,14 +1582,17 @@ export function warnParserOverwrite(oid: number, typeName: string): void {
   const remedy = TEMPORAL_PARSER_OIDS.has(oid)
     ? ' `utcTimestamps: false` leaves the six temporal OIDs (1114, 1082, 1115, 1182, 1184, 1185) alone entirely.'
     : ' There is no opt-out for this OID: Turbine registers it so bigint values come back as numbers.';
-  console.warn(
-    `[turbine] pg type parser for OID ${oid} (${typeName}) was already customized by something else in this ` +
+  logTo(
+    logger,
+    'warn',
+    `pg type parser for OID ${oid} (${typeName}) was already customized by something else in this ` +
       'process, and Turbine is replacing it. `pg.types.setTypeParser` is process-global and takes effect ' +
       'immediately for EVERY pg.Pool in the process, including pools that already exist and are already ' +
       'querying, so whatever set that parser will now read this column differently. If yours should win, ' +
       `register it AFTER constructing the client.${remedy} This warning fires under \`NODE_ENV=production\` ` +
       'too: which parser wins depends on module evaluation order, so a process can be clean in dev and wrong ' +
       'in production from import order alone.',
+    { code: 'parser-overwrite', oid, type: typeName },
   );
 }
 
@@ -1626,16 +1630,16 @@ export function warnParserOverwrite(oid: number, typeName: string): void {
  * per row at decode time, not captured per pool). If any of the four OIDs is
  * already on a NON-default parser, {@link warnParserOverwrite} says so once.
  */
-export function registerUtcTemporalParsers(): void {
+export function registerUtcTemporalParsers(logger?: TurbineLogger): void {
   // pg-types declares get/setTypeParser over its own OID enum, which lists the
   // scalar types only. The array OIDs are just as real, so both calls are
   // retyped over a plain number rather than the incomplete enum.
   const getParser = pg.types.getTypeParser as unknown as (oid: number, format: 'text') => (value: string) => unknown;
   const setParser = pg.types.setTypeParser as unknown as (oid: number, parse: (value: string) => unknown) => void;
-  warnParserOverwrite(1114, 'timestamp');
-  warnParserOverwrite(1082, 'date');
-  warnParserOverwrite(1115, 'timestamp[]');
-  warnParserOverwrite(1182, 'date[]');
+  warnParserOverwrite(1114, 'timestamp', logger);
+  warnParserOverwrite(1082, 'date', logger);
+  warnParserOverwrite(1115, 'timestamp[]', logger);
+  warnParserOverwrite(1182, 'date[]', logger);
   const parseDate = createUtcDateParser(getParser(1082, 'text'));
   const parseTimestamp = createUtcTimestampParser(getParser(1114, 'text'));
   setParser(1114, markTurbineParser(parseTimestamp));

@@ -118,7 +118,9 @@
 // never imports this subpath). It lets the public factory accept the real
 // `TurbineClient` for first-class consumer DX.
 import type { TurbineClient } from './client.js';
+import { resolveDiagnostics } from './diagnostics.js';
 import { TurbineError, TurbineErrorCode, UnsupportedFeatureError, ValidationError, wrapPgError } from './errors.js';
+import { CLIENT_LOG_CONTEXT, type ClientLogContext, consoleLogger, logTo } from './logger.js';
 import { createManyShapeRuns } from './nested-write.js';
 import { fingerprintPrismaSchema } from './prisma-schema-fingerprint.js';
 import { isPlainRecord, RELATION_FILTER_WRAPPER_SET, setOwn } from './query/filters.js';
@@ -371,6 +373,8 @@ interface ModelLookups {
 interface Ctx {
   map: PrismaCompatMap;
   schema: SchemaMetadata;
+  /** The wrapped client's logger and diagnostics. */
+  log: ClientLogContext;
   /** turbine table name → prisma model name. */
   tableToModel: Map<string, string>;
   lookups: Map<string, ModelLookups>;
@@ -641,8 +645,8 @@ const KNOWN_KEYS: Record<CompatOperation, ReadonlySet<string>> = (() => {
 })();
 
 /**
- * Dev-mode notice for a key on a delegate's args object that this operation has
- * no meaning for.
+ * Per-query advice for a key on a delegate's args object that this operation
+ * has no meaning for.
  *
  * An unrecognized key is silently ignored (JavaScript objects have no schema),
  * which makes a typo, a turbine spelling, and a genuinely missing feature all
@@ -654,11 +658,12 @@ const KNOWN_KEYS: Record<CompatOperation, ReadonlySet<string>> = (() => {
  * into a failing one on upgrade over one stray key, and a key from a Prisma
  * major newer than {@link PRISMA_ARG_KEYS} would be exactly that key. The whole
  * body is wrapped so a hostile or exotic args object (a Proxy whose `ownKeys`
- * throws) can never be the reason a query fails. Dev-only and once per
- * `model.operation.key` per process, like every other advisory here.
+ * throws) can never be the reason a query fails. Off when the client's
+ * `diagnostics` turn advice off, and once per `model.operation.key` per
+ * process, like every other advisory here.
  */
-function warnUnknownQueryOptions(model: string, op: CompatOperation, args: unknown): void {
-  if (process.env.NODE_ENV === 'production') return;
+function warnUnknownQueryOptions(log: ClientLogContext, model: string, op: CompatOperation, args: unknown): void {
+  if (!log.diagnostics.advice) return;
   if (!isPlainRecord(args)) return;
   try {
     const known = KNOWN_KEYS[op];
@@ -671,16 +676,28 @@ function warnUnknownQueryOptions(model: string, op: CompatOperation, args: unkno
       if (!alias && known.has(key)) continue;
       if (!shouldWarnOnce(WARN_NS.unknownQueryOption, `${model}.${op}.${key}`)) continue;
       if (alias) {
-        console.warn(
-          `[turbine] prisma-compat: "${key}" is Turbine's spelling and is ignored here;` +
+        logTo(
+          log.logger,
+          'warn',
+          `prisma-compat: "${key}" is Turbine's spelling and is ignored here;` +
             ` prisma-compat takes Prisma's "${alias}". (${model}.${op})`,
+          { code: 'prisma-compat-native-spelling', table: model, operation: op, key, prismaKey: alias },
         );
         continue;
       }
       const suggestion = suggestKey(key, known);
-      console.warn(
-        `[turbine] prisma-compat: unknown option "${key}" in ${model}.${op}(), it is ignored.` +
+      logTo(
+        log.logger,
+        'warn',
+        `prisma-compat: unknown option "${key}" in ${model}.${op}(), it is ignored.` +
           (suggestion ? ` Did you mean "${suggestion}"?` : ''),
+        {
+          code: 'prisma-compat-unknown-option',
+          table: model,
+          operation: op,
+          key,
+          ...(suggestion ? { suggestion } : {}),
+        },
       );
     }
   } catch {
@@ -690,8 +707,8 @@ function warnUnknownQueryOptions(model: string, op: CompatOperation, args: unkno
 }
 
 /**
- * Dev-mode notice that the `prisma-map.ts` driving this client no longer matches
- * the Prisma schema it was generated from.
+ * Notice that the `prisma-map.ts` driving this client no longer matches the
+ * Prisma schema it was generated from.
  *
  * Nothing re-runs `turbine migrate-from-prisma`. When the schema moves on, the
  * map does not, and the adapter keeps translating the names it has: a model
@@ -706,17 +723,24 @@ function warnUnknownQueryOptions(model: string, op: CompatOperation, args: unkno
  *  - **Any failure is silence.** A missing file is the NORMAL deployed state
  *    (nobody ships `prisma/` to production) and so are a bundled runtime with no
  *    `node:fs` and a read that is refused. None of them is evidence of drift.
- *  - **Production is skipped entirely**, before anything is imported or read.
- *  - **Once per process per path**, via the shared registry, so a process that
- *    builds a client per request says it once.
+ *  - **Always on**, like every construction warning: a stale map loses models
+ *    in production too. In production mode the file is READ once per process
+ *    per path, so a process that builds a client per request does not read it
+ *    per request; in development it is re-read per client, so a schema edited
+ *    under a running dev server is still noticed.
+ *  - **Warned once per process per path**, via the shared registry.
  *
  * @param map - the map under test; a map with no `source` (hand-written, or
  *   emitted before 0.60) is skipped, since absence carries no information.
  */
-function warnStalePrismaMap(map: PrismaCompatMap): void {
+function warnStalePrismaMap(map: PrismaCompatMap, log: ClientLogContext): void {
   const source = map.source;
   if (!source || typeof source.path !== 'string' || typeof source.hash !== 'string') return;
-  if (typeof process === 'undefined' || process.env?.NODE_ENV === 'production') return;
+  // No `process`, no `node:fs`: an edge runtime has no file to compare.
+  if (typeof process === 'undefined') return;
+  if (log.diagnostics.mode === 'production' && !shouldWarnOnce(WARN_NS.stalePrismaMap, `checked:${source.path}`)) {
+    return;
+  }
 
   void (async () => {
     try {
@@ -725,10 +749,13 @@ function warnStalePrismaMap(map: PrismaCompatMap): void {
       const onDisk = await readFile(source.path, 'utf8');
       if (fingerprintPrismaSchema(onDisk) === source.hash) return;
       if (!shouldWarnOnce(WARN_NS.stalePrismaMap, source.path)) return;
-      console.warn(
-        `[turbine] prisma-compat: ${source.path} has changed since prisma-map.ts was generated,` +
+      logTo(
+        log.logger,
+        'warn',
+        `prisma-compat: ${source.path} has changed since prisma-map.ts was generated,` +
           ' so any model, field, relation or compound-unique added or renamed since then is missing' +
           ' from the compat client. Re-run: turbine migrate-from-prisma',
+        { code: 'prisma-map-stale', path: source.path },
       );
     } catch {
       // No file, no `node:fs`, no permission. None of these means the map is
@@ -2137,7 +2164,7 @@ function makeDelegate(
     // itself, for the same reason (see the comment above): a compat promise that
     // is built and never awaited must produce no output at all.
     const translate = (): Args => {
-      warnUnknownQueryOptions(modelName(ctx, mm), op, rawArgs);
+      warnUnknownQueryOptions(ctx.log, modelName(ctx, mm), op, rawArgs);
       return translateRaw();
     };
     const batchable: Batchable | undefined = batch
@@ -2589,8 +2616,9 @@ const JUNCTION_WARN_NS = 'prismaCompatJunction';
  * `$transaction` must not turn the transaction surface into a delegate).
  *
  * Every skip except the mapped-table one loses a capability the caller might
- * expect, so those warn once per junction name in dev; a table that a model
- * already maps to is not a loss (the model IS that table's accessor).
+ * expect, so those warn once per junction name (a construction warning, so
+ * always on); a table that a model already maps to is not a loss (the model IS
+ * that table's accessor).
  */
 function junctionModels(ctx: Ctx, map: PrismaCompatMap, tableToModel: Map<string, string>): [string, PrismaModelMap][] {
   const out: [string, PrismaModelMap][] = [];
@@ -2612,12 +2640,15 @@ function junctionModels(ctx: Ctx, map: PrismaCompatMap, tableToModel: Map<string
       if (!name || !ownLookup(ctx.schema.tables, name) || tableToModel.has(name)) continue;
       if (registered.has(name)) continue;
       if (seen.has(name)) {
-        if (process.env.NODE_ENV !== 'production' && shouldWarnOnce(JUNCTION_WARN_NS, name)) {
-          console.warn(
-            `[turbine] prisma-compat: the many-to-many junction table "${name}" collides with an ` +
+        if (shouldWarnOnce(JUNCTION_WARN_NS, name)) {
+          logTo(
+            ctx.log.logger,
+            'warn',
+            `prisma-compat: the many-to-many junction table "${name}" collides with an ` +
               'existing client member of the same name, so no junction accessor was created for it. ' +
               'Reach its rows through the owning model relation (a nested connect / disconnect / set on the ' +
               'related model), or through $queryRaw / $executeRaw.',
+            { code: 'prisma-compat-junction-collision', table: name },
           );
         }
         continue;
@@ -2794,9 +2825,15 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
   // callback-param variance on `$transaction`).
   const db = client as unknown as CompatTurbineClient;
 
-  // Fire-and-forget, dev-only, once per process: is this map still describing
-  // the schema on disk? Nothing else in the system ever asks.
-  warnStalePrismaMap(map);
+  // Log through the wrapped client's logger and diagnostics. A stand-in client
+  // without them (a test stub) gets the console and the environment's mode.
+  const log: ClientLogContext = (client as unknown as { [CLIENT_LOG_CONTEXT]?: ClientLogContext })[
+    CLIENT_LOG_CONTEXT
+  ] ?? { logger: consoleLogger, diagnostics: resolveDiagnostics() };
+
+  // Fire-and-forget, once per process: is this map still describing the schema
+  // on disk? Nothing else in the system ever asks.
+  warnStalePrismaMap(map, log);
 
   const tableToModel = new Map<string, string>();
   for (const [prismaModel, mm] of Object.entries(map.models)) tableToModel.set(mm.table, prismaModel);
@@ -2804,6 +2841,7 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
   const ctx: Ctx = {
     map,
     schema: db.schema,
+    log,
     tableToModel,
     lookups: new Map(),
     options: {

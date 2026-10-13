@@ -202,7 +202,7 @@ describe('relation parse failure behaviour', () => {
 describe('relation parse failure handling', () => {
   const src = readFileSync(new URL('../query/relations.ts', import.meta.url), 'utf8');
 
-  it('gates the parse-failure warn on NODE_ENV and dedupes it', () => {
+  it('gates the parse-failure warn on the advice switch and dedupes it', () => {
     // The warn sits inside parseNestedRow's per-relation loop, which runs once
     // per row per relation. Ungated and undeduped, one page of 10,000 rows is
     // 10,000 console.warn calls in production.
@@ -210,7 +210,7 @@ describe('relation parse failure handling', () => {
     assert.notEqual(anchor, -1, 'the parse-failure warn namespace must be used in relations.ts');
     const catchBlock = src.slice(anchor - 600, anchor + 900);
     assert.match(catchBlock, /shouldWarnOnce\(WARN_NS\.relationParseFailure/, 'warn must be deduped');
-    assert.match(catchBlock, /NODE_ENV/, 'warn must be gated on NODE_ENV');
+    assert.match(catchBlock, /adviceLogger\(qi\)/, 'warn must be gated on the diagnostics advice switch');
     assert.match(catchBlock, /throw new ValidationError/, 'the failure must propagate, not be swallowed');
   });
 

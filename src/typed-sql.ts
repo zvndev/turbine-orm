@@ -53,6 +53,7 @@
 import type { PgCompatPool } from './client.js';
 import { type Dialect, postgresDialect } from './dialect.js';
 import { ValidationError, wrapPgError } from './errors.js';
+import { consoleLogger, logTo, type TurbineLogger } from './logger.js';
 import type { QueryEvent } from './query/deferred.js';
 import { rawIdentity, runReportedStatement } from './query-events.js';
 
@@ -226,13 +227,15 @@ export class TypedSqlQuery<T extends Record<string, unknown>> implements Promise
      * built outside a client, which then emits nothing, as before.
      */
     private readonly onQuery?: (event: QueryEvent) => void,
+    /** Where the `logging` preview line goes. Defaults to the console logger. */
+    private readonly logger: TurbineLogger = consoleLogger,
   ) {}
 
   /** Execute and return all rows. Internal; powers `then`, `one`, and `scalar`. */
   private run(): Promise<T[]> {
     return this.runScoped(async () => {
       if (this.logging) {
-        console.log(`[turbine] Typed SQL: ${this.sql.trim().substring(0, 120)}...`);
+        logTo(this.logger, 'debug', `Typed SQL: ${this.sql.trim().substring(0, 120)}...`, { code: 'typed-sql' });
       }
       const result = await runReportedStatement(
         this.onQuery,

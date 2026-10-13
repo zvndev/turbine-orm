@@ -13,6 +13,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { ValidationError } from './errors.js';
 import { assertDistinctColumnFields, printableCatalogName } from './introspect.js';
+import { consoleLogger, logTo, type TurbineLogger } from './logger.js';
 import { closestName } from './query/utils.js';
 import {
   type ColumnMetadata,
@@ -218,6 +219,12 @@ function docSafe(value: string): string {
 export interface GenerateOptions {
   /** The introspected schema to generate from */
   schema: SchemaMetadata;
+  /**
+   * Where generation notes go (a relation omitted from the generated types
+   * because it shadows a column). Defaults to the console logger. Never
+   * affects the generated files.
+   */
+  logger?: TurbineLogger;
   /** Output directory (default: './generated/turbine') */
   outDir?: string;
   /** Redact connection string from generated comments */
@@ -293,6 +300,8 @@ export interface GenerateFileOptions {
   importMode?: string;
   /** {@link GenerateOptions.columnTypes}; validated against the schema by the emitter. */
   columnTypes?: Readonly<Record<string, string>>;
+  /** {@link GenerateOptions.logger}. */
+  logger?: TurbineLogger;
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +333,7 @@ export function generate(options: GenerateOptions): { outDir: string; files: str
     importExt,
     importMode,
     ...(options.columnTypes !== undefined ? { columnTypes: options.columnTypes } : {}),
+    ...(options.logger !== undefined ? { logger: options.logger } : {}),
   };
 
   // Generate types.ts
@@ -520,17 +530,20 @@ function generatedFileHeader(options?: GenerateFileOptions): string[] {
  * skip those relations here with a warning instead of emitting broken types.
  * The runtime metadata (metadata.ts) still carries every relation.
  */
-function typeSafeRelations(table: TableMetadata, warn = true): [string, RelationDef][] {
+function typeSafeRelations(table: TableMetadata, logger: TurbineLogger | false): [string, RelationDef][] {
   const columnFields = new Set(table.columns.map((c) => c.field));
   const usable: [string, RelationDef][] = [];
   for (const [relName, rel] of Object.entries(table.relations)) {
     if (columnFields.has(relName)) {
-      if (warn) {
-        console.warn(
-          `[turbine] ${printableCatalogName(
+      if (logger) {
+        logTo(
+          logger,
+          'warn',
+          printableCatalogName(
             `Relation "${relName}" on table "${table.name}" shadows a column field of the same name, ` +
               'omitting it from the generated types. Rename the relation (or the column) to expose it.',
-          )}`,
+          ),
+          { code: 'generate-relation-shadows-column', table: table.name, relation: relName },
         );
       }
       continue;
@@ -700,7 +713,7 @@ export function generateTypes(input: SchemaMetadata, options?: GenerateFileOptio
   // (relations that would shadow a scalar column field are excluded + warned).
   const safeRelationsByTable = new Map<string, [string, RelationDef][]>();
   for (const t of Object.values(schema.tables)) {
-    safeRelationsByTable.set(t.name, typeSafeRelations(t));
+    safeRelationsByTable.set(t.name, typeSafeRelations(t, options?.logger ?? consoleLogger));
   }
   const tablesWithRelations = new Set<string>();
   for (const t of Object.values(schema.tables)) {

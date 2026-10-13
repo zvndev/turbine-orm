@@ -31,6 +31,7 @@ import {
   watchCheckouts,
 } from './connection-guard.js';
 import { detectPooler, statementTimeoutSetting, withStartupSetting } from './connection-url.js';
+import { type DiagnosticsConfig, type ResolvedDiagnostics, resolveDiagnostics } from './diagnostics.js';
 import { type Dialect, postgresDialect } from './dialect.js';
 import {
   ConnectionError,
@@ -47,6 +48,7 @@ import {
   wrapPgError,
 } from './errors.js';
 import { normalizeGlobalFilters, tableAccessorName } from './global-filters-config.js';
+import { CLIENT_LOG_CONTEXT, type ClientLogContext, logTo, resolveLogger, type TurbineLogger } from './logger.js';
 import { hasRelationFields } from './nested-write.js';
 import { type ObserveConfig, ObserveEngine, type ObserveHandle } from './observe.js';
 import type { PgCompatPool, PgCompatPoolClient, PgCompatQueryResult } from './pg-types.js';
@@ -247,8 +249,46 @@ export interface TurbineConfig {
   idleTimeoutMillis?: number | undefined;
   /** pg-style alias for {@link connectionTimeoutMs}; the explicit field wins when both are set. */
   connectionTimeoutMillis?: number | undefined;
-  /** Enable query logging to console (default: false) */
+  /**
+   * Emit Turbine's lifecycle lines (pool created, raw SQL preview, transaction
+   * committed, ...) at the logger's `debug` level, plus the errors a throwing
+   * `$on` listener raises. Default: false. With the default logger the lines
+   * go to `console`. Bound parameter values are never logged.
+   */
   logging?: boolean | undefined;
+  /**
+   * Where Turbine's log lines go. Each line is a message plus a structured
+   * entry whose `code` is stable (`'pool-error'`, `'unknown-config-key'`); the
+   * message text is not. Every method is optional and a missing one drops that
+   * level, so `{}` silences Turbine entirely. Default: `console`, each line
+   * prefixed `[turbine]`.
+   *
+   * The arguments are `(message, entry)`, like `console` and winston. For pino
+   * or bunyan, which take `(object, message)`, adapt:
+   * `{ warn: (msg, e) => log.warn(e, msg), error: (msg, e) => log.error(e, msg) }`.
+   *
+   * No line carries a bound parameter value, whatever `logQueryParams` says.
+   * Once-per-process warnings are deduplicated process-wide, so a warning one
+   * client already emitted does not reach a second client's logger.
+   */
+  logger?: TurbineLogger | undefined;
+  /**
+   * What Turbine checks and says about itself: per-query advice (unknown
+   * options, unordered pages, missing FK indexes, ...) and the SQL-cache
+   * self-check. `'development'` turns both on; `'production'` turns both off.
+   * An object overrides either part: `{ mode: 'production', cacheCheck: {
+   * sample: 0.001 } }`.
+   *
+   * Default: `'production'` when `NODE_ENV` is `'production'` when the client is
+   * constructed (or when there is no `process`, as on an edge runtime), else
+   * `'development'`. Read once, at construction. Set it explicitly on a worker
+   * or serverless function that does not set `NODE_ENV`.
+   *
+   * Construction warnings (a misspelled config key, an option an external pool
+   * ignores, prepared statements behind a pooler) do not depend on it: they
+   * describe production hazards, fire once per process, and are always on.
+   */
+  diagnostics?: DiagnosticsConfig | undefined;
   /** Default LIMIT applied to findMany() when no limit is specified (opt-in, default: undefined) */
   defaultLimit?: number | undefined;
   /**
@@ -319,7 +359,7 @@ export interface TurbineConfig {
    * strategy, every write projection, `groupBy` keys and `_min` / `_max`.
    *
    * Leaving the option unset selects `'preserve'` AND enables a one-time
-   * warning (per process, per field, not silenced by `NODE_ENV=production`) the
+   * warning (per process, per field, not silenced by `diagnostics: 'production'`) the
    * first time a stored infinity is actually read, describing that reading and
    * both escapes. Naming either reading explicitly silences it.
    */
@@ -726,6 +766,8 @@ const TURBINE_CONFIG_KEYS: Record<keyof TurbineConfig, true> = {
   idleTimeoutMillis: true,
   connectionTimeoutMillis: true,
   logging: true,
+  logger: true,
+  diagnostics: true,
   defaultLimit: true,
   warnOnUnlimited: true,
   utcTimestamps: true,
@@ -784,8 +826,7 @@ function suggestConfigKey(key: string): string | null {
 }
 
 /**
- * Dev-mode notice for a key on the config object that is not part of the config
- * surface.
+ * Notice for a key on the config object that is not part of the config surface.
  *
  * An unknown key is silently ignored (JavaScript objects have no schema), which
  * makes a typo or a wrong guess indistinguishable from a broken feature: a
@@ -797,19 +838,21 @@ function suggestConfigKey(key: string): string | null {
  * turbine that passes a key this version has not heard of must keep running,
  * and the whole check is wrapped so that a hostile / exotic config object
  * (a Proxy whose `ownKeys` throws) cannot take down the constructor either.
- * Dev-only (`NODE_ENV !== 'production'`) and once per key per process, like the
- * other advisory diagnostics.
+ * Always on, whatever `diagnostics` says: an ignored option is ignored in
+ * production too, and the line fires once per key per process.
  */
-function warnUnknownConfigKeys(config: TurbineConfig): void {
-  if (process.env.NODE_ENV === 'production') return;
+function warnUnknownConfigKeys(config: TurbineConfig, logger: TurbineLogger): void {
   try {
     for (const key of Object.keys(config)) {
       if (CONFIG_KEY_SET.has(key) || NON_CONFIG_KEYS.has(key)) continue;
       if (!shouldWarnOnce(WARN_NS.unknownConfigKey, key)) continue;
       const suggestion = suggestConfigKey(key);
-      console.warn(
-        `[turbine] Unknown option "${key}" in the config passed to TurbineClient, it is ignored.` +
+      logTo(
+        logger,
+        'warn',
+        `Unknown option "${key}" in the config passed to TurbineClient, it is ignored.` +
           (suggestion ? ` Did you mean "${suggestion}"?` : ''),
+        { code: 'unknown-config-key', key, ...(suggestion ? { suggestion } : {}) },
       );
     }
   } catch {
@@ -1057,7 +1100,7 @@ export interface PoolEvent extends PoolEventOrigin {
 /**
  * `$on('poolError')`: an IDLE connection in a pool this client opened failed,
  * and the pool discarded it. No query was affected. Without a listener the
- * error is written to `console.error`, as before.
+ * error is logged at `error` level (code `'pool-error'`), through `logger`.
  */
 export type PoolErrorEvent = PoolEvent;
 
@@ -1882,6 +1925,10 @@ export class TurbineClient {
    */
   private static utcTimestampParsersRegistered = false;
   private readonly logging: boolean;
+  /** Where this client's log lines go (the `logger` option, else console). */
+  private readonly logger: TurbineLogger;
+  /** The `diagnostics` option, resolved once at construction. */
+  private readonly diagnostics: ResolvedDiagnostics;
   /** Active SQL dialect, owns transaction keywords, set_config, raw-SQL placeholders, capability flags. */
   private readonly dialect: Dialect;
   /** Validated `plan_cache_mode` to pin on every owned connection, or undefined to issue nothing. */
@@ -1941,6 +1988,8 @@ export class TurbineClient {
       const parent = seed.parent;
       this.schema = schema;
       this.logging = parent.logging;
+      this.logger = parent.logger;
+      this.diagnostics = parent.diagnostics;
       this.dialect = parent.dialect;
       this.errorMessagesSafe = parent.errorMessagesSafe;
       this.errorMessageMode = parent.errorMessageMode;
@@ -1998,9 +2047,14 @@ export class TurbineClient {
       }
       break;
     }
+    // The logger and the diagnostics mode are validated first, so every line
+    // below, the construction warnings included, reaches the caller's logger.
+    // NODE_ENV is read here and nowhere on a query path.
+    const logger = resolveLogger(config.logger);
+    const diagnostics = resolveDiagnostics(config.diagnostics);
     // Name any key on the config object that is not part of the config surface
-    // (dev only, once per key, never throws). See warnUnknownConfigKeys.
-    warnUnknownConfigKeys(config);
+    // (once per key, never throws). See warnUnknownConfigKeys.
+    warnUnknownConfigKeys(config, logger);
     // ALL config validation runs before ANY process-global side effect below.
     // A constructor that throws must leave the process exactly as it found it:
     // settling the process-global parser mode and then rejecting the config
@@ -2072,7 +2126,7 @@ export class TurbineClient {
     // most once.
     const ownsAnyPool = !config.pool;
     if (ownsAnyPool && !TurbineClient.int8ParserRegistered) {
-      warnParserOverwrite(20, 'int8');
+      warnParserOverwrite(20, 'int8', logger);
       pg.types.setTypeParser(20, parseInt8);
       TurbineClient.int8ParserRegistered = true;
     }
@@ -2098,19 +2152,23 @@ export class TurbineClient {
     const wantUtcTimestamps = config.utcTimestamps !== false;
     TurbineClient.assertUtcTimestampsAgree(wantUtcTimestamps);
     if (ownsAnyPool && wantUtcTimestamps && !TurbineClient.utcTimestampParsersRegistered) {
-      registerUtcTemporalParsers();
+      registerUtcTemporalParsers(logger);
       TurbineClient.utcTimestampParsersRegistered = true;
     }
     TurbineClient.utcTimestampParserMode = wantUtcTimestamps;
 
     this.logging = config.logging ?? false;
+    this.logger = logger;
+    this.diagnostics = diagnostics;
     this.dialect = dialect;
     this.planCacheMode = planCacheMode;
     this.schema = schema;
     // Respect env var kill switch
     const envDisablePrepared = typeof process !== 'undefined' && process.env?.TURBINE_DISABLE_PREPARED === '1';
     const pooler = config.pool ? undefined : TurbineClient.poolerEndpoint(config);
-    if (config.preparedStatements === true && pooler !== undefined) TurbineClient.warnPreparedOnPooler(pooler);
+    if (config.preparedStatements === true && pooler !== undefined) {
+      TurbineClient.warnPreparedOnPooler(pooler, logger);
+    }
 
     this.errorMessageMode = config.errorMessages ?? 'safe';
     this.errorMessagesSafe = this.errorMessageMode === 'safe';
@@ -2140,6 +2198,8 @@ export class TurbineClient {
       sqlCache: config.sqlCache ?? true,
       sqlCacheSize: config.sqlCacheSize,
       dialect: config.dialect,
+      diagnostics,
+      logger,
       // Non-SQL backends (PowDB) inject a factory that builds their own query
       // interface (PowqlInterface) instead of the SQL QueryInterface. SQL engines
       // never set this, so `table()` keeps constructing `new QueryInterface`.
@@ -2156,7 +2216,8 @@ export class TurbineClient {
           try {
             listener(emitted);
           } catch (e) {
-            if (this.logging) console.error('[turbine] Query listener error:', e);
+            if (this.logging)
+              logTo(this.logger, 'error', 'Query listener error:', { code: 'query-listener-error', error: e });
           }
         }
       },
@@ -2186,7 +2247,8 @@ export class TurbineClient {
       this.queryPool = this.typedPool(config.pool);
       this.ownsPool = false;
       if (this.logging) {
-        console.log(`[turbine] Using external pool, ${Object.keys(schema.tables).length} tables`);
+        const tables = Object.keys(schema.tables).length;
+        logTo(this.logger, 'debug', `Using external pool, ${tables} tables`, { code: 'external-pool', tables });
       }
     } else if (!hasDatabaseTarget(config)) {
       // Nothing names a database: no pool, connection string, host settings,
@@ -2255,9 +2317,12 @@ export class TurbineClient {
       this.ownsPool = true;
 
       if (this.logging) {
-        console.log(
-          `[turbine] Pool created, max ${poolConfig.max} connections, ${Object.keys(schema.tables).length} tables`,
-        );
+        const tables = Object.keys(schema.tables).length;
+        logTo(this.logger, 'debug', `Pool created, max ${poolConfig.max} connections, ${tables} tables`, {
+          code: 'pool-created',
+          max: poolConfig.max,
+          tables,
+        });
       }
     }
 
@@ -2301,28 +2366,36 @@ export class TurbineClient {
     // Deliberate no-op rather than a throw: the option is a performance knob,
     // and an app that moves from an owned pool to a serverless driver should
     // not stop booting over it. Same ownership rule as the type parsers, which
-    // also skip external pools silently.
-    if (this.planCacheMode !== undefined && !this.ownsPool && process.env.NODE_ENV !== 'production') {
+    // also skip external pools silently. Always on, like every construction
+    // warning: the option is just as ignored in production.
+    if (this.planCacheMode !== undefined && !this.ownsPool) {
       if (shouldWarnOnce(WARN_NS.planCacheModeIgnored, this.planCacheMode)) {
         const replicaNote =
           this.ownedReplicaPools.length > 0
             ? ` It IS applied to the ${this.ownedReplicaPools.length} Turbine-owned read replica pool(s) on this ` +
               'client, so reads and writes would run under different plan-cache policies until the primary is set too.'
             : '';
-        console.warn(
-          `[turbine] planCacheMode: '${this.planCacheMode}' was not applied to the primary: this client was given an ` +
+        logTo(
+          this.logger,
+          'warn',
+          `planCacheMode: '${this.planCacheMode}' was not applied to the primary: this client was given an ` +
             'external `pool`, whose connection lifecycle the caller owns, so Turbine never opens its connections. Set ' +
             `\`plan_cache_mode\` in the driver's own connection setup (or run \`SET plan_cache_mode = ${this.planCacheMode}\` ` +
             `on checkout) instead.${replicaNote}`,
+          { code: 'plan-cache-mode-ignored', option: 'planCacheMode', ownedReplicas: this.ownedReplicaPools.length },
         );
       }
     }
     this.warnExternalPoolOptions(statementTimeoutMs, maxLifetimeSeconds);
     this.replicaTableCaches = this.replicaPools.map(() => new Map<string, QueryInterface<object>>());
     if (this.logging && this.replicaPools.length > 0) {
-      console.log(
-        `[turbine] ${this.replicaPools.length} read replica(s) configured (${this.ownedReplicaPools.length} owned)`,
-      );
+      const replicas = this.replicaPools.length;
+      const owned = this.ownedReplicaPools.length;
+      logTo(this.logger, 'debug', `${replicas} read replica(s) configured (${owned} owned)`, {
+        code: 'replicas-configured',
+        replicas,
+        owned,
+      });
     }
 
     // Auto-create typed table accessors for all tables in the schema
@@ -2505,16 +2578,18 @@ export class TurbineClient {
     return undefined;
   }
 
-  private static warnPreparedOnPooler(endpoint: string): void {
-    if (process.env.NODE_ENV === 'production' || !shouldWarnOnce(WARN_NS.preparedStatementsOnPooler, endpoint)) {
-      return;
-    }
-    console.warn(
-      `[turbine] preparedStatements: true on ${endpoint}, which looks like a connection pooler. In transaction ` +
+  /** Always on: named statements behind a transaction pooler fail in production first. */
+  private static warnPreparedOnPooler(endpoint: string, logger: TurbineLogger): void {
+    if (!shouldWarnOnce(WARN_NS.preparedStatementsOnPooler, endpoint)) return;
+    logTo(
+      logger,
+      'warn',
+      `preparedStatements: true on ${endpoint}, which looks like a connection pooler. In transaction ` +
         'mode a pooler runs each transaction on any server connection, so a statement named on one fails on ' +
         'the next ("prepared statement ... does not exist" or "already exists") unless the pooler tracks ' +
         'prepared statements: PgBouncer 1.21+ with max_prepared_statements above 0. If yours does not, leave ' +
         'preparedStatements unset; Turbine then sends unnamed statements to a pooler.',
+      { code: 'prepared-statements-on-pooler', endpoint },
     );
   }
 
@@ -2544,15 +2619,20 @@ export class TurbineClient {
   }
 
   /**
-   * Hand a pool event to its listeners. A `poolError` with no listener keeps
-   * the console line it always had; a listener that throws is ignored, like a
-   * query listener.
+   * Hand a pool event to its listeners. A `poolError` with no listener is
+   * logged at `error`, always; a listener that throws is ignored, like a query
+   * listener.
    */
   private emitPoolEvent(kind: keyof PoolListeners, event: PoolEvent): void {
     const listeners = this.poolListeners[kind];
     if (listeners.size === 0) {
       if (kind === 'poolError') {
-        console.error(`[turbine] Unexpected ${event.pool} pool error:`, event.error.message);
+        logTo(this.logger, 'error', `Unexpected ${event.pool} pool error: ${event.error.message}`, {
+          code: 'pool-error',
+          pool: event.pool,
+          ...(event.replica !== undefined ? { replica: event.replica } : {}),
+          error: event.error,
+        });
       }
       return;
     }
@@ -2560,34 +2640,48 @@ export class TurbineClient {
       try {
         listener(event);
       } catch (e) {
-        if (this.logging) console.error(`[turbine] ${kind} listener error:`, e);
+        if (this.logging) {
+          logTo(this.logger, 'error', `${kind} listener error:`, {
+            code: 'pool-listener-error',
+            listener: kind,
+            error: e,
+          });
+        }
       }
     }
   }
 
   /**
    * `statementTimeoutMs` and an explicit `maxLifetimeSeconds` reach only the
-   * pools Turbine opens. On an external primary they do nothing, which a dev
-   * warning says once, naming where the setting belongs instead.
+   * pools Turbine opens. On an external primary they do nothing, which a
+   * warning says once, naming where the setting belongs instead. Always on: an
+   * ignored timeout means no timeout in production.
    */
   private warnExternalPoolOptions(
     statementTimeoutMs: number | undefined,
     maxLifetimeSeconds: number | undefined,
   ): void {
-    if (this.ownsPool || process.env.NODE_ENV === 'production') return;
+    if (this.ownsPool) return;
+    const ownedReplicas = this.ownedReplicaPools.length;
     if (statementTimeoutMs !== undefined && shouldWarnOnce(WARN_NS.connectionOptionIgnored, 'statementTimeoutMs')) {
-      console.warn(
-        `[turbine] statementTimeoutMs: ${statementTimeoutMs} was not applied to the primary: this client was given an ` +
+      logTo(
+        this.logger,
+        'warn',
+        `statementTimeoutMs: ${statementTimeoutMs} was not applied to the primary: this client was given an ` +
           "external `pool`, whose connections Turbine never opens. Set `statement_timeout` in the driver's own " +
           "connection setup, or on the role (`ALTER ROLE app SET statement_timeout = '30s'`)." +
-          (this.ownedReplicaPools.length > 0 ? ' It IS applied to the Turbine-owned read replica pools.' : ''),
+          (ownedReplicas > 0 ? ' It IS applied to the Turbine-owned read replica pools.' : ''),
+        { code: 'connection-option-ignored', option: 'statementTimeoutMs', ownedReplicas },
       );
     }
     if (maxLifetimeSeconds !== undefined && shouldWarnOnce(WARN_NS.connectionOptionIgnored, 'maxLifetimeSeconds')) {
-      console.warn(
-        `[turbine] maxLifetimeSeconds: ${maxLifetimeSeconds} was not applied to the primary: this client was given ` +
+      logTo(
+        this.logger,
+        'warn',
+        `maxLifetimeSeconds: ${maxLifetimeSeconds} was not applied to the primary: this client was given ` +
           "an external `pool`, whose connection lifecycle the caller owns. Set it on that pool's own options." +
-          (this.ownedReplicaPools.length > 0 ? ' It IS applied to the Turbine-owned read replica pools.' : ''),
+          (ownedReplicas > 0 ? ' It IS applied to the Turbine-owned read replica pools.' : ''),
+        { code: 'connection-option-ignored', option: 'maxLifetimeSeconds', ownedReplicas },
       );
     }
   }
@@ -3018,7 +3112,12 @@ export class TurbineClient {
     if (options?.transactional === false) assertNoLockInAutocommitPipeline(queries);
 
     if (this.logging) {
-      console.log(`[turbine] Pipeline: ${queries.length} queries, ${queries.map((q) => q.tag).join(', ')}`);
+      const tags = queries.map((q) => q.tag);
+      logTo(this.logger, 'debug', `Pipeline: ${queries.length} queries, ${tags.join(', ')}`, {
+        code: 'pipeline',
+        queries: queries.length,
+        tags,
+      });
     }
     // Scoped like every other entry point. A pipeline builds NotFoundErrors (a
     // `buildFindUniqueOrThrow` slot) and wraps driver errors into
@@ -3155,7 +3254,10 @@ export class TurbineClient {
   private async runRaw<T>(sql: string, values: unknown[], action: string): Promise<T[]> {
     const params = this.rawParams(values, action);
     if (this.logging) {
-      console.log(`[turbine] Raw SQL: ${sql.trim().substring(0, 120)}...`);
+      logTo(this.logger, 'debug', `Raw SQL: ${sql.trim().substring(0, 120)}...`, {
+        code: 'raw-sql',
+        operation: action,
+      });
     }
     const result = await runReportedStatement(
       this.queryOptions._onQuery,
@@ -3277,6 +3379,7 @@ export class TurbineClient {
       this.logging,
       <R>(fn: () => R): R => this.withErrorMode(fn),
       this.queryOptions._onQuery,
+      this.logger,
     );
   }
 
@@ -3537,7 +3640,10 @@ export class TurbineClient {
       checkout.release();
 
       if (this.logging) {
-        console.log('[turbine] Transaction committed');
+        logTo(this.logger, 'debug', 'Transaction committed', {
+          code: 'transaction-committed',
+          operation: '$transaction',
+        });
       }
 
       return result;
@@ -3550,7 +3656,10 @@ export class TurbineClient {
         clean ? undefined : new Error('[turbine] transaction connection discarded: rollback not confirmed'),
       );
       if (this.logging) {
-        console.log('[turbine] Transaction rolled back');
+        logTo(this.logger, 'debug', 'Transaction rolled back', {
+          code: 'transaction-rolled-back',
+          operation: '$transaction',
+        });
       }
       throw explainConnectionLoss(err, checkout.lostWith);
     }
@@ -3745,7 +3854,8 @@ export class TurbineClient {
    * ends it instead. Postgres does not hold notifications for a disconnected
    * listener, so anything sent during the gap is lost: use
    * `options.onReconnect` to resynchronise. `options.onError` receives the loss
-   * and each failed attempt (default: one `console.error` line each).
+   * and each failed attempt (default: one log line each through `logger`, at
+   * `warn` while it reconnects and `error` once it stops).
    *
    * @example
    * ```ts
@@ -3771,7 +3881,7 @@ export class TurbineClient {
     const quoted = quoteIdent(channel);
 
     if (this.logging) {
-      console.log(`[turbine] LISTEN ${quoted}`);
+      logTo(this.logger, 'debug', `LISTEN ${quoted}`, { code: 'listen', channel });
     }
 
     const sub = await createSubscription(
@@ -3783,6 +3893,7 @@ export class TurbineClient {
         this.activeSubscriptions.delete(closed);
       },
       options,
+      this.logger,
     );
     this.activeSubscriptions.add(sub);
     return sub;
@@ -3811,7 +3922,7 @@ export class TurbineClient {
     }
     validateChannel(channel);
     if (this.logging) {
-      console.log(`[turbine] NOTIFY ${channel}`);
+      logTo(this.logger, 'debug', `NOTIFY ${channel}`, { code: 'notify', channel });
     }
     try {
       await this.pool.query('SELECT pg_notify($1, $2)', [channel, payload ?? '']);
@@ -3854,7 +3965,7 @@ export class TurbineClient {
   async connect(): Promise<void> {
     await this.roundTrip();
     if (this.logging) {
-      console.log('[turbine] Connection verified');
+      logTo(this.logger, 'debug', 'Connection verified', { code: 'connection-verified' });
     }
   }
 
@@ -3931,19 +4042,26 @@ export class TurbineClient {
       this.ownedReplicaPools.map((replicaPool) =>
         replicaPool.end().catch((err: unknown) => {
           if (this.logging) {
-            console.error('[turbine] Error closing replica pool:', (err as Error).message);
+            logTo(this.logger, 'error', `Error closing replica pool: ${(err as Error).message}`, {
+              code: 'replica-close-error',
+              error: err,
+            });
           }
         }),
       ),
     );
     if (!this.ownsPool && this.logging) {
-      console.log('[turbine] disconnect() skipped, external primary pool is not owned by Turbine');
+      logTo(this.logger, 'debug', 'disconnect() skipped, external primary pool is not owned by Turbine', {
+        code: 'disconnect-skipped',
+      });
     }
     const ending = Promise.all([endReplicas, this.ownsPool ? this.pool.end() : undefined]);
 
     if (timeoutMs === undefined || (await settlesWithin(ending, timeoutMs))) {
       await ending;
-      if (this.logging && this.ownsPool) console.log('[turbine] Pool disconnected');
+      if (this.logging && this.ownsPool) {
+        logTo(this.logger, 'debug', 'Pool disconnected', { code: 'pool-disconnected', timedOut: false });
+      }
       return options === undefined ? undefined : { timedOut: false, forcedConnections: 0 };
     }
     const forcedConnections = await this.forceCloseCheckedOut();
@@ -3952,7 +4070,12 @@ export class TurbineClient {
     // holder that never releases.
     await settlesWithin(ending, TX_ABORT_GRACE_MS);
     if (this.logging) {
-      console.log(`[turbine] Pool disconnected after ${timeoutMs}ms, ${forcedConnections} connection(s) closed in use`);
+      logTo(
+        this.logger,
+        'debug',
+        `Pool disconnected after ${timeoutMs}ms, ${forcedConnections} connection(s) closed in use`,
+        { code: 'pool-disconnected', timedOut: true, timeoutMs, forcedConnections },
+      );
     }
     return { timedOut: true, forcedConnections };
   }
@@ -3999,3 +4122,16 @@ export class TurbineClient {
     };
   }
 }
+
+// What prisma-compat (and anything else that wraps a client) logs through: the
+// client's logger and resolved diagnostics, under a `Symbol.for` key so a CJS
+// and an ESM copy agree. Defined outside the class body so it stays off the
+// published declaration of `TurbineClient`.
+Object.defineProperty(TurbineClient.prototype, CLIENT_LOG_CONTEXT, {
+  get(this: TurbineClient): ClientLogContext {
+    const self = this as unknown as ClientLogContext;
+    return { logger: self.logger, diagnostics: self.diagnostics };
+  },
+  enumerable: false,
+  configurable: false,
+});

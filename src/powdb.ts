@@ -75,6 +75,7 @@ import {
   UnsupportedFeatureError,
   ValidationError,
 } from './errors.js';
+import { consoleLogger, logTo, type TurbineLogger } from './logger.js';
 import importOptionalPeer from './optional-peer-import.cjs';
 import type { PowdbExec } from './powdb-introspect.js';
 import {
@@ -409,6 +410,8 @@ export function capabilitiesFromVersion(
  */
 export interface PowqlSchemaDDLOptions {
   capabilities?: PowdbCapabilities;
+  /** Where a skipped-link warning goes. Defaults to the console logger. */
+  logger?: TurbineLogger;
   /**
    * Emit `link Owner.name -> Target on local = target` declarations (PowDB entity
    * links, >= 0.19) for every single-column hasMany / hasOne / belongsTo relation
@@ -604,9 +607,12 @@ export function powqlSchemaDDL(schema: SchemaMetadata, opts: PowqlSchemaDDLOptio
     if (caps) requireCapability(caps, 'entityLinks', 'entity link DDL (`emitLinks`)');
     const links = deriveDesiredLinks(schema, (owner, name) => {
       if (shouldWarnOnce(WARN_NS.powdbLinks, `collide:${owner}.${name}`)) {
-        console.warn(
-          `[turbine] powqlSchemaDDL(emitLinks): relation "${name}" on "${owner}" collides with a column of the ` +
+        logTo(
+          opts.logger ?? consoleLogger,
+          'warn',
+          `powqlSchemaDDL(emitLinks): relation "${name}" on "${owner}" collides with a column of the ` +
             'same name; skipping its link declaration (PowDB hard-errors on a link that shadows a column).',
+          { code: 'powdb-link-collision', table: owner, relation: name, operation: 'powqlSchemaDDL' },
         );
       }
     });
@@ -636,9 +642,10 @@ export function powqlSchemaDDL(schema: SchemaMetadata, opts: PowqlSchemaDDLOptio
 export async function applyPowdbLinks(
   exec: PowdbExec,
   schema: SchemaMetadata,
-  options: { capabilities?: PowdbCapabilities } = {},
+  options: { capabilities?: PowdbCapabilities; logger?: TurbineLogger } = {},
 ): Promise<string[]> {
   const caps = options.capabilities;
+  const logger = options.logger ?? consoleLogger;
   if (caps) {
     requireCapability(caps, 'entityLinks', 'entity link DDL (`applyPowdbLinks`)');
     requireCapability(caps, 'linkIntrospection', 'PowDB `schema links` introspection');
@@ -647,9 +654,12 @@ export async function applyPowdbLinks(
   const byOwnerName = new Map(existing.map((l) => [`${l.owner}\u0000${l.name}`, l]));
   const desired = deriveDesiredLinks(schema, (owner, name) => {
     if (shouldWarnOnce(WARN_NS.powdbLinks, `collide:${owner}.${name}`)) {
-      console.warn(
-        `[turbine] applyPowdbLinks: relation "${name}" on "${owner}" collides with a column of the same name; ` +
+      logTo(
+        logger,
+        'warn',
+        `applyPowdbLinks: relation "${name}" on "${owner}" collides with a column of the same name; ` +
           'skipping its link (PowDB hard-errors on a link that shadows a column).',
+        { code: 'powdb-link-collision', table: owner, relation: name, operation: 'applyPowdbLinks' },
       );
     }
   });
@@ -660,10 +670,13 @@ export async function applyPowdbLinks(
       const same =
         found.target === link.target && found.localKey === link.localKey && found.targetKey === link.targetKey;
       if (!same && shouldWarnOnce(WARN_NS.powdbLinks, `drift:${link.owner}.${link.name}`)) {
-        console.warn(
-          `[turbine] applyPowdbLinks: link "${link.name}" on "${link.owner}" is already declared with different ` +
+        logTo(
+          logger,
+          'warn',
+          `applyPowdbLinks: link "${link.name}" on "${link.owner}" is already declared with different ` +
             `endpoints (have ${found.target} on ${found.localKey} = ${found.targetKey}, want ${link.target} on ` +
             `${link.localKey} = ${link.targetKey}); leaving it untouched (PowDB has no drop-link DDL).`,
+          { code: 'powdb-link-drift', table: link.owner, relation: link.name, operation: 'applyPowdbLinks' },
         );
       }
       continue; // identical → idempotent skip; drift → warned skip

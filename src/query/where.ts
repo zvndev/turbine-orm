@@ -11,9 +11,11 @@
  * primitives this module needs. See builder.ts for the thin delegating methods.
  */
 
+import { type ResolvedDiagnostics, resolveDiagnostics } from '../diagnostics.js';
 import type { Dialect, JsonPathEqualsInput } from '../dialect.js';
 import { getErrorMessageMode, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { assertSkipListNames, skipListNamesTable } from '../global-filters-config.js';
+import { consoleLogger, type TurbineLogger } from '../logger.js';
 import type { PgCompatQueryResult } from '../pg-types.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { camelToSnake, localDateTimeKind, normalizeKeyColumns } from '../schema.js';
@@ -103,6 +105,14 @@ export interface BuilderCtx {
    * default.
    */
   readonly temporalInfinity?: TemporalInfinityReading;
+  /**
+   * The owning client's resolved `diagnostics`. Resolved once, at client
+   * construction; the modules never read the environment. Read through
+   * {@link adviceLogger}.
+   */
+  readonly diagnostics?: ResolvedDiagnostics;
+  /** The owning client's logger. Read through {@link adviceLogger}. */
+  readonly logger?: TurbineLogger;
   readonly crossSchemaTypeColumns: Set<string>;
   /**
    * The active query's `skipGlobalFilters` opt-out. A live getter/setter over
@@ -225,6 +235,19 @@ export interface BuilderCtx {
    * can never bind an unvalidated NaN (which Postgres reads as "no limit").
    */
   paginationValue(value: unknown, arg?: string): number;
+}
+
+/**
+ * Where per-query advice goes for this context: the client's logger when its
+ * `diagnostics.advice` is on, else `undefined`. A site calls this first and
+ * builds its message only on a logger.
+ *
+ * A context without the client's diagnostics (one built by hand) resolves
+ * them here; every context a QueryInterface builds carries them, so on a query
+ * path this never reads the environment.
+ */
+export function adviceLogger(qi: Pick<BuilderCtx, 'diagnostics' | 'logger'>): TurbineLogger | undefined {
+  return (qi.diagnostics ?? resolveDiagnostics()).advice ? (qi.logger ?? consoleLogger) : undefined;
 }
 
 /**

@@ -16,6 +16,7 @@
 import type { JsonWireRule } from '../dialect.js';
 import { CircularRelationError, RelationError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { missingIndexForRelation } from '../index-advisor.js';
+import { logTo } from '../logger.js';
 import type { RelationDef, TableMetadata } from '../schema.js';
 import { normalizeKeyColumns, snakeToCamel } from '../schema.js';
 import { resolveCountRelations, stitchOnlyFields } from './batched-loader.js';
@@ -1740,14 +1741,17 @@ export function parseNestedRow(
         // find it.
         //
         // The warn is gated and deduped because this sits in parseNestedRow's
-        // per-relation loop: one 10,000-row page was 10,000 console.warn calls.
-        if (
-          process.env.NODE_ENV !== 'production' &&
-          shouldWarnOnce(WARN_NS.relationParseFailure, `${qi.table}.${relName}`)
-        ) {
-          console.warn(
-            `[turbine] Relation "${relName}" on "${qi.table}" returned a payload that is not valid JSON. ` +
+        // per-relation loop: one 10,000-row page was 10,000 warnings. The
+        // parse error stays out of the entry: its message quotes the payload,
+        // which is row data.
+        const log = whereMod.adviceLogger(qi);
+        if (log && shouldWarnOnce(WARN_NS.relationParseFailure, `${qi.table}.${relName}`)) {
+          logTo(
+            log,
+            'warn',
+            `Relation "${relName}" on "${qi.table}" returned a payload that is not valid JSON. ` +
               `This is a bug; please report it with the emitted SQL.`,
+            { code: 'relation-payload-json', table: qi.table, relation: relName },
           );
         }
         throw new ValidationError(
@@ -2393,7 +2397,7 @@ function flattenNodeSignature(node: FlattenNode): string {
 }
 
 /**
- * Dev-only, once-per-(table, relation, reason) note that an explicitly
+ * Per-query advice, once per (table, relation, reason): an explicitly
  * requested `relationLoadStrategy: 'flatten'` did NOT engage for a relation.
  *
  * Worth its own warning because the fallback is otherwise INVISIBLE: the query
@@ -2402,19 +2406,24 @@ function flattenNodeSignature(node: FlattenNode): string {
  * Silence there is indistinguishable from the strategy being a no-op, which is
  * exactly the shape of thing that gets filed as a bug.
  *
- * Suppressed in production like the other planner notes, and deduped through
- * the shared registry so a hot query logs once rather than per call. Note that
- * a flatten plan is recomputed on the build, param-collect and row-assembly
- * paths for the same query; the registry is what keeps that to one line.
+ * Off when `diagnostics` turn advice off, like the other planner notes, and
+ * deduped through the shared registry so a hot query logs once rather than per
+ * call. Note that a flatten plan is recomputed on the build, param-collect and
+ * row-assembly paths for the same query; the registry is what keeps that to
+ * one line.
  */
-function warnFlattenFallback(table: string, rejects: readonly FlattenReject[]): void {
+function warnFlattenFallback(qi: BuilderCtx, table: string, rejects: readonly FlattenReject[]): void {
   if (rejects.length === 0) return;
-  if (process.env.NODE_ENV === 'production') return;
+  const log = whereMod.adviceLogger(qi);
+  if (!log) return;
   for (const { relation, reason } of rejects) {
     if (!shouldWarnOnce(WARN_NS.flattenFallback, `${table}.${relation}|${reason}`)) continue;
-    console.warn(
-      `[turbine] relationLoadStrategy: 'flatten' did not engage for relation "${relation}" on "${table}": ` +
+    logTo(
+      log,
+      'warn',
+      `relationLoadStrategy: 'flatten' did not engage for relation "${relation}" on "${table}": ` +
         `${reason}. It loads via the correlated subquery instead (same rows, same values, different plan).`,
+      { code: 'flatten-fallback', table, relation, reason },
     );
   }
 }
@@ -2450,7 +2459,7 @@ export function planFlattenWith(
     if (node) nodes[relName] = node;
   }
 
-  warnFlattenFallback(table, rejects);
+  warnFlattenFallback(qi, table, rejects);
 
   if (Object.keys(nodes).length === 0) return null;
 
@@ -2461,7 +2470,7 @@ export function planFlattenWith(
   const reserved = new Set<string>([...meta.allColumns, ...Object.keys(withClause)]);
   for (const alias of aliases) {
     if (reserved.has(alias)) {
-      warnFlattenFallback(table, [
+      warnFlattenFallback(qi, table, [
         {
           relation: Object.keys(nodes).join(', '),
           reason: `the projected alias "${alias}" collides with a column or relation name on "${table}"`,
@@ -2989,12 +2998,13 @@ export function buildRelationSubquery(
   // RelationSubqueryContext is a published contract.
   const opts = relationOptions(spec);
 
-  // Dev-only: correlated relation loading probes the child table once per parent
-  // row, so a missing FK index multiplies into per-parent full-table scans (a
-  // batched-loader ORM pays the same missing index only once, which is why
-  // schemas migrated from one often lack these). Name the exact index to create
-  // instead of letting the slowness look like an ORM problem.
-  if (process.env.NODE_ENV !== 'production') {
+  // Per-query advice: correlated relation loading probes the child table once
+  // per parent row, so a missing FK index multiplies into per-parent full-table
+  // scans (a batched-loader ORM pays the same missing index only once, which is
+  // why schemas migrated from one often lack these). Name the exact index to
+  // create instead of letting the slowness look like an ORM problem.
+  const log = whereMod.adviceLogger(qi);
+  if (log) {
     const warnKey = `${relDef.from}.${relDef.name}`;
     // Compute the (potentially costly) probe only for a key not yet warned, and
     // claim the key through the process-wide registry ONLY when we actually warn,
@@ -3003,11 +3013,20 @@ export function buildRelationSubquery(
     if (!hasWarnedOnce(WARN_NS.unindexedRelation, warnKey)) {
       const miss = missingIndexForRelation(qi.schema, relDef);
       if (miss && shouldWarnOnce(WARN_NS.unindexedRelation, warnKey)) {
-        console.warn(
-          `[turbine] Relation "${relDef.name}" on "${relDef.from}" probes ` +
+        logTo(
+          log,
+          'warn',
+          `Relation "${relDef.name}" on "${relDef.from}" probes ` +
             `"${miss.table}"(${miss.columns.join(', ')}) which has no covering index, ` +
             `each parent row scans the full table. Fix: ${miss.createSql}; ` +
             'or run `npx turbine doctor` for a full report.',
+          {
+            code: 'unindexed-relation',
+            table: relDef.from,
+            relation: relDef.name,
+            probeTable: miss.table,
+            columns: miss.columns,
+          },
         );
       }
     }
