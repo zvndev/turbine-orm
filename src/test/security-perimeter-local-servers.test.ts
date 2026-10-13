@@ -27,7 +27,7 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { describe, it } from 'node:test';
 import type pg from 'pg';
-import { createLoginGate, isAllowedHostHeader, redeemLogin } from '../cli/local-server-guard.js';
+import { createTicketGate, isAllowedHostHeader, redeemTicket } from '../cli/local-server-guard.js';
 import { type ObserveOptions, handleRequest as observeRequest, startObserve } from '../cli/observe.js';
 import {
   handleRequest,
@@ -106,16 +106,16 @@ describe('isAllowedHostHeader', () => {
 
 describe('one-time login gate', () => {
   it('grants once, then reports used; a wrong token is invalid and never spends it', () => {
-    const gate = createLoginGate();
-    assert.equal(redeemLogin(gate, 'nope'), 'invalid');
+    const gate = createTicketGate();
+    assert.equal(redeemTicket(gate, 'nope'), 'invalid');
     assert.equal(gate.used, false, 'a wrong guess does not burn the ticket');
-    assert.equal(redeemLogin(gate, gate.token), 'granted');
-    assert.equal(redeemLogin(gate, gate.token), 'used');
-    assert.equal(redeemLogin(gate, 'nope'), 'invalid');
+    assert.equal(redeemTicket(gate, gate.token), 'granted');
+    assert.equal(redeemTicket(gate, gate.token), 'used');
+    assert.equal(redeemTicket(gate, 'nope'), 'invalid');
   });
 
   it('mints a distinct ticket per gate', () => {
-    assert.notEqual(createLoginGate().token, createLoginGate().token);
+    assert.notEqual(createTicketGate().token, createTicketGate().token);
   });
 });
 
@@ -265,12 +265,12 @@ describe('Studio refuses a foreign Host before any route runs', () => {
   });
 
   it('a rebinding attempt does not spend the login ticket', async () => {
-    const login = createLoginGate();
-    const ctx = demoCtx({ login });
-    const refused = await studio(ctx, 'GET', `/?token=${login.token}`, { host: 'evil.example:4983' });
+    const ticketGate = createTicketGate();
+    const ctx = demoCtx({ ticketGate });
+    const refused = await studio(ctx, 'GET', `/?token=${ticketGate.token}`, { host: 'evil.example:4983' });
     assert.equal(refused.status, 403);
-    assert.equal(login.used, false);
-    const granted = await studio(ctx, 'GET', `/?token=${login.token}`);
+    assert.equal(ticketGate.used, false);
+    const granted = await studio(ctx, 'GET', `/?token=${ticketGate.token}`);
     assert.equal(granted.status, 302);
   });
 });
@@ -281,11 +281,11 @@ describe('Studio refuses a foreign Host before any route runs', () => {
 
 describe('Studio login ticket is single use and is not the session credential', () => {
   it('exchanges the ticket for the SESSION cookie, once', async () => {
-    const login = createLoginGate();
-    assert.notEqual(login.token, SESSION, 'fixture: ticket and session credential differ');
-    const ctx = demoCtx({ login });
+    const ticketGate = createTicketGate();
+    assert.notEqual(ticketGate.token, SESSION, 'fixture: ticket and session credential differ');
+    const ctx = demoCtx({ ticketGate });
 
-    const first = await studio(ctx, 'GET', `/?token=${login.token}`);
+    const first = await studio(ctx, 'GET', `/?token=${ticketGate.token}`);
     assert.equal(first.status, 302);
     assert.equal(first.headers.Location, '/');
     const cookie = String(first.headers['Set-Cookie']);
@@ -293,30 +293,32 @@ describe('Studio login ticket is single use and is not the session credential', 
     assert.match(cookie, /HttpOnly/);
     assert.match(cookie, /SameSite=Strict/);
     assert.ok(cookie.includes(SESSION), 'the cookie carries the session credential');
-    assert.equal(cookie.includes(login.token), false, 'the ticket itself is never stored as the credential');
+    assert.equal(cookie.includes(ticketGate.token), false, 'the ticket itself is never stored as the credential');
 
-    const replay = await studio(ctx, 'GET', `/?token=${login.token}`);
+    const replay = await studio(ctx, 'GET', `/?token=${ticketGate.token}`);
     assert.equal(replay.status, 403, 'a replayed ticket opens nothing');
     assert.equal(replay.headers['Set-Cookie'], undefined, 'and sets no cookie');
     assert.match(replay.body, /already used/);
   });
 
   it('a signed-in browser that reloads the old URL is sent back to / without a new cookie', async () => {
-    const login = createLoginGate();
-    const ctx = demoCtx({ login });
-    await studio(ctx, 'GET', `/?token=${login.token}`);
-    const reload = await studio(ctx, 'GET', `/?token=${login.token}`, { cookie: `turbine_studio_token=${SESSION}` });
+    const ticketGate = createTicketGate();
+    const ctx = demoCtx({ ticketGate });
+    await studio(ctx, 'GET', `/?token=${ticketGate.token}`);
+    const reload = await studio(ctx, 'GET', `/?token=${ticketGate.token}`, {
+      cookie: `turbine_studio_token=${SESSION}`,
+    });
     assert.equal(reload.status, 302);
     assert.equal(reload.headers.Location, '/');
     assert.equal(reload.headers['Set-Cookie'], undefined);
   });
 
   it('the ticket does not authorize the API, as a header or as a cookie', async () => {
-    const login = createLoginGate();
-    const ctx = demoCtx({ login });
+    const ticketGate = createTicketGate();
+    const ctx = demoCtx({ ticketGate });
     const attempts: Record<string, string>[] = [
-      { 'x-turbine-token': login.token },
-      { cookie: `turbine_studio_token=${login.token}` },
+      { 'x-turbine-token': ticketGate.token },
+      { cookie: `turbine_studio_token=${ticketGate.token}` },
     ];
     for (const headers of attempts) {
       const r = await studio(ctx, 'GET', '/api/schema', headers);
@@ -325,16 +327,16 @@ describe('Studio login ticket is single use and is not the session credential', 
   });
 
   it('a HEAD request carrying the ticket does not spend it', async () => {
-    const login = createLoginGate();
-    const ctx = demoCtx({ login });
-    const head = await studio(ctx, 'HEAD', `/?token=${login.token}`);
+    const ticketGate = createTicketGate();
+    const ctx = demoCtx({ ticketGate });
+    const head = await studio(ctx, 'HEAD', `/?token=${ticketGate.token}`);
     assert.equal(head.status, 200, 'served the shell, redeemed nothing');
-    assert.equal(login.used, false);
-    assert.equal((await studio(ctx, 'GET', `/?token=${login.token}`)).status, 302);
+    assert.equal(ticketGate.used, false);
+    assert.equal((await studio(ctx, 'GET', `/?token=${ticketGate.token}`)).status, 302);
   });
 
   it('a wrong token still gets the shell and no cookie, as before', async () => {
-    const ctx = demoCtx({ login: createLoginGate() });
+    const ctx = demoCtx({ ticketGate: createTicketGate() });
     const r = await studio(ctx, 'GET', '/?token=not-it');
     assert.equal(r.status, 200);
     assert.equal(r.headers['Set-Cookie'], undefined);
@@ -740,12 +742,12 @@ describe('Observe: the same Host allowlist and one-time ticket', () => {
   async function observe(
     url: string,
     headers: Record<string, string>,
-    login?: ReturnType<typeof createLoginGate>,
+    ticketGate?: ReturnType<typeof createTicketGate>,
     method = 'GET',
   ): Promise<Recorded> {
     const { res, done } = makeRes();
     const req = request(method, url, { host: `${HOST}:${PORT}`, ...headers });
-    if (login) await observeRequest(req, res, NO_POOL, OBSERVE, TOKEN, new Map(), login);
+    if (ticketGate) await observeRequest(req, res, NO_POOL, OBSERVE, TOKEN, new Map(), ticketGate);
     else await observeRequest(req, res, NO_POOL, OBSERVE, TOKEN, new Map());
     return done;
   }
@@ -763,18 +765,18 @@ describe('Observe: the same Host allowlist and one-time ticket', () => {
   });
 
   it('exchanges the ticket for the session cookie once and not again', async () => {
-    const login = createLoginGate();
-    const first = await observe(`/?token=${login.token}`, {}, login);
+    const ticketGate = createTicketGate();
+    const first = await observe(`/?token=${ticketGate.token}`, {}, ticketGate);
     assert.equal(first.status, 302);
     const cookie = String(first.headers['Set-Cookie']);
     assert.match(cookie, /^turbine_observe_token=/);
-    assert.ok(cookie.includes(TOKEN) && !cookie.includes(login.token));
+    assert.ok(cookie.includes(TOKEN) && !cookie.includes(ticketGate.token));
 
-    const replay = await observe(`/?token=${login.token}`, {}, login);
+    const replay = await observe(`/?token=${ticketGate.token}`, {}, ticketGate);
     assert.equal(replay.status, 403);
     assert.equal(replay.headers['Set-Cookie'], undefined);
 
-    const ticketAsCredential = await observe('/api/latency', { 'x-turbine-token': login.token }, login);
+    const ticketAsCredential = await observe('/api/latency', { 'x-turbine-token': ticketGate.token }, ticketGate);
     assert.equal(ticketAsCredential.status, 401);
   });
 

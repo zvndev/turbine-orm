@@ -9,7 +9,7 @@
  *  - {@link isAllowedHostHeader}: a request whose `Host` names anything but this
  *    server is refused. This is what stops DNS rebinding: a page on an attacker's
  *    domain that re-resolves to 127.0.0.1 still sends `Host: attacker.example`.
- *  - {@link createLoginGate} / {@link redeemLogin}: the URL printed in the
+ *  - {@link createTicketGate} / {@link redeemTicket}: the URL printed in the
  *    terminal carries a ONE-TIME login token, separate from the credential the
  *    session then uses, so a URL that lands in browser history, a process
  *    listing or a log is a spent ticket and not a standing key.
@@ -97,17 +97,17 @@ export function isAllowedHostHeader(header: string | string[] | undefined, bound
 // ---------------------------------------------------------------------------
 
 /** The one-time ticket carried by the URL a server prints. */
-export interface LoginGate {
+export interface TicketGate {
   /** The value in the printed URL's `?token=`. Never a session credential. */
   readonly token: string;
   /** True once a GET carrying the token has been exchanged for a session cookie. */
   used: boolean;
 }
 
-export type LoginOutcome = 'granted' | 'used' | 'invalid';
+export type TicketOutcome = 'granted' | 'used' | 'invalid';
 
 /** Mint a gate. `token` is only passed by a caller that has no separate one to give. */
-export function createLoginGate(token: string = randomBytes(24).toString('hex')): LoginGate {
+export function createTicketGate(token: string = randomBytes(24).toString('hex')): TicketGate {
   return { token, used: false };
 }
 
@@ -115,7 +115,7 @@ export function createLoginGate(token: string = randomBytes(24).toString('hex'))
  * Try to exchange `candidate` for a session. `granted` happens at most once per
  * gate; afterwards the same token reports `used`, which a server must refuse.
  */
-export function redeemLogin(gate: LoginGate, candidate: string): LoginOutcome {
+export function redeemTicket(gate: TicketGate, candidate: string): TicketOutcome {
   if (!constantTimeEqual(candidate, gate.token)) return 'invalid';
   if (gate.used) return 'used';
   gate.used = true;

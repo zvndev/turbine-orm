@@ -14,10 +14,10 @@ import { absorbCheckedOutErrors } from '../connection-guard.js';
 import type { PgCompatPool } from '../pg-types.js';
 import {
   constantTimeEqual,
-  createLoginGate,
+  createTicketGate,
   isAllowedHostHeader,
-  type LoginGate,
-  redeemLogin,
+  redeemTicket,
+  type TicketGate,
 } from './local-server-guard.js';
 import { OBSERVE_HTML } from './observe-ui.js';
 import { callerKey, checkRateLimit } from './rate-limit.js';
@@ -67,11 +67,11 @@ export async function startObserve(options: ObserveOptions): Promise<ObserveServ
   }
 
   const authToken = randomBytes(24).toString('hex');
-  const login = createLoginGate();
+  const ticketGate = createTicketGate();
   const rateLimiter = new Map<string, { count: number; resetAt: number }>();
 
   const server = createServer((req, res) => {
-    handleRequest(req, res, pool, options, authToken, rateLimiter, login).catch((err) => {
+    handleRequest(req, res, pool, options, authToken, rateLimiter, ticketGate).catch((err) => {
       sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
     });
   });
@@ -85,7 +85,7 @@ export async function startObserve(options: ObserveOptions): Promise<ObserveServ
   });
 
   const hostPart = options.host.includes(':') && !options.host.startsWith('[') ? `[${options.host}]` : options.host;
-  const url = `http://${hostPart}:${options.port}/?token=${login.token}`;
+  const url = `http://${hostPart}:${options.port}/?token=${ticketGate.token}`;
 
   if (options.openBrowser) {
     openUrl(url);
@@ -113,7 +113,7 @@ export async function handleRequest(
   authToken: string,
   rateLimiter: Map<string, { count: number; resetAt: number }>,
   /** The one-time login ticket. Absent on a hand-built call: the ticket is then `authToken` itself. */
-  login: LoginGate = gateFor(authToken),
+  ticketGate: TicketGate = gateFor(authToken),
 ): Promise<void> {
   const hostPart = options.host.includes(':') && !options.host.startsWith('[') ? `[${options.host}]` : options.host;
   const expectedOrigin = `http://${hostPart}:${options.port}`;
@@ -143,7 +143,7 @@ export async function handleRequest(
     if (queryToken) {
       // The printed URL's token is a ONE-TIME ticket, exchanged here for the
       // session cookie by the first GET that carries it. HEAD never spends it.
-      const outcome = req.method === 'GET' ? redeemLogin(login, queryToken) : 'invalid';
+      const outcome = req.method === 'GET' ? redeemTicket(ticketGate, queryToken) : 'invalid';
       if (outcome === 'granted') {
         res.writeHead(302, {
           Location: '/',
@@ -218,11 +218,11 @@ function isAuthorized(req: IncomingMessage, expectedToken: string): boolean {
  * The ticket for a caller that passed none (a hand-built dispatch): `authToken`
  * itself, remembered per token so it is still spent exactly once.
  */
-const FALLBACK_GATES = new Map<string, LoginGate>();
-function gateFor(authToken: string): LoginGate {
+const FALLBACK_GATES = new Map<string, TicketGate>();
+function gateFor(authToken: string): TicketGate {
   let gate = FALLBACK_GATES.get(authToken);
   if (!gate) {
-    gate = createLoginGate(authToken);
+    gate = createTicketGate(authToken);
     FALLBACK_GATES.set(authToken, gate);
   }
   return gate;

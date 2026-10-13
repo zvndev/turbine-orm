@@ -67,10 +67,10 @@ import {
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import {
   constantTimeEqual,
-  createLoginGate,
+  createTicketGate,
   isAllowedHostHeader,
-  type LoginGate,
-  redeemLogin,
+  redeemTicket,
+  type TicketGate,
 } from './local-server-guard.js';
 import { assertNoPiiPredicates as assertNoPiiPredicatesShared } from './pii-predicate-guard.js';
 import { applyPiiTags, loadPiiTags } from './pii-tags.js';
@@ -202,7 +202,7 @@ export interface StudioContext {
    * The one-time login ticket behind the printed URL. Absent on a hand-built
    * context, which then gets a gate whose ticket is `authToken` on first use.
    */
-  login?: LoginGate;
+  ticketGate?: TicketGate;
 }
 
 // ---------------------------------------------------------------------------
@@ -330,7 +330,7 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
   }
 
   const authToken = randomBytes(24).toString('hex');
-  const login = createLoginGate();
+  const ticketGate = createTicketGate();
   const stateDir = pathResolve(options.stateDir ?? '.turbine');
   const rateLimiter = new Map<string, { count: number; resetAt: number }>();
   const ctx: StudioContext = {
@@ -338,7 +338,7 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
     metadata,
     options,
     authToken,
-    login,
+    ticketGate,
     stateDir,
     statementTimeout,
     rateLimiter,
@@ -368,7 +368,7 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
     });
   });
 
-  const url = buildStudioUrl(options.host, options.port, login.token);
+  const url = buildStudioUrl(options.host, options.port, ticketGate.token);
 
   if (options.openBrowser) {
     openUrl(url);
@@ -435,9 +435,9 @@ export async function handleRequest(req: IncomingMessage, res: ServerResponse, c
     }
     const queryToken = url.searchParams.get('token');
     if (queryToken) {
-      ctx.login ??= createLoginGate(ctx.authToken);
+      ctx.ticketGate ??= createTicketGate(ctx.authToken);
       // HEAD must not spend the ticket: only the navigation that sets the cookie may.
-      const outcome = req.method === 'GET' ? redeemLogin(ctx.login, queryToken) : 'invalid';
+      const outcome = req.method === 'GET' ? redeemTicket(ctx.ticketGate, queryToken) : 'invalid';
       if (outcome === 'granted') {
         res.writeHead(302, {
           Location: '/',
