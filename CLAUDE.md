@@ -12,11 +12,15 @@ not have to open it before your first write:
   `gh pr create`, wait for `ci-ok`, merge.
 - **Never `--no-verify`. Never `git worktree`. Never force-push `main`.**
 - **The tag publishes, not `npm publish`.** Land the release commit via PR, then
-  `git tag vX.Y.Z && git push origin vX.Y.Z`; `release.yml` runs the gates and
-  publishes with provenance. A local publish is a gated fallback that refuses
-  unless CI is green on HEAD.
-- **Adding a CI job means adding it to `ci-ok`'s `needs:` AND raising the
-  anti-vacuous count to match.** A test asserts the two are equal.
+  `git tag vX.Y.Z && git push origin vX.Y.Z`; `release.yml` refuses a tag that
+  is not on `origin/main`, runs the gates, and publishes the TESTED tarball with
+  provenance and `--ignore-scripts`. A local publish is a gated fallback that
+  refuses unless CI is green on HEAD.
+- **Adding a CI job means adding it to `.github/workflows/gates.yml`, listing
+  it in `gates-ok`'s `needs:` AND raising its anti-vacuous floor to match.** A
+  test asserts the two are equal. `ci.yml` and `release.yml` both call
+  gates.yml, so a tag runs the same matrix as a pull request; `ci-ok` (the
+  required check) needs only `gates`.
 - **A skipped suite is not a passing suite.** `TURBINE_REQUIRE_ENGINE` is set on
   every database job; an unset `DATABASE_URL` otherwise yields "12 tests, 0
   pass, 0 fail, 12 skipped" and exit 0.

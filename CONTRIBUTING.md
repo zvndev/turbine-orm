@@ -83,6 +83,7 @@ src/
     normalize-args.ts, Args-seam undefined pruning and the inclusive-cursor flag
     column-ref.ts    , The branded col() column reference
     json-value.ts    , The jsonValue() wrapper for literal JSON values
+    expr.ts          , Branded update expressions (expr.greatest, expr.case, ...)
     option-surface.ts, The query-arg option surface as runtime data
     warn-registry.ts , Process-wide once-only dev-warn registry
     deferred.ts      , DeferredQuery and option types
