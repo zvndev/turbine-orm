@@ -132,6 +132,7 @@ import {
 } from './errors.js';
 import { applyTableFilters, assertDistinctColumnFields, deriveEngineRelations, nullRecord } from './introspect.js';
 import importOptionalPeer from './optional-peer-import.cjs';
+import { orderByEntries } from './query/filters.js';
 import { availableClause } from './query/utils.js';
 import {
   type ColumnMetadata,
@@ -159,6 +160,18 @@ const MSSQL_MAX_PARAMS = 2098;
 /** Max rows per multi-row INSERT … VALUES statement. */
 const MSSQL_MAX_INSERT_ROWS = 1000;
 
+/** Integer column types narrower than 64 bits, in SQL Server and code-first (PostgreSQL) spellings. */
+const SMALL_INTEGER_TYPES: ReadonlySet<string> = new Set([
+  'tinyint',
+  'smallint',
+  'int',
+  'integer',
+  'int2',
+  'int4',
+  'serial',
+  'smallserial',
+]);
+
 /** Canonical key sort matching the query builder's `sortedEntries`/collect order. */
 function sortedRelEntries<V>(obj: Record<string, V>): [string, V][] {
   return Object.entries(obj).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
@@ -178,6 +191,7 @@ type MssqlParam = null | number | bigint | string | boolean | Date | Uint8Array;
 
 interface MssqlRequest {
   input(name: string, value: unknown): MssqlRequest;
+  input(name: string, type: unknown, value: unknown): MssqlRequest;
   query<R = Record<string, unknown>>(text: string): Promise<MssqlQueryResult<R>>;
   batch<R = Record<string, unknown>>(text: string): Promise<MssqlQueryResult<R>>;
 }
@@ -218,6 +232,9 @@ interface MssqlModule {
   Request: new (parent: MssqlConnectionPool | MssqlTransaction) => MssqlRequest;
   Transaction: new (pool: MssqlConnectionPool) => MssqlTransaction;
   ISOLATION_LEVEL: Record<string, number>;
+  /** SQL types a parameter is declared with when the driver's own inference is wrong for it. */
+  BigInt?: unknown;
+  DateTime2?: (scale?: number) => unknown;
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +313,16 @@ function coerceBigIntColumns(rows: Record<string, unknown>[], columns: MssqlColu
 
 const EMPTY_RESULT = { rows: [] as Record<string, unknown>[], rowCount: 0 };
 
+/** A JSON column's stored text as its value; text that is not JSON is returned as stored. */
+function parseJsonText(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
 /**
  * Augment a `mssql` driver error with the Postgres-shaped `.code` (SQLSTATE) and
  * detail fields that `wrapPgError` understands, so SQL Server constraint failures
@@ -368,14 +395,41 @@ function normalizeQueryArgs(arg: QueryArg, values?: unknown[]): { text: string; 
   return { text: arg.text, params: arg.values ?? values ?? [] };
 }
 
+/**
+ * Bind one parameter. Two value kinds get an explicit SQL type, because the
+ * driver's inference picks the wrong one for them:
+ *
+ *  - A JS `bigint` is declared BIGINT. Inferred, a small one became INT and one
+ *    past 2^53 an NVARCHAR string, and a multi-row `VALUES` list types each
+ *    column by the highest-precedence type across its rows, so a `createMany`
+ *    mixing the two converted the string to INT and failed ("overflowed an int
+ *    column").
+ *  - A `Date` is declared DATETIME2(7). Inferred, it is the legacy DATETIME,
+ *    whose 1/300 s ticks round milliseconds on the way in, so 23:59:59.999 was
+ *    stored as the next day's 00:00:00.000. DATETIME2 holds the exact instant
+ *    and converts to every temporal column type.
+ */
+function bindParam(request: MssqlRequest, name: string, value: unknown, types: MssqlModule | undefined): void {
+  if (typeof value === 'bigint' && types?.BigInt !== undefined) {
+    request.input(name, types.BigInt, value);
+    return;
+  }
+  if (value instanceof Date && !Number.isNaN(value.getTime()) && typeof types?.DateTime2 === 'function') {
+    request.input(name, types.DateTime2(7), value);
+    return;
+  }
+  request.input(name, toMssqlParam(value));
+}
+
 /** Bind positional `params[]` to `@p1`, `@p2`, … inputs and run the statement. */
 async function runRequest(
   request: MssqlRequest,
   text: string,
   params: unknown[],
+  types?: MssqlModule,
 ): Promise<ReturnType<typeof shapeResult>> {
   for (let i = 0; i < params.length; i++) {
-    request.input(`p${i + 1}`, toMssqlParam(params[i]));
+    bindParam(request, `p${i + 1}`, params[i], types);
   }
   try {
     const result = await request.query(text);
@@ -464,7 +518,7 @@ class MssqlTxClient implements PgCompatPoolClient {
     }
 
     const request = new this.sqlNS.Request(this.tx ?? this.pool);
-    return runRequest(request, rawSql, params);
+    return runRequest(request, rawSql, params, this.sqlNS);
   }
 
   release(): void {
@@ -512,7 +566,7 @@ export class MssqlPool implements PgCompatPool {
   // biome-ignore lint/suspicious/noExplicitAny: pg-compat query is generic over the row shape.
   async query(text: QueryArg, values?: unknown[]): Promise<any> {
     const { text: sql, params } = normalizeQueryArgs(text, values);
-    return runRequest(this.pool.request(), sql, params);
+    return runRequest(this.pool.request(), sql, params, this.sqlNS);
   }
 
   async connect(): Promise<PgCompatPoolClient> {
@@ -712,7 +766,9 @@ export const mssqlDialect: Dialect = {
     // returned `1`, i.e. the strategy silently changed the caller's value
     // types. Above 2^53 all three keep the string, which is the point of
     // carrying text at all.
-    if (t === 'bigint') {
+    // `int8` is the spelling a code-first (`defineSchema`) schema records for
+    // the same BIGINT column, so it needs the same rule.
+    if (t === 'bigint' || t === 'int8') {
       return {
         sql: (ref) => `CAST(${ref} AS NVARCHAR(50))`,
         decode: (value) => {
@@ -730,7 +786,8 @@ export const mssqlDialect: Dialect = {
     // nvarchar cell as a JSON *string* (only `buildRelationSubquery`'s nested
     // relations are JSON_QUERY-wrapped, never a scalar column), so parsing the
     // row hands back exactly the string the driver returns for a top-level
-    // read. Both routes already agree, and casting would only add noise. This
+    // read. Both routes already agree, and casting would only add noise; the
+    // text is parsed for both by `decodeColumnValue` in the row parser. This
     // is the divergence MySQL DOES have, where JSON_OBJECT embeds a real JSON
     // column as a nested value while the driver hands back text.
     //
@@ -746,8 +803,29 @@ export const mssqlDialect: Dialect = {
     return undefined;
   },
 
+  // A json/jsonb column is NVARCHAR(MAX) here, so the driver hands back the
+  // document's text, and FOR JSON PATH embeds that text as a JSON string, which
+  // the relation parser turns back into the same text. Parsing it once in the
+  // row parser gives both paths the value PostgreSQL returns.
+  decodeColumnValue(columnType: string): ((value: unknown) => unknown) | undefined {
+    const t = columnType.toLowerCase();
+    return t === 'json' || t === 'jsonb' ? parseJsonText : undefined;
+  },
+
   castAggregate(expr: string, target: 'int' | 'float'): string {
     return `CAST(${expr} AS ${target === 'int' ? 'INT' : 'FLOAT'})`;
+  },
+
+  // AVG over an integer column is an integer here (56.4 came back 56), and
+  // casting the RESULT cannot recover the fraction. Widen the input instead:
+  // FLOAT for the narrow integers, the PostgreSQL `avg` value in double
+  // precision; DECIMAL for BIGINT, which keeps an exact average (AVG of
+  // DECIMAL(38,0) is DECIMAL(38,6)) where FLOAT would round past 2^53.
+  averageArgument(columnRef: string, columnType: string): string | undefined {
+    const t = columnType.toLowerCase();
+    if (t === 'bigint' || t === 'int8' || t === 'bigserial') return `CAST(${columnRef} AS DECIMAL(38, 0))`;
+    if (SMALL_INTEGER_TYPES.has(t)) return `CAST(${columnRef} AS FLOAT)`;
+    return undefined;
   },
 
   // No array params. OPENJSON expands a single JSON-array param into a row set,
@@ -1133,8 +1211,11 @@ function buildForJsonSubquery(dialect: Dialect, ctx: RelationSubqueryContext): s
   const qTarget = q(targetTable);
   const qParent = q(parentRef);
 
+  // `orderByEntries` flattens the array form (`[{ views: 'desc' }, { id: 'asc' }]`)
+  // into the same entry list as the object form, as the core relation builder
+  // does; `Object.entries` read an array's indexes as field names.
   const orderEntries =
-    spec !== true && spec.orderBy ? Object.entries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
+    spec !== true && spec.orderBy ? orderByEntries(spec.orderBy).filter(([, dir]) => dir !== undefined) : [];
   const hasOrder = orderEntries.length > 0;
   const hasLimit = spec !== true && spec.limit !== undefined;
   // `skip` arrives folded into `offset` (the args seam does that, and refuses

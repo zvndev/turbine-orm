@@ -772,9 +772,11 @@ export function buildHavingClauses<T extends object>(
       quotedCol ??= qi.q(qi.toColumn(key));
       return quotedCol;
     };
+    const plainAggregate = (agg: { fn: string }): string =>
+      agg.fn === 'AVG' ? avgCall(qi, qi.toColumn(key)) : `${agg.fn}(${columnExpr()})`;
 
     for (const agg of aggEntries) {
-      const expr = jsonAggExprs?.get(`${key}:${agg.key}`) ?? `${agg.fn}(${columnExpr()})`;
+      const expr = jsonAggExprs?.get(`${key}:${agg.key}`) ?? plainAggregate(agg);
       clauses.push(...buildHavingNumericClauses(qi, expr, agg.filter, params));
     }
   }
@@ -1080,8 +1082,19 @@ function isExactNumericType(pgType: string): boolean {
 
 /** `AVG(col)`, float-cast unless the source column is exact (see {@link isExactNumericType}). */
 function plainAvgExpr(qi: BuilderCtx, col: string): string {
-  const inner = `AVG(${qi.q(col)})`;
+  const inner = avgCall(qi, col);
   return isExactNumericType(whereMod.getColumnPgType(qi, col)) ? inner : qi.castAgg(inner, 'float');
+}
+
+/**
+ * `AVG(col)` over a plain column, with the input widened where the engine
+ * would otherwise average an integer column as an integer (see
+ * {@link Dialect.averageArgument}). Shared by SELECT and HAVING, so a filter
+ * on `_avg` compares the same value the result reports.
+ */
+function avgCall(qi: BuilderCtx, col: string): string {
+  const ref = qi.q(col);
+  return `AVG(${qi.dialect.averageArgument?.(ref, whereMod.getColumnPgType(qi, col)) ?? ref})`;
 }
 
 /**

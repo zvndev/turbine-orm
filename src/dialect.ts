@@ -769,6 +769,20 @@ export interface Dialect {
    */
   jsonWireRule?(columnType: string): JsonWireRule | undefined;
 
+  /**
+   * How a value the driver hands back for a column of `columnType` (a schema
+   * type, e.g. `jsonb`) becomes the value PostgreSQL returns for it, or
+   * `undefined` when the driver's value already is that. The row parser applies
+   * it to top-level and nested rows alike, so the two cannot disagree.
+   *
+   * For an engine whose STORAGE differs from the declared type in a way only
+   * the schema knows: SQL Server has no JSON column type (2016 to 2022), so a
+   * json/jsonb column is NVARCHAR text on every read path. The decode must be
+   * safe to apply to exactly what the driver and the engine's JSON builder
+   * produce, once. Optional, and absent on PostgreSQL.
+   */
+  decodeColumnValue?(columnType: string): ((value: unknown) => unknown) | undefined;
+
   /** Optional type mapping hook for code generation/introspection. */
   typeToTypeScript?(dialectType: string, nullable: boolean): string;
 
@@ -781,6 +795,17 @@ export interface Dialect {
    * this hook keep emitting byte-identical SQL.
    */
   castAggregate?(expr: string, target: 'int' | 'float'): string;
+
+  /**
+   * The argument `AVG` takes for a column of `columnType`, given the column
+   * reference, or `undefined` to average the column as it is. PostgreSQL's
+   * `avg` over an integer column is an exact fraction (`avg(int4)` is
+   * `numeric`), while SQL Server averages an INT as an INT (56.4 becomes 56)
+   * and MySQL as a DECIMAL with four more digits of scale (4/3 becomes
+   * 1.3333). An engine like that widens the input instead. Optional, and
+   * absent on PostgreSQL, so its SQL is unchanged.
+   */
+  averageArgument?(columnRef: string, columnType: string): string | undefined;
 
   /**
    * Build a membership (`IN` / `NOT IN`) predicate from a column/expression and

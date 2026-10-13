@@ -528,6 +528,19 @@ export function mysqlTypeToTs(dialectType: string, nullable: boolean, columnType
  */
 const MYSQL_BOOLEAN_TYPE = 'tinyint(1)';
 
+/** Integer column types narrower than 64 bits, in MySQL and code-first (PostgreSQL) spellings. */
+const SMALL_INTEGER_TYPES: ReadonlySet<string> = new Set([
+  'tinyint',
+  'smallint',
+  'mediumint',
+  'int',
+  'integer',
+  'int2',
+  'int4',
+  'serial',
+  'smallserial',
+]);
+
 /**
  * Rewrite every boolean column's recorded dialect type to
  * {@link MYSQL_BOOLEAN_TYPE}, returning a schema that is safe to key
@@ -729,7 +742,9 @@ export const mysqlDialect: Dialect = {
     // came back 9007199254740992, and DECIMAL '1000.50' came back 1000.5.
     // mysql2 hands both back as STRINGS at top level (supportBigNumbers, and
     // DECIMAL is always a string), so carry the text and keep it.
-    if (t === 'bigint') {
+    // `int8` is the spelling a code-first (`defineSchema`) schema records for
+    // the same BIGINT column, so it needs the same rule.
+    if (t === 'bigint' || t === 'int8') {
       return {
         sql: (ref) => `CAST(${ref} AS CHAR)`,
         decode: (value) => {
@@ -785,9 +800,9 @@ export const mysqlDialect: Dialect = {
     // parsed value. It is also what `pg` returns for json/jsonb, so this is
     // Postgres parity rather than a MySQL convention.
     //
-    // Contrast SQLite and SQL Server, which return TEXT for the same schema:
-    // neither has a JSON column type, so the value there really is a string in
-    // a text column and there is nothing to parse it back from.
+    // Contrast SQLite, which has no JSON column type and stores the document as
+    // text: its driver shim parses the text back for a column the schema
+    // declares json/jsonb, and its own rule does the same through a join.
 
     // Binary columns are worse than lossy: JSON_OBJECT emits MySQL's internal
     // `base64:type15:…` marker string, so the caller got that text instead of
@@ -804,6 +819,15 @@ export const mysqlDialect: Dialect = {
 
   castAggregate(expr: string, target: 'int' | 'float'): string {
     return `CAST(${expr} AS ${target === 'int' ? 'SIGNED' : 'DECIMAL(65,30)'})`;
+  },
+
+  // AVG over an integer column is a DECIMAL with only four more digits of
+  // scale (div_precision_increment), so 4/3 came back 1.3333 where PostgreSQL
+  // returns 1.3333333333333333. Adding a DOUBLE zero averages in DOUBLE (the
+  // `CAST(... AS DOUBLE)` spelling needs 8.0.17; the engine floor is 8.0.0).
+  // BIGINT keeps its exact DECIMAL average, like PostgreSQL's numeric one.
+  averageArgument(columnRef: string, columnType: string): string | undefined {
+    return SMALL_INTEGER_TYPES.has(columnType.toLowerCase()) ? `(${columnRef} + 0E0)` : undefined;
   },
 
   // MySQL has no bare OFFSET: the grammar requires a LIMIT for OFFSET to
