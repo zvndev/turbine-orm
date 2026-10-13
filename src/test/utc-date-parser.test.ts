@@ -193,7 +193,8 @@ describe('date (OID 1082) read parser', () => {
 
   it('the scalar and array timestamp parsers agree', () => {
     const arr = createPgArrayParser(parseUtcTimestampText)('{"2026-07-21 09:30:00"}');
-    assert.equal((arr?.[0] as Date).toISOString(), parseUtcTimestampText('2026-07-21 09:30:00').toISOString());
+    assert.ok(arr, 'the array parser returned null');
+    assert.equal((arr[0] as Date).toISOString(), parseUtcTimestampText('2026-07-21 09:30:00').toISOString());
   });
 });
 

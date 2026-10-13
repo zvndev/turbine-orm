@@ -39,7 +39,7 @@ import {
   withStartupSetting,
 } from './connection-url.js';
 import { type DiagnosticsConfig, type ResolvedDiagnostics, resolveDiagnostics } from './diagnostics.js';
-import { type Dialect, postgresDialect } from './dialect.js';
+import { assertDialectCapabilities, type Dialect, postgresDialect } from './dialect.js';
 import {
   ConnectionError,
   type ErrorMessageMode,
@@ -103,6 +103,7 @@ import {
 } from './realtime.js';
 import type { SchemaMetadata, TableMetadata } from './schema.js';
 import { parseInt8, rawClientOf, typedQueryPool } from './supplied-pool-types.js';
+import { registerTransactionClient } from './transaction-client-slot.js';
 import {
   commitTransaction,
   rolledBackError,
@@ -1470,21 +1471,6 @@ function resolveNonNegativeInteger(value: unknown, name: string, unit: string): 
 }
 
 /**
- * Refuse a dialect with no `capabilities` object (E003): every code path asks
- * it what the engine can do, so a hand-built dialect without one would fail on
- * its first query with a TypeError instead of here.
- */
-function assertDialectCapabilities(dialect: Dialect): void {
-  const capabilities = (dialect as { capabilities?: unknown }).capabilities;
-  if (typeof capabilities === 'object' && capabilities !== null) return;
-  throw new ValidationError(
-    `The dialect "${String(dialect.name)}" has no \`capabilities\` object, which says what the engine can do. ` +
-      'Build it from an engine dialect (`{ ...postgresDialect, name, capabilities: { ... } }`) and state every ' +
-      'EngineCapabilities key.',
-  );
-}
-
-/**
  * The statement that opens a transaction, read-only when asked. PostgreSQL and
  * MySQL both accept `READ ONLY` after their own BEGIN form (`BEGIN [ISOLATION
  * LEVEL x] READ ONLY`, `[SET TRANSACTION ISOLATION LEVEL x; ]START TRANSACTION
@@ -2018,6 +2004,11 @@ export class TransactionClient {
     return txPool as unknown as PgCompatPool;
   }
 }
+
+// query/builder.ts opens an implicit transaction with this class but sits
+// below this module in the import graph, so the class is handed over here,
+// once, when this module is evaluated (see transaction-client-slot.ts).
+registerTransactionClient(TransactionClient);
 
 /**
  * Give each multi-statement write on a transaction-scoped accessor its own

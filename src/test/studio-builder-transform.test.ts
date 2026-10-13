@@ -251,7 +251,7 @@ describe('Studio builder: rows are entity rows', () => {
     const json = r.json as BuilderResponse;
     const withPosts = json.rows.find((row) => Array.isArray(row.posts) && (row.posts as unknown[]).length > 0);
     assert.ok(withPosts, 'at least one user has a parsed posts array');
-    const firstPost = (withPosts?.posts as Array<Record<string, unknown>>)[0] as Record<string, unknown>;
+    const firstPost = (withPosts.posts as Array<Record<string, unknown>>)[0] as Record<string, unknown>;
     assert.equal(typeof firstPost.title, 'string');
     assert.ok('createdAt' in firstPost, 'nested rows are field-keyed too');
   });

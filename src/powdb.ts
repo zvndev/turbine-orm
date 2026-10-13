@@ -90,6 +90,7 @@ import {
   quotePowqlIdent,
   requireCapability,
 } from './powdb-shared.js';
+import { PowqlInterface } from './powql.js';
 import type { QueryInterfaceOptions } from './query/index.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
 import { type ColumnMetadata, type IndexMetadata, normalizeKeyColumns, type SchemaMetadata } from './schema.js';
@@ -2581,8 +2582,6 @@ export async function turbinePowDB(
 
   let client: TurbineClient;
   try {
-    // The PowQL generator is loaded here to keep client.ts free of any PowDB import.
-    const { PowqlInterface } = await import('./powql.js');
     const queryInterfaceFactory: NonNullable<QueryInterfaceOptions['queryInterfaceFactory']> = (
       p,
       table,

@@ -576,7 +576,7 @@ Such keys used to be ignored, which silently changed the DDL: a misspelt `defaul
 
 `Dialect.capabilities` is a new required field: an `EngineCapabilities` object with 33 keys that says what the engine can do. Does it have `DISTINCT ON`? Where does NULL sort? How many bind parameters does one statement take? Does a failed statement abort the transaction? Turbine used to answer these by comparing `dialect.name`. Only code that builds a `Dialect` by hand is affected. The five shipped engines are unchanged.
 
-- **A dialect with no `capabilities`** no longer type-checks, and a `TurbineClient` built with one throws `TURBINE_E003` at construction. At runtime Turbine checks only that `capabilities` is an object. TypeScript is what requires every key.
+- **A dialect with no `capabilities`** no longer type-checks, and `TurbineClient`, `QueryInterface`, `schemaToSQL` and `introspect` throw `TURBINE_E003` for one (since 0.90.1; before that only `TurbineClient` checked, and the others threw a `TypeError`). At runtime Turbine checks only that `capabilities` is an object. TypeScript is what requires every key.
 - **A dialect spread from `postgresDialect` for an engine that is not PostgreSQL** now inherits PostgreSQL's answers, because the spread copies `capabilities`. Before, a name other than `postgresql` got the non-PostgreSQL answer for about sixty decisions. A wrong `true` is a broken query at runtime, so state your own values.
 - **A dialect spread from an engine dialect under a new name keeps that engine's behavior.** A PostgreSQL-compatible dialect under its own name used to lose `DISTINCT ON`, the positional JSON encoding, enum casts, `READ ONLY` transactions, server-side cancel and the raw-SQL transaction-control check. It now keeps them.
 

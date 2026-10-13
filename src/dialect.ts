@@ -408,10 +408,11 @@ export interface RelationSubqueryContext {
  * refuses an engine whose `capabilities` is inherited or shared.
  *
  * Code asks these questions instead of testing `dialect.name`; a source scan
- * (src/test/capabilities-guard.test.ts) refuses a new engine-name comparison
- * outside a short, commented allowlist. Rendering differences are not
- * capabilities: they belong in the dialect's hooks (a few still switch on the
- * name, allowlisted, until engines stop spreading `postgresDialect`).
+ * (src/test/capabilities-guard.test.ts) refuses a new engine-name test, of any
+ * shape, outside a short, commented allowlist that pins each site it exempts.
+ * Rendering differences are not capabilities: they belong in the dialect's
+ * hooks (a few still switch on the name, allowlisted, until engines stop
+ * spreading `postgresDialect`).
  */
 export interface EngineCapabilities {
   // ---- Query shape ------------------------------------------------------
@@ -646,6 +647,25 @@ export interface EngineCapabilities {
    * column is declared with a bounded type there.
    */
   readonly unboundedTextKeys: boolean;
+}
+
+/**
+ * Refuse a dialect with no `capabilities` object (E003). Every path that builds
+ * SQL asks it what the engine can do, so a hand-built dialect written before
+ * the object existed would otherwise fail on first use with a TypeError
+ * ("cannot read properties of undefined"). Every public entry point that takes
+ * a dialect calls this (`TurbineClient`, `QueryInterface`, `schemaToSQL`,
+ * `introspect`), so the refusal and its words are the same whichever one a
+ * caller reaches first. One `typeof`: `QueryInterface` is built per table.
+ */
+export function assertDialectCapabilities(dialect: Dialect): void {
+  const capabilities = (dialect as { capabilities?: unknown }).capabilities;
+  if (typeof capabilities === 'object' && capabilities !== null) return;
+  throw new ValidationError(
+    `The dialect "${String(dialect.name)}" has no \`capabilities\` object, which says what the engine can do. ` +
+      'Build it from an engine dialect (`{ ...postgresDialect, name, capabilities: { ... } }`) and state every ' +
+      'EngineCapabilities key.',
+  );
 }
 
 export interface Dialect {

@@ -2,11 +2,21 @@ name: Release
 
 # Publish turbine-orm to npm when a `v*` tag is pushed.
 #
-# Setup (one-time):
-#   1. Generate an npm automation token (Settings → Access Tokens → Generate New → Automation)
-#      https://docs.npmjs.com/creating-and-viewing-access-tokens
-#   2. Add it to this repo as a secret named NPM_TOKEN
-#      (Settings → Secrets and variables → Actions → New repository secret)
+# Authentication: npm trusted publishing (OIDC) first, the NPM_TOKEN secret
+# second. npm 11.5.1+ asks GitHub for an OIDC identity token and exchanges it
+# for a one-shot publish credential when the package has a trusted publisher
+# for this repository, this workflow file and the `release` environment:
+#   npm trust github turbine-orm --file release.yml --repo zvndev/turbine-orm \
+#     --env release --allow-publish --yes
+# Until that exists the exchange fails quietly and npm falls back to the token.
+# npm allows ONE trusted publisher per package, and it is this workflow's, so
+# nightly.yml's @next publish keeps using NPM_TOKEN: the secret stays for as
+# long as @next is published.
+#
+# The publish job runs in the `release` environment, which only a `v*` tag or
+# `main` may deploy to (Settings → Environments → release). That includes a
+# dry run: dispatched from any other branch, the publish job is refused before
+# it starts.
 #
 # Usage (docs/WORKFLOW.md, section 2): land the release commit on main through
 # a PR, then tag it. `main` is PR-only, so `npm version` + `git push
@@ -65,7 +75,8 @@ concurrency:
 jobs:
   # Refuses before any gate runs, so a tag on an unmerged commit fails in a
   # minute rather than after the full gate matrix. A dry run only warns, since
-  # it publishes nothing.
+  # it publishes nothing (and its publish job runs only from `main` or a `v*`
+  # tag, the refs the `release` environment admits).
   tag-ancestry:
     timeout-minutes: 5
     runs-on: ubuntu-latest
@@ -100,6 +111,10 @@ jobs:
     permissions:
       contents: write
       id-token: write
+    # Deployment rules on the environment admit only a `v*` tag or `main`, and
+    # the npm trusted publisher names this environment, so no other job or ref
+    # can mint a publish credential.
+    environment: release
     # No lifecycle script runs in this job. The tarball was built and checked by
     # the gates; publishing it must not run prepublishOnly or prepack again,
     # which would need the dev tree and could change what is uploaded.
@@ -108,14 +123,30 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      # No `registry-url`: it writes an .npmrc token line that reads
+      # NODE_AUTH_TOKEN, and every npm command in the job then errors when that
+      # is unset. The publish step writes its own token line, and only when the
+      # secret exists.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
-          registry-url: 'https://registry.npmjs.org'
           cache: npm
 
       - name: Install dependencies
         run: npm ci
+
+      # Trusted publishing needs npm 11.5.1 or later and Node 22 ships npm 10.
+      # Installed before the staging step, so the npm that proves its repack
+      # equals the tested tarball is the npm that publishes. npm 10 and 11.20.0
+      # repack the 0.90.0 tarball to the same integrity.
+      - name: Use npm 11.20.0
+        run: |
+          npm install -g npm@11.20.0 --no-audit --no-fund
+          V=$(npm --version)
+          if [ "$V" != "11.20.0" ]; then
+            echo "::error::npm is $V after installing 11.20.0"
+            exit 1
+          fi
 
       - name: Resolve version and ensure tag exists
         run: |
@@ -213,9 +244,24 @@ jobs:
         id: publish
         if: ${{ github.event.inputs.dry_run != 'true' && steps.published.outputs.already != 'true' }}
         working-directory: ${{ runner.temp }}/release-package/package
-        run: npm publish --provenance --access public
+        # npm tries trusted publishing before any token, so the token config is
+        # only a fallback. The .npmrc line names the variable, never its value,
+        # so the secret is not written to disk. The verbose log is read back to
+        # say which credential published.
+        run: |
+          set -euo pipefail
+          if [ -n "${NPM_TOKEN:-}" ]; then
+            printf '//registry.npmjs.org/:_authToken=${NPM_TOKEN}\n' > "$RUNNER_TEMP/publish.npmrc"
+            export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/publish.npmrc"
+          fi
+          npm publish --provenance --access public --loglevel verbose 2>&1 | tee "$RUNNER_TEMP/publish.log"
+          if grep -q 'oidc Successfully retrieved and set token' "$RUNNER_TEMP/publish.log"; then
+            echo "::notice::Published with npm trusted publishing (OIDC)."
+          else
+            echo "::warning::Published with the NPM_TOKEN secret. Trusted publishing is not configured for this workflow yet."
+          fi
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       # Install the just-published version from the public registry in a clean
       # temp project and verify the package surface (ESM import, CJS require,
@@ -223,10 +269,6 @@ jobs:
       # so retry the install for up to ~2 minutes before failing.
       - name: Post-publish smoke test
         if: ${{ github.event.inputs.dry_run != 'true' && steps.published.outputs.already != 'true' }}
-        env:
-          # setup-node's .npmrc references NODE_AUTH_TOKEN; npm errors on any
-          # command if it's undefined, so keep it set for this step too.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           PKG_VERSION=$(jq -r .version package.json)
           SMOKE_DIR=$(mktemp -d)

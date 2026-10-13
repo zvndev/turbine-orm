@@ -95,7 +95,6 @@ import {
 import { exprNotAllowedMessage, isSqlExpr } from './query/expr.js';
 import {
   ARRAY_OPERATOR_KEYS,
-  assertJsonNotOperand,
   assertOperatorOperands,
   cursorFieldValue,
   dedupeColumnList,
@@ -195,6 +194,7 @@ import {
   snakeToCamel,
   type TableMetadata,
 } from './schema.js';
+import { transactionClientFor } from './transaction-client-slot.js';
 
 /**
  * Max parent keys per relation-loader `in (…)` query. A `with` over a large
@@ -1341,15 +1341,15 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     // The SQL engines' operand rules and messages, so the engines agree on
     // which operator objects are valid; one naming no comparison
     // (`{ mode: 'insensitive' }`) is refused instead of compiling to nothing.
-    const operand = {
+    // JSON columns included, as on the SQL engines: skipping them let a
+    // mode-only filter fall through to the constant-false fallback below, which
+    // `NOT` turned into every non-null row (a deleteMany wrote all of them).
+    // The same call refuses a JSON `not` object made only of filter operators.
+    assertOperatorOperands(op, {
       column: colMeta.name,
       table: this.table,
       kind: operandColumnKind(this.meta.pgTypes[colMeta.name]),
-    };
-    if (!isJsonColumn(colMeta, this.schema.enums)) assertOperatorOperands(op, operand);
-    // On a JSON column a `not` object made only of filter operators is refused,
-    // as on the SQL engines (one spelling, one meaning on every engine).
-    else assertJsonNotOperand(op.not, operand);
+    });
     const insensitive = op.mode === 'insensitive';
     const lhs = insensitive ? `lower(${ref})` : ref;
     const labels = this.enumLabels(colMeta);
@@ -1436,7 +1436,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
           throw new ValidationError(`Unsupported operator "${opName}" on PowDB.`);
       }
     }
-    return conds.length > 1 ? `(${conds.join(' and ')})` : (conds[0] ?? this.alwaysFalse());
+    // assertOperatorOperands refuses an operator object that names no
+    // comparison, and every comparison above pushes a condition or throws, so
+    // an empty list is a generator bug. It must not become a constant: under
+    // `NOT` a constant false is every row, and a mutation would write them.
+    if (!conds.length) {
+      throw new InvariantError('powql-filter-empty', `the filter on "${field}" compiled to no condition.`);
+    }
+    return conds.length > 1 ? `(${conds.join(' and ')})` : conds[0]!;
   }
 
   /**
@@ -1637,7 +1644,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    * `gt` / `gte` / `lt` / `lte` compile to `in` over the labels on that side of
    * the operand in DECLARATION order, which is what PostgreSQL compares; the
    * text comparison PowDB would run is alphabetical, a different answer. A null
-   * operand matches no row, as `col > NULL` does. Case-insensitive matching and
+   * operand is refused before this (assertOperatorOperands, as on the SQL
+   * engines) and again by {@link assertEnumLabel}: compiled to a constant false,
+   * `NOT` would turn it into every row. Case-insensitive matching and
    * `contains` / `startsWith` / `endsWith` are E003: PostgreSQL has no `lower`
    * or `LIKE` on an enum (42883).
    */
@@ -1657,7 +1666,6 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       );
     }
     if (opName !== 'gt' && opName !== 'gte' && opName !== 'lt' && opName !== 'lte') return undefined;
-    if (opVal === null) return this.alwaysFalse();
     this.assertEnumLabel(col, labels, opVal);
     const at = labels.indexOf(opVal as string);
     const side = labels.filter((_, i) =>
@@ -4799,6 +4807,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     // Route tx keywords through the dialect (like the SQL path) so this never
     // drifts from `powdbDialect`; falls back to the literal lowercase keywords.
     const d = this.options.dialect;
+    // Read before the checkout, so an empty slot (client.ts never loaded in this
+    // copy of the package) refuses with no connection taken and no `begin` sent.
+    const TransactionClient = transactionClientFor(`A nested write or lookup-first upsert on "${this.table}"`);
     const client = await this.pool.connect();
     // A no-op today (PowDB checkouts have no event surface), kept so this path
     // cannot become the one unguarded checkout if a transport ever emits 'error'.
@@ -4807,7 +4818,6 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     try {
       await client.query(d?.beginStatement?.() ?? 'begin');
       began = true;
-      const { TransactionClient } = await import('./client.js');
       const tx = new TransactionClient(
         client as unknown as never,
         this.schema,

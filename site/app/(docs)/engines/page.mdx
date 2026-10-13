@@ -210,6 +210,11 @@ const db = await turbineMssql('mssql://sa:Passw0rd!@localhost:1433/app', SCHEMA)
 
 ## PowDB
 
+<Callout type="note" title="Maintenance mode">
+  Since 0.90.1 the PowDB engine receives bug and data-safety fixes only, no new
+  features. See the [stability policy](https://github.com/zvndev/turbine-orm/blob/main/STABILITY.md).
+</Callout>
+
 [PowDB](https://github.com/zvndev/powdb) is a single-node embedded database with its **own query language, PowQL**. It is *not* SQL. Turbine talks to it through a parallel PowQL generator with the same `findMany` / `with` / `where` / `create` / `aggregate` surface, so application code is unchanged; only the import and the connection target differ.
 
 PowDB runs **both ways from the same data**:

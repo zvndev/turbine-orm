@@ -9,7 +9,7 @@
  */
 
 import pg from '#pg';
-import { type Dialect, postgresDialect } from './dialect.js';
+import { assertDialectCapabilities, type Dialect, postgresDialect } from './dialect.js';
 import { ValidationError } from './errors.js';
 import { consoleLogger, logTo, type TurbineLogger } from './logger.js';
 import {
@@ -576,6 +576,7 @@ export function assertSafeCatalogSchema(schema: SchemaMetadata): void {
  */
 export async function introspect(options: IntrospectOptions): Promise<SchemaMetadata> {
   const dialect = options.dialect ?? postgresDialect;
+  assertDialectCapabilities(dialect);
   const introspector = dialect.introspector;
   const schema = introspector
     ? await introspector.introspect(options)

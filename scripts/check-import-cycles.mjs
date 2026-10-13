@@ -2,8 +2,11 @@
 /**
  * Guard, in two passes:
  *
- *   1. No static value import of client.ts from src/query/** or src/cli/**.
- *      One named rule about one file, documented in full below.
+ *   1. No value import of client.ts from src/query/** or src/cli/**, static
+ *      or dynamic. One named rule about one file, documented in full below.
+ *      Beside it, no DYNAMIC value import of any of the package's own modules
+ *      from library code (src/ minus src/test/** and src/cli/**), for the size
+ *      reason given under "Forbidden" below.
  *   2. No runtime import cycle anywhere under src/ (excluding src/test/**),
  *      found by Tarjan SCC over the whole value-edge graph. Pass 1 is a rule
  *      and cannot see a cycle it was not told about; pass 2 is the detector.
@@ -25,11 +28,21 @@
  *
  *   - `import type { X } from '../client.js'`: erased at compile time, no
  *     runtime edge, no cycle. This is how cli/studio.ts consumes PgCompatPool.
- *   - Dynamic `await import('../client.js')`: a deliberate lazy edge, resolved
- *     at call time when both modules are fully initialized. The one sanctioned
- *     site is in query/builder.ts (interactive transactions need
- *     TransactionClient), noted in CLAUDE.md.
- *   - Type-position `import('../client.js').X` inside a cast: type-only.
+ *   - Type-position `import('../client.js').X` inside a cast, and
+ *     `typeof import('../client.js')`: type-only.
+ *
+ * When a module here genuinely needs a runtime value from client.ts, client.ts
+ * hands it over instead: it registers the value with a leaf module when it is
+ * evaluated (src/transaction-client-slot.ts is the pattern, and how
+ * query/builder.ts gets TransactionClient for an implicit transaction).
+ *
+ * Forbidden, besides the static forms below: a DYNAMIC value import,
+ * `await import('../client.js')` or `import('../client.js').then(...)`. It
+ * used to be the sanctioned escape hatch (query/builder.ts had one until the
+ * registration slot replaced it), and it is not a cycle at runtime, but a
+ * bundler that does not split code inlines the target and wraps client.ts and
+ * its whole static graph in lazy-init closures to keep its evaluation lazy:
+ * about 1 kB brotli on every entry, for a module that is always already loaded.
  *
  * Forbidden: `import { X } from`, `import X from`, `export ... from`, bare
  * `import '../client.js'` (a side-effect import IS a runtime edge, and
@@ -82,6 +95,13 @@ const staticEdgeRe = /(?:^|\n)[ \t]*((?:import|export)\b[^;'"]*?)\bfrom\s*['"]([
 // trigger client.ts's process-global registrations. Still a runtime edge.
 const bareImportRe = /(?:^|\n)[ \t]*import\s*['"]([^'"]+)['"]/g;
 const requireRe = /\brequire\(\s*['"]([^'"]+)['"]\s*\)/g;
+// Any `import('...')` call, with what precedes and follows it, so the type
+// positions can be told apart from a value import: `typeof import(...)` and
+// `import(...).Member` (a type reference, as in a cast) are type-only, while
+// `await import(...)`, `import(...).then(...)` and a bare `import(...)` load
+// the module at run time.
+const dynamicImportRe = /(\btypeof\s+)?\bimport\(\s*['"]([^'"]+)['"]\s*\)(\s*\.\s*([A-Za-z_$][\w$]*))?/g;
+const PROMISE_MEMBERS = new Set(['then', 'catch', 'finally']);
 
 function findViolations(file, source) {
   const violations = [];
@@ -99,6 +119,12 @@ function findViolations(file, source) {
   for (const [, spec] of source.matchAll(requireRe)) {
     if (!resolvesToClient(file, spec)) continue;
     violations.push({ file, statement: `require('${spec}')` });
+  }
+  for (const [, typeofPrefix, spec, , member] of source.matchAll(dynamicImportRe)) {
+    if (!resolvesToClient(file, spec)) continue;
+    if (typeofPrefix) continue;
+    if (member !== undefined && !PROMISE_MEMBERS.has(member)) continue;
+    violations.push({ file, statement: `import('${spec}')${member ? `.${member}(...)` : ''} (dynamic)` });
   }
   return violations;
 }
@@ -120,6 +146,9 @@ function findViolations(file, source) {
       "export * from '../client.js';",
       "import '../client.js';",
       "const c = require('../client.js');",
+      "const { TransactionClient } = await import('../client.js');",
+      "const lazy = import('../client.js').then((m) => m.TransactionClient);",
+      "const m = await import(\n  '../client.js'\n);",
     ].join('\n')
   );
   const good = findViolations(
@@ -127,16 +156,18 @@ function findViolations(file, source) {
     [
       "import type { PgCompatPool } from '../client.js';",
       "export type { PgCompatPool } from '../client.js';",
-      "const { TransactionClient } = await import('../client.js');",
       "type X = import('../client.js').PgCompatPoolClient;",
+      "const c = pool as unknown as import('../client.js').PgCompatPoolClient;",
+      "type M = typeof import('../client.js');",
+      "const n = await import('../not-client.js');",
       "import { quoteIdent } from './utils.js';",
       "import { something } from '../not-client.js';",
       "import './not-client.js';",
     ].join('\n')
   );
-  if (bad.length !== 8 || good.length !== 0) {
+  if (bad.length !== 11 || good.length !== 0) {
     console.error(
-      `check-import-cycles: matcher self-test failed (expected 8 violations and 0 false positives, got ${bad.length} and ${good.length}); the guard cannot be trusted, refusing to pass`
+      `check-import-cycles: matcher self-test failed (expected 11 violations and 0 false positives, got ${bad.length} and ${good.length}); the guard cannot be trusted, refusing to pass`
     );
     process.exit(1);
   }
@@ -157,17 +188,84 @@ if (scanned === 0) {
 }
 
 if (violations.length > 0) {
-  console.error('Static value import of client.ts from a module that must not depend on it:');
+  console.error('Value import of client.ts from a module that must not depend on it:');
   for (const v of violations) {
     console.error(`  ${relative(repoRoot, v.file)}: ${v.statement}`);
   }
   console.error(
-    '\nclient.ts imports query/, so this edge is a cycle. Use `import type` for types, or a dynamic `await import(...)` if a runtime value is genuinely needed (see the sanctioned site in query/builder.ts).'
+    '\nclient.ts imports query/, so a static edge is a cycle. Use `import type` for types. If a runtime value is genuinely needed, have client.ts register it with a leaf module when it is evaluated (see src/transaction-client-slot.ts), not a dynamic `import(...)`: a non-splitting bundler wraps the whole client graph in lazy-init closures for one.'
   );
   process.exit(1);
 }
 
-console.log(`check-import-cycles: ${scanned} files scanned under ${scanRoots.join(', ')}, no static value import of client.ts`);
+console.log(`check-import-cycles: ${scanned} files scanned under ${scanRoots.join(', ')}, no value import of client.ts`);
+
+// ---------------------------------------------------------------------------
+// Pass 1b: no dynamic value import of the package's own modules from library
+// code. The size cost described above is not particular to client.ts: any
+// `await import('./x.js')` makes a non-splitting bundler wrap x.ts and its
+// static graph in lazy-init closures. powql.ts (TransactionClient) and powdb.ts
+// (PowqlInterface, which it also re-exported statically) each had one until
+// 0.90.1. A peer driver is loaded through importOptionalPeer with a bare
+// specifier, which this does not match. The CLI is exempt: it is Node-only and
+// may load a subcommand lazily on purpose.
+
+function findOwnDynamicImports(file, source) {
+  const found = [];
+  for (const [, typeofPrefix, spec, , member] of source.matchAll(dynamicImportRe)) {
+    if (!spec.startsWith('.')) continue;
+    if (typeofPrefix) continue;
+    if (member !== undefined && !PROMISE_MEMBERS.has(member)) continue;
+    found.push({ file, statement: `import('${spec}')${member ? `.${member}(...)` : ''} (dynamic)` });
+  }
+  return found;
+}
+
+{
+  const fixtureFile = join(repoRoot, 'src/__dynamic_import_fixture__.ts');
+  const bad = findOwnDynamicImports(
+    fixtureFile,
+    [
+      "const { PowqlInterface } = await import('./powql.js');",
+      "const m = import('./query/index.js').then((x) => x);",
+      "const n = await import(\n  '../schema.js'\n);",
+    ].join('\n')
+  );
+  const good = findOwnDynamicImports(
+    fixtureFile,
+    [
+      "type X = import('./client.js').PgCompatPoolClient;",
+      "type M = typeof import('./powql.js');",
+      "const mysql = await import('mysql2/promise');",
+      "const peer = await importOptionalPeer('mssql');",
+    ].join('\n')
+  );
+  if (bad.length !== 3 || good.length !== 0) {
+    console.error(
+      `check-import-cycles: pass 1b self-test failed (expected 3 violations and 0 false positives, got ${bad.length} and ${good.length}); refusing to pass`
+    );
+    process.exit(1);
+  }
+}
+
+const libraryFiles = tsFilesUnder(join(repoRoot, 'src')).filter((f) => {
+  const rel = relative(join(repoRoot, 'src'), f).split(sep);
+  return rel[0] !== 'test' && rel[0] !== 'cli';
+});
+if (libraryFiles.length === 0) {
+  console.error('check-import-cycles: pass 1b scanned zero files, refusing to pass vacuously');
+  process.exit(1);
+}
+const ownDynamic = libraryFiles.flatMap((f) => findOwnDynamicImports(f, readFileSync(f, 'utf-8')));
+if (ownDynamic.length > 0) {
+  console.error('Dynamic import of one of the package\'s own modules from library code:');
+  for (const v of ownDynamic) console.error(`  ${relative(repoRoot, v.file)}: ${v.statement}`);
+  console.error(
+    '\nImport it statically. If that would be a cycle, have the module that owns the value register it with a leaf module when it is evaluated (see src/transaction-client-slot.ts).'
+  );
+  process.exit(1);
+}
+console.log(`check-import-cycles: pass 1b scanned ${libraryFiles.length} library files, no dynamic import of an own module`);
 
 // ---------------------------------------------------------------------------
 // Pass 2: real cycle detection over the whole value-import graph.

@@ -757,6 +757,12 @@ src/
                       moves with the table since it is a cost comparison; a closed-form gate
                       was attempted and failed its own out-of-sample prediction.
 
+  transaction-client-slot.ts, Where the implicit-transaction path finds `TransactionClient`
+                      (0.90.1). client.ts calls `registerTransactionClient` once at module
+                      evaluation; query/builder.ts and powql.ts read `transactionClientFor(...)`
+                      before checking out a connection. Replaced their dynamic imports of
+                      client.ts (see the "Don't import client.ts" rule at the end of this file).
+
   connection-url.ts, Zero-import leaf (0.71) owning everything that reads or rewrites a
                       CONNECTION STRING. Three jobs. (1) `detectPooler(connectionString,
                       environment?)` (0.90: `fillTargetFromEnvironment` fills an unset host /
@@ -1112,17 +1118,28 @@ src/
                         `capabilities.maxBindParameters` (`Infinity` is no limit), and
                         writes.ts `rowsPerStatement` reads `capabilities.maxInsertRows` (SQL
                         Server 1000; an `onConflict` MERGE is not bound by it).
-                        `TurbineClient` refuses a dialect with no `capabilities` (E003).
+                        A dialect with no `capabilities` is refused with one E003 by
+                        `assertDialectCapabilities` (dialect.ts), which every public entry
+                        point that takes a dialect calls: `TurbineClient` (and so
+                        `turbineHttp`), `QueryInterface`, `schemaToSQL` and `introspect`.
                         `src/test/capabilities-guard.test.ts` pins every value per engine,
                         requires each engine's object to be its OWN and frozen, builds the
                         same ops under a renamed copy of each engine dialect and requires
-                        identical SQL, and SCANS `src/` for any `dialect.name` comparison,
-                        switch, `Set.has` or keyed lookup, and any comparison with an engine
-                        name literal, outside a commented allowlist (expr.ts GREATEST /
-                        LEAST / now() rendering, schema-sql.ts DEFAULT spelling, two
-                        error-hint lookups, grammar branches inside the statement lexers); a stale allowlist entry
-                        fails too. The `supports*` flags below are still top-level and
-                        inherited; moving them in is 0.91 work.
+                        identical SQL and the same `$transaction({ readOnly: true })`, and
+                        SCANS `src/` (whole files, so a wrapped test is found) for every
+                        way of testing the name: a comparison or `Object.is`, a switch,
+                        `.has` / `.includes` / `.get` / `Object.hasOwn` / `in`, a keyed
+                        lookup, a value read off the name, the name destructured or
+                        aliased, a dialect bound to a name not ending in `dialect`, and a
+                        comparison with, or a collection of, engine-name literals. The
+                        allowlist (expr.ts GREATEST / LEAST / now() rendering, schema-sql.ts
+                        DEFAULT spelling, error-hint lookups and their keyed maps, three
+                        names passed on as error text, two dialects read for transaction
+                        keywords, grammar branches inside the statement lexers) pins each
+                        entry to a rule and an EXACT site count, so a new site in an exempt
+                        file fails, and so does an entry whose sites are gone. The
+                        `supports*` flags below are still top-level and inherited; moving
+                        them in is 0.91 work.
                       • Capability flags, `supportsReturning`, `supportsVector`,
                         `supportsListenNotify`, `supportsRLS`, `supportsAdvisoryLock`,
                         `supportsILike`, `aggSupportsInlineOrderBy`, `jsonPathSupport`,
@@ -1863,7 +1880,7 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 | E017 | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) invoked on an engine whose capability flag reports it unsupported, thrown directly, not via `wrapPgError()` |
 | E018 | `ReadOnlyError` | A write refused because the database is read-only, `reason: 'snapshot'` (PowDB snapshot serving / client-level `readonly: true` fail-fast) or `'rbac'` (read-only role). Thrown locally by the PowDB readonly guard and via `wrapPowdbError()` message families |
 | E019 | `TransactionRolledBackError` | A transaction PostgreSQL rolled back instead of committing (the callback caught a failed statement, or a per-query timeout cancelled one); the first failure is `cause`. Deadlock, serialization and lock-not-available first failures keep their own class. Built by `rolledBackError` in transaction-state.ts; pg 25P02 also maps here via `wrapPgError()` as a fallback |
-| E020 | `InvariantError` | Turbine caught a bug in itself before sending a statement it knew was wrong: two internal paths that must agree did not (the SQL-template cache vs a fresh build, `invariant: 'sql-cache-lockstep'`; a cached entry whose param count differs from the params collected, `'sql-cache-param-count'`; a where scope built from an already-quoted reference, `'where-scope-reference'`; a relation payload that does not parse as JSON, `'relation-payload-json'`, both formerly E003; and in powql.ts a relation filter reaching `buildWhere` unresolved, `'powql-relation-filter-unresolved'`, a JSON string operator with no PowQL spelling, `'powql-json-operator'`, and a JSON filter that compiled to no condition, `'powql-json-filter-empty'`, formerly E003 with an `internal:` prefix). Thrown by the always-on cache prechecks in query/builder.ts, `aliasWhereScope` in where.ts, `parseNestedRow` in relations.ts and the three PowQL generator sites. Not retryable, not caused by the arguments; the message names the query shape and no value |
+| E020 | `InvariantError` | Turbine caught a bug in itself before sending a statement it knew was wrong: two internal paths that must agree did not (the SQL-template cache vs a fresh build, `invariant: 'sql-cache-lockstep'`; a cached entry whose param count differs from the params collected, `'sql-cache-param-count'`; a where scope built from an already-quoted reference, `'where-scope-reference'`; a relation payload that does not parse as JSON, `'relation-payload-json'`, both formerly E003; and in powql.ts a relation filter reaching `buildWhere` unresolved, `'powql-relation-filter-unresolved'`, a JSON string operator with no PowQL spelling, `'powql-json-operator'`, and a JSON filter that compiled to no condition, `'powql-json-filter-empty'`, formerly E003 with an `internal:` prefix; since 0.90.1 also any field filter that compiled to no condition, `'powql-filter-empty'`, which used to fall back to an always-false condition that `NOT` turned into every row). Thrown by the always-on cache prechecks in query/builder.ts, `aliasWhereScope` in where.ts, `parseNestedRow` in relations.ts and the three PowQL generator sites. Not retryable, not caused by the arguments; the message names the query shape and no value |
 
 `wrapPgError(err)` inspects the pg driver error's `.code` field and wraps it in the appropriate typed error, preserving the original as `.cause`. It is called in `client.ts` (raw queries, transaction pool proxy) and at query execution boundaries in `query/builder.ts`.
 
@@ -1946,5 +1963,5 @@ which exists because the previous copy asserted a snake_case column name was rej
 - Don't reference internal project names, client names, the applications findings were reported from, or internal planning documents in ANY tracked file, code comments, test names, CHANGELOG, release notes, commit messages, site. This repo is public. Describe changes by what they do, never by who asked for them or where feedback came from. `docs/internal/` and `AGENTS.md` are gitignored (local-only); the pre-commit hook enforces a private blocklist via `scripts/check-private-terms.mjs` + `.private-terms`.
 - Don't break the Prisma-like API (`findMany`, `findUnique`, `with`, `where`)
 - Don't put user values in SQL strings, always use `$N` parameterization
-- Don't import `client.ts` from `query/` or `cli/` (would create a circular dependency). Since 0.65 this is machine-enforced by `scripts/check-import-cycles.mjs` (`npm run check:cycles`, in CI's lint job and prepublishOnly): no STATIC VALUE import; `import type` and the one sanctioned dynamic `await import('../client.js')` in query/builder.ts (interactive transactions need TransactionClient at call time) are allowed.
+- Don't import `client.ts` from `query/` or `cli/` (would create a circular dependency). Since 0.65 this is machine-enforced by `scripts/check-import-cycles.mjs` (`npm run check:cycles`, in CI's lint job and prepublishOnly): no value import, static OR dynamic (`await import('../client.js')` fails too since 0.90.1: a non-splitting bundler wraps the whole client graph in lazy-init closures for one, about 1 kB brotli per entry); `import type` and type-position `import('../client.js').X` are allowed. A runtime value query/ needs from client.ts is REGISTERED by client.ts when it is evaluated: `src/transaction-client-slot.ts` is how query/builder.ts gets `TransactionClient` for the implicit transaction of a nested write or lookup-first upsert. One slot per package copy (deliberately not `Symbol.for`: a builder must construct its own copy's class), and an empty slot (client.ts never loaded, e.g. a deep-imported `QueryInterface`) is E003 on that path only, before any checkout. The same script's pass 1b refuses a dynamic value import of ANY of the package's own modules from library code (src/ minus test/ and cli/), for the same size reason; optional peers load through `importOptionalPeer` with a bare specifier and are not matched.
 - Don't register type parsers outside the TurbineClient constructor

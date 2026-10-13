@@ -431,7 +431,7 @@ describe('Studio demo: builder with relations', () => {
     assert.ok(json.rows.length > 0, 'has user rows');
     const withPosts = json.rows.find((row) => Array.isArray(row.posts) && (row.posts as unknown[]).length > 0);
     assert.ok(withPosts, 'at least one user has a parsed posts array');
-    const firstPost = (withPosts?.posts as Array<Record<string, unknown>>)[0];
+    const firstPost = (withPosts.posts as Array<Record<string, unknown>>)[0];
     assert.equal(typeof firstPost?.title, 'string', 'nested post row is a real object');
   });
 });
