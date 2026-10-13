@@ -29,6 +29,8 @@ import { ValidationError } from '../errors.js';
 import { mssqlDialect } from '../mssql.js';
 import { mysqlDialect } from '../mysql.js';
 import { powdbDialect } from '../powdb.js';
+import { col } from '../query/column-ref.js';
+import { expr } from '../query/expr.js';
 import { QueryInterface } from '../query/index.js';
 import { defineSchema } from '../schema-builder.js';
 import { schemaDefToMetadata } from '../schema-metadata.js';
@@ -152,9 +154,9 @@ const ALLOWLIST: { file: string; contains: string; why: string }[] = [
   // hook added to PostgreSQL today is inherited by every engine).
   { file: 'query/expr.ts', contains: 'switch (qi.dialect.name)', why: 'GREATEST / LEAST and now() rendering' },
   { file: 'query/expr.ts', contains: "case 'postgresql':", why: 'GREATEST / LEAST and now() rendering' },
-  { file: 'query/expr.ts', contains: "case 'mssql':", why: 'GREATEST / LEAST rendering' },
-  { file: 'query/expr.ts', contains: "case 'mysql':", why: 'now() rendering' },
-  { file: 'query/expr.ts', contains: "case 'sqlite':", why: 'now() rendering' },
+  { file: 'query/expr.ts', contains: "case 'mssql':", why: 'GREATEST / LEAST and now() rendering' },
+  { file: 'query/expr.ts', contains: "case 'mysql':", why: 'GREATEST / LEAST and now() rendering' },
+  { file: 'query/expr.ts', contains: "case 'sqlite':", why: 'GREATEST / LEAST and now() rendering' },
   { file: 'query/expr.ts', contains: "qi.dialect.name === 'sqlite' ? (kind", why: 'max / min spelling' },
   { file: 'schema-sql.ts', contains: 'switch (dialect.name)', why: 'column DEFAULT spelling (DDL)' },
   { file: 'schema-sql.ts', contains: "case 'sqlite':", why: 'column DEFAULT spelling (DDL)' },
@@ -330,6 +332,7 @@ describe("a dialect renamed from an engine dialect builds that engine's SQL", ()
     ['divide', (q) => q.buildUpdate({ where: { id: 1 }, data: { age: { divide: 2 } } } as never)],
     ['upsert', (q) => q.buildUpsert({ where: { email: 'a' }, create: { email: 'a' }, update: { name: 'b' } } as never)],
     ['createMany', (q) => q.buildCreateMany({ data: [{ email: 'a' }, { email: 'b' }] } as never)],
+    ['expr add', (q) => q.buildUpdate({ where: { id: 1 }, data: { age: expr.add(col('age'), 1) } } as never)],
   ];
 
   function build(dialect: Dialect, op: (q: QueryInterface<Record<string, unknown>>) => unknown): unknown {
@@ -357,6 +360,26 @@ describe("a dialect renamed from an engine dialect builds that engine's SQL", ()
       assert.ok(compiled >= 8, `only ${compiled} of ${ops.length} ops built SQL: the comparison is mostly vacuous`);
       for (const [label, op] of ops) {
         assert.deepEqual(build(renamed, op), build(dialect, op), `${engine} ${label}: the name changed the SQL`);
+      }
+    });
+  }
+
+  // The documented exception: expr.now(), expr.greatest() and expr.least() are
+  // spelled per engine name, so a renamed dialect is refused (E017) rather than
+  // handed another engine's spelling. The fallback used to be SQL Server's.
+  const spelledByName: [string, (q: QueryInterface<Record<string, unknown>>) => unknown][] = [
+    ['now', (q) => q.buildUpdate({ where: { id: 1 }, data: { born: expr.now() } } as never)],
+    ['greatest', (q) => q.buildUpdate({ where: { id: 1 }, data: { age: expr.greatest(col('age'), 1) } } as never)],
+    ['least', (q) => q.buildUpdate({ where: { id: 1 }, data: { age: expr.least(col('age'), 1) } } as never)],
+  ];
+  for (const [engine, dialect] of Object.entries(ENGINES)) {
+    if (!dialect.capabilities.updateExpressions) continue;
+    it(`${engine}: expr.now / greatest / least build under the engine name and refuse under another`, () => {
+      const renamed = { ...dialect, name: `${engine}-compatible` } as unknown as Dialect;
+      for (const [label, op] of spelledByName) {
+        const shipped = build(dialect, op) as { sql?: string };
+        assert.equal(typeof shipped.sql, 'string', `${engine} ${label}: the shipped dialect should build it`);
+        assert.deepEqual(build(renamed, op), { error: 'TURBINE_E017' }, `${engine} ${label}: renamed must be E017`);
       }
     });
   }

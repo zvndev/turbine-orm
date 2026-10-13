@@ -883,11 +883,14 @@ function renderExtreme(qi: BuilderCtx, kind: 'greatest' | 'least', args: string[
         `(SELECT ${kind === 'greatest' ? 'MAX' : 'MIN'}(turbine_v) FROM ` +
         `(VALUES ${args.map((a) => `(${a})`).join(', ')}) AS turbine_ext(turbine_v))`
       );
-    default: {
+    case 'mysql':
+    case 'sqlite': {
       const fn = qi.dialect.name === 'sqlite' ? (kind === 'greatest' ? 'max' : 'min') : kind.toUpperCase();
       const positions = args.map((a, i) => `COALESCE(${[a, ...args.filter((_, j) => j !== i)].join(', ')})`);
       return `${fn}(${positions.join(', ')})`;
     }
+    default:
+      throw unspelledExpression(qi, `expr.${kind}()`);
   }
 }
 
@@ -920,11 +923,30 @@ function renderNow(state: WalkState): string {
     case 'sqlite':
       // The text a bound Date takes on SQLite: the UTC day on a date column.
       return kind === 'date' ? "strftime('%Y-%m-%d', 'now')" : "strftime('%Y-%m-%dT%H:%M:%fZ', 'now')";
-    default:
+    case 'mssql':
       if (kind === 'tz') return 'SYSDATETIMEOFFSET()';
       if (kind === 'date') return 'CAST(SYSUTCDATETIME() AS date)';
       return 'SYSUTCDATETIME()';
+    default:
+      throw unspelledExpression(qi, 'expr.now()');
   }
+}
+
+/**
+ * GREATEST / LEAST and now() are still spelled per engine NAME (until they
+ * become dialect hooks), so a dialect under any other name is refused rather
+ * than handed one engine's spelling as a fallback. That includes a dialect
+ * spread from a shipped engine dialect under a new name: its capabilities say
+ * it takes update expressions, but nothing here knows how it spells these
+ * three. Every other expression is rendered from capabilities.
+ */
+function unspelledExpression(qi: BuilderCtx, what: string): UnsupportedFeatureError {
+  return new UnsupportedFeatureError(
+    `${what} in update data`,
+    qi.dialect.name,
+    `${what} is spelled per engine, and only postgresql, mysql, sqlite and mssql have a spelling. ` +
+      'Compute the value in JavaScript and write it as a plain value.',
+  );
 }
 
 // ---------------------------------------------------------------------------
