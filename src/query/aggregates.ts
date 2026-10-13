@@ -817,8 +817,15 @@ export function buildHavingClauses<T extends object>(
       agg.fn === 'AVG' ? avgCall(qi, qi.toColumn(key)) : `${agg.fn}(${columnExpr()})`;
 
     for (const agg of aggEntries) {
-      const expr = jsonAggExprs?.get(`${key}:${agg.key}`) ?? plainAggregate(agg);
-      clauses.push(...buildHavingNumericClauses(qi, expr, agg.filter, params));
+      const jsonExpr = jsonAggExprs?.get(`${key}:${agg.key}`);
+      const expr = jsonExpr ?? plainAggregate(agg);
+      // `_min` / `_max` return the column's own stored value, so their operands
+      // bind the way a where operand against that column does.
+      const operandType =
+        jsonExpr === undefined && (agg.fn === 'MIN' || agg.fn === 'MAX')
+          ? qi.columnPgTypeMap.get(qi.toColumn(key))
+          : undefined;
+      clauses.push(...buildHavingNumericClauses(qi, expr, agg.filter, params, operandType));
     }
   }
 
@@ -984,8 +991,24 @@ function buildHavingScalarClauses(
  * shorthand for equality. Operands are not numeric-only: `_min` / `_max`
  * return a stored cell, so `MIN("title") > 'm'` is as valid as
  * `SUM("views") > 10`. Unknown operator keys throw {@link ValidationError}.
+ *
+ * `operandType` is the column type a `_min` / `_max` operand is compared with.
+ * When given, each operand (and each `in` / `notIn` element) is bound through
+ * the where compiler's {@link whereMod.textComparedOperand}, so on MySQL a
+ * number compared with the MIN of a text column is sent as text rather than
+ * compared numerically (`'0zz' = 0` is true there).
  */
-export function buildHavingNumericClauses(qi: BuilderCtx, expr: string, filter: unknown, params: unknown[]): string[] {
+export function buildHavingNumericClauses(
+  qi: BuilderCtx,
+  expr: string,
+  filter: unknown,
+  params: unknown[],
+  operandType?: string,
+): string[] {
+  const bind = (value: unknown): unknown =>
+    operandType === undefined ? value : whereMod.textComparedOperand(qi, operandType, value);
+  const bindList = (value: unknown): unknown =>
+    operandType !== undefined && Array.isArray(value) ? value.map(bind) : value;
   if (filter === null) {
     throw new ValidationError(
       `Invalid having filter on "${expr}" for table "${qi.table}": expected a value or operator object.`,
@@ -994,7 +1017,7 @@ export function buildHavingNumericClauses(qi: BuilderCtx, expr: string, filter: 
 
   // Bare value (number, string, boolean, Date, …) → equality.
   if (typeof filter !== 'object' || filter instanceof Date) {
-    params.push(filter);
+    params.push(bind(filter));
     return [`${expr} = ${qi.p(params.length)}`];
   }
 
@@ -1011,35 +1034,35 @@ export function buildHavingNumericClauses(qi: BuilderCtx, expr: string, filter: 
 
   const clauses: string[] = [];
   if (op.equals !== undefined) {
-    params.push(op.equals);
+    params.push(bind(op.equals));
     clauses.push(`${expr} = ${qi.p(params.length)}`);
   }
   if (op.not !== undefined) {
-    params.push(op.not);
+    params.push(bind(op.not));
     clauses.push(`${expr} != ${qi.p(params.length)}`);
   }
   if (op.gt !== undefined) {
-    params.push(op.gt);
+    params.push(bind(op.gt));
     clauses.push(`${expr} > ${qi.p(params.length)}`);
   }
   if (op.gte !== undefined) {
-    params.push(op.gte);
+    params.push(bind(op.gte));
     clauses.push(`${expr} >= ${qi.p(params.length)}`);
   }
   if (op.lt !== undefined) {
-    params.push(op.lt);
+    params.push(bind(op.lt));
     clauses.push(`${expr} < ${qi.p(params.length)}`);
   }
   if (op.lte !== undefined) {
-    params.push(op.lte);
+    params.push(bind(op.lte));
     clauses.push(`${expr} <= ${qi.p(params.length)}`);
   }
   if (op.in !== undefined) {
-    params.push(qi.inParam(op.in));
+    params.push(qi.inParam(bindList(op.in)));
     clauses.push(qi.inClause(expr, qi.p(params.length), false));
   }
   if (op.notIn !== undefined) {
-    params.push(qi.inParam(op.notIn));
+    params.push(qi.inParam(bindList(op.notIn)));
     clauses.push(qi.inClause(expr, qi.p(params.length), true));
   }
   return clauses;
