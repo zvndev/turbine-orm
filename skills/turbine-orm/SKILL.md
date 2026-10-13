@@ -101,6 +101,16 @@ Operators: `equals`, `not`, `gt`, `gte`, `lt`, `lte`, `in`, `notIn`, `contains`,
 `startsWith`, `endsWith`, plus `mode: 'insensitive'`. `AND`, `OR` and `NOT` nest
 at any depth; `AND` and `OR` take arrays.
 
+`not` also takes an operator object: `givenName: { not: { contains: 'Roux' } }`.
+To compare two columns, wrap the other one in `col()`, imported from
+`turbine-orm`: `rindScore: { gt: col('aromaScore') }`. A plain `{ col: 'x' }`
+object is refused with `TURBINE_E003`, and so is an operand that does not fit
+its operator, such as an array for `equals` or `null` for `gt`.
+
+A key whose value is `undefined` is left out, as in Prisma. When that empties
+the whole `where`, `findFirst` throws `TURBINE_E003` instead of returning an
+arbitrary row.
+
 Values are always bound as parameters, and `contains` / `startsWith` /
 `endsWith` escape LIKE wildcards for you. There is no code path in the typed API
 that concatenates a value into SQL.
@@ -160,7 +170,10 @@ them. Passing both spellings of one bound with different values throws.
 { take: 20, skip: 40 }
 ```
 
-For deep pages, prefer a `cursor` over a large `offset`.
+For deep pages, prefer a `cursor` over a large `offset`. A cursor names the
+last row you have by a unique key, `cursor: { id: 41 }`; the page excludes that
+row and continues in the query's `orderBy`, with the primary key added as a
+tiebreaker.
 
 ## JSON columns
 
@@ -174,8 +187,11 @@ where: { credentialBlob: { path: ['tier'], equals: 'master' } }
 A path takes a DIFFERENT operator set from a plain column: `equals`, `gt`,
 `gte`, `lt`, `lte`, `hasKey`, `contains`, `stringContains`, `stringStartsWith`,
 `stringEndsWith`, plus `mode` (which applies to the three `string*` operators).
-`contains` on a JSON column is containment (`@>`, a whole sub-document such as
-`{ contains: { panel: { seats: 4 } } }`), NOT a substring test; the substring
+`equals` at a path compares JSON values, so `equals: null` matches a JSON
+`null` and not the string `"null"`. Without a `path`, `equals` compares the
+whole document exactly. `contains` on a JSON column is containment (`@>`, a
+whole sub-document such as `{ contains: { panel: { seats: 4 } } }`), NOT a
+substring test; the substring
 operators on a path are `stringContains`, `stringStartsWith` and
 `stringEndsWith`. `not`, `in`, `notIn`, `startsWith` and `endsWith` are refused
 with `TURBINE_E003` listing the accepted set (the last two point at their

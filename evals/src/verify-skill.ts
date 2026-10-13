@@ -18,7 +18,7 @@
 import { deepStrictEqual } from 'node:assert';
 import { readFileSync } from 'node:fs';
 import pg from 'pg';
-import { TurbineError, type SchemaMetadata } from 'turbine-orm';
+import { col, TurbineError, type SchemaMetadata } from 'turbine-orm';
 import { assertEvalDatabase, EVAL_DATABASE_URL } from './config.js';
 import { closeClient, evalClient } from './execute.js';
 import { evalSchema } from './schema-meta.js';
@@ -603,6 +603,87 @@ const CLAIMS: Claim[] = [
     run: async (db) => {
       const n = await call(db, 'cheese_wheels', 'count', { where: { status: 'graded' } });
       if (typeof n !== 'number') throw new Error(`count returned ${typeof n}`);
+    },
+  },
+  // ---- 0.90 additions (proposed rows) ---------------------------------------
+  {
+    says: '`not` also takes an operator object: `givenName: { not: { contains: \'Roux\' } }`.',
+    run: async (db) => {
+      const all = (await call(db, 'affineurs', 'findMany', { select: { id: true }, where: { givenName: { not: null } } })) as unknown[];
+      const hit = (await call(db, 'affineurs', 'findMany', { select: { id: true }, where: { givenName: { contains: 'Roux' } } })) as unknown[];
+      const neg = (await call(db, 'affineurs', 'findMany', { select: { id: true }, where: { givenName: { not: { contains: 'Roux' } } } })) as unknown[];
+      if (hit.length === 0) throw new Error('fixture has no Roux, the claim tests nothing');
+      if (neg.length + hit.length !== all.length) throw new Error(`not-contains ${neg.length} + contains ${hit.length} != ${all.length}`);
+    },
+  },
+  {
+    says: 'To compare two columns, wrap the other one in `col()`: `rindScore: { gt: col(\'aromaScore\') }`.',
+    run: async (db) => {
+      const rows = (await call(db, 'ripening_checks', 'findMany', {
+        select: { rindScore: true, aromaScore: true },
+        where: { rindScore: { gt: col('aromaScore') } },
+      })) as Array<{ rindScore: number; aromaScore: number }>;
+      if (rows.length === 0) throw new Error('no rows, the claim tests nothing');
+      for (const r of rows) if (!(r.rindScore > r.aromaScore)) throw new Error(`row ${JSON.stringify(r)} violates gt`);
+    },
+  },
+  {
+    says: 'A plain `{ col: \'x\' }` object is refused with `TURBINE_E003`.',
+    run: throws('TURBINE_E003', 'ripening_checks', 'findMany', { where: { rindScore: { gt: { col: 'aromaScore' } } } }),
+  },
+  {
+    says: 'an operand that does not fit its operator, such as an array for `equals`, is refused with `TURBINE_E003`.',
+    run: throws('TURBINE_E003', 'cheese_wheels', 'findMany', { where: { wheelCount: { equals: [1, 2] } } }),
+  },
+  {
+    says: 'an operand that does not fit its operator, such as `null` for `gt`, is refused with `TURBINE_E003`.',
+    run: throws('TURBINE_E003', 'cheese_wheels', 'findMany', { where: { wheelCount: { gt: null } } }),
+  },
+  {
+    says: 'A key whose value is `undefined` is left out, as in Prisma.',
+    run: same('cheese_wheels', 'findMany', { select: { id: true }, where: { status: 'graded', batchRef: undefined }, orderBy: { id: 'asc' }, limit: 20 },
+      { select: { id: true }, where: { status: 'graded' }, orderBy: { id: 'asc' }, limit: 20 }),
+  },
+  {
+    says: 'When that empties the whole `where`, `findFirst` throws `TURBINE_E003`.',
+    run: throws('TURBINE_E003', 'cheese_wheels', 'findFirst', { where: { batchRef: undefined } }),
+  },
+  {
+    says: 'A cursor names the last row by a unique key; the page excludes that row and continues in the query\'s `orderBy`, with the primary key added as a tiebreaker.',
+    run: async (db) => {
+      const page = (await call(db, 'cheese_wheels', 'findMany', {
+        select: { id: true, pressedOn: true }, orderBy: { pressedOn: 'desc' }, limit: 40,
+      })) as Array<{ id: number }>;
+      const anchor = page[9]!;
+      const next = (await call(db, 'cheese_wheels', 'findMany', {
+        select: { id: true, pressedOn: true }, orderBy: { pressedOn: 'desc' }, cursor: { id: anchor.id }, limit: 5,
+      })) as Array<{ id: number }>;
+      if (next.some((r) => r.id === anchor.id)) throw new Error('cursor row was included');
+      const full = (await call(db, 'cheese_wheels', 'findMany', {
+        select: { id: true, pressedOn: true }, orderBy: [{ pressedOn: 'desc' }, { id: 'desc' }],
+      })) as Array<{ id: number }>;
+      const at = full.findIndex((r) => r.id === anchor.id);
+      deepStrictEqual(next.map((r) => r.id), full.slice(at + 1, at + 6).map((r) => r.id));
+    },
+  },
+  {
+    says: '`equals` at a path compares JSON values, so `equals: null` matches a JSON `null` and not the string `"null"`.',
+    run: accepts('affineurs', 'findMany', { select: { id: true }, where: { credentialBlob: { path: ['tier'], equals: null } } }),
+  },
+  {
+    says: 'Without a `path`, `equals` compares the whole document exactly.',
+    run: async (db) => {
+      const one = (await call(db, 'affineurs', 'findFirst', {
+        select: { id: true, credentialBlob: true }, where: { credentialBlob: { not: null } }, orderBy: { id: 'asc' },
+      })) as { id: number; credentialBlob: Record<string, unknown> } | null;
+      if (!one) throw new Error('no JSON document in the fixture');
+      const keys = Object.keys(one.credentialBlob);
+      if (keys.length < 2) throw new Error('document too small to test containment vs equality');
+      const partial = { [keys[0]!]: one.credentialBlob[keys[0]!] };
+      const exact = (await call(db, 'affineurs', 'findMany', { select: { id: true }, where: { id: one.id, credentialBlob: { equals: one.credentialBlob } } })) as unknown[];
+      const sub = (await call(db, 'affineurs', 'findMany', { select: { id: true }, where: { id: one.id, credentialBlob: { equals: partial } } })) as unknown[];
+      if (exact.length !== 1) throw new Error('whole document did not match itself');
+      if (sub.length !== 0) throw new Error('a sub-document matched: equals is still containment');
     },
   },
 ];
