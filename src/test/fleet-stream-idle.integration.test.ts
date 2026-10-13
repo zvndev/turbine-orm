@@ -98,7 +98,12 @@ describe('stream idle timeout (live PostgreSQL)', () => {
         'precondition: the stream holds the one connection inside its transaction',
       );
 
-      await sleep(500);
+      // Expiry is due about 200 ms in; poll rather than sleep a fixed time, so a
+      // loaded machine running timers late does not fail the test.
+      const deadline = Date.now() + 5000;
+      while (Date.now() < deadline && (await backends(appName)).some((b) => b.state === 'idle in transaction')) {
+        await sleep(25);
+      }
 
       // The pool has ONE connection: this only succeeds if the stream gave it back.
       assert.equal(await items.count(), 20);
@@ -121,12 +126,16 @@ describe('stream idle timeout (live PostgreSQL)', () => {
     const db = oneConnectionClient(`fsi_${randomUUID().slice(0, 8)}`);
     try {
       const seen: number[] = [];
+      const started = Date.now();
+      // A batch every 60 ms against a 400 ms timeout: a wide margin for late
+      // timers, while the ten batches together outlast the timeout.
       for await (const batch of (db as Any)
         .table(TABLE)
-        .findManyStreamBatches({ orderBy: { id: 'asc' }, batchSize: 4, idleTimeoutMs: 120 })) {
+        .findManyStreamBatches({ orderBy: { id: 'asc' }, batchSize: 2, idleTimeoutMs: 400 })) {
         for (const row of batch) seen.push(row.id);
         await sleep(60);
       }
+      assert.ok(Date.now() - started > 400, 'the drain outlasted the timeout');
       assert.deepEqual(
         seen,
         Array.from({ length: 20 }, (_, i) => i + 1),

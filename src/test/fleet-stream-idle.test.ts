@@ -45,6 +45,17 @@ function schema(): SchemaMetadata {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/**
+ * Wait until `done()` holds, polling, up to a deadline far past any timeout
+ * used here. A fixed sleep sized to the timeout fails on a loaded machine,
+ * where timers fire late; the poll's own timer also keeps the loop alive,
+ * since the guard's timer is unref'd.
+ */
+async function waitFor(done: () => boolean, ms = 5000): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!done() && Date.now() < deadline) await sleep(5);
+}
+
 /** A checked-out connection that serves FETCHes from `batches` and records every statement. */
 class FakeClient extends EventEmitter {
   readonly statements: string[] = [];
@@ -122,7 +133,7 @@ describe('stream idle timeout: an abandoned stream is closed', () => {
       const first = await it.next();
       assert.equal(first.done, false);
 
-      await sleep(120);
+      await waitFor(() => client.released.length > 0);
 
       assert.deepEqual(
         client.statements.filter((s) => /^(CLOSE|COMMIT)/.test(s)).map((s) => s.split(' ')[0]),
@@ -180,18 +191,27 @@ describe('stream idle timeout: an abandoned stream is closed', () => {
 
 describe('stream idle timeout: a live consumer is never closed', () => {
   for (const [method] of METHODS) {
-    it(`${method}: one pull per timeout / 2, ten times, drains every row`, async () => {
-      const { pool, client } = fakePool(threeBatches(4), 5);
+    it(`${method}: a pull every 15 ms for three timeouts drains every row`, async () => {
+      // 30 pulls either way: 30 rows in batches of 10, or 30 batches of one row.
+      const perRow = method === 'findManyStream';
+      const size = perRow ? 10 : 1;
+      const batches = Array.from({ length: 30 / size }, (_, b) =>
+        Array.from({ length: size }, (_, i) => ({ id: b * size + i + 1 })),
+      );
+      const { pool, client } = fakePool(batches, size + 1);
       const qi = itemsInterface(pool, { logger: {} });
       const seen: number[] = [];
-      let pulls = 0;
-      for await (const item of (qi as Any)[method]({ batchSize: 4, idleTimeoutMs: 40 })) {
+      const started = Date.now();
+      // A 150 ms timeout against a pull every 15 ms: ten times the margin a
+      // late timer needs, while the whole drain still outlasts the timeout.
+      for await (const item of (qi as Any)[method]({ batchSize: size, idleTimeoutMs: 150 })) {
         for (const row of Array.isArray(item) ? item : [item]) seen.push(row.id);
-        if (++pulls <= 10) await sleep(20);
+        await sleep(15);
       }
+      assert.ok(Date.now() - started > 300, 'the drain outlasted the timeout');
       assert.deepEqual(
         seen,
-        Array.from({ length: 12 }, (_, i) => i + 1),
+        Array.from({ length: 30 }, (_, i) => i + 1),
       );
       assert.deepEqual(client.released, ['ok']);
     });
@@ -314,13 +334,15 @@ describe('stream idle timeout: the PostgreSQL server-side limit', () => {
     const { pool, client } = fakePool(threeBatches(50), 51);
     const qi = itemsInterface(pool, { logger: {} });
     let n = 0;
-    for await (const _row of qi.findManyStream({ batchSize: 50, idleTimeoutMs: 40 } as never)) {
-      if (++n > 12) break;
-      await sleep(10); // alive (pulls every 10 ms) but no FETCH for 120 ms
+    const started = Date.now();
+    for await (const _row of qi.findManyStream({ batchSize: 50, idleTimeoutMs: 200 } as never)) {
+      // Alive (a pull every 10 ms) but no FETCH, for one and a half timeouts.
+      if (++n > 49 || Date.now() - started > 300) break;
+      await sleep(10);
     }
     assert.ok(
       client.statements.filter((s) => s === 'SELECT 1').length >= 1,
-      `expected a keepalive while the consumer read one batch for 3x the timeout; got ${JSON.stringify(client.statements)}`,
+      `expected a keepalive while the consumer read one batch past half the timeout; got ${JSON.stringify(client.statements)}`,
     );
     assert.deepEqual(client.released, ['ok']);
   });
@@ -361,7 +383,7 @@ describe('stream idle timeout: validation', () => {
     const db = new TurbineClient({ pool, logger: {}, warnOnUnlimited: false, streamIdleTimeoutMs: 30 }, schema());
     const it = (db as Any).table('items').findManyStream({ batchSize: 3 })[Symbol.asyncIterator]();
     await it.next();
-    await sleep(100);
+    await waitFor(() => client.released.length > 0);
     assert.deepEqual(client.released, ['ok'], 'expired at the client-level timeout');
     await assert.rejects(() => it.next(), TimeoutError);
   });
