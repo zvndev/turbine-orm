@@ -287,7 +287,7 @@ HTTP drivers cannot hold a cursor or a LISTEN connection, so `findManyStream` an
 
 ## Database engines
 
-Postgres is the default and primary target. The same typed API also runs on **SQLite** (Node's built-in `node:sqlite`, zero extra installs, Node ≥ 22.5), **MySQL 8** (`mysql2`), **SQL Server 2016+** (`mssql`), and **PowDB** (embedded or networked), each behind a subpath export with its driver as an optional peer. All four are **Experimental** in the [stability policy](STABILITY.md): the query API they expose is the shared one, but each engine's capability boundaries and factory options may still change in a minor release.
+Postgres is the default and primary target. The same typed API also runs on **SQLite** (Node's built-in `node:sqlite`, zero extra installs, Node ≥ 22.5), **MySQL 8** (`mysql2`), **SQL Server 2016+** (`mssql`), and **PowDB** (embedded or networked), each behind a subpath export with its driver as an optional peer. All four are **Experimental** in the [stability policy](STABILITY.md): the query API they expose is the shared one, but each engine's capability boundaries and factory options may still change in a minor release. PowDB is in maintenance mode: bug and data-safety fixes, no new features.
 
 ```bash
 npm install turbine-orm                        # SQLite needs nothing else

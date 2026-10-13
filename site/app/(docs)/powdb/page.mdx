@@ -7,6 +7,13 @@ export const metadata = {
 
 # The `turbine-orm/powdb` module
 
+<Callout type="note" title="Maintenance mode">
+  Since 0.90.1 the PowDB engine receives bug and data-safety fixes only, no new
+  features. It is verified against the 0.20 PowDB packages. Any decision to
+  deprecate it will be announced in the [changelog](/changelog) at least one
+  minor release before it is removed.
+</Callout>
+
 [PowDB](/engines#powdb) is a single-node database with its own query language, PowQL, which shares no surface with `SELECT ... FROM ... WHERE`. It is the one engine that bypasses the [`Dialect`](/dialects) contract for **query generation**: the module ships a parallel query generator (`PowqlInterface`) with the same public method surface as the SQL `QueryInterface`, wired in through the `queryInterfaceFactory` seam.
 
 The dialect seam is still used. `powdbDialect` is a real `Dialect` object, and it is what makes `$listen` / `$notify`, RLS `sessionContext`, pgvector and savepoints fail with a clear `TURBINE_E017` instead of emitting text PowQL cannot parse. Its `resultStrategy` is decorative: `PowqlInterface` owns the write path and never reads it.
