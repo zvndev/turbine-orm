@@ -1075,6 +1075,76 @@ export class SerializationFailureError extends TurbineError {
   }
 }
 
+/** Marks a {@link LockNotAvailableError} across copies of this module (it shares E013 with its parent). */
+const LOCK_NOT_AVAILABLE_BRAND = Symbol.for('turbine-orm.lockNotAvailable');
+
+/**
+ * A row lock could not be taken. A locking read with `noWait` found a row
+ * locked by another transaction (PostgreSQL 55P03, MySQL 3572), or a lock wait
+ * outlasted the server's lock timeout (PostgreSQL 55P03 under `lock_timeout`,
+ * MySQL 1205, SQL Server 1222).
+ *
+ * A {@link SerializationFailureError}: same code (E013) and `isRetryable`, so
+ * code that already retries E013 retries this too. Retry after a backoff, or
+ * read with `skipLocked` to move on to the rows that are free.
+ *
+ * On PostgreSQL the failed statement aborts the transaction it ran in. To keep
+ * the outer transaction alive, take the lock in a nested `tx.$transaction(...)`
+ * (a savepoint) and catch the error outside it.
+ */
+export class LockNotAvailableError extends SerializationFailureError {
+  constructor(opts: { message?: string; cause?: unknown } = {}) {
+    const { cause } = opts;
+    let message = opts.message;
+    if (!message) {
+      const driverMessage = (cause as { message?: string } | null | undefined)?.message;
+      message =
+        `Row lock not available${driverMessage ? `: ${driverMessage}` : ''}. Another transaction holds the lock. ` +
+        'Retry after a backoff, or read with skipLocked to take only the rows that are free.';
+    }
+    super({ message, cause });
+    this.name = 'LockNotAvailableError';
+    Object.defineProperty(this, LOCK_NOT_AVAILABLE_BRAND, {
+      value: true,
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
+  }
+
+  /**
+   * `instanceof` across two copies of this module. The code alone cannot tell
+   * this class from its parent (both E013), so another copy's instance must
+   * also carry this class's own brand. A caller's subclass answers only for
+   * its own instances, as {@link TurbineError[Symbol.hasInstance]} does.
+   */
+  static override [Symbol.hasInstance](value: unknown): boolean {
+    // biome-ignore lint/complexity/noThisInStatic: the receiver may be a caller's subclass, see TurbineError
+    // biome-ignore lint/complexity/noUselessThisAlias: one alias carries one suppression
+    const cls: new (...args: never[]) => unknown = this;
+    if (Function.prototype[Symbol.hasInstance].call(cls, value)) return true;
+    if (cls !== LockNotAvailableError) return false;
+    return (
+      SerializationFailureError[Symbol.hasInstance](value) &&
+      (value as Record<PropertyKey, unknown>)[LOCK_NOT_AVAILABLE_BRAND] === true
+    );
+  }
+}
+
+/**
+ * A lock that could not be taken: PostgreSQL 55P03 (`NOWAIT`, or
+ * `lock_timeout`), MySQL 3572 (`NOWAIT`) and 1205 (lock wait timeout), SQL
+ * Server 1222 (lock request timeout). The MySQL and SQL Server shapes arrive
+ * with `.code` already set to 40001 by their engine modules, so the driver's
+ * own number decides.
+ */
+function isLockNotAvailableError(err: object, code: string): boolean {
+  if (code === '55P03' || code === 'ER_LOCK_NOWAIT') return true;
+  const e = err as { errno?: unknown; number?: unknown };
+  if (e.errno === 3572) return true;
+  return code === '40001' && (e.errno === 1205 || e.number === 1222);
+}
+
 /** Thrown when a CHECK constraint is violated (pg code 23514) */
 export class CheckConstraintError extends TurbineError {
   static override readonly CODE = TurbineErrorCode.CHECK_VIOLATION;
@@ -1768,6 +1838,8 @@ function scrubUnclassifiedServerError(err: object, code: string): unknown {
  *   23P01 (exclusion_violation)   -> ExclusionConstraintError
  *   40P01 (deadlock_detected)     -> DeadlockError       (retryable)
  *   40001 (serialization_failure) -> SerializationFailureError (retryable)
+ *   55P03 (lock_not_available)    -> LockNotAvailableError (retryable, E013); also
+ *                                    MySQL 3572 / 1205 and SQL Server 1222
  *   57014 (query_canceled)        -> TimeoutError (server-side statement_timeout)
  *   28P01 / 28000 (auth refused)  -> ConnectionError, with a remediation hint
  *   3D000 (no such database)      -> ConnectionError, with a remediation hint
@@ -1810,6 +1882,8 @@ export function wrapPgError(err: unknown): unknown {
     const pgMessage = typeof e.message === 'string' && e.message.length > 0 ? e.message : 'write refused';
     return new ReadOnlyError(`${pgMessage} (SQLSTATE 25006).`, { cause: err, reason: 'transaction' });
   }
+
+  if (isLockNotAvailableError(err, e.code)) return new LockNotAvailableError({ cause: err });
 
   // A protocol violation answered with ERROR rather than FATAL concerns one
   // message, and the connection stays usable. The common cause is a Buffer

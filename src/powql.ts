@@ -907,6 +907,30 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
     );
   }
 
+  /** `lock` (a row-locking read): PowDB has no row locks. */
+  private assertNoRowLock(args: { lock?: unknown } | undefined): void {
+    if (args?.lock === undefined) return;
+    throw new UnsupportedFeatureError(
+      'The lock read option',
+      'powdb',
+      'PowDB has no row locks: a transaction holds the single writer gate. Remove `lock`; inside ' +
+        '$transaction on PowDB, writes are already serialized.',
+    );
+  }
+
+  /** `_percentile`: PowQL has no percentile aggregate. */
+  private assertNoPercentile(args: { _percentile?: unknown }): void {
+    const spec = args._percentile;
+    // An empty block asks for nothing, as on the SQL engines.
+    if (spec === undefined) return;
+    if (typeof spec === 'object' && spec !== null && !Object.values(spec).some((v) => v != null)) return;
+    throw new UnsupportedFeatureError(
+      '_percentile',
+      'powdb',
+      'Percentile aggregates need PostgreSQL; PowQL has count, sum, avg, min and max only.',
+    );
+  }
+
   /** See query/compound-unique.ts: one rule and one message across engines. */
   private assertIdentifiesOneRow(where: Record<string, unknown> | undefined): void {
     assertWhereIdentifiesOneRow(this.meta, this.table, where);
@@ -2420,6 +2444,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async findMany(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T[]> {
     this.assertNoForceCustomPlan(args);
+    this.assertNoRowLock(args);
     this.assertNoJsonEncoding(args);
     args = this.completePageOrder(this.normalizeArgs(args));
     return this.withMiddleware('findMany', args as unknown as Record<string, unknown>, async () => {
@@ -2650,6 +2675,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async findUnique(args: FindUniqueArgs<T>): Promise<T | null> {
     this.assertNoForceCustomPlan(args);
+    this.assertNoRowLock(args);
     this.assertNoJsonEncoding(args);
     args = this.normalizeArgs(args);
     // Prisma compound-unique selector → column conjunction (engine parity with
@@ -2691,6 +2717,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
   async findFirst(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T | null> {
     args = this.normalizeArgs(args, 'findFirst');
     this.assertNoForceCustomPlan(args);
+    this.assertNoRowLock(args);
     return this.withMiddleware('findFirst', args as unknown as Record<string, unknown>, async () => {
       const { rows, native, nestedPlans, linkPlans, residualWith, forcedPk } = await this.runFind(
         { ...args, limit: 1 } as FindManyArgs<T>,
@@ -4698,6 +4725,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async aggregate(args: AggregateArgs<T>): Promise<AggregateResult<T>> {
     this.assertNoForceCustomPlan(args);
+    this.assertNoPercentile(args);
     args = this.normalizeArgs(args);
     return this.withMiddleware('aggregate', args as unknown as Record<string, unknown>, async () => {
       const result: AggregateResult<T> = {};
@@ -4821,6 +4849,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> {
 
   async groupBy(args: GroupByArgs<T>): Promise<Record<string, unknown>[]> {
     this.assertNoForceCustomPlan(args);
+    this.assertNoPercentile(args);
     args = this.normalizeArgs(args);
     return this.withMiddleware('groupBy', args as unknown as Record<string, unknown>, async () => {
       // DISTINCT ON has no PowQL equivalent (no DISTINCT ON row source).

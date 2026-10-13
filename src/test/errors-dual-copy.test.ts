@@ -45,6 +45,7 @@ const CONSTRUCT: Record<string, (m: ErrorsModule) => Error> = {
   CheckConstraintError: (m) => new m.CheckConstraintError(),
   DeadlockError: (m) => new m.DeadlockError(),
   SerializationFailureError: (m) => new m.SerializationFailureError(),
+  LockNotAvailableError: (m) => new m.LockNotAvailableError(),
   PipelineError: (m) => new m.PipelineError({ results: [{ status: 'error', error: new Error('e') }] }),
   OptimisticLockError: (m) => new m.OptimisticLockError({ table: 't', versionField: 'v', expectedVersion: 1 }),
   ExclusionConstraintError: (m) => new m.ExclusionConstraintError(),
@@ -110,8 +111,16 @@ describe('errors module, two copies loaded', () => {
     for (const [name] of classes2) {
       if (name === 'TurbineError') continue;
       const err = CONSTRUCT[name]!(copy2);
+      const own1 = (copy1 as unknown as Record<string, ErrorClass>)[name]!;
       for (const [otherName, other1] of errorClassesOf(copy1)) {
         if (otherName === name || otherName === 'TurbineError') continue;
+        // A declared subclass is an instance of its parent
+        // (LockNotAvailableError is a SerializationFailureError); the reverse
+        // direction stays asserted below.
+        if (Object.prototype.isPrototypeOf.call(other1.prototype, own1.prototype)) {
+          assert.equal(err instanceof other1, true, `${name} must be instanceof its parent ${otherName}`);
+          continue;
+        }
         assert.equal(err instanceof other1, false, `${name} must not be instanceof ${otherName}`);
       }
     }

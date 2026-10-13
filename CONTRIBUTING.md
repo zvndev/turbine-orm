@@ -85,6 +85,7 @@ src/
     json-value.ts    , The jsonValue() wrapper for literal JSON values
     expr.ts          , Branded update expressions (expr.greatest, expr.case, ...)
     option-surface.ts, The query-arg option surface as runtime data
+    row-lock.ts      , The lock read option: FOR UPDATE OF "t" and its refusals
     warn-registry.ts , Process-wide once-only dev-warn registry
     deferred.ts      , DeferredQuery and option types
     index.ts         , Barrel re-export

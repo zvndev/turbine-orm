@@ -62,6 +62,7 @@ import {
   type RelationLoadStrategy,
   type TemporalInfinityReading,
 } from './query/index.js';
+import { assertNoLockInAutocommitPipeline } from './query/row-lock.js';
 import {
   ownLookup,
   quoteIdent,
@@ -3021,6 +3022,9 @@ export class TurbineClient {
       queries = args as unknown as T;
     }
     assertDeferredQueries(queries, 'pipeline', 'pipeline');
+    // A locking read outside a transaction would release its locks before
+    // the caller saw the rows; a transactional pipeline keeps them for the batch.
+    if (options?.transactional === false) assertNoLockInAutocommitPipeline(queries);
 
     if (this.logging) {
       console.log(`[turbine] Pipeline: ${queries.length} queries, ${queries.map((q) => q.tag).join(', ')}`);

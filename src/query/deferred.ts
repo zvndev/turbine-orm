@@ -38,6 +38,13 @@ export interface DeferredQuery<T> {
    * rows), so the PostgreSQL path never allocates or consults it.
    */
   reselect?: (exec: ReselectExecutor) => Promise<PgCompatQueryResult>;
+  /**
+   * Set when the statement is a locking read (`lock`). Its locks last until
+   * the transaction ends, so a runner that executes it outside a transaction
+   * (an autocommit pipeline) must refuse it: the rows would be unlocked again
+   * before the caller saw them.
+   */
+  rowLock?: true;
 }
 
 // ---------------------------------------------------------------------------

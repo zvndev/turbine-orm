@@ -73,6 +73,13 @@ import { assertWhereNotEmptiedByPruning, isCursorInclusive, pruneUndefinedArgs }
 import { warnUnknownQueryOptions } from './option-surface.js';
 import { applyStableRelationOrderTo, normalizeWithClause, normalizeWithPagination } from './relation-names.js';
 import * as relationsMod from './relations.js';
+import {
+  lockOnStreamMessage,
+  lockOutsideTransactionMessage,
+  lockWithDistinctMessage,
+  type ResolvedRowLock,
+  resolveRowLock,
+} from './row-lock.js';
 import type {
   AggregateArgs,
   AggregateResultOf,
@@ -680,6 +687,11 @@ type Settled = { result: PgCompatQueryResult } | { error: unknown };
 function isQueryCanceled(err: unknown): boolean {
   const e = err as { code?: unknown; cause?: { code?: unknown } | null } | null;
   return e?.code === '57014' || e?.cause?.code === '57014';
+}
+
+/** The {@link DeferredQuery.rowLock} marker for a locking read, or nothing. */
+function rowLockMarker(rowLock: ResolvedRowLock | undefined): { rowLock?: true } {
+  return rowLock ? { rowLock: true } : {};
 }
 
 /** The two accepted {@link JsonEncoding} values, frozen so the check is total. */
@@ -1500,6 +1512,30 @@ export class QueryInterface<
    */
   private assertFindUniqueKey(where: Record<string, unknown> | undefined): void {
     assertWhereIdentifiesOneRow(this.tableMeta, this.table, where);
+  }
+
+  /**
+   * Refuse a locking read that is not inside a transaction, at the execute
+   * entry of each find method and before any strategy runs. The `build*`
+   * methods accept `lock` (the SQL is right wherever it runs); executing it
+   * in autocommit releases the lock before the caller sees the rows.
+   *
+   * The value is validated first, so an engine with no row locks answers
+   * E017 rather than asking for a transaction it would also refuse.
+   * "Inside a transaction" is `_txScoped`: the accessors a TransactionClient
+   * hands out, at any nesting depth.
+   */
+  private assertLockInTransaction(args: { lock?: unknown } | undefined, operation: string): void {
+    if (args?.lock === undefined) return;
+    resolveRowLock(args.lock, this.dialect, this.table);
+    if (!this.txScoped) throw new ValidationError(lockOutsideTransactionMessage(this.table, operation));
+  }
+
+  /** Refuse `lock` on a streaming read (a cursor is not a locking read). */
+  private assertNoStreamLock(args: object | undefined, operation: string): void {
+    if ((args as { lock?: unknown } | undefined)?.lock !== undefined) {
+      throw new ValidationError(lockOnStreamMessage(this.table, operation));
+    }
   }
 
   /**
@@ -3450,6 +3486,7 @@ export class QueryInterface<
     // nothing else). It is here so the invariant holds at the seam rather than
     // depending on every consumer to re-establish it.
     args = this.normalizeArgs(args);
+    this.assertLockInTransaction(args, 'findUnique');
     return this.executeWithMiddleware('findUnique', args as unknown as Record<string, unknown>, async () => {
       if (args.with) {
         const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
@@ -3580,6 +3617,9 @@ export class QueryInterface<
     // a global filter is not an identity, and letting one satisfy this would
     // hand back an arbitrary row from inside the tenant.
     this.assertFindUniqueKey(args.where as Record<string, unknown>);
+    // The locking clause, read by the cache key and all three SQL paths below.
+    const rowLock = resolveRowLock(args.lock, this.dialect, this.table);
+    const lockSql = rowLock?.sql ?? '';
     // Stable relation order (opt-in): fill PK-asc orderBy into unordered to-many
     // relations before fingerprinting (see buildFindMany).
     if (args.with && this.resolveStableOrder(args.stableRelationOrder)) {
@@ -3608,7 +3648,9 @@ export class QueryInterface<
     // `|je=`: same rule and same hazard as in buildFindMany. findUnique is never
     // flatten-planned, so this is the only plan-shape segment it needs.
     const encodingFp = `|je=${jsonEncoding === 'positional' ? 'p' : 'o'}`;
-    const ck = `fu:${whereFingerprint}|c=${colKey}|w=${withFp}|pii=${includePii ? 1 : 0}${encodingFp}${this.globalFilterCacheSegment()}`;
+    // Empty without a lock, so every unlocked key is unchanged.
+    const lockFp = rowLock ? `|lk=${rowLock.fp}` : '';
+    const ck = `fu:${whereFingerprint}|c=${colKey}|w=${withFp}|pii=${includePii ? 1 : 0}${encodingFp}${lockFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
@@ -3653,7 +3695,7 @@ export class QueryInterface<
         });
         const whereSql = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
         const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${this.q(c)}`).join(', ') : `${qt}.*`;
-        return `SELECT ${selectExpr} FROM ${qt}${whereSql}${this.limitOneClause()}`;
+        return `SELECT ${selectExpr} FROM ${qt}${whereSql}${this.limitOneClause()}${lockSql}`;
       };
       const entry = this.acquireSql(ck, buildSql);
 
@@ -3672,6 +3714,7 @@ export class QueryInterface<
         },
         tag: `${this.table}.findUnique`,
         preparedName: entry.name,
+        ...rowLockMarker(rowLock),
       };
     }
 
@@ -3682,7 +3725,7 @@ export class QueryInterface<
         const whereSql = clause ? ` WHERE ${clause}` : '';
         const qt = this.q(this.table);
         const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${this.q(c)}`).join(', ') : `${qt}.*`;
-        return `SELECT ${selectExpr} FROM ${qt}${whereSql}${this.limitOneClause()}`;
+        return `SELECT ${selectExpr} FROM ${qt}${whereSql}${this.limitOneClause()}${lockSql}`;
       };
       const entry = this.acquireSql(ck, buildSql);
 
@@ -3699,6 +3742,7 @@ export class QueryInterface<
         },
         tag: `${this.table}.findUnique`,
         preparedName: entry.name,
+        ...rowLockMarker(rowLock),
       };
     }
 
@@ -3719,7 +3763,7 @@ export class QueryInterface<
         undefined,
         includePii,
       );
-      return `SELECT ${selectClause} FROM ${this.q(this.table)}${whereSql}${this.limitOneClause()}`;
+      return `SELECT ${selectClause} FROM ${this.q(this.table)}${whereSql}${this.limitOneClause()}${lockSql}`;
     };
     const entry = this.acquireSql(ck, buildSql);
 
@@ -3739,6 +3783,7 @@ export class QueryInterface<
       },
       tag: `${this.table}.findUnique`,
       preparedName: entry.name,
+      ...rowLockMarker(rowLock),
     };
   }
 
@@ -3761,6 +3806,7 @@ export class QueryInterface<
     // nothing else). It is here so the invariant holds at the seam rather than
     // depending on every consumer to re-establish it.
     args = this.normalizeArgs(args);
+    this.assertLockInTransaction(args, 'findMany');
     this.maybeWarnUnlimited(args);
     this.maybeWarnUnorderedPage(args);
 
@@ -4057,6 +4103,13 @@ export class QueryInterface<
           'application code, or use groupBy({ by }) for one row per combination.',
       );
     }
+    // The locking clause, validated and rendered once: the cache key and the
+    // SQL both read this value. PostgreSQL refuses a lock on a DISTINCT query
+    // (0A000), so that pair is refused here, before the cache.
+    const rowLock = resolveRowLock(args?.lock, this.dialect, this.table);
+    if (rowLock && args?.distinct && args.distinct.length > 0) {
+      throw new ValidationError(lockWithDistinctMessage(this.table));
+    }
     // `distinct` + relation orderBy is refused up front (E003): the distinct
     // path re-orders in an outer wrapper (`... AS "<table>_distinct" ORDER BY
     // <userOrder>`) where a correlated relation subquery (pick-row, `_count`,
@@ -4151,7 +4204,10 @@ export class QueryInterface<
     // happens to be.
     const encodingFp = `|je=${jsonEncoding === 'positional' ? 'p' : 'o'}`;
 
-    const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}|pii=${includePii ? 1 : 0}${flattenFp}${encodingFp}${this.globalFilterCacheSegment()}`;
+    // Empty without a lock, so every unlocked key is unchanged.
+    const lockFp = rowLock ? `|lk=${rowLock.fp}` : '';
+
+    const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}|pii=${includePii ? 1 : 0}${flattenFp}${encodingFp}${lockFp}${this.globalFilterCacheSegment()}`;
 
     const params: unknown[] = [];
 
@@ -4307,6 +4363,8 @@ export class QueryInterface<
         offsetPh = this.paginationRef(args.offset, freshParams, 'skip/offset');
       }
       sql += this.buildPagination(limitPh, offsetPh, !!args?.orderBy);
+      // The locking clause follows pagination and binds nothing.
+      if (rowLock) sql += rowLock.sql;
 
       return sql;
     };
@@ -4355,6 +4413,7 @@ export class QueryInterface<
         ),
       tag: `${this.table}.findMany`,
       preparedName: entry.name,
+      ...rowLockMarker(rowLock),
     };
   }
 
@@ -4587,6 +4646,7 @@ export class QueryInterface<
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyStreamArgs<T, R, W, S, O>): AsyncGenerator<QueryResult<T, R, W, S, O>[], void, undefined> {
     args = this.normalizeArgs(args);
+    this.assertNoStreamLock(args, 'findManyStreamBatches');
     const parse = this.makeStreamRowParser<W, S, O>(args);
     for await (const batch of this.streamRaw<W, S, O>(args, 'findManyStreamBatches')) {
       const parsed = new Array<QueryResult<T, R, W, S, O>>(batch.length);
@@ -4639,6 +4699,7 @@ export class QueryInterface<
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyStreamArgs<T, R, W, S, O>): AsyncGenerator<QueryResult<T, R, W, S, O>, void, undefined> {
     args = this.normalizeArgs(args);
+    this.assertNoStreamLock(args, 'findManyStream');
     const parse = this.makeStreamRowParser<W, S, O>(args);
     // Parsed one row at a time, INSIDE the yield loop rather than a batch ahead
     // of it, so a consumer that breaks early still pays only for the rows it
@@ -4665,6 +4726,7 @@ export class QueryInterface<
     // same canonical args the builders do, and so an all-undefined `where` is
     // refused before anything runs (see normalizeArgs).
     args = this.normalizeArgs(args, 'findFirst');
+    this.assertLockInTransaction(args, 'findFirst');
     return this.executeWithMiddleware('findFirst', (args ?? {}) as Record<string, unknown>, async () => {
       if (args?.with) {
         const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
@@ -4736,6 +4798,7 @@ export class QueryInterface<
         return rows.length > 0 ? rows[0]! : null;
       },
       tag: `${this.table}.findFirst`,
+      ...(deferred.rowLock ? { rowLock: true as const } : {}),
     };
   }
 
@@ -4750,6 +4813,7 @@ export class QueryInterface<
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O>> {
     args = this.normalizeArgs(args, 'findFirstOrThrow');
+    this.assertLockInTransaction(args, 'findFirstOrThrow');
     return this.executeWithMiddleware('findFirstOrThrow', (args ?? {}) as Record<string, unknown>, async () => {
       const deferred = this.buildFindFirstOrThrow(args);
       const result = await this.readWithTimeout(
@@ -4786,6 +4850,7 @@ export class QueryInterface<
         return row;
       },
       tag: `${this.table}.findFirstOrThrow`,
+      ...(inner.rowLock ? { rowLock: true as const } : {}),
     };
   }
 
@@ -4800,6 +4865,7 @@ export class QueryInterface<
     O extends Record<string, boolean> | undefined = undefined,
   >(args: FindUniqueArgs<T, R, W, S, O, M['whereUnique']>): Promise<QueryResult<T, R, W, S, O>> {
     args = this.normalizeArgs(args);
+    this.assertLockInTransaction(args, 'findUniqueOrThrow');
     return this.executeWithMiddleware('findUniqueOrThrow', args as unknown as Record<string, unknown>, async () => {
       const deferred = this.buildFindUniqueOrThrow(args);
       const result = await this.readWithTimeout(
@@ -4836,6 +4902,7 @@ export class QueryInterface<
         return row;
       },
       tag: `${this.table}.findUniqueOrThrow`,
+      ...(inner.rowLock ? { rowLock: true as const } : {}),
     };
   }
 

@@ -46,6 +46,9 @@ export async function openFixture(prefix: string): Promise<TxFixture> {
   };
   const raw = new pg.Client({ connectionString: DATABASE_URL });
   await raw.connect();
+  // CockroachDB has no TRUNCATE ... RESTART IDENTITY, and its SERIAL draws
+  // from unique_rowid(), so its reseed writes the ids explicitly.
+  const cockroach = /cockroach/i.test((await raw.query('SELECT version() AS v')).rows[0].v as string);
   await raw.query(`
     DROP TABLE IF EXISTS ${t.posts}, ${t.users}, ${t.orgs}, ${t.counters} CASCADE;
     CREATE TABLE ${t.orgs} (id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE);
@@ -89,6 +92,16 @@ export async function openFixture(prefix: string): Promise<TxFixture> {
       return db;
     },
     async reset() {
+      if (cockroach) {
+        await raw.query(`
+          DELETE FROM ${t.posts}; DELETE FROM ${t.users}; DELETE FROM ${t.orgs}; DELETE FROM ${t.counters};
+          INSERT INTO ${t.orgs} (id, name) VALUES (1, 'acme'), (2, 'globex');
+          INSERT INTO ${t.users} (id, email, org_id, tenant) VALUES (1, 'a@x', 1, 't1'), (2, 'b@x', 2, 't2'), (3, 'c@x', NULL, 't1');
+          INSERT INTO ${t.posts} (id, user_id, title) VALUES (1, 1, 'p1'), (2, 1, 'p2');
+          INSERT INTO ${t.counters} (id, n) VALUES (1, 100), (2, 0);
+        `);
+        return;
+      }
       await raw.query(`
         TRUNCATE ${t.posts}, ${t.users}, ${t.orgs}, ${t.counters} RESTART IDENTITY CASCADE;
         INSERT INTO ${t.orgs} (name) VALUES ('acme'), ('globex');

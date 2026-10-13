@@ -34,10 +34,18 @@ import type {
   JsonPathAggregateTarget,
   OrderBySpec,
   OrderDirection,
+  PercentileSpec,
   WhereClause,
 } from './types.js';
 import { assertOrderDirection, resolveSkipGlobalFilters, resolveUnsafeFlag } from './types.js';
-import { isTemporalInfinity, ownLookup, parseDbDate, resolveColumnName, warnRedundantSortTerm } from './utils.js';
+import {
+  isTemporalInfinity,
+  ownLookup,
+  parseDbDate,
+  resolveColumnName,
+  suggestKey,
+  warnRedundantSortTerm,
+} from './utils.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
 import { assertWhereDepth, combinatorBranches } from './where-compile.js';
@@ -285,6 +293,8 @@ export function buildGroupBy<T extends object>(
   buildAggregates('_avg', 'AVG', args._avg as Record<string, boolean | JsonPathAggregateTarget> | undefined);
   buildAggregates('_min', 'MIN', args._min as Record<string, boolean | JsonPathAggregateTarget> | undefined);
   buildAggregates('_max', 'MAX', args._max as Record<string, boolean | JsonPathAggregateTarget> | undefined);
+  const percentiles = planPercentiles(qi, args._percentile, params, includePii, 'groupBy', claimResultKey);
+  selectExprs.push(...percentiles.map((plan) => plan.expr));
 
   let sql = `SELECT ${selectExprs.join(', ')} FROM ${fromSql} GROUP BY ${groupExprs.join(', ')}`;
 
@@ -404,6 +414,7 @@ export function buildGroupBy<T extends object>(
         if (hasAvgs) restructured._avg = avgObj;
         if (hasMins) restructured._min = minObj;
         if (hasMaxs) restructured._max = maxObj;
+        if (percentiles.length > 0) restructured._percentile = readPercentiles(qi, percentiles, row);
 
         return restructured;
       }),
@@ -501,6 +512,9 @@ export function buildGroupByOrderBy(
 
   for (const [key, value] of orderByEntries(orderBy)) {
     if (value === undefined) continue;
+    if (key === '_percentile') {
+      throw new ValidationError(`groupBy orderBy on table "${qi.table}": ${PERCENTILE_NOT_ORDERABLE}`);
+    }
 
     // Aggregate ordering blocks.
     if (aggBlocks.has(key)) {
@@ -792,6 +806,8 @@ function splitHavingField(
     const fn = ownLookup(HAVING_AGGREGATE_FNS, k);
     if (fn) {
       aggEntries.push({ key: k, fn, filter: v });
+    } else if (k === '_percentile') {
+      throw new ValidationError(`groupBy having on "${qi.table}.${field}": ${PERCENTILE_NOT_ORDERABLE}`);
     } else if (k.startsWith('_')) {
       throw new ValidationError(
         `Unknown aggregate "${k}" in having for field "${field}" on table "${qi.table}". ` +
@@ -1079,6 +1095,194 @@ function sumAvgValue(qi: BuilderCtx, col: string, value: unknown): number | stri
   return Number(value);
 }
 
+// ---------------------------------------------------------------------------
+// _percentile (PostgreSQL: percentile_cont / percentile_disc)
+// ---------------------------------------------------------------------------
+
+/** Why an engine refuses `_percentile`, keyed by dialect name. */
+const PERCENTILE_HINT: Readonly<Record<string, string>> = {
+  mysql: 'Percentile aggregates need PostgreSQL; MySQL has no percentile_cont/percentile_disc.',
+  sqlite:
+    'Percentile aggregates need PostgreSQL; SQLite has percentile functions only in builds compiled with ' +
+    'SQLITE_ENABLE_PERCENTILE, which node:sqlite cannot be assumed to have.',
+  mssql:
+    'Percentile aggregates are not available on SQL Server in this release: PERCENTILE_CONT is a window ' +
+    'function there, not an aggregate.',
+};
+
+const PERCENTILE_SPEC_KEYS = ['p', 'method'];
+const PERCENTILE_METHODS = ['cont', 'disc'];
+const PERCENTILE_NOT_ORDERABLE = 'ordering or filtering groups by _percentile is not supported yet.';
+
+/** One compiled `_percentile` entry: its SELECT expression and how to read it back. */
+interface PercentilePlan {
+  readonly expr: string;
+  readonly alias: string;
+  /** The canonical field name the result is keyed by (as `_min` / `_max` are). */
+  readonly field: string;
+  readonly col: string;
+}
+
+/**
+ * Compile `_percentile` into SELECT expressions, binding each fraction (or
+ * fraction array) as a `float8` / `float8[]` parameter so the SQL text does not
+ * depend on the values or on how many there are.
+ *
+ * Refusals, all before any SQL runs: E017 on a dialect without
+ * `supportsPercentileAggregates`; E003 for a spec that is not `{ p, method? }`,
+ * a fraction outside [0, 1] or not a finite number, an empty array, an unknown
+ * method, `cont` on a date/time column (`percentile_cont` has no temporal
+ * form), a JSON-path target, and two keys naming one column. Both methods need
+ * `includePii: UNSAFE` on a PII column: `disc` returns a stored cell, and so
+ * does `cont` at p = 0 or 1 or over a one-row group.
+ */
+function planPercentiles(
+  qi: BuilderCtx,
+  spec: unknown,
+  params: unknown[],
+  includePii: boolean,
+  operation: 'aggregate' | 'groupBy',
+  claimResultKey?: (key: string, what: string) => void,
+): PercentilePlan[] {
+  if (spec === undefined) return [];
+  const where = `${operation} _percentile on table "${qi.table}"`;
+  if (typeof spec !== 'object' || spec === null || Array.isArray(spec)) {
+    throw new ValidationError(
+      `${where} must be an object of field -> { p, method? }, e.g. { latencyMs: { p: 0.95 } }.`,
+    );
+  }
+  const entries = Object.entries(spec as Record<string, unknown>).filter(([, v]) => v !== undefined && v !== null);
+  if (entries.length === 0) return [];
+  if (qi.dialect.supportsPercentileAggregates !== true) {
+    throw new UnsupportedFeatureError(
+      '_percentile',
+      qi.dialect.name,
+      PERCENTILE_HINT[qi.dialect.name] ?? 'Percentile aggregates need PostgreSQL.',
+    );
+  }
+  const meta = qi.schema.tables[qi.table];
+  const plans: PercentilePlan[] = [];
+  const aliases = new Set<string>();
+  for (const [key, entry] of entries) {
+    const label = `${where}, field "${key}"`;
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      throw new ValidationError(`${label}: expected { p, method? }, received ${describeValue(entry)}.`);
+    }
+    if ('path' in entry) {
+      throw new ValidationError(`${label}: a JSON-path target is not supported for _percentile yet.`);
+    }
+    for (const k of Object.keys(entry)) {
+      if (!PERCENTILE_SPEC_KEYS.includes(k)) {
+        const hint = suggestKey(k, PERCENTILE_SPEC_KEYS);
+        throw new ValidationError(
+          `${label}: unknown key "${k}".${hint ? ` Did you mean "${hint}"?` : ''} Expected { p, method? }.`,
+        );
+      }
+    }
+    const { p, method = 'cont' } = entry as PercentileSpec;
+    if (!PERCENTILE_METHODS.includes(method as string)) {
+      throw new ValidationError(`${label}: method must be 'cont' or 'disc', received ${describeValue(method)}.`);
+    }
+    if (Array.isArray(p)) {
+      if (p.length === 0) throw new ValidationError(`${label}: p is an empty array. Give at least one fraction.`);
+      for (const fraction of p) assertFraction(fraction, label);
+    } else {
+      assertFraction(p, label);
+    }
+    const col = qi.toColumn(key);
+    if (method === 'cont' && qi.tableMeta.dateColumns.has(col)) {
+      throw new ValidationError(
+        `${label}: method 'cont' interpolates and needs a numeric or interval column, and "${col}" is a ` +
+          "date/time column. Use method: 'disc' for an actual stored value.",
+      );
+    }
+    assertAggregatePiiOptIn(qi.table, meta, key, col, `${operation} _percentile`, includePii);
+    const alias = `_percentile_${col}`;
+    if (aliases.has(alias)) {
+      throw new ValidationError(`${label}: column "${col}" is already named by another _percentile key.`);
+    }
+    aliases.add(alias);
+    claimResultKey?.(alias, `_percentile of column "${col}"`);
+    params.push(Array.isArray(p) ? [...p] : p);
+    const fractions = `${qi.p(params.length)}::float8${Array.isArray(p) ? '[]' : ''}`;
+    let expr = `percentile_${method}(${fractions}) WITHIN GROUP (ORDER BY ${qi.q(col)})`;
+    // numeric[] has a driver parser that returns JS numbers, which rounds an
+    // exact value the scalar form returns as text. Read the array as text too.
+    if (Array.isArray(p) && method === 'disc' && isDecimalType(whereMod.getColumnPgType(qi, col))) {
+      expr = `(${expr})::text[]`;
+    }
+    plans.push({
+      expr: `${expr} AS ${qi.q(alias)}`,
+      alias,
+      field: qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col),
+      col,
+    });
+  }
+  return plans;
+}
+
+function assertFraction(value: unknown, label: string): void {
+  if (typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1) return;
+  throw new ValidationError(
+    `${label}: p must be a fraction from 0 to 1 (0.95 for the 95th percentile), or an array of them, ` +
+      `received ${describeValue(value)}.`,
+  );
+}
+
+function describeValue(value: unknown): string {
+  if (typeof value === 'string') return `'${value}'`;
+  if (Array.isArray(value)) return 'an array';
+  if (value !== null && typeof value === 'object') return 'an object';
+  return String(value);
+}
+
+function isDecimalType(pgType: string): boolean {
+  const paren = pgType.indexOf('(');
+  const base = (paren === -1 ? pgType : pgType.slice(0, paren)).trim().toLowerCase();
+  return base === 'numeric' || base === 'decimal';
+}
+
+/** The `_percentile` block of one result row, keyed by canonical field. */
+function readPercentiles(
+  qi: BuilderCtx,
+  plans: readonly PercentilePlan[],
+  row: Record<string, unknown>,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const plan of plans) {
+    const value = row[plan.alias];
+    setOwn(
+      out,
+      plan.field,
+      Array.isArray(value)
+        ? value.map((element) => percentileElement(qi, plan.col, element))
+        : percentileElement(qi, plan.col, value),
+    );
+  }
+  return out;
+}
+
+/**
+ * One percentile value, read the way the column itself reads: a date/time
+ * value through {@link temporalAggValue} (element by element in the array
+ * form, where the driver may hand back text or a bare infinity), and an int8
+ * that the array form delivers as text through the same exact-number rule the
+ * scalar int8 parser applies. `null` over zero rows.
+ */
+function percentileElement(qi: BuilderCtx, col: string, value: unknown): unknown {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'string' && isInt8Type(whereMod.getColumnPgType(qi, col))) {
+    const n = Number(value);
+    return Number.isSafeInteger(n) ? n : value;
+  }
+  return temporalAggValue(qi, col, value);
+}
+
+function isInt8Type(pgType: string): boolean {
+  const base = pgType.trim().toLowerCase();
+  return base === 'int8' || base === 'bigint';
+}
+
 export function buildAggregate<T extends object>(
   qi: BuilderCtx,
   args: AggregateArgs<T>,
@@ -1171,6 +1375,9 @@ export function buildAggregate<T extends object>(
     }
   }
 
+  const percentiles = planPercentiles(qi, args._percentile, params, includePii, 'aggregate');
+  selectExprs.push(...percentiles.map((plan) => plan.expr));
+
   if (selectExprs.length === 0) {
     selectExprs.push(`${qi.castAgg('COUNT(*)', 'int')} AS _count`);
   }
@@ -1245,6 +1452,9 @@ export function buildAggregate<T extends object>(
       if (hasAvgs) aggResult._avg = avgObj as Partial<Record<keyof T & string, number | string | null>>;
       if (hasMins) aggResult._min = minObj as Partial<Record<keyof T & string, unknown>>;
       if (hasMaxs) aggResult._max = maxObj as Partial<Record<keyof T & string, unknown>>;
+      if (percentiles.length > 0) {
+        aggResult._percentile = readPercentiles(qi, percentiles, row) as Partial<Record<keyof T & string, unknown>>;
+      }
 
       return aggResult;
     },

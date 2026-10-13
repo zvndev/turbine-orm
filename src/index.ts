@@ -88,6 +88,7 @@ export {
   ExclusionConstraintError,
   ForeignKeyError,
   getErrorMessageMode,
+  LockNotAvailableError,
   MigrationError,
   NotFoundError,
   NotNullViolationError,
@@ -232,7 +233,11 @@ export type {
   NestedToOneCreateOp,
   NestedToOneUpdateOp,
   OptionalInput,
+  PercentileMethod,
+  PercentileSpec,
   RelationKind,
+  RowLock,
+  RowLockMode,
   TableInputTypes,
 } from './query/types.js';
 // $on('query') event metadata: raw-statement model name, $tag() label limit

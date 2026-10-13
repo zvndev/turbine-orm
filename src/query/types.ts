@@ -2249,10 +2249,12 @@ export type AggregateResultOf<T, A> = AggregateCountPart<A> &
  *   mirrors the shape: a scalar for a number, an array (in the same order)
  *   for an array. A fraction outside [0, 1], `NaN` or `[]` throws E003.
  * - `method`: `'cont'` (the default, `percentile_cont`) interpolates between
- *   the two nearest values, so it needs a numeric or interval column and
- *   returns a `number` (an interval reads back as a string). `'disc'`
- *   (`percentile_disc`) returns an actual stored value of the column, so it
- *   works on any sortable column and carries the column's own type.
+ *   the two nearest values, so it needs a numeric or interval column. It
+ *   returns a `number` (a numeric or int8 column included), or an interval
+ *   read the way the column reads. `'cont'` on a date/time column throws E003.
+ *   `'disc'` (`percentile_disc`) returns an actual stored value of the
+ *   column, so it works on any sortable column and carries the column's own
+ *   type.
  *
  * Over zero rows the result is `null` (the whole array in the array form).
  * Both methods need `includePii: UNSAFE` on a PII-tagged column.
@@ -2265,13 +2267,13 @@ export interface PercentileSpec {
 /** `'cont'` interpolates (`percentile_cont`); `'disc'` returns a stored value (`percentile_disc`). */
 export type PercentileMethod = 'cont' | 'disc';
 
-/** One percentile value: the column's own type for `disc`, a number (or interval text) for `cont`. */
+/** One percentile value: the column's own type for `disc`; for `cont` a number, or an interval as the column reads. */
 type PercentileScalar<T, K, Spec> = K extends keyof T
   ? Spec extends { method: 'disc' }
     ? NonNullable<T[K]>
     : [NonNullable<T[K]>] extends [number]
       ? number
-      : number | string
+      : number | NonNullable<T[K]>
   : unknown;
 
 /** A scalar `p` yields one value, an array `p` yields an array, `null` over zero rows. */
