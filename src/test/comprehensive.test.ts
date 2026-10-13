@@ -16,6 +16,7 @@ import { describe } from 'node:test';
 import { TurbineClient } from '../client.js';
 import { NotFoundError, ValidationError } from '../errors.js';
 import { introspect } from '../introspect.js';
+import { resetWarnOnce, WARN_NS } from '../query/warn-registry.js';
 import type { SchemaMetadata } from '../schema.js';
 import { skipGate } from './helpers.js';
 
@@ -1094,20 +1095,25 @@ testFn('comprehensive integration tests', () => {
     });
 
     it('warnOnUnlimited logs warning (no limit)', async () => {
+      // The warning is said once per table per process, and earlier tests in
+      // this file already ran unlimited `users` reads, so start from a clean
+      // registry or this client has nothing left to say.
+      resetWarnOnce(WARN_NS.unlimitedFindMany);
       const warnings: string[] = [];
       const originalWarn = console.warn;
       console.warn = (msg: string) => warnings.push(msg);
-
       const warnDb = new TurbineClient({ connectionString: DATABASE_URL!, poolSize: 2, warnOnUnlimited: true }, schema);
-      await warnDb.table('users').findMany({ limit: 10 }); // With limit, no warning
-      assert.equal(warnings.length, 0);
+      try {
+        await warnDb.table('users').findMany({ limit: 10 }); // With limit, no warning
+        assert.equal(warnings.length, 0);
 
-      await warnDb.table('users').findMany(); // Without limit, should warn
-      assert.ok(warnings.length > 0);
-      assert.ok(warnings[0]!.includes('no limit'));
-
-      console.warn = originalWarn;
-      await warnDb.disconnect();
+        await warnDb.table('users').findMany(); // Without limit, should warn
+        assert.ok(warnings.length > 0);
+        assert.ok(warnings[0]!.includes('no limit'));
+      } finally {
+        console.warn = originalWarn;
+        await warnDb.disconnect();
+      }
     });
   });
 
