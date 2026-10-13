@@ -53,11 +53,10 @@
  */
 
 // Runtime imports, and the only ones in this file: the unknown-key warning at
-// the bottom needs the diagnostics resolver, the logger, the once-per-process
-// registry and the name suggester. All are leaves that do not import this
-// module, so the type-only shape of everything above is unaffected.
-import { resolveDiagnostics } from '../diagnostics.js';
-import { consoleLogger, logTo, type TurbineLogger } from '../logger.js';
+// the bottom needs the logger, the once-per-process registry and the name
+// suggester. All are leaves that do not import this module, so the type-only
+// shape of everything above is unaffected.
+import { logTo, type TurbineLogger } from '../logger.js';
 import type {
   AggregateArgs,
   CountArgs,
@@ -383,11 +382,6 @@ export const REFUSED_OPTION_KEYS: Readonly<Record<string, ReadonlySet<string>>> 
   findManyStreamBatches: new Set(['lock']),
 };
 
-/** The advice logger a caller without a client gets: the console logger when the environment's mode has advice on. */
-function adviceFromEnvironment(): TurbineLogger | null {
-  return resolveDiagnostics().advice ? consoleLogger : null;
-}
-
 /**
  * Advice for a key that is not part of the operation's option
  * surface, and is therefore doing nothing.
@@ -407,18 +401,16 @@ function adviceFromEnvironment(): TurbineLogger | null {
  * tells an incorrect one exactly what happened.
  *
  * Advice: emitted only when the client's `diagnostics.advice` is on. The
- * caller passes its advice logger, or `null` when advice is off. Once per
- * `table.operation.key` per process, and total: the whole body is wrapped,
- * because a diagnostic must never be the reason a query fails.
- *
- * Omitting `advice` resolves it from the environment on each call. Only the
- * PowDB interface still does that, until it carries its client's logger.
+ * caller passes its advice logger, or `null` when advice is off, so this
+ * module never reads the environment. Once per `table.operation.key` per
+ * process, and total: the whole body is wrapped, because a diagnostic must
+ * never be the reason a query fails.
  */
 export function warnUnknownQueryOptions(
   table: string,
   operation: string,
   args: unknown,
-  advice: TurbineLogger | null = adviceFromEnvironment(),
+  advice: TurbineLogger | null,
 ): void {
   if (!advice) return;
   if (args === null || typeof args !== 'object' || Array.isArray(args)) return;
