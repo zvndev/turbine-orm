@@ -25,7 +25,7 @@ import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import http from 'node:http';
-import { syncBuiltinESMExports } from 'node:module';
+import { createRequire, syncBuiltinESMExports } from 'node:module';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { describe, it } from 'node:test';
@@ -43,6 +43,16 @@ import {
 import { createDemoContext } from '../cli/studio-demo.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { mockTable, skipGate } from './helpers.js';
+
+/** Studio's demo store runs on the built-in node:sqlite engine (Node >= 22.5). */
+const NO_SQLITE = (() => {
+  try {
+    createRequire(process.cwd())('node:sqlite');
+    return false;
+  } catch {
+    return 'requires node:sqlite (Node >= 22.5) for the Studio demo store';
+  }
+})();
 
 // ---------------------------------------------------------------------------
 // The Host allowlist, as a table
@@ -244,7 +254,7 @@ const authed = { 'x-turbine-token': SESSION, origin: ORIGIN };
 // Studio: Host header
 // ---------------------------------------------------------------------------
 
-describe('Studio refuses a foreign Host before any route runs', () => {
+describe('Studio refuses a foreign Host before any route runs', { skip: NO_SQLITE }, () => {
   it('403 on the API with a valid token, on the shell, on the favicon, and with a ticket', async () => {
     const ctx = demoCtx();
     const evil = { host: 'evil.example:4983' };
@@ -282,7 +292,7 @@ describe('Studio refuses a foreign Host before any route runs', () => {
 // Studio: one-time ticket
 // ---------------------------------------------------------------------------
 
-describe('Studio login ticket is single use and is not the session credential', () => {
+describe('Studio login ticket is single use and is not the session credential', { skip: NO_SQLITE }, () => {
   it('exchanges the ticket for the SESSION cookie, once', async () => {
     const ticketGate = createTicketGate();
     assert.notEqual(ticketGate.token, SESSION, 'fixture: ticket and session credential differ');
@@ -356,7 +366,7 @@ describe('Studio login ticket is single use and is not the session credential', 
 // Studio: request bodies
 // ---------------------------------------------------------------------------
 
-describe('Studio request bodies: 413 before buffering, 400 for malformed', () => {
+describe('Studio request bodies: 413 before buffering, 400 for malformed', { skip: NO_SQLITE }, () => {
   const post = (ctx: StudioContext, headers: Record<string, string>, chunks: Buffer[], onChunk?: () => void) => {
     const { res, done } = makeRes();
     const req = request('POST', '/api/builder', { host: `${HOST}:${PORT}`, ...authed, ...headers }, chunks, onChunk);
@@ -521,7 +531,7 @@ describe('Studio Query tab caps the rows a request can load', () => {
   });
 });
 
-describe('Studio saved queries are capped in count', () => {
+describe('Studio saved queries are capped in count', { skip: NO_SQLITE }, () => {
   it('refuses the 501st with the fix named', async () => {
     const ctx = demoCtx();
     const save = (n: number) => {
@@ -545,7 +555,7 @@ describe('Studio saved queries are capped in count', () => {
 // Studio: PII named in a select is served redacted
 // ---------------------------------------------------------------------------
 
-describe('Studio Query tab: a PII column in select is served redacted, never raw', () => {
+describe('Studio Query tab: a PII column in select is served redacted, never raw', { skip: NO_SQLITE }, () => {
   const builder = (ctx: StudioContext, args: unknown) =>
     studio(ctx, 'POST', '/api/builder', { ...authed }, json({ table: 'users', args }));
 
@@ -617,7 +627,7 @@ describe('Studio Query tab: a PII column in select is served redacted, never raw
 // Studio: a locking read is refused by name
 // ---------------------------------------------------------------------------
 
-describe('Studio Query tab refuses a locking read by name', () => {
+describe('Studio Query tab refuses a locking read by name', { skip: NO_SQLITE }, () => {
   /** A schema with a COLUMN literally called `lock`, which is not the option. */
   function jobsSchema(): SchemaMetadata {
     const jobs: TableMetadata = mockTable('jobs', [
@@ -738,7 +748,7 @@ describe('Studio Query tab refuses a locking read by name', () => {
 // Studio: messages escape names
 // ---------------------------------------------------------------------------
 
-describe('Studio messages escape names', () => {
+describe('Studio messages escape names', { skip: NO_SQLITE }, () => {
   it('an unknown table is shown escaped, and so are the available tables', async () => {
     const r = await studio(
       demoCtx(),
@@ -797,7 +807,7 @@ function freePort(): Promise<number> {
   });
 }
 
-describe('a real Studio server (demo store)', () => {
+describe('a real Studio server (demo store)', { skip: NO_SQLITE }, () => {
   it('prints a one-time ticket, honours the Host allowlist and answers an oversized body with 413', async () => {
     const port = await freePort();
     const handle = await startStudio({ ...options(), port });
@@ -854,7 +864,7 @@ describe('a real Studio server (demo store)', () => {
   });
 });
 
-describe('Studio: a malformed request target and a missing browser launcher', () => {
+describe('Studio: a malformed request target and a missing browser launcher', { skip: NO_SQLITE }, () => {
   it('answers a request target that is not a URL with 400, not 500', async () => {
     const ctx = demoCtx();
     for (const target of ['//', 'http://']) {

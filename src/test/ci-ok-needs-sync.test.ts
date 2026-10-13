@@ -58,7 +58,7 @@ interface CiShape {
  */
 function parseCi(text: string, AGGREGATOR: string): CiShape {
   const lines = text.split('\n');
-  const jobsAt = lines.findIndex((line) => line === 'jobs:');
+  const jobsAt = lines.indexOf('jobs:');
   assert.notEqual(jobsAt, -1, 'the workflow has no top-level `jobs:` line; the parser has nothing to read');
 
   const jobs: string[] = [];
