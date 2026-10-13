@@ -450,6 +450,12 @@ A `timestamptz` carries its offset on the wire. A `timestamp` (without time zone
 
 The read half is a set of pg type parsers on OIDs 1114 (`timestamp`), 1082 (`date`) and their array forms 1115 / 1182, also applied to the dates coerced out of nested-relation JSON, so every read path agrees, and scalar and array columns cannot settle differently. The write half matches: binding a `Date` to a zone-less column renders its **UTC** components. Reading in the local zone against a UTC write is what made a read-modify-write cycle on a `date` walk the stored day backward east of UTC, and let `where: { runOn: row.runOn }` match nothing.
 
+SQLite, MySQL and SQL Server follow the same write rule since 0.90: a `Date` written to or compared with a `date` column binds its UTC day (`YYYY-MM-DD`). MySQL used to round `23:59:59.999` into the next day, and SQLite stored the full ISO text. On SQLite, rows written before 0.90 hold that ISO text and stop matching an equality on the column until you rewrite them:
+
+```sql
+UPDATE events SET run_on = substr(run_on, 1, 10) WHERE length(run_on) > 10;
+```
+
 ```ts
 // Stored: date '2026-07-21'. Process running in Europe/Berlin (UTC+2).
 const job = await db.jobs.findUniqueOrThrow({ where: { id: 1 } });
