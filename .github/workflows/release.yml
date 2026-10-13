@@ -13,24 +13,21 @@ name: Release
 # --follow-tags` is refused there; the tag alone is the publish trigger.
 #   git tag vX.Y.Z && git push origin vX.Y.Z
 #
-# The workflow runs lint → typecheck → unit tests → build, then the release
-# gates that mirror ci.yml (a real Postgres integration run on the seeded fixture,
-# the packed-tarball smoke test, the coverage thresholds, and the error-code
-# contract check) before it verifies that package.json version matches the tag
-# and publishes with `--provenance` so the npm registry can attest the build to
-# this repo.
+# The gates are gates.yml, the same workflow ci.yml calls on every push and
+# pull request, so a tag is tested by exactly CI's gate: every engine, every
+# version matrix, the package-surface checks. Two jobs are release-only:
 #
-# A publish requires ALL of: test (lint/typecheck/unit/build/size),
-# integration-postgres (real DB), pack-smoke (published package surface),
-# package-types (publint + attw + a real CJS consumer typecheck),
-# coverage (.c8rc.json thresholds, measured against a real DB), and error-codes
-# (every thrown error inside the TURBINE_E* contract). Each gate job is defined
-# here rather than reused from ci.yml because ci.yml is triggered by push/PR, not
-# by the tag that starts a release, so a tag run has no CI run to depend on. The
-# full multi-version / multi-engine matrix still lives in ci.yml on push; the
-# release gate runs one representative Postgres so a tag can never publish SQL a
-# real Postgres rejects, a broken package surface, a coverage regression, or an
-# untracked error class.
+#   - tag-ancestry refuses a tag whose commit is not on main, so a version can
+#     only be published from reviewed code.
+#   - publish publishes the tarball the gates installed (gates.yml's `pack`
+#     job), never a fresh build from the tree. It checks the sha256 of the
+#     downloaded artifact against the gates' output, refuses if npm would pack
+#     different bytes, and after publishing checks that the registry's
+#     integrity equals the tested tarball's. It publishes with `--provenance`
+#     so the registry can attest the build to this repo.
+#
+# A publish requires `gates` (which fails if any gate job fails, see gates.yml
+# `gates-ok`) and `tag-ancestry`.
 
 on:
   push:
@@ -66,535 +63,35 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  test:
-    timeout-minutes: 20
+  # Refuses before any gate runs, so a tag on an unmerged commit fails in a
+  # minute rather than after the full gate matrix. A dry run only warns, since
+  # it publishes nothing.
+  tag-ancestry:
+    timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
-          node-version: 22
-          cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Lint
-        run: npm run lint
-
-      # Public-repo leak guard. It ran in exactly one place, ci.yml's lint job,
-      # which is the one workflow that does not gate publishing. prepublishOnly
-      # and this workflow both skipped it, and the pre-commit hook that also
-      # runs it is skippable with `git commit --no-verify`. A leak guard with a
-      # single bypassable enforcement point is not a guard.
-      - name: Private-material guard
-        run: npm run check:private-terms
-
-      # Same gap class as the leak guard above, on the same path. These three
-      # run in ci.yml and in prepublishOnly, but ci.yml does not gate a tag
-      # push and prepublishOnly does not run when the tag path publishes. So
-      # on the one route that actually reaches npm they ran nowhere. They are
-      # seconds each; the reason they were missing is that nobody diffed the
-      # two workflows' guard lists, which is what makes them worth stating.
-      - name: Import-cycle guard
-        run: npm run check:cycles
-
-      - name: Error-prefix guard
-        run: npm run check:error-prefix
-
-      - name: Skip-gate guard
-        run: npm run check:skip-gates
-
-      - name: Typecheck
-        run: npm run typecheck
-
-      - name: Unit tests
-        run: npm run test:unit
-
-      # The CLI coverage gate (cli/studio.ts, cli/migrate.ts,
-      # cli/destructive.ts): write mode, destructive DDL, and the scanner that
-      # classifies DDL as destructive. Own thresholds, see .c8rc.json's
-      # //cli-gate note. No database, a few seconds.
-      - name: CLI coverage thresholds
-        run: npm run test:coverage:cli
-
-      # CHANGELOG heading contract. It lived only in prepublishOnly, so a tag
-      # push (which never runs prepublishOnly) could publish over a violation.
-      - name: CHANGELOG headings
-        run: npm run check:changelog
-
-      - name: Build
-        run: npm run build
-
-      # Bundle size gate, size-limit is the single source of truth (same check
-      # CI runs). Measures the bundled import graph against .size-limit.js limits
-      # (~31 kB main / ~22 kB edge, under 35/25 ceilings). Replaces the previous
-      # stale hard-coded 150 kB tarball check that never matched reality.
-      - name: Verify bundle sizes
-        run: npx size-limit
-
-      # turbine-orm/serverless must bundle for an edge runtime: no pg and no Node
-      # builtin beyond node:async_hooks under the edge-light/worker/browser
-      # conditions (scripts/check-edge-bundle.mjs, with a built-in control).
-      - name: Edge bundle check
-        run: npm run check:edge
-
-  # Postgres integration gate, mirrors ci.yml's integration-tests but pinned to
-  # a single representative major (16). Seeds src/test/fixtures/seed.sql, then
-  # runs the full DB-backed suite so a tag can never publish SQL that a real
-  # Postgres rejects. The 14/15/16/17 matrix stays in ci.yml on push.
-  integration-postgres:
-    timeout-minutes: 30
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        # pgvector/pgvector: postgres:<major> plus the `vector` extension, so the
-        # KNN assertions in src/test/pgvector.test.ts run instead of skipping.
-        image: pgvector/pgvector:pg16
+          fetch-depth: 0
+      - name: Fetch main
+        run: git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+      - name: Require the release commit to be on main
         env:
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-          POSTGRES_DB: turbine_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - name: Install psql client
-        run: sudo apt-get update && sudo apt-get install -y postgresql-client
-      - name: Seed test database
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f src/test/fixtures/seed.sql
-        env:
-          DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
-          PGPASSWORD: test
-      - run: npm test
-        env:
-          DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
-          # Parity with ci.yml's integration-tests job. Without this a misnamed
-          # DATABASE_URL, an unhealthy container, or a reworded skip-gate reason
-          # makes every Postgres suite skip and the job still reports green.
-          # That is the exact failure mode the variable exists to prevent, and
-          # it was missing from precisely the two jobs that gate what reaches
-          # npm. `sqlite` rides along for the same reason it does in ci.yml:
-          # this job pins Node 22, so node:sqlite is present and its gates have
-          # no business skipping.
-          TURBINE_REQUIRE_ENGINE: postgres,sqlite
-
-  # Packed-tarball smoke gate, mirrors ci.yml's pack-smoke. Installs the real
-  # `npm pack` output into a clean temp project and verifies the published
-  # package surface (ESM import, CJS require, CLI bin, and every subpath export)
-  # so a tag can never publish a broken exports map or missing dist file.
-  pack-smoke:
-    timeout-minutes: 20
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      - name: Pack tarball
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
         run: |
-          TARBALL=$(npm pack --silent | tail -1)
-          echo "TARBALL=$GITHUB_WORKSPACE/$TARBALL" >> "$GITHUB_ENV"
-          echo "EXPECTED_VERSION=$(jq -r .version package.json)" >> "$GITHUB_ENV"
-      - name: Verify packed manifest has no install scripts
-        # The published tarball must not ship prepare/preinstall/install/postinstall.
-        run: |
-          MANIFEST=$(tar -xzOf "$TARBALL" package/package.json)
-          BANNED=$(echo "$MANIFEST" | jq -r '
-            (.scripts // {}) | keys[]
-            | select(. == "prepare" or . == "preinstall" or . == "install" or . == "postinstall")
-          ')
-          if [ -n "$BANNED" ]; then
-            echo "Published manifest must not contain install scripts, found:"
-            echo "$BANNED"
-            echo "$MANIFEST" | jq '.scripts'
-            exit 1
+          if [ "$DRY_RUN" = "true" ]; then
+            node scripts/check-tag-ancestry.mjs "$GITHUB_SHA" origin/main || echo "::warning::Dry run of a commit that is not on main; a real release of it would be refused."
+          else
+            node scripts/check-tag-ancestry.mjs "$GITHUB_SHA" origin/main
           fi
-          echo "Packed manifest has no install scripts OK"
-      - name: Verify the tarball loads against the oldest pg its range allows
-        # scripts/check-pg-floor.mjs installs the packed tarball next to EXACTLY
-        # the floor of dependencies.pg and imports every published entry point.
-        # CI otherwise only ever installs the newest pg in range, which is how a
-        # ^8.13.1 range shipped code that needs 8.15.0 to import at all.
-        run: node scripts/check-pg-floor.mjs "$TARBALL"
-      - name: Install tarball in temp project
-        run: |
-          SMOKE_DIR=$(mktemp -d)
-          echo "SMOKE_DIR=$SMOKE_DIR" >> "$GITHUB_ENV"
-          cd "$SMOKE_DIR"
-          npm init -y > /dev/null
-          npm install "$TARBALL" --no-audit --no-fund
-      - name: Verify ESM import
-        working-directory: ${{ env.SMOKE_DIR }}
-        run: |
-          node --input-type=module -e "const m = await import('turbine-orm'); if (!m.TurbineClient) { console.error('ESM import missing TurbineClient'); process.exit(1); } console.log('ESM import OK');"
-      - name: Verify CJS require
-        working-directory: ${{ env.SMOKE_DIR }}
-        run: |
-          node -e "const m = require('turbine-orm'); if (!m.TurbineClient) { console.error('CJS require missing TurbineClient'); process.exit(1); } console.log('CJS require OK');"
-      - name: Verify CLI bin prints version
-        working-directory: ${{ env.SMOKE_DIR }}
-        run: |
-          npx turbine --version
-          npx turbine --version | grep -F "$EXPECTED_VERSION"
-      - name: Verify serverless subpath import
-        working-directory: ${{ env.SMOKE_DIR }}
-        run: |
-          node --input-type=module -e "const m = await import('turbine-orm/serverless'); if (typeof m.turbineHttp !== 'function') { console.error('serverless subpath missing turbineHttp'); process.exit(1); } console.log('serverless subpath OK');"
-      - name: Verify sqlite subpath import
-        working-directory: ${{ env.SMOKE_DIR }}
-        run: |
-          node --input-type=module -e "const m = await import('turbine-orm/sqlite'); if (m.sqliteDialect?.name !== 'sqlite' || typeof m.turbineSqlite !== 'function') { console.error('sqlite subpath broken'); process.exit(1); } console.log('sqlite subpath OK');"
-      - name: Verify adapters subpath import
-        working-directory: ${{ env.SMOKE_DIR }}
-        run: |
-          node --input-type=module -e "const m = await import('turbine-orm/adapters'); if (!m.cockroachdb || !m.yugabytedb || !m.postgresql) { console.error('adapters subpath broken'); process.exit(1); } console.log('adapters subpath OK', Object.keys(m).slice(0,8).join(','));"
-      # The three engine subpaths and prisma-compat. This job used to verify
-      # serverless/sqlite/adapters only, so the RELEASE path, the one that
-      # decides whether a version reaches npm, checked fewer published entry
-      # points than CI did. mysql/mssql/powdb must import with their optional
-      # peers ABSENT (this temp project never installs them): the peer is loaded
-      # by a dynamic import inside the factory, so a static import creeping into
-      # the module graph would break every Postgres user and is exactly what this
-      # catches. prisma-compat was import-smoked on NEITHER path.
-      - name: Verify mysql subpath import (mysql2 NOT installed, must not crash)
-        working-directory: ${{ env.SMOKE_DIR }}
-        run: |
-          node --input-type=module -e "const m = await import('turbine-orm/mysql'); if (m.mysqlDialect?.name !== 'mysql' || typeof m.turbineMysql !== 'function') { console.error('mysql subpath broken'); process.exit(1); } console.log('mysql subpath OK (no mysql2 needed to import)');"
-      - name: Verify mssql subpath import (mssql NOT installed, must not crash)
-        working-directory: ${{ env.SMOKE_DIR }}
-        run: |
-          node --input-type=module -e "const m = await import('turbine-orm/mssql'); if (m.mssqlDialect?.name !== 'mssql' || typeof m.turbineMssql !== 'function') { console.error('mssql subpath broken'); process.exit(1); } console.log('mssql subpath OK (no mssql needed to import)');"
-      - name: Verify powdb subpath import (peers NOT installed, must not crash)
-        working-directory: ${{ env.SMOKE_DIR }}
-        run: |
-          node --input-type=module -e "const m = await import('turbine-orm/powdb'); if (typeof m.turbinePowDB !== 'function') { console.error('powdb subpath broken'); process.exit(1); } console.log('powdb subpath OK (no peer needed to import)');"
-      - name: Verify prisma-compat subpath import
-        working-directory: ${{ env.SMOKE_DIR }}
-        run: |
-          node --input-type=module -e "const m = await import('turbine-orm/prisma-compat'); if (typeof m.createPrismaCompatClient !== 'function' || !m.Prisma) { console.error('prisma-compat subpath broken, exports: ' + Object.keys(m).join(',')); process.exit(1); } console.log('prisma-compat subpath OK');"
 
-  # Coverage gate: mirrors ci.yml's coverage job (same Postgres 16 service, same
-  # seed, same DATABASE_URL wiring) so the thresholds in .c8rc.json are enforced
-  # on the release path too, not only on push. A tag cannot publish under a
-  # coverage regression.
-  coverage:
-    timeout-minutes: 30
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        # pgvector/pgvector: postgres:<major> plus the `vector` extension, so the
-        # KNN assertions in src/test/pgvector.test.ts run instead of skipping.
-        image: pgvector/pgvector:pg16
-        env:
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-          POSTGRES_DB: turbine_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - name: Install psql client
-        run: sudo apt-get update && sudo apt-get install -y postgresql-client
-      - name: Seed test database
-        run: psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f src/test/fixtures/seed.sql
-        env:
-          DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
-          PGPASSWORD: test
-      - run: npm run test:coverage
-        env:
-          DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
-          # Parity with ci.yml's coverage job, same reasoning as the
-          # integration-postgres job above. A fully-skipped run would otherwise
-          # measure coverage over SQL generation alone and still meet the
-          # thresholds.
-          TURBINE_REQUIRE_ENGINE: postgres,sqlite
-
-      # The code-generation ratchet, mirroring ci.yml's coverage job. Re-reports
-      # the coverage the step above wrote to coverage/tmp, so it runs no tests.
-      - run: npm run coverage:codegen
-
-  # Error-code gate: mirrors ci.yml's error-codes job. Every `throw new` in src/
-  # must be a known TurbineError subclass (or an explicitly allow-listed
-  # module-local class), so a release can never ship an error outside the
-  # documented TURBINE_E* contract.
-  error-codes:
-    timeout-minutes: 15
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - name: Check error code enforcement
-        run: npx tsx scripts/check-error-codes.ts
-
-  # Claim gate for the shipped agent skill: mirrors ci.yml's verify-skill job.
-  # skills/turbine-orm/SKILL.md is in package.json `files`, so a tag push
-  # publishes it, and README.md states that every factual claim in it is
-  # executed against a live database before release. This is the job that
-  # executes them, so a tag cannot publish a skill whose claims have gone stale.
-  #
-  # Database wiring differs from every other job here on purpose: the harness
-  # reads TURBINE_EVAL_URL (never DATABASE_URL) and refuses any database not
-  # named `turbine_eval`, and its schema comes from evals/schema.sql via the
-  # harness's own `db:reset`, not from src/test/fixtures/seed.sql. `npm run
-  # build` first, because evals/node_modules resolves turbine-orm through a
-  # symlink to this repo root and therefore imports dist/.
-  verify-skill:
-    name: verify-skill
-    timeout-minutes: 15
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: test
-          POSTGRES_PASSWORD: test
-          POSTGRES_DB: turbine_eval
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-    env:
-      TURBINE_EVAL_URL: postgres://test:test@localhost:5432/turbine_eval
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - name: Build the package the harness imports
-        run: npm run build
-      - run: npm ci --prefix evals
-      - name: Seed the eval database
-        run: npm run db:reset --prefix evals
-      - name: Verify every skill claim against the live database
-        run: npm run verify:skill --prefix evals
-
-  # Publish-surface type gate: mirrors ci.yml's package-types job. pack-smoke
-  # only proves the package RUNS from CJS; this proves its TYPES resolve from
-  # CJS too (the TS1479 class of bug, invisible at runtime). publint + attw on
-  # the packed tarball, then a real .cts consumer typechecked against it.
-  package-types:
-    timeout-minutes: 15
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      - name: publint + are-the-types-wrong
-        run: npm run check:package
-      - name: Pack tarball
-        run: echo "TARBALL=$GITHUB_WORKSPACE/$(npm pack --silent | tail -1)" >> "$GITHUB_ENV"
-      # `"types": ["node"]` is EXPLICIT since 0.70.0, and a tsconfig cannot carry a
-      # comment key (tsc rejects an unknown compilerOption with TS5023), so the
-      # reason lives here. The fixture uses `require`, a global from @types/node,
-      # and it used to arrive by ACCIDENT: @types/pg depends on @types/node, so
-      # while @types/pg was a RUNTIME dependency of turbine-orm, installing the
-      # tarball populated the consumer's @types directory as a side effect.
-      # Moving @types/pg to devDependencies removed that prop and TypeScript's
-      # automatic @types inclusion did not cover it, so this job failed on the
-      # first real tag push, before publishing. A consumer declaring what it uses
-      # is the correct shape; leaning on a dependency's dependency was the bug.
-      - name: Typecheck a CommonJS consumer against the packed tarball
-        run: |
-          CONSUMER=$(mktemp -d)
-          cd "$CONSUMER"
-          cat > package.json <<'JSON'
-          { "name": "cjs-consumer", "version": "1.0.0", "private": true, "type": "commonjs" }
-          JSON
-          cat > tsconfig.json <<'JSON'
-          {
-            "compilerOptions": {
-              "module": "nodenext",
-              "moduleResolution": "nodenext",
-              "target": "ES2022",
-              "strict": true,
-              "noEmit": true,
-              "skipLibCheck": true,
-              "types": ["node"]
-            },
-            "include": ["consumer.cts"]
-          }
-          JSON
-          cat > consumer.cts <<'TS'
-          import { TurbineClient, TurbineError } from 'turbine-orm';
-          import { turbineHttp } from 'turbine-orm/serverless';
-          import { turbineSqlite } from 'turbine-orm/sqlite';
-          import { turbineMysql } from 'turbine-orm/mysql';
-          import { turbineMssql } from 'turbine-orm/mssql';
-          import { turbinePowDB } from 'turbine-orm/powdb';
-          import { postgresql } from 'turbine-orm/adapters';
-          const req = require('turbine-orm') as typeof import('turbine-orm');
-          export const check = [
-            TurbineClient, TurbineError, turbineHttp, turbineSqlite,
-            turbineMysql, turbineMssql, turbinePowDB, postgresql, req.TurbineClient,
-          ];
-          TS
-          npm install "$TARBALL" --no-audit --no-fund
-          npm install --no-save typescript @types/node --no-audit --no-fund
-          npx tsc --noEmit -p tsconfig.json
-          sed -i 's/"module": "nodenext"/"module": "node16"/; s/"moduleResolution": "nodenext"/"moduleResolution": "node16"/' tsconfig.json
-          npx tsc --noEmit -p tsconfig.json
-          echo "CJS consumer typecheck OK (nodenext + node16)"
-
-  # The `@types/pg` gate, and the permanent guard on the v0.28.1 regression:
-  # mirrors ci.yml's consumer-types job. It has to exist HERE and not only
-  # there, because ci.yml does not gate a release: this workflow runs on a
-  # pushed tag or a workflow_dispatch, and `publish` waits on the jobs in its
-  # own `needs:` list. Without this job a tag push would publish the exact
-  # regression the pg-free declaration surface exists to prevent, and
-  # `package-types` would not have caught it: that job compiles with
-  # `skipLibCheck: true`, so tsc never reads the library's own declarations,
-  # and its fixture never touches `db.pool` or `transaction()`.
-  #
-  # `package-types` asks "do the declarations RESOLVE from CJS". This asks
-  # "do the declarations require a types package we no longer ship a dependency
-  # on". Different questions, and neither answer implies the other.
-  consumer-types:
-    timeout-minutes: 20
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run build
-      # The same script prepublishOnly and ci.yml run. One source of truth, so
-      # the publish path cannot drift from the branch path.
-      - name: Tripwire, no pg type references in the published declarations
-        run: npm run check:package-types
-      - name: Assert the packed manifest declares exactly one runtime dependency
-        run: |
-          TARBALL="$GITHUB_WORKSPACE/$(npm pack --silent | tail -1)"
-          echo "TARBALL=$TARBALL" >> "$GITHUB_ENV"
-          DEPS=$(tar -xzOf "$TARBALL" package/package.json | jq -r '(.dependencies // {}) | keys | join(",")')
-          if [ "$DEPS" != "pg" ]; then
-            echo "::error file=package.json::Published dependencies must be exactly [pg], found [$DEPS]."
-            exit 1
-          fi
-          echo "Packed manifest dependencies = [$DEPS] OK"
-      # The end-to-end proof: the REAL tarball installed into a clean project
-      # that has `pg` but NOT `@types/pg`. `skipLibCheck: false` is load-bearing
-      # and not a stylistic choice: with it true, tsc never reads the library's
-      # own declarations, so a pg reference there is suppressed and the gate
-      # passes vacuously. The `-d node_modules/@types/pg` assertion exists for
-      # the same reason, so the gate cannot pass merely because something pulled
-      # @types/pg in transitively and satisfied the reference.
-      - name: Typecheck a consumer that has pg but NOT @types/pg
-        run: |
-          CONSUMER=$(mktemp -d)
-          cd "$CONSUMER"
-          cat > package.json <<'JSON'
-          { "name": "types-consumer", "version": "1.0.0", "private": true, "type": "module" }
-          JSON
-          cat > tsconfig.json <<'JSON'
-          {
-            "compilerOptions": {
-              "module": "nodenext",
-              "moduleResolution": "nodenext",
-              "target": "ES2022",
-              "strict": true,
-              "noEmit": true,
-              "skipLibCheck": false
-            },
-            "include": ["consumer.ts"]
-          }
-          JSON
-          cat > consumer.ts <<'TS'
-          import {
-            type PgCompatPool,
-            type PgCompatPoolClient,
-            type PgCompatQueryResult,
-            type SchemaMetadata,
-            TurbineClient,
-          } from 'turbine-orm';
-          import { turbineHttp } from 'turbine-orm/serverless';
-
-          const schema: SchemaMetadata = { tables: {}, enums: {} };
-          const db = new TurbineClient({ connectionString: 'postgres://u:p@localhost:5432/d' }, schema);
-
-          // The pool accessor is typed by Turbine's own contract, not by @types/pg.
-          export async function readOne(): Promise<number | null> {
-            const result: PgCompatQueryResult<{ n: number }> = await db.pool.query<{ n: number }>('SELECT 1 AS n');
-            const client: PgCompatPoolClient = await db.pool.connect();
-            try {
-              return result.rows[0]?.n ?? null;
-            } finally {
-              client.release();
-            }
-          }
-
-          // The transaction callback's parameter is the same contract.
-          export async function inTransaction(): Promise<number> {
-            return db.transaction(async (tx: PgCompatPoolClient) => {
-              const r = await tx.query<{ n: number }>('SELECT 2 AS n', []);
-              return r.rows[0]?.n ?? 0;
-            });
-          }
-
-          // The external-pool seam: a hand-written driver, no pg types anywhere.
-          const externalPool: PgCompatPool = {
-            query: async () => ({ rows: [], rowCount: 0 }),
-            connect: async () => {
-              throw new Error('not reached at typecheck time');
-            },
-            end: async () => {},
-          };
-          export const edge = turbineHttp(externalPool, schema);
-          TS
-          # `pg` explicitly, to mirror a real consumer. @types/pg is never named
-          # here and nothing in the tree may pull it in.
-          npm install "$TARBALL" pg --no-audit --no-fund
-          npm install --no-save typescript @types/node --no-audit --no-fund
-          if [ -d node_modules/@types/pg ]; then
-            echo "::error file=package.json::@types/pg is present in the consumer tree, so this gate would pass vacuously. Something declares it as a runtime dependency."
-            exit 1
-          fi
-          echo "@types/pg is absent from the consumer tree OK"
-          npx tsc --noEmit -p tsconfig.json
-          echo "Consumer typecheck OK (strict + NodeNext + skipLibCheck:false, no @types/pg)"
+  gates:
+    needs: tag-ancestry
+    uses: ./.github/workflows/gates.yml
 
   publish:
     timeout-minutes: 30
-    needs: [test, integration-postgres, pack-smoke, package-types, consumer-types, coverage, error-codes, verify-skill]
+    needs: [tag-ancestry, gates]
     runs-on: ubuntu-latest
     # The only job that writes: `contents: write` for the workflow_dispatch tag
     # push and for `gh release create`, `id-token: write` for `--provenance`.
@@ -603,6 +100,11 @@ jobs:
     permissions:
       contents: write
       id-token: write
+    # No lifecycle script runs in this job. The tarball was built and checked by
+    # the gates; publishing it must not run prepublishOnly or prepack again,
+    # which would need the dev tree and could change what is uploaded.
+    env:
+      npm_config_ignore_scripts: 'true'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -634,8 +136,49 @@ jobs:
           fi
           echo "Publishing turbine-orm@$PKG_VERSION"
 
-      - name: Build
-        run: npm run build
+      # The tarball the gates installed, not a rebuild from this checkout.
+      - name: Download the tested tarball
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: package-tarball
+          path: ${{ runner.temp }}/release-package
+
+      # Three refusals. The download is the file the pack job hashed. Its
+      # manifest carries the version being released. And npm, packing the
+      # extracted directory exactly as `npm publish` below will, produces the
+      # same bytes, so what reaches the registry is what the gates installed.
+      - name: Verify and stage the tested tarball
+        env:
+          STAGE: ${{ runner.temp }}/release-package
+          TARBALL_NAME: ${{ needs.gates.outputs.tarball }}
+          TESTED_SHA256: ${{ needs.gates.outputs.tarball-sha256 }}
+          TESTED_INTEGRITY: ${{ needs.gates.outputs.tarball-integrity }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TARBALL_NAME" ] || [ -z "$TESTED_SHA256" ] || [ -z "$TESTED_INTEGRITY" ]; then
+            echo "::error::The gates reported no tarball name or hash; refusing to publish a file nobody tested."
+            exit 1
+          fi
+          TARBALL="$STAGE/$TARBALL_NAME"
+          ACTUAL=$(sha256sum "$TARBALL" | cut -d' ' -f1)
+          if [ "$ACTUAL" != "$TESTED_SHA256" ]; then
+            echo "::error::Downloaded tarball sha256 $ACTUAL is not the tested $TESTED_SHA256."
+            exit 1
+          fi
+          tar -xzf "$TARBALL" -C "$STAGE"
+          PKG_VERSION=$(jq -r .version package.json)
+          TAR_VERSION=$(jq -r .version "$STAGE/package/package.json")
+          if [ "$TAR_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::The tested tarball is version $TAR_VERSION, this release is $PKG_VERSION."
+            exit 1
+          fi
+          REPACKED=$(cd "$STAGE/package" && npm pack --dry-run --json | jq -r '.[0].integrity')
+          if [ "$REPACKED" != "$TESTED_INTEGRITY" ]; then
+            echo "::error::npm would publish different bytes ($REPACKED) from the tested tarball ($TESTED_INTEGRITY)."
+            exit 1
+          fi
+          echo "TESTED_INTEGRITY=$TESTED_INTEGRITY" >> "$GITHUB_ENV"
+          echo "Staged $TARBALL_NAME (sha256 $ACTUAL, $TESTED_INTEGRITY)"
 
       # The tag is the publish trigger, so on a tag PUSH a version that is
       # already on npm got there some other way: a local `npm publish` before
@@ -666,6 +209,7 @@ jobs:
       - name: Publish to npm
         id: publish
         if: ${{ github.event.inputs.dry_run != 'true' && steps.published.outputs.already != 'true' }}
+        working-directory: ${{ runner.temp }}/release-package/package
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -728,6 +272,23 @@ jobs:
           npx turbine --version | grep -F "$PKG_VERSION"
           echo "Post-publish smoke test passed for turbine-orm@$PKG_VERSION"
 
+      # The registry holds the bytes the gates tested. The staging step already
+      # refused a repack that differed; this reads back what was actually stored.
+      - name: Verify the registry holds the tested tarball
+        if: ${{ !cancelled() && steps.publish.outcome == 'success' }}
+        run: |
+          PKG_VERSION=$(jq -r .version package.json)
+          for _ in $(seq 1 12); do
+            STORED=$(npm view "turbine-orm@$PKG_VERSION" dist.integrity --prefer-online 2>/dev/null || true)
+            [ -n "$STORED" ] && break
+            sleep 10
+          done
+          if [ "$STORED" != "$TESTED_INTEGRITY" ]; then
+            echo "::error::turbine-orm@$PKG_VERSION on the registry has integrity '$STORED', the tested tarball has $TESTED_INTEGRITY."
+            exit 1
+          fi
+          echo "Registry integrity matches the tested tarball: $STORED"
+
       # The GitHub Release used to be a manual `gh release create` after every
       # publish, which meant it was sometimes late and could drift from the
       # CHANGELOG. Now the same run that publishes to npm creates it, with the
@@ -781,4 +342,5 @@ jobs:
 
       - name: Dry run, verify package
         if: ${{ github.event.inputs.dry_run == 'true' }}
+        working-directory: ${{ runner.temp }}/release-package/package
         run: npm pack --dry-run
