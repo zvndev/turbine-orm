@@ -88,7 +88,7 @@ import { fingerprintPrismaSchema } from '../prisma-schema-fingerprint.js';
 import { closestName } from '../query/utils.js';
 import { type SchemaMetadata, snakeToCamel } from '../schema.js';
 import type { SchemaDef } from '../schema-builder.js';
-import { DestructivePushRefusal, schemaDiff, schemaPush } from '../schema-sql.js';
+import { DestructivePushRefusal, driftWarnings, schemaDiff, schemaPush } from '../schema-sql.js';
 import { type AppliedColumnTags, applyCodeFirstColumnTags, extractCodeFirstColumnTags } from './code-first-tags.js';
 import type { CliOverrides, ConfigLoadError, ResolvedConfig, TurbineCliConfig } from './config.js';
 import {
@@ -132,6 +132,7 @@ import {
   planMigrationRollback,
   type RebaselinedChecksum,
   rollbacksWithoutSql,
+  statusGateProblems,
   summarizeMigrationStatus,
 } from './migrate.js';
 import { startObserve } from './observe.js';
@@ -236,7 +237,7 @@ export interface CliArgs {
   metricsUrl?: string;
   /** `doctor --no-plan-divergence`: skip the cached-plan divergence section (and its pg_stats read). */
   noPlanDivergence?: boolean;
-  /** `doctor --allow-pooler`: run even when the connection string looks like a transaction pooler. */
+  /** `doctor` / `migrate up|deploy|down --allow-pooler`: run even when the connection string looks like a transaction pooler. */
   allowPooler?: boolean;
   // init flags
   /** `init --yes`/`-y`: accept every step's default non-interactively. */
@@ -380,6 +381,7 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
     '--allow-drift',
     '--allow-destructive',
     '--allow-pending',
+    '--allow-pooler',
   ],
   seed: [],
   status: [],
@@ -1890,7 +1892,7 @@ async function runInitGenerate(config: ResolvedConfig, url: string): Promise<Ini
       outDir: config.out,
       connectionString: url,
       importExtension: config.importExtension,
-      columnTypes: generatorColumnTypes(appliedTags, config, schema),
+      columnTypes: await generatorColumnTypesFor(appliedTags, config, schema, url),
     });
     genSpinner.succeed(`Generated ${bold(String(result.files.length))} files to ${cyan(`${config.out}/`)}`);
     // The accessor name the generator emits is snakeToCamel of the table name
@@ -2407,12 +2409,20 @@ function describeAppliedTags(applied: AppliedColumnTags): string {
  * that table has no generated type to override; every other key goes to the
  * generator, which rejects one naming no table or column.
  *
+ * An `include` list leaves out every table it does not name, so a misspelt
+ * table looks exactly like a real table that was left out. `databaseTables`
+ * (every table the schema holds, before filtering) tells them apart: only a
+ * table the database has is dropped, and a name it does not have goes on to the
+ * generator, which names the closest match. Without it every key outside the
+ * filters is dropped.
+ *
  * @internal exported for tests.
  */
 export function generatorColumnTypes(
   applied: Pick<AppliedColumnTags, 'columnTypes'> | null,
   config: Pick<ResolvedConfig, 'columnTypes' | 'include' | 'exclude'>,
   schema: Pick<SchemaMetadata, 'tables'>,
+  databaseTables?: ReadonlySet<string>,
 ): Record<string, string> | undefined {
   const filters = {
     include: config.include.length ? config.include : undefined,
@@ -2421,10 +2431,48 @@ export function generatorColumnTypes(
   const merged: Record<string, string> = { ...applied?.columnTypes };
   for (const [key, type] of Object.entries(config.columnTypes ?? {})) {
     const table = key.slice(0, key.lastIndexOf('.'));
-    if (!Object.hasOwn(schema.tables, table) && applyTableFilters([table], filters).length === 0) continue;
+    const leftOut = !Object.hasOwn(schema.tables, table) && applyTableFilters([table], filters).length === 0;
+    if (leftOut && (databaseTables === undefined || databaseTables.has(table))) continue;
     merged[key] = type;
   }
   return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+/** The names of every table and view in `schema`, before any include / exclude filter. */
+async function listDatabaseTables(url: string, schema: string): Promise<Set<string>> {
+  const { default: pg } = await import('pg');
+  const client = new pg.Client({ connectionString: url });
+  guardConnection(client);
+  await client.connect();
+  try {
+    const res = await client.query<{ table_name: string }>(
+      'SELECT table_name FROM information_schema.tables WHERE table_schema = $1',
+      [schema],
+    );
+    return new Set(res.rows.map((r) => r.table_name));
+  } finally {
+    await client.end();
+  }
+}
+
+/**
+ * {@link generatorColumnTypes} for a run against a database. The catalog is read
+ * only when an `include` list is set and a config key names a table outside the
+ * generated set, which is the one case where a typo and a table left out look
+ * alike.
+ */
+async function generatorColumnTypesFor(
+  applied: Pick<AppliedColumnTags, 'columnTypes'> | null,
+  config: ResolvedConfig,
+  schema: Pick<SchemaMetadata, 'tables'>,
+  url: string | undefined,
+  namespace: string = config.schema,
+): Promise<Record<string, string> | undefined> {
+  const keys = Object.keys(config.columnTypes ?? {});
+  const outsideInclude =
+    config.include.length > 0 && keys.some((key) => !Object.hasOwn(schema.tables, key.slice(0, key.lastIndexOf('.'))));
+  const databaseTables = outsideInclude && url ? await listDatabaseTables(url, namespace) : undefined;
+  return generatorColumnTypes(applied, config, schema, databaseTables);
 }
 
 // ---------------------------------------------------------------------------
@@ -2538,7 +2586,7 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
     noTimestamp: args.noTimestamp,
     importExtension: config.importExtension,
     keepColumnNames: config.keepColumnNames,
-    columnTypes: generatorColumnTypes(appliedTags, config, schema),
+    columnTypes: await generatorColumnTypesFor(appliedTags, config, schema, url),
   });
 
   genSpinner.succeed(`Generated ${bold(String(result.files.length))} files in ${elapsed(startTime)}`);
@@ -2817,7 +2865,7 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
       importExtension: config.importExtension,
       keepColumnNames: config.keepColumnNames,
       // No schema file is read here, so only the config file's overrides apply.
-      columnTypes: generatorColumnTypes(null, config, schemaMeta),
+      columnTypes: await generatorColumnTypesFor(null, config, schemaMeta, url, 'public'),
     });
     for (const file of gen.files) {
       console.log(`  ${dim(symbols.teeEnd)} ${cyan(join(outDir, file))} ${dim('(client)')}`);
@@ -2907,6 +2955,16 @@ async function cmdPush(args: CliArgs, config: ResolvedConfig): Promise<void> {
     for (const w of advisories) warn(w);
     if (advisories.length > 0) newline();
     printNotCompared(diff.notCompared);
+    // A warning is a difference the diff found and cannot apply (a unique index
+    // that is not unique, a removed enum label), so a gate fails on it. What the
+    // diff only discloses as "not compared" is not a difference it found, and a
+    // CHECK expression that merely reads differently is a warning it cannot
+    // confirm (driftWarnings leaves it out).
+    if (args.exitCode && driftWarnings(diff).length > 0) {
+      warn(`The database differs from the schema file ${dim('(--exit-code: exiting 2)')}.`);
+      newline();
+      process.exit(2);
+    }
     return;
   }
 
@@ -3054,7 +3112,7 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
     console.log(`    ${cyan('--step, -n')}         Number of migrations to apply/rollback`);
     console.log(`    ${cyan('--dry-run')}          Show SQL without executing`);
     console.log(
-      `    ${cyan('--exit-code')}        Exit 2 when ${cyan('status')} finds pending, modified or missing migrations`,
+      `    ${cyan('--exit-code')}        Exit 2 when ${cyan('status')} finds pending, modified, missing or misnamed migrations`,
     );
     console.log(
       `    ${cyan('--wait')}${dim('[=<seconds>]')}   Make ${cyan('deploy')} wait for a concurrent deploy's lock`,
@@ -3065,6 +3123,9 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
     console.log(`    ${cyan('--allow-destructive')} Run data-destroying statements without prompting`);
     console.log(
       `    ${cyan('--allow-drift')}      Re-baseline drifted checksums on ${cyan('up')} / ${cyan('deploy')} / ${cyan('down')} ${dim('(advanced)')}`,
+    );
+    console.log(
+      `    ${cyan('--allow-pooler')}     Run ${cyan('up')} / ${cyan('deploy')} / ${cyan('down')} against a transaction pooler anyway ${dim('(refused by default: the migration lock is session-level and a pooler can release it on another backend)')}`,
     );
     newline();
     console.log(`  ${bold('Recipes')} ${dim('(--recipe):')}`);
@@ -3098,6 +3159,15 @@ async function cmdMigrate(args: CliArgs, config: ResolvedConfig): Promise<void> 
       `${cyan('--wait')} only applies to ${cyan('migrate deploy')}.`,
       'Example: npx turbine migrate deploy --wait=120',
     );
+  }
+
+  // The commands that take the migration lock, before the banner and before any
+  // connection. A dry run takes no lock, so it may use any endpoint.
+  if ((sub === 'up' || sub === 'deploy' || sub === 'down') && args.dryRun !== true && config.url) {
+    refusePoolerConnection(config.url, args, {
+      command: `turbine migrate ${sub}`,
+      explanation: MIGRATE_POOLER_EXPLANATION,
+    });
   }
 
   switch (sub) {
@@ -4008,14 +4078,12 @@ async function cmdMigrateStatus(args: CliArgs, config: ResolvedConfig): Promise<
   }
 
   if (args.exitCode) {
-    const health = summarizeMigrationStatus(statuses);
-    if (!health.ok) {
-      const parts = [
-        health.pending > 0 ? `${health.pending} pending` : '',
-        health.drifted > 0 ? `${health.drifted} modified after being applied` : '',
-        health.missing > 0 ? `${health.missing} missing from disk` : '',
-      ].filter(Boolean);
-      warn(`Migration history is not clean: ${parts.join(', ')} ${dim('(--exit-code: exiting 2)')}.`);
+    const problems = statusGateProblems(
+      summarizeMigrationStatus(statuses),
+      listIgnoredSqlFiles(config.migrationsDir).map(printableCatalogName),
+    );
+    if (problems.length > 0) {
+      warn(`Migration history is not clean: ${problems.join(', ')} ${dim('(--exit-code: exiting 2)')}.`);
       newline();
       process.exit(2);
     }
@@ -4364,6 +4432,24 @@ const CONCURRENTLY_RECIPE_COMMENT = [
 ].join('\n');
 
 /**
+ * Why `migrate up`, `deploy` and `down` refuse a pooled endpoint. The reason is
+ * the migration lock, not the doctor's session-state argument.
+ */
+export const MIGRATE_POOLER_EXPLANATION: readonly string[] = [
+  'turbine migrate serializes runs with a session-level advisory lock (pg_try_advisory_lock).',
+  'That lock belongs to one server backend and only means something while the same backend',
+  'serves every statement of the run. A transaction pooler (PgBouncer, a Neon "-pooler"',
+  "endpoint, Supabase's pooler) hands each transaction to whichever backend is free, so:",
+  '',
+  '  1. The lock is not tied to this run. It can be taken on one backend and released on',
+  '     another, which leaves it held on a shared backend (later runs are told another',
+  '     migration is in progress) and lets two runs apply the same file.',
+  '  2. Session state a migration file sets (SET lock_timeout, SET search_path) is left on',
+  '     a shared backend for other clients, and state an earlier client left there applies',
+  '     to this run.',
+];
+
+/**
  * Refuse a `doctor` run whose connection string points at a transaction pooler.
  *
  * Called BEFORE anything opens a connection, which is the whole point: the
@@ -4384,11 +4470,15 @@ const CONCURRENTLY_RECIPE_COMMENT = [
  * Exported for the unit test only (like {@link isLoopbackHost}): a gate whose
  * failure path is `process.exit` is untestable through the command itself.
  */
-export function refusePoolerConnection(url: string, args: CliArgs): void {
+export function refusePoolerConnection(
+  url: string,
+  args: CliArgs,
+  refusal: { command: string; explanation?: readonly string[] } = { command: 'turbine doctor' },
+): void {
   if (args.allowPooler === true) return;
   const detection = detectPooler(url);
   if (!detection.pooled) return;
-  const lines = poolerRefusalMessage(detection, { command: 'turbine doctor', allowFlag: '--allow-pooler' });
+  const lines = poolerRefusalMessage(detection, { ...refusal, allowFlag: '--allow-pooler' });
   console.error('');
   console.error(`  ${red(symbols.cross)} ${lines[0]}`);
   for (const line of lines.slice(1)) console.error(line === '' ? '' : `  ${line}`);
@@ -5847,7 +5937,7 @@ function showMigrateHelp(): void {
   console.log(`    ${cyan('--step, -n')} ${dim('<N>')}    Number of migrations to apply/rollback`);
   console.log(`    ${cyan('--dry-run')}         Show SQL without executing`);
   console.log(
-    `    ${cyan('--exit-code')}       Exit 2 when migrations are pending, modified or missing ${dim('(status only, CI)')}`,
+    `    ${cyan('--exit-code')}       Exit 2 when migrations are pending, modified, missing or misnamed ${dim('(status only, CI)')}`,
   );
   console.log(
     `    ${cyan('--wait')}${dim('[=<seconds>]')}  Wait for a concurrent deploy to release the lock, default ${DEFAULT_LOCK_WAIT_SECONDS}s ${dim('(deploy only)')}`,
@@ -5857,6 +5947,9 @@ function showMigrateHelp(): void {
   );
   console.log(
     `    ${cyan('--allow-drift')}     Re-baseline drifted checksums, REWRITING history ${dim('(up / deploy / down)')}`,
+  );
+  console.log(
+    `    ${cyan('--allow-pooler')}    Run ${cyan('up')} / ${cyan('deploy')} / ${cyan('down')} through a transaction pooler ${dim('(refused: the migration lock is session-level)')}`,
   );
   console.log(
     `    ${cyan('--allow-destructive')} Run data-destroying migration statements without the interactive confirm`,
@@ -6167,6 +6260,9 @@ function showHelp(): void {
   );
   console.log(
     `    ${cyan('--allow-drift')}        Re-baseline drifted checksums on ${cyan('migrate up')} / ${cyan('deploy')} / ${cyan('down')} ${dim('(advanced)')}`,
+  );
+  console.log(
+    `    ${cyan('--allow-pooler')}       Let ${cyan('migrate up')} / ${cyan('deploy')} / ${cyan('down')} and ${cyan('doctor')} use a transaction pooler ${dim('(refused by default)')}`,
   );
   newline();
 

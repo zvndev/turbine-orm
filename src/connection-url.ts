@@ -214,7 +214,30 @@ export interface PoolerRefusalOptions {
   command: string;
   /** The flag that overrides the refusal, e.g. `--allow-pooler`. */
   allowFlag: string;
+  /**
+   * Why THIS command cannot use a pooler, in place of the default paragraph
+   * (written for `doctor`: session state, session-scoped views, the read bound).
+   * Lines are printed as given, between the endpoint and the advice to use the
+   * direct endpoint.
+   */
+  explanation?: readonly string[];
 }
+
+/** Why `turbine doctor` refuses a pooler; the paragraph {@link poolerRefusalMessage} prints by default. */
+const DEFAULT_POOLER_EXPLANATION: readonly string[] = [
+  'A transaction pooler (PgBouncer, a Neon "-pooler" endpoint, Supabase\'s pooler) does not',
+  'give a client its own server backend. It multiplexes many clients onto a few shared',
+  'backends and reuses one as soon as a transaction ends, so:',
+  '',
+  '  1. Session state is not private. Anything this command sets on the session can be left',
+  '     behind for another client, and whatever an earlier client left behind can be in',
+  '     force for this one. That is how a "read-only guardrail" becomes an outage.',
+  '  2. Session-scoped views describe the wrong session. pg_prepared_statements, which this',
+  '     report tells you to read to confirm a cached plan, belongs to whichever backend',
+  '     answered, not to your application.',
+  '  3. The read bounds may not apply. This command asks for its statement_timeout as a',
+  '     connection parameter, and a pooler is free to drop or reject one.',
+];
 
 /**
  * The lines a command prints when it refuses a pooler endpoint.
@@ -235,18 +258,7 @@ export function poolerRefusalMessage(detection: PoolerDetection, options: Pooler
     `  Endpoint: ${where}${detection.port === null ? '' : `:${detection.port}`}`,
     `  Detected: ${what}`,
     '',
-    'A transaction pooler (PgBouncer, a Neon "-pooler" endpoint, Supabase\'s pooler) does not',
-    'give a client its own server backend. It multiplexes many clients onto a few shared',
-    'backends and reuses one as soon as a transaction ends, so:',
-    '',
-    '  1. Session state is not private. Anything this command sets on the session can be left',
-    '     behind for another client, and whatever an earlier client left behind can be in',
-    '     force for this one. That is how a "read-only guardrail" becomes an outage.',
-    '  2. Session-scoped views describe the wrong session. pg_prepared_statements, which this',
-    '     report tells you to read to confirm a cached plan, belongs to whichever backend',
-    '     answered, not to your application.',
-    '  3. The read bounds may not apply. This command asks for its statement_timeout as a',
-    '     connection parameter, and a pooler is free to drop or reject one.',
+    ...(options.explanation ?? DEFAULT_POOLER_EXPLANATION),
     '',
     'Use the DIRECT (non-pooled) endpoint for the same database instead.',
   ];

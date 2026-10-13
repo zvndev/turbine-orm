@@ -2357,6 +2357,27 @@ export interface MigrationHealth {
   ok: boolean;
 }
 
+/**
+ * Every reason `migrate status --exit-code` exits 2, as phrases for the message.
+ * Empty means the gate passes. `ignoredFiles` are the `.sql` files in the
+ * migrations directory whose name the runner never matches (see
+ * {@link listIgnoredSqlFiles}): a migration that will never run is as much a
+ * disagreement between the files and the database as a pending one.
+ */
+export function statusGateProblems(health: MigrationHealth, ignoredFiles: readonly string[]): string[] {
+  const problems: string[] = [];
+  if (health.pending > 0) problems.push(`${health.pending} pending`);
+  if (health.drifted > 0) problems.push(`${health.drifted} modified after being applied`);
+  if (health.missing > 0) problems.push(`${health.missing} missing from disk`);
+  if (ignoredFiles.length > 0) {
+    problems.push(
+      `${ignoredFiles.length} misnamed .sql file(s) that will never run (${ignoredFiles.join(', ')}; ` +
+        `a migration filename is YYYYMMDDHHMMSS_name.sql)`,
+    );
+  }
+  return problems;
+}
+
 /** Count the ways a migration history can disagree with the files on disk. */
 export function summarizeMigrationStatus(statuses: readonly MigrationStatus[]): MigrationHealth {
   const pending = statuses.filter((st) => !st.applied).length;

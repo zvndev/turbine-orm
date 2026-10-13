@@ -143,13 +143,13 @@ describe('turbine push --dry-run --exit-code', () => {
     await f.pool.query(`DROP INDEX "${f.pgSchema}".hand_made`);
   });
 
-  live.it('a difference push cannot apply is not called "in sync", and does not fail the gate', async () => {
+  live.it('a difference push cannot apply is not called "in sync", and fails the gate', async () => {
     f.schema(`${ID}\n${EMAIL}\n    indexes: [{ columns: ['email'], name: 'users_email_lookup' }],`);
     assert.equal(f.project.cli(['push']).status, 0);
     await f.pool.query(`DROP INDEX "${f.pgSchema}".users_email_lookup`);
     await f.pool.query(`CREATE UNIQUE INDEX users_email_lookup ON "${f.pgSchema}".users (email)`);
     const run = f.project.cli(['push', '--dry-run', '--exit-code']);
-    assert.equal(run.status, 0, run.output);
+    assert.equal(run.status, 2, run.output);
     assert.doesNotMatch(run.output, /already in sync/);
     assert.match(run.output, /not fully in sync/);
     assert.match(run.output, /users_email_lookup/);
