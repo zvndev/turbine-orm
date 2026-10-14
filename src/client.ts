@@ -60,6 +60,7 @@ import { hasRelationFields } from './nested-write.js';
 import { type ObserveConfig, ObserveEngine, type ObserveHandle } from './observe.js';
 import type { PgCompatPool, PgCompatPoolClient, PgCompatQueryResult } from './pg-types.js';
 import { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
+import { txQueryOptions } from './query/builder.js';
 import {
   type DeferredQuery,
   type GlobalFilters,
@@ -1743,7 +1744,7 @@ export class TransactionClient {
       // Create a QueryInterface that uses the transaction client as its "pool"
       // We use a proxy pool that routes queries through the transaction client
       const txPool = this.createTxPool();
-      const txOpts = { ...this.queryOptions, _txScoped: true };
+      const txOpts = txQueryOptions(this.queryOptions);
       qi = txOpts.queryInterfaceFactory
         ? asQueryInterface(txOpts.queryInterfaceFactory(txPool, name, this.schema, this.middlewares, txOpts))
         : new QueryInterface<object>(txPool, name, this.schema, this.middlewares, txOpts);

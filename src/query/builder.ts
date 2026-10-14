@@ -727,6 +727,78 @@ function defaultJsonEncoding(dialect: Dialect): JsonEncoding {
   return dialect.capabilities.positionalJson ? 'positional' : 'object';
 }
 
+/**
+ * SQL template caches shared by every QueryInterface built from ONE options
+ * object, for one schema and one table.
+ *
+ * A transaction builds its own QueryInterface per table, so before this each
+ * `$transaction` started with an empty cache and rebuilt the SQL of every
+ * statement it sent. TransactionClient now hands every transaction of a client
+ * the same options object (`txQueryOptions` in client.ts), so they share one
+ * cache per table and a statement is built once per process, as it is outside
+ * a transaction.
+ *
+ * THE KEY IS THE OPTIONS OBJECT'S IDENTITY, deliberately, not a fingerprint of
+ * its fields. Options change the SQL (`defaultLimit`, `jsonEncoding`,
+ * `globalFilters`, the dialect, ...), and a cache key does not carry them,
+ * because one QueryInterface never sees two values. A copy that changes any
+ * field is a new object and so gets its own caches: the batched loader's
+ * children (`defaultLimit: undefined`) can never be served the parent's SQL,
+ * and no list of SQL-affecting options exists to fall out of date. Nothing
+ * mutates an options object after construction.
+ */
+const sharedTemplateCaches = new WeakMap<
+  QueryInterfaceOptions,
+  WeakMap<SchemaMetadata, Map<string, LRUCache<string, SqlCacheEntry>>>
+>();
+
+/**
+ * The options a transaction's query interfaces are built with: `options` plus
+ * `_txScoped`. ONE object per options object, so every transaction of a client
+ * (and every nested write inside one) builds its query interfaces from the same
+ * object and shares their template caches (see {@link templateCacheFor}). A
+ * fresh copy per transaction gave each `$transaction` an empty cache, so every
+ * statement in it rebuilt its SQL. Options that are already transaction-scoped
+ * are returned as they are.
+ */
+const txOptionsCache = new WeakMap<QueryInterfaceOptions, QueryInterfaceOptions>();
+
+export function txQueryOptions(options: QueryInterfaceOptions | undefined): QueryInterfaceOptions {
+  if (options === undefined) return { _txScoped: true };
+  if (options._txScoped === true) return options;
+  let tx = txOptionsCache.get(options);
+  if (tx === undefined) {
+    tx = { ...options, _txScoped: true };
+    txOptionsCache.set(options, tx);
+  }
+  return tx;
+}
+
+function templateCacheFor(
+  options: QueryInterfaceOptions | undefined,
+  schema: SchemaMetadata,
+  table: string,
+  capacity: number,
+): LRUCache<string, SqlCacheEntry> {
+  if (options === undefined) return new LRUCache<string, SqlCacheEntry>(capacity);
+  let bySchema = sharedTemplateCaches.get(options);
+  if (bySchema === undefined) {
+    bySchema = new WeakMap();
+    sharedTemplateCaches.set(options, bySchema);
+  }
+  let byTable = bySchema.get(schema);
+  if (byTable === undefined) {
+    byTable = new Map();
+    bySchema.set(schema, byTable);
+  }
+  let cache = byTable.get(table);
+  if (cache === undefined) {
+    cache = new LRUCache<string, SqlCacheEntry>(capacity);
+    byTable.set(table, cache);
+  }
+  return cache;
+}
+
 // ---------------------------------------------------------------------------
 // Deferred query + option types (see deferred.ts)
 // ---------------------------------------------------------------------------
@@ -1064,7 +1136,10 @@ export class QueryInterface<
     // treated as the default rather than throwing.
     const sqlCacheSize = options?.sqlCacheSize;
     this.sqlCacheEnabled = options?.sqlCache !== false && sqlCacheSize !== 0;
-    this.sqlTemplateCache = new LRUCache<string, SqlCacheEntry>(
+    this.sqlTemplateCache = templateCacheFor(
+      options,
+      schema,
+      table,
       sqlCacheSize !== undefined && sqlCacheSize > 0 ? Math.floor(sqlCacheSize) : 1000,
     );
     this.dialect = options?.dialect ?? postgresDialect;
@@ -2590,8 +2665,11 @@ export class QueryInterface<
   }
 
   /**
-   * Return cache hit/miss statistics for this QueryInterface instance.
-   * Useful for monitoring and benchmarking.
+   * SQL template cache statistics. `hits`, `misses` and `hitRate` count this
+   * accessor's own lookups. `size` is the entries in the cache it reads, which
+   * since 0.90.2 is shared with every accessor built from the same client
+   * options for this table: a client's primary and replica accessors share
+   * one, and all of its transactions share another (see `templateCacheFor`).
    */
   cacheStats(): { hits: number; misses: number; hitRate: number; size: number } {
     const total = this.cacheHits + this.cacheMisses;
@@ -5340,7 +5418,10 @@ export class QueryInterface<
     const pool = this.pool;
     const schema = this.schema;
     const middlewares = this.middlewares;
-    const opts: QueryInterfaceOptions = { ...this.options, _txScoped: true };
+    // The client's transaction options object, not a copy per call: the SQL
+    // template cache is shared by options-object identity, so a fresh copy
+    // rebuilt the SQL of every child statement of every nested write.
+    const opts = txQueryOptions(this.options);
     return {
       schema,
       tx: unlockNestedWriteTx(this.makeTxProxy(pool, schema, middlewares, opts)),
