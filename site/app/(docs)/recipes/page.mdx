@@ -1,17 +1,17 @@
 export const metadata = {
   title: 'Framework Integration',
   description:
-    'Practical Turbine ORM recipes: a singleton client in a Next.js Route Handler, an Express request handler, and end-to-end Postgres Row-Level Security with CREATE POLICY and $withSession.',
+    'Wire Turbine into a Next.js Route Handler or an Express app, and enforce tenant isolation with PostgreSQL Row-Level Security and $withSession.',
   alternates: { canonical: '/recipes' },
 };
 
 # Framework Integration
 
-Patterns for wiring Turbine into an app. Each one is small, because Turbine is a client you create once and call from your handlers.
+Create one client per process and call it from your handlers. These recipes show the wiring.
 
 ## Next.js, singleton client + Route Handler
 
-Create the client **once** and reuse it. In development, Next.js hot reload re-evaluates modules and would open a new connection pool on every save, so keep the instance on `globalThis`.
+Next.js hot reload re-evaluates modules in development, which would open a new pool on every save. Keep the client on `globalThis`:
 
 ```ts
 // lib/db.ts
@@ -27,7 +27,7 @@ export const db =
 if (process.env.NODE_ENV !== 'production') globalForDb.db = db;
 ```
 
-Import that `db` from any Route Handler. Don't call `db.disconnect()` per request: the pool is long-lived and shared.
+Import that `db` in any Route Handler. Do not call `db.disconnect()` per request; the pool is shared.
 
 ```ts
 // app/api/users/route.ts
@@ -56,17 +56,17 @@ export async function POST(req: Request) {
 }
 ```
 
-> On a serverless or edge runtime instead of the Node server, bind an external HTTP pool with `turbineHttp`. See **[Serverless & Edge](/serverless)**.
+On an edge runtime, bind an HTTP pool with `turbineHttp` instead. See [Serverless & Edge](/serverless).
 
 ## Express, request handler
 
-Create the client at startup and disconnect on shutdown. Pass errors to `next(err)` so your error middleware can map typed Turbine errors to status codes.
+Create the client at startup and disconnect on shutdown. Pass errors to `next(err)` so one error handler maps Turbine's typed errors to status codes.
 
 ```ts
 // server.ts
 import express from 'express';
 import { turbine } from './generated/turbine/index.js';
-import { NotFoundError } from 'turbine-orm';
+import { NotFoundError, UniqueConstraintError } from 'turbine-orm';
 
 const db = turbine({ connectionString: process.env.DATABASE_URL });
 const app = express();
@@ -74,20 +74,19 @@ app.use(express.json());
 
 app.get('/users/:id', async (req, res, next) => {
   try {
-    const user = await db.users.findUnique({
+    const user = await db.users.findUniqueOrThrow({
       where: { id: Number(req.params.id) },
       with: { posts: { limit: 10 } },
     });
-    if (!user) return res.status(404).json({ error: 'Not found' });
     res.json(user);
   } catch (err) {
-    next(err);
+    next(err); // a NotFoundError becomes a 404 below
   }
 });
 
 app.post('/users', async (req, res, next) => {
   try {
-    const user = await db.users.create({ data: req.body });
+    const user = await db.users.create({ data: { email: req.body.email, name: req.body.name } });
     res.status(201).json(user);
   } catch (err) {
     next(err);
@@ -95,15 +94,21 @@ app.post('/users', async (req, res, next) => {
 });
 
 // Map typed Turbine errors to HTTP status codes.
-app.use((err, _req, res, _next) => {
-  if (err instanceof NotFoundError) return res.status(404).json({ error: err.message });
-  console.error(err);
-  res.status(500).json({ error: 'Internal error' });
-});
+const onError: express.ErrorRequestHandler = (err, _req, res, _next) => {
+  if (err instanceof NotFoundError) {
+    res.status(404).json({ error: err.message });
+  } else if (err instanceof UniqueConstraintError) {
+    res.status(409).json({ error: err.message });
+  } else {
+    console.error(err);
+    res.status(500).json({ error: 'Internal error' });
+  }
+};
+app.use(onError);
 
 const server = app.listen(3000);
 
-// Graceful shutdown, drain the pool.
+// Graceful shutdown: drain the pool.
 process.on('SIGTERM', async () => {
   server.close();
   await db.disconnect();
@@ -112,11 +117,11 @@ process.on('SIGTERM', async () => {
 
 ## Multi-tenant isolation with Row-Level Security
 
-Put the tenant boundary in Postgres, so a forgotten `WHERE tenant_id = …` cannot leak data. You write a policy once and the database enforces it on every query.
+Put the tenant boundary in PostgreSQL, so a forgotten `WHERE tenant_id = ...` cannot leak data. You write the policy once and the database applies it to every query.
 
 ### 1. Define the policy
 
-Enable RLS on the table and add a policy that reads the tenant from a transaction-local setting (a GUC). The two-argument `current_setting(name, true)` returns NULL instead of erroring when the setting is absent.
+Enable RLS and add a policy that reads the tenant from a transaction-local setting. `current_setting(name, true)` returns NULL, rather than an error, when the setting is absent.
 
 ```sql
 -- migration: isolate documents by tenant
@@ -126,13 +131,13 @@ CREATE POLICY tenant_isolation ON documents
   USING (tenant_id = current_setting('app.current_tenant', true)::int);
 ```
 
-Your application must connect as a role that is subject to RLS. The table owner bypasses policies unless you also run `ALTER TABLE documents FORCE ROW LEVEL SECURITY`, and superusers always bypass them.
+Connect as a role that RLS applies to. Superusers always bypass policies, and the table owner does too unless you run `ALTER TABLE documents FORCE ROW LEVEL SECURITY`.
 
-A policy with only a `USING` clause also checks rows you insert or update, so a new row needs the current tenant's `tenant_id`. Give the column a default such as `current_setting('app.current_tenant')::int`, or set it in `data`.
+A policy with only `USING` also checks rows you insert or update, so a new row needs the current tenant's `tenant_id`. Give the column a default such as `current_setting('app.current_tenant')::int`, or set it in `data`.
 
 ### 2. Set the tenant per request
 
-`$withSession(context, fn)` opens a transaction, applies each entry with `SELECT set_config(name, value, true)` right after `BEGIN`, then runs your callback. Every query inside sees only the matching rows. The settings are transaction-local, so they reset on commit or rollback.
+`$withSession(context, fn)` opens a transaction, sets each entry with `set_config(name, value, true)`, then runs your callback. Every query inside sees only the tenant's rows, and the settings reset at commit or rollback.
 
 ```ts
 import { db } from '@/lib/db';
@@ -145,7 +150,7 @@ async function listDocuments(tenantId: number) {
 }
 ```
 
-`$withSession` is shorthand for `$transaction(fn, { sessionContext })`. Use the longer form when you also want other transaction options:
+`$withSession` is shorthand for `$transaction(fn, { sessionContext })`. Use the long form to add other [transaction options](/transactions#transaction-options):
 
 ```ts
 await db.$transaction(
@@ -157,11 +162,11 @@ await db.$transaction(
 );
 ```
 
-Values may be strings, numbers or booleans, and reach the database as text. Names must be namespaced custom settings such as `app.current_tenant`; setting one of PostgreSQL's own settings needs `allowBuiltinSettings`. An invalid name, or a value of any other type (`undefined` included), throws `ValidationError` before a connection is taken.
+Values may be strings, numbers or booleans. Names need a dot, like `app.current_tenant`. An invalid name, or `undefined`, throws `ValidationError` ([E003](/errors#e003)) before a connection is taken.
 
 ### 3. Wire it into a handler
 
-Read the tenant from your auth layer and run every query through the session:
+Read the tenant from your auth layer and run the queries through the session:
 
 ```ts
 // app/api/documents/route.ts
@@ -180,11 +185,10 @@ export async function GET(req: Request) {
 }
 ```
 
-The query code never filters by tenant. The policy does it.
-
 ## See also
 
-- **[Transactions & Pipelines](/transactions)**: `$transaction`, `$withSession`, isolation levels and `sessionContext` in depth.
-- **[Serverless & Edge](/serverless)**: the client on edge runtimes via `turbineHttp`.
-- **[Typed Errors](/errors)**: mapping Turbine errors to HTTP responses.
-- **[Quick Start](/quickstart)**: generating the typed client these recipes import.
+- [Transactions](/transactions): `$transaction`, `$withSession` and `sessionContext`.
+- [Global filters](/global-filters): tenant scoping in the application instead of the database.
+- [Serverless & Edge](/serverless): the client on edge runtimes.
+- [Typed errors](/errors): every error class to map to a status code.
+- [Quick Start](/quickstart): generating the typed client these recipes import.

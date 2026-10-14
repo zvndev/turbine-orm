@@ -1,26 +1,28 @@
 export const metadata = {
   title: 'Zod Schemas',
   description:
-    'Generate Zod validators from your database schema with Turbine ORM, per-table entity, create, and update schemas derived from column metadata.',
+    'Generate Zod schemas from your database with turbine generate --zod: a row, create and update schema per table for validating untrusted input.',
   alternates: { canonical: '/zod' },
 };
 
 # Zod Schemas
 
-`turbine generate --zod` writes a `zod.ts` file next to your generated types, with a [Zod](https://zod.dev) schema per table. Use it to validate request bodies, form input or any other untrusted data against the shape your database expects. The schemas come from column metadata, so regenerating keeps them in step with the database.
-
-```bash
-npx turbine generate --zod
-```
-
-This adds a fourth file to the output directory, alongside `types.ts`, `metadata.ts` and `index.ts`:
-
-- **`zod.ts`**: `XSchema`, `XCreateSchema` and `XUpdateSchema` for each table.
-
-The generated file imports `zod`, but the Turbine runtime never does, so install Zod yourself:
+`turbine generate --zod` writes a `zod.ts` file with a [Zod](https://zod.dev) schema per table. Use it to validate request bodies and other untrusted input before a write.
 
 ```bash
 npm install zod
+npx turbine generate --zod
+```
+
+The file sits next to `types.ts`, `metadata.ts` and `index.ts`. It imports `zod`; the Turbine runtime does not, so install Zod yourself.
+
+## Using the schemas
+
+```ts
+import { PostCreateSchema } from './generated/turbine/zod.js';
+
+const data = PostCreateSchema.parse(await req.json());
+const post = await db.posts.create({ data });
 ```
 
 ## The three schemas
@@ -30,7 +32,7 @@ For a `posts` table, generation emits:
 ```ts
 import { z } from 'zod';
 
-// Full entity, every column
+// Every column, as a read returns it
 export const PostSchema = z.object({
   id: z.number(),
   title: z.string(),
@@ -39,7 +41,7 @@ export const PostSchema = z.object({
   createdAt: z.coerce.date(),
 });
 
-// Create input: server-generated, defaulted and nullable columns optional
+// Create input: generated, defaulted and nullable columns are optional
 export const PostCreateSchema = z.object({
   id: z.number().optional(),
   title: z.string(),
@@ -48,7 +50,7 @@ export const PostCreateSchema = z.object({
   createdAt: z.coerce.date().optional(),
 });
 
-// Update input, every non-PK column optional, PK omitted
+// Update input: every column optional, primary key omitted
 export const PostUpdateSchema = z.object({
   title: z.string().optional(),
   views: z.number().optional(),
@@ -57,42 +59,27 @@ export const PostUpdateSchema = z.object({
 });
 ```
 
-`XCreateSchema` and `XUpdateSchema` mirror the generated `*Create` / `*Update` input types:
-
-- The create schema makes server-generated (serial / identity), defaulted and nullable columns optional. A primary key that is none of those is **required**: a `text` natural key, a client-supplied `uuid` with no database default, or a composite key of plain integers.
-- The update schema makes every non-PK column optional and drops the primary key.
+They match the generated `*Create` and `*Update` types. A primary key the database does not generate or default stays required in the create schema, such as a `text` natural key or a `uuid` with no default. [STORED generated columns](/views) appear only in the row schema.
 
 ## Type mapping
 
 | Column | Zod |
 |---|---|
 | `text`, `varchar`, `uuid` | `z.string()` |
-| `int`, `bigint`, `float` | `z.number()`. The create and update schemas also accept a string or a `bigint` for a `bigint` column. |
-| `numeric` | `z.string()`, since `numeric` reads as exact decimal text. The create and update schemas also accept a number. |
+| `int`, `float` | `z.number()` |
+| `bigint` | `z.number()`. Create and update also accept a string or a `bigint`. |
+| `numeric` | `z.string()`. Create and update also accept a number. |
 | `boolean` | `z.boolean()` |
-| `timestamp`, `date` | `z.coerce.date()` |
+| `timestamp`, `timestamptz`, `date` | `z.coerce.date()`, which accepts a `Date` or a date string |
+| `time`, `timetz` | `z.string()`. Create and update also accept a `Date`. |
 | `json`, `jsonb` | `z.unknown()` |
-| enum column | `z.enum([...labels])` |
-| array column | element schema `.array()` |
+| `bytea` | `z.instanceof(Uint8Array)` |
+| enum | `z.enum([...labels])` |
 | `vector` | `z.array(z.number())` |
-| nullable column | schema `.nullable()` |
-
-`z.coerce.date()` accepts both `Date` objects and date strings, so it validates JSON request bodies, where dates arrive as strings.
-
-`STORED` generated columns are left out of `XCreateSchema` and `XUpdateSchema` because you cannot write them (see [Views & Generated Columns](/views)). They stay in the full `XSchema`.
-
-## Using the schemas
-
-```ts
-import { PostCreateSchema } from './generated/turbine/zod.js';
-
-// Validate an untrusted request body before writing
-const data = PostCreateSchema.parse(await req.json());
-const post = await db.posts.create({ data });
-```
+| array column | the element schema with `.array()` |
+| nullable column | the schema with `.nullable()` |
 
 ## See also
 
-- **[CLI](/cli)**: the `generate` command and every flag.
-- **[Views & Generated Columns](/views)**: why generated columns are left out of Create/Update.
-- **[Schema & Migrations](/schema)**: the column metadata these schemas come from.
+- [CLI](/cli): `turbine generate` and its flags.
+- [Schema & Migrations](/schema): the column metadata these schemas come from.

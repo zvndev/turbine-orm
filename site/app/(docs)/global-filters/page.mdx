@@ -1,22 +1,15 @@
 export const metadata = {
   title: 'Global Filters',
   description:
-    'Automatic WHERE filters for soft-delete and multi-tenancy in Turbine ORM, applied to every read, mutation, and relation subquery, with a per-query opt-out.',
+    'Add a where clause to every query on a table, for soft delete and multi-tenancy, including relation loads and mutations, with an explicit per-query opt-out.',
   alternates: { canonical: '/global-filters' },
 };
 
 # Global Filters
 
-A global filter is a `WHERE` predicate Turbine merges into **every** query on a table: reads, mutations, and the relation subqueries that target it. Two patterns need it:
-
-- **Soft delete**: hide rows where `deletedAt` is set, everywhere, without adding `where: { deletedAt: null }` to every query.
-- **Multi-tenancy**: scope every query to the current tenant, evaluated per request.
-
-You configure global filters once on the client, and Turbine `AND`s them into the compiled `WHERE`. Values are always parameterized.
+A global filter is a `where` that Turbine adds to every query on a table: reads, updates, deletes, and the relation queries that reach the table. Use it for soft delete and multi-tenancy.
 
 ## Configuration
-
-Pass `globalFilters` to the client, keyed by table accessor (`db.blogPosts`) or by table name (`blog_posts`). Either spelling works. Each value is a `WhereClause`, or a function that returns one:
 
 ```ts
 import { turbine } from './generated/turbine/index.js';
@@ -24,175 +17,123 @@ import { turbine } from './generated/turbine/index.js';
 const db = turbine({
   connectionString: process.env.DATABASE_URL,
   globalFilters: {
-    // Soft delete, static filter
-    posts: { deletedAt: null },
+    posts: { deletedAt: null },                      // soft delete
     users: { deletedAt: null },
-
-    // Multi-tenancy, evaluated per query build
-    orders: () => ({ tenantId: currentTenant() }),
+    orders: () => ({ tenantId: currentTenant() }),   // evaluated per query
   },
 });
 ```
 
-With this in place, `db.posts.findMany()` compiles to `... WHERE "deleted_at" IS NULL`, with no `where` needed.
-
-The map is checked when the client is constructed, because a filter that silently applies to nothing returns the very rows it was meant to hide. Each of these throws `ValidationError` ([`TURBINE_E003`](/errors#e003)) from the constructor, naming the bad key and the closest valid one:
-
-- A key that names no table (a typo, or a table that was renamed).
-- Two keys for one table (`blogPosts` and `blog_posts`). Combine them with `AND: [...]`.
-- A static filter whose keys name no column or relation of that table.
-- A static `AND` / `OR` / `NOT` that cannot be read as written: `OR: { ... }` (an object where an array belongs; write `OR: [{ ... }]`), or a combinator holding a scalar or `null`.
-- A static relation filter whose value is not a where object, such as `author: { is: 5 }` or `posts: { some: null }`. These are the same shapes a query refuses (see [Relation filters](/queries#relation-filters)).
-- A value that is neither a where object nor a function, including `undefined`.
-- Anything a query with that `where` would refuse, because each static filter is compiled once at construction: an operand that does not fit its operator or column, a plain `{ col }` object where `col()` is needed, an operator object with no operator (`{ name: { mode: 'insensitive' } }`), a misspelled column inside a relation filter, or an `undefined` value. The message starts with `globalFilters["<key>"]:`.
-- A static filter that reaches its own table through relation filters, such as `users: { posts: { some: {} } }` beside `posts: { author: { is: { active: true } } }`, where each filter applies inside the other's relation filter. The message names the chain.
-
-A broken static filter stops the client from being built, even if the table is never queried.
-
-A static `null` is accepted and means "no filter for this table".
-
-A generated client also catches these at compile time. The generated `turbine()` and constructor take `TypedTurbineConfig`, whose `globalFilters` is typed per table, so a misspelled table or column in a static filter or in a function's return value is a type error. If your generated client predates this, regenerate it.
-
 ```ts
-const posts = await db.posts.findMany();
+await db.posts.findMany();
 // SELECT ... FROM "posts" WHERE "deleted_at" IS NULL
 
-const active = await db.users.findMany({ where: { role: 'admin' } });
+await db.users.findMany({ where: { role: 'admin' } });
 // SELECT ... FROM "users" WHERE "role" = $1 AND "deleted_at" IS NULL
 ```
 
+Key each filter by table name (`blog_posts`) or client accessor (`blogPosts`). A value is a where object, a function that returns one, or `null` for no filter. Values are always bound as parameters.
+
+The constructor compiles every static filter and throws `ValidationError` ([E003](/errors#e003)), naming the key, for:
+
+- a key that names no table, or two keys for one table;
+- a value that is not a where object, a function or `null`, or a static filter holding `undefined`;
+- a static filter naming something that is not a column or relation, or that a query would refuse;
+- static filters that reach each other in a cycle through relation filters.
+
+A generated client also types `globalFilters` per table, so a misspelled table or column is a compile error.
+
 ## Function filters, per-request tenancy
 
-A function filter runs **every time a query is built**, so a closure over per-request state gives you a request-scoped filter. Use it for tenant isolation:
+A function filter runs each time a query is built, so it can read per-request state:
 
 ```ts
 const db = turbine({
   connectionString: process.env.DATABASE_URL,
   globalFilters: {
     orders: () => ({ tenantId: getCurrentTenantId() }),
+    invoices: () => (isAdmin() ? null : { tenantId: getCurrentTenantId() }),
   },
 });
 
-// Later, inside a request handler where getCurrentTenantId() returns 't-42':
-const orders = await db.orders.findMany();
+await db.orders.findMany();
 // SELECT ... FROM "orders" WHERE "tenant_id" = $1   -- params: ['t-42']
 ```
 
-A function filter fails closed. If it returns `undefined`, or a filter holding `undefined` at any depth (`{ tenantId: undefined }` when the request carries no tenant), the query throws `ValidationError` (`TURBINE_E003`) instead of running unfiltered. To apply no filter on purpose, return `null` or `{}`:
-
-```ts
-globalFilters: {
-  // Throws when no tenant is set, rather than reading every tenant's orders.
-  orders: () => ({ tenantId: getCurrentTenantId() }),
-
-  // An admin context opts out explicitly.
-  invoices: () => (isAdmin() ? null : { tenantId: getCurrentTenantId() }),
-},
-```
-
-The filter's **shape** is part of the SQL cache key, and its **values** are collected again on every build. Two requests with different tenant ids reuse the same cached SQL but bind their own parameters. A filter that changes shape (`{ deletedAt: null }` on one call, `{ tenantId: 't' }` on the next) gets a separate cache entry for each shape.
+Function filters fail closed. Returning `undefined`, or a filter holding it (`{ tenantId: undefined }` when no tenant is set), throws `ValidationError` ([E003](/errors#e003)) rather than run unfiltered. Return `null` or `{}` to skip the filter on purpose, as `invoices` does for admins.
 
 ## Filters flow into relations
 
-Global filters apply to **relation subqueries** too. A filter on `posts` restricts `posts` wherever it appears, including when they are loaded through a parent's `with` clause.
+A table's filter applies wherever its rows appear, including under another table's `with`:
 
 ```ts
 // globalFilters: { posts: { deletedAt: null } }
 const users = await db.users.findMany({
-  with: { posts: true },
+  with: { posts: true, _count: { posts: true } },
+  where: { posts: { some: { published: true } } },
 });
-// The correlated posts subquery ANDs "deleted_at" IS NULL -
-// soft-deleted posts never appear under any user.
+// users[n].posts, the _count and the `some` filter all skip deleted posts
 ```
 
-A target-table filter is applied to:
+That covers `with` relations on every load strategy, the relation filters `some`, `every`, `none` and `is`, relation `_count`, and ordering by `_count`.
 
-- The `with` relation subquery, under both the default `join` strategy and the `batched` strategy
-- Relation filters: `some`, `every`, `none` and belongsTo `is`
-- Relation `_count` and relation `orderBy: { posts: { _count: 'desc' } }`
-
-So with a soft-delete filter on `posts`, a user's post `_count` counts only live posts, and `where: { posts: { some: {...} } }` matches only live posts.
-
-A filter can itself hold a relation filter, such as `posts: { author: { is: { active: true } } }`. The `users` filter then applies inside it, as it does inside any relation filter. Function filters that reach each other this way, or a function filter that reaches its own table, apply once per chain: while a table's filter is being compiled, a relation that leads back to that table reads its rows unfiltered, which ends the chain. Static filters that form such a cycle are refused when the client is built (see above).
+A filter can contain a relation filter, such as `posts: { author: { is: { active: true } } }`, and the `users` filter then applies inside it. If function filters lead back to a table whose filter is being built, that step reads unfiltered, ending the chain.
 
 ## Mutations and the empty-where guard
 
-Global filters apply to `update`, `updateMany`, `delete`, `deleteMany` and the conflict `UPDATE` of `upsert`. `create` and `createMany` are **never** filtered: an insert has nothing to scope.
+Filters apply to `update`, `updateMany`, `delete`, `deleteMany` and the conflict update of `upsert`. `create` and `createMany` are never filtered.
 
-The conflict update of `upsert` needs an engine that can put a predicate on it. PostgreSQL and SQLite emit `ON CONFLICT … DO UPDATE … WHERE`. MySQL's `ON DUPLICATE KEY UPDATE`, SQL Server's `MERGE` and PowDB's `upsert` cannot carry the filter there. On those engines an `upsert` on a filtered table runs as a filtered lookup, then an update or an insert, in one transaction. Another tenant's row is invisible to the lookup and is never updated.
+On MySQL, SQL Server and PowDB, an `upsert` on a filtered table runs as a filtered lookup and then an update or insert, in one transaction, so another tenant's row is never updated. A [batched](/queries#pipeline) `buildUpsert` on those engines throws `UnsupportedFeatureError` ([E017](/errors#e017)), since a batch has no round trip for the lookup.
 
-A [batched](/queries#pipeline) `buildUpsert` on a filtered table is refused on those engines with `UnsupportedFeatureError` (`TURBINE_E017`), because a batched statement has no round trip for the lookup. Pass `skipGlobalFilters: UNSAFE` when the upsert is meant to reach every row.
-
-A global filter does **not** satisfy the [empty-where guard](/queries#delete--deletemany). The guard checks the `where` you pass, so an unqualified mass mutation is still refused even when a filter is configured:
+A filter does not satisfy the [empty-where guard](/queries#delete--deletemany), which checks only the `where` you pass:
 
 ```ts
 // globalFilters: { users: { deletedAt: null } }
 await db.users.deleteMany({ where: {} });
-// ❌ ValidationError (TURBINE_E003), the filter does NOT make this safe.
+// ❌ ValidationError (E003)
 
 await db.users.deleteMany({ where: { orgId: 1 } });
-// ✅ Deletes org-1 users, AND-merged with "deleted_at" IS NULL.
+// ✅ deletes org 1's users where "deleted_at" IS NULL
 ```
 
-The filter still compiles into the `WHERE`, but it does not turn `{}` into an allowed statement.
-
 ## Opting out, `skipGlobalFilters`
-
-Any read or mutation accepts `skipGlobalFilters` to bypass filters for that call. It is a **privilege option**: only the `UNSAFE` symbol turns it on.
 
 ```ts
 import { UNSAFE } from 'turbine-orm';
 
-// See a soft-deleted row (admin tooling): skip every filter on this call
+// Skip every filter on this call
 const all = await db.posts.findMany({ skipGlobalFilters: UNSAFE });
 
-// Skip only the `posts` filter, keep others. The array LEADS with the sentinel.
+// Skip only the posts filter. The array starts with UNSAFE.
 const some = await db.users.findMany({
   with: { posts: true },
   skipGlobalFilters: [UNSAFE, 'posts'],
 });
 ```
 
-Each entry after `UNSAFE` names a table, by table name (`blog_posts`) or by client accessor (`blogPosts`); both skip the same filter. An entry that names no table would skip nothing, so it throws `ValidationError` (`TURBINE_E003`) suggesting the nearest table name. `[UNSAFE]` with no table after it throws for the same reason. Pass `UNSAFE` alone to skip every filter.
-
-`skipGlobalFilters: true` and `skipGlobalFilters: ['posts']` throw `ValidationError` ([`TURBINE_E003`](/errors)). See [Privilege options](#privilege-options-and-the-unsafe-symbol) below for why, and for how to upgrade if you pass `true` today.
+Each entry after `UNSAFE` names a table, by table name or accessor. An entry that names no table, or `[UNSAFE]` alone, throws `ValidationError` ([E003](/errors#e003)). So do `skipGlobalFilters: true` and `['posts']`; the next section explains why.
 
 ## Privilege options and the `UNSAFE` symbol
 
-Three query options remove a safety boundary instead of changing a result: `skipGlobalFilters` (drops the tenant or soft-delete predicate), [`includePii`](/queries#pii-fields-includepii) (drops the PII projection) and `allowFullTableScan` (drops the empty-`where` guard on a mutation). Each one is enabled **only** by a symbol exported from the package:
+Three query options remove a safety boundary rather than change a result. Each is turned on only by the `UNSAFE` symbol exported from `turbine-orm`:
+
+| Option | Removes |
+|---|---|
+| `skipGlobalFilters` | The tenant or soft-delete filter |
+| [`includePii`](/queries#pii-fields-includepii) | The PII column projection |
+| `allowFullTableScan` | The empty-where guard on a mutation |
+
+These options sit beside `where`, so a handler that spreads a request body into the args would let the caller set them:
 
 ```ts
-import { UNSAFE } from 'turbine-orm';
-```
-
-### Why a symbol and not `true`
-
-All three are ordinary siblings of `where` on the same options object, and a common handler spreads a request body into it:
-
-```ts
-// The shape this closes: a request body spread straight into query args.
 app.get('/users', (req, res) => db.users.findMany({ ...req.body }));
 ```
 
-If these options took `true`, a client posting `{"where":{"name":"x"},"skipGlobalFilters":true}` would get the same statement **minus the tenant predicate**: the multi-tenancy boundary, removed over the wire by the user it exists to contain. `includePii: true` would unlock the PII projection the same way, and `allowFullTableScan: true` would disarm the guard that stops an unqualified `UPDATE` or `DELETE`.
-
-A `boolean` type plus a warning in the docs does not fix this. It is a mass-assignment shape, and mass assignment happens because nobody listed the keys. `JSON.parse` cannot produce a symbol, and neither can a query string, a form body or a `structuredClone` of parsed input. No untrusted-data path can put `UNSAFE` on an args object, so the escalation is impossible, not merely discouraged.
-
-The array form gets the same check, because `{"skipGlobalFilters":["users"]}` is the same breach with one extra step. `[UNSAFE, 'posts']` is accepted; `['posts']` is not.
-
-<Callout type="note" title="Symbol.for, not Symbol()">
-  `UNSAFE` is registered as `Symbol.for('turbine-orm.UNSAFE')`. Turbine ships
-  ESM and CJS builds, and a project can import `UNSAFE` from one copy while the
-  query interface it calls came from the other. A plain `Symbol()` would be a
-  different value in each copy, and every privileged call would throw. The
-  global registry makes the two copies agree. Application code can reach
-  `Symbol.for` too, but that weakens nothing: the attacker's channel is parsed
-  data, which cannot carry a symbol either way.
-</Callout>
+If they accepted `true`, a body of `{"skipGlobalFilters": true}` would drop the tenant filter. `JSON.parse`, query strings and form bodies cannot produce a symbol, so untrusted input can never enable these options. `UNSAFE` is `Symbol.for('turbine-orm.UNSAFE')`, so the ESM and CJS builds share it.
 
 ### Upgrading from `true`
 
-Passing `true` to any of these three options throws. Change each call site:
+Passing `true` throws `ValidationError` ([E003](/errors#e003)). The option types are `Unsafe`, so TypeScript lists every call site to change:
 
 | Before | After |
 |---|---|
@@ -201,9 +142,7 @@ Passing `true` to any of these three options throws. Change each call site:
 | `includePii: true` | `includePii: UNSAFE` |
 | `allowFullTableScan: true` | `allowFullTableScan: UNSAFE` |
 
-**TypeScript finds every one of them for you.** The option types are `Unsafe`, so each row of that table is a compile error before it is a runtime error. Type-check the project, and the compiler lists every call site to change.
-
-That includes the boolean shapes: `allowFullTableScan: false` does **not** typecheck, and neither does `allowFullTableScan: someFeatureFlag`. A conditional call site adds the key or leaves it out:
+A boolean does not typecheck, so add the key conditionally:
 
 ```ts
 await db.sessions.deleteMany({
@@ -212,15 +151,10 @@ await db.sessions.deleteMany({
 });
 ```
 
-Two rules decide what happens at *runtime*, which is what an untyped call site hits (plain JavaScript, or args that arrive as `any` from a boundary):
-
-- **`false`, `null` and `undefined` are accepted and mean "not enabled".** They never throw, because none of them *asks* for the privilege. This is a courtesy to untyped callers. In TypeScript the type already rules them out.
-- **Everything else, `true` included, throws.** Ignoring a stale `true` would trade an escalation bug for a silent failure: your admin tool would quietly stop seeing soft-deleted rows, or return objects with the PII columns missing, with no signal anywhere. The error names the option and the import, and ends with the line to grep for in an incident: *"If you did not write this option, an untrusted object was spread into these query args."*
-
-The same rule applies through [`turbine-orm/prisma-compat`](/migrate-from-prisma), which forwards these three options unchanged and leaves the check to the core.
+At runtime, `false`, `null` and `undefined` mean "not enabled" and never throw. Any other value throws, with a message that ends: *If you did not write this option, an untrusted object was spread into these query args.* [`turbine-orm/prisma-compat`](/migrate-from-prisma) forwards these options unchanged.
 
 ## See also
 
-- **[API Reference](/queries)**: the `where` operators and the empty-where guard.
-- **[Read Replicas](/read-replicas)**: filters apply the same way to reads routed to a replica.
-- **[Transactions](/transactions)**: RLS `sessionContext` for multi-tenancy enforced by the database.
+- [API Reference](/queries): `where` operators and the empty-where guard.
+- [Read Replicas](/read-replicas): filters apply the same way on replicas.
+- [Transactions](/transactions): RLS `sessionContext`, tenancy enforced by the database.

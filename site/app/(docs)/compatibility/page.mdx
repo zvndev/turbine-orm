@@ -1,87 +1,46 @@
 export const metadata = {
   title: 'Database Compatibility',
   description:
-    'Turbine ORM works with PostgreSQL and PG-compatible databases: AlloyDB, TimescaleDB, YugabyteDB, CockroachDB, Neon, Supabase, and more.',
+    'Run Turbine ORM on PostgreSQL and on databases that speak its wire protocol: AlloyDB, TimescaleDB, Neon, Supabase, YugabyteDB and CockroachDB, with what to check on each.',
   alternates: { canonical: '/compatibility' },
 };
 
 # Database Compatibility
 
-Turbine is built for PostgreSQL. It generates standard SQL (parameterized queries, `json_agg`, correlated subqueries), so it also works with databases that speak the PostgreSQL wire protocol. This page covers those databases: CockroachDB, YugabyteDB, AlloyDB, TimescaleDB, Neon, Supabase and similar. They run on Turbine's default PostgreSQL path and need no [dialect](/dialects) of their own, at most a thin adapter for migration locking or catalog quirks.
+Turbine targets PostgreSQL, so it also runs on databases that speak the PostgreSQL wire protocol. They use the default PostgreSQL dialect, with at most a small adapter for migration locking and catalog quirks.
 
-> Looking for **SQLite, MySQL or SQL Server**? Those are separate engines with their own SQL dialects. See **[Database Engines](/engines)** for setup and the per-engine capability matrix.
+> Looking for **SQLite, MySQL or SQL Server**? Those are separate engines. See **[Database Engines](/engines)**.
 
-## Compatibility Matrix
+## Compatibility matrix
 
 | Database | Adapter | Status | Notes |
 |---|---|---|---|
-| **PostgreSQL** 14+ (tested) | None (default) | Full | Native target. See the note below. |
-| **AlloyDB** | `alloydb` (no-op) | Full | Google's PG storage engine |
-| **TimescaleDB** | `timescale` (no-op) | Full | PG extension, hypertables introspect fine |
-| **Neon** | None | Full | Use `turbine-orm/serverless` for HTTP driver |
-| **Supabase** | None | Full | Standard Postgres, connect directly |
-| **YugabyteDB** | `yugabytedb` | Experimental | Untested, see below |
-| **CockroachDB** | `cockroachdb` | Experimental | Measured once against v26.2.5, see below |
+| **PostgreSQL** 14+ | None | Full | CI runs the full suite on 14, 15, 16 and 17. Older servers may work but are untested. |
+| **AlloyDB** | `alloydb` (no-op) | Full | Same wire protocol, catalogs and SQL as PostgreSQL. |
+| **TimescaleDB** | `timescale` (no-op) | Full | Hypertables introspect as tables. |
+| **Neon** | None | Full | Use [`turbine-orm/serverless`](/serverless) for its HTTP driver. |
+| **Supabase** | None | Full | Standard PostgreSQL; connect directly. |
+| **YugabyteDB** | `yugabytedb` | Experimental | CI runs only a statement-timeout check, nightly. |
+| **CockroachDB** | `cockroachdb` | Experimental | CI runs a statement-timeout and row-lock check on v24.1. Results below are from v26.2.5. |
 
-> **What "14+ (tested)" means.** CI runs the full integration suite against PostgreSQL **14, 15, 16 and 17** on every change, so 14 is the supported floor. It is not a hard technical floor: nothing in Turbine's introspection queries or generated SQL is known to need a feature newer than PostgreSQL 12. A 12 or 13 server may work, but it is untested. If you run one and hit a problem, please file a bug.
-
-## AlloyDB
-
-[AlloyDB](https://cloud.google.com/alloydb) is Google Cloud's PostgreSQL-compatible database service: PostgreSQL with a custom columnar storage engine. The wire protocol, system catalogs and SQL are identical.
-
-**No adapter is needed.** Every Turbine feature works: `json_agg` nested relations, advisory locks for migrations, `information_schema` introspection, transactions, pipelines and streaming.
-
-### Connection
+Connect to any of them with a standard connection string:
 
 ```ts
 import { TurbineClient } from 'turbine-orm';
 import { SCHEMA } from './generated/turbine/metadata.js';
 
-// AlloyDB uses standard PG connection strings
-const db = new TurbineClient({
-  connectionString: process.env.ALLOYDB_URL,
-  // AlloyDB requires SSL in production
-  ssl: { rejectUnauthorized: true },
-}, SCHEMA);
-```
-
-To name the target database explicitly (this changes no behavior):
-
-```ts
-import { alloydb } from 'turbine-orm/adapters';
-
-// turbine.config.ts
-export default {
-  url: process.env.ALLOYDB_URL,
-  adapter: alloydb, // purely documentation, no behavior changes
-};
+const db = new TurbineClient(
+  {
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: true }, // most managed services require TLS
+  },
+  SCHEMA,
+);
 ```
 
 ## TimescaleDB
 
-[TimescaleDB](https://www.timescale.com/) is a PostgreSQL extension that adds hypertables (time-series tables), continuous aggregates and compression policies. It is an extension, not a fork, so the underlying database is standard PostgreSQL.
-
-**No adapter is needed.** Hypertables introspect as regular tables through `information_schema`.
-
-### Connection
-
-```ts
-import { TurbineClient } from 'turbine-orm';
-import { SCHEMA } from './generated/turbine/metadata.js';
-
-// Timescale Cloud uses standard PG connection strings
-const db = new TurbineClient({
-  connectionString: process.env.TIMESCALE_URL,
-  ssl: { rejectUnauthorized: true },
-}, SCHEMA);
-```
-
-### Hypertable considerations
-
-- `npx turbine generate` introspects hypertables the same as regular tables.
-- `findMany` with `orderBy: { time: 'desc' }` benefits from Timescale's chunk exclusion.
-- Continuous aggregates are **not** introspected, because they are materialized views, not tables.
-- To query a continuous aggregate, use the typed `` db.sql`...` `` escape hatch (or the untyped `` db.raw`...` ``):
+`turbine generate` reads hypertables like any other table. It reads tables only by default, so continuous aggregates are left out: pass `--include-views` to add views and materialized views as read-only entities, or query them with `db.sql`:
 
 ```ts
 type DailyViews = { day: Date; views: number };
@@ -92,256 +51,84 @@ const rows = await db.sql<DailyViews>`
   ORDER BY day DESC
   LIMIT 30
 `;
-//    ^? DailyViews[] , every ${value} becomes a $N param
 ```
 
-## YugabyteDB
+## Migration locks on distributed databases
 
-[YugabyteDB](https://www.yugabyte.com/) is a distributed SQL database that reuses the PostgreSQL query layer. It supports `json_agg`, subqueries, transactions and most of `pg_catalog`, so the query surface should behave the same. Turbine has no YugabyteDB test suite, and nothing in this section has been run against a live server. Treat it as a list of things to check on your own cluster, and please report what you find.
+`turbine migrate` serializes concurrent runs with `pg_try_advisory_lock()`. On YugabyteDB that lock is scoped to one node, and on CockroachDB v26.2.5 it returns `true` to every session that asks. Two concurrent runs can both apply the same migrations.
 
-Yugabyte documents one difference itself: advisory locks (`pg_try_advisory_lock`) are scoped to a tserver node, not to the cluster. In a multi-node deployment, two concurrent `turbine migrate` commands routed to different nodes could both acquire the "same" lock.
-
-### Use the adapter for safe distributed migrations
+The `yugabytedb` and `cockroachdb` adapters replace it with a row in a `_turbine_lock` table, taken with `SELECT ... FOR UPDATE NOWAIT`:
 
 ```ts
-import { yugabytedb } from 'turbine-orm/adapters';
-
 // turbine.config.ts
+import { cockroachdb } from 'turbine-orm/adapters';
+
 export default {
-  url: process.env.YUGABYTE_URL,
-  adapter: yugabytedb,
+  url: process.env.COCKROACH_URL,
+  adapter: cockroachdb, // or yugabytedb
 };
 ```
 
 <Callout type="warning" title="turbine migrate does not read config.adapter yet">
-  The `adapter` key type-checks on `TurbineCliConfig`, and the migration runner
-  takes an adapter, but the `turbine migrate` command never passes the config
-  field to it. Setting it changes nothing today: the CLI still calls
-  `pg_try_advisory_lock()`, the per-node lock described above. Until it is
-  wired, make sure only one migration runner can be in flight at a time (for
-  example, a CI job that cannot overlap) instead of relying on the database to
-  arbitrate. The same applies to the CockroachDB adapter below.
+  The `adapter` key type-checks, but the `turbine migrate` command never passes
+  it to the migration runner, so the CLI still takes the advisory lock. Until it
+  does, make sure only one migration runner can be in flight at a time, for
+  example a CI job that cannot overlap.
 </Callout>
 
-The YugabyteDB adapter object replaces advisory locks with a `_turbine_lock` table locked by `SELECT ... FOR UPDATE NOWAIT`. YugabyteDB's row locks are distributed (backed by Raft consensus), so once the CLI passes the adapter through, that gives a cluster-wide mutex.
+## YugabyteDB
 
-### Connection
+YugabyteDB reuses the PostgreSQL query layer, so the query surface should behave the same. Apart from the nightly timeout check, nothing here has run against a live cluster. Check these on your own:
 
-```ts
-import { TurbineClient } from 'turbine-orm';
-import { SCHEMA } from './generated/turbine/metadata.js';
-
-// YugabyteDB uses standard PG connection strings
-const db = new TurbineClient({
-  connectionString: 'postgresql://yugabyte:yugabyte@localhost:5433/mydb',
-}, SCHEMA);
-```
-
-### Expected differences (unverified)
-
-| Area | Expected difference | Impact if true |
-|---|---|---|
-| Advisory locks | Per-node, not cluster-wide | Use the `yugabytedb` adapter once wired. Check whether `pg_try_advisory_lock()` returns `true` on two concurrent sessions, which is what CockroachDB does |
-| Sequences | May have gaps under concurrent inserts | Cosmetic only, IDs are still unique |
-| `pg_class.reltuples` | May be stale or zero on new tables | Studio's sidebar row estimates may lag |
-| Index types | Hash indexes not supported | GIN, GiST, B-tree all work |
-| NULL ordering in `json_agg` | Unknown | Check first. On CockroachDB this is inverted from PostgreSQL and silently changes which rows an ordered, limited relation returns |
+- Whether `pg_try_advisory_lock()` serializes two sessions (see above).
+- `NULL` ordering in an ordered relation with a `limit`. CockroachDB inverts it (see below).
+- Hash indexes are not supported; B-tree, GIN and GiST are.
+- `pg_class.reltuples` may lag on new tables, which only affects Studio's row estimates.
 
 ## CockroachDB
 
-[CockroachDB](https://www.cockroachlabs.com/) is a distributed SQL database that speaks the PostgreSQL wire protocol.
+Measured once against CockroachDB v26.2.5 (single node). Behavior changes between CockroachDB versions, so treat this as one data point.
 
-Everything in this section was **measured against CockroachDB CCL v26.2.5** (single node, `--insecure`, arm64), driving real Turbine code wherever possible. These behaviors change between CockroachDB major versions, and CI has no CockroachDB suite, so this is one run at one point in time, not a standing guarantee.
+These work through Turbine: nested relations with per-relation `orderBy` and `limit` (measured with `jsonEncoding: 'object'`), `introspect()`, `findMany`, `count`, `groupBy`, `create` with `RETURNING`, atomic `increment`, relation filters, `$transaction` with savepoints and `sessionContext`, statement timeouts, pgvector with an `hnsw` index, Studio, and `migrate deploy` and `migrate status` apart from the lock.
 
-<Callout type="warning" title="Two findings fail silently">
-  Migration locking does not lock, and `NULL` ordering is inverted from
-  PostgreSQL in a way that changes which rows come back. Both are detailed
-  below.
-</Callout>
-
-### Use the adapter
-
-```ts
-import { cockroachdb } from 'turbine-orm/adapters';
-
-// turbine.config.ts
-export default {
-  url: process.env.COCKROACH_URL,
-  adapter: cockroachdb,
-};
-```
-
-### What the adapter does
-
-| Area | PostgreSQL | CockroachDB (with adapter) | Measured on v26.2.5 |
-|---|---|---|---|
-| Migration locks | `pg_try_advisory_lock()` | `_turbine_lock` table + `SELECT FOR UPDATE NOWAIT` | **Needed.** `pg_try_advisory_lock()` exists but does not lock (see the callout below) |
-| Statement timeout | `set_config('statement_timeout', …, true)` | `set_config('transaction_timeout', …, true)` (v23.1+) | **Not needed.** `statement_timeout` works and is enforced. The override is harmless but redundant |
-| Index introspection | `pg_indexes` view | Same view (compatible since v22.1) | **Correct.** `pg_indexes` returns usable `indexdef` strings |
-| Row estimates | `pg_class.reltuples` | `crdb_internal.table_row_statistics` | **Does not work.** The override SQL fails with `42501 Access to crdb_internal and system is restricted`, even as `root` |
-
-Each row describes what the adapter **object** implements. None of it reaches you through `turbine.config.ts` today, because the CLI never reads the `adapter` key (see the YugabyteDB callout above). Even once it does, the row-estimate override in the last row cannot work on v26.2.5, because `crdb_internal` is no longer readable by default. That is a bug in the adapter.
-
-<Callout type="warning" title="pg_try_advisory_lock() does not lock, and does not fail either">
-  On v26.2.5 `pg_try_advisory_lock($1)` exists, succeeds and returns `true`
-  **to every session that asks**. Two concurrent connections requesting the
-  same lock id both got `true`.
-
-  It is a no-op stub, not an error. An error would be safe, because
-  `turbine migrate` would crash and you would know. Instead the migration
-  runner believes it holds an exclusive lock when it holds nothing, so two
-  concurrent `turbine migrate` runs both proceed and both apply the same
-  migrations. Apart from the lock, `turbine migrate deploy` works end to end:
-  the `_turbine_migrations` table, checksums, per-migration transactions and
-  `migrate status` were all verified against v26.2.5.
-
-  Until the CLI reads `config.adapter`, make sure only one migration runner
-  can ever be in flight (for example, a CI job that cannot overlap). No failed
-  lock acquisition will stop a second runner.
-</Callout>
-
-### Connection
-
-```ts
-import { TurbineClient } from 'turbine-orm';
-import { SCHEMA } from './generated/turbine/metadata.js';
-
-const db = new TurbineClient({
-  connectionString: process.env.COCKROACH_URL,
-  ssl: { rejectUnauthorized: true }, // CockroachDB Cloud requires SSL
-}, SCHEMA);
-```
-
-### What works, measured on v26.2.5
-
-Each of these ran through Turbine against a live server:
-
-- `json_agg` + `json_build_object` nested relations, at two levels of nesting, with per-relation `orderBy` and `limit`
-- Correlated subqueries (the core of Turbine's single-query strategy)
-- `introspect()`: tables, primary keys, columns, indexes, and foreign-key relations, correctly classified as `hasMany` / `belongsTo`
-- `findMany` / `count` / `groupBy` with `_count` and `_sum`
-- `create` with `RETURNING`, and `update` with the atomic `{ increment }` operator
-- Relation filters (`some`), which compile to `EXISTS` subqueries
-- `$transaction`, including a nested transaction via `SAVEPOINT`
-- `$transaction` with `sessionContext` (the RLS option): `set_config('app.tenant', …, true)` works, and `ALTER TABLE … ENABLE ROW LEVEL SECURITY` plus `CREATE POLICY` were both accepted
-- Statement timeouts: `set_config('statement_timeout', '250ms', true)` cancelled a `pg_sleep(3)` after 250ms with SQLSTATE `57014`; `transaction_timeout` also works
-- pgvector: `CREATE EXTENSION vector`, a `VECTOR(3)` column, the `<->`, `<=>` and `<#>` operators, and an `hnsw` index all work (`ivfflat` does not, see below)
-- Parameterized queries (extended query protocol)
-- `information_schema`, `pg_indexes`, `pg_enum` / `pg_type` for introspection
-- Every WHERE operator tried, including `ILIKE`
-- `turbine studio`, including its `BEGIN READ ONLY` read path
-- `turbine migrate deploy` and `migrate status`, with the lock caveat above
-
-Transactions default to `SERIALIZABLE` (`SHOW transaction_isolation` returns `serializable`), so expect more retryable serialization failures under contention than on PostgreSQL's `READ COMMITTED`.
-
-Not tried, and therefore unverified: pipeline batching, streaming and cursors, `$listen` beyond the failure below, and the `flatten` relation strategy.
-
-### Known limitations
-
-| Area | Measured behaviour on v26.2.5 | Impact |
-|---|---|---|
-| **NULL ordering** | **Inverted from PostgreSQL.** `ORDER BY col ASC` puts `NULL`s **first**; PostgreSQL puts them last | **It changes results.** See the callout below |
-| **Advisory locks** | **Present but inert.** `pg_try_advisory_lock()` returns `true` to every caller | Concurrent `turbine migrate` runs are not serialized. See the callout above |
-| `SERIAL` columns | `column_default` is `unique_rowid()`. Observed ids like `1200048904107917313` | IDs are unique, but large and non-sequential. Make sure your generated column type is a 64-bit-safe `number` or `string` |
-| Default isolation | `serializable` | More retryable errors under contention |
-| `pg_class.reltuples` | **Always `NULL`**, before and after `ANALYZE`, on a table with exactly 1000 rows | Studio's schema sidebar shows `estimatedRows: 0` for every table. The Data tab is unaffected: it runs a real `COUNT(*)` and reported the correct total |
-| `crdb_internal` | Restricted: `42501 Access to crdb_internal and system is restricted`, even as `root` | The adapter's row-estimate override cannot work as written |
-| LISTEN / NOTIFY | **Unsupported.** `LISTEN` is a `42601` syntax error; `pg_notify()` is `42883` unknown function | `db.$listen` fails with a raw `DatabaseError`, and `db.$notify` with a `ValidationError` (`TURBINE_E003`, `sqlstate` `42883`). Neither is a typed `UnsupportedFeatureError`. See the capability callout |
-| `ivfflat` vector index | `42601 unrecognized access method: ivfflat` | Use `hnsw`, which works |
-| Pipeline batching, streaming, `flatten` strategy | **Untested** | Unverified in either direction |
+Not tried: the default positional JSON encoding, pipelines, streaming and the `flatten` strategy.
 
 <Callout type="warning" title="NULL ordering is inverted, and it changes which rows you get">
-  On v26.2.5 `NULL`s sort as the **smallest** value; on PostgreSQL they sort as
-  the **largest**. The orderings are exact mirrors, so any ordered query over a
-  nullable column that also has a `limit` can return a completely different set
-  of rows.
-
-  The same Turbine relation shape (`{ orderBy: { s: 'asc' }, limit: 2 }`) over
-  the same five rows, two of which have `s IS NULL`:
+  CockroachDB sorts `NULL` as the smallest value; PostgreSQL sorts it as the
+  largest. The same relation, `{ orderBy: { s: 'asc' }, limit: 2 }`, over five
+  rows where two have `s IS NULL`:
 
   ```text
-  PostgreSQL 16 -> [{ id: 3, s: 1 },    { id: 5, s: 2 }]
-  CockroachDB   -> [{ id: 2, s: null }, { id: 4, s: null }]
+  PostgreSQL  -> [{ id: 3, s: 1 },    { id: 5, s: 2 }]
+  CockroachDB -> [{ id: 2, s: null }, { id: 4, s: null }]
   ```
 
-  Zero overlap, and nothing errors or warns. If you order by a nullable column
-  anywhere a `limit`, a cursor or a paginated relation is involved, make the
-  ordering explicit (`NULLS LAST` / `NULLS FIRST`) instead of inheriting the
-  engine's default, or keep the column non-nullable.
+  Nothing errors. Wherever a `limit`, cursor or paginated relation orders by a
+  nullable column, place the `NULL`s explicitly
+  (`orderBy: { s: { sort: 'asc', nulls: 'last' } }`) or make the column
+  non-nullable.
 </Callout>
 
-<Callout type="warning" title="join and batched relation strategies are not byte-identical here">
-  On PostgreSQL every `relationLoadStrategy` option produces identical output.
-  On CockroachDB they do not, because `json_build_object` returns **`jsonb`**
-  there and **`json`** on PostgreSQL, and `jsonb` sorts its keys:
+| Area | Behavior on v26.2.5 | What to do |
+|---|---|---|
+| Advisory locks | Return `true` to every caller | Serialize migration runs yourself (see above). |
+| `LISTEN` / `NOTIFY` | Not supported | `$listen` and `$notify` fail with a database error, not `UnsupportedFeatureError`. |
+| Default isolation | `SERIALIZABLE` | Expect more retryable errors under contention. Use [`withRetry`](/transactions#retryable-errors). |
+| `SERIAL` columns | Large, non-sequential ids from `unique_rowid()` | Type them as a 64-bit-safe `number` or `string`. |
+| `pg_class.reltuples` | Always `NULL` | Studio's sidebar shows 0 rows; the Data tab counts correctly. |
+| `crdb_internal` | Access denied, even to `root` | The `cockroachdb` adapter's row-estimate override fails. |
+| `ivfflat` index | Unsupported | Use `hnsw`. |
+| `json_build_object` | Returns `jsonb`, which sorts keys | With `jsonEncoding: 'object'`, `join` and `batched` return nested keys in different orders. Compare parsed objects, not strings. |
 
-  ```text
-  CockroachDB v26.2.5 -> {"alpha": 2, "mid": 3, "zeta": 1}   (pg_typeof: jsonb)
-  PostgreSQL 16       -> {"zeta" : 1, "alpha" : 2, "mid" : 3} (pg_typeof: json)
-  ```
+CockroachDB runs on PostgreSQL's dialect, so Turbine's PostgreSQL capability flags apply as they are. `plan_cache_mode`, `DISTINCT ON` and the batched loader's per-parent limit all work on v26.2.5.
 
-  The **data is identical**. Only the key order inside nested relation objects
-  differs, so `join` and `batched` compare equal field by field but not as
-  strings. That affects snapshot tests and any cache key or digest built by
-  `JSON.stringify`ing a query result: they differ between the two strategies
-  and change if `'auto'` switches strategy. Compare parsed objects, not
-  serialized strings.
-</Callout>
+## Other PostgreSQL-compatible databases
 
-<Callout type="warning" title="The capability flags speak for the dialect, not for your server">
-  CockroachDB and YugabyteDB are not separate engines: they run on
-  `postgresDialect`. Every capability flag on that dialect applies to them
-  as is, including flags for features these databases do not have.
+Turbine will likely work if the database supports:
 
-  On v26.2.5 most flagged features work (see the measured list above).
-  **LISTEN / NOTIFY does not.** The flag says the dialect supports it, so
-  nothing refuses the call, and you get a driver error instead of a typed
-  `UnsupportedFeatureError`:
-
-  ```text
-  db.$listen(…)  ->  DatabaseError 42601: at or near "listen": syntax error
-  db.$notify(…)  ->  ValidationError TURBINE_E003 (sqlstate 42883): unknown function: pg_notify()
-  ```
-
-  `plan_cache_mode` works: v26.2.5 implements it as a real session variable,
-  accepts `force_generic_plan` and `force_custom_plan` as connection
-  parameters, reflects them through `SHOW`, and rejects an invalid value with
-  `22023`.
-
-  The same inheritance turns on PostgreSQL-only optimizations here, because
-  the dialect is PostgreSQL's. Both were measured on v26.2.5 and work: the
-  batched loader's per-parent limit pushdown
-  (`ROW_NUMBER() OVER (PARTITION BY …)`) returns the correct per-parent rows,
-  and `SELECT DISTINCT ON` executes correctly. Neither has been measured on
-  YugabyteDB. Read the capability matrix on the engines page as a statement
-  about PostgreSQL, and test against your own cluster.
-</Callout>
-
-### Serverless with CockroachDB
-
-CockroachDB Serverless exposes a standard PostgreSQL connection string. Pass a pool built from it to `turbineHttp`:
-
-```ts
-import { turbineHttp } from 'turbine-orm/serverless';
-import { Pool } from 'pg';
-import { SCHEMA } from './generated/turbine/metadata.js';
-
-const pool = new Pool({
-  connectionString: process.env.COCKROACH_URL,
-  ssl: { rejectUnauthorized: true },
-});
-export const db = turbineHttp(pool, SCHEMA);
-```
-
-## Other PG-Compatible Databases
-
-If your database speaks the PostgreSQL wire protocol and supports
-
-1. `json_agg` and `json_build_object`
+1. `json_agg`, `json_build_object` and `json_build_array`
 2. Correlated subqueries
-3. `$1, $2, ...` parameterized queries
+3. `$1, $2, ...` parameters
 4. `information_schema.tables` and `information_schema.columns`
 
-then Turbine will likely work as is. Connect with the standard `pg` driver and run `npx turbine generate` to check that introspection works.
-
-If you hit problems with a specific PostgreSQL-compatible database, [open an issue](https://github.com/zvndev/turbine-orm/issues). Adapters are small to add.
+Run `npx turbine generate` to check that introspection works. If something breaks, [open an issue](https://github.com/zvndev/turbine-orm/issues).

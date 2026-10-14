@@ -1,132 +1,110 @@
 export const metadata = {
   title: 'Studio',
   description:
-    'Turbine Studio: a local database UI with a visual findMany builder, no raw-SQL surface, loopback binding, token auth, BEGIN READ ONLY by default, opt-in write mode, and PII redaction.',
+    'Turbine Studio is a local database UI with a visual findMany builder. It is read-only by default, has no SQL input, redacts PII on the server, and offers an opt-in write mode.',
   alternates: { canonical: '/studio' },
 };
 
 # Studio
 
-`npx turbine studio` launches a local web UI for browsing your database and building queries visually. It is **read-only by default**: no row editing, no DDL, no raw-SQL input, and every query runs inside a `BEGIN READ ONLY` transaction. `--write` turns on primary-key-addressed edits for one launch, through the same validated builder. Without the flag, the write endpoints do not exist.
+`npx turbine studio` opens a local web UI for browsing your database and building queries visually. It is read-only by default, has no SQL input, and redacts PII-tagged columns on the server.
 
 ```bash
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine studio
 ```
 
-Studio introspects the schema, starts an HTTP server on `127.0.0.1:4983` using Node's built-in `http` module, and opens your browser at a URL that carries a one-time ticket (see [Security model](#security-model)).
+Studio serves `127.0.0.1:4983` and opens your browser at a URL that carries a one-time login ticket. The connection string resolves as for every [CLI command](/cli#connection-string).
 
 ## Try it without a database
-
-`--demo` boots Studio against a seeded, in-memory sample database, with no connection string or setup:
 
 ```bash
 npx turbine-orm@latest studio --demo
 ```
 
-The sample dataset has users, posts, comments and orgs, with relations and two PII-tagged columns. It runs on Turbine's SQLite engine over an in-memory `node:sqlite` database, so it needs no `DATABASE_URL` and no extra dependency. Requires Node 22.5+.
+`--demo` runs against a seeded in-memory sample (users, posts, comments and orgs, with two PII-tagged columns) on Node's built-in SQLite. Requires Node 22.5+. A switcher in the banner toggles read-only, PII and write modes. Nothing is saved when the process ends.
 
-A **Read-only / Show PII / Write** switcher in the demo banner toggles PII redaction and writes while Studio runs, so you can try both back to back. Every launch starts read-only with PII redacted. Writes apply to the in-memory store, so edits survive a refresh, but nothing is saved: the store ends with the process and every launch starts fresh.
-
-## Launching
-
-```bash
-npx turbine studio                          # default: 127.0.0.1:4983, opens browser, read-only
-npx turbine studio --port 5173              # custom port
-npx turbine studio --no-open                # don't auto-open the browser
-npx turbine studio --schema inventory       # non-public Postgres schema
-npx turbine studio --include users,posts    # only these tables
-npx turbine studio --exclude _migrations    # hide tables
-npx turbine studio --write                  # opt in to PK-addressed writes (loud warning)
-npx turbine studio --show-pii               # reveal PII-tagged values (loud warning)
-npx turbine studio --demo                    # seeded in-memory sample DB (no DATABASE_URL)
-npx turbine studio --host 0.0.0.0 --allow-remote  # non-loopback requires explicit opt-in
-```
-
-The connection string resolves as it does for every CLI command: the `--url` flag, then `DATABASE_URL`, then `turbine.config.ts`. See [CLI, config resolution](/cli#config-resolution).
+## Flags
 
 | Flag | Description |
 |---|---|
-| `--port <n>` | HTTP port (default: `4983`). |
-| `--host <addr>` | Bind address (default: `127.0.0.1`). Non-loopback values are **refused** unless you also pass `--allow-remote`. |
-| `--allow-remote` | Allow binding to a non-loopback `--host`. Studio prints a loud warning and starts. Without it, Studio exits with code 1. |
-| `--write` | Enable insert, update and delete in the Data tab: single rows, multi-select delete, and paste-to-insert batches, each row addressed by its full primary key. Prints a startup warning, and the UI shows a persistent WRITE MODE banner. |
-| `--show-pii` | Show PII-tagged column values instead of the redaction placeholder. Prints a startup warning. |
-| `--demo` | Seeded in-memory sample database; nothing is saved. Enables the in-UI Read-only / Show PII / Write switcher. Requires Node 22.5+. |
-| `--no-open` | Don't open the browser automatically. |
-| `--include <a,b>` / `--exclude <a,b>` | Limit which tables Studio sees. |
-| `--schema <name>` | Postgres schema (default: `public`). Pinned via `set_config('search_path', ...)` on every query. |
+| `--port <n>` | HTTP port (default `4983`). |
+| `--host <addr>` | Bind address (default `127.0.0.1`). A non-loopback address needs `--allow-remote`. |
+| `--allow-remote` | Allow a non-loopback `--host`, with a startup warning. |
+| `--write` | Enable inserts, edits and deletes, each addressed by primary key. See [Write mode](#write-mode---write). |
+| `--show-pii` | Show PII-tagged values, with a startup warning and a page banner. |
+| `--demo` | Use the seeded in-memory sample. |
+| `--no-open` | Don't open the browser. |
+| `--include <a,b>` / `--exclude <a,b>` | Limit the tables Studio shows. |
+| `--schema <name>` | Postgres schema (default `public`). |
+| `--out <dir>` | Generated client directory, where Studio reads PII tags (default `./generated/turbine`). |
 
 ## The Query tab, a visual `findMany` builder
 
-The Query tab, the default, builds Turbine queries rather than SQL. You pick a table and build up `findMany` arguments:
+Pick a table and build `findMany` arguments:
 
-- **Fields**: `select` / `omit` column picks.
-- **Filters**: the full `where` operator set (`equals`, `not`, `in`, `gt`/`gte`/`lt`/`lte`, `contains`, `startsWith`, `endsWith`, `IS NULL` / `IS NOT NULL`, case-insensitive mode) with `AND` / `OR` / `NOT` grouping. An incomplete clause tells you what is missing rather than quietly disabling Run.
-- **Order + limit**: `orderBy` on any column, `limit` on the result.
-- **Relations**: drill into `with` to any depth, choosing fields, filters, ordering and limits at every level.
+- **Fields**: `select` / `omit`.
+- **Filters**: the `where` operators, with `AND` / `OR` / `NOT` grouping and case-insensitive mode.
+- **Order and limit**: `orderBy` on any column, and `limit`.
+- **Relations**: `with` at any depth, with fields, filters, order and limit at each level.
 
-A live preview shows the exact `db.table.findMany({ ... })` call your builder state produces, and **Copy TS** copies it, so a query you prototype in Studio pastes into your codebase. After a run, **View SQL** shows the single statement the query compiled to, and **Copy SQL** copies it.
+A live preview shows the `db.table.findMany({ ... })` call, and **Copy TS** copies it into your code. After a run, **View SQL** shows the single statement it compiled to.
 
-Because the builder sends ORM args instead of SQL, the server validates everything. `POST /api/builder` checks every identifier (table, relation, field, orderBy column) against the introspected schema, then compiles the query with the library's own `QueryInterface.buildFindMany`, binding every value as a `$N` parameter. No SQL text appears in the request. A run returns at most 1,000 rows, whatever limit the builder asks for, and a capped result says so. A [`lock`](/queries#row-locks) option is refused with `400` and a message pointing at `db.$transaction`, because Studio reads in a read-only transaction, where a row lock cannot be taken.
+The server checks every table, relation and field against the schema, then compiles with Turbine's own query builder and binds every value as a parameter. A run returns at most 1,000 rows. A [`lock`](/queries#row-locks) option is refused, since reads run in a read-only transaction.
 
 ## Data and Schema tabs
 
-- **Data**: browse rows with column sorting, search across every text column, stackable per-column filters (`equals`, `not`, `contains`, comparisons, null checks, all parameterized on the server), and a modal viewer for JSON/JSONB cells. Select rows with the checkbox column to copy or export them as JSON or CSV, and double-click any cell to copy its value. Page size goes up to 500 rows. In write mode, this tab also holds the row editor and batch tools.
-- **Schema**: the tables, columns, types, indexes and relations as introspected. Columns tagged `pii: true` carry a **pii** badge.
+- **Data**: sort, search every text column, stack per-column filters, and open JSON cells in a viewer. Select rows to copy or export as JSON or CSV. Pages hold up to 500 rows.
+- **Schema**: tables, columns, types, indexes and relations, with a **pii** badge on tagged columns.
 
-Both tabs use the builder's parameterized query path, and reads stay inside `BEGIN READ ONLY` even in write mode.
-
-Zone-less `timestamp` and `date` cells render as UTC, with the same parsers the client registers. A cell shows the same instant your application reads, and in `--write` mode an edit writes that same value back. `turbine mcp` applies the same parsers to the rows it samples. See [Zone-less columns](/schema#zone-less-columns-timestamp-and-date-read-as-utc).
+Zone-less `timestamp` and `date` cells render as UTC, the same instant your application reads. See [Zone-less columns](/schema#zone-less-columns-timestamp-and-date-read-as-utc).
 
 ## Write mode (`--write`)
 
-Without `--write`, the write endpoints are not registered, requests to them return 404, and every transaction is read-only at the database level. `--write` changes that for one launch:
+Without `--write`, the write endpoints do not exist. With it, the Data tab adds **Insert row**, **Edit**, **Delete**, **Delete selected** and **Paste rows** (TSV or CSV with a header row, or a JSON array), under a red WRITE MODE banner.
 
-- The Data tab gains **Insert row**, **Edit**, **Delete**, multi-select **Delete selected**, and **Paste rows** (bulk insert from pasted TSV/CSV with a header row, or a JSON array). The UI shows a persistent red WRITE MODE banner.
-- Every write is **addressed by a full primary key**: a single row, or a batch of up to 500 PK-addressed statements in one all-or-nothing transaction. There is no predicate-based mutation, bulk update, DDL or SQL input. Writes compile through the library's validated `buildUpdate` / `buildCreate` / `buildDelete` builders, with identifiers checked against the introspected schema and values bound as `$N` parameters.
-- Each write request runs in its own transaction, with the same parameterized `statement_timeout` and pinned `search_path` as reads. If any row in a batch fails, or any PK matches nothing, the whole batch rolls back.
-- The row editor is typed: enum and boolean columns get dropdowns, JSON columns validate before submit, and timestamps get ISO 8601 placeholders.
-- Write requests must also carry a matching `Origin` header. A missing or mismatched origin is rejected.
+- Every write names its row by full primary key. A batch of up to 500 rows runs in one transaction, and any failure or unmatched key rolls back the whole batch.
+- There is no bulk update, predicate-based write, DDL or SQL input.
+- The editor is typed: dropdowns for enums and booleans, JSON validated before submit.
+- Tables without a primary key are not editable. Views are not shown.
 
-Write mode is for fixing a few bad rows without opening psql, not for data entry. Tables without a primary key are not editable. Views do not appear at all: Studio introspects tables only, so a view is never in the sidebar or the schema API. (`--include-views` is a `pull` / `generate` flag; `studio` has no equivalent.)
+Write mode is for fixing a few rows without opening psql, not for data entry.
 
 ## PII redaction
 
-Columns tagged `pii: true` in [`defineSchema`](/schema#pii-fields) render as a redaction placeholder in every tab: table rows, builder results, nested relation rows, and the row echoed after a write. Redaction happens **on the server**, before the value is serialized into the API response, so the browser never receives it. Redacted columns are also excluded from the Data tab's substring search, per-column filters and sorting, so a hidden value cannot be inferred that way. That includes `IS NULL`, because whether a value is null is itself information. Their headers explain this on hover. `--show-pii` turns redaction off for one launch, with a startup warning and a persistent in-page banner.
+Columns tagged `pii: true` in [`defineSchema`](/schema#pii-fields) show a placeholder in every tab, nested relation rows and post-write echoes included. Redaction happens on the server, so the browser never receives the value.
 
-In write mode, the row echoed right after a write never contains PII values, even with `--show-pii`, because the write statement leaves those columns out. The Data grid shows them on its next refresh. See [PII fields](/queries#pii-fields-includepii) for how the same tags behave in application queries.
+- Redacted columns are excluded from search, filters (`IS NULL` too) and sorting, so a value cannot be inferred.
+- Studio reads the tags from the generated `metadata.ts` in `--out`, so run `turbine generate` after tagging. If that file cannot be parsed, Studio treats every column as PII.
+- `--show-pii` turns redaction off for one launch. The row echoed after a write still omits PII values.
 
-## Saved queries and the command palette
+See [PII fields](/queries#pii-fields-includepii) for the same tags in application queries.
 
-Saved queries go to `.turbine/studio-queries.json` in your project; commit it to share a query library with your team. In `--demo` mode they stay in memory. Studio keeps at most 500. Saved queries appear in the sidebar and in the **Cmd+K command palette**, which also jumps to any table or tab.
+## Saved queries and shortcuts
 
-Keyboard shortcuts:
+Saved queries go to `.turbine/studio-queries.json` (commit it to share them), up to 500. In `--demo` they stay in memory. They appear in the sidebar and in the **Cmd+K** palette, which also jumps to any table.
 
-- **Cmd+Enter** runs the current query.
-- **Cmd+S** opens Studio's Save dialog for it, instead of the browser's; the dialog's Save button confirms.
-- **G then Q / D / S** switches tabs.
-- **R** refreshes the Data tab, and **Shift+R** reloads the schema.
-- **/** focuses the sidebar filter.
-
-Saved queries store builder state only. Raw-SQL entries saved by older Studio versions are skipped on load with a console notice, since Studio cannot run SQL text.
+| Keys | Action |
+|---|---|
+| **Cmd+Enter** | Run the query |
+| **Cmd+S** | Save the query |
+| **G**, then **Q** / **D** / **S** | Switch tab |
+| **R** / **Shift+R** | Refresh data / reload the schema |
+| **/** | Focus the sidebar filter |
 
 ## Security model
 
-Each layer assumes the layer above it failed:
+Studio is a single-user local tool, not a service to deploy.
 
-1. **Loopback binding.** Studio binds `127.0.0.1` by default and refuses a non-loopback `--host` unless you pass `--allow-remote`. It is a single-user local tool, not a service to deploy.
-2. **One-time ticket, then a session cookie.** The launch URL carries a one-time ticket in `?token=`. The first visit exchanges it for a random per-process session credential in a `SameSite=Strict`, `HttpOnly` cookie, which every `/api/*` request must carry and which is compared in constant time. Reusing the printed URL gets `403`, or a redirect to `/` if the browser already holds the cookie. A URL that ends up in browser history, a process listing or a log is a spent ticket, not a standing key.
-3. **`Host` check.** A request whose `Host` header names anything other than loopback or the bound host gets `403`. This stops DNS rebinding: a page on another domain that re-resolves to `127.0.0.1` still sends its own `Host`.
-4. **No raw-SQL surface.** No endpoint accepts SQL text. Builder and write requests are ORM args, each identifier validated against the introspected schema, and all values are `$N` parameters.
-5. **`BEGIN READ ONLY` on every read.** Even if every check above were bypassed, Postgres rejects writes on the read path. Without `--write`, that covers every request Studio can make.
-6. **Write-mode gates.** With `--write`: full-primary-key addressing on every mutation, per-request transactions with the same timeout and schema pinning, and `Origin` checks.
-7. **Statement timeout.** A 30-second transaction-local `statement_timeout`, set through a parameterized `set_config`, bounds runaway queries. `search_path` is pinned to the configured schema the same way.
-8. **Request hygiene.** Per-session rate limiting (100 requests per 60 s), cross-origin requests refused, request bodies over 1 MiB refused with `413`, malformed JSON refused with `400`, and security headers on every response: a nonce-based CSP (`script-src 'self' 'nonce-...'`), `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`.
-
-Not implemented in any mode: raw SQL, DDL, and predicate-based mutations (`UPDATE ... WHERE` over arbitrary conditions). Every mutation names its rows by primary key. Studio is for inspection and the occasional targeted fix; use the CLI, migrations or your own code for everything else.
+- **Loopback only.** It binds `127.0.0.1` and refuses another `--host` without `--allow-remote`.
+- **One-time ticket.** The printed URL's ticket is exchanged for an `HttpOnly`, `SameSite=Strict` session cookie, checked in constant time on every API request. Reusing the URL gets `403`.
+- **`Host` check.** A request whose `Host` is not loopback or the bound host gets `403`, which blocks DNS rebinding.
+- **No SQL surface.** Requests carry query arguments, never SQL. Every name is checked against the schema and every value is bound.
+- **Read-only transactions.** On PostgreSQL every read runs in `BEGIN READ ONLY`, with a 30-second `statement_timeout` and `search_path` pinned to `--schema`, even in write mode.
+- **Write gates.** Writes exist only with `--write`, need a full primary key, and need a matching `Origin` header.
+- **Request limits.** 100 requests per minute per session, cross-origin requests refused, bodies over 1 MiB refused, and a nonce-based CSP with `X-Frame-Options: DENY`, `nosniff` and `no-referrer` on every response.
 
 ## See also
 
-- **[CLI](/cli)**: every command and flag, and the config resolution order.
-- **[API Reference](/queries)**: the `findMany` surface the builder compiles to, and the `includePii` read option (unlocked by the [`UNSAFE` symbol](/global-filters#privilege-options-and-the-unsafe-symbol), never by `true`).
-- **[Observability](/observability)**: `npx turbine observe`, the metrics dashboard, with the same security model.
+- **[CLI](/cli)**: every command and flag.
+- **[API Reference](/queries)**: the `findMany` surface the builder compiles to, and `includePii`, which takes the [`UNSAFE` symbol](/global-filters#privilege-options-and-the-unsafe-symbol).
+- **[Observability](/observability)**: `npx turbine observe`, with the same security model.
