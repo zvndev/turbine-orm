@@ -176,7 +176,7 @@ export interface CompatQueryInterface {
   findFirstOrThrow(args?: Record<string, unknown>): Promise<unknown>;
   findUniqueOrThrow(args: Record<string, unknown>): Promise<unknown>;
   create(args: Record<string, unknown>): Promise<unknown>;
-  createMany(args: Record<string, unknown>): Promise<unknown[]>;
+  createMany(args: Record<string, unknown>): Promise<unknown>;
   update(args: Record<string, unknown>): Promise<unknown>;
   updateMany(args: Record<string, unknown>): Promise<{ count: number }>;
   delete(args: Record<string, unknown>): Promise<unknown>;
@@ -191,7 +191,7 @@ export interface CompatQueryInterface {
   buildFindFirstOrThrow(args?: Record<string, unknown>): DeferredQuery<unknown>;
   buildFindUniqueOrThrow(args: Record<string, unknown>): DeferredQuery<unknown>;
   buildCreate(args: Record<string, unknown>): DeferredQuery<unknown>;
-  buildCreateMany(args: Record<string, unknown>): DeferredQuery<unknown[]>;
+  buildCreateMany(args: Record<string, unknown>): DeferredQuery<unknown>;
   buildUpdate(args: Record<string, unknown>): DeferredQuery<unknown>;
   buildUpdateMany(args: Record<string, unknown>): DeferredQuery<{ count: number }>;
   buildDelete(args: Record<string, unknown>): DeferredQuery<unknown>;
@@ -2398,10 +2398,10 @@ async function createManyByRun(
 ): Promise<{ count: number }> {
   let count = 0;
   for (const run of runs) {
-    const args: Args = { data: run };
+    const args: Args = { data: run, returning: false };
     if (t.skipDuplicates) args.skipDuplicates = true;
     if (t.timeout !== undefined) args.timeout = t.timeout;
-    count += (await qi.createMany(args)).length;
+    count += ((await qi.createMany(args)) as { count: number }).count;
   }
   return { count };
 }
@@ -2565,7 +2565,10 @@ function makeDelegate(
             );
           }
           const rows = list.map((d) => translateWriteData(ctx, mm, applyCreateDefaults(mm, d)));
-          const t: Args = { data: rows };
+          // Prisma's createMany resolves to { count }, which core counts
+          // without returning the rows (a plain MySQL insert returns none, so
+          // counting rows reported 0 there).
+          const t: Args = { data: rows, returning: false };
           applyNativeOptions(CREATE_MANY_OPTIONS, args as Args, t);
           if ((args as Args).skipDuplicates) t.skipDuplicates = true;
           return t;
@@ -2576,12 +2579,12 @@ function makeDelegate(
           // per contiguous same-shape run inside ONE transaction, so the call
           // stays all-or-nothing and the count is the total actually inserted.
           const runs = createManyRunsOf(t);
-          if (runs.length <= 1) return qi.createMany(t).then((r) => ({ count: (r as unknown[]).length }));
+          if (runs.length <= 1) return qi.createMany(t) as Promise<{ count: number }>;
           return runInTx((table) => createManyByRun(table(mm.table), t, runs));
         },
         {
           build: (qi, t) => qi.buildCreateMany(t),
-          reshape: (raw) => ({ count: (raw as unknown[]).length }),
+          reshape: (raw) => raw as { count: number },
           // A mixed batch is more than one statement, so the array
           // $transaction([...]) form runs the whole array sequentially in a tx.
           nested: (t) => createManyRunsOf(t).length > 1,

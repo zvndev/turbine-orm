@@ -1368,6 +1368,7 @@ export interface CreateManyArgs<
   D = OptionalInput<T>,
   S extends Record<string, boolean> | undefined = undefined,
   O extends Record<string, boolean> | undefined = undefined,
+  C extends boolean | undefined = true | undefined,
 > {
   /** The rows. A generated client passes its `XCreate` as `D`. */
   data: D[];
@@ -1387,6 +1388,22 @@ export interface CreateManyArgs<
   /** Return the written rows without these fields. Same rules as `select`. */
   omit?: FlagsArg<T, O>;
   /**
+   * `false` resolves to `{ count }`, the number of rows written, instead of the
+   * rows. A plain insert then sends no `RETURNING` / `OUTPUT` at all; an
+   * `onConflict` call returns only the key columns it needs to refuse two input
+   * rows that write one table row. The count is the number of rows the call
+   * would otherwise have returned: inserted plus updated, never a row
+   * `skipDuplicates` or `ignore` skipped. Cannot be combined with `select` or
+   * `omit` (E003). On MySQL, `skipDuplicates` with `false` is E017: a skipped
+   * row there counts as written.
+   *
+   * Typed by `C`, which defaults to the rows form, so args typed ahead of the
+   * call (`const args: CreateManyArgs<User> = ...`) still resolve to rows.
+   * Pass `false` as `C` to type count-only args ahead of the call, or
+   * `boolean` for a flag known only at run time (the result is then either).
+   */
+  returning?: C;
+  /**
    * Opt out of configured {@link GlobalFilters} on the conflict-UPDATE of
    * `onConflict` (inserts are never filtered). See {@link SkipGlobalFilters}.
    */
@@ -1394,6 +1411,22 @@ export interface CreateManyArgs<
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number | undefined;
 }
+
+/** What `createMany({ returning: false })` resolves to. */
+export interface CreateManyCount {
+  /** Rows written: inserted plus updated. */
+  count: number;
+}
+
+/**
+ * `createMany`'s result for a `returning` flag `C`: the rows for `true` or no
+ * flag, `{ count }` for `false`, either for a `boolean` known only at run time.
+ */
+export type CreateManyResult<Row, C> = [C] extends [false]
+  ? CreateManyCount
+  : [C] extends [true | undefined]
+    ? Row[]
+    : Row[] | CreateManyCount;
 
 /**
  * The columns of the primary key, or of one non-partial unique constraint or
@@ -1443,7 +1476,8 @@ export type SqlExprKind =
   | 'least'
   | 'case'
   | 'now'
-  | 'excluded';
+  | 'excluded'
+  | 'secondsBetween';
 
 /** Carries the phantom result type of a {@link SqlExpr}. Type-level only. */
 declare const SQL_EXPR_RESULT: unique symbol;
@@ -2054,8 +2088,11 @@ export interface GroupByArgs<T, R extends object = {}> {
   _min?: GroupByAggregateSpec<T> | undefined;
   /** Maximum value of fields (or JSON paths) in each group */
   _max?: GroupByAggregateSpec<T> | undefined;
-  /** Percentiles of fields in each group (PostgreSQL only). See {@link PercentileSpec}. */
-  _percentile?: Partial<Record<keyof T & string, PercentileSpec>> | undefined;
+  /**
+   * Percentiles of fields, or of expressions, in each group (PostgreSQL only).
+   * See {@link PercentileSpec} and {@link PercentileExprSpec}.
+   */
+  _percentile?: PercentileArgs<T> | undefined;
   /** Filter whole groups by their aggregate values (SQL HAVING). JSON-path aggregates key by their alias. */
   having?: HavingClause<T> | undefined;
   /**
@@ -2202,9 +2239,19 @@ export interface AggregateArgs<T, R extends object = {}> {
    * s._percentile.statusCode; // number | null
    * ```
    *
-   * See {@link PercentileSpec}.
+   * A key that names no field computes the percentile of an expression,
+   * given as `of`:
+   *
+   * ```ts
+   * const s = await db.jobs.aggregate({
+   *   _percentile: { wait: { of: expr.secondsBetween(col('requestedAt'), col('readyAt')), p: 0.95 } },
+   * });
+   * s._percentile.wait; // number | null, in seconds
+   * ```
+   *
+   * See {@link PercentileSpec} and {@link PercentileExprSpec}.
    */
-  _percentile?: Partial<Record<keyof T & string, PercentileSpec>> | undefined;
+  _percentile?: PercentileArgs<T> | undefined;
   /**
    * Opt in to aggregating PII-tagged (`defineSchema` `pii: true`) columns.
    * `_min` / `_max` / `_percentile` return a STORED VALUE (or one that equals a
@@ -2277,19 +2324,80 @@ export type AggregateResultOf<T, A> = AggregateCountPart<A> &
 export interface PercentileSpec {
   p: number | readonly number[];
   method?: PercentileMethod | undefined;
+  /** Only on a key that names no field: see {@link PercentileExprSpec}. */
+  of?: undefined;
 }
+
+/**
+ * One `_percentile` entry over an expression, under a key that names no field
+ * (the key is only the result's name and never reaches the SQL).
+ *
+ * - `of`: a numeric expression over the row's own columns, built with
+ *   {@link expr}: arithmetic (`expr.add` / `sub` / `mul` / `div`),
+ *   `expr.coalesce` / `greatest` / `least` / `case`, and
+ *   `expr.secondsBetween(col('a'), col('b'))` for the seconds from one
+ *   timestamp column to another. Bound values must be numbers or bigints.
+ *   `col('x')` alone is refused: use the field key `x` instead.
+ * - `p` and `method` as in {@link PercentileSpec}. The expression is ordered as
+ *   double precision, so the result is a `number` for both methods (an integer
+ *   beyond 2^53 loses exactness).
+ *
+ * Every column the expression reads as a value needs `includePii: UNSAFE`
+ * when it is PII-tagged; columns read only by an `expr.case` arm's `when` do
+ * not. Over zero rows the result is `null`.
+ */
+export interface PercentileExprSpec {
+  of: SqlExpr<number | bigint | string>;
+  p: number | readonly number[];
+  method?: PercentileMethod | undefined;
+}
+
+/**
+ * The `_percentile` argument: field keys take a {@link PercentileSpec}; any
+ * other key names an expression's result and takes a {@link PercentileExprSpec}.
+ * On an untyped table (`keyof T` is `string`) any key takes either: the
+ * `string` key is dropped from the field half, which would otherwise narrow
+ * every key to a field spec.
+ */
+export type PercentileArgs<T> = {
+  [K in keyof T & string as string extends K ? never : K]?: PercentileSpec | undefined;
+} & {
+  [name: string]: PercentileSpec | PercentileExprSpec | undefined;
+};
+
+/**
+ * `_percentile` naming fields only. `aggregate` / `groupBy` take args of this
+ * shape when their type is generic, where {@link PercentileKeysChecked} cannot
+ * read the keys, so a wrapper generic over its args still compiles.
+ */
+export type FieldPercentiles<T> = {
+  _percentile?: { [K in keyof T & string]?: PercentileSpec | undefined } | undefined;
+};
+
+/**
+ * Applied to `aggregate` / `groupBy` arguments: every `_percentile` key that
+ * names no field must carry `of`, so a misspelled field name is a compile
+ * error rather than an expression percentile with no expression.
+ */
+export type PercentileKeysChecked<T, A> = A extends { _percentile: infer S }
+  ? [S] extends [object]
+    ? { _percentile: { [K in keyof S]: K extends keyof T ? S[K] : PercentileExprSpec | undefined } }
+    : unknown
+  : unknown;
 
 /** `'cont'` interpolates (`percentile_cont`); `'disc'` returns a stored value (`percentile_disc`). */
 export type PercentileMethod = 'cont' | 'disc';
 
 /** One percentile value: the column's own type for `disc`; for `cont` a number, or an interval as the column reads. */
-type PercentileScalar<T, K, Spec> = K extends keyof T
-  ? Spec extends { method: 'disc' }
-    ? NonNullable<T[K]>
-    : [NonNullable<T[K]>] extends [number]
-      ? number
-      : number | NonNullable<T[K]>
-  : unknown;
+type PercentileScalar<T, K, Spec> = Spec extends { of: object }
+  ? number
+  : K extends keyof T
+    ? Spec extends { method: 'disc' }
+      ? NonNullable<T[K]>
+      : [NonNullable<T[K]>] extends [number]
+        ? number
+        : number | NonNullable<T[K]>
+    : unknown;
 
 /** A scalar `p` yields one value, an array `p` yields an array, `null` over zero rows. */
 type PercentileValue<T, K, Spec> = Spec extends { p: infer P }

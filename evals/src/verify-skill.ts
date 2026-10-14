@@ -756,6 +756,61 @@ const CLAIMS: Claim[] = [
       if (!(v[0]! <= v[1]! && v[1]! <= v[2]!)) throw new Error(`not in fraction order: ${JSON.stringify(v)}`);
     },
   },
+  // ---- 0.91 ---------------------------------------------------------------------
+  {
+    says: 'A `_percentile` key that names no field takes `of`, an expression, and returns a number under that key.',
+    run: async (db) => {
+      const r = (await call(db, 'ripening_checks', 'aggregate', {
+        _percentile: { scoreGap: { of: expr.sub(col('rindScore'), col('aromaScore')), p: 0.5 } },
+      })) as { _percentile: { scoreGap: number } };
+      const rows = (await call(db, 'ripening_checks', 'findMany', {
+        select: { rindScore: true, aromaScore: true },
+        limit: 100000,
+      })) as Array<{ rindScore: number; aromaScore: number }>;
+      const gaps = rows.map((x) => x.rindScore - x.aromaScore).sort((a, b) => a - b);
+      const pos = 0.5 * (gaps.length - 1);
+      const lo = Math.floor(pos);
+      const hi = Math.ceil(pos);
+      const want = gaps[lo]! + (gaps[hi]! - gaps[lo]!) * (pos - lo);
+      const got = r._percentile.scoreGap;
+      if (typeof got !== 'number') throw new Error(`scoreGap is ${typeof got}, not a number`);
+      if (Math.abs(got - want) > 1e-9) throw new Error(`scoreGap ${got}, expected ${want}`);
+    },
+  },
+  {
+    says: '`expr.secondsBetween(col(\'a\'), col(\'b\'))` is the seconds between two timestamp columns.',
+    run: async (db) => {
+      const r = (await call(db, 'affineurs', 'aggregate', {
+        where: { retiredAt: { not: null } },
+        _percentile: { zero: { of: expr.secondsBetween(col('retiredAt'), col('retiredAt')), p: 0.5 } },
+      })) as { _percentile: { zero: number | null } };
+      const retired = (await call(db, 'affineurs', 'count', { where: { retiredAt: { not: null } } })) as number;
+      const want = retired === 0 ? null : 0;
+      if (r._percentile.zero !== want) throw new Error(`expected ${want}, got ${r._percentile.zero}`);
+    },
+  },
+  {
+    says: 'A date column in `expr.secondsBetween` is refused with `TURBINE_E003`.',
+    run: throwsSaying('TURBINE_E003', 'is a date column', 'affineurs', 'aggregate', {
+      _percentile: { x: { of: expr.secondsBetween(col('tenureStartedOn'), col('retiredAt')), p: 0.5 } },
+    }),
+  },
+  {
+    says: '`createMany` with `returning: false` returns `{ count }` instead of the rows.',
+    run: (db) =>
+      inRolledBackTx(db, async (tx) => {
+        const row = (await call(tx, 'cheese_wheels', 'findUnique', { where: { id: 7 } })) as Record<string, unknown>;
+        const { id: _id, ...rest } = row;
+        const out = await call(tx, 'cheese_wheels', 'createMany', {
+          data: [
+            { ...rest, batchRef: 'VERIFY-SKILL-COUNT-1' },
+            { ...rest, batchRef: 'VERIFY-SKILL-COUNT-2' },
+          ],
+          returning: false,
+        });
+        deepStrictEqual(out, { count: 2 });
+      }),
+  },
   {
     says: "The default `method: 'cont'` interpolates and is refused on a date column with `TURBINE_E003`; use `method: 'disc'` there.",
     run: async (db) => {

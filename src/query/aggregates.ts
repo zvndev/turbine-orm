@@ -13,6 +13,7 @@ import { UnsupportedFeatureError, ValidationError } from '../errors.js';
 import type { TableMetadata } from '../schema.js';
 import { snakeToCamel } from '../schema.js';
 import type { DeferredQuery } from './deferred.js';
+import { compileReadExpr } from './expr.js';
 import {
   assertEqualityOperand,
   dedupeColumnList,
@@ -34,6 +35,7 @@ import type {
   JsonPathAggregateTarget,
   OrderBySpec,
   OrderDirection,
+  PercentileExprSpec,
   PercentileSpec,
   WhereClause,
 } from './types.js';
@@ -337,7 +339,15 @@ export function buildGroupBy<T extends object>(
   buildAggregates('_avg', 'AVG', args._avg as Record<string, boolean | JsonPathAggregateTarget> | undefined);
   buildAggregates('_min', 'MIN', args._min as Record<string, boolean | JsonPathAggregateTarget> | undefined);
   buildAggregates('_max', 'MAX', args._max as Record<string, boolean | JsonPathAggregateTarget> | undefined);
-  const percentiles = planPercentiles(qi, args._percentile, params, includePii, 'groupBy', claimResultKey);
+  const percentiles = planPercentiles(
+    qi,
+    args._percentile,
+    params,
+    includePii,
+    'groupBy',
+    claimResultKey,
+    (key) => key === '_count' || usedResultKeys.has(key),
+  );
   selectExprs.push(...percentiles.map((plan) => plan.expr));
 
   let sql = `SELECT ${selectExprs.join(', ')} FROM ${fromSql} GROUP BY ${groupExprs.join(', ')}`;
@@ -1193,7 +1203,7 @@ const PERCENTILE_HINT: Readonly<Record<string, string>> = {
     'function there, not an aggregate.',
 };
 
-const PERCENTILE_SPEC_KEYS = ['p', 'method'];
+const PERCENTILE_SPEC_KEYS = ['p', 'method', 'of'];
 const PERCENTILE_METHODS = ['cont', 'disc'];
 const PERCENTILE_NOT_ORDERABLE = 'ordering or filtering groups by _percentile is not supported yet.';
 
@@ -1201,9 +1211,13 @@ const PERCENTILE_NOT_ORDERABLE = 'ordering or filtering groups by _percentile is
 interface PercentilePlan {
   readonly expr: string;
   readonly alias: string;
-  /** The canonical field name the result is keyed by (as `_min` / `_max` are). */
+  /**
+   * The key the result is read back under: the canonical field name for a
+   * column (as `_min` / `_max` are), the caller's own name for an expression.
+   */
   readonly field: string;
-  readonly col: string;
+  /** The column, or `null` for an expression (`of`), which reads as double precision. */
+  readonly col: string | null;
 }
 
 /**
@@ -1218,6 +1232,12 @@ interface PercentilePlan {
  * form), a JSON-path target, and two keys naming one column. Both methods need
  * `includePii: UNSAFE` on a PII column: `disc` returns a stored cell, and so
  * does `cont` at p = 0 or 1 or over a one-row group.
+ *
+ * A key with `of` names an expression's result (see `PercentileExprSpec`): it
+ * must not name a field, the expression compiles through `compileReadExpr`,
+ * it is ordered as `float8`, and its SQL alias is `_percentile_of_<n>`, so the
+ * caller's name never reaches the SQL. Every PII column it reads as a value
+ * needs `includePii: UNSAFE`, as a column percentile does.
  */
 function planPercentiles(
   qi: BuilderCtx,
@@ -1226,6 +1246,7 @@ function planPercentiles(
   includePii: boolean,
   operation: 'aggregate' | 'groupBy',
   claimResultKey?: (key: string, what: string) => void,
+  resultKeyTaken?: (key: string) => boolean,
 ): PercentilePlan[] {
   if (spec === undefined) return [];
   const where = `${operation} _percentile on table "${qi.table}"`;
@@ -1246,6 +1267,15 @@ function planPercentiles(
   const meta = qi.schema.tables[qi.table];
   const plans: PercentilePlan[] = [];
   const aliases = new Set<string>();
+  // Column aliases are `_percentile_<column>`; an expression's is the first
+  // free `_percentile_of_<n>`, chosen after every column alias is known so a
+  // column named `of_0` keeps its own.
+  const columnAliases = new Set<string>();
+  for (const [key] of entries) {
+    const column = resolveColumnName(qi.tableMeta, key);
+    if (column !== undefined) columnAliases.add(`_percentile_${column}`);
+  }
+  let exprCount = 0;
   for (const [key, entry] of entries) {
     const label = `${where}, field "${key}"`;
     if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
@@ -1262,7 +1292,7 @@ function planPercentiles(
         );
       }
     }
-    const { p, method = 'cont' } = entry as PercentileSpec;
+    const { p, method = 'cont', of } = entry as PercentileSpec | PercentileExprSpec;
     if (!PERCENTILE_METHODS.includes(method as string)) {
       throw new ValidationError(`${label}: method must be 'cont' or 'disc', received ${describeValue(method)}.`);
     }
@@ -1271,6 +1301,27 @@ function planPercentiles(
       for (const fraction of p) assertFraction(fraction, label);
     } else {
       assertFraction(p, label);
+    }
+    if (of !== undefined) {
+      plans.push(
+        planExpressionPercentile(
+          qi,
+          key,
+          of,
+          p,
+          method,
+          params,
+          includePii,
+          operation,
+          label,
+          aliases,
+          columnAliases,
+          exprCount++,
+          claimResultKey,
+          resultKeyTaken,
+        ),
+      );
+      continue;
     }
     const col = qi.toColumn(key);
     if (method === 'cont' && qi.tableMeta.dateColumns.has(col)) {
@@ -1302,6 +1353,71 @@ function planPercentiles(
     });
   }
   return plans;
+}
+
+/** One `_percentile` entry over an expression (`of`); see {@link planPercentiles}. */
+function planExpressionPercentile(
+  qi: BuilderCtx,
+  key: string,
+  of: unknown,
+  p: number | readonly number[],
+  method: string,
+  params: unknown[],
+  includePii: boolean,
+  operation: 'aggregate' | 'groupBy',
+  label: string,
+  aliases: Set<string>,
+  columnAliases: ReadonlySet<string>,
+  index: number,
+  claimResultKey?: (key: string, what: string) => void,
+  resultKeyTaken?: (key: string) => boolean,
+): PercentilePlan {
+  const column = resolveColumnName(qi.tableMeta, key);
+  if (column !== undefined) {
+    throw new ValidationError(
+      `${label}: "${key}" is a field of the table, and \`of\` names an expression. Give the expression a name ` +
+        `that is not a field (the name is only its result's key), or drop \`of\` for the percentile of "${key}".`,
+    );
+  }
+  const compiled = compileReadExpr(
+    {
+      qi,
+      name: key,
+      operation: `${operation} _percentile`,
+      bind: (value, cls) => {
+        params.push(value);
+        return `${qi.p(params.length)}::${cls === 'int' ? 'int8' : 'numeric'}`;
+      },
+      predicate: (when) => {
+        const sql = whereMod.buildWhereClause(qi, when as WhereClause<Record<string, unknown>>, params);
+        if (sql === null) throw new ValidationError(`${label}: an expr.case() arm's when compiles to no predicate.`);
+        return sql;
+      },
+    },
+    of,
+  );
+  const meta = qi.schema.tables[qi.table];
+  for (const col of compiled.values) {
+    const field = qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
+    assertAggregatePiiOptIn(qi.table, meta, field, col, `${operation} _percentile "${key}"`, includePii);
+  }
+  // The caller's key never names the alias, so it skips every name already
+  // taken, a groupBy key included, rather than collide with one.
+  let n = index;
+  const taken = (alias: string): boolean =>
+    aliases.has(alias) || columnAliases.has(alias) || resultKeyTaken?.(alias) === true;
+  while (taken(`_percentile_of_${n}`)) n++;
+  const alias = `_percentile_of_${n}`;
+  aliases.add(alias);
+  claimResultKey?.(alias, `_percentile "${key}"`);
+  params.push(Array.isArray(p) ? [...p] : p);
+  const fractions = `${qi.p(params.length)}::float8${Array.isArray(p) ? '[]' : ''}`;
+  return {
+    expr: `percentile_${method}(${fractions}) WITHIN GROUP (ORDER BY (${compiled.sql})::float8) AS ${qi.q(alias)}`,
+    alias,
+    field: key,
+    col: null,
+  };
 }
 
 function assertFraction(value: unknown, label: string): void {
@@ -1352,8 +1468,11 @@ function readPercentiles(
  * that the array form delivers as text through the same exact-number rule the
  * scalar int8 parser applies. `null` over zero rows.
  */
-function percentileElement(qi: BuilderCtx, col: string, value: unknown): unknown {
+function percentileElement(qi: BuilderCtx, col: string | null, value: unknown): unknown {
   if (value === null || value === undefined) return null;
+  // An expression is ordered as float8, which the driver reads as a number
+  // (a supplied pool's own parser may hand back text).
+  if (col === null) return typeof value === 'string' ? Number(value) : value;
   if (typeof value === 'string' && isInt8Type(whereMod.getColumnPgType(qi, col))) {
     const n = Number(value);
     return Number.isSafeInteger(n) ? n : value;

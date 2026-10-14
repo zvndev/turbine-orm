@@ -743,6 +743,7 @@ export const mssqlDialect: Dialect = {
     // The limit the driver can actually send (see MSSQL_MAX_PARAMS), not 2100.
     maxBindParameters: MSSQL_MAX_PARAMS,
     maxInsertRows: MSSQL_MAX_INSERT_ROWS,
+    chunkBindParameters: MSSQL_MAX_PARAMS,
     upsertConflictTarget: 'explicit',
     setClauseOrder: 'snapshot',
     reselectLocksRows: false,
@@ -750,6 +751,7 @@ export const mssqlDialect: Dialect = {
     updateExpressions: true,
     // MERGE refuses a target row matched twice (error 8672).
     bulkUpsertAppliesRepeatedKeys: false,
+    skipDuplicatesCountsSkipped: false,
     readOnlyTransactions: false,
     connectionParameters: false,
     backendCancel: false,

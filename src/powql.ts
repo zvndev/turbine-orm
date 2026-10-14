@@ -129,6 +129,8 @@ import type {
   CountArgs,
   CreateArgs,
   CreateManyArgs,
+  CreateManyCount,
+  CreateManyResult,
   DeleteArgs,
   DeleteManyArgs,
   FieldResult,
@@ -4545,51 +4547,84 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
   createMany<
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: CreateManyArgs<T, OptionalInput<T>, S, O>): Promise<FieldResult<T, S, O>[]>;
-  async createMany(args: CreateManyArgs<T>): Promise<T[]> {
+    C extends boolean | undefined = undefined,
+  >(args: CreateManyArgs<T, OptionalInput<T>, S, O, C>): Promise<CreateManyResult<FieldResult<T, S, O>, C>>;
+  async createMany(
+    args: CreateManyArgs<T, OptionalInput<T>, undefined, undefined, boolean | undefined>,
+  ): Promise<T[] | CreateManyCount> {
     args = this.normalizeArgs(args);
     return this.withMiddleware('createMany', args as unknown as Record<string, unknown>, async () => {
-      if (args.onConflict !== undefined) {
-        throw new UnsupportedFeatureError(
-          'createMany({ onConflict })',
-          'powdb',
-          "PowQL's upsert statement takes one row. Call upsert() per row inside $transaction.",
-        );
-      }
-      // Validated as every engine validates it; it acts only on onConflict's
-      // update, which is refused above.
-      resolveSkipGlobalFilters(args.skipGlobalFilters);
-      if (args.skipDuplicates) {
-        // PowQL's `insert … returning` has no conflict clause, so there is no
-        // faithful skip-duplicates form; refuse rather than silently insert.
-        throw new UnsupportedFeatureError(
-          'createMany({ skipDuplicates: true })',
-          'powdb',
-          'PowQL insert has no ON CONFLICT DO NOTHING equivalent, filter duplicates before inserting.',
-        );
-      }
-      // Resolved before the write, so a bad projection writes nothing.
-      const plan = this.writeReturnPlan(args);
-      const supplied = (args.data as Record<string, unknown>[]).map((d) => this.applyPkDefault(d));
-      if (!supplied.length) return [];
-      // Uniformity is judged on what the caller supplied, as the SQL engines
-      // judge it; defaults are then filled per row.
-      this.assertUniformCreateManyRows(supplied);
-      const inputs = supplied.map((d) => this.applyColumnDefaults(d));
-      const params: unknown[] = [];
-      const tuples = inputs.map((d) => {
-        const assigns = this.scalarData(d);
-        return `{ ${assigns.map((a) => `${quotePowqlIdent(a.col.name)} := ${this.writeRef(a.value, a.col, params)}`).join(', ')} }`;
-      });
-      // Multi-row insert with `returning` hands back every inserted row in one round-trip.
-      const { rows, native } = await this.exec(
-        `insert ${this.qt} ${tuples.join(', ')} returning`,
-        params,
-        args.timeout,
-        'createMany',
-      );
-      return this.shape(rows, native).map((r) => this.shapeWriteRow(r, plan) as T);
+      // `returning: false` is checked as the SQL engines check it. PowQL's
+      // insert still returns the rows, which are counted and dropped.
+      const countOnly = this.createManyCountOnly(args);
+      const rows = await this.insertMany(args);
+      return countOnly ? { count: rows.length } : rows;
     });
+  }
+
+  /** `returning: false` validated: a boolean, and not combined with a projection. */
+  private createManyCountOnly(
+    args: CreateManyArgs<T, OptionalInput<T>, undefined, undefined, boolean | undefined>,
+  ): boolean {
+    const { returning } = args;
+    if (returning === undefined || returning === true) return false;
+    if (returning !== false) {
+      throw new ValidationError(
+        `createMany on "${this.table}": returning must be true or false, received ${typeof returning}.`,
+      );
+    }
+    if (args.select !== undefined || args.omit !== undefined) {
+      throw new ValidationError(
+        `createMany on "${this.table}": returning: false returns { count } and no rows, so it takes no ` +
+          `\`${args.select !== undefined ? 'select' : 'omit'}\`. Drop one of them.`,
+      );
+    }
+    return true;
+  }
+
+  private async insertMany(
+    args: CreateManyArgs<T, OptionalInput<T>, undefined, undefined, boolean | undefined>,
+  ): Promise<T[]> {
+    if (args.onConflict !== undefined) {
+      throw new UnsupportedFeatureError(
+        'createMany({ onConflict })',
+        'powdb',
+        "PowQL's upsert statement takes one row. Call upsert() per row inside $transaction.",
+      );
+    }
+    // Validated as every engine validates it; it acts only on onConflict's
+    // update, which is refused above.
+    resolveSkipGlobalFilters(args.skipGlobalFilters);
+    if (args.skipDuplicates) {
+      // PowQL's `insert … returning` has no conflict clause, so there is no
+      // faithful skip-duplicates form; refuse rather than silently insert.
+      throw new UnsupportedFeatureError(
+        'createMany({ skipDuplicates: true })',
+        'powdb',
+        'PowQL insert has no ON CONFLICT DO NOTHING equivalent, filter duplicates before inserting.',
+      );
+    }
+    // Resolved before the write, so a bad projection writes nothing.
+    const plan = this.writeReturnPlan(args);
+    const supplied = (args.data as Record<string, unknown>[]).map((d) => this.applyPkDefault(d));
+    if (!supplied.length) return [];
+    // Uniformity is judged on what the caller supplied, as the SQL engines
+    // judge it; defaults are then filled per row.
+    this.assertUniformCreateManyRows(supplied);
+    const inputs = supplied.map((d) => this.applyColumnDefaults(d));
+    const params: unknown[] = [];
+    const tuples = inputs.map((d) => {
+      const assigns = this.scalarData(d);
+      return `{ ${assigns.map((a) => `${quotePowqlIdent(a.col.name)} := ${this.writeRef(a.value, a.col, params)}`).join(', ')} }`;
+    });
+    // Multi-row insert with `returning` hands back every inserted row in one round-trip.
+    const { rows, native } = await this.exec(
+      `insert ${this.qt} ${tuples.join(', ')} returning`,
+      params,
+      args.timeout,
+      'createMany',
+    );
+    return this.shape(rows, native).map((r) => this.shapeWriteRow(r, plan) as T);
   }
 
   update<

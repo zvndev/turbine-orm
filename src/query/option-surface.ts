@@ -188,6 +188,9 @@ export const CREATE_MANY_OPTIONS: OptionTable<CreateManyArgs<Row>> = {
   onConflict: 'internal',
   select: 'internal',
   omit: 'internal',
+  // Compat's createMany already resolves to Prisma's { count } and sets this
+  // itself; a caller-supplied value would change the shape it relies on.
+  returning: 'internal',
   timeout: 'native',
   skipGlobalFilters: 'native',
 };

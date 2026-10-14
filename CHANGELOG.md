@@ -1,5 +1,130 @@
 # Changelog
 
+## 0.91.0 (2026-10-14)
+
+Two additions and a SQLite speedup. `createMany({ returning: false })`
+resolves to `{ count }` and sends no `RETURNING`, and `_percentile` takes an
+expression, including the new `expr.secondsBetween()` for the time between
+two timestamp columns. On SQLite a large `createMany` runs 70 to 140 times
+faster. Existing calls behave as in 0.90.2 with three exceptions: a
+`createMany` on SQLite larger than 250 bind parameters now runs as several
+statements in one transaction, `createMany` through
+`turbine-orm/prisma-compat` sends no `RETURNING`, and its
+`createMany({ skipDuplicates: true })` on MySQL is E017.
+
+### Added
+
+- **`createMany({ returning: false })` resolves to `{ count }`.** A plain
+  insert sends no `RETURNING` (no `OUTPUT` on SQL Server) and takes the
+  engine's row count, so neither the server nor JavaScript handles rows the
+  caller does not read. An `onConflict` call returns only its conflict-key
+  columns, which keeps the check that two rows equal under a case-insensitive
+  key are refused, and counts those rows: an ignored conflict, and a row its
+  `where` excludes, are not counted. `skipDuplicates` counts the rows
+  inserted; on MySQL, which counts a skipped row as written, the two together
+  are `UnsupportedFeatureError` (E017) for any `data`, empty included. The
+  result type follows the flag: `{ count: number }` for `false`, rows for
+  `true` or no flag. `CreateManyArgs` takes the flag as a
+  fifth type parameter, defaulting to the rows form, so args typed ahead of the
+  call and generic wrappers still resolve to rows. `select` or `omit` with
+  `returning: false`, or a `returning` that is not a boolean, is
+  `ValidationError` (E003). Every engine, and `buildCreateMany` for a
+  pipeline:
+
+  ```ts
+  const [orders, lines] = await db.pipeline(
+    db.orders.buildCreateMany({ data: orderRows, returning: false }),
+    db.orderLines.buildCreateMany({ data: lineRows, returning: false }),
+  ); // [{ count: 3 }, { count: 12 }], in one transaction
+  ```
+
+- **`_percentile` over an expression.** A `_percentile` key that names no
+  field takes `of`, an expression built with `expr`, and the result comes back
+  under that key:
+
+  ```ts
+  const s = await db.jobs.aggregate({
+    _percentile: {
+      wait: { of: expr.secondsBetween(col('requestedAt'), col('readyAt')), p: [0.5, 0.95] },
+    },
+  });
+  s._percentile.wait; // number[] | null, in seconds
+  ```
+
+  `of` takes arithmetic, `coalesce`, `greatest`, `least` and `case` over the
+  row's own columns, with numbers or bigints as bound values. The expression
+  is ordered as double precision, so both methods return a `number`. The key
+  never reaches the SQL. `aggregate` and `groupBy`, PostgreSQL only, as
+  `_percentile` already was. A key that names no field and has no `of` is a
+  type error, and E003 at run time; a field key with `of`, `col()` alone as
+  `of`, a string, `Date` or boolean bound value, a non-numeric result,
+  `expr.now()` and `expr.excluded()` are E003. A PII column the expression
+  reads as a value needs `includePii: UNSAFE`, as a column percentile does; a
+  column only a `case` arm's `when` tests does not.
+- **`expr.secondsBetween(from, to)`**: the seconds from one timestamp column
+  to another, fractional, `NULL` when either is. Both columns must be
+  `timestamptz`, or both zone-less `timestamp`. Accepted in `_percentile`'s
+  `of` in this release, and E003 in update data.
+- `PercentileExprSpec`, `PercentileArgs`, `PercentileKeysChecked`,
+  `FieldPercentiles`, `CreateManyCount` and `CreateManyResult` are exported
+  types.
+
+### Performance
+
+- **A large `createMany` on SQLite runs 70 to 140 times faster.** SQLite
+  finds each named parameter of a statement by a linear search, when it
+  prepares the statement and when it binds it, so a statement's cost grew
+  with the square of its parameters. `createMany` filled each statement to
+  SQLite's limit of 32,766. It now splits at 250 parameters, in one
+  transaction as before. 40,000 rows into an in-memory database, both sizings
+  in one process:
+
+  | Rows of | Returns | 32,766 parameters | 250 parameters |
+  |---|---|---|---|
+  | 2 columns | rows | 34.2 s | 0.48 s |
+  | 6 columns | rows | 141.2 s | 0.98 s |
+  | 2 columns | `{ count }` | 22.6 s | 0.27 s |
+  | 6 columns | `{ count }` | 59.1 s | 0.61 s |
+
+  The size is a new `EngineCapabilities` key,
+  `chunkBindParameters`; every other engine's equals its
+  `maxBindParameters`, so their statements do not change. Two calls keep one
+  statement as large as the engine allows: an `onConflict` call whose written
+  rows cannot be told apart across statements (its `update` assigns the key,
+  or the only key is a PII column), and a call on a pool with no `connect()`,
+  which cannot run several statements in one transaction.
+
+### Fixed
+
+- **`createMany` through `turbine-orm/prisma-compat` reported `count: 0` on
+  MySQL.** The adapter counted the rows `createMany` returned, and a plain
+  MySQL insert returns none. It now asks for the count. With
+  `skipDuplicates` it cannot (see Changed).
+- **`createMany({ data: [] })` threw on SQL Server.** The zero-row statement
+  was written `WHERE false`, which T-SQL rejects as a condition. It is
+  `WHERE 1 = 0` on every engine now.
+
+### Changed
+
+- `EngineCapabilities` has two new required keys, `chunkBindParameters` and
+  `skipDuplicatesCountsSkipped`. A custom dialect copies them only if it
+  spreads a shipped dialect's `capabilities` object as well as the dialect;
+  otherwise it fails to compile until it states them. At run time a dialect
+  without `chunkBindParameters` splits at `maxBindParameters`, as before.
+- `aggregate`, `groupBy` and their `build*` methods are overloaded: args of a
+  generic type take field percentiles only, so a wrapper generic over its args
+  compiles as it did in 0.90.2.
+- Through `turbine-orm/prisma-compat` on MySQL, `createMany({ skipDuplicates:
+  true })` is now E017, as it already was on SQL Server and PowDB. MySQL
+  counts a skipped row as written, so the count Prisma returns cannot be
+  read, and 0.90.2 reported `count: 0`.
+
+### Docs
+
+- The queries page covers `returning: false`, writing to several tables in
+  one transaction with a pipeline of `buildCreateMany` calls, and expression
+  percentiles.
+
 ## 0.90.2 (2026-10-13)
 
 A performance patch. `createMany` no longer searches the column list for every

@@ -69,9 +69,10 @@ interface Call {
 }
 
 /**
- * A recording client. Every `createMany` returns one canned row so a summed
- * `{ count }` is the number of statements issued, and `$transaction` calls are
- * counted so the uniform path can be shown NOT to open one.
+ * A recording client. Every count-only `createMany` answers `{ count: 1 }` so a
+ * summed `{ count }` is the number of statements issued (any other call returns
+ * one canned row), and `$transaction` calls are counted so the uniform path can
+ * be shown NOT to open one.
  */
 function spy(): { db: CompatTurbineClient; calls: Call[]; transactions: () => number } {
   const calls: Call[] = [];
@@ -94,7 +95,7 @@ function spy(): { db: CompatTurbineClient; calls: Call[]; transactions: () => nu
       {
         get: (_t, method: string) => (args: Any) => {
           calls.push({ method, args });
-          return Promise.resolve([{ id: 1 }]);
+          return Promise.resolve(method === 'createMany' && args?.returning === false ? { count: 1 } : [{ id: 1 }]);
         },
       },
     );
@@ -123,11 +124,12 @@ describe('prisma-compat createMany, statement planning', () => {
       ['createMany'],
     );
     // The very array the caller passed, so the emitted SQL cannot differ from
-    // what the ungrouped path produced.
+    // what the ungrouped path produced, and a request for the count only: the
+    // adapter never reads the rows (a plain MySQL insert returns none).
     assert.equal(calls[0]!.args.data.length, 2);
-    assert.deepEqual(calls[0]!.args, { data: calls[0]!.args.data });
+    assert.deepEqual(calls[0]!.args, { data: calls[0]!.args.data, returning: false });
     assert.equal(transactions(), 0);
-    assert.deepEqual(res, { count: 1 }, 'count is the rows the single statement returned');
+    assert.deepEqual(res, { count: 1 }, 'count is the count the single statement reported');
   });
 
   nodeIt('mixed rows become one createMany per contiguous run inside one transaction', async () => {
@@ -141,6 +143,10 @@ describe('prisma-compat createMany, statement planning', () => {
       'contiguous same-shape runs, in the order the caller wrote them',
     );
     assert.equal(transactions(), 1, 'all runs share ONE transaction, so the call stays atomic');
+    assert.ok(
+      calls.every((c) => c.args.returning === false),
+      'every run asks for its count',
+    );
     assert.deepEqual(res, { count: 3 }, 'counts sum across runs');
   });
 
@@ -303,8 +309,8 @@ describe('prisma-compat createMany, live Postgres', () => {
     assert.equal(seen.length, 1);
     assert.equal(
       seen[0],
-      `INSERT INTO "${WIDGET_TABLE}" ("name") SELECT * FROM UNNEST($1::text[]) RETURNING *`,
-      'the column-major UNNEST form the ungrouped path always emitted',
+      `INSERT INTO "${WIDGET_TABLE}" ("name") SELECT * FROM UNNEST($1::text[])`,
+      'the column-major UNNEST form, with no RETURNING: the adapter counts the rows and never reads them',
     );
   });
 

@@ -233,6 +233,12 @@ PostgreSQL only. `p` may be an array of fractions, and the result is then an
 array in the same order. The default `method: 'cont'` interpolates and is
 refused on a date column with `TURBINE_E003`; use `method: 'disc'` there.
 
+A `_percentile` key that names no field takes `of`, an expression, and returns
+a number under that key: `scoreGap: { of: expr.sub(col('rindScore'),
+col('aromaScore')), p: 0.5 }`. `expr.secondsBetween(col('a'), col('b'))` is the
+seconds between two timestamp columns, and a date column there is refused with
+`TURBINE_E003`.
+
 ## groupBy and having
 
 `by` lists the grouping columns. The `having` shape is **column first, aggregate
@@ -292,6 +298,8 @@ refused with `TURBINE_E003`, and so is an expression in `create` data.
 ['status'] }` inserts the new keys and updates the rows that already exist. The
 target must be the primary key or one whole unique key; any other column list
 is refused with `TURBINE_E003`.
+
+`createMany` with `returning: false` returns `{ count }` instead of the rows.
 
 ## Locking rows
 

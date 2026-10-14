@@ -1038,12 +1038,16 @@ export const sqliteDialect: Dialect = {
     // The default SQLITE_MAX_VARIABLE_NUMBER.
     maxBindParameters: 32766,
     maxInsertRows: Number.POSITIVE_INFINITY,
+    // Measured: 40,000 rows insert 70 to 140 times faster in statements of 250
+    // parameters than of 32,766 (named-parameter lookup is a linear search).
+    chunkBindParameters: 250,
     upsertConflictTarget: 'explicit',
     setClauseOrder: 'snapshot',
     reselectLocksRows: false,
     integerDivision: '/',
     updateExpressions: true,
     bulkUpsertAppliesRepeatedKeys: true,
+    skipDuplicatesCountsSkipped: false,
     readOnlyTransactions: false,
     connectionParameters: false,
     backendCancel: false,
@@ -1271,6 +1275,7 @@ export const sqliteDialect: Dialect = {
   },
 
   buildReturningClause(selection: ReturningSelection = '*'): string {
+    if (selection !== '*' && selection.length === 0) return '';
     return ` RETURNING ${selection === '*' ? '*' : selection.join(', ')}`;
   },
 

@@ -957,11 +957,17 @@ export function planCreateMany<T extends object>(
   qi: BuilderCtx,
   args: CreateManyArgs<T>,
   projection?: WriteProjection,
+  canSplit = true,
 ): { chunks: DeferredQuery<T[]>[]; rowsPerChunk: number } {
   const prepared = prepareCreateMany<T>(qi, args, projection);
   if ('deferred' in prepared) return { chunks: [prepared.deferred], rowsPerChunk: args.data.length };
   const rows = prepared.rowValues;
-  const size = rowsPerStatement(qi, prepared);
+  const { most, chunk } = statementSizes(qi, prepared);
+  // Rows that cannot be told apart across statements (refused below past one),
+  // and a call whose executor cannot run several statements in one
+  // transaction (`canSplit`), take the fewest statements the engine allows;
+  // the rest are split at the size the engine runs fastest.
+  const size = !canSplit || (prepared.conflict && !prepared.identity) ? most : chunk;
   if (rows.length <= size) {
     return { chunks: [emitCreateMany<T>(qi, prepared, rows, 'allow', true)], rowsPerChunk: size };
   }
@@ -1009,12 +1015,23 @@ function prepareCreateMany<T extends object>(
   // The data-independent half of onConflict is checked before the empty-data
   // shortcut, so a call is never valid with no rows and invalid with some.
   const conflict = args.onConflict === undefined ? null : resolveConflictPlan(qi, args);
+  const countOnly = isCountOnly(projection);
+  // Before the empty-data shortcut too, so the refusal never depends on the rows.
+  if (countOnly && args.skipDuplicates && qi.dialect.capabilities.skipDuplicatesCountsSkipped) {
+    throw new UnsupportedFeatureError(
+      'createMany({ skipDuplicates: true, returning: false })',
+      qi.dialect.name,
+      'It counts a skipped row as written, so the count would include the rows skipped. Without ' +
+        'returning: false the call writes the same rows and reports no count.',
+    );
+  }
   if (args.data.length === 0) {
     return {
       deferred: {
-        sql: `SELECT * FROM ${qt} WHERE false`,
+        // `1 = 0`, not `false`: T-SQL has no boolean literal in a condition.
+        sql: `SELECT * FROM ${qt} WHERE 1 = 0`,
         params: [],
-        transform: () => [],
+        transform: () => (countOnly ? { count: 0 } : []) as unknown as T[],
         tag: `${qi.table}.createMany`,
       },
     };
@@ -1046,7 +1063,10 @@ function prepareCreateMany<T extends object>(
       deferred: {
         sql: buildDefaultValuesInsert(qi, args.data.length, args.skipDuplicates, projection),
         params: [],
-        transform: (result) => result.rows.map((row) => parseWriteRow(qi, row, projection) as T),
+        transform: (result) =>
+          countOnly
+            ? (countOf(result) as unknown as T[])
+            : result.rows.map((row) => parseWriteRow(qi, row, projection) as T),
         tag: `${qi.table}.createMany`,
       },
     };
@@ -1144,31 +1164,41 @@ function emitCreateMany<T extends object>(
   return {
     sql: built.sql,
     params: built.params,
-    transform: (result) => result.rows.map((row) => parseWriteRow(qi, row, projection) as T),
+    transform: (result) =>
+      isCountOnly(projection)
+        ? (countOf(result) as unknown as T[])
+        : result.rows.map((row) => parseWriteRow(qi, row, projection) as T),
     tag: `${qi.table}.createMany`,
   };
 }
 
 /**
- * Rows one `createMany` statement may carry: the most that keep its bind
- * parameters within the engine's limit and, on SQL Server, its rows within
- * the 1000 a plain `INSERT ... VALUES` accepts. The parameter cost is measured
- * from one-row and two-row builds, which separates the per-row parameters from
- * the ones bound once per statement (an onConflict update's values); the
- * PostgreSQL UNNEST form binds one array per column, so its rows never run out.
+ * Rows one `createMany` statement may carry. `most`: the most that keep its
+ * bind parameters within the engine's limit and, on SQL Server, its rows
+ * within the 1000 a plain `INSERT ... VALUES` accepts. `chunk`: the same under
+ * the engine's `chunkBindParameters`, the size a call that runs as several
+ * statements is split at. The parameter cost is measured from one-row and
+ * two-row builds, which separates the per-row parameters from the ones bound
+ * once per statement (an onConflict update's values); the PostgreSQL UNNEST
+ * form binds one array per column, so its rows never run out.
  */
-function rowsPerStatement(qi: BuilderCtx, prepared: PreparedCreateMany): number {
+function statementSizes(qi: BuilderCtx, prepared: PreparedCreateMany): { most: number; chunk: number } {
   // An onConflict statement (SQL Server's MERGE) reads its rows as a derived
   // table, which the plain INSERT ... VALUES row cap does not bind.
   const cap = prepared.conflict ? Infinity : qi.dialect.capabilities.maxInsertRows;
-  const limit = maxBindParameters(qi.dialect);
+  const limit = maxBindParameters(qi.dialect) ?? Infinity;
+  // A dialect written before the key existed has none, and splits at its limit.
+  const preferred: number | undefined = qi.dialect.capabilities.chunkBindParameters;
+  const chunkLimit = typeof preferred === 'number' && preferred < limit ? preferred : limit;
   const rows = prepared.rowValues;
-  if (limit === undefined || rows.length < 2) return cap;
+  if (!Number.isFinite(chunkLimit) || rows.length < 2) return { most: cap, chunk: cap };
   const one = emitCreateMany(qi, prepared, rows.slice(0, 1), 'allow', true).params.length;
   const perRow = emitCreateMany(qi, prepared, rows.slice(0, 2), 'allow', true).params.length - one;
-  if (perRow <= 0) return cap;
+  if (perRow <= 0) return { most: cap, chunk: cap };
   const fixed = Math.max(0, one - perRow);
-  return Math.max(1, Math.min(cap, Math.floor((limit - fixed) / perRow)));
+  const fit = (bound: number): number =>
+    Number.isFinite(bound) ? Math.max(1, Math.min(cap, Math.floor((bound - fixed) / perRow))) : cap;
+  return { most: fit(limit), chunk: fit(chunkLimit) };
 }
 
 // ---------------------------------------------------------------------------
@@ -1654,6 +1684,11 @@ function buildBulkUpsert(
     // order is the engine's, not the input's.
     transform: (result) => {
       if (identity) assertEachRowWrittenOnce(qi, conflict, identity, result.rows, first);
+      // COUNT_ONLY: the rows back are the identity columns (or none at all when
+      // the written rows cannot be identified), counted and never returned.
+      if (isCountOnly(projection)) {
+        return (identity ? { count: result.rows.length } : countOf(result)) as unknown as Record<string, unknown>[];
+      }
       const rows = result.rows.map((row) => parseWriteRow(qi, row, projection));
       if (identity && identity.added.length > 0) {
         for (const row of rows) for (const field of identity.added) delete row[field];
@@ -2447,8 +2482,29 @@ export function piiFields(_qi: BuilderCtx, meta: TableMetadata): string[] {
  * 34,500/s with `RETURNING *`.
  */
 export interface WriteProjection {
-  /** Unquoted column names, in table order. Never empty. */
+  /**
+   * Unquoted column names, in table order. Empty only for {@link COUNT_ONLY}:
+   * a caller's projection always names at least one column.
+   */
   readonly columns: readonly string[];
+}
+
+/**
+ * The projection of `createMany({ returning: false })`: no column. A plain
+ * insert then sends no RETURNING / OUTPUT and reports its row count; an
+ * onConflict call returns only its identity columns (see
+ * {@link conflictIdentity}), which the count is taken from.
+ */
+export const COUNT_ONLY: WriteProjection = Object.freeze({ columns: Object.freeze([]) as readonly string[] });
+
+/** True for {@link COUNT_ONLY} (or any projection naming no column). */
+export function isCountOnly(projection: WriteProjection | undefined): boolean {
+  return projection !== undefined && projection.columns.length === 0;
+}
+
+/** `{ count }` from a write that returned no rows to count: the engine's row count. */
+function countOf(result: { rows: unknown[]; rowCount?: number | null }): { count: number } {
+  return { count: typeof result.rowCount === 'number' ? result.rowCount : result.rows.length };
 }
 
 /**
@@ -2544,6 +2600,8 @@ export function writeReturningColumns(qi: BuilderCtx, projection?: WriteProjecti
  */
 export function writeReselectSelection(qi: BuilderCtx, projection?: WriteProjection): string {
   const cols = writeReturningColumns(qi, projection);
+  // COUNT_ONLY: the re-read is counted, not returned, so it reads no column.
+  if (cols !== '*' && cols.length === 0) return '1';
   return cols === '*' ? '*' : cols.join(', ');
 }
 

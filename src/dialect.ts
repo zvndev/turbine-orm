@@ -544,6 +544,18 @@ export interface EngineCapabilities {
   readonly maxInsertRows: number;
 
   /**
+   * The most bind parameters each statement of a `createMany` that runs as
+   * several statements carries: at most `maxBindParameters`, and lower where
+   * an engine slows faster than linearly with a statement's size. SQLite
+   * finds each named parameter by a linear search, at prepare and at bind, so
+   * 40,000 six-column rows took 141 s in statements of 32,766 parameters and
+   * 1 s in statements of 250. A call whose rows cannot be told apart
+   * across statements, or on a pool with no `connect()`, is not split below
+   * `maxBindParameters` (see `planCreateMany`).
+   */
+  readonly chunkBindParameters: number;
+
+  /**
    * What a single-statement upsert conflicts on. `'explicit'`: the conflict
    * target it names. `'any-unique-key'`: whichever unique key collides first
    * (MySQL `ON DUPLICATE KEY UPDATE`), so a `create` that can collide on a key
@@ -578,6 +590,17 @@ export interface EngineCapabilities {
    * it afterwards, so the statement runs in a transaction it can roll back.
    */
   readonly bulkUpsertAppliesRepeatedKeys: boolean;
+
+  /**
+   * A `skipDuplicates` insert reports a skipped row as affected, so its row
+   * count cannot be the rows it inserted. MySQL: its skip is a no-op
+   * `ON DUPLICATE KEY UPDATE`, which under `CLIENT_FOUND_ROWS` (mysql2's
+   * default) counts a matched row, and a one-row statement's result carries no
+   * `info` to subtract the duplicates from. `createMany` refuses
+   * `skipDuplicates` with `returning: false` here (E017). False on an engine
+   * that never runs a skip.
+   */
+  readonly skipDuplicatesCountsSkipped: boolean;
 
   // ---- Connection and transactions --------------------------------------
 
@@ -916,7 +939,11 @@ export interface Dialect {
    */
   readonly explainQuery?: { prefix: string };
 
-  /** Build a dialect-specific RETURNING clause. Return an empty string when unsupported. */
+  /**
+   * Build a dialect-specific RETURNING clause. Return an empty string when
+   * unsupported, and for an empty column list (a write that returns no column,
+   * `createMany({ returning: false })`).
+   */
   buildReturningClause(selection?: ReturningSelection): string;
 
   /** Build a single-row INSERT statement. Inputs are SQL-ready quoted fragments. */
@@ -1427,12 +1454,14 @@ export const postgresDialect: Dialect = {
     // Counted in a 16-bit field.
     maxBindParameters: 65535,
     maxInsertRows: Number.POSITIVE_INFINITY,
+    chunkBindParameters: 65535,
     upsertConflictTarget: 'explicit',
     setClauseOrder: 'snapshot',
     reselectLocksRows: false,
     integerDivision: '/',
     updateExpressions: true,
     bulkUpsertAppliesRepeatedKeys: false,
+    skipDuplicatesCountsSkipped: false,
     readOnlyTransactions: true,
     connectionParameters: true,
     backendCancel: true,
@@ -1518,6 +1547,7 @@ export const postgresDialect: Dialect = {
   },
 
   buildReturningClause(selection: ReturningSelection = '*'): string {
+    if (selection !== '*' && selection.length === 0) return '';
     return ` RETURNING ${selection === '*' ? '*' : selection.join(', ')}`;
   },
 
