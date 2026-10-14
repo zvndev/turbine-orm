@@ -87,6 +87,29 @@ describe('createMany refuses rows that name different fields', () => {
     );
   });
 
+  nodeIt('a row that is not an object is refused by index, on every dialect', () => {
+    // `[{}, null]` used to compile to two rows of defaults: an empty first row
+    // names no field, and a null row has none either. A JSON request body can
+    // carry one, so it is refused before anything is built.
+    for (const [name, dialect] of dialects) {
+      for (const [bad, word] of [
+        [null, 'null'],
+        [5, 'a number'],
+        ['x', 'a string'],
+      ] as const) {
+        assert.throws(
+          () => q(dialect).buildCreateMany({ data: [{}, bad] as never }),
+          (e: Error) => e instanceof ValidationError && new RegExp(`row 1 is ${word}, not an object`).test(e.message),
+          `${name}: ${String(bad)}`,
+        );
+      }
+      assert.throws(
+        () => q(dialect).buildCreateMany({ data: [null, { n: 1 }] as never }),
+        (e: Error) => e instanceof ValidationError && /row 0 is null/.test(e.message),
+      );
+    }
+  });
+
   nodeIt('an explicit `undefined` counts as omitted, exactly as in `create`', () => {
     // `create({ data: { n: undefined } })` filters the key out and lets the
     // column default apply, so the bulk path must not bind it as NULL either.
