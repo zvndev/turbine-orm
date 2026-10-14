@@ -65,7 +65,7 @@ export function SiteFooter() {
       <div className="site-footer-inner">
         <div className="site-footer-brand">
           <Wordmark />
-          <p>One query, any depth. MIT licensed. Built by ZVN.</p>
+          <p>Raw SQL speed, zero raw SQL. MIT licensed. Built by ZVN.</p>
         </div>
         <nav aria-label="Footer" className="site-footer-nav">
           <div>

@@ -10,7 +10,7 @@ import { ImageResponse } from 'next/og';
  * It follows the site's night-circuit look: near-black, one amber accent, and
  * a light trail drawn with plain gradients (no images, no fonts to fetch).
  */
-export const OG_CARD_ALT = 'Turbine ORM, a TypeScript ORM for Postgres: one query, any depth';
+export const OG_CARD_ALT = 'Turbine ORM, the TypeScript ORM for Postgres: raw SQL speed, zero raw SQL';
 export const OG_CARD_SIZE = { width: 1200, height: 630 };
 export const OG_CARD_CONTENT_TYPE = 'image/png';
 
@@ -96,16 +96,16 @@ export function renderOgCard() {
         {/* Headline */}
         <div style={{ display: 'flex', flexDirection: 'column', marginBottom: 28 }}>
           <span style={{ fontSize: 96, fontWeight: 800, color: TEXT, lineHeight: 1, letterSpacing: '-0.02em' }}>
-            One query.
+            Raw SQL speed.
           </span>
           <span style={{ fontSize: 96, fontWeight: 800, color: ACCENT, lineHeight: 1.05, letterSpacing: '-0.02em' }}>
-            Any depth.
+            Zero raw SQL.
           </span>
         </div>
 
         {/* Subline */}
         <p style={{ fontSize: 30, color: MUTED, margin: 0, fontWeight: 400 }}>
-          A TypeScript ORM for Postgres. One runtime dependency.
+          The TypeScript ORM for Postgres. Within 8% of hand-written SQL.
         </p>
       </div>
     ),

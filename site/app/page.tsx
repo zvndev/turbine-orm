@@ -1,182 +1,215 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { codeToHtml } from 'shiki';
+import { CodeTabs } from '../components/CodeTabs';
 import { CopyButton } from '../components/CopyButton';
 import { HeroFallback } from '../components/hero/HeroFallback';
 import { HeroStage } from '../components/hero/HeroStage';
 import { SiteFooter, SiteHeader } from '../components/SiteChrome';
-import { HERO_TAGLINE } from '../lib/tagline';
-import { TURBINE_MINOR } from '../lib/version';
 
 export const metadata: Metadata = {
-  title: 'Turbine ORM: one query, any depth',
+  title: 'Turbine ORM: raw SQL speed, zero raw SQL',
   description:
-    'A TypeScript ORM for Postgres that compiles nested reads into one SQL statement you can read. No query engine, no WASM, one runtime dependency (pg). Read-only MCP tools for coding agents, offline index advice, migration guards. MIT.',
+    'The TypeScript ORM for Postgres that runs within 8% of hand-written SQL. A whole page of nested data in one round trip, types down to the last relation, one dependency, and tools for your coding agent. MIT.',
 };
 
 /*
- * Bundle-size claims. These exact phrases are checked against the size-limit
- * gates by src/test/size-claim-sync.test.ts, and the stat strip below reads
- * its figure out of them, so the two cannot drift apart.
+ * Every figure on this page has a source in the repo:
+ *   8%, 2.02x, 1.46x, the bars: benchmarks/RESULTS-0.71.0.md
+ *   7.16x, 24 ms vs 172 ms:    benchmarks/RESULTS-NETWORK-0.78.0.md
+ *   97% (up from 73%):         evals/AGENT-EVAL-0.73.0.md, CHANGELOG 0.73.0
+ *   streaming loss:            CHANGELOG 0.76.0
  */
-const MAIN_SIZE_CLAIM = 'under 148 kB brotli';
-const EDGE_SIZE_CLAIM = 'under 116 kB brotli';
-const sizeOf = (claim: string) => claim.match(/\d+ kB/)?.[0] ?? '';
 
-const queryCode = `const users = await db.users.findMany({
-  where: { orgId: 1 },
+const examples = [
+  {
+    label: 'Read',
+    file: 'feed.ts',
+    caption: 'A user, their five latest posts and every comment with its author. One round trip, typed to the last field.',
+    code: `const feed = await db.users.findMany({
+  where: { orgId },
   with: {
     posts: {
-      with: { comments: { with: { author: true } } },
       orderBy: { createdAt: 'desc' },
       limit: 5,
+      with: { comments: { with: { author: true } } },
     },
   },
 });
 
-users[0].posts[0].comments[0].author.name;
-//                                  ^ typed, end to end
+feed[0].posts[0].comments[0].author.name; // string, autocompleted`,
+  },
+  {
+    label: 'Write',
+    file: 'signup.ts',
+    caption: 'A user and their first posts in one call. If any row fails, none of them are written.',
+    code: `const user = await db.users.create({
+  data: {
+    email: 'ada@example.com',
+    name: 'Ada',
+    posts: {
+      create: [{ title: 'Hello, Postgres' }, { title: 'Second post' }],
+    },
+  },
+});`,
+  },
+  {
+    label: 'Transactions',
+    file: 'checkout.ts',
+    caption: 'All or nothing. If anything inside throws, none of it happened.',
+    code: `await db.$transaction(async (tx) => {
+  const order = await tx.orders.create({ data: { userId, total } });
 
-// Everything between your code and Postgres:
-//   "dependencies": { "pg": "^8.15.0" }`;
+  await tx.users.update({
+    where: { id: userId },
+    data: { credits: { decrement: total } },
+  });
 
-const sqlCode = `SELECT "users"."id", "users"."name", "users"."email",
-  (SELECT COALESCE(json_agg(json_build_array(
-    t0i."id"::text,
-    t0i."title",
-    COALESCE((SELECT COALESCE(json_agg(json_build_array(
-      t1."id"::text,
-      t1."body"
-    )), '[]'::json) FROM "comments" t1
-      WHERE t1."post_id" = "t0i"."id"), '[]'::json)
-  )), '[]'::json)
-  FROM (SELECT t0."id", t0."title" FROM "posts" t0
-    WHERE t0."user_id" = "users"."id"
-    ORDER BY t0."created_at" DESC
-    LIMIT $2) t0i
-  ) AS "posts"
-FROM "users" WHERE "org_id" = $1`;
+  return order;
+});`,
+  },
+  {
+    label: 'Vectors',
+    file: 'search.ts',
+    caption: 'Nearest-neighbour search on pgvector. Your AI features, without a second database.',
+    code: `const similar = await db.docs.findMany({
+  where: { workspaceId },
+  orderBy: {
+    embedding: { distance: { to: queryVector, metric: 'cosine' } },
+  },
+  limit: 5,
+});`,
+  },
+  {
+    label: 'Stream',
+    file: 'export.ts',
+    caption: 'Millions of rows in constant memory. Break out early and the cursor closes itself.',
+    code: `for await (const order of db.orders.findManyStream({
+  where: { status: 'paid' },
+  orderBy: { id: 'asc' },
+})) {
+  await invoices.send(order);
+}`,
+  },
+];
 
 const stats = [
-  { value: '1.08x', label: 'hand-written pg', note: 'geometric mean, see benchmarks' },
-  { value: '1', label: 'runtime dependency', note: 'pg, and nothing else' },
-  { value: sizeOf(MAIN_SIZE_CLAIM), label: 'brotli ceiling', note: 'enforced by size-limit in CI' },
-  { value: '11', label: 'read-only agent tools', note: 'an MCP server in the package' },
+  { value: '8%', label: 'from raw SQL speed', note: 'geometric mean, see benchmarks' },
+  { value: '1', label: 'round trip for nested data', note: 'no N+1, no waterfalls' },
+  { value: 'pg', label: 'the only dependency', note: 'no engine, no WASM' },
+  { value: '97%', label: 'agent first-try pass rate', note: 'with the bundled agent skill' },
 ];
 
 const pains = [
   {
     pain: 'Forty queries to render one page.',
-    fix: (
-      <>
-        A nested <code>with</code> compiles to one statement of correlated <code>json_agg</code> subqueries.
-        Users, their posts, each post&apos;s comments: one round trip, typed at every level. An empty relation
-        comes back as <code>[]</code>, never <code>null</code>.
-      </>
-    ),
+    fix: 'Ask for users, their posts and every comment in one call. It all comes back in one round trip, already nested and typed.',
   },
   {
-    pain: 'An engine riding along in your deploy.',
-    fix: (
-      <>
-        <code>dependencies</code> is one line: <code>pg</code>. No engine binary, no WASM compiler, no adapter
-        packages to keep in lockstep. The main entry stays {MAIN_SIZE_CLAIM}, and the edge entry{' '}
-        {EDGE_SIZE_CLAIM}.
-      </>
-    ),
+    pain: 'One bad filter away from an empty table.',
+    fix: 'An update or delete with an empty or always-true filter throws instead of running. Doing it on purpose takes a flag no request body can fake.',
   },
   {
-    pain: 'SQL you never get to read.',
-    fix: (
-      <>
-        Every query is a parameterized statement you can print before it runs.{' '}
-        <code>buildFindMany(args).sql</code> shows it, <code>explain(args)</code> returns the plan, and{' '}
-        <code>$on(&apos;query&apos;)</code> hands you each one with its parameters redacted.
-      </>
-    ),
+    pain: 'A slow query nobody can explain.',
+    fix: 'Print any query before it runs, pull its plan from your code, and let turbine doctor find the index you forgot.',
   },
   {
-    pain: (
-      <>
-        <code>deleteMany(&#123; where: &#123;&#125; &#125;)</code> on a Friday.
-      </>
-    ),
+    pain: 'Dependencies you never asked for.',
     fix: (
       <>
-        An empty or always-true <code>where</code> on an update or delete throws. Running it anyway takes{' '}
-        <code>allowFullTableScan: UNSAFE</code>, a symbol that a spread request body cannot produce.
+        Turbine&apos;s entire dependency list is <code>{'"pg": "^8.15.0"'}</code>. No engine binary, nothing to keep in
+        sync, and it runs on Node, Vercel Edge, Cloudflare Workers and Deno Deploy.
       </>
     ),
   },
 ];
 
 const bars = [
-  { name: 'hand-written pg', ratio: 1.0, tone: 'base' },
-  { name: 'Turbine 0.71', ratio: 1.08, tone: 'lead' },
-  { name: 'Drizzle 0.45.2', ratio: 1.47, tone: 'other' },
-  { name: 'Prisma 7.9.1', ratio: 1.81, tone: 'other' },
+  { name: 'hand-written SQL', ratio: 1.0, tone: 'base' },
+  { name: 'Turbine', ratio: 1.08, tone: 'lead' },
+  { name: 'Drizzle', ratio: 1.47, tone: 'other' },
+  { name: 'Prisma', ratio: 1.81, tone: 'other' },
 ];
 
-const agentTools = [
-  ['relation_graph', 'Every relation and the exact name a with clause accepts.'],
-  ['find_join_path', 'From comments to orgs: the chain, and the with clause to write.'],
-  ['compile_query', 'The SQL a read compiles to, without running it.'],
-  ['explain_query', 'The plan for a schema-checked findMany. No SQL input exists.'],
-  ['table_stats', 'Row estimate, size and indexes. Says analyzed: false instead of guessing.'],
-  ['sample_rows', 'Up to 50 rows, PII-tagged columns redacted first.'],
-  ['explain_error', 'A Turbine error code mapped to its cause, fix and docs link.'],
+const agentPowers = [
+  {
+    title: 'It knows your schema',
+    body: 'Every table, every relation, and the path from one to another. No guessing at column names.',
+    tools: ['schema_overview', 'relation_graph', 'find_join_path'],
+  },
+  {
+    title: 'It checks before it runs',
+    body: 'Your agent can compile a query and read its plan before it ever runs it.',
+    tools: ['compile_query', 'explain_query'],
+  },
+  {
+    title: 'It looks, it never touches',
+    body: 'Every tool is read-only, and private columns are redacted before the model sees a single row.',
+    tools: ['sample_rows', 'table_stats'],
+  },
+  {
+    title: 'It fixes its own mistakes',
+    body: 'Every error code comes with its cause and the fix, so your agent can recover without asking you.',
+    tools: ['explain_error', 'doctor_report'],
+  },
 ];
 
 const safety = [
   {
-    title: 'Studio is read-only until you say otherwise',
-    body: 'npx turbine studio binds loopback, checks a per-process token, and runs every read inside BEGIN READ ONLY. Without --write the write routes do not exist. Try it with no database: npx turbine-orm@latest studio --demo.',
+    title: 'No accidental wipes',
+    body: 'Delete or update with an empty filter and Turbine throws instead of emptying the table. Meant it? There is a flag for that, and a request body cannot set it.',
   },
   {
-    title: 'PII stays out of the SQL',
-    body: 'Tag a column pii: true and default projections leave it out of the statement itself: RETURNING "id", "name", not RETURNING *. Reading it takes includePii: UNSAFE.',
+    title: 'Private columns stay private',
+    body: 'Mark a column as PII and it stays out of query results, Studio and your agent until you explicitly ask for it.',
   },
   {
-    title: 'Errors carry keys, not values',
-    body: 'A NotFoundError says where: { id, email } without printing the email. Forward errors to your tracker without a scrubbing rule.',
+    title: 'Migrations that ask first',
+    body: 'Dropping a table or a column waits until you type "destroy my data". In CI you pass a flag, on purpose.',
   },
   {
-    title: 'Destructive migrations need consent',
-    body: 'migrate and push refuse DROP TABLE, DROP COLUMN, TRUNCATE, an unqualified DELETE or UPDATE, and column type changes until you type "destroy my data" or pass --allow-destructive in CI. A refused batch applies nothing.',
+    title: 'Errors you can ship anywhere',
+    body: 'Error messages name the fields, never the values, so they go straight to your error tracker without a scrubbing rule.',
   },
   {
-    title: 'Index advice, offline',
-    body: 'npx turbine doctor finds every relation column with no covering index, ranks each by cost, and --fix writes the migration. No cloud service, no account.',
+    title: 'A data browser that can’t break things',
+    body: 'turbine studio is read-only unless you start it with --write. Try the demo, no database needed.',
+  },
+  {
+    title: 'It finds your missing indexes',
+    body: 'turbine doctor spots every relation without an index, ranks them by cost and writes the migration for you.',
   },
 ];
 
 const inTheBox = [
-  { title: 'Vector search', body: 'pgvector KNN ordering and distance filters, every value bound.', href: '/vector' },
-  { title: 'LISTEN / NOTIFY', body: '$listen and $notify. Your database is the message bus.', href: '/realtime' },
-  { title: 'RLS session context', body: 'Transaction-local settings so row-level security filters for you.', href: '/transactions' },
-  { title: 'Full-text search', body: "where: { body: { search: 'postgres & orm' } }, bound as a parameter.", href: '/queries#full-text-search' },
-  { title: 'Wire pipelining', body: 'N queries in one round trip over Parse, Bind, Execute, Sync.', href: '/transactions' },
-  { title: 'True cursor streaming', body: 'Constant memory over DECLARE CURSOR, any orderBy, safe early break.', href: '/queries#findmanystream' },
-  { title: 'Global filters', body: 'Soft delete and tenancy as config, merged into every query on a table.', href: '/global-filters' },
-  { title: 'explain()', body: 'The plan for the exact statement a findMany would run.', href: '/queries#explain' },
-  { title: 'Observability', body: 'Query events, p50 to p99 metrics, and a local dashboard. No SaaS.', href: '/observability' },
-  { title: 'Typed errors', body: 'Stable codes, a docs link in every message, isRetryable as a typed const.', href: '/errors' },
-  { title: 'Many-to-many', body: 'Junction tables detected at generate time. No declaration needed.', href: '/relations' },
-  { title: 'Four more engines', body: 'SQLite, MySQL, SQL Server and PowDB behind subpath imports.', href: '/engines' },
+  { title: 'Vector search', body: 'Similarity search on pgvector for your AI features.', href: '/vector' },
+  { title: 'Realtime events', body: 'Push events between servers through Postgres. No Redis.', href: '/realtime' },
+  { title: 'Full-text search', body: 'Real search over your text columns. No search cluster to run.', href: '/queries#full-text-search' },
+  { title: 'Row-level security', body: 'Let Postgres decide who sees which rows.', href: '/transactions' },
+  { title: 'Batched queries', body: 'Send a whole dashboard of queries in one round trip.', href: '/transactions' },
+  { title: 'Streaming', body: 'Walk millions of rows without running out of memory.', href: '/queries#findmanystream' },
+  { title: 'Soft delete and tenancy', body: 'Set a filter once and every query on the table respects it.', href: '/global-filters' },
+  { title: 'Query plans', body: 'Ask Postgres why a query is slow, right from your code.', href: '/queries#explain' },
+  { title: 'Metrics', body: 'Latency percentiles and a local dashboard. No SaaS.', href: '/observability' },
+  { title: 'Typed errors', body: 'Every error has a code and a link to the fix.', href: '/errors' },
+  { title: 'Many-to-many', body: 'Join tables found and wired up for you.', href: '/relations' },
+  { title: 'More databases', body: 'SQLite, MySQL and SQL Server when you need them.', href: '/engines' },
 ];
 
 export default async function Home() {
-  const [queryHtml, sqlHtml] = await Promise.all([
-    codeToHtml(queryCode, { lang: 'typescript', theme: 'github-dark-dimmed' }),
-    codeToHtml(sqlCode, { lang: 'sql', theme: 'github-dark-dimmed' }),
-  ]);
+  const tabs = await Promise.all(
+    examples.map(async ({ code, ...rest }) => ({
+      ...rest,
+      html: await codeToHtml(code, { lang: 'typescript', theme: 'github-dark-dimmed' }),
+    })),
+  );
 
   const jsonLd = {
     '@context': 'https://schema.org',
     '@type': 'SoftwareApplication',
     name: 'Turbine ORM',
     description:
-      'A TypeScript ORM for Postgres with one runtime dependency (pg). Nested reads compile to one SQL statement. Read-only MCP tools for coding agents, offline index advice from turbine doctor, and destructive-migration guards. MIT.',
+      'The TypeScript ORM for Postgres that runs within 8% of hand-written SQL. Nested data in one round trip, types down to the last relation, one dependency (pg), and read-only tools for coding agents. MIT.',
     applicationCategory: 'DeveloperApplication',
     operatingSystem: 'Any',
     url: 'https://turbineorm.dev',
@@ -198,21 +231,16 @@ export default async function Home() {
           <div className="hero-scrim" aria-hidden="true" />
 
           <div className="hero-inner">
-            <Link href="/changelog" className="hero-badge">
-              <span className="hero-badge-version">{TURBINE_MINOR}</span>
-              <span className="hero-badge-text">{HERO_TAGLINE}</span>
-            </Link>
-
-            <p className="eyebrow">TypeScript ORM for Postgres</p>
+            <p className="eyebrow">The TypeScript ORM for Postgres</p>
             <h1 id="hero-title" className="hero-title">
-              One query.
+              Raw SQL speed.
               <br />
-              <span className="hero-title-accent">Any depth.</span>
+              <span className="hero-title-accent">Zero raw SQL.</span>
             </h1>
 
             <p className="hero-lede">
-              Turbine compiles a nested read into a single SQL statement you can read, then hands it straight to{' '}
-              <code>pg</code>. No query engine. No WASM. One runtime dependency.
+              Turbine is the TypeScript ORM that keeps up with Postgres. Your data arrives in one round trip, every
+              field is typed down to the last relation, and the only thing you install is <code>pg</code>.
             </p>
 
             <div className="hero-actions">
@@ -224,11 +252,11 @@ export default async function Home() {
                 <CopyButton text="npm install turbine-orm" />
               </div>
               <Link href="/quickstart" className="btn btn-primary" data-lf="quickstart-hero">
-                Quick start
+                Get started
                 <Arrow />
               </Link>
-              <Link href="/why-turbine" className="btn btn-ghost">
-                Why Turbine
+              <Link href="/benchmarks" className="btn btn-ghost">
+                See the benchmarks
               </Link>
             </div>
           </div>
@@ -251,16 +279,15 @@ export default async function Home() {
           <header className="section-head">
             <p className="eyebrow">Why switch</p>
             <h2 id="why-title" className="section-title">
-              Less machinery. More Postgres.
+              Stop fighting your ORM.
             </h2>
             <p className="section-lede">
-              Turbine writes the SQL, <code>pg</code> sends it, and Postgres does the work. No engine sits in
-              between, so there is nothing extra to ship, tune or guess about.
+              The things that make database code slow, scary and hard to debug, fixed at the source.
             </p>
           </header>
           <ul className="pain-grid">
-            {pains.map((p, i) => (
-              <li key={i} className="pain-card">
+            {pains.map((p) => (
+              <li key={p.pain} className="pain-card">
                 <p className="pain">{p.pain}</p>
                 <p className="fix">{p.fix}</p>
               </li>
@@ -268,49 +295,21 @@ export default async function Home() {
           </ul>
         </section>
 
-        {/* ========== HOW IT WORKS ========== */}
-        <section className="section" aria-labelledby="how-title">
+        {/* ========== THE API ========== */}
+        <section className="section api-layout" aria-labelledby="api-title">
           <header className="section-head">
-            <p className="eyebrow">How it works</p>
-            <h2 id="how-title" className="section-title">
-              One call in. One statement out.
+            <p className="eyebrow">The API</p>
+            <h2 id="api-title" className="section-title">
+              The API you already know.
+              <br />
+              The speed you never got.
             </h2>
             <p className="section-lede">
-              A <code>with</code> clause becomes correlated <code>json_agg</code> subqueries. Postgres builds the
-              nested result and sends it back in one round trip. You get the tree, typed at every level, with no
-              manual annotation.
+              If you have written Prisma, you can write Turbine today: <code>findMany</code>, <code>where</code>,{' '}
+              <code>with</code>, <code>create</code>. The difference is what happens after you hit save.
             </p>
           </header>
-
-          <div className="code-pair">
-            <figure className="panel">
-              <figcaption className="panel-bar">
-                <span>query.ts</span>
-              </figcaption>
-              <div className="panel-code" dangerouslySetInnerHTML={{ __html: queryHtml }} />
-            </figure>
-            <figure className="panel">
-              <figcaption className="panel-bar">
-                <span>the statement Postgres receives</span>
-              </figcaption>
-              <div className="panel-code" dangerouslySetInnerHTML={{ __html: sqlHtml }} />
-            </figure>
-          </div>
-
-          <ul className="checklist">
-            <li>
-              Per-relation <code>limit</code> and <code>orderBy</code> apply per parent, not to the whole result.
-            </li>
-            <li>Every type survives the JSON round trip, dates included.</li>
-            <li>
-              The default <code>auto</code> strategy keeps the single statement, and moves a relation whose foreign
-              key has no covering index to one flat follow-up query.
-            </li>
-            <li>
-              The join, batched and auto strategies return byte-identical rows. A differential fuzz suite holds
-              them there.
-            </li>
-          </ul>
+          <CodeTabs tabs={tabs} />
         </section>
 
         {/* ========== BENCHMARKS ========== */}
@@ -318,20 +317,19 @@ export default async function Home() {
           <header className="section-head">
             <p className="eyebrow">Benchmarks</p>
             <h2 id="bench-title" className="section-title">
-              Within 8% of hand-written SQL.
+              2x faster than Prisma.
+              <br />
+              1.46x faster than Drizzle.
             </h2>
             <p className="section-lede">
-              The suite runs Turbine, Prisma and Drizzle against a hand-written <code>pg</code> control on the same
-              schema, data and pool. The losses are published next to the wins.
+              Same schema, same data, same connection pool, ten real query shapes. Turbine lands within 8% of SQL
+              written by hand. We publish where we lose, too.
             </p>
           </header>
 
           <div className="bench">
             <figure className="bench-chart">
-              <figcaption>
-                Overhead above hand-written <code>pg</code>. Geometric mean over the eight scenarios with a raw
-                control. Lower is better.
-              </figcaption>
+              <figcaption>Time per query against hand-written SQL. Shorter is faster.</figcaption>
               <ol className="bars">
                 {bars.map((b) => (
                   <li key={b.name} className={`bar bar-${b.tone}`}>
@@ -347,34 +345,27 @@ export default async function Home() {
 
             <div className="bench-notes">
               <div className="note">
-                <p className="note-figure">2.02x / 1.46x</p>
+                <p className="note-figure">7x faster dashboards</p>
                 <p>
-                  Faster than Prisma 7.9.1 and Drizzle 0.45.2, by geometric mean across all ten scenarios.
-                </p>
-              </div>
-              <div className="note">
-                <p className="note-figure">7.16x</p>
-                <p>
-                  A five-query dashboard batch through <code>pipeline()</code> against the same queries sent one by
-                  one, over a real 22 ms link to Neon: 24 ms instead of 172 ms.
+                  Five dashboard queries sent as one batch instead of one at a time, over a real network link: 24 ms
+                  instead of 172 ms.
                 </p>
               </div>
               <div className="note note-loss">
-                <p className="note-figure">Where it loses</p>
+                <p className="note-figure">Where we lose</p>
                 <p>
-                  Streaming. In this run Drizzle 0.45.2 drained 50,000 rows in 39.5 ms to Turbine&apos;s 50.4 ms. A
-                  later re-measurement reversed that against Drizzle 0.45.2. Against Drizzle 1.0.0-rc.4 the batch
-                  API ties, and the per-row API is 5 to 11% slower.
+                  Row-by-row streaming. Against Drizzle&apos;s 1.0 release candidate our per-row stream is 5 to 11%
+                  slower. The batched stream ties.
                 </p>
               </div>
             </div>
           </div>
 
           <p className="fineprint">
-            Turbine 0.71.0, Prisma 7.9.1, Drizzle 0.45.2. Local PostgreSQL 17.9 over a Unix socket, 1,000 users,
-            10,000 posts and 50,000 comments, medians of three runs of 200 interleaved rounds, measured 2026-08-15.
-            The pipeline figure is Turbine 0.78.0 against itself on Neon in us-east-1. Full method, raw data and
-            noise floor on the{' '}
+            Turbine 0.71.0, Prisma 7.9.1 and Drizzle 0.45.2 on local PostgreSQL 17.9: 1,000 users, 10,000 posts and
+            50,000 comments, medians of three runs of 200 interleaved rounds, measured 2026-08-15. The bars are the
+            geometric mean over the eight scenarios with a hand-written control; the headline compares all ten. The
+            batch figure is Turbine 0.78.0 against itself on Neon. Method, raw data and noise floor on the{' '}
             <Link href="/benchmarks">benchmarks page</Link>.
           </p>
         </section>
@@ -384,43 +375,44 @@ export default async function Home() {
           <header className="section-head">
             <p className="eyebrow">For coding agents</p>
             <h2 id="agents-title" className="section-title">
-              Give your agent tools, not a SQL prompt.
+              Let your agent drive.
+              <br />
+              Turbine keeps it on the track.
             </h2>
             <p className="section-lede">
-              <code>npx turbine mcp</code> starts a read-only MCP server with eleven tools. Every call runs inside{' '}
-              <code>BEGIN READ ONLY</code>, PII-tagged columns are redacted before rows reach the model, and no tool
-              accepts SQL text. Typed query args turn a wrong query into a compile error your agent can read.
+              Turbine ships an agent skill and an MCP server for Claude Code, Cursor and the rest. With the skill
+              installed, agents wrote correct Turbine queries on the first try 97% of the time, up from 73%.
             </p>
           </header>
           <ul className="tool-grid">
-            {agentTools.map(([name, desc]) => (
-              <li key={name} className="tool">
-                <code className="tool-name">{name}</code>
-                <span>{desc}</span>
+            {agentPowers.map((p) => (
+              <li key={p.title} className="tool">
+                <h3 className="tool-title">{p.title}</h3>
+                <p className="tool-body">{p.body}</p>
+                <p className="tool-tags">
+                  {p.tools.map((t) => (
+                    <code key={t}>{t}</code>
+                  ))}
+                </p>
               </li>
             ))}
-            <li className="tool tool-more">
-              <span>
-                Plus <code>schema_overview</code>, <code>table_detail</code>, <code>migrate_status</code> and{' '}
-                <code>doctor_report</code>.
-              </span>
-              <Link href="/ai-agents">
-                Set it up for Claude Code or Cursor <Arrow />
-              </Link>
-            </li>
           </ul>
+          <p className="section-link">
+            <Link href="/ai-agents">
+              Set it up in Claude Code or Cursor <Arrow />
+            </Link>
+          </p>
         </section>
 
         {/* ========== SAFETY ========== */}
         <section className="section" aria-labelledby="safety-title">
           <header className="section-head">
-            <p className="eyebrow">Built for a database with real rows in it</p>
+            <p className="eyebrow">Production-safe</p>
             <h2 id="safety-title" className="section-title">
-              The dangerous operations ask first.
+              Safe to deploy on a Friday.
             </h2>
             <p className="section-lede">
-              Reads are safe by default. Anything that can lose or leak data needs an explicit opt-in, and the
-              privileged opt-ins are a symbol, so <code>JSON.parse</code> cannot produce one.
+              Anything that can lose or leak data asks first. Everything else just works.
             </p>
           </header>
           <ul className="safety-grid">
@@ -436,13 +428,11 @@ export default async function Home() {
         {/* ========== IN THE BOX ========== */}
         <section className="section" aria-labelledby="box-title">
           <header className="section-head">
-            <p className="eyebrow">Postgres-first</p>
+            <p className="eyebrow">In the box</p>
             <h2 id="box-title" className="section-title">
-              The parts you used to drop to raw SQL for.
+              Everything you used to drop to raw SQL for.
             </h2>
-            <p className="section-lede">
-              Typed, documented and in the npm package. No paid tier, no telemetry, no account.
-            </p>
+            <p className="section-lede">Typed, documented and free. No paid tier, no account, no telemetry.</p>
           </header>
           <ul className="box-grid">
             {inTheBox.map((f) => (
@@ -456,21 +446,21 @@ export default async function Home() {
           </ul>
         </section>
 
-        {/* ========== MIGRATE ========== */}
+        {/* ========== SWITCHING ========== */}
         <section className="section" aria-labelledby="move-title">
           <header className="section-head">
             <p className="eyebrow">Switching</p>
             <h2 id="move-title" className="section-title">
-              Bring your call sites with you.
+              Move over one file at a time.
             </h2>
+            <p className="section-lede">No big-bang rewrite. Your old queries keep running while the new ones land.</p>
           </header>
           <div className="move-grid">
             <Link href="/migrate-from-prisma" className="move-card">
               <span className="move-from">From Prisma</span>
               <span className="move-body">
-                <code>turbine migrate-from-prisma</code> reads <code>schema.prisma</code> and emits a typed map. A
-                compat client keeps <code>prisma.user.findMany(&#123; include &#125;)</code> working while you port
-                module by module.
+                One command reads your <code>schema.prisma</code>. A compatibility client keeps most of your
+                existing Prisma code running while you port at your own pace.
               </span>
               <span className="move-cta">
                 Prisma migration guide <Arrow />
@@ -479,8 +469,8 @@ export default async function Home() {
             <Link href="/migrate-from-drizzle" className="move-card">
               <span className="move-from">From Drizzle</span>
               <span className="move-body">
-                The API mapping, the schema translation, and the behaviour differences to audit before you cut over,
-                starting with the empty-where guard.
+                The Drizzle calls you use, mapped to Turbine, plus the behavior differences to check before you
+                switch.
               </span>
               <span className="move-cta">
                 Drizzle migration guide <Arrow />
@@ -492,10 +482,10 @@ export default async function Home() {
         {/* ========== CTA ========== */}
         <section className="cta" aria-labelledby="cta-title">
           <h2 id="cta-title">Take the fast line.</h2>
-          <p>Install it, point it at Postgres, and run your first typed query.</p>
+          <p>Install Turbine, point it at Postgres, and run your first typed query in minutes.</p>
           <div className="cta-actions">
             <Link href="/quickstart" className="btn btn-primary" data-lf="quickstart-cta">
-              Quick start
+              Get started
               <Arrow />
             </Link>
             <a
@@ -505,11 +495,8 @@ export default async function Home() {
               className="btn btn-ghost"
               data-lf="github-cta"
             >
-              GitHub
+              Star on GitHub
             </a>
-            <Link href="/queries" className="btn btn-ghost">
-              API reference
-            </Link>
           </div>
         </section>
       </main>

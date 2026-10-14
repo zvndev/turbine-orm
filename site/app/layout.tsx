@@ -25,7 +25,7 @@ const jetbrains = JetBrains_Mono({
 });
 
 const description =
-  'A TypeScript ORM for Postgres. Nested reads compile to one SQL statement you can read, with one runtime dependency (pg): no query engine, no WASM. Read-only MCP tools for coding agents, offline index advice, migration guards. MIT.';
+  'The TypeScript ORM for Postgres that runs within 8% of hand-written SQL. Nested data in one round trip, types down to the last relation, one dependency (pg), and read-only tools for coding agents. MIT.';
 
 export const metadata: Metadata = {
   title: {
@@ -35,18 +35,18 @@ export const metadata: Metadata = {
   description,
   metadataBase: new URL('https://turbineorm.dev'),
   openGraph: {
-    title: 'Turbine ORM: one query, any depth',
+    title: 'Turbine ORM: raw SQL speed, zero raw SQL',
     description:
-      'Nested reads in one SQL statement. One runtime dependency, no query engine, no WASM. A TypeScript ORM for Postgres, MIT.',
+      'The TypeScript ORM for Postgres. Within 8% of hand-written SQL, nested data in one round trip, one dependency. MIT.',
     url: 'https://turbineorm.dev',
     siteName: 'Turbine ORM',
     type: 'website',
   },
   twitter: {
     card: 'summary_large_image',
-    title: 'Turbine ORM: one query, any depth',
+    title: 'Turbine ORM: raw SQL speed, zero raw SQL',
     description:
-      'Nested reads in one SQL statement. One runtime dependency, no query engine, no WASM. A TypeScript ORM for Postgres, MIT.',
+      'The TypeScript ORM for Postgres. Within 8% of hand-written SQL, nested data in one round trip, one dependency. MIT.',
   },
   icons: {
     icon: '/favicon.svg',
