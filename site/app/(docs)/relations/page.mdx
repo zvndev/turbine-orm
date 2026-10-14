@@ -217,7 +217,7 @@ await db.users.findMany({ where: { posts: { none: {} } } });
 await db.posts.findMany({ where: { user: { is: { active: true } } } });
 ```
 
-To-one relations take `is` and `isNot`. See [Relation filters](/queries#relation-filters).
+To-one relations take `is` and `isNot`. See [Relation filters](/filtering#relation-filters).
 
 ## Counting and ordering by relations
 
@@ -229,7 +229,7 @@ const users = await db.users.findMany({
 users[0]._count.posts; // 12
 ```
 
-`_count` works in the top-level `with` only; nested, it throws `RelationError` ([E005](/errors#e005)). Posts can sort by their user's email: `orderBy: { user: { email: 'asc' } }`. See [Counting related rows](/queries#counting-related-rows-_count) and [Ordering by a relation](/queries#ordering-by-a-relation).
+`_count` works in the top-level `with` only; nested, it throws `RelationError` ([E005](/errors#e005)). Posts can sort by their user's email: `orderBy: { user: { email: 'asc' } }`. See [Counting related rows](/queries#counting-related-rows-_count) and [Ordering by a relation](/filtering#ordering-by-a-relation).
 
 ## Load strategy: `auto`, `join`, `batched`, `flatten`
 
@@ -388,7 +388,7 @@ A custom plan is not always faster, and re-planning a deep `with` costs more, so
 
 ## See also
 
-- [API Reference](/queries): every option in `where`, `with` and `select`.
+- [Filtering and sorting](/filtering): every `where` and `orderBy` option.
 - [Nested writes](/nested-writes): create and link related rows in one call.
 - [Transactions and pipelines](/transactions): atomic groups and batching.
 - [Typed errors](/errors): `RelationError` (E005) and `CircularRelationError` (E007).

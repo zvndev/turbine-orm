@@ -1,11 +1,11 @@
 export const metadata = {
-  title: 'Migrations in Practice',
+  title: 'Migrations',
   description:
     'Create, apply and roll back SQL migrations with turbine migrate, check for drift in CI, and change a populated column type safely.',
   alternates: { canonical: '/migrate' },
 };
 
-# Migrations in Practice
+# Migrations
 
 Turbine migrations are plain SQL files with `-- UP` and `-- DOWN` sections, applied in order and tracked in a `_turbine_migrations` table.
 
@@ -187,6 +187,6 @@ Declining the prompt runs nothing.
 
 ## See also
 
-- [Schema & Migrations](/schema): `defineSchema`, `push` and `schemaDiff()`.
+- [Schema](/schema): `defineSchema`, `push` and `schemaDiff()`.
 - [CLI](/cli): every command and flag.
 - [Typed Errors](/errors): including `MigrationError` ([E006](/errors#e006)).

@@ -271,12 +271,12 @@ Turbine's native cursor is **exclusive**: the row the cursor names is not return
 - Prisma `cursor: { id }` with no `skip` is inclusive. Ported unchanged, it silently loses the anchor row.
 - The cursor must name a unique key. `cursor: { createdAt }` alone throws `ValidationError` ([E003](/errors#e003)).
 
-The compat client keeps Prisma's semantics for every order: the page starts at the cursor row and `skip` counts from there. See [Pagination](/queries#pagination-limit--take-offset--skip-cursor).
+The compat client keeps Prisma's semantics for every order: the page starts at the cursor row and `skip` counts from there. See [Pagination](/filtering#pagination-limit--take-offset--skip-cursor).
 
 ### Other differences
 
 - **Relation arrays have no guaranteed order.** Add `orderBy` to any `with` block your code depends on, or set `stableRelationOrder`.
-- **Paginated reads.** The compat client orders a `take`/`skip` page by primary key, as Prisma does. Native `findMany` sends a bare `LIMIT` unless you set [`implicitPkOrdering: true`](/queries#deterministic-pages-the-unordered-pagination-warning).
+- **Paginated reads.** The compat client orders a `take`/`skip` page by primary key, as Prisma does. Native `findMany` sends a bare `LIMIT` unless you set [`implicitPkOrdering: true`](/filtering#deterministic-pages-the-unordered-pagination-warning).
 - **`time` columns.** The compat client returns a `Date` on 1970-01-01 UTC, as Prisma does. Native reads return the `'09:00:00'` string.
 - **SSL in the connection string.** With `sslmode=require`, `pg` prints a `SECURITY WARNING`. Use `sslmode=verify-full`, or `uselibpqcompat=true&sslmode=require` for encryption without certificate verification.
 
@@ -285,6 +285,6 @@ These already match Prisma: `timestamp` and `date` columns read and write as UTC
 ## See also
 
 - [Schema](/schema): `defineSchema`, introspection and type mapping.
-- [API Reference](/queries): every method, operator and option.
+- [Reading and writing](/queries) and [Filtering and sorting](/filtering): every query method, operator and option.
 - [Relations](/relations): relation filters and load strategies.
 - [Typed Errors](/errors): the error classes and codes.

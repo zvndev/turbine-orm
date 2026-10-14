@@ -62,7 +62,7 @@ npx turbine init        # writes turbine.config.ts and a turbine/ directory
 npx turbine generate    # introspect the live database, emit a typed client
 ```
 
-`generate` writes `types.ts`, `metadata.ts` and `index.ts` to `generated/turbine/`. Column names, relation names and types are in the emitted code, so the agent never guesses them. After a schema change, it re-runs `generate` and the type checker points at every call site to update. Code-first projects loop `edit turbine/schema.ts`, `turbine push`, `turbine generate` (see [Schema & Migrations](/schema)).
+`generate` writes `types.ts`, `metadata.ts` and `index.ts` to `generated/turbine/`. Column names, relation names and types are in the emitted code, so the agent never guesses them. After a schema change, it re-runs `generate` and the type checker points at every call site to update. Code-first projects loop `edit turbine/schema.ts`, `turbine push`, `turbine generate` (see [Schema](/schema)).
 
 ```ts
 const users = await db.users.findMany({
@@ -157,5 +157,5 @@ Migrations
 
 - **[MCP Server](/mcp)**: the eleven read-only tools.
 - **[Quick Start](/quickstart)**: from install to a first typed query.
-- **[API Reference](/queries)**: every method and option the snippet refers to.
+- **[Reading and writing](/queries)**: every method and option the snippet refers to.
 - **[Typed Errors](/errors)**: every error code.

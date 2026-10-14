@@ -1,0 +1,275 @@
+export const metadata = {
+  title: 'Filtering and sorting',
+  description:
+    'Filter rows with where operators and relation filters, then order, paginate and de-duplicate the results.',
+  alternates: { canonical: '/filtering' },
+};
+
+# Filtering and sorting
+
+Every read takes the same `where`, `orderBy`, `limit`, `offset`, `cursor` and `distinct`. `count`, `updateMany` and `deleteMany` take the same `where`.
+
+## Filtering
+
+### WHERE operators
+
+| Operator | Matches |
+|---|---|
+| a value, `equals` | Equal |
+| `null` | `IS NULL` |
+| `not` | Not equal. `not: null` is `IS NOT NULL`; `not: { ... }` negates an operator object |
+| `in`, `notIn` | Any, or none, of an array |
+| `gt`, `gte`, `lt`, `lte` | Comparison |
+| `contains`, `startsWith`, `endsWith` | `LIKE` substring, prefix, suffix. Wildcards in the value are escaped |
+| `mode: 'insensitive'` | Case-insensitive, inside an operator on a string column |
+
+```ts
+where: {
+  email: { endsWith: '@acme.com', mode: 'insensitive' },
+  role: { notIn: ['banned', 'spam'] },
+  score: { gte: 100 },
+  title: { not: { contains: 'draft' } }, // NOT ("title" LIKE $1 ESCAPE '\')
+  deletedAt: null,                        // IS NULL
+}
+```
+
+- A `NULL` column matches neither a filter nor its negation. Add `{ score: null }` under an `OR` to include it.
+- `mode` takes string columns, inside the operator object. On `equals`, `not`, `in` and `notIn` it compares `LOWER(...)`, which a plain btree index cannot serve: index `LOWER(col)` or use `citext`.
+- `mode` on `in` / `notIn` works on PostgreSQL and PowDB. Other engines throw `UnsupportedFeatureError` ([E017](/errors#e017)); use `OR` branches.
+- On MySQL, a number or boolean compared with a text column binds as text: `{ resetToken: 0 }` matches only `'0'`.
+- An operand that does not fit its column throws E003: an array as a value (use `in`), a `null` range bound, or an empty operator object.
+
+### Misspelled keys are a compile error
+
+On a generated client, an unknown key in `where`, `orderBy`, a `with` block or a `build*` call does not compile:
+
+```ts
+await db.users.findMany({
+  where: { OR: [{ emial: 'a@b.com' }] },          // type error
+  with: { posts: { where: { titel: 'x' } } },     // type error
+});
+```
+
+`defineSchema`-only clients and `db.table(name)` accept any `where` and `orderBy` key. `tsx` does not typecheck, so run `tsc --noEmit` in CI.
+
+### Combinators
+
+```ts
+where: {
+  AND: [{ orgId: 1 }, { role: 'admin' }],
+  OR: [{ role: 'owner' }, { role: 'admin' }],
+  NOT: { deletedAt: { not: null } },
+}
+```
+
+`OR` takes an array. `AND` and `NOT` take an object or an array, and `NOT: [a, b]` means `NOT a AND NOT b`. `OR: []` matches no row, as in Prisma; `AND: []` and `NOT: {}` add nothing.
+
+```ts
+// Decide what zero selections mean: here, any role
+const picked = selectedRoles.map((role) => ({ role }));
+const rows = await db.users.findMany({ where: picked.length > 0 ? { OR: picked } : {} });
+```
+
+### `undefined` means absent
+
+A key set to `undefined` is removed at every depth of `where`, `having`, `cursor` and `orderBy`, and so is an object it empties:
+
+```ts
+// search may be undefined: then there is no title filter
+await db.posts.findMany({ where: { orgId, title: { contains: search, mode: 'insensitive' } } });
+```
+
+An emptied `where` returns every row from `findMany` and `count`, throws E003 from `findFirst`, and is refused on writes by the [mass-mutation guard](/queries#delete--deletemany). In `data`, a top-level `undefined` field is skipped.
+
+### Relation filters
+
+| Operator | Matches |
+|---|---|
+| `some` | At least one related row matches |
+| `every` | Every related row matches |
+| `none` | No related row matches |
+| `is` / `isNot` | The to-one target matches, or does not. `is: null` means no target |
+
+```ts
+// Users who own at least one product rated 4+
+await db.users.findMany({ where: { products: { some: { data: { path: ['rating'], gte: 4 } } } } });
+
+// Users with no posts
+await db.users.findMany({ where: { posts: { none: {} } } });
+```
+
+Every operator works inside them. `some`, `every` and `none` take a where object; `is` / `isNot` take one or `null`, and only on a to-one relation. Other shapes throw E003.
+
+### Array columns
+
+| Operator | Matches |
+|---|---|
+| `has` | The array contains the element |
+| `hasEvery` | The array contains every element |
+| `hasSome` | The array contains at least one |
+
+```ts
+where: { tags: { hasSome: ['sql', 'mysql'] } }
+```
+
+### Full-text search
+
+```ts
+where: { body: { search: 'postgres & orm' } }
+// to_tsvector('english', "body") @@ to_tsquery('english', $1)
+
+where: { body: { search: 'orm', config: 'simple' } } // a configuration other than 'english'
+```
+
+The query is bound and uses `to_tsquery` syntax (`&`, `|`, `!`, `<->`). `config` takes letters, digits and underscores. PostgreSQL only; other engines throw E017.
+
+### JSON columns
+
+| Operator | Matches |
+|---|---|
+| `equals` with `path` | The value at `path`, compared as JSON |
+| `equals` without `path` | The whole document, exactly |
+| `contains` | Containment (`@>`) |
+| `hasKey` | A top-level key exists |
+| `gt`, `gte`, `lt`, `lte` with `path` | A range on the value at `path` |
+| `stringContains`, `stringStartsWith`, `stringEndsWith` with `path` | Text at `path`, with optional `mode` |
+
+```ts
+where: { data: { path: ['meta', 'tier'], equals: 'pro' } }
+where: { data: { contains: { active: true } } }    // holds these keys, maybe among others
+where: { data: { path: ['rating'], gte: 4 } }      // (data #>> path)::numeric >= $1
+where: { data: { path: ['title'], stringContains: 'orm', mode: 'insensitive' } }
+
+// equals compares JSON values. Stored: { n: 5 }, { n: "5" }, { n: null }, {}
+where: { data: { path: ['n'], equals: 5 } }     // only { n: 5 }
+where: { data: { path: ['n'], equals: null } }  // only { n: null }: a missing key is not JSON null
+```
+
+- A numeric range operand casts to numeric; a string compares as text. Without `path`, `{ gt: 5 }` compares the column itself.
+- Pathless `equals` is exact: `{ equals: { plan: 'pro' } }` does not match `{ plan: 'pro', seats: 5 }`.
+- `not: <document>` means "not this document". A `not` holding only operator keys throws E003; write `NOT: { data: { ... } }`.
+- An unknown key, such as Prisma's `string_contains`, or a `path` with no test throws E003.
+
+| Engine | `equals` with `path` | `equals` without `path` |
+|---|---|---|
+| PostgreSQL, MySQL | Every JSON value | Exact document |
+| SQL Server | Numbers and strings; arrays and objects E017 | E017 |
+| SQLite | Numbers and strings; `null`, booleans, arrays and objects E017 | E017 |
+
+SQL Server, SQLite and PowDB also refuse a bare document as a value and `not: <document>` (E017).
+
+### Column-to-column comparison
+
+```ts
+import { col } from 'turbine-orm';
+
+const stale = await db.modelInstances.findMany({
+  where: { currentVersionId: { not: col('publishedVersionId') } },
+});
+// WHERE "current_version_id" != "published_version_id"
+```
+
+`col()` works with `equals`, `not`, `gt`, `gte`, `lt` and `lte`.
+
+A plain `{ col: 'field' }` object, which `JSON.parse` can produce, throws E003, so request data cannot name a column. A reference cannot take `mode` and never identifies a row for `findUnique`, `update` or `delete`.
+
+## Ordering and pagination
+
+### orderBy
+
+```ts
+orderBy: { lastLoginAt: { sort: 'desc', nulls: 'last' } }
+// ORDER BY "last_login_at" DESC NULLS LAST
+
+orderBy: [{ createdAt: 'desc' }, { id: 'asc' }]
+// ORDER BY "created_at" DESC, "id" ASC
+```
+
+Each field takes `'asc'`, `'desc'` or `{ sort, nulls }`; an array sets precedence. Both work in `findMany`, `with` and `groupBy`. `nulls` throws E017 on MySQL and SQL Server. For vector distance, see [Vector search](/vector).
+
+### Ordering by a relation
+
+```ts
+await db.users.findMany({ orderBy: { posts: { _count: 'desc' } } });                // to-many: _count only
+await db.posts.findMany({ orderBy: { author: { name: 'asc' } } });                  // to-one: a column
+await db.versions.findMany({ orderBy: { model: { category: { name: 'asc' } } } }); // a to-one chain
+```
+
+Each hop applies its target's [global filter](/global-filters). A chain allows ten hops past the first relation; one more throws `CircularRelationError` (E007). A to-many hop mid-chain throws E003: use `_count` or a pick ordering. An unknown relation throws `RelationError` (E005).
+
+### Ordering by a JSON path
+
+```ts
+orderBy: { data: { path: ['weight'], direction: 'asc', type: 'numeric' } }
+// ORDER BY ("data" #>> $1::text[])::numeric ASC NULLS LAST
+```
+
+Without `type: 'numeric'` the value compares as text. Rows missing the path sort last unless you pass `nulls`.
+
+### Ordering by a value from one related row
+
+```ts
+orderBy: {
+  versions: {
+    pick: { orderBy: { createdAt: 'desc' } }, // the newest version
+    by: { field: 'data', path: ['title'] },   // or by: 'title'
+    direction: 'asc',
+  },
+}
+```
+
+`pick.orderBy` is required; `pick.where` filters first. It works on `hasMany` relations in a top-level `orderBy`, not with `distinct`. A JSON `by` is PostgreSQL only. On PostgreSQL, `plan: 'lateral'` compiles it as a `LEFT JOIN LATERAL`, which returns the same rows and can be faster on large parent sets.
+
+### Pagination: `limit` / `take`, `offset` / `skip`, `cursor`
+
+`take` and `skip` are aliases of `limit` and `offset`. Two different values for one bound throw E003.
+
+```ts
+const page2 = await db.posts.findMany({ orderBy: { id: 'asc' }, limit: 20, offset: 20 });
+
+// Keyset: seek past the last row, never scanning skipped rows
+const next = await db.posts.findMany({
+  orderBy: { createdAt: 'desc' },
+  cursor: last ? { id: last.id } : undefined, // first page: no cursor
+  take: 20,
+});
+```
+
+- **Order.** A cursor page follows your `orderBy` plus the primary key as tiebreaker, unless the order already holds a unique key. With no `orderBy`, it follows the primary key. A table with no primary key and no NOT NULL unique key cannot take a cursor.
+- **Placing the page.** Pass every ordered field plus the key (`{ createdAt: last.createdAt, id: last.id }`; the whole last row works), or one unique key (`{ id: last.id }`). If that row is deleted, the page is empty. The cursor row is excluded.
+- **Values** are plain or `{ equals: value }`. Operators, arrays, `null` on a NOT NULL column, `cursor: null`, `{}` and an all-`undefined` cursor throw E003.
+- Relation, JSON-path and vector orders cannot take a cursor. Use `offset`.
+- Ties are not skipped: a multi-column order seeks with `(a > $1 OR (a = $1 AND id > $2))`.
+
+A paginated read whose `orderBy` can tie gets the same tiebreaker, so the first page matches the cursor pages:
+
+```ts
+await db.users.findMany({ orderBy: { name: 'desc' }, take: 20 });
+// ORDER BY "name" DESC, "id" DESC LIMIT $1
+```
+
+### Deterministic pages: the unordered-pagination warning
+
+A page with no `orderBy` can repeat or skip rows as the table changes, so it logs `unordered-page` once per table and shape:
+
+```ts
+await db.users.findMany({ limit: 20, offset: 40 });                        // warns
+await db.users.findMany({ orderBy: { id: 'asc' }, limit: 20, offset: 40 }); // stable
+```
+
+The warning is [advice](/observability#diagnostics-diagnostics), silent under `NODE_ENV=production` by default, and follows `warnOnUnlimited`. The client option `implicitPkOrdering: true` orders such pages by primary key instead. It is off by default because it changes SQL you already send; the [`prisma-compat`](/migrate-from-prisma) adapter always applies it.
+
+### distinct
+
+```ts
+// One post per author; orderBy picks which one survives
+const sample = await db.posts.findMany({ distinct: ['userId'], orderBy: { userId: 'asc' } });
+```
+
+Sort by the `distinct` fields first. It compiles to `DISTINCT ON`, so SQLite, MySQL and SQL Server throw E017.
+
+## See also
+
+- [Reading and writing](/queries): the methods these options belong to.
+- [Relations](/relations): filtering and ordering inside `with`.
+- [Global filters](/global-filters): a `where` applied to every query on a table.

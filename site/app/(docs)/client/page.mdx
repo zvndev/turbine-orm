@@ -1,0 +1,108 @@
+export const metadata = {
+  title: 'Client API',
+  description:
+    'Per-query timeouts, middleware, explain, client configuration and the escape hatches on the Turbine client.',
+  alternates: { canonical: '/client' },
+};
+
+# Client API
+
+What the client does around every query: timeouts, middleware, query plans, and the options it is created with.
+
+## Per-query timeout
+
+Every method takes `timeout` in milliseconds, or `0` for none.
+
+```ts
+import { TimeoutError } from 'turbine-orm';
+
+try {
+  await db.orders.update({ where: { id }, data: { status: 'shipped' }, timeout: 2_000 });
+} catch (err) {
+  if (err instanceof TimeoutError && err.outcome === 'not-executed') {
+    // Nothing changed: safe to retry.
+  }
+}
+```
+
+A `TimeoutError` ([E002](/errors#e002)) carries `outcome`. `'not-executed'` means nothing changed, for example when the PostgreSQL server confirms Turbine's cancel. `'unknown'` means a write may have applied, which is the answer on other engines; check before retrying.
+
+Inside `$transaction` on PostgreSQL, a timed-out statement rolls the transaction back, and `$transaction` rejects with `TransactionRolledBackError` ([E019](/errors#e019)) even if you catch the timeout.
+
+## Middleware
+
+```ts
+db.$use(async (params, next) => {
+  const start = Date.now();
+  const result = await next(params);
+  console.log(`${params.model}.${params.action} took ${Date.now() - start}ms`);
+  return result;
+});
+```
+
+Middleware can read `params`, time the call and transform the result. It cannot change the query: editing `params.args` makes `next()` throw a `TypeError`. Put tenant and soft-delete filters in a [global filter](/global-filters).
+
+## explain
+
+```ts
+const plan = await db.posts.explain({ where: { orgId: 7 }, orderBy: { createdAt: 'desc' } });
+// ['Sort  (cost=…)', '  ->  Index Scan using posts_org_id_idx on posts …', …]
+```
+
+Returns the plan for the statement `findMany(args)` would run, as lines. SQLite uses `EXPLAIN QUERY PLAN`, PowDB its own `explain`, and SQL Server throws E017. Match node names, not layout.
+
+## Client configuration
+
+`turbine()` and `new TurbineClient()` take a `TurbineConfig`. [Quick Start](/quickstart) and [Serverless](/serverless) cover the connection fields.
+
+```ts
+const db = turbine({ connectionString: process.env.DATABASE_URL, poolSize: 20 });
+```
+
+| Option | Default | What it does |
+|---|---|---|
+| `poolSize` | `10` | Maximum connections |
+| `idleTimeoutMs` | `30000` | Close an idle connection |
+| `connectionTimeoutMs` | `5000` | Give up acquiring a connection (E004) |
+| `maxLifetimeSeconds` | `1800` | Replace an old connection when idle |
+| `preparedStatements` | `true` | Named statements; `false` for external pools and poolers |
+| `statementTimeoutMs` | unset | PostgreSQL `statement_timeout` per statement |
+| `streamIdleTimeoutMs` | `300000` | [Close an abandoned stream](/queries#abandoned-streams-close-themselves) |
+| `sqlCache` / `sqlCacheSize` | `true` / `1000` | Per-table SQL template cache |
+| `implicitPkOrdering` | `false` | [Order unordered pages](/filtering#deterministic-pages-the-unordered-pagination-warning) by primary key |
+| `planCacheMode` | unset | PostgreSQL [`plan_cache_mode`](/relations#the-generic-plan-cliff-plancachemode) |
+| `utcTimestamps` | `true` | [Zone-less columns as UTC](/schema#zone-less-columns-timestamp-and-date-read-as-utc) |
+| `temporalInfinity` | `'preserve'` | [`infinity`](/schema#infinity-and--infinity) as `Infinity`, or `'null'` |
+| `sqlComment` | unset | [sqlcommenter](/observability#sql-comments-sqlcomment) tags |
+| `logger` | `console` | [Log output](/observability#log-output-logger); `{}` silences it |
+| `diagnostics` | from `NODE_ENV` | [Advice and self-checks](/observability#diagnostics-diagnostics) |
+| `autoToOneJoinMaxRows` | `1000` | Row ceiling for the [`'auto'` to-one rule](/relations#load-strategy-auto-join-batched-flatten) |
+
+- `max`, `idleTimeoutMillis` and `connectionTimeoutMillis` work as aliases.
+- An unknown key logs `unknown-config-key` with the nearest option, and never throws.
+- Behind a transaction pooler Turbine does not recognize, set `preparedStatements: false`, or queries fail with `prepared statement "..." does not exist`.
+- Each connection keeps every named statement it parses. Build `select`, `omit` and `with` from user input only through a fixed allowlist.
+
+## Client escape hatches
+
+| Member | What it is for |
+|---|---|
+| `db.table<T>(name)` | Query a table missing from your generated types |
+| `db.pool`, `db.schema` | The underlying pool and schema metadata |
+| `db.stats` | Pool gauges: `totalCount`, `idleCount`, `waitingCount` |
+| `db.transaction(fn)` | A raw `pg.PoolClient` transaction for hand-written SQL |
+| `db.disconnect()` | Close subscriptions and the pools Turbine owns |
+| `db.$ping()` | Round-trip time in milliseconds |
+| `db.$on(event, fn)` | `'query'`, `'poolError'` or `'connectionLost'` events |
+| `db.<table>.cacheStats()` | SQL cache `hits`, `misses` and `hitRate` |
+
+```ts
+const audit = db.table<{ id: number; action: string; at: Date }>('audit_log');
+const recent = await audit.findMany({ orderBy: { at: 'desc' }, limit: 20 });
+```
+
+## See also
+
+- [Transactions](/transactions): `$transaction` and `pipeline`.
+- [Observability](/observability): logging, events and metrics.
+- [Serverless and edge](/serverless): supplying your own pool.

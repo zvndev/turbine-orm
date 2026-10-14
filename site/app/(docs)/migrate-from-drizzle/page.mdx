@@ -125,13 +125,13 @@ Field names are camelCase and become snake_case columns. Turbine's `type: 'times
 
 ## What you give up
 
-- **SQL-shaped queries.** There is no `select().from().join()` chain. Use [`db.sql`](/queries#typed-raw-sql-dbsqlt) for queries the object API does not express.
+- **SQL-shaped queries.** There is no `select().from().join()` chain. Use [`db.sql`](/raw-sql#typed-raw-sql-dbsqlt) for queries the object API does not express.
 - **Equal footing across databases.** Turbine is PostgreSQL-first. SQLite, MySQL, SQL Server and PowDB share the query API, but some features are PostgreSQL-only and the schema CLI targets PostgreSQL. See [What is actually Postgres-only](/engines#what-is-actually-postgres-only).
 - **Types inferred from the schema file.** There is no `$inferSelect`. Rerun `npx turbine generate` after each schema change.
 
 ## See also
 
 - [Quick Start](/quickstart): set up a project from scratch.
-- [API Reference](/queries): every method, operator and option.
+- [Reading and writing](/queries) and [Filtering and sorting](/filtering): every query method, operator and option.
 - [Relations](/relations): nested reads and relation filters.
 - [Migrations](/migrate): the production migration workflow.

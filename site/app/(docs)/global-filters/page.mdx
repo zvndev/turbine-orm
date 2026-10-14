@@ -83,7 +83,7 @@ A filter can contain a relation filter, such as `posts: { author: { is: { active
 
 Filters apply to `update`, `updateMany`, `delete`, `deleteMany` and the conflict update of `upsert`. `create` and `createMany` are never filtered.
 
-On MySQL, SQL Server and PowDB, an `upsert` on a filtered table runs as a filtered lookup and then an update or insert, in one transaction, so another tenant's row is never updated. A [batched](/queries#pipeline) `buildUpsert` on those engines throws `UnsupportedFeatureError` ([E017](/errors#e017)), since a batch has no round trip for the lookup.
+On MySQL, SQL Server and PowDB, an `upsert` on a filtered table runs as a filtered lookup and then an update or insert, in one transaction, so another tenant's row is never updated. A [batched](/transactions#pipeline-n-queries-1-round-trip) `buildUpsert` on those engines throws `UnsupportedFeatureError` ([E017](/errors#e017)), since a batch has no round trip for the lookup.
 
 A filter does not satisfy the [empty-where guard](/queries#delete--deletemany), which checks only the `where` you pass:
 
@@ -155,6 +155,6 @@ At runtime, `false`, `null` and `undefined` mean "not enabled" and never throw. 
 
 ## See also
 
-- [API Reference](/queries): `where` operators and the empty-where guard.
+- [Filtering and sorting](/filtering): `where` operators.
 - [Read Replicas](/read-replicas): filters apply the same way on replicas.
 - [Transactions](/transactions): RLS `sessionContext`, tenancy enforced by the database.

@@ -65,7 +65,7 @@ A query or transaction ran past its `timeout`, or the server's `statement_timeou
 - `'not-executed'`: the statement made no change, so a retry is safe.
 - `'unknown'`: it may have committed. Check before retrying a write.
 
-The next pull on a cursor stream that was closed after its [idle timeout](/queries#abandoned-streams-close-themselves) also throws it, with `'not-executed'`. See [per-query timeout](/queries#per-query-timeout).
+The next pull on a cursor stream that was closed after its [idle timeout](/queries#abandoned-streams-close-themselves) also throws it, with `'not-executed'`. See [per-query timeout](/client#per-query-timeout).
 
 <a id="e003" />
 ### E003 `ValidationError`

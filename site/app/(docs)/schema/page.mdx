@@ -1,11 +1,11 @@
 export const metadata = {
-  title: 'Schema & Migrations',
+  title: 'Schema',
   description:
     'Define tables in TypeScript with defineSchema, apply them with push or migrations, introspect an existing database, and see how Postgres types map to TypeScript.',
   alternates: { canonical: '/schema' },
 };
 
-# Schema & Migrations
+# Schema
 
 Turbine gets its schema one of two ways: you declare tables in TypeScript with `defineSchema()`, or it introspects an existing database. Either way, `turbine generate` writes the same typed client, so you can mix the two.
 
@@ -325,4 +325,4 @@ The same narrowing applies in `where` and in a `groupBy` `having` on the column.
 
 - [Migrations](/migrate): the production migration workflow.
 - [CLI](/cli): `generate`, `push` and every flag.
-- [API Reference](/queries): querying the tables you defined.
+- [Reading and writing](/queries): querying the tables you defined.

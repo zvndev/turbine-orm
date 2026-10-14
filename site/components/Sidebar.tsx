@@ -17,16 +17,24 @@ const sections: NavSection[] = [
       { href: '/quickstart', label: 'Quick start' },
       { href: '/migrate-from-prisma', label: 'Migrate from Prisma' },
       { href: '/migrate-from-drizzle', label: 'Migrate from Drizzle' },
-      { href: '/upgrading-to-0-90', label: 'Upgrading to 0.90' },
     ],
   },
   {
     title: 'Querying',
     items: [
-      { href: '/queries', label: 'API reference' },
+      { href: '/queries', label: 'Reading and writing' },
+      { href: '/filtering', label: 'Filtering and sorting' },
       { href: '/relations', label: 'Relations' },
       { href: '/nested-writes', label: 'Nested writes' },
+      { href: '/aggregations', label: 'Aggregations' },
       { href: '/transactions', label: 'Transactions and pipelines' },
+      { href: '/raw-sql', label: 'Raw SQL' },
+      { href: '/client', label: 'Client API' },
+    ],
+  },
+  {
+    title: 'Features',
+    items: [
       { href: '/global-filters', label: 'Global filters' },
       { href: '/optimistic-locking', label: 'Optimistic locking' },
       { href: '/vector', label: 'Vector search' },
@@ -36,8 +44,8 @@ const sections: NavSection[] = [
   {
     title: 'Schema',
     items: [
-      { href: '/schema', label: 'Schema and migrations' },
-      { href: '/migrate', label: 'Migrations in practice' },
+      { href: '/schema', label: 'Schema' },
+      { href: '/migrate', label: 'Migrations' },
       { href: '/seeding', label: 'Seeding' },
       { href: '/views', label: 'Views and generated columns' },
       { href: '/zod', label: 'Zod schemas' },
@@ -78,6 +86,7 @@ const sections: NavSection[] = [
     items: [
       { href: '/errors', label: 'Typed errors' },
       { href: '/benchmarks', label: 'Benchmarks' },
+      { href: '/upgrading-to-0-90', label: 'Upgrading to 0.90' },
       { href: '/changelog', label: 'Changelog' },
     ],
   },

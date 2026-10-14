@@ -1,0 +1,109 @@
+export const metadata = {
+  title: 'Aggregations',
+  description:
+    'Count rows, compute sums, averages, minimums, maximums and percentiles, and group results with groupBy and having.',
+  alternates: { canonical: '/aggregations' },
+};
+
+# Aggregations
+
+`count`, `aggregate` and `groupBy` summarize rows in the database instead of returning them. Each takes the same [`where`](/filtering) as a read.
+
+## count
+
+```ts
+const admins = await db.users.count({ where: { role: 'admin' } });
+```
+
+## aggregate
+
+```ts
+const stats = await db.posts.aggregate({
+  where: { orgId: 1 },
+  _sum: { viewCount: true },
+  _avg: { score: true },
+  _max: { createdAt: true },
+  _count: true,
+});
+```
+
+`_sum` and `_avg` return a `number` over `int2`, `int4` and float columns, an exact string over `int8` and `numeric`, and `null` over zero rows. `_min` / `_max` return the stored value. `groupBy` follows the same rules.
+
+## groupBy
+
+```ts
+const postsByUser = await db.posts.groupBy({
+  by: ['userId'],
+  where: { published: true },
+  _count: true,
+  _sum: { viewCount: true },
+  orderBy: { _count: 'desc' },
+  limit: 10,
+});
+// [{ userId: 1, _count: 12, _sum: { viewCount: 4800 } }, ...]
+```
+
+| Option | What it does |
+|---|---|
+| `by` | A non-empty array of fields or JSON keys `{ field, path }` |
+| `where` | Filter rows before grouping |
+| `_count` | `true`, or `{ _all: true, title: true }` for non-NULL counts per field |
+| `_sum`, `_avg`, `_min`, `_max` | `{ field: true }`, or a JSON target `{ field, path, type? }` |
+| [`_percentile`](#percentiles-_percentile) | Percentiles per group |
+| [`having`](#having) | Filter groups |
+| `orderBy` | A `by` field, JSON key or requested aggregate |
+| `limit` / `offset` | Top-N groups |
+| `distinctOn` | Aggregate one row per key, picked by its `orderBy` (PostgreSQL) |
+
+The result is typed from the args; a JSON-path key is left off the type.
+
+```ts
+const latestByCategory = await db.versions.groupBy({
+  distinctOn: { columns: ['instanceId'], orderBy: { createdAt: 'desc' } },
+  by: [{ field: 'data', path: ['category'] }],         // result key: 'category'
+  _sum: { price: { field: 'data', path: ['price'] } },  // cast to numeric
+});
+```
+
+## HAVING
+
+```ts
+const busy = await db.posts.groupBy({
+  by: ['typeId'],
+  _count: true,
+  _sum: { viewCount: true },
+  having: {
+    typeId: { not: null },             // the grouped value
+    _count: { gt: 1 },                 // the row count
+    viewCount: { _sum: { gte: 100 } }, // a column aggregate
+  },
+});
+// HAVING "type_id" IS NOT NULL AND COUNT(*) > $1 AND SUM("view_count") >= $2
+```
+
+Aggregate filters take `equals`, `not`, `gt`, `gte`, `lt`, `lte`, `in` and `notIn`. A grouped-value filter takes any [WHERE operator](/filtering#where-operators), on a `by` field only (E003 otherwise). `AND`, `OR` and `NOT` nest as in [`where`](/filtering#combinators).
+
+## Percentiles: `_percentile`
+
+```ts
+import { col, expr } from 'turbine-orm';
+
+const stats = await db.requests.aggregate({
+  _percentile: {
+    latencyMs: { p: [0.5, 0.95, 0.99] },  // [median, p95, p99]
+    sizeBytes: { p: 0.5, method: 'disc' }, // a stored value
+    wait: { of: expr.secondsBetween(col('requestedAt'), col('readyAt')), p: 0.95 },
+  },
+});
+```
+
+`p` is a fraction, or an array of them. `method: 'cont'` (default) interpolates over numeric and interval columns; `'disc'` returns a stored value. Over zero rows the result is `null`.
+
+A key that names no field takes `of`, a numeric [expression](/queries#update-expressions-expr), and returns a `number`. Integer division in it truncates, so multiply by a fraction instead.
+
+PostgreSQL only (E017 elsewhere). A PII column needs `includePii: UNSAFE`.
+
+## See also
+
+- [Filtering and sorting](/filtering): the `where` every aggregation takes.
+- [Relations](/relations): counting related rows with `_count`.

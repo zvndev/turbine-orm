@@ -40,7 +40,7 @@ interface QueryEvent {
 ```
 
 - A listener that throws never fails the query. With `logging: true`, the error is logged as `query-listener-error`.
-- `$on` is a passive tap. [Middleware](/queries#middleware) wraps a call and can transform its result.
+- `$on` is a passive tap. [Middleware](/client#middleware) wraps a call and can transform its result.
 
 ### What emits an event
 
@@ -297,7 +297,7 @@ It binds `127.0.0.1:4984` and reads metrics only, never your application databas
 
 ## OpenTelemetry
 
-Turbine imports nothing from `@opentelemetry/*`. [`$use`](/queries#middleware) opens a span per operation and `$on('query')` records a span per SQL statement. Install `@opentelemetry/api` and an SDK; the recipe needs the context manager the SDK registers.
+Turbine imports nothing from `@opentelemetry/*`. [`$use`](/client#middleware) opens a span per operation and `$on('query')` records a span per SQL statement. Install `@opentelemetry/api` and an SDK; the recipe needs the context manager the SDK registers.
 
 ```ts
 import { context, trace, SpanKind, SpanStatusCode } from '@opentelemetry/api';
@@ -431,5 +431,5 @@ SELECT "orders".* FROM "orders" WHERE "id" = $1 LIMIT 1 /*traceparent='00-4bf92f
 ## See also
 
 - **[Studio](/studio)**: the local database UI with the same security model.
-- **[Middleware](/queries#middleware)**: the active counterpart to `$on`.
+- **[Middleware](/client#middleware)**: the active counterpart to `$on`.
 - **[Typed Errors](/errors)**: what lands in `event.error`.

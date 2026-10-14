@@ -73,7 +73,7 @@ export const metadata = {
 
 ### Writes and transactions
 
-- **A timed-out query is cancelled on the server** (PostgreSQL). `TimeoutError.outcome` is `'not-executed'` (safe to retry) or `'unknown'`. **Do:** retry writes only on `'not-executed'`. See [Per-query timeout](/queries#per-query-timeout).
+- **A timed-out query is cancelled on the server** (PostgreSQL). `TimeoutError.outcome` is `'not-executed'` (safe to retry) or `'unknown'`. **Do:** retry writes only on `'not-executed'`. See [Per-query timeout](/client#per-query-timeout).
 - **`upsert` stamps `updatedAt` on its single-statement path too.**
 - **Nested writes and lookup-first upserts run in their own savepoint** inside `$transaction`, so a caught failure leaves nothing half done. A writing `pipeline()` rolls back entirely when a `findUniqueOrThrow` misses.
 - **`$transaction([...], options)` applies `isolationLevel`, `sessionContext` and `timeout`.**
@@ -281,5 +281,5 @@ Compile-time only:
 ## See also
 
 - **[Changelog](/changelog)**, every fix and addition in 0.90, including the new opt-in features.
-- **[API Reference](/queries)**, these rules in context.
+- **[Reading and writing](/queries)**, these rules in context.
 - **[Typed Errors](/errors)**, every error code.

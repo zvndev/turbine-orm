@@ -29,7 +29,7 @@ export default defineSeed(async (db) => {
 });
 ```
 
-That client has no table accessors, so write with [`db.raw`](/queries#raw-sql) or [`db.sql`](/queries#typed-raw-sql-dbsqlt). For typed accessors, import your generated client and disconnect it yourself:
+That client has no table accessors, so write with [`db.raw`](/raw-sql) or [`db.sql`](/raw-sql#typed-raw-sql-dbsqlt). For typed accessors, import your generated client and disconnect it yourself:
 
 ```ts
 // turbine/seed.ts

@@ -1,0 +1,42 @@
+export const metadata = {
+  title: 'Raw SQL',
+  description:
+    'Run your own SQL with bound parameters through db.raw, db.rawUnsafe and the typed db.sql template.',
+  alternates: { canonical: '/raw-sql' },
+};
+
+# Raw SQL
+
+For a query the typed methods cannot express, write the SQL yourself. Values in the template stay bound parameters.
+
+```ts
+const stats = await db.raw<{ day: Date; count: number }>`
+  SELECT DATE_TRUNC('day', created_at) AS day, COUNT(*)::int AS count
+  FROM posts WHERE org_id = ${orgId}
+  GROUP BY day ORDER BY day
+`;
+
+// SQL text built at runtime: $n placeholders, values after
+const table = 'audit_' + year; // from your own code, never from a request
+const rows = await db.rawUnsafe(`SELECT * FROM ${table} WHERE actor_id = $1`, actorId);
+```
+
+- Every `${}` in `db.raw` and `db.sql` is a bound parameter. They take only a real tagged template.
+- `rawUnsafe` escapes nothing in its text. Never let untrusted input reach it.
+- Write `$1`, `$2` on every engine; Turbine rewrites them for SQLite, MySQL and SQL Server.
+- Raw SQL emits `$on('query')` events but skips `$use` middleware.
+
+## Typed raw SQL: `db.sql<T>`
+
+```ts
+const users = await db.sql<{ id: number; name: string }>`SELECT id, name FROM users WHERE org_id = ${orgId}`;
+const user = await db.sql<{ id: number; name: string }>`SELECT id, name FROM users WHERE id = ${42}`.one();
+const total = await db.sql<{ count: number }>`SELECT COUNT(*)::int AS count FROM users`.scalar();
+```
+
+Awaiting returns `T[]`. `.one()` returns the first row or `null`; `.scalar()` the first column of the first row, or `null`.
+
+## See also
+
+- [Reading and writing](/queries): the typed methods to reach for first.
+- [Observability](/observability): raw statements in `$on('query')` events.

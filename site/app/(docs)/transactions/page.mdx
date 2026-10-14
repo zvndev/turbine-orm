@@ -157,7 +157,7 @@ try {
 
 `timeout` takes milliseconds below 2^31, or `0` for none. Anything else throws [E003](/errors#e003).
 
-On PostgreSQL, a [per-query `timeout`](/queries#per-query-timeout) inside a transaction cancels that statement and marks the transaction rolled back, so returning afterwards rejects with [E019](/errors#e019). Run the statement in a nested block to keep going.
+On PostgreSQL, a [per-query `timeout`](/client#per-query-timeout) inside a transaction cancels that statement and marks the transaction rolled back, so returning afterwards rejects with [E019](/errors#e019). Run the statement in a nested block to keep going.
 
 ## Retryable errors
 
@@ -249,7 +249,7 @@ There is no `tx.pipeline()`. For an atomic batch, use the batch form of `db.$tra
 | `tx.table<T>(name)` | Accessor for a table missing from the generated types |
 | `tx.$transaction(fn)` | A nested block on a savepoint |
 | ``tx.raw`...` `` | Tagged-template SQL; every `${value}` is bound |
-| ``tx.sql<T>`...` `` | [Typed SQL](/queries#typed-raw-sql-dbsqlt) on the transaction's connection |
+| ``tx.sql<T>`...` `` | [Typed SQL](/raw-sql#typed-raw-sql-dbsqlt) on the transaction's connection |
 | `tx.rawUnsafe(text, ...values)` | SQL text built at runtime, with `$1`, `$2` placeholders; never put untrusted input in `text` |
 | `tx.$connection()` | The driver connection, for another library's query function |
 | `tx.schema` | The schema metadata |
