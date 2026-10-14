@@ -7,7 +7,7 @@ export const metadata = {
 
 # MCP Server
 
-`turbine mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io) server so an AI agent (Claude Code, Cursor, or any MCP client) can inspect your database. It speaks JSON-RPC 2.0 over stdio, ships in the package with no extra dependency, and is **read-only by construction**: every database access runs inside `BEGIN READ ONLY` with a statement timeout, and there is no free-form SQL input anywhere on the surface.
+`turbine mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io) server so an AI agent (Claude Code, Cursor, or any MCP client) can inspect your database. It speaks JSON-RPC 2.0 over stdio and ships in the package with no extra dependency. It is **read-only**: every database access runs inside `BEGIN READ ONLY` with a statement timeout, and no tool accepts free-form SQL.
 
 ```bash
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine mcp
@@ -15,35 +15,37 @@ DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine mcp
 
 ## The tools
 
-Eleven tools. The first seven answer "what is here"; the last four exist because the hardest thing for an agent on an unfamiliar schema is working out how tables connect.
+There are eleven tools. The first seven describe what is in the database. `relation_graph`, `find_join_path` and `table_stats` cover the hardest part of an unfamiliar schema for an agent: how the tables connect and how big they are. `explain_error` decodes Turbine's error codes.
 
 | Tool | What it returns |
 |---|---|
-| `schema_overview` | Tables, columns, relations, indexes, and estimated row counts. |
-| `table_detail` | Columns, indexes, and relations for one named table. |
+| `schema_overview` | Tables, columns, relations, indexes and estimated row counts. |
+| `table_detail` | Columns, indexes and relations for one named table. |
 | `migrate_status` | Applied vs pending migrations, without applying anything. |
 | `doctor_report` | Missing relation indexes, from the same [index advisor](/cli#turbine-doctor) `turbine doctor` uses. |
 | `explain_query` | `EXPLAIN (FORMAT JSON)` for a schema-validated `findMany` plan (see below). |
-| `compile_query` | The exact SQL a read query would send, **without executing it**: bound parameters, how many statements it costs, which relation-load strategy it takes, whether a `LIMIT` bounds it, and warnings such as an unindexed correlation column. A query that fails to compile comes back as `ok: false` with the code and the fix, which is an answer rather than an error. |
-| `sample_rows` | Up to 50 rows from a validated table, PII-tagged columns never fetched. |
-| `relation_graph` | The whole relation graph, or one table's subtree: every relation name with its cardinality, target, join keys, and junction table. These are the exact names a `with` clause accepts. |
-| `find_join_path` | The shortest relation chain from one table to another, **with the nested `with` clause to write, as code**. Returns every equal-shortest path, and `found: false` instead of throwing when none exists. |
-| `table_stats` | The planner's row estimate, page count, on-disk bytes, and every index with its columns. A never-analyzed table reports `analyzed: false`, not `0`, because "unknown" and "empty" are different facts. |
-| `explain_error` | A Turbine error code (`TURBINE_E003`, `E003`, or `3`) mapped to its class, causes, fix, and docs URL. Reads no database. |
+| `compile_query` | The exact SQL a read query would send, **without executing it**: bound parameters, how many statements it costs, which relation-load strategy it takes, whether a `LIMIT` bounds it, and warnings such as an unindexed correlation column. A query that fails to compile returns `ok: false` with the error code and the fix, as a result rather than an error. |
+| `sample_rows` | Up to 50 rows from a validated table. PII-tagged columns are never fetched. |
+| `relation_graph` | The whole relation graph, or one table's subtree: every relation name with its cardinality, target, join keys and junction table. These are the exact names a `with` clause accepts. |
+| `find_join_path` | The shortest relation chain from one table to another, **with the nested `with` clause to write**. Returns every equally short path, and `found: false` rather than an error when there is none. |
+| `table_stats` | The planner's row estimate, page count, on-disk bytes, and every index with its columns. A table that has never been analyzed reports `analyzed: false`, not `0`, because unknown and empty are different facts. |
+| `explain_error` | A Turbine error code (`TURBINE_E003`, `E003` or `3`) mapped to its class, causes, fix and docs URL. Reads no database. |
 
 ## What an agent can and cannot do
 
-**Can:** learn the relation names a `with` clause accepts (`relation_graph`), get the query from `orders` to `organizations` written for it (`find_join_path`), check a table's size before writing a query that would scan it (`table_stats`), verify a plan (`explain_query`), and look at real rows (`sample_rows`).
+**Can:** learn the relation names a `with` clause accepts (`relation_graph`), get the query from `orders` to `organizations` written for it (`find_join_path`), check a table's size before writing a query that would scan it (`table_stats`), check a plan (`explain_query`), and look at real rows (`sample_rows`).
 
-**Cannot:** write anything (every access is inside `BEGIN READ ONLY`), run arbitrary SQL (no tool accepts SQL text), or read PII. `sample_rows` never fetches PII-tagged or secret-named columns and lists exactly what was hidden. `explain_query` refuses a `where` or `orderBy` on such a column, because a planner row estimate can leak whether a value exists. Column *names* are returned everywhere, since a name is schema shape, not data. A column counts as secret-named when one of its words is a secret word, with names split on underscores, dashes and case changes alike, so `api_key`, `apiKey`, `api-key` and `PasswordHash` are all caught.
+**Cannot:** write anything (every access is inside `BEGIN READ ONLY`), run arbitrary SQL (no tool accepts SQL text), or read PII. `sample_rows` never fetches PII-tagged or secret-named columns, and lists what it hid. `explain_query` refuses a `where` or `orderBy` on such a column, because a planner row estimate can leak whether a value exists. Column *names* are returned everywhere, since a name describes the schema, not the data.
 
-PII tags are a code-first declaration (introspection never infers one), so the server reads them from the generated metadata in your `out` directory. With no generated metadata there is nothing to redact, and the server says so rather than implying protection it cannot apply.
+A column is secret-named when one of its words is a secret word. Names are split on underscores, dashes and case changes, so `api_key`, `apiKey`, `api-key` and `PasswordHash` are all caught.
+
+PII tags are declared in code and never inferred by introspection, so the server reads them from the generated metadata in your `out` directory. With no generated metadata there is nothing to redact, and the server says so rather than implying protection it cannot apply.
 
 ## `explain_query`
 
-No free-form SQL. You pass a subset of `findMany` args; Turbine validates every identifier against the introspected schema, compiles parameterized SQL through the same builder your application uses, and runs `EXPLAIN (FORMAT JSON)` with bound params.
+You pass a subset of `findMany` args, not SQL. Turbine validates every identifier against the introspected schema, compiles parameterized SQL with the same builder your application uses, and runs `EXPLAIN (FORMAT JSON)` with bound parameters.
 
-A [`lock`](/queries#row-locks) option is refused by name (JSON-RPC error `-32602`), at the top level or on any `with` entry, by both `explain_query` and `compile_query`: the server is read-only, and a locking read belongs in a `db.$transaction` in your application. Compile the query without it. `compile_query` also refuses a `_percentile` when it cannot read the PII tag file, rather than compile a percentile over a column it cannot check.
+Both `explain_query` and `compile_query` refuse a [`lock`](/queries#row-locks) option by name (JSON-RPC error `-32602`), at the top level or on any `with` entry. The server is read-only, and a locking read belongs in a `db.$transaction` in your application, so compile the query without it. `compile_query` also refuses a `_percentile` when it cannot read the PII tag file, rather than compile a percentile over a column it cannot check.
 
 | Argument | Required | Description |
 |---|---|---|
@@ -96,6 +98,6 @@ Same shape, in `.cursor/mcp.json`:
 
 ## See also
 
-- **[Turbine for AI agents](/ai-agents)**, the rest of the agent story: typed query args, coded errors, `llms.txt`, and a drop-in instructions snippet.
-- **[Studio](/studio)**, the same read-only stance as a web UI for humans.
-- **[CLI](/cli)**, `turbine doctor` and `migrate status` on the command line.
+- **[Turbine for AI agents](/ai-agents)**: typed query args, coded errors, `llms.txt` and a drop-in instructions snippet.
+- **[Studio](/studio)**: the same read-only approach, as a web UI for people.
+- **[CLI](/cli)**: `turbine doctor` and `migrate status` on the command line.

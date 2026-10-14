@@ -1,17 +1,17 @@
 export const metadata = {
   title: 'Observability',
   description:
-    'Query lifecycle events with db.$on, automatic metrics aggregation with db.$observe, and the npx turbine observe dashboard.',
+    'Query events with db.$on, the logger and diagnostics options, SQL comments, per-minute metrics with db.$observe, the npx turbine observe dashboard, and an OpenTelemetry recipe.',
   alternates: { canonical: '/observability' },
 };
 
 # Observability
 
-Three layers, each opt-in: raw query events (`$on`), aggregated metrics persisted to Postgres (`$observe`), and a local dashboard over those metrics (`npx turbine observe`). No agent, no external service, no extra dependency.
+Turbine reports what it runs through query events (`$on`), a pluggable logger, and optional per-minute metrics (`$observe`) with a local dashboard (`npx turbine observe`). None of it needs an agent, an external service or an extra dependency. To trace queries, the [OpenTelemetry recipe](#opentelemetry) builds spans from the same hooks.
 
 ## Query events, `db.$on('query')`
 
-Every query emits an event after execution, success or failure. Subscribe with `$on`, unsubscribe with `$off`:
+Every statement emits an event after it runs, whether it succeeded or failed. Subscribe with `$on` and unsubscribe with `$off`:
 
 ```ts
 db.$on('query', (event) => {
@@ -36,10 +36,14 @@ interface QueryEvent {
   strategy?: 'auto-batched';            // the 'auto' relation strategy re-planned this query
   tag?: string;                         // the enclosing db.$tag() label, see below
   batch?: 'pipeline' | 'transaction';   // ran inside pipeline() or $transaction([...])
+  comment?: string;                     // the sqlComment it was sent with; sql stays commentless
+  retried?: true;                       // the failed first attempt of a read Turbine re-sent
 }
 ```
 
-A listener that throws never breaks the query. The error is swallowed, and with `logging: true` it is logged at `error` level with code `query-listener-error` (see [Log output](#log-output-logger)).
+A listener that throws never fails the query. Turbine swallows the error and, with `logging: true`, logs it at `error` level as `query-listener-error` (see [Log output](#log-output-logger)).
+
+Unlike [middleware](/queries#middleware), which wraps a call and can transform its result, `$on` is a passive tap: it fires after the statement runs, with the final SQL, timing and outcome.
 
 ### What emits an event
 
@@ -55,7 +59,11 @@ Every statement the client sends on your behalf:
 | each statement of `db.pipeline(...)` | the statement's table | its method, with `batch: 'pipeline'` |
 | each statement of `db.$transaction([...])` | the statement's table | its method, with `batch: 'transaction'` |
 
-`'$raw'` is exported as `RAW_QUERY_MODEL`. A pipeline sends all of its statements in one round trip, so each pipeline event's `duration` is the batch's wall time split evenly across its statements: the total is exact, the per-statement split is not. Statements in `$transaction([...])` are timed one by one. Transaction control statements (`BEGIN`, `COMMIT`, savepoints) are not reported.
+`'$raw'` is exported as `RAW_QUERY_MODEL`. Transaction control statements (`BEGIN`, `COMMIT`, savepoints) are not reported.
+
+A pipeline sends all of its statements in one round trip, so each pipeline event's `duration` is the batch's wall time split evenly across its statements. The total is exact; the per-statement split is not. Statements in `$transaction([...])` are timed one by one.
+
+A read that failed because the server had already closed its connection, and that Turbine sent again on a fresh one, reports two events: the first carries the error and `retried: true`, the second times the retry. See [Lost connections](/transactions#lost-connections).
 
 ### Attributing queries to a feature, `db.$tag()`
 
@@ -70,9 +78,12 @@ const order = await db.$tag('checkout', async () => {
 // all three events carry tag: 'checkout'
 ```
 
-The scope follows async context, so queries in awaited helpers, transactions, pipelines and raw SQL inside the callback are all tagged, and concurrent requests keep their own tags. An inner `$tag` replaces an outer one for its own duration. `$tag` returns whatever the callback returns. A label must be 1 to 128 characters (`MAX_QUERY_TAG_LENGTH`); anything else throws `ValidationError` (E003) before the callback runs. The tag is event metadata only and never reaches SQL, so keep request data such as user ids out of it.
+The scope follows async context. Queries in awaited helpers, transactions, pipelines and raw SQL inside the callback are all tagged, and concurrent requests keep their own tags.
 
-`$on` differs from [middleware](/queries#middleware): middleware wraps the call and can transform results; `$on` is a passive tap that fires after execution with the final SQL, timing, and outcome.
+- An inner `$tag` replaces the outer one while it runs.
+- `$tag` returns whatever the callback returns.
+- A label must be 1 to 128 characters (`MAX_QUERY_TAG_LENGTH`). Anything else throws `ValidationError` (E003) before the callback runs.
+- A label should name a code path, not a request. Keep data such as user ids out of it: it lands on every query event, and with [`sqlComment.tag`](#sql-comments-sqlcomment) in the SQL text too.
 
 ### Seeing the parameter values, `logQueryParams`
 
@@ -96,10 +107,10 @@ const db = turbine({
 // SELECT * FROM "users" WHERE "email" = $1 LIMIT 1   [ 'alice@example.com' ]
 ```
 
-Only `event.params` changes; SQL, timing, model, action, and row count are identical either way.
+Only `event.params` changes. SQL, timing, model, action and row count are the same either way.
 
 <Callout type="note" title="Relationship to `errorMessages`">
-[`errorMessages: 'verbose'`](/errors#safe-error-messages) also reveals params, and still works. The two resolve to a single value: when `logQueryParams` is set it decides; when unset, `errorMessages` decides. `logQueryParams: true` with the default `errorMessages: 'safe'` gives real values in query events while error messages stay redacted.
+[`errorMessages: 'verbose'`](/errors#safe-error-messages) also reveals params in query events. When `logQueryParams` is set, it decides; when it is unset, `errorMessages` decides. So `logQueryParams: true` with the default `errorMessages: 'safe'` shows real values in query events and keeps them out of error messages.
 </Callout>
 
 ## Log output, `logger`
@@ -133,7 +144,7 @@ const logger: TurbineLogger = {
 
 - Every method (`debug`, `info`, `warn`, `error`) is optional. A missing method drops that level, so `logger: {}` silences Turbine.
 - A logger method that throws is ignored. Logging never fails the operation that logged.
-- A `console` or winston object works as it is, because both take the message first. pino and bunyan take the object first, so wrap them:
+- A `console` or winston object works as is, because both take the message first. pino and bunyan take the object first, so wrap them:
 
 ```ts
 logger: {
@@ -143,7 +154,7 @@ logger: {
 ```
 
 - No log line carries a bound parameter value, whatever `logQueryParams` says. That option governs `$on('query')` events only.
-- A warning that fires once per process is deduplicated across the whole process. If one client already emitted it, a second client's logger does not see it.
+- A once-per-process warning is deduplicated across clients. If one client already emitted it, a second client's logger does not see it.
 - A `logger` that is not an object, or whose level members are not functions, throws `ValidationError` (E003) when the client is constructed.
 
 `logging: true` adds lifecycle lines (pool created, raw SQL preview, transaction committed, and so on) at the `debug` level. With the default logger, `debug` prints through `console.log`.
@@ -176,7 +187,7 @@ Every engine sends its lines through `logger`, PowDB included: its unknown-optio
 
 ## Diagnostics, `diagnostics`
 
-One option decides what Turbine checks and says about itself while queries run: per-query advice, and the SQL-cache self-check.
+`diagnostics` controls two things Turbine does while queries run: per-query advice, and a self-check of its SQL cache.
 
 ```ts
 const db = turbine({
@@ -190,9 +201,9 @@ const db = turbine({
 | `'development'` | on | every cache hit |
 | `'production'` | off | off |
 
-When you do not set it, the mode is `'production'` if `NODE_ENV` is `'production'`, or if there is no `process` at all (an edge runtime). Otherwise it is `'development'`. It is read once, when the client is constructed, so changing `NODE_ENV` later has no effect on that client.
+When you do not set it, the mode is `'production'` if `NODE_ENV` is `'production'` or there is no `process` at all (an edge runtime), and `'development'` otherwise. It is read once, when the client is constructed, so changing `NODE_ENV` later has no effect on that client.
 
-Set it explicitly where `NODE_ENV` is not set, such as a worker or a serverless function. Without it, such a runtime runs in development mode, with advice and the self-check on.
+Set it explicitly wherever `NODE_ENV` is unset, such as a worker or a serverless function. Otherwise that runtime runs in development mode, with advice and the self-check on.
 
 An object overrides one part and keeps the mode's default for the other:
 
@@ -206,7 +217,7 @@ diagnostics: { mode: 'production', cacheCheck: { sample: 0.001 } }
 - Two cheaper checks run in every mode, including production, `cacheCheck: 'off'` and `sqlCache: false`. On a cache miss, the parameters the cache will collect for later calls must equal the ones the build produced (`'sql-cache-lockstep'`). On a hit, the number of collected parameters must match the cached statement (`'sql-cache-param-count'`). Neither depends on `cacheCheck`, and neither message carries a bound value.
 - An unknown mode or key, a non-boolean `advice`, or a sample outside `(0, 1]` throws `ValidationError` (E003) at construction.
 
-The environment variables still work when `cacheCheck` is not set. `TURBINE_DISABLE_CACHE_CHECK=1` turns the self-check off in any mode. In production mode, `TURBINE_CACHE_CHECK_SAMPLE` sets a sample rate. When both are set, the disable variable wins. An explicit `cacheCheck` wins over both.
+Two environment variables apply when `cacheCheck` is not set. `TURBINE_DISABLE_CACHE_CHECK=1` turns the self-check off in any mode. In production mode, `TURBINE_CACHE_CHECK_SAMPLE` sets a sample rate. When both are set, the disable variable wins. An explicit `cacheCheck` wins over both.
 
 Construction warnings do not depend on `diagnostics`. A misspelled config key, an option an external pool ignores, or prepared statements behind a pooler are production hazards, so those warnings fire once per process in every mode.
 
@@ -249,7 +260,7 @@ The format is the sqlcommenter one: keys sorted, each value URL-encoded and then
 
 ## Metrics, `db.$observe()`
 
-`$observe` turns the event stream into per-minute aggregates persisted to a `_turbine_metrics` table, typically in a *separate* database so metrics writes never touch your application data:
+`$observe` turns the event stream into per-minute aggregates and writes them to a `_turbine_metrics` table. Point it at a separate database so metric writes never touch your application data:
 
 ```ts
 const handle = await db.$observe({
@@ -262,13 +273,13 @@ const handle = await db.$observe({
 await handle.stop(); // final flush, then closes the metrics pool
 ```
 
-What it does:
+How it works:
 
-- Buffers events in memory, keyed by `model:action` per minute bucket.
-- On each flush, computes **count, avg, p50, p95, p99, and error count** per key and upserts a row into `_turbine_metrics` (`ON CONFLICT` merges additively, so multiple app instances can flush into the same bucket).
-- Uses its own **1-connection pool** against the metrics database; metric writes never contend with your application pool.
-- **Fire-and-forget**: flush errors are swallowed, the flush timer is `unref()`ed so it never keeps the process alive, and a failing metrics database cannot fail a query.
-- Creates the table on init (`CREATE TABLE IF NOT EXISTS _turbine_metrics`) and prunes rows older than `retentionDays` on each flush.
+- Events are buffered in memory, keyed by `model:action` and minute.
+- Each flush computes count, avg, p50, p95, p99 and error count per key and upserts one row per key into `_turbine_metrics`. `ON CONFLICT` merges additively, so several app instances can flush into the same minute.
+- It opens its own one-connection pool against the metrics database, so metric writes never compete with your application pool.
+- Flush errors are swallowed and the flush timer is `unref()`ed. A failing metrics database cannot fail a query or keep the process alive.
+- It creates the table on start (`CREATE TABLE IF NOT EXISTS _turbine_metrics`) and prunes rows older than `retentionDays` on each flush.
 
 The table schema, if you want to query it yourself:
 
@@ -288,11 +299,11 @@ CREATE TABLE IF NOT EXISTS _turbine_metrics (
 );
 ```
 
-Calling `$observe` again replaces the previous engine (the old one is stopped and unsubscribed first).
+Calling `$observe` again stops and unsubscribes the previous engine, then starts the new one.
 
 ## Custom sinks: where the aggregates go
 
-The flush target is pluggable: pass a `sink` and the same per-minute aggregates flow wherever you point them.
+Pass a `sink` to send the same per-minute aggregates somewhere other than Postgres.
 
 ```ts
 interface MetricsFlushBatch {
@@ -316,11 +327,11 @@ interface ObserveSink {
 }
 ```
 
-With a `sink` supplied, `connectionString` becomes optional (at least one of the two is required). With no sink, the default Postgres writer is used.
+With a `sink`, `connectionString` is optional. You must pass at least one of the two; with no sink, Turbine uses its Postgres writer.
 
 ### `HttpJsonSink`
 
-A generic sink that POSTs each batch as JSON, for Grafana, a self-hosted collector, or any HTTP endpoint:
+`HttpJsonSink` POSTs each batch as JSON to any HTTP endpoint, such as Grafana or a self-hosted collector:
 
 ```ts
 import { HttpJsonSink } from 'turbine-orm';
@@ -334,32 +345,39 @@ const handle = await db.$observe({
 });
 ```
 
-It is fire-and-forget: a failed request is swallowed and never throws, and there are no retries beyond the engine's next scheduled flush, so a down collector can never affect a query. The request body carries the aggregate batch and nothing else.
+A failed request is swallowed and its batch is dropped, with no retry, so a collector that is down never affects a query. The request body is the aggregate batch and nothing else.
 
 ### Privacy posture
 
-A batch (to any sink, HTTP or Postgres) contains **only**:
+A batch, to any sink, contains only:
 
 - the model (table) name and the action (`findMany`, `create`, …);
 - the count of queries and the count of errors;
 - latency aggregates (avg, p50, p95, p99).
 
-It carries **no SQL text and no parameter values**; those never leave the app process. Observability is off by default: nothing is collected until you call `$observe`.
+**It carries no SQL text and no parameter values.** Metrics are off by default: nothing is collected until you call `$observe`.
 
 ## Dashboard, `npx turbine observe`
 
-A local, read-only dashboard over `_turbine_metrics`: latency over time and a per-`model.action` breakdown.
+`npx turbine observe` serves a local, read-only dashboard over `_turbine_metrics`: latency over time and a breakdown per `model.action`.
 
 ```bash
 TURBINE_OBSERVE_URL=postgres://... npx turbine observe
 npx turbine observe --port 5000 --no-open
 ```
 
-It binds `127.0.0.1:4984` by default and shares [Studio's security model](/studio#security-model): loopback by default, non-loopback refused without `--allow-remote`, a one-time ticket in the printed URL exchanged for a session cookie, `403` for a `Host` that is not loopback or the bound host, and security headers on every response. It reads metrics only; it never connects to your application database.
+It binds `127.0.0.1:4984` by default and shares [Studio's security model](/studio#security-model):
+
+- A non-loopback host is refused without `--allow-remote`.
+- The printed URL carries a one-time ticket, which is exchanged for a session cookie.
+- A request whose `Host` is neither loopback nor the bound host gets `403`.
+- Every response carries security headers.
+
+It reads metrics only and never connects to your application database.
 
 ## OpenTelemetry
 
-Turbine imports nothing from `@opentelemetry/*` and adds no dependency. Two hooks you already have are enough: [`$use`](/queries#middleware) opens a span for each operation, and `$on('query')` records a span for each SQL statement. Install `@opentelemetry/api` and an SDK yourself; the recipe needs OpenTelemetry's context manager (without one, `context.active()` is always the root context), which the SDK normally provides.
+Turbine imports nothing from `@opentelemetry/*`. Two hooks are enough to trace it: [`$use`](/queries#middleware) opens a span for each operation, and `$on('query')` records a span for each SQL statement. Install `@opentelemetry/api` and an SDK yourself. The recipe needs a context manager, which the SDK normally registers; without one, `context.active()` is always the root context.
 
 ```ts
 import { context, trace, SpanKind, SpanStatusCode } from '@opentelemetry/api';
@@ -425,7 +443,7 @@ The operation span is `INTERNAL` and the statement span is `CLIENT`, so a backen
 
 ### Why the tree comes out right
 
-A query event is delivered in the async context of the code that awaited the statement. `context.active()` inside the listener is therefore the span that was active at that `await`: the operation span for a model call, or your own span for a statement that has no operation span. Nothing has to be passed through Turbine for this to work.
+A query event is delivered in the async context of the code that awaited the statement. `context.active()` inside the listener is therefore the span that was active at that `await`: the operation span for a model call, or your own span for a statement that has no operation span. You pass nothing through Turbine to make this work.
 
 `$use` wraps model methods only, so these statements get no operation span. They appear as statement spans directly under whichever span is active where you await them:
 
@@ -461,7 +479,7 @@ The `db.*` and `error.type` names follow the [OpenTelemetry database semantic co
 Timing, parameters and failures:
 
 - **`duration` is measured around the driver call.** It covers the round trip and, on a pooled client, the wait for a free connection. It does not cover SQL generation, row parsing or middleware, which is why the operation span is longer. Each span ends at the event's `timestamp` and starts `duration` earlier.
-- **A pipeline's per-statement duration is the batch time divided evenly.** The pipeline sends every statement in one round trip, so the spans share the batch's wall time equally. The total is exact and the per-statement split is not. Statements in `$transaction([...])` are timed individually.
+- **A pipeline's per-statement duration is the batch time divided evenly,** so its spans share the batch's wall time equally (see [What emits an event](#what-emits-an-event)). Statements in `$transaction([...])` are timed individually.
 - **Parameter values stay out of the span.** Turbine binds every value, so `db.query.text` carries placeholders and never values. The one exception is [`db.rawUnsafe`](/queries), where you write the text yourself. The values are in `e.params`, which holds `'[REDACTED]'` for each entry unless [`logQueryParams`](#seeing-the-parameter-values-logqueryparams) is on. The recipe does not record them. If you add them, the conventions treat `db.query.parameter.<key>` as opt-in because values can carry personal data.
 - **A retried read shows as two statement spans.** The first carries `turbine.retried` and an error status, the second times the retry alone. Alert on the operation span's status to count failed calls rather than failed attempts. Writes and statements inside a transaction are never retried.
 - **`recordException` sends the error's message and stack to your backend.** See [`errorMessages`](/errors#safe-error-messages) for what a message may contain.
@@ -495,10 +513,10 @@ SELECT "orders".* FROM "orders" WHERE "id" = $1 LIMIT 1 /*traceparent='00-4bf92f
 - **A sampled statement is sent unnamed.** A value that changes per request makes every statement's text unique, and a connection keeps each prepared statement until it closes, so a statement carrying any `dynamic` value is parsed and planned on every execution instead. That costs tens of microseconds per statement on a local server, more for nested reads. Returning `undefined` for unsampled spans keeps every other statement on its prepared statement.
 - **`db.query.text` stays the same.** The event's `sql` is the statement without its comment, and the comment is in `e.comment`.
 - **`pg_stat_statements` keeps one row per statement.** PostgreSQL computes a statement's query id from its parse tree, which a comment is not part of, so traced and untraced runs of one statement share a row.
-- **Raw SQL carries no comment,** and `dynamic` is refused on MySQL and PowDB (see [`sqlComment`](#sql-comments-sqlcomment)).
+- **Raw SQL carries no comment.** `dynamic` is refused on MySQL, and `sqlComment` as a whole on PowDB (see [`sqlComment`](#sql-comments-sqlcomment)).
 
 ## See also
 
-- **[Studio](/studio)**, the read-only database UI with the same local security posture.
+- **[Studio](/studio)**, the local database UI with the same security model.
 - **[API Reference](/queries#middleware)**, middleware, the active counterpart to `$on`.
 - **[Typed Errors](/errors)**, what lands in `event.error`.
