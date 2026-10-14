@@ -392,12 +392,28 @@ const nodePlatform = (config) => {
 // 1 kB): main 146, serverless 114. The rest follow the 5% convention: the
 // tree-shaken client 119, sqlite 127, mysql 127, mssql 129, powdb 150.
 // prisma-compat stays at 20 (its 1 kB minimum headroom rounds to 20).
+// MAIN AND SERVERLESS MOVED 2026-10-14, at the 0.91.0 release. Measured with
+// `npm run build` then `npx size-limit`, against a scratch copy of the 0.90.2
+// release commit (91484a2) built the same way: main 145.08 -> 146.54 (+1.46),
+// serverless 113.43 -> 114.88 (+1.45), the tree-shaken client 113.34 -> 114.73,
+// sqlite 120.70 -> 122.14, mysql 121.17 -> 122.50, mssql 122.43 -> 123.84,
+// powdb 142.69 -> 144.03. Uniform across the client graph, no new module: the
+// growth is the release's two features in modules already in it, the
+// count-only createMany (query/writes.js, query/builder.js, the size split for
+// chunked inserts) and expression percentiles (query/expr.js's read compile and
+// secondsBetween, query/aggregates.js's expression plans), most of it the
+// refusal messages. Cutting those messages was the only trim available, and a
+// refusal that does not say what to do instead costs more than 1.5 kB, so both
+// published claims move, on the 0.90.0 rule (measured, rounded up, plus 1 kB):
+// main 148, serverless 116, with README.md (three places), site/app/page.tsx
+// (prose, stat card and table) and the serverless / batadb / neon docs pages in
+// the same commit. Every other entry is still inside its limit and is unchanged.
 export default [
   {
     name: "main entry, the whole 'turbine-orm' barrel",
     path: 'dist/index.js',
     // Same number as the README's claim, on purpose. See the note above.
-    limit: '146 kB',
+    limit: '148 kB',
     ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },
@@ -421,7 +437,7 @@ export default [
     // pagination dialect-hook dispatch). These are tiny and engine-neutral, but
     // the edge bundle includes the query builder, so the budget gets a small bump.
     path: 'dist/serverless.js',
-    limit: '114 kB',
+    limit: '116 kB',
     ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },

@@ -328,7 +328,22 @@ src/
                       cell; `_count` / `_sum` / `_avg` keep theirs. `assertGroupByKeys` runs
                       before anything reads `by`: missing, a string, an empty array or a
                       `null` entry is E003 naming `by` (the empty case points at
-                      `aggregate()`).
+                      `aggregate()`). `_percentile` over an expression (0.91): a key that
+                      names no field takes `of` (`planExpressionPercentile`); a field key with
+                      `of` is E003. The caller's key never reaches the SQL: the alias is the
+                      first free `_percentile_of_<n>`, chosen after every column alias is known.
+                      Ordered as `::float8`, read back as a number. `PercentileKeysChecked`
+                      (types.ts) makes a non-field key without `of` a compile error on
+                      `aggregate`, `groupBy` and both `build*` methods. Each of the four is
+                      OVERLOADED: the checked signature first, then one taking
+                      `Omit<Args, '_percentile'> & FieldPercentiles<T>` for args of a
+                      generic type, where the check is a deferred conditional no `A` is
+                      assignable to (a single `A & PercentileKeysChecked<T, A>` signature
+                      broke every wrapper generic over its args). A misspelled literal key
+                      fails both. The expression alias also skips a name a groupBy key
+                      already holds (`resultKeyTaken`). `PercentileArgs` drops the `string`
+                      key from its field half by key remapping, never a conditional on `T`,
+                      so an untyped table takes `of` and a row-generic wrapper still compiles.
     writes.ts       - Mutation SQL builders: create / createMany / update /
                       delete / upsert / updateMany / deleteMany plus the write-projection
                       helpers (writeReturningColumns / writeReselectSelection / parseWriteRow,
@@ -356,11 +371,35 @@ src/
                       builder.ts, which also takes nested relation writes and compiles both
                       halves BEFORE the lookup so validity never depends on whether the row
                       exists. `planCreateMany` (0.90) is the one sizing authority for
-                      `createMany`: it validates every row once, then `rowsPerStatement`
+                      `createMany`: it validates every row once, then `statementSizes`
                       measures the per-row parameter cost from one-row and two-row builds
-                      and caps it by `maxBindParameters` and, for a plain INSERT,
-                      `capabilities.maxInsertRows`, so chunks are sized before any statement is
-                      built and no engine's own per-statement check refuses one. No per-row step
+                      and returns two sizes: `most` (capped by `maxBindParameters` and, for a
+                      plain INSERT, `capabilities.maxInsertRows`) and `chunk` (the same under
+                      `capabilities.chunkBindParameters`, 0.91), so chunks are sized before any
+                      statement is built and no engine's own per-statement check refuses one.
+                      A call splits at `chunk`, even one that fits a single statement, EXCEPT
+                      an onConflict call with no identity (rows cannot be told apart across
+                      statements) and a call on a pool with no `connect()` (`canSplit`, from
+                      builder.ts), which keep `most`. SQLite's `chunk` is 250 parameters: its
+                      named-parameter lookup is a linear search at prepare AND bind, so a
+                      32,766-parameter statement made 40,000 six-column rows take 141 s
+                      (1 s at 250).
+                      `returning: false` (0.91) is the `COUNT_ONLY` projection (an empty
+                      column list): no RETURNING / OUTPUT on a plain insert (MySQL's key
+                      re-read selects `1`), identity-only RETURNING for onConflict (so
+                      `assertEachRowWrittenOnce` still runs), and every transform answers
+                      `{ count }` (`countOf`: rowCount, else rows back); builder.ts sums it
+                      across chunks. `createManyProjection` (builder.ts) is the validator:
+                      a non-boolean, or `select` / `omit` beside `false`, is E003.
+                      `skipDuplicates` with `returning: false` is E017 where
+                      `capabilities.skipDuplicatesCountsSkipped` (MySQL only, measured: its
+                      skip is a no-op ON DUPLICATE KEY UPDATE, which under mysql2's default
+                      CLIENT_FOUND_ROWS counts a skipped row, and a one-row statement returns
+                      no `info` to subtract from), refused BEFORE the empty-data shortcut so
+                      validity never depends on the rows. `CreateManyArgs`' fifth type
+                      parameter `C` types `returning` and defaults to `true | undefined`, so
+                      args typed ahead of the call and generic wrappers still resolve to rows
+                      (a plain `returning?: boolean` made them a union in an early 0.91 cut). No per-row step
                       searches the column list (0.90.2): the generated-column check reads the column
                       list once per CALL (`generatedStoredColumns`), and the row-shape check
                       compares key sets without ordering them; both used to cost a column
@@ -625,6 +664,15 @@ src/
                       MySQL, so `expr.div` truncates toward zero everywhere, float target
                       included), and a result that can be non-integer is refused on an integer
                       column (E003). A bound value's class is in the fingerprint.
+                      READ expressions (0.91): `compileReadExpr` runs the same walk with
+                      `env.read` set and no target column, for `_percentile`'s `of`. Bound
+                      leaves must be numbers / bigints (cast `int8` or `numeric` by their own
+                      class), the result must be numeric, `col()` alone and `now` /
+                      `excluded` are refused, and `values` (operand columns, not case-arm
+                      `when` columns) feeds the PII check. `expr.secondsBetween(from, to)` is
+                      read-only: `EXTRACT(EPOCH FROM (to - from))` over two `tz` or two
+                      zone-less `timestamp` columns (PostgreSQL spelling, safe because only
+                      `supportsPercentileAggregates` engines reach it), E003 in update data.
 
     row-lock.ts    , The `lock` read option (0.90). `resolveRowLock` is the one place a lock
                       value is validated and rendered; the SQL and the `|lk=` cache-key
@@ -1120,16 +1168,17 @@ src/
                         (`begin/commit/rollback/savepoint/buildSetSessionConfig`).
                       • `capabilities: EngineCapabilities` (0.90), REQUIRED: what the engine
                         can do, one fresh frozen literal per engine
-                        (`Object.freeze({ ... } satisfies EngineCapabilities)`), 33 keys:
+                        (`Object.freeze({ ... } satisfies EngineCapabilities)`), 35 keys:
                         query shape (`distinctOn`, `positionalJson`, `nullsOrderingClause`,
                         `nullsSortHigh`, `insensitiveInList`), value semantics
                         (`jsonDocumentEquality`, `jsonExtractTyped`, `jsonExactNumericCast`,
                         `numericTextComparison`, `enforcesForeignKeys`,
                         `utcTimestampRewrite`, `paramTypeCasts`, `namedEnumTypes`,
                         `structuredValueColumns`), writes (`maxBindParameters`,
-                        `maxInsertRows`, `upsertConflictTarget`, `setClauseOrder`,
+                        `maxInsertRows`, `chunkBindParameters`, `upsertConflictTarget`, `setClauseOrder`,
                         `reselectLocksRows`, `integerDivision`, `updateExpressions`,
-                        `bulkUpsertAppliesRepeatedKeys`, `partitionLimitPushdown`),
+                        `bulkUpsertAppliesRepeatedKeys`, `skipDuplicatesCountsSkipped`,
+                        `partitionLimitPushdown`),
                         connections and transactions (`readOnlyTransactions`,
                         `connectionParameters`, `backendCancel`, `idleTransactionTimeout`,
                         `abortsTransactionOnError`, `connectionDriver`,
@@ -1144,8 +1193,10 @@ src/
                         value, and the spread cannot supply it because each literal is the
                         engine's own. `maxBindParameters(dialect)` reads
                         `capabilities.maxBindParameters` (`Infinity` is no limit), and
-                        writes.ts `rowsPerStatement` reads `capabilities.maxInsertRows` (SQL
-                        Server 1000; an `onConflict` MERGE is not bound by it).
+                        writes.ts `statementSizes` reads `capabilities.maxInsertRows` (SQL
+                        Server 1000; an `onConflict` MERGE is not bound by it) and
+                        `capabilities.chunkBindParameters` (SQLite 250, every other engine its
+                        `maxBindParameters`; a dialect without the key splits at its limit).
                         A dialect with no `capabilities` is refused with one E003 by
                         `assertDialectCapabilities` (dialect.ts), which every public entry
                         point that takes a dialect calls: `TurbineClient` (and so

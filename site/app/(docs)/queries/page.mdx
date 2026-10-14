@@ -561,11 +561,39 @@ A `json` / `jsonb` cell takes the same values as a single [JSON write](#writing-
 **Large batches.** One statement takes a limited number of bind parameters: 65,535 on PostgreSQL and MySQL, 32,766 on SQLite. A `createMany` whose rows need more is split into chunks that fit, all inside one transaction, so the rows land together or not at all. PostgreSQL's `UNNEST` form binds one array per column and never gets near the limit; a table with an array column inserts row by row with `VALUES`, which can, and is chunked the same way. Before 0.90 an oversized call threw `TURBINE_E003`.
 
 - **SQL Server** takes at most 1,000 rows and 2,098 parameters in one `INSERT`, so a plain `createMany` is chunked at whichever it reaches first, inside one transaction. A [`createMany` with `onConflict`](#multi-row-upsert-onconflict) is chunked at 2,098 parameters.
+- **SQLite** is chunked at 250 parameters, far below its limit, because SQLite looks up each named parameter by a linear search and a statement's cost grows with the square of its size: 40,000 six-column rows took over two minutes in statements of 32,766 parameters and take about a second in statements of 250. Two calls keep one statement as large as SQLite allows: an `onConflict` call whose written rows cannot be told apart across statements (its `update` assigns the key, or the only key is a PII column), and a call on a pool without `connect()`.
 - **`buildCreateMany`** (one statement, for [`pipeline`](#pipeline) or `$transaction([...])`) still refuses an oversized batch with `TURBINE_E003`, naming the limit and a chunk size.
 - **Inside a `$transaction` callback** the chunks run on that transaction, inside a savepoint of their own. A failed chunk rolls back every chunk before it, even when your callback catches the error and commits.
 - **A pool without `connect()`** (a stateless HTTP driver) cannot hold the transaction the chunks need, so an oversized call there throws `UnsupportedFeatureError` (`TURBINE_E017`) naming the alternative.
 
 `createMany` takes [`select` / `omit`](#returning-fewer-columns) like `create`, to narrow the rows it returns.
+
+### Counting instead of returning rows: `returning: false`
+
+`returning: false` resolves to `{ count }` instead of the rows. A plain insert then sends no `RETURNING` (no `OUTPUT` on SQL Server), so neither the server nor your process handles rows you would not read:
+
+```ts
+const { count } = await db.events.createMany({ data: batch, returning: false });
+```
+
+- With [`onConflict`](#multi-row-upsert-onconflict), the statement returns only the conflict-key columns, which keeps the case-insensitive duplicate check below, and `count` is the rows inserted or updated: an ignored conflict and an existing row that `where` excludes are not counted.
+- With `skipDuplicates`, `count` is the rows inserted. MySQL refuses this combination with `TURBINE_E017`: it counts a skipped row as written.
+- A chunked call adds up its chunks' counts.
+- The result type follows the flag: `{ count: number }` for `false`, rows for `true` or no flag. `select` or `omit` beside `returning: false`, or a `returning` that is not a boolean, throws `TURBINE_E003`.
+
+### Writing to several tables at once
+
+Turbine has no data-modifying CTE (`WITH a AS (INSERT ...) INSERT ...`). To write batches to several tables together, put one `buildCreateMany` per table in a [pipeline](#pipeline): the statements are sent together and run in one transaction, so every batch lands or none does.
+
+```ts
+const [orders, lines] = await db.pipeline(
+  db.orders.buildCreateMany({ data: orderRows, returning: false }),
+  db.orderLines.buildCreateMany({ data: lineRows, returning: false }),
+);
+// [{ count: 3 }, { count: 12 }]
+```
+
+The statements are built before any of them runs, so rows that reference each other need keys you supply (a UUID, or ids you read first): the second statement cannot see the ids the first one generates. Each `buildCreateMany` is one statement, so an oversized batch throws `TURBINE_E003` instead of being chunked.
 
 ### Multi-row upsert: `onConflict`
 
@@ -684,6 +712,7 @@ await db.posts.update({
 | `expr.case(arms, otherwise?)` | `CASE WHEN ... THEN ... ELSE ... END` | 1 to 16 arms of `{ when, then }`. `when` is a filter on the row's own columns, written like `where` (no relation filters). The first matching arm wins; without `otherwise` an unmatched row gets NULL |
 | `expr.now()` | The server's current time | Temporal columns only. Stored in the zone convention Turbine reads with, so a zone-less `timestamp` gets the UTC wall clock and a `date` column gets the UTC day, SQLite included. On PostgreSQL it is the transaction's start time |
 | `expr.excluded('field')` | The incoming row's value | Only in `upsert`'s `update` and `createMany`'s [`onConflict.update`](#multi-row-upsert-onconflict) |
+| `expr.secondsBetween(col('a'), col('b'))` | `EXTRACT(EPOCH FROM (b - a))` | The seconds from one timestamp column to another, fractional. Both `timestamptz`, or both zone-less `timestamp`. Only in a [percentile's `of`](#percentiles-of-an-expression-of) in this release; `TURBINE_E003` in update data |
 
 An operand is a JavaScript value, `col('field')` for the current row's column, or another expression, so expressions nest: `expr.add(col('a'), expr.mul(col('b'), 2))`. A client generated by 0.90 types expressions in its update inputs; regenerate an older one.
 
@@ -819,6 +848,30 @@ const stats = await db.requests.aggregate({
 Values read the way the column reads: a date column gives `Date`, an interval gives the driver's interval object, and `numeric` stays an exact string. Over zero rows the result is `null`, in both the scalar and the array form. On a PII-tagged column both methods need `includePii: UNSAFE`, as `_min` / `_max` do.
 
 PostgreSQL only: other engines throw `UnsupportedFeatureError` (`TURBINE_E017`). A JSON-path target throws `TURBINE_E003`, and so do ordering groups by `_percentile` and filtering them on it in `having` (not supported yet).
+
+#### Percentiles of an expression: `of`
+
+A key that names no field takes `of`, an [expression](#update-expressions-expr) over the row's columns, and the result comes back under that key:
+
+```ts
+import { col, expr } from 'turbine-orm';
+
+const stats = await db.jobs.aggregate({
+  where: { kind: 'render' },
+  _percentile: {
+    wait: { of: expr.secondsBetween(col('requestedAt'), col('readyAt')), p: [0.5, 0.95] },
+    costPerTry: { of: expr.div(col('cost'), expr.greatest(col('tries'), 1)), p: 0.9 },
+  },
+});
+// stats._percentile.wait: [median, p95], in seconds
+```
+
+- `of` takes `expr.add` / `sub` / `mul` / `div`, `coalesce`, `greatest`, `least`, `case`, and `expr.secondsBetween` for the seconds between two timestamp columns. Bound values are numbers or bigints.
+- The expression is ordered as double precision, so both methods return a `number`, or `null` over zero rows.
+- Arithmetic is typed by its operands, as in updates: `expr.div` between two integers truncates before the cast. For a fractional result, multiply by a fraction instead: `expr.mul(col('ms'), 0.001)`.
+- The key is only the result's name and never reaches the SQL. A key without `of` must be a field, which the types check, so a misspelled field is a compile error.
+- `TURBINE_E003` for a field key with `of`, `col('x')` alone (use the key `x`), a string, `Date` or boolean bound value, a result that is not numeric, `expr.now()` and `expr.excluded()`.
+- A PII-tagged column the expression reads as a value needs `includePii: UNSAFE`; a column that only an `expr.case` arm's `when` tests does not.
 
 ## groupBy
 
