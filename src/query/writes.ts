@@ -1028,7 +1028,8 @@ function prepareCreateMany<T extends object>(
   if (args.data.length === 0) {
     return {
       deferred: {
-        sql: `SELECT * FROM ${qt} WHERE false`,
+        // `1 = 0`, not `false`: T-SQL has no boolean literal in a condition.
+        sql: `SELECT * FROM ${qt} WHERE 1 = 0`,
         params: [],
         transform: () => (countOnly ? { count: 0 } : []) as unknown as T[],
         tag: `${qi.table}.createMany`,

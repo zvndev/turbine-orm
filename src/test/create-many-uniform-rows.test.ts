@@ -228,7 +228,7 @@ describe('uniform createMany is untouched', () => {
   });
 
   nodeIt('an empty data array is still the zero-row short circuit', () => {
-    assert.equal(q().buildCreateMany({ data: [] }).sql, 'SELECT * FROM "default_probe" WHERE false');
+    assert.equal(q().buildCreateMany({ data: [] }).sql, 'SELECT * FROM "default_probe" WHERE 1 = 0');
   });
 });
 

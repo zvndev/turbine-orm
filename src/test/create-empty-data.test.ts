@@ -185,7 +185,16 @@ describe('createMany({ data: [{}, …] }), emitted SQL per dialect', () => {
 
   nodeIt('an empty data array is still the zero-row short circuit', () => {
     const d = q(postgresDialect).buildCreateMany({ data: [] });
-    assert.equal(d.sql, 'SELECT * FROM "report_schedule" WHERE false');
+    assert.equal(d.sql, 'SELECT * FROM "report_schedule" WHERE 1 = 0');
+  });
+
+  nodeIt('the zero-row statement is valid on every engine, SQL Server included', () => {
+    // SQL Server rejects `WHERE false` ("An expression of non-boolean type
+    // specified in a context where a condition is expected").
+    for (const dialect of [postgresDialect, sqliteDialect, mysqlDialect, mssqlDialect]) {
+      const { sql } = q(dialect).buildCreateMany({ data: [] });
+      assert.match(sql, /WHERE 1 = 0$/, `${dialect.name}: ${sql}`);
+    }
   });
 });
 

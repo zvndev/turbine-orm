@@ -100,6 +100,9 @@ statements in one transaction, `createMany` through
   MySQL.** The adapter counted the rows `createMany` returned, and a plain
   MySQL insert returns none. It now asks for the count. With
   `skipDuplicates` it cannot (see Changed).
+- **`createMany({ data: [] })` threw on SQL Server.** The zero-row statement
+  was written `WHERE false`, which T-SQL rejects as a condition. It is
+  `WHERE 1 = 0` on every engine now.
 
 ### Changed
 

@@ -337,7 +337,7 @@ describe('refusals', () => {
     );
     assert.equal(
       q().buildCreateMany({ data: [], onConflict: { target: ['key'], update: ['hits'] } }).sql,
-      'SELECT * FROM "counters" WHERE false',
+      'SELECT * FROM "counters" WHERE 1 = 0',
     );
   });
 
