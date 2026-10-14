@@ -786,6 +786,7 @@ export const mysqlDialect: Dialect = {
     // Counted in a 16-bit field.
     maxBindParameters: 65535,
     maxInsertRows: Number.POSITIVE_INFINITY,
+    chunkBindParameters: 65535,
     upsertConflictTarget: 'any-unique-key',
     setClauseOrder: 'left-to-right',
     reselectLocksRows: true,
@@ -793,6 +794,8 @@ export const mysqlDialect: Dialect = {
     updateExpressions: true,
     // Caught by the onConflict re-read, which runs in the reselect transaction.
     bulkUpsertAppliesRepeatedKeys: true,
+    // A skipped row is a no-op ON DUPLICATE KEY UPDATE, counted under FOUND_ROWS.
+    skipDuplicatesCountsSkipped: true,
     readOnlyTransactions: true,
     connectionParameters: false,
     backendCancel: false,

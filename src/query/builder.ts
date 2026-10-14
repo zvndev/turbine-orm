@@ -110,9 +110,11 @@ import type {
   CountArgs,
   CreateArgs,
   CreateManyArgs,
+  CreateManyResult,
   DefaultInputTypes,
   DeleteArgs,
   DeleteManyArgs,
+  FieldPercentiles,
   FieldResult,
   FindManyArgs,
   FindManyStreamArgs,
@@ -125,6 +127,7 @@ import type {
   OrderByClause,
   OrderBySpec,
   OrderDirection,
+  PercentileKeysChecked,
   QueryResult,
   RelationLoadStrategy,
   RelationPickOrderBy,
@@ -3573,14 +3576,40 @@ export class QueryInterface<
   buildCreateMany<
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: CreateManyArgs<T, M['createMany'], S, O>): DeferredQuery<FieldResult<T, S, O>[]> {
+    C extends boolean | undefined = undefined,
+  >(args: CreateManyArgs<T, M['createMany'], S, O, C>): DeferredQuery<CreateManyResult<FieldResult<T, S, O>, C>> {
     args = this.normalizeArgs(args);
     return writesMod.buildCreateMany(
       this.ctx,
       args as unknown as CreateManyArgs<T>,
       'refuse',
-      this.resolveWriteProjection(args),
-    ) as unknown as DeferredQuery<FieldResult<T, S, O>[]>;
+      this.createManyProjection(args),
+    ) as unknown as DeferredQuery<CreateManyResult<FieldResult<T, S, O>, C>>;
+  }
+
+  /**
+   * `createMany`'s projection: the caller's `select` / `omit`, or
+   * {@link writesMod.COUNT_ONLY} for `returning: false`, which takes neither.
+   */
+  private createManyProjection(args: {
+    returning?: unknown;
+    select?: Record<string, boolean>;
+    omit?: Record<string, boolean>;
+  }): writesMod.WriteProjection | undefined {
+    const { returning } = args;
+    if (returning === undefined || returning === true) return this.resolveWriteProjection(args);
+    if (returning !== false) {
+      throw new ValidationError(
+        `createMany on "${this.table}": returning must be true or false, received ${typeof returning}.`,
+      );
+    }
+    if (args.select !== undefined || args.omit !== undefined) {
+      throw new ValidationError(
+        `createMany on "${this.table}": returning: false returns { count } and no rows, so it takes no ` +
+          `\`${args.select !== undefined ? 'select' : 'omit'}\`. Drop one of them.`,
+      );
+    }
+    return writesMod.COUNT_ONLY;
   }
 
   buildUpdate<
@@ -5267,17 +5296,23 @@ export class QueryInterface<
   async createMany<
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: CreateManyArgs<T, M['createMany'], S, O>): Promise<FieldResult<T, S, O>[]> {
+    C extends boolean | undefined = undefined,
+  >(args: CreateManyArgs<T, M['createMany'], S, O, C>): Promise<CreateManyResult<FieldResult<T, S, O>, C>> {
     args = this.normalizeArgs(args);
     return this.executeWithMiddleware('createMany', args as unknown as Record<string, unknown>, async () => {
-      const projection = this.resolveWriteProjection(args);
+      const projection = this.createManyProjection(args);
+      const countOnly = writesMod.isCountOnly(projection);
       const base = args as unknown as CreateManyArgs<T>;
       // One statement when the rows fit the engine's per-statement limits,
       // else chunks that do, all in one transaction so the rows land together
       // or not at all. (`buildCreateMany`, one statement for a pipeline,
       // refuses instead.)
-      const { chunks, rowsPerChunk } = writesMod.planCreateMany(this.ctx, base, projection);
-      const run = async (): Promise<FieldResult<T, S, O>[]> => {
+      // Splitting a call that fits one statement needs a transaction, which a
+      // pool without connect() cannot open outside one.
+      const canSplit = this.txScoped || typeof (this.pool as { connect?: unknown }).connect === 'function';
+      const { chunks, rowsPerChunk } = writesMod.planCreateMany(this.ctx, base, projection, canSplit);
+      type Result = CreateManyResult<FieldResult<T, S, O>, C>;
+      const run = async (): Promise<Result> => {
         // An engine that applies two rows whose onConflict keys are equal only
         // under the column's collation (SQLite's NOCASE) as an insert and an
         // update of one row, in one statement, is caught by the transform (the
@@ -5288,20 +5323,23 @@ export class QueryInterface<
           this.dialect.capabilities.bulkUpsertAppliesRepeatedKeys &&
           this.dialect.resultStrategy !== 'reselect';
         if (chunks.length === 1 && !appliesRepeatedKeys) {
-          return this.executeMutation(chunks[0]!, args.timeout) as Promise<FieldResult<T, S, O>[]>;
+          return this.executeMutation(chunks[0]!, args.timeout) as Promise<Result>;
         }
         const reselects = this.dialect.resultStrategy === 'reselect';
         return this.inOneTransaction(
           async (exec) => {
             const rows: FieldResult<T, S, O>[] = [];
+            let count = 0;
             for (const chunk of chunks) {
               const result =
                 reselects && chunk.reselect
                   ? await chunk.reselect(exec)
                   : await exec(chunk.sql, chunk.params, chunk.preparedName);
-              rows.push(...(chunk.transform(result) as unknown as FieldResult<T, S, O>[]));
+              const out = chunk.transform(result) as unknown;
+              if (countOnly) count += (out as { count: number }).count;
+              else rows.push(...(out as FieldResult<T, S, O>[]));
             }
-            return rows;
+            return (countOnly ? { count } : rows) as Result;
           },
           args.timeout,
           `createMany of ${base.data.length} rows`,
@@ -5664,10 +5702,15 @@ export class QueryInterface<
    * {@link GroupByResult}). Grouping by a JSON-path key yields a runtime alias
    * that cannot be typed, so those columns are not projected onto the row type.
    */
+  groupBy<A extends GroupByArgs<T, R>>(args: A & PercentileKeysChecked<T, A>): Promise<GroupByResult<T, A>[]>;
+  /** Args of a generic type: field percentiles only (see {@link FieldPercentiles}). */
+  groupBy<A extends Omit<GroupByArgs<T, R>, '_percentile'> & FieldPercentiles<T>>(
+    args: A,
+  ): Promise<GroupByResult<T, A>[]>;
   async groupBy<A extends GroupByArgs<T, R>>(args: A): Promise<GroupByResult<T, A>[]> {
     args = this.normalizeArgs(args);
     return this.executeWithMiddleware('groupBy', args as unknown as Record<string, unknown>, async () => {
-      const deferred = this.buildGroupBy(args);
+      const deferred = this.buildGroupBy(args as A & PercentileKeysChecked<T, A>);
       const result = await this.readWithTimeout(
         deferred.sql,
         deferred.params,
@@ -5682,6 +5725,13 @@ export class QueryInterface<
   // Aggregate / groupBy compilation (extracted to aggregates.ts).
   // ---------------------------------------------------------------------------
 
+  buildGroupBy<A extends GroupByArgs<T, R>>(
+    args: A & PercentileKeysChecked<T, A>,
+  ): DeferredQuery<GroupByResult<T, A>[]>;
+  /** Args of a generic type: field percentiles only (see {@link FieldPercentiles}). */
+  buildGroupBy<A extends Omit<GroupByArgs<T, R>, '_percentile'> & FieldPercentiles<T>>(
+    args: A,
+  ): DeferredQuery<GroupByResult<T, A>[]>;
   buildGroupBy<A extends GroupByArgs<T, R>>(args: A): DeferredQuery<GroupByResult<T, A>[]> {
     const normalized = this.normalizeArgs(args);
     return this.withPreparedName(() => aggMod.buildGroupBy(this.ctx, normalized)) as unknown as DeferredQuery<
@@ -5689,6 +5739,13 @@ export class QueryInterface<
     >;
   }
 
+  buildAggregate<A extends AggregateArgs<T, R>>(
+    args: A & PercentileKeysChecked<T, A>,
+  ): DeferredQuery<AggregateResultOf<T, A>>;
+  /** Args of a generic type: field percentiles only (see {@link FieldPercentiles}). */
+  buildAggregate<A extends Omit<AggregateArgs<T, R>, '_percentile'> & FieldPercentiles<T>>(
+    args: A,
+  ): DeferredQuery<AggregateResultOf<T, A>>;
   buildAggregate<A extends AggregateArgs<T, R>>(args: A): DeferredQuery<AggregateResultOf<T, A>> {
     const normalized = this.normalizeArgs(args);
     return this.withPreparedName(() => aggMod.buildAggregate(this.ctx, normalized)) as unknown as DeferredQuery<
@@ -5700,10 +5757,15 @@ export class QueryInterface<
   // aggregate, standalone aggregation without groupBy
   // -------------------------------------------------------------------------
 
+  aggregate<A extends AggregateArgs<T, R>>(args: A & PercentileKeysChecked<T, A>): Promise<AggregateResultOf<T, A>>;
+  /** Args of a generic type: field percentiles only (see {@link FieldPercentiles}). */
+  aggregate<A extends Omit<AggregateArgs<T, R>, '_percentile'> & FieldPercentiles<T>>(
+    args: A,
+  ): Promise<AggregateResultOf<T, A>>;
   async aggregate<A extends AggregateArgs<T, R>>(args: A): Promise<AggregateResultOf<T, A>> {
     args = this.normalizeArgs(args);
     return this.executeWithMiddleware('aggregate', args as unknown as Record<string, unknown>, async () => {
-      const deferred = this.buildAggregate(args);
+      const deferred = this.buildAggregate(args as A & PercentileKeysChecked<T, A>);
       const result = await this.readWithTimeout(
         deferred.sql,
         deferred.params,

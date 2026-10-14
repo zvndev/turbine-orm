@@ -50,6 +50,7 @@ const EXPR_KINDS: ReadonlySet<string> = new Set<SqlExprKind>([
   'case',
   'now',
   'excluded',
+  'secondsBetween',
 ]);
 
 /** Operand count bounds for coalesce / greatest / least. */
@@ -227,6 +228,24 @@ function caseNode<V>(arms: unknown, otherwise: unknown): CaseExpr<V> {
   return makeNode<V>('case', frozen, otherwise === undefined ? undefined : { else: otherwise }) as CaseExpr<V>;
 }
 
+function secondsBetweenNode(from: unknown, to: unknown): SqlExpr<number> {
+  [from, to].forEach((operand, i) => {
+    if (isColumnRef(operand)) return;
+    const at = `expr.secondsBetween(): operand ${i + 1}`;
+    if (isPlainColumnRefShape(operand)) {
+      const name = JSON.stringify((operand as { col: string }).col);
+      throw new ValidationError(
+        `${at} is a plain { col: ${name} } object, not a column reference. Build one with col(${name}).`,
+      );
+    }
+    throw new ValidationError(
+      `${at} is ${operand === undefined ? 'undefined' : describeOperand(operand)}. Both operands are col() of a ` +
+        'timestamp column of the row.',
+    );
+  });
+  return makeNode<number>('secondsBetween', [from, to]);
+}
+
 /**
  * Builders for SQL expressions in update data. Each returns a frozen, branded
  * node; the SQL is generated per engine when the update compiles.
@@ -311,6 +330,21 @@ export const expr = Object.freeze({
     Object.defineProperty(node, SQL_EXPR, { value: true, enumerable: false });
     Object.defineProperty(node, EXCLUDED_REF, { value: true, enumerable: false });
     return Object.freeze(node) as unknown as ExcludedRef<F>;
+  },
+  /**
+   * The seconds from `from` to `to`, two timestamp columns of the row:
+   * `to - from`, fractional, negative when `to` is earlier, NULL when either is.
+   * Both columns must be timestamptz, or both zone-less timestamp. Accepted in
+   * `_percentile`'s `of` (PostgreSQL); refused in update data in this release.
+   *
+   * ```ts
+   * await db.jobs.aggregate({
+   *   _percentile: { wait: { of: expr.secondsBetween(col('requestedAt'), col('readyAt')), p: [0.5, 0.95] } },
+   * });
+   * ```
+   */
+  secondsBetween(from: ColumnRef, to: ColumnRef): SqlExpr<number> {
+    return secondsBetweenNode(from, to);
   },
 });
 
@@ -556,6 +590,12 @@ export interface ExprCompileEnv {
   readonly insertColumns?: ReadonlySet<string> | undefined;
   /** Compile a `case` arm's predicate (already pruned and validated) against the target row. */
   predicate(when: Record<string, unknown>): string;
+  /**
+   * The expression is READ by a query (`_percentile`'s `of`), not assigned:
+   * there is no target column, `targetKey` is the result's name, and
+   * `expr.secondsBetween` is accepted while `expr.now` is not.
+   */
+  readonly read?: true | undefined;
 }
 
 /** One compiled expression. */
@@ -581,6 +621,15 @@ interface WalkState {
   readonly env: ExprCompileEnv;
   readonly targetType: string | undefined;
   readonly reads: Set<string>;
+  /** Columns read as a VALUE of the expression (not only by a case arm's when). */
+  readonly values: Set<string>;
+}
+
+/** Where an expression sits, for messages. */
+function site(env: ExprCompileEnv): string {
+  return env.read
+    ? `${env.operation} "${env.targetKey}" on "${env.qi.table}"`
+    : `${env.operation} data on "${env.qi.table}.${env.targetKey}"`;
 }
 
 /**
@@ -603,7 +652,7 @@ export function compileSetExpr(env: ExprCompileEnv, value: SqlExpr | ColumnRef):
   const { qi } = env;
   assertEngine(qi);
   const column = assertExprTarget(qi, env.targetKey, value, env.operation);
-  const state: WalkState = { env, targetType: columnType(qi, column), reads: new Set() };
+  const state: WalkState = { env, targetType: columnType(qi, column), reads: new Set(), values: new Set() };
   const part = walkOperand(state, value, false, 0);
   if (part.cls === 'dec' && numClassOfType(state.targetType) === 'int') {
     const what = isColumnRef(value) ? `col(${JSON.stringify(value.col)})` : `expr.${(value as SqlExpr).kind}()`;
@@ -616,6 +665,80 @@ export function compileSetExpr(env: ExprCompileEnv, value: SqlExpr | ColumnRef):
     );
   }
   return { sql: part.sql, fingerprint: part.fp, reads: state.reads };
+}
+
+/** What {@link compileReadExpr} needs from its caller (the aggregate module). */
+export interface ReadExprEnv {
+  readonly qi: BuilderCtx;
+  /** The result's name, for messages. */
+  readonly name: string;
+  /** For messages: `aggregate _percentile`, `groupBy _percentile`. */
+  readonly operation: string;
+  /** Bind one number, bigint or null and return its placeholder, cast to its class's type. */
+  bind(value: number | bigint | null, cls: 'int' | 'dec'): string;
+  /** Compile a `case` arm's predicate (already pruned and validated) against the row. */
+  predicate(when: Record<string, unknown>): string;
+}
+
+/** One compiled read expression. */
+export interface CompiledReadExpr {
+  readonly sql: string;
+  /** Value-free shape, as {@link CompiledSetExpr.fingerprint}. */
+  readonly fingerprint: string;
+  /** Columns the expression reads as a value (columns only a case arm's `when` reads are not). */
+  readonly values: ReadonlySet<string>;
+}
+
+/**
+ * Compile a numeric expression a query READS (`_percentile`'s `of`): the walk
+ * {@link compileSetExpr} runs, with no target column. Bound values must be
+ * numbers or bigints and are cast by their own class, the result must be
+ * numeric, and `col()` alone is refused because a field key already says it.
+ * Not gated on `updateExpressions`: the caller's own engine check applies.
+ */
+export function compileReadExpr(read: ReadExprEnv, value: unknown): CompiledReadExpr {
+  const { qi, name, operation } = read;
+  const at = `${operation} "${name}" on "${qi.table}"`;
+  if (isColumnRef(value)) {
+    throw new ValidationError(
+      `${at}: \`of\` is col(${JSON.stringify(value.col)}) alone. Use the field as the key instead: ` +
+        `{ ${JSON.stringify(value.col)}: { p } }.`,
+    );
+  }
+  if (!isSqlExpr(value)) {
+    throw new ValidationError(
+      `${at}: \`of\` is ${value === undefined ? 'undefined' : describeOperand(value)}. Build it with expr ` +
+        "(import { col, expr } from 'turbine-orm'); a plain object is never an expression.",
+    );
+  }
+  const env: ExprCompileEnv = {
+    qi,
+    targetKey: name,
+    operation,
+    read: true,
+    bind: (leaf, arithmetic) => {
+      if (leaf !== null && typeof leaf !== 'number' && typeof leaf !== 'bigint') {
+        throw new ValidationError(
+          `${at}: a bound value is ${leaf instanceof Date ? 'a Date' : leaf instanceof Uint8Array ? 'a Uint8Array' : `a ${typeof leaf}`}. ` +
+            'An expression a query reads binds numbers and bigints only.',
+        );
+      }
+      const integer =
+        (arithmetic ?? numClassOfValue(leaf)) !== 'dec' && (typeof leaf !== 'number' || Number.isSafeInteger(leaf));
+      return read.bind(leaf as number | bigint | null, integer ? 'int' : 'dec');
+    },
+    column: (column) => qi.q(column),
+    predicate: (when) => read.predicate(when),
+  };
+  const state: WalkState = { env, targetType: undefined, reads: new Set(), values: new Set() };
+  const part = walkOperand(state, value, false, 0);
+  if (part.cls === 'other' || part.cls === 'null') {
+    throw new ValidationError(
+      `${at}: \`of\` is ${part.cls === 'null' ? 'NULL for every row' : 'not numeric (it reads a non-numeric column)'}. ` +
+        'A percentile orders numbers: numeric columns, bound numbers, and expr.secondsBetween() of two timestamps.',
+    );
+  }
+  return { sql: part.sql, fingerprint: part.fp, values: state.values };
 }
 
 function assertEngine(qi: BuilderCtx): void {
@@ -634,6 +757,7 @@ function walkOperand(state: WalkState, value: unknown, inArithmetic: boolean, de
   if (isColumnRef(value)) {
     const column = resolveOperandColumn(state, value.col, 'col', inArithmetic);
     state.reads.add(column);
+    state.values.add(column);
     return { sql: state.env.column(column), fp: `c:${column}`, cls: numClassOfType(columnType(state.env.qi, column)) };
   }
   if (isSqlExpr(value)) return walkNode(state, value, inArithmetic, depth);
@@ -647,7 +771,7 @@ function walkOperand(state: WalkState, value: unknown, inArithmetic: boolean, de
     (typeof value === 'string' || typeof value === 'boolean' || value instanceof Date || value instanceof Uint8Array)
   ) {
     throw new ValidationError(
-      `An arithmetic operand in ${state.env.operation} data on "${state.env.qi.table}.${state.env.targetKey}" is a ` +
+      `An arithmetic operand in ${site(state.env)} is a ` +
         `${value instanceof Date ? 'Date' : value instanceof Uint8Array ? 'Uint8Array' : typeof value}. ` +
         'Arithmetic takes numbers, bigints, col() of a numeric column, or numeric expressions.',
     );
@@ -667,7 +791,7 @@ function resolveOperandColumn(state: WalkState, field: string, how: 'col' | 'exc
   const column = resolveColumnName(qi.tableMeta, field);
   if (column === undefined) {
     throw new ValidationError(
-      `${call} in ${state.env.operation} data on "${qi.table}" names no column. ` +
+      `${call} in ${site(state.env)} names no column. ` +
         `Known fields: ${Object.keys(qi.tableMeta.columnMap).join(', ') || '(none)'}.`,
     );
   }
@@ -739,6 +863,11 @@ function walkNode(state: WalkState, node: SqlExpr, inArithmetic: boolean, depth:
     case 'case':
       return walkCase(state, node as CaseExpr, inArithmetic, depth);
     case 'now': {
+      if (env.read) {
+        throw new ValidationError(
+          `expr.now() in ${site(env)}: an expression a query reads takes the row's columns and bound numbers only.`,
+        );
+      }
       if (inArithmetic) {
         throw new ValidationError('expr.now() cannot be an arithmetic operand: date arithmetic is not supported.');
       }
@@ -767,6 +896,8 @@ function walkNode(state: WalkState, node: SqlExpr, inArithmetic: boolean, depth:
       }
       return { sql: env.excluded(column), fp: `x:${column}`, cls: numClassOfType(columnType(qi, column)) };
     }
+    case 'secondsBetween':
+      return walkSecondsBetween(state, node);
     default:
       throw new ValidationError(`Unknown expression kind "${String(node.kind)}".`);
   }
@@ -796,6 +927,54 @@ function walkCase(state: WalkState, node: CaseExpr, inArithmetic: boolean, depth
     sql: `CASE ${sqlParts.join(' ')}${otherwise ? ` ELSE ${otherwise.sql}` : ''} END`,
     fp: `case(${fpParts.join(';')}|e:${otherwise ? otherwise.fp : '-'})`,
     cls: combineClasses(classes),
+  };
+}
+
+/**
+ * `expr.secondsBetween(from, to)`: `EXTRACT(EPOCH FROM (to - from))`, the
+ * PostgreSQL spelling. It is read only by `_percentile`, which only an engine
+ * with `supportsPercentileAggregates` runs, and that SQL (`percentile_cont ...
+ * WITHIN GROUP`) is PostgreSQL's too. Both columns must have one temporal
+ * kind: subtracting a timestamptz from a zone-less timestamp converts through
+ * the session time zone.
+ */
+function walkSecondsBetween(state: WalkState, node: SqlExpr): Part {
+  const { env } = state;
+  const { qi } = env;
+  if (!env.read) {
+    throw new ValidationError(
+      `expr.secondsBetween() in ${site(env)}: it is accepted in _percentile's \`of\` in this release, not in ` +
+        'update data. Compute the value in JavaScript and write it as a plain value.',
+    );
+  }
+  const kinds: TemporalKind[] = [];
+  const columns = node.args.map((arg) => {
+    const field = (arg as ColumnRef).col;
+    const column = resolveOperandColumn(state, field, 'col', false);
+    const type = columnType(qi, column);
+    const kind = temporalKind(type);
+    if (kind !== 'tz' && kind !== 'timestamp') {
+      throw new ValidationError(
+        `expr.secondsBetween() in ${site(env)}: col(${JSON.stringify(field)}) is ${type === undefined ? 'a column of unknown type' : `a ${type} column`}. ` +
+          'Both operands must be timestamp (or both timestamptz) columns.',
+      );
+    }
+    kinds.push(kind);
+    state.reads.add(column);
+    state.values.add(column);
+    return column;
+  });
+  if (kinds[0] !== kinds[1]) {
+    throw new ValidationError(
+      `expr.secondsBetween() in ${site(env)} mixes a timestamptz column with a zone-less timestamp column, ` +
+        'whose difference depends on the session time zone. Use two columns of one kind.',
+    );
+  }
+  const [from, to] = columns as [string, string];
+  return {
+    sql: `EXTRACT(EPOCH FROM (${env.column(to)} - ${env.column(from)}))`,
+    fp: `secs(${from},${to})`,
+    cls: 'dec',
   };
 }
 

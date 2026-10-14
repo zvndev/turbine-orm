@@ -606,12 +606,13 @@ describe('prisma-compat, aggregate / groupBy', () => {
 describe('prisma-compat, writes', () => {
   it('createMany maps skipDuplicates onto the core option and returns { count }', async () => {
     const { schema, map } = fixture();
-    const { db, calls } = spyDb(schema, { 'users.createMany': [{ id: 1 }, { id: 2 }] });
+    const { db, calls } = spyDb(schema, { 'users.createMany': { count: 2 } });
     const compat = mkCompat(db, map);
     const res = await compat.User.createMany({ data: [{ email: 'a' }, { email: 'b' }], skipDuplicates: true });
     assert.deepEqual(res, { count: 2 });
     const call = calls.find((c) => c.method === 'createMany')!;
     assert.equal(call.args.skipDuplicates, true);
+    assert.equal(call.args.returning, false, 'the count comes from the engine, not from rows read back');
     assert.deepEqual(call.args.data, [{ emailAddress: 'a' }, { emailAddress: 'b' }], 'row fields renamed');
   });
 

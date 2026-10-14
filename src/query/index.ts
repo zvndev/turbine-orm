@@ -20,6 +20,8 @@ export type {
   CreateArgs,
   CreateDataInput,
   CreateManyArgs,
+  CreateManyCount,
+  CreateManyResult,
   DeleteArgs,
   DeleteManyArgs,
   FieldResult,
