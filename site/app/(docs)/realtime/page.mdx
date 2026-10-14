@@ -7,9 +7,9 @@ export const metadata = {
 
 # Realtime (LISTEN / NOTIFY)
 
-Push events between processes through Postgres itself, no message broker, no extra service. Turbine wraps Postgres `LISTEN` / `NOTIFY` in two methods: `$listen` subscribes to a channel and `$notify` publishes to it.
+Send events between processes through Postgres, with no message broker or extra service. Turbine wraps Postgres `LISTEN` / `NOTIFY` in two methods: `$listen` subscribes to a channel and `$notify` publishes to it.
 
-Use it for cache invalidation, live dashboards, and worker fan-out when you already have a Postgres connection and don't want to stand up Redis or a queue.
+Use it for cache invalidation, live dashboards and worker fan-out when you already have Postgres and do not want to run Redis or a queue.
 
 ## Subscribe with $listen
 
@@ -21,7 +21,7 @@ const sub = await db.$listen('order_created', (payload) => {
 });
 ```
 
-`$listen` checks out a dedicated pooled connection and runs `LISTEN "order_created"` on it, holding that connection open for the lifetime of the subscription. The returned subscription exposes the resolved `channel` and an `unsubscribe()` method.
+`$listen` checks out a dedicated pooled connection, runs `LISTEN "order_created"` on it, and holds that connection for the life of the subscription. The returned subscription exposes the resolved `channel` and an `unsubscribe()` method.
 
 ## Publish with $notify
 
@@ -29,17 +29,17 @@ const sub = await db.$listen('order_created', (payload) => {
 await db.$notify('order_created', JSON.stringify({ id: 1 }));
 ```
 
-`$notify` is a single round-trip, it runs `SELECT pg_notify($1, $2)` with the channel and payload both bound as parameters. The payload is optional and defaults to an empty string:
+`$notify` is a single round-trip: it runs `SELECT pg_notify($1, $2)` with the channel and payload bound as parameters. The payload is optional and defaults to an empty string:
 
 ```ts
 await db.$notify('cache_invalidated'); // payload defaults to ''
 ```
 
-Because the payload is a single string, serialize structured data yourself (`JSON.stringify`) on the way out and parse it in the handler.
+The payload is a string, so serialize structured data with `JSON.stringify` and parse it in the handler.
 
 ## Unsubscribe
 
-When you're done, call `unsubscribe()`. It runs `UNLISTEN` and releases the dedicated connection back to the pool.
+Call `unsubscribe()` when you are done. It runs `UNLISTEN` and returns the dedicated connection to the pool.
 
 ```ts
 const sub = await db.$listen('order_created', (payload) => {
@@ -51,11 +51,11 @@ await sub.unsubscribe();
 // subsequent $notify calls no longer fire the handler
 ```
 
-All live subscriptions are also force-released when you call `db.disconnect()`, so you won't leak connections on shutdown.
+`db.disconnect()` also releases every live subscription, so shutdown does not leak connections.
 
 ## Lost connections
 
-A subscription holds one connection for its whole life, so a database restart, failover or compute suspend will eventually close it. Since 0.80 `$listen` reopens the connection with exponential backoff and runs `LISTEN` again, 100 ms at first and doubling to at most 30 s.
+A subscription holds one connection for its whole life, so a database restart, failover or compute suspend will eventually close it. `$listen` then reopens the connection with exponential backoff and runs `LISTEN` again. The first retry waits 100 ms, and the delay doubles up to 30 s.
 
 ```ts
 const sub = await db.$listen('order_created', onOrder, {
@@ -66,15 +66,15 @@ const sub = await db.$listen('order_created', onOrder, {
 
 | Option | Default | Meaning |
 |---|---|---|
-| `reconnect` | `true` | `false` ends the subscription at the first loss. An object `{ initialDelayMs, maxDelayMs }` tunes the backoff |
-| `onError` | one line on stderr | Called with each loss and each failed reconnect attempt |
-| `onReconnect` | none | Called once the subscription is live again |
+| `reconnect` | `true` | `false` ends the subscription at the first loss. An object `{ initialDelayMs, maxDelayMs }` tunes the backoff. |
+| `onError` | one line through the client's `logger` | Called with each loss and each failed reconnect attempt. |
+| `onReconnect` | none | Called once the subscription is live again. |
 
-`NOTIFY` is not durable. A notification sent while the subscription is reconnecting is never delivered, so treat `onReconnect` as the signal to re-read whatever state the channel tracks. `unsubscribe()` and `db.disconnect()` cancel a pending reconnect.
+`NOTIFY` is not durable. A notification sent while the subscription is reconnecting is never delivered, so use `onReconnect` as the signal to re-read whatever state the channel tracks. `unsubscribe()` and `db.disconnect()` cancel a pending reconnect.
 
 ## Channel names
 
-Channel names are validated as plain identifiers and quoted before use, they're the one interpolated token in the generated SQL, so the validation is strict. Names with spaces, leading digits, dots, or other special characters throw `ValidationError` *before* any connection is touched.
+The channel name is the one identifier interpolated into the generated SQL, so Turbine validates it strictly as a plain identifier and quotes it. A name with spaces, a leading digit, dots or other special characters throws `ValidationError` *before* any connection is used.
 
 ```ts
 await db.$notify('order created');  // throws ValidationError, space
@@ -84,12 +84,12 @@ await db.$notify('app.events');     // throws ValidationError, no dotted namespa
 
 ## Not available on serverless HTTP drivers
 
-`$listen` needs a persistent connection to hold the subscription open, which HTTP / serverless drivers (Neon HTTP, Vercel Postgres, Cloudflare Hyperdrive) don't provide. On those pools it throws a clear error rather than hanging. `$notify` is a single round-trip and works everywhere.
+`$listen` needs a persistent connection to hold the subscription, which HTTP and serverless drivers (Neon HTTP, Vercel Postgres, Cloudflare Hyperdrive) do not provide. When the pool hands back a client with no event support, as a stateless HTTP driver does, `$listen` throws `ConnectionError` instead of hanging. `$notify` is a single round-trip and works everywhere.
 
-If you need realtime on the edge, run `$listen` from a long-lived process (a worker, a server) on a real `pg` pool, and `$notify` from anywhere.
+For realtime on the edge, run `$listen` in a long-lived process (a worker or server) on a real `pg` pool, and call `$notify` from anywhere.
 
 ## See also
 
-- **[Serverless & Edge](/serverless)**, which APIs work on HTTP drivers.
-- **[Transactions & Pipelines](/transactions)**, connection lifecycle and pooling.
-- **[Typed Errors](/errors)**, `ValidationError` (E003) and the full code table.
+- **[Serverless & Edge](/serverless)**: which APIs work on HTTP drivers.
+- **[Transactions & Pipelines](/transactions)**: connection lifecycle and pooling.
+- **[Typed Errors](/errors)**: `ValidationError` (E003) and the full code table.

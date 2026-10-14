@@ -7,13 +7,13 @@ export const metadata = {
 
 # Nested Writes
 
-A nested write resolves relation fields in your `data` argument into the right INSERTs, UPDATEs, and DELETEs, so you can build or mutate a whole object graph in one `create()` or `update()` call instead of orchestrating the statements by hand.
+A nested write turns relation fields in your `data` argument into the right INSERTs, UPDATEs and DELETEs, so one `create()` or `update()` call can build or change a whole object graph.
 
-The whole tree is written inside **one transaction** (all-or-nothing) and walked **depth-first, capped at depth 10**; past that Turbine throws `CircularRelationError` ([E007](/errors)). After the write completes, Turbine reads the row back with the touched relations populated, so the return value is the full tree.
+The whole tree is written in **one transaction**, so it all commits or none of it does. Turbine walks it depth-first, up to depth 10; deeper trees throw `CircularRelationError` ([E007](/errors)). After the write, Turbine reads the row back with the touched relations loaded, so the return value is the full tree.
 
 ## When it triggers
 
-A key in `data` is treated as a nested write when it matches a relation name and its value is a plain object (not `null`, not an array, not a `Date`). Everything else is a scalar column. There is no flag to set.
+A key in `data` is a nested write when it names a relation and its value is a plain object (not `null`, not an array, not a `Date`). Every other key is a scalar column. There is no flag to set.
 
 The examples below assume this shape:
 
@@ -35,15 +35,15 @@ The examples below assume this shape:
 | `update` | update only | belongsTo / hasOne / hasMany | Update the related row(s) (`where` is optional for belongsTo) |
 | `upsert` | update only | belongsTo / hasOne / hasMany | Update the row matching `where`, else create it |
 
-`create`, `connect`, and `connectOrCreate` are valid in both `create()` and `update()`. The other five are **update-only**: using them inside `create()` throws `ValidationError` ([E003](/errors)). An unknown operation name throws too.
+`create`, `connect` and `connectOrCreate` work in both `create()` and `update()`. The other five are **update-only**: using one inside `create()` throws `ValidationError` ([E003](/errors)), and so does an unknown operation name.
 
-Many-to-many relations support `connect`, `disconnect`, and `set` only; the full rules are in [Many-to-many relations](#many-to-many-relations) below. A `belongsTo` relation is a single row, so it takes no `set` and at most one pointer operation per write; see [belongsTo is one row](#belongsto-is-one-row).
+Many-to-many relations support `connect`, `disconnect` and `set` only; see [Many-to-many relations](#many-to-many-relations). A `belongsTo` relation is a single row, so it takes no `set` and at most one pointer operation per write; see [belongsTo is one row](#belongsto-is-one-row).
 
 ## Create context
 
 ### create, insert and link
 
-`create` accepts a single object or an array. For a `hasMany`/`hasOne` relation the parent is inserted first, then the children inherit the parent's primary key as their foreign key.
+`create` takes a single object or an array. For a `hasMany` or `hasOne` relation, Turbine inserts the parent first, then writes the parent's key into each child's foreign key.
 
 ```ts
 const user = await db.users.create({
@@ -59,7 +59,7 @@ const user = await db.users.create({
 // user.posts is populated, the tree is read back after the write
 ```
 
-For a `hasOne` relation the shape is the same, just a single object:
+A `hasOne` relation takes a single object:
 
 ```ts
 await db.users.create({
@@ -74,7 +74,7 @@ await db.users.create({
 
 ### belongsTo create, link the parent
 
-For a `belongsTo` relation the foreign key lives on the row you're creating, so Turbine resolves the related row **before** the parent INSERT and folds its key in. A `NOT NULL` FK column is therefore satisfied on the first insert.
+For a `belongsTo` relation, the foreign key lives on the row you are creating. Turbine writes or finds the related row **before** the parent INSERT and folds its key in, so a `NOT NULL` foreign key is satisfied on the first insert.
 
 ```ts
 await db.users.create({
@@ -89,7 +89,7 @@ await db.users.create({
 
 ### connect, link existing rows
 
-`connect` takes a `where` (one object or an array) that must match existing rows. If a target doesn't exist, Turbine throws `ValidationError`.
+`connect` takes a `where`, or an array of them, naming existing rows. A target that does not exist throws `ValidationError`.
 
 ```ts
 await db.users.create({
@@ -107,11 +107,11 @@ await db.users.create({
 
 ### Connecting a row someone else owns, `scopedConnect`
 
-`connect: { id: 42 }` on a to-many relation means "make row 42 mine", and by default it does exactly that: if another parent currently owns row 42, the row is **taken from them**. That is the intended behavior for an admin tool moving records around. It is also a cross-tenant write primitive in any handler that forwards a client-supplied id into a nested connect.
+`connect: { id: 42 }` on a to-many relation means "make row 42 mine". By default it does exactly that: if another parent owns row 42, the row is **taken from them**. An admin tool that moves records around wants this. Any handler that forwards a client-supplied id into a nested connect becomes a cross-tenant write.
 
 #### The shape that is exposed
 
-This handler has an authorization check, and the check is on the wrong row:
+This handler checks authorization, but on the wrong row:
 
 ```ts
 // POST /api/collections/:id/items   { itemIds: [42] }
@@ -127,11 +127,11 @@ app.post('/api/collections/:id/items', async (req, res) => {
 });
 ```
 
-The caller owns the collection, so the check passes. Nothing checks who owns item 42. The `connect` rewrites `items.collection_id`, so an attacker who can guess or enumerate ids moves another tenant's rows into their own collection, reads them back through their own authorized endpoints, and the victim's rows disappear from the victim's list. No error, no log line, one statement.
+The caller owns the collection, so the check passes. Nothing checks who owns item 42. The `connect` rewrites `items.collection_id`, so an attacker who can guess or enumerate ids moves another tenant's rows into their own collection and reads them through their own authorized endpoints. The rows vanish from the victim's list. Nothing errors and nothing is logged.
 
-`connectOrCreate` is the same primitive: when the lookup finds an existing row, it connects it.
+`connectOrCreate` behaves the same way: when the lookup finds an existing row, it connects it.
 
-The complete fix is to authorize the child rows too (`where: { id: { in: itemIds }, ownerId: req.user.id }` before connecting). `scopedConnect` is the backstop for the handlers you have not audited yet.
+The complete fix is to authorize the child rows too, for example by checking `where: { id: { in: itemIds }, ownerId: req.user.id }` before connecting. `scopedConnect` is the backstop for handlers you have not audited yet.
 
 #### The config
 
@@ -144,13 +144,13 @@ const db = turbine({ connectionString: process.env.DATABASE_URL, scopedConnect: 
 await db.users.update({ where: { id: 7 }, data: { posts: { connect: { id: 42 } } } });
 ```
 
-With the flag on, a connect succeeds when the child is **unowned** (its foreign key is null) or **already owned by this parent** (an idempotent re-connect), and is refused otherwise. Re-parenting then has to be an explicit update, which is the point: it stops being something a request body can do by accident.
+With the flag on, a connect succeeds when the child is **unowned** (its foreign key is null) or **already owned by this parent** (an idempotent re-connect), and is refused otherwise. Moving a row to a new parent then takes an explicit update, which a request body cannot trigger by accident.
 
-It is off by default because it changes the outcome of writes that currently succeed. Turn it on in a non-production environment first and run your test suite: anything that legitimately re-parents will start throwing, and that is the list of call sites to rewrite as explicit updates.
+It is off by default because it makes some writes that succeed today throw. Turn it on in a non-production environment and run your test suite: every call site that legitimately moves rows between parents will throw, and those are the ones to rewrite as explicit updates.
 
 #### What it covers, and what it does not
 
-The check compares the child's current foreign key against the parent's reference value, so it only exists where a connect **rewrites a foreign key**:
+The check compares the child's current foreign key with the parent's reference value, so it applies only where a connect **rewrites a foreign key**:
 
 | Relation | Covered | Why |
 |---|---|---|
@@ -159,13 +159,13 @@ The check compares the child's current foreign key against the parent's referenc
 | `belongsTo` | Not applicable | The connect points the row **being written** at a parent. It takes nothing from anyone, and the row it changes is the one you already authorized. |
 | Many-to-many | **No** | The connect inserts a junction row rather than moving one, so there is no foreign key to compare and nothing is taken from the other side. |
 
-Read the many-to-many row carefully: nothing is *taken*, but a junction row still links another tenant's row into your caller's parent, so the caller can now read it through the relation. `scopedConnect` does not close that. Authorize the child ids in the handler.
+On a many-to-many relation nothing is *taken*, but the junction row still links another tenant's row to your caller's parent, so the caller can read it through the relation. `scopedConnect` does not prevent that. Authorize the child ids in the handler.
 
-Composite foreign keys are covered: every column of the key is compared, and values are normalized to a primitive first, so a bigint FK read back as a string cannot look like a mismatch against the number the parent write returned.
+Composite foreign keys are covered. Every column of the key is compared, and values are normalized to a primitive first, so a bigint foreign key read back as a string does not count as a mismatch against the number the parent write returned.
 
 ### connectOrCreate, connect or insert
 
-Each item is `{ where, create }`: Turbine looks up `where`, links it if found, otherwise inserts the `create` payload (with the FK injected for `hasMany`/`hasOne`).
+Each item is `{ where, create }`. Turbine looks up `where` and links the row if it exists; otherwise it inserts the `create` payload, with the foreign key filled in for `hasMany` and `hasOne`.
 
 ```ts
 await db.users.create({
@@ -183,7 +183,7 @@ await db.users.create({
 
 ### Going deeper
 
-Nested writes recurse. A `create` payload can itself contain relation ops, up to depth 10:
+A `create` payload can itself contain relation ops, up to depth 10:
 
 ```ts
 await db.users.create({
@@ -203,7 +203,7 @@ await db.users.create({
 
 ## Update context
 
-Inside `update()`, the create-context ops (`create` / `connect` / `connectOrCreate`) behave exactly as above, and five more become available.
+Inside `update()`, `create`, `connect` and `connectOrCreate` work as above, and five more operations become available.
 
 ```ts
 await db.users.update({
@@ -219,7 +219,7 @@ await db.users.update({
 
 ### disconnect, null the foreign key
 
-`disconnect` sets the child's foreign key to `NULL`. The FK column **must be nullable**, otherwise Turbine throws `ValidationError` telling you to use `delete` instead.
+`disconnect` sets the child's foreign key to `NULL`. The column **must be nullable**; otherwise Turbine throws `ValidationError` and points you to `delete`.
 
 ```ts
 await db.users.update({
@@ -232,7 +232,7 @@ await db.users.update({
 });
 ```
 
-For a `belongsTo` relation, `disconnect` nulls the FK on the parent row instead (again requiring a nullable column):
+For a `belongsTo` relation, `disconnect` clears the foreign key on the row being updated instead, which also needs a nullable column:
 
 ```ts
 await db.users.update({
@@ -247,7 +247,7 @@ await db.users.update({
 
 A `belongsTo` relation is the single row the record points at, so it follows Prisma's to-one rules:
 
-- **`disconnect: true`** (or `{}`) clears the foreign key. An object with fields, `{ disconnect: { id: 3 } }`, additionally requires the connected row to match it.
+- **`disconnect: true`** (or `{}`) clears the foreign key. An object with fields, `{ disconnect: { id: 3 } }`, also requires the connected row to match it.
 - **`delete: true`** clears the foreign key and then deletes the row it pointed at. If any other row still points at that row, the foreign-key violation ([E009](/errors#e009)) rolls the whole write back.
 - Both need a **nullable** foreign key. With a `NOT NULL` one the record cannot point at nothing, so they throw `ValidationError` ([E003](/errors#e003)); connect it to a different row instead.
 - **`connectOrCreate`** works in `update()` as it does in `create()`: it points the record at the matching row, or at a newly created one.
@@ -269,11 +269,11 @@ await db.users.update({
 });
 ```
 
-When nothing is connected (the foreign key is already `NULL`), `disconnect: true` is a no-op, since what it asks for already holds. `delete: true`, or a `disconnect` naming fields, throws `NotFoundError` ([E001](/errors#e001)) saying nothing is connected. An operation whose value is `undefined` (`connect: orgId ? { id: orgId } : undefined`) is treated as absent, like any other `undefined` key.
+When nothing is connected (the foreign key is already `NULL`), `disconnect: true` does nothing, because what it asks for already holds. `delete: true`, or a `disconnect` naming fields, throws `NotFoundError` ([E001](/errors#e001)) saying nothing is connected. An operation whose value is `undefined` (`connect: orgId ? { id: orgId } : undefined`) counts as absent, like any other `undefined` key.
 
 ### set, replace the whole collection
 
-`set` takes an array and makes the relation contain exactly those rows: every current child is disconnected, then the listed rows are connected. `hasMany`/`hasOne` only.
+`set` takes an array and makes the relation contain exactly those rows: Turbine disconnects every current child, then connects the listed rows. This section covers `hasMany` and `hasOne`; for the junction version, see [Many-to-many relations](#many-to-many-relations).
 
 ```ts
 await db.users.update({
@@ -301,7 +301,7 @@ await db.users.update({
 
 ### update, patch related rows
 
-Each item is `{ where, data }`. For `belongsTo`, `where` is optional, Turbine derives it from the parent's foreign key.
+Each item is `{ where, data }`. For `belongsTo`, `where` is optional: Turbine takes it from the foreign key on the row being updated.
 
 ```ts
 await db.users.update({
@@ -319,7 +319,7 @@ await db.users.update({
 
 ### upsert, update or insert
 
-Each item is `{ where, create, update }`: update the row matching `where`, or create it if it doesn't exist.
+Each item is `{ where, create, update }`: Turbine updates the row matching `where`, or creates it if there is none.
 
 ```ts
 await db.users.update({
@@ -338,9 +338,9 @@ await db.users.update({
 
 ## Many-to-many relations
 
-A many-to-many relation has no foreign key on either side: the link lives in a junction row. Turbine writes those junction rows for you, in the same transaction as the parent write, on **every engine** (the SQL dialects and PowDB share one nested-write engine).
+A many-to-many relation has no foreign key on either side: the link lives in a junction row. Turbine writes those junction rows for you, in the same transaction as the parent write, on every engine, because the SQL dialects and PowDB share one nested-write engine.
 
-Three operations are supported, because three operations only ever touch the junction table:
+Three operations are supported, the three that touch only the junction table:
 
 | Op | Context | What it writes |
 |---|---|---|
@@ -382,20 +382,20 @@ await db.posts.update({
 });
 ```
 
-Behavior worth knowing:
+How they behave:
 
-- **`connect` is idempotent.** Turbine reads the parent's existing links inside the transaction and inserts only the missing ones, rather than relying on `ON CONFLICT DO NOTHING` (which SQL Server and PowDB refuse, and which assumes a unique constraint an implicit junction need not declare). Connecting an already-linked tag is a no-op, not a duplicate row and not a constraint error.
+- **`connect` is idempotent.** Turbine reads the parent's existing links inside the transaction and inserts only the missing ones. It does not rely on `ON CONFLICT DO NOTHING`, which SQL Server and PowDB refuse and which assumes a unique constraint an implicit junction need not declare. Connecting an already-linked tag does nothing: no duplicate row, no constraint error.
 - **`disconnect` is scoped by both keys.** The delete names the parent key *and* the listed targets, so it can neither clear the parent's other links nor touch another parent's rows.
 - **`set` replaces the whole set.** `set: []` clears every link this parent has. The clearing delete is always scoped by the parent key.
 - **Order within one payload:** `set` runs first, then `disconnect`, then `connect`.
-- **A selector that matches no row is refused**, with `ValidationError` ([E003](/errors)) naming the relation and the selector, rather than being skipped.
-- **Composite junction keys are refused.** A link row that needs more than one column per side cannot be addressed by the single-column predicates these writes use, so Turbine throws instead of writing a partial key. Write those junction rows directly.
+- **A selector that matches no row throws** `ValidationError` ([E003](/errors)) naming the relation and the selector. It is never skipped.
+- **Composite junction keys throw.** These writes address link rows with single-column predicates, so a link that needs more than one column per side would get a partial key. Write those junction rows directly.
 
 ### What still throws
 
-`create`, `connectOrCreate`, `update`, `upsert`, and `delete` on a many-to-many relation throw `ValidationError` ([E003](/errors)). Each of those would have to write the *target* row as well as the link, and there is no safe default for the junction's own extra columns. The error names the operation and the supported set.
+`create`, `connectOrCreate`, `update`, `upsert` and `delete` on a many-to-many relation throw `ValidationError` ([E003](/errors)), naming the operation and the supported set. Each of them would have to write the *target* row as well as the link, and there is no safe default for the junction's own extra columns.
 
-To create a target and link it, write the target and connect it:
+To create a target and link it, write the target, then connect it:
 
 ```ts
 await db.$transaction(async (tx) => {
@@ -407,7 +407,7 @@ await db.$transaction(async (tx) => {
 });
 ```
 
-To write link rows by hand (a junction with its own payload columns, for instance), address the junction table directly. On the core client it is an ordinary table, reachable through the camelCased accessor or `table()`:
+To write link rows by hand, for a junction with its own payload columns for instance, use the junction table directly. On the core client it is an ordinary table, reachable through its camelCase accessor or `table()`:
 
 ```ts
 await db.$transaction(async (tx) => {
@@ -417,16 +417,16 @@ await db.$transaction(async (tx) => {
 });
 ```
 
-Since 0.50 the [prisma-compat](/migrate-from-prisma) client exposes the same junction tables too, under their raw name, so this escape hatch is reachable from a migrated codebase as well.
+The [prisma-compat](/migrate-from-prisma) client exposes the same junction tables under their raw names, so a migrated codebase can do the same.
 
 ## Guarantees
 
-- **Atomic.** Every statement runs inside a single transaction. A failure anywhere rolls the whole tree back.
-- **Ordered correctly.** `belongsTo` targets are resolved before the parent insert (so `NOT NULL` FKs hold); `hasMany`/`hasOne` children are written after the parent exists.
+- **Atomic.** Every statement runs in one transaction. A failure anywhere rolls the whole tree back.
+- **Ordered.** `belongsTo` targets are resolved before the parent insert, so `NOT NULL` foreign keys hold. `hasMany` and `hasOne` children are written after the parent exists.
 - **Depth-capped at 10.** Deeper trees throw `CircularRelationError` ([E007](/errors)) with the full relation path.
-- **Validated.** Update-only ops in `create()`, unknown op names, non-nullable `disconnect`, missing `connect` targets, two pointer operations or a multi-item array on one `belongsTo`, and the unsupported many-to-many ops (`create`, `connectOrCreate`, `update`, `upsert`, `delete`) all throw `ValidationError` ([E003](/errors)) before anything commits. An unsupported many-to-many op is refused *before* the parent row is written, so a refused create leaves nothing behind.
-- **Scoped to the parent.** `delete` / `update` / `disconnect` / `upsert` can only touch rows that actually belong to the parent being written: the relation correlation is ANDed onto your `where`, and a target outside the relation reports `NotFoundError` ([E001](/errors)) instead of modifying a row owned by someone else. A selector that binds nothing (`{}`, or a field that is `undefined`) is refused rather than widened to the whole relation. The one exception is `{}` on a `belongsTo` `disconnect` or `delete`, which names the single connected row.
-- **Read back.** The return value is the parent row with the touched relations loaded via Turbine's `json_agg` machinery.
+- **Validated.** These throw `ValidationError` ([E003](/errors)) before anything commits: update-only ops in `create()`, unknown op names, `disconnect` on a non-nullable foreign key, missing `connect` targets, two pointer operations or a multi-item array on one `belongsTo`, and the unsupported many-to-many ops (`create`, `connectOrCreate`, `update`, `upsert`, `delete`). An unsupported many-to-many op is refused *before* the parent row is written, so a refused create leaves nothing behind.
+- **Scoped to the parent.** `delete`, `update`, `disconnect` and `upsert` can touch only rows that belong to the parent being written. Turbine ANDs the relation correlation onto your `where`, and a target outside the relation throws `NotFoundError` ([E001](/errors)) instead of changing a row owned by someone else. A selector that binds nothing (`{}`, or a field that is `undefined`) is refused rather than widened to the whole relation. The one exception is `{}` on a `belongsTo` `disconnect` or `delete`, which names the single connected row.
+- **Read back.** The return value is the parent row with the touched relations loaded, read with `findUnique` and a matching `with` clause.
 
 ## See also
 

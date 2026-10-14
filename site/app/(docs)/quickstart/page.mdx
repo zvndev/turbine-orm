@@ -11,9 +11,9 @@ Install Turbine, point it at your database, generate a typed client, and run you
 ## Requirements
 
 - **Node.js ≥ 20** (the package `engines` field). The optional [SQLite engine](/engines) uses Node's built-in `node:sqlite` and needs **Node ≥ 22.5**.
-- **PostgreSQL 14+** for the default path (Neon, Vercel Postgres, Supabase, or local all work). Other engines are documented under [Database Engines](/engines).
-- **`"type": "module"`** in your project `package.json` is recommended. Turbine is an ESM-first package, but the CLI also works in CommonJS projects (the default from `npm init -y`): it loads `turbine.config.ts` and schema files correctly either way.
-- **`tsx` as a dev dependency** so the CLI can load TypeScript config and schema files (`turbine.config.ts`, `turbine/schema.ts`, TypeScript seeds).
+- **PostgreSQL 14+** for the default path. Neon, Vercel Postgres, Supabase and a local server all work. Other engines are covered under [Database Engines](/engines).
+- **`"type": "module"`** in your `package.json` is recommended. Turbine is ESM-first, but the CLI also works in CommonJS projects (the `npm init -y` default) and loads `turbine.config.ts` and schema files either way.
+- **`tsx` as a dev dependency**, so the CLI can load TypeScript files: `turbine.config.ts`, `turbine/schema.ts` and TypeScript seeds.
 
 ## 1. Install
 
@@ -22,9 +22,9 @@ npm install turbine-orm
 npm install --save-dev tsx
 ```
 
-Turbine has exactly one runtime dependency (`pg`). ESM and CommonJS both work for importing the library; the CLI still needs `tsx` for `.ts` project files.
+Turbine has one runtime dependency, `pg`. You can import the library from ESM or CommonJS.
 
-If your `package.json` does not already say so, set:
+To make your project ESM, add this to `package.json`:
 
 ```json
 {
@@ -34,7 +34,7 @@ If your `package.json` does not already say so, set:
 
 ## 2. Set `DATABASE_URL`
 
-Set the standard Postgres connection string in your environment. For local development, use a `.env` file:
+Turbine reads the standard Postgres connection string from the environment. For local development, put it in a `.env` file:
 
 ```bash
 # .env
@@ -47,7 +47,7 @@ DATABASE_URL=postgres://user:pass@localhost:5432/mydb
 npx turbine init
 ```
 
-This creates `turbine.config.ts` at the project root and a `turbine/` directory for your schema and migrations. The config file looks like this:
+This creates `turbine.config.ts` at the project root and a `turbine/` directory for your schema and migrations:
 
 ```ts
 // turbine.config.ts
@@ -65,18 +65,18 @@ export default config;
 ```
 
 > **`schema` vs `schemaFile`:**  
-> - **`schema`** is the **Postgres schema name** (the namespace, almost always `'public'`).  
-> - **`schemaFile`** is the **path** to your `defineSchema()` TypeScript file (used by `turbine push` and auto-diff migrations).  
+> - **`schema`** is the Postgres schema name, the namespace. It is almost always `'public'`.  
+> - **`schemaFile`** is the path to your `defineSchema()` file, used by `turbine push` and auto-diff migrations.  
 >  
-> Never put a file path in `schema`. A value like `'./turbine/schema.ts'` makes introspection look for `WHERE table_schema = './turbine/schema.ts'`, which matches zero tables. Put the path in `schemaFile` only.
+> Never put a file path in `schema`. Introspection would look for tables in a schema named `'./turbine/schema.ts'` and find none.
 
 ## 4. Generate the typed client
 
-After `init`, pick the path that matches your database.
+Pick the path that matches your database.
 
 ### Path A, Existing tables
 
-If the database already has tables, introspect them and emit a fully-typed client:
+If the database already has tables, introspect them:
 
 ```bash
 npx turbine generate
@@ -85,10 +85,10 @@ npx turbine generate
 
 ### Path B, Empty database
 
-If the database is empty (or you want to own the schema in TypeScript first), define tables, push them, then generate:
+If the database is empty, or you want to own the schema in TypeScript, define the tables first:
 
-1. Edit `turbine/schema.ts` with `defineSchema(...)`, see [Schema & Migrations](/schema).
-2. Apply it to the database:
+1. Write your tables in `turbine/schema.ts` with `defineSchema(...)`. See [Schema & Migrations](/schema).
+2. Apply them to the database:
 
 ```bash
 npx turbine push
@@ -100,15 +100,15 @@ npx turbine push
 npx turbine generate
 ```
 
-`push` is the fast local path. For production, prefer SQL migrations (`turbine migrate`) instead of push, details on the [schema page](/schema).
+`push` is the fast path for local work. In production, use SQL migrations (`turbine migrate`); see the [schema page](/schema).
 
 ### What gets written
 
-Either path writes three files to `./generated/turbine/` (or your config `out`):
+Either path writes three files to `./generated/turbine/`, or to your config's `out`:
 
-- `types.ts`, entity interfaces and `Create` / `Update` input types
-- `metadata.ts`, runtime schema metadata
-- `index.ts`, a typed `TurbineClient` subclass with table accessors
+- `types.ts`: entity interfaces and `Create` / `Update` input types
+- `metadata.ts`: runtime schema metadata
+- `index.ts`: a typed `TurbineClient` subclass with table accessors
 
 ## 5. Your first query
 
@@ -130,14 +130,13 @@ console.log(users);
 await db.disconnect();
 ```
 
-> **Loading `.env` in your app:** the `turbine` CLI auto-loads a local `.env`,
-> but your application does not (the library never reads files). Populate
-> `process.env.DATABASE_URL` the standard way, e.g. run the script with Node's
-> built-in flag: `node --env-file=.env app.js` (Node 20.12+), or call
-> `process.loadEnvFile()` at startup. Any framework that already loads `.env`
-> (Next.js, etc.) works too.
+> **Loading `.env` in your app:** the `turbine` CLI loads a local `.env` for you.
+> Your application does not, because the library never reads files. Set
+> `process.env.DATABASE_URL` the usual way: run with Node's
+> `node --env-file=.env app.js` (Node 20.12+), call `process.loadEnvFile()` at
+> startup, or use a framework that loads `.env` itself, such as Next.js.
 
-`db.users` is typed, autocompletion surfaces every column, every operator, every relation. `users[0].createdAt` is a `Date`, `users[0].email` is a `string`, everything is inferred from the generated types.
+`db.users` is fully typed. Autocomplete lists every column, operator and relation, and the result types follow: `users[0].createdAt` is a `Date` and `users[0].email` is a `string`.
 
 ## 6. Add nested relations
 
@@ -157,28 +156,28 @@ const usersWithPosts = await db.users.findMany({
 usersWithPosts[0].posts[0].comments[0].user;
 ```
 
-> **Where `user` comes from.** Introspection names a to-one relation after the table it points at, so `comments.user_id` referencing `users.id` becomes `comments.user`, and the reverse side becomes `users.comments`. A name that reads better at the call site, `author` say, is a config rename, not a schema change: add `relationNames: { comments: { user: 'author' } }` to `turbine.config.ts` and run `generate` again. A rename that names a relation that does not exist is an error, never a silent no-op.
+> **Where `user` comes from.** Introspection names a to-one relation after the table it points at. `comments.user_id` referencing `users.id` becomes `comments.user`, and the reverse side becomes `users.comments`. To call it `author` instead, add `relationNames: { comments: { user: 'author' } }` to `turbine.config.ts` and run `generate` again; the database does not change. Renaming a relation that does not exist is an error.
 
-Turbine compiles the `with` clause to a single SQL statement using PostgreSQL's `json_agg` and correlated subqueries. No client-side stitching, no N+1. The default `'auto'` strategy keeps that plan, falling back to one flat follow-up statement for a relation whose correlation column has no covering index; the rows are identical either way. Pin `relationLoadStrategy: 'join'` for the single statement unconditionally: [Load strategies](/relations#load-strategy-auto-join-batched-flatten).
+Turbine compiles the `with` clause into one SQL statement built from PostgreSQL's `json_agg` and correlated subqueries, so there is no N+1 and no client-side stitching. The default `'auto'` strategy keeps that plan, except for a relation whose correlation column has no covering index: that relation loads in one flat follow-up statement instead. The rows are identical either way. To always get the single statement, set `relationLoadStrategy: 'join'`. See [Load strategies](/relations#load-strategy-auto-join-batched-flatten).
 
 ## Next steps
 
-**Migrating an existing app?** Start with one of these rather than the API reference:
+**Migrating an existing app?** Start here rather than in the API reference:
 
-- **[Migrate from Prisma](/migrate-from-prisma)**, `turbine migrate-from-prisma` reads your `schema.prisma` and emits a typed mapping, and `createPrismaCompatClient` gives you a `PrismaClient`-shaped surface so your existing `include` / `take` / `cursor` call sites keep working while you port.
-- **[Migrate from Drizzle](/migrate-from-drizzle)**, the API mapping, the schema translation, and the behavioural differences worth auditing before you cut over.
-- **[Why Turbine](/why-turbine)**, if you are still deciding: what is genuinely different, and what is table stakes in 2026.
+- **[Migrate from Prisma](/migrate-from-prisma)**: `turbine migrate-from-prisma` reads your `schema.prisma` and emits a typed mapping, and `createPrismaCompatClient` gives you a `PrismaClient`-shaped surface, so your `include` / `take` / `cursor` call sites keep working while you port.
+- **[Migrate from Drizzle](/migrate-from-drizzle)**: the API mapping, the schema translation, and the behavioral differences to audit before you cut over.
+- **[Why Turbine](/why-turbine)**: if you are still deciding, what is different and what is table stakes in 2026.
 
 Otherwise, keep going:
 
-- **[Vector Search](/vector)**, typed pgvector KNN ranking and distance filters, no raw SQL.
-- **[Realtime](/realtime)**, Postgres LISTEN/NOTIFY pub/sub with `$listen` / `$notify`.
-- **[Transactions & RLS Sessions](/transactions)**, SAVEPOINTs, isolation levels, and `sessionContext` for Row-Level Security multi-tenancy.
-- **[Studio](/studio)**, a local, read-only database UI: `npx turbine studio`.
-- **[Observability](/observability)**, query lifecycle events and built-in metrics aggregation.
-- **[API Reference](/queries)**, every query method, WHERE operator, and nested `with` option.
-- **[Schema & Migrations](/schema)**, define your schema in TypeScript and ship migrations.
-- **[Database Engines](/engines)**, SQLite, MySQL, SQL Server, and PowDB behind the same typed API.
-- **[CLI](/cli)**, every command with examples.
-- **[Benchmarks](/benchmarks)**, measured against Prisma 7, Drizzle 0.45, and a hand-written `pg` control.
-- **[Turbine for AI agents](/ai-agents)**, the MCP server and a drop-in agent-instructions snippet.
+- **[Vector Search](/vector)**: typed pgvector KNN ranking and distance filters, no raw SQL.
+- **[Realtime](/realtime)**: Postgres LISTEN/NOTIFY pub/sub with `$listen` / `$notify`.
+- **[Transactions & RLS Sessions](/transactions)**: SAVEPOINTs, isolation levels, and `sessionContext` for Row-Level Security multi-tenancy.
+- **[Studio](/studio)**: a local, read-only database UI, `npx turbine studio`.
+- **[Observability](/observability)**: query lifecycle events and built-in metrics aggregation.
+- **[API Reference](/queries)**: every query method, WHERE operator, and nested `with` option.
+- **[Schema & Migrations](/schema)**: define your schema in TypeScript and ship migrations.
+- **[Database Engines](/engines)**: SQLite, MySQL, SQL Server and PowDB behind the same typed API.
+- **[CLI](/cli)**: every command, with examples.
+- **[Benchmarks](/benchmarks)**: measured against Prisma 7, Drizzle 0.45, and a hand-written `pg` control.
+- **[Turbine for AI agents](/ai-agents)**: the MCP server and a drop-in agent-instructions snippet.

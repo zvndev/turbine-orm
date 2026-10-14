@@ -1,19 +1,19 @@
 export const metadata = {
   title: 'Relations',
   description:
-    'One-to-many, one-to-one, many-to-many, and self-referential relations in Turbine ORM. Nested with clauses, load strategies, payload-size guidance, when to stream instead.',
+    'One-to-many, one-to-one, many-to-many and self-referential relations in Turbine ORM: nested with clauses, load strategies, payload size, and when to stream instead.',
   alternates: { canonical: '/relations' },
 };
 
 # Relations
 
-Relations are inferred from foreign keys. `npx turbine pull` reads `information_schema` + `pg_catalog` and generates a `*Relations` interface for each table, with the target table, cardinality (`'one'` vs `'many'`), and the join keys baked into a phantom-branded `RelationDescriptor`. That brand is what powers deep `with` type inference.
+Turbine infers relations from foreign keys. `npx turbine pull` reads `information_schema` and `pg_catalog` and generates a `*Relations` interface for each table. Each relation records its target table, its cardinality (`'one'` or `'many'`) and its join keys in a `RelationDescriptor`, which is how TypeScript infers the result type of a deep `with`.
 
-You rarely declare a relation by hand. Define your foreign keys in `defineSchema()` (or let introspection read them) and the relation falls out.
+You rarely declare a relation by hand. Declare the foreign keys in `defineSchema()`, or let introspection read them, and the relations follow.
 
 ## One-to-many (hasMany)
 
-The canonical case. A user has many posts because `posts.user_id` references `users.id`.
+A user has many posts because `posts.user_id` references `users.id`.
 
 ```ts
 // schema.ts
@@ -38,11 +38,11 @@ const users = await db.users.findMany({
 // users[0].posts is Post[], never null, empty array if no rows
 ```
 
-`posts` arrives as `Post[]` on each user, `COALESCE`-d to `[]`, so you never null-check a collection.
+A to-many relation is always an array. A user with no posts gets `[]`, never `null`.
 
 ## One-to-one (belongsTo + hasOne)
 
-Same foreign-key setup, different cardinality. The *owning* side (with the FK) gets `belongsTo`; the *referenced* side gets `hasOne` if the FK is `UNIQUE`.
+The side that holds the foreign key gets `belongsTo`. When `turbine generate` reads the database, the referenced side gets `hasOne` if the foreign key column is `UNIQUE`, and `hasMany` if it is not.
 
 ```ts
 users: {
@@ -63,11 +63,9 @@ const user = await db.users.findUnique({
 // user.profile is Profile | null
 ```
 
-Without the `unique: true` on `profileId`, Turbine infers `hasMany` on the reverse side.
-
 ## Many-to-many (auto-detected pure junctions)
 
-Turbine auto-detects **pure junction tables** during `generate` and gives both endpoints a flat many-to-many relation. A pure junction is a table whose primary key is exactly two single-column foreign keys and which carries no other columns, for example `posts_tags(post_id, tag_id)`.
+`turbine generate` detects **pure junction tables** and gives both endpoints a flat many-to-many relation. A pure junction links two different tables through two single-column foreign keys, which together form its primary key, and has no other columns. `posts_tags(post_id, tag_id)` is one.
 
 ```ts
 // schema.ts
@@ -86,7 +84,7 @@ postsTags: {
 },
 ```
 
-Load the related rows directly, no join-table hop:
+Load the related rows directly, without going through the junction:
 
 ```ts
 const posts = await db.posts.findMany({
@@ -95,7 +93,7 @@ const posts = await db.posts.findMany({
 // posts[0].tags is Tag[]
 ```
 
-Nested `where` / `orderBy` / `limit` work on the m2m target too:
+`where`, `orderBy` and `limit` work on the many-to-many target too:
 
 ```ts
 const post = await db.posts.findFirst({
@@ -104,11 +102,11 @@ const post = await db.posts.findFirst({
 });
 ```
 
-Under the hood Turbine JOINs the target through the junction table and correlates `junction.sourceKey = parent.referenceKey`, still one SQL statement, still `json_agg`.
+Turbine joins the target through the junction table and correlates on `junction.sourceKey = parent.referenceKey`. It is still one SQL statement.
 
 ### Junctions with a payload, or non-pure junctions
 
-A junction table that carries extra columns (a role, a timestamp, an "added by") is a first-class entity, so Turbine keeps it as an ordinary `hasMany`. Query it like any relation, with the join-table row available:
+A junction that carries extra columns (a role, a timestamp, who added the row) is an entity of its own, so Turbine keeps it as an ordinary `hasMany`. Query it like any relation, and the junction row's columns come with it:
 
 ```ts
 memberships: {
@@ -137,7 +135,7 @@ const orgs = user.memberships.map((m) => m.organization);
 
 ### Declaring a many-to-many by hand
 
-To get the flat m2m relation on a junction that *isn't* pure, or to wire one up explicitly, declare it in your code-first schema with `manyToMany`:
+To get a flat many-to-many on a junction that is not pure, or to declare one explicitly, use `manyToMany` in your code-first schema:
 
 ```ts
 import { defineSchema } from 'turbine-orm';
@@ -155,11 +153,11 @@ export default defineSchema({
 });
 ```
 
-`sourceKey` / `targetKey` are the junction columns referencing each side's primary key. Add `references` if the source side is keyed on something other than `id`.
+`sourceKey` and `targetKey` are the junction columns that reference each side's primary key. If the source table is keyed on a column other than `id`, add `references`.
 
 ### Writing links: connect, disconnect, set
 
-Since 0.50 a many-to-many relation also accepts [nested writes](/nested-writes#many-to-many-relations) for the three operations that only ever touch the junction table. Turbine writes the junction rows in the same transaction as the parent write, on every engine including PowDB.
+A many-to-many relation accepts the three [nested writes](/nested-writes#many-to-many-relations) that touch only the junction table. Turbine writes the junction rows in the same transaction as the parent write, on every engine, PowDB included.
 
 ```ts
 // Link on create
@@ -179,13 +177,16 @@ await db.posts.update({
 });
 ```
 
-`connect` is idempotent (an already-linked target is a no-op), `disconnect` is scoped by both the parent key and the named targets, and `set: []` clears every link. `disconnect` and `set` are update-only, as on every other relation type.
+- `connect` is idempotent: linking a target that is already linked does nothing.
+- `disconnect` removes only the links between this parent and the named targets.
+- `set` replaces every link, and `set: []` clears them all.
+- `disconnect` and `set` are update-only, as on every other relation type.
 
-The operations that would also have to write the *target* row (`create`, `connectOrCreate`, `update`, `upsert`, `delete`) throw `ValidationError` ([E003](/errors)): there is no safe default for a junction's extra payload columns. Composite junction keys are refused for the same reason. See [Nested writes](/nested-writes#many-to-many-relations) for the full rules and the escape hatch.
+`create`, `connectOrCreate`, `update`, `upsert` and `delete` would also have to write the target row, and there is no safe default for a junction's extra columns, so they throw `ValidationError` ([E003](/errors)). Composite junction keys are refused for the same reason. See [Nested writes](/nested-writes#many-to-many-relations) for the full rules and the escape hatch.
 
 ## Self-referential
 
-A self-referencing foreign key (a column on a table that references that same table's primary key) introspects to **both** a `belongsTo` and a `hasMany` on the table. Categories with a `parentId`, threaded comments, an org chart: all the same shape, including nested trees.
+A foreign key that references its own table's primary key gives that table both a `belongsTo` and a `hasMany`. Category trees, threaded comments and org charts all have this shape, nested trees included.
 
 ```ts
 categories: {
@@ -211,13 +212,13 @@ const tree = await db.categories.findFirst({
 });
 ```
 
-When a table has a single self-referencing FK, Turbine auto-names the two relations after the table: the `belongsTo` takes the singular (`category`) and the `hasMany` takes the table name (`categories`). The examples above assume you renamed them to `parent` / `children` in your code-first schema.
+With a single self-referencing foreign key, introspection names the `belongsTo` after the singular table name (`category`) and the `hasMany` after the table (`categories`). The examples above rename them to `parent` and `children` with [`relationNames`](/cli#renaming-derived-relations-relationnames) in `turbine.config.ts`.
 
-Back-references like `posts -> user -> posts` are allowed: Turbine detects cycles by tracking the recursion path, not by refusing to revisit a table. The depth cap (10) is the guardrail.
+Back-references such as `posts -> user -> posts` are allowed. Turbine tracks the recursion path instead of refusing to revisit a table, and stops at a depth of 10.
 
 ## Nested with, what's available at every level
 
-At any level inside a `with` clause you can pass the same options `findMany` accepts (except pagination semantics differ, see below):
+Each level of a `with` takes the same read options as `findMany`, with pagination applied per parent:
 
 ```ts
 await db.users.findMany({
@@ -239,18 +240,18 @@ await db.users.findMany({
 });
 ```
 
-- **`where`**, applies to the relation rows, not the parents.
-- **`orderBy` + `limit`**, applied *per parent* via an inner subquery wrapping. `LIMIT 5` means "5 posts per user," not "5 posts total."
-- **`select` / `omit`**, either one, not both. Picks/drops columns at this level.
-- **Further `with`**, recurses. Depth cap is 10; beyond that Turbine throws `CircularRelationError` (TURBINE_E007) with the full path trail.
+- **`where`** filters the related rows, not the parents.
+- **`orderBy` and `limit`** apply per parent. `limit: 5` means five posts per user, not five posts in total. `take`, `skip` and `offset` page each parent's rows the same way. `skip` or `offset` on a to-one relation throws `TURBINE_E003`, since there is nothing to skip.
+- **`select` / `omit`** pick or drop columns at this level. Use one or the other, not both.
+- **`with`** recurses. Past a depth of 10, Turbine throws `CircularRelationError` (`TURBINE_E007`) with the full path.
 
-> **Relation-array order is not guaranteed.** Without an explicit `orderBy`, a `with` relation comes back in whatever order the loader produces: `json_agg` injects no `ORDER BY`, and the `'auto'` / `'batched'` strategies can order the same rows differently again. If code depends on child order, add `orderBy` to that `with` block, or opt into the client-wide `stableRelationOrder` flag (a per-relation `orderBy` always wins over it).
+> **Relation arrays have no guaranteed order.** Without an `orderBy`, a `with` relation comes back in whatever order the loader produces: `json_agg` adds no `ORDER BY`, and the `'auto'` and `'batched'` strategies can order the same rows differently. If your code depends on child order, add `orderBy` to that `with` block, or turn on the client-wide `stableRelationOrder` flag. A per-relation `orderBy` always wins over the flag.
 >
-> Key order on the returned *object* is a different axis, and it is deterministic on its own: every relation key and every `_count` entry is seeded up front in the order the join plan emits it, before any load runs, so the same query serializes to the same JSON under every strategy.
+> The key order of each returned *object* is deterministic. Every relation key and `_count` entry is placed in the order the join plan emits it, so the same query serializes to the same JSON under every strategy.
 
 ## Relation filters on the parent
 
-Filter parents *by* their relations without loading them. `some` / `every` / `none`:
+Filter parents by their relations without loading them, using `some`, `every` and `none`:
 
 ```ts
 // Users who have at least one published post
@@ -269,11 +270,11 @@ await db.users.findMany({
 });
 ```
 
-These compile to `EXISTS` / `NOT EXISTS` subqueries. No relation data is returned; the join is pure filter.
+For a to-one relation, use `is` and `isNot`. Relation filters compile to `EXISTS` / `NOT EXISTS` subqueries and return no relation data.
 
 ## Counting and ordering by relations
 
-Add `_count` to a `with` clause to get a count per to-many relation without loading the children:
+Add `_count` to a `with` to count each to-many relation without loading the children:
 
 ```ts
 const users = await db.users.findMany({
@@ -282,13 +283,15 @@ const users = await db.users.findMany({
 users[0]._count.posts; // 12
 ```
 
-You can also order a query by a relation: `{ posts: { _count: 'desc' } }` for a to-many count, or `{ author: { name: 'asc' } }` for a to-one target column. Both are covered in the API reference: [relation `_count`](/queries#counting-related-rows-_count) and [ordering by a relation](/queries#ordering-by-a-relation).
+`_count` works in the top-level `with` only. Inside a nested `with` it throws `RelationError` (`TURBINE_E005`) on every load strategy.
+
+You can also order by a relation: `{ posts: { _count: 'desc' } }` for a to-many count, or `{ author: { name: 'asc' } }` for a column of a to-one target. See [relation `_count`](/queries#counting-related-rows-_count) and [ordering by a relation](/queries#ordering-by-a-relation).
 
 ## Payload size, when to prefer streaming
 
-The `json_agg` strategy materializes the full object graph in Postgres memory *before* serializing it over the wire. Fine for bounded queries, not for unbounded ones.
+The join strategy builds the whole object graph in Postgres memory before it sends any of it. That is fine for a bounded query and a problem for an unbounded one.
 
-**Rule of thumb:** if the root `limit` is absent or > ~10k rows, or if a nested `with` has no `limit` on a `hasMany`, reach for `findManyStream` instead.
+**Rule of thumb:** if the root query has no `limit` or returns more than about 10,000 rows, or a nested `hasMany` has no `limit`, use `findManyStream`.
 
 ```ts
 // Bad, materializes the whole users table + all their posts + all their comments in Postgres RAM
@@ -296,7 +299,7 @@ const all = await db.users.findMany({
   with: { posts: { with: { comments: true } } },
 });
 
-// Good, streams parents, loads relations per batch
+// Better: stream the parents, load each one's relations separately
 for await (const user of db.users.findManyStream({ batchSize: 500 })) {
   const posts = await db.posts.findMany({
     where: { userId: user.id },
@@ -306,9 +309,9 @@ for await (const user of db.users.findManyStream({ batchSize: 500 })) {
 }
 ```
 
-Concrete numbers on a seeded dataset (5K users, 46K posts, 432K comments): the unbounded nested `findMany` above builds a ~180 MB JSON payload server-side before sending a byte. Postgres handles it. Your Lambda's 512 MB budget does not.
+On a seeded dataset (5K users, 46K posts, 432K comments), the unbounded nested `findMany` above builds a ~180 MB JSON payload on the server before it sends a byte. Postgres copes. A Lambda with a 512 MB budget does not.
 
-Nested `with` on the streaming API works too: Turbine opens a `DECLARE CURSOR` for the parent query and runs the nested subqueries per batch:
+`findManyStream` takes `with` too. Turbine declares a cursor (`DECLARE CURSOR`) over the whole statement, so the relation subqueries run as each batch is fetched:
 
 ```ts
 for await (const user of db.users.findManyStream({
@@ -321,7 +324,7 @@ for await (const user of db.users.findManyStream({
 
 ## belongsTo loading without extra JOINs
 
-Turbine emits a single correlated subquery per relation, not a `JOIN`, so a `belongsTo` with 1,000 parents doesn't cartesian-explode against the child table:
+The join strategy compiles each relation to a correlated subquery in the select list, not a `JOIN`, so the parent rows are never multiplied by their related rows:
 
 ```ts
 // 1,000 posts, each with its 1 author, one SQL statement, one pass over posts, one lookup per row
@@ -331,7 +334,7 @@ await db.posts.findMany({
 });
 ```
 
-The generated SQL for `with: { user: true }` looks like:
+The generated SQL for `with: { user: true }`:
 
 ```sql
 SELECT "posts"."id", "posts"."title", "posts"."user_id",
@@ -340,52 +343,44 @@ SELECT "posts"."id", "posts"."title", "posts"."user_id",
      WHERE t0."id" = "posts"."user_id"
      LIMIT 1) AS "user"
 FROM "posts"
-LIMIT 1000
+LIMIT $1
 ```
 
-If you want a real JOIN (a reporting query with a `GROUP BY`, say), drop to `db.raw`.
+For a real `JOIN` (a reporting query with a `GROUP BY`, say), use `db.raw`. For to-one relations, [`'flatten'`](#flatten-to-one-relations-as-a-left-join) compiles a `LEFT JOIN` for you.
 
 ## Load strategy: `auto`, `join`, `batched`, `flatten`
 
-When you don't set `relationLoadStrategy`, Turbine uses **`'auto'`** (since 0.41.0): it compiles the single-statement correlated-subquery plan (`'join'`) and moves individual relations to the batched loader when one of the two rules below fires. Everything else stays in the join. An explicit `'join'`, `'batched'` or `'flatten'` (client-wide or per query) always wins over `'auto'`; `'flatten'` is never auto-selected.
+`relationLoadStrategy` decides how a `with` tree is loaded:
 
-Every strategy returns deep-equal rows, and every strategy agrees about whether a query is *valid*: the whole `with` tree is validated on every strategy, even when the base query matches no rows, with the same error codes. A seeded differential fuzz suite runs the same random queries through the join and batched plans on every release and nightly, asserting row equality and accept/reject agreement.
+| Strategy | What it does |
+|---|---|
+| `'join'` | One statement. Each relation is a correlated subquery that returns JSON. |
+| `'batched'` | The base query, then one flat follow-up query per relation, attached to the parents in memory. |
+| `'flatten'` | One statement. Eligible to-one relations become a `LEFT JOIN`; the rest stay correlated subqueries. |
+| `'auto'` (default) | The `'join'` plan, with individual relations moved to the batched loader when a rule below fires. |
+
+An explicit `'join'`, `'batched'` or `'flatten'`, set on the client or per query, always wins over `'auto'`. `'auto'` never picks `'flatten'`.
+
+Every strategy returns deep-equal rows, and every strategy agrees on whether a query is *valid*. The whole `with` tree is validated on every strategy, with the same error codes, even when the base query matches no rows.
 
 <Callout type="note" title="Value fidelity across strategies">
-A nested relation is built as JSON (`json_build_array` / `json_build_object`, `JSON_OBJECT`, `FOR JSON PATH`, `json_group_array`), and a JSON number is an IEEE double, so a value read through a `with` relation could once differ lossily from the same value read at top level or through the batched loader. Fixed per engine: PostgreSQL `numeric` / `int8` / `date` (v0.50); SQLite `INTEGER` and `BLOB`, MySQL `BIGINT`, `DECIMAL` and `VARBINARY`, SQL Server `BIGINT` and `VARBINARY` (v0.51). Divergent columns are carried as text and decoded through each driver's own rule, so all three read paths agree on all four engines. If you read a bigint, decimal or binary column through a `with` relation before v0.51, the values you get back change with the upgrade, to the correct ones.
+A nested relation travels as JSON (`json_build_array` / `json_build_object`, `JSON_OBJECT`, `FOR JSON PATH`, `json_group_array`), and a JSON number is an IEEE double. Turbine therefore carries the column types JSON would distort as text and decodes them with each driver's own rule: PostgreSQL `numeric`, `int8` and `date`; SQLite `INTEGER` and `BLOB`; MySQL `BIGINT`, `DECIMAL` and `VARBINARY`; SQL Server `BIGINT` and `VARBINARY`. A value reads the same at top level, through a join-strategy relation and through the batched loader, on all four SQL engines.
 </Callout>
+
+**How `'auto'` chooses.** `'auto'` starts from the `'join'` plan and moves a relation to the batched loader when either rule fires:
 
 | Rule | Fires when | Why |
 |---|---|---|
-| **Unindexed probe** | DB-backed index metadata proves a probe in the relation's subtree has no covering index | A correlated probe per parent becomes N-parents by full-table-scan |
-| **To-one cardinality** (since 0.50) | The relation is `belongsTo` / `hasOne` *and* the parent set is potentially large | A correlated to-one subquery is re-evaluated once per parent row no matter how well indexed it is |
+| **Unindexed probe** | Index metadata read from the database proves that a probe in the relation's subtree has no covering index | Each parent's correlated probe becomes a full table scan |
+| **To-one cardinality** | The relation is `belongsTo` or `hasOne` *and* the parent set is potentially large | A correlated to-one subquery runs once per parent row, however well it is indexed |
 
-"Potentially large" means the query has no `limit` / `take` (and no client `defaultLimit`), or a limit above **`autoToOneJoinMaxRows`** (default `1000`). `findUnique` and `findFirst` never trip the cardinality rule: their parent set is one row.
+A parent set is potentially large when the query has no `limit` / `take` (and the client has no `defaultLimit`), or its limit is above **`autoToOneJoinMaxRows`** (default `1000`). `findUnique` and `findFirst` never trip the cardinality rule, because their parent set is one row.
 
-The unindexed rule needs index metadata read from the database, so it never fires on a `defineSchema`-only client. The cardinality rule does not depend on index metadata and applies either way.
+The unindexed rule needs index metadata from the database, so it never fires on a client built from `defineSchema()` alone. The cardinality rule needs no index metadata and applies either way.
 
-<Callout type="warning" title="Do not force 'batched' by benchmarking on localhost">
-  `'batched'` trades an **extra round trip per relation** for not building JSON
-  on the server, and a Unix socket or a container on the same host makes that
-  round trip look free. Measured on one fixture (50 users with their posts)
-  through a proxy that injects latency:
+Neither rule moves a relation the batched loader cannot handle: composite-key relations, and relations whose subtree the loader cannot express, stay in the join. When `'auto'` moves a relation, a development note names the reason once per relation, and query events carry `strategy: 'auto-batched'`.
 
-  | round trip | `'join'` | `'batched'` |
-  |---|---|---|
-  | 0 ms (unix socket) | 2.527 ms | **1.407 ms** |
-  | 1 ms | **5.115 ms** | 6.807 ms |
-  | 5 ms | **7.809 ms** | 11.343 ms |
-  | 25 ms | **29.487 ms** | 54.003 ms |
-
-  The ordering inverts by **1 ms** of round-trip time, and by 25 ms `'batched'`
-  is 1.83x slower. If your deployment is not on a socket, set `autoRoundTripMs`
-  (see the tuning note below) rather than pinning a strategy, and benchmark on
-  a link that resembles production. Reproduce with `benchmarks/bench-latency.ts`.
-</Callout>
-
-Both rules only ever move a relation the batched loader can actually handle: composite-key relations, and relations whose subtree the loader cannot express, always stay in the join. Engagement is visible: a once-per-relation dev note names the reason, and query events carry `strategy: 'auto-batched'`.
-
-Relation `_count` follows the unindexed rule only, on a far more aggressive size rule. An inline `_count` compiles to a correlated scalar `COUNT(*)` subquery re-evaluated once per parent row, so an unindexed correlation column costs one full child-table scan **per parent**; the batched follow-up is the grouped form (`COUNT(*) ... GROUP BY fk`) and pays that scan **once** for the whole page. The difference compounds linearly with the parent count:
+**Relation `_count` under `'auto'`.** `_count` follows the unindexed rule only, with its own size threshold. An inline `_count` is a correlated `COUNT(*)` that runs once per parent row, so an unindexed foreign key costs one full scan of the child table **per parent**. The batched form is a single grouped `COUNT(*) ... GROUP BY fk` that pays for the scan **once** for the whole page. The difference grows linearly with the parent count:
 
 | parent rows | inline `_count` | batched `_count` | |
 |--:|--:|--:|:--|
@@ -393,30 +388,30 @@ Relation `_count` follows the unindexed rule only, on a far more aggressive size
 | 1,000 | 3.06 s | 9.9 ms | 311x |
 | 10,000 | 31.06 s | 28.4 ms | 1,093x |
 
-Measured on a 200,000-row child table with an unindexed FK. `EXPLAIN (ANALYZE, BUFFERS)` at 30 parents reads 50,013 buffers inline against 1,727 batched, with `loops=30` on the child scan and `Rows Removed by Filter: 199980` on each one.
+Measured on a 200,000-row child table with an unindexed foreign key.
 
-So `auto` moves an unindexed `_count` to the follow-up statement from **two** parent rows upward. Only a parent set provably bounded at one row keeps it inline: `findUnique`, `findFirst`, and any query carrying `limit: 1` / `take: 1`. `autoToOneJoinMaxRows` does not influence `_count`.
+So `'auto'` moves an unindexed `_count` to the follow-up from **two** parent rows up. It stays inline only when the parent set is provably one row: `findUnique`, `findFirst`, or a query with `limit: 1` / `take: 1`. `autoToOneJoinMaxRows` does not affect `_count`. To keep `_count` in the single statement, add the covering index (`npx turbine doctor` names it), or pin `relationLoadStrategy: 'join'` on that query.
 
-To keep `_count` in the single statement: add the covering index (`npx turbine doctor` names it), or pin `relationLoadStrategy: 'join'` on that query.
+**Tuning `'auto'`.** Both rules are heuristics. The real parent count is unknown until the base query runs, and `limit` is the only bound available when the plan is built. Set **`autoRoundTripMs`** first: `'auto'` weighs one extra round trip against a correlated subquery per parent row, so the to-one threshold is derived from your round-trip time. Use what `ping` reports between your app and your database:
 
-> **Tuning note.** Both rules are heuristics: the real parent count is unknown until the base query runs, and `limit` is the only bound available at plan time. The dial worth setting first is **`autoRoundTripMs`**: the to-one threshold is derived from it, because `'auto'` is weighing an extra round trip against a correlated subquery per parent row, and that depends on your link. Set it to what `ping` says between your app and your database: roughly `0.05` for a Unix socket, `0.5` to `2` for same-region managed Postgres, `30` to `60` cross-region. The default `0.7` (same-region) reproduces the historical 1000-row threshold exactly. An explicit `autoToOneJoinMaxRows` overrides it (to-one rule only), and both are consulted only under `'auto'`. The break-even moves about **17x** between a loopback link and a 2.7 ms one.
->
-> ```ts
-> const db = turbine({ connectionString: process.env.DATABASE_URL, autoRoundTripMs: 1.2 });
-> ```
->
-> On endpoints that fan out to very large child sets (megabyte-scale JSON per request), the batched loader's flat rows can beat the join plan even with healthy indexes, so `'batched'` is worth pinning there. If profiling still disagrees, pin `relationLoadStrategy` on that query.
+| Link | `autoRoundTripMs` |
+|---|---|
+| Unix socket | about `0.05` |
+| Same-region managed Postgres | `0.5` to `2` |
+| Cross-region | `30` to `60` |
 
-<Callout type="note" title="Upgrading to 0.50">
-  The to-one cardinality rule changes which plan an existing unbounded query
-  picks, not what it returns. If a query was tuned against the old choice, pin
-  it with `relationLoadStrategy: 'join'` or raise `autoToOneJoinMaxRows`.
-</Callout>
+The default, `0.7` (same region), gives the 1000-row threshold. The break-even moves about **17x** between a loopback link and a 2.7 ms one. An explicit `autoToOneJoinMaxRows` overrides the derived threshold for the to-one rule. Both options apply only under `'auto'`.
 
-The correlated-subquery strategy (`relationLoadStrategy: 'join'`) resolves an entire `with` tree in **one** SQL statement: a single round-trip, and an index seek per parent when the child FK is indexed. Two situations favor the alternative:
+```ts
+const db = turbine({ connectionString: process.env.DATABASE_URL, autoRoundTripMs: 1.2 });
+```
 
-- **A child FK column is unindexed.** A correlated probe per parent becomes N-parents × full-table-scan. [`npx turbine doctor`](/cli#turbine-doctor) finds these; until the index exists, batched loading pays for its absence only once.
-- **Huge result sets.** Nested JSON (one `json_build_array` per row, re-serialized inside `json_agg`) is heavier to encode and decode than flat rows.
+On endpoints that fan out to very large child sets (megabytes of JSON per request), the batched loader's flat rows can beat the join plan even with healthy indexes, so pin `'batched'` there. If profiling still disagrees with `'auto'`, pin `relationLoadStrategy` on that query.
+
+**`'join'` or `'batched'`.** `'join'` resolves the whole `with` tree in **one** statement: one round trip, and an index seek per parent when the child foreign key is indexed. Two situations favor `'batched'`:
+
+- **An unindexed child foreign key.** Each parent's correlated probe becomes a full table scan. [`npx turbine doctor`](/cli#turbine-doctor) finds these. Until the index exists, the batched loader pays for its absence once instead of once per parent.
+- **Huge result sets.** Nested JSON (one `json_build_array` per row, re-serialized inside `json_agg`) costs more to encode and decode than flat rows.
 
 Opt in per query, or set a client-wide default:
 
@@ -434,36 +429,52 @@ const db = turbine({
 });
 ```
 
-`'batched'` runs the base query without `json_agg` subqueries, then issues **one flat follow-up query per relation** (`WHERE fk = ANY($1)`, chunked at 32,000 keys) and stitches the children onto the parents in memory. D relation levels cost D extra round-trips instead of one, but each is a single indexed key-set lookup and the rows come back flat.
+<Callout type="warning" title="Do not force 'batched' by benchmarking on localhost">
+  `'batched'` trades an **extra round trip per relation** for not building JSON
+  on the server. A Unix socket, or a container on the same host, makes that
+  round trip look free. One fixture (50 users with their posts), measured
+  through a proxy that injects latency:
 
-The result is **deep-equal** to the join strategy: same shape, same camelCase keys, same `Date` coercion. It honors per-relation `where` / `select` / `omit` / `orderBy` and nested `with`. The per-relation `limit` is applied **per parent**, never as a bare `LIMIT` on the follow-up (which would cap total children, not children-per-parent): on PostgreSQL the bound is pushed into the follow-up statement as a window-function partition limit, and the rows are sliced client-side on every engine. And it's **transaction-safe**: the follow-up queries run on the same pinned connection, so batched loads inside `$transaction` see the transaction's own writes.
+  | round trip | `'join'` | `'batched'` |
+  |---|---|---|
+  | 0 ms (unix socket) | 2.527 ms | **1.407 ms** |
+  | 1 ms | **5.115 ms** | 6.807 ms |
+  | 5 ms | **7.809 ms** | 11.343 ms |
+  | 25 ms | **29.487 ms** | 54.003 ms |
 
-> **Note.** Composite-key relations aren't supported by `'batched'`; use `'join'` for those (`'auto'` never batch-falls-back on a composite-key relation). A `_count` nested inside a `with` is refused on every strategy, so the plans can never disagree about whether a query is valid.
+  The winner flips by **1 ms** of round-trip time, and at 25 ms `'batched'` is
+  1.83x slower. If your deployment is not on a socket, set `autoRoundTripMs`
+  rather than pinning a strategy, and benchmark on a link that resembles
+  production. Reproduce with `benchmarks/bench-latency.ts`.
+</Callout>
 
-Because the stitching happens in memory, the loader needs each level's correlation key present in the rows it was handed. It adds those keys to the projection itself and strips them again afterwards, so a `select` or `omit` that removes an FK is fine at any depth. If a correlation key is missing from every parent row, the loader throws `UnsupportedFeatureError` (`TURBINE_E017`) naming the relation rather than returning an empty one (an empty relation is indistinguishable from a true absence).
+**How `'batched'` loads.** `'batched'` runs the base query without relation subqueries, then sends **one flat follow-up query per relation** (`WHERE fk = ANY($1)`, chunked at 32,000 keys) and attaches the children to their parents in memory. Each level of relations costs one extra round trip, but each is a single indexed key-set lookup that returns flat rows.
+
+The result is **deep-equal** to the join strategy: same shape, same camelCase keys, same `Date` coercion. The loader honors per-relation `where`, `select`, `omit`, `orderBy` and nested `with`. A per-relation `limit` applies **per parent**, never as a bare `LIMIT` on the follow-up, which would cap the total instead. On PostgreSQL the bound is pushed into the follow-up as a window-function partition limit, and every engine also slices the rows client-side. The follow-ups run on the same connection as the base query, so inside `$transaction` they see the transaction's own writes.
+
+`'batched'` does not support composite-key relations; use `'join'` for those. `'auto'` never moves a composite-key relation to the batched loader.
+
+To attach children, the loader needs each level's correlation key in the rows. It adds those keys to the projection and strips them afterwards, so a `select` or `omit` that drops a foreign key works at any depth. If a correlation key is still missing from every parent row, the loader throws `UnsupportedFeatureError` (`TURBINE_E017`) naming the relation, rather than return an empty relation that would look like a real absence.
 
 ## `'flatten'`: to-one relations as a LEFT JOIN
 
-<Callout type="note" title="New in 0.50">
-  `'flatten'` is an **explicit opt-in**. `'auto'` never selects it, and the
-  default plan is unchanged.
-</Callout>
+`relationLoadStrategy: 'flatten'` compiles each eligible **to-one** relation into a `LEFT JOIN` in the same statement, instead of a correlated subquery: one round trip, no per-parent re-evaluation, no client-side stitching. It is opt-in only. `'auto'` never selects it.
 
-`relationLoadStrategy: 'flatten'` compiles an eligible **to-one** relation into a `LEFT JOIN` in the same statement, instead of a correlated subquery. One round-trip, no per-parent re-evaluation, no client-side stitching.
-
-On the benchmark fixture (500 posts each with their author) it is **1.53x faster than the default plan**: 1.734 ms against 2.658 ms. Unlike `'batched'` it spends **no extra round trip**, so the margin is not an artifact of measuring on a socket and does not erode as latency rises.
+On the benchmark fixture (500 posts, each with its author), `'flatten'` is **1.53x faster than the default plan**: 1.734 ms against 2.658 ms. It adds **no round trip**, so unlike `'batched'` its lead does not depend on a fast link and does not shrink as latency rises.
 
 ```ts
 const posts = await db.posts.findMany({
   with: { author: { with: { org: true } } },
   relationLoadStrategy: 'flatten',
+  jsonEncoding: 'object', // required on PostgreSQL, see Lean JSON encoding
 });
 ```
 
-The whole to-one subtree becomes one derived table, joined once:
+Trimmed to a few columns, the whole to-one subtree becomes one derived table, joined once:
 
 ```sql
-SELECT "posts".*, f0."f0__id", f0."f0__name", f0."f1__code"
+SELECT "posts"."id", "posts"."title", "posts"."author_id",
+       "f0"."f0__$k", "f0"."f0__id", "f0"."f0__name", "f0"."f1__$k", "f0"."f1__code"
 FROM "posts"
 LEFT JOIN (
   SELECT 1 AS "f0__$k", f0s."id" AS "f0__$c0",
@@ -475,30 +486,34 @@ LEFT JOIN (
 ) f0 ON f0."f0__$c0" = "posts"."author_id"
 ```
 
-Every column the join exposes is prefixed (`f0__`, `f1__`, …), so a child column can never collide with a parent column. The `$k` columns are match discriminators (value-free, so a PII-tagged key column never reaches the wire); the `$c` correlation columns are used only in the outer `ON` and never returned. Turbine reassembles the nested object client-side, **deep-equal to the join strategy**: same shape, same camelCase keys, same `Date` coercion.
+Every column the join exposes is prefixed (`f0__`, `f1__`, …), so a child column never collides with a parent column. The `$k` columns record whether a row matched and carry no value, so a PII-tagged key column never reaches the wire. The `$c` correlation columns are used only in the outer `ON` and are never returned. Turbine reassembles the nested object client-side, **deep-equal to the join strategy**: same shape, same camelCase keys, same `Date` coercion.
 
 ### Eligibility, and what silently falls back
 
-An ineligible relation **falls back to a correlated subquery without an error**. You get correct results either way; you just may not get the plan you asked for.
+An ineligible relation **falls back to a correlated subquery without an error**. The rows are the same; the plan is not the one you asked for. While [`diagnostics`](/observability#diagnostics-diagnostics) advice is on, each relation that falls back logs a warning once, with code `flatten-fallback`.
 
 A relation is eligible only when **all** of these hold:
 
 - It is **`belongsTo` or `hasOne`**. Every to-many relation falls back.
-- The target-side correlation columns are **provably unique**: an exact match against the target's primary key, a declared unique constraint, or a **full, non-partial, non-expression** unique index. The proof is exact set equality, so a unique index on `(a, b)` does **not** prove `(a)`.
-- The relation has **no `limit`** and **no `orderBy`** (a to-one row has nothing to order or limit anyway).
-- It contains **no nested `_count`**. A `_count` at the top level of the `with` is fine and stays a correlated `COUNT(*)`.
+- Its target-side correlation columns are **provably unique**: they exactly match the target's primary key, a declared unique constraint, or a **full, non-partial, non-expression** unique index. The match is exact set equality, so a unique index on `(a, b)` does **not** prove `(a)`.
+- It has **no `limit`** and **no `orderBy`**. A to-one row has nothing to order or limit anyway.
 - It is under the **depth cap of 10**, the same cap the subquery path uses.
+- Its prefixed column aliases neither collide with a column or relation name nor run past the identifier length limit.
 
-Inside an eligible relation, all of this is supported: a relation `where`, target [global filters](/global-filters), `select` / `omit`, **to-one chains of arbitrary depth** (each becomes a further inner join in the same derived table), **self-relations**, and a **nested to-many**, which stays a correlated subquery hanging off the joined node.
+A `_count` in the top-level `with` does not block flattening; it stays a correlated `COUNT(*)`.
 
-Fallback is **per relation** for the rules above: one ineligible relation in a `with` clause does not stop the others from flattening. Four conditions instead disable flattening for the **whole query**:
+Inside an eligible relation, all of these work: a relation `where`, target [global filters](/global-filters), `select` / `omit`, **to-one chains of any depth** (each adds an inner join to the same derived table), **self-relations**, and a **nested to-many**, which stays a correlated subquery hanging off the joined node.
+
+Fallback is **per relation**: one ineligible relation in a `with` clause does not stop the others from flattening. Four conditions turn flattening off for the **whole query**:
 
 | Whole-query fallback | Why |
 |---|---|
 | `distinct` | The join multiplies rows before `DISTINCT` sees them |
-| `jsonEncoding: 'positional'` | A different wire encoding for relation payloads |
+| `jsonEncoding: 'positional'` | A different wire encoding for relation payloads. It is the PostgreSQL default, so pass `jsonEncoding: 'object'` |
 | **SQL Server** | Uses its own `FOR JSON PATH` relation compiler |
 | **`findUnique`** | Never plans a flatten. `findFirst` does (it routes through `findMany`) |
+
+The first three log a warning once with code `flatten-blocked` while advice is on.
 
 `'flatten'` works on **PostgreSQL, MySQL and SQLite**. PowDB has its own relation path and is unaffected.
 
@@ -512,19 +527,20 @@ Measured on **9,200 parent rows** against local PostgreSQL, as a speedup over th
 | **`'flatten'`** | **1.33x** | **1.56x** |
 | `'batched'` | **2.83x** | not measured |
 
-`'flatten'` beats `'join'` and loses to `'batched'`, for a structural reason: with 2,000 distinct targets behind 9,200 parents, the join transmits the target's columns 9,200 times, while the batched loader transmits 2,000 rows exactly once. As the cardinality approaches 1:1 that gap closes. Local round-trip time is also about 0.1 ms here, which favors the batched loader's extra round-trip more than a real network would.
+`'flatten'` beats `'join'` and loses to `'batched'` for a structural reason. With 2,000 distinct targets behind 9,200 parents, the join sends the target's columns 9,200 times, while the batched loader sends 2,000 rows once. The gap closes as the ratio approaches one parent per target. The local round trip here was also about 0.1 ms, which favors the batched loader's extra round trip more than a real network would.
 
-What `'flatten'` buys: one round-trip, transaction-trivial, no client-side stitching, and strictly better than `'join'` on large to-one parent sets. If raw throughput on a wide to-one fan-in is what you want and a second round-trip is acceptable, `'batched'` is still faster, which is why `'flatten'` is not wired into `'auto'`.
+`'flatten'` gives you one round trip, no client-side stitching, and a consistent win over `'join'` on large to-one parent sets. If you want the most throughput on a wide to-one fan-in and can afford a second round trip, `'batched'` is still faster, which is why `'auto'` does not use `'flatten'`.
 
 ## Lean JSON encoding
 
-With the join strategy, each nested row has to be encoded as JSON by the server. There are two encodings, and **on PostgreSQL the lean one is the default**.
+With the join strategy, the server encodes each nested row as JSON. There are two encodings, and **on PostgreSQL the lean one is the default**.
 
-`jsonEncoding: 'positional'` emits `json_agg(json_build_array(…))`, a key-less array per row. Turbine knows the column order at build time and maps positions back to keys when parsing. The alternative, `'object'`, emits `json_build_object('id', …, 'title', …)`, which repeats every key name in every row of every relation; for wide relations over large result sets that repetition dominates the wire payload.
+- `'positional'` emits `json_agg(json_build_array(…))`, a key-less array per row. Turbine knows the column order when it builds the query and maps positions back to keys when it parses the result.
+- `'object'` emits `json_build_object('id', …, 'title', …)`, which repeats every key name in every row of every relation. On wide relations over large results, that repetition dominates the payload.
 
-Measured on the L2 shape: **152 KB to 100 KB** on the wire and **0.685 ms to 0.350 ms** of server time. On a 14-column `hasMany` relation, 39% fewer wire bytes. The parsed rows are **byte-identical** either way; only the wire format changes.
+On the two-level nested read from the [benchmarks](/benchmarks), positional encoding cut the payload from **152 KB to 100 KB** and server time from **0.685 ms to 0.350 ms**. On a 14-column `hasMany` relation it sends 39% fewer bytes. The parsed rows are **byte-identical** either way; only the wire format changes.
 
-**The default is `'positional'` on PostgreSQL and `'object'` everywhere else.** The default is derived from the dialect, not from a capability flag, so an engine that cannot build a JSON array never selects an encoding its builder would then refuse. You can override it per client or per query:
+**The default is `'positional'` on PostgreSQL and `'object'` everywhere else.** It follows the engine's `positionalJson` capability, the same flag the query builder checks before it emits the positional form, so the default never picks an encoding the engine would refuse. Asking for `'positional'` on another engine throws `UnsupportedFeatureError` (`TURBINE_E017`) when the query loads relations. Override the default per client or per query:
 
 ```ts
 // per client
@@ -537,11 +553,11 @@ const db = turbine({
 await db.users.findMany({ with: { posts: true }, jsonEncoding: 'object' });
 ```
 
-Two things to know. `relationLoadStrategy: 'batched'` bypasses the encoding entirely, since there is no JSON aggregation on that path. And `relationLoadStrategy: 'flatten'` requires `'object'`: under the positional default a flatten-planned relation silently falls back to the correlated subquery (with a once-only warning while [`diagnostics`](/observability#diagnostics-diagnostics) advice is on, code `flatten-fallback`), so pass `jsonEncoding: 'object'` alongside it if you want flatten to engage.
+`relationLoadStrategy: 'batched'` ignores the encoding, since that path builds no JSON. `relationLoadStrategy: 'flatten'` needs `'object'`: under the positional default the whole query falls back to correlated subqueries, logged once as `flatten-blocked` while [`diagnostics`](/observability#diagnostics-diagnostics) advice is on. Pass `jsonEncoding: 'object'` alongside it.
 
 ## SQL template cache size
 
-Repeated queries of the same shape reuse cached SQL text instead of rebuilding it. `sqlCacheSize` bounds the per-table LRU template cache:
+Turbine caches the SQL text of each query shape and reuses it when the same shape runs again. `sqlCacheSize` bounds the per-table LRU cache:
 
 ```ts
 const db = turbine({
@@ -550,29 +566,29 @@ const db = turbine({
 });
 ```
 
-Values are parameterized (`$1, $2, …`) and never fragment the cache, so this bounds distinct query **shapes**. The default is `1000`: raise it for apps with a very large surface of query shapes, or lower it to cap memory. `sqlCacheSize: 0` disables caching entirely (identical to `sqlCache: false`).
+Values are bound as parameters (`$1, $2, …`) and never fragment the cache, so the size bounds distinct query **shapes**. The default is `1000`. Raise it for an app with a very large number of query shapes, or lower it to cap memory. `sqlCacheSize: 0` turns caching off, the same as `sqlCache: false`.
 
 ## The generic-plan cliff: `planCacheMode`
 
-Not a relations feature, but it decides whether the queries above stay fast: a condition, a mechanism, a fix, and an escape hatch. The symptom looks like nothing you did.
+This is a PostgreSQL behavior rather than a relations feature, but it decides whether the queries above stay fast.
 
 ### The condition
 
-A query is fast the first few times you run it and then, with no deploy, no data change and no different arguments, becomes **orders of magnitude slower and stays that way** for the life of the connection. Restarting the process fixes it until it happens again. It typically shows up on one tenant, customer or account, while the same endpoint stays fast for everyone else.
+A query is fast the first few times it runs. Then, with no deploy, no data change and no different arguments, it becomes **orders of magnitude slower and stays slow** for the life of the connection. Restarting the process fixes it until it happens again. It usually hits one tenant, customer or account while the same endpoint stays fast for everyone else.
 
 You are exposed when all of these hold:
 
-- You are on **PostgreSQL 12 or newer** with **named prepared statements** on. Turbine defaults `preparedStatements: true` on a pool it owns.
-- The statement carries a predicate whose **selectivity swings by orders of magnitude across the bound values**. The canonical case is a shared multi-tenant table with a `tenant_id` equality, where one tenant owns a few hundred rows and another owns most of the table.
+- You run **PostgreSQL 12 or newer** with **named prepared statements** on. Turbine turns `preparedStatements` on by default for a pool it opens, unless the connection string, `host` or `port` names a connection pooler.
+- The statement has a predicate whose **selectivity swings by orders of magnitude across bound values**. The classic case is a shared multi-tenant table filtered on `tenant_id`, where one tenant owns a few hundred rows and another owns most of the table.
 - The statement runs at least six times on the same connection.
 
 ### The mechanism
 
-PostgreSQL caches the plan for a **named** prepared statement. For the first five executions it builds a **custom plan** using the actual bound values, so a sparse `tenant_id` gets an index seek and a dense one gets a scan. From the **sixth** execution the backend may switch to a **generic plan**, planned once with no knowledge of the values, if its estimated cost is not worse than the average custom-plan cost. Once kept, the statement **never reverts** for as long as the connection lives.
+PostgreSQL caches the plan of a **named** prepared statement. For the first five executions it builds a **custom plan** from the bound values, so a sparse `tenant_id` gets an index seek and a dense one gets a scan. From the **sixth** execution it may switch to a **generic plan**, built once without the values, if that plan's estimated cost is not worse than the average custom plan's. Once it switches, the statement **never switches back** while the connection lives.
 
 A generic plan is wrong for the values that are not average: the sparse tenant inherits a plan built for a dense one.
 
-The measured shape, on a 358,000-row table with skewed tenants, one connection, ordered-with-limit lookup for the sparse tenant. Execution times in milliseconds:
+Measured on a 358,000-row table with skewed tenants, one connection, an ordered lookup with a limit for the sparse tenant. Execution times in milliseconds:
 
 | `planCacheMode` | exec 1 | 2 | 3 | 4 | 5 | **6** | 7 | 8 | 9 |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
@@ -580,34 +596,34 @@ The measured shape, on a 358,000-row table with skewed tenants, one connection, 
 | `'force_custom_plan'` | 1.0 | 0.3 | 0.2 | 0.2 | 0.2 | **0.2** | 0.2 | 0.2 | 0.3 |
 | `'force_generic_plan'` | 357.5 | 344.3 | 336.1 | 334.6 | 338.1 | **342.7** | 345.7 | 363.4 | 341.1 |
 
-The cliff lands exactly on execution six, and `'force_generic_plan'` reproduces it from execution one. The same query against a **dense** tenant is flat at ~0.2 ms in every row: for that tenant the generic plan is the right plan.
+The cliff lands on execution six, and `'force_generic_plan'` reproduces it from execution one. The same query for a **dense** tenant stays at ~0.2 ms in every row: for that tenant, the generic plan is the right plan.
 
 ### How to diagnose it
 
-Three checks, in increasing order of effort.
+Three checks, from cheapest to most thorough.
 
-**1. The one-line test.** On a session that reproduces the slowness, run the statement six or more times, then:
+**1. The one-line test.** On a session that shows the slowness, run the statement six or more times, then:
 
 ```sql
 SET plan_cache_mode = force_custom_plan;
 ```
 
-and run it again on that same session. If the query snaps back to its first-execution speed, you have found it. `SET plan_cache_mode = auto;` puts it back.
+and run it again on the same session. If it returns to its first-execution speed, you have found the cause. `SET plan_cache_mode = auto;` puts it back. Run this test on a direct connection, never through a transaction pooler, where a session `SET` stays on a server connection that other clients share.
 
-**2. The backend's own counters.** `pg_prepared_statements` tracks the split per statement:
+**2. The backend's counters.** `pg_prepared_statements` tracks the split for each statement:
 
 ```sql
 SELECT name, generic_plans, custom_plans FROM pg_prepared_statements;
 ```
 
-In the run above, the default gave `custom_plans = 5` with `generic_plans` climbing after that; `force_custom_plan` gave `custom_plans = 9, generic_plans = 0`. A statement with a growing `generic_plans` and a stalled `custom_plans` has been promoted.
+In the run above, the default gave `custom_plans = 5` with `generic_plans` climbing after that, and `force_custom_plan` gave `custom_plans = 9, generic_plans = 0`. A statement whose `generic_plans` keeps growing while `custom_plans` has stopped has switched.
 
-**3. `EXPLAIN`, on the prepared statement, not on the literal SQL.** `EXPLAIN SELECT …` with your values written in gives a custom plan by construction and will look fine. Instead, prepare the statement, `EXPLAIN (ANALYZE, BUFFERS) EXECUTE …` it six times, and compare the plan before and after promotion, looking for the selective predicate **moving out of the index condition and into a filter**. In the run above:
+**3. `EXPLAIN` on the prepared statement, not on the literal SQL.** `EXPLAIN SELECT …` with your values written in always gets a custom plan, so it will look fine. Instead, prepare the statement, run `EXPLAIN (ANALYZE, BUFFERS) EXECUTE …` six times, and compare the plan before and after the switch. Look for the selective predicate **moving out of the index condition and into a filter**. In the run above:
 
 - **Custom plan:** index-only scan on the tenant index with a top-N sort, estimated cost 25.34, actual 0.14 ms.
 - **Generic plan:** a backward index scan on the ordering column with `tenant_id` demoted to a **filter**, estimated cost 3.32 (cheaper on paper, which is why it won), actual 461 ms, with `Rows Removed by Filter: 357550`.
 
-A large `Rows Removed by Filter` on a column you have an index for is the signature.
+A large `Rows Removed by Filter` on a column you have indexed is the signature.
 
 ### The fix
 
@@ -618,17 +634,17 @@ const db = turbine({
 });
 ```
 
-`'force_custom_plan'` tells the backend to re-plan on every execution, so the plan always sees the values. You pay the planning cost each time (microseconds for a simple statement, and the parse is still cached), and the cliff is gone.
+`'force_custom_plan'` makes the backend plan every execution with the real values. You pay the planning cost each time (microseconds for a simple statement, and the parse is still cached), and the cliff is gone.
 
-Turbine applies it as a **connection parameter** (`options=-c plan_cache_mode=…`) as the pool opens a connection, never as a `SET` issued after checkout. It is therefore in force for that connection's very first statement, for every later checkout, `$transaction`, stream and pipeline on it, and it cannot race your first query. An existing `PGOPTIONS` or a `?options=…` already on the connection string is appended to, never replaced. Unset (the default), Turbine sends nothing at all.
+Turbine sends it as a **connection parameter** (`options=-c plan_cache_mode=…`) when the pool opens a connection, never as a `SET` after checkout. It therefore applies from the connection's first statement, to every later checkout, `$transaction`, stream and pipeline on it, and it cannot race your first query. An existing `PGOPTIONS`, or a `?options=…` on the connection string, is appended to, never replaced. With `planCacheMode` unset (the default), Turbine sends nothing.
 
-The other two values are diagnostic more than prescriptive: `'auto'` states the backend default explicitly, and `'force_generic_plan'` is how you prove the pathology exists (or measure the opposite case, a statement where planning cost dominates and the generic plan is the one you want).
+The other two values are for diagnosis: `'auto'` states the backend default explicitly, and `'force_generic_plan'` proves the problem exists. It also covers the opposite case, a statement where planning cost dominates and the generic plan is the one you want.
 
 ### What this actually reaches in Turbine
 
-The option reaches every connection the client hands out, and no Turbine read shape is exempt. A bound `LIMIT $n` does not protect a paginated read: for a limit it cannot see, the planner **substitutes a default of 10% of the child node's own row estimate**, wrong in both directions.
+The setting reaches every connection the client hands out, and no Turbine read shape is exempt. A bound `LIMIT $n` does not protect a paginated read: for a limit it cannot see, the planner **assumes 10% of the child node's own row estimate**, which can be wrong in either direction.
 
-Measured on PostgreSQL 16 with `synchronize_seqscans` off and parallelism disabled; both fixtures are reproducible from the description.
+The measurements below ran on PostgreSQL 16 with `synchronize_seqscans` off and parallelism disabled.
 
 **The substituted defaults.** 400,000 rows, `k = id % 104` so `n_distinct` is exactly 104, a btree on `k`, under `force_generic_plan`:
 
@@ -640,28 +656,28 @@ Measured on PostgreSQL 16 with `synchronize_seqscans` off and parallelism disabl
 | `WHERE k = $1 LIMIT $2` | `Limit` 385 rows | 10% of the 3846-row child |
 | `WHERE id = $1 LIMIT $2` | `Limit` 1 row | the 10% fraction clamps at 1 |
 
-A generic plan substitutes a default for **every** value it cannot see, and each unknown alone can flip the plan shape. Two conditions on the 10% are easy to miss: it clamps at one row, so it is not always an overestimate, and an unknown `OFFSET` triggers the same substitution **on its own** even when the limit is a constant (`LIMIT 20 OFFSET $2` estimated its 20 rows correctly but costed a 385-row prefix as startup, and picked a different plan shape from the same query with no offset). Turbine binds both (`… LIMIT $2 OFFSET $3`), so a paginated read has no constant-limit escape; in this fixture the constant-limit form chose a seq scan anyway.
+A generic plan substitutes a default for **every** value it cannot see, and any one of them can change the plan shape. The 10% rule clamps at one row, so it is not always an overestimate. An unknown `OFFSET` triggers the same substitution **on its own**, even with a constant limit: `LIMIT 20 OFFSET $2` estimated its 20 rows correctly but costed a 385-row prefix as startup, and chose a different plan shape from the same query without an offset. Turbine binds both (`… LIMIT $2 OFFSET $3`), so a paginated read has no constant-limit escape.
 
-**What actually goes wrong, and when.** Two 200,000-row tables joined on an indexed key, with a predicate matching 190,000 rows for one value and one row for the rest (`n_distinct` sampled at roughly 1,600, an ANALYZE estimate that varies on rebuild), for `SELECT count(*) FROM j JOIN jc ON jc.j_id = j.id WHERE j.k2 = $1`. No `LIMIT`, no `OFFSET`, no `ORDER BY` anywhere:
+**When it goes wrong.** Two 200,000-row tables joined on an indexed key, with a predicate that matches 190,000 rows for one value and one row for each other value (`n_distinct` sampled at roughly 1,600, an estimate that varies between `ANALYZE` runs), running `SELECT count(*) FROM j JOIN jc ON jc.j_id = j.id WHERE j.k2 = $1`. No `LIMIT`, no `OFFSET`, no `ORDER BY`:
 
 - custom plan: hash join, **1,770 shared buffers**
 - generic plan: nested loop (the ~1,600-way estimate makes 190,000 inner lookups look cheap), **761,002 shared buffers**, a **430x** difference
-- and it is promoted under the **default** `plan_cache_mode = auto`: `pg_prepared_statements` reports `generic_plans = 2, custom_plans = 5` after seven executions
+- the switch happens under the **default** `plan_cache_mode = auto`: `pg_prepared_statements` reports `generic_plans = 2, custom_plans = 5` after seven executions
 
-The practical takeaways:
+What follows from this:
 
-- **The sixth execution is a ceiling, not a trigger.** `auto` promotes only when the generic plan's *estimated* cost is not worse than the average custom cost. Check `pg_prepared_statements.generic_plans` to see whether a statement is actually on a generic plan; plenty never are.
-- **The shape that gets promoted unprompted has no limit.** In the same session, the limited form of that predicate was never promoted at all (`generic_plans = 0, custom_plans = 8`), because its substituted row count made the generic plan look *more* expensive. `count()` and an **unlimited** `findMany` both compile to the pure parameterized-predicate shape that promotes on its own, so look at those first.
-- **A limited `findMany` gives the planner two unknowns instead of one**, the predicate value and the limit count, and either alone can flip the plan shape. More unknowns is not the same as more damage.
-- **Neither an `ORDER BY` nor any limit is required**: the 430x case above has none of them, and neither does the clustering counterexample below.
-- **In practice, `ORDER BY` is still the strongest single predictor.** In a table-by-table sweep of a multi-tenant schema, **every** divergent shape measured was `WHERE tenant = $1 ORDER BY id ASC LIMIT $2`, and every shape without an ordering measured 1.00x. The mechanism: an `ORDER BY` on a *different* indexed column hands the planner a second plan it can run away with. `doctor`'s divergence check models exactly this shape.
-- **`implicitPkOrdering` is off by default in core**, so a default `findMany({ where, limit })` emits `SELECT … WHERE … LIMIT $2` with no `ORDER BY` at all. `turbine-orm/prisma-compat` defaults it on. Switching it on adds an ordering a generic plan can walk the whole table in.
+- **The sixth execution makes a switch possible; it does not cause one.** `auto` switches only when the generic plan's *estimated* cost is not worse than the average custom cost. Check `pg_prepared_statements.generic_plans` to see whether a statement has switched. Plenty never do.
+- **Unlimited shapes switch on their own.** In the same session, the limited form of that predicate never switched (`generic_plans = 0, custom_plans = 8`), because its substituted row count made the generic plan look *more* expensive. `count()` and an **unlimited** `findMany` both compile to the bare parameterized-predicate shape that switches on its own, so check those first.
+- **A limited `findMany` gives the planner two unknowns**, the predicate value and the limit, and either one can change the plan shape. More unknowns does not mean more damage.
+- **Neither an `ORDER BY` nor a limit is required.** The 430x case above has neither, and neither does the clustering counterexample below.
+- **In practice, `ORDER BY` is still the strongest single predictor.** Measured table by table across a multi-tenant schema, **every** divergent shape was `WHERE tenant = $1 ORDER BY id ASC LIMIT $2`, and every shape without an ordering measured 1.00x. An `ORDER BY` on a *different* indexed column hands the planner a second plan it can run away with. `doctor`'s divergence check models this shape.
+- **`implicitPkOrdering` is off by default in core**, so a default `findMany({ where, limit })` emits `SELECT … WHERE … LIMIT $2` with no `ORDER BY`. `turbine-orm/prisma-compat` turns it on by default. Turning it on adds an ordering that a generic plan can walk the whole table in.
 
-Treat `planCacheMode` as a targeted remedy for a statement you have **measured** getting slower after its fifth execution, and measure with `plan_cache_mode = force_generic_plan` against `force_custom_plan` rather than reasoning about which query shapes ought to be safe. One measurement hazard: `synchronize_seqscans` is on by default and makes a repeated seq scan resume where the last one stopped, which reported an 8,000-buffer scan as 4 buffers until it was turned off.
+Treat `planCacheMode` as a targeted fix for a statement you have **measured** slowing down after its fifth execution. Measure with `plan_cache_mode = force_generic_plan` against `force_custom_plan` rather than reasoning about which query shapes ought to be safe. One measurement hazard: `synchronize_seqscans`, on by default, makes a repeated seq scan resume where the last one stopped, which reported an 8,000-buffer scan as 4 buffers until it was turned off.
 
 ### A per-query lever: `forceCustomPlan`
 
-`planCacheMode` is a connection parameter, so it cannot express *custom here, `auto` there*. Since 0.56.0 the read args carry a per-query opt-in that can:
+`planCacheMode` is a connection parameter, so it cannot say *custom here, `auto` there*. The `forceCustomPlan` read option can:
 
 ```ts
 const rows = await db.orders.findMany({
@@ -672,20 +688,9 @@ const rows = await db.orders.findMany({
 });
 ```
 
-It is available on `findMany`, `findUnique`, `findFirst` (and the `OrThrow` forms), `count`, `aggregate`, `groupBy`, the streaming read, and the batched strategy's relation follow-ups. It is a **read** arg: writes do not take it.
+It works on `findMany`, `findUnique`, `findFirst` (and their `OrThrow` forms), `count`, `aggregate`, `groupBy`, the streaming read, and the batched strategy's relation follow-ups. It is a **read** option: writes do not take it. Through `turbine-orm/prisma-compat`, pass it as a [Turbine-native query option](/migrate-from-prisma#turbine-native-query-options).
 
-<Callout type="warning" title="On turbine-orm/prisma-compat this did nothing before 0.57.0">
-  From 0.56.0 until 0.57.0, `forceCustomPlan` passed through
-  `turbine-orm/prisma-compat` type-checked and was silently dropped, along with
-  every other Turbine-native query option missing from the adapter's key list;
-  the core client was never affected. 0.57.0 forwards them all and makes a newly
-  added core option a build failure in the adapter: see
-  [Turbine-native query options](/migrate-from-prisma#turbine-native-query-options).
-  On 0.56.0, verify at the wire: with the option working, the read leaves no
-  entry in `pg_prepared_statements`.
-</Callout>
-
-**How it works.** `true` sends that one statement **unnamed**. The lever is in the driver, not the backend: node-postgres only skips `Parse` for a statement it has already parsed **by name**, so an unnamed statement is re-parsed on every execution, each `Parse` replaces the unnamed cached plan source with a fresh one whose custom-plan counter is zero, and the five-execution threshold that precedes promotion is never reached. No GUC, no `SET LOCAL`, no transaction, no extra round trip.
+**How it works.** `forceCustomPlan: true` sends that one statement **unnamed**. node-postgres skips `Parse` only for a statement it has already parsed **by name**, so an unnamed statement is parsed again on every execution. Each `Parse` replaces the unnamed cached plan with a fresh one whose custom-plan count is zero, so the five-execution threshold before a switch is never reached. No server setting, no `SET LOCAL`, no transaction, no extra round trip.
 
 **Precedence.**
 
@@ -695,15 +700,15 @@ It is available on `findMany`, `findUnique`, `findFirst` (and the `OrThrow` form
 | `'force_custom_plan'` | redundant, harmless |
 | `'force_generic_plan'` | **refused** with `ValidationError` (`TURBINE_E003`) |
 
-The refusal is measured: `'force_generic_plan'` governs unnamed statements too. Five executions of the same unnamed statement read 19,107 buffers with it in force and 55 with the same connection set back to `auto`, so withholding the name buys nothing, and Turbine asks you to change one of the two settings instead. It can only see the setting *it* applied: a `plan_cache_mode` installed by your own `SET`, by `ALTER ROLE`, or by a pooler is not refused.
+`'force_generic_plan'` governs unnamed statements too. Five executions of the same unnamed statement read 19,107 buffers with it in force and 55 with the connection set back to `auto`. Withholding the name buys nothing there, so Turbine asks you to change one of the two settings. It can see only the setting it applied itself: a `plan_cache_mode` set by your own `SET`, by `ALTER ROLE` or by a pooler is not refused.
 
-Omitting it, or `false`, does **not** opt back out of a client-level setting. With `preparedStatements: false` every statement is already unnamed, so it is a no-op for plan choice. On SQLite, MySQL, SQL Server and PowDB it throws `UnsupportedFeatureError` (`TURBINE_E017`): an engine with no PostgreSQL plan cache cannot make this guarantee.
+Omitting the option, or passing `false`, does **not** opt out of a client-level setting. With `preparedStatements: false` every statement is already unnamed, so the option changes nothing about plan choice. On SQLite, MySQL, SQL Server and PowDB it throws `UnsupportedFeatureError` (`TURBINE_E017`), since an engine without a PostgreSQL plan cache cannot make this guarantee.
 
-**What it costs.** Planning happens on every execution instead of once: noise on a flat read (an unnamed statement also skips the extra first-execution round trip a named one needs), larger for a deep `with` tree, which is a much bigger plan to rebuild each time. Turn it on where a flip is the risk, not everywhere.
+**What it costs.** The statement is planned on every execution instead of once. On a flat read that is noise, and an unnamed statement also skips the extra first-execution round trip a named one needs. On a deep `with` tree it costs more, because the plan rebuilt each time is much bigger. Turn it on where a plan switch is the risk, not everywhere.
 
 ### A custom plan is not automatically the better plan
 
-The counterexample, here so nobody reads `force_custom_plan` as strictly safe. Reproduced on PostgreSQL 16.14 with `synchronize_seqscans` off and parallelism disabled:
+Forcing a custom plan can lose too. Reproduced on PostgreSQL 16.14 with `synchronize_seqscans` off and parallelism disabled:
 
 ```sql
 CREATE TABLE ev (id bigserial PRIMARY KEY, tenant_id int NOT NULL, pad text);
@@ -730,17 +735,15 @@ PREPARE q(int, int) AS SELECT * FROM ev WHERE tenant_id = $1 LIMIT $2;
 | `force_custom_plan` | Seq Scan | **4,262** |
 | `force_generic_plan` | Bitmap Heap Scan | **71** |
 
-60x, with no `ORDER BY` anywhere. The custom planner knows tenant 400 is 20% of the table, so with `LIMIT 20` it prices a sequential scan as nearly free on the assumption it will stop almost immediately. It is right about **how many** rows match and wrong about **where they are**: they are all at the end of the heap, so it reads 319,600 non-matching rows first. The generic plan, unable to see the value, estimates 500 rows, takes the bitmap path, and touches one heap block. Re-insert the identical rows in random physical order and the effect vanishes and reverses (custom 2 buffers, generic in the seventies): the variable is physical **clustering**, not selectivity.
+60x, with no `ORDER BY` anywhere. The custom planner knows tenant 400 is 20% of the table, so with `LIMIT 20` it prices a sequential scan as nearly free, expecting to stop almost at once. It is right about **how many** rows match and wrong about **where they are**: all at the end of the heap, behind 319,600 non-matching rows. The generic plan cannot see the value, estimates 500 rows, takes the bitmap path, and touches one heap block. Insert the same rows in random physical order and the effect vanishes and reverses (custom 2 buffers, generic in the seventies). The variable is physical **clustering**, not selectivity.
 
-The 60x is `force_generic_plan` against `force_custom_plan`, not against the default. On this fixture `plan_cache_mode = auto` never promotes: after nine executions `pg_prepared_statements` reports `generic_plans = 0, custom_plans = 9` (the generic plan's *estimated* cost, 157, is far above the average custom cost, 2.59), and `auto`'s plan is byte-identical to `force_custom_plan`'s. So a shape exists where `force_generic_plan` beats both the default and a forced custom plan by 60x; forcing a custom plan is **not** a 60x regression against the default.
-
-Either way, this is why `forceCustomPlan` is per query and why `planCacheMode: 'force_custom_plan'` is not a blanket recommendation.
+The 60x compares `force_generic_plan` with `force_custom_plan`, not with the default. On this fixture `plan_cache_mode = auto` never switches: after nine executions `pg_prepared_statements` reports `generic_plans = 0, custom_plans = 9`, because the generic plan's *estimated* cost (157) is far above the average custom cost (2.59), and `auto`'s plan is identical to `force_custom_plan`'s. So `force_generic_plan` beats both the default and a forced custom plan by 60x here, and forcing a custom plan is **not** a 60x regression against the default. It is still why `forceCustomPlan` is per query, and why `planCacheMode: 'force_custom_plan'` is not a blanket recommendation.
 
 ### When to reach for this
 
-Recommended: **a multi-tenant reader on a shared table** with a skewed tenant column, paginating with `ORDER BY <pk> LIMIT $n`. That is the shape that diverges, that `doctor` detects, and that `forceCustomPlan` fixes without touching anything else. Run `turbine doctor`, confirm with `pg_prepared_statements.generic_plans` and the `EXPLAIN` pair it prints, and scope the option to the reads it named.
+Use it for **a multi-tenant read on a shared table** with a skewed tenant column, paginating with `ORDER BY <pk> LIMIT $n`. That is the shape that diverges, the shape `doctor` detects, and the shape `forceCustomPlan` fixes without touching anything else. Run `turbine doctor`, confirm with `pg_prepared_statements.generic_plans` and the `EXPLAIN` pair it prints, and set the option only on the reads it names.
 
-Not recommended as a global setting: on a workload with no skew it buys nothing and costs a re-plan per execution, and on the clustering shape above it is the wrong direction outright.
+Do not set it globally. On a workload with no skew it buys nothing and costs a re-plan per execution, and on the clustering shape above it points the wrong way.
 
 ### The blunter alternative: `preparedStatements: false`
 
@@ -751,15 +754,15 @@ const db = turbine({
 });
 ```
 
-With prepared statements off, Turbine submits `{ text, values }` instead of `{ name, text, values }`. No named statement, no cached plan to promote, no cliff. It is also the setting you already need behind a transaction-pooling proxy.
+With prepared statements off, Turbine sends `{ text, values }` instead of `{ name, text, values }`: no named statement, no cached plan to switch, no cliff. You already need this setting behind a transaction-pooling proxy, and Turbine defaults to it when the connection string, `host` or `port` names one.
 
-The cost: the backend re-parses and re-plans **every execution of every statement**, for the whole application, not just the skewed one. `planCacheMode: 'force_custom_plan'` gives up the plan half, keeps the parse half, and only where you asked for it. Reach for `preparedStatements: false` when you want it for the pooler reason anyway, or as a fast global mitigation while you find the statement, and prefer `planCacheMode` as the durable fix.
+The cost: the backend parses and plans **every execution of every statement**, across the whole application, not only for the skewed statement. `planCacheMode: 'force_custom_plan'` gives up only the planning, keeps the parse, and applies only where you set it. Reach for `preparedStatements: false` when you need it for a pooler anyway, or as a quick global mitigation while you find the statement, and prefer `planCacheMode` as the lasting fix.
 
 ### Three scope limits
 
-- **External pools.** Turbine never opens those connections, so the option is a no-op there, with a warning (code `plan-cache-mode-ignored`) printed once per process in every mode. Set the GUC in the driver's own connection setup instead. Turbine-owned string `replicas` on that same client **are** Turbine's connections and do get it, which splits the policy between reads and writes, so the warning names them when they exist.
-- **Postgres wire-compatible engines.** The capability flag speaks for the dialect, not the server. CockroachDB, YugabyteDB and pre-12 PostgreSQL run through the default Postgres dialect and have no `plan_cache_mode`, so they reject the connection parameter itself with `unrecognized configuration parameter` rather than raising `TURBINE_E017`. Leave it unset there. A non-Postgres engine (SQLite, MySQL, SQL Server, PowDB) throws `UnsupportedFeatureError` (`TURBINE_E017`) at construction, and any value outside the three throws `ValidationError` (`TURBINE_E003`).
-- **Connection poolers.** The GUC travels as a connection-time startup parameter, and a pooler may refuse to pass it through (PgBouncer's `ignore_startup_parameters`). Set it on the role there instead: `ALTER ROLE app_user SET plan_cache_mode = 'force_custom_plan';`.
+- **External pools.** Turbine does not open those connections, so `planCacheMode` does nothing there, and a warning (code `plan-cache-mode-ignored`) prints once per process in every mode. Set the parameter in the driver's own connection setup instead. String `replicas` on the same client are connections Turbine opens, so they do get it. That splits the policy between reads and writes, and the warning names the replicas when they exist.
+- **Postgres wire-compatible engines.** The capability flag speaks for the dialect, not the server. CockroachDB, YugabyteDB and PostgreSQL before 12 run through the default Postgres dialect and have no `plan_cache_mode`, so they reject the connection parameter with `unrecognized configuration parameter` rather than Turbine raising `TURBINE_E017`. Leave it unset there. On SQLite, MySQL, SQL Server and PowDB it throws `UnsupportedFeatureError` (`TURBINE_E017`) at construction, and any value outside the three throws `ValidationError` (`TURBINE_E003`).
+- **Connection poolers.** The setting travels as a startup parameter, and a pooler may refuse to pass it on (PgBouncer's `ignore_startup_parameters`). Set it on the role there instead: `ALTER ROLE app_user SET plan_cache_mode = 'force_custom_plan';`.
 
 ## See also
 
