@@ -210,9 +210,9 @@
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.2",
     "@biomejs/biome": "^2.5.14",
-    "@size-limit/esbuild": "^12.1.0",
-    "@size-limit/file": "^12.1.0",
-    "@swc/core": "1.16.2",
+    "@size-limit/esbuild": "^14.1.0",
+    "@size-limit/file": "^14.1.0",
+    "@swc/core": "1.16.12",
     "@types/node": "^22.20.4",
     "@types/pg": "^8.23.1",
     "@zvndev/powdb-client": "^0.20.0",
@@ -224,7 +224,7 @@
     "mssql": "^12.7.2",
     "mysql2": "^3.24.5",
     "publint": "^0.3.24",
-    "size-limit": "^12.1.0",
+    "size-limit": "^14.1.0",
     "tsx": "^4.23.15",
     "typescript": "^6.0.3"
   },
