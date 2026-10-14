@@ -133,9 +133,9 @@ function Scene({ frame }: { frame: Frame }) {
           <stop offset="1" stopColor="#05070b" />
         </linearGradient>
         <radialGradient id={`${id}-lamp`}>
-          <stop offset="0" stopColor="#ffe2b8" stopOpacity="0.95" />
-          <stop offset="0.18" stopColor="#ffb866" stopOpacity="0.35" />
-          <stop offset="1" stopColor="#ff9a3d" stopOpacity="0" />
+          <stop offset="0" stopColor="#fff1e2" stopOpacity="0.95" />
+          <stop offset="0.18" stopColor="#ffd4b2" stopOpacity="0.35" />
+          <stop offset="1" stopColor="#ffb08a" stopOpacity="0" />
         </radialGradient>
         {/* Frame-sized region: a bounding-box one clips the blur off a flat trail. */}
         <filter id={`${id}-glow`} filterUnits="userSpaceOnUse" x="0" y="0" width={frame.w} height={frame.h}>
@@ -171,13 +171,13 @@ function Scene({ frame }: { frame: Frame }) {
               key={`c${s}`}
               d={d}
               fill="none"
-              stroke={s < 2 ? '#fff4dc' : t.spec.color}
+              stroke={s < 2 ? '#ffe6f1' : t.spec.color}
               strokeOpacity={1 - s / 6}
               strokeWidth={2.4 - s * 0.3}
               strokeLinecap="round"
             />
           ))}
-          {t.head && <circle cx={t.head[0]} cy={t.head[1]} r="5" fill="#fff8ea" />}
+          {t.head && <circle cx={t.head[0]} cy={t.head[1]} r="5" fill="#fff0f6" />}
         </g>
       ))}
     </svg>

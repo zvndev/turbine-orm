@@ -9,7 +9,7 @@ type CalloutType = 'note' | 'warning' | 'tip';
 
 const CALLOUT_STYLES: Record<CalloutType, { accent: string; tint: string; label: string }> = {
   note: { accent: '#7d9cc9', tint: 'rgba(125, 156, 201, 0.07)', label: 'Note' },
-  warning: { accent: '#ffb01f', tint: 'rgba(255, 176, 31, 0.07)', label: 'Warning' },
+  warning: { accent: '#ff9f43', tint: 'rgba(255, 159, 67, 0.07)', label: 'Warning' },
   tip: { accent: '#3ddc84', tint: 'rgba(61, 220, 132, 0.06)', label: 'Tip' },
 };
 

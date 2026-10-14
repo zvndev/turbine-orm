@@ -20,19 +20,19 @@
   /* Lines */
   --border: #1a2030;
   --border-strong: #283247;
-  --border-accent: rgba(255, 176, 31, 0.42);
+  --border-accent: rgba(255, 46, 136, 0.42);
 
   /* Text. Muted still clears 6:1 on the page background. */
   --text-primary: #eef1f6;
   --text-secondary: #b6bdcb;
   --text-muted: #8a93a6;
 
-  /* Accent: Turbine amber, the lead tracer's colour */
-  --accent: #ffb01f;
-  --accent-light: #ffc95a;
-  --accent-dim: #c27a00;
-  --accent-glow: rgba(255, 176, 31, 0.1);
-  --accent-glow-strong: rgba(255, 176, 31, 0.3);
+  /* Accent: Turbine pink, the lead tracer's colour */
+  --accent: #ff2e88;
+  --accent-light: #ff7ab5;
+  --accent-dim: #b8125c;
+  --accent-glow: rgba(255, 46, 136, 0.1);
+  --accent-glow-strong: rgba(255, 46, 136, 0.3);
 
   /* Structure: the cool light along the circuit's barriers */
   --steel: #7d9cc9;
@@ -92,7 +92,7 @@ a:hover {
 }
 
 ::selection {
-  background: rgba(255, 176, 31, 0.3);
+  background: rgba(255, 46, 136, 0.3);
   color: #fff;
 }
 
@@ -163,7 +163,7 @@ code {
   color: #fff;
 }
 .logo-mark {
-  filter: drop-shadow(0 0 6px rgba(255, 176, 31, 0.35));
+  filter: drop-shadow(0 0 6px rgba(255, 46, 136, 0.35));
 }
 
 .version-chip {
@@ -488,8 +488,8 @@ code {
 .hero-title-accent {
   color: var(--accent);
   text-shadow:
-    0 0 24px rgba(255, 176, 31, 0.45),
-    0 0 64px rgba(255, 120, 0, 0.25);
+    0 0 24px rgba(255, 46, 136, 0.45),
+    0 0 64px rgba(190, 16, 100, 0.3);
 }
 
 .hero-lede {
@@ -575,7 +575,7 @@ code {
 }
 .hero-stat:first-child dd {
   color: var(--accent);
-  text-shadow: 0 0 18px rgba(255, 176, 31, 0.35);
+  text-shadow: 0 0 18px rgba(255, 46, 136, 0.35);
 }
 .hero-stat dt {
   font-size: 0.82rem;
@@ -731,7 +731,7 @@ code {
 }
 .pain code {
   font-size: 0.86em;
-  color: var(--red);
+  color: var(--text-primary);
 }
 .pain::before {
   content: 'Problem';
@@ -742,7 +742,7 @@ code {
   font-weight: 600;
   letter-spacing: 0.16em;
   text-transform: uppercase;
-  color: var(--red);
+  color: var(--steel);
 }
 .fix {
   margin: 1rem 0 0;
@@ -796,7 +796,7 @@ code {
   box-shadow:
     inset 0 0 0 1px var(--border),
     0 30px 80px rgba(0, 0, 0, 0.45),
-    0 0 60px rgba(255, 176, 31, 0.05);
+    0 0 60px rgba(255, 46, 136, 0.05);
 }
 .showcase-bar {
   display: flex;
@@ -961,8 +961,8 @@ code {
   color: var(--accent);
 }
 .bar-lead .bar-fill {
-  background: linear-gradient(90deg, #ff7a00, var(--accent) 70%, #ffe1a1);
-  box-shadow: 0 0 18px rgba(255, 176, 31, 0.55);
+  background: linear-gradient(90deg, #b3105f, var(--accent) 70%, #ffb3d4);
+  box-shadow: 0 0 18px rgba(255, 46, 136, 0.55);
 }
 .bar-other .bar-fill {
   background: #3a4458;
@@ -1132,7 +1132,7 @@ code {
 .move-card:hover {
   box-shadow:
     inset 0 0 0 1px var(--border-accent),
-    0 0 28px rgba(255, 176, 31, 0.08);
+    0 0 28px rgba(255, 46, 136, 0.08);
   transform: translateY(-2px);
 }
 .box-title {
@@ -1302,7 +1302,7 @@ code {
 }
 .sidebar-link.active {
   color: var(--accent);
-  background: linear-gradient(90deg, rgba(255, 176, 31, 0.12), rgba(255, 176, 31, 0.02));
+  background: linear-gradient(90deg, rgba(255, 46, 136, 0.12), rgba(255, 46, 136, 0.02));
 }
 .sidebar-link.active::before {
   content: '';
@@ -1455,7 +1455,7 @@ code {
 .mdx-content a {
   color: var(--accent-light);
   text-decoration: underline;
-  text-decoration-color: rgba(255, 176, 31, 0.35);
+  text-decoration-color: rgba(255, 46, 136, 0.35);
   text-underline-offset: 3px;
   text-decoration-thickness: 1px;
 }
@@ -1503,7 +1503,7 @@ code {
   padding: 0.85rem 1.1rem;
   margin: 1.6rem 0;
   color: var(--text-secondary);
-  background: linear-gradient(90deg, rgba(255, 176, 31, 0.07), rgba(255, 176, 31, 0.015));
+  background: linear-gradient(90deg, rgba(255, 46, 136, 0.07), rgba(255, 46, 136, 0.015));
 }
 .mdx-content blockquote p {
   margin: 0;

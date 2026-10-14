@@ -453,7 +453,7 @@ export function startHeroScene(canvas: HTMLCanvasElement, options: HeroOptions):
   const lampUniform = { value: Array.from({ length: MAX_LAMPS }, () => new Vector4()) };
   const tracerLightUniform = { value: Array.from({ length: TRACER_LIGHTS }, () => new Vector4()) };
   const tracerColorUniform = { value: Array.from({ length: TRACER_LIGHTS }, () => new Vector3()) };
-  const lampColor = new Color(1.0, 0.82, 0.62);
+  const lampColor = new Color(1.0, 0.88, 0.76);
   const lightUniforms = {
     uLamps: lampUniform,
     uLampColor: { value: new Vector3(lampColor.r, lampColor.g, lampColor.b) },

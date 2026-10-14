@@ -82,23 +82,23 @@ export interface TracerSpec {
 }
 
 /**
- * The lead tracer is Turbine amber. The other two are desaturated nods to an
+ * The lead tracer is Turbine pink. The other two are desaturated nods to an
  * indigo-to-teal family and an acid lime, kept dim enough to read as company
  * on the track rather than as labels.
  */
 export const TRACERS: readonly TracerSpec[] = [
   {
     id: 'lead',
-    color: '#ffb01f',
-    tail: '#ff6a00',
+    color: '#ff2e88',
+    tail: '#b3105f',
     commit: 1,
     lane: 0,
     wander: 0,
     wanderSeed: 0,
-    vmax: 44,
-    aLat: 64,
-    aAcc: 25,
-    aBrk: 58,
+    vmax: 48,
+    aLat: 74,
+    aAcc: 30,
+    aBrk: 64,
     intensity: 1,
   },
   {
@@ -109,10 +109,10 @@ export const TRACERS: readonly TracerSpec[] = [
     lane: 0.55,
     wander: 0.22,
     wanderSeed: 1.7,
-    vmax: 43.6,
-    aLat: 60.5,
-    aAcc: 23.5,
-    aBrk: 55,
+    vmax: 43,
+    aLat: 59,
+    aAcc: 23,
+    aBrk: 54,
     intensity: 0.62,
   },
   {
@@ -123,16 +123,16 @@ export const TRACERS: readonly TracerSpec[] = [
     lane: -0.55,
     wander: 0.3,
     wanderSeed: 4.2,
-    vmax: 43.8,
-    aLat: 59.5,
-    aAcc: 24,
-    aBrk: 53,
+    vmax: 42.6,
+    aLat: 58,
+    aAcc: 22.5,
+    aBrk: 52,
     intensity: 0.58,
   },
 ];
 
-/** One race lasts this long, then the lights fade and the grid resets. */
-export const RACE_PERIOD = 46;
+/** One race lasts this long, then the lights fade and the grid resets. Short enough that the leader never comes back around to the pack. */
+export const RACE_PERIOD = 30;
 /** The moment the static fallback and the reduced-motion still depict. */
 export const STILL_TIME = 8.8;
 /** Seconds of history each trail shows. */
