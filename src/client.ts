@@ -60,6 +60,7 @@ import { hasRelationFields } from './nested-write.js';
 import { type ObserveConfig, ObserveEngine, type ObserveHandle } from './observe.js';
 import type { PgCompatPool, PgCompatPoolClient, PgCompatQueryResult } from './pg-types.js';
 import { executePipeline, type PipelineOptions, type PipelineResults, pipelineSupported } from './pipeline.js';
+import { txQueryOptions } from './query/builder.js';
 import {
   type DeferredQuery,
   type GlobalFilters,
@@ -721,7 +722,9 @@ export interface TurbineConfig {
    * connection, so a statement named on one is missing (or already present) on
    * the next, unless the pooler tracks prepared statements (PgBouncer 1.21+
    * with `max_prepared_statements` above 0). Set `true` on such a pooler only
-   * when it does; Turbine warns once in development when you do.
+   * when it does. Turbine warns once (`prepared-statements-on-pooler`) when you
+   * set `true` and the connection settings name a pooler: Turbine's own, or
+   * the `options` of a `pg.Pool` you pass as `pool` (since 0.90.2).
    *
    * Override with `TURBINE_DISABLE_PREPARED=1` env var.
    *
@@ -1743,7 +1746,7 @@ export class TransactionClient {
       // Create a QueryInterface that uses the transaction client as its "pool"
       // We use a proxy pool that routes queries through the transaction client
       const txPool = this.createTxPool();
-      const txOpts = { ...this.queryOptions, _txScoped: true };
+      const txOpts = txQueryOptions(this.queryOptions);
       qi = txOpts.queryInterfaceFactory
         ? asQueryInterface(txOpts.queryInterfaceFactory(txPool, name, this.schema, this.middlewares, txOpts))
         : new QueryInterface<object>(txPool, name, this.schema, this.middlewares, txOpts);
@@ -2374,8 +2377,11 @@ export class TurbineClient {
     // Respect env var kill switch
     const envDisablePrepared = typeof process !== 'undefined' && process.env?.TURBINE_DISABLE_PREPARED === '1';
     const pooler = config.pool ? undefined : TurbineClient.poolerEndpoint(config);
-    if (config.preparedStatements === true && pooler !== undefined) {
-      TurbineClient.warnPreparedOnPooler(pooler, logger);
+    // A supplied pool defaults to unnamed statements, so its endpoint is read
+    // only to warn when they are turned on behind a pooler.
+    if (config.preparedStatements === true) {
+      const endpoint = config.pool ? TurbineClient.suppliedPoolEndpoint(config.pool) : pooler;
+      if (endpoint !== undefined) TurbineClient.warnPreparedOnPooler(endpoint, logger);
     }
 
     this.errorMessageMode = config.errorMessages ?? 'safe';
@@ -2787,6 +2793,46 @@ export class TurbineClient {
     for (const replica of config.replicas ?? []) {
       if (typeof replica === 'string' && replica) targets.push(parseConnectionTarget(replica));
     }
+    return TurbineClient.firstPooledTarget(targets);
+  }
+
+  /**
+   * The pooler a pool the CALLER supplied connects to, read from the settings
+   * node-postgres keeps on the pool (`pool.options`, which `pg.Pool` and the
+   * drivers built on it expose), the way {@link poolerEndpoint} reads Turbine's
+   * own: the connection string wins over `host` / `port`, and an unset host or
+   * port is `PGHOST` / `PGPORT`. `undefined` for a pool that exposes no
+   * settings (another driver) or names no pooler.
+   */
+  private static suppliedPoolEndpoint(pool: PgCompatPool): string | undefined {
+    // A diagnostic: a pool whose settings cannot be read is simply not checked,
+    // and nothing here may fail the constructor.
+    let target: ConnectionTarget;
+    try {
+      const options: unknown = (pool as { options?: unknown }).options;
+      if (options === null || typeof options !== 'object') return undefined;
+      const { connectionString, host, port } = options as {
+        connectionString?: unknown;
+        host?: unknown;
+        port?: unknown;
+      };
+      if (typeof connectionString === 'string' && connectionString) {
+        target = parseConnectionTarget(connectionString);
+      } else {
+        const portNumber = typeof port === 'string' ? Number.parseInt(port, 10) : port;
+        target = {
+          host: typeof host === 'string' && host ? host.toLowerCase() : null,
+          port: typeof portNumber === 'number' && Number.isInteger(portNumber) ? portNumber : null,
+        };
+      }
+    } catch {
+      return undefined;
+    }
+    return TurbineClient.firstPooledTarget([target]);
+  }
+
+  /** The first of `targets` that names a pooler, as `host:port`, after filling unset parts from the environment. */
+  private static firstPooledTarget(targets: readonly ConnectionTarget[]): string | undefined {
     const environment = { host: pgEnv('PGHOST'), port: pgEnv('PGPORT') };
     for (const target of targets) {
       const found = detectPoolerTarget(fillTargetFromEnvironment(target, environment));

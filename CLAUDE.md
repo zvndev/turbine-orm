@@ -213,7 +213,9 @@ src/
                       not know which connection it will run on. Behind a pooler,
                       `preparedStatements` defaults to `false` (client.ts: a connection
                       string, `host` or `port` that `detectPooler` recognizes, on a pool
-                      Turbine builds; an explicit `true` there warns), and
+                      Turbine builds; an explicit `true` there warns, and since 0.90.2 so
+                      does an explicit `true` on a supplied `pg.Pool` whose `options` name
+                      a pooler, via `suppliedPoolEndpoint`), and
                       `TURBINE_DISABLE_PREPARED=1` turns names off everywhere.
     deferred.ts    , DeferredQuery, QueryInterfaceOptions, middleware/event types.
                       `queryInterfaceFactory` returns a `TableClient` (see below).
@@ -254,6 +256,27 @@ src/
                       bound method members. Each module's functions are `export function
                       f(qi: BuilderCtx, …)` and import each other directly; the class holds a
                       `private readonly ctx: BuilderCtx`.
+                      SHARED TEMPLATE CACHES (0.90.2): `templateCacheFor` gives every
+                      QueryInterface built from ONE options object, for one schema object
+                      and one table, the same LRU. Keyed by the options object's IDENTITY,
+                      never a fingerprint of its fields, because options change the SQL
+                      without being in the cache key; a copy with any field changed (the
+                      batched loader's `defaultLimit: undefined` children) is another
+                      object and so another cache. Every transaction of a client, and every
+                      nested write, builds from ONE options object (`txQueryOptions`,
+                      memoized per options object, returning already-tx-scoped options
+                      as they are); a fresh `{ ...options, _txScoped: true }` per
+                      transaction gave each `$transaction` an empty cache, so every
+                      statement in it rebuilt its SQL. No options object (a bare
+                      `new QueryInterface`) keeps a private cache. `cacheStats().size` is
+                      the shared cache's; hits and misses stay per accessor. A groupBy
+                      with a JSON-path key or JSON aggregate target is sent UNNAMED: its
+                      aliases are caller text written into the SQL. `aggregate` / `groupBy` are not template-cached
+                      but are NAMED since 0.90.2 (`withPreparedName`, the same
+                      variable-arity bracket `buildCacheEntry` uses), and the `findFirst` /
+                      `findFirstOrThrow` / `findUniqueOrThrow` wrappers pass the inner
+                      statement's name through (they used to drop it). `create`,
+                      `createMany` and `upsert` are still unnamed.
                       TIMEOUTS (0.90): a per-query `timeout` is a number of ms up to
                       2^31-1, or `0` for NO timeout (the pre-0.90 meaning, and the same word
                       `$transaction`'s `timeout` takes); `queryWithTimeout` maps 0 to no
@@ -337,7 +360,12 @@ src/
                       measures the per-row parameter cost from one-row and two-row builds
                       and caps it by `maxBindParameters` and, for a plain INSERT,
                       `capabilities.maxInsertRows`, so chunks are sized before any statement is
-                      built and no engine's own per-statement check refuses one. The MySQL
+                      built and no engine's own per-statement check refuses one. No per-row step
+                      searches the column list (0.90.2): the generated-column check reads the column
+                      list once per CALL (`generatedStoredColumns`), and the row-shape check
+                      compares key sets without ordering them; both used to cost a column
+                      search or a sort per row, ~3.6 µs a row. A test counts column-list reads
+                      through a proxy and requires the same count for 2 rows and 500. The MySQL
                       reselect (0.90) re-reads a `create` only by a key whose value is known
                       EXACTLY (a supplied primary key, the driver's insert id for a
                       server-numbered key, decided by `isGenerated` when the metadata

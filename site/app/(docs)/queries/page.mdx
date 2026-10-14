@@ -1640,6 +1640,22 @@ The suggestion covers plain typos and a guess that leaves out a whole word (`log
   pooler tracks prepared statements (PgBouncer 1.21+ with
   `max_prepared_statements` above 0), `preparedStatements: true` turns them
   back on.
+
+  Measured behind PgBouncer 1.26 in `transaction` mode with
+  `max_prepared_statements = 0`, 200 concurrent reads: the defaults completed
+  200 of 200, for a pool you pass in and for one Turbine opens. A pool you pass
+  in with `preparedStatements: true` completed 15; the rest failed with
+  `ConnectionError` (E004, `sqlstate` 42P05 or 26000). Since 0.90.2 Turbine
+  warns once (`prepared-statements-on-pooler`) when you turn them on for a
+  `pg.Pool` whose settings name a pooler, as it already did for its own pools.
+
+  Which statements are named: `findMany`, `findUnique`, `findFirst` (and the
+  `OrThrow` forms), `count`, `aggregate`, `groupBy`, `update`, `updateMany`,
+  `delete` and `deleteMany`, except a statement whose shape the caller writes:
+  an `AND` / `OR` array, and a `groupBy` with a JSON-path key or JSON aggregate
+  target. `create`, `createMany`, `upsert` and raw SQL are always sent unnamed.
+  Before 0.90.2 `findFirst`, its `OrThrow` forms, `findUniqueOrThrow`,
+  `aggregate` and `groupBy` were unnamed too.
 </Callout>
 
 <Callout type="warning" title="Named statements accumulate, and a request body can choose how many">

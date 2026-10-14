@@ -221,6 +221,10 @@ export function buildGroupBy<T extends object>(
       havingGroupKeys.set(field, { kind: 'column', field });
     } else {
       const col = resolveJsonPathTarget(qi, 'group key', entry.field, entry.path);
+      // The alias below is caller text (`alias`, else the last path segment),
+      // written into the statement, so the statement goes unnamed: a key
+      // chosen per request would otherwise claim a prepared name per value.
+      qi.markVariableArity();
       assertAggregatePiiOptIn(qi.table, meta, entry.field, col, 'groupBy JSON `by` key', includePii);
       params.push(whereMod.jsonPathParam(qi, entry.path));
       const extract = qi.dialect.buildJsonPathExtract(qi.q(col), qi.p(params.length));
@@ -305,6 +309,8 @@ export function buildGroupBy<T extends object>(
         continue;
       }
       const col = resolveJsonPathTarget(qi, `${aggKey} target "${key}"`, target.field, target.path);
+      // `key` is a caller-chosen label written into the alias: unnamed, as above.
+      qi.markVariableArity();
       if (aggKey === '_min' || aggKey === '_max') {
         assertAggregatePiiOptIn(qi.table, meta, target.field, col, `groupBy ${aggKey} JSON target`, includePii);
       }

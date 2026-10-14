@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.90.2 (2026-10-13)
+
+A performance patch. `createMany` no longer searches the column list for every
+field of every row, a `$transaction` reuses SQL built by earlier transactions,
+and `findFirst`, `aggregate` and `groupBy` now use named prepared statements
+like the other reads. No query's SQL text changes. The one new refusal is a
+`createMany` row that is not an object.
+
+### Performance
+
+- **`createMany` spends about a tenth of the JavaScript it did.** The check
+  that refuses a write to a `GENERATED ALWAYS AS ... STORED` column searched
+  the column list for every field of every row, with a `camelToSnake` per
+  comparison, and the check that every row names the same fields sorted each
+  row's keys. Both now do their per-call work once. Building a 150-row upsert
+  (`onConflict` with five `expr.add` updates) went from 533 µs to 52 µs, 3.6
+  µs to 0.35 µs a row. A test counts reads of the column list and requires
+  the same count for 2 rows and for 500.
+- **A `$transaction` no longer rebuilds the SQL of every statement it sends.**
+  A transaction builds its own query interface per table, and each one started
+  with an empty SQL template cache, so every statement in every transaction was
+  built from scratch. All transactions of a client, and the nested writes
+  inside them, now share one cache per table. A cache is shared only between
+  query interfaces built from the same client options and schema, so two
+  configurations are never served each other's SQL. `cacheStats().size` now
+  reports that shared cache; `hits` and `misses` are still per accessor.
+- Together, on a heartbeat-shaped transaction (a locking read, 11 updates with
+  `expr`, a 150-row upsert) against local PostgreSQL 16, with 0.90.1, 0.90.2
+  and the same SQL through `raw` alternating in one process:
+
+  | Measure | 0.90.1 | 0.90.2 | `raw` |
+  |---|---|---|---|
+  | Turbine's JavaScript per transaction, no database | 685 µs | 217 µs | 68 µs |
+  | Transaction p50, one at a time | 2.67 ms | 2.15 ms | 1.79 ms |
+  | Transactions per second, 16 concurrent | 411 | 524 | 613 |
+
+  The machine was shared with other work, so read the last two rows as
+  ratios.
+
+### Fixed
+
+- **`findFirst`, `findFirstOrThrow`, `findUniqueOrThrow`, `aggregate` and
+  `groupBy` were always sent unnamed,** even with `preparedStatements: true`,
+  so the server parsed them on every call. The three wrappers built their
+  statement from `findMany` or `findUnique` and dropped its name; `aggregate`
+  and `groupBy` never asked for one. They are now named as the other reads
+  are. A caller-written `AND` / `OR` array (in `where` or `having`) still
+  sends the statement unnamed, and so does a `groupBy` with a JSON-path key or
+  a JSON aggregate target, whose aliases are caller text written into the SQL.
+  `create`, `createMany`, `upsert` and raw SQL stay unnamed.
+- **`preparedStatements: true` on a pool you pass in now warns when the pool
+  points at a pooler.** The `prepared-statements-on-pooler` warning read only
+  the settings of a pool Turbine opens. It now also reads a `pg.Pool`'s
+  `options` (connection string, else host and port, else `PGHOST` /
+  `PGPORT`), and only when prepared statements are turned on. Measured behind
+  PgBouncer 1.26 in transaction mode with `max_prepared_statements = 0`: the
+  defaults completed 200 of 200 concurrent reads, and a supplied pool with
+  `preparedStatements: true` completed 15, the rest failing with
+  `ConnectionError` (E004). A supplied pool still defaults to unnamed
+  statements, and that does not warn.
+- **A `createMany` row that is not an object is refused.** `[{}, null]` inserted
+  two rows of defaults, and `[{}, 5]` did too. Each now throws
+  `ValidationError` (E003) naming the row.
+
+### Docs
+
+- The prepared-statements callout on the queries page lists which operations
+  are named and gives the PgBouncer measurements above.
+
 ## 0.90.1 (2026-10-13)
 
 A patch release. It fixes a PowDB filter that could write every row, gives a

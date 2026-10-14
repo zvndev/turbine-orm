@@ -196,20 +196,76 @@ describe('prepared statements: caller-written combinator arrays go unnamed', () 
     assert.equal(q.buildFindMany({ where: { OR: [{ age: 1 }, { age: 2 }] } } as never).preparedName, '');
   });
 
-  it('groupBy carries no prepared name at all, so a having OR cannot accumulate statements', () => {
-    // groupBy/aggregate assemble their SQL directly instead of going through
-    // `acquireSql`, so they are outside the named-statement path entirely. This
-    // pins that fact: the HAVING marking is defensive against a future rerouting,
-    // and if groupBy ever gains a prepared name this assertion is what says so.
+  it('groupBy is named, and a caller-written having OR is not', () => {
+    // groupBy and aggregate do not go through the SQL template cache, and until
+    // 0.90.2 they carried no prepared name at all, so with prepared statements
+    // on the server re-parsed every one. They are named the way a cached
+    // statement is, between a reset and a read of the variable-arity flag, so
+    // the HAVING combinator marking applies.
     const q = makeQuery('users', schema());
     const plain = q.buildGroupBy({ by: ['tenantId'], having: { _count: { gt: 1 } } } as never);
-    assert.equal(plain.preparedName, undefined);
+    assert.match(plain.preparedName ?? '', /^t_[0-9a-f]{16}$/);
 
     const combinator = q.buildGroupBy({
       by: ['tenantId'],
       having: { OR: [{ _count: { gt: 1 } }, { age: { _min: { gt: 2 } } }] },
     } as never);
-    assert.equal(combinator.preparedName, undefined);
+    assert.equal(combinator.preparedName, '');
+    const where = q.buildGroupBy({ by: ['tenantId'], where: { OR: [{ age: 1 }, { age: 2 }] } } as never);
+    assert.equal(where.preparedName, '');
+  });
+
+  it('a groupBy whose SQL carries caller text (a JSON-path alias or label) is unnamed', () => {
+    // A JSON-path group key is aliased by its `alias` or its last path segment,
+    // and a JSON aggregate target by its caller-chosen key, both written into
+    // the statement. Named, a key taken from a request would claim one of the
+    // process's prepared-statement names per value.
+    const q = makeQuery('events', {
+      enums: {},
+      tables: {
+        events: mockTable('events', [
+          { name: 'id', field: 'id' },
+          { name: 'tenant_id', field: 'tenantId' },
+          { name: 'age', field: 'age', pgType: 'int4' },
+          { name: 'data', field: 'data', pgType: 'jsonb' },
+        ]),
+      },
+    });
+    const byPath = q.buildGroupBy({ by: [{ field: 'data', path: ['plan'] }], _count: true } as never);
+    assert.equal(byPath.preparedName, '');
+    const target = q.buildGroupBy({ by: ['tenantId'], _sum: { seats: { field: 'data', path: ['seats'] } } } as never);
+    assert.equal(target.preparedName, '');
+    // Column keys alone stay named.
+    assert.match(q.buildGroupBy({ by: ['tenantId'], _sum: { age: true } } as never).preparedName ?? '', /^t_/);
+  });
+
+  it('aggregate is named, and a caller-written where OR is not', () => {
+    const q = makeQuery('users', schema());
+    const plain = q.buildAggregate({ where: { tenantId: 1 }, _sum: { age: true } } as never);
+    assert.match(plain.preparedName ?? '', /^t_[0-9a-f]{16}$/);
+    // Same shape, other values: the same statement, so the same name.
+    const again = q.buildAggregate({ where: { tenantId: 2 }, _sum: { age: true } } as never);
+    assert.equal(again.sql, plain.sql);
+    assert.equal(again.preparedName, plain.preparedName);
+    const combinator = q.buildAggregate({ where: { OR: [{ age: 1 }, { age: 2 }] }, _count: true } as never);
+    assert.equal(combinator.preparedName, '');
+    // The flag does not leak onto the next build.
+    assert.ok((q.buildAggregate({ _count: true } as never).preparedName ?? '').length > 0);
+  });
+
+  it('findFirst, findFirstOrThrow and findUniqueOrThrow keep the name of the statement they run', () => {
+    // They wrap findMany's / findUnique's DeferredQuery, and the wrappers used
+    // to drop its name, so these always ran unnamed.
+    const q = makeQuery('users', schema());
+    const first = q.buildFindFirst({ where: { age: 30 } } as never);
+    assert.match(first.preparedName ?? '', /^t_[0-9a-f]{16}$/);
+    assert.equal(first.preparedName, q.buildFindMany({ where: { age: 30 }, limit: 1 } as never).preparedName);
+    assert.equal(q.buildFindFirstOrThrow({ where: { age: 30 } } as never).preparedName, first.preparedName);
+    const unique = q.buildFindUnique({ where: { id: 1 } } as never);
+    assert.match(unique.preparedName ?? '', /^t_[0-9a-f]{16}$/);
+    assert.equal(q.buildFindUniqueOrThrow({ where: { id: 1 } } as never).preparedName, unique.preparedName);
+    // The variable-arity verdict travels through the wrapper too.
+    assert.equal(q.buildFindFirst({ where: { OR: [{ age: 1 }, { age: 2 }] } } as never).preparedName, '');
   });
 
   it('count / aggregate honour the same rule', () => {

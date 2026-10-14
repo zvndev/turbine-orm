@@ -20,7 +20,6 @@ import {
 import { NotFoundError, OptimisticLockError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import type { PgCompatQueryResult } from '../pg-types.js';
 import type { TableMetadata } from '../schema.js';
-import { camelToSnake } from '../schema.js';
 import { isColumnRef } from './column-ref.js';
 import {
   assertMutationWhereIdentifiesOneRow,
@@ -874,6 +873,9 @@ function definedKeys(qi: BuilderCtx, row: Record<string, unknown>): string[] {
 function assertUniformCreateManyRows(qi: BuilderCtx, rows: Record<string, unknown>[], firstKeys: string[]): void {
   const expected = new Set(firstKeys);
   for (let i = 1; i < rows.length; i++) {
+    // The common case, decided without ordering the row's keys: as many
+    // defined keys as the first row, each one of its keys.
+    if (namesExactly(rows[i]!, expected)) continue;
     const rowKeys = definedKeys(qi, rows[i]!);
     const unexpected = rowKeys.filter((k) => !expected.has(k));
     // No stranger and the same count means the same set (object keys are unique).
@@ -892,6 +894,17 @@ function assertUniformCreateManyRows(qi: BuilderCtx, rows: Record<string, unknow
         'row shape.',
     );
   }
+}
+
+/** Whether `row`'s defined keys are exactly `keys` (object keys are unique, so count plus membership decides it). */
+function namesExactly(row: Record<string, unknown>, keys: ReadonlySet<string>): boolean {
+  let count = 0;
+  for (const key in row) {
+    if (!Object.hasOwn(row, key) || row[key] === undefined) continue;
+    if (!keys.has(key)) return false;
+    count++;
+  }
+  return count === keys.size;
 }
 
 /** `a, b` → `"a", "b"`, for the field lists in {@link assertUniformCreateManyRows}. */
@@ -1008,8 +1021,16 @@ function prepareCreateMany<T extends object>(
   }
 
   assertWritable(qi, 'createMany');
-  for (const row of args.data) {
-    assertNoGeneratedColumns(qi, row as Record<string, unknown>, 'createMany');
+  args.data.forEach((row, i) => {
+    if (row === null || typeof row !== 'object') {
+      throw new ValidationError(
+        `createMany on "${qi.table}": row ${i} is ${row === null ? 'null' : `a ${typeof row}`}, not an object of fields.`,
+      );
+    }
+  });
+  const generated = generatedStoredColumns(qi);
+  if (generated !== null) {
+    for (const row of args.data) assertNoGeneratedKeys(qi, generated, row as Record<string, unknown>, 'createMany');
   }
 
   const keys = definedKeys(qi, args.data[0] as Record<string, unknown>);
@@ -1261,12 +1282,15 @@ function describeConflictTargets(qi: BuilderCtx): string {
 
 /** The conflict-UPDATE's data: the field-list shorthand becomes `{ f: expr.excluded(f) }`. */
 function resolveConflictUpdate(qi: BuilderCtx, raw: unknown): Record<string, unknown> {
-  const empty = new ValidationError(
-    `createMany on "${qi.table}": onConflict.update is empty; use onConflict: { target, ignore: true } to skip ` +
-      'conflicting rows.',
-  );
+  // A function, not an error built up front: constructing one captures a
+  // stack trace, and this runs on every onConflict call.
+  const empty = (): ValidationError =>
+    new ValidationError(
+      `createMany on "${qi.table}": onConflict.update is empty; use onConflict: { target, ignore: true } to skip ` +
+        'conflicting rows.',
+    );
   if (Array.isArray(raw)) {
-    if (raw.length === 0) throw empty;
+    if (raw.length === 0) throw empty();
     const update: Record<string, unknown> = {};
     for (const field of raw) {
       if (typeof field !== 'string') {
@@ -1286,7 +1310,7 @@ function resolveConflictUpdate(qi: BuilderCtx, raw: unknown): Record<string, unk
       `createMany on "${qi.table}": onConflict.update takes a list of field names or a { field: value } object.`,
     );
   }
-  if (!Object.values(raw).some((v) => v !== undefined)) throw empty;
+  if (!Object.values(raw).some((v) => v !== undefined)) throw empty();
   assertNoGeneratedColumns(qi, raw, 'createMany');
   return raw;
 }
@@ -1350,11 +1374,14 @@ function assertNoDuplicateKeys(
 ): void {
   const at = conflict.target.map((c) => columns.indexOf(c));
   const seen = new Map<string, number>();
-  for (let i = 0; i < rowValues.length; i++) {
+  rows: for (let i = 0; i < rowValues.length; i++) {
     const row = rowValues[i]!;
-    const parts = at.map((j) => row[j]);
-    if (parts.some((v) => v === null || v === undefined)) continue;
-    const key = parts.map(keyToken).join('|');
+    let key = '';
+    for (let k = 0; k < at.length; k++) {
+      const value = row[at[k]!];
+      if (value === null || value === undefined) continue rows;
+      key += k === 0 ? keyToken(value) : `|${keyToken(value)}`;
+    }
     const first = seen.get(key);
     if (first !== undefined) {
       throw new ValidationError(
@@ -2568,10 +2595,38 @@ export function assertWritable(qi: BuilderCtx, operation: string): void {
  * (they're stripped from the statement anyway).
  */
 export function assertNoGeneratedColumns(qi: BuilderCtx, data: Record<string, unknown>, operation: string): void {
-  for (const [key, value] of Object.entries(data)) {
-    if (value === undefined) continue;
-    const col = qi.tableMeta.columns.find((c) => c.field === key || c.name === key || c.name === camelToSnake(key));
-    if (col?.isGeneratedStored) {
+  const generated = generatedStoredColumns(qi);
+  if (generated !== null) assertNoGeneratedKeys(qi, generated, data, operation);
+}
+
+/**
+ * The table's generated stored columns, or `null` when it has none (most
+ * tables, and then a write checks nothing). Read once per call, so
+ * `createMany` checks every row against one answer: it used to search the
+ * column list, with a `camelToSnake` per comparison, for every field of every
+ * row, which was most of a 150-row upsert's build time.
+ */
+function generatedStoredColumns(qi: BuilderCtx): ReadonlySet<string> | null {
+  let columns: Set<string> | null = null;
+  for (const c of qi.tableMeta.columns) {
+    if (!c.isGeneratedStored) continue;
+    columns ??= new Set();
+    columns.add(c.name);
+  }
+  return columns;
+}
+
+/** Refuse a key of `data` that names one of `generated` (by THE key rule, {@link resolveColumnName}). */
+function assertNoGeneratedKeys(
+  qi: BuilderCtx,
+  generated: ReadonlySet<string>,
+  data: Record<string, unknown>,
+  operation: string,
+): void {
+  for (const key in data) {
+    if (!Object.hasOwn(data, key) || data[key] === undefined) continue;
+    const column = resolveColumnName(qi.tableMeta, key);
+    if (column !== undefined && generated.has(column)) {
       throw new ValidationError(
         `Cannot ${operation} "${qi.table}": column "${key}" is a GENERATED ALWAYS AS (…) STORED ` +
           'column whose value the database computes, remove it from your data.',
