@@ -3,12 +3,15 @@ import { Sidebar } from '../../components/Sidebar';
 
 export default function DocsLayout({ children }: { children: ReactNode }) {
   return (
-    <div className="flex min-h-screen">
+    <div className="min-h-screen">
+      <a href="#main" className="skip-link">
+        Skip to content
+      </a>
       <Sidebar />
-      <main className="flex-1 min-w-0 md:ml-[260px]">
-        <div className="max-w-content mx-auto px-6 md:px-10 py-12 pb-24">
+      <main id="main" className="docs-main">
+        <article className="docs-article">
           <div className="mdx-content">{children}</div>
-        </div>
+        </article>
       </main>
     </div>
   );

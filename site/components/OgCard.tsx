@@ -6,10 +6,18 @@ import { ImageResponse } from 'next/og';
  * files now hold only the metadata exports Next.js reads by convention
  * (`runtime`, `alt`, `size`, `contentType`, default) and delegate the drawing
  * here, so the card can never drift between the two surfaces.
+ *
+ * It follows the site's night-circuit look: near-black, one amber accent, and
+ * a light trail drawn with plain gradients (no images, no fonts to fetch).
  */
-export const OG_CARD_ALT = 'Turbine ORM - Postgres-native TypeScript ORM';
+export const OG_CARD_ALT = 'Turbine ORM, a TypeScript ORM for Postgres: one query, any depth';
 export const OG_CARD_SIZE = { width: 1200, height: 630 };
 export const OG_CARD_CONTENT_TYPE = 'image/png';
+
+const BG = '#05070b';
+const ACCENT = '#ffb01f';
+const TEXT = '#f2f4f8';
+const MUTED = '#8a93a6';
 
 export function renderOgCard() {
   return new ImageResponse(
@@ -20,102 +28,85 @@ export function renderOgCard() {
           height: '100%',
           display: 'flex',
           flexDirection: 'column',
-          alignItems: 'center',
           justifyContent: 'center',
-          background: '#09090B',
+          padding: '0 88px',
+          background: BG,
           fontFamily: 'system-ui, sans-serif',
           position: 'relative',
           overflow: 'hidden',
         }}
       >
-        {/* Subtle radial glow behind the logo */}
+        {/* Warm haze low on the right, where the trail runs */}
         <div
           style={{
             position: 'absolute',
-            top: '50%',
-            left: '50%',
-            transform: 'translate(-50%, -55%)',
-            width: 600,
-            height: 400,
+            right: -160,
+            bottom: -220,
+            width: 900,
+            height: 520,
             borderRadius: '50%',
-            background: 'radial-gradient(ellipse, rgba(245,158,11,0.10) 0%, transparent 70%)',
+            background: 'radial-gradient(ellipse, rgba(255,140,30,0.16) 0%, transparent 70%)',
           }}
         />
 
-        {/* Lightning bolt icon */}
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            width: 72,
-            height: 72,
-            borderRadius: 18,
-            background: 'rgba(245,158,11,0.12)',
-            border: '1px solid rgba(245,158,11,0.25)',
-            marginBottom: 32,
-          }}
-        >
-          <svg width="36" height="36" viewBox="0 0 24 24" fill="none">
-            <path d="M13 3L4 14h7l-1 7 9-11h-7l1-7z" fill="#F59E0B" />
-          </svg>
-        </div>
-
-        {/* Title */}
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'baseline',
-            gap: 16,
-            marginBottom: 20,
-          }}
-        >
-          <span
-            style={{
-              fontSize: 72,
-              fontWeight: 800,
-              color: '#EDEDEF',
-              letterSpacing: '-0.03em',
-            }}
-          >
-            Turbine
-          </span>
-          <span
-            style={{
-              fontSize: 72,
-              fontWeight: 800,
-              color: '#F59E0B',
-              letterSpacing: '-0.03em',
-            }}
-          >
-            ORM
-          </span>
-        </div>
-
-        {/* Tagline */}
-        <p
-          style={{
-            fontSize: 28,
-            color: '#A1A1AA',
-            margin: 0,
-            fontWeight: 400,
-            letterSpacing: '-0.01em',
-          }}
-        >
-          Postgres-native TypeScript ORM for the Edge
-        </p>
-
-        {/* Bottom accent bar */}
+        {/* The light trail: a soft glow under a bright core, fading to the left */}
         <div
           style={{
             position: 'absolute',
-            bottom: 0,
             left: 0,
             right: 0,
-            height: 4,
-            background: 'linear-gradient(90deg, transparent, #F59E0B, transparent)',
+            bottom: 58,
+            height: 26,
+            background: 'linear-gradient(90deg, transparent 0%, rgba(255,106,0,0) 30%, rgba(255,140,30,0.22) 78%, rgba(255,190,90,0.4) 100%)',
+            borderRadius: 13,
           }}
         />
+        <div
+          style={{
+            position: 'absolute',
+            left: 0,
+            right: 0,
+            bottom: 70,
+            height: 3,
+            background: 'linear-gradient(90deg, transparent 0%, rgba(255,106,0,0.2) 35%, #ffb01f 80%, #fff4dc 100%)',
+          }}
+        />
+
+        {/* Brand */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 18, marginBottom: 44 }}>
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              width: 60,
+              height: 60,
+              borderRadius: 12,
+              background: 'rgba(255,176,31,0.12)',
+              border: '1px solid rgba(255,176,31,0.35)',
+            }}
+          >
+            <svg width="30" height="30" viewBox="0 0 24 24" fill="none">
+              <path d="M13 3L4 14h7l-1 7 9-11h-7l1-7z" fill={ACCENT} />
+            </svg>
+          </div>
+          <span style={{ fontSize: 34, fontWeight: 800, color: TEXT, letterSpacing: '0.12em' }}>TURBINE</span>
+        </div>
+
+        {/* Headline */}
+        <div style={{ display: 'flex', flexDirection: 'column', marginBottom: 28 }}>
+          <span style={{ fontSize: 96, fontWeight: 800, color: TEXT, lineHeight: 1, letterSpacing: '-0.02em' }}>
+            One query.
+          </span>
+          <span style={{ fontSize: 96, fontWeight: 800, color: ACCENT, lineHeight: 1.05, letterSpacing: '-0.02em' }}>
+            Any depth.
+          </span>
+        </div>
+
+        {/* Subline */}
+        <p style={{ fontSize: 30, color: MUTED, margin: 0, fontWeight: 400 }}>
+          A TypeScript ORM for Postgres. One runtime dependency.
+        </p>
       </div>
     ),
     { ...OG_CARD_SIZE },

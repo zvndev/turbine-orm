@@ -1,13 +1,14 @@
-import type { Metadata } from 'next';
-import { Bricolage_Grotesque, DM_Sans, JetBrains_Mono } from 'next/font/google';
+import type { Metadata, Viewport } from 'next';
+import { DM_Sans, JetBrains_Mono, Saira } from 'next/font/google';
 import type { ReactNode } from 'react';
 import './globals.css';
 
-const bricolage = Bricolage_Grotesque({
+// Display face: Saira with its width axis, set wide for headings.
+const saira = Saira({
   subsets: ['latin'],
   variable: '--font-display',
   display: 'swap',
-  weight: ['400', '500', '600', '700', '800'],
+  axes: ['wdth'],
 });
 
 const dmSans = DM_Sans({
@@ -23,27 +24,29 @@ const jetbrains = JetBrains_Mono({
   weight: ['400', '500', '600'],
 });
 
+const description =
+  'A TypeScript ORM for Postgres. Nested reads compile to one SQL statement you can read, with one runtime dependency (pg): no query engine, no WASM. Read-only MCP tools for coding agents, offline index advice, migration guards. MIT.';
+
 export const metadata: Metadata = {
   title: {
-    default: 'Turbine ORM, Postgres-native TypeScript ORM',
+    default: 'Turbine ORM, a TypeScript ORM for Postgres',
     template: '%s, Turbine ORM',
   },
-  description:
-    'A Postgres ORM written from scratch, with one runtime dependency (pg). Typed queries compiled straight to SQL, nested relations in one statement, an 11-tool read-only MCP server for coding agents, offline index advice, and migration guards. MIT.',
+  description,
   metadataBase: new URL('https://turbineorm.dev'),
   openGraph: {
-    title: 'Turbine ORM',
+    title: 'Turbine ORM: one query, any depth',
     description:
-      'A Postgres ORM written from scratch. One dependency, no WASM. Nested relations in one statement, a read-only MCP server for agents, offline index advice, migration guards. MIT.',
+      'Nested reads in one SQL statement. One runtime dependency, no query engine, no WASM. A TypeScript ORM for Postgres, MIT.',
     url: 'https://turbineorm.dev',
     siteName: 'Turbine ORM',
     type: 'website',
   },
   twitter: {
     card: 'summary_large_image',
-    title: 'Turbine ORM',
+    title: 'Turbine ORM: one query, any depth',
     description:
-      'A Postgres ORM written from scratch. One dependency, no WASM. Nested relations in one statement, read-only agent tools, offline index advice. MIT.',
+      'Nested reads in one SQL statement. One runtime dependency, no query engine, no WASM. A TypeScript ORM for Postgres, MIT.',
   },
   icons: {
     icon: '/favicon.svg',
@@ -53,12 +56,14 @@ export const metadata: Metadata = {
   },
 };
 
+export const viewport: Viewport = {
+  themeColor: '#05070b',
+  colorScheme: 'dark',
+};
+
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
-    <html
-      lang="en"
-      className={`dark ${bricolage.variable} ${dmSans.variable} ${jetbrains.variable}`}
-    >
+    <html lang="en" className={`dark ${saira.variable} ${dmSans.variable} ${jetbrains.variable}`}>
       <head>
         {/* Little Friend analytics. It tracks client-side navigations itself, so it loads once here. */}
         <script defer src="https://cdn.littlefriend.io/lf.js" data-site="lf_lPpOvu9zeRrHMLiQjS8IwAyp" data-mode="journey" />
