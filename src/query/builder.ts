@@ -2746,15 +2746,34 @@ export class QueryInterface<
     this.variableArityShape = false;
     this.cacheMisses++;
     this.lastMissParams = built;
+    return { sql, name: this.preparedNameOf(sql, variableArity), paramCount: built.length };
+  }
+
+  /**
+   * The prepared-statement name for `sql`: empty (sent unnamed) for a
+   * variable-arity shape, else derived from the text.
+   */
+  private preparedNameOf(sql: string, variableArity: boolean): string {
+    if (variableArity) return '';
     // With `sqlComment` putting a comment on every statement, the template's own
     // name is never sent (the execute seam sends a `c_` name derived from it),
     // so it is not claimed from the budget: only names that reach the wire do.
-    const name = variableArity
-      ? ''
-      : this.sqlCommenter?.alwaysComments
-        ? sqlToPreparedName(sql)
-        : boundedPreparedName(sql);
-    return { sql, name, paramCount: built.length };
+    return this.sqlCommenter?.alwaysComments ? sqlToPreparedName(sql) : boundedPreparedName(sql);
+  }
+
+  /**
+   * Name a statement the SQL template cache does not hold (`aggregate`,
+   * `groupBy`): the build runs between a reset and a read of the
+   * variable-arity flag, exactly as in {@link buildCacheEntry}, so the same
+   * shapes stay unnamed. These used to be sent unnamed always, so with
+   * prepared statements on the server re-parsed every `aggregate`.
+   */
+  private withPreparedName<D extends DeferredQuery<unknown>>(build: () => D): D {
+    this.variableArityShape = false;
+    const deferred = build();
+    const variableArity = this.variableArityShape;
+    this.variableArityShape = false;
+    return { ...deferred, preparedName: this.preparedNameOf(deferred.sql, variableArity) };
   }
 
   /**
@@ -5111,6 +5130,8 @@ export class QueryInterface<
         return rows.length > 0 ? rows[0]! : null;
       },
       tag: `${this.table}.findFirst`,
+      // findMany's name: the same statement, so the same prepared statement.
+      ...(deferred.preparedName !== undefined ? { preparedName: deferred.preparedName } : {}),
       ...(deferred.rowLock ? { rowLock: true as const } : {}),
     };
   }
@@ -5163,6 +5184,7 @@ export class QueryInterface<
         return row;
       },
       tag: `${this.table}.findFirstOrThrow`,
+      ...(inner.preparedName !== undefined ? { preparedName: inner.preparedName } : {}),
       ...(inner.rowLock ? { rowLock: true as const } : {}),
     };
   }
@@ -5215,6 +5237,7 @@ export class QueryInterface<
         return row;
       },
       tag: `${this.table}.findUniqueOrThrow`,
+      ...(inner.preparedName !== undefined ? { preparedName: inner.preparedName } : {}),
       ...(inner.rowLock ? { rowLock: true as const } : {}),
     };
   }
@@ -5660,11 +5683,15 @@ export class QueryInterface<
   // ---------------------------------------------------------------------------
 
   buildGroupBy<A extends GroupByArgs<T, R>>(args: A): DeferredQuery<GroupByResult<T, A>[]> {
-    return aggMod.buildGroupBy(this.ctx, this.normalizeArgs(args)) as unknown as DeferredQuery<GroupByResult<T, A>[]>;
+    const normalized = this.normalizeArgs(args);
+    return this.withPreparedName(() => aggMod.buildGroupBy(this.ctx, normalized)) as unknown as DeferredQuery<
+      GroupByResult<T, A>[]
+    >;
   }
 
   buildAggregate<A extends AggregateArgs<T, R>>(args: A): DeferredQuery<AggregateResultOf<T, A>> {
-    return aggMod.buildAggregate(this.ctx, this.normalizeArgs(args)) as unknown as DeferredQuery<
+    const normalized = this.normalizeArgs(args);
+    return this.withPreparedName(() => aggMod.buildAggregate(this.ctx, normalized)) as unknown as DeferredQuery<
       AggregateResultOf<T, A>
     >;
   }
