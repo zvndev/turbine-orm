@@ -58,6 +58,7 @@ import {
   BAND_QUERY,
   cameraPose,
   driverAt,
+  FINISH_FADE,
   RACE_PERIOD,
   raceFade,
   STILL_TIME,
@@ -77,13 +78,32 @@ export interface HeroOptions {
 
 export interface HeroHandle {
   setActive(active: boolean): void;
+  /**
+   * Where a mouse or pen is, in client pixels, or null once it leaves the
+   * hero. Tilts the camera a little and lights the asphalt under it.
+   */
+  setPointer(x: number | null, y?: number): void;
+  /** While held, the lead tracer pulls away faster. */
+  setBoost(on: boolean): void;
   dispose(): void;
 }
 
 const HALF = TRACK_WIDTH / 2;
 const BARRIER = HALF + 1.15;
 const MAX_LAMPS = 24;
-const TRACER_LIGHTS = 6;
+/** Two per tracer (head and mid-trail), plus one under the pointer. */
+const TRACER_LIGHTS = 7;
+const POINTER_LIGHT = 6;
+
+/** How much faster the lead runs at full boost (1 = twice its pace). */
+const BOOST_GAIN = 0.85;
+/**
+ * A boosted leader that gets this far ahead (in laps, on the closest of the
+ * pack) is about to come back around to them, so the race ends there.
+ */
+const GAP_LIMIT = 0.72;
+/** Brightness of the light under the pointer. */
+const POINTER_STRENGTH = 6;
 
 /* ------------------------------------------------------------------ */
 /* Procedural textures                                                 */
@@ -865,6 +885,8 @@ export function startHeroScene(canvas: HTMLCanvasElement, options: HeroOptions):
     flat: BufferGeometry;
     color: Color;
     tail: Color;
+    /** Each trail material's brightness, with the value it was built at. */
+    gains: Array<{ uniform: { value: number }; base: number }>;
   }
   const trailVert = /* glsl */ `
     attribute float aAge;
@@ -968,6 +990,7 @@ export function startHeroScene(canvas: HTMLCanvasElement, options: HeroOptions):
     const fm = flatMaterial(color, tail, gain * 0.5);
     const rm = wallMaterial(color, tail, gain * 0.55);
     fadeUniforms.push(wm.uniforms.uFade!, fm.uniforms.uFade!, rm.uniforms.uFade!);
+    const gains = [wm, fm, rm].map((m) => ({ uniform: m.uniforms.uGain!, base: m.uniforms.uGain!.value as number }));
     const wallMesh = new Mesh(wall, wm);
     const flatMesh = new Mesh(flat, fm);
     const reflMesh = new Mesh(wall, rm);
@@ -976,7 +999,7 @@ export function startHeroScene(canvas: HTMLCanvasElement, options: HeroOptions):
     flatMesh.renderOrder = 29;
     scene.add(wallMesh, flatMesh);
     mirror.add(reflMesh);
-    return { wall, flat, color, tail };
+    return { wall, flat, color, tail, gains };
   });
 
   const headGlowGeo = glowGeometry(parts.length);
@@ -1036,8 +1059,28 @@ export function startHeroScene(canvas: HTMLCanvasElement, options: HeroOptions):
   const head = new Float32Array(3);
   const prev = new Float32Array(3);
 
+  /**
+   * The race in progress. `start` is when it began, in scene seconds. The
+   * leader runs `leadExtra` seconds ahead of the race clock (boosting adds
+   * to it). `end` is the race time the lights are gone: RACE_PERIOD, or
+   * sooner once a boosted leader is about to come back around to the pack.
+   */
+  const race = { start: 0, leadExtra: 0, end: RACE_PERIOD };
+  /** 0..1, eased toward 1 while the boost is held. */
+  let boost = 0;
+  let boostHeld = false;
+
+  /** How far ahead the leader is, in laps, of the closest of the pack. */
+  function leadGap(raceTime: number): number {
+    const [lead, ...pack] = model.drivers;
+    const leadLaps = (raceTime + race.leadExtra) / lead!.lapTime;
+    let gap = Number.POSITIVE_INFINITY;
+    for (const d of pack) gap = Math.min(gap, leadLaps - raceTime / d.lapTime);
+    return gap;
+  }
+
   function updateTracers(raceTime: number) {
-    const fade = raceFade(raceTime);
+    const fade = raceFade(raceTime, race.end);
     for (const u of fadeUniforms) u.value = fade;
     const offs = headGlowGeo.attributes.aOffset as InstancedBufferAttribute;
     const sizes = headGlowGeo.attributes.aSize as InstancedBufferAttribute;
@@ -1045,24 +1088,29 @@ export function startHeroScene(canvas: HTMLCanvasElement, options: HeroOptions):
     const dt = TRAIL_SECONDS / (samples - 1);
     model.drivers.forEach((d, di) => {
       const p = parts[di]!;
+      const lift = di === 0 ? boost : 0;
+      const time = di === 0 ? raceTime + race.leadExtra : raceTime;
+      // A boosted trail reaches further back along the line, so it streaks.
+      const step = dt * (1 + 0.9 * lift);
+      for (const g of p.gains) g.uniform.value = g.base * (1 + 0.7 * lift);
       const wallPos = p.wall.attributes.position as BufferAttribute;
       const flatPos = p.flat.attributes.position as BufferAttribute;
       let px = 0;
       let pz = 0;
       for (let k = 0; k < samples; k++) {
-        const t = Math.max(0, raceTime - k * dt);
+        const t = Math.max(0, time - k * step);
         driverAt(d, t, scratch);
         const x = scratch[0]!;
         const z = scratch[1]!;
         const age = k / (samples - 1);
-        const h = 0.07 + 0.95 * Math.pow(1 - age, 0.55);
+        const h = (0.07 + 0.95 * Math.pow(1 - age, 0.55)) * (1 + 0.3 * lift);
         wallPos.setXYZ(k * 2, x, 0.05, z);
         wallPos.setXYZ(k * 2 + 1, x, h, z);
         // Flat glow: perpendicular to the direction of travel.
         let dx = k === 0 ? 0 : px - x;
         let dz = k === 0 ? 0 : pz - z;
         if (k === 0) {
-          driverAt(d, Math.max(0, raceTime - dt), prev);
+          driverAt(d, Math.max(0, time - step), prev);
           dx = x - prev[0]!;
           dz = z - prev[1]!;
         }
@@ -1081,7 +1129,7 @@ export function startHeroScene(canvas: HTMLCanvasElement, options: HeroOptions):
         // Light cast on the road: from the head and from partway down the trail.
         if (k === 0 || k === Math.floor(samples * 0.3)) {
           const slot = di * 2 + (k === 0 ? 0 : 1);
-          const strength = (k === 0 ? 1.0 : 0.45) * fade * d.spec.intensity;
+          const strength = (k === 0 ? 1.0 : 0.45) * fade * d.spec.intensity * (1 + 0.6 * lift);
           tracerLightUniform.value[slot]!.set(x, 0.4, z, k === 0 ? 1.5 : 2.2);
           tracerColorUniform.value[slot]!.set(
             p.color.r * strength * 1.3,
@@ -1092,9 +1140,10 @@ export function startHeroScene(canvas: HTMLCanvasElement, options: HeroOptions):
       }
       wallPos.needsUpdate = true;
       flatPos.needsUpdate = true;
-      const g = 5.5 * d.spec.intensity * fade;
+      const g = 5.5 * d.spec.intensity * fade * (1 + 0.9 * lift);
+      const r = 2.6 * (1 + 0.45 * lift);
       offs.setXYZ(di, head[0]!, 0.36, head[1]!);
-      sizes.setXY(di, 2.6, 2.6);
+      sizes.setXY(di, r, r);
       cols.setXYZ(di, p.color.r * g, p.color.g * g, p.color.b * g);
     });
     offs.needsUpdate = true;
@@ -1102,16 +1151,69 @@ export function startHeroScene(canvas: HTMLCanvasElement, options: HeroOptions):
     cols.needsUpdate = true;
   }
 
+  /* ---------- pointer: a little camera tilt and a light on the asphalt ---------- */
+  /** Pointer over the canvas, -1..1 each way (y up), and whether it is there at all. */
+  const pointer = { x: 0, y: 0, inside: false };
+  /** The pointer position the camera follows, eased. */
+  const tilt = new Vector2();
+  /** 0..1, how much of the pointer light is on. */
+  let pointerGlow = 0;
+  const lightAt = new Vector3();
+  let lightPlaced = false;
+  const ray = new Vector3();
+  const hit = new Vector3();
+  const forward = new Vector3();
+  const right = new Vector3();
+  const up = new Vector3();
+  const WORLD_UP = new Vector3(0, 1, 0);
+
   const bandQuery = window.matchMedia(BAND_QUERY);
   function placeCamera(camTime: number) {
     const aspect = size.x / Math.max(1, size.y);
     const pose = cameraPose(camTime, aspect, bandQuery.matches);
-    camera.fov = pose.fov;
+    // A slight punch-in while boosting.
+    camera.fov = pose.fov * (1 - 0.05 * boost);
     camera.aspect = aspect;
     camera.position.set(...pose.position);
+    if (tilt.x !== 0 || tilt.y !== 0) {
+      // Slide across and up toward the pointer, still aimed at the same spot.
+      forward.set(pose.target[0], pose.target[1], pose.target[2]).sub(camera.position);
+      const dist = forward.length();
+      forward.divideScalar(dist || 1);
+      right.crossVectors(forward, WORLD_UP).normalize();
+      up.crossVectors(right, forward);
+      camera.position.addScaledVector(right, tilt.x * dist * 0.045);
+      camera.position.addScaledVector(up, tilt.y * dist * 0.03);
+    }
     camera.lookAt(pose.target[0], pose.target[1], pose.target[2]);
     camera.setViewOffset(size.x, size.y, pose.shiftX * size.x, pose.shiftY * size.y, size.x, size.y);
     camera.updateProjectionMatrix();
+    camera.updateMatrixWorld();
+  }
+
+  /** Where the pointer meets the ground, or false when it is off the ground. */
+  function pointerOnGround(): boolean {
+    if (!pointer.inside) return false;
+    ray.set(pointer.x, pointer.y, 0.5).unproject(camera).sub(camera.position).normalize();
+    if (ray.y > -0.02) return false;
+    const d = -camera.position.y / ray.y;
+    if (d > 420) return false;
+    hit.copy(camera.position).addScaledVector(ray, d);
+    return true;
+  }
+
+  function updatePointerLight(dt: number) {
+    const onGround = pointerOnGround();
+    if (onGround) {
+      if (!lightPlaced || pointerGlow < 0.02) lightAt.copy(hit);
+      else lightAt.lerp(hit, 1 - Math.exp(-dt * 12));
+      lightPlaced = true;
+    }
+    pointerGlow += ((onGround ? 1 : 0) - pointerGlow) * (1 - Math.exp(-dt * (onGround ? 4 : 2.5)));
+    if (pointerGlow < 1e-3) pointerGlow = 0;
+    const s = POINTER_STRENGTH * pointerGlow;
+    tracerLightUniform.value[POINTER_LIGHT]!.set(lightAt.x, 2.2, lightAt.z, 6.5);
+    tracerColorUniform.value[POINTER_LIGHT]!.set(0.78 * s, 0.84 * s, 1.0 * s);
   }
 
   function resize() {
@@ -1137,11 +1239,33 @@ export function startHeroScene(canvas: HTMLCanvasElement, options: HeroOptions):
   let last = 0;
   let frames = 0;
   let slowFrames = 0;
+  const bloomBase = bloom.strength;
 
-  function render(time: number) {
-    const raceTime = elapsed % RACE_PERIOD;
-    updateTracers(raceTime);
+  /** Advance the race, the boost and the pointer easing by `dt` seconds. */
+  function advance(dt: number) {
+    elapsed += dt;
+    let raceTime = elapsed - race.start;
+    if (raceTime >= race.end) {
+      race.start = elapsed;
+      race.leadExtra = 0;
+      race.end = RACE_PERIOD;
+      raceTime = 0;
+    }
+    const ease = (from: number, to: number, rate: number) => from + (to - from) * (1 - Math.exp(-dt * rate));
+    boost = ease(boost, boostHeld ? 1 : 0, boostHeld ? 5 : 2.2);
+    if (boost < 1e-3) boost = 0;
+    if (race.end === RACE_PERIOD) {
+      race.leadExtra += dt * BOOST_GAIN * boost;
+      if (leadGap(raceTime) >= GAP_LIMIT) race.end = Math.min(RACE_PERIOD, raceTime + FINISH_FADE);
+    }
+    tilt.set(ease(tilt.x, pointer.inside ? pointer.x : 0, 2.5), ease(tilt.y, pointer.inside ? pointer.y : 0, 2.5));
+  }
+
+  function render(time: number, dt = 0) {
+    updateTracers(elapsed - race.start);
     placeCamera(elapsed);
+    updatePointerLight(dt);
+    bloom.strength = bloomBase * (1 + 0.25 * boost);
     grade.uniforms.uTime!.value = time;
     composer.render();
     if (!firstFrame) {
@@ -1155,8 +1279,8 @@ export function startHeroScene(canvas: HTMLCanvasElement, options: HeroOptions):
     if (!active || disposed) return;
     const dt = last ? Math.min(0.1, (now - last) / 1000) : 1 / 60;
     last = now;
-    elapsed += dt;
-    render(elapsed);
+    advance(dt);
+    render(elapsed, dt);
     // Adaptive quality: if frames stay slow, drop resolution a step at a time.
     frames++;
     if (frames > 40) {
@@ -1192,6 +1316,22 @@ export function startHeroScene(canvas: HTMLCanvasElement, options: HeroOptions):
         raf = 0;
       }
     },
+    setPointer(x: number | null, y = 0) {
+      if (disposed || still) return;
+      if (x === null) {
+        pointer.inside = false;
+        return;
+      }
+      const rect = canvas.getBoundingClientRect();
+      if (rect.width < 1 || rect.height < 1) return;
+      pointer.x = Math.max(-1, Math.min(1, ((x - rect.left) / rect.width) * 2 - 1));
+      pointer.y = Math.max(-1, Math.min(1, 1 - ((y - rect.top) / rect.height) * 2));
+      pointer.inside = true;
+    },
+    setBoost(on: boolean) {
+      if (disposed || still) return;
+      boostHeld = on;
+    },
     dispose() {
       if (disposed) return;
       disposed = true;
@@ -1216,4 +1356,3 @@ export function startHeroScene(canvas: HTMLCanvasElement, options: HeroOptions):
     },
   };
 }
-

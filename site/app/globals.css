@@ -451,6 +451,73 @@ code {
 .hero-stage[data-ready='true'] .hero-fallback {
   opacity: 0;
 }
+/* The live scene takes a press-and-hold; nothing in it should select or call out. */
+.hero-stage {
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* "Hold to boost": appears once the live scene runs, gone after the first boost.
+   Narrow screens: a line under the band. Wide: over the scene, under the track. */
+.hero-hint {
+  position: relative;
+  order: 2;
+  align-self: center;
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin: -0.4rem 0 1.25rem;
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  pointer-events: none;
+  opacity: 1;
+  transition: opacity 0.45s ease;
+  animation: hero-hint-in 0.9s ease 2.6s both;
+}
+.hero-hint::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 10px rgba(255, 46, 136, 0.85);
+  animation: hero-hint-pulse 1.6s ease-in-out infinite;
+}
+.hero-hint[data-show='false'] {
+  visibility: hidden;
+  animation: none;
+}
+.hero-hint[data-gone='true'] {
+  opacity: 0;
+  animation: none;
+}
+.hero-hint-touch {
+  display: none;
+}
+@media (hover: none), (pointer: coarse) {
+  .hero-hint-mouse {
+    display: none;
+  }
+  .hero-hint-touch {
+    display: inline;
+  }
+}
+@keyframes hero-hint-in {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes hero-hint-pulse {
+  50% {
+    transform: scale(0.6);
+    opacity: 0.55;
+  }
+}
 
 /* Darkens the area behind the text on wide screens, where the scene is the
    backdrop. Narrow screens put the scene in its own band and need none. */
@@ -603,6 +670,12 @@ code {
     margin: 0;
     -webkit-mask-image: none;
     mask-image: none;
+  }
+  .hero-hint {
+    position: absolute;
+    right: 32px;
+    bottom: 30%;
+    margin: 0;
   }
   .hero-scrim {
     display: block;

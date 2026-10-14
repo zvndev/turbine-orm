@@ -378,10 +378,16 @@ export function driverAt(d: Driver, time: number, out: Float32Array): void {
   out[2] = Math.atan2(z1 - z0, x1 - x0);
 }
 
-/** Opacity of the lights at a point in the race: fade in at the start, out at the end. */
-export function raceFade(time: number): number {
+/** Seconds the lights take to fade out when a race ends. */
+export const FINISH_FADE = 1.4;
+
+/**
+ * Opacity of the lights at a point in the race: fade in at the start, out
+ * toward `end`, the race time at which the lights are gone.
+ */
+export function raceFade(time: number, end = RACE_PERIOD): number {
   const fadeIn = Math.min(1, time / 0.5);
-  const fadeOut = Math.min(1, Math.max(0, (RACE_PERIOD - time) / 1.4));
+  const fadeOut = Math.min(1, Math.max(0, (end - time) / FINISH_FADE));
   return fadeIn * fadeOut;
 }
 
