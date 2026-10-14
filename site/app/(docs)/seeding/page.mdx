@@ -7,7 +7,7 @@ export const metadata = {
 
 # Seeding
 
-`turbine seed` runs a seed file to populate your database. The file can be TypeScript, JavaScript, or SQL; Turbine picks the right runner for each. TypeScript seeds run through `tsx`, so there is no separate build step.
+`turbine seed` runs a seed file to populate your database. The file can be TypeScript, JavaScript or SQL, and Turbine picks the right runner for each. TypeScript seeds run through `tsx`, so there is no build step.
 
 ```bash
 npx turbine seed
@@ -15,7 +15,9 @@ npx turbine seed
 
 ## `defineSeed`, TypeScript seeds
 
-`defineSeed` wraps a function that receives a connected client. It reads `DATABASE_URL`, runs your function, and disconnects when it's done. You don't manage the connection lifecycle. When `turbine.config.ts` sets a `schema` other than `public`, `turbine seed` connects with `search_path` pinned to it through the connection's startup parameters (`options=-c search_path="<schema>"`, never a `SET`), so unqualified table names in the seed land in the same schema `push`, `generate` and `migrate` use.
+`defineSeed` wraps a function that receives a connected client. It reads `DATABASE_URL`, runs your function and disconnects afterwards, so you never manage the connection.
+
+When `turbine.config.ts` sets a `schema` other than `public`, `turbine seed` pins `search_path` to it in the connection's startup parameters (`options=-c search_path="<schema>"`, never a `SET`). Unqualified table names in the seed then land in the same schema `push`, `generate` and `migrate` use.
 
 ```ts
 // seed.ts
@@ -30,7 +32,7 @@ export default defineSeed(async (db) => {
 });
 ```
 
-The `db` handed to the callback is a base client: use [`db.raw`](/queries#raw-sql) or [`db.sql`](/queries#typed-raw-sql-dbsqlt) for inserts. For fully typed table accessors, import your generated client instead and manage its lifecycle yourself:
+The `db` passed to the callback is a base client, so write with [`db.raw`](/queries#raw-sql) or [`db.sql`](/queries#typed-raw-sql-dbsqlt). For typed table accessors, import your generated client instead and manage its lifecycle yourself:
 
 ```ts
 // seed.ts
@@ -48,12 +50,12 @@ await db.organizations.createMany({
 await db.disconnect();
 ```
 
-Either file runs the same way: `npx turbine seed`. A TypeScript seed that does not call `defineSeed`, like the second one, runs to completion and exits `0` with a notice that Turbine cannot confirm what it wrote. Before 0.90 it failed the command.
+Both files run the same way: `npx turbine seed`. A TypeScript seed that does not call `defineSeed`, like the second one, runs to completion and exits `0`, with a notice that Turbine cannot confirm what it wrote.
 
 ## JavaScript and SQL seeds
 
-- **`.js`**, imported dynamically. If the default export is a function, Turbine calls it.
-- **`.sql`**, executed as raw SQL against the database.
+- **`.js`**: imported dynamically. If the default export is a function, Turbine calls it.
+- **`.sql`**: executed as raw SQL against the database.
 
 ```sql
 -- seed.sql
@@ -61,13 +63,13 @@ INSERT INTO organizations (name, slug) VALUES ('Acme', 'acme')
 ON CONFLICT (slug) DO NOTHING;
 ```
 
-> **Note:** TypeScript seeds need `tsx` available (a dev dependency in most TypeScript projects). If it's missing, Turbine tells you to install `tsx` or use a `.js` / `.sql` seed instead.
+> **Note:** TypeScript seeds need `tsx`, which most TypeScript projects already have as a dev dependency. If it is missing, Turbine tells you to install it or use a `.js` / `.sql` seed.
 
 ## File resolution
 
 Turbine resolves the seed file in this order:
 
-1. The `seedFile` field in `turbine.config.ts`. An explicit path always wins, even if the file doesn't exist yet.
+1. The `seedFile` field in `turbine.config.ts`. An explicit path always wins, even if the file does not exist yet.
 2. The first default candidate found: `seed.ts`, `seed.js`, `seed.sql`, `turbine/seed.ts`, `turbine/seed.js`, `turbine/seed.sql`.
 
 ```ts
@@ -80,11 +82,11 @@ export default {
 } satisfies TurbineCliConfig;
 ```
 
-`seedFile` is the canonical key and what `turbine init` writes. `seed` is a back-compat alias; when both are present, `seedFile` wins.
+`seedFile` is the canonical key, and the one `turbine init` writes. `seed` is a back-compat alias. When both are set, `seedFile` wins.
 
 ## Seeding in CI/CD
 
-Pair `migrate deploy` with `seed`. `migrate deploy` applies pending migrations non-interactively, so it's safe in a pipeline; then seed on top:
+Run `migrate deploy`, then `seed`. `migrate deploy` applies pending migrations without prompts, so it is safe in a pipeline:
 
 ```bash
 # CI: bring a fresh database up to date, then seed it
@@ -92,10 +94,10 @@ npx turbine migrate deploy
 npx turbine seed
 ```
 
-`migrate deploy` refuses to run on a checksum mismatch or a missing migration file (exit 1), so a drifted migration history fails the build instead of silently diverging. See [`migrate deploy`](/cli#turbine-migrate-deploy).
+`migrate deploy` exits `1` on a checksum mismatch or a missing migration file, so a drifted migration history fails the build instead of diverging unnoticed. See [`migrate deploy`](/cli#turbine-migrate-deploy).
 
 ## See also
 
-- **[CLI](/cli)**, `turbine seed`, `turbine migrate deploy`, and every flag.
-- **[Schema & Migrations](/schema)**, the migration workflow seeds run on top of.
-- **[API Reference](/queries)**, `createMany`, `raw`, and `sql` for writing seed data.
+- **[CLI](/cli)**: `turbine seed`, `turbine migrate deploy` and every flag.
+- **[Schema & Migrations](/schema)**: the migration workflow your seeds build on.
+- **[API Reference](/queries)**: `createMany`, `raw` and `sql` for writing seed data.

@@ -7,11 +7,11 @@ export const metadata = {
 
 # Framework Integration
 
-Patterns for wiring Turbine into a real app. Each one is small: Turbine is a client you create once and call from your handlers.
+Patterns for wiring Turbine into an app. Each one is small, because Turbine is a client you create once and call from your handlers.
 
 ## Next.js, singleton client + Route Handler
 
-Create the client **once** and reuse it. Next.js hot-reload re-evaluates modules in development, which would leak a new connection pool on every save, so stash the instance on `globalThis`.
+Create the client **once** and reuse it. In development, Next.js hot reload re-evaluates modules and would open a new connection pool on every save, so keep the instance on `globalThis`.
 
 ```ts
 // lib/db.ts
@@ -56,11 +56,11 @@ export async function POST(req: Request) {
 }
 ```
 
-> Running on a serverless or edge runtime instead of the Node server? Bind an external HTTP pool with `turbineHttp`, see **[Serverless & Edge](/serverless)**.
+> On a serverless or edge runtime instead of the Node server, bind an external HTTP pool with `turbineHttp`. See **[Serverless & Edge](/serverless)**.
 
 ## Express, request handler
 
-Create the client at startup, pass errors to `next(err)` so your error middleware can map typed Turbine errors to status codes, and disconnect on shutdown.
+Create the client at startup and disconnect on shutdown. Pass errors to `next(err)` so your error middleware can map typed Turbine errors to status codes.
 
 ```ts
 // server.ts
@@ -112,11 +112,11 @@ process.on('SIGTERM', async () => {
 
 ## Multi-tenant isolation with Row-Level Security
 
-Push the tenant boundary into Postgres so a missing `WHERE tenant_id = …` can never leak data. You write a policy once; the database enforces it on every query.
+Put the tenant boundary in Postgres, so a forgotten `WHERE tenant_id = …` cannot leak data. You write a policy once and the database enforces it on every query.
 
 ### 1. Define the policy
 
-Enable RLS on the table and add a policy that reads the tenant from a transaction-local setting (a GUC). Use the two-argument `current_setting(name, true)` so the policy doesn't error when the setting is absent.
+Enable RLS on the table and add a policy that reads the tenant from a transaction-local setting (a GUC). The two-argument `current_setting(name, true)` returns NULL instead of erroring when the setting is absent.
 
 ```sql
 -- migration: isolate documents by tenant
@@ -126,11 +126,13 @@ CREATE POLICY tenant_isolation ON documents
   USING (tenant_id = current_setting('app.current_tenant', true)::int);
 ```
 
-Make sure your application connects as a role that is subject to RLS, the table owner bypasses policies unless you also `ALTER TABLE documents FORCE ROW LEVEL SECURITY`, and superusers always bypass them.
+Your application must connect as a role that is subject to RLS. The table owner bypasses policies unless you also run `ALTER TABLE documents FORCE ROW LEVEL SECURITY`, and superusers always bypass them.
+
+A policy with only a `USING` clause also checks rows you insert or update, so a new row needs the current tenant's `tenant_id`. Give the column a default such as `current_setting('app.current_tenant')::int`, or set it in `data`.
 
 ### 2. Set the tenant per request
 
-`$withSession(context, fn)` opens a transaction, applies each entry as `SELECT set_config(name, value, true)` (transaction-local) right after `BEGIN`, then runs your callback. Every query inside sees only the matching rows, and the setting resets automatically on commit or rollback.
+`$withSession(context, fn)` opens a transaction, applies each entry with `SELECT set_config(name, value, true)` right after `BEGIN`, then runs your callback. Every query inside sees only the matching rows. The settings are transaction-local, so they reset on commit or rollback.
 
 ```ts
 import { db } from '@/lib/db';
@@ -143,7 +145,7 @@ async function listDocuments(tenantId: number) {
 }
 ```
 
-Use the longer `$transaction(fn, { sessionContext })` form when you also need writes or multiple statements in the same isolated session:
+`$withSession` is shorthand for `$transaction(fn, { sessionContext })`. Use the longer form when you also want other transaction options:
 
 ```ts
 await db.$transaction(
@@ -155,11 +157,11 @@ await db.$transaction(
 );
 ```
 
-Values may be strings, numbers, or booleans (coerced to text, since GUCs are text). An invalid setting name throws `ValidationError` and rolls back before any query runs.
+Values may be strings, numbers or booleans, and reach the database as text. Names must be namespaced custom settings such as `app.current_tenant`; setting one of PostgreSQL's own settings needs `allowBuiltinSettings`. An invalid name, or a value of any other type (`undefined` included), throws `ValidationError` before a connection is taken.
 
 ### 3. Wire it into a handler
 
-Pull the tenant from your auth layer and scope every query through the session:
+Read the tenant from your auth layer and run every query through the session:
 
 ```ts
 // app/api/documents/route.ts
@@ -178,11 +180,11 @@ export async function GET(req: Request) {
 }
 ```
 
-The query layer never has to remember to filter by tenant; the policy does it.
+The query code never filters by tenant. The policy does it.
 
 ## See also
 
-- **[Transactions & Pipelines](/transactions)**, `$transaction`, `$withSession`, isolation levels, and `sessionContext` in depth.
-- **[Serverless & Edge](/serverless)**, the singleton pattern adapted for edge runtimes via `turbineHttp`.
-- **[Typed Errors](/errors)**, mapping Turbine errors to HTTP responses.
-- **[Quick Start](/quickstart)**, generating the typed client these recipes import.
+- **[Transactions & Pipelines](/transactions)**: `$transaction`, `$withSession`, isolation levels and `sessionContext` in depth.
+- **[Serverless & Edge](/serverless)**: the client on edge runtimes via `turbineHttp`.
+- **[Typed Errors](/errors)**: mapping Turbine errors to HTTP responses.
+- **[Quick Start](/quickstart)**: generating the typed client these recipes import.

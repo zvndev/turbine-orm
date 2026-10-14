@@ -7,7 +7,7 @@ export const metadata = {
 
 # Writing a custom dialect
 
-**This is how you add an engine Turbine does not ship.** Every piece of SQL text that varies between engines routes through a single exported contract, `Dialect`: query generation, DML, DDL, migration-tracking SQL, transaction control, streaming and introspection all go through it. Turbine is MIT-licensed, and the contract is the documented extension seam: you implement a dialect and bind a pool shim, instead of forking the core. The shipped SQLite, MySQL, and SQL Server engines are built on exactly this seam.
+A dialect is how you add an engine Turbine does not ship. Every piece of SQL text that varies between engines goes through one exported contract, `Dialect`: query generation, DML, DDL, migration-tracking SQL, transaction control, streaming and introspection. You implement a dialect and bind a pool shim instead of forking the core. The shipped SQLite, MySQL and SQL Server engines are built the same way.
 
 ```ts
 import {
@@ -29,22 +29,22 @@ import {
 } from 'turbine-orm';
 ```
 
-<Callout type="note" title="Do you actually need one?">
+<Callout type="note" title="Do you need one?">
   If your database speaks the PostgreSQL wire protocol (CockroachDB, YugabyteDB,
   AlloyDB, TimescaleDB, Neon, Supabase), you do **not** need a dialect. Those
-  reuse `postgresDialect` directly, with at most a thin
-  [adapter](/compatibility) for migration locking or catalog quirks. A dialect
-  is for an engine with genuinely different SQL. And if the engine has no SQL at
-  all, a dialect cannot express the queries: see [PowDB](/powdb), which keeps a
-  `Dialect` for capability gating and transaction keywords but replaces query
-  generation with a parallel PowQL generator.
+  reuse `postgresDialect`, with at most a thin [adapter](/compatibility) for
+  migration locking or catalog quirks. A dialect is for an engine whose SQL
+  differs. If the engine has no SQL at all, a dialect cannot express the
+  queries: see [PowDB](/powdb), which keeps a `Dialect` for capability gating
+  and transaction keywords but replaces query generation with a parallel PowQL
+  generator.
 </Callout>
 
 ## The shape of the job
 
-A dialect is a plain object. Turbine ships five: `postgresDialect` (the default and the reference implementation), the ones behind the `sqlite`, `mysql` and `mssql` subpaths, and `powdbDialect` behind the `powdb` subpath (a genuine `Dialect`, but only its capability flags and transaction keywords are consumed).
+A dialect is a plain object. Turbine ships five: `postgresDialect` (the default and the reference implementation), the ones behind the `sqlite`, `mysql` and `mssql` subpaths, and `powdbDialect` behind the `powdb` subpath. PowDB's is a full `Dialect`, but only its capability flags and transaction keywords are used.
 
-The fastest way to start is to spread the Postgres one and override what differs:
+The fastest way to start is to spread the PostgreSQL one and override what differs:
 
 ```ts
 import { postgresDialect, type Dialect } from 'turbine-orm';
@@ -61,7 +61,7 @@ export const myDialect: Dialect = {
 };
 ```
 
-You then bind it with a pg-compatible pool shim through the external-pool seam:
+Then bind it to a pg-compatible pool shim through the `pool` option:
 
 ```ts
 import { TurbineClient } from 'turbine-orm';
@@ -69,11 +69,11 @@ import { TurbineClient } from 'turbine-orm';
 const db = new TurbineClient({ pool: myPoolShim, dialect: myDialect }, SCHEMA);
 ```
 
-The pool shim satisfies `PgCompatPool`: `query(text, values)`, `connect()`, `end()`. That is the whole driver contract. `PowdbPool`, `SqlitePool`, `MysqlPool` and `MssqlPool` are all just that interface over their respective drivers.
+The pool shim implements `PgCompatPool`: `query(text, values)`, `connect()` and `end()`. That is the whole driver contract. `PowdbPool`, `SqlitePool`, `MysqlPool` and `MssqlPool` each implement that interface over their own driver.
 
 ## Capability flags: refuse, do not degrade
 
-The most important design rule in the contract. When your engine cannot do something, say so with a flag. The builders and the client then throw `UnsupportedFeatureError` (`TURBINE_E017`) naming the feature and the engine, instead of emitting SQL that cannot work.
+When your engine cannot do something, say so with a flag. The builders and the client then throw `UnsupportedFeatureError` (`TURBINE_E017`) naming the feature and the engine, instead of emitting SQL that cannot work. This is the most important rule in the contract.
 
 | Flag | Required | Turning it off means |
 |---|:---:|---|
@@ -86,21 +86,24 @@ The most important design rule in the contract. When your engine cannot do somet
 | `supportsJsonContains` | yes | The JSON `contains` filter throws; path filters (`{ path, equals }`) still work. SQLite sets it `false`. |
 | `aggSupportsInlineOrderBy` | yes | Your array aggregate takes no inline `ORDER BY`, so every ordered to-many relation is rewritten into an inner subquery. MySQL and SQLite both set this `false`. |
 | `jsonPathSupport` | yes | `'native' \| 'function' \| 'limited'`. |
-| `supportsUpsertUpdateWhere` | optional | Absent is `false`. Whether your `buildUpsertStatement` honors `input.updateWhere`, a predicate on the conflict-UPDATE branch. Global filters compile that predicate (and bind its parameters) **only** when this is `true`, so reporting `true` and then dropping `updateWhere` leaves parameters bound to no placeholder. Postgres and SQLite are `true`; MySQL is `false` (`ON DUPLICATE KEY UPDATE` has no predicate slot) and SQL Server is `false` (the predicate the builder supplies would be ambiguous between `MERGE` target and source aliases). Set it `true` only if your `buildUpsertStatement` actually emits `input.updateWhere`. |
-| `supportsFullTextSearch` | optional | Absent is `false`, so a `search` filter throws. MySQL's `MATCH ... AGAINST` and SQL Server's `CONTAINS` deliberately stay `false`: they are different surfaces with different index requirements, and substituting them would change the semantics. |
+| `supportsUpsertUpdateWhere` | optional | Absent is `false`. Whether your `buildUpsertStatement` honors `input.updateWhere`, a predicate on the conflict-UPDATE branch. Global filters compile that predicate and bind its parameters **only** when this is `true`, so reporting `true` and then dropping `updateWhere` leaves parameters bound to no placeholder. PostgreSQL and SQLite are `true`. MySQL is `false` (`ON DUPLICATE KEY UPDATE` has no predicate slot), and so is SQL Server (the predicate would be ambiguous between the `MERGE` target and source aliases). Set it `true` only if your `buildUpsertStatement` emits `input.updateWhere`. |
+| `supportsFullTextSearch` | optional | Absent is `false`, so a `search` filter throws. MySQL's `MATCH ... AGAINST` and SQL Server's `CONTAINS` stay `false`: they have different index requirements and semantics, so substituting them would change what a search matches. |
 | `supportsArrayColumns` | optional | Absent is `false`. `has` / `hasEvery` / `hasSome` / `isEmpty` throw. A JSON column is not an array column. |
 | `supportsLateralJoin` | optional | Absent is `false`. Gates the opt-in `plan: 'lateral'` pick-row ordering. |
 | `supportsPlanCacheMode` | optional | Absent is `false`. Gates the client-level `planCacheMode` option and the per-query `forceCustomPlan` read option, both properties of the PostgreSQL plan cache. Only `postgresDialect` sets it `true`. |
-| `inlineLimitOffset` | optional | Render `LIMIT` / `OFFSET` as integer literals instead of bound params. MySQL sets it because mysql2's binary protocol sends JS numbers as `DOUBLE`, which `LIMIT` rejects. The values are Turbine-validated non-negative integers, never user strings, so inlining stays injection-safe. |
+| `rowLockModes` | optional | Absent means none, so every `lock` read throws `TURBINE_E017`. The lock strengths a locking read may use (`'update'`, `'noKeyUpdate'`, `'share'`, `'keyShare'`). PostgreSQL allows all four, MySQL `'update'` and `'share'`. |
+| `supportsPercentileAggregates` | optional | Absent is `false`, so `_percentile` aggregates throw. Only `postgresDialect` sets it `true`. |
+| `supportsBulkUpsert` | optional | Absent is `false`, so `createMany({ onConflict })` throws. |
+| `inlineLimitOffset` | optional | Render `LIMIT` / `OFFSET` as integer literals instead of bound parameters. MySQL sets it because mysql2's binary protocol sends JS numbers as `DOUBLE`, which `LIMIT` rejects. The values are non-negative integers Turbine has validated, never user strings, so inlining stays injection-safe. |
 | `explainQuery` | optional | `{ prefix: string }`. Absent means `explain()` throws `TURBINE_E017` (SQL Server, whose SHOWPLAN needs a separate session toggle). |
 
-Every optional flag defaults to the behaviour that keeps existing dialects byte-identical, which is why new hooks can be added without touching the ones already shipped.
+An absent optional flag keeps the behavior every shipped dialect had before the flag existed, so new flags never change a shipped engine. A spread is not absence, though: a dialect spread from `postgresDialect` arrives with PostgreSQL's value for every flag above, so set each one your engine answers differently. The shipped engines set `rowLockModes`, `supportsPercentileAggregates` and `supportsBulkUpsert` as their own properties for this reason.
 
 ## Engine capabilities: what the engine is, not what it is called
 
-Every dialect carries a `capabilities` object (`EngineCapabilities`, exported as a type). It answers the questions Turbine used to answer by comparing `dialect.name`: whether the engine has `DISTINCT ON`, where it sorts NULL, how many bind parameters one statement may carry, whether a failed statement aborts the transaction, and about thirty more. The `Dialect` type requires it, and `TurbineClient` refuses a dialect without one (`TURBINE_E003`).
+Every dialect carries a `capabilities` object (`EngineCapabilities`, exported as a type). It describes what the engine can do: whether it has `DISTINCT ON`, where it sorts NULL, how many bind parameters one statement may carry, whether a failed statement aborts the transaction, and about thirty more. Turbine reads these keys, not `dialect.name`. The `Dialect` type requires the object, and `TurbineClient` refuses a dialect without one (`TURBINE_E003`).
 
-A spread copies `capabilities`, so a dialect built from an engine dialect inherits that engine's answers under whatever `name` you give it. That is right for a PostgreSQL-compatible engine and wrong for any other, so a dialect for a different engine states its own:
+A spread copies `capabilities`, so a dialect built from an engine dialect inherits that engine's answers under whatever `name` you give it. That is right for a PostgreSQL-compatible engine and wrong for any other. A dialect for a different engine states its own:
 
 ```ts
 export const myDialect: Dialect = {
@@ -120,9 +123,12 @@ export const myDialect: Dialect = {
 };
 ```
 
-Go through every key, not only the ones above. A key left at PostgreSQL's value is a claim about your engine, and a wrong `true` is a broken query at runtime rather than a clear `TURBINE_E017`. The JSDoc on `EngineCapabilities` describes each key, and the shipped engines are worked examples: `sqliteDialect.capabilities` (`turbine-orm/sqlite`), `mysqlDialect.capabilities` (`turbine-orm/mysql`) and `mssqlDialect.capabilities` (`turbine-orm/mssql`).
+Go through every key, not only the ones above. A key left at PostgreSQL's value is a claim about your engine, and a wrong `true` becomes a broken query at runtime instead of a clear `TURBINE_E017`. The JSDoc on `EngineCapabilities` describes each key, and the shipped engines are worked examples: `sqliteDialect.capabilities` (`turbine-orm/sqlite`), `mysqlDialect.capabilities` (`turbine-orm/mysql`) and `mssqlDialect.capabilities` (`turbine-orm/mssql`).
 
-Two things still follow the engine name rather than `capabilities`. `expr.now()`, `expr.greatest()` and `expr.least()` are spelled per engine, so a dialect under any name other than `postgresql`, `mysql`, `sqlite` or `mssql` refuses them with `TURBINE_E017`; every other update expression follows `capabilities`. And the column `DEFAULT` spellings `schemaToSQL` emits use PostgreSQL's spelling under any other name. Both become dialect hooks in a later release.
+Two things still follow the engine name instead of `capabilities`:
+
+- `expr.now()`, `expr.greatest()` and `expr.least()` are spelled per engine. A dialect under any name other than `postgresql`, `mysql`, `sqlite` or `mssql` refuses them with `TURBINE_E017`. Every other update expression follows `capabilities`.
+- The column `DEFAULT` spellings `schemaToSQL` emits use PostgreSQL's spelling under any other name.
 
 | Key | PostgreSQL | What it decides |
 |---|---|---|
@@ -141,8 +147,9 @@ Two things still follow the engine name rather than `capabilities`. `expr.now()`
 | `paramTypeCasts` | `true` | Bound values in update expressions carry a `::type` cast. |
 | `namedEnumTypes` | `true` | An enum is a named type (`CREATE TYPE ... AS ENUM`, `::"Enum"` casts). Else `buildEnumColumn`. |
 | `structuredValueColumns` | `'pg-scalars'` | Which columns refuse an object or array written to them. |
-| `maxBindParameters` | `65535` | The most bind parameters per statement. `createMany` sizes its chunks by it. |
+| `maxBindParameters` | `65535` | The most bind parameters one statement may carry. `createMany` never builds a statement past it. |
 | `maxInsertRows` | `Infinity` | The most rows per plain `INSERT ... VALUES` (SQL Server: 1000). |
+| `chunkBindParameters` | `65535` | The bind parameters per statement when `createMany` splits a call into several statements. At most `maxBindParameters`; lower where an engine slows faster than linearly with statement size (SQLite: 250). |
 | `upsertConflictTarget` | `'explicit'` | What a single-statement upsert conflicts on: the named target, or `'any-unique-key'` (MySQL). |
 | `setClauseOrder` | `'snapshot'` | Whether a later SET expression reads an earlier assignment (`'left-to-right'`, MySQL). |
 | `reselectLocksRows` | `false` | A reselect write's reads take `FOR UPDATE`. |
@@ -166,7 +173,7 @@ Two things still follow the engine name rather than `capabilities`. `expr.now()`
 type ResultStrategy = 'returning' | 'output' | 'reselect';
 ```
 
-This is the branch the write executor takes, and it is the deepest structural difference between the shipped engines.
+This decides how the write executor gets rows back, and it is the deepest structural difference between the shipped engines.
 
 | Strategy | Mechanism | Used by |
 |---|---|---|
@@ -175,11 +182,11 @@ This is the branch the write executor takes, and it is the deepest structural di
 | `'output'` | Rows come back from the same statement, via `OUTPUT INSERTED.*` / `OUTPUT DELETED.*` / `MERGE`. | SQL Server |
 
 <Callout type="warning" title="'reselect' is not free and not identical">
-  A reselect is a second statement, so it is a second chance for the row to have
-  changed underneath you, and it cannot see a row the write deleted. It is also
-  why `createMany` on MySQL returns `[]` rather than the inserted rows: the rows
-  are inserted, there is simply no key set to reselect them by. If you choose
-  `'reselect'` for a new dialect, document the same caveat.
+  A reselect is a second statement, so the row can change between the write and
+  the read, and it cannot see a row the write deleted. It is also why a plain
+  `createMany` on MySQL returns `[]` instead of the inserted rows: the rows are
+  inserted, but there is no key set to reselect them by. If you choose
+  `'reselect'` for a new dialect, document the same caveats.
 </Callout>
 
 ## The required primitives
@@ -188,17 +195,17 @@ These have no default. A dialect must supply all of them.
 
 **Identifiers and values**
 
-- `paramPlaceholder(index)` for the 1-indexed Nth placeholder. Every shipped dialect returns a **numbered** placeholder: `$1` (Postgres), `:p1` (SQLite and MySQL), `@p1` (SQL Server). None returns a bare `?`, and yours should not either unless your driver has no other option: a positional `?` makes `params[n]` depend on the order the placeholder appears in the assembled text, which the relation and pagination builders do not guarantee. A numbered placeholder keeps `:pN` bound to `params[N-1]` regardless of text order.
+- `paramPlaceholder(index)` for the Nth placeholder, counting from 1. Every shipped dialect returns a **numbered** placeholder: `$1` (PostgreSQL), `:p1` (SQLite and MySQL), `@p1` (SQL Server). None returns a bare `?`, and yours should not unless your driver has no other option. With a positional `?`, `params[n]` depends on where the placeholder lands in the assembled text, which the relation and pagination builders do not guarantee. A numbered placeholder keeps `:pN` bound to `params[N-1]` whatever the text order.
 - `quoteIdentifier(name)` and `escapeStringLiteral(value)`.
 
 **JSON nesting**, which is how `with` clauses become one statement:
 
 - `buildJsonObject(pairs)` from `[key, expr]` pairs.
 - `buildJsonArrayAgg(jsonObjectExpr, orderBy?)`.
-- `wrapJsonSubresult(subquery, fallback)`, which wraps a correlated subquery for embedding as a JSON value. Postgres emits `COALESCE((sub), fallback)`; SQLite overrides it to additionally `json(...)`-wrap the result, because `json_group_array` double-encodes nested objects. SQL Server does **not** override this hook: its `ISNULL((... FOR JSON PATH), '[]')` is emitted inside its own `buildRelationSubquery` override (see the additive hooks below).
+- `wrapJsonSubresult(subquery, fallback)`, which wraps a correlated subquery for embedding as a JSON value. PostgreSQL emits `COALESCE((sub), fallback)`. SQLite also wraps the result in `json(...)`, because `json_group_array` double-encodes nested objects. SQL Server does **not** override this hook: it emits its `ISNULL((... FOR JSON PATH), '[]')` inside its own `buildRelationSubquery` override (see the additive hooks below).
 - `emptyJsonArrayLiteral` and `nullJsonLiteral`, the fallbacks for an empty to-many and a missing to-one.
 - `buildJsonContains`, `buildJsonPathExtract`.
-- `buildJsonArray(exprs)` is optional, and only reached by the Postgres-only `jsonEncoding: 'positional'` mode.
+- `buildJsonArray(exprs)` is optional. Only the `jsonEncoding: 'positional'` mode reaches it, and only where `capabilities.positionalJson` is `true`.
 
 **Statements**: `buildReturningClause`, `buildInsertStatement`, `buildBulkInsertStatement`, `buildUpsertStatement`, `buildInsensitiveLike`, `buildCorrelation` (across single **or composite** keys).
 
@@ -208,45 +215,45 @@ These have no default. A dialect must supply all of them.
 
 **Transaction control**, because the keywords vary: `beginStatement(isolationLevel?)`, `commitStatement()`, `rollbackStatement()`, `savepointStatement(name)`, `releaseSavepointStatement(name)`, `rollbackToSavepointStatement(name)`, and `buildSetSessionConfig(name, value)` (both name and value bound as parameters).
 
-**Streaming**: `openStream(connection, sql, params, batchSize)`, an async generator of row batches. Postgres runs a `DECLARE CURSOR` / `FETCH` / `CLOSE` loop inside a transaction and is the only shipped dialect with constant memory.
+**Streaming**: `openStream(connection, sql, params, batchSize)`, an async generator of row batches. PostgreSQL runs a `DECLARE CURSOR` / `FETCH` / `CLOSE` loop inside a transaction, and it is the only shipped dialect with constant memory.
 
-**None of the other three bundled dialects streams.** SQLite, MySQL and SQL Server run the statement once, hold the entire result set in memory, and yield `batchSize` slices of it, so `findManyStream` on them is `findMany` with a different iteration shape and the same peak memory. That is a property of the seam: `StreamableConnection` exposes only `query()`, so mysql2's `.stream()` and the `mssql` `request.stream` event API are not reachable from a dialect. If your engine can do better and you can reach its cursor, `openStream` is where that goes. If it materializes, say so in your dialect's docs: a caller who reads "streaming: supported" and drains a 50M-row table will run the process out of memory.
+**The other three bundled dialects do not stream.** SQLite, MySQL and SQL Server run the statement once, hold the whole result set in memory, and yield `batchSize` slices of it. On them, `findManyStream` is `findMany` with a different iteration shape and the same peak memory. That is a limit of the seam: `StreamableConnection` exposes only `query()`, so mysql2's `.stream()` and the `mssql` `request.stream` event API are not reachable from a dialect. If your engine can do better and you can reach its cursor, `openStream` is where that goes. If it materializes the result, say so in your dialect's docs: a caller who reads "streaming: supported" and drains a 50M-row table will run the process out of memory.
 
 ## The additive hooks
 
-Every hook here is optional, and omitting it falls back to the PostgreSQL behaviour. That is the property that lets the contract grow.
+Every hook here is optional. Omitting one falls back to the PostgreSQL behavior, which is what lets the contract grow without breaking existing dialects.
 
 | Hook | Fallback when omitted | Who overrides it and why |
 |---|---|---|
-| `castAggregate(expr, target)` | Postgres postfix cast `expr::int` | SQLite, which has no `::` operator, emits `CAST(expr AS INTEGER)`. |
-| `buildInClause(expr, ref, negated)` + `inClauseParam(values)` | Postgres binds the whole list as one array param (`= ANY($n)` / `!= ALL($n)`) | Engines with no array parameters. SQLite and SQL Server bind the list as one JSON document unpacked in a subquery, each element serialized the way the scalar binds; MySQL emits `IN (:pN)` and its pool shim expands it into one placeholder per element. **Both must move together**: the builder's text stays independent of the list length, so the SQL cache stays valid. |
-| `escapeLikePattern(value)` | The shared escaper for `\`, `%`, `_`, paired with the `ESCAPE` clause the builders always emit | SQL Server, whose `LIKE` also treats `[` as opening a character class, so a bound `contains: '[draft]'` would silently match any one of its letters. MySQL, which escapes with `!` (see the next row). Whatever you return must be escaped for the dialect's `likeEscapeCharacter`. |
-| `likeEscapeCharacter` | `\`, so the clause is `ESCAPE '\'` | MySQL names `!`: in MySQL's default `sql_mode` a backslash escapes inside a literal, so `'\'` never closes and every LIKE filter was a syntax error on a pool without `NO_BACKSLASH_ESCAPES`. A dialect that sets it must define `escapeLikePattern` for the same character. |
-| `checkTextWrite(table, column, columnType, value)` | none: the string is bound as is, and the server refuses text its column cannot hold | SQLite, whose type affinity stores such text in a numeric or boolean column instead of refusing it. It returns a message for a string the column would keep as text, and the write throws it as `TURBINE_E003` before any SQL runs. No dialect spreads SQLite's, so testing for the hook's presence is sound. |
-| `buildEnumColumn(column, labels)` | `TURBINE_E017` for an enum column on any engine but PostgreSQL | MySQL (`ENUM(...)`), SQLite and SQL Server (a text column plus a `CHECK` over the labels). PostgreSQL never calls it: `schemaToSQL` emits `CREATE TYPE ... AS ENUM` when `dialect.name` is `'postgresql'`, not when the hook is absent, because every engine spreads `postgresDialect`. |
+| `castAggregate(expr, target)` | PostgreSQL postfix cast `expr::int` | SQLite, which has no `::` operator, emits `CAST(expr AS INTEGER)`. |
+| `buildInClause(expr, ref, negated)` + `inClauseParam(values)` | PostgreSQL binds the whole list as one array parameter (`= ANY($n)` / `!= ALL($n)`) | Engines with no array parameters. SQLite and SQL Server bind the list as one JSON document unpacked in a subquery, each element serialized the way the scalar binds. MySQL emits `IN (:pN)`, and its pool shim expands it into one placeholder per element. **Override both or neither**: the builder's text must not depend on the list length, or the SQL cache breaks. |
+| `escapeLikePattern(value)` | The shared escaper for `\`, `%` and `_`, paired with the `ESCAPE` clause the builders always emit | SQL Server, whose `LIKE` also treats `[` as opening a character class, so a bound `contains: '[draft]'` would silently match any one of its letters. MySQL, which escapes with `!` (see the next row). Whatever you return must be escaped for the dialect's `likeEscapeCharacter`. |
+| `likeEscapeCharacter` | `\`, so the clause is `ESCAPE '\'` | MySQL names `!`. In MySQL's default `sql_mode` a backslash escapes inside a literal, so `'\'` never closes, and every LIKE filter would be a syntax error on a pool without `NO_BACKSLASH_ESCAPES`. A dialect that sets it must define `escapeLikePattern` for the same character. |
+| `checkTextWrite(table, column, columnType, value)` | none: the string is bound as is, and the server refuses text its column cannot hold | SQLite, whose type affinity stores such text in a numeric or boolean column instead of refusing it. The hook returns a message for a string the column would keep as text, and the write throws it as `TURBINE_E003` before any SQL runs. No dialect spreads SQLite's, so testing for the hook's presence is sound. |
+| `buildEnumColumn(column, labels)` | `TURBINE_E017` for an enum column on any engine without `capabilities.namedEnumTypes` | MySQL (`ENUM(...)`), SQLite and SQL Server (a text column plus a `CHECK` over the labels). PostgreSQL never calls it: `schemaToSQL` emits `CREATE TYPE ... AS ENUM` when `capabilities.namedEnumTypes` is `true`, not when the hook is absent, because every engine spreads `postgresDialect`. |
 | `arrayType(baseType)` | none | Array-cast hook for bulk insert. |
-| `buildLimitOffset(input)` | `LIMIT <ph>` / `OFFSET <ph>` | SQL Server, which has no `LIMIT`, emits `OFFSET n ROWS FETCH NEXT n ROWS ONLY` (and a synthetic `ORDER BY (SELECT NULL)` when there is no sort). |
+| `buildLimitOffset(input)` | `LIMIT <ph>` / `OFFSET <ph>` | SQL Server, which has no `LIMIT`, emits `OFFSET n ROWS FETCH NEXT n ROWS ONLY`, plus a synthetic `ORDER BY (SELECT NULL)` when there is no sort. |
 | `buildUpdateStatement`, `buildDeleteStatement` | `UPDATE t SET ... WHERE ...` plus a trailing returning clause | SQL Server, which must inject `OUTPUT INSERTED.*` **mid-statement**, between the `SET` and the `WHERE`. |
-| `buildRelationSubquery(ctx)` | The native `json_agg(json_build_object(...))` path, composed from the JSON primitives above | SQL Server only. MySQL and SQLite merely swap the primitives and produce correct output without defining this. Reach for it only when your JSON aggregate cannot be expressed through the primitives, as `FOR JSON PATH` cannot: it is expressed through the child SELECT's column aliases. |
-| `typeToTypeScript(type, nullable)` | Postgres mapping | Code generation and introspection. |
+| `buildRelationSubquery(ctx)` | The native `json_agg(json_build_object(...))` path, composed from the JSON primitives above | SQL Server only. MySQL and SQLite swap the primitives and produce correct output without it. Reach for it only when your JSON aggregate cannot be built from the primitives. `FOR JSON PATH` cannot, because it is driven by the child SELECT's column aliases. |
+| `typeToTypeScript(type, nullable)` | PostgreSQL mapping | Code generation and introspection. |
 | `introspector` | `undefined` | A `DialectIntrospector` with a single `introspect(options)` method, so `introspect()` can route to your catalog SQL. |
 
 <Callout type="warning" title="buildRelationSubquery owns parameter ordering">
-  If you override relation-subquery generation, you take over the
-  param-push-ordering contract with it: parameters must be pushed in exactly the
-  order the placeholders appear in the assembled statement. Getting this subtly
-  wrong produces a query that runs and returns the wrong rows, which is the
-  worst possible failure mode. Read `RelationSubqueryContext` before you start,
-  and test against the same fixtures the shipped engines use.
+  If you override relation-subquery generation, you take over parameter
+  ordering with it: parameters must be pushed in exactly the order their
+  placeholders appear in the assembled statement. Getting this subtly wrong
+  produces a query that runs and returns the wrong rows, with no error. Read
+  `RelationSubqueryContext` before you start, and test against the same
+  fixtures the shipped engines use.
 </Callout>
 
 ## Migration locking is not here
 
-`DialectMigrator` is exported and **deprecated**. It was never implemented or wired, and is retained only for type back-compat. Migration locking lives in the `DatabaseAdapter` seam (`acquireLock`, `releaseLock`, `statementTimeout`), which is the single canonical locking seam. A new engine ships a `DatabaseAdapter`, not a `DialectMigrator`.
+`DialectMigrator` is exported and **deprecated**. Nothing implements or calls it; it remains only so existing type imports keep compiling. Migration locking lives in the `DatabaseAdapter` seam (`acquireLock`, `releaseLock`, `statementTimeout`). A new engine ships a `DatabaseAdapter`, not a `DialectMigrator`.
 
 ## A checklist before you ship one
 
-1. Set every `capabilities` key and every required capability flag from measured behavior. A `true` you cannot back up becomes a broken query at runtime; a `false` becomes a clear `TURBINE_E017`.
+1. Set every `capabilities` key and every capability flag from measured behavior. A `true` you cannot back up becomes a broken query at runtime; a `false` becomes a clear `TURBINE_E017`.
 2. Pick the `resultStrategy` that matches reality, and document the consequences if it is not `'returning'`.
 3. Run the same query shapes the shipped engines are tested on: nested `with` at depth, an ordered to-many with a per-relation `limit`, a composite-key correlation, an empty to-many (it must be `[]`, never `null`), and a to-one that misses (it must be `null`).
 4. Check that identifiers with embedded quote characters survive `quoteIdentifier`.
@@ -255,6 +262,6 @@ Every hook here is optional, and omitting it falls back to the PostgreSQL behavi
 ## See also
 
 - **[Database Engines](/engines)**: the engines Turbine ships and their capability matrix.
-- **[Database Compatibility](/compatibility)**: PG-wire-compatible databases, which need no dialect.
-- **[The `turbine-orm/powdb` module](/powdb)**: the engine that is deliberately not a dialect.
+- **[Database Compatibility](/compatibility)**: PostgreSQL-wire-compatible databases, which need no dialect.
+- **[The `turbine-orm/powdb` module](/powdb)**: the engine whose queries do not go through a dialect.
 - **[Typed Errors](/errors)**: `UnsupportedFeatureError` and the rest of the code table.

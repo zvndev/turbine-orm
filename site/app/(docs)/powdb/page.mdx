@@ -8,33 +8,32 @@ export const metadata = {
 # The `turbine-orm/powdb` module
 
 <Callout type="note" title="Maintenance mode">
-  Since 0.90.1 the PowDB engine receives bug and data-safety fixes only, no new
-  features. It is verified against the 0.20 PowDB packages. Any decision to
-  deprecate it will be announced in the [changelog](/changelog) at least one
-  minor release before it is removed.
+  The PowDB engine receives bug and data-safety fixes only, no new features. It
+  is verified against the 0.20 PowDB packages. Any decision to deprecate it will
+  be announced in the [changelog](/changelog) at least one minor release before
+  it is removed.
 </Callout>
 
-[PowDB](/engines#powdb) is a single-node database with its own query language, PowQL, which shares no surface with `SELECT ... FROM ... WHERE`. It is the one engine that bypasses the [`Dialect`](/dialects) contract for **query generation**: the module ships a parallel query generator (`PowqlInterface`) with the same public method surface as the SQL `QueryInterface`, wired in through the `queryInterfaceFactory` seam.
+[PowDB](/engines#powdb) is a single-node database with its own query language, PowQL, which shares nothing with `SELECT ... FROM ... WHERE`. It is the one engine that bypasses the [`Dialect`](/dialects) contract for **query generation**. The module ships a parallel query generator, `PowqlInterface`, with the same public methods as the SQL `QueryInterface`, plugged in through the `queryInterfaceFactory` option.
 
-The dialect seam is still used. `powdbDialect` is a real `Dialect` object, and it is what makes `$listen` / `$notify`, RLS `sessionContext`, pgvector and savepoints fail with a clear `TURBINE_E017` instead of emitting text PowQL cannot parse. Its `resultStrategy` is decorative: `PowqlInterface` owns the write path and never reads it.
+PowDB still has a dialect. `powdbDialect` is a real `Dialect` object, and its capability flags make `$listen` / `$notify`, RLS `sessionContext`, pgvector and savepoints fail with a clear `TURBINE_E017` instead of emitting text PowQL cannot parse. `PowqlInterface` owns the write path and never reads the dialect's `resultStrategy`.
 
-The [Engines page](/engines#powdb) covers using PowDB through the ordinary `db.users.findMany(...)` API. **This page is the module reference**: everything the subpath exports, and when you would reach past `turbinePowDB()` for it.
+The [Engines page](/engines#powdb) covers using PowDB through the ordinary `db.users.findMany(...)` API. This page is the module reference: everything the subpath exports, and when you would reach past `turbinePowDB()` for it.
 
 ```ts
 import { turbinePowDB } from 'turbine-orm/powdb';
 ```
 
 <Callout type="note" title="No driver in the base install">
-  `npm install turbine-orm` still pulls exactly one runtime dependency (`pg`).
-  The PowDB drivers are **optional peer dependencies** loaded through a dynamic
-  `import()` only when you open a PowDB connection:
-  `@zvndev/powdb-client` for the networked transport,
-  `@zvndev/powdb-embedded` for the in-process one.
+  `npm install turbine-orm` installs one runtime dependency (`pg`). The PowDB
+  drivers are **optional peer dependencies**, loaded with a dynamic `import()`
+  only when you open a PowDB connection: `@zvndev/powdb-client` for the
+  networked transport, `@zvndev/powdb-embedded` for the in-process one.
 </Callout>
 
 ## `turbinePowDB(target, schema, options?)`
 
-The factory. It resolves a transport, probes the engine version, derives a capability set, and returns an ordinary `TurbineClient` whose table accessors generate PowQL instead of SQL.
+The factory resolves a transport, probes the engine version, derives a capability set, and returns an ordinary `TurbineClient` whose table accessors generate PowQL instead of SQL.
 
 ```ts
 import { turbinePowDB } from 'turbine-orm/powdb';
@@ -60,31 +59,29 @@ const remote = await turbinePowDB('powdb://127.0.0.1:7070', SCHEMA);
 | An already-constructed Turbine `PowdbPool` | Networked | Yours |
 | `{ embedded: dir, syncMode?, memoryLimit?, readonly? }` | In-process | `@zvndev/powdb-embedded` |
 
-The two injected-pool shapes are not equivalent. A raw client `Pool` is wrapped in a fresh `PowdbPool` and still goes through the version probe, so it gets real capabilities and the floor check. An already-constructed `PowdbPool` is used as-is, because it already carries its own `PowdbPoolOptions` and capability set.
+The two injected-pool shapes behave differently. A raw client `Pool` is wrapped in a fresh `PowdbPool` and still goes through the version probe, so it gets real capabilities and the version floor check. An already-constructed `PowdbPool` is used as is, because it carries its own `PowdbPoolOptions` and capability set.
 
-A networked target probes `serverVersion` on connect and throws `ConnectionError` on anything below `MIN_POWDB_VERSION` (`'0.7.0'`).
+A networked target probes `serverVersion` on connect and throws `ConnectionError` for anything below `MIN_POWDB_VERSION` (`'0.7.0'`).
 
-When the factory fails after it opened something, it closes what it opened before it throws. That covers a server below the version floor, an embedded `syncMode` the installed addon cannot apply, and a client option refused at construction, such as a `globalFilters` key naming no table. A client `Pool` or `PowdbPool` you pass in is never closed. Before 0.90 the pool or handle stayed open, and an idle socket kept the process alive.
+If the factory fails after opening something, it closes what it opened before it throws. That covers a server below the version floor, an embedded `syncMode` the installed addon cannot apply, and a client option refused at construction, such as a `globalFilters` key naming no table. A client `Pool` or `PowdbPool` you pass in is never closed.
 
 ### Options
 
-`TurbinePowdbOptions` extends **every** client-level field of `TurbineConfig` (`globalFilters`, `errorMessages`, `logging`, `defaultLimit`, `warnOnUnlimited`, `relationLoadStrategy`, and the rest), minus the connection and pool plumbing the factory owns, plus the transport options below.
-
-Before 0.75.0 it was a four-key subset, so anything else you passed was accepted by the type and dropped before the client saw it. If you configure `globalFilters` against PowDB, it applies from 0.75.0 on, which changes what your queries return.
+`TurbinePowdbOptions` accepts **every** client-level field of `TurbineConfig` (`globalFilters`, `errorMessages`, `logging`, `defaultLimit`, `warnOnUnlimited`, `relationLoadStrategy` and the rest), except the connection and pool settings the factory owns, plus the transport options below.
 
 | Option | Default | Notes |
 |---|---|---|
-| `relationLoadStrategy` | engine default | PowDB's own default, **not** the SQL side's. On engine 0.18+ that is nested projections (one statement); below that, the batched loaders. `'join'` opts in to native server-side joins for eligible top-level relations; ineligible ones fall back per relation, silently. |
+| `relationLoadStrategy` | engine default | PowDB's own default, **not** the SQL engines'. On engine 0.18+ that is nested projections (one statement); below that, the batched loaders. `'join'` opts in to native server-side joins for eligible top-level relations. Ineligible relations fall back one by one, silently. |
 | `connectionLimit` | `10` | Max pooled connections. Networked only. |
 | `transactionQueueTimeoutMs` | `30_000` | How long a concurrent `$transaction` waits in the FIFO queue for PowDB's single global write lock before throwing `TimeoutError`. `0` or `Infinity` waits without limit. |
-| `retryStaleReads` | `false` | Networked opt-in: replay a **first-statement read** once on a fresh connection when it fails with the stale-wire-frame `ConnectionError` a long-idle socket can produce. Writes and anything inside a transaction are never replayed: an ambiguous mutation reply is not safe to repeat. |
-| `assumeEngineVersion` | probed | Override the detected version used for capability gating, for deployments where the version cannot be probed. Without it, an undetectable version turns every gated feature **off** with a hinting `UnsupportedFeatureError`. |
+| `retryStaleReads` | `false` | Networked opt-in: replay a **first-statement read** once on a fresh connection when it fails with the stale-wire-frame `ConnectionError` a long-idle socket can produce. Writes and anything inside a transaction are never replayed, because an ambiguous write reply is not safe to repeat. |
+| `assumeEngineVersion` | probed | Override the detected version used for capability gating, for deployments where the version cannot be probed. Without it, an undetectable version turns every gated feature **off**, and each one throws an `UnsupportedFeatureError` with a hint. |
 | `readonly` | `false` | Fail a write (or a transaction `begin`) locally with `ReadOnlyError` (`TURBINE_E018`) before it reaches the wire. Implied by `{ embedded, readonly: true }`. |
 | `powdbClientModule`, `powdbEmbeddedModule` | unset | Driver-module injection, for tests and advanced embedding. |
 
-`connectionLimit` is ignored on **both** injected-pool paths: it sizes a pool the factory would have constructed, and you already constructed yours.
+`connectionLimit` is ignored on **both** injected-pool paths: it sizes a pool the factory would have built, and you already built yours.
 
-`transactionQueueTimeoutMs`, `readonly` and `retryStaleReads` are ignored **only when you inject an already-constructed `PowdbPool`**, because that pool carries its own `PowdbPoolOptions`; set them on the `PowdbPool` constructor instead. When you inject a raw `@zvndev/powdb-client` `Pool`, the factory builds the `PowdbPool` around it and all three **are** applied.
+`transactionQueueTimeoutMs`, `readonly` and `retryStaleReads` are ignored **only when you inject an already-constructed `PowdbPool`**, because that pool carries its own `PowdbPoolOptions`. Set them on the `PowdbPool` constructor instead. When you inject a raw `@zvndev/powdb-client` `Pool`, the factory builds the `PowdbPool` around it and applies all three.
 
 ### Embedded targets
 
@@ -96,11 +93,11 @@ const fast = await turbinePowDB({ embedded: './data', syncMode: 'normal' }, SCHE
 const snap = await turbinePowDB({ embedded: './data', readonly: true }, SCHEMA);
 ```
 
-`TurbinePowdbEmbeddedTarget` carries `embedded` (the data directory), `syncMode` (`'full' | 'normal' | 'off'`, addon 0.7.1+), `memoryLimit`, and `readonly`. Combining `readonly: true` with a `syncMode` throws `ValidationError`: a read-only database never writes, so a durability selector there is meaningless, and refusing beats silently ignoring it.
+`TurbinePowdbEmbeddedTarget` carries `embedded` (the data directory), `syncMode` (`'full' | 'normal' | 'off'`, addon 0.7.1+), `memoryLimit` and `readonly`. Combining `readonly: true` with a `syncMode` throws `ValidationError`: a read-only database never writes, so a durability setting there would be ignored.
 
 ## Capability gating
 
-PowDB gains query-language features release to release. Rather than emit PowQL an older engine cannot parse, the module resolves a capability set at connect time and turns each gated feature into a typed `UnsupportedFeatureError` (`TURBINE_E017`) carrying the version you would need.
+PowDB gains query-language features from release to release. Instead of emitting PowQL an older engine cannot parse, the module resolves a capability set at connect time. On an engine too old for a gated feature, using it throws `UnsupportedFeatureError` (`TURBINE_E017`) naming the version you need.
 
 ```ts
 import {
@@ -120,18 +117,18 @@ import {
 | `docFieldIndexes` | 0.13 | `alter T add index (.col->"seg")` expression indexes. |
 | `serverJoins` | 0.13 | Native server-side joins under `relationLoadStrategy: 'join'`. |
 | `nestedProjections` | 0.18 | Compiling an eligible `with` clause into the parent statement as a correlated nested projection, instead of running the batched loaders. |
-| `entityLinks` | 0.19 | Link DDL. Recognized but deliberately not consumed by query generation. |
+| `entityLinks` | 0.19 | Link DDL. Recognized, but not used by query generation. |
 | `linkIntrospection` | 0.19.1 | The `schema links` listing and link rows in `describe`. |
-| `linkPaths` | 0.19.1 | Scalar to-one link paths in query generation. Floored at the patch release because 0.19.0 had silent-wrong-result link bugs that 0.19.1 turned into hard errors. |
-| `engineVersion`, `nativeRaw` | metadata | Not gates. `nativeRaw` routes results through the typed wire so cells arrive pre-typed; both transports can set it (networked on server 0.13+ with a client exposing `queryNativeRaw`, embedded when the opened handle exposes `queryWithParams`, addon 0.14+). It is feature-detected on the live driver, never assumed from the version alone. |
+| `linkPaths` | 0.19.1 | Scalar to-one link paths in query generation. The floor is the patch release because 0.19.0 returned silently wrong results for some link queries, which 0.19.1 turned into hard errors. |
+| `engineVersion`, `nativeRaw` | metadata | Not gates. `nativeRaw` routes results through the typed wire so cells arrive already typed. Both transports can set it: networked on server 0.13+ with a client exposing `queryNativeRaw`, embedded when the opened handle exposes `queryWithParams` (addon 0.14+). It is detected on the live driver, never assumed from the version alone. |
 
-`ALL_POWDB_CAPABILITIES` is the trusted-caller default used for a pool you constructed directly, which never went through the factory's version probe. Note what it leaves **off**: `nativeRaw`, `nestedProjections`, `entityLinks`, `linkIntrospection` and `linkPaths`. Each of those changes the PowQL actually generated (or, for `entityLinks`, permanently upgrades the on-disk catalog), so they only light up behind a real version probe.
+`ALL_POWDB_CAPABILITIES` is the trusted-caller default for a pool you constructed directly, which never went through the factory's version probe. It leaves **off** `nativeRaw`, `nestedProjections`, `entityLinks`, `linkIntrospection` and `linkPaths`. Each of those changes the PowQL that is generated (or, for `entityLinks`, permanently upgrades the on-disk catalog), so they turn on only after a real version probe.
 
 <Callout type="warning" title="assumeEngineVersion is a promise you are making">
-  Passing `assumeEngineVersion: '0.19.1'` to a server actually running 0.13
-  does not make the features work. It removes the guard that would have given
-  you a clear `TURBINE_E017` and leaves you with a raw PowQL parse error.
-  Use it only when the version genuinely cannot be probed.
+  Passing `assumeEngineVersion: '0.19.1'` to a server running 0.13 does not
+  make the features work. It removes the guard that would have given you a
+  clear `TURBINE_E017` and leaves you with a raw PowQL parse error. Use it only
+  when the version cannot be probed.
 </Callout>
 
 ## Schema DDL
@@ -150,30 +147,34 @@ for (const stmt of powqlSchemaDDL(SCHEMA)) {
 }
 ```
 
-`PowqlSchemaDDLOptions` carries `emitLinks` (also emit link DDL for the schema's relations, gated on the `entityLinks` capability) and a `capabilities` set, so a statement an older engine cannot parse is refused at build time rather than at the wire.
+`PowqlSchemaDDLOptions` carries `emitLinks` (also emit link DDL for the schema's relations, gated on the `entityLinks` capability) and a `capabilities` set, so a statement an older engine cannot parse is refused when the DDL is built, not when it reaches the server.
 
-Type mapping is deliberately narrow: `powqlColumnType(col)` maps a Turbine column to one of `'str' | 'int' | 'float' | 'bool' | 'json'` (`PowqlType`). It never emits `uuid`, `datetime` or `bytes`, because PowQL has no such types; a `Date` binds as integer microseconds. Since 0.90 a number, bigint or boolean compared with or written to a `Date` column throws `ValidationError` (`TURBINE_E003`), as on PostgreSQL; pass `new Date(ms)` or ISO text. Before, the number was bound as raw microseconds, so a filter matched nothing and a write stored the wrong instant. `isJsonColumn(col)` is the predicate behind the `json` mapping.
+`powqlColumnType(col)` maps a Turbine column to one of `'str' | 'int' | 'float' | 'bool' | 'json'` (`PowqlType`). It never emits `uuid`, `datetime` or `bytes`, because PowQL has no such types. A `Date` binds as integer microseconds. A number, bigint or boolean compared with or written to a `Date` column throws `ValidationError` (`TURBINE_E003`), as on PostgreSQL: pass `new Date(ms)` or ISO text. `isJsonColumn(col)` is the predicate behind the `json` mapping.
 
-An enum column (declared in `defineSchema`'s `enums`, or an introspected enum type) maps to `str` and holds its label. A value that is not one of its labels is `TURBINE_E003` in writes and filters, and `gt` / `gte` / `lt` / `lte` compare in declaration order, as on PostgreSQL. `contains`, `startsWith`, `endsWith`, `mode: 'insensitive'`, `_sum` and `_avg` on an enum are `TURBINE_E003`, as on PostgreSQL. Ordering by an enum (`orderBy`, `_min` / `_max`, groupBy ordering) throws `UnsupportedFeatureError` (`TURBINE_E017`), because PowDB would sort the label text alphabetically; order by the label's position in application code. Before 0.90 an enum column was declared `json`, and every write of a label failed.
+An enum column (declared in `defineSchema`'s `enums`, or an introspected enum type) maps to `str` and holds its label. As on PostgreSQL:
 
-Two column kinds have no mapping at all and throw `ValidationError` (`TURBINE_E003`) naming the column, rather than being coerced into something wrong:
+- A value that is not one of its labels is `TURBINE_E003` in writes and filters.
+- `gt` / `gte` / `lt` / `lte` compare in declaration order.
+- `contains`, `startsWith`, `endsWith`, `mode: 'insensitive'`, `_sum` and `_avg` on an enum are `TURBINE_E003`.
+
+Unlike PostgreSQL, ordering by an enum (`orderBy`, `_min` / `_max`, groupBy ordering) throws `UnsupportedFeatureError` (`TURBINE_E017`), because PowDB would sort the label text alphabetically. Order by the label's position in application code.
+
+Two column kinds have no mapping and throw `ValidationError` (`TURBINE_E003`) naming the column, instead of being coerced into something wrong:
 
 - **Array columns** (`isArray`, and not a `json` column): PowDB has no array type.
 - **Binary columns** (`Buffer` / `Uint8Array`): PowDB cannot store client-supplied bytes on the wire. Use a string, for example base64.
 
-Both fire at DDL-build time, so an unsupported column fails when you generate the schema rather than at the first write.
+Both fire when the DDL is built, so an unsupported column fails when you generate the schema, not at the first write.
 
-Primary keys are one of two shapes. A column marked generated emits PowDB's `auto` modifier and the engine assigns the id; a defaulted string primary key gets a client-side UUID instead. Composite primary-key columns are emitted as `required` only, and per-column `unique` is emitted **only** for a single-column primary key, because PowDB has no composite unique.
+Primary keys come in two shapes. A column marked generated emits PowDB's `auto` modifier, and the engine assigns the id. A defaulted string primary key gets a client-side UUID instead. Composite primary-key columns are emitted as `required` only, and per-column `unique` is emitted **only** for a single-column primary key, because PowDB has no composite unique.
 
-A composite primary key's own index (`<table>_pkey` in introspected metadata) is skipped rather than refused, since the `required` columns above already carry it (since 0.80). Every other composite index, including a composite unique that is not the primary key, is still refused with `UnsupportedFeatureError`: PowDB cannot enforce it.
+A composite primary key's own index (`<table>_pkey` in introspected metadata) is skipped rather than refused, since the `required` columns above already cover it. Every other composite index, including a composite unique that is not the primary key, is refused with `UnsupportedFeatureError`: PowDB cannot enforce it.
 
 ## Upsert and aggregates
 
-`upsert` updates the row its `where` names, or inserts `create`, as on the SQL engines. PowQL's native `upsert … on .col` statement is used for the one shape it expresses: a single-column primary key whose `where` value is the one `create` carries, a non-empty `update`, and no global filter on the table. Every other shape looks the row up by `where` first, then updates it or inserts `create`, in one transaction. That covers a unique non-key column, a composite key, nested writes, an empty `update`, and a table under a [global filter](/global-filters), where the lookup and the update carry the filter so another tenant's row is never overwritten. When `where` carries the same key as `create` and the lookup misses only because the filter hides that row, the upsert throws `NotFoundError` (`TURBINE_E001`) and writes nothing, as on PostgreSQL; before 0.90 it was `UniqueConstraintError` (`TURBINE_E008`).
+`upsert` updates the row its `where` names, or inserts `create`, as on the SQL engines. PowQL's native `upsert … on .col` statement is used for the one shape it expresses: a single-column primary key whose `where` value matches the one in `create`, a non-empty `update`, no nested writes, and no global filter on the table. Every other shape looks the row up by `where` first, then updates it or inserts `create`, in one transaction. That covers a unique non-key column, a composite key, nested writes, an empty `update`, and a table under a [global filter](/global-filters), where the lookup and the update both carry the filter so another tenant's row is never overwritten. When `where` carries the same key as `create` and the lookup misses only because the filter hides that row, the upsert throws `NotFoundError` (`TURBINE_E001`) and writes nothing, as on PostgreSQL.
 
-Before 0.80 the native statement was used for all of them, so an upsert by email never found the existing row and a tenant-scoped upsert could update another tenant's. Before 0.81 the lookup used `create`'s values rather than `where`'s, so `where: { id: 1 }` with a `create` carrying another key missed row 1.
-
-`aggregate()` with several fields runs them in one `group 1` statement on an engine probed at 0.20 or later, instead of one statement per field. Measured with eight sums, median of 20: 2.5 ms to 2.1 ms at 50k rows embedded, 42 to 59 ms to 32 ms at 500k rows embedded, 3.5 ms to 2.3 ms networked on loopback. Engines 0.13 to 0.19 keep the per-field statements, because a per-field `count` of a nullable column disagrees between the two forms there. An empty filtered set also takes the per-field path, since the grouped form returns no row at all for it.
+On an engine probed at 0.20 or later, `aggregate()` with several fields runs them in one `group 1` statement instead of one statement per field. Measured with eight sums, median of 20 runs: 2.5 ms to 2.1 ms at 50k rows embedded, 42 to 59 ms to 32 ms at 500k rows embedded, 3.5 ms to 2.3 ms networked over loopback. Engines 0.13 to 0.19 keep the per-field statements, because there a per-field `count` of a nullable column disagrees between the two forms. An empty filtered set also takes the per-field path, since the grouped form returns no row at all for it.
 
 `deriveDesiredLinks(...)` and `powdbLinkStatement(link)` build link DDL from `PowdbDesiredLink` descriptors, and `applyPowdbLinks(...)` applies them. `quotePowqlIdent(name)` quotes an identifier, checked against `POWQL_KEYWORDS`, the reserved-word set.
 
@@ -185,48 +186,53 @@ import { introspectPowdbDatabase, type PowdbExec } from 'turbine-orm/powdb';
 const schema = await introspectPowdbDatabase(exec, { capabilities });
 ```
 
-`introspectPowdbDatabase` reads a live catalog (`schema`, then `describe <T>` per table) into a `SchemaMetadata`, which is enough to bootstrap against an existing database. Two limitations: the primary key is a heuristic, and relations are populated only from declared entity links, which needs the `linkIntrospection` capability (engine ≥ 0.19.1); below that, relations come back `{}` (PowDB has no declared foreign keys). Many-to-many junctions cannot be inferred from links on any version. `defineSchema` plus `schemaDefToMetadata` remains the relation-complete path.
+`introspectPowdbDatabase` reads a live catalog (`schema`, then `describe <T>` per table) into a `SchemaMetadata`, enough to bootstrap against an existing database. It has two limits:
 
-The `exec` you pass must be **record-keyed**: zip the raw client's positional rows into objects first. A mis-shaped `exec` that yields zero named tables throws rather than quietly returning an empty schema, which would otherwise generate a client with no tables in it. The optional `capabilities` argument gates the call, so an engine below 0.10 gets `TURBINE_E017`.
+- The primary key is a heuristic.
+- Relations come only from declared entity links, which needs the `linkIntrospection` capability (engine ≥ 0.19.1). Below that, relations come back `{}`, because PowDB has no declared foreign keys. Many-to-many junctions cannot be inferred from links on any version.
+
+`defineSchema` plus `schemaDefToMetadata` remains the path that captures every relation.
+
+The `exec` you pass must be **record-keyed**: zip the raw client's positional rows into objects first. A mis-shaped `exec` that yields zero named tables throws instead of returning an empty schema, which would generate a client with no tables. The optional `capabilities` argument gates the call, so an engine below 0.10 gets `TURBINE_E017`.
 
 ## Pools and parameters
 
-`PowdbPool` (networked, over the client's own `Pool`) and `PowdbEmbeddedPool` (a single `Database` handle) both implement `PgCompatPool`, which is why the rest of Turbine does not need to know which transport it is talking to.
+`PowdbPool` (networked, over the client's own `Pool`) and `PowdbEmbeddedPool` (a single `Database` handle) both implement `PgCompatPool`, so the rest of Turbine does not need to know which transport it is talking to.
 
-Below addon 0.14 the embedded addon **takes no parameter array at all**, so `PowdbEmbeddedPool` materializes each `$N` into a PowQL literal itself: `encodePowqlLiteral(value)` produces one literal and `materializePowql(powql, params)` substitutes the whole statement. The string escaping matches the engine lexer exactly (`\"`, `\\`, `\n`, `\t`, everything else raw), so the path is injection-safe. On addon 0.14+ the pool routes real `$N` binding through `queryWithParams` and the literal encoder becomes the fallback path.
+Below addon 0.14 the embedded addon **takes no parameter array**, so `PowdbEmbeddedPool` turns each `$N` into a PowQL literal itself. `encodePowqlLiteral(value)` produces one literal, and `materializePowql(powql, params)` substitutes the whole statement. The string escaping matches the engine lexer exactly (`\"`, `\\`, `\n`, `\t`, everything else raw), so the path is injection-safe. On addon 0.14+ the pool binds `$N` for real through `queryWithParams`, and the literal encoder is the fallback.
 
-`POWQL_LEXER_TESTED_CEILING` records the highest engine version whose lexer has been verified byte-identical, which is what makes the literal encoder safe to keep.
+`POWQL_LEXER_TESTED_CEILING` records the highest engine version whose lexer has been verified byte-identical, which is what keeps the literal encoder safe.
 
-`PowdbFloatParam` and `PowdbJsonParam` are marker wrappers for values whose PowQL representation cannot be inferred from the JavaScript type alone: a whole-number float that must not be emitted as an integer, and an object or array that must be serialized as canonical JSON text.
+`PowdbFloatParam` and `PowdbJsonParam` are marker wrappers for values whose PowQL form cannot be inferred from the JavaScript type: a whole-number float that must not be emitted as an integer, and an object or array that must be serialized as canonical JSON text.
 
 ## Errors
 
-`wrapPowdbError(err)` maps both transports into Turbine's [typed error hierarchy](/errors). It handles two very different inputs: the embedded napi addon tags **every** error `code: 'GenericFailure'`, so there is nothing to switch on there, while a networked engine 0.17+ carries a typed wire error class.
+`wrapPowdbError(err)` maps both transports into Turbine's [typed error hierarchy](/errors). The two inputs differ: the embedded napi addon tags **every** error `code: 'GenericFailure'`, so there is nothing to switch on, while a networked engine 0.17+ carries a typed wire error class.
 
 Classification runs in three stages, in this order:
 
 1. **Specific message families**, matched on both transports. These run first because they extract detail the later stages cannot carry: the constraint name behind a unique violation (`TURBINE_E008`), the column behind a missing required value (`TURBINE_E010`), pool-lifecycle and stale-wire-frame failures (`TURBINE_E004`), read-only refusals split into `snapshot` and `rbac` (`TURBINE_E018`), query and transaction-gate timeouts (`TURBINE_E002`), and the bounded-join and entity-link misuse rejections (`TURBINE_E003`).
-2. **The typed wire error class** on `err.wireErrorClass` (networked, engine 0.17+). It runs before any generic message matching, which is the property that matters: the server sanitizes non-allowlisted messages to a generic "query execution error" text, and the class byte stays accurate when the message no longer is.
+2. **The typed wire error class** on `err.wireErrorClass` (networked, engine 0.17+). It runs before any generic message matching. The server replaces messages outside its allowlist with a generic "query execution error" text, and the class byte stays accurate when the message does not.
 3. **The networked `.code` switch**, for pre-0.17 servers and unknown wire classes.
 
 `isStaleFramePowdbError(err)` is the predicate behind `retryStaleReads`. `protocol_error`, including the "received unexpected frame" shape an idle socket produces, maps to `ConnectionError` (`TURBINE_E004`) with the original preserved as `.cause`.
 
 ## Transactions are single-writer
 
-PowDB has one global write lock, and the module makes that explicit rather than letting it surface as a hang:
+PowDB has one global write lock. The module handles it explicitly instead of letting it surface as a hang:
 
-- **Independent concurrent `db.$transaction` calls queue FIFO** on the pool-level transaction gate and run one at a time, bounded by `transactionQueueTimeoutMs`. Without the gate, a networked second `begin` against a held lock simply hangs.
-- **A re-entrant `db.$transaction`**, one opened inside an active transaction callback's async context, throws `TURBINE_E017`: queueing it would deadlock against the transaction waiting for it. Detection uses `AsyncLocalStorage`, scoped to the callback's async subtree, so a same-tick sibling transaction is correctly treated as independent.
+- **Independent concurrent `db.$transaction` calls queue FIFO** on the pool-level transaction gate and run one at a time, bounded by `transactionQueueTimeoutMs`. Without the gate, a networked second `begin` against a held lock would hang.
+- **A re-entrant `db.$transaction`**, one opened inside an active transaction callback's async context, throws `TURBINE_E017`, because queueing it would deadlock against the transaction waiting for it. Detection uses `AsyncLocalStorage`, scoped to the callback's async subtree, so a sibling transaction started in the same tick counts as independent.
 - **A nested `tx.$transaction` throws `TURBINE_E017`**: PowDB has no savepoints.
 
 ## What is not supported
 
 `$listen` / `$notify`, RLS `sessionContext`, pgvector, and cursor streaming all throw `UnsupportedFeatureError` (`TURBINE_E017`), because `powdbDialect` reports the corresponding capability flags as false.
 
-[Nested writes](/nested-writes) are **not** in that list: PowDB routes them through the same shared nested-write engine as the SQL dialects, inside one flat top-level transaction, including many-to-many `connect` / `disconnect` / `set`. The many-to-many operations that are refused (`create`, `connectOrCreate`, `update`, `upsert`, `delete`) are refused identically on every backend, PowDB included.
+[Nested writes](/nested-writes) work: PowDB runs them through the same nested-write engine as the SQL dialects, inside one flat top-level transaction, including many-to-many `connect` / `disconnect` / `set`. The many-to-many operations that are refused (`create`, `connectOrCreate`, `update`, `upsert`, `delete`) are refused the same way on every backend.
 
 ## See also
 
 - **[Database Engines](/engines#powdb)**: using PowDB through the ordinary typed API.
-- **[Writing a custom dialect](/dialects)**: the seam PowDB still uses for capability gating, and the query generation it replaces.
+- **[Writing a custom dialect](/dialects)**: the contract PowDB still uses for capability gating, and the query generation it replaces.
 - **[Typed Errors](/errors)**: the codes `wrapPowdbError` maps into.
