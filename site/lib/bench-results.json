@@ -1,0 +1,311 @@
+{
+  "version": "0.91.0",
+  "date": "2026-10-15",
+  "env": {
+    "machine": "AMD Ryzen 9 7950X host, 4-vCPU 16 GB Firecracker VM, client and PostgreSQL 17 (Docker) on the same VM over a Unix socket",
+    "node": "v24.18.0",
+    "postgres": "17.11",
+    "pgDriver": "8.23.1",
+    "drizzle": "0.45.3",
+    "drizzleRc": "1.0.0-rc.4",
+    "prisma": "7.10.0",
+    "rounds": 200,
+    "warmup": 20,
+    "runs": 3
+  },
+  "core": [
+    {
+      "id": "findMany-100",
+      "label": "findMany, 100 users",
+      "turbine": 0.204,
+      "drizzle": 0.307,
+      "prisma": 0.349,
+      "control": 0.198,
+      "tie": false
+    },
+    {
+      "id": "findMany-l2",
+      "label": "findMany, 50 users + posts",
+      "turbine": 1.47,
+      "drizzle": 1.488,
+      "prisma": 2.93,
+      "control": 0.791,
+      "tie": true
+    },
+    {
+      "id": "findMany-l3",
+      "label": "findMany, 10 users + posts + comments",
+      "turbine": 0.795,
+      "drizzle": 0.899,
+      "prisma": 2.303,
+      "control": null,
+      "tie": false
+    },
+    {
+      "id": "findUnique-pk",
+      "label": "findUnique by primary key",
+      "turbine": 0.09,
+      "drizzle": 0.151,
+      "prisma": 0.179,
+      "control": 0.074,
+      "tie": false
+    },
+    {
+      "id": "findUnique-l3",
+      "label": "findUnique, user + posts + comments",
+      "turbine": 0.278,
+      "drizzle": 0.467,
+      "prisma": 0.599,
+      "control": null,
+      "tie": false
+    },
+    {
+      "id": "count",
+      "label": "count, all users",
+      "turbine": 0.08,
+      "drizzle": 0.115,
+      "prisma": 0.17,
+      "control": 0.077,
+      "tie": false
+    },
+    {
+      "id": "stream-50k",
+      "label": "stream 50,000 comments, per row",
+      "turbine": 55.269,
+      "drizzle": 57.334,
+      "prisma": 85.993,
+      "control": 56.383,
+      "tie": true
+    },
+    {
+      "id": "increment",
+      "label": "atomic increment",
+      "turbine": 0.175,
+      "drizzle": 0.185,
+      "prisma": 0.274,
+      "control": 0.143,
+      "tie": false
+    },
+    {
+      "id": "pipeline",
+      "label": "pipeline, 5-query batch",
+      "turbine": 0.333,
+      "drizzle": 0.707,
+      "prisma": 0.782,
+      "control": 0.365,
+      "tie": false
+    },
+    {
+      "id": "hot-findUnique",
+      "label": "hot findUnique, rotating ids",
+      "turbine": 0.078,
+      "drizzle": 0.143,
+      "prisma": 0.159,
+      "control": 0.072,
+      "tie": false
+    }
+  ],
+  "geomean": {
+    "overheadVsControl": {
+      "turbine": 1.141,
+      "drizzle": 1.609,
+      "prisma": 2.165,
+      "scenarios": 8
+    },
+    "ratioToFastest": {
+      "turbine": 1,
+      "drizzle": 1.404,
+      "prisma": 2.005,
+      "scenarios": 10
+    }
+  },
+  "extended": [
+    {
+      "id": "findMany-5k",
+      "label": "findMany, 5,000 comments",
+      "turbine": 3.882,
+      "drizzle": 5.867,
+      "prisma": 7.001,
+      "control": 4.849,
+      "tie": false
+    },
+    {
+      "id": "findMany-50k",
+      "label": "findMany, 50,000 comments",
+      "turbine": 43.421,
+      "drizzle": 71.251,
+      "prisma": 82.619,
+      "control": 55.444,
+      "tie": false
+    },
+    {
+      "id": "findMany-wide",
+      "label": "findMany, 1,000 rows x 39 columns",
+      "turbine": 4.379,
+      "drizzle": 6.925,
+      "prisma": 7.242,
+      "control": 4.127,
+      "tie": false
+    },
+    {
+      "id": "list-page",
+      "label": "list page, newest first",
+      "turbine": 0.321,
+      "drizzle": 0.395,
+      "prisma": 0.401,
+      "control": 0.275,
+      "tie": false
+    },
+    {
+      "id": "createMany",
+      "label": "createMany, 1,000 rows",
+      "turbine": 5.183,
+      "drizzle": 16.661,
+      "prisma": 44.694,
+      "control": 3.511,
+      "tie": false
+    },
+    {
+      "id": "update",
+      "label": "update by primary key",
+      "turbine": 0.159,
+      "drizzle": 0.172,
+      "prisma": 0.25,
+      "control": 0.136,
+      "tie": false
+    },
+    {
+      "id": "upsert",
+      "label": "upsert on a unique column",
+      "turbine": 0.21,
+      "drizzle": 0.21,
+      "prisma": 0.281,
+      "control": 0.154,
+      "tie": true
+    },
+    {
+      "id": "delete",
+      "label": "delete by unique column",
+      "turbine": 0.167,
+      "drizzle": 0.167,
+      "prisma": 0.258,
+      "control": 0.128,
+      "tie": true
+    },
+    {
+      "id": "to-one",
+      "label": "to-one, 500 posts + author",
+      "turbine": 1.774,
+      "drizzle": 1.936,
+      "prisma": 2.302,
+      "control": 1.285,
+      "tie": false
+    },
+    {
+      "id": "m2m",
+      "label": "many-to-many, 200 posts + tags",
+      "turbine": 1.642,
+      "drizzle": 2.498,
+      "prisma": 3.821,
+      "control": null,
+      "tie": false
+    },
+    {
+      "id": "relation-count",
+      "label": "relation `_count`, 100 users",
+      "turbine": 0.379,
+      "drizzle": 0.486,
+      "prisma": 0.52,
+      "control": null,
+      "tie": false
+    },
+    {
+      "id": "relation-filter",
+      "label": "relation filter (`some`), 100 users",
+      "turbine": 0.285,
+      "drizzle": 0.408,
+      "prisma": 0.461,
+      "control": 0.319,
+      "tie": false
+    },
+    {
+      "id": "groupBy",
+      "label": "groupBy + `having`, 5 groups",
+      "turbine": 0.916,
+      "drizzle": 0.971,
+      "prisma": 1.077,
+      "control": 0.894,
+      "tie": false
+    },
+    {
+      "id": "cold-start",
+      "label": "first query on a new client",
+      "turbine": 0.502,
+      "drizzle": 0.495,
+      "prisma": 0.691,
+      "control": null,
+      "tie": true
+    }
+  ],
+  "streaming": [
+    {
+      "arm": "Drizzle 1.0.0-rc.4",
+      "library": "drizzle",
+      "median": 47.847
+    },
+    {
+      "arm": "Turbine findManyStreamBatches",
+      "library": "turbine",
+      "median": 48.074
+    },
+    {
+      "arm": "Turbine findManyStream (per row)",
+      "library": "turbine",
+      "median": 52.284
+    },
+    {
+      "arm": "hand-written pg, keyset pages",
+      "library": "control",
+      "median": 54.498
+    },
+    {
+      "arm": "Drizzle 0.45.3",
+      "library": "drizzle",
+      "median": 55.512
+    }
+  ],
+  "deepPagination": {
+    "turbine": 0.764,
+    "turbineForceCustomPlan": 0.567,
+    "drizzle": 0.622,
+    "prisma": 0.616,
+    "control": 0.393
+  },
+  "latency": {
+    "rtt": [
+      0,
+      1,
+      5,
+      25
+    ],
+    "turbinePipeline": [
+      0.438,
+      2.664,
+      4.726,
+      24.871
+    ],
+    "drizzleTransaction": [
+      1.062,
+      16.155,
+      30.489,
+      171.031
+    ],
+    "prismaTransaction": [
+      1.233,
+      16.274,
+      30.681,
+      171.119
+    ]
+  },
+  "network": null
+}

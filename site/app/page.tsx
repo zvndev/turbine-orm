@@ -6,19 +6,18 @@ import { CopyButton } from '../components/CopyButton';
 import { HeroFallback } from '../components/hero/HeroFallback';
 import { HeroStage } from '../components/hero/HeroStage';
 import { SiteFooter, SiteHeader } from '../components/SiteChrome';
+import { BENCH, measuredOn, ms, overheadPercent, SPEED_CLAIM, shortRatio, timesTurbine } from '../lib/bench';
 
 export const metadata: Metadata = {
   title: 'Turbine ORM: raw SQL speed, zero raw SQL',
   description:
-    'The TypeScript ORM for Postgres that runs within 8% of hand-written SQL. A whole page of nested data in one round trip, types down to the last relation, one dependency, and tools for your coding agent. MIT.',
+    `The TypeScript ORM for Postgres, ${SPEED_CLAIM}. A whole page of nested data in one round trip, types down to the last relation, one dependency, and tools for your coding agent. MIT.`,
 };
 
 /*
  * Every figure on this page has a source in the repo:
- *   8%, 2.02x, 1.46x, the bars: benchmarks/RESULTS-0.71.0.md
- *   7.16x, 24 ms vs 172 ms:    benchmarks/RESULTS-NETWORK-0.78.0.md
- *   97% (up from 73%):         evals/AGENT-EVAL-0.73.0.md, CHANGELOG 0.73.0
- *   streaming loss:            CHANGELOG 0.76.0
+ *   benchmark figures:   lib/bench-results.json, a copy of benchmarks/results-<version>.json
+ *   97% (up from 73%):   evals/AGENT-EVAL-0.73.0.md, CHANGELOG 0.73.0
  */
 
 const examples = [
@@ -94,7 +93,7 @@ feed[0].posts[0].comments[0].author.name; // string, autocompleted`,
 ];
 
 const stats = [
-  { value: '8%', label: 'from raw SQL speed', note: 'geometric mean, see benchmarks' },
+  { value: shortRatio(timesTurbine('drizzle')), label: 'faster than Drizzle', note: 'geometric mean, see benchmarks' },
   { value: '1', label: 'round trip for nested data', note: 'no N+1, no waterfalls' },
   { value: 'pg', label: 'the only dependency', note: 'no engine, no WASM' },
   { value: '97%', label: 'agent first-try pass rate', note: 'with the bundled agent skill' },
@@ -124,12 +123,17 @@ const pains = [
   },
 ];
 
+const overhead = BENCH.geomean.overheadVsControl;
 const bars = [
   { name: 'hand-written SQL', ratio: 1.0, tone: 'base' },
-  { name: 'Turbine', ratio: 1.08, tone: 'lead' },
-  { name: 'Drizzle', ratio: 1.47, tone: 'other' },
-  { name: 'Prisma', ratio: 1.81, tone: 'other' },
+  { name: 'Turbine', ratio: overhead.turbine, tone: 'lead' },
+  { name: 'Drizzle', ratio: overhead.drizzle, tone: 'other' },
+  { name: 'Prisma', ratio: overhead.prisma, tone: 'other' },
 ];
+const barMax = Math.max(...bars.map((b) => b.ratio));
+const rttFar = BENCH.latency.rtt.length - 1;
+const perRowStream = BENCH.streaming.find((s) => s.arm.includes('per row'));
+const rcStream = BENCH.streaming.find((s) => s.arm.startsWith('Drizzle 1.0'));
 
 const agentPowers = [
   {
@@ -209,7 +213,7 @@ export default async function Home() {
     '@type': 'SoftwareApplication',
     name: 'Turbine ORM',
     description:
-      'The TypeScript ORM for Postgres that runs within 8% of hand-written SQL. Nested data in one round trip, types down to the last relation, one dependency (pg), and read-only tools for coding agents. MIT.',
+      `The TypeScript ORM for Postgres, ${SPEED_CLAIM}. Nested data in one round trip, types down to the last relation, one dependency (pg), and read-only tools for coding agents. MIT.`,
     applicationCategory: 'DeveloperApplication',
     operatingSystem: 'Any',
     url: 'https://turbineorm.dev',
@@ -317,13 +321,15 @@ export default async function Home() {
           <header className="section-head">
             <p className="eyebrow">Benchmarks</p>
             <h2 id="bench-title" className="section-title">
-              2x faster than Prisma.
+              {shortRatio(timesTurbine('prisma'))} faster than Prisma.
               <br />
-              1.46x faster than Drizzle.
+              {shortRatio(timesTurbine('drizzle'))} faster than Drizzle.
             </h2>
             <p className="section-lede">
-              Same schema, same data, same connection pool, ten real query shapes. Turbine lands within 8% of SQL
-              written by hand. We publish where we lose, too.
+              Same schema, same data, same connection pool, real query shapes. Turbine adds{' '}
+              {overheadPercent(overhead.turbine).slice(1)} to SQL written by hand, Drizzle{' '}
+              {overheadPercent(overhead.drizzle).slice(1)} and Prisma {overheadPercent(overhead.prisma).slice(1)}. We
+              publish where we lose, too.
             </p>
           </header>
 
@@ -335,7 +341,7 @@ export default async function Home() {
                   <li key={b.name} className={`bar bar-${b.tone}`}>
                     <span className="bar-name">{b.name}</span>
                     <span className="bar-track">
-                      <span className="bar-fill" style={{ width: `${(b.ratio / 1.81) * 100}%` }} />
+                      <span className="bar-fill" style={{ width: `${(b.ratio / barMax) * 100}%` }} />
                     </span>
                     <span className="bar-value">{b.ratio.toFixed(2)}x</span>
                   </li>
@@ -345,28 +351,34 @@ export default async function Home() {
 
             <div className="bench-notes">
               <div className="note">
-                <p className="note-figure">7x faster dashboards</p>
+                <p className="note-figure">
+                  {Math.round(BENCH.latency.drizzleTransaction[rttFar] / BENCH.latency.turbinePipeline[rttFar])}x faster
+                  dashboards
+                </p>
                 <p>
-                  Five dashboard queries sent as one batch instead of one at a time, over a real network link: 24 ms
-                  instead of 172 ms.
+                  Five dashboard queries sent as one batch, {BENCH.latency.rtt[rttFar]} ms from the database:{' '}
+                  {Math.round(BENCH.latency.turbinePipeline[rttFar])} ms instead of{' '}
+                  {Math.round(BENCH.latency.drizzleTransaction[rttFar])} ms for a transaction.
                 </p>
               </div>
               <div className="note note-loss">
                 <p className="note-figure">Where we lose</p>
                 <p>
-                  Row-by-row streaming. Against Drizzle&apos;s 1.0 release candidate our per-row stream is 5 to 11%
-                  slower. The batched stream ties.
+                  Row-by-row streaming. Against Drizzle&apos;s 1.0 release candidate our per-row stream takes{' '}
+                  {perRowStream ? ms(perRowStream.median) : ''} ms to its {rcStream ? ms(rcStream.median) : ''}. The
+                  batched stream ties.
                 </p>
               </div>
             </div>
           </div>
 
           <p className="fineprint">
-            Turbine 0.71.0, Prisma 7.9.1 and Drizzle 0.45.2 on local PostgreSQL 17.9: 1,000 users, 10,000 posts and
-            50,000 comments, medians of three runs of 200 interleaved rounds, measured 2026-08-15. The bars are the
-            geometric mean over the eight scenarios with a hand-written control; the headline compares all ten. The
-            batch figure is Turbine 0.78.0 against itself on Neon. Method, raw data and noise floor on the{' '}
-            <Link href="/benchmarks">benchmarks page</Link>.
+            {measuredOn()}, against Prisma {BENCH.env.prisma} and Drizzle {BENCH.env.drizzle} on PostgreSQL{' '}
+            {BENCH.env.postgres}, on a dedicated AMD Ryzen 9 7950X benchmark box: 1,000 users, 10,000 posts and 50,000 comments, medians of {BENCH.env.runs} runs of{' '}
+            {BENCH.env.rounds} interleaved rounds. The bars are the geometric mean over the{' '}
+            {overhead.scenarios} scenarios with a hand-written control; the headline compares{' '}
+            {BENCH.geomean.ratioToFastest.scenarios}. The batch figure adds the round trip through a local proxy.
+            Method, raw data and losses on the <Link href="/benchmarks">benchmarks page</Link>.
           </p>
         </section>
 

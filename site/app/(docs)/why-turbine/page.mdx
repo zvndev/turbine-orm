@@ -1,3 +1,7 @@
+import { BENCH, SPEED_CLAIM } from '../../../lib/bench';
+
+export const g = BENCH.geomean.overheadVsControl;
+
 export const metadata = {
   title: 'Why Turbine',
   description:
@@ -7,7 +11,7 @@ export const metadata = {
 
 # Why Turbine
 
-Turbine is the TypeScript ORM for Postgres that runs within 8% of hand-written SQL, installs one dependency, and writes correct queries in an AI agent's hands on the first try. Here is what that gets you.
+Turbine is the TypeScript ORM for Postgres that runs {SPEED_CLAIM}, installs one dependency, and writes correct queries in an AI agent's hands on the first try. Here is what that gets you.
 
 ## Faster than Drizzle and Prisma
 
@@ -17,7 +21,7 @@ On the same data and the same connection pool, measured against hand-written `pg
 
 | | Turbine | Drizzle | Prisma |
 |---|---|---|---|
-| Overhead above hand-written SQL | **1.08x** | 1.47x | 1.81x |
+| Time against hand-written SQL | **{g.turbine.toFixed(2)}x** | {g.drizzle.toFixed(2)}x | {g.prisma.toFixed(2)}x |
 
 A user with their posts and each post's comments comes back in one round trip, with no N+1 and no waterfall. Every number is reproducible from the repo, and the [benchmarks](/benchmarks) page publishes the scenarios Turbine loses too.
 
