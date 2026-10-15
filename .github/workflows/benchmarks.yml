@@ -1,0 +1,148 @@
+name: Benchmarks
+
+# One full benchmark round on a quiet, dedicated machine, producing the site's
+# results file as an artifact. Every release's published numbers should come
+# from this job, so that they all come from the same hardware by one command:
+#
+#   gh workflow run benchmarks.yml
+#   gh workflow run benchmarks.yml -f ref=v0.91.0
+#
+# Dispatch only. It is not a gate: it never runs on a pull request or a push,
+# and it is deliberately absent from gates.yml / gates-ok. A benchmark measures,
+# it does not pass or fail a change.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Library ref to benchmark (branch, tag or SHA). Empty means this workflow's commit. The harness always comes from this workflow's commit.
+        required: false
+        default: ''
+      quick:
+        description: Smoke run (tiny round counts). Proves the pipeline; its numbers mean nothing.
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+# Two rounds on one machine would measure each other.
+concurrency:
+  group: benchmarks
+  cancel-in-progress: false
+
+jobs:
+  round:
+    # A full round takes about 25 minutes on a laptop, plus install, seed and
+    # the quiet-machine gate before every run.
+    timeout-minutes: 90
+    # Self-hosted Firecracker VMs on a dedicated host. The runner's trust policy
+    # decides who may dispatch onto it.
+    runs-on: grandprix-4x16
+    env:
+      PGSOCK_DIR: /tmp/pgsock
+      PG_CONTAINER: turbine-bench-pg
+      PG_DB: turbine_bench
+      # Over the Unix socket, the way every published round has measured.
+      DATABASE_URL: postgresql://postgres@/turbine_bench?host=/tmp/pgsock
+      OUT_DIR: ${{ github.workspace }}/bench-round
+      QUICK: ${{ inputs.quick && '1' || '0' }}
+      BENCH_MACHINE_NOTE: PostgreSQL in Docker on the same VM over a Unix socket
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # With a ref, the library comes from that ref and the harness (benchmarks/)
+      # from this commit, so two releases are compared on the same scenarios.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: inputs.ref != ''
+        with:
+          ref: ${{ inputs.ref }}
+          path: library-under-test
+          persist-credentials: false
+
+      - name: Choose the library directory
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          if [ -n "$REF" ]; then
+            rm -rf library-under-test/benchmarks
+            cp -R benchmarks library-under-test/benchmarks
+            echo "LIB_DIR=$GITHUB_WORKSPACE/library-under-test" >> "$GITHUB_ENV"
+          else
+            echo "LIB_DIR=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+
+      # Plain `docker run`, not a `services:` block, so the socket directory can
+      # be bind-mounted. No network: the harness reaches it by socket only.
+      - name: Start PostgreSQL 17
+        run: |
+          mkdir -p "$PGSOCK_DIR"
+          chmod 777 "$PGSOCK_DIR"
+          docker run -d --name "$PG_CONTAINER" --network none --shm-size=1g \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -v "$PGSOCK_DIR:/var/run/postgresql" \
+            postgres:17
+          # The image runs a temporary server during init, so wait for init to
+          # finish before trusting pg_isready.
+          for _ in $(seq 1 90); do
+            if docker logs "$PG_CONTAINER" 2>&1 | grep -q 'PostgreSQL init process complete' &&
+              docker exec "$PG_CONTAINER" pg_isready -U postgres -q; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec "$PG_CONTAINER" pg_isready -U postgres
+          test -S "$PGSOCK_DIR/.s.PGSQL.5432"
+          docker exec "$PG_CONTAINER" psql -U postgres -qc "CREATE DATABASE $PG_DB"
+
+      - name: Build the library
+        run: |
+          cd "$LIB_DIR"
+          npm ci
+          npm run build
+
+      - name: Install the harness
+        run: |
+          cd "$LIB_DIR/benchmarks"
+          npm ci
+          npx prisma generate
+
+      - name: Seed and analyze
+        run: |
+          cd "$LIB_DIR/benchmarks"
+          npx tsx seed-neon.ts
+          docker exec "$PG_CONTAINER" psql -U postgres -d "$PG_DB" -qc ANALYZE
+
+      - name: Generate the Turbine client
+        run: |
+          cd "$LIB_DIR"
+          node dist/cli/index.js generate --out generated/turbine
+
+      - name: Run the round
+        run: |
+          cd "$LIB_DIR/benchmarks"
+          ./run-round.sh "$OUT_DIR"
+
+      - name: Postgres server log
+        if: always()
+        run: |
+          mkdir -p "$OUT_DIR"
+          docker logs "$PG_CONTAINER" > "$OUT_DIR/postgres.log" 2>&1 || true
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: benchmark-round-${{ github.run_id }}
+          path: ${{ env.OUT_DIR }}
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Stop PostgreSQL
+        if: always()
+        run: docker rm -f "$PG_CONTAINER" || true
