@@ -25,7 +25,7 @@ npx turbine doctor --fix
 npx turbine migrate up
 ```
 
-`doctor` lists every relation whose foreign key (or junction key) has no covering index, and `--fix` writes a migration that adds them. See [`turbine doctor`](/cli#turbine-doctor).
+`doctor` lists every relation whose foreign key (or junction key) has no covering index, and `--fix` writes a migration that adds them. See [`turbine doctor`](/doctor).
 
 Until the indexes exist, `relationLoadStrategy: 'batched'` loads relations the way Prisma does, one query per relation:
 

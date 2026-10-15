@@ -1,3 +1,6 @@
+import { HashRedirect } from '../../../components/HashRedirect';
+import { CLI_MOVED } from '../../../lib/moved-anchors';
+
 export const metadata = {
   title: 'CLI',
   description:
@@ -6,6 +9,8 @@ export const metadata = {
 };
 
 # CLI
+
+<HashRedirect moved={CLI_MOVED} />
 
 The `turbine` CLI ships with `turbine-orm`. Run `npx turbine <command>` from your project root.
 
@@ -301,76 +306,12 @@ It shows the connection string (password redacted), the schema and table count, 
 
 ## `turbine doctor`
 
-Finds relations whose foreign key has no index, and ranks each missing index by write cost against read benefit. It reads live Postgres statistics and never writes to your database; `--fix` writes a migration file.
+Finds relations whose foreign key has no index, ranks each fix, writes the migration with `--fix`, and flags reads a cached plan could slow down. Every flag, the triage tiers and the JSON report are on [its own page](/doctor).
 
 ```bash
 npx turbine doctor
 npx turbine doctor --fix
-npx turbine doctor --unused --min-scans 5
-npx turbine doctor --json > doctor.json
 ```
-
-| Flag | Description |
-|---|---|
-| `--fix` | Write a migration that adds the missing indexes. |
-| `--no-concurrently` | With `--fix`, write plain in-transaction `CREATE INDEX` statements. |
-| `--json` | Print the versioned JSON report only. |
-| `--unused` | Also report never-scanned and redundant indexes. |
-| `--min-scans <n>` | Count an index scanned fewer than `n` times as unused (default 1). |
-| `--audit` | Report which indexes `doctor` suggested have never been scanned. |
-| `--metrics-url <url>` | Read `_turbine_metrics` from a separate database. |
-| `--no-plan-divergence` | Skip the cached-plan check and its `pg_stats` read. |
-| `--allow-pooler` | Run against a transaction pooler anyway. |
-
-A nested read probes the child table once per parent row, so an unindexed foreign key costs a scan per parent. `doctor` refuses a pooler endpoint, because the statistics it reads are session-scoped.
-
-### Triage tiers
-
-- **Take freely**: a large table with few writes and few indexes.
-- **Take deliberately**: real write volume, many indexes, or HOT updates in use.
-- **Scrutinize**: a tiny table, an append-only log, or statistics too thin for a verdict.
-
-Each finding prints the exact `CREATE INDEX`. A foreign key that is 90% or more NULL gets a partial index (`WHERE col IS NOT NULL`). Tables hot in [`db.$observe()`](/observability#metrics-dbobserve) metrics sort first. Invalid indexes from a failed concurrent build are listed with the `DROP` that clears them. Non-Postgres engines get a size-sorted report.
-
-### `--fix`
-
-```bash
-npx turbine doctor --fix
-# Created migration: 20260708143022_add_relation_fk_indexes.sql
-
-npx turbine migrate up
-# ! Running ...add_relation_fk_indexes.sql WITHOUT a transaction (-- turbine:no-transaction).
-# v Applied 1 migration(s)
-```
-
-Each index is `DROP INDEX CONCURRENTLY IF EXISTS` then `CREATE INDEX CONCURRENTLY`, so a rerun after a failed build ends with a valid index.
-
-### `--unused` and `--audit`
-
-`--unused` prints `DROP INDEX CONCURRENTLY` candidates with the space each would reclaim. It never applies them.
-
-- **Never scanned** since the last statistics reset. Primary-key, unique, exclusion and replica-identity indexes are excluded. A replica's scans never reach the primary's counters.
-- **Redundant**: a non-unique index whose columns lead a wider index.
-- **Invalid**: failed concurrent builds.
-
-`--audit` runs the never-scanned check on the `idx_<table>_<cols>` names `--fix` writes.
-
-### Cached-plan divergence
-
-`doctor` scores foreign-key and leading index columns for a value distribution that makes a cached generic plan slow, on reads shaped `WHERE col = $1 ORDER BY <other column> LIMIT $n`.
-
-- **`sparse-value`**: an index serves the column, but some values are far rarer than average. Use [`forceCustomPlan`](/relations#a-per-query-lever-forcecustomplan) on those reads.
-- **`unindexed-filter`**: no index serves the column. Add one. Each finding is checked with a plan-only `EXPLAIN` and dropped when the generic plan avoids the slow path.
-
-A finding is exposure, not an incident: its diagnostic block first reads `pg_prepared_statements.generic_plans`, and while that is 0 you get custom plans. Columns that are neither foreign keys nor indexed are not scored.
-
-### `--json`
-
-The report is versioned (`schemaVersion: 1`) and only gains fields. Its arrays (`planDivergence`, `unused`, `redundant`, `audit`, `invalid`) are always present. Each divergence finding has a `branch`, and branch-specific fields are omitted rather than zero-filled.
-
-### Runtime warning
-
-While [`diagnostics`](/observability#diagnostics-diagnostics) advice is on (the default outside `NODE_ENV=production`), the first query that loads a relation over an unindexed foreign key logs the `CREATE INDEX` it needs, once, with code `unindexed-relation`. It needs a schema with index information (an introspected or generated client).
 
 ## `turbine migrate-from-prisma`
 

@@ -42,7 +42,7 @@ Add the server to your project's `.mcp.json` for Claude Code, or `.cursor/mcp.js
 | `explain_query` | `EXPLAIN (FORMAT JSON)` for a schema-validated `findMany`. |
 | `sample_rows` | Up to 50 rows from one table, with hidden columns never fetched. |
 | `migrate_status` | Applied and pending migrations. |
-| `doctor_report` | Missing relation indexes, from the same advisor as [`turbine doctor`](/cli#turbine-doctor). |
+| `doctor_report` | Missing relation indexes, from the same advisor as [`turbine doctor`](/doctor). |
 | `explain_error` | A Turbine error code (`TURBINE_E003`, `E003` or `3`) with its class, causes, fix and docs link. Needs no database. |
 
 `compile_query` takes a `table`, an `operation` (`findMany`, `findUnique`, `findFirst`, `count`, `aggregate` or `groupBy`) and the `args` you would pass that method. `explain_query` takes `table` plus optional `where`, `orderBy`, `limit` and `select`.

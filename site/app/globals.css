@@ -1660,6 +1660,40 @@ code {
   border-top-right-radius: 0;
 }
 
+/* The engine capability table (dialects page): a key and its description
+   share the first column so five value columns fit the content width. */
+.mdx-content .cap-table td,
+.mdx-content .cap-table th {
+  padding: 0.45rem;
+}
+.mdx-content .cap-table th {
+  white-space: normal;
+  letter-spacing: 0.04em;
+}
+.mdx-content .cap-table td:not(:first-child),
+.mdx-content .cap-table th:not(:first-child) {
+  text-align: center;
+}
+.mdx-content .cap-table .cap-key {
+  font-size: 0.74rem;
+  white-space: nowrap;
+}
+.mdx-content .cap-table .cap-decides {
+  display: block;
+  margin-top: 0.3rem;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  color: var(--text-muted);
+}
+.mdx-content .cap-table .cap-value {
+  font-size: 0.68rem;
+  word-break: keep-all;
+  overflow-wrap: normal;
+}
+.mdx-content .cap-table .cap-no {
+  opacity: 0.45;
+}
+
 /* Tables scroll inside themselves on narrow screens. */
 .mdx-content table {
   display: block;

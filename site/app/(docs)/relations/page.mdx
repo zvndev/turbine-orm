@@ -254,7 +254,7 @@ FROM "posts"
 LIMIT $1
 ```
 
-Each relation subquery runs per parent row, so index your foreign keys ([`turbine doctor`](/cli#turbine-doctor) lists missing ones). Set the strategy per query or per client:
+Each relation subquery runs per parent row, so index your foreign keys ([`turbine doctor`](/doctor) lists missing ones). Set the strategy per query or per client:
 
 ```ts
 await db.users.findMany({ with: { posts: true }, relationLoadStrategy: 'batched' });
@@ -348,7 +348,7 @@ Turbine names prepared statements on pools it opens, unless the connection names
 SELECT name, generic_plans, custom_plans FROM pg_prepared_statements;
 ```
 
-A growing `generic_plans` means it switched; [`turbine doctor`](/cli#turbine-doctor) flags reads at risk. The fix plans every run with the real values:
+A growing `generic_plans` means it switched; [`turbine doctor`](/doctor) flags reads at risk. The fix plans every run with the real values:
 
 ```ts
 const db = turbine({
