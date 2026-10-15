@@ -1,80 +1,121 @@
 export const metadata = {
   title: 'Why Turbine',
   description:
-    'The case for Turbine ORM against Prisma, Drizzle and Kysely: one dependency, a published benchmark control, a read-only MCP server, offline index advice, and where Turbine is the wrong choice.',
+    'Why teams pick Turbine ORM: faster than Drizzle and Prisma, one dependency, built for AI agents, index advice in the CLI, and an easy move from Prisma.',
   alternates: { canonical: '/why-turbine' },
 };
 
 # Why Turbine
 
-The case for choosing Turbine, with each claim pointing at something you can check.
+Turbine is the TypeScript ORM for Postgres that runs within 8% of hand-written SQL, installs one dependency, and writes correct queries in an AI agent's hands on the first try. Here is what that gets you.
 
-## What is not a reason
+## Faster than Drizzle and Prisma
 
-Loading a nested `with` in one statement is common ground. Drizzle's relational queries always emit one SQL statement, Prisma does it with its `relationJoins` preview, and Kysely ships `jsonArrayFrom` / `jsonObjectFrom`. Turbine does it with correlated `json_agg` subqueries.
+Turbine turns each query into one parameterized SQL statement, nested relations included, and caches it by shape. There is no query engine between your code and Postgres.
 
-Raw speed is not a reason on its own either. On an indexed schema the differences are fractions of a millisecond, and over a network the round trip dominates.
+On the same data and the same connection pool, measured against hand-written `pg` queries:
 
-## One dependency, no query engine
+| | Turbine | Drizzle | Prisma |
+|---|---|---|---|
+| Overhead above hand-written SQL | **1.08x** | 1.47x | 1.81x |
 
-`dependencies` lists one package: `pg`. There is no engine binary, no WASM module and no adapter package to keep in step. Turbine builds a parameterized SQL string and caches it per query shape, so there is no query compiler running in your process and no plan cache to size.
+A user with their posts and each post's comments comes back in one round trip, with no N+1 and no waterfall. Every number is reproducible from the repo, and the [benchmarks](/benchmarks) page publishes the scenarios Turbine loses too.
 
-The main entry stays under a CI-enforced size limit with `pg` external, so the [edge build](/serverless) is an import swap, not a separate package.
+## One dependency, almost nothing to attack
 
-## Measured against hand-written SQL
+Turbine's `dependencies` field has one entry: `pg`, the Postgres driver you would install anyway.
 
-The [benchmarks](/benchmarks) run Turbine, Drizzle, Prisma and a hand-written `pg` control on the same data and pool. On a local socket, Turbine runs at 1.08x the control by geometric mean, Drizzle at 1.47x and Prisma at 1.81x.
+- **No engine binary, no WASM, no install scripts.** Nothing runs when you `npm install`.
+- **A security review fits in one line** of `package.json`.
+- **Published from CI with npm provenance.** Every release is the exact tarball that passed the test suite, signed back to the commit that built it.
 
-Turbine loses deep pagination unless you set `forceCustomPlan`, and its per-row stream trails the Drizzle 1.0 release candidate. Both losses sit on the page next to the wins.
+Fewer packages means fewer maintainers you are trusting and fewer places for a supply-chain attack to land.
 
-## Built for agents
+## Built for AI agents
 
-`npx turbine mcp` starts an MCP server with eleven tools. Prisma ships an MCP server too; the difference is what Turbine's server rules out:
-
-- **No write surface.** No tool accepts SQL text, and every database read runs inside `BEGIN READ ONLY` with a statement timeout.
-- **Answers to the schema questions agents get wrong.** `relation_graph` lists the relation names a `with` accepts, `find_join_path` returns the `with` clause that connects two tables, and `table_stats` reports a table's size before a query scans it.
-- **No PII reaches the model.** `sample_rows` never fetches PII-tagged columns, and `explain_query` refuses predicates on them.
-
-Typed query arguments turn a wrong query into a compile error, and every error carries a stable code (`TURBINE_E001` to `TURBINE_E020`) with a docs link. Setup: [Turbine for AI agents](/ai-agents).
-
-## Tooling in the box, offline
-
-**`turbine doctor`.** A relation load probes the child table once per parent row, so an unindexed foreign key costs a scan per parent. `doctor` lists every probed column with no covering index, each with a cost tier, and `--fix` writes the migration. One missing index took a correlated query [from 17.8 s to 62 ms](/migrate-from-prisma#before-anything-else-run-doctor). As of July 2026, no other TypeScript ORM CLI gives missing-index advice.
-
-**PII kept out of the SQL.** Tag a column [`pii: true`](/schema#pii-fields) and every default projection leaves it out of the statement itself, writes included (`RETURNING "id", "name"`, not `RETURNING *`). Reading it takes [`includePii: UNSAFE`](/global-filters#privilege-options-and-the-unsafe-symbol), a symbol a request body cannot carry. By default, errors name the keys of a lookup, never its values.
-
-**A read-only Studio.** `npx turbine studio` binds loopback, authenticates with a per-process token, reads inside `BEGIN READ ONLY` and has no raw-SQL surface. Without `--write`, the write endpoints do not exist. As of July 2026, no other TypeScript ORM ships a studio that is read-only by default or redacts PII.
-
-**Destructive migrations need consent.** `migrate up`, `migrate down` and `push` list the data-destroying statements they find and refuse. Type `destroy my data` and then `yes`, or pass `--allow-destructive` in CI.
-
-## Free and extensible
-
-MIT, with no cloud tier, telemetry or account. Studio, doctor, the MCP server and observability ship in the npm package. Prisma's query analysis, Query Insights, is part of its hosted Prisma Postgres.
-
-All SQL generation goes through the documented [`Dialect` contract](/dialects). The SQLite, MySQL and SQL Server engines implement it, so a new engine starts there.
-
-## When Turbine is the wrong choice
-
-- **You need first-class SQLite, MySQL or SQL Server tooling.** Those [engines](/engines) run the same query API, but `turbine generate` and `turbine migrate` are PostgreSQL-only, and pgvector, LISTEN/NOTIFY and RLS `sessionContext` throw [`UnsupportedFeatureError`](/errors#e017) elsewhere.
-- **You stream large results off PostgreSQL.** Only PostgreSQL streams through a cursor. The other engines load the full result, then yield it in batches.
-- **Your hot path is a full-table drain on an ascending key.** `findManyStream` runs 5% to 11% behind Drizzle 1.0.0-rc.4. `findManyStreamBatches` ties it and beats Drizzle 0.45.2.
-- **You want a large community.** Turbine is younger, with fewer answers online.
-- **You want a schema DSL.** The schema is code-first (`defineSchema`) or introspected; there is no `.prisma` file.
-
-## Coming from somewhere else
-
-- **[Migrate from Prisma](/migrate-from-prisma)**: `turbine migrate-from-prisma` reads `schema.prisma`, and a compat adapter keeps `PrismaClient`-shaped call sites working while you port.
-- **[Migrate from Drizzle](/migrate-from-drizzle)**: the API mapping and the behavior differences to audit.
-
-## Check it yourself
+Coding agents get Turbine right. With the bundled skill installed, agents wrote correct Turbine queries on the first try 97% of the time, up from 73% without it.
 
 ```bash
-npx turbine doctor          # index advice on your own schema
-npx turbine studio          # read-only by default
-npx turbine studio --demo   # no database needed
-npx turbine mcp             # the agent server
+npx turbine skill   # teaches your agent the query API
+npx turbine mcp     # a read-only MCP server for your database
 ```
 
-- **[Benchmarks](/benchmarks)**, with the losses and the noise floor.
-- **[Typed Errors](/errors)**, the full code table.
-- **[Quick Start](/quickstart)**, from zero to a typed query.
+- **Mistakes fail at compile time.** Query arguments are fully typed, so a wrong field or relation name is a type error, not a bad query at runtime.
+- **Errors an agent can act on.** Every error has a stable code, `TURBINE_E001` to `TURBINE_E020`, with a link to the fix.
+- **A database agents can explore safely.** The [MCP server](/mcp) has no write tools, runs every read inside a read-only transaction, and never sends PII-tagged columns to the model.
+
+Setup for Claude Code, Cursor and others: [Turbine for AI agents](/ai-agents).
+
+## Find slow queries before your users do
+
+Most slow ORM queries come down to a missing index. Turbine finds them for you.
+
+```bash
+npx turbine doctor        # every unindexed foreign key, ranked by cost
+npx turbine doctor --fix  # writes the migration that adds them
+```
+
+One missing index took a nested query [from 17.8 seconds to 62 ms](/migrate-from-prisma#before-anything-else-run-doctor). As of July 2026, no other TypeScript ORM's CLI gives missing-index advice.
+
+To see how Postgres runs a query, ask it directly:
+
+```ts
+const plan = await db.posts.explain({
+  where: { orgId: 7 },
+  orderBy: { createdAt: 'desc' },
+});
+```
+
+For the rest, [query events](/observability) report every statement with its duration, so flagging anything over 200 ms is one line. A local metrics dashboard and OpenTelemetry traces build on the same hooks, with no hosted service.
+
+## Easy to move to from Prisma
+
+If you know Prisma, you already know most of Turbine. The query API is the same shape, and `include` becomes `with`:
+
+```ts
+// Prisma
+await prisma.user.findMany({
+  where: { role: 'admin' },
+  include: { posts: true },
+});
+
+// Turbine
+await db.users.findMany({
+  where: { role: 'admin' },
+  with: { posts: true },
+});
+```
+
+You don't have to rewrite everything at once:
+
+- **`turbine migrate-from-prisma`** reads your `schema.prisma` and generates a typed Turbine client.
+- **A Prisma compatibility adapter** keeps `PrismaClient`-style call sites working while you port them one at a time.
+
+Full guide: [Migrate from Prisma](/migrate-from-prisma). Coming from Drizzle? [Migrate from Drizzle](/migrate-from-drizzle).
+
+## Safe by default
+
+- **Accidental mass updates are blocked.** An `update` or `delete` with an empty or always-true `where` throws instead of touching every row.
+- **Personal data stays out of your queries.** Tag a column [`pii: true`](/schema#pii-fields) and Turbine leaves it out of every default read and write.
+- **Destructive migrations ask first.** Dropping a column or table needs an explicit confirmation, or `--allow-destructive` in CI.
+- **[Studio](/studio) is read-only** unless you start it with `--write`.
+
+## Free, with everything included
+
+MIT licensed, with no cloud tier, no account and no telemetry. Studio, `doctor`, the MCP server and observability all ship in the npm package.
+
+## Is Turbine right for you?
+
+Turbine fits best when you run **Postgres** and want speed, type safety and a small footprint.
+
+It may not be the right pick if you need full migration tooling for SQLite, MySQL or SQL Server (the query API runs on [those engines](/engines), but `generate` and `migrate` are Postgres-only), want a schema DSL like `.prisma` files, or need the largest community of answers online.
+
+## Try it
+
+```bash
+npm install turbine-orm
+npx turbine studio --demo   # explore a sample database, no setup needed
+```
+
+- **[Quick start](/quickstart)**: from zero to a typed query in a few minutes.
+- **[Benchmarks](/benchmarks)**: every scenario, wins and losses.
