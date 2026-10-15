@@ -242,11 +242,29 @@ async function main(): Promise<void> {
       ) AS "user"
       FROM posts p LIMIT 500`;
     const toOneRaw = emitted === 'positional' ? toOneRawArray : toOneRawObject;
+    // Like the L2 control in bench-interleaved.ts, the raw arm decodes the
+    // nested author into an object with Date timestamps, which is what every ORM
+    // arm returns and what an application needs before it can use the row.
+    const toDate = (v: unknown) => (v == null ? v : new Date(v as string));
+    const decodeUser = (u: unknown[] | Record<string, unknown> | null) =>
+      u == null
+        ? u
+        : Array.isArray(u)
+          ? {
+              id: u[0], orgId: u[1], email: u[2], name: u[3], role: u[4], avatarUrl: u[5],
+              lastLoginAt: toDate(u[6]), createdAt: toDate(u[7]),
+            }
+          : { ...u, lastLoginAt: toDate(u.lastLoginAt), createdAt: toDate(u.createdAt) };
+    const decodeToOne = async () => {
+      const res = await rawPool.query(toOneRaw);
+      for (const row of res.rows) row.user = decodeUser(row.user);
+      return res.rows;
+    };
     await bench.interleave('to-one, 500 posts + author', [
       { name: 'Turbine', fn: () => turbine.posts.findMany({ limit: 500, with: { user: true } }) },
       { name: 'Prisma 7', fn: () => prisma.post.findMany({ take: 500, include: { user: true } }) },
       { name: 'Drizzle', fn: () => drizzleDb.query.posts.findMany({ limit: 500, with: { user: true } }) },
-      { name: 'Raw', fn: () => rawPool.query(toOneRaw) },
+      { name: 'Raw', fn: decodeToOne },
     ]);
 
     await bench.interleave(
