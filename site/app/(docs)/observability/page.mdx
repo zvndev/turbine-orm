@@ -289,8 +289,8 @@ const handle = await db.$observe({
 A local, read-only dashboard over `_turbine_metrics`: latency over time and a breakdown per `model.action`.
 
 ```bash
-TURBINE_OBSERVE_URL=postgres://... npx turbine observe
-npx turbine observe --port 5000 --no-open
+npx turbine observe --metrics-url postgres://...
+TURBINE_OBSERVE_URL=postgres://... npx turbine observe --port 5000 --no-open
 ```
 
 It binds `127.0.0.1:4984` and reads metrics only, never your application database. It shares [Studio's security model](/studio#security-model): a non-loopback host needs `--allow-remote`, the printed URL holds a one-time ticket, and a foreign `Host` header gets `403`.

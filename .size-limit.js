@@ -408,12 +408,25 @@ const nodePlatform = (config) => {
 // main 148, serverless 116, with README.md (three places), site/app/page.tsx
 // (prose, stat card and table) and the serverless / batadb / neon docs pages in
 // the same commit. Every other entry is still inside its limit and is unchanged.
+// MAIN AND SERVERLESS MOVED 2026-10-15, for 0.92.0. Measured with `npm run build`
+// then `npx size-limit` on the release branch: main 146.54 -> 147.53 (+0.99),
+// serverless 114.88 -> 115.90 (+1.02), the tree-shaken client 114.73 -> 115.81,
+// sqlite 122.14 -> 123.20, mysql 122.50 -> 123.68, mssql 123.84 -> 124.95, powdb
+// 144.03 -> 145.23. Uniform across the client graph, no new module: it is the
+// one-pass positional decoder in query/relations.js (a per-shape plan builder
+// beside the row parser it replaces, which stays as the fallback for shapes the
+// plan declines) and the date fast path in query/utils.js. That is the release's
+// L2 nested-read speedup (1.86x -> 1.33x of hand-written SQL on the benchmark
+// box), so both published claims move on the 0.90.0 rule (measured, rounded up,
+// plus 1 kB): main 149, serverless 117, with README.md (three places) and the
+// serverless / batadb / neon docs pages in the same commit. Every other entry is
+// still inside its limit and is unchanged.
 export default [
   {
     name: "main entry, the whole 'turbine-orm' barrel",
     path: 'dist/index.js',
     // Same number as the README's claim, on purpose. See the note above.
-    limit: '148 kB',
+    limit: '149 kB',
     ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },
@@ -437,7 +450,7 @@ export default [
     // pagination dialect-hook dispatch). These are tiny and engine-neutral, but
     // the edge bundle includes the query builder, so the budget gets a small bump.
     path: 'dist/serverless.js',
-    limit: '116 kB',
+    limit: '117 kB',
     ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },

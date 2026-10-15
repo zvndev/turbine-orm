@@ -2,23 +2,23 @@
 /**
  * turbine-orm CLI
  *
- * Commands:
- *   turbine init                 , Initialize a Turbine project
- *   turbine generate | pull      , Introspect database and generate TypeScript types
- *   turbine migrate-from-prisma   - Parse a schema.prisma and emit a Prisma->Turbine name map + report
- *   turbine push                  - Apply schema-builder definitions to database (--schema-file, destructive ops gated)
- *   turbine migrate create <name> - Create a new SQL migration file (--auto | --from-diff | --recipe <name>)
- *   turbine migrate up           , Apply pending migrations
- *   turbine migrate deploy       , Apply pending migrations without prompts
- *   turbine migrate down         , Rollback last migration
- *   turbine migrate status       , Show migration status
- *   turbine seed                 , Run seed file
- *   turbine status               , Show schema summary
- *   turbine doctor                - Index + cached-plan triage (--fix, --json, --no-concurrently, --unused, --audit, --no-plan-divergence, --allow-pooler)
- *   turbine studio                : Launch local read-only web UI (--demo for a seeded sample DB)
- *   turbine mcp                  , Start read-only MCP server over JSON-RPC stdio
- *   turbine observe              , Launch metrics dashboard (requires TURBINE_OBSERVE_URL)
- *   turbine skill                 - Install the agent query skill (--print, --agents, --dir <path>)
+ * Commands (each has its own `--help`, which is the full flag list):
+ *   turbine init                   Initialize a Turbine project
+ *   turbine generate | pull        Introspect the database and generate TypeScript types
+ *   turbine migrate-from-prisma    Parse a schema.prisma and emit a Prisma->Turbine name map + report
+ *   turbine push                   Apply defineSchema() definitions to the database (destructive ops gated)
+ *   turbine migrate create <name>  Create a SQL migration file (--auto | --from-diff | --recipe <name>)
+ *   turbine migrate up             Apply pending migrations
+ *   turbine migrate deploy         Apply pending migrations without prompts
+ *   turbine migrate down           Roll back the last migration
+ *   turbine migrate status         Show migration status
+ *   turbine seed                   Run the seed file
+ *   turbine status                 Show a schema summary
+ *   turbine doctor                 Index + cached-plan triage
+ *   turbine studio                 Launch the local read-only web UI (--demo for a seeded sample DB)
+ *   turbine mcp                    Start the read-only MCP server over JSON-RPC stdio
+ *   turbine observe                Launch the metrics dashboard (--metrics-url or TURBINE_OBSERVE_URL)
+ *   turbine skill                  Install the agent query skill
  *
  * Usage:
  *   DATABASE_URL=postgres://... npx turbine generate
@@ -95,6 +95,7 @@ import {
   connectionStringHasPassword,
   DEFAULT_INIT_SEED_FILE,
   findConfigFile,
+  firstNonEmpty,
   loadConfigResult,
   looksLikeSchemaFilePath,
   resolveConfig,
@@ -3669,6 +3670,7 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
       allowDestructive: args.allowDestructive,
       onNoTransaction,
       schema: config.schema,
+      adapter: config.adapter,
     });
   } catch (err) {
     if (!isDestructiveRefusal(err)) throw err;
@@ -3685,6 +3687,7 @@ async function cmdMigrateUp(args: CliArgs, config: ResolvedConfig): Promise<void
       allowDestructive: true,
       onNoTransaction,
       schema: config.schema,
+      adapter: config.adapter,
     });
   }
 
@@ -3868,6 +3871,7 @@ async function cmdMigrateDeploy(args: CliArgs, config: ResolvedConfig): Promise<
   const result = await migrateDeploy(url, config.migrationsDir, {
     allowDrift: args.allowDrift,
     schema: config.schema,
+    adapter: config.adapter,
     lockWaitMs: args.wait !== undefined ? args.wait * 1000 : undefined,
     onLockWait: () => {
       runSpinner.stop();
@@ -3990,6 +3994,7 @@ async function cmdMigrateDown(args: CliArgs, config: ResolvedConfig): Promise<vo
       allowDestructive: args.allowDestructive,
       allowDrift: args.allowDrift,
       schema: config.schema,
+      adapter: config.adapter,
     });
   } catch (err) {
     if (!isDestructiveRefusal(err)) throw err;
@@ -4005,6 +4010,7 @@ async function cmdMigrateDown(args: CliArgs, config: ResolvedConfig): Promise<vo
       allowDestructive: true,
       allowDrift: args.allowDrift,
       schema: config.schema,
+      adapter: config.adapter,
     });
   }
 
@@ -5695,12 +5701,12 @@ async function cmdMcp(_args: CliArgs, config: ResolvedConfig): Promise<void> {
 async function cmdObserve(args: CliArgs): Promise<void> {
   banner();
 
-  const url = process.env.TURBINE_OBSERVE_URL;
+  const url = firstNonEmpty(args.metricsUrl, process.env.TURBINE_OBSERVE_URL);
   if (!url) {
-    error('TURBINE_OBSERVE_URL environment variable is required for the observe command.');
+    error('The observe command needs the metrics database: pass --metrics-url or set TURBINE_OBSERVE_URL.');
     errorLine();
-    errorLine(`${dim('Set it to the Postgres connection string where metrics are stored.')}`);
-    errorLine(`${dim('Example:')} ${cyan('TURBINE_OBSERVE_URL=postgres://... npx turbine observe')}`);
+    errorLine(`${dim('Point it at the Postgres database where metrics are stored.')}`);
+    errorLine(`${dim('Example:')} ${cyan('npx turbine observe --metrics-url postgres://...')}`);
     errorLine();
     process.exit(1);
   }
@@ -6111,7 +6117,7 @@ function showDoctorHelp(): void {
   console.log(
     `  ${dim('doctor refuses a transaction-pooling endpoint (a')} ${cyan('-pooler')} ${dim('or')} ${cyan('pgbouncer')}`,
   );
-  console.log(`  ${dim('host, or port 6543). Point it at the direct endpoint instead: a pooler')}`);
+  console.log(`  ${dim('host, or port 6543 or 6432). Point it at the direct endpoint instead: a pooler')}`);
   console.log(`  ${dim('shares one server backend between clients, so neither the session state')}`);
   console.log(`  ${dim('doctor needs nor the session-scoped views it cites belong to it.')}`);
   newline();
@@ -6173,9 +6179,10 @@ function showMcpHelp(): void {
   console.log(`  ${bold('Usage:')}`);
   console.log(`    npx turbine mcp ${dim('[options]')}`);
   newline();
-  console.log(`  Speaks newline-delimited JSON-RPC 2.0 on stdin/stdout and exposes ten`);
-  console.log(`  read-only tools: schema, relation graph, join paths, migration status,`);
-  console.log(`  doctor, EXPLAIN, table stats, sample rows, and error lookup.`);
+  console.log(`  Speaks newline-delimited JSON-RPC 2.0 on stdin/stdout and exposes eleven`);
+  console.log(`  read-only tools: schema overview, table detail, relation graph, join paths,`);
+  console.log(`  migration status, doctor, EXPLAIN, query compile, table stats, sample rows`);
+  console.log(`  and error lookup.`);
   newline();
   console.log(`  ${bold('Options:')}`);
   console.log(`    ${cyan('--url, -u')} ${dim('<url>')}       Postgres connection string`);
@@ -6190,18 +6197,21 @@ function showObserveHelp(): void {
   console.log(`  ${bold('turbine observe')}, Query metrics dashboard`);
   newline();
   console.log(`  ${bold('Usage:')}`);
-  console.log(`    TURBINE_OBSERVE_URL=postgres://... npx turbine observe ${dim('[options]')}`);
+  console.log(`    npx turbine observe --metrics-url postgres://... ${dim('[options]')}`);
   newline();
   console.log(`  Reads the ${cyan('_turbine_metrics')} table written by ${cyan('db.$observe()')} and serves`);
   console.log(`  per-minute count / avg / p50 / p95 / p99 / error aggregates. Read-only,`);
   console.log(`  loopback-bound, behind a random per-session token, same model as Studio.`);
   newline();
   console.log(
-    `  ${dim('The connection string comes from')} ${cyan('TURBINE_OBSERVE_URL')}${dim(', not')} ${cyan('DATABASE_URL')}${dim(':')}`,
+    `  ${dim('The connection string comes from')} ${cyan('--metrics-url')} ${dim('or')} ${cyan('TURBINE_OBSERVE_URL')}${dim(', not')} ${cyan('DATABASE_URL')}${dim(':')}`,
   );
   console.log(`  ${dim('metrics are meant to live in a different database from the one they measure.')}`);
   newline();
   console.log(`  ${bold('Options:')}`);
+  console.log(
+    `    ${cyan('--metrics-url')} ${dim('<url>')}   Metrics database ${dim('(default: TURBINE_OBSERVE_URL)')}`,
+  );
   console.log(`    ${cyan('--port')} ${dim('<n>')}            HTTP port ${dim('(default: 4984)')}`);
   console.log(`    ${cyan('--host')} ${dim('<addr>')}         Bind address ${dim('(default: 127.0.0.1)')}`);
   console.log(`    ${cyan('--no-open')}             Don't auto-open the browser`);

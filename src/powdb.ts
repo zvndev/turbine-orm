@@ -21,7 +21,9 @@
  *     writable types (`str`/`int`/`float`/`bool`); `Date` → `int` epoch micros;
  *     `string` PKs hold UUID strings.
  *   - **No JSON aggregation / link navigation**, single-query nested `with` is
- *     impossible → it degrades to batched N+1 loaders (Phase B).
+ *     not available → on PowDB 0.18+ an eligible `with` compiles to nested
+ *     projections inside the parent statement; older engines and ineligible
+ *     relations use batched loaders.
  *   - **Single global write lock; no savepoints/isolation**, nested
  *     transactions / isolation / vector / LISTEN-NOTIFY / RLS throw.
  *     Independent concurrent `db.$transaction` calls do NOT throw: they queue
@@ -2245,8 +2247,10 @@ export { PowqlInterface } from './powql.js';
  */
 export interface TurbinePowdbOptions extends EngineClientConfig {
   /**
-   * Client-level default `with`-relation load strategy. On PowDB the default is
-   * the batched N+1 loaders; setting `'join'` opts INTO native PowQL server-side
+   * Client-level default `with`-relation load strategy. On PowDB 0.18+ the default
+   * compiles eligible relations to nested projections in one statement (older
+   * engines and ineligible relations use the batched loaders); `'batched'` forces
+   * the loaders, and setting `'join'` opts INTO native PowQL server-side
    * joins for eligible top-level relations (ineligible ones, e.g. a paged parent
    * or a nested `with`, fall back to the loaders per-relation and silently). A
    * per-query `relationLoadStrategy` arg still overrides this. Requires an engine
@@ -2322,9 +2326,9 @@ export interface TurbinePowdbOptions extends EngineClientConfig {
 /**
  * Selects the **embedded** transport, an in-process `@zvndev/powdb-embedded`
  * database at the given data directory (no server, no socket). The value is the
- * data dir path. Preview: Full-durability checkpoint-bound; built binaries ship
- * for macOS (arm64/x64) and Unix-glibc only (Intel-mac/musl/Windows fall back to
- * a from-source `npm run build`).
+ * data dir path. Preview: Full-durability checkpoint-bound; prebuilt binaries ship
+ * for macOS arm64 and Linux glibc x64/arm64 only (Intel macOS, musl and Windows
+ * fall back to a from-source `npm run build`).
  *
  * @example
  * ```ts
@@ -2391,7 +2395,7 @@ async function loadPowdbEmbedded(): Promise<EmbeddedModule> {
     throw new ConnectionError(
       "turbine-orm/powdb embedded mode requires the optional peer '@zvndev/powdb-embedded'. " +
         'Install it: npm i @zvndev/powdb-embedded. If install succeeded but loading failed, your platform has no ' +
-        'prebuilt binary (prebuilts ship for macOS arm64/x64 and Linux glibc x64/arm64; Intel-mac/musl/Windows ' +
+        'prebuilt binary (prebuilts ship for macOS arm64 and Linux glibc x64/arm64; Intel macOS, musl and Windows ' +
         'build from source), build it with `npm run build` in the addon, then retry. You can also construct the ' +
         'pool yourself and inject it: turbinePowDB(pool, schema). ' +
         `(${(err as Error).message})`,

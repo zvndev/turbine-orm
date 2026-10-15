@@ -1,6 +1,36 @@
 # Changelog
 
-## Unreleased
+## 0.92.0 (2026-10-15)
+
+Nested reads are faster, and four CLI fixes. A `findMany` with a `with`
+decodes its relation rows in one pass, which takes the 50-users-with-posts
+read from 1.86x to 1.33x of a hand-written query on the benchmark machine.
+`turbine migrate` now takes its lock through the `adapter` in your config,
+`turbine observe` reads `--metrics-url`, and two help screens state the
+right numbers. No query changes its SQL or its result.
+
+### Fixed
+
+- **`turbine migrate` uses the configured `adapter`.** `migrate up`,
+  `deploy` and `down` never passed the config file's `adapter` to the
+  migration runner, so a CockroachDB or YugabyteDB project still took
+  `pg_try_advisory_lock()`, which on those engines does not keep two
+  concurrent runs apart. The lock now goes through the adapter's lock table.
+- **`turbine observe --metrics-url` works.** The flag was accepted and
+  ignored, so `observe` refused to start unless `TURBINE_OBSERVE_URL` was set.
+  It now reads `--metrics-url` first, then `TURBINE_OBSERVE_URL`.
+- **`turbine mcp --help` says eleven tools**, the number the server lists. A
+  test now compares the two.
+- **`turbine doctor --help` names both pooler ports it refuses**, 6543 and
+  6432. A test now checks every refused port appears.
+
+### Changed
+
+- **Studio and the observe dashboard use the brand blue**, `#6f9bf7`, in
+  place of `#60a5fa`.
+- **Bundle-size limits move by 1 kB**: the main entry is held under 149 kB
+  brotli and the edge entry under 117 kB. The growth is the one-pass decoder
+  below.
 
 ### Performance
 
@@ -26,6 +56,18 @@
   parser.
 
 ### Measured
+
+On the dedicated benchmark machine (`benchmarks.yml`: a 4-vCPU Firecracker VM
+on an AMD Ryzen 9 7950X host, PostgreSQL 17 over a Unix socket, three runs),
+against the same workflow on 0.91.0:
+
+| Scenario | 0.91.0 | 0.92.0 |
+|---|---|---|
+| `findMany`, 50 users + posts | 1.470 ms (1.86x hand-written) | 1.072 ms (1.33x) |
+| `findMany`, 10 users + posts + comments | 0.795 ms | 0.636 ms |
+| to-one, 500 posts + author | 1.774 ms | 1.511 ms |
+| many-to-many, 200 posts + tags | 1.642 ms | 1.490 ms |
+| overhead over hand-written SQL, geomean of 8 | 1.141x | 1.100x |
 
 Paired and interleaved in one process (this build against 0.91.0,
 plus a second copy of 0.91.0 as the negative control), 600 rounds, local

@@ -16,7 +16,7 @@ export const OBSERVE_HTML = `<!doctype html>
       --border: #26262b;
       --text: #e6e6ea;
       --text-dim: #8a8a93;
-      --accent: #60a5fa;
+      --accent: #6f9bf7;
       --green: #4ade80;
       --red: #f87171;
       --orange: #fb923c;

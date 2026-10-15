@@ -117,7 +117,7 @@ Run transactions, streaming and realtime on a server or worker over the direct c
 
 ## Why Turbine on BataDB?
 
-- **No WASM**: the edge entry is held under 116 kB brotli in CI.
+- **No WASM**: the edge entry is held under 117 kB brotli in CI.
 - **Single-query nested reads**: one SQL statement via `json_agg`, not N+1.
 - **Pipeline batching**: several queries in one round trip. A cold compute pays its wake-up cost once per request, not once per query.
 - **No adapter layer**: `turbineHttp(pool, SCHEMA)` works with any pg-compatible driver.

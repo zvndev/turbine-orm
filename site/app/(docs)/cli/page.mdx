@@ -444,10 +444,10 @@ See [Turbine for AI agents](/ai-agents).
 Serves a local dashboard over the `_turbine_metrics` table that `db.$observe()` writes.
 
 ```bash
-TURBINE_OBSERVE_URL=postgres://... npx turbine observe
+npx turbine observe --metrics-url postgres://...
 ```
 
-Flags: `--port` (default 4984), `--host`, `--no-open`, `--allow-remote`. See [Observability](/observability#dashboard-npx-turbine-observe).
+Flags: `--metrics-url` (default `TURBINE_OBSERVE_URL`), `--port` (default 4984), `--host`, `--no-open`, `--allow-remote`. See [Observability](/observability#dashboard-npx-turbine-observe).
 
 ## Config resolution
 
@@ -486,7 +486,7 @@ A command that connects uses the first non-empty value of:
 3. `url` in `turbine.config.ts`
 4. `migrate-from-prisma` only: the schema's `datasource` block, through its `env("...")` (`url`, then `directUrl`) or a literal `url`
 
-The CLI loads `.env` from the current directory (Node 20.12+), but a variable already set in your shell wins. `observe` reads only `TURBINE_OBSERVE_URL`.
+The CLI loads `.env` from the current directory (Node 20.12+), but a variable already set in your shell wins. `observe` reads `--metrics-url`, then `TURBINE_OBSERVE_URL`, never `DATABASE_URL`.
 
 ## See also
 
