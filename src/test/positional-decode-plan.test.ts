@@ -630,6 +630,56 @@ describe('positional decode plan: shapes it declines still decode through the re
     });
   }
 
+  // Two guards whose shapes no earlier check reaches. Each test compares the
+  // rows FIRST, so a deleted guard fails on the wrong row it produces rather
+  // than only on the decline assertion after it.
+  function declinedRowsMatch(s: SchemaMetadata, withClause: WithClause, items: unknown[][]) {
+    const q = makeQuery('users', s, { warnOnUnlimited: false, logger: {} });
+    const ctx = (q as unknown as { ctx: BuilderCtx }).ctx;
+    const shapes = buildRelationShapes(ctx, 'users', withClause, false);
+    const row = { id: 1, items: JSON.stringify(items) };
+    const expected = makeReferencePositionalParser(ctx, shapes)(structuredClone(row));
+    const actual = makeNestedParser(ctx, withClause, false, null)(structuredClone(row));
+    assertIdentical(actual, expected, 'declined shape');
+    assert.equal(makePositionalRowParser(ctx, 'users', shapes), undefined, 'the plan should have declined');
+    return { shapes, item: (expected.items as Record<string, unknown>[])[0]! };
+  }
+
+  test('two DISTINCT keys reaching one field through reverseColumnMap: declined', () => {
+    // Column `a_col` (float8) has field `title`, and column `title` (text) has
+    // field `heading`. The relation's keys are `title` and `heading`, both
+    // distinct, but parseRow maps the key `title` through reverseColumnMap to
+    // `heading`, so both land on `heading` with different cell kinds (float,
+    // plain). The reference keeps the LAST write as written; a plan would run
+    // the float decode over it and turn the text 'NaN' into NaN.
+    const s = oneTable([
+      { name: 'id', field: 'id' },
+      { name: 'a_col', field: 'title', pgType: 'float8' },
+      { name: 'title', field: 'heading', pgType: 'text' },
+    ]);
+    const { shapes, item } = declinedRowsMatch(s, { items: true }, [[7, 1.5, 'NaN']]);
+    assert.deepEqual(shapes.items!.keys, ['id', 'title', 'heading']);
+    assert.deepEqual(Object.keys(item), ['id', 'heading']);
+    assert.equal(item.heading, 'NaN', 'the text column keeps its text');
+  });
+
+  test('a nested relation slot parseRow would copy under another field: declined', () => {
+    // `items` has a column named `owner` (field `ownerLabel`) and a relation
+    // named `owner`. With the column left out by `select`, the relation slot's
+    // key `owner` reaches parseRow, which files it under `ownerLabel`, so the
+    // reference row carries BOTH `ownerLabel` (the slot copied through) and
+    // `owner` (the parsed relation). Only the nested-slot check sees this.
+    const s = oneTable([
+      { name: 'id', field: 'id' },
+      { name: 'user_id', field: 'userId' },
+      { name: 'owner', field: 'ownerLabel', pgType: 'text' },
+    ]);
+    const withClause = { items: { select: { id: true }, with: { owner: true } } } as WithClause;
+    const { shapes, item } = declinedRowsMatch(s, withClause, [[7, [1]]]);
+    assert.deepEqual(shapes.items!.keys, ['id', 'owner']);
+    assert.deepEqual(Object.keys(item), ['id', 'ownerLabel', 'owner']);
+  });
+
   test('a hand-built ctx without the decode hooks takes the reference path', () => {
     const ctx = ctxOf({});
     const bare = { ...ctx, rowDecodePlan: undefined } as unknown as BuilderCtx;
