@@ -5,6 +5,9 @@ export const rc = BENCH.streaming.find((s) => s.arm.startsWith('Drizzle 1.0'));
 export const perRow = BENCH.streaming.find((s) => s.arm.includes('per row'));
 export const batches = BENCH.streaming.find((s) => s.arm.includes('Batches'));
 export const big = BENCH.extended.find((s) => s.id === 'findMany-50k');
+export const widest = [...BENCH.core, ...BENCH.extended]
+  .filter((s) => s.control)
+  .reduce((a, b) => (b.turbine / b.control > a.turbine / a.control ? b : a));
 import { GapTower } from '../../../components/bench/GapTower';
 import { ScenarioChart } from '../../../components/bench/ScenarioChart';
 import { LatencyChart } from '../../../components/bench/LatencyChart';
@@ -69,7 +72,7 @@ On a local socket every query is cheap and the differences are the libraries' ow
 - **Same rounds.** Every arm, the hand-written control included, runs once per round, and the arm order rotates every round, so machine drift lands on all arms alike.
 - **Medians.** {BENCH.env.rounds} rounds after {BENCH.env.warmup} warmup for the core scenarios, fewer for the slowest ones, each taken as the median of {BENCH.env.runs} full runs.
 - **Each ORM as its docs prescribe.** Prisma {BENCH.env.prisma} with `@prisma/adapter-pg` and the `relationJoins` preview, Drizzle {BENCH.env.drizzle} with its relational API, `pg` {BENCH.env.pgDriver} under every arm. Drizzle has no relation `_count` or relation-filter primitive, so those two arms are subqueries through its query builder.
-- **Same work in the control.** Where a query returns nested rows, the hand-written version turns them into objects with `Date` timestamps, as every ORM does. The widest remaining gap is the 50-users-with-posts read, where Turbine takes {(l2.turbine / l2.control).toFixed(1)}x the hand-written time and Drizzle {(l2.drizzle / l2.control).toFixed(1)}x.
+- **Same work in the control.** Where a query returns nested rows, the hand-written version turns them into objects with `Date` timestamps, as every ORM does. On the 50-users-with-posts read Turbine takes {(l2.turbine / l2.control).toFixed(2)}x the hand-written time and Drizzle {(l2.drizzle / l2.control).toFixed(2)}x. Turbine's widest gap to the control is {widest.label.replace(/^\w/, (c) => c.toLowerCase())}, at {(widest.turbine / widest.control).toFixed(2)}x.
 - **Machine.** A dedicated benchmark box, run by the repository's `benchmarks.yml` workflow: {BENCH.env.machine}. Node {BENCH.env.node} and PostgreSQL {BENCH.env.postgres}, seeded with 5 orgs, 1,000 users, 10,000 posts and 50,000 comments, then `ANALYZE`d.
 - **Large reads beat the control.** On 50,000 rows Turbine takes {ms(big.turbine)} ms and hand-written `pg` {ms(big.control)}. Turbine parses timestamps with its own faster parser, while the control uses node-postgres's default. Given the same parser, the control is faster than Turbine.
 - **Small numbers.** Figures under 0.15 ms carry about a third uncertainty in their absolute value. Their order held across runs; their margins are not quotable.
