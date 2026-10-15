@@ -373,8 +373,8 @@ export default async function Home() {
           </div>
 
           <p className="fineprint">
-            {measuredOn()}, against Prisma {BENCH.env.prisma} and Drizzle {BENCH.env.drizzle} on local PostgreSQL{' '}
-            {BENCH.env.postgres}: 1,000 users, 10,000 posts and 50,000 comments, medians of {BENCH.env.runs} runs of{' '}
+            {measuredOn()}, against Prisma {BENCH.env.prisma} and Drizzle {BENCH.env.drizzle} on PostgreSQL{' '}
+            {BENCH.env.postgres}, on a dedicated AMD Ryzen 9 7950X benchmark box: 1,000 users, 10,000 posts and 50,000 comments, medians of {BENCH.env.runs} runs of{' '}
             {BENCH.env.rounds} interleaved rounds. The bars are the geometric mean over the{' '}
             {overhead.scenarios} scenarios with a hand-written control; the headline compares{' '}
             {BENCH.geomean.ratioToFastest.scenarios}. The batch figure adds the round trip through a local proxy.

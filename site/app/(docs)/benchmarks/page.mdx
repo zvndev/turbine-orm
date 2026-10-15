@@ -1,6 +1,6 @@
 import { BENCH, ms } from '../../../lib/bench';
 
-export const cold = [...BENCH.extended].find((s) => s.id === 'cold-start');
+export const l2 = BENCH.core.find((s) => s.id === 'findMany-l2');
 export const rc = BENCH.streaming.find((s) => s.arm.startsWith('Drizzle 1.0'));
 export const perRow = BENCH.streaming.find((s) => s.arm.includes('per row'));
 export const batches = BENCH.streaming.find((s) => s.arm.includes('Batches'));
@@ -60,7 +60,6 @@ On a local socket every query is cheap and the differences are the libraries' ow
 ## Where Turbine loses
 
 - **Deep pagination.** A sorted 20-row page at offset 9,000 takes {ms(BENCH.deepPagination.turbine)} ms on Turbine, {ms(BENCH.deepPagination.drizzle)} on Drizzle and {ms(BENCH.deepPagination.prisma)} on Prisma. Turbine names its prepared statements, and PostgreSQL gives a named statement a generic plan that cannot see the bound offset. Set [`forceCustomPlan: true`](/relations#a-per-query-lever-forcecustomplan) on that query and it runs in {ms(BENCH.deepPagination.turbineForceCustomPlan)} ms.
-- **The first query on a new client.** Drizzle answers it in {ms(cold.drizzle)} ms against Turbine's {ms(cold.turbine)}, in every run. It is a one-time cost per client.
 - **Per-row streaming against Drizzle 1.0.** `findManyStream` takes {ms(perRow.median)} ms against the release candidate's {ms(rc.median)}. Use `findManyStreamBatches` when you don't need rows one at a time.
 - **`relationLoadStrategy: 'batched'` over a network.** It is fast on a local socket and slower once the database is a network hop away, because it spends a round trip per relation. The default, `'auto'`, uses the join.
 - **Ties.** Scenarios marked *tie*, mostly single-row writes, are too close to call between Turbine and Drizzle across runs.
@@ -70,8 +69,9 @@ On a local socket every query is cheap and the differences are the libraries' ow
 - **Same rounds.** Every arm, the hand-written control included, runs once per round, and the arm order rotates every round, so machine drift lands on all arms alike.
 - **Medians.** {BENCH.env.rounds} rounds after {BENCH.env.warmup} warmup for the core scenarios, fewer for the slowest ones, each taken as the median of {BENCH.env.runs} full runs.
 - **Each ORM as its docs prescribe.** Prisma {BENCH.env.prisma} with `@prisma/adapter-pg` and the `relationJoins` preview, Drizzle {BENCH.env.drizzle} with its relational API, `pg` {BENCH.env.pgDriver} under every arm. Drizzle has no relation `_count` or relation-filter primitive, so those two arms are subqueries through its query builder.
-- **Machine.** {BENCH.env.machine}, Node {BENCH.env.node}, PostgreSQL {BENCH.env.postgres} over a Unix socket, seeded with 5 orgs, 1,000 users, 10,000 posts and 50,000 comments, then `ANALYZE`d.
-- **Large reads beat the control.** On 50,000 rows Turbine takes {ms(big.turbine)} ms and hand-written `pg` {ms(big.control)}. Turbine parses timestamps with its own faster parser, while the control uses node-postgres's default. Given the same parser, the control is about 5% faster than Turbine.
+- **Same work in the control.** Where a query returns nested rows, the hand-written version turns them into objects with `Date` timestamps, as every ORM does. The widest remaining gap is the 50-users-with-posts read, where Turbine takes {(l2.turbine / l2.control).toFixed(1)}x the hand-written time and Drizzle {(l2.drizzle / l2.control).toFixed(1)}x.
+- **Machine.** A dedicated benchmark box, run by the repository's `benchmarks.yml` workflow: {BENCH.env.machine}. Node {BENCH.env.node} and PostgreSQL {BENCH.env.postgres}, seeded with 5 orgs, 1,000 users, 10,000 posts and 50,000 comments, then `ANALYZE`d.
+- **Large reads beat the control.** On 50,000 rows Turbine takes {ms(big.turbine)} ms and hand-written `pg` {ms(big.control)}. Turbine parses timestamps with its own faster parser, while the control uses node-postgres's default. Given the same parser, the control is faster than Turbine.
 - **Small numbers.** Figures under 0.15 ms carry about a third uncertainty in their absolute value. Their order held across runs; their margins are not quotable.
 
 ## Run it yourself
@@ -94,4 +94,4 @@ npx tsx bench-latency.ts          # simulated round-trip times
 npx tsx bench-network.ts          # a real link: use a direct, non-pooler endpoint
 ```
 
-Expect this shape on a local socket, and a flatter one on a remote database, where the round trip dominates. The full write-up, with per-run figures: <a href={`https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-${BENCH.version}.md`}><code>{`RESULTS-${BENCH.version}.md`}</code></a>.
+Or run the whole round on a fresh machine with `gh workflow run benchmarks.yml`, which uploads every log and the results file as an artifact. Expect this shape on a local socket, and a flatter one on a remote database, where the round trip dominates. The full write-up, with per-run figures: <a href={`https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-${BENCH.version}.md`}><code>{`RESULTS-${BENCH.version}.md`}</code></a>.
