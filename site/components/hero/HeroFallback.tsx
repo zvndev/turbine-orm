@@ -171,13 +171,13 @@ function Scene({ frame }: { frame: Frame }) {
               key={`c${s}`}
               d={d}
               fill="none"
-              stroke={s < 2 ? '#ffe6f1' : t.spec.color}
+              stroke={s < 2 ? '#e7eefe' : t.spec.color}
               strokeOpacity={1 - s / 6}
               strokeWidth={2.4 - s * 0.3}
               strokeLinecap="round"
             />
           ))}
-          {t.head && <circle cx={t.head[0]} cy={t.head[1]} r="5" fill="#fff0f6" />}
+          {t.head && <circle cx={t.head[0]} cy={t.head[1]} r="5" fill="#f0f5fe" />}
         </g>
       ))}
     </svg>

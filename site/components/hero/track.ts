@@ -82,15 +82,15 @@ export interface TracerSpec {
 }
 
 /**
- * The lead tracer is Turbine pink. The other two are desaturated nods to an
- * indigo-to-teal family and an acid lime, kept dim enough to read as company
+ * The lead tracer is Turbine cornflower blue. The other two are desaturated nods to a
+ * teal family and an acid lime, kept dim enough to read as company
  * on the track rather than as labels.
  */
 export const TRACERS: readonly TracerSpec[] = [
   {
     id: 'lead',
-    color: '#ff2e88',
-    tail: '#b3105f',
+    color: '#6f9bf7',
+    tail: '#274fa5',
     commit: 1,
     lane: 0,
     wander: 0,
@@ -103,8 +103,8 @@ export const TRACERS: readonly TracerSpec[] = [
   },
   {
     id: 'second',
-    color: '#7d80d6',
-    tail: '#3fa79c',
+    color: '#4fb3b9',
+    tail: '#2f8a8f',
     commit: 0.45,
     lane: 0.55,
     wander: 0.22,
