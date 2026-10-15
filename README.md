@@ -21,36 +21,36 @@ Six reasons, each with the mechanism that makes it true:
 1. **One dependency.** `dependencies` is `{ "pg": "^8.15.0" }`. No engine binary, no WASM compiler, no adapter packages in lockstep. The optional engines (SQLite, MySQL, SQL Server, PowDB, all tiered Experimental in [STABILITY.md](STABILITY.md)) are peer dependencies or Node builtins you install only if you use them.
 2. **Written from scratch.** Turbine is not a layer over Knex or a query-builder library. Query compilation is plain string building with an FNV-1a shape fingerprint into a bounded LRU of SQL templates, so there is no plan cache to size and no compiler running on your event loop.
 3. **Nested relations in one statement.** A `with` clause compiles to correlated `json_agg` subqueries, so users with posts with comments is one round trip, typed end to end: `users[0].posts[0].comments[0].author.name` autocompletes with no annotation.
-4. **Faster than Drizzle and Prisma.** In the 0.91.0 run Drizzle took 1.4x as long as Turbine and Prisma 2.0x, by geometric mean, on a dedicated benchmark machine. The table is below; the losses are stated with the wins.
+4. **Faster than Drizzle and Prisma.** In the 0.92.0 run Drizzle took 1.5x as long as Turbine and Prisma 2.1x, by geometric mean, on a dedicated benchmark machine. The table is below; the losses are stated with the wins.
 5. **Agents get a skill and typed tools, not a SQL prompt.** `npx turbine skill` installs a query-writing skill whose every claim is executed against a live database before release; `npx turbine mcp` exposes eleven read-only MCP tools, including a relation graph and a join-path finder that returns the `with` clause to write. Every tool runs inside `BEGIN READ ONLY`, and PII-tagged columns are redacted before rows reach a model.
 6. **The dangerous operations ask first.** Destructive migration statements refuse to run without typed consent. `update`/`delete` with an empty `where` throws. Columns tagged `pii: true` are excluded from the emitted SQL's projections. `turbine doctor` reports missing FK indexes offline, no account, no telemetry.
 
 ## Benchmarks
 
-Measured **2026-10-15 against turbine-orm 0.91.0**, versus **Drizzle 0.45.3** (relational queries) and **Prisma 7.10.0** (`@prisma/adapter-pg`, `relationJoins` on), with a hand-written `pg` control arm. Run by the repository's [`benchmarks.yml`](.github/workflows/benchmarks.yml) workflow on a dedicated machine: AMD Ryzen 9 7950X host, 4-vCPU 16 GB Firecracker VM, client and PostgreSQL 17 (Docker) on the same VM over a Unix socket. PostgreSQL 17.11, Node v24.18.0, `pg` 8.23.1 under every arm. Same schema, same data (1K users, 10K posts, 50K comments), same pool config. Each figure is the median over 200 rounds with arm order rotated per round, taken as the median of 3 full runs.
+Measured **2026-10-15 against turbine-orm 0.92.0**, versus **Drizzle 0.45.3** (relational queries) and **Prisma 7.10.0** (`@prisma/adapter-pg`, `relationJoins` on), with a hand-written `pg` control arm. Run by the repository's [`benchmarks.yml`](.github/workflows/benchmarks.yml) workflow on a dedicated machine: AMD Ryzen 9 7950X host, 4-vCPU 16 GB Firecracker VM, client and PostgreSQL 17 (Docker) on the same VM over a Unix socket. PostgreSQL 17.11, Node v24.18.0, `pg` 8.23.1 under every arm. Same schema, same data (1K users, 10K posts, 50K comments), same pool config. Each figure is the median over 200 rounds with arm order rotated per round, taken as the median of 3 full runs.
 
-| Scenario | Turbine 0.91.0 | Drizzle 0.45.3 | Prisma 7.10.0 | raw pg |
+| Scenario | Turbine 0.92.0 | Drizzle 0.45.3 | Prisma 7.10.0 | raw pg |
 |---|---|---|---|---|
-| findMany, 100 users | **0.204 ms** | 0.307 ms | 0.349 ms | 0.198 ms |
-| findMany, 50 users + posts *(tie)* | 1.470 ms | 1.488 ms | 2.930 ms | 0.791 ms |
-| findMany, 10 users + posts + comments | **0.795 ms** | 0.899 ms | 2.303 ms | n/a |
-| findUnique by primary key | **0.090 ms** | 0.151 ms | 0.179 ms | 0.074 ms |
-| findUnique, user + posts + comments | **0.278 ms** | 0.467 ms | 0.599 ms | n/a |
-| count, all users | **0.080 ms** | 0.115 ms | 0.170 ms | 0.077 ms |
-| stream 50,000 comments, per row *(tie)* | 55.27 ms | 57.33 ms | 85.99 ms | 56.38 ms |
-| atomic increment | **0.175 ms** | 0.185 ms | 0.274 ms | 0.143 ms |
-| pipeline, 5-query batch | **0.333 ms** | 0.707 ms | 0.782 ms | 0.365 ms |
-| hot findUnique, rotating ids | **0.078 ms** | 0.143 ms | 0.159 ms | 0.072 ms |
+| findMany, 100 users | **0.208 ms** | 0.310 ms | 0.352 ms | 0.201 ms |
+| findMany, 50 users + posts | **1.075 ms** | 1.485 ms | 2.955 ms | 0.854 ms |
+| findMany, 10 users + posts + comments | **0.620 ms** | 0.884 ms | 2.270 ms | n/a |
+| findUnique by primary key | **0.090 ms** | 0.149 ms | 0.179 ms | 0.075 ms |
+| findUnique, user + posts + comments | **0.246 ms** | 0.460 ms | 0.599 ms | n/a |
+| count, all users | **0.079 ms** | 0.114 ms | 0.169 ms | 0.078 ms |
+| stream 50,000 comments, per row *(tie)* | 55.02 ms | 55.13 ms | 82.84 ms | 57.03 ms |
+| atomic increment | **0.164 ms** | 0.182 ms | 0.259 ms | 0.135 ms |
+| pipeline, 5-query batch | **0.343 ms** | 0.701 ms | 0.784 ms | 0.360 ms |
+| hot findUnique, rotating ids | **0.078 ms** | 0.145 ms | 0.158 ms | 0.070 ms |
 
 What that run says:
 
-- **Across all ten scenarios Drizzle took 1.40x as long as Turbine and Prisma 2.00x**, by geometric mean. Turbine won or tied every one against Drizzle (2 ties) and won all ten against Prisma.
-- **Against hand-written `pg`, Turbine ran at 1.14x, Drizzle at 1.61x and Prisma at 2.17x** (geometric mean over the 8 scenarios with a control). Where a query returns nested rows, the control decodes them into objects with `Date` timestamps as the ORMs do. The 0.71.0 figure of 1.08x was adjusted by hand against a control that did more work than Turbine; this one is not adjusted.
+- **Across all ten scenarios Drizzle took 1.49x as long as Turbine and Prisma 2.13x**, by geometric mean. Turbine won or tied every one against both (1 tie with Drizzle), and won or tied all 14 extra scenarios too.
+- **Against hand-written `pg`, Turbine ran at 1.09x, Drizzle at 1.59x and Prisma at 2.13x** (geometric mean over the 8 scenarios with a control). Where a query returns nested rows, the control decodes them into objects with `Date` timestamps as the ORMs do. The nested read with posts is 1.26x the control, down from 1.86x in 0.91.0, because relation rows now decode in one pass.
 - **Pipelining is the clearest win over a network**: five dashboard queries 25 ms from the database take 25 ms as one batch against 171 ms as a transaction.
 - **Where Turbine loses:** deep `OFFSET` pagination unless `forceCustomPlan` is set, and per-row streaming against the Drizzle 1.0 release candidate (`findManyStreamBatches` ties it).
 - Figures under 0.15 ms carry roughly one third uncertainty in their absolute values. Orderings held across runs; those margins should not be quoted.
 
-Full method, the extra scenarios, streaming, latency and the losses: [`benchmarks/RESULTS-0.91.0.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-0.91.0.md), or the charts at [turbineorm.dev/benchmarks](https://turbineorm.dev/benchmarks).
+Full method, the extra scenarios, streaming, latency and the losses: [`benchmarks/RESULTS-0.92.0.md`](https://github.com/zvndev/turbine-orm/blob/main/benchmarks/RESULTS-0.92.0.md), or the charts at [turbineorm.dev/benchmarks](https://turbineorm.dev/benchmarks).
 
 Reproduce it on a fresh machine with `gh workflow run benchmarks.yml`, or locally with `benchmarks/run-round.sh` (see [`benchmarks/README.md`](benchmarks/README.md)).
 
