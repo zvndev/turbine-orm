@@ -82,15 +82,15 @@ export interface TracerSpec {
 }
 
 /**
- * The lead tracer is Turbine violet. The other two are desaturated nods to an
+ * The lead tracer is Turbine raspberry. The other two are desaturated nods to an
  * indigo-to-teal family and an acid lime, kept dim enough to read as company
  * on the track rather than as labels.
  */
 export const TRACERS: readonly TracerSpec[] = [
   {
     id: 'lead',
-    color: '#c84cf2',
-    tail: '#7e1fb0',
+    color: '#e0388f',
+    tail: '#b31064',
     commit: 1,
     lane: 0,
     wander: 0,
