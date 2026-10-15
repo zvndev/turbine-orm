@@ -1,5 +1,5 @@
 import { ImageResponse } from 'next/og';
-import { ROTOR_BLADES } from './logo-path';
+import { ROTOR_BLADES, ROTOR_HUB } from './logo-path';
 
 /**
  * The shared 1200x630 social card. `opengraph-image.tsx` and
@@ -58,7 +58,7 @@ export function renderOgCard() {
             right: 0,
             bottom: 58,
             height: 26,
-            background: 'linear-gradient(90deg, transparent 0%, rgba(179,16,95,0) 30%, rgba(111,155,247,0.22) 78%, rgba(255,140,190,0.4) 100%)',
+            background: 'linear-gradient(90deg, transparent 0%, rgba(39,79,165,0) 30%, rgba(111,155,247,0.22) 78%, rgba(168,194,250,0.4) 100%)',
             borderRadius: 13,
           }}
         />
@@ -69,7 +69,7 @@ export function renderOgCard() {
             right: 0,
             bottom: 70,
             height: 3,
-            background: 'linear-gradient(90deg, transparent 0%, rgba(179,16,95,0.2) 35%, #6f9bf7 80%, #e7eefe 100%)',
+            background: 'linear-gradient(90deg, transparent 0%, rgba(39,79,165,0.2) 35%, #6f9bf7 80%, #e7eefe 100%)',
           }}
         />
 
@@ -90,7 +90,7 @@ export function renderOgCard() {
             <svg width="44" height="44" viewBox="0 0 32 32" fill="none">
               <circle cx="16" cy="16" r="13.9" stroke={ACCENT} strokeWidth="1.6" />
               <path d={ROTOR_BLADES} fill={ACCENT} />
-              <circle cx="16" cy="16" r="2.6" fill={ACCENT} />
+              <circle cx="16" cy="16" r={ROTOR_HUB} fill={ACCENT} />
             </svg>
           </div>
           <span style={{ fontSize: 34, fontWeight: 800, color: TEXT, letterSpacing: '0.12em' }}>TURBINE</span>

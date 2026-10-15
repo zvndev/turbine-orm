@@ -48,8 +48,13 @@ export const metadata: Metadata = {
     description:
       'The TypeScript ORM for Postgres. Within 8% of hand-written SQL, nested data in one round trip, one dependency. MIT.',
   },
+  // The ?v= suffix makes browsers drop a cached icon when the mark changes.
   icons: {
-    icon: '/favicon.svg',
+    icon: [
+      { url: '/favicon.ico?v=2', sizes: '16x16 32x32 48x48' },
+      { url: '/favicon.svg?v=2', type: 'image/svg+xml' },
+    ],
+    apple: '/apple-touch-icon.png?v=2',
   },
   alternates: {
     canonical: 'https://turbineorm.dev',

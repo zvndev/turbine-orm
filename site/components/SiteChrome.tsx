@@ -1,13 +1,13 @@
 import Link from 'next/link';
 import { TURBINE_VERSION } from '../lib/version';
-import { ROTOR_BLADES } from './logo-path';
+import { ROTOR_BLADES, ROTOR_HUB } from './logo-path';
 
 export function LogoMark({ size = 28 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 32 32" fill="none" aria-hidden="true" className="logo-mark">
       <circle cx="16" cy="16" r="13.9" stroke="currentColor" strokeWidth="1.6" />
       <path d={ROTOR_BLADES} fill="currentColor" />
-      <circle cx="16" cy="16" r="2.6" fill="currentColor" />
+      <circle cx="16" cy="16" r={ROTOR_HUB} fill="currentColor" />
     </svg>
   );
 }
