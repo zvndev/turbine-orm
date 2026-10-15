@@ -15,6 +15,10 @@
  *   5. A test step that points at a database but sets no
  *      `TURBINE_REQUIRE_ENGINE` passes when the URL is wrong, because every
  *      database test skips and a skipped suite exits 0.
+ *   6. benchmarks.yml measures, it does not gate. A `pull_request` or `push`
+ *      trigger would queue every change behind the dedicated benchmark
+ *      runner, and listing it in gates.yml would make a noisy timing a
+ *      required check.
  *
  * A line parser, like its sibling, and every extraction asserts it found
  * something, so a layout change fails here instead of passing over nothing.
@@ -172,7 +176,7 @@ describe('every workflow is valid YAML in the one way a line edit breaks it', ()
     assert.deepEqual(plainScalarsWithColon(['      - run: |', '          echo "a: b"', '        env:']), []);
   });
 
-  for (const file of ['ci.yml', 'gates.yml', 'release.yml', 'nightly.yml', 'codeql.yml']) {
+  for (const file of ['ci.yml', 'gates.yml', 'release.yml', 'nightly.yml', 'codeql.yml', 'benchmarks.yml']) {
     it(`${file}: no unquoted value holds ": "`, () => {
       assert.deepEqual(
         plainScalarsWithColon(workflow(file)),
@@ -209,5 +213,40 @@ describe('gates.yml: a test step that points at a database requires that engine'
         'test and the step still exits 0:\n  ' +
         missing.join('\n  '),
     );
+  });
+});
+
+describe('benchmarks.yml: a dispatch-only measurement, never a gate', () => {
+  const lines = workflow('benchmarks.yml');
+  const onAt = lines.indexOf('on:');
+  const triggers = lines
+    .slice(
+      onAt + 1,
+      lines.findIndex((l, i) => i > onAt && /^\S/.test(l)),
+    )
+    .map((l) => /^ {2}([a-z_]+):/.exec(l)?.[1])
+    .filter((t): t is string => t !== undefined);
+
+  it('is triggered by workflow_dispatch alone', () => {
+    assert.notEqual(onAt, -1, 'benchmarks.yml has no top-level `on:` line');
+    assert.deepEqual(triggers, ['workflow_dispatch']);
+  });
+
+  it('runs on the dedicated benchmark runner with read-only contents', () => {
+    const jobs = jobsOf(lines);
+    assert.ok(jobs.size > 0);
+    for (const [name, job] of jobs) {
+      assert.ok(job.includes('    runs-on: grandprix-4x16'), `benchmarks.yml job ${name} is not on grandprix-4x16`);
+    }
+    assert.equal(
+      lines.slice(lines.indexOf('permissions:'), lines.indexOf('permissions:') + 2).join('\n'),
+      'permissions:\n  contents: read',
+    );
+  });
+
+  it('is not called from any gate workflow', () => {
+    for (const file of ['ci.yml', 'gates.yml', 'release.yml']) {
+      assert.ok(!workflow(file).some((l) => l.includes('benchmarks.yml')), `${file} references benchmarks.yml`);
+    }
   });
 });

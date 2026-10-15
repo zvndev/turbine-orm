@@ -20,6 +20,8 @@
  * Env:
  *   ROUNDS=100     rounds per scenario (heavy scenarios scale down from this)
  *   WARMUP=10      warmup calls per arm per scenario
+ *   COLD_ROUNDS    fresh clients per arm in the cold-start scenario
+ *                  (default: ROUNDS, at least 10)
  *   GROUPS=...     comma-separated subset of:
  *                  large,list,relations,agg,writes,strategy,cold
  */
@@ -36,6 +38,10 @@ import { Bench } from './bench-harness.js';
 const DATABASE_URL = process.env['DATABASE_URL'] ?? 'postgres://localhost:5432/turbine_bench';
 const ROUNDS = parseInt(process.env['ROUNDS'] ?? '100', 10);
 const WARMUP = parseInt(process.env['WARMUP'] ?? '10', 10);
+// Cold start takes one sample per fresh client, so its sample count is its own
+// knob. It used to be ROUNDS / 5 (20 per arm in a published round), too few for
+// a median of a first-query time whose spread is several times its value.
+const COLD_ROUNDS = parseInt(process.env['COLD_ROUNDS'] ?? String(Math.max(10, ROUNDS)), 10);
 const ALL_GROUPS = ['large', 'list', 'relations', 'agg', 'writes', 'strategy', 'cold'] as const;
 type Group = (typeof ALL_GROUPS)[number];
 const GROUPS = new Set<Group>(
@@ -45,7 +51,9 @@ const GROUPS = new Set<Group>(
 async function main(): Promise<void> {
   const bench = new Bench({ rounds: ROUNDS, warmup: WARMUP });
   console.log('Extended suite: the shapes the headline ten do not cover.');
-  console.log(`ROUNDS=${ROUNDS} WARMUP=${WARMUP} GROUPS=${[...GROUPS].join(',')} Node ${process.version}`);
+  console.log(
+    `ROUNDS=${ROUNDS} WARMUP=${WARMUP} COLD_ROUNDS=${COLD_ROUNDS} GROUPS=${[...GROUPS].join(',')} Node ${process.version}`,
+  );
 
   const turbine = new TurbineClient({ connectionString: DATABASE_URL, logging: false });
   await turbine.connect();
@@ -581,7 +589,6 @@ async function main(): Promise<void> {
   // land.
   // -------------------------------------------------------------------------
   if (GROUPS.has('cold')) {
-    const COLD_ROUNDS = Math.max(10, Math.floor(ROUNDS / 5));
     const coldArms: { name: string; run: () => Promise<number> }[] = [
       {
         name: 'Turbine',
