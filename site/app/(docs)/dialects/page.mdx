@@ -1,3 +1,5 @@
+import { CapabilityTable } from '../../../components/CapabilityTable';
+
 export const metadata = {
   title: 'Writing a custom dialect',
   description:
@@ -74,43 +76,9 @@ The pool shim implements `PgCompatPool`: `query(text, values)`, `connect()` and 
 
 A spread copies PostgreSQL's answers under your new name. Go through every key: a wrong `true` becomes a failing query at runtime, while a correct `false` becomes a clear `TURBINE_E017`. The shipped `sqliteDialect`, `mysqlDialect` and `mssqlDialect` (from their subpaths) are worked examples.
 
-| Key | PostgreSQL | What it decides |
-|---|---|---|
-| `distinctOn` | `true` | findMany `distinct` and groupBy `distinctOn` |
-| `positionalJson` | `true` | Positional relation encoding (the default where true) |
-| `nullsOrderingClause` | `true` | `NULLS FIRST` / `NULLS LAST` placement |
-| `nullsSortHigh` | `true` | NULL sorts after every value ascending |
-| `insensitiveInList` | `true` | `mode: 'insensitive'` on `in` / `notIn` |
-| `jsonDocumentEquality` | `'jsonb'` | Whole-document JSON comparison: `'jsonb'`, `'exact'` or `'text'` (refused) |
-| `jsonExtractTyped` | `false` | JSON path extraction returns typed values |
-| `jsonExactNumericCast` | `true` | JSON path ranges cast to exact `numeric` |
-| `numericTextComparison` | `false` | Numbers compared with text bind as text |
-| `enforcesForeignKeys` | `true` | Foreign keys are always enforced |
-| `partitionLimitPushdown` | `true` | Batched loader pushes per-parent `limit` into SQL |
-| `utcTimestampRewrite` | `true` | `utcTimestamps` rewrite of zone-less timestamps |
-| `paramTypeCasts` | `true` | Update-expression parameters carry `::type` casts |
-| `namedEnumTypes` | `true` | Enums are named types (`CREATE TYPE ... AS ENUM`) |
-| `structuredValueColumns` | `'pg-scalars'` | Columns that refuse an object or array |
-| `maxBindParameters` | `65535` | Parameters per statement |
-| `maxInsertRows` | `Infinity` | Rows per `INSERT ... VALUES` |
-| `chunkBindParameters` | `65535` | Parameters per `createMany` chunk |
-| `upsertConflictTarget` | `'explicit'` | Named conflict target, or `'any-unique-key'` |
-| `setClauseOrder` | `'snapshot'` | `'left-to-right'` when a SET reads earlier assignments |
-| `reselectLocksRows` | `false` | Reselect reads take `FOR UPDATE` |
-| `integerDivision` | `'/'` | Truncating integer division operator |
-| `updateExpressions` | `true` | `expr` and `col()` in update data |
-| `bulkUpsertAppliesRepeatedKeys` | `false` | Multi-row upsert merges collation-equal keys |
-| `skipDuplicatesCountsSkipped` | `false` | `skipDuplicates` counts skipped rows as affected |
-| `readOnlyTransactions` | `true` | `$transaction({ readOnly: true })` |
-| `connectionParameters` | `true` | Server settings as connection parameters |
-| `backendCancel` | `true` | Timed-out statements are cancelled on the server |
-| `idleTransactionTimeout` | `true` | Server-side idle limit for a transaction |
-| `abortsTransactionOnError` | `true` | A failed statement aborts the transaction |
-| `connectionDriver` | `'pg-compatible'` | `'pg-compatible'`, `'engine-driver'` or `'none'` |
-| `preparesEveryStatement` | `false` | Every statement is prepared under a server-wide cap |
-| `statementSyntax` | `'postgresql'` | Lexer for screening raw SQL (`null`: none) |
-| `inlineForeignKeys` | `true` | Inline `REFERENCES` creates a foreign key |
-| `unboundedTextKeys` | `true` | Unbounded text columns can be keys |
+Every shipped engine's value, generated from its dialect object and checked against it on every pull request (✓ is `true`, ✗ is `false`, and a string value is shown without its quotes):
+
+<CapabilityTable />
 
 Two renderings still follow the name. `expr.now()`, `expr.greatest()` and `expr.least()` throw `TURBINE_E017` under any name other than `postgresql`, `mysql`, `sqlite` or `mssql`. `schemaToSQL` writes column `DEFAULT`s in PostgreSQL's spelling under any other name.
 

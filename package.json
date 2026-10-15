@@ -165,6 +165,7 @@
     "lint:fix": "biome check --write src/",
     "format": "biome format --write src/",
     "check:error-codes": "tsx scripts/check-error-codes.ts",
+    "gen:capabilities": "tsx scripts/gen-capability-table.ts",
     "//check:error-prefix": "No message reaching a TurbineError may hand-write a `[turbine] ` prefix. formatErrorMessage prepends `[TURBINE_EXXX] ` unless the message already opens with that exact tag, and a hand-written `[turbine] ` never matches one, so the two stacked on roughly 355 of the package's throw sites. A prefix rule looks unnecessary because formatErrorMessage guarantees the [CODE] tag: true, and not the failure mode, which is the INTERACTION between the automatic tag and a manual one. Diagnostics that no code tag ever touches (console calls, stream writes, Studio HTTP bodies) keep the prefix and are named in the script's DIAGNOSTIC_SINKS.",
     "check:error-prefix": "node scripts/check-error-prefix.mjs",
     "check:changelog": "node scripts/check-changelog-headings.mjs",

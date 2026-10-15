@@ -75,6 +75,7 @@ const sections: NavSection[] = [
     items: [
       { href: '/cli', label: 'CLI' },
       { href: '/cli-module', label: 'CLI config module' },
+      { href: '/doctor', label: 'turbine doctor' },
       { href: '/studio', label: 'Studio' },
       { href: '/mcp', label: 'MCP server' },
       { href: '/ai-agents', label: 'AI agents' },

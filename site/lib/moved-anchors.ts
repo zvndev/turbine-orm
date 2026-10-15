@@ -39,3 +39,17 @@ export const QUERIES_MOVED: Readonly<Record<string, string>> = {
   'client-configuration': '/client#client-configuration',
   'client-escape-hatches': '/client#client-escape-hatches',
 };
+
+/**
+ * Sections that moved off /cli when `turbine doctor` got its own page. The
+ * `turbine-doctor` anchor stays on /cli (a short pointer section), so only
+ * the subsections are forwarded.
+ */
+export const CLI_MOVED: Readonly<Record<string, string>> = {
+  'triage-tiers': '/doctor#triage-tiers',
+  '--fix': '/doctor#--fix',
+  '--unused-and---audit': '/doctor#--unused-and---audit',
+  'cached-plan-divergence': '/doctor#cached-plan-divergence',
+  '--json': '/doctor#--json',
+  'runtime-warning': '/doctor#runtime-warning',
+};
