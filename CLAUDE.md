@@ -460,6 +460,19 @@ src/
                       APPLIED select-minus-omit. Studio's chips enforce the pair rule live
                       (choosing select clears omit and vice versa) and its emit drops a
                       stale saved query's omit when select is non-empty.
+                      POSITIONAL DECODE PLAN: `makeNestedParser` compiles the
+                      positional relation shapes into a plan once per query
+                      (`makePositionalRowParser`) that writes each nested row in ONE
+                      pass, instead of keyed object, wire-decoded copy, then
+                      `parseRow`. It is held to `makeReferencePositionalParser` (the
+                      old path, kept as the fallback): field names and cell kinds come
+                      from `qi.rowDecodePlan` (parseRow's own plan), cell decodes from
+                      `qi.decodeCell`, and the work runs in the reference's order. Any
+                      shape it cannot prove identical (duplicate keys or fields, an
+                      integer-like or `Object.prototype` key, a `_count__` field, a
+                      scalar named like a relation, a top-level relation named like a
+                      column) declines the WHOLE query to the reference. Differential
+                      net: src/test/positional-decode-plan.test.ts.
     batched-loader.ts, The `relationLoadStrategy: 'batched'` path. Instead of the default
                       single-statement `json_agg` join, runs the base query without relation
                       subqueries, then ONE flat follow-up per relation

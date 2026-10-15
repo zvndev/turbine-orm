@@ -148,6 +148,12 @@ import {
   assertMiddlewareArgsKept,
   availableClause,
   boundedPreparedName,
+  CELL_DIALECT,
+  CELL_FLOAT,
+  CELL_FLOAT_ARRAY,
+  CELL_PLAIN,
+  CELL_TEMPORAL,
+  CELL_TEXT_ARRAY,
   canCancelBackend,
   isNodePostgresPool,
   isTemporalInfinity,
@@ -446,15 +452,6 @@ interface RowDecodePlan {
   readonly fields: readonly string[];
   readonly kinds: readonly number[];
 }
-
-/** Per-cell decode work in a {@link RowDecodePlan}. */
-const CELL_PLAIN = 0;
-const CELL_TEMPORAL = 1;
-const CELL_FLOAT = 2;
-const CELL_FLOAT_ARRAY = 3;
-const CELL_TEXT_ARRAY = 4;
-/** The dialect's own decode for a type whose storage differs (see `Dialect.decodeColumnValue`). */
-const CELL_DIALECT = 5;
 
 const FLOAT_TYPES = new Set(['float4', 'float8', 'real', 'double precision']);
 const FLOAT_ARRAY_TYPES = new Set(['_float4', '_float8', 'float4[]', 'float8[]', 'real[]', 'double precision[]']);
@@ -1271,6 +1268,11 @@ export class QueryInterface<
       toColumn: (field) => this.toColumn(field),
       castAgg: (expr, target) => this.castAgg(expr, target),
       parseRow: (row, table) => this.parseRow(row, table),
+      rowDecodePlan: (table, keys) => {
+        const meta = this.schema.tables[table];
+        return meta ? this.rowDecodePlanFor(table, meta, keys) : undefined;
+      },
+      decodeCell: (kind, value, table, field) => this.decodeCell(kind, value, table, field),
       nullsSuffix: (nulls) => this.nullsSuffix(nulls),
       isRelationOrderByValue: (value) => this.isRelationOrderByValue(value),
       resolveOrderByColumn: (table, meta, key) => this.resolveOrderByColumn(table, meta, key),
@@ -6394,6 +6396,19 @@ export class QueryInterface<
    * search down the wrong path.
    */
   private buildRowDecodePlan(table: string, meta: TableMetadata, keys: string[]): RowDecodePlan {
+    const plan = this.rowDecodePlanFor(table, meta, keys);
+    this.rowPlanLast.set(table, plan);
+    return plan;
+  }
+
+  /**
+   * The cached decode plan for one exact column list, without touching the
+   * per-table most-recent slot. {@link buildRowDecodePlan} is the per-row entry;
+   * this is also what the positional nested-row plan in relations.ts reads
+   * (through the ctx) when it is built, so a nested row decodes by exactly the
+   * field names and cell kinds {@link parseRow} would give the same keys.
+   */
+  private rowDecodePlanFor(table: string, meta: TableMetadata, keys: readonly string[]): RowDecodePlan {
     const shapeKey = `${table}\u0000${keys.join('\u0000')}`;
     let plan = this.rowPlanCache.get(shapeKey);
     if (plan === undefined) {
@@ -6419,7 +6434,6 @@ export class QueryInterface<
       plan = { cols, fields, kinds };
       this.rowPlanCache.set(shapeKey, plan);
     }
-    this.rowPlanLast.set(table, plan);
     return plan;
   }
 
@@ -6489,10 +6503,13 @@ export class QueryInterface<
   // When active, relation subqueries emit `json_agg(json_build_array(v1, v2, …))`
   // instead of `json_build_object('k1', v1, …)`, dropping every repeated key
   // name. The builder knows the exact column order, so it records a recursive
-  // RelationShape during SQL generation; the transform decodes each positional
-  // array back into the object representation the object-encoding would have
-  // produced, then hands it to parseNestedRow, so parsed output is byte-
-  // identical to the object path (same dates, same snake→camel, same recursion).
+  // RelationShape during SQL generation. The transform compiles the shapes into
+  // a decode plan (makePositionalRowParser in relations.ts) that writes each
+  // parsed row in one pass, from the same field names, cell kinds and decodes
+  // parseRow uses; a shape the plan declines is decoded back into the object
+  // representation and handed to parseNestedRow. Either way parsed output is
+  // byte-identical to the object path (same dates, same snake→camel, same
+  // recursion).
   // -------------------------------------------------------------------------
 
   /**

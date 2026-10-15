@@ -193,6 +193,21 @@ export interface BuilderCtx {
   // Shared primitives reached by the aggregate/groupBy module (aggregates.ts).
   castAgg(expr: string, target: 'int' | 'float'): string;
   parseRow(row: Record<string, unknown>, table: string): Record<string, unknown>;
+  /**
+   * The field name and cell kind {@link parseRow} applies to each key of a row
+   * whose keys are exactly `keys`, in order (`undefined` for a table with no
+   * metadata). Read once per relation shape by the positional nested-row plan
+   * in relations.ts, so a nested row decodes by the same answers `parseRow`
+   * would give. Optional, like the members above, so a hand-built ctx keeps
+   * compiling; without it (or {@link decodeCell}) the nested parser takes the
+   * general path.
+   */
+  rowDecodePlan?(
+    table: string,
+    keys: readonly string[],
+  ): { readonly fields: readonly string[]; readonly kinds: readonly number[] } | undefined;
+  /** {@link parseRow}'s decode of one cell whose kind is not `CELL_PLAIN` (see utils.ts). */
+  decodeCell?(kind: number, value: unknown, table: string, field: string): unknown;
   nullsSuffix(nulls: 'first' | 'last' | undefined): string;
   isRelationOrderByValue(value: unknown): boolean;
   resolveOrderByColumn(table: string, meta: TableMetadata, key: string): string;

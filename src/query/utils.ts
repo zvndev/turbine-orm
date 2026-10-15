@@ -925,6 +925,15 @@ function renderTemporal(value: Date, kind: TemporalBindKind): string {
  */
 const TZ_SUFFIX_RE = /(?:Z|[+-]\d{2}(?::?\d{2})?)$/;
 
+const COLON_CHAR = 58;
+const PLUS_CHAR = 43;
+const MINUS_CHAR = 45;
+
+/** `0`-`9` as a char code. */
+function isDigitCode(code: number): boolean {
+  return code >= 48 && code <= 57;
+}
+
 /**
  * Parse a database date-time string deterministically.
  *
@@ -948,6 +957,31 @@ export function parseDbDate(value: string): Date {
 }
 
 function parseDbDateCommon(value: string): Date {
+  // Fast path for the shape `timestamptz` arrives in, a trailing `±HH:MM`
+  // offset (`2026-07-07T17:15:41.896+00:00`). It is exactly the general path's
+  // answer for that shape, not an approximation of it: the string contains a
+  // ':' (at length-3), TZ_SUFFIX_RE matches, and neither normalizing replace
+  // below can fire (the first needs four digits after the sign, the second two
+  // digits at the very end after it), so that path also ends in
+  // `new Date(value)`. All six offset characters are checked, so a near miss
+  // (`+0a:00`, `05:30` without a sign) still takes the general path. It skips
+  // one regex test and two regex replaces per value, which on a nested read is
+  // the single largest cost in the decode. The invalid-date fallback in
+  // parseDbDate still runs on the result, so a BC or five-digit year is
+  // unchanged.
+  const n = value.length;
+  if (n >= 6 && value.charCodeAt(n - 3) === COLON_CHAR) {
+    const sign = value.charCodeAt(n - 6);
+    if (
+      (sign === PLUS_CHAR || sign === MINUS_CHAR) &&
+      isDigitCode(value.charCodeAt(n - 5)) &&
+      isDigitCode(value.charCodeAt(n - 4)) &&
+      isDigitCode(value.charCodeAt(n - 2)) &&
+      isDigitCode(value.charCodeAt(n - 1))
+    ) {
+      return new Date(value);
+    }
+  }
   // Date-only values (`2026-07-07`, from `date` columns in json_agg output)
   // have no time to zone-pin, and their `-07` tail must not be read as an
   // offset. JS parses bare ISO dates as UTC midnight already.
@@ -989,6 +1023,20 @@ function parseDbDateGeneral(value: string): Date | undefined {
   }
   return date;
 }
+
+/**
+ * Per-cell decode work in a row decode plan (`RowDecodePlan` in builder.ts).
+ * Defined here rather than in builder.ts because the positional nested-row
+ * plan in relations.ts reads the same codes, and relations.ts cannot import
+ * builder.ts.
+ */
+export const CELL_PLAIN = 0;
+export const CELL_TEMPORAL = 1;
+export const CELL_FLOAT = 2;
+export const CELL_FLOAT_ARRAY = 3;
+export const CELL_TEXT_ARRAY = 4;
+/** The dialect's own decode for a type whose storage differs (see `Dialect.decodeColumnValue`). */
+export const CELL_DIALECT = 5;
 
 /**
  * A float column's value as the driver reads it. JSON has no NaN or infinity,

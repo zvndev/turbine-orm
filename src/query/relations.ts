@@ -51,6 +51,8 @@ import type {
 import { assertDirectionToken, assertOrderDirection } from './types.js';
 import {
   availableClause,
+  CELL_FLOAT,
+  CELL_PLAIN,
   canonicalColumnOrder,
   ownLookup,
   relationInProjectionMessage,
@@ -1755,6 +1757,28 @@ export function parseNestedRow(
 ): Record<string, unknown> {
   const meta = qi.schema.tables[table];
   if (!meta) return qi.parseRow(row, table);
+  const parsed = parseScalarColumns(qi, row, table, meta, fromJson);
+  for (const [relName, relDef] of getRelationEntries(qi, table, meta)) {
+    const rawValue = row[relName];
+    if (rawValue === undefined) continue;
+    parsed[relName] = parseRelationValue(qi, relName, relDef, rawValue);
+  }
+  return parsed;
+}
+
+/**
+ * The scalar half of {@link parseNestedRow}: the row through `parseRow` (after
+ * the JSON-wire decode when `fromJson`), with any `_count__<rel>` columns
+ * folded into a `_count` object. Relation columns are copied through as they
+ * are; the caller replaces each one it parses.
+ */
+function parseScalarColumns(
+  qi: BuilderCtx,
+  row: Record<string, unknown>,
+  table: string,
+  meta: TableMetadata,
+  fromJson: boolean,
+): Record<string, unknown> {
   const parsed = qi.parseRow(fromJson ? decodeJsonWireRow(qi, row, table, meta) : row, table);
 
   // Assemble reserved `_count__<rel>` scalar columns into a `_count` object.
@@ -1779,85 +1803,77 @@ export function parseNestedRow(
     for (const rel of Object.keys(countObj)) delete parsed[`${COUNT_PREFIX}${rel}`];
     parsed._count = countObj;
   }
+  return parsed;
+}
 
-  for (const [relName, relDef] of getRelationEntries(qi, table, meta)) {
-    const rawValue = row[relName];
-    if (rawValue === undefined) continue;
+/**
+ * The relation half of {@link parseNestedRow}: one relation column's value
+ * (never `undefined`, which the caller skips) as the parsed relation.
+ */
+function parseRelationValue(qi: BuilderCtx, relName: string, relDef: RelationDef, rawValue: unknown): unknown {
+  // --- Short-circuit: skip JSON.parse for common empty/null cases ---
+  // hasMany returns '[]' (from COALESCE(..., '[]'::json)); belongsTo/hasOne returns null
+  if (rawValue === null || rawValue === 'null') return null;
+  if (rawValue === '[]') return [];
+  if (Array.isArray(rawValue) && rawValue.length === 0) return [];
 
-    // --- Short-circuit: skip JSON.parse for common empty/null cases ---
-    // hasMany returns '[]' (from COALESCE(..., '[]'::json)); belongsTo/hasOne returns null
-    if (rawValue === null || rawValue === 'null') {
-      parsed[relName] = null;
-      continue;
-    }
-    if (rawValue === '[]') {
-      parsed[relName] = [];
-      continue;
-    }
-    if (Array.isArray(rawValue) && rawValue.length === 0) {
-      parsed[relName] = [];
-      continue;
-    }
-
-    // --- Non-empty values: full parse path ---
-    if (typeof rawValue === 'string') {
-      try {
-        const jsonVal = JSON.parse(rawValue);
-        // After parsing, recurse via parseNestedRow so each item gets date
-        // coercion AND its own sub-relations parsed at arbitrary depth.
-        if (Array.isArray(jsonVal)) {
-          parsed[relName] = jsonVal.map((item: unknown) =>
-            typeof item === 'object' && item !== null
-              ? parseNestedRow(qi, item as Record<string, unknown>, relDef.to, true)
-              : item,
-          );
-        } else if (typeof jsonVal === 'object' && jsonVal !== null) {
-          parsed[relName] = parseNestedRow(qi, jsonVal as Record<string, unknown>, relDef.to, true);
-        } else {
-          parsed[relName] = jsonVal;
-        }
-      } catch (err) {
-        // A relation column that does not parse is a bug in the emitted SQL or
-        // a driver-level corruption, not a recoverable condition. Handing back
-        // the raw string satisfied the assignment and violated the generated
-        // type: callers got a `string` where `Post[]` was promised, and found
-        // out at the first `.map`. Throw instead, with the context needed to
-        // find it.
-        //
-        // The warn is gated and deduped because this sits in parseNestedRow's
-        // per-relation loop: one 10,000-row page was 10,000 warnings. The
-        // parse error stays out of the entry: its message quotes the payload,
-        // which is row data.
-        const log = whereMod.adviceLogger(qi);
-        if (log && shouldWarnOnce(WARN_NS.relationParseFailure, `${qi.table}.${relName}`)) {
-          logTo(
-            log,
-            'warn',
-            `Relation "${relName}" on "${qi.table}" returned a payload that is not valid JSON. ` +
-              `This is a bug; please report it with the emitted SQL.`,
-            { code: 'relation-payload-json', table: qi.table, relation: relName },
-          );
-        }
-        throw new InvariantError(
-          'relation-payload-json',
-          `Relation "${relName}" on table "${qi.table}" returned a payload that could not be parsed as JSON.`,
-          { cause: err },
+  // --- Non-empty values: full parse path ---
+  if (typeof rawValue === 'string') {
+    try {
+      const jsonVal = JSON.parse(rawValue);
+      // After parsing, recurse via parseNestedRow so each item gets date
+      // coercion AND its own sub-relations parsed at arbitrary depth.
+      if (Array.isArray(jsonVal)) {
+        return jsonVal.map((item: unknown) =>
+          typeof item === 'object' && item !== null
+            ? parseNestedRow(qi, item as Record<string, unknown>, relDef.to, true)
+            : item,
         );
       }
-    } else if (Array.isArray(rawValue)) {
-      parsed[relName] = rawValue.map((item) =>
-        typeof item === 'object' && item !== null
-          ? parseNestedRow(qi, item as Record<string, unknown>, relDef.to, true)
-          : item,
+      if (typeof jsonVal === 'object' && jsonVal !== null) {
+        return parseNestedRow(qi, jsonVal as Record<string, unknown>, relDef.to, true);
+      }
+      return jsonVal;
+    } catch (err) {
+      // A relation column that does not parse is a bug in the emitted SQL or
+      // a driver-level corruption, not a recoverable condition. Handing back
+      // the raw string satisfied the assignment and violated the generated
+      // type: callers got a `string` where `Post[]` was promised, and found
+      // out at the first `.map`. Throw instead, with the context needed to
+      // find it.
+      //
+      // The warn is gated and deduped because this sits in parseNestedRow's
+      // per-relation loop: one 10,000-row page was 10,000 warnings. The
+      // parse error stays out of the entry: its message quotes the payload,
+      // which is row data.
+      const log = whereMod.adviceLogger(qi);
+      if (log && shouldWarnOnce(WARN_NS.relationParseFailure, `${qi.table}.${relName}`)) {
+        logTo(
+          log,
+          'warn',
+          `Relation "${relName}" on "${qi.table}" returned a payload that is not valid JSON. ` +
+            `This is a bug; please report it with the emitted SQL.`,
+          { code: 'relation-payload-json', table: qi.table, relation: relName },
+        );
+      }
+      throw new InvariantError(
+        'relation-payload-json',
+        `Relation "${relName}" on table "${qi.table}" returned a payload that could not be parsed as JSON.`,
+        { cause: err },
       );
-    } else if (typeof rawValue === 'object' && rawValue !== null) {
-      parsed[relName] = parseNestedRow(qi, rawValue as Record<string, unknown>, relDef.to, true);
-    } else {
-      parsed[relName] = rawValue;
     }
   }
-
-  return parsed;
+  if (Array.isArray(rawValue)) {
+    return rawValue.map((item) =>
+      typeof item === 'object' && item !== null
+        ? parseNestedRow(qi, item as Record<string, unknown>, relDef.to, true)
+        : item,
+    );
+  }
+  if (typeof rawValue === 'object' && rawValue !== null) {
+    return parseNestedRow(qi, rawValue as Record<string, unknown>, relDef.to, true);
+  }
+  return rawValue;
 }
 
 /**
@@ -2072,9 +2088,12 @@ export function buildRelationShape(
 
 /**
  * Build the row parser for a `with` clause. In object mode this is just
- * {@link parseNestedRow}. In positional mode it decodes each relation's
- * positional arrays into the object form first (shapes built once, not per
- * row), then delegates to parseNestedRow for date/snake-camel coercion.
+ * {@link parseNestedRow}. In positional mode the relation shapes are built
+ * once (not per row) and compiled into a decode plan
+ * ({@link makePositionalRowParser}) that turns each positional array straight
+ * into its parsed row. A query whose shapes the plan declines takes the
+ * reference path instead, which decodes each positional array into the object
+ * form and hands it to parseNestedRow.
  */
 export function makeNestedParser(
   qi: BuilderCtx,
@@ -2090,6 +2109,20 @@ export function makeNestedParser(
     return (row) => parseNestedRow(qi, row, qi.table);
   }
   const shapes = buildRelationShapes(qi, qi.table, withClause, includePii);
+  return makePositionalRowParser(qi, qi.table, shapes) ?? makeReferencePositionalParser(qi, shapes);
+}
+
+/**
+ * The positional parser the plan in {@link makePositionalRowParser} is held to:
+ * decode each relation's arrays into the object representation, then parse
+ * that exactly as an object-encoded row is parsed. It is the path for every
+ * query the plan declines, and is exported so the differential tests can
+ * compare the two.
+ */
+export function makeReferencePositionalParser(
+  qi: BuilderCtx,
+  shapes: Record<string, RelationShape>,
+): (row: Record<string, unknown>) => Record<string, unknown> {
   return (row) => parseNestedRow(qi, decodePositionalRelations(qi, row, shapes), qi.table);
 }
 
@@ -2146,6 +2179,290 @@ export function decodePositionalObject(qi: BuilderCtx, arr: unknown, shape: Rela
     obj[key] = nestedShape ? decodePositionalValue(qi, arr[i], nestedShape) : arr[i];
   }
   return obj;
+}
+
+// ---------------------------------------------------------------------------
+// Positional decode plan: one pass from a positional array to its parsed row
+//
+// The reference path above builds every nested row three times: once as a
+// keyed object (decodePositionalObject), once as a copy with its JSON-wire
+// columns decoded (decodeJsonWireRow), and once more as parseRow's output,
+// which also costs an `Object.keys` per row to look its plan up. The plan
+// below resolves all of that per relation SHAPE, once per query, and then
+// writes each nested row exactly once.
+//
+// It is held to the reference, not merely modelled on it. Every per-cell
+// answer comes from the same source the reference reads: the field name and
+// cell kind from the row decode plan `parseRow` itself uses (through
+// `qi.rowDecodePlan`), the JSON-wire rule from the same memo, the cell decode
+// from `parseRow`'s own `decodeCell`, and the work runs in the same order (a
+// row's wire decodes, then its cell decodes in key order, then its relations
+// in the order `parseNestedRow` walks them). Anything that would make the
+// reference do something other than that, a key that collides with another,
+// one that `Object.keys` would reorder, a relation the scalar loop would also
+// read, declines the plan for the whole query, which then takes the reference
+// path. Declining costs speed and never correctness.
+// ---------------------------------------------------------------------------
+
+/** One relation slot of a {@link PositionalRowPlan}. */
+interface PositionalRelationPlan {
+  readonly name: string;
+  readonly def: RelationDef;
+  readonly many: boolean;
+  /** Index of the relation's value in its parent's positional array. */
+  readonly position: number;
+  readonly row: PositionalRowPlan;
+}
+
+/** How to turn one relation shape's positional array into its parsed row. */
+interface PositionalRowPlan {
+  readonly table: string;
+  /** Output field per scalar position (scalars are positions `0..n-1`). */
+  readonly fields: readonly string[];
+  /** The JSON-wire rule per scalar position, `undefined` for most. */
+  readonly wire: readonly (JsonWireRule | undefined)[];
+  /** The scalar positions whose cell kind is not `CELL_PLAIN`, in key order, and their kinds. */
+  readonly cellPositions: readonly number[];
+  readonly cellKinds: readonly number[];
+  /** Relation slots in key order (always after the scalars). */
+  readonly relations: readonly PositionalRelationPlan[];
+  /**
+   * The order `parseNestedRow` decodes the relations in (its table's
+   * relation-declaration order), as indexes into {@link relations}; `null`
+   * when that is key order, which it nearly always is.
+   */
+  readonly relationOrder: readonly number[] | null;
+}
+
+/**
+ * A key the reference path treats as an ordinary own property: not one that
+ * resolves through `Object.prototype` when read off a plain object (`__proto__`
+ * included), and not an integer-like key, which `Object.keys` lists ahead of
+ * every other key whatever order it was written in.
+ */
+function isPlainKey(key: unknown): key is string {
+  return typeof key === 'string' && !(key in Object.prototype) && !/^\d+$/.test(key);
+}
+
+/**
+ * Does `name` reach `parseRow`'s answer for a top-level column? Any overlap
+ * with a column name, field name, reverse-map key or date column means the
+ * reference would give the relation column a field or cell kind of its own.
+ */
+function nameTouchesColumns(qi: BuilderCtx, table: string, meta: TableMetadata, name: string): boolean {
+  if (Object.hasOwn(meta.reverseColumnMap, name) || meta.dateColumns.has(name)) return true;
+  if (getCamelDateFields(qi, table, meta).has(name)) return true;
+  return meta.columns.some((column) => column.name === name || column.field === name);
+}
+
+/** The indexes of `relations` in `entries` order, or `null` when that is their own order. */
+function relationDecodeOrder(
+  relations: readonly PositionalRelationPlan[],
+  entries: readonly [string, RelationDef][],
+): number[] | null {
+  const order: number[] = [];
+  for (const [name] of entries) {
+    const index = relations.findIndex((rel) => rel.name === name);
+    if (index !== -1) order.push(index);
+  }
+  return order.every((index, i) => index === i) ? null : order;
+}
+
+/** The plan for one relation shape, or `undefined` when the plan cannot take it. */
+function planPositionalRow(qi: BuilderCtx, table: string, shape: RelationShape): PositionalRowPlan | undefined {
+  const meta = qi.schema.tables[table];
+  if (!meta || !qi.rowDecodePlan) return undefined;
+  const keys = shape.keys;
+  if (new Set(keys).size !== keys.length || !keys.every(isPlainKey)) return undefined;
+  const rowPlan = qi.rowDecodePlan(table, keys);
+  if (!rowPlan) return undefined;
+  const entries = getRelationEntries(qi, table, meta);
+  if (!entries.every(([name]) => isPlainKey(name))) return undefined;
+  const relationNames = new Set(entries.map(([name]) => name));
+  const wireFields = jsonWireFields(qi, table, meta);
+  const wireOrder = wireFields ? [...wireFields.keys()] : [];
+
+  const fields: string[] = [];
+  const wire: (JsonWireRule | undefined)[] = [];
+  const cellPositions: number[] = [];
+  const cellKinds: number[] = [];
+  const relations: PositionalRelationPlan[] = [];
+  let lastWireRank = -1;
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i]!;
+    const field = rowPlan.fields[i];
+    const kind = rowPlan.kinds[i];
+    // parseNestedRow folds a `_count__` field into `_count`; the plan does not.
+    if (!isPlainKey(field) || field.startsWith(COUNT_PREFIX)) return undefined;
+    const nested = shape.nested[key];
+    if (nested) {
+      const def = ownLookup(meta.relations, key);
+      // The reference copies the slot through parseRow before replacing it, so
+      // the slot must be a plain cell under its own name, and no wire field.
+      if (!def || field !== key || kind !== CELL_PLAIN || wireFields?.has(key)) return undefined;
+      const row = planPositionalRow(qi, def.to, nested);
+      if (!row) return undefined;
+      relations.push({ name: key, def, many: nested.cardinality === 'many', position: i, row });
+      continue;
+    }
+    // buildRelationShape puts every scalar ahead of every relation slot, and a
+    // scalar named like one of the table's relations would be re-read as it.
+    if (relations.length > 0 || relationNames.has(key)) return undefined;
+    const rule = wireFields?.get(key);
+    if (rule !== undefined) {
+      // The reference decodes wire columns in table-column order before any
+      // cell decode; the plan does them in key order, so the two must agree.
+      const rank = wireOrder.indexOf(key);
+      if (rank < lastWireRank) return undefined;
+      lastWireRank = rank;
+    }
+    fields.push(field);
+    wire.push(rule);
+    if (kind !== CELL_PLAIN) {
+      cellPositions.push(i);
+      cellKinds.push(kind as number);
+    }
+  }
+  // Two keys landing on one field, or a scalar field named like a relation
+  // slot, would collapse into one property in a different order.
+  const written = new Set(fields);
+  if (written.size !== fields.length || relations.some((rel) => written.has(rel.name))) return undefined;
+  return {
+    table,
+    fields,
+    wire,
+    cellPositions,
+    cellKinds,
+    relations,
+    relationOrder: relationDecodeOrder(relations, entries),
+  };
+}
+
+/**
+ * Compile a top-level positional parser for `shapes`, or `undefined` when any
+ * part of it is a shape the plan does not take (the caller then uses
+ * {@link makeReferencePositionalParser}). Rows are identical to the
+ * reference's on every shape it does take.
+ */
+export function makePositionalRowParser(
+  qi: BuilderCtx,
+  table: string,
+  shapes: Record<string, RelationShape>,
+): ((row: Record<string, unknown>) => Record<string, unknown>) | undefined {
+  const meta = qi.schema.tables[table];
+  if (!meta || !qi.rowDecodePlan || !qi.decodeCell) return undefined;
+  const entries = getRelationEntries(qi, table, meta);
+  if (!entries.every(([name]) => isPlainKey(name))) return undefined;
+  const plans: (PositionalRelationPlan | null)[] = [];
+  for (const [name, def] of entries) {
+    const shape = Object.hasOwn(shapes, name) ? shapes[name] : undefined;
+    if (!shape) {
+      plans.push(null);
+      continue;
+    }
+    // The reference runs the top-level row through parseRow with the relation
+    // columns already decoded; the plan runs it with them raw and replaces them
+    // after. Those agree only while parseRow copies a relation column through
+    // untouched, under its own name, and the `_count` fold never reads it.
+    if (name.startsWith(COUNT_PREFIX) || nameTouchesColumns(qi, table, meta, name)) return undefined;
+    const row = planPositionalRow(qi, def.to, shape);
+    if (!row) return undefined;
+    plans.push({ name, def, many: shape.cardinality === 'many', position: -1, row });
+  }
+  const isOwnEnumerable = Object.prototype.propertyIsEnumerable;
+  return (row) => {
+    const parsed = parseScalarColumns(qi, row, table, meta, false);
+    for (let i = 0; i < entries.length; i++) {
+      const [name, def] = entries[i]!;
+      // The reference reads relation columns off a `{ ...row }` copy, which
+      // holds exactly the row's own enumerable properties.
+      if (!isOwnEnumerable.call(row, name)) continue;
+      const plan = plans[i]!;
+      if (plan !== null) {
+        parsed[name] = decodePlannedRelation(qi, row[name], plan);
+        continue;
+      }
+      const raw = row[name];
+      if (raw !== undefined) parsed[name] = parseRelationValue(qi, name, def, raw);
+    }
+    return parsed;
+  };
+}
+
+/**
+ * One relation value through the plan: exactly what the reference produces by
+ * {@link decodePositionalValue} followed by {@link parseRelationValue}. Every
+ * value that is not the well-formed positional shape (a payload that is not
+ * JSON, a to-many that is not an array, a to-one that is not an array) is
+ * handed to `parseRelationValue` as the reference would hand it, so it
+ * decodes, or throws, identically.
+ */
+function decodePlannedRelation(qi: BuilderCtx, raw: unknown, rel: PositionalRelationPlan): unknown {
+  let value = raw;
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return parseRelationValue(qi, rel.name, rel.def, raw);
+    }
+  }
+  if (value === null || value === undefined) return rel.many ? [] : null;
+  if (!rel.many) {
+    return Array.isArray(value)
+      ? decodePlannedRow(qi, value, rel.row)
+      : parseRelationValue(qi, rel.name, rel.def, value);
+  }
+  if (!Array.isArray(value)) return parseRelationValue(qi, rel.name, rel.def, value);
+  const out: unknown[] = [];
+  for (let i = 0; i < value.length; i++) {
+    const item: unknown = value[i];
+    out.push(
+      Array.isArray(item)
+        ? decodePlannedRow(qi, item, rel.row)
+        : typeof item === 'object' && item !== null
+          ? parseNestedRow(qi, item as Record<string, unknown>, rel.def.to, true)
+          : item,
+    );
+  }
+  return out;
+}
+
+/** One positional array through its row plan, into the parsed row. */
+function decodePlannedRow(qi: BuilderCtx, arr: unknown[], plan: PositionalRowPlan): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  const { fields, wire, cellPositions, cellKinds, relations, table } = plan;
+  for (let i = 0; i < fields.length; i++) {
+    let value = arr[i];
+    const rule = wire[i];
+    if (rule !== undefined && typeof value === 'string') value = rule.decode(value);
+    out[fields[i]!] = value;
+  }
+  if (cellPositions.length > 0) {
+    // `decodeCell` is present: the plan is only built when it is.
+    const decodeCell = qi.decodeCell!;
+    for (let c = 0; c < cellPositions.length; c++) {
+      const field = fields[cellPositions[c]!]!;
+      const kind = cellKinds[c]!;
+      const value = out[field];
+      // parseRow's own skip: a float the driver already made a number.
+      if (kind === CELL_FLOAT && typeof value !== 'string') continue;
+      out[field] = decodeCell(kind, value, table, field);
+    }
+  }
+  if (relations.length > 0) {
+    const order = plan.relationOrder;
+    if (order === null) {
+      for (const rel of relations) out[rel.name] = decodePlannedRelation(qi, arr[rel.position], rel);
+    } else {
+      // Claim the keys in key order first, then decode in the reference's order.
+      for (const rel of relations) out[rel.name] = undefined;
+      for (const index of order) {
+        const rel = relations[index]!;
+        out[rel.name] = decodePlannedRelation(qi, arr[rel.position], rel);
+      }
+    }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
