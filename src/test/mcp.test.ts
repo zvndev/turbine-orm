@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { PassThrough } from 'node:stream';
 import { describe, it } from 'node:test';
+import { showSubcommandHelp } from '../cli/index.js';
 import { startMcpServer } from '../cli/mcp.js';
+import { POOLER_PORTS } from '../connection-url.js';
 
 const packageJson = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf-8')) as {
   version: string;
@@ -301,5 +303,59 @@ describe('turbine mcp protocol', () => {
     assert.match(parsed[2]?.error?.message ?? '', /select\.id must be a boolean/i);
 
     await handle.dispose();
+  });
+});
+
+/** A command's rendered `--help`, with `console.log` captured. */
+function helpText(command: string): string {
+  const real = console.log;
+  const lines: string[] = [];
+  console.log = (...parts: unknown[]) => {
+    lines.push(parts.map(String).join(' '));
+  };
+  try {
+    assert.ok(showSubcommandHelp(command), `${command} must have a help block`);
+  } finally {
+    console.log = real;
+  }
+  return lines.join('\n');
+}
+
+describe('help text that states a count or a list', () => {
+  it('turbine mcp --help states the number of tools the server lists', async () => {
+    const { input, output, handle } = createHarness();
+    const responses = readJsonLines(output, 1);
+    input.write(`${JSON.stringify({ jsonrpc: '2.0', id: 'tools', method: 'tools/list' })}\n`);
+    const [reply] = (await responses) as Array<{ result: { tools: unknown[] } }>;
+    await handle.dispose();
+
+    const count = reply?.result.tools.length ?? 0;
+    assert.ok(count > 0, 'tools/list returned no tools (anti-vacuous)');
+    const words = [
+      'zero',
+      'one',
+      'two',
+      'three',
+      'four',
+      'five',
+      'six',
+      'seven',
+      'eight',
+      'nine',
+      'ten',
+      'eleven',
+      'twelve',
+      'thirteen',
+      'fourteen',
+      'fifteen',
+    ];
+    const word = words[count] ?? String(count);
+    assert.match(helpText('mcp'), new RegExp(`exposes ${word}\\b`), `the server lists ${count} tools`);
+  });
+
+  it('turbine doctor --help names every port the pooler check refuses', () => {
+    const text = helpText('doctor');
+    assert.ok(POOLER_PORTS.length > 0, 'no pooler ports (anti-vacuous)');
+    for (const port of POOLER_PORTS) assert.match(text, new RegExp(`\\b${port}\\b`), `doctor refuses port ${port}`);
   });
 });

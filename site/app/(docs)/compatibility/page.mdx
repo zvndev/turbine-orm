@@ -69,12 +69,7 @@ export default {
 };
 ```
 
-<Callout type="warning" title="turbine migrate does not read config.adapter yet">
-  The `adapter` key type-checks, but the `turbine migrate` command never passes
-  it to the migration runner, so the CLI still takes the advisory lock. Until it
-  does, make sure only one migration runner can be in flight at a time, for
-  example a CI job that cannot overlap.
-</Callout>
+`turbine migrate up`, `deploy` and `down` take the lock through the configured adapter (since 0.92.0).
 
 ## YugabyteDB
 

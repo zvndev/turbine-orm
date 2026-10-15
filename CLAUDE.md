@@ -1625,8 +1625,8 @@ src/
                       (1) ROW PROJECTIONS: a PII column is excluded from every default
                       row projection (top-level, `with` subqueries, batched loader,
                       positional encoding, PowQL loaders + native joins, and write
-                      returns), and comes back only when named explicitly in `select`
-                      or unlocked by the `includePii: UNSAFE` read arg. Enforced AT THE
+                      returns), and comes back only from a read that passes
+                      `includePii: UNSAFE`; naming it in `select` without that is E003. Enforced AT THE
                       SQL LEVEL on every engine (see the write projection below), with
                       parseWriteRow's strip as defense-in-depth.
                       (2) AGGREGATES: two shapes are REFUSED without `includePii: UNSAFE`

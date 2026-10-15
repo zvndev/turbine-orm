@@ -638,3 +638,57 @@ describe('turbine migrate deploy --wait', () => {
     assert.match(run.output, /positive whole number of seconds/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The config file's adapter reaches the migration runner
+// ---------------------------------------------------------------------------
+
+describe('turbine migrate uses the config file adapter', () => {
+  let f: Fixture;
+  let lockLog: string;
+
+  before(async () => {
+    if (!DATABASE_URL) return;
+    f = await fixture('adapter');
+    lockLog = join(f.project.dir, 'lock.log');
+    const adapters = join(REPO_ROOT, 'src', 'adapters', 'index.ts');
+    // A recording adapter over the PostgreSQL one: it takes the same lock and
+    // writes one line per call, so the test can see which adapter the CLI used.
+    f.project.write(
+      'turbine.config.js',
+      `import { appendFileSync } from 'node:fs';\n` +
+        `import { postgresql } from ${JSON.stringify(adapters)};\n` +
+        `const log = (m) => appendFileSync(${JSON.stringify(lockLog)}, m + '\\n');\n` +
+        `export default {\n` +
+        `  schema: ${JSON.stringify(f.pgSchema)},\n` +
+        `  adapter: {\n` +
+        `    ...postgresql,\n` +
+        `    name: 'recording',\n` +
+        `    async acquireLock(client, id) { log('acquire'); return postgresql.acquireLock(client, id); },\n` +
+        `    async releaseLock(client, id) { log('release'); return postgresql.releaseLock(client, id); },\n` +
+        `  },\n` +
+        `};\n`,
+    );
+  });
+  after(async () => {
+    await f?.cleanup();
+  });
+
+  const calls = (): string[] => (existsSync(lockLog) ? readFileSync(lockLog, 'utf-8').trim().split('\n') : []);
+
+  live.it('migrate up, deploy and down each lock through it', () => {
+    f.migration('20260101000001_first.sql', 'CREATE TABLE adapter_one (id int);', 'DROP TABLE adapter_one;');
+    const up = f.project.cli(['migrate', 'up']);
+    assert.equal(up.status, 0, up.output);
+    assert.deepEqual(calls(), ['acquire', 'release'], 'migrate up did not use the configured adapter');
+
+    f.migration('20260101000002_second.sql', 'CREATE TABLE adapter_two (id int);', 'DROP TABLE adapter_two;');
+    const deploy = f.project.cli(['migrate', 'deploy']);
+    assert.equal(deploy.status, 0, deploy.output);
+    assert.deepEqual(calls().slice(2), ['acquire', 'release'], 'migrate deploy did not use the configured adapter');
+
+    const down = f.project.cli(['migrate', 'down', '--allow-destructive']);
+    assert.equal(down.status, 0, down.output);
+    assert.deepEqual(calls().slice(4), ['acquire', 'release'], 'migrate down did not use the configured adapter');
+  });
+});

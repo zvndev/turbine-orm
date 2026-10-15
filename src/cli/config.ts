@@ -304,6 +304,11 @@ export interface ResolvedConfig {
   relationNames?: Record<string, Record<string, string>>;
   /** Column type overrides for the generator, or undefined when none is declared. */
   columnTypes?: Record<string, string>;
+  /**
+   * The config file's `adapter`, passed to `migrate up` / `deploy` / `down` so a
+   * CockroachDB or YugabyteDB project takes the migration lock its engine supports.
+   */
+  adapter?: import('../adapters/index.js').DatabaseAdapter;
 }
 
 export interface CliOverrides {
@@ -354,6 +359,7 @@ export function resolveConfig(fileConfig: TurbineCliConfig, overrides: CliOverri
     importExtension: overrides.importExtension ?? fileConfig.importExtension ?? 'auto',
     keepColumnNames: overrides.keepColumnNames ?? fileConfig.keepColumnNames ?? false,
     legacyToManyUniques: overrides.legacyToManyUniques ?? fileConfig.legacyToManyUniques ?? false,
+    adapter: fileConfig.adapter,
   };
 }
 

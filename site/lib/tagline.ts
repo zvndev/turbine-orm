@@ -15,6 +15,7 @@ const TAGLINE_OVERRIDES: Record<string, string> = {
   '0.90.1': 'Patch: a PowDB filter that could delete every row, 1 kB smaller bundles, OIDC-ready publishing',
   '0.90.2': 'Patch: createMany 10x less JavaScript, transactions reuse their SQL, more prepared statements',
   '0.91.0': 'Count-only createMany, percentiles of expressions, SQLite bulk inserts 70 to 140x faster',
+  '0.92.0': 'Nested reads decode in one pass: 1.33x of hand-written SQL, down from 1.86x',
 };
 
 /** The tagline shown in the landing hero badge. */

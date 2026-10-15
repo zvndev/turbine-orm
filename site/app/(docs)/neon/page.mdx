@@ -79,7 +79,7 @@ npx turbine migrate status
 
 ## Why Turbine on Neon?
 
-- **No WASM**: the edge entry is held under 116 kB brotli in CI.
+- **No WASM**: the edge entry is held under 117 kB brotli in CI.
 - **Single-query nested reads**: one SQL statement via `json_agg`, not N+1.
 - **Pipeline batching**: several queries in one round trip, which matters most on high-latency serverless links.
 - **No adapter layer**: `turbineHttp(pool, SCHEMA)` with any pg-compatible driver.

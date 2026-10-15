@@ -146,8 +146,10 @@ export interface ColumnDef {
    * code-first declaration: it carries onto {@link ColumnConfig.pii} and, via
    * `schemaDefToMetadata` / codegen, onto
    * {@link import('./schema.js').ColumnMetadata.pii}. A PII column is excluded
-   * from default projections (read back only via an explicit `select` or
-   * `includePii: UNSAFE`, the imported sentinel symbol) and redacted by Studio.
+   * from default projections and comes back only from a read that passes
+   * `includePii: UNSAFE` (the imported sentinel symbol). Naming it in `select`
+   * without that flag throws (E003), a write never returns it, and Studio
+   * redacts it.
    * Introspection never auto-tags PII.
    */
   pii?: boolean;
@@ -487,9 +489,10 @@ export interface TableDef {
   checks?: readonly CheckDef[];
   /**
    * Index declarations for this table (plain column indexes and/or PowDB
-   * doc-field expression indexes). Consumed by the PowDB DDL generator
-   * (`powqlSchemaDDL`) and carried onto `IndexMetadata` by
-   * `schemaDefToMetadata`; the SQL DDL generators do not consume them yet.
+   * doc-field expression indexes). Plain column indexes are emitted as `CREATE [UNIQUE] INDEX` by
+   * `schemaToSQL` and added by `schemaDiff`; doc-field indexes are PowDB-only
+   * (`powqlSchemaDDL`). Both are carried onto `IndexMetadata` by
+   * `schemaDefToMetadata`.
    */
   indexes?: readonly SchemaIndexDef[];
 }
