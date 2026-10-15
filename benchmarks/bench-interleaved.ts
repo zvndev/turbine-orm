@@ -253,11 +253,15 @@ async function main() {
   // own compiled SQL above, so the control is matched in BOTH configurations
   // and no future encoding change can silently unmatch it again.
   //
-  // Disclosed asymmetry: with the array spelling the raw arm receives nested
-  // ARRAYS, while Turbine decodes them back into objects. The control therefore
-  // does slightly LESS work than the ORM, which biases the overhead figure
-  // UPWARD for Turbine. That is the conservative direction, which is why it is
-  // acceptable; `raw-l2-encoding.ts` prices the decode separately.
+  // THE CONTROL ALSO DECODES WHAT IT FETCHES. Left as the bare query, the raw
+  // arm handed back nested ARRAYS with timestamps as strings, which no
+  // application can use, while every ORM arm returns one object per post with
+  // Date timestamps. The control then bounded a cheaper job than the one being
+  // measured: Turbine AND Drizzle both read as 2.2x "hand-written SQL" here, and
+  // that one scenario was the whole difference between a 1.06x and a 1.16x
+  // overhead geomean. `decodeRawL2` does what hand-written code must do before
+  // it can use the rows (objects, camelCase keys, Dates) and nothing more: the
+  // top-level user rows stay exactly as node-postgres returns them.
   const RAW_L2_OBJECT = `
     SELECT u.*, COALESCE((
       SELECT json_agg(json_build_object('id', p.id, 'userId', p.user_id, 'orgId', p.org_id,
@@ -303,11 +307,26 @@ async function main() {
       `Raw L2 encoding check: both spellings return ${objRes.rows.length} rows / ${objChildren} children.`,
     );
   }
+  const toDate = (v: unknown) => (v == null ? v : new Date(v as string));
+  type RawPost = unknown[] | Record<string, unknown>;
+  const decodePost = (p: RawPost) =>
+    Array.isArray(p)
+      ? {
+          id: p[0], userId: p[1], orgId: p[2], title: p[3], content: p[4], published: p[5],
+          viewCount: p[6], createdAt: toDate(p[7]), updatedAt: toDate(p[8]),
+        }
+      : { ...p, createdAt: toDate(p.createdAt), updatedAt: toDate(p.updatedAt) };
+  const decodeRawL2 = async () => {
+    const res = await rawPool.query(rawL2);
+    for (const row of res.rows) row.posts = (row.posts as RawPost[]).map(decodePost);
+    return res.rows;
+  };
+
   await bench.interleave('findMany, 50 users + posts (L2)', withRc([
     { name: 'Turbine', fn: () => turbine.users.findMany({ limit: 50, with: { posts: true } }) },
     { name: 'Prisma 7', fn: () => prisma.user.findMany({ take: 50, include: { posts: true } }) },
     { name: 'Drizzle', fn: () => drizzleDb.query.users.findMany({ limit: 50, with: { posts: true } }) },
-    { name: 'Raw', fn: () => rawPool.query(rawL2) },
+    { name: 'Raw', fn: decodeRawL2 },
   ], { name: 'Drizzle RC', fn: () => rcDb.query.users.findMany({ limit: 50, with: { posts: true } }) }));
 
   // 3. findMany L3 (no hand-written raw equivalent, ORM arms only)
