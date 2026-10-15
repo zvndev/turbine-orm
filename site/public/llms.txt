@@ -33,7 +33,7 @@ Common mistakes to avoid when generating Turbine code:
 ## Docs
 
 - [Quick Start](https://turbineorm.dev/quickstart): Install, set DATABASE_URL, generate the typed client, run your first query and nested `with`.
-- [Why Turbine](https://turbineorm.dev/why-turbine): The checkable comparison against Prisma, Drizzle and Kysely: what is genuinely different (operational safety), what is table stakes in 2026, and what Turbine is not.
+- [Why Turbine](https://turbineorm.dev/why-turbine): Why teams pick Turbine: faster than Drizzle and Prisma against hand-written SQL, one dependency, built for AI agents, index advice from `turbine doctor`, an easy move from Prisma, and when another ORM fits better.
 - [Turbine for AI agents](https://turbineorm.dev/ai-agents): How to point a coding agent at Turbine: the installable query skill (`npx turbine skill`), the MCP server, the deterministic codegen flow, and a drop-in agent-instructions snippet.
 - [Reading and writing](https://turbineorm.dev/queries): findMany, findUnique, findFirst, select and omit, row locks, create, createMany, update, upsert, delete, update expressions, and streaming.
 - [Filtering and sorting](https://turbineorm.dev/filtering): Every WHERE operator, relation, JSON, array and full-text filters, orderBy, pagination, cursors and distinct.
