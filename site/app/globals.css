@@ -1748,3 +1748,562 @@ code {
 .callout-body > :last-child {
   margin-bottom: 0;
 }
+
+/* ==========================================================================
+   Benchmarks page. Chart colours come from lib/bench.ts (validated for
+   colour-vision deficiency on this surface); every mark also has a shape.
+   ========================================================================== */
+
+.mdx-content .bench-stamp {
+  display: block;
+  margin: -0.25rem 0 1.25rem;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+.mdx-content .bench-lede {
+  font-family: var(--font-display);
+  font-stretch: 104%;
+  font-size: clamp(1.3rem, 3.2vw, 1.65rem);
+  line-height: 1.3;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0 0 1.75rem;
+  max-width: 34ch;
+}
+.mdx-content .bench-note {
+  margin-top: 0.75rem;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+.bench-marker {
+  flex: none;
+  display: inline-block;
+}
+
+/* The timing tower */
+.bench-tower {
+  margin: 0 0 1.5rem;
+}
+.bench-tower-rows {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg-secondary);
+}
+.bench-tower-row {
+  display: grid;
+  grid-template-columns: 2rem 9.5rem 1fr 4.2rem 4.6rem;
+  align-items: center;
+  gap: 0.9rem;
+  min-height: 3.25rem;
+  padding: 0 1rem;
+  border-top: 1px solid var(--border);
+}
+.bench-tower-row:first-child {
+  border-top: 0;
+}
+.bench-tower-row.is-lead {
+  background: linear-gradient(90deg, var(--accent-glow), transparent 70%);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.bench-tower-pos {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 1.15rem;
+  color: var(--text-muted);
+  text-align: center;
+}
+.bench-tower-row.is-lead .bench-tower-pos {
+  color: var(--text-primary);
+}
+.bench-tower-name {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+.bench-tower-row.is-control .bench-tower-name {
+  font-family: var(--font-mono);
+  font-weight: 400;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+}
+.bench-tower-track {
+  display: flex;
+  gap: 2px;
+  height: 10px;
+}
+.bench-tower-sql,
+.bench-tower-over {
+  display: block;
+  height: 100%;
+  transform-origin: left center;
+}
+.bench-tower-sql {
+  background: #2f384a;
+  border-radius: 2px 0 0 2px;
+}
+.bench-tower-row.is-control .bench-tower-sql {
+  border-radius: 2px 4px 4px 2px;
+}
+.bench-tower-over {
+  background: var(--c);
+  border-radius: 0 4px 4px 0;
+  animation: bench-grow 0.9s var(--ease-out-expo) both;
+  animation-delay: calc(0.25s + var(--i) * 0.12s);
+}
+@keyframes bench-grow {
+  from {
+    transform: scaleX(0);
+  }
+}
+.bench-tower-ratio {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.95rem;
+  color: var(--text-primary);
+  text-align: right;
+}
+.bench-tower-gap {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  text-align: right;
+}
+.bench-tower-row.is-lead .bench-tower-ratio,
+.bench-tower-row.is-lead .bench-tower-gap {
+  color: var(--accent-light);
+}
+.bench-key {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.25rem;
+  margin-top: 0.75rem;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+}
+.bench-key span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+.bench-key i {
+  display: inline-block;
+  width: 18px;
+  height: 8px;
+  border-radius: 2px;
+}
+.bench-key-sql {
+  background: #2f384a;
+}
+.bench-key-over {
+  background: linear-gradient(90deg, #698eef 33%, #7fa32a 33% 66%, #009a9b 66%);
+}
+.bench-key-note {
+  flex-basis: 100%;
+}
+@media (max-width: 640px) {
+  .bench-tower-row {
+    grid-template-columns: 1.5rem 1fr auto auto;
+    grid-template-areas: 'pos name ratio gap' 'pos track track track';
+    gap: 0.35rem 0.75rem;
+    padding: 0.7rem 0.85rem;
+  }
+  .bench-tower-pos {
+    grid-area: pos;
+  }
+  .bench-tower-name {
+    grid-area: name;
+  }
+  .bench-tower-track {
+    grid-area: track;
+  }
+  .bench-tower-ratio {
+    grid-area: ratio;
+  }
+  .bench-tower-gap {
+    grid-area: gap;
+  }
+}
+
+.mdx-content .bench-highlights {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 1rem;
+  display: grid;
+  gap: 0.35rem;
+}
+.mdx-content .bench-highlights li {
+  padding: 0;
+  margin: 0;
+  color: var(--text-secondary);
+}
+.mdx-content .bench-highlights li::before {
+  display: none;
+}
+.mdx-content .bench-highlights strong {
+  font-family: var(--font-display);
+  font-weight: 700;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Shared chart chrome */
+.bench-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.9rem;
+}
+.bench-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.1rem;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  margin-bottom: 0.4rem;
+}
+.bench-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+.bench-control-tick {
+  display: inline-block;
+  width: 2px;
+  height: 12px;
+  background: var(--text-muted);
+  border-radius: 1px;
+}
+.bench-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.bench-toggle button {
+  font: inherit;
+  font-size: 0.8rem;
+  padding: 0.3rem 0.8rem;
+  color: var(--text-secondary);
+  background: transparent;
+  cursor: pointer;
+}
+.bench-toggle button + button {
+  border-left: 1px solid var(--border-strong);
+}
+.bench-toggle button[aria-pressed='true'] {
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+}
+.bench-toggle button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.bench-tie {
+  display: inline-block;
+  margin-left: 0.5rem;
+  padding: 0 0.4rem;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  font-size: 0.72rem;
+  line-height: 1.45;
+  color: var(--text-muted);
+  vertical-align: 1px;
+}
+.bench-tip,
+.bench-latency-tip {
+  display: grid;
+  gap: 0.25rem;
+  min-width: 15rem;
+  padding: 0.6rem 0.75rem;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  pointer-events: none;
+  z-index: 5;
+}
+.bench-tip strong,
+.bench-latency-tip strong {
+  color: var(--text-primary);
+  font-weight: 600;
+  margin-bottom: 0.15rem;
+}
+.bench-tip span,
+.bench-latency-tip span {
+  display: grid;
+  grid-template-columns: 10px 1fr auto auto;
+  align-items: center;
+  gap: 0.5rem;
+}
+.bench-latency-tip span {
+  grid-template-columns: 10px 1fr auto;
+}
+.bench-tip em,
+.bench-latency-tip em {
+  font-style: normal;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+  text-align: right;
+}
+.bench-tip b {
+  font-weight: 400;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+  min-width: 3.2rem;
+  text-align: right;
+}
+.bench-tip .bench-control-tick {
+  height: 10px;
+  justify-self: center;
+}
+
+/* Every scenario */
+.bench-scen {
+  margin: 1.25rem 0 2rem;
+}
+.bench-scen-plot {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  padding: 0.5rem 1rem 0.75rem;
+}
+.bench-scen-axis,
+.bench-scen-row {
+  display: grid;
+  grid-template-columns: 15.5rem 1fr;
+  gap: 1rem;
+  align-items: center;
+}
+.bench-scen-axis {
+  padding: 0.5rem 0 0.4rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+.bench-scen-axis-track,
+.bench-scen-track {
+  position: relative;
+  height: 1.75rem;
+  margin: 0 0.6rem;
+}
+.bench-scen-tick {
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.bench-scen-tick.is-one {
+  color: var(--accent-light);
+}
+.bench-scen-group-name {
+  margin: 0.9rem 0 0.15rem;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.bench-scen-row {
+  position: relative;
+  border-radius: 4px;
+  outline: none;
+}
+.bench-scen-row:hover,
+.bench-scen-row:focus-visible {
+  background: rgba(125, 156, 201, 0.06);
+}
+.bench-scen-row:focus-visible {
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.bench-scen-label {
+  font-size: 0.86rem;
+  color: var(--text-secondary);
+  padding: 0.2rem 0 0.2rem 0.4rem;
+  line-height: 1.35;
+}
+.bench-scen-grid {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+}
+.bench-scen-grid.is-one {
+  background: var(--accent-dim);
+}
+.bench-scen-control {
+  position: absolute;
+  top: 50%;
+  width: 2px;
+  height: 14px;
+  transform: translate(-50%, -50%);
+  background: var(--text-muted);
+  border-radius: 1px;
+}
+.bench-scen-dot {
+  position: absolute;
+  top: 50%;
+  display: flex;
+  transform: translate(-50%, -50%);
+}
+.bench-scen-dot .bench-marker {
+  filter: drop-shadow(0 0 0 var(--bg-secondary)) drop-shadow(0 0 1px var(--bg-secondary));
+}
+.bench-scen-row .bench-tip {
+  position: absolute;
+  right: 0.5rem;
+  bottom: calc(100% + 4px);
+  display: none;
+}
+.bench-scen-row:hover .bench-tip,
+.bench-scen-row:focus-visible .bench-tip {
+  display: grid;
+}
+.bench-table-wrap td.is-best {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.bench-table-wrap td:not(:first-child),
+.bench-table-wrap th:not(:first-child) {
+  text-align: right;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+@media (max-width: 640px) {
+  .bench-scen-axis,
+  .bench-scen-row {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+  .bench-scen-axis-label {
+    display: none;
+  }
+  .bench-scen-row .bench-tip {
+    left: 0;
+    right: auto;
+  }
+}
+
+/* Latency sweep */
+.bench-latency {
+  position: relative;
+  margin: 1.25rem 0 2rem;
+  padding: 1rem 1rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+}
+.bench-latency svg:not(.bench-marker) {
+  display: block;
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+.bench-grid {
+  stroke: var(--border);
+  stroke-width: 1;
+}
+.bench-crosshair {
+  stroke: var(--border-strong);
+  stroke-width: 1;
+}
+.bench-axis-text {
+  fill: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.bench-axis-text.is-title {
+  font-family: var(--font-sans);
+}
+.bench-point {
+  stroke: var(--bg-secondary);
+  stroke-width: 2;
+}
+.bench-end-label {
+  fill: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+}
+.bench-latency-tip {
+  position: absolute;
+  top: 3.5rem;
+  transform: translateX(-50%);
+  min-width: 12rem;
+}
+
+/* Streaming */
+.bench-stream {
+  margin: 1.25rem 0 1.5rem;
+  display: grid;
+  gap: 0.55rem;
+}
+.bench-stream-row {
+  display: grid;
+  grid-template-columns: 17rem 1fr 5.5rem;
+  align-items: center;
+  gap: 0.9rem;
+}
+.bench-stream-name {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.86rem;
+  color: var(--text-secondary);
+}
+.bench-stream-track {
+  height: 10px;
+}
+.bench-stream-track span {
+  display: block;
+  height: 100%;
+  border-radius: 0 4px 4px 0;
+}
+.bench-stream-value {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 0.85rem;
+  color: var(--text-primary);
+  text-align: right;
+}
+@media (max-width: 640px) {
+  .bench-stream-row {
+    grid-template-columns: 1fr auto;
+    gap: 0.3rem 0.75rem;
+  }
+  .bench-stream-track {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bench-tower-over {
+    animation: none;
+  }
+}
+
+/* The latency chart scales down to about half size on a phone, so its text is set in larger SVG units there. */
+@media (max-width: 640px) {
+  .bench-latency .bench-axis-text {
+    font-size: 20px;
+  }
+  .bench-latency .bench-end-label {
+    font-size: 21px;
+  }
+  /* At this size the axis title and unit collide with the tick labels; the caption carries both. */
+  .bench-latency .bench-axis-text.is-title,
+  .bench-latency .bench-axis-text.is-unit {
+    display: none;
+  }
+}
