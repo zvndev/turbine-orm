@@ -47,7 +47,9 @@ jobs:
       DATABASE_URL: postgresql://postgres@/turbine_bench?host=/tmp/pgsock
       OUT_DIR: ${{ github.workspace }}/bench-round
       QUICK: ${{ inputs.quick && '1' || '0' }}
-      BENCH_MACHINE_NOTE: PostgreSQL in Docker on the same VM over a Unix socket
+      # The VM's /proc/cpuinfo names a generic CPU rather than the host's, so the
+      # description is stated here. Keep it in step with the runner label above.
+      BENCH_MACHINE: AMD Ryzen 9 7950X host, 4-vCPU 16 GB Firecracker VM, client and PostgreSQL 17 (Docker) on the same VM over a Unix socket
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
