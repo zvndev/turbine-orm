@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+
+- **Nested rows decode in one pass.** Under the positional encoding (the
+  PostgreSQL default), each relation row used to be built three times: as a
+  keyed object, as a copy with its `::text` columns decoded, and as the parsed
+  row, which also cost an `Object.keys` per row to find its decode plan. The
+  row parser now compiles each relation shape into a plan once per query and
+  writes every nested row exactly once. The plan reads the same field names,
+  cell kinds, wire rules and cell decodes the general path does, and a query
+  whose shapes it cannot prove identical (two columns mapping to one field, a
+  field named like a relation, an integer-like or `Object.prototype` key, a
+  `_count__` field) takes the general path unchanged. Rows are identical on
+  every strategy and encoding; a differential test holds the plan to the
+  general path over seeded random shapes and payloads, malformed ones
+  included, on three client configurations, and against real rows with BC
+  dates, five-digit years and infinity.
+- **`timestamptz` values skip the regex work.** A value ending in a
+  `±HH:MM` offset, which is how every `timestamptz` reaches a nested row, is
+  now handed straight to `new Date`. The general path gave the same answer for
+  that shape after one regex test and two replaces that could not match, so
+  the result is unchanged; BC and five-digit years still take the general
+  parser.
+
+### Measured
+
+Paired and interleaved in one process (this build against 0.91.0,
+plus a second copy of 0.91.0 as the negative control), 600 rounds, local
+PostgreSQL 17, medians:
+
+| Scenario | 0.91.0 | This build | Paired change |
+|---|---|---|---|
+| `findMany`, 50 users + posts | 1.605 ms | 1.376 ms | -0.229 ms (-14%) |
+| its row decode alone | 0.441 ms | 0.178 ms | -0.263 ms (-60%) |
+| `findMany`, 50 posts + to-one user | 0.188 ms | 0.172 ms | -0.017 ms (-8%) |
+| `findMany`, 50 users, no relations | 0.071 ms | 0.070 ms | none |
+
+Against a hand-written query that decodes the same rows to objects and Dates,
+the nested read went from 1.39x to 1.19x on this machine. The `::text` casts on
+`int8` / `numeric` relation columns stay: they are what keeps a value past
+2^53 exact.
+
 ## 0.91.0 (2026-10-14)
 
 Two additions and a SQLite speedup. `createMany({ returning: false })`
