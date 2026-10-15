@@ -1,4 +1,5 @@
 import { ImageResponse } from 'next/og';
+import { SPEED_CLAIM } from '../lib/bench';
 import { ROTOR_BLADES, ROTOR_HUB } from './logo-path';
 
 /**
@@ -108,7 +109,7 @@ export function renderOgCard() {
 
         {/* Subline */}
         <p style={{ fontSize: 30, color: MUTED, margin: 0, fontWeight: 400 }}>
-          The TypeScript ORM for Postgres. Within 8% of hand-written SQL.
+          The TypeScript ORM for Postgres. {SPEED_CLAIM[0].toUpperCase() + SPEED_CLAIM.slice(1)}.
         </p>
       </div>
     ),

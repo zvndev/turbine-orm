@@ -2,6 +2,7 @@ import type { Metadata, Viewport } from 'next';
 import { DM_Sans, JetBrains_Mono, Saira } from 'next/font/google';
 import type { ReactNode } from 'react';
 import './globals.css';
+import { SPEED_CLAIM } from '../lib/bench';
 
 // Display face: Saira with its width axis, set wide for headings.
 const saira = Saira({
@@ -25,7 +26,7 @@ const jetbrains = JetBrains_Mono({
 });
 
 const description =
-  'The TypeScript ORM for Postgres that runs within 8% of hand-written SQL. Nested data in one round trip, types down to the last relation, one dependency (pg), and read-only tools for coding agents. MIT.';
+  `The TypeScript ORM for Postgres, ${SPEED_CLAIM}. Nested data in one round trip, types down to the last relation, one dependency (pg), and read-only tools for coding agents. MIT.`;
 
 export const metadata: Metadata = {
   title: {
@@ -37,7 +38,7 @@ export const metadata: Metadata = {
   openGraph: {
     title: 'Turbine ORM: raw SQL speed, zero raw SQL',
     description:
-      'The TypeScript ORM for Postgres. Within 8% of hand-written SQL, nested data in one round trip, one dependency. MIT.',
+      `The TypeScript ORM for Postgres. ${SPEED_CLAIM[0].toUpperCase()}${SPEED_CLAIM.slice(1)}, nested data in one round trip, one dependency. MIT.`,
     url: 'https://turbineorm.dev',
     siteName: 'Turbine ORM',
     type: 'website',
@@ -46,7 +47,7 @@ export const metadata: Metadata = {
     card: 'summary_large_image',
     title: 'Turbine ORM: raw SQL speed, zero raw SQL',
     description:
-      'The TypeScript ORM for Postgres. Within 8% of hand-written SQL, nested data in one round trip, one dependency. MIT.',
+      `The TypeScript ORM for Postgres. ${SPEED_CLAIM[0].toUpperCase()}${SPEED_CLAIM.slice(1)}, nested data in one round trip, one dependency. MIT.`,
   },
   // The ?v= suffix makes browsers drop a cached icon when the mark changes.
   icons: {
