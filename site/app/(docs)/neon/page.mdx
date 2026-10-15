@@ -7,7 +7,7 @@ export const metadata = {
 
 # Turbine + Neon
 
-From zero to typed queries on Neon, Node.js or edge, same API.
+From zero to typed queries on Neon, with the same API on Node.js and the edge.
 
 ## 1. Install
 
@@ -17,17 +17,17 @@ npm install turbine-orm @neondatabase/serverless
 
 ## 2. Generate your client
 
-Point Turbine at your Neon database and generate a fully-typed client:
+Point Turbine at your Neon database:
 
 ```bash
 DATABASE_URL="postgresql://..." npx turbine generate
 ```
 
-This introspects your schema and writes typed accessors to `./generated/turbine/`.
+This reads your schema and writes a typed client to `./generated/turbine/`.
 
 ## 3. Connect (Node.js / long-running server)
 
-For traditional Node.js servers, Express, Fastify, or any long-running process:
+For a long-running Node.js process, such as an Express or Fastify server:
 
 ```ts
 import { turbine } from './generated/turbine/index.js';
@@ -43,15 +43,16 @@ const users = await db.users.findMany({
 
 ## 4. Connect (Serverless / Edge)
 
-For Vercel Edge, Cloudflare Workers, Deno Deploy, or any serverless runtime:
+For Vercel Edge, Cloudflare Workers, Deno Deploy or any serverless runtime, pass Neon's `Pool` to `turbineHttp`:
 
 ```ts
 import { Pool } from '@neondatabase/serverless';
 import { turbineHttp } from 'turbine-orm/serverless';
+import type { TurbineClient } from './generated/turbine/index.js';
 import { SCHEMA } from './generated/turbine/metadata.js';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-const db = turbineHttp(pool, SCHEMA);
+const db = turbineHttp<TurbineClient>(pool, SCHEMA);
 
 // Same API, works on Vercel Edge, Cloudflare Workers, etc.
 const users = await db.users.findMany({
@@ -59,9 +60,11 @@ const users = await db.users.findMany({
 });
 ```
 
+The `<TurbineClient>` type argument gives you the typed accessors, such as `db.users`.
+
 ## 5. Migrations
 
-SQL-first migrations, plain `.sql` files:
+Migrations are plain `.sql` files. `migrate up` refuses a pooled (`-pooler`) connection string, so use Neon's direct one.
 
 ```bash
 # Create a migration
@@ -76,14 +79,14 @@ npx turbine migrate status
 
 ## Why Turbine on Neon?
 
-- **No WASM**: the edge entry is held under 116 kB brotli in CI (Prisma 7: ~1.6 MB TS/WASM query compiler)
-- **Single-query nested reads**, one SQL statement via `json_agg`, not N+1
-- **Pipeline batching**, N queries in 1 round-trip (critical for high-latency serverless)
-- **No adapter layer**, `turbineHttp(pool, SCHEMA)` with any pg-compatible driver
-- **SQL-first migrations**, no shadow database, no proprietary schema DSL
+- **No WASM**: the edge entry is held under 116 kB brotli in CI.
+- **Single-query nested reads**: one SQL statement via `json_agg`, not N+1.
+- **Pipeline batching**: several queries in one round trip, which matters most on high-latency serverless links.
+- **No adapter layer**: `turbineHttp(pool, SCHEMA)` with any pg-compatible driver.
+- **SQL-first migrations**: no shadow database, no proprietary schema DSL.
 
 ## Next steps
 
-- **[Serverless & Edge](/serverless)**, full guide for Neon, Vercel Postgres, Cloudflare, Supabase
-- **[Transactions & Pipelines](/transactions)**, pipelines are the highest-leverage edge optimization
-- **[Quick Start](/quickstart)**, the complete getting-started walkthrough
+- **[Serverless & Edge](/serverless)**: the full guide for Neon, Vercel Postgres, Cloudflare and Supabase.
+- **[Transactions & Pipelines](/transactions)**: pipelines save the most round trips on the edge.
+- **[Quick Start](/quickstart)**: the complete getting-started walkthrough.

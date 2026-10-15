@@ -35,14 +35,18 @@ Common mistakes to avoid when generating Turbine code:
 - [Quick Start](https://turbineorm.dev/quickstart): Install, set DATABASE_URL, generate the typed client, run your first query and nested `with`.
 - [Why Turbine](https://turbineorm.dev/why-turbine): The checkable comparison against Prisma, Drizzle and Kysely: what is genuinely different (operational safety), what is table stakes in 2026, and what Turbine is not.
 - [Turbine for AI agents](https://turbineorm.dev/ai-agents): How to point a coding agent at Turbine: the installable query skill (`npx turbine skill`), the MCP server, the deterministic codegen flow, and a drop-in agent-instructions snippet.
-- [API Reference](https://turbineorm.dev/queries): Every query method, WHERE operator, nested `with` option, the build* deferred builders, client configuration, and the escape hatches.
+- [Reading and writing](https://turbineorm.dev/queries): findMany, findUnique, findFirst, select and omit, row locks, create, createMany, update, upsert, delete, update expressions, and streaming.
+- [Filtering and sorting](https://turbineorm.dev/filtering): Every WHERE operator, relation, JSON, array and full-text filters, orderBy, pagination, cursors and distinct.
+- [Aggregations](https://turbineorm.dev/aggregations): count, aggregate, groupBy, HAVING and percentiles.
+- [Raw SQL](https://turbineorm.dev/raw-sql): db.raw, db.rawUnsafe and the typed db.sql template.
+- [Client API](https://turbineorm.dev/client): Per-query timeouts, middleware, explain, client configuration and the escape hatches.
 - [Relations](https://turbineorm.dev/relations): hasMany / belongsTo / hasOne / manyToMany and how the json_agg nesting works.
 - [Global Filters](https://turbineorm.dev/global-filters): Soft-delete and multi-tenancy predicates AND-merged into every compiled WHERE.
 - [Nested Writes](https://turbineorm.dev/nested-writes): Create, connect, connectOrCreate, disconnect, set, delete, update, upsert on relations inside one transaction.
 - [Transactions & Pipelines](https://turbineorm.dev/transactions): $transaction, SAVEPOINT nesting, isolation levels, pipeline batching, and the full TransactionClient reference.
 - [Optimistic Locking](https://turbineorm.dev/optimistic-locking): Version-checked updates and OptimisticLockError.
-- [Schema & Migrations](https://turbineorm.dev/schema): Code-first defineSchema, DDL generation, and auto-diff migrations.
-- [Migrations in Practice](https://turbineorm.dev/migrate): SQL-first migration files, checksums, and the destructive-statement guard.
+- [Schema](https://turbineorm.dev/schema): Code-first defineSchema, DDL generation, and auto-diff migrations.
+- [Migrations](https://turbineorm.dev/migrate): SQL-first migration files, checksums, and the destructive-statement guard.
 - [Seeding](https://turbineorm.dev/seeding): defineSeed, seed-as-code, and the non-interactive CI path.
 - [Views & Generated Columns](https://turbineorm.dev/views): Read-only views and generated columns in the generated client.
 - [Zod Schemas](https://turbineorm.dev/zod): Generating Zod validators from the introspected schema.
@@ -67,7 +71,7 @@ Common mistakes to avoid when generating Turbine code:
 - [Observability](https://turbineorm.dev/observability): Query lifecycle events and built-in metrics aggregation.
 - [The PowDB Module](https://turbineorm.dev/powdb): The turbine-orm/powdb subpath in full: transports, capability gating, PowQL helpers, schema DDL, introspection, and error mapping.
 - [Writing a Custom Dialect](https://turbineorm.dev/dialects): The exported Dialect contract: capability flags, resultStrategy, required primitives, and the additive override hooks.
-- [Framework Integration](https://turbineorm.dev/recipes): Next.js, Express, and other runtime integration recipes.
+- [Framework recipes](https://turbineorm.dev/recipes): Next.js, Express, and other runtime integration recipes.
 - [Migrate from Prisma](https://turbineorm.dev/migrate-from-prisma): API differences and a migration path from Prisma.
 - [Migrate from Drizzle](https://turbineorm.dev/migrate-from-drizzle): API differences and a migration path from Drizzle.
 - [Changelog](https://turbineorm.dev/changelog): Per-release detail.

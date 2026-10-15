@@ -1,101 +1,72 @@
 export const metadata = {
   title: 'MCP Server',
   description:
-    'Turbine ORM ships a read-only Model Context Protocol server: eleven tools over JSON-RPC stdio, including a relation graph, a join-path finder that returns the with clause to write, EXPLAIN plans, and PII-redacted sample rows.',
+    'Turbine ships a read-only Model Context Protocol server with eleven tools that show an agent your schema, relation names, query plans, compiled SQL and PII-safe sample rows.',
   alternates: { canonical: '/mcp' },
 };
 
 # MCP Server
 
-`turbine mcp` starts a [Model Context Protocol](https://modelcontextprotocol.io) server so an AI agent (Claude Code, Cursor, or any MCP client) can inspect your database. It speaks JSON-RPC 2.0 over stdio, ships in the package with no extra dependency, and is **read-only by construction**: every database access runs inside `BEGIN READ ONLY` with a statement timeout, and there is no free-form SQL input anywhere on the surface.
+`turbine mcp` starts a read-only [Model Context Protocol](https://modelcontextprotocol.io) server, so an AI agent (Claude Code, Cursor or any MCP client) can inspect your database. It speaks JSON-RPC 2.0 over stdio and needs no extra dependency.
 
 ```bash
 DATABASE_URL=postgres://user:pass@localhost:5432/mydb npx turbine mcp
 ```
 
-## The tools
+## Connect a client
 
-Eleven tools. The first seven answer "what is here"; the last four exist because the hardest thing for an agent on an unfamiliar schema is working out how tables connect.
+Add the server to your project's `.mcp.json` for Claude Code, or `.cursor/mcp.json` for Cursor:
+
+```json
+{
+  "mcpServers": {
+    "turbine": {
+      "command": "npx",
+      "args": ["turbine", "mcp"],
+      "env": { "DATABASE_URL": "postgres://user:pass@localhost:5432/mydb" }
+    }
+  }
+}
+```
+
+## The tools
 
 | Tool | What it returns |
 |---|---|
-| `schema_overview` | Tables, columns, relations, indexes, and estimated row counts. |
-| `table_detail` | Columns, indexes, and relations for one named table. |
-| `migrate_status` | Applied vs pending migrations, without applying anything. |
-| `doctor_report` | Missing relation indexes, from the same [index advisor](/cli#turbine-doctor) `turbine doctor` uses. |
-| `explain_query` | `EXPLAIN (FORMAT JSON)` for a schema-validated `findMany` plan (see below). |
-| `compile_query` | The exact SQL a read query would send, **without executing it**: bound parameters, how many statements it costs, which relation-load strategy it takes, whether a `LIMIT` bounds it, and warnings such as an unindexed correlation column. A query that fails to compile comes back as `ok: false` with the code and the fix, which is an answer rather than an error. |
-| `sample_rows` | Up to 50 rows from a validated table, PII-tagged columns never fetched. |
-| `relation_graph` | The whole relation graph, or one table's subtree: every relation name with its cardinality, target, join keys, and junction table. These are the exact names a `with` clause accepts. |
-| `find_join_path` | The shortest relation chain from one table to another, **with the nested `with` clause to write, as code**. Returns every equal-shortest path, and `found: false` instead of throwing when none exists. |
-| `table_stats` | The planner's row estimate, page count, on-disk bytes, and every index with its columns. A never-analyzed table reports `analyzed: false`, not `0`, because "unknown" and "empty" are different facts. |
-| `explain_error` | A Turbine error code (`TURBINE_E003`, `E003`, or `3`) mapped to its class, causes, fix, and docs URL. Reads no database. |
+| `schema_overview` | Tables, columns, relations, indexes and estimated row counts. |
+| `table_detail` | Columns, indexes and relations for one table. |
+| `relation_graph` | Every relation with its cardinality, target, join keys and junction table. These are the exact names `with` accepts. |
+| `find_join_path` | The shortest relation chains between two tables, **with the nested `with` clause to write**. Returns `found: false` when there is none. |
+| `table_stats` | The planner's row estimate, page count, size on disk, and every index. A never-analyzed table reports `analyzed: false`. |
+| `compile_query` | The exact SQL a read query would send, **without running it**: parameters, statement count, relation strategy, whether a `LIMIT` bounds it, and warnings such as an unindexed relation. A query that fails to compile returns `ok: false` with the error code and fix. |
+| `explain_query` | `EXPLAIN (FORMAT JSON)` for a schema-validated `findMany`. |
+| `sample_rows` | Up to 50 rows from one table, with hidden columns never fetched. |
+| `migrate_status` | Applied and pending migrations. |
+| `doctor_report` | Missing relation indexes, from the same advisor as [`turbine doctor`](/cli#turbine-doctor). |
+| `explain_error` | A Turbine error code (`TURBINE_E003`, `E003` or `3`) with its class, causes, fix and docs link. Needs no database. |
 
-## What an agent can and cannot do
+`compile_query` takes a `table`, an `operation` (`findMany`, `findUnique`, `findFirst`, `count`, `aggregate` or `groupBy`) and the `args` you would pass that method. `explain_query` takes `table` plus optional `where`, `orderBy`, `limit` and `select`.
 
-**Can:** learn the relation names a `with` clause accepts (`relation_graph`), get the query from `orders` to `organizations` written for it (`find_join_path`), check a table's size before writing a query that would scan it (`table_stats`), verify a plan (`explain_query`), and look at real rows (`sample_rows`).
+## Security model
 
-**Cannot:** write anything (every access is inside `BEGIN READ ONLY`), run arbitrary SQL (no tool accepts SQL text), or read PII. `sample_rows` never fetches PII-tagged or secret-named columns and lists exactly what was hidden. `explain_query` refuses a `where` or `orderBy` on such a column, because a planner row estimate can leak whether a value exists. Column *names* are returned everywhere, since a name is schema shape, not data. A column counts as secret-named when one of its words is a secret word, with names split on underscores, dashes and case changes alike, so `api_key`, `apiKey`, `api-key` and `PasswordHash` are all caught.
-
-PII tags are a code-first declaration (introspection never infers one), so the server reads them from the generated metadata in your `out` directory. With no generated metadata there is nothing to redact, and the server says so rather than implying protection it cannot apply.
-
-## `explain_query`
-
-No free-form SQL. You pass a subset of `findMany` args; Turbine validates every identifier against the introspected schema, compiles parameterized SQL through the same builder your application uses, and runs `EXPLAIN (FORMAT JSON)` with bound params.
-
-A [`lock`](/queries#row-locks) option is refused by name (JSON-RPC error `-32602`), at the top level or on any `with` entry, by both `explain_query` and `compile_query`: the server is read-only, and a locking read belongs in a `db.$transaction` in your application. Compile the query without it. `compile_query` also refuses a `_percentile` when it cannot read the PII tag file, rather than compile a percentile over a column it cannot check.
-
-| Argument | Required | Description |
-|---|---|---|
-| `table` | yes | Table name; must exist in the live schema. |
-| `where` | no | `findMany`-style where clause, field names validated. |
-| `orderBy` | no | `findMany`-style orderBy (object or array). |
-| `limit` | no | Positive integer row limit for the planned query. |
-| `select` | no | Field selection map (`{ field: true }`). |
+- Every database access runs in `BEGIN READ ONLY` with a 30-second statement timeout.
+- No tool accepts SQL. Query tools take method arguments, and every name is checked against the live schema.
+- `sample_rows` never fetches a PII-tagged or secret-named column (`password`, `token`, `api_key` and similar, in any case style), and lists what it hid.
+- `explain_query` and `compile_query` refuse a `where` or `orderBy` on such a column, since a row estimate can reveal a value. They also refuse a [`lock`](/queries#row-locks) option.
+- Column names are returned everywhere: a name describes the schema, not the data.
+- PII tags come from the generated metadata in `--out`. Without it, only the secret-name list applies, and each `sample_rows` reply says so in `piiTagSource`. A tag file that cannot be parsed hides every column.
 
 ## Options
 
 | Option | Description |
 |---|---|
-| `--url`, `-u <url>` | Postgres connection string. Overrides `DATABASE_URL`. |
-| `--schema`, `-s <name>` | Postgres schema (default: `public`). |
-| `--include <tables>` | Comma-separated tables to include. |
-| `--exclude <tables>` | Comma-separated tables to exclude. |
-
-## Connect it to Claude Code
-
-Add the server to your project's `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "turbine": {
-      "command": "npx",
-      "args": ["turbine", "mcp"],
-      "env": { "DATABASE_URL": "postgres://user:pass@localhost:5432/mydb" }
-    }
-  }
-}
-```
-
-## Connect it to Cursor
-
-Same shape, in `.cursor/mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "turbine": {
-      "command": "npx",
-      "args": ["turbine", "mcp"],
-      "env": { "DATABASE_URL": "postgres://user:pass@localhost:5432/mydb" }
-    }
-  }
-}
-```
+| `--url`, `-u <url>` | Connection string. Overrides `DATABASE_URL`. |
+| `--schema`, `-s <name>` | Postgres schema (default `public`). |
+| `--include <tables>` / `--exclude <tables>` | Comma-separated tables to expose or hide. |
+| `--out`, `-o <dir>` | Generated client directory, where the PII tags are read (default `./generated/turbine`). |
 
 ## See also
 
-- **[Turbine for AI agents](/ai-agents)**, the rest of the agent story: typed query args, coded errors, `llms.txt`, and a drop-in instructions snippet.
-- **[Studio](/studio)**, the same read-only stance as a web UI for humans.
-- **[CLI](/cli)**, `turbine doctor` and `migrate status` on the command line.
+- **[Turbine for AI agents](/ai-agents)**: the query skill, `llms.txt` and a drop-in instructions snippet.
+- **[Studio](/studio)**: the same read-only approach, as a web UI.
+- **[CLI](/cli)**: `turbine doctor` and `migrate status` on the command line.

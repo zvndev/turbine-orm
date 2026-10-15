@@ -1,24 +1,13 @@
 export const metadata = {
   title: 'Turbine for AI agents',
   description:
-    'How to point a coding agent at Turbine ORM: the installable query skill, the read-only MCP server, the llms.txt integration point, the deterministic introspect-generate-typed-client flow, and a drop-in agent-instructions snippet.',
+    'Point a coding agent at Turbine ORM: the installable query skill, the read-only MCP server, llms.txt, the generate-then-typecheck loop, and a drop-in instructions snippet.',
   alternates: { canonical: '/ai-agents' },
 };
 
 # Turbine for AI agents
 
-Turbine is built to be legible to AI coding agents, not just to people. Five properties do the work: an **installable skill** (`npx turbine skill`) whose every claim is executed against a live database before release, a **read-only [MCP server](/mcp)** with eleven tools that ground the agent in your live schema, a **deterministic codegen flow** it can run and re-run, **fully typed query arguments** that turn an invalid query into a compile error it can read, and **stable coded errors** it can branch on instead of parsing prose. This page shows how to point an agent at Turbine and gives you a snippet to drop into your project so the agent uses it correctly.
-
-## Point an agent at Turbine: `llms.txt`
-
-Turbine publishes an [llms.txt](https://turbineorm.dev/llms.txt) at the site root, following the [llms.txt convention](https://llmstxt.org): a concise description of the library, the key facts, and links to every docs page with a one-line summary. There is also a fuller [llms-full.txt](https://turbineorm.dev/llms-full.txt) with a condensed API reference distilled from these docs.
-
-| File | URL | What it is |
-|---|---|---|
-| `llms.txt` | [turbineorm.dev/llms.txt](https://turbineorm.dev/llms.txt) | Short index: description, key facts, and links to each docs page. |
-| `llms-full.txt` | [turbineorm.dev/llms-full.txt](https://turbineorm.dev/llms-full.txt) | Condensed API reference: reads, writes, WHERE operators, transactions, errors, engines. |
-
-To ground an agent, hand it one or both URLs, or paste them into your project's agent-instructions file (see the snippet below). Both are static text: fetch them, cache them, feed them into context.
+A coding agent can use Turbine correctly on a schema it has never seen. It gets a tested query skill, a read-only [MCP server](/mcp), a generated client whose types catch bad queries, and stable error codes to branch on.
 
 ## The installable skill
 
@@ -26,74 +15,54 @@ To ground an agent, hand it one or both URLs, or paste them into your project's 
 npx turbine skill
 ```
 
-writes a query-writing skill to `.claude/skills/turbine-orm/SKILL.md`. It covers
-the constructs an agent gets wrong on a schema it has not seen: `with` versus
-Prisma's `include`, how relation names are derived, what `select` may and may not
-name, the WHERE operator set, relation filters, per-relation options, `having`,
-JSON paths, and which errors each mistake produces.
+This writes a query-writing skill to `.claude/skills/turbine-orm/SKILL.md`. It covers what agents get wrong on an unfamiliar schema: `with` instead of Prisma's `include`, how relation names are derived, what `select` may name, WHERE operators, relation filters, `having`, JSON paths, and the error each mistake produces.
 
-Two variants for other setups:
-
-| command | what it does |
+| Command | What it does |
 |---|---|
-| `npx turbine skill --print` | writes the skill to stdout, so you can pipe it anywhere |
-| `npx turbine skill --agents` | prints a short instructions block for `AGENTS.md` / `CLAUDE.md` |
-| `npx turbine skill --dir <path>` | installs under a different skills root |
+| `npx turbine skill --print` | Write the skill to stdout. |
+| `npx turbine skill --agents` | Print a short block for `AGENTS.md` / `CLAUDE.md`. |
+| `npx turbine skill --dir <path>` | Install under another skills root. |
 
-**Every factual claim in the skill is executed against a live database before
-release.** The repository's eval harness runs each sentence as a query and fails
-the build if the answer changed, so the file cannot drift from the ORM the way
-documentation usually does. That check exists because the previous version of
-this skill carried a table saying a snake_case column name was rejected in
-`orderBy`, which was true when it was written and false one release later.
+Every factual claim in the skill is run as a query against a live database before each release, so it cannot drift from the ORM.
 
-### What it is worth, measured
+On a held-out schema, across 240 scored attempts, first-try pass rates were:
 
-On a held-out schema the models had never seen, across 240 scored attempts:
-
-| | cold, schema only | + the skill | + a live MCP connection |
+| | Schema only | + the skill | + a live MCP connection |
 |---|---|---|---|
 | `claude-sonnet-5` | 73% | **97%** | 93% |
 | `claude-haiku-4-5` | 60% | **97%** | 90% |
 
-Run-to-run variance on this harness measures about 7 points, so the skill's
-contribution is well outside noise, and on both models it matched or beat the
-live tool connection. Twelve of the twenty cold failures were the same mistake,
-a relation named inside `select`, which is the fourth thing the skill says.
-Method, raw records and what the numbers do **not** show: `evals/` in the
-repository.
+Run-to-run variance is about 7 points. Twelve of the twenty schema-only failures were one mistake: a relation named inside `select`. The method and raw records are in `evals/` in the repository.
 
 ## The MCP server
 
-For an agent that speaks MCP, `npx turbine mcp` exposes the **live database** through eleven read-only tools, every one inside `BEGIN READ ONLY`, with PII-tagged columns redacted before rows reach the model. The four that matter most on an unfamiliar schema:
+`npx turbine mcp` gives an agent eleven read-only tools over your live database. The most useful on an unfamiliar schema:
 
-- `relation_graph`: every relation name with its cardinality, target, and keys. These are the exact names a `with` clause accepts, so the agent reads them instead of guessing from column names.
-- `find_join_path`: "how do I get from `comments` to `orgs`" answered with the relation chain **and the `with` clause to write, as code**.
-- `table_stats`: the planner's row estimate and index list, so the agent checks size before writing a query that would scan fifty million rows.
-- `explain_error`: a Turbine error code mapped to cause, fix, and docs link, with no database read at all.
+- `relation_graph`: every relation name with its cardinality and keys, the exact names `with` accepts.
+- `find_join_path`: the relation chain from one table to another, with the `with` clause to write.
+- `table_stats`: the row estimate and indexes, so the agent checks size before writing a scan.
+- `compile_query`: the SQL a read query compiles to, without running it.
+- `explain_error`: a Turbine error code's cause and fix, without a database.
 
-Plus `compile_query` (the exact SQL a read query compiles to, without executing it), `schema_overview`, `table_detail`, `sample_rows`, `explain_query`, `migrate_status`, and `doctor_report`. Setup and the full tool table: [MCP Server](/mcp).
+Setup and the full tool list: [MCP Server](/mcp).
 
-## The deterministic codegen flow
+## `llms.txt`
 
-An agent works best when the same commands always produce the same typed surface. Turbine's flow is exactly that: **introspect → generate → typed client**.
+| File | What it is |
+|---|---|
+| [turbineorm.dev/llms.txt](https://turbineorm.dev/llms.txt) | A short index: what Turbine is, key facts, and a link to each docs page. |
+| [turbineorm.dev/llms-full.txt](https://turbineorm.dev/llms-full.txt) | A condensed API reference: reads, writes, WHERE operators, transactions, errors, engines. |
+
+Both follow the [llms.txt convention](https://llmstxt.org). Give an agent the URLs, or reference them in your instructions file.
+
+## Generate, then typecheck
 
 ```bash
 npx turbine init        # writes turbine.config.ts and a turbine/ directory
 npx turbine generate    # introspect the live database, emit a typed client
 ```
 
-`generate` reads the database (or your code-first `defineSchema`) and writes three files to `generated/turbine/`:
-
-- `types.ts`, entity interfaces and `Create` / `Update` input types
-- `metadata.ts`, runtime schema metadata
-- `index.ts`, a typed `TurbineClient` subclass with `db.<table>` accessors and a `turbine()` factory
-
-Because the output is generated from the schema, an agent never has to guess column names, relation names, or types, they are all present in the emitted `.ts`, and they move in lockstep with the database. When the schema changes, the agent re-runs `generate` and the type checker immediately surfaces every call site that needs updating. For code-first projects the loop is `edit turbine/schema.ts → turbine push → turbine generate` (see [Schema & Migrations](/schema)).
-
-## Why typed query args suit agents
-
-Turbine's query arguments are fully typed against the generated schema, so a wrong query fails at compile time with a message the agent can act on, not at runtime in production.
+`generate` writes `types.ts`, `metadata.ts` and `index.ts` to `generated/turbine/`. Column names, relation names and types are in the emitted code, so the agent never guesses them. After a schema change, it re-runs `generate` and the type checker points at every call site to update. Code-first projects loop `edit turbine/schema.ts`, `turbine push`, `turbine generate` (see [Schema](/schema)).
 
 ```ts
 const users = await db.users.findMany({
@@ -104,15 +73,13 @@ const users = await db.users.findMany({
 users[0].posts[0].comments[0].author.name; // inferred end to end, no manual casts
 ```
 
-- **Invalid columns, operators, and relations are type errors.** A misspelled field in `where`, an operator that does not exist, or an unknown relation in `with` will not typecheck. An agent that runs `tsc` gets a precise pointer instead of a silent wrong result.
-- **`with` results are inferred at any depth.** The agent does not annotate nested shapes by hand; `findMany` returns the exact nested type for the `with` clause it passed.
-- **Parameterization is guaranteed.** Every user value becomes a bound `$1, $2, ...` parameter; `contains` / `startsWith` / `endsWith` escape LIKE wildcards automatically. An agent cannot accidentally build a string-interpolated query with the typed API, there is no code path that concatenates a value into SQL. Even the raw escape hatches (`db.raw` and `db.sql<T>`) bind every `${value}` as a parameter.
+- A misspelled field, an unknown operator or an unknown relation in `with` is a type error, so `tsc` reviews the query before it runs.
+- `with` results are typed at any depth.
+- Every value is a bound parameter, in the builder and in `db.raw` / `db.sql<T>` alike.
 
-The practical effect: an agent can propose a query, run the type checker, and know it is at least structurally correct before it ever touches the database.
+## Coded errors
 
-## Why coded errors suit agents
-
-Every Turbine error extends `TurbineError` and carries a stable `code` (`TURBINE_E001` through `E020`). Agents branch on the class or code, which is stable across versions, instead of scraping a driver's error text.
+Every error carries a stable `code` (`TURBINE_E001` to `TURBINE_E020`), so an agent branches on the class or code instead of parsing text.
 
 ```ts
 import { SerializationFailureError, UniqueConstraintError } from 'turbine-orm';
@@ -128,11 +95,11 @@ try {
 }
 ```
 
-Retryable failures (`DeadlockError` E012, `SerializationFailureError` E013) expose `isRetryable = true` as a const, so an agent can write a correct, type-checked retry loop. See [Typed Errors](/errors) for the full table.
+`DeadlockError` (E012) and `SerializationFailureError` (E013) have `isRetryable: true` as a const. See [Typed Errors](/errors).
 
 ## Drop-in agent instructions
 
-Paste this into your project's `CLAUDE.md` or `AGENTS.md` so any agent working in the repo uses Turbine correctly. Trim it to what your project uses.
+Paste this into your project's `CLAUDE.md` or `AGENTS.md`, trimmed to what you use.
 
 ```markdown
 ## Database: Turbine ORM
@@ -188,8 +155,7 @@ Migrations
 
 ## See also
 
-- **[MCP Server](/mcp)**, a read-only MCP server that grounds an agent in your live schema, plans, and sample rows.
-- **[Quick Start](/quickstart)**, the fastest path from install to first typed query.
-- **[API Reference](/queries)**, every method, operator, and option the snippet above refers to.
-- **[Typed Errors](/errors)**, the full E001-E020 table and retry patterns.
-- **[Schema & Migrations](/schema)**, code-first schemas and the migration workflow.
+- **[MCP Server](/mcp)**: the eleven read-only tools.
+- **[Quick Start](/quickstart)**: from install to a first typed query.
+- **[Reading and writing](/queries)**: every method and option the snippet refers to.
+- **[Typed Errors](/errors)**: every error code.

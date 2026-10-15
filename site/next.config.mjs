@@ -18,7 +18,9 @@ const tracingRoot = existsSync(join(repoRoot, 'package.json')) ? repoRoot : __di
 const prettyCodeOptions = {
   theme: 'github-dark-dimmed',
   keepBackground: false,
-  defaultLang: 'ts',
+  // Fenced blocks without a language read as TypeScript. Inline code stays
+  // plain: keyword colors on single words like `with` read as warnings.
+  defaultLang: { block: 'ts' },
 };
 
 /** @type {import('next').NextConfig} */

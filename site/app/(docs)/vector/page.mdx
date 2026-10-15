@@ -1,19 +1,17 @@
 export const metadata = {
   title: 'Vector Search (pgvector)',
   description:
-    'KNN nearest-neighbor ranking and distance WHERE filters over pgvector columns in Turbine ORM. l2 / cosine / inner-product metrics, fully parameterized.',
+    'Rank rows by distance to a query vector and filter by a distance threshold on pgvector columns, with l2, cosine and inner-product metrics.',
   alternates: { canonical: '/vector' },
 };
 
 # Vector Search (pgvector)
 
-Rank rows by similarity to a query vector, for semantic search, recommendations, or RAG retrieval, without dropping to raw SQL. Turbine queries [pgvector](https://github.com/pgvector/pgvector) columns through the same `findMany` you already use, with `orderBy` for nearest-neighbor ranking and `where` for distance thresholds.
-
-You need the `pgvector` extension installed and a `vector` column on your table. Everything else is ordinary Turbine.
+Query [pgvector](https://github.com/pgvector/pgvector) columns with `findMany`: `orderBy` ranks nearest neighbors and `where` filters by distance. Use it for semantic search, recommendations and RAG retrieval. You need the `pgvector` extension and a `vector` column.
 
 ## KNN, order by distance
 
-Pass a `distance` object on a `vector` column in `orderBy` to sort rows by their distance to a query vector. Add `limit` to take the closest *k* rows.
+Order by `distance` and add `limit` to take the closest *k*:
 
 ```ts
 const similar = await db.items.findMany({
@@ -23,7 +21,7 @@ const similar = await db.items.findMany({
 // queryVector is a number[]; the 5 nearest rows, nearest-first
 ```
 
-`to` is a `number[]`. The default sort direction is `'asc'`, smallest distance first, i.e. nearest-first. To invert it, pass `direction: 'desc'`:
+This compiles to `ORDER BY "embedding" <=> $1::vector ASC`. The default direction is `'asc'`, nearest first; pass `direction: 'desc'` for farthest first:
 
 ```ts
 const farthest = await db.items.findMany({
@@ -32,11 +30,9 @@ const farthest = await db.items.findMany({
 });
 ```
 
-This compiles to `ORDER BY "embedding" <=> $1::vector ASC`, with the vector bound as a parameter.
-
 ## Distance filter, keep rows within a threshold
 
-Put the same `distance` object in `where` with a comparator to keep only rows inside (or outside) a distance threshold.
+Put `distance` in `where` with a comparator to keep rows inside or outside a threshold:
 
 ```ts
 const close = await db.items.findMany({
@@ -45,9 +41,7 @@ const close = await db.items.findMany({
 // Generates: WHERE "embedding" <-> $1::vector < $2
 ```
 
-Distance filters accept `lt`, `lte`, `gt`, and `gte`. A distance filter with no comparator throws `ValidationError`.
-
-Combine a filter with KNN ordering to retrieve the closest matches above a quality bar:
+Filters take `lt`, `lte`, `gt` or `gte`; a filter with none throws `ValidationError` ([E003](/errors#e003)). Combine a filter with ordering to get the closest matches that clear a bar:
 
 ```ts
 const results = await db.items.findMany({
@@ -59,21 +53,19 @@ const results = await db.items.findMany({
 
 ## Metrics
 
-`metric` selects the pgvector distance operator:
-
 | `metric` | Operator | Distance |
 |---|---|---|
 | `'l2'` | `<->` | Euclidean (L2) distance |
 | `'cosine'` | `<=>` | Cosine distance |
 | `'ip'` | `<#>` | Negative inner product |
 
-An unknown metric throws `ValidationError`. A `distance` op on a non-`vector` column also throws `ValidationError`.
+An unknown metric, or `distance` on a column that is not a `vector`, throws `ValidationError` ([E003](/errors#e003)).
 
-> **Note:** pg has no built-in parser for the `vector` type, so a fetched `vector` column comes back as a string literal like `'[1,2,3]'` unless you register a parser (for example via pgvector's own client helpers). Querying *by* distance works regardless, this only affects how the column value reads when you select it.
+A selected `vector` column reads back as a string such as `'[1,2,3]'`, because `pg` has no parser for the type. Register one (for example with pgvector's client helpers) if you need arrays.
 
 ## The exported types
 
-The vector surface is fully typed and every type is exported from the package root, so you can build a query object in a helper and hand it to `findMany` without losing type safety.
+Every vector type is exported from the package root, for building queries in helpers:
 
 ```ts
 import type {
@@ -87,13 +79,13 @@ import type {
 
 | Type | Shape | Where it goes |
 |---|---|---|
-| `VectorMetric` | `'l2' \| 'cosine' \| 'ip'` | The `metric` field of both specs below. A fixed allow-list, so a user-supplied string can never become a SQL operator. |
-| `VectorDistanceFilter` | `{ to: number[]; metric: VectorMetric; lt?, lte?, gt?, gte?: number }` | The `distance` value inside a `where`. |
-| `VectorFilter` | `{ distance: VectorDistanceFilter }` | The per-column value in `where`, i.e. `where: { embedding: VectorFilter }`. |
-| `VectorOrderByDistance` | `{ to: number[]; metric: VectorMetric; direction?: 'asc' \| 'desc' }` | The `distance` value inside an `orderBy`. `direction` defaults to `'asc'`, which is nearest-first. |
-| `VectorOrderBy` | `{ distance: VectorOrderByDistance }` | The per-column value in `orderBy`, i.e. `orderBy: { embedding: VectorOrderBy }`. |
+| `VectorMetric` | `'l2' \| 'cosine' \| 'ip'` | The `metric` field of both specs below |
+| `VectorDistanceFilter` | `{ to: number[]; metric: VectorMetric; lt?, lte?, gt?, gte?: number }` | The `distance` value inside a `where` |
+| `VectorFilter` | `{ distance: VectorDistanceFilter }` | `where: { embedding: VectorFilter }` |
+| `VectorOrderByDistance` | `{ to: number[]; metric: VectorMetric; direction?: 'asc' \| 'desc' }` | The `distance` value inside an `orderBy` |
+| `VectorOrderBy` | `{ distance: VectorOrderByDistance }` | `orderBy: { embedding: VectorOrderBy }` |
 
-A typical use is a shared retrieval helper that takes the query embedding once and builds both halves:
+A retrieval helper that builds both halves from one embedding:
 
 ```ts
 import type { VectorFilter, VectorMetric, VectorOrderBy } from 'turbine-orm';
@@ -114,36 +106,17 @@ const results = await db.items.findMany({
 });
 ```
 
-<Callout type="note" title="Postgres only">
-  The vector operators are gated on the dialect's `supportsVector` capability
-  flag. On the SQLite, MySQL, SQL Server and PowDB engines a `distance` filter
-  or ordering throws `UnsupportedFeatureError` (`TURBINE_E017`) rather than
-  emitting SQL that cannot work.
-</Callout>
+## Limits
 
-## Validation and safety
-
-Every value in a vector query is bound as a parameter, so hostile input can't escape the query:
-
-- The query vector is always bound as `$n::vector`.
-- The distance threshold is always bound as `$n`.
-- A non-number element in `to` (including `NaN` or `Infinity`) throws `ValidationError` before any query runs.
+- PostgreSQL only. On SQLite, MySQL, SQL Server and PowDB, a `distance` filter or ordering throws `UnsupportedFeatureError` ([E017](/errors#e017)).
+- The query vector is bound as `$n::vector` and each threshold as `$n`; the metric comes from a fixed list, so no input reaches the SQL text.
+- An empty `to`, a non-finite element (`NaN`, `Infinity`) or a non-finite threshold throws `ValidationError` ([E003](/errors#e003)) before the query runs.
 
 ## The same query, three ways
 
-The task: the 10 nearest rows by cosine distance, filtered to a quality threshold, fully parameterized.
+The 10 nearest rows by cosine distance, under a threshold. In Turbine it is the combined `where` and `orderBy` query [above](#distance-filter-keep-rows-within-a-threshold).
 
-**Turbine**, `distance` is a first-class `where` / `orderBy` operator on `vector` columns:
-
-```ts
-const results = await db.items.findMany({
-  where: { embedding: { distance: { to: queryVector, metric: 'cosine', lt: 0.4 } } },
-  orderBy: { embedding: { distance: { to: queryVector, metric: 'cosine' } } },
-  limit: 10,
-});
-```
-
-**Prisma**, pgvector columns are `Unsupported("vector")` in the schema, so querying by distance means `$queryRaw` with the vector serialized to a string and cast by hand:
+**Prisma**: a pgvector column is `Unsupported("vector")`, so distance queries go through `$queryRaw`.
 
 ```ts
 const embedding = `[${queryVector.join(',')}]`;
@@ -159,7 +132,7 @@ const results = await prisma.$queryRaw<
 `;
 ```
 
-**Drizzle**, a native `vector` column type plus SQL expression helpers; the distance expression is built with `cosineDistance` and threaded through `where` / `orderBy`:
+**Drizzle**: a `vector` column type plus the `cosineDistance` expression helper.
 
 ```ts
 import { asc, cosineDistance, lt } from 'drizzle-orm';
@@ -174,10 +147,7 @@ const results = await db
   .limit(10);
 ```
 
-All three run the same SQL. The difference is where the vector semantics live: in Turbine they're part of the typed query object; in Prisma they're raw SQL you maintain; in Drizzle they're SQL expression helpers you compose yourself.
-
 ## See also
 
-- **[API Reference](/queries)**, `findMany`, `where`, `orderBy`, and the full operator table.
-- **[Realtime](/realtime)**, `LISTEN` / `NOTIFY` pub/sub.
-- **[Relations](/relations)**, combine vector ranking with nested `with` loads.
+- [Filtering and sorting](/filtering): `where` and `orderBy`.
+- [Relations](/relations): load relations alongside a vector ranking.

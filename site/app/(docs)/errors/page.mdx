@@ -1,87 +1,89 @@
 export const metadata = {
   title: 'Typed Errors',
   description:
-    'Every Turbine ORM error class, error code, and retry pattern. Typed Postgres constraint violations and retryable transactions.',
+    'Every Turbine ORM error code and class: when each is thrown and what to do about it, plus retries, safe error messages and how database errors map.',
   alternates: { canonical: '/errors' },
 };
 
 # Typed Errors
 
-Turbine throws typed errors you can catch with `instanceof` or by code. Every error Turbine RAISES extends `TurbineError` and carries a stable `readonly code` field for programmatic handling. The one exception is a driver error whose SQLSTATE Turbine does not map: it reaches you as the driver's own error, with the SQLSTATE on `.code` and `.sqlstate`, in both message modes. See [unmapped SQLSTATEs](#unmapped-sqlstates) below. Messages start with the same code tag (e.g. `[TURBINE_E008] …`) so logs are greppable, but **do not parse the message**; branch on `err.code` / `instanceof`. Postgres driver errors (23505, 23503, 40P01, etc.) are translated into typed classes via `wrapPgError()`.
-
-`err.code` is the check that survives any module graph. A process that loads the package twice, once as ESM and once as CommonJS (a `"type": "commonjs"` project whose generated client is `require`d while an `.mts` entry `import`s the package, a CJS library that wraps Turbine, a Jest setup), holds two copies of every class, and a plain prototype-chain `instanceof` against the other copy is `false`. Since 0.78 `instanceof` works across copies too: every error carries a cross-copy brand and each class implements `Symbol.hasInstance` over that brand and the error's code, so `err instanceof UniqueConstraintError` is true whichever copy threw it. The code comparison needs no import at all, which makes it the right check in a shared handler or a library.
-
-Every error also carries `readonly docsUrl` (e.g. `https://turbineorm.dev/errors#e008`, an anchor into the table below), and its message ends with the same link, so structured sinks get the URL as a field without parsing anything. A unit test asserts every code has its row and anchor here, so a new code cannot ship undocumented.
-
-## Error code table
-
-| Code | Class | When thrown |
-|---|---|---|
-| <a id="e001" /> `TURBINE_E001` | `NotFoundError` | `findUniqueOrThrow`, `findFirstOrThrow`, update/delete against a non-matching row |
-| <a id="e002" /> `TURBINE_E002` | `TimeoutError` | Query or transaction exceeds its configured timeout. Since 0.90 it carries `outcome`: `'not-executed'` when the statement made no change, `'unknown'` when it may still have. Since 0.90 also the next pull on a cursor stream that Turbine closed after its [idle timeout](/queries#abandoned-streams-close-themselves) (`outcome: 'not-executed'`). See [per-query timeout](/queries#per-query-timeout) |
-| <a id="e003" /> `TURBINE_E003` | `ValidationError` | Unknown column, invalid operator, empty-where guard on update/delete, PII aggregate without `includePii`, a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol) passed a plain `true` instead of the `UNSAFE` symbol, a `createMany` whose first data row names no column while a later row does. Since 0.90 also: an operand that does not fit its operator or column, a plain `{ col }` object where `col()` is needed, a PII column in `select` without `includePii: UNSAFE`, a `globalFilters` key or filter that names nothing, a static filter with a bad operand or an `undefined` value (thrown by the constructor), a global filter that reaches its own table through relation filters, or a function filter that returns `undefined`, a query on a `tx` whose transaction has settled, a transaction callback that returned while a query it started was still running, a `sessionContext` name without a dot that is not in `allowBuiltinSettings`, an array passed to `raw` / `sql` in place of a tagged template, a `lock` outside a transaction, a plain object shaped like an `expr` node, an `onConflict` target that is not a unique key or two rows in one call sharing it, a `cursor` that cannot place its page or carries an operator, `cursor: null` or `cursor: {}`, a relation quantifier or `is` / `isNot` value that is not a where object, `is` / `isNot` on a to-many relation, `lock` in a relation's `with` options, a `_count` relation entry other than `true`, a mutation `where` that is always true (`NOT: { OR: [] }`, `notIn: []`, an `OR` with an empty branch, `contains: ''` or `not: null` on a NOT NULL column), an Invalid Date in a `where`, an unknown key or a non-boolean `isEmpty` in an array filter, a groupBy `by` that is missing, a string, empty or holds `null`, a JSON `not` whose object has only filter-operator keys, an invalid per-query `timeout` or `relationLoadStrategy`, paging options on `updateMany` / `deleteMany`, `optimisticLock` on `upsert`, `updateMany`, `delete` or `deleteMany`, an object or array written to a scalar column, a `Map` or `Set` written to any column, an `expr` result that can be a non-integer written to an integer column, an unknown key in `defineSchema` or a name it cannot resolve (a `references` that is not `table.column` or names no column, an index on an unknown column, two names for one database column or table), a statement through the outer `tx` inside an open nested `tx.$transaction` block, a transaction-control statement (`COMMIT`, `ROLLBACK`, `BEGIN`, `SAVEPOINT` and the like) sent through `raw`, `rawUnsafe`, `sql` or `$connection()` inside a transaction, `end()` or `connect()` on a transaction's connection, a `?` placeholder or a `$n` with no value in `rawUnsafe` on SQLite, MySQL or SQL Server, a MySQL `in` / `notIn` list that takes the statement past 65,535 placeholders, a string that is not a number written to a numeric or boolean column on SQLite, an enum column `schemaToSQL` cannot declare off PostgreSQL (not in `defineSchema`'s `enums`, or no labels), a column default it cannot write, a malformed `sqlComment` option (thrown by the constructor), a `streamIdleTimeoutMs` or stream `idleTimeoutMs` that is not a whole number of milliseconds, on PowDB a number, bigint or boolean compared with or written to a `Date` column, a value that is not one of an enum column's labels, and `contains` / `startsWith` / `endsWith` / `mode: 'insensitive'` / `_sum` / `_avg` on an enum column, an option prisma-compat cannot translate, a value the server could not read as its column's type at bind time (such as a `Buffer` bound to a non-`bytea` column, formerly `TURBINE_E004`), and pg 42883 (no operator for these argument types) |
-| <a id="e004" /> `TURBINE_E004` | `ConnectionError` | A connection could not be opened, or an open one was closed by the server (restart, failover, idle timeout, compute suspend), or none came free within `connectionTimeoutMs` (the message names the pool size), or the client was built with no database to connect to (raised by the first query). Since 0.90 also a named prepared statement that a transaction-pooling endpoint handed to the wrong server connection (sqlstates `42P05` and `26000`), with `sqlstate` set and advice naming the fixes: the direct endpoint, `preparedStatements: false`, or a pooler that tracks prepared statements. Since 0.90 also sqlstate `25P03`, a session the server ended because it sat idle in an open transaction past `idle_in_transaction_session_timeout` (a cursor stream sets that limit to its idle timeout plus 10 seconds). See [lost connections](/transactions#lost-connections) for what Turbine retries |
-| <a id="e005" /> `TURBINE_E005` | `RelationError` | Unknown relation name in a `with` clause |
-| <a id="e006" /> `TURBINE_E006` | `MigrationError` | Checksum mismatch, migration-lock contention, or a failure while applying a migration |
-| <a id="e007" /> `TURBINE_E007` | `CircularRelationError` | Relation nesting depth exceeds 10 |
-| <a id="e008" /> `TURBINE_E008` | `UniqueConstraintError` | pg 23505, translated via `wrapPgError()` |
-| <a id="e009" /> `TURBINE_E009` | `ForeignKeyError` | pg 23503, translated via `wrapPgError()` |
-| <a id="e010" /> `TURBINE_E010` | `NotNullViolationError` | pg 23502, translated via `wrapPgError()` |
-| <a id="e011" /> `TURBINE_E011` | `CheckConstraintError` | pg 23514, translated via `wrapPgError()` |
-| <a id="e012" /> `TURBINE_E012` | `DeadlockError` | pg 40P01, **retryable**, exposes `isRetryable: true` |
-| <a id="e013" /> `TURBINE_E013` | `SerializationFailureError` | pg 40001, **retryable**, exposes `isRetryable: true`. Also SQLite `SQLITE_BUSY` / `SQLITE_LOCKED`, and a SQLite caller that waited `busyTimeoutMs` for another caller's open transaction. A `$transaction` whose first failure was a serialization conflict keeps this class when its `COMMIT` is rolled back. Since 0.90 its subclass `LockNotAvailableError` (same code, also retryable) is a [row lock](/queries#row-locks) that could not be taken: PostgreSQL 55P03, MySQL 3572 and 1205, SQL Server 1222 |
-| <a id="e014" /> `TURBINE_E014` | `PipelineError` | Non-transactional pipeline has partial failures |
-| <a id="e015" /> `TURBINE_E015` | `OptimisticLockError` | Version mismatch on an `optimisticLock` update, the row was modified by another transaction |
-| <a id="e016" /> `TURBINE_E016` | `ExclusionConstraintError` | pg 23P01, translated via `wrapPgError()` |
-| <a id="e017" /> `TURBINE_E017` | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) invoked on a non-Postgres engine, exposes `feature` and `dialect`. Since 0.90 also, on MySQL, a `create` whose new key cannot be read back exactly and a single-row write whose re-read matches more than one row, on SQLite and SQL Server a whole JSON document as a `where` value or `not: <document>`, on SQL Server a binary element in an `in` / `notIn` list, an enum array column in `schemaToSQL` off PostgreSQL, `sqlComment`'s `dynamic` option on MySQL, and on PowDB a deferred query (`build*`, so `db.pipeline()` and `$transaction([...])`), a whole JSON document in a `where`, ordering by an enum column (`orderBy`, `_min` / `_max`), and `sqlComment` itself. Through prisma-compat: a filtered relation count, and `cursor` or `distinct` on an included relation |
-| <a id="e018" /> `TURBINE_E018` | `ReadOnlyError` | A write refused because the database, the role or the transaction is read-only, exposes `reason: 'snapshot' \| 'rbac' \| 'transaction'` (PowDB snapshot serving / read-only role / a read-only transaction or replica) |
-| <a id="e019" /> `TURBINE_E019` | `TransactionRolledBackError` | Since 0.90. A transaction PostgreSQL rolled back instead of committing: a statement inside it failed (and the callback caught the error), or a per-query `timeout` cancelled one. Also a nested `tx.$transaction` block that saw such a failure, the raw `transaction()` API, a statement sent after the failure (refused before it reaches the server), and pg `25P02` on any path Turbine wraps. The first failure is `cause`. Not retryable as such: when the first failure was a deadlock or a serialization conflict, that class (`DeadlockError`, `SerializationFailureError`, `LockNotAvailableError`) is thrown instead, so a retry loop still works. See [a caught error still rolls the transaction back](/transactions#a-caught-error-still-rolls-the-transaction-back) |
-| <a id="e020" /> `TURBINE_E020` | `InvariantError` | Since 0.90. Turbine caught a bug in itself before sending a statement it knew was wrong: two internal paths that must agree did not, for example the SQL-template cache producing parameters that differ from a fresh build of the same query. Exposes `invariant`, a stable id of the broken rule (`'sql-cache-lockstep'`, `'sql-cache-param-count'`, `'where-scope-reference'`, `'relation-payload-json'`, and on PowDB `'powql-relation-filter-unresolved'`, `'powql-json-operator'`, `'powql-json-filter-empty'`, `'powql-filter-empty'`). Not caused by the arguments and not retryable: report it at https://github.com/zvndev/turbine-orm/issues with the message, which names the query shape and no row or parameter value |
-
-## Catching typed errors
-
-Import the classes from the package root and narrow with `instanceof`.
+Every error Turbine throws extends `TurbineError` and carries a stable `code`, such as `TURBINE_E008`. Branch on `err.code` or `instanceof`, never on the message text.
 
 ```ts
-import {
-  NotFoundError,
-  ValidationError,
-  TimeoutError,
-  UniqueConstraintError,
-} from 'turbine-orm';
+import { NotFoundError, UniqueConstraintError } from 'turbine-orm';
 
 try {
-  const user = await db.users.findUniqueOrThrow({ where: { id: 999 } });
+  await db.users.create({ data: { email: 'taken@example.com' } });
 } catch (err) {
-  if (err instanceof NotFoundError) {
-    // err.code === 'TURBINE_E001'
-    // err.table, err.where, and err.operation are all populated
-    return { status: 404 };
-  }
-  if (err instanceof ValidationError) {
-    // err.code === 'TURBINE_E003'
-    return { status: 400, message: err.message };
-  }
-  if (err instanceof TimeoutError) {
-    // err.code === 'TURBINE_E002'
-    // err.timeoutMs is the configured limit
-    return { status: 504 };
-  }
+  if (err instanceof UniqueConstraintError) return { status: 409 }; // err.columns: ['email']
+  if (err instanceof NotFoundError) return { status: 404 };
   throw err;
 }
 ```
 
+- Each message starts with its code (`[TURBINE_E008] ...`) and ends with a link to its entry below, which `err.docsUrl` also holds.
+- `instanceof` works even when a process loads the package twice, as ESM and as CommonJS. `err.code` needs no import, so it suits shared handlers.
+- A database error with a known SQLSTATE becomes one of these classes, with the driver's error as `.cause`. Any other keeps the driver's class: see [Unmapped SQLSTATEs](#unmapped-sqlstates).
+
+## Error code table
+
+| Code | Class | When | What to do |
+|---|---|---|---|
+| [`TURBINE_E001`](#e001) | `NotFoundError` | An `...OrThrow` read, update or delete matched no row | Return a 404, or use the non-throwing method |
+| [`TURBINE_E002`](#e002) | `TimeoutError` | A query or transaction ran past its timeout | Retry only when `outcome` is `'not-executed'` |
+| [`TURBINE_E003`](#e003) | `ValidationError` | The call is invalid | Fix the call; the message names the field |
+| [`TURBINE_E004`](#e004) | `ConnectionError` | No connection, a lost connection, or a pooler mismatch | Check the URL, server and pool size |
+| [`TURBINE_E005`](#e005) | `RelationError` | Unknown relation in `with` | Use the name from the generated types |
+| [`TURBINE_E006`](#e006) | `MigrationError` | Checksum mismatch, lock held, or a migration failed | Reconcile the file, or wait for the other run |
+| [`TURBINE_E007`](#e007) | `CircularRelationError` | `with` nested deeper than 10 | Split the read |
+| [`TURBINE_E008`](#e008) | `UniqueConstraintError` | Duplicate key (`23505`) | Report a conflict, or use `upsert` |
+| [`TURBINE_E009`](#e009) | `ForeignKeyError` | Missing or still-referenced parent row (`23503`) | Write the parent first, or delete children first |
+| [`TURBINE_E010`](#e010) | `NotNullViolationError` | A required column got no value (`23502`) | Supply the value, or give the column a default |
+| [`TURBINE_E011`](#e011) | `CheckConstraintError` | A `CHECK` constraint rejected the row (`23514`) | Fix the value |
+| [`TURBINE_E012`](#e012) | `DeadlockError` | Deadlock (`40P01`) | Retry with `withRetry` |
+| [`TURBINE_E013`](#e013) | `SerializationFailureError` | Serialization conflict or unavailable lock | Retry with `withRetry` |
+| [`TURBINE_E014`](#e014) | `PipelineError` | A non-transactional pipeline had failures | Read `err.results` |
+| [`TURBINE_E015`](#e015) | `OptimisticLockError` | The row's version changed since you read it | Re-read and retry, or report the conflict |
+| [`TURBINE_E016`](#e016) | `ExclusionConstraintError` | An exclusion constraint rejected the row (`23P01`) | Fix the overlapping value |
+| [`TURBINE_E017`](#e017) | `UnsupportedFeatureError` | This engine or path cannot do that | Read `err.feature`; use the supported path |
+| [`TURBINE_E018`](#e018) | `ReadOnlyError` | A write hit a read-only database, role or transaction | Route the write to the primary |
+| [`TURBINE_E019`](#e019) | `TransactionRolledBackError` | A failed statement rolled the transaction back | Read `cause`; isolate expected failures in a nested block |
+| [`TURBINE_E020`](#e020) | `InvariantError` | Turbine caught a bug in itself | Report it |
+
+## Error reference
+
+<a id="e001" />
+### E001 `NotFoundError`
+
+`findUniqueOrThrow` or `findFirstOrThrow` found nothing, or an `update` or `delete` matched no row. It carries `table`, `where` and `operation`. In the default safe mode, the message names only the `where` keys (see [Safe error messages](#safe-error-messages)).
+
+<a id="e002" />
+### E002 `TimeoutError`
+
+A query or transaction ran past its `timeout`, or the server's `statement_timeout` cancelled it (`57014`). It carries `timeoutMs` and `outcome`:
+
+- `'not-executed'`: the statement made no change, so a retry is safe.
+- `'unknown'`: it may have committed. Check before retrying a write.
+
+The next pull on a cursor stream that was closed after its [idle timeout](/queries#abandoned-streams-close-themselves) also throws it, with `'not-executed'`. See [per-query timeout](/client#per-query-timeout).
+
+<a id="e003" />
+### E003 `ValidationError`
+
+The call is invalid, so the statement did not run or the database rejected a value. Common causes:
+
+- **Names**: an unknown column or key anywhere in the call (see [Unknown field names](#unknown-field-names)), a `defineSchema` reference it cannot resolve, a `globalFilters` key that names nothing.
+- **Values**: an operand that does not fit its operator or column, an Invalid Date, an object written to a scalar column, a value the database cannot read as the column's type (class `22`, `42883`).
+- **Where clauses**: an `update` / `delete` with an empty `where`, or one that is always true (`NOT: { OR: [] }`, `notIn: []`), and a relation filter whose value is not a where object.
+- **Options**: a [privilege option](/global-filters#privilege-options-and-the-unsafe-symbol) set to `true` instead of `UNSAFE`, a PII column in `select` or an aggregate without `includePii: UNSAFE`, an invalid `cursor`, `timeout` or `relationLoadStrategy`, `optimisticLock` on `upsert`, `updateMany`, `delete` or `deleteMany`, and a `lock` outside a transaction.
+- **Transactions**: a query on a `tx` whose transaction has finished, a callback that returned while its query was still running, and `BEGIN`, `COMMIT` or `ROLLBACK` sent through raw SQL inside a transaction.
+- **Setup and engines**: a global filter that does not compile, a malformed client option, a MySQL `in` list past 65,535 placeholders, a non-numeric string written to a numeric column on SQLite.
+
+It may carry `column`, `sqlstate` and, in verbose mode, `detail`.
+
 ### Unknown field names
 
-Every name you supply is resolved against the schema, and one that does not
-resolve throws `TURBINE_E003` naming the table and, where it can, the column you
-probably meant. That holds for `where`, `orderBy`, `distinct`, `groupBy` keys,
-aggregate targets, create/update `data`, and `select` / `omit`, at every depth
-including inside a relation. There is no partial mode: a name is never dropped
-and the query never runs without it.
-
-Naming a **relation** in `select` or `omit` gets its own message, because it is
-usually a habit carried over from Prisma rather than a typo:
+Every name you pass is checked against the schema in `where`, `orderBy`, `distinct`, `groupBy`, aggregates, `data`, `select` and `omit`, at every depth. An unknown name throws E003 with the closest match; it is never dropped. A relation named in `select` gets its own message:
 
 ```
 [TURBINE_E003] "comments" is a relation on table "post", not a column, so it
@@ -89,50 +91,118 @@ cannot be named in `select`. Load it with `with: { comments: true }`, which is
 a sibling of `select`, not a member of it.
 ```
 
-Relations live in [`with`](/relations), which sits beside `select` rather than
-inside it. To narrow a relation's own columns, put a `select` inside that
-relation's options: `with: { comments: { select: { body: true } } }`.
+To narrow a relation's columns, put `select` inside its options: `with: { comments: { select: { body: true } } }`.
 
-## `wrapPgError` translation
+<a id="e004" />
+### E004 `ConnectionError`
 
-Every query execution runs its pg error through `wrapPgError()`. The original driver error is preserved as `.cause` on the wrapped error.
+A connection could not be opened, the server closed one (restart, failover, idle timeout), none came free within `connectionTimeoutMs`, or the client has no database configured. A read outside a transaction is retried once; see [lost connections](/transactions#lost-connections).
 
-| pg SQLSTATE | Name | Turbine class |
-|---|---|---|
-| `23505` | unique_violation | `UniqueConstraintError` |
-| `23503` | foreign_key_violation | `ForeignKeyError` |
-| `23502` | not_null_violation | `NotNullViolationError` |
-| `23514` | check_violation | `CheckConstraintError` |
-| `23P01` | exclusion_violation | `ExclusionConstraintError` |
-| `40P01` | deadlock_detected | `DeadlockError` (retryable) |
-| `40001` | serialization_failure | `SerializationFailureError` (retryable) |
-| class `22` (`22P02`, `22003`, `22001`, `22007`, `22008`, `22012`) | data_exception: a bad enum label, numeric overflow, a value too long, a bad date, division by zero | `ValidationError` (E003), naming the column when the driver reports one |
-| `42601` from `to_tsquery` | syntax_error in a `search` query string | `ValidationError` (E003) with a hint about the search syntax |
+Behind a transaction pooler, sqlstates `42P05` and `26000` mean a named prepared statement reached the wrong server connection. Use the direct endpoint, `preparedStatements: false`, or a pooler that tracks prepared statements. It carries `sqlstate`.
 
-For these codes the offending value sits in the driver's own message text, so the wrapped `ValidationError` is built the other way round from the constraint classes: its message names the column (when the driver reports one), a value-free account of the problem (`the value could not be parsed as the column type`, `the number is out of range for the column type`, ...) and the SQLSTATE. Under `errorMessages: 'verbose'` the account is the driver's text and `.detail` carries it; under the default `'safe'` mode the driver's text is kept out of the message, out of `.detail`, and out of the `.cause` error's message. Any other SQLSTATE stays outside the `TurbineError` hierarchy (no `TURBINE_` code, and `.code` is the SQLSTATE): under `'safe'` it is returned as a clone of the driver error whose message reads `Database error <SQLSTATE>`, with `.detail` redacted and the original error on `.cause`; under `'verbose'` the raw driver error is returned as-is, because its message grammar is unknown to Turbine and only the verbose mode has asked to see it.
+<a id="e005" />
+### E005 `RelationError`
+
+A `with` clause named a relation the table does not have. The message suggests the closest name. Relation names are in the generated types, or renamed with [`relationNames`](/cli#renaming-derived-relations-relationnames).
+
+<a id="e006" />
+### E006 `MigrationError`
+
+A migration file changed after it was applied, another run holds the migration lock, or a migration failed. Reconcile the edited file, wait for the other run (`migrate deploy --wait`), or fix the SQL. See the [CLI](/cli#turbine-migrate-deploy).
+
+<a id="e007" />
+### E007 `CircularRelationError`
+
+A `with` tree is nested deeper than 10 levels. `err.path` lists the relations. Split the read into two queries.
+
+<a id="e008" />
+### E008 `UniqueConstraintError`
+
+A unique constraint rejected the write (`23505`). It carries `constraint`, `columns` and `table`.
+
+<a id="e009" />
+### E009 `ForeignKeyError`
+
+A foreign key rejected the write (`23503`): the referenced row does not exist, or a deleted row is still referenced. It carries `constraint` and `table`.
+
+<a id="e010" />
+### E010 `NotNullViolationError`
+
+A `NOT NULL` column got no value (`23502`). It carries `column` and `table`.
+
+<a id="e011" />
+### E011 `CheckConstraintError`
+
+A `CHECK` constraint rejected the row (`23514`). It carries `constraint` and `table`.
+
+<a id="e012" />
+### E012 `DeadlockError`
+
+The database broke a deadlock by failing this transaction (`40P01`). It has `isRetryable: true`; see [Retryable errors](#retryable-errors).
+
+<a id="e013" />
+### E013 `SerializationFailureError`
+
+A serializable or repeatable-read transaction conflicted with another (`40001`), or SQLite reported `SQLITE_BUSY` / `SQLITE_LOCKED`. It has `isRetryable: true`.
+
+Its subclass `LockNotAvailableError` (same code, also retryable) is a [row lock](/queries#row-locks) that could not be taken: PostgreSQL `55P03`, MySQL 3572 and 1205, SQL Server 1222. On PostgreSQL it aborts the transaction, so take the lock inside a nested `tx.$transaction` if you want to recover.
+
+<a id="e014" />
+### E014 `PipelineError`
+
+A pipeline run with `{ transactional: false }` had one or more failures. A transactional pipeline (the default) rolls back and throws the failing query's own error instead.
 
 ```ts
-import { UniqueConstraintError } from 'turbine-orm';
+import { PipelineError } from 'turbine-orm';
 
 try {
-  await db.users.create({ data: { email: 'taken@example.com', ... } });
+  await db.pipeline(queries, { transactional: false });
 } catch (err) {
-  if (err instanceof UniqueConstraintError) {
-    // err.constraint, e.g. 'users_email_key'
-    // err.columns  , e.g. ['email']
-    // err.table    , e.g. 'users'
-    // err.cause    , the original pg error
-    return { status: 409, message: 'Email already in use' };
+  if (err instanceof PipelineError) {
+    // err.results: ({ status: 'ok', value } | { status: 'error', error })[]
+    // err.failedIndex, err.failedTag: the first failure
   }
-  throw err;
 }
 ```
 
+<a id="e015" />
+### E015 `OptimisticLockError`
+
+An `optimisticLock` update found a different version than expected: another write changed the row. It carries `table`, `versionField` and `expectedVersion`. Re-read the row and retry, or report the conflict.
+
+<a id="e016" />
+### E016 `ExclusionConstraintError`
+
+An exclusion constraint rejected the row (`23P01`), usually an overlapping range. It carries `constraint` and `table`.
+
+<a id="e017" />
+### E017 `UnsupportedFeatureError`
+
+Turbine cannot do this here, so it refuses instead of sending broken SQL. It carries `feature` and `dialect`. Common causes:
+
+- A PostgreSQL-only feature on another [engine](/engines): pgvector operators, `$listen` / `$notify`, RLS `sessionContext`.
+- A PowDB feature the connected version is too old for. The message names the minimum version.
+- `relationLoadStrategy: 'batched'` on a composite-key relation. Use the default plan.
+- A Prisma shape [prisma-compat](/migrate-from-prisma) cannot translate exactly, such as a negative `take` or a `query` extension.
+
+<a id="e018" />
+### E018 `ReadOnlyError`
+
+A write was refused as read-only. `err.reason` says why: `'snapshot'`, `'rbac'` or `'transaction'`. See [Read-only refusals](#read-only-refusals).
+
+<a id="e019" />
+### E019 `TransactionRolledBackError`
+
+PostgreSQL rolled the transaction back instead of committing, because a statement inside it failed, even if your callback caught the error. The first failure is `cause`. A deadlock, serialization failure or unavailable lock keeps its own retryable class instead. To survive an expected failure, run that statement in a nested block: see [a caught error still rolls the transaction back](/transactions#a-caught-error-still-rolls-the-transaction-back).
+
+<a id="e020" />
+### E020 `InvariantError`
+
+Turbine caught a bug in itself before sending a statement it knew was wrong. `err.invariant` names the broken rule. It is not caused by your arguments and is not retryable. Report it at https://github.com/zvndev/turbine-orm/issues with the message, which contains no row or parameter values.
+
 ## Retryable errors
 
-`DeadlockError` and `SerializationFailureError` expose a `readonly isRetryable = true as const` field, a type-level signal your retry loop can narrow on.
-
-You do not have to write that loop. Turbine exports **`withRetry`**, and `TurbineClient` exposes the same thing as **`db.$retry`**:
+`DeadlockError` and `SerializationFailureError` (with `LockNotAvailableError`) have `isRetryable: true`. `withRetry`, also available as `db.$retry`, retries a function on those errors and rethrows anything else:
 
 ```ts
 import { withRetry } from 'turbine-orm';
@@ -151,79 +221,20 @@ await withRetry(() =>
 );
 ```
 
-`withRetry(fn, options?)` retries only when the thrown error carries `isRetryable === true`, and rethrows anything else immediately. Options: `maxAttempts` (default `3`), `baseDelay` in ms (default `50`), `maxDelay` (default `5000`), and an `onRetry(error, attempt)` hook. Backoff is exponential with jitter, capped at `maxDelay`. `db.$retry(fn, options)` is the same function bound to the client.
-
-## Pipeline errors
-
-`PipelineError` is only thrown when a pipeline runs in non-transactional mode (`{ transactional: false }`) and one or more queries fail. It carries a per-query result array so you can inspect exactly which succeeded and which failed.
-
-```ts
-import { PipelineError } from 'turbine-orm';
-
-try {
-  await db.pipeline(queries, { transactional: false });
-} catch (err) {
-  if (err instanceof PipelineError) {
-    // err.results: ({status:'ok', value} | {status:'error', error})[]
-    // err.failedIndex: zero-based index of the first failed query
-    // err.failedTag: DeferredQuery.tag of the first failure
-    for (const [i, slot] of err.results.entries()) {
-      if (slot.status === 'error') {
-        console.error(`Query ${i} failed:`, slot.error);
-      }
-    }
-  }
-}
-```
-
-Transactional pipelines (the default) either fully succeed or roll back, a failure surfaces as whichever typed error the failing query raised.
-
-## Unsupported features on other engines
-
-`UnsupportedFeatureError` (`TURBINE_E017`) is thrown when you invoke a **Postgres-only** feature on one of Turbine's other [database engines](/engines), SQLite, MySQL, or SQL Server. It is *not* a `wrapPgError()` translation; Turbine raises it directly (from a capability flag on the active dialect) instead of generating broken SQL. The Postgres-only features are pgvector distance ops, LISTEN/NOTIFY realtime (`$listen` / `$notify`), and RLS `sessionContext` (`$withSession`).
-
-```ts
-import { UnsupportedFeatureError } from 'turbine-orm';
-import { turbineMysql } from 'turbine-orm/mysql';
-
-const db = await turbineMysql(process.env.MYSQL_URL!, SCHEMA);
-
-try {
-  await db.$listen('orders', (payload) => console.log(payload));
-} catch (err) {
-  if (err instanceof UnsupportedFeatureError) {
-    // err.code    === 'TURBINE_E017'
-    // err.feature === 'LISTEN/NOTIFY'
-    // err.dialect === 'mysql'
-  }
-}
-```
-
-**`TURBINE_E017` is not a "wrong engine" error in general**, though. It is the code for *this build cannot do that*, and Postgres raises it too:
-
-- `relationLoadStrategy: 'batched'` on a **composite-key** relation, including a composite-key many-to-many junction. The batched loader keys on one column, so it refuses instead of loading a wrong set. Use the default join plan for those relations.
-- `relationLoadStrategy: 'batched'` where the **correlation key is missing from every parent row**. The batched loader stitches in JS, so it needs that column in the rows it was handed; without it the relation would come back silently empty, so it refuses instead, naming the relation and the key. This should not be reachable; if you hit it, report it, and use `relationLoadStrategy: 'join'` on that query meanwhile.
-- On [`turbine-orm/prisma-compat`](/migrate-from-prisma), a Prisma shape with no Turbine equivalent: a **negative `take`**, `skip` on a nested `include`, the [inclusive-cursor shapes](/migrate-from-prisma#cursor-pagination) that cannot be translated exactly, `limit` on `updateMany` / `deleteMany`, and `$extends` with a `query` or `result` component (or any component the adapter does not implement, refused at `$extends` time with the alternative named).
-
-Catch on `err.code === 'TURBINE_E017'` and read `err.feature`, which names what was refused. See [Database Engines](/engines) for the full capability matrix.
-
-The same error carries PowDB's **version-gated** capabilities, where the feature exists but the connected engine is too old for it. Those messages name the feature once and then give the floor and what the connection reported:
-
-```
-[TURBINE_E017] JSON path filters is unsupported on "PowDB". Requires PowDB >= 0.12;
-this connection reports 0.11.0. Upgrade powdb-server / @zvndev/powdb-embedded
-(or pass `assumeEngineVersion` if the version cannot be detected).
-```
-
-Some gates append one more sentence naming a workaround. `err.feature` is the label from the first sentence, `err.dialect` is `'PowDB'`.
+| Option | Default | |
+|---|---|---|
+| `maxAttempts` | `3` | Total attempts. |
+| `baseDelay` | `50` | First backoff in ms; grows exponentially with jitter. |
+| `maxDelay` | `5000` | Backoff cap in ms. |
+| `onRetry(error, attempt)` | none | Called before each retry. |
 
 ## Read-only refusals
 
-`ReadOnlyError` (`TURBINE_E018`) is the routing signal for writes that hit a read-only database. Its `reason` field tells you which kind:
+`ReadOnlyError` (`TURBINE_E018`) carries a `reason`:
 
-- **`'snapshot'`**, the database itself is read-only: a PowDB `--readonly` snapshot server, an embedded `{ readonly: true }` open, or Turbine's own client-level `readonly: true` fail-fast flag. Nothing can write here; route the write to your primary.
-- **`'rbac'`**, the database is writable but this connection's role may not write (`permission denied: role …`). Re-authenticating with a writer role may suffice.
-- **`'transaction'`** (since 0.90), the transaction is read-only: one opened with `BEGIN READ ONLY` or `SET TRANSACTION READ ONLY`, or any transaction on a hot-standby read replica. PostgreSQL SQLSTATE `25006` and MySQL error 1792 map here; before 0.90 they surfaced as a generic database error. Run the write in a read-write transaction on the primary. A write inside `$transaction(fn, { readOnly: true })` lands here too. An exhaustive `switch` over `reason` needs the new case.
+- **`'snapshot'`**: the database is read-only (a PowDB snapshot, or the client's `readonly: true`). Send the write to your primary.
+- **`'rbac'`**: this connection's role cannot write. Connect with a writer role.
+- **`'transaction'`**: the transaction is read-only (`$transaction(fn, { readOnly: true })`, `BEGIN READ ONLY`, or a hot-standby replica). PostgreSQL `25006` and MySQL 1792 map here.
 
 ```ts
 import { ReadOnlyError } from 'turbine-orm';
@@ -237,17 +248,21 @@ try {
 }
 ```
 
-See [Read Replicas](/read-replicas) for the snapshot-serving pattern this supports.
+See [Read Replicas](/read-replicas).
 
 ## Safe error messages
 
-By default, `NotFoundError` messages include only the **keys** of the `where` clause; values are redacted so PII does not leak into logs (Sentry, Datadog).
+By default, messages leave out values a log should not hold. A `NotFoundError` names only the `where` keys:
 
 ```
 [TURBINE_E001] findUniqueOrThrow on "users" found no record matching where: { id, email }
 ```
 
-The full `where` object is always available as `err.where` for programmatic access, only the human-readable message is redacted. Since 0.90 `where` is not enumerable in safe mode, so `JSON.stringify(err)` and error serializers that walk own properties do not carry it into logs; read `err.where` directly. Opt into verbose messages (useful in local development) by setting `errorMessages: 'verbose'` in your `TurbineConfig`, or by calling `setErrorMessageMode('verbose')` at startup.
+- `err.where` still holds the full object. It is not enumerable in safe mode, so `JSON.stringify(err)` leaves it out.
+- The PostgreSQL fields that can carry a row value (`detail`, `hint`, `where`, `internalQuery`) are redacted on the error and its `.cause`.
+- A value error (class `22`) names the column and describes the problem without the value.
+
+For full messages in development, set `errorMessages: 'verbose'` on the client or call `setErrorMessageMode('verbose')`:
 
 ```ts
 const db = turbine({
@@ -256,43 +271,50 @@ const db = turbine({
 });
 ```
 
-### What safe mode redacts
+## SQLSTATE mapping
 
-Safe mode redacts the four PostgreSQL error fields that can carry a row value: `detail`, `hint`, `where` (the CONTEXT line) and `internalQuery`. Each is replaced on both the returned error and on `.cause`, so nothing a logger walks holds the value. `hint` is the one most often missed, because a `RAISE ... USING HINT` interpolates whatever the function author put there, and `internalQuery` carries the text an `EXECUTE format(...)` built, bound values included.
+Turbine maps these PostgreSQL errors to typed classes. `wrapPgError(err)` does the same for an error you caught yourself.
+
+| SQLSTATE | Class |
+|---|---|
+| `23505` | `UniqueConstraintError` (E008) |
+| `23503` | `ForeignKeyError` (E009) |
+| `23502` | `NotNullViolationError` (E010) |
+| `23514` | `CheckConstraintError` (E011) |
+| `23P01` | `ExclusionConstraintError` (E016) |
+| `40P01` | `DeadlockError` (E012) |
+| `40001` | `SerializationFailureError` (E013) |
+| `55P03` | `LockNotAvailableError` (E013) |
+| `57014` | `TimeoutError` (E002, `outcome: 'not-executed'`) |
+| `25006` | `ReadOnlyError` (E018, `reason: 'transaction'`) |
+| `25P02` | `TransactionRolledBackError` (E019) |
+| class `08`, `28000`, `28P01`, `3D000`, `42P05`, `26000`, `53300`, `57P01`, `57P02`, `57P03`, `25P03` | `ConnectionError` (E004) |
+| class `22`, `42883`, `08P01` at severity `ERROR`, `42601` from a `search` query | `ValidationError` (E003) |
 
 ## Unmapped SQLSTATEs
 
-A driver error whose SQLSTATE has no typed class reaches you as **the driver's own error**, not a `TurbineError`. That is the same in both message modes, deliberately: `verbose` has always returned the raw error, and minting a typed error only under `safe` would make one database failure land in different `catch` branches depending on a logging setting.
-
-It carries the SQLSTATE on `.code`, and on `.sqlstate` under the name the typed errors use:
+Any other database error keeps the driver's own class, with the SQLSTATE on `.code`:
 
 ```ts
+import { TurbineError } from 'turbine-orm';
+
 try {
   await db.orders.findMany();
 } catch (err) {
   if (err instanceof TurbineError) handleTyped(err);
-  else if ((err as { sqlstate?: string }).sqlstate === '42P01') runMigrations();
+  else if ((err as { code?: string }).code === '42P01') runMigrations();
 }
 ```
 
-Under `safe` the **message** is kept when the SQLSTATE class's grammar cannot hold a row value, and withheld when it can:
+In verbose mode it is the raw driver error. In safe mode it is a redacted copy with the original on `.cause` and the SQLSTATE also on `.sqlstate`. Safe mode keeps the message when it cannot hold a row value and withholds it otherwise:
 
-| Class | Example | Message under `safe` |
-| --- | --- | --- |
-| `42` (except `42601`) | `42P01`, `42703` | kept: `relation "orders" does not exist` |
-| `08`, `3D`, `3F`, `53`, `57`, `58` | connection, catalog, resource, operator, system | kept |
-| `42601` | syntax error | withheld: the message quotes a token of the statement, and a token can be a string literal |
-| `P0001`, class `55` | `RAISE EXCEPTION` from your own function | withheld: that text is yours, and nothing here knows what is in it |
-| everything else | | withheld |
-
-A withheld message says so and names the setting that shows it:
-
-```
-Database error P0001 (driver text withheld by errorMessages: 'safe'; set errorMessages: 'verbose' to see it)
-```
+| Class | Message in safe mode |
+|---|---|
+| `42` (except `42601`), `08`, `3D`, `3F`, `53`, `57`, `58` | kept, e.g. `relation "orders" does not exist` |
+| `42601`, `P0001`, `55`, everything else | withheld, naming the setting that shows it |
 
 ## See also
 
-- **[API Reference](/queries)**, transactions, pipelines, and the queries that raise these errors.
-- **[Schema & Migrations](/schema)**, `MigrationError` fires here.
-- **[Database Engines](/engines)**, where `UnsupportedFeatureError` comes from and the per-engine capability matrix.
+- **[Transactions](/transactions)**: rollbacks, timeouts and lost connections.
+- **[Database Engines](/engines)**: the capability matrix behind `UnsupportedFeatureError`.
+- **[MCP Server](/mcp)**: `explain_error` looks up any code from an agent.

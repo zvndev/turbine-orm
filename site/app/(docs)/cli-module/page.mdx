@@ -1,15 +1,13 @@
 export const metadata = {
   title: 'The turbine-orm/cli module',
   description:
-    'Reference for the turbine-orm/cli subpath: TurbineCliConfig, config file discovery and loading, resolveConfig precedence, seed-file resolution, and the config template.',
+    'Reference for the turbine-orm/cli subpath: the TurbineCliConfig type and the functions that find, load and resolve config the way the turbine CLI does.',
   alternates: { canonical: '/cli-module' },
 };
 
 # The `turbine-orm/cli` module
 
-[The CLI page](/cli) documents the `turbine` **binary**. This page documents the importable module behind it, `turbine-orm/cli`: the `TurbineCliConfig` type, the file discovery and loading routines, and the precedence rules that decide what a command runs against.
-
-Most projects import exactly one thing from it, the type:
+`turbine-orm/cli` holds the config behind the [`turbine` CLI](/cli): the `TurbineCliConfig` type and the functions that find, load and resolve it. Most projects import only the type:
 
 ```ts
 // turbine.config.ts
@@ -27,108 +25,78 @@ const config: TurbineCliConfig = {
 export default config;
 ```
 
-The rest of the surface lets your own tooling use the same resolution rules the CLI uses.
-
-<Callout type="note" title="This subpath is config only">
-  `turbine-orm/cli` resolves to the config module. It does not export the
-  command implementations, the argument parser, or anything that touches your
-  database. Importing it is side-effect free and needs no connection.
-</Callout>
+The module exports no commands and opens no connection, so importing it has no side effects.
 
 ## `TurbineCliConfig`
 
 | Field | Default | Meaning |
 |---|---|---|
-| `url` | none | Postgres connection string. |
-| `out` | `'./generated/turbine'` | Output directory for the generated types and client. |
-| `schema` | `'public'` | The Postgres **namespace** to introspect. Not a file path: see the warning below. |
+| `url` | none | Connection string. |
+| `out` | `'./generated/turbine'` | Output directory for the generated client. |
+| `schema` | `'public'` | The Postgres **namespace** to introspect, not a file path. |
 | `include` | `[]` | Tables to include. Empty means all. |
 | `exclude` | `[]` | Tables to exclude. |
-| `migrationsDir` | `'./turbine/migrations'` | Directory for SQL migration files. |
-| `seedFile` | see below | Path to the seed file. The canonical key. |
-| `seed` | none | Back-compat alias for `seedFile`. `seedFile` wins when both are set. |
-| `schemaFile` | `'./turbine/schema.ts'` | The `defineSchema` file. `turbine push` applies it, and `turbine generate` reads its `pii` / `updatedAt` / `maxLength` / `tsType` declarations. A file named here (or with `--schema-file`) that is missing fails both; a missing default is skipped. |
-| `importExtension` | `'auto'` | Specifier style in the generated `index.ts`: `'js'` (`./types.js`), `'ts'` (`./types.ts`, for Node type stripping), `'none'` (`./types`), or `'auto'`, which detects from your tsconfig and falls back to `'js'`. |
-| `columnTypes` | none | `{ 'table.column': 'TypeScript type' }` with database names. Replaces the generated type of each named column; wins over a schema file's `tsType`. See [Typing columns](/cli#typing-columns-columntypes). |
-| `keepColumnNames` | `false` | Keep raw database column names (snake_case) as generated field names instead of camelCasing them. |
-| `legacyToManyUniques` | `false` | Opt out of the unique-FK to one-to-one (`hasOne`) introspection flip, emitting the legacy `hasMany` shape for unique-covered child relations. |
-| `adapter` | none | A `DatabaseAdapter` for a PG-compatible database with dialect-specific behaviour, e.g. `cockroachdb`. **Type only, the bundled CLI does not read it yet.** See the note below. |
+| `migrationsDir` | `'./turbine/migrations'` | SQL migration directory. |
+| `seedFile` | see [`resolveSeedFile`](#resolveseedfileconfig-cwd) | Seed file path. |
+| `seed` | none | Alias for `seedFile`, which wins when both are set. |
+| `schemaFile` | `'./turbine/schema.ts'` | The `defineSchema` file that `push` applies and whose tags `generate` reads. A named file that is missing fails both; a missing default is skipped. |
+| `columnTypes` | none | `{ 'table.column': 'TypeScript type' }`. See [Typing columns](/cli#typing-columns-columntypes). |
+| `relationNames` | none | `{ table: { derivedName: newName } }`. See [Renaming derived relations](/cli#renaming-derived-relations-relationnames). |
+| `importExtension` | `'auto'` | Imports in the generated `index.ts`: `'js'`, `'ts'`, `'none'`, or `'auto'` (from your tsconfig, else `'js'`). |
+| `keepColumnNames` | `false` | Use raw column names as field names instead of camelCase. |
+| `legacyToManyUniques` | `false` | Type a child with a unique foreign key as `hasMany` instead of `hasOne`. |
+| `adapter` | none | A `DatabaseAdapter` such as `cockroachdb`. **The CLI does not read it.** |
 
-<Callout type="warning" title="adapter is declared on the type but the bundled CLI ignores it">
-  `turbine migrate` never forwards `TurbineCliConfig.adapter` into the
-  migration runner, so `adapter: cockroachdb` changes nothing: migrations
-  still take the PostgreSQL path, including `pg_try_advisory_lock()`, which
-  CockroachDB does not implement. Until this is wired, do not rely on the CLI
-  to hold a cluster-wide migration lock on CockroachDB or YugabyteDB:
-  serialize `turbine migrate up` yourself (one runner, in a CI job that
-  cannot overlap), or apply the generated `.sql` files with a tool that
-  supports the engine. The value is otherwise inert, not harmful. See
-  [Compatibility](/compatibility).
+<Callout type="warning" title="adapter is ignored by the CLI">
+  `turbine migrate` does not pass `adapter` to the migration runner, so it
+  takes the PostgreSQL path, including `pg_try_advisory_lock()`, which
+  CockroachDB does not implement. On CockroachDB or YugabyteDB, run one
+  migration job at a time yourself, or apply the generated `.sql` files with a
+  tool that supports the engine. See [Compatibility](/compatibility).
 </Callout>
 
-`TurbineConfig` is exported as an alias of `TurbineCliConfig`. This is a **different type** from the runtime `TurbineConfig` exported from the package root, which configures a `TurbineClient`.
-
-<Callout type="warning" title="schema is a namespace, schemaFile is a path">
-  `schema: './turbine/schema.ts'` makes introspection run
-  `WHERE table_schema = './turbine/schema.ts'`, which matches zero tables and
-  generates an empty client with no error. `looksLikeSchemaFilePath(value)` is
-  the exported heuristic that catches it (a path separator, or a
-  `.ts` / `.mts` / `.cts` / `.js` / `.mjs` / `.cjs` / `.json` extension), and
-  `turbine generate` uses it to fail loudly instead.
-</Callout>
+- The module's `TurbineConfig` export is an alias of `TurbineCliConfig`, not the runtime `TurbineConfig` from the package root.
+- A `schema` that looks like a file path (a `/` or `\`, or a `.ts`, `.mts`, `.cts`, `.js`, `.mjs`, `.cjs` or `.json` ending) would match no tables, so `turbine generate` refuses it. The check is the exported `looksLikeSchemaFilePath(value)`.
 
 ## Finding and loading the config
 
 ```ts
 import { findConfigFile, loadConfig, loadConfigResult } from 'turbine-orm/cli';
-```
 
-Candidates are tried in this fixed priority order: `turbine.config.ts`, `turbine.config.mts`, `turbine.config.js`, `turbine.config.mjs`. The first one that **imports successfully** wins.
-
-- `findConfigFile(cwd?)` returns the path of the first candidate that exists, or `null`. It does not import anything, so it is the right call for display purposes.
-- `loadConfig(cwd?)` returns the config or `{}`. Load failures are swallowed.
-- `loadConfigResult(cwd?)` returns `{ config, loadError? }`. Prefer this in tooling.
-
-If a config file exists but throws on import (a syntax error, an ESM/CJS interop failure), `loadConfigResult` keeps trying lower-priority candidates, and if none load it returns `config: {}` plus a `loadError` describing the first real failure. Resolution can then still fall through to environment variables and flags, while the caller reports what actually went wrong instead of a misleading "no database URL".
-
-```ts
 const { config, loadError } = await loadConfigResult();
 if (loadError) {
   console.error(`Failed to load ${loadError.filename}:`, loadError.error);
 }
 ```
 
-`ConfigLoadError` is `{ filename, error }`; `ConfigLoadResult` is `{ config, loadError? }`.
+Candidates are `turbine.config.ts`, `turbine.config.mts`, `turbine.config.js` and `turbine.config.mjs`, in that order. The first that imports successfully wins.
 
-### Module unwrapping
+| Function | Returns |
+|---|---|
+| `findConfigFile(cwd?)` | The first candidate that exists, or `null`. Imports nothing. |
+| `loadConfig(cwd?)` | The config, or `{}`. Load errors are swallowed. |
+| `loadConfigResult(cwd?)` | `{ config, loadError? }`. A file that throws is skipped for the next candidate, and the first failure is reported as `loadError: { filename, error }`. |
 
-```ts
-import { unwrapModuleDefault, unwrapConfigModule } from 'turbine-orm/cli';
-```
-
-In a project with `"type": "commonjs"` (the `npm init -y` default), importing `turbine.config.ts` through the tsx loader can produce a **double-wrapped** default: `mod.default` is itself `{ default: config }`. The obvious `mod.default ?? mod` then reads every field as `undefined`, and every command fails with a misleading "No database URL provided".
-
-`unwrapModuleDefault(mod)` prefers `default` at the top level, then keeps descending through any further **pure** `{ default: ... }` wrappers (bounded, so a self-referential object cannot spin forever). A wrapper counts as pure only when `default` is its only key besides `__esModule`, and since no Turbine config field is named `default`, a genuine config object is never mistaken for a wrapper. `unwrapConfigModule(mod)` is the config-specialized form: a non-object export collapses to `{}` so downstream resolution can proceed.
+`unwrapModuleDefault(mod)` and `unwrapConfigModule(mod)` unwrap a module's `default` export. In a `"type": "commonjs"` project, importing `turbine.config.ts` through tsx can wrap the default twice (`{ default: { default: config } }`), which would otherwise read every field as `undefined`.
 
 ## `resolveConfig(fileConfig, overrides)`
 
-Merges a loaded config with CLI overrides and environment variables into a fully defaulted `ResolvedConfig`.
+Merges a loaded config with flag overrides and the environment into a fully defaulted `ResolvedConfig`.
 
 ```ts
-import { resolveConfig, loadConfig } from 'turbine-orm/cli';
+import { loadConfig, resolveConfig } from 'turbine-orm/cli';
 
 const resolved = resolveConfig(await loadConfig(), { url: argv.url, out: argv.out });
 ```
 
-**Precedence: CLI flags, then environment variables, then the config file, then defaults.** One asymmetry: `url` is the only field that consults an environment variable (`DATABASE_URL`), and it consults it **before** the config file. So a `DATABASE_URL` in your shell overrides `url` in `turbine.config.ts`, while an `out` in the config file is used no matter what is in the environment. An empty or whitespace-only value counts as unset at every step, so an exported but empty `DATABASE_URL=` no longer hides the `url` in your config file.
-
-`CliOverrides` covers `url`, `out`, `schema`, `schemaFile`, `include`, `exclude`, `importExtension`, `keepColumnNames` and `legacyToManyUniques`. `migrationsDir` and `seedFile` come from the config file only: there are no flags for them.
-
-`ResolvedConfig` has every field non-optional except `seedFile`, which stays `string | undefined` because there may genuinely not be one.
+- A flag beats the config file, which beats the default.
+- `url` alone reads the environment: `--url`, then `DATABASE_URL`, then the file's `url`. A shell `DATABASE_URL` therefore overrides the config file.
+- An empty or whitespace-only value counts as unset.
+- `CliOverrides` covers `url`, `out`, `schema`, `schemaFile`, `include`, `exclude`, `importExtension`, `keepColumnNames` and `legacyToManyUniques`. Everything else comes from the file.
 
 ## `resolveSeedFile(config, cwd?)`
 
-Resolves the seed file to an absolute path, or `null`.
+Returns the seed file's absolute path, or `null`.
 
 ```ts
 import { resolveSeedFile } from 'turbine-orm/cli';
@@ -136,14 +104,14 @@ import { resolveSeedFile } from 'turbine-orm/cli';
 const seed = resolveSeedFile({ seedFile: './turbine/seed.ts' });
 ```
 
-An explicit value wins **even if the file does not exist yet**, which is deliberate: a config that names a seed file should produce a "that file is missing" error rather than silently falling back to a different file that happens to be lying around. The canonical `seedFile` is checked before the `seed` alias. With no explicit value, the candidates are tried in order: `seed.ts`, `seed.js`, `seed.sql`, `turbine/seed.ts`, `turbine/seed.js`, `turbine/seed.sql`.
+An explicit `seedFile` (or `seed`) wins even when the file does not exist yet, so a typo surfaces as a missing file. Otherwise the first that exists of `seed.ts`, `seed.js`, `seed.sql`, `turbine/seed.ts`, `turbine/seed.js`, `turbine/seed.sql`.
 
-## `configTemplate(connectionString?)`
+## `configTemplate(connectionString?, schema?)`
 
-Returns the `turbine.config.ts` source that `turbine init` writes. Pass a connection string to inline it, or omit it to get `url: process.env.DATABASE_URL`. `DEFAULT_INIT_SEED_FILE` is the seed path the template points at, kept next to the schema file so a new project's Turbine files live in one directory.
+Returns the `turbine.config.ts` source that `turbine init` writes, with `schema` defaulting to `'public'`. A connection string without a password is inlined. One with a password, or none, gives `url: process.env.DATABASE_URL`. `DEFAULT_INIT_SEED_FILE` is the seed path the template uses.
 
 ## See also
 
-- **[CLI](/cli)**: the `turbine` binary: every command and flag.
-- **[Seeding](/seeding)**: writing the seed file this module resolves.
-- **[Schema & Migrations](/schema)**: the `schemaFile` that `turbine push` reads.
+- **[CLI](/cli)**: every command and flag.
+- **[Seeding](/seeding)**: writing the seed file.
+- **[Schema](/schema)**: the `schemaFile` that `push` applies.

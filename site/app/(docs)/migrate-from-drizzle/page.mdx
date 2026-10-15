@@ -1,209 +1,25 @@
 export const metadata = {
   title: 'Migrating from Drizzle',
   description:
-    'Move from Drizzle ORM to Turbine ORM. API mapping, side-by-side examples, schema translation, and feature comparison.',
+    'Move a Drizzle app to Turbine ORM: generate a typed client, map the query API, translate the schema, and audit the behavior differences.',
   alternates: { canonical: '/migrate-from-drizzle' },
 };
 
 # Migrating from Drizzle
 
-Drizzle and Turbine both resolve a nested read in a single statement: Drizzle's relational queries compile to `LEFT JOIN LATERAL` plus JSON aggregation, Turbine's `with` compiles to correlated `json_agg` subqueries. The difference is the surface. Turbine is a Prisma-style typed API with schema-generated types (no `relations()` re-declaration), typed errors, a read-only-by-default Studio, PII enforced in the emitted SQL, and edge/serverless support with no config.
+Turbine replaces Drizzle's SQL-builder calls with a Prisma-style object API, and generates its types from the database instead of from `pgTable()` declarations. Both can load a nested `with` tree in one SQL statement.
 
-## API mapping
+## Steps
 
-| Drizzle | Turbine | Notes |
-|---|---|---|
-| `db.select().from(users)` | `db.users.findMany()` | Object-based API instead of SQL builder. |
-| `db.select().from(users).where(eq(users.id, 1))` | `db.users.findUnique({ where: { id: 1 } })` | No operator imports needed. |
-| `db.select().from(users).limit(10).offset(20)` | `db.users.findMany({ limit: 10, offset: 20 })` | Same semantics. |
-| `db.insert(users).values({ ... })` | `db.users.create({ data: { ... } })` | Returns the created row by default (RETURNING *). |
-| `db.insert(users).values([...]).onConflictDoNothing()` | `db.users.createMany({ data: [...], skipDuplicates: true })` | Bulk insert via UNNEST. |
-| `db.update(users).set({ ... }).where(eq(users.id, 1))` | `db.users.update({ where: { id: 1 }, data: { ... } })` | Supports atomic operators: `{ increment: 1 }`. |
-| `db.delete(users).where(eq(users.id, 1))` | `db.users.delete({ where: { id: 1 } })` | Returns deleted row. |
-| `db.query.users.findMany({ with: { posts: true } })` | `db.users.findMany({ with: { posts: true } })` | Nearly identical. |
-| `db.transaction(async (tx) => { ... })` | `db.$transaction(async (tx) => { ... })` | SAVEPOINTs for nesting, isolation levels. |
-| `sql\`SELECT ...\`` | `db.raw\`SELECT ...\`` | Tagged template SQL with type inference. |
+1. Install Turbine and generate a client from your existing database:
 
-## Schema translation
+   ```bash
+   npm install turbine-orm
+   npx turbine generate
+   ```
 
-Drizzle uses `pgTable()` with column helpers. Turbine uses `defineSchema()` with a declarative object.
+2. Create the client in place of `drizzle()`:
 
-```ts
-// Drizzle
-import { pgTable, serial, text, integer, boolean, timestamp } from 'drizzle-orm/pg-core';
-
-export const users = pgTable('users', {
-  id: serial('id').primaryKey(),
-  email: text('email').notNull().unique(),
-  name: text('name').notNull(),
-  createdAt: timestamp('created_at').defaultNow(),
-});
-
-export const posts = pgTable('posts', {
-  id: serial('id').primaryKey(),
-  userId: integer('user_id').notNull().references(() => users.id),
-  title: text('title').notNull(),
-  published: boolean('published').notNull().default(false),
-  viewCount: integer('view_count').notNull().default(0),
-  createdAt: timestamp('created_at').defaultNow(),
-});
-```
-
-```ts
-// Turbine
-import { defineSchema } from 'turbine-orm';
-
-export default defineSchema({
-  users: {
-    id: { type: 'serial', primaryKey: true },
-    email: { type: 'text', unique: true, notNull: true },
-    name: { type: 'text', notNull: true },
-    createdAt: { type: 'timestamp', default: 'now()' },
-  },
-  posts: {
-    id: { type: 'serial', primaryKey: true },
-    userId: { type: 'integer', notNull: true, references: 'users.id' },
-    title: { type: 'text', notNull: true },
-    published: { type: 'boolean', notNull: true, default: 'false' },
-    viewCount: { type: 'integer', notNull: true, default: '0' },
-    createdAt: { type: 'timestamp', default: 'now()' },
-  },
-});
-```
-
-Relations are inferred from foreign keys. No separate `relations()` declaration needed.
-
-## Side-by-side
-
-### Query with nested relations
-
-```ts
-// Drizzle (relational queries)
-const users = await db.query.users.findMany({
-  with: { posts: { limit: 5, orderBy: (posts, { desc }) => [desc(posts.createdAt)] } },
-  where: (users, { eq }) => eq(users.orgId, 1),
-  limit: 10,
-});
-```
-
-```ts
-// Turbine
-const users = await db.users.findMany({
-  where: { orgId: 1 },
-  with: { posts: { orderBy: { createdAt: 'desc' }, limit: 5 } },
-  limit: 10,
-});
-```
-
-Turbine's `with` generates a single SQL statement using `json_agg` subqueries. No N+1, no separate round-trips.
-
-### Filtering with operators
-
-```ts
-// Drizzle
-import { eq, gt, like, and } from 'drizzle-orm';
-
-const results = await db.select()
-  .from(users)
-  .where(and(gt(users.age, 18), like(users.name, '%smith%')));
-```
-
-```ts
-// Turbine, operators are object keys, no imports needed
-const results = await db.users.findMany({
-  where: { age: { gt: 18 }, name: { contains: 'smith' } },
-});
-```
-
-### Atomic update
-
-```ts
-// Drizzle
-import { sql } from 'drizzle-orm';
-
-await db.update(posts)
-  .set({ viewCount: sql`${posts.viewCount} + 1` })
-  .where(eq(posts.id, 42));
-```
-
-```ts
-// Turbine, first-class operator syntax
-await db.posts.update({
-  where: { id: 42 },
-  data: { viewCount: { increment: 1 } },
-});
-```
-
-### Upsert
-
-```ts
-// Drizzle
-await db.insert(users)
-  .values({ email: 'a@b.c', name: 'A' })
-  .onConflictDoUpdate({
-    target: users.email,
-    set: { name: 'A' },
-  });
-```
-
-```ts
-// Turbine
-await db.users.upsert({
-  where: { email: 'a@b.c' },
-  create: { email: 'a@b.c', name: 'A' },
-  update: { name: 'A' },
-});
-```
-
-### Transaction with nesting
-
-```ts
-// Drizzle
-await db.transaction(async (tx) => {
-  const user = await tx.insert(users).values({ email: 'a@b.c', name: 'A' }).returning();
-  await tx.insert(posts).values({ userId: user[0].id, title: 'Hi' });
-});
-```
-
-```ts
-// Turbine, nested transactions use SAVEPOINTs automatically
-await db.$transaction(async (tx) => {
-  const user = await tx.users.create({ data: { email: 'a@b.c', name: 'A' } });
-  await tx.posts.create({ data: { userId: user.id, title: 'Hi' } });
-});
-```
-
-## What Turbine adds over Drizzle
-
-| Feature | Drizzle | Turbine |
-|---|---|---|
-| Single-query nested relations | Yes, relational queries (RQBv2) | Yes, via `json_agg`, typed and date-coerced at any depth |
-| Typed errors with codes | Generic Error (raw pg errors) | Typed error classes (`TURBINE_E001`-`E020`) with SQLSTATE mapping |
-| Optimistic locking | Manual | Built-in `optimisticLock: { field, expected }` |
-| Retry with backoff | Manual | `withRetry()` + `isRetryable` errors |
-| Full-text search | Raw SQL | `{ search: 'query' }` operator |
-| Edge/serverless | Separate driver packages | `turbineHttp(pool, SCHEMA)`, any pg-compatible pool |
-| Relation filters | Manual subquery | `where: { posts: { some: { published: true } } }` |
-| Pipeline batching | N/A | Multiple queries in one round-trip |
-| Schema introspection | External tools | `npx turbine pull` → full metadata |
-| Down migrations | None, `drizzle-kit drop` removed in v1 | SQL `-- DOWN` sections, checksummed |
-| Local Studio UI | Drizzle Studio (free, closed source) | `npx turbine studio` (free, read-only, MIT) |
-| Runtime deps | 0 (pg adapter separate) | 1 (`pg`) |
-| Select/omit type narrowing | Yes (via `.select()`) | Yes (via `select`/`omit` args) |
-| Empty-where guard | No protection | Rejects `{}` unless [`allowFullTableScan: UNSAFE`](/global-filters#privilege-options-and-the-unsafe-symbol) |
-
-## What you'll lose
-
-- **SQL-like syntax.** If you prefer `select().from().where()` chaining, Turbine's object API is a style change.
-- **First-class multi-database support.** Drizzle treats MySQL, SQLite, and Postgres as peers. Turbine is Postgres-first: SQLite, MySQL 8, SQL Server, and PowDB ship behind subpath exports (`turbine-orm/sqlite`, `/mysql`, `/mssql`, `/powdb`) with the same typed query API, but a handful of query features throw a typed `UnsupportedFeatureError` there (pgvector, LISTEN/NOTIFY, RLS session context), and the schema tooling (`turbine generate` / `push` / `migrate`, `doctor`) targets Postgres, so the other engines are code-first via `defineSchema`. See [What is actually Postgres-only](/engines#what-is-actually-postgres-only).
-- **`$inferSelect` / `$inferInsert`.** Turbine generates types from introspection instead of inferring from schema definitions. Run `npx turbine generate` after schema changes.
-
-## Migration checklist
-
-1. `npm install turbine-orm && npm uninstall drizzle-orm @drizzle-team/drizzle-kit`
-2. Convert your `schema.ts` from `pgTable()` calls to `defineSchema()`, or run `npx turbine pull` against your live database.
-3. `npx turbine generate`, writes `./generated/turbine/{types,metadata,index}.ts`.
-4. Replace your Drizzle client:
    ```ts
    // Before
    import { drizzle } from 'drizzle-orm/node-postgres';
@@ -213,21 +29,109 @@ await db.$transaction(async (tx) => {
    import { turbine } from './generated/turbine/index.js';
    const db = turbine({ connectionString: process.env.DATABASE_URL });
    ```
-5. Convert queries:
-   - `db.select().from(table).where(...)` → `db.table.findMany({ where: { ... } })`
-   - `db.insert(table).values(...)` → `db.table.create({ data: { ... } })`
-   - `db.update(table).set(...).where(...)` → `db.table.update({ where: { ... }, data: { ... } })`
-   - `db.delete(table).where(...)` → `db.table.delete({ where: { ... } })`
-   - `db.query.table.findMany({ with: ... })` → `db.table.findMany({ with: ... })` (nearly identical)
-6. Remove operator imports (`eq`, `gt`, `like`, etc.), Turbine uses object keys.
-7. Replace raw SQL: `sql\`...\`` → `db.raw\`...\``.
-8. Add error handling for typed errors (optional, they still extend `Error`).
-9. Delete `drizzle.config.ts` and the `drizzle/` migrations directory once stable.
+
+3. Convert queries with the [API mapping](#api-mapping) below. Operators become object keys, so the `eq`, `gt` and `like` imports go away.
+4. Run `npx turbine doctor` and add the foreign-key indexes it reports. Nested reads probe the child table once per parent row, so an unindexed foreign key gets expensive.
+5. Audit the [behavior differences](#behavior-differences-to-audit).
+6. Once nothing imports Drizzle, uninstall `drizzle-orm` and `drizzle-kit`. Keep `drizzle/` until your [migrations](/migrate) take over.
+
+## API mapping
+
+| Drizzle | Turbine |
+|---|---|
+| `db.select().from(users)` | `db.users.findMany()` |
+| `db.select().from(users).where(eq(users.id, 1))` | `db.users.findUnique({ where: { id: 1 } })` |
+| `.limit(10).offset(20)` | `findMany({ limit: 10, offset: 20 })` |
+| `db.query.users.findMany({ with: { posts: true } })` | `db.users.findMany({ with: { posts: true } })` |
+| `db.insert(users).values({ ... })` | `db.users.create({ data: { ... } })`, returns the row |
+| `db.insert(users).values([...]).onConflictDoNothing()` | `db.users.createMany({ data: [...], skipDuplicates: true })` |
+| `.onConflictDoUpdate({ target, set })` | `db.users.upsert({ where, create, update })` |
+| `db.update(users).set({ ... }).where(...)` | `db.users.update({ where: { ... }, data: { ... } })` |
+| `db.delete(users).where(...)` | `db.users.delete({ where: { ... } })`, returns the row |
+| `db.transaction(async (tx) => ...)` | `db.$transaction(async (tx) => ...)` |
+| ``sql`SELECT ...` `` | ``db.raw`SELECT ...` ``, or ``db.sql<Row>`...` `` for typed rows |
+
+### Filters and updates
+
+```ts
+// Drizzle
+await db.select().from(users).where(and(gt(users.age, 18), like(users.name, '%smith%')));
+await db.update(posts).set({ viewCount: sql`${posts.viewCount} + 1` }).where(eq(posts.id, 42));
+```
+
+```ts
+// Turbine
+await db.users.findMany({ where: { age: { gt: 18 }, name: { contains: 'smith' } } });
+await db.posts.update({ where: { id: 42 }, data: { viewCount: { increment: 1 } } });
+```
+
+### Nested reads
+
+```ts
+// Drizzle
+const users = await db.query.users.findMany({
+  where: (users, { eq }) => eq(users.orgId, 1),
+  with: { posts: { limit: 5, orderBy: (posts, { desc }) => [desc(posts.createdAt)] } },
+});
+```
+
+```ts
+// Turbine
+const users = await db.users.findMany({
+  where: { orgId: 1 },
+  with: { posts: { orderBy: { createdAt: 'desc' }, limit: 5 } },
+});
+```
+
+Relations come from foreign keys, so there is no `relations()` declaration to port.
+
+## Schema translation
+
+On an existing database, `turbine generate` reads the schema, so you do not need to translate anything. For a code-first schema, `pgTable()` becomes a [`defineSchema()`](/schema) table:
+
+```ts
+// Drizzle
+export const posts = pgTable('posts', {
+  id: serial('id').primaryKey(),
+  userId: integer('user_id').notNull().references(() => users.id),
+  title: text('title').notNull(),
+  published: boolean('published').notNull().default(false),
+});
+```
+
+```ts
+// Turbine
+import { defineSchema } from 'turbine-orm';
+
+export default defineSchema({
+  posts: {
+    id: { type: 'serial', primaryKey: true },
+    userId: { type: 'integer', notNull: true, references: 'users.id' },
+    title: { type: 'text', notNull: true },
+    published: { type: 'boolean', notNull: true, default: false },
+  },
+});
+```
+
+Field names are camelCase and become snake_case columns. Turbine's `type: 'timestamp'` creates `TIMESTAMPTZ`, while Drizzle's `timestamp()` is zone-less, so introspect an existing database rather than retyping those columns.
+
+## Behavior differences to audit
+
+- **Empty `where` on a write throws.** `update`, `updateMany`, `delete` and `deleteMany` with an empty `where` throw `ValidationError` ([E003](/errors#e003)) unless you pass [`allowFullTableScan: UNSAFE`](/global-filters#privilege-options-and-the-unsafe-symbol).
+- **Zone-less `timestamp` and `date` columns read as UTC**, whatever the process's time zone. See [Zone-less columns](/schema#zone-less-columns-timestamp-and-date-read-as-utc).
+- **`numeric` reads as a `string`, `int8` as a `number`**, or a `string` above `Number.MAX_SAFE_INTEGER`.
+- **Relation arrays have no guaranteed order.** Add `orderBy` inside `with` when order matters.
+- **Errors are typed.** Constraint violations throw classes such as `UniqueConstraintError` ([E008](/errors#e008)). They extend `Error`, so existing handlers still catch them.
+
+## What you give up
+
+- **SQL-shaped queries.** There is no `select().from().join()` chain. Use [`db.sql`](/raw-sql#typed-raw-sql-dbsqlt) for queries the object API does not express.
+- **Equal footing across databases.** Turbine is PostgreSQL-first. SQLite, MySQL, SQL Server and PowDB share the query API, but some features are PostgreSQL-only and the schema CLI targets PostgreSQL. See [What is actually Postgres-only](/engines#what-is-actually-postgres-only).
+- **Types inferred from the schema file.** There is no `$inferSelect`. Rerun `npx turbine generate` after each schema change.
 
 ## See also
 
-- **[Quickstart](/quickstart)**, 5-minute setup guide.
-- **[Schema & Migrations](/schema)**, `defineSchema`, DDL, introspection.
-- **[Relations](/relations)**, one-to-many, many-to-many, nested queries.
-- **[Typed Errors](/errors)**, full hierarchy with SQLSTATE mapping.
-- **[Benchmarks](/benchmarks)**, Performance comparison vs Prisma and Drizzle.
+- [Quick Start](/quickstart): set up a project from scratch.
+- [Reading and writing](/queries) and [Filtering and sorting](/filtering): every query method, operator and option.
+- [Relations](/relations): nested reads and relation filters.
+- [Migrations](/migrate): the production migration workflow.

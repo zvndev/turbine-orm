@@ -1,19 +1,19 @@
 export const metadata = {
   title: 'Optimistic Locking',
   description:
-    'Prevent lost updates in Turbine ORM with optimistic concurrency control: a version column, the optimisticLock update option, and the OptimisticLockError (E015) thrown when a row changed under you.',
+    'Prevent lost updates with a version column and the optimisticLock update option, which throws OptimisticLockError when the row changed after you read it.',
   alternates: { canonical: '/optimistic-locking' },
 };
 
 # Optimistic Locking
 
-Optimistic locking lets concurrent writers detect a *lost update* without holding a row lock. You read a row (capturing its version), then write back asserting the version is unchanged. If someone else committed in between, your update matches zero rows and Turbine throws `OptimisticLockError`.
+Optimistic locking catches a lost update without holding a lock. You read a row with its version, then write back only if the version is unchanged. If someone else wrote in between, Turbine throws `OptimisticLockError`.
 
-It's "optimistic" because nothing is locked: you bet that conflicts are rare and pay only when one happens. Pessimistic `SELECT ... FOR UPDATE` is the opposite, serializing writers up front.
+Use it when conflicts are rare. For a lock held during a transaction, see [Row locks](/queries#row-locks).
 
 ## The version column
 
-Add an integer column that increments on every update. The convention is `version`, defaulting to `0`.
+Add an integer column, conventionally `version`, defaulting to `0`:
 
 ```ts
 // schema.ts
@@ -34,7 +34,7 @@ ALTER TABLE posts ADD COLUMN version integer NOT NULL DEFAULT 0;
 
 ## The `optimisticLock` option
 
-Pass `optimisticLock: { field, expected }` to `update`. `field` is the version column name; `expected` is the version you read.
+Pass `optimisticLock: { field, expected }` to `update`, where `expected` is the version you read:
 
 ```ts
 const post = await db.posts.findUniqueOrThrow({ where: { id: 1 } });
@@ -46,7 +46,7 @@ await db.posts.update({
 });
 ```
 
-Turbine adds the version check to the `WHERE` clause and auto-increments the column in the same statement:
+Turbine checks the version and increments it in the same statement:
 
 ```sql
 UPDATE posts SET title = $1, version = version + 1
@@ -54,11 +54,11 @@ WHERE id = $2 AND version = $3
 RETURNING *
 ```
 
-If another writer bumped `version` after you read it, the `version = $3` predicate fails, no row is updated, and Turbine raises `OptimisticLockError` instead of silently doing nothing.
+If another writer bumped `version` after your read, no row matches and Turbine throws `OptimisticLockError`.
 
 ### `update` only
 
-`optimisticLock` is an `update` option. Passing it to `updateMany` or `upsert` throws `ValidationError` ([`TURBINE_E003`](/errors#e003)). Before 0.90 both ignored it, so a stale write went through with no error, the one outcome the option exists to prevent. The message names the equivalent:
+Passing `optimisticLock` to `updateMany`, `upsert`, `delete` or `deleteMany` throws `ValidationError` ([E003](/errors#e003)). Use these instead:
 
 ```ts
 // updateMany: put the expected version in `where` and bump it in `data`.
@@ -79,11 +79,11 @@ await db.$transaction(async (tx) => {
 });
 ```
 
-The `upsert` refusal holds whatever the call carries. An `upsert` whose `create` or `update` includes nested relation data takes another code path, and before 0.90 that path skipped the check. It now throws the same `TURBINE_E003` before anything is read or written.
+For `delete`, put the version in `where` (`where: { id, version: expected }`): a row at another version is not deleted, and the call throws `NotFoundError` ([E001](/errors#e001)). For `deleteMany`, the returned count is the rows still at that version.
 
 ## Handling a conflict
 
-`OptimisticLockError` is `TURBINE_E015`. It carries the `table`, the `versionField`, and the `expectedVersion` you supplied. Under the default `errorMessages: 'safe'` the message names the version field but not the value you sent (a version can be a timestamp or any stored cell, so it is treated like one); the value stays on `.expectedVersion` and `.detail` in both modes.
+`OptimisticLockError` ([E015](/errors#e015)) carries `table`, `versionField` and `expectedVersion`. Under the default `errorMessages: 'safe'`, the message leaves out the value you sent; read it from `.expectedVersion`.
 
 ```ts
 import { OptimisticLockError } from 'turbine-orm';
@@ -107,9 +107,7 @@ try {
 
 ### Not auto-retryable
 
-Unlike `DeadlockError` and `SerializationFailureError`, `OptimisticLockError` does **not** carry an `isRetryable` flag. That's deliberate: resolving a version conflict means the underlying data changed, so you can't blindly replay the same statement. You have to re-read the current row and decide whether your change still makes sense.
-
-A re-read-then-retry helper makes that explicit:
+`OptimisticLockError` has no `isRetryable` flag, so `withRetry` does not retry it. The data changed, so replaying the same statement would be wrong. Re-read the row and decide whether your change still applies:
 
 ```ts
 import { OptimisticLockError } from 'turbine-orm';
@@ -131,14 +129,11 @@ async function patchPost(id: number, patch: { title?: string }, maxAttempts = 3)
 }
 ```
 
-For a user-facing edit form, prefer surfacing the conflict (HTTP `409`) so the human can re-review the latest data, rather than silently overwriting it.
+For an edit form, return the conflict (HTTP `409`) so the person sees the latest data.
 
 ## Optimistic locking vs atomic operators
 
-These solve different problems:
-
-- **Atomic update operators** (`{ increment: 1 }`, `{ decrement: 1 }`, …) compute the new value from the current column inside the `UPDATE`, so concurrent `+1`s never lose each other. Use them for counters and balances where you don't care what the previous value *was*.
-- **Optimistic locking** guards a *read-modify-write* where the new value depends on what the user saw. Use it for edit forms and any update computed in application code from a value you read earlier.
+Atomic operators (`increment`, `decrement`, ...) compute the new value inside the `UPDATE`, so concurrent counters never cancel out. Optimistic locking guards a read-modify-write, where the new value depends on what you read.
 
 ```ts
 // Atomic, no lock needed, both increments land:
@@ -155,6 +150,6 @@ await db.posts.update({
 
 ## See also
 
-- **[Transactions & Pipelines](/transactions)**, `SerializationFailureError` and `DeadlockError`, the *retryable* concurrency errors.
-- **[Typed Errors](/errors)**, the full error table, including `OptimisticLockError` (E015).
-- **[API Reference](/queries)**, `update`, atomic operators, and the rest of the write surface.
+- [Transactions](/transactions#retryable-errors): the retryable concurrency errors.
+- [Typed errors](/errors#e015): `OptimisticLockError`.
+- [Reading and writing](/queries): `update` and atomic operators.

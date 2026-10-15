@@ -8,9 +8,9 @@ import type { ComponentPropsWithoutRef, ReactNode } from 'react';
 type CalloutType = 'note' | 'warning' | 'tip';
 
 const CALLOUT_STYLES: Record<CalloutType, { accent: string; tint: string; label: string }> = {
-  note: { accent: '#60A5FA', tint: 'rgba(96, 165, 250, 0.08)', label: 'Note' },
-  warning: { accent: '#F59E0B', tint: 'rgba(245, 158, 11, 0.08)', label: 'Warning' },
-  tip: { accent: '#34D399', tint: 'rgba(52, 211, 153, 0.08)', label: 'Tip' },
+  note: { accent: '#7d9cc9', tint: 'rgba(125, 156, 201, 0.07)', label: 'Note' },
+  warning: { accent: '#ff9f43', tint: 'rgba(255, 159, 67, 0.07)', label: 'Warning' },
+  tip: { accent: '#3ddc84', tint: 'rgba(61, 220, 132, 0.06)', label: 'Tip' },
 };
 
 /**
@@ -36,26 +36,29 @@ export function Callout({
   return (
     <aside
       style={{
-        margin: '1.5rem 0',
-        padding: '0.9rem 1.1rem',
-        borderLeft: `3px solid ${style.accent}`,
-        borderRadius: '0 8px 8px 0',
-        background: style.tint,
+        margin: '1.75rem 0',
+        padding: '0.95rem 1.15rem 1rem',
+        borderLeft: `2px solid ${style.accent}`,
+        background: `linear-gradient(90deg, ${style.tint}, rgba(9, 12, 18, 0.4))`,
+        boxShadow: 'inset 0 0 0 1px rgba(26, 32, 48, 0.9)',
       }}
     >
       <p
         style={{
-          margin: '0 0 0.35rem',
-          fontSize: '0.72rem',
+          margin: '0 0 0.4rem',
+          fontFamily: 'var(--font-mono)',
+          fontSize: '0.7rem',
           fontWeight: 600,
-          letterSpacing: '0.06em',
+          letterSpacing: '0.14em',
           textTransform: 'uppercase',
           color: style.accent,
         }}
       >
         {title ?? style.label}
       </p>
-      <div style={{ fontSize: '0.92rem', lineHeight: 1.7 }}>{children}</div>
+      <div className="callout-body" style={{ fontSize: '0.95rem', lineHeight: 1.7 }}>
+        {children}
+      </div>
     </aside>
   );
 }
