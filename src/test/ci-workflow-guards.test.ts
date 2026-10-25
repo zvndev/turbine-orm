@@ -16,9 +16,11 @@
  *      `TURBINE_REQUIRE_ENGINE` passes when the URL is wrong, because every
  *      database test skips and a skipped suite exits 0.
  *   6. benchmarks.yml measures, it does not gate. A `pull_request` or `push`
- *      trigger would queue every change behind the dedicated benchmark
- *      runner, and listing it in gates.yml would make a noisy timing a
- *      required check.
+ *      trigger would spend a 90-minute round on every change, and listing it
+ *      in gates.yml would make a noisy timing a required check.
+ *   7. This is a public repository, so every job runs on GitHub's free
+ *      standard hosted runners. A self-hosted label (ZVN's grandprix pool) or
+ *      a Depot one would hand any fork's code a machine ZVN pays for.
  *
  * A line parser, like its sibling, and every extraction asserts it found
  * something, so a layout change fails here instead of passing over nothing.
@@ -232,11 +234,11 @@ describe('benchmarks.yml: a dispatch-only measurement, never a gate', () => {
     assert.deepEqual(triggers, ['workflow_dispatch']);
   });
 
-  it('runs on the dedicated benchmark runner with read-only contents', () => {
+  it('runs on a GitHub-hosted standard runner with read-only contents', () => {
     const jobs = jobsOf(lines);
     assert.ok(jobs.size > 0);
     for (const [name, job] of jobs) {
-      assert.ok(job.includes('    runs-on: grandprix-4x16'), `benchmarks.yml job ${name} is not on grandprix-4x16`);
+      assert.ok(job.includes('    runs-on: ubuntu-latest'), `benchmarks.yml job ${name} is not on ubuntu-latest`);
     }
     assert.equal(
       lines.slice(lines.indexOf('permissions:'), lines.indexOf('permissions:') + 2).join('\n'),
@@ -248,5 +250,26 @@ describe('benchmarks.yml: a dispatch-only measurement, never a gate', () => {
     for (const file of ['ci.yml', 'gates.yml', 'release.yml']) {
       assert.ok(!workflow(file).some((l) => l.includes('benchmarks.yml')), `${file} references benchmarks.yml`);
     }
+  });
+});
+
+describe('a public repository: no workflow runs on a self-hosted or paid runner', () => {
+  const files = ['ci.yml', 'gates.yml', 'release.yml', 'nightly.yml', 'codeql.yml', 'benchmarks.yml'];
+  const runsOn = files.flatMap((file) =>
+    workflow(file)
+      .filter((l) => /^\s+runs-on:/.test(l))
+      .map((l) => `${file}: ${l.trim()}`),
+  );
+
+  it('found the runs-on lines (anti-vacuous)', () => {
+    assert.ok(runsOn.length >= files.length, `only ${runsOn.length} runs-on lines parsed`);
+  });
+
+  it('none names grandprix, Depot or self-hosted', () => {
+    assert.deepEqual(
+      runsOn.filter((l) => /grandprix|depot|self-hosted/i.test(l)),
+      [],
+      'public repositories run on GitHub-hosted standard runners only',
+    );
   });
 });

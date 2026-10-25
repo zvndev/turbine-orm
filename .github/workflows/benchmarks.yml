@@ -1,8 +1,8 @@
 name: Benchmarks
 
-# One full benchmark round on a quiet, dedicated machine, producing the site's
+# One full benchmark round on a GitHub-hosted runner, producing the site's
 # results file as an artifact. Every release's published numbers should come
-# from this job, so that they all come from the same hardware by one command:
+# from this job, so that they all come from the same runner class by one command:
 #
 #   gh workflow run benchmarks.yml
 #   gh workflow run benchmarks.yml -f ref=v0.91.0
@@ -36,9 +36,12 @@ jobs:
     # A full round takes about 25 minutes on a laptop, plus install, seed and
     # the quiet-machine gate before every run.
     timeout-minutes: 90
-    # Self-hosted Firecracker VMs on a dedicated host. The runner's trust policy
-    # decides who may dispatch onto it.
-    runs-on: grandprix-4x16
+    # GitHub's standard hosted runner: free for a public repository, and 4 vCPU /
+    # 16 GB here. Not a larger runner (those are billed) and never ZVN's
+    # self-hosted grandprix pool, which public repositories must not use.
+    # Hosted VMs vary in CPU model from run to run, so compare ratios within a
+    # round, never absolute numbers across rounds.
+    runs-on: ubuntu-latest
     env:
       PGSOCK_DIR: /tmp/pgsock
       PG_CONTAINER: turbine-bench-pg
@@ -47,9 +50,9 @@ jobs:
       DATABASE_URL: postgresql://postgres@/turbine_bench?host=/tmp/pgsock
       OUT_DIR: ${{ github.workspace }}/bench-round
       QUICK: ${{ inputs.quick && '1' || '0' }}
-      # The VM's /proc/cpuinfo names a generic CPU rather than the host's, so the
-      # description is stated here. Keep it in step with the runner label above.
-      BENCH_MACHINE: AMD Ryzen 9 7950X host, 4-vCPU 16 GB Firecracker VM, client and PostgreSQL 17 (Docker) on the same VM over a Unix socket
+      # build-results.ts reads the CPU model, CPU count and memory from the VM
+      # itself (hosted runners differ run to run); this note is appended to it.
+      BENCH_MACHINE_NOTE: GitHub-hosted ubuntu-latest runner, client and PostgreSQL 17 (Docker) on the same VM over a Unix socket
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
