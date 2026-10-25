@@ -34,9 +34,10 @@ measuring again.
 
 ## On the benchmark runner
 
-The `Benchmarks` workflow runs a full round on a dedicated self-hosted runner,
-with PostgreSQL 17 in Docker on the same VM, reached over a Unix socket. It only
-runs when dispatched:
+The `Benchmarks` workflow runs a full round on a GitHub-hosted `ubuntu-latest`
+runner, with PostgreSQL 17 in Docker on the same VM, reached over a Unix socket.
+Hosted VMs differ in CPU model from run to run, so compare ratios within a round.
+It only runs when dispatched:
 
 ```bash
 gh workflow run benchmarks.yml                     # this commit

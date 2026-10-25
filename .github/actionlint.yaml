@@ -1,5 +1,0 @@
-# actionlint configuration. The self-hosted runner label used by benchmarks.yml,
-# so a lint of the workflows does not report it as unknown.
-self-hosted-runner:
-  labels:
-    - grandprix-4x16
