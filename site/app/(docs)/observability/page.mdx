@@ -297,7 +297,7 @@ It binds `127.0.0.1:4984` and reads metrics only, never your application databas
 
 ## Tracing channel, `turbine:query`
 
-Every statement that emits a query event is also published on the Node [`diagnostics_channel`](https://nodejs.org/api/diagnostics_channel.html#class-tracingchannel) tracing channel `turbine:query`. A tracer or APM agent subscribes to the channel by name, so it sees Turbine queries without a client handed to it and without a `$on` listener.
+Every statement Turbine sends is published on the Node [`diagnostics_channel`](https://nodejs.org/api/diagnostics_channel.html#class-tracingchannel) tracing channel `turbine:query`. A tracer or APM agent subscribes to the channel by name, so it sees Turbine queries without a client handed to it and without a `$on` listener.
 
 ```ts
 import diagnostics_channel from 'node:diagnostics_channel';
@@ -322,8 +322,8 @@ diagnostics_channel.tracingChannel<string, QueryChannelContext>('turbine:query')
 
 ```ts
 interface QueryChannelContext {
-  model: string;        // the table, or '$raw' for raw SQL
-  operation: string;    // findMany, create, raw, $queryRaw ...
+  model: string;        // the table, or '$raw' for raw SQL and transaction control
+  operation: string;    // findMany, create, raw, $queryRaw ..., or '$transaction'
   sql: string;          // the parametrized text, without the sqlComment
   paramCount: number;   // how many values were bound
   rowCount?: number;    // set before asyncStart
@@ -334,10 +334,10 @@ interface QueryChannelContext {
 }
 ```
 
-- **No values.** The context never carries a bound parameter or a result row. `sql` has placeholders (`$1`, `$2`), except with [`db.rawUnsafe`](/queries), where you write the text.
+- **No values.** The context never carries a bound parameter, a result row or a connection string. `sql` has placeholders (`$1`, `$2`), except with [`db.rawUnsafe`](/queries), where you write the text. `error` is the error your code receives, and a database error message can quote data (a unique violation names the duplicate key), so record its `name` or `code` rather than its message.
 - **Lifecycle.** `start` and `end` fire when the statement is handed to the driver, then `error` on failure, `asyncStart` and `asyncEnd` when it settles. All five get the same object, so key your state on it. Every `start` gets its `asyncEnd`, including pipeline statements that never ran because an earlier one failed.
 - **Parent span.** `start` runs in the async context of the code that issued the query, so the span active there is the parent. Turbine publishes the events directly rather than through `tracePromise`, which would put the driver result on the context, so stores bound with `bindStore` are not entered: read your context in `start`.
-- **Coverage.** The same statements as [query events](#what-emits-an-event): model methods (nested `with` reads are one statement), raw and typed SQL, statements inside `$transaction`, pipelines and batch transactions. `BEGIN`, `COMMIT` and savepoints are not published.
+- **Coverage.** The statements [query events](#what-emits-an-event) report: model methods (nested `with` reads are one statement), raw and typed SQL, statements inside `$transaction`, pipelines and batch transactions. The channel also carries what query events leave out: the `BEGIN`, `COMMIT`, `ROLLBACK`, savepoint and `sessionContext` statements Turbine sends for a transaction, with `model: '$raw'` and `operation: '$transaction'`, and `db.$notify` as `operation: '$notify'`. A `COMMIT` the server answered with a rollback is published as failed. Not published: connection checks (`connect`, `$ping`), the cursor statements (`DECLARE`, `FETCH`, `CLOSE`) a stream sends once it outgrows its first read, statements you send on the driver client that `transaction()` or `$connection()` hands you, and the CLI (migrations, introspection).
 - **Cost.** Without a subscriber, each statement costs one `hasSubscribers` check and builds nothing. The channel name is exported as `QUERY_CHANNEL`.
 - **Runtimes.** The channel is found through `process.getBuiltinModule`, so it is published on Node 20.16, 22.3 and later. Edge runtimes and older Node versions publish nothing, and the edge entry imports no Node builtin for it.
 

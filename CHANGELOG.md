@@ -13,8 +13,12 @@ application. No query changes its SQL or its result.
   `diagnostics_channel.tracingChannel('turbine:query')`, with
   `{ model, operation, sql, paramCount, rowCount, durationMs, error? }` plus
   `batch` and `retried` where they apply. `sql` is the parametrized text and
-  the context never carries a bound value or a result row. `start` runs in the
-  caller's async context, so the span active there becomes the parent. It
+  the context never carries a bound value or a result row. The transaction
+  control Turbine sends (`BEGIN`, `COMMIT`, `ROLLBACK`, savepoints,
+  `sessionContext` settings) is published too, as `model: '$raw'`,
+  `operation: '$transaction'`, and `db.$notify` as `operation: '$notify'`.
+  `start` runs in the caller's async context, so the span active there
+  becomes the parent. It
   covers model methods (nested `with` reads included), raw and typed SQL,
   statements inside `$transaction`, pipelines and batch transactions, and
   works without a `$on` listener. Without a subscriber a statement costs one
