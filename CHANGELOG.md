@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+Every statement is published on a Node `diagnostics_channel` tracing
+channel, so a tracer or APM agent sees Turbine queries with no setup in the
+application. No query changes its SQL or its result.
+
+### Added
+
+- **The `turbine:query` tracing channel.** Each statement that emits a
+  `$on('query')` event is also published on
+  `diagnostics_channel.tracingChannel('turbine:query')`, with
+  `{ model, operation, sql, paramCount, rowCount, durationMs, error? }` plus
+  `batch` and `retried` where they apply. `sql` is the parametrized text and
+  the context never carries a bound value or a result row. The transaction
+  control Turbine sends (`BEGIN`, `COMMIT`, `ROLLBACK`, savepoints,
+  `sessionContext` settings) is published too, as `model: '$raw'`,
+  `operation: '$transaction'`, and `db.$notify` as `operation: '$notify'`.
+  `start` runs in the caller's async context, so the span active there
+  becomes the parent. It
+  covers model methods (nested `with` reads included), raw and typed SQL,
+  statements inside `$transaction`, pipelines and batch transactions, and
+  works without a `$on` listener. Without a subscriber a statement costs one
+  `hasSubscribers` check. The name is exported as `QUERY_CHANNEL` and the
+  context type as `QueryChannelContext`. Published on Node 20.16, 22.3 and
+  later; edge runtimes publish nothing and the edge entry imports no new
+  builtin.
+
 ## 0.92.0 (2026-10-15)
 
 Nested reads are faster, and four CLI fixes. A `findMany` with a `with`

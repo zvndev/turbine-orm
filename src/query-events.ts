@@ -32,6 +32,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { ValidationError } from './errors.js';
 import type { QueryEvent } from './query/deferred.js';
+import { settleQueryTrace, startQueryTrace } from './query-channel.js';
 
 /**
  * The `model` reported for statements that are not tied to one table: `raw`,
@@ -130,14 +131,17 @@ export async function runReportedStatement<R extends { rowCount?: number | null;
   run: () => Promise<R>,
   wrap: (err: unknown) => unknown,
 ): Promise<R> {
+  const trace = startQueryTrace(identity.model, identity.action, sql, params.length, identity.batch);
   const start = performance.now();
   const report = (rows: number, error?: Error): void => {
+    const duration = performance.now() - start;
+    settleQueryTrace(trace, rows, duration, error);
     if (!sink) return;
     emitStatementEvent(sink, {
       ...identity,
       sql,
       params,
-      duration: performance.now() - start,
+      duration,
       rows,
       ...(error === undefined ? {} : { error }),
     });
