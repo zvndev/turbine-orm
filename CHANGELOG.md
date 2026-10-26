@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.93.0 (2026-10-26)
 
 Every statement is published on a Node `diagnostics_channel` tracing
 channel, so a tracer or APM agent sees Turbine queries with no setup in the

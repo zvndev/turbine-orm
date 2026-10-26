@@ -16,6 +16,7 @@ const TAGLINE_OVERRIDES: Record<string, string> = {
   '0.90.2': 'Patch: createMany 10x less JavaScript, transactions reuse their SQL, more prepared statements',
   '0.91.0': 'Count-only createMany, percentiles of expressions, SQLite bulk inserts 70 to 140x faster',
   '0.92.0': 'Nested reads decode in one pass: users with posts 27% faster',
+  '0.93.0': 'Every query on the turbine:query tracing channel, ready for any tracer',
 };
 
 /** The tagline shown in the landing hero badge. */
