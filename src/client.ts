@@ -85,7 +85,13 @@ import {
   warnParserOverwrite,
 } from './query/utils.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
-import { queryChannelActive, settleQueryTrace, startQueryTrace } from './query-channel.js';
+import {
+  queryChannelActive,
+  settleQueryTrace,
+  startQueryTrace,
+  TRANSACTION_CONTROL_OPERATION,
+  traceStatement,
+} from './query-channel.js';
 import {
   currentQueryTag,
   deferredIdentity,
@@ -1238,11 +1244,13 @@ const ISOLATION_LEVELS: Record<string, string> = Object.assign(Object.create(nul
  * that are the main reason to run SERIALIZABLE at all.
  */
 async function runTxControl(client: PgCompatPoolClient, sql: string, params?: unknown[]): Promise<void> {
-  try {
-    await client.query(sql, params);
-  } catch (err) {
-    throw wrapPgError(err);
-  }
+  await traceStatement(TRANSACTION_CONTROL_OPERATION, sql, params?.length ?? 0, async () => {
+    try {
+      await client.query(sql, params);
+    } catch (err) {
+      throw wrapPgError(err);
+    }
+  });
 }
 
 /**
@@ -1448,6 +1456,15 @@ async function applySessionSetting(
   client: PgCompatPoolClient,
   setting: { name: string; sql: string; params: unknown[] },
 ): Promise<void> {
+  await traceStatement(TRANSACTION_CONTROL_OPERATION, setting.sql, setting.params.length, () =>
+    sendSessionSetting(client, setting),
+  );
+}
+
+async function sendSessionSetting(
+  client: PgCompatPoolClient,
+  setting: { name: string; sql: string; params: unknown[] },
+): Promise<void> {
   try {
     await client.query(setting.sql, setting.params);
   } catch (err) {
@@ -1543,7 +1560,8 @@ async function rollbackOnServer(
     if (!(await state.whenIdle(TX_ABORT_GRACE_MS))) return false;
   }
   let failed = false;
-  const rollback = client.query(dialect.rollbackStatement()).catch(() => {
+  const sql = dialect.rollbackStatement();
+  const rollback = traceStatement(TRANSACTION_CONTROL_OPERATION, sql, 0, () => client.query(sql)).catch(() => {
     failed = true;
   });
   return (await settlesWithin(rollback, TX_ABORT_GRACE_MS)) && !failed;
@@ -4228,11 +4246,14 @@ export class TurbineClient {
     if (this.logging) {
       logTo(this.logger, 'debug', `NOTIFY ${channel}`, { code: 'notify', channel });
     }
-    try {
-      await this.pool.query('SELECT pg_notify($1, $2)', [channel, payload ?? '']);
-    } catch (err) {
-      throw wrapPgError(err);
-    }
+    const sql = 'SELECT pg_notify($1, $2)';
+    await traceStatement('$notify', sql, 2, async () => {
+      try {
+        return await this.pool.query(sql, [channel, payload ?? '']);
+      } catch (err) {
+        throw wrapPgError(err);
+      }
+    });
   }
 
   // -------------------------------------------------------------------------

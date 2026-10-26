@@ -48,6 +48,7 @@ import {
   wrapPgError,
 } from './errors.js';
 import type { PgCompatPoolClient, PgCompatQueryResult } from './pg-types.js';
+import { TRANSACTION_CONTROL_OPERATION, traceStatement } from './query-channel.js';
 import {
   type ControlKind,
   type ControlStatement,
@@ -558,13 +559,15 @@ export class TransactionState {
    */
   private async control(sql: string): Promise<void> {
     this.assertOpen();
-    await this.send(async () => {
-      try {
-        await this.client.query(sql);
-      } catch (err) {
-        throw wrapPgError(err);
-      }
-    });
+    await this.send(() =>
+      traceStatement(TRANSACTION_CONTROL_OPERATION, sql, 0, async () => {
+        try {
+          await this.client.query(sql);
+        } catch (err) {
+          throw wrapPgError(err);
+        }
+      }),
+    );
   }
 }
 
@@ -608,13 +611,16 @@ export async function commitTransaction(
   firstFailure?: unknown,
   api: TransactionApi = '$transaction',
 ): Promise<void> {
-  let result: PgCompatQueryResult;
-  try {
-    result = await client.query(commitSql);
-  } catch (err) {
-    throw wrapPgError(err);
-  }
-  if (commitWasRolledBack(result)) throw rolledBackError(firstFailure, 'transaction', api);
+  // The rolled-back check is inside the trace: a COMMIT answered with ROLLBACK is a failed COMMIT.
+  await traceStatement(TRANSACTION_CONTROL_OPERATION, commitSql, 0, async () => {
+    let result: PgCompatQueryResult;
+    try {
+      result = await client.query(commitSql);
+    } catch (err) {
+      throw wrapPgError(err);
+    }
+    if (commitWasRolledBack(result)) throw rolledBackError(firstFailure, 'transaction', api);
+  });
 }
 
 /** Whether a COMMIT result reports that the server rolled the transaction back. */

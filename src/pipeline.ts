@@ -31,6 +31,7 @@ import {
   supportsExtendedPipeline,
 } from './pipeline-submittable.js';
 import type { DeferredQuery } from './query/index.js';
+import { TRANSACTION_CONTROL_OPERATION, traceStatement } from './query-channel.js';
 import { commitTransaction } from './transaction-state.js';
 
 // ---------------------------------------------------------------------------
@@ -99,11 +100,14 @@ async function runSequential<T extends readonly DeferredQuery<unknown>[]>(
     // TurbineError, and a caller branching on `err.code` saw neither
     // `TURBINE_E004` nor a retryable flag for the one failure that is most
     // worth retrying.
-    try {
-      await client.query(dialect.beginStatement());
-    } catch (err) {
-      throw wrapPgError(err);
-    }
+    const begin = dialect.beginStatement();
+    await traceStatement(TRANSACTION_CONTROL_OPERATION, begin, 0, async () => {
+      try {
+        await client.query(begin);
+      } catch (err) {
+        throw wrapPgError(err);
+      }
+    });
 
     const results: unknown[] = [];
     for (const q of queries) {
@@ -123,7 +127,8 @@ async function runSequential<T extends readonly DeferredQuery<unknown>[]>(
     return results as PipelineResults<T>;
   } catch (err) {
     try {
-      await client.query(dialect.rollbackStatement());
+      const rollback = dialect.rollbackStatement();
+      await traceStatement(TRANSACTION_CONTROL_OPERATION, rollback, 0, () => client.query(rollback));
     } catch {
       // Best-effort rollback
     }

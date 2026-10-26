@@ -1,11 +1,12 @@
 /**
  * turbine-orm, the `turbine:query` tracing channel.
  *
- * Every statement that emits a `$on('query')` event is also published on the
- * Node `diagnostics_channel` tracing channel named {@link QUERY_CHANNEL}, so a
- * tracer or APM agent can turn Turbine queries into spans without any setup in
- * the application: it subscribes to the channel, and the application never
- * passes it a client.
+ * Every statement that emits a `$on('query')` event, and the transaction
+ * control and `$notify` statements Turbine sends on its own (which emit none),
+ * is published on the Node `diagnostics_channel` tracing channel named
+ * {@link QUERY_CHANNEL}, so a tracer or APM agent can turn Turbine queries
+ * into spans without any setup in the application: it subscribes to the
+ * channel, and the application never passes it a client.
  *
  * The events follow the TracingChannel lifecycle for an async call: `start`
  * and `end` when the statement is handed to the driver, then `error` (on
@@ -33,14 +34,22 @@
 export const QUERY_CHANNEL = 'turbine:query';
 
 /**
+ * The `operation` of a transaction-control statement Turbine sends on its own:
+ * `BEGIN`, `COMMIT`, `ROLLBACK`, savepoints and `sessionContext` settings. Its
+ * `model` is `'$raw'`, the `RAW_QUERY_MODEL` of query-events.ts (not imported:
+ * query-events.ts imports this module).
+ */
+export const TRANSACTION_CONTROL_OPERATION = '$transaction';
+
+/**
  * The context object published on every `turbine:query` event. `rowCount` and
  * `durationMs` are set before `asyncStart`, and `error` before the `error`
  * event; the start events see only the identity fields.
  */
 export interface QueryChannelContext {
-  /** The table, or `'$raw'` for raw SQL. */
+  /** The table, or `'$raw'` for raw SQL and transaction control. */
   model: string;
-  /** The entry point: `findMany`, `create`, `raw`, `$queryRaw` ... */
+  /** The entry point: `findMany`, `create`, `raw`, `$queryRaw` ..., or `'$transaction'` for transaction control. */
   operation: string;
   /** The parametrized statement, never its values, and without the `sqlComment`. */
   sql: string;
@@ -159,5 +168,35 @@ export function settleQueryTrace(
     c.asyncEnd.publish(context);
   } catch {
     // A subscriber problem must not fail the statement.
+  }
+}
+
+/**
+ * Run a statement Turbine sends on its own (transaction control, `$notify`)
+ * with a `turbine:query` trace around it. `run` should throw the error the
+ * caller receives, so the trace carries that one. Without a subscriber it is
+ * `run()` and nothing else.
+ */
+export function traceStatement<R>(
+  operation: string,
+  sql: string,
+  paramCount: number,
+  run: () => Promise<R>,
+): Promise<R> {
+  const trace = startQueryTrace('$raw', operation, sql, paramCount);
+  if (trace === undefined) return run();
+  return settleAround(trace, run);
+}
+
+async function settleAround<R>(trace: QueryChannelContext, run: () => Promise<R>): Promise<R> {
+  const start = performance.now();
+  try {
+    const result = await run();
+    const rows = (result as { rowCount?: unknown } | null | undefined)?.rowCount;
+    settleQueryTrace(trace, typeof rows === 'number' ? rows : 0, performance.now() - start);
+    return result;
+  } catch (err) {
+    settleQueryTrace(trace, 0, performance.now() - start, err instanceof Error ? err : new Error(String(err)));
+    throw err;
   }
 }

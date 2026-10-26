@@ -37,6 +37,7 @@ interface Seen {
 }
 
 const SECRET = 'value-that-must-never-be-published';
+class Rollback extends Error {}
 const als = new AsyncLocalStorage<string>();
 
 /** Subscribes to every phase of the channel and records what each one saw. */
@@ -207,12 +208,16 @@ describe('turbine:query channel without a database', () => {
     await db.$transaction([db.users.buildFindMany({ where: { name: SECRET }, limit: 1 }), db.users.buildCount()]);
     assertBalanced(rec.seen);
     assert.deepEqual(
-      rec.settled().map((c) => [c.model, c.operation, c.batch]),
+      rec.settled().map((c) => [c.model, c.operation, c.batch, c.operation === '$transaction' ? c.sql : '']),
       [
-        ['users', 'findMany', undefined],
-        [RAW_QUERY_MODEL, 'raw', undefined],
-        ['users', 'findMany', 'transaction'],
-        ['users', 'count', 'transaction'],
+        [RAW_QUERY_MODEL, '$transaction', undefined, 'BEGIN'],
+        ['users', 'findMany', undefined, ''],
+        [RAW_QUERY_MODEL, 'raw', undefined, ''],
+        [RAW_QUERY_MODEL, '$transaction', undefined, 'COMMIT'],
+        [RAW_QUERY_MODEL, '$transaction', undefined, 'BEGIN'],
+        ['users', 'findMany', 'transaction', ''],
+        ['users', 'count', 'transaction', ''],
+        [RAW_QUERY_MODEL, '$transaction', undefined, 'COMMIT'],
       ],
     );
     assertNoValues(rec.settled());
@@ -222,7 +227,7 @@ describe('turbine:query channel without a database', () => {
     const db = mockClient(mockPool([{ id: 1, name: 'a' }]));
     await db.pipeline(db.users.buildFindMany({ where: { name: SECRET }, limit: 5 }), db.users.buildCount());
     assertBalanced(rec.seen);
-    const settled = rec.settled();
+    const settled = rec.settled().filter((c) => c.operation !== '$transaction');
     assert.deepEqual(
       settled.map((c) => [c.operation, c.batch, c.rowCount]),
       [
@@ -231,6 +236,14 @@ describe('turbine:query channel without a database', () => {
       ],
     );
     assert.equal(settled[0]!.durationMs, settled[1]!.durationMs);
+    // The batch's own BEGIN and COMMIT are published too.
+    assert.deepEqual(
+      rec
+        .settled()
+        .filter((c) => c.operation === '$transaction')
+        .map((c) => c.sql),
+      ['BEGIN', 'COMMIT'],
+    );
   });
 
   unitIt('settles every traced pipeline statement when one fails', async () => {
@@ -240,6 +253,78 @@ describe('turbine:query channel without a database', () => {
     const starts = rec.seen.filter((s) => s.phase === 'start').length;
     assert.equal(rec.settled().length, starts);
     assert.ok(rec.settled().some((c) => c.operation === 'count' && c.error instanceof Error));
+  });
+
+  unitIt('publishes transaction control: savepoints, session settings without their values, and ROLLBACK', async () => {
+    const sent: string[] = [];
+    const base = mockPool([{ id: 1, name: 'a' }]);
+    const query = async (sql: string | { text: string }, values?: unknown[]) => {
+      sent.push(typeof sql === 'string' ? sql : sql.text);
+      return (base.query as Any)(sql, values);
+    };
+    const pool = { ...base, query, connect: async () => ({ query, release: () => {} }) } as unknown as PgCompatPool;
+    const db = mockClient(pool);
+    await assert.rejects(
+      db.$transaction(
+        async (tx: Any) => {
+          await tx.$transaction(async (inner: Any) => {
+            await inner.users.findMany({ limit: 1 });
+          });
+          throw new Rollback('roll it back');
+        },
+        { sessionContext: { 'app.tenant': SECRET } },
+      ),
+      Rollback,
+    );
+    assertBalanced(rec.seen);
+    const control = rec.settled().filter((c) => c.operation === '$transaction');
+    assert.ok(control.length >= 5);
+    for (const c of control) {
+      assert.equal(c.model, RAW_QUERY_MODEL);
+      assert.equal(c.error, undefined);
+      // Each is the exact text the driver received, so a tracer can match its own driver span.
+      assert.ok(sent.includes(c.sql), `not sent as published: ${c.sql}`);
+    }
+    const verbs = control.map((c) => c.sql.split(/\s|\(/)[0]!.toUpperCase());
+    assert.deepEqual(verbs, ['BEGIN', 'SELECT', 'SAVEPOINT', 'RELEASE', 'ROLLBACK']);
+    const setting = control[1]!;
+    assert.match(setting.sql, /set_config\(\$1, \$2/);
+    assert.equal(setting.paramCount, setting.sql.match(/\$\d/g)!.length);
+    assertNoValues(rec.settled());
+  });
+
+  unitIt('publishes a COMMIT the server answered with ROLLBACK as a failed statement', async () => {
+    const base = mockPool([{ id: 1, name: 'a' }]);
+    const query = async (sql: string | { text: string }, values?: unknown[]) =>
+      (typeof sql === 'string' ? sql : sql.text) === 'COMMIT'
+        ? { rows: [], rowCount: null, command: 'ROLLBACK', fields: [] }
+        : (base.query as Any)(sql, values);
+    const pool = { ...base, query, connect: async () => ({ query, release: () => {} }) } as unknown as PgCompatPool;
+    const db = mockClient(pool);
+    let thrown: unknown;
+    await db
+      .$transaction(async (tx: Any) => {
+        await tx.users.findMany({ limit: 1 });
+      })
+      .catch((err: unknown) => {
+        thrown = err;
+      });
+    assert.ok(thrown instanceof Error);
+    assertBalanced(rec.seen);
+    const commit = rec.settled().find((c) => c.sql === 'COMMIT');
+    assert.equal(commit?.error, thrown);
+    assert.ok(rec.seen.some((s) => s.phase === 'error' && s.context === commit));
+  });
+
+  unitIt('publishes $notify with its payload bound, not in the text', async () => {
+    const db = mockClient(mockPool([{ pg_notify: '' }]));
+    await db.$notify('orders', SECRET);
+    assertBalanced(rec.seen);
+    assert.deepEqual(
+      rec.settled().map((c) => [c.model, c.operation, c.sql, c.paramCount]),
+      [[RAW_QUERY_MODEL, '$notify', 'SELECT pg_notify($1, $2)', 2]],
+    );
+    assertNoValues(rec.settled());
   });
 
   unitIt('keeps $on listeners and the channel independent of each other', async () => {
@@ -260,8 +345,6 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const SKIP = !DATABASE_URL;
 if (SKIP) console.log('⚠ Skipping turbine:query channel integration tests: DATABASE_URL not set');
 const { it, before, after } = skipGate(SKIP, 'DATABASE_URL not set');
-
-class Rollback extends Error {}
 
 describe('turbine:query channel against Postgres', () => {
   let db: Any;
@@ -328,13 +411,15 @@ describe('turbine:query channel against Postgres', () => {
     assertBalanced(rec.seen);
     const settled = rec.settled();
     assert.deepEqual(
-      settled.map((c) => [c.model, c.operation, c.rowCount]),
+      settled.map((c) => [c.model, c.operation, c.rowCount, c.operation === '$transaction' ? c.sql : '']),
       [
-        [RAW_QUERY_MODEL, 'raw', 1],
-        ['users', 'create', 1],
-        ['users', 'update', 1],
-        ['users', 'upsert', 1],
-        ['users', 'delete', 1],
+        [RAW_QUERY_MODEL, '$transaction', 0, 'BEGIN'],
+        [RAW_QUERY_MODEL, 'raw', 1, ''],
+        ['users', 'create', 1, ''],
+        ['users', 'update', 1, ''],
+        ['users', 'upsert', 1, ''],
+        ['users', 'delete', 1, ''],
+        [RAW_QUERY_MODEL, '$transaction', 0, 'ROLLBACK'],
       ],
     );
     assertNoValues(settled);
