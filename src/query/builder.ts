@@ -37,6 +37,7 @@ import {
   type NestedWriteContext,
 } from '../nested-write.js';
 import type { PgCompatPool, PgCompatQueryConfig, PgCompatQueryResult } from '../pg-types.js';
+import { type QueryChannelContext, settleQueryTrace, startQueryTrace } from '../query-channel.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { normalizeKeyColumns, snakeToCamel } from '../schema.js';
 import { transactionClientFor } from '../transaction-client-slot.js';
@@ -2897,7 +2898,9 @@ export class QueryInterface<
     rows: number,
     error?: Error,
     retried?: boolean,
+    trace?: QueryChannelContext,
   ): void {
+    settleQueryTrace(trace, rows, duration, error, retried);
     const onQuery = this.options?._onQuery;
     if (!onQuery) return;
     try {
@@ -3070,6 +3073,7 @@ export class QueryInterface<
         return this.queryCancellableInTransaction(out, params, timeout, state, action);
       }
     }
+    let trace = startQueryTrace(this.table, action, out.sql, params.length);
     let start = performance.now();
     // Build the query argument, use object form with `name` for prepared
     // statements, or the plain (text, values) form otherwise.
@@ -3106,9 +3110,11 @@ export class QueryInterface<
           0,
           wrapped instanceof Error ? wrapped : undefined,
           true,
+          trace,
         );
         await settleEventLoop();
         if (abandoned) throw err;
+        trace = startQueryTrace(this.table, action, out.sql, params.length);
         start = performance.now();
         return send();
       });
@@ -3117,7 +3123,16 @@ export class QueryInterface<
     if (!timeout) {
       try {
         const result = await exec;
-        this.emitQueryEvent(out, params, performance.now() - start, action, result.rowCount ?? 0);
+        this.emitQueryEvent(
+          out,
+          params,
+          performance.now() - start,
+          action,
+          result.rowCount ?? 0,
+          undefined,
+          undefined,
+          trace,
+        );
         return result;
       } catch (err) {
         const wrapped = wrapPgError(err);
@@ -3128,6 +3143,8 @@ export class QueryInterface<
           action,
           0,
           wrapped instanceof Error ? wrapped : undefined,
+          undefined,
+          trace,
         );
         throw wrapped;
       }
@@ -3148,7 +3165,16 @@ export class QueryInterface<
     });
     try {
       const result = await Promise.race([exec, timeoutPromise]);
-      this.emitQueryEvent(out, params, performance.now() - start, action, result.rowCount ?? 0);
+      this.emitQueryEvent(
+        out,
+        params,
+        performance.now() - start,
+        action,
+        result.rowCount ?? 0,
+        undefined,
+        undefined,
+        trace,
+      );
       return result;
     } catch (err) {
       const wrapped = wrapPgError(err);
@@ -3159,6 +3185,8 @@ export class QueryInterface<
         action,
         0,
         wrapped instanceof Error ? wrapped : undefined,
+        undefined,
+        trace,
       );
       throw wrapped;
     } finally {
@@ -3200,13 +3228,14 @@ export class QueryInterface<
     retryIfStale: boolean,
     action: string,
   ): Promise<PgCompatQueryResult> {
+    let trace = startQueryTrace(this.table, action, out.sql, params.length);
     let start = performance.now();
     const config =
       out.name && this.preparedStatementsEnabled ? { name: out.name, text: out.text, values: params } : null;
     const report = (err: unknown, retried?: boolean): unknown => {
       const wrapped = err instanceof TimeoutError ? err : wrapPgError(err);
       const error = wrapped instanceof Error ? wrapped : undefined;
-      this.emitQueryEvent(out, params, performance.now() - start, action, 0, error, retried);
+      this.emitQueryEvent(out, params, performance.now() - start, action, 0, error, retried, trace);
       return wrapped;
     };
     let expired = false;
@@ -3252,7 +3281,8 @@ export class QueryInterface<
         const settled = first === TIMED_OUT ? await this.cancelTimedOut(held, running, timeout) : first;
         if ('result' in settled) {
           if (first !== TIMED_OUT) checkout.release();
-          this.emitQueryEvent(out, params, performance.now() - start, action, settled.result.rowCount ?? 0);
+          const rows = settled.result.rowCount ?? 0;
+          this.emitQueryEvent(out, params, performance.now() - start, action, rows, undefined, undefined, trace);
           return settled.result;
         }
         if ('timeout' in settled) throw report(settled.timeout);
@@ -3263,6 +3293,7 @@ export class QueryInterface<
         report(err, true);
         await settleEventLoop();
         if (expired) throw report(neverSent());
+        trace = startQueryTrace(this.table, action, out.sql, params.length);
         start = performance.now();
       }
     } finally {
@@ -3288,6 +3319,7 @@ export class QueryInterface<
     state: TransactionState,
     action: string,
   ): Promise<PgCompatQueryResult> {
+    const trace = startQueryTrace(this.table, action, out.sql, params.length);
     const start = performance.now();
     const running: Promise<Settled> = (
       out.name && this.preparedStatementsEnabled
@@ -3313,11 +3345,13 @@ export class QueryInterface<
       clearTimeout(timer);
     }
     if ('result' in settled) {
-      this.emitQueryEvent(out, params, performance.now() - start, action, settled.result.rowCount ?? 0);
+      const rows = settled.result.rowCount ?? 0;
+      this.emitQueryEvent(out, params, performance.now() - start, action, rows, undefined, undefined, trace);
       return settled.result;
     }
     const err = 'timeout' in settled ? settled.timeout : wrapPgError(settled.error);
-    this.emitQueryEvent(out, params, performance.now() - start, action, 0, err instanceof Error ? err : undefined);
+    const error = err instanceof Error ? err : undefined;
+    this.emitQueryEvent(out, params, performance.now() - start, action, 0, error, undefined, trace);
     throw err;
   }
 

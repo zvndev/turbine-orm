@@ -85,6 +85,7 @@ import {
   warnParserOverwrite,
 } from './query/utils.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
+import { queryChannelActive, settleQueryTrace, startQueryTrace } from './query-channel.js';
 import {
   currentQueryTag,
   deferredIdentity,
@@ -3394,7 +3395,7 @@ export class TurbineClient {
     const comments = this.statementComments(queries);
     const sent = comments ? (queries.map((q, i) => commentDeferred(q, comments[i])) as unknown as T) : queries;
     const sink = this.queryListeners.size > 0 ? this.queryOptions._onQuery : undefined;
-    if (!sink) return this.withErrorMode(() => executePipeline(this.queryPool, sent, options));
+    if (!sink && !queryChannelActive()) return this.withErrorMode(() => executePipeline(this.queryPool, sent, options));
     return this.withErrorMode(() => this.reportedPipeline(sink, queries, options, sent, comments));
   }
 
@@ -3421,7 +3422,7 @@ export class TurbineClient {
    * `batch: 'pipeline'`.
    */
   private async reportedPipeline<T extends readonly DeferredQuery<unknown>[]>(
-    sink: (event: QueryEvent) => void,
+    sink: ((event: QueryEvent) => void) | undefined,
     queries: T,
     options: PipelineOptions | undefined,
     sent: T,
@@ -3435,6 +3436,10 @@ export class TurbineClient {
         return q.transform(raw);
       },
     })) as unknown as T;
+    const traces = queries.map((q) => {
+      const { model, action } = deferredIdentity(q.tag);
+      return startQueryTrace(model, action, q.sql, q.params.length, 'pipeline');
+    });
     const start = performance.now();
     let failure: unknown;
     try {
@@ -3454,6 +3459,16 @@ export class TurbineClient {
             : rowCounts.indexOf(undefined);
       queries.forEach((q, i) => {
         const failed = i === failedIndex;
+        const error =
+          failure === undefined ? undefined : failure instanceof Error ? failure : new Error(String(failure));
+        // A traced slot is always settled, so every channel start has its end: one that never ran
+        // (or rolled back unseen) settles with the batch's error.
+        settleQueryTrace(
+          traces[i],
+          rowCounts[i] ?? 0,
+          duration,
+          failed || rowCounts[i] === undefined ? error : undefined,
+        );
         // A slot that never ran (or rolled back unseen) is not reported.
         if (failed || rowCounts[i] !== undefined) {
           emitStatementEvent(sink, {
@@ -3464,7 +3479,7 @@ export class TurbineClient {
             rows: rowCounts[i] ?? 0,
             batch: 'pipeline',
             ...(comments?.[i] === undefined ? {} : { comment: comments[i] }),
-            ...(failed ? { error: failure instanceof Error ? failure : new Error(String(failure)) } : {}),
+            ...(failed ? { error } : {}),
           });
         }
       });

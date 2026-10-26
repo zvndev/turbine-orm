@@ -188,6 +188,7 @@ import {
   type WhereFoldOptions,
 } from './query/where-compile.js';
 import { assertNoBulkWritePaging, assertNoOptimisticLock } from './query/writes.js';
+import { settleQueryTrace, startQueryTrace } from './query-channel.js';
 import {
   type ColumnMetadata,
   normalizeKeyColumns,
@@ -2626,6 +2627,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     if (this.pool.readonly === true && POWQL_WRITE_ACTIONS.has(action)) {
       throw this.readOnlyError(action);
     }
+    const trace = startQueryTrace(this.table, action, powql, params.length);
     const start = performance.now();
     const run = this.pool.query(powql, params) as Promise<{
       rows: Record<string, unknown>[];
@@ -2639,7 +2641,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
             new Promise<never>((_, reject) => setTimeout(() => reject(new TimeoutError(timeout)), timeout)),
           ])
         : await run;
-      this.emit(action, powql, params, performance.now() - start, result.rowCount ?? result.rows.length);
+      const duration = performance.now() - start;
+      settleQueryTrace(trace, result.rowCount ?? result.rows.length, duration);
+      this.emit(action, powql, params, duration, result.rowCount ?? result.rows.length);
       // The pool tags each result with the wire that actually served it
       // (adaptResult → false, adaptNativeResult → true). A heterogeneous
       // injected pool can fall back to the legacy wire per call, so read the
@@ -2649,12 +2653,16 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       const native = result.native ?? Boolean(this.capabilities.nativeRaw);
       return { rows: result.rows, rowCount: result.rowCount ?? result.rows.length, native };
     } catch (err) {
+      const duration = performance.now() - start;
       if (!isRetry && this.shouldRetryStaleRead(err, action)) {
         // Transparent single replay on a fresh connection; the first (swallowed)
-        // failure is not emitted, only the retried outcome is observed.
+        // failure is not emitted, only the retried outcome is observed. Its
+        // channel trace is still settled, marked retried.
+        settleQueryTrace(trace, 0, duration, err instanceof Error ? err : new Error(String(err)), true);
         return this.execOnce(powql, params, timeout, action, true);
       }
-      this.emit(action, powql, params, performance.now() - start, 0, err as Error);
+      settleQueryTrace(trace, 0, duration, err instanceof Error ? err : new Error(String(err)));
+      this.emit(action, powql, params, duration, 0, err as Error);
       throw err;
     }
   }

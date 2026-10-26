@@ -269,6 +269,8 @@ export type {
   SqlExprKind,
   TableInputTypes,
 } from './query/types.js';
+// diagnostics_channel tracing channel every statement is published on
+export { QUERY_CHANNEL, type QueryChannelContext } from './query-channel.js';
 // $on('query') event metadata: raw-statement model name, $tag() label limit
 export { MAX_QUERY_TAG_LENGTH, RAW_QUERY_MODEL } from './query-events.js';
 // Realtime, LISTEN/NOTIFY pub/sub
