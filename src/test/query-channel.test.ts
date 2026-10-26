@@ -37,7 +37,6 @@ interface Seen {
 }
 
 const SECRET = 'value-that-must-never-be-published';
-class Rollback extends Error {}
 const als = new AsyncLocalStorage<string>();
 
 /** Subscribes to every phase of the channel and records what each one saw. */
@@ -270,11 +269,11 @@ describe('turbine:query channel without a database', () => {
           await tx.$transaction(async (inner: Any) => {
             await inner.users.findMany({ limit: 1 });
           });
-          throw new Rollback('roll it back');
+          throw new Error('roll it back');
         },
         { sessionContext: { 'app.tenant': SECRET } },
       ),
-      Rollback,
+      { message: 'roll it back' },
     );
     assertBalanced(rec.seen);
     const control = rec.settled().filter((c) => c.operation === '$transaction');
@@ -404,9 +403,9 @@ describe('turbine:query channel against Postgres', () => {
           update: { name: `${SECRET}-3` },
         });
         await tx.table('users').delete({ where: { id: created.id } });
-        throw new Rollback('leave the fixture untouched');
+        throw new Error('leave the fixture untouched');
       }),
-      Rollback,
+      { message: 'leave the fixture untouched' },
     );
     assertBalanced(rec.seen);
     const settled = rec.settled();
