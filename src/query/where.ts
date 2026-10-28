@@ -2985,11 +2985,13 @@ export function buildJsonFilterClauses(
   }
 
   // Range comparisons on the extracted path: numbers compare numerically
-  // (cast through the dialect), strings compare as text.
+  // (cast through the dialect), strings compare as text. A row whose value at
+  // the path is not a number is left out of a numeric comparison rather than
+  // failing the whole query (see castJsonNumericOrNull).
   for (const { sqlOp, value } of jsonRangeEntries(qi, filter, column)) {
     const extract = pathExtract();
     params.push(value);
-    const lhs = typeof value === 'number' ? castJsonNumeric(qi, extract) : extract;
+    const lhs = typeof value === 'number' ? castJsonNumericOrNull(qi, extract) : extract;
     clauses.push(`${lhs} ${sqlOp} ${qi.p(params.length)}`);
   }
 
@@ -3042,6 +3044,32 @@ export function jsonPathParam(qi: BuilderCtx, path: readonly (string | number)[]
 export function castJsonNumeric(qi: BuilderCtx, extract: string): string {
   if (qi.dialect.capabilities.jsonExactNumericCast) return `(${extract})::numeric`;
   return qi.dialect.castAggregate ? qi.dialect.castAggregate(`(${extract})`, 'float') : `(${extract})::numeric`;
+}
+
+/**
+ * The text of a number as PostgreSQL's numeric input accepts it: optional
+ * surrounding space and sign, digits with an optional fraction, an optional
+ * exponent. POSIX classes, so the pattern needs no backslash in the SQL text.
+ */
+export const NUMERIC_TEXT_PATTERN = '^[[:space:]]*[-+]?([0-9]+[.]?[0-9]*|[.][0-9]+)([eE][-+]?[0-9]+)?[[:space:]]*$';
+
+/**
+ * {@link castJsonNumeric} for a WHERE comparison against a number. On
+ * PostgreSQL a plain `(expr)::numeric` raises `invalid input syntax for type
+ * numeric` the moment ONE row holds text, a boolean, an object or an array at
+ * the path, so a single stray value failed the whole query. Here only text that
+ * reads as a number is cast; anything else is NULL, and NULL compares as
+ * neither true nor false, so that row is simply not matched. Every row the
+ * plain cast compared still compares the same way, a JSON string holding a
+ * number included, so no query that worked before returns different rows.
+ * `extract` is a `#>>` text expression over bound params only, and the pattern
+ * is a constant, so no value reaches the SQL text.
+ *
+ * Other engines keep {@link castJsonNumeric}: their float casts do not raise.
+ */
+export function castJsonNumericOrNull(qi: BuilderCtx, extract: string): string {
+  if (!qi.dialect.capabilities.jsonExactNumericCast) return castJsonNumeric(qi, extract);
+  return `CASE WHEN (${extract}) ~ '${NUMERIC_TEXT_PATTERN}' THEN (${extract})::numeric END`;
 }
 
 /**

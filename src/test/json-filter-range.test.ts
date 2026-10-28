@@ -1,8 +1,10 @@
 /**
  * turbine-orm, JsonFilter range operators gt/gte/lt/lte
  *
- * Numbers cast the `#>>` path extraction to numeric -
- * `("col" #>> $1::text[])::numeric > $2`, while strings compare as text.
+ * Numbers cast the `#>>` path extraction to numeric, guarded so a row whose
+ * value is not a number reads NULL instead of failing the query:
+ * `CASE WHEN ("col" #>> $1::text[]) ~ '<number>' THEN ("col" #>> $1::text[])::numeric END > $2`,
+ * while strings compare as text.
  * The `path` param is bound once and its placeholder shared by every clause
  * that extracts it. All range ops require `path`.
  *
@@ -17,8 +19,13 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { ValidationError } from '../errors.js';
+import { NUMERIC_TEXT_PATTERN } from '../query/where.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
+
+/** The guarded numeric cast of one `#>>` extraction, as the builder emits it. */
+const num = (extract: string): string =>
+  `CASE WHEN (${extract}) ~ '${NUMERIC_TEXT_PATTERN}' THEN (${extract})::numeric END`;
 
 function buildSchema(): SchemaMetadata {
   const tables: Record<string, TableMetadata> = {};
@@ -52,7 +59,7 @@ describe('JsonFilter range operators', () => {
   it('gt with a number casts the extraction to numeric', () => {
     const q = makeQuery('events', buildSchema());
     const d = q.buildFindMany({ where: { payload: { path: ['score'], gt: 10 } } as never });
-    assert.match(d.sql, /\("payload" #>> \$1::text\[\]\)::numeric > \$2/);
+    assert.ok(d.sql.includes(`${num('"payload" #>> $1::text[]')} > $2`), d.sql);
     assert.deepEqual(d.params, [['score'], 10]);
   });
 
@@ -65,7 +72,7 @@ describe('JsonFilter range operators', () => {
     ] as const) {
       const d = q.buildFindMany({ where: { payload: { path: ['score'], [op]: 7 } } as never });
       assert.ok(
-        d.sql.includes(`("payload" #>> $1::text[])::numeric ${sqlOp} $2`),
+        d.sql.includes(`${num('"payload" #>> $1::text[]')} ${sqlOp} $2`),
         `${op} → expected "::numeric ${sqlOp} $2" in: ${d.sql}`,
       );
       assert.deepEqual(d.params, [['score'], 7]);
@@ -83,8 +90,8 @@ describe('JsonFilter range operators', () => {
   it('multiple range ops share ONE bound path param', () => {
     const q = makeQuery('events', buildSchema());
     const d = q.buildFindMany({ where: { payload: { path: ['score'], gte: 1, lte: 5 } } as never });
-    assert.match(d.sql, /\("payload" #>> \$1::text\[\]\)::numeric >= \$2/);
-    assert.match(d.sql, /\("payload" #>> \$1::text\[\]\)::numeric <= \$3/);
+    assert.ok(d.sql.includes(`${num('"payload" #>> $1::text[]')} >= $2`), d.sql);
+    assert.ok(d.sql.includes(`${num('"payload" #>> $1::text[]')} <= $3`), d.sql);
     assert.deepEqual(d.params, [['score'], 1, 5]);
   });
 
@@ -94,7 +101,7 @@ describe('JsonFilter range operators', () => {
       where: { payload: { path: ['score'], equals: '3', gt: 1 } } as never,
     });
     assert.match(d.sql, /\("payload" #> \$1::text\[\]\)::jsonb = \$2::jsonb/);
-    assert.match(d.sql, /\("payload" #>> \$1::text\[\]\)::numeric > \$3/);
+    assert.ok(d.sql.includes(`${num('"payload" #>> $1::text[]')} > $3`), d.sql);
     assert.deepEqual(d.params, [['score'], '"3"', 1]);
   });
 
@@ -127,7 +134,7 @@ describe('JsonFilter range operators', () => {
     const d = q.buildFindMany({
       where: { AND: [{ payload: { path: ['score'], gt: 10 } }, { name: 'launch' }] } as never,
     });
-    assert.match(d.sql, /\("payload" #>> \$1::text\[\]\)::numeric > \$2/);
+    assert.ok(d.sql.includes(`${num('"payload" #>> $1::text[]')} > $2`), d.sql);
     assert.match(d.sql, /"name" = \$3/);
     assert.deepEqual(d.params, [['score'], 10, 'launch']);
   });
@@ -138,7 +145,7 @@ describe('JsonFilter range operators', () => {
       where: { metrics: { some: { data: { path: ['p95'], lt: 250 } } } } as never,
     });
     assert.match(d.sql, /EXISTS \(SELECT 1 FROM "metrics"/);
-    assert.match(d.sql, /\("metrics"\."data" #>> \$1::text\[\]\)::numeric < \$2/);
+    assert.ok(d.sql.includes(`${num('"metrics"."data" #>> $1::text[]')} < $2`), d.sql);
     assert.deepEqual(d.params, [['p95'], 250]);
   });
 

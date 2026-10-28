@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+A numeric range filter on a JSON path no longer fails the whole query when
+one row holds something that is not a number there.
+
+### Fixed
+
+- **JSON path `gt` / `gte` / `lt` / `lte` with a number, on PostgreSQL.**
+  The path's value was cast with a plain `::numeric`, so a single row holding
+  text, a boolean, an object or an array at that path failed the query with
+  `invalid input syntax for type numeric`. A JSON column is schemaless, so one
+  stray value was enough. The cast now applies only to text that reads as a
+  number; any other value is NULL and that row does not match. Every value
+  the plain cast compared, a JSON number or a JSON string holding one,
+  compares exactly as before, so no query that worked returns different rows.
+  Ordering and aggregates with `type: 'numeric'` are unchanged, since there
+  the caller declares the values numeric. Other engines are unchanged: their
+  float casts do not raise.
+
 ## 0.93.0 (2026-10-26)
 
 Every statement is published on a Node `diagnostics_channel` tracing
