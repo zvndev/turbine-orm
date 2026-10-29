@@ -2985,11 +2985,13 @@ export function buildJsonFilterClauses(
   }
 
   // Range comparisons on the extracted path: numbers compare numerically
-  // (cast through the dialect), strings compare as text.
+  // (cast through the dialect), strings compare as text. A row whose value at
+  // the path is not a number is left out of a numeric comparison rather than
+  // failing the whole query (see castJsonNumericOrNull).
   for (const { sqlOp, value } of jsonRangeEntries(qi, filter, column)) {
     const extract = pathExtract();
     params.push(value);
-    const lhs = typeof value === 'number' ? castJsonNumeric(qi, extract) : extract;
+    const lhs = typeof value === 'number' ? castJsonNumericOrNull(qi, extract) : extract;
     clauses.push(`${lhs} ${sqlOp} ${qi.p(params.length)}`);
   }
 
@@ -3042,6 +3044,57 @@ export function jsonPathParam(qi: BuilderCtx, path: readonly (string | number)[]
 export function castJsonNumeric(qi: BuilderCtx, extract: string): string {
   if (qi.dialect.capabilities.jsonExactNumericCast) return `(${extract})::numeric`;
   return qi.dialect.castAggregate ? qi.dialect.castAggregate(`(${extract})`, 'float') : `(${extract})::numeric`;
+}
+
+/**
+ * The text every supported PostgreSQL version (14 to 17) reads as a numeric:
+ * a signed decimal with an optional fraction and exponent, or a signed
+ * `inf` / `infinity`, or an unsigned `NaN` (a signed one is refused), with
+ * surrounding white space. The white space is exactly what the numeric parser
+ * skips, the six ASCII characters C's `isspace` names, NOT `[[:space:]]`: in a
+ * UTF-8 database that class also matches Unicode spaces such as U+2003, which
+ * the parser rejects, so a row holding one would still fail the query.
+ *
+ * PostgreSQL 16 added digit separators and base prefixes. Those spellings use
+ * NUMERIC_TEXT_PATTERN_PG16 instead, selected by the connected server version.
+ *
+ * Written for an `E'...'` literal: `\t` and friends are escapes there, read
+ * the same whatever `standard_conforming_strings` says.
+ */
+export const NUMERIC_TEXT_PATTERN =
+  '^[ \\t\\n\\r\\f\\013]*([-+]?(([0-9]+[.]?[0-9]*|[.][0-9]+)([eE][-+]?[0-9]+)?|[Ii][Nn][Ff]([Ii][Nn][Ii][Tt][Yy])?)|[Nn][Aa][Nn])[ \\t\\n\\r\\f\\013]*$';
+
+// Separators must occur between digits; base prefixes also allow one leading
+// separator (0x_FF). A point or exponent sign cannot adjoin an underscore.
+const PG16_NUMERIC_DIGITS = '[0-9](_?[0-9])*';
+const PG16_NUMERIC_DECIMAL =
+  `(${PG16_NUMERIC_DIGITS}([.](${PG16_NUMERIC_DIGITS})?)?|[.]${PG16_NUMERIC_DIGITS})` +
+  `([eE][-+]?${PG16_NUMERIC_DIGITS})?`;
+const PG16_NUMERIC_INTEGER = '0([xX]_?[0-9A-Fa-f](_?[0-9A-Fa-f])*|[oO]_?[0-7](_?[0-7])*|[bB]_?[01](_?[01])*)';
+
+/** PostgreSQL 16+ numeric input grammar, written for an E'...' literal. */
+export const NUMERIC_TEXT_PATTERN_PG16 = `^[ \\t\\n\\r\\f\\013]*([-+]?(${PG16_NUMERIC_DECIMAL}|${PG16_NUMERIC_INTEGER}|[Ii][Nn][Ff]([Ii][Nn][Ii][Tt][Yy])?)|[Nn][Aa][Nn])[ \\t\\n\\r\\f\\013]*$`;
+
+/**
+ * {@link castJsonNumeric} for a WHERE comparison against a number. On
+ * PostgreSQL a plain `(expr)::numeric` raises `invalid input syntax for type
+ * numeric` the moment ONE row holds text, a boolean, an object or an array at
+ * the path, so a single stray value failed the whole query. Here only text that
+ * reads as a number on the connected server is cast; anything else is NULL,
+ * and NULL compares as neither true nor false, so that row is not matched.
+ * Select the grammar in SQL so the same builder works with PostgreSQL 14/15
+ * and 16+, without requiring a version probe before building queries.
+ * `extract` is a `#>>` text expression over bound params only, and the pattern
+ * is a constant, so no value reaches the SQL text.
+ *
+ * Other engines keep {@link castJsonNumeric}: their float casts do not raise.
+ */
+export function castJsonNumericOrNull(qi: BuilderCtx, extract: string): string {
+  if (!qi.dialect.capabilities.jsonExactNumericCast) return castJsonNumeric(qi, extract);
+  const pattern =
+    `CASE WHEN current_setting('server_version_num')::integer >= 160000 ` +
+    `THEN E'${NUMERIC_TEXT_PATTERN_PG16}' ELSE E'${NUMERIC_TEXT_PATTERN}' END`;
+  return `CASE WHEN (${extract}) ~ (${pattern}) THEN (${extract})::numeric END`;
 }
 
 /**

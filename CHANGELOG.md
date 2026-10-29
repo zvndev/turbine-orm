@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+A numeric range filter on a JSON path no longer fails the whole query when
+one row holds something that is not a number there.
+
+### Fixed
+
+- **JSON path `gt` / `gte` / `lt` / `lte` with a number, on PostgreSQL.**
+  The path's value was cast with a plain `::numeric`, so a single row holding
+  text, a boolean, an object or an array at that path failed the query with
+  `invalid input syntax for type numeric`. A JSON column is schemaless, so one
+  stray value was enough. The cast now applies only to text the connected
+  PostgreSQL server reads as a number: a decimal with an optional fraction
+  and exponent, `NaN`, or `Infinity` / `inf`, with the ASCII white space the
+  numeric parser skips (a Unicode space such as U+2003 is not skipped by the
+  parser, so it is not here either). Any other value is NULL and that row does
+  not match. Numeric strings with digit separators (`1_000`) and the `0x` /
+  `0o` / `0b` prefixes keep comparing on PostgreSQL 16+, and are safely
+  skipped on PostgreSQL 14/15, where the numeric parser refuses them.
+  Ordering and aggregates with `type: 'numeric'` are unchanged, since there
+  the caller declares the values numeric. Other engines are unchanged: their
+  float casts do not raise.
+
 ## 0.93.0 (2026-10-26)
 
 Every statement is published on a Node `diagnostics_channel` tracing
