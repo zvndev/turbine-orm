@@ -17,6 +17,7 @@ const TAGLINE_OVERRIDES: Record<string, string> = {
   '0.91.0': 'Count-only createMany, percentiles of expressions, SQLite bulk inserts 70 to 140x faster',
   '0.92.0': 'Nested reads decode in one pass: users with posts 27% faster',
   '0.93.0': 'Every query on the turbine:query tracing channel, ready for any tracer',
+  '0.93.1': 'Patch: JSON range filters skip nonnumeric values and preserve numeric strings',
 };
 
 /** The tagline shown in the landing hero badge. */

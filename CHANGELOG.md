@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.93.1 (2026-10-29)
 
 A numeric range filter on a JSON path no longer fails the whole query when
 one row holds something that is not a number there.
