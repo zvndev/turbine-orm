@@ -3055,9 +3055,8 @@ export function castJsonNumeric(qi: BuilderCtx, extract: string): string {
  * UTF-8 database that class also matches Unicode spaces such as U+2003, which
  * the parser rejects, so a row holding one would still fail the query.
  *
- * Deliberately left out: `1_000` and the `0x` / `0o` / `0b` prefixes. PostgreSQL
- * 16 accepts them and 14 and 15 do not, and a guard that admitted them would
- * fail the query on those versions, so such a value is not matched on any.
+ * PostgreSQL 16 added digit separators and base prefixes. Those spellings use
+ * NUMERIC_TEXT_PATTERN_PG16 instead, selected by the connected server version.
  *
  * Written for an `E'...'` literal: `\t` and friends are escapes there, read
  * the same whatever `standard_conforming_strings` says.
@@ -3065,16 +3064,26 @@ export function castJsonNumeric(qi: BuilderCtx, extract: string): string {
 export const NUMERIC_TEXT_PATTERN =
   '^[ \\t\\n\\r\\f\\013]*([-+]?(([0-9]+[.]?[0-9]*|[.][0-9]+)([eE][-+]?[0-9]+)?|[Ii][Nn][Ff]([Ii][Nn][Ii][Tt][Yy])?)|[Nn][Aa][Nn])[ \\t\\n\\r\\f\\013]*$';
 
+// Separators must occur between digits; base prefixes also allow one leading
+// separator (0x_FF). A point or exponent sign cannot adjoin an underscore.
+const PG16_NUMERIC_DIGITS = '[0-9](_?[0-9])*';
+const PG16_NUMERIC_DECIMAL =
+  `(${PG16_NUMERIC_DIGITS}([.](${PG16_NUMERIC_DIGITS})?)?|[.]${PG16_NUMERIC_DIGITS})` +
+  `([eE][-+]?${PG16_NUMERIC_DIGITS})?`;
+const PG16_NUMERIC_INTEGER = '0([xX]_?[0-9A-Fa-f](_?[0-9A-Fa-f])*|[oO]_?[0-7](_?[0-7])*|[bB]_?[01](_?[01])*)';
+
+/** PostgreSQL 16+ numeric input grammar, written for an E'...' literal. */
+export const NUMERIC_TEXT_PATTERN_PG16 = `^[ \\t\\n\\r\\f\\013]*([-+]?(${PG16_NUMERIC_DECIMAL}|${PG16_NUMERIC_INTEGER}|[Ii][Nn][Ff]([Ii][Nn][Ii][Tt][Yy])?)|[Nn][Aa][Nn])[ \\t\\n\\r\\f\\013]*$`;
+
 /**
  * {@link castJsonNumeric} for a WHERE comparison against a number. On
  * PostgreSQL a plain `(expr)::numeric` raises `invalid input syntax for type
  * numeric` the moment ONE row holds text, a boolean, an object or an array at
  * the path, so a single stray value failed the whole query. Here only text that
- * reads as a number on every supported version ({@link NUMERIC_TEXT_PATTERN})
- * is cast; anything else is NULL, and NULL compares as neither true nor false,
- * so that row is simply not matched. Every value the plain cast compared still
- * compares the same way (a JSON number, a JSON string holding one, `NaN`,
- * `Infinity`), except the PostgreSQL 16 only spellings that pattern leaves out.
+ * reads as a number on the connected server is cast; anything else is NULL,
+ * and NULL compares as neither true nor false, so that row is not matched.
+ * Select the grammar in SQL so the same builder works with PostgreSQL 14/15
+ * and 16+, without requiring a version probe before building queries.
  * `extract` is a `#>>` text expression over bound params only, and the pattern
  * is a constant, so no value reaches the SQL text.
  *
@@ -3082,7 +3091,10 @@ export const NUMERIC_TEXT_PATTERN =
  */
 export function castJsonNumericOrNull(qi: BuilderCtx, extract: string): string {
   if (!qi.dialect.capabilities.jsonExactNumericCast) return castJsonNumeric(qi, extract);
-  return `CASE WHEN (${extract}) ~ E'${NUMERIC_TEXT_PATTERN}' THEN (${extract})::numeric END`;
+  const pattern =
+    `CASE WHEN current_setting('server_version_num')::integer >= 160000 ` +
+    `THEN E'${NUMERIC_TEXT_PATTERN_PG16}' ELSE E'${NUMERIC_TEXT_PATTERN}' END`;
+  return `CASE WHEN (${extract}) ~ (${pattern}) THEN (${extract})::numeric END`;
 }
 
 /**

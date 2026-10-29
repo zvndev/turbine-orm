@@ -19,13 +19,14 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import { ValidationError } from '../errors.js';
-import { NUMERIC_TEXT_PATTERN } from '../query/where.js';
+import { NUMERIC_TEXT_PATTERN, NUMERIC_TEXT_PATTERN_PG16 } from '../query/where.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { makeQuery, mockTable } from './helpers.js';
 
 /** The guarded numeric cast of one `#>>` extraction, as the builder emits it. */
 const num = (extract: string): string =>
-  `CASE WHEN (${extract}) ~ E'${NUMERIC_TEXT_PATTERN}' THEN (${extract})::numeric END`;
+  `CASE WHEN (${extract}) ~ (CASE WHEN current_setting('server_version_num')::integer >= 160000 ` +
+  `THEN E'${NUMERIC_TEXT_PATTERN_PG16}' ELSE E'${NUMERIC_TEXT_PATTERN}' END) THEN (${extract})::numeric END`;
 
 function buildSchema(): SchemaMetadata {
   const tables: Record<string, TableMetadata> = {};
