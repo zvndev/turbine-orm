@@ -137,7 +137,7 @@ The query is bound and uses `to_tsquery` syntax (`&`, `|`, `!`, `<->`). `config`
 ```ts
 where: { data: { path: ['meta', 'tier'], equals: 'pro' } }
 where: { data: { contains: { active: true } } }    // holds these keys, maybe among others
-where: { data: { path: ['rating'], gte: 4 } }      // (data #>> path)::numeric >= $1
+where: { data: { path: ['rating'], gte: 4 } }      // numeric comparison; skips nonnumeric values on PostgreSQL
 where: { data: { path: ['title'], stringContains: 'orm', mode: 'insensitive' } }
 
 // equals compares JSON values. Stored: { n: 5 }, { n: "5" }, { n: null }, {}
@@ -145,7 +145,7 @@ where: { data: { path: ['n'], equals: 5 } }     // only { n: 5 }
 where: { data: { path: ['n'], equals: null } }  // only { n: null }: a missing key is not JSON null
 ```
 
-- A numeric range operand casts to numeric; a string compares as text. Without `path`, `{ gt: 5 }` compares the column itself.
+- A numeric range operand compares numerically; a string compares as text. Range operators require `path`. On PostgreSQL, values without valid numeric syntax are skipped instead of failing the query. Numeric strings still compare, including digit separators (`"1_000"`) and base prefixes (`"0x10"`) on PostgreSQL 16+; those spellings are skipped on PostgreSQL 14/15. Values surrounded by Unicode whitespace are skipped.
 - Pathless `equals` is exact: `{ equals: { plan: 'pro' } }` does not match `{ plan: 'pro', seats: 5 }`.
 - `not: <document>` means "not this document". A `not` holding only operator keys throws E003; write `NOT: { data: { ... } }`.
 - An unknown key, such as Prisma's `string_contains`, or a `path` with no test throws E003.
