@@ -3047,21 +3047,34 @@ export function castJsonNumeric(qi: BuilderCtx, extract: string): string {
 }
 
 /**
- * The text of a number as PostgreSQL's numeric input accepts it: optional
- * surrounding space and sign, digits with an optional fraction, an optional
- * exponent. POSIX classes, so the pattern needs no backslash in the SQL text.
+ * The text every supported PostgreSQL version (14 to 17) reads as a numeric:
+ * a signed decimal with an optional fraction and exponent, or a signed
+ * `inf` / `infinity`, or an unsigned `NaN` (a signed one is refused), with
+ * surrounding white space. The white space is exactly what the numeric parser
+ * skips, the six ASCII characters C's `isspace` names, NOT `[[:space:]]`: in a
+ * UTF-8 database that class also matches Unicode spaces such as U+2003, which
+ * the parser rejects, so a row holding one would still fail the query.
+ *
+ * Deliberately left out: `1_000` and the `0x` / `0o` / `0b` prefixes. PostgreSQL
+ * 16 accepts them and 14 and 15 do not, and a guard that admitted them would
+ * fail the query on those versions, so such a value is not matched on any.
+ *
+ * Written for an `E'...'` literal: `\t` and friends are escapes there, read
+ * the same whatever `standard_conforming_strings` says.
  */
-export const NUMERIC_TEXT_PATTERN = '^[[:space:]]*[-+]?([0-9]+[.]?[0-9]*|[.][0-9]+)([eE][-+]?[0-9]+)?[[:space:]]*$';
+export const NUMERIC_TEXT_PATTERN =
+  '^[ \\t\\n\\r\\f\\013]*([-+]?(([0-9]+[.]?[0-9]*|[.][0-9]+)([eE][-+]?[0-9]+)?|[Ii][Nn][Ff]([Ii][Nn][Ii][Tt][Yy])?)|[Nn][Aa][Nn])[ \\t\\n\\r\\f\\013]*$';
 
 /**
  * {@link castJsonNumeric} for a WHERE comparison against a number. On
  * PostgreSQL a plain `(expr)::numeric` raises `invalid input syntax for type
  * numeric` the moment ONE row holds text, a boolean, an object or an array at
  * the path, so a single stray value failed the whole query. Here only text that
- * reads as a number is cast; anything else is NULL, and NULL compares as
- * neither true nor false, so that row is simply not matched. Every row the
- * plain cast compared still compares the same way, a JSON string holding a
- * number included, so no query that worked before returns different rows.
+ * reads as a number on every supported version ({@link NUMERIC_TEXT_PATTERN})
+ * is cast; anything else is NULL, and NULL compares as neither true nor false,
+ * so that row is simply not matched. Every value the plain cast compared still
+ * compares the same way (a JSON number, a JSON string holding one, `NaN`,
+ * `Infinity`), except the PostgreSQL 16 only spellings that pattern leaves out.
  * `extract` is a `#>>` text expression over bound params only, and the pattern
  * is a constant, so no value reaches the SQL text.
  *
@@ -3069,7 +3082,7 @@ export const NUMERIC_TEXT_PATTERN = '^[[:space:]]*[-+]?([0-9]+[.]?[0-9]*|[.][0-9
  */
 export function castJsonNumericOrNull(qi: BuilderCtx, extract: string): string {
   if (!qi.dialect.capabilities.jsonExactNumericCast) return castJsonNumeric(qi, extract);
-  return `CASE WHEN (${extract}) ~ '${NUMERIC_TEXT_PATTERN}' THEN (${extract})::numeric END`;
+  return `CASE WHEN (${extract}) ~ E'${NUMERIC_TEXT_PATTERN}' THEN (${extract})::numeric END`;
 }
 
 /**

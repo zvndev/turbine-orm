@@ -5,9 +5,11 @@
  * row and text, a boolean, an object or an array in the next. A numeric
  * comparison (`{ path, gt: n }`) used to cast the extraction with a plain
  * `::numeric`, so ONE such row failed the whole query with `invalid input
- * syntax for type numeric`. Now a value that does not read as a number is
- * NULL and simply does not match, and every value the plain cast compared
- * (a JSON number, or a JSON string holding one) compares exactly as before.
+ * syntax for type numeric`. Now a value that does not read as a number on
+ * every supported version is NULL and simply does not match, and every value
+ * the plain cast compared (a JSON number, a JSON string holding one, `NaN`,
+ * `Infinity`) compares exactly as before, apart from the PostgreSQL 16 only
+ * spellings (`1_000`, `0x10`), which are skipped on every version.
  *
  * Run: DATABASE_URL=postgres://... npx tsx --test src/test/json-filter-range.integration.test.ts
  */
@@ -44,6 +46,19 @@ const MIXED_ROWS: [number, string][] = [
   [11, '{"other": 1}'],
   [12, '{"score": -3.5}'],
   [13, '{"score": ""}'],
+  [14, '{"score": "Infinity"}'],
+  [15, '{"score": "NaN"}'],
+  [16, '{"score": "-inf"}'],
+  // A signed NaN is refused by the numeric parser.
+  [17, '{"score": "-NaN"}'],
+  // Unicode spaces: [[:space:]] matches them in a UTF-8 database, the parser does not.
+  [18, '{"score": "\\u20037\\u2003"}'],
+  [19, '{"score": "7\\u00a0"}'],
+  // ASCII white space the parser does skip.
+  [20, '{"score": "\\t8\\n"}'],
+  // Accepted by PostgreSQL 16 only, so skipped on every version.
+  [21, '{"score": "1_000"}'],
+  [22, '{"score": "0x10"}'],
 ];
 
 /** Only values the plain cast always accepted, to prove it matches the same rows. */
@@ -55,6 +70,10 @@ const NUMERIC_ROWS: [number, string][] = [
   [5, '{"score": 6}'],
   [6, '{"other": 1}'],
   [7, '{"score": null}'],
+  [8, '{"score": "Infinity"}'],
+  [9, '{"score": "-inf"}'],
+  [10, '{"score": "NaN"}'],
+  [11, '{"score": "\\t8\\n"}'],
 ];
 
 const DDL = `
@@ -110,26 +129,41 @@ describe('live: a numeric JSON range filter skips values that are not numbers', 
 
   gate.it('gt matches numbers and numeric strings, and skips text, booleans, objects, arrays and nulls', async () => {
     const rows = await mixed().findMany({ where: { data: { path: ['score'], gt: 6 } } as never });
-    // 12, "7", " 9 ", "1e2" (100). Not 5, -3.5, "abc", true, {}, [], null, missing, "".
-    assert.deepEqual(ids(rows), [2, 3, 4, 5]);
+    // 12, "7", " 9 ", "1e2" (100), "Infinity", "NaN" (PostgreSQL sorts NaN above every
+    // number), tab/newline around 8. Not 5, -3.5, "-inf", or any value the parser refuses.
+    assert.deepEqual(ids(rows), [2, 3, 4, 5, 14, 15, 20]);
   });
+
+  gate.it(
+    'Unicode spaces, a signed NaN and PostgreSQL 16 only spellings are skipped, never a failed query',
+    async () => {
+      const t = mixed();
+      for (const op of ['gt', 'gte', 'lt', 'lte'] as const) {
+        const rows = await t.findMany({ where: { data: { path: ['score'], [op]: 7 } } as never });
+        for (const id of [17, 18, 19, 21, 22]) assert.ok(!ids(rows).includes(id), `${op}: row ${id} matched`);
+      }
+    },
+  );
 
   gate.it('gte / lt / lte answer the same way', async () => {
     const t = mixed();
-    assert.deepEqual(ids(await t.findMany({ where: { data: { path: ['score'], gte: 7 } } as never })), [2, 3, 4, 5]);
-    assert.deepEqual(ids(await t.findMany({ where: { data: { path: ['score'], lt: 7 } } as never })), [1, 12]);
-    assert.deepEqual(ids(await t.findMany({ where: { data: { path: ['score'], lte: 7 } } as never })), [1, 3, 12]);
+    assert.deepEqual(
+      ids(await t.findMany({ where: { data: { path: ['score'], gte: 7 } } as never })),
+      [2, 3, 4, 5, 14, 15, 20],
+    );
+    assert.deepEqual(ids(await t.findMany({ where: { data: { path: ['score'], lt: 7 } } as never })), [1, 12, 16]);
+    assert.deepEqual(ids(await t.findMany({ where: { data: { path: ['score'], lte: 7 } } as never })), [1, 3, 12, 16]);
   });
 
   gate.it('a bounded range with gt and lt together', async () => {
     const rows = await mixed().findMany({ where: { data: { path: ['score'], gt: 0, lt: 10 } } as never });
-    assert.deepEqual(ids(rows), [1, 3, 4]);
+    assert.deepEqual(ids(rows), [1, 3, 4, 20]);
   });
 
   gate.it('count and a json (not jsonb) column take the same guard', async () => {
-    assert.equal(await mixed().count({ where: { data: { path: ['score'], gt: 6 } } as never }), 4);
+    assert.equal(await mixed().count({ where: { data: { path: ['score'], gt: 6 } } as never }), 7);
     const rows = await mixed().findMany({ where: { doc: { path: ['score'], gt: 6 } } as never });
-    assert.deepEqual(ids(rows), [2, 3, 4, 5]);
+    assert.deepEqual(ids(rows), [2, 3, 4, 5, 14, 15, 20]);
   });
 
   gate.it('where every value is numeric, the rows match the plain ::numeric cast exactly', async () => {

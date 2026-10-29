@@ -3,7 +3,7 @@
  *
  * Numbers cast the `#>>` path extraction to numeric, guarded so a row whose
  * value is not a number reads NULL instead of failing the query:
- * `CASE WHEN ("col" #>> $1::text[]) ~ '<number>' THEN ("col" #>> $1::text[])::numeric END > $2`,
+ * `CASE WHEN ("col" #>> $1::text[]) ~ E'<number>' THEN ("col" #>> $1::text[])::numeric END > $2`,
  * while strings compare as text.
  * The `path` param is bound once and its placeholder shared by every clause
  * that extracts it. All range ops require `path`.
@@ -25,7 +25,7 @@ import { makeQuery, mockTable } from './helpers.js';
 
 /** The guarded numeric cast of one `#>>` extraction, as the builder emits it. */
 const num = (extract: string): string =>
-  `CASE WHEN (${extract}) ~ '${NUMERIC_TEXT_PATTERN}' THEN (${extract})::numeric END`;
+  `CASE WHEN (${extract}) ~ E'${NUMERIC_TEXT_PATTERN}' THEN (${extract})::numeric END`;
 
 function buildSchema(): SchemaMetadata {
   const tables: Record<string, TableMetadata> = {};
