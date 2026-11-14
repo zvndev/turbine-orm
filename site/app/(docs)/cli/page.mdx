@@ -90,7 +90,7 @@ It writes `types.ts` (entity and input types), `metadata.ts` (the runtime `Schem
 | `--keep-column-names` | Use raw column names (`created_at`) as field names. Config: `keepColumnNames`. |
 | `--no-timestamp` | Omit the `Generated at` header, for byte-identical output. |
 | `--import-ext <mode>` | Extension on imports between generated files: `js`, `ts`, `none` or `auto` (default). Config: `importExtension`. |
-| `--legacy-to-many-uniques` | Type a child with a unique foreign key as `hasMany` instead of `hasOne`. Config: `legacyToManyUniques`. |
+| `--legacy-to-many-uniques` | Type a child with a unique foreign key as `hasMany` under its plural name (`profiles`) instead of a `hasOne` named with the singular (`profile`). Config: `legacyToManyUniques`. |
 | `--allow-empty` | Generate even when no tables match. |
 
 - **Column tags.** `generate` reads the `pii`, `updatedAt`, `maxLength` and `tsType` tags from your schema file, since the database cannot store them. A named file that is missing or fails to load stops the command; a missing default is skipped. See [How generate picks up the tags](/schema#how-generate-picks-up-the-tags).

@@ -44,7 +44,7 @@ The module exports no commands and opens no connection, so importing it has no s
 | `relationNames` | none | `{ table: { derivedName: newName } }`. See [Renaming derived relations](/cli#renaming-derived-relations-relationnames). |
 | `importExtension` | `'auto'` | Imports in the generated `index.ts`: `'js'`, `'ts'`, `'none'`, or `'auto'` (from your tsconfig, else `'js'`). |
 | `keepColumnNames` | `false` | Use raw column names as field names instead of camelCase. |
-| `legacyToManyUniques` | `false` | Type a child with a unique foreign key as `hasMany` instead of `hasOne`. |
+| `legacyToManyUniques` | `false` | Type a child with a unique foreign key as `hasMany` under its plural name (`profiles`) instead of a `hasOne` named with the singular (`profile`). |
 | `adapter` | none | A `DatabaseAdapter` such as `cockroachdb`. **The CLI does not read it.** |
 
 <Callout type="warning" title="adapter is ignored by the CLI">

@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### Behaviour changes
+
+- **Relations derive the same on every engine as on PostgreSQL.** One
+  derivation now serves PostgreSQL, SQLite (`node:sqlite` and better-sqlite3),
+  MySQL, SQL Server, local libSQL, D1 and `defineSchema`, each with its own
+  catalog facts, and a test creates one schema natively on each engine and
+  compares the results. The four cross-engine differences listed for 0.94.0
+  are gone. PostgreSQL's output is unchanged. What changes elsewhere:
+  - A junction table with no primary key, keyed by a two-column unique index
+    over its two foreign keys (Prisma's implicit many-to-many shape), now gets
+    `manyToMany` on both sides. Before, only a two-column primary key counted
+    off PostgreSQL. `defineSchema` reads a declared two-column
+    `indexes: [{ columns, unique: true }]` entry the same way.
+  - Relations carry the foreign key's `onDelete` and `onUpdate`, as they
+    already did on PostgreSQL and through `schemaDefToMetadata`. This adds
+    fields to generated metadata and changes no query.
+  - When two composite foreign keys from one table point at the same target,
+    their names come from the constraint names. SQLite, libSQL and D1 now read
+    a declared `CONSTRAINT` name from the `CREATE TABLE` text. A name the
+    engine generated (MySQL `returns_ibfk_1`, SQL Server `FK__returns__...`
+    with a random suffix) or no name at all now counts as the name PostgreSQL
+    would have generated, `returns_tenant_id_order_id_fkey`. Such relations
+    are renamed, for example from `returnsIbfk_1` to `returnsTenantIdOrderId`.
+  - When two foreign keys want one name, the first in source table and
+    constraint name order keeps it, on every engine. Before, the order was
+    whatever the catalog returned, and declaration order for `defineSchema`.
+    Generated files for these engines and for `defineSchema` can list
+    relations in a different order as a result.
+  - Pin any relation name that moved with `relationNames`.
+    [Details, and the edge cases that still differ](docs/relation-names.md#known-differences).
+
 ## 0.94.0 (2026-11-15)
 
 Five new engines and transports, a CLI project lifecycle for SQLite, MySQL,

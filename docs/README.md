@@ -32,7 +32,7 @@ does not have them.
 | [MySQL metadata](mysql-introspection-metadata.md) | Native generated columns, complex key facts and conservative relation cardinality |
 | [SQL Server tools](sql-server-tools.md) | 0.94.0 fixed catalog reads and compilation; native suite in the `mssql-integration` job |
 | [SQL Server metadata](mssql-introspection-metadata.md) | Scoped key/default/generated facts and conservative relation cardinality |
-| [Relation names across engines](relation-names.md) | The unique foreign key to-one rule, which entry points take `legacyToManyUniques` and `relationNames`, and the known cross-engine differences |
+| [Relation names across engines](relation-names.md) | The unique foreign key to-one rule, which entry points take `legacyToManyUniques` and `relationNames`, and the edge cases that still differ across engines |
 | [Usage guide](USING-TURBINE-ORM.md) | Repository guide to query and schema APIs |
 | [Prisma migration guide](migrate-from-prisma.md) | Compatibility tooling and migration steps |
 | [Benchmarks](../benchmarks/README.md) | Reproduction, exact headline checks and remaining measurement limits |
