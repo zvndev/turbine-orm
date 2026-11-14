@@ -87,7 +87,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createRequire } from 'node:module';
 import type { DatabaseSync } from 'node:sqlite';
-import { sqliteToOneForeignKey } from './catalog-metadata.js';
 import {
   type DisconnectOptions,
   type DisconnectResult,
@@ -109,21 +108,26 @@ import {
   applyTableFilters,
   assertDistinctColumnFields,
   type IntrospectOptions as CatalogIntrospectOptions,
-  deriveEngineRelations,
+  defaultForeignKeyConstraintName,
+  deriveRelations,
   nullRecord,
   printableCatalogName,
+  referentialActionFromCatalog,
+  sqliteKeyComparison,
 } from './introspect.js';
 import { withoutTrailingComment } from './query/sql-comment.js';
 import {
   type ColumnMetadata,
   type IndexMetadata,
   isDateType,
+  type ReferentialAction,
   type RelationDef,
   type SchemaMetadata,
   snakeToCamel,
   type TableMetadata,
 } from './schema.js';
 import { rewritePositionalPlaceholders } from './sql-placeholders.js';
+import { declaredForeignKeyName, declaredForeignKeyNames } from './sqlite-constraint-names.js';
 
 export { sqliteTypeToTs } from './d1/sqlite-dialect.js';
 
@@ -1710,6 +1714,8 @@ interface PragmaForeignKey {
   table: string;
   from: string;
   to: string | null;
+  on_update: string;
+  on_delete: string;
 }
 interface PragmaIndex {
   seq: number;
@@ -1784,6 +1790,8 @@ export function introspectSqliteDatabase(
     constraintName: string;
   }
   const foreignKeys: FKEntry[] = [];
+  const constraintNames = new Set<string>();
+  const relationActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
 
   for (const tableName of tableNames) {
     const q = (name: string) => `"${name.replace(/"/g, '""')}"`;
@@ -1839,6 +1847,7 @@ export function introspectSqliteDatabase(
     const fks = pragma<PragmaForeignKey>(db, `PRAGMA main.foreign_key_list(${q(tableName)})`);
     // Group by FK id (composite FKs share an id), ordered by seq.
     const fkById = new Map<number, FKEntry>();
+    const fkActions = new Map<number, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
     for (const fk of fks.sort((a, b) => a.id - b.id || a.seq - b.seq)) {
       let entry = fkById.get(fk.id);
       if (!entry) {
@@ -1847,15 +1856,28 @@ export function introspectSqliteDatabase(
           sourceColumns: [],
           targetTable: fk.table,
           targetColumns: [],
-          constraintName: `fk_${tableName}_${fk.id}`,
+          constraintName: '',
         };
         fkById.set(fk.id, entry);
+        fkActions.set(fk.id, {
+          onDelete: referentialActionFromCatalog(fk.on_delete),
+          onUpdate: referentialActionFromCatalog(fk.on_update),
+        });
       }
       entry.sourceColumns.push(fk.from);
       // `to` is null when the FK references the target's PK implicitly.
       if (fk.to) entry.targetColumns.push(fk.to);
     }
-    for (const entry of fkById.values()) {
+    const declaredNames = declaredForeignKeyNames(tableDefinitions.get(tableName) ?? '');
+    for (const [fkId, entry] of fkById) {
+      // SQLite's catalog names no constraint, and relation naming reads the
+      // name for a composite FK: take it from the CREATE TABLE text, else the
+      // name PostgreSQL would give it.
+      const declared = declaredForeignKeyName(declaredNames, entry.sourceColumns, entry.targetTable);
+      if (declared !== undefined) constraintNames.add(declared);
+      entry.constraintName =
+        declared ?? defaultForeignKeyConstraintName(tableName, entry.sourceColumns, constraintNames);
+      relationActions.set(`${tableName}::${entry.constraintName}`, fkActions.get(fkId)!);
       if (entry.targetColumns.length === 0) {
         // Implicit reference → the target table's primary key.
         const targetPk = pragma<PragmaColumn>(db, `PRAGMA main.table_xinfo(${q(entry.targetTable)})`)
@@ -1911,26 +1933,29 @@ export function introspectSqliteDatabase(
   }
 
   // ----- Build relations from foreign keys (belongsTo + hasMany + m2m) -----
-  // Delegated to the SHARED introspection pipeline (introspect.ts) so SQLite
-  // derives IDENTICAL relation names to the Postgres introspector for the
-  // same logical schema, legacy-first naming, per-column disambiguation,
-  // collision resolution against scalar column fields, and the conservative
-  // pure-junction manyToMany auto-detection included.
+  // Delegated to the ONE relation derivation every engine calls, so SQLite
+  // derives the relations PostgreSQL derives for the same schema. What SQLite
+  // contributes is its own facts: which column sets are unique keys, and when a
+  // foreign key compares the way its key does (affinity), which together decide
+  // a to-one before it is named.
   // One field per column, as the PostgreSQL introspector requires.
   for (const [tableName, cols] of columnsByTable) assertDistinctColumnFields(tableName, cols);
-  // A to-one is decided per foreign key BEFORE naming, so it is named as
-  // PostgreSQL names it (`users.profile`); the shared test is the libSQL and D1
-  // one, so every SQLite introspector gives the same answer.
-  const relationsByTable = deriveEngineRelations(
+  // The comparison test is the one every SQLite introspector shares (libSQL
+  // and D1 included), so they all give the same answer.
+  const relationsByTable = deriveRelations({
     tableNames,
     foreignKeys,
     pkByTable,
     columnsByTable,
-    options.logger,
-    options.legacyToManyUniques
-      ? undefined
-      : sqliteToOneForeignKey(columnsByTable, relationUniqueByTable, tableDefinitions, tableFlags!),
-  );
+    uniqueKeysByTable: relationUniqueByTable,
+    sameKeyComparison: sqliteKeyComparison(columnsByTable, tableDefinitions, tableFlags!),
+    junctionKeysByTable: new Map(
+      Array.from(uniqueByTable, ([table, keys]) => [table, keys.filter((key) => key.length === 2)]),
+    ),
+    fkActions: relationActions,
+    ...(options.legacyToManyUniques ? { legacyToManyUniques: true } : {}),
+    ...(options.logger ? { logger: options.logger } : {}),
+  });
 
   // ----- Assemble TableMetadata -----
   const tables: Record<string, TableMetadata> = nullRecord<TableMetadata>();

@@ -448,11 +448,11 @@ function resolveRelationNameCollision(
  *   from {@link detectUniqueForeignKeySets}). A reverse relation whose FK column
  *   set EXACTLY matches one of the child's unique sets is emitted as `hasOne`
  *   (to-one) instead of `hasMany`, and named with the SINGULAR of the child
- *   table (falling back to the legacy plural name on collision). The engine
- *   introspectors pass a function instead, deciding each foreign key on its own
- *   (a unique key alone is not enough there: the key must also compare the way
- *   the join does, which depends on the parent column too). Omit it to keep
- *   every reverse relation `hasMany`.
+ *   table (falling back to the legacy plural name on collision).
+ *   {@link deriveRelations} passes a function instead, deciding each foreign
+ *   key on its own (on most engines a unique key alone is not enough: the key
+ *   must also compare the way the join does, which depends on the parent column
+ *   too). Omit it to keep every reverse relation `hasMany`.
  */
 export function buildRelationsFromForeignKeys(
   foreignKeys: ForeignKeyEntry[],
@@ -756,56 +756,219 @@ export function addAutoManyToManyRelations(
 }
 
 /**
- * One-stop relation derivation for the engine introspectors (SQLite / MySQL /
- * MSSQL): filters the FK list to the introspected table set, seeds the
- * taken-name / json-shadow maps from the engine's column metadata, and runs
- * the SAME `buildRelationsFromForeignKeys` + `addAutoManyToManyRelations`
- * pipeline as the Postgres introspector, so every engine derives identical
- * relation names for the same logical schema (the engines previously carried
- * stale copies of a retired naming scheme).
+ * The constraint name PostgreSQL gives a foreign key nobody named:
+ * `<table>_<column>[_<column>...]_fkey`, truncated the way PostgreSQL truncates
+ * an identifier to 63 bytes (the longer of the two parts first), with a counter
+ * after `fkey` while the name is in `taken`.
  *
- * `isToOne` decides, per foreign key, whether the reverse relation is a to-one.
- * It must be decided HERE, before naming, and not by flipping the type of a
- * relation already named: a to-one is named with the singular of the child
- * table (`users.profile`), as PostgreSQL names it, and a flip afterwards kept
- * the to-many's plural (`users.profiles`). Omit it (the `legacyToManyUniques`
- * opt-out does) to keep every reverse relation `hasMany`.
+ * A relation name reads the constraint name in exactly one shape, a COMPOSITE
+ * foreign key that shares its target with another foreign key from the same
+ * table. Engines disagree about what an unnamed constraint is called (MySQL
+ * `orders_ibfk_1`, SQL Server `FK__orders__tenan__1A2B3C4D` with a random
+ * suffix, SQLite nothing at all), so an engine introspector passes this name for
+ * a constraint the user did not name, and that shape derives the same relation
+ * names as on PostgreSQL (and, on SQL Server, the same names on every database).
+ * Pass one `taken` set per introspection so two synthesized names cannot collide.
  */
-export function deriveEngineRelations(
-  tableNames: string[],
-  foreignKeys: ForeignKeyEntry[],
-  pkByTable: Map<string, string[]>,
-  columnsByTable: Map<string, Pick<ColumnMetadata, 'name' | 'field' | 'tsType'>[]>,
-  logger: TurbineLogger = consoleLogger,
-  isToOne?: (fk: ForeignKeyEntry) => boolean,
-): Map<string, Record<string, RelationDef>> {
-  const tableSet = new Set(tableNames);
-  const fks = foreignKeys.filter((fk) => tableSet.has(fk.sourceTable) && tableSet.has(fk.targetTable));
+export function defaultForeignKeyConstraintName(table: string, columns: string[], taken?: Set<string>): string {
+  const PG_NAME_BYTES = 63;
+  const bytesOf = (s: string): number => {
+    let n = 0;
+    for (const ch of s) {
+      const code = ch.codePointAt(0)!;
+      n += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+    }
+    return n;
+  };
+  const clip = (s: string, bytes: number): string => {
+    let out = '';
+    for (const ch of s) {
+      if (bytesOf(out + ch) > bytes) break;
+      out += ch;
+    }
+    return out;
+  };
+  // ChooseForeignKeyConstraintNameAddition: columns joined by `_`, stopping
+  // once the addition reaches NAMEDATALEN.
+  let addition = '';
+  for (const column of columns) {
+    if (addition.length > 0) addition += '_';
+    addition += column;
+    if (bytesOf(addition) >= PG_NAME_BYTES + 1) break;
+  }
+  // makeObjectName + ChooseConstraintName.
+  for (let pass = 0; ; pass++) {
+    const label = pass === 0 ? 'fkey' : `fkey${pass}`;
+    let tableBytes = bytesOf(table);
+    let additionBytes = bytesOf(addition);
+    const available = PG_NAME_BYTES - (label.length + 2);
+    while (tableBytes + additionBytes > available) {
+      if (tableBytes > additionBytes) tableBytes--;
+      else additionBytes--;
+    }
+    const name = `${clip(table, tableBytes)}_${clip(addition, additionBytes)}_${label}`;
+    if (!taken?.has(name)) {
+      taken?.add(name);
+      return name;
+    }
+  }
+}
+
+/**
+ * A catalog's ON DELETE / ON UPDATE rule (`CASCADE`, `SET NULL`, SQL Server's
+ * `NO_ACTION`, ...) as a {@link ReferentialAction}. Anything else is
+ * `no action`, the SQL default.
+ */
+export function referentialActionFromCatalog(rule: unknown): ReferentialAction {
+  const action = typeof rule === 'string' ? rule.trim().toLowerCase().replace(/_/g, ' ') : '';
+  return action === 'cascade' || action === 'restrict' || action === 'set null' || action === 'set default'
+    ? action
+    : 'no action';
+}
+
+/** Everything {@link deriveRelations} reads: one engine's catalog facts. */
+export interface RelationCatalogFacts {
+  /** The introspected table set, after include / exclude filtering. */
+  tableNames: string[];
+  /** One entry per foreign-key constraint. One whose source or target is not in `tableNames` is ignored. */
+  foreignKeys: ForeignKeyEntry[];
+  /** Primary-key columns per table. */
+  pkByTable: Map<string, string[]>;
+  /** Column metadata per table (only name / field / tsType / pgType are read). */
+  columnsByTable: Map<string, Pick<ColumnMetadata, 'name' | 'field' | 'tsType' | 'pgType'>[]>;
+  /** Enum types, so an enum column (tsType `unknown` here) is not mistaken for a json/jsonb shadow. */
+  enums?: Record<string, readonly string[]>;
+  /**
+   * Per table, every column set that holds at most one row under the engine's
+   * own rules: the primary key, UNIQUE constraints and plain, non-partial
+   * UNIQUE indexes. A foreign key whose columns are exactly one of its child
+   * table's sets makes the reverse relation to-one.
+   */
+  uniqueKeysByTable?: Map<string, string[][]>;
+  /**
+   * Whether the engine compares a foreign key's child and parent columns the
+   * way the child's unique key compares them (same type, affinity, collation).
+   * When it does not, two children the key keeps apart can match one parent,
+   * so the key proves nothing for THAT foreign key. Decided per foreign key: a
+   * second foreign key over the same columns that fails it does not change the
+   * first one's answer. Absent: always.
+   */
+  sameKeyComparison?: (fk: ForeignKeyEntry) => boolean;
+  /** Two-column UNIQUE keys that stand in for a missing primary key on a junction table. */
+  junctionKeysByTable?: Map<string, string[][]>;
+  /** Referential actions keyed `<table>::<constraint>` (or the bare constraint name). */
+  fkActions?: Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>;
+  /**
+   * `tableNames` and `foreignKeys` are already in PostgreSQL's catalog order
+   * (source table, then constraint name, as the server orders `name`), so they
+   * are taken as given and not sorted again. The PostgreSQL catalog reader sets
+   * it, which keeps its output exactly what its own catalog order gives.
+   */
+  inCatalogOrder?: boolean;
+  /** Keep every reverse relation `hasMany` under its plural name, the output before the to-one rule. */
+  legacyToManyUniques?: boolean;
+  /** Where relation-naming notes go. Defaults to the console logger. */
+  logger?: TurbineLogger;
+}
+
+/**
+ * PostgreSQL's order for `name`, which compares bytes: for UTF-8 that is code
+ * point order. JavaScript's `<` compares UTF-16 code units instead, which puts a
+ * character above U+FFFF (a surrogate pair) BEFORE one in U+E000..U+FFFF, so two
+ * differing units at or above U+D800 are compared as the code points they
+ * encode.
+ */
+function compareCatalogNames(a: string, b: string): number {
+  const length = Math.min(a.length, b.length);
+  for (let i = 0; i < length; i++) {
+    let x = a.charCodeAt(i);
+    let y = b.charCodeAt(i);
+    if (x === y) continue;
+    if (x >= 0xd800 && y >= 0xd800) {
+      // Surrogates (U+D800..U+DFFF) move above U+E000..U+FFFF.
+      x += x >= 0xe000 ? -0x800 : 0x2000;
+      y += y >= 0xe000 ? -0x800 : 0x2000;
+    }
+    return x - y;
+  }
+  return a.length - b.length;
+}
+
+/**
+ * THE relation derivation. Every surface that turns a schema into relations
+ * calls it with its own catalog facts: the PostgreSQL introspector and the MCP
+ * server (via `deriveCatalogRelations`), the SQLite, MySQL, SQL Server, libSQL
+ * and D1 introspectors, and `schemaDefToMetadata` for a `defineSchema` schema.
+ * The same schema therefore derives the same relations on every engine:
+ * `src/test/relation-derivation-parity.test.ts` creates one schema natively on
+ * each and holds them all to PostgreSQL's answer.
+ *
+ * Two things live here rather than in each caller, because each is where the
+ * engines used to drift:
+ *
+ *   - CARDINALITY IS DECIDED BEFORE NAMING, one foreign key at a time. A to-one
+ *     reverse relation is named with the singular of its table
+ *     (`users.profile`), so the engines that flipped `hasMany` to `hasOne` after
+ *     naming kept the plural (`profiles`) and accepted a different `with` key
+ *     than PostgreSQL for the same schema. Each engine states what a unique key
+ *     is and how its columns compare
+ *     ({@link RelationCatalogFacts.uniqueKeysByTable},
+ *     {@link RelationCatalogFacts.sameKeyComparison}) and the decision is made
+ *     once, here.
+ *   - FOREIGN KEYS ARE TAKEN IN ONE ORDER, source table then constraint name.
+ *     The first foreign key to claim a contested name keeps it, and the
+ *     catalogs return them in different orders (PostgreSQL by table and
+ *     constraint, MySQL by constraint name, SQLite by PRAGMA id).
+ */
+export function deriveRelations(facts: RelationCatalogFacts): Map<string, Record<string, RelationDef>> {
+  const tableSet = new Set(facts.tableNames);
+  const foreignKeys = facts.foreignKeys.filter((fk) => tableSet.has(fk.sourceTable) && tableSet.has(fk.targetTable));
+  if (!facts.inCatalogOrder) {
+    foreignKeys.sort(
+      (a, b) =>
+        compareCatalogNames(a.sourceTable, b.sourceTable) || compareCatalogNames(a.constraintName, b.constraintName),
+    );
+  }
+  const enums = facts.enums ?? {};
 
   const columnFieldsByTable = new Map<string, Set<string>>();
   const unknownTypedFieldsByTable = new Map<string, Set<string>>();
-  for (const [tbl, cols] of columnsByTable) {
+  for (const [tbl, cols] of facts.columnsByTable) {
     columnFieldsByTable.set(tbl, new Set(cols.map((c) => c.field)));
-    unknownTypedFieldsByTable.set(tbl, new Set(cols.filter((c) => isUnknownTsType(c.tsType)).map((c) => c.field)));
+    // Enum-typed columns also report tsType 'unknown' here, but generate.ts
+    // gives them a concrete union type, so a shadow of one is type-broken and
+    // must NOT be preserved as a historical json/jsonb shadow.
+    unknownTypedFieldsByTable.set(
+      tbl,
+      new Set(cols.filter((c) => isUnknownTsType(c.tsType) && !Object.hasOwn(enums, c.pgType)).map((c) => c.field)),
+    );
   }
 
+  const { uniqueKeysByTable, sameKeyComparison } = facts;
+  const isToOne = facts.legacyToManyUniques
+    ? undefined
+    : (fk: ForeignKeyEntry) =>
+        (uniqueKeysByTable?.get(fk.sourceTable) ?? []).some((key) => columnSetsEqual(key, fk.sourceColumns)) &&
+        (sameKeyComparison === undefined || sameKeyComparison(fk));
+
+  const logger = facts.logger ?? consoleLogger;
   const relationsByTable = buildRelationsFromForeignKeys(
-    fks,
+    foreignKeys,
     columnFieldsByTable,
-    undefined,
+    facts.fkActions,
     unknownTypedFieldsByTable,
     isToOne,
     logger,
   );
   addAutoManyToManyRelations(
-    tableNames,
-    fks,
-    pkByTable,
-    new Map(Array.from(columnsByTable, ([tbl, cols]) => [tbl, cols.map((c) => c.name)])),
+    facts.inCatalogOrder ? facts.tableNames : [...facts.tableNames].sort(compareCatalogNames),
+    foreignKeys,
+    facts.pkByTable,
+    new Map(Array.from(facts.columnsByTable, ([tbl, cols]) => [tbl, cols.map((c) => c.name)])),
     relationsByTable,
     columnFieldsByTable,
     unknownTypedFieldsByTable,
-    undefined,
+    facts.junctionKeysByTable,
     logger,
   );
   return relationsByTable;
@@ -824,27 +987,26 @@ function sqliteComparisonAffinity(declared: string, strict: boolean): string {
 }
 
 /**
- * The SQLite to-one test, one foreign key at a time, shared by every SQLite
- * introspector (node:sqlite, better-sqlite3, libSQL, D1) so they cannot
- * disagree. The child's columns must be exactly a unique key that compares the
- * way the join does:
+ * SQLite's {@link RelationCatalogFacts.sameKeyComparison}, shared by every
+ * SQLite introspector (node:sqlite, better-sqlite3, libSQL, D1) so they cannot
+ * disagree. A child's unique key proves a to-one only when the foreign key
+ * compares the way the join does:
  *
  * - The same comparison affinity on both sides. A TEXT unique FK can store both
  *   '1' and '01', and both match the INTEGER parent 1 after affinity is applied,
  *   so index uniqueness alone cannot justify a to-one.
  * - No collation that could make two distinct child values match one parent.
  *   Column collations are absent from the catalog, so the test reads the DDL
- *   and refuses on any `COLLATE` it finds. `relationUniqueByTable` already
- *   leaves out every child key of a table or index that mentions one. On the
- *   parent side a key that is the rowid alias needs no such check: it holds
- *   only integers, which compare as numbers whatever the collation. Any other
- *   parent key is refused when the parent's DDL mentions `COLLATE`, because a
- *   `NOCASE` parent key lets the child values 'a' and 'A' both reference the
- *   parent 'a'.
+ *   and refuses on any `COLLATE` it finds. The child's unique keys (the
+ *   introspector's `uniqueKeysByTable`) already leave out every key of a table
+ *   or index that mentions one. On the parent side a key that is the rowid
+ *   alias needs no such check: it holds only integers, which compare as numbers
+ *   whatever the collation. Any other parent key is refused when the parent's
+ *   DDL mentions `COLLATE`, because a `NOCASE` parent key lets the child values
+ *   'a' and 'A' both reference the parent 'a'.
  */
-export function sqliteToOneForeignKey(
+export function sqliteKeyComparison(
   columnsByTable: Map<string, ColumnMetadata[]>,
-  relationUniqueByTable: Map<string, string[][]>,
   tableDefinitions: Map<string, string>,
   tableFlags: Map<string, { strict: number }>,
 ): (fk: ForeignKeyEntry) => boolean {
@@ -865,8 +1027,7 @@ export function sqliteToOneForeignKey(
           sqliteComparisonAffinity(from.pgType, tableFlags.get(fk.sourceTable)?.strict === 1) ===
             sqliteComparisonAffinity(to.pgType, tableFlags.get(fk.targetTable)?.strict === 1)
         );
-      }) &&
-      (relationUniqueByTable.get(fk.sourceTable) ?? []).some((key) => columnSetsEqual(key, fk.sourceColumns))
+      })
     );
   };
 }

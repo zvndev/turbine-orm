@@ -15,9 +15,10 @@
  * set, PostgreSQL included: PostgreSQL is the reference, and the integration
  * job is what proves the expected values are what it really derives.
  *
- * The second half pins the cross-engine differences that are KNOWN and left
- * alone (docs/engines.md lists them), each with every engine's exact output, so
- * changing one of them is a deliberate act that fails here first.
+ * The second half holds the engines to PostgreSQL on shapes they used to
+ * derive differently even without a unique foreign key: a junction keyed by a
+ * unique index, referential actions, unnamed composite foreign keys sharing a
+ * target, and a name two relations compete for.
  *
  * WHERE IT RUNS. Code-first and node:sqlite in the unit lane; better-sqlite3
  * when the optional binding loads (CI names it with TURBINE_SQLITE_BINDING_PEER,
@@ -91,13 +92,6 @@ interface Case {
   noCodeFirst?: string;
   /** What PostgreSQL derives, the reference every engine is held to. */
   expected: Relations;
-}
-
-interface KnownDifference {
-  name: string;
-  tables: TableSpec[];
-  /** Each harness's exact output. The SQLite drivers share one value. */
-  expected: Partial<Record<HarnessName | 'sqlite', Relations>>;
 }
 
 const id = (): ColSpec => ({ name: 'id', type: 'int', notNull: true });
@@ -304,16 +298,15 @@ const CASES: Case[] = [
 ];
 
 // ---------------------------------------------------------------------------
-// Known differences, left alone deliberately. None involves a unique foreign
-// key, and each output here is what the engine derived before the to-one change
-// as well.
+// Shapes the engines used to derive differently. None involves a unique
+// foreign key; each comes out as PostgreSQL derives it now that every engine
+// calls the one derivation with its own catalog facts.
 // ---------------------------------------------------------------------------
 
-const KNOWN_DIFFERENCES: KnownDifference[] = [
+CASES.push(
   {
-    // PostgreSQL accepts a two-column UNIQUE index in place of a junction's
-    // primary key (Prisma's implicit many-to-many tables have none). The other
-    // engines, and code-first, need the primary key.
+    // A two-column UNIQUE index in place of a junction's primary key (Prisma's
+    // implicit many-to-many tables have none).
     name: 'junction table keyed by a unique index, no primary key',
     tables: [
       t('posts', [id(), text('title')]),
@@ -324,27 +317,19 @@ const KNOWN_DIFFERENCES: KnownDifference[] = [
         foreignKeys: [fk('post_id', 'posts'), fk('tag_id', 'tags')],
       }),
     ],
-    expected: (() => {
-      const base: Relations = {
-        posts: { postTagLinks: hasMany('post_tag_links', 'post_id') },
-        tags: { postTagLinks: hasMany('post_tag_links', 'tag_id') },
-        post_tag_links: { post: belongsTo('posts', 'post_id'), tag: belongsTo('tags', 'tag_id') },
-      };
-      return {
-        postgres: {
-          ...base,
-          posts: { ...base.posts, tags: manyToMany('tags', 'post_tag_links', 'post_id', 'tag_id') },
-          tags: { ...base.tags, posts: manyToMany('posts', 'post_tag_links', 'tag_id', 'post_id') },
-        },
-        sqlite: base,
-        mysql: base,
-        'code-first': base,
-      };
-    })(),
+    expected: {
+      posts: {
+        postTagLinks: hasMany('post_tag_links', 'post_id'),
+        tags: manyToMany('tags', 'post_tag_links', 'post_id', 'tag_id'),
+      },
+      tags: {
+        postTagLinks: hasMany('post_tag_links', 'tag_id'),
+        posts: manyToMany('posts', 'post_tag_links', 'tag_id', 'post_id'),
+      },
+      post_tag_links: { post: belongsTo('posts', 'post_id'), tag: belongsTo('tags', 'tag_id') },
+    },
   },
   {
-    // PostgreSQL and code-first carry onDelete / onUpdate; the other engines'
-    // introspectors do not read referential actions.
     name: 'referential actions',
     tables: [
       USERS,
@@ -352,23 +337,15 @@ const KNOWN_DIFFERENCES: KnownDifference[] = [
         foreignKeys: [fk('user_id', 'users', 'id', { onDelete: 'cascade' })],
       }),
     ],
-    expected: (() => {
-      const plain: Relations = {
-        users: { posts: hasMany('posts', 'user_id') },
-        posts: { user: belongsTo('users', 'user_id') },
-      };
-      const withActions: Relations = {
-        users: { posts: { ...hasMany('posts', 'user_id'), onDelete: 'cascade' } },
-        posts: { user: { ...belongsTo('users', 'user_id'), onDelete: 'cascade' } },
-      };
-      return { postgres: withActions, 'code-first': withActions, sqlite: plain, mysql: plain };
-    })(),
+    expected: {
+      users: { posts: { ...hasMany('posts', 'user_id'), onDelete: 'cascade' } },
+      posts: { user: { ...belongsTo('users', 'user_id'), onDelete: 'cascade' } },
+    },
   },
   {
     // Two composite foreign keys to one target are named from their constraint
-    // names, and each engine names an unnamed constraint differently:
-    // PostgreSQL `returns_tenant_id_order_id_fkey`, MySQL `returns_ibfk_1`,
-    // SQLite keeps no name (the introspector uses `fk_<table>_<id>`).
+    // names. An unnamed constraint is read as the name PostgreSQL gives it
+    // (`returns_tenant_id_order_id_fkey`), whatever the engine called it.
     name: 'two composite foreign keys to one target, unnamed',
     tables: [
       t('orders', [int('tenant_id', { notNull: true }), int('id', { notNull: true })], {
@@ -385,53 +362,25 @@ const KNOWN_DIFFERENCES: KnownDifference[] = [
         },
       ),
     ],
-    expected: (() => {
-      const original = ['tenant_id', 'order_id'];
-      const replacement = ['tenant_id', 'replacement_id'];
-      const ref = ['tenant_id', 'id'];
-      return {
-        postgres: {
-          orders: {
-            returnsByReturnsTenantIdOrderId: hasMany('returns', original, ref),
-            returnsByReturnsTenantIdReplacementId: hasMany('returns', replacement, ref),
-          },
-          returns: {
-            returnsTenantIdOrderId: belongsTo('orders', original, ref),
-            returnsTenantIdReplacementId: belongsTo('orders', replacement, ref),
-          },
-        },
-        // PRAGMA foreign_key_list numbers the LAST declared foreign key 0.
-        sqlite: {
-          orders: {
-            returnsByReturns_0: hasMany('returns', replacement, ref),
-            returnsByReturns_1: hasMany('returns', original, ref),
-          },
-          returns: {
-            returns_0: belongsTo('orders', replacement, ref),
-            returns_1: belongsTo('orders', original, ref),
-          },
-        },
-        mysql: {
-          orders: {
-            returnsByReturnsIbfk_1: hasMany('returns', original, ref),
-            returnsByReturnsIbfk_2: hasMany('returns', replacement, ref),
-          },
-          returns: {
-            returnsIbfk_1: belongsTo('orders', original, ref),
-            returnsIbfk_2: belongsTo('orders', replacement, ref),
-          },
-        },
-      };
-    })(),
+    noCodeFirst: 'defineSchema `references` is single-column',
+    expected: {
+      orders: {
+        returnsByReturnsTenantIdOrderId: hasMany('returns', ['tenant_id', 'order_id'], ['tenant_id', 'id']),
+        returnsByReturnsTenantIdReplacementId: hasMany('returns', ['tenant_id', 'replacement_id'], ['tenant_id', 'id']),
+      },
+      returns: {
+        returnsTenantIdOrderId: belongsTo('orders', ['tenant_id', 'order_id'], ['tenant_id', 'id']),
+        returnsTenantIdReplacementId: belongsTo('orders', ['tenant_id', 'replacement_id'], ['tenant_id', 'id']),
+      },
+    },
   },
   {
-    // Two relations that want one name: the first foreign key in catalog order
-    // keeps it, and the catalogs order foreign keys differently. PostgreSQL
-    // walks (source table, constraint name); SQLite walks table names, then
-    // PRAGMA foreign_key_list ids, which number the LAST declared key 0. Here
-    // `notes.user` is wanted by a key to `user` (declared first, its
-    // constraint name sorts first) and a key to `users`.
-    name: 'a contested name within one table (SQLite catalog order)',
+    // Two relations that want one name: the first foreign key in (source
+    // table, constraint name) order keeps it, whatever order the catalog
+    // returned them in (SQLite numbers the LAST declared key 0). Here
+    // `notes.user` is wanted by a key to `user` (its constraint name sorts
+    // first) and a key to `users`.
+    name: 'a contested name within one table',
     tables: [
       t('user', [id(), text('handle')]),
       USERS,
@@ -442,51 +391,29 @@ const KNOWN_DIFFERENCES: KnownDifference[] = [
         ],
       }),
     ],
-    expected: (() => {
-      const userFirst: Relations = {
-        user: { notes: hasMany('notes', 'owner') },
-        users: { notes: hasMany('notes', 'user_id') },
-        notes: { user: belongsTo('user', 'owner'), userRel: belongsTo('users', 'user_id') },
-      };
-      const usersFirst: Relations = {
-        user: { notes: hasMany('notes', 'owner') },
-        users: { notes: hasMany('notes', 'user_id') },
-        notes: { user: belongsTo('users', 'user_id'), userRel: belongsTo('user', 'owner') },
-      };
-      return { postgres: userFirst, mysql: userFirst, 'code-first': userFirst, sqlite: usersFirst };
-    })(),
+    expected: {
+      user: { notes: hasMany('notes', 'owner') },
+      users: { notes: hasMany('notes', 'user_id') },
+      notes: { user: belongsTo('user', 'owner'), userRel: belongsTo('users', 'user_id') },
+    },
   },
   {
-    // The same race across two tables. MySQL walks constraint names alone,
-    // whichever table they belong to, so `a_users_post` (on `users`) runs
-    // before `z_post_owner` (on `post`), which PostgreSQL and SQLite reach
-    // first because `post` sorts before `users`. Both want `users.post`.
-    name: 'a contested name across tables (MySQL catalog order)',
+    // The same race across two tables. MySQL's catalog orders by constraint
+    // name alone, so `a_users_post` (on `users`) came before `z_post_owner`
+    // (on `post`); the source table decides first. Both want `users.post`.
+    name: 'a contested name across tables',
     tables: [
       t('posts', [id(), text('title')]),
       t('users', [id(), int('post_id')], { foreignKeys: [fk('post_id', 'posts', 'id', { name: 'a_users_post' })] }),
       t('post', [id(), int('owner_id')], { foreignKeys: [fk('owner_id', 'users', 'id', { name: 'z_post_owner' })] }),
     ],
-    expected: (() => {
-      const postTableFirst: Relations = {
-        posts: { users: hasMany('users', 'post_id') },
-        users: { postRel: belongsTo('posts', 'post_id'), post: hasMany('post', 'owner_id') },
-        post: { user: belongsTo('users', 'owner_id') },
-      };
-      const usersTableFirst: Relations = {
-        posts: { users: hasMany('users', 'post_id') },
-        users: { post: belongsTo('posts', 'post_id'), postRel: hasMany('post', 'owner_id') },
-        post: { user: belongsTo('users', 'owner_id') },
-      };
-      return {
-        postgres: postTableFirst,
-        sqlite: postTableFirst,
-        mysql: usersTableFirst,
-        'code-first': usersTableFirst,
-      };
-    })(),
+    expected: {
+      posts: { users: hasMany('users', 'post_id') },
+      users: { postRel: belongsTo('posts', 'post_id'), post: hasMany('post', 'owner_id') },
+      post: { user: belongsTo('users', 'owner_id') },
+    },
   },
-];
+);
 
 // ---------------------------------------------------------------------------
 // Rendering
@@ -769,15 +696,6 @@ for (const h of HARNESSES) {
       it(c.name, { skip }, async () => {
         const actual = normalize(await h.introspect(c.tables, `p${index}`));
         assert.deepEqual(actual, c.expected, `${h.name} derives different relations for "${c.name}"`);
-      });
-    }
-    for (const [index, k] of KNOWN_DIFFERENCES.entries()) {
-      const key = h.name === 'node:sqlite' || h.name === 'better-sqlite3' ? 'sqlite' : h.name;
-      const expected = k.expected[key];
-      // A shape the code-first path cannot express has no code-first value.
-      it(`known difference: ${k.name}`, { skip: expected ? false : 'not expressible on this path' }, async () => {
-        const actual = normalize(await h.introspect(k.tables, `k${index}`));
-        assert.deepEqual(actual, expected, `${h.name} changed a known cross-engine difference: "${k.name}"`);
       });
     }
   });

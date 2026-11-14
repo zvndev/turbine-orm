@@ -102,7 +102,15 @@ import {
   UnsupportedFeatureError,
   ValidationError,
 } from './errors.js';
-import { applyTableFilters, assertDistinctColumnFields, deriveEngineRelations, nullRecord } from './introspect.js';
+import {
+  applyTableFilters,
+  assertDistinctColumnFields,
+  defaultForeignKeyConstraintName,
+  deriveRelations,
+  nullRecord,
+  type RelationCatalogFacts,
+  referentialActionFromCatalog,
+} from './introspect.js';
 import { consoleLogger, logTo } from './logger.js';
 import importOptionalPeer from './optional-peer-import.cjs';
 import type { TransactionRecovery } from './pg-types.js';
@@ -110,6 +118,7 @@ import {
   type ColumnMetadata,
   type IndexMetadata,
   isDateType,
+  type ReferentialAction,
   type RelationDef,
   type SchemaMetadata,
   snakeToCamel,
@@ -1731,6 +1740,8 @@ interface InfoFk extends InfoKey {
   REFERENCED_TABLE_NAME: string;
   REFERENCED_COLUMN_NAME: string;
   CONSTRAINT_NAME: string;
+  UPDATE_RULE?: string | null;
+  DELETE_RULE?: string | null;
 }
 interface InfoIndex {
   TABLE_NAME: string;
@@ -1757,22 +1768,15 @@ interface FKEntry {
 }
 
 /**
- * Derive relations from the FK list via the SHARED introspection pipeline
- * (`deriveEngineRelations` → `buildRelationsFromForeignKeys` +
- * `addAutoManyToManyRelations` in introspect.ts), so this engine derives
- * IDENTICAL relation names to `turbine generate` against Postgres for the
- * same logical schema, legacy-first naming, per-column disambiguation, and
- * collision resolution against scalar column fields included.
+ * Derive relations through the ONE relation derivation every engine calls
+ * (`deriveRelations` in catalog-metadata.ts), so this engine derives the
+ * relations `turbine generate` derives against PostgreSQL for the same schema.
+ * MySQL contributes its own facts: its unique keys, the column domains under
+ * which a key also enforces the join (`mysqlSameKeyEquality`), and its
+ * referential actions.
  */
-function buildRelationsFromForeignKeys(
-  tableNames: string[],
-  foreignKeys: FKEntry[],
-  pkByTable: Map<string, string[]>,
-  columnsByTable: Map<string, ColumnMetadata[]>,
-  logger: IntrospectOptions['logger'],
-  isToOne?: (fk: FKEntry) => boolean,
-): Map<string, Record<string, RelationDef>> {
-  return deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable, logger, isToOne);
+function buildRelationsFromForeignKeys(facts: RelationCatalogFacts): Map<string, Record<string, RelationDef>> {
+  return deriveRelations(facts);
 }
 
 /** Only comparison domains whose native equality also enforces the unique key. */
@@ -1969,14 +1973,18 @@ export async function introspectMysqlWith(
 
   // ----- Foreign keys (grouped by constraint for composite FKs) -----
   const fkRows = (await exec(
-    `SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, CONSTRAINT_NAME, ORDINAL_POSITION
-     FROM information_schema.KEY_COLUMN_USAGE
-     WHERE TABLE_SCHEMA = :p1 AND REFERENCED_TABLE_NAME IS NOT NULL
-       AND REFERENCED_TABLE_SCHEMA = :p1
-     ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION`,
+    `SELECT k.TABLE_NAME, k.COLUMN_NAME, k.REFERENCED_TABLE_SCHEMA, k.REFERENCED_TABLE_NAME, k.REFERENCED_COLUMN_NAME,
+            k.CONSTRAINT_NAME, k.ORDINAL_POSITION, r.UPDATE_RULE, r.DELETE_RULE
+     FROM information_schema.KEY_COLUMN_USAGE k
+     LEFT JOIN information_schema.REFERENTIAL_CONSTRAINTS r
+       ON r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA AND r.CONSTRAINT_NAME = k.CONSTRAINT_NAME AND r.TABLE_NAME = k.TABLE_NAME
+     WHERE k.TABLE_SCHEMA = :p1 AND k.REFERENCED_TABLE_NAME IS NOT NULL
+       AND k.REFERENCED_TABLE_SCHEMA = :p1
+     ORDER BY k.CONSTRAINT_NAME, k.ORDINAL_POSITION`,
     [schema],
   )) as unknown as InfoFk[];
   const fkByConstraint = new Map<string, FKEntry>();
+  const fkActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
   for (const r of fkRows) {
     if (!tableSet.has(r.TABLE_NAME)) continue;
     if (r.REFERENCED_TABLE_SCHEMA !== undefined && r.REFERENCED_TABLE_SCHEMA !== schema) continue;
@@ -1991,9 +1999,25 @@ export async function introspectMysqlWith(
         constraintName: r.CONSTRAINT_NAME,
       };
       fkByConstraint.set(key, entry);
+      fkActions.set(key, {
+        onDelete: referentialActionFromCatalog(r.DELETE_RULE),
+        onUpdate: referentialActionFromCatalog(r.UPDATE_RULE),
+      });
     }
     entry.sourceColumns.push(r.COLUMN_NAME);
     entry.targetColumns.push(r.REFERENCED_COLUMN_NAME);
+  }
+  // A constraint InnoDB named itself (`<table>_ibfk_<n>`) takes the name
+  // PostgreSQL would have given it, which is what relation naming reads for a
+  // composite FK. Actions are re-keyed "<table>::<constraint>" to match.
+  const relationActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
+  const constraintNames = new Set<string>();
+  for (const [key, entry] of fkByConstraint) {
+    const generated = `${entry.sourceTable}_ibfk_`;
+    if (entry.constraintName.startsWith(generated) && /^\d+$/.test(entry.constraintName.slice(generated.length))) {
+      entry.constraintName = defaultForeignKeyConstraintName(entry.sourceTable, entry.sourceColumns, constraintNames);
+    }
+    relationActions.set(`${entry.sourceTable}::${entry.constraintName}`, fkActions.get(key)!);
   }
   const foreignKeys = [...fkByConstraint.values()].filter((fk) => tableSet.has(fk.targetTable));
 
@@ -2055,26 +2079,30 @@ export async function introspectMysqlWith(
   // PostgreSQL names it (`users.profile`): the child's columns are exactly its
   // primary key or a unique key, and each column pair compares the way the
   // enforced key does.
-  const relationsByTable = buildRelationsFromForeignKeys(
+  const relationsByTable = buildRelationsFromForeignKeys({
     tableNames,
     foreignKeys,
     pkByTable,
     columnsByTable,
-    options.logger,
-    options.legacyToManyUniques
-      ? undefined
-      : (fk) =>
-          fk.sourceColumns.length === fk.targetColumns.length &&
-          fk.sourceColumns.every((name, i) =>
-            mysqlSameKeyEquality(
-              nativeColumns.get(JSON.stringify([fk.sourceTable, name])),
-              nativeColumns.get(JSON.stringify([fk.targetTable, fk.targetColumns[i]])),
-            ),
-          ) &&
-          [pkByTable.get(fk.sourceTable) ?? [], ...(uniqueByTable.get(fk.sourceTable) ?? [])].some(
-            (key) => key.length === fk.sourceColumns.length && key.every((name) => fk.sourceColumns.includes(name)),
-          ),
-  );
+    uniqueKeysByTable: new Map(
+      tableNames.map((table) => [table, [pkByTable.get(table) ?? [], ...(uniqueByTable.get(table) ?? [])]]),
+    ),
+    // A unique key proves a to-one only when the join compares like the key.
+    sameKeyComparison: (fk) =>
+      fk.sourceColumns.length === fk.targetColumns.length &&
+      fk.sourceColumns.every((name, i) =>
+        mysqlSameKeyEquality(
+          nativeColumns.get(JSON.stringify([fk.sourceTable, name])),
+          nativeColumns.get(JSON.stringify([fk.targetTable, fk.targetColumns[i]])),
+        ),
+      ),
+    junctionKeysByTable: new Map(
+      Array.from(uniqueByTable, ([table, keys]) => [table, keys.filter((key) => key.length === 2)]),
+    ),
+    fkActions: relationActions,
+    ...(options.legacyToManyUniques ? { legacyToManyUniques: true } : {}),
+    ...(options.logger ? { logger: options.logger } : {}),
+  });
 
   // ----- Assemble TableMetadata -----
   const tables: Record<string, TableMetadata> = nullRecord<TableMetadata>();
