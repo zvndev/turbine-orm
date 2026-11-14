@@ -213,11 +213,11 @@ jobs:
           node verify.mjs missing-esm
           node verify.mjs missing-cjs
       # The shared cross-engine battery (relation reads, nested writes, upsert,
-      # transactions), the parent-scoped nested writes and the unique foreign key
-      # relation parity, on the binding as well as on node:sqlite. These files
-      # hard-code no driver: each registers a better-sqlite3 run that
-      # TURBINE_REQUIRE_SQLITE_BINDING=1 turns from a skip into a failure when the
-      # binding does not load.
+      # transactions), the parent-scoped nested writes, the unique foreign key
+      # relation parity and the relation derivation parity cases, on the binding
+      # as well as on node:sqlite. These files hard-code no driver: each
+      # registers a better-sqlite3 run that TURBINE_REQUIRE_SQLITE_BINDING=1
+      # turns from a skip into a failure when the binding does not load.
       - name: Run the shared SQLite battery and nested writes on the optional binding
         shell: bash
         run: |
@@ -225,7 +225,8 @@ jobs:
           npm install --prefix "$peer" --no-package-lock --no-audit --no-fund better-sqlite3@12.11.1
           TURBINE_REQUIRE_SQLITE_BINDING=1 TURBINE_SQLITE_BINDING_PEER="$peer/node_modules/better-sqlite3" \
             npx tsx --test src/test/cross-engine-correctness.test.ts src/test/nested-write-parent-scope.test.ts \
-            src/test/relation-unique-fk-parity.test.ts src/test/relation-unique-fk-options.test.ts
+            src/test/relation-unique-fk-parity.test.ts src/test/relation-unique-fk-options.test.ts \
+            src/test/relation-derivation-parity.test.ts
         env:
           TURBINE_REQUIRE_ENGINE: sqlite
 
