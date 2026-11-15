@@ -114,3 +114,136 @@ it('refuses trailing SQL before a PRAGMA can change state during native prepare'
     await pool.end();
   }
 });
+
+// The PRAGMA separator screen as it was first written, kept as the oracle for
+// which statements it refuses. It retried from every `[` and every `;`, which
+// is quadratic on a long run of either; the screen now scans once.
+function screenOracle(sql: string): boolean {
+  if (sql.includes('\0')) return true;
+  if (!sql.includes(';')) return false;
+  const code = sql
+    .replace(
+      /('(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\])|--[^\n]*|\/\*[\s\S]*?(?:\*\/|$)/g,
+      (_text, q) => (q ? 'x' : ' '),
+    )
+    .replace(/^[;\s]+/, '');
+  return /^(?:EXPLAIN\s+(?:QUERY\s+PLAN\s+)?)?PRAGMA\b/i.test(code) && /;[;\s]*[^;\s]/.test(code);
+}
+
+function screenCorpus(): string[] {
+  const corpus = [
+    'PRAGMA cache_size=1',
+    'PRAGMA cache_size=1;',
+    'PRAGMA cache_size=1; ;\n ;',
+    'PRAGMA cache_size=1; x',
+    'pragma cache_size=1 ; x',
+    'EXPLAIN QUERY PLAN PRAGMA x; y',
+    'EXPLAIN  PRAGMA x;y',
+    'SELECT 1; PRAGMA x',
+    '; ;PRAGMA x; y',
+    "PRAGMA x='a;b'",
+    "PRAGMA x='a'';b'; ",
+    'PRAGMA x="a;b"; ',
+    'PRAGMA x=`a;b`; z',
+    'PRAGMA x=[a;b]; ',
+    'PRAGMA x=[a;b; z',
+    'PRAGMA x; [',
+    'PRAGMA x; [ ]',
+    'PRAGMA x; ]',
+    'PRAGMA x; [a] [b',
+    'PRAGMA x [a; [b] ;',
+    'PRAGMA x; -- c',
+    'PRAGMA x; -- c\ny',
+    'PRAGMA x; /* c */',
+    'PRAGMA x; /* c',
+    'PRAGMA x; /* c */ y',
+    '/* a */ PRAGMA x; /*',
+    '-- a\nPRAGMA x;;',
+    "PRAGMA x; 'unclosed",
+    'PRAGMA x; "unclosed',
+    'PRAGMA x; `unclosed',
+    "PRAGMA x '[' ; ']'",
+    'PRAGMA x; /* [ */ ]',
+    'PRAGMA x; [ /* ] */ y',
+    'PRAGMA\tx;\t',
+    'PRAGMAx; y',
+  ];
+  // Seeded, so a failure names an input that reproduces.
+  let seed = 0x5eed;
+  const next = () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+    return (t ^ (t >>> 14)) >>> 0;
+  };
+  const heads = ['', ' ', ';', '; ', '/* h */', '-- h\n', "'q' ", '[q] '];
+  const verbs = ['PRAGMA x', 'pragma x', 'EXPLAIN PRAGMA x', 'EXPLAIN QUERY PLAN PRAGMA x', 'SELECT 1', 'PRAGMAx'];
+  const pieces = ["'", '"', '`', '[', ']', '--', '/*', '*/', '*', '/', '-', ';', ';', ';', ' ', '\n', '\t', 'y', 'x'];
+  for (let i = 0; i < 3000; i++) {
+    let sql = heads[next() % heads.length]! + verbs[next() % verbs.length]!;
+    for (let n = next() % 16; n > 0; n--) sql += pieces[next() % pieces.length]!;
+    corpus.push(sql);
+  }
+  return corpus;
+}
+
+it('the PRAGMA separator screen refuses exactly what it always refused', async () => {
+  const db = new native!.DatabaseSync(':memory:');
+  const pool = new SqlitePool(db);
+  try {
+    await pool.query('SELECT 1 AS warm');
+    // Every statement the screen lets through reaches prepare, which then
+    // stops it, so the screen's verdict is observed without running anything.
+    const prepared: string[] = [];
+    (db as unknown as { prepare: (sql: string) => never }).prepare = (sql) => {
+      prepared.push(sql);
+      throw new Error('stopped at prepare');
+    };
+    const corpus = screenCorpus();
+    let refusals = 0;
+    for (const sql of corpus) {
+      const error = await pool.query(sql).then(
+        () => undefined,
+        (err: unknown) => err as Error,
+      );
+      const screened = !prepared.includes(sql);
+      if (screened) assert.match(String(error?.message), /accepts one statement/, JSON.stringify(sql));
+      assert.equal(screened, screenOracle(sql), `screen verdict differs for ${JSON.stringify(sql)}`);
+      if (screened) refusals++;
+      prepared.length = 0;
+    }
+    // Both verdicts occur often enough for the comparison to mean something.
+    assert.ok(refusals > 300 && corpus.length - refusals > 300, `refused ${refusals} of ${corpus.length}`);
+  } finally {
+    await pool.end();
+  }
+});
+
+it('screens long runs of brackets, separators, quotes and comments in linear time', async () => {
+  const db = new native!.DatabaseSync(':memory:');
+  const pool = new SqlitePool(db);
+  const n = 100_000;
+  const slow: string[] = [];
+  try {
+    for (const [sql, refused] of [
+      [`PRAGMA cache_size=1; ${'['.repeat(n)}`, true],
+      [`PRAGMA cache_size=1${';'.repeat(n)}`, false],
+      [`PRAGMA cache_size=1${'; '.repeat(n)}`, false],
+      [`PRAGMA cache_size=1; ${'/*'.repeat(n)}`, true],
+      [`PRAGMA cache_size=1; ${"'".repeat(n)}`, true],
+      [`PRAGMA cache_size=1; ${'--'.repeat(n)}`, false],
+    ] as const) {
+      const started = performance.now();
+      const outcome = await pool.query(sql).then(
+        () => 'ran',
+        (err: unknown) => (/accepts one statement/.test(String((err as Error).message)) ? 'refused' : String(err)),
+      );
+      const elapsed = performance.now() - started;
+      assert.equal(outcome, refused ? 'refused' : 'ran', sql.slice(0, 30));
+      if (elapsed >= 1000) slow.push(`${JSON.stringify(sql.slice(0, 30))} took ${elapsed.toFixed(0)} ms`);
+    }
+    assert.deepEqual(slow, []);
+  } finally {
+    await pool.end();
+  }
+});

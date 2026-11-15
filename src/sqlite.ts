@@ -884,6 +884,28 @@ function refusePlaceholder(message: string): never {
   throw new ValidationError(message);
 }
 
+/**
+ * `sql` with each quoted run replaced by `x` and each comment by a space, in one
+ * scan from the left. A `[` with no `]` after it stays as written. Past the last
+ * `]` no `[` can close, so an unclosed one is known without scanning to the end
+ * again from each `[`, which made a run of them quadratic.
+ */
+function maskQuotedRunsAndComments(sql: string): string {
+  const token = /'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|--[^\n]*|\/\*[\s\S]*?(?:\*\/|$)|\[/g;
+  const lastClose = sql.lastIndexOf(']');
+  let masked = '';
+  let end = 0;
+  for (let match = token.exec(sql); match; match = token.exec(sql)) {
+    if (match[0] === '[') {
+      if (match.index > lastClose) continue;
+      token.lastIndex = sql.indexOf(']', match.index) + 1;
+    }
+    masked += sql.slice(end, match.index) + (/^(?:--|\/\*)/.test(match[0]) ? ' ' : 'x');
+    end = token.lastIndex;
+  }
+  return masked + sql.slice(end);
+}
+
 /** Let SQLite parse triggers/quoted SQL, then refuse any unconsumed statement before stepping. */
 function prepareSingleStatement(db: DatabaseSync, sql: string): ReturnType<DatabaseSync['prepare']> {
   const refuse = () => {
@@ -893,13 +915,16 @@ function prepareSingleStatement(db: DatabaseSync, sql: string): ReturnType<Datab
   // Some PRAGMAs take effect during prepare. Screen their separators first;
   // quoted runs remain code markers, while SQLite comments disappear.
   if (sql.includes(';')) {
-    const code = sql
-      .replace(
-        /('(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\])|--[^\n]*|\/\*[\s\S]*?(?:\*\/|$)/g,
-        (_text, quoted) => (quoted ? 'x' : ' '),
-      )
-      .replace(/^[;\s]+/, '');
-    if (/^(?:EXPLAIN\s+(?:QUERY\s+PLAN\s+)?)?PRAGMA\b/i.test(code) && /;[;\s]*[^;\s]/.test(code)) refuse();
+    const code = maskQuotedRunsAndComments(sql).replace(/^[;\s]+/, '');
+    // Refuse code after a separator. Everything from the first `;` to the next
+    // code character is a separator, so the first `;` decides it.
+    const separator = code.indexOf(';');
+    if (
+      /^(?:EXPLAIN\s+(?:QUERY\s+PLAN\s+)?)?PRAGMA\b/i.test(code) &&
+      separator >= 0 &&
+      /[^;\s]/.test(code.slice(separator + 1))
+    )
+      refuse();
   }
   const stmt = db.prepare(sql);
   // Node 22.5 exposed this as a method; later runtimes use a getter.
