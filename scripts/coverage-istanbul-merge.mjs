@@ -49,6 +49,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const require = createRequire(import.meta.url);
 const createReport = require('c8/lib/report.js');
@@ -59,30 +60,97 @@ const createReport = require('c8/lib/report.js');
  * a generator, so only one raw file is alive at a time.
  */
 function* loadReportsOneByOne(tempDirectory) {
-  for (const file of readdirSync(tempDirectory)) {
+  const files = readdirSync(tempDirectory);
+  if (files.some((file) => file.startsWith('.capture-'))) {
+    throw new Error(`[coverage] unfinished attributed collection in ${tempDirectory}`);
+  }
+  for (const file of files) {
     let parsed;
     try {
       parsed = JSON.parse(readFileSync(resolve(tempDirectory, file), 'utf8'));
     } catch {
       continue;
     }
-    yield parsed;
+    yield { file, parsed };
   }
 }
 
 /** Build a c8 Report whose process-coverage merge is a concatenation. */
 export function createIstanbulMergeReport(options) {
   const report = createReport(options);
+  const sourceMaps = new WeakMap();
+  const scriptSources = new WeakMap();
+  const uniqueSourceMaps = new Map();
+  const getSourceMap = report._getSourceMap;
+
+  // A URL identifies a module, not its generated text. Runtime loaders can
+  // compile that module differently in different processes (e.g. with mock
+  // instrumentation). Offsets and lineLengths belong to that process's map.
+  // A global last-map-wins cache remaps earlier offsets through unrelated
+  // generated text, inventing function locations and losing real hits.
+  report._getSourceMap = function _getSourceMap(script) {
+    if (scriptSources.has(script)) return scriptSources.get(script);
+    if (!sourceMaps.has(script)) return getSourceMap.call(this, script);
+    const url = pathToFileURL(script.url).href;
+    return getSourceMap.call({ sourceMapCache: { [url]: sourceMaps.get(script) } }, script);
+  };
 
   report._getMergedProcessCov = function _getMergedProcessCov() {
     const processCovs = [];
     const fileIndex = new Set();
-    for (const processCov of loadReportsOneByOne(this.tempDirectory)) {
+    for (const { file, parsed: processCov } of loadReportsOneByOne(this.tempDirectory)) {
       if (!this._isCoverageObject(processCov)) continue;
-      if (processCov['source-map-cache']) {
-        Object.assign(this.sourceMapCache, this._normalizeSourceMapCache(processCov['source-map-cache']));
+      const cache = processCov['source-map-cache'] ?? {};
+      const urls = new WeakMap();
+      const identities = new Map();
+      // c8 rewrites each ScriptCov URL to a filesystem path in place. Associate
+      // its exact map first: ?query and #fragment identify distinct transforms,
+      // including a genuinely unmapped transform of the same physical file.
+      for (const script of processCov.result) {
+        const url = script.url.startsWith('file:') ? script.url : pathToFileURL(script.url).href;
+        urls.set(script, url);
+        const ids = identities.get(url) ?? new Set();
+        ids.add(script.scriptId);
+        identities.set(url, ids);
+        sourceMaps.set(script, cache[url]);
       }
-      processCovs.push(this._normalizeProcessCov(processCov, fileIndex));
+      const normalized = this._normalizeProcessCov(processCov, fileIndex);
+      for (const script of normalized.result) {
+        const url = urls.get(script);
+        const attribution = processCov['turbine-script-maps'];
+        const captured = attribution?.version === 1 ? attribution.scripts?.[script.scriptId] : undefined;
+        if (captured) {
+          const extent = script.functions.reduce((end, fn) => fn.ranges.reduce((end, range) => Math.max(end, range.endOffset), end), 0);
+          if (captured.url !== url || typeof captured.source !== 'string' || extent > captured.source.length
+            || !Object.hasOwn(captured, 'sourceMap') || captured.error
+            || (captured.sourceMap !== null && !captured.sourceMap?.data)) {
+            throw new Error(`[coverage] invalid script attribution in ${file}: scriptId=${script.scriptId} ${url}`);
+          }
+          scriptSources.set(script, {
+            source: captured.source,
+            ...(captured.sourceMap ? { sourceMap: { sourcemap: captured.sourceMap.data } } : {}),
+          });
+        } else if (identities.get(url).size > 1) {
+          // Node's cache is keyed by URL, so it contains at most the LAST map.
+          // Even equal extents or identical function names cannot establish
+          // which generated source/map belongs to an earlier scriptId. Throw
+          // before c8's conversion loop, which otherwise swallows errors.
+          throw new Error(`[coverage] ambiguous source-map attribution in ${file}: ${url} has scriptIds=${[...identities.get(url)].sort().join(',')}. Recollect with tooling/coverage-regressions/collect.mjs; the URL-keyed cache cannot recover these transforms.`);
+        }
+        let sourceMap = sourceMaps.get(script);
+        if (sourceMap) {
+          // Most processes use identical transforms. Share only exact-content
+          // matches, including lineLengths, so retaining process-local maps
+          // does not retain a copy of every source for every test process.
+          const key = JSON.stringify(sourceMap);
+          if (!uniqueSourceMaps.has(key)) uniqueSourceMaps.set(key, sourceMap);
+          sourceMap = uniqueSourceMaps.get(key);
+        }
+        // Store absence as well: a script with no map must never inherit one
+        // from another process that happened to load the same URL.
+        sourceMaps.set(script, sourceMap);
+      }
+      processCovs.push(normalized);
     }
     // `all` synthesises zero-count entries for files no process loaded. It must
     // stay FIRST: the downstream istanbul merge is additive, so a zero entry is

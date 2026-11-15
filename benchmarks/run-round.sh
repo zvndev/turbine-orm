@@ -51,6 +51,8 @@ cd "$(dirname "$0")" || exit 1
 
 export DATABASE_URL="${DATABASE_URL:-postgresql:///turbine_bench?host=/tmp}"
 
+ENGINE="${BENCH_ENGINE:-postgres}"
+case "$ENGINE" in postgres|sqlite|mysql) ;; *) echo "Unknown comparison engine: $ENGINE"; exit 1 ;; esac
 RUNS="${RUNS:-3}"
 QUICK="${QUICK:-0}"
 QUIET_IDLE_SET="${QUIET_IDLE+set}"
@@ -69,14 +71,14 @@ if [ "$QUICK" = "1" ]; then
   QUIET_HOLD=1
   QUIET_INTERVAL=1
   DEFAULT_ENV=(ROUNDS=10 WARMUP=2 STREAM_ROUNDS=2)
-  EXTENDED_ENV=(ROUNDS=10 WARMUP=2 COLD_ROUNDS=10)
+  EXTENDED_ENV=(EXTENDED_QUICK=1 ROUNDS=10 WARMUP=2 COLD_ROUNDS=10)
   STREAM_ENV=(STREAM_ROUNDS=2 WARMUP=1)
   LATENCY_ENV=(ROUNDS=3)
   DEEP_ENV=(ROUNDS=10)
   CONTROL_ENV=(ROUNDS=20 WARMUP=2)
 else
   DEFAULT_ENV=(ROUNDS=200 WARMUP=20 STREAM_ROUNDS=15)
-  EXTENDED_ENV=(ROUNDS=100 WARMUP=15 COLD_ROUNDS=100)
+  EXTENDED_ENV=(EXTENDED_QUICK=0 ROUNDS=100 WARMUP=15 COLD_ROUNDS=100)
   STREAM_ENV=(STREAM_ROUNDS=15 WARMUP=2)
   LATENCY_ENV=(ROUNDS=25)
   DEEP_ENV=(ROUNDS=150)
@@ -88,6 +90,7 @@ fi
 # DATABASE_URL unless they are set explicitly. pg-connection-string is the
 # parser node-postgres itself uses, so the socket derived here is the one every
 # other suite connects to.
+if [ "$ENGINE" = "postgres" ]; then
 {
   IFS= read -r DERIVED_HOST
   IFS= read -r DERIVED_PORT
@@ -105,6 +108,7 @@ esac
 export PGSOCKET="${PGSOCKET:-$DERIVED_HOST/.s.PGSQL.$DERIVED_PORT}"
 export PGDATABASE="${PGDATABASE:-$DERIVED_DB}"
 if [ -z "${PGUSER:-}" ] && [ -n "$DERIVED_USER" ]; then export PGUSER="$DERIVED_USER"; fi
+fi
 
 # --- the quiet-machine gate --------------------------------------------------
 
@@ -219,7 +223,32 @@ fi
 
 echo "=== benchmark round, output in $OUT ==="
 echo "node $(node -v), $OS, QUICK=$QUICK RUNS=$RUNS, gate idle>=${QUIET_IDLE}% x${QUIET_HOLD} every ${QUIET_INTERVAL}s"
-echo "socket $PGSOCKET, database $PGDATABASE"
+if [ "$ENGINE" = "postgres" ]; then echo "socket $PGSOCKET, database $PGDATABASE"; fi
+
+# The marker confirms serial execution; the host idle check still runs separately.
+if [ "$QUICK" != "1" ] && [ "${COMPARISON_SERIALIZED:-}" != "1" ]; then
+  fail "final timing requires COMPARISON_SERIALIZED=1 on an idle machine"
+fi
+if [ "$ENGINE" = "sqlite" ] || [ "$ENGINE" = "mysql" ]; then
+  if [ "$ENGINE" = "sqlite" ]; then
+    SQLITE_MODE=--full
+    [ "$QUICK" = "1" ] && SQLITE_MODE=--quick
+    npx tsx bench-sqlite.ts --verify-only "$SQLITE_MODE" --report "$OUT/sqlite-preflight.json" >"$OUT/verify-arms.log" 2>&1 || fail sqlite-preflight
+    for i in $(seq 1 "$RUNS"); do
+      run_gated "sqlite-run$i" npx tsx bench-sqlite.ts --time "$SQLITE_MODE" --report "$OUT/sqlite-run$i.json" || fail "sqlite-run$i"
+    done
+  else
+    MYSQL_ENV=(RTTS=0,1,5,25)
+    if [ "$QUICK" = "1" ]; then MYSQL_ENV+=(ROUNDS=10 WARMUP=2 STREAM_ROUNDS=2 COLD_ROUNDS=10); fi
+    env "${MYSQL_ENV[@]}" npx tsx bench-mysql.ts --verify-only >"$OUT/verify-arms.log" 2>&1 || fail mysql-preflight
+    for i in $(seq 1 "$RUNS"); do
+      run_gated "mysql-run$i" env "${MYSQL_ENV[@]}" MYSQL_COMPARISON_SERIALIZED=1 MYSQL_COMPARISON_OUTPUT="$OUT/mysql-run$i.json" npx tsx bench-mysql.ts || fail "mysql-run$i"
+    done
+  fi
+  npx tsx build-results.ts "$ENGINE" "$OUT" || fail "$ENGINE-results"
+  echo "=== $ENGINE round complete: $OUT/$ENGINE-results.json ==="
+  exit 0
+fi
 
 # Every number below is attributed to these versions and this machine, so they
 # are captured first, from the installed packages and the server itself.
@@ -233,6 +262,19 @@ npx tsx verify-arms.ts >"$OUT/verify-arms.log" 2>&1 || {
 }
 echo "[verify-arms] OK"
 
+env EXTENDED_VERIFY_ONLY=1 npx tsx bench-extended.ts >"$OUT/verify-extended.log" 2>&1 || {
+  tail -20 "$OUT/verify-extended.log"
+  fail "extended exact preflight"
+}
+
+# Complete secondary catalogs must pass exact preflight before any timing.
+for secondary_suite in bench-stream-parity bench-latency deepoffset; do
+  SECONDARY_REPORT="$OUT/$secondary_suite-preflight.json" npx tsx "$secondary_suite.ts" --preflight >"$OUT/$secondary_suite-preflight.log" 2>&1 || {
+    tail -20 "$OUT/$secondary_suite-preflight.log"
+    fail "$secondary_suite exact preflight"
+  }
+done
+
 run_gated control-before env "${CONTROL_ENV[@]}" npx tsx machine-control.ts before || fail control-before
 for i in $(seq 1 "$RUNS"); do
   run_gated "default-run$i" env "${DEFAULT_ENV[@]}" npx tsx bench-interleaved.ts || fail "default-run$i"
@@ -241,14 +283,14 @@ for i in $(seq 1 "$RUNS"); do
   run_gated "extended-run$i" env "${EXTENDED_ENV[@]}" npx tsx bench-extended.ts || fail "extended-run$i"
 done
 for i in $(seq 1 "$RUNS"); do
-  run_gated "stream-run$i" env "${STREAM_ENV[@]}" npx tsx bench-stream-parity.ts || fail "stream-run$i"
+  run_gated "stream-run$i" env "${STREAM_ENV[@]}" SECONDARY_REPORT="$OUT/stream-run$i.json" npx tsx bench-stream-parity.ts || fail "stream-run$i"
 done
 for i in $(seq 1 "$RUNS"); do
-  run_gated "latency-run$i" env "${LATENCY_ENV[@]}" npx tsx bench-latency.ts || fail "latency-run$i"
+  run_gated "latency-run$i" env "${LATENCY_ENV[@]}" SECONDARY_REPORT="$OUT/latency-run$i.json" npx tsx bench-latency.ts || fail "latency-run$i"
 done
-run_gated deepoffset env "${DEEP_ENV[@]}" npx tsx deepoffset.ts || fail deepoffset
+run_gated deepoffset env "${DEEP_ENV[@]}" SECONDARY_REPORT="$OUT/deepoffset.json" npx tsx deepoffset.ts || fail deepoffset
 run_gated control-after env "${CONTROL_ENV[@]}" npx tsx machine-control.ts after || fail control-after
 
-npx tsx build-results.ts build "$OUT" | tee "$OUT/summary.txt"
+EXTENDED_ALLOW_SMOKE="$QUICK" npx tsx build-results.ts build "$OUT" | tee "$OUT/summary.txt"
 [ "${PIPESTATUS[0]}" -eq 0 ] || fail "build-results"
 echo "=== round complete: $OUT/results.json ==="

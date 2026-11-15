@@ -439,7 +439,7 @@ describe('schemaPush pins the search_path it diffed (live)', () => {
 
   it('refuses a target schema that does not exist instead of writing to public', async () => {
     // Postgres accepts a missing namespace in search_path without complaint and
-    // simply skips it during resolution, so this used to report success with
+    // skips it during resolution, so this used to report success with
     // every table created in public.
     const table = `pin_missing_${SUFFIX}`;
     const def = defineSchema({ [table]: { id: { type: 'serial', primaryKey: true } } } as never);

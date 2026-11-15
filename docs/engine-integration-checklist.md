@@ -1,0 +1,166 @@
+# Engine integration checklist
+
+Use this for one engine/server/driver/transport/runtime combination, from first
+reproduction to release. Keep the evidence beside the change or in a durable
+public release artifact. A short record with reproducible commands is enough;
+unchecked, failed, skipped, unsupported and unmeasured work must stay visible.
+The [roadmap](ROADMAP.md) defines the program; [STABILITY](../STABILITY.md)
+defines the support contract.
+
+## 1. Establish scope and full correctness
+
+- [ ] Record exact source SHA, server identity/version, driver/runtime versions,
+  transport, platform and intended support tier. Separate a proposed tuple from
+  a server actually observed running; redact connection secrets and row data.
+- [ ] Reproduce each selected gap with independent SQL/native-driver expectations.
+  Verify exact values, precision, null/missing, temporal and binary behavior,
+  affected rows and side effects. Do not use one ORM as another's oracle.
+- [ ] Check projections, ordering/tie breakers, composite/unique keys, global
+  filters, PII, nested reads/writes and per-parent relation limits. Test empty
+  and hostile inputs and explicit refusals of unsupported semantics.
+- [ ] Exercise transaction/savepoint success and rollback, failed statements,
+  concurrency, retries, cancellation/timeouts, connection loss, pool ownership
+  and externally supplied connections. Show recovery permits subsequent work.
+- [ ] Run required real-engine suites with their `TURBINE_REQUIRE_ENGINE` tokens.
+  Preserve pass/fail/skip counts and logs; prove a new guard rejects a deliberately
+  broken case, then revert the break. Mocks and source review do not certify an
+  engine. See [WORKFLOW](WORKFLOW.md#3-tests).
+
+## 2. Complete the typed lifecycle
+
+- [ ] From a fresh project, install the packed candidate and create a schema,
+  migrate, generate and run typed nested reads/writes/transactions. Cover
+  code-first and introspected existing databases without manual entity casts.
+  Check strict ESM and CJS consumers and useful invalid-query diagnostics.
+- [ ] Re-run generation to confirm deterministic output; test defaults,
+  generated/identity columns, natural/composite keys, quoted names, relations
+  and supported views. Document introspection omissions rather than inventing
+  metadata. Run examples from the candidate build, not an older registry package.
+- [ ] Create/apply/status/deploy/rollback SQL migrations. Test checksums and legacy
+  history, modified/missing files, out-of-order application, destructive consent,
+  concurrent runners, lock-connection loss and process interruption before/after
+  commit. Show the next run and status reflect actual committed state.
+- [ ] Add schema diff/push only with native DDL guarantees. Rebuild tests must
+  preserve data, foreign keys, indexes and triggers and roll back failures.
+  MySQL DDL is not assumed transactional; SQL Server batch separators need an
+  explicit parser/execution contract; SQLite's writer lock must not use a second
+  connection that blocks the migration.
+- [ ] Demonstrate seed, incremental schema change, regeneration and application
+  upgrade without reapplying or re-checksumming valid migration history. List
+  missing lifecycle operations as open gates.
+
+## 3. Complete tooling and stream contracts
+
+- [ ] Verify native schema/index/plan inspection, compile-only query output,
+  doctor and migration diagnostics. Compile-only tools must never execute the
+  query. Document Studio and agent-tool scope per engine.
+- [ ] Demonstrate permission enforcement for every advertised read-only tool;
+  a SQL text classifier is not database authorization. Keep PII out of fetched
+  projections and bound values out of logs. Refuse unsupported guarantees.
+- [ ] Test stream backpressure, early break, abort, idle expiry, native failure,
+  transaction completion and connection release. Increase result cardinality
+  and observe retained RSS with a recorded row/payload contract. A parent batch
+  limit does not bound nested JSON, BLOBs or native sort workspace; never truncate
+  data to satisfy the memory test. State synchronous execution limits.
+
+## 4. Benchmark fairly, then optimize
+
+- [ ] Pin stable/candidate comparators and raw driver; validate every selected
+  arm's exact results and effects before timing. Match schema/data/indexes,
+  projection, ordering/limits, durability, isolation, driver and pool settings.
+  Check independent-read and transaction workloads separately.
+- [ ] Retain at least three independent full rounds, machine/runtime versions,
+  commands, seeds, SQL, raw results and failures. Measure serial latency and
+  fixed-load throughput/tails/errors, CPU/RSS, cold start and import costs.
+  Scope conclusions to measured workloads and report every loss and uncertainty.
+- [ ] Compare complete same-driver dependency/install and application bundles;
+  label externalized-library results separately. Record generated bytes and
+  typecheck time/memory. See [comparison policy](ROADMAP.md#fair-dependency-and-performance-comparisons).
+- [ ] Select an observed deficiency, preserve its reproduction, change one
+  justified plan/path, then rerun correctness and the matched workload. Record
+  regressions and resource tradeoffs; do not claim an unmeasured improvement.
+
+## 5. Review the recorded results and certify only its scope
+
+- [ ] Review all preceding gates. Every open/failed gate has a concrete follow-up;
+  a native limitation has a reproducible refusal and documented user impact.
+  A required skipped test or absent artifact blocks promotion.
+- [ ] Verify packed install/import/type/edge consumers, complete example,
+  supported versions, error/capability matrix, migration/recovery and upgrade
+  notes. Keep support Experimental until its defined promotion criteria pass.
+- [ ] Wire regression checks into reusable `gates.yml`, its `gates-ok` needs list
+  and matching anti-vacuous floor. Follow [release rules](WORKFLOW.md#2-releases).
+  A schedule-only smoke cannot authorize publication.
+- [ ] Publish the evidence scope/date/tuple and review decision; rerun affected
+  gates after server, driver, runtime, transport or semantic changes. Revisit
+  comparator versions before making new performance claims.
+
+## Starting points in this repository
+
+These are entry points, not a replacement for the full gate set. Run on an
+appropriate runtime and disposable test databases. Set native server URLs for
+the selected suites; do not count skipped tests as passing.
+
+| Scope | Source and existing checks |
+| --- | --- |
+| PostgreSQL | [client](../src/client.ts), [migration runner](../src/cli/migrate.ts), [shared CI commands](../.github/workflows/gates.yml) |
+| SQLite | [generation checks](../src/test/generate-sqlite-consumer.test.ts), [migration checks](../src/test/sqlite-migrations.test.ts), [CLI checks](../src/test/sqlite-cli-project-command.test.ts), [native stream checks](../src/test/sqlite-native-stream.test.ts), [memory probe](../src/test/sqlite-native-stream-memory.ts) |
+| MySQL | [engine checks](../src/test/mysql.test.ts), [cross-engine checks](../src/test/sql-engines-mysql.test.ts), [value oracle](../src/test/oracle-engines-mysql.test.ts) |
+| MSSQL | [engine checks](../src/test/mssql.test.ts), [cross-engine checks](../src/test/sql-engines-mssql.test.ts), [value oracle](../src/test/oracle-engines-mssql.test.ts) |
+| Benchmark correctness | [headline oracle](../benchmarks/equivalence.ts), [dashboard contract](../benchmarks/dashboard.ts), [reproduction guide](../benchmarks/README.md) |
+| Support matrix | [Engine and version support](engine-support.md), generated from [its data](engine-support.json); a unit test checks every citation against the workflows |
+| Candidate evidence | [Yugabyte evidence contract](engine-certification.md), [reporter](../scripts/engine-certification.mjs); this narrow schema cannot record full certification |
+
+For example, on Node 24.10+ with repository dependencies installed, the existing
+SQLite migration and CLI checks can be invoked as follows:
+
+```sh
+npm run gen:studio
+TURBINE_REQUIRE_ENGINE=sqlite,sqlite-migrations npx tsx --test src/test/sqlite-migrations.test.ts src/test/sqlite-cli-project-command.test.ts src/test/sqlite-cli-project.test.ts src/test/sqlite-cli-project-config.test.ts
+```
+
+`gen:studio` creates the ignored UI module imported by the source CLI, including
+when testing non-Studio commands from a fresh checkout. Retain the actual TAP
+totals and runtime. These commands alone do not cover client generation,
+streaming, performance or certification.
+
+## Example evidence record: source review only
+
+This completed example records the source inspection underlying the roadmap,
+not a live-engine result. It deliberately leaves runtime and performance
+observations absent. Use the same separation in an implementation record,
+adding real logs, commands and artifact hashes as gates execute. This is a human
+review record, not input to the narrow Yugabyte evidence validator.
+
+```json
+{
+  "scope": "sqlite-lifecycle-source-review",
+  "reviewedOn": "2026-11-05",
+  "sourceHead": "7ba8b52832adb4905850cf207f733e50702f8420",
+  "releaseBaseline": "v0.93.1",
+  "availability": "unreleased-source",
+  "supportTier": "experimental",
+  "certified": false,
+  "observedEngineVersion": null,
+  "observedDriverVersion": null,
+  "observedRuntime": null,
+  "observedTransport": null,
+  "inspection": {
+    "outcome": "reviewed",
+    "paths": [
+      "src/generate.ts",
+      "src/cli/sqlite-project.ts",
+      "src/cli/sqlite-migrate.ts",
+      "src/sqlite.ts"
+    ],
+    "findings": [
+      "SQLite generation target and SQL migration runner exist",
+      "Schema diff/push and CLI seed/doctor/Studio remain unsupported",
+      "Shared runtime imports and mandatory pg dependency remain"
+    ]
+  },
+  "realEngineTests": { "outcome": "not-run", "counts": null, "artifact": null },
+  "benchmarks": { "outcome": "unmeasured", "rounds": null, "artifact": null },
+  "decision": "No promotion; execute the remaining lifecycle and evidence gates"
+}
+```

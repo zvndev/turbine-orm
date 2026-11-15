@@ -89,7 +89,7 @@ import { type SchemaMetadata, snakeToCamel } from '../schema.js';
 import type { SchemaDef } from '../schema-builder.js';
 import { DestructivePushRefusal, driftWarnings, schemaDiff, schemaPush } from '../schema-sql.js';
 import { type AppliedColumnTags, applyCodeFirstColumnTags, extractCodeFirstColumnTags } from './code-first-tags.js';
-import type { CliOverrides, ConfigLoadError, ResolvedConfig, TurbineCliConfig } from './config.js';
+import type { CliEngine, CliOverrides, ConfigLoadError, ResolvedConfig, TurbineCliConfig } from './config.js';
 import {
   configTemplate,
   connectionStringHasPassword,
@@ -102,8 +102,22 @@ import {
   resolveSeedFile,
   unwrapModuleDefault,
 } from './config.js';
+import { assertD1Config } from './d1-config.js';
+import { assertD1Arguments, cmdD1Project, showD1Help } from './d1-project.js';
 import { DESTRUCTIVE_KIND_LABEL } from './destructive.js';
 import { errorText } from './error-text.js';
+import { assertLibsqlMigrationArguments, cmdLibsqlMigrate, showLibsqlMigrateHelp } from './libsql-migrate-command.js';
+import {
+  assertLibsqlProjectArguments,
+  cmdLibsqlGenerate,
+  cmdLibsqlInit,
+  cmdLibsqlStatus,
+  introspectLibsqlProject,
+  resolveLibsqlProjectContext,
+  showLibsqlProjectHelp,
+} from './libsql-project.js';
+import { assertLibsqlProjectConfigOptions, libsqlProjectUrl } from './libsql-project-config.js';
+import { assertLibsqlSeedArguments, cmdLibsqlSeed, showLibsqlSeedHelp } from './libsql-seed-command.js';
 import { canResolveTsx, getTsLoaderError, needsTsLoader, registerTsLoader } from './loader.js';
 import { runMcpServer } from './mcp.js';
 import {
@@ -136,6 +150,30 @@ import {
   statusGateProblems,
   summarizeMigrationStatus,
 } from './migrate.js';
+import { assertMssqlDoctorArguments, cmdMssqlDoctor, showMssqlDoctorHelp } from './mssql-doctor.js';
+import { cmdMssqlMigrate } from './mssql-migrate-command.js';
+import {
+  assertMssqlProjectCommand,
+  cmdMssqlGenerate,
+  cmdMssqlInit,
+  cmdMssqlStatus,
+  showMssqlHelp,
+} from './mssql-project.js';
+import { assertMssqlSeedArguments, cmdMssqlSeed, showMssqlSeedHelp } from './mssql-seed.js';
+import { assertMysqlDoctorArguments, cmdMysqlDoctor, showMysqlDoctorHelp } from './mysql-doctor.js';
+import { assertMysqlMigrationArguments, cmdMysqlMigrate, showMysqlMigrateHelp } from './mysql-migrate-command.js';
+import {
+  assertMysqlProjectCommand,
+  cmdMysqlGenerate,
+  cmdMysqlInit,
+  cmdMysqlStatus,
+  showMysqlHelp,
+} from './mysql-project.js';
+import { assertMysqlPushArguments, cmdMysqlPush, showMysqlPushHelp } from './mysql-push-command.js';
+import { cmdMysqlSchema } from './mysql-schema-command.js';
+import { assertMysqlSeedArguments, cmdMysqlSeed, showMysqlSeedHelp } from './mysql-seed.js';
+import importSeedModule from './mysql-seed-loader.cjs';
+import { mysqlToolDoctorReport } from './mysql-tools.js';
 import { startObserve } from './observe.js';
 import { formatPrismaReport, summaryLines } from './prisma-report.js';
 import { DEFAULT_EXCLUDED_TABLES, resolvePrismaSchema } from './prisma-resolve.js';
@@ -146,7 +184,14 @@ import {
   type ResolvedPrismaDatasourceUrl,
   resolvePrismaDatasourceUrl,
 } from './prisma-schema.js';
+import { assertSqliteDoctorArguments, cmdSqliteDoctor, showSqliteDoctorHelp } from './sqlite-doctor.js';
+import { cmdSqliteMigrate, showSqliteHelp } from './sqlite-migrate-command.js';
+import { assertSqliteProjectCommand, cmdSqliteGenerate, cmdSqliteInit, cmdSqliteStatus } from './sqlite-project.js';
+import { cmdSqliteSchema } from './sqlite-schema-command.js';
+import { cmdSqliteSeed, showSqliteSeedHelp } from './sqlite-seed.js';
 import { startStudio } from './studio.js';
+import { toolEngine } from './tool-capabilities.js';
+import { runToolCommand, TOOL_COMMANDS } from './tool-command.js';
 import {
   banner,
   blue,
@@ -182,6 +227,7 @@ import {
 
 export interface CliArgs {
   command: string;
+  engine?: CliEngine;
   subcommand?: string;
   positional: string[];
   url?: string;
@@ -210,6 +256,8 @@ export interface CliArgs {
   /** `migrate create --from-diff`: scaffold UP/DOWN from the schema diff, destructive statements flagged. */
   fromDiff?: boolean;
   allowDrift?: boolean;
+  /** MySQL recovery assertion after manual schema/data reconciliation. */
+  acknowledgePartialDdl?: boolean;
   allowEmpty?: boolean;
   allowDestructive?: boolean;
   /** `migrate create --auto|--from-diff --allow-pending`: diff even while migrations are pending. */
@@ -262,11 +310,13 @@ export interface CliArgs {
   includeViews?: boolean;
   /** Omit the `Generated at:` header line for reproducible (diff-stable) output. */
   noTimestamp?: boolean;
-  /** `generate --import-ext <js|ts|none|auto>`: sibling-import extension mode (F3). */
+  /** `generate --import-ext <js|ts|none|auto>`: sibling-import extension mode. */
   importExtension?: 'js' | 'ts' | 'none' | 'auto';
-  /** `generate --keep-column-names`: keep raw DB column names as field names (F4). */
+  /** `generate --keep-column-names`: keep raw DB column names as field names. */
   keepColumnNames?: boolean;
-  /** `generate --legacy-to-many-uniques`: opt out of the unique-FK → hasOne flip (F2). */
+  /** Opt-in native integer declaration generation. */
+  exactNativeIntegers?: boolean;
+  /** `generate --legacy-to-many-uniques`: opt out of the unique-FK → hasOne flip. */
   legacyToManyUniques?: boolean;
   // studio / observe flags
   port?: number;
@@ -332,6 +382,7 @@ function failArg(message: string, ...hints: string[]): never {
  * below.
  */
 const GLOBAL_FLAGS = [
+  '--engine',
   '--url',
   '--out',
   '--schema',
@@ -365,6 +416,7 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
     '--no-timestamp',
     '--import-ext',
     '--keep-column-names',
+    '--exact-native-integers',
     '--legacy-to-many-uniques',
     '--allow-empty',
   ],
@@ -380,6 +432,7 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
     '--exit-code',
     '--wait',
     '--allow-drift',
+    '--acknowledge-partial-ddl',
     '--allow-destructive',
     '--allow-pending',
     '--allow-pooler',
@@ -398,7 +451,11 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
     '--allow-pooler',
   ],
   studio: ['--port', '--host', '--no-open', '--allow-remote', '--write', '--show-pii', '--demo'],
-  mcp: [],
+  mcp: ['--legacy-to-many-uniques'],
+  capabilities: [],
+  compile: [],
+  schema: [],
+  'explain-error': [],
   observe: ['--port', '--host', '--no-open', '--allow-remote', '--metrics-url'],
   skill: ['--print', '--agents', '--dir'],
   help: [],
@@ -565,6 +622,10 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
   // in which case nothing here validates flags: main() reports the misspelled
   // command instead, which is the actual problem.
   const accepted = acceptedFlagTokens(result.command);
+  if (result.command === 'push' && argv.some((token, i) => token === '--engine' && argv[i + 1] === 'mysql')) {
+    accepted?.add('--yes');
+    accepted?.add('-y');
+  }
   const unknownFlags: string[] = [];
   /** The raw `--step` operand, judged after the loop. Absent means unset. */
   let stepRaw: string | undefined;
@@ -589,6 +650,22 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
     }
 
     switch (arg) {
+      case '--engine':
+        if (
+          next !== 'postgresql' &&
+          next !== 'sqlite' &&
+          next !== 'mysql' &&
+          next !== 'mssql' &&
+          next !== 'libsql' &&
+          next !== 'd1'
+        ) {
+          failArg(
+            `Unknown CLI engine ${JSON.stringify(next ?? '')}. Use --engine postgresql, --engine sqlite, --engine mysql, --engine mssql or --engine libsql or --engine d1.`,
+          );
+        }
+        result.engine = next;
+        i++;
+        break;
       case '--url':
       case '-u':
         result.url = next;
@@ -672,6 +749,9 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
       case '--skip-generate':
         result.skipGenerate = true;
         break;
+      case '--acknowledge-partial-ddl':
+        result.acknowledgePartialDdl = true;
+        break;
       case '--allow-drift':
         result.allowDrift = true;
         break;
@@ -737,6 +817,9 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
         }
         result.importExtension = next;
         i++;
+        break;
+      case '--exact-native-integers':
+        result.exactNativeIntegers = true;
         break;
       case '--keep-column-names':
         result.keepColumnNames = true;
@@ -859,7 +942,7 @@ export function parseArgs(argv = process.argv.slice(2)): CliArgs {
 
 /**
  * Print a friendly error explaining how to install tsx, then exit.
- * Called when we know we need to load a `.ts` file but the loader isn't available.
+ * Called when a `.ts` file must be loaded but the loader is unavailable.
  */
 function failMissingTsLoader(filePath: string, reason: 'missing' | 'unsupported' | 'failed'): never {
   errorLine();
@@ -932,6 +1015,16 @@ export interface CliConfigBootstrap {
   skipped: boolean;
 }
 
+/** Keep the public config helper independent of the runtime error graph. */
+function resolveCommandConfig(file: TurbineCliConfig, overrides: CliOverrides): ResolvedConfig {
+  try {
+    return resolveConfig(file, overrides);
+  } catch (error) {
+    if (error instanceof TypeError) throw new ValidationError(error.message);
+    throw error;
+  }
+}
+
 /**
  * Resolve the effective CLI config: register the tsx loader when the config file
  * is TypeScript, import it, then merge it with env vars and CLI flags. Exits with
@@ -945,11 +1038,11 @@ export async function bootstrapCliConfig(
   overrides: CliOverrides,
 ): Promise<CliConfigBootstrap> {
   if (!usesProjectConfig(args)) {
-    return { config: resolveConfig({}, overrides), fileConfig: {}, skipped: true };
+    return { config: resolveCommandConfig({}, overrides), fileConfig: {}, skipped: true };
   }
 
   // If the user has a TypeScript config file, register the tsx ESM loader
-  // before we attempt to import it. Otherwise Node throws
+  // before importing it. Otherwise Node throws
   // ERR_UNKNOWN_FILE_EXTENSION for `.ts`.
   const configPath = findConfigFile();
   if (needsTsLoader(configPath)) {
@@ -959,8 +1052,8 @@ export async function bootstrapCliConfig(
     }
   }
 
-  const { config: fileConfig, loadError } = await loadConfigResult();
-  return { config: resolveConfig(fileConfig, overrides), fileConfig, loadError, skipped: false };
+  const { config: fileConfig, loadError } = await loadConfigResult(undefined, importSeedModule);
+  return { config: resolveCommandConfig(fileConfig, overrides), fileConfig, loadError, skipped: false };
 }
 
 // ---------------------------------------------------------------------------
@@ -1003,7 +1096,7 @@ function requireUrl(config: ResolvedConfig, options: RequireUrlOptions = {}): st
   return config.url;
 }
 
-async function loadSchemaFile(schemaFile: string): Promise<SchemaDef> {
+async function loadSchemaFile(schemaFile: string, importer?: (url: string) => Promise<unknown>): Promise<SchemaDef> {
   const absPath = resolve(schemaFile);
   if (!existsSync(absPath)) {
     error(`Schema file not found: ${schemaFile}`);
@@ -1012,7 +1105,7 @@ async function loadSchemaFile(schemaFile: string): Promise<SchemaDef> {
   }
 
   // If this is a TypeScript file, ensure the tsx ESM loader is registered
-  // before we attempt the dynamic import. Without this, Node throws
+  // before the dynamic import. Without this, Node throws
   // ERR_UNKNOWN_FILE_EXTENSION for `.ts`.
   if (needsTsLoader(absPath)) {
     const status = await registerTsLoader();
@@ -1023,7 +1116,7 @@ async function loadSchemaFile(schemaFile: string): Promise<SchemaDef> {
 
   try {
     const fileUrl = pathToFileURL(absPath).href;
-    const mod = await import(fileUrl);
+    const mod = await (importer ? importer(fileUrl) : import(fileUrl));
     // Unwrap the same CJS-interop double-wrapped default that bites config files
     // in a "type": "commonjs" project under the tsx loader (see
     // unwrapModuleDefault). Without this, `mod.default ?? mod` reads
@@ -1173,7 +1266,7 @@ export function loadDotEnvForCli(
  * differing, non-empty `url` in the config file. Pure so it is unit-testable.
  *
  * Precedence is unchanged (`.env` `DATABASE_URL` still wins), this only decides
- * whether that override is silent or loud. We warn ONLY when all hold:
+ * whether to emit a warning. Warn ONLY when all hold:
  *   - no CLI `--url` override (an explicit override is the user's clear intent),
  *   - `DATABASE_URL` came from `.env` (shell-exported stays silent, as before),
  *   - the config file has a non-empty `url`, and
@@ -1200,7 +1293,7 @@ export function dotEnvUrlConflictWarning(input: {
   );
 }
 
-/** Package managers we can name an exact install command for. */
+/** Package managers with a known install command. */
 export type PackageManager = 'npm' | 'pnpm' | 'yarn' | 'bun';
 
 /**
@@ -1595,7 +1688,7 @@ export type EnvScaffoldAction = 'created' | 'appended' | 'unchanged';
 /** Detected state of the three files the scaffold touches (all IO by the caller). */
 export interface EnvScaffoldState {
   envExists: boolean;
-  /** `.env` already assigns DATABASE_URL (their value wins; we never rewrite it). */
+  /** `.env` already assigns DATABASE_URL (the existing value wins and is never rewritten). */
   envHasDatabaseUrl: boolean;
   envExampleExists: boolean;
   gitignoreExists: boolean;
@@ -1651,8 +1744,8 @@ export function planEnvScaffold(state: EnvScaffoldState): EnvScaffoldPlan {
   return {
     env: !state.envExists ? 'created' : state.envHasDatabaseUrl ? 'unchanged' : 'appended',
     envExample: state.envExampleExists ? 'unchanged' : 'created',
-    // No `.gitignore` at all means nothing is ignored, so the `.env` we just
-    // wrote is committable. Create one rather than warn about it.
+    // No `.gitignore` at all means nothing is ignored, so the `.env` created
+    // above is committable. Create one rather than warn about it.
     gitignore: !state.gitignoreExists ? 'created' : state.gitignoreIgnoresEnv ? 'unchanged' : 'appended',
   };
 }
@@ -1940,6 +2033,7 @@ async function runInitGenerate(config: ResolvedConfig, url: string): Promise<Ini
     const genSpinner = new Spinner('Generating TypeScript client').start();
     const result = generate({
       schema,
+      exactNativeIntegers: config.exactNativeIntegers,
       outDir: config.out,
       connectionString: url,
       importExtension: config.importExtension,
@@ -2136,7 +2230,7 @@ async function cmdInit(args: CliArgs, config: ResolvedConfig): Promise<void> {
   const hasEnvFile = existsSync('.env');
   const hasEnvLocal = existsSync('.env.local');
   // On Node < 20.12 (no process.loadEnvFile) main() could not auto-load .env, so
-  // we cannot claim it "has no DATABASE_URL"; we simply could not read it.
+  // an unread `.env` cannot be described as lacking DATABASE_URL.
   const canAutoLoadEnv = typeof process.loadEnvFile === 'function';
 
   const envNotice = initEnvNotice({
@@ -2569,7 +2663,7 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
     `Found ${bold(String(tableNames.length))} tables, ${bold(String(totalColumns))} columns, ${bold(String(totalRelations))} relations`,
   );
 
-  // F12: make the default bookkeeping-table exclusions discoverable rather than
+  // Make the default bookkeeping-table exclusions discoverable rather than
   // silent. `include` re-adds any of them byte-for-byte.
   for (const t of skippedInternalTables) {
     console.log(`    ${dim(`${symbols.teeEnd} skipped internal table ${t} (add it to include to keep it)`)}`);
@@ -2631,6 +2725,7 @@ async function cmdGenerate(args: CliArgs, config: ResolvedConfig): Promise<void>
 
   const result = generate({
     schema,
+    exactNativeIntegers: config.exactNativeIntegers,
     outDir: config.out,
     connectionString: url,
     zod: args.zod,
@@ -2709,7 +2804,7 @@ export interface MigrateFromPrismaUrl {
  * `configUrl` is what {@link resolveConfig} already produced (`--url`, then
  * `DATABASE_URL`, then `turbine.config.ts`) and always wins: an explicit flag
  * must never be overridden by a value declared in someone else's schema file.
- * Only when that is empty do we fall back to the `datasource` block, which
+ * Only when that is empty does resolution fall back to the `datasource` block, which
  * removes the flag a project with a non-standard variable name would otherwise
  * pass on every run.
  */
@@ -2780,7 +2875,7 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
     process.exit(1);
   }
 
-  // Parse (fatal only on a construct we must understand).
+  // Parse (fatal only on a construct the importer must understand).
   let source: string;
   try {
     source = readPrismaSchemaSource(prismaPath);
@@ -2916,6 +3011,7 @@ async function cmdMigrateFromPrisma(args: CliArgs, config: ResolvedConfig): Prom
     // client's field names match the name map (D).
     const gen = generate({
       schema: schemaMeta,
+      exactNativeIntegers: config.exactNativeIntegers,
       outDir: config.out,
       connectionString: url,
       noTimestamp: args.noTimestamp,
@@ -3746,7 +3842,7 @@ function reportRebaselined(rebaselined: RebaselinedChecksum[]): void {
  * never see, because their name is not `YYYYMMDDHHMMSS_<name>.sql`.
  *
  * They were skipped in silence by `status`, `up` and `deploy` alike, so a
- * hand-named migration simply never ran and nothing said so.
+ * hand-named migration never ran and nothing said so.
  */
 function warnIgnoredMigrationFiles(migrationsDir: string): void {
   const ignored = listIgnoredSqlFiles(migrationsDir);
@@ -4250,7 +4346,7 @@ async function runSeedPlan(plan: SeedExecutionPlan, config: ResolvedConfig): Pro
       if (!canResolveTsx()) {
         throw new Error('TypeScript seed files require tsx, install tsx or use seed.js/seed.sql.');
       }
-      // The seed runs in a child process, so we cannot observe its callback
+      // The seed runs in a child process, so its callback cannot be observed here
       // directly. Hand it a sentinel path: `defineSeed`'s runner writes the file
       // only after a callback executes to completion. A non-zero exit is a
       // failure. A clean exit with no sentinel is a script that did its work at
@@ -5541,7 +5637,7 @@ async function cmdStudio(args: CliArgs, config: ResolvedConfig): Promise<void> {
 
   // Non-loopback binds require an explicit --allow-remote opt-in. Studio has
   // only a random session token, exposing it on a LAN interface is foot-gun
-  // territory, so we refuse rather than warn-and-proceed.
+  // territory, so refuse rather than warn-and-proceed.
   if (!isLoopbackHost(host)) {
     if (!args.allowRemote) {
       error(`Studio refuses to bind to ${yellow(host)} without ${cyan('--allow-remote')}.`);
@@ -5686,11 +5782,13 @@ async function cmdMcp(_args: CliArgs, config: ResolvedConfig): Promise<void> {
   const url = requireUrl(config);
   await runMcpServer({
     url,
+    engine: toolEngine(config.engine),
     schema: config.schema,
     migrationsDir: config.migrationsDir,
     metadataDir: config.out,
     include: config.include.length ? config.include : undefined,
     exclude: config.exclude.length ? config.exclude : undefined,
+    legacyToManyUniques: config.legacyToManyUniques,
   });
 }
 
@@ -5887,6 +5985,7 @@ function showGenerateHelp(): void {
   console.log(
     `    ${cyan('--keep-column-names')}   Keep raw DB column names as field names ${dim('(snake_case, not camelCase)')}`,
   );
+  console.log(`    ${cyan('--exact-native-integers')}  Native integer unions ${dim('(sqlite/mysql/mssql only)')}`);
   console.log(
     `    ${cyan('--legacy-to-many-uniques')} Emit ${cyan('hasMany')} for unique-FK children ${dim('(pre-0.41 shape; default flips to hasOne)')}`,
   );
@@ -6073,6 +6172,9 @@ function showStatusHelp(): void {
 
 function showDoctorHelp(): void {
   banner();
+  console.log(
+    '  SQL Server: turbine doctor --engine mssql [--json] (fixed catalog diagnostics only; no repairs/plans).',
+  );
   console.log(`  ${bold('turbine doctor')}, Index + cached-plan triage`);
   newline();
   console.log(`  ${bold('Usage:')}`);
@@ -6179,16 +6281,25 @@ function showMcpHelp(): void {
   console.log(`  ${bold('Usage:')}`);
   console.log(`    npx turbine mcp ${dim('[options]')}`);
   newline();
-  console.log(`  Speaks newline-delimited JSON-RPC 2.0 on stdin/stdout and exposes eleven`);
+  console.log(`  Speaks newline-delimited JSON-RPC 2.0 on stdin/stdout and exposes twelve`);
   console.log(`  read-only tools: schema overview, table detail, relation graph, join paths,`);
   console.log(`  migration status, doctor, EXPLAIN, query compile, table stats, sample rows`);
-  console.log(`  and error lookup.`);
+  console.log(`  error lookup and engine capability discovery.`);
+  console.log(`  SQLite and MySQL expose nine tools; SQL Server exposes eight catalog/compile/discovery tools.`);
+  console.log(`  SQL Server sample/explain/data execution is refused; no native read-only transaction is asserted.`);
+  console.log(`  Use capabilities, schema [table], compile '<json>', or explain-error <code> for one JSON result.`);
   newline();
   console.log(`  ${bold('Options:')}`);
-  console.log(`    ${cyan('--url, -u')} ${dim('<url>')}       Postgres connection string`);
+  console.log(`    ${cyan('--engine')} ${dim('<name>')}     postgresql (default), sqlite, mysql, mssql, libsql or d1`);
+  console.log(
+    `    ${cyan('--url, -u')} ${dim('<url>')}       Postgres/MySQL/SQL Server connection string or existing SQLite file`,
+  );
   console.log(`    ${cyan('--schema, -s')} ${dim('<name>')}   Postgres schema ${dim('(default: public)')}`);
   console.log(`    ${cyan('--include')} ${dim('<tables>')}    Comma-separated tables to include`);
   console.log(`    ${cyan('--exclude')} ${dim('<tables>')}    Comma-separated tables to exclude`);
+  console.log(
+    `    ${cyan('--legacy-to-many-uniques')} Describe unique-FK children as ${cyan('hasMany')}, as before 0.41 ${dim('(match a client generated with the same flag)')}`,
+  );
   newline();
 }
 
@@ -6281,6 +6392,10 @@ function showHelp(): void {
     `    ${cyan('studio')}             Launch local read-only web UI ${dim('(--write for writes, --demo for a sample DB)')}`,
   );
   console.log(`    ${cyan('mcp')}                Start read-only MCP server over stdio`);
+  console.log(`    ${cyan('capabilities')}       JSON engine/runtime/tool transport facts (no connection)`);
+  console.log(`    ${cyan('schema [table]')}     JSON read-only schema overview or table detail`);
+  console.log(`    ${cyan('compile <json>')}     Compile {table, operation?, args?} without executing`);
+  console.log(`    ${cyan('explain-error <code>')} Explain an error from the catalog (no connection)`);
   console.log(`    ${cyan('observe')}            Launch metrics dashboard ${dim('(requires TURBINE_OBSERVE_URL)')}`);
   console.log(
     `    ${cyan('skill')}              Install the agent query skill ${dim('(--print, --agents, --dir <path>)')}`,
@@ -6288,6 +6403,12 @@ function showHelp(): void {
   newline();
 
   console.log(`  ${bold('Options:')}`);
+  console.log(
+    `    ${cyan('--engine')} ${dim('<name>')}     postgresql (default), sqlite, mysql, mssql, libsql or d1; use migrate --engine sqlite --help for its workflow; generate --engine mysql --help or generate --engine mssql --help`,
+  );
+  console.log(
+    `    ${cyan('--acknowledge-partial-ddl')}  MySQL migrate recover only; manually reconcile partial DDL first`,
+  );
   console.log(`    ${cyan('--url, -u')} ${dim('<url>')}      Postgres connection string`);
   console.log(
     `    ${cyan('--out, -o')} ${dim('<dir>')}      Output directory ${dim('(default: ./generated/turbine)')}`,
@@ -6524,7 +6645,38 @@ function showVersion(): void {
 async function main() {
   let args: CliArgs;
   try {
+    const preflightRaw = process.argv.slice(2);
+    if (preflightRaw.some((token, i) => token === '--engine' && preflightRaw[i + 1] === 'd1'))
+      assertD1Arguments(preflightRaw);
     args = parseArgs();
+    const rawArgs = process.argv.slice(2);
+    if (args.engine === 'libsql' || rawArgs.some((token, i) => token === '--engine' && rawArgs[i + 1] === 'libsql')) {
+      if (canonicalCommand(args.command) === 'migrate') assertLibsqlMigrationArguments(args, rawArgs);
+      else if (canonicalCommand(args.command) === 'seed') assertLibsqlSeedArguments(args, rawArgs);
+      else assertLibsqlProjectArguments(args.command, rawArgs);
+    }
+    if (args.command === 'doctor' && args.engine === 'mysql') assertMysqlDoctorArguments(args, rawArgs);
+    if (args.command === 'doctor' && args.engine === 'sqlite')
+      assertSqliteDoctorArguments(args as CliArgs & Record<string, unknown>, rawArgs);
+    if (args.command === 'doctor' && args.engine === 'mssql') assertMssqlDoctorArguments(args, rawArgs);
+    if (
+      args.command === 'push' &&
+      (args.engine === 'mysql' || rawArgs.some((token, i) => token === '--engine' && rawArgs[i + 1] === 'mysql'))
+    ) {
+      assertMysqlPushArguments(args, rawArgs);
+    }
+    if (canonicalCommand(args.command) === 'seed' && args.engine === 'mssql') {
+      assertMssqlSeedArguments(args, rawArgs);
+    }
+    if (canonicalCommand(args.command) === 'seed' && args.engine === 'mysql') {
+      assertMysqlSeedArguments(args, rawArgs);
+    }
+    if (
+      canonicalCommand(args.command) === 'migrate' &&
+      (args.engine === 'mysql' || rawArgs.some((token, i) => token === '--engine' && rawArgs[i + 1] === 'mysql'))
+    ) {
+      assertMysqlMigrationArguments(args, rawArgs);
+    }
   } catch (err) {
     // A last-resort net. Every flag refusal parseArgs makes goes through
     // `failArg` (banner, red line, hints) and exits there, so nothing is
@@ -6542,7 +6694,77 @@ async function main() {
     return;
   }
   // Subcommand help: e.g. `turbine migrate --help`
-  if (args.help) {
+  let libsqlConfigHelp = false;
+  if (args.help && args.engine === undefined && findConfigFile()) {
+    if (needsTsLoader(findConfigFile())) await registerTsLoader();
+    libsqlConfigHelp = ['libsql', 'd1'].includes(
+      (await loadConfigResult(undefined, importSeedModule)).config.engine ?? '',
+    );
+  }
+  const configCommandHelp =
+    args.help &&
+    args.engine === undefined &&
+    (canonicalCommand(args.command) === 'migrate' || canonicalCommand(args.command) === 'seed' || libsqlConfigHelp) &&
+    !!findConfigFile();
+  if (args.help && !configCommandHelp) {
+    if (args.engine === 'd1') {
+      showD1Help();
+      return;
+    }
+    if (args.engine === 'libsql') {
+      if (canonicalCommand(args.command) === 'migrate') showLibsqlMigrateHelp();
+      else if (canonicalCommand(args.command) === 'seed') showLibsqlSeedHelp();
+      else showLibsqlProjectHelp();
+      return;
+    }
+    if (TOOL_COMMANDS.includes(args.command) || args.command === 'mcp') {
+      showMcpHelp();
+      return;
+    }
+    if (args.engine === 'mysql') {
+      if (args.command === 'doctor') {
+        showMysqlDoctorHelp();
+        return;
+      }
+      if (args.command === 'push') {
+        showMysqlPushHelp();
+        return;
+      }
+      if (canonicalCommand(args.command) === 'seed') {
+        showMysqlSeedHelp();
+        return;
+      }
+      if (canonicalCommand(args.command) === 'migrate') {
+        showMysqlMigrateHelp();
+        return;
+      }
+      showMysqlHelp();
+      return;
+    }
+    if (args.engine === 'mssql') {
+      if (args.command === 'doctor') {
+        showMssqlDoctorHelp();
+        return;
+      }
+      if (canonicalCommand(args.command) === 'seed') {
+        showMssqlSeedHelp();
+        return;
+      }
+      showMssqlHelp();
+      return;
+    }
+    if (args.engine === 'sqlite') {
+      if (args.command === 'doctor') {
+        showSqliteDoctorHelp();
+        return;
+      }
+      if (canonicalCommand(args.command) === 'seed') {
+        showSqliteSeedHelp();
+        return;
+      }
+      showSqliteHelp();
+      return;
+    }
     if (showSubcommandHelp(args.command)) return;
     showHelp();
     return;
@@ -6552,59 +6774,295 @@ async function main() {
     return;
   }
 
-  // Load a local `.env` so `DATABASE_URL` (and every other var it defines) is
-  // available to the config file, to `turbine()` in user scripts, and to command
-  // resolution: exactly what the quickstart promises. A pre-existing env var
-  // always wins. Surfaces the honest state when the file cannot be read.
-  const dotEnv = loadDotEnvForCli();
-  if (dotEnv.loadError) {
-    warn(`Could not read ${cyan('.env')}: ${dotEnv.loadError}. Continuing without it.`);
-  } else if (dotEnv.fileExists && dotEnv.unsupported) {
-    warn(
-      `Found ${cyan('.env')} but this Node version cannot auto-load it. ` +
-        `Upgrade to Node 20.12+ or export ${cyan('DATABASE_URL')} yourself.`,
-    );
-  }
-
-  const overrides: CliOverrides = {
-    url: args.url,
-    out: args.out,
-    schema: args.schema,
-    schemaFile: args.schemaFile,
-    include: args.include,
-    exclude: args.exclude,
-    importExtension: args.importExtension,
-    keepColumnNames: args.keepColumnNames,
-    legacyToManyUniques: args.legacyToManyUniques,
-  };
-
-  // Resolve the config file (skipped entirely for config-free invocations such
-  // as `studio --demo`). A config that exists but fails to import is surfaced
-  // loudly (with a name + the underlying error) instead of being swallowed and
-  // later misreported as a missing database URL.
-  const { config, fileConfig, loadError } = await bootstrapCliConfig(args, overrides);
-  if (loadError && args.command !== 'init') {
-    const underlying = loadError.error instanceof Error ? loadError.error.message : String(loadError.error);
-    warn(`Could not load ${cyan(loadError.filename)}: ${underlying}`);
-    if (loadError.error instanceof Error) printCjsHintIfApplicable(loadError.error);
-    newline();
-  }
-
-  // Warn (don't change precedence) when an .env-sourced DATABASE_URL is silently
-  // overriding a differing, non-empty url in the config file (a wrong-database
-  // hazard for push/migrate/seed). Shell-exported DATABASE_URL stays silent.
-  const urlConflict = dotEnvUrlConflictWarning({
-    provenance: dotEnv.databaseUrlProvenance,
-    envUrl: process.env.DATABASE_URL,
-    fileConfigUrl: fileConfig.url,
-    overrideUrl: overrides.url,
-  });
-  if (urlConflict && args.command !== 'init') {
-    warn(urlConflict);
-    newline();
-  }
-
   try {
+    // Load a local `.env` so `DATABASE_URL` (and every other var it defines) is
+    // available to the config file, to `turbine()` in user scripts, and to command
+    // resolution: exactly what the quickstart promises. A pre-existing env var
+    // always wins. Surfaces the honest state when the file cannot be read.
+    const dotEnv = loadDotEnvForCli();
+    if (dotEnv.loadError) {
+      warn(`Could not read ${cyan('.env')}: ${dotEnv.loadError}. Continuing without it.`);
+    } else if (dotEnv.fileExists && dotEnv.unsupported) {
+      warn(
+        `Found ${cyan('.env')} but this Node version cannot auto-load it. ` +
+          `Upgrade to Node 20.12+ or export ${cyan('DATABASE_URL')} yourself.`,
+      );
+    }
+
+    const overrides: CliOverrides = {
+      engine: args.engine,
+      url: args.url,
+      out: args.out,
+      schema: args.schema,
+      schemaFile: args.schemaFile,
+      include: args.include,
+      exclude: args.exclude,
+      importExtension: args.importExtension,
+      keepColumnNames: args.keepColumnNames,
+      exactNativeIntegers: args.exactNativeIntegers,
+      legacyToManyUniques: args.legacyToManyUniques,
+    };
+
+    // Resolve the config file (skipped entirely for config-free invocations such
+    // as `studio --demo`). A config that exists but fails to import is surfaced
+    // loudly (with a name + the underlying error) instead of being swallowed and
+    // later misreported as a missing database URL.
+    const { config, fileConfig, loadError } = await bootstrapCliConfig(args, overrides);
+    if (loadError && args.engine === undefined) {
+      throw new ValidationError(
+        `Could not load ${loadError.filename}: ${errorText(loadError.error)}. Refusing to select a database engine from an unreadable config. Fix the config or explicitly choose --engine.`,
+      );
+    }
+    if (loadError && args.command === 'doctor' && config.engine === 'mysql')
+      throw new ValidationError('Could not load MySQL doctor configuration.');
+    if (loadError && args.command !== 'init') {
+      const underlying = loadError.error instanceof Error ? loadError.error.message : String(loadError.error);
+      warn(`Could not load ${cyan(loadError.filename)}: ${underlying}`);
+      if (loadError.error instanceof Error) printCjsHintIfApplicable(loadError.error);
+      newline();
+    }
+
+    if (config.engine === 'd1') {
+      if (loadError) throw new ValidationError(`Could not load ${loadError.filename}: ${errorText(loadError.error)}`);
+      assertD1Config(fileConfig);
+      if (args.command === 'init' && findConfigFile() && fileConfig.engine !== 'd1')
+        throw new ValidationError('Existing config selects a different database engine.');
+      const d1Config =
+        args.command === 'init' && !findConfigFile()
+          ? { ...config, d1: { binding: 'DB', databaseId: 'turbine-local', persist: './.turbine/d1' } }
+          : config;
+      await cmdD1Project(args.command, args, d1Config, process.argv.slice(2));
+      return;
+    }
+
+    if (config.engine === 'libsql') {
+      assertLibsqlProjectConfigOptions(fileConfig);
+      const projectConfig = { ...config, url: config.url ? libsqlProjectUrl(config.url).url : config.url };
+      if (loadError) throw new ValidationError(`Could not load ${loadError.filename}: ${errorText(loadError.error)}`);
+      if (args.command === 'init' && findConfigFile() && fileConfig.engine !== 'libsql')
+        throw new ValidationError('Existing config selects a different database engine.');
+      if (canonicalCommand(args.command) === 'migrate') assertLibsqlMigrationArguments(args, process.argv.slice(2));
+      else if (canonicalCommand(args.command) === 'seed') assertLibsqlSeedArguments(args, process.argv.slice(2));
+      else assertLibsqlProjectArguments(args.command, process.argv.slice(2));
+      if (args.help) {
+        if (canonicalCommand(args.command) === 'migrate') showLibsqlMigrateHelp();
+        else if (canonicalCommand(args.command) === 'seed') showLibsqlSeedHelp();
+        else showLibsqlProjectHelp();
+        return;
+      }
+      switch (canonicalCommand(args.command)) {
+        case 'migrate':
+          await cmdLibsqlMigrate(args, projectConfig);
+          return;
+        case 'seed': {
+          const context = resolveLibsqlProjectContext(projectConfig);
+          await cmdLibsqlSeed(args, { ...projectConfig, url: context.url }, async () => ({
+            url: context.url,
+            schema: await introspectLibsqlProject(projectConfig),
+          }));
+          return;
+        }
+        case 'init':
+          await cmdLibsqlInit(args, { ...projectConfig, url: projectConfig.url || 'file:./turbine/dev.sqlite' });
+          return;
+        case 'generate':
+          await cmdLibsqlGenerate(args, projectConfig);
+          return;
+        case 'status':
+          await cmdLibsqlStatus(args, projectConfig);
+          return;
+      }
+      throw new ValidationError('Unsupported local libSQL command.');
+    }
+
+    // Refuse before commands can replace reports, maps or generated output.
+    if (config.exactNativeIntegers && config.engine === 'postgresql') {
+      throw new ValidationError('exactNativeIntegers requires an explicit target: sqlite, mysql or mssql.');
+    }
+
+    if (config.engine === 'mysql' && args.command === 'push') {
+      assertMysqlPushArguments(args, process.argv.slice(2));
+    }
+    if (config.engine === 'mysql' && canonicalCommand(args.command) === 'migrate') {
+      assertMysqlMigrationArguments(args, process.argv.slice(2));
+    }
+    if (config.engine === 'mysql' && canonicalCommand(args.command) === 'seed') {
+      assertMysqlSeedArguments(args, process.argv.slice(2));
+    }
+    if (config.engine === 'mssql' && canonicalCommand(args.command) === 'seed') {
+      assertMssqlSeedArguments(args, process.argv.slice(2));
+    }
+    if (configCommandHelp) {
+      if (loadError) throw new ValidationError(`Could not load ${loadError.filename}: ${errorText(loadError.error)}`);
+      if (canonicalCommand(args.command) === 'seed') {
+        if (config.engine === 'mysql') showMysqlSeedHelp();
+        else if (config.engine === 'sqlite') showSqliteSeedHelp();
+        else if (config.engine === 'mssql') showMssqlSeedHelp();
+        else showSubcommandHelp(args.command);
+        return;
+      }
+      if (config.engine === 'mysql') showMysqlMigrateHelp();
+      else if (config.engine === 'sqlite') showSqliteHelp();
+      else if (config.engine === 'mssql') showMssqlHelp();
+      else showSubcommandHelp(args.command);
+      return;
+    }
+
+    // Warn (don't change precedence) when an .env-sourced DATABASE_URL is silently
+    // overriding a differing, non-empty url in the config file (a wrong-database
+    // hazard for push/migrate/seed). Shell-exported DATABASE_URL stays silent.
+    const urlConflict = dotEnvUrlConflictWarning({
+      provenance: dotEnv.databaseUrlProvenance,
+      envUrl: process.env.DATABASE_URL,
+      fileConfigUrl: fileConfig.url,
+      overrideUrl: overrides.url,
+    });
+    if (urlConflict && args.command !== 'init') {
+      warn(
+        (config.engine === 'mssql' || config.engine === 'sqlite') &&
+          (args.command === 'doctor' || args.command === 'mcp')
+          ? 'DATABASE_URL from .env is overriding the url in your config file. Using the .env value. Remove DATABASE_URL from .env, or unset the config url, to silence this.'
+          : urlConflict,
+      );
+      newline();
+    }
+
+    if (TOOL_COMMANDS.includes(args.command)) {
+      if (loadError) throw new ValidationError(`Could not load ${loadError.filename}: ${errorText(loadError.error)}`);
+      refuseSchemaFilePath(config);
+      const result = await runToolCommand(args, {
+        engine: toolEngine(config.engine),
+        url: config.url,
+        schema: config.schema,
+        migrationsDir: config.migrationsDir,
+        legacyToManyUniques: config.legacyToManyUniques,
+        metadataDir: config.out,
+        include: config.include,
+        exclude: config.exclude,
+      });
+      console.log(JSON.stringify(result, null, 2));
+      return;
+    }
+    if (args.acknowledgePartialDdl && config.engine !== 'mysql') {
+      throw new ValidationError('--acknowledge-partial-ddl only applies to MySQL migrate recover.');
+    }
+    if (config.engine === 'mysql') {
+      if (args.command === 'doctor') {
+        assertMysqlDoctorArguments(args, process.argv.slice(2));
+        if (loadError) throw new ValidationError('Could not load MySQL doctor configuration.');
+        await cmdMysqlDoctor(args, config, mysqlToolDoctorReport);
+        return;
+      }
+      if (loadError) throw new ValidationError(`Could not load ${loadError.filename}: ${errorText(loadError.error)}`);
+      if (args.command === 'init' && findConfigFile() && fileConfig.engine !== config.engine) {
+        throw new ValidationError(
+          'Existing config selects a different database engine. Set engine: "mysql" before initializing a MySQL project.',
+        );
+      }
+      if (args.command === 'mcp') {
+        await cmdMcp(args, config);
+        return;
+      }
+      if (args.command === 'diff') {
+        await cmdMysqlSchema(args, config, loadSchemaFile);
+        return;
+      }
+      if (args.command === 'push') {
+        await cmdMysqlPush(args, config, (path) => loadSchemaFile(path, importSeedModule));
+        return;
+      }
+      if (canonicalCommand(args.command) === 'seed') {
+        await cmdMysqlSeed(args, config);
+        return;
+      }
+      assertMysqlProjectCommand(args.command);
+      switch (canonicalCommand(args.command)) {
+        case 'migrate':
+          await cmdMysqlMigrate(args, config, loadSchemaFile);
+          return;
+        case 'init':
+          await cmdMysqlInit(args, config);
+          return;
+        case 'generate':
+          await cmdMysqlGenerate(args, config);
+          return;
+        case 'status':
+          await cmdMysqlStatus(args, config);
+          return;
+      }
+    }
+    if (config.engine === 'mssql') {
+      if (loadError) throw new ValidationError(`Could not load ${loadError.filename}: ${errorText(loadError.error)}`);
+      if (args.command === 'init' && findConfigFile() && fileConfig.engine !== config.engine) {
+        throw new ValidationError(
+          'Existing config selects a different database engine. Set engine: "mssql" before initializing a SQL Server project.',
+        );
+      }
+      if (args.command === 'mcp') {
+        await cmdMcp(args, config);
+        return;
+      }
+      if (canonicalCommand(args.command) === 'seed') {
+        await cmdMssqlSeed(args, config, importSeedModule);
+        return;
+      }
+      if (args.command === 'doctor') {
+        await cmdMssqlDoctor(args, config, process.argv.slice(2));
+        return;
+      }
+      assertMssqlProjectCommand(args.command);
+      switch (canonicalCommand(args.command)) {
+        case 'init':
+          await cmdMssqlInit(args, config);
+          return;
+        case 'generate':
+          await cmdMssqlGenerate(args, config);
+          return;
+        case 'status':
+          await cmdMssqlStatus(args, config);
+          return;
+        case 'migrate':
+          await cmdMssqlMigrate(args, config, confirmDestructive);
+          return;
+      }
+    }
+    if (config.engine === 'sqlite') {
+      if (loadError) throw new ValidationError(`Could not load ${loadError.filename}: ${errorText(loadError.error)}`);
+      if (args.command === 'init' && findConfigFile() && fileConfig.engine !== config.engine) {
+        throw new ValidationError(
+          'Existing config selects a different database engine. Set engine: "sqlite" in that config before initializing a SQLite project.',
+        );
+      }
+      if (args.command === 'mcp') {
+        await cmdMcp(args, config);
+        return;
+      }
+      if (args.command === 'doctor') {
+        await cmdSqliteDoctor(args, config);
+        return;
+      }
+      assertSqliteProjectCommand(args.command);
+      switch (canonicalCommand(args.command)) {
+        case 'init':
+          await cmdSqliteInit(args, config);
+          return;
+        case 'generate':
+          await cmdSqliteGenerate(args, config);
+          return;
+        case 'status':
+          await cmdSqliteStatus(args, config);
+          return;
+        case 'seed':
+          await cmdSqliteSeed(args, config);
+          return;
+        case 'migrate':
+          await cmdSqliteMigrate(args, config, confirmDestructive);
+          return;
+        case 'push':
+          await cmdSqliteSchema(args, config, loadSchemaFile);
+          return;
+      }
+    }
     switch (args.command) {
       case 'init':
         await cmdInit(args, config);

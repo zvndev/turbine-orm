@@ -1,0 +1,101 @@
+{
+  "schemaVersion": 1,
+  "tools": {
+    "typescript": "6.0.3",
+    "@types/node": "22.20.4"
+  },
+  "profiles": {
+    "postgres": {
+      "entry": "turbine-orm",
+      "drivers": {
+        "pg": "8.22.0"
+      },
+      "initialization": "Unconnected pg.Pool and TurbineClient"
+    },
+    "sqlite": {
+      "entry": "turbine-orm/sqlite",
+      "drivers": {},
+      "initialization": "Native node:sqlite in-memory database and turbineSqlite"
+    },
+    "mysql": {
+      "entry": "turbine-orm/mysql",
+      "drivers": {
+        "mysql2": "3.24.5"
+      },
+      "initialization": "unavailable: turbineMysql probes SELECT VERSION() even with a supplied pool; this tool never connects to a database"
+    },
+    "serverless": {
+      "entry": "turbine-orm/serverless",
+      "drivers": {
+        "pg": "8.22.0"
+      },
+      "initialization": "turbineHttp with a supplied pg.Pool on Node; not an edge/HTTP driver profile"
+    },
+    "cli": {
+      "entry": "turbine-orm/cli",
+      "drivers": {},
+      "initialization": "CLI config entry import; executable --help startup reported separately"
+    },
+    "sql": {
+      "entry": "turbine-orm/sql",
+      "drivers": {},
+      "initialization": "unavailable: execution-free SQL composition has no engine initialization; behavioral compilation is checked separately"
+    },
+    "mysql-seed": {
+      "entry": "turbine-orm/mysql/seed",
+      "drivers": {},
+      "initialization": "unavailable: runMysqlSeed requires a native MySQL connection/catalog/transaction; declaration-only import without the optional mysql2 peer"
+    },
+    "mssql-seed": {
+      "entry": "turbine-orm/mssql/seed",
+      "drivers": {},
+      "initialization": "unavailable: runMssqlSeed requires a native SQL Server connection/catalog/transaction; declaration-only import without the optional mssql peer"
+    },
+    "core": {
+      "entry": "turbine-orm/core",
+      "drivers": {
+        "pg": "8.23.1"
+      },
+      "initialization": "Unconnected supplied pg.Pool and turbineCore with client ownership; no connection or SQL"
+    },
+    "neon-ws": {
+      "entry": "turbine-orm/neon-ws",
+      "drivers": {
+        "@neondatabase/serverless": "1.2.0",
+        "ws": "8.18.3"
+      },
+      "initialization": "unavailable: no actual WebSocket endpoint/session contract; real pinned Neon Pool and ws imports only, no factory invocation or hosted claim"
+    },
+    "neon-http": {
+      "entry": "turbine-orm/neon-http",
+      "drivers": {
+        "@neondatabase/serverless": "1.2.0"
+      },
+      "initialization": "unavailable: no actual HTTP endpoint; real pinned neon driver import only, no query function fabrication or hosted claim"
+    },
+    "notification-hub": {
+      "entry": "turbine-orm/notification-hub",
+      "drivers": {
+        "pg": "8.23.1"
+      },
+      "initialization": "Unsubscribed hub with an owned unconnected pg.Pool; no checkout, LISTEN or SQL"
+    },
+    "live-query": {
+      "entry": "turbine-orm/live-query",
+      "drivers": {},
+      "initialization": "unavailable: application supplies query and subscription; local callback correctness is separate from native initialization"
+    },
+    "d1": {
+      "entry": "turbine-orm/d1",
+      "drivers": {},
+      "initialization": "unavailable: actual D1Database binding requires a Worker; no fake binding, Worker initialization or hosted execution"
+    },
+    "libsql": {
+      "entry": "turbine-orm/libsql",
+      "drivers": {
+        "@libsql/client": "0.18.0"
+      },
+      "initialization": "Real local native :memory: turbineLibsql including mandatory read-only integer-mode admission SELECT; disconnect cleanup excluded; no query benchmark or remote provider certification"
+    }
+  }
+}

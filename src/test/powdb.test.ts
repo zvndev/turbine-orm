@@ -133,7 +133,7 @@ const schema: SchemaMetadata = {
         },
       },
     ),
-    // A json-document table for F1/F2 (JSON path filters, ordering, grouping).
+    // A json-document table for JSON path filters, ordering, and grouping.
     doc: table('doc', [
       col('id', 'id', 'string', 'text', { hasDefault: true }),
       col('data', 'data', 'Record<string, unknown>', 'jsonb', { nullable: true }),
@@ -247,7 +247,7 @@ describe('powdb: type mapping', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F4a: doc-field expression index DDL
+// Doc-field expression index DDL
 // ---------------------------------------------------------------------------
 
 describe('powdb: powqlSchemaDDL doc-field expression indexes', () => {
@@ -1122,7 +1122,7 @@ describe('powdb: encodePowqlLiteral (typed encoding)', () => {
 
   it('ADVERSARIAL: escapes break-out characters per the PowDB lexer rules', () => {
     // The lexer recognizes only \" \\ \n \t inside a "…" literal; every other
-    // char is taken literally. So we escape \ and " (the only break-out vectors)
+    // char is taken literally. Escape \ and " (the only break-out vectors)
     // and render \n / \t as their recognized escapes.
     assert.equal(encodePowqlLiteral('a"b'), '"a\\"b"'); // embedded quote escaped
     assert.equal(encodePowqlLiteral('a\\b'), '"a\\\\b"'); // backslash doubled
@@ -1319,7 +1319,7 @@ describe('powdb: PowdbEmbeddedPool param materialization', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F1: embedded native typed transport (addon >= 0.14)
+// Embedded native typed transport (addon >= 0.14)
 // ---------------------------------------------------------------------------
 
 /**
@@ -1449,7 +1449,7 @@ describe('powdb: PowdbEmbeddedPool native typed transport (F1)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F3: read-only awareness: pool flag + embedded readonly target routing
+// Read-only awareness: pool flag + embedded readonly target routing
 // ---------------------------------------------------------------------------
 
 /**
@@ -2378,7 +2378,7 @@ describe('powdb: owned-pool disconnect() closes every driver client (socket-leak
 });
 
 // ---------------------------------------------------------------------------
-// v0.31 review fixes, release destroy contract, closed guards, implicit-tx marker
+// v0.31: release destroy contract, closed guards, implicit-tx marker
 // ---------------------------------------------------------------------------
 
 describe('powdb: connection release honors the destroy contract (review fix)', () => {
@@ -2831,7 +2831,7 @@ describe('powdb: injected client pool runs the version probe (B1 fix)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F3: native typed wire (queryNativeRaw) materialization + feature-detect
+// Native typed wire (queryNativeRaw) materialization + feature-detect
 // ---------------------------------------------------------------------------
 
 /**
@@ -2982,7 +2982,7 @@ describe('powdb: F3 rowToEntity native branch', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F5: typed connection errors + stale-frame classification
+// Typed connection errors + stale-frame classification
 // ---------------------------------------------------------------------------
 
 describe('powdb: F5 wrapPowdbError connection-class reclassification', () => {
@@ -3061,7 +3061,7 @@ describe('powdb: F5 isStaleFramePowdbError predicate + retryStaleReads plumbing'
 });
 
 // ---------------------------------------------------------------------------
-// F1: JsonFilter → PowQL path filters
+// JsonFilter → PowQL path filters
 // ---------------------------------------------------------------------------
 
 describe('powdb F1: JsonFilter → PowQL path filters', () => {
@@ -3226,7 +3226,7 @@ describe('powdb F1: JsonFilter → PowQL path filters', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F2: JSON-path orderBy and groupBy
+// JSON-path orderBy and groupBy
 // ---------------------------------------------------------------------------
 
 describe('powdb F2: JSON-path orderBy', () => {

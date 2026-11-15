@@ -52,8 +52,8 @@ export type PiiTagMap = Record<string, string[]>;
  * not look like `generateMetadata` output (no `tables:` map, or not a single
  * parsable column object), or it did not parse to completion (it ends inside a
  * string, a comment, or an unclosed object). An empty `tags` with `ok: true` is
- * a real "no tagged columns"; an empty `tags` with `ok: false` is "we do not
- * know", and the two must never be treated the same way. Nor is a NON-empty
+ * a real "no tagged columns"; an empty `tags` with `ok: false` is "unknown".
+ * The two must never be treated the same way. Nor is a NON-empty
  * `tags` with `ok: false` usable: a truncated file's surviving tags are a
  * prefix of the real set, so trusting them still under-redacts.
  */
@@ -281,7 +281,7 @@ export function scanPiiTags(source: string): PiiScan {
   // Truncation is checked FIRST and independently of what was found. A file cut
   // short mid-write still contains a `tables:` map and parsable columns, so the
   // "did this look like generated metadata" questions all answer yes while the
-  // tags after the cut are simply missing. That is the shape this scan used to
+  // tags after the cut are missing. That is the shape this scan used to
   // report as `ok: true` with a short tag list.
   if (truncated) reason = `${truncated}; the generated metadata file looks truncated`;
   else if (stack.length > 0) {

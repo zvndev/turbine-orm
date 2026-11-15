@@ -9,14 +9,17 @@ import { formatBytes, type TableStats } from '../index-stats.js';
 import {
   deriveCatalogRelations,
   type ForeignKeyEntry,
-  indexKeyColumn,
-  parseIndexKeyEntries,
+  indexMetadataFromDefinition,
   printableCatalogName,
 } from '../introspect.js';
+import { mssqlDialect } from '../mssql.js';
+import { mysqlDialect } from '../mysql.js';
+import { isSequenceDefault, readIndexDefinition } from '../pg-catalog-text.js';
 import type { PgCompatPool, PgCompatPoolClient } from '../pg-types.js';
 import type { FindManyArgs } from '../query/index.js';
 import { QueryInterface, quoteIdent } from '../query/index.js';
-import { ownLookup, registerUtcTemporalParsers } from '../query/utils.js';
+import { registerUtcTemporalParsers } from '../query/pg-type-parsers.js';
+import { ownLookup } from '../query/utils.js';
 import {
   type ColumnMetadata,
   type IndexMetadata,
@@ -28,6 +31,7 @@ import {
   snakeToCamel,
   type TableMetadata,
 } from '../schema.js';
+import { sqliteDialect } from '../sqlite.js';
 import {
   COMPILE_OPERATIONS,
   type CompileOperation,
@@ -38,12 +42,29 @@ import {
 } from './compile-query.js';
 import { CATALOGUED_ERROR_CODES, explainErrorCode } from './error-catalog.js';
 import { listMigrationFiles } from './migrate.js';
+import { collectMssqlDoctorReport } from './mssql-doctor.js';
+import {
+  createMssqlToolPool,
+  introspectMssqlToolClient,
+  mssqlToolIndexSummary,
+  releaseMssqlToolClient,
+} from './mssql-tools.js';
+import {
+  createMysqlToolPool,
+  introspectMysqlToolClient,
+  mysqlToolDoctorReport,
+  mysqlToolIndexSummary,
+  sampleMysqlToolRows,
+} from './mysql-tools.js';
 import {
   assertNoPiiPredicates as assertNoPiiPredicatesShared,
   findRowLockOption,
   rowLockRefusalMessage,
 } from './pii-predicate-guard.js';
 import { applyPiiTags, loadPiiTags } from './pii-tags.js';
+import { assertSqliteDoctorFile, collectSqliteDoctorReport } from './sqlite-doctor.js';
+import { createSqliteToolPool, introspectSqliteToolClient, sqliteToolIndexSummary } from './sqlite-tools.js';
+import { discoverToolCapabilities, type ToolEngine, toolEngine, toolSupported } from './tool-capabilities.js';
 import { redactUrl } from './ui.js';
 
 /**
@@ -88,11 +109,14 @@ const TRACKING_TABLE = '_turbine_migrations';
 const shown = printableCatalogName;
 
 export interface McpServerOptions {
+  /** Defaults to PostgreSQL; SQLite tools open existing files read-only. */
+  engine?: ToolEngine;
   url: string;
   schema: string;
   migrationsDir: string;
   include?: string[];
   exclude?: string[];
+  legacyToManyUniques?: boolean;
   /**
    * Directory holding generated Turbine metadata (`turbine generate`'s `out`).
    * PII tags are code-first declarations that introspection never sets, so
@@ -151,6 +175,7 @@ type JsonObject = Record<string, unknown>;
 interface McpContext {
   options: McpServerOptions;
   pool: PgCompatPool;
+  injectedPool?: boolean;
 }
 
 /**
@@ -333,7 +358,8 @@ const TOOLS: ToolDefinition[] = [
   },
   {
     name: 'doctor_report',
-    description: 'Report missing relation indexes using Turbine metadata and the index advisor.',
+    description:
+      'Report relation index advice on PostgreSQL, or scoped catalog diagnostics on SQLite, MySQL and SQL Server. Unknown observations do not establish a clean assessment.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
   },
   {
@@ -450,6 +476,12 @@ const TOOLS: ToolDefinition[] = [
     },
   },
   {
+    name: 'engine_capabilities',
+    description:
+      'Versioned effective engine, runtime and transport facts for these read-only tools. Does not open a database or probe connectivity. SQL dialect support is distinct from tool sessions, transactions, cursors, pipeline and read-only enforcement.',
+    inputSchema: { type: 'object', properties: {}, additionalProperties: false },
+  },
+  {
     name: 'explain_error',
     description:
       'Explain a Turbine error code: the class name, when it is thrown, the likely causes, how to fix it, the extra properties the error carries, and its docs URL. Accepts `TURBINE_E003`, `E003`, or `3`. Needs no database and reads none.',
@@ -464,6 +496,55 @@ const TOOLS: ToolDefinition[] = [
   },
 ];
 
+function createToolContext(options: McpServerOptions, pool?: PgCompatPool): McpContext {
+  const engine = toolEngine(options.engine);
+  if (engine === 'mssql' && pool) {
+    throw new Error('SQL Server tools own their catalog handles; an injected pool is not supported.');
+  }
+  if (engine === 'mysql' && pool) {
+    throw new Error('MySQL tools own their native connections; an injected pool is not supported.');
+  }
+  if (engine === 'sqlite' && pool) {
+    throw new Error('SQLite tools own their read-only file handles; an injected pool is not supported.');
+  }
+  return {
+    options,
+    injectedPool: pool !== undefined,
+    pool:
+      pool ??
+      (engine === 'mssql'
+        ? createMssqlToolPool(options.url, options.schema)
+        : engine === 'mysql'
+          ? createMysqlToolPool(options.url, options.schema, options)
+          : engine === 'sqlite'
+            ? createSqliteToolPool(options.url, options.schema)
+            : new pg.Pool({ connectionString: options.url, max: 2, idleTimeoutMillis: 10_000 })),
+  };
+}
+
+/**
+ * Run one CLI tool through the MCP validation and PII perimeter, then close owned resources.
+ * Discovery and error lookup do not require a database URL or SQLite runtime.
+ * @example runReadOnlyTool(options, 'compile_query', { table: 'users', args: { limit: 5 } })
+ */
+export async function runReadOnlyTool(
+  options: McpServerOptions,
+  name: string,
+  args: JsonObject = {},
+): Promise<unknown> {
+  // Keep connection-free tools usable even without a path or native runtime.
+  const engine = toolEngine(options.engine);
+  if (name === 'engine_capabilities') return discoverToolCapabilities(engine);
+  if (name === 'explain_error') return explainError(requiredString(args, 'code'));
+  const ctx = createToolContext(options);
+  try {
+    const result = (await callTool({ name, arguments: args }, ctx)) as { content: { text: string }[] };
+    return JSON.parse(result.content[0]!.text);
+  } finally {
+    await ctx.pool.end();
+  }
+}
+
 export function startMcpServer(options: McpServerOptions, transport: McpTransport = {}): McpServerHandle {
   const input = transport.input ?? process.stdin;
   const output = transport.output ?? process.stdout;
@@ -471,11 +552,8 @@ export function startMcpServer(options: McpServerOptions, transport: McpTranspor
   // a pool it owns. This server builds its own raw pool, so without it a
   // `date` sampled here is serialized at the CLI process's local midnight while
   // the application reading the same row through Turbine sees UTC midnight.
-  registerUtcTemporalParsers();
-  const ctx: McpContext = {
-    options,
-    pool: transport.pool ?? new pg.Pool({ connectionString: options.url, max: 2, idleTimeoutMillis: 10_000 }),
-  };
+  if (toolEngine(options.engine) === 'postgresql') registerUtcTemporalParsers();
+  const ctx = createToolContext(options, transport.pool);
 
   // An idle pooled connection that dies (server restart, proxy idle timeout)
   // emits 'error' on the POOL, which has no default listener: unhandled, it
@@ -650,7 +728,22 @@ async function dispatch(request: JsonRpcRequest, ctx: McpContext): Promise<unkno
     case 'notifications/initialized':
       return null;
     case 'tools/list':
-      return { tools: TOOLS };
+      return {
+        tools: TOOLS.filter((tool) => toolSupported(toolEngine(ctx.options.engine), tool.name)).map((tool) =>
+          (ctx.options.engine === 'sqlite' || ctx.options.engine === 'mysql' || ctx.options.engine === 'mssql') &&
+          tool.name === 'schema_overview'
+            ? {
+                ...tool,
+                description:
+                  ctx.options.engine === 'mssql'
+                    ? 'List tables, columns, relations and indexes. SQL Server row estimates are unavailable and reported as null.'
+                    : ctx.options.engine === 'mysql'
+                      ? 'List tables, columns, relations and indexes. MySQL row estimates are unavailable and reported as null.'
+                      : 'List tables, columns, relations and indexes. SQLite row estimates are unavailable and reported as null.',
+              }
+            : tool,
+        ),
+      };
     case 'tools/call':
       return callTool(request.params, ctx);
     case 'shutdown':
@@ -666,8 +759,15 @@ async function callTool(params: unknown, ctx: McpContext): Promise<unknown> {
   }
   const args = isObject(params.arguments) ? params.arguments : {};
 
+  const engine = toolEngine(ctx.options.engine);
+  if (TOOLS.some((tool) => tool.name === params.name) && !toolSupported(engine, params.name)) {
+    throw jsonRpcError(-32602, `Tool "${params.name}" is not implemented for engine "${engine}".`);
+  }
   let result: unknown;
   switch (params.name) {
+    case 'engine_capabilities':
+      result = discoverToolCapabilities(engine, ctx.injectedPool);
+      break;
     case 'schema_overview':
       result = await schemaOverview(ctx);
       break;
@@ -678,6 +778,12 @@ async function callTool(params: unknown, ctx: McpContext): Promise<unknown> {
       result = await migrationStatus(ctx);
       break;
     case 'doctor_report':
+      if (
+        engine !== 'postgresql' &&
+        params.arguments !== undefined &&
+        (!isObject(params.arguments) || Object.keys(args).length > 0)
+      )
+        throw jsonRpcError(-32602, 'Native doctor_report takes no arguments or SQL.');
       result = await doctorReport(ctx);
       break;
     case 'explain_query':
@@ -714,12 +820,15 @@ async function callTool(params: unknown, ctx: McpContext): Promise<unknown> {
 async function schemaOverview(ctx: McpContext): Promise<unknown> {
   return withReadOnly(ctx, async (client) => {
     const { metadata } = await loadSchemaMetadata(client, ctx.options);
-    const rowCounts = await collectTableStats(client, ctx.options.schema);
+    const rowCounts =
+      ctx.options.engine === 'sqlite' || ctx.options.engine === 'mysql' || ctx.options.engine === 'mssql'
+        ? null
+        : await collectTableStats(client, ctx.options.schema);
     return {
       schema: ctx.options.schema,
       tables: Object.values(metadata.tables).map((table) => ({
         name: table.name,
-        estimatedRows: estimatedRowCount(rowCounts.get(table.name)),
+        estimatedRows: rowCounts ? estimatedRowCount(rowCounts.get(table.name)) : null,
         columns: table.columns.length,
         primaryKey: table.primaryKey,
         indexes: table.indexes.length,
@@ -745,6 +854,7 @@ async function tableDetail(ctx: McpContext, tableName: string): Promise<unknown>
         nullable: column.nullable,
         hasDefault: column.hasDefault,
         isGenerated: column.isGenerated ?? false,
+        ...(ctx.options.engine === 'mssql' ? { isGeneratedStored: column.isGeneratedStored ?? false } : {}),
         isArray: column.isArray,
         maxLength: column.maxLength,
       })),
@@ -763,32 +873,6 @@ async function tableDetail(ctx: McpContext, tableName: string): Promise<unknown>
 }
 
 /**
- * Index of the predicate-introducing ` WHERE `, ignoring any that sits INSIDE a
- * single-quoted string literal.
- *
- * A plain `indexOf(' WHERE ')` matches the first occurrence anywhere, so an
- * expression index whose key list embeds the text (`((email || ' WHERE '))`)
- * gets cut mid-literal. The head then no longer contains a balanced quote, the
- * literal check on it reads clean, and the literal ships. That is the exact
- * failure this function exists to prevent, arriving through the parser rather
- * than through the branch.
- *
- * Postgres escapes an embedded quote by doubling it, and a doubled quote toggles
- * the flag twice, so it needs no special case.
- */
-function predicateStart(definition: string): number {
-  let inLiteral = false;
-  for (let i = 0; i < definition.length; i++) {
-    if (definition[i] === "'") {
-      inLiteral = !inLiteral;
-      continue;
-    }
-    if (!inLiteral && definition.startsWith(' WHERE ', i)) return i;
-  }
-  return -1;
-}
-
-/**
  * Strip literal values out of an index definition before returning it.
  *
  * `pg_indexes.indexdef` is raw DDL, and a PARTIAL index carries its predicate
@@ -799,30 +883,36 @@ function predicateStart(definition: string): number {
  * is reported as PRESENT, so the shape of the index is still legible.
  */
 function sanitizeIndex(index: IndexMetadata): Record<string, unknown> {
+  const mssql = mssqlToolIndexSummary(index);
+  if (mssql) return mssql;
+  const mysql = mysqlToolIndexSummary(index);
+  if (mysql) return mysql;
+  const sqlite = sqliteToolIndexSummary(index);
+  if (sqlite) return sqlite;
   const definition = index.definition ?? '';
-  // pg renders the predicate as a trailing ` WHERE ...` on one line, so the tail
-  // from the keyword onwards is the whole predicate. Matched case-sensitively
-  // and OUTSIDE string literals (see predicateStart): pg normalizes the keyword
-  // to upper case, so a lower-case `where` in a quoted identifier cannot trigger
-  // it, and an upper-case one inside a literal no longer can either.
-  const whereAt = predicateStart(definition);
-  const partial = whereAt !== -1;
-  // Everything before the predicate, which is where the KEY LIST lives. Checked
-  // for both index shapes: an expression index can embed a literal
-  // (`lower(email || 'x')`), and it can be partial at the same time, in which
-  // case dropping only the predicate still ships the literal in the key list.
-  // The key-list check used to sit in the non-partial branch alone, so exactly
-  // the combination this function was written for went out verbatim.
-  // Double quotes are NOT a trigger: those delimit an identifier, and
-  // identifiers are already returned in `columns`.
-  const head = partial ? definition.slice(0, whereAt) : definition;
-  const keys = keyList(head);
-  const keysHoldLiteral = keys === null || /[(']/.test(keys);
-  // `columns` is not a safe passthrough for an expression index: it is the key
-  // list split on commas, so for `((email || 'ceo@example.com'))` the "column"
-  // IS the literal. Only entries that are a bare identifier survive, and only
-  // on the expression path, so an ordinary index (including one with a quoted
-  // identifier holding a space) is untouched.
+  // Read by the one reader of index definitions (pg-catalog-text.ts), which
+  // lexes the text: the predicate is the top-level `WHERE` after the key list,
+  // so the word inside a literal or a quoted identifier is never taken for it,
+  // and the key list is the group after `USING <method>`, never a parenthesis
+  // in a quoted name.
+  const read = readIndexDefinition(definition);
+  const partial = !read || read.partial;
+  // Everything before the predicate. Checked for both index shapes: an
+  // expression index can embed a literal (`lower(email || 'x')`), and it can be
+  // partial at the same time, in which case dropping only the predicate still
+  // ships the literal in the key list.
+  const head = read?.partial ? definition.slice(0, read.whereAt).trimEnd() : definition;
+  // An expression key may hold a value (`((email || 'ceo@example.com'))`), and
+  // so may an operator class's parameter list. A column NAME is not a value,
+  // however it is quoted: identifiers are already returned in `columns`.
+  const keysHoldLiteral =
+    !read || read.keys.some((key) => key.column === null || key.modifiers.some((m) => /[(']/.test(m)));
+  // Every key is accounted for: a column by its name, an expression as a
+  // withheld entry. The relation metadata's own `columns` lists plain columns
+  // only (`indexMetadataFromDefinition`), which would drop the expression
+  // silently instead of reporting it withheld. On the withholding path a name
+  // that is not a bare identifier is withheld too, so an ordinary index
+  // (including one with a quoted identifier holding a space) is untouched.
   //
   // PARTITIONED IN ONE PASS, and the flag is read off the partition rather than
   // recomputed. `columnsWithheld` used to be a LENGTH COMPARISON against
@@ -832,24 +922,25 @@ function sanitizeIndex(index: IndexMetadata): Record<string, unknown> {
   // reply displayed a withholding marker. A derived flag cannot drift from the
   // list it describes.
   //
-  // SEEDED from `keys === null`, i.e. an UNPARSABLE definition, because that is
-  // the one input where the loop below cannot speak for the answer: the column
-  // list was derived from the same definition, so it arrives empty and every
-  // per-column test passes vacuously. `columns: [], columnsWithheld: false`
-  // reads as the FACT "this index has no columns", which no unreadable
-  // definition supports. Not knowing is a withholding like any other here, and
-  // it is labelled like one.
+  // SEEDED from an UNPARSABLE definition, because that is the one input where
+  // the loop below cannot speak for the answer: the entry list was derived from
+  // the same definition, so it arrives empty and every per-column test passes
+  // vacuously. `columns: [], columnsWithheld: false` reads as the FACT "this
+  // index has no columns", which no unreadable definition supports. Not knowing
+  // is a withholding like any other here, and it is labelled like one.
   const columns: string[] = [];
-  let columnsWithheld = keys === null;
-  for (const column of index.columns) {
-    if (keysHoldLiteral && !PLAIN_IDENTIFIER.test(column)) columnsWithheld = true;
+  let columnsWithheld = !read;
+  for (const { column } of read?.keys ?? []) {
+    if (column === null || (keysHoldLiteral && !PLAIN_IDENTIFIER.test(column))) columnsWithheld = true;
     else columns.push(column);
   }
   return {
     name: index.name,
     columns,
     columnsWithheld,
-    unique: index.unique,
+    // The database's own flag, which is what this reply describes. The relation
+    // metadata's `unique` is narrower: true only when every key is a column.
+    unique: read?.unique === true,
     partial,
     // Withholding is LABELLED, never expressed by dropping the field:
     // `JSON.stringify` omits an `undefined` value, so the agent would see an
@@ -858,7 +949,7 @@ function sanitizeIndex(index: IndexMetadata): Record<string, unknown> {
     // this file names itself, and so does this one.
     definitionWithheld: keysHoldLiteral,
     definition: keysHoldLiteral
-      ? keys === null
+      ? !read
         ? '(definition withheld: the index definition could not be parsed, so it cannot be shown to hold no literal values)'
         : '(definition withheld: the index key list is an expression that may embed literal values)'
       : partial
@@ -869,21 +960,6 @@ function sanitizeIndex(index: IndexMetadata): Record<string, unknown> {
 
 /** A key-list entry that is a bare column name, so it can hold no literal. */
 const PLAIN_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_$]*$/;
-
-/**
- * The parenthesized key list of an index definition, or `null` when the
- * definition does not parse as one.
- *
- * `null` is not the same answer as an empty key list, and the caller must not
- * collapse them. This used to return `''`, which scanned clean for literals and
- * shipped the whole definition verbatim: the ONE input this function cannot
- * read is the one it waved through. Unparsable now means WITHHELD.
- */
-function keyList(definition: string): string | null {
-  const open = definition.indexOf('(');
-  const close = definition.lastIndexOf(')');
-  return open === -1 || close <= open ? null : definition.slice(open + 1, close);
-}
 
 async function migrationStatus(ctx: McpContext): Promise<unknown> {
   return withReadOnly(ctx, async (client) => {
@@ -963,7 +1039,19 @@ async function migrationStatus(ctx: McpContext): Promise<unknown> {
 }
 
 async function doctorReport(ctx: McpContext): Promise<unknown> {
+  if (ctx.options.engine === 'sqlite') {
+    if (ctx.options.include?.length || ctx.options.exclude?.length)
+      throw jsonRpcError(-32602, 'SQLite doctor_report does not accept table filters.');
+    assertSqliteDoctorFile(ctx.options.url);
+    try {
+      return await withReadOnly(ctx, collectSqliteDoctorReport);
+    } catch {
+      throw jsonRpcError(-32603, 'Internal error', 'SQLite doctor failed; owned cleanup was attempted.');
+    }
+  }
   return withReadOnly(ctx, async (client) => {
+    if (ctx.options.engine === 'mssql') return collectMssqlDoctorReport(client, ctx.options);
+    if (ctx.options.engine === 'mysql') return mysqlToolDoctorReport(client, ctx.options);
     const { metadata } = await loadSchemaMetadata(client, ctx.options);
     const rowCounts = await collectTableStats(client, ctx.options.schema);
     const missing = findMissingRelationIndexes(metadata).sort(
@@ -1200,7 +1288,20 @@ async function compileQuery(ctx: McpContext, args: JsonObject): Promise<unknown>
 
   let report: ReturnType<typeof compileQueryPlan>;
   try {
-    report = compileQueryPlan({ metadata, table, operation, args: queryArgs });
+    report = compileQueryPlan({
+      metadata,
+      table,
+      operation,
+      args: queryArgs,
+      dialect:
+        ctx.options.engine === 'mssql'
+          ? mssqlDialect
+          : ctx.options.engine === 'mysql'
+            ? mysqlDialect
+            : ctx.options.engine === 'sqlite'
+              ? sqliteDialect
+              : undefined,
+    });
   } catch (err) {
     // Not a TurbineError (compileQueryPlan turns those into an `ok: false`
     // answer): a malformed args shape the builder rejected some other way.
@@ -1436,7 +1537,15 @@ async function sampleRows(ctx: McpContext, tableName: string, limit: number): Pr
     const visible = table.columns.filter((col) => !hidden.has(col.name));
     // Every column hidden: still report the row count, without selecting data.
     const selectList = visible.length > 0 ? visible.map((col) => quoteIdent(col.name)).join(', ') : '1 AS "_"';
-    const result = await client.query(`SELECT ${selectList} FROM ${qualifiedTable} LIMIT $1`, [limit]);
+    const result =
+      ctx.options.engine === 'mysql'
+        ? await sampleMysqlToolRows(
+            client,
+            table.name,
+            visible.map((column) => column.name),
+            limit,
+          )
+        : await client.query(`SELECT ${selectList} FROM ${qualifiedTable} LIMIT $1`, [limit]);
 
     // Rebuild each row in the table's own column order, so a hidden column is
     // visibly present-and-withheld rather than absent (an absent key reads like
@@ -1509,7 +1618,7 @@ async function sampleRows(ctx: McpContext, tableName: string, limit: number): Pr
  * built.
  *
  * `metadata` is REQUIRED, and that is the whole guard. It was optional, with an
- * unmemoized fallback when omitted, and two of the four call sites then simply
+ * unmemoized fallback when omitted, and two of the four call sites then
  * did not pass it: the cache was declared and half bypassed, silently, because
  * omitting an optional argument is not an error. Every caller has the metadata
  * object in scope, so nothing needed the fallback and only the bypass survived
@@ -2011,9 +2120,25 @@ function explainError(input: string): unknown {
 
 async function withReadOnly<T>(ctx: McpContext, fn: (client: PgCompatPoolClient) => Promise<T>): Promise<T> {
   const client = await ctx.pool.connect();
+  if (ctx.options.engine === 'mssql') {
+    try {
+      return await fn(client);
+    } finally {
+      await releaseMssqlToolClient(client);
+    }
+  }
+  if (ctx.options.engine === 'mysql') {
+    try {
+      return await fn(client);
+    } finally {
+      client.release();
+    }
+  }
   try {
-    await client.query('BEGIN READ ONLY');
-    await client.query(`SELECT set_config('statement_timeout', $1, true)`, [STATEMENT_TIMEOUT]);
+    await client.query(ctx.options.engine === 'sqlite' ? 'BEGIN' : 'BEGIN READ ONLY');
+    if (ctx.options.engine !== 'sqlite') {
+      await client.query(`SELECT set_config('statement_timeout', $1, true)`, [STATEMENT_TIMEOUT]);
+    }
     const result = await fn(client);
     await client.query('COMMIT');
     return result;
@@ -2038,6 +2163,18 @@ async function loadSchemaMetadata(client: PgCompatPoolClient, options: McpServer
   // every schema-reading tool would throw. The queueing meant they were never
   // concurrent on the wire anyway; awaiting them in turn costs nothing and puts
   // the ordering in this file rather than in a deprecated driver behaviour.
+  if (options.engine === 'mysql') {
+    const metadata = await introspectMysqlToolClient(client, options);
+    return applyMetadataPiiTags(metadata, options);
+  }
+  if (options.engine === 'mssql') {
+    const metadata = await introspectMssqlToolClient(client, options);
+    return applyMetadataPiiTags(metadata, options);
+  }
+  if (options.engine === 'sqlite') {
+    const metadata = introspectSqliteToolClient(client, options);
+    return applyMetadataPiiTags(metadata, options);
+  }
   const tablesResult = await client.query<{ table_name: string }>(
     `SELECT table_name
      FROM information_schema.tables
@@ -2211,8 +2348,7 @@ async function loadSchemaMetadata(client: PgCompatPoolClient, options: McpServer
       nullable: isNullable,
       hasDefault: row.column_default !== null,
       isGenerated:
-        (typeof row.column_default === 'string' && row.column_default.includes('nextval(')) ||
-        row.is_identity === 'YES',
+        (typeof row.column_default === 'string' && isSequenceDefault(row.column_default)) || row.is_identity === 'YES',
       isArray,
       arrayType: pgArrayType(baseType),
       pgArrayType: pgArrayType(baseType),
@@ -2246,17 +2382,15 @@ async function loadSchemaMetadata(client: PgCompatPoolClient, options: McpServer
     uniqueByTable.set(group.table, entries);
   }
 
+  // The SAME builder `turbine generate` uses, so unique, partial and columns
+  // agree with it: relation derivation below reads them, and an index this
+  // server read differently (a partial unique junction taken for a table-wide
+  // one) produced a relation the generated client does not have.
   const indexesByTable = new Map<string, IndexMetadata[]>();
   for (const row of indexResult.rows) {
     if (!tableSet.has(row.tablename)) continue;
-    const columns = extractIndexColumns(row.indexdef);
     const indexes = indexesByTable.get(row.tablename) ?? [];
-    indexes.push({
-      name: row.indexname,
-      columns,
-      unique: row.indexdef.includes('UNIQUE'),
-      definition: row.indexdef,
-    });
+    indexes.push(indexMetadataFromDefinition(row.indexname, row.indexdef));
     indexesByTable.set(row.tablename, indexes);
   }
 
@@ -2275,6 +2409,7 @@ async function loadSchemaMetadata(client: PgCompatPoolClient, options: McpServer
     uniqueByTable,
     indexesByTable,
     enums,
+    options.legacyToManyUniques === true,
   );
   const tables: Record<string, TableMetadata> = {};
   for (const tableName of tableNames) {
@@ -2323,6 +2458,10 @@ async function loadSchemaMetadata(client: PgCompatPoolClient, options: McpServer
   // while "a metadata file is sitting right there and did not parse" means the
   // user believes tags are in force while nothing is being hidden. Callers fail
   // closed on the latter (`tagsUnreadable`).
+  return applyMetadataPiiTags(metadata, options);
+}
+
+function applyMetadataPiiTags(metadata: SchemaMetadata, options: McpServerOptions): LoadedSchema {
   let piiTags: PiiTagStatus = { state: 'not-configured' };
   if (options.metadataDir) {
     const source = loadPiiTags(options.metadataDir);
@@ -2372,6 +2511,10 @@ interface ForeignKeyRow {
  * `uniqueByTable` and `indexesByTable` are therefore REQUIRED parameters, not
  * optional ones: an optional catalog input is exactly how the hasOne flip went
  * missing here in the first place. Exported for the parity unit test.
+ *
+ * `legacyToManyUniques` is the server's own `legacyToManyUniques` option, the
+ * same opt-out `turbine generate` reads, so both keep a unique foreign key's
+ * reverse relation `hasMany` (`users.profiles`) together or neither does.
  */
 export function buildRelations(
   tableNames: string[],
@@ -2381,6 +2524,7 @@ export function buildRelations(
   uniqueByTable: Map<string, string[][]>,
   indexesByTable: Map<string, IndexMetadata[]>,
   enums: Record<string, string[]> = {},
+  legacyToManyUniques = false,
 ): Map<string, Record<string, RelationDef>> {
   const tableSet = new Set(tableNames);
   const groups = new Map<string, ForeignKeyEntry>();
@@ -2410,6 +2554,7 @@ export function buildRelations(
     uniqueByTable,
     indexesByTable,
     enums,
+    legacyToManyUniques,
   });
 }
 
@@ -2485,32 +2630,6 @@ function requireTable(metadata: SchemaMetadata, tableName: string): TableMetadat
     throw jsonRpcError(-32602, `Unknown table "${shown(tableName)}". Available: ${available}`);
   }
   return table;
-}
-
-/**
- * The key-list entries of an index definition, for this server's copy of the
- * catalog.
- *
- * ONE PARSER, SHARED WITH `turbine generate`. This used to be a second,
- * independently written implementation, and it drifted from
- * {@link parseIndexKeyEntries} in ways that mattered: on
- * `USING btree (id) INCLUDE (email)` it answered `['id) INCLUDE (email']` where
- * introspection answered `['id']`, and the same for `WITH (fillfactor=…)`. Those
- * columns are handed to {@link deriveCatalogRelations}, which decides
- * hasOne-vs-hasMany and auto-m2m from unique-index coverage, so a UNIQUE index
- * with INCLUDE columns was visible to `turbine generate` and invisible here, and
- * `relation_graph` / `find_join_path` omitted a relation the ORM accepts.
- * Duplication is also what produced the predicate leak this function's history
- * records (`name) WHERE (email = 'ceo@example.com'`, verbatim, in `columns`).
- *
- * The one thing this caller wants differently is an EXPRESSION entry.
- * `parseIndexColumns` drops it, since generated metadata has nowhere to say a
- * key was not a column; here it is KEPT verbatim so {@link sanitizeIndex} can
- * report `columnsWithheld: true` rather than silently returning a shorter list.
- * That difference is now one `??` rather than a second implementation.
- */
-function extractIndexColumns(indexdef: string): string[] {
-  return parseIndexKeyEntries(indexdef).map((entry) => indexKeyColumn(entry) ?? entry);
 }
 
 function optionalLimit(value: unknown): number {

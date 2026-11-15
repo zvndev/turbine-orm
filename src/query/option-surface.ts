@@ -57,6 +57,7 @@
 // suggester. All are leaves that do not import this module, so the type-only
 // shape of everything above is unaffected.
 import { logTo, type TurbineLogger } from '../logger.js';
+import { suggestKey } from '../query-utils.js';
 import type {
   AggregateArgs,
   CountArgs,
@@ -72,7 +73,6 @@ import type {
   UpdateManyArgs,
   UpsertArgs,
 } from './types.js';
-import { suggestKey } from './utils.js';
 import { shouldWarnOnce, WARN_NS } from './warn-registry.js';
 
 /**
@@ -137,6 +137,7 @@ export const FIND_MANY_OPTIONS: OptionTable<FindManyArgs<Row>> = {
   omit: 'prisma',
   orderBy: 'prisma',
   cursor: 'prisma',
+  cursorPredicate: 'native',
   // `take` and `skip` are Prisma's own spellings and core accepts them as
   // aliases, but they stay hand-translated because Prisma gives them meanings
   // core does not have: a NEGATIVE `take` pages from the end, and `skip: 1`
@@ -168,6 +169,7 @@ export const FIND_MANY_STREAM_OPTIONS: OptionTable<FindManyStreamArgs<Row>> = {
   ...FIND_MANY_STREAM_BASE,
   // No streaming delegate exists on the compat surface, so these are not known
   // keys there and passing one is reported rather than quietly ignored.
+  signal: 'internal',
   batchSize: 'internal',
   idleTimeoutMs: 'internal',
 };
@@ -391,7 +393,7 @@ export const REFUSED_OPTION_KEYS: Readonly<Record<string, ReadonlySet<string>>> 
  *
  * The motivating case is `include`. It is Prisma's word for `with`, it is what
  * a model or a developer coming from Prisma reaches for first, and an
- * unrecognized key is simply ignored: the query runs, returns rows, and the
+ * unrecognized key is ignored: the query runs, returns rows, and the
  * relation the caller asked for is absent. No error, no empty array, just a
  * missing key on every row. A cross-model eval measured this as the single
  * largest source of confidently-wrong queries against Turbine, and every one of

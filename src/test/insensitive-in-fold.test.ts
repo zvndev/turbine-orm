@@ -46,6 +46,7 @@ import { mysqlDialect } from '../mysql.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { introspectSqliteDatabase, sqliteDialect, turbineSqlite } from '../sqlite.js';
 import { makeQuery, mockTable } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 // biome-ignore lint/suspicious/noExplicitAny: test harness plumbing
 type Any = any;
@@ -96,7 +97,7 @@ interface Engine {
 async function sqliteEngine(): Promise<Engine> {
   // Unreachable when the probe found nothing: every caller is a `sqliteIt`.
   if (!DatabaseSync) throw new Error('node:sqlite is absent; this arm should have been skipped');
-  const handle = new DatabaseSync(':memory:');
+  const handle = closeSqliteAfter(new DatabaseSync(':memory:'));
   handle.exec('CREATE TABLE folk (id INTEGER PRIMARY KEY, name TEXT NOT NULL)');
   const insert = handle.prepare('INSERT INTO folk (id, name) VALUES (?, ?)');
   for (const [i, n] of NAMES.entries()) insert.run(i + 1, n);

@@ -29,7 +29,6 @@ import {
   setOwn,
 } from './query/filters.js';
 import type { GlobalFilters } from './query/index.js';
-import { resolveColumnName, resolveRelation } from './query/utils.js';
 import {
   type CombinatorKey,
   combinatorBranches,
@@ -38,6 +37,7 @@ import {
   metadataWhereHost,
   walkWhere,
 } from './query/where-compile.js';
+import { resolveColumnName, resolveRelation } from './query-utils.js';
 import type { SchemaMetadata, TableMetadata } from './schema.js';
 
 /** The accessor a table gets on the client (`blog_posts` -> `blogPosts`). The one place it is derived. */
@@ -168,7 +168,7 @@ export function normalizeGlobalFilters(
     assertFilterNamesExist(value, schema.tables, schema.tables[table]!, key, '', 0);
     // The query path refuses a filter holding `undefined` on every query (it
     // may be a tenant id that was not set); a static filter is read once, so
-    // say so now, with the fix that applies to a static filter.
+    // reject it with the remedy that applies to a static filter.
     const hole = holdsUndefinedValue(value, 0) ? findUndefinedPath(value, '', 0) : null;
     if (hole !== null) {
       throw new ValidationError(

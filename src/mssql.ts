@@ -18,15 +18,13 @@
  *     'output'`: the statement returns its own rows in ONE round-trip (executed
  *     exactly like the PostgreSQL `'returning'` path). Upsert becomes a
  *     `MERGE … WHEN MATCHED … WHEN NOT MATCHED … OUTPUT INSERTED.* ;` (a MERGE
- *     must end with `;`). This is the first shipped engine to exercise the
- *     Phase-0 `'output'` result strategy.
+ *     must end with `;`).
  *  2. **No `json_agg`.** SQL Server has no JSON aggregate function; the idiomatic
  *     single-query nested-relation path is `(SELECT child cols … FOR JSON PATH)`,
  *     whose object shape is expressed by the child SELECT's column ALIASES rather
  *     than an explicit `JSON_OBJECT(...)`. That does NOT map onto
  *     `buildJsonObject`/`buildJsonArrayAgg`, so `mssqlDialect` defines the
- *     additive `Dialect.buildRelationSubquery` override (the sanctioned Phase-3
- *     seam extension) and owns the whole correlated subquery. To-many wraps
+ *     `Dialect.buildRelationSubquery` override and owns the whole correlated subquery. To-many wraps
  *     `ISNULL((… FOR JSON PATH), '[]')` (FOR JSON over zero rows is NULL, not
  *     `[]`); to-one adds `, WITHOUT_ARRAY_WRAPPER` and lets NULL be the no-row
  *     value. Nested relations are embedded with `JSON_QUERY(...)` so they stay
@@ -90,6 +88,7 @@
  * ```
  */
 
+import type { EventEmitter } from 'node:events';
 import {
   type DisconnectOptions,
   type DisconnectResult,
@@ -115,6 +114,7 @@ import {
   type JsonPathEqualsInput,
   type JsonWireRule,
   type LimitOffsetInput,
+  type OpenStreamOptions,
   postgresDialect,
   type RelationSubqueryContext,
   type ReturningSelection,
@@ -131,7 +131,13 @@ import {
   UnsupportedFeatureError,
   ValidationError,
 } from './errors.js';
-import { applyTableFilters, assertDistinctColumnFields, deriveEngineRelations, nullRecord } from './introspect.js';
+import {
+  applyTableFilters,
+  assertDistinctColumnFields,
+  type IntrospectOptions as CatalogIntrospectOptions,
+  deriveEngineRelations,
+  nullRecord,
+} from './introspect.js';
 import importOptionalPeer from './optional-peer-import.cjs';
 import { orderByEntries } from './query/filters.js';
 import { availableClause } from './query/utils.js';
@@ -180,7 +186,7 @@ function sortedRelEntries<V>(obj: Record<string, V>): [string, V][] {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal structural typing for the `mssql` surface we touch
+// Minimal structural typing for the `mssql` surface used here
 // ---------------------------------------------------------------------------
 //
 // Typed structurally (not via `import type` from mssql) so this module stays
@@ -196,6 +202,13 @@ interface MssqlRequest {
   input(name: string, type: unknown, value: unknown): MssqlRequest;
   query<R = Record<string, unknown>>(text: string): Promise<MssqlQueryResult<R>>;
   batch<R = Record<string, unknown>>(text: string): Promise<MssqlQueryResult<R>>;
+}
+
+interface MssqlStreamingRequest extends MssqlRequest, Pick<EventEmitter, 'on' | 'removeListener'> {
+  stream: boolean;
+  pause(): boolean;
+  resume(): boolean;
+  cancel(): boolean;
 }
 
 /** Per-column metadata `mssql` attaches to a recordset (`recordset.columns`). */
@@ -494,6 +507,157 @@ async function runRequest(
   }
 }
 
+/** One paused request and one batch, with no queue growing behind the consumer. */
+function nativeMssqlStream(
+  candidate: MssqlRequest,
+  text: string,
+  params: unknown[],
+  batchSize: number,
+  types: MssqlModule,
+  signal?: AbortSignal,
+  onClosed?: () => void,
+): { stream: AsyncGenerator<Record<string, unknown>[], void, undefined>; close(): Promise<void> } {
+  const request = candidate as MssqlStreamingRequest;
+  let started = false;
+  let ended = false;
+  let closed = false;
+  let cancelRequested = false;
+  let error: unknown;
+  let rows: Record<string, unknown>[] = [];
+  let columns: MssqlColumnMeta | undefined;
+  let resultSets = 0;
+  let wake: (() => void) | undefined;
+  let settle!: () => void;
+  const settled = new Promise<void>((resolve) => {
+    settle = resolve;
+  });
+  const notify = () => {
+    wake?.();
+    wake = undefined;
+  };
+  const onError = (failure: unknown) => {
+    if (error === undefined) error = augmentMssqlError(failure);
+    notify();
+  };
+  const cancel = () => {
+    if (started && !ended && !cancelRequested) {
+      cancelRequested = true;
+      request.cancel();
+      request.resume();
+    }
+  };
+  const onRecordset = (next: MssqlColumnMeta) => {
+    if (++resultSets > 1) {
+      onError(
+        new UnsupportedFeatureError(
+          'multiple native stream result sets',
+          'mssql',
+          'Stream a single row result set per statement.',
+        ),
+      );
+      cancel();
+    } else columns = next;
+  };
+  const onRow = (row: Record<string, unknown>) => {
+    if (closed || error !== undefined) return;
+    if (rows.length >= batchSize) {
+      onError(new ValidationError('The SQL Server driver emitted rows after native stream backpressure.'));
+      cancel();
+      return;
+    }
+    rows.push(row);
+    if (rows.length === batchSize) {
+      request.pause();
+      notify();
+    }
+  };
+  const finish = () => {
+    ended = true;
+    settle();
+    notify();
+  };
+  const onAbort = () => {
+    onError(signal!.reason);
+    void close().catch(onError);
+  };
+  let closing: Promise<void> | undefined;
+  const close = (): Promise<void> =>
+    (closing ??= (async () => {
+      closed = true;
+      if (error === undefined) error = new ValidationError('This SQL Server native stream has been closed.');
+      notify();
+      if (started && !ended) {
+        // A paused tedious request must resume to consume the cancellation ACK.
+        cancel();
+        await settled;
+      }
+      rows = [];
+      signal?.removeEventListener('abort', onAbort);
+      request.removeListener?.('row', onRow);
+      request.removeListener?.('recordset', onRecordset);
+      request.removeListener?.('error', onError);
+      onClosed?.();
+    })());
+  const stream = (async function* (): AsyncGenerator<Record<string, unknown>[], void, undefined> {
+    if (!Number.isSafeInteger(batchSize) || batchSize < 1)
+      throw new ValidationError('Native stream batchSize must be a positive safe integer.');
+    signal?.throwIfAborted();
+    if (closed) throw new ValidationError('This SQL Server native stream has been closed.');
+    if (
+      typeof request.on !== 'function' ||
+      typeof request.pause !== 'function' ||
+      typeof request.resume !== 'function' ||
+      typeof request.cancel !== 'function'
+    ) {
+      throw new UnsupportedFeatureError(
+        'native streaming',
+        'mssql',
+        'A request with pause(), resume() and cancel() is required.',
+      );
+    }
+    const sql = rewritePositionalPlaceholders(text, 'mssql', params.length, (i) => `@p${i}`, refusePlaceholder);
+    for (let i = 0; i < params.length; i++) bindParam(request, `p${i + 1}`, params[i], types);
+    request.stream = true;
+    request.on('recordset', onRecordset);
+    request.on('row', onRow);
+    request.on('error', onError);
+    try {
+      started = true;
+      // With stream=true mssql never collects recordset arrays. Its query
+      // promise settles after the driver's connection has been returned.
+      try {
+        Promise.resolve(request.query(sql)).then(finish, (failure) => {
+          onError(failure);
+          finish();
+        });
+      } catch (failure) {
+        onError(failure);
+        finish();
+      }
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+      while (true) {
+        if (error !== undefined) throw error;
+        if (closed) throw new ValidationError('This SQL Server native stream has been closed.');
+        if (rows.length === batchSize || (ended && rows.length > 0)) {
+          const batch = rows;
+          rows = [];
+          coerceBigIntColumns(batch, columns);
+          yield batch;
+          if (!closed && !ended) request.resume();
+        } else if (ended) return;
+        else
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+          });
+      }
+    } finally {
+      await close();
+    }
+  })();
+  return { stream, close };
+}
+
 /** Map a SQL-standard isolation-level name to the mssql `ISOLATION_LEVEL` constant. */
 function mapIsolationLevel(sqlNS: MssqlModule, level: string | null): number | undefined {
   if (!level) return undefined;
@@ -511,6 +675,9 @@ function mapIsolationLevel(sqlNS: MssqlModule, level: string | null): number | u
 class MssqlTxClient implements PgCompatPoolClient {
   private tx: MssqlTransaction | null = null;
   private pendingIsolation: string | null = null;
+  private released = false;
+  private readonly pending = new Set<Promise<unknown>>();
+  private active?: ReturnType<typeof nativeMssqlStream>;
 
   constructor(
     private readonly pool: MssqlConnectionPool,
@@ -519,8 +686,32 @@ class MssqlTxClient implements PgCompatPoolClient {
 
   // biome-ignore lint/suspicious/noExplicitAny: pg-compat query is generic over the row shape.
   async query(text: QueryArg, values?: unknown[]): Promise<any> {
+    const work = this.runQuery(text, values);
+    this.pending.add(work);
+    try {
+      return await work;
+    } finally {
+      this.pending.delete(work);
+    }
+  }
+
+  // biome-ignore lint/suspicious/noExplicitAny: see query().
+  private async runQuery(text: QueryArg, values?: unknown[]): Promise<any> {
+    if (this.released) throw new ConnectionError('This SQL Server checkout has been released.');
     const { text: rawSql, params } = normalizeQueryArgs(text, values);
     const sql = rawSql.trim();
+    if (this.active) {
+      if (
+        params.length === 0 &&
+        (sql === '' || /^(?:COMMIT|ROLLBACK|SAVE TRAN(?:SACTION)?|RELEASE SAVEPOINT)\b/i.test(sql))
+      ) {
+        await this.active.close();
+        this.active = undefined;
+      } else
+        throw new ValidationError(
+          'A SQL Server native stream is active on this connection. Close it before another statement.',
+        );
+    }
 
     // RELEASE SAVEPOINT has no SQL Server equivalent (savepoints auto-persist until
     // the outer commit/rollback), releaseSavepointStatement() returns '' → no-op.
@@ -576,9 +767,52 @@ class MssqlTxClient implements PgCompatPoolClient {
     return runRequest(request, rawSql, params, this.sqlNS);
   }
 
+  async *streamBatches(
+    text: string,
+    values: unknown[],
+    batchSize: number,
+    signal?: AbortSignal,
+  ): AsyncGenerator<Record<string, unknown>[], void, undefined> {
+    if (this.released) throw new ConnectionError('This SQL Server checkout has been released.');
+    if (this.active) throw new ValidationError('A SQL Server native stream is already active on this connection.');
+    if (this.pending.size) throw new ValidationError('A SQL Server statement is still running on this connection.');
+    const state = nativeMssqlStream(
+      new this.sqlNS.Request(this.tx ?? this.pool),
+      text,
+      values,
+      batchSize,
+      this.sqlNS,
+      signal,
+      () => {
+        if (this.active === state) this.active = undefined;
+      },
+    );
+    this.active = state;
+    try {
+      yield* state.stream;
+    } finally {
+      await state.close();
+      if (this.active === state) this.active = undefined;
+    }
+  }
+
   release(): void {
-    // The transaction's connection is owned by the mssql Transaction object and is
-    // returned to the pool on commit/rollback; nothing to release here.
+    if (this.released) return;
+    this.released = true;
+    const active = this.active;
+    // release() is synchronous, but cancellation and rollback must remain ordered.
+    // Normal transaction completion has already closed the request in query().
+    if (active || this.tx) {
+      const tx = this.tx;
+      this.tx = null;
+      void (async () => {
+        await active?.close();
+        // An ordinary Request also holds the driver's transaction pin. A
+        // rollback attempted before it settles fails with EREQINPROG.
+        await Promise.allSettled(this.pending);
+        await tx?.rollback();
+      })().catch(() => {});
+    }
   }
 }
 
@@ -725,7 +959,9 @@ export const mssqlDialect: Dialect = {
   name: 'mssql',
   capabilities: Object.freeze({
     distinctOn: false,
+    tupleCursorPredicate: false,
     positionalJson: false,
+    jsonObjectKeysAsWritten: true,
     nullsOrderingClause: false,
     nullsSortHigh: false,
     insensitiveInList: false,
@@ -757,6 +993,7 @@ export const mssqlDialect: Dialect = {
     backendCancel: false,
     idleTransactionTimeout: false,
     abortsTransactionOnError: false,
+    classifiesCommitAnswer: false,
     connectionDriver: 'engine-driver',
     preparesEveryStatement: false,
     statementSyntax: 'mssql',
@@ -765,7 +1002,7 @@ export const mssqlDialect: Dialect = {
     unboundedTextKeys: false,
   } satisfies EngineCapabilities),
   // No RETURNING → the statement emits its rows via OUTPUT INSERTED.* in ONE
-  // round-trip (Phase-0 'output' strategy, executed like 'returning').
+  // round-trip ('output' strategy, executed like 'returning').
   resultStrategy: 'output',
   supportsReturning: false,
   // MERGE can carry `WHEN MATCHED AND <pred>`, but the predicate the builder
@@ -1270,22 +1507,17 @@ export const mssqlDialect: Dialect = {
 
   // ---- Streaming ----------------------------------------------------------
 
-  /**
-   * The {@link StreamableConnection} seam only exposes `query()`, not the `mssql`
-   * `request.stream` event API, so this fetches once and yields the rows in
-   * `batchSize` chunks. True server-side streaming would require direct `mssql`
-   * access (documented limitation).
-   */
+  /** Incremental requests; query-only connections cannot stream. */
   async *openStream(
     connection: StreamableConnection,
     sql: string,
     params: unknown[],
     batchSize: number,
+    options?: OpenStreamOptions,
   ): AsyncGenerator<Record<string, unknown>[], void, undefined> {
-    const result = await connection.query(sql, params);
-    for (let i = 0; i < result.rows.length; i += batchSize) {
-      yield result.rows.slice(i, i + batchSize);
-    }
+    if (!connection.streamBatches)
+      throw new UnsupportedFeatureError('native streaming', 'mssql', 'An acquired MssqlPool connection is required.');
+    yield* connection.streamBatches(sql, params, batchSize, options?.signal);
   },
 
   // ---- Introspection ------------------------------------------------------
@@ -1605,8 +1837,9 @@ function buildRelationsFromForeignKeys(
   pkByTable: Map<string, string[]>,
   columnsByTable: Map<string, ColumnMetadata[]>,
   logger: IntrospectOptions['logger'],
+  isToOne?: (fk: FKEntry) => boolean,
 ): Map<string, Record<string, RelationDef>> {
-  return deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable, logger);
+  return deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable, logger, isToOne);
 }
 
 /**
@@ -1619,12 +1852,13 @@ function buildRelationsFromForeignKeys(
  * @param exec   Runs a parameterized (`@p1`, `@p2`, …) query and returns rows.
  * @param schema The SQL Server schema to introspect (default `dbo`).
  * @param options Optional include / exclude table-name filters, and the logger
- *               that receives relation-naming notes (console when absent).
+ *               that receives relation-naming notes (console when absent), and
+ *               the legacy array-cardinality opt-out.
  */
 export async function introspectMssqlWith(
   exec: MssqlRowExecutor,
   schema = 'dbo',
-  options: Pick<IntrospectOptions, 'include' | 'exclude' | 'logger'> = {},
+  options: Pick<CatalogIntrospectOptions, 'include' | 'exclude' | 'logger' | 'legacyToManyUniques'> = {},
 ): Promise<SchemaMetadata> {
   // ----- Tables -----
   const candidateTables = (
@@ -1633,7 +1867,7 @@ export async function introspectMssqlWith(
       [schema],
     )
   ).map((r) => String(r.TABLE_NAME));
-  // include / exclude + default bookkeeping-table exclusions (F12).
+  // include / exclude + default bookkeeping-table exclusions.
   const tableNames = applyTableFilters(candidateTables, options);
   const tableSet = new Set(tableNames);
 
@@ -1646,43 +1880,75 @@ export async function introspectMssqlWith(
      WHERE s.name = @p1`,
     [schema],
   );
-  const identityCols = new Set(identityRows.map((r) => `${r.TABLE_NAME}.${r.COLUMN_NAME}`));
+  const columnKey = (table: string, column: string): string => JSON.stringify([table, column]);
+  const identityCols = new Set(identityRows.map((r) => columnKey(String(r.TABLE_NAME), String(r.COLUMN_NAME))));
 
   // ----- Columns -----
   const columnRows = await exec(
-    `SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, CHARACTER_MAXIMUM_LENGTH
-     FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = @p1 ORDER BY TABLE_NAME, ORDINAL_POSITION`,
+    `SELECT info.TABLE_NAME, info.COLUMN_NAME, info.DATA_TYPE, info.IS_NULLABLE,
+            CAST(CASE WHEN c.default_object_id <> 0 THEN 1 ELSE 0 END AS bit) AS HAS_DEFAULT,
+            info.CHARACTER_MAXIMUM_LENGTH, info.NUMERIC_PRECISION, info.NUMERIC_SCALE,
+            info.DATETIME_PRECISION, c.collation_name AS COLLATION_NAME,
+            c.is_computed AS IS_COMPUTED, c.generated_always_type AS GENERATED_ALWAYS_TYPE,
+            c.is_hidden AS IS_HIDDEN
+     FROM INFORMATION_SCHEMA.COLUMNS info
+     JOIN sys.schemas s ON s.name = info.TABLE_SCHEMA
+     JOIN sys.tables t ON t.schema_id = s.schema_id AND t.name = info.TABLE_NAME
+     JOIN sys.columns c ON c.object_id = t.object_id AND c.name = info.COLUMN_NAME
+     WHERE info.TABLE_SCHEMA = @p1 AND c.is_hidden = 0
+     ORDER BY info.TABLE_NAME, info.ORDINAL_POSITION`,
     [schema],
   );
 
   // ----- Primary keys (ordered) -----
   const pkRows = await exec(
-    `SELECT kcu.TABLE_NAME, kcu.COLUMN_NAME, kcu.ORDINAL_POSITION
+    `SELECT kcu.TABLE_NAME, kcu.COLUMN_NAME, kcu.ORDINAL_POSITION,
+            i.is_disabled AS IS_DISABLED, i.is_hypothetical AS IS_HYPOTHETICAL
      FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
      JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
-       ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+       ON tc.CONSTRAINT_CATALOG = kcu.CONSTRAINT_CATALOG
+      AND tc.CONSTRAINT_SCHEMA = kcu.CONSTRAINT_SCHEMA AND tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+      AND tc.TABLE_CATALOG = kcu.TABLE_CATALOG AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+      AND tc.TABLE_NAME = kcu.TABLE_NAME
+     JOIN sys.schemas s ON s.name = tc.TABLE_SCHEMA
+     JOIN sys.tables t ON t.schema_id = s.schema_id AND t.name = tc.TABLE_NAME
+     JOIN sys.key_constraints kc ON kc.parent_object_id = t.object_id AND kc.name = tc.CONSTRAINT_NAME
+     JOIN sys.indexes i ON i.object_id = t.object_id AND i.index_id = kc.unique_index_id
      WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY' AND tc.TABLE_SCHEMA = @p1
      ORDER BY kcu.TABLE_NAME, kcu.ORDINAL_POSITION`,
     [schema],
   );
   const pkByTable = new Map<string, string[]>();
-  for (const r of pkRows) {
+  const inactivePrimaryTables = new Set<string>();
+  for (const r of pkRows.sort((a, b) => Number(a.ORDINAL_POSITION) - Number(b.ORDINAL_POSITION))) {
     const t = String(r.TABLE_NAME);
     if (!tableSet.has(t)) continue;
+    if (bitIsTrue(r.IS_DISABLED) || bitIsTrue(r.IS_HYPOTHETICAL)) inactivePrimaryTables.add(t);
     if (!pkByTable.has(t)) pkByTable.set(t, []);
     pkByTable.get(t)!.push(String(r.COLUMN_NAME));
   }
   const pkColSet = new Set<string>();
-  for (const [t, cols] of pkByTable) for (const c of cols) pkColSet.add(`${t}.${c}`);
+  for (const [t, cols] of pkByTable) for (const c of cols) pkColSet.add(columnKey(t, c));
 
   // ----- Assemble columns -----
   const columnsByTable = new Map<string, ColumnMetadata[]>();
+  const catalogColumns = new Map<string, Record<string, unknown>>();
   for (const c of columnRows) {
     const tableName = String(c.TABLE_NAME);
-    if (!tableSet.has(tableName)) continue;
+    if (!tableSet.has(tableName) || bitIsTrue(c.IS_HIDDEN)) continue;
     const colName = String(c.COLUMN_NAME);
+    const key = columnKey(tableName, colName);
+    catalogColumns.set(key, c);
     const dataType = String(c.DATA_TYPE).toLowerCase();
-    const isPk = pkColSet.has(`${tableName}.${colName}`);
+    const isPk = pkColSet.has(key);
+    const generated = identityCols.has(key);
+    // The existing read-only generated-column seam also protects virtual computed,
+    // temporal/ledger generated-always and rowversion columns from explicit writes.
+    const readOnly =
+      bitIsTrue(c.IS_COMPUTED) ||
+      Number(c.GENERATED_ALWAYS_TYPE ?? 0) > 0 ||
+      dataType === 'timestamp' ||
+      dataType === 'rowversion';
     const nullable = String(c.IS_NULLABLE).toUpperCase() === 'YES' && !isPk;
     const maxLen = c.CHARACTER_MAXIMUM_LENGTH != null ? num(c.CHARACTER_MAXIMUM_LENGTH as number) : undefined;
     const col: ColumnMetadata = {
@@ -1692,7 +1958,9 @@ export async function introspectMssqlWith(
       pgType: dataType,
       tsType: mssqlTypeToTs(dataType, nullable),
       nullable,
-      hasDefault: c.COLUMN_DEFAULT !== null || identityCols.has(`${tableName}.${colName}`),
+      hasDefault: bitIsTrue(c.HAS_DEFAULT) || c.COLUMN_DEFAULT != null || generated || readOnly,
+      ...(generated ? { isGenerated: true } : {}),
+      ...(readOnly ? { isGeneratedStored: true } : {}),
       isArray: false,
       arrayType: undefined,
       pgArrayType: 'text[]',
@@ -1709,25 +1977,36 @@ export async function introspectMssqlWith(
             cps.name AS COLUMN_NAME,
             OBJECT_NAME(fkc.referenced_object_id) AS REFERENCED_TABLE_NAME,
             cpt.name AS REFERENCED_COLUMN_NAME,
-            fkc.constraint_column_id AS ORDINAL_POSITION
+            fkc.constraint_column_id AS ORDINAL_POSITION,
+            s.name AS TABLE_SCHEMA,
+            rs.name AS REFERENCED_TABLE_SCHEMA
      FROM sys.foreign_keys fk
      JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
      JOIN sys.columns cps ON cps.object_id = fkc.parent_object_id AND cps.column_id = fkc.parent_column_id
      JOIN sys.columns cpt ON cpt.object_id = fkc.referenced_object_id AND cpt.column_id = fkc.referenced_column_id
      JOIN sys.schemas s ON s.schema_id = fk.schema_id
-     WHERE s.name = @p1
+     JOIN sys.tables rt ON rt.object_id = fkc.referenced_object_id
+     JOIN sys.schemas rs ON rs.schema_id = rt.schema_id
+     WHERE s.name = @p1 AND rs.name = @p1
      ORDER BY fk.name, fkc.constraint_column_id`,
     [schema],
   );
   const fkByConstraint = new Map<string, FKEntry>();
-  for (const r of fkRows) {
+  for (const r of fkRows.sort((a, b) => Number(a.ORDINAL_POSITION) - Number(b.ORDINAL_POSITION))) {
     const sourceTable = String(r.TABLE_NAME);
     const targetTable = String(r.REFERENCED_TABLE_NAME);
-    if (!tableSet.has(sourceTable)) continue;
-    const key = String(r.CONSTRAINT_NAME);
+    // The native query applies catalog collation to the requested namespace.
+    // Compare canonical returned names, never the caller's casing.
+    if (
+      !tableSet.has(sourceTable) ||
+      (r.TABLE_SCHEMA != null && r.REFERENCED_TABLE_SCHEMA != null && r.REFERENCED_TABLE_SCHEMA !== r.TABLE_SCHEMA)
+    )
+      continue;
+    const constraintName = String(r.CONSTRAINT_NAME);
+    const key = JSON.stringify([sourceTable, constraintName]);
     let entry = fkByConstraint.get(key);
     if (!entry) {
-      entry = { sourceTable, sourceColumns: [], targetTable, targetColumns: [], constraintName: key };
+      entry = { sourceTable, sourceColumns: [], targetTable, targetColumns: [], constraintName };
       fkByConstraint.set(key, entry);
     }
     entry.sourceColumns.push(String(r.COLUMN_NAME));
@@ -1738,54 +2017,134 @@ export async function introspectMssqlWith(
   // ----- Indexes + unique constraints -----
   const idxRows = await exec(
     `SELECT t.name AS TABLE_NAME, i.name AS INDEX_NAME, i.is_unique AS IS_UNIQUE,
-            c.name AS COLUMN_NAME, ic.key_ordinal AS SEQ
+            c.name AS COLUMN_NAME, ic.key_ordinal AS SEQ,
+            ic.is_included_column AS IS_INCLUDED, ic.is_descending_key AS IS_DESCENDING,
+            i.has_filter AS HAS_FILTER, i.is_disabled AS IS_DISABLED,
+            i.is_hypothetical AS IS_HYPOTHETICAL, i.type_desc AS TYPE_DESC,
+            ic.index_column_id AS INDEX_COLUMN_ID
      FROM sys.indexes i
      JOIN sys.tables t ON t.object_id = i.object_id
      JOIN sys.schemas s ON s.schema_id = t.schema_id
-     JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
-     JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
-     WHERE s.name = @p1 AND i.is_primary_key = 0 AND ic.is_included_column = 0 AND i.name IS NOT NULL
-     ORDER BY t.name, i.name, ic.key_ordinal`,
+     LEFT JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+     LEFT JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+     WHERE s.name = @p1 AND i.is_primary_key = 0 AND i.name IS NOT NULL
+     ORDER BY t.name, i.name, ic.key_ordinal, ic.index_column_id`,
     [schema],
   );
-  const indexGroups = new Map<string, { table: string; name: string; unique: boolean; columns: string[] }>();
+  const indexGroups = new Map<string, { table: string; name: string; rows: Record<string, unknown>[] }>();
   for (const r of idxRows) {
     const t = String(r.TABLE_NAME);
     if (!tableSet.has(t)) continue;
     const name = String(r.INDEX_NAME);
-    const key = `${t}.${name}`;
+    const key = JSON.stringify([t, name]);
     let g = indexGroups.get(key);
     if (!g) {
-      g = { table: t, name, unique: bitIsTrue(r.IS_UNIQUE), columns: [] };
+      g = { table: t, name, rows: [] };
       indexGroups.set(key, g);
     }
-    g.columns.push(String(r.COLUMN_NAME));
+    g.rows.push(r);
   }
   const indexesByTable = new Map<string, IndexMetadata[]>();
   const uniqueByTable = new Map<string, string[][]>();
+  const q = mssqlDialect.quoteIdentifier;
   for (const g of indexGroups.values()) {
+    const first = g.rows[0]!;
+    const disabled = bitIsTrue(first.IS_DISABLED);
+    const hypothetical = bitIsTrue(first.IS_HYPOTHETICAL);
+    const partial = bitIsTrue(first.HAS_FILTER);
+    const unique = bitIsTrue(first.IS_UNIQUE);
+    const keys = g.rows
+      .filter((r) => Number(r.SEQ) > 0 && !bitIsTrue(r.IS_INCLUDED))
+      .sort((a, b) => Number(a.SEQ) - Number(b.SEQ));
+    const columns = keys.map((r) => String(r.COLUMN_NAME));
+    const plain =
+      columns.length > 0 &&
+      columns.every((name) => {
+        const column = catalogColumns.get(columnKey(g.table, name));
+        return column !== undefined && !bitIsTrue(column.IS_COMPUTED);
+      });
+    const included = g.rows.filter((r) => bitIsTrue(r.IS_INCLUDED) && r.COLUMN_NAME != null);
+    // This is a catalog summary, never replayable DDL. Do not fetch or embed
+    // filter/default/computed SQL: it can hold sensitive literals or native SQL.
+    const kind = typeof first.TYPE_DESC === 'string' && /^[A-Z_ ]+$/.test(first.TYPE_DESC) ? `${first.TYPE_DESC} ` : '';
+    const notes = [
+      partial && 'FILTERED (predicate withheld)',
+      !plain && 'NON-PLAIN KEYS',
+      disabled && 'DISABLED',
+      hypothetical && 'HYPOTHETICAL',
+    ].filter(Boolean);
     if (!indexesByTable.has(g.table)) indexesByTable.set(g.table, []);
     indexesByTable.get(g.table)!.push({
       name: g.name,
-      columns: g.columns,
-      unique: g.unique,
-      definition: `${g.unique ? 'UNIQUE ' : ''}INDEX ${g.name} ON ${g.table}(${g.columns.join(', ')})`,
+      // Empty keys prevent expression/disabled/non-key facts from proving a
+      // compound selector or FK index coverage through existing consumers.
+      columns: plain && !disabled && !hypothetical ? columns : [],
+      unique: unique && !disabled && !hypothetical,
+      ...(partial ? { partial: true } : {}),
+      definition:
+        `${unique ? 'UNIQUE ' : ''}${kind}INDEX ${q(g.name)} ON ${q(schema)}.${q(g.table)}` +
+        `(${keys.map((r) => `${q(String(r.COLUMN_NAME))}${bitIsTrue(r.IS_DESCENDING) ? ' DESC' : ''}`).join(', ')})` +
+        (included.length ? ` INCLUDE (${included.map((r) => q(String(r.COLUMN_NAME))).join(', ')})` : '') +
+        (notes.length ? ` /* ${notes.join('; ')} */` : ''),
     });
-    if (g.unique && g.columns.length > 0) {
+    if (unique && !partial && !disabled && !hypothetical && plain) {
       if (!uniqueByTable.has(g.table)) uniqueByTable.set(g.table, []);
-      uniqueByTable.get(g.table)!.push(g.columns);
+      uniqueByTable.get(g.table)!.push(columns);
     }
   }
 
   // ----- Relations -----
   // One field per column, as the PostgreSQL introspector requires.
   for (const [tableName, cols] of columnsByTable) assertDistinctColumnFields(tableName, cols);
+  // A to-one is decided per foreign key BEFORE naming, so it is named as
+  // PostgreSQL names it (`users.profile`): the child's columns are exactly an
+  // active primary key or unique key, and the enforced key and the join have
+  // the same comparison semantics.
+  const sameComparison = (childTable: string, childName: string, parentTable: string, parentName: string) => {
+    const child = catalogColumns.get(columnKey(childTable, childName));
+    const parent = catalogColumns.get(columnKey(parentTable, parentName));
+    if (!child || !parent || child.DATA_TYPE !== parent.DATA_TYPE) return false;
+    // Missing collation facts for character types cannot establish equality
+    // semantics. Matching types avoid implicit conversion changing the join.
+    if (
+      /char|text/i.test(String(child.DATA_TYPE)) &&
+      (typeof child.COLLATION_NAME !== 'string' ||
+        child.COLLATION_NAME !== parent.COLLATION_NAME ||
+        child.CHARACTER_MAXIMUM_LENGTH == null)
+    )
+      return false;
+    if (
+      /^(decimal|numeric)$/.test(String(child.DATA_TYPE)) &&
+      (child.NUMERIC_PRECISION == null || child.NUMERIC_SCALE == null)
+    )
+      return false;
+    if (/^(datetime2|datetimeoffset|time)$/.test(String(child.DATA_TYPE)) && child.DATETIME_PRECISION == null)
+      return false;
+    return ['CHARACTER_MAXIMUM_LENGTH', 'NUMERIC_PRECISION', 'NUMERIC_SCALE', 'DATETIME_PRECISION'].every(
+      (fact) => child[fact] === parent[fact],
+    );
+  };
   const relationsByTable = buildRelationsFromForeignKeys(
     tableNames,
     foreignKeys,
     pkByTable,
     columnsByTable,
     options.logger,
+    options.legacyToManyUniques
+      ? undefined
+      : (fk) => {
+          const columns = fk.sourceColumns;
+          if (
+            columns.length !== fk.targetColumns.length ||
+            !columns.every((name, i) => sameComparison(fk.sourceTable, name, fk.targetTable, fk.targetColumns[i]!))
+          )
+            return false;
+          const primary = inactivePrimaryTables.has(fk.sourceTable) ? [] : (pkByTable.get(fk.sourceTable) ?? []);
+          const keys = [primary, ...(uniqueByTable.get(fk.sourceTable) ?? [])];
+          return keys.some(
+            (key) => key.length > 0 && key.length === columns.length && key.every((name) => columns.includes(name)),
+          );
+        },
   );
 
   // ----- Assemble TableMetadata -----
@@ -1834,7 +2193,9 @@ export async function introspectMssqlWith(
  * {@link introspectMssqlWith} for the {@link DialectIntrospector} seam used by
  * `introspect()` / `npx turbine generate`.
  */
-export async function introspectMssql(options: IntrospectOptions): Promise<SchemaMetadata> {
+export async function introspectMssql(
+  options: IntrospectOptions & Pick<CatalogIntrospectOptions, 'legacyToManyUniques'>,
+): Promise<SchemaMetadata> {
   const sqlNS = await loadMssql();
   const config = parseMssqlConfig(options.connectionString);
   const pool = await new sqlNS.ConnectionPool(config).connect();
@@ -1848,6 +2209,7 @@ export async function introspectMssql(options: IntrospectOptions): Promise<Schem
       include: options.include,
       exclude: options.exclude,
       logger: options.logger,
+      legacyToManyUniques: options.legacyToManyUniques,
     });
   } finally {
     await pool.close();
@@ -1900,7 +2262,7 @@ async function loadMssql(): Promise<MssqlModule> {
   try {
     // `mssql` ships no bundled type declarations (it needs @types/mssql, which
     // Turbine deliberately does not depend on), the structural MssqlModule
-    // above is our typed surface; the helper returns `unknown` so no TS7016.
+    // above is the typed surface; the helper returns `unknown` so no TS7016.
     // Via the .cts helper so the CJS build keeps a path to a REAL dynamic
     // import() even if a future mssql major goes ESM-only (the CommonJS pass
     // transpiles a plain `import()` here into `require()`).

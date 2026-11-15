@@ -4,7 +4,7 @@
  *
  * The API handler tests use an in-memory mock pool (same pattern as
  * serverless.test.ts) and a tiny fake IncomingMessage/ServerResponse pair
- * so we can exercise the endpoints without a real HTTP server or database.
+ * to exercise the endpoints without a real HTTP server or database.
  */
 
 import assert from 'node:assert/strict';
@@ -90,13 +90,13 @@ describe('Studio has no LIKE escaper of its own', () => {
     /^\s*(?:export\s+)?(?:(?:async\s+)?function\s+escapeLikePattern\s*\(|(?:const|let|var)\s+escapeLikePattern\s*=|escapeLikePattern\??\s*\([^)]*\)\s*:\s*string\s*[{;])/m;
   // The Postgres default's body, in both spellings it has had: the chained
   // replace (mssql.ts legitimately extends that sequence) and the one-pass
-  // character class query/utils.ts uses. A copy under a NEW name slips past the
+  // character class query-utils.ts uses. A copy under a NEW name slips past the
   // name check; its body does not.
   const DEFAULT_BODIES = [
     String.raw`.replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_')`,
     String.raw`/[\\%_]/g`,
   ];
-  const ALLOWED_BODIES = new Set(['query/utils.ts', 'mssql.ts']);
+  const ALLOWED_BODIES = new Set(['query-utils.ts', 'mssql.ts']);
 
   const sources = readdirSync(SRC, { recursive: true, encoding: 'utf8' })
     .filter((rel) => rel.endsWith('.ts') && !rel.startsWith('test/') && !rel.endsWith('.generated.ts'))
@@ -124,23 +124,23 @@ describe('Studio has no LIKE escaper of its own', () => {
     );
   });
 
-  it('the default escape sequence lives in query/utils.ts (and the mssql override that extends it)', () => {
+  it('the default escape sequence lives in query-utils.ts (and the mssql override that extends it)', () => {
     const carriers = sources.filter((s) => DEFAULT_BODIES.some((b) => s.text.includes(b))).map((s) => s.rel);
     assert.ok(
-      carriers.includes('query/utils.ts'),
-      `the body scanner missed query/utils.ts (saw: ${carriers.join(', ')})`,
+      carriers.includes('query-utils.ts'),
+      `the body scanner missed query-utils.ts (saw: ${carriers.join(', ')})`,
     );
     const copies = carriers.filter((rel) => !ALLOWED_BODIES.has(rel));
     assert.deepEqual(
       copies,
       [],
-      `a copy of escapeLike's body lives in ${copies.join(', ')}; import escapeLike from query/utils.js`,
+      `a copy of escapeLike's body lives in ${copies.join(', ')}; import escapeLike from query-utils.js`,
     );
   });
 });
 
 // ---------------------------------------------------------------------------
-// Mock HTTP req/res + mock pg.Pool so we can drive the API handlers without
+// Mock HTTP req/res + mock pg.Pool to drive the API handlers without
 // spinning up a real server or database.
 // ---------------------------------------------------------------------------
 
@@ -453,7 +453,7 @@ describe('Studio, saved queries round-trip', () => {
         assert.equal(data.queries[0]?.id, createdId);
       }
 
-      // Verify the on-disk file exists and contains what we wrote.
+      // Verify the on-disk file exists and contains the written query.
       const file = join(tmp, 'studio-queries.json');
       assert.ok(existsSync(file));
       const parsed = JSON.parse(readFileSync(file, 'utf8')) as {

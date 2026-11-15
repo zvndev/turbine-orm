@@ -15,17 +15,30 @@
  * VALUES (ids, names, counts) rather than as SQL text, so they mean the same
  * thing on every engine.
  *
- * SCOPE. Postgres is deliberately absent: it already has the full suite, and
- * adding it here would only duplicate. The engines registered are the ones with
- * no shared coverage at all:
- *   - sqlite   , always (node:sqlite builtin, no server, so this battery runs
- *                in the plain `test:unit` lane on every PR)
- *   - mysql    , when MYSQL_URL is set (CI's mysql:8 service)
- *   - mssql    , when MSSQL_URL is set (CI's SQL Server 2022 service)
+ * SCOPE. The engines registered:
+ *   - sqlite         , always (node:sqlite builtin, no server, so this battery
+ *                      runs in the plain `test:unit` lane on every PR)
+ *   - better-sqlite3 , when the optional binding loads (CI installs the pinned
+ *                      release and names it with TURBINE_SQLITE_BINDING_PEER)
+ *   - mysql          , when MYSQL_URL is set (CI's mysql:8 service)
+ *   - mssql          , when MSSQL_URL is set (CI's SQL Server 2022 service)
+ *   - postgres       , when DATABASE_URL is set (the integration-tests matrix)
+ * Postgres has the full suite as well. It runs here because the nested-write
+ * cases at the end assert the same database truth on every engine, and the
+ * reference engine passing the same assertion is what makes a difference on
+ * another engine attributable to that engine.
+ *
+ * REQUIRED, NOT OPTIONAL, IN CI. Each harness gates through `skipGate`, so a job
+ * that names its engine in TURBINE_REQUIRE_ENGINE fails this file when the
+ * engine is unreachable. The battery used to register its own `{ skip }` and so
+ * skipped silently under that guard. The better-sqlite3 harness follows the
+ * binding's own guard instead: TURBINE_REQUIRE_SQLITE_BINDING=1 fails the file
+ * when the binding does not load.
  *
  * ISOLATION. The server-backed engines create their OWN database
  * (`turbine_cross`) rather than sharing the one `mysql.test.ts` /
- * `mssql.test.ts` create and drop tables in. Node's test runner executes files
+ * `mssql.test.ts` create and drop tables in, or the seed.sql database the rest
+ * of the Postgres suite reads. Node's test runner executes files
  * in parallel by default, and two files racing DDL on the same tables is a
  * flake generator, not a gate.
  *
@@ -40,9 +53,12 @@
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
-import { after, before, beforeEach, describe, it as nodeIt } from 'node:test';
-import { UniqueConstraintError, ValidationError } from '../index.js';
+import { after, before, beforeEach, describe } from 'node:test';
+import type { BetterSqlite3Database } from '../better-sqlite3.js';
+import { NotFoundError, UniqueConstraintError, ValidationError } from '../index.js';
 import type { SchemaMetadata } from '../schema.js';
+import { type GatedRunners, skipGate } from './helpers.js';
+import { closeSqliteAfter, sqliteFixtureScope } from './sqlite-fixture-lifetime.js';
 
 // ---------------------------------------------------------------------------
 // Fixture, identical row-for-row on every engine (a port of
@@ -92,6 +108,17 @@ CREATE TABLE post_tags (
   tag_id  INTEGER NOT NULL REFERENCES tags(id),
   PRIMARY KEY (post_id, tag_id)
 );
+CREATE TABLE profiles (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER UNIQUE REFERENCES users(id),
+  bio     TEXT NOT NULL
+);
+CREATE TABLE tasks (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  assignee_id INTEGER REFERENCES users(id),
+  title       TEXT NOT NULL UNIQUE
+);
+CREATE INDEX idx_tasks_assignee_id ON tasks(assignee_id);
 `;
 
 const MYSQL_DDL = [
@@ -141,6 +168,18 @@ const MYSQL_DDL = [
     PRIMARY KEY (post_id, tag_id),
     CONSTRAINT fk_pt_post FOREIGN KEY (post_id) REFERENCES posts(id),
     CONSTRAINT fk_pt_tag FOREIGN KEY (tag_id) REFERENCES tags(id)
+  )`,
+  `CREATE TABLE profiles (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    user_id BIGINT NULL UNIQUE,
+    bio VARCHAR(255) NOT NULL,
+    CONSTRAINT fk_profiles_user FOREIGN KEY (user_id) REFERENCES users(id)
+  )`,
+  `CREATE TABLE tasks (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    assignee_id BIGINT NULL,
+    title VARCHAR(255) NOT NULL UNIQUE,
+    CONSTRAINT fk_tasks_assignee FOREIGN KEY (assignee_id) REFERENCES users(id)
   )`,
 ];
 
@@ -192,6 +231,78 @@ const MSSQL_DDL = [
     CONSTRAINT fk_pt_post FOREIGN KEY (post_id) REFERENCES posts(id),
     CONSTRAINT fk_pt_tag FOREIGN KEY (tag_id) REFERENCES tags(id)
   )`,
+  // A SQL Server UNIQUE constraint admits ONE NULL, not many. The battery is
+  // written so at most one profile is ever unowned at a time (the seed has
+  // none), so the plain constraint, which introspection reads as a to-one key,
+  // holds on every engine.
+  `CREATE TABLE profiles (
+    id BIGINT IDENTITY(1,1) PRIMARY KEY,
+    user_id BIGINT NULL,
+    bio NVARCHAR(255) NOT NULL,
+    CONSTRAINT uq_profiles_user UNIQUE (user_id),
+    CONSTRAINT fk_profiles_user FOREIGN KEY (user_id) REFERENCES users(id)
+  )`,
+  `CREATE TABLE tasks (
+    id BIGINT IDENTITY(1,1) PRIMARY KEY,
+    assignee_id BIGINT NULL,
+    title NVARCHAR(255) NOT NULL UNIQUE,
+    CONSTRAINT fk_tasks_assignee FOREIGN KEY (assignee_id) REFERENCES users(id)
+  )`,
+];
+
+const POSTGRES_DDL = [
+  `CREATE TABLE organizations (
+    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL UNIQUE
+  )`,
+  `CREATE TABLE users (
+    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
+    email TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    name_cs TEXT COLLATE "C" NOT NULL,
+    role TEXT NOT NULL DEFAULT 'member',
+    avatar_url TEXT
+  )`,
+  `CREATE INDEX idx_users_org_id ON users(org_id)`,
+  `CREATE TABLE posts (
+    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
+    title TEXT NOT NULL,
+    content TEXT NOT NULL,
+    published INTEGER NOT NULL DEFAULT 0,
+    view_count INTEGER NOT NULL DEFAULT 0
+  )`,
+  `CREATE INDEX idx_posts_user_id ON posts(user_id)`,
+  `CREATE TABLE comments (
+    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    post_id INTEGER NOT NULL REFERENCES posts(id),
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    body TEXT NOT NULL
+  )`,
+  `CREATE INDEX idx_comments_post_id ON comments(post_id)`,
+  `CREATE TABLE tags (
+    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+  )`,
+  `CREATE TABLE post_tags (
+    post_id INTEGER NOT NULL REFERENCES posts(id),
+    tag_id INTEGER NOT NULL REFERENCES tags(id),
+    PRIMARY KEY (post_id, tag_id)
+  )`,
+  `CREATE TABLE profiles (
+    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    user_id INTEGER UNIQUE REFERENCES users(id),
+    bio TEXT NOT NULL
+  )`,
+  `CREATE TABLE tasks (
+    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+    assignee_id INTEGER REFERENCES users(id),
+    title TEXT NOT NULL UNIQUE
+  )`,
+  `CREATE INDEX idx_tasks_assignee_id ON tasks(assignee_id)`,
 ];
 
 /**
@@ -297,9 +408,39 @@ const POST_TAGS = [
   { post_id: 2, tag_id: 1 },
   { post_id: 3, tag_id: 3 },
 ];
+// The nested-write tables. `profiles.user_id` is a NULLABLE UNIQUE foreign key,
+// so introspection reads users -> profiles as a to-one (hasOne) relation that
+// can be disconnected; `tasks.assignee_id` is a nullable plain one, a to-many
+// that `disconnect` and `set` can clear. Every other foreign key in the fixture
+// is NOT NULL, and those operations refuse on a NOT NULL key by design.
+// User 5 owns nothing but task 5, so a belongsTo `delete` through task 5 can
+// remove that user without a foreign-key violation.
+const PROFILES = [
+  { id: 1, user_id: 1, bio: 'Alice bio' },
+  { id: 2, user_id: 2, bio: 'Bob bio' },
+];
+const TASKS = [
+  { id: 1, assignee_id: 1, title: 'Write docs' },
+  { id: 2, assignee_id: 1, title: 'Fix bug' },
+  { id: 3, assignee_id: 2, title: 'Review change' },
+  { id: 4, assignee_id: null, title: 'Unassigned' },
+  { id: 5, assignee_id: 5, title: 'Erin task' },
+];
 
 /** Delete order (children first) shared by every engine's reseed. */
-const TABLES_CHILD_FIRST = ['post_tags', 'comments', 'posts', 'tags', 'users', 'organizations'];
+const TABLES_CHILD_FIRST = ['tasks', 'profiles', 'post_tags', 'comments', 'posts', 'tags', 'users', 'organizations'];
+
+/** Every seeded table with its rows, parents first: the insert order of each reseed. */
+const SEED: [string, Record<string, unknown>[]][] = [
+  ['organizations', ORGS],
+  ['users', USERS],
+  ['posts', POSTS],
+  ['comments', COMMENTS],
+  ['tags', TAGS],
+  ['post_tags', POST_TAGS],
+  ['profiles', PROFILES],
+  ['tasks', TASKS],
+];
 
 // ---------------------------------------------------------------------------
 // Row shapes (loose: the wire type of a bigint/boolean is engine-specific, and
@@ -345,14 +486,27 @@ const ids = (rows: { id: unknown }[]): number[] => rows.map((r) => n(r.id));
 
 interface EngineHarness {
   name: string;
-  /** Reason to skip, or '' to run. */
-  skip: string;
+  /** False when the engine cannot be reached here; `runners` then registers every test as skipped. */
+  available: boolean;
+  /**
+   * From `skipGate`, so an engine a CI job names in `TURBINE_REQUIRE_ENGINE`
+   * FAILS this file when it is unreachable instead of skipping it. Each
+   * harness passes its reason as a literal, which is what lets
+   * scripts/check-skip-gate-reasons.ts read it.
+   */
+  runners: GatedRunners;
   connect(): Promise<void>;
   reseed(): Promise<void>;
   close(): Promise<void>;
   /** biome-ignore lint/suspicious/noExplicitAny: TurbineClient kept loose so this file loads in the unit lane. */
   client(): any;
   schema(): SchemaMetadata;
+  /**
+   * Rows straight from the driver, never through Turbine: the database truth a
+   * write is checked against. Keys are the column names. The SQL must be
+   * portable (unquoted lowercase identifiers, no placeholders).
+   */
+  raw(sql: string): Promise<Record<string, unknown>[]>;
   /**
    * `createMany` returns the inserted rows everywhere EXCEPT MySQL, whose
    * result strategy is count-not-rows (documented in src/mysql.ts). The battery
@@ -381,26 +535,32 @@ const DatabaseSync: (new (path: string) => DatabaseSyncType) | undefined = (() =
   }
 })();
 
+/** The seed as SQLite statements, shared by both SQLite drivers. */
+function sqliteSeedStatements(): string[] {
+  const lit = (v: unknown) =>
+    v === null ? 'NULL' : typeof v === 'number' ? String(v) : `'${String(v).replace(/'/g, "''")}'`;
+  return SEED.flatMap(([table, rows]) =>
+    rows.map(
+      (r) => `INSERT INTO ${table} (${Object.keys(r).join(', ')}) VALUES (${Object.values(r).map(lit).join(', ')});`,
+    ),
+  );
+}
+
 function sqliteHarness(): EngineHarness {
   let db: DatabaseSyncType;
   // biome-ignore lint/suspicious/noExplicitAny: TurbineClient, see EngineHarness.
   let c: any;
   let s: SchemaMetadata;
-  const lit = (v: unknown) =>
-    v === null ? 'NULL' : typeof v === 'number' ? String(v) : `'${String(v).replace(/'/g, "''")}'`;
-  const insert = (table: string, rows: Record<string, unknown>[]) =>
-    rows.map(
-      (r) => `INSERT INTO ${table} (${Object.keys(r).join(', ')}) VALUES (${Object.values(r).map(lit).join(', ')});`,
-    );
   return {
     name: 'sqlite',
-    skip: DatabaseSync ? '' : 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)',
+    available: Boolean(DatabaseSync),
+    runners: skipGate(!DatabaseSync, 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)'),
     createManyReturnsRows: true,
     async connect() {
       const { introspectSqliteDatabase, turbineSqlite } = await import('../sqlite.js');
-      // `!` is safe: connect() runs only when `skip` is '', which is exactly
-      // the case where the node:sqlite probe above found DatabaseSync.
-      db = new DatabaseSync!(':memory:');
+      // `!` is safe: connect() runs only when the node:sqlite probe above
+      // found DatabaseSync.
+      db = closeSqliteAfter(new DatabaseSync!(':memory:'), sqliteCleanup);
       db.exec('PRAGMA foreign_keys = ON');
       db.exec(SQLITE_DDL);
       s = introspectSqliteDatabase(db);
@@ -413,18 +573,73 @@ function sqliteHarness(): EngineHarness {
     },
     async reseed() {
       for (const t of TABLES_CHILD_FIRST) db.exec(`DELETE FROM ${t};`);
-      const stmts = [
-        ...insert('organizations', ORGS),
-        ...insert('users', USERS),
-        ...insert('posts', POSTS),
-        ...insert('comments', COMMENTS),
-        ...insert('tags', TAGS),
-        ...insert('post_tags', POST_TAGS),
-      ];
-      for (const stmt of stmts) db.exec(stmt);
+      for (const stmt of sqliteSeedStatements()) db.exec(stmt);
+    },
+    async raw(sql) {
+      return db.prepare(sql).all() as Record<string, unknown>[];
     },
     async close() {
       await c.disconnect();
+    },
+    client: () => c,
+    schema: () => s,
+  };
+}
+
+// --- better-sqlite3 --------------------------------------------------------
+
+// The optional binding is not a dependency of this repository. CI installs the
+// pinned release outside the checkout and names it with
+// TURBINE_SQLITE_BINDING_PEER; TURBINE_REQUIRE_SQLITE_BINDING=1 turns a binding
+// that does not load into a failure of this file, the guard
+// src/test/sqlite-binding.test.ts uses for the same peer.
+const BetterSqlite3: (new (path: string) => BetterSqlite3Database) | undefined = (() => {
+  try {
+    return createRequire(import.meta.url)(process.env.TURBINE_SQLITE_BINDING_PEER ?? 'better-sqlite3');
+  } catch (error) {
+    if (process.env.TURBINE_REQUIRE_SQLITE_BINDING === '1') throw error;
+    return undefined;
+  }
+})();
+
+function betterSqlite3Harness(): EngineHarness {
+  let db: BetterSqlite3Database;
+  // biome-ignore lint/suspicious/noExplicitAny: TurbineClient, see EngineHarness.
+  let c: any;
+  let s: SchemaMetadata;
+  const exec = (sql: string) => db.exec(sql);
+  return {
+    name: 'better-sqlite3',
+    available: Boolean(BetterSqlite3),
+    runners: skipGate(!BetterSqlite3, 'requires the optional better-sqlite3 peer (set TURBINE_SQLITE_BINDING_PEER)'),
+    createManyReturnsRows: true,
+    async connect() {
+      const { introspectBetterSqlite3Database, turbineBetterSqlite3 } = await import('../better-sqlite3.js');
+      db = new BetterSqlite3!(':memory:');
+      exec('PRAGMA foreign_keys = ON');
+      exec(SQLITE_DDL);
+      s = introspectBetterSqlite3Database(db);
+      c = await turbineBetterSqlite3(db, s);
+      await this.reseed();
+    },
+    async filtered(globalFilters) {
+      const { turbineBetterSqlite3 } = await import('../better-sqlite3.js');
+      return turbineBetterSqlite3(db, s, { globalFilters });
+    },
+    async reseed() {
+      for (const t of TABLES_CHILD_FIRST) exec(`DELETE FROM ${t};`);
+      for (const stmt of sqliteSeedStatements()) exec(stmt);
+    },
+    async raw(sql) {
+      return db.prepare(sql).all() as Record<string, unknown>[];
+    },
+    async close() {
+      try {
+        await c.disconnect();
+      } finally {
+        // A supplied handle stays caller owned: the client never closes it.
+        db.close();
+      }
     },
     client: () => c,
     schema: () => s,
@@ -455,7 +670,8 @@ function mysqlHarness(): EngineHarness {
   };
   return {
     name: 'mysql',
-    skip: MYSQL_URL ? '' : 'requires MYSQL_URL / MYSQL_TEST_URL pointing at a MySQL 8 server',
+    available: Boolean(MYSQL_URL),
+    runners: skipGate(!MYSQL_URL, 'requires MYSQL_URL / MYSQL_TEST_URL pointing at a MySQL 8 server'),
     createManyReturnsRows: false,
     async connect() {
       const { createPool } = await import('mysql2/promise');
@@ -504,17 +720,13 @@ function mysqlHarness(): EngineHarness {
       await rawPool.query('SET FOREIGN_KEY_CHECKS=0');
       for (const t of TABLES_CHILD_FIRST) await rawPool.query(`TRUNCATE TABLE \`${t}\``);
       await rawPool.query('SET FOREIGN_KEY_CHECKS=1');
-      for (const [table, rows] of [
-        ['organizations', ORGS],
-        ['users', USERS],
-        ['posts', POSTS],
-        ['comments', COMMENTS],
-        ['tags', TAGS],
-        ['post_tags', POST_TAGS],
-      ] as [string, Record<string, unknown>[]][]) {
+      for (const [table, rows] of SEED) {
         const { sql, params } = insert(table, rows);
         await rawPool.query(sql, params);
       }
+    },
+    async raw(sql) {
+      return (await rawPool.query(sql))[0];
     },
     async close() {
       await rawPool.end();
@@ -547,7 +759,8 @@ function mssqlHarness(): EngineHarness {
   };
   return {
     name: 'mssql',
-    skip: MSSQL_URL ? '' : 'requires MSSQL_URL pointing at a SQL Server 2016+ instance',
+    available: Boolean(MSSQL_URL),
+    runners: skipGate(!MSSQL_URL, 'requires MSSQL_URL pointing at a SQL Server 2016+ instance'),
     createManyReturnsRows: true,
     async connect() {
       // `mssql` ships no bundled types; widen the specifier so tsc treats it as
@@ -586,15 +799,95 @@ function mssqlHarness(): EngineHarness {
     },
     async reseed() {
       for (const t of TABLES_CHILD_FIRST) await rawPool.request().batch(`DELETE FROM ${t}`);
-      await rawPool.request().batch(insertBatch('organizations', ORGS, true));
-      await rawPool.request().batch(insertBatch('users', USERS, true));
-      await rawPool.request().batch(insertBatch('posts', POSTS, true));
-      await rawPool.request().batch(insertBatch('comments', COMMENTS, true));
-      await rawPool.request().batch(insertBatch('tags', TAGS, true));
-      await rawPool.request().batch(insertBatch('post_tags', POST_TAGS, false));
+      // post_tags is the one table with no identity column.
+      for (const [table, rows] of SEED) await rawPool.request().batch(insertBatch(table, rows, table !== 'post_tags'));
+    },
+    async raw(sql) {
+      return (await rawPool.request().query(sql)).recordset;
     },
     async close() {
       await rawPool.close();
+    },
+    client: () => c,
+    schema: () => s,
+  };
+}
+
+// --- postgres --------------------------------------------------------------
+
+const DATABASE_URL = process.env.DATABASE_URL ?? '';
+
+function postgresHarness(): EngineHarness {
+  // biome-ignore lint/suspicious/noExplicitAny: pg pool, loaded dynamically only when gated on.
+  let rawPool: any;
+  // biome-ignore lint/suspicious/noExplicitAny: TurbineClient, see EngineHarness.
+  let c: any;
+  let s: SchemaMetadata;
+  const insert = (table: string, rows: Record<string, unknown>[]) => {
+    const cols = Object.keys(rows[0] as Record<string, unknown>);
+    let n = 0;
+    return {
+      sql: `INSERT INTO ${table} (${cols.join(', ')}) VALUES ${rows
+        .map(() => `(${cols.map(() => `$${++n}`).join(', ')})`)
+        .join(', ')}`,
+      params: rows.flatMap((r) => cols.map((k) => r[k])),
+    };
+  };
+  return {
+    name: 'postgres',
+    available: Boolean(DATABASE_URL),
+    runners: skipGate(!DATABASE_URL, 'requires DATABASE_URL pointing at a PostgreSQL server'),
+    createManyReturnsRows: true,
+    async connect() {
+      const { default: pg } = await import('pg');
+      const { TurbineClient } = await import('../client.js');
+      const { introspect } = await import('../introspect.js');
+      // Own database, as on the other servers: the rest of the suite owns the
+      // URL's database and its seed.sql tables share these names.
+      const admin = new pg.Client({ connectionString: DATABASE_URL });
+      await admin.connect();
+      try {
+        const found = await admin.query("SELECT 1 FROM pg_database WHERE datname = 'turbine_cross'");
+        if (found.rowCount === 0) await admin.query('CREATE DATABASE turbine_cross');
+      } finally {
+        await admin.end();
+      }
+      const url = new URL(DATABASE_URL);
+      url.pathname = '/turbine_cross';
+      rawPool = new pg.Pool({ connectionString: url.toString(), max: 2 });
+      for (const t of TABLES_CHILD_FIRST) await rawPool.query(`DROP TABLE IF EXISTS ${t} CASCADE`);
+      for (const stmt of POSTGRES_DDL) await rawPool.query(stmt);
+      s = await introspect({ connectionString: url.toString() });
+      c = new TurbineClient({ connectionString: url.toString(), poolSize: 5 }, s);
+      await this.reseed();
+    },
+    async filtered(globalFilters) {
+      const { TurbineClient } = await import('../client.js');
+      return new TurbineClient({ pool: rawPool, globalFilters }, s);
+    },
+    async reseed() {
+      await rawPool.query(`TRUNCATE ${TABLES_CHILD_FIRST.join(', ')} RESTART IDENTITY`);
+      for (const [table, rows] of SEED) {
+        const { sql, params } = insert(table, rows);
+        await rawPool.query(sql, params);
+        // Explicit ids do not advance an identity column, and the next
+        // generated key would collide with a seeded row.
+        if (table !== 'post_tags') {
+          await rawPool.query(
+            `SELECT setval(pg_get_serial_sequence('${table}', 'id'), (SELECT MAX(id) FROM ${table}))`,
+          );
+        }
+      }
+    },
+    async raw(sql) {
+      return (await rawPool.query(sql)).rows;
+    },
+    async close() {
+      try {
+        await c.disconnect();
+      } finally {
+        await rawPool.end();
+      }
     },
     client: () => c,
     schema: () => s,
@@ -609,21 +902,21 @@ function registerBattery(h: EngineHarness): void {
   // Registering with { skip } (rather than not registering) makes an
   // unreachable engine show as SKIPPED in the reporter. A silently absent
   // engine is exactly how "the suite never touches MySQL" went unnoticed.
-  const it: typeof nodeIt = h.skip
-    ? (((name: string) => nodeIt(name, { skip: h.skip }, () => {})) as typeof nodeIt)
-    : nodeIt;
+  // And the skip goes through skipGate, so the CI job that exists to run an
+  // engine fails instead of reporting a battery it never ran.
+  const { it } = h.runners;
 
   describe(`cross-engine correctness: ${h.name}`, () => {
     before(async () => {
-      if (h.skip) return;
+      if (!h.available) return;
       await h.connect();
     });
     after(async () => {
-      if (h.skip) return;
+      if (!h.available) return;
       await h.close();
     });
     beforeEach(async () => {
-      if (h.skip) return;
+      if (!h.available) return;
       await h.reseed();
     });
 
@@ -698,7 +991,8 @@ function registerBattery(h: EngineHarness): void {
       // That is a real cross-engine divergence in `contains`, recorded here
       // rather than hidden by dropping the assertion everywhere.
       const sensitive = await users().findMany({ where: { nameCs: { contains: 'alice' } } });
-      if (h.name === 'sqlite') {
+      // Both SQLite drivers run the same library, so both behave this way.
+      if (h.name === 'sqlite' || h.name === 'better-sqlite3') {
         assert.deepEqual(ids(sensitive), [1], 'sqlite LIKE is case-insensitive by default, so this matches');
       } else {
         assert.deepEqual(sensitive, [], 'without insensitive mode the case-sensitive column must NOT match');
@@ -1006,6 +1300,38 @@ function registerBattery(h: EngineHarness): void {
       assert.equal(n(await users().count()), USERS.length + 1);
     });
 
+    // A unique key plus a column that narrows (`email` beside `name`) is not
+    // one conflict target, so it looks the row up by the whole `where`: SQLite
+    // rejected `ON CONFLICT ("email", "name")`, and MySQL's target-less
+    // `ON DUPLICATE KEY UPDATE` updated the `email` row whatever its name.
+    const keyAndName = (email: string, name: string) => ({
+      where: { email, name },
+      create: { orgId: 1, email, name, nameCs: name, role: 'member' },
+      update: { role: 'editor' },
+    });
+
+    it('upsert `where: { key, other column }`: a matching row is updated', async () => {
+      const row = await users().upsert(keyAndName('user1@example.com', 'Alice Admin'));
+      assert.equal(n(row.id), 1);
+      assert.equal(row.role, 'editor');
+      assert.equal(n(await users().count()), USERS.length);
+    });
+
+    it('upsert `where: { key, other column }`: a missing key is inserted', async () => {
+      const row = await users().upsert(keyAndName('fresh@example.com', 'Fresh'));
+      assert.equal(row.email, 'fresh@example.com');
+      assert.equal(row.role, 'member');
+      assert.equal(n(await users().count()), USERS.length + 1);
+    });
+
+    it('upsert `where: { key, other column }`: a key held by a non-matching row conflicts, unchanged', async () => {
+      await assert.rejects(() => users().upsert(keyAndName('user1@example.com', 'Not Alice')), UniqueConstraintError);
+      const alice = await users().findUnique({ where: { id: 1 } });
+      assert.equal(alice?.name, 'Alice Admin');
+      assert.equal(alice?.role, USERS[0]!.role);
+      assert.equal(n(await users().count()), USERS.length);
+    });
+
     // MySQL and SQL Server cannot put the filter on their conflict statement,
     // so 0.80 refused this call there (E017). The lookup carries the filter on
     // every engine: another tenant's row is invisible to it, and never updated.
@@ -1058,9 +1384,432 @@ function registerBattery(h: EngineHarness): void {
       const rows = await users().findMany({ where: { id: 1 }, select: { id: true, email: true } });
       assert.deepEqual(Object.keys(rows[0] as Record<string, unknown>).sort(), ['email', 'id']);
     });
+
+    // --- nested-write.ts ---------------------------------------------------
+    //
+    // Every case below checks the DATABASE after the write, read straight from
+    // the driver (h.raw), not only the tree the write returns: the returned
+    // tree is a read the nested-write engine performs itself, so a write that
+    // reached the wrong row, or none, can still come back looking right.
+
+    const tasks = () => h.client().table('tasks');
+    const profiles = () => h.client().table('profiles');
+    /** Rows of a portable query as plain values: integer columns as numbers, text as text. */
+    const truth = async (sql: string): Promise<unknown[][]> =>
+      (await h.raw(sql)).map((r) =>
+        Object.values(r).map((v) =>
+          v === null || (typeof v === 'string' && !/^-?\d+$/.test(v)) ? v : n(v as number | string | bigint),
+        ),
+      );
+    const taskOwners = () => truth('SELECT id, assignee_id FROM tasks ORDER BY id');
+    // By bio, not id: a generated key is not predictable across reseeds (SQLite
+    // AUTOINCREMENT, for one, never reuses an id after a DELETE).
+    const profileOwners = () => truth('SELECT bio, user_id FROM profiles ORDER BY bio');
+    const userIdByEmail = async (email: string): Promise<number | undefined> => {
+      const rows = await truth(`SELECT id FROM users WHERE email = '${email}'`);
+      return rows.length === 0 ? undefined : (rows[0]?.[0] as number);
+    };
+    const newUserData = (email: string) => ({ orgId: 1, email, name: 'Nested', nameCs: 'Nested', role: 'member' });
+
+    it('the unique foreign key introspects as the to-one users.profile, the name PostgreSQL gives it', () => {
+      const rel = h.schema().tables.users?.relations.profile;
+      assert.equal(rel?.type, 'hasOne');
+      assert.equal(rel?.to, 'profiles');
+      assert.equal(rel?.foreignKey, 'user_id');
+      assert.equal(h.schema().tables.users?.relations.profiles, undefined);
+    });
+
+    it('nested create: hasMany rows of mixed shape and a hasOne row land with the new parent key', async () => {
+      const made = await users().create({
+        data: {
+          ...newUserData('nest@example.com'),
+          posts: {
+            create: [
+              { orgId: 1, title: 'Nested A', content: 'a' },
+              { orgId: 1, title: 'Nested B', content: 'b', published: 1, viewCount: 7 },
+            ],
+          },
+          tasks: { create: { title: 'Nested task' } },
+          profile: { create: { bio: 'Nested bio' } },
+        },
+      });
+      const id = await userIdByEmail('nest@example.com');
+      assert.ok(id, 'the parent row must exist');
+      assert.equal(n(made.id), id);
+      // The omitted fields of the first post take their column defaults, which
+      // is what splitting a mixed-shape array into same-shape runs is for.
+      assert.deepEqual(
+        await truth(
+          `SELECT user_id, title, published, view_count FROM posts WHERE title IN ('Nested A', 'Nested B') ORDER BY title`,
+        ),
+        [
+          [id, 'Nested A', 0, 0],
+          [id, 'Nested B', 1, 7],
+        ],
+      );
+      assert.deepEqual(await truth(`SELECT assignee_id FROM tasks WHERE title = 'Nested task'`), [[id]]);
+      assert.deepEqual(await truth(`SELECT user_id, bio FROM profiles WHERE bio = 'Nested bio'`), [[id, 'Nested bio']]);
+      // The returned tree is the rows that landed.
+      const postIds = (await truth(`SELECT id FROM posts WHERE user_id = ${id} ORDER BY id`)).map((r) => r[0]);
+      assert.deepEqual(
+        ids(made.posts).sort((a, b) => a - b),
+        postIds,
+      );
+      assert.equal(made.tasks.length, 1);
+      assert.equal(made.profile?.bio, 'Nested bio');
+    });
+
+    it('nested create two levels deep writes the grandchildren under the new child', async () => {
+      const made = await users().create({
+        data: {
+          ...newUserData('deep@example.com'),
+          posts: {
+            create: {
+              orgId: 1,
+              title: 'Deep post',
+              content: 'd',
+              comments: {
+                create: [
+                  { userId: 1, body: 'deep one' },
+                  { userId: 2, body: 'deep two' },
+                ],
+              },
+            },
+          },
+        },
+      });
+      const id = await userIdByEmail('deep@example.com');
+      const [[postId]] = (await truth(`SELECT id FROM posts WHERE user_id = ${id}`)) as [[number]];
+      assert.deepEqual(
+        await truth(`SELECT post_id, user_id, body FROM comments WHERE post_id = ${postId} ORDER BY body`),
+        [
+          [postId, 1, 'deep one'],
+          [postId, 2, 'deep two'],
+        ],
+      );
+      assert.deepEqual((made.posts[0]?.comments ?? []).map((c: CommentRow) => c.body).sort(), ['deep one', 'deep two']);
+    });
+
+    it('nested connect points existing children at the parent, in create and in update', async () => {
+      await users().update({ where: { id: 3 }, data: { posts: { connect: { id: 4 } } } });
+      assert.deepEqual(await truth('SELECT id, user_id FROM posts ORDER BY id'), [
+        [1, 1],
+        [2, 1],
+        [3, 1],
+        [4, 3],
+        [5, 4],
+      ]);
+      const made = await users().create({
+        data: { ...newUserData('conn@example.com'), tasks: { connect: [{ id: 4 }, { id: 3 }] } },
+      });
+      const id = await userIdByEmail('conn@example.com');
+      assert.deepEqual(await taskOwners(), [
+        [1, 1],
+        [2, 1],
+        [3, id],
+        [4, id],
+        [5, 5],
+      ]);
+      assert.deepEqual(ids(made.tasks).sort(), [3, 4]);
+    });
+
+    it('nested connectOrCreate connects the row that exists and creates the one that does not', async () => {
+      await users().update({
+        where: { id: 3 },
+        data: {
+          tasks: {
+            connectOrCreate: [
+              { where: { title: 'Unassigned' }, create: { title: 'Unassigned' } },
+              { where: { title: 'Fresh task' }, create: { title: 'Fresh task' } },
+            ],
+          },
+        },
+      });
+      assert.deepEqual(await truth('SELECT title, assignee_id FROM tasks WHERE assignee_id = 3 ORDER BY title'), [
+        ['Fresh task', 3],
+        ['Unassigned', 3],
+      ]);
+      assert.equal(n((await truth('SELECT COUNT(*) FROM tasks'))[0]?.[0]), TASKS.length + 1);
+    });
+
+    it('nested update changes the owned child only, and refuses a child of another parent', async () => {
+      await users().update({
+        where: { id: 1 },
+        data: {
+          posts: { update: { where: { id: 2 }, data: { title: 'Second Renamed', viewCount: { increment: 5 } } } },
+        },
+      });
+      assert.deepEqual(await truth('SELECT title, view_count FROM posts WHERE id = 2'), [['Second Renamed', 80]]);
+      await assert.rejects(
+        () =>
+          users().update({
+            where: { id: 1 },
+            data: { posts: { update: { where: { id: 4 }, data: { title: 'Hijack' } } } },
+          }),
+        NotFoundError,
+      );
+      assert.deepEqual(await truth('SELECT title FROM posts WHERE id = 4'), [['100% Sure']]);
+    });
+
+    it("nested upsert updates an owned child and creates instead of touching another parent's", async () => {
+      await users().update({
+        where: { id: 1 },
+        data: {
+          tasks: {
+            upsert: [
+              { where: { id: 1 }, create: { title: 'Never created' }, update: { title: 'Docs written' } },
+              { where: { id: 3 }, create: { title: 'Mine now' }, update: { title: 'Hijacked' } },
+            ],
+          },
+        },
+      });
+      assert.deepEqual(await truth('SELECT title, assignee_id FROM tasks ORDER BY title'), [
+        ['Docs written', 1],
+        ['Erin task', 5],
+        ['Fix bug', 1],
+        ['Mine now', 1],
+        ['Review change', 2],
+        ['Unassigned', null],
+      ]);
+    });
+
+    it('nested delete removes the owned child only, and refuses a child of another parent', async () => {
+      await users().update({ where: { id: 1 }, data: { tasks: { delete: { id: 2 } } } });
+      assert.deepEqual(
+        (await taskOwners()).map((r) => r[0]),
+        [1, 3, 4, 5],
+      );
+      await assert.rejects(
+        () => users().update({ where: { id: 1 }, data: { tasks: { delete: { id: 3 } } } }),
+        NotFoundError,
+      );
+      assert.deepEqual(
+        (await taskOwners()).map((r) => r[0]),
+        [1, 3, 4, 5],
+      );
+    });
+
+    it('nested disconnect clears a nullable foreign key, and refuses a NOT NULL one', async () => {
+      await users().update({ where: { id: 1 }, data: { tasks: { disconnect: [{ id: 1 }] } } });
+      assert.deepEqual(await taskOwners(), [
+        [1, null],
+        [2, 1],
+        [3, 2],
+        [4, null],
+        [5, 5],
+      ]);
+      await assert.rejects(
+        () => users().update({ where: { id: 1 }, data: { posts: { disconnect: { id: 1 } } } }),
+        ValidationError,
+      );
+      assert.deepEqual(await truth('SELECT user_id FROM posts WHERE id = 1'), [[1]]);
+    });
+
+    it('nested set replaces the whole relation: old children cleared, named ones connected, others untouched', async () => {
+      await users().update({ where: { id: 1 }, data: { tasks: { set: [{ id: 3 }, { id: 4 }] } } });
+      assert.deepEqual(await taskOwners(), [
+        [1, null],
+        [2, null],
+        [3, 1],
+        [4, 1],
+        [5, 5],
+      ]);
+    });
+
+    it('hasOne connect re-points an existing row, and connectOrCreate creates once then connects', async () => {
+      await users().update({ where: { id: 3 }, data: { profile: { connect: { id: 2 } } } });
+      assert.deepEqual(await profileOwners(), [
+        ['Alice bio', 1],
+        ['Bob bio', 3],
+      ]);
+      const cocArgs = { where: { userId: 4 }, create: { bio: 'Dave bio' } };
+      await users().update({ where: { id: 4 }, data: { profile: { connectOrCreate: cocArgs } } });
+      await users().update({ where: { id: 4 }, data: { profile: { connectOrCreate: cocArgs } } });
+      assert.deepEqual(await profileOwners(), [
+        ['Alice bio', 1],
+        ['Bob bio', 3],
+        ['Dave bio', 4],
+      ]);
+    });
+
+    it('hasOne update and upsert write the related row, creating it when the parent has none', async () => {
+      await users().update({
+        where: { id: 1 },
+        data: { profile: { update: { where: { id: 1 }, data: { bio: 'Alice 2' } } } },
+      });
+      await users().update({
+        where: { id: 2 },
+        data: { profile: { upsert: { where: { id: 2 }, create: { bio: 'Never' }, update: { bio: 'Bob 2' } } } },
+      });
+      await users().update({
+        where: { id: 3 },
+        data: { profile: { upsert: { where: { id: 999 }, create: { bio: 'Carol bio' }, update: { bio: 'Never' } } } },
+      });
+      assert.deepEqual(await profileOwners(), [
+        ['Alice 2', 1],
+        ['Bob 2', 2],
+        ['Carol bio', 3],
+      ]);
+    });
+
+    it('hasOne delete: true removes the related row, and disconnect: true unlinks it', async () => {
+      await users().update({ where: { id: 2 }, data: { profile: { delete: true } } });
+      await users().update({ where: { id: 1 }, data: { profile: { disconnect: true } } });
+      assert.deepEqual(await profileOwners(), [['Alice bio', null]]);
+      assert.equal(
+        await profiles()
+          .count({ where: { userId: 1 } })
+          .then(n),
+        0,
+      );
+    });
+
+    it('belongsTo create and connect in a create fold the parent keys into the INSERT', async () => {
+      const made: PostRow = await posts().create({
+        data: {
+          title: 'BT post',
+          content: 'x',
+          organization: { connect: { id: 2 } },
+          user: { create: { orgId: 2, email: 'bt@example.com', name: 'BT', nameCs: 'BT' } },
+        },
+      });
+      const id = await userIdByEmail('bt@example.com');
+      assert.ok(id, 'the related row must exist');
+      assert.deepEqual(await truth(`SELECT user_id, org_id FROM posts WHERE title = 'BT post'`), [[id, 2]]);
+      assert.equal(made.user?.email, 'bt@example.com');
+    });
+
+    it('belongsTo connectOrCreate connects an existing row and creates a missing one', async () => {
+      await tasks().create({
+        data: {
+          title: 'COC one',
+          user: {
+            connectOrCreate: { where: { email: 'user3@example.com' }, create: newUserData('user3@example.com') },
+          },
+        },
+      });
+      await tasks().create({
+        data: {
+          title: 'COC two',
+          user: { connectOrCreate: { where: { email: 'coc@example.com' }, create: newUserData('coc@example.com') } },
+        },
+      });
+      const id = await userIdByEmail('coc@example.com');
+      assert.ok(id);
+      assert.deepEqual(await truth(`SELECT title, assignee_id FROM tasks WHERE title LIKE 'COC%' ORDER BY title`), [
+        ['COC one', 3],
+        ['COC two', id],
+      ]);
+      assert.equal(n((await truth('SELECT COUNT(*) FROM users'))[0]?.[0]), USERS.length + 1);
+    });
+
+    it('belongsTo connect and update in an update re-point the parent and write the related row', async () => {
+      await posts().update({ where: { id: 3 }, data: { user: { connect: { id: 2 } } } });
+      assert.deepEqual(await truth('SELECT user_id FROM posts WHERE id = 3'), [[2]]);
+      await posts().update({ where: { id: 4 }, data: { user: { update: { data: { name: 'Bob Renamed' } } } } });
+      assert.deepEqual(await truth('SELECT id, name FROM users WHERE id IN (1, 2) ORDER BY id'), [
+        [1, 'Alice Admin'],
+        [2, 'Bob Renamed'],
+      ]);
+    });
+
+    it('belongsTo upsert updates the row the parent points at, and creates one for a parent pointing nowhere', async () => {
+      await tasks().update({
+        where: { id: 1 },
+        data: {
+          user: { upsert: { where: { id: 1 }, create: newUserData('never@example.com'), update: { role: 'owner' } } },
+        },
+      });
+      assert.deepEqual(await truth('SELECT role FROM users WHERE id = 1'), [['owner']]);
+      await tasks().update({
+        where: { id: 4 },
+        data: {
+          user: { upsert: { where: { id: 1 }, create: newUserData('ups4@example.com'), update: { role: 'x' } } },
+        },
+      });
+      const id = await userIdByEmail('ups4@example.com');
+      assert.ok(id, 'a parent pointing at nothing takes the create branch');
+      assert.deepEqual(await truth('SELECT assignee_id FROM tasks WHERE id = 4'), [[id]]);
+      assert.deepEqual(await truth('SELECT role FROM users WHERE id = 1'), [['owner']]);
+      assert.equal(await userIdByEmail('never@example.com'), undefined);
+    });
+
+    it('belongsTo disconnect clears the key; delete also removes the row; a NOT NULL key refuses both', async () => {
+      await tasks().update({ where: { id: 1 }, data: { user: { disconnect: true } } });
+      await tasks().update({ where: { id: 5 }, data: { user: { delete: true } } });
+      assert.deepEqual(await taskOwners(), [
+        [1, null],
+        [2, 1],
+        [3, 2],
+        [4, null],
+        [5, null],
+      ]);
+      assert.deepEqual(
+        (await truth('SELECT id FROM users ORDER BY id')).map((r) => r[0]),
+        [1, 2, 3, 4],
+      );
+      await assert.rejects(
+        () => posts().update({ where: { id: 1 }, data: { user: { disconnect: true } } }),
+        ValidationError,
+      );
+      assert.deepEqual(await truth('SELECT user_id FROM posts WHERE id = 1'), [[1]]);
+    });
+
+    it('a nested create that fails on its last child leaves nothing behind', async () => {
+      await assert.rejects(
+        () =>
+          users().create({
+            data: {
+              ...newUserData('rollback@example.com'),
+              posts: { create: { orgId: 1, title: 'Rollback post', content: 'r' } },
+              // 'Write docs' is task 1's title, and title is UNIQUE.
+              tasks: { create: [{ title: 'Rollback task' }, { title: 'Write docs' }] },
+            },
+          }),
+        UniqueConstraintError,
+      );
+      assert.equal(await userIdByEmail('rollback@example.com'), undefined);
+      assert.deepEqual(await truth(`SELECT id FROM posts WHERE title = 'Rollback post'`), []);
+      assert.deepEqual(await truth(`SELECT id FROM tasks WHERE title = 'Rollback task'`), []);
+      assert.equal(n((await truth('SELECT COUNT(*) FROM users'))[0]?.[0]), USERS.length);
+    });
+
+    it('a nested update that fails after earlier writes rolls back the scalar update and every nested write', async () => {
+      await assert.rejects(
+        () =>
+          users().update({
+            where: { id: 1 },
+            data: {
+              name: 'Changed',
+              tasks: { create: { title: 'Rollback task' }, disconnect: { id: 1 } },
+              // User 1 already has profile 1, and profiles.user_id is UNIQUE.
+              profile: { create: { bio: 'Second profile' } },
+            },
+          }),
+        UniqueConstraintError,
+      );
+      assert.deepEqual(await truth('SELECT name FROM users WHERE id = 1'), [['Alice Admin']]);
+      assert.deepEqual(await truth(`SELECT id FROM tasks WHERE title = 'Rollback task'`), []);
+      assert.deepEqual(await taskOwners(), [
+        [1, 1],
+        [2, 1],
+        [3, 2],
+        [4, null],
+        [5, 5],
+      ]);
+      assert.deepEqual(await profileOwners(), [
+        ['Alice bio', 1],
+        ['Bob bio', 2],
+      ]);
+    });
   });
 }
 
 registerBattery(sqliteHarness());
+registerBattery(betterSqlite3Harness());
 registerBattery(mysqlHarness());
 registerBattery(mssqlHarness());
+registerBattery(postgresHarness());
+
+// Register native teardown after the existing client teardown hooks.
+const sqliteCleanup = sqliteFixtureScope();

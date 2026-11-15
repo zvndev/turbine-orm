@@ -18,6 +18,7 @@ import { createRequire } from 'node:module';
 import { describe, it } from 'node:test';
 import { TurbineClient } from '../client.js';
 import { introspectSqliteDatabase, SqlitePool, sqliteDialect } from '../sqlite.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 const HAVE_NODE_SQLITE = (() => {
   try {
@@ -33,7 +34,7 @@ const ROWS = Array.from({ length: 1000 }, (_, i) => ({ k: `k${String(i).padStart
 /** A client over a fresh database, recording every INSERT it prepares and its parameter count. */
 async function recordingClient(options: { connectless?: boolean; dialect?: typeof sqliteDialect } = {}) {
   const { DatabaseSync } = await import('node:sqlite');
-  const handle = new DatabaseSync(':memory:');
+  const handle = closeSqliteAfter(new DatabaseSync(':memory:'));
   handle.exec('CREATE TABLE t (k TEXT PRIMARY KEY, n INTEGER)');
   const inserts: number[] = [];
   const prepare = handle.prepare.bind(handle);

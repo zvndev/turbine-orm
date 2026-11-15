@@ -60,6 +60,8 @@ export const ENGINE_GATE_PATTERNS: Readonly<Record<string, RegExp>> = {
   mssql: /\bMSSQL_URL\b/,
   powdb: /no prebuilt binary|@zvndev\/powdb-embedded >=/,
   sqlite: /\bnode:sqlite\b/,
+  // Native migration writes have a newer runtime floor than ordinary SQLite.
+  'sqlite-migrations': /\bSQLite migration writer\b/,
   pgbouncer: /\bPGBOUNCER_URL\b/,
 };
 
@@ -107,7 +109,7 @@ function requiredEnginePatterns(): RegExp[] {
  * and the job reports GREEN. Nothing downstream asserts the tests ran.
  *
  * Set `TURBINE_REQUIRE_ENGINE` to one or more comma-separated engine tokens
- * (`postgres`, `mysql`, `mssql`, `powdb`, `sqlite`, `pgbouncer`) and a gate that would skip
+ * (`postgres`, `mysql`, `mssql`, `powdb`, `sqlite`, `sqlite-migrations`, `pgbouncer`) and a gate that would skip
  * for that engine THROWS instead, naming the precondition it could not meet.
  * The throw happens at module scope, where these gates are declared, so the
  * test runner fails the file rather than reporting zero tests. Gates for the
@@ -151,7 +153,9 @@ export function mockColumn(name: string, field: string, pgType = 'int8', pii = f
     tsType: 'number',
     nullable: false,
     hasDefault: name === 'id',
-    isArray: false,
+    // As introspection and defineSchema record it: the catalog array flag
+    // agrees with an array type token (`_text`).
+    isArray: pgType.startsWith('_'),
     pgArrayType: pgArrayType(pgType),
     ...(pii ? { pii: true as const } : {}),
   };

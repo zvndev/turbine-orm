@@ -11,6 +11,7 @@ import { guardConnection } from './connection-guard.js';
 import { assertDialectCapabilities, type Dialect, postgresDialect } from './dialect.js';
 import { UnsupportedFeatureError, ValidationError } from './errors.js';
 import { pgConfActionToReferential, stripCheckWrapper } from './introspect.js';
+import { foldSqlText, isSequenceDefault, readIndexDefinition } from './pg-catalog-text.js';
 import { camelToSnake, type ReferentialAction } from './schema.js';
 import {
   type ColumnConfig,
@@ -703,55 +704,33 @@ function declaredIndexName(tableName: string, idx: ColumnIndexDef): string {
 
 /**
  * Compare a declared plain index against a pg_indexes `indexdef` string.
- * Returns a human-readable description of the first mismatch (uniqueness or
- * column list), or null when the definitions agree. Expression/partial indexes
- * in the DB never structurally match a plain column list, which is the
- * intended outcome: the operator gets a warning rather than a silent skip.
+ * Returns a human-readable description of the first mismatch (uniqueness,
+ * column list, or a predicate), or null when the definitions agree.
  *
- * ## Parser 3 of 3, and what it is safe for
- *
- * THREE indexdef parsers coexist in this repo, catalogued on
- * `parseIndexKeyEntries` in introspect.ts: that character-by-character scanner
- * (the one to prefer for new callers), `parsePlainUniqueIndexColumns` in the
- * same file, and this one. The two in introspect.ts do NOT feed this function
- * and a fix to either does not reach it.
- *
- * This still uses the `USING \w+ \(([^)]*)\)` regex the scanner was written to
- * replace, so it inherits the same weaknesses: it stops at the FIRST `)`, and it
- * splits on every comma, which misreads an expression key (`lower(email)`), a
- * quoted identifier containing a comma or a paren, and an opclass'd key. Safe
- * here because every outcome of a misread is the SAME outcome as a genuine
- * mismatch: a string describing the difference, which the caller turns into a
- * warning for a human to read. It never drops or alters an index, and it is
- * never consulted about whether a column set is unique. Do not reuse it
- * anywhere those two properties stop holding.
+ * The definition is read by `readIndexDefinition` (pg-catalog-text.ts), the
+ * one reader of that text, so a quoted index or table name cannot supply the
+ * key list. Uniqueness is the DATABASE's flag (the `CREATE UNIQUE INDEX`
+ * keyword), since the question is whether the existing index is what was
+ * declared. A key with an expression, a COLLATE clause or an operator class is
+ * never a declared plain column, so it reads as a mismatch, and so does a
+ * definition the reader cannot read: the operator gets a warning rather than a
+ * silent skip. Ordering words (`DESC`, `NULLS LAST`) are not compared. This
+ * never drops or alters an index; the caller turns the string into a warning.
  */
 export function describeIndexDefMismatch(idx: ColumnIndexDef, indexdef: string): string | null {
-  const dbUnique = /^\s*CREATE\s+UNIQUE\s+INDEX\b/i.test(indexdef);
+  const read = readIndexDefinition(indexdef);
   const wantUnique = idx.unique === true;
-  if (dbUnique !== wantUnique) {
+  if (read && read.unique !== wantUnique) {
     return wantUnique
       ? 'declared UNIQUE, existing index is not unique'
       : 'existing index is UNIQUE, declaration is not';
   }
-  // pg_indexes.indexdef always reads `CREATE [UNIQUE] INDEX name ON tbl
-  // USING method (col, ...) [WHERE ...]`; anchor on the USING clause so a
-  // partial index's WHERE parentheses are never mistaken for the column list.
-  const parenMatch = indexdef.match(/USING\s+\w+\s*\(([^)]*)\)/i) ?? indexdef.match(/\(([^)]*)\)/);
-  const dbCols = parenMatch
-    ? parenMatch[1]!.split(',').map((c) =>
-        c
-          .trim()
-          .replace(/\s+(ASC|DESC|NULLS\s+(FIRST|LAST))\b/gi, '')
-          .replace(/^"(.*)"$/, '$1')
-          .trim(),
-      )
-    : [];
+  const dbCols = read?.keys.map((key) => [key.column ?? '(expression)', ...key.modifiers].join(' '));
   const wantCols = idx.columns.map(camelToSnake);
-  if (dbCols.length !== wantCols.length || dbCols.some((c, i) => c !== wantCols[i])) {
-    return `declared columns (${wantCols.join(', ')}) differ from existing (${dbCols.join(', ') || 'unparsed'})`;
+  if (!dbCols || dbCols.length !== wantCols.length || dbCols.some((c, i) => c !== wantCols[i])) {
+    return `declared columns (${wantCols.join(', ')}) differ from existing (${dbCols?.join(', ') ?? 'unreadable'})`;
   }
-  if (/\bWHERE\b/i.test(indexdef)) return 'existing index is partial (has a WHERE clause)';
+  if (read?.partial) return 'existing index is partial (has a WHERE clause)';
   return null;
 }
 
@@ -1087,9 +1066,10 @@ export interface CheckSpec {
 /**
  * Diff a table's CHECK constraints (matched by name). Adds constraints missing
  * from the DB, drops DB constraints absent from the schema, and drop+adds when a
- * same-named constraint's expression changed. Expression comparison is a naive
- * whitespace-insensitive match, semantically-equal-but-different-spelled
- * expressions may re-emit (documented; harmless drop+add).
+ * same-named constraint's expression changed. Expressions are compared with
+ * whitespace and letter case folded outside string literals and quoted
+ * identifiers, so a changed literal is a change; semantically-equal-but-
+ * differently-spelled expressions may re-emit (documented; harmless drop+add).
  */
 export function diffCheckConstraints(
   table: string,
@@ -1102,7 +1082,8 @@ export function diffCheckConstraints(
   const reverseStatements: string[] = [];
   const dbByName = new Map(dbChecks.map((c) => [c.name, c]));
   const schemaByName = new Map(schemaChecks.map((c) => [c.name, c]));
-  const norm = (e: string) => e.replace(/\s+/g, ' ').trim();
+  // Whitespace and case outside literals; a literal's own spaces are its value.
+  const norm = foldSqlText;
   // `c.expression` is raw SQL emitted verbatim by design (see CheckSpec):
   // schema-authored only, never untrusted input.
   const addStmt = (c: CheckSpec) => `ALTER TABLE ${q(table)} ADD CONSTRAINT ${q(c.name)} CHECK (${c.expression});`;
@@ -1406,7 +1387,7 @@ export async function schemaDiff(
     for (const existingTable of existingTables) {
       if (!schemaDdlNames.has(existingTable) && !existingTable.startsWith('_turbine_')) {
         result.drop.push(existingTable);
-        // We don't auto-generate DROP statements for safety
+        // Leave tables absent from the schema intact to avoid accidental data loss.
       }
     }
 
@@ -1540,7 +1521,7 @@ export async function schemaDiff(
             schemaDefault &&
             dbDefault &&
             !isSequenceDefault(dbDefault) &&
-            !defaultsMatch(schemaDefault, dbDefault)
+            !defaultsMatch(schemaDefault, dbDefault, isTextValued(dbCol.udtName, dbEnums))
           ) {
             // Both have defaults but they differ
             const sql = `ALTER TABLE ${dialect.quoteIdentifier(tableName)} ALTER COLUMN ${dialect.quoteIdentifier(snakeName)} SET DEFAULT ${schemaDefault};`;
@@ -1628,9 +1609,9 @@ export async function schemaDiff(
 
       // --- Named table-level CHECK constraints ---
       // Presence-only diffing: ADD checks whose NAME is missing from the DB.
-      // We do NOT auto-drop DB checks absent from the schema (column-level /
+      // Do NOT auto-drop DB checks absent from the schema (column-level /
       // inline checks carry auto-generated names the code-first schema never
-      // sees), and we do NOT drop+add on expression mismatch: pg_get_constraintdef
+      // sees), and do NOT drop+add on expression mismatch: pg_get_constraintdef
       // canonicalizes expressions (casts, ANY(ARRAY[...]) rewrites), so authored
       // text almost never string-matches the stored form, comparing would emit a
       // spurious full-table-revalidating drop+add on every diff. An apparent
@@ -1657,7 +1638,8 @@ export async function schemaDiff(
             `to match them against the database`,
         );
       }
-      const normExpr = (e: string) => e.replace(/\s+/g, ' ').trim();
+      // Whitespace and case outside literals; a literal's own spaces are its value.
+      const normExpr = foldSqlText;
       for (const sc of namedSchemaChecks) {
         const existing = dbCheckByName.get(sc.name);
         // The constraint name is quoted; `sc.expression` is raw SQL emitted
@@ -1679,7 +1661,7 @@ export async function schemaDiff(
 
       // --- User-declared indexes (TableDef.indexes) ---
       // ADD any declared plain index whose NAME is missing from the DB (reverse:
-      // DROP INDEX). Doc-field indexes are PowDB-only and skipped. We never
+      // DROP INDEX). Doc-field indexes are PowDB-only and skipped. Never
       // auto-drop DB indexes not in the schema, matching the column-drop posture.
       // When the table declares at least one index (the user is actively managing
       // indexes here), unrecognized extra DB indexes are surfaced as warnings so
@@ -1851,12 +1833,12 @@ export type TypeChangePlan =
  *     the same family, because there is no automatic cast between a scalar and
  *     an array and the plain ALTER would be unrunnable.
  *   - `time` / `timetz` were listed as `temporal` alongside date and the
- *     timestamps, and the contract simply is not true there: pg_cast has NO
+ *     timestamps, and the contract does not hold there: pg_cast has NO
  *     entry between `time` and `date`, `timestamp` or `timestamptz` in EITHER
  *     direction, so `ALTER COLUMN c TYPE DATE` on a `time` column fails with
  *     "cannot be cast automatically". They are their own family, which makes a
  *     time-to-date change cross-family: still not something Turbine can apply,
- *     but now it says so in the loss warning instead of asserting a cast that
+ *     but it says so in the loss warning instead of asserting a cast that
  *     does not exist. (`{date, timestamp, timestamptz}` and `{time, timetz}`
  *     are each internally complete.)
  */
@@ -2266,7 +2248,7 @@ function schemaTypeToUdt(config: ColumnConfig): string | null {
  * Two rules, and the second one is why this takes the whole column:
  *
  *   1. A type this generator itself emits gets its own uppercase spelling back,
- *      so a reverse statement reads like the forward one. `numeric` now carries
+ *      so a reverse statement reads like the forward one. `numeric` carries
  *      its precision and scale: a `numeric(10, 2)` column changed to INTEGER
  *      reversed to a bare `NUMERIC`, quietly discarding the constraint the DOWN
  *      was supposed to restore.
@@ -2326,19 +2308,25 @@ function normalizeDbDefault(dbDefault: string): string {
   return val;
 }
 
-/** Check if a DB default is a sequence default (auto-generated for serial columns). */
-function isSequenceDefault(dbDefault: string): boolean {
-  return dbDefault.includes('nextval(');
-}
-
 /**
  * Compare a schema default against a database default, accounting for
- * PostgreSQL's normalization of default values.
+ * PostgreSQL's normalization of default values. Case and whitespace are folded
+ * outside string literals (`foldSqlText`): `NOW()` is `now()`. Inside a literal,
+ * case is the VALUE when the column holds text (`textValued`): `'UPPER'` and
+ * `'upper'` store different strings, and an enum's labels are case-sensitive.
+ * For any other type the literal is an input form PostgreSQL rewrites when it
+ * stores the default (`'A0EE...'::uuid` comes back lower-cased, `'1 DAY'` as
+ * `'1 day'::interval`), so case inside it is folded as well.
  */
-function defaultsMatch(schemaDefault: string, dbDefault: string): boolean {
-  const a = schemaDefault.toLowerCase().trim();
-  const b = normalizeDbDefault(dbDefault).toLowerCase().trim();
-  return a === b;
+function defaultsMatch(schemaDefault: string, dbDefault: string, textValued: boolean): boolean {
+  const fold = (text: string) => (textValued ? foldSqlText(text) : foldSqlText(text).toLowerCase());
+  return fold(schemaDefault) === fold(normalizeDbDefault(dbDefault));
+}
+
+/** Whether a column (by `udt_name`) holds text, so a literal's case is part of its value. Arrays included. */
+function isTextValued(udtName: string, enums: Record<string, string[]>): boolean {
+  const base = udtName.replace(/^_/, '');
+  return /^(?:text|varchar|bpchar|char|name|citext|jsonb?|xml)$/.test(base) || Object.hasOwn(enums, base);
 }
 
 // ---------------------------------------------------------------------------
@@ -2397,7 +2385,7 @@ function quoteSearchPathIdent(name: string): string {
  *      stay identical; the EFFECT is, and the effect of pinning `"public"` on a
  *      connection that already resolved to public is nil.
  *   2. Postgres does not validate schema names in `search_path`: setting it to a
- *      namespace that does not exist succeeds, and name resolution simply skips
+ *      namespace that does not exist succeeds, and name resolution skips
  *      the missing entry. So a typo in `schema` silently redirected every
  *      CREATE into whatever came next in the path (public), reported success,
  *      and wedged the second push exactly as (1) does. `to_regnamespace`

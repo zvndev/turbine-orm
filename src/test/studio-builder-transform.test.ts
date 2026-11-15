@@ -31,6 +31,7 @@ import { createRequire } from 'node:module';
 import { describe, it as nodeIt } from 'node:test';
 import { handleRequest, PII_REDACTED, type StudioContext, type StudioOptions } from '../cli/studio.js';
 import { createDemoContext } from '../cli/studio-demo.js';
+import { closeSqliteContextAfter } from './sqlite-fixture-lifetime.js';
 import { studioTestStateDir } from './studio-test-state.js';
 
 const STATE_DIR = studioTestStateDir();
@@ -89,7 +90,7 @@ const ORIGIN = `http://${HOST}:0`;
 const TOKEN = 'test-token';
 
 function makeDemoCtx(showPii = false): StudioContext {
-  const demo = createDemoContext();
+  const demo = closeSqliteContextAfter(createDemoContext());
   const options: StudioOptions = {
     url: 'demo://in-memory',
     schema: 'public',

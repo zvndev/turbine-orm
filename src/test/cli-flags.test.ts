@@ -8,7 +8,7 @@
  * Also unit-tests `parseArgs` / `isLoopbackHost` for the Studio/Observe
  * `--allow-remote` hard-fail gate (Track 2).
  *
- * This is a regression guard, not a fuzz test, we do NOT spawn the CLI
+ * This regression guard does NOT spawn the CLI
  * binary. Spawning would require a prior `npm run build` and coupling this
  * unit test to the build artifact, which `test:unit` must stay free of.
  *

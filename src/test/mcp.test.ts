@@ -128,6 +128,7 @@ describe('turbine mcp protocol', () => {
         'relation_graph',
         'find_join_path',
         'table_stats',
+        'engine_capabilities',
         'explain_error',
       ],
     );

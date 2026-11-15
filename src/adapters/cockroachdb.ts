@@ -11,10 +11,10 @@
  *    `SET transaction_timeout` (v23.1+) for per-transaction time limits.
  *
  * 3. **`pg_indexes` view**, CockroachDB supports `pg_indexes` since v22.1
- *    but the `indexdef` column may not match Postgres exactly. We use
- *    `SHOW INDEXES` as a more reliable alternative.
+ *    with `tablename`, `indexname`, and `indexdef` columns consumed by the
+ *    standard introspection flow.
  *
- * 4. **`pg_class.reltuples`**, Not reliable in CockroachDB. We use
+ * 4. **`pg_class.reltuples`**, Not reliable in CockroachDB. The adapter uses
  *    `crdb_internal.table_row_statistics` for row estimates.
  *
  * Known limitations with Turbine on CockroachDB:
@@ -77,8 +77,8 @@ const SQL_INDEXES_CRDB = `
 `;
 
 /**
- * Row estimates using crdb_internal. Falls back gracefully if the view
- * doesn't exist (permissions issue), returns 0 rows in that case.
+ * Row-estimates override query using crdb_internal, with zero for tables
+ * lacking statistics.
  */
 const SQL_ROW_ESTIMATES_CRDB = `
   SELECT
@@ -93,8 +93,7 @@ const SQL_ROW_ESTIMATES_CRDB = `
 
 /**
  * Enum introspection, CockroachDB supports pg_type/pg_enum since v20.2.
- * The standard query works, but we include it explicitly so the override
- * mechanism is complete.
+ * The override uses the same catalog columns as PostgreSQL.
  */
 const SQL_ENUMS_CRDB = `
   SELECT t.typname, e.enumlabel
@@ -135,7 +134,6 @@ export const cockroachdb: DatabaseAdapter = {
   },
 
   async acquireLock(client: PgCompatPoolClient, lockId: number): Promise<boolean> {
-    // Ensure the lock table exists
     await client.query(CREATE_LOCK_TABLE_SQL);
 
     // Insert the lock row if it doesn't exist (idempotent)
@@ -145,12 +143,11 @@ export const cockroachdb: DatabaseAdapter = {
     try {
       await client.query('BEGIN');
       await client.query(`SELECT lock_id FROM "${LOCK_TABLE}" WHERE lock_id = $1 FOR UPDATE NOWAIT`, [lockId]);
-      // Update the acquired metadata
       await client.query(
         `UPDATE "${LOCK_TABLE}" SET acquired_at = now(), acquired_by = current_user WHERE lock_id = $1`,
         [lockId],
       );
-      // Note: we leave the transaction OPEN, the lock is held until
+      // The transaction stays OPEN: the lock is held until
       // releaseLock() commits or rolls back. That is why this adapter sets
       // `lockHoldsOpenTransaction` and the runner hands it its own connection:
       // on a shared one, the first migration's COMMIT would end this.
@@ -166,7 +163,6 @@ export const cockroachdb: DatabaseAdapter = {
         }
         return false;
       }
-      // Any other error, rollback and re-throw
       try {
         await client.query('ROLLBACK');
       } catch {

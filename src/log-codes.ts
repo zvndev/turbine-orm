@@ -26,6 +26,7 @@ export const LOG_CODES = [
   'raw-sql',
   'transaction-committed',
   'transaction-rolled-back',
+  'transaction-outcome-unknown',
   'listen',
   'notify',
   'connection-verified',
@@ -68,6 +69,9 @@ export const LOG_CODES = [
   'powdb-introspect-no-primary-key',
   // introspect.ts, generate.ts
   'introspect-cross-schema-fk',
+  // mysql.ts: an ENUM column whose labels the utf8mb3 catalog text may have
+  // rendered lossily; typed as string.
+  'introspect-enum-labels-unrecoverable',
   'introspect-relation-renamed',
   'introspect-relation-shadows-json',
   'generate-relation-shadows-column',

@@ -11,7 +11,7 @@ What the client does around every query: timeouts, middleware, query plans, and 
 
 ## Per-query timeout
 
-Every method takes `timeout` in milliseconds, or `0` for none.
+Query methods take `timeout` in milliseconds, or `0` for none.
 
 ```ts
 import { TimeoutError } from 'turbine-orm';
@@ -25,9 +25,11 @@ try {
 }
 ```
 
-A `TimeoutError` ([E002](/errors#e002)) carries `outcome`. `'not-executed'` means nothing changed, for example when the PostgreSQL server confirms Turbine's cancel. `'unknown'` means a write may have applied, which is the answer on other engines; check before retrying.
+A `TimeoutError` ([E002](/errors#e002)) carries `outcome`. `'not-executed'` confirms that the operation made no change. `'unknown'` means that Turbine could not confirm this. An ordinary write may have applied; make retries idempotent. For a transaction deadline, COMMIT was never sent, but an unconfirmed rollback can leave locks held. See [transaction timeouts](/transactions#timeouts) for each engine's cleanup limits.
 
-Inside `$transaction` on PostgreSQL, a timed-out statement rolls the transaction back, and `$transaction` rejects with `TransactionRolledBackError` ([E019](/errors#e019)) even if you catch the timeout.
+Inside `$transaction` on PostgreSQL, a timed-out statement means the transaction cannot commit, and `$transaction` rejects even if you catch the timeout: with `TransactionRolledBackError` ([E019](/errors#e019)) once the server acknowledges the rollback, or with the statement's own `TimeoutError` when it does not.
+
+A write that takes several statements (a nested write, a lookup-first upsert, a `createMany` split across statements) is different: inside `$transaction` it runs in a savepoint of its own (on every engine except PowDB, which has none), and its timeout rolls back to that savepoint. When the server acknowledges that rollback, the error says `'not-executed'` and the transaction can continue and commit. When it does not, the error says `'unknown'` and the transaction cannot commit.
 
 ## Middleware
 

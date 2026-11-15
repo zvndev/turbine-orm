@@ -1,15 +1,15 @@
 /**
  * turbine-orm, SQL dialect contract
  *
- * Phase-1 seam for future database packages. The current package remains
- * PostgreSQL-native by default, but query generation now depends on this
- * contract for the SQL primitives that vary across MySQL and SQLite.
+ * Shared contract for database engines. PostgreSQL remains the default;
+ * query generation uses this contract for SQL primitives that vary by engine.
  */
 
 import { ValidationError } from './errors.js';
 import type { TurbineLogger } from './logger.js';
+import type { NativeStreamConnection } from './pg-types.js';
 import type { RowLockMode, WithOptions } from './query/types.js';
-import { coerceJsonWireValue, jsonWireCoercionOid } from './query/utils.js';
+import { coerceJsonWireValue, jsonWireCoercionOid } from './query-utils.js';
 import { pgArrayType, pgTypeToTs, type RelationDef, type SchemaMetadata, type TableMetadata } from './schema.js';
 
 export type DialectName = 'postgresql' | 'mysql' | 'sqlite' | (string & {});
@@ -240,12 +240,14 @@ export type ResultStrategy = 'returning' | 'output' | 'reselect';
  * Declared locally so {@link Dialect.openStream} stays free of an import cycle
  * back into `client.ts`.
  */
-export interface StreamableConnection {
+export interface StreamableConnection extends NativeStreamConnection {
   query(text: string, values?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
 }
 
 /** Options for {@link Dialect.openStream}. */
 export interface OpenStreamOptions {
+  /** Cancel a native network request, including a pull waiting for its first row. */
+  signal?: AbortSignal;
   /**
    * The connection is already inside a caller-owned transaction. Dialects that
    * would otherwise wrap the stream in their own transaction MUST emit no
@@ -420,6 +422,9 @@ export interface EngineCapabilities {
   /** `SELECT DISTINCT ON (...)`: findMany `distinct` and groupBy `distinctOn`. Else E017. */
   readonly distinctOn: boolean;
 
+  /** Explicit non-null scalar row-comparison cursors. Omission conservatively refuses them. */
+  readonly tupleCursorPredicate?: boolean;
+
   /**
    * The positional relation encoding (`json_build_array`, see
    * {@link Dialect.buildJsonArray}). One flag answers both questions about it:
@@ -427,6 +432,16 @@ export interface EngineCapabilities {
    * false, so the default can never pick an encoding the builder refuses.
    */
   readonly positionalJson: boolean;
+
+  /**
+   * Whether a JSON object the engine builds for a nested relation keeps its
+   * keys in the order the statement wrote them. PostgreSQL, SQLite and SQL
+   * Server do; MySQL returns them sorted by length, then bytes. Where true,
+   * object-encoded relation rows are decoded through a plan compiled once per
+   * query, which reads a row by position; where false they keep the generic
+   * walker, and no plan is built.
+   */
+  readonly jsonObjectKeysAsWritten: boolean;
 
   /** The `NULLS FIRST` / `NULLS LAST` ordering clause. Explicit `nulls` placement is E017 without it. */
   readonly nullsOrderingClause: boolean;
@@ -632,6 +647,22 @@ export interface EngineCapabilities {
    * (PostgreSQL), so the next statement is refused locally rather than sent.
    */
   readonly abortsTransactionOnError: boolean;
+
+  /**
+   * Turbine can tell the server's answer to a failed COMMIT from a COMMIT that
+   * got none: PostgreSQL's error response carries a SQLSTATE and a severity.
+   * Where true, a COMMIT with no such answer may have committed, so it is
+   * `TransactionOutcomeUnknownError` and no ROLLBACK follows it. Where false,
+   * the driver's error is rethrown and a cleanup ROLLBACK follows; a rollback
+   * is then reported only if that ROLLBACK is acknowledged, which settles the
+   * outcome on an engine that runs in process (SQLite keeps the transaction
+   * open after a failed COMMIT). False on SQL Server and PowDB too, whose
+   * answers Turbine does not classify: SQL Server's driver refuses a rollback
+   * once its commit has failed, and so does the networked PowDB adapter, so
+   * neither claims one. A driver's recovery policy (MySQL, the Neon WebSocket
+   * driver) settles its own transactions either way.
+   */
+  readonly classifiesCommitAnswer: boolean;
 
   /**
    * What connection object backs a transaction, for `tx.$connection()` and
@@ -867,7 +898,7 @@ export interface Dialect {
    * of the PostgreSQL PLAN CACHE, not of the SQL string, so a
    * Postgres-compatible dialect that grows one can opt in without editing
    * client.ts, and one that has the wire protocol but not the plan cache
-   * (which is why it is not simply inherited) can leave it off. Optional:
+   * (which is why it is not inherited) can leave it off. Optional:
    * absent is treated as `false`, so every engine that predates the flag keeps
    * throwing {@link UnsupportedFeatureError} (E017).
    *
@@ -1437,7 +1468,9 @@ export const postgresDialect: Dialect = {
   name: 'postgresql',
   capabilities: Object.freeze({
     distinctOn: true,
+    tupleCursorPredicate: true,
     positionalJson: true,
+    jsonObjectKeysAsWritten: true,
     nullsOrderingClause: true,
     nullsSortHigh: true,
     insensitiveInList: true,
@@ -1467,6 +1500,7 @@ export const postgresDialect: Dialect = {
     backendCancel: true,
     idleTransactionTimeout: true,
     abortsTransactionOnError: true,
+    classifiesCommitAnswer: true,
     connectionDriver: 'pg-compatible',
     preparesEveryStatement: false,
     statementSyntax: 'postgresql',

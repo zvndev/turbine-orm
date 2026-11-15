@@ -40,8 +40,8 @@ function extractSql(textOrConfig: string | { text: string }): string {
 /**
  * `pool.query()` returns a generic 1-row result so statement-level read/write
  * transforms don't throw. `connect()` clients return EMPTY rows so cursor
- * streams terminate immediately and pipeline/tx transforms stay harmless, we
- * only care that routing recorded the call before any transform ran.
+ * streams terminate immediately and pipeline/tx transforms stay harmless. Only
+ * routing recorded before any transform ran is relevant here.
  */
 function makeRecordingPool(label: string): RecordingPool {
   const pool: RecordingPool = {

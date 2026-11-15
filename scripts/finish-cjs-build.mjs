@@ -13,7 +13,7 @@
  * publint --strict rejects an `imports` field in a nested package.json. Edge
  * bundlers never reach this tree: every subpath export lists `import` before
  * `require`, and an edge build resolves the ESM files. So the CJS build is
- * Node-only and simply names the driver. `npm run check:edge` covers the ESM
+ * Node-only and names the driver. `npm run check:edge` covers the ESM
  * serverless entry, which is the one edge bundles load.
  *
  * Fails closed: the rewrite must find the expected sites, and no `require` of

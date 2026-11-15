@@ -1,7 +1,7 @@
 /**
  * Unit tests for the batched relation-loading strategy (relationLoadStrategy:
  * 'batched'). No database, a fake pg-compatible pool records every SQL string
- * and returns canned rows, so we can assert both the generated SQL shape (base
+ * and returns canned rows, to assert both the generated SQL shape (base
  * query has no json_agg; follow-ups use `= ANY($1)`) and the client-side
  * stitching, end to end through the real QueryInterface.
  */

@@ -415,8 +415,12 @@ describe('TurbineErrorCode', () => {
     assert.equal(TurbineErrorCode.INVARIANT_VIOLATION, 'TURBINE_E020');
   });
 
-  it('has exactly 20 error codes', () => {
-    assert.equal(Object.keys(TurbineErrorCode).length, 20);
+  it('has TRANSACTION_OUTCOME_UNKNOWN = TURBINE_E021', () => {
+    assert.equal(TurbineErrorCode.TRANSACTION_OUTCOME_UNKNOWN, 'TURBINE_E021');
+  });
+
+  it('has exactly 21 error codes', () => {
+    assert.equal(Object.keys(TurbineErrorCode).length, 21);
   });
 });
 
@@ -792,8 +796,8 @@ describe('wrapPgError', () => {
       assert.equal(wrapped.cause, err);
       assert.equal(wrapped.timeoutMs, 0, 'server-side cancel has no client-side budget');
       assert.ok(
-        wrapped.message.includes('Query canceled by server-side statement_timeout'),
-        'message should name the server-side statement_timeout cause',
+        wrapped.message.includes('cancelled on the server, by its `statement_timeout` or by a cancel request'),
+        'message should name both possible causes, since the SQLSTATE does not say which',
       );
     }
   });
@@ -972,8 +976,8 @@ describe('NotFoundError redaction modes', () => {
   it('default mode is "safe"', () => {
     // Constructor of TurbineClient sets the mode if config.errorMessages is
     // provided. The library default (no client constructed) should be safe.
-    // We can't reliably assert "safe" here if a previous test changed it, so
-    // we restore explicitly first.
+    // A previous test may have changed the mode, so restore "safe" explicitly
+    // before asserting its default behavior.
     setErrorMessageMode('safe');
     assert.equal(getErrorMessageMode(), 'safe');
     restore();

@@ -197,6 +197,16 @@ type Check = (op: string) => Promise<void>;
  * behavioural check.
  */
 const BEHAVIOR: Record<string, Check> = {
+  cursorPredicate: async (op) => {
+    await reseed();
+    const args = { cursor: { tenantId: 't1', id: 2 }, orderBy: { tenantId: 'asc' }, limit: 2 };
+    const expected = await run(db, op, args);
+    assert.ok(Array.isArray(expected) && expected.length === 2);
+    assert.deepEqual(await run(db, op, { ...args, cursorPredicate: 'tuple' }), expected);
+    await assert.rejects(run(db, op, { ...args, cursorPredicate: 'tuple', cursor: { id: 2 } }), {
+      code: 'TURBINE_E003',
+    });
+  },
   // --- predicate ----------------------------------------------------------
   where: async (op) => {
     await reseed();
@@ -317,7 +327,7 @@ const BEHAVIOR: Record<string, Check> = {
     );
 
     // A per-relation `where` filters children, not parents: parent 1 keeps its
-    // row and simply loses the non-matching children.
+    // row and loses the non-matching children.
     const filtered = (await run(db, 'findMany', {
       where: { id: 1 },
       with: { [REL]: { where: { label: 'g12' } } },

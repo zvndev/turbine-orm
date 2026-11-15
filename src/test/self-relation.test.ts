@@ -232,7 +232,7 @@ testFn('self-relation integration', () => {
   let schema: SchemaMetadata;
 
   before(async () => {
-    // Bootstrap a unique-named self-referencing table so we never clobber the
+    // Bootstrap a unique-named self-referencing table to avoid clobbering the
     // shared fixture (users/posts/comments/orgs).
     const setup = new TurbineClient({ connectionString: DATABASE_URL!, poolSize: 2 }, { tables: {}, enums: {} });
     await setup.connect();

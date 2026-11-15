@@ -359,7 +359,7 @@ src/
                       the returned ROW instead (its `returning` takes no column list).
                       `upsertLookupReason` (0.81) is the one authority on when `upsert()`
                       looks the row up instead of running `buildUpsert`'s statement
-                      (`where` not pinned to `create`, an empty `update`, a global filter
+                      (`where` not exactly one unique key pinned to `create`, an empty `update`, a global filter
                       on an engine without `supportsUpsertUpdateWhere`, and since 0.90
                       `other-unique-key` on MySQL: `ON DUPLICATE KEY UPDATE` has no
                       conflict target and updates whichever unique key collides first, so
@@ -546,7 +546,7 @@ src/
                       `upsertWhereMatchesCreate`, whether ONE conflict statement means what
                       the call says. `ON CONFLICT` compares the values it INSERTS (`create`'s)
                       and never reads `where`'s, so `where: { id: 5 }` with a keyless `create`
-                      inserted a new row on every call. Only when every `where` key is pinned
+                      inserted a new row on every call. Only when `where` is exactly one unique key and every key is pinned
                       to `create`'s value may an engine take its single-statement path;
                       otherwise it looks the row up by `where` in one transaction (Prisma's
                       contract). `false` is always safe (the lookup is correct for every
@@ -948,6 +948,20 @@ src/
                       the raw paths (via transaction-control.ts); raw `transaction()` keeps
                       SAVEPOINT / RELEASE / ROLLBACK TO.
 
+  transaction-outcome.ts, How every transaction on a connection of its own ends:
+                      `completeTransaction` (body, COMMIT, settlement) and
+                      `rollbackOnServer`, shared by client.ts and query/ (which
+                      cannot import client.ts) and pipeline.ts. A rollback is
+                      reported only on the server's word. An unanswered COMMIT on
+                      PostgreSQL, MySQL or Neon WebSocket is E021, with the
+                      connection discarded. SQL Server and PowDB retain the driver's
+                      COMMIT error. A
+                      release that throws never replaces the outcome. `api`
+                      undefined is Turbine's own transaction, whose statement
+                      timeout is reported as the transaction's outcome. A nested
+                      block whose ROLLBACK TO is not acknowledged dooms the outer
+                      transaction (`TransactionState.doom`), so no COMMIT follows.
+
   transaction-control.ts, Zero-import leaf (0.90): `findTransactionControl(sql, syntax)`
                       finds BEGIN / COMMIT / ROLLBACK / SAVEPOINT / RELEASE / SET
                       TRANSACTION / PREPARE TRANSACTION and the rest at statement STARTS,
@@ -1181,10 +1195,11 @@ src/
                         (`begin/commit/rollback/savepoint/buildSetSessionConfig`).
                       • `capabilities: EngineCapabilities` (0.90), REQUIRED: what the engine
                         can do, one fresh frozen literal per engine
-                        (`Object.freeze({ ... } satisfies EngineCapabilities)`), 35 keys:
-                        query shape (`distinctOn`, `positionalJson`, `nullsOrderingClause`,
+                        (`Object.freeze({ ... } satisfies EngineCapabilities)`), 37 required keys
+                        plus the optional `tupleCursorPredicate` (38 on PostgreSQL):
+                        query shape (`distinctOn`, optional `tupleCursorPredicate`, `positionalJson`, `nullsOrderingClause`,
                         `nullsSortHigh`, `insensitiveInList`), value semantics
-                        (`jsonDocumentEquality`, `jsonExtractTyped`, `jsonExactNumericCast`,
+                        (`jsonDocumentEquality`, `jsonObjectKeysAsWritten`, `jsonExtractTyped`, `jsonExactNumericCast`,
                         `numericTextComparison`, `enforcesForeignKeys`,
                         `utcTimestampRewrite`, `paramTypeCasts`, `namedEnumTypes`,
                         `structuredValueColumns`), writes (`maxBindParameters`,
@@ -1194,7 +1209,7 @@ src/
                         `partitionLimitPushdown`),
                         connections and transactions (`readOnlyTransactions`,
                         `connectionParameters`, `backendCancel`, `idleTransactionTimeout`,
-                        `abortsTransactionOnError`, `connectionDriver`,
+                        `abortsTransactionOnError`, `classifiesCommitAnswer`, `connectionDriver`,
                         `preparesEveryStatement`, `statementSyntax`, which picks the lexer
                         transaction-state.ts screens raw SQL with) and DDL (`inlineForeignKeys`,
                         `unboundedTextKeys`). Every site that asked `dialect.name ===
@@ -1586,7 +1601,7 @@ src/
                       names.
 
   errors.ts        , Error hierarchy rooted at TurbineError. Each error has a code
-                      (TURBINE_E001-E020). wrapPgError() translates pg driver errors
+                      (TURBINE_E001-E021). wrapPgError() translates pg driver errors
                       (23505, 23503, 23502, 23514, 23P01, 40P01, 40001) into typed
                       Turbine errors. 0.90: 42P05 and 26000 (a named prepared statement
                       the server connection already holds, or never prepared, which is
@@ -1970,9 +1985,10 @@ All errors extend `TurbineError` which carries a `code: TurbineErrorCode` proper
 | E015 | `OptimisticLockError` | Version mismatch on `optimisticLock` update |
 | E016 | `ExclusionConstraintError` | pg 23P01, via `wrapPgError()` |
 | E017 | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) invoked on an engine whose capability flag reports it unsupported, thrown directly, not via `wrapPgError()` |
-| E018 | `ReadOnlyError` | A write refused because the database is read-only, `reason: 'snapshot'` (PowDB snapshot serving / client-level `readonly: true` fail-fast) or `'rbac'` (read-only role). Thrown locally by the PowDB readonly guard and via `wrapPowdbError()` message families |
+| E018 | `ReadOnlyError` | A write refused because the database is read-only, `reason: 'snapshot'` (PowDB snapshot serving / client-level `readonly: true` fail-fast) or `'rbac'` (read-only role), or `'transaction'` (PostgreSQL 25006 and MySQL 1792). Thrown by local guards and driver error mapping |
 | E019 | `TransactionRolledBackError` | A transaction PostgreSQL rolled back instead of committing (the callback caught a failed statement, or a per-query timeout cancelled one); the first failure is `cause`. Deadlock, serialization and lock-not-available first failures keep their own class. Built by `rolledBackError` in transaction-state.ts; pg 25P02 also maps here via `wrapPgError()` as a fallback |
 | E020 | `InvariantError` | Turbine caught a bug in itself before sending a statement it knew was wrong: two internal paths that must agree did not (the SQL-template cache vs a fresh build, `invariant: 'sql-cache-lockstep'`; a cached entry whose param count differs from the params collected, `'sql-cache-param-count'`; a where scope built from an already-quoted reference, `'where-scope-reference'`; a relation payload that does not parse as JSON, `'relation-payload-json'`, both formerly E003; and in powql.ts a relation filter reaching `buildWhere` unresolved, `'powql-relation-filter-unresolved'`, a JSON string operator with no PowQL spelling, `'powql-json-operator'`, and a JSON filter that compiled to no condition, `'powql-json-filter-empty'`, formerly E003 with an `internal:` prefix; since 0.90.1 also any field filter that compiled to no condition, `'powql-filter-empty'`, which used to fall back to an always-false condition that `NOT` turned into every row). Thrown by the always-on cache prechecks in query/builder.ts, `aliasWhereScope` in where.ts, `parseNestedRow` in relations.ts and the three PowQL generator sites. Not retryable, not caused by the arguments; the message names the query shape and no value |
+| E021 | `TransactionOutcomeUnknownError` | A transaction's COMMIT got no answer Turbine could read (a `query_timeout`, a lost connection, a driver that refused it), so it may have committed. `completeTransaction` in transaction-outcome.ts, the ONE settlement for `$transaction`, `transaction()` and Turbine's own transactions (`inOneTransaction` / `runInImplicitTx` in query/builder.ts, the sequential pipeline), sends no ROLLBACK after it (a ROLLBACK only reports that no transaction is open) and discards the connection; the hiding failure is `cause`. Gated on `capabilities.classifiesCommitAnswer` (PostgreSQL only). An ERROR answer or the `ROLLBACK` tag is a confirmed rollback instead (`answeredWithError` in transaction-state.ts: severity `ERROR`, or for a non-English severity word a SQLSTATE in class 23, class 40 except 40003, or 57014; FATAL / PANIC are not, a backend can die after its commit). Not retryable, and a read does not settle it. MySQL (`classifiesCommitAnswer: false`) and Neon WS (the PostgreSQL dialect) classify unanswered COMMITs as E021 through their own `TransactionRecovery` policies; answered errors keep their typed class. SQLite and local libSQL return native engine failures. SQL Server and PowDB rethrow the driver's COMMIT error |
 
 `wrapPgError(err)` inspects the pg driver error's `.code` field and wraps it in the appropriate typed error, preserving the original as `.cause`. It is called in `client.ts` (raw queries, transaction pool proxy) and at query execution boundaries in `query/builder.ts`.
 
@@ -2005,7 +2021,7 @@ which exists because the previous copy asserted a snake_case column name was rej
 
 **Integration tests** need a PostgreSQL instance with seeded data. Set `DATABASE_URL` env var. The small correctness fixture is `src/test/fixtures/seed.sql` (8 users / 10 posts / 20 comments / 5 orgs). The larger benchmark seed lives in `benchmarks/seed-neon.ts` and defaults to 1K users / 10K posts / 50K comments (override via `USERS`/`POSTS_PER_USER`/`COMMENTS_PER_POST`). Tests that require a database are gated via the `skipGate()` helper in `src/test/helpers.ts` when `DATABASE_URL` is absent, each test registers with `{ skip }` so the reporter shows real skipped counts, not silent passes.
 
-**Coverage** is configured in `.c8rc.json`. It covers `src/**` but excludes `src/test/**`, `src/cli/**`, `src/generate.ts`, `src/introspect.ts`, `src/serverless.ts`, `src/index.ts`, and the three type-only modules that emit no runtime code (`src/query/deferred.ts`, `src/engine-config.ts`, `src/pg-types.ts`, each compiles to `export {};` and would only count as permanently-uncovered denominator). `src/query/types.ts` was excluded under that same rationale and no longer is: it carries the `UNSAFE` sentinel and the privilege-option guards, and measured 2026-09-06 it reads 99.67% lines on its own and RAISES the project figure from 96.98 to 97.09, so the exclusion was hiding well-tested runtime code rather than denominator noise. Thresholds: 93% lines, 78% functions, 89% branches, 93% statements. Those are MEASURED floors, re-baselined 2026-08-16 onto a corrected measurement: every earlier figure (75/59/85/75, and before it the aspirational 80/82/82/80 that had been failing continuously, which is how a permanently-red gate got normalized) was read under a broken coverage merge that understated the truth by about 20 points, see `//merge-bug` in `.c8rc.json`. `.c8rc.json` carries the measurements and the rule in its own `//` keys: raise as coverage improves, never lower one without recording why. `src/cli/**` is excluded HERE but has its own per-file gate, `npm run test:coverage:cli`, over ELEVEN files: `cli/studio.ts`, `cli/migrate.ts`, `cli/destructive.ts`, `cli/sql-statements.ts`, `cli/pii-predicate-guard.ts`, `cli/mcp.ts`, `cli/compile-query.ts`, `cli/error-catalog.ts`, `cli/local-server-guard.ts`, `cli/observe.ts` and `cli/index.ts`, each with its own floor (`cli/index.ts` is deliberately kept out of the aggregate pass, see `//cli-gate` in `.c8rc.json`); a new test file for any of them must be added to `coverage:cli:collect` in package.json or its coverage does not count. These numbers and this file list are asserted against `.c8rc.json` and package.json by `src/test/docs-claims-sync.test.ts`. THE TWO HALVES ARE SEPARATE, and both are required: a file added to `coverage:cli:collect` with no `coverage:cli:gate:<file>` of its own and no entry in `coverage:cli:gate:aggregate`'s `--include` list is COLLECTED and gated by nothing, i.e. a slower lane enforcing a floor of zero. That is what happened to mcp.ts and error-catalog.ts when they were first added.
+**Coverage** is configured in `.c8rc.json`. It covers `src/**` but excludes `src/test/**`, `src/cli/**`, `src/generate.ts`, `src/introspect.ts`, `src/serverless.ts`, `src/index.ts`, and the three type-only modules that emit no runtime code (`src/query/deferred.ts`, `src/engine-config.ts`, `src/pg-types.ts`, each compiles to `export {};` and would only count as permanently-uncovered denominator). `src/query/types.ts` was excluded under that same rationale and no longer is: it carries the `UNSAFE` sentinel and the privilege-option guards, and measured 2026-09-06 it reads 99.67% lines on its own and RAISES the project figure from 96.98 to 97.09, so the exclusion was hiding well-tested runtime code rather than denominator noise. Thresholds: 93% lines, 78% functions, 89% branches, 93% statements. Those are MEASURED floors, re-baselined 2026-08-16 onto a corrected measurement: every earlier figure (75/59/85/75, and before it the aspirational 80/82/82/80 that had been failing continuously, which is how a permanently-red gate got normalized) was read under a broken coverage merge that understated the truth by about 20 points, see `//merge-bug` in `.c8rc.json`. `.c8rc.json` carries the measurements and the rule in its own `//` keys: raise as coverage improves, never lower one without recording why. `src/cli/**` is excluded HERE but has its own per-file gate, `npm run test:coverage:cli`, over 16 files: `cli/studio.ts`, `cli/migrate.ts`, `cli/destructive.ts`, `cli/sql-statements.ts`, `cli/pii-predicate-guard.ts`, `cli/mcp.ts`, `cli/compile-query.ts`, `cli/error-catalog.ts`, `cli/local-server-guard.ts`, `cli/observe.ts`, `cli/index.ts`, `cli/sqlite-tools.ts`, `cli/tool-capabilities.ts`, `cli/tool-command.ts`, `cli/mssql-tools.ts` and `cli/loader.ts`, each with its own floor (`cli/index.ts` is deliberately kept out of the aggregate pass, see `//cli-gate` in `.c8rc.json`); a new test file for any of them must be added to `coverage:cli:collect` in package.json or its coverage does not count. These numbers and this file list are asserted against `.c8rc.json` and package.json by `src/test/docs-claims-sync.test.ts`. THE TWO HALVES ARE SEPARATE, and both are required: a file added to `coverage:cli:collect` with no `coverage:cli:gate:<file>` of its own and no entry in `coverage:cli:gate:aggregate`'s `--include` list is COLLECTED and gated by nothing, i.e. a slower lane enforcing a floor of zero. That is what happened to mcp.ts and error-catalog.ts when they were first added.
 
 ## Key Patterns
 
@@ -2052,7 +2068,7 @@ which exists because the previous copy asserted a snake_case column name was rej
 - Don't use `eval`, `new Function`, or shell interpolation
 - Don't `import pg from 'pg'` (or `pg/lib/*`) in any module the serverless entry reaches. Import the driver as `#pg` (package.json `imports`: real `pg` on Node and `workerd`, the `src/pg-edge.ts` shim under `edge-light`/`browser`). A static `pg` import in the shared graph breaks every edge build while every Node gate stays green; `npm run check:edge` is the guard. The CLI and the engine files are Node-only and keep plain `pg`.
 - Don't hand a caught error from `catch` to `finally` through a local (`catch (e) { err = wrap(e); throw err } finally { report(err) }`). SWC's minifier, which `next build` runs, drops that assignment. Report from inside the `catch`. `src/test/minified-events.test.ts` runs the event paths through SWC.
-- Don't reference internal project names, client names, the applications findings were reported from, or internal planning documents in ANY tracked file, code comments, test names, CHANGELOG, release notes, commit messages, site. This repo is public. Describe changes by what they do, never by who asked for them or where feedback came from. `docs/internal/` and `AGENTS.md` are gitignored (local-only); the pre-commit hook enforces a private blocklist via `scripts/check-private-terms.mjs` + `.private-terms`.
+- Don't reference internal project names, client names, the applications findings were reported from, or internal planning documents in ANY tracked file, code comments, test names, CHANGELOG, release notes, commit messages, site. This repo is public. Describe changes by what they do, never by who asked for them or where feedback came from. `docs/internal/` and `AGENTS.md` are gitignored (local-only); the pre-commit hook enforces a private blocklist via `scripts/check-private-terms.mjs` + `.private-terms`. Numbered planning labels, home-directory paths and machine checkout identifiers are also rejected in CI. Runtime workers, frozen objects and SQL admission checks remain valid software terminology.
 - Don't break the Prisma-like API (`findMany`, `findUnique`, `with`, `where`)
 - Don't put user values in SQL strings, always use `$N` parameterization
 - Don't import `client.ts` from `query/` or `cli/` (would create a circular dependency). Since 0.65 this is machine-enforced by `scripts/check-import-cycles.mjs` (`npm run check:cycles`, in CI's lint job and prepublishOnly): no value import, static OR dynamic (`await import('../client.js')` fails too since 0.90.1: a non-splitting bundler wraps the whole client graph in lazy-init closures for one, about 1 kB brotli per entry); `import type` and type-position `import('../client.js').X` are allowed. A runtime value query/ needs from client.ts is REGISTERED by client.ts when it is evaluated: `src/transaction-client-slot.ts` is how query/builder.ts gets `TransactionClient` for the implicit transaction of a nested write or lookup-first upsert. One slot per package copy (deliberately not `Symbol.for`: a builder must construct its own copy's class), and an empty slot (client.ts never loaded, e.g. a deep-imported `QueryInterface`) is E003 on that path only, before any checkout. The same script's pass 1b refuses a dynamic value import of ANY of the package's own modules from library code (src/ minus test/ and cli/), for the same size reason; optional peers load through `importOptionalPeer` with a bare specifier and are not matched.

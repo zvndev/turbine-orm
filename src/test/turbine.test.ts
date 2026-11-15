@@ -2116,7 +2116,7 @@ testFn('turbine integration tests', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 4. Middleware system comprehensive tests
+  // 4. Middleware system tests
   // ---------------------------------------------------------------------------
 
   describe('middleware system (comprehensive)', () => {
@@ -2266,7 +2266,7 @@ testFn('turbine integration tests', () => {
           }));
         }
         if (params.action === 'count' && typeof result === 'number') {
-          // Multiply count by -1 (silly, but proves we can transform)
+          // Multiply count by -1 (proves middleware can transform results)
           return result * -1;
         }
         return result;
@@ -2327,7 +2327,7 @@ testFn('turbine integration tests', () => {
   });
 
   // ---------------------------------------------------------------------------
-  // 5. orderBy direction validation (Task 6)
+  // 5. orderBy direction validation
   // ---------------------------------------------------------------------------
 
   describe('orderBy direction safety', () => {

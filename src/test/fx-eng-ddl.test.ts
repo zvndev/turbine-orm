@@ -31,6 +31,7 @@ import { schemaToSQL } from '../schema-sql.js';
 import { sqliteDialect } from '../sqlite.js';
 import { HAVE_NODE_SQLITE } from './fix-where-engines.js';
 import { skipGate } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 // biome-ignore lint/suspicious/noExplicitAny: tables are driven by name, with no generated types
 type Any = any;
@@ -285,7 +286,7 @@ const sqlite = skipGate(!HAVE_NODE_SQLITE, 'requires node:sqlite (Node >= 22.5)'
 describe('enum columns and defaults on SQLite', () => {
   sqlite.it('creates the table, stores the labels and defaults, and the CHECK refuses another label', async () => {
     const { DatabaseSync } = createRequire(process.cwd())('node:sqlite');
-    const raw = new DatabaseSync(':memory:');
+    const raw = closeSqliteAfter(new DatabaseSync(':memory:'));
     for (const stmt of schemaToSQL(def, { dialect: sqliteDialect })) raw.exec(stmt);
     const { turbineSqlite } = await import('../sqlite.js');
     const db = turbineSqlite(raw, schemaDefToMetadata(def), { warnOnUnlimited: false });

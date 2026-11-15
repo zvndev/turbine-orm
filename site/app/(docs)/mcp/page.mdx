@@ -1,7 +1,7 @@
 export const metadata = {
   title: 'MCP Server',
   description:
-    'Turbine ships a read-only Model Context Protocol server with eleven tools that show an agent your schema, relation names, query plans, compiled SQL and PII-safe sample rows.',
+    'Turbine ships a read-only Model Context Protocol server with twelve tools that show an agent your schema, relation names, query plans, compiled SQL and PII-safe sample rows.',
   alternates: { canonical: '/mcp' },
 };
 
@@ -44,12 +44,15 @@ Add the server to your project's `.mcp.json` for Claude Code, or `.cursor/mcp.js
 | `migrate_status` | Applied and pending migrations. |
 | `doctor_report` | Missing relation indexes, from the same advisor as [`turbine doctor`](/doctor). |
 | `explain_error` | A Turbine error code (`TURBINE_E003`, `E003` or `3`) with its class, causes, fix and docs link. Needs no database. |
+| `engine_capabilities` | The engine, runtime and transport facts for these tools. Opens no database. |
+
+Those are the twelve tools on PostgreSQL. With `--engine sqlite` or `--engine mysql` the server lists nine (no `migrate_status`, `explain_query` or `table_stats`), and with `--engine mssql` eight (also no `sample_rows`): SQL Server tools read the catalog and compile queries, and run no data query. SQLite tools open the file read-only and need Node 22.12+.
 
 `compile_query` takes a `table`, an `operation` (`findMany`, `findUnique`, `findFirst`, `count`, `aggregate` or `groupBy`) and the `args` you would pass that method. `explain_query` takes `table` plus optional `where`, `orderBy`, `limit` and `select`.
 
 ## Security model
 
-- Every database access runs in `BEGIN READ ONLY` with a 30-second statement timeout.
+- On PostgreSQL, every database access runs in `BEGIN READ ONLY` with a 30-second statement timeout.
 - No tool accepts SQL. Query tools take method arguments, and every name is checked against the live schema.
 - `sample_rows` never fetches a PII-tagged or secret-named column (`password`, `token`, `api_key` and similar, in any case style), and lists what it hid.
 - `explain_query` and `compile_query` refuse a `where` or `orderBy` on such a column, since a row estimate can reveal a value. They also refuse a [`lock`](/queries#row-locks) option.

@@ -7,7 +7,7 @@
  * redaction, the builder's nested-relation query, the live mode switcher, the
  * write flow, and per-launch isolation. No DATABASE_URL, no container, no server.
  *
- * `node:sqlite` is a builtin only on Node >= 22.5, so (like sqlite.test.ts) we
+ * `node:sqlite` is a builtin only on Node >= 22.5, so like sqlite.test.ts,
  * probe for it WITHOUT a static import and register every test skipped when it
  * is absent, rather than crashing the whole unit lane.
  */
@@ -21,6 +21,7 @@ import { join } from 'node:path';
 import { describe, it as nodeIt } from 'node:test';
 import { handleRequest, PII_REDACTED, type StudioContext, type StudioOptions } from '../cli/studio.js';
 import { createDemoContext } from '../cli/studio-demo.js';
+import { closeSqliteContextAfter } from './sqlite-fixture-lifetime.js';
 import { studioTestStateDir } from './studio-test-state.js';
 
 const STATE_DIR = studioTestStateDir();
@@ -109,7 +110,7 @@ const ORIGIN = `http://${HOST}:${PORT}`;
 const TOKEN = 'test-token';
 
 function makeDemoCtx(): StudioContext {
-  const demo = createDemoContext();
+  const demo = closeSqliteContextAfter(createDemoContext());
   const options: StudioOptions = {
     url: 'demo://in-memory',
     schema: 'public',

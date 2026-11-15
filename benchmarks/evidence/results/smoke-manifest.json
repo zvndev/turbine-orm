@@ -1,0 +1,1155 @@
+{
+  "schemaVersion": 1,
+  "semantics": "cross-engine-exact-effects-v1",
+  "performanceClaimsAllowed": false,
+  "classification": "smoke",
+  "source": {
+    "gitHead": "7ba8b52832adb4905850cf207f733e50702f8420",
+    "contentSha256": "aeecd2074358c45acb77178190e97d08175470743abcaed1418b65e53b1736a9"
+  },
+  "harnessSha256": "f0dfe91dd19ec0839df3b135e2f1384ef23094885b851332238c642d547f3b8a",
+  "installed": {
+    "drizzle-stable": "0.45.4",
+    "drizzle-candidate": "1.0.0-rc.5",
+    "pg": "8.23.1",
+    "mysql2": "3.24.6",
+    "mssql": "11.0.2",
+    "tsx": "4.23.15"
+  },
+  "runtime": {
+    "node": "v26.12.0",
+    "v8": "14.6.202.34-node.39",
+    "openssl": "3.5.9",
+    "sourcePg": "8.22.0"
+  },
+  "fixtureRows": 2048,
+  "batchSize": 128,
+  "rounds": 30,
+  "warmup": 5,
+  "limitations": [
+    "Smoke correctness/resource evidence only; no speed, superiority or general cross-engine conclusion.",
+    "Shared host; independent process runs reuse warm server/OS caches and are not cold-start measurements.",
+    "MySQL and SQL Server unavailability is not successful execution or certification.",
+    "Raw/Drizzle writes and Turbine writes share transaction/effect semantics but include different RETURNING/reselection work.",
+    "RSS samples are observed boundaries, not true peaks; process maxRSS is cumulative; local PG backend resources exclude shared workers.",
+    "No relations, JSON, decimal, temporal, concurrent load or Prisma workloads in this runner."
+  ],
+  "runs": [
+    {
+      "runId": "27ed02f0-4214-446b-8aad-a47f36f3a79f",
+      "at": "2026-11-06T05:15:52.624Z",
+      "resultSha256": "fee4a55be4283ef7c4f3447d9cb2d5a28a92b182cd61e84655ac4041d9c3a6cb",
+      "engines": [
+        {
+          "engine": "sqlite",
+          "status": "complete",
+          "actualServerVersion": "3.54.0",
+          "settings": {
+            "journalMode": "wal",
+            "synchronous": 2,
+            "foreignKeys": 1
+          },
+          "pool": {
+            "max": 1,
+            "sharedPhysicalPoolAcrossArms": true,
+            "concurrency": 1
+          },
+          "correctness": {
+            "exactRows": true,
+            "everyArmRollback": true,
+            "everyMeasuredEffect": true
+          },
+          "cleanup": "complete",
+          "controls": {
+            "wrongCellAndOrderRejected": true,
+            "wrongEffectRejected": true,
+            "probeMedianRatio": 1.0402127660256075,
+            "noiseFlag": false
+          },
+          "scenarios": [
+            {
+              "id": "page",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "point",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "transaction",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "native",
+              "consumption": "native-bounded-drain",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "transport": "node:sqlite iterate(), BEGIN/COMMIT, one handle; sampled every 128 rows",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "transport": "native SQLite iterator in batches; includes Turbine speculative LIMIT probe/transaction policy",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "engine": "postgresql",
+          "status": "complete",
+          "actualServerVersion": "18.6",
+          "settings": {
+            "isolation": "read committed",
+            "synchronous_commit": "on",
+            "fsync": "on",
+            "timezone": "UTC"
+          },
+          "pool": {
+            "max": 1,
+            "sharedPhysicalPoolAcrossArms": true,
+            "concurrency": 1
+          },
+          "correctness": {
+            "exactRows": true,
+            "everyArmRollback": true,
+            "everyMeasuredEffect": true
+          },
+          "cleanup": "complete",
+          "controls": {
+            "wrongCellAndOrderRejected": true,
+            "wrongEffectRejected": true,
+            "probeMedianRatio": 1.0385432947925342,
+            "noiseFlag": false
+          },
+          "scenarios": [
+            {
+              "id": "page",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "pg",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                }
+              ]
+            },
+            {
+              "id": "point",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "pg",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                }
+              ]
+            },
+            {
+              "id": "transaction",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "pg",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                }
+              ]
+            },
+            {
+              "id": "native",
+              "consumption": "native-bounded-drain",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "pg",
+                  "transport": "pg transaction cursor; FETCH 128; no speculative read; one max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "transport": "native pg cursor in batches; includes Turbine speculative LIMIT probe/transaction policy",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "engine": "mysql",
+          "status": "unavailable",
+          "reason": "EVIDENCE_MYSQL_ADMIN_URL unset; no server provisioned or certified"
+        },
+        {
+          "engine": "mssql",
+          "status": "unavailable",
+          "reason": "EVIDENCE_MSSQL_ADMIN_URL unset; no server provisioned or certified"
+        }
+      ]
+    },
+    {
+      "runId": "6dab7f55-9015-4a11-bf3e-8031eafce80a",
+      "at": "2026-11-06T05:16:21.371Z",
+      "resultSha256": "354dce6417cf2c54e16372ebd97f9ccf91ea88aa9224f814c1112155c706cbdd",
+      "engines": [
+        {
+          "engine": "sqlite",
+          "status": "complete",
+          "actualServerVersion": "3.54.0",
+          "settings": {
+            "journalMode": "wal",
+            "synchronous": 2,
+            "foreignKeys": 1
+          },
+          "pool": {
+            "max": 1,
+            "sharedPhysicalPoolAcrossArms": true,
+            "concurrency": 1
+          },
+          "correctness": {
+            "exactRows": true,
+            "everyArmRollback": true,
+            "everyMeasuredEffect": true
+          },
+          "cleanup": "complete",
+          "controls": {
+            "wrongCellAndOrderRejected": true,
+            "wrongEffectRejected": true,
+            "probeMedianRatio": 1.0946002511028643,
+            "noiseFlag": false
+          },
+          "scenarios": [
+            {
+              "id": "page",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "point",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "transaction",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "native",
+              "consumption": "native-bounded-drain",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "transport": "node:sqlite iterate(), BEGIN/COMMIT, one handle; sampled every 128 rows",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "transport": "native SQLite iterator in batches; includes Turbine speculative LIMIT probe/transaction policy",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "engine": "postgresql",
+          "status": "complete",
+          "actualServerVersion": "18.6",
+          "settings": {
+            "isolation": "read committed",
+            "synchronous_commit": "on",
+            "fsync": "on",
+            "timezone": "UTC"
+          },
+          "pool": {
+            "max": 1,
+            "sharedPhysicalPoolAcrossArms": true,
+            "concurrency": 1
+          },
+          "correctness": {
+            "exactRows": true,
+            "everyArmRollback": true,
+            "everyMeasuredEffect": true
+          },
+          "cleanup": "complete",
+          "controls": {
+            "wrongCellAndOrderRejected": true,
+            "wrongEffectRejected": true,
+            "probeMedianRatio": 0.8346129837587749,
+            "noiseFlag": false
+          },
+          "scenarios": [
+            {
+              "id": "page",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "pg",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                }
+              ]
+            },
+            {
+              "id": "point",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "pg",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                }
+              ]
+            },
+            {
+              "id": "transaction",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "pg",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                }
+              ]
+            },
+            {
+              "id": "native",
+              "consumption": "native-bounded-drain",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "pg",
+                  "transport": "pg transaction cursor; FETCH 128; no speculative read; one max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "transport": "native pg cursor in batches; includes Turbine speculative LIMIT probe/transaction policy",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "engine": "mysql",
+          "status": "unavailable",
+          "reason": "EVIDENCE_MYSQL_ADMIN_URL unset; no server provisioned or certified"
+        },
+        {
+          "engine": "mssql",
+          "status": "unavailable",
+          "reason": "EVIDENCE_MSSQL_ADMIN_URL unset; no server provisioned or certified"
+        }
+      ]
+    },
+    {
+      "runId": "d5cbdead-c34d-4f7e-b548-24a7342f083a",
+      "at": "2026-11-06T05:16:50.638Z",
+      "resultSha256": "bede5926ec200cea33e6c2840c31823e35d7568c5986c85050bb19757ef62532",
+      "engines": [
+        {
+          "engine": "sqlite",
+          "status": "complete",
+          "actualServerVersion": "3.54.0",
+          "settings": {
+            "journalMode": "wal",
+            "synchronous": 2,
+            "foreignKeys": 1
+          },
+          "pool": {
+            "max": 1,
+            "sharedPhysicalPoolAcrossArms": true,
+            "concurrency": 1
+          },
+          "correctness": {
+            "exactRows": true,
+            "everyArmRollback": true,
+            "everyMeasuredEffect": true
+          },
+          "cleanup": "complete",
+          "controls": {
+            "wrongCellAndOrderRejected": true,
+            "wrongEffectRejected": true,
+            "probeMedianRatio": 1.0927596577265484,
+            "noiseFlag": false
+          },
+          "scenarios": [
+            {
+              "id": "page",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "point",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "transaction",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "native",
+              "consumption": "native-bounded-drain",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "transport": "node:sqlite iterate(), BEGIN/COMMIT, one handle; sampled every 128 rows",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "transport": "native SQLite iterator in batches; includes Turbine speculative LIMIT probe/transaction policy",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "engine": "postgresql",
+          "status": "complete",
+          "actualServerVersion": "18.6",
+          "settings": {
+            "isolation": "read committed",
+            "synchronous_commit": "on",
+            "fsync": "on",
+            "timezone": "UTC"
+          },
+          "pool": {
+            "max": 1,
+            "sharedPhysicalPoolAcrossArms": true,
+            "concurrency": 1
+          },
+          "correctness": {
+            "exactRows": true,
+            "everyArmRollback": true,
+            "everyMeasuredEffect": true
+          },
+          "cleanup": "complete",
+          "controls": {
+            "wrongCellAndOrderRejected": true,
+            "wrongEffectRejected": true,
+            "probeMedianRatio": 0.33786153643103917,
+            "noiseFlag": true
+          },
+          "scenarios": [
+            {
+              "id": "page",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "pg",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                }
+              ]
+            },
+            {
+              "id": "point",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "pg",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                }
+              ]
+            },
+            {
+              "id": "transaction",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "pg",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-postgres on the same max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                }
+              ]
+            },
+            {
+              "id": "native",
+              "consumption": "native-bounded-drain",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "pg",
+                  "transport": "pg transaction cursor; FETCH 128; no speculative read; one max=1 pool",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "transport": "native pg cursor in batches; includes Turbine speculative LIMIT probe/transaction policy",
+                  "samples": 30,
+                  "clientCpuAndRssSamples": 30,
+                  "attributedLocalServerSamples": 30
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "engine": "mysql",
+          "status": "unavailable",
+          "reason": "EVIDENCE_MYSQL_ADMIN_URL unset; no server provisioned or certified"
+        },
+        {
+          "engine": "mssql",
+          "status": "unavailable",
+          "reason": "EVIDENCE_MSSQL_ADMIN_URL unset; no server provisioned or certified"
+        }
+      ]
+    }
+  ]
+}

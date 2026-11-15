@@ -1,625 +1,623 @@
 /**
- * Turbine ORM interleaved benchmark harness.
+ * Interleaved headline suite. Every selected arm passes an exact independent
+ * preflight before warmup or timing. See README.md for setup and semantics.
  *
- * Why this exists alongside bench.ts:
- *   bench.ts measures each ORM in a contiguous block (all 200 Turbine
- *   iterations, then all 200 Prisma, then all 200 Drizzle). Any drift over the
- *   life of the process (JIT state, page cache, autovacuum, thermal) is
- *   attributed to whichever arm happened to occupy that slice of wall clock.
- *
- *   This harness runs every arm ONCE PER ROUND, rotating the arm order each
- *   round, and reports the MEDIAN across rounds. It also runs a hand-written
- *   raw-SQL control arm in most scenarios, so the residual drift and the ORM
- *   overhead above raw pg can both be quantified.
- *
- * Run:
- *   DATABASE_URL="postgresql:///turbine_bench?host=/tmp" npx tsx bench-interleaved.ts
- *
- * Env:
- *   ROUNDS=200      interleaved rounds per scenario
- *   WARMUP=20       warmup calls per arm per scenario
- *   STREAM_ROUNDS=15 interleaved rounds for the 50K streaming scenario
- *   INCLUDE_RC=1    add a fifth arm, drizzle-orm 1.0.0-rc.4 with its JIT row
- *                   mapper enabled (see below)
- *
- * On INCLUDE_RC, and why it is a switch rather than always on:
- *
- *   Adding an arm is not free for the OTHER arms. Every arm runs once per round,
- *   so a fifth arm puts one more competitor's working set between each arm's
- *   consecutive calls. Measured directly while profiling 0.70.0, the identical
- *   Turbine L2 query costs 1.28 ms when the only other arms are its own phases
- *   and 2.34 ms when two Drizzle arms rotate between its calls. That is not
- *   noise, it is cache eviction, and it means a 5-arm suite CANNOT be compared
- *   number-for-number against the published 4-arm suite.
- *
- *   So the default stays exactly the four arms 0.50.0 and 0.66.0 measured, and
- *   the RC is run as a separate 5-arm suite. Both are reported. Within either
- *   suite every arm is on equal footing, which is what the interleaving is for;
- *   it is only ACROSS suites that absolute values must not be mixed.
+ * DATABASE_URL=postgres://localhost:5432/turbine_bench npx tsx bench-interleaved.ts
+ * ROUNDS=200 WARMUP=20 STREAM_ROUNDS=15 INCLUDE_RC=1
+ * TURBINE_JSON=object|positional TURBINE_STREAM=rows|batches
  */
-
+import { writeFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+import { PrismaPg } from '@prisma/adapter-pg';
+import { PrismaClient } from '@prisma/client';
+import { asc, count, desc, eq, gt, sql } from 'drizzle-orm';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import { asc as rcAsc, count as rcCount, eq as rcEq, gt as rcGt, sql as rcSql } from 'drizzle-rc';
+import { drizzle as drizzleRc } from 'drizzle-rc/node-postgres';
+import { makeDefaultRqbMapper, makeJitRqbMapper } from 'drizzle-rc/relations';
 import pg from 'pg';
 import { TurbineClient } from '../generated/turbine/index.js';
-import { PrismaClient } from '@prisma/client';
-import { PrismaPg } from '@prisma/adapter-pg';
-import { drizzle } from 'drizzle-orm/node-postgres';
-import { eq, count as drizzleCount, gt, asc, sql } from 'drizzle-orm';
+import { type Arm, Bench } from './bench-harness.js';
+import { dashboardOrder, dashboardReads, rawDashboard, turbineDashboard } from './dashboard.js';
+import { assertExact, type HeadlineScenario, headlineNames, verifyHeadline } from './equivalence.js';
 import * as schema from './schema.js';
-import { drizzle as drizzleRc } from 'drizzle-rc/node-postgres';
-import {
-  eq as rcEq,
-  count as rcCount,
-  gt as rcGt,
-  asc as rcAsc,
-  sql as rcSql,
-} from 'drizzle-rc';
-import { makeJitRqbMapper } from 'drizzle-rc/relations';
 import * as rcSchema from './schema-rc.js';
-import { Bench } from './bench-harness.js';
+import { observedPgIdentity } from './pg-admission.js';
+import { HEADLINE_SEMANTICS } from './semantics.js';
 
-const DATABASE_URL = process.env['DATABASE_URL'] ?? 'postgres://localhost:5432/turbine_bench';
-const ROUNDS = parseInt(process.env['ROUNDS'] ?? '200', 10);
-const WARMUP = parseInt(process.env['WARMUP'] ?? '20', 10);
-/**
- * 15, not 9.
- *
- * Nine rounds is the smallest sample anywhere in this suite (every other
- * scenario runs 200) and it is spent on the LONGEST scenario, where a single
- * scheduler stall is a whole-round outlier rather than something a median can
- * absorb. On a quiet box nine is enough and the p95 sits within ~10% of the
- * median; on a contended one the same nine rounds produced medians that moved
- * by more than the difference the scenario is trying to resolve.
- *
- * 15 is what `RESULTS-0.72.0.md` used for exactly this drain, so this is the
- * suite catching up with the repo's own precedent rather than a new number. The
- * cost is about six extra seconds.
- */
-const STREAM_ROUNDS = parseInt(process.env['STREAM_ROUNDS'] ?? '15', 10);
-const INCLUDE_RC = process.env['INCLUDE_RC'] === '1';
-/**
- * `TURBINE_JSON` overrides the Turbine arm's relation JSON wire encoding.
- *
- * UNSET IS THE POINT. Unset, the option is not passed at all and the arm runs
- * on whatever the shipping client defaults to, which is what a user actually
- * gets. That is the only configuration whose numbers may be published as
- * "Turbine". Pinning it here to a literal would mean the harness kept
- * measuring the encoding that was the default on the day the line was written,
- * and would silently go on reporting it after the default moved: exactly the
- * stale-arm failure `verify-arms.ts` exists to catch elsewhere.
- *
- * Set it to `object` or `positional` to force one encoding. Both are shipped
- * options rather than benchmark-only fast paths, and neither changes the arm
- * count, so a forced run is directly comparable to an unset one. Forcing
- * `object` is how the OLD PostgreSQL default is priced now that `positional`
- * has taken over.
- */
-/**
- * `TURBINE_STREAM=batches` points the Turbine STREAM arm at
- * `findManyStreamBatches` instead of `findManyStream`.
- *
- * It is a DIFFERENT API, not a faster version of the same one, and the reason
- * it gets a switch rather than a fifth arm is the same reason INCLUDE_RC does:
- * adding an arm changes what every other arm's cache sees, so a 5-arm number
- * cannot be compared to the 4-arm table. Swapping which method the existing arm
- * calls keeps the arm count at four and changes exactly one thing.
- *
- * `findManyStream` is UNCHANGED in this release, so the default stream arm is
- * expected to sit where it sat. A batch run must therefore be labelled as the
- * batch API's number and never presented as the per-row API improving.
- */
-const TURBINE_STREAM_RAW = process.env['TURBINE_STREAM'];
-if (TURBINE_STREAM_RAW !== undefined && TURBINE_STREAM_RAW !== 'rows' && TURBINE_STREAM_RAW !== 'batches') {
-  console.error(`TURBINE_STREAM must be 'rows' or 'batches', got ${JSON.stringify(TURBINE_STREAM_RAW)}.`);
-  process.exit(1);
-}
-const TURBINE_STREAM = TURBINE_STREAM_RAW === 'batches' ? 'batches' : 'rows';
+const BATCH = 1000;
 
-const TURBINE_JSON_RAW = process.env['TURBINE_JSON'];
-if (TURBINE_JSON_RAW !== undefined && TURBINE_JSON_RAW !== 'object' && TURBINE_JSON_RAW !== 'positional') {
-  console.error(`TURBINE_JSON must be 'object' or 'positional', got ${JSON.stringify(TURBINE_JSON_RAW)}.`);
-  process.exit(1);
-}
-const TURBINE_JSON = TURBINE_JSON_RAW as 'object' | 'positional' | undefined;
-
-async function main() {
-  const bench = new Bench({ rounds: ROUNDS, warmup: WARMUP });
-  console.log('Interleaved harness: every arm once per round, order rotated per round, medians reported.');
-  console.log(`ROUNDS=${ROUNDS} WARMUP=${WARMUP} STREAM_ROUNDS=${STREAM_ROUNDS} Node ${process.version}`);
-
-  const turbine = new TurbineClient({
-    connectionString: DATABASE_URL,
-    logging: false,
-    // Spread, so an unset TURBINE_JSON passes NO key and the client default
-    // stands. `jsonEncoding: undefined` would also fall through to the default
-    // today, but it asserts nothing, and the value being measured is too
-    // important to rest on a `??` staying where it is.
-    ...(TURBINE_JSON ? { jsonEncoding: TURBINE_JSON } : {}),
-  });
-  await turbine.connect();
-
-  /**
-   * Report the encoding that was actually EMITTED, read out of the SQL, not the
-   * one we believe we configured.
-   *
-   * The whole reason this run exists is that a default moved in src/. A harness
-   * that prints its own input would have happily printed "default" while
-   * benchmarking a stale dist/ (the arm resolves `turbine-orm` through
-   * benchmarks/node_modules -> ../.. -> dist/, so an unbuilt tree measures old
-   * code and says nothing). buildFindMany compiles the statement without
-   * executing it, so this costs one SQL build and cannot be fooled.
-   */
-  const relationSql = (turbine.users.buildFindMany({ limit: 1, with: { posts: true } }) as { sql: string }).sql;
-  const emitted = relationSql.includes('json_build_array')
-    ? 'positional'
-    : relationSql.includes('json_build_object')
-      ? 'object'
-      : 'unknown';
-  if (emitted === 'unknown') {
-    console.error('Could not determine the relation JSON encoding from the emitted SQL. Refusing to report numbers.');
-    process.exit(1);
-  }
-  if (TURBINE_JSON && emitted !== TURBINE_JSON) {
-    console.error(`TURBINE_JSON=${TURBINE_JSON} but the emitted SQL is ${emitted}. Refusing to report numbers.`);
-    process.exit(1);
-  }
-  console.log(
-    `Turbine arm: jsonEncoding='${emitted}' (${TURBINE_JSON ? 'forced via TURBINE_JSON' : 'client default'}), verified from emitted SQL.`,
-  );
-  if (TURBINE_STREAM === 'batches') {
-    console.log("Turbine stream arm: findManyStreamBatches (BATCH API, not the default findManyStream).");
-  }
-
-  const prismaPool = new pg.Pool({ connectionString: DATABASE_URL, max: 10 });
-  const prisma = new PrismaClient({ adapter: new PrismaPg(prismaPool) });
-
-  const drizzlePool = new pg.Pool({ connectionString: DATABASE_URL, max: 10 });
-  const drizzleDb = drizzle(drizzlePool, { schema });
-
-  const rawPool = new pg.Pool({ connectionString: DATABASE_URL, max: 10 });
-
-  // Drizzle 1.0.0-rc.4. NOTE the object form: `drizzleRc(pool, config)` is
-  // accepted at runtime but destructures `client`/`connection` off the POOL,
-  // finds neither, builds a brand-new default pg.Pool, and DISCARDS the config,
-  // so `relations` and `jit` are silently dropped. That failure is invisible
-  // except that the JIT assertion below catches it.
-  const rcPool = new pg.Pool({ connectionString: DATABASE_URL, max: 10 });
-  const rcDb = drizzleRc({ client: rcPool, relations: rcSchema.relations, jit: true });
-
-  if (INCLUDE_RC) {
-    // `jit: true` is passed through `jitCompatCheck`, which falls back to the
-    // premade mappers if `new Function` is unavailable. Publishing a fallback
-    // run as a JIT result would be a fabricated number, so engagement is
-    // asserted by identity against the library's own exported generator rather
-    // than inferred from the flag we passed in.
-    const gen = (rcDb as unknown as { dialect?: { mapperGenerators?: { relationalRows?: unknown } } })
-      .dialect?.mapperGenerators?.relationalRows;
-    if (gen !== makeJitRqbMapper) {
-      console.error(
-        `Drizzle RC arm is NOT using the JIT mapper (got ${(gen as { name?: string })?.name}). ` +
-          'Refusing to report it as a JIT result.',
-      );
-      process.exit(1);
-    }
-    console.log('Drizzle RC arm: JIT row mapper engagement verified.');
-  }
-
-  /** Append the Drizzle RC arm only when the 5-arm suite was asked for. */
-  const withRc = <T extends { name: string; fn: (i: number) => unknown }>(
-    arms: T[],
-    rcArm: T,
-  ): T[] => (INCLUDE_RC ? [...arms, rcArm] : arms);
-
-  const u = await turbine.users.count();
-  const p = await turbine.posts.count();
-  const c = await turbine.comments.count();
-  console.log(`Data: ${u} users, ${p} posts, ${c} comments`);
-  if (u !== 1000 || p !== 10000 || c !== 50000) {
-    console.error('SEED MISMATCH, expected 1000/10000/50000. Refusing to report numbers.');
-    process.exit(1);
-  }
-
-  // Drift probe, run at the head and the tail of the suite. The difference
-  // between the two is the residual drift floor for this process.
-  const driftProbe = (label: string) => bench.driftProbe(rawPool, label);
-
-  const driftHead = await driftProbe('head');
-
-  // 1. findMany flat
-  await bench.interleave('findMany, 100 users (flat)', withRc([
-    { name: 'Turbine', fn: () => turbine.users.findMany({ limit: 100 }) },
-    { name: 'Prisma 7', fn: () => prisma.user.findMany({ take: 100 }) },
-    { name: 'Drizzle', fn: () => drizzleDb.query.users.findMany({ limit: 100 }) },
-    { name: 'Raw', fn: () => rawPool.query('SELECT * FROM users LIMIT 100') },
-  ], { name: 'Drizzle RC', fn: () => rcDb.query.users.findMany({ limit: 100 }) }));
-
-  // 2. findMany L2
-  //
-  // THE RAW CONTROL IS ENCODING-MATCHED TO THE TURBINE ARM, and it has to be.
-  //
-  // This arm exists to answer "what does Turbine cost above hand-written pg".
-  // It was written when Turbine emitted `json_build_object`, so it spelled the
-  // nested aggregate that way too. When positional encoding became the
-  // PostgreSQL default in 0.71.0, the control silently stopped matching the arm
-  // it controls for: measured directly on identical rows, the object spelling
-  // costs 1.83x the array spelling (`raw-l2-encoding.ts`). The control was
-  // therefore doing strictly more work than the ORM it bounds, and Turbine's L2
-  // "overhead" computed to 0.90x, i.e. faster than hand-written SQL. That
-  // reading is not supportable, and `RESULTS-0.71.0.md` had to publish a
-  // derived 1.08x instead of the recorded 1.00x to avoid quoting it.
-  //
-  // The fix is not to hard-code the array spelling, because then the
-  // `TURBINE_JSON=object` control run would be mismatched in the other
-  // direction. The statement follows `emitted`, which was read out of Turbine's
-  // own compiled SQL above, so the control is matched in BOTH configurations
-  // and no future encoding change can silently unmatch it again.
-  //
-  // THE CONTROL ALSO DECODES WHAT IT FETCHES. Left as the bare query, the raw
-  // arm handed back nested ARRAYS with timestamps as strings, which no
-  // application can use, while every ORM arm returns one object per post with
-  // Date timestamps. The control then bounded a cheaper job than the one being
-  // measured: Turbine AND Drizzle both read as 2.2x "hand-written SQL" here, and
-  // that one scenario was the whole difference between a 1.06x and a 1.16x
-  // overhead geomean. `decodeRawL2` does what hand-written code must do before
-  // it can use the rows (objects, camelCase keys, Dates) and nothing more: the
-  // top-level user rows stay exactly as node-postgres returns them.
-  const RAW_L2_OBJECT = `
-    SELECT u.*, COALESCE((
-      SELECT json_agg(json_build_object('id', p.id, 'userId', p.user_id, 'orgId', p.org_id,
-        'title', p.title, 'content', p.content, 'published', p.published,
-        'viewCount', p.view_count, 'createdAt', p.created_at, 'updatedAt', p.updated_at))
-      FROM posts p WHERE p.user_id = u.id), '[]'::json) AS posts
-    FROM users u LIMIT 50`;
-
-  const RAW_L2_ARRAY = `
-    SELECT u.*, COALESCE((
-      SELECT json_agg(json_build_array(p.id, p.user_id, p.org_id,
-        p.title, p.content, p.published,
-        p.view_count, p.created_at, p.updated_at))
-      FROM posts p WHERE p.user_id = u.id), '[]'::json) AS posts
-    FROM users u LIMIT 50`;
-
-  const rawL2 = emitted === 'positional' ? RAW_L2_ARRAY : RAW_L2_OBJECT;
-  console.log(
-    `Raw L2 control: ${emitted === 'positional' ? 'json_build_array' : 'json_build_object'}, ` +
-      `encoding-matched to the Turbine arm.`,
-  );
-
-  // The two spellings must return the same data, or the control is measuring a
-  // different query rather than a different encoding. Checked here, once,
-  // before anything is timed: same parent count, same total child count.
-  {
-    const [objRes, arrRes] = await Promise.all([
-      rawPool.query(RAW_L2_OBJECT),
-      rawPool.query(RAW_L2_ARRAY),
-    ]);
-    const childCount = (rows: any[], key: string) =>
-      rows.reduce((n, r) => n + (r[key] as unknown[]).length, 0);
-    const objChildren = childCount(objRes.rows, 'posts');
-    const arrChildren = childCount(arrRes.rows, 'posts');
-    if (objRes.rows.length !== arrRes.rows.length || objChildren !== arrChildren) {
-      console.error(
-        `Raw L2 encoding check FAILED: object ${objRes.rows.length} rows/${objChildren} children, ` +
-          `array ${arrRes.rows.length} rows/${arrChildren} children. Refusing to report numbers.`,
-      );
-      process.exit(1);
-    }
-    console.log(
-      `Raw L2 encoding check: both spellings return ${objRes.rows.length} rows / ${objChildren} children.`,
-    );
-  }
-  const toDate = (v: unknown) => (v == null ? v : new Date(v as string));
-  type RawPost = unknown[] | Record<string, unknown>;
-  const decodePost = (p: RawPost) =>
-    Array.isArray(p)
-      ? {
-          id: p[0], userId: p[1], orgId: p[2], title: p[3], content: p[4], published: p[5],
-          viewCount: p[6], createdAt: toDate(p[7]), updatedAt: toDate(p[8]),
-        }
-      : { ...p, createdAt: toDate(p.createdAt), updatedAt: toDate(p.updatedAt) };
-  const decodeRawL2 = async () => {
-    const res = await rawPool.query(rawL2);
-    for (const row of res.rows) row.posts = (row.posts as RawPost[]).map(decodePost);
-    return res.rows;
+export async function runHeadline(
+  options: {
+    verifyOnly?: boolean;
+    includeNoJit?: boolean;
+    mutate?: (scenarios: HeadlineScenario[]) => void;
+    reportPath?: string;
+  } = {},
+) {
+  const report = {
+    headlineSemantics: HEADLINE_SEMANTICS,
+    provenance: observedPgIdentity(),
+    runtime: observedPgIdentity()?.runtime ?? { node: process.version, executable: process.execPath },
+    settings: { rounds: 0, warmup: 0, streamRounds: 0 },
+    armProfile: options.includeNoJit ? ('rc-nojit-control' as const) : ('original' as const),
+    status: 'running',
+    timing: !options.verifyOnly,
+    catalog: [] as { scenario: string; arms: string[]; note?: string }[],
+    results: [] as Bench['results'],
+    cleanup: { closed: false },
+    error: undefined as string | undefined,
+    driftSamples: [] as Bench['probes'],
+    driftHead: undefined as number | undefined,
+    driftMid: undefined as number | undefined,
+    driftTail: undefined as number | undefined,
   };
+  const url = process.env['DATABASE_URL'] ?? 'postgres://localhost:5432/turbine_bench';
+  const rounds = parseInt(process.env['ROUNDS'] ?? '200', 10);
+  const warmup = parseInt(process.env['WARMUP'] ?? '20', 10);
+  const streamRounds = parseInt(process.env['STREAM_ROUNDS'] ?? '15', 10);
+  report.settings = { rounds, warmup, streamRounds };
+  const includeRc = options.includeNoJit || process.env['INCLUDE_RC'] !== '0';
+  const json = process.env['TURBINE_JSON'];
+  const stream = process.env['TURBINE_STREAM'] ?? 'rows';
+  if (json !== undefined && json !== 'object' && json !== 'positional')
+    throw new Error('TURBINE_JSON must be object or positional');
+  if (stream !== 'rows' && stream !== 'batches') throw new Error('TURBINE_STREAM must be rows or batches');
+  for (const [key, n] of Object.entries({ ROUNDS: rounds, WARMUP: warmup, STREAM_ROUNDS: streamRounds })) {
+    if (!Number.isSafeInteger(n) || n < (key === 'WARMUP' ? 0 : 1)) throw new Error(`${key} has an invalid count`);
+  }
+  // Every measured PG arm uses this benchmark's locked driver and pool limit.
+  // The package's default-owned driver profile is a separate comparison.
+  const pools = Array.from({ length: 6 }, () => new pg.Pool({ connectionString: url, max: 10 }));
+  const [prismaPool, drizzlePool, rawPool, rcPool, noJitPool, turbinePool] = pools as [
+    pg.Pool,
+    pg.Pool,
+    pg.Pool,
+    pg.Pool,
+    pg.Pool,
+    pg.Pool,
+  ];
+  const turbine = new TurbineClient({
+    pool: turbinePool,
+    preparedStatements: true,
+    logging: false,
+    ...(json ? { jsonEncoding: json } : {}),
+  });
+  const prisma = new PrismaClient({ adapter: new PrismaPg(prismaPool) });
+  const drizzleDb = drizzle(drizzlePool, { schema });
+  const rcDb = drizzleRc({ client: rcPool, relations: rcSchema.relations, jit: true });
+  const noJitDb = drizzleRc({ client: noJitPool, relations: rcSchema.relations, jit: false });
+  let failure: unknown;
+  try {
+    await turbine.connect();
+    if (turbine.pool !== turbinePool || !turbine.users.buildFindMany({ limit: 1 }).preparedName)
+      throw new Error('Benchmark requires the matched supplied-pool and named Turbine statement profile.');
+    const relationSql = turbine.users.buildFindMany({ limit: 1, with: { posts: true } }).sql;
+    const emitted = relationSql.includes('json_build_array')
+      ? 'positional'
+      : relationSql.includes('json_build_object')
+        ? 'object'
+        : 'unknown';
+    if (emitted === 'unknown' || (json && emitted !== json))
+      throw new Error('Relation JSON encoding does not match the requested arm');
+    console.log(`Turbine arm: jsonEncoding='${emitted}' (${json ? 'forced' : 'client default'}), stream=${stream}`);
+    console.log(
+      'PG pool profile: shared locked pg driver, separate pools, max=10; Turbine uses a caller-owned pool and named statements.',
+    );
+    if (includeRc) {
+      const mapper = (db: unknown) =>
+        (db as { dialect?: { mapperGenerators?: { relationalRows?: unknown } } }).dialect?.mapperGenerators
+          ?.relationalRows;
+      if (mapper(rcDb) !== makeJitRqbMapper) throw new Error('Drizzle RC JIT mapper is not engaged');
+      if (options.includeNoJit && mapper(noJitDb) !== makeDefaultRqbMapper)
+        throw new Error('RC no-jit control is not using the default mapper');
+      const probe = makeJitRqbMapper({
+        selection: [{ key: 'id', field: rcSchema.users.id, fieldType: 'Column' }],
+        isFirst: false,
+        parseJson: false,
+        parseJsonIfString: false,
+        rootJsonMappers: false,
+        arrayModeRoot: false,
+      });
+      const body = (probe as typeof probe & { body?: string }).body;
+      if (!body?.includes('jitRqbMapper')) throw new Error('RC JIT mapper did not produce a compiled function body');
+    }
+    // The no-jit control uses every RC arm definition below, changing only its client.
+    const rcClients = includeRc
+      ? [
+          { name: 'Drizzle RC', db: rcDb },
+          ...(options.includeNoJit ? [{ name: 'Drizzle RC (no jit)', db: noJitDb }] : []),
+        ]
+      : [];
+    const scenarios: HeadlineScenario[] = [];
+    const add = (
+      index: number,
+      arms: Arm[],
+      rc: (db: typeof rcDb) => Arm['fn'],
+      extra?: HeadlineScenario['options'],
+    ) => {
+      scenarios.push({
+        scenario: headlineNames[index]!,
+        arms: [...arms, ...rcClients.map(({ name, db }) => ({ name, fn: rc(db) }))],
+        options: extra,
+      });
+    };
+    add(
+      0,
+      [
+        { name: 'Turbine', fn: () => turbine.users.findMany({ limit: 100, orderBy: { id: 'asc' } }) },
+        { name: 'Prisma 7', fn: () => prisma.user.findMany({ take: 100, orderBy: { id: 'asc' } }) },
+        { name: 'Drizzle', fn: () => drizzleDb.query.users.findMany({ limit: 100, orderBy: asc(schema.users.id) }) },
+        { name: 'Raw', fn: () => rawPool.query('SELECT * FROM users ORDER BY id ASC LIMIT 100') },
+      ],
+      (db) => () => db.query.users.findMany({ limit: 100, orderBy: { id: 'asc' } }),
+    );
 
-  await bench.interleave('findMany, 50 users + posts (L2)', withRc([
-    { name: 'Turbine', fn: () => turbine.users.findMany({ limit: 50, with: { posts: true } }) },
-    { name: 'Prisma 7', fn: () => prisma.user.findMany({ take: 50, include: { posts: true } }) },
-    { name: 'Drizzle', fn: () => drizzleDb.query.users.findMany({ limit: 50, with: { posts: true } }) },
-    { name: 'Raw', fn: decodeRawL2 },
-  ], { name: 'Drizzle RC', fn: () => rcDb.query.users.findMany({ limit: 50, with: { posts: true } }) }));
-
-  // 3. findMany L3 (no hand-written raw equivalent, ORM arms only)
-  await bench.interleave('findMany, 10 users -> posts -> comments (L3)', withRc([
-    { name: 'Turbine', fn: () => turbine.users.findMany({ limit: 10, with: { posts: { with: { comments: true }, limit: 5 } } }) },
-    { name: 'Prisma 7', fn: () => prisma.user.findMany({ take: 10, include: { posts: { take: 5, include: { comments: true } } } }) },
-    { name: 'Drizzle', fn: () => drizzleDb.query.users.findMany({ limit: 10, with: { posts: { limit: 5, with: { comments: true } } } }) },
-  ], { name: 'Drizzle RC', fn: () => rcDb.query.users.findMany({ limit: 10, with: { posts: { limit: 5, with: { comments: true } } } }) }));
-
-  // 4. findUnique by PK
-  // NOTE: RQB v2 replaced the `eq(col, v)` where-builder with a relational
-  // filter OBJECT, so the RC arm is spelled differently on purpose. It compiles
-  // to the same predicate; equivalence of the returned rows is asserted by
-  // verify-arms.ts before any of this is timed.
-  await bench.interleave('findUnique, single user by PK', withRc([
-    { name: 'Turbine', fn: () => turbine.users.findUnique({ where: { id: 1 } }) },
-    { name: 'Prisma 7', fn: () => prisma.user.findUnique({ where: { id: BigInt(1) } }) },
-    { name: 'Drizzle', fn: () => drizzleDb.query.users.findFirst({ where: eq(schema.users.id, 1) }) },
-    { name: 'Raw', fn: () => rawPool.query('SELECT * FROM users WHERE id = $1', [1]) },
-  ], { name: 'Drizzle RC', fn: () => rcDb.query.users.findFirst({ where: { id: 1 } }) }));
-
-  // 5. findUnique nested L3
-  await bench.interleave('findUnique, user + posts + comments (L3)', withRc([
-    { name: 'Turbine', fn: () => turbine.users.findUnique({ where: { id: 1 }, with: { posts: { with: { comments: true } } } }) },
-    { name: 'Prisma 7', fn: () => prisma.user.findUnique({ where: { id: BigInt(1) }, include: { posts: { include: { comments: true } } } }) },
-    { name: 'Drizzle', fn: () => drizzleDb.query.users.findFirst({ where: eq(schema.users.id, 1), with: { posts: { with: { comments: true } } } }) },
-  ], { name: 'Drizzle RC', fn: () => rcDb.query.users.findFirst({ where: { id: 1 }, with: { posts: { with: { comments: true } } } }) }));
-
-  const driftMid = await driftProbe('mid');
-
-  // 6. count
-  await bench.interleave('count, all users', withRc([
-    { name: 'Turbine', fn: () => turbine.users.count() },
-    { name: 'Prisma 7', fn: () => prisma.user.count() },
-    { name: 'Drizzle', fn: () => drizzleDb.select({ value: drizzleCount() }).from(schema.users) },
-    { name: 'Raw', fn: () => rawPool.query('SELECT count(*) FROM users') },
-  ], { name: 'Drizzle RC', fn: () => rcDb.select({ value: rcCount() }).from(rcSchema.users) }));
-
-  // 7. streaming 50K
-  const BATCH = 1000;
-  await bench.interleave(
-    'stream, iterate 50K comments (batch 1000)',
-    withRc([
-      {
-        name: 'Turbine',
-        fn:
-          TURBINE_STREAM === 'batches'
-            ? async () => {
-                // Counted per ROW, exactly as the per-row arm and every
-                // competitor arm counts, so the two spellings are measured on
-                // identical work and the only difference is how rows leave the
-                // generator.
-                let n = 0;
-                for await (const batch of turbine.comments.findManyStreamBatches({ batchSize: BATCH })) {
-                  for (const _c of batch) n++;
-                }
-                return n;
-              }
-            : async () => {
-                let n = 0;
-                for await (const _c of turbine.comments.findManyStream({ batchSize: BATCH })) n++;
-                return n;
-              },
-      },
-      {
-        name: 'Prisma 7',
-        fn: async () => {
-          let n = 0;
-          let cursor: { id: bigint } | undefined;
-          for (;;) {
-            const batch = await prisma.comment.findMany({
-              take: BATCH,
-              ...(cursor ? { cursor, skip: 1 } : {}),
+    // The raw nested control matches both Turbine's emitted encoding and its decoded payload.
+    const fields = [
+      'id',
+      'user_id',
+      'org_id',
+      'title',
+      'content',
+      'published',
+      'view_count',
+      'created_at',
+      'updated_at',
+    ];
+    const keys = ['id', 'userId', 'orgId', 'title', 'content', 'published', 'viewCount', 'createdAt', 'updatedAt'];
+    const rawL2Sql = (encoding: 'object' | 'positional') => {
+      const cells = fields.map((f, i) => (encoding === 'object' ? `'${keys[i]}', p.${f}` : `p.${f}`)).join(', ');
+      return `SELECT u.*, COALESCE((SELECT json_agg(json_build_${encoding === 'object' ? 'object' : 'array'}(${cells}) ORDER BY p.id ASC) FROM posts p WHERE p.user_id = u.id), '[]'::json) AS posts FROM users u ORDER BY u.id ASC LIMIT 50`;
+    };
+    const rawL2 = async (encoding: 'object' | 'positional') => {
+      const res = await rawPool.query(rawL2Sql(encoding));
+      for (const row of res.rows)
+        row.posts = (row.posts as (unknown[] | Record<string, unknown>)[]).map((p) => {
+          const post = Array.isArray(p) ? Object.fromEntries(keys.map((k, i) => [k, p[i]])) : { ...p };
+          post.createdAt = new Date(post.createdAt as string);
+          post.updatedAt = new Date(post.updatedAt as string);
+          return post;
+        });
+      return res.rows;
+    };
+    // Exact comparison, including every nested column and order, in both encodings.
+    assertExact('Raw L2 object/positional control', await rawL2('object'), await rawL2('positional'));
+    add(
+      1,
+      [
+        {
+          name: 'Turbine',
+          fn: () =>
+            turbine.users.findMany({ limit: 50, orderBy: { id: 'asc' }, with: { posts: { orderBy: { id: 'asc' } } } }),
+        },
+        {
+          name: 'Prisma 7',
+          fn: () =>
+            prisma.user.findMany({ take: 50, orderBy: { id: 'asc' }, include: { posts: { orderBy: { id: 'asc' } } } }),
+        },
+        {
+          name: 'Drizzle',
+          fn: () =>
+            drizzleDb.query.users.findMany({
+              limit: 50,
+              orderBy: asc(schema.users.id),
+              with: { posts: { orderBy: asc(schema.posts.id) } },
+            }),
+        },
+        { name: 'Raw', fn: () => rawL2(emitted) },
+      ],
+      (db) => () =>
+        db.query.users.findMany({ limit: 50, orderBy: { id: 'asc' }, with: { posts: { orderBy: { id: 'asc' } } } }),
+    );
+    add(
+      2,
+      [
+        {
+          name: 'Turbine',
+          fn: () =>
+            turbine.users.findMany({
+              limit: 10,
               orderBy: { id: 'asc' },
-            });
-            if (batch.length === 0) break;
-            n += batch.length;
-            if (batch.length < BATCH) break;
-            cursor = { id: batch[batch.length - 1]!.id };
-          }
-          return n;
+              with: { posts: { limit: 5, orderBy: { id: 'asc' }, with: { comments: { orderBy: { id: 'asc' } } } } },
+            }),
         },
-      },
-      {
-        name: 'Drizzle',
-        fn: async () => {
-          let n = 0;
-          let lastId = 0;
-          for (;;) {
-            const batch = await drizzleDb
-              .select()
-              .from(schema.comments)
-              .where(gt(schema.comments.id, lastId))
-              .orderBy(asc(schema.comments.id))
-              .limit(BATCH);
-            if (batch.length === 0) break;
-            for (const row of batch) {
-              n++;
-              lastId = row.id;
+        {
+          name: 'Prisma 7',
+          fn: () =>
+            prisma.user.findMany({
+              take: 10,
+              orderBy: { id: 'asc' },
+              include: {
+                posts: { take: 5, orderBy: { id: 'asc' }, include: { comments: { orderBy: { id: 'asc' } } } },
+              },
+            }),
+        },
+        {
+          name: 'Drizzle',
+          fn: () =>
+            drizzleDb.query.users.findMany({
+              limit: 10,
+              orderBy: asc(schema.users.id),
+              with: {
+                posts: {
+                  limit: 5,
+                  orderBy: asc(schema.posts.id),
+                  with: { comments: { orderBy: asc(schema.comments.id) } },
+                },
+              },
+            }),
+        },
+      ],
+      (db) => () =>
+        db.query.users.findMany({
+          limit: 10,
+          orderBy: { id: 'asc' },
+          with: { posts: { limit: 5, orderBy: { id: 'asc' }, with: { comments: { orderBy: { id: 'asc' } } } } },
+        }),
+    );
+    add(
+      3,
+      [
+        { name: 'Turbine', fn: () => turbine.users.findUnique({ where: { id: 1 } }) },
+        { name: 'Prisma 7', fn: () => prisma.user.findUnique({ where: { id: 1n } }) },
+        { name: 'Drizzle', fn: () => drizzleDb.query.users.findFirst({ where: eq(schema.users.id, 1) }) },
+        { name: 'Raw', fn: () => rawPool.query('SELECT * FROM users WHERE id = $1', [1]) },
+      ],
+      (db) => () => db.query.users.findFirst({ where: { id: 1 } }),
+    );
+    add(
+      4,
+      [
+        {
+          name: 'Turbine',
+          fn: () =>
+            turbine.users.findUnique({
+              where: { id: 1 },
+              with: { posts: { orderBy: { id: 'asc' }, with: { comments: { orderBy: { id: 'asc' } } } } },
+            }),
+        },
+        {
+          name: 'Prisma 7',
+          fn: () =>
+            prisma.user.findUnique({
+              where: { id: 1n },
+              include: { posts: { orderBy: { id: 'asc' }, include: { comments: { orderBy: { id: 'asc' } } } } },
+            }),
+        },
+        {
+          name: 'Drizzle',
+          fn: () =>
+            drizzleDb.query.users.findFirst({
+              where: eq(schema.users.id, 1),
+              with: {
+                posts: { orderBy: asc(schema.posts.id), with: { comments: { orderBy: asc(schema.comments.id) } } },
+              },
+            }),
+        },
+      ],
+      (db) => () =>
+        db.query.users.findFirst({
+          where: { id: 1 },
+          with: { posts: { orderBy: { id: 'asc' }, with: { comments: { orderBy: { id: 'asc' } } } } },
+        }),
+    );
+    add(
+      5,
+      [
+        { name: 'Turbine', fn: () => turbine.users.count() },
+        { name: 'Prisma 7', fn: () => prisma.user.count() },
+        { name: 'Drizzle', fn: () => drizzleDb.select({ value: count() }).from(schema.users) },
+        { name: 'Raw', fn: () => rawPool.query('SELECT count(*) FROM users') },
+      ],
+      (db) => () => db.select({ value: rcCount() }).from(rcSchema.users),
+    );
+
+    add(
+      6,
+      [
+        {
+          name: 'Turbine',
+          fn: async (_i, observe) => {
+            let n = 0;
+            if (stream === 'batches') {
+              for await (const batch of turbine.comments.findManyStreamBatches({
+                batchSize: BATCH,
+                orderBy: { id: 'asc' },
+              }))
+                for (const row of batch) {
+                  observe?.(row);
+                  n++;
+                }
+            } else {
+              for await (const row of turbine.comments.findManyStream({ batchSize: BATCH, orderBy: { id: 'asc' } })) {
+                observe?.(row);
+                n++;
+              }
             }
-            if (batch.length < BATCH) break;
-          }
-          return n;
+            return n;
+          },
         },
-      },
-      {
-        name: 'Raw',
-        fn: async () => {
-          let n = 0;
-          let lastId = 0;
-          for (;;) {
-            const res = await rawPool.query(
-              'SELECT * FROM comments WHERE id > $1 ORDER BY id ASC LIMIT $2',
-              [lastId, BATCH],
-            );
-            if (res.rows.length === 0) break;
-            for (const row of res.rows) {
-              n++;
-              lastId = Number(row.id);
+        {
+          name: 'Prisma 7',
+          fn: async (_i, observe) => {
+            let n = 0;
+            let cursor: { id: bigint } | undefined;
+            for (;;) {
+              const batch = await prisma.comment.findMany({
+                take: BATCH,
+                ...(cursor ? { cursor, skip: 1 } : {}),
+                orderBy: { id: 'asc' },
+              });
+              for (const row of batch) {
+                observe?.(row);
+                n++;
+              }
+              if (batch.length < BATCH) break;
+              cursor = { id: batch[batch.length - 1]!.id };
             }
-            if (res.rows.length < BATCH) break;
-          }
-          return n;
+            return n;
+          },
         },
-      },
-    ],
-    {
-      name: 'Drizzle RC',
-      fn: async () => {
+        {
+          name: 'Drizzle',
+          fn: async (_i, observe) => {
+            let n = 0;
+            let last = 0;
+            for (;;) {
+              const batch = await drizzleDb
+                .select()
+                .from(schema.comments)
+                .where(gt(schema.comments.id, last))
+                .orderBy(asc(schema.comments.id))
+                .limit(BATCH);
+              for (const row of batch) {
+                observe?.(row);
+                n++;
+                last = row.id;
+              }
+              if (batch.length < BATCH) break;
+            }
+            return n;
+          },
+        },
+        {
+          name: 'Raw',
+          fn: async (_i, observe) => {
+            let n = 0;
+            let last: unknown = 0;
+            for (;;) {
+              const batch = (
+                await rawPool.query('SELECT * FROM comments WHERE id > $1 ORDER BY id ASC LIMIT $2', [last, BATCH])
+              ).rows;
+              for (const row of batch) {
+                observe?.(row);
+                n++;
+                last = row.id;
+              }
+              if (batch.length < BATCH) break;
+            }
+            return n;
+          },
+        },
+      ],
+      (db) => async (_i, observe) => {
         let n = 0;
-        let lastId = 0;
+        let last = 0;
         for (;;) {
-          const batch = await rcDb
+          const batch = await db
             .select()
             .from(rcSchema.comments)
-            .where(rcGt(rcSchema.comments.id, lastId))
+            .where(rcGt(rcSchema.comments.id, last))
             .orderBy(rcAsc(rcSchema.comments.id))
             .limit(BATCH);
-          if (batch.length === 0) break;
           for (const row of batch) {
+            observe?.(row);
             n++;
-            lastId = row.id;
+            last = row.id;
           }
           if (batch.length < BATCH) break;
         }
         return n;
       },
-    }),
-    {
-      rounds: STREAM_ROUNDS,
-      warmup: 1,
-      /**
-       * THE ARMS IN THIS SCENARIO ARE NOT DOING THE SAME WORK, and until this
-       * note existed the table said so nowhere.
-       *
-       * Two asymmetries, both measured (`stream-arm-audit.ts` records every
-       * statement each arm puts on the wire; `bench-stream-parity.ts` prices
-       * them):
-       *
-       * 1. UNIT OF WORK. Every competitor arm here pages with keyset
-       *    pagination: it awaits a `SELECT … WHERE id > $1 ORDER BY id LIMIT
-       *    1000`, receives a materialised array, and walks it with a plain
-       *    synchronous `for` loop. One generator suspension per THOUSAND rows.
-       *    The Turbine arm defaults to `findManyStream`, which yields one row
-       *    at a time: one suspension per ROW. Measured at 84-87 ns/row over
-       *    three runs, that is ~4.3 ms of the drain, ~13%, and it is charged to
-       *    Turbine alone because no other arm offers a per-row API to charge it
-       *    to. `TURBINE_STREAM=batches` points this arm at
-       *    `findManyStreamBatches`, whose unit of work IS the competitors', and
-       *    that spelling wins the scenario. Both numbers are true; publishing
-       *    only the first one is not neutral.
-       *
-       * 2. DATABASE WORK. Turbine holds a real `NO SCROLL CURSOR` open in a
-       *    transaction over one unordered sequential scan, and additionally
-       *    pays a speculative `SELECT … LIMIT 1001` that OVERFLOWS on a 50K
-       *    drain and is discarded: 56 statements and 51,001 rows decoded to
-       *    deliver 50,000, against the competitors' 51 statements and 50,000
-       *    rows. That discarded fetch measures 0.63 ms. In exchange the cursor
-       *    reads one consistent snapshot, which keyset paging does not, and it
-       *    is the only arm whose memory is bounded by the SERVER rather than by
-       *    the page size the caller happened to pick.
-       *
-       * So this row compares two different streaming strategies end to end. It
-       * is a fair question to ask and a useful number to have; it is not a
-       * like-for-like decode benchmark, and a reader should not read it as one.
-       */
-      note:
-        'ARMS DIFFER. Turbine = true server-side cursor, and by default the PER-ROW api ' +
-        '(findManyStream, ~86 ns/row of generator suspension = ~13% of the drain); ' +
-        'every other arm = keyset pagination consuming materialised 1000-row arrays. ' +
-        'TURBINE_STREAM=batches selects the unit-of-work-matched Turbine api. ' +
-        'See bench-stream-parity.ts and stream-arm-audit.ts.',
-    },
-  );
+      {
+        rounds: streamRounds,
+        warmup: 1,
+        note: 'ARMS DIFFER: Turbine uses a server cursor; other arms use independent keyset pages. All return the same ordered rows on the static fixture. TURBINE_STREAM=batches selects the batch API.',
+      },
+    );
 
-  // 8. atomic increment
-  await bench.interleave('atomic increment, posts.view_count + 1', withRc([
-    { name: 'Turbine', fn: () => turbine.posts.update({ where: { id: 1 }, data: { viewCount: { increment: 1 } } }) },
-    { name: 'Prisma 7', fn: () => prisma.post.update({ where: { id: BigInt(1) }, data: { viewCount: { increment: 1 } } }) },
-    { name: 'Drizzle', fn: () => drizzleDb.update(schema.posts).set({ viewCount: sql`${schema.posts.viewCount} + 1` }).where(eq(schema.posts.id, 1)) },
-    { name: 'Raw', fn: () => rawPool.query('UPDATE posts SET view_count = view_count + 1 WHERE id = $1', [1]) },
-  ], {
-    name: 'Drizzle RC',
-    fn: () => rcDb.update(rcSchema.posts).set({ viewCount: rcSql`${rcSchema.posts.viewCount} + 1` }).where(rcEq(rcSchema.posts.id, 1)),
-  }));
+    add(
+      7,
+      [
+        {
+          name: 'Turbine',
+          fn: () => turbine.posts.update({ where: { id: 1 }, data: { viewCount: { increment: 1 } } }),
+        },
+        {
+          name: 'Prisma 7',
+          fn: () => prisma.post.update({ where: { id: 1n }, data: { viewCount: { increment: 1 } } }),
+        },
+        {
+          name: 'Drizzle',
+          fn: () =>
+            drizzleDb
+              .update(schema.posts)
+              .set({ viewCount: sql`${schema.posts.viewCount} + 1` })
+              .where(eq(schema.posts.id, 1))
+              .returning(),
+        },
+        {
+          name: 'Raw',
+          fn: () => rawPool.query('UPDATE posts SET view_count = view_count + 1 WHERE id = $1 RETURNING *', [1]),
+        },
+      ],
+      (db) => () =>
+        db
+          .update(rcSchema.posts)
+          .set({ viewCount: rcSql`${rcSchema.posts.viewCount} + 1` })
+          .where(rcEq(rcSchema.posts.id, 1))
+          .returning(),
+    );
 
-  // 9. pipeline 5-query dashboard batch
-  await bench.interleave('pipeline, 5-query dashboard batch', withRc([
-    {
-      name: 'Turbine',
-      fn: () =>
-        turbine.pipeline(
+    for (const mode of ['independent', 'transaction'] as const) {
+      const deferred = () =>
+        [
           turbine.users.buildFindUnique({ where: { id: 1 } }),
           turbine.posts.buildCount({ where: { userId: 1 } }),
           turbine.comments.buildCount({ where: { userId: 1 } }),
-          turbine.posts.buildFindMany({ where: { userId: 1 }, orderBy: { createdAt: 'desc' }, limit: 5 }),
+          turbine.posts.buildFindMany({ where: { userId: 1 }, orderBy: [...dashboardOrder], limit: 5 }),
           turbine.users.buildCount(),
-        ),
-    },
-    {
-      name: 'Prisma 7',
-      fn: () =>
-        prisma.$transaction([
-          prisma.user.findUnique({ where: { id: BigInt(1) } }),
-          prisma.post.count({ where: { userId: BigInt(1) } }),
-          prisma.comment.count({ where: { userId: BigInt(1) } }),
-          prisma.post.findMany({ where: { userId: BigInt(1) }, orderBy: { createdAt: 'desc' }, take: 5 }),
+        ] as const;
+      const prismaQueries = () =>
+        [
+          prisma.user.findUnique({ where: { id: 1n } }),
+          prisma.post.count({ where: { userId: 1n } }),
+          prisma.comment.count({ where: { userId: 1n } }),
+          prisma.post.findMany({ where: { userId: 1n }, orderBy: [...dashboardOrder], take: 5 }),
           prisma.user.count(),
-        ]),
-    },
-    {
-      name: 'Drizzle',
-      fn: () =>
-        drizzleDb.transaction(async (tx) => [
-          await tx.query.users.findFirst({ where: eq(schema.users.id, 1) }),
-          await tx.select({ v: drizzleCount() }).from(schema.posts).where(eq(schema.posts.userId, 1)),
-          await tx.select({ v: drizzleCount() }).from(schema.comments).where(eq(schema.comments.userId, 1)),
-          await tx.query.posts.findMany({ where: eq(schema.posts.userId, 1), limit: 5 }),
-          await tx.select({ v: drizzleCount() }).from(schema.users),
-        ]),
-    },
-    {
-      name: 'Raw',
-      fn: async () => {
-        const client = await rawPool.connect();
-        try {
-          await client.query('SELECT * FROM users WHERE id = $1', [1]);
-          await client.query('SELECT count(*) FROM posts WHERE user_id = $1', [1]);
-          await client.query('SELECT count(*) FROM comments WHERE user_id = $1', [1]);
-          await client.query('SELECT * FROM posts WHERE user_id = $1 ORDER BY created_at DESC LIMIT 5', [1]);
-          await client.query('SELECT count(*) FROM users');
-        } finally {
-          client.release();
-        }
-      },
-    },
-  ], {
-    name: 'Drizzle RC',
-    fn: () =>
-      rcDb.transaction(async (tx) => [
-        await tx.query.users.findFirst({ where: { id: 1 } }),
-        await tx.select({ v: rcCount() }).from(rcSchema.posts).where(rcEq(rcSchema.posts.userId, 1)),
-        await tx.select({ v: rcCount() }).from(rcSchema.comments).where(rcEq(rcSchema.comments.userId, 1)),
-        await tx.query.posts.findMany({ where: { userId: 1 }, limit: 5 }),
-        await tx.select({ v: rcCount() }).from(rcSchema.users),
-      ]),
-  }));
+        ] as const;
+      const stableReads = (db: Pick<typeof drizzleDb, 'query' | 'select'>) => ({
+        user: () => db.query.users.findFirst({ where: eq(schema.users.id, 1) }),
+        postCount: () => db.select({ v: count() }).from(schema.posts).where(eq(schema.posts.userId, 1)),
+        commentCount: () => db.select({ v: count() }).from(schema.comments).where(eq(schema.comments.userId, 1)),
+        recentPosts: () =>
+          db.query.posts.findMany({
+            where: eq(schema.posts.userId, 1),
+            orderBy: [desc(schema.posts.createdAt), desc(schema.posts.id)],
+            limit: 5,
+          }),
+        userCount: () => db.select({ v: count() }).from(schema.users),
+      });
+      add(
+        mode === 'independent' ? 8 : 9,
+        [
+          {
+            name: 'Turbine',
+            fn: () => turbineDashboard(turbine, deferred(), mode),
+          },
+          {
+            name: 'Prisma 7',
+            fn: () =>
+              mode === 'independent'
+                ? Promise.all(prismaQueries())
+                : prisma.$transaction([...prismaQueries()], { isolationLevel: 'ReadCommitted' }),
+          },
+          {
+            name: 'Drizzle',
+            fn: () =>
+              mode === 'independent'
+                ? dashboardReads(stableReads(drizzleDb), mode)
+                : drizzleDb.transaction((tx) => dashboardReads(stableReads(tx), mode), {
+                    isolationLevel: 'read committed',
+                  }),
+          },
+          { name: 'Raw', fn: () => rawDashboard(rawPool, mode) },
+        ],
+        (db) => () => {
+          const reads = (tx: Pick<typeof rcDb, 'query' | 'select'>) => ({
+            user: () => tx.query.users.findFirst({ where: { id: 1 } }),
+            postCount: () => tx.select({ v: rcCount() }).from(rcSchema.posts).where(rcEq(rcSchema.posts.userId, 1)),
+            commentCount: () =>
+              tx.select({ v: rcCount() }).from(rcSchema.comments).where(rcEq(rcSchema.comments.userId, 1)),
+            recentPosts: () =>
+              tx.query.posts.findMany({ where: { userId: 1 }, orderBy: { createdAt: 'desc', id: 'desc' }, limit: 5 }),
+            userCount: () => tx.select({ v: rcCount() }).from(rcSchema.users),
+          });
+          return mode === 'independent'
+            ? dashboardReads(reads(db), mode)
+            : db.transaction((tx) => dashboardReads(reads(tx), mode), { isolationLevel: 'read committed' });
+        },
+        {
+          note:
+            mode === 'independent'
+              ? 'Independent reads: no atomicity or shared-snapshot guarantee. Turbine pipelines; competitors use concurrent pool reads.'
+              : 'Every arm uses one explicit READ COMMITTED transaction on one pinned connection. READ COMMITTED does not promise a shared snapshot across statements.',
+        },
+      );
+    }
+    add(
+      10,
+      [
+        { name: 'Turbine', fn: (i) => turbine.users.findUnique({ where: { id: (i % 50) + 1 } }) },
+        { name: 'Prisma 7', fn: (i) => prisma.user.findUnique({ where: { id: BigInt((i % 50) + 1) } }) },
+        { name: 'Drizzle', fn: (i) => drizzleDb.query.users.findFirst({ where: eq(schema.users.id, (i % 50) + 1) }) },
+        { name: 'Raw', fn: (i) => rawPool.query('SELECT * FROM users WHERE id = $1', [(i % 50) + 1]) },
+      ],
+      (db) => (i) => db.query.users.findFirst({ where: { id: (i % 50) + 1 } }),
+    );
 
-  // 10. hot findUnique, rotating ids
-  await bench.interleave('hot findUnique, rotating IDs', withRc([
-    { name: 'Turbine', fn: (i) => turbine.users.findUnique({ where: { id: (i % 50) + 1 } }) },
-    { name: 'Prisma 7', fn: (i) => prisma.user.findUnique({ where: { id: BigInt((i % 50) + 1) } }) },
-    { name: 'Drizzle', fn: (i) => drizzleDb.query.users.findFirst({ where: eq(schema.users.id, (i % 50) + 1) }) },
-    { name: 'Raw', fn: (i) => rawPool.query('SELECT * FROM users WHERE id = $1', [(i % 50) + 1]) },
-  ], { name: 'Drizzle RC', fn: (i) => rcDb.query.users.findFirst({ where: { id: (i % 50) + 1 } }) }));
+    options.mutate?.(scenarios);
+    report.catalog = scenarios.map((s) => ({
+      scenario: s.scenario,
+      arms: s.arms.map((a) => a.name),
+      note: s.options?.note,
+    }));
 
-  const driftTail = await driftProbe('tail');
-  bench.reportDrift([driftHead, driftMid, driftTail]);
+    const requiredRc = [...(includeRc ? ['Drizzle RC'] : []), ...(options.includeNoJit ? ['Drizzle RC (no jit)'] : [])];
+    if (requiredRc.some((name) => !scenarios.some((s) => s.arms.some((a) => a.name === name))))
+      throw new Error('RC participation was required by the selected headline profile');
 
-  // Machine-readable dump for the writeup.
-  console.log('\n=== JSON ===');
-  console.log(JSON.stringify({ driftHead, driftMid, driftTail, results: bench.results }, null, 2));
-
-  await turbine.disconnect();
-  await prisma.$disconnect();
-  await drizzlePool.end();
-  await prismaPool.end();
-  await rawPool.end();
-  await rcPool.end();
-  console.log('\nDone.');
+    // Independent driver parser: Turbine's global int8 parser must not round the oracle.
+    await verifyHeadline(scenarios, {
+      query: (text, values) =>
+        rawPool.query({
+          text,
+          values,
+          types: {
+            getTypeParser: (oid: number, format?: string) =>
+              oid === 20 ? (v: string) => v : pg.types.getTypeParser(oid, format as 'text'),
+          },
+        }),
+    });
+    const prepared = await turbinePool.query('SELECT name FROM pg_prepared_statements');
+    if (!prepared.rows.length)
+      throw new Error('The supplied Turbine pool did not execute native named statements during preflight.');
+    console.log(`Native named statements observed on the Turbine backend: ${prepared.rows.length}.`);
+    report.status = 'passed';
+    if (!options.verifyOnly) {
+      const bench = new Bench({ rounds, warmup });
+      report.results = bench.results;
+      console.log(`ROUNDS=${rounds} WARMUP=${warmup} STREAM_ROUNDS=${streamRounds} Node ${process.version}`);
+      const driftHead = await bench.driftProbe(rawPool, 'head');
+      let driftMid = driftHead;
+      for (const [i, scenario] of scenarios.entries()) {
+        if (i === 5) driftMid = await bench.driftProbe(rawPool, 'mid');
+        await bench.interleave(scenario.scenario, scenario.arms, scenario.options);
+      }
+      const driftTail = await bench.driftProbe(rawPool, 'tail');
+      bench.reportDrift([driftHead, driftMid, driftTail]);
+      Object.assign(report, { driftHead, driftMid, driftTail, driftSamples: bench.probes });
+    }
+  } catch (error) {
+    report.status = 'failed';
+    report.error = String(error);
+    failure = error;
+  } finally {
+    const clients = await Promise.allSettled([turbine.disconnect(), prisma.$disconnect()]);
+    const ended = await Promise.allSettled(pools.map((pool) => pool.end()));
+    const failures = [...clients, ...ended].filter((r) => r.status === 'rejected').map((r) => r.reason);
+    report.cleanup.closed = failures.length === 0;
+    if (failures.length) {
+      report.status = 'failed';
+      failure = new AggregateError([...(failure ? [failure] : []), ...failures], 'Headline execution/cleanup failed');
+      report.error = [report.error, ...failures.map(String)].filter(Boolean).join('; ');
+    }
+    if (options.reportPath) writeFileSync(options.reportPath, `${JSON.stringify(report, null, 2)}\n`);
+  }
+  if (failure) throw failure;
+  if (!options.verifyOnly) {
+    console.log('\n=== JSON ===');
+    console.log(JSON.stringify(report, null, 2));
+  }
+  return report;
 }
 
-main().catch((err) => {
-  console.error('\nBenchmark error:', err);
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  runHeadline({ verifyOnly: process.argv.includes('--preflight'), reportPath: process.env.HEADLINE_REPORT }).catch(
+    (error) => {
+      console.error('Benchmark error:', error);
+      process.exitCode = 1;
+    },
+  );
+}

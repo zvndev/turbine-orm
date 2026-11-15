@@ -53,6 +53,7 @@ const CONSTRUCT: Record<string, (m: ErrorsModule) => Error> = {
   ReadOnlyError: (m) => new m.ReadOnlyError('refused.'),
   TransactionRolledBackError: (m) => new m.TransactionRolledBackError('rolled back.'),
   InvariantError: (m) => new m.InvariantError('probe', 'two internal paths disagreed.'),
+  TransactionOutcomeUnknownError: (m) => new m.TransactionOutcomeUnknownError(new Error('lost')),
 };
 
 /** Every exported class that is TurbineError or extends it, in export order. */

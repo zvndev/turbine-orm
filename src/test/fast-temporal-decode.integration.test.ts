@@ -27,8 +27,8 @@
  *   German      15.08.2026 18:10:43.476603 +0545
  *
  * Only the first is the fast path's shape. The other three must be DELEGATED,
- * and the assertion is not "we handle them" but "we return byte-for-byte what
- * the driver returned before this existed", which for those three is
+ * and must return byte-for-byte what the driver returned before the fast path
+ * existed. For those three formats this is
  * `postgres-date`'s answer, `null` included.
  *
  * ## Method

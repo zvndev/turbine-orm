@@ -30,6 +30,7 @@ import { defineSchema } from '../schema-builder.js';
 import { schemaToSQL } from '../schema-sql.js';
 import { sqliteDialect } from '../sqlite.js';
 import { skipGate } from './helpers.js';
+import { closeSqliteAfter, sqliteFixtureScope } from './sqlite-fixture-lifetime.js';
 
 const DatabaseSync: (new (path: string) => DatabaseSyncType) | undefined = (() => {
   try {
@@ -261,7 +262,7 @@ describe('schemaToSQL DDL runs on SQLite', () => {
 
   before(() => {
     if (!DatabaseSync) return;
-    db = new DatabaseSync(':memory:');
+    db = closeSqliteAfter(new DatabaseSync(':memory:'), sqliteCleanup);
     db.exec('PRAGMA foreign_keys = ON');
     for (const stmt of schemaToSQL(schema, { dialect: sqliteDialect })) db.exec(stmt);
   });
@@ -304,6 +305,9 @@ describe('schemaToSQL DDL runs on SQLite', () => {
     ).map((r) => r.name);
     assert.ok(names.includes('idx_mig_posts_slug'), names.join(', '));
   });
+
+  // Register native teardown after the existing client teardown hooks.
+  const sqliteCleanup = sqliteFixtureScope();
 });
 
 // ---------------------------------------------------------------------------

@@ -35,6 +35,7 @@ import { introspect } from '../introspect.js';
 import { createManyShapeRuns } from '../nested-write.js';
 import type { SchemaMetadata } from '../schema.js';
 import { makeQuery, mockTable, skipGate } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 // ---------------------------------------------------------------------------
 // Tier 1, the splitter
@@ -211,7 +212,7 @@ describe('nested create with mixed row shapes, live sqlite', () => {
   sqliteGate.it('splits into contiguous runs, keeps order, and applies defaults', async () => {
     const { introspectSqliteDatabase, turbineSqlite } = await import('../sqlite.js');
     const { DatabaseSync } = createRequire(process.cwd())('node:sqlite');
-    const db = new DatabaseSync(':memory:');
+    const db = closeSqliteAfter(new DatabaseSync(':memory:'));
     db.exec(usersDdl('INTEGER PRIMARY KEY AUTOINCREMENT'));
     db.exec(postsDdl('INTEGER PRIMARY KEY AUTOINCREMENT', 'INTEGER', '1'));
 

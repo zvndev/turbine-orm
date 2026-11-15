@@ -1,0 +1,55 @@
+import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import { turbine } from './generated/index.js';
+import type { Label, LabelWhereUnique, Ticket, TicketCreate, TicketUpdate } from './generated/types.js';
+
+async function main() {
+  const driver = createRequire(__PACKAGE_PATH__)('mysql2/promise');
+  const pool = driver.createPool({ host: '127.0.0.1', port: Number(process.argv[2]), user: 'root', database: process.argv[3], namedPlaceholders: true });
+  const db = await turbine(pool, { logger: {} });
+  try {
+    const status: Ticket['status'] = 'new';
+    const priority: Ticket['priority'] = null;
+    const create: TicketCreate = { status, priority };
+    const first = await db.tickets.create({ data: create });
+    assert.equal(first.status, 'new');
+    assert.equal(first.priority, null);
+    const update: TicketUpdate = { status: { set: 'done' }, priority: 'high' };
+    const changed = await db.tickets.update({ where: { id: first.id }, data: update });
+    assert.equal(changed.status, 'done');
+    assert.equal(changed.priority, 'high');
+    const filtered = await db.tickets.findMany({ where: { status: { in: ['new', 'done'] }, priority: 'high' } });
+    assert.equal(filtered.length, 1);
+    const committed = await db.$transaction(async (tx) => {
+      const row = await tx.tickets.create({ data: { status: 'new', priority: 'low' } });
+      return tx.tickets.update({ where: { id: row.id }, data: { status: 'done', priority: null } });
+    });
+    assert.equal(committed.status, 'done');
+    assert.equal(committed.priority, null);
+    await assert.rejects(db.$transaction(async (tx) => {
+      await tx.tickets.create({ data: { status: 'new' } });
+      throw new Error('enum rollback control');
+    }), /enum rollback control/);
+    assert.equal((await db.tickets.findMany()).length, 2);
+    const labels: Label['value'][] = __LABEL_VALUES__;
+    for (const value of labels) await db.labels.create({ data: { value } });
+    const rows = await db.labels.findMany({ orderBy: { id: 'asc' } });
+    assert.deepEqual(rows.map((row) => row.value), labels);
+    for (const value of labels) {
+      const where: LabelWhereUnique = { value };
+      assert.equal((await db.labels.findUnique({ where }))?.value, value);
+    }
+    const mirror = await db.mirrors.create({ data: { status: 'queued' } });
+    assert.equal(mirror.status, 'queued');
+    const copy = await db.copies.create({ data: { status: 'new' } });
+    assert.equal(copy.status, 'new');
+    const note = await db.notes.create({ data: { body: 'non-enum control' } });
+    assert.equal(note.body, 'non-enum control');
+    console.log(JSON.stringify({ nativeReadWriteTransaction: true, completeValues: labels, rows: rows.length, rollback: true }));
+  } finally {
+    await db.disconnect();
+    assert.equal((await pool.query('SELECT 42 AS alive'))[0][0].alive, 42);
+    await pool.end();
+  }
+}
+main().catch((error) => { console.error(error); process.exitCode = 1; });

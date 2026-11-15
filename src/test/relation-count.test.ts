@@ -244,7 +244,7 @@ describe('relation _count, batched strategy', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Global-filter interaction (review fixes: batched skip capture, m2m EXISTS,
+// Global-filter interaction (batched skip capture, m2m EXISTS,
 // cache-segment guard)
 // ---------------------------------------------------------------------------
 

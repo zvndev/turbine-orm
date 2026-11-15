@@ -1,7 +1,7 @@
 /**
  * Unknown `TurbineConfig` keys are named in dev, never thrown on.
  *
- * A JavaScript object has no schema, so a config key nobody reads is simply
+ * A JavaScript object has no schema, so a config key nobody reads is
  * ignored. That makes a typo (or a plausible guess at an option name that does
  * not exist, `logParams` for `logQueryParams`) indistinguishable from a broken
  * feature: nothing happens, and the reasonable conclusion is that the feature
@@ -29,6 +29,7 @@ import type { PrismaCompatMap, SchemaMetadata } from '../schema.js';
 import { turbineHttp } from '../serverless.js';
 import { turbineSqlite } from '../sqlite.js';
 import { mockTable } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 // `node:sqlite` is a builtin only on Node >= 22.5; probe without a static
 // import so this file loads (and skips cleanly) on Node 20.
@@ -208,7 +209,7 @@ describe('TurbineConfig: unknown keys are named', () => {
 describe('TurbineConfig: legitimate construction paths stay silent', () => {
   sqliteIt('turbineSqlite, including its own pragma options', async () => {
     const warnings = await captureWarnings(async () => {
-      const handle = new DatabaseSync!(':memory:');
+      const handle = closeSqliteAfter(new DatabaseSync!(':memory:'));
       handle.exec('CREATE TABLE cfg_probe (id INTEGER PRIMARY KEY, name TEXT NOT NULL)');
       const db = turbineSqlite(handle, probeSchema(), {
         wal: false,
@@ -225,7 +226,9 @@ describe('TurbineConfig: legitimate construction paths stay silent', () => {
     // The silence above has to be the check running and finding nothing, not
     // the check never reaching the engine path at all.
     const warnings = await captureWarnings(async () => {
-      const db = turbineSqlite(new DatabaseSync!(':memory:'), probeSchema(), { logParams: true } as never);
+      const db = turbineSqlite(closeSqliteAfter(new DatabaseSync!(':memory:')), probeSchema(), {
+        logParams: true,
+      } as never);
       await db.disconnect();
     });
     assert.equal(warnings.length, 1);

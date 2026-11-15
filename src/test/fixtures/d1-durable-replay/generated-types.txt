@@ -1,0 +1,39 @@
+import type { D1Database } from '@cloudflare/workers-types';
+import type { D1DatabaseBinding, D1Result, D1Statement } from 'turbine-orm/d1';
+import { turbine, type TurbineClient } from './generated/index.js';
+import { ReplayApp, type Command, type Event } from './application.js';
+function negative(db: TurbineClient) {
+  // @ts-expect-error D1 factory requires a binding
+  turbine('file:db');
+  // @ts-expect-error no interactive D1 transaction
+  db.$transaction(async () => 1);
+  // @ts-expect-error no invented D1 notifications
+  db.$listen('events');
+  // @ts-expect-error exact quantity is TEXT, not a JS bigint
+  const invalid: Command = {eventId:'e',orderId:'o',quantity:1n,amount:'1.000000000000',occurredAt:'2026-11-07T00:00:00.000000Z',title:null,body:new Uint8Array()};
+  // @ts-expect-error unknown field
+  db.replayEvents.findMany({select:{missing:true}});
+  void invalid;
+}
+void negative;
+export async function run(binding: D1Database) {
+  const shape: D1DatabaseBinding = binding;
+  const statement: D1Statement = {sql:'SELECT 1'};
+  const results: D1Result[] = await binding.batch([binding.prepare(statement.sql)]);
+  const app = new ReplayApp(shape);
+  const command: Command = {eventId:'generated',orderId:'generated',quantity:'9223372036854775807',amount:'999999999999999999999999999999.120000000001',occurredAt:'2026-11-07T12:34:56.123456Z',title:null,body:new Uint8Array([0,128,255])};
+  const event: Event = await app.append('generated',command);
+  const db = turbine(shape,{warnOnUnlimited:false});
+  const selected = await db.replayEvents.findMany({where:{tenant:'generated'},select:{position:true,captured:true}});
+  const text: string = selected[0]!.captured;
+  const position: number = selected[0]!.position;
+  // @ts-expect-error selected rows do not expose tenant
+  selected[0]!.tenant;
+  const [count,orders] = await db.$batch([db.replayEvents.buildCount({where:{tenant:'generated'}}),db.replayOrders.buildFindMany({where:{tenant:'generated'}})]);
+  if(count!==1 || orders[0]?.captured!==text || position!==1 || results.length!==1) throw Error('Generated native query mismatch');
+  const values = JSON.parse(text);
+  if(values[2]!==command.quantity || values[3]!==command.amount || values[4]!==command.occurredAt || values[5]!==null || values[6]!=='0080ff') throw Error('Generated exact TEXT values');
+  await db.disconnect(); await app.close();
+  await shape.prepare('SELECT 1').all();
+  return {position,count,values,event};
+}

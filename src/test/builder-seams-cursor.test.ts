@@ -28,6 +28,7 @@ import { CURSOR_INCLUSIVE } from '../query/normalize-args.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { introspectSqliteDatabase, sqliteDialect, turbineSqlite } from '../sqlite.js';
 import { makeQuery, mockTable, skipGate } from './helpers.js';
+import { closeSqliteAfter, sqliteFixtureScope } from './sqlite-fixture-lifetime.js';
 
 // biome-ignore lint/suspicious/noExplicitAny: the suites drive untyped accessors and args
 type Any = any;
@@ -448,13 +449,13 @@ const lite = skipGate(!DatabaseSync, 'node:sqlite requires Node >= 22.5');
 describe('cursor page walks (live SQLite)', () => {
   let db: TurbineClient;
   lite.before(() => {
-    const raw = new DatabaseSync!(':memory:');
+    const raw = closeSqliteAfter(new DatabaseSync!(':memory:'), sqliteCleanup);
     raw.exec(`CREATE TABLE ${TABLE} (id INTEGER PRIMARY KEY, grp INTEGER NOT NULL, score INTEGER, label TEXT)`);
     const insert = raw.prepare(`INSERT INTO ${TABLE} VALUES (?, ?, ?, ?)`);
     for (const r of seedRows()) insert.run(r.id, r.grp, r.score, r.label);
     db = turbineSqlite(raw, introspectSqliteDatabase(raw), { warnOnUnlimited: false });
   });
-  lite.after(async () => {
+  const sqliteCleanup = sqliteFixtureScope(async () => {
     if (db) await db.disconnect();
   });
 

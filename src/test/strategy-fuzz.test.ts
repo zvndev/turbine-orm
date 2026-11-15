@@ -78,6 +78,7 @@ import { JSON_WIRE_COERCION_OIDS } from '../query/utils.js';
 import { camelToSnake, type SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, turbineSqlite } from '../sqlite.js';
 import { skipGate } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 // Same probe as sqlite.test.ts: load on Node < 22.5, skip cleanly.
 const DatabaseSync: (new (path: string) => DatabaseSyncType) | undefined = (() => {
@@ -216,7 +217,7 @@ function chance(rng: () => number, p: number): boolean {
  *
  * The class this closes: several sites tested `key in meta.columnMap`, which
  * knows only the FIELD spelling, and were therefore reachable-but-divergent
- * rather than simply wrong. The batched loader's per-parent limit pushdown
+ * rather than wrong. The batched loader's per-parent limit pushdown
  * DECLINED on a snake-spelled orderBy (silently falling back to fetching every
  * child and slicing client-side), and its correlation-key projection matched
  * the caller's `select` / `omit` keys by raw string, which force-added and then
@@ -338,7 +339,7 @@ function randomOrderBy(rng: () => number, model: TableModel): Array<Record<strin
 /**
  * `refused` marks a projection the 0.65 shape rules reject (E003). These stay
  * in the domain so the fuzz proves every strategy refuses them identically:
- * the review of the 0.65 fix found the first generator never produced them,
+ * the first generator never produced them,
  * which is how a presence-vs-truthy refusal mismatch between the strategies
  * survived the suite. The flag is threaded up to generateCase so a case never
  * carries BOTH a refused shape and a planted name corruption: with two
@@ -494,9 +495,10 @@ async function runWith(
 }
 
 describe('strategy differential fuzz (join vs batched vs auto)', () => {
-  beforeEach(() => {
+  beforeEach((t) => {
+    assert.ok('after' in t, 'beforeEach must receive a test context');
     if (!DatabaseSync) return;
-    db = new DatabaseSync(':memory:');
+    db = closeSqliteAfter(new DatabaseSync(':memory:'), t.after.bind(t));
     db.exec('PRAGMA foreign_keys = ON');
     db.exec(SCHEMA_SQL);
     seedDatabase(db);

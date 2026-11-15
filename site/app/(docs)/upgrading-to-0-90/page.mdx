@@ -210,7 +210,7 @@ export const metadata = {
 - **A nested block has its own handle.** Using the outer `tx` while it is open throws.
 - **Transaction-control SQL through `tx.raw` or `tx.$connection()` throws.** Return to commit, throw to roll back, nest for a savepoint.
 - **A settled `tx` throws, and a callback that returns with queries still running rolls back.** Await every query.
-- **A per-query timeout inside `$transaction` rolls it back.** Retry the whole transaction.
+- **A per-query timeout inside `$transaction` rolls it back.** Retry the whole transaction. Since 0.94, a write that takes several statements rolls back to a savepoint of its own instead, and the transaction can continue once that rollback is acknowledged ([timeouts](/transactions#timeouts)).
 - **`sessionContext` names need a dot** (`app.tenant`) unless listed in `allowBuiltinSettings`; values must be strings, numbers or booleans.
 - **A Promise in `$transaction([...])` or `pipeline([...])` throws.** Pass `build*()` results.
 

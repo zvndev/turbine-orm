@@ -17,14 +17,12 @@
 
 import pg from '#pg';
 import type { PgCompatPool, PgCompatPoolClient } from './pg-types.js';
+import { createPgArrayParser, isDefaultTextParser, markTurbineParser } from './query/pg-type-parsers.js';
 import {
   createFastTimestamptzParser,
-  createPgArrayParser,
   createUtcDateParser,
   createUtcTimestampParser,
-  isDefaultTextParser,
-  markTurbineParser,
-} from './query/utils.js';
+} from './query/temporal-parsers.js';
 
 /** Where node-postgres reads a parser from: `pg.types`, a pool's `types` option, a client's table. */
 export interface TypeParserTable {

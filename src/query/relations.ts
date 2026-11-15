@@ -23,9 +23,25 @@ import {
 } from '../errors.js';
 import { missingIndexForRelation } from '../index-advisor.js';
 import { logTo } from '../logger.js';
+import {
+  availableClause,
+  CELL_FLOAT,
+  CELL_PLAIN,
+  canonicalColumnOrder,
+  ownLookup,
+  relationInProjectionMessage,
+  resolveColumnName,
+  resolveRelation,
+  resolveRelationDef,
+  selectNamesNothingMessage,
+  selectOmitExclusiveMessage,
+  suggestKey,
+  unknownFieldMessage,
+} from '../query-utils.js';
 import type { RelationDef, TableMetadata } from '../schema.js';
 import { normalizeKeyColumns, snakeToCamel } from '../schema.js';
 import { resolveCountRelations, stitchOnlyFields } from './batched-loader.js';
+import { uniqueKeyNames } from './compound-unique.js';
 import {
   describeOperand,
   isJsonPathOrderBy,
@@ -49,21 +65,6 @@ import type {
   WithOptions,
 } from './types.js';
 import { assertDirectionToken, assertOrderDirection } from './types.js';
-import {
-  availableClause,
-  CELL_FLOAT,
-  CELL_PLAIN,
-  canonicalColumnOrder,
-  ownLookup,
-  relationInProjectionMessage,
-  resolveColumnName,
-  resolveRelation,
-  resolveRelationDef,
-  selectNamesNothingMessage,
-  selectOmitExclusiveMessage,
-  suggestKey,
-  unknownFieldMessage,
-} from './utils.js';
 import { hasWarnedOnce, shouldWarnOnce, WARN_NS } from './warn-registry.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
@@ -183,7 +184,7 @@ export function resolveProjection(
   // Check 1 runs first so both are PRESENCE-decided exactly like the branch
   // below (`if (select)`): a truthiness-decided refusal here flipped verdicts
   // between strategies when the batched loader force-added correlation keys
-  // to an all-falsy select (review-caught in 0.65). The batched loader
+  // to an all-falsy select (0.65). The batched loader
   // asserts the same two rules on the RAW args (`assertProjectionShape`)
   // before any adjustment, with these same messages.
   if (select && !Array.isArray(select)) {
@@ -238,7 +239,7 @@ export function resolveProjection(
     // projection positionally except through THIS list: the SELECT list, the
     // relation `json_build_object` pairs and the positional `RelationShape`
     // keys are all derived from it, so they move together. The one observable
-    // consequence is that a projected row's KEY INSERTION order now follows the
+    // consequence is that a projected row's KEY INSERTION order follows the
     // table rather than the `select` literal.
     const piiCols = includePii ? undefined : writesMod.piiColumns(qi, meta);
     const stitchOnly = piiCols && piiCols.size > 0 ? stitchOnlyFields(select) : undefined;
@@ -284,6 +285,11 @@ export function resolveProjection(
  * The query's own table. Thin wrapper over {@link resolveProjection} kept for
  * the existing call sites in builder.ts.
  */
+/** A qualified scalar projection, preserving the caller's column order. */
+export function qualifiedColumns(qi: BuilderCtx, columns: readonly string[], qualifier: string): string {
+  return columns.map((column) => `${qualifier}.${qi.q(column)}`).join(', ');
+}
+
 export function resolveColumns(
   qi: BuilderCtx,
   select?: Record<string, boolean>,
@@ -593,85 +599,33 @@ export function collectRelationSubqueryParams(
   // where → limit → nested).
   const nativeOrderPath = !qi.dialect.buildRelationSubquery;
 
-  // manyToMany param order mirrors buildManyToManySubquery:
-  //   orderBy params → where params → limit param → nested-with params
-  //   (always, both paths).
-  if (relDef.type === 'manyToMany') {
-    const m2mOrderEntries = opts.orderBy ? orderByEntries(opts.orderBy).filter(([, dir]) => dir !== undefined) : [];
-    if (nativeOrderPath && m2mOrderEntries.length > 0) {
-      collectRelationOrderParams(qi, targetTable, targetMeta, m2mOrderEntries, params);
-    }
-    if (opts.where) {
-      whereMod.collectAliasWhereParams(qi, targetTable, targetMeta, opts.where as Record<string, unknown>, params);
-    }
-    whereMod.collectTargetGlobalFilterAlias(qi, targetTable, params);
-    if (opts.limit !== undefined && !qi.dialect.inlineLimitOffset) {
-      params.push(qi.paginationValue(opts.limit, 'relation limit'));
-    }
-    const m2mOffset = relationOffset(opts);
-    if (m2mOffset !== undefined && !qi.dialect.inlineLimitOffset) {
-      params.push(qi.paginationValue(m2mOffset, 'relation offset'));
-    }
-    if (opts.with) {
-      for (const [nestedRelName, nestedSpec] of sortedEntries(opts.with)) {
-        const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
-        if (!nestedRelDef) continue;
-        collectRelationSubqueryParams(qi, nestedRelDef, nestedSpec, params, 'alias', depth + 1);
-      }
-    }
-    return;
-  }
-
-  // Mirrors buildRelationSubquery's willWrap: `orderBy: {}` is treated as absent.
-  const relOrderEntries = opts.orderBy ? orderByEntries(opts.orderBy).filter(([, dir]) => dir !== undefined) : [];
-  const hasOrder = relOrderEntries.length > 0;
+  const manyToMany = relDef.type === 'manyToMany';
+  const many = manyToMany || relDef.type === 'hasMany';
+  const entries = opts.orderBy ? orderByEntries(opts.orderBy).filter(([, dir]) => dir !== undefined) : [];
   const offset = relationOffset(opts);
-  const willWrap = relDef.type === 'hasMany' && (opts.limit !== undefined || offset !== undefined || hasOrder);
-
-  // Non-wrapped path: nested relations BEFORE where/limit
-  if (!willWrap && opts.with) {
-    for (const [nestedRelName, nestedSpec] of sortedEntries(opts.with)) {
-      const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
-      if (!nestedRelDef) continue;
-      collectRelationSubqueryParams(qi, nestedRelDef, nestedSpec, params, 'alias', depth + 1);
+  const nestedLast = manyToMany || (many && (opts.limit !== undefined || offset !== undefined || entries.length > 0));
+  const collectNested = (): void => {
+    if (!opts.with) return;
+    for (const [name, nestedSpec] of sortedEntries(opts.with)) {
+      const nested = ownLookup(targetMeta.relations, name);
+      if (nested) collectRelationSubqueryParams(qi, nested, nestedSpec, params, 'alias', depth + 1);
     }
+  };
+  // Unwrapped to-one/hasMany builds nested SELECTs before its predicates;
+  // wrapped hasMany and every m2m build them after paging the inner rows.
+  if (!nestedLast) collectNested();
+  if (nativeOrderPath && entries.length > 0) {
+    collectRelationOrderParams(qi, targetTable, targetMeta, entries, params);
   }
-
-  // orderBy params (JSON paths / relation-order global filters): mirrors
-  // buildRelationSubquery, which builds its ORDER BY terms BEFORE compiling
-  // spec.where (both wrapped and non-wrapped paths).
-  if (nativeOrderPath && hasOrder) {
-    collectRelationOrderParams(qi, targetTable, targetMeta, relOrderEntries, params);
-  }
-
-  // where params, mirrors buildAliasWhere push order
   if (opts.where) {
     whereMod.collectAliasWhereParams(qi, targetTable, targetMeta, opts.where as Record<string, unknown>, params);
   }
-
-  // Global filter on the target, mirrors targetGlobalFilterAlias in
-  // buildRelationSubquery (pushed after spec.where, before limit).
   whereMod.collectTargetGlobalFilterAlias(qi, targetTable, params);
-
-  // limit param, only hasMany parameterizes its limit (mirrors
-  // buildRelationSubquery). belongsTo/hasOne ignore limit (always LIMIT 1), so
-  // pushing one here would orphan a param and desync the collect path.
-  // `limit: 0` pushes (LIMIT 0 is honored), so check !== undefined.
-  if (relDef.type === 'hasMany' && opts.limit !== undefined && !qi.dialect.inlineLimitOffset) {
-    params.push(qi.paginationValue(opts.limit, 'relation limit'));
+  if (many && !qi.dialect.inlineLimitOffset) {
+    if (opts.limit !== undefined) params.push(qi.paginationValue(opts.limit, 'relation limit'));
+    if (offset !== undefined) params.push(qi.paginationValue(offset, 'relation offset'));
   }
-  if (relDef.type === 'hasMany' && offset !== undefined && !qi.dialect.inlineLimitOffset) {
-    params.push(qi.paginationValue(offset, 'relation offset'));
-  }
-
-  // Wrapped path: nested relations AFTER where/limit (inside inner subquery)
-  if (willWrap && opts.with) {
-    for (const [nestedRelName, nestedSpec] of sortedEntries(opts.with)) {
-      const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
-      if (!nestedRelDef) continue;
-      collectRelationSubqueryParams(qi, nestedRelDef, nestedSpec, params, 'innerAlias', depth + 1);
-    }
-  }
+  if (nestedLast) collectNested();
 }
 
 /**
@@ -1123,7 +1077,7 @@ export function buildRelationOrderBy(
 
   // Pick-row ordering (`{ pick, by }`): order by a value from ONE related
   // row: a correlated scalar subquery with its own ORDER BY … LIMIT 1.
-  // Top-level findMany only (`ctx` present means we are inside a relation
+  // Top-level findMany only (`ctx` present means this is inside a relation
   // subquery's orderBy) and hasMany only: validatePickOrderBy throws the
   // scope errors, shared with the cache-hit collect mirror.
   if (isRelationPickOrderBy(value)) {
@@ -1566,38 +1520,46 @@ export function collectRelationOrderParams(
   orderEntries: [string, unknown][],
   params: unknown[],
 ): void {
-  for (const [key, dirValue] of orderEntries) {
-    if (isVectorOrderBy(dirValue)) {
-      throw new ValidationError(
-        `Vector distance ordering on "${key}" is only supported in a top-level findMany orderBy.`,
-      );
-    }
-    if (isJsonPathOrderBy(dirValue)) {
-      validateJsonPathOrderBy(qi, targetTable, targetMeta, key, dirValue);
-      params.push(whereMod.jsonPathParam(qi, dirValue.path));
-      continue;
-    }
-    if (isRelationOrderByValue(qi, dirValue)) {
-      // Pick-row ordering is top-level-only: the build path throws the same
-      // E003 (buildRelationOrderBy with ctx set), so the mirror must too.
-      if (isRelationPickOrderBy(dirValue)) {
-        throw pickOrderNestedError(qi, key);
-      }
-      // resolveRelationDef, as buildRelationOrderBy resolves it, so a relation
-      // written in its table spelling binds its params on a cache hit too.
-      const relDef = resolveRelationDef(targetMeta.relations, key);
-      if (relDef && (relDef.type === 'hasMany' || relDef.type === 'manyToMany')) {
-        collectRelationCountParams(qi, relDef, params);
-      } else if (relDef) {
-        collectToOneRelationOrderParams(qi, key, dirValue as Record<string, unknown>, params, {
-          meta: targetMeta,
-          table: targetTable,
-          parentRef: targetTable,
-        });
-      }
-      continue;
-    }
-    resolveOrderByColumn(qi, targetTable, targetMeta, key);
+  collectOrderParams(qi, orderEntries, params, { meta: targetMeta, table: targetTable });
+}
+
+/** Shared root/relation cache-hit binding; nested-only refusals remain explicit. */
+export function collectOrderParams(
+  qi: BuilderCtx,
+  entries: [string, unknown][],
+  params: unknown[],
+  scope?: { meta: TableMetadata; table: string },
+): void {
+  const meta = scope?.meta ?? qi.tableMeta;
+  const table = scope?.table ?? qi.table;
+  for (const [key, value] of entries) {
+    if (isVectorOrderBy(value)) {
+      if (scope)
+        throw new ValidationError(
+          `Vector distance ordering on "${key}" is only supported in a top-level findMany orderBy.`,
+        );
+      const column = qi.toColumn(key);
+      whereMod.vectorOperator(qi, key, column, value.distance.metric);
+      whereMod.pushVectorParam(qi, key, column, value.distance.to, params);
+    } else if (isJsonPathOrderBy(value)) {
+      validateJsonPathOrderBy(qi, table, meta, key, value);
+      params.push(whereMod.jsonPathParam(qi, value.path));
+    } else if (isRelationOrderByValue(qi, value)) {
+      if (scope && isRelationPickOrderBy(value)) throw pickOrderNestedError(qi, key);
+      const resolved = resolveRelation(meta.relations, key);
+      const def = resolved?.def;
+      if (def && isRelationPickOrderBy(value)) collectRelationPickOrderParams(qi, resolved.name, def, value, params);
+      else if (def && (def.type === 'hasMany' || def.type === 'manyToMany'))
+        collectRelationCountParams(qi, def, params);
+      else if (def)
+        collectToOneRelationOrderParams(
+          qi,
+          key,
+          value as Record<string, unknown>,
+          params,
+          scope ? { meta, table, parentRef: table } : undefined,
+        );
+    } else if (scope) resolveOrderByColumn(qi, table, meta, key);
   }
 }
 
@@ -1800,10 +1762,35 @@ function parseScalarColumns(
     countObj[key.slice(COUNT_PREFIX.length)] = Number(parsed[key]);
   }
   if (countObj) {
+    // Preserve the row and its descriptors. Copying it would read scalar
+    // getters again, including accessors installed by inherited setters.
     for (const rel of Object.keys(countObj)) delete parsed[`${COUNT_PREFIX}${rel}`];
     parsed._count = countObj;
   }
   return parsed;
+}
+
+/**
+ * The warn-and-throw for a relation payload that could not be parsed as
+ * JSON, shared by {@link parseRelationValue} and the object decode plan so
+ * both report the same relation with the same cause chain.
+ */
+function throwRelationPayloadError(qi: BuilderCtx, relName: string, err: unknown): never {
+  const log = whereMod.adviceLogger(qi);
+  if (log && shouldWarnOnce(WARN_NS.relationParseFailure, `${qi.table}.${relName}`)) {
+    logTo(
+      log,
+      'warn',
+      `Relation "${relName}" on "${qi.table}" returned a payload that is not valid JSON. ` +
+        `This is a bug; please report it with the emitted SQL.`,
+      { code: 'relation-payload-json', table: qi.table, relation: relName },
+    );
+  }
+  throw new InvariantError(
+    'relation-payload-json',
+    `Relation "${relName}" on table "${qi.table}" returned a payload that could not be parsed as JSON.`,
+    { cause: err },
+  );
 }
 
 /**
@@ -1820,20 +1807,9 @@ function parseRelationValue(qi: BuilderCtx, relName: string, relDef: RelationDef
   // --- Non-empty values: full parse path ---
   if (typeof rawValue === 'string') {
     try {
-      const jsonVal = JSON.parse(rawValue);
       // After parsing, recurse via parseNestedRow so each item gets date
       // coercion AND its own sub-relations parsed at arbitrary depth.
-      if (Array.isArray(jsonVal)) {
-        return jsonVal.map((item: unknown) =>
-          typeof item === 'object' && item !== null
-            ? parseNestedRow(qi, item as Record<string, unknown>, relDef.to, true)
-            : item,
-        );
-      }
-      if (typeof jsonVal === 'object' && jsonVal !== null) {
-        return parseNestedRow(qi, jsonVal as Record<string, unknown>, relDef.to, true);
-      }
-      return jsonVal;
+      return parseRelationObject(qi, relDef, JSON.parse(rawValue));
     } catch (err) {
       // A relation column that does not parse is a bug in the emitted SQL or
       // a driver-level corruption, not a recoverable condition. Handing back
@@ -1846,23 +1822,14 @@ function parseRelationValue(qi: BuilderCtx, relName: string, relDef: RelationDef
       // per-relation loop: one 10,000-row page was 10,000 warnings. The
       // parse error stays out of the entry: its message quotes the payload,
       // which is row data.
-      const log = whereMod.adviceLogger(qi);
-      if (log && shouldWarnOnce(WARN_NS.relationParseFailure, `${qi.table}.${relName}`)) {
-        logTo(
-          log,
-          'warn',
-          `Relation "${relName}" on "${qi.table}" returned a payload that is not valid JSON. ` +
-            `This is a bug; please report it with the emitted SQL.`,
-          { code: 'relation-payload-json', table: qi.table, relation: relName },
-        );
-      }
-      throw new InvariantError(
-        'relation-payload-json',
-        `Relation "${relName}" on table "${qi.table}" returned a payload that could not be parsed as JSON.`,
-        { cause: err },
-      );
+      throwRelationPayloadError(qi, relName, err);
     }
   }
+  return parseRelationObject(qi, relDef, rawValue);
+}
+
+/** The same nested-object walk for driver-decoded JSON and JSON text. */
+function parseRelationObject(qi: BuilderCtx, relDef: RelationDef, rawValue: unknown): unknown {
   if (Array.isArray(rawValue)) {
     return rawValue.map((item) =>
       typeof item === 'object' && item !== null
@@ -2087,13 +2054,13 @@ export function buildRelationShape(
 }
 
 /**
- * Build the row parser for a `with` clause. In object mode this is just
- * {@link parseNestedRow}. In positional mode the relation shapes are built
- * once (not per row) and compiled into a decode plan
- * ({@link makePositionalRowParser}) that turns each positional array straight
- * into its parsed row. A query whose shapes the plan declines takes the
- * reference path instead, which decodes each positional array into the object
- * form and hands it to parseNestedRow.
+ * Build the row parser for a `with` clause. The relation shapes are built
+ * once per query (not per row) and compiled into a decode plan: in positional mode
+ * {@link makePositionalRowParser} turns each positional array straight into
+ * its parsed row, in object mode {@link makeObjectRowParser} does the same
+ * for each keyed JSON object. A query whose shapes the plan declines takes
+ * the reference path instead ({@link parseNestedRow}, in positional mode
+ * after decoding each array into the object form).
  */
 export function makeNestedParser(
   qi: BuilderCtx,
@@ -2106,7 +2073,32 @@ export function makeNestedParser(
   // ahead of the positional one.
   if (flattenPlan) return makeFlattenParser(qi, flattenPlan);
   if (qi.jsonEncoding !== 'positional') {
-    return (row) => parseNestedRow(qi, row, qi.table);
+    // The plan reads a row by position, so it is only worth building where
+    // the engine returns a JSON object's keys in the order the statement
+    // wrote them. MySQL sorts them: every row would fall back to the walker,
+    // and the plan would be built for each query and never used.
+    if (!qi.dialect.capabilities.jsonObjectKeysAsWritten) return (row) => parseNestedRow(qi, row, qi.table);
+    // Built lazily, on the first row actually decoded, never here: this
+    // parser can be constructed before its statement exists (the stream
+    // paths build it first), and the statement build owns validation and
+    // diagnostic ordering. Shape building can throw the same validation
+    // errors, so constructing eagerly would surface them ahead of that
+    // ordering and skip its warnings. If construction fails for any
+    // reason the query decodes through the reference; plan
+    // construction surfaces no error and no log line of its own.
+    let parser: ((row: Record<string, unknown>) => Record<string, unknown>) | undefined;
+    return (row) => {
+      if (parser === undefined) {
+        parser = (r) => parseNestedRow(qi, r, qi.table);
+        try {
+          parser =
+            makeObjectRowParser(qi, qi.table, buildRelationShapes(qi, qi.table, withClause, includePii)) ?? parser;
+        } catch {
+          // The reference parser above stays in place for this query.
+        }
+      }
+      return parser(row);
+    };
   }
   const shapes = buildRelationShapes(qi, qi.table, withClause, includePii);
   return makePositionalRowParser(qi, qi.table, shapes) ?? makeReferencePositionalParser(qi, shapes);
@@ -2214,9 +2206,18 @@ interface PositionalRelationPlan {
   readonly row: PositionalRowPlan;
 }
 
-/** How to turn one relation shape's positional array into its parsed row. */
+/**
+ * How to turn one relation shape's nested row into its parsed row. Shared by
+ * the positional decoder (which reads positions) and the object decoder
+ * (which reads {@link PositionalRowPlan.keys} by name): the field names,
+ * cell kinds, wire
+ * rules and decline checks are the same answers either way, so they are
+ * planned once, here.
+ */
 interface PositionalRowPlan {
   readonly table: string;
+  /** The shape's key order: scalar keys first, then relation slots. */
+  readonly keys: readonly string[];
   /** Output field per scalar position (scalars are positions `0..n-1`). */
   readonly fields: readonly string[];
   /** The JSON-wire rule per scalar position, `undefined` for most. */
@@ -2232,6 +2233,15 @@ interface PositionalRowPlan {
    * when that is key order, which it nearly always is.
    */
   readonly relationOrder: readonly number[] | null;
+  /**
+   * Object decoding only: set when a row of this shape arrives with the
+   * shape's keys in any other order (MySQL sorts JSON object keys). The plan
+   * decodes cells in shape order, which is the reference's decode order only
+   * for a shape-order row, so a marked node sends every later row of this
+   * result to the reference without repeating the comparison. Plans are
+   * built per query, so the mark never outlives one result.
+   */
+  unordered?: boolean;
 }
 
 /**
@@ -2329,6 +2339,7 @@ function planPositionalRow(qi: BuilderCtx, table: string, shape: RelationShape):
   if (written.size !== fields.length || relations.some((rel) => written.has(rel.name))) return undefined;
   return {
     table,
+    keys,
     fields,
     wire,
     cellPositions,
@@ -2349,41 +2360,61 @@ export function makePositionalRowParser(
   table: string,
   shapes: Record<string, RelationShape>,
 ): ((row: Record<string, unknown>) => Record<string, unknown>) | undefined {
+  return makeTopRowParser(qi, table, shapes, false);
+}
+
+/**
+ * The top-level planned parser both encodings share: the row's scalar half
+ * through {@link parseScalarColumns} exactly as the reference runs it, then
+ * each relation column replaced by its planned decode (or the reference's
+ * {@link parseRelationValue} for a relation the `with` clause did not plan).
+ * The encodings differ in three places, all keyed on `objectMode`: the
+ * positional reference reads relation columns off a `{ ...row }` copy (own
+ * enumerable only) with them already decoded, so it needs the plain-name and
+ * column-collision declines below and decodes a present-but-`undefined`
+ * slot, where the object reference reads the row directly and skips
+ * `undefined`. An object
+ * query with no planned relation at all (a bare `_count`) declines, where
+ * the positional one still has decoding of its own to do.
+ */
+function makeTopRowParser(
+  qi: BuilderCtx,
+  table: string,
+  shapes: Record<string, RelationShape>,
+  objectMode: boolean,
+): ((row: Record<string, unknown>) => Record<string, unknown>) | undefined {
   const meta = qi.schema.tables[table];
   if (!meta || !qi.rowDecodePlan || !qi.decodeCell) return undefined;
   const entries = getRelationEntries(qi, table, meta);
-  if (!entries.every(([name]) => isPlainKey(name))) return undefined;
+  if (!objectMode && !entries.every(([name]) => isPlainKey(name))) return undefined;
   const plans: (PositionalRelationPlan | null)[] = [];
+  let planned = false;
   for (const [name, def] of entries) {
     const shape = Object.hasOwn(shapes, name) ? shapes[name] : undefined;
     if (!shape) {
       plans.push(null);
       continue;
     }
-    // The reference runs the top-level row through parseRow with the relation
-    // columns already decoded; the plan runs it with them raw and replaces them
-    // after. Those agree only while parseRow copies a relation column through
-    // untouched, under its own name, and the `_count` fold never reads it.
-    if (name.startsWith(COUNT_PREFIX) || nameTouchesColumns(qi, table, meta, name)) return undefined;
+    if (!objectMode && (name.startsWith(COUNT_PREFIX) || nameTouchesColumns(qi, table, meta, name))) return undefined;
     const row = planPositionalRow(qi, def.to, shape);
     if (!row) return undefined;
     plans.push({ name, def, many: shape.cardinality === 'many', position: -1, row });
+    planned = true;
   }
+  if (objectMode && !planned) return undefined;
   const isOwnEnumerable = Object.prototype.propertyIsEnumerable;
   return (row) => {
     const parsed = parseScalarColumns(qi, row, table, meta, false);
     for (let i = 0; i < entries.length; i++) {
       const [name, def] = entries[i]!;
-      // The reference reads relation columns off a `{ ...row }` copy, which
-      // holds exactly the row's own enumerable properties.
-      if (!isOwnEnumerable.call(row, name)) continue;
+      if (objectMode ? row[name] === undefined : !isOwnEnumerable.call(row, name)) continue;
       const plan = plans[i]!;
-      if (plan !== null) {
-        parsed[name] = decodePlannedRelation(qi, row[name], plan);
-        continue;
-      }
       const raw = row[name];
-      if (raw !== undefined) parsed[name] = parseRelationValue(qi, name, def, raw);
+      if (plan !== null) {
+        parsed[name] = objectMode ? decodeObjectRelation(qi, raw, plan) : decodePlannedRelation(qi, raw, plan);
+      } else if (raw !== undefined) {
+        parsed[name] = parseRelationValue(qi, name, def, raw);
+      }
     }
     return parsed;
   };
@@ -2429,6 +2460,22 @@ function decodePlannedRelation(qi: BuilderCtx, raw: unknown, rel: PositionalRela
 
 /** One positional array through its row plan, into the parsed row. */
 function decodePlannedRow(qi: BuilderCtx, arr: unknown[], plan: PositionalRowPlan): Record<string, unknown> {
+  return decodePlannedRowWith(qi, arr, plan, decodePlannedRelation);
+}
+
+/**
+ * The planned row write both decoders share: scalars and cell decodes from a
+ * values array in shape order (a positional array as it arrived, or
+ * `Object.values` of a keyed row whose keys were verified to be in shape
+ * order), then relation slots through the caller's relation decoder, which
+ * is where the two encodings' value semantics differ.
+ */
+function decodePlannedRowWith(
+  qi: BuilderCtx,
+  arr: unknown[],
+  plan: PositionalRowPlan,
+  decodeRelation: (qi: BuilderCtx, raw: unknown, rel: PositionalRelationPlan) => unknown,
+): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   const { fields, wire, cellPositions, cellKinds, relations, table } = plan;
   for (let i = 0; i < fields.length; i++) {
@@ -2452,17 +2499,120 @@ function decodePlannedRow(qi: BuilderCtx, arr: unknown[], plan: PositionalRowPla
   if (relations.length > 0) {
     const order = plan.relationOrder;
     if (order === null) {
-      for (const rel of relations) out[rel.name] = decodePlannedRelation(qi, arr[rel.position], rel);
+      for (const rel of relations) out[rel.name] = decodeRelation(qi, arr[rel.position], rel);
     } else {
       // Claim the keys in key order first, then decode in the reference's order.
       for (const rel of relations) out[rel.name] = undefined;
       for (const index of order) {
         const rel = relations[index]!;
-        out[rel.name] = decodePlannedRelation(qi, arr[rel.position], rel);
+        out[rel.name] = decodeRelation(qi, arr[rel.position], rel);
       }
     }
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Object decode plan: one pass from a keyed JSON object to its parsed row
+//
+// The same plan the positional decoder runs, read by key instead of by
+// position. It is held to {@link parseNestedRow} the way the positional plan
+// is held to its reference: field names, cell kinds and wire rules come from
+// the shared {@link PositionalRowPlan} (so every decline check in
+// `planPositionalRow` applies here too), cell decodes go through
+// `qi.decodeCell`, and the work runs in the reference's order. One thing
+// differs from the positional decoder: a keyed row's own key order is not
+// guaranteed to be the shape's (MySQL sorts JSON object keys by length then
+// bytes, and a caller-supplied JSON type parser can reorder freely), and
+// the reference decodes cells in the order the row carries them, which is
+// observable through the logger. The plan therefore decodes only a row
+// whose keys are exactly the shape's keys in shape order; any other row
+// (permuted, a missing or extra key, a `_count__` field, a relation the
+// `with` clause did not ask for) falls back to `parseNestedRow`, decided
+// before any cell decode runs, so the fallback decodes exactly once. A
+// permuted row also marks its plan node (see `PositionalRowPlan.unordered`)
+// so an engine that never emits shape order pays the comparison once per
+// shape per result, not once per row.
+// ---------------------------------------------------------------------------
+
+/**
+ * Compile a top-level object parser for `shapes` (see `makeTopRowParser`),
+ * or `undefined` when a shape is declined or nothing is planned.
+ */
+export function makeObjectRowParser(
+  qi: BuilderCtx,
+  table: string,
+  shapes: Record<string, RelationShape>,
+): ((row: Record<string, unknown>) => Record<string, unknown>) | undefined {
+  return makeTopRowParser(qi, table, shapes, true);
+}
+
+/**
+ * One relation value through the object plan: exactly what the reference
+ * produces by {@link parseRelationValue}. The shortcuts and the dispatch on
+ * the value's type are the reference's; only the per-row walk is planned.
+ */
+function decodeObjectRelation(qi: BuilderCtx, raw: unknown, rel: PositionalRelationPlan): unknown {
+  if (raw === null || raw === 'null') return null;
+  if (raw === '[]') return [];
+  if (Array.isArray(raw) && raw.length === 0) return [];
+  let value = raw;
+  let wrapped = false;
+  if (typeof raw === 'string') {
+    try {
+      value = JSON.parse(raw);
+    } catch (err) {
+      throwRelationPayloadError(qi, rel.name, err);
+    }
+    wrapped = true;
+  }
+  // The reference parses AND decodes a string payload inside one try, so a
+  // failure deep in it is re-reported against THIS relation, with the inner
+  // failure as its cause. The `wrapped` catch mirrors that exactly.
+  try {
+    if (Array.isArray(value)) {
+      const out: unknown[] = [];
+      for (let i = 0; i < value.length; i++) {
+        const item: unknown = value[i];
+        out.push(
+          typeof item === 'object' && item !== null
+            ? Array.isArray(item)
+              ? parseNestedRow(qi, item as unknown as Record<string, unknown>, rel.def.to, true)
+              : decodeObjectRow(qi, item as Record<string, unknown>, rel.row)
+            : item,
+        );
+      }
+      return out;
+    }
+    if (typeof value === 'object' && value !== null) {
+      return decodeObjectRow(qi, value as Record<string, unknown>, rel.row);
+    }
+    return value;
+  } catch (err) {
+    if (wrapped) throwRelationPayloadError(qi, rel.name, err);
+    throw err;
+  }
+}
+
+/** One keyed JSON object through its row plan, into the parsed row. */
+function decodeObjectRow(
+  qi: BuilderCtx,
+  row: Record<string, unknown>,
+  plan: PositionalRowPlan,
+): Record<string, unknown> {
+  const { keys, table } = plan;
+  if (plan.unordered) return parseNestedRow(qi, row, table, true);
+  const rowKeys = Object.keys(row);
+  if (rowKeys.length !== keys.length) return parseNestedRow(qi, row, table, true);
+  for (let i = 0; i < keys.length; i++) {
+    if (rowKeys[i] !== keys[i]) {
+      plan.unordered = true;
+      return parseNestedRow(qi, row, table, true);
+    }
+  }
+  // The compare above is what proves the row is in shape order, so nothing
+  // is assumed; `Object.values` of such a row is its values in that order.
+  return decodePlannedRowWith(qi, Object.values(row), plan, decodeObjectRelation);
 }
 
 // ---------------------------------------------------------------------------
@@ -2645,15 +2795,7 @@ export function provableUniqueTargetKey(relDef: RelationDef, targetMeta: TableMe
   }
   if (cols.length === 0) return null;
   if (!cols.every((col) => targetMeta.allColumns.includes(col))) return null;
-  if (sameColumnSet(cols, targetMeta.primaryKey)) return cols;
-  for (const unique of targetMeta.uniqueColumns) {
-    if (sameColumnSet(cols, unique)) return cols;
-  }
-  for (const idx of targetMeta.indexes) {
-    if (!idx.unique || idx.partial || idx.docPath) continue;
-    if (sameColumnSet(cols, idx.columns)) return cols;
-  }
-  return null;
+  return uniqueKeyNames(targetMeta).some((key) => sameColumnSet(cols, key)) ? cols : null;
 }
 
 /**
@@ -2810,7 +2952,7 @@ function flattenNodeSignature(node: FlattenNode): string {
  *
  * Off when `diagnostics` turn advice off, like the other planner notes, and
  * deduped through the shared registry so a hot query logs once rather than per
- * call. Note that a flatten plan is recomputed on the build, param-collect and
+ * call. A flatten plan is recomputed on the build, param-collect and
  * row-assembly paths for the same query; the registry is what keeps that to
  * one line.
  */
@@ -3231,7 +3373,7 @@ export function buildSelectWithRelations(
 
   const cols = columnsList ?? meta.allColumns;
   const qtbl = qi.q(table);
-  const baseCols = cols.map((col) => `${qtbl}.${qi.q(col)}`).join(', ');
+  const baseCols = qualifiedColumns(qi, cols, qtbl);
 
   const relationSelects: string[] = [];
   const aliasCounter = { n: 0 };
@@ -3275,6 +3417,46 @@ export function buildSelectWithRelations(
   }
 
   return [baseCols, ...relationSelects].join(', ');
+}
+
+/** Append nested JSON slots at the caller's existing parameter position. */
+function appendNestedJson(
+  qi: BuilderCtx,
+  pairs: [string, string][],
+  relDef: RelationDef,
+  targetMeta: TableMetadata,
+  withClause: WithClause | undefined,
+  params: unknown[],
+  parentAlias: string,
+  aliasCounter: { n: number },
+  depth: number,
+  path: string[],
+  includePii: boolean | undefined,
+  manyFallback = false,
+): void {
+  if (!withClause) return;
+  for (const [name, spec] of sortedEntries(withClause)) {
+    const nested = ownLookup(targetMeta.relations, name);
+    if (!nested)
+      throw new RelationError(
+        `Unknown relation "${name}" on table "${relDef.to}". ` +
+          availableClause(Object.keys(targetMeta.relations), `"${relDef.to}" has no relations.`),
+      );
+    const subquery = buildRelationSubquery(
+      qi,
+      nested,
+      spec,
+      params,
+      parentAlias,
+      aliasCounter,
+      depth + 1,
+      [...path, relDef.name],
+      includePii,
+    );
+    const array = manyFallback ? nested.type !== 'belongsTo' && nested.type !== 'hasOne' : nested.type === 'hasMany';
+    const fallback = array ? qi.dialect.emptyJsonArrayLiteral : qi.dialect.nullJsonLiteral;
+    pairs.push([name, qi.dialect.wrapJsonSubresult(subquery, fallback)]);
+  }
 }
 
 /**
@@ -3410,7 +3592,7 @@ export function buildRelationSubquery(
   if (log) {
     const warnKey = `${relDef.from}.${relDef.name}`;
     // Compute the (potentially costly) probe only for a key not yet warned, and
-    // claim the key through the process-wide registry ONLY when we actually warn,
+    // claim the key through the process-wide registry ONLY when emitting a warning,
     // so a dual-package / HMR-reevaluated second module copy cannot re-warn the
     // same relation, and indexed relations never consume the dedupe cap.
     if (!hasWarnedOnce(WARN_NS.unindexedRelation, warnKey)) {
@@ -3508,7 +3690,7 @@ export function buildRelationSubquery(
 
   // Determine if this hasMany will take the wrapped subquery path (LIMIT or ORDER BY).
   // When wrapping, nested relations are built in the wrapped path referencing innerAlias,
-  // so we must NOT build them here (they would push orphaned params).
+  // so do NOT build them here (they would push orphaned params).
   // An orderBy with no defined entries (`orderBy: {}`) is treated as absent -
   // it must neither trigger the wrap (dropping nested relations) nor render a
   // dangling `ORDER BY `. `limit: 0` is meaningful (LIMIT 0) and DOES wrap.
@@ -3537,34 +3719,22 @@ export function buildRelationSubquery(
     );
   }
 
-  // Nested relations, only in the non-wrapped path (wrapped path builds them separately)
-  if (!willWrap && opts.with) {
-    for (const [nestedRelName, nestedSpec] of sortedEntries(opts.with)) {
-      const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
-      if (!nestedRelDef) {
-        throw new RelationError(
-          `Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
-            availableClause(Object.keys(targetMeta.relations), `"${relDef.to}" has no relations.`),
-        );
-      }
-      // Recursively build nested subquery, passing THIS alias as the parent reference
-      const nestedSubquery = buildRelationSubquery(
-        qi,
-        nestedRelDef,
-        nestedSpec,
-        params,
-        alias,
-        aliasCounter,
-        currentDepth + 1,
-        [...currentPath, relDef.name],
-        includePii,
-      );
-      // Use '[]'::json for hasMany (empty array), NULL for belongsTo/hasOne (no object)
-      const fallback = nestedRelDef.type === 'hasMany' ? qi.dialect.emptyJsonArrayLiteral : qi.dialect.nullJsonLiteral;
-      jsonPairs.push([nestedRelName, qi.dialect.wrapJsonSubresult(nestedSubquery, fallback)]);
-    }
-  }
-
+  // The two SELECT levels differ only in their row alias. Invoke at the
+  // original bind position so nested WHERE params stay before or after paging.
+  if (!willWrap)
+    appendNestedJson(
+      qi,
+      jsonPairs,
+      relDef,
+      targetMeta,
+      opts.with as WithClause | undefined,
+      params,
+      alias,
+      aliasCounter,
+      currentDepth,
+      currentPath,
+      includePii,
+    );
   const jsonObj = buildJsonRow(qi, jsonPairs);
 
   // Quote parent ref, can be a table name or auto-generated alias
@@ -3632,35 +3802,22 @@ export function buildRelationSubquery(
       const innerAlias = `${alias}i`;
       // Rewrite: SELECT json_agg(json_build_object(...)) FROM (SELECT * FROM table WHERE ... ORDER BY ... LIMIT N) AS alias
       // Inner SELECT always needs all columns for WHERE/ORDER to work; json_build_object filters later
-      const innerSql = `SELECT ${targetMeta.allColumns.map((c) => `${alias}.${qi.q(c)}`).join(', ')} FROM ${qTarget} ${alias} WHERE ${whereClause}${orderClause}${limitClause}`;
+      const innerSql = `SELECT ${qualifiedColumns(qi, targetMeta.allColumns, alias)} FROM ${qTarget} ${alias} WHERE ${whereClause}${orderClause}${limitClause}`;
       // For the json_build_object, reference the inner alias, only include resolved columns
       const innerJsonPairs: [key: string, expr: string][] = jsonScalarPairs(qi, targetMeta, targetColumns, innerAlias);
-      // Build nested relation subqueries referencing innerAlias
-      if (opts.with) {
-        for (const [nestedRelName, nestedSpec] of sortedEntries(opts.with)) {
-          const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
-          if (!nestedRelDef) {
-            throw new RelationError(
-              `Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
-                availableClause(Object.keys(targetMeta.relations), `"${relDef.to}" has no relations.`),
-            );
-          }
-          const nestedSub = buildRelationSubquery(
-            qi,
-            nestedRelDef,
-            nestedSpec,
-            params,
-            innerAlias,
-            aliasCounter,
-            currentDepth + 1,
-            [...currentPath, relDef.name],
-            includePii,
-          );
-          const fallback =
-            nestedRelDef.type === 'hasMany' ? qi.dialect.emptyJsonArrayLiteral : qi.dialect.nullJsonLiteral;
-          innerJsonPairs.push([nestedRelName, qi.dialect.wrapJsonSubresult(nestedSub, fallback)]);
-        }
-      }
+      appendNestedJson(
+        qi,
+        innerJsonPairs,
+        relDef,
+        targetMeta,
+        opts.with as WithClause | undefined,
+        params,
+        innerAlias,
+        aliasCounter,
+        currentDepth,
+        currentPath,
+        includePii,
+      );
       const innerJsonObj = buildJsonRow(qi, innerJsonPairs);
       return `SELECT ${qi.dialect.buildJsonArrayAgg(innerJsonObj)} FROM (${innerSql}) ${innerAlias}`;
     }
@@ -3728,7 +3885,7 @@ export function buildManyToManySubquery(
   // JOIN: junction.targetKey = target.<targetPK>. Composite keys pair positionally.
   const targetKeys = normalizeKeyColumns(relDef.through.targetKey);
   // The target PK is the column(s) the junction's targetKey references. An empty
-  // introspected PK means we cannot know what to JOIN on, fail loudly rather than
+  // introspected PK leaves no known JOIN column: fail loudly rather than
   // silently guessing `id` and generating a wrong JOIN.
   if (targetMeta.primaryKey.length === 0) {
     throw new ValidationError(
@@ -3793,76 +3950,28 @@ export function buildManyToManySubquery(
 
   const fromJoin = `FROM ${qTarget} ${talias} JOIN ${qJunction} ${jalias} ON ${joinOn}`;
 
-  // When LIMIT or ORDER BY is present, wrap the joined rows in an inner subquery
-  // so the LIMIT applies to rows BEFORE aggregation (same approach as hasMany).
-  if (limitClause || orderClause) {
-    const innerAlias = `${talias}i`;
-    const innerSql =
-      `SELECT ${targetMeta.allColumns.map((c) => `${talias}.${qi.q(c)}`).join(', ')} ` +
-      `${fromJoin} WHERE ${whereClause}${orderClause}${limitClause}`;
-    const innerJsonPairs: [key: string, expr: string][] = jsonScalarPairs(qi, targetMeta, targetColumns, innerAlias);
-    // Nested relations reference the inner alias.
-    if (opts.with) {
-      for (const [nestedRelName, nestedSpec] of sortedEntries(opts.with)) {
-        const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
-        if (!nestedRelDef) {
-          throw new RelationError(
-            `Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
-              availableClause(Object.keys(targetMeta.relations), `"${relDef.to}" has no relations.`),
-          );
-        }
-        const nestedSub = buildRelationSubquery(
-          qi,
-          nestedRelDef,
-          nestedSpec,
-          params,
-          innerAlias,
-          aliasCounter,
-          currentDepth + 1,
-          [...currentPath, relDef.name],
-          includePii,
-        );
-        const fallback =
-          nestedRelDef.type === 'belongsTo' || nestedRelDef.type === 'hasOne'
-            ? qi.dialect.nullJsonLiteral
-            : qi.dialect.emptyJsonArrayLiteral;
-        innerJsonPairs.push([nestedRelName, qi.dialect.wrapJsonSubresult(nestedSub, fallback)]);
-      }
-    }
-    const innerJsonObj = buildJsonRow(qi, innerJsonPairs);
-    return `SELECT ${qi.dialect.buildJsonArrayAgg(innerJsonObj)} FROM (${innerSql}) ${innerAlias}`;
-  }
-
-  // Simple path: build the json object pairs directly off the target alias,
-  // including any nested relations (correlated to the target alias).
-  const jsonPairs: [key: string, expr: string][] = jsonScalarPairs(qi, targetMeta, targetColumns, talias);
-  if (opts.with) {
-    for (const [nestedRelName, nestedSpec] of sortedEntries(opts.with)) {
-      const nestedRelDef = ownLookup(targetMeta.relations, nestedRelName);
-      if (!nestedRelDef) {
-        throw new RelationError(
-          `Unknown relation "${nestedRelName}" on table "${targetTable}". ` +
-            availableClause(Object.keys(targetMeta.relations), `"${relDef.to}" has no relations.`),
-        );
-      }
-      const nestedSub = buildRelationSubquery(
-        qi,
-        nestedRelDef,
-        nestedSpec,
-        params,
-        talias,
-        aliasCounter,
-        currentDepth + 1,
-        [...currentPath, relDef.name],
-        includePii,
-      );
-      const fallback =
-        nestedRelDef.type === 'belongsTo' || nestedRelDef.type === 'hasOne'
-          ? qi.dialect.nullJsonLiteral
-          : qi.dialect.emptyJsonArrayLiteral;
-      jsonPairs.push([nestedRelName, qi.dialect.wrapJsonSubresult(nestedSub, fallback)]);
-    }
-  }
+  // Both shapes project the same row after their filters and paging have
+  // bound. Only its alias and FROM source differ.
+  const wrapped = !!(limitClause || orderClause);
+  const rowAlias = wrapped ? `${talias}i` : talias;
+  const from = wrapped
+    ? `FROM (SELECT ${qualifiedColumns(qi, targetMeta.allColumns, talias)} ${fromJoin} WHERE ${whereClause}${orderClause}${limitClause}) ${rowAlias}`
+    : `${fromJoin} WHERE ${whereClause}`;
+  const jsonPairs: [key: string, expr: string][] = jsonScalarPairs(qi, targetMeta, targetColumns, rowAlias);
+  appendNestedJson(
+    qi,
+    jsonPairs,
+    relDef,
+    targetMeta,
+    opts.with as WithClause | undefined,
+    params,
+    rowAlias,
+    aliasCounter,
+    currentDepth,
+    currentPath,
+    includePii,
+    true,
+  );
   const jsonObj = buildJsonRow(qi, jsonPairs);
-  return `SELECT ${qi.dialect.buildJsonArrayAgg(jsonObj)} ${fromJoin} WHERE ${whereClause}`;
+  return `SELECT ${qi.dialect.buildJsonArrayAgg(jsonObj)} ${from}`;
 }

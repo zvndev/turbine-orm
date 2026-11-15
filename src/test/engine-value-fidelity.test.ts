@@ -17,7 +17,7 @@
  *     all four relation plans.
  *  2. A column Turbine GENERATES a `boolean` type for must read back as a
  *     boolean, whatever the schema calls the column and whatever the driver can
- *     tell us. SQLite has no boolean storage class and MySQL's is `TINYINT(1)`,
+ *     distinguish. SQLite has no boolean storage class and MySQL's is `TINYINT(1)`,
  *     so a value the ORM itself wrote as `true` came back as 1, `row.ok ===
  *     true` was false, and `JSON.stringify(row)` emitted `1`. Both engines fix
  *     it from a capability only the DIRECT read paths have (result-field
@@ -46,11 +46,13 @@
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
-import { after, describe, it as nodeIt } from 'node:test';
+import { after, describe, it } from 'node:test';
 import { ConnectionError, REDACTED_DETAIL, setErrorMessageMode } from '../errors.js';
 import { mssqlDialect } from '../mssql.js';
 import { mysqlDialect } from '../mysql.js';
 import type { SchemaMetadata } from '../schema.js';
+import { skipGate } from './helpers.js';
+import { closeSqliteAfter, sqliteFixtureScope } from './sqlite-fixture-lifetime.js';
 
 // ---------------------------------------------------------------------------
 // SQLite harness (in-process, no server)
@@ -63,10 +65,8 @@ try {
 } catch {
   DatabaseSync = undefined;
 }
-const sqliteSkip = DatabaseSync ? '' : 'requires node:sqlite (Node >= 22.5)';
-const it: typeof nodeIt = sqliteSkip
-  ? (((name: string) => nodeIt(name, { skip: sqliteSkip }, () => {})) as typeof nodeIt)
-  : nodeIt;
+
+const { it: sqliteIt } = skipGate(!DatabaseSync, 'requires node:sqlite (Node >= 22.5)');
 
 /**
  * Does THIS runtime's `node:sqlite` report a result column's declared type?
@@ -119,14 +119,14 @@ let handle: DatabaseSyncType | undefined;
 
 async function connect(): Promise<void> {
   const { introspectSqliteDatabase, turbineSqlite } = await import('../sqlite.js');
-  // Safe: only called when `sqliteSkip` is '', i.e. the probe above found it.
-  handle = new (DatabaseSync as DatabaseSyncCtor)(':memory:');
+  // Only called by tests admitted by the native SQLite prerequisite gate.
+  handle = closeSqliteAfter(new (DatabaseSync as DatabaseSyncCtor)(':memory:'), sqliteCleanup);
   handle.exec(DDL);
   const schema: SchemaMetadata = introspectSqliteDatabase(handle);
   client = turbineSqlite(handle, schema, { warnOnUnlimited: false });
 }
 
-after(async () => {
+const sqliteCleanup = sqliteFixtureScope(async () => {
   if (client) await client.disconnect();
 });
 
@@ -135,7 +135,7 @@ after(async () => {
 // ---------------------------------------------------------------------------
 
 describe('engine value fidelity: a declared boolean reads back as a boolean on every path', () => {
-  it('agrees across top level, join, batched and flatten', async () => {
+  sqliteIt('agrees across top level, join, batched and flatten', async () => {
     if (!client) await connect();
 
     const top = await client.table('items').findMany({ orderBy: { id: 'asc' } });
@@ -158,7 +158,7 @@ describe('engine value fidelity: a declared boolean reads back as a boolean on e
     }
   });
 
-  it('returns a boolean from a write the ORM itself performed', async () => {
+  sqliteIt('returns a boolean from a write the ORM itself performed', async () => {
     if (!client) await connect();
     const created = await client.table('items').create({ data: { orgId: 1, ok: true, n: 7 } });
     assert.equal(created.ok, TRUE_VALUE);
@@ -166,7 +166,7 @@ describe('engine value fidelity: a declared boolean reads back as a boolean on e
     assert.equal(readBack.ok, TRUE_VALUE);
   });
 
-  it('leaves a non-boolean value in a declared-boolean column alone, on every path', async () => {
+  sqliteIt('leaves a non-boolean value in a declared-boolean column alone, on every path', async () => {
     // SQLite does not enforce the declared type, so a column declared BOOLEAN
     // can hold anything. Only 0 and 1 mean true/false; everything else has to
     // read back as the driver returns it, and identically on the join path,
@@ -203,8 +203,7 @@ describe('engine value fidelity: the SQLite boolean rule is gated on the capabil
     }
   };
 
-  it('declares no BOOL rule when the driver cannot report declared types', async (t) => {
-    if (sqliteSkip) return;
+  sqliteIt('declares no BOOL rule when the driver cannot report declared types', async (t) => {
     if (noCapabilitySkip) return t.skip(noCapabilitySkip);
     const { sqliteDialect } = await import('../sqlite.js');
     // Present by default on a supported Node: the rule exists.
@@ -214,12 +213,11 @@ describe('engine value fidelity: the SQLite boolean rule is gated on the capabil
     });
   });
 
-  it('reads 1/0 on BOTH the top level and the join when the capability is missing', async (t) => {
-    if (sqliteSkip) return;
+  sqliteIt('reads 1/0 on BOTH the top level and the join when the capability is missing', async (t) => {
     if (noCapabilitySkip) return t.skip(noCapabilitySkip);
     const { introspectSqliteDatabase, turbineSqlite } = await import('../sqlite.js');
     await withoutColumns(async () => {
-      const db = new (DatabaseSync as DatabaseSyncCtor)(':memory:');
+      const db = closeSqliteAfter(new (DatabaseSync as DatabaseSyncCtor)(':memory:'));
       db.exec(DDL);
       // biome-ignore lint/suspicious/noExplicitAny: see `client` above.
       const c: any = turbineSqlite(db, introspectSqliteDatabase(db), { warnOnUnlimited: false });
@@ -279,10 +277,8 @@ describe('engine value fidelity: MySQL json and boolean carry through the join s
 });
 
 const MSSQL_URL = process.env.MSSQL_URL ?? process.env.MSSQL_TEST_URL ?? '';
-const mssqlSkip = MSSQL_URL ? '' : 'requires MSSQL_URL pointing at a SQL Server 2016+ instance';
-const mssqlIt: typeof nodeIt = mssqlSkip
-  ? (((name: string) => nodeIt(name, { skip: mssqlSkip }, () => {})) as typeof nodeIt)
-  : nodeIt;
+
+const { it: mssqlIt } = skipGate(!MSSQL_URL, 'requires MSSQL_URL pointing at a SQL Server 2016+ instance');
 
 describe('engine value fidelity: SQL Server agrees across paths AND pool shapes', () => {
   // The same two questions asked of MySQL, asked here because the answers are
@@ -377,10 +373,8 @@ describe('engine value fidelity: SQL Server agrees across paths AND pool shapes'
 // ---------------------------------------------------------------------------
 
 const MYSQL_URL = process.env.MYSQL_URL ?? process.env.MYSQL_TEST_URL ?? '';
-const mysqlSkip = MYSQL_URL ? '' : 'requires MYSQL_URL / MYSQL_TEST_URL pointing at a MySQL 8 server';
-const mysqlIt: typeof nodeIt = mysqlSkip
-  ? (((name: string) => nodeIt(name, { skip: mysqlSkip }, () => {})) as typeof nodeIt)
-  : nodeIt;
+
+const { it: mysqlIt } = skipGate(!MYSQL_URL, 'requires MYSQL_URL / MYSQL_TEST_URL pointing at a MySQL 8 server');
 
 describe('engine value fidelity: a MySQL json column reads the same on every path AND every pool shape', () => {
   // The pool shape is the second axis, and the one a dialect-only test cannot
@@ -730,11 +724,10 @@ describe("errorMessages: 'safe' withholds row values that live in the driver mes
 // ---------------------------------------------------------------------------
 
 describe('errorMessages is per client, not the last constructor to run', () => {
-  it('two clients at different modes each keep their own', async () => {
-    if (sqliteSkip) return;
+  sqliteIt('two clients at different modes each keep their own', async () => {
     const { introspectSqliteDatabase, turbineSqlite } = await import('../sqlite.js');
     const build = (mode: 'safe' | 'verbose') => {
-      const db = new (DatabaseSync as DatabaseSyncCtor)(':memory:');
+      const db = closeSqliteAfter(new (DatabaseSync as DatabaseSyncCtor)(':memory:'));
       db.exec(`CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE);
                INSERT INTO users (id, email) VALUES (1, 'alice@example.com');`);
       // biome-ignore lint/suspicious/noExplicitAny: see `client` above.

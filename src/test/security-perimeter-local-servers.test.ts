@@ -42,6 +42,7 @@ import {
 import { createDemoContext } from '../cli/studio-demo.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { mockTable, skipGate } from './helpers.js';
+import { closeSqliteContextAfter } from './sqlite-fixture-lifetime.js';
 import { studioTestStateDir } from './studio-test-state.js';
 
 const STATE_DIR = studioTestStateDir();
@@ -221,7 +222,7 @@ function options(): StudioOptions {
 }
 
 function demoCtx(extra: Partial<StudioContext> = {}): StudioContext {
-  const demo = createDemoContext();
+  const demo = closeSqliteContextAfter(createDemoContext());
   return {
     pool: demo.pool,
     metadata: demo.metadata,

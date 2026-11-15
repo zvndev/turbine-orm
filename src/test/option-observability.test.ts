@@ -229,6 +229,11 @@ const OBSERVATION: Record<string, Observation> = {
   // A cursor carries a value for every column of its page order, which on the
   // composite-key table includes the `tenantId` tiebreaker.
   cursor: { how: 'compiled', value: { id: 5, tenantId: 't1' }, needs: { orderBy: { id: 'asc' } } },
+  cursorPredicate: {
+    how: 'compiled',
+    value: 'tuple',
+    needs: { cursor: { id: 5, tenantId: 't1' }, orderBy: { tenantId: 'asc' } },
+  },
   distinct: { how: 'compiled', value: ['name'] },
   distinctOn: { how: 'compiled', value: { columns: ['name'], orderBy: { id: 'desc' } } },
 
@@ -409,11 +414,10 @@ describe('the option matrix itself', () => {
     // `lock` is the one deliberate omission: a cursor cannot hold its rows
     // locked across fetches, so streams refuse it. Pinned by name.
     assert.deepEqual(missing, ['lock'], 'the streaming reads dropped a findMany option');
-    // The two legitimate additions, pinned by name so a THIRD divergence cannot
-    // hide behind them: `batchSize` (findManyStreamBatches yields T[] and needs
-    // to be told how big a batch is) and `idleTimeoutMs` (how long a cursor may
-    // wait for its consumer, which a one-shot read never does).
-    assert.deepEqual(extra, ['batchSize', 'idleTimeoutMs'], 'the streaming table grew an unexpected option');
+    // The three legitimate additions are pinned by name: cancellation applies
+    // only to streams, batchSize bounds pulls, and idleTimeoutMs closes a cursor
+    // waiting for its consumer. Any further divergence must be deliberate.
+    assert.deepEqual(extra, ['signal', 'batchSize', 'idleTimeoutMs'], 'the streaming table grew an unexpected option');
   });
 
   it('the matrix is not vacuous', () => {

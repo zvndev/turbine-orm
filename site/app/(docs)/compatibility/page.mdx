@@ -13,15 +13,17 @@ Turbine targets PostgreSQL, so it also runs on databases that speak the PostgreS
 
 ## Compatibility matrix
 
+Status says how each one is tested. Only PostgreSQL itself runs the full suite in CI. The others are expected to work because they speak the same protocol, which is not the same as being tested; the [engine support matrix](https://github.com/zvndev/turbine-orm/blob/main/docs/engine-support.md) has the evidence for each.
+
 | Database | Adapter | Status | Notes |
 |---|---|---|---|
-| **PostgreSQL** 14+ | None | Full | CI runs the full suite on 14, 15, 16 and 17. Older servers may work but are untested. |
-| **AlloyDB** | `alloydb` (no-op) | Full | Same wire protocol, catalogs and SQL as PostgreSQL. |
-| **TimescaleDB** | `timescale` (no-op) | Full | Hypertables introspect as tables. |
-| **Neon** | None | Full | Use [`turbine-orm/serverless`](/serverless) for its HTTP driver. |
-| **Supabase** | None | Full | Standard PostgreSQL; connect directly. |
+| **PostgreSQL** 14+ | None | Supported | CI runs the full suite on 14, 15, 16, 17 and 18. Servers older than 14 are untested. |
+| **AlloyDB** | `alloydb` (no-op) | Compatible by protocol, not tested in CI | Same wire protocol, catalogs and SQL as PostgreSQL. No test connects to AlloyDB. |
+| **TimescaleDB** | `timescale` (no-op) | Compatible by protocol, not tested in CI | Hypertables are expected to introspect as tables. No test connects to TimescaleDB. |
+| **Neon** | None | Compatible by protocol, not tested in CI | Connect directly, or use [`turbine-orm/serverless`](/serverless), [`turbine-orm/neon-ws` or `turbine-orm/neon-http`](/engines#engines-and-transports-added-in-094). CI runs the Neon driver only against local stand-ins for Neon, never hosted Neon. |
+| **Supabase** | None | Compatible by protocol, not tested in CI | Standard PostgreSQL; connect directly. No test connects to Supabase. |
 | **YugabyteDB** | `yugabytedb` | Experimental | CI runs only a statement-timeout check, nightly. |
-| **CockroachDB** | `cockroachdb` | Experimental | CI runs a statement-timeout and row-lock check on v24.1. Results below are from v26.2.5. |
+| **CockroachDB** | `cockroachdb` | Experimental | CI runs a Studio statement-timeout test and two row-lock tests on v24.1. Results below are from v26.2.5. |
 
 Connect to any of them with a standard connection string:
 

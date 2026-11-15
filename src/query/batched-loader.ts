@@ -57,10 +57,6 @@
 import type { PartitionLimitInput } from '../dialect.js';
 import { CircularRelationError, RelationError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import type { PgCompatQueryResult } from '../pg-types.js';
-import { normalizeKeyColumns, type RelationDef, type SchemaMetadata, type TableMetadata } from '../schema.js';
-import type { ReselectExecutor } from './builder.js';
-import { dedupeOrderEntries, isOrderBySpec, isRelationPickOrderBy, orderByEntries, sortedEntries } from './filters.js';
-import type { SkipGlobalFilters, Unsafe, WithClause, WithCount, WithOptions } from './types.js';
 import {
   availableClause,
   boundedPreparedName,
@@ -70,7 +66,11 @@ import {
   resolveColumnName,
   selectNamesNothingMessage,
   selectOmitExclusiveMessage,
-} from './utils.js';
+} from '../query-utils.js';
+import { normalizeKeyColumns, type RelationDef, type SchemaMetadata, type TableMetadata } from '../schema.js';
+import type { ReselectExecutor } from './builder.js';
+import { dedupeOrderEntries, isOrderBySpec, isRelationPickOrderBy, orderByEntries, sortedEntries } from './filters.js';
+import type { SkipGlobalFilters, Unsafe, WithClause, WithCount, WithOptions } from './types.js';
 
 /**
  * Max parent keys per follow-up query. On Postgres the whole key set travels as
@@ -570,7 +570,7 @@ export function resolveCountRelations(parentMeta: TableMetadata, countSpec: With
 }
 
 /**
- * Stringified stitch key, robust to number/uuid/bigint type drift across a join.
+ * Stringified stitch key, tolerating number/uuid/bigint type drift across a join.
  * A binary key is keyed by its bytes: `String()` of a Buffer decodes it as
  * UTF-8, which maps different invalid sequences to the same replacement text.
  * A Date by its instant, which `String()` truncates to the second.
@@ -674,15 +674,13 @@ export async function loadRelationsBatched(
   // choice is made by a cost heuristic reading index coverage and table size.
   // The same code therefore worked on a small table and threw on a large one.
   //
-  // That is the same non-determinism as the correlation-key bug this module was
-  // just fixed for, only louder, so it is closed the same way: by agreement.
   // Refusing is the direction that is a no-op for anyone on the default, since
   // there the shape already fails whenever the relation is NOT demoted. Nested
   // `_count` is a real feature (Prisma has it) and teaching the join path is
   // the right end state, but that means the four json_build_object emission
   // sites, the positional encoding, SQL Server's FOR JSON override and PowDB's
-  // nested projections all learning it together, which is a feature release,
-  // not a line in a correctness fix. Until then both strategies say no.
+  // nested projections all need support together before either strategy can
+  // accept it. Until then both strategies refuse it.
   if (hasCount && depth > 0) {
     throw new RelationError(
       `Unknown relation "_count" on table "${ctx.parentMeta.name}". ` +
@@ -1082,7 +1080,7 @@ async function loadManyToMany(
   const parentKeys = uniqueKeys(parents, parentRefField);
 
   // (1) Junction rows: sourceKeyVal → [targetKeyVal]. Raw SQL through the caller's
-  // executor (the junction table has no relations we need, so no child reader).
+  // executor (the junction table needs no child relations, so no child reader).
   const targetsBySource = new Map<string, unknown[]>();
   const targetValSet = new Set<unknown>();
   const jTable = ctx.quote(through.table);

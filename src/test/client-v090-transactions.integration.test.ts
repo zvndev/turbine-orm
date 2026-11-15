@@ -96,7 +96,8 @@ describe('transaction lifecycle (live Postgres)', () => {
           },
           { timeout: 300 },
         ),
-        (err: unknown) => err instanceof TimeoutError && /cancelled on the server/.test(err.message),
+        (err: unknown) =>
+          err instanceof TimeoutError && err.outcome === 'not-executed' && /was rolled back/.test(err.message),
       );
       const elapsed = Date.now() - started;
       // Without the cancel, the ROLLBACK queues behind the blocked UPDATE until

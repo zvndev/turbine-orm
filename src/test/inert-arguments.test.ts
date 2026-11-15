@@ -11,7 +11,7 @@
  *   2. `findUnique` accepted a `where` that matched many rows and emitted
  *      `LIMIT 1` with no ordering, returning an arbitrary one of them.
  *   3. Any unrecognized key, `include` above all, was dropped in silence: the
- *      query ran, returned rows, and the relation was simply absent.
+ *      query ran, returned rows, and the relation was absent.
  *
  * Each of these produced a plausible-looking result, which is what makes them
  * worth a regression file of their own. A thrown error gets fixed the same day.

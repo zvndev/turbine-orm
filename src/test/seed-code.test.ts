@@ -105,7 +105,7 @@ describe('defineSeed self-run detection (spawned entry)', () => {
   // The node:test runner exports NODE_TEST_CONTEXT into this process, and
   // defineSeed deliberately suppresses its auto-run whenever that variable is
   // present. A spawned seed must therefore NOT inherit it, or it would look like
-  // a test context and never run, the exact false-negative we are guarding.
+  // a test context and never run, the false-negative guarded here.
   function childEnv(extra: Record<string, string>): NodeJS.ProcessEnv {
     const { NODE_TEST_CONTEXT: _omit, ...rest } = process.env;
     return { ...rest, DATABASE_URL: BOGUS_URL, ...extra };

@@ -81,7 +81,12 @@ const report = createIstanbulMergeReport({
   skipFull: rc['skip-full'] ?? false,
 });
 
-await report.run();
+try {
+  await report.run();
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
+}
 
 if (!process.argv.includes('--no-check') && rc['check-coverage'] !== false) {
   // c8's own gate, handed the patched report. `getCoverageMapFromAllCoverageFiles`

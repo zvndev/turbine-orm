@@ -390,3 +390,42 @@ describe('the pre-commit hook and CI run the linter with the same flags', () => 
     );
   });
 });
+
+describe('the unknown-outcome replay guidance', () => {
+  // A unique violation on a replay says a row with the idempotency key is
+  // committed only when it is that key's constraint, and even then not that the
+  // row is this write. Every surface that describes the replay must say so.
+  const surfaces = [
+    'site/app/(docs)/transactions/page.mdx',
+    'site/app/(docs)/errors/page.mdx',
+    'src/errors.ts',
+    'src/cli/error-catalog.ts',
+    'CHANGELOG.md',
+  ];
+
+  it('no surface reads any unique violation as proof that the first attempt committed', () => {
+    for (const path of surfaces) {
+      const text = read(path);
+      for (const claim of [
+        /fails with (?:\[)?E008(?:\]\([^)]*\))? because the first attempt committed/,
+        /on the key the first attempt committed/,
+        /fails on the key the original\s+(?:\*\s+)?committed/,
+      ]) {
+        assert.doesNotMatch(text, claim, `${path} equates a unique violation with a committed first attempt`);
+      }
+    }
+  });
+
+  it("the documented recipe checks the key's own constraint, then reads the row back and compares", () => {
+    const page = read('site/app/(docs)/transactions/page.mdx');
+    const block = /```ts\n(import \{ TransactionOutcomeUnknownError[\s\S]*?)```/.exec(page)?.[1];
+    assert.ok(block, 'the replay example is no longer on the transactions page');
+    assert.match(block, /replay\.constraint !== '[a-z_]+'/, 'the recipe accepts a unique violation on any constraint');
+    assert.match(
+      block,
+      /findUniqueOrThrow\(\{ where: \{ idempotencyKey \} \}\)/,
+      'the recipe does not read the row back',
+    );
+    assert.match(block, /stored\.amount !== amount/, 'the recipe does not compare the stored row with the write');
+  });
+});

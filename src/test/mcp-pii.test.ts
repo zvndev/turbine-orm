@@ -535,7 +535,7 @@ describe('mcp table_detail: index definitions carry no literals', () => {
 
 describe('mcp migrate_status: resolves the tracking table like the CLI', () => {
   it('does NOT pin search_path, because `turbine migrate status` does not', async () => {
-    // Round 1 added a pin here as hardening. It was not hardening: cli/migrate.ts
+    // Pinning search_path here changed tracking-table resolution: cli/migrate.ts
     // reads `_turbine_migrations` unqualified through the role's search_path, so
     // pinning made the tool disagree with the runner it reports on. The
     // resolution is disclosed instead (see mcp-pii-round2.test.ts).

@@ -266,6 +266,7 @@ const OBSERVATION: Record<string, Observation> = {
   // PowQL's `distinct` keyword is ROW-WIDE and takes no column list, so it
   // used to be "compiled" into a DIFFERENT row set under the same argument,
   // with no error. Same answer as its groupBy spelling below: E017.
+  cursorPredicate: { how: 'unsupported', value: 'tuple', needs: { cursor: { id: '5' } } },
   distinct: { how: 'unsupported', value: ['name'] },
   // PowQL has no DISTINCT ON row source for a groupBy, and says so.
   distinctOn: { how: 'unsupported', value: { columns: ['name'], orderBy: { id: 'desc' } } },

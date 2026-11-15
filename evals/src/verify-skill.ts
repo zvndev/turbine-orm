@@ -733,7 +733,7 @@ const CLAIMS: Claim[] = [
       if (sub.length !== 0) throw new Error('a sub-document matched: equals is still containment');
     },
   },
-  // ---- 0.90 Wave C (proposed rows) -------------------------------------------
+  // ---- 0.90 expression, locking and conflict options -------------------------------------------
   {
     says: '`_percentile: { aromaScore: { p: 0.9 } }` returns the 90th percentile, on PostgreSQL only.',
     run: async (db) => {

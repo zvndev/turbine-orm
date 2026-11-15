@@ -282,4 +282,53 @@ describe('upsert: the row `where` names is the row it updates (live Postgres)', 
       (err: unknown) => err instanceof ValidationError && /`update` is empty/.test(err.message),
     );
   });
+
+  // A unique key beside a column that narrows (`id` and `name`) names no
+  // conflict target: the single statement was `ON CONFLICT ("id", "name")`,
+  // which PostgreSQL rejects with 42P10 whatever the data. It looks the row up
+  // by the whole `where` instead.
+  const keyAndName = (id: number, name: string) => ({
+    where: { id, name },
+    create: { id, email: `${name.toLowerCase().replaceAll(' ', '-')}@x.test`, name },
+    update: { tenant: 't9' },
+  });
+
+  it('`where: { key, other column }`: a matching row is updated through the lookup', async () => {
+    const row = await accounts().upsert(keyAndName(1, 'A'));
+    assert.equal(row.tenant, 't9');
+    assert.deepEqual(statements(), ['SELECT', 'UPDATE']);
+    assert.deepEqual(
+      (await rows()).map((r) => [r.id, r.tenant]),
+      [
+        [1, 't9'],
+        [2, 't2'],
+      ],
+    );
+  });
+
+  it('`where: { key, other column }`: a missing key is inserted', async () => {
+    const row = await accounts().upsert(keyAndName(7, 'Seven'));
+    assert.equal(row.id, 7);
+    assert.equal(row.tenant, 't1');
+    assert.equal((await rows()).length, 3);
+  });
+
+  it('`where: { key, other column }`: a key held by a non-matching row conflicts and is unchanged', async () => {
+    await assert.rejects(() => accounts().upsert(keyAndName(1, 'Not A')), UniqueConstraintError);
+    assert.deepEqual(
+      (await rows()).map((r) => [r.id, r.name, r.tenant]),
+      [
+        [1, 'A', 't1'],
+        [2, 'B', 't2'],
+      ],
+    );
+  });
+
+  it('`where: { key, other column }` is refused batched, never sent as a statement', async () => {
+    const refused = (err: unknown) => err instanceof ValidationError && /not exactly one unique key/.test(err.message);
+    assert.throws(() => accounts().buildUpsert(keyAndName(1, 'A')), refused);
+    await assert.rejects(async () => db.pipeline(accounts().buildUpsert(keyAndName(1, 'A'))), refused);
+    await assert.rejects(async () => db.$transaction([accounts().buildUpsert(keyAndName(1, 'A'))]), refused);
+    assert.deepEqual(statements(), []);
+  });
 });

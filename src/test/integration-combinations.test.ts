@@ -224,7 +224,7 @@ testFn('integration-combinations', () => {
 
   describe('findManyStream with nested relations', () => {
     it('streams users with posts and supports early break without leaking the cursor', async () => {
-      // Capture pool stats BEFORE we start the stream so we can verify the
+      // Capture pool stats BEFORE starting the stream to verify the
       // dedicated cursor connection is released after `break`.
       const idleBefore = db.stats.idleCount;
       const totalBefore = db.stats.totalCount;
@@ -248,7 +248,7 @@ testFn('integration-combinations', () => {
       }
 
       assert.equal(seen.length, 3, 'should have iterated exactly 3 users before breaking');
-      // Ids should be ascending (we ordered by id)
+      // Ids should be ascending (the query orders by id).
       for (let i = 1; i < seen.length; i++) {
         assert.ok(seen[i]!.id > seen[i - 1]!.id, 'streamed users should be in ascending id order');
       }
@@ -257,14 +257,14 @@ testFn('integration-combinations', () => {
       // the pool. Give pg a microtask tick to settle release().
       await new Promise((resolve) => setImmediate(resolve));
 
-      // The pool's totalCount should not be permanently inflated, and we
-      // should be able to run another query immediately (i.e. the cursor
+      // The pool's totalCount should not be permanently inflated, and a
+      // follow-up query should run immediately (i.e. the cursor
       // didn't deadlock the pool).
       const followup = await db.table('users').findMany({ limit: 1 });
       assert.equal(followup.length, 1, 'follow-up query should succeed after stream early-break');
 
-      // Sanity: the pool didn't lose connections to a leaked cursor. We
-      // tolerate the pool growing by at most one between snapshots, since
+      // Check that no connection leaked to a cursor. Allow the pool to grow by
+      // at most one between snapshots, since
       // pg.Pool may lazily expand to satisfy the follow-up query, but it
       // should never blow past totalBefore + 1 just from one stream.
       const totalAfter = db.stats.totalCount;

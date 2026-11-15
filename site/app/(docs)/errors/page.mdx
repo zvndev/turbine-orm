@@ -49,6 +49,7 @@ try {
 | [`TURBINE_E018`](#e018) | `ReadOnlyError` | A write hit a read-only database, role or transaction | Route the write to the primary |
 | [`TURBINE_E019`](#e019) | `TransactionRolledBackError` | A failed statement rolled the transaction back | Read `cause`; isolate expected failures in a nested block |
 | [`TURBINE_E020`](#e020) | `InvariantError` | Turbine caught a bug in itself | Report it |
+| [`TURBINE_E021`](#e021) | `TransactionOutcomeUnknownError` | COMMIT got no answer Turbine could read | Retry only a write a unique key makes safe to repeat |
 
 ## Error reference
 
@@ -60,10 +61,10 @@ try {
 <a id="e002" />
 ### E002 `TimeoutError`
 
-A query or transaction ran past its `timeout`, or the server's `statement_timeout` cancelled it (`57014`). It carries `timeoutMs` and `outcome`:
+A query or transaction ran past its `timeout`, or the server cancelled a statement (`57014`, from `statement_timeout` or a cancel request). It carries `timeoutMs` and `outcome`:
 
 - `'not-executed'`: the statement made no change, so a retry is safe.
-- `'unknown'`: it may have committed. Check before retrying a write.
+- `'unknown'`: Turbine could not confirm that the operation made no change. A write outside a transaction may have applied. A transaction deadline fires before COMMIT, so that transaction cannot commit, but unconfirmed cleanup can leave locks held. An unanswered COMMIT is E021 instead. See [transaction outcomes](/transactions#when-the-outcome-is-unknown).
 
 The next pull on a cursor stream that was closed after its [idle timeout](/queries#abandoned-streams-close-themselves) also throws it, with `'not-executed'`. See [per-query timeout](/client#per-query-timeout).
 
@@ -199,6 +200,13 @@ PostgreSQL rolled the transaction back instead of committing, because a statemen
 ### E020 `InvariantError`
 
 Turbine caught a bug in itself before sending a statement it knew was wrong. `err.invariant` names the broken rule. It is not caused by your arguments and is not retryable. Report it at https://github.com/zvndev/turbine-orm/issues with the message, which contains no row or parameter values.
+
+<a id="e021" />
+### E021 `TransactionOutcomeUnknownError`
+
+A transaction's COMMIT got no answer Turbine could read: the driver gave up waiting (a node-postgres `query_timeout`), the connection was lost, or the driver refused the statement. Turbine cannot tell those apart, so the transaction may have committed, may still be committing, or may never have reached the server. The failure that hid the answer is `cause`. Turbine sends no ROLLBACK after it, since a ROLLBACK cannot tell which happened, and discards the connection instead of reusing it. Raised on the PostgreSQL dialect, the MySQL engine and the Neon WebSocket driver, for `$transaction`, `transaction()` and the transactions Turbine opens for nested writes, lookup-first upserts, multi-statement writes and sequential pipelines; see [which engines raise it](/transactions#which-engines-raise-e021).
+
+It is not retryable: retrying writes that did commit applies them twice. Reading the database does not settle it, because a COMMIT still in flight can commit after the read. Retry only a write that is safe to repeat: one that stores a unique idempotency key, enforced by the database, in the same transaction, so a replay either saves the write or fails with [E008](#e008) on that key's constraint. Then read the stored row back and check that it holds this write before treating the first attempt as committed. E008 on any other constraint says nothing about the first attempt; see [the replay example](/transactions#when-the-outcome-is-unknown).
 
 ## Retryable errors
 

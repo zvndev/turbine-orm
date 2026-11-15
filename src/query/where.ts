@@ -17,6 +17,15 @@ import { getErrorMessageMode, InvariantError, UnsupportedFeatureError, Validatio
 import { assertSkipListNames, skipListNamesTable } from '../global-filters-config.js';
 import { consoleLogger, type TurbineLogger } from '../logger.js';
 import type { PgCompatQueryResult } from '../pg-types.js';
+import {
+  coerceTemporalValue,
+  escapeLike,
+  isInternalCombinator,
+  markInternalCombinator,
+  ownLookup,
+  resolveColumnName,
+  type SqlCacheEntry,
+} from '../query-utils.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { camelToSnake, localDateTimeKind, normalizeKeyColumns } from '../schema.js';
 import type { TemporalInfinityReading } from './deferred.js';
@@ -25,19 +34,18 @@ import {
   assertEqualityOperand,
   assertJsonFilterKeys,
   assertOperatorOperands,
-  findArrayUniqueKey,
-  findJsonUniqueKey,
+  columnOperandKind,
+  columnTypeToken,
   findUndefinedPath,
   holdsUndefinedValue,
-  isArrayFilter,
   isColumnRef,
-  isJsonFilter,
   isPlainRecord,
   isWhereOperator,
   JSON_RANGE_OPERATORS,
   JSON_STRING_OPERATORS,
+  type OperandColumnKind,
   type OperandContext,
-  operandColumnKind,
+  RELATION_FILTER_WRAPPERS,
   VECTOR_DISTANCE_COMPARATORS,
   VECTOR_METRIC_OPERATORS,
   validateTextSearchConfig,
@@ -55,15 +63,6 @@ import type {
   WhereClause,
   WhereOperator,
 } from './types.js';
-import {
-  coerceTemporalValue,
-  escapeLike,
-  isInternalCombinator,
-  markInternalCombinator,
-  ownLookup,
-  resolveColumnName,
-  type SqlCacheEntry,
-} from './utils.js';
 import {
   assertWhereDepth,
   classifyScalarForSql,
@@ -237,7 +236,7 @@ export interface BuilderCtx {
    * `'object'` on every other engine.
    *
    * A live getter on the concrete ctx (like `currentSkip`), not a value copied
-   * at construction, because it is now a per-query option. `readonly` here says
+   * at construction, because it is a per-query option. `readonly` here says
    * the modules may not write it, not that it cannot change between builds.
    */
   readonly jsonEncoding: JsonEncoding;
@@ -330,17 +329,16 @@ interface ColumnRefContext {
    */
   rawColumn: string;
   /**
-   * The column's type token, which decides what its operands may be (see
-   * `operandColumnKind`). Resolved by the caller from the same source its
-   * classification used, identically on the build and collect side.
+   * What the column's operands may be (`columnOperandKind`), from the same
+   * host its classification used, identically on the build and collect side.
    */
-  pgType: string;
+  kind: OperandColumnKind;
 }
 
 /** The operand-validation context for an operator object on `refCtx`'s column. */
 function operandContext(qi: BuilderCtx, column: string, refCtx: ColumnRefContext | undefined): OperandContext {
   if (!refCtx) return { column, table: qi.table, kind: 'scalar' };
-  return { column: refCtx.rawColumn, table: refCtx.table, kind: operandColumnKind(refCtx.pgType) };
+  return { column: refCtx.rawColumn, table: refCtx.table, kind: refCtx.kind };
 }
 
 /**
@@ -393,23 +391,38 @@ interface WhereScope {
  * @internal Exposed as package-private for testing via class access.
  */
 export function fingerprintWhere(qi: BuilderCtx, where: Record<string, unknown>, depth = 0): string {
+  return fingerprintWhereIn(qi, qi.whereHost, where, depth, 1);
+}
+
+/** Shared token traversal; each scope keeps its historical depth accounting. */
+function fingerprintWhereIn(
+  qi: BuilderCtx,
+  host: WhereHost,
+  where: Record<string, unknown>,
+  depth: number,
+  relationStep: number,
+): string {
   assertWhereDepth(depth);
   const parts: string[] = [];
-  for (const event of walkWhere(qi.whereHost, where)) {
+  for (const event of walkWhere(host, where)) {
     switch (event.kind) {
       case 'or':
-        parts.push(`OR[${event.conditions.map((cond) => fingerprintWhere(qi, cond, depth + 1)).join(',')}]`);
+        parts.push(
+          `OR[${event.conditions.map((cond) => fingerprintWhereIn(qi, host, cond, depth + 1, relationStep)).join(',')}]`,
+        );
         break;
       case 'and':
-        parts.push(`AND[${event.conditions.map((cond) => fingerprintWhere(qi, cond, depth + 1)).join(',')}]`);
+        parts.push(
+          `AND[${event.conditions.map((cond) => fingerprintWhereIn(qi, host, cond, depth + 1, relationStep)).join(',')}]`,
+        );
         break;
       case 'not':
-        parts.push(`NOT(${fingerprintWhere(qi, event.condition, depth + 1)})`);
+        parts.push(`NOT(${fingerprintWhereIn(qi, host, event.condition, depth + 1, relationStep)})`);
         break;
       case 'relation':
         // { posts: { some: { published: true } } } → `posts:{some(...)}`
         parts.push(
-          `${event.key}:{${fingerprintRelationParts(qi, event.relDef, event.filterObj, depth + 1).join(',')}}`,
+          `${event.key}:{${fingerprintRelationParts(qi, event.relDef, event.filterObj, depth + relationStep).join(',')}}`,
         );
         break;
       case 'scalar':
@@ -436,28 +449,18 @@ export function fingerprintRelationParts(
   filterObj: WhereRecord,
   depth = 0,
 ): string[] {
-  const relParts: string[] = [];
-  if (filterObj.some !== undefined)
-    relParts.push(`some(${fingerprintRelFilter(qi, relDef.to, filterObj.some as Record<string, unknown>, depth + 1)})`);
-  if (filterObj.every !== undefined)
-    relParts.push(
-      `every(${fingerprintRelFilter(qi, relDef.to, filterObj.every as Record<string, unknown>, depth + 1)})`,
-    );
-  if (filterObj.none !== undefined)
-    relParts.push(`none(${fingerprintRelFilter(qi, relDef.to, filterObj.none as Record<string, unknown>, depth + 1)})`);
-  if (filterObj.is !== undefined)
-    relParts.push(
-      filterObj.is === null
-        ? 'is(null)'
-        : `is(${fingerprintRelFilter(qi, relDef.to, filterObj.is as Record<string, unknown>, depth + 1)})`,
-    );
-  if (filterObj.isNot !== undefined)
-    relParts.push(
-      filterObj.isNot === null
-        ? 'isNot(null)'
-        : `isNot(${fingerprintRelFilter(qi, relDef.to, filterObj.isNot as Record<string, unknown>, depth + 1)})`,
-    );
-  return relParts;
+  const parts: string[] = [];
+  // Fingerprint ordering predates the SQL branch order; retain its bytes.
+  for (const key of ['some', 'every', 'none', 'is', 'isNot']) {
+    const value = filterObj[key];
+    if (value === undefined) continue;
+    const nested =
+      (key === 'is' || key === 'isNot') && value === null
+        ? 'null'
+        : fingerprintRelFilter(qi, relDef.to, value as WhereRecord, depth + 1);
+    parts.push(`${key}(${nested})`);
+  }
+  return parts;
 }
 
 /**
@@ -491,29 +494,42 @@ export function collectWhereParams(
   params: unknown[],
   depth = 0,
 ): boolean {
+  return collectWhereIn(qi, where, params, depth);
+}
+
+/** Canonical cache-hit traversal, retaining scope-specific scalar semantics. */
+function collectWhereIn(
+  qi: BuilderCtx,
+  where: Record<string, unknown>,
+  params: unknown[],
+  depth: number,
+  scope?: WhereScope,
+): boolean {
   assertWhereDepth(depth);
   let emitted = false;
   // ONE canonical walk (shared with fingerprintWhere + buildWhereClause), so
   // the key order + combinator structure cannot drift out of lockstep.
-  for (const event of walkWhere(qi.whereHost, where)) {
+  for (const event of walkWhere(scope?.host ?? qi.whereHost, where)) {
     switch (event.kind) {
       case 'or':
-        collectOrParams(event.conditions, params, (cond) => collectWhereParams(qi, cond, params, depth + 1));
+        collectOrParams(event.conditions, params, (cond) => collectWhereIn(qi, cond, params, depth + 1, scope));
         emitted = true;
         break;
       case 'and':
         for (const cond of event.conditions) {
-          if (collectWhereParams(qi, cond, params, depth + 1)) emitted = true;
+          if (collectWhereIn(qi, cond, params, depth + 1, scope)) emitted = true;
         }
         break;
       case 'not':
-        if (collectWhereParams(qi, event.condition, params, depth + 1)) emitted = true;
+        if (collectWhereIn(qi, event.condition, params, depth + 1, scope)) emitted = true;
         break;
       case 'relation':
-        if (collectRelationFilterParams(qi, event.relDef, event.filterObj, params, depth + 1)) emitted = true;
+        if (collectRelationFilterParams(qi, event.relDef, event.filterObj, params, depth + (scope ? 0 : 1)))
+          emitted = true;
         break;
       case 'scalar':
-        collectScalarParams(qi, event.key, event.value, params);
+        if (scope) collectScopedScalarParams(qi, scope, event.key, event.value, params);
+        else collectScalarParams(qi, event.key, event.value, params);
         emitted = true;
         break;
     }
@@ -531,8 +547,17 @@ export function collectWhereParams(
  * error there is only reachable on a MISS, before anything is cached).
  */
 export function collectScalarParams(qi: BuilderCtx, key: string, value: unknown, params: unknown[]): void {
-  const rawColumn = qi.toColumn(key);
-  const cls = classifyScalarForSql(qi.whereHost, rawColumn, value);
+  collectScalarIn(qi, key, value, params);
+}
+
+/** Same classification and binding rules for root and scoped cache hits. */
+function collectScalarIn(qi: BuilderCtx, key: string, value: unknown, params: unknown[], scope?: WhereScope): void {
+  const meta = scope?.meta ?? qi.tableMeta;
+  const table = scope?.table ?? qi.table;
+  const rawColumn = scope ? (resolveColumnName(meta, key) ?? camelToSnake(key)) : qi.toColumn(key);
+  const host = scope?.host ?? qi.whereHost;
+  const column = scope ? `${qi.q(table)}.${qi.q(rawColumn)}` : qi.q(rawColumn);
+  const cls = classifyScalarForSql(host, rawColumn, value, !scope);
   switch (cls.kind) {
     case 'null':
       // IS NULL is parameterless.
@@ -544,10 +569,10 @@ export function collectScalarParams(qi: BuilderCtx, key: string, value: unknown,
       collectVectorFilterParams(qi, key, rawColumn, value as VectorFilter, params);
       return;
     case 'json':
-      collectJsonFilterParams(qi, value as JsonFilter, params, qi.q(rawColumn));
+      collectJsonFilterParams(qi, value as JsonFilter, params, column);
       return;
     case 'array':
-      collectArrayFilterParams(qi, value as ArrayFilter, params, qi.q(rawColumn));
+      collectArrayFilterParams(qi, value as ArrayFilter, params, column);
       return;
     case 'textsearch':
       // Same gate the build path applies, so the collect path never diverges
@@ -557,24 +582,24 @@ export function collectScalarParams(qi: BuilderCtx, key: string, value: unknown,
       return;
     case 'operator':
       collectOperatorParams(qi, rawColumn, value as WhereOperator, params, {
-        meta: qi.tableMeta,
-        table: qi.table,
+        meta,
+        table,
         prefix: '',
         rawColumn,
-        pgType: getColumnPgType(qi, rawColumn),
+        kind: host.getColumnKind(rawColumn),
       });
       return;
     default: {
       // 'equality' | 'jsonThrow' | 'arrayThrow': same strict validation as
       // the build path, so a cache hit can never silently bind a
       // misspelled-operator object.
-      const pgType = getColumnPgType(qi, rawColumn);
-      assertBindableEqualityValue(qi, rawColumn, value, pgType, qi.table);
-      if (isBareJsonDocument(qi, pgType, value)) {
+      const kind = host.getColumnKind(rawColumn);
+      assertBindableEqualityValue(qi, rawColumn, value, kind, table);
+      if (isBareJsonDocument(qi, kind, value)) {
         jsonDocumentEquals(qi, '', rawColumn, value, collectOnly(params));
         return;
       }
-      params.push(coerceWhereOperand(qi, qi.tableMeta, rawColumn, value));
+      params.push(coerceWhereOperand(qi, meta, rawColumn, value));
       return;
     }
   }
@@ -601,35 +626,15 @@ export function collectRelationFilterParams(
   const target = relDef.to;
   if (!qi.schema.tables[target]) return false;
   let emitted = false;
-  if (filterObj.some !== undefined) {
-    collectRelFilterParams(qi, target, filterObj.some as Record<string, unknown>, params, depth + 1);
-    collectTargetGlobalFilterExists(qi, target, params);
-    emitted = true;
-  }
-  if (filterObj.none !== undefined) {
-    collectRelFilterParams(qi, target, filterObj.none as Record<string, unknown>, params, depth + 1);
-    collectTargetGlobalFilterExists(qi, target, params);
-    emitted = true;
-  }
-  // gf is only emitted (build) when the `every` sub-where compiles to a
-  // filter, otherwise `every` is trivially true and no subquery is built. A
-  // sub-where that compiles to nothing pushes nothing.
-  if (
-    filterObj.every !== undefined &&
-    collectRelFilterParams(qi, target, filterObj.every as Record<string, unknown>, params, depth + 1)
-  ) {
-    collectTargetGlobalFilterExists(qi, target, params);
-    emitted = true;
-  }
-  if (filterObj.is !== undefined) {
-    if (filterObj.is !== null)
-      collectRelFilterParams(qi, target, filterObj.is as Record<string, unknown>, params, depth + 1);
-    collectTargetGlobalFilterExists(qi, target, params);
-    emitted = true;
-  }
-  if (filterObj.isNot !== undefined) {
-    if (filterObj.isNot !== null)
-      collectRelFilterParams(qi, target, filterObj.isNot as Record<string, unknown>, params, depth + 1);
+  for (const key of RELATION_FILTER_WRAPPERS) {
+    const value = filterObj[key];
+    if (value === undefined) continue;
+    const hasFilter =
+      (key === 'is' || key === 'isNot') && value === null
+        ? false
+        : collectRelFilterParams(qi, target, value as WhereRecord, params, depth + 1);
+    // An empty `every` is true without a subquery or global-filter bindings.
+    if (key === 'every' && !hasFilter) continue;
     collectTargetGlobalFilterExists(qi, target, params);
     emitted = true;
   }
@@ -698,10 +703,14 @@ function collectOperatorParamsChecked(
     if (insensitive) assertInsensitiveOperand(op.equals, 'equals', column);
     params.push(cv(op.equals));
   }
-  if (op.gt !== undefined && !skipRef(op.gt)) params.push(cv(op.gt));
-  if (op.gte !== undefined && !skipRef(op.gte)) params.push(cv(op.gte));
-  if (op.lt !== undefined && !skipRef(op.lt)) params.push(cv(op.lt));
-  if (op.lte !== undefined && !skipRef(op.lte)) params.push(cv(op.lte));
+  const gt = op.gt;
+  if (gt !== undefined && !skipRef(gt)) params.push(cv(gt));
+  const gte = op.gte;
+  if (gte !== undefined && !skipRef(gte)) params.push(cv(gte));
+  const lt = op.lt;
+  if (lt !== undefined && !skipRef(lt)) params.push(cv(lt));
+  const lte = op.lte;
+  if (lte !== undefined && !skipRef(lte)) params.push(cv(lte));
   if (op.not !== undefined && op.not !== null && !skipRef(op.not)) {
     const negatedDocument = jsonNegatedDocument(qi, op.not, operand);
     if (negatedDocument !== NO_JSON_NEGATION) {
@@ -713,23 +722,25 @@ function collectOperatorParamsChecked(
       params.push(cv(op.not));
     }
   }
-  if (op.in !== undefined) {
+  const inValues = op.in;
+  if (inValues !== undefined) {
     if (insensitive) {
-      assertInsensitiveOperand(op.in, 'in', column);
+      assertInsensitiveOperand(inValues, 'in', column);
       requireInsensitiveList(qi, column, 'in');
     }
-    params.push(qi.inParam(cv(op.in)));
+    params.push(qi.inParam(cv(inValues)));
   }
-  if (op.notIn !== undefined) {
+  const notInValues = op.notIn;
+  if (notInValues !== undefined) {
     if (insensitive) {
-      assertInsensitiveOperand(op.notIn, 'notIn', column);
+      assertInsensitiveOperand(notInValues, 'notIn', column);
       requireInsensitiveList(qi, column, 'notIn');
     }
-    params.push(qi.inParam(cv(op.notIn)));
+    params.push(qi.inParam(cv(notInValues)));
   }
-  if (op.contains !== undefined) params.push(`%${likeOperand(qi, op.contains)}%`);
-  if (op.startsWith !== undefined) params.push(`${likeOperand(qi, op.startsWith)}%`);
-  if (op.endsWith !== undefined) params.push(`%${likeOperand(qi, op.endsWith)}`);
+  if (op.contains !== undefined) params.push(JSON_STRING_OPERATORS.stringContains(likeOperand(qi, op.contains)));
+  if (op.startsWith !== undefined) params.push(JSON_STRING_OPERATORS.stringStartsWith(likeOperand(qi, op.startsWith)));
+  if (op.endsWith !== undefined) params.push(JSON_STRING_OPERATORS.stringEndsWith(likeOperand(qi, op.endsWith)));
 }
 
 /**
@@ -792,9 +803,10 @@ export function collectJsonFilterParams(qi: BuilderCtx, filter: JsonFilter, para
 export function collectArrayFilterParams(qi: BuilderCtx, filter: ArrayFilter, params: unknown[], column: string): void {
   requireArrayColumns(qi);
   assertArrayFilter(filter, column);
-  if (filter.has !== undefined) params.push(filter.has);
-  if (filter.hasEvery !== undefined) params.push(filter.hasEvery);
-  if (filter.hasSome !== undefined) params.push(filter.hasSome);
+  for (const key of ['has', 'hasEvery', 'hasSome'] as const) {
+    const value = filter[key];
+    if (value !== undefined) params.push(value);
+  }
   // isEmpty has no params (IS NULL / IS NOT NULL)
 }
 
@@ -823,9 +835,14 @@ export function buildWhere<T extends object>(
   where: WhereClause<T>,
 ): { sql: string; params: unknown[] } {
   const params: unknown[] = [];
-  const clause = buildWhereClause(qi, where as Record<string, unknown>, params);
-  if (!clause) return { sql: '', params: [] };
-  return { sql: ` WHERE ${clause}`, params };
+  const sql = buildWhereSql(qi, where as Record<string, unknown>, params);
+  return { sql, params: sql ? params : [] };
+}
+
+/** Compile a top-level WHERE suffix into an existing parameter traversal. */
+export function buildWhereSql(qi: BuilderCtx, where: Record<string, unknown>, params: unknown[]): string {
+  const clause = buildWhereClause(qi, where, params);
+  return clause ? ` WHERE ${clause}` : '';
 }
 
 /**
@@ -1129,6 +1146,17 @@ export function buildWhereClause(
   params: unknown[],
   depth = 0,
 ): string | null {
+  return buildWhereIn(qi, where, params, depth);
+}
+
+/** The shared branch walk preserves the two scopes' exact SQL grouping. */
+function buildWhereIn(
+  qi: BuilderCtx,
+  where: Record<string, unknown>,
+  params: unknown[],
+  depth: number,
+  scope?: WhereScope,
+): string | null {
   assertWhereDepth(depth);
   const andClauses: string[] = [];
   // A combinator ARRAY is the one shape whose branch COUNT is written into the
@@ -1141,36 +1169,52 @@ export function buildWhereClause(
   const internal = isInternalCombinator(where);
 
   // ONE canonical walk (shared with fingerprintWhere + collectWhereParams).
-  for (const event of walkWhere(qi.whereHost, where)) {
+  for (const event of walkWhere(scope?.host ?? qi.whereHost, where)) {
     switch (event.kind) {
       case 'or': {
         if (!internal) qi.markVariableArity();
         andClauses.push(
-          buildOrClause(event.conditions, params, (cond) => buildWhereClause(qi, cond, params, depth + 1)),
+          buildOrClause(event.conditions, params, (cond) => {
+            const sub = buildWhereIn(qi, cond, params, depth + 1, scope);
+            return scope && sub !== null ? `(${sub})` : sub;
+          }),
         );
         break;
       }
-      case 'and':
-        // `AND: { ... }` is one branch whatever the caller sends (fixedArity).
+      case 'and': {
         if (!internal && !event.fixedArity) qi.markVariableArity();
-        for (const andCond of event.conditions) {
-          const sub = buildWhereClause(qi, andCond, params, depth + 1);
-          if (sub) andClauses.push(sub);
+        const parts: string[] = [];
+        for (const cond of event.conditions) {
+          const sub = buildWhereIn(qi, cond, params, depth + 1, scope);
+          if (sub !== null) parts.push(scope ? `(${sub})` : sub);
         }
+        if (scope) {
+          if (parts.length > 0) andClauses.push(`(${parts.join(' AND ')})`);
+        } else for (const part of parts) andClauses.push(part);
         break;
+      }
       case 'not': {
-        const sub = buildWhereClause(qi, event.condition, params, depth + 1);
+        const sub = buildWhereIn(qi, event.condition, params, depth + 1, scope);
         if (sub) andClauses.push(`NOT (${sub})`);
         break;
       }
       case 'relation': {
         // { posts: { some: { published: true } } } → EXISTS / NOT EXISTS
-        const relClause = buildRelationFilter(qi, event.key, event.relDef, event.filterObj, params, undefined, depth);
+        const relClause = buildRelationFilter(
+          qi,
+          event.key,
+          event.relDef,
+          event.filterObj,
+          params,
+          scope?.relationParent,
+          depth,
+        );
         if (relClause) andClauses.push(relClause);
         break;
       }
       case 'scalar':
-        buildScalarClause(qi, event.key, event.value, params, andClauses);
+        if (scope) buildScopedScalarClause(qi, scope, event.key, event.value, params, andClauses);
+        else buildScalarClause(qi, event.key, event.value, params, andClauses);
         break;
     }
   }
@@ -1239,9 +1283,26 @@ export function buildScalarClause(
   params: unknown[],
   andClauses: string[],
 ): void {
-  const rawColumn = qi.toColumn(key);
-  const column = qi.q(rawColumn);
-  const cls = classifyScalarForSql(qi.whereHost, rawColumn, value);
+  buildScalarIn(qi, key, value, params, andClauses);
+}
+
+/** One scalar renderer, with scoped vector/text-search behavior kept explicit. */
+function buildScalarIn(
+  qi: BuilderCtx,
+  key: string,
+  value: unknown,
+  params: unknown[],
+  andClauses: string[],
+  scope?: WhereScope,
+): void {
+  const meta = scope?.meta ?? qi.tableMeta;
+  const table = scope?.table ?? qi.table;
+  const rawColumn = scope ? resolveColumnName(meta, key) : qi.toColumn(key);
+  if (rawColumn === undefined) throw scope!.unknownColumn(key);
+  const host = scope?.host ?? qi.whereHost;
+  const pgType = host.getColumnPgType(rawColumn);
+  const column = `${scope?.qualifier ?? ''}${qi.q(rawColumn)}`;
+  const cls = classifyScalarForSql(host, rawColumn, value, !scope);
   switch (cls.kind) {
     case 'null':
       andClauses.push(`${column} IS NULL`);
@@ -1257,16 +1318,16 @@ export function buildScalarClause(
       // or schema mismatch. `contains`/`equals` are shared with WhereOperator
       // (LIKE / equality), so only shape-unique keys reach here.
       throw new ValidationError(
-        `Column "${rawColumn}" on table "${qi.table}" is not a JSON column ` +
-          `(actual type: ${getColumnPgType(qi, rawColumn)}); cannot apply JSON operator '${cls.jsonKey}'.`,
+        `Column "${rawColumn}" on table "${table}" is not a JSON column ` +
+          `(actual type: ${pgType}); cannot apply JSON operator '${cls.jsonKey}'.`,
       );
     case 'array':
       andClauses.push(...buildArrayFilterClauses(qi, column, value as ArrayFilter, params, cls.colType));
       return;
     case 'arrayThrow':
       throw new ValidationError(
-        `Column "${rawColumn}" on table "${qi.table}" is not an array column ` +
-          `(actual type: ${getColumnPgType(qi, rawColumn)}); cannot apply array operator '${cls.arrayKey}'.`,
+        `Column "${rawColumn}" on table "${table}" is not an array column ` +
+          `(actual type: ${pgType}); cannot apply array operator '${cls.arrayKey}'.`,
       );
     case 'textsearch':
       andClauses.push(buildTextSearchClause(qi, column, value as TextSearchFilter, params));
@@ -1274,11 +1335,11 @@ export function buildScalarClause(
     case 'operator':
       andClauses.push(
         ...buildOperatorClauses(qi, column, value as WhereOperator, params, {
-          meta: qi.tableMeta,
-          table: qi.table,
-          prefix: '',
+          meta,
+          table,
+          prefix: scope?.qualifier ?? '',
           rawColumn,
-          pgType: getColumnPgType(qi, rawColumn),
+          kind: host.getColumnKind(rawColumn),
         }),
       );
       return;
@@ -1286,13 +1347,13 @@ export function buildScalarClause(
       // 'equality': a plain object literal that matched no known filter shape
       // is almost always a misspelled operator (`startWith` for `startsWith`);
       // the guard also runs on the cache-hit param-collect path.
-      const pgType = getColumnPgType(qi, rawColumn);
-      assertBindableEqualityValue(qi, rawColumn, value, pgType, qi.table);
-      if (isBareJsonDocument(qi, pgType, value)) {
+      const kind = host.getColumnKind(rawColumn);
+      assertBindableEqualityValue(qi, rawColumn, value, kind, table);
+      if (isBareJsonDocument(qi, kind, value)) {
         andClauses.push(jsonDocumentEquals(qi, column, rawColumn, value, bindInto(qi, params)));
         return;
       }
-      params.push(coerceWhereOperand(qi, qi.tableMeta, rawColumn, value));
+      params.push(coerceWhereOperand(qi, meta, rawColumn, value));
       andClauses.push(`${column} = ${qi.p(params.length)}`);
       return;
     }
@@ -1310,8 +1371,8 @@ export function buildScalarClause(
  * the cache key already carries (a bare object fingerprints as `obj(...)`; a
  * bare array only ever refuses, so it changes no SQL).
  */
-function isBareJsonDocument(qi: BuilderCtx, pgType: string, value: unknown): boolean {
-  if (qi.dialect.capabilities.jsonDocumentEquality === 'jsonb' || operandColumnKind(pgType) !== 'json') return false;
+function isBareJsonDocument(qi: BuilderCtx, kind: OperandColumnKind, value: unknown): boolean {
+  if (qi.dialect.capabilities.jsonDocumentEquality === 'jsonb' || kind !== 'json') return false;
   return isPlainRecord(value) || (Array.isArray(value) && !comparesJsonDocuments(qi));
 }
 
@@ -1339,6 +1400,7 @@ export function emptyRelationsHost(qi: BuilderCtx, table: string): WhereHost {
     tableMeta: { name: table, relations: {} } as TableMetadata,
     normalizeRelationFilter: (relDef, filterObj) => normalizeRelationFilter(qi, relDef, filterObj),
     getColumnPgType: () => 'text',
+    getColumnKind: () => 'scalar',
     isJsonColumnType: (colType) => isJsonColumnType(qi, colType),
   };
 }
@@ -1350,6 +1412,7 @@ export function scopedWhereHost(qi: BuilderCtx, meta: TableMetadata): WhereHost 
       tableMeta: meta,
       normalizeRelationFilter: (relDef, filterObj) => normalizeRelationFilter(qi, relDef, filterObj),
       getColumnPgType: (column) => pgTypeForColumn(qi, meta, column),
+      getColumnKind: memoizedKinds(meta),
       isJsonColumnType: (colType) => isJsonColumnType(qi, colType),
     };
     qi.scopedHostCache.set(meta.name, host);
@@ -1474,55 +1537,7 @@ export function buildScopedWhere(
   params: unknown[],
   depth = 0,
 ): string | null {
-  assertWhereDepth(depth);
-  const clauses: string[] = [];
-  const internal = isInternalCombinator(where);
-  for (const event of walkWhere(scope.host, where)) {
-    switch (event.kind) {
-      case 'or':
-        // Same variable-arity rule as the top level: a nested relation filter
-        // or a relation `with` where can carry a caller-sized OR just as easily.
-        if (!internal) qi.markVariableArity();
-        clauses.push(
-          buildOrClause(event.conditions, params, (cond) => {
-            const sub = buildScopedWhere(qi, scope, cond, params, depth + 1);
-            return sub === null ? null : `(${sub})`;
-          }),
-        );
-        break;
-      case 'and': {
-        if (!internal && !event.fixedArity) qi.markVariableArity();
-        const parts = event.conditions
-          .map((cond) => buildScopedWhere(qi, scope, cond, params, depth + 1))
-          .filter((s): s is string => s !== null)
-          .map((s) => `(${s})`);
-        if (parts.length > 0) clauses.push(`(${parts.join(' AND ')})`);
-        break;
-      }
-      case 'not': {
-        const sub = buildScopedWhere(qi, scope, event.condition, params, depth + 1);
-        if (sub) clauses.push(`NOT (${sub})`);
-        break;
-      }
-      case 'relation': {
-        const c = buildRelationFilter(
-          qi,
-          event.key,
-          event.relDef,
-          event.filterObj,
-          params,
-          scope.relationParent,
-          depth,
-        );
-        if (c) clauses.push(c);
-        break;
-      }
-      case 'scalar':
-        buildScopedScalarClause(qi, scope, event.key, event.value, params, clauses);
-        break;
-    }
-  }
-  return clauses.length > 0 ? clauses.join(' AND ') : null;
+  return buildWhereIn(qi, where, params, depth, scope);
 }
 
 /**
@@ -1541,67 +1556,7 @@ export function buildScopedScalarClause(
   params: unknown[],
   clauses: string[],
 ): void {
-  const meta = scope.meta;
-  const col = resolveColumnName(meta, field);
-  if (col === undefined) throw scope.unknownColumn(field);
-  const qCol = `${scope.qualifier}${qi.q(col)}`;
-
-  if (value === null) {
-    clauses.push(`${qCol} IS NULL`);
-    return;
-  }
-
-  if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
-    const colType = pgTypeForColumn(qi, meta, col);
-    if (isJsonColumnType(qi, colType)) {
-      clauses.push(...buildJsonFilterClauses(qi, qCol, value, params));
-      return;
-    }
-    const jsonKey = findJsonUniqueKey(value);
-    if (jsonKey) {
-      throw new ValidationError(
-        `Column "${col}" on table "${scope.table}" is not a JSON column ` +
-          `(actual type: ${colType}); cannot apply JSON operator '${jsonKey}'.`,
-      );
-    }
-  }
-
-  if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
-    const colType = pgTypeForColumn(qi, meta, col);
-    if (colType.startsWith('_')) {
-      clauses.push(...buildArrayFilterClauses(qi, qCol, value, params, colType));
-      return;
-    }
-    const arrayKey = findArrayUniqueKey(value);
-    if (arrayKey) {
-      throw new ValidationError(
-        `Column "${col}" on table "${scope.table}" is not an array column ` +
-          `(actual type: ${colType}); cannot apply array operator '${arrayKey}'.`,
-      );
-    }
-  }
-
-  if (isWhereOperator(value)) {
-    clauses.push(
-      ...buildOperatorClauses(qi, qCol, value, params, {
-        meta,
-        table: scope.table,
-        prefix: scope.qualifier,
-        rawColumn: col,
-        pgType: pgTypeForColumn(qi, meta, col),
-      }),
-    );
-    return;
-  }
-
-  const pgType = pgTypeForColumn(qi, meta, col);
-  assertBindableEqualityValue(qi, col, value, pgType, scope.table);
-  if (isBareJsonDocument(qi, pgType, value)) {
-    clauses.push(jsonDocumentEquals(qi, qCol, col, value, bindInto(qi, params)));
-    return;
-  }
-  params.push(coerceWhereOperand(qi, meta, col, value));
-  clauses.push(`${qCol} = ${qi.p(params.length)}`);
+  buildScalarIn(qi, field, value, params, clauses, scope);
 }
 
 /**
@@ -1618,36 +1573,7 @@ export function collectScopedWhereParams(
   params: unknown[],
   depth = 0,
 ): boolean {
-  assertWhereDepth(depth);
-  let emitted = false;
-  for (const event of walkWhere(scope.host, where)) {
-    switch (event.kind) {
-      case 'or':
-        collectOrParams(event.conditions, params, (cond) =>
-          collectScopedWhereParams(qi, scope, cond, params, depth + 1),
-        );
-        emitted = true;
-        break;
-      case 'and':
-        for (const cond of event.conditions) {
-          if (collectScopedWhereParams(qi, scope, cond, params, depth + 1)) emitted = true;
-        }
-        break;
-      case 'not':
-        if (collectScopedWhereParams(qi, scope, event.condition, params, depth + 1)) emitted = true;
-        break;
-      case 'relation':
-        // Same some→none→every→is→isNot (each: sub-where params then target
-        // global-filter params) as buildRelationFilter emits.
-        if (collectRelationFilterParams(qi, event.relDef, event.filterObj, params, depth)) emitted = true;
-        break;
-      case 'scalar':
-        collectScopedScalarParams(qi, scope, event.key, event.value, params);
-        emitted = true;
-        break;
-    }
-  }
-  return emitted;
+  return collectWhereIn(qi, where, params, depth, scope);
 }
 
 /** Param-collect mirror of {@link buildScopedScalarClause}. */
@@ -1658,48 +1584,7 @@ export function collectScopedScalarParams(
   value: unknown,
   params: unknown[],
 ): void {
-  if (value === null) return;
-  const meta = scope.meta;
-  // Unvalidated on purpose: this is the cache-HIT mirror, and a key that does
-  // not resolve could never have produced the entry being served. It still
-  // goes through the one authority, so the column it binds against cannot
-  // differ from the one the build path emitted.
-  const col = resolveColumnName(meta, field) ?? camelToSnake(field);
-
-  if (typeof value === 'object' && !Array.isArray(value) && isJsonFilter(value)) {
-    const colType = pgTypeForColumn(qi, meta, col);
-    if (isJsonColumnType(qi, colType)) {
-      collectJsonFilterParams(qi, value, params, `${qi.q(scope.table)}.${qi.q(col)}`);
-      return;
-    }
-  }
-
-  if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
-    const colType = pgTypeForColumn(qi, meta, col);
-    if (colType.startsWith('_')) {
-      collectArrayFilterParams(qi, value, params, `${qi.q(scope.table)}.${qi.q(col)}`);
-      return;
-    }
-  }
-
-  if (isWhereOperator(value)) {
-    collectOperatorParams(qi, col, value, params, {
-      meta,
-      table: scope.table,
-      prefix: '',
-      rawColumn: col,
-      pgType: pgTypeForColumn(qi, meta, col),
-    });
-    return;
-  }
-
-  const pgType = pgTypeForColumn(qi, meta, col);
-  assertBindableEqualityValue(qi, col, value, pgType, scope.table);
-  if (isBareJsonDocument(qi, pgType, value)) {
-    jsonDocumentEquals(qi, '', col, value, collectOnly(params));
-    return;
-  }
-  params.push(coerceWhereOperand(qi, meta, col, value));
+  if (value !== null) collectScalarIn(qi, field, value, params, scope);
 }
 
 /**
@@ -1717,28 +1602,7 @@ export function fingerprintScopedWhere(
   where: Record<string, unknown>,
   depth = 0,
 ): string {
-  assertWhereDepth(depth);
-  const parts: string[] = [];
-  for (const event of walkWhere(host, where)) {
-    switch (event.kind) {
-      case 'or':
-        parts.push(`OR[${event.conditions.map((c) => fingerprintScopedWhere(qi, host, c, depth + 1)).join(',')}]`);
-        break;
-      case 'and':
-        parts.push(`AND[${event.conditions.map((c) => fingerprintScopedWhere(qi, host, c, depth + 1)).join(',')}]`);
-        break;
-      case 'not':
-        parts.push(`NOT(${fingerprintScopedWhere(qi, host, event.condition, depth + 1)})`);
-        break;
-      case 'relation':
-        parts.push(`${event.key}:{${fingerprintRelationParts(qi, event.relDef, event.filterObj, depth).join(',')}}`);
-        break;
-      case 'scalar':
-        parts.push(`${event.key}:${fingerprintScalarToken(event.value)}`);
-        break;
-    }
-  }
-  return parts.join('&');
+  return fingerprintWhereIn(qi, host, where, depth, 0);
 }
 
 /**
@@ -1874,61 +1738,23 @@ export function buildRelationFilter(
     return gf ? ` AND ${gf}` : '';
   };
 
-  // "some": EXISTS (SELECT 1 FROM target WHERE correlation AND filter AND gf)
-  // `some` / `none` / `every` hold a where object here: the where walk refuses
-  // any other value (relationFilterValueProblem), so none compiles to nothing.
-  if (filterObj.some !== undefined) {
-    const subWhere = filterObj.some as Record<string, unknown>;
-    const filterClause = buildSubWhereForRelation(qi, targetTable, qt, subWhere, params, depth + 1);
-    const filterAnd = filterClause ? ` AND ${filterClause}` : '';
-    clauses.push(`EXISTS (SELECT 1 FROM ${fromTarget} WHERE ${correlation}${filterAnd}${gfAnd()})`);
-  }
-
-  // "none": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND filter AND gf)
-  if (filterObj.none !== undefined) {
-    const subWhere = filterObj.none as Record<string, unknown>;
-    const filterClause = buildSubWhereForRelation(qi, targetTable, qt, subWhere, params, depth + 1);
-    const filterAnd = filterClause ? ` AND ${filterClause}` : '';
-    clauses.push(`NOT EXISTS (SELECT 1 FROM ${fromTarget} WHERE ${correlation}${filterAnd}${gfAnd()})`);
-  }
-
-  // "every": NOT EXISTS (SELECT 1 FROM target WHERE correlation AND gf AND NOT (filter))
-  if (filterObj.every !== undefined) {
-    const subWhere = filterObj.every as Record<string, unknown>;
-    const filterClause = buildSubWhereForRelation(qi, targetTable, qt, subWhere, params, depth + 1);
-    if (filterClause) {
-      // gf params pushed AFTER filter params (collect mirrors this order), but
-      // placed textually inside the domain so it restricts which rows count.
-      const gf = gfAnd();
-      clauses.push(`NOT EXISTS (SELECT 1 FROM ${fromTarget} WHERE ${correlation}${gf} AND NOT (${filterClause}))`);
+  // Preserve some -> none -> every -> is -> isNot binding order. `every`
+  // negates its filter inside NOT EXISTS; nullable to-one forms negate existence.
+  for (const key of RELATION_FILTER_WRAPPERS) {
+    const value = filterObj[key];
+    if (value === undefined) continue;
+    const nullRelation = (key === 'is' || key === 'isNot') && value === null;
+    const filter = nullRelation
+      ? null
+      : buildSubWhereForRelation(qi, targetTable, qt, value as WhereRecord, params, depth + 1);
+    if (key === 'every') {
+      if (filter)
+        clauses.push(`NOT EXISTS (SELECT 1 FROM ${fromTarget} WHERE ${correlation}${gfAnd()} AND NOT (${filter}))`);
     } else {
-      // "every" with empty filter = true (all match trivially), gf irrelevant.
-    }
-  }
-
-  // "is": EXISTS, for to-one relations (same SQL as "some").
-  // `is: null` = "no related row" (Prisma semantics) → NOT EXISTS.
-  if (filterObj.is !== undefined) {
-    if (filterObj.is === null) {
-      clauses.push(`NOT EXISTS (SELECT 1 FROM ${fromTarget} WHERE ${correlation}${gfAnd()})`);
-    } else {
-      const subWhere = filterObj.is as Record<string, unknown>;
-      const filterClause = buildSubWhereForRelation(qi, targetTable, qt, subWhere, params, depth + 1);
-      const filterAnd = filterClause ? ` AND ${filterClause}` : '';
-      clauses.push(`EXISTS (SELECT 1 FROM ${fromTarget} WHERE ${correlation}${filterAnd}${gfAnd()})`);
-    }
-  }
-
-  // "isNot": NOT EXISTS, for to-one relations (same SQL as "none").
-  // `isNot: null` = "a related row exists" → EXISTS.
-  if (filterObj.isNot !== undefined) {
-    if (filterObj.isNot === null) {
-      clauses.push(`EXISTS (SELECT 1 FROM ${fromTarget} WHERE ${correlation}${gfAnd()})`);
-    } else {
-      const subWhere = filterObj.isNot as Record<string, unknown>;
-      const filterClause = buildSubWhereForRelation(qi, targetTable, qt, subWhere, params, depth + 1);
-      const filterAnd = filterClause ? ` AND ${filterClause}` : '';
-      clauses.push(`NOT EXISTS (SELECT 1 FROM ${fromTarget} WHERE ${correlation}${filterAnd}${gfAnd()})`);
+      const negative = key === 'none' || (key === 'isNot' ? !nullRelation : key === 'is' && nullRelation);
+      clauses.push(
+        `${negative ? 'NOT ' : ''}EXISTS (SELECT 1 FROM ${fromTarget} WHERE ${correlation}${filter ? ` AND ${filter}` : ''}${gfAnd()})`,
+      );
     }
   }
 
@@ -1957,7 +1783,23 @@ export function buildSubWhereForRelation(
  * (relation targets, not just `qi.table`).
  */
 export function pgTypeForColumn(_qi: BuilderCtx, meta: TableMetadata, column: string): string {
-  return meta.dialectTypes?.[column] ?? meta.pgTypes?.[column] ?? 'text';
+  return columnTypeToken(meta, column) ?? 'text';
+}
+
+/**
+ * {@link columnOperandKind} for `meta`'s columns, remembered per column: a
+ * host lives as long as its query interface, and the answer cannot change.
+ */
+export function memoizedKinds(meta: TableMetadata): (column: string) => OperandColumnKind {
+  const kinds = new Map<string, OperandColumnKind>();
+  return (column) => {
+    let kind = kinds.get(column);
+    if (kind === undefined) {
+      kind = columnOperandKind(meta, column);
+      kinds.set(column, kind);
+    }
+    return kind;
+  };
 }
 
 /**
@@ -2094,7 +1936,7 @@ export function enumTypeForColumn(qi: BuilderCtx, column: string): string | null
   // (same-schema types, defineSchema/legacy metadata) keep the cast.
   if (qi.crossSchemaTypeColumns.has(column)) return null;
   const pgType = qi.columnPgTypeMap.get(column) ?? qi.tableMeta.pgTypes?.[column];
-  if (!pgType || pgType.startsWith('_')) return null;
+  if (!pgType || qi.whereHost.getColumnKind(column) === 'array') return null;
   return Object.hasOwn(enums, pgType) ? pgType : null;
 }
 
@@ -2120,10 +1962,10 @@ export function assertBindableEqualityValue(
   _qi: BuilderCtx,
   rawColumn: string,
   value: unknown,
-  columnPgType: string,
+  kind: OperandColumnKind,
   table: string,
 ): void {
-  assertEqualityOperand(value, { column: rawColumn, table, kind: operandColumnKind(columnPgType) });
+  assertEqualityOperand(value, { column: rawColumn, table, kind });
 }
 
 /**
@@ -2253,6 +2095,7 @@ function buildOperatorClausesChecked(
   operand: OperandContext,
 ): string[] {
   const clauses: string[] = [];
+  const bind = bindInto(qi, params);
   // Temporal bind rewrite, identical to `collectOperatorParams`. Value-only, so
   // the emitted SQL (and therefore the template cache) is untouched.
   const cv = (v: unknown): unknown => (refCtx ? coerceWhereOperand(qi, refCtx.meta, refCtx.rawColumn, v) : v);
@@ -2264,41 +2107,28 @@ function buildOperatorClausesChecked(
       clauses.push(`${column} = ${columnRefSql(qi, op.equals, refCtx, op.mode)}`);
     } else {
       if (insensitive) assertInsensitiveOperand(op.equals, 'equals', column);
-      params.push(cv(op.equals));
-      clauses.push(insensitiveEquality(column, '=', qi.p(params.length), insensitive));
+      clauses.push(insensitiveEquality(column, '=', bind(cv(op.equals)), insensitive));
     }
   }
-  if (op.gt !== undefined) {
-    if (isColumnRef(op.gt)) {
-      clauses.push(`${column} > ${columnRefSql(qi, op.gt, refCtx, op.mode)}`);
-    } else {
-      params.push(cv(op.gt));
-      clauses.push(`${column} > ${qi.p(params.length)}`);
-    }
+  const gt = op.gt;
+  if (gt !== undefined) {
+    const ref = isColumnRef(gt) ? columnRefSql(qi, gt, refCtx, op.mode) : bind(cv(gt));
+    clauses.push(`${column} > ${ref}`);
   }
-  if (op.gte !== undefined) {
-    if (isColumnRef(op.gte)) {
-      clauses.push(`${column} >= ${columnRefSql(qi, op.gte, refCtx, op.mode)}`);
-    } else {
-      params.push(cv(op.gte));
-      clauses.push(`${column} >= ${qi.p(params.length)}`);
-    }
+  const gte = op.gte;
+  if (gte !== undefined) {
+    const ref = isColumnRef(gte) ? columnRefSql(qi, gte, refCtx, op.mode) : bind(cv(gte));
+    clauses.push(`${column} >= ${ref}`);
   }
-  if (op.lt !== undefined) {
-    if (isColumnRef(op.lt)) {
-      clauses.push(`${column} < ${columnRefSql(qi, op.lt, refCtx, op.mode)}`);
-    } else {
-      params.push(cv(op.lt));
-      clauses.push(`${column} < ${qi.p(params.length)}`);
-    }
+  const lt = op.lt;
+  if (lt !== undefined) {
+    const ref = isColumnRef(lt) ? columnRefSql(qi, lt, refCtx, op.mode) : bind(cv(lt));
+    clauses.push(`${column} < ${ref}`);
   }
-  if (op.lte !== undefined) {
-    if (isColumnRef(op.lte)) {
-      clauses.push(`${column} <= ${columnRefSql(qi, op.lte, refCtx, op.mode)}`);
-    } else {
-      params.push(cv(op.lte));
-      clauses.push(`${column} <= ${qi.p(params.length)}`);
-    }
+  const lte = op.lte;
+  if (lte !== undefined) {
+    const ref = isColumnRef(lte) ? columnRefSql(qi, lte, refCtx, op.mode) : bind(cv(lte));
+    clauses.push(`${column} <= ${ref}`);
   }
   if (op.not !== undefined) {
     const negatedDocument =
@@ -2308,57 +2138,61 @@ function buildOperatorClausesChecked(
     } else if (isColumnRef(op.not)) {
       clauses.push(`${column} != ${columnRefSql(qi, op.not, refCtx, op.mode)}`);
     } else if (negatedDocument !== NO_JSON_NEGATION) {
-      const equality = jsonDocumentEquals(qi, column, column, negatedDocument, (v) => {
-        params.push(v);
-        return qi.p(params.length);
-      });
+      const equality = jsonDocumentEquals(qi, column, column, negatedDocument, bind);
       clauses.push(`NOT (${equality})`);
     } else if (isNegatedOperatorObject(op.not, operand)) {
       const inner = buildOperatorClausesChecked(qi, column, notOperand(op), params, refCtx, operand);
       if (inner.length > 0) clauses.push(`NOT (${inner.join(' AND ')})`);
     } else {
       if (insensitive) assertInsensitiveOperand(op.not, 'not', column);
-      params.push(cv(op.not));
-      clauses.push(insensitiveEquality(column, '!=', qi.p(params.length), insensitive));
+      clauses.push(insensitiveEquality(column, '!=', bind(cv(op.not)), insensitive));
     }
   }
-  if (op.in !== undefined) {
+  const inValues = op.in;
+  if (inValues !== undefined) {
     if (insensitive) {
-      assertInsensitiveOperand(op.in, 'in', column);
+      assertInsensitiveOperand(inValues, 'in', column);
       requireInsensitiveList(qi, column, 'in');
     }
-    params.push(qi.inParam(cv(op.in)));
-    clauses.push(
-      insensitive
-        ? insensitiveInClause(qi, column, qi.p(params.length), false, 'in')
-        : qi.inClause(column, qi.p(params.length), false),
-    );
+    const ref = bind(qi.inParam(cv(inValues)));
+    clauses.push(insensitive ? insensitiveInClause(qi, column, ref, false, 'in') : qi.inClause(column, ref, false));
   }
-  if (op.notIn !== undefined) {
+  const notInValues = op.notIn;
+  if (notInValues !== undefined) {
     if (insensitive) {
-      assertInsensitiveOperand(op.notIn, 'notIn', column);
+      assertInsensitiveOperand(notInValues, 'notIn', column);
       requireInsensitiveList(qi, column, 'notIn');
     }
-    params.push(qi.inParam(cv(op.notIn)));
+    const ref = bind(qi.inParam(cv(notInValues)));
+    clauses.push(insensitive ? insensitiveInClause(qi, column, ref, true, 'notIn') : qi.inClause(column, ref, true));
+  }
+  if (op.contains !== undefined)
     clauses.push(
-      insensitive
-        ? insensitiveInClause(qi, column, qi.p(params.length), true, 'notIn')
-        : qi.inClause(column, qi.p(params.length), true),
+      buildLikeClause(
+        qi,
+        column,
+        bind(JSON_STRING_OPERATORS.stringContains(likeOperand(qi, op.contains))),
+        insensitive,
+      ),
     );
-  }
-
-  if (op.contains !== undefined) {
-    params.push(`%${likeOperand(qi, op.contains)}%`);
-    clauses.push(buildLikeClause(qi, column, qi.p(params.length), insensitive));
-  }
-  if (op.startsWith !== undefined) {
-    params.push(`${likeOperand(qi, op.startsWith)}%`);
-    clauses.push(buildLikeClause(qi, column, qi.p(params.length), insensitive));
-  }
-  if (op.endsWith !== undefined) {
-    params.push(`%${likeOperand(qi, op.endsWith)}`);
-    clauses.push(buildLikeClause(qi, column, qi.p(params.length), insensitive));
-  }
+  if (op.startsWith !== undefined)
+    clauses.push(
+      buildLikeClause(
+        qi,
+        column,
+        bind(JSON_STRING_OPERATORS.stringStartsWith(likeOperand(qi, op.startsWith))),
+        insensitive,
+      ),
+    );
+  if (op.endsWith !== undefined)
+    clauses.push(
+      buildLikeClause(
+        qi,
+        column,
+        bind(JSON_STRING_OPERATORS.stringEndsWith(likeOperand(qi, op.endsWith))),
+        insensitive,
+      ),
+    );
 
   return clauses;
 }
@@ -2538,7 +2372,8 @@ export function getColumnPgType(qi: BuilderCtx, column: string): string {
  * E.g. '_text' → 'text', '_int4' → 'integer'
  */
 export function getArrayElementType(_qi: BuilderCtx, pgType: string): string {
-  const baseType = pgType.startsWith('_') ? pgType.slice(1) : pgType;
+  const t = pgType.toLowerCase();
+  const baseType = t.startsWith('_') ? t.slice(1) : t.endsWith('[]') ? t.slice(0, -2) : t;
   const typeMap: Record<string, string> = {
     int2: 'smallint',
     int4: 'integer',

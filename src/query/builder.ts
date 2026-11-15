@@ -17,6 +17,7 @@ import { type ResolvedDiagnostics, resolveDiagnostics } from '../diagnostics.js'
 import type { Dialect, StreamableConnection } from '../dialect.js';
 import { assertDialectCapabilities, postgresDialect } from '../dialect.js';
 import {
+  ConnectionError,
   explainConnectionLoss,
   INVARIANT_REPORT_HINT,
   InvariantError,
@@ -30,6 +31,7 @@ import {
 import { missingIndexForRelation, schemaHasIndexInfo } from '../index-advisor.js';
 import { consoleLogger, logTo, type TurbineLogger } from '../logger.js';
 import {
+  assertNestedArrayWrites,
   executeNestedCreate,
   executeNestedUpdate,
   extractRelationFields,
@@ -38,10 +40,48 @@ import {
 } from '../nested-write.js';
 import type { PgCompatPool, PgCompatQueryConfig, PgCompatQueryResult } from '../pg-types.js';
 import { type QueryChannelContext, settleQueryTrace, startQueryTrace } from '../query-channel.js';
+import {
+  assertMiddlewareArgsKept,
+  availableClause,
+  boundedPreparedName,
+  CELL_DIALECT,
+  CELL_FLOAT,
+  CELL_FLOAT_ARRAY,
+  CELL_PLAIN,
+  CELL_TEMPORAL,
+  CELL_TEXT_ARRAY,
+  canCancelBackend,
+  canReadArrayRows,
+  isNodePostgresPool,
+  isTemporalInfinity,
+  LRUCache,
+  normalizePagination,
+  ownLookup,
+  parseDbDate,
+  readJsonFloat,
+  readJsonFloatArray,
+  readOnlyMiddlewareParams,
+  readTextArray,
+  resolveColumnName,
+  resolveRelation,
+  resolveRelationDef,
+  type SqlCacheEntry,
+  sendCancelRequest,
+  sqlToPreparedName,
+  unknownFieldMessage,
+  warnRedundantSortTerm,
+} from '../query-utils.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
 import { normalizeKeyColumns, snakeToCamel } from '../schema.js';
 import { transactionClientFor } from '../transaction-client-slot.js';
-import { type TransactionState, transactionStateOf, withSavepoint } from '../transaction-state.js';
+import { completeTransaction } from '../transaction-outcome.js';
+import {
+  sendControl,
+  TransactionState,
+  transactionStateOf,
+  withSavepoint,
+  writeDeadline,
+} from '../transaction-state.js';
 import * as aggMod from './aggregates.js';
 import {
   assertProjectionShape,
@@ -62,17 +102,17 @@ import {
   uniqueKeyNames,
   whereIdentifiesOneRow,
 } from './compound-unique.js';
+import { assertTupleCursorMetadata, refuseTupleCursor, tupleCursorFingerprint } from './cursor-tuple.js';
 import { resolveExcludedFromCreate } from './expr.js';
 import {
+  columnOperandKind,
   cursorFieldValue,
   dedupeColumnList,
   dedupeOrderEntries,
   isEmptyOrderBy,
   isJsonPathOrderBy,
-  isRelationPickOrderBy,
   isVectorOrderBy,
   normalizeOrderBy,
-  operandColumnKind,
   orderByEntries,
   sortedEntries,
 } from './filters.js';
@@ -85,7 +125,12 @@ import {
   pruneUndefinedArgs,
 } from './normalize-args.js';
 import { warnUnknownQueryOptions } from './option-surface.js';
-import { applyStableRelationOrderTo, normalizeWithClause, normalizeWithPagination } from './relation-names.js';
+import {
+  applyStableRelationOrderTo,
+  normalizeWithClause,
+  normalizeWithPagination,
+  primaryKeyOrderBy,
+} from './relation-names.js';
 import * as relationsMod from './relations.js';
 import {
   lockOnStreamMessage,
@@ -96,6 +141,7 @@ import {
 } from './row-lock.js';
 import { resolveSqlComment, type SqlCommenter } from './sql-comment.js';
 import {
+  assertStreamActive,
   DEFAULT_STREAM_IDLE_TIMEOUT_MS,
   newStreamIdleState,
   resolveStreamIdleTimeout,
@@ -105,6 +151,14 @@ import {
   streamIdleExpiredError,
   watchStreamConnection,
 } from './stream-idle.js';
+import {
+  acquireStreamConnection,
+  CANCEL_GRACE_MS,
+  cancellableStreamConnection,
+  resolveStreamSignal,
+  settleBackendCancel,
+  TIMED_OUT,
+} from './stream-signal.js';
 import type {
   AggregateArgs,
   AggregateResultOf,
@@ -124,14 +178,13 @@ import type {
   GroupByArgs,
   GroupByResult,
   JsonEncoding,
-  JsonPathOrderBy,
   OrderByClause,
   OrderBySpec,
   OrderDirection,
   PercentileKeysChecked,
+  PrototypeFilterInput,
   QueryResult,
   RelationLoadStrategy,
-  RelationPickOrderBy,
   ResolvedSkipGlobalFilters,
   SkipGlobalFilters,
   TableInputTypes,
@@ -145,36 +198,6 @@ import type {
   WithOrderByObject,
 } from './types.js';
 import { resolveSkipGlobalFilters, resolveUnsafeFlag, UNSAFE, type Unsafe } from './types.js';
-import {
-  assertMiddlewareArgsKept,
-  availableClause,
-  boundedPreparedName,
-  CELL_DIALECT,
-  CELL_FLOAT,
-  CELL_FLOAT_ARRAY,
-  CELL_PLAIN,
-  CELL_TEMPORAL,
-  CELL_TEXT_ARRAY,
-  canCancelBackend,
-  isNodePostgresPool,
-  isTemporalInfinity,
-  LRUCache,
-  normalizePagination,
-  ownLookup,
-  parseDbDate,
-  readJsonFloat,
-  readJsonFloatArray,
-  readOnlyMiddlewareParams,
-  readTextArray,
-  resolveColumnName,
-  resolveRelation,
-  resolveRelationDef,
-  type SqlCacheEntry,
-  sendCancelRequest,
-  sqlToPreparedName,
-  unknownFieldMessage,
-  warnRedundantSortTerm,
-} from './utils.js';
 import { resetWarnOnce, shouldWarnOnce, WARN_NS } from './warn-registry.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
@@ -248,8 +271,8 @@ const CACHE_MISMATCH_WARN_NS = 'cacheMismatch';
  *   loopback TCP        0.118ms  0.000711ms    ~166-236     between 200 and 400
  *   +1ms/direction      2.683ms  0.000717ms    ~3744-3993   between 3000 and 5000
  *
- * The two things that matters most in that table: the per-row penalty is
- * essentially IDENTICAL across the two links (it is a property of the plan, not
+ * Two measurements matter in that table: the per-row penalty is nearly
+ * identical across the two links (it is a property of the plan, not
  * the wire), while the break-even moved by 17x. So the break-even is a function
  * of the deployment's round-trip time and NOTHING ELSE that is knowable at plan
  * time. That is why this is expressed as a per-row cost and a round-trip time
@@ -386,7 +409,8 @@ interface AutoEngaged {
 }
 
 /** One column of a cursor page's effective order, while it is being planned. */
-interface CursorTerm {
+interface CursorTerm extends Omit<CursorKeysetTerm, 'nullsFirst'> {
+  nullsFirst?: boolean;
   column: string;
   /** The key written into the rewritten orderBy (the caller's own, or the field name). */
   key: string;
@@ -406,16 +430,11 @@ interface CursorKeysetTerm {
 }
 
 /** A planned `cursor` page (see `planCursor`). */
-interface CursorPlan {
-  mode: 'values' | 'row';
+type CursorPlan = {
   terms: CursorKeysetTerm[];
-  /** `values` mode: the coerced cursor value per term, `null` for SQL NULL. */
-  values: unknown[];
-  /** `row` mode: the cursor's own fields, which name one row. */
-  lookup: { column: string; value: unknown }[];
   inclusive: boolean;
   fingerprint: string;
-}
+} & ({ mode: 'values' | 'tuple'; values: unknown[] } | { mode: 'row'; lookup: { column: string; value: unknown }[] });
 
 /** The `'auto'` per-relation partition of one `with` clause. */
 interface AutoSplit {
@@ -454,6 +473,9 @@ interface RowDecodePlan {
   readonly kinds: readonly number[];
 }
 
+/** The context-free cell readers, indexed by the shared decode kind. */
+const CELL_READERS = [undefined, undefined, readJsonFloat, readJsonFloatArray, readTextArray];
+
 const FLOAT_TYPES = new Set(['float4', 'float8', 'real', 'double precision']);
 const FLOAT_ARRAY_TYPES = new Set(['_float4', '_float8', 'float4[]', 'float8[]', 'real[]', 'double precision[]']);
 
@@ -462,10 +484,16 @@ const FLOAT_ARRAY_TYPES = new Set(['_float4', '_float8', 'float4[]', 'float8[]',
  * temporal: a float can arrive from JSON as "NaN" / "Infinity", and an enum
  * array, which the driver has no parser for, as array text.
  */
-function cellKindOf(pgType: string, enums: Readonly<Record<string, unknown>> | undefined): number {
+function cellKindOf(pgType: string, enums: Readonly<Record<string, unknown>> | undefined, array: boolean): number {
   if (FLOAT_TYPES.has(pgType)) return CELL_FLOAT;
   if (FLOAT_ARRAY_TYPES.has(pgType)) return CELL_FLOAT_ARRAY;
-  const element = pgType.startsWith('_') ? pgType.slice(1) : pgType.endsWith('[]') ? pgType.slice(0, -2) : undefined;
+  const element = !array
+    ? undefined
+    : pgType.startsWith('_')
+      ? pgType.slice(1)
+      : pgType.endsWith('[]')
+        ? pgType.slice(0, -2)
+        : undefined;
   return element !== undefined && enums !== undefined && Object.hasOwn(enums, element) ? CELL_TEXT_ARRAY : CELL_PLAIN;
 }
 
@@ -504,14 +532,7 @@ function cacheParamValueEqual(a: unknown, b: unknown): boolean {
   const aArr = Array.isArray(a);
   const bArr = Array.isArray(b);
   if (aArr || bArr) {
-    if (!aArr || !bArr) return false;
-    const arrA = a as unknown[];
-    const arrB = b as unknown[];
-    if (arrA.length !== arrB.length) return false;
-    for (let i = 0; i < arrA.length; i++) {
-      if (!cacheParamValueEqual(arrA[i], arrB[i])) return false;
-    }
-    return true;
+    return aArr && bArr && cacheParamsEqual(a as unknown[], b as unknown[]);
   }
   const objA = a as Record<string, unknown>;
   const objB = b as Record<string, unknown>;
@@ -526,10 +547,12 @@ function cacheParamValueEqual(a: unknown, b: unknown): boolean {
 }
 
 /** Element-wise strict equality of two SQL parameter arrays. */
-function cacheParamsEqual(a: unknown[], b: unknown[]): boolean {
+function cacheParamsEqual(a: readonly unknown[], b: readonly unknown[]): boolean {
   if (a.length !== b.length) return false;
-  for (let i = 0; i < a.length; i++) {
-    if (!cacheParamValueEqual(a[i], b[i])) return false;
+  for (let i = 0; i < a.length; ) {
+    const av = a[i];
+    const bv = b[i++];
+    if (av !== bv && !cacheParamValueEqual(av, bv)) return false;
   }
   return true;
 }
@@ -555,7 +578,7 @@ function maybeExpandCompoundUnique<A extends { where?: unknown }>(meta: TableMet
  * fully-derived predicate (the parent's own FK match, guarded there against a
  * null reference key), not caller input, and the flag is what lets that
  * unconditional-looking statement through the empty-`where` guard. Since
- * `allowFullTableScan` now only accepts {@link UNSAFE}, that literal `true`
+ * `allowFullTableScan` only accepts {@link UNSAFE}, that literal `true`
  * would throw and every nested `set` would fail.
  *
  * Rather than hand the nested-write engine the sentinel (which would put the
@@ -565,9 +588,16 @@ function maybeExpandCompoundUnique<A extends { where?: unknown }>(meta: TableMet
  * exactly `true`, so nothing else about the call is touched and no other
  * operation gains an escape hatch.
  *
+ * `timeout` bounds the nested write as one call: every statement it sends
+ * gets what is left of it (see `writeDeadline`).
+ *
  * @internal Exported for its unit test; not part of the public surface.
  */
-export function unlockNestedWriteTx<X extends { table(name: string): Record<string, unknown> }>(tx: X): X {
+export function unlockNestedWriteTx<X extends { table(name: string): Record<string, unknown> }>(
+  tx: X,
+  timeout?: number,
+): X {
+  const deadline = timeout ? writeDeadline(timeout) : undefined;
   const wrapped = {
     table(name: string): Record<string, unknown> {
       const handle = tx.table(name);
@@ -580,9 +610,15 @@ export function unlockNestedWriteTx<X extends { table(name: string): Record<stri
           const value = Reflect.get(target, prop, target);
           if (typeof value !== 'function') return value;
           const method = value as (args: Record<string, unknown>) => unknown;
-          if (prop !== 'updateMany') return method.bind(target);
-          return (args: Record<string, unknown>) =>
-            method.call(target, args?.allowFullTableScan === true ? { ...args, allowFullTableScan: UNSAFE } : args);
+          if (prop !== 'updateMany' && !deadline) return method.bind(target);
+          return (args: Record<string, unknown>) => {
+            const unlocked =
+              prop === 'updateMany' && args?.allowFullTableScan === true
+                ? { ...args, allowFullTableScan: UNSAFE }
+                : args;
+            // Every statement of a nested write gets what is left of the call's `timeout`.
+            return method.call(target, deadline ? { ...unlocked, timeout: deadline() } : unlocked);
+          };
         },
       });
     },
@@ -648,31 +684,6 @@ function relationLoadStrategyMessage(value: unknown): string {
   );
 }
 
-/** A value the findUnique simple path may bind as it is: a primitive, Date or Buffer. */
-function isFastPathScalar(value: unknown): boolean {
-  switch (typeof value) {
-    case 'string':
-    case 'number':
-    case 'bigint':
-    case 'boolean':
-      return true;
-    case 'object':
-      return value instanceof Date || (value !== null && ArrayBuffer.isView(value));
-    default:
-      return false;
-  }
-}
-
-/** Resolves a race when a deadline passes first. */
-const TIMED_OUT: unique symbol = Symbol('timedOut');
-
-/**
- * How long a statement that outlived its `timeout` gets, after the cancel
- * request is sent, to answer before its connection is destroyed instead of
- * reused. A cancel normally lands within a round trip or two.
- */
-const CANCEL_GRACE_MS = 2000;
-
 /** How a statement in flight ended. */
 type Settled = { result: PgCompatQueryResult } | { error: unknown };
 
@@ -695,9 +706,9 @@ function isQueryCanceled(err: unknown): boolean {
   return e?.code === '57014' || e?.cause?.code === '57014';
 }
 
-/** The {@link DeferredQuery.rowLock} marker for a locking read, or nothing. */
-function rowLockMarker(rowLock: ResolvedRowLock | undefined): { rowLock?: true } {
-  return rowLock ? { rowLock: true } : {};
+/** A marker only for locking reads; unlocked reads allocate no marker object. */
+function rowLockMarker(rowLock: ResolvedRowLock | undefined): { rowLock: true } | null {
+  return rowLock ? { rowLock: true } : null;
 }
 
 /** The two accepted {@link JsonEncoding} values, frozen so the check is total. */
@@ -732,9 +743,9 @@ function defaultJsonEncoding(dialect: Dialect): JsonEncoding {
  * SQL template caches shared by every QueryInterface built from ONE options
  * object, for one schema and one table.
  *
- * A transaction builds its own QueryInterface per table, so before this each
+ * A transaction builds its own QueryInterface per table, so previously each
  * `$transaction` started with an empty cache and rebuilt the SQL of every
- * statement it sent. TransactionClient now hands every transaction of a client
+ * statement it sent. TransactionClient hands every transaction of a client
  * the same options object (`txQueryOptions` in client.ts), so they share one
  * cache per table and a statement is built once per process, as it is outside
  * a transaction.
@@ -956,13 +967,15 @@ export class QueryInterface<
    * source but can be assembled per request from user input, so the key space
    * is not provably finite. Eviction only ever costs a rebuild.
    */
+  /** Only the last executed native projection; descriptors are snapshotted, never retained. */
+  private arrayReadPlan?: { names: string[]; indices: number[]; decode: RowDecodePlan };
   private readonly rowPlanCache = new LRUCache<string, RowDecodePlan>(ROW_PLAN_CACHE_SIZE);
   /**
-   * The most recent plan per table, which is the entry `parseRow` actually
-   * probes. One result set is one shape, so this hits for every row after the
-   * first without hashing a cache key per row.
+   * Each table's row parser holds its most recent shape locally. Flat reads
+   * capture the parser once, so neither the table nor parser cache is looked
+   * up again for every row. Every row still verifies its exact own key order.
    */
-  private readonly rowPlanLast = new Map<string, RowDecodePlan>();
+  private readonly rowParsers = new Map<string, (row: Record<string, unknown>) => Record<string, unknown>>();
   /**
    * Client-level automatic WHERE filters keyed by table accessor (soft-delete /
    * multi-tenancy). AND-merged into every query on the keyed table and every
@@ -1002,10 +1015,11 @@ export class QueryInterface<
    */
   private readonly camelDateFieldCache = new Map<string, Set<string>>();
 
-  /** Per-table memo of {@link cellKindOf}, keyed by column name and field name. */
-  private readonly cellKindCache = new Map<string, Map<string, number>>();
-  /** The dialect decode of each {@link CELL_DIALECT} column, by table, then by column and field name. */
-  private readonly dialectDecodeCache = new Map<string, Map<string, (value: unknown) => unknown>>();
+  /** Per-table cell kinds and optional dialect readers, keyed by column and field name. */
+  private readonly cellKindCache = new Map<
+    string,
+    { kinds: Map<string, number>; decoders?: Map<string, (value: unknown) => unknown> }
+  >();
 
   /**
    * Per-table memo of `Object.entries(meta.relations)`, consumed by the nested
@@ -1175,7 +1189,7 @@ export class QueryInterface<
     this.txScoped = options?._txScoped ?? false;
     this.options = options;
 
-    // Pre-compute column type lookup maps (TASK-26)
+    // Pre-compute column type lookup maps
     //
     // Metadata can carry a column's database type in EITHER of two places: on
     // the column entry (`dialectType` / `pgType`, what introspection and
@@ -1215,9 +1229,10 @@ export class QueryInterface<
     // the walk needs no public accessors on the class.
     this.whereHost = {
       tableMeta: this.tableMeta,
-      normalizeRelationFilter: (relDef, filterObj) => this.normalizeRelationFilter(relDef, filterObj),
-      getColumnPgType: (column) => this.getColumnPgType(column),
-      isJsonColumnType: (colType) => this.isJsonColumnType(colType),
+      normalizeRelationFilter: (relDef, filterObj) => whereMod.normalizeRelationFilter(this.ctx, relDef, filterObj),
+      getColumnPgType: (column) => whereMod.getColumnPgType(this.ctx, column),
+      getColumnKind: whereMod.memoizedKinds(this.tableMeta),
+      isJsonColumnType: (colType) => whereMod.isJsonColumnType(this.ctx, colType),
     };
 
     // Bind the privacy-preserving view handed to the extracted WHERE module.
@@ -1274,17 +1289,17 @@ export class QueryInterface<
         return meta ? this.rowDecodePlanFor(table, meta, keys) : undefined;
       },
       decodeCell: (kind, value, table, field) => this.decodeCell(kind, value, table, field),
-      nullsSuffix: (nulls) => this.nullsSuffix(nulls),
-      isRelationOrderByValue: (value) => this.isRelationOrderByValue(value),
-      resolveOrderByColumn: (table, meta, key) => this.resolveOrderByColumn(table, meta, key),
+      nullsSuffix: (nulls) => relationsMod.nullsSuffix(this.ctx, nulls),
+      isRelationOrderByValue: (value) => relationsMod.isRelationOrderByValue(this.ctx, value),
+      resolveOrderByColumn: (table, meta, key) => relationsMod.resolveOrderByColumn(this.ctx, table, meta, key),
       buildJsonPathOrderEntry: (table, meta, field, spec, prefix, params) =>
-        this.buildJsonPathOrderEntry(table, meta, field, spec, prefix, params),
+        relationsMod.buildJsonPathOrderEntry(this.ctx, table, meta, field, spec, prefix, params),
       toSqlColumn: (field) => this.toSqlColumn(field),
       mutationInsertId: (result) => this.mutationInsertId(result),
       acquireSql: (cacheKey, build) => this.acquireSql(cacheKey, build),
       crossCheckCache: (op, cacheKey, entry, build, collectedParams) =>
         this.crossCheckCache(op, cacheKey, entry, build, collectedParams),
-      // LIVE getter, not a copied value: `jsonEncoding` is now a per-query
+      // LIVE getter, not a copied value: `jsonEncoding` is a per-query
       // option, so the module-facing view must see the encoding of the query
       // being built rather than the one the client was constructed with. Same
       // shape and same reason as `currentSkip` above.
@@ -1414,10 +1429,7 @@ export class QueryInterface<
    * ROWS ONLY`. No params are pushed, so the collect path is unaffected.
    */
   private limitOneClause(): string {
-    if (this.dialect.buildLimitOffset) {
-      return this.dialect.buildLimitOffset({ limitPlaceholder: '1', offsetPlaceholder: undefined, hasOrderBy: false });
-    }
-    return ' LIMIT 1';
+    return this.buildPagination('1', undefined, false);
   }
 
   /**
@@ -1580,7 +1592,12 @@ export class QueryInterface<
    * `findFirstOrThrow`) that refuses a `where` whose every key was `undefined`.
    */
   private normalizeArgs<A extends object | undefined>(args: A, refuseEmptiedWhere?: string): A {
-    const pruned = pruneUndefinedArgs(this.schema, this.table, args);
+    const pruned = pruneUndefinedArgs(
+      this.schema,
+      this.table,
+      args,
+      this.dialect.capabilities.tupleCursorPredicate === true,
+    );
     if (pruned !== args) {
       if (refuseEmptiedWhere) assertWhereNotEmptiedByPruning(this.table, refuseEmptiedWhere, args, pruned);
       assertCursorNotEmptied(this.table, args, pruned);
@@ -1608,15 +1625,6 @@ export class QueryInterface<
   }
 
   /**
-   * Refuse a `findUnique` whose `where` names no unique key. The rule and the
-   * message live in query/compound-unique.ts, beside the definition of what
-   * counts as unique and shared with the PowDB engine.
-   */
-  private assertFindUniqueKey(where: Record<string, unknown> | undefined): void {
-    assertWhereIdentifiesOneRow(this.tableMeta, this.table, where);
-  }
-
-  /**
    * Refuse a locking read that is not inside a transaction, at the execute
    * entry of each find method and before any strategy runs. The `build*`
    * methods accept `lock` (the SQL is right wherever it runs); executing it
@@ -1640,39 +1648,9 @@ export class QueryInterface<
     }
   }
 
-  /**
-   * Fill a PK-ascending `orderBy` into every to-many `with` relation that has no
-   * explicit one, recursing into nested `with`. Returns a CLONED clause (user
-   * args are never mutated); when nothing needs filling it returns the input
-   * object unchanged, so the byte-identical fast path stays free. Only called
-   * when {@link resolveStableOrder} is true; runs BEFORE `withFingerprint`, so
-   * the two orderings get distinct SQL-cache entries automatically. To-one
-   * relations are single rows (no array to order) and PK-less targets have
-   * nothing stable to order by, so both are left untouched.
-   */
-  private applyStableRelationOrder(withClause: WithClause, table: string, depth = 0): WithClause {
-    // The transform itself lives in ./relation-names.ts as of 0.74.0, so PowDB
-    // runs the SAME rule instead of a second copy that accepted the option and
-    // did nothing.
-    return applyStableRelationOrderTo(this.schema, withClause, table, depth);
-  }
-
   // -------------------------------------------------------------------------
   // Deterministic pagination (unordered LIMIT/OFFSET)
   // -------------------------------------------------------------------------
-
-  /**
-   * The primary key of this table as an ascending `orderBy`, in DECLARATION
-   * order (a composite PK orders on every column), or `undefined` for a PK-less
-   * table. Field names are the camelCase accessor names, so the emitted SQL goes
-   * through the normal column mapping.
-   */
-  private pkOrderBy(): WithOrderByObject | WithOrderByObject[] | undefined {
-    const pk = this.tableMeta.primaryKey ?? [];
-    if (pk.length === 0) return undefined;
-    const fields = pk.map((c) => this.tableMeta.reverseColumnMap[c] ?? c);
-    return fields.length === 1 ? { [fields[0]!]: 'asc' } : fields.map((f) => ({ [f]: 'asc' as const }));
-  }
 
   /** Memo for {@link totalOrderKeys}; table metadata is immutable. */
   private totalOrderKeysMemo: string[][] | undefined;
@@ -1731,7 +1709,8 @@ export class QueryInterface<
     let lastDesc = false;
     for (const [key, dir] of entries) {
       lastDesc = false;
-      if (isVectorOrderBy(dir) || isJsonPathOrderBy(dir) || this.isRelationOrderByValue(dir)) continue;
+      if (isVectorOrderBy(dir) || isJsonPathOrderBy(dir) || relationsMod.isRelationOrderByValue(this.ctx, dir))
+        continue;
       const column = resolveColumnName(this.tableMeta, key);
       if (column === undefined) continue;
       ordered.add(column);
@@ -1775,10 +1754,12 @@ export class QueryInterface<
    * out, so a Postgres-compatible engine with a different default reads the
    * same order the seek assumes.
    */
-  private planCursor<A extends { cursor?: unknown; orderBy?: unknown }>(
-    args: A,
-  ): { args: A; plan: CursorPlan | undefined } {
+  private planCursor<
+    A extends { cursor?: unknown; orderBy?: unknown; cursorPredicate?: unknown; offset?: unknown; distinct?: unknown },
+  >(args: A): { args: A; plan: CursorPlan | undefined } {
     const raw = args.cursor;
+    const tuple = args.cursorPredicate === 'tuple';
+    if (tuple) assertTupleCursorMetadata(this.tableMeta);
     if (!hasCursor(raw)) return { args, plan: undefined };
     const meta = this.tableMeta;
     const field = (column: string): string => meta.reverseColumnMap[column] ?? column;
@@ -1796,7 +1777,7 @@ export class QueryInterface<
       const value = cursorFieldValue(key, written, {
         column,
         table: this.table,
-        kind: operandColumnKind(this.getColumnPgType(column)),
+        kind: this.whereHost.getColumnKind(column),
         nullable: nullableColumn(column),
       });
       cursorValues.set(column, value);
@@ -1808,7 +1789,7 @@ export class QueryInterface<
     const terms: CursorTerm[] = [];
     const orderEntries = orderByEntries(args.orderBy).filter(([, d]) => d !== undefined);
     for (const [key, dir] of orderEntries) {
-      if (isVectorOrderBy(dir) || isJsonPathOrderBy(dir) || this.isRelationOrderByValue(dir)) {
+      if (isVectorOrderBy(dir) || isJsonPathOrderBy(dir) || relationsMod.isRelationOrderByValue(this.ctx, dir)) {
         throw new ValidationError(
           `findMany on "${this.table}" refused: \`cursor\` cannot page past the orderBy entry "${key}", which ` +
             'orders by a relation, a JSON path or a vector distance rather than a column. Order the cursor ' +
@@ -1824,6 +1805,7 @@ export class QueryInterface<
     // Tiebreaker, the same one a first page gets (see tiebreakColumns).
     const tiebreak = this.tiebreakColumns(new Set(terms.map((t) => t.column)));
     if (!tiebreak) {
+      if (tuple) refuseTupleCursor('Need a non-null unique key.');
       throw new ValidationError(
         `findMany on "${this.table}" refused: a \`cursor\` page needs an order with no ties, and "${this.table}" ` +
           'has no primary key or unique key on NOT NULL columns to break them. Add a primary key, or page ' +
@@ -1848,9 +1830,8 @@ export class QueryInterface<
         t.pin = true;
         pinned = true;
       }
+      t.nullsFirst = t.nulls !== undefined ? t.nulls === 'first' : nullsSortHigh ? t.desc : !t.desc;
     }
-    const nullsFirst = (t: CursorTerm): boolean =>
-      t.nulls !== undefined ? t.nulls === 'first' : nullsSortHigh ? t.desc : !t.desc;
 
     let nextArgs = args;
     if (appended || pinned) {
@@ -1865,28 +1846,33 @@ export class QueryInterface<
     const inclusive = isCursorInclusive(args);
     const coerce = (column: string, value: unknown): unknown =>
       whereMod.coerceWhereOperand(this.ctx, meta, column, value);
-    const keysetTerms: CursorKeysetTerm[] = terms.map((t) => ({
-      column: t.column,
-      desc: t.desc,
-      nullsFirst: nullsFirst(t),
-      nullable: t.nullable,
-    }));
+    // The placement loop has filled every term before the plan can escape.
+    const keysetTerms = terms as CursorKeysetTerm[];
+
+    const orderFp = (values?: readonly unknown[]): string =>
+      keysetTerms
+        .map(
+          (t, i) =>
+            `${t.column}:${t.desc ? 'd' : 'a'}${t.nullable ? (t.nullsFirst ? 'f' : 'l') : ''}${values?.[i] === null ? '0' : ''}`,
+        )
+        .join(',');
+    // IndexMetadata.columns can omit expressions and does not prove that an
+    // index uses the column's own equality/collation. Trust constraints only.
+    const tupleFp = tuple ? tupleCursorFingerprint(meta, terms, cursorValues, args, inclusive, this.schema.enums) : '';
 
     // An inclusive cursor (prisma-compat) names a ROW, as Prisma's does, so it
     // always reads that row: a deleted cursor row gives an empty page, never a
     // page placed where the row used to be.
-    const namesRow = inclusive && whereIdentifiesOneRow(meta, flat);
-    if (!namesRow && terms.every((t) => cursorValues.has(t.column))) {
+    const namesRow = !tuple && inclusive && whereIdentifiesOneRow(meta, flat);
+    if (tuple || (!namesRow && terms.every((t) => cursorValues.has(t.column)))) {
       const values = terms.map((t) => {
         const v = cursorValues.get(t.column);
         return v === null ? null : coerce(t.column, v);
       });
-      const fp =
-        `v:${keysetTerms.map((t, i) => `${t.column}:${t.desc ? 'd' : 'a'}${t.nullable ? (t.nullsFirst ? 'f' : 'l') : ''}${values[i] === null ? '0' : ''}`).join(',')}` +
-        (inclusive ? ':i' : '');
+      const fp = tupleFp || `v:${orderFp(values)}${inclusive ? ':i' : ''}`;
       return {
         args: nextArgs,
-        plan: { mode: 'values', terms: keysetTerms, values, lookup: [], inclusive, fingerprint: fp },
+        plan: { mode: tuple ? 'tuple' : 'values', terms: keysetTerms, values, inclusive, fingerprint: fp },
       };
     }
 
@@ -1904,12 +1890,12 @@ export class QueryInterface<
     }
     const lookup = [...cursorValues].map(([column, v]) => ({ column, value: v === null ? null : coerce(column, v) }));
     const fp =
-      `r:${keysetTerms.map((t) => `${t.column}:${t.desc ? 'd' : 'a'}${t.nullable ? (t.nullsFirst ? 'f' : 'l') : ''}`).join(',')}` +
+      `r:${orderFp()}` +
       `|k=${lookup.map((l) => `${l.column}${l.value === null ? '0' : ''}`).join(',')}` +
       (inclusive ? ':i' : '');
     return {
       args: nextArgs,
-      plan: { mode: 'row', terms: keysetTerms, values: [], lookup, inclusive, fingerprint: fp },
+      plan: { mode: 'row', terms: keysetTerms, lookup, inclusive, fingerprint: fp },
     };
   }
 
@@ -1929,12 +1915,15 @@ export class QueryInterface<
     const col = (t: CursorKeysetTerm) => `${qt}.${this.q(t.column)}`;
     let ref: (i: number) => string | null;
     let guard = '';
-    if (plan.mode === 'values') {
+    if (plan.mode !== 'row') {
       const refs = plan.values.map((v) => {
         if (v === null) return null;
         params.push(v);
         return this.p(params.length);
       });
+      if (plan.mode === 'tuple') {
+        return `(${plan.terms.map(col).join(', ')}) ${plan.terms[0]!.desc ? '<' : '>'} (${refs.join(', ')})`;
+      }
       ref = (i) => refs[i] ?? null;
     } else {
       const alias = 'cursor_row';
@@ -2048,7 +2037,7 @@ export class QueryInterface<
   }): WithOrderByObject | WithOrderByObject[] | undefined {
     if (!this.implicitPkOrdering) return undefined;
     if (!this.isUnorderedPage(args)) return undefined;
-    return this.pkOrderBy();
+    return primaryKeyOrderBy(this.tableMeta);
   }
 
   /**
@@ -2330,7 +2319,7 @@ export class QueryInterface<
     // metadata, so it still applies.
     if (!schemaHasIndexInfo(this.schema) && !parentSetLarge) return null;
     const withClause = this.resolveStableOrder(stableFlag)
-      ? this.applyStableRelationOrder(withArg, this.table)
+      ? applyStableRelationOrderTo(this.schema, withArg, this.table)
       : withArg;
     const split = this.partitionWithForAuto(withClause, parentSetLarge, parentBound);
     if (Object.keys(split.batchedWith).length === 0) return null;
@@ -2539,7 +2528,7 @@ export class QueryInterface<
       // relation fetch was never affected, because that one goes through the
       // child's own buildFindMany and merges the filter unqualified.
       tableGlobalFilter: (table, ref, precedingParams) => {
-        const gf = this.resolveGlobalFilter(table, resolvedSkip);
+        const gf = whereMod.resolveGlobalFilter(this.ctx, table, resolvedSkip);
         if (!gf) return null;
         const meta = this.schema.tables[table];
         if (!meta) return null;
@@ -2606,7 +2595,7 @@ export class QueryInterface<
     // orderBy into its follow-up query, so filling the synthesized PK order here
     // makes the batched output deterministic exactly like the join path.
     const withClause = this.resolveStableOrder(args.stableRelationOrder)
-      ? this.applyStableRelationOrder(args.with as WithClause, this.table)
+      ? applyStableRelationOrderTo(this.schema, args.with as WithClause, this.table)
       : (args.with as WithClause);
     // Scope-rule parity with the join strategy (which throws at SQL build):
     // reject nested pick-row ordering BEFORE the base query so acceptance
@@ -3040,6 +3029,85 @@ export class QueryInterface<
     return this.queryWithTimeout(sql, params, timeout, preparedName, true);
   }
 
+  /** One executor for compiled reads; all paths retain timeout, naming and decoding. */
+  private async executeRead<V>(
+    deferred: DeferredQuery<V>,
+    args: { timeout?: number | undefined; forceCustomPlan?: boolean | undefined } | undefined,
+  ): Promise<V> {
+    const result = await this.readWithTimeout(
+      deferred.sql,
+      deferred.params,
+      args?.timeout,
+      this.preparedNameFor(args, deferred.preparedName),
+    );
+    return deferred.transform(result);
+  }
+
+  /** Native flat reads skip the driver's intermediate object materialization. */
+  private async executeFlatRead<V>(
+    deferred: DeferredQuery<V>,
+    args: { timeout?: number | undefined; forceCustomPlan?: boolean | undefined } | undefined,
+  ): Promise<V> {
+    // Only native pg's standard text-row lifecycle is positional. Custom
+    // clients, binary pools, transactions and timed reads keep object rows.
+    const arrayRows =
+      !args?.timeout &&
+      !this.txScoped &&
+      this.dialect.capabilities.connectionDriver === 'pg-compatible' &&
+      canReadArrayRows(this.pool);
+    if (!arrayRows) return this.executeRead(deferred, args);
+    const result = await this.queryWithTimeout(
+      deferred.sql,
+      deferred.params,
+      args?.timeout,
+      this.preparedNameFor(args, deferred.preparedName),
+      true,
+      this.pool,
+      true,
+    );
+    if (result.fields && Array.isArray(result.rows[0])) {
+      let plan = this.arrayReadPlan;
+      const columns = result.fields;
+      let same = plan !== undefined && plan.names.length === columns.length;
+      if (same) {
+        for (let i = 0; i < columns.length; i++) {
+          if (plan!.names[i] !== columns[i]!.name) {
+            same = false;
+            break;
+          }
+        }
+      }
+      if (!same) {
+        // Object.keys reproduces pg's object enumeration: integer keys sort,
+        // duplicate names retain their first position and their LAST value.
+        const positions: Record<string, number> = Object.create(null);
+        for (let i = 0; i < columns.length; i++) positions[columns[i]!.name] = i;
+        this.arrayReadPlan = plan = {
+          names: columns.map((column) => column.name),
+          indices: Object.values(positions),
+          decode: this.rowDecodePlanFor(this.table, this.tableMeta, Object.keys(positions)),
+        };
+      }
+      const { fields, kinds } = plan!.decode;
+      const { indices } = plan!;
+      return result.rows.map((row) => {
+        const parsed: Record<string, unknown> = {};
+        for (let i = 0; i < fields.length; i++) {
+          const field = fields[i]!;
+          const kind = kinds[i]!;
+          let value = row[indices[i]!];
+          if (field === '__proto__')
+            Object.defineProperty(parsed, field, { writable: true, enumerable: true, configurable: true });
+          if (kind !== CELL_PLAIN && (kind !== CELL_FLOAT || typeof value === 'string'))
+            value = this.decodeCell(kind, value, this.table, field);
+          parsed[field] = value;
+        }
+        return parsed;
+      }) as V;
+    }
+    return deferred.transform(result);
+  }
+
   /**
    * Execute a pool.query with an optional timeout.
    *
@@ -3059,6 +3127,7 @@ export class QueryInterface<
     preparedName?: string,
     retryIfStale = false,
     pool: PgCompatPool = this.pool,
+    arrayRows = false,
   ): Promise<PgCompatQueryResult> {
     const action = this.currentAction;
     const out = this.outgoing(sql, preparedName, action);
@@ -3067,10 +3136,11 @@ export class QueryInterface<
     if (timeout !== undefined && pool === this.pool && this.cancelsOnTimeout()) {
       return this.queryCancellable(out, params, timeout, retryIfStale, action);
     }
-    if (timeout !== undefined && pool === this.pool && this.txScoped && this.dialect.capabilities.backendCancel) {
-      const state = transactionStateOf(this.pool);
-      if (state !== undefined && canCancelBackend(state.client)) {
-        return this.queryCancellableInTransaction(out, params, timeout, state, action);
+    // The caller's transaction, for a timed statement that runs in one.
+    const state = timeout !== undefined && pool === this.pool && this.txScoped ? transactionStateOf(pool) : undefined;
+    if (timeout !== undefined && state !== undefined && this.dialect.capabilities.backendCancel) {
+      if (canCancelBackend(state.client)) {
+        return this.queryCancellable(out, params, timeout, false, action, state);
       }
     }
     let trace = startQueryTrace(this.table, action, out.sql, params.length);
@@ -3083,14 +3153,16 @@ export class QueryInterface<
     // cast. Guarded at runtime by `preparedStatementsEnabled`, which only the
     // drivers that accept it turn on.
     const usePrepared = out.name && this.preparedStatementsEnabled;
-    const send = (): Promise<PgCompatQueryResult> =>
-      usePrepared
-        ? (pool as unknown as { query(config: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query({
-            name: out.name,
-            text: out.text,
-            values: params,
-          })
-        : pool.query(out.text, params);
+    const send = (): Promise<PgCompatQueryResult> => {
+      if (!arrayRows && !usePrepared) return pool.query(out.text, params);
+      const config: PgCompatQueryConfig & { rowMode?: 'array' } = {
+        name: usePrepared ? out.name : undefined,
+        text: out.text,
+        values: params,
+      };
+      if (arrayRows) config.rowMode = 'array';
+      return (pool as unknown as { query(config: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query(config);
+    };
     let exec = send();
     // Set when the caller's timeout has already answered, so a first attempt
     // that fails AFTER that does not send a retry nobody is waiting for.
@@ -3120,51 +3192,28 @@ export class QueryInterface<
       });
     }
 
-    if (!timeout) {
-      try {
-        const result = await exec;
-        this.emitQueryEvent(
-          out,
-          params,
-          performance.now() - start,
-          action,
-          result.rowCount ?? 0,
-          undefined,
-          undefined,
-          trace,
-        );
-        return result;
-      } catch (err) {
-        const wrapped = wrapPgError(err);
-        this.emitQueryEvent(
-          out,
-          params,
-          performance.now() - start,
-          action,
-          0,
-          wrapped instanceof Error ? wrapped : undefined,
-          undefined,
-          trace,
-        );
-        throw wrapped;
-      }
-    }
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const timeoutPromise = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => {
-        abandoned = true;
-        reject(
-          new TimeoutError(timeout, 'Query', {
-            outcome: 'unknown',
-            message:
-              `Query timed out after ${timeout}ms. It could not be cancelled on the server and may still ` +
-              'complete, so a write may have been applied: check before retrying it.',
-          }),
-        );
-      }, timeout);
-    });
+    const timeoutPromise = timeout
+      ? new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            abandoned = true;
+            const lead = `Query timed out after ${timeout}ms. It could not be cancelled on the server`;
+            reject(
+              new TimeoutError(timeout, 'Query', {
+                outcome: 'unknown',
+                // In a write's own savepoint, the rollback to it waits for the statement
+                // to end, so the statement cannot complete after the error is settled
+                // (see settledTimeout in transaction-state.ts).
+                message: state?.inWriteSavepoint
+                  ? `${lead}.`
+                  : `${lead} and may still complete: check before retrying a write.`,
+              }),
+            );
+          }, timeout);
+        })
+      : undefined;
     try {
-      const result = await Promise.race([exec, timeoutPromise]);
+      const result = await (timeoutPromise ? Promise.race([exec, timeoutPromise]) : exec);
       this.emitQueryEvent(
         out,
         params,
@@ -3220,6 +3269,10 @@ export class QueryInterface<
    * A deadline that passes while still waiting for a connection sends nothing
    * (`'not-executed'`). Either way the connection goes back to the pool only
    * once its backend is idle, so timed-out statements cannot hold the pool.
+   *
+   * With `state`, the transaction owns the connection: skip checkout/release
+   * and retry, and cancel through its existing rollback-only settlement path.
+   * The shared runner keeps statement naming, timing and query events identical.
    */
   private async queryCancellable(
     out: Outgoing,
@@ -3227,6 +3280,7 @@ export class QueryInterface<
     timeout: number,
     retryIfStale: boolean,
     action: string,
+    state?: TransactionState,
   ): Promise<PgCompatQueryResult> {
     let trace = startQueryTrace(this.table, action, out.sql, params.length);
     let start = performance.now();
@@ -3254,21 +3308,27 @@ export class QueryInterface<
       });
     try {
       for (let attempt = 0; ; attempt++) {
-        const checkingOut = acquireConnection(this.pool);
-        let held: Checkout | typeof TIMED_OUT;
-        try {
-          held = await Promise.race([checkingOut, deadline]);
-        } catch (err) {
-          throw report(err);
+        // Ambient transactions own their checkout. Only a standalone statement
+        // races pool admission against the deadline and returns late checkouts.
+        let held: Checkout | undefined;
+        if (!state) {
+          const checkingOut = acquireConnection(this.pool);
+          let admission: Checkout | typeof TIMED_OUT;
+          try {
+            admission = await Promise.race([checkingOut, deadline]);
+          } catch (err) {
+            throw report(err);
+          }
+          if (admission === TIMED_OUT) {
+            checkingOut.then(
+              (late) => late.checkout.release(),
+              () => {},
+            );
+            throw report(neverSent());
+          }
+          held = admission;
         }
-        if (held === TIMED_OUT) {
-          checkingOut.then(
-            (late) => late.checkout.release(),
-            () => {},
-          );
-          throw report(neverSent());
-        }
-        const { client, checkout } = held;
+        const client = held?.client ?? this.pool;
         const running: Promise<Settled> = (
           config
             ? (client as unknown as { query(c: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query(config)
@@ -3278,9 +3338,14 @@ export class QueryInterface<
           (error: unknown) => ({ error }),
         );
         const first = await Promise.race([running, deadline]);
-        const settled = first === TIMED_OUT ? await this.cancelTimedOut(held, running, timeout) : first;
+        const settled =
+          first === TIMED_OUT
+            ? state
+              ? await this.cancelInTransaction(state, running, timeout)
+              : await this.cancelTimedOut(held!, running, timeout)
+            : first;
         if ('result' in settled) {
-          if (first !== TIMED_OUT) checkout.release();
+          if (first !== TIMED_OUT) held?.checkout.release();
           const rows = settled.result.rowCount ?? 0;
           this.emitQueryEvent(out, params, performance.now() - start, action, rows, undefined, undefined, trace);
           return settled.result;
@@ -3288,8 +3353,8 @@ export class QueryInterface<
         if ('timeout' in settled) throw report(settled.timeout);
         const err = settled.error;
         if (first === TIMED_OUT) throw report(err);
-        checkout.release(err instanceof Error ? err : true);
-        if (!(retryIfStale && attempt === 0 && isStaleConnectionError(err))) throw report(err);
+        held?.checkout.release(err instanceof Error ? err : true);
+        if (!(retryIfStale && !state && attempt === 0 && isStaleConnectionError(err))) throw report(err);
         report(err, true);
         await settleEventLoop();
         if (expired) throw report(neverSent());
@@ -3301,93 +3366,32 @@ export class QueryInterface<
     }
   }
 
-  /**
-   * A timed statement inside a transaction, cancelled on the server when the
-   * deadline passes, on the transaction's own connection.
-   *
-   * A cancelled statement made no change, but PostgreSQL aborts the
-   * transaction it ran in, so the timeout ends the transaction too: it is
-   * marked to roll back ({@link TransactionState.abort}), which also covers a
-   * cancel that arrived after the statement finished. The error is
-   * `outcome: 'not-executed'` either way, because nothing it did can commit.
-   * A statement that finishes before the deadline is returned as usual.
-   */
-  private async queryCancellableInTransaction(
-    out: Outgoing,
-    params: unknown[],
-    timeout: number,
-    state: TransactionState,
-    action: string,
-  ): Promise<PgCompatQueryResult> {
-    const trace = startQueryTrace(this.table, action, out.sql, params.length);
-    const start = performance.now();
-    const running: Promise<Settled> = (
-      out.name && this.preparedStatementsEnabled
-        ? (this.pool as unknown as { query(c: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query({
-            name: out.name,
-            text: out.text,
-            values: params,
-          })
-        : this.pool.query(out.text, params)
-    ).then(
-      (result) => ({ result }),
-      (error: unknown) => ({ error }),
-    );
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const deadline = new Promise<typeof TIMED_OUT>((resolve) => {
-      timer = setTimeout(() => resolve(TIMED_OUT), timeout);
-    });
-    let settled: Settled | { timeout: TimeoutError };
-    try {
-      const first = await Promise.race([running, deadline]);
-      settled = first === TIMED_OUT ? await this.cancelInTransaction(state, running, timeout) : first;
-    } finally {
-      clearTimeout(timer);
-    }
-    if ('result' in settled) {
-      const rows = settled.result.rowCount ?? 0;
-      this.emitQueryEvent(out, params, performance.now() - start, action, rows, undefined, undefined, trace);
-      return settled.result;
-    }
-    const err = 'timeout' in settled ? settled.timeout : wrapPgError(settled.error);
-    const error = err instanceof Error ? err : undefined;
-    this.emitQueryEvent(out, params, performance.now() - start, action, 0, error, undefined, trace);
-    throw err;
-  }
-
-  /** Cancel a timed-out statement in a transaction and end the transaction. See {@link queryCancellableInTransaction}. */
+  /** Cancel a timed-out statement in a transaction and end the transaction. See {@link queryCancellable}. */
   private async cancelInTransaction(
     state: TransactionState,
     running: Promise<Settled>,
     timeout: number,
   ): Promise<Settled | { timeout: TimeoutError }> {
-    let graceTimer: ReturnType<typeof setTimeout> | undefined;
-    const graceOver = new Promise<typeof TIMED_OUT>((resolve) => {
-      graceTimer = setTimeout(() => resolve(TIMED_OUT), CANCEL_GRACE_MS);
+    const { answer } = await settleBackendCancel(sendCancelRequest(state.client, CANCEL_GRACE_MS), running);
+    if (answer !== TIMED_OUT && 'result' in answer) return answer;
+    const cancelled = answer !== TIMED_OUT && isQueryCanceled(answer.error);
+    if (answer !== TIMED_OUT && !cancelled) return answer;
+    const lead = cancelled
+      ? `Query timed out after ${timeout}ms and was cancelled on the server`
+      : `Query timed out after ${timeout}ms, and the server did not confirm its cancellation within ${CANCEL_GRACE_MS}ms`;
+    // In a write's own savepoint the write's other statements are still in the
+    // transaction until the rollback to that savepoint answers, which then
+    // decides what the error says (see settledTimeout in transaction-state.ts).
+    const inWrite = state.inWriteSavepoint;
+    const error = new TimeoutError(timeout, 'Query', {
+      outcome: inWrite ? 'unknown' : 'not-executed',
+      ...(cancelled ? { cause: answer.error } : {}),
+      message: inWrite
+        ? `${lead}.`
+        : `${lead}${cancelled ? ', so it made no change' : ''}. The transaction it ran in rolls back instead of committing.`,
     });
-    try {
-      await Promise.race([sendCancelRequest(state.client, CANCEL_GRACE_MS), graceOver]);
-      const answer = await Promise.race([running, graceOver]);
-      if (answer !== TIMED_OUT && 'result' in answer) return answer;
-      const cancelled = answer !== TIMED_OUT && isQueryCanceled(answer.error);
-      if (answer !== TIMED_OUT && !cancelled) return answer;
-      const error = new TimeoutError(timeout, 'Query', {
-        outcome: 'not-executed',
-        ...(cancelled ? { cause: answer.error } : {}),
-        message:
-          (cancelled
-            ? `Query timed out after ${timeout}ms and was cancelled on the server, so it made no change. `
-            : `Query timed out after ${timeout}ms, and the server did not confirm its cancellation within ` +
-              `${CANCEL_GRACE_MS}ms. `) +
-          'The transaction it ran in is over: it rolls back instead of committing, and no statement in it is ' +
-          'kept. Let this error leave the transaction callback and retry the whole transaction, or run a ' +
-          'statement that may time out in a nested `tx.$transaction(...)`, which rolls back only that block.',
-      });
-      state.abort(error);
-      return { timeout: error };
-    } finally {
-      clearTimeout(graceTimer);
-    }
+    state.abort(error);
+    return { timeout: error };
   }
 
   /**
@@ -3399,48 +3403,39 @@ export class QueryInterface<
     running: Promise<Settled>,
     timeout: number,
   ): Promise<Settled | { timeout: TimeoutError }> {
-    let graceTimer: ReturnType<typeof setTimeout> | undefined;
-    const graceOver = new Promise<typeof TIMED_OUT>((resolve) => {
-      graceTimer = setTimeout(() => resolve(TIMED_OUT), CANCEL_GRACE_MS);
-    });
-    try {
-      const delivered = await Promise.race([sendCancelRequest(held.client, CANCEL_GRACE_MS), graceOver]);
-      const answer = await Promise.race([running, graceOver]);
-      if (answer === TIMED_OUT) {
-        held.checkout.release(new Error('the statement did not stop after a cancel request'));
-        return {
-          timeout: new TimeoutError(timeout, 'Query', {
-            outcome: 'unknown',
-            message:
-              `Query timed out after ${timeout}ms and the server did not confirm its cancellation within ` +
-              `${CANCEL_GRACE_MS}ms, so it may still complete and a write may have been applied: check before ` +
-              'retrying it. The connection was closed.',
-          }),
-        };
-      }
-      // A cancel that was sent but not confirmed could still land on the NEXT
-      // statement this connection runs, so such a connection is not reused.
-      const reusable = delivered === true;
-      if ('result' in answer) {
-        held.checkout.release(reusable ? undefined : true);
-        return answer;
-      }
-      const err = answer.error;
-      if (reusable && (err as { code?: unknown } | null)?.code === '57014') {
-        held.checkout.release();
-        return {
-          timeout: new TimeoutError(timeout, 'Query', {
-            outcome: 'not-executed',
-            cause: err,
-            message: `Query timed out after ${timeout}ms and was cancelled on the server. It made no change.`,
-          }),
-        };
-      }
-      held.checkout.release(err instanceof Error ? err : true);
-      return answer;
-    } finally {
-      clearTimeout(graceTimer);
+    const { delivered, answer } = await settleBackendCancel(sendCancelRequest(held.client, CANCEL_GRACE_MS), running);
+    if (answer === TIMED_OUT) {
+      held.checkout.release(new Error('the statement did not stop after a cancel request'));
+      return {
+        timeout: new TimeoutError(timeout, 'Query', {
+          outcome: 'unknown',
+          message:
+            `Query timed out after ${timeout}ms and the server did not confirm its cancellation within ` +
+            `${CANCEL_GRACE_MS}ms, so it may still complete and a write may have been applied: check before ` +
+            'retrying it. The connection was closed.',
+        }),
+      };
     }
+    // A cancel that was sent but not confirmed could still land on the NEXT
+    // statement this connection runs, so such a connection is not reused.
+    const reusable = delivered === true;
+    if ('result' in answer) {
+      held.checkout.release(reusable ? undefined : true);
+      return answer;
+    }
+    const err = answer.error;
+    if (reusable && (err as { code?: unknown } | null)?.code === '57014') {
+      held.checkout.release();
+      return {
+        timeout: new TimeoutError(timeout, 'Query', {
+          outcome: 'not-executed',
+          cause: err,
+          message: `Query timed out after ${timeout}ms and was cancelled on the server. It made no change.`,
+        }),
+      };
+    }
+    held.checkout.release(err instanceof Error ? err : true);
+    return answer;
   }
 
   /**
@@ -3479,33 +3474,23 @@ export class QueryInterface<
    * deadline is not sent. `onClient` routes them to a held connection.
    */
   private deadlineExec(timeout: number | undefined, onClient?: PgCompatPool): ReselectExecutor {
-    const deadline = timeout ? performance.now() + timeout : undefined;
+    const left = timeout ? writeDeadline(timeout) : undefined;
     return async (sql, params, preparedName) => {
-      let left = timeout;
-      if (deadline !== undefined) {
-        left = Math.ceil(deadline - performance.now());
-        if (left <= 0) {
-          throw new TimeoutError(timeout as number, 'Query', {
-            outcome: 'not-executed',
-            message:
-              `Query timed out after ${timeout}ms: the write's statements share one deadline, and it passed ` +
-              'before the next one was sent. Its earlier statements are rolled back, so it makes no change.',
-          });
-        }
-      }
+      const ms = left?.();
       return onClient
-        ? this.queryWithTimeout(sql, params, left, preparedName, false, onClient)
-        : this.queryWithTimeout(sql, params, left, preparedName);
+        ? this.queryWithTimeout(sql, params, ms, preparedName, false, onClient)
+        : this.queryWithTimeout(sql, params, ms, preparedName);
     };
   }
 
   /**
    * Run a write that takes several statements as one transaction on one
    * connection: the caller's transaction when there is one, else one opened
-   * here. A statement that times out is cancelled where the engine allows it,
-   * and its connection is closed rather than rolled back (a ROLLBACK would wait
-   * behind it); the transaction never commits, so the write made no change.
-   * `timeout` is one deadline for every statement (see {@link deadlineExec}).
+   * here and settled by {@link completeTransaction}. A statement that times
+   * out ends that transaction: its running statement is cancelled where the
+   * engine allows it and ROLLBACK sent, and the error says whether the server
+   * confirmed the rollback. `timeout` is one deadline for every statement (see
+   * {@link deadlineExec}).
    */
   private async inOneTransaction<V>(
     work: (exec: ReselectExecutor) => Promise<V>,
@@ -3516,6 +3501,8 @@ export class QueryInterface<
     if (this.txScoped) {
       // In the caller's transaction, a savepoint keeps the write whole: a later
       // statement that fails and is caught cannot leave the earlier ones behind.
+      // A deadline between statements made no change only once the rollback
+      // to that savepoint is acknowledged (see writeDeadline).
       return withSavepoint(this.pool, () => work(this.deadlineExec(timeout)));
     }
     if (typeof (this.pool as { connect?: unknown }).connect !== 'function') {
@@ -3526,48 +3513,20 @@ export class QueryInterface<
           `this pool cannot check one out (a stateless HTTP driver). ${alternative}`,
       );
     }
-    const { client, checkout } = await openCheckout(this.pool, (c) => c.query(this.dialect.beginStatement()));
+    const held = await openCheckout(this.pool, (c) => sendControl(c, this.dialect.beginStatement()));
+    const { client } = held;
+    const state = new TransactionState(client, this.dialect);
+    // Statements go through the state, so the settlement knows one is still
+    // running when a timeout cuts the write short.
     const onClient = {
       query: (text: string | PgCompatQueryConfig, values?: unknown[]) =>
-        typeof text === 'string'
-          ? client.query(text, values)
-          : (client as unknown as { query(c: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query(text),
+        state.run(() =>
+          typeof text === 'string'
+            ? client.query(text, values)
+            : (client as unknown as { query(c: PgCompatQueryConfig): Promise<PgCompatQueryResult> }).query(text),
+        ),
     } as unknown as PgCompatPool;
-    try {
-      const value = await work(this.deadlineExec(timeout, onClient));
-      await client.query(this.dialect.commitStatement());
-      checkout.release();
-      return value;
-    } catch (err) {
-      if (err instanceof TimeoutError) {
-        if (await sendCancelRequest(client, CANCEL_GRACE_MS)) {
-          checkout.release(err);
-        } else {
-          // No cancel reached the server (or the engine has none), so the
-          // statement may still be running. The ROLLBACK queues behind it on
-          // this connection, and the connection goes back to the pool only
-          // after it: never with the transaction still open.
-          client.query(this.dialect.rollbackStatement()).then(
-            () => checkout.release(),
-            (e: unknown) => checkout.release(e instanceof Error ? e : true),
-          );
-        }
-        throw new TimeoutError(err.timeoutMs, 'Query', {
-          outcome: 'not-executed',
-          cause: err,
-          message:
-            `Query timed out after ${err.timeoutMs}ms. Its transaction is rolled back rather than committed, ` +
-            'so it makes no change.',
-        });
-      }
-      try {
-        await client.query(this.dialect.rollbackStatement());
-      } catch {
-        // Best effort: the connection may be gone.
-      }
-      checkout.release();
-      throw explainConnectionLoss(wrapPgError(err), checkout.lostWith);
-    }
+    return completeTransaction(held, state, this.dialect, undefined, () => work(this.deadlineExec(timeout, onClient)));
   }
 
   // ---------------------------------------------------------------------------
@@ -3647,7 +3606,18 @@ export class QueryInterface<
     }
     return writesMod.COUNT_ONLY;
   }
-
+  buildUpdate<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+    const Input = unknown,
+  >(
+    args: PrototypeFilterInput<
+      T,
+      R,
+      UpdateArgs<T, R, S, O, M['update'], Input> & { where: Input },
+      UpdateArgs<T, R, S, O, M['update']>
+    >,
+  ): DeferredQuery<FieldResult<T, S, O>>;
   buildUpdate<
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
@@ -3659,7 +3629,13 @@ export class QueryInterface<
       this.resolveWriteProjection(args),
     ) as unknown as DeferredQuery<FieldResult<T, S, O>>;
   }
-
+  buildDelete<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+    const Input = unknown,
+  >(
+    args: PrototypeFilterInput<T, R, DeleteArgs<T, R, S, O, Input> & { where: Input }, DeleteArgs<T, R, S, O>>,
+  ): DeferredQuery<FieldResult<T, S, O>>;
   buildDelete<
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
@@ -3671,7 +3647,18 @@ export class QueryInterface<
       this.resolveWriteProjection(args),
     ) as unknown as DeferredQuery<FieldResult<T, S, O>>;
   }
-
+  buildUpsert<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+    const Input = unknown,
+  >(
+    args: PrototypeFilterInput<
+      T,
+      R,
+      UpsertArgs<T, R, S, O, M['whereUnique'], M['createMany'], M['updateMany'], Input> & { where: Input },
+      UpsertArgs<T, R, S, O, M['whereUnique'], M['createMany'], M['updateMany']>
+    >,
+  ): DeferredQuery<FieldResult<T, S, O>>;
   buildUpsert<
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
@@ -3685,11 +3672,20 @@ export class QueryInterface<
       this.resolveWriteProjection(args),
     ) as unknown as DeferredQuery<FieldResult<T, S, O>>;
   }
-
+  buildUpdateMany<const Input = unknown>(
+    args: PrototypeFilterInput<
+      T,
+      R,
+      UpdateManyArgs<T, R, M['updateMany'], Input> & { where: Input },
+      UpdateManyArgs<T, R, M['updateMany']>
+    >,
+  ): DeferredQuery<{ count: number }>;
   buildUpdateMany(args: UpdateManyArgs<T, R, M['updateMany']>): DeferredQuery<{ count: number }> {
     return writesMod.buildUpdateMany(this.ctx, this.normalizeArgs(args));
   }
-
+  buildDeleteMany<const Input = unknown>(
+    args: PrototypeFilterInput<T, R, DeleteManyArgs<T, R, Input> & { where: Input }, DeleteManyArgs<T, R>>,
+  ): DeferredQuery<{ count: number }>;
   buildDeleteMany(args: DeleteManyArgs<T, R>): DeferredQuery<{ count: number }> {
     return writesMod.buildDeleteMany(this.ctx, this.normalizeArgs(args));
   }
@@ -3748,7 +3744,20 @@ export class QueryInterface<
 
     return next(params) as Promise<R>;
   }
-
+  findUnique<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+    const Input = unknown,
+  >(
+    args: PrototypeFilterInput<
+      T,
+      R,
+      FindUniqueArgs<T, R, W, S, O, M['whereUnique'], Input> & { where: Input },
+      FindUniqueArgs<T, R, W, S, O, M['whereUnique']>
+    >,
+  ): Promise<QueryResult<T, R, W, S, O> | null>;
   // -------------------------------------------------------------------------
   // findUnique
   // -------------------------------------------------------------------------
@@ -3769,7 +3778,7 @@ export class QueryInterface<
     // depending on every consumer to re-establish it.
     args = this.normalizeArgs(args);
     this.assertLockInTransaction(args, 'findUnique');
-    return this.executeWithMiddleware('findUnique', args as unknown as Record<string, unknown>, async () => {
+    return this.executeWithMiddleware<unknown>('findUnique', args as unknown as Record<string, unknown>, () => {
       if (args.with) {
         const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
         if (strategy === 'batched') return this.runFindUniqueBatched(args as unknown as FindUniqueArgs<T>);
@@ -3783,13 +3792,7 @@ export class QueryInterface<
         }
       }
       const deferred = this.buildFindUnique(args);
-      const result = await this.readWithTimeout(
-        deferred.sql,
-        deferred.params,
-        args.timeout,
-        this.preparedNameFor(args, deferred.preparedName),
-      );
-      return deferred.transform(result);
+      return this.executeRead(deferred, args);
     }) as Promise<QueryResult<T, R, W, S, O> | null>;
   }
 
@@ -3804,7 +3807,7 @@ export class QueryInterface<
     args = this.normalizeArgs(args);
     // Stable relation order (opt-in), see runFindManyBatched.
     const withClause = this.resolveStableOrder(args.stableRelationOrder)
-      ? this.applyStableRelationOrder(args.with as WithClause, this.table)
+      ? applyStableRelationOrderTo(this.schema, args.with as WithClause, this.table)
       : (args.with as WithClause);
     // Same scope-rule parity as runFindManyBatched: reject before querying.
     rejectNestedPickOrder(withClause);
@@ -3843,7 +3846,20 @@ export class QueryInterface<
     stripFields([entity], proj.strip);
     return entity as T;
   }
-
+  buildFindUnique<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+    const Input = unknown,
+  >(
+    args: PrototypeFilterInput<
+      T,
+      R,
+      FindUniqueArgs<T, R, W, S, O, M['whereUnique'], Input> & { where: Input },
+      FindUniqueArgs<T, R, W, S, O, M['whereUnique']>
+    >,
+  ): DeferredQuery<QueryResult<T, R, W, S, O> | null>;
   buildFindUnique<
     // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
     W extends TypedWithClause<R> = {},
@@ -3859,6 +3875,7 @@ export class QueryInterface<
     // Prisma compound-unique selector expansion (before global-filter merge and
     // fingerprinting, so the cache only ever sees the canonical expanded where).
     args = maybeExpandCompoundUnique(this.tableMeta, args);
+    const userWhere = (args.where ?? {}) as Record<string, unknown>;
     // A findUnique whose `where` carries NO predicate must not run.
     //
     // `{ id: undefined }` is what `{ id: req.params.id }` becomes on a request
@@ -3878,7 +3895,7 @@ export class QueryInterface<
     // filter" is its contract, and `where: {}` or no `where` asks for any row.
     // It refuses only a `where` that was emptied by `undefined` values (see
     // normalizeArgs), which never meant "any row".
-    if (whereMod.userPredicateIsEmpty(this.ctx, (args.where ?? {}) as Record<string, unknown>)) {
+    if (whereMod.userPredicateIsEmpty(this.ctx, userWhere)) {
       throw new ValidationError(
         `findUnique on "${this.table}" refused: the \`where\` clause has no predicate, ` +
           'so this would return an arbitrary row rather than a specific one. ' +
@@ -3898,14 +3915,14 @@ export class QueryInterface<
     // Checked against the USER's where for the same reason as the guard above:
     // a global filter is not an identity, and letting one satisfy this would
     // hand back an arbitrary row from inside the tenant.
-    this.assertFindUniqueKey(args.where as Record<string, unknown>);
+    assertWhereIdentifiesOneRow(this.tableMeta, this.table, userWhere);
     // The locking clause, read by the cache key and all three SQL paths below.
     const rowLock = resolveRowLock(args.lock, this.dialect, this.table);
     const lockSql = rowLock?.sql ?? '';
     // Stable relation order (opt-in): fill PK-asc orderBy into unordered to-many
     // relations before fingerprinting (see buildFindMany).
     if (args.with && this.resolveStableOrder(args.stableRelationOrder)) {
-      const normalized = this.applyStableRelationOrder(args.with as WithClause, this.table);
+      const normalized = applyStableRelationOrderTo(this.schema, args.with as WithClause, this.table);
       if (normalized !== args.with) args = { ...args, with: normalized as typeof args.with };
     }
     // Resolved once, see buildFindMany.
@@ -3916,11 +3933,9 @@ export class QueryInterface<
     if (args.with && this.resolveLoadStrategy(args.relationLoadStrategy) === 'flatten') {
       this.warnFlattenBlocked('findUnique reads a single parent row, where the correlated subquery already runs once');
     }
-    const columnsList = this.resolveColumns(args.select, args.omit, includePii);
-    // A global filter turns the where into `{ AND: [...] }`, which the
-    // `isSimpleWhere` test below rejects → the general (buildWhereClause) path
-    // handles the merge and its params uniformly.
-    const whereObj = (this.mergeGlobalFilter(args.where as Record<string, unknown>) ?? {}) as Record<string, unknown>;
+    const columnsList = relationsMod.resolveColumns(this.ctx, args.select, args.omit, includePii);
+    // A global filter wraps the user where in an AND before compilation.
+    const whereObj = (whereMod.mergeGlobalFilter(this.ctx, userWhere) ?? {}) as Record<string, unknown>;
     const colKey = columnsList ? columnsList.join(',') : '*';
     const whereFingerprint = this.fingerprintWhere(whereObj);
     const withFp = args.with ? this.withFingerprint(args.with as WithClause) : '';
@@ -3932,143 +3947,64 @@ export class QueryInterface<
     const encodingFp = `|je=${jsonEncoding === 'positional' ? 'p' : 'o'}`;
     // Empty without a lock, so every unlocked key is unchanged.
     const lockFp = rowLock ? `|lk=${rowLock.fp}` : '';
-    const ck = `fu:${whereFingerprint}|c=${colKey}|w=${withFp}|pii=${includePii ? 1 : 0}${encodingFp}${lockFp}${this.globalFilterCacheSegment()}`;
+    const ck = `fu:${whereFingerprint}|c=${colKey}|w=${withFp}|pii=${includePii ? 1 : 0}${encodingFp}${lockFp}${whereMod.globalFilterCacheSegment(this.ctx)}`;
 
     const params: unknown[] = [];
 
-    // Check if all where values are simple (plain equality, no operators/null/OR).
-    // Keys are sorted to match fingerprintWhere, insertion order here would let
-    // permuted where literals share a cache entry with misaligned params.
-    const whereKeys = Object.keys(whereObj)
-      .filter((k) => whereObj[k] !== undefined)
-      .sort();
-    // Only a scalar the general path would accept as it is (a primitive, Date
-    // or Buffer) on a non-JSON column takes the simple path, so no operand
-    // reaches SQL without the general path's validation. Resolved, not looked
-    // up: a relation filter spelled the snake_case way must not read as a
-    // plain equality.
-    const isSimpleWhere =
-      !whereObj.OR &&
-      !whereObj.AND &&
-      !whereObj.NOT &&
-      whereKeys.every((k) => {
-        if (!isFastPathScalar(whereObj[k]) || resolveRelationDef(this.tableMeta.relations, k)) return false;
-        const column = resolveColumnName(this.tableMeta, k);
-        return column !== undefined && !this.isJsonColumnType(this.getColumnPgType(column));
-      });
-
-    // Simple path: plain equality, no operators/null/OR.
-    //
-    // This path pushes its own params instead of going through
-    // `buildWhereClause`, so every VALUE transform the general walker applies
-    // has to be mirrored here or the two paths disagree on the same predicate.
-    // `coerceWhereOperand` is the one that matters: without it a `Date` keyed on
-    // a zone-less `date`/`timestamp`/`time` column binds raw, and a row that
-    // `findFirst` matches, `findUnique` silently misses. It is a value-only
-    // transform, so the emitted SQL and the cache key are untouched.
-    if (!args.with && isSimpleWhere) {
-      const coerce = (k: string, v: unknown): unknown =>
-        whereMod.coerceWhereOperand(this.ctx, this.tableMeta, this.toColumn(k), v);
-      const buildSql = (freshParams: unknown[]): string => {
-        const qt = this.q(this.table);
-        const whereClauses = whereKeys.map((k, i) => {
-          freshParams.push(coerce(k, whereObj[k]));
-          return `${this.toSqlColumn(k)} = ${this.p(i + 1)}`;
-        });
-        const whereSql = whereClauses.length > 0 ? ` WHERE ${whereClauses.join(' AND ')}` : '';
-        const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${this.q(c)}`).join(', ') : `${qt}.*`;
-        return `SELECT ${selectExpr} FROM ${qt}${whereSql}${this.limitOneClause()}${lockSql}`;
-      };
-      const entry = this.acquireSql(ck, buildSql);
-
-      // Collect params (same order and same coercion as build)
-      for (const k of whereKeys) {
-        params.push(coerce(k, whereObj[k]));
-      }
-      this.crossCheckCache('findUnique', ck, entry, buildSql, params);
-
-      return {
-        sql: entry.sql,
-        params,
-        transform: (result) => {
-          const row = result.rows[0];
-          return row ? (this.parseRow(row, this.table) as unknown as QueryResult<T, R, W, S, O>) : null;
-        },
-        tag: `${this.table}.findUnique`,
-        preparedName: entry.name,
-        ...rowLockMarker(rowLock),
-      };
-    }
-
-    // General path (with operators, null, OR, with clause)
-    if (!args.with) {
-      const buildSql = (freshParams: unknown[]): string => {
-        const clause = this.buildWhereClause(whereObj, freshParams);
-        const whereSql = clause ? ` WHERE ${clause}` : '';
-        const qt = this.q(this.table);
-        const selectExpr = columnsList ? columnsList.map((c) => `${qt}.${this.q(c)}`).join(', ') : `${qt}.*`;
-        return `SELECT ${selectExpr} FROM ${qt}${whereSql}${this.limitOneClause()}${lockSql}`;
-      };
-      const entry = this.acquireSql(ck, buildSql);
-
-      // Collect params
-      this.collectWhereParams(whereObj, params);
-      this.crossCheckCache('findUnique', ck, entry, buildSql, params);
-
-      return {
-        sql: entry.sql,
-        params,
-        transform: (result) => {
-          const row = result.rows[0];
-          return row ? (this.parseRow(row, this.table) as unknown as QueryResult<T, R, W, S, O>) : null;
-        },
-        tag: `${this.table}.findUnique`,
-        preparedName: entry.name,
-        ...rowLockMarker(rowLock),
-      };
-    }
-
-    // Nested queries with `with` clause.
-    // The param order in the original code is:
-    //   1. buildWhere pushes where params
-    //   2. buildSelectWithRelations pushes relation params to same array
-    // We must preserve this exact order.
+    // Scalar equalities share the general compiler's validation and bind order.
     const buildSql = (freshParams: unknown[]): string => {
-      const clause = this.buildWhereClause(whereObj, freshParams);
-      const whereSql = clause ? ` WHERE ${clause}` : '';
-      const selectClause = this.buildSelectWithRelations(
-        this.table,
-        args.with as WithClause,
-        freshParams,
-        columnsList,
-        undefined,
-        undefined,
-        includePii,
-      );
-      return `SELECT ${selectClause} FROM ${this.q(this.table)}${whereSql}${this.limitOneClause()}${lockSql}`;
+      const clause = whereMod.buildWhereClause(this.ctx, whereObj, freshParams);
+      const qt = this.q(this.table);
+      const selectClause = args.with
+        ? relationsMod.buildSelectWithRelations(
+            this.ctx,
+            this.table,
+            args.with as WithClause,
+            freshParams,
+            columnsList,
+            undefined,
+            undefined,
+            includePii,
+            undefined,
+          )
+        : columnsList
+          ? relationsMod.qualifiedColumns(this.ctx, columnsList, qt)
+          : `${qt}.*`;
+      return `SELECT ${selectClause} FROM ${qt}${clause ? ` WHERE ${clause}` : ''}${this.limitOneClause()}${lockSql}`;
     };
     const entry = this.acquireSql(ck, buildSql);
-
-    // Collect params in exact build order: where first, then with-clause relations
     this.collectWhereParams(whereObj, params);
-    this.collectWithParams(args.with as WithClause, params);
+    if (args.with) relationsMod.collectWithParams(this.ctx, args.with as WithClause, params, undefined, undefined);
     this.crossCheckCache('findUnique', ck, entry, buildSql, params);
-
-    const parseWith = this.makeNestedParser(args.with as WithClause, includePii);
-
+    const parse = args.with
+      ? relationsMod.makeNestedParser(this.ctx, args.with as WithClause, includePii, undefined)
+      : this.makeRowParser(this.table);
     return {
       sql: entry.sql,
       params,
       transform: (result) => {
         const row = result.rows[0];
-        return row ? (parseWith(row) as unknown as QueryResult<T, R, W, S, O>) : null;
+        return row ? (parse(row) as QueryResult<T, R, W, S, O>) : null;
       },
       tag: `${this.table}.findUnique`,
       preparedName: entry.name,
       ...rowLockMarker(rowLock),
     };
   }
-
+  findMany<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+    const Input = unknown,
+  >(
+    args?: PrototypeFilterInput<
+      T,
+      R,
+      FindManyArgs<T, R, W, S, O, Input> & { where?: Input },
+      FindManyArgs<T, R, W, S, O>
+    >,
+  ): Promise<QueryResult<T, R, W, S, O>[]>;
   // -------------------------------------------------------------------------
   // findMany
   // -------------------------------------------------------------------------
@@ -4111,7 +4047,7 @@ export class QueryInterface<
       }
     }
 
-    return this.executeWithMiddleware('findMany', (args ?? {}) as Record<string, unknown>, async () => {
+    return this.executeWithMiddleware<unknown>('findMany', (args ?? {}) as Record<string, unknown>, () => {
       if (args?.with) {
         const strategy = this.resolveLoadStrategy(args.relationLoadStrategy);
         if (strategy === 'batched') return this.runFindManyBatched(args as unknown as FindManyArgs<T>);
@@ -4126,13 +4062,7 @@ export class QueryInterface<
         }
       }
       const deferred = this.buildFindMany(args as unknown as FindManyArgs<T, R, W, S, O>);
-      const result = await this.readWithTimeout(
-        deferred.sql,
-        deferred.params,
-        args?.timeout,
-        this.preparedNameFor(args, deferred.preparedName),
-      );
-      return deferred.transform(result);
+      return args?.with ? this.executeRead(deferred, args) : this.executeFlatRead(deferred, args);
     }) as Promise<QueryResult<T, R, W, S, O>[]>;
   }
 
@@ -4293,7 +4223,20 @@ export class QueryInterface<
     }
     return maxDepth;
   }
-
+  buildFindMany<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+    const Input = unknown,
+  >(
+    args?: PrototypeFilterInput<
+      T,
+      R,
+      FindManyArgs<T, R, W, S, O, Input> & { where?: Input },
+      FindManyArgs<T, R, W, S, O>
+    >,
+  ): DeferredQuery<QueryResult<T, R, W, S, O>[]>;
   buildFindMany<
     // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
     W extends TypedWithClause<R> = {},
@@ -4312,7 +4255,7 @@ export class QueryInterface<
     // relations BEFORE fingerprinting, so the two orderings get distinct cache
     // entries and every downstream path (SQL build, collect, parser) inherits it.
     if (args?.with && this.resolveStableOrder(args.stableRelationOrder)) {
-      const normalized = this.applyStableRelationOrder(args.with as WithClause, this.table);
+      const normalized = applyStableRelationOrderTo(this.schema, args.with as WithClause, this.table);
       if (normalized !== args.with) args = { ...args, with: normalized as typeof args.with };
     }
     // An empty orderBy carries no ordering, so treat it as ABSENT rather than
@@ -4402,7 +4345,7 @@ export class QueryInterface<
     // identically (same rule as the vector guard inside the distinct branch).
     if (args?.distinct && args.distinct.length > 0 && args.orderBy) {
       for (const [, d] of orderByEntries(args.orderBy)) {
-        if (this.isRelationOrderByValue(d)) {
+        if (relationsMod.isRelationOrderByValue(this.ctx, d)) {
           throw new ValidationError(
             '`distinct` cannot be combined with relation orderBy (pick-row, `_count`, or ' +
               'to-one relation ordering): the outer re-order cannot reference the parent table.',
@@ -4414,12 +4357,12 @@ export class QueryInterface<
     // the UNSAFE sentinel or nothing: a literal `true` (what a spread request
     // body carries) throws here rather than unlocking the projection.
     const includePii = resolveUnsafeFlag(args?.includePii, 'includePii');
-    const columnsList = this.resolveColumns(args?.select, args?.omit, includePii);
+    const columnsList = relationsMod.resolveColumns(this.ctx, args?.select, args?.omit, includePii);
     const colKey = columnsList ? columnsList.join(',') : '*';
     // AND-merge this table's global filter into the user where; `hasWhere` gates
     // the build/collect just like `args?.where` did (a merged filter can make
     // an otherwise-absent where present).
-    const effWhere = this.mergeGlobalFilter(args?.where as Record<string, unknown> | undefined);
+    const effWhere = whereMod.mergeGlobalFilter(this.ctx, args?.where as Record<string, unknown> | undefined);
     const hasWhere = effWhere !== undefined;
     const whereObj = (effWhere ?? {}) as Record<string, unknown>;
 
@@ -4438,7 +4381,7 @@ export class QueryInterface<
           // cache entry instead of minting two templates for one query.
           .map(([k, d]) => {
             const rel = resolveRelation(this.tableMeta.relations, k);
-            return `${rel?.name ?? k}:${this.orderByEntryFingerprint(d, rel?.def.to)}`;
+            return `${rel?.name ?? k}:${relationsMod.orderByEntryFingerprint(this.ctx, d, rel?.def.to)}`;
           })
           .join(',')
       : '';
@@ -4490,18 +4433,13 @@ export class QueryInterface<
     // Empty without a lock, so every unlocked key is unchanged.
     const lockFp = rowLock ? `|lk=${rowLock.fp}` : '';
 
-    const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}|pii=${includePii ? 1 : 0}${flattenFp}${encodingFp}${lockFp}${this.globalFilterCacheSegment()}`;
+    const ck = `fm:${whereFp}|c=${colKey}|o=${orderFp}|l=${limitFp}|off=${offsetFp}|cur=${cursorFp}|d=${distinctFp}|w=${withFp}|pii=${includePii ? 1 : 0}${flattenFp}${encodingFp}${lockFp}${whereMod.globalFilterCacheSegment(this.ctx)}`;
 
     const params: unknown[] = [];
 
     const buildSql = (freshParams: unknown[]): string => {
       // Fresh build: generates SQL and populates freshParams
-      const { sql: freshWhereSql } = hasWhere
-        ? (() => {
-            const clause = this.buildWhereClause(whereObj, freshParams);
-            return { sql: clause ? ` WHERE ${clause}` : '' };
-          })()
-        : { sql: '' };
+      const freshWhereSql = hasWhere ? whereMod.buildWhereSql(this.ctx, whereObj, freshParams) : '';
 
       const qt = this.q(this.table);
 
@@ -4544,7 +4482,8 @@ export class QueryInterface<
 
       let selectClause: string;
       if (args?.with) {
-        selectClause = this.buildSelectWithRelations(
+        selectClause = relationsMod.buildSelectWithRelations(
+          this.ctx,
           this.table,
           args.with as WithClause,
           freshParams,
@@ -4555,7 +4494,7 @@ export class QueryInterface<
           flattenPlan ? { plan: flattenPlan, joinSink: relationJoins } : undefined,
         );
       } else if (columnsList) {
-        selectClause = columnsList.map((c) => `${qt}.${this.q(c)}`).join(', ');
+        selectClause = relationsMod.qualifiedColumns(this.ctx, columnsList, qt);
       } else {
         selectClause = `${qt}.*`;
       }
@@ -4590,7 +4529,7 @@ export class QueryInterface<
         if (orderByEntries(args.orderBy).some(([, d]) => isVectorOrderBy(d))) {
           throw new ValidationError('`distinct` cannot be combined with vector distance ordering.');
         }
-        const userOrder = this.buildOrderBy(args.orderBy, freshParams);
+        const userOrder = relationsMod.buildOrderBy(this.ctx, args.orderBy, freshParams, undefined);
         // The outer level re-orders by the user's columns, which must therefore
         // exist in the derived table. A NARROWED projection (`select`, `omit`,
         // or the PII rule, which narrows with no user projection at all) left
@@ -4616,7 +4555,7 @@ export class QueryInterface<
             if (!projected.has(col) && !extras.includes(col)) extras.push(col);
           }
           if (extras.length > 0) {
-            innerSelect = `${selectClause}, ${extras.map((c) => `${qt}.${this.q(c)}`).join(', ')}`;
+            innerSelect = `${selectClause}, ${relationsMod.qualifiedColumns(this.ctx, extras, qt)}`;
             outerSelect = this.distinctOuterSelectList(columnsList, args.with as WithClause | undefined).join(', ');
           }
         }
@@ -4629,7 +4568,7 @@ export class QueryInterface<
         // vector at the correct position (after cursor params, before LIMIT), and
         // lateralJoins so a lateral pick splices its join into the FROM clause.
         const orderBySql = args?.orderBy
-          ? ` ORDER BY ${this.buildOrderBy(args.orderBy, freshParams, lateralJoins)}`
+          ? ` ORDER BY ${relationsMod.buildOrderBy(this.ctx, args.orderBy, freshParams, lateralJoins)}`
           : '';
         sql = `SELECT ${distinctPrefix}${selectClause} FROM ${qt}${relationJoins.join('')}${lateralJoins.join('')}${tail}${orderBySql}`;
       }
@@ -4660,7 +4599,7 @@ export class QueryInterface<
     }
     // 2. WITH relation params
     if (args?.with) {
-      this.collectWithParams(args.with as WithClause, params, undefined, flattenPlan);
+      relationsMod.collectWithParams(this.ctx, args.with as WithClause, params, undefined, flattenPlan);
     }
     // 3. Cursor params: the build's own renderer, SQL discarded.
     if (cursorPlan) this.renderCursorPredicate(cursorPlan, params);
@@ -4684,16 +4623,14 @@ export class QueryInterface<
     this.crossCheckCache('findMany', ck, entry, buildSql, params);
 
     // Build the row parser once (positional shapes are computed here, not per row).
-    const parseWith = args?.with ? this.makeNestedParser(args.with as WithClause, includePii, flattenPlan) : null;
+    const parse = args?.with
+      ? relationsMod.makeNestedParser(this.ctx, args.with as WithClause, includePii, flattenPlan)
+      : this.makeRowParser(this.table);
 
     return {
       sql: entry.sql,
       params,
-      transform: (result) =>
-        result.rows.map(
-          (row) =>
-            (parseWith ? parseWith(row) : this.parseRow(row, this.table)) as unknown as QueryResult<T, R, W, S, O>,
-        ),
+      transform: (result) => result.rows.map(parse) as unknown as QueryResult<T, R, W, S, O>[],
       tag: `${this.table}.findMany`,
       preparedName: entry.name,
       ...rowLockMarker(rowLock),
@@ -4736,11 +4673,10 @@ export class QueryInterface<
     // throw also lands here first, before a connection is taken.
     this.resolveJsonEncoding(args?.jsonEncoding);
     if (!args?.with) {
-      const table = this.table;
-      return (row) => this.parseRow(row, table);
+      return this.makeRowParser(this.table);
     }
     const streamFlattenPlan = this.planFlatten(args, streamPii);
-    return this.makeNestedParser(args.with as WithClause, streamPii, streamFlattenPlan);
+    return relationsMod.makeNestedParser(this.ctx, args.with as WithClause, streamPii, streamFlattenPlan);
   }
 
   /**
@@ -4779,7 +4715,22 @@ export class QueryInterface<
     // Canonical args BEFORE the speculative build below, which spreads `args`
     // and sets its own `limit`: a surviving `take` would reach that spread
     // beside it and be read as a second value for one bound.
+    const signal = args?.signal;
     args = this.normalizeArgs(args);
+    const state = this.txScoped ? transactionStateOf(this.pool) : undefined;
+    if (
+      signal &&
+      this.dialect.capabilities.backendCancel &&
+      (this.txScoped
+        ? !state || !this.pool.runStreamQuery || !canCancelBackend(state.client)
+        : !isNodePostgresPool(this.pool))
+    ) {
+      throw new UnsupportedFeatureError(
+        'Stream cancellation',
+        this.dialect.name,
+        'A native pg pool, or a scoped transaction with a protocol-cancel target, is required.',
+      );
+    }
     const batchSize = Math.max(1, Math.floor(Number(args?.batchSize ?? 1000)));
     // Validated on every path, so a bad value is refused whether or not this
     // stream turns out to need a cursor.
@@ -4821,13 +4772,13 @@ export class QueryInterface<
     // most expensive exactly where it was least likely to pay off: raising
     // `batchSize` for throughput made every large drain slower, and the stream
     // was the only thing here that got slower as `batchSize` went up. So the
-    // speculation is now bounded BY `batchSize` rather than scaled by it. At or
+    // speculation is bounded BY `batchSize` rather than scaled by it. At or
     // below the default it is unchanged; above it, a caller asking for large
-    // batches has told us not to expect a one-batch result, and we go straight
+    // batches has indicated a one-batch result is unlikely, so go straight
     // to the cursor and waste nothing. The cost of being wrong about that is
     // four round trips on a drain that would have fit, never any transferred
     // rows.
-    if (batchSize <= STREAM_SPECULATION_MAX_BATCH) {
+    if (!signal && batchSize <= STREAM_SPECULATION_MAX_BATCH) {
       // The caller's bound (or the client's `defaultLimit`, exactly as findMany
       // applies it) caps the speculative fetch. When the bound fits in a batch
       // the speculative fetch IS the whole answer; otherwise `rows <= batchSize`
@@ -4867,20 +4818,50 @@ export class QueryInterface<
 
     // Acquire a dedicated connection: cursors require a single connection in a
     // transaction. The dialect owns the streaming SQL (Postgres: BEGIN → DECLARE
-    // … NO SCROLL CURSOR FOR → FETCH n → CLOSE → COMMIT, ROLLBACK on error); we
-    // just yield the row batches it produces.
+    // … NO SCROLL CURSOR FOR → FETCH n → CLOSE → COMMIT, ROLLBACK on error);
+    // yield the row batches it produces.
     //
     // Inside a caller-owned transaction there is nothing to check out: the
     // transaction-scoped pool pins every query to the transaction's own
     // connection, so `pool.query` already IS that connection. The stream rides
     // on it, is never released here, and the dialect is told to emit no
     // transaction control of its own (`ambientTransaction`).
-    const held = this.txScoped ? null : await this.acquireConnection();
+    const held = this.txScoped ? null : await this.acquireConnection(signal);
     const client = held?.client ?? null;
-    const base: StreamableConnection = client ?? {
-      query: async (text: string, values?: unknown[]) =>
-        (await this.pool.query(text, values)) as { rows: Record<string, unknown>[] },
-    };
+    let discard = false;
+    let base: StreamableConnection = client ?? this.pool;
+    try {
+      signal?.throwIfAborted();
+      if (signal && !this.dialect.capabilities.backendCancel && !base.streamBatches)
+        throw new UnsupportedFeatureError(
+          'Stream cancellation',
+          this.dialect.name,
+          'A native streaming handle is required.',
+        );
+      if (signal && this.dialect.capabilities.backendCancel) {
+        const target = state?.client ?? client;
+        if (!canCancelBackend(target))
+          throw new UnsupportedFeatureError(
+            'Stream cancellation',
+            this.dialect.name,
+            'The acquired connection has no native protocol-cancel target.',
+          );
+        base = cancellableStreamConnection(
+          base,
+          target!,
+          signal,
+          (error) => {
+            discard = true;
+            state?.abort(error);
+            if (error instanceof ConnectionError) held?.checkout.release(error);
+          },
+          state ? (send, settled) => this.pool.runStreamQuery!(send, settled) : undefined,
+        );
+      }
+    } catch (error) {
+      held?.checkout.release();
+      throw error;
+    }
     // The idle guard watches only a stream that holds a connection of its own
     // between pulls. Inside a caller's transaction the connection is theirs and
     // their transaction's timeout bounds it. On PostgreSQL the stream's BEGIN
@@ -4904,51 +4885,61 @@ export class QueryInterface<
     const streamSql = this.outgoing(deferred.sql, undefined, action).text;
     const stream = this.dialect.openStream(conn, streamSql, deferred.params, batchSize, {
       ambientTransaction: this.txScoped,
+      ...(signal ? { signal } : {}),
     });
+    let closing: Promise<void> | undefined;
+    const close = (): Promise<void> =>
+      (closing ??= (async () => {
+        guard?.stop();
+        signal?.removeEventListener('abort', onAbort);
+        let failure: unknown;
+        try {
+          await stream.return(undefined);
+        } catch (error) {
+          failure = error;
+          throw explainConnectionLoss(wrapPgError(error), held?.checkout.lostWith);
+        } finally {
+          held?.checkout.release(
+            discard || failure !== undefined ? (failure instanceof Error ? failure : true) : undefined,
+          );
+        }
+      })());
+    const onAbort = (): void => {
+      if (closing || idle.expired) return;
+      idle.cancelled = { reason: signal!.reason };
+      // return() queues behind an active pull; the transport listener wakes it.
+      // Observe a suspended consumer's cleanup failure again in finally below.
+      void close().catch(() => {});
+    };
     if (watched) {
       guard = new StreamIdleGuard(
         idle,
         idleTimeoutMs,
         () => streamIdleExpiredError(action, this.table, idleTimeoutMs, unit),
-        () => this.expireIdleStream(stream, held, action, idleTimeoutMs, idle, unit),
+        () => this.expireIdleStream(close, action, idleTimeoutMs, idle, unit),
         backstop ? () => base.query('SELECT 1') : undefined,
       );
     }
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
     try {
       // Driven by hand rather than `yield*`, so an expired stream's cleanup can
       // run from the timer while this generator is suspended.
       while (true) {
+        assertStreamActive(idle);
         const step = await stream.next();
+        assertStreamActive(idle);
         if (step.done) break;
         yield step.value;
-        if (idle.expired) throw idle.expired;
+        assertStreamActive(idle);
       }
     } catch (err) {
-      if (err === idle.expired) throw err;
+      if (err === idle.expired || (idle.cancelled && err === idle.cancelled.reason)) throw err;
       // Wrap pg constraint errors so streaming surfaces typed errors like the rest of the API
       throw explainConnectionLoss(wrapPgError(err), held?.checkout.lostWith);
     } finally {
-      guard?.stop();
-      if (guard?.expiry) {
-        // The timer already closed the stream and released the connection;
-        // wait for that so the connection is never handed back mid-cleanup.
-        await guard.expiry;
-      } else {
-        try {
-          // An early exit (`break`) closes the cursor here; after a full drain
-          // or an error the dialect's generator has finished and this is a no-op.
-          await stream.return(undefined);
-        } catch (err) {
-          // Only an early exit can reach this throw: after an error or a full
-          // drain the dialect's generator has finished and return() resolves.
-          // A failed CLOSE / COMMIT on an early exit must reach the caller, as
-          // it did when this loop was a `yield*`.
-          // biome-ignore lint/correctness/noUnsafeFinally: it replaces only an early-exit return, see above
-          throw explainConnectionLoss(wrapPgError(err), held?.checkout.lostWith);
-        } finally {
-          held?.checkout.release();
-        }
-      }
+      if (guard?.expiry) await guard.expiry;
+      else await close();
     }
   }
 
@@ -4960,20 +4951,16 @@ export class QueryInterface<
    * never pulls again, so it never sees the E002 waiting for it.
    */
   private async expireIdleStream(
-    stream: AsyncGenerator<Record<string, unknown>[], void, undefined>,
-    held: Checkout,
+    close: () => Promise<void>,
     action: string,
     timeoutMs: number,
     idle: StreamIdleState,
     unit: string,
   ): Promise<void> {
-    let failure: unknown;
     try {
-      await stream.return(undefined);
-    } catch (err) {
-      failure = err;
-    } finally {
-      held.checkout.release(failure === undefined ? undefined : failure instanceof Error ? failure : true);
+      await close();
+    } catch {
+      // The idle timeout already owns the terminal error; close discarded the checkout.
     }
     logTo(
       this.logger,
@@ -5027,10 +5014,14 @@ export class QueryInterface<
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyStreamArgs<T, R, W, S, O>): AsyncGenerator<QueryResult<T, R, W, S, O>[], void, undefined> {
     args = this.normalizeArgs(args);
+    resolveStreamSignal(args?.signal);
     this.assertNoStreamLock(args, 'findManyStreamBatches');
     const parse = this.makeStreamRowParser<W, S, O>(args);
     const idle = newStreamIdleState();
+    const assertStreamOpen = this.pool.assertStreamOpen;
     for await (const batch of this.streamRaw<W, S, O>(args, 'findManyStreamBatches', idle, 'batch')) {
+      assertStreamActive(idle);
+      assertStreamOpen?.();
       const parsed = new Array<QueryResult<T, R, W, S, O>>(batch.length);
       for (let i = 0; i < batch.length; i++) {
         parsed[i] = parse(batch[i]!) as QueryResult<T, R, W, S, O>;
@@ -5042,7 +5033,8 @@ export class QueryInterface<
       yield parsed;
       idle.suspended = false;
       idle.pulls++;
-      if (idle.expired) throw idle.expired;
+      assertStreamActive(idle);
+      assertStreamOpen?.();
     }
   }
 
@@ -5088,6 +5080,7 @@ export class QueryInterface<
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyStreamArgs<T, R, W, S, O>): AsyncGenerator<QueryResult<T, R, W, S, O>, void, undefined> {
     args = this.normalizeArgs(args);
+    resolveStreamSignal(args?.signal);
     this.assertNoStreamLock(args, 'findManyStream');
     const parse = this.makeStreamRowParser<W, S, O>(args);
     // Parsed one row at a time, INSIDE the yield loop rather than a batch ahead
@@ -5095,8 +5088,11 @@ export class QueryInterface<
     // took. That laziness is the reason this loop is not written over
     // `findManyStreamBatches`.
     const idle = newStreamIdleState();
+    const assertStreamOpen = this.pool.assertStreamOpen;
     for await (const batch of this.streamRaw<W, S, O>(args, 'findManyStream', idle, 'row')) {
       for (let i = 0; i < batch.length; i++) {
+        assertStreamActive(idle);
+        assertStreamOpen?.();
         const row = parse(batch[i]!) as QueryResult<T, R, W, S, O>;
         idle.rows++;
         // See findManyStreamBatches: the idle guard's view of the consumer.
@@ -5104,11 +5100,25 @@ export class QueryInterface<
         yield row;
         idle.suspended = false;
         idle.pulls++;
-        if (idle.expired) throw idle.expired;
+        assertStreamActive(idle);
+        assertStreamOpen?.();
       }
     }
   }
-
+  findFirst<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+    const Input = unknown,
+  >(
+    args?: PrototypeFilterInput<
+      T,
+      R,
+      FindManyArgs<T, R, W, S, O, Input> & { where?: Input },
+      FindManyArgs<T, R, W, S, O>
+    >,
+  ): Promise<QueryResult<T, R, W, S, O> | null>;
   // -------------------------------------------------------------------------
   // findFirst, like findMany but returns a single row or null
   // -------------------------------------------------------------------------
@@ -5150,16 +5160,23 @@ export class QueryInterface<
         }
       }
       const deferred = this.buildFindFirst(args);
-      const result = await this.readWithTimeout(
-        deferred.sql,
-        deferred.params,
-        args?.timeout,
-        this.preparedNameFor(args, deferred.preparedName),
-      );
-      return deferred.transform(result);
+      return this.executeRead(deferred, args);
     }) as Promise<QueryResult<T, R, W, S, O> | null>;
   }
-
+  buildFindFirst<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+    const Input = unknown,
+  >(
+    args?: PrototypeFilterInput<
+      T,
+      R,
+      FindManyArgs<T, R, W, S, O, Input> & { where?: Input },
+      FindManyArgs<T, R, W, S, O>
+    >,
+  ): DeferredQuery<QueryResult<T, R, W, S, O> | null>;
   buildFindFirst<
     // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
     W extends TypedWithClause<R> = {},
@@ -5200,7 +5217,20 @@ export class QueryInterface<
       ...(deferred.rowLock ? { rowLock: true as const } : {}),
     };
   }
-
+  findFirstOrThrow<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+    const Input = unknown,
+  >(
+    args?: PrototypeFilterInput<
+      T,
+      R,
+      FindManyArgs<T, R, W, S, O, Input> & { where?: Input },
+      FindManyArgs<T, R, W, S, O>
+    >,
+  ): Promise<QueryResult<T, R, W, S, O>>;
   // -------------------------------------------------------------------------
   // findFirstOrThrow, like findFirst but throws if no record found
   // -------------------------------------------------------------------------
@@ -5213,18 +5243,25 @@ export class QueryInterface<
   >(args?: FindManyArgs<T, R, W, S, O>): Promise<QueryResult<T, R, W, S, O>> {
     args = this.normalizeArgs(args, 'findFirstOrThrow');
     this.assertLockInTransaction(args, 'findFirstOrThrow');
-    return this.executeWithMiddleware('findFirstOrThrow', (args ?? {}) as Record<string, unknown>, async () => {
+    return this.executeWithMiddleware('findFirstOrThrow', (args ?? {}) as Record<string, unknown>, () => {
       const deferred = this.buildFindFirstOrThrow(args);
-      const result = await this.readWithTimeout(
-        deferred.sql,
-        deferred.params,
-        args?.timeout,
-        this.preparedNameFor(args, deferred.preparedName),
-      );
-      return deferred.transform(result);
+      return this.executeRead(deferred, args);
     }) as Promise<QueryResult<T, R, W, S, O>>;
   }
-
+  buildFindFirstOrThrow<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+    const Input = unknown,
+  >(
+    args?: PrototypeFilterInput<
+      T,
+      R,
+      FindManyArgs<T, R, W, S, O, Input> & { where?: Input },
+      FindManyArgs<T, R, W, S, O>
+    >,
+  ): DeferredQuery<QueryResult<T, R, W, S, O>>;
   buildFindFirstOrThrow<
     // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
     W extends TypedWithClause<R> = {},
@@ -5232,28 +5269,22 @@ export class QueryInterface<
     O extends Record<string, boolean> | undefined = undefined,
   >(args?: FindManyArgs<T, R, W, S, O>): DeferredQuery<QueryResult<T, R, W, S, O>> {
     args = this.normalizeArgs(args, 'findFirstOrThrow');
-    const inner = this.buildFindFirstAs<W, S, O>(args, 'findFirstOrThrow');
-
-    return {
-      sql: inner.sql,
-      params: inner.params,
-      transform: (result) => {
-        const row = inner.transform(result);
-        if (row === null) {
-          throw new NotFoundError({
-            table: this.table,
-            where: args?.where,
-            operation: 'findFirstOrThrow',
-          });
-        }
-        return row;
-      },
-      tag: `${this.table}.findFirstOrThrow`,
-      ...(inner.preparedName !== undefined ? { preparedName: inner.preparedName } : {}),
-      ...(inner.rowLock ? { rowLock: true as const } : {}),
-    };
+    return this.requireFound(this.buildFindFirstAs<W, S, O>(args, 'findFirstOrThrow'), args?.where, 'findFirstOrThrow');
   }
-
+  findUniqueOrThrow<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+    const Input = unknown,
+  >(
+    args: PrototypeFilterInput<
+      T,
+      R,
+      FindUniqueArgs<T, R, W, S, O, M['whereUnique'], Input> & { where: Input },
+      FindUniqueArgs<T, R, W, S, O, M['whereUnique']>
+    >,
+  ): Promise<QueryResult<T, R, W, S, O>>;
   // -------------------------------------------------------------------------
   // findUniqueOrThrow, like findUnique but throws if no record found
   // -------------------------------------------------------------------------
@@ -5266,18 +5297,25 @@ export class QueryInterface<
   >(args: FindUniqueArgs<T, R, W, S, O, M['whereUnique']>): Promise<QueryResult<T, R, W, S, O>> {
     args = this.normalizeArgs(args);
     this.assertLockInTransaction(args, 'findUniqueOrThrow');
-    return this.executeWithMiddleware('findUniqueOrThrow', args as unknown as Record<string, unknown>, async () => {
+    return this.executeWithMiddleware('findUniqueOrThrow', args as unknown as Record<string, unknown>, () => {
       const deferred = this.buildFindUniqueOrThrow(args);
-      const result = await this.readWithTimeout(
-        deferred.sql,
-        deferred.params,
-        args.timeout,
-        this.preparedNameFor(args, deferred.preparedName),
-      );
-      return deferred.transform(result);
+      return this.executeRead(deferred, args);
     }) as Promise<QueryResult<T, R, W, S, O>>;
   }
-
+  buildFindUniqueOrThrow<
+    // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
+    W extends TypedWithClause<R> = {},
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+    const Input = unknown,
+  >(
+    args: PrototypeFilterInput<
+      T,
+      R,
+      FindUniqueArgs<T, R, W, S, O, M['whereUnique'], Input> & { where: Input },
+      FindUniqueArgs<T, R, W, S, O, M['whereUnique']>
+    >,
+  ): DeferredQuery<QueryResult<T, R, W, S, O>>;
   buildFindUniqueOrThrow<
     // biome-ignore lint/complexity/noBannedTypes: {} means "no with clause", matches TypedWithClause default
     W extends TypedWithClause<R> = {},
@@ -5285,23 +5323,24 @@ export class QueryInterface<
     O extends Record<string, boolean> | undefined = undefined,
   >(args: FindUniqueArgs<T, R, W, S, O, M['whereUnique']>): DeferredQuery<QueryResult<T, R, W, S, O>> {
     args = this.normalizeArgs(args);
-    const inner = this.buildFindUnique(args);
+    return this.requireFound(this.buildFindUnique(args), args.where, 'findUniqueOrThrow');
+  }
 
+  /** The throwing read wrappers retain the inner statement and its markers. */
+  private requireFound<Q>(
+    inner: DeferredQuery<Q | null>,
+    where: unknown,
+    operation: 'findFirstOrThrow' | 'findUniqueOrThrow',
+  ): DeferredQuery<Q> {
     return {
       sql: inner.sql,
       params: inner.params,
       transform: (result) => {
         const row = inner.transform(result);
-        if (row === null) {
-          throw new NotFoundError({
-            table: this.table,
-            where: args.where,
-            operation: 'findUniqueOrThrow',
-          });
-        }
+        if (row === null) throw new NotFoundError({ table: this.table, where, operation });
         return row;
       },
-      tag: `${this.table}.findUniqueOrThrow`,
+      tag: `${this.table}.${operation}`,
       ...(inner.preparedName !== undefined ? { preparedName: inner.preparedName } : {}),
       ...(inner.rowLock ? { rowLock: true as const } : {}),
     };
@@ -5391,7 +5430,18 @@ export class QueryInterface<
       }
     });
   }
-
+  update<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+    const Input = unknown,
+  >(
+    args: PrototypeFilterInput<
+      T,
+      R,
+      UpdateArgs<T, R, S, O, M['update'], Input> & { where: Input },
+      UpdateArgs<T, R, S, O, M['update']>
+    >,
+  ): Promise<FieldResult<T, S, O>>;
   // -------------------------------------------------------------------------
   // update
   // -------------------------------------------------------------------------
@@ -5417,40 +5467,50 @@ export class QueryInterface<
   private async nestedCreate(
     args: CreateArgs<T, R, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
   ): Promise<T> {
+    // Refuse before a belongsTo write or transaction can produce effects.
+    writesMod.assertWritable(this.ctx, 'create');
     const data = args.data as Record<string, unknown>;
+    assertNestedArrayWrites(this.schema, this.table, data);
     // Validated up front, before any row is written, and then applied by the
     // nested engine's final read-back, which already speaks select/omit.
     this.resolveWriteProjection(args);
     const shape = { select: args.select, omit: args.omit };
 
     if (this.txScoped) {
-      const ctx = this.buildNestedCtx();
+      const ctx = this.buildNestedCtx(args.timeout);
       return executeNestedCreate(ctx, this.table, data, 0, [], shape) as Promise<T>;
     }
 
     return this.runInImplicitTx(async (ctx) => {
       const result = await executeNestedCreate(ctx, this.table, data, 0, [], shape);
       return result as T;
-    });
+    }, args.timeout);
   }
 
   private async nestedUpdate(
     args: UpdateArgs<T, R, Record<string, boolean> | undefined, Record<string, boolean> | undefined>,
   ): Promise<T> {
+    writesMod.assertWritable(this.ctx, 'update');
     const data = args.data as Record<string, unknown>;
     const where = args.where as Record<string, unknown>;
+    // The lock goes to the parent's own UPDATE, which the nested engine runs
+    // before any relation write; its version column is refused in `data`
+    // here, before a transaction opens, as on the flat path.
+    const lock = args.optimisticLock;
+    if (lock) writesMod.assertLockColumnNotWritten(this.tableMeta, this.table, data, lock.field);
+    assertNestedArrayWrites(this.schema, this.table, data);
     this.resolveWriteProjection(args);
     const shape = { select: args.select, omit: args.omit };
 
     if (this.txScoped) {
-      const ctx = this.buildNestedCtx();
-      return executeNestedUpdate(ctx, this.table, where, data, 0, [], shape) as Promise<T>;
+      const ctx = this.buildNestedCtx(args.timeout);
+      return executeNestedUpdate(ctx, this.table, where, data, 0, [], shape, lock) as Promise<T>;
     }
 
     return this.runInImplicitTx(async (ctx) => {
-      const result = await executeNestedUpdate(ctx, this.table, where, data, 0, [], shape);
+      const result = await executeNestedUpdate(ctx, this.table, where, data, 0, [], shape, lock);
       return result as T;
-    });
+    }, args.timeout);
   }
 
   /**
@@ -5459,11 +5519,11 @@ export class QueryInterface<
    * matters); the cursor stream holds it, and a nested write opens its
    * implicit transaction on one through `openCheckout`.
    */
-  private acquireConnection(): Promise<Checkout> {
-    return acquireConnection(this.pool);
+  private acquireConnection(signal?: AbortSignal): Promise<Checkout> {
+    return signal ? acquireStreamConnection(this.pool, signal) : acquireConnection(this.pool);
   }
 
-  private async runInImplicitTx<R>(fn: (ctx: NestedWriteContext) => Promise<R>): Promise<R> {
+  private async runInImplicitTx<R>(fn: (ctx: NestedWriteContext) => Promise<R>, timeout?: number): Promise<R> {
     // client.ts registers TransactionClient when it is evaluated (it cannot be
     // imported from here, see transaction-client-slot.ts). Read before the
     // checkout, so a program that never loaded client.ts gets a typed error
@@ -5471,14 +5531,15 @@ export class QueryInterface<
     const TransactionClient = transactionClientFor(`A nested write or lookup-first upsert on "${this.table}"`);
     // BEGIN runs inside openCheckout, which sends it once more on a fresh
     // connection when the first one turns out to be dead and releases the
-    // connection itself when BEGIN fails for good. The catch below therefore
+    // connection itself when BEGIN fails for good. The settlement therefore
     // only sees a transaction that began, and never emits a stray ROLLBACK on
     // a connection that opened none.
-    const { client, checkout } = await openCheckout(this.pool, (c) => c.query(this.dialect.beginStatement()));
-    try {
+    const held = await openCheckout(this.pool, (c) => sendControl(c, this.dialect.beginStatement()));
+    const state = new TransactionState(held.client, this.dialect);
+    return completeTransaction(held, state, this.dialect, undefined, async () => {
       const tx = new TransactionClient(
         // biome-ignore lint/suspicious/noExplicitAny: MiddlewareFn and Middleware are structurally identical
-        client as any,
+        held.client as any,
         this.schema,
         // biome-ignore lint/suspicious/noExplicitAny: MiddlewareFn and Middleware are structurally identical
         this.middlewares as any,
@@ -5489,29 +5550,18 @@ export class QueryInterface<
         // older-engine client falls back to the full capability set inside the
         // implicit transaction.
         this.pool as unknown as { readonly?: boolean; capabilities?: unknown },
+        state,
       );
-      const ctx: NestedWriteContext = {
+      return fn({
         schema: this.schema,
         // biome-ignore lint/suspicious/noExplicitAny: TransactionClient satisfies NestedWriteContext['tx'] at runtime
-        tx: unlockNestedWriteTx(tx as any),
+        tx: unlockNestedWriteTx(tx as any, timeout),
         scopedConnect: this.scopedConnect,
-      };
-      const result = await fn(ctx);
-      await client.query(this.dialect.commitStatement());
-      return result;
-    } catch (err) {
-      try {
-        await client.query(this.dialect.rollbackStatement());
-      } catch {
-        // Best-effort rollback: connection may have died.
-      }
-      throw explainConnectionLoss(err, checkout.lostWith);
-    } finally {
-      checkout.release();
-    }
+      });
+    });
   }
 
-  private buildNestedCtx(): NestedWriteContext {
+  private buildNestedCtx(timeout?: number): NestedWriteContext {
     const pool = this.pool;
     const schema = this.schema;
     const middlewares = this.middlewares;
@@ -5521,7 +5571,7 @@ export class QueryInterface<
     const opts = txQueryOptions(this.options);
     return {
       schema,
-      tx: unlockNestedWriteTx(this.makeTxProxy(pool, schema, middlewares, opts)),
+      tx: unlockNestedWriteTx(this.makeTxProxy(pool, schema, middlewares, opts), timeout),
     };
   }
 
@@ -5531,7 +5581,13 @@ export class QueryInterface<
       table: <U extends object>(name: string) => new QueryInterface<U>(pool, name, schema, middlewares, opts),
     };
   }
-
+  delete<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+    const Input = unknown,
+  >(
+    args: PrototypeFilterInput<T, R, DeleteArgs<T, R, S, O, Input> & { where: Input }, DeleteArgs<T, R, S, O>>,
+  ): Promise<FieldResult<T, S, O>>;
   // -------------------------------------------------------------------------
   // delete
   // -------------------------------------------------------------------------
@@ -5546,7 +5602,18 @@ export class QueryInterface<
       return this.executeMutation(deferred, args.timeout);
     });
   }
-
+  upsert<
+    S extends Record<string, boolean> | undefined = undefined,
+    O extends Record<string, boolean> | undefined = undefined,
+    const Input = unknown,
+  >(
+    args: PrototypeFilterInput<
+      T,
+      R,
+      UpsertArgs<T, R, S, O, M['whereUnique'], M['createMany'], M['updateMany'], Input> & { where: Input },
+      UpsertArgs<T, R, S, O, M['whereUnique'], M['createMany'], M['updateMany']>
+    >,
+  ): Promise<FieldResult<T, S, O>>;
   // -------------------------------------------------------------------------
   // upsert, INSERT ... ON CONFLICT ... DO UPDATE
   // -------------------------------------------------------------------------
@@ -5560,6 +5627,7 @@ export class QueryInterface<
       // First: the nested-write branch below decides before upsertLookupReason
       // would have refused it.
       writesMod.assertNoOptimisticLock(this.ctx, args, 'upsert');
+      writesMod.assertWritable(this.ctx, 'upsert');
       if (this.upsertNeedsLookup(args)) {
         return this.upsertLookupFirst(args) as Promise<FieldResult<T, S, O>>;
       }
@@ -5589,10 +5657,10 @@ export class QueryInterface<
    * `upsert` as Prisma defines it: find the row `where` names, update it if it
    * exists, else insert `create`, in one transaction (the caller's, when there
    * is one). Taken whenever the single conflict statement would mean something
-   * else (`upsertLookupReason`: `where` not pinned to `create`'s values, an
-   * empty `update`, a global filter the engine's statement cannot carry) and
-   * whenever `create` or `update` holds nested relation writes, which only the
-   * nested-write engine can run.
+   * else (`upsertLookupReason`: `where` not pinned to `create`'s values or not
+   * exactly one unique key, an empty `update`, a global filter the engine's
+   * statement cannot carry) and whenever `create` or `update` holds nested
+   * relation writes, which only the nested-write engine can run.
    *
    * Validation is DATA-INDEPENDENT, as it is for the batched relation loader:
    * both halves are compiled before the lookup runs, so an unknown field in
@@ -5628,6 +5696,7 @@ export class QueryInterface<
     const shape = { select: args.select, omit: args.omit, timeout: args.timeout };
     const scalarCreate = extractRelationFields(create, this.tableMeta).scalars;
     const scalarUpdate = extractRelationFields(update, this.tableMeta).scalars;
+    assertNestedArrayWrites(this.schema, this.table, [create, update]);
     const updateIsEmpty = Object.values(update).every((v) => v === undefined);
     if (Object.keys(scalarCreate).length > 0) this.buildCreate({ data: scalarCreate } as CreateArgs<T, R>);
     if (Object.values(scalarUpdate).some((v) => v !== undefined)) {
@@ -5649,7 +5718,14 @@ export class QueryInterface<
     }
     return this.runInImplicitTx((ctx) => run(ctx.tx.table<T>(this.table) as unknown as QueryInterface<T>));
   }
-
+  updateMany<const Input = unknown>(
+    args: PrototypeFilterInput<
+      T,
+      R,
+      UpdateManyArgs<T, R, M['updateMany'], Input> & { where: Input },
+      UpdateManyArgs<T, R, M['updateMany']>
+    >,
+  ): Promise<{ count: number }>;
   // -------------------------------------------------------------------------
   // updateMany, UPDATE ... WHERE ... returning count
   // -------------------------------------------------------------------------
@@ -5662,7 +5738,9 @@ export class QueryInterface<
       return deferred.transform(result);
     });
   }
-
+  deleteMany<const Input = unknown>(
+    args: PrototypeFilterInput<T, R, DeleteManyArgs<T, R, Input> & { where: Input }, DeleteManyArgs<T, R>>,
+  ): Promise<{ count: number }>;
   // -------------------------------------------------------------------------
   // deleteMany, DELETE ... WHERE ... returning count
   // -------------------------------------------------------------------------
@@ -5675,39 +5753,36 @@ export class QueryInterface<
       return deferred.transform(result);
     });
   }
-
+  count<const Input = unknown>(
+    args?: PrototypeFilterInput<T, R, CountArgs<T, R, Input> & { where?: Input }, CountArgs<T, R>>,
+  ): Promise<number>;
   // -------------------------------------------------------------------------
   // count
   // -------------------------------------------------------------------------
 
   async count(args?: CountArgs<T, R>): Promise<number> {
     args = this.normalizeArgs(args);
-    return this.executeWithMiddleware('count', (args ?? {}) as Record<string, unknown>, async () => {
+    return this.executeWithMiddleware('count', (args ?? {}) as Record<string, unknown>, () => {
       const deferred = this.buildCount(args);
-      const result = await this.readWithTimeout(
-        deferred.sql,
-        deferred.params,
-        args?.timeout,
-        this.preparedNameFor(args, deferred.preparedName),
-      );
-      return deferred.transform(result);
+      return this.executeRead(deferred, args);
     });
   }
-
+  buildCount<const Input = unknown>(
+    args?: PrototypeFilterInput<T, R, CountArgs<T, R, Input> & { where?: Input }, CountArgs<T, R>>,
+  ): DeferredQuery<number>;
   buildCount(args?: CountArgs<T, R>): DeferredQuery<number> {
     args = this.normalizeArgs(args);
     this.currentSkip = resolveSkipGlobalFilters(args?.skipGlobalFilters);
-    const effWhere = this.mergeGlobalFilter(args?.where as Record<string, unknown> | undefined);
+    const effWhere = whereMod.mergeGlobalFilter(this.ctx, args?.where as Record<string, unknown> | undefined);
     const hasWhere = effWhere !== undefined;
     const whereObj = (effWhere ?? {}) as Record<string, unknown>;
     const whereFp = hasWhere ? this.fingerprintWhere(whereObj) : '';
-    const ck = `cnt:${whereFp}${this.globalFilterCacheSegment()}`;
+    const ck = `cnt:${whereFp}${whereMod.globalFilterCacheSegment(this.ctx)}`;
 
     const params: unknown[] = [];
 
     const buildSql = (freshParams: unknown[]): string => {
-      const clause = hasWhere ? this.buildWhereClause(whereObj, freshParams) : null;
-      const whereSql = clause ? ` WHERE ${clause}` : '';
+      const whereSql = hasWhere ? whereMod.buildWhereSql(this.ctx, whereObj, freshParams) : '';
       return `SELECT ${this.castAgg('COUNT(*)', 'int')} AS count FROM ${this.q(this.table)}${whereSql}`;
     };
     const entry = this.acquireSql(ck, buildSql);
@@ -5745,15 +5820,9 @@ export class QueryInterface<
   ): Promise<GroupByResult<T, A>[]>;
   async groupBy<A extends GroupByArgs<T, R>>(args: A): Promise<GroupByResult<T, A>[]> {
     args = this.normalizeArgs(args);
-    return this.executeWithMiddleware('groupBy', args as unknown as Record<string, unknown>, async () => {
+    return this.executeWithMiddleware('groupBy', args as unknown as Record<string, unknown>, () => {
       const deferred = this.buildGroupBy(args as A & PercentileKeysChecked<T, A>);
-      const result = await this.readWithTimeout(
-        deferred.sql,
-        deferred.params,
-        args.timeout,
-        this.preparedNameFor(args, deferred.preparedName),
-      );
-      return deferred.transform(result) as GroupByResult<T, A>[];
+      return this.executeRead(deferred, args) as Promise<GroupByResult<T, A>[]>;
     });
   }
 
@@ -5800,128 +5869,14 @@ export class QueryInterface<
   ): Promise<AggregateResultOf<T, A>>;
   async aggregate<A extends AggregateArgs<T, R>>(args: A): Promise<AggregateResultOf<T, A>> {
     args = this.normalizeArgs(args);
-    return this.executeWithMiddleware('aggregate', args as unknown as Record<string, unknown>, async () => {
+    return this.executeWithMiddleware('aggregate', args as unknown as Record<string, unknown>, () => {
       const deferred = this.buildAggregate(args as A & PercentileKeysChecked<T, A>);
-      const result = await this.readWithTimeout(
-        deferred.sql,
-        deferred.params,
-        args.timeout,
-        this.preparedNameFor(args, deferred.preparedName),
-      );
-      return deferred.transform(result);
+      return this.executeRead(deferred, args);
     });
-  }
-
-  // =========================================================================
-  // Internal helpers
-  // =========================================================================
-
-  // ---------------------------------------------------------------------------
-  // Relation + orderBy compilation (extracted to relations.ts).
-  // ---------------------------------------------------------------------------
-
-  private resolveColumns(
-    select?: Record<string, boolean>,
-    omit?: Record<string, boolean>,
-    includePii?: boolean,
-  ): string[] | null {
-    return relationsMod.resolveColumns(this.ctx, select, omit, includePii);
   }
 
   withFingerprint(withClause: WithClause | undefined, table?: string, depth = 0): string {
     return relationsMod.withFingerprint(this.ctx, withClause, table, depth);
-  }
-
-  private collectWithParams(
-    withClause: WithClause,
-    params: unknown[],
-    table?: string,
-    flattenPlan?: relationsMod.FlattenPlan | null,
-  ): void {
-    relationsMod.collectWithParams(this.ctx, withClause, params, table, flattenPlan);
-  }
-
-  private orderByEntryFingerprint(d: unknown, targetTable?: string): string {
-    return relationsMod.orderByEntryFingerprint(this.ctx, d, targetTable);
-  }
-
-  private buildOrderBy(orderBy: OrderByClause, params?: unknown[], lateralSink?: string[]): string {
-    return relationsMod.buildOrderBy(this.ctx, orderBy, params, lateralSink);
-  }
-
-  private isRelationOrderByValue(value: unknown): boolean {
-    return relationsMod.isRelationOrderByValue(this.ctx, value);
-  }
-
-  private nullsSuffix(nulls: 'first' | 'last' | undefined): string {
-    return relationsMod.nullsSuffix(this.ctx, nulls);
-  }
-
-  private resolveOrderByColumn(table: string, meta: TableMetadata, key: string): string {
-    return relationsMod.resolveOrderByColumn(this.ctx, table, meta, key);
-  }
-
-  private validateJsonPathOrderBy(table: string, meta: TableMetadata, field: string, spec: JsonPathOrderBy): string {
-    return relationsMod.validateJsonPathOrderBy(this.ctx, table, meta, field, spec);
-  }
-
-  private buildJsonPathOrderEntry(
-    table: string,
-    meta: TableMetadata,
-    field: string,
-    spec: JsonPathOrderBy,
-    prefix: string,
-    params?: unknown[],
-  ): string {
-    return relationsMod.buildJsonPathOrderEntry(this.ctx, table, meta, field, spec, prefix, params);
-  }
-
-  private collectRelationPickOrderParams(
-    relName: string,
-    relDef: RelationDef,
-    spec: RelationPickOrderBy,
-    params: unknown[],
-  ): void {
-    relationsMod.collectRelationPickOrderParams(this.ctx, relName, relDef, spec, params);
-  }
-
-  private collectRelationCountParams(relDef: RelationDef, params: unknown[]): void {
-    relationsMod.collectRelationCountParams(this.ctx, relDef, params);
-  }
-
-  private getCamelDateFields(table: string, meta: TableMetadata): Set<string> {
-    return relationsMod.getCamelDateFields(this.ctx, table, meta);
-  }
-
-  private makeNestedParser(
-    withClause: WithClause,
-    includePii?: boolean,
-    flattenPlan?: relationsMod.FlattenPlan | null,
-  ): (row: Record<string, unknown>) => Record<string, unknown> {
-    return relationsMod.makeNestedParser(this.ctx, withClause, includePii, flattenPlan);
-  }
-
-  private buildSelectWithRelations(
-    table: string,
-    withClause: WithClause,
-    params: unknown[],
-    columnsList?: string[] | null,
-    depth?: number,
-    path?: string[],
-    includePii?: boolean,
-    flatten?: { plan: relationsMod.FlattenPlan; joinSink: string[] },
-  ): string {
-    return relationsMod.buildSelectWithRelations(
-      this.ctx,
-      table,
-      withClause,
-      params,
-      columnsList,
-      depth,
-      path,
-      includePii,
-      flatten,
-    );
   }
 
   /**
@@ -5941,7 +5896,7 @@ export class QueryInterface<
    * strategy, silently and byte-identically):
    *   - the resolved strategy is not `'flatten'`;
    *   - `jsonEncoding: 'positional'` (a flattened relation emits no JSON at all,
-   *     so the two are not composed in this version). NOTE that this is the
+   *     so the two are not composed in this version). This is the
    *     PostgreSQL DEFAULT, so on Postgres `'flatten'` engages only when the
    *     caller ALSO passes `jsonEncoding: 'object'`. The fallback is silent and
    *     byte-identical, and `warnFlattenBlocked` names the encoding and the
@@ -6061,10 +6016,8 @@ export class QueryInterface<
   // ---------------------------------------------------------------------------
   // WHERE-clause compilation (extracted to where.ts).
   //
-  // These thin delegators forward to the free functions in where.ts, passing
-  // this.ctx (the BuilderCtx view built in the constructor). Methods called
-  // only from within where.ts itself were moved out entirely; only the
-  // cross-module + public + @internal entry points keep a delegator here.
+  // Public fingerprint/collect entry points retain their delegators. Private
+  // compiler calls use the module functions directly with the same ctx.
   // ---------------------------------------------------------------------------
 
   fingerprintWhere(where: Record<string, unknown>): string {
@@ -6075,63 +6028,6 @@ export class QueryInterface<
     whereMod.collectWhereParams(this.ctx, where, params);
   }
 
-  private resolveGlobalFilter(
-    table: string,
-    skip: ResolvedSkipGlobalFilters | undefined = this.currentSkip,
-  ): Record<string, unknown> | null {
-    return whereMod.resolveGlobalFilter(this.ctx, table, skip);
-  }
-
-  private mergeGlobalFilter(userWhere: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
-    return whereMod.mergeGlobalFilter(this.ctx, userWhere);
-  }
-
-  private collectTargetGlobalFilterAlias(targetTable: string, params: unknown[]): void {
-    whereMod.collectTargetGlobalFilterAlias(this.ctx, targetTable, params);
-  }
-
-  private globalFilterCacheSegment(): string {
-    return whereMod.globalFilterCacheSegment(this.ctx);
-  }
-
-  private buildWhereClause(where: Record<string, unknown>, params: unknown[]): string | null {
-    return whereMod.buildWhereClause(this.ctx, where, params);
-  }
-
-  private buildAliasWhere(
-    targetTable: string,
-    targetMeta: TableMetadata,
-    alias: string,
-    where: Record<string, unknown>,
-    params: unknown[],
-  ): string | null {
-    return whereMod.buildAliasWhere(this.ctx, targetTable, targetMeta, alias, where, params);
-  }
-
-  private vectorOperator(field: string, rawColumn: string, metric: string): string {
-    return whereMod.vectorOperator(this.ctx, field, rawColumn, metric);
-  }
-
-  private pushVectorParam(field: string, _rawColumn: string, to: unknown, params: unknown[]): string {
-    return whereMod.pushVectorParam(this.ctx, field, _rawColumn, to, params);
-  }
-
-  private normalizeRelationFilter(relDef: RelationDef, filterObj: Record<string, unknown>): Record<string, unknown> {
-    return whereMod.normalizeRelationFilter(this.ctx, relDef, filterObj);
-  }
-
-  private isJsonColumnType(colType: string): boolean {
-    return whereMod.isJsonColumnType(this.ctx, colType);
-  }
-
-  private getColumnPgType(column: string): string {
-    return whereMod.getColumnPgType(this.ctx, column);
-  }
-
-  private jsonPathParam(path: readonly (string | number)[], nativeForm?: unknown): unknown {
-    return whereMod.jsonPathParam(this.ctx, path, nativeForm);
-  }
-
   /**
    * Collect params for an orderBy clause. Vector KNN ordering pushes the
    * `$n::vector` query vector and JSON-path ordering pushes its text[] path;
@@ -6139,41 +6035,7 @@ export class QueryInterface<
    * order exactly so the cached-SQL param re-collection stays in lockstep.
    */
   private collectOrderByParams(orderBy: OrderByClause, params: unknown[]): void {
-    for (const [key, dir] of orderByEntries(orderBy)) {
-      if (isVectorOrderBy(dir)) {
-        const rawColumn = this.toColumn(key);
-        // Re-run the same validation as buildOrderBy so the collect path can
-        // never push a param that the build path rejected (or vice versa).
-        this.vectorOperator(key, rawColumn, dir.distance.metric);
-        this.pushVectorParam(key, rawColumn, dir.distance.to, params);
-        continue;
-      }
-      // JSON-path ordering: mirrors buildJsonPathOrderEntry: same validation,
-      // then the path bound as one text[] param.
-      if (isJsonPathOrderBy(dir)) {
-        this.validateJsonPathOrderBy(this.table, this.tableMeta, key, dir);
-        params.push(this.jsonPathParam(dir.path));
-        continue;
-      }
-      // To-many relation orderBy (`{ posts: { _count } }`) uses the same count
-      // subquery as `_count`: mirror its global-filter params. Pick-row
-      // ordering mirrors its full param chain (by-path / global filter /
-      // pick.where / pick.orderBy paths). To-one relation orderBy is mirrored
-      // by running its build (see collectToOneRelationOrderParams).
-      if (this.isRelationOrderByValue(dir)) {
-        // Mirrors the build path's resolution, so a cache HIT binds params for
-        // the same relation the cached SQL was built from.
-        const resolvedRel = resolveRelation(this.tableMeta.relations, key);
-        const relDef = resolvedRel?.def;
-        if (relDef && isRelationPickOrderBy(dir)) {
-          this.collectRelationPickOrderParams(resolvedRel.name, relDef, dir, params);
-        } else if (relDef && (relDef.type === 'hasMany' || relDef.type === 'manyToMany')) {
-          this.collectRelationCountParams(relDef, params);
-        } else if (relDef) {
-          relationsMod.collectToOneRelationOrderParams(this.ctx, key, dir as Record<string, unknown>, params);
-        }
-      }
-    }
+    relationsMod.collectOrderParams(this.ctx, orderByEntries(orderBy), params);
   }
 
   // -------------------------------------------------------------------------
@@ -6357,90 +6219,49 @@ export class QueryInterface<
     return this.utcTimestamps ? parseDbDate(String(value)) : new Date(value as string);
   }
 
-  /** The non-temporal decode kinds of `table`'s columns, by column and by field name. */
-  private getCellKinds(table: string, meta: TableMetadata): Map<string, number> {
-    let kinds = this.cellKindCache.get(table);
-    if (!kinds) {
-      kinds = new Map();
+  /** The non-temporal decode kinds and dialect readers of one immutable table. */
+  private getCellKinds(table: string, meta: TableMetadata) {
+    let cached = this.cellKindCache.get(table);
+    if (!cached) {
+      cached = { kinds: new Map() };
       for (const column of meta.columns) {
         // Metadata may carry the type on the column or only in the table map.
         const pgType = column.pgType ?? meta.pgTypes?.[column.name];
         if (typeof pgType !== 'string') continue;
-        let kind = cellKindOf(pgType, this.schema.enums);
+        let kind = cellKindOf(pgType, this.schema.enums, columnOperandKind(meta, column.name) === 'array');
         const decode = kind === CELL_PLAIN ? this.dialect.decodeColumnValue?.(pgType) : undefined;
         if (decode !== undefined) {
           kind = CELL_DIALECT;
-          let decoders = this.dialectDecodeCache.get(table);
-          if (!decoders) {
-            decoders = new Map();
-            this.dialectDecodeCache.set(table, decoders);
-          }
-          decoders.set(column.name, decode);
-          decoders.set(column.field, decode);
+          cached.decoders ??= new Map();
+          cached.decoders.set(column.name, decode);
+          cached.decoders.set(column.field, decode);
         }
         if (kind === CELL_PLAIN) continue;
-        kinds.set(column.name, kind);
-        kinds.set(column.field, kind);
+        cached.kinds.set(column.name, kind);
+        cached.kinds.set(column.field, kind);
       }
-      this.cellKindCache.set(table, kinds);
+      this.cellKindCache.set(table, cached);
     }
-    return kinds;
+    return cached;
   }
 
   /** One cell's decode, for every kind but {@link CELL_PLAIN}. */
   private decodeCell(kind: number, value: unknown, table: string, field: string): unknown {
-    switch (kind) {
-      case CELL_TEMPORAL:
-        return this.decodeTemporalCell(value, table, field);
-      case CELL_FLOAT:
-        return readJsonFloat(value);
-      case CELL_FLOAT_ARRAY:
-        return readJsonFloatArray(value);
-      case CELL_TEXT_ARRAY:
-        return readTextArray(value);
-      case CELL_DIALECT:
-        return this.decodeDialectCell(value, table, field);
-      default:
-        return value;
+    if (kind === CELL_TEMPORAL) return this.decodeTemporalCell(value, table, field);
+    if (kind === CELL_DIALECT) {
+      if (value === null || value === undefined) return value;
+      const decode = this.cellKindCache.get(table)?.decoders?.get(field);
+      return decode ? decode(value) : value;
     }
+    const read = CELL_READERS[kind];
+    return read === undefined ? value : read(value);
   }
 
   /**
-   * A {@link CELL_DIALECT} cell: the dialect's decode for the column's declared
-   * type, recorded by {@link getCellKinds} when it classified the column.
-   */
-  private decodeDialectCell(value: unknown, table: string, field: string): unknown {
-    if (value === null || value === undefined) return value;
-    const decode = this.dialectDecodeCache.get(table)?.get(field);
-    return decode ? decode(value) : value;
-  }
-
-  /**
-   * Build the decode plan for one exact column list, and remember it as this
-   * table's most recent shape so the next row of the same result set hits the
-   * fast path in {@link parseRow}.
-   *
-   * The shape key's delimiter is NUL because it is the one byte a Postgres
-   * identifier cannot contain, even quoted, so no table or column name can
-   * forge a collision. It MUST be written as the six-character escape, never
-   * as a literal NUL byte: a raw NUL makes byte-oriented tools classify this
-   * file as binary, and `grep` then reports ZERO matches for a term that is
-   * present rather than saying it declined to look. This is the largest file
-   * in the repo, and that silent empty result has already sent more than one
-   * search down the wrong path.
-   */
-  private buildRowDecodePlan(table: string, meta: TableMetadata, keys: string[]): RowDecodePlan {
-    const plan = this.rowDecodePlanFor(table, meta, keys);
-    this.rowPlanLast.set(table, plan);
-    return plan;
-  }
-
-  /**
-   * The cached decode plan for one exact column list, without touching the
-   * per-table most-recent slot. {@link buildRowDecodePlan} is the per-row entry;
-   * this is also what the positional nested-row plan in relations.ts reads
-   * (through the ctx) when it is built, so a nested row decodes by exactly the
-   * field names and cell kinds {@link parseRow} would give the same keys.
+   * The bounded decode plan for one exact column list. Both the object parser
+   * and positional relation parser use these same names and cell kinds.
+   * NUL separates identifiers because it cannot occur in a SQL identifier;
+   * keep it escaped in source so text tools never classify this file as binary.
    */
   private rowDecodePlanFor(table: string, meta: TableMetadata, keys: readonly string[]): RowDecodePlan {
     const shapeKey = `${table}\u0000${keys.join('\u0000')}`;
@@ -6450,8 +6271,8 @@ export class QueryInterface<
       const dateCols = meta.dateColumns;
       // camelCase-keyed date fields, so nested json_build_object rows (whose
       // keys are already camelCase) get the same Date coercion as top-level rows.
-      const camelDateFields = this.getCamelDateFields(table, meta);
-      const cellKinds = this.getCellKinds(table, meta);
+      const camelDateFields = relationsMod.getCamelDateFields(this.ctx, table, meta);
+      const { kinds: cellKinds } = this.getCellKinds(table, meta);
       const cols = keys.slice();
       const fields: string[] = [];
       const kinds: number[] = [];
@@ -6471,64 +6292,58 @@ export class QueryInterface<
     return plan;
   }
 
-  /**
-   * Whether a cached plan describes exactly this row's column list, in order.
-   * A pointer compare per column: both sides are the driver's own interned
-   * column-name strings, so this is far cheaper than the reverse-map lookup and
-   * two Set probes per column that it replaces, and unlike a length check or a
-   * fingerprint it CANNOT accept a different projection that happens to look
-   * similar. That matters more than the speed: a positional plan applied to the
-   * wrong column list would silently write each value under a neighbouring
-   * field's name, which is the one failure mode worth paying a full comparison
-   * to make impossible.
-   */
-  private static rowPlanMatches(plan: RowDecodePlan, keys: string[]): boolean {
-    const cols = plan.cols;
-    if (cols.length !== keys.length) return false;
-    for (let i = 0; i < keys.length; i++) {
-      if (cols[i] !== keys[i]) return false;
-    }
-    return true;
+  private parseRow(row: Record<string, unknown>, table: string): Record<string, unknown> {
+    return this.makeRowParser(table)(row);
   }
 
-  private parseRow(row: Record<string, unknown>, table: string): Record<string, unknown> {
-    const parsed: Record<string, unknown> = {};
+  private makeRowParser(table: string): (row: Record<string, unknown>) => Record<string, unknown> {
+    const cached = this.rowParsers.get(table);
+    if (cached) return cached;
     const meta = this.schema.tables[table];
-
-    if (meta) {
-      // Every row of one result set has the same columns in the same order (a
-      // SQL result set has fixed field descriptors, and a nested row decoded
-      // from `json_build_object` has a fixed key list), so the per-column
-      // name resolution and date-column membership tests are the same answer
-      // recomputed for every row. Resolve them ONCE per column shape and keep
-      // the plan; the shape is verified against each row rather than assumed,
-      // so a caller that does hand this function heterogeneous rows gets a
-      // rebuilt plan instead of a mis-mapped one.
-      const keys = Object.keys(row);
-      const last = this.rowPlanLast.get(table);
-      const plan =
-        last !== undefined && QueryInterface.rowPlanMatches(last, keys)
-          ? last
-          : this.buildRowDecodePlan(table, meta, keys);
-
-      const { cols, fields, kinds } = plan;
-      for (let i = 0; i < cols.length; i++) {
-        const field = fields[i]!;
-        const value = row[cols[i]!];
-        const kind = kinds[i]!;
-        // A float from the driver is already a number; only JSON's strings need reading.
-        parsed[field] =
-          kind === CELL_PLAIN || (kind === CELL_FLOAT && typeof value !== 'string')
-            ? value
-            : this.decodeCell(kind, value, table, field);
+    let last: RowDecodePlan | undefined;
+    let plain: boolean[] | undefined;
+    const parse = (row: Record<string, unknown>): Record<string, unknown> => {
+      const parsed: Record<string, unknown> = {};
+      if (meta) {
+        // Every row of one result set has the same columns in the same order (a
+        // SQL result set has fixed field descriptors, and a nested row decoded
+        // from `json_build_object` has a fixed key list), so the per-column
+        // name resolution and date-column membership tests are the same answer
+        // recomputed for every row. Resolve them ONCE per column shape and keep
+        // the plan; the shape is verified against each row rather than assumed,
+        // so a caller that does hand this function heterogeneous rows gets a
+        // rebuilt plan instead of a mis-mapped one.
+        const keys = Object.keys(row);
+        // String keys use the shared comparator's exact, ordered === checks.
+        if (last === undefined || !cacheParamsEqual(last.cols, keys)) {
+          last = this.rowDecodePlanFor(table, meta, keys);
+          plain = last.kinds.map((kind, i) => kind === CELL_PLAIN && last!.fields[i] !== '__proto__');
+        }
+        const { cols, fields, kinds } = last;
+        // Keep this row's classification across reentrant reads of another shape.
+        const plainColumns = plain!;
+        for (let i = 0; i < cols.length; i++) {
+          const field = fields[i]!;
+          let value = row[cols[i]!];
+          if (!plainColumns[i]) {
+            const kind = kinds[i]!;
+            if (field === '__proto__')
+              Object.defineProperty(parsed, field, { writable: true, enumerable: true, configurable: true });
+            if (kind !== CELL_PLAIN && (kind !== CELL_FLOAT || typeof value === 'string'))
+              value = this.decodeCell(kind, value, table, field);
+          }
+          parsed[field] = value;
+        }
+      } else {
+        // Fallback: no metadata, use regex conversion
+        for (const [col, value] of Object.entries(row)) {
+          parsed[snakeToCamel(col)] = value;
+        }
       }
-    } else {
-      // Fallback: no metadata, use regex conversion
-      for (const [col, value] of Object.entries(row)) {
-        parsed[snakeToCamel(col)] = value;
-      }
-    }
-    return parsed;
+      return parsed;
+    };
+    this.rowParsers.set(table, parse);
+    return parse;
   }
 
   // -------------------------------------------------------------------------

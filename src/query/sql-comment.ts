@@ -46,8 +46,8 @@
 import { UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { logTo, type TurbineLogger } from '../logger.js';
 import { currentQueryTag } from '../query-events.js';
+import { claimPreparedName, fnv1a64Hex, LRUCache } from '../query-utils.js';
 import type { DeferredQuery } from './deferred.js';
-import { claimPreparedName, fnv1a64Hex, LRUCache } from './utils.js';
 import { shouldWarnOnce } from './warn-registry.js';
 
 /** `TurbineConfig.sqlComment`. */

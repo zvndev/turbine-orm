@@ -15,8 +15,8 @@
 import type { Dialect } from '../dialect.js';
 import { UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { tableAccessorName } from '../global-filters-config.js';
+import { suggestKey } from '../query-utils.js';
 import type { RowLockMode } from './types.js';
-import { suggestKey } from './utils.js';
 
 const MODES: readonly RowLockMode[] = ['update', 'noKeyUpdate', 'share', 'keyShare'];
 

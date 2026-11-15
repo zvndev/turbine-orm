@@ -1,0 +1,33 @@
+{
+  "name": "turbine-prisma8-postgres-candidate",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "26.12.0"
+  },
+  "packageManager": "npm@11.20.0",
+  "scripts": {
+    "verify:pins": "node scripts/verify-pins.mjs",
+    "generate": "node scripts/generate.mjs",
+    "typecheck": "tsc --noEmit",
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "preflight": "node scripts/run.mjs --mode preflight",
+    "run": "node scripts/run.mjs",
+    "generate:check": "node scripts/generate.mjs --check",
+    "catalog": "node scripts/run.mjs --mode catalog",
+    "plan-service": "node scripts/run.mjs --mode plan"
+  },
+  "dependencies": {
+    "@prisma/orm-postgres": "8.0.0-rc.23",
+    "pg": "8.22.0",
+    "pg-cursor": "2.22.1"
+  },
+  "devDependencies": {
+    "prisma": "8.0.0-rc.33",
+    "typescript": "5.9.3",
+    "@types/node": "26.1.2",
+    "@types/pg": "8.20.4"
+  }
+}

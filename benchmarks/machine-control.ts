@@ -25,6 +25,7 @@
  */
 
 import pg from 'pg';
+import { summarizeSamples, type ArmStat } from './bench-harness.js';
 
 const DATABASE_URL = process.env['DATABASE_URL'] ?? 'postgresql:///turbine_bench_070?host=/tmp';
 const LABEL = process.argv[2] ?? 'control';
@@ -46,6 +47,7 @@ function median(xs: number[]): number {
   return s.length % 2 ? s[(s.length - 1) / 2]! : (s[s.length / 2 - 1]! + s[s.length / 2]!) / 2;
 }
 
+const retained: ArmStat[] = [];
 async function time(fn: () => Promise<unknown>, rounds: number, warmup: number): Promise<number> {
   for (let i = 0; i < warmup; i++) await fn();
   const s: number[] = [];
@@ -54,6 +56,8 @@ async function time(fn: () => Promise<unknown>, rounds: number, warmup: number):
     await fn();
     s.push(performance.now() - t);
   }
+  if (process.env.BENCH_RETAIN_SAMPLES === '1')
+    retained.push(summarizeSamples(`control-${retained.length + 1}`, s, true));
   return median(s);
 }
 
@@ -64,23 +68,33 @@ async function main() {
   const flat = await time(() => pool.query('SELECT * FROM users LIMIT 100'), ROUNDS, WARMUP);
   const l2 = await time(() => pool.query(RAW_L2), ROUNDS, WARMUP);
 
-  const drain = await time(async () => {
-    let n = 0;
-    let lastId = 0;
-    for (;;) {
-      const res = await pool.query('SELECT * FROM comments WHERE id > $1 ORDER BY id ASC LIMIT $2', [lastId, 1000]);
-      if (res.rows.length === 0) break;
-      for (const row of res.rows) {
-        n++;
-        lastId = Number(row.id);
+  const drain = await time(
+    async () => {
+      let n = 0;
+      let lastId = 0;
+      for (;;) {
+        const res = await pool.query('SELECT * FROM comments WHERE id > $1 ORDER BY id ASC LIMIT $2', [lastId, 1000]);
+        if (res.rows.length === 0) break;
+        for (const row of res.rows) {
+          n++;
+          lastId = Number(row.id);
+        }
+        if (res.rows.length < 1000) break;
       }
-      if (res.rows.length < 1000) break;
-    }
-    if (n !== 50000) throw new Error(`drain returned ${n} rows, expected 50000`);
-    return n;
-  }, 9, 1);
+      if (n !== 50000) throw new Error(`drain returned ${n} rows, expected 50000`);
+      return n;
+    },
+    9,
+    1,
+  );
 
   const out = {
+    ...(retained.length
+      ? {
+          samples: retained,
+          sampleOrder: ['SELECT 1', 'raw flat 100 users', 'raw L2 50 users + posts', 'raw 50K keyset drain'],
+        }
+      : {}),
     label: LABEL,
     at: new Date().toISOString(),
     node: process.version,

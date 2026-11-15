@@ -17,7 +17,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { describe } from 'node:test';
+import { describe, it as unitIt } from 'node:test';
 import pg from 'pg';
 import { TurbineClient } from '../client.js';
 import { columnTsType } from '../generate.js';
@@ -139,7 +139,7 @@ function matchesType(type: string, value: unknown, enums: Readonly<Record<string
   if (t === 'string') return typeof value === 'string';
   if (t === 'boolean') return typeof value === 'boolean';
   if (t === 'Date') return value instanceof Date;
-  if (t === 'Buffer') return Buffer.isBuffer(value);
+  if (t === 'Buffer' || t === 'globalThis.Buffer') return Buffer.isBuffer(value);
   if (t.endsWith('[]')) {
     let element = t.slice(0, -2).trim();
     if (element.startsWith('(') && element.endsWith(')')) element = element.slice(1, -1);
@@ -172,6 +172,33 @@ function describeValue(value: unknown): string {
   if (typeof value === 'object') return `{${Object.keys(value as object).join(', ')}}`;
   return `${typeof value} ${JSON.stringify(value)}`;
 }
+
+describe('type matcher: generated binary intrinsic spellings', () => {
+  unitIt('checks qualified and legacy Buffer values with the same native predicate', () => {
+    for (const type of ['Buffer', 'globalThis.Buffer']) {
+      assert.equal(matchesType(type, Buffer.from([0, 255]), {}), true);
+      for (const value of [new Uint8Array([0, 255]), { id: 1, title: 'model' }, '00ff', null]) {
+        assert.equal(matchesType(type, value, {}), false);
+      }
+    }
+  });
+
+  unitIt('checks qualified Buffer array elements and nullable unions', () => {
+    const bytes = Buffer.from([0, 255]);
+    assert.equal(matchesType('globalThis.Buffer[]', [bytes], {}), true);
+    assert.equal(matchesType('globalThis.Buffer[]', [], {}), true);
+    assert.equal(matchesType('globalThis.Buffer[]', [bytes, { id: 1 }], {}), false);
+    assert.equal(matchesType('globalThis.Buffer[]', [new Uint8Array([0, 255])], {}), false);
+    assert.equal(matchesType('globalThis.Buffer | null', null, {}), true);
+    assert.equal(matchesType('globalThis.Buffer | null', bytes, {}), true);
+    assert.equal(matchesType('globalThis.Buffer | null', { id: 1 }, {}), false);
+  });
+
+  unitIt('keeps unknown qualified names distinct from enum names', () => {
+    assert.equal(matchesType('ByteLike', 'label', { ByteLike: ['label'] }), true);
+    assert.throws(() => matchesType('globalThis.ByteLike', 'label', { ByteLike: ['label'] }), /no rule for the type/);
+  });
+});
 
 const { it, before, after } = skipGate(SKIP, 'DATABASE_URL not set');
 

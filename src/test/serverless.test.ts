@@ -100,7 +100,7 @@ describe('turbineHttp / external pool integration', () => {
     const { pool } = createMockPool();
     const db = new TurbineClient({ pool }, buildSchema());
     assert.ok(db, 'TurbineClient constructed with external pool');
-    // pool property should be the same instance we passed in
+    // pool property should be the supplied instance
     assert.strictEqual((db as unknown as { pool: PgCompatPool }).pool, pool);
   });
 
@@ -168,13 +168,13 @@ describe('turbineHttp / external pool integration', () => {
   });
 
   it('does not register the int8 type parser when using an external pool', () => {
-    // If we mutated pg.types for external pools, Neon/Vercel drivers could
-    // see changed global state. This test ensures the constructor path
+    // Mutating pg.types for external pools could change global state seen by
+    // Neon/Vercel drivers. This test ensures the constructor path
     // under config.pool skips that registration.
     const { pool } = createMockPool();
     const db = new TurbineClient({ pool }, buildSchema());
     assert.ok(db);
-    // We don't import pg.types here, but the logic is: `!config.pool && !registered`.
+    // The constructor gates parser registration on: `!config.pool && !registered`.
     // Construction succeeding with a pool that has no .on('error') method is
     // the behavioral proof, pg.Pool would have been instantiated and would
     // call .on internally; that path is skipped.

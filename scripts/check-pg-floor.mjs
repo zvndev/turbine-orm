@@ -82,7 +82,7 @@ try {
 
   // The probe is only meaningful if turbine-orm really resolves the floor pg. A
   // nested copy under turbine-orm/node_modules would mean the range excludes the
-  // floor we just installed and the imports below would test a different pg.
+  // floor installed above and the imports below would test a different pg.
   const installed = JSON.parse(readFileSync(join(dir, 'node_modules/pg/package.json'), 'utf8')).version;
   if (installed !== floor) fail(`asked npm for pg@${floor} and got ${installed}`);
   if (existsSync(join(dir, 'node_modules/turbine-orm/node_modules/pg'))) {

@@ -1,5 +1,5 @@
 /**
- * turbine-orm: Unique-FK → one-to-one (hasOne) introspection flip (F2)
+ * turbine-orm: Unique-FK → one-to-one (hasOne) introspection flip
  *
  * Unit tests for the pure detection + naming core: a child relation whose FK
  * column set is EXACTLY covered by a unique constraint or a plain (non-partial,

@@ -70,6 +70,8 @@ src/
   query/           , SQL generation, split into submodules:
     types.ts         , Public query arg types
     utils.ts         , quoteIdent, escapeLike, LRUCache, column-name resolution
+    temporal-parsers.ts, Portable scalar date/timestamp parser factories
+    pg-type-parsers.ts, PostgreSQL array parsers, registration and ownership
     filters.ts       , Where-filter type guards + shape fingerprints
     where-compile.ts , The single where-clause enumeration authority
     where.ts         , All WHERE SQL generation
@@ -78,6 +80,7 @@ src/
     relations.ts     , json_agg relation machinery and the orderBy surface
     builder.ts       , QueryInterface class and the execute facade
     batched-loader.ts, relationLoadStrategy: 'batched'
+    cursor-tuple.ts  , Explicit tuple cursor eligibility and cache signature
     compound-unique.ts, Compound-unique selectors and the findUnique identity rule
     relation-names.ts, The relation-name resolution rule
     normalize-args.ts, Args-seam undefined pruning and the inclusive-cursor flag
@@ -88,6 +91,7 @@ src/
     row-lock.ts      , The lock read option: FOR UPDATE OF "t" and its refusals
     sql-comment.ts   , sqlComment: sqlcommenter key/values appended at the execute seam
     stream-idle.ts   , The abandoned-stream idle guard and its server-side limit
+    stream-signal.ts , Public stream cancellation, scoped admission and bounded PG settlement
     table-client.ts  , The accessor contract (TableClient) every engine implements
     warn-registry.ts , Process-wide once-only dev-warn registry
     deferred.ts      , DeferredQuery and option types
@@ -104,7 +108,7 @@ src/
   observe.ts       , Observability / query metrics
   serverless.ts    , Edge/serverless driver binding (turbineHttp)
   adapters/        , Dialect adapters (CockroachDB, YugabyteDB, …)
-  errors.ts        , Typed TurbineError hierarchy (E001-E020)
+  errors.ts        , Typed TurbineError hierarchy (E001-E021)
   cli/             , CLI commands (init, generate, migrate, studio, etc.)
 ```
 

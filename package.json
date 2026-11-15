@@ -1,6 +1,6 @@
 {
   "name": "turbine-orm",
-  "version": "0.93.1",
+  "version": "0.94.0",
   "description": "Postgres-native TypeScript ORM, runs on Neon, Vercel Postgres, Cloudflare, Supabase. Streaming cursors, typed errors, single-query nested relations. One dependency, no WASM engine",
   "type": "module",
   "//exports": "Each subpath declares its types PER CONDITION. A single shared top-level \"types\" resolves to the ESM declarations for `require` too, which is TS1479 (\"is an ES module ... cannot be require()d\") for any CJS consumer on moduleResolution node16/nodenext. The require condition points at dist/cjs, which ships its own {\"type\":\"commonjs\"} package.json, so those declarations are CJS declarations. Gated in CI by publint + @arethetypeswrong/cli + a real .cts consumer typecheck (see the package-types job in ci.yml).",
@@ -13,6 +13,16 @@
       "require": {
         "types": "./dist/cjs/index.d.ts",
         "default": "./dist/cjs/index.js"
+      }
+    },
+    "./sql": {
+      "import": {
+        "types": "./dist/sql.d.ts",
+        "default": "./dist/sql.js"
+      },
+      "require": {
+        "types": "./dist/cjs/sql.d.ts",
+        "default": "./dist/cjs/sql.js"
       }
     },
     "./serverless": {
@@ -45,6 +55,16 @@
         "default": "./dist/cjs/sqlite.js"
       }
     },
+    "./sqlite/seed": {
+      "import": {
+        "types": "./dist/sqlite-seed.d.ts",
+        "default": "./dist/sqlite-seed.js"
+      },
+      "require": {
+        "types": "./dist/cjs/sqlite-seed.d.ts",
+        "default": "./dist/cjs/sqlite-seed.js"
+      }
+    },
     "./mysql": {
       "import": {
         "types": "./dist/mysql.d.ts",
@@ -53,6 +73,26 @@
       "require": {
         "types": "./dist/cjs/mysql.d.ts",
         "default": "./dist/cjs/mysql.js"
+      }
+    },
+    "./mysql/seed": {
+      "import": {
+        "types": "./dist/mysql-seed.d.ts",
+        "default": "./dist/mysql-seed.js"
+      },
+      "require": {
+        "types": "./dist/cjs/mysql-seed.d.ts",
+        "default": "./dist/cjs/mysql-seed.js"
+      }
+    },
+    "./mssql/seed": {
+      "import": {
+        "types": "./dist/mssql-seed.d.ts",
+        "default": "./dist/mssql-seed.js"
+      },
+      "require": {
+        "types": "./dist/cjs/mssql-seed.d.ts",
+        "default": "./dist/cjs/mssql-seed.js"
       }
     },
     "./mssql": {
@@ -94,6 +134,146 @@
         "types": "./dist/cjs/adapters/index.d.ts",
         "default": "./dist/cjs/adapters/index.js"
       }
+    },
+    "./neon-ws": {
+      "import": {
+        "types": "./dist/neon-ws.d.ts",
+        "default": "./dist/neon-ws.js"
+      },
+      "require": {
+        "types": "./dist/cjs/neon-ws.d.ts",
+        "default": "./dist/cjs/neon-ws.js"
+      }
+    },
+    "./neon-http": {
+      "import": {
+        "types": "./dist/neon-http.d.ts",
+        "default": "./dist/neon-http.js"
+      },
+      "require": {
+        "types": "./dist/cjs/neon-http.d.ts",
+        "default": "./dist/cjs/neon-http.js"
+      }
+    },
+    "./live-query": {
+      "import": {
+        "types": "./dist/live-query.d.ts",
+        "default": "./dist/live-query.js"
+      },
+      "require": {
+        "types": "./dist/cjs/live-query.d.ts",
+        "default": "./dist/cjs/live-query.js"
+      }
+    },
+    "./notification-hub": {
+      "import": {
+        "types": "./dist/notification-hub.d.ts",
+        "default": "./dist/notification-hub.js"
+      },
+      "require": {
+        "types": "./dist/cjs/notification-hub.d.ts",
+        "default": "./dist/cjs/notification-hub.js"
+      }
+    },
+    "./libsql": {
+      "import": {
+        "types": "./dist/libsql.d.ts",
+        "default": "./dist/libsql.js"
+      },
+      "require": {
+        "types": "./dist/cjs/libsql.d.ts",
+        "default": "./dist/cjs/libsql.js"
+      }
+    },
+    "./libsql/generate": {
+      "import": {
+        "types": "./dist/libsql/generate.d.ts",
+        "default": "./dist/libsql/generate.js"
+      },
+      "require": {
+        "types": "./dist/cjs/libsql/generate.d.ts",
+        "default": "./dist/cjs/libsql/generate.js"
+      }
+    },
+    "./libsql/introspect": {
+      "import": {
+        "types": "./dist/libsql/introspect.d.ts",
+        "default": "./dist/libsql/introspect.js"
+      },
+      "require": {
+        "types": "./dist/cjs/libsql/introspect.d.ts",
+        "default": "./dist/cjs/libsql/introspect.js"
+      }
+    },
+    "./core": {
+      "import": {
+        "types": "./dist/core.d.ts",
+        "default": "./dist/core.js"
+      },
+      "require": {
+        "types": "./dist/cjs/core.d.ts",
+        "default": "./dist/cjs/core.js"
+      }
+    },
+    "./d1": {
+      "import": {
+        "types": "./dist/d1.d.ts",
+        "default": "./dist/d1.js"
+      },
+      "require": {
+        "types": "./dist/cjs/d1.d.ts",
+        "default": "./dist/cjs/d1.js"
+      }
+    },
+    "./libsql/seed": {
+      "import": {
+        "types": "./dist/libsql-seed.d.ts",
+        "default": "./dist/libsql-seed.js"
+      },
+      "require": {
+        "types": "./dist/cjs/libsql-seed.d.ts",
+        "default": "./dist/cjs/libsql-seed.js"
+      }
+    },
+    "./d1/introspect": {
+      "import": {
+        "types": "./dist/d1/introspect.d.ts",
+        "default": "./dist/d1/introspect.js"
+      },
+      "require": {
+        "types": "./dist/cjs/d1/introspect.d.ts",
+        "default": "./dist/cjs/d1/introspect.js"
+      }
+    },
+    "./d1/generate": {
+      "import": {
+        "types": "./dist/d1/generate.d.ts",
+        "default": "./dist/d1/generate.js"
+      },
+      "require": {
+        "types": "./dist/cjs/d1/generate.d.ts",
+        "default": "./dist/cjs/d1/generate.js"
+      }
+    },
+    "./better-sqlite3": {
+      "import": {
+        "types": "./dist/better-sqlite3.d.ts",
+        "default": "./dist/better-sqlite3.js"
+      },
+      "require": {
+        "types": "./dist/cjs/better-sqlite3.d.ts",
+        "default": "./dist/cjs/better-sqlite3.js"
+      }
+    },
+    "./d1/migrate": {
+      "import": {
+        "types": "./dist/d1/migrate.d.ts",
+        "default": "./dist/d1/migrate.js"
+      },
+      "require": {
+        "types": "./dist/cjs/d1/migrate.d.ts",
+        "default": "./dist/cjs/d1/migrate.js"
+      }
     }
   },
   "//imports": "`#pg` is how the modules shared with the serverless entry reach node-postgres. It is `pg` itself everywhere except edge-light and browser, which get dist/pg-edge.js (see src/pg-edge.ts): those runtimes cannot bundle pg at all, and turbineHttp() never uses it. workerd is listed first so Cloudflare keeps the real driver (pg supports Workers). An imports target may be a bare package name, which is what keeps src/ runnable under tsx with no dist/ present. The CJS build (dist/cjs) is Node-only: scripts/finish-cjs-build.mjs rewrites its require(\"#pg\") to require(\"pg\"), because a require() resolves #imports against the NEAREST package.json (dist/cjs/package.json) and publint rejects a nested imports field. Edge bundlers resolve the import condition, i.e. the ESM files. `npm run check:edge` bundles the serverless entry for the edge conditions and fails on any pg or Node-builtin import.",
@@ -132,16 +312,16 @@
     "dogfood": "tsx examples/dogfood.ts",
     "test": "tsx --test --test-concurrency=1 src/test/*.test.ts",
     "test:unit": "DATABASE_URL= tsx --test src/test/*.test.ts",
-    "//test:coverage": "Collection and reporting are SEPARATE, and the report is not c8's. c8 merges every process's V8 coverage into one ProcessCov before converting to istanbul, and that merge is not monotonic on a run this size: measured on this suite, query/relations.ts read 3043 covered lines at 240 process files and 1333 at 359, and a 448-test SUBSET read 91.88% where the full 5,819-test superset read 41.78%. scripts/coverage-report.mjs keeps every other c8 behaviour (same .c8rc.json, same reporters, same checkCoverages gate) and only moves the merge to the istanbul level, where it is additive and cannot go backwards. Collection is a bare NODE_V8_COVERAGE, which is exactly what the c8 wrapper set; dropping the wrapper also drops the broken merge from the critical path instead of running it and discarding the result.",
-    "test:coverage": "rm -rf coverage/tmp && mkdir -p coverage/tmp && NODE_V8_COVERAGE=coverage/tmp tsx --test --test-concurrency=1 src/test/*.test.ts && node scripts/coverage-report.mjs",
+    "//test:coverage": "Collection and reporting are SEPARATE, and the report is not c8's. c8 merges every process's V8 coverage into one ProcessCov before converting to istanbul, and that merge is not monotonic on a run this size: measured on this suite, query/relations.ts read 3043 covered lines at 240 process files and 1333 at 359, and a 448-test SUBSET read 91.88% where the full 5,819-test superset read 41.78%. scripts/coverage-report.mjs keeps every other c8 behaviour (same .c8rc.json, same reporters, same checkCoverages gate) and only moves the merge to the istanbul level, where it is additive and cannot go backwards. Collection retains native NODE_V8_COVERAGE and adds inspector attribution only for same-process same-URL collisions. Each generated source and inline map is bound to its V8 scriptId before reporting; a URL-keyed cache cannot recover an overwritten transform map. The collector never invokes the broken V8 merge.",
+    "test:coverage": "rm -rf coverage/tmp && mkdir -p coverage/tmp && node tooling/coverage-regressions/collect.mjs --directory coverage/tmp -- node --import tsx --test --test-concurrency=1 src/test/*.test.ts && node scripts/coverage-report.mjs",
     "//coverage:codegen": "The ratchet for the two code-generation modules, which .c8rc.json excludes from the main gate and which therefore sat in no gate at all. introspect.ts carries a stated correctness invariant (determinism) and generate.ts writes executable TypeScript from database-controlled identifiers, which is the highest-consequence untested code in the package. Both were excluded from all measurement. Same ratchet argument. Adds NO test execution: it re-reports the coverage `npm run test:coverage` already wrote to coverage/tmp, under .c8rc.codegen.json, so it must run AFTER that command. It goes through scripts/coverage-report.mjs rather than `c8 report` because the main collection is 418 process files, past the point where c8's own merge stops being monotonic (see //merge-bug in .c8rc.json). Floors, thresholds and the per-file reasoning live in .c8rc.codegen.json.",
     "coverage:codegen": "node scripts/coverage-report.mjs --config .c8rc.codegen.json",
     "//check:coverage-sync": "The three-way coupling between a coverage collection and the floors that hold it. A file can be added to coverage:cli:collect and then be held by NOTHING, which is not a missing gate but a slower lane enforcing a floor of zero, and it has happened twice (mcp.ts and error-catalog.ts each spent a release that way). The invariant is that every file in the collection is named by a per-file gate OR by the aggregate, NOT that the collection and the aggregate are equal: cli/index.ts is deliberately outside the aggregate, see //coverage:cli:gate:aggregate. It also refuses a gate that names a file nobody collects, which measures nothing and passes, and it fails closed on an empty parse. It runs FIRST in test:coverage:cli, ahead of the collection, because it needs no coverage data and its failure names the missing wiring instead of a number.",
     "check:coverage-sync": "node scripts/check-coverage-gate-sync.mjs",
     "//coverage:cli": "The CLI coverage gate, split into ONE collection run plus a per-file threshold check for every file in it, and an aggregate. c8 enforces a single threshold set per invocation and its --per-file applies the SAME numbers to every file, neither of which can express 'destructive.ts holds 100 while migrate.ts holds 70'. An aggregate-only floor lets the least-covered file spend the whole slack the best-covered file earned: at the measured 3623/2951 lines, migrate.ts could fall from 70.3% to 66.6% with the aggregate still green. So each file gets its OWN floor, checked by re-reporting the coverage already on disk (c8 report re-reads ./coverage/tmp, so this costs no extra test run). The aggregate check is kept as well: it catches all three sagging together inside their individual margins. Per-file gates run FIRST because their failure names the file. DATABASE_URL is neutralized on the collection run: these test files include live migration tests that create and drop tables, and this script runs from prepublishOnly.",
-    "test:coverage:cli": "npm run check:coverage-sync && npm run coverage:cli:collect && npm run coverage:cli:gate:destructive && npm run coverage:cli:gate:sql-statements && npm run coverage:cli:gate:pii-guard && npm run coverage:cli:gate:error-catalog && npm run coverage:cli:gate:mcp && npm run coverage:cli:gate:compile-query && npm run coverage:cli:gate:local-server-guard && npm run coverage:cli:gate:observe && npm run coverage:cli:gate:studio && npm run coverage:cli:gate:migrate && npm run coverage:cli:gate:index && npm run coverage:cli:gate:aggregate",
+    "test:coverage:cli": "npm run check:coverage-sync && npm run coverage:cli:collect && npm run coverage:cli:gate:destructive && npm run coverage:cli:gate:sql-statements && npm run coverage:cli:gate:pii-guard && npm run coverage:cli:gate:error-catalog && npm run coverage:cli:gate:mcp && npm run coverage:cli:gate:compile-query && npm run coverage:cli:gate:local-server-guard && npm run coverage:cli:gate:observe && npm run coverage:cli:gate:studio && npm run coverage:cli:gate:migrate && npm run coverage:cli:gate:index && npm run coverage:cli:gate:sqlite-tools && npm run coverage:cli:gate:tool-capabilities && npm run coverage:cli:gate:tool-command && npm run coverage:cli:gate:mssql-tools && npm run coverage:cli:gate:loader && npm run coverage:cli:gate:aggregate",
     "//coverage:cli:collect": "--check-coverage=false is load-bearing, not tidying. c8 reads .c8rc.json for defaults, so this COLLECTION step was silently enforcing the MAIN gate's global thresholds against a src/cli-only file set. That is a gate nobody wrote and nobody wanted, and it went unnoticed only because the main floor was low enough (75) for the CLI aggregate (89.29) to clear it by accident. When the main floors were re-baselined to 93/89/78 (see //merge-bug in .c8rc.json) it started failing here, several steps before the per-file gates that are supposed to decide. Thresholds for these files belong to the coverage:cli:gate:* scripts, which pass their own explicitly.",
-    "coverage:cli:collect": "DATABASE_URL= c8 --all --check-coverage=false --reporter text --exclude 'src/test/**' --include src/cli/studio.ts --include src/cli/migrate.ts --include src/cli/destructive.ts --include src/cli/sql-statements.ts --include src/cli/pii-predicate-guard.ts --include src/cli/mcp.ts --include src/cli/compile-query.ts --include src/cli/error-catalog.ts --include src/cli/index.ts --include src/cli/local-server-guard.ts --include src/cli/observe.ts tsx --test src/test/studio-write.test.ts src/test/pii-guard-symmetry.test.ts src/test/studio-demo.test.ts src/test/studio.test.ts src/test/studio-security.test.ts src/test/migrate.test.ts src/test/migrations-pure.test.ts src/test/migrate-deploy.test.ts src/test/migrate-smoke-fixes.test.ts src/test/tracking-table-race.test.ts src/test/destructive-dynamic-assembly.test.ts src/test/destructive-migrations.test.ts src/test/backfill-recipe.test.ts src/test/cli.test.ts src/test/cli-diff-migration.test.ts src/test/cli-flags.test.ts src/test/cli-first-run.test.ts src/test/mcp.test.ts src/test/mcp-relations.test.ts src/test/mcp-pii.test.ts src/test/mcp-pii-round2.test.ts src/test/mcp-agent-tools.test.ts src/test/mcp-compile-query.test.ts src/test/mcp-perimeter-bounds.test.ts src/test/destructive-obfuscation.test.ts src/test/cli-init-schema.test.ts src/test/cli-introspect-options.test.ts src/test/mcp-transport-bounds.test.ts src/test/seed-schema.test.ts src/test/migrate-preview-and-report.test.ts src/test/destructive-quoting-forms.test.ts src/test/codegen-cli-destructive.test.ts src/test/codegen-cli-config.test.ts src/test/security-perimeter-local-servers.test.ts src/test/security-perimeter-mcp-secret-names.test.ts src/test/observe-cli.test.ts",
+    "coverage:cli:collect": "DATABASE_URL= c8 --all --check-coverage=false --reporter text --exclude 'src/test/**' --include src/cli/studio.ts --include src/cli/migrate.ts --include src/cli/destructive.ts --include src/cli/sql-statements.ts --include src/cli/pii-predicate-guard.ts --include src/cli/mcp.ts --include src/cli/compile-query.ts --include src/cli/error-catalog.ts --include src/cli/index.ts --include src/cli/local-server-guard.ts --include src/cli/observe.ts --include src/cli/sqlite-tools.ts --include src/cli/tool-capabilities.ts --include src/cli/tool-command.ts --include src/cli/mssql-tools.ts --include src/cli/loader.ts tsx --test src/test/migration-operations-postgres.test.ts src/test/migration-operations-sqlite.test.ts src/test/migration-operations-mysql.test.ts src/test/studio-write.test.ts src/test/pii-guard-symmetry.test.ts src/test/studio-demo.test.ts src/test/studio.test.ts src/test/studio-security.test.ts src/test/migrate.test.ts src/test/migrations-pure.test.ts src/test/migrate-deploy.test.ts src/test/migrate-smoke-fixes.test.ts src/test/tracking-table-race.test.ts src/test/destructive-dynamic-assembly.test.ts src/test/destructive-migrations.test.ts src/test/backfill-recipe.test.ts src/test/cli.test.ts src/test/cli-diff-migration.test.ts src/test/cli-flags.test.ts src/test/cli-first-run.test.ts src/test/mcp.test.ts src/test/mcp-relations.test.ts src/test/mcp-pii.test.ts src/test/mcp-pii-round2.test.ts src/test/mcp-agent-tools.test.ts src/test/mcp-compile-query.test.ts src/test/mcp-perimeter-bounds.test.ts src/test/destructive-obfuscation.test.ts src/test/cli-init-schema.test.ts src/test/cli-introspect-options.test.ts src/test/mcp-transport-bounds.test.ts src/test/seed-schema.test.ts src/test/migrate-preview-and-report.test.ts src/test/destructive-quoting-forms.test.ts src/test/codegen-cli-destructive.test.ts src/test/codegen-cli-config.test.ts src/test/security-perimeter-local-servers.test.ts src/test/security-perimeter-mcp-secret-names.test.ts src/test/observe-cli.test.ts src/test/sqlite-cli-project-command.test.ts src/test/sqlite-cli-project-config.test.ts src/test/sqlite-cli-project.test.ts src/test/sqlite-migrations.test.ts src/test/sqlite-schema.test.ts src/test/sqlite-schema-command.test.ts src/test/sqlite-seed.test.ts src/test/sqlite-seed-cli.test.ts src/test/sqlite-tools.test.ts src/test/mssql-tools.test.ts src/test/mssql-tools-lifecycle.test.ts src/test/cli-loader-tsx-fallbacks.test.ts src/test/cli-arg-safety.test.ts src/test/cli-first-run.paths.test.ts src/test/cli-init-secrets.test.ts src/test/cli-observe-url.test.ts src/test/cli-prisma-datasource-url.test.ts src/test/fix-cli-schema-file.test.ts src/test/fx-eng-cli.test.ts src/test/libsql-cli-admission.test.ts src/test/mysql-cli-migrations.test.ts src/test/mysql-cli-project-command.test.ts src/test/mysql-seed-cli.test.ts src/test/prisma-cli-schema-source.test.ts",
     "coverage:cli:gate": "c8 report --all --exclude 'src/test/**' --reporter text --check-coverage",
     "coverage:cli:gate:destructive": "npm run coverage:cli:gate -- --include src/cli/destructive.ts --lines 98 --statements 98 --branches 84 --functions 98",
     "coverage:cli:gate:sql-statements": "npm run coverage:cli:gate -- --include src/cli/sql-statements.ts --lines 100 --statements 100 --branches 98 --functions 100",
@@ -151,8 +331,8 @@
     "//coverage:cli:gate:compile-query": "compile_query's core: the CLOSED set of read operations an agent may compile, the sealed pool that makes 'never executes' structural rather than promised, and the aggregate-arg name harvest the PII refusal runs on. Every one of those is a refusal boundary, which is the same reason destructive.ts and pii-predicate-guard.ts carry their own floors. It gets a gate the SAME commit it joins coverage:cli:collect and the aggregate --include list, because a file in the collection with neither is collected and enforced by nothing, which is how mcp.ts and error-catalog.ts spent a release at a floor of zero. Floors measured 2026-08-15 at 100 lines / 100 statements / 94.21 branches / 100 functions.",
     "coverage:cli:gate:compile-query": "npm run coverage:cli:gate -- --include src/cli/compile-query.ts --lines 100 --statements 100 --branches 94 --functions 100",
     "coverage:cli:gate:error-catalog": "npm run coverage:cli:gate -- --include src/cli/error-catalog.ts --lines 100 --statements 100 --branches 90 --functions 100",
-    "//coverage:cli:gate:index": "cli/index.ts is the largest file in the repo (5,945 lines) and was in no coverage gate at all. The .c8rc.json //cli-gate argument for the other CLI files applies verbatim: coverage could fall to zero without anything noticing. The floors are LOW on purpose and are not a target: this file is argument parsing and command dispatch whose `process.exit` paths dominate any figure set over it, and the point of the gate is that the number cannot fall silently, not that it is high. MEASURED 2026-08-23 by `npm run coverage:cli:collect` (no database), read from the json-summary reporter rather than the text table, per the //cli-gate-measurements note: 32.62 lines / 32.62 statements / 75.62 branches / 20 functions, identical in isolation and in the nine-file collection. Floors sit about two points under. Raise as coverage improves; never lower one without recording why. It is deliberately NOT in coverage:cli:gate:aggregate, see that key's note.",
-    "coverage:cli:gate:index": "npm run coverage:cli:gate -- --include src/cli/index.ts --lines 30 --statements 30 --branches 73 --functions 18",
+    "//coverage:cli:gate:index": "cli/index.ts is the largest file in the repo (5,945 lines) and was in no coverage gate at all. The .c8rc.json //cli-gate argument for the other CLI files applies verbatim: coverage could fall to zero without anything noticing. The floors are LOW on purpose and are not a target: this file is argument parsing and command dispatch whose `process.exit` paths dominate any figure set over it, and the point of the gate is that the number cannot fall silently, not that it is high. MEASURED 2026-08-23 by `npm run coverage:cli:collect` (no database), read from the json-summary reporter rather than the text table, per the //cli-gate-measurements note: 32.62 lines / 32.62 statements / 75.62 branches / 20 functions, identical in isolation and in the nine-file collection. Floors sat about two points under that reading. RE-MEASURED 2026-11-14 after the engine dispatch, config, help and refusal suites joined coverage:cli:collect (they run in the full suite but were not collected, so the file read 42.04 lines / 77.94 branches / 31.2 functions here while more of it ran elsewhere): 48.78 lines / 48.78 statements / 82.26 branches / 44.8 functions. Floors raised to sit about two points under the new reading. Raise as coverage improves; never lower one without recording why. It is deliberately NOT in coverage:cli:gate:aggregate, see that key's note.",
+    "coverage:cli:gate:index": "npm run coverage:cli:gate -- --include src/cli/index.ts --lines 46 --statements 46 --branches 80 --functions 42",
     "coverage:cli:gate:local-server-guard": "npm run coverage:cli:gate -- --include src/cli/local-server-guard.ts --lines 100 --statements 100 --branches 96 --functions 100",
     "//coverage:cli:gate:observe": "cli/observe.ts is the read-only metrics dashboard behind `turbine observe`: a loopback HTTP server with its own session token, one-time login ticket, Host allowlist, Origin check, rate limit and CSP, in front of two queries that run in read-only transactions. It was in no coverage gate at all (about 48 percent of lines were executed by the suites that happened to touch it), while Studio, which shares its perimeter, was. Floors MEASURED 2026-10-13 by `npm run coverage:cli:collect`, read from the json-summary reporter: 100 lines / 100 statements / 99.13 branches / 100 functions. THE COLLECTION BLANKS DATABASE_URL, so the figures are the no-database ones: the live-Postgres tests in observe-cli.test.ts skip here and are not counted, and with a database the figure is 99.14 branches and otherwise identical. That is by design: the fake pool and the fake Postgres wire server in that file reach every line without a database. The one uncovered branch is the non-Error arm of the server's 500 handler (`String(err)`), which a real pg pool never produces. Floors sit 2 points under. Held by this per-file gate only and NOT listed in coverage:cli:gate:aggregate, the same arrangement as local-server-guard.ts: that aggregate was baselined over the larger files and adding a 100 percent file would only move it. Raise as coverage improves; never lower one without recording why.",
     "coverage:cli:gate:observe": "npm run coverage:cli:gate -- --include src/cli/observe.ts --lines 98 --statements 98 --branches 97 --functions 98",
@@ -166,6 +346,7 @@
     "format": "biome format --write src/",
     "check:error-codes": "tsx scripts/check-error-codes.ts",
     "gen:capabilities": "tsx scripts/gen-capability-table.ts",
+    "gen:engine-support": "tsx scripts/gen-engine-support.ts",
     "//check:error-prefix": "No message reaching a TurbineError may hand-write a `[turbine] ` prefix. formatErrorMessage prepends `[TURBINE_EXXX] ` unless the message already opens with that exact tag, and a hand-written `[turbine] ` never matches one, so the two stacked on roughly 355 of the package's throw sites. A prefix rule looks unnecessary because formatErrorMessage guarantees the [CODE] tag: true, and not the failure mode, which is the INTERACTION between the automatic tag and a manual one. Diagnostics that no code tag ever touches (console calls, stream writes, Studio HTTP bodies) keep the prefix and are named in the script's DIAGNOSTIC_SINKS.",
     "check:error-prefix": "node scripts/check-error-prefix.mjs",
     "check:changelog": "node scripts/check-changelog-headings.mjs",
@@ -182,6 +363,9 @@
     "check:edge": "node scripts/check-edge-bundle.mjs",
     "//check:pg-floor": "Installs the packed tarball next to EXACTLY the floor of dependencies.pg and imports every published entry point under both import and require. CI and dev machines only ever install the newest pg in range, so the floor is otherwise never exercised: a ^8.13.1 range shipped code that read pg.utils at load time, which pg first exports in 8.15.0, and 6 of the 8 entry points failed to import on 8.13 and 8.14. Packs dist/ itself when given no tarball, so it runs after `npm run build`. Called from prepublishOnly and from the pack-smoke job of both ci.yml and release.yml.",
     "check:pg-floor": "node scripts/check-pg-floor.mjs",
+    "check:optional-pg-transports": "node scripts/check-optional-pg-transports.mjs",
+    "test:optional-pg-transports": "node --test tooling/optional-pg-transports/harness.test.mjs",
+    "check:sql-fragments": "node scripts/check-sql-fragments.mjs",
     "prepublishOnly": "npm run build && npm run typecheck && npm run lint && npm run test:unit && npm run test:coverage:cli && npm run check:error-codes && npm run check:error-prefix && npm run check:changelog && npm run check:cycles && npm run check:skip-gates && npm run check:private-terms && npm run check:package && npm run check:package-types && npm run check:edge && npm run check:pg-floor && npm run size && npm run check:release-tests",
     "prepare": "node scripts/prepare.mjs",
     "prepack": "node scripts/strip-prepare.mjs",
@@ -196,10 +380,30 @@
     "site:deploy": "cd site && vercel --prod",
     "gen:studio": "node scripts/build-studio-ui.mjs",
     "pretypecheck": "npm run gen:studio",
-    "pretest": "npm run gen:studio",
-    "pretest:unit": "npm run gen:studio",
-    "pretest:coverage": "npm run gen:studio",
-    "pretest:coverage:cli": "npm run gen:studio"
+    "//pretest": "A full build, not just gen:studio (which prebuild still runs), before every whole-suite run: tests in the suite import dist/ or the package by name, which resolves to dist/. Without it a fresh checkout (every CI job) fails them, and a stale dist/ tests old code while the run reports green. pretest:unit and pretest:coverage do the same for the same reason.",
+    "pretest": "npm run build",
+    "pretest:unit": "npm run build",
+    "pretest:coverage": "npm run build",
+    "pretest:coverage:cli": "npm run gen:studio",
+    "//coverage:cli:gate:tools": "The SQLite file ownership/read-only adapter, versioned effective discovery and single-shot CLI dispatcher share the MCP perimeter. Real SQLite tests include write and PII refusal controls, cleanup/shutdown races and actual CLI/MCP processes. Focused baseline: 99.23 lines/statements, 92.79 branches, 100 functions. Each module is held separately, outside the established aggregate; existing floors are unchanged.",
+    "coverage:cli:gate:sqlite-tools": "npm run coverage:cli:gate -- --include src/cli/sqlite-tools.ts --lines 96 --statements 96 --branches 90 --functions 98",
+    "coverage:cli:gate:tool-capabilities": "npm run coverage:cli:gate -- --include src/cli/tool-capabilities.ts --lines 96 --statements 96 --branches 90 --functions 98",
+    "coverage:cli:gate:tool-command": "npm run coverage:cli:gate -- --include src/cli/tool-command.ts --lines 96 --statements 96 --branches 90 --functions 98",
+    "coverage:cli:gate:mssql-tools": "npm run coverage:cli:gate -- --include src/cli/mssql-tools.ts --lines 97 --statements 97 --branches 80 --functions 98",
+    "//coverage:cli:gate:loader": "cli/loader.ts decides how a user TypeScript config or schema file gets loaded at all: it probes the project tsx install, picks between its programmatic APIs and legacy entries, and reports the real registration failure when one occurs. It was in no coverage gate, so its fallback entries (the legacy tsx/cjs side effect, a manifest that is not exported, an API entry with no register()) were never run by any collected suite. Held by this per-file gate only and NOT in the aggregate, the same arrangement as cli/index.ts. MEASURED 2026-11-14 by `npm run coverage:cli:collect` (no database), read from the json-summary reporter: 98.44 lines / 98.44 statements / 95.91 branches / 100 functions; the only uncovered lines are the Node without module.register() refusal, which no supported Node in CI reaches. Floors sit about two points under. A new test file for cli/loader.ts must be added to coverage:cli:collect or its coverage does not count here.",
+    "coverage:cli:gate:loader": "npm run coverage:cli:gate -- --include src/cli/loader.ts --lines 96 --statements 96 --branches 93 --functions 98",
+    "test:neon-http": "tsx --test src/test/neon-http.test.ts",
+    "test:neon-http:driver": "TURBINE_REQUIRE_NEON_HTTP_DRIVER=1 tsx --test src/test/neon-http-driver.test.ts",
+    "test:neon-http:native": "TURBINE_REQUIRE_NEON_HTTP_NATIVE=1 tsx --test src/test/neon-http-native.test.ts",
+    "test:neon-http:package": "node src/test/fixtures/neon-http/package-check.mjs",
+    "test:libsql": "tsx --test src/test/libsql*.test.ts && node src/test/fixtures/libsql-package.mjs",
+    "test:core": "tsx --test src/test/driver-neutral.test.ts src/test/driver-neutral-imports.test.ts src/test/driver-neutral-parsers.test.ts",
+    "test:core:packed": "node scripts/test-core-d1.mjs core",
+    "test:d1": "node scripts/test-core-d1.mjs d1",
+    "test:d1:catalog": "node --import tsx --test --test-concurrency=1 src/test/d1-introspection.test.ts src/test/fixtures/d1-introspection/consumers.test.ts src/test/fixtures/d1-introspection/graph.test.ts",
+    "test:d1:generation": "node src/test/fixtures/d1-generation/run.mjs",
+    "test:d1:migrations": "node src/test/fixtures/d1-native-migrations/run.mjs",
+    "build:optional-package": "node scripts/build-optional-package.mjs"
   },
   "engines": {
     "node": ">=20.0.0"
@@ -227,13 +431,23 @@
     "publint": "^0.3.24",
     "size-limit": "^12.1.0",
     "tsx": "^4.23.15",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "@neondatabase/serverless": "^1.2.0",
+    "ws": "^8.18.3",
+    "@edge-runtime/vm": "^5.0.0",
+    "@libsql/client": "^0.18.0",
+    "miniflare": "4.20260730.0",
+    "@cloudflare/workers-types": "5.20261106.1"
   },
   "peerDependencies": {
     "@zvndev/powdb-client": ">=0.7.1 <1.0.0",
     "@zvndev/powdb-embedded": ">=0.7.1 <1.0.0",
     "mssql": "^10.0.0 || ^11.0.0 || ^12.0.0",
-    "mysql2": "^3.0.0"
+    "mysql2": "^3.0.0",
+    "@neondatabase/serverless": "^1.2.0",
+    "@libsql/client": "^0.18.0",
+    "better-sqlite3": "^12.11.1",
+    "miniflare": "4.20260730.0"
   },
   "peerDependenciesMeta": {
     "@zvndev/powdb-client": {
@@ -246,6 +460,18 @@
       "optional": true
     },
     "mysql2": {
+      "optional": true
+    },
+    "@neondatabase/serverless": {
+      "optional": true
+    },
+    "@libsql/client": {
+      "optional": true
+    },
+    "better-sqlite3": {
+      "optional": true
+    },
+    "miniflare": {
       "optional": true
     }
   },

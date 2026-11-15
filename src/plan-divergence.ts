@@ -170,7 +170,7 @@ export const PLAN_DIVERGENCE_THRESHOLDS = {
    * here claimed it was. The crossover grows as sqrt(limit), so raising the
    * limit moves BOTH gates: `rarestBucket < crossover` gets easier to satisfy
    * and `genericEstimate >= crossover` gets harder, and the second one can turn
-   * a finding off. 20 is simply a common first page. Every finding also reports
+   * a finding off. 20 is a common first page. Every finding also reports
    * the crossover at {@link wideLimit} so a caller paginating in thousands can
    * see where their own limit lands.
    */

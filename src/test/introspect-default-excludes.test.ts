@@ -1,5 +1,5 @@
 /**
- * turbine-orm: Default table exclusions (F12)
+ * turbine-orm: Default table exclusions
  *
  * Unit tests for `applyTableFilters` / `defaultExcludedTablesPresent`, the
  * single authority that turns a raw table list into the introspected set:

@@ -1,5 +1,5 @@
 /**
- * turbine-orm: keepColumnNames / withDbFieldNames (F4)
+ * turbine-orm: keepColumnNames / withDbFieldNames
  *
  * The opt-in flag rewrites generated column FIELD names to the raw DB column
  * names (snake_case) via a pure generate-time transform with ZERO runtime code
@@ -101,6 +101,25 @@ describe('withDbFieldNames', () => {
     assert.equal(users.relations.posts?.foreignKey, 'user_id');
     assert.deepEqual(users.primaryKey, ['id']);
     assert.equal(users.pgTypes.created_at, 'timestamptz');
+  });
+
+  it('skips a key a column proxy lists without a descriptor', () => {
+    const s = schema();
+    const users = s.tables.users!;
+    // A proxy may report a key from ownKeys that it then describes as absent.
+    const proxied = new Proxy(users.columns[1]!, {
+      ownKeys: (target) => [...Reflect.ownKeys(target), 'ghost'],
+      getOwnPropertyDescriptor: (target, key) =>
+        key === 'ghost' ? undefined : Reflect.getOwnPropertyDescriptor(target, key),
+    });
+    const t = withDbFieldNames({
+      ...s,
+      tables: { ...s.tables, users: { ...users, columns: [users.columns[0]!, proxied, ...users.columns.slice(2)] } },
+    }).tables.users!;
+    const renamed = t.columns[1]!;
+    assert.equal(renamed.field, 'full_name');
+    assert.equal(renamed.pgType, 'text');
+    assert.equal(Object.hasOwn(renamed, 'ghost'), false);
   });
 
   it('does not mutate the input schema', () => {

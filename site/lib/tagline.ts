@@ -18,6 +18,7 @@ const TAGLINE_OVERRIDES: Record<string, string> = {
   '0.92.0': 'Nested reads decode in one pass: users with posts 27% faster',
   '0.93.0': 'Every query on the turbine:query tracing channel, ready for any tracer',
   '0.93.1': 'Patch: JSON range filters skip nonnumeric values and preserve numeric strings',
+  '0.94.0': 'New engines and transports: better-sqlite3, libSQL, D1 and Neon, plus CLI projects beyond PostgreSQL',
 };
 
 /** The tagline shown in the landing hero badge. */

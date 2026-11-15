@@ -1,0 +1,16 @@
+import { turbine } from './generated/turbine/index.js';
+export async function generated(url:string){
+  const db=await turbine(url);
+  try{
+    const rows=await db.mailProjection.findMany({where:{tenant:'B',consumer:'mail'},select:{delivered:true},limit:1});
+    const n:number|undefined=rows[0]?.delivered;
+    if(n!==2)throw new Error('Generated native projection mismatch');
+    if(false){
+      // @ts-expect-error Generated columns reject unknown names.
+      await db.mailProjection.findMany({select:{missing:true}});
+      // @ts-expect-error Generated int field filters reject text.
+      await db.mailProjection.findMany({where:{delivered:'wrong'}});
+    }
+  }finally{await db.disconnect();}
+}
+await generated(process.env.MYSQL_URL!);

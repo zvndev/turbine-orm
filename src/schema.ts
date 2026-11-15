@@ -88,6 +88,12 @@ export interface ColumnMetadata {
   /** TypeScript type string (e.g. 'number', 'string', 'Date') */
   tsType: string;
   /**
+   * Explicit generation hint for an inferred binary intrinsic, not a runtime
+   * converter or proof of origin. Only own data values are admitted. Absent or
+   * undefined keeps legacy type text; declarations/columnTypes take precedence.
+   */
+  inferredBinaryType?: 'Uint8Array' | 'Buffer';
+  /**
    * The TypeScript type a `defineSchema()` file declared for this column, WITHOUT
    * `| null`. Only `turbine generate` reads it. Every engine branches on
    * {@link tsType}, which stays the type mapped from the database type (MySQL
@@ -154,6 +160,19 @@ export interface ColumnMetadata {
    * silently have its writes changed. Untagged schemas emit byte-identical SQL.
    */
   updatedAt?: boolean;
+  /**
+   * True when this MySQL ENUM column's labels could not be read exactly: the
+   * catalog reports `COLUMN_TYPE` in utf8mb3 and replaces every character
+   * outside the BMP with `?`, and a label holds `?` on a charset that can
+   * encode past the BMP (a literal question mark reads the same, so it is
+   * marked too). The column then has NO entry in `SchemaMetadata.enums` and is
+   * typed `string`, never a literal union built from the damaged catalog text,
+   * because such a union would name labels the column does not have and reject
+   * ones it does. An explicit `enums` entry for the column (caller-supplied
+   * exact labels) outranks the marker. Optional / defaults to `false`; set
+   * only by MySQL introspection.
+   */
+  enumLabelsUnrecoverable?: boolean;
   /** Whether this is an array column */
   isArray: boolean;
   /** Dialect-specific array/bulk-insert type token when needed. */
@@ -221,7 +240,23 @@ export function normalizeKeyColumns(key: string | string[]): string[] {
 
 export interface IndexMetadata {
   name: string;
+  /**
+   * The keys that are plain columns, in key order. An EXPRESSION key
+   * (`lower(email)`) names no column and is left out, so this is the index's
+   * whole key list only when it has no expression key, which `unique: true`
+   * guarantees.
+   */
   columns: string[];
+  /**
+   * The listed `columns` are unique TOGETHER: a UNIQUE index whose every key is
+   * a plain column. A UNIQUE index with an expression key reports `false`
+   * (`UNIQUE (kind, lower(slug))` does not make `kind` unique) and keeps its
+   * full `definition`, from which the database's own UNIQUE keyword can still be
+   * read. Every reader of this flag pairs it with `columns`: the one-row rule
+   * behind `findUnique` / `update` / `delete`, compound-unique selectors,
+   * relation cardinality and conflict targets. Combine it with `partial`, since
+   * a partial unique index is unique only over its predicate's rows.
+   */
   unique: boolean;
   definition: string;
   /**
@@ -624,7 +659,7 @@ export function singularize(s: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// keepColumnNames transform (F4)
+// keepColumnNames transform
 // ---------------------------------------------------------------------------
 
 /**
@@ -659,7 +694,32 @@ export function singularize(s: string): string {
 export function withDbFieldNames(schema: SchemaMetadata): SchemaMetadata {
   const tables: Record<string, TableMetadata> = {};
   for (const [tableKey, table] of Object.entries(schema.tables)) {
-    const columns = table.columns.map((col) => ({ ...col, field: col.name }));
+    const columns = table.columns.map((col) => {
+      const renamed = {} as ColumnMetadata;
+      // CopyDataProperties semantics for every other field, including getter
+      // receivers, order and symbols. Carry the hint descriptor without reading
+      // it, even when nonenumerable; generation validates it before use.
+      for (const key of Reflect.ownKeys(col)) {
+        const descriptor = Object.getOwnPropertyDescriptor(col, key);
+        if (!descriptor) continue;
+        if (key === 'inferredBinaryType') Object.defineProperty(renamed, key, descriptor);
+        else if (descriptor.enumerable) {
+          Object.defineProperty(renamed, key, {
+            value: Reflect.get(col, key),
+            enumerable: true,
+            configurable: true,
+            writable: true,
+          });
+        }
+      }
+      Object.defineProperty(renamed, 'field', {
+        value: col.name,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+      return renamed;
+    });
     const columnMap: Record<string, string> = {};
     const reverseColumnMap: Record<string, string> = {};
     for (const col of columns) {
@@ -679,7 +739,7 @@ export function withDbFieldNames(schema: SchemaMetadata): SchemaMetadata {
  * A typed name map from a Prisma schema onto a Turbine client, produced by
  * `turbine migrate-from-prisma` (`generatePrismaMap` writes it as a
  * `prisma-map.ts` module next to the generated client). It is library-side so
- * the phase-2 `turbine-orm/prisma-compat` runtime adapter can consume the same
+ * the `turbine-orm/prisma-compat` runtime adapter can consume the same
  * shape to translate Prisma model/field/relation/compound-unique names onto the
  * Turbine surface without re-parsing anything.
  *
@@ -733,7 +793,7 @@ export interface PrismaModelMap {
    * Prisma compound-unique/compound-id selector name → the Turbine field names
    * (in declared order). The selector name is Prisma's: the explicit
    * `@@unique(name:)` / `@@id(name:)` argument, else the field names joined with
-   * `_`. Consumed by the phase-2 client to translate
+   * `_`. Consumed by the Prisma-compatible client to translate
    * `where: { <selector>: { ... } }`, including custom `@@unique(name:)` names
    * the core `findUnique`-family derivation cannot know.
    */

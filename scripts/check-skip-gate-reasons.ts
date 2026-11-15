@@ -94,6 +94,11 @@ const NON_ENGINE_GATES: Readonly<Record<string, string>> = {
   'no generated @prisma/client to compare against':
     'Compares Turbine option surface against a REAL generated Prisma client, which is not a dependency ' +
     'of this repo and is not installed in CI. The check is opportunistic by design.',
+  'requires the optional better-sqlite3 peer (set TURBINE_SQLITE_BINDING_PEER)':
+    'The binding is an optional peer that is not in package-lock.json. Its requirement guard is ' +
+    'TURBINE_REQUIRE_SQLITE_BINDING=1, which makes the peer load THROW at module scope, so the job step ' +
+    'that installs the binding for this suite (in sqlite-migrations) fails rather than skips. No ' +
+    'TURBINE_REQUIRE_ENGINE token can claim it: every other job runs without the peer installed.',
   'tsx is not installed in node_modules (run npm ci)':
     'A missing devDependency, not a missing database. Unreachable in practice (this suite runs UNDER ' +
     'tsx), and no engine token should claim it, or a broken install would be reported as a database problem.',
@@ -421,11 +426,10 @@ const NODE_SQLITE_PROBE = /\(\s*['"`]node:sqlite['"`]\s*\)/;
  * {@link NON_ENGINE_GATES}: an entry here suppresses a build failure.
  */
 const UNGATED_ENGINE_IMPORTS: Readonly<Record<string, string>> = {
-  // Empty, and that is the result rather than an oversight: with the check
-  // scoped to the `turbineSqlite()` call, every one of the 20 call sites in
-  // src/test/** is genuinely gated. The escape hatch stays because the next file
-  // that legitimately needs it should record WHY here rather than widen the
-  // pattern, on the same rule as NON_ENGINE_GATES above.
+  'src/test/d1-generation.test.ts':
+    'Pure generation and emitter-drift controls inspect a string containing turbineSqlite(target, SCHEMA); ' +
+    'the function is neither imported nor called. The complete suite passes on Node20 without node:sqlite. ' +
+    'Real D1 execution is separately required in the native workerd packed gate.',
 };
 
 let engineFilesChecked = 0;

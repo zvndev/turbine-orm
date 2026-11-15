@@ -46,6 +46,7 @@ import type { DeferredQuery } from '../query/deferred.js';
 import type { SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, turbineSqlite } from '../sqlite.js';
 import { makeQuery, mockTable, skipGate } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 // ---------------------------------------------------------------------------
 // Fixture. Every column's two spellings DIFFER (a name like `id` or `title` is
@@ -750,9 +751,10 @@ describe('column spelling symmetry: both spellings return the same ROWS', () => 
   let execDb: DatabaseSyncType;
   let execClient: TurbineClient;
 
-  beforeEach(() => {
+  beforeEach((t) => {
+    assert.ok('after' in t, 'beforeEach must receive a test context');
     if (!DatabaseSync) return;
-    execDb = new DatabaseSync(':memory:');
+    execDb = closeSqliteAfter(new DatabaseSync(':memory:'), t.after.bind(t));
     execDb.exec('PRAGMA foreign_keys = ON');
     execDb.exec(EXEC_SCHEMA_SQL);
     // Deliberately uneven: an author with no articles exercises the empty

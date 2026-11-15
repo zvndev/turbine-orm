@@ -40,9 +40,18 @@
  */
 
 import { ValidationError } from '../errors.js';
+import { isInternalCombinator, ownLookup, resolveColumnName, resolveRelationDef } from '../query-utils.js';
 import type { TableMetadata } from '../schema.js';
-import { isArrayFilter, isJsonFilter, isPlainRecord, isVectorFilter, isWhereOperator } from './filters.js';
-import { isInternalCombinator, ownLookup, resolveColumnName, resolveRelationDef } from './utils.js';
+import {
+  assertEqualityOperand,
+  columnOperandKind,
+  hasArrayHole,
+  isArrayFilter,
+  isJsonFilter,
+  isPlainRecord,
+  isVectorFilter,
+  isWhereOperator,
+} from './filters.js';
 
 const syntheticKeyCache = new WeakMap<TableMetadata, Map<string, string[]>>();
 
@@ -55,17 +64,7 @@ function syntheticKeyMap(meta: TableMetadata): Map<string, string[]> {
   const cached = syntheticKeyCache.get(meta);
   if (cached) return cached;
 
-  const columnSets: string[][] = [];
-  const push = (cols: string[]): void => {
-    if (cols.length >= 2) columnSets.push(cols);
-  };
-  push(meta.primaryKey);
-  for (const uc of meta.uniqueColumns) push(uc);
-  for (const idx of meta.indexes) {
-    // A PARTIAL unique index only guarantees uniqueness over its predicate's
-    // rows, not table-wide, so it can never back a compound-unique selector.
-    if (idx.unique && !idx.docPath && !idx.partial && idx.columns.length >= 2) push(idx.columns);
-  }
+  const columnSets = uniqueColumnSets(meta).filter((cols) => cols.length >= 2);
 
   // Names that must never be shadowed by a synthetic selector.
   const reserved = new Set<string>();
@@ -246,10 +245,7 @@ export function assertWhereIdentifiesOneRow(
   where: Record<string, unknown> | undefined,
 ): void {
   if (whereIdentifiesOneRow(meta, where ?? {})) return;
-  const field = (c: string): string => meta.reverseColumnMap[c] ?? c;
-  const keys = uniqueKeyNames(meta).map((cols) =>
-    cols.length === 1 ? `\`${field(cols[0] as string)}\`` : `\`{ ${cols.map(field).join(', ')} }\``,
-  );
+  const keys = describeUniqueKeys(meta);
   const advice =
     keys.length > 0
       ? `Name a unique key (${keys.join(', ')}), or use \`findFirst\` if you meant "any row matching a filter".`
@@ -454,9 +450,8 @@ export function whereIdentifiesOneRow(meta: TableMetadata, where: Record<string,
   }
   const pinned = new Set<string>();
   for (const [key, value] of Object.entries(where)) {
-    if (!isPinnedToOneValue(value)) continue;
     const column = resolveColumnName(meta, key);
-    if (column !== undefined) pinned.add(column);
+    if (column !== undefined && isPinnedToOneValue(meta, column, value)) pinned.add(column);
   }
   if (pinned.size === 0) return false;
   return uniqueColumnSets(meta).some((cols) => cols.every((c) => pinned.has(c)));
@@ -470,18 +465,24 @@ export function whereIdentifiesOneRow(meta: TableMetadata, where: Record<string,
  * keys>)` (or PowDB's `upsert ... on`) compares the conflict columns against
  * the values being INSERTED, which are `create`'s, and never reads `where`'s
  * values at all. The two agree exactly when every `where` key is pinned to the
- * value `create` carries for that column. Otherwise the statement answers a
+ * value `create` carries for that column AND `where`'s columns are exactly one
+ * unique key ({@link upsertWhereIsOneKey}). Otherwise the statement answers a
  * different question: `where: { id: 5 }` with a `create` that leaves `id` to
  * its sequence inserted a new row every time and never touched row 5, and
  * `where: { email: a }` with `create: { email: b }` updated the row holding
- * `b`, silently.
+ * `b`, silently. And `where: { id, note }` (a key plus a column that narrows)
+ * names no conflict target: PostgreSQL and SQLite reject `ON CONFLICT ("id",
+ * "note")`, and MySQL's `ON DUPLICATE KEY UPDATE`, which has no target, updated
+ * the row holding `id` whatever its `note`.
  *
  * Shared by every engine, like the one-row rule above: each one decides here
  * whether it may take its single-statement fast path, and looks the row up by
  * `where` first when it may not. `false` is always a SAFE answer (the lookup
  * path is correct for every shape, only slower), so anything this does not
  * recognise as a plain matching value answers `false`: an operator other than a
- * bare `equals`, a different object (two Dates compare by instant), a key that
+ * bare `equals`, a different object (two Dates compare by instant, two
+ * arrays on an array column element by element; anything else by identity,
+ * so a JSON array never matches a copy of itself), a key that
  * names no column, and NULL, which a unique index never treats as equal to
  * anything.
  */
@@ -496,16 +497,37 @@ export function upsertWhereMatchesCreate(
     const column = resolveColumnName(meta, key);
     if (column !== undefined) createByColumn.set(column, value);
   }
-  let keys = 0;
+  let pinned = false;
   for (const [key, raw] of Object.entries(expandCompoundUniqueWhere(meta, where))) {
     if (raw === undefined) continue;
     const column = resolveColumnName(meta, key);
     if (column === undefined || !createByColumn.has(column)) return false;
     const value = isBareEquals(raw) ? (raw as { equals: unknown }).equals : raw;
-    if (!sameKeyValue(value, createByColumn.get(column))) return false;
-    keys++;
+    if (!sameKeyValue(value, createByColumn.get(column), Array.isArray(value) && isArrayColumn(meta, column))) {
+      return false;
+    }
+    pinned = true;
   }
-  return keys > 0;
+  return pinned && upsertWhereIsOneKey(meta, where);
+}
+
+/**
+ * Whether `where`'s columns (a compound selector expanded, `undefined` keys
+ * dropped) are exactly one unique key: the primary key, a unique column set or
+ * a non-partial unique index. That is all one conflict statement can name:
+ * `ON CONFLICT (...)` infers its index from exactly the columns it lists, and
+ * a column beside the key narrows the match, which only a lookup by `where`
+ * answers. A key that names no column is not one.
+ */
+export function upsertWhereIsOneKey(meta: TableMetadata, where: Record<string, unknown>): boolean {
+  const columns = new Set<string>();
+  for (const [key, raw] of Object.entries(expandCompoundUniqueWhere(meta, where))) {
+    if (raw === undefined) continue;
+    const column = resolveColumnName(meta, key);
+    if (column === undefined) return false;
+    columns.add(column);
+  }
+  return uniqueColumnSets(meta).some((cols) => cols.length === columns.size && cols.every((c) => columns.has(c)));
 }
 
 /**
@@ -578,13 +600,48 @@ function isBareEquals(value: unknown): boolean {
   return isPlainRecord(value) && Object.keys(value).length === 1 && 'equals' in value;
 }
 
-/** Equal non-null key values; two Dates compare by instant, other objects by identity. */
-function sameKeyValue(a: unknown, b: unknown): boolean {
+/**
+ * Equal non-null key values; two Dates compare by instant, other objects by
+ * identity. On an array column (`arrayColumn`, decided by
+ * {@link isArrayColumn}) two arrays compare element by element, the way
+ * whole-array equality and the unique index over it do: a NULL element is a
+ * value there, equal to another NULL, unlike the column-level NULL refused
+ * here. An array with a hole never matches: the driver would bind the hole as
+ * NULL while `every` would skip it, and the where compiler refuses it.
+ * Anywhere else an array keeps the identity comparison, so a JSON array never
+ * matches a copy of itself and keeps the lookup path.
+ */
+function sameKeyValue(a: unknown, b: unknown, arrayColumn: boolean): boolean {
+  if (arrayColumn && Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!(i in a) || !(i in b)) return false;
+      if (a[i] === null ? b[i] !== null : !sameKeyValue(a[i], b[i], true)) return false;
+    }
+    return true;
+  }
   return a != null && (a instanceof Date && b instanceof Date ? a.getTime() === b.getTime() : a === b);
 }
 
 /**
+ * Whether `column` is an array column: the where compiler's own answer
+ * ({@link columnOperandKind}), so a value this rule counts as a whole-array key
+ * is exactly one the compiler binds as `"tags" = $1`, and no array value on a
+ * column it compares as a scalar can count.
+ */
+function isArrayColumn(meta: TableMetadata, column: string): boolean {
+  return columnOperandKind(meta, column) === 'array';
+}
+
+/**
  * A bare scalar, or `{ equals: <scalar> }` (optionally with `mode: 'default'`).
+ * On an ARRAY column ({@link isArrayColumn}) the same two spellings with an
+ * array value pin it too: the where compiler emits whole-array equality
+ * (`"tags" = $1`, the array as one parameter) for both, and a unique index
+ * over an array column admits one row per array value, the empty array
+ * included. The array OPERATORS (`has`, `hasEvery`, `hasSome`, `isEmpty`) are
+ * not equalities and never pin, and neither does an array value on any other
+ * column.
  *
  * Nothing else pins a column, and the refusals are the point. A column
  * reference (`{ equals: col('id') }`, or the plain `{ col }` a request body
@@ -594,16 +651,31 @@ function sameKeyValue(a: unknown, b: unknown): boolean {
  * casing of the value, and a JSON / array / vector filter narrows rather than
  * identifies.
  */
-function isPinnedToOneValue(value: unknown): boolean {
-  if (isIdentityScalar(value)) return true;
+function isPinnedToOneValue(meta: TableMetadata, column: string, value: unknown): boolean {
+  if (isIdentityScalar(value) || isWholeArrayKey(meta, column, value)) return true;
   if (!isPlainRecord(value)) return false;
   const keys = Object.keys(value).filter((k) => value[k] !== undefined);
   const op = value as { equals?: unknown; mode?: unknown };
   return (
     keys.every((k) => k === 'equals' || (k === 'mode' && op.mode === 'default')) &&
     keys.includes('equals') &&
-    isIdentityScalar(op.equals)
+    (isIdentityScalar(op.equals) || isWholeArrayKey(meta, column, op.equals))
   );
+}
+
+/**
+ * A whole array on an array column whose elements the where compiler binds as
+ * an equality operand: NULL, a scalar, or a nested array (the `fitsColumn`
+ * rule in filters.ts). An array with a hole at any depth is refused with the
+ * compiler's own E003, naming the column, rather than read as identifying a
+ * row: the driver binds a hole as NULL, so `new Array(1)` is `{NULL}` on the
+ * server whatever a skipping check concluded.
+ */
+function isWholeArrayKey(meta: TableMetadata, column: string, value: unknown): boolean {
+  if (!Array.isArray(value) || !isArrayColumn(meta, column)) return false;
+  if (hasArrayHole(value)) assertEqualityOperand(value, { column, table: meta.name, kind: 'array' });
+  for (const el of value) if (el !== null && !Array.isArray(el) && !isIdentityScalar(el)) return false;
+  return true;
 }
 
 /** A non-null scalar a unique index compares by value. */

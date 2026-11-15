@@ -30,7 +30,7 @@
  *     than the average custom plan and get promoted under the default `auto`.
  *   - tenant 1 is SPARSE (500 rows) and clustered at the end of the id order,
  *     so a generic plan costed for ~3.3k rows prefers an ordered primary-key
- *     scan under `ORDER BY id LIMIT n` and has to discard essentially the whole
+ *     scan under `ORDER BY id LIMIT n` and has to discard nearly the whole
  *     table before it finds a match, while the custom plan takes a 12-buffer
  *     bitmap scan.
  *
@@ -233,8 +233,8 @@ async function sparseFixtureDiverges(db: TurbineClient): Promise<string | null> 
     // reader: anything but the ordered walk. `no-flip` is a Sort bounding the
     // work or a seq scan at the table, either of which costs what it costs
     // whatever the parameter is; `unknown` means the plan could not be read at
-    // all, and inferring a plan from buffer counts on top of a plan we could not
-    // parse is not a measurement.
+    // all. Inferring a plan from buffer counts when that plan could not be parsed
+    // is not a measurement.
     const custom = await probeVerdict(db, 'force_custom_plan', String(SPARSE_TENANT));
     if (custom.verdict !== 'no-flip') {
       return (
@@ -573,7 +573,7 @@ describe('forceCustomPlan against a live plan cache', () => {
         // The MAGNITUDE, though, is the backend's call, not Turbine's, and
         // asserting it unconditionally made this test fail on a freshly seeded
         // database with `forced=45854 default=45854`. Promotion happened (the
-        // assertion above proves it) and the promoted generic plan was simply
+        // assertion above proves it) and the promoted generic plan was
         // the SAME plan as the custom one. That is allowed and documented:
         // `plan_cache_mode = auto` promotes only when the generic plan is not
         // estimated to cost more, so on some statistics it promotes to a plan

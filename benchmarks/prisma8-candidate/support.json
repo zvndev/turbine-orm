@@ -1,0 +1,1314 @@
+{
+  "formatVersion": 1,
+  "appendix": "prisma8-postgres-candidate",
+  "engines": {
+    "postgresql": "implemented",
+    "mysql": "unsupported",
+    "sqlite": "unsupported",
+    "mongodb": "unsupported"
+  },
+  "measurementStatus": "unmeasured",
+  "catalog": [
+    {
+      "id": "headline-0",
+      "scenario": "findMany, 100 users (flat)",
+      "group": "headline",
+      "index": 0,
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "headline-1",
+      "scenario": "findMany, 50 users + posts (L2)",
+      "group": "headline",
+      "index": 1,
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "headline-2",
+      "scenario": "findMany, 10 users -> posts -> comments (L3)",
+      "group": "headline",
+      "index": 2,
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "headline-3",
+      "scenario": "findUnique, single user by PK",
+      "group": "headline",
+      "index": 3,
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "headline-4",
+      "scenario": "findUnique, user + posts + comments (L3)",
+      "group": "headline",
+      "index": 4,
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "headline-5",
+      "scenario": "count, all users",
+      "group": "headline",
+      "index": 5,
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "headline-6",
+      "scenario": "stream, iterate 50K comments (batch 1000)",
+      "group": "headline",
+      "index": 6,
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "buffered-full-drain",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "buffered-full-drain",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "implemented",
+          "route": "native-pg-cursor-full-drain",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "implemented",
+          "route": "native-pg-cursor-full-drain",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "headline-7",
+      "scenario": "atomic increment, posts.view_count + 1",
+      "group": "headline",
+      "index": 7,
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "refused",
+          "reason": "No atomic field-expression update in this typed ORM adapter; raw SQL is not a typed ORM feature.",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "headline-8",
+      "scenario": "pipeline, 5-query dashboard batch",
+      "group": "headline",
+      "index": 8,
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "refused",
+          "reason": "No matching autocommit pipeline API implemented. Independent parallel reads and sequential reads are separate scenarios.",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "refused",
+          "reason": "No matching autocommit pipeline API implemented. Independent parallel reads and sequential reads are separate scenarios.",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "headline-9",
+      "scenario": "transaction, 5-query dashboard batch",
+      "group": "headline",
+      "index": 9,
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "transaction-sequential",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "transaction-sequential",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "headline-10",
+      "scenario": "hot findUnique, rotating IDs",
+      "group": "headline",
+      "index": 10,
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "comments-5000",
+      "group": "large",
+      "scenario": "findMany, 5,000 comments (flat)",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "comments-50000",
+      "group": "large",
+      "scenario": "findMany, 50,000 comments (flat)",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "wide-1000",
+      "group": "large",
+      "scenario": "findMany, 1,000 rows x 39 columns (wide)",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "list-page3",
+      "group": "list",
+      "scenario": "list, published posts in org 1, newest first (page 3)",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "list-deep",
+      "group": "list",
+      "scenario": "list, published posts in org 1, newest first (deep offset)",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "to-one",
+      "group": "relations",
+      "scenario": "to-one, 500 posts + author",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "many-to-many",
+      "group": "relations",
+      "scenario": "many-to-many, 200 posts + tags through a junction",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "relation-count",
+      "group": "relations",
+      "scenario": "relation _count, 100 users + their post count",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "relation-filter",
+      "group": "relations",
+      "scenario": "relation filter, 100 users having a published post",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "group-by",
+      "group": "agg",
+      "scenario": "groupBy org, count + avg views, having count > 100",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "create-many",
+      "group": "writes",
+      "scenario": "createMany, 1,000 rows",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "update",
+      "group": "writes",
+      "scenario": "update by primary key",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "upsert",
+      "group": "writes",
+      "scenario": "upsert on a unique column (update path)",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "delete",
+      "group": "writes",
+      "scenario": "delete by unique column",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "raw-sql",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "typed-orm",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "strategy-many",
+      "group": "strategy",
+      "scenario": "strategy (to-many), 200 users + posts",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "refused",
+          "reason": "No equivalent strategy selector implemented or admitted in this candidate lane.",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "refused",
+          "reason": "No equivalent strategy selector implemented or admitted in this candidate lane.",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "strategy-one",
+      "group": "strategy",
+      "scenario": "strategy (to-one), 500 posts + author",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "refused",
+          "reason": "No equivalent strategy selector implemented or admitted in this candidate lane.",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "refused",
+          "reason": "No equivalent strategy selector implemented or admitted in this candidate lane.",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "cold-user",
+      "group": "cold",
+      "scenario": "cold start, first query on a fresh client",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "refused",
+          "reason": "Fresh-client connection/query/disposal boundary not implemented in this slice.",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "refused",
+          "reason": "Fresh-client connection/query/disposal boundary not implemented in this slice.",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "dashboard-independent",
+      "scenario": "5-query dashboard, independent reads",
+      "group": "appendix",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "independent",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "independent",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    },
+    {
+      "id": "dashboard-sequential",
+      "scenario": "5-query dashboard, sequential reads",
+      "group": "appendix",
+      "arms": {
+        "Raw pg 8.22.0": {
+          "status": "implemented",
+          "route": "sequential",
+          "metrics": null
+        },
+        "Prisma 8 buffered": {
+          "status": "implemented",
+          "route": "sequential",
+          "metrics": null
+        },
+        "Prisma 8 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Raw pg 8.22.0 cursor batch1000": {
+          "status": "refused",
+          "reason": "Only the ordered full comments drain has a cursor variant.",
+          "metrics": null
+        },
+        "Turbine": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle stable": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Drizzle RC": {
+          "status": "optional-input-required",
+          "metrics": null
+        },
+        "Prisma 7": {
+          "status": "optional-input-required",
+          "metrics": null
+        }
+      }
+    }
+  ]
+}

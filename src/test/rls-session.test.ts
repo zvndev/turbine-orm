@@ -169,7 +169,7 @@ testFn('rls session-context integration', () => {
   // superuser with rolbypassrls=true, which skips ALL row-level security
   // regardless of FORCE. To actually prove the policy filters, each test
   // transaction SET LOCAL ROLEs to this constrained role.
-  const RLS_ROLE = 'w3_rls_role';
+  const RLS_ROLE = 'test_rls_role';
 
   before(async () => {
     // Bootstrap the RLS table on a raw connection first so introspection sees it.
@@ -227,14 +227,14 @@ testFn('rls session-context integration', () => {
   });
 
   // Helper: run a SELECT on the RLS table INSIDE a $transaction with the given
-  // session context. We SET LOCAL ROLE to the NOBYPASSRLS role first (also
+  // session context. SET LOCAL ROLE to the NOBYPASSRLS role first (also
   // transaction-local, auto-resets on COMMIT) so RLS is actually enforced, then
   // run the SELECT, both on the transaction's own connection, so the GUCs set
   // by sessionContext apply.
   const selectTenants = (ctx?: Record<string, string>) =>
     client.$transaction(
       async (tx) => {
-        await tx.raw`SET LOCAL ROLE w3_rls_role`;
+        await tx.raw`SET LOCAL ROLE test_rls_role`;
         return tx.raw<{ tenant: string }>`SELECT tenant FROM "_w3_rls_docs" ORDER BY id`;
       },
       ctx ? { sessionContext: ctx } : undefined,

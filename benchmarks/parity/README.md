@@ -97,7 +97,7 @@ These are documented in `run.ts` / `normalize.ts` at the point they're handled.
    (same instant, different JS type/format), not a data error. `normalize.ts`
    collapses any ISO-8601 timestamp string and any `Date` to one canonical
    `toISOString()` instant before comparing, so genuine instant differences are
-   still caught (verified). **Flagged for the PM as a minor consistency
+    still caught (verified). **A minor consistency
    nit, not fixed here (parity harness must not edit `src/`).**
 
 3. **bigint representation.** Prisma returns `BIGINT` PKs/FKs as JS `bigint`;

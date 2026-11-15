@@ -10,10 +10,6 @@
  * text was already computing correctly ("Did you mean ...?"). A system that can
  * name the intended relation can accept it.
  *
- * Found by the agent eval, not by review: after the column fix landed, 65% of
- * the remaining failures across three models were a model reading the schema
- * and writing the table's own spelling back.
- *
  * THE SHAPE OF THIS SUITE IS THE POINT, and it mirrors its sibling exactly. One
  * list of surfaces, four questions asked of every one of them by construction:
  *
@@ -45,6 +41,7 @@ import { resolveRelation } from '../query/utils.js';
 import type { SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, turbineSqlite } from '../sqlite.js';
 import { makeQuery, mockTable, skipGate } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 // ---------------------------------------------------------------------------
 // Fixture. Every relation name is MULTI-WORD, because a single-word relation
@@ -329,9 +326,10 @@ describe('relation spelling symmetry: both spellings return the same ROWS', () =
   let execClient: TurbineClient;
   let execSchema: SchemaMetadata;
 
-  beforeEach(() => {
+  beforeEach((t) => {
+    assert.ok('after' in t, 'beforeEach must receive a test context');
     if (!DatabaseSync) return;
-    execDb = new DatabaseSync(':memory:');
+    execDb = closeSqliteAfter(new DatabaseSync(':memory:'), t.after.bind(t));
     execDb.exec('PRAGMA foreign_keys = ON');
     execDb.exec(EXEC_SCHEMA_SQL);
     // Uneven on purpose: an author with no posts exercises the empty relation.

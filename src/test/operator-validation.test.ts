@@ -1,7 +1,7 @@
 /**
  * turbine-orm, Strict operator validation tests
  *
- * Build-only tests (no DB) that verify TASK-2.2: passing a JSON or array
+ * Build-only tests (no DB) that verify that passing a JSON or array
  * filter operator on a column whose type does not support it now throws
  * `ValidationError` instead of silently dropping the filter.
  *

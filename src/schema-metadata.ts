@@ -262,8 +262,9 @@ export function declaredTagsOf(config: ColumnConfig): CodeFirstColumnTags {
  *   - Column-level `primaryKey` and table-level composite `primaryKey`.
  *   - `unique: true` columns → single-column `uniqueColumns` entries.
  *   - `references:` FKs → `belongsTo` (child) + `hasMany` (parent) relations,
- *     including `onDelete`/`onUpdate` actions (the `'no action'` default is
- *     omitted, matching introspection).
+ *     `hasOne` when the FK column is a unique key (see below), including
+ *     `onDelete`/`onUpdate` actions (the `'no action'` default is omitted,
+ *     matching introspection).
  *   - Pure junction tables → auto-detected `manyToMany` relations (same
  *     conservative rules as introspection).
  *   - Explicit `manyToMany` declarations → merged additively.
@@ -279,8 +280,15 @@ export function declaredTagsOf(config: ColumnConfig): CodeFirstColumnTags {
  * What SchemaDef cannot express (and how it degrades):
  *   - Views → never marked (`isView` is introspection-only).
  *   - Composite foreign keys → `references:` is single-column by design.
+ *
+ * A foreign key whose column is exactly a unique key of its own table (the
+ * primary key, a `unique: true` column or a declared unique index) gets a
+ * to-one reverse relation named with the singular of that table
+ * (`users.profile`, `hasOne`), which is what PostgreSQL introspection derives
+ * for the same schema. `options.legacyToManyUniques: true` keeps the earlier
+ * output instead: `hasMany`, named with the plural (`users.profiles`).
  */
-export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
+export function schemaDefToMetadata(def: SchemaDef, options: { legacyToManyUniques?: boolean } = {}): SchemaMetadata {
   // ----- Pass 1: resolve every table's snake_case names for FK lookups -----
   // Lookup accepts the accessor key (camelCase), the DDL name (snake_case),
   // and the explicit `accessor` field, same tolerance as schema-sql.ts.
@@ -321,7 +329,7 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
     }
   }
 
-  // ----- Pass 3: derive belongsTo / hasMany relations (SHARED with introspect)
+  // ----- Pass 3: derive belongsTo / hasMany / hasOne relations (SHARED with introspect)
   //
   // Delegates to the exact same builder introspection uses
   // (`buildRelationsFromForeignKeys`), so the same logical schema yields
@@ -376,11 +384,29 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
     );
   }
 
+  // The column sets that hold at most one row per value, the same sets
+  // PostgreSQL introspection reads from the pushed schema's catalog: the
+  // primary key, every `unique: true` column and every declared unique index.
+  // A foreign key over exactly one of them has a to-one reverse relation.
+  const uniqueSetsByTable = new Map<string, string[][]>();
+  for (const tableDef of Object.values(def.tables)) {
+    const sets: string[][] = [];
+    if (tableDef.primaryKey && tableDef.primaryKey.length > 0) sets.push(tableDef.primaryKey.map(camelToSnake));
+    for (const [field, config] of Object.entries(tableDef.columns)) {
+      if (config.isPrimaryKey || config.isUnique) sets.push([camelToSnake(field)]);
+    }
+    for (const idx of tableDef.indexes ?? []) {
+      if (idx.unique && !isDocFieldIndexDef(idx)) sets.push(idx.columns.map(camelToSnake));
+    }
+    uniqueSetsByTable.set(tableDef.name, sets);
+  }
+
   const relationsByTable = buildRelationsFromForeignKeys(
     fkEntries,
     columnFieldsByTable,
     fkActions,
     unknownTypedFieldsByTable,
+    options.legacyToManyUniques ? undefined : uniqueSetsByTable,
   );
 
   // ----- Pass 4: conservative junction auto-m2m (SHARED with introspect) ---
@@ -456,6 +482,7 @@ export function schemaDefToMetadata(def: SchemaDef): SchemaMetadata {
         ...declaredTags,
         // Always the mapped type. A declared `tsType` rides along separately.
         tsType: pgTypeToTs(wireType, nullable),
+        ...(config.type === 'BYTEA' && declaredTsType === undefined ? { inferredBinaryType: 'Buffer' as const } : {}),
         ...(declaredTsType !== undefined ? { declaredTsType } : {}),
       };
       columns.push(col);

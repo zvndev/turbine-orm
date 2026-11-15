@@ -1,7 +1,7 @@
 /**
  * turbine-orm, Unlimited findMany warning tests
  *
- * Verifies TASK-2.3: calling `findMany()` without an explicit `limit`/`take`
+ * Verifies that calling `findMany()` without an explicit `limit`/`take`
  * triggers a one-time `console.warn` per table. The warning is on by default
  * (`warnOnUnlimited` defaults to `true`) and can be silenced by passing
  * `warnOnUnlimited: false` in the QueryInterface options.

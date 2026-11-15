@@ -36,6 +36,7 @@ import {
   type StudioOptions,
 } from '../cli/studio.js';
 import { createDemoContext } from '../cli/studio-demo.js';
+import { closeSqliteContextAfter } from './sqlite-fixture-lifetime.js';
 import { studioTestStateDir } from './studio-test-state.js';
 
 const STATE_DIR = studioTestStateDir();
@@ -120,7 +121,7 @@ async function postBuilder(ctx: StudioContext, table: string, args: unknown): Pr
  * exactly what `startStudio` does when `loadPiiTags(...).scan.ok` is false.
  */
 function failClosedCtx(): { ctx: StudioContext; forced: number } {
-  const demo = createDemoContext();
+  const demo = closeSqliteContextAfter(createDemoContext());
   // `createDemoContext` hands back the shared DEMO_SCHEMA constant, and
   // force-tagging mutates in place (that is the point: the enforcement points
   // read the tags off the metadata). Clone so one test cannot tag the schema
@@ -169,7 +170,7 @@ describe('Studio: an unreadable PII tag scan is not "no PII"', () => {
   });
 
   it('force-tags every column, and says how many', () => {
-    const metadata = structuredClone(createDemoContext().metadata);
+    const metadata = structuredClone(closeSqliteContextAfter(createDemoContext()).metadata);
     const total = Object.values(metadata.tables).reduce((n, t) => n + t.columns.length, 0);
     const alreadyTagged = Object.values(metadata.tables).reduce(
       (n, t) => n + t.columns.filter((c) => c.pii === true).length,
@@ -223,7 +224,7 @@ describe('Studio: an unreadable PII tag scan is not "no PII"', () => {
     // The same trap without the fail-closed posture: a schema that genuinely
     // tags every column of a table. Before this, the response was the
     // database's syntax error for `SELECT  FROM "users"`.
-    const demo = createDemoContext();
+    const demo = closeSqliteContextAfter(createDemoContext());
     const metadata = structuredClone(demo.metadata);
     for (const col of metadata.tables.users?.columns ?? []) col.pii = true;
     const ctx = { ...failClosedCtx().ctx, metadata, piiScanFailed: undefined };
@@ -259,7 +260,7 @@ describe('Studio: an unreadable PII tag scan is not "no PII"', () => {
   });
 
   it('reports nothing when the scan succeeded (the banner is not always-on)', async () => {
-    const demo = createDemoContext();
+    const demo = closeSqliteContextAfter(createDemoContext());
     const options: StudioOptions = {
       url: 'demo://in-memory',
       schema: 'public',

@@ -277,8 +277,8 @@ function quotedTrackingTable(dialect: Dialect): string {
 }
 
 /**
- * Postgres error codes that mean "someone else created this table between our
- * existence check and our CREATE".
+ * Postgres error codes that mean "someone else created this table between the
+ * existence check and CREATE".
  *
  * `CREATE TABLE IF NOT EXISTS` is NOT race-free: the existence check and the
  * catalog insert are separate steps, so two concurrent sessions can both pass
@@ -314,7 +314,7 @@ export async function ensureTrackingTable(
     await client.query(sql);
   } catch (err) {
     if (!TABLE_ALREADY_EXISTS_CODES.has(String((err as { code?: string }).code))) throw err;
-    // The winner has committed by the time we see its error, so the retry finds
+    // The winner has committed by the time its error is received, so the retry finds
     // the table present and the statement really is a no-op. Retried ONCE: a
     // second failure is not this race and must surface.
     await client.query(sql);
@@ -481,7 +481,7 @@ export function listMigrationFiles(migrationsDir: string): MigrationFile[] {
  * name lacks the `YYYYMMDDHHMMSS_<name>.sql` shape {@link listMigrationFiles}
  * requires (a hand-written `add_thing.sql`, a 13-digit prefix, an upper-case
  * `.SQL` extension). Such a file used to be skipped in silence by `status`,
- * `up` and `deploy` alike, so a misnamed migration simply never ran and
+ * `up` and `deploy` alike, so a misnamed migration never ran and
  * nothing said so. The CLI prints one warning per entry.
  *
  * The extension is matched in any case here and only in lower case by the
@@ -647,7 +647,7 @@ function checksum(content: string): string {
 /**
  * The pre-v0.6 checksum algorithm (a 32-bit rolling hash rendered as base36).
  * Kept verbatim so a legacy stored value can be RE-DERIVED from the current
- * file content before we upgrade the row to SHA-256. Never used for new rows.
+ * file content before upgrading the row to SHA-256. Never used for new rows.
  */
 function legacyChecksum(content: string): string {
   let hash = 0;
@@ -1791,7 +1791,7 @@ export async function migrateUp(
     /**
      * Wait up to this many milliseconds for another migration to release the
      * lock, instead of failing at once. The pending list is read AFTER the lock
-     * is taken, so whatever the other run applied is simply no longer pending.
+     * is taken, so whatever the other run applied is no longer pending.
      */
     lockWaitMs?: number;
     /** Called once when the lock is held by someone else and the wait begins. */
@@ -1839,19 +1839,17 @@ export async function migrateUp(
       // Validate checksums of already-applied migrations.
       // Drift = an APPLIED migration's on-disk file has changed (or been deleted)
       // since it was run. Either situation means the database state and the
-      // migration history no longer agree, so we BLOCK the run by default.
+      // migration history no longer agree, so BLOCK the run by default.
       // Users can pass `allowDrift: true` (CLI: `--allow-drift`) to force past
       // the block when they are intentionally rewriting history.
       // Computed on BOTH paths. Without the flag a mismatch blocks the run;
       // with it, the drifted files are re-baselined so the decision is made
       // once rather than on every future run (see rebaselineChecksums).
-      const mismatches = await validateChecksums(client, migrationsDir, dialect);
-      if (mismatches.length > 0) {
-        if (!allowDrift) throw new MigrationError(formatChecksumMismatchError(mismatches));
-        rebaselined.push(...(await rebaselineChecksums(client, migrationsDir, mismatches, dialect)));
-      }
-
       const applied = await getAppliedMigrations(client, dialect);
+      const { mismatches, legacyUpgrades } = compareAppliedChecksums(applied, migrationsDir);
+      if (mismatches.length > 0 && !allowDrift) {
+        throw new MigrationError(formatChecksumMismatchError(mismatches));
+      }
       const appliedNames = new Set(applied.map((m) => m.name));
 
       // Newest already-applied timestamp. Anything applied below this line is
@@ -1897,6 +1895,18 @@ export async function migrateUp(
         lines.push('Review the statements above. To proceed: run `npx turbine migrate up` interactively');
         lines.push('and confirm, pass --allow-destructive, or set allowDestructive: true programmatically.');
         throw new MigrationError(lines.join('\n'));
+      }
+
+      // Admission must finish before changing an applied checksum, including a
+      // verified legacy upgrade. A refused batch must not bless edited files.
+      for (const upgrade of legacyUpgrades) {
+        await client.query(dialect.buildMigrationUpdateChecksum(quotedTrackingTable(dialect)), [
+          upgrade.checksum,
+          upgrade.name,
+        ]);
+      }
+      if (mismatches.length > 0) {
+        rebaselined.push(...(await rebaselineChecksums(client, migrationsDir, mismatches, dialect)));
       }
 
       const results: MigrationFile[] = [];
@@ -2188,12 +2198,11 @@ export async function migrateDown(
       // must touch nothing, which means the only write on this path happens
       // after the last thing that can refuse.
       const rebaselined: RebaselinedChecksum[] = [];
-      const mismatches = await validateChecksums(client, migrationsDir, dialect);
+      const applied = await getAppliedMigrations(client, dialect);
+      const { mismatches, legacyUpgrades } = compareAppliedChecksums(applied, migrationsDir);
       if (mismatches.length > 0 && options?.allowDrift !== true) {
         throw new MigrationError(formatChecksumMismatchError(mismatches, 'roll back'));
       }
-
-      const applied = await getAppliedMigrations(client, dialect);
 
       if (applied.length === 0) {
         return { rolledBack: [], errors: [], rebaselined };
@@ -2242,6 +2251,12 @@ export async function migrateDown(
 
       // Past every gate: nothing below this line can refuse, so the history
       // rewrite `--allow-drift` asks for is finally safe to perform.
+      for (const upgrade of legacyUpgrades) {
+        await client.query(dialect.buildMigrationUpdateChecksum(quotedTrackingTable(dialect)), [
+          upgrade.checksum,
+          upgrade.name,
+        ]);
+      }
       if (mismatches.length > 0) {
         rebaselined.push(...(await rebaselineChecksums(client, migrationsDir, mismatches, dialect)));
       }

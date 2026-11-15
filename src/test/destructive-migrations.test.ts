@@ -653,7 +653,7 @@ gated.it('migrateDown refuses destructive DOWN sections by default', async () =>
 // The rules all need a parseable object name, and dynamic SQL has none until it
 // runs, so a procedural body that BUILDS its statement matched nothing and the
 // operator was shown a clean inventory. All three shapes below were executed on
-// PostgreSQL 16 during the review that found this: the table was gone and the
+// PostgreSQL 16: the table was gone and the
 // guard had reported nothing. That is the module's defining failure, the
 // operator confirming what they were shown while something else runs under the
 // confirmation, so these are reported with an explicit unknown target.

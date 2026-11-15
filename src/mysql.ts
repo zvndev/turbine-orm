@@ -14,8 +14,7 @@
  *     rows. `mysqlDialect.resultStrategy = 'reselect'`: the executor runs the
  *     write, then issues a follow-up `SELECT` by primary key (using mysql2's
  *     `insertId` for auto-increment PKs) / by the `where` predicate, so
- *     `create`/`update`/`upsert`/`delete` still return real rows. This is the
- *     first shipped engine to exercise the Phase-0 `reselect` path.
+ *     `create`/`update`/`upsert`/`delete` still return real rows.
  *  2. **Positional `?` is broken for this builder.** Turbine pushes params in
  *     1-indexed generation order but EMITS them in a different SQL-text position
  *     (e.g. a `with`-relation `LIMIT` lands in the SELECT list, ahead of the
@@ -63,6 +62,7 @@
  * ```
  */
 
+import type { EventEmitter } from 'node:events';
 import {
   type DisconnectOptions,
   type DisconnectResult,
@@ -87,6 +87,7 @@ import {
   type JsonPathEqualsInput,
   type JsonWireRule,
   type LimitOffsetInput,
+  type OpenStreamOptions,
   postgresDialect,
   type StreamableConnection,
   type UpsertStatementInput,
@@ -96,11 +97,15 @@ import {
   ConnectionError,
   malformedConnectionStringMessage,
   markValueBearingMessage,
+  TimeoutError,
+  TransactionOutcomeUnknownError,
   UnsupportedFeatureError,
   ValidationError,
 } from './errors.js';
 import { applyTableFilters, assertDistinctColumnFields, deriveEngineRelations, nullRecord } from './introspect.js';
+import { consoleLogger, logTo } from './logger.js';
 import importOptionalPeer from './optional-peer-import.cjs';
+import type { TransactionRecovery } from './pg-types.js';
 import {
   type ColumnMetadata,
   type IndexMetadata,
@@ -113,7 +118,7 @@ import {
 import { rewritePositionalPlaceholders, scanPlaceholders } from './sql-placeholders.js';
 
 // ---------------------------------------------------------------------------
-// Minimal structural typing for the mysql2 surface we touch
+// Minimal structural typing for the mysql2 surface used here
 // ---------------------------------------------------------------------------
 //
 // Typed structurally (not via `import type` from mysql2) so this module stays
@@ -134,7 +139,21 @@ interface Mysql2Queryable {
 
 interface Mysql2Connection extends Mysql2Queryable {
   release(): void;
+  /** mysql2/promise exposes its callback connection for incremental results. */
+  connection?: unknown;
 }
+
+interface Mysql2RawConnection extends Partial<Mysql2Command> {
+  query(sql: string, values?: unknown): Mysql2Command;
+  execute(sql: string, values?: unknown): Mysql2Command;
+  destroy(): void;
+  pause(): void;
+  resume(): void;
+  /** The connection's socket. */
+  stream?: { destroy?(): void };
+}
+
+type Mysql2Command = Pick<EventEmitter, 'on' | 'removeListener'>;
 
 interface Mysql2Pool extends Mysql2Queryable {
   getConnection(): Promise<Mysql2Connection>;
@@ -217,34 +236,55 @@ function refusePlaceholder(message: string): never {
   throw new ValidationError(message);
 }
 
+/** Bounded SQL-only templates. Neither bindings nor list contents are retained. */
+const bindingTemplates = new Map<string, { count: number; sql: string; names: string[] }>();
+
+function bindingTemplate(sql: string, count: number): { sql: string; names: string[] } {
+  const cached = bindingTemplates.get(sql);
+  if (cached?.count === count) return cached;
+  // Arity is part of admission: a warmed $2 must still refuse one supplied value.
+  const template = {
+    count,
+    sql: rewritePositionalPlaceholders(sql, 'mysql', count, (i) => `:p${i}`, refusePlaceholder),
+    names: Array.from({ length: count }, (_, i) => `p${i + 1}`),
+  };
+  if (sql.length <= 8192 && count <= 128) {
+    if (bindingTemplates.size >= 128) bindingTemplates.delete(bindingTemplates.keys().next().value!);
+    bindingTemplates.set(sql, template);
+  }
+  return template;
+}
+
 /**
  * The statement text and named binding for one execution: `$n` placeholders
  * (the spelling `rawUnsafe` documents) rewritten to `:pN`, every
  * {@link MysqlInList} expanded, and every other value bound by name. Mapping by
  * NAME makes binding independent of where each placeholder lands in the SQL
- * text, the same guarantee Postgres' numbered `$N` gives. `binding` is
+ * text, the same guarantee Postgres' numbered `$N` gives. No wrapper is needed
+ * for an empty parameter array. `binding` is
  * `undefined` when nothing is bound, so parameter-less statements (BEGIN,
  * COMMIT, DDL) run through `.query()`.
  */
 function bindStatement(
   sql: string,
   values: unknown[],
-): { sql: string; binding: Record<string, MysqlParam> | undefined } {
-  if (values.length === 0) return { sql, binding: undefined };
-  const text = rewritePositionalPlaceholders(sql, 'mysql', values.length, (i) => `:p${i}`, refusePlaceholder);
+): { sql: string; binding: Record<string, MysqlParam> | undefined } | undefined {
+  if (values.length === 0) return undefined;
+  const template = bindingTemplate(sql, values.length);
   const named: Record<string, MysqlParam> = {};
   let lists: Map<string, MysqlInList> | undefined;
   for (let i = 0; i < values.length; i++) {
     const value = values[i];
+    const name = i < template.names.length ? template.names[i]! : `p${i + 1}`;
     if (value instanceof MysqlInList) {
       lists ??= new Map();
-      lists.set(`p${i + 1}`, value);
+      lists.set(name, value);
     } else {
-      named[`p${i + 1}`] = toMysqlParam(value);
+      named[name] = toMysqlParam(value);
     }
   }
-  if (lists === undefined) return { sql: text, binding: named };
-  const expanded = expandInLists(text, lists, named);
+  if (lists === undefined) return { sql: template.sql, binding: named };
+  const expanded = expandInLists(template.sql, lists, named);
   return { sql: expanded, binding: Object.keys(named).length > 0 ? named : undefined };
 }
 
@@ -334,13 +374,14 @@ const MYSQL_FIELD_TYPE_TINY = 1;
  */
 function coerceBooleanColumns(rows: Record<string, unknown>[], fields: unknown): void {
   if (!Array.isArray(fields) || rows.length === 0) return;
-  const names: string[] = [];
+  let names: string[] | undefined;
   for (const f of fields as { name?: unknown; columnType?: unknown; columnLength?: unknown }[]) {
     if (!f || f.columnType !== MYSQL_FIELD_TYPE_TINY || f.columnLength !== 1) continue;
     if (typeof f.name !== 'string') continue;
+    names ??= [];
     names.push(f.name);
   }
-  if (names.length === 0) return;
+  if (names === undefined || names.length === 0) return;
   for (const row of rows) {
     for (const name of names) {
       const v = row[name];
@@ -378,7 +419,7 @@ function shapeResult(
  * deadlock / lock-wait-timeout become retryable (E012/E013). The original mysql2
  * error (with its real message) is preserved as the wrapped error's `.cause`
  * downstream. Returns the value unchanged when it is not a recognizable mysql2
- * error. We only annotate here, `wrapPgError` (invoked downstream in the query
+ * error. This only annotates the error; `wrapPgError` (invoked downstream in the query
  * executor / transaction proxy) does the actual translation.
  */
 function augmentMysqlError(err: unknown): unknown {
@@ -498,6 +539,45 @@ function normalizeQueryArgs(arg: QueryArg, values?: unknown[]): { text: string; 
 }
 
 /**
+ * Only the bulk INSERT builder knows that its placeholders occur exactly once,
+ * in parameter order, with no value expressions or SQL literals between them.
+ * Keep its positional driver statement private, keyed by the actual parameter
+ * array. The public DeferredQuery still contains the same named SQL. A copied
+ * array, edited SQL (including comments), or changed arity uses normal binding.
+ * No values or statements outlive the parameter array.
+ */
+const bulkInsertBindings = new WeakMap<unknown[], { sql: string; positional: string; count: number }>();
+
+/** Arity-only templates: eight entries of at most 8,192 cells, never caller values or identifiers. */
+const bulkInsertTuples = new Map<string, { named: string; positional: string }>();
+
+function mysqlParamPlaceholder(index: number): string {
+  return `:p${index}`;
+}
+
+function bulkTuples(rows: unknown[][]): { named: string; positional: string } {
+  const width = rows[0]?.length ?? 0;
+  const uniform = rows.every((row) => row.length === width);
+  const cacheable = uniform && width > 0 && rows.length * width <= 8192;
+  const key = `${rows.length}:${width}`;
+  const cached = cacheable ? bulkInsertTuples.get(key) : undefined;
+  if (cached) return cached;
+  let n = 0;
+  const named = rows.map((row) => `(${row.map(() => `:p${++n}`).join(', ')})`).join(', ');
+  const positional = uniform
+    ? Array(rows.length)
+        .fill(`(${Array(width).fill('?').join(', ')})`)
+        .join(', ')
+    : rows.map((row) => `(${row.map(() => '?').join(', ')})`).join(', ');
+  const tuples = { named, positional };
+  if (cacheable) {
+    if (bulkInsertTuples.size >= 8) bulkInsertTuples.delete(bulkInsertTuples.keys().next().value!);
+    bulkInsertTuples.set(key, tuples);
+  }
+  return tuples;
+}
+
+/**
  * Run one statement against a mysql2 queryable (pool or connection). Parameterized
  * statements use `.execute()` (mysql2 server-side prepared statements, cached per
  * connection); parameter-less statements (transaction control, DDL) use `.query()`,
@@ -509,10 +589,16 @@ async function execOne(
   sql: string,
   params: unknown[],
 ): Promise<ReturnType<typeof shapeResult>> {
-  const bound = bindStatement(sql, params);
-  const binding = bound.binding;
+  const bulk = bulkInsertBindings.get(params);
+  const bound =
+    bulk && bulk.sql === sql && bulk.count === params.length && !params.some((v) => v instanceof MysqlInList)
+      ? { sql: bulk.positional, binding: Array.from(params, toMysqlParam) }
+      : bindStatement(sql, params);
+  const binding = bound?.binding;
   try {
-    const [result, fields] = binding ? await runner.execute(bound.sql, binding) : await runner.query(bound.sql);
+    const [result, fields] = binding
+      ? await runner.execute(bound!.sql, binding)
+      : await runner.query(bound?.sql ?? sql);
     return shapeResult(result, fields);
   } catch (err) {
     throw augmentMysqlError(err);
@@ -534,14 +620,333 @@ async function runOnConnection(
   params: unknown[],
 ): Promise<ReturnType<typeof shapeResult>> {
   if (params.length === 0 && /^SET TRANSACTION ISOLATION LEVEL /i.test(sql) && sql.includes('; ')) {
-    let last = shapeResult([]);
+    let last: ReturnType<typeof shapeResult> | undefined;
     for (const part of sql.split('; ')) {
       const trimmed = part.trim();
       if (trimmed) last = await execOne(conn, trimmed, []);
     }
-    return last;
+    // The first real statement supplies the result; only an empty split needs
+    // a fallback. Do not allocate a discarded row array and result per BEGIN.
+    return last ?? shapeResult([]);
   }
   return execOne(conn, sql, params);
+}
+
+/**
+ * Whether the server answered with `err`: an error packet on a live connection
+ * (a numeric `errno`, not fatal), as the error or its cause. A lost or
+ * timed-out connection is no answer. So are a shutdown (1053), an interrupted
+ * statement (1317) and a killed connection (1927), which can arrive while a
+ * COMMIT is being written.
+ */
+function answeredByServer(err: unknown): boolean {
+  for (let e = err, depth = 0; depth < 4 && e !== null && typeof e === 'object'; depth++) {
+    const { errno, fatal } = e as { errno?: unknown; fatal?: unknown };
+    if (typeof errno === 'number') return errno > 0 && fatal !== true && ![1053, 1317, 1927].includes(errno);
+    e = (e as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/**
+ * Close a connection Turbine is discarding, in both directions, so the server
+ * ends its session now.
+ *
+ * mysql2's own `destroy()` is `stream.end()`, a half-close, and it drops the
+ * connection from the pool at once. A server still writing a result to a
+ * client that stopped reading (a stream returned early) never reads that close,
+ * so its session stayed in "Sending to client", holding its metadata lock,
+ * until `net_write_timeout`, outside the pool limit. The half-closed client
+ * also kept reading: the execute mysql2 queues behind a prepare was sent on the
+ * closed socket, and the server's parting error packet arrived as its answer,
+ * which mysql2 prints as "got packets out of order".
+ *
+ * Destroying the socket closes both directions (a reset while unread rows are
+ * buffered), which the server sees on its next read or write. mysql2 handles it
+ * as any lost connection: queued commands fail, and the pool drops the
+ * connection when the socket closes. Nothing waits on this connection any
+ * more, so the error mysql2 reports for it is absorbed.
+ */
+function destroyConnection(raw: Partial<Mysql2RawConnection>): void {
+  raw.on?.('error', () => {});
+  if (typeof raw.stream?.destroy === 'function') raw.stream.destroy();
+  else raw.destroy?.();
+}
+
+/** A checked-out connection never queues another statement behind a paused result. */
+class MysqlStreamClient implements PgCompatPoolClient {
+  private released = false;
+  private discarded = false;
+  private inTransaction = false;
+  private pending = 0;
+  private committing = false;
+  private deadlineError?: TimeoutError;
+  private active?: { close(): Promise<void>; cancel(error: unknown): void };
+
+  constructor(private readonly conn: Mysql2Connection) {}
+
+  private timeoutError(timeout: number, confirmed = false): TimeoutError {
+    return new TimeoutError(timeout, 'Transaction', {
+      outcome: confirmed ? 'not-executed' : 'unknown',
+      message: `Transaction timed out after ${timeout}ms. ${
+        confirmed ? 'Rollback was confirmed.' : 'Cancellation and rollback are not confirmed; its outcome is unknown.'
+      }`,
+    });
+  }
+
+  readonly transactionRecovery: TransactionRecovery = {
+    assertTimeout: () => {},
+    pendingMessage: 'transaction cannot commit; rollback is not yet confirmed. ',
+    sessionMessage: 'Your callback did not run; rollback is not yet confirmed.',
+    timeoutError: (timeout) => (this.deadlineError = this.timeoutError(timeout)),
+    rollback: async (running, send, graceMs) => {
+      // mysql2 cannot cancel a running statement. A failed COMMIT response is
+      // uncertain even if a later ROLLBACK answers successfully.
+      if (running || this.pending || this.committing) return false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          send().then(
+            () => true,
+            () => false,
+          ),
+          new Promise<false>((resolve) => {
+            timer = setTimeout(() => resolve(false), graceMs);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+    finish: (state, clean, error, logger) => {
+      state.end(clean ? 'was rolled back' : 'ended with an unknown outcome');
+      if (!clean && logger)
+        logTo(logger, 'debug', 'Transaction ended with an unknown outcome', {
+          code: 'transaction-outcome-unknown',
+          operation: '$transaction',
+        });
+      if (clean && this.deadlineError === error && this.deadlineError)
+        return this.timeoutError(this.deadlineError.timeoutMs, true);
+      // A COMMIT the server did not answer (a lost or timed-out connection)
+      // may have committed. An error the server answered with keeps its class.
+      return this.committing && !answeredByServer(error) ? new TransactionOutcomeUnknownError(error) : error;
+    },
+  };
+
+  private assertOpen(): void {
+    if (this.released || this.discarded)
+      throw new ConnectionError('This MySQL checkout has been released or discarded.');
+  }
+
+  // biome-ignore lint/suspicious/noExplicitAny: pg-compat query is generic over the row shape.
+  async query(text: QueryArg, values?: unknown[]): Promise<any> {
+    this.pending++;
+    try {
+      return await this.runQuery(text, values);
+    } finally {
+      this.pending--;
+    }
+  }
+
+  // biome-ignore lint/suspicious/noExplicitAny: see query().
+  private async runQuery(text: QueryArg, values?: unknown[]): Promise<any> {
+    this.assertOpen();
+    const { text: sql, params } = normalizeQueryArgs(text, values);
+    if (this.active) {
+      if (params.length === 0 && /^\s*(?:COMMIT|ROLLBACK|SAVEPOINT|RELEASE SAVEPOINT)\b/i.test(sql)) {
+        await this.active.close();
+        this.assertOpen();
+      } else
+        throw new ValidationError(
+          'A MySQL native stream is active on this connection. Close it before another statement.',
+        );
+    }
+    if (sql === 'COMMIT' && params.length === 0) this.committing = true;
+    const result = await runOnConnection(this.conn, sql, params);
+    if (
+      /^\s*(?:(?:SET TRANSACTION ISOLATION LEVEL [A-Z ]+; )?START TRANSACTION|BEGIN)\b/i.test(sql) &&
+      params.length === 0
+    )
+      this.inTransaction = true;
+    else if (/^\s*(?:COMMIT|ROLLBACK(?!\s+TO))\b/i.test(sql) && params.length === 0) this.inTransaction = false;
+    return result;
+  }
+
+  async *streamBatches(
+    text: string,
+    values: unknown[],
+    batchSize: number,
+    signal?: AbortSignal,
+  ): AsyncGenerator<Record<string, unknown>[], void, undefined> {
+    this.assertOpen();
+    if (this.active) throw new ValidationError('A MySQL native stream is already active on this connection.');
+    if (this.pending) throw new ValidationError('A MySQL statement is still running on this connection.');
+    if (!Number.isSafeInteger(batchSize) || batchSize < 1)
+      throw new ValidationError('Native stream batchSize must be a positive safe integer.');
+    signal?.throwIfAborted();
+    const raw = this.conn.connection as Mysql2RawConnection | undefined;
+    if (
+      !raw ||
+      typeof raw.destroy !== 'function' ||
+      typeof raw.pause !== 'function' ||
+      typeof raw.resume !== 'function' ||
+      typeof raw.execute !== 'function' ||
+      typeof raw.query !== 'function'
+    ) {
+      throw new UnsupportedFeatureError(
+        'native streaming',
+        'mysql',
+        'The mysql2 callback connection with pause(), resume() and destroy() is required.',
+      );
+    }
+    const bound = bindStatement(text, values);
+    let command: Mysql2Command | undefined;
+    let fields: unknown;
+    let rows: Record<string, unknown>[] = [];
+    let wake: (() => void) | undefined;
+    const notify = () => {
+      const resolve = wake;
+      wake = undefined;
+      resolve?.();
+    };
+    let resultSets = 0;
+    let complete = false;
+    let closed = false;
+    let failure: unknown;
+    let settle!: () => void;
+    const settled = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    const discard = () => {
+      if (this.discarded) return;
+      this.discarded = true;
+      destroyConnection(raw);
+    };
+    const onEnd = () => {
+      complete = true;
+      notify();
+      settle();
+    };
+    const onError = (error: unknown) => {
+      if (failure === undefined) failure = augmentMysqlError(error);
+      notify();
+      settle();
+    };
+    const onFields = (next: unknown) => {
+      if (++resultSets > 1)
+        cancel(
+          new UnsupportedFeatureError(
+            'multiple native stream result sets',
+            'mysql',
+            'Stream a single row result set per statement.',
+          ),
+        );
+      else fields = next;
+    };
+    const onRow = (row: unknown) => {
+      // Callbackless mysql2 commands never collect rows. Keep exactly one
+      // batch here and pause packet decoding until the consumer asks again.
+      // ResultSetHeader has no fields and must not become a streamed row.
+      if (closed || failure !== undefined || !Array.isArray(fields)) return;
+      if (rows.length === batchSize) {
+        cancel(new ConnectionError('The MySQL driver exceeded native stream backpressure.'));
+        return;
+      }
+      rows.push(row as Record<string, unknown>);
+      if (rows.length === batchSize) {
+        raw.pause();
+        notify();
+      }
+    };
+    const cancel = (error: unknown) => {
+      if (failure === undefined) failure = error;
+      closed = true;
+      command?.removeListener('result', onRow);
+      discard();
+      rows = [];
+      notify();
+      settle();
+      signal?.removeEventListener('abort', onAbort);
+      if (this.active === state) this.active = undefined;
+    };
+    let closing: Promise<void> | undefined;
+    const close = (): Promise<void> =>
+      (closing ??= (async () => {
+        const priorFailure = failure;
+        closed = true;
+        command?.removeListener('result', onRow);
+        rows = [];
+        notify();
+        if (!complete && failure === undefined) {
+          // Callbackless commands do not collect result arrays. Detach delivery
+          // and resume the wire to discard a transaction's remainder. Standalone
+          // streams can discard their checkout instead of draining.
+          if (this.inTransaction) {
+            raw.resume();
+            await settled;
+          } else discard();
+        }
+        if (failure !== undefined && !complete) discard();
+        if (this.active === state) this.active = undefined;
+        signal?.removeEventListener('abort', onAbort);
+        command?.removeListener('end', onEnd);
+        command?.removeListener('fields', onFields);
+        if (!this.discarded) raw.removeListener?.('error', onError);
+        if (priorFailure === undefined && failure !== undefined) throw failure;
+      })());
+    const state = { close, cancel };
+    this.active = state;
+    const onAbort = () => cancel(signal!.reason);
+    try {
+      // Fatal parser/socket failures can bypass a callbackless command and
+      // reach only the connection's error event.
+      raw.on?.('error', onError);
+      command = bound?.binding ? raw.execute(bound.sql, bound.binding) : raw.query(bound?.sql ?? text);
+      command.on('end', onEnd);
+      command.on('error', onError);
+      command.on('fields', onFields);
+      command.on('result', onRow);
+      signal?.addEventListener('abort', onAbort, { once: true });
+      if (signal?.aborted) onAbort();
+      while (true) {
+        if (failure !== undefined) throw failure;
+        if (closed) throw new ValidationError('This MySQL native stream has been closed.');
+        if (rows.length === batchSize || (complete && rows.length > 0)) {
+          const batch = rows;
+          rows = [];
+          coerceBooleanColumns(batch, fields);
+          yield batch;
+          if (!closed && failure === undefined && !complete) raw.resume();
+        } else if (complete) return;
+        else
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+          });
+      }
+    } catch (error) {
+      if (failure === undefined)
+        failure = closed ? new ValidationError('This MySQL native stream has been closed.') : augmentMysqlError(error);
+      throw failure;
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+      await close();
+      // A destroyed mysql2 command may still report a late connection error.
+      // Keep its harmless error listener until the command is collected.
+    }
+  }
+
+  release(error?: Error | boolean): void {
+    if (this.released) return;
+    this.released = true;
+    if (this.active) this.active.cancel(new ConnectionError('The MySQL checkout was released during a native stream.'));
+    if (!this.discarded) {
+      const raw = this.conn.connection as Partial<Mysql2RawConnection> | undefined;
+      if ((error || this.pending) && typeof raw?.destroy === 'function') {
+        this.discarded = true;
+        destroyConnection(raw);
+      } else this.conn.release();
+    }
+  }
 }
 
 /**
@@ -567,14 +972,7 @@ export class MysqlPool implements PgCompatPool {
 
   async connect(): Promise<PgCompatPoolClient> {
     const conn = await this.pool.getConnection();
-    return {
-      // biome-ignore lint/suspicious/noExplicitAny: see query() above.
-      query: async (text: QueryArg, values?: unknown[]): Promise<any> => {
-        const { text: sql, params } = normalizeQueryArgs(text, values);
-        return runOnConnection(conn, sql, params);
-      },
-      release: () => conn.release(),
-    };
+    return new MysqlStreamClient(conn);
   }
 
   async end(): Promise<void> {
@@ -768,7 +1166,9 @@ export const mysqlDialect: Dialect = {
   name: 'mysql',
   capabilities: Object.freeze({
     distinctOn: false,
+    tupleCursorPredicate: false,
     positionalJson: false,
+    jsonObjectKeysAsWritten: false,
     nullsOrderingClause: false,
     nullsSortHigh: false,
     insensitiveInList: false,
@@ -801,6 +1201,7 @@ export const mysqlDialect: Dialect = {
     backendCancel: false,
     idleTransactionTimeout: false,
     abortsTransactionOnError: false,
+    classifiesCommitAnswer: false,
     connectionDriver: 'engine-driver',
     // mysql2 execute() prepares each statement text; max_prepared_stmt_count caps them server-wide.
     preparesEveryStatement: true,
@@ -810,7 +1211,7 @@ export const mysqlDialect: Dialect = {
     // TEXT / BLOB need a prefix length in a key (ER_BLOB_KEY_WITHOUT_LENGTH).
     unboundedTextKeys: false,
   } satisfies EngineCapabilities),
-  // No RETURNING → run the write, then re-SELECT by PK/where (Phase-0 reselect).
+  // No RETURNING → run the write, then re-SELECT by PK/where.
   resultStrategy: 'reselect',
   supportsReturning: false,
   // `ON DUPLICATE KEY UPDATE` has no predicate slot, so `buildUpsertStatement`
@@ -859,9 +1260,7 @@ export const mysqlDialect: Dialect = {
   // text position; positional `?` mis-binds. mysql2 named parameters bind by
   // name, so `:pN` ↔ `params[N-1]` mirrors Postgres' `$N` regardless of text
   // order. The driver shim binds via a `{ p1, p2, … }` object.
-  paramPlaceholder(index: number): string {
-    return `:p${index}`;
-  },
+  paramPlaceholder: mysqlParamPlaceholder,
 
   quoteIdentifier(name: string): string {
     return `\`${name.replace(/`/g, '``')}\``;
@@ -1046,19 +1445,30 @@ export const mysqlDialect: Dialect = {
   },
 
   buildBulkInsertStatement(input: BulkInsertStatementInput): BuiltStatement {
-    // No UNNEST in MySQL, emit multi-row VALUES with flattened, named
-    // placeholders (`:p1`, `:p2`, …) matching the flat param order.
-    let n = 0;
-    const placeholders = input.rowValues
-      .map((row) => `(${row.map(() => this.paramPlaceholder(++n)).join(', ')})`)
-      .join(', ');
+    const standard = this.paramPlaceholder === mysqlParamPlaceholder;
+    let next = 0;
+    const tuples = standard
+      ? bulkTuples(input.rowValues)
+      : {
+          named: input.rowValues
+            .map((row) => `(${row.map(() => this.paramPlaceholder(++next)).join(', ')})`)
+            .join(', '),
+          positional: '',
+        };
     // skipDuplicates → no-op ON DUPLICATE KEY UPDATE (keeps the existing row).
     const firstCol = input.columns[0] ?? '`id`';
     const conflict = input.skipDuplicates ? ` ON DUPLICATE KEY UPDATE ${firstCol} = ${firstCol}` : '';
-    return {
-      sql: `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES ${placeholders}${conflict}`,
-      params: input.rowValues.flat(),
-    };
+    const prefix = `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES `;
+    const sql = `${prefix}${tuples.named}${conflict}`;
+    const params: unknown[] = [];
+    for (const row of input.rowValues) for (const value of row) params.push(value);
+    if (standard && params.length > 0)
+      bulkInsertBindings.set(params, {
+        sql,
+        positional: `${prefix}${tuples.positional}${conflict}`,
+        count: params.length,
+      });
+    return { sql, params };
   },
 
   buildBulkUpsertStatement(input: BulkUpsertStatementInput): BuiltStatement {
@@ -1116,7 +1526,7 @@ export const mysqlDialect: Dialect = {
     // MySQL ignores the explicit conflict target, ON DUPLICATE KEY UPDATE keys
     // off the table's PK/unique indexes. The `where`-derived conflictColumns
     // (input.conflictColumns) must therefore correspond to a real unique/PK index
-    // for the upsert to target the intended row (plan §4 / R9).
+    // for the upsert to target the intended row.
     return (
       `INSERT INTO ${input.table} (${input.insertColumns.join(', ')}) VALUES (${input.valuePlaceholders.join(', ')})` +
       ` ON DUPLICATE KEY UPDATE ${input.updateSetClauses.join(', ')}`
@@ -1268,22 +1678,17 @@ export const mysqlDialect: Dialect = {
 
   // ---- Streaming ----------------------------------------------------------
 
-  /**
-   * The {@link StreamableConnection} seam only exposes `query()`, not mysql2's
-   * native `.stream()`, so the "stream" fetches once and yields the rows in
-   * `batchSize` chunks. True server-side streaming would require direct mysql2
-   * access (documented limitation).
-   */
+  /** Incremental mysql2 consumption; query-only connections cannot stream. */
   async *openStream(
     connection: StreamableConnection,
     sql: string,
     params: unknown[],
     batchSize: number,
+    options?: OpenStreamOptions,
   ): AsyncGenerator<Record<string, unknown>[], void, undefined> {
-    const result = await connection.query(sql, params);
-    for (let i = 0; i < result.rows.length; i += batchSize) {
-      yield result.rows.slice(i, i + batchSize);
-    }
+    if (!connection.streamBatches)
+      throw new UnsupportedFeatureError('native streaming', 'mysql', 'An acquired MysqlPool connection is required.');
+    yield* connection.streamBatches(sql, params, batchSize, options?.signal);
   },
 
   // ---- Introspection ------------------------------------------------------
@@ -1312,6 +1717,9 @@ interface InfoColumn {
   COLUMN_DEFAULT: string | null;
   EXTRA: string;
   CHARACTER_MAXIMUM_LENGTH: number | string | null;
+  CHARACTER_SET_NAME: string | null;
+  COLLATION_NAME: string | null;
+  GENERATION_EXPRESSION: string;
 }
 interface InfoKey {
   TABLE_NAME: string;
@@ -1319,6 +1727,7 @@ interface InfoKey {
   ORDINAL_POSITION: number | string;
 }
 interface InfoFk extends InfoKey {
+  REFERENCED_TABLE_SCHEMA: string;
   REFERENCED_TABLE_NAME: string;
   REFERENCED_COLUMN_NAME: string;
   CONSTRAINT_NAME: string;
@@ -1327,8 +1736,14 @@ interface InfoIndex {
   TABLE_NAME: string;
   INDEX_NAME: string;
   NON_UNIQUE: number | string;
-  COLUMN_NAME: string;
+  COLUMN_NAME: string | null;
   SEQ_IN_INDEX: number | string;
+  SUB_PART: number | string | null;
+  EXPRESSION: string | null;
+  COLLATION: string | null;
+  INDEX_TYPE: string;
+  IS_VISIBLE: string;
+  INDEX_COMMENT: string;
 }
 
 const num = (v: number | string | null | undefined): number => (typeof v === 'string' ? Number(v) : (v ?? 0));
@@ -1355,8 +1770,85 @@ function buildRelationsFromForeignKeys(
   pkByTable: Map<string, string[]>,
   columnsByTable: Map<string, ColumnMetadata[]>,
   logger: IntrospectOptions['logger'],
+  isToOne?: (fk: FKEntry) => boolean,
 ): Map<string, Record<string, RelationDef>> {
-  return deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable, logger);
+  return deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable, logger, isToOne);
+}
+
+/** Only comparison domains whose native equality also enforces the unique key. */
+function mysqlSameKeyEquality(child: InfoColumn | undefined, parent: InfoColumn | undefined): boolean {
+  if (!child || !parent) return false;
+  const type = child.COLUMN_TYPE.toLowerCase();
+  if (type !== parent.COLUMN_TYPE.toLowerCase()) return false;
+  if (/^(?:char|varchar)\(\d+\)$/.test(type)) {
+    return (
+      typeof child.CHARACTER_SET_NAME === 'string' &&
+      child.CHARACTER_SET_NAME === parent.CHARACTER_SET_NAME &&
+      typeof child.COLLATION_NAME === 'string' &&
+      child.COLLATION_NAME === parent.COLLATION_NAME
+    );
+  }
+  // ENUM/SET, approximate numbers and unrecognized domains stay conservative.
+  return /^(?:(?:tinyint|smallint|mediumint|int|bigint)(?:\(\d+\))?(?: unsigned)?|decimal\(\d+,\d+\)(?: unsigned)?|(?:var)?binary\(\d+\)|date|(?:datetime|timestamp|time)(?:\(\d+\))?|year)$/.test(
+    type,
+  );
+}
+
+/** Decode COLUMN_TYPE's catalog serialization, independently of DDL sql_mode. */
+function parseMysqlEnum(source: string): string[] {
+  const labels: string[] = [];
+  const token = /'((?:[^'\\]|''|\\[\\0nr])*)'([,)])/gy;
+  token.lastIndex = 5;
+  if (/^enum\(/i.test(source)) {
+    for (let match = token.exec(source); match; match = token.exec(source)) {
+      labels.push(
+        match[1]!.replace(/''|\\[\\0nr]/g, (escaped) =>
+          escaped === "''"
+            ? "'"
+            : escaped === '\\0'
+              ? '\u0000'
+              : escaped === '\\n'
+                ? '\n'
+                : escaped === '\\r'
+                  ? '\r'
+                  : '\\',
+        ),
+      );
+      if (match[2] === ')') {
+        if (token.lastIndex === source.length) return labels;
+        break;
+      }
+    }
+  }
+  throw new ValidationError('Invalid MySQL ENUM catalog definition.');
+}
+
+/**
+ * Character sets that can encode a code point the catalog text cannot.
+ * `information_schema` reports `COLUMN_TYPE` in utf8mb3 (verified on MySQL
+ * 8.4.0: `SELECT CHARSET(COLUMN_TYPE)` is `utf8mb3`, and the bytes are `?`
+ * where a supplementary character was), so only a column in one of these
+ * sets can hold a label the catalog rendering loses. Every other MySQL
+ * charset has a BMP-only repertoire, which utf8mb3 renders exactly (a
+ * literal `?` in such a label really is a question mark).
+ */
+const SUPPLEMENTARY_CHARSETS = new Set(['utf8mb4', 'utf16', 'utf16le', 'utf32', 'gb18030']);
+
+/**
+ * Whether catalog-decoded `labels` may have lost a supplementary character:
+ * some label holds a `?` and the column's charset can encode what utf8mb3
+ * cannot. The loss always surfaces as `?` (the conversion has no other
+ * substitute), so its absence proves the labels exact; its presence is
+ * ambiguous with a literal question mark, which catalog text cannot settle,
+ * so a suspect list is withheld whatever it holds. A missing charset is
+ * suspect too: the catalog always reports one for an ENUM, so a custom
+ * executor that omits it has not proven the column BMP-only.
+ */
+function enumLabelsSuspect(labels: string[], charset: string | null | undefined): boolean {
+  if (!labels.some((label) => label.includes('?'))) return false;
+  // Loose null on purpose: a custom executor's row can omit the field the
+  // catalog query selected, and absent is not proof of a BMP-only column.
+  return charset == null || SUPPLEMENTARY_CHARSETS.has(charset.toLowerCase());
 }
 
 /**
@@ -1364,15 +1856,22 @@ function buildRelationsFromForeignKeys(
  * Postgres catalog introspector produces, using a caller-supplied query
  * executor (so tests can dogfood an already-open mysql2 pool/connection).
  *
+ * Every statement is a `SELECT`. An ENUM column whose catalog labels may have
+ * lost a supplementary character (the utf8mb3 `COLUMN_TYPE` text holds `?` on
+ * a charset that can encode past the BMP) is marked
+ * `enumLabelsUnrecoverable`, warned about by name, and typed `string` instead
+ * of a union guessed from the damaged text; labels declared explicitly (an
+ * `enums` entry, or a `columnTypes` override at generation) outrank it.
+ *
  * @param exec    Runs a parameterized (`:p1`, `:p2`, …) query and returns rows.
  * @param schema  The MySQL database (schema) name to introspect.
- * @param options Optional include / exclude table-name filters, and the logger
- *                that receives relation-naming notes (console when absent).
+ * @param options Table-name filters, relation-naming logger, and the legacy
+ *                opt-out from proven unique-FK reverse to-one cardinality.
  */
 export async function introspectMysqlWith(
   exec: MysqlRowExecutor,
   schema: string,
-  options: Pick<IntrospectOptions, 'include' | 'exclude' | 'logger'> = {},
+  options: Pick<IntrospectOptions, 'include' | 'exclude' | 'logger'> & { legacyToManyUniques?: boolean } = {},
 ): Promise<SchemaMetadata> {
   // ----- Tables -----
   const candidateTables = (
@@ -1381,36 +1880,30 @@ export async function introspectMysqlWith(
       [schema],
     )
   ).map((r) => String(r.TABLE_NAME));
-  // include / exclude + default bookkeeping-table exclusions (F12).
+  // include / exclude + default bookkeeping-table exclusions.
   const tableNames = applyTableFilters(candidateTables, options);
   const tableSet = new Set(tableNames);
 
   // ----- Columns -----
   const columnRows = (await exec(
     `SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY,
-            COLUMN_DEFAULT, EXTRA, CHARACTER_MAXIMUM_LENGTH
+            COLUMN_DEFAULT, EXTRA, CHARACTER_MAXIMUM_LENGTH, CHARACTER_SET_NAME, COLLATION_NAME,
+            GENERATION_EXPRESSION
      FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = :p1 ORDER BY TABLE_NAME, ORDINAL_POSITION`,
     [schema],
   )) as unknown as InfoColumn[];
 
   const columnsByTable = new Map<string, ColumnMetadata[]>();
+  const nativeColumns = new Map<string, InfoColumn>();
   const enums: Record<string, string[]> = nullRecord<string[]>();
+  const logger = options.logger ?? consoleLogger;
   for (const c of columnRows) {
     if (!tableSet.has(c.TABLE_NAME)) continue;
+    nativeColumns.set(JSON.stringify([c.TABLE_NAME, c.COLUMN_NAME]), c);
     const nullable = c.IS_NULLABLE === 'YES' && c.COLUMN_KEY !== 'PRI';
+    const computed = /\b(?:VIRTUAL|STORED) GENERATED\b/i.test(c.EXTRA) || !!c.GENERATION_EXPRESSION;
     const dataType = c.DATA_TYPE.toLowerCase();
-    // Inline ENUM parsing from COLUMN_TYPE: enum('a','b','c')
-    if (dataType === 'enum') {
-      const m = /^enum\((.*)\)$/i.exec(c.COLUMN_TYPE);
-      if (m?.[1]) {
-        enums[`${c.TABLE_NAME}.${c.COLUMN_NAME}`] = m[1].split(',').map((s) =>
-          s
-            .trim()
-            .replace(/^'(.*)'$/, '$1')
-            .replace(/''/g, "'"),
-        );
-      }
-    }
+    const enumLabels = dataType === 'enum' ? parseMysqlEnum(c.COLUMN_TYPE) : undefined;
     const maxLen = c.CHARACTER_MAXIMUM_LENGTH != null ? num(c.CHARACTER_MAXIMUM_LENGTH) : undefined;
     // `tinyint(1)` is the one type whose DATA_TYPE is not enough to identify it
     // (see MYSQL_BOOLEAN_TYPE); everything else keeps the bare DATA_TYPE.
@@ -1422,14 +1915,41 @@ export async function introspectMysqlWith(
       pgType: recordedType,
       tsType: mysqlTypeToTs(dataType, nullable, c.COLUMN_TYPE),
       nullable,
-      hasDefault: c.COLUMN_DEFAULT !== null || /auto_increment/i.test(c.EXTRA),
+      // Nullable MySQL columns have an effective DEFAULT NULL even when the
+      // catalog cannot distinguish an explicit NULL from an implicit default.
+      hasDefault: nullable || c.COLUMN_DEFAULT !== null || /auto_increment/i.test(c.EXTRA) || computed,
       // The server numbers it, so a create's re-read can use the insert id.
       isGenerated: /auto_increment/i.test(c.EXTRA),
+      // The existing flag protects BOTH virtual and stored computed values.
+      ...(computed ? { isGeneratedStored: true } : {}),
+      ...(computed && c.GENERATION_EXPRESSION ? { generationExpression: c.GENERATION_EXPRESSION } : {}),
       isArray: false,
       arrayType: undefined,
       pgArrayType: 'text[]',
     };
     if (maxLen !== undefined) col.maxLength = maxLen;
+    if (enumLabels !== undefined) {
+      // Exact unless suspect (see enumLabelsSuspect). A suspect list is
+      // withheld, never recorded from the damaged text, so no consumer can type
+      // or validate against a label the column does not have.
+      const key = `${c.TABLE_NAME}.${c.COLUMN_NAME}`;
+      if (!enumLabelsSuspect(enumLabels, c.CHARACTER_SET_NAME)) {
+        enums[key] = enumLabels;
+      } else {
+        col.enumLabelsUnrecoverable = true;
+        logTo(
+          logger,
+          'warn',
+          `MySQL introspection: the ENUM labels of "${key}" may hold characters outside the BMP, which the MySQL ` +
+            'catalog reports as "?" (a label that really contains "?" reads the same), so the column is typed as ' +
+            'string instead of a literal union. For exact literal types, declare its labels explicitly: with the ' +
+            `CLI, a \`columnTypes\` entry in turbine.config.ts (\`columnTypes: { "${key}": "'a' | 'b'" }\`); in code, ` +
+            `an \`enums\` entry on the introspected metadata before calling generate() (\`schema.enums["${key}"] = ` +
+            "['a', 'b']`). The stored labels and row data are unaffected.",
+          { code: 'introspect-enum-labels-unrecoverable', table: c.TABLE_NAME },
+        );
+      }
+    }
     if (!columnsByTable.has(c.TABLE_NAME)) columnsByTable.set(c.TABLE_NAME, []);
     columnsByTable.get(c.TABLE_NAME)!.push(col);
   }
@@ -1449,16 +1969,18 @@ export async function introspectMysqlWith(
 
   // ----- Foreign keys (grouped by constraint for composite FKs) -----
   const fkRows = (await exec(
-    `SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, CONSTRAINT_NAME, ORDINAL_POSITION
+    `SELECT TABLE_NAME, COLUMN_NAME, REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME, CONSTRAINT_NAME, ORDINAL_POSITION
      FROM information_schema.KEY_COLUMN_USAGE
      WHERE TABLE_SCHEMA = :p1 AND REFERENCED_TABLE_NAME IS NOT NULL
+       AND REFERENCED_TABLE_SCHEMA = :p1
      ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION`,
     [schema],
   )) as unknown as InfoFk[];
   const fkByConstraint = new Map<string, FKEntry>();
   for (const r of fkRows) {
     if (!tableSet.has(r.TABLE_NAME)) continue;
-    const key = `${r.TABLE_NAME}.${r.CONSTRAINT_NAME}`;
+    if (r.REFERENCED_TABLE_SCHEMA !== undefined && r.REFERENCED_TABLE_SCHEMA !== schema) continue;
+    const key = JSON.stringify([r.TABLE_NAME, r.CONSTRAINT_NAME]);
     let entry = fkByConstraint.get(key);
     if (!entry) {
       entry = {
@@ -1477,47 +1999,81 @@ export async function introspectMysqlWith(
 
   // ----- Indexes + unique constraints -----
   const idxRows = (await exec(
-    `SELECT TABLE_NAME, INDEX_NAME, NON_UNIQUE, COLUMN_NAME, SEQ_IN_INDEX FROM information_schema.STATISTICS
+    `SELECT TABLE_NAME, INDEX_NAME, NON_UNIQUE, COLUMN_NAME, SEQ_IN_INDEX,
+            SUB_PART, EXPRESSION, COLLATION, INDEX_TYPE, IS_VISIBLE, INDEX_COMMENT
+     FROM information_schema.STATISTICS
      WHERE TABLE_SCHEMA = :p1 ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX`,
     [schema],
   )) as unknown as InfoIndex[];
-  const indexGroups = new Map<string, { table: string; name: string; unique: boolean; columns: string[] }>();
+  const indexGroups = new Map<string, InfoIndex[]>();
   for (const r of idxRows) {
     if (!tableSet.has(r.TABLE_NAME)) continue;
-    const key = `${r.TABLE_NAME}.${r.INDEX_NAME}`;
-    let g = indexGroups.get(key);
-    if (!g) {
-      g = { table: r.TABLE_NAME, name: r.INDEX_NAME, unique: num(r.NON_UNIQUE) === 0, columns: [] };
-      indexGroups.set(key, g);
-    }
-    g.columns.push(r.COLUMN_NAME);
+    const key = JSON.stringify([r.TABLE_NAME, r.INDEX_NAME]);
+    if (!indexGroups.has(key)) indexGroups.set(key, []);
+    indexGroups.get(key)!.push(r);
   }
   const indexesByTable = new Map<string, IndexMetadata[]>();
   const uniqueByTable = new Map<string, string[][]>();
-  for (const g of indexGroups.values()) {
-    if (g.name === 'PRIMARY') continue; // PK is tracked separately
-    if (!indexesByTable.has(g.table)) indexesByTable.set(g.table, []);
-    indexesByTable.get(g.table)!.push({
-      name: g.name,
-      columns: g.columns,
-      unique: g.unique,
-      definition: `${g.unique ? 'UNIQUE ' : ''}INDEX ${g.name} ON ${g.table}(${g.columns.join(', ')})`,
+  for (const rows of indexGroups.values()) {
+    rows.sort((a, b) => num(a.SEQ_IN_INDEX) - num(b.SEQ_IN_INDEX));
+    const first = rows[0]!;
+    if (first.INDEX_NAME === 'PRIMARY') continue; // PK is tracked separately
+    const plain = rows.every((r) => typeof r.COLUMN_NAME === 'string' && r.EXPRESSION == null && r.SUB_PART == null);
+    // Never publish a subset of a functional/prefix key as a complete key.
+    const columns = plain ? rows.map((r) => r.COLUMN_NAME!) : [];
+    const unique = num(first.NON_UNIQUE) === 0;
+    if (!indexesByTable.has(first.TABLE_NAME)) indexesByTable.set(first.TABLE_NAME, []);
+    indexesByTable.get(first.TABLE_NAME)!.push({
+      name: first.INDEX_NAME,
+      columns,
+      unique,
+      // Opaque, non-executable catalog facts. In particular, expressions must
+      // never be converted into guessed migration DDL. MySQL has no partial
+      // indexes; SUB_PART is a key prefix length, not a WHERE predicate.
+      definition: `MySQL index metadata: ${JSON.stringify({
+        type: first.INDEX_TYPE ?? null,
+        visible: first.IS_VISIBLE ?? null,
+        comment: first.INDEX_COMMENT ?? null,
+        keys: rows.map((r) => ({
+          column: r.COLUMN_NAME,
+          expression: r.EXPRESSION ?? null,
+          prefixLength: r.SUB_PART == null ? null : num(r.SUB_PART),
+          order: r.COLLATION ?? null,
+        })),
+      })}`,
     });
-    if (g.unique && g.columns.length > 0) {
-      if (!uniqueByTable.has(g.table)) uniqueByTable.set(g.table, []);
-      uniqueByTable.get(g.table)!.push(g.columns);
+    if (unique && columns.length > 0) {
+      if (!uniqueByTable.has(first.TABLE_NAME)) uniqueByTable.set(first.TABLE_NAME, []);
+      uniqueByTable.get(first.TABLE_NAME)!.push(columns);
     }
   }
 
   // ----- Relations -----
   // One field per column, as the PostgreSQL introspector requires.
   for (const [tableName, cols] of columnsByTable) assertDistinctColumnFields(tableName, cols);
+  // A to-one is decided per foreign key BEFORE naming, so it is named as
+  // PostgreSQL names it (`users.profile`): the child's columns are exactly its
+  // primary key or a unique key, and each column pair compares the way the
+  // enforced key does.
   const relationsByTable = buildRelationsFromForeignKeys(
     tableNames,
     foreignKeys,
     pkByTable,
     columnsByTable,
     options.logger,
+    options.legacyToManyUniques
+      ? undefined
+      : (fk) =>
+          fk.sourceColumns.length === fk.targetColumns.length &&
+          fk.sourceColumns.every((name, i) =>
+            mysqlSameKeyEquality(
+              nativeColumns.get(JSON.stringify([fk.sourceTable, name])),
+              nativeColumns.get(JSON.stringify([fk.targetTable, fk.targetColumns[i]])),
+            ),
+          ) &&
+          [pkByTable.get(fk.sourceTable) ?? [], ...(uniqueByTable.get(fk.sourceTable) ?? [])].some(
+            (key) => key.length === fk.sourceColumns.length && key.every((name) => fk.sourceColumns.includes(name)),
+          ),
   );
 
   // ----- Assemble TableMetadata -----
@@ -1565,7 +2121,9 @@ export async function introspectMysqlWith(
  * database), and close it. Wraps {@link introspectMysqlWith} for the
  * {@link DialectIntrospector} seam used by `introspect()` / `npx turbine generate`.
  */
-export async function introspectMysql(options: IntrospectOptions): Promise<SchemaMetadata> {
+export async function introspectMysql(
+  options: IntrospectOptions & { legacyToManyUniques?: boolean },
+): Promise<SchemaMetadata> {
   const createPool = await loadCreatePool();
   const config = parseMysqlConfig(options.connectionString);
   const pool = createPool({ ...config, ...MYSQL_DRIVER_FLAGS }) as Mysql2Pool;
@@ -1589,6 +2147,7 @@ export async function introspectMysql(options: IntrospectOptions): Promise<Schem
       include: options.include,
       exclude: options.exclude,
       logger: options.logger,
+      legacyToManyUniques: options.legacyToManyUniques,
     });
   } finally {
     await pool.end();
@@ -1772,8 +2331,8 @@ export async function turbineMysql(
     // NOTE: even on a `mysql2/promise` pool, the 'connection' event yields the
     // *raw* (callback-style) connection, its `.query()` returns a non-thenable
     // `Query`, so `.catch()`/`await` on it throws "result of query that is not a
-    // promise". Use the callback form here (fire-and-forget): if the SET fails we
-    // fall back to MySQL's default escaping, harmless since every value is a param.
+    // promise". Use the callback form here (fire-and-forget): if the SET fails,
+    // MySQL keeps its default escaping, harmless since every value is a param.
     mysql2Pool.on?.('connection', (rawConn: { query: (sql: string, cb: () => void) => void }) => {
       rawConn.query("SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES')", () => {});
     });

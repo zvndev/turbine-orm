@@ -19,7 +19,9 @@ export interface CapabilityRow {
 
 export const CAPABILITY_ROWS: readonly CapabilityRow[] = [
   { key: 'distinctOn', decides: "findMany `distinct` and groupBy `distinctOn`", values: { postgresql: true, sqlite: false, mysql: false, mssql: false, powdb: false } },
+  { key: 'tupleCursorPredicate', decides: "Explicit non-null scalar tuple cursor predicates", values: { postgresql: true, sqlite: false, mysql: false, mssql: false, powdb: false } },
   { key: 'positionalJson', decides: "Positional relation encoding (the default where true)", values: { postgresql: true, sqlite: false, mysql: false, mssql: false, powdb: false } },
+  { key: 'jsonObjectKeysAsWritten', decides: "JSON objects built for nested relations keep their keys in the order written (one-pass row decode)", values: { postgresql: true, sqlite: true, mysql: false, mssql: true, powdb: false } },
   { key: 'nullsOrderingClause', decides: "`NULLS FIRST` / `NULLS LAST` placement", values: { postgresql: true, sqlite: true, mysql: false, mssql: false, powdb: false } },
   { key: 'nullsSortHigh', decides: "NULL sorts after every value ascending", values: { postgresql: true, sqlite: false, mysql: false, mssql: false, powdb: false } },
   { key: 'insensitiveInList', decides: "`mode: 'insensitive'` on `in` / `notIn`", values: { postgresql: true, sqlite: false, mysql: false, mssql: false, powdb: false } },
@@ -48,6 +50,7 @@ export const CAPABILITY_ROWS: readonly CapabilityRow[] = [
   { key: 'backendCancel', decides: "Timed-out statements are cancelled on the server", values: { postgresql: true, sqlite: false, mysql: false, mssql: false, powdb: false } },
   { key: 'idleTransactionTimeout', decides: "Server-side idle limit for a transaction", values: { postgresql: true, sqlite: false, mysql: false, mssql: false, powdb: false } },
   { key: 'abortsTransactionOnError', decides: "A failed statement aborts the transaction", values: { postgresql: true, sqlite: false, mysql: false, mssql: false, powdb: false } },
+  { key: 'classifiesCommitAnswer', decides: "A failed COMMIT is classified from the server's error fields", values: { postgresql: true, sqlite: false, mysql: false, mssql: false, powdb: false } },
   { key: 'connectionDriver', decides: "`'pg-compatible'`, `'engine-driver'` or `'none'`", values: { postgresql: "pg-compatible", sqlite: "engine-driver", mysql: "engine-driver", mssql: "engine-driver", powdb: "none" } },
   { key: 'preparesEveryStatement', decides: "Every statement is prepared under a server-wide cap", values: { postgresql: false, sqlite: false, mysql: true, mssql: false, powdb: false } },
   { key: 'statementSyntax', decides: "Lexer for screening raw SQL (`null`: none)", values: { postgresql: "postgresql", sqlite: "sqlite", mysql: "mysql", mssql: "mssql", powdb: null } },

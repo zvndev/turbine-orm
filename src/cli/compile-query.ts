@@ -8,7 +8,7 @@
  * -shaped args, get back the exact statement the ORM would send, the bound
  * parameter list, and a read of whether the query is a mistake.
  *
- * ZERO DATABASE ACCESS, ENFORCED BY CONSTRUCTION RATHER THAN BY REVIEW.
+ * ZERO DATABASE ACCESS: THE POOL REFUSES EVERY METHOD.
  * `QueryInterface` takes a pool in its constructor and never touches it on the
  * build path, so this module hands it {@link SEALED_POOL}, whose every method
  * THROWS. That is the whole guarantee: a future build path that grew a query
@@ -21,8 +21,8 @@
  * module, not of its caller: {@link COMPILE_OPERATIONS} is the closed set, and
  * a name outside it never reaches a builder. A write's SQL text is arguably as
  * harmless to display as a read's, but the TOOL SURFACE is the security
- * boundary on an agent-facing server, and "we also compile deletes, we just
- * don't run them" is an argument, where "there is no write path" is a fact.
+ * boundary on an agent-facing server. Excluding writes from this set keeps a
+ * delete request from reaching any builder.
  *
  * A COMPILE FAILURE IS AN ANSWER, NOT AN ERROR. `where: { titel: 'x' }` throws
  * `ValidationError` (E003) and `with: { autor: true }` throws `RelationError`
@@ -34,8 +34,9 @@
  * hide it.
  */
 
+import type { Dialect } from '../dialect.js';
 import { TurbineError } from '../errors.js';
-import { missingIndexForRelation } from '../index-advisor.js';
+import { doctorIndexName, missingIndexForRelation } from '../index-advisor.js';
 import type { PgCompatPool } from '../pg-types.js';
 import type {
   AggregateArgs,
@@ -208,6 +209,8 @@ export interface CompiledQueryError {
 }
 
 export interface CompileQueryInput {
+  /** SQL compiler dialect; omitted preserves the PostgreSQL report. */
+  dialect?: Dialect;
   metadata: SchemaMetadata;
   table: TableMetadata;
   operation: CompileOperation;
@@ -302,6 +305,7 @@ export function compileQueryPlan(input: CompileQueryInput): CompileQueryReport {
     // what lets the report tell a named shape from an unnamed one.
     sqlCache: false,
     preparedStatements: false,
+    dialect: input.dialect,
   });
 
   let deferred: { sql: string; params: unknown[]; preparedName?: string };
@@ -321,6 +325,15 @@ export function compileQueryPlan(input: CompileQueryInput): CompileQueryReport {
   let relationsTruncated = false;
   if (isPlainObject(args.with)) {
     relationsTruncated = walkWith(metadata, table, args.with, 1, '', relations);
+  }
+  if (input.dialect) {
+    const q = input.dialect.quoteIdentifier;
+    for (const relation of relations) {
+      const probe = relation.unindexedProbe;
+      if (probe) {
+        probe.createSql = `CREATE INDEX ${q(doctorIndexName(probe.table, probe.columns))} ON ${q(probe.table)} (${probe.columns.map(q).join(', ')})`;
+      }
+    }
   }
   const relationDepth = relations.reduce((max, relation) => Math.max(max, relation.depth), 0);
 
@@ -376,6 +389,17 @@ export function compileQueryPlan(input: CompileQueryInput): CompileQueryReport {
       'This is the statement the ORM would send. It was compiled and NOT executed: no connection was opened and ' +
       'no query ran, so the numbers here are properties of the query, never of your data.',
   };
+  if (input.dialect?.capabilities.connectionDriver === 'engine-driver') {
+    success.preparedStatement = {
+      named: false,
+      name: null,
+      note: 'Engine-native statements have no PostgreSQL server-side prepared-statement name.',
+    };
+    success.advice = success.advice.filter((entry) => !entry.code.includes('prepared'));
+    if (effective === 'join' && relations.length > 0) {
+      success.statements.note = 'One statement: JSON subqueries load relations inside the SELECT.';
+    }
+  }
   return { ok: true, ...success };
 }
 

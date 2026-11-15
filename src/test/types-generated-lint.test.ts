@@ -11,8 +11,8 @@
  * typescript-eslint is not a dependency here, so this asserts the structure
  * the rule checks, through the TypeScript parser: in each generated file, no
  * class shares its name with an interface (or a type alias, which would be a
- * duplicate identifier). Checked against the real rule: the generator before
- * this change produced its four reports, at exactly the declarations this test
+ * duplicate identifier). Checked against the real rule: the generator
+ * with class/interface declaration merging produced its four reports, at exactly the declarations this test
  * names.
  */
 

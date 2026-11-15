@@ -1,0 +1,89 @@
+import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
+import { describe, it } from 'node:test';
+import { generateIndex, generateTypes } from '../generate.js';
+import { defineSchema } from '../schema-builder.js';
+import { schemaDefToMetadata } from '../schema-metadata.js';
+import { introspectSqliteDatabase } from '../sqlite.js';
+
+function catalog() {
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec(`CREATE TABLE uint8_arrays(id INTEGER PRIMARY KEY, title TEXT NOT NULL);
+      CREATE TABLE assets(id INTEGER PRIMARY KEY, data BLOB NOT NULL UNIQUE, optional BLOB);
+      INSERT INTO assets VALUES(1, X'0001FEFF', NULL);`);
+    const native = db.prepare('SELECT data FROM assets').get()!;
+    assert.deepEqual(native.data, new Uint8Array([0, 1, 254, 255]));
+    return introspectSqliteDatabase(db);
+  } finally {
+    db.close();
+  }
+}
+
+describe('intrinsic binary types beside public entity names', () => {
+  it('qualifies actual native catalog BLOB rows, writes and unique keys', () => {
+    const input = catalog();
+    const before = JSON.stringify(input);
+    const types = generateTypes(input, { noTimestamp: true, target: 'sqlite' });
+    assert.match(types, /export interface Uint8Array \{/);
+    assert.match(types, /data: globalThis.Uint8Array;/);
+    assert.match(types, /optional: globalThis.Uint8Array \| null;/);
+    assert.match(types, /optional\?: globalThis.Uint8Array \| null \| undefined;/);
+    assert.match(types, /UpdateOperatorInput<globalThis.Uint8Array>/);
+    assert.match(types, /\{ data: globalThis.Uint8Array \}/);
+    assert.match(generateIndex(input, { noTimestamp: true, target: 'sqlite' }), /readonly uint8Arrays:/);
+    assert.equal(JSON.stringify(input), before);
+  });
+
+  it('qualifies the public code-first bytea mapping including arrays', () => {
+    const input = schemaDefToMetadata(
+      defineSchema({
+        buffers: { id: { type: 'serial', primaryKey: true } },
+        assets: {
+          id: { type: 'serial', primaryKey: true },
+          data: { type: 'bytea', notNull: true },
+          many: { type: 'bytea', array: true },
+        },
+      }),
+    );
+    const types = generateTypes(input, { noTimestamp: true });
+    assert.match(types, /export interface Buffer \{/);
+    assert.match(types, /data: globalThis.Buffer;/);
+    assert.match(types, /many: globalThis.Buffer\[\] \| null;/);
+  });
+
+  it('preserves exact caller declarations and overrides', () => {
+    const input = catalog();
+    input.tables.assets!.columns.find((c) => c.name === 'optional')!.declaredTsType = 'Uint8Array';
+    const types = generateTypes(input, { noTimestamp: true, columnTypes: { 'assets.data': 'Uint8Array' } });
+    assert.match(types, /data: Uint8Array;/);
+    assert.match(types, /optional: Uint8Array \| null;/);
+    assert.doesNotMatch(types, /globalThis.Uint8Array/);
+  });
+
+  it('preserves custom type expressions and nonbinary metadata', () => {
+    const input = catalog();
+    const columns = input.tables.assets!.columns;
+    columns.find((c) => c.name === 'data')!.tsType = 'Uint8Array & { brand: "custom" }';
+    const optional = columns.find((c) => c.name === 'optional')!;
+    optional.dialectType = optional.pgType = 'TEXT';
+    optional.tsType = 'Uint8Array | null';
+    const types = generateTypes(input, { noTimestamp: true });
+    assert.match(types, /data: Uint8Array & \{ brand: "custom" \};/);
+    assert.match(types, /optional: Uint8Array \| null;/);
+    assert.doesNotMatch(types, /globalThis.Uint8Array/);
+  });
+
+  it('preserves enum references before binary inference', () => {
+    const input = catalog();
+    delete input.tables.uint8_arrays;
+    input.enums.blob = ['binary', 'Uint8Array'];
+    for (const c of input.tables.assets!.columns) {
+      if (c.name !== 'id') c.dialectType = c.pgType = 'blob';
+    }
+    const types = generateTypes(input, { noTimestamp: true });
+    assert.match(types, /export type Blob = 'binary' \| 'Uint8Array';/);
+    assert.match(types, /data: Blob;/);
+    assert.doesNotMatch(types, /globalThis.Uint8Array/);
+  });
+});

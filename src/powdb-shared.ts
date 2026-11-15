@@ -13,7 +13,7 @@
  * is half-initialized: whichever module the loader reaches first decides, so
  * the same code can work under ESM and fail under CJS, or work until an import
  * is reordered. The failure surfaces far from its cause, as an undefined
- * binding at call time. `scripts/check-import-cycles.mjs` now fails the build
+ * binding at call time. `scripts/check-import-cycles.mjs` fails the build
  * on any such cycle under `src/`, so this file is what keeps that gate green
  * for the PowDB engine.
  *
@@ -296,8 +296,8 @@ export function requireCapability(
 
 /**
  * PowQL column types Turbine emits: the four writable scalars plus PowDB's
- * native `json` document type (added to the map in the 0.12/0.13 parity round,
- * see {@link isJsonColumn}). A `json` column stores a canonical binary document
+ * native `json` document type (see {@link isJsonColumn}). A `json` column stores
+ * a canonical binary document
  * (sorted keys, int/float distinction preserved) that Turbine writes as a JSON
  * string literal and reads back by parsing the canonical JSON text.
  */
@@ -309,7 +309,7 @@ export type PowqlType = 'str' | 'int' | 'float' | 'bool' | 'json';
  * THE ONE AUTHORITY for that question, and deliberately not a regular
  * expression. The obvious spelling, `tsType.replace(/\s*\|\s*null$/i, '')`,
  * is POLYNOMIAL: `\s*` can start at every position, so an input of N spaces
- * with no `|` costs O(N^2). Measured on Node 24 before this change: 10,000
+ * with no `|` costs O(N^2). Measured for that regex on Node 24: 10,000
  * spaces took 39.6 ms, 20,000 took 150.3 ms and 40,000 took 617.5 ms, the
  * quadratic signature. It was written eight times across powdb.ts and powql.ts.
  *
@@ -659,8 +659,9 @@ export function coerceValue(raw: string, col: ColumnMetadata, enums?: PowdbEnums
   if (powdbEnumLabels(col, enums)) return raw === 'null' && col.nullable ? null : raw;
   const ts = baseTsType(col.tsType);
   const json = isJsonColumn(col, enums);
-  // NULL bareword: unambiguous for non-string columns; for `str` we cannot tell a
-  // literal "null" from SQL NULL, so a nullable str of value "null" reads as null.
+  // NULL bareword: unambiguous for non-string columns; for `str`, a literal
+  // "null" is indistinguishable from SQL NULL. A nullable str of value "null"
+  // therefore reads as null.
   // For a `json` column the bareword `null` (a legacy-wire rendering shared by an
   // absent value AND a top-level JSON-null document, documented residual,
   // resolved on the native transport by the WireValue path) maps to null; a JSON
@@ -731,7 +732,7 @@ export function coerceNativeValue(value: unknown, col: ColumnMetadata): unknown 
  * projections round-trip unchanged. `native` selects the coercion policy: the
  * default `false` handles the legacy string wire (every cell is a string, via
  * {@link coerceValue}); `true` handles the native typed wire, where non-string
- * cells arrive pre-typed and go through {@link coerceNativeValue} (see F3).
+ * cells arrive pre-typed and go through {@link coerceNativeValue}.
  * Callers on the native transport pass `this.pool.capabilities.nativeRaw`.
  */
 export function rowToEntity(

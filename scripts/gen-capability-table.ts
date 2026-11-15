@@ -40,7 +40,9 @@ const ENGINES = [
 /** What each key decides, in the order the page lists them. */
 const DECIDES: Record<keyof EngineCapabilities, string> = {
   distinctOn: 'findMany `distinct` and groupBy `distinctOn`',
+  tupleCursorPredicate: 'Explicit non-null scalar tuple cursor predicates',
   positionalJson: 'Positional relation encoding (the default where true)',
+  jsonObjectKeysAsWritten: 'JSON objects built for nested relations keep their keys in the order written (one-pass row decode)',
   nullsOrderingClause: '`NULLS FIRST` / `NULLS LAST` placement',
   nullsSortHigh: 'NULL sorts after every value ascending',
   insensitiveInList: "`mode: 'insensitive'` on `in` / `notIn`",
@@ -69,6 +71,7 @@ const DECIDES: Record<keyof EngineCapabilities, string> = {
   backendCancel: 'Timed-out statements are cancelled on the server',
   idleTransactionTimeout: 'Server-side idle limit for a transaction',
   abortsTransactionOnError: 'A failed statement aborts the transaction',
+  classifiesCommitAnswer: "A failed COMMIT is classified from the server's error fields",
   connectionDriver: "`'pg-compatible'`, `'engine-driver'` or `'none'`",
   preparesEveryStatement: 'Every statement is prepared under a server-wide cap',
   statementSyntax: 'Lexer for screening raw SQL (`null`: none)',

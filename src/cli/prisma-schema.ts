@@ -444,7 +444,7 @@ function matchBrace(s: string, open: number): number {
 /**
  * Scan the top level for `keyword Name { ... }` blocks via brace matching.
  *
- * A header whose keyword is not one we handle is skipped, and now RECORDED:
+ * A header whose keyword is not handled here is skipped and RECORDED:
  * the switch in `parsePrismaSchema` has a `default` branch that pushes an
  * "unsupported block" warning, but nothing could ever reach it because the
  * filter here dropped those blocks first. The body is deliberately still
@@ -489,7 +489,7 @@ function scanBlocks(src: string, warnings: string[]): RawBlock[] {
 
 /**
  * Split a block body into logical lines, keeping each line's absolute source
- * offset so we can report exact line numbers. Prisma fields and block
+ * offset to report exact line numbers. Prisma fields and block
  * attributes are single-line.
  */
 function bodyLines(body: string, bodyOffset: number, src: string): { text: string; line: number }[] {

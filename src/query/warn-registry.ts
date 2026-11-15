@@ -61,7 +61,7 @@ function namespaceSet(ns: string): Set<string> {
  * process-wide. Returns `true` exactly once per distinct key (the caller should
  * emit its warning then), `false` on every subsequent call for that key, and
  * `false` once the namespace has recorded {@link WARN_ONCE_CAP} distinct keys
- * (bounded growth; the warning simply stops rather than re-firing).
+ * (bounded growth; the warning stops rather than re-firing).
  */
 export function shouldWarnOnce(ns: string, key: string): boolean {
   const set = namespaceSet(ns);

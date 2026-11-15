@@ -96,7 +96,7 @@ jobs:
   # The coverage jobs stay on Node 22 on purpose: c8's V8 coverage does not
   # produce usable output on Node 26 yet.
   unit-tests:
-    timeout-minutes: 15
+    timeout-minutes: 45
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -109,13 +109,132 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run test:unit
+      - name: Require optional SQLite prototype-column preservation on Node 20
+        if: matrix.node-version == 20
+        shell: bash
+        run: |
+          peer="${{ runner.temp }}/sqlite-binding-peer"
+          npm install --prefix "$peer" --no-package-lock --no-audit --no-fund better-sqlite3@12.11.1
+          TURBINE_REQUIRE_SQLITE_BINDING=1 TURBINE_SQLITE_BINDING_PEER="$peer/node_modules/better-sqlite3" \
+            npx tsx --test src/test/sqlite-binding.test.ts
+      - name: Verify SQLite fixture lifetime failure controls
+        run: node --test tooling/sqlite-fixture-lifetimes/harness.test.mjs
+      - name: Audit native SQLite fixture ownership
+        if: matrix.node-version != 20
+        run: node tooling/sqlite-fixture-lifetimes/run.mjs --out "$RUNNER_TEMP/sqlite-fixture-lifetimes"
+      - name: Exercise consumer measurement failure and compiler controls
+        run: node --test tooling/consumer-cost/measure-consumer-cost.test.mjs tooling/consumer-cost/comparison.test.mjs tooling/consumer-cost/runtime-role-closure.test.mjs
+      - name: Verify optional package source and payload admission
+        run: node --test tooling/optional-package/artifact-contract.test.mjs
+      - name: Verify MySQL preparation measurement guards
+        run: node --test benchmarks/mysql-preparation/harness.test.mjs
+      - name: Verify MySQL streaming resource evidence guards
+        run: node --test benchmarks/mysql-streaming/harness.test.mjs
+      - name: Verify PostgreSQL streaming resource and ownership guards
+        run: node --test benchmarks/postgres-streaming/harness.test.mjs
+      - name: Exercise PostgreSQL streaming evidence omissions
+        run: node benchmarks/postgres-streaming/omissions.mjs
+      - name: Verify native relation workload evidence guards
+        run: node --test benchmarks/sqlite-relations/harness.test.mjs benchmarks/mysql-relations/guards.test.mjs
+      - name: Exercise SQLite relation evidence omissions
+        run: node benchmarks/sqlite-relations/omissions.mjs
+      - name: Exercise MySQL relation evidence omissions
+        run: node benchmarks/mysql-relations/controls.mjs "$RUNNER_TEMP/mysql-relations-omissions.json" guards
+      - name: Verify SQLite contention and query-cost report guards
+        run: node --test benchmarks/sqlite-contention/harness.test.mjs benchmarks/sqlite-query-cost/harness.test.mjs
+      - name: Verify lifecycle consumer failure controls
+        run: node --test tooling/lifecycle-examples/harness.test.mjs tooling/lifecycle-upgrades/harness.test.mjs tooling/native-consumer-contracts/harness.test.mjs tooling/native-integer-types/harness.test.mjs
+      - name: Verify optional PostgreSQL transport artifact and cleanup guards
+        run: node --test tooling/optional-pg-transports/harness.test.mjs
+      - name: Verify PostgreSQL pagination evidence validator controls
+        run: node --import tsx --test benchmarks/postgres-pagination/validator.test.mjs
+      - name: Verify PostgreSQL tuple-keyset evidence guards
+        run: node --test benchmarks/postgres-keyset/guards.test.mjs
+      - name: Verify native SQLite preparation and decoding controls
+        if: matrix.node-version != 20
+        run: node --import tsx --test benchmarks/sqlite-preparation/workload.test.mjs
+      - name: Install locked evidence control dependencies
+        if: matrix.node-version == 24
+        run: npm ci --prefix benchmarks/evidence --ignore-scripts
+      - name: Validate exact-result evidence controls
+        if: matrix.node-version == 24
+        run: npm test --prefix benchmarks/evidence
+      - name: Verify required native evidence gate controls
+        if: matrix.node-version == 24
+        run: node --test benchmarks/evidence/native-gate.test.mjs
+
+  # SQLite migration writers need native authorization introduced in Node 24.10.
+  # Ordinary SQLite remains required in the Node 22 integration/coverage jobs.
+  sqlite-migrations:
+    needs: pack
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: ['24.10.0', '24']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      - name: Generate the module imported by the source CLI
+        run: npm run gen:studio
+      - name: Exercise native SQLite migrations and actual CLI lifecycle
+        run: npx tsx --test src/test/migration-operations-sqlite.test.ts src/test/sqlite-migrations.test.ts src/test/sqlite-cli-project-command.test.ts src/test/sqlite-cli-project.test.ts src/test/sqlite-cli-project-config.test.ts src/test/sqlite-schema.test.ts src/test/sqlite-schema-command.test.ts src/test/sqlite-table-modes.test.ts src/test/sqlite-seed.test.ts src/test/sqlite-seed-cli.test.ts src/test/sqlite-introspection-metadata.test.ts src/test/sqlite-doctor.test.ts src/test/sqlite-doctor-dispatch.test.ts
+        env:
+          TURBINE_REQUIRE_ENGINE: sqlite,sqlite-migrations
+      - name: Download the tested package for native consumer examples
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: package-tarball
+          path: ${{ runner.temp }}/package-tarball
+      - name: Verify packed native SQLite consumer examples
+        run: >-
+          node tooling/lifecycle-examples/verify.mjs
+          --tarball "${{ runner.temp }}/package-tarball/${{ needs.pack.outputs.tarball }}"
+          --engine sqlite --report "${{ runner.temp }}/sqlite-lifecycles.json"
+      - name: Require the optional native SQLite binding and installed exports
+        shell: bash
+        run: |
+          consumer="${{ runner.temp }}/sqlite-binding-consumer"
+          mkdir -p "$consumer"
+          npm install --prefix "$consumer" --no-package-lock --no-audit --no-fund \
+            "${{ runner.temp }}/package-tarball/${{ needs.pack.outputs.tarball }}" better-sqlite3@12.11.1
+          TURBINE_REQUIRE_SQLITE_BINDING=1 TURBINE_SQLITE_BINDING_PEER="$consumer/node_modules/better-sqlite3" \
+            npx tsx --test src/test/sqlite-binding.test.ts src/test/sqlite-binding-node-values.test.ts src/test/generate-better-sqlite3.test.ts src/test/sqlite-result-metadata.test.ts src/test/sqlite-driver-capabilities.test.ts src/test/sqlite-materialization-boundaries.test.ts src/test/sqlite-bulk-positional.test.ts
+          cp src/test/fixtures/sqlite-binding-consumer.mjs "$consumer/verify.mjs"
+          cd "$consumer"
+          node verify.mjs esm
+          node verify.mjs cjs
+          mv node_modules/better-sqlite3 node_modules/.sqlite-peer-held
+          trap 'mv node_modules/.sqlite-peer-held node_modules/better-sqlite3' EXIT
+          node verify.mjs missing-esm
+          node verify.mjs missing-cjs
+      # The shared cross-engine battery (relation reads, nested writes, upsert,
+      # transactions), the parent-scoped nested writes and the unique foreign key
+      # relation parity, on the binding as well as on node:sqlite. These files
+      # hard-code no driver: each registers a better-sqlite3 run that
+      # TURBINE_REQUIRE_SQLITE_BINDING=1 turns from a skip into a failure when the
+      # binding does not load.
+      - name: Run the shared SQLite battery and nested writes on the optional binding
+        shell: bash
+        run: |
+          peer="${{ runner.temp }}/sqlite-battery-peer"
+          npm install --prefix "$peer" --no-package-lock --no-audit --no-fund better-sqlite3@12.11.1
+          TURBINE_REQUIRE_SQLITE_BINDING=1 TURBINE_SQLITE_BINDING_PEER="$peer/node_modules/better-sqlite3" \
+            npx tsx --test src/test/cross-engine-correctness.test.ts src/test/nested-write-parent-scope.test.ts \
+            src/test/relation-unique-fk-parity.test.ts src/test/relation-unique-fk-options.test.ts
+        env:
+          TURBINE_REQUIRE_ENGINE: sqlite
 
   # Coverage runs the FULL suite against a real Postgres, seeded exactly like the
   # integration-tests job. Without a database roughly half of the query engine is
   # unreachable, so the measurement (and the thresholds in .c8rc.json) would be
   # against a run that can never exercise execution paths, only SQL generation.
   coverage:
-    timeout-minutes: 30
+    timeout-minutes: 90
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -147,6 +266,8 @@ jobs:
         env:
           DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
           PGPASSWORD: test
+      - name: Verify coverage merge identities
+        run: node --test tooling/coverage-regressions/merge.test.mjs
       - run: npm run test:coverage
         env:
           DATABASE_URL: postgres://test:test@localhost:5432/turbine_test
@@ -203,13 +324,14 @@ jobs:
   # default statement_timeout path that was previously never integration-tested).
   # Failures gate PRs.
   integration-tests:
-    timeout-minutes: 30
+    needs: pack
+    timeout-minutes: 60
     name: integration-tests (postgres ${{ matrix.postgres-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        postgres-version: [14, 15, 16, 17]
+        postgres-version: [14, 15, 16, 17, 18]
     services:
       postgres:
         # pgvector/pgvector, not stock postgres: the image is postgres:<major> with
@@ -237,6 +359,27 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - name: Download the exact package for optional WS native consumers
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: package-tarball
+          path: ${{ runner.temp }}/package-tarball
+      - name: Verify installed optional WS transport on the disposable PostgreSQL service
+        run: >-
+          node scripts/check-optional-pg-transports.mjs
+          "${{ runner.temp }}/package-tarball/${{ needs.pack.outputs.tarball }}"
+          --sha256 "${{ needs.pack.outputs.sha256 }}" --native
+          --report "${{ runner.temp }}/optional-pg-native.json"
+        env:
+          TURBINE_OPTIONAL_PG_SERVICE_URL: postgres://test:test@localhost:5432/turbine_test
+          TURBINE_OPTIONAL_PG_DISPOSABLE: '1'
+      - name: Retain installed optional transport cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: optional-pg-native-${{ matrix.postgres-version }}
+          path: ${{ runner.temp }}/optional-pg-native.json
+          if-no-files-found: error
       - name: Install psql client
         run: sudo apt-get update && sudo apt-get install -y postgresql-client
       - name: Seed test database
@@ -253,6 +396,54 @@ jobs:
           # there: this job runs the whole suite on Node 22, so node:sqlite is
           # present and its gates have no business skipping.
           TURBINE_REQUIRE_ENGINE: postgres,sqlite
+
+      - name: Require WS source tests and cleanup hooks on the disposable service
+        run: node tooling/optional-pg-transports/source-suite-gate.mjs
+        env:
+          TURBINE_NEON_WS_PG_SERVICE_URL: postgres://test:test@localhost:5432/turbine_test
+          TURBINE_NEON_WS_PG_DISPOSABLE: '1'
+          TURBINE_REQUIRE_NEON_WS: '1'
+          TURBINE_NEON_WS_GATE_REPORT: ${{ runner.temp }}/optional-pg-source.json
+      - name: Retain native WS source and cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: optional-pg-source-${{ matrix.postgres-version }}
+          path: ${{ runner.temp }}/optional-pg-source.json
+          if-no-files-found: error
+
+      - name: Require actual Neon HTTP network queries and native effects
+        run: node src/test/fixtures/neon-http/gate-run.mjs
+        env:
+          NEON_HTTP_NATIVE_URL: postgres://test:test@localhost:5432/turbine_test
+          NEON_HTTP_EVIDENCE: ${{ runner.temp }}/neon-http-native
+      - name: Retain native HTTP bridge evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: neon-http-native-pg${{ matrix.postgres-version }}
+          path: ${{ runner.temp }}/neon-http-native/
+          if-no-files-found: error
+
+      # Use a separate disposable pinned service; keep the existing battery intact.
+      - name: Select evidence runtime after the existing PostgreSQL battery
+        if: matrix.postgres-version == 17
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.10.0'
+      - name: Install locked native evidence dependencies
+        if: matrix.postgres-version == 17
+        run: npm ci --prefix benchmarks/evidence --ignore-scripts
+      - name: Require exact PostgreSQL native stream audits and effects
+        if: matrix.postgres-version == 17
+        run: node benchmarks/evidence/native-gate-container.mjs postgresql "${{ runner.temp }}/postgres-native-gate.json"
+      - name: Retain PostgreSQL native gate provenance and cleanup
+        if: ${{ always() && matrix.postgres-version == 17 }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: postgres-native-stream-gate
+          path: ${{ runner.temp }}/postgres-native-gate.json*
+          if-no-files-found: error
 
   # Real CockroachDB job. The CRDB/Yugabyte adapters were only ever unit-tested
   # with mocked clients, so a bug in the adapter's statementTimeout set_config()
@@ -328,7 +519,7 @@ jobs:
         # Only the two tests whose semantics CockroachDB shares. The rest of the
         # file reads pg_locks and the PostgreSQL four-mode matrix.
         run: |
-          npx tsx --test --test-name-pattern "skipLocked|noWait: LockNotAvailableError" src/test/wave-c-locks-pg.integration.test.ts
+          npx tsx --test --test-name-pattern "skipLocked|noWait: LockNotAvailableError" src/test/row-locks-pg.integration.test.ts
         env:
           DATABASE_URL: postgres://root@localhost:26257/turbine_test?sslmode=disable
           TURBINE_REQUIRE_ENGINE: postgres
@@ -341,9 +532,10 @@ jobs:
   # endpoint) on a real pooler. ubuntu-24.04's package is PgBouncer 1.22; the
   # package starts its own service on 6432, which is stopped first.
   pgbouncer-integration:
-    timeout-minutes: 20
+    timeout-minutes: 30
     name: pgbouncer-integration
     runs-on: ubuntu-24.04
+    needs: pack
     services:
       postgres:
         image: postgres:17
@@ -367,7 +559,7 @@ jobs:
       - run: npm ci
       - name: Start PgBouncer (transaction mode, no prepared-statement tracking, small server pool)
         run: |
-          sudo apt-get update && sudo apt-get install -y pgbouncer
+          sudo apt-get update && sudo apt-get install -y pgbouncer libevent-dev libssl-dev build-essential pkg-config bison flex
           sudo systemctl stop pgbouncer || true
           echo '"test" ""' > "$RUNNER_TEMP/users.txt"
           cat > "$RUNNER_TEMP/pgbouncer.ini" <<INI
@@ -393,6 +585,84 @@ jobs:
         env:
           PGBOUNCER_URL: postgres://test@127.0.0.1:6432/turbine_test
           TURBINE_REQUIRE_ENGINE: pgbouncer
+      # Owned exact-runtime contract workflow. Existing prepared-plan tests above stay intact.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.10.0
+      - name: Record exact Node 24 binary
+        id: pooler-node24
+        run: echo "binary=$(node -p process.execPath)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.16.0
+      - name: Download the tested pooler consumer archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: package-tarball
+          path: ${{ runner.temp }}/pooler-package
+      - name: Run exact native pooler contracts with the tested archive
+        run: |
+          set -euo pipefail
+          bash src/test/fixtures/pg-pooler/acquire.sh "$RUNNER_TEMP/pooler-build"
+          bash src/test/fixtures/pg-pooler/acquire-postgres.sh "$RUNNER_TEMP/pooler-pg"
+          npm run build
+          export PG_PREFIX="$RUNNER_TEMP/pooler-pg/install"
+          export PG_POOLER_BINARY="$RUNNER_TEMP/pooler-build/pgbouncer-1.26.1/pgbouncer"
+          export PG_POOLER_ARCHIVE="$RUNNER_TEMP/pooler-package/${{ needs.pack.outputs.tarball }}"
+          export PG_POOLER_SHA256="${{ needs.pack.outputs.sha256 }}"
+          export PG_POOLER_NODE22="$(node -p process.execPath)"
+          export PG_POOLER_NODE24="${{ steps.pooler-node24.outputs.binary }}"
+          export PG_POOLER_NPM_CLI="$(readlink -f "$(command -v npm)")"
+          export PG_POOLER_EVIDENCE="$RUNNER_TEMP/pooler-contract-evidence"
+          node src/test/fixtures/pg-pooler/native-run.mjs
+      - name: Prove composed notification live-query application on exact Node 22 and 24
+        env:
+          PG_PREFIX: ${{ runner.temp }}/pooler-pg/install
+          LQ_ARCHIVE: ${{ runner.temp }}/pooler-package/${{ needs.pack.outputs.tarball }}
+          LQ_SHA256: ${{ needs.pack.outputs.sha256 }}
+          LQ_NODE24: ${{ steps.pooler-node24.outputs.binary }}
+        run: |
+          set -euo pipefail
+          node src/test/fixtures/live-query-hub-pg/native-run.mjs "$LQ_ARCHIVE" "$LQ_SHA256" "$RUNNER_TEMP/live-query-hub/node22"
+          PATH="$(dirname "$LQ_NODE24"):$PATH" "$LQ_NODE24" src/test/fixtures/live-query-hub-pg/native-run.mjs "$LQ_ARCHIVE" "$LQ_SHA256" "$RUNNER_TEMP/live-query-hub/node24"
+      - name: Retain composed live-query application and cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: notification-live-query-application
+          path: ${{ runner.temp }}/live-query-hub
+          if-no-files-found: error
+      - name: Require native HTTP interruption and caller ownership checks on exact Node 22 and 24
+        id: http-interruption
+        env:
+          PG_PREFIX: ${{ runner.temp }}/pooler-pg/install
+          NEON_HTTP_ARCHIVE: ${{ runner.temp }}/pooler-package/${{ needs.pack.outputs.tarball }}
+          NEON_HTTP_ARCHIVE_SHA256: ${{ needs.pack.outputs.sha256 }}
+          HTTP_NODE24: ${{ steps.pooler-node24.outputs.binary }}
+        run: |
+          set -euo pipefail
+          HTTP22_EVIDENCE="$(mktemp -d /tmp/nh22.XXXXXX)"
+          HTTP24_EVIDENCE="$(mktemp -d /tmp/nh24.XXXXXX)"
+          echo "node22=$HTTP22_EVIDENCE" >> "$GITHUB_OUTPUT"
+          echo "node24=$HTTP24_EVIDENCE" >> "$GITHUB_OUTPUT"
+          NEON_HTTP_INTERRUPTION_EVIDENCE="$HTTP22_EVIDENCE" node --test --test-concurrency=1 src/test/fixtures/neon-http/native-interruption.test.mjs src/test/fixtures/neon-http/gate-interruption.test.mjs
+          NEON_HTTP_INTERRUPTION_EVIDENCE="$HTTP24_EVIDENCE" "$HTTP_NODE24" --test --test-concurrency=1 src/test/fixtures/neon-http/native-interruption.test.mjs src/test/fixtures/neon-http/gate-interruption.test.mjs
+      - name: Retain native HTTP interruption and cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-http-interruption-evidence
+          path: |
+            ${{ steps.http-interruption.outputs.node22 }}
+            ${{ steps.http-interruption.outputs.node24 }}
+          if-no-files-found: error
+      - name: Retain pooler contract and cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: optional-pg-pooler-evidence
+          path: ${{ runner.temp }}/pooler-contract-evidence
+          if-no-files-found: error
 
   # Real MySQL 8 job for the turbine-orm/mysql engine (Phase 2, multi-dialect).
   # The mysql2 named-param driver + the `reselect` result strategy (no RETURNING)
@@ -405,7 +675,7 @@ jobs:
   # the build-only + mock-driver tests still run. mysql2 is a devDep, so `npm ci`
   # installs it. Hard gate, engine integration regressions fail the PR.
   mysql-integration:
-    timeout-minutes: 30
+    timeout-minutes: 40
     name: mysql-integration
     runs-on: ubuntu-latest
     services:
@@ -470,12 +740,38 @@ jobs:
       # The Postgres-oracle cross-engine battery (src/test/oracle/engines/): the
       # same scenarios on Postgres and on MySQL, compared with type tags. A
       # difference fails unless src/test/oracle/engines/allowlist.ts names it.
+      - name: Build and exercise native MySQL tools and seed CLI in both module formats
+        run: |
+          npm run build
+          MYSQL_TOOLS_FORMAT=esm node --test tooling/mysql-tools/integration.mjs
+          MYSQL_TOOLS_FORMAT=cjs node --test tooling/mysql-tools/integration.mjs
+          npx tsx --test --test-concurrency=1 src/test/mysql-seed.test.ts src/test/mysql-seed-cli.test.ts src/test/mysql-seed-packed.test.ts
+        env:
+          MYSQL_URL: mysql://root:root@127.0.0.1:3306/turbine_test
+          TURBINE_REQUIRE_ENGINE: mysql
       - name: Cross-engine oracle battery, Postgres against MySQL
         run: npx tsx --test src/test/oracle-engines-mysql.test.ts
         env:
           DATABASE_URL: postgres://test:test@localhost:5432/turbine_oracle
           MYSQL_URL: mysql://root:root@127.0.0.1:3306/turbine_test
           TURBINE_REQUIRE_ENGINE: postgres,mysql
+
+      # Use a separate disposable pinned service; keep the existing battery intact.
+      - name: Select evidence runtime after the existing MySQL battery
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24.10.0'
+      - name: Install locked native evidence dependencies
+        run: npm ci --prefix benchmarks/evidence --ignore-scripts
+      - name: Require exact MySQL native stream audits and effects
+        run: node benchmarks/evidence/native-gate-container.mjs mysql "${{ runner.temp }}/mysql-native-gate.json"
+      - name: Retain MySQL native gate provenance and cleanup
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mysql-native-stream-gate
+          path: ${{ runner.temp }}/mysql-native-gate.json*
+          if-no-files-found: error
 
   # Real SQL Server 2022 job for the turbine-orm/mssql engine (Phase 3, multi-dialect).
   # The FOR JSON PATH nested-relation generator, the OUTPUT/MERGE result strategy, the
@@ -663,7 +959,7 @@ jobs:
         run: test -f dist/index.js
       # Bundle size is gated by size-limit alone, it measures the REAL bundled
       # import graph (esbuild) of each public entry against the limits declared
-      # in .size-limit.js (~31 kB main / ~22 kB edge, under 35/25 limits). This
+      # in .size-limit.js, which is the only place the limits are written. This
       # replaces the previous hard-coded `npm pack` KB ceiling (which was stale
       # at 350 kB and measured tarball size, not the runtime closure). One
       # source of truth, shared with `npm run size`.
@@ -675,6 +971,8 @@ jobs:
       # conditions (scripts/check-edge-bundle.mjs, with a built-in control).
       - name: Edge bundle check
         run: npm run check:edge
+      - name: Driver-neutral source import boundary and refusal contracts
+        run: npm run test:core
 
   # Packs the tarball ONCE. Every job below that installs the package installs
   # this file, and release.yml publishes this file, so nothing reaches the
@@ -944,12 +1242,18 @@ jobs:
     timeout-minutes: 20
     runs-on: ubuntu-latest
     needs: pack
+    strategy:
+      matrix:
+        node-version: ['22.16.0', '22', '24.10.0']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
+          node-version: ${{ matrix.node-version }}
           cache: npm
+      # The packed SQL consumer script uses the repository's pinned TypeScript
+      # compiler; its isolated consumer still contains no driver packages.
+      - run: npm ci
       - name: Download the tested tarball
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -983,6 +1287,84 @@ jobs:
         # CI otherwise only ever installs the newest pg in range, which is how a
         # ^8.13.1 range shipped code that needs 8.15.0 to import at all.
         run: node scripts/check-pg-floor.mjs "$TARBALL"
+      - name: Verify packed TypeScript config loading in ESM and CommonJS projects
+        run: node scripts/check-cli-typescript.mjs "$TARBALL"
+      - name: Verify packed SQLite seed modules and transaction lifecycle
+        run: node scripts/check-sqlite-seed.mjs "$TARBALL"
+      - name: Verify combined installed local libSQL project and seed workflow
+        run: node scripts/check-libsql-project.mjs "$TARBALL" --sha256 "${{ needs.pack.outputs.sha256 }}" --report "${{ runner.temp }}/libsql-project-workflow.json"
+      - name: Retain combined local libSQL workflow evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: libsql-project-workflow-${{ matrix.node-version }}
+          path: ${{ runner.temp }}/libsql-project-workflow.json
+          if-no-files-found: error
+      - name: Verify packed local libSQL generated consumers and native transactions
+        run: node src/test/fixtures/libsql-package.mjs "$TARBALL"
+      - name: Verify exact packed local libSQL catalog and generated consumers
+        run: node src/test/fixtures/libsql-introspection-package.mjs "$TARBALL"
+        env:
+          TURBINE_LIBSQL_INTROSPECTION_PEER: ${{ github.workspace }}/node_modules/@libsql/client
+          TURBINE_LIBSQL_INTROSPECTION_SHA256: ${{ needs.pack.outputs.sha256 }}
+          TURBINE_LIBSQL_INTROSPECTION_REPORT: ${{ runner.temp }}/libsql-catalog-smoke.json
+      - name: Retain local libSQL catalog consumer evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: libsql-catalog-smoke-${{ matrix.node-version }}
+          path: ${{ runner.temp }}/libsql-catalog-smoke.json
+          if-no-files-found: error
+      - name: Verify packed SQL fragments without driver dependencies
+        run: node scripts/check-sql-fragments.mjs "$TARBALL"
+      - name: Verify packed core ESM/CJS, absent drivers and local Worker runtime
+        run: npm run test:core:packed
+        env:
+          TURBINE_CORE_D1_TARBALL: ${{ env.TARBALL }}
+      - name: Verify packed D1 consumers and native local Worker batches
+        run: npm run test:d1
+        env:
+          TURBINE_CORE_D1_TARBALL: ${{ env.TARBALL }}
+      - name: Verify exact packed D1 catalog and strict native generated consumers
+        run: npm run test:d1:catalog
+        env:
+          TURBINE_D1_MINIFLARE_MODULE: ${{ github.workspace }}/node_modules/miniflare/dist/src/index.js
+          TURBINE_D1_WORKERS_TYPES_DIR: ${{ github.workspace }}/node_modules/@cloudflare/workers-types
+          TURBINE_D1_INTROSPECTION_ARCHIVE: ${{ env.TARBALL }}
+          TURBINE_D1_INTROSPECTION_SHA256: ${{ needs.pack.outputs.sha256 }}
+      - name: Verify exact packed D1 generated factories in native local workerd
+        run: npm run test:d1:generation
+        env:
+          TURBINE_D1_GENERATION_ARCHIVE: ${{ env.TARBALL }}
+          TURBINE_D1_GENERATION_SHA256: ${{ needs.pack.outputs.sha256 }}
+          TURBINE_D1_GENERATION_REPORT: ${{ runner.temp }}/d1-generation.json
+      - name: Verify exact packed D1 migrations and native atomic history guards
+        run: npm run test:d1:migrations
+        env:
+          TURBINE_D1_MIGRATIONS_ARCHIVE: ${{ env.TARBALL }}
+          TURBINE_D1_MIGRATIONS_SHA256: ${{ needs.pack.outputs.sha256 }}
+          TURBINE_D1_MIGRATIONS_REPORT: ${{ runner.temp }}/d1-migrations.json
+      - name: Retain D1 migration native and ownership evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: d1-migrations-${{ matrix.node-version }}
+          path: ${{ runner.temp }}/d1-migrations.json
+          if-no-files-found: error
+      - name: Verify exact optional PostgreSQL exports and strict consumers
+        run: >-
+          node scripts/check-optional-pg-transports.mjs "$TARBALL"
+          --sha256 "${{ needs.pack.outputs.sha256 }}"
+          --report "${{ runner.temp }}/optional-pg-smoke.json"
+      - name: Retain optional transport installed consumer evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: optional-pg-smoke-${{ matrix.node-version }}
+          path: ${{ runner.temp }}/optional-pg-smoke.json
+          if-no-files-found: error
+      - name: Verify packed PostgreSQL tuple cursor contracts
+        run: node tooling/cursor-tuple/consumer.mjs "$TARBALL"
       - name: Install tarball in temp project
         run: |
           SMOKE_DIR=$(mktemp -d)
@@ -1235,6 +1617,7 @@ jobs:
       - lint
       - typecheck
       - unit-tests
+      - sqlite-migrations
       - coverage
       - coverage-cli
       - integration-tests
@@ -1262,8 +1645,8 @@ jobs:
           # Anti-vacuous: an empty or unparseable `needs` object would otherwise
           # report success while checking nothing.
           count=$(echo "$RESULTS" | jq 'length')
-          if [ "$count" -lt 21 ]; then
-            echo "gates-ok saw $count dependencies, expected at least 21" >&2
+          if [ "$count" -lt 22 ]; then
+            echo "gates-ok saw $count dependencies, expected at least 22" >&2
             exit 1
           fi
           failed=$(echo "$RESULTS" | jq -r 'to_entries[] | select(.value.result != "success") | "\(.key): \(.value.result)"')

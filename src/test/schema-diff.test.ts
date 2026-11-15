@@ -252,7 +252,7 @@ describe('schemaDiff patterns, remove column (DROP COLUMN UP)', () => {
   });
 
   it('reverse of DROP COLUMN is a comment (cannot auto-reverse)', () => {
-    // From line 554: reverseSql is a comment because we can't know the column type
+    // The DROP statement carries no column type, so reverseSql cannot reconstruct the column.
     const reverseSql = `-- Cannot auto-reverse DROP COLUMN for "legacy_field", add it back manually`;
     assert.match(reverseSql, /Cannot auto-reverse DROP COLUMN/);
   });
@@ -433,7 +433,7 @@ integrationDescribe('schemaDiff() integration, live database', () => {
     await client.connect();
     await client.query(`CREATE SCHEMA IF NOT EXISTS "${testSchema}"`);
     await client.query(`SET search_path TO "${testSchema}"`);
-    // Create a table that we'll diff against
+    // Create a table for the schema diff.
     await client.query(`
       CREATE TABLE "${testSchema}".diff_users (
         id BIGSERIAL PRIMARY KEY,
@@ -503,7 +503,7 @@ integrationDescribe('schemaDiff() integration, live database', () => {
 describe('WS-B round-trip, extended features push then diff clean', () => {
   const { it, before, after } = skipGate(!DATABASE_URL, 'DATABASE_URL not set');
 
-  // Unique names so we never collide with (or clobber) real public tables.
+  // Unique names avoid colliding with (or clobbering) real public tables.
   const suffix = `wsb_${Date.now()}`;
   const orgTable = `orgs_${suffix}`;
   const memberTable = `members_${suffix}`;
@@ -1037,7 +1037,7 @@ describe('B1 - findDestructivePushStatements (pure)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// I-2: DestructivePushRefusal is a typed marker (no more message sniffing)
+// DestructivePushRefusal is a typed marker (no more message sniffing)
 // ---------------------------------------------------------------------------
 
 describe('I-2 - DestructivePushRefusal (typed refusal)', () => {
@@ -1068,7 +1068,7 @@ describe('I-2 - DestructivePushRefusal (typed refusal)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// I-1: schemaPush applies the precomputed (confirmed) diff verbatim
+// schemaPush applies the precomputed (confirmed) diff verbatim
 // ---------------------------------------------------------------------------
 
 describe('I-1 - schemaPush precomputed diff (no TOCTOU re-diff)', () => {
@@ -1149,7 +1149,7 @@ describe('I-1 - schemaPush precomputed diff (no TOCTOU re-diff)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// I-3: undeclared-index warning scope (pure decision)
+// undeclared-index warning scope (pure decision)
 // ---------------------------------------------------------------------------
 
 describe('I-3 - undeclaredIndexWarnings (scope decision)', () => {

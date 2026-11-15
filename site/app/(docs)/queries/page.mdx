@@ -411,8 +411,9 @@ const user = await db.users.upsert({
 });
 ```
 
-When every `where` key has the same value in `create`, it is one atomic `INSERT ... ON CONFLICT`. Otherwise Turbine looks the row up, then updates or inserts, in one transaction. These take the lookup:
+When `where` is exactly one unique key and every key has the same value in `create`, it can use one atomic `INSERT ... ON CONFLICT`. Otherwise Turbine looks the row up, then updates or inserts, in one transaction. These take the lookup:
 
+- Extra predicates beside a unique key, or two separate unique keys.
 - A `where` value that `create` lacks or contradicts.
 - `update: {}`, or [nested writes](/nested-writes).
 - A [global filter](/global-filters) on MySQL or SQL Server.

@@ -1,5 +1,5 @@
 /**
- * turbine-orm/powdb: F2 native-join LIVE integration tests through the REAL
+ * turbine-orm/powdb: Native-join LIVE integration tests through the REAL
  * in-process `@zvndev/powdb-embedded` napi addon (no server, no socket).
  *
  * The acceptance contract for native joins is deep-equality: for every relation

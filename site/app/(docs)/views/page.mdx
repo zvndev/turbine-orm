@@ -27,6 +27,26 @@ const active = await db.activeUsers.findMany({
 });
 ```
 
+### SQLite views
+
+For a project configured with `engine: 'sqlite'`, `turbine generate --include-views`
+and `turbine pull --include-views` discover ordinary views in the main database.
+Views are excluded by default; the existing include/exclude filters apply. The
+CLI opens the existing database read-only. Temporary and attached views are
+excluded, and this does not manage view DDL or materialized views.
+
+SQLite views have no inferred primary or unique keys, so generated accessors
+omit `findUnique` and `findUniqueOrThrow`. Write methods remain in the generated
+types and reject with E003 at runtime, including views with INSTEAD OF triggers.
+JSON view columns retain decoding when the base table is filtered out. Computed
+columns keep the unknown types SQLite reports.
+
+Library callers can pass `{ includeViews: true }` to
+`introspectSqliteDatabase(handle, options)` or
+`introspectBetterSqlite3Database(handle, options)`. Both accept the same filters
+and preserve the caller-owned handle. The better-sqlite3 client uses the same
+read-only view metadata and E003 write refusals.
+
 ### Views are read-only
 
 Every write method on a view throws `ValidationError` ([E003](/errors#e003)) before any SQL runs, on every SQL engine:

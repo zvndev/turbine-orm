@@ -1,0 +1,152 @@
+--- a/package.json
++++ b/package.json
+@@ -262,6 +262,8 @@
+     "check:edge": "node scripts/check-edge-bundle.mjs",
+     "//check:pg-floor": "Installs the packed tarball next to EXACTLY the floor of dependencies.pg and imports every published entry point under both import and require. CI and dev machines only ever install the newest pg in range, so the floor is otherwise never exercised: a ^8.13.1 range shipped code that read pg.utils at load time, which pg first exports in 8.15.0, and 6 of the 8 entry points failed to import on 8.13 and 8.14. Packs dist/ itself when given no tarball, so it runs after `npm run build`. Called from prepublishOnly and from the pack-smoke job of both ci.yml and release.yml.",
+     "check:pg-floor": "node scripts/check-pg-floor.mjs",
++    "check:optional-pg-transports": "node scripts/check-optional-pg-transports.mjs",
++    "test:optional-pg-transports": "node --test tooling/optional-pg-transports/harness.test.mjs",
+     "check:sql-fragments": "node scripts/check-sql-fragments.mjs",
+     "prepublishOnly": "npm run build && npm run typecheck && npm run lint && npm run test:unit && npm run test:coverage:cli && npm run check:error-codes && npm run check:error-prefix && npm run check:changelog && npm run check:cycles && npm run check:skip-gates && npm run check:private-terms && npm run check:package && npm run check:package-types && npm run check:edge && npm run check:pg-floor && npm run size && npm run check:release-tests",
+     "prepare": "node scripts/prepare.mjs",
+--- a/.size-limit.js
++++ b/.size-limit.js
+@@ -1,3 +1,5 @@
++import { optionalPgSizes } from './tooling/optional-pg-transports/budgets.mjs';
++
+ // Measures the REAL bundled import graph (esbuild) of each public entry, not
+ // the bare barrel file. `pg` (the one runtime dependency) is excluded so the
+ // numbers reflect Turbine's own footprint; platform:node keeps Node builtins
+@@ -422,6 +424,8 @@
+ // serverless / batadb / neon docs pages in the same commit. Every other entry is
+ // still inside its limit and is unchanged.
+ export default [
++  // Four new optional entries only; original limits below remain unchanged.
++  ...optionalPgSizes,
+   {
+     name: "main entry, the whole 'turbine-orm' barrel",
+     path: 'dist/index.js',
+--- a/.github/workflows/gates.yml
++++ b/.github/workflows/gates.yml
+@@ -134,6 +134,8 @@
+         run: node --test benchmarks/sqlite-contention/harness.test.mjs benchmarks/sqlite-query-cost/harness.test.mjs
+       - name: Verify lifecycle consumer failure controls
+         run: node --test tooling/lifecycle-examples/harness.test.mjs tooling/lifecycle-upgrades/harness.test.mjs tooling/native-consumer-contracts/harness.test.mjs tooling/native-integer-types/harness.test.mjs
++      - name: Verify optional PostgreSQL transport artifact and cleanup guards
++        run: node --test tooling/optional-pg-transports/harness.test.mjs
+       - name: Verify PostgreSQL pagination evidence validator controls
+         run: node --import tsx --test benchmarks/postgres-pagination/validator.test.mjs
+       - name: Verify PostgreSQL tuple-keyset evidence guards
+@@ -277,6 +279,7 @@
+   # default statement_timeout path that was previously never integration-tested).
+   # Failures gate PRs.
+   integration-tests:
++    needs: pack
+     timeout-minutes: 30
+     name: integration-tests (postgres ${{ matrix.postgres-version }})
+     runs-on: ubuntu-latest
+@@ -311,6 +314,27 @@
+           node-version: 22
+           cache: npm
+       - run: npm ci
++      - name: Download the exact package for optional WS native consumers
++        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
++        with:
++          name: package-tarball
++          path: ${{ runner.temp }}/package-tarball
++      - name: Verify installed optional WS transport on the disposable PostgreSQL service
++        run: >-
++          node scripts/check-optional-pg-transports.mjs
++          "${{ runner.temp }}/package-tarball/${{ needs.pack.outputs.tarball }}"
++          --sha256 "${{ needs.pack.outputs.sha256 }}" --native
++          --report "${{ runner.temp }}/optional-pg-native.json"
++        env:
++          TURBINE_OPTIONAL_PG_SERVICE_URL: postgres://test:test@localhost:5432/turbine_test
++          TURBINE_OPTIONAL_PG_DISPOSABLE: '1'
++      - name: Retain installed optional transport cleanup evidence
++        if: always()
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
++        with:
++          name: optional-pg-native-${{ matrix.postgres-version }}
++          path: ${{ runner.temp }}/optional-pg-native.json
++          if-no-files-found: error
+       - name: Install psql client
+         run: sudo apt-get update && sudo apt-get install -y postgresql-client
+       - name: Seed test database
+@@ -327,6 +351,22 @@
+           # there: this job runs the whole suite on Node 22, so node:sqlite is
+           # present and its gates have no business skipping.
+           TURBINE_REQUIRE_ENGINE: postgres,sqlite
++          TURBINE_NEON_WS_PG_SERVICE_URL: postgres://test:test@localhost:5432/turbine_test
++          TURBINE_NEON_WS_PG_DISPOSABLE: '1'
++          TURBINE_REQUIRE_NEON_WS: '1'
++
++      - name: Require actual Neon HTTP network queries and native effects
++        run: node src/test/fixtures/neon-http/gate-run.mjs
++        env:
++          NEON_HTTP_NATIVE_URL: postgres://test:test@localhost:5432/turbine_test
++          NEON_HTTP_EVIDENCE: ${{ runner.temp }}/neon-http-native
++      - name: Retain native HTTP bridge evidence
++        if: always()
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
++        with:
++          name: neon-http-native-pg${{ matrix.postgres-version }}
++          path: ${{ runner.temp }}/neon-http-native/
++          if-no-files-found: error
+
+       # Use a separate disposable pinned service; keep the existing battery intact.
+       - name: Select evidence runtime after the existing PostgreSQL battery
+@@ -1115,6 +1155,18 @@
+         run: node scripts/check-sqlite-seed.mjs "$TARBALL"
+       - name: Verify packed SQL fragments without driver dependencies
+         run: node scripts/check-sql-fragments.mjs "$TARBALL"
++      - name: Verify exact optional PostgreSQL exports and strict consumers
++        run: >-
++          node scripts/check-optional-pg-transports.mjs "$TARBALL"
++          --sha256 "${{ needs.pack.outputs.sha256 }}"
++          --report "${{ runner.temp }}/optional-pg-smoke.json"
++      - name: Retain optional transport installed consumer evidence
++        if: always()
++        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
++        with:
++          name: optional-pg-smoke-${{ matrix.node-version }}
++          path: ${{ runner.temp }}/optional-pg-smoke.json
++          if-no-files-found: error
+       - name: Verify packed PostgreSQL tuple cursor contracts
+         run: node tooling/cursor-tuple/consumer.mjs "$TARBALL"
+       - name: Install tarball in temp project
+--- a/src/test/neon-ws-native.test.ts
++++ b/src/test/neon-ws-native.test.ts
+@@ -11,9 +11,10 @@
+ import { mockTable } from './helpers.js';
+
+ const pgRoot = process.env.TURBINE_NEON_WS_PG_ROOT;
+-if (!pgRoot && process.env.TURBINE_REQUIRE_NEON_WS === '1') {
++const hasNative = Boolean(pgRoot || process.env.TURBINE_NEON_WS_PG_SERVICE_URL);
++if (!hasNative && process.env.TURBINE_REQUIRE_NEON_WS === '1') {
+   throw new Error(
+-    'Required Neon WebSocket native suite needs TURBINE_NEON_WS_PG_ROOT (PostgreSQL18.6), actual @neondatabase/serverless and ws',
++    'Required Neon WebSocket native suite needs explicit TURBINE_NEON_WS_PG_ROOT (PostgreSQL18.6) or disposable TURBINE_NEON_WS_PG_SERVICE_URL, actual @neondatabase/serverless and ws',
+   );
+ }
+
+@@ -50,8 +51,8 @@
+   }
+ }
+
+-describe('actual Neon driver + native PostgreSQL18.6 over local WebSocket byte relay', {
+-  skip: !pgRoot,
++describe('actual Neon driver + disposable native PostgreSQL over local WebSocket byte relay', {
++  skip: !hasNative,
+   concurrency: false,
+ }, () => {
+   let native: Awaited<ReturnType<typeof startNative>>;
+@@ -67,7 +68,7 @@
+   }
+   before(async () => {
+     driver = (await importOptionalPeer('@neondatabase/serverless')) as typeof driver;
+-    native = await startNative(pgRoot!);
++    native = await startNative(pgRoot ?? '');
+     await native.admin.query('CREATE TABLE neon_ws_items (id integer PRIMARY KEY, label text NOT NULL)');
+   });
+   after(async () => {

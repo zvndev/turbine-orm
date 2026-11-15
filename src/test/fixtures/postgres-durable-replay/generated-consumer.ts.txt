@@ -1,0 +1,21 @@
+import assert from 'node:assert/strict';
+import pg from 'pg';
+import { turbine } from './generated/index.js';
+async function main(){
+const pool=new pg.Pool({connectionString:process.env.DATABASE_URL,options:'-c search_path=durable_generated',max:3,connectionTimeoutMillis:1500,query_timeout:3000,statement_timeout:2500});
+pool.on('error',error=>console.error(error));
+const db=turbine({pool});
+try{
+const rows=await db.outbox.findMany({where:{tenant:'A'},select:{eventId:true,title:true,amount:true},orderBy:{position:'asc'},limit:2});
+const exact:{eventId:string;title:string|null;amount:string}[]=rows;
+// @ts-expect-error numeric retains decimal-string type
+const bad:{amount:number}[]=rows;
+if(rows[0]){
+// @ts-expect-error projection excludes body
+rows[0].body;
+}
+void bad;
+assert.deepEqual(exact,[{eventId:'00000000-0000-4000-8000-000000000001',title:'generated ☃',amount:'12345678901234567890.123456789012'}]);
+console.log(JSON.stringify({generatedTypedProjection:true,rows:exact}));
+}finally{await db.disconnect();assert.equal((await pool.query('SELECT 42 AS answer')).rows[0].answer,42);await pool.end();}}
+main().catch(error=>{console.error(error);process.exitCode=1});

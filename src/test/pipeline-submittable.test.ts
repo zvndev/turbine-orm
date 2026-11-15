@@ -92,10 +92,10 @@ class FakeConnection extends EventEmitter {
   describe(msg: unknown) {
     this.messages.push({ type: 'describe', args: [msg] });
     // noData for DML without RETURNING, rowDescription for SELECT
-    // We'll emit noData for BEGIN/COMMIT and rowDescription for real queries
+    // Emit noData for BEGIN/COMMIT and rowDescription for real queries.
     const m = msg as { type: string; name?: string };
     if (m.type === 'P') {
-      // Queue nothing here, we'll handle it in the execute response setup
+      // Queue nothing here; the execute response setup supplies the messages.
     }
   }
 
@@ -567,8 +567,8 @@ describe('TCP write count (cork/uncork proof)', () => {
 
     // Override _send to track writes at the Connection level
     // The real connection.parse/bind/etc call this._send which calls stream.write
-    // Our FakeConnection records messages but doesn't actually write.
-    // We check that cork was called before any protocol method and uncork after.
+    // FakeConnection records messages but doesn't actually write.
+    // Check that cork was called before any protocol method and uncork after.
 
     let wasCorkBeforeFirstMessage = false;
     let wasUncorkAfterLastMessage = false;

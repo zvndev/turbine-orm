@@ -797,6 +797,23 @@ describe('powdb v0.90: shared option refusals', () => {
     });
   });
 
+  it('optimisticLock with its version column also in data is refused, as on the SQL engines', async () => {
+    await withDb({}, async (db) => {
+      await assert.rejects(
+        () =>
+          db.table('users').update({
+            where: { id: 1 },
+            data: { email: 'z@x', score: 9 },
+            optimisticLock: { field: 'score', expected: 1 },
+          } as never),
+        (err: unknown) =>
+          err instanceof ValidationError &&
+          err.message.includes('`optimisticLock` on "users" writes "score" itself (it adds 1)'),
+      );
+      assert.equal(await db.table('users').count({ where: { email: 'z@x' } }), 0);
+    });
+  });
+
   it('skip on a to-one relation inside with is refused', async () => {
     await withDb({}, async (db) => {
       await assert.rejects(

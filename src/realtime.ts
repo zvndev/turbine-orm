@@ -30,7 +30,7 @@
  *   A subscription's connection is held indefinitely with no query in flight,
  *   so a database restart, failover or `pg_terminate_backend` reaches it only
  *   as an `'error'` event. That event used to have no listener, which exits the
- *   process. It is now guarded (connection-guard.ts), and the subscription
+ *   process. It is guarded (connection-guard.ts), and the subscription
  *   RECONNECTS by default: the dead connection is destroyed, a fresh one is
  *   checked out with exponential backoff, and `LISTEN` is re-issued. Postgres
  *   does not queue notifications for a listener that is not connected, so
@@ -347,7 +347,7 @@ export async function createSubscription(
         await conn.client.query(`UNLISTEN ${quotedChannel}`);
       } catch (err) {
         // Best-effort: the connection may already be dead. Still detach +
-        // release below so we don't leak the pool slot.
+        // release below to avoid leaking the pool slot.
         dropCurrent(true);
         onClosed(sub);
         throw wrapPgError(err);
@@ -359,7 +359,7 @@ export async function createSubscription(
       if (closed) return;
       stop();
       // Destroy the connection (release(true)) rather than return it to the pool:
-      // we skip UNLISTEN here (the pool is being torn down), so a recycled
+      // UNLISTEN is skipped here, so a recycled
       // connection would otherwise carry a stale LISTEN registration. Destroying
       // it guarantees no pooled backend keeps receiving NOTIFY traffic. Matters
       // most for external/serverless pools, where disconnect() is a no-op and the

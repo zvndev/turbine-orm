@@ -10,7 +10,7 @@
  *   - object-KEY position, `{ name: v }` with `name` interpolated raw. A key
  *     inside brackets is a COMPUTED key, evaluated when the object literal is
  *     constructed, so an enum type named `[Function('...')()+'x']` ran its
- *     payload on import. Reproduced end to end before this fix.
+ *     payload on import. Reproduced end to end.
  *   - string-LITERAL position, wrapped in quotes but escaped only for `\` and
  *     `'`, so a raw newline left the literal unterminated and put the rest of
  *     the name on a new source LINE.

@@ -218,7 +218,7 @@ testFn('typed-sql integration', () => {
   it('INJECTION SAFETY: malicious value is treated as data, users table survives', async () => {
     // Pass a classic injection payload as an interpolated value. If it were
     // string-concatenated, this would (try to) drop the table. Because it is
-    // bound as a parameter, it simply becomes a (non-matching) email filter.
+    // bound as a parameter, it becomes a (non-matching) email filter.
     const evil = "x@example.com'; DROP TABLE users; --";
     const rows = await client.sql<{ id: number }>`
       SELECT id FROM users WHERE email = ${evil}

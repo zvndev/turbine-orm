@@ -10,6 +10,14 @@
  */
 
 import { UnsupportedFeatureError, ValidationError } from '../errors.js';
+import {
+  isTemporalInfinity,
+  ownLookup,
+  parseDbDate,
+  resolveColumnName,
+  suggestKey,
+  warnRedundantSortTerm,
+} from '../query-utils.js';
 import type { TableMetadata } from '../schema.js';
 import { snakeToCamel } from '../schema.js';
 import type { DeferredQuery } from './deferred.js';
@@ -21,6 +29,7 @@ import {
   isUnmatchedPlainObject,
   isVectorOrderBy,
   isWhereOperator,
+  JSON_RANGE_OPERATORS,
   normalizeOrderBy,
   orderByEntries,
   setOwn,
@@ -32,7 +41,6 @@ import type {
   GroupByOrderBy,
   HavingClause,
   HavingComparisonOperator,
-  JsonPathAggregateTarget,
   OrderBySpec,
   OrderDirection,
   PercentileExprSpec,
@@ -40,14 +48,6 @@ import type {
   WhereClause,
 } from './types.js';
 import { assertOrderDirection, resolveSkipGlobalFilters, resolveUnsafeFlag } from './types.js';
-import {
-  isTemporalInfinity,
-  ownLookup,
-  parseDbDate,
-  resolveColumnName,
-  suggestKey,
-  warnRedundantSortTerm,
-} from './utils.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
 import { assertWhereDepth, combinatorBranches } from './where-compile.js';
@@ -254,18 +254,9 @@ export function buildGroupBy<T extends object>(
   const countIsRecord = countArg !== true && countArg !== undefined && typeof countArg === 'object';
   const scalarCount = countArg === true || countArg === undefined;
   if (scalarCount) {
-    // default: always include the scalar count
     selectExprs.push(`${qi.castAgg('COUNT(*)', 'int')} AS _count`);
   } else if (countIsRecord) {
-    for (const [field, enabled] of Object.entries(countArg as Record<string, boolean>)) {
-      if (!enabled) continue;
-      if (field === '_all') {
-        selectExprs.push(`${qi.castAgg('COUNT(*)', 'int')} AS ${qi.q('_count__all')}`);
-      } else {
-        const col = qi.toColumn(field);
-        selectExprs.push(`${qi.castAgg(`COUNT(${qi.q(col)})`, 'int')} AS ${qi.q(`_count_${col}`)}`);
-      }
-    }
+    appendCountFields(qi, countArg as Record<string, boolean>, selectExprs);
   }
 
   // ORDER BY aggregate expressions, keyed `${aggKey}:${field}` (plus a bare
@@ -285,12 +276,12 @@ export function buildGroupBy<T extends object>(
   // reuse the exact aggregate expression (same placeholders) by alias.
   const jsonAggFields = new Map<string, { field: string; numeric: boolean }>();
   const jsonAggExprs = new Map<string, string>();
-  const buildAggregates = (
-    aggKey: '_sum' | '_avg' | '_min' | '_max',
-    sqlFn: 'SUM' | 'AVG' | 'MIN' | 'MAX',
-    spec: Record<string, boolean | JsonPathAggregateTarget | undefined> | undefined,
-  ): void => {
-    if (!spec) return;
+  // The aggregate key determines the SQL function. Walk the same ordered list
+  // as aggregate(), without allocating a per-build dispatcher for four calls.
+  for (const aggKey of VALUE_AGGREGATES) {
+    const spec = args[aggKey];
+    if (!spec) continue;
+    const sqlFn = aggKey.slice(1).toUpperCase();
     for (const [key, target] of Object.entries(spec)) {
       if (!target) continue;
       if (target === true) {
@@ -334,11 +325,7 @@ export function buildGroupBy<T extends object>(
       jsonAggExprs.set(`${key}:${aggKey}`, expr);
       aggOrderExprs.set(`${aggKey}:${key}`, expr);
     }
-  };
-  buildAggregates('_sum', 'SUM', args._sum as Record<string, boolean | JsonPathAggregateTarget> | undefined);
-  buildAggregates('_avg', 'AVG', args._avg as Record<string, boolean | JsonPathAggregateTarget> | undefined);
-  buildAggregates('_min', 'MIN', args._min as Record<string, boolean | JsonPathAggregateTarget> | undefined);
-  buildAggregates('_max', 'MAX', args._max as Record<string, boolean | JsonPathAggregateTarget> | undefined);
+  }
   const percentiles = planPercentiles(
     qi,
     args._percentile,
@@ -396,78 +383,15 @@ export function buildGroupBy<T extends object>(
           restructured[reader.resultKey] = reader.raw ? row[reader.rowKey] : parsed[reader.resultKey];
         }
 
-        // _count
-        //   scalar form → the plain `_count` (or driver-lowercased `count`) column.
-        //   record form → assemble `{ _all, field, ... }` from the `_count__all`
-        //   and `_count_<col>` columns. `_count__all` MUST be matched before the
-        //   generic `_count_` prefix (its slice(7) would map through snakeToCamel).
+        let readCounts = true;
         if ('_count' in row) {
           restructured._count = row._count;
+          readCounts = false;
         } else if ('count' in row) {
           restructured._count = row.count;
-        } else {
-          const countObj: Record<string, unknown> = {};
-          let hasCount = false;
-          for (const [rawKey, rawValue] of Object.entries(row)) {
-            if (rawKey === '_count__all') {
-              countObj._all = rawValue;
-              hasCount = true;
-            } else if (rawKey.startsWith('_count_')) {
-              const col = rawKey.slice(7);
-              const field = qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
-              countObj[field] = rawValue;
-              hasCount = true;
-            }
-          }
-          if (hasCount) restructured._count = countObj;
+          readCounts = false;
         }
-
-        // Collect aggregates into nested objects
-        const sumObj: Record<string, unknown> = {};
-        const avgObj: Record<string, unknown> = {};
-        const minObj: Record<string, unknown> = {};
-        const maxObj: Record<string, unknown> = {};
-        let hasSums = false,
-          hasAvgs = false,
-          hasMins = false,
-          hasMaxs = false;
-
-        // JSON-path aggregates keep their arg key verbatim; plain-column
-        // aggregates keep the snake→camel field mapping.
-        const jsonAgg = (rawKey: string) => jsonAggFields.get(rawKey);
-        const fieldFor = (rawKey: string, col: string): string =>
-          jsonAgg(rawKey)?.field ?? qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
-
-        // A JSON-path `_sum` / `_avg` casts its extracted text to numeric in
-        // SQL and is always a number; a plain column follows its source type
-        // (see {@link isExactNumericType}).
-        const sumAvg = (rawKey: string, rawValue: unknown): number | string | null =>
-          jsonAgg(rawKey) ? (rawValue !== null ? Number(rawValue) : null) : sumAvgValue(qi, rawKey.slice(5), rawValue);
-
-        for (const [rawKey, rawValue] of Object.entries(row)) {
-          if (rawKey.startsWith('_sum_')) {
-            sumObj[fieldFor(rawKey, rawKey.slice(5))] = sumAvg(rawKey, rawValue);
-            hasSums = true;
-          } else if (rawKey.startsWith('_avg_')) {
-            avgObj[fieldFor(rawKey, rawKey.slice(5))] = sumAvg(rawKey, rawValue);
-            hasAvgs = true;
-          } else if (rawKey.startsWith('_min_')) {
-            const j = jsonAgg(rawKey);
-            minObj[fieldFor(rawKey, rawKey.slice(5))] =
-              j?.numeric && rawValue !== null ? Number(rawValue) : temporalAggValue(qi, rawKey.slice(5), rawValue);
-            hasMins = true;
-          } else if (rawKey.startsWith('_max_')) {
-            const j = jsonAgg(rawKey);
-            maxObj[fieldFor(rawKey, rawKey.slice(5))] =
-              j?.numeric && rawValue !== null ? Number(rawValue) : temporalAggValue(qi, rawKey.slice(5), rawValue);
-            hasMaxs = true;
-          }
-        }
-
-        if (hasSums) restructured._sum = sumObj;
-        if (hasAvgs) restructured._avg = avgObj;
-        if (hasMins) restructured._min = minObj;
-        if (hasMaxs) restructured._max = maxObj;
+        readAggregateBlocks(qi, row, restructured, jsonAggFields, readCounts);
         if (percentiles.length > 0) restructured._percentile = readPercentiles(qi, percentiles, row);
 
         return restructured;
@@ -919,7 +843,7 @@ function buildHavingCombinator<T extends object>(
   // prepared-statement-arity.test.ts). It is marked anyway so that routing
   // them through the cache later cannot silently reopen the hole, and so the
   // rule reads the same in both clause compilers. The DEPTH cap above is the
-  // half of this that bites here and now.
+  // half of this relevant to aggregate reads.
   if (Array.isArray(value)) qi.markVariableArity();
   const parts: string[] = [];
   for (const branch of branches) {
@@ -1014,6 +938,9 @@ function buildHavingScalarClauses(
  * number compared with the MIN of a text column is sent as text rather than
  * compared numerically (`'0zz' = 0` is true there).
  */
+const HAVING_COMPARISONS = { equals: '=', not: '!=', ...JSON_RANGE_OPERATORS };
+const HAVING_OPERATORS = new Set([...Object.keys(HAVING_COMPARISONS), 'in', 'notIn']);
+
 export function buildHavingNumericClauses(
   qi: BuilderCtx,
   expr: string,
@@ -1038,7 +965,7 @@ export function buildHavingNumericClauses(
   }
 
   const op = filter as HavingComparisonOperator<unknown>;
-  const allowedKeys = new Set(['equals', 'not', 'gt', 'gte', 'lt', 'lte', 'in', 'notIn']);
+  const allowedKeys = HAVING_OPERATORS;
   for (const k of Object.keys(op)) {
     if (!allowedKeys.has(k)) {
       throw new ValidationError(
@@ -1049,37 +976,16 @@ export function buildHavingNumericClauses(
   }
 
   const clauses: string[] = [];
-  if (op.equals !== undefined) {
-    params.push(bind(op.equals));
-    clauses.push(`${expr} = ${qi.p(params.length)}`);
+  for (const [key, sign] of Object.entries(HAVING_COMPARISONS)) {
+    const value = (op as Record<string, unknown>)[key];
+    if (value === undefined) continue;
+    params.push(bind(value));
+    clauses.push(`${expr} ${sign} ${qi.p(params.length)}`);
   }
-  if (op.not !== undefined) {
-    params.push(bind(op.not));
-    clauses.push(`${expr} != ${qi.p(params.length)}`);
-  }
-  if (op.gt !== undefined) {
-    params.push(bind(op.gt));
-    clauses.push(`${expr} > ${qi.p(params.length)}`);
-  }
-  if (op.gte !== undefined) {
-    params.push(bind(op.gte));
-    clauses.push(`${expr} >= ${qi.p(params.length)}`);
-  }
-  if (op.lt !== undefined) {
-    params.push(bind(op.lt));
-    clauses.push(`${expr} < ${qi.p(params.length)}`);
-  }
-  if (op.lte !== undefined) {
-    params.push(bind(op.lte));
-    clauses.push(`${expr} <= ${qi.p(params.length)}`);
-  }
-  if (op.in !== undefined) {
-    params.push(qi.inParam(bindList(op.in)));
-    clauses.push(qi.inClause(expr, qi.p(params.length), false));
-  }
-  if (op.notIn !== undefined) {
-    params.push(qi.inParam(bindList(op.notIn)));
-    clauses.push(qi.inClause(expr, qi.p(params.length), true));
+  for (const key of ['in', 'notIn'] as const) {
+    if (op[key] === undefined) continue;
+    params.push(qi.inParam(bindList(op[key])));
+    clauses.push(qi.inClause(expr, qi.p(params.length), key === 'notIn'));
   }
   return clauses;
 }
@@ -1485,6 +1391,63 @@ function isInt8Type(pgType: string): boolean {
   return base === 'int8' || base === 'bigint';
 }
 
+const VALUE_AGGREGATES = ['_sum', '_avg', '_min', '_max'] as const;
+
+/** Shared result assembly; JSON targets keep their declared names and numeric policy. */
+function readAggregateBlocks(
+  qi: BuilderCtx,
+  row: Record<string, unknown>,
+  result: Partial<Record<(typeof VALUE_AGGREGATES)[number] | '_count', unknown>>,
+  jsonFields?: ReadonlyMap<string, { field: string; numeric: boolean }>,
+  readCounts = false,
+): void {
+  const blocks: Record<string, unknown>[] = [{}, {}, {}, {}];
+  let present = 0;
+  let count: Record<string, unknown> | undefined;
+  for (const [key, value] of Object.entries(row)) {
+    if (readCounts && key.startsWith('_count_')) {
+      const col = key.slice(7);
+      const field = key === '_count__all' ? '_all' : (qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col));
+      count ??= {};
+      count[field] = value;
+      continue;
+    }
+    const index = VALUE_AGGREGATES.indexOf(key.slice(0, 4) as (typeof VALUE_AGGREGATES)[number]);
+    if (index < 0 || key[4] !== '_') continue;
+    const col = key.slice(5);
+    const json = jsonFields?.get(key);
+    const field = json?.field ?? qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
+    blocks[index]![field] =
+      index < 2
+        ? json
+          ? value !== null
+            ? Number(value)
+            : null
+          : sumAvgValue(qi, col, value)
+        : json?.numeric && value !== null
+          ? Number(value)
+          : temporalAggValue(qi, col, value);
+    present |= 1 << index;
+  }
+  if (count) result._count = count;
+  for (let i = 0; i < VALUE_AGGREGATES.length; i++) {
+    if (present & (1 << i)) result[VALUE_AGGREGATES[i]!] = blocks[i];
+  }
+}
+
+/** One count projection compiler for aggregate and groupBy, including `_all`. */
+function appendCountFields(qi: BuilderCtx, count: Record<string, boolean>, selectExprs: string[]): void {
+  for (const [field, enabled] of Object.entries(count)) {
+    if (!enabled) continue;
+    if (field === '_all') {
+      selectExprs.push(`${qi.castAgg('COUNT(*)', 'int')} AS ${qi.q('_count__all')}`);
+    } else {
+      const col = qi.toColumn(field);
+      selectExprs.push(`${qi.castAgg(`COUNT(${qi.q(col)})`, 'int')} AS ${qi.q(`_count_${col}`)}`);
+    }
+  }
+}
+
 export function buildAggregate<T extends object>(
   qi: BuilderCtx,
   args: AggregateArgs<T>,
@@ -1523,57 +1486,20 @@ export function buildAggregate<T extends object>(
   if (args._count === true) {
     selectExprs.push(`${qi.castAgg('COUNT(*)', 'int')} AS _count`);
   } else if (args._count && typeof args._count === 'object') {
-    for (const [field, enabled] of Object.entries(args._count)) {
+    appendCountFields(qi, args._count as Record<string, boolean>, selectExprs);
+  }
+
+  for (const kind of VALUE_AGGREGATES) {
+    const fields = args[kind];
+    if (!fields) continue;
+    for (const [field, enabled] of Object.entries(fields)) {
       if (!enabled) continue;
-      if (field === '_all') {
-        selectExprs.push(`${qi.castAgg('COUNT(*)', 'int')} AS ${qi.q('_count__all')}`);
-      } else {
-        const col = qi.toColumn(field);
-        selectExprs.push(`${qi.castAgg(`COUNT(${qi.q(col)})`, 'int')} AS ${qi.q(`_count_${col}`)}`);
+      const col = qi.toColumn(field);
+      if (kind === '_min' || kind === '_max') {
+        assertAggregatePiiOptIn(qi.table, meta, field, col, `aggregate ${kind}`, includePii);
       }
-    }
-  }
-
-  // _sum
-  if (args._sum) {
-    for (const [field, enabled] of Object.entries(args._sum)) {
-      if (enabled) {
-        const col = qi.toColumn(field);
-        selectExprs.push(`SUM(${qi.q(col)}) AS ${qi.q(`_sum_${col}`)}`);
-      }
-    }
-  }
-
-  // _avg
-  if (args._avg) {
-    for (const [field, enabled] of Object.entries(args._avg)) {
-      if (enabled) {
-        const col = qi.toColumn(field);
-        selectExprs.push(`${plainAvgExpr(qi, col)} AS ${qi.q(`_avg_${col}`)}`);
-      }
-    }
-  }
-
-  // _min / _max return a stored cell verbatim, so a PII-tagged column needs the
-  // same `includePii` opt-in a row projection needs. _count / _sum / _avg do not.
-  if (args._min) {
-    for (const [field, enabled] of Object.entries(args._min)) {
-      if (enabled) {
-        const col = qi.toColumn(field);
-        assertAggregatePiiOptIn(qi.table, meta, field, col, 'aggregate _min', includePii);
-        selectExprs.push(`MIN(${qi.q(col)}) AS ${qi.q(`_min_${col}`)}`);
-      }
-    }
-  }
-
-  // _max
-  if (args._max) {
-    for (const [field, enabled] of Object.entries(args._max)) {
-      if (enabled) {
-        const col = qi.toColumn(field);
-        assertAggregatePiiOptIn(qi.table, meta, field, col, 'aggregate _max', includePii);
-        selectExprs.push(`MAX(${qi.q(col)}) AS ${qi.q(`_max_${col}`)}`);
-      }
+      const expr = kind === '_avg' ? plainAvgExpr(qi, col) : `${kind.slice(1).toUpperCase()}(${qi.q(col)})`;
+      selectExprs.push(`${expr} AS ${qi.q(`${kind}_${col}`)}`);
     }
   }
 
@@ -1593,67 +1519,9 @@ export function buildAggregate<T extends object>(
       const row = result.rows[0] as Record<string, unknown>;
       const aggResult: AggregateResult<T> = {};
 
-      // _count
-      if (row._count !== undefined) {
-        aggResult._count = row._count as number;
-      } else {
-        // Check for per-column counts. `_count__all` MUST be matched before the
-        // generic `_count_` prefix (its slice(7) is `_all`, which snakeToCamel
-        // would mangle to `All`).
-        const countObj: Record<string, number> = {};
-        let hasCountFields = false;
-        for (const [key, val] of Object.entries(row)) {
-          if (key === '_count__all') {
-            countObj._all = val as number;
-            hasCountFields = true;
-          } else if (key.startsWith('_count_')) {
-            const col = key.slice(7);
-            const field = qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
-            countObj[field] = val as number;
-            hasCountFields = true;
-          }
-        }
-        if (hasCountFields) aggResult._count = countObj;
-      }
-
-      // Build nested aggregate objects
-      const sumObj: Record<string, number | string | null> = {};
-      const avgObj: Record<string, number | string | null> = {};
-      const minObj: Record<string, unknown> = {};
-      const maxObj: Record<string, unknown> = {};
-      let hasSums = false,
-        hasAvgs = false,
-        hasMins = false,
-        hasMaxs = false;
-
-      for (const [key, val] of Object.entries(row)) {
-        if (key.startsWith('_sum_')) {
-          const col = key.slice(5);
-          const field = qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
-          sumObj[field] = sumAvgValue(qi, col, val);
-          hasSums = true;
-        } else if (key.startsWith('_avg_')) {
-          const col = key.slice(5);
-          const field = qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
-          avgObj[field] = sumAvgValue(qi, col, val);
-          hasAvgs = true;
-        } else if (key.startsWith('_min_')) {
-          const col = key.slice(5);
-          const field = qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
-          minObj[field] = temporalAggValue(qi, col, val);
-          hasMins = true;
-        } else if (key.startsWith('_max_')) {
-          const col = key.slice(5);
-          const field = qi.tableMeta.reverseColumnMap[col] ?? snakeToCamel(col);
-          maxObj[field] = temporalAggValue(qi, col, val);
-          hasMaxs = true;
-        }
-      }
-
-      if (hasSums) aggResult._sum = sumObj as Partial<Record<keyof T & string, number | string | null>>;
-      if (hasAvgs) aggResult._avg = avgObj as Partial<Record<keyof T & string, number | string | null>>;
-      if (hasMins) aggResult._min = minObj as Partial<Record<keyof T & string, unknown>>;
-      if (hasMaxs) aggResult._max = maxObj as Partial<Record<keyof T & string, unknown>>;
+      const readCounts = row._count === undefined;
+      if (!readCounts) aggResult._count = row._count as number;
+      readAggregateBlocks(qi, row, aggResult, undefined, readCounts);
       if (percentiles.length > 0) {
         aggResult._percentile = readPercentiles(qi, percentiles, row) as Partial<Record<keyof T & string, unknown>>;
       }

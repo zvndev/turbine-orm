@@ -7,6 +7,8 @@
  */
 
 import { ValidationError } from '../errors.js';
+import { type ColumnNameSource, OPERATOR_KEYS, ownLookup, resolveColumnName } from '../query-utils.js';
+import type { TableMetadata } from '../schema.js';
 import { isColumnRef, isPlainColumnRefShape, plainColumnRefMessage } from './column-ref.js';
 import type {
   ArrayFilter,
@@ -21,7 +23,6 @@ import type {
   WhereOperator,
 } from './types.js';
 import { assertDirectionToken, assertOrderDirection } from './types.js';
-import { type ColumnNameSource, OPERATOR_KEYS, resolveColumnName } from './utils.js';
 
 // ---------------------------------------------------------------------------
 // Where-operator detection
@@ -159,21 +160,59 @@ function copySymbols(source: object): Record<string, unknown> {
 // ---------------------------------------------------------------------------
 
 /**
- * What a column's type allows at a value position. Decided from the column's
- * type token: json/jsonb take JSON values, an array column (`_text`) takes
- * arrays, a pgvector column takes a number array, and everything else takes a
- * scalar.
+ * What a column's type allows at a value position: json/jsonb take JSON
+ * values, an array column takes arrays, a pgvector column takes a number
+ * array, and everything else takes a scalar. {@link columnOperandKind} is the
+ * one place it is decided for a column.
  */
 export type OperandColumnKind = 'scalar' | 'array' | 'vector' | 'json';
 
-/** {@link OperandColumnKind} for a column type token (case-insensitive). */
-export function operandColumnKind(columnType: string | undefined): OperandColumnKind {
-  if (columnType === undefined) return 'scalar';
-  const t = columnType.toLowerCase();
+/**
+ * The type token metadata records for `column`, by the one resolution order
+ * every reader uses: the column entry (`dialectType`, then `pgType`), then the
+ * table-level `dialectTypes` / `pgTypes` maps.
+ */
+export function columnTypeToken(
+  meta: TableMetadata,
+  column: string,
+  entry = meta.columns?.find((c) => c.name === column),
+): string | undefined {
+  return (
+    entry?.dialectType ??
+    entry?.pgType ??
+    (meta.dialectTypes && ownLookup(meta.dialectTypes, column)) ??
+    (meta.pgTypes && ownLookup(meta.pgTypes, column))
+  );
+}
+
+/**
+ * THE answer to "what may `column` hold at a value position", and so to "is
+ * it an array column". The where compiler (build, cache-hit param collection
+ * and the `OR: []` key the fingerprint reads), the unique-key rule and the
+ * write path all ask here, so none can treat a column as an array while
+ * another binds it as a scalar.
+ *
+ * Decided from the type token ({@link columnTypeToken}) and the catalog's
+ * array flag. A token spelled as an array type (`_text`, the catalog's
+ * udt_name, or `text[]`) is an array column unless the column entry says
+ * `isArray: false`: a scalar type can be NAMED like one
+ * (`CREATE TYPE _mood AS ENUM ...`, which introspection records with the flag
+ * false). The flag alone is not enough, because only a token that names an
+ * array type says what the elements are; metadata with no column entry or no
+ * flag is decided by the token, as it always was.
+ */
+export function columnOperandKind(meta: TableMetadata, column: string): OperandColumnKind {
+  const entry = meta.columns?.find((c) => c.name === column);
+  const t = columnTypeToken(meta, column, entry)?.toLowerCase();
+  if (t === undefined) return 'scalar';
   if (t === 'json' || t === 'jsonb') return 'json';
-  if (t.startsWith('_')) return 'array';
-  if (t === 'vector') return 'vector';
-  return 'scalar';
+  if (isArrayTypeToken(t)) return entry?.isArray === false ? 'scalar' : 'array';
+  return t === 'vector' ? 'vector' : 'scalar';
+}
+
+/** Whether a type token is spelled as an array type: the catalog's `_text`, or `text[]`. */
+export function isArrayTypeToken(token: string): boolean {
+  return token.startsWith('_') || token.endsWith('[]');
 }
 
 /**
@@ -242,7 +281,25 @@ function fitsColumn(value: unknown, kind: OperandColumnKind): boolean {
     return !(typeof value === 'object' && value !== null && NON_SCALAR_BUILTINS.some((c) => value instanceof c));
   }
   if (kind === 'array' || kind === 'vector') {
-    return Array.isArray(value) && value.every((el) => el === null || isBindableScalar(el) || Array.isArray(el));
+    if (!Array.isArray(value) || hasArrayHole(value)) return false;
+    for (const el of value) if (el !== null && !isBindableScalar(el) && !Array.isArray(el)) return false;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Whether an array has a hole (an index never assigned) at any depth. An
+ * array operand with one is refused, like the `undefined` a hole reads as:
+ * `every` and `map` skip a hole while the driver binds it as NULL, so
+ * accepting one read the same operand two ways (a one-row check that skipped
+ * it agreed the value was `['other']`, and the server compared `{NULL}`).
+ */
+export function hasArrayHole(value: readonly unknown[]): boolean {
+  for (let i = 0; i < value.length; i++) {
+    if (!(i in value)) return true;
+    const el = value[i];
+    if (Array.isArray(el) && hasArrayHole(el)) return true;
   }
   return false;
 }
@@ -251,7 +308,7 @@ function fitsColumn(value: unknown, kind: OperandColumnKind): boolean {
 export function describeOperand(value: unknown): string {
   if (value === null) return 'null';
   if (value === undefined) return 'undefined';
-  if (Array.isArray(value)) return 'an array';
+  if (Array.isArray(value)) return hasArrayHole(value) ? 'a sparse array (an index with no element)' : 'an array';
   if (isColumnRef(value)) return 'a column reference';
   if (value instanceof Date && Number.isNaN(value.getTime())) return 'an Invalid Date';
   if (isPlainRecord(value)) {
@@ -493,7 +550,11 @@ export function assertEqualityOperand(value: unknown, ctx: OperandContext): void
   if (fitsColumn(value, ctx.kind)) return;
   throw new ValidationError(
     `Invalid value ${where}: received ${describeOperand(value)}. A bare value takes ${acceptedFor(ctx.kind)}` +
-      (Array.isArray(value) ? '; to match any of several values use { in: [...] }.' : '.'),
+      (!Array.isArray(value)
+        ? '.'
+        : hasArrayHole(value)
+          ? '; give every index an element (null for a NULL element).'
+          : '; to match any of several values use { in: [...] }.'),
   );
 }
 
@@ -650,7 +711,7 @@ export const JSON_STRING_OPERATORS: Record<
  * unrecognized operator is REFUSED rather than dropped.
  *
  * This existed as tribal knowledge spread across `buildJsonFilterClauses` and
- * `collectJsonFilterParams`: each simply ignored what it did not recognize, so
+ * `collectJsonFilterParams`: each ignored what it did not recognize, so
  * `{ path: ['title'], string_contains: 'x' }` (the Prisma spelling) compiled to
  * no predicate at all and returned every row of the table. The scalar operator
  * path has always thrown on an unknown key; this set is what lets the JSON path

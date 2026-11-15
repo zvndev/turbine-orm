@@ -141,7 +141,7 @@ export {
  *     already-open one throws E017 before it can deadlock on the write lock,
  *     while INDEPENDENT concurrent `db.$transaction` calls queue FIFO and run
  *     one at a time instead of failing.
- * Isolation levels remain Phase B.
+ * Transaction isolation-level options are unsupported.
  */
 export const powdbDialect: Dialect = {
   ...postgresDialect,
@@ -151,7 +151,9 @@ export const powdbDialect: Dialect = {
   // queries, `tx.$connection()`) and keep every SQL-only feature off.
   capabilities: Object.freeze({
     distinctOn: false,
+    tupleCursorPredicate: false,
     positionalJson: false,
+    jsonObjectKeysAsWritten: false,
     nullsOrderingClause: false,
     nullsSortHigh: false,
     insensitiveInList: false,
@@ -182,6 +184,7 @@ export const powdbDialect: Dialect = {
     backendCancel: false,
     idleTransactionTimeout: false,
     abortsTransactionOnError: false,
+    classifiesCommitAnswer: false,
     connectionDriver: 'none',
     preparesEveryStatement: false,
     statementSyntax: null,
@@ -235,7 +238,7 @@ function throwNoNestedTransaction(): never {
 }
 
 // ---------------------------------------------------------------------------
-// PowDB client surface (the subset we bind, see @zvndev/powdb-client)
+// PowDB client surface (the bound subset, see @zvndev/powdb-client)
 // ---------------------------------------------------------------------------
 
 /** A single value PowDB accepts as a positional `$N` parameter. */
@@ -348,9 +351,10 @@ export function parsePowdbUrl(connectionString: string): PowdbConnOptions {
  * Fail fast if a networked PowDB server is older than {@link MIN_POWDB_VERSION}.
  * Turbine's write path relies on the trailing `returning` keyword and the
  * int→float coercion fix, both of which landed in 0.7.0. Embedded exposes no
- * version method, so this is networked-only (the embedded peer is pinned ^0.7.0
- * at install time). A non-semver / empty version string is tolerated (we cannot
- * prove it is too old).
+ * version method, so this is networked-only. The embedded peer range enforces
+ * a compatible minimum version at install time. A non-semver / empty version
+ * string is tolerated
+ * (the version check cannot prove it is too old).
  */
 export function assertSupportedPowdbVersion(version: string | undefined): void {
   const m = /^(\d+)\.(\d+)\.(\d+)/.exec(String(version ?? '').trim());
@@ -450,9 +454,8 @@ export function capabilitiesFromVersion(
 /**
  * Options for {@link powqlSchemaDDL}. Additive: with no options the DDL is
  * emitted unconditionally (pure-function callers / tests); pass `capabilities`
- * to gate engine-version-specific features (json columns, and, since the
- * 0.13 parity round, doc-field expression indexes) behind the connection's
- * real capabilities. Doc-field expression index declarations plug into the
+ * to gate engine-version-specific features (json columns and doc-field
+ * expression indexes) behind the connection's real capabilities. Doc-field expression index declarations plug into the
  * per-table `indexes` surface consumed here without further signature churn.
  */
 export interface PowqlSchemaDDLOptions {
@@ -828,7 +831,7 @@ function toPowdbParam(value: unknown, col?: ColumnMetadata): PowdbParam {
  *     message text (`Execution("column 'email' is required …")`,
  *     `Execution("type mismatch …")`, `Parse(…)`, `StorageError(…)`).
  *
- * So we always run the unique-constraint and message-shape checks first (they
+ * The unique-constraint and message-shape checks run first (they
  * fire for both transports and extract detail like constraint / column names),
  * then classify by the typed wire error class (`.wireErrorClass`, networked
  * server >= 0.17, accurate even when the server sanitized the message text),
@@ -1003,7 +1006,7 @@ export function wrapPowdbError(err: unknown): Error {
   }
   // Operator-chain / nesting budget → ValidationError (E003) with the actual fix.
   // PowDB 0.20 counts flat `and` / `or` chains against the same 64-level budget as
-  // nested parentheses, so a machine-built predicate with very many terms is now
+  // nested parentheses, so a machine-built predicate with very many terms is
   // rejected outright (see POWQL_MAX_NESTING_DEPTH).
   if (/nesting depth exceeds maximum/i.test(msg)) {
     return new ValidationError(
@@ -1083,7 +1086,7 @@ export function wrapPowdbError(err: unknown): Error {
   }
   // Type mismatch / parse / execution / storage / unexpected(token) / row too
   // large → validation (E003). On the embedded transport these are the only
-  // signal we get (code is always 'GenericFailure'); on the networked path they
+  // signal available (code is always 'GenericFailure'); on the networked path they
   // are a safety net before the .code switch.
   if (/type mismatch|\bParse\b|\bExecution\b|StorageError|unexpected|row too large/i.test(msg)) {
     return new ValidationError(`PowDB query rejected: ${msg}`);
@@ -1353,9 +1356,9 @@ class PowdbTxGate {
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
-        // Give up the queue slot: finishing resolves our `finished` link, so
+        // Give up the queue slot: finishing resolves this hold's `finished` link, so
         // once every transaction ahead completes, later waiters skip straight
-        // past us instead of stalling behind a slot nobody will release.
+        // past this hold instead of stalling behind a slot nobody will release.
         hold.finish();
         reject(new TimeoutError(timeoutMs, 'PowDB transaction (queued behind the single-writer lock)'));
       }, timeoutMs);
@@ -1580,7 +1583,7 @@ export class PowdbPool implements PgCompatPool {
       this.poolHold = await this.txGate.acquire();
     }
     if ((ctl === 'commit' || ctl === 'rollback') && this.poolHold === null) {
-      // No gate hold → our `begin` never ran (gate timeout / re-entrant
+      // No gate hold → this connection's `begin` never ran (gate timeout / re-entrant
       // E017 / no begin at all). Never forward a stray commit/rollback to
       // the engine, PowDB is single-writer, so it could only ever end a
       // DIFFERENT caller's open transaction. Empty success instead.
@@ -1650,10 +1653,19 @@ export class PowdbPool implements PgCompatPool {
           hold = await this.txGate.acquire();
         }
         if ((ctl === 'commit' || ctl === 'rollback') && hold === null) {
-          // This connection never acquired the gate, its `begin` never ran
-          // (gate timeout / re-entrant E017). A stray commit/rollback must
-          // never reach the single-writer engine, where it could only end a
-          // DIFFERENT caller's open transaction. Empty success instead.
+          // This connection holds no gate: its `begin` never ran (gate timeout
+          // / re-entrant E017), or its transaction already ended. A stray
+          // commit/rollback must never reach the single-writer engine, where
+          // it could only end a DIFFERENT caller's open transaction. After a
+          // COMMIT or ROLLBACK that failed, a rollback is refused rather than
+          // answered: an empty success would read as a confirmed rollback of a
+          // transaction whose COMMIT may have taken effect.
+          if (broken && ctl === 'rollback') {
+            throw new ConnectionError(
+              'No rollback was sent: the transaction on this PowDB connection already ended with a COMMIT or ' +
+                'ROLLBACK that failed, so a rollback could only reach another transaction.',
+            );
+          }
           return { rows: [], rowCount: 0, fields: [] };
         }
         try {
@@ -1827,7 +1839,7 @@ function normalizeEmbeddedResult(r: EmbeddedQueryResult): PowdbResult {
  * (`crates/query/src/lexer.rs`) exactly: a string literal is `"…"`, and inside
  * it the lexer recognizes only the escapes `\"`, `\\`, `\n`, `\t` (any other
  * `\x` drops the backslash and keeps `x`; every non-`\`/non-`"` char, raw
- * newlines, CR, unicode, is taken literally). So we escape `\` → `\\` and
+ * newlines, CR, unicode, is taken literally). Escape `\` → `\\` and
  * `"` → `\"` (the only breakout vectors), render `\n`/`\t` as their recognized
  * escapes, and leave everything else raw. Verified against the real engine:
  * quotes, backslashes, `$N`, `"); drop … --`, raw CR, and emoji all round-trip
@@ -1914,7 +1926,7 @@ function powqlNumberText(n: number): string {
  * between v0.18.0 and v0.19.0 (empty git diff), and `link` was already a lexer
  * keyword at 0.18.0. The 0.19 entity-links surface adds new STATEMENTS built from
  * pre-existing tokens, so the tokenization / escape surface this ceiling guards is
- * unmoved. The 0.19.1 link-introspection / link-path round is likewise lexer-neutral:
+ * unmoved. The 0.19.1 link-introspection / link-path support is likewise lexer-neutral:
  * `git diff v0.19.0 v0.19.1 -- crates/query/src/lexer.rs` is empty (the bare-dotted-path
  * hard error is parser-level, not tokenization). The guard in
  * {@link PowdbEmbeddedPool.exec} compares major.minor only, so one entry covers every
@@ -1990,6 +2002,15 @@ export function materializePowql(powql: string, params: unknown[]): string {
  */
 export class PowdbEmbeddedPool implements PgCompatPool {
   private closed = false;
+  /**
+   * The COMMIT or ROLLBACK that failed on the handle, once one has. After that
+   * the engine's state is unknown: on embedded 0.20.0 a ROLLBACK failing with
+   * `bad heap superblock magic` left later reads returning wrong rows and
+   * writes acknowledged and lost. The pool then refuses every operation,
+   * queued ones included, with {@link unusable}. It never reopens or retries:
+   * the handle is closed by `disconnect()` as usual.
+   */
+  private failed?: { statement: string; message: string; cause: unknown };
   /**
    * Single-writer gate. The embedded engine is one handle with one global
    * write lock, only one transaction may be open at a time. A re-entrant
@@ -2076,6 +2097,33 @@ export class PowdbEmbeddedPool implements PgCompatPool {
   }
 
   /**
+   * Why this pool refuses every operation, as a fresh `ConnectionError` naming
+   * the COMMIT or ROLLBACK that failed (see {@link failed}); undefined while
+   * the pool is usable.
+   */
+  get unusable(): ConnectionError | undefined {
+    const f = this.failed;
+    return (
+      f &&
+      new ConnectionError(
+        `A ${f.statement} on the embedded PowDB database failed (${f.message}), so the database may no longer ` +
+          'hold what was committed. This client refuses every operation from now on: disconnect it, and check ' +
+          'the database before opening it again.',
+        { cause: f.cause },
+      )
+    );
+  }
+
+  /** Refuse once the pool is closed or {@link unusable}. */
+  private assertUsable(): void {
+    if (this.closed) {
+      throw new ConnectionError('The PowDB embedded pool is closed: disconnect() was already called on this client.');
+    }
+    const unusable = this.unusable;
+    if (unusable) throw unusable;
+  }
+
+  /**
    * Run one statement, gating transaction control. `holdRef` scopes the gate
    * hold to whoever issued the `begin` (the pool itself or one checked-out
    * client), so finishing a transaction can never release a slot a different
@@ -2086,23 +2134,22 @@ export class PowdbEmbeddedPool implements PgCompatPool {
     params: unknown[],
     holdRef: { hold: PowdbTxHold | null },
   ): Promise<PgCompatQueryResult> {
-    if (this.closed) {
-      throw new ConnectionError('The PowDB embedded pool is closed: disconnect() was already called on this client.');
-    }
+    this.assertUsable();
     const ctl = txControl(powql);
     if (ctl === 'begin') {
       // Gate BEFORE hitting the engine: a begin from inside an active
       // transaction callback throws re-entrant E017 fast; independent
       // concurrent ones wait their FIFO turn.
       holdRef.hold = await this.txGate.acquire();
-      // The gate may have handed us the slot AFTER disconnect() closed the
+      // The gate may have handed over the slot AFTER disconnect() closed the
       // handle (a transaction queued behind an in-flight one, released as the
-      // pool shut down). Re-check before touching the now-closed engine, and
-      // release the slot we just took so the queue keeps draining.
-      if (this.closed) {
+      // pool shut down), or after a failed COMMIT or ROLLBACK made it unusable.
+      // Re-check before touching the engine, and release the slot acquired above
+      // so the queue keeps draining.
+      if (this.closed || this.failed) {
         holdRef.hold.finish();
         holdRef.hold = null;
-        throw new ConnectionError('The PowDB embedded pool is closed: disconnect() was already called on this client.');
+        this.assertUsable();
       }
     }
     if (ctl === null && holdRef.hold === null && this.txGate.busy) {
@@ -2115,11 +2162,7 @@ export class PowdbEmbeddedPool implements PgCompatPool {
       // gate refuses it there.
       const hold = await this.txGate.acquire(statementInsideTransactionError);
       try {
-        if (this.closed) {
-          throw new ConnectionError(
-            'The PowDB embedded pool is closed: disconnect() was already called on this client.',
-          );
-        }
+        this.assertUsable();
         try {
           return this.exec(powql, params);
         } catch (err) {
@@ -2146,6 +2189,16 @@ export class PowdbEmbeddedPool implements PgCompatPool {
         holdRef.hold?.finish();
         holdRef.hold = null;
       }
+      if (ctl === 'commit' || ctl === 'rollback') {
+        // The gate is still released below, so queued work wakes up and is
+        // refused rather than waiting out its queue timeout.
+        this.failed = {
+          statement: ctl.toUpperCase(),
+          message: err instanceof Error ? err.message : String(err),
+          cause: wrapPowdbError(err),
+        };
+        throw this.unusable;
+      }
       throw wrapPowdbError(err);
     } finally {
       if (ctl === 'commit' || ctl === 'rollback') {
@@ -2166,11 +2219,15 @@ export class PowdbEmbeddedPool implements PgCompatPool {
     // keywords run serially on it. Each checked-out client scopes its own
     // gate hold so release() only ever finishes ITS transaction.
     const holdRef: { hold: PowdbTxHold | null } = { hold: null };
+    const unusable = () => this.unusable;
     return {
       // biome-ignore lint/suspicious/noExplicitAny: see query() above.
       query: async (text: QueryArg, values?: unknown[]): Promise<any> => {
         const { text: powql, params } = normalizeQueryArgs(text, values);
         return this.run(powql, params, holdRef);
+      },
+      get unusable() {
+        return unusable();
       },
       // Scope the gate's re-entrancy marker to the user callback's async
       // subtree (see PowdbPool.connect(), identical contract).
@@ -2215,7 +2272,7 @@ export class PowdbEmbeddedPool implements PgCompatPool {
 }
 
 // ---------------------------------------------------------------------------
-// PowqlInterface, the PowQL query generator (Phase A: flat CRUD via returning)
+// PowqlInterface, the PowQL query generator
 // ---------------------------------------------------------------------------
 
 // `describe`-based introspection (programmatic API; see powdb-introspect.ts).

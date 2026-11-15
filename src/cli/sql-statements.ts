@@ -12,7 +12,7 @@
  *   - `destructive.ts` ended a block comment at the first `*\/`
  *     (`sql.indexOf('*\/', i + 2)`). Postgres NESTS block comments, so a
  *     commented-out block that itself contains a comment, the ordinary shape of
- *     "I disabled this for now", reopened as CODE partway through and the
+ *     temporarily disabling a block, reopened as CODE partway through and the
  *     scanner resynchronised in the middle of the file.
  *   - `destructive.ts` then split statements with `text.split(';')`, so a
  *     semicolon inside a quoted identifier (`DROP TABLE "we;ird"`) cut a

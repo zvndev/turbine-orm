@@ -173,7 +173,7 @@ describe('relation naming depends on foreign-key walk order', () => {
     const uniqueFirst = namesFor([fk('profiles'), fk('profile')]);
     const plainFirst = namesFor([fk('profile'), fk('profiles')]);
 
-    // Both orders are internally consistent; they simply disagree, which is the
+    // Both orders are internally consistent; they disagree, which is the
     // whole point. `users.profile` is a hasOne on `profiles` in one and a hasMany
     // on `profile` in the other, so the same relation name reads a different
     // table with a different shape.

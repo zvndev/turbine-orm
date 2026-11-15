@@ -2,8 +2,7 @@
  * The MCP server's three UNBOUNDED-INPUT perimeters, closed in 0.76.0.
  *
  * None of these is a query-builder bug; all three are the surrounding transport
- * accepting something with no ceiling on it, which is the class the 0.75.0
- * review found the query builder to be clean of and the tooling not to be.
+ * accepting input without a ceiling on its size or nesting depth.
  *
  *   1. the stdio reader's unframed buffer (a peer that never sends `\n`)
  *   2. the fail-closed "does this arg name a column" test, which read the top

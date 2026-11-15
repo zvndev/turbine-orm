@@ -105,7 +105,7 @@ at any depth; `AND` and `OR` take arrays.
 To compare two columns, wrap the other one in `col()`, imported from
 `turbine-orm`: `rindScore: { gt: col('aromaScore') }`. A plain `{ col: 'x' }`
 object is refused with `TURBINE_E003`, and so is an operand that does not fit
-its operator, such as an array for `equals` or `null` for `gt`.
+its operator, such as an array for `equals` on a scalar column or `null` for `gt`. Whole-array equality is valid on an array column and can identify a unique array key.
 
 A key whose value is `undefined` is left out, as in Prisma. When that empties
 the whole `where`, `findFirst` throws `TURBINE_E003` instead of returning an
@@ -271,10 +271,11 @@ where: { guildId: 4, batchRef: 'WB-0007' }              // equivalent
 `update`, `delete` and `upsert` each require a `where` that identifies one row,
 by the same rule as `findUnique`, and anything else is `TURBINE_E003` naming the
 keys that would work. For an upsert the `where` names the row to update, and is
-the `ON CONFLICT` target when `create` carries the same values, so a non-unique
-predicate is refused rather than sent. When `create` does not carry them (a
-`create` that leaves `id` to its sequence, say), `upsert` looks the row up by
-`where` first, inside a transaction. Use `updateMany` and `deleteMany` for
+the `ON CONFLICT` target only when `where` is exactly one unique key and
+`create` carries the same values. Extra predicates beside a unique key, two
+separate unique keys, or values absent from `create` require a lookup by the
+whole `where`, inside a transaction. An empty `update` or nested write also
+requires that lookup. Use `updateMany` and `deleteMany` for
 "every row matching a filter". They take no `limit`, `take`, `offset` or `skip`
 (`TURBINE_E003`): to write a bounded batch, `findMany` the ids first, then pass
 `where: { id: { in: ids } }`.

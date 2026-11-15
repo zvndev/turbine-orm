@@ -21,12 +21,23 @@
  * machine description outright; BENCH_MACHINE_NOTE is appended to it.
  */
 
+import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
+import { assertHeadlineRuns } from './semantics.js';
+import type { PgAdmissionOptions } from './pg-admission.js';
+import { assertExtendedRuns } from './extended-results.js';
+import { assertComparisonRuns, loadComparisonFinalManifest, type Engine } from './comparison-results.js';
+import { assertSecondaryRuns, secondarySummary, latencyRows } from './secondary-results.js';
+import type { Report as SecondaryReport } from './secondary-contract.js';
+
+const pgAdmissionOptions: PgAdmissionOptions = process.env.PG_REPORT_SCOPE === 'historical'
+  ? { scope: 'historical' }
+  : { admission: process.env.PG_FINAL_ADMISSION ? JSON.parse(readFileSync(process.env.PG_FINAL_ADMISSION, 'utf8')) : undefined };
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -45,6 +56,17 @@ interface Scenario {
 }
 
 interface BenchResults {
+  secondarySemantics: string;
+  secondary: {
+    stream: ReturnType<typeof secondarySummary>;
+    latency: ReturnType<typeof secondarySummary>;
+    deepoffset: ReturnType<typeof secondarySummary>;
+  };
+  admissionScope: 'final' | 'historical';
+  headlineSemantics: string;
+  headlineEvidence: { runs: SuiteRun[]; combined: Combined[] };
+  extendedSemantics: string;
+  extendedEvidence: { runs: SuiteRun[]; combined: Combined[] };
   version: string;
   date: string;
   env: {
@@ -65,7 +87,7 @@ interface BenchResults {
     overheadVsControl: Record<Library, number> & { scenarios: number };
     ratioToFastest: Record<Library, number> & { scenarios: number };
   };
-  streaming: { arm: string; library: Library | 'control'; median: number }[];
+  streaming: { arm: string; library: Library | 'drizzle-rc' | 'control'; median: number }[];
   deepPagination: {
     turbine: number;
     turbineForceCustomPlan: number;
@@ -223,13 +245,11 @@ interface ScenarioResult {
   stats: Stat[];
 }
 interface SuiteRun {
+  headlineSemantics?: unknown;
   driftHead?: number;
   driftMid?: number;
   driftTail?: number;
   results: ScenarioResult[];
-}
-interface LatencyRun {
-  results: { scenario: string; arm: string; byRtt: Record<string, number> }[];
 }
 interface Combined {
   scenario: string;
@@ -253,27 +273,6 @@ function jsonBlock<T>(path: string): T {
   if (at < 0) throw new Error(`no "=== JSON ===" block in ${path}`);
   const rest = text.slice(at + '=== JSON ==='.length);
   return JSON.parse(rest.slice(0, rest.lastIndexOf('}') + 1)) as T;
-}
-
-/**
- * bench-stream-parity.ts prints only the text table bench-harness renders:
- * a `-- scenario --` header, then `  arm  median avg p95 min` rows.
- */
-function textBlocks(path: string): ScenarioResult[] {
-  const out: ScenarioResult[] = [];
-  let cur: ScenarioResult | null = null;
-  for (const line of readFileSync(path, 'utf8').split('\n')) {
-    const h = /^-- (.+) --$/.exec(line);
-    if (h) {
-      cur = { scenario: h[1]!, stats: [] };
-      out.push(cur);
-      continue;
-    }
-    if (!cur) continue;
-    const m = /^ {2}(\S(?:.*?\S)?)\s{2,}(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)\s+(\d+\.\d+)/.exec(line);
-    if (m && m[1] !== 'arm') cur.stats.push({ name: m[1]!, median: Number(m[2]) });
-  }
-  return out.filter((b) => b.stats.length > 0);
 }
 
 /** Median of the runs' medians, per arm per scenario, in first-seen order. */
@@ -399,9 +398,20 @@ function build(dir: string): void {
 
   const defaultLogs = runLogs(dir, 'default');
   const defaultRuns = defaultLogs.map((p) => jsonBlock<SuiteRun>(p));
+  const headlineSemantics = assertHeadlineRuns(defaultRuns, pgAdmissionOptions);
   const extendedRuns = runLogs(dir, 'extended').map((p) => jsonBlock<SuiteRun>(p));
-  const streamRuns: SuiteRun[] = runLogs(dir, 'stream').map((p) => ({ results: textBlocks(p) }));
-  const latencyRuns = runLogs(dir, 'latency').map((p) => jsonBlock<LatencyRun>(p));
+  const extendedSemantics = assertExtendedRuns(extendedRuns, { ...pgAdmissionOptions, allowSmoke: process.env.EXTENDED_ALLOW_SMOKE === '1' });
+  const streamRuns = runLogs(dir, 'stream').map((p) => jsonBlock<SecondaryReport>(p));
+  const secondaryLatencyRuns = runLogs(dir, 'latency').map((p) => jsonBlock<SecondaryReport>(p));
+  const secondaryDeepRuns = [jsonBlock<SecondaryReport>(join(dir, 'deepoffset.log'))];
+  assertSecondaryRuns(streamRuns, 'stream', pgAdmissionOptions);
+  assertSecondaryRuns(secondaryLatencyRuns, 'latency', pgAdmissionOptions);
+  assertSecondaryRuns(secondaryDeepRuns, 'deepoffset', pgAdmissionOptions);
+  for (const report of [...secondaryLatencyRuns, ...secondaryDeepRuns]) {
+    assert.deepEqual(report.profile, streamRuns[0]!.profile,
+      'Secondary suites use different execution profiles or source/artifact provenance');
+  }
+  const latencyRuns = secondaryLatencyRuns.map(latencyRows);
   const defaultTable = combine(defaultRuns);
   const extendedTable = combine(extendedRuns);
   const floors = { default: driftFloor(defaultRuns), extended: driftFloor(extendedRuns) };
@@ -479,6 +489,17 @@ function build(dir: string): void {
 
   const { rounds, warmup } = header(defaultLogs[0]!);
   const out: BenchResults = {
+    secondarySemantics: streamRuns[0]!.secondarySemantics,
+    secondary: {
+      stream: secondarySummary(streamRuns, 'stream', pgAdmissionOptions),
+      latency: secondarySummary(secondaryLatencyRuns, 'latency', pgAdmissionOptions),
+      deepoffset: secondarySummary(secondaryDeepRuns, 'deepoffset', pgAdmissionOptions),
+    },
+    admissionScope: pgAdmissionOptions.scope === 'historical' ? 'historical' : 'final',
+    headlineSemantics,
+    headlineEvidence: { runs: defaultRuns, combined: defaultTable },
+    extendedSemantics,
+    extendedEvidence: { runs: extendedRuns, combined: extendedTable },
     version: env.version,
     date: env.capturedAt.slice(0, 10),
     env: {
@@ -512,7 +533,8 @@ function build(dir: string): void {
     streaming: (
       [
         { arm: 'Turbine findManyStreamBatches', library: 'turbine', median: streamArm('T batches') },
-        { arm: `Drizzle ${env.drizzleRc}`, library: 'drizzle', median: streamArm('Drizzle RC') },
+        { arm: `Drizzle ${env.drizzleRc}`, library: 'drizzle-rc', median: streamArm('Drizzle RC') },
+        { arm: `Prisma ${env.prisma}, keyset page emulation`, library: 'prisma', median: streamArm('Prisma 7 pages') },
         { arm: 'Turbine findManyStream (per row)', library: 'turbine', median: streamArm('T rows') },
         { arm: `Drizzle ${env.drizzle}`, library: 'drizzle', median: streamArm('Drizzle') },
         { arm: 'hand-written pg, keyset pages', library: 'control', median: streamArm('Raw') },
@@ -616,15 +638,40 @@ function assertShape(r: BenchResults): void {
   if (bad.length) throw new Error(`results would not be publishable:\n  ${bad.join('\n  ')}`);
 }
 
+/** Keep full native matrices and unsupported cells; never manufacture PG site scores. */
+function buildEngine(dir: string, engine: Engine): void {
+  const pattern = new RegExp(`^${engine}-run([1-9]\\d*)\\.json$`);
+  const files = readdirSync(dir).filter((name) => pattern.test(name))
+    .sort((a, b) => Number(pattern.exec(a)![1]) - Number(pattern.exec(b)![1]));
+  if (!files.length || files.some((f, i) => Number(pattern.exec(f)![1]) !== i + 1))
+    throw new Error('Missing or noncontiguous engine run reports');
+  const prefix = engine === 'mysql' ? 'MYSQL_COMPARISON' : 'SQLITE_COMPARISON';
+  const expected = loadComparisonFinalManifest(engine, process.env[`${prefix}_FINAL_MANIFEST`],
+    process.env[`${prefix}_FINAL_MANIFEST_SHA256`]);
+  const reports = files.map((name) => {
+    const report = JSON.parse(readFileSync(join(dir, name), 'utf8'));
+    // Capture each runtime closure independently from the actual invocation.
+    const provenance = JSON.parse(readFileSync(join(dir, name.replace(/\.json$/, '.runtime-closure.json')), 'utf8'));
+    return { ...report, runtimeClosure: provenance };
+  });
+  assertComparisonRuns(reports, engine, expected);
+  writeFileSync(join(dir, `${engine}-results.json`), `${JSON.stringify({
+    format: `${engine}-comparison-round-v1`, comparativeClaim: false,
+    scope: 'Complete per-engine reports. Stable/RC, unsupported operations, return work and driver versions remain distinct. Host controls require separate assessment.',
+    reports,
+  }, null, 2)}\n`);
+}
+
 // --- main ----------------------------------------------------------------------
 
 const [mode, dir] = process.argv.slice(2);
-if ((mode !== 'env' && mode !== 'build') || !dir) {
-  console.error('usage: npx tsx build-results.ts env|build <outdir>');
+if (!['env', 'build', 'sqlite', 'mysql'].includes(mode ?? '') || !dir) {
+  console.error('usage: npx tsx build-results.ts env|build|sqlite|mysql <outdir>');
   process.exit(2);
 }
 try {
-  if (mode === 'env') await captureEnv(dir);
+  if (mode === 'sqlite' || mode === 'mysql') buildEngine(dir, mode);
+  else if (mode === 'env') await captureEnv(dir);
   else build(dir);
 } catch (err) {
   console.error(`build-results ${mode}: ${err instanceof Error ? err.message : String(err)}`);

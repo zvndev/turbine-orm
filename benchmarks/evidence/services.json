@@ -1,0 +1,19 @@
+{
+  "verifiedAt": "2026-11-06T05:06:05.033524+00:00",
+  "images": {
+    "mysql": {
+      "image": "mysql@sha256:a81d043930e51745522bd5c430961cf8286f0a23f0a9a2a6e0108f7ea71b0902",
+      "source": "https://registry-1.docker.io/v2/library/mysql/manifests/8.4",
+      "mediaType": "application/vnd.oci.image.index.v1+json",
+      "platform": "linux/amd64",
+      "actualServerVersion": "Must be queried by runner after startup; image discovery is not runtime evidence"
+    },
+    "mssql": {
+      "image": "mcr.microsoft.com/mssql/server@sha256:ba4c8329f48fb8f02e1416be6a930ebfd71268caee78aa985f3af4315e457c89",
+      "source": "https://mcr.microsoft.com/v2/mssql/server/manifests/2022-CU26-ubuntu-22.04",
+      "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+      "platform": "linux/amd64",
+      "actualServerVersion": "Must be queried by runner after startup; image discovery is not runtime evidence"
+    }
+  }
+}

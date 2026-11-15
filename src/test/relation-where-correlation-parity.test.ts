@@ -18,6 +18,7 @@ import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { afterEach, beforeEach, describe, it as nodeIt } from 'node:test';
 import type { TurbineClient } from '../client.js';
 import { introspectSqliteDatabase, turbineSqlite } from '../sqlite.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 // `node:sqlite` is a builtin only on Node >= 22.5, so probe without a static
 // import so the file still loads (and skips) on the lowest supported Node.
@@ -65,9 +66,10 @@ interface UserRow {
 let db: DatabaseSyncType;
 let client: TurbineClient;
 
-beforeEach(() => {
+beforeEach((t) => {
+  assert.ok('after' in t, 'beforeEach must receive a test context');
   if (!DatabaseSync) return;
-  db = new DatabaseSync(':memory:');
+  db = closeSqliteAfter(new DatabaseSync(':memory:'), t.after.bind(t));
   db.exec('PRAGMA foreign_keys = ON');
   db.exec(SCHEMA_SQL);
   db.exec(SEED_SQL);

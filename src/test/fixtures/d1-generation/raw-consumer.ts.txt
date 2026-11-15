@@ -1,0 +1,30 @@
+import type { D1Database } from '@cloudflare/workers-types';
+import { turbine, type UserCreate } from './generated/index.js';
+function check(value: unknown, message: string): asserts value {if(!value)throw new Error(message);}
+export async function run(binding:D1Database) {
+  const db=turbine(binding,{warnOnUnlimited:false,globalFilters:{users:{active:true}}});
+  const data:UserCreate={display_name:'Raw',active:true,created_at:new Date('2026-01-01T00:00:00Z'),large_id:7,payload:new Uint8Array([1,2])};
+  const created=await db.users.create({data});
+  const date:Date=created.created_at; const bytes:Uint8Array|null=created.payload; const integer:number=created.large_id;
+  // @ts-expect-error keepColumnNames retains raw names
+  created.displayName;
+  check(date instanceof Date && bytes instanceof Uint8Array && integer===7,'raw parser classes');
+  await db.posts.create({data:{user_id:created.id,title:'raw relation'}});
+  const related=await db.users.findMany({with:{posts:true}});
+  const id:number=related[0]!.posts[0]!.user_id;
+  check(id===created.id,'raw relation field');
+  await db.pairs.create({data:{left_id:1,right_id:2,label:'raw'}});
+  const pair=await db.pairs.findUnique({where:{left_id_right_id:{left_id:1,right_id:2}}});
+  check(pair?.computed===3,'raw composite selector');
+  const raw=await db.rawNames.create({data:{id:1,['__proto__']:'retained',constructor:'ctor',toString:'string'}});
+  const rawRead=await db.rawNames.findUnique({where:{id:1}});
+  for(const row of [raw,rawRead]) {
+    check(row && Object.hasOwn(row,'__proto__') && row.__proto__==='retained','own raw prototype column');
+    check(!Object.hasOwn(row,'[object Object]'),'no miskeyed prototype value');
+    const value:string=row.__proto__;
+    check(value==='retained' && row.constructor==='ctor' && row.toString==='string','raw prototype field types');
+  }
+  await db.disconnect();
+  check((await binding.prepare('SELECT 1 AS n').first<{n:number}>())?.n===1,'raw caller binding');
+  return {ok:true,groups:6};
+}

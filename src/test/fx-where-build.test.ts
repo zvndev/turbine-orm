@@ -1,5 +1,5 @@
 /**
- * The where rules fixed after review wave C, build-only (no database):
+ * The where rules fixed for expressions and locking, build-only (no database):
  *
  *   - an `OR` with a branch that applies no condition is TRUE (it dropped the
  *     branch, so its `NOT` deleted every row but one);

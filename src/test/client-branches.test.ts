@@ -125,7 +125,7 @@ describe('TurbineClient.$transaction, isolation levels', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 1b. Failed BEGIN, no stray ROLLBACK (adversarial-review regression)
+// 1b. Failed BEGIN, no stray ROLLBACK
 // ---------------------------------------------------------------------------
 //
 // If BEGIN itself throws (e.g. a single-writer engine's transaction gate times

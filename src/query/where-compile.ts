@@ -36,10 +36,13 @@
  */
 
 import { ValidationError } from '../errors.js';
+import { resolveColumnName, resolveRelation } from '../query-utils.js';
 import type { RelationDef, TableMetadata } from '../schema.js';
 import { normalizeKeyColumns } from '../schema.js';
 import { isColumnRef } from './column-ref.js';
 import {
+  columnOperandKind,
+  columnTypeToken,
   describeOperand,
   dropUndefinedKeys,
   findArrayUniqueKey,
@@ -54,14 +57,13 @@ import {
   isUnmatchedPlainObject,
   isVectorFilter,
   isWhereOperator,
-  operandColumnKind,
+  type OperandColumnKind,
   RELATION_FILTER_WRAPPER_SET,
   RELATION_FILTER_WRAPPERS,
   sortedKeys,
   VECTOR_DISTANCE_COMPARATORS,
 } from './filters.js';
 import type { ArrayFilter, JsonFilter, TextSearchFilter, VectorFilter } from './types.js';
-import { resolveColumnName, resolveRelation } from './utils.js';
 
 /** A table-scoped WHERE object (or an `OR`/`AND`/`NOT` branch of one). */
 export type WhereRecord = Record<string, unknown>;
@@ -119,6 +121,8 @@ export interface WhereHost {
   normalizeRelationFilter(relDef: RelationDef, filterObj: WhereRecord): WhereRecord;
   /** Resolve a column's Postgres type token (defaults to `text`). */
   getColumnPgType(column: string): string;
+  /** What the column may hold at a value position ({@link columnOperandKind}). */
+  getColumnKind(column: string): OperandColumnKind;
   /** True for `json` / `jsonb` column types. */
   isJsonColumnType(colType: string): boolean;
 }
@@ -338,7 +342,7 @@ function combinatorShapeError(
 function matchNothingEvent(host: WhereHost): WhereEvent {
   const meta = host.tableMeta;
   for (const column of [...(meta.primaryKey ?? []), ...(meta.allColumns ?? [])]) {
-    if (operandColumnKind(host.getColumnPgType(column)) !== 'scalar') continue;
+    if (host.getColumnKind(column) !== 'scalar') continue;
     return { kind: 'scalar', key: meta.reverseColumnMap?.[column] ?? column, value: { in: [] } };
   }
   throw new ValidationError(
@@ -662,7 +666,7 @@ function foldScalar(host: WhereHost, key: string, value: unknown, options?: Wher
   const kind = classifyScalarForSql(host, column, value).kind;
   if (kind === 'array') return notNull ? foldArrayFilter(value as Record<string, unknown>) : 'row';
   if (kind !== 'operator') return 'row';
-  const json = operandColumnKind(host.getColumnPgType(column)) === 'json';
+  const json = host.getColumnKind(column) === 'json';
   return foldOperator(value as Record<string, unknown>, json, 0, notNull && !json ? { host, column } : undefined);
 }
 
@@ -740,8 +744,12 @@ export function metadataWhereHost(meta: TableMetadata): WhereHost {
   return {
     tableMeta: meta,
     normalizeRelationFilter: normalizeToOneRelationFilter,
-    getColumnPgType: (column) => meta.dialectTypes?.[column] ?? meta.pgTypes?.[column] ?? 'text',
-    isJsonColumnType: (colType) => operandColumnKind(colType) === 'json',
+    getColumnPgType: (column) => columnTypeToken(meta, column) ?? 'text',
+    getColumnKind: (column) => columnOperandKind(meta, column),
+    isJsonColumnType: (colType) => {
+      const t = colType.toLowerCase();
+      return t === 'json' || t === 'jsonb';
+    },
   };
 }
 
@@ -772,10 +780,15 @@ export function foldWhereFor(
  * error (`*Throw`). Both the build and collect paths call this, so they can
  * never classify the same value differently.
  */
-export function classifyScalarForSql(host: WhereHost, rawColumn: string, value: unknown): ScalarSqlClass {
+export function classifyScalarForSql(
+  host: WhereHost,
+  rawColumn: string,
+  value: unknown,
+  extensions = true,
+): ScalarSqlClass {
   if (value === null) return { kind: 'null' };
 
-  if (typeof value === 'object' && !Array.isArray(value) && isVectorFilter(value)) {
+  if (extensions && typeof value === 'object' && !Array.isArray(value) && isVectorFilter(value)) {
     return { kind: 'vector' };
   }
 
@@ -790,13 +803,13 @@ export function classifyScalarForSql(host: WhereHost, rawColumn: string, value: 
 
   if (typeof value === 'object' && !Array.isArray(value) && isArrayFilter(value)) {
     const colType = host.getColumnPgType(rawColumn);
-    if (colType.startsWith('_')) return { kind: 'array', colType };
+    if (host.getColumnKind(rawColumn) === 'array') return { kind: 'array', colType };
     const arrayKey = findArrayUniqueKey(value);
     if (arrayKey) return { kind: 'arrayThrow', arrayKey };
     // else: fall through.
   }
 
-  if (typeof value === 'object' && !Array.isArray(value) && isTextSearchFilter(value)) {
+  if (extensions && typeof value === 'object' && !Array.isArray(value) && isTextSearchFilter(value)) {
     return { kind: 'textsearch' };
   }
 

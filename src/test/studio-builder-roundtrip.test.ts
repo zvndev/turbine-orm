@@ -7,7 +7,7 @@
  * the loader was left translating in neither direction: it read every saved key
  * as a column name, so on any snake_case schema `hydrate` produced clauses
  * whose `column` matched nothing, and the emit side then DROPPED them. No
- * toast, no validation error, no console warning: a reloaded saved query simply
+ * toast, no validation error, no console warning: a reloaded saved query
  * returned more rows than it did when it was saved. `orderBy` and `select` /
  * `omit` had the same mismatch, showing "(none)" and inactive chips while the
  * emitted args still carried them.
@@ -16,7 +16,7 @@
  * asserted that particular lines of JavaScript existed in the served HTML.
  * These tests instead extract the pure `builder-args` region out of the HTML
  * that is actually served and RUN it, so save -> disk -> load -> save is tested
- * as behaviour. `node:vm` on a delimited region of our own shipped source is the
+ * as behaviour. `node:vm` on a delimited region of the shipped source is the
  * only way to reach browser code from a Node test without adding a DOM
  * dependency, which the package's one-runtime-dependency rule forbids; it is
  * confined to this file and never used at runtime.

@@ -62,7 +62,7 @@ const schema: SchemaMetadata = {
 /**
  * 358k rows over 8 tenants. The sparse tenant holds ~0.1% of them, all in the
  * oldest time slice, which is what makes the backward `created_at` scan discard
- * essentially the whole table before finding a match. Rows are padded to 600
+ * nearly the whole table before finding a match. Rows are padded to 600
  * bytes with PLAIN storage so the heap is wide: that inflates the bad plan's
  * full-scan cost without touching the index-only plan's, which is what puts the
  * good plan inside the window where the two plans disagree.

@@ -557,7 +557,7 @@ function searchPathListValue(schema: string, alsoResolveIn: readonly string[]): 
  * layout (`public, extensions`) a `citext` / `vector` / `hstore` / `postgis`
  * column, an extension opclass in a CREATE INDEX, or a CHECK calling an
  * extension function all failed under a pin that the same DDL did not need
- * without one. Two authorities on one question, so there is now one.
+ * without one. Both checks use this predicate to keep that decision consistent.
  *
  * The inherited path cannot be read before the connection exists, so
  * `alsoResolveIn` is the caller's job: connect once unpinned, `SHOW

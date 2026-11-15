@@ -31,6 +31,7 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
+import { ENGINE_GATE_PATTERNS } from './helpers.js';
 
 function workflow(file: string): string[] {
   return readFileSync(new URL(`../../.github/workflows/${file}`, import.meta.url), 'utf8').split('\n');
@@ -72,10 +73,536 @@ function stepsOf(job: string[]): string[][] {
   return steps;
 }
 
+it('requires coverage map identity checks before the existing coverage collection', () => {
+  const job = jobsOf(workflow('gates.yml')).get('coverage');
+  assert.ok(job);
+  const command = 'run: node --test tooling/coverage-regressions/merge.test.mjs';
+  const validate = (steps: string[][]) => {
+    const check = steps.findIndex((step) => step.some((line) => line.trim() === command));
+    const collect = steps.findIndex((step) => step.includes('      - run: npm run test:coverage'));
+    assert.ok(check >= 0 && collect > check, 'coverage map checks must precede collection');
+    assert.doesNotMatch(steps[check]!.join('\n'), /^\s*(?:if:|continue-on-error:)/m);
+  };
+  const steps = stepsOf(job);
+  const index = steps.findIndex((step) => step.some((line) => line.trim() === command));
+  validate(steps);
+  assert.throws(() => validate(steps.filter((_, at) => at !== index)));
+  for (const directive of ['if: false', 'continue-on-error: true'])
+    assert.throws(() => validate(steps.map((step, at) => (at === index ? [...step, `        ${directive}`] : step))));
+  assert.throws(() => validate([...steps.filter((_, at) => at !== index), steps[index]!]));
+});
+
 const AGGREGATORS = [
   { file: 'ci.yml', job: 'ci-ok' },
   { file: 'gates.yml', job: 'gates-ok' },
 ] as const;
+
+function assertSqliteSourceSetup(steps: string[][]): void {
+  const commandAt = (command: string) =>
+    steps.findIndex((step) => step.some((line) => line.trim().replace(/^-\s*/, '') === `run: ${command}`));
+  const install = commandAt('npm ci');
+  const generate = commandAt('npm run gen:studio');
+  const tests = steps.findIndex((step) =>
+    step.some((line) => line.includes('run: npx tsx --test') && line.includes('sqlite-cli-project-command.test.ts')),
+  );
+  assert.ok(install >= 0 && tests >= 0, 'SQLite source gate must install dependencies and run CLI tests');
+  assert.ok(
+    install < generate && generate < tests,
+    'SQLite source gate must run gen:studio after npm ci and before CLI tests in a fresh checkout',
+  );
+  assert.ok(
+    !steps[generate]!.some((line) => /^\s*(?:if:|continue-on-error:)/.test(line)),
+    'SQLite source generation must be unconditional and must propagate failure',
+  );
+}
+
+it('requires native SQLite migration writers in their supported-runtime gate', () => {
+  const job = jobsOf(workflow('gates.yml')).get('sqlite-migrations');
+  assert.ok(job, 'native SQLite migration job must exist');
+  const source = job.join('\n');
+  assert.match(source, /node-version: \['24\.10\.0', '24'\]/);
+  assert.match(source, /TURBINE_REQUIRE_ENGINE: sqlite,sqlite-migrations/);
+  assert.match(source, /sqlite-table-modes\.test\.ts/);
+  assert.match(source, /sqlite-doctor\.test\.ts/);
+  assert.match(source, /sqlite-doctor-dispatch\.test\.ts/);
+  assert.match(source, /tsx --test .*sqlite-migrations\.test\.ts .*sqlite-cli-project-command\.test\.ts/);
+  assertSqliteSourceSetup(stepsOf(job));
+  const reason = 'SQLite migration writer requires setAuthorizer/isTransaction (Node >= 24.10)';
+  assert.equal(ENGINE_GATE_PATTERNS['sqlite-migrations']?.test(reason), true);
+  assert.equal(ENGINE_GATE_PATTERNS.sqlite?.test(reason), false, 'ordinary SQLite on Node 22 has its own gate');
+});
+
+it('rejects omitted, late or conditional SQLite source generation', () => {
+  const job = jobsOf(workflow('gates.yml')).get('sqlite-migrations');
+  assert.ok(job);
+  const steps = stepsOf(job);
+  assertSqliteSourceSetup(steps);
+  const generation = steps.find((step) => step.some((line) => line.trim() === 'run: npm run gen:studio'));
+  assert.ok(generation, 'negative controls need the real generation step');
+  const omitted = steps.filter((step) => step !== generation);
+  assert.throws(() => assertSqliteSourceSetup(omitted), /gen:studio.*before CLI tests/);
+  assert.throws(() => assertSqliteSourceSetup([...omitted, generation]), /gen:studio.*before CLI tests/);
+  for (const bypass of ['        if: false', '        continue-on-error: true']) {
+    const conditional = steps.map((step) => (step === generation ? [...step, bypass] : step));
+    assert.throws(() => assertSqliteSourceSetup(conditional), /unconditional.*propagate failure/);
+  }
+});
+
+function assertOptionalSqliteBinding(steps: string[][]): void {
+  const step = steps.find((lines) => lines.some((line) => line.includes('Require the optional native SQLite binding')));
+  assert.ok(step, 'optional SQLite binding must have a required native step');
+  assert.ok(
+    !step.some((line) => /^\s*(?:if:|continue-on-error:)/.test(line)),
+    'native binding admission must be unconditional',
+  );
+  const source = step.join('\n');
+  for (const required of [
+    'better-sqlite3@12.11.1',
+    'TURBINE_REQUIRE_SQLITE_BINDING=1',
+    'TURBINE_SQLITE_BINDING_PEER=',
+    'src/test/sqlite-binding.test.ts',
+    'src/test/sqlite-binding-node-values.test.ts',
+    'src/test/generate-better-sqlite3.test.ts',
+    'src/test/sqlite-result-metadata.test.ts',
+    'src/test/sqlite-driver-capabilities.test.ts',
+    'src/test/sqlite-materialization-boundaries.test.ts',
+    'src/test/sqlite-bulk-positional.test.ts',
+    'needs.pack.outputs.tarball',
+    'node verify.mjs esm',
+    'node verify.mjs cjs',
+    'node verify.mjs missing-esm',
+    'node verify.mjs missing-cjs',
+  ])
+    assert.ok(source.includes(required), `native binding admission requires ${required}`);
+}
+
+it('refuses omitted or disabled optional SQLite native and installed checks', () => {
+  const job = jobsOf(workflow('gates.yml')).get('sqlite-migrations');
+  assert.ok(job);
+  const steps = stepsOf(job);
+  assertOptionalSqliteBinding(steps);
+  const step = steps.find((lines) =>
+    lines.some((line) => line.includes('Require the optional native SQLite binding')),
+  )!;
+  assert.throws(() => assertOptionalSqliteBinding(steps.filter((lines) => lines !== step)), /required native step/);
+  for (const missing of [
+    'TURBINE_REQUIRE_SQLITE_BINDING=1',
+    'src/test/sqlite-result-metadata.test.ts',
+    'src/test/sqlite-driver-capabilities.test.ts',
+    'src/test/sqlite-materialization-boundaries.test.ts',
+    'src/test/sqlite-bulk-positional.test.ts',
+    'node verify.mjs cjs',
+    'node verify.mjs missing-esm',
+  ]) {
+    assert.throws(
+      () => assertOptionalSqliteBinding(steps.map((lines) => lines.map((line) => line.replace(missing, '')))),
+      /requires/,
+    );
+  }
+  for (const bypass of ['        if: false', '        continue-on-error: true']) {
+    assert.throws(
+      () => assertOptionalSqliteBinding(steps.map((lines) => (lines === step ? [...lines, bypass] : lines))),
+      /unconditional/,
+    );
+  }
+  const unit = jobsOf(workflow('gates.yml')).get('unit-tests');
+  assert.ok(unit);
+  const checkFloor = (steps: string[][]) => {
+    const step = steps.find((lines) => lines.some((line) => line.includes('SQLite prototype-column preservation')));
+    assert.ok(step, 'Node 20 native binding step is required');
+    assert.equal(
+      step
+        .filter((line) => /^\s*if:/.test(line))
+        .join('\n')
+        .trim(),
+      'if: matrix.node-version == 20',
+    );
+    assert.ok(!step.some((line) => /continue-on-error:/.test(line)), 'native binding failures must propagate');
+    const source = step.join('\n');
+    for (const required of [
+      'better-sqlite3@12.11.1',
+      'TURBINE_REQUIRE_SQLITE_BINDING=1',
+      'src/test/sqlite-binding.test.ts',
+    ])
+      assert.ok(source.includes(required), `Node 20 binding requires ${required}`);
+  };
+  const unitSteps = stepsOf(unit);
+  checkFloor(unitSteps);
+  for (const omitted of ['TURBINE_REQUIRE_SQLITE_BINDING=1', 'if: matrix.node-version == 20'])
+    assert.throws(() => checkFloor(unitSteps.map((step) => step.map((line) => line.replace(omitted, '')))));
+});
+
+function assertConsumerCostTests(steps: string[][]): void {
+  const install = steps.findIndex((step) => step.includes('      - run: npm ci'));
+  const tests = steps.findIndex((step) =>
+    step.some(
+      (line) =>
+        line.trim() ===
+        'run: node --test tooling/consumer-cost/measure-consumer-cost.test.mjs tooling/consumer-cost/comparison.test.mjs tooling/consumer-cost/runtime-role-closure.test.mjs',
+    ),
+  );
+  assert.ok(install >= 0 && tests > install, 'consumer-cost behavioral tests must run after npm ci');
+  assert.ok(
+    !steps[tests]!.some((line) => /^\s*(?:if:|continue-on-error:)/.test(line)),
+    'consumer-cost behavioral tests must be unconditional and propagate failure',
+  );
+}
+
+it('gates consumer-cost behavioral controls in the existing unit Node matrix', () => {
+  const job = jobsOf(workflow('gates.yml')).get('unit-tests');
+  assert.ok(job);
+  const steps = stepsOf(job);
+  assertConsumerCostTests(steps);
+  const tests = steps.find((step) => step.some((line) => line.includes('measure-consumer-cost.test.mjs')))!;
+  assert.throws(() => assertConsumerCostTests(steps.filter((step) => step !== tests)), /must run after npm ci/);
+  for (const file of ['comparison.test.mjs', 'runtime-role-closure.test.mjs']) {
+    assert.throws(
+      () =>
+        assertConsumerCostTests(
+          steps.map((step) => step.map((line) => line.replace(` tooling/consumer-cost/${file}`, ''))),
+        ),
+      /must run after npm ci/,
+    );
+  }
+  for (const bypass of ['        if: false', '        continue-on-error: true']) {
+    assert.throws(
+      () => assertConsumerCostTests(steps.map((step) => (step === tests ? [...step, bypass] : step))),
+      /unconditional and propagate failure/,
+    );
+  }
+});
+
+function assertEvidenceControls(steps: string[][]): void {
+  const commandAt = (command: string) =>
+    steps.findIndex((step) => step.some((line) => line.trim() === `run: ${command}`));
+  const install = commandAt('npm ci --prefix benchmarks/evidence --ignore-scripts');
+  const tests = commandAt('npm test --prefix benchmarks/evidence');
+  assert.ok(install >= 0 && tests > install, 'evidence controls must run after their locked dependency install');
+  for (const step of [steps[install]!, steps[tests]!]) {
+    assert.ok(
+      step.includes('        if: matrix.node-version == 24'),
+      'evidence controls require the supported Node 24 unit lane',
+    );
+    assert.ok(!step.some((line) => line.includes('continue-on-error:')), 'evidence control failures must propagate');
+  }
+}
+
+it('runs exact-result evidence controls in the existing supported unit lane', () => {
+  const job = jobsOf(workflow('gates.yml')).get('unit-tests');
+  assert.ok(job);
+  const steps = stepsOf(job);
+  assertEvidenceControls(steps);
+  const control = steps.find((step) =>
+    step.some((line) => line.includes('run: npm test --prefix benchmarks/evidence')),
+  )!;
+  assert.throws(() => assertEvidenceControls(steps.filter((step) => step !== control)), /must run after/);
+  assert.throws(
+    () =>
+      assertEvidenceControls(
+        steps.map((step) => step.map((line) => line.replace('matrix.node-version == 24', 'matrix.node-version == 20'))),
+      ),
+    /supported Node 24/,
+  );
+  assert.throws(
+    () =>
+      assertEvidenceControls(
+        steps.map((step) => (step === control ? [...step, '        continue-on-error: true'] : step)),
+      ),
+    /failures must propagate/,
+  );
+});
+
+it('gates artifact upgrades, native consumer contracts and preparation controls on supported unit runtimes', () => {
+  const steps = stepsOf(jobsOf(workflow('gates.yml')).get('unit-tests')!);
+  const assertControl = (candidate: string[][], command: string, condition?: string) => {
+    const install = candidate.findIndex((step) => step.includes('      - run: npm ci'));
+    const index = candidate.findIndex((step) => step.some((line) => line.trim() === `run: ${command}`));
+    assert.ok(index > install && install >= 0, 'control must run after npm ci');
+    const step = candidate[index]!;
+    assert.deepEqual(
+      step.filter((line) => /^\s*if:/.test(line)).map((line) => line.trim()),
+      condition ? [`if: ${condition}`] : [],
+      'supported runtime guard',
+    );
+    assert.ok(!step.some((line) => /continue-on-error:/.test(line)), 'control failure must propagate');
+  };
+  for (const [command, condition] of [
+    ['node --test tooling/sqlite-fixture-lifetimes/harness.test.mjs', undefined],
+    [
+      'node tooling/sqlite-fixture-lifetimes/run.mjs --out "$RUNNER_TEMP/sqlite-fixture-lifetimes"',
+      'matrix.node-version != 20',
+    ],
+    [
+      'node --test tooling/lifecycle-examples/harness.test.mjs tooling/lifecycle-upgrades/harness.test.mjs tooling/native-consumer-contracts/harness.test.mjs tooling/native-integer-types/harness.test.mjs',
+      undefined,
+    ],
+    ['node --import tsx --test benchmarks/postgres-pagination/validator.test.mjs', undefined],
+    ['node --test benchmarks/postgres-keyset/guards.test.mjs', undefined],
+    ['node --test benchmarks/mysql-preparation/harness.test.mjs', undefined],
+    ['node --test benchmarks/mysql-streaming/harness.test.mjs', undefined],
+    ['node --test benchmarks/postgres-streaming/harness.test.mjs', undefined],
+    ['node benchmarks/postgres-streaming/omissions.mjs', undefined],
+    ['node --test benchmarks/sqlite-relations/harness.test.mjs benchmarks/mysql-relations/guards.test.mjs', undefined],
+    ['node benchmarks/sqlite-relations/omissions.mjs', undefined],
+    ['node benchmarks/mysql-relations/controls.mjs "$RUNNER_TEMP/mysql-relations-omissions.json" guards', undefined],
+    [
+      'node --test benchmarks/sqlite-contention/harness.test.mjs benchmarks/sqlite-query-cost/harness.test.mjs',
+      undefined,
+    ],
+    ['node --import tsx --test benchmarks/sqlite-preparation/workload.test.mjs', 'matrix.node-version != 20'],
+    ['node --test benchmarks/evidence/native-gate.test.mjs', 'matrix.node-version == 24'],
+  ] as const) {
+    assertControl(steps, command, condition);
+    const step = steps.find((entry) => entry.some((line) => line.trim() === `run: ${command}`))!;
+    assert.throws(
+      () =>
+        assertControl(
+          steps.filter((entry) => entry !== step),
+          command,
+          condition,
+        ),
+      /after npm ci/,
+    );
+    assert.throws(
+      () =>
+        assertControl(
+          steps.map((entry) => (entry === step ? [...entry, '        continue-on-error: true'] : entry)),
+          command,
+          condition,
+        ),
+      /failure must propagate/,
+    );
+    assert.throws(
+      () =>
+        assertControl(
+          steps.map((entry) => (entry === step ? [...entry, '        if: false'] : entry)),
+          command,
+          condition,
+        ),
+      /runtime guard/,
+    );
+  }
+});
+
+it('keeps SQLite schema apply and recovery suites in native CI and CLI coverage collection', () => {
+  const native = jobsOf(workflow('gates.yml')).get('sqlite-migrations')!.join('\n');
+  const pkg = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8'));
+  for (const suite of [
+    'sqlite-schema.test.ts',
+    'sqlite-schema-command.test.ts',
+    'sqlite-seed.test.ts',
+    'sqlite-seed-cli.test.ts',
+  ]) {
+    assert.ok(native.includes(`src/test/${suite}`), `SQLite native gate must include ${suite}`);
+    assert.ok(pkg.scripts['coverage:cli:collect'].includes(`src/test/${suite}`), `CLI coverage must collect ${suite}`);
+  }
+});
+
+it('requires pinned optional transport consumers and explicit native admission in existing jobs', () => {
+  const jobs = jobsOf(workflow('gates.yml'));
+  for (const jobName of ['pack-smoke', 'integration-tests']) {
+    const job = jobs.get(jobName);
+    assert.ok(job);
+    assert.ok(job.includes('    needs: pack'), `${jobName} must use the shared pack artifact`);
+    const verify = (steps: string[][]) => {
+      const step = steps.find((candidate) =>
+        candidate.some((line) => line.includes('node scripts/check-optional-pg-transports.mjs')),
+      );
+      assert.ok(step, 'optional consumer step required');
+      const command = step.join('\n');
+      assert.match(command, /--sha256 "\$\{\{ needs\.pack\.outputs\.sha256 \}\}"/);
+      assert.doesNotMatch(command, /^\s*(?:if:|continue-on-error:)/m);
+      if (jobName === 'integration-tests') {
+        assert.match(command, /--native/);
+        assert.match(command, /TURBINE_OPTIONAL_PG_SERVICE_URL:/);
+        assert.match(command, /TURBINE_OPTIONAL_PG_DISPOSABLE: '1'/);
+      }
+    };
+    const steps = stepsOf(job);
+    verify(steps);
+    assert.throws(() => verify(steps.filter((step) => !step.join('\n').includes('check-optional-pg-transports'))));
+    assert.throws(() => verify(steps.map((step) => step.filter((line) => !line.includes('--sha256')))));
+  }
+  for (const { jobName, command, required } of [
+    {
+      jobName: 'integration-tests',
+      command: 'node tooling/optional-pg-transports/source-suite-gate.mjs',
+      required: [
+        /TURBINE_REQUIRE_NEON_WS: '1'/,
+        /TURBINE_NEON_WS_PG_DISPOSABLE: '1'/,
+        /TURBINE_NEON_WS_PG_SERVICE_URL:/,
+        /TURBINE_NEON_WS_GATE_REPORT:/,
+      ],
+    },
+    { jobName: 'unit-tests', command: 'node --test tooling/optional-pg-transports/harness.test.mjs', required: [] },
+  ]) {
+    const validate = (steps: string[][]) => {
+      const step = steps.find((candidate) => candidate.some((line) => line.trim() === `run: ${command}`));
+      assert.ok(step, 'required optional transport admission step missing');
+      const source = step.join('\n');
+      assert.doesNotMatch(source, /^\s*(?:if:|continue-on-error:)/m);
+      for (const pattern of required) assert.match(source, pattern);
+    };
+    const steps = stepsOf(jobs.get(jobName)!);
+    const index = steps.findIndex((step) => step.some((line) => line.trim() === `run: ${command}`));
+    validate(steps);
+    assert.throws(() => validate(steps.filter((_, at) => at !== index)));
+    for (const directive of ['if: false', 'continue-on-error: true'])
+      assert.throws(() => validate(steps.map((step, at) => (at === index ? [...step, `        ${directive}`] : step))));
+    for (const pattern of required) {
+      const detached = steps[index]!.filter((line) => pattern.test(line));
+      assert.throws(() =>
+        validate(steps.map((step, at) => (at === index ? step.filter((line) => !pattern.test(line)) : step))),
+      );
+      assert.throws(() =>
+        validate([
+          ...steps.map((step, at) => (at === index ? step.filter((line) => !pattern.test(line)) : step)),
+          ['      - name: unrelated step', '        env:', ...detached],
+        ]),
+      );
+    }
+  }
+  const native = jobs.get('integration-tests')!.join('\n');
+  assert.match(native, /run: node src\/test\/fixtures\/neon-http\/gate-run\.mjs/);
+  assert.match(native, /NEON_HTTP_NATIVE_URL:/);
+  assert.match(native, /NEON_HTTP_EVIDENCE:/);
+});
+
+it('runs real pooler contracts with exact runtimes and the shared pinned artifact', () => {
+  const job = jobsOf(workflow('gates.yml')).get('pgbouncer-integration');
+  assert.ok(job);
+  assert.ok(job.includes('    needs: pack'));
+  const steps = stepsOf(job);
+  const assertPooler = (candidate: string[][]) => {
+    const execution = candidate.find((step) =>
+      step.some((line) => line.includes('node src/test/fixtures/pg-pooler/native-run.mjs')),
+    );
+    assert.ok(execution, 'required pooler command missing');
+    const source = execution.join('\n');
+    assert.match(source, /PG_POOLER_SHA256="\$\{\{ needs\.pack\.outputs\.sha256 \}\}"/);
+    assert.match(source, /PG_POOLER_ARCHIVE=.*needs\.pack\.outputs\.tarball/);
+    assert.match(source, /acquire-postgres\.sh/);
+    assert.match(source, /pg-pooler\/acquire\.sh/);
+    assert.match(source, /PG_POOLER_NODE22=/);
+    assert.match(source, /PG_POOLER_NODE24=.*steps\.pooler-node24\.outputs\.binary/);
+    assert.ok(!execution.some((line) => /^\s*(?:if:|continue-on-error:)/.test(line)));
+    assert.doesNotMatch(source, /npm pack/);
+  };
+  assertPooler(steps);
+  assert.throws(
+    () => assertPooler(steps.filter((step) => !step.some((line) => line.includes('pg-pooler/native-run.mjs')))),
+    /required pooler command missing/,
+  );
+  for (const token of ['PG_POOLER_SHA256=', 'PG_POOLER_NODE24='])
+    assert.throws(() => assertPooler(steps.map((step) => step.filter((line) => !line.includes(token)))));
+  assert.match(job.join('\n'), /node-version: 22\.16\.0/);
+  assert.match(job.join('\n'), /node-version: 24\.10\.0/);
+});
+
+it('requires HTTP interruption checks with provisioned PG, exact runtimes and the shared archive', () => {
+  const job = jobsOf(workflow('gates.yml')).get('pgbouncer-integration');
+  assert.ok(job);
+  const validate = (steps: string[][]) => {
+    const at = steps.findIndex((step) => step.includes('        id: http-interruption'));
+    assert.ok(at >= 0, 'required HTTP interruption step missing');
+    const execution = steps[at]!.join('\n');
+    assert.doesNotMatch(execution, /^\s*(?:if:|continue-on-error:)/m);
+    for (const pattern of [
+      /PG_PREFIX: \$\{\{ runner\.temp \}\}\/pooler-pg\/install/,
+      /NEON_HTTP_ARCHIVE: .*needs\.pack\.outputs\.tarball/,
+      /NEON_HTTP_ARCHIVE_SHA256: \$\{\{ needs\.pack\.outputs\.sha256 \}\}/,
+      /HTTP_NODE24: \$\{\{ steps\.pooler-node24\.outputs\.binary \}\}/,
+      /set -euo pipefail/,
+    ])
+      assert.match(execution, pattern);
+    for (const [evidence, binary] of [
+      ['HTTP22_EVIDENCE', 'node'],
+      ['HTTP24_EVIDENCE', '"$HTTP_NODE24"'],
+    ]) {
+      assert.ok(
+        execution.includes(
+          `NEON_HTTP_INTERRUPTION_EVIDENCE="$${evidence}" ${binary} --test --test-concurrency=1 src/test/fixtures/neon-http/native-interruption.test.mjs src/test/fixtures/neon-http/gate-interruption.test.mjs`,
+        ),
+        `required HTTP interruption command missing for ${evidence}`,
+      );
+    }
+    const provision = steps.findIndex((step) =>
+      step.some((line) => line.includes('acquire-postgres.sh "$RUNNER_TEMP/pooler-pg"')),
+    );
+    assert.ok(provision >= 0 && provision < at, 'exact PG must be provisioned before HTTP checks');
+  };
+  const steps = stepsOf(job);
+  const at = steps.findIndex((step) => step.includes('        id: http-interruption'));
+  validate(steps);
+  assert.throws(() => validate(steps.filter((_, index) => index !== at)));
+  for (const directive of ['if: false', 'continue-on-error: true']) {
+    assert.throws(() =>
+      validate(steps.map((step, index) => (index === at ? [...step, `        ${directive}`] : step))),
+    );
+  }
+  for (const token of [
+    'PG_PREFIX:',
+    'NEON_HTTP_ARCHIVE:',
+    'NEON_HTTP_ARCHIVE_SHA256:',
+    'HTTP_NODE24:',
+    'HTTP22_EVIDENCE" node --test',
+    'HTTP24_EVIDENCE" "$HTTP_NODE24" --test',
+  ]) {
+    const detached = steps[at]!.filter((line) => line.includes(token));
+    assert.ok(detached.length > 0);
+    assert.throws(() =>
+      validate([
+        ...steps.map((step, index) => (index === at ? step.filter((line) => !line.includes(token)) : step)),
+        ['      - name: unrelated step', ...detached],
+      ]),
+    );
+  }
+  assert.throws(() => validate(steps.map((step) => step.filter((line) => !line.includes('acquire-postgres.sh')))));
+});
+
+it('checks packed TypeScript config loading without a loader preload on the Node 22 floor', () => {
+  const job = jobsOf(workflow('gates.yml')).get('pack-smoke');
+  assert.ok(job, 'packed consumer gate must exist');
+  const source = job.join('\n');
+  assert.match(source, /node-version: \['22\.16\.0', '22', '24\.10\.0'\]/);
+  assert.match(source, /node scripts\/check-cli-typescript\.mjs "\$TARBALL"/);
+});
+
+it('runs packed SQL, tuple and libSQL consumers using the tested tarball and installed typecheck tools', () => {
+  const job = jobsOf(workflow('gates.yml')).get('pack-smoke');
+  assert.ok(job);
+  assert.ok(job.includes('    needs: pack'));
+  const steps = stepsOf(job);
+  const install = steps.findIndex((step) => step.includes('      - run: npm ci'));
+  for (const script of [
+    'scripts/check-sql-fragments.mjs',
+    'tooling/cursor-tuple/consumer.mjs',
+    'src/test/fixtures/libsql-package.mjs',
+    'src/test/fixtures/libsql-introspection-package.mjs',
+  ]) {
+    const assertSmoke = (candidate: string[][]) => {
+      const smoke = candidate.findIndex((step) =>
+        step.some((line) => line.trim() === `run: node ${script} "$TARBALL"`),
+      );
+      assert.ok(install >= 0 && smoke > install, 'packed smoke needs repository TypeScript installed first');
+      assert.ok(!candidate[smoke]!.some((line) => /^\s*(?:if:|continue-on-error:)/.test(line)));
+    };
+    assertSmoke(steps);
+    assert.throws(
+      () => assertSmoke(steps.filter((step) => !step.some((line) => line.includes(script)))),
+      /installed first/,
+    );
+  }
+  const catalog = steps
+    .find((step) => step.some((line) => line.includes('libsql-introspection-package.mjs')))!
+    .join('\n');
+  assert.match(
+    catalog,
+    /TURBINE_LIBSQL_INTROSPECTION_PEER: \$\{\{ github\.workspace \}\}\/node_modules\/@libsql\/client/,
+  );
+  assert.match(catalog, /TURBINE_LIBSQL_INTROSPECTION_SHA256: \$\{\{ needs\.pack\.outputs\.sha256 \}\}/);
+  assert.match(catalog, /TURBINE_LIBSQL_INTROSPECTION_REPORT:/);
+});
 
 for (const { file, job } of AGGREGATORS) {
   describe(`${file}: ${job} cannot pass while a job it needs did not succeed`, () => {
@@ -272,4 +799,45 @@ describe('a public repository: no workflow runs on a self-hosted or paid runner'
       'public repositories run on GitHub-hosted standard runners only',
     );
   });
+});
+
+it('requires both built MySQL tool module formats in the existing native service gate', () => {
+  const native = [...jobsOf(workflow('gates.yml')).values()]
+    .map((lines) => lines.join('\n'))
+    .find((job) => job.includes('Run the suite against MySQL 8'));
+  assert.ok(native, 'native MySQL job must exist');
+  const check = (source: string) => {
+    assert.match(source, /npm run build/);
+    for (const format of ['esm', 'cjs'])
+      assert.ok(
+        source.includes(`MYSQL_TOOLS_FORMAT=${format} node --test tooling/mysql-tools/integration.mjs`),
+        `missing ${format} native tools`,
+      );
+    assert.match(source, /TURBINE_REQUIRE_ENGINE: mysql/);
+  };
+  check(native);
+  assert.throws(() => check(native.replace('MYSQL_TOOLS_FORMAT=cjs', 'OMITTED=cjs')), /missing cjs/);
+});
+
+it('requires core and D1 contracts against the pack job archive on exact local runtimes', () => {
+  const jobs = jobsOf(workflow('gates.yml'));
+  assert.ok(jobs.get('build')?.some((line) => line.trim() === 'run: npm run test:core'));
+  const smoke = jobs.get('pack-smoke');
+  assert.ok(smoke);
+  assert.match(smoke.join('\n'), /node-version: \['22\.16\.0', '22', '24\.10\.0'\]/);
+  const steps = stepsOf(smoke);
+  for (const script of ['test:core:packed', 'test:d1']) {
+    const validate = (candidate: string[][]) => {
+      const step = candidate.find((lines) => lines.some((line) => line.trim() === `run: npm run ${script}`));
+      assert.ok(step, `required ${script} step`);
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: literal GitHub Actions expression.
+      assert.ok(step.some((line) => line.trim() === 'TURBINE_CORE_D1_TARBALL: ${{ env.TARBALL }}'));
+      assert.ok(!step.some((line) => /^\s*(?:if:|continue-on-error:)/.test(line)));
+    };
+    validate(steps);
+    assert.throws(() => validate(steps.filter((step) => !step.some((line) => line.includes(script)))));
+    assert.throws(() =>
+      validate(steps.map((step) => step.filter((line) => !line.includes('TURBINE_CORE_D1_TARBALL')))),
+    );
+  }
 });

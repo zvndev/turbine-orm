@@ -8,7 +8,7 @@
  * `prisma-map.ts` that the `turbine-orm/prisma-compat` adapter is driven by.
  * Nothing re-runs it. Add a model, rename a field, change a `@@unique` name, and
  * the map keeps describing the schema as it was: the adapter goes on translating
- * the names it knows and simply has no entry for the new ones. That surfaces as
+ * the names it knows and has no entry for the new ones. That surfaces as
  * "this model is not on the compat client" or a field silently absent from a
  * result, which reads like an adapter bug rather than a stale artifact, and
  * which is exactly the failure mode a code generator ought to be able to

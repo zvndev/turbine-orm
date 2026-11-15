@@ -1,0 +1,22 @@
+import type { LiveQuery } from 'turbine-orm/live-query';
+import { createOrderApplication, type OrderCommand, type OrderEvent } from './examples/postgres-durable-replay/application.js';
+function types(app: ReturnType<typeof createOrderApplication>, command: OrderCommand) {
+  const event: Promise<OrderEvent> = app.append('tenant', command);
+  const progress: LiveQuery<number> = app.watchProgress('tenant', 'consumer', (value, signal) => {
+    const exact: string = value.quantity;
+    const timestamp: string = value.occurredAt;
+    const bytes: Buffer = value.body;
+    const nullable: string | null = value.title;
+    // @ts-expect-error bigint must retain exact decimal string precision
+    const rounded: number = value.quantity;
+    // @ts-expect-error temporal microseconds are not a JS Date
+    const date: Date = value.occurredAt;
+    void exact; void timestamp; void bytes; void nullable; void rounded; void date; void signal;
+  });
+  // @ts-expect-error amount input cannot be a rounded number
+  app.append('tenant', { ...command, amount: 1.234 });
+  // @ts-expect-error delivery receives an OrderEvent, not a text payload
+  app.consumeBatch('tenant', 'consumer', (payload: string) => {});
+  void event; void progress;
+}
+void types;

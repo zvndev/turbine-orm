@@ -16,7 +16,7 @@
  * runtime warning in query/builder.ts.
  */
 
-import { quoteIdent } from './query/utils.js';
+import { quoteIdent } from './query-utils.js';
 import { normalizeKeyColumns, type SchemaMetadata, type TableMetadata } from './schema.js';
 
 export interface RelationProbe {

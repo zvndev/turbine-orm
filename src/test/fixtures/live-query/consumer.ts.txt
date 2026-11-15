@@ -1,0 +1,55 @@
+import { liveQuery, type LiveQuery, type LiveQueryOptions, type LiveQuerySubscriptionCallbacks } from 'turbine-orm/live-query';
+import type { TurbineClient } from 'turbine-orm';
+
+function equal<T>(_value: T): void {}
+const subscribe: LiveQueryOptions<unknown>['subscribe'] = (_invalidate, _callbacks) => ({ unsubscribe() {} });
+const primitive = liveQuery({ subscribe, query: () => ({ id: 7, name: 'typed' }) });
+equal<LiveQuery<{ id: number; name: string }>>(primitive);
+const tuple = liveQuery({ subscribe, query: async () => [1, 'x'] as const });
+equal<LiveQuery<readonly [1, 'x']>>(tuple);
+const nullable = liveQuery({ subscribe, query: (): Promise<{ id: bigint } | null> => Promise.resolve(null) });
+equal<LiveQuery<{ id: bigint } | null>>(nullable);
+// @ts-expect-error query result must not become any or lose its field type
+equal<LiveQuery<{ id: string }>>(primitive);
+
+function ordinaryTypedQuery(db: TurbineClient) {
+  const query = () => db.table<{ id: number; name: string; secret: string }>('users').findMany({
+    select: { id: true, name: true }, orderBy: { id: 'asc' },
+  });
+  const live = liveQuery({ query, subscribe: (invalidate, { onReconnect }) => db.$listen('users_changed', invalidate, { onReconnect }) });
+  equal<LiveQuery<Awaited<ReturnType<typeof query>>>>(live);
+  live.next().then((result) => {
+    if (!result.done) {
+      equal<number>(result.value[0]!.id);
+      equal<string>(result.value[0]!.name);
+      // @ts-expect-error projection must omit secret
+      result.value[0]!.secret;
+      // @ts-expect-error selected field must not become any
+      equal<string>(result.value[0]!.id);
+    }
+  });
+  return live;
+}
+void ordinaryTypedQuery;
+void (null as unknown as LiveQuerySubscriptionCallbacks);
+
+async function run() {
+  let invalidate!: () => void;
+  let unsubscribe = 0;
+  let value = 1;
+  const live = liveQuery({
+    query: () => ({ value }),
+    subscribe: (handler) => { invalidate = handler; return { unsubscribe() { unsubscribe++; } }; },
+  });
+  const first = await live.next();
+  if (first.done || first.value.value !== 1) throw new Error('first snapshot mismatch');
+  value = 9;
+  invalidate();
+  const next = await live.next();
+  if (next.done || next.value.value !== 9) throw new Error('refetch mismatch');
+  await live.dispose();
+  if (unsubscribe !== 1) throw new Error('listener cleanup mismatch');
+  await Promise.all([primitive.dispose(), tuple.dispose(), nullable.dispose()]);
+  console.log('strict consumer: exact types, rows and cleanup passed');
+}
+run().catch((error) => { console.error(error); process.exitCode = 1; });

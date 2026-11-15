@@ -191,7 +191,7 @@ describe('pg-compat: SQL compatibility across PG-compatible databases', () => {
     // one it is handed and `jsonEncoding` decides that per client or per query.
     // `json_build_array` and `json_build_object` are both core PostgreSQL 9.4+
     // builtins, so neither is an extension of the compatible surface; positional
-    // is simply the DEFAULT on this dialect, which is why the default arm below
+    // is the DEFAULT on this dialect, which is why the default arm below
     // reads `json_build_array`.
     for (const [jsonEncoding, encoder] of [
       ['object', 'json_build_object'],

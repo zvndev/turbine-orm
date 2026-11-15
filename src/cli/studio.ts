@@ -49,19 +49,14 @@ import { ValidationError } from '../errors.js';
 import { introspect, printableCatalogName } from '../introspect.js';
 import type { CreateArgs, DeleteArgs, FindManyArgs, UpdateArgs } from '../query/index.js';
 import { QueryInterface, quoteIdent, UNSAFE } from '../query/index.js';
+import { registerUtcTemporalParsers } from '../query/pg-type-parsers.js';
 // `ownLookup` and `resolveRelation` are not re-exported from the query barrel,
 // so they are imported from their defining leaf module rather than duplicated
 // here. `resolveRelation` in particular MUST be the compiler's own copy: it is
 // what decides that `blog_posts` and `blogPosts` name the same relation, and a
 // redaction walk that answered that differently would redact a different query
 // than the one that ran.
-import {
-  escapeLike,
-  ownLookup,
-  registerUtcTemporalParsers,
-  resolveColumnName as resolveBuilderColumn,
-  resolveRelation,
-} from '../query/utils.js';
+import { escapeLike, ownLookup, resolveColumnName as resolveBuilderColumn, resolveRelation } from '../query/utils.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import {
   constantTimeEqual,
@@ -292,8 +287,8 @@ export async function startStudio(options: StudioOptions): Promise<StudioHandle>
       const source = loadPiiTags(options.metadataDir);
       if (source && !source.scan.ok) {
         // FAIL CLOSED. The file exists and is meant to carry the tags, but the
-        // scanner could not prove anything about it (`ok: false` is "we do not
-        // know", never "no tagged columns"). Redacting nothing here and then
+        // scanner could not prove anything about it (`ok: false` is "unknown",
+        // never "no tagged columns"). Redacting nothing here and then
         // reporting a clean tag count is the exact silent-failure shape this
         // module was rewritten to end, and Studio is also the tool with a
         // `--write` mode. So every column of every table is marked PII, which
@@ -674,7 +669,7 @@ async function apiSchema(res: ServerResponse, ctx: StudioContext): Promise<void>
       counts.set(t.name, Number(r.rows[0]?.count ?? 0));
     }
   } else {
-    // Use pg_class reltuples as a fast estimate so we don't hammer big tables
+    // Use pg_class reltuples as a fast estimate to avoid scanning big tables
     // with SELECT COUNT(*).
     const countsResult = await ctx.pool.query<{ relname: string; reltuples: string }>(
       `SELECT c.relname, c.reltuples::bigint::text AS reltuples
@@ -762,7 +757,7 @@ function isRedactedColumn(table: TableMetadata, columnName: string, showPii: boo
 /**
  * Resolve a relation key to a single column name on `table`, or `null`. Composite
  * (array) keys return null: a composite reference has no single cell to click, so
- * those relations simply produce no link rather than a half-working one.
+ * those relations produce no link rather than a half-working one.
  */
 function singleRelationColumn(table: TableMetadata, key: string | string[]): string | null {
   if (typeof key !== 'string') return null;
@@ -965,7 +960,7 @@ export async function apiTableRows(
   const client = await ctx.pool.connect();
   try {
     // Demo: the in-memory SQLite handle is a single synchronous connection with
-    // no READ ONLY txn mode or statement_timeout GUC, so we skip the read
+    // no READ ONLY txn mode or statement_timeout GUC, so skip the read
     // transaction wrapper entirely. Postgres keeps its belt-and-suspenders
     // READ ONLY transaction + timeout.
     if (!ctx.demo) {
@@ -1941,10 +1936,9 @@ function clampInt(value: string | null, fallback: number, min: number, max: numb
 
 /**
  * Column descriptors for a result payload. Postgres results carry a `fields`
- * array (name + OID); the SQLite demo driver does not, so we fall back to the
+ * array (name + OID); the SQLite demo driver does not, so use the
  * keys of the first returned row (dataTypeID 0 = "unknown", which the UI treats
- * generically). When `fields` is present this is byte-identical to the previous
- * inline `result.fields.map(...)`.
+ * generically).
  */
 function resultColumns(
   result: { fields?: Array<{ name: string; dataTypeID: number }> },

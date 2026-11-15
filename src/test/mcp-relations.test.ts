@@ -260,6 +260,32 @@ describe('turbine mcp, relation naming matches turbine generate', () => {
     });
   });
 
+  it('honors legacyToManyUniques exactly as turbine generate does', () => {
+    const legacy = silenced(() => buildRelations(TABLES, COLUMNS, PKS, FK_ROWS, UNIQUES, INDEXES, {}, true));
+    const users = legacy.get('users')!;
+    assert.equal(users.profile, undefined);
+    assert.equal(users.profiles!.type, 'hasMany');
+    const generated = silenced(() =>
+      deriveCatalogRelations({
+        tableNames: TABLES,
+        foreignKeys: FK_ROWS.map((r) => ({
+          sourceTable: r.source_table,
+          sourceColumns: [r.source_column],
+          targetTable: r.target_table,
+          targetColumns: [r.target_column],
+          constraintName: r.constraint_name,
+        })),
+        pkByTable: PKS,
+        columnsByTable: COLUMNS,
+        uniqueByTable: UNIQUES,
+        indexesByTable: INDEXES,
+        enums: {},
+        legacyToManyUniques: true,
+      }),
+    );
+    for (const table of generated.keys()) assert.deepStrictEqual(legacy.get(table), generated.get(table), table);
+  });
+
   it('keeps the legacy reverse names for the plain two-FK shape', () => {
     const users = mcpRelations().get('users')!;
     assert.deepStrictEqual(

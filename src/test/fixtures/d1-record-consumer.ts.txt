@@ -1,0 +1,60 @@
+import type { D1Database } from '@cloudflare/workers-types';
+import type { CreateManyArgs, CreateManyResult, DeferredQuery, FieldResult } from 'turbine-orm';
+import { turbine, type TurbineClient, type Record as PublicRecord } from './generated/index.js';
+
+function check(value: unknown, message: string): asserts value { if (!value) throw new Error(message); }
+function same(actual: unknown, expected: unknown) { check(JSON.stringify(actual) === JSON.stringify(expected), JSON.stringify({actual, expected})); }
+type Flags = { [key in string]: boolean };
+function generic<S extends Flags | undefined = undefined, O extends Flags | undefined = undefined, C extends boolean | undefined = undefined>(
+  db: TurbineClient, args: Omit<CreateManyArgs<PublicRecord, PublicRecord, S, O, C>, 'onConflict'>,
+): Promise<CreateManyResult<FieldResult<PublicRecord, S, O>, C>> { return db.records.createMany(args); }
+void generic;
+function genericBuild<S extends Flags | undefined = undefined, O extends Flags | undefined = undefined, C extends boolean | undefined = undefined>(
+  db: TurbineClient, args: Omit<CreateManyArgs<PublicRecord, PublicRecord, S, O, C>, 'onConflict'>,
+): DeferredQuery<CreateManyResult<FieldResult<PublicRecord, S, O>, C>> { return db.records.buildCreateMany(args); }
+void genericBuild;
+
+export async function run(binding: D1Database) {
+  const db = turbine(binding, {warnOnUnlimited: false, globalFilters: {records: {tenantId: 7}}});
+  const date = new Date('2026-01-02T03:04:05.000Z');
+  const input = {id: 1, title: "bound ' title; 雪", tenantId: 7, active: true, createdAt: date, payload: new Uint8Array([0,128,255])};
+  const rows = await db.records.createMany({data: [input], select: {title: true}});
+  const title: string = rows[0]!.title;
+  same(rows, [{title: input.title}]); check(title === input.title, 'select');
+  const omitted = await db.records.createMany({data: [{...input,id: 2,title: 'two'}], omit: {payload: true}});
+  const omittedTitle: string = omitted[0]!.title; check(omittedTitle === 'two', 'omit');
+  const counted = await db.records.createMany({data: [{...input,id: 3,title: 'three'}], returning: false});
+  const count: number = counted.count; same(count, 1);
+  const [built, builtOmit, builtCount] = await db.$batch([
+    db.records.buildCreateMany({data: [{...input,id: 4,title: 'four'}], select: {id: true}}),
+    db.records.buildCreateMany({data: [{...input,id: 5,title: 'five'}], omit: {title: true}}),
+    db.records.buildCreateMany({data: [{...input,id: 6,title: 'six'}], returning: false}),
+  ]);
+  const builtId: number = built[0]!.id, builtTenant: number = builtOmit[0]!.tenantId, builtN: number = builtCount.count;
+  same([builtId,builtTenant,builtN], [4,7,1]);
+  const full: PublicRecord = (await db.records.findUnique({where:{id:1}}))!;
+  same({...full, payload: Array.from(full.payload!), createdAt: full.createdAt.toISOString()}, {...input,payload:[0,128,255],createdAt:date.toISOString()});
+  check(full.payload instanceof Uint8Array && full.createdAt instanceof Date && full.active === true, 'native classes');
+  const table = await db.table('records').findMany({where:{id:1}});
+  const unknown: unknown = table[0]!.title; check(unknown === title, 'table default dictionary');
+  await db.recordNotes.create({data:{id:1,recordId:1,body:'note'}});
+  const related = await db.recordNotes.findMany({with:{records:true}});
+  check(related[0]!.records?.title === input.title, 'native relation');
+  await db.records.create({data:{...input,id:99,title:'hidden',tenantId:8}});
+  check(await db.records.count() === 6, 'global filter');
+  await db.records.update({where:{id:2},data:{title:'updated'}});
+  check((await db.records.findUnique({where:{id:2}}))?.title === 'updated', 'write/read');
+  await db.records.delete({where:{id:6}}); check(await db.records.count() === 5, 'delete');
+  try {
+    await db.$batchRaw([{sql:'INSERT INTO records(id,title,tenant_id,active,created_at) VALUES(?1,?2,?3,?4,?5)',params:[100,'rollback',7,true,date]}, {sql:'INSERT INTO records(id,title,tenant_id,active,created_at) VALUES(?1,?2,?3,?4,?5)',params:[1,'duplicate',7,true,date]}]);
+    throw new Error('rollback not refused');
+  } catch(error) { check(/UNIQUE|constraint/.test(String(error)), String(error)); }
+  check(await binding.prepare('SELECT count(*) AS n FROM records WHERE id=100').first('n') === 0, 'native batch rollback');
+  const caller = await binding.prepare('SELECT id,title,tenant_id,active,created_at,payload FROM records WHERE id=?1').bind(1).first();
+  check(caller?.id === 1 && caller.title === input.title && caller.tenant_id === 7 && caller.active === 1, 'actual stored scalars');
+  same(new Date(String(caller.created_at)).toISOString(), date.toISOString());
+  same(Array.isArray(caller.payload) ? caller.payload : Array.from(new Uint8Array(caller.payload as ArrayBuffer)), [0,128,255]);
+  await db.disconnect(); check(await binding.prepare('SELECT 1 AS n').first('n') === 1, 'caller binding ownership');
+  return {ok:true, groups:15};
+}
+export default { async fetch(_request: Request, env: {DB:D1Database}) { try { return Response.json(await run(env.DB)); } catch(error) { return new Response(String(error instanceof Error ? error.stack : error), {status:500}); } } };

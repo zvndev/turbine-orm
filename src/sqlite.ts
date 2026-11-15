@@ -87,6 +87,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createRequire } from 'node:module';
 import type { DatabaseSync } from 'node:sqlite';
+import { sqliteToOneForeignKey } from './catalog-metadata.js';
 import {
   type DisconnectOptions,
   type DisconnectResult,
@@ -95,38 +96,24 @@ import {
   TurbineClient,
 } from './client.js';
 import {
-  type BuiltStatement,
-  type BulkInsertStatementInput,
-  type BulkUpsertStatementInput,
-  type ColumnDefinitionInput,
-  type ColumnTypeInput,
-  type CreateIndexStatementInput,
-  type CreateTableStatementInput,
-  type DefaultValuesInsertStatementInput,
-  type Dialect,
-  type DialectIntrospector,
-  type EngineCapabilities,
-  type InsertStatementInput,
-  type IntrospectOptions,
-  type JsonWireRule,
-  type LimitOffsetInput,
-  onConflictAction,
-  postgresDialect,
-  type ReturningSelection,
-  type StreamableConnection,
-  type UpsertStatementInput,
-} from './dialect.js';
+  createPortableSqliteDialect,
+  parseJsonCell,
+  sqliteTypeToTs,
+  sqliteValueDecode,
+  toSqliteParam,
+} from './d1/sqlite-dialect.js';
+import type { Dialect, DialectIntrospector, IntrospectOptions } from './dialect.js';
 import type { EngineClientConfig } from './engine-config.js';
 import { ConnectionError, SerializationFailureError, UnsupportedFeatureError, ValidationError } from './errors.js';
 import {
   applyTableFilters,
   assertDistinctColumnFields,
+  type IntrospectOptions as CatalogIntrospectOptions,
   deriveEngineRelations,
   nullRecord,
   printableCatalogName,
 } from './introspect.js';
 import { withoutTrailingComment } from './query/sql-comment.js';
-import { LRUCache } from './query/utils.js';
 import {
   type ColumnMetadata,
   type IndexMetadata,
@@ -137,6 +124,8 @@ import {
   type TableMetadata,
 } from './schema.js';
 import { rewritePositionalPlaceholders } from './sql-placeholders.js';
+
+export { sqliteTypeToTs } from './d1/sqlite-dialect.js';
 
 // ---------------------------------------------------------------------------
 // Driver constructor, lazily loaded
@@ -190,71 +179,6 @@ function loadDatabaseSync(): DatabaseSyncCtor {
 type SqliteParam = null | number | bigint | string | Uint8Array;
 
 /**
- * Coerce an arbitrary JS value into something `node:sqlite` can bind.
- *
- * `node:sqlite` throws on `boolean`, `undefined`, `Date`, and plain objects, so
- * we normalize: booleans → 1/0, a safe integer → INTEGER (see below),
- * `undefined`/`null` → NULL, `Date` → ISO text,
- * `Uint8Array`/`Buffer` → BLOB, and any remaining object/array → JSON text
- * (matches how Turbine already pre-serializes JSON filter params).
- */
-function toSqliteParam(value: unknown): SqliteParam {
-  if (value === undefined || value === null) return null;
-  switch (typeof value) {
-    case 'boolean':
-      return value ? 1 : 0;
-    case 'number':
-      // `node:sqlite` binds every JS number as REAL, so `views / 2` divided as
-      // floats (75 / 2 = 37.5, stored in an INTEGER column) and an integral
-      // number written to a TEXT column was stored as '3.0'. Binding a safe
-      // integer as an INTEGER gives the arithmetic and text PostgreSQL gives.
-      // -0 stays REAL: as an integer it would lose its sign.
-      return Number.isSafeInteger(value) && !Object.is(value, -0) ? BigInt(value) : value;
-    case 'bigint':
-    case 'string':
-      return value;
-  }
-  if (value instanceof Date) return value.toISOString();
-  if (value instanceof Uint8Array) return value; // also covers Buffer
-  return JSON.stringify(value);
-}
-
-/**
- * The JSON text an `in` / `notIn` list binds as, element by element in the
- * form {@link toSqliteParam} would bind it, so a list element compares exactly
- * as the same value given to `equals` does. A bigint is written as a JSON
- * integer (exact to 64 bits; `JSON.stringify` refuses one), an infinity as the
- * overflowing literal SQLite's JSON parser reads as one, and a binary value as
- * `{"b": "<hex>"}`, which {@link sqliteDialect.buildInClause} turns back into a
- * BLOB. Any other object binds as its JSON text, as it would on its own.
- */
-function sqliteInListJson(values: readonly unknown[]): string {
-  const parts = values.map((value): string => {
-    if (value === undefined || value === null) return 'null';
-    switch (typeof value) {
-      case 'boolean':
-        return value ? '1' : '0';
-      case 'number':
-        if (Number.isFinite(value)) return JSON.stringify(value);
-        if (Number.isNaN(value)) return 'null';
-        return value > 0 ? '9e999' : '-9e999';
-      case 'bigint':
-        return value.toString();
-      case 'string':
-        return JSON.stringify(value);
-    }
-    if (value instanceof Uint8Array) {
-      let hex = '';
-      for (const byte of value) hex += byte.toString(16).padStart(2, '0');
-      return `{"b":"${hex}"}`;
-    }
-    const bound = toSqliteParam(value);
-    return JSON.stringify(bound);
-  });
-  return `[${parts.join(',')}]`;
-}
-
-/**
  * Normalize a single column value read from SQLite. With `setReadBigInts(true)`
  * every integer column comes back as a `bigint`; apply the same safe-integer
  * policy Turbine uses for Postgres `int8`, number when it fits in a JS safe
@@ -266,6 +190,9 @@ function normalizeValue(value: null | number | bigint | string | Uint8Array): un
     const asNumber = Number(value);
     return Number.isSafeInteger(asNumber) ? asNumber : value.toString();
   }
+  // Compatible native bindings can return Buffer for BLOBs. Keep the builtin's
+  // Uint8Array contract without exposing a driver-specific prototype.
+  if (value instanceof Uint8Array && Buffer.isBuffer(value)) return Uint8Array.from(value);
   return value;
 }
 
@@ -278,23 +205,34 @@ type ColumnDecode = 'boolean' | 'json';
  * read paths use: the driver shim for direct reads and {@link sqliteDialect}'s
  * `jsonWireRule` for `with` rows, so the two cannot disagree about a column.
  */
-function sqliteValueDecode(type: string): ColumnDecode | undefined {
-  const t = type.toUpperCase();
-  if (t.includes('BOOL')) return 'boolean';
-  if (t === 'JSON' || t === 'JSONB') return 'json';
-  return undefined;
-}
-
 /**
  * `table NUL column -> decode` for every schema column whose stored form is not
  * its declared JS type: a boolean (stored 1/0) or a json/jsonb column (stored as
  * JSON text). `null` when the schema has none.
  */
-type DeclaredDecoders = ReadonlyMap<string, ColumnDecode> | null;
+type DeclaredDecoders = {
+  byOrigin: ReadonlyMap<string, ColumnDecode>;
+  knownTablesForJsonViews: ReadonlySet<string> | null;
+} | null;
+
+type ResultColumnDescription = {
+  name?: unknown;
+  type?: unknown;
+  table?: unknown;
+  column?: unknown;
+  database?: unknown;
+};
+
+/** Only the most recent result shape; every execution must validate it again. */
+interface DecoderMemo {
+  columns?: ResultColumnDescription[];
+  decoders: Map<string, ColumnDecode> | null;
+}
 
 function declaredDecoders(schema: SchemaMetadata | undefined): DeclaredDecoders {
   if (!schema) return null;
   let out: Map<string, ColumnDecode> | null = null;
+  let hasJsonView = false;
   for (const [table, meta] of Object.entries(schema.tables)) {
     for (const column of meta.columns) {
       const type = column.pgType ?? meta.pgTypes?.[column.name];
@@ -302,9 +240,12 @@ function declaredDecoders(schema: SchemaMetadata | undefined): DeclaredDecoders 
       if (decode === undefined) continue;
       if (out === null) out = new Map();
       out.set(`${table}\u0000${column.name}`, decode);
+      if (decode === 'json' && meta.isView === true) hasJsonView = true;
     }
   }
-  return out;
+  return out === null
+    ? null
+    : { byOrigin: out, knownTablesForJsonViews: hasJsonView ? new Set(Object.keys(schema.tables)) : null };
 }
 
 /**
@@ -316,54 +257,6 @@ function declaredDecoders(schema: SchemaMetadata | undefined): DeclaredDecoders 
  * place, which made a long non-numeric cell take seconds to reject (quadratic:
  * 40,000 digits and an `x` took 0.8 s, a million take 1.5 ms now).
  */
-const SQLITE_NUMBER_TEXT = /^-?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i;
-
-/**
- * The text SQLite's INTEGER, REAL and NUMERIC affinities convert to a number,
- * measured against SQLite 3.51: an optional sign, a decimal integer or float,
- * an optional exponent, and ASCII whitespace around it. Anything else
- * (`'abc'`, `''`, `'Infinity'`, `'0x10'`, `'1_000'`) is stored as TEXT in the
- * numeric column. Linear for the same reason as {@link SQLITE_NUMBER_TEXT}.
- */
-const SQLITE_NUMERIC_LITERAL = /^[ \t\n\v\f\r]*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?[ \t\n\v\f\r]*$/i;
-
-/**
- * Declared column types whose SQLite affinity is numeric (INTEGER, REAL or
- * NUMERIC), boolean included (stored 1/0). Matched whole, not by SQLite's own
- * "contains INT" rule: the type a schema records for a column can be an enum's
- * name (`point_kind`), which that rule reads as INTEGER while the column is
- * TEXT. A type this misses is written as SQLite always wrote it, so a miss
- * costs a refusal, never a wrong one.
- */
-const SQLITE_NUMERIC_COLUMN_TYPE =
-  /^(?:(?:tiny|small|medium|big)?int(?:eger)?|int[248]|(?:small|big)?serial|unsigned big int|real|float[48]?|double(?: precision)?|numeric|decimal|money|bool(?:ean)?)(?:\(\s*\d+\s*(?:,\s*\d+\s*)?\))?$/i;
-
-/**
- * Decode a REAL / NUMERIC cell carried as text through a `with` join back to
- * the value a direct read returns: an integer by the safe-integer policy, a
- * double as the number its 17 digits name, `Inf` / `-Inf` as infinities.
- */
-function decodeRealText(value: unknown): unknown {
-  if (typeof value !== 'string') return value;
-  if (/^-?\d+$/.test(value)) {
-    const asNumber = Number(value);
-    return Number.isSafeInteger(asNumber) ? asNumber : value;
-  }
-  if (value === 'Inf') return Number.POSITIVE_INFINITY;
-  if (value === '-Inf') return Number.NEGATIVE_INFINITY;
-  return SQLITE_NUMBER_TEXT.test(value) ? Number(value) : value;
-}
-
-/** Read a JSON column's stored text as its value; text that is not JSON is returned as stored. */
-function parseJsonCell(value: unknown): unknown {
-  if (typeof value !== 'string') return value;
-  try {
-    return JSON.parse(value);
-  } catch {
-    return value;
-  }
-}
-
 /**
  * Convert a `node:sqlite` null-prototype row into a normalized plain object.
  *
@@ -380,6 +273,7 @@ function normalizeRow(
   for (const key of Object.keys(row)) {
     const value = normalizeValue(row[key] as null | number | bigint | string | Uint8Array);
     const decode = decoders?.get(key);
+    if (key === '__proto__') Object.defineProperty(out, key, { writable: true, enumerable: true, configurable: true });
     out[key] =
       decode === undefined
         ? value
@@ -390,6 +284,88 @@ function normalizeRow(
             : value;
   }
   return out;
+}
+
+/**
+ * Pin a native iterator's projection after its first step (which can reprepare
+ * after DDL). Resolve keys/decoders once, rather than enumerate and Map.get for
+ * every cell. Array-capable drivers also avoid allocating a keyed native row.
+ * The first row stays in object mode so missing/failed descriptions can always
+ * fall back to the driver's actual keys without guessing a projection.
+ */
+function streamRowNormalizer(
+  stmt: ReturnType<DatabaseSync['prepare']>,
+  first: Record<string, unknown>,
+  decoders: ReadonlyMap<string, ColumnDecode> | null,
+  switchArrays = true,
+): (row: Record<string, unknown>) => Record<string, unknown> {
+  let keys = Object.keys(first);
+  let arrays = false;
+  if (switchArrays && typeof stmt.setReturnArrays === 'function' && typeof stmt.columns === 'function') {
+    let described: ResultColumnDescription[] | undefined;
+    try {
+      described = stmt.columns();
+    } catch {
+      // Compatible drivers can omit descriptions. Object rows remain sound.
+    }
+    // Duplicate output names collapse in object mode. Keep that path rather
+    // than infer which positional cell the compatible driver retained.
+    if (
+      described?.length === keys.length &&
+      described.every((c) => typeof c.name === 'string' && Object.hasOwn(first, c.name)) &&
+      new Set(described.map((c) => c.name)).size === keys.length
+    ) {
+      keys = described.map((c) => c.name as string);
+      stmt.setReturnArrays(true);
+      arrays = true;
+    }
+  }
+  return resultRowNormalizer(keys, decoders, arrays ? keys.map((_, i) => i) : undefined);
+}
+
+/** A projection pinned to one fully stepped result or one active iterator. */
+function resultRowNormalizer(
+  keys: string[],
+  decoders: ReadonlyMap<string, ColumnDecode> | null,
+  indices?: number[],
+): (raw: Record<string, unknown>) => Record<string, unknown> {
+  const decode = keys.map((key) => decoders?.get(key));
+  return (r) => {
+    const row: Record<string, unknown> = {};
+    for (let i = 0; i < keys.length; i++) {
+      const key = keys[i]!;
+      const value = normalizeValue((indices ? (r as unknown as SqliteParam[])[indices[i]!] : r[key]) as SqliteParam);
+      const columnDecode = decode[i];
+      if (key === '__proto__')
+        Object.defineProperty(row, key, { writable: true, enumerable: true, configurable: true });
+      row[key] =
+        columnDecode === undefined
+          ? value
+          : columnDecode === 'json'
+            ? parseJsonCell(value)
+            : value === 1 || value === 0
+              ? value === 1
+              : value;
+    }
+    return row;
+  };
+}
+
+/** Native all() rows share a projection; this plan lives only for this result. */
+function normalizeResultRows(
+  raw: ReturnType<ReturnType<DatabaseSync['prepare']>['all']>,
+  decoders: ReadonlyMap<string, ColumnDecode> | null,
+  columns?: ResultColumnDescription[],
+  projectionOrder?: boolean,
+): Record<string, unknown>[] {
+  // Repeated names retain the last cell in the first name's insertion order.
+  const positions = columns ? new Map(columns.map((c, i) => [c.name as string, i])) : undefined;
+  // Builtin arrays retain projection order; compatible object producers visit
+  // integer keys first. Preserve each producer's raw assignment/setter order.
+  const keys = projectionOrder
+    ? [...positions!.keys()]
+    : Object.keys(positions ? Object.fromEntries(positions) : raw[0]!);
+  return raw.map(resultRowNormalizer(keys, decoders, positions ? keys.map((key) => positions.get(key)!) : undefined));
 }
 
 /**
@@ -411,6 +387,9 @@ function normalizeRow(
  *  - The client's schema: an origin column declared boolean or json/jsonb there.
  *    Turbine's own DDL stores those as INTEGER and TEXT, so the declared type
  *    alone missed every table Turbine created.
+ *  - A selected JSON view can expose native main-database JSON origins whose
+ *    base tables were filtered out. Known schema origins keep their declared
+ *    meaning; no-schema/table-only pools and expressions retain their behavior.
  *
  * Node gained `columns()` in 22.16 / 23.11 while this engine's floor is 22.5, so
  * it is feature-detected: on the narrow band without it, these columns keep
@@ -419,32 +398,260 @@ function normalizeRow(
 function resultColumnDecoders(
   stmt: ReturnType<DatabaseSync['prepare']>,
   declared: DeclaredDecoders,
+  memo: DecoderMemo,
+  columns?: ResultColumnDescription[],
 ): Map<string, ColumnDecode> | null {
-  const columnsFn = (
-    stmt as { columns?: () => { name?: unknown; type?: unknown; table?: unknown; column?: unknown }[] }
-  ).columns;
-  if (typeof columnsFn !== 'function') return null;
-  let described: { name?: unknown; type?: unknown; table?: unknown; column?: unknown }[];
-  try {
-    described = columnsFn.call(stmt);
-  } catch {
-    // A statement the driver cannot describe (some PRAGMA forms) is not worth
-    // failing a query over; skip the decoding for it.
-    return null;
+  let described = columns;
+  if (described === undefined) {
+    const columnsFn = (stmt as { columns?: () => ResultColumnDescription[] }).columns;
+    if (typeof columnsFn !== 'function') return null;
+    try {
+      described = columnsFn.call(stmt);
+    } catch {
+      // A statement the driver cannot describe (some PRAGMA forms) is not worth
+      // failing a query over; skip the decoding for it.
+      return null;
+    }
+  }
+  const previous = memo.columns;
+  if (previous?.length === described.length) {
+    let same = true;
+    for (let i = 0; i < described.length; i++) {
+      const a = previous[i]!;
+      const b = described[i]!;
+      if (
+        a.name !== b.name ||
+        a.type !== b.type ||
+        a.table !== b.table ||
+        a.column !== b.column ||
+        a.database !== b.database
+      ) {
+        same = false;
+        break;
+      }
+    }
+    if (same) return memo.decoders;
   }
   let out: Map<string, ColumnDecode> | null = null;
   for (const c of described) {
     if (typeof c.name !== 'string') continue;
     let decode: ColumnDecode | undefined;
-    if (typeof c.type === 'string' && sqliteValueDecode(c.type) === 'boolean') decode = 'boolean';
+    const nativeDecode = typeof c.type === 'string' ? sqliteValueDecode(c.type) : undefined;
+    if (nativeDecode === 'boolean') decode = 'boolean';
     else if (declared !== null && typeof c.table === 'string' && typeof c.column === 'string') {
-      decode = declared.get(`${c.table}\u0000${c.column}`);
+      decode = declared.byOrigin.get(`${c.table}\u0000${c.column}`);
+      if (
+        decode === undefined &&
+        nativeDecode === 'json' &&
+        declared.knownTablesForJsonViews !== null &&
+        c.database === 'main' &&
+        !declared.knownTablesForJsonViews.has(c.table)
+      )
+        decode = 'json';
     }
-    if (decode === undefined) continue;
+    // Object rows retain the last cell for a repeated output name. Its type
+    // must also replace an earlier boolean/JSON origin, including expressions.
+    if (decode === undefined) {
+      out?.delete(c.name);
+      continue;
+    }
     if (out === null) out = new Map();
     out.set(c.name, decode);
   }
+  // Snapshot the fields: a compatible driver can reuse/mutate its own array.
+  // SQL text and schema-version equality never stand in for fresh metadata.
+  memo.columns = described.map(({ name, type, table, column, database }) => ({ name, type, table, column, database }));
+  memo.decoders = out;
   return out;
+}
+
+type BuiltinStatement = import('node:sqlite').StatementSync;
+
+/**
+ * The builtin methods a wildcard read goes through, or `null` when every read
+ * uses the statement's own all(). `undefined` until the first wildcard read.
+ */
+let wildcardRead: { all: BuiltinStatement['all']; iterate: BuiltinStatement['iterate'] } | null | undefined;
+
+/**
+ * Some builtin all() implementations (Node 22.16 and 24.10, for example) fix
+ * the result width before the first step. When SQLite reprepares a star there,
+ * because DDL ran since prepare or another connection changed the schema, a
+ * grown table loses its new cells and a repeated name keeps an earlier cell.
+ * Ask this runtime once: all() is trusted only if it returns the reprepared
+ * projection. Without iterate() (Node before 22.13) there is no complete
+ * route, so all() stays, as documented. A replaced prototype all() keeps its
+ * own contract.
+ */
+function probeWildcardRead(): typeof wildcardRead {
+  let sqlite: typeof import('node:sqlite');
+  try {
+    sqlite = createRequire(process.cwd())('node:sqlite') as typeof import('node:sqlite');
+  } catch {
+    return null;
+  }
+  const { all, iterate } = sqlite.StatementSync.prototype;
+  if (typeof iterate !== 'function' || !Function.prototype.toString.call(all).includes('[native code]')) return null;
+  let probe: DatabaseSync | undefined;
+  try {
+    probe = new sqlite.DatabaseSync(':memory:');
+    probe.exec('CREATE TABLE t(a); INSERT INTO t VALUES(1)');
+    const stmt = probe.prepare('SELECT *, 2 AS b FROM t');
+    probe.exec('ALTER TABLE t ADD COLUMN b DEFAULT 3');
+    // The executed projection is a, b, b: one row, the last b wins.
+    const [row, ...rest] = Reflect.apply(all, stmt, []) as Record<string, unknown>[];
+    if (row && rest.length === 0 && Object.keys(row).length === 2 && row.a === 1 && row.b === 2) return null;
+  } catch {
+    // An all() that cannot answer the probe is not trusted with a wildcard.
+  } finally {
+    probe?.close();
+  }
+  return { all, iterate };
+}
+
+let wildcardReuse: boolean | undefined;
+
+/**
+ * Whether a statement containing `*` may be kept for reuse: trial the reader a
+ * wildcard read will use on a statement executed once and then reprepared by
+ * DDL that grows and then shrinks its table. Asked once per process.
+ */
+function wildcardReuseSafe(): boolean {
+  if (wildcardReuse !== undefined) return wildcardReuse;
+  let sqlite: typeof import('node:sqlite');
+  try {
+    sqlite = createRequire(process.cwd())('node:sqlite') as typeof import('node:sqlite');
+  } catch {
+    wildcardReuse = false;
+    return wildcardReuse;
+  }
+  if (typeof sqlite.StatementSync.prototype.iterate !== 'function') {
+    wildcardReuse = false;
+    return wildcardReuse;
+  }
+  if (wildcardRead === undefined) wildcardRead = probeWildcardRead();
+  const reader = wildcardRead ? wildcardRead.iterate : sqlite.StatementSync.prototype.all;
+  let probe: DatabaseSync | undefined;
+  try {
+    probe = new sqlite.DatabaseSync(':memory:');
+    probe.exec('CREATE TABLE t(a); INSERT INTO t VALUES(1)');
+    const stmt = probe.prepare('SELECT * FROM t');
+    [...(Reflect.apply(reader, stmt, []) as Iterable<unknown>)];
+    probe.exec('ALTER TABLE t ADD COLUMN b DEFAULT 3');
+    const grown = [...(Reflect.apply(reader, stmt, []) as Iterable<Record<string, unknown>>)];
+    probe.exec('ALTER TABLE t DROP COLUMN b');
+    const shrunk = [...(Reflect.apply(reader, stmt, []) as Iterable<Record<string, unknown>>)];
+    wildcardReuse =
+      grown.length === 1 &&
+      Object.keys(grown[0]!).length === 2 &&
+      grown[0]!.b === 3 &&
+      shrunk.length === 1 &&
+      Object.keys(shrunk[0]!).length === 1 &&
+      shrunk[0]!.a === 1;
+  } catch {
+    wildcardReuse = false;
+  } finally {
+    probe?.close();
+  }
+  return wildcardReuse;
+}
+
+/**
+ * Read a stepped result. On a runtime whose probe trusts all(), this is all()
+ * after one null test. Elsewhere builtin statements containing `*` are read by
+ * native iteration, which reads the width after each step. Wrapped/compatible
+ * all() methods keep control of their own row contract.
+ */
+function readResultRows(
+  stmt: ReturnType<DatabaseSync['prepare']>,
+  sql: string,
+  binding: Record<string, SqliteParam> | undefined,
+  positionalParams?: SqliteParam[],
+): ReturnType<ReturnType<DatabaseSync['prepare']>['all']> {
+  if (wildcardRead !== null && sql.includes('*')) {
+    wildcardRead ??= probeWildcardRead();
+    if (wildcardRead && stmt.all === wildcardRead.all) {
+      const iterator = Reflect.apply(
+        wildcardRead.iterate,
+        stmt,
+        positionalParams ?? (binding ? [binding] : []),
+      ) as ReturnType<BuiltinStatement['iterate']>;
+      try {
+        return [...iterator];
+      } finally {
+        iterator.return?.();
+      }
+    }
+  }
+  return positionalParams ? stmt.all(...positionalParams) : binding ? stmt.all(binding) : stmt.all();
+}
+
+/**
+ * Which array readers return the executed projection on this runtime, or
+ * `null` when neither can be trusted (or there is no builtin). `undefined`
+ * until the first wildcard array candidate.
+ *
+ * Both readers are trialled, because which one runs is not this probe's
+ * choice: {@link readResultRows} iterates a wildcard when the OBJECT probe
+ * distrusts all(), whatever the array all() trial said. Measured, not
+ * assumed: Node 26.12 passes both trials and its object probe trusts all();
+ * Node 24.10 fails both all() trials (the width is fixed at prepare in BOTH
+ * row modes) and passes iteration, which is the route its object probe
+ * selects anyway. A runtime whose array all() passed while its object all()
+ * failed would iterate arrays, so {@link wildcardArraysEligible} requires
+ * the trial for the reader that will actually run, never the other one.
+ */
+let wildcardArrayRead: { all: boolean; iterate: boolean } | null | undefined;
+
+function probeWildcardArrayRead(): typeof wildcardArrayRead {
+  let sqlite: typeof import('node:sqlite');
+  try {
+    sqlite = createRequire(process.cwd())('node:sqlite') as typeof import('node:sqlite');
+  } catch {
+    return null;
+  }
+  const { all, iterate, setReturnArrays } = sqlite.StatementSync.prototype;
+  if (
+    typeof setReturnArrays !== 'function' ||
+    !Function.prototype.toString.call(setReturnArrays).includes('[native code]')
+  )
+    return null;
+  // One trial per reader: prepare, grow the table, then read as arrays. The
+  // executed projection is a, b with the new column's default in b.
+  const trial = (read: (stmt: BuiltinStatement) => unknown[]): boolean => {
+    let probe: DatabaseSync | undefined;
+    try {
+      probe = new sqlite.DatabaseSync(':memory:');
+      probe.exec('CREATE TABLE t(a); INSERT INTO t VALUES(1)');
+      const stmt = probe.prepare('SELECT * FROM t') as BuiltinStatement;
+      probe.exec('ALTER TABLE t ADD COLUMN b DEFAULT 3');
+      Reflect.apply(setReturnArrays, stmt, [true]);
+      const [row, ...rest] = read(stmt) as unknown[][];
+      return rest.length === 0 && Array.isArray(row) && row.length === 2 && row[0] === 1 && row[1] === 3;
+    } catch {
+      return false;
+    } finally {
+      probe?.close();
+    }
+  };
+  const allOk = trial((stmt) => Reflect.apply(all, stmt, []) as unknown[]);
+  const iterateOk =
+    typeof iterate === 'function' && trial((stmt) => [...(Reflect.apply(iterate, stmt, []) as Iterable<unknown>)]);
+  return allOk || iterateOk ? { all: allOk, iterate: iterateOk } : null;
+}
+
+/**
+ * May a wildcard statement read array rows on this runtime? The probe answer
+ * is per-process, like {@link wildcardRead}. The object probe decides the
+ * reader ({@link readResultRows} iterates exactly when it distrusts all()),
+ * so eligibility is the ARRAY trial for that same reader: iteration when
+ * {@link wildcardRead} holds the builtin methods, all() when it is `null`.
+ */
+function wildcardArraysEligible(sql: string): boolean {
+  if (wildcardArrayRead === undefined) wildcardArrayRead = probeWildcardArrayRead();
+  if (!wildcardArrayRead) return false;
+  if (wildcardRead === undefined && sql.includes('*')) wildcardRead = probeWildcardRead();
+  return wildcardRead ? wildcardArrayRead.iterate : wildcardArrayRead.all;
 }
 
 /**
@@ -663,11 +870,11 @@ function normalizeQueryArgs(arg: QueryArg, values?: unknown[]): { text: string; 
  * guarantee Postgres' numbered `$N` gives. Returns `undefined` when there are no
  * params so parameter-less statements (BEGIN/COMMIT/DDL) bind nothing.
  */
-function toNamedBinding(values: unknown[]): Record<string, SqliteParam> | undefined {
+function toNamedBinding(values: unknown[], qualified = false): Record<string, SqliteParam> | undefined {
   if (values.length === 0) return undefined;
   const named: Record<string, SqliteParam> = {};
   for (let i = 0; i < values.length; i++) {
-    named[`p${i + 1}`] = toSqliteParam(values[i]);
+    named[qualified ? `:p${i + 1}` : `p${i + 1}`] = toSqliteParam(values[i]);
   }
   return named;
 }
@@ -677,42 +884,349 @@ function refusePlaceholder(message: string): never {
   throw new ValidationError(message);
 }
 
+/**
+ * `sql` with each quoted run replaced by `x` and each comment by a space, in one
+ * scan from the left. A `[` with no `]` after it stays as written. Past the last
+ * `]` no `[` can close, so an unclosed one is known without scanning to the end
+ * again from each `[`, which made a run of them quadratic.
+ */
+function maskQuotedRunsAndComments(sql: string): string {
+  const token = /'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|--[^\n]*|\/\*[\s\S]*?(?:\*\/|$)|\[/g;
+  const lastClose = sql.lastIndexOf(']');
+  let masked = '';
+  let end = 0;
+  for (let match = token.exec(sql); match; match = token.exec(sql)) {
+    if (match[0] === '[') {
+      if (match.index > lastClose) continue;
+      token.lastIndex = sql.indexOf(']', match.index) + 1;
+    }
+    masked += sql.slice(end, match.index) + (/^(?:--|\/\*)/.test(match[0]) ? ' ' : 'x');
+    end = token.lastIndex;
+  }
+  return masked + sql.slice(end);
+}
+
+/** Let SQLite parse triggers/quoted SQL, then refuse any unconsumed statement before stepping. */
+function prepareSingleStatement(db: DatabaseSync, sql: string): ReturnType<DatabaseSync['prepare']> {
+  const refuse = () => {
+    throw new ValidationError('SQLite query accepts one statement; execute additional statements separately.');
+  };
+  if (sql.includes('\0')) refuse();
+  // Some PRAGMAs take effect during prepare. Screen their separators first;
+  // quoted runs remain code markers, while SQLite comments disappear.
+  if (sql.includes(';')) {
+    const code = maskQuotedRunsAndComments(sql).replace(/^[;\s]+/, '');
+    // Refuse code after a separator. Everything from the first `;` to the next
+    // code character is a separator, so the first `;` decides it.
+    const separator = code.indexOf(';');
+    if (
+      /^(?:EXPLAIN\s+(?:QUERY\s+PLAN\s+)?)?PRAGMA\b/i.test(code) &&
+      separator >= 0 &&
+      /[^;\s]/.test(code.slice(separator + 1))
+    )
+      refuse();
+  }
+  const stmt = db.prepare(sql);
+  // Node 22.5 exposed this as a method; later runtimes use a getter.
+  const source = stmt.sourceSQL as string | (() => string);
+  const parsed = typeof source === 'function' ? source.call(stmt) : source;
+  if (
+    !sql.startsWith(parsed) ||
+    sql.slice(parsed.length).replace(/--[^\n]*|\/\*[\s\S]*?(?:\*\/|$)|[;\t\n\r\f ]/g, '')
+  ) {
+    refuse();
+  }
+  return stmt;
+}
+
+// Only a factory-opened, never exposed handle has no caller-installed prepare
+// callbacks (notably an authorizer whose policy can change between calls).
+const unexposedNativeDatabases = new WeakSet<DatabaseSync>();
+
+interface SqliteQueryPlan {
+  valueCount: number;
+  sql: string;
+  returnsRows: boolean;
+  bytes: number;
+}
+
+/** Pool-owned SQL-only admission memo. No statements, bindings or result metadata. */
+interface SqliteQueryPlans {
+  entries: Map<string, SqliteQueryPlan>;
+  bytes: number;
+}
+
+function sqliteQueryPlan(text: string, valueCount: number, memo: SqliteQueryPlans): SqliteQueryPlan {
+  // Avoid hashing oversized text on every execution, even when it cannot fit.
+  const cacheable = text.length <= 32768;
+  const previous = cacheable ? memo.entries.get(text) : undefined;
+  // Parameter count is part of the identity: rewriting validates $n bounds,
+  // and zero parameters deliberately bypass rewriting altogether.
+  if (previous?.valueCount === valueCount) return previous;
+  const sql = rewritePositionalPlaceholders(text, 'sqlite', valueCount, (i) => `:p${i}`, refusePlaceholder);
+  // Conservative UTF-16 payload accounting, including both strings even when
+  // rewriting returns the input. The cap is not a JavaScript/native heap bound.
+  const bytes = (text.length + sql.length) * 2;
+  const plan = { valueCount, sql, returnsRows: statementReturnsRows(sql), bytes };
+  if (previous) {
+    memo.entries.delete(text);
+    memo.bytes -= previous.bytes;
+  }
+  // Keep the first shapes that fit. Churning SQL cannot evict hot entries or
+  // impose per-miss eviction/accounting work once the memo is full.
+  if (cacheable && memo.entries.size < 128 && memo.bytes + bytes <= 131072) {
+    memo.entries.set(text, plan);
+    memo.bytes += bytes;
+  }
+  return plan;
+}
+
+type NativeResultMethods = Pick<ReturnType<DatabaseSync['prepare']>, 'all' | 'columns' | 'setReturnArrays'>;
+let nativeResultMethods: NativeResultMethods | null | undefined;
+const bindingArrayStatements = new WeakMap<DatabaseSync, WeakMap<object, NativeResultMethods>>();
+
+/** Array results require builtin descriptions; compatible/wrapped methods keep object rows. */
+function nativeArrayResults(
+  db: DatabaseSync,
+  stmt: ReturnType<DatabaseSync['prepare']>,
+): NativeResultMethods | undefined {
+  const binding = bindingArrayStatements.get(db)?.get(stmt);
+  if (binding) {
+    return stmt.all === binding.all &&
+      stmt.columns === binding.columns &&
+      stmt.setReturnArrays === binding.setReturnArrays
+      ? binding
+      : undefined;
+  }
+  if (nativeResultMethods === undefined) {
+    try {
+      const { StatementSync } = createRequire(process.cwd())('node:sqlite') as typeof import('node:sqlite');
+      const p = StatementSync.prototype;
+      const methods = { all: p.all, columns: p.columns, setReturnArrays: p.setReturnArrays };
+      nativeResultMethods = Object.values(methods).every(
+        (fn) => typeof fn === 'function' && Function.prototype.toString.call(fn).includes('[native code]'),
+      )
+        ? methods
+        : null;
+    } catch {
+      nativeResultMethods = null;
+    }
+  }
+  if (
+    nativeResultMethods &&
+    stmt.all === nativeResultMethods.all &&
+    stmt.columns === nativeResultMethods.columns &&
+    stmt.setReturnArrays === nativeResultMethods.setReturnArrays
+  )
+    return nativeResultMethods;
+  return undefined;
+}
+
+/**
+ * Generated bulk INSERTs can bind fully qualified names with bare-name lookup
+ * disabled. Key by the exact params array, SQL and arity; copies/edited SQL
+ * keep ordinary binding. No values or native statements are retained.
+ *
+ * On a genuine native handle the same generated statement can go further and
+ * bind POSITIONALLY: SQLite's parser registers each distinct named parameter
+ * by searching the ones already seen, so preparing `:p1 … :p6000` is
+ * quadratic (a 1,000-row insert prepares in ~35 ms named against ~0.9 ms with
+ * `?` placeholders, on either driver), and the object binding repeats a name
+ * lookup per value. The positional text is derived here, below every observer:
+ * statement events, `buildCreateMany` output and wrapped handles keep seeing
+ * the generated `:pN` SQL and its named binding exactly as before.
+ *
+ * `qualifiedNames` records which named binding the recording dialect used
+ * before positional binding existed: the node:sqlite dialect bound bulk
+ * inserts with fully qualified `:pN` keys, the better-sqlite3 dialect did
+ * not record at all and so bound plain `{ p1 }` keys. A handle that cannot
+ * bind positionally must receive the same binding it always did, so the
+ * style travels with the recorded statement, not with the handle.
+ *
+ * `positional` starts `undefined` (not yet derived) and is filled lazily by
+ * {@link bulkPositionalBinding} on the first eligible execution, `null` when
+ * the SQL may not be rewritten. Deriving eagerly at build time taxed every
+ * handle for a spelling only eligible ones use, including the throwaway
+ * sizing builds `createMany` makes per call.
+ */
+interface BulkInsertBinding {
+  sql: string;
+  count: number;
+  qualifiedNames: boolean;
+  positional?: string | null;
+}
+const bulkInsertBindings = new WeakMap<unknown[], BulkInsertBinding>();
+
+/**
+ * The `?` spelling of a generated bulk INSERT, or `undefined` unless the SQL
+ * holds exactly `:p1 … :p<count>` in order and nothing else that looks like
+ * one. The strict sequence check is what makes a textual rewrite sound: a
+ * quoted identifier containing `:p7` would break the run or the count and the
+ * statement keeps named binding.
+ */
+function positionalBulkSql(sql: string, count: number): string | undefined {
+  if (count === 0) return undefined;
+  let seen = 0;
+  let inOrder = true;
+  const out = sql.replace(/:p(\d+)/g, (_token, digits: string) => {
+    seen += 1;
+    if (Number(digits) !== seen) inOrder = false;
+    return '?';
+  });
+  return inOrder && seen === count ? out : undefined;
+}
+
+/**
+ * @internal Record a generated bulk INSERT for the binding shortcuts above. Called by
+ * the SQLite dialects at statement-build time with the exact params array the
+ * statement will execute with.
+ */
+export function recordSqliteBulkInsert(params: unknown[], sql: string, qualifiedNames = true): void {
+  bulkInsertBindings.set(params, { sql, count: params.length, qualifiedNames });
+}
+
+let nativePrepareFn: DatabaseSync['prepare'] | null | undefined;
+
+/**
+ * May this handle receive the positional spelling? Only when nothing can
+ * observe the difference: a genuine `node:sqlite` handle whose `prepare` is
+ * still the native prototype method (a wrapped or proxied handle, or a
+ * compatible driver object, keeps the generated SQL and named binding it has
+ * always seen), or the better-sqlite3 adapter over a handle this package
+ * opened itself (registered for array results in {@link bindingArrayStatements}).
+ */
+function bulkPositionalEligible(db: DatabaseSync): boolean {
+  if (bindingArrayStatements.has(db)) return true;
+  if (nativePrepareFn === undefined) {
+    try {
+      const { DatabaseSync } = createRequire(process.cwd())('node:sqlite') as typeof import('node:sqlite');
+      const fn = DatabaseSync.prototype.prepare;
+      nativePrepareFn =
+        typeof fn === 'function' && Function.prototype.toString.call(fn).includes('[native code]') ? fn : null;
+    } catch {
+      nativePrepareFn = null;
+    }
+  }
+  return nativePrepareFn !== null && db.prepare === nativePrepareFn;
+}
+
+/**
+ * The positional spelling and spread values for a generated bulk insert on
+ * an eligible handle, or `undefined` to keep named binding. Kept out of
+ * {@link runStatement} so the path every statement takes stays as it was;
+ * only a recorded bulk insert calls this. The derived text is memoized on
+ * the WeakMap entry, so a statement executed more than once (a deferred
+ * query run twice) derives once.
+ */
+function bulkPositionalBinding(
+  db: DatabaseSync,
+  bulk: BulkInsertBinding,
+  values: unknown[],
+): { sql: string; params: SqliteParam[] } | undefined {
+  if (!bulkPositionalEligible(db)) return undefined;
+  bulk.positional ??= positionalBulkSql(bulk.sql, bulk.count) ?? null;
+  if (bulk.positional === null) return undefined;
+  // Read each slot by index, never `map`: a sparse params array binds NULL in
+  // its holes (toSqliteParam(undefined)) without shifting later values, the
+  // same contract the named loop in toNamedBinding keeps.
+  const params = new Array<SqliteParam>(values.length);
+  for (let i = 0; i < values.length; i++) params[i] = toSqliteParam(values[i]);
+  return { sql: bulk.positional, params };
+}
+
+/** Account the actual native bindings, never the caller's pre-conversion objects. */
+function retainStatementBindings(binding: Record<string, SqliteParam> | undefined): boolean {
+  let bytes = 0;
+  for (const name in binding) {
+    const value = binding[name];
+    if (value instanceof Uint8Array) return false;
+    bytes += typeof value === 'string' ? value.length * 2 : 8;
+    if (bytes > 8192) return false;
+  }
+  return true;
+}
+
 function runStatement(
   db: DatabaseSync,
   text: string,
   values: unknown[],
-  decoderCache?: LRUCache<string, Map<string, ColumnDecode> | null>,
-  declared: DeclaredDecoders = null,
+  declared: DeclaredDecoders,
+  memo: DecoderMemo,
+  plans: SqliteQueryPlans,
+  statements: WeakMap<SqliteQueryPlan, ReturnType<DatabaseSync['prepare']>> | undefined,
 ) {
-  const binding = toNamedBinding(values);
+  const generated = bulkInsertBindings.get(values);
+  const bulk = generated?.sql === text && generated.count === values.length ? generated : undefined;
+  const positional = bulk ? bulkPositionalBinding(db, bulk, values) : undefined;
+  const binding = positional ? undefined : toNamedBinding(values, bulk?.qualifiedNames ?? false);
   // `$n` is the spelling `rawUnsafe` documents for every engine; SQLite would
   // read `$1` as a parameter NAMED "1", which the `{ p1, ... }` binding lacks.
-  const sql = rewritePositionalPlaceholders(text, 'sqlite', values.length, (i) => `:p${i}`, refusePlaceholder);
+  const plan = sqliteQueryPlan(text, values.length, plans);
+  const { sql, returnsRows } = plan;
+  // Only genuine native preparation is unobservable to a caller's wrapper.
+  // Keep the admitted SQL's bounded slot, never a SQL-to-type cache: SQLite
+  // can reprepare this statement on step, and metadata is still read after it.
+  let reusable =
+    statements !== undefined &&
+    !bulk &&
+    /^\s*(?:SELECT|INSERT|UPDATE|DELETE|REPLACE|BEGIN|COMMIT|END|ROLLBACK|SAVEPOINT|RELEASE)\b/i.test(sql) &&
+    bulkPositionalEligible(db) &&
+    !bindingArrayStatements.has(db);
   let stmt: ReturnType<DatabaseSync['prepare']>;
   try {
-    stmt = db.prepare(sql);
+    stmt = (reusable && statements!.get(plan)) || prepareSingleStatement(db, positional?.sql ?? sql);
+    // A recursive call must never check out a statement that is being stepped.
+    statements?.delete(plan);
   } catch (err) {
     throw augmentSqliteError(err);
   }
+  // Some runtimes fix a wildcard's width before stepping, even in iterate()
+  // (Node 22.13 to 22.15). A statement kept across DDL there would keep its old
+  // columns, so a star is retained only where the reader it will use follows a
+  // reprepare; elsewhere it is prepared fresh, as before.
+  if (reusable && sql.includes('*') && !wildcardReuseSafe()) reusable = false;
   stmt.setReadBigInts(true);
+  // node:sqlite builds a bare-name map on every execution when enabled. The
+  // generated statement binds exact :pN names, so that extra lookup is unused.
+  if (bulk?.qualifiedNames && !positional) stmt.setAllowBareNamedParameters?.(false);
   try {
-    if (statementReturnsRows(sql)) {
-      // Describe each distinct statement ONCE. `null` (nothing to decode) is a
-      // cached answer too, so the ordinary query pays a single Map hit per call
-      // and nothing per row.
-      let decoders = decoderCache?.get(sql);
-      if (decoders === undefined) {
-        decoders = resultColumnDecoders(stmt, declared);
-        decoderCache?.set(sql, decoders);
-      }
-      const rows = (binding ? stmt.all(binding) : stmt.all()).map((r) =>
-        normalizeRow(r as Record<string, null | number | bigint | string | Uint8Array>, decoders ?? undefined),
-      );
+    if (returnsRows) {
+      // With no wildcard, SELECT's result width is fixed by its expressions.
+      // A wildcard SELECT joins the array path when this runtime's array
+      // read returns the executed projection (probeWildcardArrayRead); the
+      // keys still come from columns() after stepping, never a pre-step
+      // shape. A LIMIT 1 read stays on object rows: its one row cannot
+      // repay the columns() call and decode-plan setup.
+      const arrays =
+        bindingArrayStatements.get(db)?.has(stmt) ||
+        (/^\s*SELECT\b/i.test(sql) &&
+          (!sql.includes('*') || (!/\bLIMIT\s+1\b/.test(sql) && wildcardArraysEligible(sql))))
+          ? nativeArrayResults(db, stmt)
+          : undefined;
+      if (arrays) arrays.setReturnArrays.call(stmt, true);
+      const raw = readResultRows(stmt, positional?.sql ?? sql, binding, positional?.params);
+      // SQL text cannot identify column types across DDL, rollback or namespace
+      // changes. Describe this execution after stepping, when SQLite may have
+      // automatically reprepared it. A matching description can reuse decoding.
+      // Pin the builtin method before stepping: SQL functions can run JS while
+      // all() executes. Neither types nor keys may come from a pre-step shape.
+      const columns = arrays && raw.length > 0 ? arrays.columns.call(stmt) : undefined;
+      const decoders = raw.length === 0 ? null : resultColumnDecoders(stmt, declared, memo, columns);
+      const rows =
+        raw.length > 0 && (arrays || raw.length > 1)
+          ? normalizeResultRows(raw, decoders, columns, arrays && arrays === nativeResultMethods)
+          : raw.map((r) =>
+              normalizeRow(r as Record<string, null | number | bigint | string | Uint8Array>, decoders ?? undefined),
+            );
+      // Preparation is a fixed cost. Large results keep fresh statements:
+      // retaining them does not repay the native reader's result-sized work.
+      if (reusable && raw.length <= 128 && retainStatementBindings(binding)) statements!.set(plan, stmt);
       return { rows, rowCount: rows.length };
     }
-    const info = binding ? stmt.run(binding) : stmt.run();
+    const info = positional ? stmt.run(...positional.params) : binding ? stmt.run(binding) : stmt.run();
     const changes = typeof info.changes === 'bigint' ? Number(info.changes) : info.changes;
     const lastID = typeof info.lastInsertRowid === 'bigint' ? Number(info.lastInsertRowid) : info.lastInsertRowid;
+    if (reusable && retainStatementBindings(binding)) statements!.set(plan, stmt);
     return { rows: [] as Record<string, unknown>[], rowCount: changes, lastID, insertId: lastID };
   } catch (err) {
     throw augmentSqliteError(err);
@@ -747,6 +1261,13 @@ interface HandleWaiter {
 const TX_OPEN_HEAD = /^\s*(?:begin|savepoint)\b/i;
 /** Statement heads that end the transaction (not `ROLLBACK TO`, which keeps it open). */
 const TX_CLOSE_HEAD = /^\s*(?:commit|end|rollback(?!\s+(?:transaction\s+)?to\b))\b/i;
+/** A transaction boundary invalidates a suspended native iterator before executing. */
+const TX_BOUNDARY_HEAD = /^\s*(?:begin|savepoint|release|commit|end|rollback)\b/i;
+
+interface ActiveSqliteIterator {
+  readonly owner: object;
+  close(): void;
+}
 
 /**
  * The one statement the pool can never run: something on the handle while the
@@ -763,19 +1284,19 @@ function statementInsideTransactionError(): UnsupportedFeatureError {
   );
 }
 
-/** The error a caller gets when an open transaction holds the handle past `busyTimeoutMs`. */
+/** The error when a transaction or iterator holds the handle past `busyTimeoutMs`. */
 function handleBusyError(timeoutMs: number): SerializationFailureError {
   return new SerializationFailureError({
     message:
-      `SQLite database is busy: a transaction on this client held it for longer than busyTimeoutMs (${timeoutMs} ms). ` +
-      'Retry the operation (withRetry does), keep transactions short, or raise busyTimeoutMs.',
+      `SQLite database is busy: a transaction or stream on this client held it for longer than busyTimeoutMs (${timeoutMs} ms). ` +
+      'Retry the operation (withRetry does), keep transactions short, close streams with return(), or raise busyTimeoutMs.',
   });
 }
 
 /** Options for {@link SqlitePool}. */
 export interface SqlitePoolOptions {
   /**
-   * How long, in ms, a statement waits for a transaction another caller has
+   * How long, in ms, a statement waits for a transaction or iterator another caller has
    * open on this handle before failing with a retryable
    * `SerializationFailureError`. Default: 5000, the same bound as
    * `PRAGMA busy_timeout`.
@@ -800,19 +1321,17 @@ export interface SqlitePoolOptions {
  * wait their turn in FIFO order (bounded by `busyTimeoutMs`) instead of running
  * inside it. Without that, a write issued outside an open transaction joined
  * it, reported success, and was rolled back with it, and reads saw its
- * uncommitted rows. A checkout that does not open a transaction (a stream, a
- * connectivity check) holds nothing, so other callers keep running beside it.
+ * uncommitted rows. A native iterator also owns the handle until it is closed;
+ * a connectivity check holds it only while its statement runs.
  */
 export class SqlitePool implements PgCompatPool {
-  /** The underlying `node:sqlite` handle, exposed as an escape hatch (seed/DDL). */
-  readonly db: DatabaseSync;
+  /** The underlying native handle, retained as a readonly field in declarations. */
+  declare readonly db: DatabaseSync;
+  private readonly nativeDb: DatabaseSync;
   private closed = false;
-  /**
-   * `sql -> result columns to decode` (or `null` for none). Bounded like
-   * the query builder's SQL-template cache, since a caller can generate
-   * unbounded distinct statements (raw SQL, an IN-list that inlines).
-   */
-  private readonly decoderCache = new LRUCache<string, Map<string, ColumnDecode> | null>(1000);
+  private readonly decoderMemo: DecoderMemo = { decoders: null };
+  private readonly queryPlans: SqliteQueryPlans = { entries: new Map(), bytes: 0 };
+  private statements: WeakMap<SqliteQueryPlan, ReturnType<DatabaseSync['prepare']>> | undefined;
   /** Schema columns whose stored form is not their declared JS type (see {@link declaredDecoders}). */
   private readonly declared: DeclaredDecoders;
   private readonly busyTimeoutMs: number;
@@ -823,9 +1342,23 @@ export class SqlitePool implements PgCompatPool {
   private readonly poolOwner = {};
   /** Transaction state when the driver cannot report it (`isTransaction` arrived in Node 22.16). */
   private trackedTransaction = false;
+  /** Only transactions opened through this pool may be rolled back on release. */
+  private transactionOwner: object | null = null;
+  private activeIterator: ActiveSqliteIterator | undefined;
 
   constructor(db: DatabaseSync, options: SqlitePoolOptions = {}) {
-    this.db = db;
+    this.nativeDb = db;
+    // Capture the owner so readonly proxies can expose the handle without
+    // forwarding private reads or writes through their public interface.
+    Object.defineProperty(this, 'db', {
+      get: () => {
+        this.statements = undefined;
+        return db;
+      },
+      enumerable: true,
+      configurable: true,
+    });
+    if (unexposedNativeDatabases.delete(db)) this.statements = new WeakMap();
     const t = Number(options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS);
     this.busyTimeoutMs = Number.isFinite(t) && t >= 0 ? t : DEFAULT_BUSY_TIMEOUT_MS;
     this.declared = declaredDecoders(options.schema);
@@ -851,8 +1384,9 @@ export class SqlitePool implements PgCompatPool {
           );
         }
         const { text: sql, params } = normalizeQueryArgs(text, values);
-        return this.runAs(owner, sql, params);
+        return this.runAs(owner, sql, params, () => released);
       },
+      streamBatches: (text, values, batchSize) => this.iterateAs(owner, text, values, batchSize, () => released),
       wrapTransactionCallback: <R>(fn: () => Promise<R>): Promise<R> =>
         sqliteTxStorage.run({ pool: this, owner, parent: sqliteTxStorage.getStore() }, fn),
       release: () => {
@@ -865,19 +1399,36 @@ export class SqlitePool implements PgCompatPool {
 
   async end(): Promise<void> {
     if (this.closed) return;
-    this.closed = true;
-    this.db.close();
+    try {
+      this.activeIterator?.close();
+    } finally {
+      this.closed = true;
+      this.decoderMemo.columns = undefined;
+      this.decoderMemo.decoders = null;
+      this.statements = undefined;
+      this.queryPlans.entries.clear();
+      this.queryPlans.bytes = 0;
+      this.nativeDb.close();
+    }
   }
 
   /** Is the handle inside a transaction right now? */
   private inTransaction(): boolean {
-    const reported = (this.db as { isTransaction?: unknown }).isTransaction;
+    const reported = (this.nativeDb as { isTransaction?: unknown }).isTransaction;
     return typeof reported === 'boolean' ? reported : this.trackedTransaction;
   }
 
   /** Run one statement for `owner`, waiting first if another caller's transaction holds the handle. */
-  private async runAs(owner: object, sql: string, params: unknown[]) {
+  private async runAs(owner: object, sql: string, params: unknown[], released?: () => boolean) {
     if (this.closed) throw new ConnectionError('This SQLite client has been disconnected.');
+    if (this.inTransaction() && this.transactionOwner === null && this.owner !== owner) {
+      throw new UnsupportedFeatureError(
+        'A pooled statement inside an externally opened transaction',
+        'sqlite',
+        'The supplied DatabaseSync has a caller-owned transaction. Use that handle for statements until ' +
+          'the caller commits or rolls back; the pool cannot assign unrelated statements to that transaction safely.',
+      );
+    }
     if (this.owner !== owner) {
       if (this.owner !== null || this.waiters.length > 0) {
         if (this.calledFromOwnersCallback()) throw statementInsideTransactionError();
@@ -887,13 +1438,149 @@ export class SqlitePool implements PgCompatPool {
       }
     }
     try {
-      const result = runStatement(this.db, sql, params, this.decoderCache, this.declared);
+      if (this.closed || released?.()) throw new ConnectionError('This SQLite connection was closed or released.');
+      if (this.activeIterator?.owner === owner) {
+        if (TX_BOUNDARY_HEAD.test(sql)) this.activeIterator.close();
+        else
+          throw new ValidationError(
+            'Close the active SQLite stream with return() before issuing another statement on its connection.',
+          );
+      }
+      const wasInTransaction = this.inTransaction();
+      const result = runStatement(
+        this.nativeDb,
+        sql,
+        params,
+        this.declared,
+        this.decoderMemo,
+        this.queryPlans,
+        this.statements,
+      );
       if (TX_OPEN_HEAD.test(sql)) this.trackedTransaction = true;
       else if (TX_CLOSE_HEAD.test(sql)) this.trackedTransaction = false;
+      if (!wasInTransaction && this.inTransaction()) this.transactionOwner = owner;
+      else if (!this.inTransaction()) this.transactionOwner = null;
       return result;
     } finally {
       // A statement that leaves no transaction open hands the handle on.
-      if (this.owner === owner && !this.inTransaction()) this.handOff();
+      if (this.owner === owner && !this.inTransaction() && !this.activeIterator) this.handOff();
+    }
+  }
+
+  /**
+   * Step on this checkout's handle, never `.all()`. Stepping is synchronous:
+   * timers/cancellation run between pulls, not during sqlite3_step(). A batch
+   * bounds row count only; one BLOB/JSON row, nested relation or SQLite sort
+   * can still be arbitrarily large. No nested results are truncated.
+   */
+  private async *iterateAs(
+    owner: object,
+    text: string,
+    values: unknown[],
+    batchSize: number,
+    released: () => boolean,
+  ): AsyncGenerator<Record<string, unknown>[], void, undefined> {
+    if (!Number.isSafeInteger(batchSize) || batchSize < 1)
+      throw new ValidationError('SQLite stream batchSize must be a positive safe integer.');
+    if (this.closed || released()) throw new ConnectionError('This SQLite connection was closed or released.');
+    // The SQL-head fallback tracks only statements sent through this pool. It
+    // cannot distinguish an external transaction on a supplied handle, so it
+    // cannot safely support the native iterator's ownership contract.
+    if (typeof this.nativeDb.isTransaction !== 'boolean')
+      throw new UnsupportedFeatureError(
+        'Native incremental streaming',
+        'sqlite',
+        'DatabaseSync.isTransaction is required (Node 22.x >= 22.16, or Node >= 24). Upgrade Node for native streaming.',
+      );
+    if (this.inTransaction() && this.transactionOwner === null && this.owner !== null && this.owner !== owner) {
+      throw new UnsupportedFeatureError(
+        'Concurrent streams inside an externally opened transaction',
+        'sqlite',
+        'Close the active stream before opening another stream on the supplied DatabaseSync.',
+      );
+    }
+    if (this.owner !== owner) {
+      if (this.owner !== null || this.waiters.length > 0) {
+        if (this.calledFromOwnersCallback()) throw statementInsideTransactionError();
+        await this.waitForHandle(owner);
+      } else this.owner = owner;
+    }
+    let active: ActiveSqliteIterator | undefined;
+    let failed = false;
+    try {
+      if (this.closed || released()) throw new ConnectionError('This SQLite connection was closed or released.');
+      if (this.activeIterator)
+        throw new ValidationError(
+          'Close the active SQLite stream with return() before opening another stream on its connection.',
+        );
+      const binding = toNamedBinding(values);
+      const { sql } = sqliteQueryPlan(text, values.length, this.queryPlans);
+      const stmt = prepareSingleStatement(this.nativeDb, sql);
+      stmt.setReadBigInts(true);
+      if (typeof stmt.iterate !== 'function')
+        throw new UnsupportedFeatureError(
+          'Native incremental streaming',
+          'sqlite',
+          'The SQLite driver must provide StatementSync.iterate().',
+        );
+      let normalize: ((row: Record<string, unknown>) => Record<string, unknown>) | undefined;
+      const iterator = binding ? stmt.iterate(binding) : stmt.iterate();
+      if (typeof iterator.return !== 'function')
+        throw new UnsupportedFeatureError(
+          'Native incremental streaming',
+          'sqlite',
+          'The SQLite iterator must provide return() so a suspended statement can be closed.',
+        );
+      let closed = false;
+      active = {
+        owner,
+        close: () => {
+          if (closed) return;
+          closed = true;
+          try {
+            iterator.return!();
+          } finally {
+            if (this.activeIterator === active) this.activeIterator = undefined;
+          }
+        },
+      };
+      this.activeIterator = active;
+      while (true) {
+        if (closed)
+          throw new ValidationError('This SQLite stream was closed when its transaction or connection ended.');
+        const batch: Record<string, unknown>[] = [];
+        let done = false;
+        for (let i = 0; i < batchSize; i++) {
+          const step = iterator.next();
+          if (step.done) {
+            done = true;
+            break;
+          }
+          // The first step can reprepare after external DDL. Validate its fresh
+          // description, then pin the decoder map for this iterator's snapshot.
+          if (normalize === undefined) {
+            const decoders = resultColumnDecoders(stmt, this.declared, this.decoderMemo);
+            batch.push(normalizeRow(step.value, decoders ?? undefined));
+            normalize = streamRowNormalizer(stmt, step.value, decoders, !bindingArrayStatements.has(this.nativeDb));
+          } else batch.push(normalize(step.value));
+        }
+        if (done) active.close();
+        if (batch.length > 0) yield batch;
+        if (done) return;
+      }
+    } catch (err) {
+      failed = true;
+      throw augmentSqliteError(err);
+    } finally {
+      try {
+        active?.close();
+      } catch (err) {
+        // A step failure remains the primary error if cleanup also failed.
+        // biome-ignore lint/correctness/noUnsafeFinally: only replaces a successful return, never a step failure.
+        if (!failed) throw augmentSqliteError(err);
+      } finally {
+        if (this.owner === owner && !this.activeIterator && this.transactionOwner !== owner) this.handOff();
+      }
     }
   }
 
@@ -947,15 +1634,20 @@ export class SqlitePool implements PgCompatPool {
    */
   private releaseOwner(owner: object): void {
     if (this.owner !== owner) return;
-    if (this.inTransaction() && !this.closed) {
-      try {
-        this.db.exec('ROLLBACK');
-      } catch {
-        // Nothing left to roll back.
+    try {
+      if (this.activeIterator?.owner === owner) this.activeIterator.close();
+    } finally {
+      if (this.transactionOwner === owner && this.inTransaction() && !this.closed) {
+        try {
+          this.nativeDb.exec('ROLLBACK');
+        } catch {
+          // Nothing left to roll back.
+        }
+        this.trackedTransaction = false;
+        this.transactionOwner = null;
       }
-      this.trackedTransaction = false;
+      this.handOff();
     }
-    this.handOff();
   }
 }
 
@@ -965,40 +1657,12 @@ export class SqlitePool implements PgCompatPool {
 
 /**
  * Map a SQLite declared column type (type affinity) to a TypeScript type.
- * SQLite is dynamically typed; we read the declared `PRAGMA table_info` type.
+ * SQLite is dynamically typed; use the declared `PRAGMA table_info` type.
  */
-export function sqliteTypeToTs(declaredType: string, nullable: boolean): string {
-  const t = declaredType.toLowerCase();
-  let base: string;
-  if (/int/.test(t)) base = 'number';
-  else if (/(real|floa|doub)/.test(t)) base = 'number';
-  else if (/bool/.test(t)) base = 'boolean';
-  else if (/(timestamp|datetime|date)/.test(t)) base = 'Date';
-  else if (/(char|clob|text)/.test(t)) base = 'string';
-  else if (/blob/.test(t)) base = 'Uint8Array';
-  else if (/(numeric|decimal)/.test(t)) base = 'string';
-  else if (t === '')
-    base = 'unknown'; // no declared affinity (BLOB affinity)
-  else base = 'unknown';
-  return nullable ? `${base} | null` : base;
-}
-
 /** Is a SQLite declared type a date/time type (so values coerce back to `Date`)? */
 function isSqliteDateType(declaredType: string): boolean {
   const t = declaredType.toLowerCase();
   return isDateType(t) || /(timestamp|datetime|date)/.test(t);
-}
-
-/** Map a schema-builder (Postgres-flavored) column type to a SQLite affinity. */
-function sqliteColumnAffinity(type: string): string {
-  const t = type.toUpperCase();
-  if (/SERIAL|INT/.test(t)) return 'INTEGER';
-  if (/REAL|FLOAT|DOUBLE/.test(t)) return 'REAL';
-  if (/NUMERIC|DECIMAL|MONEY/.test(t)) return 'NUMERIC';
-  if (/BLOB|BYTEA/.test(t)) return 'BLOB';
-  if (/BOOL/.test(t)) return 'INTEGER';
-  // TEXT, VARCHAR, CHAR, UUID, JSON(B), TIMESTAMP(TZ), DATE, TIME, ENUM, …
-  return 'TEXT';
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,451 +1679,11 @@ function sqliteColumnAffinity(type: string): string {
  * LISTEN/NOTIFY, RLS, advisory locks).
  */
 export const sqliteDialect: Dialect = {
-  ...postgresDialect,
-  name: 'sqlite',
-  capabilities: Object.freeze({
-    distinctOn: false,
-    positionalJson: false,
-    // NULLS FIRST / LAST since 3.30; NULL is the smallest value.
-    nullsOrderingClause: true,
-    nullsSortHigh: false,
-    insensitiveInList: false,
-    jsonDocumentEquality: 'text',
-    jsonExtractTyped: true,
-    jsonExactNumericCast: false,
-    numericTextComparison: false,
-    // Enforced only on a connection that turned `foreign_keys` on.
-    enforcesForeignKeys: false,
-    partitionLimitPushdown: false,
-    utcTimestampRewrite: false,
-    paramTypeCasts: false,
-    namedEnumTypes: false,
-    structuredValueColumns: 'scalars',
-    // The default SQLITE_MAX_VARIABLE_NUMBER.
-    maxBindParameters: 32766,
-    maxInsertRows: Number.POSITIVE_INFINITY,
-    // Measured: 40,000 rows insert 70 to 140 times faster in statements of 250
-    // parameters than of 32,766 (named-parameter lookup is a linear search).
-    chunkBindParameters: 250,
-    upsertConflictTarget: 'explicit',
-    setClauseOrder: 'snapshot',
-    reselectLocksRows: false,
-    integerDivision: '/',
-    updateExpressions: true,
-    bulkUpsertAppliesRepeatedKeys: true,
-    skipDuplicatesCountsSkipped: false,
-    readOnlyTransactions: false,
-    connectionParameters: false,
-    backendCancel: false,
-    idleTransactionTimeout: false,
-    abortsTransactionOnError: false,
-    connectionDriver: 'engine-driver',
-    preparesEveryStatement: false,
-    statementSyntax: 'sqlite',
-    inlineForeignKeys: true,
-    unboundedTextKeys: true,
-  } satisfies EngineCapabilities),
-  resultStrategy: 'returning', // SQLite ≥ 3.35 has RETURNING
-  supportsReturning: true,
-  supportsILike: false,
-  supportsVector: false,
-  supportsJsonContains: false,
-  // FTS5 is a virtual-table feature with its own MATCH syntax, not the
-  // `to_tsvector @@ to_tsquery` shape Turbine's `search` filter emits.
-  supportsFullTextSearch: false,
-  // No array column type (a JSON column is not an array column).
-  supportsArrayColumns: false,
-  supportsListenNotify: false,
-  supportsRLS: false,
-  supportsAdvisoryLock: false,
-  // No FROM-clause LATERAL: the opt-in lateral pick plan is Postgres-only.
-  supportsLateralJoin: false,
-  supportsPlanCacheMode: false,
-  // No row locks: a write transaction locks the whole database.
-  rowLockModes: [],
-  // percentile_cont / percentile_disc exist only in builds compiled with
-  // SQLITE_ENABLE_PERCENTILE, which node:sqlite cannot be assumed to have.
-  supportsPercentileAggregates: false,
-  // INSERT ... ON CONFLICT (cols) DO UPDATE ... RETURNING (3.24 + 3.35).
-  supportsBulkUpsert: true,
-  // SQLite explains a compiled query with `EXPLAIN QUERY PLAN` (four columns:
-  // id, parent, notused, detail), overriding the inherited Postgres `EXPLAIN`.
-  explainQuery: { prefix: 'EXPLAIN QUERY PLAN' },
-  // json_group_array / json_object have no inline ORDER BY argument, so every
-  // ordered to-many relation is forced through the inner-subquery rewrite.
-  aggSupportsInlineOrderBy: false,
-  jsonPathSupport: 'function',
-  emptyJsonArrayLiteral: "json('[]')",
-  nullJsonLiteral: 'NULL',
-
-  // Named placeholders (`:p1`, `:p2`, …), NOT positional `?`. Turbine pushes
-  // params in 1-indexed generation order but may EMIT them in a different SQL
-  // text position (e.g. a `with`-relation LIMIT lands in the SELECT list, ahead
-  // of the outer WHERE). Postgres reconciles this via numbered `$N`; positional
-  // `?` cannot. SQLite named parameters bind by name, so `:pN` ↔ `params[N-1]`
-  // exactly mirrors Postgres' `$N` semantics regardless of text order. The
-  // driver binds via a `{ p1, p2, … }` object built from the positional array.
-  paramPlaceholder(index: number): string {
-    return `:p${index}`;
-  },
-
-  quoteIdentifier(name: string): string {
-    return `"${name.replace(/"/g, '""')}"`;
-  },
-
-  buildJsonObject(pairs: [key: string, expr: string][]): string {
-    const args = pairs.map(([key, expr]) => `'${this.escapeStringLiteral(key)}', ${expr}`);
-    return `json_object(${args.join(', ')})`;
-  },
-
-  buildJsonArrayAgg(jsonObjectExpr: string, orderBy?: string): string {
-    // json() wraps each aggregated object so SQLite stores real JSON, not an
-    // escaped string; COALESCE handles the empty-group NULL.
-    const suffix = orderBy ? ` ${orderBy}` : '';
-    return `COALESCE(json_group_array(json(${jsonObjectExpr}))${suffix}, json('[]'))`;
-  },
-
-  /**
-   * SQLite's `json_group_array` double-encodes nested objects unless each nested
-   * subresult is `json(...)`-wrapped. This is the whole point of the hook: it
-   * keeps `users[0].posts[0].author.name` a real parsed tree instead of a string
-   * containing a string containing JSON.
-   */
-  wrapJsonSubresult(subquery: string, fallback: string): string {
-    return `COALESCE(json((${subquery})), ${fallback})`;
-  },
-
-  jsonWireRule(columnType: string): JsonWireRule | undefined {
-    // SQLite's storage classes, as introspection records them.
-    const t = columnType.toUpperCase();
-
-    // INTEGER is 64-bit, and `json_object` renders it as a JSON number, which
-    // is an IEEE double: 9007199254740993 came back through a `with` join as
-    // …992 while a top-level read and the batched loader both returned the
-    // exact decimal string. Carry the text and re-apply the SAME safe-integer
-    // policy `normalizeValue` applies to the driver's bigint, so all three
-    // paths agree for both small and large values.
-    if (t.includes('INT')) {
-      return {
-        sql: (ref) => `CAST(${ref} AS TEXT)`,
-        decode: (value) => {
-          if (typeof value !== 'string' || !/^-?\d+$/.test(value)) return value;
-          const asNumber = Number(value);
-          return Number.isSafeInteger(asNumber) ? asNumber : value;
-        },
-      };
-    }
-
-    // A declared-boolean column is 1/0 in storage, and the driver shim turns
-    // that back into true/false on every direct read (see
-    // resultColumnDecoders). `json_object` sees the raw integer and has no
-    // decltype to consult, so the join strategy alone would have kept handing
-    // back 1/0 while the top-level read, the batched loader and the flatten
-    // plan returned booleans, which is the same strategy-dependent type flip
-    // the bigint rule above exists to prevent. No cast is needed, only the
-    // decode: the JSON number IS the stored value, it just has to be read the
-    // same way.
-    //
-    // Gated on the SAME capability the direct-read half feature-detects (see
-    // driverReportsDeclaredTypes). Without it the shim cannot name a boolean
-    // result column, so 1/0 is the answer everywhere; converting here alone
-    // would put the flip back, pointing the other way.
-    const decode = sqliteValueDecode(columnType);
-    if (decode === 'boolean' && driverReportsDeclaredTypes()) {
-      return {
-        // Carried as TEXT because that is how the decode half is reached at
-        // all: the parser only runs `decode` on a string cell, so a rule that
-        // left the JSON number alone would never fire. The CASE narrows the
-        // carrier to EXACTLY the two values that mean true/false, so anything
-        // else a declared-boolean column happens to hold (SQLite does not
-        // enforce the type) stays in its own JSON form and reads back as the
-        // driver would have returned it, rather than being stringified.
-        sql: (ref) => `CASE WHEN ${ref} IN (0, 1) THEN CAST(${ref} AS TEXT) ELSE ${ref} END`,
-        decode: (value) => (value === '1' ? true : value === '0' ? false : value),
-      };
-    }
-
-    // A json/jsonb column is JSON text in storage, which the shim parses on
-    // every direct read (see resultColumnDecoders). `json_object` embeds the
-    // same text as a JSON string, so the decode is the same parse. No cast: the
-    // column reference already yields the text. Gated like the boolean rule,
-    // since the direct-read half needs the same driver capability.
-    if (decode === 'json' && driverReportsDeclaredTypes()) {
-      return { sql: (ref) => ref, decode: parseJsonCell };
-    }
-
-    // `json_object` renders a REAL with 15 significant digits on the SQLite
-    // that Node 22 and 24 bundle (3.47 to 3.51; 3.53 renders 17), so 0.1 + 0.2
-    // came back 0.3 through a join and a NUMERIC past 15 digits was rounded
-    // again on top of its REAL storage, while the top-level read and the
-    // batched loader return the stored double. `printf('%!.17g')` prints every
-    // double with enough digits to rebuild it, on every version; an INTEGER in
-    // the same column is carried as its text and decoded by the safe-integer
-    // policy above; text and NULL pass through as stored.
-    if (/REAL|FLOA|DOUB|NUMERIC|DECIMAL|MONEY/.test(t)) {
-      return {
-        sql: (ref) =>
-          `CASE typeof(${ref}) WHEN 'real' THEN printf('%!.17g', ${ref}) ` +
-          `WHEN 'integer' THEN CAST(${ref} AS TEXT) ELSE ${ref} END`,
-        decode: decodeRealText,
-      };
-    }
-
-    // A BLOB cannot go into JSON at all: SQLite raises "JSON cannot hold BLOB
-    // values" and the whole query fails with a raw SQL logic error, where the
-    // batched loader returns the row fine. Carry hex and rebuild the bytes.
-    if (t.includes('BLOB')) {
-      return {
-        sql: (ref) => `hex(${ref})`,
-        decode: (value) => (typeof value === 'string' ? Uint8Array.from(Buffer.from(value, 'hex')) : value),
-      };
-    }
-
-    return undefined;
-  },
-
-  castAggregate(expr: string, target: 'int' | 'float'): string {
-    return `CAST(${expr} AS ${target === 'int' ? 'INTEGER' : 'REAL'})`;
-  },
-
-  // SQLite's grammar only allows OFFSET after LIMIT, so `offset` without
-  // `limit` (valid on Postgres, which the default path is written for) is a
-  // syntax error here. A negative LIMIT is SQLite's documented "no upper
-  // bound", so that shape becomes `LIMIT -1 OFFSET n`. The other shapes emit
-  // byte-identically to the default path.
-  buildLimitOffset(input: LimitOffsetInput): string {
-    const { limitPlaceholder, offsetPlaceholder } = input;
-    if (limitPlaceholder === undefined && offsetPlaceholder === undefined) return '';
-    if (limitPlaceholder === undefined) return ` LIMIT -1 OFFSET ${offsetPlaceholder}`;
-    let s = ` LIMIT ${limitPlaceholder}`;
-    if (offsetPlaceholder !== undefined) s += ` OFFSET ${offsetPlaceholder}`;
-    return s;
-  },
-
-  // No `= ANY(array)` in SQLite. `json_each` expands a single JSON-array param
-  // into a row set, keeping ONE placeholder (so the SQL cache stays valid
-  // regardless of list length) and handling the empty-list case correctly.
-  // `x IN (SELECT ...)` compares like `x = ?`: the column's affinity and
-  // collation apply to each element, as they do to a bound operand. JSON has no
-  // bytes, so a binary element travels as `{"b": "<hex>"}` and is decoded back
-  // to a BLOB here (see sqliteInListJson).
-  buildInClause(expr: string, paramRef: string, negated: boolean): string {
-    return (
-      `${expr} ${negated ? 'NOT IN' : 'IN'} ` +
-      `(SELECT CASE WHEN type = 'object' THEN unhex(json_extract(value, '$.b')) ELSE value END ` +
-      `FROM json_each(${paramRef}))`
-    );
-  },
-
-  inClauseParam(values: unknown[]): unknown {
-    return sqliteInListJson(Array.isArray(values) ? values : []);
-  },
-
-  /**
-   * A string written to a numeric or boolean column. SQLite's type affinity
-   * keeps text it cannot convert as TEXT in that column, where PostgreSQL
-   * refuses it at the server: `'abc'` in an INTEGER column, or `'true'` in a
-   * boolean one (stored 1/0), which `{ flag: true }` then never matches. A
-   * string that is a number (`'12.5'`, `'9007199254740993'`, `' 7 '`) is
-   * accepted and converted by SQLite, as before.
-   */
-  checkTextWrite(table: string, column: string, columnType: string, value: string): string | undefined {
-    if (!SQLITE_NUMERIC_COLUMN_TYPE.test(columnType.trim())) return undefined;
-    if (SQLITE_NUMERIC_LITERAL.test(value)) return undefined;
-    const boolean = /BOOL/i.test(columnType);
-    return (
-      `The string written to "${column}" on "${table}", a column of type ${columnType}, is not a number, so SQLite ` +
-      `would store it as text in that column; PostgreSQL refuses it. ` +
-      (boolean ? 'Write true or false.' : 'Write a number, or a string holding one, such as "12.5".')
-    );
-  },
-
-  buildReturningClause(selection: ReturningSelection = '*'): string {
-    if (selection !== '*' && selection.length === 0) return '';
-    return ` RETURNING ${selection === '*' ? '*' : selection.join(', ')}`;
-  },
-
-  buildInsertStatement(input: InsertStatementInput): string {
-    return (
-      `INSERT INTO ${input.table} (${input.columns.join(', ')}) ` +
-      `VALUES (${input.valuePlaceholders.join(', ')})${this.buildReturningClause(input.returning)}`
-    );
-  },
-
-  buildBulkInsertStatement(input: BulkInsertStatementInput) {
-    // No UNNEST in SQLite, emit multi-row VALUES with flattened, named
-    // placeholders (`:p1`, `:p2`, …) matching the flat param order.
-    let n = 0;
-    const placeholders = input.rowValues
-      .map((row) => `(${row.map(() => this.paramPlaceholder(++n)).join(', ')})`)
-      .join(', ');
-    const conflict = input.skipDuplicates ? ' ON CONFLICT DO NOTHING' : '';
-    return {
-      sql:
-        `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES ${placeholders}` +
-        `${conflict}${this.buildReturningClause(input.returning)}`,
-      params: input.rowValues.flat(),
-    };
-  },
-
-  buildBulkUpsertStatement(input: BulkUpsertStatementInput): BuiltStatement {
-    // VALUES, not `INSERT ... SELECT`: after a SELECT, SQLite cannot tell a
-    // trailing `ON CONFLICT` from the SELECT's own clauses. The rest is the
-    // PostgreSQL grammar (3.24 upsert, 3.35 RETURNING), `excluded` included.
-    let n = 0;
-    const tuples = input.rowValues.map((row) => `(${row.map(() => this.paramPlaceholder(++n)).join(', ')})`).join(', ');
-    const params = input.rowValues.flat();
-    return {
-      sql:
-        `INSERT INTO ${input.table} (${input.columns.join(', ')}) VALUES ${tuples} ` +
-        `ON CONFLICT (${input.conflictColumns.join(', ')}) ` +
-        onConflictAction(input, params, { target: input.table, incoming: 'excluded' }) +
-        this.buildReturningClause(input.returning),
-      params,
-    };
-  },
-
-  buildDefaultValuesInsertStatement(input: DefaultValuesInsertStatementInput): string {
-    // SQLite's `DEFAULT VALUES` inserts exactly one row and the engine accepts
-    // neither `VALUES (DEFAULT, …)` nor MySQL's empty `VALUES ()` tuple, so
-    // there is no multi-row all-defaults statement to emit.
-    if (input.rowCount !== 1) {
-      throw new UnsupportedFeatureError(
-        `createMany with ${input.rowCount} empty data rows`,
-        'sqlite',
-        'SQLite INSERT … DEFAULT VALUES inserts a single row and has no multi-row form; ' +
-          'issue one create({ data: {} }) per row.',
-      );
-    }
-    const conflict = input.skipDuplicates ? ' ON CONFLICT DO NOTHING' : '';
-    return `INSERT INTO ${input.table} DEFAULT VALUES${conflict}${this.buildReturningClause(input.returning)}`;
-  },
-
-  buildUpsertStatement(input: UpsertStatementInput): string {
-    return (
-      `INSERT INTO ${input.table} (${input.insertColumns.join(', ')}) VALUES (${input.valuePlaceholders.join(', ')})` +
-      ` ON CONFLICT (${input.conflictColumns.join(', ')}) DO UPDATE SET ${input.updateSetClauses.join(', ')}` +
-      // SQLite's upsert takes the same trailing conflict-UPDATE predicate as
-      // Postgres, so `supportsUpsertUpdateWhere` (inherited true) is honest and
-      // global filters restrict the UPDATE branch here too.
-      (input.updateWhere ? ` WHERE ${input.updateWhere}` : '') +
-      this.buildReturningClause(input.returning)
-    );
-  },
-
-  // A SQLite transaction is always SERIALIZABLE, which satisfies every level
-  // `$transaction({ isolationLevel })` can ask for, and the inherited
-  // `BEGIN ISOLATION LEVEL ...` is a syntax error here.
-  beginStatement(): string {
-    return 'BEGIN';
-  },
-
-  buildInsensitiveLike(column: string, paramRef: string): string {
-    // COLLATE NOCASE is ASCII-only (no Unicode case folding), documented limit.
-    return `${column} LIKE ${paramRef} COLLATE NOCASE`;
-  },
-
-  // UNREACHABLE while `supportsJsonContains` is false, and kept deliberately:
-  // it is the emulation this dialect would use if the encoding mismatch were
-  // repaired, and deleting it would delete the record of what was tried. The
-  // param is bound as JSON text (`'"gold"'`) while `json_each.value` yields the
-  // decoded SQL value (`gold`), so this predicate never holds for ANY operand.
-  // See `supportsJsonContains` in dialect.ts for the measurements and the shape
-  // a faithful version needs (`json_each.type` alongside the value).
-  buildJsonContains(column: string, paramRef: string): string {
-    return `EXISTS (SELECT 1 FROM json_each(${column}) WHERE json_each.value = ${paramRef})`;
-  },
-
-  buildJsonPathExtract(column: string, pathParamRef: string): string {
-    return `json_extract(${column}, ${pathParamRef})`;
-  },
-
-  // ---- Type mapping -------------------------------------------------------
-
-  typeToTypeScript(dialectType: string, nullable: boolean): string {
-    return sqliteTypeToTs(dialectType, nullable);
-  },
-
-  // SQLite has no true array columns; bulk insert uses multi-row VALUES, so no
-  // array cast is ever needed. Returning undefined disables the UNNEST path.
-  arrayType: undefined,
-
-  // ---- DDL ----------------------------------------------------------------
-
-  buildColumnType(input: ColumnTypeInput): string {
-    return sqliteColumnAffinity(input.type);
-  },
-
-  /** SQLite has no enum type: a TEXT column, and a CHECK that admits only the labels (compared exactly, BINARY collation). */
-  buildEnumColumn(column: string, labels: readonly string[]): { type: string; check: string } {
-    const literals = labels.map((label) => `'${label.replace(/'/g, "''")}'`);
-    return { type: 'TEXT', check: `${column} IN (${literals.join(', ')})` };
-  },
-
-  buildColumnDefinition(input: ColumnDefinitionInput): string {
-    const isSerial = /serial/i.test(input.type);
-    const parts: string[] = [input.name];
-    if (input.primaryKey && isSerial) {
-      // The canonical SQLite auto-increment PK (implicitly NOT NULL).
-      parts.push('INTEGER PRIMARY KEY AUTOINCREMENT');
-    } else {
-      parts.push(this.buildColumnType(input));
-      if (input.primaryKey) parts.push('PRIMARY KEY');
-      if (input.unique && !input.primaryKey) parts.push('UNIQUE');
-      if (input.notNull) parts.push('NOT NULL');
-    }
-    if (input.defaultValue != null) parts.push(`DEFAULT ${input.defaultValue}`);
-    if (input.references) parts.push(`REFERENCES ${input.references.table}(${input.references.column})`);
-    return parts.join(' ');
-  },
-
-  buildCreateIndexStatement(input: CreateIndexStatementInput): string {
-    return `CREATE INDEX IF NOT EXISTS ${input.name} ON ${input.table}(${input.columns.join(', ')});`;
-  },
-
-  buildCreateTableStatement(input: CreateTableStatementInput): string {
-    const body = input.definitions.map((d) => `    ${d}`).join(',\n');
-    return `CREATE TABLE ${input.table} (\n${body}\n);`;
-  },
-
-  // ---- Migration tracking -------------------------------------------------
-  // buildMigrationSelectApplied / UpdateChecksum / InsertApplied / DeleteApplied
-  // are inherited from postgresDialect: they call `this.paramPlaceholder(n)`
-  // (→ `?`) and `ON CONFLICT (name) DO NOTHING`, both valid SQLite. Only the
-  // tracking-table DDL (SERIAL / TIMESTAMPTZ) needs a SQLite-specific override.
-
-  buildMigrationTrackingTable(table: string): string {
-    return `
-  CREATE TABLE IF NOT EXISTS ${table} (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    checksum TEXT NOT NULL,
-    applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-`;
-  },
-
-  // ---- Streaming ----------------------------------------------------------
-
-  /**
-   * SQLite is in-process: the whole result set already lives in memory, so the
-   * "stream" simply fetches once via the pooled connection and yields the rows
-   * in `batchSize` chunks. No server-side cursor (and none needed).
-   */
-  async *openStream(
-    connection: StreamableConnection,
-    sql: string,
-    params: unknown[],
-    batchSize: number,
-  ): AsyncGenerator<Record<string, unknown>[], void, undefined> {
-    const result = await connection.query(sql, params);
-    for (let i = 0; i < result.rows.length; i += batchSize) {
-      yield result.rows.slice(i, i + batchSize);
-    }
-  },
-
-  // ---- Introspection ------------------------------------------------------
-
+  ...createPortableSqliteDialect({
+    declaredTypes: driverReportsDeclaredTypes,
+    decodeBlob: (value) => Uint8Array.from(Buffer.from(value, 'hex')),
+    recordBulkInsert: recordSqliteBulkInsert,
+  }),
   introspector: {
     async introspect(options) {
       return introspectSqlite(options);
@@ -1478,6 +1702,7 @@ interface PragmaColumn {
   notnull: number;
   dflt_value: string | null;
   pk: number;
+  hidden: number;
 }
 interface PragmaForeignKey {
   id: number;
@@ -1496,7 +1721,7 @@ interface PragmaIndex {
 interface PragmaIndexColumn {
   seqno: number;
   cid: number;
-  name: string;
+  name: string | null;
 }
 
 function pragma<T>(db: DatabaseSync, sql: string): T[] {
@@ -1518,21 +1743,37 @@ function pragma<T>(db: DatabaseSync, sql: string): T[] {
  */
 export function introspectSqliteDatabase(
   db: DatabaseSync,
-  options: Pick<IntrospectOptions, 'include' | 'exclude' | 'logger'> = {},
+  options: Pick<
+    CatalogIntrospectOptions,
+    'include' | 'exclude' | 'includeViews' | 'logger' | 'legacyToManyUniques'
+  > = {},
 ) {
   // ----- Tables (skip SQLite internal + the migration tracking table) -----
-  const candidateTables = pragma<{ name: string }>(
+  const catalogTables = pragma<{ name: string; sql: string | null }>(
     db,
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-  ).map((r) => r.name);
-  // include / exclude + default bookkeeping-table exclusions (F12), shared with
-  // every other introspector via applyTableFilters.
-  const tableNames = applyTableFilters(candidateTables, options);
+    options.includeViews === true
+      ? "SELECT name, sql FROM main.sqlite_master WHERE type IN ('table', 'view') AND substr(name, 1, 7) <> 'sqlite_' ORDER BY name"
+      : "SELECT name, sql FROM main.sqlite_master WHERE type = 'table' AND substr(name, 1, 7) <> 'sqlite_' ORDER BY name",
+  );
+  const candidateTables = catalogTables.map((t) => t.name);
+  const tableDefinitions = new Map(catalogTables.map((t) => [t.name, t.sql ?? '']));
+  let tableFlags: Map<string, { name: string; type: string; wr: number; strict: number }>;
+  // Keep option access before the existing table-list read. Native shadow
+  // classification adds per-call defaults; explicit include still restores them.
+  const tableNames = applyTableFilters(candidateTables, options, (defaults) => {
+    tableFlags = new Map(
+      pragma<{ name: string; type: string; wr: number; strict: number }>(db, 'PRAGMA main.table_list').map((t) => {
+        if (t.type === 'shadow') defaults.add(t.name);
+        return [t.name, t];
+      }),
+    );
+  });
   const tableSet = new Set(tableNames);
 
   const columnsByTable = new Map<string, ColumnMetadata[]>();
   const pkByTable = new Map<string, string[]>();
   const uniqueByTable = new Map<string, string[][]>();
+  const relationUniqueByTable = new Map<string, string[][]>();
   const indexesByTable = new Map<string, IndexMetadata[]>();
 
   interface FKEntry {
@@ -1548,19 +1789,40 @@ export function introspectSqliteDatabase(
     const q = (name: string) => `"${name.replace(/"/g, '""')}"`;
 
     // ----- Columns + primary key -----
-    const cols = pragma<PragmaColumn>(db, `PRAGMA table_info(${q(tableName)})`);
+    // table_xinfo also exposes computed columns (hidden = 2/3). Virtual-table
+    // hidden inputs (1) are not ordinary projected/writable columns.
+    const cols = pragma<PragmaColumn>(db, `PRAGMA main.table_xinfo(${q(tableName)})`).filter((c) => c.hidden !== 1);
+    const idxList = pragma<PragmaIndex>(db, `PRAGMA main.index_list(${q(tableName)})`);
+    const flags = tableFlags!.get(tableName);
+    const primaryColumns = cols.filter((c) => c.pk > 0);
+    // Only a sole INTEGER PK on a rowid table aliases the rowid. A separate
+    // PK index distinguishes the historical inline PRIMARY KEY DESC exception
+    // without parsing DDL; INT/BIGINT and WITHOUT ROWID keys never qualify.
+    const rowidKey =
+      flags?.wr === 0 && primaryColumns.length === 1 && !idxList.some((idx) => idx.origin === 'pk')
+        ? primaryColumns.find((c) => c.type.toUpperCase() === 'INTEGER')?.name
+        : undefined;
     const colMeta: ColumnMetadata[] = [];
     const pkCols: { name: string; order: number }[] = [];
     for (const c of cols) {
       const declared = c.type || '';
+      const generated = c.hidden === 2 || c.hidden === 3;
+      const nullable =
+        c.notnull === 0 && c.name !== rowidKey && !(c.pk > 0 && (flags?.wr === 1 || flags?.strict === 1));
+      const tsType = sqliteTypeToTs(declared, nullable);
       colMeta.push({
         name: c.name,
         field: snakeToCamel(c.name),
         dialectType: declared,
         pgType: declared,
-        tsType: sqliteTypeToTs(declared, c.notnull === 0 && c.pk === 0),
-        nullable: c.notnull === 0 && c.pk === 0,
-        hasDefault: c.dflt_value !== null || c.pk === 1,
+        tsType,
+        ...(tsType === `Uint8Array${nullable ? ' | null' : ''}` ? { inferredBinaryType: 'Uint8Array' as const } : {}),
+        nullable,
+        hasDefault: c.dflt_value !== null || c.name === rowidKey || generated,
+        ...(c.name === rowidKey ? { isGenerated: true } : {}),
+        // This existing flag means computed/non-writable to the generator and
+        // write guards, which is true for both SQLite VIRTUAL and STORED values.
+        ...(generated ? { isGeneratedStored: true } : {}),
         isArray: false,
         arrayType: undefined,
         pgArrayType: 'text[]',
@@ -1574,7 +1836,7 @@ export function introspectSqliteDatabase(
     );
 
     // ----- Foreign keys -----
-    const fks = pragma<PragmaForeignKey>(db, `PRAGMA foreign_key_list(${q(tableName)})`);
+    const fks = pragma<PragmaForeignKey>(db, `PRAGMA main.foreign_key_list(${q(tableName)})`);
     // Group by FK id (composite FKs share an id), ordered by seq.
     const fkById = new Map<number, FKEntry>();
     for (const fk of fks.sort((a, b) => a.id - b.id || a.seq - b.seq)) {
@@ -1596,7 +1858,7 @@ export function introspectSqliteDatabase(
     for (const entry of fkById.values()) {
       if (entry.targetColumns.length === 0) {
         // Implicit reference → the target table's primary key.
-        const targetPk = pragma<PragmaColumn>(db, `PRAGMA table_info(${q(entry.targetTable)})`)
+        const targetPk = pragma<PragmaColumn>(db, `PRAGMA main.table_xinfo(${q(entry.targetTable)})`)
           .filter((c) => c.pk > 0)
           .sort((a, b) => a.pk - b.pk)
           .map((c) => c.name);
@@ -1606,23 +1868,46 @@ export function introspectSqliteDatabase(
     }
 
     // ----- Indexes + unique constraints -----
-    const idxList = pragma<PragmaIndex>(db, `PRAGMA index_list(${q(tableName)})`);
     const idxMeta: IndexMetadata[] = [];
     const uniques: string[][] = [];
+    // An index's collation can differ from the relation comparison's column
+    // collation: UNIQUE BINARY can admit both 'a' and 'A' under NOCASE joins.
+    // Column collations are absent from table_xinfo. Conservatively keep the
+    // to-many shape if the table/index DDL mentions COLLATE (even in a comment
+    // or identifier), rather than promise a to-one on incomplete facts.
+    const tableHasCollation = /\bCOLLATE\b/i.test(tableDefinitions.get(tableName) ?? '');
+    const relationUniques = tableHasCollation ? [] : [pkByTable.get(tableName) ?? []];
     for (const idx of idxList) {
-      const idxCols = pragma<PragmaIndexColumn>(db, `PRAGMA index_info(${q(idx.name)})`)
-        .sort((a, b) => a.seqno - b.seqno)
-        .map((c) => c.name);
+      const keys = pragma<PragmaIndexColumn>(db, `PRAGMA main.index_info(${q(idx.name)})`).sort(
+        (a, b) => a.seqno - b.seqno,
+      );
+      const plain = keys.length > 0 && keys.every((c) => c.cid >= 0 && c.name !== null);
+      // Expression keys have no column name. Never let their null catalog
+      // placeholders reach metadata/codegen or treat the remaining names as a
+      // unique set. Keep the real DDL for partial/expression index consumers.
+      // `columns` must describe a complete plain key: shared consumers also
+      // derive compound selectors from it without parsing the definition.
+      const idxCols = plain ? keys.map((c) => c.name!) : [];
+      const catalog = db
+        .prepare("SELECT sql FROM main.sqlite_master WHERE type = 'index' AND name = ?")
+        .get(idx.name) as { sql: string | null } | undefined;
       idxMeta.push({
         name: idx.name,
         columns: idxCols,
         unique: idx.unique === 1,
-        definition: `${idx.unique === 1 ? 'UNIQUE ' : ''}INDEX ${idx.name} ON ${tableName}(${idxCols.join(', ')})`,
+        definition:
+          catalog?.sql ??
+          `${idx.unique === 1 ? 'UNIQUE ' : ''}INDEX ${q(idx.name)} ON ${q(tableName)}(${idxCols.map(q).join(', ')})`,
+        ...(idx.partial === 1 ? { partial: true } : {}),
       });
-      if (idx.unique === 1 && idxCols.length > 0) uniques.push(idxCols);
+      if (idx.unique === 1 && idx.partial === 0 && plain) {
+        uniques.push(idxCols);
+        if (!tableHasCollation && !/\bCOLLATE\b/i.test(catalog?.sql ?? '')) relationUniques.push(idxCols);
+      }
     }
     indexesByTable.set(tableName, idxMeta);
     uniqueByTable.set(tableName, uniques);
+    relationUniqueByTable.set(tableName, relationUniques);
   }
 
   // ----- Build relations from foreign keys (belongsTo + hasMany + m2m) -----
@@ -1633,7 +1918,19 @@ export function introspectSqliteDatabase(
   // pure-junction manyToMany auto-detection included.
   // One field per column, as the PostgreSQL introspector requires.
   for (const [tableName, cols] of columnsByTable) assertDistinctColumnFields(tableName, cols);
-  const relationsByTable = deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable, options.logger);
+  // A to-one is decided per foreign key BEFORE naming, so it is named as
+  // PostgreSQL names it (`users.profile`); the shared test is the libSQL and D1
+  // one, so every SQLite introspector gives the same answer.
+  const relationsByTable = deriveEngineRelations(
+    tableNames,
+    foreignKeys,
+    pkByTable,
+    columnsByTable,
+    options.logger,
+    options.legacyToManyUniques
+      ? undefined
+      : sqliteToOneForeignKey(columnsByTable, relationUniqueByTable, tableDefinitions, tableFlags!),
+  );
 
   // ----- Assemble TableMetadata -----
   const tables: Record<string, TableMetadata> = nullRecord<TableMetadata>();
@@ -1668,6 +1965,7 @@ export function introspectSqliteDatabase(
       uniqueColumns: uniqueByTable.get(tableName) ?? [],
       relations: relationsByTable.get(tableName) ?? nullRecord<RelationDef>(),
       indexes: indexesByTable.get(tableName) ?? [],
+      ...(tableFlags!.get(tableName)?.type === 'view' ? { isView: true } : {}),
     };
   }
 
@@ -1683,7 +1981,9 @@ export function introspectSqliteDatabase(
  * Note: introspecting `':memory:'` opens a *fresh, empty* database (memory DBs
  * are per-handle), so codegen should target a real file.
  */
-export async function introspectSqlite(options: IntrospectOptions): Promise<SchemaMetadata> {
+export async function introspectSqlite(
+  options: IntrospectOptions & Pick<CatalogIntrospectOptions, 'legacyToManyUniques' | 'includeViews'>,
+): Promise<SchemaMetadata> {
   const DatabaseSync = loadDatabaseSync();
   let db: DatabaseSync;
   try {
@@ -1694,7 +1994,13 @@ export async function introspectSqlite(options: IntrospectOptions): Promise<Sche
     );
   }
   try {
-    return introspectSqliteDatabase(db, { include: options.include, exclude: options.exclude, logger: options.logger });
+    return introspectSqliteDatabase(db, {
+      include: options.include,
+      exclude: options.exclude,
+      logger: options.logger,
+      legacyToManyUniques: options.legacyToManyUniques,
+      includeViews: options.includeViews,
+    });
   } finally {
     db.close();
   }
@@ -1749,6 +2055,7 @@ function openSqliteDatabase(target: string, options: TurbineSqliteOptions): Data
       // Some filesystems (network mounts) reject WAL, fall back silently.
     }
   }
+  unexposedNativeDatabases.add(db);
   return db;
 }
 
@@ -1778,9 +2085,22 @@ export function turbineSqlite(
 ): TurbineClient {
   const owns = typeof target === 'string';
   const db = owns ? openSqliteDatabase(target, options) : target;
+  return createSqliteBindingClient(db, schema, options, owns, sqliteDialect);
+}
+
+/** @internal Shared native SQLite lifecycle; bindings retain their own open and decode policy. */
+export function createSqliteBindingClient(
+  db: DatabaseSync,
+  schema: SchemaMetadata,
+  options: TurbineSqliteOptions,
+  owns: boolean,
+  dialect: Dialect,
+  arrayStatements?: WeakMap<object, NativeResultMethods>,
+): TurbineClient {
   let pool: SqlitePool;
   let client: TurbineClient;
   try {
+    if (arrayStatements) bindingArrayStatements.set(db, arrayStatements);
     pool = new SqlitePool(db, { busyTimeoutMs: options.busyTimeoutMs, schema });
     // Everything that is not a SQLite pragma is client config and rides through
     // untouched, so a new TurbineConfig option works here the day it lands. The
@@ -1790,7 +2110,7 @@ export function turbineSqlite(
       {
         ...clientConfig,
         pool,
-        dialect: sqliteDialect,
+        dialect,
         preparedStatements: false,
       },
       schema,

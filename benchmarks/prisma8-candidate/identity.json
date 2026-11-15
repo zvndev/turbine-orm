@@ -1,0 +1,105 @@
+{
+  "formatVersion": 1,
+  "name": "prisma8-postgres-candidate",
+  "canonicalBase": "6052829e9c83e8549fca48932b30e9448cafcc9f",
+  "runtime": {
+    "version": "v26.12.0",
+    "sha256": "caa24debe02770c92a70677e2a62ca98890150e7ac1c17bcfe31bcc98cc89943",
+    "platform": "linux",
+    "arch": "x64",
+    "distribution": "Node.js 26.12.0 binary; exact executable hash required"
+  },
+  "source": {
+    "orm": {
+      "tag": "v8.0.0-rc.23",
+      "commit": "557c0d4c1b1061b8fff954dc96598ff4db95d262",
+      "url": "https://github.com/prisma/orm/releases/tag/v8.0.0-rc.23"
+    },
+    "cli": {
+      "tag": "v8.0.0-rc.33",
+      "commit": "8285143a8c1af46a38c9f76f16b8df93559a3c9b",
+      "url": "https://github.com/prisma/prisma-cli/releases/tag/v8.0.0-rc.33"
+    }
+  },
+  "lockSha256": "75beeef9728c27197a13f07a8cb26d728237f0523307a732d3ffb90cb305a409",
+  "packages": {
+    "@prisma/cli-engine": {
+      "version": "0.9.0",
+      "integrity": "sha512-M53Xx/KiPQ02iT8FXT2c9X+3fVgMVfWK/emf/tq+jRNFi7b0Ffwaeo1yz8XS4UKOza5DaKRwMs+K8U44z9corg==",
+      "treeSha256": "f74a7667cfda065966cc8591f0bb295d67100a5b58ba42e8e45ce30aea6a37ca"
+    },
+    "@prisma/orm-family-sql": {
+      "version": "8.0.0-rc.23",
+      "integrity": "sha512-BRHwT0f83dXRiYPY0YYyUNocwuRdyLvVJZYZ3BNVZBoqiY4vxN4nbEo+mQpdwhemvrQ9C8AzJdK5dJt8vuVsSQ==",
+      "treeSha256": "9ad0f5d7c51070d0c4bc6ec5878caa7d5062aaf2a6b179ac849d0d93d4c21dc4"
+    },
+    "@prisma/orm-framework": {
+      "version": "8.0.0-rc.23",
+      "integrity": "sha512-iwPh/qcrRG4TgB5C8vPyK/qD8spOqi8yeKxMbyFqtylhRQJAbcrEVMhGba9C/CUvCdAiVvTvaO0XhvvTPrdL5w==",
+      "treeSha256": "53417f008d25f942cb078d649ab489d973d75f445dcd7face8bbc550e12e696a"
+    },
+    "@prisma/orm-postgres": {
+      "version": "8.0.0-rc.23",
+      "integrity": "sha512-RqhtQsmiuX2ULMG6MhCSeurD689OSHPLFOeBT622HItlLx6nXAazZTFaW+LvEBLQrdV0qIDcILX2CsWAK++ECQ==",
+      "treeSha256": "143ea4b7acf257085fd1859b9c0fa64e216d0b1ea0c6b2eb627a2becb810c3e3"
+    },
+    "@prisma/orm-target-postgres": {
+      "version": "8.0.0-rc.23",
+      "integrity": "sha512-WUo8q5FCMLd0RLuCPIrnYrH0QVIvw37HHAgzkUmshhJBN72NDrjTc38r06DxCeRBE09cN6wchMVVRM1xUfAQ+w==",
+      "treeSha256": "86ac1e93e68c5b0d17c1bd3e4152586d337ac99f9d7c57ee0ecbd78ac5886973"
+    },
+    "@prisma/orm-toolchain": {
+      "version": "8.0.0-rc.23",
+      "integrity": "sha512-mctCtrOZbT/xHjtHSGA+dNOpzJeAgtcwbJsz7NuGdxHRy2gy5x1eOG0dekAdi/ij2JVZ8EwlXQDBNRPKrgQqeA==",
+      "treeSha256": "6b42b752121fda9da8d75d1bd44034cedf61bf1a3f1304c76673aa397985f54c"
+    },
+    "@types/node": {
+      "version": "26.1.2",
+      "integrity": "sha512-Vu4a5UFA9rIIFJ7rB/Vaafh9lrCQszopTCx6KjFboXTGQbPNasehVR5TEiithSDGyd1DEiUByggTZsg8jukeIg==",
+      "treeSha256": "6438cfcdf13c69994565b6f141ff3ebc8038c5e63f9372a01a0ed5ce2dd83f1b"
+    },
+    "@types/pg": {
+      "version": "8.20.4",
+      "integrity": "sha512-Jz7UDOlIiFJuacC0TlBoLyNtmwlA/wpIyPDd3tvUqlRM+HzkWy2xUgpFpaXtbfTAFF6sIGq5lsCDBdJnhky1Xg==",
+      "treeSha256": "06671de189dbfcf27b1b0024abf5ee133837fb26c95ae4fa6da2ac570d816d63"
+    },
+    "pg": {
+      "version": "8.22.0",
+      "integrity": "sha512-8wih1vVIBMxoUM2oB4soJsD9tDnDpLv4OXBJ+EJzFsvycD+lfyIreC2gGHq78f8jbLLt+bvlPTFdFZfJkOuzAA==",
+      "treeSha256": "bad340b79e87aee34c03f5c65f6a16e85f65cce2ab7e3b2ecefb2ca26f177f2a"
+    },
+    "pg-cursor": {
+      "version": "2.22.1",
+      "integrity": "sha512-X10ldv3wwBONQkOSwgWEbaEITMGLd92V2Zd+xsFPhDt3nhhU3hpAT08SERBChnIFmomczLax6lKXLJrHPPXfxA==",
+      "treeSha256": "4ab5fdf221699789873c41868f9419213dda1218ee224939e04cd8209fce9087"
+    },
+    "prisma": {
+      "version": "8.0.0-rc.33",
+      "integrity": "sha512-l/HTB0GbzWwk6wG9T3k2EjpNXR14jRaf0CWju3WgY2AF5b0RTZUUXleT+S3ucO47qiSDF3Un3C09n+HAHs1KAA==",
+      "treeSha256": "1e306b1a35a4d3ea7df87b46233b386724d9e9f4f07be158c2cf86ed3d3a1df6"
+    },
+    "typescript": {
+      "version": "5.9.3",
+      "integrity": "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==",
+      "treeSha256": "30d8f39e2740e3436f2d822b43387f54c406ef52dfc2a8269db39d2a5daf20c6"
+    }
+  },
+  "files": {
+    "fixture/contract.prisma": "c1deb99e05b179b33e7e7ff6c86cf1b22292c9fee5dd61282e7693c802b228a4",
+    "fixture/contract.json": "85996b37cf71514ba3743b5df348f5a1d2d06edd2a74742e98a292f170de20c6",
+    "fixture/contract.d.ts": "74aaa4d3aab26be99f401d125aeb4559018b4e31101aff864864016df62a67df",
+    "fixture/postgres-service.mjs": "518afb59eccb3939793502625f658e234e580c99d14f270ad060443919592994",
+    "prisma.config.ts": "8ae506efb8fa5673c5218304c0a7163062658ecef068b1f0e66db8b16c5fa2cf",
+    "tsconfig.json": "0007b3e08593f133c826979af3f0a23d63044f907dc733315b67c09ca151b877",
+    "canonical/manifest.json": "efe51d36a2bbe70a65f41e7ab291d4b040e8708a3e807796efed8fd4bc24af1f",
+    "../../tooling/native-consumer-contracts/postgres-service.mjs": "d2b50fc6e7c390a65060b0d5c08f16e15f19ad8a66c707be0279586a06c6eb88",
+    "../../tooling/optional-pg-transports/lifecycle.mjs": "b3e4d7ac60e7bf91a6fc13070ce62fc466ae8c22d4ef1906da156b8fa19a8d60",
+    "../../tooling/optional-pg-transports/run.mjs": "deafa3cddafe9d656c8b3344f3c7b8d1ee7531a7fd665225ed2074773dcfabad",
+    "../../tooling/optional-pg-transports/harness.mjs": "027e0c83796b1e527a53e4ac5361a142e1bd5bf59a63ee3672eab086e8b4aa2a",
+    "../../src/test/fixtures/neon-http/native-lifecycle.mjs": "4b18bef2faa96ff1b210001b7f92bc58bcdee54e82b55179af216081510239d5",
+    "../../src/test/fixtures/neon-http/http-command-supervisor.py": "44ab9124fa4b56b3a31d3b1be46a28a70ce5c940dbb0501d387cfe4b33e222f3",
+    "../../tooling/optional-pg-transports/ownership-prerequisites.py": "ef6e4994a99760aa29188e9846b4f58742afa5edeee95db637728cf7581c43ca",
+    "../../tooling/optional-pg-transports/reason.mjs": "70abdaba55ba90143e5b5480a9261f5f758adfe97d5fedc67b080acb3860bb0f",
+    "../../tooling/lifecycle-examples/harness.mjs": "b0e03467945f46937bf5eb00c40c52f3fe0bd860c52c4cd0c707e9ed3b4989ad"
+  }
+}

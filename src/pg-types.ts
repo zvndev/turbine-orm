@@ -98,11 +98,49 @@ export interface PgCompatQueryConfig {
   values?: unknown[];
 }
 
+/** Optional, connection-owned incremental iteration. Absent on PostgreSQL. */
+export interface NativeStreamConnection {
+  /** A scoped facade checks its lifetime before handing out buffered rows too. */
+  assertStreamOpen?(): void;
+  /**
+   * At most `batchSize` rows per pull. The driver owns iterator cleanup on
+   * return, failure and connection release. This does not bound one row's
+   * bytes, nested JSON/fanout, or the database's execution workspace.
+   */
+  streamBatches?(
+    text: string,
+    values: unknown[],
+    batchSize: number,
+    signal?: AbortSignal,
+  ): AsyncGenerator<Record<string, unknown>[], void, undefined>;
+}
+
 /**
  * Minimal pg-compatible client used by TurbineClient for transactions.
  * `pg.PoolClient` satisfies this; so do Neon and Vercel's equivalents.
  */
-export interface PgCompatPoolClient {
+/**
+ * Optional driver recovery policy. Absent, Turbine's own native pg settlement
+ * applies: rollback is reported only on the server's word, and an unanswered
+ * COMMIT is `TransactionOutcomeUnknownError`.
+ */
+export interface TransactionRecovery {
+  assertTimeout(timeout: number): void;
+  timeoutError(timeout: number): Error;
+  readonly pendingMessage: string;
+  readonly sessionMessage: string;
+  /** Only a server acknowledgement establishes rollback. */
+  rollback(running: boolean, send: () => Promise<unknown>, graceMs: number): Promise<boolean>;
+  finish(
+    state: { end(how: 'was rolled back' | 'ended with an unknown outcome'): void },
+    clean: boolean,
+    error: unknown,
+    logger?: import('./logger.js').TurbineLogger,
+  ): unknown;
+}
+
+export interface PgCompatPoolClient extends NativeStreamConnection {
+  readonly transactionRecovery?: TransactionRecovery;
   query<R = Record<string, unknown>>(text: string, values?: unknown[]): Promise<PgCompatQueryResult<R>>;
   release(err?: Error | boolean): void;
   /**
@@ -129,6 +167,14 @@ export interface PgCompatPoolClient {
    * engine, in which case the callback runs unwrapped (zero behavior change).
    */
   wrapTransactionCallback?<R>(fn: () => Promise<R>): Promise<R>;
+  /**
+   * Optional engine seam: set once a COMMIT or ROLLBACK failure has left this
+   * connection's engine in an unknown state, so it refuses every statement
+   * (embedded PowDB, whose one handle is the whole database). A transaction
+   * whose cleanup ROLLBACK failed reports this error instead of its own, which
+   * would read as a clean rollback. Absent on every other engine.
+   */
+  readonly unusable?: Error;
 }
 
 /**
@@ -145,7 +191,16 @@ export interface PgCompatPoolClient {
  * const db = new TurbineClient({ pool: neonPool }, schema);
  * ```
  */
-export interface PgCompatPool {
+/** @internal Lifetime of a stream query's cancellation listener and delivery. */
+export interface StreamQuerySettlement {
+  promise: Promise<void>;
+  closed: boolean;
+}
+
+export interface PgCompatPool extends NativeStreamConnection {
+  readonly transactionRecovery?: TransactionRecovery;
+  /** @internal Run a stream statement within its transaction/savepoint scope. */
+  runStreamQuery?<T>(statement: () => Promise<T>, settled: StreamQuerySettlement): Promise<T>;
   query<R = Record<string, unknown>>(text: string, values?: unknown[]): Promise<PgCompatQueryResult<R>>;
   connect(): Promise<PgCompatPoolClient>;
   end(): Promise<void>;

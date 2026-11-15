@@ -369,7 +369,8 @@ const WITH_READS: Scenario[] = [
           limit: 1,
           with: { oeComments: { orderBy: { id: 'asc' }, select: { id: true, body: true, likes: true } } },
         },
-        oeProfiles: { select: { bio: true } },
+        // `oe_profiles.user_id` is unique, so this is the to-one `oeProfile`.
+        oeProfile: { select: { bio: true } },
       },
     }),
   ),
