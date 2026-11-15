@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
 import { resolveConfig } from '../cli/config.js';
@@ -157,13 +156,15 @@ describe('MSSQL CLI project contracts', () => {
         readFileSync(join(dir, 'index.ts'), 'utf8'),
         generateIndex(schema, { ...options, importMode: 'js' }),
       );
+      // An unknown target is refused before the output directory is touched.
+      const refused = join(dir, 'invalid-target');
+      assert.throws(
+        () => generate({ schema, target: 'sqlserver' as never, outDir: refused }),
+        /Unknown generation target/,
+      );
+      assert.equal(existsSync(refused), false);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
-    const missing = join(tmpdir(), 'turbine-mssql-invalid-target');
-    assert.throws(
-      () => generate({ schema, target: 'sqlserver' as never, outDir: missing }),
-      /Unknown generation target/,
-    );
   });
 });
