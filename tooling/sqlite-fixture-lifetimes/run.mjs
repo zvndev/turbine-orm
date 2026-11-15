@@ -31,7 +31,8 @@ const inputHashes = { observer: hash(observer), runner: hash(fileURLToPath(impor
 const identity = { inputHashes, pid: process.pid, ppid: process.ppid, childPid: child.pid, execPath: process.execPath, node: process.version, cwd: process.cwd(), argv, files, started: new Date().toISOString() };
 writeFileSync(resolve(out, 'command.json'), `${JSON.stringify(identity, null, 2)}\n`);
 let timedOut = false;
-const timer = setTimeout(() => { timedOut = true; process.kill(-child.pid, 'SIGKILL'); }, 600_000);
+// A hang guard, not a budget: the whole observed suite takes 8.5 to 10 minutes on CI runners.
+const timer = setTimeout(() => { timedOut = true; process.kill(-child.pid, 'SIGKILL'); }, 1_200_000);
 const forward = (signal) => { try { process.kill(-child.pid, signal); } catch {} };
 const interrupt = () => forward('SIGINT');
 const terminate = () => forward('SIGTERM');
