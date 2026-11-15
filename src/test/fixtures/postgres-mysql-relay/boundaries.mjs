@@ -157,14 +157,15 @@ try {
     };
     const result = await outcome(() => relay.relayBatch(tenant));
     assert.equal(result.resolved, false);
-    assert.equal(result.reason, reason);
+    assert.equal(result.reason.code, 'TURBINE_E021');
+    assert.equal(result.reason.cause, reason);
     assert.equal(relay.outstandingTargets, 0);
     hook = async () => {};
     await noAck(tenant, relay);
     assert.equal(await relay.relayBatch(tenant), 1);
   }
   report.passed.push(
-    'failed page-wrapper startup preserves all five original falsy rejections and releases its admission slot',
+    'failed page-wrapper startup reports an unknown commit outcome with each original falsy cause and releases its admission slot',
   );
 
   await relay.append('identity', input(20));
