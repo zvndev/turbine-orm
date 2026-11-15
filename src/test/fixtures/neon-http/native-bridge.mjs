@@ -124,25 +124,24 @@ export async function localBridge(pg, connectionString) {
         record.outcome = 'rolled-back';
       }
       if (record) record.error = { message: error.message, code: error.code, where: error.where };
-      const value = { message: error.message };
-      for (const key of [
-        'severity',
-        'code',
-        'detail',
-        'hint',
-        'position',
-        'internalPosition',
-        'internalQuery',
-        'schema',
-        'table',
-        'column',
-        'dataType',
-        'constraint',
-        'file',
-        'line',
-        'routine',
-      ])
-        if (error[key] !== undefined) value[key] = error[key];
+      const value = {
+        message: error.message,
+        severity: error.severity,
+        code: error.code,
+        detail: error.detail,
+        hint: error.hint,
+        position: error.position,
+        internalPosition: error.internalPosition,
+        internalQuery: error.internalQuery,
+        schema: error.schema,
+        table: error.table,
+        column: error.column,
+        dataType: error.dataType,
+        constraint: error.constraint,
+        file: error.file,
+        line: error.line,
+        routine: error.routine,
+      };
       res.writeHead(400, { 'content-type': 'application/json' });
       res.end(JSON.stringify(value));
     } finally {
