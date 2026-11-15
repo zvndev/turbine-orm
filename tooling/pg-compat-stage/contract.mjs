@@ -9,7 +9,7 @@ export { files, fileHashes, hashBytes, hashFile };
 export const source = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const packageVersion = JSON.parse(readFileSync(join(source, 'package.json'))).version;
 // Exact normal build includes binary provenance and native unique selectors.
-export const normalPin = 'ed3956956c0635b6ccba5dc91bc4b52b79f43cdf4ae5339a23536a864ac19496';
+export const normalPin = '0759d78e1a4befa3d1ea65c29d2dac0b46f787520737d6e53b7e4a65a5f8850c';
 export const pgPin = '8.22.0';
 export const jsonBytes = value => Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
 export function inputs(root = source) {
