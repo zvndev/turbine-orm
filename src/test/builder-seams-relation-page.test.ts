@@ -24,6 +24,7 @@ import { mysqlDialect } from '../mysql.js';
 import type { SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, sqliteDialect, turbineSqlite } from '../sqlite.js';
 import { makeQuery, mockTable, skipGate } from './helpers.js';
+import { closeSqliteAfter, sqliteFixtureScope } from './sqlite-fixture-lifetime.js';
 
 // biome-ignore lint/suspicious/noExplicitAny: the suites drive untyped accessors and args
 type Any = any;
@@ -308,12 +309,12 @@ describe('relation offset: rows per parent (live SQLite)', () => {
   let db: TurbineClient;
   let s: SchemaMetadata;
   lite.before(() => {
-    const raw = new DatabaseSync!(':memory:');
+    const raw = closeSqliteAfter(new DatabaseSync!(':memory:'), sqliteCleanup);
     raw.exec(SQLITE_DDL);
     s = introspectSqliteDatabase(raw);
     db = turbineSqlite(raw, s, { warnOnUnlimited: false });
   });
-  lite.after(async () => {
+  const sqliteCleanup = sqliteFixtureScope(async () => {
     if (db) await db.disconnect();
   });
 

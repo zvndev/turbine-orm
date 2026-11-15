@@ -26,7 +26,7 @@ const savePath = resolve(repoRoot, '.prepare-script.json');
 const text = readFileSync(pkgPath, 'utf8');
 
 // Capture indent / value / trailing-comma / line-ending of the `prepare` line
-// separately so we can both remove it cleanly and record its exact value.
+// separately to remove it cleanly and record its exact value.
 const lineRe = /^([ \t]*)"prepare":[ \t]*("(?:[^"\\]|\\.)*")([ \t]*,?)(\r?\n)/m;
 const match = text.match(lineRe);
 

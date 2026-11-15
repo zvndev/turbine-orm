@@ -1,0 +1,170 @@
+--- a/src/cli/config.ts
++++ b/src/cli/config.ts
+@@ -8,15 +8,18 @@
+ import { existsSync } from 'node:fs';
+ import { join, resolve } from 'node:path';
+ import { fileURLToPath, pathToFileURL } from 'node:url';
++import { assertD1Config, type D1LocalConfig } from './d1-config.js';
+ import { PASSWORD_QUERY_PARAM_PATTERN } from './ui.js';
+ 
+ // ---------------------------------------------------------------------------
+ // Config types
+ // ---------------------------------------------------------------------------
+ 
+-export type CliEngine = 'postgresql' | 'sqlite' | 'mysql' | 'mssql' | 'libsql';
++export type CliEngine = 'postgresql' | 'sqlite' | 'mysql' | 'mssql' | 'libsql' | 'd1';
+ 
+ export interface TurbineCliConfig {
++  /** Explicit persistent local Miniflare D1 binding. */
++  d1?: D1LocalConfig;
+   /** CLI database engine (default: postgresql). */
+   engine?: CliEngine;
+   /** Engine connection URL, or persistent SQLite filename / file URL. */
+@@ -288,6 +291,7 @@
+ // ---------------------------------------------------------------------------
+ 
+ export interface ResolvedConfig {
++  d1?: D1LocalConfig;
+   /** Optional for compatibility with older typed fixtures; resolution always sets it. */
+   engine?: CliEngine;
+   url: string;
+@@ -355,7 +359,7 @@
+ /** Validate config arguments with TypeError; the command boundary adds its E003 diagnostic. */
+ export function resolveCliEngine(engine: unknown): CliEngine {
+   if (engine === undefined) return 'postgresql';
+-  if (['postgresql', 'sqlite', 'mysql', 'mssql', 'libsql'].includes(engine as string)) return engine as CliEngine;
++  if (['postgresql', 'sqlite', 'mysql', 'mssql', 'libsql', 'd1'].includes(engine as string)) return engine as CliEngine;
+   throw new TypeError('Unknown CLI engine.');
+ }
+ 
+@@ -427,6 +431,7 @@
+ export function validateCliEngineUrl(engine: CliEngine, url: string): void {
+   // The libSQL route validates and normalizes with its real effect-free helper.
+   // This config-only entry deliberately avoids importing the native graph.
++  if (engine === 'd1' && url) throw new TypeError('Local D1 has no URL. Remove url and DATABASE_URL.');
+   if (!url || engine === 'libsql') return;
+   if (engine === 'mysql') {
+     mysqlDatabaseFromUrl(url);
+@@ -463,6 +468,7 @@
+   // Validate both supplied values, even when a flag would override a bad file value.
+   if (fileConfig.engine !== undefined) resolveCliEngine(fileConfig.engine);
+   const engine = resolveCliEngine(overrides.engine !== undefined ? overrides.engine : fileConfig.engine);
++  if (engine === 'd1') assertD1Config(fileConfig);
+   const url = firstNonEmpty(overrides.url, process.env.DATABASE_URL, fileConfig.url) ?? '';
+   validateCliEngineUrl(engine, url);
+   if (engine !== 'postgresql' && fileConfig.adapter !== undefined) {
+@@ -480,6 +486,7 @@
+   }
+   return {
+     engine,
++    d1: fileConfig.d1,
+     url: engine === 'sqlite' && url ? normalizeSqlitePath(url) : url,
+     out: option('out') ?? './generated/turbine',
+     schema:
+--- a/src/cli/index.ts
++++ b/src/cli/index.ts
+@@ -89,6 +89,8 @@
+ import type { SchemaDef } from '../schema-builder.js';
+ import { DestructivePushRefusal, driftWarnings, schemaDiff, schemaPush } from '../schema-sql.js';
+ import { type AppliedColumnTags, applyCodeFirstColumnTags, extractCodeFirstColumnTags } from './code-first-tags.js';
++import { assertD1Arguments, cmdD1Project, showD1Help } from './d1-project.js';
++import { assertD1Config } from './d1-config.js';
+ import type { CliEngine, CliOverrides, ConfigLoadError, ResolvedConfig, TurbineCliConfig } from './config.js';
+ import {
+   configTemplate,
+@@ -649,9 +651,9 @@
+ 
+     switch (arg) {
+       case '--engine':
+-        if (next !== 'postgresql' && next !== 'sqlite' && next !== 'mysql' && next !== 'mssql' && next !== 'libsql') {
++        if (next !== 'postgresql' && next !== 'sqlite' && next !== 'mysql' && next !== 'mssql' && next !== 'libsql' && next !== 'd1') {
+           failArg(
+-            `Unknown CLI engine ${JSON.stringify(next ?? '')}. Use --engine postgresql, --engine sqlite, --engine mysql, --engine mssql or --engine libsql.`,
++            `Unknown CLI engine ${JSON.stringify(next ?? '')}. Use --engine postgresql, --engine sqlite, --engine mysql, --engine mssql or --engine libsql or --engine d1.`,
+           );
+         }
+         result.engine = next;
+@@ -6281,7 +6283,7 @@
+   console.log(`  Use capabilities, schema [table], compile '<json>', or explain-error <code> for one JSON result.`);
+   newline();
+   console.log(`  ${bold('Options:')}`);
+-  console.log(`    ${cyan('--engine')} ${dim('<name>')}     postgresql (default), sqlite, mysql, mssql or libsql`);
++  console.log(`    ${cyan('--engine')} ${dim('<name>')}     postgresql (default), sqlite, mysql, mssql, libsql or d1`);
+   console.log(
+     `    ${cyan('--url, -u')} ${dim('<url>')}       Postgres/MySQL/SQL Server connection string or existing SQLite file`,
+   );
+@@ -6392,7 +6394,7 @@
+ 
+   console.log(`  ${bold('Options:')}`);
+   console.log(
+-    `    ${cyan('--engine')} ${dim('<name>')}     postgresql (default), sqlite, mysql, mssql or libsql; use migrate --engine sqlite --help for its workflow; generate --engine mysql --help or generate --engine mssql --help`,
++    `    ${cyan('--engine')} ${dim('<name>')}     postgresql (default), sqlite, mysql, mssql, libsql or d1; use migrate --engine sqlite --help for its workflow; generate --engine mysql --help or generate --engine mssql --help`,
+   );
+   console.log(
+     `    ${cyan('--acknowledge-partial-ddl')}  MySQL migrate recover only; manually reconcile partial DDL first`,
+@@ -6633,6 +6635,8 @@
+ async function main() {
+   let args: CliArgs;
+   try {
++    const preflightRaw = process.argv.slice(2);
++    if (preflightRaw.some((token, i) => token === '--engine' && preflightRaw[i + 1] === 'd1')) assertD1Arguments(preflightRaw);
+     args = parseArgs();
+     const rawArgs = process.argv.slice(2);
+     if (args.engine === 'libsql' || rawArgs.some((token, i) => token === '--engine' && rawArgs[i + 1] === 'libsql')) {
+@@ -6682,7 +6686,7 @@
+   let libsqlConfigHelp = false;
+   if (args.help && args.engine === undefined && findConfigFile()) {
+     if (needsTsLoader(findConfigFile())) await registerTsLoader();
+-    libsqlConfigHelp = (await loadConfigResult(undefined, importSeedModule)).config.engine === 'libsql';
++    libsqlConfigHelp = ['libsql', 'd1'].includes((await loadConfigResult(undefined, importSeedModule)).config.engine ?? '');
+   }
+   const configCommandHelp =
+     args.help &&
+@@ -6690,6 +6694,7 @@
+     (canonicalCommand(args.command) === 'migrate' || canonicalCommand(args.command) === 'seed' || libsqlConfigHelp) &&
+     !!findConfigFile();
+   if (args.help && !configCommandHelp) {
++    if (args.engine === 'd1') { showD1Help(); return; }
+     if (args.engine === 'libsql') {
+       if (canonicalCommand(args.command) === 'migrate') showLibsqlMigrateHelp();
+       else if (canonicalCommand(args.command) === 'seed') showLibsqlSeedHelp();
+@@ -6799,6 +6804,17 @@
+       warn(`Could not load ${cyan(loadError.filename)}: ${underlying}`);
+       if (loadError.error instanceof Error) printCjsHintIfApplicable(loadError.error);
+       newline();
++    }
++
++    if (config.engine === 'd1') {
++      if (loadError) throw new ValidationError(`Could not load ${loadError.filename}: ${errorText(loadError.error)}`);
++      assertD1Config(fileConfig);
++      if (args.command === 'init' && findConfigFile() && fileConfig.engine !== 'd1') throw new ValidationError('Existing config selects a different database engine.');
++      const d1Config = args.command === 'init' && !findConfigFile()
++        ? { ...config, d1: { binding: 'DB', databaseId: 'turbine-local', persist: './.turbine/d1' } }
++        : config;
++      await cmdD1Project(args.command, args, d1Config, process.argv.slice(2));
++      return;
+     }
+ 
+     if (config.engine === 'libsql') {
+--- a/package.json
++++ b/package.json
+@@ -442,7 +442,8 @@
+     "mysql2": "^3.0.0",
+     "@neondatabase/serverless": "^1.2.0",
+     "@libsql/client": "^0.18.0",
+-    "better-sqlite3": "^12.11.1"
++    "better-sqlite3": "^12.11.1",
++    "miniflare": "4.20260730.0"
+   },
+   "peerDependenciesMeta": {
+     "@zvndev/powdb-client": {
+@@ -464,6 +465,9 @@
+       "optional": true
+     },
+     "better-sqlite3": {
++      "optional": true
++    },
++    "miniflare": {
+       "optional": true
+     }
+   },

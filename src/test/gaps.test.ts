@@ -1,7 +1,7 @@
 /**
  * turbine-orm, High-priority gap tests
  *
- * Targeted second pass after comprehensive.test.ts. Each test fills a gap
+ * Additional integration cases beyond comprehensive.test.ts. Each test covers
  * identified in docs/internal/TEST-MATRIX.md that wasn't already covered. Focus areas:
  *   - Multi-column orderBy (mixed asc/desc)
  *   - Edge-case operator inputs (`in: []`, `limit: 0`, `limit: 1`, very large limit)
@@ -152,7 +152,7 @@ testFn('high-priority gap tests', () => {
         where: { id: { in: ids } },
         limit: 1000,
       });
-      // Should match users where id is between 1..250 (we have 100 users, ids 1..100)
+      // Should match users where id is between 1..250 (the fixture has 100 users, ids 1..100)
       assert.ok(users.length > 0);
       assert.ok(users.length <= 250);
       for (const u of users) {

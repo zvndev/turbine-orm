@@ -16,6 +16,7 @@ import { defineSchema } from '../schema-builder.js';
 import { schemaDefToMetadata } from '../schema-metadata.js';
 import { schemaToSQL } from '../schema-sql.js';
 import { skipGate } from './helpers.js';
+import { closeSqliteAfter, sqliteFixtureScope } from './sqlite-fixture-lifetime.js';
 
 const hasSqlite = (() => {
   try {
@@ -25,11 +26,7 @@ const hasSqlite = (() => {
     return false;
   }
 })();
-const {
-  it: sqliteIt,
-  before: sqliteBefore,
-  after: sqliteAfter,
-} = skipGate(!hasSqlite, 'requires node:sqlite (Node >= 22.5)');
+const { it: sqliteIt, before: sqliteBefore } = skipGate(!hasSqlite, 'requires node:sqlite (Node >= 22.5)');
 
 /**
  * Decoding a column the schema declares needs the driver to name each result
@@ -77,9 +74,9 @@ describe('sqlite value fidelity (schema-declared types)', () => {
     const { turbineSqlite } = await import('../sqlite.js');
     const { sqliteDialect } = await import('../sqlite.js');
     const { DatabaseSync } = createRequire(process.cwd())('node:sqlite') as {
-      DatabaseSync: new (p: string) => { exec(sql: string): void };
+      DatabaseSync: new (p: string) => import('node:sqlite').DatabaseSync;
     };
-    const raw = new DatabaseSync(':memory:');
+    const raw = closeSqliteAfter(new DatabaseSync(':memory:'), sqliteCleanup);
     for (const sql of schemaToSQL(DEF, { dialect: sqliteDialect })) raw.exec(sql);
     db = turbineSqlite(raw as never, SCHEMA, { warnOnUnlimited: false }) as Db;
     await tbl('ff_teams').createMany({ data: [{ id: 1, name: 'a' }] });
@@ -91,7 +88,7 @@ describe('sqlite value fidelity (schema-declared types)', () => {
       ],
     });
   });
-  sqliteAfter(async () => {
+  const sqliteCleanup = sqliteFixtureScope(async () => {
     await db?.disconnect();
   });
 

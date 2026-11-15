@@ -1,0 +1,33 @@
+{
+  "format": "mysql-streaming-portable-evidence-v1",
+  "sourceHead": "77cfe8fd25380b14e9a557005b7a3d4d8646905a",
+  "sourceSha256": "bac55f8be550b58aef15622c2c16628d35c18ca1d4a5c64fa2ddaa199438ee51",
+  "harnessSha256": "8e353b021d6abad0bf610a375d85557a567efc8321c1623fdcb6b26bd9edc3d4",
+  "inheritedArtifact": {
+    "sha256": "85317d7ae1c02fe5160402508fbb3600073d2bbe261d9efba3509939367a711f",
+    "exercised": false
+  },
+  "samples": 176,
+  "nativeControls": 12,
+  "lateSignalControls": 2,
+  "files": {
+    "native.json.gz": {
+      "sha256": "18b1b9be901289e2043b4eb4541080052ac3289d2613d1eeb104688a8e5795ee",
+      "bytes": 113473
+    },
+    "controls.json.gz": {
+      "sha256": "7cf876194cd237f698e0d1e49197321fc385dbee7132a3be45f3ac7b5f7cec5e",
+      "bytes": 3144
+    },
+    "cleanup.json.gz": {
+      "sha256": "3b689dce9f0f6986c617a8e7ed7e7a26c785c489b02ec2ece22c79666686109a",
+      "bytes": 4094
+    },
+    "guards.json.gz": {
+      "sha256": "e8d34d6672b89527a91af8b6116f393cf4749bfb3fee515e60bfee6e2c89d29b",
+      "bytes": 686
+    }
+  },
+  "claims": "Branch source observations only. No integrated-head, all-memory bound, speed winner or certification claim.",
+  "pathRedaction": "Checkout and exact Node executable paths replaced only in the portable copy. Original local reports retain exact commands."
+}

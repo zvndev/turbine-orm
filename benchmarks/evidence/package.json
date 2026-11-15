@@ -1,0 +1,26 @@
+{
+  "name": "turbine-comparative-evidence",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.10.0"
+  },
+  "scripts": {
+    "test": "tsx --test guards.test.mjs",
+    "run": "tsx run.mjs",
+    "run:postgres": "tsx with-postgres.mjs",
+    "validate": "tsx validate.mjs",
+    "summarize": "tsx summarize.mjs",
+    "verify:pins": "node verify-pins.mjs",
+    "run:mysql": "tsx with-mysql.mjs",
+    "test:mysql": "tsx --test mysql-live.test.mjs"
+  },
+  "dependencies": {
+    "drizzle-stable": "npm:drizzle-orm@0.45.4",
+    "drizzle-candidate": "npm:drizzle-orm@1.0.0-rc.5",
+    "pg": "8.23.1",
+    "mysql2": "3.24.6",
+    "mssql": "11.0.2",
+    "tsx": "4.23.15"
+  }
+}

@@ -140,7 +140,7 @@ describe('stress: deep nesting (up to depth 9)', () => {
 
     // users -> posts -> comments -> post (back to posts is a cycle, so go author instead)
     // Actually, comments->author goes to users which IS in the path already.
-    // Let's do: users -> posts -> comments (3 levels of nesting)
+    // users -> posts -> comments (3 levels of nesting)
     const deferred = q.buildFindMany({
       with: {
         posts: {
@@ -162,7 +162,7 @@ describe('stress: deep nesting (up to depth 9)', () => {
 
   it('builds a query with depth 9 on a long chain schema', () => {
     // Build a chain of 10 tables: t0 -> t1 -> t2 -> ... -> t9
-    // That gives us depth 9 (0-indexed), which is below the limit of 10
+    // That gives depth 9 (0-indexed), which is below the limit of 10
     const tables: Record<string, TableMetadata> = {};
 
     for (let i = 0; i < 10; i++) {
@@ -328,7 +328,7 @@ describe('stress: depth limit (10)', () => {
   });
 
   it('succeeds at exactly depth 9 but fails at depth 10', () => {
-    // Build 13 tables: t0..t12 so we can test both passing and failing depths.
+    // Build 13 tables: t0..t12 to test both passing and failing depths.
     // Each buildRelationSubquery call increments depth by 1:
     //   buildSelectWithRelations(t0, depth=undefined) -> buildRelationSubquery(t0->t1, depth=0)
     //   -> nested buildRelationSubquery(t1->t2, depth=1) -> ... -> depth=N-1 for N with levels
@@ -581,7 +581,7 @@ describe('stress: wide with clause', () => {
       assert.ok(deferred.sql.includes(`"child_${i}"`), `should include child_${i} table reference`);
     }
 
-    // Verify we have 12 AS aliases for the relation subqueries
+    // Verify there are 12 AS aliases for the relation subqueries
     for (let i = 0; i < 12; i++) {
       assert.ok(deferred.sql.includes(`AS "child_${i}"`), `should include AS "child_${i}" alias`);
     }

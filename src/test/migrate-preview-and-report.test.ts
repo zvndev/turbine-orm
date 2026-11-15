@@ -57,7 +57,7 @@ interface CliRun {
   output: string;
 }
 
-/** Block the current thread; `execFileSync` gives us nowhere to await. */
+/** Block the current thread; `execFileSync` cannot await asynchronous work. */
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }

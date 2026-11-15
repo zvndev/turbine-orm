@@ -43,10 +43,11 @@
  */
 
 import { ValidationError } from '../errors.js';
+import { normalizePagination, resolveRelation, resolveRelationDef } from '../query-utils.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
+import { assertCursorPredicateOption, refuseTupleCursor } from './cursor-tuple.js';
 import { isEmptyOrderBy } from './filters.js';
 import type { WithClause, WithCount, WithOptions, WithOrderByObject } from './types.js';
-import { normalizePagination, resolveRelation, resolveRelationDef } from './utils.js';
 
 /** Depth cap mirroring the builder's own, so a cyclic `with` cannot spin here. */
 const MAX_DEPTH = 12;
@@ -101,6 +102,10 @@ export function normalizeWithClause(
 function normalizeSpec(schema: SchemaMetadata, target: string, spec: unknown, depth: number): unknown {
   if (spec === true || spec === false || spec === null || typeof spec !== 'object') return spec;
   const opts = spec as WithOptions;
+  if ((spec as Record<string, unknown>).cursorPredicate !== undefined) {
+    assertCursorPredicateOption(spec as Record<string, unknown>, false);
+    refuseTupleCursor('Nested cursorPredicate is unsupported; query the related table.');
+  }
   if (!opts.with) return spec;
   const nested = normalizeWithClause(schema, target, opts.with as WithClause, depth + 1);
   return nested === opts.with ? spec : { ...opts, with: nested };
@@ -150,6 +155,16 @@ function normalizeCount(meta: TableMetadata, count: WithCount | undefined): With
  * orders every relation allocates nothing and its SQL/fingerprint stay
  * byte-identical.
  */
+/** Primary-key ordering shared by root and relation pagination. */
+export function primaryKeyOrderBy(
+  meta: TableMetadata | undefined,
+): WithOrderByObject | WithOrderByObject[] | undefined {
+  const pk = meta?.primaryKey ?? [];
+  if (!meta || pk.length === 0) return undefined;
+  const fields = pk.map((column) => meta.reverseColumnMap[column] ?? column);
+  return fields.length === 1 ? { [fields[0]!]: 'asc' } : fields.map((field) => ({ [field]: 'asc' as const }));
+}
+
 export function applyStableRelationOrderTo(
   schema: SchemaMetadata,
   withClause: WithClause,
@@ -175,12 +190,7 @@ export function applyStableRelationOrderTo(
     const hasOrder = options.orderBy !== undefined && !isEmptyOrderBy(options.orderBy);
     let synthOrder: WithOrderByObject | WithOrderByObject[] | undefined;
     if (isToMany && !hasOrder) {
-      const targetMeta = schema.tables[rel.to];
-      const pk = targetMeta?.primaryKey ?? [];
-      if (targetMeta && pk.length > 0) {
-        const pkFields = pk.map((c) => targetMeta.reverseColumnMap[c] ?? c);
-        synthOrder = pkFields.length === 1 ? { [pkFields[0]!]: 'asc' } : pkFields.map((f) => ({ [f]: 'asc' as const }));
-      }
+      synthOrder = primaryKeyOrderBy(schema.tables[rel.to]);
     }
 
     if (!synthOrder && !nestedChanged) continue; // nothing to change, keep the ref

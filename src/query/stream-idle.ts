@@ -20,6 +20,7 @@
  */
 
 import { TimeoutError, ValidationError } from '../errors.js';
+import type { NativeStreamConnection } from '../pg-types.js';
 
 /** The default for `streamIdleTimeoutMs` (client) and `idleTimeoutMs` (per call). */
 export const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300_000;
@@ -72,6 +73,13 @@ export interface StreamIdleState {
   rows: number;
   /** Set when the guard closed the stream; the next pull throws it. */
   expired: TimeoutError | undefined;
+  /** First accepted abort, including non-Error reasons. */
+  cancelled?: { reason: unknown };
+}
+
+export function assertStreamActive(state: StreamIdleState): void {
+  if (state.expired) throw state.expired;
+  if (state.cancelled) throw state.cancelled.reason;
 }
 
 export function newStreamIdleState(): StreamIdleState {
@@ -138,7 +146,7 @@ export class StreamIdleGuard {
   private idleTicks = 0;
   private lastStatementAt = Date.now();
   private statementsInFlight = 0;
-  private keepaliveInFlight = false;
+  private keepaliveInFlight: Promise<void> | undefined;
   /** Settles once an expired stream's cleanup has run (connection released). */
   expiry: Promise<void> | undefined;
 
@@ -171,6 +179,11 @@ export class StreamIdleGuard {
     clearInterval(this.timer);
   }
 
+  /** A new cursor statement must not cancel a keepalive queued ahead of it. */
+  waitForKeepalive(): Promise<void> | undefined {
+    return this.keepaliveInFlight;
+  }
+
   private tick(): void {
     if (this.expiry) return;
     if (!this.state.suspended || this.state.pulls !== this.lastPulls) {
@@ -189,14 +202,14 @@ export class StreamIdleGuard {
       this.statementsInFlight === 0 &&
       Date.now() - this.lastStatementAt >= this.timeoutMs / 2
     ) {
-      this.keepaliveInFlight = true;
       this.statementStarted();
       // A failed keepalive is not reported here: the stream's next statement
       // meets the same broken connection and reports it with context.
-      this.keepalive()
+      this.keepaliveInFlight = this.keepalive()
+        .then(() => undefined)
         .catch(() => undefined)
         .finally(() => {
-          this.keepaliveInFlight = false;
+          this.keepaliveInFlight = undefined;
           this.statementSettled();
         });
     }
@@ -204,8 +217,24 @@ export class StreamIdleGuard {
 }
 
 /** The connection surface a stream drives; structurally `StreamableConnection` in dialect.ts. */
-interface StreamConnection {
+interface StreamConnection extends NativeStreamConnection {
   query(text: string, values?: unknown[]): Promise<{ rows: Record<string, unknown>[] }>;
+}
+
+/** Guard each native pull while retaining cleanup after guard failures and return(). */
+export async function* guardNativeStream<T>(
+  stream: AsyncGenerator<T, void, undefined>,
+  pull: () => Promise<IteratorResult<T, void>>,
+): AsyncGenerator<T, void, undefined> {
+  try {
+    while (true) {
+      const step = await pull();
+      if (step.done) return;
+      yield step.value;
+    }
+  } finally {
+    await stream.return(undefined);
+  }
 }
 
 /**
@@ -223,20 +252,32 @@ export function watchStreamConnection(
   backstop?: { begin: string; statement: string },
 ): StreamConnection {
   let backstopSent = false;
-  return {
+  const run = async <T>(statement: () => Promise<T>): Promise<T> => {
+    const g = guard();
+    if (g?.waitForKeepalive()) await g.waitForKeepalive();
+    g?.statementStarted();
+    try {
+      return await statement();
+    } finally {
+      g?.statementSettled();
+    }
+  };
+  const watched: StreamConnection = {
     query: async (text, values) => {
       let sql = text;
       if (backstop && !backstopSent && values === undefined && text === backstop.begin) {
         backstopSent = true;
         sql = `${text}; ${backstop.statement}`;
       }
-      const g = guard();
-      g?.statementStarted();
-      try {
-        return await base.query(sql, values);
-      } finally {
-        g?.statementSettled();
-      }
+      return run(() => base.query(sql, values));
     },
   };
+  if (base.streamBatches) {
+    if (base.assertStreamOpen) watched.assertStreamOpen = () => base.assertStreamOpen!();
+    watched.streamBatches = (text, values, batchSize, signal) => {
+      const stream = base.streamBatches!(text, values, batchSize, signal);
+      return guardNativeStream(stream, () => run(() => stream.next()));
+    };
+  }
+  return watched;
 }

@@ -8,7 +8,7 @@
     "db:generate": "npx turbine generate"
   },
   "dependencies": {
-    "@neondatabase/serverless": "^0.10.0",
+    "@neondatabase/serverless": "^1.2.0",
     "turbine-orm": "file:../../"
   },
   "devDependencies": {

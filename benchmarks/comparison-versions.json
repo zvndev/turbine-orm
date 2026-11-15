@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "registryCheckedAt": "2026-11-06T14:09:34.006518+00:00",
+  "registry": "https://registry.npmjs.org/",
+  "scope": "Benchmark dependencies only; installed versions and native runtime/server settings must accompany each campaign.",
+  "arms": {
+    "drizzleStable": "0.45.4",
+    "drizzleCandidate": "1.0.0-rc.5",
+    "prismaMatched": "7.10.1"
+  },
+  "drivers": {
+    "pg": "8.23.1",
+    "mysql2": "3.24.6",
+    "better-sqlite3": "12.11.1",
+    "prismaMysqlAdapterDriver": "mariadb@3.5.4"
+  },
+  "prismaCandidate": {
+    "cliLatest": "8.0.0-rc.30",
+    "matchingClientAvailable": false,
+    "matchingPgAdapterAvailable": false,
+    "result": "Registry lookup returned E404 for matching client and adapter. Do not pair this CLI with a different client or label 7.10.1 as Prisma 8."
+  },
+  "sqliteDriverChoice": "12.11.1 is the current 12.x better-sqlite3 release compatible with Prisma adapter 7.10.1 (^12.6.0). The overall better-sqlite3 latest is 13.0.3; it is not substituted for that declared adapter dependency. Turbine uses node:sqlite. Record the actual SQLite versions separately.",
+  "comparisonStatus": "Setup only. No current full campaign results or speed claim."
+}

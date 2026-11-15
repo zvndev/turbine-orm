@@ -1,0 +1,33 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "..",
+    "noEmit": true
+  },
+  "include": [
+    "bench-interleaved.ts",
+    "bench.ts",
+    "verify-arms.ts",
+    "bench-harness.ts",
+    "equivalence.ts",
+    "dashboard.ts",
+    "schema.ts",
+    "schema-rc.ts",
+    "bench-extended.ts",
+    "extended-*.ts",
+    "secondary-*.ts",
+    "bench-stream-parity.ts",
+    "bench-latency.ts",
+    "deepoffset.ts",
+    "build-results.ts",
+    "comparison-results*.ts",
+    "bench-mysql.ts",
+    "mysql-*.ts",
+    "bench-sqlite.ts",
+    "sqlite-*.ts",
+    "../types/**/*.d.ts"
+  ],
+  "exclude": [
+    "node_modules"
+  ]
+}

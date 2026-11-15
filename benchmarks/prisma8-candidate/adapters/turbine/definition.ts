@@ -1,0 +1,31 @@
+export const supported = [
+  ...[0, 1, 2, 3, 4, 5, 6, 9, 10].map((n) => `headline-${n}`),
+  'comments-5000',
+  'comments-50000',
+  'wide-1000',
+  'list-page3',
+  'list-deep',
+  'to-one',
+  'many-to-many',
+  'relation-count',
+  'relation-filter',
+  'group-by',
+  'create-many',
+  'update',
+  'upsert',
+  'delete',
+  'dashboard-independent',
+  'dashboard-sequential',
+] as const;
+
+export const policy = {
+  route: 'BUFFERED full drain; complete findMany result before iteration; no native cursor claim',
+  diagnostics: { mode: 'production', cacheCheck: 'off', advice: false },
+  logging: false,
+  warnOnUnlimited: false,
+  preparedStatements: true,
+  prepared: 'native bounded fixed-arity names; variable-arity statements unnamed; no Prisma name parity claim',
+  relationLoadStrategy: 'join',
+  defaultLimit: 'unset; unlimited',
+  utcTimestamps: true,
+} as const;

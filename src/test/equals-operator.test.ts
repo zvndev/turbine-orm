@@ -3,7 +3,7 @@
  *
  * README and the site docs document `{ email: { equals: 'a@b.com' } }` as
  * explicit equality, the most common operator a migrating Prisma user types.
- * Before this fix, `equals` was only recognized as a JSONB filter key and
+ * Previously, `equals` was only recognized as a JSONB filter key and
  * threw ValidationError on non-JSON columns. These tests pin the documented
  * contract:
  *

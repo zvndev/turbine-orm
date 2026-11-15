@@ -1,0 +1,94 @@
+--- a/tooling/consumer-cost/profiles.json
++++ b/tooling/consumer-cost/profiles.json
+@@ -50,6 +50,39 @@
+       "entry": "turbine-orm/mssql/seed",
+       "drivers": {},
+       "initialization": "unavailable: runMssqlSeed requires a native SQL Server connection/catalog/transaction; declaration-only import without the optional mssql peer"
++    },
++    "core": {
++      "entry": "turbine-orm/core",
++      "drivers": {
++        "pg": "8.23.1"
++      },
++      "initialization": "Unconnected supplied pg.Pool and turbineCore; mandatory installed pg retained"
++    },
++    "neon-ws": {
++      "entry": "turbine-orm/neon-ws",
++      "drivers": {
++        "@neondatabase/serverless": "1.2.0"
++      },
++      "initialization": "unavailable: factory opens transport resources; import and strict public declarations only, no hosted scope"
++    },
++    "neon-http": {
++      "entry": "turbine-orm/neon-http",
++      "drivers": {
++        "@neondatabase/serverless": "1.2.0"
++      },
++      "initialization": "unavailable: requires supplied HTTP query function; import and strict public declarations only"
++    },
++    "notification-hub": {
++      "entry": "turbine-orm/notification-hub",
++      "drivers": {
++        "pg": "8.23.1"
++      },
++      "initialization": "Unsubscribed hub with owned unconnected pg.Pool; no LISTEN or native execution"
++    },
++    "live-query": {
++      "entry": "turbine-orm/live-query",
++      "drivers": {},
++      "initialization": "unavailable: application supplies query and subscription; no native initialization dimension"
+     }
+   }
+ }
+--- a/scripts/measure-consumer-cost-fixtures.mjs
++++ b/scripts/measure-consumer-cost-fixtures.mjs
+@@ -1,5 +1,6 @@
+ // These sources are copied into isolated consumers; all package imports use public exports.
+ export function profileSource(name) {
++  if (optionalRuntime[name]) return optionalRuntime[name];
+   const schema = 'const schema = { tables: {}, enums: {} };\n';
+   switch (name) {
+     case 'postgres':
+@@ -171,6 +172,7 @@
+ 
+ // Separate correctness processes: no assertion/helper work enters runtime timings.
+ export function profileBehaviorSource(name) {
++  if (optionalBehavior[name]) return "import assert from 'node:assert/strict';\nimport * as entry from './entry.mjs';\n" + optionalBehavior[name];
+   const header = "import assert from 'node:assert/strict';\nimport * as entry from './entry.mjs';\n";
+   if (name === 'sql')
+     return (
+@@ -215,6 +217,7 @@
+ }
+ 
+ export function profileTypeSource(name) {
++  if (optionalTypes[name]) return optionalTypes[name];
+   if (name === 'sql')
+     return `import { sql, identifier, join, compile, type CompiledSql } from 'turbine-orm/sql';
+ const result: CompiledSql = compile(sql\`SELECT \${identifier('id')} WHERE id IN (\${join([1, 2])})\`, {
+@@ -253,3 +256,26 @@
+   }
+   return null;
+ }
++
++// Optional profile proposal: import/initialization/type scope only; no native timing.
++const optionalRuntime = {
++  "core": "import pg from 'pg';\nimport {turbineCore} from 'turbine-orm/core';\nexport {turbineCore};\nexport async function initialize(){const pool=new pg.Pool({host:'127.0.0.1',port:1});const db=turbineCore(pool,{tables:{},enums:{}},{ownership:'client'});return ()=>db.disconnect();}\n",
++  "neon-ws": "export {turbineNeonWs} from 'turbine-orm/neon-ws';\n",
++  "neon-http": "export {turbineNeonHttp} from 'turbine-orm/neon-http';\n",
++  "notification-hub": "import pg from 'pg';\nimport {createNotificationHub} from 'turbine-orm/notification-hub';\nexport {createNotificationHub};\nexport async function initialize(){const pool=new pg.Pool({host:'127.0.0.1',port:1});const hub=createNotificationHub(pool,{endpoint:'direct',ownership:'owned'});return ()=>hub.close();}\n",
++  "live-query": "export {liveQuery} from 'turbine-orm/live-query';\n"
++};
++const optionalBehavior = {
++  "core": "assert.throws(()=>entry.turbineCore({}, {tables:{},enums:{}}));\n",
++  "neon-ws": "await assert.rejects(entry.turbineNeonWs({pool:{}},{tables:{},enums:{}},{sessionMode:'persistent',lifetime:'persistent'}));\n",
++  "neon-http": "assert.throws(()=>entry.turbineNeonHttp({}, {tables:{},enums:{}}));\n",
++  "notification-hub": "assert.throws(()=>entry.createNotificationHub({connect(){throw new Error('must not checkout');},async end(){}},{endpoint:'transaction-pool'}));\n",
++  "live-query": "let disposed=0;const live=entry.liveQuery({query:()=>({id:1}),subscribe:()=>({unsubscribe(){disposed++;}})});assert.deepEqual((await live.next()).value,{id:1});await live.dispose();assert.equal(disposed,1);\n"
++};
++const optionalTypes = {
++  "core": "import {turbineCore,type PgCompatPool,type SchemaMetadata} from 'turbine-orm/core';\ndeclare const pool:PgCompatPool;declare const schema:SchemaMetadata;const db=turbineCore(pool,schema);const rows=db.table<{id:number;title:string}>('records').findMany({select:{id:true}});rows.then(result=>{const id:number=result[0]!.id;void id;\n// @ts-expect-error title was projected out\nresult[0]!.title;});\n",
++  "neon-ws": "import {turbineNeonWs,type NeonWsSource} from 'turbine-orm/neon-ws';\ndeclare const source:NeonWsSource;void turbineNeonWs(source,{tables:{},enums:{}},{sessionMode:'persistent',lifetime:'persistent'});\n// @ts-expect-error HTTP is not a WS session assertion\nvoid turbineNeonWs(source,{tables:{},enums:{}},{sessionMode:'http',lifetime:'persistent'});\n",
++  "neon-http": "import {turbineNeonHttp,type NeonHttpSql} from 'turbine-orm/neon-http';\ndeclare const sql:NeonHttpSql;const db=turbineNeonHttp(sql,{tables:{},enums:{}});void db;\n// @ts-expect-error query function is mandatory\nturbineNeonHttp({}, {tables:{},enums:{}});\n",
++  "notification-hub": "import {createNotificationHub} from 'turbine-orm/notification-hub';\ndeclare const pool:Parameters<typeof createNotificationHub>[0];const hub=createNotificationHub(pool,{endpoint:'direct'});void hub;\n// @ts-expect-error transaction pool does not support LISTEN\ncreateNotificationHub(pool,{endpoint:'transaction-pool'});\n",
++  "live-query": "import {liveQuery,type LiveQuery} from 'turbine-orm/live-query';\nconst live:LiveQuery<{id:number}>=liveQuery({query:()=>({id:1}),subscribe:()=>({unsubscribe(){}})});\n// @ts-expect-error snapshot value preserves number\nconst bad:LiveQuery<{id:string}>=live;void bad;\n"
++};

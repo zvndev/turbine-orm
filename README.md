@@ -2,7 +2,7 @@
 
 **A Postgres ORM written from scratch. One dependency.**
 
-Turbine compiles typed queries straight to SQL. There is no query engine, no WASM, and nothing between your code and Postgres except `pg`: `dependencies` is literally one line. Nested relations resolve in one statement. The client is small enough for a Worker or a Lambda cold start, sits next to hand-written `pg` in the benchmarks, ships an 11-tool read-only MCP server so coding agents can work your schema safely, and includes the operational tooling (index advice, migration guards, PII projection) that usually lives in a paid cloud tier. MIT, and the engine seam is documented if you want to fork it.
+Turbine compiles typed queries straight to SQL. There is no query engine, no WASM, and nothing between your code and Postgres except `pg`: `dependencies` is literally one line. Nested relations resolve in one statement. The client is small enough for a Worker or a Lambda cold start, sits next to hand-written `pg` in the benchmarks, ships a read-only MCP server (twelve tools on PostgreSQL) so coding agents can work your schema safely, and includes the operational tooling (index advice, migration guards, PII projection) that usually lives in a paid cloud tier. MIT, and the engine seam is documented if you want to fork it.
 
 ```
 npm install turbine-orm
@@ -18,11 +18,11 @@ Turbine is **pre-1.0** (`0.x`). Which surfaces hold steady across minors, which 
 
 Six reasons, each with the mechanism that makes it true:
 
-1. **One dependency.** `dependencies` is `{ "pg": "^8.15.0" }`. No engine binary, no WASM compiler, no adapter packages in lockstep. The optional engines (SQLite, MySQL, SQL Server, PowDB, all tiered Experimental in [STABILITY.md](STABILITY.md)) are peer dependencies or Node builtins you install only if you use them.
+1. **One dependency.** `dependencies` is `{ "pg": "^8.15.0" }`. No engine binary, no WASM compiler, no adapter packages in lockstep. The optional engines and transports (SQLite, better-sqlite3, MySQL, SQL Server, libSQL, Cloudflare D1, Neon WebSocket and HTTP, PowDB, each API tiered Experimental in [STABILITY.md](STABILITY.md)) use optional peer dependencies, Node builtins or a Worker binding, installed only if you use them.
 2. **Written from scratch.** Turbine is not a layer over Knex or a query-builder library. Query compilation is plain string building with an FNV-1a shape fingerprint into a bounded LRU of SQL templates, so there is no plan cache to size and no compiler running on your event loop.
 3. **Nested relations in one statement.** A `with` clause compiles to correlated `json_agg` subqueries, so users with posts with comments is one round trip, typed end to end: `users[0].posts[0].comments[0].author.name` autocompletes with no annotation.
 4. **Faster than Drizzle and Prisma.** In the 0.92.0 run Drizzle took 1.5x as long as Turbine and Prisma 2.1x, by geometric mean, on a dedicated benchmark machine. The table is below; the losses are stated with the wins.
-5. **Agents get a skill and typed tools, not a SQL prompt.** `npx turbine skill` installs a query-writing skill whose every claim is executed against a live database before release; `npx turbine mcp` exposes eleven read-only MCP tools, including a relation graph and a join-path finder that returns the `with` clause to write. Every tool runs inside `BEGIN READ ONLY`, and PII-tagged columns are redacted before rows reach a model.
+5. **Agents get a skill and typed tools, not a SQL prompt.** `npx turbine skill` installs a query-writing skill whose every claim is executed against a live database before release; `npx turbine mcp` exposes twelve read-only MCP tools for PostgreSQL, nine for SQLite and MySQL and eight for SQL Server, including a relation graph and a join-path finder that returns the `with` clause to write. Database-backed PostgreSQL tools use read-only transactions; [SQLite tools](docs/sqlite-tools.md) open native read-only files. PII-tagged columns are redacted before rows reach a model.
 6. **The dangerous operations ask first.** Destructive migration statements refuse to run without typed consent. `update`/`delete` with an empty `where` throws. Columns tagged `pii: true` are excluded from the emitted SQL's projections. `turbine doctor` reports missing FK indexes offline, no account, no telemetry.
 
 ## Benchmarks
@@ -137,7 +137,9 @@ await db.$transaction(async (tx) => {
 });
 ```
 
-Nested `$transaction` calls become SAVEPOINTs. Isolation levels, timeouts, and `sessionContext` (transaction-local GUCs for Postgres RLS) are options. A transaction PostgreSQL rolled back (a statement failed and the callback caught it) rejects instead of reporting a commit, and a `tx` used after its callback settles throws rather than running outside the transaction. `tx` deliberately exposes a smaller surface than `db`; reaching for a client-only member is a compile error, not a production surprise. Reference: [turbineorm.dev/transactions](https://turbineorm.dev/transactions).
+Nested `$transaction` calls become SAVEPOINTs. Isolation levels, timeouts, and `sessionContext` (transaction-local GUCs for Postgres RLS) are options. A transaction PostgreSQL rolled back (a statement failed and the callback caught it) rejects instead of reporting a commit, and a `tx` used after its callback settles throws rather than running outside the transaction. `tx` deliberately exposes a smaller surface than `db`; reaching for a client-only member is a compile error, not a production surprise. An unanswered COMMIT raises `TransactionOutcomeUnknownError` (E021) on PostgreSQL, MySQL and Neon WebSocket. It may have committed, so a read alone cannot justify a retry. Use a database-enforced idempotency key. SQL Server and PowDB retain the driver's COMMIT error; SQLite and local libSQL return the engine's own failure.
+
+A transaction timeout fires before COMMIT. `TimeoutError.outcome` is `'not-executed'` after an acknowledged rollback and `'unknown'` while rollback is unconfirmed. MySQL cannot cancel a running statement. Neon WebSocket also needs confirmation; a supplied Neon `Client` refuses transaction timeouts. SQLite and local libSQL cannot interrupt synchronous native work. An ordinary timed-out write outside a transaction may have applied. Reference: [turbineorm.dev/transactions](https://turbineorm.dev/transactions).
 
 ### Pipelining, at the protocol level
 
@@ -163,6 +165,8 @@ const one = await db.sql<{ id: number }>`SELECT id FROM users WHERE id = ${42}`.
 ```
 
 `db.sql<T>` is the typed escape hatch (thenable, with `.one()` and `.scalar()`); `db.raw` is the untyped one. Neither has a code path that interpolates a value into SQL text.
+
+For reusable fragments, quoted identifiers and lists, use the optional [`turbine-orm/sql` import](docs/sql-fragments.md). Compile with your engine's dialect, then execute the resulting text and parameters through `db.rawUnsafe`. Raw SQL requires explicit authorization and tenant/PII handling by the caller.
 
 ### Streaming
 
@@ -216,7 +220,7 @@ try {
 }
 ```
 
-Every error Turbine raises extends `TurbineError` with a stable code (`TURBINE_E001` through `E020`) and a `docsUrl`; a driver error whose SQLSTATE Turbine does not map stays the driver's own error, carrying that SQLSTATE on `.code`. Error messages carry keys, never values: a `NotFoundError` says `where: { id, email }` without printing the email, so errors are safe to forward to a tracker without a scrubbing rule. Retryable failures (`DeadlockError`, `SerializationFailureError` and its subclass `LockNotAvailableError`) expose `isRetryable: true` as a typed const. `err.code` is the check that survives a mixed ESM/CJS module graph, where two copies of the package hold two copies of every class; since 0.78 `instanceof` works across copies too, through a cross-copy brand on every error. Full table: [turbineorm.dev/errors](https://turbineorm.dev/errors).
+Every error Turbine raises extends `TurbineError` with a stable code (`TURBINE_E001` through `E021`) and a `docsUrl`; a driver error whose SQLSTATE Turbine does not map stays the driver's own error, carrying that SQLSTATE on `.code`. Error messages carry keys, never values: a `NotFoundError` says `where: { id, email }` without printing the email, so errors are safe to forward to a tracker without a scrubbing rule. Retryable failures (`DeadlockError`, `SerializationFailureError` and its subclass `LockNotAvailableError`) expose `isRetryable: true` as a typed const. `err.code` is the check that survives a mixed ESM/CJS module graph, where two copies of the package hold two copies of every class; since 0.78 `instanceof` works across copies too, through a cross-copy brand on every error. Full table: [turbineorm.dev/errors](https://turbineorm.dev/errors).
 
 ## Built for agents
 
@@ -229,10 +233,11 @@ npx turbine mcp    # read-only MCP server over JSON-RPC stdio, ships in the pack
 
 The skill covers what an agent gets wrong on a schema it has not seen: `with` versus Prisma's `include`, how relation names are derived, what `select` may name, relation filters, the `having` shape, JSON paths, and which error each mistake produces. **Every factual claim in it is executed against a live database before release**, so it cannot drift from the ORM the way documentation usually does. `--agents` prints a short block for `AGENTS.md` instead.
 
-Eleven tools, every one inside `BEGIN READ ONLY` with a statement timeout, so an agent cannot mutate anything through this server:
+Twelve tools on PostgreSQL. Database-backed tools use `BEGIN READ ONLY` with a statement timeout. Capability discovery and error lookup need no database:
 
 | Tool | What it answers |
 |---|---|
+| `engine_capabilities` | Available tools, engine capabilities and runtime prerequisites, without opening a database. |
 | `schema_overview` | Tables, columns, relations, indexes, estimated row counts. |
 | `table_detail` | One table, in full. |
 | `relation_graph` | The whole relation graph, or one table's subtree, with cardinality, keys, and junction tables. |
@@ -271,7 +276,7 @@ Going deep on one database means the parts other ORMs push to raw SQL are typed 
 
 ## Serverless and edge
 
-The core is driver-agnostic: hand any pg-compatible pool to `turbineHttp()` and Turbine runs on Vercel Edge, Cloudflare Workers, Deno Deploy, or anywhere else without TCP. The main entry's import graph is held under **149 kB brotli** (edge entry under **117 kB**) with `pg` external, enforced by `size-limit` in CI at those exact numbers; run `npm run size` for the current figure.
+The core is driver-agnostic: hand any pg-compatible pool to `turbineHttp()` and Turbine runs on Vercel Edge, Cloudflare Workers, Deno Deploy, or anywhere else without TCP. For Neon, `turbine-orm/neon-ws` and `turbine-orm/neon-http` bind its WebSocket `Pool` and its `neon()` HTTP function with their own session rules ([WebSocket](docs/neon-websocket.md), [HTTP](docs/neon-http.md)); both are Experimental. The main entry's import graph is held under **154 kB brotli** (edge entry under **120 kB**) with `pg` external, enforced by `size-limit` in CI at those exact numbers; run `npm run size` for the current figure. MySQL generation emits exact column-local ENUM labels as literal unions and falls back to `string` when catalog labels may be damaged; see [typed ENUM generation](docs/mysql-enum-generation.md) for its boundaries and measured footprint.
 
 ```typescript
 import { Pool } from '@neondatabase/serverless';
@@ -286,14 +291,34 @@ HTTP drivers cannot hold a cursor or a LISTEN connection, so `findManyStream` an
 
 ## Database engines
 
-Postgres is the default and primary target. The same typed API also runs on **SQLite** (Node's built-in `node:sqlite`, zero extra installs, Node ≥ 22.5), **MySQL 8** (`mysql2`), **SQL Server 2016+** (`mssql`), and **PowDB** (embedded or networked), each behind a subpath export with its driver as an optional peer. All four are **Experimental** in the [stability policy](STABILITY.md): the query API they expose is the shared one, but each engine's capability boundaries and factory options may still change in a minor release. PowDB is in maintenance mode: bug and data-safety fixes, no new features.
+Postgres is the default and primary target. The same typed API also runs on the engines and transports below, each behind its own subpath export with its driver as an optional peer:
+
+| Engine or transport | Import | Tier |
+|---|---|---|
+| SQLite, Node's built-in `node:sqlite` (Node ≥ 22.5) | `turbine-orm/sqlite` | Supported |
+| SQLite through `better-sqlite3` | `turbine-orm/better-sqlite3` | Supported |
+| MySQL 8 (`mysql2`) | `turbine-orm/mysql` | Supported |
+| SQL Server (`mssql`) | `turbine-orm/mssql` | Deferred |
+| libSQL, local files (`@libsql/client`) | `turbine-orm/libsql` | Deferred |
+| Cloudflare D1, inside a Worker | `turbine-orm/d1` | Experimental |
+| Neon over WebSockets (`@neondatabase/serverless`) | `turbine-orm/neon-ws` | Experimental |
+| Neon over HTTP, `neon()` | `turbine-orm/neon-http` | Experimental |
+| PowDB, embedded or networked | `turbine-orm/powdb` | Maintenance |
+
+The tier is the evidence tier from the [engine support matrix](docs/engine-support.md), computed from what CI runs: Supported means typed queries, nested reads, nested writes, transactions, upsert and `createMany` all run against the real engine on every change; Deferred means no further work is planned this cycle. Separately, every API outside PostgreSQL is **Experimental** in the [stability policy](STABILITY.md): the query API is the shared one, but each engine's capability boundaries and factory options may still change in a minor release. PowDB is in maintenance mode: bug and data-safety fixes, no new features.
 
 ```bash
-npm install turbine-orm                        # SQLite needs nothing else
-npm install turbine-orm mysql2                 # MySQL
-npm install turbine-orm mssql                  # SQL Server
-npm install turbine-orm @zvndev/powdb-embedded # PowDB, in-process
+npm install turbine-orm                          # SQLite needs nothing else
+npm install turbine-orm better-sqlite3           # SQLite through better-sqlite3
+npm install turbine-orm mysql2                   # MySQL
+npm install turbine-orm mssql                    # SQL Server
+npm install turbine-orm @libsql/client           # libSQL, local files
+npm install turbine-orm @neondatabase/serverless # Neon, WebSocket or HTTP
+npm install turbine-orm @zvndev/powdb-embedded   # PowDB, in-process
+npm install -D miniflare@4.20260730.0            # only for the local D1 CLI commands
 ```
+
+D1 needs no driver: the Worker's binding is the connection.
 
 ```typescript
 import { turbineSqlite } from 'turbine-orm/sqlite';
@@ -303,9 +328,10 @@ const db = turbineSqlite(':memory:', SCHEMA);
 const users = await db.users.findMany({ with: { posts: true }, limit: 10 });
 ```
 
-That snippet assumes a Postgres database somewhere, because `SCHEMA` comes from
-`turbine generate` and `generate` reads a live Postgres catalog. **If SQLite is
-your only database, describe the schema in code instead.** `defineSchema` is the
+`SCHEMA` comes from `turbine generate`. For a SQLite-only project,
+`turbine init --engine sqlite` and `turbine generate --engine sqlite` read the
+SQLite file (Node 22.12+; [migrations](docs/sqlite-migrations.md) need 24.10+).
+**Or describe the schema in code, with no CLI at all.** `defineSchema` is the
 same declaration `push` and `migrate` consume, and two pure functions turn it
 into the DDL and the runtime metadata, with no database involved:
 
@@ -342,7 +368,7 @@ const users = await db
 accessors are `db.table('users')` rather than `db.users`: the typed property
 accessors are what `turbine generate` emits, and this path skips it.
 
-Single-statement nested `with` works on all four SQL engines (`json_agg`, `json_group_array`, `JSON_ARRAYAGG`, `FOR JSON PATH`). Postgres-only features (pgvector, LISTEN/NOTIFY, RLS `sessionContext`, true cursor streaming) throw a typed `UnsupportedFeatureError` (`TURBINE_E017`) elsewhere instead of degrading silently. The `turbine generate` / `migrate` CLI is Postgres-only. Full capability matrix and per-engine notes: [turbineorm.dev/engines](https://turbineorm.dev/engines).
+Single-statement nested `with` works on all four SQL engines (`json_agg`, `json_group_array`, `JSON_ARRAYAGG`, `FOR JSON PATH`). Postgres-only features (pgvector, LISTEN/NOTIFY, RLS `sessionContext`) throw a typed `UnsupportedFeatureError` (`TURBINE_E017`) elsewhere instead of degrading silently. The CLI has project commands (`init`, `generate`, migrations, seeds and more) for SQLite, MySQL, SQL Server, local libSQL and local D1, a different subset per engine; Studio, `observe` and `migrate-from-prisma` are Postgres-only. Full capability matrix and per-engine notes: [turbineorm.dev/engines](https://turbineorm.dev/engines).
 
 **Migrating from Prisma?** `turbine migrate-from-prisma` reads your `schema.prisma` and emits a typed mapping; `turbine-orm/prisma-compat` then wraps a TurbineClient in a `PrismaClient`-shaped surface, so `prisma.user.findMany({ include })` keeps working while you port. [Guide](https://turbineorm.dev/migrate-from-prisma). Coming from Drizzle: [the mapping](https://turbineorm.dev/migrate-from-drizzle).
 
@@ -358,16 +384,16 @@ It is also built to be extended rather than wrapped. All SQL generation routes t
 |---|---|---|---|---|---|
 | **Engine / runtime** | No engine binary (`pg` only) | Client + TS/WASM query compiler | No engine | No engine | Kysely as query runner; SQL built by MikroORM (v7) |
 | **Runtime deps** | 1 (`pg`) | `@prisma/client` + required driver adapter | 0 | 0 | `@mikro-orm/core` (0 deps) + a driver package |
-| **Main bundle (brotli)** | under 149 kB import graph (CI-enforced), `pg` external | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small | |
+| **Main bundle (brotli)** | under 154 kB import graph (CI-enforced), `pg` external | ~1.6 MB client (TS/WASM compiler) | ~7 KB core | small | |
 | **Studio** | Read-only by default | Full CRUD, cloud-hosted | Full CRUD; [Gateway](https://gateway.drizzle.team/) self-hosted, free | None | AdminJS integration guide (CRUD panel) |
 | **Error PII safety** | Keys only by default | Values in messages | Raw pg errors | Raw pg errors | |
 | **Migrations** | SQL-first, SHA-256 checksums | DSL-generated, shadow DB | SQL or Drizzle Kit | None | Generated by diffing entities against a snapshot or the database; TS/JS classes |
-| **Edge runtime** | One import swap, under 117 kB brotli (CI-enforced) | Driver adapter + WASM compiler | Native | Native | Cloudflare Workers and Deno (v7) |
+| **Edge runtime** | One import swap, under 120 kB brotli (CI-enforced) | Driver adapter + WASM compiler | Native | Native | Cloudflare Workers and Deno (v7) |
 | **Pipeline batching** | Parse/Bind/Execute protocol | Sequential in txn | Sequential | Manual | `flush()` runs queued changes in one transaction |
 | **Typed errors** | `isRetryable` discriminant | Error codes only | None | None | `DriverException` subclasses (`UniqueConstraintViolationException`, ...) |
 | **Nested relations** | 1 query, deep type inference | 1 query per relation by default; single-query `relationJoins` is Preview | 1 query, `relations()` re-declaration | Manual (`jsonArrayFrom`) | `populate`; default `balanced`: joins to-one, one query per to-many relation |
 | **Index advice** | `turbine doctor`, offline, `--fix` | Optimize retired March 2026 (cloud Query Insights) | None | None | |
-| **MCP server for agents** | 11 read-only tools, PII-redacted | Official MCP server | `drizzle-kit mcp` | None | |
+| **MCP server for agents** | 12 PostgreSQL / 9 SQLite / 9 MySQL / 8 SQL Server read-only tools, PII-redacted | Official MCP server | `drizzle-kit mcp` | None | |
 | **Vector search** | Built-in `distance` / KNN | Preview / raw | Extension API | Manual | |
 | **LISTEN/NOTIFY** | `$listen` / `$notify` | None | None | None | |
 
@@ -377,8 +403,8 @@ Competitor columns last checked 2026-08-22, against Prisma 7 and Drizzle 0.45 (t
 
 Stated so you do not find out three weeks in:
 
-- **Postgres-first.** The other engines are real and tested, but pgvector, LISTEN/NOTIFY, RLS `sessionContext`, full-text `search`, array filters, and `distinct` are Postgres-only and throw `UnsupportedFeatureError` elsewhere. The CLI (`generate`, `migrate`) is Postgres-only.
-- **Only Postgres streams with a true cursor.** The other engines' `findManyStream` materializes the result first, then yields in batches: same rows, not constant memory.
+- **Postgres-first.** The other engines are real and tested, but pgvector, LISTEN/NOTIFY, RLS `sessionContext`, full-text `search`, array filters, and `distinct` are Postgres-only and throw `UnsupportedFeatureError` elsewhere. Studio, `observe` and `migrate-from-prisma` are Postgres-only; the other engines have their own subset of CLI commands.
+- **Only Postgres streams from a server-side cursor.** SQLite, MySQL and SQL Server read rows from the driver in batches as you iterate. A batch bounds the row count, not bytes, and on SQLite an open stream holds the client's single connection until it finishes.
 - **Large nested result sets** are materialized in PostgreSQL memory. For relations with 10K+ rows, put a `limit` in the `with` clause, or stream parents and resolve children per batch.
 - **It is younger** than Prisma or Drizzle: fewer Stack Overflow answers, a smaller community. The migration paths in both directions are real, which is the honest mitigation.
 
@@ -406,8 +432,8 @@ Stated so you do not find out three weeks in:
 
 ## Requirements
 
-- Node.js ≥ 20 (the SQLite engine needs ≥ 22.5 for `node:sqlite`)
-- PostgreSQL ≥ 14 tested; CI runs the integration suite against PostgreSQL 14, 15, 16, and 17
+- Node.js ≥ 20 (the SQLite engine needs ≥ 22.5 for `node:sqlite`, and 22.16+ or 24+ for native streaming; SQLite CLI projects need 22.12+, and SQLite migration writes 24.10+)
+- PostgreSQL ≥ 14 tested; CI runs the integration suite against PostgreSQL 14, 15, 16, 17, and 18
 - ESM and CommonJS both supported
 - `@types/node` in `devDependencies` when you typecheck with `skipLibCheck: false`: the `turbine-orm/sqlite` engine and the `turbine-orm/cli` declarations reference Node's own types (`node:sqlite`, `NodeJS`)
 

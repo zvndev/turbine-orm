@@ -35,6 +35,11 @@ function entityName(tableName: string): string {
   return snakeToPascal(singularize(tableName));
 }
 
+/** Keep intrinsic dictionaries independent of a generated entity or enum named Record. */
+function intrinsicRecord(value: string): string {
+  return `{ [key in string]: ${value} }`;
+}
+
 /**
  * Per-column TypeScript overrides from {@link GenerateOptions.columnTypes},
  * keyed by database table name, then database column name.
@@ -54,49 +59,61 @@ function overrideFor(overrides: ColumnTypeOverrides | undefined, table: string, 
  * added). Falls back to the introspected `col.tsType` for everything else.
  */
 export function columnTsType(col: ColumnMetadata, enums: Record<string, string[]>, override?: string): string {
+  return resolvedColumnType(col, enums, override);
+}
+
+/** Inspect only explicit data, never inherited values or hint getters. */
+function inferredBinaryType(col: ColumnMetadata): ColumnMetadata['inferredBinaryType'] {
+  const hint = Object.getOwnPropertyDescriptor(col, 'inferredBinaryType');
+  if (!hint) return undefined;
+  if (
+    Object.hasOwn(hint, 'value') &&
+    (hint.value === undefined || hint.value === 'Uint8Array' || hint.value === 'Buffer')
+  ) {
+    return hint.value;
+  }
+  throw new ValidationError("inferredBinaryType must be an own data value of 'Uint8Array', 'Buffer', or undefined.");
+}
+
+/** Resolve read/write types once, keeping engine-derived Date references intrinsic. */
+function resolvedColumnType(
+  col: ColumnMetadata,
+  enums: Record<string, string[]>,
+  override?: string,
+  forWrite?: boolean,
+  intrinsicDates?: ReadonlySet<string>,
+): string {
+  const binary = inferredBinaryType(col);
   if (override !== undefined) return col.nullable ? `${override} | null` : override;
   const dt = col.dialectType ?? col.pgType;
   const isArray = col.isArray || dt.startsWith('_');
   const base = isArray && dt.startsWith('_') ? dt.slice(1) : dt;
   if (Object.hasOwn(enums, base)) {
-    let t = snakeToPascal(base);
-    if (isArray) t += '[]';
-    return col.nullable ? `${t} | null` : t;
+    return `${snakeToPascal(base)}${isArray ? '[]' : ''}${col.nullable ? ' | null' : ''}`;
   }
-  return col.tsType;
-}
-
-/**
- * Resolve the TypeScript type a column accepts on the WRITE path (the `*Create`
- * / `*Update` input types). It differs from the row type where the runtime
- * accepts more than one spelling or cannot take the parsed read value back
- * ({@link pgTypeToTsInput}), and for time-of-day columns.
- *
- * A `time` / `timetz` column reads back as a `string` (`'09:00:00'`), so the
- * row type stays `string`. On write the runtime also accepts a JS `Date` and
- * narrows it to its UTC time of day (see `coerceWriteValue` in
- * query/writes.ts), matching Prisma, which types a `DateTime @db.Time(6)`
- * field as a `Date`.
- */
-function writeColumnTsType(col: ColumnMetadata, enums: Record<string, string[]>, override?: string): string {
-  const tsType = columnTsType(col, enums, override);
-  if (override !== undefined) return tsType;
-  const dt = col.dialectType ?? col.pgType;
-  const isArray = col.isArray || dt.startsWith('_');
-  const base = isArray && dt.startsWith('_') ? dt.slice(1) : dt;
-  if (Object.hasOwn(enums, base)) return tsType;
-  if (timeOfDayKind(base)) {
-    // A `time[]` column accepts a Date per element (the bind rewrite runs
-    // element-wise, see coerceTemporalValue in query/utils.ts).
-    const widened = isArray ? '(string | Date)[]' : 'string | Date';
+  // Time reads as string, but its write template accepts a Date per element.
+  if (forWrite && timeOfDayKind(base)) {
+    const date = 'globalThis.Date';
+    const widened = isArray ? `(string | ${date})[]` : `string | ${date}`;
     return col.nullable ? `${widened} | null` : widened;
   }
-  // Only rewrite a type the read map produced: hand-built or engine metadata
-  // carrying its own tsType keeps it.
+  const declared = forWrite === undefined ? undefined : col.declaredTsType;
+  const tsType = declared === undefined ? col.tsType : col.nullable ? `${declared} | null` : declared;
   const pgType = isArray && !dt.startsWith('_') ? `_${dt}` : dt;
   const read = pgTypeToTs(pgType, col.nullable);
-  const input = pgTypeToTsInput(pgType, col.nullable);
-  return input !== read && tsType === read ? input : tsType;
+  if (
+    binary !== undefined &&
+    col.declaredTsType === undefined &&
+    tsType === `${binary}${isArray ? '[]' : ''}${col.nullable ? ' | null' : ''}`
+  ) {
+    return `globalThis.${tsType}`;
+  }
+  // Every catalog/code-first bridge marks temporal reads. Custom type text
+  // and metadata without that runtime marker retain their original meaning.
+  if (intrinsicDates?.has(col.name) && /^Date(?:\[\])?(?: \| null)?$/.test(tsType)) {
+    return `globalThis.${tsType}`;
+  }
+  return forWrite && tsType === read ? pgTypeToTsInput(pgType, col.nullable) : tsType;
 }
 
 /**
@@ -219,6 +236,17 @@ function docSafe(value: string): string {
 export interface GenerateOptions {
   /** The introspected schema to generate from */
   schema: SchemaMetadata;
+  /** Engine for the generated factory. Defaults to PostgreSQL; SQLite is synchronous; MySQL and MSSQL use async native factories. */
+  target?: 'postgresql' | 'sqlite' | 'mysql' | 'mssql';
+  /** Optional SQLite factory binding; requires target: sqlite. */
+  sqliteBinding?: 'node:sqlite' | 'better-sqlite3';
+  /**
+   * Opt in to native integer read/write types: number | string on reads and
+   * number | string | bigint on writes. Covers SQLite integer affinity and
+   * MySQL/MSSQL BIGINT. Requires an explicit non-PostgreSQL target. Does not
+   * change runtime decoding, storage validation, or explicit column types.
+   */
+  exactNativeIntegers?: boolean;
   /**
    * Where generation notes go (a relation omitted from the generated types
    * because it shadows a column). Defaults to the console logger. Never
@@ -245,7 +273,7 @@ export interface GenerateOptions {
   noTimestamp?: boolean;
   /**
    * Which extension the generated `index.ts` uses on its sibling import
-   * specifiers (`./types`, `./metadata`). F3.
+   * specifiers (`./types`, `./metadata`).
    *
    *   - `'js'`: always `./types.js` (required by NodeNext `tsc` and by
    *     tsc-compiled ESM run on Node; the pre-0.41 behavior).
@@ -264,7 +292,7 @@ export interface GenerateOptions {
   importExtension?: 'js' | 'ts' | 'none' | 'auto';
   /**
    * Rewrite generated column FIELD names to the raw database column names
-   * (snake_case) instead of camelCase (F4). Opt-in; when unset the output is
+   * (snake_case) instead of camelCase. Opt-in; when unset the output is
    * byte-identical to before. Implemented as the pure generate-time
    * {@link withDbFieldNames} transform (identity `columnMap`/`reverseColumnMap`,
    * zero runtime changes). Relation names, table accessors, and entity type
@@ -289,6 +317,11 @@ export interface GenerateOptions {
 
 /** Per-file generator options (subset of {@link GenerateOptions} the emitters need). */
 export interface GenerateFileOptions {
+  /** {@link GenerateOptions.target}; selects the factory emitted by `generateIndex`. */
+  target?: GenerateOptions['target'];
+  sqliteBinding?: GenerateOptions['sqliteBinding'];
+  /** {@link GenerateOptions.exactNativeIntegers}. */
+  exactNativeIntegers?: boolean;
   /** Omit the `Generated at:` header line for reproducible output. */
   noTimestamp?: boolean;
   /**
@@ -309,6 +342,13 @@ export interface GenerateFileOptions {
 // ---------------------------------------------------------------------------
 
 export function generate(options: GenerateOptions): { outDir: string; files: string[] } {
+  const target = generationTarget(options.target);
+  validateNativeIntegerOptions(options);
+  // Validate before automatic copying can read a hint accessor, and before any
+  // output write, even when a column has an explicit type override.
+  for (const table of Object.values(options.schema.tables)) {
+    for (const col of table.columns) inferredBinaryType(col);
+  }
   const outDir = options.outDir ?? './generated/turbine';
 
   // Path traversal protection, ensure output stays within project root
@@ -320,15 +360,18 @@ export function generate(options: GenerateOptions): { outDir: string; files: str
 
   mkdirSync(outDir, { recursive: true });
 
-  // F4: keep raw DB column names as field names (opt-in). Pure transform: when
+  // Keep raw DB column names as field names (opt-in). Pure transform: when
   // the flag is off `withDbFieldNames` is never called and output is unchanged.
   const schema = options.keepColumnNames ? withDbFieldNames(options.schema) : options.schema;
 
-  // F3: resolve which extension sibling imports get in index.ts.
+  // Resolve which extension sibling imports get in index.ts.
   const { ext: importExt, mode: importMode } = resolveImportExtension(outDir, options.importExtension ?? 'auto');
 
   const files: string[] = [];
   const fileOptions: GenerateFileOptions = {
+    target,
+    exactNativeIntegers: options.exactNativeIntegers,
+    sqliteBinding: options.sqliteBinding,
     noTimestamp: options.noTimestamp,
     importExt,
     importMode,
@@ -362,7 +405,7 @@ export function generate(options: GenerateOptions): { outDir: string; files: str
 }
 
 // ---------------------------------------------------------------------------
-// Import-extension resolution (F3)
+// Import-extension resolution
 // ---------------------------------------------------------------------------
 
 /**
@@ -593,38 +636,6 @@ function requireEmittable(derived: string, subject: string, role: string): void 
 /** Table accessors the generated `TurbineClient` class cannot declare as members. */
 const RESERVED_ACCESSORS: ReadonlySet<string> = new Set(['constructor', '__proto__']);
 
-/** The type a defineSchema file declared for a column (bare, no `| null`), if any. */
-function declaredTsTypeOf(col: ColumnMetadata): string | undefined {
-  return col.declaredTsType;
-}
-
-/**
- * The metadata `types.ts` is written from. A column whose schema file declared a
- * TypeScript type takes it, with `| null` for a nullable column, in place of the
- * type mapped from its database type. The runtime keeps the mapped type
- * (`metadata.ts` is written from the input), because the engines branch on it.
- * Returns `schema` itself when no column declared one.
- */
-function withDeclaredTypes(schema: SchemaMetadata): SchemaMetadata {
-  let declaredAny = false;
-  const tables: Record<string, TableMetadata> = Object.create(null);
-  for (const [name, table] of Object.entries(schema.tables)) {
-    if (!table.columns.some((c) => declaredTsTypeOf(c) !== undefined)) {
-      tables[name] = table;
-      continue;
-    }
-    declaredAny = true;
-    tables[name] = {
-      ...table,
-      columns: table.columns.map((col) => {
-        const declared = declaredTsTypeOf(col);
-        return declared === undefined ? col : { ...col, tsType: col.nullable ? `${declared} | null` : declared };
-      }),
-    };
-  }
-  return declaredAny ? { ...schema, tables } : schema;
-}
-
 /**
  * Refuse a schema whose names cannot be emitted as TypeScript identifiers.
  *
@@ -663,7 +674,8 @@ export function assertEmittableSchema(schema: SchemaMetadata): void {
     // can carry anything, and a line break or a stray bracket would end the type
     // and start a statement in the generated file.
     for (const col of table.columns) {
-      for (const text of [col.tsType, declaredTsTypeOf(col)]) {
+      inferredBinaryType(col);
+      for (const text of [col.tsType, col.declaredTsType]) {
         const problem = text === undefined ? null : tsTypeTextProblem(text);
         if (problem !== null) {
           throw new ValidationError(
@@ -691,14 +703,77 @@ export function assertEmittableSchema(schema: SchemaMetadata): void {
   }
 }
 
+/** MySQL ENUM identities are column-local catalog keys, not type identifiers. */
+function mysqlEnumTypeSchema(schema: SchemaMetadata, target: GenerateOptions['target']): SchemaMetadata {
+  if (target !== 'mysql') return schema;
+  const enums = { ...schema.enums };
+  const types = new Map<string, string>();
+  const identities = new Set<string>();
+  for (const table of Object.values(schema.tables)) {
+    for (const col of table.columns) {
+      const key = `${table.name}.${col.name}`;
+      if ((col.dialectType ?? col.pgType) !== 'enum') continue;
+      const hasLabels = Object.hasOwn(schema.enums, key);
+      // No label entry is an identity gap to refuse, EXCEPT the recorded one:
+      // `enumLabelsUnrecoverable` says the catalog text may be lossy, so
+      // introspection recorded no labels and the widest correct type is
+      // `string`. An explicit entry outranks the marker:
+      // caller-supplied exact labels are authoritative over an inferred gap.
+      if (!hasLabels && !col.enumLabelsUnrecoverable) {
+        throw new ValidationError(`Missing MySQL ENUM column identity ${printableCatalogName(JSON.stringify(key))}.`);
+      }
+      if (identities.has(key)) {
+        throw new ValidationError(`Ambiguous MySQL ENUM column identity ${printableCatalogName(JSON.stringify(key))}.`);
+      }
+      identities.add(key);
+      // Encode derived literal text after escaping, without relaxing caller type validation.
+      types.set(
+        key,
+        hasLabels
+          ? schema.enums[key]!.map((label) => `'${escSQ(label).replaceAll('*/', '*\\x2f')}'`).join(' | ') || 'never'
+          : 'string',
+      );
+      delete enums[key];
+    }
+  }
+  if (types.size === 0) return schema;
+  const view = { ...schema, enums };
+  // Check caller type text before substituting engine-derived literal unions.
+  assertEmittableSchema(view);
+  return {
+    ...view,
+    tables: Object.fromEntries(
+      Object.entries(schema.tables).map(([name, table]) => [
+        name,
+        {
+          ...table,
+          columns: table.columns.map((col) => {
+            const type =
+              (col.dialectType ?? col.pgType) === 'enum' ? types.get(`${table.name}.${col.name}`) : undefined;
+            return type === undefined
+              ? col
+              : {
+                  ...col,
+                  dialectType: 'mysql-enum',
+                  tsType: col.nullable ? `${type} | null` : type,
+                  declaredTsType: col.declaredTsType ?? type,
+                };
+          }),
+        },
+      ]),
+    ),
+  };
+}
+
 /**
  * Generate the contents of `types.ts` (entity interfaces, *Create / *Update,
  * *Relations brand-field interfaces, and the write input types). Exported so
  * tests can pin the generator output without writing files to disk.
  */
 export function generateTypes(input: SchemaMetadata, options?: GenerateFileOptions): string {
-  assertEmittableSchema(input);
-  const schema = withDeclaredTypes(input);
+  validateNativeIntegerOptions(options);
+  const schema = mysqlEnumTypeSchema(input, options?.target);
+  assertEmittableSchema(schema);
   const overrides = resolveColumnTypeOverrides(schema, options?.columnTypes);
   const lines: string[] = [...generatedFileHeader(options)];
 
@@ -719,10 +794,19 @@ export function generateTypes(input: SchemaMetadata, options?: GenerateFileOptio
   for (const t of Object.values(schema.tables)) {
     if ((safeRelationsByTable.get(t.name) ?? []).length > 0) tablesWithRelations.add(t.name);
   }
-  const rowType = (table: TableMetadata, col: ColumnMetadata): string =>
-    columnTsType(col, schema.enums, overrideFor(overrides, table.name, col.name));
-  const writeType = (table: TableMetadata, col: ColumnMetadata): string =>
-    writeColumnTsType(col, schema.enums, overrideFor(overrides, table.name, col.name));
+  const columnType = (table: TableMetadata, col: ColumnMetadata, forWrite = false): string => {
+    const override =
+      overrideFor(overrides, table.name, col.name) ?? nativeIntegerType(col, schema.enums, options, forWrite);
+    return resolvedColumnType(
+      col,
+      schema.enums,
+      override,
+      forWrite,
+      col.declaredTsType === undefined ? table.dateColumns : undefined,
+    );
+  };
+  const rowType = columnType;
+  const writeType = (table: TableMetadata, col: ColumnMetadata): string => columnType(table, col, true);
 
   // Generate enum types
   for (const [enumName, labels] of Object.entries(schema.enums)) {
@@ -837,13 +921,28 @@ export function generateTypes(input: SchemaMetadata, options?: GenerateFileOptio
   // ---------------------------------------------------------------------------
 
   for (const table of Object.values(schema.tables)) {
-    emitWhereUnique(lines, table, (col) => rowType(table, { ...col, nullable: false, tsType: stripNull(col.tsType) }));
+    emitWhereUnique(lines, table, (col) =>
+      rowType(table, {
+        ...col,
+        // Spread omits valid nonenumerable hints; carry only the validated data value.
+        inferredBinaryType: inferredBinaryType(col),
+        nullable: false,
+        tsType: stripNull(col.tsType),
+      }),
+    );
   }
 
   const variantsByTable = createVariantsByTable(schema, safeRelationsByTable);
+  const emptyRecord = intrinsicRecord('never');
   for (const table of Object.values(schema.tables)) {
-    emitWriteInputs(lines, schema, table, safeRelationsByTable.get(table.name) ?? [], variantsByTable, (col) =>
-      writeType(table, col),
+    emitWriteInputs(
+      lines,
+      schema,
+      table,
+      safeRelationsByTable.get(table.name) ?? [],
+      variantsByTable,
+      emptyRecord,
+      (col) => writeType(table, col),
     );
   }
 
@@ -1079,6 +1178,7 @@ function emitWriteInputs(
   table: TableMetadata,
   relations: readonly [string, RelationDef][],
   variantsByTable: ReadonlyMap<string, ReadonlyMap<string, CreateVariant>>,
+  emptyRecord: string,
   writeTs: (col: ColumnMetadata) => string,
 ): void {
   const typeName = entityName(table.name);
@@ -1123,7 +1223,7 @@ function emitWriteInputs(
       if (omitted.has(relName)) continue;
       members.push(`${quoteIfNeeded(relName)}?: ${relationField(rel, false)} | undefined`);
     }
-    const parts = [members.length > 0 ? `{ ${members.join('; ')} }` : 'Record<string, never>'];
+    const parts = [members.length > 0 ? `{ ${members.join('; ')} }` : emptyRecord];
     for (const { relName, rel, fks } of choices) {
       if (omitted.has(relName) || fks.every((c) => omitted.has(c.field))) continue;
       const viaKey = fks.map((c) => `${quoteIfNeeded(c.field)}: ${writeTs(c)}`).join('; ');
@@ -1186,7 +1286,7 @@ function emitWriteInputs(
 
   // A belongsTo points at ONE row: single objects, no `set`, and `true` (or
   // `{}`) for "the connected row" on disconnect / delete.
-  const connected = `boolean | Record<string, never> | ${where}`;
+  const connected = `boolean | ${emptyRecord} | ${where}`;
   lines.push(`export interface ${typeName}NestedToOneCreateInput {`);
   lines.push(`  create?: ${typeName}CreateInput | undefined;`);
   lines.push(`  connect?: ${where} | undefined;`);
@@ -1266,7 +1366,7 @@ function zodScalar(ts: string): string {
  * `.array()`, and vectors → `z.array(z.number())`. Does NOT append
  * `.nullable()` / `.optional()`, callers layer those on per-schema.
  *
- * `forWrite` mirrors {@link writeColumnTsType}: the Create/Update schemas
+ * `forWrite` mirrors {@link resolvedColumnType}: the Create/Update schemas
  * validate WRITE input, where a `time` / `timetz` column also accepts a JS
  * `Date` (narrowed to its UTC time of day at bind time), so a bare
  * `z.string()` there would reject a value the runtime happily writes. The
@@ -1303,7 +1403,31 @@ function zodBaseType(col: ColumnMetadata, enums: Record<string, string[]>, forWr
  * the output without writing files.
  */
 export function generateZod(schema: SchemaMetadata, options?: GenerateFileOptions): string {
-  assertEmittableSchema(schema);
+  validateNativeIntegerOptions(options);
+  assertEmittableSchema(mysqlEnumTypeSchema(schema, options?.target));
+  const overrides = options?.exactNativeIntegers ? resolveColumnTypeOverrides(schema, options.columnTypes) : undefined;
+  const baseType = (table: TableMetadata, col: ColumnMetadata, forWrite = false): string => {
+    const key = `${table.name}.${col.name}`;
+    let enumColumn = col;
+    if (options?.target === 'mysql' && (col.dialectType ?? col.pgType) === 'enum') {
+      if (Object.hasOwn(schema.enums, key)) enumColumn = { ...col, dialectType: key };
+      // No exact labels to validate against (see mysqlEnumTypeSchema): the
+      // value is a string, so the schema accepts every label the column can
+      // hold instead of rejecting the true ones over damaged catalog text.
+      else if (col.enumLabelsUnrecoverable) enumColumn = { ...col, dialectType: 'text' };
+    }
+    // Explicit TS overrides retain the existing Zod behavior; arbitrary TS
+    // types cannot be translated to validators by this option.
+    const native =
+      overrideFor(overrides, table.name, col.name) === undefined
+        ? nativeIntegerType(col, schema.enums, options, forWrite)
+        : undefined;
+    return native === undefined
+      ? zodBaseType(enumColumn, schema.enums, forWrite)
+      : forWrite
+        ? 'z.union([z.number(), z.string(), z.bigint()])'
+        : 'z.union([z.number(), z.string()])';
+  };
   const lines: string[] = [...generatedFileHeader(options)];
   // `zod` is a USER dependency, this generated file imports it, but the Turbine
   // library runtime never does, so Zod stays out of the package's dep graph.
@@ -1317,7 +1441,7 @@ export function generateZod(schema: SchemaMetadata, options?: GenerateFileOption
     lines.push(`/** Zod schema for a \`${docSafe(table.name)}\` row */`);
     lines.push(`export const ${typeName}Schema = z.object({`);
     for (const col of table.columns) {
-      let expr = zodBaseType(col, schema.enums);
+      let expr = baseType(table, col);
       if (col.nullable) expr += '.nullable()';
       lines.push(`  ${objectKey(col.field)}: ${expr},`);
     }
@@ -1331,7 +1455,7 @@ export function generateZod(schema: SchemaMetadata, options?: GenerateFileOption
     lines.push(`export const ${typeName}CreateSchema = z.object({`);
     for (const col of table.columns) {
       if (col.isGeneratedStored) continue;
-      let expr = zodBaseType(col, schema.enums, true);
+      let expr = baseType(table, col, true);
       if (col.nullable) expr += '.nullable()';
       if (col.isGenerated === true || col.hasDefault || col.nullable) expr += '.optional()';
       lines.push(`  ${objectKey(col.field)}: ${expr},`);
@@ -1345,7 +1469,7 @@ export function generateZod(schema: SchemaMetadata, options?: GenerateFileOption
     for (const col of table.columns) {
       if (col.isGeneratedStored) continue;
       if (table.primaryKey.includes(col.name)) continue;
-      let expr = zodBaseType(col, schema.enums, true);
+      let expr = baseType(table, col, true);
       if (col.nullable) expr += '.nullable()';
       expr += '.optional()';
       lines.push(`  ${objectKey(col.field)}: ${expr},`);
@@ -1362,6 +1486,7 @@ export function generateZod(schema: SchemaMetadata, options?: GenerateFileOption
 // ---------------------------------------------------------------------------
 
 export function generateMetadata(schema: SchemaMetadata, options?: GenerateFileOptions): string {
+  validateNativeIntegerOptions(options);
   // metadata.ts is where a field collision does its runtime damage: the
   // emitted `columnMap` keeps whichever column was written last, so refuse it
   // here as well as in the type emitters (see assertEmittableSchema).
@@ -1510,13 +1635,18 @@ export function generateMetadata(schema: SchemaMetadata, options?: GenerateFileO
 // ---------------------------------------------------------------------------
 
 export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOptions): string {
-  assertEmittableSchema(schema);
+  const target = generationTarget(options?.target);
+  validateNativeIntegerOptions(options);
+  assertEmittableSchema(mysqlEnumTypeSchema(schema, options?.target));
+  if (target === 'sqlite' || target === 'mysql' || target === 'mssql') {
+    return generateNativeIndex(schema, target, options);
+  }
   const tableEntries = Object.values(schema.tables);
   // Must mirror generateTypes: `XRelations` only exists in types.ts when the
   // table has at least one type-safe (non-column-shadowing) relation.
   const hasSafeRelations = new Map<string, boolean>();
   for (const t of tableEntries) hasSafeRelations.set(t.name, typeSafeRelations(t, false).length > 0);
-  // F3: sibling-import extension. Defaults to '.js' for direct callers so their
+  // Sibling-import extension. Defaults to '.js' for direct callers so their
   // output stays byte-stable; `generate()` resolves it (auto / js / none).
   const ext = options?.importExt ?? '.js';
   const lines: string[] = [
@@ -1547,15 +1677,7 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
   // two spellings the runtime accepts.
   lines.push('/** `globalFilters` for this schema: a where clause (or a function returning one) per table. */');
   lines.push('export interface TurbineGlobalFilters {');
-  for (const table of tableEntries) {
-    const typeName = entityName(table.name);
-    const where = `WhereClause<${typeName}${hasSafeRelations.get(table.name) ? `, ${typeName}Relations` : ''}>`;
-    // `null` (or a function returning it) applies no filter on purpose.
-    const filter = `${where} | null | (() => ${where} | null)`;
-    const accessor = snakeToCamelStr(table.name);
-    lines.push(`  ${quoteIfNeeded(accessor)}?: ${filter} | undefined;`);
-    if (accessor !== table.name) lines.push(`  ${quoteIfNeeded(table.name)}?: ${filter} | undefined;`);
-  }
+  appendGlobalFilterFields(lines, tableEntries);
   lines.push('}');
   lines.push('');
   // Each field also admits an explicit `undefined` (read as unset), so
@@ -1680,7 +1802,7 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
   lines.push('   * callback receives a typed `TypedTransactionClient`, same as `$transaction`.');
   lines.push('   */');
   lines.push('  override $withSession<R>(');
-  lines.push('    context: Record<string, string | number | boolean>,');
+  lines.push(`    context: ${intrinsicRecord('string | number | boolean')},`);
   lines.push('    fn: (tx: TypedTransactionClient) => Promise<R>,');
   lines.push('  ): Promise<R> {');
   lines.push('    return super.$withSession(context, fn as (tx: BaseTransactionClient) => Promise<R>);');
@@ -1709,6 +1831,160 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
   return lines.join('\n');
 }
 
+/** Shared field emitter keeps engine-specific clients on the same filter contract. */
+function appendGlobalFilterFields(lines: string[], tables: TableMetadata[]): void {
+  for (const table of tables) {
+    const typeName = entityName(table.name);
+    const where = `WhereClause<${typeName}${typeSafeRelations(table, false).length > 0 ? `, ${typeName}Relations` : ''}>`;
+    // `null` (or a function returning it) applies no filter on purpose.
+    const filter = `${where} | null | (() => ${where} | null)`;
+    const accessor = snakeToCamelStr(table.name);
+    lines.push(`  ${quoteIfNeeded(accessor)}?: ${filter} | undefined;`);
+    if (accessor !== table.name) lines.push(`  ${quoteIfNeeded(table.name)}?: ${filter} | undefined;`);
+  }
+}
+
+/** Resolve before any output is written: an unknown engine must never emit a PostgreSQL client. */
+function generationTarget(target: GenerateOptions['target']): NonNullable<GenerateOptions['target']> {
+  if (target === undefined || target === 'postgresql') return 'postgresql';
+  if (target === 'sqlite' || target === 'mysql' || target === 'mssql') return target;
+  throw new ValidationError(
+    `Unknown generation target ${JSON.stringify(target)}. Expected "postgresql", "sqlite", "mysql" or "mssql".`,
+  );
+}
+
+/** Validate at every public emitter, and before generate() creates output. */
+function validateNativeIntegerOptions(options?: GenerateFileOptions): void {
+  if (
+    options?.sqliteBinding !== undefined &&
+    (options.target !== 'sqlite' || !['node:sqlite', 'better-sqlite3'].includes(options.sqliteBinding))
+  ) {
+    throw new ValidationError('sqliteBinding requires target: sqlite and either node:sqlite or better-sqlite3.');
+  }
+  if (options?.exactNativeIntegers === undefined) return;
+  if (typeof options.exactNativeIntegers !== 'boolean') {
+    throw new ValidationError('exactNativeIntegers must be a boolean.');
+  }
+  if (options.exactNativeIntegers && generationTarget(options.target) === 'postgresql') {
+    throw new ValidationError('exactNativeIntegers requires an explicit target: sqlite, mysql or mssql.');
+  }
+}
+
+/** Bare type only: callers add nullability. Runtime metadata is never rewritten. */
+function nativeIntegerType(
+  col: ColumnMetadata,
+  enums: Record<string, string[]>,
+  options: GenerateFileOptions | undefined,
+  forWrite = false,
+): string | undefined {
+  if (!options?.exactNativeIntegers || col.declaredTsType !== undefined || col.isArray) return undefined;
+  const declared = col.dialectType ?? col.pgType;
+  if (Object.hasOwn(enums, declared)) return undefined;
+  const type = declared.trim().toLowerCase();
+  // SQLite's INT affinity is substring-based and imposes no declared-width
+  // constraint. Even TINYINT/INT2 can hold every signed 64-bit integer.
+  const integer =
+    options.target === 'sqlite'
+      ? type.includes('int')
+      : options.target === 'mysql'
+        ? /^(?:bigint(?:\(\d+\))?(?: unsigned)?(?: zerofill)?|int8|bigserial)$/.test(type)
+        : /^(?:bigint|int8|bigserial)$/.test(type);
+  return integer ? (forWrite ? 'number | string | bigint' : 'number | string') : undefined;
+}
+
+/** Schema-specific declarations over the native factories, with engine-owned runtime behavior. */
+function generateNativeIndex(
+  schema: SchemaMetadata,
+  target: 'sqlite' | 'mysql' | 'mssql',
+  options?: GenerateFileOptions,
+): string {
+  let engine: string;
+  let factory: string;
+  const optionalSqlite = target === 'sqlite' && options?.sqliteBinding === 'better-sqlite3';
+  if (target === 'sqlite' && !optionalSqlite) {
+    engine = 'Sqlite';
+    factory = `/** Bind this schema synchronously; disconnect closes only Turbine-owned handles. */
+export function turbine(
+  target: string | import('node:sqlite').DatabaseSync,
+  options?: TypedTurbineSqliteOptions,
+): TurbineClient {
+  return turbineSqlite(target, SCHEMA, options as TurbineSqliteOptions | undefined) as TurbineClient;
+}`;
+  } else {
+    engine = optionalSqlite ? 'BetterSqlite3' : target === 'mysql' ? 'Mysql' : 'Mssql';
+    const description = optionalSqlite
+      ? 'Bind this SQLite schema with the optional better-sqlite3 factory.'
+      : target === 'mysql'
+        ? 'Bind this schema asynchronously using the native MySQL factory.'
+        : 'Bind this SQL Server schema; disconnect closes only Turbine-owned pools.';
+    const call = `await turbine${engine}(target, SCHEMA, options as Turbine${engine}Options | undefined)`;
+    factory = `/** ${description} */
+export async function turbine(
+  target: Parameters<typeof turbine${engine}>[0],
+  options?: TypedTurbine${engine}Options,
+): Promise<TurbineClient> {
+  return ${target === 'mssql' ? `(${call})` : call} as TurbineClient;
+}`;
+  }
+  const tables = Object.values(schema.tables);
+  const ext = options?.importExt ?? '.js';
+  const lines = [
+    ...generatedFileHeader(options),
+    ...(options?.importMode ? [`// Sibling imports resolved with importExtension: ${options.importMode}.`, ''] : []),
+    `import { turbine${engine} } from 'turbine-orm/${optionalSqlite ? 'better-sqlite3' : target}';`,
+    `import type { Turbine${engine}Options } from 'turbine-orm/${optionalSqlite ? 'better-sqlite3' : target}';`,
+    "import type { TurbineClient as BaseTurbineClient, TransactionClient as BaseTransactionClient, QueryInterface, TransactionOptions, DeferredQuery, PipelineResults, WhereClause } from 'turbine-orm';",
+    `import { SCHEMA } from './metadata${ext}';`,
+  ];
+  const imports: string[] = [];
+  const accessors = tables
+    .map((table) => {
+      const name = entityName(table.name);
+      const relations = typeSafeRelations(table, false).length > 0 ? `${name}Relations` : undefined;
+      imports.push(name, ...(relations ? [relations] : []), `${name}Inputs`);
+      const args = `${name}, ${relations ?? '{}'}, ${name}Inputs`;
+      return `  readonly ${snakeToCamelStr(table.name)}: ${accessorType(table, args)};`;
+    })
+    .join('\n');
+  if (imports.length > 0) lines.push(`import type { ${imports.join(', ')} } from './types${ext}';`);
+  lines.push('');
+  lines.push('/** Filters keyed by accessor or database table name. */');
+  lines.push('export interface TurbineGlobalFilters {');
+  appendGlobalFilterFields(lines, tables);
+  lines.push(`}
+
+export type TypedTurbine${engine}Options = {
+  [K in Exclude<keyof Turbine${engine}Options, 'globalFilters'>]?: Turbine${engine}Options[K] | undefined;
+} & { globalFilters?: TurbineGlobalFilters | undefined };
+
+export interface TypedTransactionClient extends BaseTransactionClient {
+${accessors}
+  $transaction<R>(fn: (tx: TypedTransactionClient) => Promise<R>): Promise<R>;
+}
+
+export interface TurbineClient extends BaseTurbineClient {
+${accessors}
+  $transaction<R>(
+    fn: (tx: TypedTransactionClient) => Promise<R>,
+    options?: TransactionOptions,
+  ): Promise<R>;
+  $transaction<T extends readonly DeferredQuery<unknown>[]>(
+    queries: readonly [...T],
+    options?: TransactionOptions,
+  ): Promise<PipelineResults<T>>;
+  $withSession<R>(
+    context: ${intrinsicRecord('string | number | boolean')},
+    fn: (tx: TypedTransactionClient) => Promise<R>,
+  ): Promise<R>;
+}
+
+${factory}
+`);
+  lines.push(`export * from './types${ext}';`);
+  lines.push(`export { SCHEMA } from './metadata${ext}';`, '');
+  return lines.join('\n');
+}
+
 // ---------------------------------------------------------------------------
 // prisma-map.ts generator
 // ---------------------------------------------------------------------------
@@ -1717,7 +1993,7 @@ export function generateIndex(schema: SchemaMetadata, options?: GenerateFileOpti
  * Serialize a resolved {@link PrismaCompatMap} into a `prisma-map.ts` module
  * that exports `export const PRISMA_MAP: PrismaCompatMap = {...}`. Written next
  * to the generated client by `turbine migrate-from-prisma`; consumed later by
- * the phase-2 `turbine-orm/prisma-compat` runtime adapter.
+ * the `turbine-orm/prisma-compat` runtime adapter.
  *
  * Deterministic: uses the same reproducible header as the other emitters, so a
  * stable input regenerates byte-identical output under `noTimestamp`.
@@ -1798,6 +2074,7 @@ function accessorType(table: TableMetadata, genericArgs: string): string {
 }
 
 function serializeColumn(col: ColumnMetadata): string {
+  const binary = inferredBinaryType(col);
   const parts = [
     `name: '${escSQ(col.name)}'`,
     `field: '${escSQ(col.field)}'`,
@@ -1810,6 +2087,12 @@ function serializeColumn(col: ColumnMetadata): string {
     `arrayType: '${escSQ(col.arrayType ?? col.pgArrayType)}'`,
     `pgArrayType: '${escSQ(col.pgArrayType)}'`,
   ];
+  if (binary !== undefined) {
+    parts.push(`inferredBinaryType: '${binary}'`);
+    // A declaration taking ownership of a marked type must survive alongside
+    // its hint, so regenerating this metadata keeps that precedence.
+    if (col.declaredTsType !== undefined) parts.push(`declaredTsType: '${escSQ(col.declaredTsType)}'`);
+  }
   // Cross-schema type marker, introspection records it only for types living
   // outside the introspected schema; it must survive codegen or the runtime
   // enum-cast guard in query/builder.ts loses the signal.
@@ -1827,6 +2110,10 @@ function serializeColumn(col: ColumnMetadata): string {
   // object built from `defineSchema` (pii: true) carries it through codegen.
   if (col.pii) parts.push(`pii: true`);
   if (col.updatedAt) parts.push(`updatedAt: true`);
+  // ENUM labels the catalog could not report exactly: must survive codegen,
+  // or regenerating types from this metadata would meet a missing ENUM
+  // identity with no record of why there are no labels to name.
+  if (col.enumLabelsUnrecoverable) parts.push(`enumLabelsUnrecoverable: true`);
   if (col.maxLength !== undefined) parts.push(`maxLength: ${col.maxLength}`);
   // The default expression, so an engine without column defaults (PowDB) can
   // apply it on create. Arbitrary SQL text, so written as a JSON string

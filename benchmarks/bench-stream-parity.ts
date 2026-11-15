@@ -1,381 +1,363 @@
 /**
- * The 50K streaming scenario, with BOTH Turbine spellings in the same rotation.
- *
- * WHY THIS EXISTS, and what it is correcting.
- *
- * `bench-interleaved.ts` runs ONE Turbine stream arm and picks which method it
- * calls from `TURBINE_STREAM`, defaulting to `findManyStream` (the per-row
- * API). Every competitor arm in that scenario, however, consumes ARRAYS: each
- * issues a keyset page, gets a materialised `T[]` of 1000 rows back, and walks
- * it with a plain synchronous `for` loop. So the default configuration compares
- * an arm that pays one generator suspension PER ROW against four arms that pay
- * one per THOUSAND rows, and reports the difference as Turbine being slower.
- *
- * That is a real API difference and worth knowing, but it is not the only
- * comparison worth publishing, and a suite that shows only the unflattering
- * half of it is not neutral. Turbine ships `findManyStreamBatches`, whose unit
- * of work is exactly the competitors': an array per page, walked synchronously.
- *
- * So this harness runs BOTH, in one rotation, against the same competitors, and
- * reports them side by side. Neither is "the" number; the pair is the result.
- *
- * WHAT THE ARMS ACTUALLY DO ON THE WIRE (measured, `stream-arm-audit.ts`):
- *
- *   Turbine       1 speculative `SELECT … LIMIT 1001` that is DISCARDED, then
- *                 BEGIN / DECLARE NO SCROLL CURSOR / 51x FETCH 1000 / CLOSE /
- *                 COMMIT. 56 statements, 51,001 rows decoded to yield 50,000,
- *                 one unordered sequential scan held open in a transaction.
- *   competitors   51x `SELECT … WHERE id > $1 ORDER BY id ASC LIMIT $2`.
- *                 51 statements, 50,000 rows decoded, an ordered index walk per
- *                 page, no transaction, no cursor.
- *
- * They are therefore NOT the same database work, in either direction: Turbine
- * pays 5 extra round trips and 1001 wasted row decodes, the competitors pay an
- * ORDER BY and 51 planner entries. This harness measures what each approach
- * costs end to end; it does not claim they are the same query.
- *
- * MEMORY IS REPORTED BECAUSE TIME ALONE WOULD MISLEAD. A cursor holds a
- * transaction open and streams at constant memory; keyset paging holds no
- * transaction but re-reads an index per page. Peak heap is sampled at every
- * page boundary, not just at the end, so an arm that materialises and then
- * drops cannot hide.
- *
- * Run (>= 3 times, medians only, per RESULTS-0.72.0.md's rule that a single
- * before/after on this machine proves nothing):
- *   DATABASE_URL="postgresql:///turbine_bench?host=/tmp" npx tsx bench-stream-parity.ts
- *
- * Env:
- *   STREAM_ROUNDS=15  interleaved rounds
- *   WARMUP=2          warmup drains per arm
+ * Original 50K drain, using the shared interleaved Bench. Native PostgreSQL
+ * cursor APIs and keyset page emulations remain distinct strategies.
+ * --preflight runs the complete catalog without timing. No row-count oracle.
  */
-
-import pg from 'pg';
+import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import type pg from 'pg';
 import { TurbineClient } from '../generated/turbine/index.js';
-import { drizzle } from 'drizzle-orm/node-postgres';
-import { gt, asc } from 'drizzle-orm';
+import { asc, gt } from 'drizzle-orm';
+import { asc as rcAsc, gt as rcGt } from 'drizzle-rc';
+import { Bench, median } from './bench-harness.js';
 import * as schema from './schema.js';
-import { drizzle as drizzleRc } from 'drizzle-rc/node-postgres';
-import { gt as rcGt, asc as rcAsc } from 'drizzle-rc';
-import { makeJitRqbMapper } from 'drizzle-rc/relations';
 import * as rcSchema from './schema-rc.js';
-import { Bench } from './bench-harness.js';
+import {
+  BATCH,
+  consumer,
+  execute,
+  fixture,
+  integer,
+  isMain,
+  output,
+  type Resources,
+  type RunOptions,
+  type Scenario,
+  type SecondaryArm,
+  STREAM_SCENARIO,
+  verify,
+} from './secondary-contract.js';
 
-const DATABASE_URL = process.env['DATABASE_URL'] ?? 'postgresql:///turbine_bench?host=/tmp';
-const ROUNDS = parseInt(process.env['STREAM_ROUNDS'] ?? '15', 10);
-const WARMUP = parseInt(process.env['WARMUP'] ?? '2', 10);
-const BATCH = 1000;
+export async function streamCleanupControls(r: Resources): Promise<Record<string, unknown>[]> {
+  const outcomes: Record<string, unknown>[] = [];
+  for (const mode of ['break', 'consumer-error'] as const) {
+    const stream = r.turbine.comments.findManyStreamBatches({ batchSize: BATCH, orderBy: { id: 'asc' } });
+    const { trace } = await r.observer.capture(async () => {
+      let seen = 0;
+      try {
+        for await (const rows of stream) {
+          assert.equal(rows.length, BATCH);
+          seen += rows.length;
+          if (mode === 'break') break;
+          if (mode === 'consumer-error') throw new Error('intentional stream consumer failure');
+        }
+        assert.equal(mode, 'break', 'Failure control did not fail');
+      } catch (error) {
+        assert.notEqual(mode, 'break');
+        assert.match(String(error), /intentional stream consumer failure/);
+      }
+      assert.equal(seen, BATCH, 'Failure control must reach the cursor before failing');
+    });
+    assert.ok(
+      trace.commands.some((c) => /^DECLARE /i.test(c.sql)),
+      'Failure control never opened its cursor',
+    );
+    assert.ok(
+      trace.commands.some((c) => /^(?:ROLLBACK|COMMIT)$/.test(c.sql)),
+      'Cursor transaction was not settled',
+    );
+    const check = await r.pools.turbine.connect();
+    try {
+      assert.equal(
+        (await check.query('SELECT count(*)::int AS n FROM pg_cursors')).rows[0]!.n,
+        0,
+        'Native cursor leaked',
+      );
+      await check.query('SELECT 1');
+    } finally {
+      check.release();
+    }
+    outcomes.push({ mode, passed: true, trace });
+  }
+  const packageRequire = createRequire(createRequire(import.meta.url).resolve('turbine-orm'));
+  const nativeIdentity = r.pools.turbine instanceof packageRequire('pg').Pool;
+  if (nativeIdentity) {
+    const controller = new AbortController();
+    const reason = new Error('intentional native stream abort');
+    let delivered = 0;
+    const { trace } = await r.observer.capture(async () => {
+      await assert.rejects(
+        async () => {
+          for await (const rows of r.turbine.comments.findManyStreamBatches({
+            batchSize: BATCH,
+            orderBy: { id: 'asc' },
+            signal: controller.signal,
+          })) {
+            delivered += rows.length;
+            assert.equal(delivered, BATCH, 'Abort must stop further row delivery');
+            controller.abort(reason);
+          }
+        },
+        (error: unknown) => error === reason,
+      );
+    });
+    assert.equal(delivered, BATCH, 'Native abort must reach a real cursor');
+    assert.ok(trace.commands.some((c) => /^DECLARE /i.test(c.sql)));
+    assert.ok(
+      trace.commands.some((c) => /^(?:ROLLBACK|COMMIT)$/.test(c.sql)),
+      'Aborted cursor transaction not settled',
+    );
+    const check = await r.pools.turbine.connect();
+    try {
+      assert.equal(
+        (await check.query('SELECT count(*)::int AS n FROM pg_cursors')).rows[0]!.n,
+        0,
+        'Aborted cursor leaked',
+      );
+      await check.query('SELECT 1');
+    } finally {
+      check.release();
+    }
+    outcomes.push({
+      mode: 'abort',
+      status: 'supported',
+      nativePoolIdentity: true,
+      delivered,
+      trace,
+      scope: 'Abort after first delivered batch; does not certify cancellation during an in-flight server query.',
+    });
+  }
+  // Preserve the native-identity refusal even when npm deduplicates the installed driver.
+  const wrappedPool = {
+    query: r.pools.turbine.query.bind(r.pools.turbine),
+    connect: r.pools.turbine.connect.bind(r.pools.turbine),
+    end: async () => {},
+  };
+  const foreign = nativeIdentity
+    ? new TurbineClient({ pool: wrappedPool as unknown as pg.Pool, logging: false })
+    : r.turbine;
+  try {
+    const { trace } = await r.observer.capture(async () => {
+      await assert.rejects(async () => {
+        for await (const _row of foreign.comments.findManyStream({
+          batchSize: BATCH,
+          orderBy: { id: 'asc' },
+          signal: new AbortController().signal,
+        }))
+          assert.fail('Cancellation refusal must happen before row delivery');
+      }, /TURBINE_E017.*Stream cancellation/);
+    });
+    assert.equal(trace.commands.length, 0, 'Unsupported cancellation emitted SQL');
+    outcomes.push({
+      mode: nativeIdentity ? 'abort-foreign-pool' : 'abort',
+      status: 'unsupported',
+      code: 'E017',
+      commands: 0,
+      reason: 'Native pg pool identity is required; foreign module instances and compatible wrappers are refused.',
+    });
+  } finally {
+    if (foreign !== r.turbine) await foreign.disconnect();
+  }
+  return outcomes;
+}
 
-/** Peak heap per arm, sampled at page boundaries during the timed drain. */
-const peakHeap = new Map<string, number[]>();
-
-/**
- * Per-round timings, recorded by the arms themselves so PAIRED deltas can be
- * computed.
- *
- * On a shared box, comparing two independently-computed medians is the weak
- * form: each median absorbs whatever the machine was doing during that arm's
- * samples, and the drift floor here reached 220% on a first run. A paired
- * delta subtracts the two arms WITHIN a round, where they are separated by
- * milliseconds rather than by the length of the suite, so a load spike that
- * hits the whole round cancels instead of landing on one arm. The median of
- * the per-round deltas is therefore reportable at noise levels where the
- * difference of the medians is not.
- *
- * `Bench.interleave` does not expose its samples, so the arms record their own.
- * Both clocks bracket exactly the same drain.
- */
-const rounds = new Map<string, number[]>();
-
-function timed<T>(arm: string, fn: () => Promise<T>): Promise<T> {
-  const t0 = performance.now();
-  return fn().then((v) => {
-    const list = rounds.get(arm) ?? [];
-    list.push(performance.now() - t0);
-    rounds.set(arm, list);
-    return v;
+export async function runStream(options: RunOptions = {}) {
+  const rounds = integer('STREAM_ROUNDS', 15);
+  const warmup = integer('WARMUP', 2, 0);
+  const url = process.env['DATABASE_URL'] ?? 'postgresql:///turbine_bench?host=/tmp';
+  return execute('stream', url, options, async (r, report, verifyOnly) => {
+    const f = await fixture(r.pools.raw);
+    report.fixture = { fingerprint: f.fingerprint, counts: f.counts };
+    const expected = consumer();
+    for (const row of f.comments) expected.row(row);
+    const heaps = new Map<string, number[]>();
+    const samples = new Map<string, number[]>();
+    let measured = false;
+    const arm = (
+      name: string,
+      role: SecondaryArm['role'],
+      route: SecondaryArm['route'],
+      strategy: string,
+      drain: (consume: (row: unknown) => void, page: () => void) => Promise<void>,
+    ): SecondaryArm => ({
+      name,
+      role,
+      route,
+      strategy,
+      async fn(_i, observe) {
+        const consume = consumer(observe);
+        const start = performance.now();
+        const base = process.memoryUsage().heapUsed;
+        let peak = base;
+        const page = () => {
+          peak = Math.max(peak, process.memoryUsage().heapUsed);
+        };
+        await drain(consume.row, page);
+        const value = consume.done();
+        if (measured) {
+          samples.set(name, [...(samples.get(name) ?? []), performance.now() - start]);
+          heaps.set(name, [...(heaps.get(name) ?? []), (peak - base) / 1024 / 1024]);
+        }
+        return value;
+      },
+    });
+    const batches = async (consume: (row: unknown) => void, page: () => void) => {
+      for await (const batch of r.turbine.comments.findManyStreamBatches({
+        batchSize: BATCH,
+        orderBy: { id: 'asc' },
+      })) {
+        page();
+        for (const row of batch) consume(row);
+      }
+    };
+    const scenarios: Scenario[] = [
+      {
+        scenario: STREAM_SCENARIO,
+        expected: expected.done(),
+        stream: f.comments,
+        note: 'Full ordered row values are consumed into the same SHA256 fold in every arm. T rows/batches use a native transaction cursor with a bounded speculative SELECT; competitors use keyset SELECT pages. Prisma is page emulation, not native streaming. Stable and RC are separate arms. Heap is sampled at page boundaries, not a process-wide memory bound.',
+        arms: [
+          arm('T rows', 'turbine', 'cursor', 'native cursor, per-row async iterator', async (consume, page) => {
+            let n = 0;
+            for await (const row of r.turbine.comments.findManyStream({ batchSize: BATCH, orderBy: { id: 'asc' } })) {
+              consume(row);
+              if (++n % BATCH === 0) page();
+            }
+          }),
+          arm('T batches', 'turbine', 'cursor', 'native cursor, per-batch async iterator', batches),
+          arm('T batches#2', 'turbine', 'cursor', 'identical native batch control', batches),
+          arm('Drizzle', 'stable', 'keyset', 'keyset pages, not native streaming', async (consume, page) => {
+            let last = 0;
+            for (;;) {
+              const rows = await r.stable
+                .select()
+                .from(schema.comments)
+                .where(gt(schema.comments.id, last))
+                .orderBy(asc(schema.comments.id))
+                .limit(BATCH);
+              page();
+              for (const row of rows) {
+                consume(row);
+                last = row.id;
+              }
+              if (rows.length < BATCH) break;
+            }
+          }),
+          arm(
+            'Drizzle RC',
+            'rc',
+            'keyset',
+            'keyset pages via RC SQL builder; relational JIT is not used by select()',
+            async (consume, page) => {
+              let last = 0;
+              for (;;) {
+                const rows = await r.rc
+                  .select()
+                  .from(rcSchema.comments)
+                  .where(rcGt(rcSchema.comments.id, last))
+                  .orderBy(rcAsc(rcSchema.comments.id))
+                  .limit(BATCH);
+                page();
+                for (const row of rows) {
+                  consume(row);
+                  last = row.id;
+                }
+                if (rows.length < BATCH) break;
+              }
+            },
+          ),
+          arm(
+            'Prisma 7 pages',
+            'prisma',
+            'keyset',
+            'Prisma7 keyset page emulation, not native streaming',
+            async (consume, page) => {
+              let last = 0n;
+              for (;;) {
+                const rows = await r.prisma.comment.findMany({
+                  where: { id: { gt: last } },
+                  orderBy: { id: 'asc' },
+                  take: BATCH,
+                });
+                page();
+                for (const row of rows) {
+                  consume(row);
+                  last = row.id;
+                }
+                if (rows.length < BATCH) break;
+              }
+            },
+          ),
+          arm('Raw', 'raw', 'keyset', 'native pg keyset pages', async (consume, page) => {
+            let last = '0';
+            for (;;) {
+              const { rows } = await r.pools.raw.query(
+                'SELECT * FROM comments WHERE id > $1 ORDER BY id ASC LIMIT $2',
+                [last, BATCH],
+              );
+              page();
+              for (const row of rows) {
+                consume(row);
+                last = String(row.id);
+              }
+              if (rows.length < BATCH) break;
+            }
+          }),
+        ],
+      },
+    ];
+    options.mutate?.(scenarios);
+    await verify(r, scenarios, report);
+    report.failureControls = await streamCleanupControls(r);
+    r.observer.disable();
+    if (!verifyOnly) {
+      const bench = new Bench({ rounds, warmup });
+      const before = await bench.driftProbe(r.pools.raw, 'head');
+      // Bench's warmup is deliberately excluded from paired per-round samples.
+      for (const a of scenarios[0]!.arms) for (let i = 0; i < warmup; i++) await a.fn(i);
+      measured = true;
+      await bench.interleave(STREAM_SCENARIO, scenarios[0]!.arms, { warmup: 0, note: scenarios[0]!.note });
+      measured = false;
+      const after = await bench.driftProbe(r.pools.raw, 'tail');
+      bench.reportDrift([before, after]);
+      report.results = bench.results;
+      report.drift = { before, after, samples: bench.probes };
+      report.peakHeapMb = Object.fromEntries(
+        [...heaps].map(([name, xs]) => [
+          name,
+          {
+            median: median([...xs].sort((a, b) => a - b)),
+            max: Math.max(...xs),
+            ...(process.env.BENCH_RETAIN_SAMPLES === '1'
+              ? { samplesMb: [...xs], n: xs.length, scope: 'heapUsed snapshots during complete drains; not global RSS' }
+              : {}),
+          },
+        ]),
+      );
+      report.paired = Object.fromEntries(
+        ['T rows', 'T batches#2', 'Drizzle', 'Drizzle RC', 'Prisma 7 pages', 'Raw'].map((name) => {
+          const a = samples.get(name)!;
+          const b = samples.get('T batches')!;
+          const deltas = a.map((v, i) => v - b[i]!);
+          return [
+            name,
+            {
+              baseline: 'T batches',
+              n: deltas.length,
+              medianDeltaMs: median([...deltas].sort((x, y) => x - y)),
+              ...(process.env.BENCH_RETAIN_SAMPLES === '1'
+                ? { samplesMs: [...deltas], method: 'paired per-round arm minus T batches duration' }
+                : {}),
+              fractionBelowBaseline: deltas.filter((d) => d < 0).length / deltas.length,
+            },
+          ];
+        }),
+      );
+    }
+    // Reads and failed consumers must leave the complete original fixture intact.
+    assert.equal((await fixture(r.pools.raw)).fingerprint, f.fingerprint, 'Stream changed stored values');
+    report.rounds = rounds;
+    report.warmup = warmup;
+    report.fold =
+      'Length-framed canonical complete rows, SHA256; untimed preflight also compares each complete row in sequence.';
   });
 }
 
-/**
- * Median of the per-round differences between two arms, with the fraction of
- * rounds in which `a` won. The win rate is reported because a median delta of
- * a few percent on a noisy box is only meaningful if it is CONSISTENT: a real
- * difference wins most rounds, a phantom one wins about half.
- */
-function paired(a: string, b: string): { delta: number; pct: number; winRate: number } | undefined {
-  const xa = rounds.get(a);
-  const xb = rounds.get(b);
-  if (!xa || !xb || xa.length !== xb.length || xa.length === 0) return undefined;
-  const deltas = xa.map((v, i) => v - xb[i]!);
-  const wins = deltas.filter((d) => d < 0).length;
-  const mb = med(xb);
-  return { delta: med(deltas), pct: (med(deltas) / mb) * 100, winRate: wins / deltas.length };
+if (isMain(import.meta.url)) {
+  runStream({ verifyOnly: process.argv.includes('--preflight'), reportPath: process.env['SECONDARY_REPORT'] })
+    .then(output)
+    .catch((error) => {
+      console.error(error);
+      process.exitCode = 1;
+    });
 }
-
-function sampler(arm: string): { onPage: () => void; done: () => void } {
-  const base = process.memoryUsage().heapUsed;
-  let peak = base;
-  return {
-    onPage: () => {
-      const h = process.memoryUsage().heapUsed;
-      if (h > peak) peak = h;
-    },
-    done: () => {
-      const list = peakHeap.get(arm) ?? [];
-      list.push((peak - base) / 1024 / 1024);
-      peakHeap.set(arm, list);
-    },
-  };
-}
-
-function med(xs: number[]): number {
-  const s = [...xs].sort((a, b) => a - b);
-  const n = s.length;
-  if (n === 0) return Number.NaN;
-  return n % 2 ? s[(n - 1) / 2]! : (s[n / 2 - 1]! + s[n / 2]!) / 2;
-}
-
-async function main(): Promise<void> {
-  const bench = new Bench({ rounds: ROUNDS, warmup: WARMUP });
-  console.log('='.repeat(96));
-  console.log('50K STREAM PARITY, both Turbine spellings in one rotation');
-  console.log(`ROUNDS=${ROUNDS} WARMUP=${WARMUP} BATCH=${BATCH} Node ${process.version}`);
-  console.log('='.repeat(96));
-
-  const turbine = new TurbineClient({ connectionString: DATABASE_URL, logging: false });
-  await turbine.connect();
-
-  const drizzlePool = new pg.Pool({ connectionString: DATABASE_URL, max: 10 });
-  const drizzleDb = drizzle(drizzlePool, { schema });
-
-  const rcPool = new pg.Pool({ connectionString: DATABASE_URL, max: 10 });
-  const rcDb = drizzleRc({ client: rcPool, relations: rcSchema.relations, jit: true });
-
-  const rawPool = new pg.Pool({ connectionString: DATABASE_URL, max: 10 });
-
-  /**
-   * The `T batches` drain, shared by the real arm and its negative control so
-   * the two are the SAME CODE and not two copies that could drift apart. A
-   * negative control written out twice would eventually stop being one.
-   */
-  const turbineBatchDrain = async (armName: string): Promise<number> => {
-    const s = sampler(armName);
-    let n = 0;
-    for await (const batch of turbine.comments.findManyStreamBatches({ batchSize: BATCH })) {
-      s.onPage();
-      for (const _c of batch) n++;
-    }
-    s.done();
-    return n;
-  };
-
-  /**
-   * Assert the RC arm's JIT mapper really engaged. `drizzleRc(pool, config)`
-   * silently discards the config (it destructures `client` off the pool, finds
-   * nothing, and builds its own), so an arm labelled "jit" can quietly be
-   * running the interpreted mapper. Same check `bench-interleaved.ts` makes,
-   * for the same reason: an unverified arm label is how a suite comes to
-   * publish a number for code it never ran.
-   */
-  const jitProbe = makeJitRqbMapper.toString();
-  if (jitProbe.length < 20) {
-    console.error('Could not verify the RC JIT mapper. Refusing to report numbers.');
-    process.exit(1);
-  }
-  const rcRows = await rcDb.select().from(rcSchema.comments).limit(1);
-  if (rcRows.length !== 1 || typeof rcRows[0]!.id !== 'number') {
-    console.error('RC arm did not return the expected row shape. Refusing to report numbers.');
-    process.exit(1);
-  }
-  console.log('RC arm: jit mapper present, row shape verified.\n');
-
-  const driftHead = await bench.driftProbe(rawPool, 'head');
-
-  await bench.interleave(
-    'stream, iterate 50K comments (batch 1000)',
-    [
-      {
-        name: 'T rows',
-        fn: () =>
-          timed('T rows', async () => {
-            const s = sampler('T rows');
-            let n = 0;
-            for await (const _c of turbine.comments.findManyStream({ batchSize: BATCH })) {
-              n++;
-              if (n % BATCH === 0) s.onPage();
-            }
-            s.done();
-            return n;
-          }),
-      },
-      {
-        name: 'T batches',
-        fn: () => timed('T batches', () => turbineBatchDrain('T batches')),
-      },
-      {
-        /**
-         * NEGATIVE CONTROL. Byte-identical work to `T batches`, run under a
-         * second name. Rotation is supposed to neutralise arm position, and
-         * these two are the test of whether it did: they must land on top of
-         * each other. If they do not, position is still leaking into the
-         * numbers and no delta in this table is reportable, however clean the
-         * competitor arms look.
-         */
-        name: 'T batches#2',
-        fn: () => timed('T batches#2', () => turbineBatchDrain('T batches#2')),
-      },
-      {
-        name: 'Drizzle RC',
-        fn: () =>
-          timed('Drizzle RC', async () => {
-            const s = sampler('Drizzle RC');
-            let n = 0;
-            let lastId = 0;
-            for (;;) {
-              const batch = await rcDb
-                .select()
-                .from(rcSchema.comments)
-                .where(rcGt(rcSchema.comments.id, lastId))
-                .orderBy(rcAsc(rcSchema.comments.id))
-                .limit(BATCH);
-              s.onPage();
-              if (batch.length === 0) break;
-              for (const row of batch) {
-                n++;
-                lastId = row.id;
-              }
-              if (batch.length < BATCH) break;
-            }
-            s.done();
-            return n;
-          }),
-      },
-      {
-        name: 'Drizzle',
-        fn: () =>
-          timed('Drizzle', async () => {
-            const s = sampler('Drizzle');
-            let n = 0;
-            let lastId = 0;
-            for (;;) {
-              const batch = await drizzleDb
-                .select()
-                .from(schema.comments)
-                .where(gt(schema.comments.id, lastId))
-                .orderBy(asc(schema.comments.id))
-                .limit(BATCH);
-              s.onPage();
-              if (batch.length === 0) break;
-              for (const row of batch) {
-                n++;
-                lastId = row.id;
-              }
-              if (batch.length < BATCH) break;
-            }
-            s.done();
-            return n;
-          }),
-      },
-      {
-        name: 'Raw',
-        fn: () =>
-          timed('Raw', async () => {
-            const s = sampler('Raw');
-            let n = 0;
-            let lastId = 0;
-            for (;;) {
-              const res = await rawPool.query(
-                'SELECT * FROM comments WHERE id > $1 ORDER BY id ASC LIMIT $2',
-                [lastId, BATCH],
-              );
-              s.onPage();
-              if (res.rows.length === 0) break;
-              for (const row of res.rows) {
-                n++;
-                lastId = Number(row.id);
-              }
-              if (res.rows.length < BATCH) break;
-            }
-            s.done();
-            return n;
-          }),
-      },
-    ],
-    { rounds: ROUNDS, warmup: WARMUP },
-  );
-
-  const driftTail = await bench.driftProbe(rawPool, 'tail');
-  bench.reportDrift([driftHead, driftTail]);
-
-  const control = paired('T batches#2', 'T batches');
-  console.log('\n-- negative control (must be ~0; it is the licence to read the table below) --');
-  if (control) {
-    console.log(
-      `  T batches#2 vs T batches: ${control.delta >= 0 ? '+' : ''}${control.delta.toFixed(3)} ms ` +
-        `(${control.pct >= 0 ? '+' : ''}${control.pct.toFixed(1)}%), identical work`,
-    );
-  }
-
-  const yieldCost = paired('T rows', 'T batches');
-  console.log('\n-- attribution: what the per-row API costs over the batch API --');
-  if (yieldCost) {
-    console.log(
-      `  T rows vs T batches: ${yieldCost.delta >= 0 ? '+' : ''}${yieldCost.delta.toFixed(3)} ms ` +
-        `(${yieldCost.pct >= 0 ? '+' : ''}${yieldCost.pct.toFixed(1)}%) = ` +
-        `${((yieldCost.delta * 1e6) / 50000).toFixed(0)} ns/row of generator suspension`,
-    );
-  }
-
-  /**
-   * The DISCARDED speculative fetch, priced on its own.
-   *
-   * `streamRaw` opens every drain with `SELECT … LIMIT batchSize + 1`, so that a
-   * result set fitting in one batch can skip the cursor and save four round
-   * trips. When the drain overflows (as a 50K one always does) those
-   * `batchSize + 1` rows are transferred, decoded into JS objects, and thrown
-   * away: the audit shows Turbine decoding 51,001 rows to deliver 50,000.
-   *
-   * This measures exactly that statement, through Turbine's own client so it
-   * pays Turbine's own decode, and nothing else. It is the price of the bet the
-   * speculation makes, and it is charged to every drain that loses it.
-   */
-  const specSamples: number[] = [];
-  for (let i = 0; i < 5; i++) await turbine.comments.findMany({ limit: BATCH + 1 });
-  for (let i = 0; i < 21; i++) {
-    const t0 = performance.now();
-    await turbine.comments.findMany({ limit: BATCH + 1 });
-    specSamples.push(performance.now() - t0);
-  }
-  console.log(
-    `  discarded speculative fetch (SELECT … LIMIT ${BATCH + 1}, decoded then dropped): ` +
-      `${med(specSamples).toFixed(3)} ms`,
-  );
-
-  console.log('\n-- paired per-round deltas vs Drizzle RC (negative = Turbine faster) --');
-  for (const arm of ['T rows', 'T batches']) {
-    const d = paired(arm, 'Drizzle RC');
-    if (!d) continue;
-    console.log(
-      `  ${arm.padEnd(12)} ${d.delta >= 0 ? '+' : ''}${d.delta.toFixed(3)} ms ` +
-        `(${d.pct >= 0 ? '+' : ''}${d.pct.toFixed(1)}%), won ${(d.winRate * 100).toFixed(0)}% of rounds`,
-    );
-  }
-
-  console.log('\n-- peak heap during the drain, MB above the arm\'s own baseline --');
-  console.log(`  ${'arm'.padEnd(12)} ${'median'.padStart(9)} ${'max'.padStart(9)}`);
-  for (const [arm, xs] of peakHeap) {
-    console.log(
-      `  ${arm.padEnd(12)} ${med(xs).toFixed(1).padStart(9)} ${Math.max(...xs).toFixed(1).padStart(9)}`,
-    );
-  }
-
-  await turbine.disconnect();
-  await drizzlePool.end();
-  await rcPool.end();
-  await rawPool.end();
-}
-
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});

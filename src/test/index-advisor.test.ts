@@ -181,7 +181,7 @@ test('builder emits a dev-mode warning once for unindexed relation probes', asyn
 });
 
 // ---------------------------------------------------------------------------
-// F4a: doc-field (docPath) expression indexes are ignored by the advisor
+// Doc-field (docPath) expression indexes are ignored by the advisor
 // ---------------------------------------------------------------------------
 
 test('a doc-field index never satisfies an equality probe on its column', () => {

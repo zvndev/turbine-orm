@@ -7,19 +7,28 @@
 
 import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { assertD1Config, type D1LocalConfig } from './d1-config.js';
 import { PASSWORD_QUERY_PARAM_PATTERN } from './ui.js';
 
 // ---------------------------------------------------------------------------
 // Config types
 // ---------------------------------------------------------------------------
 
+export type { D1SeedPlan, D1SeedValue } from './d1-config.js';
+
+export type CliEngine = 'postgresql' | 'sqlite' | 'mysql' | 'mssql' | 'libsql' | 'd1';
+
 export interface TurbineCliConfig {
-  /** Postgres connection string */
+  /** Explicit persistent local Miniflare D1 binding. */
+  d1?: D1LocalConfig;
+  /** CLI database engine (default: postgresql). */
+  engine?: CliEngine;
+  /** Engine connection URL, or persistent SQLite filename / file URL. */
   url?: string;
   /** Output directory for generated files (default: ./generated/turbine) */
   out?: string;
-  /** Postgres schema to introspect (default: public) */
+  /** Namespace to introspect (PostgreSQL: public; MySQL: URL database; MSSQL: dbo; SQLite: main). */
   schema?: string;
   /** Tables to include (empty = all) */
   include?: string[];
@@ -44,7 +53,7 @@ export interface TurbineCliConfig {
    */
   columnTypes?: Record<string, string>;
   /**
-   * Extension for the generated `index.ts` sibling imports (F3):
+   * Extension for the generated `index.ts` sibling imports:
    * `'js'` (`./types.js`), `'ts'` (`./types.ts`, for Node's native type
    * stripping), `'none'` (`./types`), or `'auto'` (default: tsconfig-detected,
    * falling back to `'js'`; never picks `'ts'`).
@@ -52,11 +61,13 @@ export interface TurbineCliConfig {
   importExtension?: 'js' | 'ts' | 'none' | 'auto';
   /**
    * Keep raw database column names as generated field names (snake_case)
-   * instead of camelCase (F4). Opt-in; default `false`.
+   * instead of camelCase. Opt-in; default `false`.
    */
   keepColumnNames?: boolean;
+  /** Opt-in native integer generation; sqlite/mysql/mssql only. */
+  exactNativeIntegers?: boolean;
   /**
-   * Opt OUT of the unique-FK → one-to-one (`hasOne`) introspection flip (F2),
+   * Opt OUT of the unique-FK → one-to-one (`hasOne`) introspection flip,
    * emitting the pre-0.41 `hasMany` shape for unique-covered child relations.
    * Default `false` (detection on).
    */
@@ -174,8 +185,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * Turbine config field is named `default`, so a real config never matches.
  */
 function isPureDefaultWrapper(value: Record<string, unknown>): boolean {
-  const keys = Object.keys(value).filter((k) => k !== '__esModule');
-  return keys.length === 1 && keys[0] === 'default';
+  const keys = Object.keys(value);
+  return keys.includes('default') && keys.every((key) => key === 'default' || key === '__esModule');
 }
 
 /**
@@ -222,12 +233,15 @@ export function unwrapConfigModule(mod: unknown): TurbineCliConfig {
  *
  * Candidates are tried in {@link CONFIG_FILES} priority order. The first one
  * that imports successfully wins. If a candidate exists but throws (syntax
- * error, ESM/CJS interop failure, etc.) we remember the first such error and
+ * error, ESM/CJS interop failure, etc.), retain the first such error and
  * keep trying lower-priority candidates; if none load, the remembered error is
  * returned in `loadError` while `config` stays `{}` so env/flag resolution can
  * still proceed.
  */
-export async function loadConfigResult(cwd?: string): Promise<ConfigLoadResult> {
+export async function loadConfigResult(
+  cwd?: string,
+  importModule?: (url: string) => Promise<unknown>,
+): Promise<ConfigLoadResult> {
   const dir = cwd ?? process.cwd();
   let loadError: ConfigLoadError | undefined;
 
@@ -236,12 +250,11 @@ export async function loadConfigResult(cwd?: string): Promise<ConfigLoadResult> 
     if (!existsSync(filePath)) continue;
 
     try {
-      const absPath = resolve(filePath);
-      const fileUrl = pathToFileURL(absPath).href;
+      const fileUrl = pathToFileURL(filePath).href;
 
-      // For .ts files, we rely on the tsx loader being registered by the CLI
+      // For .ts files, the CLI must register the tsx loader before importing.
       // before this runs. Dynamic import handles .js/.mjs natively.
-      const mod = await import(fileUrl);
+      const mod = await (importModule ? importModule(fileUrl) : import(fileUrl));
       return { config: unwrapConfigModule(mod) };
     } catch (err) {
       // Remember the first real load failure but keep trying lower-priority
@@ -280,6 +293,9 @@ export function findConfigFile(cwd?: string): string | null {
 // ---------------------------------------------------------------------------
 
 export interface ResolvedConfig {
+  d1?: D1LocalConfig;
+  /** Optional for compatibility with older typed fixtures; resolution always sets it. */
+  engine?: CliEngine;
   url: string;
   out: string;
   schema: string;
@@ -294,11 +310,13 @@ export interface ResolvedConfig {
    * an error; a missing default just means a database-first project.
    */
   schemaFileConfigured?: boolean;
-  /** Resolved generator import-extension mode (F3). */
+  /** Resolved generator import-extension mode. */
   importExtension: 'js' | 'ts' | 'none' | 'auto';
-  /** Resolved keep-column-names generator flag (F4). */
+  /** Resolved keep-column-names generator flag. */
   keepColumnNames: boolean;
-  /** Resolved opt-out of the unique-FK → hasOne introspection flip (F2). */
+  /** Opt-in native integer declarations. */
+  exactNativeIntegers?: boolean;
+  /** Resolved opt-out of the unique-FK → hasOne introspection flip. */
   legacyToManyUniques: boolean;
   /** Resolved derived-relation rename map, or undefined when none is declared. */
   relationNames?: Record<string, Record<string, string>>;
@@ -312,6 +330,7 @@ export interface ResolvedConfig {
 }
 
 export interface CliOverrides {
+  engine?: CliEngine;
   url?: string;
   out?: string;
   schema?: string;
@@ -321,6 +340,8 @@ export interface CliOverrides {
   exclude?: string[];
   importExtension?: 'js' | 'ts' | 'none' | 'auto';
   keepColumnNames?: boolean;
+  /** Opt-in native integer generation; sqlite/mysql/mssql only. */
+  exactNativeIntegers?: boolean;
   legacyToManyUniques?: boolean;
 }
 
@@ -337,28 +358,164 @@ export function firstNonEmpty(...candidates: Array<string | undefined>): string 
   return undefined;
 }
 
+/** Validate config arguments with TypeError; the command boundary adds its E003 diagnostic. */
+export function resolveCliEngine(engine: unknown): CliEngine {
+  if (engine === undefined) return 'postgresql';
+  if (['postgresql', 'sqlite', 'mysql', 'mssql', 'libsql', 'd1'].includes(engine as string)) return engine as CliEngine;
+  throw new TypeError('Unknown CLI engine.');
+}
+
+/** Validate the endpoint fields consumed by the native network introspectors. */
+function networkDatabaseFromUrl(url: string, protocol: string, label: string): string {
+  try {
+    if (typeof url !== 'string' || /[\s\0?#]/.test(url)) throw new Error();
+    const parsed = new URL(url);
+    const database = decodeURIComponent(parsed.pathname.slice(1));
+    decodeURIComponent(parsed.username);
+    decodeURIComponent(parsed.password);
+    if (parsed.protocol !== `${protocol}:` || !parsed.hostname || !database || /[/\\\0]/.test(database)) {
+      throw new Error();
+    }
+    return database;
+  } catch {
+    throw new TypeError(
+      `${label} CLI requires ${protocol}://host/database with valid URL escaping and no query parameters or fragments. Use a native pool for advanced connection options.`,
+    );
+  }
+}
+
+/** Resolve the MySQL database without opening a connection or exposing credentials. */
+export function mysqlDatabaseFromUrl(url: string): string {
+  return networkDatabaseFromUrl(url, 'mysql', 'MySQL');
+}
+
+/** Resolve a local, persistent SQLite target without opening or creating it. */
+export function normalizeSqlitePath(url: string, cwd = process.cwd()): string {
+  if (typeof url !== 'string' || !url.trim() || url.includes('\0')) {
+    throw new TypeError('SQLite requires a nonempty persistent database path.');
+  }
+  let path = url.trim();
+  if (
+    /^postgres(?:ql)?:/i.test(path) ||
+    /(?:^|\s)(?:host|hostaddr|dbname|user|password|port|service|sslmode|connect_timeout)\s*=/i.test(path)
+  ) {
+    throw new TypeError('A PostgreSQL connection string cannot be used with engine "sqlite".');
+  }
+  const uri = /^(file|sqlite):/i.exec(path);
+  if (uri) {
+    const value = path.slice(uri[0].length);
+    if (/[?#]/.test(value)) {
+      throw new TypeError('SQLite CLI file URLs cannot contain query parameters or fragments.');
+    }
+    try {
+      if (value.startsWith('//')) {
+        // Both spellings use file URL rules, including rejection of remote hosts.
+        const parsed = new URL(`file:${value}`);
+        if (parsed.hostname && parsed.hostname !== 'localhost') throw new Error('remote host');
+        path = fileURLToPath(parsed);
+      } else {
+        path = decodeURIComponent(value);
+      }
+    } catch {
+      throw new TypeError('Invalid SQLite file URL. Use a local filename or file:///absolute/path.');
+    }
+  } else if (/^[a-z][a-z\d+.-]*:/i.test(path)) {
+    throw new TypeError('SQLite requires a local database path, not a network connection URL.');
+  }
+  if (path.includes('\0')) throw new TypeError('SQLite database paths cannot contain NUL characters.');
+  if (!path.trim() || path === ':memory:' || /(?:^|[/\\]):memory:(?:$|[/\\])/i.test(path)) {
+    throw new TypeError('SQLite CLI commands require a persistent file; :memory: cannot survive between commands.');
+  }
+  return resolve(cwd, path);
+}
+
+/** Refuse SQLite targets on the default PG path before a driver sees them. */
+export function validateCliEngineUrl(engine: CliEngine, url: string): void {
+  // The libSQL route validates and normalizes with its real effect-free helper.
+  // This config-only entry deliberately avoids importing the native graph.
+  if (engine === 'd1' && url) throw new TypeError('Remove url and DATABASE_URL for local D1.');
+  if (!url || engine === 'libsql') return;
+  if (engine === 'mysql') {
+    mysqlDatabaseFromUrl(url);
+  } else if (engine === 'mssql') {
+    networkDatabaseFromUrl(url, 'mssql', 'MSSQL');
+  } else if (/^mssql:/i.test(url.trim())) {
+    throw new TypeError('A SQL Server connection URL requires engine "mssql" (or --engine mssql).');
+  } else if (engine === 'sqlite') {
+    normalizeSqlitePath(url);
+  } else if (/^mysql:/i.test(url.trim())) {
+    throw new TypeError('A MySQL URL requires engine "mysql" (or --engine mysql).');
+  } else if (/^(?:postgres(?:ql)?:|\s*[a-z_]+\s*=)/i.test(url.trim())) {
+    // Database names may themselves end in .db; preserve libpq strings too.
+    return;
+  } else if (/^\/\S+\s+\S+$/.test(url.trim())) {
+    // pg accepts "<Unix socket directory> <database>" as a connection string.
+    return;
+  } else if (/^(?:file:|sqlite:|:memory:|\.{0,2}[/\\]|[a-z]:[/\\])|\.(?:db|sqlite3?)(?:[?#].*)?$/i.test(url.trim())) {
+    throw new TypeError('A SQLite database path requires engine "sqlite" (or --engine sqlite).');
+  }
+}
+
 /**
  * Merge config file values with CLI overrides and env vars.
  * Priority: CLI flags > env vars > config file > defaults.
  */
 export function resolveConfig(fileConfig: TurbineCliConfig, overrides: CliOverrides): ResolvedConfig {
+  const option = <K extends keyof CliOverrides>(key: K) => overrides[key] ?? fileConfig[key];
+  for (const value of [fileConfig.exactNativeIntegers, overrides.exactNativeIntegers]) {
+    if (value !== undefined && typeof value !== 'boolean') {
+      throw new TypeError('exactNativeIntegers must be a boolean.');
+    }
+  }
+  // Validate both supplied values, even when a flag would override a bad file value.
+  if (fileConfig.engine !== undefined) resolveCliEngine(fileConfig.engine);
+  const engine = resolveCliEngine(overrides.engine !== undefined ? overrides.engine : fileConfig.engine);
+  if (engine === 'd1') assertD1Config(fileConfig);
+  const url = firstNonEmpty(overrides.url, process.env.DATABASE_URL, fileConfig.url) ?? '';
+  validateCliEngineUrl(engine, url);
+  if (engine !== 'postgresql' && fileConfig.adapter !== undefined) {
+    throw new TypeError(`PostgreSQL adapters cannot be used with engine "${engine}".`);
+  }
+  if (
+    engine === 'mysql' &&
+    option('schema') !== undefined &&
+    option('schema') !== (url ? mysqlDatabaseFromUrl(url) : '')
+  ) {
+    throw new TypeError('MySQL CLI schema must match the database in its URL.');
+  }
+  if (engine === 'sqlite' && (option('schema') ?? 'main') !== 'main') {
+    throw new TypeError('SQLite CLI introspection uses schema "main"; PostgreSQL namespaces are not supported.');
+  }
   return {
-    url: firstNonEmpty(overrides.url, process.env.DATABASE_URL, fileConfig.url) ?? '',
-    out: overrides.out ?? fileConfig.out ?? './generated/turbine',
-    schema: overrides.schema ?? fileConfig.schema ?? 'public',
-    include: overrides.include ?? fileConfig.include ?? [],
+    engine,
+    d1: fileConfig.d1,
+    url: engine === 'sqlite' && url ? normalizeSqlitePath(url) : url,
+    out: option('out') ?? './generated/turbine',
+    schema:
+      option('schema') ??
+      (engine === 'postgresql'
+        ? 'public'
+        : engine === 'mssql'
+          ? 'dbo'
+          : engine === 'mysql'
+            ? url
+              ? mysqlDatabaseFromUrl(url)
+              : ''
+            : 'main'),
+    include: option('include') ?? [],
     relationNames: fileConfig.relationNames,
     columnTypes: fileConfig.columnTypes,
-    exclude: overrides.exclude ?? fileConfig.exclude ?? [],
+    exclude: option('exclude') ?? [],
     migrationsDir: fileConfig.migrationsDir ?? './turbine/migrations',
     // `seedFile` is canonical (what the docs and `turbine init` use); `seed` is a
     // back-compat alias kept working for configs scaffolded before 0.50.
     seedFile: fileConfig.seedFile ?? fileConfig.seed,
-    schemaFile: overrides.schemaFile ?? fileConfig.schemaFile ?? './turbine/schema.ts',
-    schemaFileConfigured: (overrides.schemaFile ?? fileConfig.schemaFile) !== undefined,
-    importExtension: overrides.importExtension ?? fileConfig.importExtension ?? 'auto',
-    keepColumnNames: overrides.keepColumnNames ?? fileConfig.keepColumnNames ?? false,
-    legacyToManyUniques: overrides.legacyToManyUniques ?? fileConfig.legacyToManyUniques ?? false,
+    schemaFile: option('schemaFile') ?? './turbine/schema.ts',
+    schemaFileConfigured: option('schemaFile') !== undefined,
+    importExtension: option('importExtension') ?? 'auto',
+    keepColumnNames: option('keepColumnNames') ?? false,
+    exactNativeIntegers: option('exactNativeIntegers') ?? false,
+    legacyToManyUniques: option('legacyToManyUniques') ?? false,
     adapter: fileConfig.adapter,
   };
 }
@@ -425,8 +582,8 @@ export function connectionStringHasPassword(connectionString: string): boolean {
   try {
     const parsed = new URL(value);
     // An empty password ("postgres://user@host/db", "?password=") is not a
-    // secret. decodeURIComponent is deliberately NOT applied: presence is all
-    // we need, and a percent-encoded value is still a non-empty one.
+    // secret. decodeURIComponent is deliberately NOT applied: presence is
+    // sufficient, and a percent-encoded value is still a non-empty one.
     if (parsed.password !== '') return true;
     for (const match of value.matchAll(new RegExp(PASSWORD_QUERY_PARAM_PATTERN, 'gi'))) {
       if (match[2] !== '') return true;
@@ -462,40 +619,20 @@ export function configTemplate(connectionString?: string, schema = 'public'): st
   const inlineUrl = connectionString && !connectionStringHasPassword(connectionString) ? connectionString : undefined;
   // Same delimiter rule as the URL below: a schema name is an arbitrary
   // identifier, and a quote in it must not end the TS string early.
-  const schemaLiteral = schema.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  const schemaLiteral = schema.replace(/[\\']/g, '\\$&');
   // Single quotes are the string delimiter in the emitted TS, so a connection
   // string containing one would otherwise produce a config file that does not
   // parse (a password-free URL can still carry a quote in a query parameter).
-  const urlLine = inlineUrl
-    ? `  url: '${inlineUrl.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}',`
-    : `  url: process.env.DATABASE_URL,`;
+  const urlLine = inlineUrl ? `  url: '${inlineUrl.replace(/[\\']/g, '\\$&')}',` : `  url: process.env.DATABASE_URL,`;
 
   return `import type { TurbineCliConfig } from 'turbine-orm/cli';
 
-/**
- * Turbine configuration
- * @see https://turbineorm.dev
- */
 const config: TurbineCliConfig = {
-  /** Postgres connection string */
 ${urlLine}
-
-  /** Output directory for generated types + client */
   out: './generated/turbine',
-
-  /** Postgres schema to introspect (default: public) */
   schema: '${schemaLiteral}',
-
-  /** Tables to exclude from generation */
-  // exclude: ['_migrations', '_sessions'],
-
-  /** Directory for SQL migration files */
   migrationsDir: './turbine/migrations',
-
-  /** Path to seed file (defaults: ./seed.ts, ./seed.js, ./seed.sql, ./turbine/seed.ts) */
   seedFile: '${DEFAULT_INIT_SEED_FILE}',
-
-  /** Path to schema builder file (for turbine push) */
   schemaFile: './turbine/schema.ts',
 };
 

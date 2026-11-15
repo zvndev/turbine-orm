@@ -68,7 +68,11 @@ const LEADING_WORDS = 4;
 const WORD_START = /[A-Za-z_\u0080-￿]/;
 const WORD_PART = /[A-Za-z0-9_$\u0080-￿]/;
 
+const SQL_WHITESPACE = /[ \t\n\r\f]/;
+
 interface Rules {
+  /** Native whitespace outside literals and comments. PostgreSQL also accepts VT. */
+  whitespace: RegExp;
   /** Block comments nest (PostgreSQL, SQL Server). */
   nestedBlockComments: boolean;
   /** `#` starts a line comment (MySQL). */
@@ -87,6 +91,7 @@ interface Rules {
 
 const RULES: Readonly<Record<ControlSyntax, Rules>> = {
   postgresql: {
+    whitespace: /[ \t\n\v\r\f]/,
     nestedBlockComments: true,
     hashComment: false,
     dashNeedsSpace: false,
@@ -96,6 +101,7 @@ const RULES: Readonly<Record<ControlSyntax, Rules>> = {
     bracket: false,
   },
   mysql: {
+    whitespace: SQL_WHITESPACE,
     nestedBlockComments: false,
     hashComment: true,
     dashNeedsSpace: true,
@@ -105,6 +111,7 @@ const RULES: Readonly<Record<ControlSyntax, Rules>> = {
     bracket: false,
   },
   sqlite: {
+    whitespace: SQL_WHITESPACE,
     nestedBlockComments: false,
     hashComment: false,
     dashNeedsSpace: false,
@@ -114,6 +121,7 @@ const RULES: Readonly<Record<ControlSyntax, Rules>> = {
     bracket: true,
   },
   mssql: {
+    whitespace: SQL_WHITESPACE,
     nestedBlockComments: true,
     hashComment: false,
     dashNeedsSpace: false,
@@ -218,7 +226,7 @@ export function leadingWords(sql: string, syntax: ControlSyntax): string[][] {
       i++;
       continue;
     }
-    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r' || ch === '\f') {
+    if (rules.whitespace.test(ch)) {
       i++;
       continue;
     }

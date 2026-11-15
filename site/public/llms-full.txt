@@ -1,6 +1,6 @@
 # Turbine ORM, full reference for LLMs
 
-> Turbine is a Postgres-first TypeScript ORM with a Prisma-like API. Nested relations compile to a single SQL statement via PostgreSQL json_agg. The client is fully typed and generated from your live schema. One runtime dependency (pg). Optional SQLite / MySQL / SQL Server / PowDB engines share the same typed API behind subpath exports.
+> Turbine is a Postgres-first TypeScript ORM with a Prisma-like API. Nested relations compile to a single SQL statement via PostgreSQL json_agg. The client is fully typed and generated from your live schema. One runtime dependency (pg). Optional SQLite, better-sqlite3, MySQL, SQL Server, local libSQL, D1, Neon WebSocket/HTTP and PowDB routes share the typed API behind subpath exports, with route-specific refusals.
 
 This file is a condensed API reference for coding agents. It is accurate to the documented API; when in doubt, prefer the full docs at https://turbineorm.dev. Everything below is real, current API, do not invent methods, operators, or options that are not listed here.
 
@@ -26,7 +26,7 @@ npx turbine generate              # emit the typed client from the live schema
 Requirements: Node.js >= 20 (SQLite engine needs Node >= 22.5), PostgreSQL 14+ for the default path. ESM-first; `"type": "module"` recommended. The library never reads `.env`, populate `process.env.DATABASE_URL` yourself (e.g. `node --env-file=.env app.js`); the CLI auto-loads `.env`.
 
 ```ts
-import { turbine } from './generated/turbine';
+import { turbine } from './generated/turbine/index.js';
 
 const db = turbine();   // reads DATABASE_URL; or turbine({ connectionString })
 
@@ -72,7 +72,7 @@ Async iterable backed by a server-side cursor. Constant memory, supports nested 
 ```ts
 await db.users.count({ where: { role: 'admin' } });
 await db.posts.aggregate({ where: { orgId: 1 }, _sum: { viewCount: true }, _avg: { score: true }, _count: true });
-await db.posts.groupBy({ by: ['userId'], _count: true, _sum: { viewCount: true }, having: { _count: { gt: 1 } } });
+await db.posts.groupBy({ by: ['userId'], _count: true, _sum: { viewCount: true }, having: { id: { _count: { gt: 1 } } } });
 ```
 Aggregate functions: `_count`, `_sum`, `_avg`, `_min`, `_max`, and (PostgreSQL only, E017 elsewhere) `_percentile: { field: { p: 0.95 } }` or `{ p: [0.5, 0.99], method: 'disc' }` ('cont', the default, interpolates and is refused on date/time columns; 'disc' returns a stored value). `groupBy` also supports `where` (filter rows before grouping), `having` (filter groups; operators gt/gte/lt/lte/in/notIn), `orderBy`, JSON-path group keys/targets, and Postgres-only `distinctOn`.
 
@@ -85,7 +85,7 @@ Equality: bare literal (`{ email: 'a@b.com' }`), `equals`, `not` (also `not: nul
 Sets: `in`, `notIn`.
 Comparison: `gt`, `gte`, `lt`, `lte`.
 String: `contains`, `startsWith`, `endsWith`, and `mode: 'insensitive'` (switches to ILIKE). Wildcards in input are escaped.
-Array columns: `has`, `hasEvery`, `hasSome`.
+Array columns (PostgreSQL): `has`, `hasEvery`, `hasSome`, `isEmpty`, and whole-array equality. Equality on a unique array column identifies one row for unique reads, writes, upsert and nested connect. Sparse array write values are E003 before SQL; use explicit null elements.
 Full-text: `search` (with optional `config`, default 'english').
 JSON (`json`/`jsonb`): `path` (drill into keys), `equals`, `contains` (containment @>), `hasKey`, and `gt`/`gte`/`lt`/`lte` (require `path`). Pathless `equals` compares the whole document (PostgreSQL, MySQL; E017 on SQLite and SQL Server); path `equals` compares JSON values, so `equals: null` matches a JSON null, not the string "null". Use `contains` for containment.
 Column-to-column: `col('otherField')` (imported from `turbine-orm`) inside `equals`/`not`/`gt`/`gte`/`lt`/`lte`. A plain `{ col: 'x' }` object throws E003.
@@ -104,7 +104,7 @@ where: {
 
 ```ts
 await db.users.create({ data: { email: 'a@b.com', name: 'Alice', orgId: 1 } });   // returns the full row
-await db.users.createMany({ data: [ /* ... */ ] });                                // single INSERT ... UNNEST
+await db.users.createMany({ data: [ /* ... */ ] });                                // PostgreSQL scalar columns use UNNEST; array columns use VALUES
 await db.users.update({ where: { id: 42 }, data: { name: 'Alice Updated' } });
 await db.users.updateMany({ where: { role: 'guest' }, data: { role: 'member' } });
 await db.users.delete({ where: { id: 42 } });
@@ -112,7 +112,7 @@ await db.users.deleteMany({ where: { createdAt: { lt: cutoff } } });
 await db.users.upsert({ where: { email: 'a@b.com' }, create: { /* ... */ }, update: { /* ... */ } });
 ```
 
-`updateMany` / `deleteMany` take no `limit` / `take` / `offset` / `skip` (E003): `findMany` the ids first, then write `where: { id: { in: ids } }`. A `createMany` past the engine's bind-parameter limit is split into chunks inside one transaction (a plain `createMany` on SQL Server throws E003 instead). `createMany` takes `select` / `omit`.
+`updateMany` / `deleteMany` take no `limit` / `take` / `offset` / `skip` (E003): `findMany` the ids first, then write `where: { id: { in: ids } }`. A `createMany` past the engine's chunk parameter or row limit is split into chunks inside one transaction, including on SQL Server. `createMany` takes `select` / `omit`.
 
 Multi-row upsert: `createMany({ data, onConflict: { target: ['email'], update: ['name'] } })` inserts new keys and updates existing rows in one statement. `target` is the primary key or one full unique key; `update` is a field list or a per-column object; `where` limits which existing rows are updated; `{ target, ignore: true }` skips them. Two rows with the same key in one call throw E003. MySQL needs 8.0.19+ and refuses `where`, `ignore` and a global filter (E017); PowDB refuses `onConflict` (E017).
 
@@ -124,6 +124,8 @@ await db.posts.update({ where: { id: 1 }, data: { viewCount: { increment: 1 } } 
 Update expressions, for a value computed from the row: `import { expr, col } from 'turbine-orm'`, then `data: { views: expr.add(col('views'), 1), peak: expr.greatest(col('peak'), col('views')), seenAt: expr.now() }`. Builders: `add`, `sub`, `mul`, `div`, `coalesce`, `greatest`, `least` (NULLs ignored on every engine), `case([{ when, then }], otherwise)`, `now()`, and `excluded('field')` (the incoming row, in upsert's `update` and `onConflict.update`). Accepted in `update`, `updateMany`, upsert's `update`, nested update data and `onConflict.update`; refused (E003) in create data and on json/array columns. A plain `{ kind, args }` object is never an expression. PowDB and prisma-compat throw E017.
 
 Safety: `update`/`delete` with an empty `where` (`{}` or all-undefined) or an always-true one (`NOT: { OR: [] }`, `{ id: { notIn: [] } }`) throws `ValidationError` (E003). To mass-mutate on purpose, import the `UNSAFE` symbol and pass `{ allowFullTableScan: UNSAFE }`. A literal `true` throws, see Privilege options below.
+
+Upsert uses a single conflict statement only when `where` is exactly one unique key pinned to the values in `create` and no other lookup condition applies. Extra predicates, two separate unique keys, an empty `update` or nested writes use a lookup by the whole `where` inside a transaction. A batched `buildUpsert` refuses lookup shapes.
 
 Nested writes: relation fields in `create`/`update` `data` support `create`, `connect`, `connectOrCreate`, `disconnect`, `set`, `delete`, `update`, `upsert`, resolved in one transaction (depth-capped at 10).
 
@@ -160,7 +162,7 @@ await db.$transaction(async (tx) => {
   await tx.posts.create({ data: { userId: user.id, /* ... */ } });
 }, { isolationLevel: 'Serializable', timeout: 5000 });
 ```
-`tx` has the same typed accessors as `db`. Nested `$transaction` calls become SAVEPOINTs. Isolation levels: `ReadCommitted`, `RepeatableRead`, `Serializable`. Every query on `tx` must finish inside the callback: a `tx` used after it settles throws E003, and a callback that returns while a query it started is still running rolls the transaction back (E003). Catching a failed statement does not save the transaction: PostgreSQL rolls it back at COMMIT and `$transaction` rejects with `TransactionRolledBackError` (E019, the first failure as `cause`); wrap a statement that may fail in a nested `tx.$transaction` to recover. Options: `isolationLevel`, `timeout` (on expiry the statement is cancelled on the server and the transaction rolled back), `readOnly` (PostgreSQL, MySQL), `sessionContext` (dotted names such as `app.tenant`; a built-in setting needs `allowBuiltinSettings`). `tx` also has `raw`, `rawUnsafe`, `sql` and `$connection()`. The array form `$transaction([...builds], options)` takes deferred `build*()` queries, never promises.
+`tx` has the same typed accessors as `db`. Nested `$transaction` calls become SAVEPOINTs. Isolation levels: `ReadUncommitted`, `ReadCommitted`, `RepeatableRead`, `Serializable`. Every query on `tx` must finish inside the callback: a `tx` used after it settles throws E003, and a callback that returns while a query it started is still running does not commit (E003). Catching a failed statement does not save the transaction: PostgreSQL rolls it back at COMMIT and `$transaction` rejects with `TransactionRolledBackError` (E019, the first failure as `cause`); wrap a statement that may fail in a nested `tx.$transaction` to recover. Options: `isolationLevel`, `timeout` (on expiry Turbine tries to stop work and roll back: `TimeoutError.outcome` is `'not-executed'` when the server confirmed that, `'unknown'` when it did not, and either way COMMIT was never sent), `readOnly` (PostgreSQL, MySQL), `sessionContext` (dotted names such as `app.tenant`; a built-in setting needs `allowBuiltinSettings`). `tx` also has `raw`, `rawUnsafe`, `sql` and `$connection()`. The array form `$transaction([...builds], options)` takes deferred `build*()` queries, never promises.
 
 Pipeline, N independent queries in one round-trip via the Postgres extended-query pipeline protocol:
 ```ts
@@ -170,7 +172,7 @@ const [user, postCount, recent] = await db.pipeline([
   db.posts.buildFindMany({ where: { userId: 1 }, limit: 5 }),
 ]);
 ```
-`build*` methods return DeferredQuery objects (sql + params + transform) without executing. Pipelines run in a transaction by default; `{ transactional: false }` isolates errors (inspect `PipelineError`). HTTP/serverless pools fall back to sequential; probe with `db.pipelineSupported()`.
+`build*` methods return DeferredQuery objects (sql + params + transform) without executing. Pipelines run in a transaction by default; `{ transactional: false }` isolates errors (inspect `PipelineError`). Pools with an interactive checkout can fall back to sequential execution; stateless pools without one refuse the session-dependent pipeline. Probe with `db.pipelineSupported()`.
 
 Raw SQL, every `${value}` becomes a bound `$N` parameter (injection impossible):
 ```ts
@@ -206,6 +208,7 @@ Every error extends `TurbineError` and carries a `code`. Branch on the class/cod
 - E018 ReadOnlyError, a write refused on a read-only database, role or transaction (`reason`: 'snapshot' | 'rbac' | 'transaction')
 - E019 TransactionRolledBackError, a transaction PostgreSQL rolled back instead of committing (a statement inside it failed or timed out); the first failure is `cause`
 - E020 InvariantError, Turbine caught a bug in itself (two internal paths that must agree did not) before sending the statement; exposes `invariant`, not retryable, report it
+- E021 TransactionOutcomeUnknownError, a transaction's COMMIT got no answer Turbine could read (PostgreSQL, MySQL and Neon WebSocket; a `query_timeout`, a lost connection), so it may have committed or may still commit; no ROLLBACK is sent and the connection is discarded; the hiding failure is `cause`; not retryable, and a read does not settle it: retry only a write that a database-enforced unique idempotency key makes safe to repeat
 
 ```ts
 import { SerializationFailureError } from 'turbine-orm';
@@ -223,13 +226,20 @@ SQL-first migration files (UTC timestamp-prefixed, `-- UP` / `-- DOWN` sections)
 
 Default is PostgreSQL. Optional engines share the same typed API via subpath exports and load their drivers lazily (Postgres users still pull only `pg`):
 - `turbine-orm/sqlite`, `turbineSqlite(...)`, uses Node's built-in `node:sqlite` (Node >= 22.5)
+- `turbine-orm/better-sqlite3`, `await turbineBetterSqlite3(...)` (optional peer `better-sqlite3` `^12.11.1`)
 - `turbine-orm/mysql`, `await turbineMysql(...)` (optional peer `mysql2`)
 - `turbine-orm/mssql`, `await turbineMssql(...)` (optional peer `mssql`)
+- `turbine-orm/libsql`, `await turbineLibsql(...)` (optional peer `@libsql/client`, local files only)
+- `turbine-orm/d1`, `turbineD1(binding, schema)` (Worker binding, no driver)
+- `turbine-orm/neon-ws`, `await turbineNeonWs(...)` (explicit session and lifetime options)
+- `turbine-orm/neon-http`, `turbineNeonHttp(neon(url), schema)` (single statements and native batches)
 - `turbine-orm/powdb`, `await turbinePowDB(...)` (PowDB, its own query language under the same API)
+
+Both Neon entries require the optional peer `@neondatabase/serverless` `^1.2.0`; 0.10 is incompatible. Evidence tiers are computed in docs/engine-support.md. PostgreSQL, builtin SQLite, better-sqlite3 and MySQL 8 are Supported. SQL Server and local libSQL remain Deferred. API stability is a separate policy in STABILITY.md.
 
 Several flagship features stay Postgres-only (pgvector, LISTEN/NOTIFY, RLS session context); calling them on an engine that lacks the capability throws `UnsupportedFeatureError` (E017) instead of emitting broken SQL. See https://turbineorm.dev/engines for the capability matrix.
 
 ## Agent integration point
 
-The canonical way to teach an agent about Turbine is `npx turbine skill`, which installs a query-writing skill into the project (`--print` writes it to stdout, `--agents` prints an instruction block for CLAUDE.md / AGENTS.md). Every factual claim in that skill is executed against a live database on each release, so it cannot drift from the ORM. Beyond it, point the agent at https://turbineorm.dev/llms.txt (index) and this file (full reference); see https://turbineorm.dev/ai-agents. Turbine also ships a read-only MCP server (`npx turbine mcp`) exposing eleven tools to MCP clients like Claude Code and Cursor: schema overview, table detail, relation graph, join-path finder (returns the `with` clause to write), migration status, doctor report, EXPLAIN, query compilation (the exact SQL, without running it), table stats, sample rows, and error lookup. Every database access runs inside `BEGIN READ ONLY`, so an agent cannot mutate data through it, and PII-tagged values are redacted before they reach the model. `explain_error` needs no database, so it still answers when the pool is unreachable.
+The canonical way to teach an agent about Turbine is `npx turbine skill`, which installs a query-writing skill into the project (`--print` writes it to stdout, `--agents` prints an instruction block for CLAUDE.md / AGENTS.md). Every factual claim in that skill is executed against a live database on each release, so it cannot drift from the ORM. Beyond it, point the agent at https://turbineorm.dev/llms.txt (index) and this file (full reference); see https://turbineorm.dev/ai-agents. Turbine also ships a read-only MCP server (`npx turbine mcp`) exposing twelve tools on PostgreSQL, nine on SQLite and MySQL, and eight on SQL Server: schema overview, table detail, relation graph, join-path finder (returns the `with` clause to write), migration status, doctor report, EXPLAIN, query compilation (the exact SQL, without running it), table stats, sample rows, error lookup and engine capability discovery. PostgreSQL database access runs inside `BEGIN READ ONLY`, so an agent cannot mutate data through it, and PII-tagged values are redacted before they reach the model. `explain_error` and `engine_capabilities` need no database, so they still answer when the pool is unreachable.
 </content>

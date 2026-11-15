@@ -26,7 +26,7 @@ import type { PgCompatPoolClient } from '../client.js';
  * pg_catalog or information_schema behaves differently.
  */
 export interface IntrospectionOverrides {
-  /** Override the pg_indexes query (CockroachDB uses crdb_internal or show indexes) */
+  /** Override the pg_indexes query. CockroachDB supplies a pg_indexes compatibility query. */
   indexes: string;
   /** Override the pg_enum query */
   enums: string;

@@ -1,0 +1,11 @@
+{
+  "extends": "../../../../tsconfig.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "turbine-orm": ["../../../index.ts"],
+      "turbine-orm/live-query": ["../../../live-query.ts"],
+      "turbine-orm/notification-hub": ["../../../notification-hub.ts"]
+    }
+  }
+}

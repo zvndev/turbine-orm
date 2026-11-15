@@ -127,7 +127,7 @@ The entry carries a stable `code`, plus `table`, `operation` or `error` when rel
 | `unknown-config-key`, `plan-cache-mode-ignored`, `prepared-statements-on-pooler`, `connection-option-ignored`, `parser-overwrite` | `warn` | Client construction, once per process. Always on. |
 | `pool-error` | `error` | A pool connection failed with no `$on('poolError')` listener. Always on. |
 | `query-listener-error`, `pool-listener-error`, `replica-close-error` | `error` | A listener threw, or a replica pool failed to close. With `logging: true`. |
-| `external-pool`, `pool-created`, `replicas-configured`, `connection-verified`, `pipeline`, `raw-sql`, `typed-sql`, `transaction-committed`, `transaction-rolled-back`, `listen`, `notify`, `disconnect-skipped`, `pool-disconnected` | `debug` | Lifecycle. With `logging: true`. |
+| `external-pool`, `pool-created`, `replicas-configured`, `connection-verified`, `pipeline`, `raw-sql`, `typed-sql`, `transaction-committed`, `transaction-rolled-back`, `transaction-outcome-unknown`, `listen`, `notify`, `disconnect-skipped`, `pool-disconnected` | `debug` | Lifecycle. With `logging: true`. |
 | `listen-reconnecting`, `listen-lost` | `warn`, `error` | A `$listen` connection is reconnecting, or lost for good. Not logged when you pass `onError`. |
 | `untyped-columns`, `unordered-page`, `auto-strategy`, `deep-with`, `flatten-blocked`, `redundant-sort-term`, `unknown-query-option`, `unindexed-relation`, `flatten-fallback`, `relation-payload-json` | `warn` | Per-query advice, each once. While `diagnostics` advice is on. |
 | `unlimited-find-many` | `warn` | A `findMany` with no limit, when `warnOnUnlimited` is on. |

@@ -267,7 +267,7 @@ describe('buildRelationsFromForeignKeys, referential actions', () => {
 // runtime. Each case below states whether the expected names are
 // LEGACY-PRESERVED (exactly what main generated, collision-free, worked) or
 // LEGITIMATELY CHANGED (the legacy name collided with a concrete-typed scalar
-// column, i.e. the shape was BROKEN on main and the rename is the fix).
+// column, i.e. the shape previously produced invalid types and the rename is the fix).
 // ---------------------------------------------------------------------------
 
 describe('buildRelationsFromForeignKeys, main-parity table', () => {

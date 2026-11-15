@@ -119,28 +119,28 @@ describe('generateTypes, temporal column types', () => {
   });
 
   it('reads timestamp / timestamptz / date back as Date and interval as string', () => {
-    assert.match(out, /at_timestamp: Date;/);
-    assert.match(out, /at_timestamptz: Date;/);
-    assert.match(out, /at_date: Date;/);
+    assert.match(out, /at_timestamp: globalThis\.Date;/);
+    assert.match(out, /at_timestamptz: globalThis\.Date;/);
+    assert.match(out, /at_date: globalThis\.Date;/);
     assert.match(out, /every: string;/);
   });
 
   it('write inputs accept a Date on a time column (Prisma types @db.Time as Date)', () => {
     const create = out.slice(out.indexOf('ReportScheduleCreate'), out.indexOf('ReportScheduleUpdate'));
-    assert.match(create, /at_time: string \| Date;/);
-    assert.match(create, /at_timetz: string \| Date;/);
-    assert.match(create, /maybe_time\?: string \| Date \| null \| undefined;/);
+    assert.match(create, /at_time: string \| globalThis\.Date;/);
+    assert.match(create, /at_timetz: string \| globalThis\.Date;/);
+    assert.match(create, /maybe_time\?: string \| globalThis\.Date \| null \| undefined;/);
     const update = out.slice(out.indexOf('ReportScheduleUpdate'));
     assert.match(
       update,
-      /at_time\?: string \| Date \| UpdateOperatorInput<string \| Date> \| SqlExpr<string \| Date> \| ColumnRef \| undefined;/,
+      /at_time\?: string \| globalThis\.Date \| UpdateOperatorInput<string \| globalThis\.Date> \| SqlExpr<string \| globalThis\.Date> \| ColumnRef \| undefined;/,
     );
   });
 
   it('write inputs for timestamp / date columns are unchanged', () => {
     const create = out.slice(out.indexOf('ReportScheduleCreate'), out.indexOf('ReportScheduleUpdate'));
-    assert.match(create, /at_timestamp: Date;/);
-    assert.match(create, /at_date: Date;/);
+    assert.match(create, /at_timestamp: globalThis\.Date;/);
+    assert.match(create, /at_date: globalThis\.Date;/);
     assert.doesNotMatch(create, /at_timestamp: string \| Date;/);
   });
 });
@@ -246,7 +246,7 @@ describe('array time columns, codegen widening', () => {
     const out = generateTypes(ARRAY_SCHEMA);
     assert.match(out, /windows: string\[\];/); // row type unchanged
     const create = out.slice(out.indexOf('SlotCreate'), out.indexOf('SlotUpdate'));
-    assert.match(create, /windows: \(string \| Date\)\[\];/);
+    assert.match(create, /windows: \(string \| globalThis\.Date\)\[\];/);
   });
 
   it('widens the Zod write schemas the same way', () => {

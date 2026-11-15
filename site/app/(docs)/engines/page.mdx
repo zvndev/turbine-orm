@@ -1,23 +1,36 @@
+import { EngineSupportTable } from '../../../components/EngineSupportTable';
+
 export const metadata = {
   title: 'Database Engines',
   description:
-    'Run Turbine on PostgreSQL, SQLite, MySQL 8, SQL Server or PowDB with one typed API. A capability matrix, setup for each engine, and the differences you will hit.',
+    'Run Turbine on PostgreSQL, SQLite, MySQL 8, SQL Server, libSQL, Cloudflare D1, Neon or PowDB with one typed API. Support tiers, a capability matrix, setup for each engine, and the differences you will hit.',
   alternates: { canonical: '/engines' },
 };
 
 # Database Engines
 
-Turbine is built for PostgreSQL. The same typed `findMany` / `with` / `where` / `create` API also runs on SQLite, MySQL 8, SQL Server and PowDB, each behind its own import path.
+Turbine is built for PostgreSQL. The same typed `findMany` / `with` / `where` / `create` API also runs on SQLite, MySQL 8, SQL Server, local libSQL, Cloudflare D1 and PowDB, and over Neon's WebSocket and HTTP drivers, each behind its own import path.
 
-| Engine | Import | Driver to install | Minimum version |
-|---|---|---|---|
-| PostgreSQL | `turbine-orm` | none (`pg` is included) | PostgreSQL 14 |
-| SQLite | `turbine-orm/sqlite` | none (`node:sqlite` is built in) | Node 22.5 |
-| MySQL | `turbine-orm/mysql` | `mysql2` | MySQL 8.0 (not MariaDB) |
-| SQL Server | `turbine-orm/mssql` | `mssql` | SQL Server 2016 |
-| PowDB | `turbine-orm/powdb` | `@zvndev/powdb-embedded` or `@zvndev/powdb-client` | PowDB 0.7 |
+| Engine | Import | Driver to install | Tested in CI | Refused at connection |
+|---|---|---|---|---|
+| PostgreSQL | `turbine-orm` | none (`pg` is included) | PostgreSQL 14, 15, 16, 17 and 18 | nothing checked |
+| SQLite | `turbine-orm/sqlite` | none (`node:sqlite` is built in) | Node 22 and 24 | Node before 22.5 (no `node:sqlite`) |
+| SQLite (better-sqlite3) | `turbine-orm/better-sqlite3` | `better-sqlite3` | better-sqlite3 12.11.1, Node 20 and 24 | nothing checked |
+| MySQL | `turbine-orm/mysql` | `mysql2` | the floating `mysql:8` image | MySQL before 8.0, and MariaDB |
+| SQL Server | `turbine-orm/mssql` | `mssql` | SQL Server 2022 | SQL Server before 2016 |
+| libSQL | `turbine-orm/libsql` | `@libsql/client` | local files, `@libsql/client` 0.18.0 | remote URLs and sync settings |
+| Cloudflare D1 | `turbine-orm/d1` | none (the Worker binding) | local workerd through Miniflare | n/a |
+| Neon WebSocket | `turbine-orm/neon-ws` | `@neondatabase/serverless` | a local relay to PostgreSQL 14 to 18 | n/a |
+| Neon HTTP | `turbine-orm/neon-http` | `@neondatabase/serverless` | a local bridge to PostgreSQL 14 to 18 | n/a |
+| PowDB | `turbine-orm/powdb` | `@zvndev/powdb-embedded` or `@zvndev/powdb-client` | embedded, packages 0.20 | a networked server before 0.7.0 |
 
-The engine drivers are optional peer dependencies, so `npm install turbine-orm` installs only `pg`. The non-PostgreSQL engines are Experimental under the [stability policy](https://github.com/zvndev/turbine-orm/blob/main/STABILITY.md), so a minor release can change them.
+"Refused at connection" is what the factory checks, not a tested floor: a version between it and the tested one may work, and no CI job shows that it does. The engine drivers are optional peer dependencies, so `npm install turbine-orm` installs only `pg`. Every engine's API except PostgreSQL's is Experimental under the [stability policy](https://github.com/zvndev/turbine-orm/blob/main/STABILITY.md), so a minor release can change it.
+
+## Support tiers
+
+Each tier is computed from test evidence, not chosen. Supported means the core features (typed queries, nested reads, nested writes, transactions, upsert and `createMany`) each run against the real engine in CI on every change. The [engine support matrix](https://github.com/zvndev/turbine-orm/blob/main/docs/engine-support.md) has the rule, every feature row, the versions CI exercises and the tests behind each claim.
+
+<EngineSupportTable />
 
 ## Capability matrix
 
@@ -28,13 +41,13 @@ The engine drivers are optional peer dependencies, so `npm install turbine-orm` 
 | Nested relations (`with`) | ✓ | ✓ | ✓ | ✓ | ✓ ¹ |
 | Atomic update operators (`increment`, ...) | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Update expressions (`expr`) | ✓ | ✓ | ✓ | ✓ | ✗ |
-| Multi-row upsert (`createMany` `onConflict`) | ✓ | ✓ | ✓ 8.0.19+ | ✓ | ✗ |
+| Multi-row upsert (`createMany` `onConflict`) | ✓ | ✓ | ✓ ⁷ | ✓ | ✗ |
 | Optimistic locking | ✓ | ✓ | ✓ | ✓ | ✓ |
 | `$transaction` | ✓ | ✓ ² | ✓ | ✓ | ✓ ³ |
 | Nested `tx.$transaction` (savepoints) | ✓ | ✓ | ✓ | ✓ | ✗ |
 | Read-only transactions (`readOnly`) | ✓ | ✗ | ✓ | ✗ | ✗ |
 | Row locks (`lock`) | all modes | ✗ | `'update'`, `'share'` | ✗ | ✗ |
-| `findManyStream` | server cursor | in memory ⁴ | in memory ⁴ | in memory ⁴ | ✗ |
+| `findManyStream` | server cursor | native batches ⁴ | native batches ⁴ | native batches ⁴ | ✗ |
 | Cursor pagination (`cursor`) | ✓ | ✓ | ✓ | ✓ | ✗ |
 | `mode: 'insensitive'` on `in` / `notIn` | ✓ | ✗ | ✗ | ✗ | ✓ |
 | `nulls` placement in `orderBy` | ✓ | ✓ | ✗ | ✗ | `'last'` only |
@@ -47,28 +60,30 @@ The engine drivers are optional peer dependencies, so `npm install turbine-orm` 
 | LISTEN/NOTIFY (`$listen` / `$notify`) | ✓ | ✗ | ✗ | ✗ | ✗ |
 | RLS `sessionContext` | ✓ | ✗ | ✗ | ✗ | ✗ |
 | Read replicas (`replicas`) | ✓ | n/a | n/a | n/a | snapshots ⁵ |
-| `turbine` CLI | ✓ | n/a | n/a | n/a | n/a |
+| `turbine` CLI | ✓ | partial ⁶ | partial ⁶ | partial ⁶ | n/a |
 
 ¹ One PowQL statement on engine 0.18+. Older engines and many-to-many relations use batched lookups, with the same results.
 ² SQLite has one connection. An open `$transaction` holds it, and other callers wait up to `busyTimeoutMs`.
 ³ PowDB has a single writer. Concurrent `$transaction` calls queue and run one at a time.
-⁴ The whole result loads into memory, then yields in `batchSize` batches. Only PostgreSQL streams in constant memory.
+⁴ Rows are read from the engine in `batchSize` batches as you iterate. SQLite uses a bounded first fetch and then native iteration, which needs Node 22.16+ or 24+, and its stepping is synchronous. Only PostgreSQL holds a server-side cursor. `batchSize` bounds rows, not payload bytes.
 ⁵ [Read-only snapshots](#read-only-snapshots-and-replicas-powdb--014), routed by hand.
+⁶ Project commands (init, generate, migrations and more) exist per engine; Studio, `observe` and `migrate-from-prisma` do not. SQLite supports init, generate and pull, SQL migrations, schema push, seed, status, and read-only doctor and MCP tools, all through `node:sqlite` (a better-sqlite3 database file uses the same commands). Which commands each engine has, and how each is tested, is in the [engine support matrix](https://github.com/zvndev/turbine-orm/blob/main/docs/engine-support.md).
+⁷ Uses the row-alias syntax MySQL added in 8.0.19. CI runs the floating `mysql:8` image, so 8.0.19 itself is not tested.
 
 ## What is actually Postgres-only
 
 Every row above with ✗ on all other engines is a PostgreSQL feature. Using one elsewhere throws `TURBINE_E017`, never broken SQL.
 
-Two pieces of tooling also target PostgreSQL only, with no capability error:
+Some tooling also targets PostgreSQL only, with no capability error:
 
-- The `turbine` CLI: `generate` / `pull`, `push`, `migrate`, `seed`, `status`, `studio`, `mcp`, `observe`, `doctor` and `migrate-from-prisma`.
-- `schemaPush` and `schemaDiff`. `schemaToSQL` builds DDL for any engine's dialect and opens no connection.
+- The `turbine` CLI's `studio`, `observe` and `migrate-from-prisma` commands. SQLite, MySQL and SQL Server projects have their own subset of the other commands (see ⁶); on SQLite, doctor and MCP are read-only.
+- The root `schemaPush` and `schemaDiff` functions. SQLite CLI push uses its own guarded planner. `schemaToSQL` builds DDL for any engine's dialect and opens no connection.
 
 If pgvector, realtime or RLS is core to your app, stay on PostgreSQL. The other engines suit tests, edge demos and existing MySQL or SQL Server deployments.
 
 ## Setup
 
-Outside PostgreSQL you work code-first. Define the schema with `defineSchema` and turn it into runtime metadata:
+Outside PostgreSQL you can work code-first. SQLite also supports introspection and SQL-first CLI projects. Define the schema with `defineSchema` and turn it into runtime metadata:
 
 ```ts
 // schema.ts
@@ -128,6 +143,42 @@ const user = await db.table('users').findUnique({ where: { id: 1 }, with: { post
 - `mode: 'insensitive'` uses `COLLATE NOCASE`, which folds ASCII only.
 - `isolationLevel` is ignored, since SQLite transactions are serializable.
 
+#### Optional better-sqlite3 binding
+
+Install `better-sqlite3@^12.11.1` alongside Turbine, then use the asynchronous
+`turbineBetterSqlite3(target, schema, options)` factory from
+`turbine-orm/better-sqlite3`. A supplied handle remains caller-owned. Both
+bindings share query, transaction, native iterator and value-decoding behavior.
+`introspectBetterSqlite3Database(handle, { includeViews: true })` supports the
+same filters as `introspectSqliteDatabase`; see [views](/views).
+
+#### Result metadata and limits
+
+Turbine checks once per process whether builtin `all()` keeps a width change
+between prepare and the first step, which also happens on the first `SELECT *`
+after another connection altered the table. Node 22.16.0 and 24.10.0 native
+`all()` drop cells there, so SQL containing `*` uses native iteration on them;
+Node 26.12.0 does not, so it keeps `all()`. Node 22.5 to 22.15 read the width
+before the first step in every reader (22.5 to 22.12 have no `iterate()`, and
+22.13 to 22.15's `iterate()` does the same), so the defect remains there when
+the schema changes between prepare and the first step; use Node 22.16 or later
+if that can happen while your application runs. Ordinary results are
+still collected eagerly. Repeated output names use the final column's value and
+decoder.
+
+Whole-document JSON equality/containment and JSON-path equality with null,
+arrays, objects or booleans throw E017. Numeric and string path equality remain
+available. SQLite has no native array or enum type: schema enums use TEXT plus
+CHECK; introspection does not recover enum labels. Native binary JSONB remains
+binary. Integers outside the safe JS range return strings.
+
+SQL migration writes and code-first push require builtin authorizer and
+transaction-state support (Node >= 24.10). Seed and migration helper handle
+contracts target node:sqlite, so a better-sqlite3 handle is not a drop-in target;
+use its file through the CLI or an explicit client transaction for seed writes.
+The [SQLite support and refusal inventory](https://github.com/zvndev/turbine-orm/blob/main/docs/sqlite-support.md)
+lists every E017 family and links its implementation and tests.
+
 ### MySQL 8
 
 ```bash
@@ -168,6 +219,30 @@ const db = await turbineMssql('mssql://sa:Passw0rd!@localhost:1433/app', SCHEMA)
 - `numeric` reads as a JS number, because the driver has no string mode for `DECIMAL`. A `UNIQUEIDENTIFIER` reads back in upper case.
 - A `json` / `jsonb` column is stored as `NVARCHAR(MAX)` and reads back parsed. Pathless JSON `equals` throws `TURBINE_E017`.
 - Back an upsert's conflict target with a real `UNIQUE` index or primary key. `MERGE` alone does not stop two concurrent inserts.
+
+## Engines and transports added in 0.94
+
+Each of these is new in 0.94.0. The tier after each name is its evidence tier from the table above.
+
+### SQLite through better-sqlite3 (Supported)
+
+`await turbineBetterSqlite3('app.db', SCHEMA)` from `turbine-orm/better-sqlite3` runs the same SQLite SQL and client as `turbine-orm/sqlite`, through the `better-sqlite3` package (`npm install better-sqlite3`). A path is closed by `disconnect()`; a handle you pass in stays open. CI runs the binding suite on Node 20 and 24, plus the shared battery and parent-scoped nested writes on Node 24. [Guide](https://github.com/zvndev/turbine-orm/blob/main/docs/sqlite-binding.md).
+
+### libSQL, local files (Deferred)
+
+`await turbineLibsql('file:app.db', SCHEMA)` from `turbine-orm/libsql` runs on a local libSQL file or `:memory:` through `@libsql/client`. Remote URLs, sync and embedded replicas are refused. No further work is planned on it this cycle. [Guide](https://github.com/zvndev/turbine-orm/blob/main/docs/libsql-local.md).
+
+### Cloudflare D1 (Experimental)
+
+`turbineD1(env.DB, SCHEMA)` from `turbine-orm/d1` runs inside a Worker on its `D1Database` binding, with no driver to install. The Worker needs the `nodejs_compat` flag. Nested writes (D1 has no interactive transaction), streams, row locks and `$listen` throw before any statement is prepared. CI runs it in local workerd through Miniflare; hosted D1 is not tested. [Guide](https://github.com/zvndev/turbine-orm/blob/main/docs/d1-binding.md).
+
+### Neon over WebSockets (Experimental)
+
+`await turbineNeonWs({ connection: { connectionString } }, SCHEMA, { sessionMode: 'persistent', lifetime: 'persistent' })` from `turbine-orm/neon-ws` binds a Neon `Pool` or `Client` from `@neondatabase/serverless`. You state whether the endpoint keeps a session (`sessionMode`) and whether connections may outlive one invocation (`lifetime`). CI runs it through a local WebSocket relay to PostgreSQL; hosted Neon is not tested. [Guide](https://github.com/zvndev/turbine-orm/blob/main/docs/neon-websocket.md).
+
+### Neon over HTTP (Experimental)
+
+`turbineNeonHttp(neon(url), SCHEMA)` from `turbine-orm/neon-http` sends each query as one HTTP request, plus native batches. Anything that needs a second request, such as a nested write, throws before it runs. CI runs it through a local HTTP bridge to PostgreSQL; hosted Neon is not tested. [Guide](https://github.com/zvndev/turbine-orm/blob/main/docs/neon-http.md).
 
 ## PowDB
 
@@ -230,7 +305,7 @@ These agree on all four SQL engines:
 
 ## Postgres-compatible databases
 
-Databases that speak the PostgreSQL wire protocol (Neon, Supabase, AlloyDB, TimescaleDB, YugabyteDB, CockroachDB) are not separate engines. They use the default `turbine-orm` import, some with a thin adapter. See [Database Compatibility](/compatibility).
+Databases that speak the PostgreSQL wire protocol (Neon, Supabase, AlloyDB, TimescaleDB, YugabyteDB, CockroachDB) are not separate engines. They use the default `turbine-orm` import, some with a thin adapter; Neon can also use the two transports above. See [Database Compatibility](/compatibility).
 
 ## See also
 

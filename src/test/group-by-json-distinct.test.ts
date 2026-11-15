@@ -34,6 +34,7 @@ import { PowqlInterface } from '../powql.js';
 import type { SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, sqliteDialect, turbineSqlite } from '../sqlite.js';
 import { makeQuery, mockTable, skipGate } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 function schema(): SchemaMetadata {
   return {
@@ -611,7 +612,7 @@ describe('groupBy JSON paths live on SQLite', () => {
   const skip = DatabaseSync ? false : 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)';
 
   it('JSON group keys, aggregate targets, orderBy, and range filters execute end-to-end', { skip }, async () => {
-    const handle = new DatabaseSync!(':memory:');
+    const handle = closeSqliteAfter(new DatabaseSync!(':memory:'));
     handle.exec('CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, data JSON)');
     handle.exec(`INSERT INTO items (name, data) VALUES
       ('a', '{"weight": 3, "cat": "x"}'),
@@ -726,7 +727,7 @@ describe('groupBy / orderBy extensions on PowDB (JSON supported since 0.12; othe
   });
 
   it('object orderBy: JSON path + nulls:last now compile; relation / vector / nulls:first stay E017', async () => {
-    // F2 supports JSON-path ordering on a json column and OrderBySpec nulls:last.
+    // JSON-path ordering is supported on a json column and OrderBySpec nulls:last.
     await assert.doesNotReject(powqlQuery().findMany({ orderBy: { data: { path: ['x'] } } } as never));
     await assert.doesNotReject(powqlQuery().findMany({ orderBy: { status: { sort: 'asc', nulls: 'last' } } } as never));
     // Still refused, each with its own feature name.

@@ -9,11 +9,13 @@
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
-import { afterEach, beforeEach, describe, it as nodeIt } from 'node:test';
+import { afterEach, beforeEach, describe } from 'node:test';
 import type { TurbineClient } from '../client.js';
 import { UnsupportedFeatureError } from '../errors.js';
 import type { SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, sqliteDialect, turbineSqlite } from '../sqlite.js';
+import { skipGate } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 // `node:sqlite` is a builtin only on Node >= 22.5. Probe for it WITHOUT a static
 // import so this file *loads* on Node 20 (the unit matrix's lowest version) and
@@ -31,10 +33,7 @@ const DatabaseSync: (new (path: string) => DatabaseSyncType) | undefined = (() =
 // When node:sqlite is absent (Node < 22.5), register each test as skipped: the
 // Postgres/dialect paths still get full coverage on Node 20, and the SQLite
 // engine is explicitly documented as Node >= 22.5.
-const it: typeof nodeIt = DatabaseSync
-  ? nodeIt
-  : (((name: string) =>
-      nodeIt(name, { skip: 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)' }, () => {})) as typeof nodeIt);
+const { it } = skipGate(!DatabaseSync, 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)');
 
 // ---------------------------------------------------------------------------
 // SQLite port of src/test/fixtures/seed.sql (+ a tags/post_tags m2m junction).
@@ -164,9 +163,10 @@ let db: DatabaseSyncType;
 let schema: SchemaMetadata;
 let client: TurbineClient;
 
-beforeEach(() => {
+beforeEach((t) => {
+  assert.ok('after' in t, 'beforeEach must receive a test context');
   if (!DatabaseSync) return; // Node < 22.5, every test in this file is skipped.
-  db = new DatabaseSync(':memory:');
+  db = closeSqliteAfter(new DatabaseSync(':memory:'), t.after.bind(t));
   db.exec('PRAGMA foreign_keys = ON');
   db.exec(SCHEMA_SQL);
   db.exec(SEED_SQL);

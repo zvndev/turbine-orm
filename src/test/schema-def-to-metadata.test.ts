@@ -689,7 +689,7 @@ describe('schemaDefToMetadata, relation-name parity with buildRelationsFromForei
 });
 
 // ---------------------------------------------------------------------------
-// F4a: defineSchema `indexes` surface → IndexMetadata carry-through
+// defineSchema `indexes` surface → IndexMetadata carry-through
 // ---------------------------------------------------------------------------
 
 describe('schemaDefToMetadata: index declarations', () => {

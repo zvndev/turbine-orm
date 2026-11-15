@@ -59,7 +59,9 @@ const INF = Number.POSITIVE_INFINITY;
 // One column per engine, in ENGINES order: postgresql, sqlite, mysql, mssql, powdb.
 const EXPECTED: { [K in keyof EngineCapabilities]: readonly EngineCapabilities[K][] } = {
   distinctOn: [true, false, false, false, false],
+  tupleCursorPredicate: [true, false, false, false, false],
   positionalJson: [true, false, false, false, false],
+  jsonObjectKeysAsWritten: [true, true, false, true, false],
   nullsOrderingClause: [true, true, false, false, false],
   nullsSortHigh: [true, false, false, false, false],
   insensitiveInList: [true, false, false, false, false],
@@ -88,6 +90,7 @@ const EXPECTED: { [K in keyof EngineCapabilities]: readonly EngineCapabilities[K
   backendCancel: [true, false, false, false, false],
   idleTransactionTimeout: [true, false, false, false, false],
   abortsTransactionOnError: [true, false, false, false, false],
+  classifiesCommitAnswer: [true, false, false, false, false],
   connectionDriver: ['pg-compatible', 'engine-driver', 'engine-driver', 'engine-driver', 'none'],
   preparesEveryStatement: [false, false, true, false, false],
   statementSyntax: ['postgresql', 'sqlite', 'mysql', 'mssql', null],
@@ -220,6 +223,13 @@ const RULES: { rule: string; re: RegExp }[] = (
  * are gone.
  */
 const ALLOWLIST: { file: string; rule: string; contains?: string; count: number; why: string }[] = [
+  {
+    file: 'generate.ts',
+    rule: 'comparison with an engine name',
+    contains: 'options.target !==',
+    count: 1,
+    why: 'validate the explicit SQLite binding at the generator target boundary before output side effects',
+  },
   // Rendering: which SQL text an engine spells, not what it can do. These
   // become per-engine hooks once engines stop spreading postgresDialect (a
   // hook added to PostgreSQL today is inherited by every engine).
@@ -322,6 +332,141 @@ const ALLOWLIST: { file: string; rule: string; contains?: string; count: number;
   // Lexers: inside a statement scanner, a branch on the syntax it was handed
   // (`capabilities.statementSyntax`, or an engine entry's own constant) is
   // grammar, not an engine test.
+  {
+    file: 'generate.ts',
+    rule: 'comparison with an engine name',
+    contains: "if (target !== 'mysql') return schema;",
+    count: 1,
+    why: 'render column-local MySQL ENUM catalog identities as literal union types for an explicit generation target; no runtime capability dispatch',
+  },
+  {
+    file: 'generate.ts',
+    rule: 'comparison with an engine name',
+    contains: "if (options?.target === 'mysql' && (col.dialectType ?? col.pgType) === 'enum')",
+    count: 1,
+    why: 'render Zod literals (or the string fallback for labels the catalog could not report exactly) from column-local MySQL ENUM catalog identities; no runtime capability dispatch',
+  },
+  {
+    file: 'generate.ts',
+    rule: 'comparison with an engine name',
+    contains: 'target ===',
+    count: 10,
+    why: 'validate the generation target and SQLite binding, select their factory and opt-in native integer declarations; no runtime capability dispatch',
+  },
+  {
+    file: 'generate.ts',
+    rule: 'comparison with an engine name',
+    contains: 'generationTarget(options.target)',
+    count: 1,
+    why: 'reject opt-in native integer generation for the default PostgreSQL target before emitting files',
+  },
+  {
+    file: 'cli/config.ts',
+    rule: 'comparison with an engine name',
+    count: 10,
+    why: 'validate engine-specific connection formats and config defaults before opening a driver; the closed engine admission moved to one collection',
+  },
+  {
+    file: 'cli/index.ts',
+    rule: 'comparison with an engine name',
+    // Adding D1 unfolded the existing closed --engine admission across lines;
+    // this line-based scan now counts its four dialect comparisons separately.
+    count: 32,
+    why: 'parse and dispatch native CLI engines, refuse unsupported integer declarations before command side effects, validate MySQL migration/push and native seed operands, admit explicit MySQL push consent, validate scoped native doctor arguments/configuration, withhold catalog endpoint diagnostics, and select configured native help before a database connection exists',
+  },
+  {
+    file: 'cli/mysql-push-command.ts',
+    rule: 'comparison with an engine name',
+    count: 3,
+    why: 'require explicit native MySQL push consent and refuse a misrouted command before loading schema or connecting',
+  },
+  {
+    file: 'cli/mysql-migrate-command.ts',
+    rule: 'comparison with an engine name',
+    count: 1,
+    why: 'refuse a misrouted native MySQL migration command before connecting or writing files',
+  },
+  {
+    file: 'cli/mysql-doctor.ts',
+    rule: 'comparison with an engine name',
+    count: 1,
+    why: 'refuse a misrouted MySQL doctor before opening a native snapshot',
+  },
+  {
+    file: 'cli/sqlite-doctor.ts',
+    rule: 'comparison with an engine name',
+    count: 1,
+    why: 'refuse a misrouted SQLite doctor before opening a native file',
+  },
+  {
+    file: 'cli/tool-command.ts',
+    rule: 'comparison with an engine name',
+    count: 1,
+    why: 'keep the SQLite-only single-shot doctor adapter separate from PostgreSQL doctor dispatch',
+  },
+  {
+    file: 'cli/mssql-doctor.ts',
+    rule: 'comparison with an engine name',
+    count: 1,
+    why: 'refuse a misrouted scoped SQL Server doctor before loading a driver or reading catalogs',
+  },
+  {
+    file: 'cli/mssql-migrate-command.ts',
+    rule: 'comparison with an engine name',
+    count: 1,
+    why: 'refuse a misrouted native SQL Server migration command before connecting or writing files',
+  },
+  {
+    file: 'cli/mysql-project.ts',
+    rule: 'comparison with an engine name',
+    count: 1,
+    why: 'refuse misrouted project commands at the native CLI entry boundary',
+  },
+  {
+    file: 'cli/mssql-project.ts',
+    rule: 'comparison with an engine name',
+    count: 1,
+    why: 'refuse misrouted project commands at the native CLI entry boundary',
+  },
+  {
+    file: 'cli/config.ts',
+    rule: 'collection of engine names',
+    contains: 'includes(engine as string)',
+    count: 1,
+    why: 'closed CLI engine-name admission includes local libSQL; this selects a project transport before any dialect or driver exists',
+  },
+  {
+    file: 'generate.ts',
+    rule: 'collection of engine names',
+    contains: 'Expected',
+    count: 1,
+    why: 'diagnostic lists supported engine selections, not a runtime capability lookup',
+  },
+  {
+    file: 'cli/mcp.ts',
+    rule: 'comparison with an engine name',
+    count: 27,
+    why: 'validate native no-argument doctor requests and dispatch engine-owned catalog collectors, serialize native generated-column restrictions and dispatch an explicit tool engine to its native read-only transport, compiler and catalog; arbitrary dialects are not accepted here',
+  },
+  {
+    file: 'cli/tool-capabilities.ts',
+    rule: 'comparison with an engine name',
+    count: 11,
+    why: 'validate explicit tool engine selection and bind implemented adapter facts; SQL feature flags come from the dialect capability object',
+  },
+  {
+    file: 'cli/tool-capabilities.ts',
+    rule: 'collection of engine names',
+    contains: 'support engines',
+    count: 1,
+    why: 'diagnostic lists explicit tool engine selections; it does not select a SQL feature',
+  },
+  {
+    file: 'cli/sqlite-project.ts',
+    rule: 'comparison with an engine name',
+    count: 1,
+    why: 'refuse misrouted project commands at the native SQLite CLI entry boundary',
+  },
   {
     file: 'sql-placeholders.ts',
     rule: 'comparison with an engine name',

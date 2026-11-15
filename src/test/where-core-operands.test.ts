@@ -27,6 +27,7 @@ import * as whereMod from '../query/where.js';
 import type { SchemaMetadata } from '../schema.js';
 import { sqliteDialect, turbineSqlite } from '../sqlite.js';
 import { mockTable, skipGate } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 import { accounts, compileWhere, ctxOf } from './where-core-fixture.js';
 
 /** Both halves refuse: the cold build, and the collect a cache hit runs instead. */
@@ -326,7 +327,7 @@ const sqliteGate = skipGate(!hasNodeSqlite, 'turbine-orm/sqlite requires node:sq
 describe('live sqlite', () => {
   sqliteGate.it('JSON path equals compares number and string apart', async () => {
     const { DatabaseSync } = createRequire(process.cwd())('node:sqlite');
-    const raw = new DatabaseSync(':memory:');
+    const raw = closeSqliteAfter(new DatabaseSync(':memory:'));
     raw.exec('CREATE TABLE docs (id INTEGER PRIMARY KEY, data TEXT NOT NULL)');
     for (const [id, doc] of DOCS) raw.prepare('INSERT INTO docs VALUES (?, ?)').run(id, doc);
     const schema: SchemaMetadata = {

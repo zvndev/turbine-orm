@@ -10,9 +10,9 @@
  * has the code and nothing else. `errors.ts` knows the class and the docs
  * anchor but carries no prose about causes or repairs, and the prose that does
  * exist lives on the docs site, which an offline agent cannot read and which a
- * `WebFetch` of a marketing page is a poor way to consult. This turns "I got
- * E015" into "this is an OptimisticLockError, here is why it fired, here is what
- * to do", with no database, no network, and no tokens spent re-deriving it.
+ * fetch of a marketing page may not expose. This maps E015 to its
+ * OptimisticLockError name, causes, and remedies without database or network
+ * access.
  *
  * TWO RULES KEEP IT HONEST.
  *
@@ -418,6 +418,25 @@ const CATALOG: Record<TurbineErrorCode, ErrorExplanationBody> = {
       'Do not retry: the same call fails the same way.',
     ],
     properties: ['invariant'],
+  },
+  TURBINE_E021: {
+    className: 'TransactionOutcomeUnknownError',
+    retryable: false,
+    origin: 'turbine',
+    whenThrown:
+      "A transaction's COMMIT got no answer Turbine could read, so the transaction may have committed, may still be committing, or may never have reached the server. Raised on the PostgreSQL dialect, the MySQL engine and the Neon WebSocket driver, including for the transactions Turbine opens for nested writes, lookup-first upserts and sequential pipelines.",
+    likelyCauses: [
+      'The driver gave up waiting for the COMMIT: a node-postgres `query_timeout` shorter than the COMMIT, which is slow when deferred constraint triggers or synchronous replication run at commit.',
+      'The connection was lost while the COMMIT was in flight (a network fault, a restart, a proxy closing the socket), or before it could be sent.',
+    ],
+    howToFix: [
+      'Do not decide from a read: a COMMIT still in flight can commit after the read finds nothing, and a retry then applies the writes twice.',
+      "Make the write safe to repeat: store a unique idempotency key, enforced by a UNIQUE constraint, in the same transaction, and replay it. The replay either saves the write or fails with E008 on that key's constraint; then read the stored row back and check it holds this write before treating the first attempt as committed.",
+      'E008 on any other unique constraint says nothing about the first attempt: let it propagate.',
+      'The failure that hid the answer is `cause`. The connection was discarded, never reused.',
+      'If a `query_timeout` causes it, raise it above the slowest COMMIT, or bound the work with `$transaction({ timeout })`, which never interrupts a COMMIT.',
+    ],
+    properties: [],
   },
 };
 

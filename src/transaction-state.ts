@@ -43,11 +43,12 @@ import {
   DeadlockError,
   LockNotAvailableError,
   SerializationFailureError,
+  TimeoutError,
   TransactionRolledBackError,
   ValidationError,
   wrapPgError,
 } from './errors.js';
-import type { PgCompatPoolClient, PgCompatQueryResult } from './pg-types.js';
+import type { PgCompatPoolClient, PgCompatQueryResult, StreamQuerySettlement } from './pg-types.js';
 import { TRANSACTION_CONTROL_OPERATION, traceStatement } from './query-channel.js';
 import {
   type ControlKind,
@@ -61,7 +62,12 @@ import {
 export const TRANSACTION_STATE: unique symbol = Symbol.for('turbine-orm.transactionState');
 
 /** How a transaction ended, phrased to complete "This transaction ...". */
-export type TransactionEnd = 'has ended' | 'committed' | 'was rolled back' | 'timed out';
+export type TransactionEnd =
+  | 'has ended'
+  | 'committed'
+  | 'was rolled back'
+  | 'timed out'
+  | 'ended with an unknown outcome';
 
 /** The API that opened a transaction, which its error messages name. */
 export type TransactionApi = '$transaction' | 'transaction';
@@ -139,6 +145,8 @@ export class TransactionState {
   private readonly openFrames: TransactionScope[] = [];
   /** Statements sent on the connection that have not answered yet. */
   private onWire = 0;
+  /** A cancellable statement owns admission until its listener and delivery settle. */
+  private exclusive = false;
   /** Statements and savepoint blocks started through the transaction that have not settled. */
   private started = 0;
   private idleWaiters: Array<() => void> = [];
@@ -189,9 +197,13 @@ export class TransactionState {
     return this.root;
   }
 
-  /** Why the transaction must roll back instead of committing (see {@link abort}), if it must. */
-  get abortedWith(): unknown {
-    return this.aborted?.error;
+  /**
+   * Why the transaction must roll back instead of committing (see {@link abort}),
+   * if it must. A record rather than the reason itself: a block may reject with
+   * `undefined` (or any other value), and that still forbids the COMMIT.
+   */
+  get mustRollBack(): { readonly error: unknown } | undefined {
+    return this.aborted;
   }
 
   /**
@@ -200,12 +212,20 @@ export class TransactionState {
    * not awaited.
    */
   get busy(): boolean {
-    return this.started > 0;
+    return this.started > 0 || this.exclusive;
   }
 
   /** Whether a statement is on the wire right now (what a cancel request would stop). */
   get running(): boolean {
     return this.onWire > 0;
+  }
+
+  /**
+   * Whether the connection is inside the savepoint of one write (see
+   * {@link withSavepoint}): its innermost open savepoint is that write's.
+   */
+  get inWriteSavepoint(): boolean {
+    return this.openFrames.at(-1)?.handle === false;
   }
 
   /**
@@ -267,7 +287,12 @@ export class TransactionState {
    * would be lost. `recovery` marks the one statement that is sent regardless,
    * a rollback to a savepoint the caller set by hand (see {@link runRaw}).
    */
-  async run<T>(statement: () => Promise<T>, scope: TransactionScope = this.root, recovery = false): Promise<T> {
+  async run<T>(
+    statement: () => Promise<T>,
+    scope: TransactionScope = this.root,
+    recovery = false,
+    exclusive?: StreamQuerySettlement,
+  ): Promise<T> {
     this.assertOpen();
     this.assertNotFromInsideBlock(scope, 'A statement');
     this.started++;
@@ -278,6 +303,17 @@ export class TransactionState {
         this.assertOpen();
       }
       if (!recovery) this.assertNotAborted();
+      this.assertAvailable(exclusive !== undefined);
+      if (exclusive && !exclusive.closed) {
+        this.exclusive = true;
+        // Count cancellation settlement separately from the actual driver promise.
+        // Even after ReadyForQuery, a delayed CancelRequest still owns this backend.
+        this.onWire++;
+        void exclusive.promise.then(() => {
+          this.exclusive = false;
+          this.settled();
+        });
+      }
       const result = await this.send(statement);
       if (recovery) this.clearAbort();
       return result;
@@ -322,6 +358,11 @@ export class TransactionState {
     return found.every((s) => s.kind === 'rollback-to');
   }
 
+  private assertAvailable(exclusive = false): void {
+    if (this.exclusive || (exclusive && this.onWire > 0))
+      throw new ValidationError('A cancellable cursor requires an otherwise idle transaction connection.');
+  }
+
   /** Put one statement on the wire, counted for {@link whenIdle} and recorded on failure. */
   private async send<T>(statement: () => Promise<T>): Promise<T> {
     this.onWire++;
@@ -332,12 +373,15 @@ export class TransactionState {
       if (this.abortsOnError && reportedByServer(err)) this.noteDead(err);
       throw err;
     } finally {
-      this.onWire--;
-      if (this.onWire === 0 && this.idleWaiters.length > 0) {
-        const waiters = this.idleWaiters;
-        this.idleWaiters = [];
-        for (const wake of waiters) wake();
-      }
+      this.settled();
+    }
+  }
+
+  private settled(): void {
+    if (--this.onWire === 0 && this.idleWaiters.length > 0) {
+      const waiters = this.idleWaiters;
+      this.idleWaiters = [];
+      for (const wake of waiters) wake();
     }
   }
 
@@ -363,10 +407,20 @@ export class TransactionState {
    * transaction cannot commit, so there is nothing to send them for.
    */
   abort(err: unknown): void {
-    this.noteFailure(err);
-    if (this.aborted === undefined) this.aborted = { error: err, at: ++this.tick };
+    this.doom(err);
     // The cancel's own error (57014) may already be recorded as the cause; this one says more.
     if (this.abortsOnError) this.dead = { error: err, at: this.dead?.at ?? ++this.tick };
+  }
+
+  /**
+   * Mark the transaction as one that must not commit, because of `err`, without
+   * claiming anything about the server's state: COMMIT is refused (see
+   * {@link mustRollBack}) and statements are still sent. A rollback to a
+   * savepoint set before it clears the mark.
+   */
+  private doom(err: unknown): void {
+    this.noteFailure(err);
+    if (this.aborted === undefined) this.aborted = { error: err, at: ++this.tick };
   }
 
   /**
@@ -492,23 +546,29 @@ export class TransactionState {
       try {
         result = await currentFrame.run(opened, () => block(opened));
       } catch (err) {
-        await this.rollbackTo(name, opened);
-        throw err;
+        // A write's timeout says what became of the write once this rollback answers.
+        const settled = settledTimeout(err, await this.rollbackTo(name, opened, err), !handle);
+        // A COMMIT refused later names, as its cause, the error the caller was given.
+        for (const record of [this.failure, this.aborted, this.dead])
+          if (record && record.error === err) record.error = settled;
+        throw settled;
       }
       // A failure the block caught (or a statement its timeout cut short) leaves
       // the server's savepoint unusable, and PostgreSQL would refuse the RELEASE
       // anyway, so the block rolls back without asking.
+      // The block is reported rolled back only once the server acknowledged
+      // the ROLLBACK TO; otherwise the failure itself is the error.
       const doomed = this.doomedSince(opened);
       if (doomed !== undefined) {
-        await this.rollbackTo(name, opened);
-        throw rolledBackError(doomed.error, 'savepoint');
+        throw (await this.rollbackTo(name, opened, doomed.error))
+          ? rolledBackError(doomed.error, 'savepoint')
+          : doomed.error;
       }
       try {
         await this.control(this.dialect.releaseSavepointStatement(name));
       } catch (err) {
         const cause = this.failureSince(opened) ?? err;
-        await this.rollbackTo(name, opened);
-        throw rolledBackError(cause, 'savepoint');
+        throw (await this.rollbackTo(name, opened, err)) ? rolledBackError(cause, 'savepoint') : err;
       }
       return result;
     } finally {
@@ -539,17 +599,27 @@ export class TransactionState {
     return undefined;
   }
 
-  private async rollbackTo(name: string, frame: TransactionScope): Promise<void> {
+  /**
+   * Roll back to `frame`'s savepoint; resolves whether the server acknowledged
+   * it. When it did not, the block's writes may still be in the transaction (a
+   * RELEASE that answered late merged them into it), so the transaction is
+   * doomed by `cause`: a caller that catches the block's error and returns
+   * gets no COMMIT.
+   */
+  private async rollbackTo(name: string, frame: TransactionScope, cause: unknown): Promise<boolean> {
     try {
       await this.control(this.dialect.rollbackToSavepointStatement(name));
     } catch {
       // The transaction cannot take the rollback (it settled, or the connection
       // is gone). The error that brought the block down is the one to report.
-      return;
+      this.doom(cause);
+      return false;
     }
-    if (this.failureSince(frame) !== undefined) this.failure = undefined;
+    // Read as records, so a failure whose value is `undefined` is cleared too.
+    if (this.failure !== undefined && this.failure.at > frame.openedAt) this.failure = undefined;
     if (this.aborted !== undefined && this.aborted.at > frame.openedAt) this.aborted = undefined;
     if (this.dead !== undefined && this.dead.at > frame.openedAt) this.dead = undefined;
+    return true;
   }
 
   /**
@@ -559,15 +629,8 @@ export class TransactionState {
    */
   private async control(sql: string): Promise<void> {
     this.assertOpen();
-    await this.send(() =>
-      traceStatement(TRANSACTION_CONTROL_OPERATION, sql, 0, async () => {
-        try {
-          await this.client.query(sql);
-        } catch (err) {
-          throw wrapPgError(err);
-        }
-      }),
-    );
+    this.assertAvailable();
+    await this.send(() => sendControl(this.client, sql));
   }
 }
 
@@ -586,7 +649,7 @@ export function transactionStateOf(pool: unknown): TransactionState | undefined 
  * part way through, the statements it already ran are rolled back and the
  * caller's transaction carries on as if the operation had never started. On
  * any other pool (no transaction, or Turbine's own implicit transaction, which
- * is atomic already) it simply runs `operation`.
+ * is atomic already) it runs `operation`.
  *
  * Every user-facing write that issues more than one statement inside a
  * transaction already goes through this from `TransactionClient`'s accessors
@@ -599,27 +662,113 @@ export function withSavepoint<R>(pool: unknown, operation: () => Promise<R>): Pr
 }
 
 /**
- * Send COMMIT and refuse to report success when the server rolled back instead.
- *
- * PostgreSQL answers COMMIT in an aborted transaction with the command tag
- * `ROLLBACK` and no error. Other engines never set `command` on a COMMIT
- * result, so the check is inert for them.
+ * Timeouts rebuilt by {@link settledTimeout}, each with the timeout it was
+ * rebuilt from, so the next savepoint it leaves rebuilds it from that again.
  */
-export async function commitTransaction(
-  client: { query(text: string): Promise<PgCompatQueryResult> },
-  commitSql: string,
-  firstFailure?: unknown,
-  api: TransactionApi = '$transaction',
+const settledTimeouts = new WeakMap<object, TimeoutError>();
+
+/**
+ * One deadline for the statements of one write: each call answers the
+ * milliseconds left for the next statement, or throws when none are. That
+ * error is `'unknown'`: statements already sent may still be in the
+ * transaction (see {@link settledTimeout}), and a transaction Turbine opened
+ * for the write rebuilds it from its own settlement.
+ */
+export function writeDeadline(timeout: number): () => number {
+  const at = performance.now() + timeout;
+  return () => {
+    const left = Math.ceil(at - performance.now());
+    if (left > 0) return left;
+    throw new TimeoutError(timeout, 'Query', {
+      message:
+        `Query timed out after ${timeout}ms: the write's statements share one deadline, and it passed ` +
+        'before the next one was sent.',
+    });
+  };
+}
+
+/**
+ * `err` as it leaves a savepoint whose rollback answered `acknowledged`: a
+ * timeout from a write that ran in its own savepoint (`write`), or one an
+ * inner savepoint already rebuilt, is rebuilt to say what became of the write.
+ *
+ * A timed-out statement of such a write is reported `'unknown'`, with text that
+ * stays true however the write ends, because the write's other statements are
+ * still in the transaction until this rollback answers. Acknowledged, the
+ * write made no change (`'not-executed'`): the server runs one statement at a
+ * time, so the rollback ran after the timed-out statement ended, cancelled or
+ * not, and undid it with the rest of the write. Refused, it is `'unknown'` and
+ * the transaction cannot commit. The last savepoint the error leaves decides.
+ */
+function settledTimeout(err: unknown, acknowledged: boolean, write: boolean): unknown {
+  const original = settledTimeouts.get(err as object) ?? (write && err instanceof TimeoutError ? err : undefined);
+  if (original === undefined) return err;
+  const settled = new TimeoutError(original.timeoutMs, 'Query', {
+    cause: original,
+    outcome: acknowledged ? 'not-executed' : 'unknown',
+    message: `${original.message.replace(` (${original.docsUrl})`, '')} A savepoint rollback ${acknowledged ? 'undid the write; the transaction can continue.' : 'was not acknowledged; the transaction cannot commit.'}`,
+  });
+  settledTimeouts.set(settled, original);
+  return settled;
+}
+
+/** The part of a connection a transaction-control statement needs. */
+type ControlClient = { query(text: string, values?: unknown[]): Promise<PgCompatQueryResult> };
+
+/**
+ * Run a transaction-control statement (BEGIN / COMMIT / ROLLBACK / SAVEPOINT)
+ * inside the statement trace, with the same error translation every other
+ * query boundary gets. `check` reads the answer inside the trace too, so a
+ * statement it refuses is traced as failed.
+ *
+ * These statements were once issued raw, and COMMIT is the one that matters:
+ * Postgres reports DEFERRABLE constraint violations and a good share of
+ * SERIALIZABLE conflicts at COMMIT rather than at the statement that caused
+ * them. Unwrapped, those surfaced as a raw `DatabaseError` carrying a SQLSTATE
+ * in `.code`, which is the SAME property Turbine puts `TURBINE_E0NN` in, so
+ * `err.code === 'TURBINE_E008'` silently missed them. Worse for the retry
+ * case: a loop keyed on `SerializationFailureError.isRetryable` would never
+ * fire for the commit-time conflicts that are the main reason to run
+ * SERIALIZABLE at all.
+ */
+export function sendControl(
+  client: ControlClient,
+  sql: string,
+  params?: unknown[],
+  check?: (answer: PgCompatQueryResult) => void,
 ): Promise<void> {
-  // The rolled-back check is inside the trace: a COMMIT answered with ROLLBACK is a failed COMMIT.
-  await traceStatement(TRANSACTION_CONTROL_OPERATION, commitSql, 0, async () => {
-    let result: PgCompatQueryResult;
+  return traceStatement(TRANSACTION_CONTROL_OPERATION, sql, params?.length ?? 0, async () => {
+    let answer: PgCompatQueryResult;
     try {
-      result = await client.query(commitSql);
+      answer = await client.query(sql, params);
     } catch (err) {
       throw wrapPgError(err);
     }
-    if (commitWasRolledBack(result)) throw rolledBackError(firstFailure, 'transaction', api);
+    check?.(answer);
+  });
+}
+
+/**
+ * Send COMMIT and refuse to report success when the server rolled back instead.
+ *
+ * PostgreSQL answers COMMIT in an aborted transaction with the command tag
+ * `ROLLBACK` and no error. An engine that reports no `command`, or `COMMIT`,
+ * passes the check. The check runs inside the trace: a COMMIT answered with
+ * ROLLBACK is a failed COMMIT. `rolledBack` is called when the server
+ * answered that way, and only then: an answer that cannot be read is not one.
+ */
+export function commitTransaction(
+  client: ControlClient,
+  commitSql: string,
+  firstFailure?: unknown,
+  api: TransactionApi = '$transaction',
+  rolledBack?: () => void,
+): Promise<void> {
+  return sendControl(client, commitSql, undefined, (answer) => {
+    if (commitWasRolledBack(answer)) {
+      rolledBack?.();
+      throw rolledBackError(firstFailure, 'transaction', api);
+    }
   });
 }
 
@@ -640,22 +789,25 @@ export function commitWasRolledBack(result: { command?: string } | null | undefi
  */
 export function rolledBackError(
   firstFailure: unknown,
-  scope: 'transaction' | 'savepoint' | 'statement',
+  scope: 'transaction' | 'refused' | 'savepoint' | 'statement',
   api: TransactionApi = '$transaction',
 ): Error {
   const head =
     scope === 'transaction'
       ? 'The transaction was rolled back, not committed: a statement inside it failed, and PostgreSQL ' +
         'aborts a transaction at its first error, so COMMIT ended it as a ROLLBACK and none of its writes were saved.'
-      : scope === 'savepoint'
-        ? 'The nested `$transaction` block was rolled back, not released: a statement inside it failed, and ' +
-          'PostgreSQL aborts at the first error, so none of the writes inside the block were kept. The outer ' +
-          'transaction is usable again.'
-        : 'This statement was not sent: an earlier statement in the transaction failed, and PostgreSQL ignores ' +
-          'every statement after a failure until the transaction, or the savepoint it ran in, is rolled back. ' +
-          'Nothing in the transaction can be saved now.';
+      : scope === 'refused'
+        ? 'The transaction was rolled back, not committed: a statement in it was cut short, or a nested block in ' +
+          'it could not be rolled back, so ROLLBACK was sent instead of COMMIT and none of its writes were saved.'
+        : scope === 'savepoint'
+          ? 'The nested `$transaction` block was rolled back, not released: a statement inside it failed, and ' +
+            'PostgreSQL aborts at the first error, so none of the writes inside the block were kept. The outer ' +
+            'transaction is usable again.'
+          : 'This statement was not sent: an earlier statement in the transaction failed, and PostgreSQL ignores ' +
+            'every statement after a failure until the transaction, or the savepoint it ran in, is rolled back. ' +
+            'Nothing in the transaction can be saved now.';
   const message =
-    `${head}${firstFailure !== undefined ? ' The statement that failed first is attached as `cause`.' : ''} ` +
+    `${head}${firstFailure !== undefined ? ' The first failure is attached as `cause`.' : ''} ` +
     'Catching an error inside the callback does not undo the abort. To recover from an expected failure and ' +
     'keep the rest of the work, ' +
     (api === '$transaction'
@@ -690,10 +842,11 @@ export function closedTransactionError(how: TransactionEnd, api: TransactionApi 
  * transaction was still running. Committing then would save whatever part of
  * that work had run, so the transaction is rolled back instead.
  */
-export function unawaitedWorkError(api: TransactionApi): ValidationError {
+export function unawaitedWorkError(api: TransactionApi, cleanupMessage?: string): ValidationError {
   return new ValidationError(
     `The \`${api}\` callback returned while a query it started on the transaction was still running, so the ` +
-      'transaction was rolled back instead of committing part of that work. Await every query before the ' +
+      (cleanupMessage ?? 'transaction did not commit and none of that work was saved. ') +
+      'Await every query before the ' +
       'callback returns. The usual causes are a missing `await`, an `async` callback passed to `forEach` (use ' +
       '`for ... of` or `await Promise.all(...)`), or a promise that was started and not returned.',
   );
@@ -769,14 +922,54 @@ function transactionControlError(statement: ControlStatement, api: TransactionAp
  * client-side failure (a value the driver could not serialize, a closed
  * client) has neither, and says nothing about the state of the transaction.
  */
-function reportedByServer(err: unknown): boolean {
+function reportedByServer(err: unknown, uncommitted?: boolean): boolean {
   let current = err;
   for (let depth = 0; depth < 4 && current !== null && typeof current === 'object'; depth++) {
     const { code, severity } = current as { code?: unknown; severity?: unknown };
-    if (typeof code === 'string' && typeof severity === 'string' && /^[0-9A-Z]{5}$/.test(code)) return true;
+    if (typeof code === 'string' && typeof severity === 'string' && /^[0-9A-Z]{5}$/.test(code)) {
+      return (
+        !uncommitted ||
+        severity === 'ERROR' ||
+        (severity !== 'FATAL' && severity !== 'PANIC' && UNCOMMITTED_ERRORS.test(code))
+      );
+    }
     current = (current as { cause?: unknown }).cause;
   }
   return false;
+}
+
+/**
+ * SQLSTATEs that, raised as an ERROR at COMMIT, end the transaction without
+ * committing: integrity violations (a deferred constraint), transaction
+ * rollbacks (a serialization failure or deadlock, not 40003, "statement
+ * completion unknown") and a cancelled statement (a `statement_timeout` while
+ * deferred triggers run). Read when the severity is not an English word, see
+ * {@link answeredWithError}, so the rule cannot tell an ERROR from a FATAL.
+ * PostgreSQL does raise two of these states as FATAL: 40001 when a recovery
+ * conflict ends a session on a hot standby, and 57014 when authentication
+ * times out. Neither can follow a COMMIT that saved anything (a standby is
+ * read-only, and authentication comes before any transaction), which is why
+ * counting them as a rollback is still safe.
+ */
+const UNCOMMITTED_ERRORS = /^(?:23|40(?!003)|57014)/;
+
+/**
+ * Whether the server answered with an ERROR (see {@link reportedByServer}),
+ * which ends a COMMIT without committing, as the `ROLLBACK` tag does. A FATAL
+ * or PANIC does not count: a backend can die after its commit record is
+ * written. Severity is the server's word in its `lc_messages` language
+ * (node-postgres does not expose the untranslated one), so a word other than
+ * `ERROR`, `FATAL` or `PANIC` counts only for a SQLSTATE in
+ * {@link UNCOMMITTED_ERRORS}; anything else reads as no answer, which is never
+ * wrong.
+ */
+export function answeredWithError(err: unknown): boolean {
+  try {
+    return reportedByServer(err, true);
+  } catch {
+    // A rejection whose fields cannot be read is no server answer.
+    return false;
+  }
 }
 
 /** Whether `dialect` can set a savepoint at all (PowDB cannot, and says so by throwing). */

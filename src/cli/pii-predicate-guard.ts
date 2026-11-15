@@ -48,7 +48,7 @@
  *     `resolveRelation`; columns have carried the same two-spelling rule
  *     (`resolveColumnName`) for longer. Both are IMPORTED here rather than
  *     re-derived: an exact-match lookup answered "not a relation" for the snake
- *     spelling and the walk simply moved on, so `with: { blog_posts: … }` and
+ *     spelling and the walk moved on, so `with: { blog_posts: … }` and
  *     `where: { blog_posts: { some: … } }` reached the builder unguarded while
  *     the declared spelling of the identical query was refused. Every fixture in
  *     the tree used single-word relation names, whose two spellings are the same
@@ -269,7 +269,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  * So: nesting counts, iteration does not. No legal arg shape puts an array
  * directly inside an array (`orderBy` is `X | X[]`, the combinators take `X[]`),
  * so nothing the builder would accept is refused for depth by this rule, and it
- * needs no second budget to reason about, the existing cap now simply sees the
+ * needs no second budget to reason about, the existing cap sees the
  * nesting it was already meant to be counting.
  */
 function arrayItemDepth(item: unknown, depth: number): number {

@@ -18,10 +18,15 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { assertHeadlineRuns } from './semantics.js';
+import type { PgAdmissionOptions } from './pg-admission.js';
+const pgAdmissionOptions: PgAdmissionOptions = process.env.PG_REPORT_SCOPE === 'historical'
+  ? { scope: 'historical' }
+  : { admission: process.env.PG_FINAL_ADMISSION ? JSON.parse(readFileSync(process.env.PG_FINAL_ADMISSION, 'utf8')) : undefined };
 
 interface Stat { name: string; median: number; avg: number; p95: number; min: number; n: number }
 interface Scenario { scenario: string; stats: Stat[]; note?: string }
-interface RunJson { driftHead: number; driftMid: number; driftTail: number; results: Scenario[] }
+interface RunJson { headlineSemantics?: unknown; driftHead: number; driftMid: number; driftTail: number; results: Scenario[] }
 
 function med(xs: number[]): number {
   const s = [...xs].sort((a, b) => a - b);
@@ -46,6 +51,7 @@ if (files.length === 0) {
   process.exit(1);
 }
 const runs = files.map(parseRun);
+const headlineSemantics = assertHeadlineRuns(runs, pgAdmissionOptions);
 
 // Scenario order from the first run; arms from the union, in first-seen order.
 const scenarios = runs[0]!.results.map((r) => r.scenario);
@@ -68,6 +74,7 @@ for (const sc of scenarios) {
 
 const ORMS = arms.filter((a) => a !== 'Raw');
 
+console.log(`Admission scope: ${pgAdmissionOptions.scope === 'historical' ? 'historical' : 'final'}`);
 console.log(`Aggregated from ${runs.length} runs: ${files.join(', ')}\n`);
 const w = Math.max(...scenarios.map((s) => s.length)) + 2;
 console.log(
@@ -158,7 +165,7 @@ for (let i = 0; i < runs.length; i++) {
 
 console.log('\n=== MACHINE ===');
 console.log(JSON.stringify(
-  table.map((r) => ({ scenario: r.scenario, ...Object.fromEntries(r.byArm) })),
+  { headlineSemantics, results: table.map((r) => ({ scenario: r.scenario, ...Object.fromEntries(r.byArm) })) },
   null,
   2,
 ));

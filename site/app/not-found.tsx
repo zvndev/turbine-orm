@@ -10,7 +10,7 @@ const SUGGESTIONS = [
   { href: '/quickstart', label: 'Quick start', hint: 'Install, generate, run a typed query' },
   { href: '/queries', label: 'Reading and writing', hint: 'findMany, create, update and the rest' },
   { href: '/relations', label: 'Relations', hint: 'The nested `with` clause at depth' },
-  { href: '/errors', label: 'Typed errors', hint: 'Every code from E001 to E020' },
+  { href: '/errors', label: 'Typed errors', hint: 'Every code from E001 to E021' },
   { href: '/cli', label: 'CLI', hint: 'init, generate, migrate, doctor, studio' },
   { href: '/changelog', label: 'Changelog', hint: 'What shipped, release by release' },
 ];

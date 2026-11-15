@@ -1100,8 +1100,7 @@ function dynamicDestructiveKind({ text, before }: ProceduralCandidate): Destruct
   // A bare `DROP` whose object keyword is itself part of the runtime expression
   // (`'DROP ' || 'TABLE users'`). Deliberately NOT reported as `drop-cascade`:
   // that label claims dependent objects go too, which would be a factual claim
-  // about the operator's migration that we cannot support. Being alarming is
-  // fine here; being wrong is not.
+  // about the operator's migration that the detector cannot support.
   if (/^DROP\b/i.test(text)) return 'dynamic-destructive';
   if (/^TRUNCATE\b/i.test(text)) return 'truncate';
   if (/^DELETE\b/i.test(text)) return 'delete';

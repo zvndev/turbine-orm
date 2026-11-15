@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "skipLibCheck": false,
+    "target": "ES2023",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "outDir": "build"
+  },
+  "include": ["app.ts", "generated/**/*.ts", "turbine.config.ts", "schema.ts", "seed.ts"]
+}

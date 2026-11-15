@@ -21,6 +21,7 @@ import type { SchemaMetadata } from '../schema.js';
 import { sqliteDialect } from '../sqlite.js';
 import { HAVE_NODE_SQLITE } from './fix-where-engines.js';
 import { makeQuery, mockTable, skipGate } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 // biome-ignore lint/suspicious/noExplicitAny: build-only harness calls
 type Any = any;
@@ -108,7 +109,7 @@ describe('SQLite live: a Date finds the row holding its day', () => {
   sqliteIt('equality and in-lists match the stored YYYY-MM-DD text', async () => {
     const { DatabaseSync } = await import('node:sqlite');
     const { turbineSqlite } = await import('../sqlite.js');
-    const raw = new DatabaseSync(':memory:');
+    const raw = closeSqliteAfter(new DatabaseSync(':memory:'));
     raw.exec('CREATE TABLE fw_events (id INTEGER PRIMARY KEY, birthday DATE, at TEXT)');
     raw.exec("INSERT INTO fw_events (id, birthday) VALUES (1, '2000-02-29'), (2, '1999-12-31'), (3, NULL)");
     const db = turbineSqlite(raw, schema('DATE'), { warnOnUnlimited: false } as never);

@@ -965,7 +965,7 @@ export function defineSchema<S extends SchemaInput>(
       }
 
       // Validate composite PK references real columns and clear column-level PKs
-      // for those columns so we don't double-emit `PRIMARY KEY` clauses.
+      // for those columns to avoid duplicate `PRIMARY KEY` clauses.
       // Composite PK members are implicitly NOT NULL, preserve that even
       // when the user clears the column-level `primaryKey: true` flag.
       if (pk && pk.length > 0) {
@@ -1287,7 +1287,7 @@ export function applyManyToManyRelations(meta: SchemaMetadata, def: SchemaDef): 
     return camelToSnakeLocal(k as string);
   };
 
-  // Deep-ish clone of the tables we touch so the input metadata is not mutated.
+  // Clone the tables being modified so the input metadata is not mutated.
   const tables: Record<string, TableMetadata> = { ...meta.tables };
 
   for (const tableDef of Object.values(def.tables)) {

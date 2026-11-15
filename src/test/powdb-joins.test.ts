@@ -1,5 +1,5 @@
 /**
- * turbine-orm/powdb: F2 native-join + F4 explain + readonly-guard unit tests.
+ * turbine-orm/powdb: Native-join + explain + readonly-guard unit tests.
  *
  * Build-only (no server): a fake pool records every PowQL string the
  * {@link PowqlInterface} emits and returns canned rows, so these assert the
@@ -207,7 +207,7 @@ function qiClientJoin(mock: ReturnType<typeof mockPool>, t = 'app_user') {
 }
 
 // ---------------------------------------------------------------------------
-// F2: join emission shapes
+// Join emission shapes
 // ---------------------------------------------------------------------------
 
 describe('powdb F2: native-join emission', () => {
@@ -279,7 +279,7 @@ describe('powdb F2: native-join emission', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F2: alias-qualified where (parent qualified `p`, relation qualified `c`)
+// Alias-qualified where (parent qualified `p`, relation qualified `c`)
 // ---------------------------------------------------------------------------
 
 describe('powdb F2: alias-qualified where', () => {
@@ -332,7 +332,7 @@ describe('powdb F2: alias-qualified where', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F2: eligibility fallbacks (silent → loader) + capability gate (throw)
+// Eligibility fallbacks (silent → loader) + capability gate (throw)
 // ---------------------------------------------------------------------------
 
 describe('powdb F2: eligibility', () => {
@@ -416,7 +416,7 @@ describe('powdb F2: eligibility', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F4: explain()
+// explain()
 // ---------------------------------------------------------------------------
 
 describe('powdb F4: explain', () => {

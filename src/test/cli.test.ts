@@ -855,9 +855,9 @@ describe('CLI TypeScript loader', () => {
     });
 
     it('returns true (or false, environment-dependent) when called with no resolver', () => {
-      // We cannot reliably assert true/false because the test runs inside the
+      // The result depends on the environment: this test runs inside the
       // turbine-orm dev environment where tsx IS installed (it is a devDep),
-      // but downstream consumers may not have it. We can at least assert that
+      // but downstream consumers may not have it. Assert that
       // the function returns a boolean and does not throw.
       const result = canResolveTsx();
       assert.equal(typeof result, 'boolean');
@@ -887,7 +887,7 @@ describe('CLI TypeScript loader', () => {
       const first = await registerTsLoader();
       // If the first call could register (or had already registered), the
       // second call must report "already". If the first call returned
-      // 'missing' / 'unsupported', we cannot assert idempotency the same way
+      // 'missing' / 'unsupported', the same idempotency assertion does not apply
       // - the helper will keep retrying.
       if (first === 'registered' || first === 'already') {
         const second = await registerTsLoader();
@@ -897,7 +897,7 @@ describe('CLI TypeScript loader', () => {
 
     it('returns "missing" when tsx cannot be resolved (cwd-based probe)', async () => {
       // Switch the CWD to a directory that has no `node_modules/tsx`,
-      // reset state, and verify we get 'missing'. We restore the original
+      // reset state, and expect 'missing'. Restore the original
       // cwd in a finally block.
       _resetTsLoaderStateForTests();
       const originalCwd = process.cwd();
@@ -905,9 +905,9 @@ describe('CLI TypeScript loader', () => {
       try {
         process.chdir(isolated);
         const status = await registerTsLoader();
-        // tsx is NOT resolvable from an empty tmp dir, so we expect 'missing'.
+        // tsx is NOT resolvable from an empty tmp dir, so expect 'missing'.
         // (If the dev machine has a global tsx symlinked, the test environment
-        // would still see it as 'registered', we soften the assertion.)
+        // would still see it as 'registered', so the assertion accepts that too.)
         assert.ok(
           status === 'missing' || status === 'registered' || status === 'already',
           `unexpected status: ${status}`,

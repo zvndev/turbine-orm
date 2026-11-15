@@ -14,7 +14,7 @@
  *   1184 / 1185 DECLINE when somebody else's parser is already there. They
  *     exist only to be faster, so overwriting a caller's own `timestamptz`
  *     reading (strings, Luxon, a Temporal instant) would trade their
- *     correctness for our speed. Turbine had never touched 1184 before this,
+ *     correctness for speed. Turbine did not register a parser for 1184 before,
  *     so declining is also what keeps that promise.
  *
  * And they are declined TOGETHER: registering the array half over a caller's

@@ -214,7 +214,7 @@ describe('turbine-orm/mssql, dialect conformance (no Postgres leakage)', () => {
     assert.equal(mssqlDialect.supportsListenNotify, false);
     assert.equal(mssqlDialect.supportsRLS, false);
     assert.equal(mssqlDialect.supportsAdvisoryLock, true);
-    // The FOR JSON relation override is present (the sanctioned Phase-3 seam).
+    // The FOR JSON relation override is present.
     assert.equal(typeof mssqlDialect.buildRelationSubquery, 'function');
     assert.equal(typeof mssqlDialect.buildLimitOffset, 'function');
     assert.equal(typeof mssqlDialect.buildUpdateStatement, 'function');

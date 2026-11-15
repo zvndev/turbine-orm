@@ -45,7 +45,7 @@ npx turbine mcp     # a read-only MCP server for your database
 ```
 
 - **Mistakes fail at compile time.** Query arguments are fully typed, so a wrong field or relation name is a type error, not a bad query at runtime.
-- **Errors an agent can act on.** Every error has a stable code, `TURBINE_E001` to `TURBINE_E020`, with a link to the fix.
+- **Errors an agent can act on.** Every error has a stable code, `TURBINE_E001` to `TURBINE_E021`, with a link to the fix.
 - **A database agents can explore safely.** The [MCP server](/mcp) has no write tools, runs every read inside a read-only transaction, and never sends PII-tagged columns to the model.
 
 Setup for Claude Code, Cursor and others: [Turbine for AI agents](/ai-agents).
@@ -112,7 +112,7 @@ MIT licensed, with no cloud tier, no account and no telemetry. Studio, `doctor`,
 
 Turbine fits best when you run **Postgres** and want speed, type safety and a small footprint.
 
-It may not be the right pick if you need full migration tooling for SQLite, MySQL or SQL Server (the query API runs on [those engines](/engines), but `generate` and `migrate` are Postgres-only), want a schema DSL like `.prisma` files, or need the largest community of answers online.
+It may not be the right pick if you need mature tooling for SQLite, MySQL or SQL Server (the query API and project commands run on [those engines](/engines), but their CLI support is newer, a different subset per engine, and Studio is Postgres-only), want a schema DSL like `.prisma` files, or need the largest community of answers online.
 
 ## Try it
 

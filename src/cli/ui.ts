@@ -349,7 +349,7 @@ function redactUserinfo(input: string): string {
     // Scan the run of non-whitespace characters that could hold userinfo,
     // remembering the last `@`. A `/`, `?`, or `#` only ends the run once an `@`
     // has been seen, so a password containing one is still covered; a URL with
-    // no credentials simply reaches the end of the run with no `@` recorded.
+    // no credentials reaches the end of the run with no `@` recorded.
     let i = start;
     let lastAt = -1;
     for (; i < input.length; i++) {

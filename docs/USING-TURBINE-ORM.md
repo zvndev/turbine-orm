@@ -182,14 +182,14 @@ export const db = turbine({
 ```ts
 import { turbineHttp } from 'turbine-orm/serverless';
 import type { TurbineClient } from '../generated/turbine/index.js';
-import { schema } from '../generated/turbine/metadata.js';
+import { SCHEMA } from '../generated/turbine/metadata.js';
 import { Pool } from '@neondatabase/serverless';
 
 const pool = new Pool({ connectionString: process.env.DATABASE_URL! });
 
 // Pass the generated client type to get the same typed accessors the TCP
 // `turbine()` factory gives you, `db.users`, `db.posts`, …, with no cast.
-export const db = turbineHttp<TurbineClient>(pool, schema);
+export const db = turbineHttp<TurbineClient>(pool, SCHEMA);
 
 const users = await db.users.findMany({ limit: 10 }); // fully typed
 ```
@@ -297,15 +297,15 @@ Percentiles (PostgreSQL only): `_percentile: { latencyMs: { p: [0.5, 0.95] } }` 
 ### `groupBy`
 
 ```ts
-const byRole = await db.users.groupBy({
-  by: ['role'],
+const byUser = await db.posts.groupBy({
+  by: ['userId'],
   _count: true,
   _sum: { viewCount: true },
   // Order groups by any result column: a by-column, a JSON group-key alias, or
   // a requested aggregate (`_count`, or `_sum`/`_avg`/`_min`/`_max` by field).
   orderBy: { _count: 'desc', _sum: { viewCount: 'desc' } },
 });
-// [{ role: 'member', _count: 42, _sum: { viewCount: 9001 } }, { role: 'admin', _count: 3, _sum: { viewCount: 120 } }]
+// [{ userId: 1, _count: 42, _sum: { viewCount: 9001 } }, { userId: 2, _count: 3, _sum: { viewCount: 120 } }]
 ```
 
 `by` must be a non-empty array of field names: a missing, string or empty `by`, or a `null` entry, throws E003. For one group over every row, use `aggregate()`.
@@ -446,8 +446,9 @@ const users = await db.users.createMany({
     { email: 'd@e.f', name: 'D' },
   ],
 });
-// Single INSERT ... UNNEST, one round-trip regardless of row count. Returns the rows
-// (MySQL returns [] here). Takes select / omit, like create.
+// PostgreSQL uses UNNEST for scalar columns and VALUES for array columns.
+// Large VALUES writes can split into chunks in one transaction.
+// Returns rows (MySQL returns [] here). Takes select / omit, like create.
 ```
 
 Multi-row upsert: new keys are inserted, existing rows updated, in one statement.
@@ -542,7 +543,7 @@ await db.users.upsert({
 // INSERT ... ON CONFLICT DO UPDATE
 ```
 
-When `create` carries the same values as `where` (as above) this is one atomic statement. Otherwise (a `create` that leaves `id` to its sequence, an empty `update`, nested writes) `upsert` looks the row up by `where` first and then updates or inserts, inside one transaction. Keep the shape above when you need race-free "create or update".
+When `where` is exactly one unique key and `create` carries the same values (as above), this can use one atomic conflict statement. Extra predicates beside that key require a lookup. Otherwise (a `create` that leaves `id` to its sequence, an empty `update`, nested writes) `upsert` looks the row up by `where` first and then updates or inserts, inside one transaction. Keep the shape above when you need race-free "create or update".
 
 ### Nested writes
 
@@ -629,7 +630,7 @@ await db.sessions.deleteMany({
 
 ## 7. Transactions
 
-Callback form. Throw to rollback. Every query on `tx` must finish inside the callback: a `tx` used after the callback settles throws `ValidationError`, and a callback that returns while a query it started is still running rolls the transaction back. A statement that fails inside the callback aborts the transaction even when the callback catches the error, and `$transaction` then rejects with `TransactionRolledBackError` (E019) instead of reporting a commit; wrap a statement that may fail in a nested `tx.$transaction` to recover from it. A nested block's callback gets its own handle (`inner` below); a statement through the outer `tx` while the block is open throws `ValidationError`. `COMMIT`, `ROLLBACK`, `SAVEPOINT` and the other transaction-control statements are refused on `tx`'s raw SQL paths.
+Callback form. Throw to rollback. Every query on `tx` must finish inside the callback: a `tx` used after the callback settles throws `ValidationError`, and a callback that returns while a query it started is still running does not commit. A statement that fails inside the callback aborts the transaction even when the callback catches the error, and `$transaction` then rejects with `TransactionRolledBackError` (E019) instead of reporting a commit; wrap a statement that may fail in a nested `tx.$transaction` to recover from it. A nested block's callback gets its own handle (`inner` below); a statement through the outer `tx` while the block is open throws `ValidationError`. `COMMIT`, `ROLLBACK`, `SAVEPOINT` and the other transaction-control statements are refused on `tx`'s raw SQL paths.
 
 ```ts
 await db.$transaction(async (tx) => {
@@ -645,12 +646,26 @@ await db.$transaction(
   async (tx) => { /* ... */ },
   {
     isolationLevel: 'Serializable',   // 'ReadUncommitted' | 'ReadCommitted' | 'RepeatableRead' | 'Serializable'
-    timeout: 5_000,                   // ms; on expiry the statement is cancelled and the transaction rolled back
+    timeout: 5_000,                   // ms; tries to stop work and roll back (see TimeoutError.outcome)
     readOnly: false,                  // true: BEGIN READ ONLY (PostgreSQL, MySQL)
     sessionContext: { 'app.current_tenant': tenantId }, // dotted names; built-ins need allowBuiltinSettings
   },
 );
 ```
+
+A transaction deadline expires before COMMIT. `TimeoutError.outcome` is
+`'not-executed'` only after rollback is acknowledged; an unconfirmed rollback
+is `'unknown'`. PostgreSQL can request cancellation, but the error does not
+claim the running statement was cancelled. MySQL cannot cancel it. Neon
+WebSocket uses its own confirmation policy and refuses transaction timeouts
+on a caller-supplied `Client`. SQLite and local libSQL cannot interrupt
+synchronous native work.
+
+An unanswered COMMIT is E021 on PostgreSQL, MySQL and Neon WebSocket. It may
+have committed, so a read alone does not establish that retrying is safe. Use
+a unique idempotency key written in the same transaction. SQL Server and PowDB
+retain the driver's COMMIT error. SQLite and local libSQL return native engine
+failures. [Transaction details](https://turbineorm.dev/transactions).
 
 ### Nested (SAVEPOINTs)
 
@@ -800,6 +815,8 @@ All errors extend `TurbineError` with a `code: TurbineErrorCode` discriminant.
 | E017 | `UnsupportedFeatureError` | A Postgres-only feature (pgvector, `LISTEN`/`NOTIFY`, RLS `sessionContext`) invoked on an engine that does not support it |
 | E018 | `ReadOnlyError` | A write refused by a read-only database, role or transaction (`reason`) |
 | E019 | `TransactionRolledBackError` | A transaction PostgreSQL rolled back instead of committing; the first failure is `cause` |
+| E020 | `InvariantError` | Turbine caught a bug in itself before dispatch; `invariant` names the failed internal rule |
+| E021 | `TransactionOutcomeUnknownError` | A transaction's COMMIT got no answer Turbine could read, so it may have committed or may still commit (PostgreSQL, MySQL and Neon WebSocket, explicit and Turbine's own transactions); the failure that hid the answer is `cause`. A read does not settle it: retry only a write a unique idempotency key makes safe to repeat |
 
 ### Canonical error handling
 

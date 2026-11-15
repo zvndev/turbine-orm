@@ -19,10 +19,21 @@
  * Hyperdrive), mock pools in tests, and any pool that doesn't expose pg internals.
  */
 
-import { acquireConnection } from './checkout.js';
+import { acquireConnection, type Checkout } from './checkout.js';
 import { type CheckoutGuard, guardCheckout } from './connection-guard.js';
 import { type Dialect, postgresDialect } from './dialect.js';
-import { explainConnectionLoss, PipelineError, type PipelineResultSlot, TurbineError, wrapPgError } from './errors.js';
+import {
+  ConnectionError,
+  driverConnectionLoss,
+  explainConnectionLoss,
+  PipelineError,
+  type PipelineResultSlot,
+  refusedBeforeSending,
+  TimeoutError,
+  TransactionOutcomeUnknownError,
+  TurbineError,
+  wrapPgError,
+} from './errors.js';
 import type { PgCompatPool, PgCompatPoolClient, PgCompatQueryResult } from './pg-types.js';
 import {
   type PipelineRunOptions,
@@ -31,8 +42,8 @@ import {
   supportsExtendedPipeline,
 } from './pipeline-submittable.js';
 import type { DeferredQuery } from './query/index.js';
-import { TRANSACTION_CONTROL_OPERATION, traceStatement } from './query-channel.js';
-import { commitTransaction } from './transaction-state.js';
+import { completeTransaction } from './transaction-outcome.js';
+import { answeredWithError, sendControl, TransactionState } from './transaction-state.js';
 
 // ---------------------------------------------------------------------------
 // Pipeline options (public)
@@ -43,7 +54,7 @@ export interface PipelineOptions {
    * Whether to wrap the pipeline in a transaction (default: true).
    *
    * - `true` (default): All queries execute atomically within BEGIN/COMMIT.
-   *   If any query fails, the entire batch is rolled back.
+   *   If any query fails, nothing in the batch is committed.
    *
    * - `false`: Each query is independent. A failure in one query does NOT
    *   affect others. On partial failure, a `PipelineError` is thrown with
@@ -62,7 +73,6 @@ export interface PipelineOptions {
 /** Minimal client interface for sequential execution */
 interface SequentialClient {
   query(text: string, values?: unknown[]): Promise<PgCompatQueryResult>;
-  release(err?: Error | boolean): void;
 }
 
 /**
@@ -80,40 +90,51 @@ function runOne(client: SequentialClient, q: DeferredQuery<unknown>): Promise<Pg
  * This is the fallback path for clients that don't support the extended-query
  * pipeline protocol (HTTP drivers, mocks, etc.).
  *
- * The caller is responsible for acquiring the client and releasing it after
- * this function completes (in the finally block).
+ * A transactional batch is settled by {@link completeTransaction}, the same
+ * settlement as an explicit transaction, which releases the connection itself:
+ * discarded when its state is not confirmed (a COMMIT with no answer is
+ * `TransactionOutcomeUnknownError`, and a rollback the server did not
+ * acknowledge is reported as no rollback). Every other path leaves the release
+ * to the caller (the finally block in {@link executePipeline}).
+ *
+ * A `timeout` covers both modes and every statement, BEGIN and COMMIT
+ * included (see {@link withDeadline}).
  */
 async function runSequential<T extends readonly DeferredQuery<unknown>[]>(
-  client: SequentialClient,
+  held: Checkout,
   queries: T,
   dialect: Dialect,
   options: PipelineOptions = {},
 ): Promise<PipelineResults<T>> {
-  const { transactional = true } = options;
+  const { transactional = true, timeout } = options;
+  if (timeout && timeout > 0) {
+    return withDeadline(held, timeout, (fenced) => runSequential(fenced, queries, dialect, { transactional }));
+  }
+  const { client, checkout } = held;
 
-  if (!transactional) return runIndependent(client, queries);
+  if (!transactional) return runIndependent(held, queries);
 
+  // Transaction control is wrapped too. It used to be bare, so a connection
+  // that died between checkout and BEGIN (or at COMMIT) surfaced the raw
+  // driver error while every statement between them surfaced a typed
+  // TurbineError, and a caller branching on `err.code` saw neither
+  // `TURBINE_E004` nor a retryable flag for the one failure that is most
+  // worth retrying.
   try {
-    // Transaction control is wrapped too. It used to be bare, so a connection
-    // that died between checkout and BEGIN (or at COMMIT) surfaced the raw
-    // driver error while every statement between them surfaced a typed
-    // TurbineError, and a caller branching on `err.code` saw neither
-    // `TURBINE_E004` nor a retryable flag for the one failure that is most
-    // worth retrying.
-    const begin = dialect.beginStatement();
-    await traceStatement(TRANSACTION_CONTROL_OPERATION, begin, 0, async () => {
-      try {
-        await client.query(begin);
-      } catch (err) {
-        throw wrapPgError(err);
-      }
-    });
-
+    await sendControl(client, dialect.beginStatement());
+  } catch (err) {
+    // Whether a transaction began is not known, so the connection is not reused.
+    checkout.release(err instanceof Error ? err : true);
+    throw err;
+  }
+  const state = new TransactionState(client, dialect);
+  const tracked = { query: (sql: string, values?: unknown[]) => state.run(() => client.query(sql, values)) };
+  return completeTransaction(held, state, dialect, undefined, async () => {
     const results: unknown[] = [];
     for (const q of queries) {
       let raw: PgCompatQueryResult;
       try {
-        raw = await runOne(client, q);
+        raw = await runOne(tracked, q);
       } catch (err) {
         throw wrapPgError(err);
       }
@@ -121,19 +142,56 @@ async function runSequential<T extends readonly DeferredQuery<unknown>[]>(
       // (a `...OrThrow` miss, an optimistic-lock conflict) rolls the batch back.
       results.push(q.transform(raw));
     }
-
-    await commitTransaction(client, dialect.commitStatement());
-
     return results as PipelineResults<T>;
-  } catch (err) {
-    try {
-      const rollback = dialect.rollbackStatement();
-      await traceStatement(TRANSACTION_CONTROL_OPERATION, rollback, 0, () => client.query(rollback));
-    } catch {
-      // Best-effort rollback
-    }
-    throw err;
-  }
+  });
+}
+
+/**
+ * Run a sequential batch under the pipeline's `timeout`. The protocol path
+ * enforces it by destroying its socket; this path had no deadline at all, so a
+ * statement or COMMIT that never got an answer held the checkout forever.
+ *
+ * At the deadline the call rejects with `TimeoutError` (E002) and outcome
+ * `'unknown'`, as on the protocol path: a statement or a COMMIT in flight may
+ * still take effect. The connection is released with that error, so the pool
+ * retires it instead of lending it out. The batch runs on a fenced copy of the
+ * client that refuses every statement once the deadline has passed, without
+ * sending it, so nothing the batch would still send (its next statement, its
+ * COMMIT, or a cleanup ROLLBACK after a COMMIT it already sent) reaches the
+ * connection. A late answer finds the call settled and the checkout released
+ * (the guard releases once).
+ */
+function withDeadline<R>(held: Checkout, timeout: number, run: (fenced: Checkout) => Promise<R>): Promise<R> {
+  const { client, checkout } = held;
+  let expired: TimeoutError | undefined;
+  // Everything but `query` is the client's own (a driver's transaction
+  // recovery policy included), read and called with the client itself as the
+  // receiver, so accessors and private fields keep working. The proxy's own
+  // target is a fresh object, so a frozen client imposes no proxy invariant.
+  const fenced = new Proxy({} as PgCompatPoolClient, {
+    get(_target, key) {
+      if (key === 'query')
+        return (text: string, values?: unknown[]) => (expired ? Promise.reject(expired) : client.query(text, values));
+      const value: unknown = Reflect.get(client, key, client);
+      return typeof value === 'function' ? value.bind(client) : value;
+    },
+    has: (_target, key) => Reflect.has(client, key),
+    getPrototypeOf: () => Reflect.getPrototypeOf(client),
+  });
+  return new Promise<R>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      expired = new TimeoutError(timeout, 'Pipeline');
+      try {
+        checkout.release(expired);
+      } catch {
+        // The deadline is the outcome; a release that throws must not replace it.
+      }
+      reject(expired);
+    }, timeout);
+    run({ client: fenced, checkout })
+      .then(resolve, reject)
+      .finally(() => clearTimeout(timer));
+  });
 }
 
 /**
@@ -186,15 +244,24 @@ function poolDialect(pool: PgCompatPool): Dialect {
  * `err.code === 'TURBINE_E014'` were permanently false on the one path that
  * documents them, and `err.results` did not exist at all. The first failure is
  * still reachable, as `.cause` and as the first `error` slot.
+ *
+ * Each query autocommits, so one whose connection failed under it without an
+ * answer from the server may have run and committed, a SELECT included (it can
+ * write through a function it calls). Its slot is
+ * `TransactionOutcomeUnknownError` (E021) carrying the connection error. Only a
+ * query the driver refused before sending it keeps the connection error, whose
+ * advice is that a retry is safe. A connection that failed is released with
+ * the error, so the pool discards it.
  */
 async function runIndependent<T extends readonly DeferredQuery<unknown>[]>(
-  client: SequentialClient,
+  { client, checkout }: Checkout,
   queries: T,
 ): Promise<PipelineResults<T>> {
   const slots: PipelineResultSlot[] = [];
   let firstError: Error | undefined;
   let failedIndex: number | undefined;
   let failedTag: string | undefined;
+  let lost: Error | undefined;
 
   const fail = (index: number, error: Error): void => {
     slots.push({ status: 'error', error });
@@ -210,8 +277,14 @@ async function runIndependent<T extends readonly DeferredQuery<unknown>[]>(
     try {
       raw = await runOne(client, q);
     } catch (err) {
-      const wrapped = wrapPgError(err);
-      fail(i, wrapped instanceof Error ? wrapped : new Error(String(wrapped)));
+      const wrapped = wrapPgError(driverConnectionLoss(err) ?? err);
+      let error = wrapped instanceof Error ? wrapped : new Error(String(wrapped));
+      if (error instanceof ConnectionError) {
+        lost ??= error;
+        if (!answeredWithError(error) && !refusedBeforeSending(error))
+          error = new TransactionOutcomeUnknownError(error);
+      }
+      fail(i, error);
       continue;
     }
     // A transform throw is a slot failure too, not a batch abort: that is what
@@ -225,6 +298,7 @@ async function runIndependent<T extends readonly DeferredQuery<unknown>[]>(
     }
   }
 
+  if (lost) checkout.release(lost);
   if (firstError === undefined) {
     return slots.map((slot) => (slot as { value: unknown }).value) as unknown as PipelineResults<T>;
   }
@@ -256,6 +330,8 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
   pool: PgCompatPool,
   queries: T,
   options?: PipelineOptions,
+  /** @internal The client's dialect, when the pool does not name one (see {@link poolDialect}). */
+  dialect: Dialect = poolDialect(pool),
 ): Promise<PipelineResults<T>> {
   if (queries.length === 0) {
     return [] as unknown as PipelineResults<T>;
@@ -265,7 +341,8 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
   // checkout types a connection-level failure (wrong password, TLS, refused,
   // an exhausted pool) and guards the checkout window: a connection that dies
   // mid-batch emits 'error', which with no listener exits the process.
-  const { client, checkout }: { client: PgCompatPoolClient; checkout: CheckoutGuard } = await acquireConnection(pool);
+  const held = await acquireConnection(pool);
+  const { client, checkout }: { client: PgCompatPoolClient; checkout: CheckoutGuard } = held;
 
   try {
     if (supportsExtendedPipeline(client)) {
@@ -281,7 +358,7 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
     // non-Postgres engine takes (none of their clients expose pg's wire
     // internals), so it is the one that has to speak the engine's transaction
     // keywords rather than Postgres's.
-    return await runSequential(client, queries, poolDialect(pool), options);
+    return await runSequential(held, queries, dialect, options);
   } catch (err) {
     // Already-typed Turbine errors pass through untouched; anything else is a
     // driver error that must not escape with a SQLSTATE sitting in the same
@@ -295,7 +372,8 @@ export async function executePipeline<T extends readonly DeferredQuery<unknown>[
     // is the residue: a rollback that did not take, or a backend left in a
     // transaction by something other than this module. Releasing such a client
     // normally is what turned one failed batch into `25P02` on somebody else's
-    // query.
+    // query. A transactional sequential batch was already released by its
+    // settlement, which leaves this a no-op (the guard releases once).
     if (pipelineClientNeedsDiscard(client)) {
       checkout.release(new Error('turbine: pipeline connection left an open transaction and was discarded'));
     } else {

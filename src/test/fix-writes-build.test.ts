@@ -395,12 +395,15 @@ describe('createMany is sized before any statement is built', () => {
 });
 
 describe('the statements of one write share one deadline', () => {
-  it('a re-read write whose statements together outlast the timeout is a timeout, and rolls back', async () => {
+  it('a re-read write whose statements together outlast the timeout is a timeout, and never commits', async () => {
     // Each statement alone fits the 100 ms timeout; the UPDATE and its re-read together do not.
     const { qi, sqls } = recording(mysqlDialect, 'tasks', { rowsFor: () => [{ id: 1 }], delayMs: 60 });
     await assert.rejects(qi.update({ where: { id: 1 }, data: { status: 's' }, timeout: 100 }), (err: unknown) => {
       assert.ok(err instanceof TimeoutError, String(err));
-      assert.equal((err as TimeoutError).outcome, 'not-executed');
+      // The re-read is still running and nothing can cancel it, so the
+      // rollback is not confirmed: no rollback is claimed.
+      assert.equal((err as TimeoutError).outcome, 'unknown');
+      assert.match((err as Error).message, /COMMIT was never sent[\s\S]*rollback is not confirmed/);
       return true;
     });
     assert.ok(!sqls().includes('COMMIT'));

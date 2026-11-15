@@ -21,6 +21,7 @@ import { UNSAFE } from '../query/index.js';
 import type { SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, turbineSqlite } from '../sqlite.js';
 import { mockTable } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 const DatabaseSync: (new (path: string) => DatabaseSyncType) | undefined = (() => {
   try {
@@ -53,7 +54,7 @@ describe('batched loader: a PII-tagged correlation key', () => {
   for (const strategy of ['join', 'batched', 'auto'] as const) {
     dbIt(`still loads the relation under relationLoadStrategy: '${strategy}'`, async () => {
       if (!DatabaseSync) return;
-      const db = new DatabaseSync(':memory:');
+      const db = closeSqliteAfter(new DatabaseSync(':memory:'));
       db.exec(SCHEMA_SQL);
       // The strategy is a per-QUERY arg here: TurbineSqliteOptions does not
       // carry the client-level knob, so passing it there would silently test
@@ -82,7 +83,7 @@ describe('batched loader: a PII-tagged correlation key', () => {
 
   dbIt('returns the PII key when the caller opts in with includePii', async () => {
     if (!DatabaseSync) return;
-    const db = new DatabaseSync(':memory:');
+    const db = closeSqliteAfter(new DatabaseSync(':memory:'));
     db.exec(SCHEMA_SQL);
     const client = turbineSqlite(db, taggedSchema(db), { warnOnUnlimited: false });
     try {

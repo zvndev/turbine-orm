@@ -481,17 +481,25 @@ describe('driver errors that used to arrive untyped or mistyped', () => {
     assert.match(new ReadOnlyError('refused.', { reason: 'rbac' }).message, /Route writes to a writable primary/);
   });
 
-  it("a cancel request's 57014 names Turbine's timeout; statement_timeout keeps its own wording", () => {
-    const cancelled = wrapPgError(
-      pgError({ code: '57014', severity: 'ERROR', message: 'canceling statement due to user request' }),
-    );
-    assert.ok(cancelled instanceof TimeoutError && cancelled.outcome === 'not-executed');
-    assert.match((cancelled as Error).message, /Turbine sends when a query or transaction `timeout` expires/);
-    assert.doesNotMatch((cancelled as Error).message, /statement_timeout/);
-    const server = wrapPgError(
-      pgError({ code: '57014', severity: 'ERROR', message: 'canceling statement due to statement timeout' }),
-    );
-    assert.match((server as Error).message, /server-side statement_timeout/);
+  it('a 57014 names no single cause, whatever language the server reports in', () => {
+    // The SQLSTATE does not say who cancelled the statement, and the message
+    // that does is in the server's lc_messages language: a German server says
+    // "storniere Anfrage wegen Benutzeraufforderung" for a cancel request.
+    for (const message of [
+      'canceling statement due to user request',
+      'canceling statement due to statement timeout',
+      'storniere Anfrage wegen Benutzeraufforderung',
+      'storniere Anfrage wegen Zeitüberschreitung der Anweisung',
+    ]) {
+      const cancelled = wrapPgError(pgError({ code: '57014', severity: 'ERROR', message }));
+      assert.ok(cancelled instanceof TimeoutError && cancelled.outcome === 'not-executed', message);
+      assert.match(
+        (cancelled as Error).message,
+        /cancelled on the server, by its `statement_timeout` or by a cancel request/,
+        message,
+      );
+      assert.doesNotMatch((cancelled as Error).message, /canceled by server-side statement_timeout/, message);
+    }
   });
 
   it("pg-pool's checkout timeout on a caller's own pool is a ConnectionError naming the fix", () => {

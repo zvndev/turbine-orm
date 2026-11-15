@@ -1,0 +1,320 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://turbineorm.dev/benchmarks/cross-engine-exact-effects-v2.schema.json",
+  "title": "Comparative exact-effects evidence",
+  "description": "Structural schema. validate.mjs additionally checks exact engine/scenario/arm catalogs, installed pins, distributions, repetitions, cleanup and correctness controls. A schema-valid document alone does not establish evidence.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "semantics",
+    "status",
+    "runId",
+    "performanceClaimsAllowed",
+    "rounds",
+    "warmup",
+    "fixtureRows",
+    "batchSize",
+    "source",
+    "harnessSha256",
+    "installed",
+    "runtime",
+    "engines"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "semantics": {
+      "const": "cross-engine-exact-effects-v2"
+    },
+    "status": {
+      "const": "complete"
+    },
+    "runId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "performanceClaimsAllowed": {
+      "const": false
+    },
+    "rounds": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "warmup": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "fixtureRows": {
+      "const": 2048
+    },
+    "batchSize": {
+      "const": 128
+    },
+    "source": {
+      "type": "object",
+      "required": [
+        "gitHead",
+        "contentSha256"
+      ],
+      "properties": {
+        "gitHead": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{40}$"
+        },
+        "contentSha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "harnessSha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "installed": {
+      "type": "object"
+    },
+    "runtime": {
+      "type": "object",
+      "required": [
+        "node",
+        "v8",
+        "openssl",
+        "sourcePg"
+      ],
+      "properties": {
+        "node": {
+          "type": "string",
+          "minLength": 1
+        },
+        "v8": {
+          "type": "string",
+          "minLength": 1
+        },
+        "openssl": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sourcePg": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "engines": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "engine",
+              "status",
+              "reason"
+            ],
+            "properties": {
+              "engine": {
+                "enum": [
+                  "sqlite",
+                  "postgresql",
+                  "mysql",
+                  "mssql"
+                ]
+              },
+              "status": {
+                "const": "unavailable"
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 11
+              }
+            },
+            "not": {
+              "required": [
+                "scenarios"
+              ]
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "engine",
+              "status",
+              "serverVersion",
+              "settings",
+              "pool",
+              "correctness",
+              "controls",
+              "scenarios",
+              "cleanup"
+            ],
+            "properties": {
+              "engine": {
+                "enum": [
+                  "sqlite",
+                  "postgresql",
+                  "mysql",
+                  "mssql"
+                ]
+              },
+              "status": {
+                "const": "complete"
+              },
+              "cleanup": {
+                "const": "complete"
+              },
+              "serverVersion": {
+                "type": "string",
+                "minLength": 1
+              },
+              "scenarios": {
+                "type": "array",
+                "minItems": 4,
+                "maxItems": 4
+              },
+              "settings": {
+                "type": "object",
+                "minProperties": 3,
+                "additionalProperties": {
+                  "type": [
+                    "string",
+                    "number",
+                    "boolean"
+                  ]
+                }
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "engine": {
+                      "const": "mysql"
+                    }
+                  }
+                },
+                "then": {
+                  "properties": {
+                    "controls": {
+                      "type": "object",
+                      "required": [
+                        "nativeRoutes"
+                      ],
+                      "properties": {
+                        "nativeRoutes": {
+                          "type": "object",
+                          "required": [
+                            "raw",
+                            "turbine-source"
+                          ],
+                          "properties": {
+                            "raw": {
+                              "$ref": "#/$defs/mysqlNativeRoute"
+                            },
+                            "turbine-source": {
+                              "$ref": "#/$defs/mysqlNativeRoute"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "$defs": {
+    "mysqlNativeRoute": {
+      "type": "object",
+      "required": [
+        "driver",
+        "physicalConnections",
+        "statements",
+        "commands",
+        "pauseCalls",
+        "resumeCalls"
+      ],
+      "properties": {
+        "driver": {
+          "const": "mysql2"
+        },
+        "physicalConnections": {
+          "const": 1
+        },
+        "pauseCalls": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "resumeCalls": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "statements": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "commands": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "sql",
+              "method",
+              "commandClass",
+              "callback",
+              "fieldsEvents",
+              "rowEvents",
+              "retainedRowsAtEnd",
+              "ended"
+            ],
+            "properties": {
+              "sql": {
+                "type": "string"
+              },
+              "method": {
+                "enum": [
+                  "query",
+                  "execute"
+                ]
+              },
+              "commandClass": {
+                "enum": [
+                  "Query",
+                  "Execute"
+                ]
+              },
+              "callback": {
+                "type": "boolean"
+              },
+              "fieldsEvents": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "rowEvents": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "retainedRowsAtEnd": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "ended": {
+                "const": true
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

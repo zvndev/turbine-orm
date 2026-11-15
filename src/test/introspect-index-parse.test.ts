@@ -4,25 +4,34 @@
  * The old greedy `/\((.+)\)/` swallowed a PARTIAL index's trailing
  * `WHERE (...)` parentheses into the captured column list, so IndexMetadata
  * carried a raw predicate fragment that then leaked into generated
- * compound-unique selector names. These build-only tests pin the USING-anchored
- * parse: clean columns, no WHERE fragment, quoted identifiers de-quoted, and the
+ * compound-unique selector names. These build-only tests pin the parse: clean
+ * columns, no WHERE fragment, quoted identifiers de-quoted, and the
  * partial-index flag.
  *
  * They also pin the clauses that follow the key list. `INCLUDE (...)`,
  * `WITH (...)` and a COLLATE / opclass key are the shapes `cli/mcp.ts`'s
- * independently written copy of this parser got wrong while this one did not
+ * independently written copy of this parser once got wrong
  * (`['id) INCLUDE (email']` against `['id']`), which is what made the ORM and the
  * MCP server disagree about whether an index covers a column, and therefore
- * about relation cardinality. Both surfaces consume this scanner now, so they
- * cannot answer differently; these tests are what pins its answers. (Two OTHER
- * indexdef parsers still exist, `parsePlainUniqueIndexColumns` in introspect.ts
- * and `describeIndexDefMismatch` in schema-sql.ts, and a fix here does not reach
- * them; see the catalogue on `parseIndexKeyEntries`.)
+ * about relation cardinality. Every reader of index definitions now goes
+ * through `readIndexDefinition` (pg-catalog-text.ts); its own adversarial
+ * cases live in src/test/pg-catalog-text.test.ts.
  */
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { indexHasWhere, indexKeyColumn, parseIndexColumns, parseIndexKeyEntries } from '../introspect.js';
+import { indexHasWhere, parseIndexColumns } from '../introspect.js';
+import { readIndexDefinition } from '../pg-catalog-text.js';
+
+/** One entry per key, an expression key included as `<expression>`. */
+const parseIndexKeyEntries = (def: string): string[] =>
+  readIndexDefinition(def)?.keys.map((key) => key.column ?? '<expression>') ?? [];
+
+/** The column a single key entry indexes, or null for an expression. */
+function indexKeyColumn(entry: string): string | null {
+  const keys = readIndexDefinition(`CREATE INDEX i ON t USING btree (${entry})`)?.keys;
+  return keys?.length === 1 ? keys[0]!.column : null;
+}
 
 describe('parseIndexColumns', () => {
   it('parses a plain multi-column index', () => {
@@ -83,7 +92,7 @@ describe('parseIndexColumns', () => {
   it('does not split a comma INSIDE an expression key', () => {
     // `.split(',')` cut this in half and produced two entries, neither of which
     // is a column and neither of which is a whole expression.
-    assert.deepEqual(parseIndexKeyEntries('CREATE INDEX idx ON tbl USING btree (coalesce(a, b))'), ['coalesce(a, b)']);
+    assert.deepEqual(parseIndexKeyEntries('CREATE INDEX idx ON tbl USING btree (coalesce(a, b))'), ['<expression>']);
     assert.deepEqual(parseIndexColumns('CREATE INDEX idx ON tbl USING btree (coalesce(a, b))'), []);
   });
 
@@ -109,7 +118,7 @@ describe('parseIndexColumns', () => {
     // (`deriveCatalogRelations`, which now re-reads the arity from the raw
     // definition and requires the two to agree).
     const def = 'CREATE UNIQUE INDEX u ON t USING btree (a, lower(b), c)';
-    assert.deepEqual(parseIndexKeyEntries(def), ['a', 'lower(b)', 'c']);
+    assert.deepEqual(parseIndexKeyEntries(def), ['a', '<expression>', 'c']);
     assert.deepEqual(parseIndexColumns(def), ['a', 'c']);
     assert.notEqual(parseIndexKeyEntries(def).length, parseIndexColumns(def).length);
     // An all-plain key list is the case where the two DO agree.
@@ -126,17 +135,16 @@ describe('parseIndexColumns', () => {
   });
 });
 
-describe('parseIndexKeyEntries / indexKeyColumn', () => {
+describe('key entries and key columns', () => {
   /**
-   * The one difference between the two exports, and the reason `cli/mcp.ts` can
-   * consume this module instead of keeping a copy: `parseIndexColumns` DROPS an
-   * expression key (generated metadata has nowhere to say a key was not a
-   * column), while the entries variant keeps it so the MCP server can report
-   * `columnsWithheld: true` rather than silently returning a shorter list.
+   * `parseIndexColumns` DROPS an expression key (generated metadata has nowhere
+   * to say a key was not a column), while the reader keeps every entry so the
+   * MCP server can report `columnsWithheld: true` rather than silently
+   * returning a shorter list.
    */
   it('keeps an expression entry that parseIndexColumns drops', () => {
     const def = "CREATE INDEX idx ON tbl USING btree (id, (email || 'ceo@example.com'))";
-    assert.deepEqual(parseIndexKeyEntries(def), ['id', "(email || 'ceo@example.com')"]);
+    assert.deepEqual(parseIndexKeyEntries(def), ['id', '<expression>']);
     assert.deepEqual(parseIndexColumns(def), ['id']);
   });
 

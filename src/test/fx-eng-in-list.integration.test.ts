@@ -23,6 +23,7 @@ import type { TurbineClient } from '../client.js';
 import type { SchemaMetadata } from '../schema.js';
 import { HAVE_NODE_SQLITE } from './fix-where-engines.js';
 import { skipGate } from './helpers.js';
+import { closeSqliteAfter, sqliteFixtureScope } from './sqlite-fixture-lifetime.js';
 
 // biome-ignore lint/suspicious/noExplicitAny: tables are driven by name, with no generated types
 type Any = any;
@@ -242,7 +243,7 @@ describe('in / notIn match equality on SQLite, BLOB and bigint included (live, i
     const { createRequire } = await import('node:module');
     const { DatabaseSync } = createRequire(process.cwd())('node:sqlite');
     const { introspectSqliteDatabase, turbineSqlite } = await import('../sqlite.js');
-    const raw = new DatabaseSync(':memory:');
+    const raw = closeSqliteAfter(new DatabaseSync(':memory:'), sqliteCleanup);
     raw.exec(
       'CREATE TABLE vals (id INTEGER PRIMARY KEY, bin BLOB, big INTEGER, flag BOOLEAN, txt TEXT, nc TEXT COLLATE NOCASE, r REAL);' +
         "INSERT INTO vals VALUES (1, X'00ff', 9007199254740993, 1, '5', 'Abc', 1e999), (2, X'00fe', 9007199254740992, 0, 'x', 'zz', 1.5), " +
@@ -254,7 +255,7 @@ describe('in / notIn match equality on SQLite, BLOB and bigint included (live, i
     );
     db = turbineSqlite(raw, introspectSqliteDatabase(raw), { warnOnUnlimited: false }) as Any;
   });
-  sqlite.after(async () => {
+  const sqliteCleanup = sqliteFixtureScope(async () => {
     await db?.disconnect();
   });
 

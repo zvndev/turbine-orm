@@ -17,7 +17,7 @@
  * the stitcher no longer has.
  *
  * That difference is silent: the query succeeds, the HTTP status is 200, and a
- * to-one relation is simply `null`.
+ * to-one relation is `null`.
  *
  * This suite is the property-style guard for the whole class. It enumerates
  * query shapes as data, runs each one under BOTH `relationLoadStrategy: 'join'`

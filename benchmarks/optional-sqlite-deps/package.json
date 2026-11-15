@@ -1,0 +1,25 @@
+{
+  "name": "turbine-optional-sqlite-benchmarks",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@biomejs/biome": "2.5.14",
+    "@cloudflare/workers-types": "5.20261106.1",
+    "@libsql/client": "0.18.0",
+    "@prisma/adapter-d1": "7.10.1",
+    "@prisma/adapter-libsql": "7.10.1",
+    "@prisma/client": "7.10.1",
+    "drizzle-orm": "0.45.4",
+    "drizzle-rc": "npm:drizzle-orm@1.0.0-rc.5",
+    "esbuild": "0.28.2",
+    "lint-staged": "17.6.0",
+    "marked": "17.0.1",
+    "miniflare": "4.20260730.0",
+    "prisma": "7.10.1",
+    "tsx": "4.23.15"
+  },
+  "overrides": {
+    "workerd": "1.20260730.1",
+    "libsql": "0.5.29"
+  }
+}

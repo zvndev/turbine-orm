@@ -19,7 +19,7 @@
  *     impossible to string-concatenate a value into the query through this API.
  *     This is the whole point of the tagged-template shape: the literal segments
  *     are frozen by the compiler (`TemplateStringsArray`), and the only way to
- *     get a runtime value into the query is via `${...}`, which we bind. A
+ *     get a runtime value into the query is via `${...}`, which is bound. A
  *     plain array passed where the template belongs is refused at runtime
  *     ({@link assertTemplateStrings}).
  *

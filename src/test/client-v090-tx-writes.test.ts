@@ -23,6 +23,7 @@ import { mysqlDialect } from '../mysql.js';
 import type { SchemaMetadata } from '../schema.js';
 import { SqlitePool, sqliteDialect } from '../sqlite.js';
 import { mockTable } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 const schema: SchemaMetadata = {
   tables: {
@@ -48,7 +49,7 @@ const twoParamSqlite = { ...sqliteDialect, capabilities: { ...sqliteDialect.capa
 
 async function sqliteClient(): Promise<{ db: TurbineClient; codes: () => string[] }> {
   const { DatabaseSync } = await import('node:sqlite');
-  const handle = new DatabaseSync(':memory:');
+  const handle = closeSqliteAfter(new DatabaseSync(':memory:'));
   handle.exec('CREATE TABLE items (id INTEGER PRIMARY KEY, code TEXT NOT NULL UNIQUE)');
   handle.exec("INSERT INTO items (code) VALUES ('taken')");
   const db = new TurbineClient(

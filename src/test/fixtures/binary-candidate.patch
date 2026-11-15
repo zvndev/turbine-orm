@@ -1,0 +1,19 @@
+diff --git i/src/generate.ts w/src/generate.ts
+index 7e0431f..5141845 100644
+--- i/src/generate.ts
++++ w/src/generate.ts
+@@ -89,7 +89,13 @@ function resolvedColumnType(
+   const read = pgTypeToTs(pgType, col.nullable);
+   // Every catalog/code-first bridge marks temporal reads. Custom type text
+   // and metadata without that runtime marker retain their original meaning.
+-  if (intrinsicDates?.has(col.name) && /^Date(?:\[\])?(?: \| null)?$/.test(tsType)) {
++  if (
++    (intrinsicDates?.has(col.name) && /^Date(?:\[\])?(?: \| null)?$/.test(tsType)) ||
++    (declared === undefined &&
++      (base === 'bytea'
++        ? tsType === read
++        : /^blob$/i.test(base) && tsType === `Uint8Array${col.nullable ? ' | null' : ''}`))
++  ) {
+     return `globalThis.${tsType}`;
+   }
+   return forWrite && tsType === read ? pgTypeToTsInput(pgType, col.nullable) : tsType;

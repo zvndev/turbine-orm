@@ -41,6 +41,7 @@ import { createPrismaCompatClient } from '../prisma-compat.js';
 import type { WithClause } from '../query/types.js';
 import type { PrismaCompatMap, SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, turbineSqlite } from '../sqlite.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 const DatabaseSync: (new (path: string) => DatabaseSyncType) | undefined = (() => {
   try {
@@ -74,7 +75,7 @@ INSERT INTO post_tag VALUES (1, 1), (1, 2), (2, 1);
 `;
 
 function fixture(): { db: DatabaseSyncType; schema: SchemaMetadata } {
-  const db = new (DatabaseSync as NonNullable<typeof DatabaseSync>)(':memory:');
+  const db = closeSqliteAfter(new (DatabaseSync as NonNullable<typeof DatabaseSync>)(':memory:'));
   db.exec(SCHEMA_SQL);
   return { db, schema: introspectSqliteDatabase(db) };
 }
@@ -348,7 +349,7 @@ describe('projection and relation validation is data-independent (0.65)', () => 
 
   dbIt('a select that names no fields is refused on every strategy (review-caught)', async () => {
     if (!DatabaseSync) return;
-    // The 0.65 review found the original refusal was truthiness-decided while
+    // In 0.65, the original refusal was truthiness-decided while
     // the resolver's branch is presence-decided, and the batched loader
     // force-adds correlation keys to a select BEFORE resolving: an all-falsy
     // select therefore looked populated under batched and empty under join,

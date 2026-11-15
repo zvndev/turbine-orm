@@ -638,7 +638,7 @@ const ALIAS_HINT: Readonly<Record<string, string>> = {
  * hand-translated (`optimisticLock`, `distinctOn`); they are fully honoured, and
  * warning about a key the adapter just acted on would be the worst possible
  * diagnostic. `'nativeAlias'` members are in the set on purpose too: `limit` on
- * `findMany` IS recognized, it simply gets the alias message rather than the
+ * `findMany` IS recognized, it gets the alias message rather than the
  * generic one. Only `'internal'` is excluded, because nothing on this surface
  * can reach it.
  *
@@ -725,7 +725,7 @@ function warnUnknownQueryOptions(log: ClientLogContext, model: string, op: Compa
  *
  * Nothing re-runs `turbine migrate-from-prisma`. When the schema moves on, the
  * map does not, and the adapter keeps translating the names it has: a model
- * added last week is simply not on the client, a renamed field is quietly
+ * added after generation is absent from the client, a renamed field is quietly
  * absent from results. Both read as adapter bugs. This turns them into one line
  * naming the file and the command that fixes it.
  *
@@ -1111,8 +1111,7 @@ function assertWriteProjectionField(ctx: Ctx, mm: PrismaModelMap, op: string, cl
  *
  * A relation (or `_count`) key THROWS instead: a write returns its own row and
  * nothing else, so serving it is impossible, and the alternative is handing
- * back a row whose relation property is silently `undefined`, which is the
- * failure mode this whole round exists to remove.
+ * back a row whose relation property is silently `undefined`, which would hide an unsupported projection.
  */
 function resolveWriteProjection(
   ctx: Ctx,
@@ -3000,7 +2999,7 @@ const EMPTY_EXTENSIONS: ExtensionState = { client: {}, model: new Map(), allMode
  * `$extends` was called on keeps working unchanged).
  *
  * Everything this adapter cannot honour throws here: an unsupported component
- * ({@link UNSUPPORTED_COMPONENTS}), a component name we do not recognize at all
+ * ({@link UNSUPPORTED_COMPONENTS}), an unrecognized component name
  * (`@prisma/extension-accelerate`, Pulse, read replicas, ...), a `client` member
  * that would shadow a delegate or a client-level method, or a `model` key that
  * names no model in the map. Extension-over-extension overrides are allowed and

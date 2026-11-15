@@ -3,8 +3,8 @@
  *
  * 0.66 made the mode per-client instead of last-constructor-wins, by running
  * each operation inside an AsyncLocalStorage scope carrying that client's mode.
- * A review found three paths where the scope was never established, and all
- * three failed in the direction that leaks: a `'safe'` client rendered row
+ * Three paths lacked that scope, and all three failed in the direction that
+ * leaks: a `'safe'` client rendered row
  * VALUES as soon as any `'verbose'` client existed anywhere in the process.
  *
  *   1. A HOISTED DELEGATE. The scoping proxy was built only once two clients
@@ -21,7 +21,7 @@
  *      raw-SQL entry points disagreed about the same statement. The subtlety
  *      that hid it: `TypedSqlQuery` is LAZY, so a scope wrapped around the
  *      tagged-template call is torn down before a row is fetched. The scope has
- *      to reach the execution, which is why it is now a constructor parameter.
+ *      to reach the execution, which is why it is a constructor parameter.
  *
  * Every test here constructs a `'verbose'` client to force divergence, then
  * asserts the `'safe'` client still redacts. Without the divergence the module

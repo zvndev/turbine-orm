@@ -35,6 +35,7 @@ import type { QueryInterface } from '../query/index.js';
 import type { SchemaMetadata } from '../schema.js';
 import { sqliteDialect, turbineSqlite } from '../sqlite.js';
 import { makeQuery, mockTable, skipGate } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 // ---------------------------------------------------------------------------
 // Tier 1, build-only
@@ -312,7 +313,7 @@ describe('createMany returning: false live, sqlite', () => {
   sqliteGate.it('counts every shape, and the chunked and NOCASE paths still hold', async () => {
     const { introspectSqliteDatabase } = await import('../sqlite.js');
     const { DatabaseSync } = createRequire(process.cwd())('node:sqlite');
-    const db = new DatabaseSync(':memory:');
+    const db = closeSqliteAfter(new DatabaseSync(':memory:'));
     db.exec(`
       CREATE TABLE cm_up (k TEXT PRIMARY KEY, n INTEGER, note TEXT);
       CREATE TABLE cm_ci (k TEXT PRIMARY KEY COLLATE NOCASE, n INTEGER);

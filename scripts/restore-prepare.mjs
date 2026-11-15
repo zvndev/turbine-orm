@@ -8,8 +8,7 @@
  * already present.
  *
  * The value comes from the gitignored temp file strip-prepare.mjs wrote (so it
- * is never hardcoded); if that file is missing we fall back to a sensible
- * default. The entry is re-inserted immediately after `prepublishOnly` (its
+ * is never hardcoded); if that file is missing, fall back to a default. The entry is re-inserted immediately after `prepublishOnly` (its
  * original position), and the trailing comma is COMPUTED from the insertion
  * position rather than hardcoded, so strip plus restore round-trips to a
  * byte-identical file and never emits invalid JSON, even if `prepublishOnly`

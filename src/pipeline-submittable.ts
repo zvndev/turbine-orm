@@ -8,22 +8,25 @@
  *
  * The approach (listener-swap):
  *   1. Detach the pg.Client's event listeners from the Connection
- *   2. Attach our own state-machine listeners
+ *   2. Attach the pipeline state-machine listeners
  *   3. Cork the TCP stream, push all protocol messages, uncork (one TCP write)
  *   4. Drive a state machine over backend response events
  *   5. Restore original listeners and release the client
  *
  * This is the same pattern used by pg-cursor and pg-query-stream, but extended
- * to handle N queries in a single pipeline.
+ * to handle N queries in a single pipeline. Unlike those, the batch is not the
+ * Client's active query, so the Client cannot fail it when the socket dies:
+ * this module listens for the Connection's `end` / `error` itself while it
+ * owns the connection (see `onConnectionLost`).
  */
 
 import type { EventEmitter } from 'node:events';
 import type PgResult from 'pg/lib/result';
 import pg from '#pg';
-import { PipelineError, TimeoutError, wrapPgError } from './errors.js';
+import { PipelineError, TimeoutError, TransactionOutcomeUnknownError, wrapPgError } from './errors.js';
 import type { PgCompatQueryResult } from './pg-types.js';
 import type { DeferredQuery } from './query/index.js';
-import { rolledBackError } from './transaction-state.js';
+import { answeredWithError, rolledBackError } from './transaction-state.js';
 
 // Read off pg's own module object (`pg.Result` IS `pg/lib/result`, `pg.utils`
 // IS `pg/lib/utils`) rather than imported by subpath, so the whole driver comes
@@ -32,7 +35,7 @@ const Result = (pg as unknown as { Result: typeof PgResult }).Result;
 const { prepareValue } = (pg as unknown as { utils: { prepareValue(value: unknown): unknown } }).utils;
 
 // ---------------------------------------------------------------------------
-// Types for pg internals we interact with
+// Types for pg internals used by the pipeline
 // ---------------------------------------------------------------------------
 
 /** The pg Connection object, an EventEmitter with wire-protocol methods */
@@ -57,7 +60,7 @@ export interface PgConnection extends EventEmitter {
   sync(): void;
 }
 
-/** A pg PoolClient with the internal fields we need */
+/** A pg PoolClient with the internals required by the pipeline */
 export interface PgPoolClient {
   connection: PgConnection;
   /** pg.Client sets this to control query queue draining */
@@ -95,12 +98,12 @@ export function pipelineClientNeedsDiscard(client: unknown): boolean {
 type TransactionStatus = 'I' | 'T' | 'E' | undefined;
 
 // ---------------------------------------------------------------------------
-// Event names we intercept
+// Intercepted event names
 // ---------------------------------------------------------------------------
 
 /**
  * All backend message event names that the pg Client listens for.
- * We snapshot, detach, and restore listeners for these events.
+ * Listeners for these events are snapshotted, detached, and restored.
  */
 const INTERCEPTED_EVENTS = [
   'readyForQuery',
@@ -132,7 +135,10 @@ export interface PipelineRunOptions {
    * query's transform has run, so a transform that throws (a `...OrThrow`
    * miss, an optimistic-lock conflict) rolls the writes back instead of
    * rejecting after they committed. That costs a second round trip; a batch
-   * of plain SELECTs has nothing to undo and keeps the single one.
+   * of plain SELECTs keeps the single one, its COMMIT sent with the batch and
+   * its transforms run after it. A SELECT can still write through a function
+   * it calls, so that COMMIT is never assumed to have changed nothing (see
+   * `onConnectionLost`).
    */
   transactional?: boolean;
 
@@ -175,13 +181,17 @@ function restoreListeners(emitter: EventEmitter, snapshot: ListenerMap): void {
 // Core pipeline execution
 // ---------------------------------------------------------------------------
 
-/** A statement that only reads: its transform may run after COMMIT, since there is nothing to undo. */
+/** A plain SELECT: its transform may run after COMMIT (see {@link batchMayWrite}). */
 const READ_ONLY_STATEMENT = /^\s*select\b/i;
 
 /**
  * Whether a transactional batch must hold its COMMIT until the transforms have
  * run. Anything that is not a plain SELECT counts as a write, so a statement
  * this cannot classify costs a round trip rather than correctness.
+ *
+ * It decides WHEN the COMMIT is sent, never what a lost COMMIT means: a SELECT
+ * can call a function that writes, so a batch of SELECTs is not known to be
+ * effect-free and its unanswered COMMIT is an unknown outcome like any other.
  */
 export function batchMayWrite(queries: readonly DeferredQuery<unknown>[]): boolean {
   return queries.some((q) => !READ_ONLY_STATEMENT.test(q.sql));
@@ -191,7 +201,7 @@ export function batchMayWrite(queries: readonly DeferredQuery<unknown>[]): boole
  * Execute multiple queries using the Postgres extended-query pipeline protocol.
  *
  * All protocol messages are buffered into a single TCP write via cork/uncork.
- * The backend processes them in order and sends back results which our state
+ * The backend processes them in order and sends back results which the pipeline state
  * machine collects.
  *
  * @param client - A pg PoolClient with an accessible Connection
@@ -211,7 +221,7 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
   const savedListeners = snapshotListeners(connection);
   detachListeners(connection);
 
-  // Block the Client from processing any queued queries while we own the connection
+  // Block the Client from processing queued queries while the pipeline owns the connection
   const savedReadyForQuery = client.readyForQuery;
   client.readyForQuery = false;
 
@@ -233,7 +243,7 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
      */
     let phase: 'batch' | 'commit' | 'rollback' = 'batch';
 
-    /** The command tag the held COMMIT came back with (`ROLLBACK` when the server rolled back). */
+    /** The command tag the COMMIT came back with (`ROLLBACK` when the server rolled back). */
     let commitTag: string | undefined;
 
     /** Transformed results, computed before a held COMMIT is sent. */
@@ -274,20 +284,22 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
     let txStatus: TransactionStatus;
 
     /**
-     * Map commandComplete index to the corresponding results[] index.
-     * In transactional mode: index 0 = BEGIN, 1..N = queries, N+1 = COMMIT
-     * (absent when the COMMIT is held). In non-transactional mode: 1:1.
-     * Follow-up statements belong to no query.
+     * The results[] index the next backend message belongs to. Transactional
+     * mode counts commands: 0 = BEGIN, 1..N = queries, N+1 = COMMIT (absent
+     * when the COMMIT is held), and follow-up statements belong to no query.
+     * Non-transactional mode gives each query its own Sync, so the
+     * ReadyForQuery count IS the slot, which also places an error raised at a
+     * query's implicit COMMIT (a deferred constraint), after its
+     * CommandComplete, on that query rather than the next.
      */
-    function commandToQueryIndex(cmdIdx: number): number | null {
-      if (phase !== 'batch') return null;
-      const qIdx = transactional ? cmdIdx - 1 : cmdIdx;
+    function currentQueryIndex(): number | null {
+      const qIdx = !transactional ? rfqCount : phase === 'batch' ? commandIndex - 1 : -1;
       return qIdx >= 0 && qIdx < queries.length ? qIdx : null;
     }
 
-    /** Get the current query-results index for row data */
-    function currentQueryIndex(): number | null {
-      return commandToQueryIndex(commandIndex);
+    /** Record `qIdx` as the failing query on `error`, for the PipelineError. */
+    function tagged(error: Error, qIdx: number): Error {
+      return Object.assign(error, { failedIndex: qIdx, failedTag: queries[qIdx]!.tag });
     }
 
     // -----------------------------------------------------------------------
@@ -303,8 +315,11 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
         timeoutHandle = undefined;
       }
 
-      // Remove our listeners
+      // Remove the pipeline listeners. The Client's own `end` / `error` listeners were
+      // never detached, so only ours come off.
       detachListeners(connection);
+      connection.removeListener('end', onConnectionLost);
+      connection.removeListener('error', onConnectionLost);
 
       // Restore original listeners
       restoreListeners(connection, savedListeners);
@@ -330,7 +345,7 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
      *
      * The recovery is one `ROLLBACK` on the same connection, sent AFTER the
      * ReadyForQuery that says the backend will accept a new statement, and
-     * waited for: its own ReadyForQuery brings us back here with `I`. That
+     * waited for: its own ReadyForQuery returns control here with `I`. That
      * keeps the connection, which matters at small pool sizes where discarding
      * is a reconnect on the caller's next query.
      *
@@ -356,11 +371,14 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
       return !sendFollowUp('ROLLBACK', 'rollback');
     }
 
+    /** Mark the client so the caller releases it with an error and the pool drops it. */
+    function markDiscard(): void {
+      Object.defineProperty(client, PIPELINE_DISCARD, { value: true, enumerable: false, configurable: true });
+    }
+
     /** Mark the client for disposal when the backend still reports an open or failed transaction. */
     function markDiscardIfInTransaction(): void {
-      if (txStatus === 'E' || txStatus === 'T') {
-        Object.defineProperty(client, PIPELINE_DISCARD, { value: true, enumerable: false, configurable: true });
-      }
+      if (txStatus === 'E' || txStatus === 'T') markDiscard();
     }
 
     /**
@@ -383,7 +401,7 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
         }
         return true;
       } catch (err) {
-        Object.defineProperty(client, PIPELINE_DISCARD, { value: true, enumerable: false, configurable: true });
+        markDiscard();
         if (!pipelineError) pipelineError = err instanceof Error ? err : new Error(String(err));
         return false;
       }
@@ -489,7 +507,9 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
     }
 
     function onCommandComplete(msg: { text?: string; command?: string }): void {
-      if (phase === 'commit') commitTag = msg.command ?? msg.text;
+      // Past BEGIN and the queries: the COMMIT, held or sent with the batch
+      // (or a recovery ROLLBACK, which no outcome reads).
+      if (commandIndex > queries.length) commitTag = msg.command ?? msg.text;
       const qIdx = currentQueryIndex();
       if (qIdx !== null && qIdx >= 0 && qIdx < results.length) {
         results[qIdx]!.addCommandComplete(msg);
@@ -506,36 +526,66 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
       const wrapped = wrapPgError(msg);
       const error = wrapped instanceof Error ? wrapped : new Error(String(wrapped));
 
+      const qIdx = currentQueryIndex();
       if (transactional) {
         // In transactional mode, the first error aborts everything.
         // Postgres marks the transaction as aborted; subsequent commands
-        // until Sync all return errors which we absorb.
-        if (!pipelineError) {
-          const qIdx = currentQueryIndex();
-          if (qIdx !== null && qIdx >= 0 && qIdx < queries.length) {
-            (error as Error & { failedIndex?: number; failedTag?: string }).failedIndex = qIdx;
-            (error as Error & { failedTag?: string }).failedTag = queries[qIdx]!.tag;
-          }
-          pipelineError = error;
-        }
-      } else {
+        // until Sync all return errors that the pipeline absorbs.
+        pipelineError ??= qIdx === null ? error : tagged(error, qIdx);
+      } else if (qIdx !== null) {
         // Non-transactional: record per-query error
-        const qIdx = currentQueryIndex();
-        if (qIdx !== null && qIdx >= 0 && qIdx < queries.length) {
-          queryErrors[qIdx] = error;
-          if (!pipelineError) {
-            (error as Error & { failedIndex?: number; failedTag?: string }).failedIndex = qIdx;
-            (error as Error & { failedTag?: string }).failedTag = queries[qIdx]!.tag;
-            pipelineError = error;
-          }
-        }
+        queryErrors[qIdx] = error;
+        pipelineError ??= tagged(error, qIdx);
       }
       // Advance command index past the failed command
       commandIndex++;
     }
 
     function onPortalSuspended(): void {
-      // We don't use row-limited portals
+      // The pipeline does not use row-limited portals.
+    }
+
+    /**
+     * The socket closed, or failed, while the batch owned the connection. No
+     * ReadyForQuery will come, so settle now and have the client discarded.
+     *
+     * What the caller is told follows what the server could have done. Before
+     * a COMMIT is sent nothing is committed: the batch's first error, else a
+     * connection error. That is only the batch phase of a batch that holds its
+     * COMMIT. A batch of plain SELECTs sends its COMMIT with the batch, and a
+     * SELECT can write through a function it calls, so it is never assumed to
+     * have had no effect. A COMMIT the server did not answer, held or sent with
+     * the batch, may have committed, so its outcome is unknown
+     * (`TransactionOutcomeUnknownError`, as for every transaction Turbine
+     * runs), unless the server answered it with the `COMMIT` or `ROLLBACK` tag
+     * or an ERROR, which rolls the transaction back (a FATAL does not count, see
+     * `answeredWithError`).
+     *
+     * In non-transactional mode every query autocommits at its own Sync, and
+     * all of them went out in the batch's one write, so a query with no
+     * ReadyForQuery yet may have run and committed, a SELECT included: its
+     * slot is `TransactionOutcomeUnknownError` carrying the connection error,
+     * unless the server answered it with an ERROR. Finished queries keep their
+     * results, and no slot gets the connection error alone, whose advice is
+     * that a retry is safe.
+     */
+    function onConnectionLost(err?: Error): void {
+      if (cleaned) return;
+      markDiscard();
+      const lost = wrapPgError(err ?? new Error('Connection terminated unexpectedly')) as Error;
+      if (!transactional) {
+        for (let i = rfqCount; i < queries.length; i++) {
+          const answer = queryErrors[i];
+          if (answeredWithError(answer)) continue;
+          const unknown = new TransactionOutcomeUnknownError(answer ?? lost);
+          queryErrors[i] = unknown;
+          if (!pipelineError || pipelineError === answer) pipelineError = tagged(unknown, i);
+        }
+      } else if (holdCommit && phase !== 'commit') pipelineError ??= lost;
+      else if (commitTag === 'ROLLBACK') pipelineError ??= rolledBackError(undefined, 'transaction');
+      else if (commitTag !== 'COMMIT' && !answeredWithError(pipelineError))
+        pipelineError = new TransactionOutcomeUnknownError(pipelineError ?? lost);
+      finalize();
     }
 
     function onReadyForQuery(msg?: { status?: string }): void {
@@ -574,7 +624,7 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
     }
 
     // -----------------------------------------------------------------------
-    // Attach our listeners
+    // Attach the pipeline listeners
     // -----------------------------------------------------------------------
 
     connection.on('parseComplete', onParseComplete);
@@ -590,6 +640,8 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
     connection.on('notice', () => {});
     connection.on('copyInResponse', () => {});
     connection.on('copyData', () => {});
+    connection.on('end', onConnectionLost);
+    connection.on('error', onConnectionLost);
 
     // -----------------------------------------------------------------------
     // Timeout
@@ -602,10 +654,12 @@ export async function runPipelined<T extends readonly DeferredQuery<unknown>[]>(
         // .docsUrl, and failing `instanceof TurbineError`, so the two timeout
         // paths in the same client disagreed about their own contract.
         pipelineError = new TimeoutError(timeout, 'Pipeline');
+        // Detached before the socket goes, so the timeout is what the caller
+        // hears whether the stream reports its end now or on a later tick.
+        cleanup();
         if (connection.stream.destroy) {
           connection.stream.destroy(pipelineError);
         }
-        cleanup();
         reject(pipelineError);
       }, timeout);
     }

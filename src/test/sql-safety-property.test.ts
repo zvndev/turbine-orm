@@ -4,7 +4,7 @@
  * NOTE: despite the file name, this is NOT a property/fuzz test, there is no
  * random input generation. It is a fixed, hand-curated corpus of known
  * SQL-injection payloads iterated in a loop (a table-driven / parameterized
- * test). Each payload is fed through the query builder and we assert the
+ * test). Each payload is fed through the query builder; assert the
  * builder never string-interpolates it: the raw payload must not appear in the
  * generated SQL, and the value must instead show up in the `$N` params array.
  *

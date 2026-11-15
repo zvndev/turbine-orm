@@ -1,0 +1,10 @@
+import assert from 'node:assert/strict';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { audit } from './lifecycle.mjs';
+const [input, output] = process.argv.slice(2);
+assert.ok(input && output, 'Usage: node audit.mjs REPORT.json NEW-AUDIT.json');
+const report = JSON.parse(readFileSync(input));
+const result = { input, checkedAt: new Date().toISOString(), recordedBackends: report.proof?.backends ?? [], ...await audit(report.identity) };
+writeFileSync(output, `${JSON.stringify(result, null, 2)}\n`, { flag: 'wx' });
+assert.equal(result.complete, true, 'independent cleanup audit failed');
+console.log(JSON.stringify(result));

@@ -470,7 +470,7 @@ describe('findManyStream: speculative fast-path', () => {
 
 describe('parseNestedRow: short-circuit optimizations', () => {
   /**
-   * We test parseNestedRow indirectly by using buildFindMany's transform,
+   * Test parseNestedRow indirectly by using buildFindMany's transform,
    * which calls parseNestedRow when `with` is used.
    */
 

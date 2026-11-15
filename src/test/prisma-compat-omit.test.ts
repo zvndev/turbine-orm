@@ -205,7 +205,7 @@ describe('prisma-compat, write projections validate their field names', () => {
   // `select` / `omit` on a WRITE are applied to the returned object here, they
   // are never handed to core, so core's E003 on an unknown projection key (the
   // rule the caller has already met on findMany) could not fire. A misspelled
-  // key was simply added to the Set and did nothing.
+  // key was added to the Set and did nothing.
   const ROW = { id: 1, email: 'ada@example.com', passwordHash: 'argon2:...' };
 
   it('a misspelled `omit` key throws instead of returning the column', async () => {

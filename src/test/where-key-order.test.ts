@@ -5,7 +5,7 @@
  * sorts object keys (`fingerprintWhere`, `fingerprintAliasWhere`,
  * `fingerprintRelFilter`, `withFingerprint`, the findMany `cursorFp`). The
  * SQL-BUILD and cache-hit param-COLLECT paths must therefore enumerate keys
- * in the same sorted (canonical) order. Before this fix they iterated object
+ * in the same sorted (canonical) order. Previously they iterated object
  * INSERTION order, so two where clauses with the same fields in different
  * key order shared one cache entry but pushed params in different orders:
  *

@@ -52,6 +52,7 @@ const KNOWN_ERRORS = new Set([
   'ReadOnlyError',
   'TransactionRolledBackError',
   'InvariantError',
+  'TransactionOutcomeUnknownError',
   // Typed subclasses of the above defined outside errors.ts:
   // DestructivePushRefusal (schema-sql.ts) extends ValidationError so callers
   // can `instanceof` the refusal instead of sniffing message text.
@@ -61,14 +62,42 @@ const KNOWN_ERRORS = new Set([
 // Also allow standard Error in test files and CLI UI code
 const ALLOWED_IN_TESTS = new Set(['Error', 'TypeError', 'RangeError', 'SyntaxError']);
 
-// Error classes that are defined AND thrown inside a single CLI-only module.
-// They carry no TURBINE_E* code because they never reach a query runtime: the
-// CLI catches them and prints them. Scoped per file so the same class name
-// cannot be thrown from library code without tripping this check.
+// Narrow file-specific exceptions. CLI-local classes carry no TURBINE_E* code
+// because they never reach a query runtime. The optional SQL composition leaf
+// documents native TypeError for invalid arguments and intentionally imports
+// no execution/error graph. The local libSQL seed runner retains both original
+// failures in a native AggregateError when callback and cleanup fail together.
+// These exceptions apply only to the named class in its owning file.
 //
 // PrismaParseError (src/cli/prisma-schema.ts) is the parse failure of the
 // zero-dependency schema.prisma reader used by `turbine migrate-from-prisma`.
 const FILE_LOCAL_ERRORS = new Map<string, Set<string>>([
+  // Native test teardown retains every cleanup failure; this is not a public runtime error.
+  ['src/test/fixtures/live-query-hub-pg/fixture.ts', new Set(['AggregateError'])],
+  ['src/test/fixtures/postgres-durable-replay/controls.ts', new Set(['AggregateError'])],
+  // Preserve the exact seed and cleanup failures instead of replacing either.
+  ['src/libsql-seed.ts', new Set(['AggregateError'])],
+  // CLI-owned migration cleanup retains every failure after preserving the
+  // original transaction outcome, including an acknowledged COMMIT.
+  ['src/cli/libsql-migrate.ts', new Set(['AggregateError'])],
+  // Local D1 startup/disposal preserves the original failure and aggregates
+  // cleanup-only failures without rewriting an acknowledged dispatch outcome.
+  ['src/cli/d1-local.ts', new Set(['AggregateError'])],
+  // CLI complete-plan capture and read-only status use the same phase/outcome
+  // error as the isolated native migration helper, not query-runtime codes.
+  ['src/cli/d1-migrations.ts', new Set(['D1MigrationError'])],
+  // Declarative local D1 seed failures retain exact native causes and dispatch outcomes.
+  ['src/cli/d1-seed.ts', new Set(['D1SeedError'])],
+  ['src/sql.ts', new Set(['TypeError'])],
+  // The optional live-query leaf has no execution/driver imports. Invalid
+  // callback handles and concurrent pulls use its documented native TypeError.
+  ['src/live-query.ts', new Set(['TypeError'])],
+  // Binding-native D1 migrations are an isolated optional leaf. Its public
+  // error carries phase/outcome instead of importing the query error graph.
+  // Internal result/lexer Errors are caught and retained as the typed error's
+  // cause (or used to refuse an existing schema); they are not public codes.
+  ['src/d1/migrate.ts', new Set(['D1MigrationError', 'Error'])],
+  ['src/d1/migrations/sql.ts', new Set(['Error'])],
   ['src/cli/prisma-schema.ts', new Set(['PrismaParseError'])],
   // The PII guard's refusal callbacks (`refuseColumn` / `refuseDepth` /
   // `refuseShape`) exist so each caller throws ITS OWN error type: Studio throws
@@ -76,6 +105,10 @@ const FILE_LOCAL_ERRORS = new Map<string, Set<string>>([
   // therefore has to supply a third, and a test-local class is the point rather
   // than a shortcut.
   ['src/test/pii-guard-symmetry.test.ts', new Set(['GuardRefusal'])],
+  // Test-owned fixture teardown retains every cleanup failure. This native
+  // aggregate never enters a published runtime or replaces a TurbineError.
+  ['src/test/sqlite-fixture-lifetime.ts', new Set(['AggregateError'])],
+  ['src/test/live-query-pg.test.ts', new Set(['AggregateError'])],
   // Studio's request-body reader refuses an oversized or malformed body with an
   // HTTP status (413 / 400). It never leaves the HTTP layer, so it is not a
   // TurbineError and carries no TURBINE_E code.
@@ -112,7 +145,7 @@ for (const file of files) {
   const isCliFile = relPath.includes('/cli/');
   const isErrorsFile = relPath.endsWith('src/errors.ts');
   // Generator and schema tooling files are invoked via the CLI, not at
-  // query runtime, allow standard Error the same way we allow it in CLI code.
+  // query runtime, allow standard Error as in CLI code.
   const isToolingFile =
     relPath.endsWith('generate.ts') ||
     relPath.endsWith('schema-builder.ts') ||

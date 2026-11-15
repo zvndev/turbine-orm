@@ -1825,7 +1825,7 @@ describe('Studio PII guard: nested arrays cannot outrun the depth cap', () => {
 
   it('refuses nested arrays under a RELATION key too (the second array branch)', async () => {
     // `visitRelationValue` has its own array branch and had the identical hole.
-    // The review named only `orderBy`; this one is reached through `where`.
+    // The same ordering is reached through `where` as well as `orderBy`.
     const r = await runBuilderBody(nested('users', (a) => `{"where":{"posts":${a}}}`, '{"title":"x"}', 10_000));
     assert.equal(r.status, 400, r.body);
     assert.match(errorOf(r), /nested more than 32 levels deep/);

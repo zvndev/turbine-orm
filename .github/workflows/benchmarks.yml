@@ -130,6 +130,8 @@ jobs:
           node dist/cli/index.js generate --out generated/turbine
 
       - name: Run the round
+        env:
+          COMPARISON_SERIALIZED: "1"
         run: |
           cd "$LIB_DIR/benchmarks"
           ./run-round.sh "$OUT_DIR"

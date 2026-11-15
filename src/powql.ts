@@ -96,6 +96,7 @@ import { exprNotAllowedMessage, isSqlExpr } from './query/expr.js';
 import {
   ARRAY_OPERATOR_KEYS,
   assertOperatorOperands,
+  columnOperandKind,
   cursorFieldValue,
   dedupeColumnList,
   isJsonFilter,
@@ -105,7 +106,6 @@ import {
   isUnmatchedPlainObject,
   isVectorOrderBy,
   normalizeOrderBy,
-  operandColumnKind,
   orderByEntries,
   UPDATE_OPERATOR_KEYS,
 } from './query/filters.js';
@@ -146,6 +146,7 @@ import type {
   OptionalInput,
   OrderByClause,
   OrderBySpec,
+  PrototypeFilterInput,
   QueryResult,
   TypedWithClause,
   UpdateArgs,
@@ -187,7 +188,7 @@ import {
   relationFilterValueProblem,
   type WhereFoldOptions,
 } from './query/where-compile.js';
-import { assertNoBulkWritePaging, assertNoOptimisticLock } from './query/writes.js';
+import { assertLockColumnNotWritten, assertNoBulkWritePaging, assertNoOptimisticLock } from './query/writes.js';
 import { settleQueryTrace, startQueryTrace } from './query-channel.js';
 import {
   type ColumnMetadata,
@@ -259,7 +260,7 @@ const POWQL_WRITE_ACTIONS: ReadonlySet<string> = new Set([
 
 /**
  * Top-level query context threaded from {@link PowqlInterface.findMany} into
- * {@link PowqlInterface.loadRelations} so the F2 native-join path can re-emit
+ * {@link PowqlInterface.loadRelations} so the native-join path can re-emit
  * the parent predicate (alias-qualified) and gate eligibility on the parent's
  * paging / configured strategy. Present only for a top-level `with`.
  */
@@ -598,7 +599,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
 
   /**
    * PowQL column reference for a field: a dotted field reference
-   * (`.snake_name`), or `alias.snake_name` when an `alias` is supplied (the F2
+   * (`.snake_name`), or `alias.snake_name` when an `alias` is supplied (the
    * join path).
    */
   private ref(field: string, alias?: string): string {
@@ -609,7 +610,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    * Render a raw column name as a PowQL reference, qualified with `alias` when
    * given.
    *
-   * BOTH branches quote now; they just use different rules, because the two
+   * BOTH branches quote; they use different rules, because the two
    * positions have different grammars. A QUALIFIED `p.col` does not bypass
    * keyword lookup, so it needs the full {@link quotePowqlIdent}. An
    * UNQUALIFIED `.col` does bypass it, so it uses {@link quotePowqlDotted},
@@ -776,7 +777,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    * for the loaders' whole life because the one test of the shape compared
    * the join path against the loader path and both were wrong the same way;
    * the cross-engine benchmark found it, where the wrong answer was the fast
-   * one. Every loader now fetches its children unbounded, WITH the relation
+   * one. Every loader fetches its children unbounded, WITH the relation
    * `orderBy` (which decides which rows the window keeps), and applies this
    * at stitch time: the rule the SQL engines' batched loader has always used.
    */
@@ -909,7 +910,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       cursorFieldValue(key, written, {
         column: col.name,
         table: this.table,
-        kind: operandColumnKind(this.meta.pgTypes[col.name]),
+        kind: columnOperandKind(this.meta, col.name),
         nullable: col.nullable && !this.meta.primaryKey.includes(col.name),
       });
     }
@@ -1015,7 +1016,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    * `jsonEncoding` selects between PostgreSQL's `json_build_object` and
    * `json_build_array` row encodings for relation subqueries. PowQL emits no
    * JSON row encoding at all, so there is nothing for the option to select and
-   * it was simply dropped: the caller asked for a wire format and got silence.
+   * it was dropped: the caller asked for a wire format and got silence.
    * Refused for the same reason `forceCustomPlan` is.
    */
   private assertNoJsonEncoding(args: { jsonEncoding?: string } | undefined): void {
@@ -1124,7 +1125,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    * Compile a {@link WhereClause} into a PowQL filter expression, pushing every
    * value as a positional `$N` param. Returns `''` when there are no conditions.
    *
-   * When `alias` is supplied (the F2 native-join path) every field reference is
+   * When `alias` is supplied (the native-join path) every field reference is
    * qualified with it (`.col` → `alias.col`, JSON path bases too); params bind
    * exactly as in the unqualified path. The caller only ever passes an alias for
    * an already-RESOLVED where (relation filters pre-resolved to literal in-lists
@@ -1351,7 +1352,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     assertOperatorOperands(op, {
       column: colMeta.name,
       table: this.table,
-      kind: operandColumnKind(this.meta.pgTypes[colMeta.name]),
+      kind: columnOperandKind(this.meta, colMeta.name),
     });
     const insensitive = op.mode === 'insensitive';
     const lhs = insensitive ? `lower(${ref})` : ref;
@@ -1456,7 +1457,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    * needed around the path in a comparison. Segments are bound (never inlined)
    * to keep {@link materializePowql}'s `$N`-scan invariant intact: a segment
    * that literally contained `$1` would otherwise be rewritten. Shared by the
-   * F1 where-filter path and the F2 orderBy / groupBy path emitters.
+   * where-filter path and the orderBy / groupBy path emitters.
    *
    * A digit-only STRING segment (`'0'`) binds as an `int` array index, matching
    * the SQL engines: `JsonFilter.path` is typed `string[]`, so an array index
@@ -1566,7 +1567,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       conds.push(this.buildStringMatch(kind, pathP(), value, params, insensitive, `the JSON path on "${col.name}"`));
     }
 
-    // Every reachable shape now emits a condition or throws: assertJsonFilterKeys
+    // Every reachable shape emits a condition or throws: assertJsonFilterKeys
     // rejects a filter that compares nothing, so an empty list here would be a
     // generator bug rather than a user error, and must not silently widen the
     // query the way it used to.
@@ -1969,8 +1970,8 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
   /**
    * hasMany / hasOne / belongsTo: the local field, and the distinct correlation
    * keys of the target rows matching `inner` (inside the target's global filter).
-   * hasMany/hasOne: local = our referenceKey, collected = the child's foreignKey.
-   * belongsTo:      local = our foreignKey,   collected = the target's referenceKey.
+   * hasMany/hasOne: local = this table's referenceKey, collected = the child's foreignKey.
+   * belongsTo:      local = this table's foreignKey,   collected = the target's referenceKey.
    */
   private async directRelationKeys(
     rel: RelationDef,
@@ -2269,7 +2270,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     // so one query meant different columns depending on the backend. And a
     // zero-key/all-false select used to fall through to the DEFAULT
     // projection here while the SQL engines emitted broken or empty rows;
-    // both shapes are ambiguous and now refused identically on every engine.
+    // both shapes are ambiguous and refused identically on every engine.
     // Presence-decided, exactly like resolveProjection (see its comment for
     // the strategy-flip this prevents).
     if (select) {
@@ -2410,7 +2411,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    * (unlike the SQL engines, which emit an explicit non-PII `RETURNING`/`OUTPUT`
    * projection) the create/update/delete `returning` paths cannot exclude PII at
    * the query-language level and must strip it here after the fact. This is the
-   * client-side strip of last resort, not defense-in-depth, for those paths; we
+   * client-side strip of last resort, not defense-in-depth, for those paths;
    * do NOT reverse-engineer an undocumented projection form. The upsert path is
    * different: it has no `returning` and reselects by PK through the read
    * projection ({@link projectionPlan}), which already omits PII, so PII never
@@ -2720,7 +2721,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
 
   /** Map raw rows to typed entities. `native` is the wire that ACTUALLY served
    * this result (threaded from {@link execOnce}, not the pool-level capability),
-   * so cells that arrived pre-typed over `queryNativeRaw` (F3) skip the legacy
+   * so cells that arrived pre-typed over `queryNativeRaw` skip the legacy
    * string coercion (a genuine str `"null"` stays `"null"` instead of collapsing
    * to null) while a per-call legacy fallback on a native-capable pool still
    * coerces its string cells correctly. Defaults to the pool capability for the
@@ -2738,7 +2739,15 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     W extends TypedWithClause = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args?: FindManyArgs<T, NoRelations, W, S, O>): Promise<QueryResult<T, NoRelations, W, S, O>[]>;
+    const Input = unknown,
+  >(
+    args?: PrototypeFilterInput<
+      T,
+      NoRelations,
+      FindManyArgs<T, NoRelations, W, S, O, Input> & { where?: Input },
+      FindManyArgs<T, NoRelations, W, S, O>
+    >,
+  ): Promise<QueryResult<T, NoRelations, W, S, O>[]>;
   async findMany(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T[]> {
     this.assertNoForceCustomPlan(args);
     this.assertNoRowLock(args);
@@ -2779,7 +2788,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
   /**
    * Compile the findMany select into PowQL (no execution), pushing values into
    * `params`. Returns the query plus the RESOLVED where (relation filters
-   * already collapsed to literal in-lists) so the F2 join path can re-emit the
+   * already collapsed to literal in-lists) so the join path can re-emit the
    * exact parent predicate alias-qualified, and so {@link explain} can wrap it.
    *
    * When the engine supports nested projections (>= 0.18) and the strategy
@@ -2823,7 +2832,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     //
     // Refused with the same E017 the other non-Postgres engines already raise
     // (query/builder.ts's `distinctOn` capability gate) and in the same
-    // words, so `distinct` now means one thing across every engine and matches
+    // words, so `distinct` means one thing across every engine and matches
     // what the README documents. Refused BEFORE the column names are resolved,
     // matching that gate's position, so `distinct: ['nope']` reports the
     // unsupported feature rather than the typo on every engine alike. The
@@ -2849,7 +2858,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     // on the loaders (its block key would duplicate the column's). A parent
     // `distinct` used to be a third exclusion here (distinct over a row
     // containing a JSON array is not a defined comparison); the refusal above
-    // now settles that one statement earlier, so the branch cannot be reached
+    // settles that one statement earlier, so the branch cannot be reached
     // with a `distinct` present and testing for it again would be dead code
     // implying the option is still accepted.
     const withClause = args.with as Record<string, unknown> | undefined;
@@ -3001,7 +3010,15 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     W extends TypedWithClause = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: FindUniqueArgs<T, NoRelations, W, S, O>): Promise<QueryResult<T, NoRelations, W, S, O> | null>;
+    const Input = unknown,
+  >(
+    args: PrototypeFilterInput<
+      T,
+      NoRelations,
+      FindUniqueArgs<T, NoRelations, W, S, O, unknown, Input> & { where: Input },
+      FindUniqueArgs<T, NoRelations, W, S, O, unknown>
+    >,
+  ): Promise<QueryResult<T, NoRelations, W, S, O> | null>;
   async findUnique(args: FindUniqueArgs<T>): Promise<T | null> {
     this.assertNoForceCustomPlan(args);
     this.assertNoRowLock(args);
@@ -3048,7 +3065,15 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     W extends TypedWithClause = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args?: FindManyArgs<T, NoRelations, W, S, O>): Promise<QueryResult<T, NoRelations, W, S, O> | null>;
+    const Input = unknown,
+  >(
+    args?: PrototypeFilterInput<
+      T,
+      NoRelations,
+      FindManyArgs<T, NoRelations, W, S, O, Input> & { where?: Input },
+      FindManyArgs<T, NoRelations, W, S, O>
+    >,
+  ): Promise<QueryResult<T, NoRelations, W, S, O> | null>;
   async findFirst(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T | null> {
     args = this.normalizeArgs(args, 'findFirst');
     this.assertNoForceCustomPlan(args);
@@ -3086,7 +3111,15 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     W extends TypedWithClause = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: FindUniqueArgs<T, NoRelations, W, S, O>): Promise<QueryResult<T, NoRelations, W, S, O>>;
+    const Input = unknown,
+  >(
+    args: PrototypeFilterInput<
+      T,
+      NoRelations,
+      FindUniqueArgs<T, NoRelations, W, S, O, unknown, Input> & { where: Input },
+      FindUniqueArgs<T, NoRelations, W, S, O, unknown>
+    >,
+  ): Promise<QueryResult<T, NoRelations, W, S, O>>;
   async findUniqueOrThrow(args: FindUniqueArgs<T>): Promise<T> {
     const row = await this.findUnique(args);
     if (!row) throw new NotFoundError({ table: this.table, where: args.where as Record<string, unknown> });
@@ -3098,7 +3131,15 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     W extends TypedWithClause = {},
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args?: FindManyArgs<T, NoRelations, W, S, O>): Promise<QueryResult<T, NoRelations, W, S, O>>;
+    const Input = unknown,
+  >(
+    args?: PrototypeFilterInput<
+      T,
+      NoRelations,
+      FindManyArgs<T, NoRelations, W, S, O, Input> & { where?: Input },
+      FindManyArgs<T, NoRelations, W, S, O>
+    >,
+  ): Promise<QueryResult<T, NoRelations, W, S, O>>;
   async findFirstOrThrow(args: FindManyArgs<T> = {} as FindManyArgs<T>): Promise<T> {
     args = this.normalizeArgs(args, 'findFirstOrThrow');
     const row = await this.findFirst(args);
@@ -3117,7 +3158,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    * resolved where). When the effective `relationLoadStrategy` resolves to an
    * explicit `'join'` and the pool advertises `serverJoins`, an eligible
    * top-level relation is loaded with a native PowQL join instead of the keyed
-   * loaders (F2); everything else (nested `with` levels, ineligible shapes, and
+   * loaders; everything else (nested `with` levels, ineligible shapes, and
    * the default `'batched'` strategy) keeps the loaders. Output is byte-equal
    * either way (the join reuses the same stitch / shape helpers).
    */
@@ -3664,7 +3705,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
   }
 
   // -------------------------------------------------------------------------
-  // Nested relations: native PowQL joins (F2, opt-in via relationLoadStrategy)
+  // Nested relations: native PowQL joins (opt-in via relationLoadStrategy)
   // -------------------------------------------------------------------------
 
   /**
@@ -3688,9 +3729,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    *     configured `defaultLimit`): a parent-filter join under a page would scan
    *     children of off-page parents, where the loaders are strictly better;
    *   - the relation must not request a nested `with` (its subtree stays on the
-   *     loaders this round) or a `distinct`;
+   *     loaders) or a `distinct`;
    *   - single-column relation keys only (a composite key falls to the loader,
-   *     which throws the same E017 as today);
+   *     which throws E017);
    *   - the PARENT-SIDE correlation column must be a single-column PK or unique
    *     column, or the INNER join would re-emit one child copy per matching
    *     parent row (a non-unique correlation key produces duplicate children the
@@ -3998,7 +4039,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    * Should this query's `with` compile to nested-projection blocks? Requires
    * the engine capability (>= 0.18), and an EXPLICIT `relationLoadStrategy:
    * 'batched'` (per-query or client-level) opts back out to the keyed loaders.
-   * The default and `'join'` both prefer nesting: unlike the F2 INNER join it
+   * The default and `'join'` both prefer nesting: unlike the INNER join it
    * has no fan-out, keeps childless parents, works under parent paging, and
    * applies per-parent `order`/`limit`/`offset` natively, so it is the
    * strictly-better single-statement path wherever it is eligible. Ineligible
@@ -4638,11 +4679,29 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
   update<
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: UpdateArgs<T, NoRelations, S, O>): Promise<FieldResult<T, S, O>>;
+    const Input = unknown,
+  >(
+    args: PrototypeFilterInput<
+      T,
+      NoRelations,
+      UpdateArgs<T, NoRelations, S, O, UpdateArgs<T>['data'], Input> & { where: Input },
+      UpdateArgs<T, NoRelations, S, O, UpdateArgs<T>['data']>
+    >,
+  ): Promise<FieldResult<T, S, O>>;
   async update(args: UpdateArgs<T>): Promise<T> {
     args = this.normalizeArgs(args);
     return this.withMiddleware('update', args as unknown as Record<string, unknown>, async () => {
       const plan = this.writeReturnPlan(args);
+      // Before the nested branch, which hands the lock to the parent's own
+      // update: the lock writes the version, so `data` must not.
+      if (args.optimisticLock) {
+        assertLockColumnNotWritten(
+          this.meta,
+          this.table,
+          args.data as Record<string, unknown>,
+          args.optimisticLock.field,
+        );
+      }
       if (hasRelationFields(args.data as Record<string, unknown>, this.meta)) {
         // The nested engine re-enters `update` / `findUnique` for the parent
         // row before it writes anything, so the identity rule below still runs
@@ -4661,7 +4720,9 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       this.assertCompiledWhere(where, allowFullTableScan, 'update', userWhere);
       this.assertMutationIdentifiesOneRow(userWhere, allowFullTableScan, 'update');
       where = this.applyGlobalFilter(where, params, await this.globalFilterWhere(args.skipGlobalFilters, args.timeout));
-      let setClause = this.buildUpdateAssignments(args.data as Record<string, unknown>, params);
+      const lock = args.optimisticLock;
+      // With a lock, `data` may set nothing: the version bump below is the write.
+      let setClause = this.buildUpdateAssignments(args.data as Record<string, unknown>, params, lock !== undefined);
       // Optimistic locking, matching the SQL engines exactly: bump the version
       // column in the SET, add `version = expected` to the filter, and treat
       // "matched no row" as a lost race rather than a missing row.
@@ -4670,10 +4731,10 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       // worse than not supporting it: the update applied, the caller's version
       // check never happened, and a concurrent writer's change was overwritten
       // by a caller who believed they held the lock.
-      const lock = args.optimisticLock;
       if (lock) {
         const versionCol = quotePowqlIdent(this.column(lock.field).name);
-        setClause += `, ${versionCol} := ${this.ref(lock.field)} + 1`;
+        const bump = `${versionCol} := ${this.ref(lock.field)} + 1`;
+        setClause = setClause ? `${setClause}, ${bump}` : bump;
         params.push(lock.expected);
         const check = `${this.ref(lock.field)} = $${params.length}`;
         where = where ? `(${where}) and (${check})` : check;
@@ -4700,6 +4761,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     });
   }
 
+  updateMany<const Input = unknown>(
+    args: PrototypeFilterInput<
+      T,
+      NoRelations,
+      UpdateManyArgs<T, NoRelations, UpdateManyArgs<T>['data'], Input> & { where: Input },
+      UpdateManyArgs<T, NoRelations, UpdateManyArgs<T>['data']>
+    >,
+  ): Promise<{ count: number }>;
   async updateMany(args: UpdateManyArgs<T>): Promise<{ count: number }> {
     args = this.normalizeArgs(args);
     assertNoBulkWritePaging(this.table, 'updateMany', args);
@@ -4728,7 +4797,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
   }
 
   /** Compile `data` into PowQL update assignments, including atomic operators. */
-  private buildUpdateAssignments(data: Record<string, unknown>, params: unknown[]): string {
+  private buildUpdateAssignments(data: Record<string, unknown>, params: unknown[], allowEmpty = false): string {
     const parts: string[] = [];
     for (const [field, value] of Object.entries(data)) {
       if (value === undefined) continue;
@@ -4769,7 +4838,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
         parts.push(`${col} := ${this.writeRef(value, colMeta, params)}`);
       }
     }
-    if (!parts.length) throw new ValidationError(`update on "${this.table}" has no fields to set.`);
+    if (!parts.length && !allowEmpty) throw new ValidationError(`update on "${this.table}" has no fields to set.`);
     return parts.join(', ');
   }
 
@@ -4835,10 +4904,13 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     const data = args.data as Record<string, unknown>;
     const where = args.where as Record<string, unknown>;
     const shape = { select: args.select, omit: args.omit };
+    const lock = args.optimisticLock;
     if (this.isTxScoped()) {
-      return executeNestedUpdate(this.buildNestedCtx(), this.table, where, data, 0, [], shape) as Promise<T>;
+      return executeNestedUpdate(this.buildNestedCtx(), this.table, where, data, 0, [], shape, lock) as Promise<T>;
     }
-    return this.runInImplicitTx((ctx) => executeNestedUpdate(ctx, this.table, where, data, 0, [], shape)) as Promise<T>;
+    return this.runInImplicitTx((ctx) =>
+      executeNestedUpdate(ctx, this.table, where, data, 0, [], shape, lock),
+    ) as Promise<T>;
   }
 
   /** Open a flat PowDB transaction on a pinned connection and run `fn` inside it. */
@@ -4889,14 +4961,19 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       await client.query(d?.commitStatement?.() ?? 'commit');
       return result;
     } catch (err) {
-      // Only roll back a transaction we actually opened, a failed BEGIN
+      // Only roll back a transaction opened here: a failed BEGIN
       // (queue timeout, re-entrancy E017) must not emit a stray ROLLBACK that
       // could land inside another transaction on a shared engine handle.
       if (began) {
         try {
           await client.query(d?.rollbackStatement?.() ?? 'rollback');
         } catch {
-          /* best-effort, the connection may be gone */
+          // A lost networked connection is discarded on release, and the
+          // server ends its transaction. An embedded handle whose ROLLBACK
+          // failed is unusable: report that, since the write's own error would
+          // read as a clean rollback.
+          const unusable = client.unusable;
+          if (unusable) throw unusable;
         }
       }
       throw err;
@@ -4921,7 +4998,15 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
   delete<
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: DeleteArgs<T, NoRelations, S, O>): Promise<FieldResult<T, S, O>>;
+    const Input = unknown,
+  >(
+    args: PrototypeFilterInput<
+      T,
+      NoRelations,
+      DeleteArgs<T, NoRelations, S, O, Input> & { where: Input },
+      DeleteArgs<T, NoRelations, S, O>
+    >,
+  ): Promise<FieldResult<T, S, O>>;
   async delete(args: DeleteArgs<T>): Promise<T> {
     args = this.normalizeArgs(args);
     this.assertNoOptimisticLock(args, 'delete');
@@ -4948,6 +5033,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     });
   }
 
+  deleteMany<const Input = unknown>(
+    args: PrototypeFilterInput<
+      T,
+      NoRelations,
+      DeleteManyArgs<T, NoRelations, Input> & { where: Input },
+      DeleteManyArgs<T, NoRelations>
+    >,
+  ): Promise<{ count: number }>;
   async deleteMany(args: DeleteManyArgs<T>): Promise<{ count: number }> {
     args = this.normalizeArgs(args);
     assertNoBulkWritePaging(this.table, 'deleteMany', args);
@@ -4972,7 +5065,15 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
   upsert<
     S extends Record<string, boolean> | undefined = undefined,
     O extends Record<string, boolean> | undefined = undefined,
-  >(args: UpsertArgs<T, NoRelations, S, O>): Promise<FieldResult<T, S, O>>;
+    const Input = unknown,
+  >(
+    args: PrototypeFilterInput<
+      T,
+      NoRelations,
+      UpsertArgs<T, NoRelations, S, O, unknown, OptionalInput<T>, UpsertArgs<T>['update'], Input> & { where: Input },
+      UpsertArgs<T, NoRelations, S, O, unknown, OptionalInput<T>, UpsertArgs<T>['update']>
+    >,
+  ): Promise<FieldResult<T, S, O>>;
   async upsert(args: UpsertArgs<T>): Promise<T> {
     args = this.normalizeArgs(args);
     this.assertNoOptimisticLock(args, 'upsert');
@@ -5008,7 +5109,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
       // insert then collides on the key and fails, and nothing is overwritten.
       const filtered = this.hasGlobalFilter(args.skipGlobalFilters);
       // The shape the SQL engines answer with ONE conflict statement (`where`
-      // pinned to `create`, a non-empty scalar update).
+      // exactly one unique key, pinned to `create`, a non-empty scalar update).
       const conflictShape =
         upsertWhereMatchesCreate(this.meta, upsertWhere, (args.create ?? {}) as Record<string, unknown>) &&
         !hasRelationFields(args.create as Record<string, unknown>, this.meta) &&
@@ -5126,6 +5227,14 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
     return this.isTxScoped() ? run(this.buildNestedCtx()) : this.runInImplicitTx(run);
   }
 
+  count<const Input = unknown>(
+    args?: PrototypeFilterInput<
+      T,
+      NoRelations,
+      CountArgs<T, NoRelations, Input> & { where?: Input },
+      CountArgs<T, NoRelations>
+    >,
+  ): Promise<number>;
   // -------------------------------------------------------------------------
   // Aggregates
   // -------------------------------------------------------------------------
@@ -5720,7 +5829,7 @@ export class PowqlInterface<T extends object = Record<string, unknown>> implemen
    * cannot re-emit an aggregate EXPRESSION in `order` (engine error), but CAN
    * order by a projection alias on a grouped query (probed), so each key maps to
    * its projected alias (`.agg_N` / `.gk_N` / `.col`). Semantics and error
-   * surface mirror the SQL `buildGroupByOrderBy` (0.32.2 R3-1): an aggregate not
+   * surface mirror the SQL `buildGroupByOrderBy` (0.32.2): an aggregate not
    * requested in this call, or an unknown by-key, throws E003 listing the valid
    * keys. `nulls: 'first'` stays E017 (PowDB has no NULLS placement grammar).
    */

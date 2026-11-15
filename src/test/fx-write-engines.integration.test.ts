@@ -29,6 +29,7 @@ import { UnsupportedFeatureError, ValidationError } from '../errors.js';
 import { col, expr } from '../index.js';
 import { introspect } from '../introspect.js';
 import { skipGate } from './helpers.js';
+import { closeSqliteAfter, sqliteFixtureScope } from './sqlite-fixture-lifetime.js';
 
 // biome-ignore lint/suspicious/noExplicitAny: live harness drives untyped clients
 type Any = any;
@@ -319,7 +320,7 @@ describe('write rules on SQLite (live, in memory)', () => {
   gate.before(async () => {
     const { DatabaseSync } = await import('node:sqlite');
     const { introspectSqliteDatabase, turbineSqlite } = await import('../sqlite.js');
-    raw = new DatabaseSync(':memory:');
+    raw = closeSqliteAfter(new DatabaseSync(':memory:'), sqliteCleanup);
     raw.exec(`
       CREATE TABLE fxw_ar (id INTEGER PRIMARY KEY, n INTEGER NOT NULL, m INTEGER NOT NULL, f REAL, label TEXT,
         version INTEGER NOT NULL DEFAULT 0);
@@ -370,4 +371,7 @@ describe('write rules on SQLite (live, in memory)', () => {
     rows[39_999] = { email: 'z@x', name: 'last' };
     assert.equal((await db.table('fxw_ci').createMany({ data: rows, onConflict: conflict })).length, 40_000);
   });
+
+  // Register native teardown after the existing client teardown hooks.
+  const sqliteCleanup = sqliteFixtureScope();
 });

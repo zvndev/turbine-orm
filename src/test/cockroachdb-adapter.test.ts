@@ -426,7 +426,7 @@ describe('migration lock wiring', () => {
       assert.equal(loser.lock.lockClient, undefined);
       assert.ok(server.closed.includes(loser.lockId), 'a refused lock must not leak its connection');
 
-      // Releasing a lock we never held must not unlock somebody else's.
+      // Releasing an unheld lock must not unlock somebody else's.
       await releaseMigrationLock(loser.lock, loser.runner);
       assert.equal(server.heldBy, holder.lockId);
     });

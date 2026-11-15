@@ -37,7 +37,8 @@ import { UnsupportedFeatureError } from '../errors.js';
 import { mysqlDialect } from '../mysql.js';
 import type { SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, sqliteDialect, turbineSqlite } from '../sqlite.js';
-import { makeQuery, mockTable } from './helpers.js';
+import { makeQuery, mockTable, skipGate } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 function schema(): SchemaMetadata {
   return {
@@ -159,10 +160,7 @@ const DatabaseSync: (new (path: string) => DatabaseSyncType) | undefined = (() =
   }
 })();
 
-const liveIt: typeof it = DatabaseSync
-  ? it
-  : (((name: string) =>
-      it(name, { skip: 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)' }, () => {})) as typeof it);
+const { it: liveIt } = skipGate(!DatabaseSync, 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)');
 
 describe('sqlite, live', () => {
   liveIt('the emulation it replaced really did match nothing', async () => {
@@ -170,7 +168,7 @@ describe('sqlite, live', () => {
     // exactly as the JSON filter path encoded it. This is the measurement the
     // refusal rests on; if a future SQLite makes it work, this test fails and
     // the flag should be revisited rather than the test relaxed.
-    const db = new (DatabaseSync as NonNullable<typeof DatabaseSync>)(':memory:');
+    const db = closeSqliteAfter(new (DatabaseSync as NonNullable<typeof DatabaseSync>)(':memory:'));
     db.exec('CREATE TABLE docs (id INTEGER PRIMARY KEY, meta JSON)');
     db.exec(`INSERT INTO docs VALUES (1,'["gold"]'), (2,'[1]'), (3,'{"a":1,"tier":"gold"}')`);
     const emulation = db.prepare(
@@ -184,7 +182,7 @@ describe('sqlite, live', () => {
   });
 
   liveIt('the ORM refuses rather than returning that empty result', async () => {
-    const db = new (DatabaseSync as NonNullable<typeof DatabaseSync>)(':memory:');
+    const db = closeSqliteAfter(new (DatabaseSync as NonNullable<typeof DatabaseSync>)(':memory:'));
     db.exec('CREATE TABLE docs (id INTEGER PRIMARY KEY, meta JSON)');
     db.exec(`INSERT INTO docs VALUES (1,'{"a":1,"tier":"gold"}')`);
     const client = turbineSqlite(db, introspectSqliteDatabase(db));
@@ -211,7 +209,7 @@ describe('sqlite, live', () => {
     // extract and binds the raw number), which is what the fix should mirror.
     // Pinning the working half here keeps this test honest about which half
     // that is.
-    const db = new (DatabaseSync as NonNullable<typeof DatabaseSync>)(':memory:');
+    const db = closeSqliteAfter(new (DatabaseSync as NonNullable<typeof DatabaseSync>)(':memory:'));
     db.exec('CREATE TABLE docs (id INTEGER PRIMARY KEY, meta JSON)');
     db.exec(`INSERT INTO docs VALUES (1,'{"a":1,"tier":"gold"}'), (2,'{"a":2,"tier":"silver"}')`);
     const client = turbineSqlite(db, introspectSqliteDatabase(db));

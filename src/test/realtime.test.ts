@@ -11,7 +11,7 @@
  *         touching the pool (no connect() call).
  *
  *  2. **Integration (needs DATABASE_URL).** Real end-to-end:
- *       - $listen('w3_test_chan', handler), then $notify the same channel and
+ *       - $listen('realtime_test_chan', handler), then $notify the same channel and
  *         assert the handler fires with the payload within ~2s;
  *       - after unsubscribe(), a subsequent $notify does NOT fire the handler;
  *       - the dedicated connection is cleaned up (disconnect() doesn't hang).
@@ -181,11 +181,11 @@ testFn('realtime integration (LISTEN/NOTIFY)', () => {
     const fired = new Promise<string>((resolve) => {
       resolveFired = resolve;
     });
-    const sub = await client.$listen('w3_test_chan', (payload) => resolveFired(payload));
+    const sub = await client.$listen('realtime_test_chan', (payload) => resolveFired(payload));
 
     // Give the LISTEN a moment to register on the backend, then notify.
     await new Promise((r) => setTimeout(r, 100));
-    await client.$notify('w3_test_chan', 'hello');
+    await client.$notify('realtime_test_chan', 'hello');
 
     const timeout = new Promise<never>((_, reject) =>
       setTimeout(() => reject(new Error('handler did not fire within 2s')), 2000),
@@ -198,13 +198,13 @@ testFn('realtime integration (LISTEN/NOTIFY)', () => {
 
   it('after unsubscribe, a subsequent notify does NOT fire the handler', async () => {
     let calls = 0;
-    const sub = await client.$listen('w3_test_chan2', () => {
+    const sub = await client.$listen('realtime_test_chan2', () => {
       calls++;
     });
     await new Promise((r) => setTimeout(r, 100));
     await sub.unsubscribe();
 
-    await client.$notify('w3_test_chan2', 'should-not-arrive');
+    await client.$notify('realtime_test_chan2', 'should-not-arrive');
     // Wait long enough that a notification would have arrived if still subscribed.
     await new Promise((r) => setTimeout(r, 300));
     assert.equal(calls, 0, 'handler must not fire after unsubscribe');
@@ -212,7 +212,7 @@ testFn('realtime integration (LISTEN/NOTIFY)', () => {
 
   it('disconnect() does not hang with an open subscription', async () => {
     const local = new TurbineClient({ connectionString: DATABASE_URL!, poolSize: 2 }, schema);
-    await local.$listen('w3_test_chan3', () => {});
+    await local.$listen('realtime_test_chan3', () => {});
     // Intentionally do NOT unsubscribe, disconnect() must force-release it.
     await local.disconnect();
     assert.ok(true, 'disconnect() resolved without hanging');

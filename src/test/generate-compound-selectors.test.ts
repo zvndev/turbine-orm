@@ -58,7 +58,7 @@ function table(name: string, columns: ColumnMetadata[], indexes: IndexMetadata[]
  * TypeScript 7 moved that API: the package's root export is now a version stub
  * (`"." -> "./lib/version.cjs"`) and the real compiler surface lives under
  * `typescript/unstable/*`. So the import resolved, `ts.createSourceFile` was
- * simply absent, and the file failed to typecheck. Importing the API therefore
+ * absent, and the file failed to typecheck. Importing the API therefore
  * pins the whole repo to TypeScript 6, and following it to an `unstable/`
  * subpath would pin it to a surface that is named for its instability.
  *

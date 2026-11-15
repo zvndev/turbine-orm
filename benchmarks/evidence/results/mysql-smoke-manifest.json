@@ -1,0 +1,1512 @@
+{
+  "schemaVersion": 1,
+  "semantics": "cross-engine-exact-effects-v2",
+  "performanceClaimsAllowed": false,
+  "classification": "smoke",
+  "source": {
+    "gitHead": "274a387a8d1fdf8fccb23fb28f7814157fb329a6",
+    "contentSha256": "b7aedbdb85818cd0cc5636c75a353a626d74e3b5d19ee4b6cc8b1b563c9cd52c"
+  },
+  "harnessSha256": "84f8da73ad0d2ec4d12113727bc07ac2fbcf0a778f911f6d905a73b34b68ff77",
+  "installed": {
+    "drizzle-stable": "0.45.4",
+    "drizzle-candidate": "1.0.0-rc.5",
+    "pg": "8.23.1",
+    "mysql2": "3.24.6",
+    "mssql": "11.0.2",
+    "tsx": "4.23.15"
+  },
+  "runtime": {
+    "node": "v26.12.0",
+    "v8": "14.6.202.34-node.39",
+    "openssl": "3.5.9",
+    "sourcePg": "8.22.0"
+  },
+  "fixtureRows": 2048,
+  "batchSize": 128,
+  "rounds": 3,
+  "warmup": 1,
+  "limitations": [
+    "Smoke correctness/resource evidence only; no speed, superiority or general cross-engine conclusion.",
+    "Shared host; independent process runs reuse warm server/OS caches and are not cold-start measurements.",
+    "Unavailable engines are not successful execution or certification; a native route audit is separate from server/version coverage.",
+    "Raw/Drizzle writes and Turbine writes share transaction/effect semantics but include different RETURNING/reselection work.",
+    "RSS samples are observed boundaries, not true peaks; process maxRSS is cumulative; local PG backend resources exclude shared workers.",
+    "No relations, JSON, decimal, temporal, concurrent load or Prisma workloads in this runner."
+  ],
+  "runs": [
+    {
+      "runId": "a6a130f8-3493-4023-bc0c-e364b0e9d537",
+      "at": "2026-11-06T05:55:50.721Z",
+      "resultSha256": "c905b51fe2c5b95dd5009ce8d8dee38242e9345ea76001bcdb6a1a5157083740",
+      "engines": [
+        {
+          "engine": "sqlite",
+          "status": "complete",
+          "actualServerVersion": "3.54.0",
+          "settings": {
+            "journalMode": "wal",
+            "synchronous": 2,
+            "foreignKeys": 1
+          },
+          "pool": {
+            "max": 1,
+            "sharedPhysicalPoolAcrossArms": true,
+            "concurrency": 1
+          },
+          "correctness": {
+            "exactRows": true,
+            "everyArmRollback": true,
+            "everyMeasuredEffect": true
+          },
+          "cleanup": "complete",
+          "controls": {
+            "wrongCellAndOrderRejected": true,
+            "wrongEffectRejected": true,
+            "nativeRoutes": {
+              "raw": {
+                "statements": [
+                  "SELECT id, label, value, note FROM evidence_items ORDER BY id ASC"
+                ],
+                "iteratorOpens": 1,
+                "steppedRows": 2048
+              },
+              "turbine-source": {
+                "statements": [
+                  "SELECT \"evidence_items\".* FROM \"evidence_items\" ORDER BY \"id\" ASC LIMIT :p1",
+                  "SELECT \"evidence_items\".* FROM \"evidence_items\" ORDER BY \"id\" ASC"
+                ],
+                "iteratorOpens": 1,
+                "steppedRows": 2048
+              }
+            },
+            "probeMedianRatio": 0.9306288032476533,
+            "noiseFlag": false
+          },
+          "scenarios": [
+            {
+              "id": "page",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "point",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "transaction",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "native",
+              "consumption": "native-bounded-drain",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "transport": "node:sqlite iterate(), BEGIN/COMMIT, one handle; sampled every 128 rows",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "transport": "native SQLite iterator in batches; includes Turbine speculative LIMIT probe/transaction policy",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "engine": "postgresql",
+          "status": "unavailable",
+          "reason": "EVIDENCE_PG_ADMIN_URL unset; no server provisioned or certified"
+        },
+        {
+          "engine": "mysql",
+          "status": "complete",
+          "actualServerVersion": "8.4.0",
+          "settings": {
+            "isolation": "REPEATABLE-READ",
+            "flush_log": 1,
+            "charset": "utf8mb4",
+            "collation": "utf8mb4_bin",
+            "sql_mode": "IGNORE_SPACE,ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+            "autocommit": 1,
+            "log_bin": 1
+          },
+          "pool": {
+            "max": 1,
+            "sharedPhysicalPoolAcrossArms": true,
+            "concurrency": 1
+          },
+          "correctness": {
+            "exactRows": true,
+            "everyArmRollback": true,
+            "everyMeasuredEffect": true
+          },
+          "cleanup": "complete",
+          "controls": {
+            "wrongCellAndOrderRejected": true,
+            "wrongEffectRejected": true,
+            "nativeRoutes": {
+              "raw": {
+                "driver": "mysql2",
+                "physicalConnections": 1,
+                "statements": [
+                  "START TRANSACTION",
+                  "SELECT id, label, value, note FROM evidence_items ORDER BY id ASC",
+                  "COMMIT"
+                ],
+                "commands": [
+                  {
+                    "sql": "START TRANSACTION",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": true,
+                    "fieldsEvents": 1,
+                    "rowEvents": 1,
+                    "retainedRowsAtEnd": 1,
+                    "ended": true
+                  },
+                  {
+                    "sql": "SELECT id, label, value, note FROM evidence_items ORDER BY id ASC",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": false,
+                    "fieldsEvents": 1,
+                    "rowEvents": 2048,
+                    "retainedRowsAtEnd": 0,
+                    "ended": true
+                  },
+                  {
+                    "sql": "COMMIT",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": true,
+                    "fieldsEvents": 1,
+                    "rowEvents": 1,
+                    "retainedRowsAtEnd": 1,
+                    "ended": true
+                  }
+                ],
+                "pauseCalls": 2048,
+                "resumeCalls": 2050
+              },
+              "turbine-source": {
+                "driver": "mysql2",
+                "physicalConnections": 1,
+                "statements": [
+                  "START TRANSACTION",
+                  "SELECT `evidence_items`.* FROM `evidence_items` ORDER BY `id` ASC LIMIT 129",
+                  "SELECT `evidence_items`.* FROM `evidence_items` ORDER BY `id` ASC",
+                  "COMMIT"
+                ],
+                "commands": [
+                  {
+                    "sql": "START TRANSACTION",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": true,
+                    "fieldsEvents": 1,
+                    "rowEvents": 1,
+                    "retainedRowsAtEnd": 1,
+                    "ended": true
+                  },
+                  {
+                    "sql": "SELECT `evidence_items`.* FROM `evidence_items` ORDER BY `id` ASC LIMIT 129",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": true,
+                    "fieldsEvents": 1,
+                    "rowEvents": 0,
+                    "retainedRowsAtEnd": 129,
+                    "ended": true
+                  },
+                  {
+                    "sql": "SELECT `evidence_items`.* FROM `evidence_items` ORDER BY `id` ASC",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": false,
+                    "fieldsEvents": 1,
+                    "rowEvents": 2048,
+                    "retainedRowsAtEnd": 0,
+                    "ended": true
+                  },
+                  {
+                    "sql": "COMMIT",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": true,
+                    "fieldsEvents": 1,
+                    "rowEvents": 1,
+                    "retainedRowsAtEnd": 1,
+                    "ended": true
+                  }
+                ],
+                "pauseCalls": 2048,
+                "resumeCalls": 2049
+              }
+            },
+            "probeMedianRatio": 0.8694150094407325,
+            "noiseFlag": false
+          },
+          "scenarios": [
+            {
+              "id": "page",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "mysql2",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "point",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "mysql2",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "transaction",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "mysql2",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "native",
+              "consumption": "native-bounded-drain",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "mysql2",
+                  "transport": "mysql2 callback Query.stream highWaterMark=1; ordered digest; BEGIN/COMMIT; same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "transport": "mysql2 callback row events; batches 128; ordered digest; explicit Turbine transaction; includes speculative LIMIT129 reread",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "engine": "mssql",
+          "status": "unavailable",
+          "reason": "EVIDENCE_MSSQL_ADMIN_URL unset; no server provisioned or certified"
+        }
+      ]
+    },
+    {
+      "runId": "e35ed458-b804-4245-a574-a43405a7cbc0",
+      "at": "2026-11-06T05:55:52.083Z",
+      "resultSha256": "79099363e73c40c7b940d7a80cb6c3768124253c173d814777eadd98f51e159d",
+      "engines": [
+        {
+          "engine": "sqlite",
+          "status": "complete",
+          "actualServerVersion": "3.54.0",
+          "settings": {
+            "journalMode": "wal",
+            "synchronous": 2,
+            "foreignKeys": 1
+          },
+          "pool": {
+            "max": 1,
+            "sharedPhysicalPoolAcrossArms": true,
+            "concurrency": 1
+          },
+          "correctness": {
+            "exactRows": true,
+            "everyArmRollback": true,
+            "everyMeasuredEffect": true
+          },
+          "cleanup": "complete",
+          "controls": {
+            "wrongCellAndOrderRejected": true,
+            "wrongEffectRejected": true,
+            "nativeRoutes": {
+              "raw": {
+                "statements": [
+                  "SELECT id, label, value, note FROM evidence_items ORDER BY id ASC"
+                ],
+                "iteratorOpens": 1,
+                "steppedRows": 2048
+              },
+              "turbine-source": {
+                "statements": [
+                  "SELECT \"evidence_items\".* FROM \"evidence_items\" ORDER BY \"id\" ASC LIMIT :p1",
+                  "SELECT \"evidence_items\".* FROM \"evidence_items\" ORDER BY \"id\" ASC"
+                ],
+                "iteratorOpens": 1,
+                "steppedRows": 2048
+              }
+            },
+            "probeMedianRatio": 1.0298270033726935,
+            "noiseFlag": false
+          },
+          "scenarios": [
+            {
+              "id": "page",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "point",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "transaction",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "native",
+              "consumption": "native-bounded-drain",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "transport": "node:sqlite iterate(), BEGIN/COMMIT, one handle; sampled every 128 rows",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "transport": "native SQLite iterator in batches; includes Turbine speculative LIMIT probe/transaction policy",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "engine": "postgresql",
+          "status": "unavailable",
+          "reason": "EVIDENCE_PG_ADMIN_URL unset; no server provisioned or certified"
+        },
+        {
+          "engine": "mysql",
+          "status": "complete",
+          "actualServerVersion": "8.4.0",
+          "settings": {
+            "isolation": "REPEATABLE-READ",
+            "flush_log": 1,
+            "charset": "utf8mb4",
+            "collation": "utf8mb4_bin",
+            "sql_mode": "IGNORE_SPACE,ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+            "autocommit": 1,
+            "log_bin": 1
+          },
+          "pool": {
+            "max": 1,
+            "sharedPhysicalPoolAcrossArms": true,
+            "concurrency": 1
+          },
+          "correctness": {
+            "exactRows": true,
+            "everyArmRollback": true,
+            "everyMeasuredEffect": true
+          },
+          "cleanup": "complete",
+          "controls": {
+            "wrongCellAndOrderRejected": true,
+            "wrongEffectRejected": true,
+            "nativeRoutes": {
+              "raw": {
+                "driver": "mysql2",
+                "physicalConnections": 1,
+                "statements": [
+                  "START TRANSACTION",
+                  "SELECT id, label, value, note FROM evidence_items ORDER BY id ASC",
+                  "COMMIT"
+                ],
+                "commands": [
+                  {
+                    "sql": "START TRANSACTION",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": true,
+                    "fieldsEvents": 1,
+                    "rowEvents": 1,
+                    "retainedRowsAtEnd": 1,
+                    "ended": true
+                  },
+                  {
+                    "sql": "SELECT id, label, value, note FROM evidence_items ORDER BY id ASC",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": false,
+                    "fieldsEvents": 1,
+                    "rowEvents": 2048,
+                    "retainedRowsAtEnd": 0,
+                    "ended": true
+                  },
+                  {
+                    "sql": "COMMIT",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": true,
+                    "fieldsEvents": 1,
+                    "rowEvents": 1,
+                    "retainedRowsAtEnd": 1,
+                    "ended": true
+                  }
+                ],
+                "pauseCalls": 2048,
+                "resumeCalls": 2050
+              },
+              "turbine-source": {
+                "driver": "mysql2",
+                "physicalConnections": 1,
+                "statements": [
+                  "START TRANSACTION",
+                  "SELECT `evidence_items`.* FROM `evidence_items` ORDER BY `id` ASC LIMIT 129",
+                  "SELECT `evidence_items`.* FROM `evidence_items` ORDER BY `id` ASC",
+                  "COMMIT"
+                ],
+                "commands": [
+                  {
+                    "sql": "START TRANSACTION",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": true,
+                    "fieldsEvents": 1,
+                    "rowEvents": 1,
+                    "retainedRowsAtEnd": 1,
+                    "ended": true
+                  },
+                  {
+                    "sql": "SELECT `evidence_items`.* FROM `evidence_items` ORDER BY `id` ASC LIMIT 129",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": true,
+                    "fieldsEvents": 1,
+                    "rowEvents": 0,
+                    "retainedRowsAtEnd": 129,
+                    "ended": true
+                  },
+                  {
+                    "sql": "SELECT `evidence_items`.* FROM `evidence_items` ORDER BY `id` ASC",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": false,
+                    "fieldsEvents": 1,
+                    "rowEvents": 2048,
+                    "retainedRowsAtEnd": 0,
+                    "ended": true
+                  },
+                  {
+                    "sql": "COMMIT",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": true,
+                    "fieldsEvents": 1,
+                    "rowEvents": 1,
+                    "retainedRowsAtEnd": 1,
+                    "ended": true
+                  }
+                ],
+                "pauseCalls": 2048,
+                "resumeCalls": 2049
+              }
+            },
+            "probeMedianRatio": 1.1306200246673592,
+            "noiseFlag": false
+          },
+          "scenarios": [
+            {
+              "id": "page",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "mysql2",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "point",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "mysql2",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "transaction",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "mysql2",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "native",
+              "consumption": "native-bounded-drain",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "mysql2",
+                  "transport": "mysql2 callback Query.stream highWaterMark=1; ordered digest; BEGIN/COMMIT; same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "transport": "mysql2 callback row events; batches 128; ordered digest; explicit Turbine transaction; includes speculative LIMIT129 reread",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "engine": "mssql",
+          "status": "unavailable",
+          "reason": "EVIDENCE_MSSQL_ADMIN_URL unset; no server provisioned or certified"
+        }
+      ]
+    },
+    {
+      "runId": "da4221a4-d942-41ef-84bf-feae31be68c3",
+      "at": "2026-11-06T05:55:53.485Z",
+      "resultSha256": "3e745aaa4385ae4aa96731d3c7eef478675e0024a7743806114daff3acd3acd9",
+      "engines": [
+        {
+          "engine": "sqlite",
+          "status": "complete",
+          "actualServerVersion": "3.54.0",
+          "settings": {
+            "journalMode": "wal",
+            "synchronous": 2,
+            "foreignKeys": 1
+          },
+          "pool": {
+            "max": 1,
+            "sharedPhysicalPoolAcrossArms": true,
+            "concurrency": 1
+          },
+          "correctness": {
+            "exactRows": true,
+            "everyArmRollback": true,
+            "everyMeasuredEffect": true
+          },
+          "cleanup": "complete",
+          "controls": {
+            "wrongCellAndOrderRejected": true,
+            "wrongEffectRejected": true,
+            "nativeRoutes": {
+              "raw": {
+                "statements": [
+                  "SELECT id, label, value, note FROM evidence_items ORDER BY id ASC"
+                ],
+                "iteratorOpens": 1,
+                "steppedRows": 2048
+              },
+              "turbine-source": {
+                "statements": [
+                  "SELECT \"evidence_items\".* FROM \"evidence_items\" ORDER BY \"id\" ASC LIMIT :p1",
+                  "SELECT \"evidence_items\".* FROM \"evidence_items\" ORDER BY \"id\" ASC"
+                ],
+                "iteratorOpens": 1,
+                "steppedRows": 2048
+              }
+            },
+            "probeMedianRatio": 1.0783842794761018,
+            "noiseFlag": false
+          },
+          "scenarios": [
+            {
+              "id": "page",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "point",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "transaction",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "sqlite-proxy over the same node:sqlite handle (async callback overhead included)",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "node-sqlite over the same node:sqlite handle",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "native",
+              "consumption": "native-bounded-drain",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "node:sqlite",
+                  "transport": "node:sqlite iterate(), BEGIN/COMMIT, one handle; sampled every 128 rows",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "transport": "native SQLite iterator in batches; includes Turbine speculative LIMIT probe/transaction policy",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "engine": "postgresql",
+          "status": "unavailable",
+          "reason": "EVIDENCE_PG_ADMIN_URL unset; no server provisioned or certified"
+        },
+        {
+          "engine": "mysql",
+          "status": "complete",
+          "actualServerVersion": "8.4.0",
+          "settings": {
+            "isolation": "REPEATABLE-READ",
+            "flush_log": 1,
+            "charset": "utf8mb4",
+            "collation": "utf8mb4_bin",
+            "sql_mode": "IGNORE_SPACE,ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+            "autocommit": 1,
+            "log_bin": 1
+          },
+          "pool": {
+            "max": 1,
+            "sharedPhysicalPoolAcrossArms": true,
+            "concurrency": 1
+          },
+          "correctness": {
+            "exactRows": true,
+            "everyArmRollback": true,
+            "everyMeasuredEffect": true
+          },
+          "cleanup": "complete",
+          "controls": {
+            "wrongCellAndOrderRejected": true,
+            "wrongEffectRejected": true,
+            "nativeRoutes": {
+              "raw": {
+                "driver": "mysql2",
+                "physicalConnections": 1,
+                "statements": [
+                  "START TRANSACTION",
+                  "SELECT id, label, value, note FROM evidence_items ORDER BY id ASC",
+                  "COMMIT"
+                ],
+                "commands": [
+                  {
+                    "sql": "START TRANSACTION",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": true,
+                    "fieldsEvents": 1,
+                    "rowEvents": 1,
+                    "retainedRowsAtEnd": 1,
+                    "ended": true
+                  },
+                  {
+                    "sql": "SELECT id, label, value, note FROM evidence_items ORDER BY id ASC",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": false,
+                    "fieldsEvents": 1,
+                    "rowEvents": 2048,
+                    "retainedRowsAtEnd": 0,
+                    "ended": true
+                  },
+                  {
+                    "sql": "COMMIT",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": true,
+                    "fieldsEvents": 1,
+                    "rowEvents": 1,
+                    "retainedRowsAtEnd": 1,
+                    "ended": true
+                  }
+                ],
+                "pauseCalls": 2048,
+                "resumeCalls": 2050
+              },
+              "turbine-source": {
+                "driver": "mysql2",
+                "physicalConnections": 1,
+                "statements": [
+                  "START TRANSACTION",
+                  "SELECT `evidence_items`.* FROM `evidence_items` ORDER BY `id` ASC LIMIT 129",
+                  "SELECT `evidence_items`.* FROM `evidence_items` ORDER BY `id` ASC",
+                  "COMMIT"
+                ],
+                "commands": [
+                  {
+                    "sql": "START TRANSACTION",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": true,
+                    "fieldsEvents": 1,
+                    "rowEvents": 1,
+                    "retainedRowsAtEnd": 1,
+                    "ended": true
+                  },
+                  {
+                    "sql": "SELECT `evidence_items`.* FROM `evidence_items` ORDER BY `id` ASC LIMIT 129",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": true,
+                    "fieldsEvents": 1,
+                    "rowEvents": 0,
+                    "retainedRowsAtEnd": 129,
+                    "ended": true
+                  },
+                  {
+                    "sql": "SELECT `evidence_items`.* FROM `evidence_items` ORDER BY `id` ASC",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": false,
+                    "fieldsEvents": 1,
+                    "rowEvents": 2048,
+                    "retainedRowsAtEnd": 0,
+                    "ended": true
+                  },
+                  {
+                    "sql": "COMMIT",
+                    "method": "query",
+                    "commandClass": "Query",
+                    "callback": true,
+                    "fieldsEvents": 1,
+                    "rowEvents": 1,
+                    "retainedRowsAtEnd": 1,
+                    "ended": true
+                  }
+                ],
+                "pauseCalls": 2048,
+                "resumeCalls": 2049
+              }
+            },
+            "probeMedianRatio": 1.1384160495191473,
+            "noiseFlag": false
+          },
+          "scenarios": [
+            {
+              "id": "page",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "mysql2",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "point",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "mysql2",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "transaction",
+              "consumption": "materialized",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "mysql2",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "complete",
+                  "adapter": "mysql2 on the same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                }
+              ]
+            },
+            {
+              "id": "native",
+              "consumption": "native-bounded-drain",
+              "arms": [
+                {
+                  "name": "raw",
+                  "status": "complete",
+                  "adapter": "mysql2",
+                  "transport": "mysql2 callback Query.stream highWaterMark=1; ordered digest; BEGIN/COMMIT; same max=1 pool",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "turbine-source",
+                  "status": "complete",
+                  "adapter": "repository source with shared native handle/pool",
+                  "transport": "mysql2 callback row events; batches 128; ordered digest; explicit Turbine transaction; includes speculative LIMIT129 reread",
+                  "samples": 3,
+                  "clientCpuAndRssSamples": 3,
+                  "attributedLocalServerSamples": 0
+                },
+                {
+                  "name": "drizzle-stable",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                },
+                {
+                  "name": "drizzle-candidate",
+                  "status": "unavailable",
+                  "reason": "Native consumption not implemented in this adapter; materialized reads are a separate scenario"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "engine": "mssql",
+          "status": "unavailable",
+          "reason": "EVIDENCE_MSSQL_ADMIN_URL unset; no server provisioned or certified"
+        }
+      ]
+    }
+  ]
+}

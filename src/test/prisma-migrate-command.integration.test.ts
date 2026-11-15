@@ -16,7 +16,7 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
@@ -52,6 +52,34 @@ function runCli(cwd: string, args: string[], env: NodeJS.ProcessEnv = {}): { cod
 // ---------------------------------------------------------------------------
 
 describe('turbine migrate-from-prisma - parse-only (--no-db)', () => {
+  it('refuses native integer declarations before replacing any Prisma output', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'turbine-mfp-integer-refusal-'));
+    const outputDir = join(dir, 'out');
+    mkdirSync(outputDir);
+    const sentinel = 'preserve existing consumer output\n';
+    const names = ['prisma-migration-report.md', 'prisma-map.ts', 'types.ts'];
+    try {
+      for (const name of names) writeFileSync(join(outputDir, name), sentinel);
+      writeFileSync(join(dir, 'turbine.config.mjs'), 'export default { exactNativeIntegers: true };');
+      for (const mode of [[], ['--no-db']]) {
+        const result = runCli(dir, ['--schema', shopPrisma, '--out', './out', '--no-timestamp', ...mode], {
+          DATABASE_URL: '',
+        });
+        assert.equal(result.code, 1, result.output);
+        assert.match(result.output, /exactNativeIntegers requires an explicit target/);
+        for (const name of names) assert.equal(readFileSync(join(outputDir, name), 'utf8'), sentinel);
+      }
+      writeFileSync(join(dir, 'turbine.config.mjs'), 'export default { exactNativeIntegers: false };');
+      const allowed = runCli(dir, ['--schema', shopPrisma, '--out', './out', '--no-db', '--no-timestamp'], {
+        DATABASE_URL: '',
+      });
+      assert.equal(allowed.code, 0, allowed.output);
+      assert.match(readFileSync(join(outputDir, names[0]!), 'utf8'), /parse-only/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('writes a report but no prisma-map.ts and exits 0', { skip: !haveTsx }, () => {
     const dir = join(tmpdir(), `turbine-mfp-nodb-${Date.now()}`);
     mkdirSync(dir, { recursive: true });

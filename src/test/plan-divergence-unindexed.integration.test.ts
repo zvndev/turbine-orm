@@ -243,7 +243,7 @@ describe('unindexed-filter plan divergence (live Postgres)', () => {
   it('estimates the tuple walk and the amplification within measuring distance', () => {
     const f = findPlanDivergence(schema, snapshot).findings.find((x) => x.table === 'inv_loc')!;
     const m = measured.inv_loc!;
-    // The generic plan fetches essentially every row one at a time, so the
+    // The generic plan fetches nearly every row one at a time, so the
     // measured buffer count and the estimated tuple walk should agree closely.
     assert.ok(
       Math.abs((f.tuplesWalked ?? 0) - m.generic) / m.generic < 0.05,

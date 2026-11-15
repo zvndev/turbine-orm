@@ -27,6 +27,7 @@ import type { QueryEvent } from '../query/index.js';
 import type { SchemaMetadata } from '../schema.js';
 import { turbineSqlite } from '../sqlite.js';
 import { mockTable, skipGate } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 // `node:sqlite` is a builtin only on Node >= 22.5; probe without a static import
 // so this file loads (and skips cleanly) on Node 20.
@@ -70,7 +71,7 @@ async function captureQueryEvent(db: TurbineClient): Promise<QueryEvent> {
 // ---------------------------------------------------------------------------
 
 function openSqliteProbe(options?: Parameters<typeof turbineSqlite>[2]): TurbineClient {
-  const handle = new DatabaseSync!(':memory:');
+  const handle = closeSqliteAfter(new DatabaseSync!(':memory:'));
   handle.exec('CREATE TABLE cfg_probe (id INTEGER PRIMARY KEY, name TEXT NOT NULL)');
   handle.exec("INSERT INTO cfg_probe (id, name) VALUES (1, 'probe')");
   return turbineSqlite(handle, probeSchema(), options);

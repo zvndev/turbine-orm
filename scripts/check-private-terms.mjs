@@ -15,7 +15,8 @@
  *
  * ## Two independent rulesets, because they have different secrecy needs
  *
- * 1. BUILTIN_PATTERNS, below. Provenance framing: wording that attributes a
+ * 1. BUILTIN_PATTERNS and BUILTIN_PATH_PATTERNS, below. These reject machine
+ *    locations and planning labels as well as wording that attributes a
  *    change to who reported it or to whose system it was measured on. The
  *    patterns are not themselves sensitive, so they live in this tracked file
  *    and are therefore enforced in CI and in every clone, not just on the
@@ -45,7 +46,7 @@
  * introspector"). That is ordinary engineering English and blocking it would
  * train people to bypass the hook.
  */
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 
 /**
@@ -61,6 +62,26 @@ const BUILTIN_PATTERNS = [
   [/\bthe\s+the\s+\w+\s+consumer\b/i, 'leftover from an earlier redaction; a name was here'],
   [/\((?:T|N)-\d+[a-z]?\)/, 'opaque external-report item label'],
   [/\bdogfood[-\s]source\b/i, 'names a feedback source'],
+  [/\bwave[ _-]*\d+|\bwave[ _-]+c\b/i, 'numbered planning label; describe the behavior'],
+  [/\bW\d{2,}[A-Z0-9]*_[A-Z0-9_]+\b|\bw\d{2,}(?:[a-z]+|[_-])[\w-]*/, 'planning identifier; use a descriptive name'],
+  [/(?:\/(?:home|Users)\/[^\s/"'`]+|[A-Z]:\\Users\\[^\s\\"'`]+)/, 'home-directory path; use an argument, environment variable or OS temp directory'],
+  [/\bt3-[a-f0-9]{8}\b|\.t3\/worktrees\//i, 'machine checkout identifier'],
+  [/\b(?:PM|ROOT)[ -](?:owns?|owned|supplied|patched|must|only|integration|configuration|serial|execution|review)\b|\b(?:for|by|the)\s+PM\b/, 'internal coordination role'],
+  [/\bPM[-_]TO[-_]FILL\b|\bPM(?:'s|\s+(?:serialization|performs?|may|will|should|runs?|executes?|integrates?|reviews?|approves?|accepts?))\b/, 'internal coordination role or placeholder'],
+  [/\b(?:implementation|producer|review)[ -]workers?\b|\bworkers?\s+(?:must\s+)?freeze\b|\bworker[ -]freeze\b|\bfrozen[ -]workers?\b/i, 'development coordination wording; describe the execution requirement'],
+  [/\b(?:PM|ROOT|review)[ -](?:admission|evidence|receipts?)\b|\b(?:sealed|handoff)[ -](?:evidence|receipts?)\b/i, 'internal review record; describe the actual check or output'],
+  [/\bfrozen[ -](?:producer(?:[ -]commits?)?|commits?|branches?|source[ -]tree|implementation)\b/i, 'development freeze wording; describe pinned inputs or the execution requirement'],
+  [/\badmission[ -](?:review|decision|round)\b|\b(?:reviewable|reviewed)[ -]evidence[ -]record\b/i, 'internal coordination record; describe the validation result'],
+  [/\bindependent[ -]review\b|\bfirst material review\b/i, 'internal review process'],
+  [/\bprivate[ -](?:(?:runtime|package|full-package|PostgreSQL|MySQL|better-sqlite3|compatibility)[ -]){0,2}(?:distributions?|profiles?|stages?)\b/i, 'internal package label; describe optional package builds'],
+];
+
+// Match path components, including abbreviated iteration prefixes. Runtime
+// workers, SQL admission and frozen objects are valid software terminology.
+const BUILTIN_PATH_PATTERNS = [
+  [/(?:^|[/_.-])wave(?:[ _-]*\d+|[ _-]+c(?:[._/-]|$))/i, 'planning name in tracked path'],
+  [/(?:^|[/_.-])w\d{2,}(?=[a-z_.-]|$)/i, 'abbreviated planning name in tracked path'],
+  [/(?:^|\/)pm[-_.]|(?:^|\/)review[-_]/i, 'coordination name in tracked path'],
 ];
 
 const TERMS_FILE = '.private-terms';
@@ -95,7 +116,7 @@ function readContent(file) {
   try {
     const raw = ALL
       ? readFileSync(file)
-      : execSync(`git show :"${file}"`, { maxBuffer: 64 * 1024 * 1024 });
+      : execFileSync('git', ['show', `:${file}`], { maxBuffer: 64 * 1024 * 1024 });
     if (raw.includes(0)) return undefined;
     return raw.toString('utf8');
   } catch {
@@ -105,6 +126,9 @@ function readContent(file) {
 
 const hits = [];
 for (const file of files) {
+  for (const [re, why] of BUILTIN_PATH_PATTERNS) {
+    if (re.test(file)) hits.push(`${file}: ${why}`);
+  }
   const content = readContent(file);
   if (content === undefined) continue; // binary, missing or unreadable
 
@@ -112,7 +136,10 @@ for (const file of files) {
   if (file !== 'scripts/check-private-terms.mjs') {
     for (const [re, why] of BUILTIN_PATTERNS) {
       const m = content.match(re);
-      if (m) hits.push(`${file}: ${why} ("${m[0].trim().slice(0, 60)}")`);
+      if (m) {
+        const line = content.slice(0, m.index).split('\n').length;
+        hits.push(`${file}:${line}: ${why} ("${m[0].trim().slice(0, 60)}")`);
+      }
     }
   }
 
@@ -127,8 +154,8 @@ for (const file of files) {
 if (hits.length) {
   console.error(
     ALL
-      ? `\ncheck failed, tracked content contains private material (${files.length} files scanned):\n`
-      : '\ncommit blocked, staged content contains private material:\n',
+      ? `\ncheck failed, tracked paths or content contain private material (${files.length} files scanned):\n`
+      : '\ncommit blocked, staged paths or content contain private material:\n',
   );
   for (const h of hits) console.error(`  ${h}`);
   console.error(

@@ -36,7 +36,7 @@ Run-to-run variance is about 7 points. Twelve of the twenty schema-only failures
 
 ## The MCP server
 
-`npx turbine mcp` gives an agent eleven read-only tools over your live database. The most useful on an unfamiliar schema:
+`npx turbine mcp` gives an agent twelve read-only tools over your live PostgreSQL database (fewer on SQLite, MySQL and SQL Server). The most useful on an unfamiliar schema:
 
 - `relation_graph`: every relation name with its cardinality and keys, the exact names `with` accepts.
 - `find_join_path`: the relation chain from one table to another, with the `with` clause to write.
@@ -79,7 +79,7 @@ users[0].posts[0].comments[0].author.name; // inferred end to end, no manual cas
 
 ## Coded errors
 
-Every error carries a stable `code` (`TURBINE_E001` to `TURBINE_E020`), so an agent branches on the class or code instead of parsing text.
+Every error carries a stable `code` (`TURBINE_E001` to `TURBINE_E021`), so an agent branches on the class or code instead of parsing text.
 
 ```ts
 import { SerializationFailureError, UniqueConstraintError } from 'turbine-orm';
@@ -144,7 +144,7 @@ Safety
 - Wrap multi-step writes in `db.$transaction(async (tx) => { ... })`.
 
 Errors
-- Catch typed errors and branch on the class/code (TURBINE_E001..E020), not the message.
+- Catch typed errors and branch on the class/code (TURBINE_E001..E021), not the message.
 - Retry only when `err.isRetryable` is true (DeadlockError E012, SerializationFailureError E013).
 
 Migrations
@@ -155,7 +155,7 @@ Migrations
 
 ## See also
 
-- **[MCP Server](/mcp)**: the eleven read-only tools.
+- **[MCP Server](/mcp)**: the read-only tools, per engine.
 - **[Quick Start](/quickstart)**: from install to a first typed query.
 - **[Reading and writing](/queries)**: every method and option the snippet refers to.
 - **[Typed Errors](/errors)**: every error code.

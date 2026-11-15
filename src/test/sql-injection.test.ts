@@ -95,9 +95,8 @@ describe('SQL injection defense, hostile orderBy keys', () => {
 
 describe('SQL injection defense, quoted identifier escaping', () => {
   it('a field name with an embedded double-quote, even if it somehow reaches quoteIdent, must not break out', async () => {
-    // We can't directly reach quoteIdent's code path through the public API
-    // with a hostile column name (metadata validation rejects it first),
-    // but we can verify quoteIdent's contract directly.
+    // Metadata validation rejects hostile column names before they reach
+    // quoteIdent through the public API, so check its contract directly.
     const { quoteIdent } = await import('../query/index.js');
     assert.equal(quoteIdent('users'), '"users"');
     assert.equal(quoteIdent('id"; DROP TABLE users; --'), '"id""; DROP TABLE users; --"');

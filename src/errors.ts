@@ -29,6 +29,7 @@ export const TurbineErrorCode = {
   READ_ONLY: 'TURBINE_E018',
   TRANSACTION_ROLLED_BACK: 'TURBINE_E019',
   INVARIANT_VIOLATION: 'TURBINE_E020',
+  TRANSACTION_OUTCOME_UNKNOWN: 'TURBINE_E021',
 } as const;
 
 export type TurbineErrorCode = (typeof TurbineErrorCode)[keyof typeof TurbineErrorCode];
@@ -444,7 +445,7 @@ function redactValueBearingFields(err: object): PropertyDescriptorMap {
  * so the values still reached every place an error object gets rendered whole:
  *   - `console.error(err)` / an uncaught rejection: Node's error printer walks
  *     the cause chain and prints `[cause]: ... detail: 'Key (email)=(...)'`.
- *     Note that `cause` is ALREADY non-enumerable (the Error constructor defines
+ *     `cause` is ALREADY non-enumerable (the Error constructor defines
  *     it that way) and Node prints it anyway, so hiding the property is not a
  *     fix;
  *   - Sentry and similar sinks link `cause` chains by default and serialize
@@ -1420,6 +1421,41 @@ export class TransactionRolledBackError extends TurbineError {
 }
 
 /**
+ * Thrown when a transaction's COMMIT got no answer Turbine could read: the
+ * driver gave up waiting (a `query_timeout`), the connection was lost, or the
+ * driver refused the statement. Turbine cannot tell those apart, so the
+ * transaction may have committed, may still be committing, or may never have
+ * reached the server. A ROLLBACK sent afterwards cannot tell either (it only
+ * reports that no transaction is open), so none is sent and the connection is
+ * discarded rather than reused.
+ *
+ * NOT retryable: a retry of writes that did commit applies them twice. Reading
+ * the database does not settle it either, since a COMMIT still in flight can
+ * commit after the read. Retry only a write that is safe to repeat: one
+ * carrying a unique idempotency key the database enforces, written in the same
+ * transaction, so a replay either saves it or fails with E008 on that key's
+ * constraint. That says a row with the key is committed, not that it is this
+ * write: read it back and compare. E008 on any other constraint says nothing
+ * about the first attempt. The failure that hid the answer is attached as
+ * `cause`.
+ */
+export class TransactionOutcomeUnknownError extends TurbineError {
+  static override readonly CODE = TurbineErrorCode.TRANSACTION_OUTCOME_UNKNOWN;
+
+  /** @param cause the failure that hid the COMMIT's answer. */
+  constructor(cause: unknown) {
+    super(
+      TurbineErrorCode.TRANSACTION_OUTCOME_UNKNOWN,
+      'COMMIT got no answer Turbine could read, so whether the transaction committed is unknown, and it may still ' +
+        'commit. Retry only a write that a unique key the database enforces makes safe to repeat. The failure is ' +
+        'attached as `cause`.',
+      { cause },
+    );
+    this.name = 'TransactionOutcomeUnknownError';
+  }
+}
+
+/**
  * The sentence every {@link InvariantError} message ends with, before the docs
  * link. Exported so a test can assert it without restating it.
  */
@@ -1506,7 +1542,7 @@ const CONNECTION_ERROR_CODES = new Set<string>([
   // the usual cause is a transaction-pooling endpoint switching backends.
   '42P05', // duplicate_prepared_statement
   '26000', // invalid_sql_statement_name
-  // pg SQLSTATE class 28: the server answered and REFUSED us. These are the
+  // pg SQLSTATE class 28: the server answered and REFUSED the connection. These are the
   // most common first-run failures there are (wrong password, a pg_hba rule
   // that does not cover this user/host), and they used to fall through
   // wrapPgError untouched: the caller got a raw pg `DatabaseError` whose
@@ -1586,6 +1622,35 @@ const PG_NOT_QUERYABLE_MESSAGES = new Set<string>([
 ]);
 
 /**
+ * Whether `err` is the {@link ConnectionError} for a statement node-postgres
+ * refused to send, because the client had already failed or been closed. Such
+ * a statement cannot have run.
+ */
+export function refusedBeforeSending(err: unknown): boolean {
+  const cause = err instanceof ConnectionError ? err.cause : undefined;
+  return cause instanceof Error && (PG_NOT_QUERYABLE_MESSAGES.has(cause.message) || isMysqlClosedState(cause));
+}
+
+/** mysql2's own refusal on a closed connection, never a server error packet (those carry an `errno`). */
+function isMysqlClosedState(err: Error): boolean {
+  return err.message === MYSQL_CLOSED_STATE && typeof (err as { errno?: unknown }).errno !== 'number';
+}
+
+/** mysql2's words for a command it refused because the connection had already closed. */
+const MYSQL_CLOSED_STATE = "Can't add new command when connection is in closed state";
+
+/**
+ * mysql2's lost connection as a {@link ConnectionError}: the socket closed under
+ * a command (`PROTOCOL_CONNECTION_LOST`), or a later command was refused on the
+ * closed connection. `undefined` for anything else.
+ */
+export function driverConnectionLoss(err: unknown): ConnectionError | undefined {
+  if (!(err instanceof Error)) return undefined;
+  if ((err as { code?: unknown }).code !== 'PROTOCOL_CONNECTION_LOST' && !isMysqlClosedState(err)) return undefined;
+  return new ConnectionError(`Database connection lost: ${err.message}. ${CONNECTION_LOSS_HINT}`, { cause: err });
+}
+
+/**
  * Report the error that KILLED a held connection instead of its follow-on.
  *
  * When a connection dies while a transaction callback is between queries, the
@@ -1598,9 +1663,7 @@ const PG_NOT_QUERYABLE_MESSAGES = new Set<string>([
  * server's own message.
  */
 export function explainConnectionLoss(err: unknown, lostWith: Error | undefined): unknown {
-  if (!lostWith || !(err instanceof ConnectionError)) return err;
-  const cause = err.cause;
-  if (!(cause instanceof Error) || !PG_NOT_QUERYABLE_MESSAGES.has(cause.message)) return err;
+  if (!lostWith || !refusedBeforeSending(err)) return err;
   const original = wrapPgError(lostWith);
   return original instanceof ConnectionError ? original : err;
 }
@@ -1653,7 +1716,7 @@ const PREPARED_STATEMENT_POOLER_HINT =
  * failed for user \"postgres\""); these state what to do about it, which is the
  * whole difference between a typed error and a raw one for a first-run failure.
  *
- * A code with no entry here simply gets no hint appended.
+ * A code with no entry here gets no hint appended.
  */
 const CONNECTION_ERROR_HINTS: Readonly<Record<string, string>> = {
   '42P05': PREPARED_STATEMENT_POOLER_HINT,
@@ -1883,7 +1946,7 @@ function withheldServerMessage(code: string): string {
  * LOG-REDACTION setting would decide which `catch` branch runs. An error whose
  * TYPE depends on a logging option is a worse bug than the one that would fix.
  * The frozen code set (STABILITY.md) points the same way: there is no
- * TURBINE_E0NN for "a SQLSTATE we have no opinion about", minting one is out of
+ * TURBINE_E0NN for an unmapped SQLSTATE, minting one is out of
  * scope, and a Turbine class whose `.code` held a raw SQLSTATE instead would
  * break both the `TurbineErrorCode` type and the brand matching in
  * {@link TurbineError[Symbol.hasInstance]}. So `.code` stays the raw SQLSTATE it
@@ -1941,7 +2004,7 @@ function scrubUnclassifiedServerError(err: object, code: string): unknown {
  *   40001 (serialization_failure) -> SerializationFailureError (retryable)
  *   55P03 (lock_not_available)    -> LockNotAvailableError (retryable, E013); also
  *                                    MySQL 3572 / 1205 and SQL Server 1222
- *   57014 (query_canceled)        -> TimeoutError (server-side statement_timeout)
+ *   57014 (query_canceled)        -> TimeoutError (statement_timeout or a cancel request)
  *   28P01 / 28000 (auth refused)  -> ConnectionError, with a remediation hint
  *   3D000 (no such database)      -> ConnectionError, with a remediation hint
  *   42P05 / 26000 (prepared statement name clash or miss, a transaction-mode
@@ -2046,16 +2109,13 @@ export function wrapPgError(err: unknown): unknown {
         cause: err,
       });
     case '57014':
-      // query_canceled: the statement was stopped, so it made no change. A
-      // cancel request (what Turbine sends when a query or transaction
-      // `timeout` expires) reads "due to user request"; anything else is the
-      // server's own statement_timeout.
+      // query_canceled: the statement was stopped, so it made no change. The
+      // SQLSTATE does not say who stopped it, and the message text that does
+      // is in the server's language, so the error names both causes.
       return new TimeoutError(0, 'Query', {
         message:
-          typeof e.message === 'string' && /user request/i.test(e.message)
-            ? 'Query cancelled on the server by a cancel request, which Turbine sends when a query or ' +
-              'transaction `timeout` expires. It made no change.'
-            : 'Query canceled by server-side statement_timeout',
+          'Query cancelled on the server, by its `statement_timeout` or by a cancel request (Turbine sends one ' +
+          'when a query or transaction `timeout` expires). It made no change.',
         cause: err,
         outcome: 'not-executed',
       });

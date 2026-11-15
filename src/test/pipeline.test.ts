@@ -15,7 +15,13 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { PipelineError, TurbineErrorCode } from '../errors.js';
+import {
+  ConnectionError,
+  PipelineError,
+  TransactionOutcomeUnknownError,
+  TurbineErrorCode,
+  UniqueConstraintError,
+} from '../errors.js';
 import { executePipeline } from '../pipeline.js';
 import type { DeferredQuery } from '../query/index.js';
 
@@ -307,5 +313,117 @@ describe('executePipeline', () => {
       [7, 7],
     );
     assert.equal(released.value, 1, 'connection released');
+  });
+});
+
+/**
+ * The sequential `{ transactional: false }` batch when its connection fails.
+ * Each query autocommits, so one whose connection failed under it without an
+ * answer may have committed: E021, never E004, whose advice is that a retry is
+ * safe. Only a query the driver refused before sending it keeps E004.
+ */
+describe('executePipeline non-transactional sequential batch when the connection fails', () => {
+  const lostMidStatement = () => new Error('Connection terminated unexpectedly');
+  const notQueryable = () => new Error('Client has encountered a connection error and is not queryable');
+
+  function failingPool(answer: (sql: string) => Error | { rows: unknown[]; rowCount: number }) {
+    const sent: string[] = [];
+    const releases: unknown[] = [];
+    const pool = {
+      async connect() {
+        return {
+          async query(text: string) {
+            sent.push(text);
+            const r = answer(text);
+            if (r instanceof Error) throw r;
+            return r;
+          },
+          release(err?: unknown) {
+            releases.push(err);
+          },
+        };
+      },
+    };
+    return { pool, sent, releases };
+  }
+
+  const run = (pool: unknown, queries: DeferredQuery<unknown>[]) =>
+    // biome-ignore lint/suspicious/noExplicitAny: mock pool shape
+    executePipeline(pool as any, queries, { transactional: false }).then(
+      () => null,
+      (e: unknown) => e,
+    );
+  const slotError = (err: PipelineError, i: number) => (err.results[i] as { error?: unknown }).error;
+
+  it('reports a write whose answer was lost as an unknown outcome and keeps acknowledged slots', async () => {
+    let dead = false;
+    const { pool, sent, releases } = failingPool((sql) => {
+      if (dead) return notQueryable();
+      if (sql.startsWith('INSERT INTO b')) {
+        dead = true;
+        return lostMidStatement();
+      }
+      return { rows: [{ n: 1 }], rowCount: 1 };
+    });
+    const err = await run(pool, [
+      defer('INSERT INTO a VALUES (1)', [], (r) => r.rowCount, 'a.create'),
+      defer('INSERT INTO b VALUES (1)', [], (r) => r.rowCount, 'b.create'),
+      defer('INSERT INTO c VALUES (1)', [], (r) => r.rowCount, 'c.create'),
+    ]);
+    assert.ok(err instanceof PipelineError, `got ${String(err)}`);
+    assert.deepEqual(err.results[0], { status: 'ok', value: 1 }, 'an acknowledged slot keeps its result');
+    const unknown = slotError(err, 1);
+    assert.ok(unknown instanceof TransactionOutcomeUnknownError, `got ${String(unknown)}`);
+    assert.ok(unknown.cause instanceof ConnectionError, 'the connection error is the cause');
+    const refused = slotError(err, 2);
+    assert.ok(refused instanceof ConnectionError, 'a statement the driver refused to send keeps E004');
+    assert.equal(err.failedIndex, 1);
+    assert.equal(err.failedTag, 'b.create');
+    assert.equal(err.cause, unknown);
+    assert.equal(sent.length, 3, 'the batch stays independent');
+    assert.equal(releases.length, 1, 'released once');
+    assert.ok(releases[0] instanceof Error, 'a connection that failed is released with the error, so it is discarded');
+  });
+
+  it('reports a SELECT whose answer was lost as unknown: it can write through a function', async () => {
+    const { pool } = failingPool(() => Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }));
+    const err = await run(pool, [defer('SELECT write_something()', [], (r) => r.rows)]);
+    assert.ok(err instanceof PipelineError);
+    assert.ok(slotError(err, 0) instanceof TransactionOutcomeUnknownError);
+  });
+
+  it('reports a sent COMMIT of an explicit BEGIN / INSERT / COMMIT batch as unknown', async () => {
+    const { pool } = failingPool((sql) => (sql === 'COMMIT' ? lostMidStatement() : { rows: [], rowCount: 1 }));
+    const err = await run(pool, [
+      defer('BEGIN', [], (r) => r.rowCount),
+      defer('INSERT INTO a VALUES (1)', [], (r) => r.rowCount),
+      defer('COMMIT', [], (r) => r.rowCount),
+    ]);
+    assert.ok(err instanceof PipelineError);
+    assert.deepEqual(
+      err.results.map((slot) => slot.status),
+      ['ok', 'ok', 'error'],
+    );
+    assert.ok(slotError(err, 2) instanceof TransactionOutcomeUnknownError, 'the COMMIT may have committed');
+  });
+
+  it('keeps the errors the server answered with', async () => {
+    const { pool, releases } = failingPool(() =>
+      Object.assign(new Error('duplicate key'), { code: '23505', severity: 'ERROR' }),
+    );
+    const err = await run(pool, [defer('INSERT INTO a VALUES (1)', [], (r) => r.rowCount)]);
+    assert.ok(err instanceof PipelineError);
+    assert.ok(slotError(err, 0) instanceof UniqueConstraintError);
+    assert.deepEqual(releases, [undefined], 'a connection the server answered on is kept');
+  });
+
+  it('keeps E004 for a connection error the server answered with an ERROR', async () => {
+    const { pool } = failingPool(() =>
+      Object.assign(new Error('prepared statement "t_1" does not exist'), { code: '26000', severity: 'ERROR' }),
+    );
+    const err = await run(pool, [defer('SELECT 1', [], (r) => r.rows)]);
+    assert.ok(err instanceof PipelineError);
+    const answered = slotError(err, 0);
+    assert.ok(answered instanceof ConnectionError && !(answered instanceof TransactionOutcomeUnknownError));
   });
 });

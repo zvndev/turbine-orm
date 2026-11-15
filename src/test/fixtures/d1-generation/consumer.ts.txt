@@ -1,0 +1,111 @@
+import type { D1Database } from '@cloudflare/workers-types';
+import type { D1DatabaseBinding } from 'turbine-orm/d1';
+import { turbine, type TurbineClient, type UserWithPosts } from './generated/index.js';
+
+function check(value: unknown, message: string): asserts value { if (!value) throw new Error(message); }
+function same(actual: unknown, expected: unknown, message: string) { check(JSON.stringify(actual) === JSON.stringify(expected), `${message}: ${JSON.stringify(actual)}`); }
+async function refused(action: () => unknown, pattern: RegExp) {
+  try { await action(); } catch (error) { check(pattern.test(String(error)), String(error)); return; }
+  throw new Error(`Expected refusal: ${pattern}`);
+}
+
+// Compile-only negative controls exercise the actual emitted declarations.
+async function admission(db: TurbineClient) {
+  // @ts-expect-error supplied binding, not a URL
+  turbine('file:local');
+  // @ts-expect-error cannot select an unknown table
+  db.missing;
+  // @ts-expect-error no session APIs
+  db.$transaction([]);
+  // @ts-expect-error no pinned session
+  db.$withSession({}, async () => 1);
+  // @ts-expect-error no PostgreSQL pipeline
+  db.pipeline([]);
+  // @ts-expect-error no LISTEN
+  db.$listen('x');
+  // @ts-expect-error no native cursor API
+  db.users.findManyStream();
+  // @ts-expect-error untyped table API must also omit cursor
+  db.table('users').findManyStreamBatches();
+  // @ts-expect-error unsupported bulk reconciliation
+  db.posts.createMany({data: [], onConflict: { target: ['id'], action: 'ignore' }});
+  // @ts-expect-error required generated create fields retained
+  db.posts.create({data: {userId: 1}});
+  // @ts-expect-error computed column never writable
+  db.pairs.create({data: {leftId: 1, rightId: 2, label: 'x', computed: 3}});
+  // @ts-expect-error D1 integer row/write policy does not admit libSQL string integers
+  db.users.create({data: {displayName: 'bad', active: true, createdAt: new Date(), largeId: '123'}});
+  // @ts-expect-error known filter fields only
+  turbine({} as D1Database, {globalFilters: {users: {absent: 1}}});
+}
+void admission;
+
+export async function run(binding: D1Database) {
+  const shape: D1DatabaseBinding = binding;
+  const db = turbine(shape, {warnOnUnlimited: false, globalFilters: {posts: {title: {not: 'hidden'}}}});
+  check(!(db instanceof Promise), 'factory must be synchronous');
+  const createdAt = new Date('2026-01-02T03:04:05.000Z');
+  const user = await db.users.create({data: {displayName: 'Ada', active: true, profile: {tags: ['a']}, createdAt, payload: new Uint8Array([0,128,255]), largeId: 42}});
+  const id: number = user.id;
+  const large: number = user.largeId;
+  const bytes: Uint8Array | null = user.payload;
+  const date: Date = user.createdAt;
+  const json: {tags: string[]} | null = user.profile;
+  check(bytes instanceof Uint8Array && date instanceof Date && user.active === true, 'native parser classes');
+  same([...bytes], [0,128,255], 'binary');
+  same(json, {tags:['a']}, 'JSON');
+  same(date.toISOString(), createdAt.toISOString(), 'date');
+  check(large === 42, 'integer row');
+  const rows = await db.posts.createMany({data: [{userId:id,title:'first'},{userId:id,title:'hidden'}], select:{title:true}});
+  const title: string = rows[0]!.title;
+  // @ts-expect-error bulk projection retains its exact result type
+  rows[0]!.userId;
+  check(title === 'first', 'typed bulk projection');
+  const [post,count] = await db.$batch([db.posts.buildCreate({data:{userId:id,title:'second'}}), db.posts.buildCount()]);
+  const postId: number = post.id;
+  const total: number = count;
+  check(postId === 3 && total === 2, 'native deferred batch sequential visibility/scope');
+  const related = await db.users.findMany({select:{displayName:true},with:{posts:{select:{title:true},orderBy:{id:'asc'}}}});
+  const name: string = related[0]!.displayName;
+  const relatedTitle: string = related[0]!.posts[0]!.title;
+  // @ts-expect-error relation projection preserves string result
+  const wrong: number = related[0]!.posts[0]!.title;
+  // @ts-expect-error root projection excludes active
+  related[0]!.active;
+  check(name === 'Ada' && relatedTitle === 'first' && related[0]!.posts.length === 2, 'native relation and global filter');
+  const legacy: UserWithPosts = (await db.users.findMany({with:{posts:true}}))[0]!;
+  check(legacy.posts.length === 2, 'legacy relation declaration');
+  await db.pairs.create({data:{leftId:4,rightId:5,label:'pair'}});
+  const pair = await db.pairs.findUnique({where:{leftId_rightId:{leftId:4,rightId:5}}});
+  check(pair?.computed === 9, 'composite selector / native computed value');
+  await db.posts.update({where:{id:postId},data:{title:'updated'}});
+  check((await db.posts.findUnique({where:{id:postId}}))?.title === 'updated', 'typed update');
+  await db.posts.delete({where:{id:postId}});
+  check(await db.posts.count() === 1, 'typed delete');
+  await refused(()=>db.$batchRaw([{sql:'INSERT INTO posts(user_id,title) VALUES(?1,?2)',params:[id,'rolled back']},{sql:'INSERT INTO users(id,display_name,active,created_at,large_id) VALUES(?1,?2,?3,?4,?5)',params:[id,'duplicate',1,createdAt,1]}]), /UNIQUE|constraint/);
+  check((await binding.prepare("SELECT count(*) AS n FROM posts WHERE title='rolled back'").first<{n:number}>())!.n === 0, 'native batch atomic rollback');
+  const second = turbine(binding,{warnOnUnlimited:false});
+  await refused(()=>db.$batch([second.posts.buildCount()]), /this facade/);
+  await refused(()=>db.rawUnsafe('SELECT ?1', Number.MAX_SAFE_INTEGER+1), /safe integers/);
+  await refused(()=>db.rawUnsafe('SELECT ?1', 2n**53n), /BigInt/);
+  const safe = await db.rawUnsafe<{v:number}>('SELECT ?1 AS v', 42n);
+  check(safe[0]!.v === 42, 'safe BigInt binding');
+  await refused(()=>db.rawUnsafe('BEGIN'), /session|Raw BEGIN|transactions/i);
+  await refused(()=>db.rawUnsafe('SELECT 1; SELECT 2'), /one prepared/);
+  const before = await db.posts.count();
+  const cancelled = new AbortController(); cancelled.abort(new Error('cancel before prepare'));
+  await refused(()=>db.$batchRaw([{sql:'DELETE FROM posts'}],{signal:cancelled.signal}), /cancel before prepare/);
+  check(await db.posts.count() === before, 'cancel no side effect');
+  await second.disconnect();
+  const held = db.posts;
+  await db.disconnect();
+  await refused(()=>held.count(), /disconnected/);
+  await refused(()=>db.$batch([db.posts.buildCount()]), /disconnected/);
+  check((await binding.prepare('SELECT 1 AS n').first<{n:number}>())!.n === 1, 'caller binding still alive');
+  return {ok:true,groups:17};
+}
+
+export default { async fetch(_request: Request, env: {DB:D1Database}) {
+  try { return Response.json(await run(env.DB)); }
+  catch(error) {return new Response(String(error instanceof Error ? error.stack : error),{status:500});}
+} };

@@ -1,0 +1,146 @@
+{
+  "tables": {
+    "notes": {
+      "name": "notes",
+      "columns": [
+        {
+          "name": "id",
+          "field": "id",
+          "dialectType": "int",
+          "pgType": "int",
+          "tsType": "number",
+          "nullable": false,
+          "hasDefault": false,
+          "isGenerated": false,
+          "isArray": false,
+          "pgArrayType": "text[]"
+        },
+        {
+          "name": "body",
+          "field": "body",
+          "dialectType": "varchar",
+          "pgType": "varchar",
+          "tsType": "string | null",
+          "nullable": true,
+          "hasDefault": true,
+          "isGenerated": false,
+          "isArray": false,
+          "pgArrayType": "text[]",
+          "maxLength": 30
+        }
+      ],
+      "columnMap": {
+        "id": "id",
+        "body": "body"
+      },
+      "reverseColumnMap": {
+        "id": "id",
+        "body": "body"
+      },
+      "dateColumns": [],
+      "dialectTypes": {
+        "id": "int",
+        "body": "varchar"
+      },
+      "pgTypes": {
+        "id": "int",
+        "body": "varchar"
+      },
+      "allColumns": ["id", "body"],
+      "primaryKey": ["id"],
+      "uniqueColumns": [],
+      "relations": {},
+      "indexes": []
+    },
+    "tickets": {
+      "name": "tickets",
+      "columns": [
+        {
+          "name": "id",
+          "field": "id",
+          "dialectType": "int",
+          "pgType": "int",
+          "tsType": "number",
+          "nullable": false,
+          "hasDefault": true,
+          "isGenerated": true,
+          "isArray": false,
+          "pgArrayType": "text[]"
+        },
+        {
+          "name": "status",
+          "field": "status",
+          "dialectType": "enum",
+          "pgType": "enum",
+          "tsType": "string",
+          "nullable": false,
+          "hasDefault": false,
+          "isGenerated": false,
+          "isArray": false,
+          "pgArrayType": "text[]",
+          "maxLength": 4
+        },
+        {
+          "name": "priority",
+          "field": "priority",
+          "dialectType": "enum",
+          "pgType": "enum",
+          "tsType": "string | null",
+          "nullable": true,
+          "hasDefault": true,
+          "isGenerated": false,
+          "isArray": false,
+          "pgArrayType": "text[]",
+          "maxLength": 4
+        },
+        {
+          "name": "note",
+          "field": "note",
+          "dialectType": "varchar",
+          "pgType": "varchar",
+          "tsType": "string | null",
+          "nullable": true,
+          "hasDefault": true,
+          "isGenerated": false,
+          "isArray": false,
+          "pgArrayType": "text[]",
+          "maxLength": 30
+        }
+      ],
+      "columnMap": {
+        "id": "id",
+        "status": "status",
+        "priority": "priority",
+        "note": "note"
+      },
+      "reverseColumnMap": {
+        "id": "id",
+        "status": "status",
+        "priority": "priority",
+        "note": "note"
+      },
+      "dateColumns": [],
+      "dialectTypes": {
+        "id": "int",
+        "status": "enum",
+        "priority": "enum",
+        "note": "varchar"
+      },
+      "pgTypes": {
+        "id": "int",
+        "status": "enum",
+        "priority": "enum",
+        "note": "varchar"
+      },
+      "allColumns": ["id", "status", "priority", "note"],
+      "primaryKey": ["id"],
+      "uniqueColumns": [],
+      "relations": {},
+      "indexes": []
+    }
+  },
+  "enums": {
+    "tickets.status": ["new", "done"],
+    "tickets.priority": ["low", "high"]
+  }
+}

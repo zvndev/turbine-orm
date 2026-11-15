@@ -173,7 +173,7 @@ type AwaitedOf<P> = P extends Promise<infer V> ? V : never;
 declare const users: QueryInterface<User, UserRelations>;
 
 // --- Plain call: no with ---
-// Note: we pass `<{}>` explicitly here because `ReturnType<typeof fn>` on a
+// Pass `<{}>` explicitly here because `ReturnType<typeof fn>` on a
 // generic function substitutes the constraint (`TypedWithClause<R>`), not the
 // default (`{}`). In real user code, calling `users.findMany()` without type
 // args does infer `W = {}` correctly, that path is exercised in section 9.
@@ -220,13 +220,13 @@ assertTrue<Equals<UniqOrThrowRes['posts'], Post[]>>();
 //    write, explicit generics would be a regression in ergonomics.
 // ---------------------------------------------------------------------------
 
-// We call the method and capture the inferred return type via `typeof`.
+// Call the method and capture the inferred return type via `typeof`.
 // TypeScript evaluates this at compile time even though it's in a type
 // position, no runtime invocation happens because the expression is
 // guarded by `false`.
 async function callSiteInference() {
   // Using `0 as 1` guard so the body is unreachable at runtime but TS still
-  // typechecks the calls for us.
+  // typechecks the calls.
   if (false as boolean) {
     // Plain call, no with. Should collapse to plain `User`.
     const plain = await users.findMany();

@@ -40,6 +40,7 @@ import { RAW_QUERY_MODEL } from '../query-events.js';
 import type { SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, turbineSqlite } from '../sqlite.js';
 import { skipGate } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 // ---------------------------------------------------------------------------
 // In-memory tracer: the method shapes of @opentelemetry/api, on AsyncLocalStorage
@@ -304,7 +305,7 @@ const sqliteGate = skipGate(!nodeSqlite, 'turbine-orm/sqlite requires node:sqlit
 type ClientExtra = { sqlComment?: SqlCommentOptions };
 
 async function openSqlite(extra: ClientExtra = {}): Promise<Opened> {
-  const sqlite = new (nodeSqlite as NonNullable<typeof nodeSqlite>).DatabaseSync(':memory:');
+  const sqlite = closeSqliteAfter(new (nodeSqlite as NonNullable<typeof nodeSqlite>).DatabaseSync(':memory:'));
   sqlite.exec(`
     CREATE TABLE otel_owner (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
     CREATE TABLE otel_item (id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL REFERENCES otel_owner(id), label TEXT);

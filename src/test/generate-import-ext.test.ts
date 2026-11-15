@@ -1,5 +1,5 @@
 /**
- * turbine-orm: importExtension generator option (F3)
+ * turbine-orm: importExtension generator option
  *
  * Unit tests (no DB) for the sibling-import extension: the resolved extension
  * threaded into `generateIndex`, plus the tsconfig-aware `'auto'` resolution

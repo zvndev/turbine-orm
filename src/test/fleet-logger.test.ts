@@ -7,7 +7,7 @@
  *   logger and asserts the code and the level.
  * - The default logger's console output is the text Turbine printed before the
  *   logger existed. The `console` strings below were captured by running these
- *   same triggers against the build before this change, so they are a snapshot,
+ *   same triggers against a build without fleet logging, so they are a snapshot,
  *   not a transcription. Three deliberate differences: a `$listen` loss it will
  *   retry is now `console.warn` (level `warn`) rather than `console.error`; the
  *   sampled cache-mismatch line now carries the `[turbine]` prefix like every
@@ -37,6 +37,7 @@ import {
   type TurbineLogger,
   type TurbineLogLevel,
 } from '../logger.js';
+import { introspectMysqlWith } from '../mysql.js';
 import { applyPowdbLinks, powqlSchemaDDL } from '../powdb.js';
 import { introspectPowdbDatabase } from '../powdb-introspect.js';
 import { createPrismaCompatClient } from '../prisma-compat.js';
@@ -55,6 +56,7 @@ const MODULES: FleetModules = {
   powqlSchemaDDL,
   applyPowdbLinks,
   introspectPowdbDatabase,
+  introspectMysqlWith,
   buildRelationsFromForeignKeys,
   generateTypes,
   warnParserOverwrite,
@@ -164,6 +166,7 @@ const EXPECT: Record<TurbineLogCode, Expectation> = {
   pipeline: { level: 'debug', console: '[turbine] Pipeline: 1 queries, items.findMany' },
   'raw-sql': { level: 'debug', console: '[turbine] Raw SQL: SELECT $1...' },
   'transaction-committed': { level: 'debug', console: '[turbine] Transaction committed' },
+  'transaction-outcome-unknown': { level: 'debug', integration: 'neon-ws-lifecycle.test.ts' },
   'transaction-rolled-back': { level: 'debug', console: '[turbine] Transaction rolled back' },
   listen: { level: 'debug', console: '[turbine] LISTEN "fleet_chan"' },
   notify: { level: 'debug', console: '[turbine] NOTIFY fleet_chan' },
@@ -244,6 +247,11 @@ const EXPECT: Record<TurbineLogCode, Expectation> = {
       '[turbine] Relation "posts" on table "users" shadows a column field of the same name, omitting it from the generated types. Rename the relation (or the column) to expose it.',
   },
   'introspect-cross-schema-fk': { level: 'warn', integration: 'fleet-logger.integration.test.ts' },
+  'introspect-enum-labels-unrecoverable': {
+    level: 'warn',
+    console:
+      '[turbine] MySQL introspection: the ENUM labels of "tickets.mood" may hold characters outside the BMP, which the MySQL catalog reports as "?" (a label that really contains "?" reads the same), so the column is typed as string instead of a literal union. For exact literal types, declare its labels explicitly: with the CLI, a `columnTypes` entry in turbine.config.ts (`columnTypes: { "tickets.mood": "\'a\' | \'b\'" }`); in code, an `enums` entry on the introspected metadata before calling generate() (`schema.enums["tickets.mood"] = [\'a\', \'b\']`). The stored labels and row data are unaffected.',
+  },
 };
 
 const CONSOLE_METHOD: Record<TurbineLogLevel, 'log' | 'info' | 'warn' | 'error'> = {

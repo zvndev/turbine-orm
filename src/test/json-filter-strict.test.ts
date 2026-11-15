@@ -5,7 +5,7 @@
  * operator the builder did not recognize compiled to NO predicate at all, so
  * the query returned every row of the table. `isJsonFilter` fires on the
  * presence of `path`, and `buildJsonFilterClauses` only emitted a clause per
- * key it knew, so an unknown key produced an empty clause list that simply
+ * key it knew, so an unknown key produced an empty clause list that
  * disappeared. Inside an `AND` it dropped that conjunct, which widens a tenant
  * scope written that way to the whole table. The same typo on a scalar column
  * had always thrown.

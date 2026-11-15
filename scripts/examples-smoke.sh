@@ -11,7 +11,8 @@
 # None of it was caught, because nothing ran them. An example that does not run
 # is worse than no example: it is the first thing a new user tries.
 #
-# WHAT IT DOES NOT DO. It does not RUN the examples. Four of them target a
+# WHAT IT DOES NOT DO. It does not RUN the examples, and it does not check the
+# directories in NOT_PROJECTS below (each names what does). Four projects target a
 # runtime this job has no business booting (Next.js, Cloudflare Workers, an edge
 # function), and a smoke test that needs `wrangler` is a smoke test that gets
 # disabled. push -> generate -> `tsc --noEmit` is the part that was actually
@@ -50,8 +51,56 @@ db_url_for() {
   ' "$1"
 }
 
+# Directories under examples/ that are NOT standalone push -> generate -> tsc
+# projects. Each is source copied into a consumer by the README, or a fixture
+# that a named test or harness drives against its own engine, so this job has
+# nothing to push or generate for it. The list is exact in both directions: a
+# directory with no package.json that is not named here fails the job (a new
+# example must either ship a package.json or be added here with the thing that
+# runs it), a listed directory that gains a package.json fails until it is
+# removed, and a listed name with no directory fails as stale.
+NOT_PROJECTS=(
+  # D1 source; src/test/d1-durable-replay.test.ts runs it (unit-tests).
+  d1-durable-replay
+  # MySQL source; src/test/mysql-durable-replay.test.ts runs it.
+  mysql-durable-replay
+  # Per-engine app files; tooling/lifecycle-examples/verify.mjs installs the
+  # tarball and runs them (sqlite-migrations, mysql-integration).
+  native-lifecycles
+  # PostgreSQL source; src/test/live-query-hub-pg.test.ts (integration-tests)
+  # and src/test/fixtures/live-query-hub-pg/native-run.mjs (pgbouncer-integration).
+  notification-live-query
+  # PostgreSQL source; src/test/postgres-postgres-durable-replay.test.ts (integration-tests).
+  postgres-durable-replay
+  # PostgreSQL + MySQL source; src/test/pg-mysql-relay.test.ts.
+  postgres-mysql-relay
+  # SQLite source; src/test/sqlite-durable-replay.test.ts.
+  sqlite-durable-replay
+  # SQLite generation source; src/test/generate-sqlite-consumer.test.ts.
+  sqlite-generated
+  # README-only walkthrough of `turbine init --engine sqlite`; the CLI project
+  # suites in sqlite-migrations run the same commands.
+  sqlite-lifecycle
+)
+
+is_not_project() {
+  local candidate
+  for candidate in "${NOT_PROJECTS[@]}"; do
+    [ "$candidate" = "$1" ] && return 0
+  done
+  return 1
+}
+
 failed=()
 checked=0
+not_projects=0
+
+for listed in "${NOT_PROJECTS[@]}"; do
+  if [ ! -d "$ROOT/examples/$listed" ]; then
+    echo "  x NOT_PROJECTS names examples/$listed, which does not exist"
+    failed+=("$listed: stale NOT_PROJECTS entry")
+  fi
+done
 
 for dir in "$ROOT"/examples/*/; do
   name="$(basename "$dir")"
@@ -59,6 +108,21 @@ for dir in "$ROOT"/examples/*/; do
   echo "=============================================================="
   echo "  $name"
   echo "=============================================================="
+
+  if is_not_project "$name"; then
+    if [ -f "$dir/package.json" ]; then
+      echo "  x listed in NOT_PROJECTS but has a package.json; remove it from the list"
+      failed+=("$name: has package.json but is listed in NOT_PROJECTS")
+    else
+      echo "  -- not a standalone project (NOT_PROJECTS); driven elsewhere"
+      not_projects=$((not_projects + 1))
+    fi
+    continue
+  fi
+  if [ ! -f "$dir/package.json" ]; then
+    echo "  x no package.json, and not listed in NOT_PROJECTS"
+    failed+=("$name: no package.json"); continue
+  fi
 
   db="ex_$(printf '%s' "$name" | tr -c 'a-z0-9' '_')"
   psql "$ADMIN_URL" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS $db" >/dev/null
@@ -109,14 +173,14 @@ echo ""
 # Anti-vacuous: a glob that matched nothing, or a loop that `continue`d every
 # example, would otherwise report success.
 if [ "$checked" -eq 0 ] && [ "${#failed[@]}" -eq 0 ]; then
-  echo "examples-smoke: checked NOTHING; the examples/ glob matched no directory" >&2
+  echo "examples-smoke: checked NOTHING; no examples/ directory was a project to push and typecheck" >&2
   exit 1
 fi
 
 if [ "${#failed[@]}" -ne 0 ]; then
-  echo "examples-smoke: ${#failed[@]} failed, $checked passed" >&2
+  echo "examples-smoke: ${#failed[@]} failed, $checked passed, $not_projects not projects" >&2
   for f in "${failed[@]}"; do echo "  - $f" >&2; done
   exit 1
 fi
 
-echo "examples-smoke: all $checked examples push, generate and typecheck"
+echo "examples-smoke: all $checked examples push, generate and typecheck ($not_projects listed as not projects)"

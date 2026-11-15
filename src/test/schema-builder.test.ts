@@ -807,7 +807,7 @@ describe('edge cases', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Composite primary keys (TASK-3.1)
+// Composite primary keys
 // ---------------------------------------------------------------------------
 
 describe('composite primary keys', () => {
@@ -885,7 +885,7 @@ describe('composite primary keys', () => {
 });
 
 // ---------------------------------------------------------------------------
-// camelCase table name normalization (TASK-3.2)
+// camelCase table name normalization
 // ---------------------------------------------------------------------------
 
 describe('camelCase table name normalization', () => {

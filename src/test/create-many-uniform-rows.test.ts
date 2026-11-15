@@ -46,6 +46,7 @@ import { introspectMysqlWith, MysqlPool, mysqlDialect, turbineMysql } from '../m
 import type { SchemaMetadata } from '../schema.js';
 import { sqliteDialect, turbineSqlite } from '../sqlite.js';
 import { makeQuery, mockTable, skipGate } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 // ---------------------------------------------------------------------------
 // Tier 1, build-only
@@ -288,7 +289,7 @@ describe('createMany uniformity live, sqlite', () => {
   sqliteGate.it('refuses both reverse shapes and writes nothing', async () => {
     const { introspectSqliteDatabase } = await import('../sqlite.js');
     const { DatabaseSync } = createRequire(process.cwd())('node:sqlite');
-    const db = new DatabaseSync(':memory:');
+    const db = closeSqliteAfter(new DatabaseSync(':memory:'));
     db.exec(probeDdl('INTEGER PRIMARY KEY AUTOINCREMENT', 'TEXT'));
     const client = turbineSqlite(db, introspectSqliteDatabase(db));
     try {

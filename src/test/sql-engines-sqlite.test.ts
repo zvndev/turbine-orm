@@ -34,6 +34,20 @@ const HAVE_NODE_SQLITE = (() => {
 })();
 
 const { it } = skipGate(!HAVE_NODE_SQLITE, 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)');
+const HAVE_TRANSACTION_STATE = (() => {
+  if (!HAVE_NODE_SQLITE) return false;
+  const { DatabaseSync } = createRequire(process.cwd())('node:sqlite') as typeof import('node:sqlite');
+  const probe = new DatabaseSync(':memory:');
+  try {
+    return typeof probe.isTransaction === 'boolean';
+  } finally {
+    probe.close();
+  }
+})();
+const { it: nativeIt } = skipGate(
+  !HAVE_TRANSACTION_STATE,
+  'requires node:sqlite native streaming with DatabaseSync.isTransaction (Node 22.x >= 22.16, or Node >= 24)',
+);
 
 const SCHEMA = schemaDefToMetadata(
   defineSchema({
@@ -263,18 +277,34 @@ describe('waiting is bounded and leaves the client usable', () => {
     await db.disconnect();
   });
 
-  it('a checkout that opens no transaction (a stream) does not block other callers', async () => {
+  nativeIt('a native stream keeps other callers queued until its iterator closes', async () => {
     const { db } = await open();
-    for (const label of ['a', 'b', 'c']) await db.table('tags').create({ data: { label } });
-    const seen: string[] = [];
-    for await (const row of db.table('tags').findManyStream({ orderBy: { id: 'asc' }, batchSize: 1 })) {
-      seen.push((row as { label: string }).label);
-      // A write through the client while the stream holds its checkout.
-      await db.table('tags').update({ where: { id: (row as { id: number }).id }, data: { label: `${seen.at(-1)}!` } });
+    const stream = db.table('tags').findManyStream({ orderBy: { id: 'asc' }, batchSize: 1 });
+    let write: Promise<unknown> | undefined;
+    try {
+      for (const label of ['a', 'b', 'c']) await db.table('tags').create({ data: { label } });
+      const first = await stream.next();
+      assert.equal(first.done, false);
+      assert.equal(first.value!.label, 'a');
+      let settled = false;
+      write = db
+        .table('tags')
+        .update({ where: { id: first.value!.id }, data: { label: 'a!' } })
+        .then((row) => {
+          settled = true;
+          return row;
+        });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(settled, false, 'the write must not run through an active iterator on the same handle');
+      await stream.return(undefined);
+      await write;
+      assert.equal(settled, true);
+      assert.deepEqual(await labels(db), ['a!', 'b', 'c']);
+    } finally {
+      await stream.return(undefined);
+      await write;
+      await db.disconnect();
     }
-    assert.deepEqual(seen, ['a', 'b', 'c']);
-    assert.deepEqual(await labels(db), ['a!', 'b!', 'c!']);
-    await db.disconnect();
   });
 });
 

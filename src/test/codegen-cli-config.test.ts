@@ -16,6 +16,7 @@ import { join } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 import { firstNonEmpty, resolveConfig } from '../cli/config.js';
 import { bootstrapCliConfig, loadDotEnvForCli, parseArgs } from '../cli/index.js';
+import { assertLibsqlProjectConfigOptions } from '../cli/libsql-project-config.js';
 import { resolveImportExtension } from '../generate.js';
 
 const cleanups: Array<() => void> = [];
@@ -51,6 +52,22 @@ describe('firstNonEmpty', () => {
 });
 
 describe('resolveConfig: DATABASE_URL precedence', () => {
+  it('rejects invalid integer options in either input even when a valid value masks them', () => {
+    for (const invalid of [null, 'true', 0, [], {}]) {
+      for (const valid of [true, false]) {
+        for (const [fileConfig, overrides] of [
+          [{ exactNativeIntegers: invalid }, { exactNativeIntegers: valid }],
+          [{ exactNativeIntegers: valid }, { exactNativeIntegers: invalid }],
+        ]) {
+          assert.throws(() => resolveConfig(fileConfig as never, overrides as never), {
+            name: 'TypeError',
+            message: 'exactNativeIntegers must be a boolean.',
+          });
+        }
+      }
+    }
+  });
+
   it('an empty DATABASE_URL does not beat a literal url in the config file', async () => {
     await withDatabaseUrl('', () => {
       const config = resolveConfig({ url: 'postgres://from-file/db' }, {});
@@ -171,5 +188,36 @@ describe('--import-ext ts', () => {
     assert.deepEqual(resolveImportExtension('./generated/turbine', 'ts'), { ext: '.ts', mode: 'ts' });
     assert.notEqual(resolveImportExtension('./generated/turbine', 'auto').ext, '.ts');
     assert.equal(resolveImportExtension('./generated/turbine', 'js').ext, '.js');
+  });
+});
+
+describe('resolveConfig: the d1 block', () => {
+  const libsqlFile = { engine: 'libsql', url: 'file:./app.sqlite' } as const;
+
+  it('is unset in a resolved config that never set it, so a libSQL project is accepted', () => {
+    const config = resolveConfig(libsqlFile, {});
+    assert.equal(config.d1, undefined);
+    assert.doesNotThrow(() => assertLibsqlProjectConfigOptions(config));
+  });
+
+  it('an unset key of any name is not a libSQL setting, and a set unknown one still is', () => {
+    assert.doesNotThrow(() => assertLibsqlProjectConfigOptions({ url: 'file:./app.sqlite', later: undefined }));
+    assert.throws(() => assertLibsqlProjectConfigOptions({ url: 'file:./app.sqlite', later: 1 }), {
+      code: 'TURBINE_E003',
+      message: /Unsupported local libSQL option: later/,
+    });
+  });
+
+  it('is still refused by a libSQL project when it is set', () => {
+    const d1 = { binding: 'DB' } as never;
+    assert.throws(() => assertLibsqlProjectConfigOptions({ ...resolveConfig(libsqlFile, {}), d1 }), {
+      code: 'TURBINE_E003',
+      message: /Unsupported local libSQL option: d1/,
+    });
+  });
+
+  it('is carried through when the config file sets it', () => {
+    const d1 = { binding: 'DB' } as never;
+    assert.equal(resolveConfig({ engine: 'postgresql', url: 'postgres://h/db', d1 }, {}).d1, d1);
   });
 });

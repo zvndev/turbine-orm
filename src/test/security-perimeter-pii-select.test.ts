@@ -33,6 +33,7 @@ import { piiSelectRefusedMessage } from '../query/relations.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { introspectSqliteDatabase, turbineSqlite } from '../sqlite.js';
 import { makeQuery, mockTable } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 // ---------------------------------------------------------------------------
 // Fixture: users(id, name, email[PII], ssn[PII]) -> posts(id, author_id, title, secret[PII]) -> comments
@@ -333,7 +334,7 @@ INSERT INTO posts VALUES (1, 'a@x', 'p1'), (2, 'a@x', 'p2'), (3, 'b@x', 'p3');
 `;
 
 function taggedDb(): { db: DatabaseSyncType; meta: SchemaMetadata } {
-  const db = new DatabaseSync!(':memory:');
+  const db = closeSqliteAfter(new DatabaseSync!(':memory:'));
   db.exec(SCHEMA_SQL);
   const meta = introspectSqliteDatabase(db);
   // The correlation key is PII on BOTH sides: users.email (parent key) and posts.author_email (child key).

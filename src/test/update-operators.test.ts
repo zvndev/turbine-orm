@@ -255,9 +255,9 @@ testFn('update operators: integration', () => {
   // Without DATABASE_URL these tests register as skipped (visible in the
   // reporter summary) and the before/after hooks become no-ops.
   const { it, before, after } = skipGate(SKIP, 'DATABASE_URL not set');
-  // A post we create in `before` and mutate across tests.
+  // A post created in `before` and mutated across tests.
   let postId: number;
-  // A user ID we borrow for FK purposes
+  // A user ID used for FK references
   let userId: number;
   let orgId: number;
 
@@ -272,7 +272,7 @@ testFn('update operators: integration', () => {
     userId = user.id as number;
     orgId = user.orgId as number;
 
-    // Create an isolated post we own for this test suite
+    // Create an isolated post for this test suite.
     const post = (await db.table('posts').create({
       data: {
         userId,
@@ -306,7 +306,7 @@ testFn('update operators: integration', () => {
     })) as Record<string, unknown>;
 
     assert.equal(updated.viewCount, startVc + 7);
-    // RETURNING * should give us the new value
+    // RETURNING * should include the new value.
     const verify = (await db.table('posts').findUnique({ where: { id: postId } })) as Record<string, unknown>;
     assert.equal(verify.viewCount, startVc + 7);
   });
@@ -333,7 +333,7 @@ testFn('update operators: integration', () => {
   });
 
   it('updateMany: increments across multiple rows', async () => {
-    // Create two more posts so we can updateMany them
+    // Create two more posts for updateMany.
     const a = (await db.table('posts').create({
       data: {
         userId,

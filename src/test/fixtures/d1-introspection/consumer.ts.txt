@@ -1,0 +1,91 @@
+import { turbineD1, type D1DatabaseBinding } from 'turbine-orm/d1';
+import { introspectD1 } from 'turbine-orm/d1/introspect';
+import type { D1Database } from '@cloudflare/workers-types';
+import type { TurbineClient } from './generated/index.js';
+import { SCHEMA } from './generated/metadata.js';
+function officialBinding(binding: D1Database) {
+  const structural: D1DatabaseBinding = binding;
+  return introspectD1(structural, { schema: 'main' });
+}
+void officialBinding;
+function equal(actual: unknown, expected: unknown, message: string): void {
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) throw new Error(`${message}: ${JSON.stringify(actual)}`);
+}
+async function refuses(check: () => unknown, pattern: RegExp): Promise<void> {
+  try { await check(); } catch (error) { if (pattern.test(String(error))) return; throw error; }
+  throw new Error('Expected explicit refusal');
+}
+const prototypeName = '__proto__';
+export async function run(binding: D1DatabaseBinding) {
+  const fresh = await introspectD1(binding, { include: Object.keys(SCHEMA.tables), keepColumnNames: true, logger: {} });
+  equal(fresh.tables.composite_parents!.primaryKey, SCHEMA.tables.composite_parents!.primaryKey, 'live composite key');
+  equal(fresh.tables.parents!.relations.profile!.type, 'hasOne', 'live cardinality');
+  const db = turbineD1<TurbineClient>(binding, SCHEMA, { logger: {}, warnOnUnlimited: false });
+  try {
+    const parent = await db.parents.create({ data: {} });
+    const parentId: number = parent.id;
+    await db.profiles.create({ data: { parent_id: parentId, label: 'profile' } });
+    const parents = await db.parents.findMany({ with: { profile: true } });
+    const label: string | undefined = parents[0]!.profile?.label;
+    equal(label, 'profile', 'to-one relation');
+    const composite = await db.compositeParents.create({ data: { tenant_id: 11, code: 'north' } });
+    const tenant: number = composite.tenant_id;
+    const byComposite = await db.compositeParents.findUnique({ where: { tenant_id_code: { tenant_id: tenant, code: composite.code } } });
+    equal(byComposite?.code, 'north', 'generated composite selector');
+    await db.compositeLinks.create({ data: { tenant_id: tenant, code: composite.code } });
+    const linked = await db.compositeLinks.findFirst({ with: { compositeParent: true } });
+    equal(linked?.compositeParent?.code, 'north', 'composite belongsTo');
+    equal(linked?.compositeParent?.tenant_id, 11, 'composite belongsTo order');
+    const generated = await db.generatedRecords.create({ data: { quantity: 4 } });
+    equal(generated.virtual_total, 8, 'virtual computed'); equal(generated.stored_total, 12, 'stored computed');
+    const defaults = await db.defaultKeys.create({ data: {} });
+    const count: number = defaults.count;
+    equal([defaults.slug, count, defaults.optional_text], ['new', 0, null], 'native defaults');
+    const numeric = await db.numberRecords.create({ data: { large_value: 9007199254740991, detail: { catalog: true }, stamped_at: new Date('2026-02-03T00:00:00Z') } });
+    const integer: number = numeric.large_value;
+    equal(integer, Number.MAX_SAFE_INTEGER, 'D1 number integer');
+    equal(numeric.enabled, true, 'boolean decoder'); equal(numeric.detail, { catalog: true }, 'JSON decoder');
+    if (!(numeric.stamped_at instanceof Date)) throw new Error('Date decoder missing');
+    const inserted = await db.prototypeRows.create({ data: { [prototypeName]: 'proto', constructor: 'ctor', toString: 'text' } });
+    const selected = await db.prototypeRows.findFirst();
+    for (const row of [inserted, selected!]) {
+      if (Object.getPrototypeOf(row) !== Object.prototype || !Object.hasOwn(row, prototypeName)) throw new Error('prototype key lost '+JSON.stringify({keys:Object.keys(row),own:Object.hasOwn(row,prototypeName),proto:Object.getPrototypeOf(row)===Object.prototype,row,native:await binding.prepare('SELECT * FROM prototype_rows').all()}));
+      equal(row[prototypeName], 'proto', 'prototype field'); equal(row.constructor, 'ctor', 'constructor field');
+    }
+    const projected = await db.numberRecords.findMany({ select: { large_value: true } });
+    const projectedInteger: number = projected[0]!.large_value;
+    equal(projectedInteger, integer, 'projection integer');
+    if (false) {
+      // @ts-expect-error D1 integer declarations are number-valued
+      const wrongInteger: bigint = projected[0]!.large_value;
+      // @ts-expect-error projection omits enabled
+      projected[0]!.enabled;
+      // @ts-expect-error generated computed column cannot be created
+      db.generatedRecords.create({ data: { quantity: 1, virtual_total: 2 } });
+      // @ts-expect-error generated computed column cannot be updated
+      db.generatedRecords.updateMany({ where: {}, data: { stored_total: 2 } });
+      // @ts-expect-error composite key field is required
+      db.compositeParents.create({ data: { code: 'missing' } });
+      // @ts-expect-error unique-FK reverse relation is not an array
+      parents[0]!.profile?.map(() => 1);
+      void wrongInteger;
+    }
+    const unsafe = db as unknown as { generatedRecords: { create(input: unknown): Promise<unknown>; updateMany(input: unknown): Promise<unknown> } };
+    await refuses(() => unsafe.generatedRecords.create({ data: { quantity: 9, virtual_total: 99 } }), /generated/i);
+    await refuses(() => unsafe.generatedRecords.updateMany({ where: {}, data: { stored_total: 99 } }), /generated/i);
+    equal((await db.generatedRecords.findMany()).length, 1, 'computed refusal before write');
+  } finally { await db.disconnect(); }
+  // The schema-specific consumer uses the caller binding after facade shutdown.
+  const legacy = await introspectD1(binding, { include: ['parents', 'profiles'], legacyToManyUniques: true, logger: {} });
+  equal(legacy.tables.parents!.relations.profiles!.type, 'hasMany', 'cardinality opt-out');
+  const legacyDb = turbineD1(binding, legacy, { logger: {}, warnOnUnlimited: false });
+  try { equal(Array.isArray((await legacyDb.table('parents').findFirst({ with: { profiles: true } }))?.profiles), true, 'legacy runtime array'); }
+  finally { await legacyDb.disconnect(); }
+  const renamed = await introspectD1(binding, { include: ['parents', 'profiles'], relationNames: { parents: { profile: 'ownProfile' } }, logger: {} });
+  equal(Object.keys(renamed.tables), ['parents', 'profiles'], 'native include filter');
+  equal(renamed.tables.parents!.relations.ownProfile!.type, 'hasOne', 'relation rename');
+  const renamedDb = turbineD1(binding, renamed, { logger: {}, warnOnUnlimited: false });
+  try { equal(((await renamedDb.table('parents').findFirst({ with: { ownProfile: true } }))?.ownProfile as { label: string }).label, 'profile', 'renamed runtime relation'); }
+  finally { await renamedDb.disconnect(); }
+  return { ok: true };
+}

@@ -26,6 +26,7 @@ export interface FleetModules {
   powqlSchemaDDL: Any;
   applyPowdbLinks: Any;
   introspectPowdbDatabase: Any;
+  introspectMysqlWith: Any;
   buildRelationsFromForeignKeys: Any;
   generateTypes: Any;
   warnParserOverwrite: Any;
@@ -225,7 +226,7 @@ const TAKEN_USER_FIELD = (): Map<string, Set<string>> =>
   ]);
 
 /**
- * Every phase-1 code. `async` marks a line that lands after the trigger
+ * Every fleet diagnostic code. `async` marks a line that lands after the trigger
  * returns (an unawaited file read); the runner polls for it.
  */
 export const TRIGGERS: Record<string, { trigger: Trigger; async?: true }> = {
@@ -711,6 +712,44 @@ export const TRIGGERS: Record<string, { trigger: Trigger; async?: true }> = {
         { name: 'user_id', field: 'userId' },
       ]);
       m.generateTypes({ enums: {}, tables: { users, posts } }, logger ? { logger } : undefined);
+    },
+  },
+  'introspect-enum-labels-unrecoverable': {
+    trigger: async (m, logger) => {
+      // A utf8mb3-shaped catalog (`?` where a supplementary character was)
+      // on a utf8mb4 column: the labels are withheld, the column is marked,
+      // and this warning names it.
+      const exec = async (sql: string) => {
+        if (sql.includes('information_schema.TABLES')) return [{ TABLE_NAME: 'tickets' }];
+        if (sql.includes('information_schema.COLUMNS')) {
+          const col = (COLUMN_NAME: string, extra: Record<string, unknown> = {}) => ({
+            TABLE_NAME: 'tickets',
+            COLUMN_NAME,
+            DATA_TYPE: 'int',
+            COLUMN_TYPE: 'int',
+            IS_NULLABLE: 'NO',
+            COLUMN_KEY: '',
+            COLUMN_DEFAULT: null,
+            EXTRA: '',
+            CHARACTER_MAXIMUM_LENGTH: null,
+            CHARACTER_SET_NAME: null,
+            COLLATION_NAME: null,
+            GENERATION_EXPRESSION: '',
+            ...extra,
+          });
+          return [
+            col('id', { COLUMN_KEY: 'PRI' }),
+            col('mood', {
+              DATA_TYPE: 'enum',
+              COLUMN_TYPE: "enum('雪?')",
+              CHARACTER_SET_NAME: 'utf8mb4',
+              COLLATION_NAME: 'utf8mb4_0900_ai_ci',
+            }),
+          ];
+        }
+        return [];
+      };
+      await m.introspectMysqlWith(exec, 'app', logger ? { logger } : {});
     },
   },
 };

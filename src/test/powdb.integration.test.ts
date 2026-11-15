@@ -461,7 +461,7 @@ describe('powdb integration (embedded)', () => {
   });
 
   // -------------------------------------------------------------------------
-  // Adversarial-review regressions: stray ROLLBACK after a failed BEGIN must
+  // Transaction regressions: stray ROLLBACK after a failed BEGIN must
   // never touch the OTHER transaction on the single shared engine handle, and
   // cross-pool nesting must not defeat the re-entrancy marker.
   // -------------------------------------------------------------------------
@@ -604,7 +604,7 @@ describe('powdb integration (embedded)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Phase B (v0.23.0), auto/server-generated PKs, manyToMany reads + filters,
+// v0.23.0: auto/server-generated PKs, manyToMany reads + filters,
 // nested writes, composite-key upsert. Own schema (auto-int PKs + a junction).
 // These exercise the live engine; the relation-filter cases also guard the
 // PowDB subquery-result-cache bug (Turbine resolves filters to literal lists).
@@ -841,7 +841,7 @@ describe('powdb integration: Phase B', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F3 / B1: native `json` document round-trip on the EMBEDDED transport
+// Native `json` document round-trip on the EMBEDDED transport
 //
 // The embedded addon exposes only the legacy string wire (its rows are
 // `string[][]`), so the acceptance here is: json document CONTENTS are lossless
@@ -853,7 +853,7 @@ describe('powdb integration: Phase B', () => {
 // Writes go through raw PowQL carrying a PowdbJsonParam (the embedded pool
 // materializes it via encodePowqlLiteral); the read path exercises the real
 // findMany -> coerceValue json parsing. The create()/findMany json write path
-// (param() constructing PowdbJsonParam for a json column) lands with F1.
+// (param() constructing PowdbJsonParam for a json column) is tested separately.
 // ---------------------------------------------------------------------------
 
 const docSchema: SchemaMetadata = {
@@ -943,7 +943,7 @@ describe('powdb integration (embedded): json document round-trip', () => {
       const rows = await db.table('doc').findMany({ orderBy: { id: 'asc' } });
       const byId = Object.fromEntries(rows.map((r: { id: string; s: unknown }) => [r.id, r.s]));
       // The legacy string wire collapsed both to null (the coerceValue wart);
-      // the native typed wire (F1) keeps the literal string "null" a string and
+      // the native typed wire keeps the literal string "null" a string and
       // an absent value null, so the two are distinguishable, matching the
       // networked native transport.
       assert.equal(byId.s1, 'null');
@@ -953,7 +953,7 @@ describe('powdb integration (embedded): json document round-trip', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F4a: doc-field expression index DDL. The real embedded engine must ACCEPT
+// Doc-field expression index DDL. The real embedded engine must ACCEPT
 // the `alter T add index (.data->"seg")` statements powqlSchemaDDL emits, and
 // an index-backed path query returns the right rows (an index must never
 // change results). Doc index DDL is executed via powqlSchemaDDL(db.raw).
@@ -995,7 +995,7 @@ describe('powdb integration (embedded): doc-field expression index DDL', () => {
       // The real engine ACCEPTS every statement (a malformed path would throw).
       for (const stmt of ddl) await db.rawUnsafe(stmt);
 
-      // Seed docs and query over the indexed path via raw PowQL (F1's ORM-level
+      // Seed docs and query over the indexed path via raw PowQL (the ORM-level
       // JsonFilter lands separately; the index must not alter results either way).
       await db.raw`insert doc { id := ${'a'}, data := ${new PowdbJsonParam({ ns: { value: 7 }, ext: 'x1' })} } returning`;
       await db.raw`insert doc { id := ${'b'}, data := ${new PowdbJsonParam({ ns: { value: 9 }, ext: 'x2' })} } returning`;
@@ -1032,7 +1032,7 @@ describe('powdb integration (embedded): doc-field expression index DDL', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F1 / F2: JSON path filters, ordering, and grouped aggregates against the real
+// JSON path filters, ordering, and grouped aggregates against the real
 // embedded 0.13 engine. Writes go through the real create() path (param() wraps
 // the object in a PowdbJsonParam); reads/filters/orders/groups exercise the full
 // PowqlInterface emission end-to-end.
@@ -1252,7 +1252,7 @@ describe('powdb integration (embedded): F2 JSON groupBy', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F4b: describe-based introspection. Introspect a live embedded database via
+// Describe-based introspection. Introspect a live embedded database via
 // `introspectPowdbDatabase(exec)` (exec built from the client's `raw` tagged
 // template) and assert the SchemaMetadata shape, then prove a generated-style
 // workflow (introspect → open a fresh client on the introspected metadata →
@@ -1357,7 +1357,7 @@ describe('powdb integration (embedded): describe-based introspection', () => {
     try {
       // 1) The introspected metadata provisions the schema (json column + PK).
       for (const stmt of powqlSchemaDDL(meta)) await db2.rawUnsafe(stmt);
-      // 2) Seed via raw PowQL (the ORM-level json write path lands with F1); the
+      // 2) Seed via raw PowQL (the ORM-level json write path is tested separately); the
       //    json column rides in a PowdbJsonParam the embedded pool materializes.
       await db2.raw`insert widget { id := ${'w1'}, label := ${'Ada'}, qty := ${5}, score := ${1.5}, active := ${true}, data := ${new PowdbJsonParam({ k: 1 })} } returning`;
       // 3) Query through the TurbineClient built on the introspected metadata.
@@ -1444,7 +1444,7 @@ describe('powdb integration (networked): F1 param-in-segment JSON filters over T
 });
 
 // ---------------------------------------------------------------------------
-// Networked F2/F3: the design's dual-transport assertions run over the real
+// Networked JSON and join assertions run over the real
 // native typed wire (nativeRaw auto-enabled for a >= 0.13 server). These are
 // the tests whose absence let the BigInt-group-key defect ship; they prove
 // group-key / coercion parity between the native wire and the legacy/embedded
@@ -1700,7 +1700,7 @@ describe('powdb integration (networked): F2/F3 native-wire shapes', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F1: embedded native typed transport (addon >= 0.14). With the pinned 0.14
+// Embedded native typed transport (addon >= 0.14). With a compatible
 // addon the embedded pool auto-routes through queryWithParams (nativeRaw on),
 // so a full create/findMany round-trip must go over the native path, a genuine
 // str "null" survives as a string (distinct from SQL NULL), and groupBy keys
@@ -1812,7 +1812,7 @@ describe('powdb integration (embedded): F1 native typed transport', () => {
 });
 
 // ---------------------------------------------------------------------------
-// F3: read-only awareness (embedded openReadOnly). Seed a directory writable,
+// Read-only awareness (embedded openReadOnly). Seed a directory writable,
 // close it (flushing the WAL), reopen it read-only for snapshot serving: reads
 // work, writes are refused and map to ReadOnlyError (E018), both the ORM
 // create() path and a raw injected write that bypasses any client-side guard.

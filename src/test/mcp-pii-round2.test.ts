@@ -1,7 +1,7 @@
 /**
- * MCP server: second-round PII perimeter holes.
+ * MCP server: PII perimeter regressions.
  *
- * Round 1 closed part of each of these. What survived, and what this file pins:
+ * This file pins the following failure modes:
  *
  *  - `explain_query` refused a predicate only on a code-first `pii` tag, while
  *    `sample_rows` ALSO refuses to fetch a secret-NAMED column (api_key,
@@ -71,7 +71,7 @@ const COLUMNS: ColumnRow[] = [
   col('users', 'name'),
   col('users', 'api_key'),
   col('users', 'session_id'),
-  // Round 3. Both of these were REFUSED by the unanchored substring rule:
+  // Both of these were REFUSED by the unanchored substring rule:
   // `secret` inside `secretary_id`, `token` inside `token_count`.
   col('users', 'secretary_id'),
   col('users', 'token_count'),
@@ -94,14 +94,14 @@ const INDEX_ROWS = [
     indexname: 'users_expr_plain_idx',
     indexdef: `CREATE INDEX users_expr_plain_idx ON public.users USING btree (lower((email || 'vip@example.com')))`,
   },
-  // Round 3. The key-list literal CONTAINS the predicate keyword, so a plain
+  // The key-list literal CONTAINS the predicate keyword, so a plain
   // `indexOf(' WHERE ')` splits inside the literal instead of at the predicate.
   {
     tablename: 'users',
     indexname: 'users_where_literal_idx',
     indexdef: `CREATE INDEX users_where_literal_idx ON public.users USING btree ((email || ' WHERE board@example.com')) WHERE (id > 5)`,
   },
-  // Round 3. Nothing parses as a key list, which used to scan clean.
+  // Nothing parses as a key list, which used to scan clean.
   {
     tablename: 'users',
     indexname: 'users_unparsable_idx',
@@ -412,12 +412,12 @@ describe('mcp migrate_status: agrees with `turbine migrate status`', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Round 3: what round 2's own fixes still let through
+// Index parser boundaries
 // ---------------------------------------------------------------------------
 
 describe('mcp table_detail: the index parser itself fails closed', () => {
   it('does not split on a ` WHERE ` that lives inside the key list literal', async () => {
-    // Round 2 checked the key list for literals in BOTH branches, which is
+    // The parser checked the key list for literals in BOTH branches, which is
     // right, but computed the boundary with `indexOf(' WHERE ')`. When the
     // literal itself contains the keyword, the split lands mid-literal, the
     // head no longer holds the opening quote, and the scan reads clean. The

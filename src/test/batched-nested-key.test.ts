@@ -48,6 +48,7 @@ import { describe, it } from 'node:test';
 import type { WithClause } from '../query/types.js';
 import type { SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, turbineSqlite } from '../sqlite.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 const DatabaseSync: (new (path: string) => DatabaseSyncType) | undefined = (() => {
   try {
@@ -96,7 +97,7 @@ INSERT INTO depletion_tag VALUES (1, 1), (1, 2), (2, 1);
 `;
 
 function fixture(): { db: DatabaseSyncType; schema: SchemaMetadata } {
-  const db = new (DatabaseSync as NonNullable<typeof DatabaseSync>)(':memory:');
+  const db = closeSqliteAfter(new (DatabaseSync as NonNullable<typeof DatabaseSync>)(':memory:'));
   db.exec(SCHEMA_SQL);
   return { db, schema: introspectSqliteDatabase(db) };
 }

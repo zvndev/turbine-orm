@@ -1,0 +1,27 @@
+import type {D1DatabaseBinding} from 'turbine-orm/d1';
+import {turbine} from './generated/index.js';
+declare const binding: D1DatabaseBinding;
+const db=turbine(binding);
+async function negatives() {
+  const selected=await db.records.createMany({data:[],select:{title:true}});
+  selected[0]!.id;
+  const omitted=await db.records.createMany({data:[],omit:{title:true}});
+  omitted[0]!.title;
+  const counted=await db.records.createMany({data:[],returning:false});
+  counted[0];
+  const wrong:number=selected[0]!.title;
+  const [built]=await db.$batch([db.records.buildCreateMany({data:[],select:{title:true}})]);
+  built[0]!.id;
+  const [builtOmit,builtCount]=await db.$batch([db.records.buildCreateMany({data:[],omit:{title:true}}),db.records.buildCreateMany({data:[],returning:false})]);
+  builtOmit[0]!.title;
+  builtCount[0];
+  db.records.findManyStream();
+  db.table('records').findManyStreamBatches();
+  db.$transaction([]);
+  db.$withSession({},async()=>1);
+  db.records.createMany({data:[],onConflict:{target:['id'],action:'ignore'}});
+  turbine('file:local');
+  turbine(binding,{globalFilters:{records:{missing:1}}});
+  return wrong;
+}
+void negatives;

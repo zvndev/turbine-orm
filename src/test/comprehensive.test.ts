@@ -1,5 +1,5 @@
 /**
- * turbine-orm, Comprehensive integration test suite
+ * turbine-orm, Integration test suite
  *
  * Tests every untested code path in query.ts and client.ts against a real Postgres.
  * Covers: select/omit, cursor pagination, distinct, upsert, updateMany, deleteMany,
@@ -283,7 +283,7 @@ testFn('comprehensive integration tests', () => {
       const roleValues = roles.map((r: Record<string, unknown>) => r.role);
       const uniqueRoles = [...new Set(roleValues)];
       assert.deepEqual(roleValues, uniqueRoles);
-      // We know there are admin, editor, member roles
+      // The fixture contains admin, editor, and member roles.
       assert.ok(roleValues.length >= 3);
     });
 

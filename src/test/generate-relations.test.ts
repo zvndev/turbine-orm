@@ -273,7 +273,7 @@ describe('generator: *Relations interface output', () => {
     // regression check fails, the generator has reverted and deep `with`
     // inference is broken end-to-end. Note: the per-relation `*With<Rel>`
     // compat interfaces (e.g. `UserWithPosts`) DO still emit bare shapes -
-    // we only check the Relations interface body here, not the whole file.
+    // Only check the Relations interface body here, not the whole file.
     const userRelations = extractInterfaceBody(out, 'UserRelations');
     assert.doesNotMatch(userRelations, /posts: Post\[\];/);
     assert.doesNotMatch(userRelations, /profile: Profile \| null;/);

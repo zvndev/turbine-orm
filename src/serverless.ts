@@ -1,82 +1,39 @@
 /**
- * turbine-orm/serverless, edge / serverless driver integration
+ * turbine-orm/serverless: the existing generic pg-compatible pool binding.
  *
- * Turbine runs on any Postgres driver that speaks the node-postgres API.
- * This module exposes a thin factory (`turbineHttp`) that binds an external
- * pg-compatible pool to a schema, so you can use Turbine on Vercel Edge,
- * Cloudflare Workers, Deno Deploy, Netlify Edge, or any other environment
- * where a direct TCP connection is unavailable.
+ * The historical turbineHttp name does not identify the driver's transport.
+ * Neon Pool/Client use WebSockets; neon() uses HTTP and is not a Pool. Passing
+ * an external Pool does not certify a provider, backend session mode or runtime.
+ * Callback transactions need a connection pinned through the transaction.
+ * LISTEN needs a persistent actual backend session and asynchronous events;
+ * a logical checkout from a transaction pooler does not establish that contract.
+ * Stateless HTTP drivers cannot supply interactive transactions or LISTEN.
  *
- * ## Supported drivers
+ * For the explicit optional Neon WebSocket lifecycle/session binding see
+ * docs/neon-websocket.md. For this generic API, the caller owns the Pool:
+ * disconnect releases Turbine subscriptions but does not end that Pool.
  *
- * Any driver whose `Pool` satisfies `PgCompatPool` will work. The ones
- * below are verified:
- *
- * - **Neon** (`@neondatabase/serverless`), HTTP and WebSocket transports
- * - **Vercel Postgres** (`@vercel/postgres`), wraps Neon
- * - **Cloudflare Hyperdrive**, exposes a pg-compatible driver
- * - **Supabase**, use the regular `pg` package; Supabase is Postgres-native
- *
- * Turbine does NOT bundle any of these, install whichever you need and
- * pass its pool directly.
- *
- * ## Limitations over HTTP
- *
- * - **Streaming cursors** (`findManyStream`, `findManyCursor`) require
- *   server-side `DECLARE CURSOR`, which most HTTP drivers do not support.
- *   If you call these on an HTTP pool the underlying driver will error.
- * - **LISTEN/NOTIFY** is not available over HTTP.
- * - **Transactions** are supported but each transaction holds an HTTP
- *   connection for its duration, keep them short.
- *
- * ## Example, Neon on Vercel Edge
- *
+ * @example Invocation-local Neon WebSocket Pool
  * ```ts
- * // app/api/users/route.ts
  * import { Pool } from '@neondatabase/serverless';
  * import { turbineHttp } from 'turbine-orm/serverless';
- * import { SCHEMA } from '../../generated/turbine/metadata';
- *
- * export const runtime = 'edge';
- *
- * const pool = new Pool({ connectionString: process.env.DATABASE_URL });
- * const db = turbineHttp(pool, SCHEMA);
- *
- * export async function GET() {
- *   const users = await db.table('users').findMany({ limit: 10 });
- *   return Response.json(users);
- * }
- * ```
- *
- * ## Example, Supabase (direct Postgres, no HTTP proxy needed)
- *
- * ```ts
- * import { TurbineClient } from 'turbine-orm';
  * import { SCHEMA } from './generated/turbine/metadata.js';
  *
- * const db = new TurbineClient({
- *   connectionString: process.env.SUPABASE_DB_URL,
- *   ssl: { rejectUnauthorized: false },
- * }, SCHEMA);
- * ```
- *
- * ## Example, Cloudflare Workers
- *
- * ```ts
- * // Use the Neon HTTP driver which works in Workers runtime
- * import { Pool } from '@neondatabase/serverless';
- * import { turbineHttp } from 'turbine-orm/serverless';
- * import { SCHEMA } from './generated/turbine/metadata';
- *
- * export default {
- *   async fetch(req: Request, env: Env) {
- *     const pool = new Pool({ connectionString: env.DATABASE_URL });
- *     const db = turbineHttp(pool, SCHEMA);
+ * export async function handle(connectionString: string) {
+ *   const pool = new Pool({ connectionString });
+ *   const db = turbineHttp(pool, SCHEMA);
+ *   try {
  *     const users = await db.table('users').findMany({ limit: 10 });
  *     return Response.json(users);
+ *   } finally {
+ *     try { await db.disconnect(); }
+ *     finally { await pool.end(); }
  *   }
- * };
+ * }
  * ```
+ * In edge functions every Pool/Client must be created, used and closed within
+ * one invocation. Configure an instance WebSocket implementation if required
+ * by the runtime; do not change global driver defaults in a request handler.
  */
 
 import { type PgCompatPool, TurbineClient, type TurbineConfig } from './client.js';
@@ -109,7 +66,7 @@ export type TurbineHttpOptions = Omit<TurbineConfig, 'pool'>;
  *
  * Use this for serverless/edge environments where Turbine should NOT
  * manage its own `pg.Pool`. The caller retains ownership of the pool's
- * lifecycle, `db.disconnect()` is a no-op.
+ * lifecycle. `db.disconnect()` releases its subscriptions without ending the pool.
  *
  * ## Typed table accessors
  *
@@ -121,10 +78,6 @@ export type TurbineHttpOptions = Omit<TurbineConfig, 'pool'>;
  * subclass only adds `declare readonly` accessor typings, and the base
  * constructor already creates those accessors at runtime for every table in
  * the schema, so the assertion is sound (not a lie about the shape).
- *
- * This closes the "identical typed code across transports" gap: the edge
- * client is now as typed as the direct one, with no `as` casts at the call
- * site.
  *
  * @typeParam TClient - The generated `TurbineClient` subclass (from
  *   `./generated/turbine`). Defaults to the base client for back-compat.

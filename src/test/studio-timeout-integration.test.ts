@@ -31,7 +31,7 @@ if (SKIP) {
   console.log('⚠ Skipping studio-timeout integration test: DATABASE_URL not set');
 }
 
-// Pick the adapter whose engine-specific timeout SQL we should exercise.
+// Pick the adapter for the engine-specific timeout SQL under test.
 const ENGINE = (process.env.TURBINE_TEST_ENGINE ?? 'postgres').toLowerCase();
 const ADAPTER_BY_ENGINE = {
   postgres: postgresql,
@@ -55,7 +55,7 @@ testFn(`statement-timeout SQL executes on a real engine (${ENGINE})`, () => {
     try {
       const { sql, params } = adapter.statementTimeout!(30);
       // Plain BEGIN (not `BEGIN READ ONLY`, which CockroachDB rejects as a
-      // single statement), we are validating the timeout SQL, not read-only.
+      // single statement), this validates the timeout SQL, not read-only.
       await client.query('BEGIN');
       // With the old `SET ... = $1` form this throws a bind-param syntax error
       // on every engine. set_config() is the parameterizable, txn-local form.

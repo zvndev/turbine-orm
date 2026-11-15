@@ -348,20 +348,15 @@ describe('nested-write: executeNestedCreate', () => {
             email: 'x',
             bogus: { create: [{}] },
           }),
-        // "bogus" won't be detected as a relation, it'll go into scalars
-        // because it's not in tableMeta.relations. So it gets passed to
-        // create() as scalar data without error.
-        // Actually wait, extractRelationFields checks key in tableMeta.relations,
-        // so { create: [{}] } for key "bogus" would be a plain object but
-        // "bogus" is NOT in relations. So it goes to scalars. No error.
-        // Let's test that it's handled gracefully.
+        // "bogus" is absent from tableMeta.relations, so extractRelationFields
+        // passes it to create() as scalar data without a relation error.
       )
       .catch(() => {
         // This is expected to NOT throw from the nested write engine -
         // "bogus" goes to scalars. The DB would reject it instead.
       });
 
-    // Actually verify it doesn't throw from nested-write
+    // Check the nested-write call directly; the preceding catch absorbs any rejection.
     const { ctx: ctx2, log: log2 } = makeMockCtx(schema);
     await executeNestedCreate(ctx2, 'users', {
       email: 'x',
@@ -1155,7 +1150,7 @@ describe('nested-write: internal reads do not raise user-facing dev warnings', (
  * A nested write reads the row back with the relations it touched populated.
  * The `with` clause was built from the TOP-LEVEL relation keys only, so a
  * depth-3 create wrote all three levels and returned an object whose
- * grandchildren were simply absent (`users[0].posts === undefined`), which
+ * grandchildren were absent (`users[0].posts === undefined`), which
  * reads as "there are none" rather than "this layer did not ask for them".
  * The clause now mirrors the shape of the data that was written, to the same
  * depth cap the walk itself uses.

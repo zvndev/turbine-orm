@@ -76,7 +76,7 @@ const CREATE_LOCK_TABLE_SQL = `
 
 /**
  * Row estimates override. YugabyteDB's pg_class.reltuples can be stale or
- * zero. We still query it (it works) but the results may lag behind actual
+ * zero. The query still returns estimates, but they may lag behind actual
  * row counts. This query matches the PostgreSQL format so the introspection
  * consumer doesn't need special handling.
  *

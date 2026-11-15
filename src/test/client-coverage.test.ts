@@ -400,7 +400,7 @@ describe('TurbineClient, external pool lifecycle', () => {
     const { pool } = createMockPool();
     const db = new TurbineClient({ pool }, buildSchema());
     // Verify by checking generated SQL does not use named statement form
-    // (we can't inspect the private field, but behavior proves it:
+    // (the field is private, so check its behavior:
     //  queries go through pool.query(text, values) not pool.query({name, text, values}))
     assert.ok(db, 'client constructed with external pool');
   });

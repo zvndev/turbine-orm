@@ -59,7 +59,7 @@ async function holdLock(sql: string): Promise<{ release(): Promise<void> }> {
   };
 }
 
-/** Our app's backends still running a statement (not idle). */
+/** Application backends still running a statement (not idle). */
 async function busyBackends(): Promise<number> {
   const { rows } = await admin.query<{ n: number }>(
     "SELECT count(*)::int AS n FROM pg_stat_activity WHERE application_name = $1 AND state <> 'idle'",

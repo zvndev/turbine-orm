@@ -1,0 +1,12 @@
+import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const format = process.argv[2];
+const load = (name) => format === 'cjs' ? Promise.resolve().then(() => require(name)) : import(name);
+assert.ok(['esm', 'cjs'].includes(format));
+const { turbineCore } = await load('turbine-orm/core');
+const transport = { async query() { return { rows: [] }; }, async connect() { throw new Error('No checkout'); }, async end() {} };
+const db = turbineCore(transport, { tables: {}, enums: {} });
+assert.equal(typeof db.table, 'function');
+await db.disconnect();
+console.log(JSON.stringify({ format, coreWithPgAndNeonPhysicallyOmitted: true, native: false }));

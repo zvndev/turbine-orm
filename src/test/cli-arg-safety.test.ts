@@ -149,6 +149,7 @@ describe('unknown flags do not fire on valid input', () => {
       ['studio', '--demo'],
       ['observe', '--port', '4984', '--host', '127.0.0.1', '--no-open'],
       ['mcp', '--schema', 'public'],
+      ['mcp', '--legacy-to-many-uniques'],
       ['skill', '--print'],
       ['skill', '--agents'],
       ['skill', '--dir', './skills'],

@@ -10,19 +10,33 @@
     "bench:interleaved": "tsx bench-interleaved.ts",
     "bench:extended": "tsx bench-extended.ts",
     "bench:latency": "tsx bench-latency.ts",
-    "parity": "tsx parity/seed.ts && tsx parity/run.ts"
+    "parity": "tsx parity/seed.ts && tsx parity/run.ts",
+    "setup:mysql": "prisma generate --schema prisma/mysql.prisma",
+    "seed:mysql": "tsx mysql-seed.ts",
+    "bench:mysql": "tsx bench-mysql.ts",
+    "bench:mysql:verify": "tsx bench-mysql.ts --verify-only",
+    "bench:mysql:catalog": "tsx bench-mysql.ts --catalog",
+    "bench:mysql:native": "tsx mysql-comparison-native.ts",
+    "setup:sqlite": "prisma generate --schema prisma/sqlite.prisma",
+    "bench:sqlite": "tsx bench-sqlite.ts",
+    "bench:sqlite:verify": "tsx bench-sqlite.ts --verify-only",
+    "test:extended": "tsx --test extended-equivalence.test.ts"
   },
   "dependencies": {
-    "@prisma/adapter-pg": "7.10.0",
-    "@prisma/client": "7.10.0",
-    "drizzle-orm": "0.45.3",
-    "drizzle-rc": "npm:drizzle-orm@1.0.0-rc.4",
+    "@prisma/adapter-better-sqlite3": "7.10.1",
+    "@prisma/adapter-mariadb": "7.10.1",
+    "@prisma/adapter-pg": "7.10.1",
+    "@prisma/client": "7.10.1",
+    "better-sqlite3": "12.11.1",
+    "drizzle-orm": "0.45.4",
+    "drizzle-rc": "npm:drizzle-orm@1.0.0-rc.5",
+    "mysql2": "3.24.6",
     "pg": "8.23.1",
     "tsx": "^4.19.0",
     "turbine-orm": "file:.."
   },
   "devDependencies": {
     "@types/pg": "^8.11.11",
-    "prisma": "7.10.0"
+    "prisma": "7.10.1"
   }
 }

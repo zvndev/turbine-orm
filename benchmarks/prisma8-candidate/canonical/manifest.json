@@ -1,0 +1,22 @@
+{
+  "equivalence.ts": {
+    "source": "benchmarks/equivalence.ts",
+    "commit": "6052829e9c83e8549fca48932b30e9448cafcc9f",
+    "sha256": "ba2353d1caa9bc956e04ff223993979faa888a3b9b29135d21cc8c993e4fd790"
+  },
+  "bench-harness.ts": {
+    "source": "benchmarks/bench-harness.ts",
+    "commit": "6052829e9c83e8549fca48932b30e9448cafcc9f",
+    "sha256": "58bf2532fc6e40ab88188838b727c740c4c758def71007698a748c23760ab9d5"
+  },
+  "extended-equivalence.ts": {
+    "source": "benchmarks/extended-equivalence.ts",
+    "commit": "6052829e9c83e8549fca48932b30e9448cafcc9f",
+    "sha256": "38f8a14d11875716d5136ff877a5bdaa38ca43fa545321bc20b10a25105f42f6"
+  },
+  "seed-neon.ts": {
+    "source": "benchmarks/seed-neon.ts",
+    "commit": "6052829e9c83e8549fca48932b30e9448cafcc9f",
+    "sha256": "5346279b30c775211455f496207cf09744984583ee43e483ab84eca7b7cf643f"
+  }
+}

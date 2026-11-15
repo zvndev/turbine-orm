@@ -32,6 +32,7 @@ import { introspect } from '../introspect.js';
 import { jsonValue } from '../query/json-value.js';
 import type { SchemaMetadata } from '../schema.js';
 import { skipGate } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 const DATABASE_URL = process.env.DATABASE_URL;
 const pgGate = skipGate(!DATABASE_URL, 'DATABASE_URL not set');
@@ -328,7 +329,7 @@ describe('json writes, live sqlite', () => {
   sqliteGate.it('arrays, raw JSON strings and jsonValue store the same JSON as on postgres', async () => {
     const { introspectSqliteDatabase, turbineSqlite } = await import('../sqlite.js');
     const { DatabaseSync } = createRequire(process.cwd())('node:sqlite');
-    const sqlite = new DatabaseSync(':memory:');
+    const sqlite = closeSqliteAfter(new DatabaseSync(':memory:'));
     sqlite.exec('CREATE TABLE wj_docs (id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT UNIQUE, title TEXT, data JSON)');
     const client = turbineSqlite(sqlite, introspectSqliteDatabase(sqlite));
     const docs = client.table('wj_docs') as Table;

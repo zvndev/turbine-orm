@@ -776,6 +776,8 @@ describe('every read option is classified for the local read-only tools', () => 
     'offset',
     'take',
     'skip',
+    // Shapes a read predicate; cursor/orderBy already own its column names.
+    'cursorPredicate',
     // Execution tuning that these tools never run, or that is inert on a build-only compile.
     'timeout',
     'relationLoadStrategy',

@@ -25,7 +25,7 @@
  *       return { rows: r.rows.map((row) => Object.fromEntries(r.columns.map((c, i) => [c, row[i]]))) };
  *     };
  *     ```
- *     (A mis-shaped exec is now caught: if `schema` returns rows but none carry
+ *     (A mis-shaped exec is rejected: if `schema` returns rows but none carry
  *     a `name`, {@link introspectPowdbDatabase} throws instead of returning an
  *     empty schema.)
  *
@@ -175,7 +175,7 @@ export async function introspectPowdbDatabase(
     );
   }
 
-  // include / exclude + default bookkeeping-table exclusions (F12).
+  // include / exclude + default bookkeeping-table exclusions.
   const tableNames = applyTableFilters(candidateTables, options);
 
   // Keyed by catalog names, so prototype-less: a table or column named
@@ -191,7 +191,7 @@ export async function introspectPowdbDatabase(
       // `describe <T>` (a `type` cell of literally `"link"`, an Empty nullable
       // slot, and an arrow description in the index slot). They are NOT columns,
       // so drop them before column parsing, unconditionally (no capability check):
-      // the rows simply never appear on a pre-0.19.1 engine, and a linked database
+      // the rows never appear on a pre-0.19.1 engine, and a linked database
       // introspected without this filter would produce garbage `link`-typed
       // columns. Declared links are read separately via `schema links` below.
       .filter((r) => asString(r.type) !== 'link')
@@ -350,8 +350,8 @@ async function introspectPowdbLinks(exec: PowdbExec, tables: Record<string, Tabl
   for (const link of linkRows) {
     const owner = Object.hasOwn(tables, link.owner) ? tables[link.owner] : undefined;
     const target = Object.hasOwn(tables, link.target) ? tables[link.target] : undefined;
-    // A link referencing a filtered-out (include/exclude) table is skipped: we
-    // cannot describe the target, so the relation would be unusable.
+    // A link referencing a filtered-out (include/exclude) table is skipped:
+    // the target metadata is unavailable, so the relation would be unusable.
     if (!owner || !target) continue;
     const toOne = link.cardinality === 'to-one';
     const relName = snakeToCamel(link.name);

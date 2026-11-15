@@ -1,5 +1,866 @@
 # Changelog
 
+## 0.94.0 (2026-11-15)
+
+Five new engines and transports, a CLI project lifecycle for SQLite, MySQL,
+SQL Server, local libSQL and local D1, and native streaming on SQLite, MySQL
+and SQL Server. Root `dependencies` is still exactly `{ "pg": "^8.15.0" }`: every new
+driver is an optional peer, and no export was removed from `turbine-orm`.
+
+How far each engine and transport is tested now has one place:
+[`docs/engine-support.md`](docs/engine-support.md). Its tiers are computed
+from the tests CI runs, not chosen. PostgreSQL, SQLite on `node:sqlite`,
+better-sqlite3 and MySQL 8 are **Supported**. Cloudflare D1, both Neon transports,
+the edge entry and the PostgreSQL-compatible adapters are Experimental; local
+libSQL and SQL Server are Deferred. Each tier below is quoted from that page.
+
+### Added
+
+#### Engines and transports
+
+- **`turbine-orm/better-sqlite3`, SQLite through the `better-sqlite3`
+  binding.** Supported. `await turbineBetterSqlite3(pathOrHandle, schema,
+  options?)` returns the same typed client as `turbine-orm/sqlite`, with the
+  same transaction and stream rules. Optional peer `better-sqlite3` `^12.11.1`,
+  loaded only when a path is opened; a missing peer is a `ConnectionError`. A
+  path is owned by the client and closed by `disconnect()`; a handle you pass
+  in is left open with its own pragmas. `introspectBetterSqlite3Database(handle)`
+  reads a handle's catalog, including views when requested. CI runs the binding
+  suite on Node 20 and Node 24, plus the shared cross-engine battery and
+  parent-scoped nested writes on Node 24.
+  [Guide](docs/sqlite-binding.md).
+- **`turbine-orm/libsql`, local libSQL files.** Deferred: no further work is
+  planned this cycle and no support is promised. `await turbineLibsql(target,
+  schema)` takes a `file:` URL or `:memory:`, or `{ client, url }` for a
+  `@libsql/client` client you created with `intMode: 'bigint'`. Remote URLs,
+  sync and embedded replicas are refused. Optional peer `@libsql/client`
+  `^0.18.0`. The entry still loads the PostgreSQL client graph, so it is not
+  free of `pg`. [Guide](docs/libsql-local.md).
+- **`turbine-orm/d1`, Cloudflare D1 inside a Worker.** Experimental.
+  `turbineD1(env.DB, schema)` runs typed queries through the Worker's
+  `D1Database` binding and its native batch, with no Node SQLite, TCP or
+  PostgreSQL pool. The Worker needs `node:async_hooks` (the `nodejs_compat`
+  flag). Nested writes, streams, row locks and LISTEN are refused before any
+  statement is prepared, and a statement binds at most 100 values. CI runs it
+  in local workerd through Miniflare; no job reaches hosted D1.
+  [Guide](docs/d1-binding.md).
+- **`turbine-orm/neon-ws`, a Neon WebSocket `Pool` or `Client`.**
+  Experimental. `await turbineNeonWs(source, schema, { sessionMode, lifetime })`
+  binds the existing client to `@neondatabase/serverless` over WebSockets. Both
+  options are required: `sessionMode: 'persistent' | 'transaction'` states what
+  the endpoint guarantees, and `lifetime: 'persistent' | 'invocation'` states
+  whether connections may outlive one invocation. Prepared statements default
+  to off and are refused in transaction mode; `$listen` needs a persistent
+  session and lifetime. `withNeonWs` opens a pool for one callback and closes
+  it afterwards. Optional
+  peer `@neondatabase/serverless` `^1.2.0`. CI runs it against PostgreSQL 14 to
+  18 through a local WebSocket relay; no job reaches hosted Neon.
+  [Guide](docs/neon-websocket.md).
+- **`turbine-orm/neon-http`, Neon's `neon()` HTTP query function.**
+  Experimental. `turbineNeonHttp(sql, schema, options?)` sends one
+  parameterized statement per call, plus native batches. Anything that needs
+  more than one request is refused before it runs: nested writes, upserts that
+  need a lookup, multi-statement bulk writes, and the `batched` and `auto`
+  relation strategies. Your `sql` function is never closed or reconfigured.
+  Same optional peer, same CI arrangement through a local HTTP bridge.
+  [Guide](docs/neon-http.md).
+
+#### Entry points
+
+- **`turbine-orm/core`.** `turbineCore(pool, schema, options?)` is the typed
+  client over a transport you supply (`query`, `connect`, `end`), with no
+  driver of its own. D1 is built on it. [Guide](docs/driver-neutral-entry.md).
+- **`turbine-orm/sql`, composable SQL fragments.** `sql`, `identifier`,
+  `join` and `compile(fragment, dialect)` build parameterized SQL for any
+  engine's dialect, and `table`, `selectFrom`, `cte` / `withCtes`, `union`,
+  `unionAll`, `intersect` and `except` add typed projections. It executes
+  nothing and adds no code to the other entries. Projection types are caller
+  declarations, and raw SQL does not pick up global filters or the PII
+  projection. [Guide](docs/sql-fragments.md).
+- **`turbine-orm/notification-hub`.** `createNotificationHub(pool, options)`
+  shares one PostgreSQL LISTEN connection across channels and subscribers,
+  with bounded `maxChannels` / `maxSubscriptions`, reconnect with backoff and
+  an `onResync` callback. `endpoint: 'direct' | 'session-pool'` is required.
+  Existing `$listen` subscriptions still hold one connection each.
+  [Guide](docs/notification-multiplexing.md).
+- **`turbine-orm/live-query`.** `liveQuery({ subscribe, query, signal })`
+  reruns an ordinary query when a notification arrives and yields the newest
+  snapshot, with memory bounded to one result and one pending pull. It does
+  not replay notifications missed during a reconnect; it reruns the query
+  instead. [Guide](docs/live-queries.md).
+- **Seed entries**: `turbine-orm/sqlite/seed`, `turbine-orm/mysql/seed`,
+  `turbine-orm/mssql/seed` and `turbine-orm/libsql/seed`
+  (`defineSqliteSeed` / `runSqliteSeed` and the same pair per engine), typed
+  seed callbacks that run in one transaction.
+- **Catalog and generation entries for libSQL and D1**:
+  `turbine-orm/libsql/introspect` (`introspectLibsql`),
+  `turbine-orm/libsql/generate`, `turbine-orm/d1/introspect` (`introspectD1`),
+  `turbine-orm/d1/generate` and `turbine-orm/d1/migrate` (`migrateD1`).
+  [libSQL catalog](docs/libsql-introspection.md),
+  [D1 catalog](docs/d1-introspection.md),
+  [D1 generation](docs/d1-generation.md).
+
+#### CLI projects beyond PostgreSQL
+
+`--engine <name>` (or `engine` in `turbine.config.ts`) selects `postgresql`
+(the default), `sqlite`, `mysql`, `mssql`, `libsql` or `d1`. Each engine has
+its own subset of commands; `turbine <command> --engine <name> --help` lists
+it. Studio, `observe` and `migrate-from-prisma` stay PostgreSQL-only.
+
+- **SQLite**: `init`, `pull` / `generate`, `status`, SQL migrations
+  (`migrate create | up | deploy | down | status`), `push --schema-file` with a
+  dry-run preview, `seed`, `doctor` and the MCP tools. Project commands need
+  Node 22.12+, migration status Node 22.16+ or 24, and migration writes Node
+  24.10+. [Migrations](docs/sqlite-migrations.md),
+  [seeds](docs/sqlite-seeding.md), [doctor](docs/sqlite-doctor.md).
+- **MySQL**: `init`, `pull` / `generate`, `status`, SQL migrations including
+  `migrate recover` for a migration whose DDL stopped part way, a journaled
+  `push`, `create --from-diff`, `seed`, `doctor` and the MCP tools.
+  [Projects](docs/mysql-projects.md), [migrations](docs/mysql-migrations.md),
+  [push](docs/mysql-push.md).
+- **SQL Server**: `init`, `pull` / `generate`, `status`, SQL migrations,
+  `seed`, `doctor` and catalog-only MCP tools. No `push` or schema diff.
+  [CLI](docs/sql-server-cli.md), [migrations](docs/sql-server-migrations.md).
+- **Local libSQL**: `init`, `pull` / `generate`, `status`, `seed`,
+  `migrate status` and an additive-only `migrate deploy`.
+  [CLI](docs/libsql-cli.md).
+- **Local D1** (needs the optional peer `miniflare` at exactly
+  `4.20260730.0`): `init`, `pull` / `generate`, `status`, a declarative
+  `seed`, and `migrate deploy | status` over an ordered plan file. Hosted D1 is
+  not touched.
+- **MCP and one-shot tools.** `turbine mcp --engine` lists 12 tools on
+  PostgreSQL, 9 on SQLite and MySQL, and 8 on SQL Server. A new
+  `engine_capabilities` tool, and the new `turbine capabilities`,
+  `turbine schema [table]`, `turbine compile <json>` and
+  `turbine explain-error <code>` commands, print one JSON result each.
+
+#### Queries
+
+- **`signal` on streamed reads.** `findManyStream` and
+  `findManyStreamBatches` take an `AbortSignal`. An abort rejects the next
+  pull with the signal's reason and releases the connection; a pre-aborted
+  signal sends no SQL. Without `signal` the SQL is unchanged.
+  [Details](docs/stream-cancellation.md).
+- **`cursorPredicate: 'tuple'` on PostgreSQL.** Compiles a cursor to one row
+  comparison, `("score", "id") > ($1, $2)`, instead of the expanded
+  lexicographic predicate. It is accepted only when the ordering ends in a
+  proven unique key, uses one direction and plain columns, and the cursor
+  carries every ordering value. The default stays `'lexicographic'`.
+  [Details](docs/cursor-pagination.md).
+- **SQLite views.** `introspectSqliteDatabase(db, { includeViews: true })`
+  adds views as read-only entities: writes to them are refused with E003, and
+  keyless views have no `findUnique`. For a SQLite CLI project,
+  `turbine generate --include-views` and `turbine pull --include-views` do
+  the same through the read-only catalog path, and
+  `introspectBetterSqlite3Database(handle, options)` takes the same filters
+  and `includeViews` option as the builtin handle introspector.
+  [Details](docs/sqlite-view-readonly.md).
+
+#### Generation and typing
+
+- **Schema-specific clients for SQLite, MySQL and SQL Server.**
+  `generate({ schema, target: 'sqlite' | 'mysql' | 'mssql' })` emits a typed
+  factory for that engine. MySQL and SQL Server factories are async; the SQLite
+  one is synchronous unless `sqliteBinding: 'better-sqlite3'` is set, which
+  makes it async. Omitting `target` keeps PostgreSQL output as it was.
+- **MySQL ENUM columns generate literal unions** of their catalog labels in
+  row, input, filter and unique-selector types.
+  [Details](docs/mysql-enum-generation.md).
+- **Binary columns carry `inferredBinaryType` in generated metadata**
+  (`'Buffer'` for a PostgreSQL `bytea` column), a hint the generator reads
+  when it writes the column's type. Rows and runtime behaviour are unchanged.
+- **`exactNativeIntegers: true`** (with a non-PostgreSQL `target`) types
+  64-bit integer columns as `number | string`, matching what the native
+  engines already return past `Number.MAX_SAFE_INTEGER`. It changes
+  declarations only. [Details](docs/native-integer-types.md).
+
+#### Transaction outcomes
+
+- **`TransactionOutcomeUnknownError` (E021)**, exported from the package root.
+  Not retryable, and a read of the database does not settle it: a COMMIT still
+  in flight can commit after the read finds nothing. Retry only a write that a
+  unique idempotency key, enforced by the database and written in the same
+  transaction, makes safe to repeat. A replay that fails with E008 on that
+  key's constraint shows a row with the key is committed, not that it is this
+  write, so read it back and compare; E008 on any other constraint says
+  nothing about the first attempt. Raised where Turbine can tell the
+  server's answer to COMMIT from no answer: the PostgreSQL dialect, the MySQL
+  engine and the Neon WebSocket driver. SQLite and libsql run in process,
+  where a failed COMMIT is the engine's answer; SQL Server and PowDB rethrow
+  the driver's error for a failed COMMIT, and on SQL Server the `mssql` driver
+  hands the connection back to its own pool before Turbine sees the result.
+- **`capabilities.classifiesCommitAnswer`**, which decides where an unanswered
+  COMMIT uses the shared E021 classification: `true` for PostgreSQL, `false`
+  for every other shipped engine. MySQL and Neon WebSocket raise E021 through
+  their own recovery policies. It used to be decided by `abortsTransactionOnError`, which answers a
+  different question.
+
+### Behaviour changes
+
+- **The optional `@neondatabase/serverless` peer now requires `^1.2.0`.**
+  A project still using 0.10 has an incompatible peer range. Upgrade the driver
+  before installing this release with either Neon transport.
+- **MySQL introspection no longer tries to recover damaged ENUM labels by
+  writing temporary tables.** It only reads the catalog. A suspect label list
+  is withheld, the column is marked `enumLabelsUnrecoverable`, and generation
+  uses `string` (`z.string()` with Zod). Each affected column gets one warning
+  per introspection call. Declare exact labels with `enums` on library metadata
+  or `columnTypes` in `turbine.config.ts`. A literal question mark on a column
+  with a supplementary-capable or unknown character set gets the same fallback.
+  [Details](docs/mysql-enum-generation.md).
+- **A unique foreign key's reverse relation is a to-one, named as on
+  PostgreSQL, on every engine and in `defineSchema` metadata.** When a foreign
+  key's columns are exactly a unique key of their own table (the primary key, a
+  UNIQUE constraint or a plain unique index) and both sides compare the same
+  way, the parent's relation is `hasOne` (an object or `null`), named with the
+  singular of the child table. For
+  `profiles.user_id INTEGER UNIQUE REFERENCES users(id)`:
+  - **SQLite (`node:sqlite`), MySQL and SQL Server introspection, and
+    `schemaDefToMetadata`** gave `users.profiles`, a `hasMany` array, in
+    0.93.1. They now give `users.profile`, `hasOne`. better-sqlite3, local
+    libSQL and D1, new in this release, give `users.profile` too. PostgreSQL
+    already did and is unchanged.
+  - Generated types change with it, and `with`, relation filters, relation
+    `orderBy` and nested writes take the new key. The old key is an unknown
+    relation (E005 in `with`).
+  - The name follows PostgreSQL's rules: two unique foreign keys from one table
+    to the same target give `coupleByPartnerA` and `coupleByPartnerB`, and
+    where the singular is already taken by a column or another relation, the
+    plural is kept.
+  - What "compare the same way" checks is per engine. On SQLite, libSQL and
+    D1 a `COLLATE` in the child table's DDL, or in the parent's when the
+    referenced key is not the rowid alias, keeps the relation `hasMany`: with a
+    `NOCASE` parent key, the child values `'a'` and `'A'` both reference the
+    parent `'a'`. Each foreign key is decided on its own.
+  - **To keep the 0.93.1 output** (an array under the plural name), set
+    `legacyToManyUniques: true` in `turbine.config.ts` or pass
+    `--legacy-to-many-uniques` (generation and `turbine mcp`), pass it to any
+    introspection function, or call
+    `schemaDefToMetadata(def, { legacyToManyUniques: true })`.
+  - **To keep only the old name**, rename the to-one back with
+    `relationNames: { users: { profile: 'profiles' } }`. `turbine.config.ts`,
+    `introspect({ dialect, ... })`, `introspectLibsql` and `introspectD1` read
+    it; `introspectSqliteDatabase`, `introspectBetterSqlite3Database`,
+    `introspectMysqlWith`, `introspectMysql`, `introspectMssqlWith`,
+    `introspectMssql` and `schemaDefToMetadata` do not. An existing entry that
+    renamed the plural now fails with
+    `relationNames: table "users" has no relation "profiles". Derived relations: profile.`
+  - Four shapes still give different relations on different engines, each
+    unchanged by this release: a junction keyed only by a unique index, the
+    `onDelete` / `onUpdate` actions, two composite foreign keys sharing a
+    target, and which relation keeps a contested name.
+    [Details, the entry-point table and examples](docs/relation-names.md).
+- **`findManyStream` on SQLite steps through rows natively** when the result
+  is larger than the first bounded fetch, instead of loading it all first. The
+  open iterator holds the client's single SQLite handle: other calls on that
+  client wait up to `busyTimeoutMs`, then fail with the retryable
+  `SerializationFailureError`. Finish or `return()` the iterator before
+  awaiting other work on the same client. Native iteration needs Node 22.16+ or
+  Node 24+; on Node 22.5 to 22.15, a stream larger than the first fetch now
+  throws `UnsupportedFeatureError` (E017). [Details](docs/sqlite-streaming.md).
+- **MySQL and SQL Server streams read rows from the driver in batches** as you
+  iterate, instead of materializing the result. The stream holds its pooled
+  connection until it finishes or is returned. A MySQL stream returned early
+  (a `break`, `return()`, an abort or the idle timeout) outside a transaction
+  closes that connection, so the server stops sending the rest of the result
+  at once. Inside a `$transaction` the connection is the transaction's, so the
+  rest of the result is read and discarded instead. A SQL Server stream
+  cancels its request. [Details](docs/stream-cancellation.md).
+- **SQLite raw SQL accepts one statement.** `raw` and `rawUnsafe` with a
+  second statement after the first are refused with E003. 0.93.1 ran only
+  the first statement and silently dropped the rest, so
+  `SELECT 1; UPDATE ...` never updated. A trailing `;` or comment is still
+  accepted. Send each statement in its own call.
+  [Details](docs/sqlite-decoding.md).
+- **SQLite introspection leaves out native shadow tables** (an FTS5 table's
+  storage tables, for example) by default. The virtual table itself stays. Name
+  a shadow table in `include` to get it back.
+- **MySQL and SQL Server introspection report computed columns as
+  non-writable**, so they leave generated create and update inputs and an
+  explicit write to one is refused before it runs. An index with a prefix or
+  expression key part now reports no key columns, so it can no longer make a
+  smaller column set look unique.
+  [MySQL](docs/mysql-introspection-metadata.md),
+  [SQL Server](docs/mssql-introspection-metadata.md).
+- **SQLite, MySQL and SQL Server introspection report column defaults and
+  index definitions more exactly.** Code that stores or compares
+  introspection output sees these changes, `legacyToManyUniques` included:
+  - SQLite: an `INTEGER PRIMARY KEY` (the rowid alias) is marked
+    `isGenerated`, and a column of a composite primary key no longer reports
+    `hasDefault`, since only the rowid alias gets a value from SQLite.
+  - MySQL: a nullable column reports `hasDefault`, its effective
+    `DEFAULT NULL`.
+  - Index `definition` text: SQLite returns the catalog's own `CREATE INDEX`
+    statement, MySQL returns `MySQL index metadata: ` followed by JSON
+    describing the native key, and SQL Server includes the index kind and
+    schema-qualified names. The structured `columns` and `unique` of a plain
+    index are unchanged.
+- **A MySQL `$transaction` timeout no longer always reports
+  `outcome: 'not-executed'`.** 0.93.1 said every timed-out MySQL transaction
+  was rolled back and its running statement cancelled, which `mysql2` cannot
+  do. `TimeoutError.outcome` is now `'not-executed'` only when the server
+  acknowledged the ROLLBACK. When a statement is still running at the
+  deadline, or the ROLLBACK is not acknowledged in time, the connection is
+  discarded and the outcome is `'unknown'`, because Turbine cannot confirm what
+  the server did. A callback that resumes after the deadline cannot send more
+  SQL. If you retry on `'not-executed'`, check the data before retrying an
+  `'unknown'` timeout. A discarded connection's session stays on the server
+  until its statement finishes, so under timeouts MySQL can briefly show more
+  sessions than the pool's connection limit.
+- **`upsert` takes its single conflict statement only when `where` is exactly
+  one unique key.** A `where` that pairs a key with another column, such as
+  `{ id, note }` with `note` an ordinary column, or that names two separate
+  unique keys, now looks the row up by the whole `where` and then updates it
+  or inserts `create`, as a `where` that differs from `create` already did.
+  Before, every key pinned to `create` was enough, and the statement named
+  all of them as its conflict target.
+  - **PostgreSQL and SQLite.** Such a call failed whatever the data
+    (`ON CONFLICT ("id", "note")` names no unique index: SQLSTATE 42P10 on
+    PostgreSQL, an "ON CONFLICT clause does not match" error on SQLite). It now
+    updates the row when the whole `where` matches, inserts when the key is
+    absent, and fails with `UniqueConstraintError` (E008), leaving the row
+    unchanged, when the key exists but the other column does not match.
+  - **MySQL.** `ON DUPLICATE KEY UPDATE` has no conflict target, so a row
+    holding the key was treated as matched whatever its other column held, and
+    was updated. What followed depended on the update. When it left the other
+    column not matching, the read-back by `where` found nothing, and the call
+    failed with `NotFoundError` (E001) and rolled the update back. When it made
+    the column match (for example `where: { id: 1, note: 'target' }` with
+    `update: { note: 'target' }` on a row whose note is `'before'`), the
+    read-back found the row, and the call succeeded and stored the new value.
+    A row whose other column does not match is no longer treated as matched:
+    the insert is attempted and fails with E008, and the row is unchanged. So a
+    call of that second kind used to succeed and now fails. A matching row is
+    updated as before.
+  - **SQL Server.** The `MERGE` already matched on every `where` column, so
+    results are unchanged; the call now runs as a lookup and one write.
+  - **Round trips and concurrency.** The lookup is a `SELECT` and then an
+    `UPDATE` or `INSERT` in one transaction (the caller's when there is one),
+    where the statement was one round trip. Like every lookup-first upsert it
+    is not atomic against a concurrent insert of the same key: two callers can
+    both miss, and the second insert fails. On PostgreSQL and MySQL it fails
+    with E008. On SQLite, where the two callers hold separate connections to
+    one database file, the second caller gets `SerializationFailureError`
+    (E013) instead. Either way, the caller's remedy is to retry the whole call.
+  - **Middleware and query events.** `$use` middleware and `query` events
+    see the lookup as it runs: the `upsert` call, then its inner `findUnique`
+    and `update` or `create`, as every lookup-first upsert already reported.
+    Code that counts or allows actions by name sees those names for these
+    calls too.
+  - **Batched forms refuse it.** `buildUpsert`, and so `pipeline()` and an
+    array `$transaction`, throw E003 for such a `where` (naming it as not
+    exactly one unique key) rather than sending a statement. A client without
+    implicit transactions (`turbine-orm/core`) refuses the call as it refuses
+    every lookup-first upsert. prisma-compat's array `$transaction` runs the
+    array inside a transaction instead of batching it.
+- **The MySQL engine and the Neon WebSocket driver throw
+  `TransactionOutcomeUnknownError` (E021) for a COMMIT that got no answer.**
+  A lost or timed-out connection under COMMIT (on MySQL also a server
+  shutting down, or the statement or connection killed while the COMMIT ran)
+  used to rethrow the driver's error, which a caller could not tell from any
+  other failure. It is now E021, with that error as `cause`; the connection is
+  still discarded, no rollback is claimed, and `transaction-outcome-unknown`
+  is still logged. An error the server answered the COMMIT with keeps its
+  typed class. Code that caught the driver's error for this case should catch
+  E021 and read `cause`.
+
+### Fixed
+
+#### Transaction outcomes
+
+A transaction is reported as rolled back only when the server said so, on
+every path that runs one: `$transaction`, `transaction()`, and the
+transactions Turbine opens for a nested write, a lookup-first upsert, a write
+that takes several statements and a sequential pipeline. A COMMIT whose
+answer never arrived used to be followed by a ROLLBACK that the server
+acknowledged (there was no transaction left), so the caller was told the
+transaction rolled back while its writes were committed, and a retry applied
+them twice.
+
+- **A COMMIT that got no answer is no longer reported as a rollback.** Seen
+  without any fault: node-postgres's `query_timeout` rejects a COMMIT that a
+  deferred constraint trigger makes slower than the timeout, and the server
+  commits anyway. Turbine then sent ROLLBACK, the server answered it with a
+  warning, and `transaction()` and `$transaction()` reported a rollback,
+  `$transaction()` logged `transaction-rolled-back`, and the connection was
+  reused. Now no ROLLBACK is sent (it cannot tell a commit from a rollback),
+  the connection is discarded, and the call rejects with the new
+  `TransactionOutcomeUnknownError` (E021), carrying the failure that hid the
+  answer as `cause`.
+- **The same holds for the transactions Turbine opens on its own.** A
+  `create` or `update` with nested relation writes, a lookup-first `upsert`,
+  a write that takes several statements (a MySQL write and its re-read, a
+  `createMany` split into chunks) and a `pipeline()` on a pool without
+  node-postgres's pipeline protocol each ran their own BEGIN and COMMIT. An
+  unanswered COMMIT there surfaced as the plain driver error, a ROLLBACK
+  followed it, and the connection went back to the pool while the server
+  could still commit. They now share the settlement explicit transactions
+  use: E021 on PostgreSQL, MySQL and Neon WebSocket, the connection discarded,
+  transforms still run
+  before COMMIT, and a COMMIT answered with the `ROLLBACK` tag is reported as
+  a rollback instead of counting as success. A statement timeout that ends one
+  of them used to report `outcome: 'not-executed'` and "rolled back" before
+  any rollback was confirmed; it now reports `'not-executed'` only once the
+  server acknowledged the ROLLBACK, and `'unknown'` (COMMIT never sent)
+  otherwise. A sequential pipeline whose BEGIN fails discards its connection.
+- **A `pipeline()` whose connection closes mid-batch now settles.** On a
+  node-postgres pool the batch runs over the pipeline protocol, and a socket
+  that closed without a server message (a network drop, a terminated backend,
+  a restart) left the call pending forever unless it had a `timeout`, holding
+  its pool slot. Under repeated backend kills every slot ended up held. 0.93.1
+  has the same defect. The call now rejects and the connection is discarded,
+  with what the server could have done:
+  - the error a statement of the batch failed with, which rolled the
+    transaction back;
+  - `ConnectionError` (E004) when the connection closed before a COMMIT was
+    sent, so nothing was committed. A batch that writes sends its COMMIT only
+    after every statement has answered and every transform has run;
+  - `TransactionOutcomeUnknownError` (E021) once a COMMIT was sent and not
+    answered. A batch of plain SELECTs sends its COMMIT with the batch, so a
+    connection that closes under it is E021 from the start: a SELECT can write
+    through a function it calls, and the batch does not run read-only.
+
+  With `{ transactional: false }` each statement commits on its own, so the
+  call rejects with `PipelineError` (E014) and each slot reports what is
+  known: a statement that answered keeps its result, one the server answered
+  with an error keeps that error, and one that was sent and got no answer is
+  E021 carrying the connection error, since it may have committed (a SELECT
+  included). Only a statement the driver refused to send reports E004, whose
+  advice is that a retry is safe. A pool without node-postgres's pipeline
+  protocol runs that mode one statement at a time, and there a statement
+  whose answer was lost reported E004, as in 0.93.1, so a retry could apply
+  its write twice. It now follows the same rule, and the connection is
+  discarded.
+
+  A COMMIT the server acknowledged before the connection closed resolves. A
+  pipeline `timeout` keeps its own answer in every phase, unchanged from
+  0.93.1: the connection is destroyed and the call rejects with `TimeoutError`
+  (E002) and `outcome: 'unknown'`, including while a COMMIT is unanswered.
+- **A `{ transactional: false }` pipeline keeps an error raised at a
+  statement's own COMMIT on that statement.** A deferred constraint is checked
+  when each statement commits, after the statement has answered. On a
+  node-postgres pool that error was recorded on the next statement, which
+  then reported a failure although it had committed, while the statement that
+  did not commit reported success. A batch whose last statement failed this
+  way resolved as if every statement had committed. 0.93.1 has the same
+  defect.
+- **A `pipeline()` `timeout` also applies on a pool without node-postgres's
+  pipeline protocol.** Such a pool (one that exposes `query` and `release`
+  but not the driver's wire internals) runs the batch one statement at a
+  time, and that path ignored `timeout`: a statement or a COMMIT that never
+  got an answer held the call and its connection forever. 0.93.1 has the same
+  defect. The deadline now covers every statement, BEGIN and COMMIT included,
+  in both modes. At the deadline the call rejects with `TimeoutError` (E002)
+  and `outcome: 'unknown'`, as on the protocol path, and the connection is
+  released with that error, which tells the pool to discard it. Nothing more
+  is sent on it, so no ROLLBACK follows a COMMIT that was already sent, and a
+  late answer cannot settle the call or release the connection again.
+- **A nested `tx.$transaction` block whose `ROLLBACK TO SAVEPOINT` the server
+  did not acknowledge no longer lets the outer transaction commit.** The block
+  throws its own error, as before, but an outer callback that caught it and
+  returned used to get a COMMIT that saved the block's writes. The outer
+  transaction now sends ROLLBACK instead, and rejects with E019 once the
+  server acknowledges it. A block is still reported as rolled back only when
+  its `ROLLBACK TO SAVEPOINT` was acknowledged.
+- **A cleanup ROLLBACK the server did not acknowledge is no longer reported
+  as one**, on every engine without its own recovery policy (PostgreSQL,
+  SQLite, libsql, SQL Server, PowDB). A ROLLBACK that was refused before it was
+  sent, or answered after the 2 second grace period, discarded the connection
+  but still logged `transaction-rolled-back` and told a leaked handle the
+  transaction "was rolled back". It now logs `transaction-outcome-unknown`, and
+  the handle says the transaction "ended with an unknown outcome". The
+  callback's own error is rethrown, as before.
+- **Networked PowDB no longer reports a rollback after a failed COMMIT.** Its
+  adapter answered the cleanup rollback with an empty local success, which
+  read as an acknowledged rollback although the commit could have taken
+  effect. That rollback is now refused, so the outcome is reported as unknown.
+- **An embedded PowDB database whose COMMIT or ROLLBACK failed is no longer
+  kept in service.** On `@zvndev/powdb-embedded` 0.20.0, a ROLLBACK after a
+  failed write can itself fail with `bad heap superblock magic`, an engine
+  defect. Turbine ignored that failure and let the next operation run: reads
+  returned wrong rows (a missing row, or another row in its place), writes
+  were acknowledged and then lost, and the database could not be reopened.
+  0.93.1 has the same defect. The caller whose COMMIT or ROLLBACK failed, from
+  a nested write, a lookup-first upsert, `$transaction` or `transaction()`,
+  now gets `ConnectionError` (E004) naming that failure, with the engine's
+  error as `cause`, and every later or queued operation on that client is
+  refused with the same error without reaching the engine. Turbine does not
+  reopen or retry. The engine's damage is on disk once its ROLLBACK fails, so
+  the database may still not reopen; disconnect the client and check the
+  database before opening it again. A networked PowDB connection whose COMMIT
+  or ROLLBACK failed is discarded, as before, and the client stays usable.
+- **A transaction `timeout` reports what was confirmed**, on the same
+  engines. When the running statement could not be cancelled, or the ROLLBACK
+  was not acknowledged, the `TimeoutError` used to say
+  `outcome: 'not-executed'`, that the transaction "was rolled back", and that
+  a statement "was cancelled on the server". It now says
+  `outcome: 'unknown'`, that COMMIT was never sent (so none of the writes were
+  saved and a retry cannot apply them twice), and that the server may hold the
+  transaction's locks until it notices the closed connection. A confirmed
+  rollback keeps `'not-executed'` and says the transaction was rolled back. It
+  no longer says a statement was cancelled: the server ignores a cancel request
+  that arrives after the statement finished, and Turbine cannot see which
+  happened.
+- **A COMMIT the server answered stays a confirmed rollback.** An ERROR at
+  COMMIT (a deferred constraint, a serialization failure) or the `ROLLBACK`
+  command tag is still reported as rolled back, keeps its class
+  (`SerializationFailureError` and `DeadlockError` stay retryable), and is
+  still traced on `turbine:query` as a failed COMMIT. A FATAL or PANIC answer
+  is not taken as a rollback, since a backend can die after writing its commit.
+  A COMMIT answer whose fields cannot be read is an unknown outcome, not a
+  rollback.
+- **A server that reports errors in another language keeps the typed COMMIT
+  errors.** node-postgres exposes the severity word in the server's
+  `lc_messages` language (`FEHLER`, `ERREUR`), so a serialization failure,
+  deadlock or deferred constraint violation at COMMIT on such a server read as
+  no answer: E021, the connection discarded, and nothing for `withRetry` to
+  retry. When the word is not English, a SQLSTATE that ends a COMMIT without
+  committing when raised as an ERROR (class 23, class 40 except 40003, and
+  57014) now counts as the server's answer. PostgreSQL raises two of them as
+  FATAL as well, on a read-only hot standby and during authentication, where
+  nothing can have been committed.
+- **A connection release that throws** no longer changes what the caller is
+  told. After an acknowledged COMMIT it sends no ROLLBACK on a connection the
+  pool may already have lent out, and does not report the committed
+  transaction as rolled back. After a failure, the transaction's own error
+  (E021 and its cause included) is what the call rejects with, and the outcome
+  is still logged.
+- Errors built before the cleanup runs no longer promise its result: the
+  unawaited-work error says the transaction "did not commit", a refused
+  `sessionContext` setting says the callback "did not run, and nothing was
+  committed", and a write whose statements share one deadline no longer says
+  its earlier statements "are rolled back".
+- **A write that takes several statements inside the caller's transaction**
+  (a nested write, a lookup-first upsert, a chunked `createMany`, a MySQL
+  write and its re-read) runs in a savepoint of its own. When it timed out,
+  whether its shared deadline passed before its next statement or while one
+  was still running, the `TimeoutError` could say `outcome: 'not-executed'` at
+  once, even when the `ROLLBACK TO SAVEPOINT` that followed was not
+  acknowledged and the write's statements were still in the transaction. It
+  now says `'unknown'` until that rollback answers: `'not-executed'` once it
+  is acknowledged, `'unknown'` when it is not, and the outer transaction then
+  refuses to commit. For a write inside another write's savepoint, the
+  outermost of those rollbacks decides, and a server `statement_timeout` that
+  cancels one of the write's statements follows the same rule.
+- **That timeout's text is true once the rollback answers.** On PostgreSQL, a
+  statement still running at the deadline said the caller's transaction was
+  over and kept nothing, when an acknowledged rollback left that transaction
+  open and able to commit. The error now says what the rollback did: a
+  savepoint rollback undid the write and the transaction can continue, or it
+  was not acknowledged and the transaction cannot commit.
+  On MySQL, which cannot cancel the running statement, it said the statement
+  might still complete after the rollback had waited for it to end and undone
+  it.
+- **A nested write honours its `timeout`.** A `create` or `update` with
+  nested relation writes ignored the call's `timeout`: it ran every statement
+  to completion and committed past the deadline. The timeout is now one
+  deadline for every statement the nested write sends, as it already was for
+  a chunked `createMany`: a statement still running at the deadline times out.
+  In the write's own transaction, that transaction does not commit, and the
+  `TimeoutError` says `'not-executed'` only once the rollback is
+  acknowledged (on MySQL, which cannot cancel the running statement, it says
+  `'unknown'` and COMMIT was never sent). Inside the caller's transaction the
+  write runs in a savepoint of its own, so the timeout rolls back only the
+  write: the caller's transaction can continue and commit once that rollback
+  is acknowledged, and cannot commit when it is not.
+
+#### Other fixes
+
+- **An index is read the way PostgreSQL writes it, so its name, a column name
+  or an expression key no longer changes what it is.** PostgreSQL
+  introspection and `turbine mcp` read an index's uniqueness, columns and
+  predicate by searching the text of its definition, which also holds the
+  index name, the table name, the column names, any expressions and a partial
+  predicate. A non-unique index named `"IDX_UNIQUE_kind"` was recorded as
+  unique. A unique index named `"USING btree (kind)"` over `slug` was recorded
+  as unique on `kind`. A column named `"owner_id DESC"` under a unique index
+  was read as `owner_id`. A unique index over `(tenant_id, lower(email))` was
+  recorded as unique on `tenant_id`, because the expression key was dropped.
+  In each case `findUnique`, `update` and `delete` accepted a `where` naming a
+  value that several rows share, and such an `update` or `delete` wrote every
+  matching row. A foreign key covered by such an index also became a to-one
+  relation, which returned one of its rows instead of all of them, and a
+  nested `delete: true` on it deleted all of them. The definition is now read
+  token by token, and an index counts as unique only when it is a
+  `CREATE UNIQUE INDEX` whose every key is a plain column: a unique index with
+  an expression key keeps its definition but is no longer a unique key over
+  its other columns. Regenerate the client to pick this up. A client
+  generated before this release carries the old index metadata and still
+  accepts those `where` clauses. After regenerating, a `where` that relied on
+  such an index is refused with E003, as for any column that does not
+  identify one row, and the relation is a to-many under its plural name again.
+- **`turbine mcp` derives relations from the same index metadata as
+  `turbine generate`.** Its schema tools built their own index list without
+  the partial flag, so a partial unique index over a join table's two foreign
+  keys (`UNIQUE (a, b) WHERE ...`) made the server report a many-to-many
+  relation that the generated client does not have, and `compile_query`
+  compiled a join that returned the same row more than once.
+- **A column default that only contains the text `nextval(` is no longer
+  taken for a sequence.** Introspection, `turbine mcp` and `schemaDiff` looked
+  for `nextval(` anywhere in a default, string literals included, so
+  `DEFAULT 'nextval(fake)'` was reported as a generated column and `schemaDiff`
+  never compared it with the schema. A default now counts as a sequence only
+  when it is the `nextval(...)` call itself. Regenerate the client to pick up
+  the corrected column metadata.
+- **`schemaDiff` compares the contents of string literals exactly.** It
+  compared defaults after lower-casing the whole text and CHECK expressions
+  after collapsing every run of whitespace, literals included, so changing
+  `DEFAULT 'UPPER'` to `'upper'`, or `CHECK (v <> 'a  b')` to `'a b'`, was
+  reported as no change: no statement for the default, and no warning for the
+  CHECK. Case and whitespace are now folded only outside string literals and
+  quoted identifiers. A default's literal is still compared without case for a
+  column whose type PostgreSQL rewrites when it stores the default (a `uuid`
+  default comes back lower-cased), so those defaults do not report drift.
+- **PostgreSQL array columns use one classification rule** for filters,
+  unique selectors and writes. Array type names with a suffix, such as
+  `text[]`, work alongside catalog names such as `_text`. Whole-array equality
+  on a unique array key identifies one row for `findUnique`, `update`, `delete`,
+  `upsert` and nested `connect` or `connectOrCreate`. Array membership operators
+  still do not identify one row.
+- **Sparse arrays in array-column write data are refused with E003 before
+  SQL is sent.** Every index must have an element, including in nested arrays.
+  Use an explicit `null` for a NULL element. An array written to a scalar
+  column whose type is merely named like an array type is also refused.
+- **`turbine mcp` honors `legacyToManyUniques` on PostgreSQL.** It forwarded
+  the option on SQLite, MySQL and SQL Server, but its PostgreSQL schema tools
+  ignored it, so with the option set they reported `users.profile` (`hasOne`)
+  while `turbine generate` produced `users.profiles` (`hasMany`) for the same
+  database.
+- **Generated clients for a table named `records` or `dates`** keep the
+  built-in `Record` and `Date` types for other fields, so an entity named
+  `Record` or `Date` no longer changes what those fields mean. Every
+  generated client now spells those types `globalThis.Date` and
+  `{ [key in string]: ... }`, so regenerating shows that textual change in
+  files whose types are the same as before.
+- **SQLite reads decode correctly after a schema change on the same handle.**
+  Column decoders are taken from the statement's result metadata after it
+  runs, not cached from before the change.
+- **SQLite introspection no longer drops a user table named like
+  `sqlitex_log`.** The reserved-prefix filter was `NOT LIKE 'sqlite_%'`, where
+  `_` matches any character, so any table whose name began with `sqlite` and
+  one more character was left out. Only the literal `sqlite_` prefix is
+  skipped now.
+- **SQLite wildcard result width after prepare.** On runtimes whose builtin
+  `all()` keeps the prepare-time width (Node 22.16 and 24.10, for example),
+  statements containing `*` use native iteration to preserve the executed
+  projection when SQLite reprepares after a schema change, including one made
+  by another connection. Before, the first such read dropped the new column,
+  including the row returned by a write that had already committed. A
+  once-per-process check keeps `all()` where it is already correct (Node
+  26.12, for example), so those runtimes pay nothing; on an affected runtime a
+  wildcard read is slower than before. On Node 22.5 to 22.15 every builtin
+  reader fixes the width before the first step, so that defect remains there;
+  use Node 22.16 or later when the schema can change while the application
+  runs. Repeated result names on both drivers now use the final column's
+  decoder, including expressions that replace a boolean or JSON origin.
+- **`turbine init --engine libsql`** no longer fails with "Unsupported local
+  libSQL option: d1". An option whose value is unset is not a setting, so the
+  libSQL project check ignores it.
+- **A nested write returns everything it wrote.** `create` and `update`
+  return the tree they wrote. Three shapes came back short, as if rows had not
+  been written, although they had. A created child row that set a column named
+  `data`, `create` or `update` (a JSON `data` column, for example) came back
+  without its own nested rows. When sibling rows wrote the same relation and
+  only some of them went a level deeper, only the last sibling's deeper rows
+  were returned, so the result depended on the order of the rows. A row
+  created through a nested `connectOrCreate` came back without its nested
+  rows. All three are fixed on every engine that runs nested writes. When
+  `connectOrCreate` finds an existing row instead, that row's related rows
+  are returned at the levels its `create` names. A tree nested more than ten
+  levels below its root, which a read cannot return, is now refused with
+  E007 before any statement on the SQL engines. It used to be written when its
+  last level had no nested rows of its own, or when the depth came from
+  `update`, `upsert` or `connectOrCreate`, and came back cut off at the tenth
+  level.
+- **`optimisticLock` with its version column also in `data`.** The update
+  assigned the column twice (`"version" = ... , "version" = "version" + 1`),
+  which PostgreSQL rejects with SQLSTATE 42601, so the call failed with an
+  untyped database error. It is now refused with E003 before anything is
+  sent, on every engine, also when `data` has relation writes (there the lock
+  was dropped and the version written as given, see the next entry): the lock
+  writes the version itself.
+- **`optimisticLock` on an `update` whose `data` has relation writes is no
+  longer ignored.** When `data` also created, connected or changed related
+  rows, the parent's UPDATE was rebuilt without the lock, on every engine that
+  runs nested writes: a stale `expected` version wrote anyway, overwriting a
+  concurrent change, and an update with only relation writes left the version
+  as it was. 0.93.1 has the same defect. The parent's UPDATE now checks and
+  bumps the version before any relation write. A stale version is
+  `OptimisticLockError` (E015) with nothing written, an update with only
+  relation writes bumps the version once, and a relation write that fails
+  takes the bump back with it: the call's own transaction rolls back, and
+  inside `$transaction` the write's savepoint does (PowDB has no savepoints,
+  so there only the caller's rollback undoes it). The lock still covers the
+  top-level row only; a nested `update` of a related row takes no
+  `optimisticLock`. On PowDB, an `update` whose lock is all it writes now
+  bumps the version, as the SQL engines do, instead of failing with E003.
+- **Raw SQL inside `$transaction` could end the transaction after a
+  vertical tab.** The screen that refuses `COMMIT`, `ROLLBACK` and the other
+  transaction-control statements on the raw paths did not treat a vertical
+  tab as whitespace on PostgreSQL, so `tx.rawUnsafe('SELECT 1;\vCOMMIT')`
+  committed in the middle of the callback, and a write made before it
+  survived the callback's rollback. It is now refused with E003 like any
+  other `COMMIT`. Reaching it needed control of raw SQL text.
+
+### Performance
+
+A separate comparison with published 0.93.1 used four independent installs,
+including an identical 0.93.1 noise arm, fresh random arm order per round and
+two opposite load orders, with 300 paired rounds per shape per run. Percentages
+in this comparison are medians of paired per-round latency changes:
+
+- **Repeated small builtin SQLite statements reuse native preparation on
+  handles opened by the factory.** Result descriptions still come from the
+  executed statement on every nonempty result, including after external DDL,
+  rollback and namespace changes. The memo has at most 128 admitted plans,
+  an 8 KiB converted-binding budget per statement and a 128-row result cutoff.
+  Native streams, DDL and PRAGMAs always prepare fresh. Statements producing
+  larger results or binding BLOBs are not retained for another execution.
+  Accessing `SqlitePool.db` permanently disables reuse; supplied
+  and wrapped handles also keep fresh preparation so changing authorizer
+  policies and prepare callbacks still run on every call. A statement
+  containing `*` is kept only where the runtime's reader follows a reprepare,
+  checked once per process, so on Node 22.13 to 22.15 those statements are
+  prepared fresh.
+- **Remaining SQLite costs versus 0.93.1.** Opening a new client and reading
+  one indexed row still measured about 8 percent higher latency (13 microseconds).
+  Its first query gains nothing from statement reuse. 0.93.1 also prepared and
+  described that statement; the remaining difference was not attributed to
+  one component. Supplied handles, and owned handles after `SqlitePool.db` is
+  read, retain the metadata cost on every call: an indexed lookup and count
+  measured about 10 percent higher latency, and a 50-lookup loop about 27
+  percent. These costs
+  preserve correct decoding and caller authorizers; the warm owned-handle
+  improvement does not apply to them. See [decoding](docs/sqlite-decoding.md).
+- **Scalar filter compilation avoids temporary operator arrays.** `in`,
+  `notIn`, range and LIKE operands keep the same validation and binding order
+  on SQL-template hits. The measured `in` / `contains` shapes on PostgreSQL,
+  MySQL and builtin SQLite all finished within 3 percent of 0.93.1.
+  PostgreSQL's combined and `contains` filters retained about 1 percent higher
+  latency; validation and parameter collection still run on template hits.
+- **PostgreSQL reuses a verified last-projection decode plan.** Every result
+  still checks all column names, and every call rechecks native text-row
+  eligibility. Flat reads of 1, 3, 6, 10, 20 and 100 rows finished within
+  3 percent of 0.93.1. The one-row case retained about 1 to 2 percent overhead;
+  no limit-based cutoff was added. The large-read gains below remain.
+- **MySQL transaction reads retain a small cost.** A 50-statement read
+  transaction measured about 1 to 2 percent higher latency than 0.93.1.
+  A smaller loss also appeared with the unrelated fast paths disabled; no
+  transaction-specific cause was isolated, and no transaction fix is claimed.
+
+The following measurements compare this release with the earlier development
+tree, rather than with 0.93.1.
+
+Measured on Linux x64 with Node 26.12.0, as paired runs of this release
+against the tree before these changes. Each range is the 95 percent interval
+of the measured cases, rounded outward to whole percents.
+
+- **Flat PostgreSQL `findMany` reads decode array rows in one pass.** On
+  PostgreSQL 18.6, flat reads measured 16 to 24 percent lower latency for
+  5,000 to 50,000 rows, 24 to 27 percent for a 1,000-row, 39-column read and
+  7 to 10 percent for a 100-row read. This path needs a pool from the same
+  node-postgres copy, its standard `Client`, and text mode. It accepts owned
+  and supplied pools, but excludes binary mode, custom clients, Neon pools,
+  transactions, nonzero per-query timeouts and any `with` clause; reads on
+  those paths measured the same as before. Other read methods, streams and
+  pipelines keep their existing paths.
+- **SQLite generated bulk inserts bind positionally on eligible handles.**
+  A 1,000-row `createMany` measured 35 to 43 percent lower latency on builtin
+  SQLite and 36 to 43 percent on factory-owned better-sqlite3 12.11.1
+  handles. Genuine builtin handles need an unchanged native `prepare`.
+  Supplied better-sqlite3 handles and wrapped or proxied builtin handles keep
+  named binding and measured within 1 percent of the previous tree, slightly
+  slower. `onConflict`, changed SQL (including `sqlComment`), copied
+  parameter arrays and identifiers that prevent the positional rewrite also
+  keep the existing binding path.
+- **Builtin SQLite wildcard reads decode native array rows when the runtime
+  probe permits it.** Flat reads of 5,000 to 50,000 rows measured 18 to 28
+  percent lower latency, and a 1,000-row, 39-column read 16 to 18 percent. The
+  capability probe also admits Node 22.16.0 and 24.10.0, using iteration where
+  native `all()` cannot preserve a changed result width; those versions were
+  checked for correctness, not measured. A `SELECT` containing `*` qualifies
+  unless it is a single-row read (`LIMIT 1`). Wrapped statements, older
+  runtimes without the native methods, writes with `RETURNING` and supplied
+  better-sqlite3 handles keep their existing readers. Factory-owned
+  better-sqlite3 already decoded array rows and gains no new read path here.
+- **SQLite reads with nested relations decode each nested row in one pass**,
+  through a plan compiled once per query, as the PostgreSQL default encoding
+  already did. On the builtin driver and better-sqlite3 alike, reads measured
+  12 to 14 percent lower latency for 50 users with their posts, 8 to 11
+  percent for 10 users with posts and comments, 6 to 9 percent for 500 posts
+  with authors and for 200 posts with tags, and 3 to 5 percent for one user
+  with posts and comments. SQL Server and PostgreSQL with
+  `jsonEncoding: 'object'` take the same path and were checked for identical
+  results, not timed. MySQL returns the keys of a JSON object sorted, so it
+  keeps the previous decoder, and its relation reads measured the same as
+  before. So does any nested row whose keys do not arrive in the order the
+  statement wrote them.
+
+### Changed
+
+- **Bundle-size limits.** Five limits rise: the main barrel from 149 to 154
+  kB brotli, the edge entry from 117 to 120 kB, `turbine-orm/sqlite` and
+  `turbine-orm/mysql` from 127 to 134 kB, and `turbine-orm/mssql` from 129
+  to 131 kB. The shared query graph grew with the transaction outcome
+  reporting, the array and upsert rules, the read paths described above and
+  the `optimisticLock` and pipeline fixes, and the barrel also carries the
+  reader for catalog text. Straight-line operand compilation and the
+  last-projection decode plan trade a small amount of bundle space for lower
+  fixed costs on repeated small reads.
+  Measured on this release with `npm run size` (brotli, drivers external):
+
+  | Entry | Measured | Limit |
+  |---|---|---|
+  | `turbine-orm` (whole barrel) | 153.84 kB | 154 kB |
+  | `turbine-orm/serverless` | 119.55 kB | 120 kB |
+  | `turbine-orm/sqlite` | 130.82 kB | 134 kB |
+  | `turbine-orm/mysql` | 129.90 kB | 134 kB |
+  | `turbine-orm/mssql` | 130.63 kB | 131 kB |
+  | `turbine-orm/better-sqlite3` | 132.36 kB | 135 kB |
+  | `turbine-orm/libsql` | 124.98 kB | 129 kB |
+  | `turbine-orm/neon-ws` | 122.18 kB | 125 kB |
+  | `turbine-orm/neon-http` | 103.34 kB | 106 kB |
+  | `turbine-orm/core` | 103.18 kB | 106 kB |
+  | `turbine-orm/d1` | 107.78 kB | 111 kB |
+  | `turbine-orm/notification-hub` | 8.85 kB | 10 kB |
+  | `turbine-orm/live-query` | 973 B | 2 kB |
+  | `turbine-orm/sql` | 2.54 kB | 3 kB |
+
+- `EngineCapabilities` has two new required keys, `classifiesCommitAnswer`
+  (see Transaction outcomes) and `jsonObjectKeysAsWritten`, which says
+  whether the engine returns a JSON object's keys in the order the statement
+  wrote them and so whether nested rows can use the compiled decode plan. A
+  custom dialect copies them only if it spreads a shipped dialect's
+  `capabilities` object as well as the dialect; otherwise it fails to compile
+  until it states them.
+
+### Documentation
+
+- **[`docs/engine-support.md`](docs/engine-support.md)**, generated from
+  `docs/engine-support.json`, lists for every route its tier, the versions CI
+  runs, every feature row and the test behind each claim. A unit test checks
+  the citations against the workflows and test files. The site's engines page
+  shows the same tiers.
+- Per-engine guides for every addition above are under [`docs/`](docs/README.md).
+
+### Known limits
+
+- **What keeps other routes below Supported**, from the matrix: libSQL and Neon
+  WebSocket lack native coverage for some core features. D1 and Neon HTTP
+  refuse nested writes by design. SQL Server and libSQL remain Deferred.
+  Their lifecycle support is not complete in this release.
+- **No hosted provider is tested.** Neon, D1, Supabase, AlloyDB, TimescaleDB
+  and the edge runtimes run in CI only through local stand-ins, or not at all.
+- **`pg` is still installed for every engine.** It remains the one runtime
+  dependency, including for SQLite, MySQL, SQL Server, libSQL and D1 apps.
+- **`miniflare` is an optional peer pinned to `4.20260730.0`.** A project with
+  another Miniflare version installed gets a peer warning; only the local D1
+  CLI loads it.
+- **SQLite work is synchronous.** Statements, lock waits and stream steps block
+  the event loop, and cancellation acts only between pulls.
+- **libSQL**: local files only, and migrations are limited to additive
+  `CREATE TABLE`, `CREATE INDEX` and `INSERT` statements.
+
 ## 0.93.1 (2026-10-29)
 
 A numeric range filter on a JSON path no longer fails the whole query when

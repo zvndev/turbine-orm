@@ -62,11 +62,11 @@ function canonicalPath(p: string): string {
 /**
  * The canonical path of THIS module's own file, captured once at load time from
  * a fresh stack. It is used to skip the library's own frames when locating the
- * caller. This is robust to the src (`seed.ts`) vs published dist (`seed.js`)
- * basename difference AND to the fact that the user's own file is ALSO named
- * `seed.ts`, which a basename skip-list would wrongly exclude. This fixes the
- * silent no-op: previously the plain-path skip-list only knew `src/seed.ts`, so
- * the library's own `dist/seed.js` frame (or a tsx plain-path frame) was
+ * caller. This handles the src (`seed.ts`) vs published dist (`seed.js`)
+ * basename difference AND the fact that the user's own file is ALSO named
+ * `seed.ts`, which a basename skip-list would wrongly exclude. Previously the
+ * plain-path skip-list only knew `src/seed.ts`, so the library's own
+ * `dist/seed.js` frame (or a tsx plain-path frame) was
  * mistaken for the caller and the entry===caller self-run check never passed.
  */
 const SELF_PATH: string | null = (() => {

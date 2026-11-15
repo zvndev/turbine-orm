@@ -22,8 +22,9 @@ import {
 } from './errors.js';
 import { markInternalRowSelector } from './query/compound-unique.js';
 import { resolveExcludedFromCreate } from './query/expr.js';
-import { isPlainRecord, setOwn } from './query/filters.js';
-import { markInternalCombinator, resolveColumnName } from './query/utils.js';
+import { columnOperandKind, columnTypeToken, isPlainRecord, setOwn } from './query/filters.js';
+import { assertArrayWrite } from './query/writes.js';
+import { markInternalCombinator, resolveColumnName } from './query-utils.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from './schema.js';
 import { normalizeKeyColumns } from './schema.js';
 
@@ -43,7 +44,7 @@ export interface ExtractedFields {
 
 /**
  * Transaction context for nested write operations.
- * Matches the subset of TransactionClient that we actually use.
+ * Matches the subset of TransactionClient used for nested writes.
  */
 export interface NestedWriteContext {
   schema: SchemaMetadata;
@@ -72,7 +73,11 @@ export interface NestedWriteContext {
     ): {
       create(args: { data: Partial<T> }): Promise<T>;
       createMany(args: { data: Partial<T>[]; skipDuplicates?: boolean }): Promise<T[]>;
-      update(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<T>;
+      update(args: {
+        where: Record<string, unknown>;
+        data: Record<string, unknown>;
+        optimisticLock?: NestedOptimisticLock;
+      }): Promise<T>;
       updateMany(args: {
         where: Record<string, unknown>;
         data: Record<string, unknown>;
@@ -209,6 +214,75 @@ function isRelationEntry(meta: TableMetadata, key: string, value: unknown): bool
     !Array.isArray(value) &&
     !(value instanceof Date)
   );
+}
+
+/**
+ * Where each operation of a relation payload carries rows of the related
+ * table, by the keys the engine reads them from: `create` is a row or a list
+ * of them, `connectOrCreate` holds one under `create`, `update` under `data`,
+ * and `upsert` under `create` and `update`. `updateMany` holds one under
+ * `data` as `update` does (the operation itself is refused by name). `connect`,
+ * `disconnect`, `set` and `delete` name rows that exist and write none, and a
+ * `where` is a selector, never a row.
+ */
+const PAYLOAD_ROWS: readonly (readonly [string, readonly string[] | null])[] = [
+  ['create', null],
+  ['connectOrCreate', ['create']],
+  ['update', ['data']],
+  ['updateMany', ['data']],
+  ['upsert', ['create', 'update']],
+];
+
+/**
+ * {@link assertArrayWrite} over every row a nested write will write,
+ * before it opens a transaction: the engine binds each level's rows only when
+ * it reaches them, after the rows above are written. `rows` is a row of
+ * `table` or a list of them. A key is a relation exactly when the engine reads
+ * it as one ({@link isRelationEntry}) and its payload is followed by
+ * {@link PAYLOAD_ROWS}; any other key naming a column is a value and is never
+ * descended into, so neither a JSON document nor a column named like an
+ * operation (`data`, `create`, `set`) is taken for a payload. An update's
+ * `{ set }` is checked as the value it writes.
+ *
+ * The same walk refuses a tree that is too deep, with the error a read gives
+ * for the same depth. The engine counts depth only along a chain of `create`
+ * operations that themselves nest, so a row at the last level, or a chain
+ * through `update`, `upsert` or `connectOrCreate`, was written however deep it
+ * sat, and the tree returned to the caller then stopped at the read limit
+ * without those rows. A write is accepted only when its whole tree can be
+ * returned.
+ */
+export function assertNestedArrayWrites(
+  schema: SchemaMetadata,
+  table: string,
+  rows: unknown,
+  depth = 0,
+  path: string[] = [],
+): void {
+  const meta = schema.tables[table];
+  if (!meta) return;
+  for (const row of toArray(rows)) {
+    if (!isPlainRecord(row)) continue;
+    if (depth > MAX_DEPTH) throw new CircularRelationError(path);
+    for (const [key, value] of Object.entries(row)) {
+      if (isRelationEntry(meta, key, value)) {
+        const to = meta.relations[key]!.to;
+        const below = [...path, key];
+        for (const [op, at] of PAYLOAD_ROWS) {
+          for (const item of toArray((value as Record<string, unknown>)[op])) {
+            if (at === null) assertNestedArrayWrites(schema, to, item, depth + 1, below);
+            else if (isPlainRecord(item))
+              for (const k of at) assertNestedArrayWrites(schema, to, item[k], depth + 1, below);
+          }
+        }
+        continue;
+      }
+      const column = resolveColumnName(meta, key);
+      if (column === undefined) continue;
+      const written = isPlainRecord(value) && Object.hasOwn(value, 'set') ? value.set : value;
+      assertArrayWrite(columnOperandKind(meta, column), columnTypeToken(meta, column), table, key, written);
+    }
+  }
 }
 
 /**
@@ -369,6 +443,14 @@ function singleToOneItem<T>(value: T | T[], op: string, relName: string, rel: Re
 }
 
 /**
+ * The operations whose rows {@link readBackWith} follows into deeper levels:
+ * every one that can write a row of the related table. A `connectOrCreate`
+ * that finds its row writes none; the levels requested for its `create` then
+ * return that existing row's related rows, as any relation read does.
+ */
+const READ_BACK_OPS: ReadonlySet<string> = new Set(['create', 'connectOrCreate', 'update', 'upsert']);
+
+/**
  * The `with` clause that reads back the tree a nested write just wrote.
  *
  * Built from the DATA, recursively: a relation whose payload itself contains
@@ -395,26 +477,35 @@ function readBackWith(
     const rel = tableMeta.relations[relName];
     if (!rel) continue;
     // Every payload this relation was written with: `create` / `update` /
-    // `upsert` take objects (or arrays of them) whose own keys may name
-    // relations of the TARGET table. `connect` / `disconnect` / `set` name
-    // existing rows and write no nested data, so they contribute nothing here.
-    const nested: Record<string, Record<string, unknown>> = {};
-    for (const key of ['create', 'update', 'upsert'] as const) {
-      const payload = ops[key];
-      if (payload === undefined) continue;
-      for (const item of toArray(payload as unknown)) {
-        // `{ where, data }` (nested update) and `{ where, create, update }`
-        // (nested upsert) carry their written fields one level in.
-        const bodies =
-          isPlainRecord(item) && ('data' in item || 'create' in item || 'update' in item)
-            ? [item.data, item.create, item.update]
-            : [item];
+    // `upsert` / `connectOrCreate` carry rows (or arrays of them) whose own
+    // keys may name relations of the TARGET table. `connect` / `disconnect` /
+    // `set` name existing rows and write no nested data, so they contribute
+    // nothing here.
+    const nested: Record<string, Record<string, unknown[]>> = {};
+    for (const [op, at] of PAYLOAD_ROWS) {
+      if (!READ_BACK_OPS.has(op)) continue;
+      for (const item of toArray(ops[op] as unknown)) {
+        // Where the written rows sit is decided by the OPERATION, as the
+        // engine reads it, never by the row's own keys: a child column named
+        // `data`, `create` or `update` is a value of a created row, not a
+        // wrapper around one.
+        const bodies = at === null ? [item] : isPlainRecord(item) ? at.map((k) => item[k]) : [];
         for (const body of bodies) {
           if (!isPlainRecord(body)) continue;
           const child = schema.tables[rel.to];
           if (!child) continue;
           for (const [k, v] of Object.entries(extractRelationFields(body, child).relations)) {
-            nested[k] = { ...(nested[k] ?? {}), ...v };
+            // Every sibling row counts, not the last one: two rows that both
+            // write the same relation with the same operation each bring their
+            // own deeper relations, so their payloads are kept side by side, in
+            // a list this walk owns and appends to (never a copy per sibling).
+            const into = nested[k] ?? {};
+            nested[k] = into;
+            for (const [op, payload] of Object.entries(v)) {
+              const list = Object.hasOwn(into, op) ? into[op]! : [];
+              into[op] = list;
+              for (const one of toArray(payload)) list.push(one);
+            }
           }
         }
       }
@@ -1087,7 +1178,7 @@ async function processManyToMany(
  * The E001 raised when a nested delete/update/disconnect target is not a child
  * of this parent (it belongs to another parent, or does not exist at all).
  * Matches Prisma's behavior: the nested where is scoped to the relation, so a
- * row outside the relation is simply "not found".
+ * row outside the relation is "not found".
  */
 function notRelatedToParent(op: string, relName: string, rel: RelationDef, target: unknown): NotFoundError {
   // Object form, not the legacy string one: `err.table` / `err.where` /
@@ -1152,6 +1243,16 @@ export interface NestedReturnShape {
   omit?: Record<string, boolean>;
 }
 
+/**
+ * The `optimisticLock` of an `update` whose `data` carries relation writes. It
+ * applies to the TOP-LEVEL row only: executeNestedUpdate hands it to the
+ * parent's own UPDATE, which runs before any relation operation.
+ */
+export interface NestedOptimisticLock {
+  field: string;
+  expected: number;
+}
+
 export async function executeNestedCreate(
   ctx: NestedWriteContext,
   tableName: string,
@@ -1185,7 +1286,7 @@ export async function executeNestedCreate(
 
   // belongsTo relations put the foreign key on the PARENT row, so they must be
   // resolved BEFORE the parent is inserted, otherwise a NOT NULL FK column
-  // fails on the initial INSERT. We resolve each belongsTo op (create/connect/
+  // fails on the initial INSERT. Resolve each belongsTo op (create/connect/
   // connectOrCreate) to its referenced row and fold the FK values into the
   // parent's own INSERT.
   const belongsToFks: Record<string, unknown> = {};
@@ -1246,7 +1347,8 @@ export async function executeNestedCreate(
 /**
  * Tree-walking update: updates the parent row with scalar data, then
  * processes each relation operation (create, connect, connectOrCreate,
- * disconnect, set, delete), and reads back the full tree.
+ * disconnect, set, delete), and reads back the full tree. `optimisticLock`
+ * is the top-level `update`'s, checked and bumped by the parent's UPDATE.
  */
 export async function executeNestedUpdate(
   ctx: NestedWriteContext,
@@ -1256,6 +1358,7 @@ export async function executeNestedUpdate(
   depth = 0,
   path: string[] = [],
   returnShape?: NestedReturnShape,
+  optimisticLock?: NestedOptimisticLock,
 ): Promise<Record<string, unknown>> {
   if (depth > MAX_DEPTH) {
     throw new CircularRelationError(path);
@@ -1280,10 +1383,15 @@ export async function executeNestedUpdate(
     validateOps(relName, ops, true, rel);
   }
 
-  // Update parent row with scalar data (may be empty if only relation ops)
+  // Update the parent row first, before any relation operation, so a missing
+  // row or a lock conflict leaves nothing to undo. With `optimisticLock` the
+  // versioned UPDATE runs even when `data` has only relation writes: it is the
+  // version check, and a relation-only write changes the row's version too.
   let parentRow: Record<string, unknown>;
-  if (Object.keys(scalars).length > 0) {
-    parentRow = (await ctx.tx.table(tableName).update({ where, data: scalars })) as Record<string, unknown>;
+  if (optimisticLock || Object.keys(scalars).length > 0) {
+    parentRow = (await ctx.tx
+      .table(tableName)
+      .update({ where, data: scalars, ...(optimisticLock && { optimisticLock }) })) as Record<string, unknown>;
   } else {
     parentRow = (await ctx.tx.table(tableName).findUnique({ where })) as Record<string, unknown>;
     if (!parentRow) {

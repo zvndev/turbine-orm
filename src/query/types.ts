@@ -419,14 +419,115 @@ type RelationWhereValue<Rel> =
  * properties, so a misspelled column OR relation is a compile error at the
  * offending key while every legitimate filter shape still typechecks.
  *
+ * Query methods infer `Input` from the supplied filter's own keys for tables
+ * with Object prototype-named columns. This lets `{ id: 1 }` omit a text
+ * `constructor` column without admitting an explicitly supplied Function.
+ * For an explicit annotation, `WhereClause<T, R, typeof filter>` uses the same
+ * admission rules; the existing two-argument spelling remains structural.
+ *
  * When `R` is omitted / `{}` (the untyped escape hatch, `defineSchema`-only
  * clients, and any call site that does not thread the relations map) the type
  * degrades to exactly its historical permissive form.
  */
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
-export type WhereClause<T, R extends object = {}> = [keyof R] extends [never]
-  ? LooseWhereClause<T>
-  : StrictWhereClause<T, R>;
+export type WhereClause<T, R extends object = {}, Input = unknown> = unknown extends Input
+  ? [keyof R] extends [never]
+    ? LooseWhereClause<T>
+    : StrictWhereClause<T, R>
+  : InferredWhere<T, R, Input> & ([InvalidWhereInput<T, R, Input>] extends [never] ? unknown : never);
+
+// biome-ignore lint/complexity/noBannedTypes: the exact inherited Object keys, not an object value type
+type ObjectPrototypeKeys = keyof Object;
+
+/**
+ * Select inferred filter admission only for prototype-named tables. Ordinary
+ * tables use their original argument type directly, preserving contextual
+ * inference without instantiating repeated generic overloads. With an unknown
+ * filter input the inferred signature retains the structural argument contract
+ * for Parameters/ReturnType and explicitly typed args. Keep that contract as an
+ * unconditional alternative so structural subtypes and unresolved public
+ * WhereClause generics do not have to prove a recursive inferred conditional.
+ */
+export type PrototypeFilterInput<T, R extends object, Input, Ordinary = never> =
+  | Ordinary
+  | ([Extract<keyof T | keyof R, ObjectPrototypeKeys>] extends [never] ? never : Input);
+
+// Map the INPUT's keys: omitted Object methods never become predicates. A
+// separate admission check prevents deferred conditional mapped types from
+// accepting an explicit Function. Check every union branch before admitting it.
+// biome-ignore lint/complexity/noBannedTypes: reject all function inputs, including the non-call-signature Function interface
+type WhereFunction = Function;
+
+type InferredWhere<T, R extends object, Input> = Input extends WhereFunction | readonly unknown[]
+  ? never
+  : Input extends object
+    ? // Reuse an already structural filter without remapping its recursive
+      // controls. Check each union branch independently, just like admission.
+      [Input, WhereClause<T, R>] extends [WhereClause<T, R>, Input]
+      ? WhereClause<T, R>
+      : { [K in keyof Input]: InputWhereField<T, R, K, Input[K]> }
+    : never;
+
+type InvalidWhereInput<T, R extends object, Input> = Input extends unknown
+  ? [Input] extends [InferredWhere<T, R, Input>]
+    ? never
+    : Input
+  : never;
+
+type InputWhereField<T, R extends object, K, Value> = (K extends keyof T
+  ? InputWhereValue<T[K], Extract<keyof T, string>, Value> | undefined
+  : unknown) &
+  (K extends keyof R ? InputRelationValue<R[K], Value> | undefined : unknown) &
+  (K extends 'OR' | 'AND'
+    ? Value extends readonly unknown[]
+      ? { [Index in keyof Value]: WhereClause<T, R, Value[Index]> }
+      : Value extends undefined
+        ? undefined
+        : never
+    : K extends 'NOT'
+      ? Value extends undefined
+        ? undefined
+        : WhereClause<T, R, Value>
+      : K extends keyof T | keyof R
+        ? unknown
+        : [keyof R] extends [never]
+          ? unknown
+          : never);
+
+type ObjectKeys<Value> = Value extends object ? keyof Value : never;
+
+// Preserve the ordinary scalar/operator union and its excess-property checks,
+// including nested `not`. JSON/object-valued columns retain their existing rules.
+type InputWhereValue<V, F extends string, Input> = WhereValue<V, F> &
+  ([V] extends [ScalarWhereType] ? InputValueKeys<V, WhereValue<V, F>, Input> : unknown);
+
+type InputValueKeys<V, Allowed, Input> = Input extends V
+  ? unknown
+  : Input extends (...args: never[]) => unknown
+    ? never
+    : Input extends object
+      ? Exclude<keyof Input, ObjectKeys<Allowed>> extends never
+        ? Input extends { not: infer Inner }
+          ? InputValueKeys<V, WhereOperator<V>, Inner>
+          : unknown
+        : never
+      : unknown;
+
+type InputRelationValue<Rel, Input> = Input extends unknown
+  ? Rel extends RelationDescriptor<infer Target, infer Cardinality, infer TR>
+    ? Cardinality extends 'many'
+      ? InputRelationControls<Target, TR & object, Input, 'some' | 'every' | 'none'>
+      : Extract<keyof Input, 'is' | 'isNot'> extends never
+        ? WhereClause<Target, TR & object, Input>
+        : InputRelationControls<Target, TR & object, Input, 'is' | 'isNot'>
+    : unknown
+  : never;
+
+type InputRelationControls<T, R extends object, Input, Controls> = Input extends WhereFunction | readonly unknown[]
+  ? never
+  : Input extends object
+    ? { [K in keyof Input]: K extends Controls ? WhereClause<T, R, Exclude<Input[K], undefined>> | undefined : never }
+    : never;
 
 /** The historical, index-signature-carrying where clause. See {@link WhereClause}. */
 export type LooseWhereClause<T> = {
@@ -862,7 +963,7 @@ type ToManyKeys<R> = {
  * Key-validating companion for an inferred `select` / `omit` flag map.
  *
  * `select?: S` alone can never reject a typo: `S` is inferred FROM the object
- * literal, so `{ emial: true }` simply becomes the inferred type and a
+ * literal, so `{ emial: true }` becomes the inferred type and a
  * misspelled column silently narrows the result to `Pick<T, never>`. Writing
  * the property as `S & FieldFlags<T, S>` keeps `S` inferred exactly as before
  * (the naked `S` member is still the inference site, so literal `true` values
@@ -982,6 +1083,7 @@ export interface FindUniqueArgs<
   S extends Record<string, boolean> | undefined = undefined,
   O extends Record<string, boolean> | undefined = undefined,
   U = unknown,
+  Input = unknown,
 > {
   /**
    * Row selector. Keys are checked against `T` and `R` (see {@link WhereClause}).
@@ -989,7 +1091,7 @@ export interface FindUniqueArgs<
    * is known, the selector must name one unique key or compound selector, and
    * may add further filters beside it.
    */
-  where: U & WhereClause<T, R>;
+  where: U & WhereClause<T, R, Input>;
   /** Only return these fields. Keys are checked against `T` (see {@link FieldFlags}). */
   select?: FlagsArg<T, S>;
   /** Exclude these fields. Keys are checked against `T` (see {@link FieldFlags}). */
@@ -1035,9 +1137,10 @@ export interface FindManyArgs<
   W extends TypedWithClause<R> = TypedWithClause<R>,
   S extends Record<string, boolean> | undefined = undefined,
   O extends Record<string, boolean> | undefined = undefined,
+  Input = unknown,
 > {
   /** Row filter. Keys are checked against `T` and `R` (see {@link WhereClause}). */
-  where?: WhereClause<T, R> | undefined;
+  where?: WhereClause<T, R, Exclude<Input, undefined>> | undefined;
   /** Only return these fields. Keys are checked against `T` (see {@link FieldFlags}). */
   select?: FlagsArg<T, S>;
   /** Exclude these fields. Keys are checked against `T` (see {@link FieldFlags}). */
@@ -1048,6 +1151,8 @@ export interface FindManyArgs<
   with?: (W & TypedWithClause<R>) | undefined;
   /** Cursor-based pagination: start after this row */
   cursor?: Partial<T> | undefined;
+  /** Explicit PostgreSQL row comparison; requires complete non-null scalar cursor values and a uniform total order. */
+  cursorPredicate?: 'lexicographic' | 'tuple' | undefined;
   /**
    * Prisma's spelling of {@link FindManyArgs.limit}. Folded into `limit` before
    * anything reads it; passing both with different values is a
@@ -1174,7 +1279,7 @@ export interface FindManyArgs<
    *     setting TURBINE applied is visible: a `plan_cache_mode` installed by a
    *     caller's `SET`, `ALTER ROLE`, or a pooler cannot be seen or refused.
    *   - `false` / omitted changes nothing. It does not opt back out of a
-   *     client-level setting, it simply leaves that setting in charge.
+   *     client-level setting, it leaves that setting in charge.
    *   - With the client-level `preparedStatements: false`, every statement is
    *     already unnamed, so this option is a no-op for plan choice.
    *
@@ -1214,7 +1319,7 @@ export interface FindManyArgs<
    *
    * 60x, with no `ORDER BY` anywhere. The custom planner knows tenant 400 is
    * 20% of the table, so with `LIMIT 20` it prices a sequential scan as
-   * essentially free on the assumption it will stop almost immediately. It is
+   * nearly free on the assumption it will stop almost immediately. It is
    * right about how MANY rows match and wrong about WHERE they are: they are
    * all at the end of the heap, so it reads 319,600 non-matching rows first.
    * The generic plan, unable to see the value, estimates 500 rows, takes the
@@ -1296,6 +1401,14 @@ export interface FindManyStreamArgs<
   S extends Record<string, boolean> | undefined = undefined,
   O extends Record<string, boolean> | undefined = undefined,
 > extends Omit<FindManyArgs<T, R, W, S, O>, 'lock'> {
+  /**
+   * Cancel this stream with the signal's original reason. Pre-abort sends no
+   * SQL. Opting in bypasses the speculative materialized read. PostgreSQL
+   * requires a native pg cancel target; MySQL discards its active checkout;
+   * SQL Server cancels and settles its request. SQLite checks between steps
+   * and cannot interrupt synchronous work. See docs/stream-cancellation.md.
+   */
+  signal?: AbortSignal | undefined;
   /**
    * Number of rows to fetch per internal FETCH batch (default: 1000).
    *
@@ -1582,9 +1695,10 @@ export interface UpdateArgs<
   S extends Record<string, boolean> | undefined = undefined,
   O extends Record<string, boolean> | undefined = undefined,
   D = UpdateDataInput<T, R>,
+  Input = unknown,
 > {
   /** Row selector. Keys are checked against `T` and `R` (see {@link WhereClause}). */
-  where: WhereClause<T, R>;
+  where: WhereClause<T, R, Input>;
   /**
    * Update data. On typed clients, relation names additionally accept nested
    * write ops ({@link NestedUpdateOp}): `create` / `connect` / `connectOrCreate`
@@ -1646,8 +1760,8 @@ export interface UpdateArgs<
 }
 
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
-export interface UpdateManyArgs<T, R extends object = {}, D = UpdateInput<T>> {
-  where: WhereClause<T, R>;
+export interface UpdateManyArgs<T, R extends object = {}, D = UpdateInput<T>, Input = unknown> {
+  where: WhereClause<T, R, Input>;
   data: D;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number | undefined;
@@ -1663,8 +1777,9 @@ export interface DeleteArgs<
   R extends object = {},
   S extends Record<string, boolean> | undefined = undefined,
   O extends Record<string, boolean> | undefined = undefined,
+  Input = unknown,
 > {
-  where: WhereClause<T, R>;
+  where: WhereClause<T, R, Input>;
   /**
    * Return only these fields of the deleted row, instead of the whole row.
    * Keys are checked against `T` (see {@link FieldFlags}) and follow the read
@@ -1691,8 +1806,8 @@ export interface DeleteArgs<
 }
 
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
-export interface DeleteManyArgs<T, R extends object = {}> {
-  where: WhereClause<T, R>;
+export interface DeleteManyArgs<T, R extends object = {}, Input = unknown> {
+  where: WhereClause<T, R, Input>;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number | undefined;
   /** See {@link UpdateArgs.allowFullTableScan}. */
@@ -1710,9 +1825,10 @@ export interface UpsertArgs<
   U = unknown,
   C = OptionalInput<T>,
   D = UpdateInput<T>,
+  Input = unknown,
 > {
   /** The row to update. A generated client passes its `XWhereUnique` as `U`, so this names a unique key. */
-  where: U & WhereClause<T, R>;
+  where: U & WhereClause<T, R, Input>;
   /**
    * Return only these fields of the inserted or updated row, instead of the whole row.
    * Keys are checked against `T` (see {@link FieldFlags}) and follow the read
@@ -1863,8 +1979,8 @@ export type UpdateDataInput<T, R extends object = {}> = [keyof R] extends [never
     };
 
 // biome-ignore lint/complexity/noBannedTypes: {} means "no relations known", matches QueryInterface default
-export interface CountArgs<T, R extends object = {}> {
-  where?: WhereClause<T, R> | undefined;
+export interface CountArgs<T, R extends object = {}, Input = unknown> {
+  where?: WhereClause<T, R, Exclude<Input, undefined>> | undefined;
   /** Query timeout in milliseconds. Rejects with an error if exceeded. */
   timeout?: number | undefined;
   /** Opt out of configured {@link GlobalFilters}. See {@link SkipGlobalFilters}. */

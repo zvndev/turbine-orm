@@ -117,6 +117,7 @@ await db.$transaction(async (tx) => {
 - `tx.$transaction` takes no options. Isolation, timeout and session context belong to the outer transaction.
 - Blocks that share a parent run one at a time, even under `Promise.all`.
 - A nested create, nested update or lookup-first `upsert` on `tx` gets its own savepoint, so a failure part way leaves the transaction as it was.
+- If a block fails and the server does not acknowledge its `ROLLBACK TO SAVEPOINT` (the connection dropped, or the answer came too late), the block throws its own error and the outer transaction can no longer commit, since it may still hold the block's writes. An outer callback that catches the error and returns gets ROLLBACK instead of COMMIT, and rejects with [E019](/errors#e019) once the server acknowledges it, or with the block's error when it does not.
 
 ## A caught error still rolls the transaction back
 
@@ -142,7 +143,12 @@ await db.$transaction(async (tx) => {
 
 ## Timeouts
 
-When `timeout` fires, Turbine cancels the running statement and rolls back. Only then does the call reject, with `TimeoutError` ([E002](/errors#e002)) and `outcome: 'not-executed'`, so nothing was saved and the locks are free:
+When `timeout` fires, Turbine tries to stop the transaction on the server: on PostgreSQL it sends a cancel request for a statement that is still running and waits for that statement to answer, then it sends ROLLBACK, giving each step at most 2 seconds. The call then rejects with `TimeoutError` ([E002](/errors#e002)). `outcome` says what the server confirmed:
+
+- `'not-executed'`: the server acknowledged the ROLLBACK, so nothing was saved and the locks are free.
+- `'unknown'`: the cancel request could not be sent, or the statement or the ROLLBACK did not answer within 2 seconds, so the connection was discarded. The call rejects without waiting longer, and the server may still be running the statement. COMMIT was never sent, so none of the writes were saved and a retry cannot apply them twice. The server may still hold the transaction's locks until it notices the closed connection, so a retry can wait on them.
+
+The error does not say whether the running statement itself was cancelled: the server ignores a cancel request that arrives after the statement finished.
 
 ```ts
 import { TimeoutError } from 'turbine-orm';
@@ -151,13 +157,69 @@ try {
   await db.$transaction(async (tx) => tx.reports.create({ data: report }), { timeout: 5_000 });
 } catch (err) {
   if (!(err instanceof TimeoutError)) throw err;
-  err.outcome; // 'not-executed': nothing was saved, so a retry is safe
+  err.outcome; // 'not-executed' or 'unknown': either way COMMIT was never sent
 }
 ```
 
-`timeout` takes milliseconds below 2^31, or `0` for none. Anything else throws [E003](/errors#e003).
+`timeout` takes milliseconds below 2^31, or `0` for none. Anything else throws [E003](/errors#e003). It bounds the callback only: once COMMIT is sent, it is never interrupted.
 
-On PostgreSQL, a [per-query `timeout`](/client#per-query-timeout) inside a transaction cancels that statement and marks the transaction rolled back, so returning afterwards rejects with [E019](/errors#e019). Run the statement in a nested block to keep going.
+On PostgreSQL, a [per-query `timeout`](/client#per-query-timeout) inside a transaction sends a cancel for that statement and stops the transaction from committing, so returning afterwards rejects with [E019](/errors#e019) once the rollback is acknowledged (or with the statement's own `TimeoutError` when it is not). Run the statement in a nested block to keep going.
+
+A write that takes several statements (a nested write, a lookup-first upsert, a `createMany` split across statements, and on MySQL a write and its re-read) already runs in a savepoint of its own (on every engine except PowDB, which has none), and its timeout rolls back to that savepoint. When the server acknowledges that rollback, the `TimeoutError` says `outcome: 'not-executed'`, and the transaction can continue and commit. When it does not, the error says `'unknown'` and the transaction cannot commit.
+
+## When the outcome is unknown
+
+Turbine reports a transaction as rolled back only when rollback was confirmed. On PostgreSQL, an ERROR answer to COMMIT or its `ROLLBACK` command tag also confirms rollback. FATAL, PANIC and unreadable answers do not. When it cannot confirm that, it says so instead:
+
+| What happened | What you get |
+|---|---|
+| COMMIT got no answer Turbine could read | `TransactionOutcomeUnknownError` ([E021](/errors#e021)), with the hiding failure as `cause` |
+| Your callback failed and the ROLLBACK was not acknowledged | Your callback's own error |
+| `timeout` fired and the rollback was not confirmed | `TimeoutError` with `outcome: 'unknown'` |
+| A nested block failed and its `ROLLBACK TO SAVEPOINT` was not acknowledged | The block's own error, and the outer transaction cannot commit |
+| A write's `timeout` fired and the rollback to its savepoint was not acknowledged | `TimeoutError` with `outcome: 'unknown'`, and the outer transaction cannot commit |
+
+On PostgreSQL, MySQL and Neon WebSocket, the first three cases discard the connection rather than reuse it. Other engines have the limits described below. A `tx` used afterwards does not say the transaction was rolled back. With `logging: true`, `$transaction` (both forms) logs `transaction-outcome-unknown` to your [logger](/observability) rather than `transaction-rolled-back`. `transaction()` and the transactions Turbine opens on its own (below) log neither.
+
+Only the first case can have committed. The answer to a COMMIT is lost when the connection drops while it runs, or when node-postgres's `query_timeout` is shorter than the COMMIT, which can be slow when deferred constraint triggers or synchronous replication run at commit time. Turbine sends no ROLLBACK after it: one sent then cannot tell a commit from a rollback, since it only reports that no transaction is open.
+
+Reading the database does not settle it either. The COMMIT may still be running, and can commit after a read finds nothing, so a retry chosen that way can save the write twice. Make the write safe to repeat instead: store a unique idempotency key in the same transaction, enforced by a `UNIQUE` constraint, and replay the transaction. A replay that starts while the first COMMIT is still running waits for it on the key, then either saves the write or fails with [E008](/errors#e008) on the key's constraint. That error says a row with this key is committed, not that it is this write: read it back and compare before you treat the first attempt as done. E008 on any other unique constraint says nothing about the first attempt, so let it propagate:
+
+```ts
+import { TransactionOutcomeUnknownError, UniqueConstraintError } from 'turbine-orm';
+
+// payments.idempotency_key has a UNIQUE constraint named payments_idempotency_key_key.
+const pay = () => db.$transaction(async (tx) => tx.payments.create({ data: { idempotencyKey, amount } }));
+
+try {
+  await pay();
+} catch (err) {
+  if (!(err instanceof TransactionOutcomeUnknownError)) throw err;
+  try {
+    await pay(); // saves the payment, unless a payment with this key is already committed
+  } catch (replay) {
+    // Only a conflict on the idempotency key itself can mean the first attempt committed.
+    if (!(replay instanceof UniqueConstraintError) || replay.constraint !== 'payments_idempotency_key_key') {
+      throw replay;
+    }
+    const stored = await db.payments.findUniqueOrThrow({ where: { idempotencyKey } });
+    if (stored.amount !== amount) throw new Error(`idempotency key ${idempotencyKey} holds a different payment`);
+    // the first attempt committed
+  }
+}
+```
+
+A replay can itself end in E021; handle it the same way. Without such a key, a read settles nothing until the original transaction has finished, and Turbine cannot tell you when that is.
+
+### Transactions Turbine opens on its own
+
+The same rules cover the transactions Turbine opens for a single call: a `create` or `update` with nested relation writes, a lookup-first `upsert`, a write that takes several statements (a MySQL write and its re-read, a `createMany` split into chunks), and a `pipeline()` that runs its queries one after another. An unanswered COMMIT there is E021 too, with the connection discarded. A per-query `timeout` that ends one of them rejects with `TimeoutError`: `outcome: 'not-executed'` once the server acknowledged the ROLLBACK, `'unknown'` when it did not, and COMMIT was never sent either way. A `pipeline()` over node-postgres's pipeline protocol keeps its own rule: its `timeout` destroys the connection and rejects with `TimeoutError`, `outcome: 'unknown'`. When its connection closes instead, it rejects with the error a statement failed with, with `ConnectionError` (E004) when no COMMIT was sent, or with E021 once a COMMIT was sent and not answered. A batch of plain SELECTs sends its COMMIT with the batch, so a closed connection there is E021 from the start: a SELECT can write through a function it calls.
+
+### Which engines raise E021
+
+E021 is raised where Turbine can tell the server's answer to COMMIT from no answer. On the PostgreSQL dialect, over node-postgres or a compatible pool, `capabilities.classifiesCommitAnswer` is `true`, and a server ERROR at COMMIT is read from its SQLSTATE as well as its severity, so a server reporting in another language still gets the typed error. The MySQL engine and the Neon WebSocket driver settle their own transactions and raise it too: a COMMIT that got no answer (a lost or timed-out connection, and on MySQL also a server shutting down or a statement or connection killed while the COMMIT runs) is E021 with the driver's error as `cause`, the connection discarded and no rollback claimed. An error the server answered the COMMIT with keeps its typed class. SQLite and libsql run in process, where a failed COMMIT is the engine's own answer.
+
+On SQL Server and PowDB, Turbine does not detect an unanswered COMMIT: the driver's error is rethrown. On SQL Server the `mssql` driver also returns the connection to its own pool inside its commit callback, before Turbine sees the result, so Turbine cannot discard it. That pool does not lend a connection again once it is closed or has had a socket error, but a connection whose COMMIT failed while it stayed open goes back into the pool.
 
 ## Retryable errors
 
@@ -223,7 +285,7 @@ const [user, posts, commentCount] = await db.pipeline([
 ]);
 ```
 
-A pipeline sends every query before reading any reply, so use it for independent queries. By default the batch runs in one transaction, and any failure rolls it all back. With `{ transactional: false }` each query stands alone, and a partial failure throws `PipelineError` ([E014](/errors#e014)):
+A pipeline sends every query before reading any reply, so use it for independent queries. By default the batch runs in one transaction, and if any query fails, nothing in it is committed. With `{ transactional: false }` each query stands alone, and a partial failure throws `PipelineError` ([E014](/errors#e014)):
 
 ```ts
 import { PipelineError } from 'turbine-orm';

@@ -24,12 +24,12 @@
  */
 
 import { UnsupportedFeatureError, ValidationError } from '../errors.js';
+import { resolveColumnName } from '../query-utils.js';
 import type { TableMetadata } from '../schema.js';
 import { type ColumnRef, isColumnRef, isPlainColumnRefShape } from './column-ref.js';
 import { isPlainRecord } from './filters.js';
 import { pruneUndefinedArgs } from './normalize-args.js';
 import type { ExcludedRef, SqlExpr, SqlExprKind } from './types.js';
-import { resolveColumnName } from './utils.js';
 import { type BuilderCtx, fingerprintWhere } from './where.js';
 import { type WhereRecord, walkWhere } from './where-compile.js';
 
@@ -262,7 +262,9 @@ function secondsBetweenNode(from: unknown, to: unknown): SqlExpr<number> {
  * });
  * ```
  */
-export const expr = Object.freeze({
+// Freezing this newly allocated constructor table has no external effects.
+// Let query-only entry points keep the compiler without retaining unused builders.
+export const expr = /* @__PURE__ */ Object.freeze({
   /** `a + b`. Numbers, bigints, numeric columns and numeric expressions. */
   add<V extends number | bigint | string = number>(a: NumericOperand, b: NumericOperand): SqlExpr<V> {
     return arithmetic<V>('add', a, b);
@@ -323,13 +325,7 @@ export const expr = Object.freeze({
    * value). Refused anywhere else.
    */
   excluded<F extends string>(field: F): ExcludedRef<F> {
-    if (typeof field !== 'string' || field.length === 0) {
-      throw new ValidationError('expr.excluded() takes the name of a field on the table, as a non-empty string.');
-    }
-    const node: Record<string, unknown> = { kind: 'excluded', args: Object.freeze([]), field };
-    Object.defineProperty(node, SQL_EXPR, { value: true, enumerable: false });
-    Object.defineProperty(node, EXCLUDED_REF, { value: true, enumerable: false });
-    return Object.freeze(node) as unknown as ExcludedRef<F>;
+    return buildExcludedRef(field);
   },
   /**
    * The seconds from `from` to `to`, two timestamp columns of the row:
@@ -347,6 +343,17 @@ export const expr = Object.freeze({
     return secondsBetweenNode(from, to);
   },
 });
+
+/** @internal Build the branded incoming-row reference used by upsert shorthand. */
+export function buildExcludedRef<F extends string>(field: F): ExcludedRef<F> {
+  if (typeof field !== 'string' || field.length === 0) {
+    throw new ValidationError('expr.excluded() takes the name of a field on the table, as a non-empty string.');
+  }
+  const node: Record<string, unknown> = { kind: 'excluded', args: Object.freeze([]), field };
+  Object.defineProperty(node, SQL_EXPR, { value: true, enumerable: false });
+  Object.defineProperty(node, EXCLUDED_REF, { value: true, enumerable: false });
+  return Object.freeze(node) as unknown as ExcludedRef<F>;
+}
 
 /** True only for a node built by {@link expr} (any loaded copy of the package). */
 export function isSqlExpr(value: unknown): value is SqlExpr {
@@ -481,11 +488,12 @@ function normalizeType(dbType: string): string {
     .trim();
 }
 
-function columnClass(dbType: string | undefined): ColumnClass {
+/** `array`: the column is an array column (`columnOperandKind`), decided by the caller. */
+function columnClass(dbType: string | undefined, array: boolean): ColumnClass {
   if (dbType === undefined) return 'unknown';
   const t = normalizeType(dbType);
   if (t === 'json' || t === 'jsonb') return 'json';
-  if (t.startsWith('_') || t.endsWith('[]')) return 'array';
+  if (array) return 'array';
   if (NUMERIC_TYPES.has(t)) return 'numeric';
   if (Object.hasOwn(TEMPORAL_TYPES, t)) return 'temporal';
   return 'other';
@@ -530,6 +538,10 @@ function columnType(qi: BuilderCtx, column: string): string | undefined {
   return qi.columnPgTypeMap.get(column);
 }
 
+function isArrayColumn(qi: BuilderCtx, column: string): boolean {
+  return qi.whereHost.getColumnKind(column) === 'array';
+}
+
 /**
  * Refuse an expression assigned to a column it cannot target in this release
  * (json/jsonb and array columns). Shared by the walker and the single-row
@@ -541,7 +553,7 @@ export function assertExprTarget(qi: BuilderCtx, key: string, value: SqlExpr | C
     // The SET builder's own unknown-column error names the key; reach it.
     return qi.toColumn(key);
   }
-  const cls = columnClass(columnType(qi, column));
+  const cls = columnClass(columnType(qi, column), isArrayColumn(qi, column));
   if (cls === 'json' || cls === 'array') {
     // A bare copy of the incoming row's same-typed column (the onConflict
     // field list, `update: ['payload']`) applies no operator, so it is a plain
@@ -620,6 +632,7 @@ interface Part {
 interface WalkState {
   readonly env: ExprCompileEnv;
   readonly targetType: string | undefined;
+  readonly targetArray: boolean;
   readonly reads: Set<string>;
   /** Columns read as a VALUE of the expression (not only by a case arm's when). */
   readonly values: Set<string>;
@@ -652,7 +665,13 @@ export function compileSetExpr(env: ExprCompileEnv, value: SqlExpr | ColumnRef):
   const { qi } = env;
   assertEngine(qi);
   const column = assertExprTarget(qi, env.targetKey, value, env.operation);
-  const state: WalkState = { env, targetType: columnType(qi, column), reads: new Set(), values: new Set() };
+  const state: WalkState = {
+    env,
+    targetType: columnType(qi, column),
+    targetArray: isArrayColumn(qi, column),
+    reads: new Set(),
+    values: new Set(),
+  };
   const part = walkOperand(state, value, false, 0);
   if (part.cls === 'dec' && numClassOfType(state.targetType) === 'int') {
     const what = isColumnRef(value) ? `col(${JSON.stringify(value.col)})` : `expr.${(value as SqlExpr).kind}()`;
@@ -730,7 +749,7 @@ export function compileReadExpr(read: ReadExprEnv, value: unknown): CompiledRead
     column: (column) => qi.q(column),
     predicate: (when) => read.predicate(when),
   };
-  const state: WalkState = { env, targetType: undefined, reads: new Set(), values: new Set() };
+  const state: WalkState = { env, targetType: undefined, targetArray: false, reads: new Set(), values: new Set() };
   const part = walkOperand(state, value, false, 0);
   if (part.cls === 'other' || part.cls === 'null') {
     throw new ValidationError(
@@ -795,7 +814,7 @@ function resolveOperandColumn(state: WalkState, field: string, how: 'col' | 'exc
         `Known fields: ${Object.keys(qi.tableMeta.columnMap).join(', ') || '(none)'}.`,
     );
   }
-  const cls = columnClass(columnType(qi, column));
+  const cls = columnClass(columnType(qi, column), isArrayColumn(qi, column));
   if (cls === 'json' || cls === 'array') {
     throw new ValidationError(
       `${call} on "${qi.table}" reads ${cls === 'json' ? 'a json/jsonb' : 'an array'} column; expressions over json and ` +
@@ -821,7 +840,7 @@ function walkNode(state: WalkState, node: SqlExpr, inArithmetic: boolean, depth:
     case 'sub':
     case 'mul':
     case 'div': {
-      const cls = columnClass(state.targetType);
+      const cls = columnClass(state.targetType, state.targetArray);
       if (!inArithmetic && cls !== 'numeric' && cls !== 'unknown') {
         throw new ValidationError(
           `expr.${node.kind}() in ${env.operation} data on "${qi.table}.${env.targetKey}": arithmetic needs a numeric ` +

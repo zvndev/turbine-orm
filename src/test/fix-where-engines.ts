@@ -14,6 +14,7 @@ import type { QueryInterfaceOptions } from '../query/deferred.js';
 import { UNSAFE } from '../query/types.js';
 import type { SchemaMetadata, TableMetadata } from '../schema.js';
 import { mockTable } from './helpers.js';
+import { closeSqliteAfter, sqliteFixtureScope } from './sqlite-fixture-lifetime.js';
 
 export const DATABASE_URL = process.env.DATABASE_URL ?? '';
 export const MYSQL_URL = process.env.MYSQL_URL ?? process.env.MYSQL_TEST_URL ?? '';
@@ -234,7 +235,7 @@ export async function openMysql(options: Record<string, unknown> = {}): Promise<
 export async function openSqlite(options: Record<string, unknown> = {}): Promise<EngineHandle> {
   const { DatabaseSync } = await import('node:sqlite');
   const { turbineSqlite } = await import('../sqlite.js');
-  const raw = new DatabaseSync(':memory:');
+  const raw = closeSqliteAfter(new DatabaseSync(':memory:'), sqliteCleanup);
   const reset = async (): Promise<void> => {
     raw.exec('DROP TABLE IF EXISTS fw_posts');
     raw.exec('DROP TABLE IF EXISTS fw_users');
@@ -288,3 +289,6 @@ export async function openPowdb(options: Record<string, unknown> = {}): Promise<
 export function ids(rows: readonly { id: unknown }[]): number[] {
   return rows.map((r) => Number(r.id)).sort((a, b) => a - b);
 }
+
+// Register native teardown after the existing client teardown hooks.
+const sqliteCleanup = sqliteFixtureScope();

@@ -26,6 +26,7 @@ import { schemaDefToMetadata } from '../schema-metadata.js';
 import { sqliteDialect } from '../sqlite.js';
 import { HAVE_NODE_SQLITE } from './fix-where-engines.js';
 import { skipGate } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 // biome-ignore lint/suspicious/noExplicitAny: tables are driven by name, with no generated types
 type Any = any;
@@ -93,7 +94,7 @@ async function open(): Promise<{ db: Any; raw: Any }> {
   const { DatabaseSync } = createRequire(process.cwd())('node:sqlite');
   const { turbineSqlite } = await import('../sqlite.js');
   const { schemaToSQL } = await import('../schema-sql.js');
-  const raw = new DatabaseSync(':memory:');
+  const raw = closeSqliteAfter(new DatabaseSync(':memory:'));
   for (const sql of schemaToSQL(def, { dialect: sqliteDialect })) raw.exec(sql);
   const db = turbineSqlite(raw, SCHEMA, { warnOnUnlimited: false });
   await db.table('fxe_parents').create({ data: { id: 1, name: 'p' } });
@@ -111,7 +112,7 @@ function assertRefused(err: unknown, column: string): true {
 describe('SQLite refuses a string its numeric column would keep as text', () => {
   it('the accepted strings are exactly the ones SQLite converts to a number', () => {
     const { DatabaseSync } = createRequire(process.cwd())('node:sqlite');
-    const raw = new DatabaseSync(':memory:');
+    const raw = closeSqliteAfter(new DatabaseSync(':memory:'));
     raw.exec('CREATE TABLE t (i INTEGER, r REAL, n NUMERIC)');
     const insert = raw.prepare('INSERT INTO t VALUES (?, ?, ?)');
     const kinds = raw.prepare(

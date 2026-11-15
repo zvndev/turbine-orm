@@ -1,6 +1,6 @@
 /**
- * The interleaved benchmark harness, shared by `bench-interleaved.ts` (the ten
- * headline scenarios) and `bench-extended.ts` (everything the headline set does
+ * The interleaved benchmark harness, shared by `bench-interleaved.ts` (the headline
+ * scenarios) and `bench-extended.ts` (everything the headline set does
  * not reach: large result sets, list pages, to-one and many-to-many relations,
  * aggregation, relation filters, writes, wide rows, strategies, cold start).
  *
@@ -17,8 +17,8 @@
 
 export interface Arm {
   name: string;
-  /** The measured call. */
-  fn: (i: number) => Promise<unknown>;
+  /** The measured call; observeRow is supplied only by the untimed stream verifier. */
+  fn: (i: number, observeRow?: (row: unknown) => void) => Promise<unknown>;
   /**
    * Untimed preparation for this round, run immediately before `fn`. This is
    * what makes destructive scenarios measurable: a delete benchmark needs a row
@@ -26,6 +26,8 @@ export interface Arm {
    * those is the thing being measured.
    */
   setup?: (i: number) => Promise<unknown>;
+  /** Untimed exact-result/effect verification after every warmup and measured call. */
+  verify?: (value: unknown, i: number) => Promise<void>;
 }
 
 export interface ArmStat {
@@ -35,6 +37,17 @@ export interface ArmStat {
   p95: number;
   min: number;
   n: number;
+  /** Execution-order durations; warmup/setup excluded. Present only when opted in. */
+  samplesMs?: number[];
+  p99?: number | null;
+  p99Status?: 'unavailable-small-n' | 'unstable-tail' | 'estimated';
+  sampleMethod?: {
+    unit: 'ms';
+    p50: 'arithmetic median';
+    p95: 'nearest-rank';
+    p99: 'nearest-rank';
+    scope: 'individual arm calls';
+  };
 }
 
 export interface ScenarioResult {
@@ -54,12 +67,40 @@ export function pct(sorted: number[], p: number): number {
   return sorted[Math.max(0, Math.ceil(sorted.length * p) - 1)]!;
 }
 
+/** Summarize actual samples only; never combine per-arm medians into percentiles. */
+export function summarizeSamples(name: string, samples: readonly number[], retainSamples = false): ArmStat {
+  if (!samples.length || samples.some((n) => !Number.isFinite(n) || n < 0))
+    throw new Error('Expected nonempty finite nonnegative duration samples');
+  const sorted = [...samples].sort((a, b) => a - b);
+  const n = sorted.length;
+  return {
+    name,
+    median: median(sorted),
+    avg: sorted.reduce((a, b) => a + b, 0) / n,
+    p95: pct(sorted, 0.95),
+    min: sorted[0]!,
+    n,
+    p99: n >= 100 ? pct(sorted, 0.99) : null,
+    p99Status: n < 100 ? 'unavailable-small-n' : n < 1000 ? 'unstable-tail' : 'estimated',
+    sampleMethod: {
+      unit: 'ms',
+      p50: 'arithmetic median',
+      p95: 'nearest-rank',
+      p99: 'nearest-rank',
+      scope: 'individual arm calls',
+    },
+    ...(retainSamples ? { samplesMs: [...samples] } : {}),
+  };
+}
+
 export interface BenchOptions {
   rounds: number;
   warmup: number;
+  retainSamples?: boolean;
 }
 
 export interface InterleaveOptions {
+  retainSamples?: boolean;
   rounds?: number;
   warmup?: number;
   /**
@@ -73,6 +114,7 @@ export interface InterleaveOptions {
 
 export class Bench {
   readonly results: ScenarioResult[] = [];
+  readonly probes: { label: string; stats: ArmStat }[] = [];
 
   constructor(private readonly opts: BenchOptions) {}
 
@@ -83,7 +125,8 @@ export class Bench {
     for (const arm of arms) {
       for (let i = 0; i < warmup; i++) {
         if (arm.setup) await arm.setup(i);
-        await arm.fn(i);
+        const value = await arm.fn(i);
+        if (arm.verify) await arm.verify(value, i);
       }
     }
 
@@ -96,22 +139,14 @@ export class Bench {
         const arm = arms[(k + offset) % arms.length]!;
         if (arm.setup) await arm.setup(r);
         const start = performance.now();
-        await arm.fn(r);
+        const value = await arm.fn(r);
         samples.get(arm.name)!.push(performance.now() - start);
+        if (arm.verify) await arm.verify(value, r);
       }
     }
 
-    const stats: ArmStat[] = arms.map((a) => {
-      const s = [...samples.get(a.name)!].sort((x, y) => x - y);
-      return {
-        name: a.name,
-        median: median(s),
-        avg: s.reduce((x, y) => x + y, 0) / s.length,
-        p95: pct(s, 0.95),
-        min: s[0]!,
-        n: s.length,
-      };
-    });
+    const retain = options.retainSamples ?? this.opts.retainSamples ?? process.env.BENCH_RETAIN_SAMPLES === '1';
+    const stats = arms.map((a) => summarizeSamples(a.name, samples.get(a.name)!, retain));
 
     this.results.push({ scenario, stats, note: options.note });
     print(scenario, stats, options.note);
@@ -131,8 +166,10 @@ export class Bench {
       await pool.query('SELECT 1');
       s.push(performance.now() - t);
     }
-    s.sort((a, b) => a - b);
-    const m = median(s);
+    const retain = this.opts.retainSamples ?? process.env.BENCH_RETAIN_SAMPLES === '1';
+    const stats = summarizeSamples('SELECT 1', s, retain);
+    if (retain) this.probes.push({ label, stats });
+    const m = stats.median;
     console.log(`\n[drift probe ${label}] SELECT 1 median ${m.toFixed(4)} ms (n=500)`);
     return m;
   }
@@ -149,18 +186,19 @@ export function print(scenario: string, stats: ArmStat[], note?: string): void {
   console.log(`\n-- ${scenario} --`);
   if (note) console.log(`  note: ${note}`);
   console.log('  arm            median      avg      p95      min');
-  const ormStats = stats.filter((s) => s.name !== 'Raw');
+  const isRaw = (s: ArmStat) => /^(?:Raw(?:$|\s)|raw pg)/i.test(s.name);
+  const ormStats = stats.filter((s) => !isRaw(s));
   const fastest = ormStats.length > 0 ? ormStats.reduce((a, b) => (a.median < b.median ? a : b)) : undefined;
   for (const s of stats) {
     const f = (n: number) => n.toFixed(3).padStart(8);
     const mark = s === fastest ? ' <= fastest ORM' : '';
     console.log(`  ${s.name.padEnd(12)} ${f(s.median)} ${f(s.avg)} ${f(s.p95)} ${f(s.min)}${mark}`);
   }
-  const raw = stats.find((s) => s.name === 'Raw');
+  const raw = stats.find(isRaw);
   if (raw) {
     for (const s of ormStats) {
       console.log(
-        `    ${s.name} overhead above raw pg: +${(s.median - raw.median).toFixed(3)} ms (${(s.median / raw.median).toFixed(2)}x)`,
+        `    ${s.name} overhead above raw: +${(s.median - raw.median).toFixed(3)} ms (${(s.median / raw.median).toFixed(2)}x)`,
       );
     }
   }

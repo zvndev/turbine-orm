@@ -1,0 +1,10 @@
+import pg from 'pg';
+import { createOrderApplication } from './examples/postgres-durable-replay/application.js';
+const pool = new pg.Pool({connectionString:process.env.DATABASE_URL,max:5,connectionTimeoutMillis:1500,query_timeout:3000,statement_timeout:2500});
+pool.on('error',error=>console.error(error));
+const app=createOrderApplication({pool,schema:'durable_generated',endpoint:'direct',onDiagnostic:error=>console.error(error)});
+async function main(){try{
+await app.initialize();
+await app.append('A',{eventId:'00000000-0000-4000-8000-000000000001',orderId:'10000000-0000-4000-8000-000000000001',title:'generated ☃',quantity:'9007199254740993',amount:'12345678901234567890.123456789012',occurredAt:'2026-11-07T12:34:56.123456Z',body:Buffer.from([0,255,128])});
+}finally{await app.close();await pool.end();}}
+main().catch(error=>{console.error(error);process.exitCode=1});

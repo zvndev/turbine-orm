@@ -1,0 +1,45 @@
+{
+  "format": 1,
+  "arms": [
+    {
+      "name": "Turbine",
+      "version": "EXACT_ARTIFACT_VERSION",
+      "driver": "pg@8.22.0",
+      "implementationKind": "typed-orm",
+      "sourceCommit": "EXACT_40_CHARACTER_SOURCE_COMMIT",
+      "artifact": { "path": "/absolute/frozen-turbine.tgz", "sha256": "EXACT_SHA256" },
+      "module": { "path": "/absolute/frozen-turbine-adapter.mjs", "sha256": "EXACT_SHA256" },
+      "supported": ["headline-0", "headline-3", "headline-5", "headline-10"]
+    },
+    {
+      "name": "Drizzle stable",
+      "version": "0.45.4",
+      "driver": "pg@8.22.0",
+      "implementationKind": "typed-orm",
+      "sourceCommit": "EXACT_40_CHARACTER_SOURCE_COMMIT",
+      "artifact": { "path": "/absolute/drizzle-orm-0.45.4.tgz", "sha256": "EXACT_SHA256" },
+      "module": { "path": "/absolute/drizzle-stable-adapter.mjs", "sha256": "EXACT_SHA256" },
+      "supported": ["headline-0", "headline-3"]
+    },
+    {
+      "name": "Drizzle RC",
+      "version": "1.0.0-rc.5",
+      "driver": "pg@8.22.0",
+      "implementationKind": "typed-orm",
+      "sourceCommit": "EXACT_40_CHARACTER_SOURCE_COMMIT",
+      "artifact": { "path": "/absolute/drizzle-orm-1.0.0-rc.5.tgz", "sha256": "EXACT_SHA256" },
+      "module": { "path": "/absolute/drizzle-rc-adapter.mjs", "sha256": "EXACT_SHA256" },
+      "supported": ["headline-0", "headline-3"]
+    },
+    {
+      "name": "Prisma 7",
+      "version": "7.10.1",
+      "driver": "pg@8.22.0",
+      "implementationKind": "typed-orm",
+      "sourceCommit": "EXACT_40_CHARACTER_SOURCE_COMMIT",
+      "artifact": { "path": "/absolute/prisma-client-7.10.1.tgz", "sha256": "EXACT_SHA256" },
+      "module": { "path": "/absolute/prisma7-adapter-with-generated-client.mjs", "sha256": "EXACT_SHA256" },
+      "supported": ["headline-0", "headline-3"]
+    }
+  ]
+}

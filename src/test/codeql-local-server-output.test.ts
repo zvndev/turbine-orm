@@ -28,9 +28,9 @@ const STATE_DIR = studioTestStateDir();
 /** What a foreign error type can look like: nothing safe to print, and a stack in its string form. */
 const HOSTILE = {
   message: 'not an Error instance',
-  toString: () => 'Error: boom\n    at secret (/home/dev/app.ts:1:1)',
+  toString: () => 'Error: boom\n    at secret (/workspace/app/app.ts:1:1)',
 };
-const STACK_TEXT = 'Error: x\n    at secret (/home/dev/app.ts:9:9)';
+const STACK_TEXT = 'Error: x\n    at secret (/workspace/app/app.ts:9:9)';
 
 // ---------------------------------------------------------------------------
 // responseErrorText
@@ -204,7 +204,7 @@ for (const [name, run] of [
       const r = await run(Object.assign(new Error('relation "x" does not exist'), { stack: STACK_TEXT }));
       assert.ok(r.status >= 400, String(r.status));
       assert.equal(r.json?.error, 'relation "x" does not exist');
-      assert.ok(!r.body.includes('/home/dev'), r.body);
+      assert.ok(!r.body.includes('/workspace/app'), r.body);
       assert.ok(!r.body.includes('    at '), r.body);
     });
 

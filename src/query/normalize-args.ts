@@ -27,9 +27,10 @@
  */
 
 import { ValidationError } from '../errors.js';
+import { resolveColumnName, resolveRelation } from '../query-utils.js';
 import type { RelationDef, SchemaMetadata, TableMetadata } from '../schema.js';
+import { assertCursorPredicateOption } from './cursor-tuple.js';
 import { isPlainRecord, RELATION_FILTER_WRAPPER_SET } from './filters.js';
-import { resolveColumnName, resolveRelation } from './utils.js';
 import { MAX_WHERE_DEPTH } from './where-compile.js';
 
 /** Sentinel for "remove this key / element". Never escapes this module. */
@@ -392,9 +393,10 @@ function argHoldsUndefined(value: unknown): boolean {
  * `table` is the operation's table; relation filters and `with` levels are
  * resolved against `schema` so each sub-where is pruned against its own target.
  */
-export function pruneUndefinedArgs<A>(schema: SchemaMetadata, table: string, args: A): A {
+export function pruneUndefinedArgs<A>(schema: SchemaMetadata, table: string, args: A, tupleSupported = false): A {
   if (!isPlainRecord(args)) return args;
   const src = args as Record<string, unknown>;
+  assertCursorPredicateOption(src, tupleSupported);
   if (
     !argHoldsUndefined(src.where) &&
     !argHoldsUndefined(src.having) &&

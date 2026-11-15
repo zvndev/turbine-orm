@@ -244,14 +244,14 @@ const DATABASE_URL = process.env.DATABASE_URL;
 let HAS_VECTOR = false;
 
 // Probe the extension synchronously-ish before declaring the suite. node:test
-// evaluates the module top-to-bottom, so we resolve the probe in `before` and
+// evaluates the module top-to-bottom, so resolve the probe in `before` and
 // rely on it being installed; if the probe fails each test calls `t.skip()`.
 const SKIP_DB = !DATABASE_URL;
 if (SKIP_DB) {
   console.log('⚠ Skipping pgvector integration tests: DATABASE_URL not set');
 }
 
-// We cannot await the probe before declaring the suite, so we always declare
+// The probe runs after the suite is declared, so always declare
 // it and skip individual probes inside `it` when the extension is unavailable.
 const dbDescribe = describe;
 

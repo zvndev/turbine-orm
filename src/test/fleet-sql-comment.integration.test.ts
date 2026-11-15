@@ -29,6 +29,7 @@ import { resetPreparedNameBudget } from '../query/utils.js';
 import type { SchemaMetadata } from '../schema.js';
 import { introspectSqliteDatabase, turbineSqlite } from '../sqlite.js';
 import { mockTable, skipGate } from './helpers.js';
+import { closeSqliteAfter } from './sqlite-fixture-lifetime.js';
 
 // biome-ignore lint/suspicious/noExplicitAny: the suites drive untyped accessors
 type Any = any;
@@ -225,7 +226,7 @@ const sqliteGate = skipGate(!DatabaseSync, 'node:sqlite requires Node >= 22.5');
 
 describe('sqlComment (live SQLite)', () => {
   sqliteGate.it('hostile values parse, and a write still reports its change count', async () => {
-    const raw = new DatabaseSync!(':memory:');
+    const raw = closeSqliteAfter(new DatabaseSync!(':memory:'));
     raw.exec(`CREATE TABLE ${TABLE} (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`);
     for (let i = 1; i <= 4; i++) raw.prepare(`INSERT INTO ${TABLE} VALUES (?, ?)`).run(i, `n${i}`);
     const db = turbineSqlite(raw, introspectSqliteDatabase(raw), {
@@ -247,7 +248,7 @@ describe('sqlComment (live SQLite)', () => {
   sqliteGate.it('a comment value holding the word "returning" does not turn a write into a row read', async () => {
     // The SQLite engine picks between a row read and a change count by looking
     // for RETURNING in the statement; the comment is not part of the statement.
-    const raw = new DatabaseSync!(':memory:');
+    const raw = closeSqliteAfter(new DatabaseSync!(':memory:'));
     raw.exec(`CREATE TABLE ${TABLE} (id INTEGER PRIMARY KEY, name TEXT NOT NULL)`);
     for (let i = 1; i <= 4; i++) raw.prepare(`INSERT INTO ${TABLE} VALUES (?, ?)`).run(i, `n${i}`);
     const db = turbineSqlite(raw, introspectSqliteDatabase(raw), {

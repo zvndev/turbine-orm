@@ -44,12 +44,11 @@ import {
   ConnectionError,
   type ErrorMessageMode,
   errorMessageModesDiverged,
-  explainConnectionLoss,
   PipelineError,
   registerClientErrorMessageMode,
   runWithErrorMessageMode,
   setErrorMessageMode,
-  TimeoutError,
+  TransactionOutcomeUnknownError,
   UnsupportedFeatureError,
   ValidationError,
   wrapPgError,
@@ -72,18 +71,12 @@ import {
   type RelationLoadStrategy,
   type TemporalInfinityReading,
 } from './query/index.js';
+import { registerUtcTemporalParsers, warnParserOverwrite } from './query/pg-type-parsers.js';
 import { assertNoLockInAutocommitPipeline } from './query/row-lock.js';
 import { commentDeferred, resolveSqlComment, type SqlCommenter, type SqlCommentOptions } from './query/sql-comment.js';
 import { resolveStreamIdleTimeout } from './query/stream-idle.js';
 import { asQueryInterface, TABLE_METHODS } from './query/table-client.js';
-import {
-  ownLookup,
-  quoteIdent,
-  registerUtcTemporalParsers,
-  sendCancelRequest,
-  suggestKey,
-  warnParserOverwrite,
-} from './query/utils.js';
+import { ownLookup, quoteIdent, sendCancelRequest, suggestKey } from './query/utils.js';
 import { shouldWarnOnce, WARN_NS } from './query/warn-registry.js';
 import {
   queryChannelActive,
@@ -112,14 +105,9 @@ import {
 import type { SchemaMetadata, TableMetadata } from './schema.js';
 import { parseInt8, rawClientOf, typedQueryPool } from './supplied-pool-types.js';
 import { registerTransactionClient } from './transaction-client-slot.js';
-import {
-  commitTransaction,
-  rolledBackError,
-  TRANSACTION_STATE,
-  type TransactionScope,
-  TransactionState,
-  unawaitedWorkError,
-} from './transaction-state.js';
+import { completeTransaction, settlesWithin, TX_ABORT_GRACE_MS } from './transaction-outcome.js';
+import { sendControl, type TransactionScope, TransactionState } from './transaction-state.js';
+import { createTransactionPool, guardTransactionConnection } from './transaction-transport.js';
 import { buildTypedSql, TypedSqlQuery, utcDateParams } from './typed-sql.js';
 
 // ---------------------------------------------------------------------------
@@ -405,7 +393,7 @@ export interface TurbineConfig {
    * exposed" because they bind `LIMIT $n`: that was false. PostgreSQL does not
    * deny the planner a limit fraction for a bound limit, it SUBSTITUTES a
    * default of 10% of the child node's own row estimate (clamped at one row),
-   * which is simply a different wrong number. An unknown `OFFSET` triggers the
+   * which is a different wrong number. An unknown `OFFSET` triggers the
    * same substitution on its own even when the limit is a constant, and a
    * paginated Turbine read binds both.
    *
@@ -765,14 +753,13 @@ export interface TurbineConfig {
    * `sqlCache: false`); a negative value is ignored (treated as the default).
    */
   sqlCacheSize?: number | undefined;
-  /** SQL dialect implementation. Defaults to PostgreSQL. Internal Phase-1 seam for dialect packages. */
+  /** SQL dialect implementation. Defaults to PostgreSQL. Used by dialect packages. */
   dialect?: Dialect | undefined;
   /**
    * Read replicas. When set, read-only operations issued outside a transaction
    * (`findMany`, `findFirst`, `findUnique`, `*OrThrow`, `count`, `aggregate`,
-   * `groupBy`, `findManyStream`) are round-robin load-balanced across these
-   * pools; the primary handles them along with every write. ALL writes,
-   * `$transaction` bodies, `pipeline`, `raw`/`sql`, `$listen`/`$notify`, and
+   * `groupBy`, `findManyStream`, `findManyStreamBatches`) are round-robin
+   * load-balanced across these pools. ALL writes, `$transaction` bodies, `pipeline`, `raw`/`sql`, `$listen`/`$notify`, and
    * observability flushes always use the primary.
    *
    *   - `string` entries are connection strings, Turbine constructs an owned
@@ -1229,31 +1216,6 @@ const ISOLATION_LEVELS: Record<string, string> = Object.assign(Object.create(nul
 });
 
 /**
- * Run a transaction-control statement (BEGIN / COMMIT / ROLLBACK) with the same
- * error translation every other query boundary gets.
- *
- * These four statements were the only ones issued raw, and COMMIT is the one
- * that matters: Postgres reports DEFERRABLE constraint violations and a good
- * share of SERIALIZABLE conflicts at COMMIT rather than at the statement that
- * caused them. Unwrapped, those surfaced as a raw `DatabaseError` carrying a
- * SQLSTATE in `.code`, which is the SAME property Turbine puts `TURBINE_E0NN`
- * in, so `err.code === 'TURBINE_E008'` silently missed them and a `switch` on
- * `.code` received a value from a foreign namespace. Worse for the retry case:
- * `SerializationFailureError.isRetryable` exists so callers can build retry
- * loops, and a loop keyed on it would never fire for the commit-time conflicts
- * that are the main reason to run SERIALIZABLE at all.
- */
-async function runTxControl(client: PgCompatPoolClient, sql: string, params?: unknown[]): Promise<void> {
-  await traceStatement(TRANSACTION_CONTROL_OPERATION, sql, params?.length ?? 0, async () => {
-    try {
-      await client.query(sql, params);
-    } catch (err) {
-      throw wrapPgError(err);
-    }
-  });
-}
-
-/**
  * Refuse anything in a batch that is not a deferred query, before any of it
  * runs.
  *
@@ -1297,6 +1259,18 @@ const PG_ENV_TARGETS = ['PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER'] as const;
 /** A non-empty environment variable, or undefined (also where `process` does not exist). */
 function pgEnv(name: string): string | undefined {
   return (typeof process !== 'undefined' ? process.env?.[name] : undefined) || undefined;
+}
+
+/** Whether any explicit connection field suppresses the environment URL fallback. */
+function hasExplicitConnectionTarget(config: TurbineConfig): boolean {
+  return (
+    config.connectionString != null ||
+    config.host != null ||
+    config.port != null ||
+    config.database != null ||
+    config.user != null ||
+    config.password != null
+  );
 }
 
 /**
@@ -1370,14 +1344,6 @@ function resolveIsolationLevel(level: string | undefined): string | undefined {
  */
 const GUC_NAME_REGEX = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/;
 
-/**
- * How long a transaction being abandoned (timed out, failed, or returned with
- * work still running) gives its in-flight statement to answer a cancel
- * request, and its ROLLBACK to answer, before the connection is destroyed
- * instead of reused.
- */
-const TX_ABORT_GRACE_MS = 2000;
-
 /** Default {@link TurbineConfig.maxLifetimeSeconds} on pools Turbine opens. */
 const DEFAULT_MAX_LIFETIME_SECONDS = 1800;
 
@@ -1447,24 +1413,21 @@ const SESSION_SETTING_REFUSALS: Readonly<Record<string, (setting: string) => str
   },
 );
 
+/** One `sessionContext` entry as the statement that applies it. */
+type SessionSetting = { name: string; sql: string; params: unknown[] };
+
 /**
  * Apply one `sessionContext` entry. A refusal by the server names the setting
  * that caused it rather than reading as a column or type error; the server's
  * own message (which may contain the value) stays on `cause`.
  */
-async function applySessionSetting(
-  client: PgCompatPoolClient,
-  setting: { name: string; sql: string; params: unknown[] },
-): Promise<void> {
+async function applySessionSetting(client: PgCompatPoolClient, setting: SessionSetting): Promise<void> {
   await traceStatement(TRANSACTION_CONTROL_OPERATION, setting.sql, setting.params.length, () =>
     sendSessionSetting(client, setting),
   );
 }
 
-async function sendSessionSetting(
-  client: PgCompatPoolClient,
-  setting: { name: string; sql: string; params: unknown[] },
-): Promise<void> {
+async function sendSessionSetting(client: PgCompatPoolClient, setting: SessionSetting): Promise<void> {
   try {
     await client.query(setting.sql, setting.params);
   } catch (err) {
@@ -1473,7 +1436,7 @@ async function sendSessionSetting(
     if (describe === undefined) throw wrapPgError(err);
     throw new ValidationError(
       `sessionContext["${setting.name}"] was refused by the server: ${describe(setting.name.toLowerCase())} (SQLSTATE ${code}). ` +
-        'The transaction was rolled back before your callback ran.',
+        (client.transactionRecovery?.sessionMessage ?? 'Your callback did not run, and nothing was committed.'),
       { cause: err },
     );
   }
@@ -1516,57 +1479,6 @@ function resolveReadOnly(value: unknown): boolean {
   throw new ValidationError(`$transaction: readOnly must be true or false, received ${describeValue(value)}.`);
 }
 
-/** Whether `pending` settles (either way) within `ms`. */
-async function settlesWithin(pending: Promise<unknown>, ms: number): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const late = new Promise<false>((resolve) => {
-    timer = setTimeout(() => resolve(false), ms);
-  });
-  try {
-    return await Promise.race([
-      pending.then(
-        () => true,
-        () => true,
-      ),
-      late,
-    ]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * Stop a transaction that will not commit, on the server and now: cancel the
- * statement it is running (the protocol's CancelRequest, which also reaches the
- * right backend through a pooler), wait for it to answer, then ROLLBACK, which
- * releases every lock the transaction holds.
- *
- * Closing the socket alone does not do that. PostgreSQL notices a closed
- * client only when it next writes to it, so a backend waiting on a lock keeps
- * the transaction, and every lock it already took, until that lock clears.
- *
- * Resolves `true` when the connection is rolled back and reusable, `false` when
- * it is not (the cancel could not be sent, the statement or the ROLLBACK did not
- * answer within {@link TX_ABORT_GRACE_MS}, or the ROLLBACK failed); the caller
- * then destroys it. Call after `state.end()`, so nothing new is sent meanwhile.
- */
-async function rollbackOnServer(
-  client: PgCompatPoolClient,
-  state: TransactionState,
-  dialect: Dialect,
-): Promise<boolean> {
-  if (state.running) {
-    if (!(await sendCancelRequest(client, TX_ABORT_GRACE_MS))) return false;
-    if (!(await state.whenIdle(TX_ABORT_GRACE_MS))) return false;
-  }
-  let failed = false;
-  const sql = dialect.rollbackStatement();
-  const rollback = traceStatement(TRANSACTION_CONTROL_OPERATION, sql, 0, () => client.query(sql)).catch(() => {
-    failed = true;
-  });
-  return (await settlesWithin(rollback, TX_ABORT_GRACE_MS)) && !failed;
-}
-
 /** `rawUnsafe` takes statement text; a tagged-template call or a non-string is E003. */
 function assertSqlText(text: unknown, api: string): asserts text is string {
   if (typeof text === 'string' && text.trim() !== '') return;
@@ -1576,85 +1488,6 @@ function assertSqlText(text: unknown, api: string): asserts text is string {
           'template, whose values are bound for you.'
       : `${api} takes the statement text as a non-empty string, received ${text === null ? 'null' : typeof text}.`,
   );
-}
-
-/**
- * The connection `transaction(fn)` and `tx.$connection()` hand out: the
- * checked-out client, with every statement routed through the transaction's
- * state, so one issued after the transaction settled is refused rather than
- * run on a connection that is back in the pool, and transaction-control SQL
- * (`COMMIT`, `BEGIN`, ...) is refused rather than ending the transaction behind
- * the state that tracks it.
- *
- * What would take the connection away is refused too: `release` (the
- * transaction returns it itself), `end` and `connect`, and the driver's
- * `connection` (the wire-level object, whose writes bypass every check here) is
- * hidden. Everything else is the driver client's own.
- */
-function closableRawClient(
-  client: PgCompatPoolClient,
-  state: TransactionState,
-  scope: TransactionScope = state.rootScope,
-  api: 'transaction()' | '$connection()' = 'transaction()',
-): PgCompatPoolClient {
-  // The refusals name the API the caller used: a `tx.$connection()` caller
-  // never called `transaction()`.
-  const who = api === 'transaction()' ? 'transaction(): the callback' : '$connection(): the $transaction callback';
-  const target = client as unknown as Record<PropertyKey, unknown>;
-  const send = target.query as (...args: unknown[]) => unknown;
-  const query = (...args: unknown[]): unknown => {
-    const first = args[0] as { submit?: unknown; text?: unknown } | string | null;
-    const text = typeof first === 'string' ? first : first?.text;
-    // Callback form and submittables (cursors, COPY streams) answer through
-    // their own channel, not a promise: checked, then passed straight through.
-    if (
-      typeof args[args.length - 1] === 'function' ||
-      typeof (first as { submit?: unknown } | null)?.submit === 'function'
-    ) {
-      state.assertOpen();
-      state.screenRaw(text);
-      return send.apply(client, args);
-    }
-    return state.runRaw(text, () => send.apply(client, args) as Promise<unknown>, scope);
-  };
-  const release = (): never => {
-    throw new ValidationError(
-      `${who} must not release its client; the transaction releases it after COMMIT or ROLLBACK.`,
-    );
-  };
-  const refuse = (verb: string): (() => never) => {
-    return () => {
-      throw new ValidationError(
-        `${who} must not ${verb} its client; the transaction owns the connection and ` +
-          'returns it to the pool after COMMIT or ROLLBACK.',
-      );
-    };
-  };
-  const refused = new Map<PropertyKey, () => never>([
-    ['end', refuse('end')],
-    ['connect', refuse('connect')],
-  ]);
-  const bound = new Map<PropertyKey, unknown>();
-  return new Proxy(target, {
-    has(t, prop) {
-      return prop === 'connection' ? false : Reflect.has(t, prop);
-    },
-    get(t, prop) {
-      if (prop === 'query') return query;
-      if (prop === 'release') return release;
-      if (prop === 'connection') return undefined;
-      const refusal = refused.get(prop);
-      if (refusal !== undefined) return refusal;
-      const value = Reflect.get(t, prop, t);
-      if (typeof value !== 'function') return value;
-      let fn = bound.get(prop);
-      if (fn === undefined) {
-        fn = (value as (...a: unknown[]) => unknown).bind(t);
-        bound.set(prop, fn);
-      }
-      return fn;
-    },
-  }) as unknown as PgCompatPoolClient;
 }
 
 /**
@@ -1762,8 +1595,7 @@ export class TransactionClient {
   table<T extends object = Record<string, unknown>>(name: string): QueryInterface<T> {
     let qi = this.tableCache.get(name);
     if (!qi) {
-      // Create a QueryInterface that uses the transaction client as its "pool"
-      // We use a proxy pool that routes queries through the transaction client
+      // A proxy pool routes queries through the transaction client
       const txPool = this.createTxPool();
       const txOpts = txQueryOptions(this.queryOptions);
       qi = txOpts.queryInterfaceFactory
@@ -1819,7 +1651,7 @@ export class TransactionClient {
           'connection to hand out. Use `tx.raw` / `tx.rawUnsafe`, or a TCP pool.',
       );
     }
-    this.connectionHandle = closableRawClient(raw, this.state, this.scope, '$connection()');
+    this.connectionHandle = guardTransactionConnection(raw, this.state, this.scope, '$connection()');
     return this.connectionHandle;
   }
 
@@ -1985,45 +1817,7 @@ export class TransactionClient {
    * transaction state, which refuses it once the transaction has settled.
    */
   private createTxPool(): PgCompatPool {
-    const client = this.client;
-    const state = this.state;
-    const scope = this.scope;
-    const query = (textOrConfig: string | { name?: string; text: string; values?: unknown[] }, values?: unknown[]) =>
-      state.run(async () => {
-        try {
-          if (typeof textOrConfig === 'string') {
-            return await client.query(textOrConfig, values);
-          }
-          // Object form for prepared statements: { name, text, values }
-          // A driver client accepts it, but the two-argument `query` in the
-          // PgCompatPoolClient contract does not describe it, so we cast.
-          return await (client as unknown as { query(config: unknown): Promise<PgCompatQueryResult> }).query(
-            textOrConfig,
-          );
-        } catch (err) {
-          throw wrapPgError(err);
-        }
-      }, scope);
-    // Return a minimal pool-compatible object that routes queries
-    // through the transaction client
-    const txPool: Record<PropertyKey, unknown> = {
-      query,
-      // The transaction's connection is not this pool's to lend: a "checkout"
-      // runs on it through the same guarded `query`, and releasing it is a
-      // no-op, so nothing reached through the pool can hand the connection back
-      // to the real pool while the transaction still holds it.
-      connect: async () => {
-        state.assertOpen();
-        return { query, release: () => {} };
-      },
-      [TRANSACTION_STATE]: state,
-    };
-    // Carry the parent pool's PowDB-only flags through so a transaction-scoped
-    // PowqlInterface reads the same read-only guard and capabilities it would
-    // outside the transaction (a plain pg pool has neither, so nothing changes).
-    if (this.sourcePool?.readonly !== undefined) txPool.readonly = this.sourcePool.readonly;
-    if (this.sourcePool?.capabilities !== undefined) txPool.capabilities = this.sourcePool.capabilities;
-    return txPool as unknown as PgCompatPool;
+    return createTransactionPool(this.client, this.state, this.scope, this.sourcePool);
   }
 }
 
@@ -2340,7 +2134,7 @@ export class TurbineClient {
      * use cases (IDs, counts, timestamps). If you store values > 2^53 - 1 in a
      * bigint column, the runtime return type will be `string` for those rows.
      *
-     * NOTE: We intentionally do NOT register a parser for numeric (OID 1700).
+     * No parser is registered for numeric (OID 1700).
      * Postgres numeric is arbitrary-precision, so the default pg driver behavior
      * of returning a string is correct and matches the generated TypeScript type
      * (numeric → string). Users who want number can cast explicitly in SQL.
@@ -2504,16 +2298,10 @@ export class TurbineClient {
       // DATABASE_URL is present in the environment, fall back to it so
       // `turbine()` with no arguments just works (the convention Prisma/Drizzle
       // use, and what the generated factory JSDoc + `turbine init` promise).
-      // We only read the already-populated env var; the library never parses
+      // Only the already-populated env var is read; the library never parses
       // .env files (that is the CLI's job). An explicit host/port/db/user/pass
       // still takes precedence, so this never overrides a deliberate config.
-      const hasExplicitConnection =
-        config.connectionString != null ||
-        config.host != null ||
-        config.port != null ||
-        config.database != null ||
-        config.user != null ||
-        config.password != null;
+      const hasExplicitConnection = hasExplicitConnectionTarget(config);
 
       if (config.connectionString) {
         poolConfig.connectionString = config.connectionString;
@@ -2534,19 +2322,12 @@ export class TurbineClient {
       }
 
       // Held as a `pg.Pool` for the length of this block: `PgCompatPool.on` is
-      // optional (HTTP drivers have no pool events), and here we know we own a
+      // optional (HTTP drivers have no pool events), and this branch owns a
       // real pg pool that has one. Same shape as the replica loop below.
       const ownPool = new pg.Pool(
         TurbineClient.ownedPoolConfig(poolConfig, planCacheMode, statementTimeoutMs, maxLifetimeSeconds),
       );
       this.watchOwnedPool(ownPool, { pool: 'primary' });
-      // After a freeze (a serverless function between invocations), wait one
-      // loop turn before reusing a long-idle connection, so the pool has read
-      // any close the server sent meanwhile. See connection-guard.ts.
-      settleLongIdleCheckouts(ownPool);
-      // An exhausted pool rejects a checkout with an untyped pg-pool error;
-      // make it a ConnectionError on every path, `pool.query` included.
-      typeCheckoutTimeouts(ownPool);
       this.pool = ownPool;
       this.queryPool = ownPool;
       this.ownsPool = true;
@@ -2583,8 +2364,6 @@ export class TurbineClient {
           ),
         );
         this.watchOwnedPool(replicaPool, { pool: 'replica', replica: this.replicaPools.length });
-        settleLongIdleCheckouts(replicaPool);
-        typeCheckoutTimeouts(replicaPool);
         // Next to a supplied primary no parsers were registered, so this
         // replica's reads carry them like the primary's do.
         this.replicaPools.push(this.ownsPool ? replicaPool : this.typedPool(replicaPool));
@@ -2793,13 +2572,7 @@ export class TurbineClient {
    * the target leaves unset is `PGHOST` / `PGPORT`.
    */
   private static poolerEndpoint(config: TurbineConfig): string | undefined {
-    const explicit =
-      config.connectionString != null ||
-      config.host != null ||
-      config.port != null ||
-      config.database != null ||
-      config.user != null ||
-      config.password != null;
+    const explicit = hasExplicitConnectionTarget(config);
     const targets: ConnectionTarget[] = [];
     if (config.connectionString) targets.push(parseConnectionTarget(config.connectionString));
     else if (!explicit && process.env.DATABASE_URL) targets.push(parseConnectionTarget(process.env.DATABASE_URL));
@@ -2824,7 +2597,7 @@ export class TurbineClient {
    * settings (another driver) or names no pooler.
    */
   private static suppliedPoolEndpoint(pool: PgCompatPool): string | undefined {
-    // A diagnostic: a pool whose settings cannot be read is simply not checked,
+    // A diagnostic: a pool whose settings cannot be read is not checked,
     // and nothing here may fail the constructor.
     let target: ConnectionTarget;
     try {
@@ -2898,6 +2671,10 @@ export class TurbineClient {
     this.checkoutWatches.push(
       watchCheckouts(pool, (err) => this.emitPoolEvent('connectionLost', { error: err, ...origin })),
     );
+    // Settle close events after a freeze before reusing an idle connection,
+    // then translate exhausted-pool checkout errors on every query path.
+    settleLongIdleCheckouts(pool);
+    typeCheckoutTimeouts(pool);
   }
 
   /**
@@ -2905,7 +2682,7 @@ export class TurbineClient {
    * logged at `error`, always; a listener that throws is ignored, like a query
    * listener.
    */
-  private emitPoolEvent(kind: keyof PoolListeners, event: PoolEvent): void {
+  protected emitPoolEvent(kind: keyof PoolListeners, event: PoolEvent): void {
     const listeners = this.poolListeners[kind];
     if (listeners.size === 0) {
       if (kind === 'poolError') {
@@ -3323,7 +3100,7 @@ export class TurbineClient {
    *
    * The view shares the primary pool, schema, dialect, query options, and
    * middleware; it owns nothing, so its `disconnect()` is a no-op. When no
-   * replicas are configured this simply returns the client itself (already
+   * replicas are configured this returns the client itself (already
    * primary-only). The view is cached, repeated calls return the same instance.
    *
    * Typed as `this` so a generated subclass keeps its declared table accessors
@@ -3413,7 +3190,8 @@ export class TurbineClient {
     const comments = this.statementComments(queries);
     const sent = comments ? (queries.map((q, i) => commentDeferred(q, comments[i])) as unknown as T) : queries;
     const sink = this.queryListeners.size > 0 ? this.queryOptions._onQuery : undefined;
-    if (!sink && !queryChannelActive()) return this.withErrorMode(() => executePipeline(this.queryPool, sent, options));
+    if (!sink && !queryChannelActive())
+      return this.withErrorMode(() => executePipeline(this.queryPool, sent, options, this.dialect));
     return this.withErrorMode(() => this.reportedPipeline(sink, queries, options, sent, comments));
   }
 
@@ -3461,7 +3239,7 @@ export class TurbineClient {
     const start = performance.now();
     let failure: unknown;
     try {
-      return await executePipeline(this.queryPool, observed, options);
+      return await executePipeline(this.queryPool, observed, options, this.dialect);
     } catch (err) {
       failure = err;
       throw err;
@@ -3716,8 +3494,9 @@ export class TurbineClient {
    * Like `$transaction`'s `tx`, the client is closed when the transaction
    * settles: a query sent through it afterwards throws `ValidationError`
    * (E003). The callback must not `release()` it, and must await every query
-   * it starts: one still running when the callback returns rolls the
-   * transaction back with E003.
+   * it starts: one still running when the callback returns means the
+   * transaction does not commit (E003). An unanswered COMMIT is
+   * {@link TransactionOutcomeUnknownError} (E021), as for `$transaction`.
    *
    * @example
    * ```ts
@@ -3730,37 +3509,14 @@ export class TurbineClient {
     // BEGIN runs inside openCheckout, which sends it once more on a fresh
     // connection when the first one turns out to be dead. A BEGIN that fails
     // for good throws from there with the connection already released, so the
-    // catch below only ever sees a transaction that began: its ROLLBACK can
+    // settlement only ever sees a transaction that began: its ROLLBACK can
     // never be a stray statement from a context that opened none, which on a
     // driver with one shared engine handle (PowDB embedded) would roll back a
     // DIFFERENT caller's open transaction.
-    const { client, checkout } = await openCheckout(this.pool, (c) => runTxControl(c, this.dialect.beginStatement()));
-    const state = new TransactionState(client, this.dialect, { api: 'transaction' });
-    const guarded = closableRawClient(client, state);
-    try {
-      // Engine seam: single-writer engines scope their transaction re-entrancy
-      // marker to the callback's async subtree (see
-      // PgCompatPoolClient.wrapTransactionCallback). Absent everywhere else.
-      const wrap = (client as unknown as PgCompatPoolClient).wrapTransactionCallback;
-      // `.call` erases the generic, so the callback's Promise<T> is re-asserted.
-      const result = wrap ? ((await wrap.call(client, () => fn(guarded))) as T) : await fn(guarded);
-      const unawaited = state.busy;
-      state.end('has ended');
-      if (unawaited) throw unawaitedWorkError('transaction');
-      // A COMMIT answered with ROLLBACK (a statement failed and the callback
-      // caught it) rejects, with the first failed statement as the cause.
-      await commitTransaction(client, this.dialect.commitStatement(), state.firstFailure, 'transaction');
-      state.end('committed');
-      checkout.release();
-      return result;
-    } catch (err) {
-      state.end('was rolled back');
-      const clean = await rollbackOnServer(client, state, this.dialect);
-      checkout.release(
-        clean ? undefined : new Error('[turbine] transaction connection discarded: rollback not confirmed'),
-      );
-      throw explainConnectionLoss(err, checkout.lostWith);
-    }
+    const held = await openCheckout(this.pool, (c) => sendControl(c, this.dialect.beginStatement()));
+    const state = new TransactionState(held.client, this.dialect, { api: 'transaction' });
+    const guarded = guardTransactionConnection(held.client, state);
+    return completeTransaction(held, state, this.dialect, 'transaction', () => fn(guarded));
   }
 
   // -------------------------------------------------------------------------
@@ -3846,7 +3602,7 @@ export class TurbineClient {
     }
     const fn = fnOrQueries as (tx: TransactionClient) => Promise<unknown>;
     // Pass the parent pool so its read-only guard + PowDB capabilities flow
-    // into the transaction-scoped proxy pool (see TransactionClient.createTxPool).
+    // into the transaction-scoped proxy pool (see createTransactionPool).
     const sourcePool = this.pool as unknown as { readonly?: boolean; capabilities?: unknown };
     return this.runInTransaction(options, (client, state) =>
       fn(new TransactionClient(client, this.schema, this.middlewares, this.queryOptions, sourcePool, state)),
@@ -3860,7 +3616,7 @@ export class TurbineClient {
    */
   private resolveTransactionOptions(options: TransactionOptions | undefined): {
     begin: string;
-    sessionConfig: Array<{ name: string; sql: string; params: unknown[] }>;
+    sessionConfig: SessionSetting[];
     timeout: number | undefined;
   } {
     const isolationSql = resolveIsolationLevel(options?.isolationLevel);
@@ -3872,6 +3628,7 @@ export class TurbineClient {
         `$transaction: timeout must be a positive number of milliseconds (or 0 for none), received ${describeValue(timeout)}.`,
       );
     }
+    if (timeout) this.pool.transactionRecovery?.assertTimeout(timeout);
     return { begin, sessionConfig, timeout: timeout || undefined };
   }
 
@@ -3881,17 +3638,12 @@ export class TurbineClient {
    * only) -> `sessionContext` GUCs -> body, raced against `timeout` -> COMMIT,
    * and ROLLBACK on any failure.
    *
-   * The transaction state is ended as soon as the body settles, BEFORE the
-   * COMMIT, so a `tx` that leaked out of the callback can never slip a
-   * statement in ahead of the COMMIT or onto the connection after it. Work the
-   * body started and did not await is caught there too: the transaction rolls
-   * back rather than committing whatever part of it had run.
-   *
-   * A transaction that will not commit (timed out, failed, unawaited work) is
-   * stopped on the server before its connection is released: the running
-   * statement is cancelled and ROLLBACK sent, so its locks are freed now (see
-   * {@link rollbackOnServer}). A connection that cannot be confirmed clean is
-   * destroyed instead of reused.
+   * The settlement, and what is reported about it, is
+   * {@link completeTransaction}'s, which `transaction()` shares. A transaction
+   * that will not commit (timed out, failed, unawaited work) is stopped on the
+   * server before its connection is released: the running statement is
+   * cancelled and ROLLBACK sent, so its locks are freed now (see
+   * {@link rollbackOnServer}).
    */
   private async runInTransaction<R>(
     options: TransactionOptions | undefined,
@@ -3901,84 +3653,23 @@ export class TurbineClient {
     // openCheckout sends BEGIN once more on a fresh connection when the first
     // one turns out to be dead, and releases the connection itself when BEGIN
     // fails for good. So everything below runs in a transaction that began.
-    const { client, checkout } = await openCheckout(this.queryPool, (c) => runTxControl(c, begin));
-    const state = new TransactionState(client, this.dialect, { userTransaction: true });
-    let timedOut = false;
-
-    try {
+    const held = await openCheckout(this.queryPool, (c) => sendControl(c, begin));
+    const state = new TransactionState(held.client, this.dialect, { userTransaction: true });
+    return completeTransaction(
+      held,
+      state,
+      this.dialect,
+      '$transaction',
+      () => state.enter(() => body(held.client, state)),
+      this.logging ? this.logger : undefined,
+      timeout,
       // Transaction-local session context (RLS / multi-tenant GUCs), applied
       // after BEGIN and before the body via set_config(name, value,
       // is_local=true), so both name and value are BOUND params.
-      for (const cfg of sessionConfig) await applySessionSetting(client, cfg);
-
-      // Engine seam: when the checked-out connection exposes
-      // wrapTransactionCallback (single-writer engines such as PowDB), run the
-      // body through it so the engine can scope its re-entrancy marker to the
-      // body's async subtree. All other drivers: plain body().
-      const wrap = (client as unknown as PgCompatPoolClient).wrapTransactionCallback;
-      const runBody = (): Promise<R> =>
-        state.enter(() => (wrap ? (wrap.call(client, () => body(client, state)) as Promise<R>) : body(client, state)));
-
-      let result: R;
-      if (timeout) {
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        const timeoutPromise = new Promise<never>((_, reject) => {
-          timer = setTimeout(() => {
-            timedOut = true;
-            state.end('timed out');
-            reject(
-              new TimeoutError(timeout, 'Transaction', {
-                message:
-                  `Transaction timed out after ${timeout}ms and was rolled back, so none of its writes were ` +
-                  'saved. A statement it was running was cancelled on the server.',
-                outcome: 'not-executed',
-              }),
-            );
-          }, timeout);
-        });
-        try {
-          result = await Promise.race([runBody(), timeoutPromise]);
-        } finally {
-          clearTimeout(timer);
-        }
-      } else {
-        result = await runBody();
-      }
-
-      const unawaited = state.busy;
-      state.end('has ended');
-      if (unawaited) throw unawaitedWorkError('$transaction');
-      // A statement inside was cut short by its timeout, and the callback
-      // caught the error: whether it ran is not known, so nothing commits.
-      if (state.abortedWith !== undefined) throw rolledBackError(state.abortedWith, 'transaction');
-      await commitTransaction(client, this.dialect.commitStatement(), state.firstFailure);
-      state.end('committed');
-      checkout.release();
-
-      if (this.logging) {
-        logTo(this.logger, 'debug', 'Transaction committed', {
-          code: 'transaction-committed',
-          operation: '$transaction',
-        });
-      }
-
-      return result;
-    } catch (err) {
-      // A timed-out transaction keeps its 'timed out' wording for any late
-      // statement the callback still tries to send.
-      if (!timedOut) state.end('was rolled back');
-      const clean = await rollbackOnServer(client, state, this.dialect);
-      checkout.release(
-        clean ? undefined : new Error('[turbine] transaction connection discarded: rollback not confirmed'),
-      );
-      if (this.logging) {
-        logTo(this.logger, 'debug', 'Transaction rolled back', {
-          code: 'transaction-rolled-back',
-          operation: '$transaction',
-        });
-      }
-      throw explainConnectionLoss(err, checkout.lostWith);
-    }
+      async () => {
+        for (const cfg of sessionConfig) await applySessionSetting(held.client, cfg);
+      },
+    );
   }
 
   /**
@@ -3995,7 +3686,7 @@ export class TurbineClient {
   private resolveSessionContext(
     context: TransactionOptions['sessionContext'],
     allowBuiltinSettings?: readonly string[],
-  ): Array<{ name: string; sql: string; params: unknown[] }> {
+  ): SessionSetting[] {
     const allowed = resolveBuiltinSettingsAllowlist(allowBuiltinSettings);
     if (!context) return [];
     if (!this.dialect.supportsRLS) {
@@ -4005,7 +3696,7 @@ export class TurbineClient {
         'set_config-based row-level-security context requires PostgreSQL.',
       );
     }
-    const statements: Array<{ name: string; sql: string; params: unknown[] }> = [];
+    const statements: SessionSetting[] = [];
     for (const [name, value] of Object.entries(context)) {
       if (!GUC_NAME_REGEX.test(name)) {
         throw new ValidationError(
@@ -4345,11 +4036,11 @@ export class TurbineClient {
   async disconnect(options?: DisconnectOptions): Promise<unknown> {
     const timeoutMs = resolveNonNegativeInteger(options?.timeoutMs, 'disconnect timeoutMs', 'milliseconds');
     // Tear down any live LISTEN subscriptions first. Each holds a dedicated
-    // pooled connection checked out; if we ended the pool (or returned for an
-    // external pool) without releasing them, pool.end() would wait forever for
+    // pooled connection checked out; ending the pool (or returning for an
+    // external pool) without releasing them would make pool.end() wait forever for
     // those connections to return. _forceRelease() detaches the handler and
-    // releases the client WITHOUT issuing UNLISTEN (pointless if we're ending
-    // the pool / the connection is going away anyway). This runs for both
+    // destroys the connection WITHOUT issuing UNLISTEN, so no stale LISTEN
+    // registration returns to a pool that outlives this client. This runs for both
     // owned and external pools so subscriptions never leak.
     if (this.activeSubscriptions.size > 0) {
       // _forceRelease mutates activeSubscriptions via the onClosed callback,

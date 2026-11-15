@@ -286,12 +286,12 @@ describe('upsert: Date on a time column', () => {
 });
 
 // ---------------------------------------------------------------------------
-// 5. Back-compat: metadata generated before this change
+// 5. Back-compat: metadata carrying types only in table-level maps
 // ---------------------------------------------------------------------------
 
 describe('older generated metadata', () => {
   /**
-   * The shape `generateMetadata` emitted before this change: per-column
+   * The older `generateMetadata` shape: per-column
    * `pgTypes` / `dialectTypes` (both have always been part of TableMetadata),
    * no new fields. The narrowing reads the same per-column type, so an old
    * generated client picks up the fix without regenerating.

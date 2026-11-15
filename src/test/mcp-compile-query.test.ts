@@ -28,6 +28,8 @@ import type pg from 'pg';
 import { collectAggregateColumnNames, compileQueryPlan, SEALED_POOL } from '../cli/compile-query.js';
 import { buildRelations, type McpServerOptions, startMcpServer } from '../cli/mcp.js';
 import { generateMetadata } from '../generate.js';
+import { mssqlDialect } from '../mssql.js';
+import { mysqlDialect } from '../mysql.js';
 import { type ColumnMetadata, type SchemaMetadata, snakeToCamel, type TableMetadata } from '../schema.js';
 import { mockTable } from './helpers.js';
 
@@ -377,6 +379,69 @@ function fixtureMetadata(): SchemaMetadata {
 // ---------------------------------------------------------------------------
 
 describe('mcp compile_query: nothing is executed', () => {
+  it('preserves the bounded advisory index name for long native identifiers', () => {
+    const metadata = fixtureMetadata();
+    metadata.tables.users!.indexes = [
+      { name: 'users_id', columns: ['id'], unique: true, definition: 'CREATE UNIQUE INDEX users_id ON users(id)' },
+    ];
+    const childName = `posts_${'x'.repeat(45)}`;
+    const field = 'author_identifier_with_a_long_name';
+    const child = metadata.tables.posts!;
+    delete metadata.tables.posts;
+    metadata.tables[childName] = child;
+    child.name = childName;
+    child.indexes = [];
+    child.uniqueColumns = [];
+    const column = child.columns.find((column) => column.name === 'author_id')!;
+    column.name = field;
+    column.field = field;
+    child.allColumns = child.allColumns.map((name) => (name === 'author_id' ? field : name));
+    const relation = metadata.tables.users!.relations.posts!;
+    relation.to = childName;
+    relation.foreignKey = [field];
+    for (const dialect of [mysqlDialect, mssqlDialect]) {
+      const result = compileQueryPlan({
+        metadata,
+        table: metadata.tables.users!,
+        operation: 'findMany',
+        args: { with: { posts: true } },
+        dialect,
+      });
+      assert.equal(result.ok, true);
+      if (!result.ok) return;
+      const probe = result.plan.relations[0]!.unindexedProbe!;
+      const name = `idx_${childName}_${field}`.slice(0, 63);
+      assert.equal(name.length, 63);
+      assert.equal(
+        probe.createSql,
+        `CREATE INDEX ${dialect.quoteIdentifier(name)} ON ${dialect.quoteIdentifier(childName)} (${dialect.quoteIdentifier(field)})`,
+      );
+    }
+  });
+  it('quotes native index advice through the supplied dialect, independent of its name', () => {
+    const metadata = fixtureMetadata();
+    metadata.tables.users!.indexes = [
+      { name: 'users_id', columns: ['id'], unique: true, definition: 'CREATE UNIQUE INDEX users_id ON users(id)' },
+    ];
+    for (const dialect of [mysqlDialect, mssqlDialect]) {
+      const report = compileQueryPlan({
+        metadata,
+        table: metadata.tables.users!,
+        operation: 'findMany',
+        args: { limit: 2, with: { posts: true } },
+        dialect: { ...dialect, name: 'renamed-native' },
+      });
+      assert.equal(report.ok, true);
+      if (!report.ok) return;
+      const probe = report.plan.relations[0]!.unindexedProbe!;
+      assert.ok(probe);
+      assert.equal(
+        probe.createSql,
+        `CREATE INDEX ${dialect.quoteIdentifier('idx_posts_author_id')} ON ${dialect.quoteIdentifier('posts')} (${dialect.quoteIdentifier('author_id')})`,
+      );
+    }
+  });
+
   it('compiles a findMany and never sends the compiled statement to the driver', async () => {
     const h = createHarness();
     const result = payload(await compile(h, 'posts', { where: { views: { gt: 10 } }, limit: 5 }));

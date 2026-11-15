@@ -19,6 +19,7 @@ import {
 } from '../dialect.js';
 import { NotFoundError, OptimisticLockError, UnsupportedFeatureError, ValidationError } from '../errors.js';
 import type { PgCompatQueryResult } from '../pg-types.js';
+import { canonicalWriteEntries, coerceTemporalValue, resolveColumnName, type SqlCacheEntry } from '../query-utils.js';
 import type { TableMetadata } from '../schema.js';
 import { isColumnRef } from './column-ref.js';
 import {
@@ -27,20 +28,28 @@ import {
   otherCollidingUniqueKey,
   uniqueKeyNames,
   upsertCreateCollidingKey,
+  upsertWhereIsOneKey,
   upsertWhereMatchesCreate,
 } from './compound-unique.js';
 import type { DeferredQuery, ReselectExecutor } from './deferred.js';
 import {
+  buildExcludedRef,
   compileSetExpr,
   type ExprCompileEnv,
-  expr as exprBuilders,
   exprNotAllowedMessage,
   isPlainExprShape,
   isSqlExpr,
   plainExprShapeMessage,
   resolveExcludedFromCreate,
 } from './expr.js';
-import { isPlainRecord, isUnmatchedPlainObject, UPDATE_OPERATOR_KEYS } from './filters.js';
+import {
+  hasArrayHole,
+  isArrayTypeToken,
+  isPlainRecord,
+  isUnmatchedPlainObject,
+  type OperandColumnKind,
+  UPDATE_OPERATOR_KEYS,
+} from './filters.js';
 import { isJsonValue, serializeJsonValue } from './json-value.js';
 import { pruneUndefinedArgs } from './normalize-args.js';
 import type {
@@ -53,7 +62,6 @@ import type {
   UpsertArgs,
 } from './types.js';
 import { resolveSkipGlobalFilters, resolveUnsafeFlag } from './types.js';
-import { canonicalWriteEntries, coerceTemporalValue, resolveColumnName, type SqlCacheEntry } from './utils.js';
 import type { BuilderCtx } from './where.js';
 import * as whereMod from './where.js';
 
@@ -127,12 +135,50 @@ export function coerceWriteValue(qi: BuilderCtx, key: string, value: unknown): u
     throw new ValidationError(plainExprShapeMessage(qi.table, key, String((value as { kind: unknown }).kind)));
   }
   assertScalarBindable(qi, key, dbType, value);
+  if (column !== undefined) assertArrayWrite(qi.whereHost.getColumnKind(column), dbType, qi.table, key, value);
   if (!(value instanceof Date) && !Array.isArray(value)) return value;
   // A column missing from the type map resolves to undefined → no coercion.
   // The gate is where.ts's, so a written Date and a compared Date take the
   // same form: a `date` column the UTC date part on every SQL engine, a
   // zone-less `timestamp` the UTC literal on PostgreSQL only.
   return coerceTemporalValue(dbType, value, whereMod.utcDateTimeRewrite(qi, dbType));
+}
+
+/**
+ * Refuse an array written to a column that cannot store it as one value:
+ *
+ * - on an array column, an array with a hole at any depth: the driver binds
+ *   each hole as NULL, so `new Array(1)` would store `{NULL}`, and the where
+ *   compiler already refuses the same value as an operand;
+ * - on a scalar type named like an array type (`dbType` spelled `_mood` or
+ *   `mood[]` while the catalog records `isArray: false`, so `kind` is not
+ *   `array`; see `columnOperandKind`), any array: it was bound as an array
+ *   literal, so a one-row write stored the label `{"x"}` and createMany's
+ *   UNNEST flattened it to `x`, while reads refuse the same value.
+ *
+ * A JSON column never gets here with an array (it is serialized as JSON
+ * does), and an array on every other scalar column is
+ * {@link assertScalarBindable}'s to refuse or not, as before.
+ */
+export function assertArrayWrite(
+  kind: OperandColumnKind,
+  dbType: string | undefined,
+  table: string,
+  key: string,
+  value: unknown,
+): void {
+  if (!Array.isArray(value)) return;
+  if (kind === 'array' && hasArrayHole(value)) {
+    throw new ValidationError(
+      `Invalid value for "${key}" on table "${table}": received a sparse array (an index with no element), which ` +
+        'would store each hole as NULL. Give every index an element (null for a NULL element).',
+    );
+  }
+  if (kind !== 'array' && dbType !== undefined && isArrayTypeToken(dbType)) {
+    throw new ValidationError(
+      `Cannot write an array to "${table}.${key}" (column type ${dbType}): a scalar type named like an array type.`,
+    );
+  }
 }
 
 /**
@@ -1113,7 +1159,7 @@ function prepareCreateMany<T extends object>(
   // nested array to flatten (a raw `[1, 2, 3]` there used to become three
   // rows), and every other cell is a string, object or null that the driver
   // serializes as one array element.
-  const hasArrayColumn = columns.some((col) => (qi.columnPgTypeMap.get(col) ?? '').startsWith('_'));
+  const hasArrayColumn = columns.some((col) => qi.whereHost.getColumnKind(col) === 'array');
 
   return {
     conflict,
@@ -1331,7 +1377,7 @@ function resolveConflictUpdate(qi: BuilderCtx, raw: unknown): Record<string, unk
       if (Object.hasOwn(update, field)) {
         throw new ValidationError(`createMany on "${qi.table}": onConflict.update names "${field}" twice.`);
       }
-      update[field] = exprBuilders.excluded(field);
+      update[field] = buildExcludedRef(field);
     }
     return update;
   }
@@ -1729,6 +1775,7 @@ export function buildUpdate<T extends object>(
   // members count as a real predicate.
   const userWhere = expandCompoundUniqueWhere(qi.tableMeta, args.where as Record<string, unknown>);
   const lock = args.optimisticLock;
+  if (lock) assertLockColumnNotWritten(qi.tableMeta, qi.table, dataObj, lock.field);
   // The empty-`where` guard checks the USER predicate only, a global filter
   // must never turn an unguarded mass update into an allowed one.
   const userHasPredicate = !whereMod.userPredicateIsEmpty(qi, userWhere) || !!lock;
@@ -1789,8 +1836,7 @@ export function buildUpdate<T extends object>(
       setClauses.push(`${versionCol} = ${versionCol} + 1`);
     }
 
-    const whereClause = whereMod.buildWhereClause(qi, whereObj, freshParams);
-    let whereSql = whereClause ? ` WHERE ${whereClause}` : '';
+    let whereSql = whereMod.buildWhereSql(qi, whereObj, freshParams);
 
     if (lock) {
       const versionCol = qi.toSqlColumn(lock.field);
@@ -1928,8 +1974,7 @@ export function buildDelete<T extends object>(
   const params: unknown[] = [];
 
   const buildSql = (freshParams: unknown[]): string => {
-    const clause = whereMod.buildWhereClause(qi, whereObj, freshParams);
-    const whereSql = clause ? ` WHERE ${clause}` : '';
+    const whereSql = whereMod.buildWhereSql(qi, whereObj, freshParams);
     // SQL Server injects `OUTPUT DELETED.*` between `DELETE FROM <t>` and WHERE;
     // absent override → the trailing-clause PG/SQLite/MySQL form (byte-identical).
     // `returning` excludes PII columns on tagged tables (else '*').
@@ -2039,7 +2084,9 @@ const OPTIMISTIC_LOCK_ALTERNATIVE: Readonly<Record<OptimisticLockRefusal, (field
  * `$transaction`) has no second round trip to look anything up with.
  *
  * - `where-differs`: `where` is not pinned to `create`'s values, so the
- *   conflict statement would compare the wrong row (upsertWhereMatchesCreate).
+ *   conflict statement would compare the wrong row, or its columns are not
+ *   exactly one unique key, so no conflict target names it
+ *   (upsertWhereMatchesCreate).
  * - `empty-update`: an `update` with no fields has no `DO UPDATE SET` to emit;
  *   every engine rejected the statement as a syntax error. Prisma reads it as
  *   "create it if it is missing", which the lookup answers.
@@ -2109,7 +2156,9 @@ function upsertStatementRefusal(
     `A batched upsert on "${qi.table}" cannot be one statement: ` +
       (reason === 'empty-update'
         ? 'its `update` is empty. '
-        : `\`where\` (${keys.join(', ')}) does not carry \`create\`'s values, which are what one statement matches on. `) +
+        : !upsertWhereIsOneKey(qi.tableMeta, where)
+          ? `\`where\` (${keys.join(', ')}) is not exactly one unique key, which is all one statement's conflict target can name. `
+          : `\`where\` (${keys.join(', ')}) does not carry \`create\`'s values, which are what one statement matches on. `) +
       call,
   );
 }
@@ -2311,27 +2360,43 @@ export function buildUpdateMany<T extends object>(
   qi: BuilderCtx,
   args: UpdateManyArgs<T>,
 ): DeferredQuery<{ count: number }> {
-  assertWritable(qi, 'updateMany');
-  assertNoBulkWritePaging(qi.table, 'updateMany', args);
-  assertNoOptimisticLock(qi, args, 'updateMany');
+  return buildBulkMutation(qi, args, 'updateMany');
+}
+
+export function buildDeleteMany<T extends object>(
+  qi: BuilderCtx,
+  args: DeleteManyArgs<T>,
+): DeferredQuery<{ count: number }> {
+  return buildBulkMutation(qi, args, 'deleteMany');
+}
+
+/** The two count-returning writes share guards, cache traversal and result shape. */
+function buildBulkMutation<T extends object>(
+  qi: BuilderCtx,
+  args: UpdateManyArgs<T> | DeleteManyArgs<T>,
+  operation: 'updateMany' | 'deleteMany',
+): DeferredQuery<{ count: number }> {
+  assertWritable(qi, operation);
+  assertNoBulkWritePaging(qi.table, operation, args);
+  assertNoOptimisticLock(qi, args, operation);
   qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
-  const dataObj = applyUpdatedAtColumns(qi, args.data as Record<string, unknown>);
-  assertNoGeneratedColumns(qi, dataObj, 'updateMany');
+  const update = operation === 'updateMany';
+  let data: Record<string, unknown> | undefined;
+  if (update) {
+    data = applyUpdatedAtColumns(qi, (args as UpdateManyArgs<T>).data as Record<string, unknown>);
+    assertNoGeneratedColumns(qi, data, operation);
+  }
   whereMod.assertMutationHasPredicate(
     qi,
-    'updateMany',
+    operation,
     whereMod.userPredicateIsEmpty(qi, args.where as Record<string, unknown>) ? '' : ' WHERE x',
     resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'),
   );
-  const whereObj = (whereMod.mergeGlobalFilter(qi, args.where as Record<string, unknown>) ?? {}) as Record<
+  const where = (whereMod.mergeGlobalFilter(qi, args.where as Record<string, unknown>) ?? {}) as Record<
     string,
     unknown
   >;
-  // Nothing to SET: a no-op, for the same reason as `update` above (that path
-  // has the full rationale). Reports `count: 0` because zero rows were
-  // modified, no statement is issued at all, so this is not the count of rows
-  // the predicate MATCHED.
-  if (!Object.values(dataObj).some((v) => v !== undefined)) {
+  if (update && !Object.values(data!).some((v) => v !== undefined)) {
     return {
       sql: `SELECT ${qi.p(1)} AS count`,
       params: [0],
@@ -2339,72 +2404,25 @@ export function buildUpdateMany<T extends object>(
       tag: `${qi.table}.updateMany`,
     };
   }
-
-  const setFp = fingerprintSet(qi, dataObj);
-  const whereFp = whereMod.fingerprintWhere(qi, whereObj);
-  const ck = `um:${setFp}|${whereFp}${whereMod.globalFilterCacheSegment(qi)}`;
-
+  const setFp = update ? fingerprintSet(qi, data!) : undefined;
+  const whereFp = whereMod.fingerprintWhere(qi, where);
+  const key = `${update ? `um:${setFp}|` : 'dm:'}${whereFp}${whereMod.globalFilterCacheSegment(qi)}`;
   const params: unknown[] = [];
-
-  const buildSql = (freshParams: unknown[]): string => {
-    const setClauses = buildSetClauses(qi, writeEntries(qi, dataObj), freshParams, { operation: 'updateMany' });
-    const whereClause = whereMod.buildWhereClause(qi, whereObj, freshParams);
-    const whereSql = whereClause ? ` WHERE ${whereClause}` : '';
-    return `UPDATE ${qi.q(qi.table)} SET ${setClauses.join(', ')}${whereSql}`;
+  const build = (fresh: unknown[]): string => {
+    const set = update ? buildSetClauses(qi, writeEntries(qi, data!), fresh, { operation: 'updateMany' }) : undefined;
+    const whereSql = whereMod.buildWhereSql(qi, where, fresh);
+    const prefix = set ? `UPDATE ${qi.q(qi.table)} SET ${set.join(', ')}` : `DELETE FROM ${qi.q(qi.table)}`;
+    return `${prefix}${whereSql}`;
   };
-  const entry = qi.acquireSql(ck, buildSql);
-
-  collectSetParams(qi, dataObj, params);
-  whereMod.collectWhereParams(qi, whereObj, params);
-  qi.crossCheckCache('updateMany', ck, entry, buildSql, params);
-
+  const entry = qi.acquireSql(key, build);
+  if (update) collectSetParams(qi, data!, params);
+  whereMod.collectWhereParams(qi, where, params);
+  qi.crossCheckCache(operation, key, entry, build, params);
   return {
     sql: entry.sql,
     params,
     transform: (result) => ({ count: result.rowCount ?? 0 }),
-    tag: `${qi.table}.updateMany`,
-    preparedName: entry.name,
-  };
-}
-
-export function buildDeleteMany<T extends object>(
-  qi: BuilderCtx,
-  args: DeleteManyArgs<T>,
-): DeferredQuery<{ count: number }> {
-  assertWritable(qi, 'deleteMany');
-  assertNoBulkWritePaging(qi.table, 'deleteMany', args);
-  assertNoOptimisticLock(qi, args, 'deleteMany');
-  qi.currentSkip = resolveSkipGlobalFilters(args.skipGlobalFilters);
-  whereMod.assertMutationHasPredicate(
-    qi,
-    'deleteMany',
-    whereMod.userPredicateIsEmpty(qi, args.where as Record<string, unknown>) ? '' : ' WHERE x',
-    resolveUnsafeFlag(args.allowFullTableScan, 'allowFullTableScan'),
-  );
-  const whereObj = (whereMod.mergeGlobalFilter(qi, args.where as Record<string, unknown>) ?? {}) as Record<
-    string,
-    unknown
-  >;
-  const whereFp = whereMod.fingerprintWhere(qi, whereObj);
-  const ck = `dm:${whereFp}${whereMod.globalFilterCacheSegment(qi)}`;
-
-  const params: unknown[] = [];
-
-  const buildSql = (freshParams: unknown[]): string => {
-    const clause = whereMod.buildWhereClause(qi, whereObj, freshParams);
-    const whereSql = clause ? ` WHERE ${clause}` : '';
-    return `DELETE FROM ${qi.q(qi.table)}${whereSql}`;
-  };
-  const entry = qi.acquireSql(ck, buildSql);
-
-  whereMod.collectWhereParams(qi, whereObj, params);
-  qi.crossCheckCache('deleteMany', ck, entry, buildSql, params);
-
-  return {
-    sql: entry.sql,
-    params,
-    transform: (result) => ({ count: result.rowCount ?? 0 }),
-    tag: `${qi.table}.deleteMany`,
+    tag: `${qi.table}.${operation}`,
     preparedName: entry.name,
   };
 }
@@ -2574,6 +2592,25 @@ export function applyUpdatedAtColumns(qi: BuilderCtx, data: Record<string, unkno
  * key. A key set to `undefined` names nothing (see {@link definedKeys}), and a
  * key that resolves to no column is left to the SQL builder's own E003.
  */
+/**
+ * `optimisticLock` writes its own version bump, so `data` that also writes the
+ * version column would assign it twice, which PostgreSQL rejects (42601) with
+ * an untyped error. Refused before anything is built, on every engine.
+ */
+export function assertLockColumnNotWritten(
+  meta: TableMetadata,
+  table: string,
+  data: Record<string, unknown>,
+  field: string,
+): void {
+  const column = resolveColumnName(meta, field);
+  if (column === undefined || !namedColumns(meta, data).has(column)) return;
+  throw new ValidationError(
+    `\`optimisticLock\` on "${table}" writes "${field}" itself (it adds 1), so \`data\` must not write it too. ` +
+      'Remove it from `data`, or drop `optimisticLock` and write the version yourself.',
+  );
+}
+
 function namedColumns(meta: TableMetadata, data: Record<string, unknown>): Set<string> {
   const out = new Set<string>();
   for (const key of Object.keys(data)) {
@@ -2586,7 +2623,7 @@ function namedColumns(meta: TableMetadata, data: Record<string, unknown>): Set<s
 
 export function writeReturningColumns(qi: BuilderCtx, projection?: WriteProjection): ReturningSelection {
   if (projection) return projection.columns.map((col) => qi.q(col));
-  // The PK exemption used to be re-stated here as `|| pk.has(col)`. It now
+  // The PK exemption used to be re-stated here as `|| pk.has(col)`. It
   // lives in `piiColumns` so every projection inherits it and none can drift.
   const piiCols = piiColumns(qi, qi.tableMeta);
   if (piiCols.size === 0) return '*';
@@ -2648,7 +2685,7 @@ export function assertWritable(qi: BuilderCtx, operation: string): void {
 /**
  * Reject a write whose `data` names a `GENERATED ALWAYS AS (...) STORED`
  * column (H3). Postgres computes these from other columns and errors if you
- * try to write them; we fail early with a clear {@link ValidationError} (E003)
+ * try to write them; fail early with a clear {@link ValidationError} (E003)
  * instead of surfacing a cryptic driver error. Undefined values are ignored
  * (they're stripped from the statement anyway).
  */
@@ -2914,7 +2951,7 @@ function exprValueCast(qi: BuilderCtx, key: string): string {
   if (enumCast) return enumCast;
   if (qi.crossSchemaTypeColumns.has(column)) return '';
   const type = qi.columnPgTypeMap.get(column);
-  if (type === undefined || type.startsWith('_') || !SAFE_CAST_TYPE.test(type)) return '';
+  if (type === undefined || qi.whereHost.getColumnKind(column) === 'array' || !SAFE_CAST_TYPE.test(type)) return '';
   return `::${type}`;
 }
 

@@ -4,7 +4,7 @@
  * `relation_graph`, `find_join_path`, `table_stats` and `explain_error` exist to
  * answer the four questions an agent pointed at an unfamiliar Turbine schema
  * otherwise burns a whole context window on: what relations exist and what are
- * they CALLED, how do I get from this table to that one, how big is this table,
+ * they CALLED, which relations connect two tables, how big a table is,
  * and what does this error code mean. Three of them read the catalog; the fourth
  * reads nothing at all.
  *
