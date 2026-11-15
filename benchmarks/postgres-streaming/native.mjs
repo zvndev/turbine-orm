@@ -71,7 +71,7 @@ try {
   await within(init.done, 20000, 'Owned initdb deadline'); report.initOutput = initOutput;
   assert.deepEqual(init.record.exit, { code: 0, signal: null }, 'Native initdb must succeed'); requireActive();
   const logPath = join(output, 'server.log');
-  logFd = openSync(logPath, 'wx');
+  logFd = openSync(logPath, 'wx+');
   const args = ['-D', report.data, '-h', '127.0.0.1', '-p', String(report.port), '-k', report.socket,
     '-c', 'timezone=UTC', '-c', 'shared_buffers=32MB', '-c', 'max_connections=12', '-c', 'fsync=on', '-c', 'synchronous_commit=on', '-c', 'full_page_writes=on',
     '-c', `dynamic_library_path=${join(prefix, 'lib/postgresql')}`, '-c', 'log_statement=all', '-c', 'log_line_prefix=%m [%p] ', '-c', 'log_connections=on', '-c', 'log_disconnections=on'];

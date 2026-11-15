@@ -20,7 +20,7 @@ const observer = fileURLToPath(new URL('./observe.mjs', import.meta.url));
 const runtimeFlags = process.execArgv.filter((arg) => arg === '--experimental-sqlite');
 const argv = [...runtimeFlags, '--import', observer, '--import', 'tsx', '--test', '--test-reporter=tap', '--test-concurrency=4', ...files];
 const logPath = resolve(out, 'tests.log');
-const log = openSync(logPath, 'w');
+const log = openSync(logPath, 'w+');
 const env = { ...process.env, DATABASE_URL: '', MYSQL_URL: '', MYSQL_TEST_URL: '', MSSQL_URL: '', POWDB_URL: '',
   TURBINE_SQLITE_LIFETIME_REPORT: records };
 delete env.NODE_TEST_CONTEXT;
