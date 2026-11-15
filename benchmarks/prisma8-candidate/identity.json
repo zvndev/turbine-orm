@@ -94,10 +94,10 @@
     "canonical/manifest.json": "efe51d36a2bbe70a65f41e7ab291d4b040e8708a3e807796efed8fd4bc24af1f",
     "../../tooling/native-consumer-contracts/postgres-service.mjs": "d2b50fc6e7c390a65060b0d5c08f16e15f19ad8a66c707be0279586a06c6eb88",
     "../../tooling/optional-pg-transports/lifecycle.mjs": "b3e4d7ac60e7bf91a6fc13070ce62fc466ae8c22d4ef1906da156b8fa19a8d60",
-    "../../tooling/optional-pg-transports/run.mjs": "0fae9ca03ba0f0dbe609a6f9da0088964b3295204753073d8b4ebac49d0439ce",
+    "../../tooling/optional-pg-transports/run.mjs": "deafa3cddafe9d656c8b3344f3c7b8d1ee7531a7fd665225ed2074773dcfabad",
     "../../tooling/optional-pg-transports/harness.mjs": "027e0c83796b1e527a53e4ac5361a142e1bd5bf59a63ee3672eab086e8b4aa2a",
     "../../src/test/fixtures/neon-http/native-lifecycle.mjs": "4b18bef2faa96ff1b210001b7f92bc58bcdee54e82b55179af216081510239d5",
-    "../../src/test/fixtures/neon-http/http-command-supervisor.py": "0d4e248d1332d92319c68740a8b24d008df9cba0a90934e6e080a64e537111e4",
+    "../../src/test/fixtures/neon-http/http-command-supervisor.py": "44ab9124fa4b56b3a31d3b1be46a28a70ce5c940dbb0501d387cfe4b33e222f3",
     "../../tooling/optional-pg-transports/ownership-prerequisites.py": "ef6e4994a99760aa29188e9846b4f58742afa5edeee95db637728cf7581c43ca",
     "../../tooling/optional-pg-transports/reason.mjs": "70abdaba55ba90143e5b5480a9261f5f758adfe97d5fedc67b080acb3860bb0f",
     "../../tooling/lifecycle-examples/harness.mjs": "b0e03467945f46937bf5eb00c40c52f3fe0bd860c52c4cd0c707e9ed3b4989ad"
