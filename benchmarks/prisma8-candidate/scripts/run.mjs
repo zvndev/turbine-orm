@@ -71,15 +71,6 @@ if (mode === 'catalog') {
   assert.equal(plan.format, 1);
   assert.ok(existsSync(plan.root));
   const reportPath = join(plan.out, 'report.json');
-  // Reserve the report exclusively up front; the final write below goes
-  // through this descriptor, never re-looked-up by path.
-  let reportFd;
-  try {
-    reportFd = openSync(reportPath, 'wx+');
-  } catch (error) {
-    if (error.code === 'EEXIST') assert.fail('Attempt already has a report; plan a new evidence directory');
-    throw error;
-  }
   const rounds = Number(options.rounds ?? 30),
     warmup = Number(options.warmup ?? 5);
   assert.ok(
@@ -177,6 +168,15 @@ if (mode === 'catalog') {
       'Optional comparator inputs remain unexecuted unless explicitly supplied and preflighted.',
     ],
   };
+  // Reserve the report exclusively once every admission above has passed;
+  // the final write below goes through this descriptor, never by path.
+  let reportFd;
+  try {
+    reportFd = openSync(reportPath, 'wx+');
+  } catch (error) {
+    if (error.code === 'EEXIST') assert.fail('Attempt already has a report; plan a new evidence directory');
+    throw error;
+  }
   try {
     await runWithShutdown(report, reportPath, async (scope) => {
       const service = await startService(plan, report, scope);

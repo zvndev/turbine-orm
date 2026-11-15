@@ -43,15 +43,6 @@ assert.ok(
   'usage: node --import tsx benchmarks/mysql-comparison-native.ts NEW.json [--mode=ordinary|no-backslash] [--controls] [--timing]',
 );
 const output = resolve(destination);
-// Reserve the report exclusively up front; every update below rewrites it
-// through this descriptor, never re-looked-up by path.
-let outputFd: number;
-try {
-  outputFd = openSync(output, 'wx+');
-} catch (error) {
-  if ((error as NodeJS.ErrnoException).code === 'EEXIST') assert.fail('refusing to overwrite native report');
-  throw error;
-}
 const args = new Set(process.argv.slice(3));
 for (const arg of args)
   assert.ok(
@@ -76,6 +67,15 @@ assert.ok(prefix, 'MYSQL_COMPARISON_PREFIX must name the local MySQL installatio
 const libraries = process.env.MYSQL_COMPARISON_LIBRARIES ?? '';
 const binary = join(prefix, 'bin/mysqld');
 const env = { ...process.env, LD_LIBRARY_PATH: libraries, NODE_OPTIONS: '' };
+// Reserve the report exclusively once the cheap admissions pass; every
+// update below rewrites it through this descriptor, never by path.
+let outputFd: number;
+try {
+  outputFd = openSync(output, 'wx+');
+} catch (error) {
+  if ((error as NodeJS.ErrnoException).code === 'EEXIST') assert.fail('refusing to overwrite native report');
+  throw error;
+}
 const installed = installedIdentity();
 const admittedPreflight = timing
   ? timingAdmission(process.env.MYSQL_COMPARISON_PREFLIGHT, installed.artifact.sha256!, mode, benchmarkDirectory)

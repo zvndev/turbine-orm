@@ -28,15 +28,6 @@ const repository = resolve(flags.get('--repository')!),
   benchmark = resolve(flags.get('--benchmark')!);
 const output = resolve(flags.get('--output')!),
   mode = flags.get('--mode')!;
-// Reserve the destination exclusively up front; the manifest is written
-// through this descriptor, never re-looked-up by path.
-let outputFd: number;
-try {
-  outputFd = openSync(output, 'wx');
-} catch (error) {
-  if ((error as NodeJS.ErrnoException).code === 'EEXIST') assert.fail('refusing to overwrite a final manifest');
-  throw error;
-}
 assert.ok(['ordinary', 'no-backslash'].includes(mode));
 assert.equal(process.version, 'v24.10.0');
 assert.equal(process.execPath, flags.get('--runtime'));
@@ -44,6 +35,15 @@ assert.equal(hashFile(process.execPath), flags.get('--runtime-sha256'), 'explici
 const git = (...argv: string[]) => execFileSync('git', argv, { cwd: repository, encoding: 'utf8' }).trim();
 assert.equal(git('rev-parse', 'HEAD'), flags.get('--head'), 'explicit final HEAD mismatch');
 assert.equal(git('status', '--porcelain'), '', 'final manifest requires clean source');
+// Reserve the destination exclusively once the cheap admissions pass; the
+// manifest is written through this descriptor, never re-looked-up by path.
+let outputFd: number;
+try {
+  outputFd = openSync(output, 'wx');
+} catch (error) {
+  if ((error as NodeJS.ErrnoException).code === 'EEXIST') assert.fail('refusing to overwrite a final manifest');
+  throw error;
+}
 process.env.MYSQL_COMPARISON_ARTIFACT = resolve(flags.get('--artifact')!);
 process.env.MYSQL_COMPARISON_ARTIFACT_SHA256 = flags.get('--sha256')!;
 const installed = installedIdentity();
