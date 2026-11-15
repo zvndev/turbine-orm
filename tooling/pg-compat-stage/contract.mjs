@@ -9,7 +9,7 @@ export { files, fileHashes, hashBytes, hashFile };
 export const source = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 export const packageVersion = JSON.parse(readFileSync(join(source, 'package.json'))).version;
 // Exact normal build includes binary provenance and native unique selectors.
-export const normalPin = '8c3d4f90faf7aaae4f38b567a65a432c49d10c246bb17f8697789fdb07f540a3';
+export const normalPin = 'ed3956956c0635b6ccba5dc91bc4b52b79f43cdf4ae5339a23536a864ac19496';
 export const pgPin = '8.22.0';
 export const jsonBytes = value => Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
 export function inputs(root = source) {
@@ -56,8 +56,8 @@ export function stageManifest(original) {
 export function expectedPayload(normal) {
   const manifest = stageManifest(JSON.parse(readFileSync(join(normal, 'package.json'))));
   const payload = Object.fromEntries(files(normal).map(path => [relative(normal, path), readFileSync(path)]));
-  assert.equal(Object.keys(payload).length, 769, 'Pinned full normal inventory required');
-  assert.equal(Object.keys(payload).filter(name => name.startsWith('dist/')).length, 765);
+  assert.equal(Object.keys(payload).length, 773, 'Pinned full normal inventory required');
+  assert.equal(Object.keys(payload).filter(name => name.startsWith('dist/')).length, 769);
   payload['package.json'] = jsonBytes(manifest);
   payload['README.md'] = readFileSync(join(source, 'tooling/pg-compat-stage/README.md'));
   return payload;

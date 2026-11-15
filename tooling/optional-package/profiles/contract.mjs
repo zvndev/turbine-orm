@@ -249,8 +249,8 @@ export function profilePayload(original, source, originalManifest, profile, orig
 export const mysqlDriver = '3.24.6';
 export const mysqlPins = Object.freeze({
   // Exact inputs include binary provenance and native unique-selector projection.
-  source: '7060b7648e8b7c59f1dbbfed4f101d817d09cb594347e3ab85d26ecb4465478c',
-  dist: 'd2e424ab46ca4c9c46ac7767a3893d94b2c604037952f0b9ba9b4203eebd14ba',
+  source: '8a4ed681e542b32b03c4b794f3c17f3b4361751f04fc752cab04f96937d0fdd8',
+  dist: '114612bf98bc0aec0a61d919e638b0387c0d676ddcfd1fa5ac7c6379ceda8194',
   helpers: {
     'dist/optional-peer-import.cjs': '5c1ffa76fa4f35f1cbd8bf82975a59a5cd142668c3b3db0c00c7e82413281ebd',
     'dist/cjs/optional-peer-import.cjs': '4401af07cbb45d8865447bc7645beaa17a20c07b6a3bb85341cf2b312c365323',
@@ -298,8 +298,8 @@ export function mysqlHelperEdges(name, available, target, edges) {
 /** Finite better-sqlite3-only admission for the existing peer helper. */
 export const betterSqlite3Driver = '12.11.1';
 export const betterSqlite3Pins = Object.freeze({
-  source: '7060b7648e8b7c59f1dbbfed4f101d817d09cb594347e3ab85d26ecb4465478c',
-  dist: 'd2e424ab46ca4c9c46ac7767a3893d94b2c604037952f0b9ba9b4203eebd14ba',
+  source: '8a4ed681e542b32b03c4b794f3c17f3b4361751f04fc752cab04f96937d0fdd8',
+  dist: '114612bf98bc0aec0a61d919e638b0387c0d676ddcfd1fa5ac7c6379ceda8194',
   helpers: {
     'dist/optional-peer-import.cjs': '5c1ffa76fa4f35f1cbd8bf82975a59a5cd142668c3b3db0c00c7e82413281ebd',
     'dist/cjs/optional-peer-import.cjs': '4401af07cbb45d8865447bc7645beaa17a20c07b6a3bb85341cf2b312c365323',
