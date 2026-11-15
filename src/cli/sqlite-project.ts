@@ -205,21 +205,19 @@ export async function initSqliteProject(
 ): Promise<SqliteInitResult> {
   checkConfig(config, args);
   const databasePath = normalizeSqlitePath(config.url || './turbine/dev.sqlite');
-  let existingDatabase = existsSync(databasePath);
   // Resolve the driver before making any project files on unsupported Node versions.
   const Database = databaseConstructor();
   mkdirSync(dirname(databasePath), { recursive: true });
   const created: string[] = [];
-  if (!existingDatabase) {
-    try {
-      // Reserve a new path exclusively so a concurrent creator is never opened
-      // for writing merely because the earlier existence check saw no file.
-      writeFileSync(databasePath, '', { flag: 'wx' });
-      created.push(databasePath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      existingDatabase = true;
-    }
+  // The exclusive create is the existence check: a database that is already
+  // there, or that a concurrent creator makes first, is opened read-only.
+  let existingDatabase = false;
+  try {
+    writeFileSync(databasePath, '', { flag: 'wx' });
+    created.push(databasePath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    existingDatabase = true;
   }
   const db = new Database(databasePath, { readOnly: existingDatabase });
   let tableCount: number;
