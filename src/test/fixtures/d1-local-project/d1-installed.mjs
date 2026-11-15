@@ -97,8 +97,9 @@ try {
       );
       for (const commandName of ['init', 'generate', 'pull', 'gen', 'g', 'status', 'info', 'migrate', 'migration', 'm'])
         assert.match(await cli([commandName, '--help']), /Local D1:/);
-      for (const commandName of ['doctor', 'push', 'studio', 'seed'])
+      for (const commandName of ['doctor', 'push', 'studio'])
         await cliRefuse([commandName, '--engine', 'd1'], /Local D1 supports/);
+      await cliRefuse(['seed', '--engine', 'd1'], /uninitialized or its identity differs/);
       rmSync(join(project, 'turbine.config.mjs'));
       assert(!existsSync(join(project, 'state')));
       report.helpWithoutToolOrState = true;
