@@ -1,12 +1,13 @@
 /** Optional Node tooling for an explicitly scoped persistent local D1 binding. */
 import { execFileSync } from 'node:child_process';
-import { lstatSync, readdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
+import { lstatSync, readdirSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { D1DatabaseBinding } from '../d1/types.js';
 import { ValidationError } from '../errors.js';
 import importOptionalPeer from '../optional-peer-import.cjs';
 import { assertD1Config, type D1ProjectConfig } from './d1-config.js';
+import { isSymlinkRefusal, readNoFollow } from './no-follow.js';
 
 export type { D1LocalConfig, D1ProjectConfig } from './d1-config.js';
 
@@ -107,16 +108,22 @@ export function writeD1Marker(context: D1Context): void {
 }
 export function requireD1State(context: D1Context): void {
   const marker = d1ProjectPath(join(context.persist, D1_MARKER));
-  if (
-    !exists(marker) ||
-    !lstatSync(marker).isFile() ||
-    lstatSync(marker).nlink !== 1 ||
-    lstatSync(marker).isSymbolicLink()
-  )
-    throw new ValidationError(
+  const uninitialized = () =>
+    new ValidationError(
       'D1 persistent binding is uninitialized or its identity differs. Run init with a fresh persistence directory.',
     );
-  const value = JSON.parse(readFileSync(marker, 'utf8'));
+  // One descriptor for the checks and the read: a marker replaced after a
+  // separate check, by a symlink or a hard link, is never the one read.
+  let text: string;
+  try {
+    text = readNoFollow(marker, (state) => {
+      if (!state.isFile() || state.nlink !== 1) throw uninitialized();
+    }).toString('utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' || isSymlinkRefusal(error)) throw uninitialized();
+    throw error;
+  }
+  const value = JSON.parse(text);
   if (
     value?.version !== 1 ||
     value.runtime !== 'miniflare@4.20260730.0' ||

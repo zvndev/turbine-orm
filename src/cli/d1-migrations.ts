@@ -1,10 +1,10 @@
 /** Local complete-plan capture and genuinely read-only native D1 journal inspection. */
 import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync } from 'node:fs';
 import { type D1Migration, D1MigrationError } from '../d1/migrate.js';
 import { migrationStatement } from '../d1/migrations/sql.js';
 import type { D1DatabaseBinding, D1Result } from '../d1/types.js';
 import { ValidationError } from '../errors.js';
+import { isSymlinkRefusal, readNoFollow } from './no-follow.js';
 
 const JOURNAL = '_turbine_d1_migrations';
 const CREATE =
@@ -49,10 +49,18 @@ export function captureD1Plan(value: unknown): D1Migration[] {
   return plan;
 }
 export function readD1Plan(path: string): D1Migration[] {
-  const stat = lstatSync(path);
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 10_000_000)
-    throw new ValidationError('D1 plan.json must be a regular, unaliased file of at most 10 MB.');
-  return captureD1Plan(JSON.parse(readFileSync(path, 'utf8')));
+  const refused = () => new ValidationError('D1 plan.json must be a regular, unaliased file of at most 10 MB.');
+  let bytes: Buffer;
+  try {
+    // Checked and read through one descriptor, so the file admitted is the file read.
+    bytes = readNoFollow(path, (stat) => {
+      if (!stat.isFile() || stat.nlink !== 1 || stat.size > 10_000_000) throw refused();
+    });
+  } catch (error) {
+    if (isSymlinkRefusal(error)) throw refused();
+    throw error;
+  }
+  return captureD1Plan(JSON.parse(bytes.toString('utf8')));
 }
 function rows<Row>(result: D1Result<Row>): Row[] {
   if (result?.success !== true || !Array.isArray(result.results))

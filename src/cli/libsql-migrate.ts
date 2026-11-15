@@ -1,6 +1,6 @@
 /** Bounded additive local libSQL deployment. Not a general SQLite SQL parser. */
 import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { lstatSync, realpathSync } from 'node:fs';
 import { relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { ConnectionError, MigrationError } from '../errors.js';
@@ -14,6 +14,7 @@ import {
   type MigrationFile,
   parseMigrationContent,
 } from './migrate.js';
+import { isSymlinkRefusal, readNoFollow } from './no-follow.js';
 
 interface Writer extends LibsqlMigrationReader {
   execute(sql: string | { sql: string; args: string[] }): Promise<LibsqlResultSet>;
@@ -308,15 +309,19 @@ function capture(filename: string, migrationsDir: string): { absolute: string; f
   if (rel === '' || (!rel.startsWith(`..${sep}`) && rel !== '..' && !rel.startsWith(sep)))
     fail('database must be outside the migrations directory.');
   const files = listMigrationFiles(dir).map((file) => {
-    const stat = lstatSync(file.path);
-    if (
-      !stat.isFile() ||
-      stat.isSymbolicLink() ||
-      writableFiles.some((file) => stat.dev === file.dev && stat.ino === file.ino)
-    )
+    const refuse = () =>
       fail('migration inputs must be regular files and must not alias the database or its sidecars.');
     // All reads and hashes precede the first await, including peer loading.
-    const bytes = readFileSync(file.path);
+    // Checked and read through one descriptor, so the file admitted is the file read.
+    let bytes: Buffer;
+    try {
+      bytes = readNoFollow(file.path, (stat) => {
+        if (!stat.isFile() || writableFiles.some((file) => stat.dev === file.dev && stat.ino === file.ino)) refuse();
+      });
+    } catch (error) {
+      if (isSymlinkRefusal(error)) refuse();
+      throw error;
+    }
     const content = bytes.toString('utf8');
     if (!Buffer.from(content, 'utf8').equals(bytes)) fail('migration files must be valid UTF-8.');
     parseMigrationContent(content, file.path);

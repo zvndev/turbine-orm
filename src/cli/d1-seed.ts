@@ -1,5 +1,4 @@
 /** Local declarative inserts. No SQL scripts, executable seeds or interactive sessions. */
-import { lstatSync, readFileSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import type { D1Migration } from '../d1/migrate.js';
 import { migrationStatement } from '../d1/migrations/sql.js';
@@ -7,6 +6,7 @@ import type { D1DatabaseBinding, D1PreparedStatement, D1Result } from '../d1/typ
 import { ValidationError } from '../errors.js';
 import { type D1Context, d1ProjectPath } from './d1-local.js';
 import { inspectD1Migrations } from './d1-migrations.js';
+import { isSymlinkRefusal, readNoFollow } from './no-follow.js';
 
 export type D1SeedValue = null | string | number | boolean | { readonly bytes: readonly number[] };
 export interface D1SeedPlan {
@@ -119,15 +119,17 @@ export function readD1Seed(context: D1Context): readonly Insert[] {
   for (const protectedPath of [context.persist, context.out, context.configPath, context.planPath])
     if (path === protectedPath || path.startsWith(protectedPath + sep) || protectedPath.startsWith(path + sep))
       fail('D1 seed plan must be disjoint from persistence, output, config and migration plan.');
+  const refuse = () => fail('D1 seed.json must be a private regular file of at most 10 MB.');
   try {
-    const stat = lstatSync(path);
-    if (!stat.isFile() || stat.nlink !== 1 || stat.size > 10_000_000)
-      fail('D1 seed.json must be a private regular file of at most 10 MB.');
-    const bytes = readFileSync(path);
+    // Checked and read through one descriptor, so the file admitted is the file read.
+    const bytes = readNoFollow(path, (stat) => {
+      if (!stat.isFile() || stat.nlink !== 1 || stat.size > 10_000_000) refuse();
+    });
     if (bytes.length > 10_000_000) fail('D1 seed.json exceeds 10 MB.');
     return captureD1Seed(JSON.parse(bytes.toString('utf8')));
   } catch (cause) {
     if (cause instanceof D1SeedError) throw cause;
+    if (isSymlinkRefusal(cause)) refuse();
     throw new D1SeedError('D1 seed plan could not be captured.', 'admission', 'not-dispatched', cause);
   }
 }
