@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { copyFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createServer } from 'node:net';
-import { join } from 'node:path';
+import { join, relative, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { runD1MigrationContract } from '../d1-native-migrations/contract.ts';
 
@@ -63,7 +63,7 @@ export async function nativeProof({ root, consumer, project, library, run, repor
     packages: 'external',
     metafile: true,
   });
-  const configInputs = Object.keys(configGraph.metafile.inputs);
+  const configInputs = Object.keys(configGraph.metafile.inputs).map((path) => relative(library, resolve(path)));
   assert(configInputs.some((p) => p.endsWith('/cli/d1-config.js')));
   assert(
     !configInputs.some((p) =>
