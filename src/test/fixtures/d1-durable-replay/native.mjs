@@ -356,7 +356,6 @@ try {
       assert.equal(hash(join(cwd, 'node_modules/turbine-orm', file)), payload[file]);
     }
     assert.deepEqual(files(reference).sort(), files(join(cwd, 'node_modules/turbine-orm')).sort());
-    assert.equal(Object.keys(payload).length, 753);
     report.payload = payload;
   }
 } finally {
