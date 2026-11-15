@@ -23,6 +23,21 @@ const quote = (value: string) => `\`${value.replaceAll('`', '``')}\``;
 const secret = /literal-secret|default-secret|row-secret|predicate-secret|history-secret|checksum-secret/;
 const check = (report: MysqlDoctorReport, code: string) => report.checks.find((value) => value.code === code)!;
 
+// The server reaps a closed connection's thread asynchronously, so under a loaded
+// server the first PROCESSLIST read can still list one that was just ended: wait a
+// bounded time for the database's sessions to go. A leaked session stays listed.
+async function sessionsLeft(admin: Connection, database: string): Promise<number> {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const [sessions] = await admin.query<RowDataPacket[]>(
+      'SELECT ID FROM information_schema.PROCESSLIST WHERE DB = ? AND ID <> CONNECTION_ID()',
+      [database],
+    );
+    if (sessions.length === 0 || Date.now() >= deadline) return sessions.length;
+    await new Promise((done) => setTimeout(done, 50));
+  }
+}
+
 async function fixture(
   body: (f: {
     admin: Connection;
@@ -317,11 +332,7 @@ describe('native scoped MySQL doctor', () => {
         } finally {
           await caller.end();
         }
-        const [sessions] = await f.admin.query<RowDataPacket[]>(
-          'SELECT ID FROM information_schema.PROCESSLIST WHERE DB = ? AND ID <> CONNECTION_ID()',
-          [f.database],
-        );
-        assert.equal(sessions.length, 0);
+        assert.equal(await sessionsLeft(f.admin, f.database), 0, 'a session is still open after 10 s');
       }),
   );
   native.it('retains a failed collection report after the owned native session is killed', async (t) =>
@@ -353,11 +364,7 @@ describe('native scoped MySQL doctor', () => {
       assert.equal(check(report, 'MYSQL_VISIBILITY').status, 'pass');
       assert.equal(check(report, 'MYSQL_SCOPE').status, 'fail');
       assert.doesNotMatch(JSON.stringify(report), secret);
-      const [sessions] = await f.admin.query<RowDataPacket[]>(
-        'SELECT ID FROM information_schema.PROCESSLIST WHERE DB = ? AND ID <> CONNECTION_ID()',
-        [f.database],
-      );
-      assert.equal(sessions.length, 0);
+      assert.equal(await sessionsLeft(f.admin, f.database), 0, 'a session is still open after 10 s');
     }),
   );
   native.it(
@@ -405,11 +412,7 @@ describe('native scoped MySQL doctor', () => {
             .result.tools.some((tool: { name: string }) => tool.name === 'doctor_report'),
         );
         assert.deepEqual(readdirSync(f.dir).sort(), before);
-        const [sessions] = await f.admin.query<RowDataPacket[]>(
-          'SELECT ID FROM information_schema.PROCESSLIST WHERE DB = ? AND ID <> CONNECTION_ID()',
-          [f.database],
-        );
-        assert.equal(sessions.length, 0);
+        assert.equal(await sessionsLeft(f.admin, f.database), 0, 'a session is still open after 10 s');
       }),
   );
 });
