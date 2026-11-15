@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, mkdirSync, openSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
@@ -15,6 +15,8 @@ const manifest = JSON.parse(readFileSync(join(pkg, 'package.json')));
 const ownRequire = createRequire(join(pkg, 'package.json'));
 const report = { node: process.version, lane, revision, commands: [], cases: [], clients: [], servicesStarted: 0 };
 const digest = bytes => createHash('sha256').update(bytes).digest('hex');
+// One open per read: the bytes come from the descriptor, not a re-looked-up path.
+const readBytes = file => { const fd = openSync(file, 'r'); try { return readFileSync(fd); } finally { closeSync(fd); } };
 const quote = name => '"' + name.replaceAll('"', '""') + '"';
 const tree = dir => Object.fromEntries(readdirSync(dir, { withFileTypes: true }).flatMap(entry => {
   const file = join(dir, entry.name);
@@ -85,7 +87,7 @@ await runWithShutdown(report, join(evidence, `installed-${lane}-${revision}-${pr
         const result = await init(dir, args);
         assert.equal(result.existingDatabase, true); assert.equal(result.generated, undefined);
         assert.deepEqual(readdirSync(join(dir, 'migrations')), [], name);
-        assert.deepEqual(readFileSync(file), before); assert.deepEqual(rows(file, name), values);
+        assert.deepEqual(readBytes(file), before); assert.deepEqual(rows(file, name), values);
         for (const field of ['uid', 'gid', 'mode', 'ino']) assert.equal(statSync(file)[field], ownership[field]);
         const files = tree(dir);
         assert.deepEqual((await init(dir, { ...args, force: true })).created, []);

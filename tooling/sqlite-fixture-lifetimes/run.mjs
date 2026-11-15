@@ -1,7 +1,7 @@
 /** Run a no-network source audit without coverage collection or hidden cleanup success. */
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, mkdirSync, openSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { closeSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -44,6 +44,16 @@ const result = await new Promise((done) => {
 clearTimeout(timer);
 process.removeListener('SIGINT', interrupt);
 process.removeListener('SIGTERM', terminate);
+// Read the log back through the descriptor that wrote it, then close it.
+const logSize = fstatSync(log).size;
+const logBytes = Buffer.alloc(logSize);
+let logRead = 0;
+while (logRead < logSize) {
+  const n = readSync(log, logBytes, logRead, logSize - logRead, logRead);
+  if (!n) break;
+  logRead += n;
+}
+const logText = logBytes.toString('utf8', 0, logRead);
 closeSync(log);
 const allReports = readdirSync(records).filter((f) => f.endsWith('.json')).map((f) => JSON.parse(readFileSync(resolve(records, f), 'utf8')));
 const reports = allReports.filter((r) => r.ppid === child.pid);
@@ -53,7 +63,7 @@ const counts = Object.fromEntries(['constructed', 'opened', 'observedClosed', 'l
 counts.cleanupFailures = reports.reduce((sum, r) => sum + r.cleanupFailures.length, 0);
 const incomplete = reports.filter((r) => !r.complete).map((r) => r.pid);
 const unsupported = reports.filter((r) => !r.supported).map((r) => r.pid);
-const failedTap = readFileSync(logPath, 'utf8').split('\n').filter((line) => /^\s*not ok \d+\b/.test(line));
+const failedTap = logText.split('\n').filter((line) => /^\s*not ok \d+\b/.test(line));
 const allowUnsupported = args.includes('--allow-unsupported');
 const nativeCovered = !unsupported.length && counts.opened > 0;
 const unavailable = reports.length === files.length && unsupported.length === reports.length;
@@ -65,6 +75,6 @@ const summary = { ...identity, finished: new Date().toISOString(), ...result, ti
 writeFileSync(resolve(out, 'summary.json'), `${JSON.stringify(summary, null, 2)}\n`);
 console.log(JSON.stringify(summary, null, 2));
 if (!ok) {
-  console.error(readFileSync(logPath, 'utf8').split('\n').slice(-70).join('\n'));
+  console.error(logText.split('\n').slice(-70).join('\n'));
   process.exitCode = 1;
 }

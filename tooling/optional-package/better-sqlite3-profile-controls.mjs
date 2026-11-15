@@ -1,7 +1,7 @@
 /** Actual repacks with forged descriptors, plus fresh-source/old-emission attacks. */
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, symlinkSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { fileHashes, hashBytes, hashFile, sourceHashes } from './artifact-contract.mjs';
@@ -68,8 +68,9 @@ for (const changedSource of ['src/better-sqlite3.ts', 'src/optional-peer-import.
   for (const name of Object.keys(identity.inputHashes)) { mkdirSync(dirname(join(scratch, name)), { recursive: true }); cpSync(join(source, name), join(scratch, name)); }
   cpSync(join(source, 'dist'), join(scratch, 'dist'), { recursive: true });
   symlinkSync(join(source, 'node_modules'), join(scratch, 'node_modules'));
-  const path = join(scratch, changedSource); assert.ok(existsSync(path));
-  writeFileSync(path, readFileSync(path) + '\n// Deliberate changed source with stale normal emission.\n');
+  const path = join(scratch, changedSource);
+  const fd = openSync(path, 'r+');
+  try { writeSync(fd, '\n// Deliberate changed source with stale normal emission.\n', readFileSync(fd).length); } finally { closeSync(fd); }
   const inputs = sourceHashes(scratch);
   const edited = { ...identity, source: scratch, inputHashes: inputs, build: { ...identity.build, inputSha256: hashBytes(JSON.stringify(inputs)), distHashes: fileHashes(join(scratch, 'dist')) } };
   cpSync(join(dirname(identityPath), 'package'), staged, { recursive: true });
