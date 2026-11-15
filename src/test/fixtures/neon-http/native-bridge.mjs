@@ -123,7 +123,7 @@ export async function localBridge(pg, connectionString) {
         await client.query('ROLLBACK');
         record.outcome = 'rolled-back';
       }
-      if (record) record.error = { message: error.message, code: error.code };
+      if (record) record.error = { message: error.message, code: error.code, where: error.where };
       const value = { message: error.message };
       for (const key of [
         'severity',
@@ -133,7 +133,6 @@ export async function localBridge(pg, connectionString) {
         'position',
         'internalPosition',
         'internalQuery',
-        'where',
         'schema',
         'table',
         'column',

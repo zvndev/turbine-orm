@@ -7,10 +7,12 @@ import {
   closeSync,
   copyFileSync,
   existsSync,
+  fstatSync,
   mkdirSync,
   mkdtempSync,
   openSync,
   readFileSync,
+  readSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -98,14 +100,13 @@ function run(dir, binary, args) {
 async function child(label, binary, args, env, failure) {
   checkSignal();
   const path = join(output, `${label}.log`);
-  const fd = openSync(path, 'w');
+  const fd = openSync(path, 'w+');
   const proc = spawn(binary, args, {
     cwd: env.PG_POOLER_CONSUMER || cwd,
     env,
     detached: true,
     stdio: ['ignore', fd, fd],
   });
-  closeSync(fd);
   active = proc;
   const record = {
     label,
@@ -135,7 +136,14 @@ async function child(label, binary, args, env, failure) {
     record.groupGone = gone(-proc.pid);
     assert.equal(record.groupGone, true, 'all command children must exit before proceeding');
     checkSignal();
-    const log = readFileSync(path, 'utf8');
+    const bytes = Buffer.alloc(fstatSync(fd).size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = readSync(fd, bytes, offset, bytes.length - offset, offset);
+      assert.ok(count > 0, 'Child log truncated while reading');
+      offset += count;
+    }
+    const log = bytes.toString('utf8');
     if (failure) {
       assert.notEqual(status.code, 0);
       assert.match(log, failure);
@@ -145,6 +153,7 @@ async function child(label, binary, args, env, failure) {
         record.contractEvidence = assertContractEvidence(log);
     }
   } finally {
+    closeSync(fd);
     clearTimeout(timer);
     clearTimeout(killTimer);
     // Keep the detached group's ownership after its leader exits. Detecting an

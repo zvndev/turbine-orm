@@ -79,7 +79,13 @@ class Request {
         ],
       };
     const statePath = process.env.MSSQL_FIXTURE_STATE;
-    const rows = fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : [];
+    let rows;
+    try {
+      rows = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      rows = [];
+    }
     if (sql.startsWith('INSERT INTO [users]')) {
       const columns = sql
         .match(/\[users\] \((.*?)\)/)[1]

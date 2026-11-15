@@ -32,8 +32,7 @@ const report = {
 };
 const save = () => writeFileSync(join(root, 'report.json'), `${JSON.stringify(report, null, 2)}\n`);
 const put = (path, content) => {
-  assert(!existsSync(path), `Refuse existing ${path}`);
-  writeFileSync(path, content);
+  writeFileSync(path, content, { flag: 'wx' });
 };
 let commandId = 0;
 let commandCwd = root;

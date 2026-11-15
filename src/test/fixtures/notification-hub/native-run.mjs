@@ -1,7 +1,17 @@
 // Native source runner. Fails if PostgreSQL binaries/driver/runtime are absent.
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { createConnection } from 'node:net';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -67,9 +77,8 @@ const run = (dir, binary, args, expected = 0) => {
 };
 async function child(label, args, childEnv = env, success = true) {
   const log = join(output, `${label}.log`);
-  const fd = openSync(log, 'w');
+  const fd = openSync(log, 'w+');
   const process_ = spawn(process.execPath, args, { cwd, env: childEnv, stdio: ['ignore', fd, fd] });
-  closeSync(fd);
   const record = {
     label,
     binary: process.execPath,
@@ -86,12 +95,21 @@ async function child(label, args, childEnv = env, success = true) {
       process_.once('error', reject);
       process_.once('exit', accept);
     });
-    if (success) assert.equal(record.exit, 0, readFileSync(log, 'utf8'));
+    const bytes = Buffer.alloc(fstatSync(fd).size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = readSync(fd, bytes, offset, bytes.length - offset, offset);
+      assert.ok(count > 0, 'Child log truncated while reading');
+      offset += count;
+    }
+    const contents = bytes.toString('utf8');
+    if (success) assert.equal(record.exit, 0, contents);
     else {
       assert.notEqual(record.exit, 0);
-      assert.match(readFileSync(log, 'utf8'), /precondition is unmet/);
+      assert.match(contents, /precondition is unmet/);
     }
   } finally {
+    closeSync(fd);
     clearTimeout(timer);
   }
 }
