@@ -451,7 +451,10 @@ export function validateCliEngineUrl(engine: CliEngine, url: string): void {
   } else if (/^\/\S+\s+\S+$/.test(url.trim())) {
     // pg accepts "<Unix socket directory> <database>" as a connection string.
     return;
-  } else if (/^(?:file:|sqlite:|:memory:|\.{0,2}[/\\]|[a-z]:[/\\])|\.(?:db|sqlite3?)(?:[?#].*)?$/i.test(url.trim())) {
+  } else if (/^(?:file:|sqlite:|:memory:|\.{0,2}[/\\]|[a-z]:[/\\])|\.(?:db|sqlite3?)(?:[?#]|$)/i.test(url.trim())) {
+    // An extension followed by `?`, `#` or the end. This was `(?:[?#].*)?$`;
+    // `.` stops at a line break, so each `.db#` before one rescanned up to it
+    // (quadratic), and a line break after the `?` or `#` hid the extension.
     throw new TypeError('A SQLite database path requires engine "sqlite" (or --engine sqlite).');
   }
 }

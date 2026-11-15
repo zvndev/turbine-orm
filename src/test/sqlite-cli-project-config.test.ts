@@ -97,6 +97,48 @@ describe('CLI engine and SQLite target resolution', () => {
     assert.doesNotThrow(() => validateCliEngineUrl('postgresql', 'postgres://localhost/app.db'));
   });
 
+  it('recognizes a SQLite path by its extension, in linear time', () => {
+    const refused = (url: string) => {
+      try {
+        validateCliEngineUrl('postgresql', url);
+        return false;
+      } catch (err) {
+        if (/requires engine "sqlite"/.test((err as Error).message)) return true;
+        throw err;
+      }
+    };
+    // The previous expression is the oracle wherever no line break is involved.
+    const before = /^(?:file:|sqlite:|:memory:|\.{0,2}[/\\]|[a-z]:[/\\])|\.(?:db|sqlite3?)(?:[?#].*)?$/i;
+    const pieces = ['.', 'db', 'DB', 'sqlite', 'Sqlite3', '3', '?', '#', 'x', '/', '\\', ':', 'c:', 'file:', '-'];
+    let seed = 7;
+    const next = () => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t ^= t + Math.imul(t ^ (t >>> 7), 61 | t);
+      return (t ^ (t >>> 14)) >>> 0;
+    };
+    let matches = 0;
+    for (let i = 0; i < 4000; i++) {
+      let url = '';
+      for (let n = 1 + (next() % 8); n > 0; n--) url += pieces[next() % pieces.length];
+      assert.equal(refused(url), before.test(url), JSON.stringify(url));
+      if (before.test(url)) matches++;
+    }
+    assert.ok(matches > 400 && matches < 3600, `${matches} of 4000 matched`);
+    for (const url of ['app.db', 'app.sqlite3?mode=ro', 'app.sqlite#x', 'APP.DB', 'a.bak.db']) {
+      assert.equal(refused(url), true, url);
+    }
+    for (const url of ['app.dbx', 'app.sqlite4', 'app.db/x', 'a.db.bak?x', 'postgres://localhost/app.db']) {
+      assert.equal(refused(url), false, url);
+    }
+    // A line break after the query or fragment no longer hides the extension.
+    assert.equal(refused('app.db?mode=ro\nx'), true);
+    const started = performance.now();
+    assert.equal(refused(`${'.db#'.repeat(50_000)}\nx`), true);
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 1000, `took ${elapsed.toFixed(0)} ms`);
+  });
+
   it('refuses transient, remote and ambiguous URI targets', () => {
     for (const value of [
       '',
