@@ -21,8 +21,20 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import fs, { linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import fs, {
+  chmodSync,
+  constants,
+  linkSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { describe, it } from 'node:test';
@@ -33,8 +45,11 @@ import { D1SeedError, readD1Seed } from '../cli/d1-seed.js';
 import { migrateLibsqlDeploy } from '../cli/libsql-migrate.js';
 import { initLibsqlProject, type LibsqlProjectConfig } from '../cli/libsql-project.js';
 import { ignoreEnvFile } from '../cli/mysql-project.js';
+import { openNoFollow } from '../cli/no-follow.js';
 
 const canLink = process.platform !== 'win32';
+// Permission bits do not stop root, and Windows has no mode bits to clear.
+const canDenyWrites = process.platform !== 'win32' && process.getuid?.() !== 0;
 const TSX_LOADER = pathToFileURL(resolve('node_modules/tsx/dist/loader.mjs')).href;
 const D1_MIGRATIONS = new URL('../cli/d1-migrations.ts', import.meta.url).href;
 const USES = ['openSync', 'readFileSync', 'writeFileSync', 'appendFileSync'] as const;
@@ -312,5 +327,272 @@ describe('MySQL init and the /.env rule', () => {
         '.env would be written with no ignore rule for it',
       );
       assert.deepEqual(created, []);
+    }));
+});
+
+/**
+ * Run `run` with `stage` called the first time a descriptor opened on `target`
+ * is used (its fstat or a read): after the name was admitted and before its
+ * bytes are read or appended to. Anything that goes back to the name after
+ * that point sees what `stage` put there instead of the admitted file.
+ */
+async function raceAfterOpen<T>(
+  target: string,
+  stage: () => void,
+  run: () => T | Promise<T>,
+): Promise<{ staged: boolean; result: PromiseSettledResult<T> }> {
+  const names = ['openSync', 'fstatSync', 'readFileSync'] as const;
+  const real = Object.fromEntries(names.map((name) => [name, fs[name]])) as Record<string, unknown>;
+  const call = (name: string, args: unknown[]) => (real[name] as (...a: unknown[]) => unknown).apply(fs, args);
+  const at = resolve(target);
+  let opened: number | undefined;
+  let staged = false;
+  const patched = fs as unknown as Record<string, unknown>;
+  patched.openSync = (...args: unknown[]) => {
+    const fd = call('openSync', args);
+    if (opened === undefined && typeof args[0] === 'string' && resolve(args[0]) === at) opened = fd as number;
+    return fd;
+  };
+  for (const name of ['fstatSync', 'readFileSync'] as const) {
+    patched[name] = (...args: unknown[]) => {
+      if (!staged && opened !== undefined && args[0] === opened) {
+        staged = true;
+        stage();
+      }
+      return call(name, args);
+    };
+  }
+  syncBuiltinESMExports();
+  try {
+    const [result] = await Promise.allSettled([Promise.resolve().then(run)]);
+    return { staged, result: result! };
+  } finally {
+    Object.assign(fs, real);
+    syncBuiltinESMExports();
+  }
+}
+
+/** Move the admitted file at `path` aside to `aside` and put `replacement` at its name. */
+const replaceAfterAdmission = (path: string, aside: string, replacement: string) => () => {
+  renameSync(path, aside);
+  writeFileSync(path, replacement);
+};
+
+describe('admitted files are read and appended through their descriptor', { skip: !canLink }, () => {
+  it('readD1Plan reads the bytes of the file it admitted, not a file renamed into its place', () =>
+    inTempDir(async (dir) => {
+      const plan = join(dir, 'plan.json');
+      writeFileSync(plan, JSON.stringify([{ id: '0001_checked', statements: ['CREATE TABLE a(id INTEGER)'] }]));
+      const replaced = JSON.stringify([{ id: '0001_replaced', statements: ['CREATE TABLE b(id INTEGER)'] }]);
+      const { staged, result } = await raceAfterOpen(
+        plan,
+        replaceAfterAdmission(plan, join(dir, 'admitted.json'), replaced),
+        () => readD1Plan(plan),
+      );
+      assert.equal(staged, true, 'the race was never staged, so this test proves nothing');
+      assert.equal(result.status, 'fulfilled', String((result as PromiseRejectedResult).reason));
+      const read = (result as PromiseFulfilledResult<ReturnType<typeof readD1Plan>>).value;
+      assert.equal(read[0]?.id, '0001_checked', 'the plan was read by name after it was admitted');
+    }));
+
+  it('libSQL init appends to the .gitignore it admitted, not to a file renamed into its place', () =>
+    inTempDir(async () => {
+      writeFileSync('.gitignore', 'keep-me\n');
+      const { staged, result } = await raceAfterOpen(
+        '.gitignore',
+        replaceAfterAdmission('.gitignore', 'admitted', 'other\n'),
+        () =>
+          initLibsqlProject(
+            {
+              engine: 'libsql',
+              url: 'file:./local.sqlite',
+              out: './generated',
+              schema: 'main',
+              include: [],
+              exclude: [],
+              migrationsDir: './migrations',
+              schemaFile: './schema.ts',
+              keepColumnNames: false,
+              legacyToManyUniques: false,
+              importExtension: 'js',
+            },
+            { noTimestamp: true, skipGenerate: true },
+          ),
+      );
+      assert.equal(staged, true, 'the race was never staged, so this test proves nothing');
+      assert.equal(result.status, 'fulfilled', String((result as PromiseRejectedResult).reason));
+      assert.equal(readFileSync('admitted', 'utf8'), 'keep-me\n.env\n*.sqlite\n*.sqlite-shm\n*.sqlite-wal\n');
+      assert.equal(readFileSync('.gitignore', 'utf8'), 'other\n', 'the lines went to the file renamed into place');
+    }));
+
+  it('MySQL init appends the rule to the .gitignore it opened, not to a file renamed into its place', () =>
+    inTempDir(async () => {
+      writeFileSync('.gitignore', 'node_modules\n');
+      const created: string[] = [];
+      const { staged, result } = await raceAfterOpen(
+        '.gitignore',
+        replaceAfterAdmission('.gitignore', 'admitted', 'other\n'),
+        () => ignoreEnvFile(created),
+      );
+      assert.equal(staged, true, 'the race was never staged, so this test proves nothing');
+      assert.equal(result.status, 'fulfilled', String((result as PromiseRejectedResult).reason));
+      assert.equal(readFileSync('admitted', 'utf8'), 'node_modules\n\n# Local database credentials\n/.env\n');
+      assert.equal(readFileSync('.gitignore', 'utf8'), 'other\n', 'the rule went to the file renamed into place');
+    }));
+});
+
+describe('a read-only .gitignore that already has every line', { skip: !canDenyWrites }, () => {
+  it('MySQL init leaves it alone, and still refuses one that lacks the rule', () =>
+    inTempDir(() => {
+      const complete = '# Local database credentials\n/.env\n';
+      writeFileSync('.gitignore', complete);
+      chmodSync('.gitignore', 0o444);
+      const created: string[] = [];
+      ignoreEnvFile(created);
+      assert.equal(readFileSync('.gitignore', 'utf8'), complete);
+      assert.deepEqual(created, []);
+
+      chmodSync('.gitignore', 0o644);
+      writeFileSync('.gitignore', 'node_modules\n');
+      chmodSync('.gitignore', 0o444);
+      assert.throws(() => ignoreEnvFile(created), { code: 'EACCES' });
+      assert.equal(readFileSync('.gitignore', 'utf8'), 'node_modules\n');
+    }));
+
+  it('libSQL init leaves it alone', () =>
+    inTempDir(async () => {
+      const complete = '.env\n*.sqlite\n*.sqlite-shm\n*.sqlite-wal\n';
+      writeFileSync('.gitignore', complete);
+      chmodSync('.gitignore', 0o444);
+      await initLibsqlProject(
+        {
+          engine: 'libsql',
+          url: 'file:./local.sqlite',
+          out: './generated',
+          schema: 'main',
+          include: [],
+          exclude: [],
+          migrationsDir: './migrations',
+          schemaFile: './schema.ts',
+          keepColumnNames: false,
+          legacyToManyUniques: false,
+          importExtension: 'js',
+        },
+        { noTimestamp: true, skipGenerate: true },
+      );
+      assert.equal(readFileSync('.gitignore', 'utf8'), complete);
+    }));
+});
+
+/** Run `open`, returning what it threw and every descriptor it opened. */
+function opening(open: () => number): { error: unknown; fds: number[] } {
+  const real = fs.openSync;
+  const fds: number[] = [];
+  (fs as unknown as Record<string, unknown>).openSync = (...args: Parameters<typeof real>) => {
+    const fd = real.apply(fs, args);
+    fds.push(fd);
+    return fd;
+  };
+  syncBuiltinESMExports();
+  try {
+    fds.push(open());
+    return { error: undefined, fds };
+  } catch (error) {
+    return { error, fds };
+  } finally {
+    fs.openSync = real;
+    syncBuiltinESMExports();
+  }
+}
+
+const isClosed = (fd: number) => {
+  try {
+    fs.fstatSync(fd);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EBADF';
+  }
+};
+
+/** Call `stage` just before the first lstat of `target`. */
+function beforeLstat<T>(target: string, stage: () => void, run: () => T): T {
+  const real = fs.lstatSync;
+  const patched = fs as unknown as Record<string, unknown>;
+  const at = resolve(target);
+  let staged = false;
+  patched.lstatSync = (...args: Parameters<typeof real>) => {
+    if (!staged && typeof args[0] === 'string' && resolve(args[0]) === at) {
+      staged = true;
+      stage();
+    }
+    return real.apply(fs, args);
+  };
+  syncBuiltinESMExports();
+  try {
+    return run();
+  } finally {
+    patched.lstatSync = real;
+    syncBuiltinESMExports();
+  }
+}
+
+describe('the open for platforms without O_NOFOLLOW', { skip: !canLink }, () => {
+  const fallback = (path: string) => openNoFollow(path, constants.O_RDONLY, 0);
+
+  it('keeps the descriptor of a plain file', () =>
+    inTempDir((dir) => {
+      const file = join(dir, 'plan.json');
+      writeFileSync(file, 'plain');
+      const { error, fds } = opening(() => fallback(file));
+      assert.equal(error, undefined);
+      assert.equal(readFileSync(fds.at(-1)!, 'utf8'), 'plain');
+      fs.closeSync(fds.at(-1)!);
+    }));
+
+  it('refuses a symlink and closes what it opened', () =>
+    inTempDir((dir) => {
+      writeFileSync(join(dir, 'victim'), 'victim');
+      symlinkSync(join(dir, 'victim'), join(dir, 'plan.json'));
+      const { error, fds } = opening(() => fallback(join(dir, 'plan.json')));
+      assert.equal((error as NodeJS.ErrnoException).code, 'ELOOP');
+      assert.ok(fds.length > 0 && fds.every(isClosed), 'a descriptor was left open');
+    }));
+
+  it('refuses a name that no longer names the file it opened, and closes it', () =>
+    inTempDir((dir) => {
+      const file = join(dir, 'plan.json');
+      writeFileSync(file, 'opened');
+      const { error, fds } = beforeLstat(file, replaceAfterAdmission(file, join(dir, 'aside'), 'replaced'), () =>
+        opening(() => fallback(file)),
+      );
+      assert.equal((error as NodeJS.ErrnoException).code, 'ELOOP', 'the descriptor of a different file was kept');
+      assert.ok(fds.length > 0 && fds.every(isClosed), 'a descriptor was left open');
+    }));
+
+  it('closes what it opened when the name disappears before it is checked', () =>
+    inTempDir((dir) => {
+      const file = join(dir, 'plan.json');
+      writeFileSync(file, 'opened');
+      const { error, fds } = beforeLstat(
+        file,
+        () => rmSync(file),
+        () => opening(() => fallback(file)),
+      );
+      assert.equal((error as NodeJS.ErrnoException).code, 'ENOENT');
+      assert.ok(fds.length > 0 && fds.every(isClosed), 'a descriptor was left open');
+    }));
+});
+
+describe('a socket where a D1 input belongs', { skip: process.platform === 'win32' }, () => {
+  it('readD1Plan refuses it with the usual validation error', () =>
+    inTempDir(async (dir) => {
+      const plan = join(dir, 'plan.json');
+      const server = createServer();
+      await new Promise<void>((done) => server.listen(plan, done));
+      try {
+        assert.throws(() => readD1Plan(plan), /regular, unaliased file/);
+      } finally {
+        await new Promise<void>((done) => server.close(() => done()));
+      }
     }));
 });

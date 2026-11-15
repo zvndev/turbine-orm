@@ -4,7 +4,7 @@ import { type D1Migration, D1MigrationError } from '../d1/migrate.js';
 import { migrationStatement } from '../d1/migrations/sql.js';
 import type { D1DatabaseBinding, D1Result } from '../d1/types.js';
 import { ValidationError } from '../errors.js';
-import { isSymlinkRefusal, readNoFollow } from './no-follow.js';
+import { isRefusedOpen, readNoFollow } from './no-follow.js';
 
 const JOURNAL = '_turbine_d1_migrations';
 const CREATE =
@@ -57,7 +57,7 @@ export function readD1Plan(path: string): D1Migration[] {
       if (!stat.isFile() || stat.nlink !== 1 || stat.size > 10_000_000) throw refused();
     });
   } catch (error) {
-    if (isSymlinkRefusal(error)) throw refused();
+    if (isRefusedOpen(error)) throw refused();
     throw error;
   }
   return captureD1Plan(JSON.parse(bytes.toString('utf8')));

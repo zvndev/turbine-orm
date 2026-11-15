@@ -7,7 +7,7 @@ import type { D1DatabaseBinding } from '../d1/types.js';
 import { ValidationError } from '../errors.js';
 import importOptionalPeer from '../optional-peer-import.cjs';
 import { assertD1Config, type D1ProjectConfig } from './d1-config.js';
-import { isSymlinkRefusal, readNoFollow } from './no-follow.js';
+import { isRefusedOpen, readNoFollow } from './no-follow.js';
 
 export type { D1LocalConfig, D1ProjectConfig } from './d1-config.js';
 
@@ -120,7 +120,7 @@ export function requireD1State(context: D1Context): void {
       if (!state.isFile() || state.nlink !== 1) throw uninitialized();
     }).toString('utf8');
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT' || isSymlinkRefusal(error)) throw uninitialized();
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' || isRefusedOpen(error)) throw uninitialized();
     throw error;
   }
   const value = JSON.parse(text);

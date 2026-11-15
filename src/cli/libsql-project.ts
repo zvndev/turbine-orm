@@ -23,7 +23,7 @@ import importOptionalPeer from '../optional-peer-import.cjs';
 import type { SchemaMetadata } from '../schema.js';
 import { findConfigFile, type ResolvedConfig } from './config.js';
 import { assertLibsqlProjectConfigOptions, libsqlProjectUrl } from './libsql-project-config.js';
-import { isSymlinkRefusal, openNoFollow } from './no-follow.js';
+import { isRefusedOpen, isWriteRefusal, openNoFollow } from './no-follow.js';
 import { banner, info, label, success } from './ui.js';
 
 export { libsqlProjectUrl } from './libsql-project-config.js';
@@ -145,17 +145,36 @@ function addIgnores(ignores: string, created: string[]): void {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
   }
   const irregular = () => new ValidationError('.gitignore must be a regular file.');
+  const open = (flags: number) => {
+    try {
+      return openNoFollow('.gitignore', flags);
+    } catch (error) {
+      if (isRefusedOpen(error) || (error as NodeJS.ErrnoException).code === 'EISDIR') throw irregular();
+      throw error;
+    }
+  };
+  // Reads the opened file and returns its text and the lines it lacks.
+  const inspect = (fd: number) => {
+    if (!fstatSync(fd).isFile()) throw irregular();
+    const previous = readFileSync(fd, 'utf8');
+    return { previous, missing: ignores.split('\n').filter((line) => line && !previous.split(/\r?\n/).includes(line)) };
+  };
   let fd: number;
   try {
-    fd = openNoFollow('.gitignore', constants.O_RDWR | constants.O_APPEND);
+    fd = open(constants.O_RDWR | constants.O_APPEND);
   } catch (error) {
-    if (isSymlinkRefusal(error) || (error as NodeJS.ErrnoException).code === 'EISDIR') throw irregular();
+    // A .gitignore that cannot be written but already lists every line needs nothing.
+    if (!isWriteRefusal(error)) throw error;
+    const readOnly = open(constants.O_RDONLY);
+    try {
+      if (inspect(readOnly).missing.length === 0) return;
+    } finally {
+      closeSync(readOnly);
+    }
     throw error;
   }
   try {
-    if (!fstatSync(fd).isFile()) throw irregular();
-    const previous = readFileSync(fd, 'utf8');
-    const missing = ignores.split('\n').filter((line) => line && !previous.split(/\r?\n/).includes(line));
+    const { previous, missing } = inspect(fd);
     if (missing.length) appendFileSync(fd, `${previous.endsWith('\n') ? '' : '\n'}${missing.join('\n')}\n`);
   } finally {
     closeSync(fd);

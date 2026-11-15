@@ -17,6 +17,7 @@ import { applyRelationRenames, assertSafeCatalogSchema, printableCatalogName as 
 import { introspectMysql } from '../mysql.js';
 import type { SchemaMetadata } from '../schema.js';
 import { findConfigFile, mysqlDatabaseFromUrl, type ResolvedConfig, resolveCliEngine } from './config.js';
+import { isWriteRefusal } from './no-follow.js';
 import { banner, info, label, redactUrl, success } from './ui.js';
 
 export interface MysqlProjectArgs {
@@ -204,17 +205,28 @@ export function ignoreEnvFile(created: string[]): void {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
   }
+  const lacksRule = (fd: number) => !/(?:^|\n)\/\.env\s*$/.test(readFileSync(fd, 'utf8').trimEnd());
   let fd: number;
   try {
     fd = openSync('.gitignore', constants.O_RDWR | constants.O_APPEND);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    throw new ValidationError(
-      '.gitignore cannot be read or created (a dangling symlink?). Remove it and run the command again.',
-    );
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new ValidationError(
+        '.gitignore cannot be read or created (a dangling symlink?). Remove it and run the command again.',
+      );
+    }
+    // A .gitignore that cannot be written but already has the rule needs nothing.
+    if (!isWriteRefusal(error)) throw error;
+    const readOnly = openSync('.gitignore', constants.O_RDONLY);
+    try {
+      if (!lacksRule(readOnly)) return;
+    } finally {
+      closeSync(readOnly);
+    }
+    throw error;
   }
   try {
-    if (!/(?:^|\n)\/\.env\s*$/.test(readFileSync(fd, 'utf8').trimEnd())) appendFileSync(fd, `\n${rule}`);
+    if (lacksRule(fd)) appendFileSync(fd, `\n${rule}`);
   } finally {
     closeSync(fd);
   }

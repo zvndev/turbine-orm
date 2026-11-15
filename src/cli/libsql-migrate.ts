@@ -14,7 +14,7 @@ import {
   type MigrationFile,
   parseMigrationContent,
 } from './migrate.js';
-import { isSymlinkRefusal, readNoFollow } from './no-follow.js';
+import { isRefusedOpen, readNoFollow } from './no-follow.js';
 
 interface Writer extends LibsqlMigrationReader {
   execute(sql: string | { sql: string; args: string[] }): Promise<LibsqlResultSet>;
@@ -319,7 +319,7 @@ function capture(filename: string, migrationsDir: string): { absolute: string; f
         if (!stat.isFile() || writableFiles.some((file) => stat.dev === file.dev && stat.ino === file.ino)) refuse();
       });
     } catch (error) {
-      if (isSymlinkRefusal(error)) refuse();
+      if (isRefusedOpen(error)) refuse();
       throw error;
     }
     const content = bytes.toString('utf8');

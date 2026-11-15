@@ -6,7 +6,7 @@ import type { D1DatabaseBinding, D1PreparedStatement, D1Result } from '../d1/typ
 import { ValidationError } from '../errors.js';
 import { type D1Context, d1ProjectPath } from './d1-local.js';
 import { inspectD1Migrations } from './d1-migrations.js';
-import { isSymlinkRefusal, readNoFollow } from './no-follow.js';
+import { isRefusedOpen, readNoFollow } from './no-follow.js';
 
 export type D1SeedValue = null | string | number | boolean | { readonly bytes: readonly number[] };
 export interface D1SeedPlan {
@@ -129,7 +129,7 @@ export function readD1Seed(context: D1Context): readonly Insert[] {
     return captureD1Seed(JSON.parse(bytes.toString('utf8')));
   } catch (cause) {
     if (cause instanceof D1SeedError) throw cause;
-    if (isSymlinkRefusal(cause)) refuse();
+    if (isRefusedOpen(cause)) refuse();
     throw new D1SeedError('D1 seed plan could not be captured.', 'admission', 'not-dispatched', cause);
   }
 }
