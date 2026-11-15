@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { cpSync, existsSync, mkdirSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -13,7 +13,10 @@ import { runWithShutdown } from '../../../../tooling/optional-pg-transports/run.
 
 const repo = resolve(fileURLToPath(new URL('../../../..', import.meta.url)));
 const fixture = dirname(fileURLToPath(import.meta.url));
-const root = resolve(process.env.RELAY_ROOT ?? join(tmpdir(), `turbine-relay-${process.pid}`));
+const root = resolve(process.env.RELAY_ROOT ?? mkdtempSync(join(tmpdir(), 'turbine-relay-')));
+process.once('exit', () => {
+  if (!process.env.RELAY_ROOT) rmSync(root, { recursive: true, force: true });
+});
 for (const name of ['TMPDIR', 'TMP', 'TEMP']) assert.equal(process.env[name], `${root}/tmp`);
 assert.equal(process.env.CLOUDFLARE_CF_FETCH_ENABLED, 'false');
 const attempt = process.env.RELAY_ATTEMPT;
@@ -367,12 +370,13 @@ await runWithShutdown(report, `${root}/${attempt}.json`, async (scope) => {
     return { client, stop };
   }
 
-  const pgService = await service('pg', 60111);
+  const pgPort = Number(process.env.RELAY_PG_PORT ?? 60111);
+  const pgService = await service('pg', pgPort);
   for (const [index, sqlMode] of [
     'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION',
     'STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION,NO_BACKSLASH_ESCAPES',
   ].entries()) {
-    const port = 60112 + index,
+    const port = Number(process.env.RELAY_MYSQL_PORT ?? 60112) + index,
       destination = await service('mysql', port, sqlMode);
     for (const n of [22, 24])
       for (const format of ['esm', 'cjs']) {
@@ -384,7 +388,7 @@ await runWithShutdown(report, `${root}/${attempt}.json`, async (scope) => {
         const env = {
           ...process.env,
           RELAY_REPO: repo,
-          DATABASE_URL: 'postgresql://contract@127.0.0.1:60111/postgres',
+          DATABASE_URL: `postgresql://contract@127.0.0.1:${pgPort}/postgres`,
           PG_SCHEMA: schema,
           MYSQL_PORT: String(port),
           MYSQL_DATABASE: database,

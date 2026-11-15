@@ -1,6 +1,6 @@
 /** Explicit native evidence entry. Uses the existing bounded subreaper owner. */
 import assert from 'node:assert/strict';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -9,7 +9,10 @@ import { archiveIdentity, command } from '../../../../tooling/optional-pg-transp
 import { runWithShutdown } from '../../../../tooling/optional-pg-transports/run.mjs';
 
 const repo = resolve(fileURLToPath(new URL('../../../..', import.meta.url)));
-const root = resolve(process.env.D1_REPLAY_ROOT ?? join(tmpdir(), `turbine-d1-replay-${process.pid}`));
+const root = resolve(process.env.D1_REPLAY_ROOT ?? mkdtempSync(join(tmpdir(), 'turbine-d1-replay-')));
+process.once('exit', () => {
+  if (!process.env.D1_REPLAY_ROOT) rmSync(root, { recursive: true, force: true });
+});
 const archive = process.env.D1_REPLAY_ARCHIVE;
 const pin = process.env.D1_REPLAY_SHA256;
 assert.ok(archive, 'D1_REPLAY_ARCHIVE must name the package archive to test.');

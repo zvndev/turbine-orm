@@ -5,6 +5,7 @@ import {
   createWriteStream,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -19,7 +20,10 @@ import { processIdentity } from '../../../../tooling/optional-pg-transports/life
 import { runWithShutdown } from '../../../../tooling/optional-pg-transports/run.mjs';
 
 const repo = resolve(fileURLToPath(new URL('../../../..', import.meta.url)));
-const root = resolve(process.env.MYSQL_REPLAY_ROOT ?? join(tmpdir(), `turbine-mysql-replay-${process.pid}`));
+const root = resolve(process.env.MYSQL_REPLAY_ROOT ?? mkdtempSync(join(tmpdir(), 'turbine-mysql-replay-')));
+process.once('exit', () => {
+  if (!process.env.MYSQL_REPLAY_ROOT) rmSync(root, { recursive: true, force: true });
+});
 const report = { commands: [], services: [], cells: [], source: repo };
 const nodes = { 22: process.env.MYSQL_REPLAY_NODE22, 24: process.env.MYSQL_REPLAY_NODE24 };
 const fixture = join(repo, 'src/test/fixtures/mysql-durable-replay');
@@ -97,7 +101,7 @@ await runWithShutdown(report, join(root, `${attempt}.json`), async (scope) => {
     const serviceRoot = join(root, 'services', `${attempt}-${index}`),
       data = `${serviceRoot}/data`,
       socket = `${serviceRoot}/mysql.sock`,
-      port = 59861 + index;
+      port = Number(process.env.MYSQL_REPLAY_PORT ?? 59861) + index;
     assert.ok(!existsSync(serviceRoot), 'Fresh owned service directory required');
     mkdirSync(data, { recursive: true });
     const probe = createServer();

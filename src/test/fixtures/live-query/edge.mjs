@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { build, stop } from 'esbuild';
@@ -10,7 +11,10 @@ assert.ok(
   runtimePath && existsSync(runtimePath),
   'Pass the installed miniflare module path; a real workerd runtime is required',
 );
-const output = resolve(process.argv[3] ?? '/tmp/turbine-live-query-edge');
+const output = resolve(process.argv[3] ?? mkdtempSync(join(tmpdir(), 'turbine-live-query-edge-')));
+process.once('exit', () => {
+  if (!process.argv[3]) rmSync(output, { recursive: true, force: true });
+});
 mkdirSync(output, { recursive: true });
 const { Miniflare } = await import(pathToFileURL(resolve(runtimePath)).href);
 const report = {

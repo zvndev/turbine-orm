@@ -7,6 +7,7 @@ import {
   linkSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -18,8 +19,11 @@ import { join, resolve } from 'node:path';
 import { archiveIdentity, command, installedPayload } from '../../../tooling/optional-pg-transports/harness.mjs';
 import { runWithShutdown } from '../../../tooling/optional-pg-transports/run.mjs';
 
-const root = process.env.D1_SIDECAR_ROOT ?? join(tmpdir(), `turbine-d1-sidecars-${process.pid}`);
-assert(root && !existsSync(root), 'Fresh owned root required');
+const root = process.env.D1_SIDECAR_ROOT ?? mkdtempSync(join(tmpdir(), 'turbine-d1-sidecars-'));
+process.once('exit', () => {
+  if (!process.env.D1_SIDECAR_ROOT) rmSync(root, { recursive: true, force: true });
+});
+if (process.env.D1_SIDECAR_ROOT) mkdirSync(root, { mode: 0o700 });
 const archive = resolve(process.env.D1_SIDECAR_ARCHIVE);
 const identity = archiveIdentity(archive, process.env.D1_SIDECAR_SHA256);
 const lock = JSON.parse(readFileSync(process.env.D1_SIDECAR_TOOL_LOCK, 'utf8'));
@@ -42,7 +46,7 @@ const project = join(consumer, 'project');
 const hash = (file) => createHash('sha256').update(readFileSync(file)).digest('hex');
 await runWithShutdown(
   report,
-  `${root}.json`,
+  join(root, 'report.json'),
   async (scope) => {
     const run = (cwd, binary, args, extra = {}) =>
       command(report, cwd, binary, args, { ...env, ...extra }, { scope, timeoutMs: 120000 });

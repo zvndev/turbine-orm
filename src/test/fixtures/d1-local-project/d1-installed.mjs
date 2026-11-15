@@ -1,15 +1,18 @@
 /** Normal installed CLI lifecycle proof. Every command uses the existing bounded owner. */
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { archiveIdentity, command, installedPayload } from '../../../../tooling/optional-pg-transports/harness.mjs';
 import { runWithShutdown } from '../../../../tooling/optional-pg-transports/run.mjs';
 
-const root = process.env.D1_PROJECT_ROOT ?? join(tmpdir(), `turbine-d1-project-${process.pid}`);
-assert(root && !existsSync(root), 'Fresh output directory required');
+const root = process.env.D1_PROJECT_ROOT ?? mkdtempSync(join(tmpdir(), 'turbine-d1-project-'));
+process.once('exit', () => {
+  if (!process.env.D1_PROJECT_ROOT) rmSync(root, { recursive: true, force: true });
+});
+if (process.env.D1_PROJECT_ROOT) mkdirSync(root, { mode: 0o700 });
 const archive = resolve(process.env.D1_PROJECT_ARCHIVE ?? '');
 const identity = archiveIdentity(archive, process.env.D1_PROJECT_SHA256);
 const report = { commands: [], root, archive, sha256: identity.sha256, node: process.version, controls: [] };
@@ -36,7 +39,7 @@ const sha = (p) => createHash('sha256').update(readFileSync(p)).digest('hex');
 try {
   await runWithShutdown(
     report,
-    `${root}.json`,
+    join(root, 'report.json'),
     async (scope) => {
       const run = (cwd, args, binary = process.execPath) =>
         command(report, cwd, binary, args, env, { scope, timeoutMs: 120000 });
@@ -268,4 +271,4 @@ try {
   console.error(error);
   process.exitCode = report.signalExitCode ?? 1;
 }
-console.log(`D1 installed report: ${root}.json`);
+console.log(`D1 installed report: ${join(root, 'report.json')}`);

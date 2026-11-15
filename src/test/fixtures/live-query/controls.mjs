@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 const cwd = process.cwd();
-const output = resolve(process.argv[2] ?? '/tmp/turbine-live-query-controls');
+const output = resolve(process.argv[2] ?? mkdtempSync(join(tmpdir(), 'turbine-live-query-controls-')));
+process.once('exit', () => {
+  if (!process.argv[2]) rmSync(output, { recursive: true, force: true });
+});
 mkdirSync(output, { recursive: true });
 const root = mkdtempSync(join(output, 'fixture-'));
 const report = { root, commands: [] };
