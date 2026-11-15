@@ -2,11 +2,15 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
+  closeSync,
+  constants,
   existsSync,
+  fstatSync,
   linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   readlinkSync,
@@ -63,10 +67,21 @@ function snapshot(dir = '.'): Record<string, string> {
   return Object.fromEntries(
     readdirSync(dir).flatMap((name): [string, string][] => {
       const path = join(dir, name);
-      const stat = lstatSync(path);
-      if (stat.isSymbolicLink()) return [[path, `link:${readlinkSync(path)}`]];
-      if (stat.isDirectory()) return [[path, 'directory'], ...Object.entries(snapshot(path))];
-      return [[path, createHash('sha256').update(readFileSync(path)).digest('hex')]];
+      // O_NOFOLLOW keeps the old lstat semantics: a symlink is recorded as a
+      // link, never followed; kind and bytes then come from one descriptor.
+      let fd: number;
+      try {
+        fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ELOOP') return [[path, `link:${readlinkSync(path)}`]];
+        throw error;
+      }
+      try {
+        if (fstatSync(fd).isDirectory()) return [[path, 'directory'], ...Object.entries(snapshot(path))];
+        return [[path, createHash('sha256').update(readFileSync(fd)).digest('hex')]];
+      } finally {
+        closeSync(fd);
+      }
     }),
   );
 }
@@ -202,7 +217,7 @@ test('generation and init refuse every database/output collision, including esca
           kind === 'hardlink'
             ? config.url
             : kind === 'normalized'
-              ? `file:./g%65nerated/../generated/${name.replace('.', '%2E')}`
+              ? `file:./g%65nerated/../generated/${name.replaceAll('.', '%2E')}`
               : kind === 'absolute'
                 ? pathToFileURL(join(dir, 'generated', name)).href
                 : kind === 'ancestor-alias'

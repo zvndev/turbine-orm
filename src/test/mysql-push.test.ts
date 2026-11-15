@@ -43,7 +43,7 @@ function ok(r: { code: number | null; output: string }, code = 0, pattern?: RegE
   assert.equal(r.code, code, r.output);
   if (pattern) assert.match(r.output, pattern);
 }
-async function cli(dir: string, args: string[], preload?: string) {
+async function cli(dir: string, args: string[], preload?: string, env: Record<string, string> = {}) {
   const child = spawn(
     process.execPath,
     [
@@ -55,7 +55,7 @@ async function cli(dir: string, args: string[], preload?: string) {
     ],
     {
       cwd: dir,
-      env: { ...process.env, DATABASE_URL: '', NODE_OPTIONS: '', NO_COLOR: '1' },
+      env: { ...process.env, DATABASE_URL: '', NODE_OPTIONS: '', NO_COLOR: '1', ...env },
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 30000,
     },
@@ -353,11 +353,16 @@ describe('MySQL push native journal lifecycle', () => {
       pushFixture(async (f) => {
         f.schema(related());
         const hook = join(f.dir, 'kill.cjs');
+        // Driver path and kill boundary travel in environment variables, so
+        // the preload source is one fixed string for every boundary.
         writeFileSync(
           hook,
-          `const d=require(${JSON.stringify(join(pushRepo, 'node_modules/mysql2/promise'))});const original=d.createConnection;d.createConnection=async function(config){const c=await original(config),query=c.query.bind(c),execute=c.execute.bind(c);let n=0;c.query=async(sql,...a)=>{const r=await query(sql,...a);if(/^(?:CREATE TABLE|ALTER TABLE|CREATE (?:UNIQUE )?INDEX) \\x60(?!_turbine)/.test(sql)&&++n===${Number(boundary.slice(3)) || 0}&&${JSON.stringify(boundary.startsWith('ddl'))})process.kill(process.pid,'SIGKILL');if(sql==='COMMIT'&&${JSON.stringify(boundary === 'commit')})process.kill(process.pid,'SIGKILL');return r;};c.execute=async(sql,values)=>{const r=await execute(sql,values);if((${JSON.stringify(boundary === 'journal')}&&sql.startsWith('INSERT INTO \\x60_turbine_migration_state'))||(${JSON.stringify(boundary.startsWith('confirmed'))}&&sql.startsWith('UPDATE \\x60_turbine_migration_state')&&values[0]===${Number(boundary.slice(9)) || 0}))process.kill(process.pid,'SIGKILL');return r;};return c;};`,
+          "const d=require(process.env.TURBINE_MYSQL_PUSH_KILL_DRIVER);const boundary=process.env.TURBINE_MYSQL_PUSH_KILL_BOUNDARY;const original=d.createConnection;d.createConnection=async function(config){const c=await original(config),query=c.query.bind(c),execute=c.execute.bind(c);let n=0;c.query=async(sql,...a)=>{const r=await query(sql,...a);if(/^(?:CREATE TABLE|ALTER TABLE|CREATE (?:UNIQUE )?INDEX) \\x60(?!_turbine)/.test(sql)&&++n===(Number(boundary.slice(3))||0)&&boundary.startsWith('ddl'))process.kill(process.pid,'SIGKILL');if(sql==='COMMIT'&&boundary==='commit')process.kill(process.pid,'SIGKILL');return r;};c.execute=async(sql,values)=>{const r=await execute(sql,values);if((boundary==='journal'&&sql.startsWith('INSERT INTO \\x60_turbine_migration_state'))||(boundary.startsWith('confirmed')&&sql.startsWith('UPDATE \\x60_turbine_migration_state')&&values[0]===(Number(boundary.slice(9))||0)))process.kill(process.pid,'SIGKILL');return r;};return c;};",
         );
-        const r = await cli(f.dir, ['push', '--engine', 'mysql', '--yes', '--allow-destructive'], hook);
+        const r = await cli(f.dir, ['push', '--engine', 'mysql', '--yes', '--allow-destructive'], hook, {
+          TURBINE_MYSQL_PUSH_KILL_DRIVER: join(pushRepo, 'node_modules/mysql2/promise'),
+          TURBINE_MYSQL_PUSH_KILL_BOUNDARY: boundary,
+        });
         assert.equal(r.signal, 'SIGKILL', r.output);
         const plan = await inspectMysqlMigrationDeploy(f.url, f.migrations);
         const names = files(f.migrations);

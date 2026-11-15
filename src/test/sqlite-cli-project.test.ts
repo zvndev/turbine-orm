@@ -104,7 +104,7 @@ describe('SQLite project helper workflows', () => {
       assert.equal(result.databasePath, join(dir, 'turbine/dev.sqlite'));
       assert.equal(result.existingDatabase, false);
       assert.equal(result.generated, undefined);
-      assert.ok(statSync(result.databasePath).size > 0, 'new database must have a durable SQLite header');
+      assert.ok(readFileSync(result.databasePath).length > 0, 'new database must have a durable SQLite header');
       const db = new Database!(result.databasePath, { readOnly: true });
       try {
         assert.equal(db.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type = 'table'").get()!.n, 0);

@@ -164,7 +164,15 @@ const db=turbineCore(pool,schema,{warnOnUnlimited:false});const rows=await db.ta
     });
     const inputs = Object.keys(bundle.metafile.inputs);
     assert.ok(inputs.some((path) => path.endsWith('dist/core.js')));
-    assert.ok(inputs.every((path) => !/(?:^|\/)pg(?:\/|-)|node:sqlite|sqlite\.js|client\.js$/.test(path)));
+    assert.ok(
+      inputs.every(
+        (path) =>
+          !/(?:^|\/)pg(?:\/|-)/.test(path) &&
+          !path.includes('node:sqlite') &&
+          !path.includes('sqlite.js') &&
+          !path.endsWith('client.js'),
+      ),
+    );
     const { Miniflare } = await import(pathToFileURL(runtimePath).href);
     worker = new Miniflare({
       modules: true,

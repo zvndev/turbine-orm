@@ -158,7 +158,9 @@ describe('native scoped SQLite doctor', () => {
       assert.equal(result.ok, false);
       assert.equal(result.checks.find((check) => check.code === 'SQLITE_FOREIGN_KEYS')!.status, 'warn');
       assert.ok(sql.length > 5);
-      assert.ok(sql.every((text) => !/^(BEGIN|COMMIT|ROLLBACK|ANALYZE|VACUUM)\b|PRAGMA\s+.*=/i.test(text)));
+      assert.ok(
+        sql.every((text) => !/^(?:BEGIN|COMMIT|ROLLBACK|ANALYZE|VACUUM)\b/i.test(text) && !/PRAGMA\s+.*=/i.test(text)),
+      );
       assert.ok(sql.every((text) => !/FROM\s+(?:"?(?:parent|child)"?)(?:\s|$)/i.test(text)));
       assert.equal((await client.query('PRAGMA foreign_keys')).rows[0]!.foreign_keys, 0);
       // A second BEGIN must still fail: collector did not finish the snapshot.

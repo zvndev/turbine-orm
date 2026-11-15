@@ -100,28 +100,40 @@ test('D1 refuses drift in the existing SQLite factory contract', async () => {
       ],
     ]) {
       assert(original.includes(from!));
-      const result = await build({
-        entryPoints: [resolve('src/d1/generate.ts')],
-        bundle: true,
-        platform: 'node',
-        format: 'esm',
-        write: false,
-        plugins: [
-          {
-            name: 'drift-control',
-            setup(builder) {
-              builder.onResolve({ filter: /\.\.\/generate\.js$/ }, () => ({ path: 'generator', namespace: 'drift' }));
-              builder.onLoad({ filter: /.*/, namespace: 'drift' }, () => ({
-                contents: `export const generateIndex=()=>${JSON.stringify(original.replace(from!, to!))}; export const generateTypes=()=>''; export const generateMetadata=()=>'';`,
-              }));
+      // The drifted text travels in a file named by an environment variable,
+      // never embedded in generated source.
+      const driftFile = join(root, `${label}.txt`);
+      writeFileSync(driftFile, original.replace(from!, to!));
+      const previousDrift = process.env.TURBINE_D1_DRIFT_FILE;
+      process.env.TURBINE_D1_DRIFT_FILE = driftFile;
+      try {
+        const result = await build({
+          entryPoints: [resolve('src/d1/generate.ts')],
+          bundle: true,
+          platform: 'node',
+          format: 'esm',
+          write: false,
+          plugins: [
+            {
+              name: 'drift-control',
+              setup(builder) {
+                builder.onResolve({ filter: /\.\.\/generate\.js$/ }, () => ({ path: 'generator', namespace: 'drift' }));
+                builder.onLoad({ filter: /.*/, namespace: 'drift' }, () => ({
+                  contents:
+                    "import { readFileSync } from 'node:fs';\nexport const generateIndex=()=>readFileSync(process.env.TURBINE_D1_DRIFT_FILE,'utf8'); export const generateTypes=()=>''; export const generateMetadata=()=>'';",
+                }));
+              },
             },
-          },
-        ],
-      });
-      const file = join(root, `${label}.mjs`);
-      writeFileSync(file, result.outputFiles[0]!.text);
-      const module = await import(pathToFileURL(file).href);
-      assert.throws(() => module.generateD1Files(schema, options), /SQLite generation contract changed/);
+          ],
+        });
+        const file = join(root, `${label}.mjs`);
+        writeFileSync(file, result.outputFiles[0]!.text);
+        const module = await import(pathToFileURL(file).href);
+        assert.throws(() => module.generateD1Files(schema, options), /SQLite generation contract changed/);
+      } finally {
+        if (previousDrift === undefined) delete process.env.TURBINE_D1_DRIFT_FILE;
+        else process.env.TURBINE_D1_DRIFT_FILE = previousDrift;
+      }
     }
   } finally {
     rmSync(root, { recursive: true, force: true });

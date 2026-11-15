@@ -2,13 +2,15 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
+  closeSync,
   existsSync,
+  fstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   rmSync,
-  statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -65,14 +67,20 @@ function tree(root: string): unknown {
     .sort()
     .map((name) => {
       const path = join(root, name);
-      const stat = statSync(path);
-      return {
-        name,
-        mode: stat.mode,
-        value: stat.isDirectory()
-          ? tree(path)
-          : { bytes: hash(readFileSync(path).toString('base64')), size: stat.size, mtime: stat.mtimeMs },
-      };
+      // One open per entry: stat and bytes come from the same descriptor.
+      const fd = openSync(path, 'r');
+      try {
+        const stat = fstatSync(fd);
+        return {
+          name,
+          mode: stat.mode,
+          value: stat.isDirectory()
+            ? tree(path)
+            : { bytes: hash(readFileSync(fd).toString('base64')), size: stat.size, mtime: stat.mtimeMs },
+        };
+      } finally {
+        closeSync(fd);
+      }
     });
 }
 
