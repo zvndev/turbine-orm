@@ -1,11 +1,15 @@
 /** Local native libSQL projects. No migration, schema lifecycle or remote transport. */
 import {
   appendFileSync,
+  closeSync,
+  constants,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   readFileSync,
   realpathSync,
+  type Stats,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -19,6 +23,7 @@ import importOptionalPeer from '../optional-peer-import.cjs';
 import type { SchemaMetadata } from '../schema.js';
 import { findConfigFile, type ResolvedConfig } from './config.js';
 import { assertLibsqlProjectConfigOptions, libsqlProjectUrl } from './libsql-project-config.js';
+import { isSymlinkRefusal, openNoFollow } from './no-follow.js';
 import { banner, info, label, success } from './ui.js';
 
 export { libsqlProjectUrl } from './libsql-project-config.js';
@@ -91,9 +96,70 @@ export function resolveLibsqlProjectContext(config: LibsqlProjectConfig, args: L
   return { ...target, introspectOptions };
 }
 
+const notADatabaseFile = () =>
+  new ValidationError('The local libSQL database must be an existing regular file. Run turbine init first.');
+
+/**
+ * Whether a database file is at `path`: false when nothing is there, refused
+ * when something other than a regular file is. One lstat answers both, so the
+ * two answers cannot describe different files.
+ */
+function existingDatabaseFile(path: string): boolean {
+  let stat: Stats;
+  try {
+    stat = lstatSync(path);
+  } catch {
+    return false;
+  }
+  if (!stat.isFile()) throw notADatabaseFile();
+  return true;
+}
+
 function requireFile(path: string): void {
-  if (!existsSync(path) || !lstatSync(path).isFile())
-    throw new ValidationError('The local libSQL database must be an existing regular file. Run turbine init first.');
+  if (!existingDatabaseFile(path)) throw notADatabaseFile();
+}
+
+/** Refuse a `.gitignore` that is not a regular file before init creates anything. */
+function assertGitignoreIsRegular(): void {
+  try {
+    const stat = lstatSync('.gitignore');
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new ValidationError('.gitignore must be a regular file.');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+}
+
+/**
+ * Create `.gitignore` holding `ignores`, or append the lines it lacks. An
+ * existing file is opened once without following a symlink and is read and
+ * appended through that descriptor, so a name replaced after the create was
+ * refused is never written through, and a file that appeared in that window
+ * gets the lines instead of being skipped.
+ */
+function addIgnores(ignores: string, created: string[]): void {
+  try {
+    writeFileSync('.gitignore', ignores, { flag: 'wx' });
+    created.push('.gitignore');
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  const irregular = () => new ValidationError('.gitignore must be a regular file.');
+  let fd: number;
+  try {
+    fd = openNoFollow('.gitignore', constants.O_RDWR | constants.O_APPEND);
+  } catch (error) {
+    if (isSymlinkRefusal(error) || (error as NodeJS.ErrnoException).code === 'EISDIR') throw irregular();
+    throw error;
+  }
+  try {
+    if (!fstatSync(fd).isFile()) throw irregular();
+    const previous = readFileSync(fd, 'utf8');
+    const missing = ignores.split('\n').filter((line) => line && !previous.split(/\r?\n/).includes(line));
+    if (missing.length) appendFileSync(fd, `${previous.endsWith('\n') ? '' : '\n'}${missing.join('\n')}\n`);
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export async function introspectLibsqlProject(config: LibsqlProjectConfig, args: LibsqlProjectArgs = {}) {
@@ -236,14 +302,8 @@ async function nativeClientFactory() {
 export async function initLibsqlProject(config: LibsqlProjectConfig, args: LibsqlProjectArgs = {}) {
   const context = resolveLibsqlProjectContext(config, args);
   const outDir = outputDirectory(config.out, context.databasePath);
-  try {
-    const stat = lstatSync('.gitignore');
-    if (!stat.isFile() || stat.isSymbolicLink()) throw new ValidationError('.gitignore must be a regular file.');
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-  }
-  const existingDatabase = existsSync(context.databasePath);
-  if (existingDatabase) requireFile(context.databasePath);
+  assertGitignoreIsRegular();
+  const existingDatabase = existingDatabaseFile(context.databasePath);
   const occupied = ['index.ts', 'types.ts', 'metadata.ts', 'zod.ts'].some((name) => existsSync(join(outDir, name)));
   // An empty native in-memory catalog validates new-project generation without creating a file or directory.
   const planned =
@@ -302,15 +362,7 @@ void main().catch((error: unknown) => { console.error(error); process.exitCode =
   if (!findConfigFile()) create('turbine.config.ts', configText);
   create('libsql-example.ts', exampleText);
   // Append ignores additively. Never create .env or write credentials.
-  const ignores = '.env\n*.sqlite\n*.sqlite-shm\n*.sqlite-wal\n';
-  if (!existsSync('.gitignore')) create('.gitignore', ignores);
-  else {
-    if (!lstatSync('.gitignore').isFile() || lstatSync('.gitignore').isSymbolicLink())
-      throw new ValidationError('.gitignore must be a regular file.');
-    const previous = readFileSync('.gitignore', 'utf8');
-    const missing = ignores.split('\n').filter((line) => line && !previous.split(/\r?\n/).includes(line));
-    if (missing.length) appendFileSync('.gitignore', `${previous.endsWith('\n') ? '' : '\n'}${missing.join('\n')}\n`);
-  }
+  addIgnores('.env\n*.sqlite\n*.sqlite-shm\n*.sqlite-wal\n', created);
   if (planned) writeGeneratedFiles(outDir, planned.files);
   const generated = planned ? { schema: planned.schema, outDir, files: Object.keys(planned.files) } : undefined;
   return { databasePath: context.databasePath, existingDatabase, created, generated };

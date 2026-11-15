@@ -1,14 +1,20 @@
 /**
  * turbine-orm, CLI files that were checked by name and then used by name.
  *
- * The local D1 and libSQL commands looked at a file (`lstat`) and then read
- * it by name. Between the two the name can be replaced, and a symlink or a hard
- * link planted there was read through. Each test stages that replacement at the
- * first open, read or write of the name, which is the window, and pins the
- * behavior that replaced the look:
+ * The local D1, libSQL and MySQL project commands looked at a file (`lstat`,
+ * `existsSync`) and then read or appended to it by name. Between the two the
+ * name can be replaced: a symlink or a hard link planted there was read or
+ * written through, and a `.gitignore` that appeared after the look was skipped,
+ * leaving the next file the command wrote unignored. Each test stages that
+ * replacement at the first open, read or write of the name, which is the
+ * window, and pins the behavior that replaced the look:
  *
  *   - the D1 marker, plan and seed, and libSQL migration inputs, are checked
- *     and read through one descriptor opened without following a symlink.
+ *     and read through one descriptor opened without following a symlink;
+ *   - libSQL init appends to `.gitignore` through such a descriptor, and adds
+ *     its lines to a `.gitignore` that appeared after it looked;
+ *   - MySQL init gives a `.gitignore` that appeared after it looked the `/.env`
+ *     rule before `.env` is written.
  *
  * Run: npx tsx --test src/test/cli-file-races.test.ts
  */
@@ -25,6 +31,8 @@ import { D1_MARKER, type D1Context, requireD1State, resolveD1Context } from '../
 import { readD1Plan } from '../cli/d1-migrations.js';
 import { D1SeedError, readD1Seed } from '../cli/d1-seed.js';
 import { migrateLibsqlDeploy } from '../cli/libsql-migrate.js';
+import { initLibsqlProject, type LibsqlProjectConfig } from '../cli/libsql-project.js';
+import { ignoreEnvFile } from '../cli/mysql-project.js';
 
 const canLink = process.platform !== 'win32';
 const TSX_LOADER = pathToFileURL(resolve('node_modules/tsx/dist/loader.mjs')).href;
@@ -205,5 +213,104 @@ describe('local libSQL deploy reads each migration once', { skip: !canLink }, ()
       assert.equal(result.status, 'rejected', 'the migration was read through the symlink and deployed');
       assert.match(String((result as PromiseRejectedResult).reason), /migration inputs must be regular files/);
       assert.equal(readFileSync(database).length, 0, 'the database was opened');
+    }));
+});
+
+describe('local libSQL init and .gitignore', { skip: !canLink }, () => {
+  const config: LibsqlProjectConfig = {
+    engine: 'libsql',
+    url: 'file:./local.sqlite',
+    out: './generated',
+    schema: 'main',
+    include: [],
+    exclude: [],
+    migrationsDir: './migrations',
+    schemaFile: './schema.ts',
+    keepColumnNames: false,
+    legacyToManyUniques: false,
+    importExtension: 'js',
+  };
+
+  it('never appends through a symlink planted after the .gitignore check', () =>
+    inTempDir(async (dir) => {
+      writeFileSync('.gitignore', 'keep-me\n');
+      const victim = join(dir, 'victim');
+      writeFileSync(victim, 'victim\n');
+
+      const { staged, result } = await raceAtFirstUse(
+        '.gitignore',
+        replaceWithLink('.gitignore', victim, 'symlink'),
+        () => initLibsqlProject(config, { noTimestamp: true, skipGenerate: true }),
+      );
+      assert.equal(staged, true, 'the race was never staged, so this test proves nothing');
+      assert.equal(readFileSync(victim, 'utf8'), 'victim\n', '.gitignore lines were appended through the symlink');
+      assert.equal(result.status, 'rejected');
+      assert.match(String((result as PromiseRejectedResult).reason), /\.gitignore must be a regular file/);
+    }));
+
+  it('adds its lines to a .gitignore that appears after it looked', () =>
+    inTempDir(async () => {
+      const { staged, result } = await raceAtFirstUse(
+        '.gitignore',
+        () => writeFileSync('.gitignore', 'mine\n'),
+        () => initLibsqlProject(config, { noTimestamp: true, skipGenerate: true }),
+      );
+      assert.equal(staged, true, 'the race was never staged, so this test proves nothing');
+      assert.equal(result.status, 'fulfilled', String((result as PromiseRejectedResult).reason));
+      assert.equal(readFileSync('.gitignore', 'utf8'), 'mine\n.env\n*.sqlite\n*.sqlite-shm\n*.sqlite-wal\n');
+      assert.equal(
+        (result as PromiseFulfilledResult<{ created: string[] }>).value.created.includes('.gitignore'),
+        false,
+      );
+    }));
+});
+
+describe('MySQL init and the /.env rule', () => {
+  it('creates .gitignore with the rule when nothing is there, and reports it', () =>
+    inTempDir(() => {
+      const created: string[] = [];
+      ignoreEnvFile(created);
+      assert.deepEqual(created, ['.gitignore']);
+      assert.equal(readFileSync('.gitignore', 'utf8'), '# Local database credentials\n/.env\n');
+      ignoreEnvFile(created);
+      assert.equal(readFileSync('.gitignore', 'utf8'), '# Local database credentials\n/.env\n');
+      assert.deepEqual(created, ['.gitignore']);
+    }));
+
+  it('appends the rule to an existing .gitignore once', () =>
+    inTempDir(() => {
+      writeFileSync('.gitignore', '/venv');
+      const created: string[] = [];
+      ignoreEnvFile(created);
+      ignoreEnvFile(created);
+      assert.deepEqual(created, []);
+      assert.equal(readFileSync('.gitignore', 'utf8'), '/venv\n# Local database credentials\n/.env\n');
+    }));
+
+  it('stops at a dangling .gitignore symlink instead of skipping the rule', { skip: !canLink }, () =>
+    inTempDir((dir) => {
+      symlinkSync(join(dir, 'missing'), '.gitignore');
+      const created: string[] = [];
+      assert.throws(() => ignoreEnvFile(created), /\.gitignore cannot be read or created \(a dangling symlink\?\)/);
+      assert.deepEqual(created, []);
+    }),
+  );
+
+  it('gives a .gitignore that appears after it looked the rule', () =>
+    inTempDir(async () => {
+      const created: string[] = [];
+      const { staged, result } = await raceAtFirstUse(
+        '.gitignore',
+        () => writeFileSync('.gitignore', 'node_modules\n'),
+        () => ignoreEnvFile(created),
+      );
+      assert.equal(staged, true, 'the race was never staged, so this test proves nothing');
+      assert.equal(result.status, 'fulfilled', String((result as PromiseRejectedResult).reason));
+      assert.equal(
+        readFileSync('.gitignore', 'utf8'),
+        'node_modules\n\n# Local database credentials\n/.env\n',
+        '.env would be written with no ignore rule for it',
+      );
+      assert.deepEqual(created, []);
     }));
 });

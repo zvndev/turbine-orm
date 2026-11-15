@@ -1,5 +1,15 @@
 /** SQL-first MySQL project commands backed by the optional native introspector. */
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  closeSync,
+  constants,
+  existsSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { ValidationError } from '../errors.js';
 import { generate } from '../generate.js';
@@ -178,6 +188,38 @@ function createFile(path: string, contents: string, created: string[]): void {
   }
 }
 
+/**
+ * Make `.gitignore` ignore `/.env`. Created only when nothing is at the name;
+ * otherwise read and appended through one descriptor, so the file read is the
+ * file appended to, and a `.gitignore` that appeared after a separate look is
+ * given the rule instead of being skipped before `.env` is written.
+ * @internal exported for tests.
+ */
+export function ignoreEnvFile(created: string[]): void {
+  const rule = '# Local database credentials\n/.env\n';
+  try {
+    writeFileSync('.gitignore', rule, { encoding: 'utf8', flag: 'wx' });
+    created.push('.gitignore');
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  let fd: number;
+  try {
+    fd = openSync('.gitignore', constants.O_RDWR | constants.O_APPEND);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    throw new ValidationError(
+      '.gitignore cannot be read or created (a dangling symlink?). Remove it and run the command again.',
+    );
+  }
+  try {
+    if (!/(?:^|\n)\/\.env\s*$/.test(readFileSync(fd, 'utf8').trimEnd())) appendFileSync(fd, `\n${rule}`);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 const STARTER_SQL = `-- UP
 CREATE TABLE users (
   id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -201,13 +243,7 @@ export async function initMysqlProject(config: ResolvedConfig, args: MysqlProjec
   const created: string[] = [];
   if (!findConfigFile()) createFile('turbine.config.ts', mysqlConfigTemplate(config), created);
   // Establish the ignore rule before writing a URL that might contain a password.
-  if (existsSync('.gitignore')) {
-    const text = readFileSync('.gitignore', 'utf8');
-    if (!/(?:^|\n)\/\.env\s*$/.test(text.trimEnd()))
-      appendFileSync('.gitignore', '\n# Local database credentials\n/.env\n');
-  } else {
-    createFile('.gitignore', '# Local database credentials\n/.env\n', created);
-  }
+  ignoreEnvFile(created);
   createFile('.env', `DATABASE_URL=${JSON.stringify(config.url)}\n`, created);
   createFile('.env.example', 'DATABASE_URL=mysql://user:password@localhost:3306/app\n', created);
   mkdirSync(config.migrationsDir, { recursive: true });
