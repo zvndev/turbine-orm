@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-const directory = resolve(process.argv[2] ?? '/tmp/turbine-sqlite-comparison-controls');
+const directory = process.argv[2] ? resolve(process.argv[2]) : mkdtempSync(join(tmpdir(), 'turbine-sqlite-comparison-controls-'));
 const { execute, liveGroup } = await import(new URL('./evidence/native-gate-child.mjs', import.meta.url).href);
 const forwarded = process.argv.slice(3);
 assert.ok(
@@ -120,7 +120,6 @@ for (const [fault, expected] of Object.entries(controls)) {
   });
   console.log(`${fault}: passed (${fault === 'none' ? 'positive prerequisite' : 'intended failure rejected'})`);
 }
-writeFileSync(
-  resolve(directory, 'controls.json'),
-  `${JSON.stringify({ status: 'passed', node: process.version, results }, null, 2)}\n`,
-);
+writeFileSync(resolve(directory, 'controls.json'), `${JSON.stringify({ status: 'passed', node: process.version, results }, null, 2)}\n`, {
+  mode: 0o600,
+});

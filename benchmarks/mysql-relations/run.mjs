@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -22,7 +22,11 @@ assert.ok(['ordinary', 'no-backslash'].includes(options.mode), 'invalid SQL mode
 assert.ok(Number.isInteger(options.scale) && options.scale >= 1 && options.scale <= 4, 'scale must be 1..4');
 assert.ok(Number.isInteger(options.repetitions) && options.repetitions >= 1 && options.repetitions <= 10, 'repetitions must be 1..10');
 const output = resolve(destination);
-assert.ok(!existsSync(output), 'destination already exists; refusing to overwrite evidence');
+// Reserve the destination exclusively up front; the report is written
+// through this descriptor at the end, never re-looked-up by path.
+let outputFd;
+try { outputFd = openSync(output, 'wx'); }
+catch (error) { if (error.code === 'EEXIST') assert.fail('destination already exists; refusing to overwrite evidence'); throw error; }
 const lockPath = `${output}.lock`;
 const reservation = openSync(lockPath, 'wx'); closeSync(reservation);
 let root, initialization, server, worker, admin;
@@ -119,8 +123,8 @@ finally {
     try { assertSuccess(report); } catch (e) { failures.push(e.message); report.status = 'failure'; }
   }
   report.finishedAt = new Date().toISOString();
-  try { writeFileSync(output, `${JSON.stringify(report, null, 2)}\n`, { flag: 'wx' }); }
-  finally { rmSync(lockPath, { force: true }); }
+  try { writeFileSync(outputFd, `${JSON.stringify(report, null, 2)}\n`); }
+  finally { try { closeSync(outputFd); } finally { rmSync(lockPath, { force: true }); } }
   process.off('SIGINT', interrupt); process.off('SIGTERM', interrupt);
 }
 console.log(JSON.stringify({ output, status: report.status, cases: report.proof?.cases.length ?? 0, failures }));

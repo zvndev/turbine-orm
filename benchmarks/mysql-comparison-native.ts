@@ -2,7 +2,17 @@
 import assert from 'node:assert/strict';
 import { type ChildProcess, execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  existsSync,
+  ftruncateSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  writeSync,
+} from 'node:fs';
 import { connect, createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -33,7 +43,15 @@ assert.ok(
   'usage: node --import tsx benchmarks/mysql-comparison-native.ts NEW.json [--mode=ordinary|no-backslash] [--controls] [--timing]',
 );
 const output = resolve(destination);
-assert.ok(!existsSync(output), 'refusing to overwrite native report');
+// Reserve the report exclusively up front; every update below rewrites it
+// through this descriptor, never re-looked-up by path.
+let outputFd: number;
+try {
+  outputFd = openSync(output, 'wx+');
+} catch (error) {
+  if ((error as NodeJS.ErrnoException).code === 'EEXIST') assert.fail('refusing to overwrite native report');
+  throw error;
+}
 const args = new Set(process.argv.slice(3));
 for (const arg of args)
   assert.ok(
@@ -94,6 +112,12 @@ const report: Record<string, unknown> = {
   admittedPreflight,
   command: [process.execPath, ...process.argv.slice(1)],
   skipped: timing ? [] : ['comparative timing: run serially on an idle machine using the tested artifact'],
+};
+const writeReport = () => {
+  const bytes = Buffer.from(JSON.stringify(report, null, 2) + '\n');
+  ftruncateSync(outputFd, 0);
+  let written = 0;
+  while (written < bytes.length) written += writeSync(outputFd, bytes, written, bytes.length - written, written);
 };
 let admin: Connection | undefined;
 let interrupted = false;
@@ -156,7 +180,7 @@ function owned(role: string, cmd: string, argv: string[], extra: Record<string, 
   });
   processes.push(state);
   identity.processes = processes.map(({ child, done, ...p }) => p);
-  writeFileSync(output, JSON.stringify(report, null, 2) + '\n');
+  writeReport();
   return state;
 }
 async function bounded(p: Owned, ms: number) {
@@ -205,7 +229,7 @@ try {
   port = (reserve.address() as { port: number }).port;
   await new Promise<void>((r) => reserve.close(() => r()));
   identity.port = port;
-  writeFileSync(output, JSON.stringify(report, null, 2) + '\n');
+  writeReport();
   console.log(JSON.stringify({ stage: 'owned-service-announcement-before-initialize', root, port, output, binary }));
   if (nativeFault === 'setup') throw new Error('forced native setup reporting fault');
   const init = owned('initialize', binary, [
@@ -396,7 +420,8 @@ try {
     process.exitCode = 1;
   }
   identity.finishedAt = new Date().toISOString();
-  writeFileSync(output, JSON.stringify(report, null, 2) + '\n');
+  writeReport();
+  closeSync(outputFd);
   process.off('SIGTERM', interrupt);
   process.off('SIGINT', interrupt);
   console.log(

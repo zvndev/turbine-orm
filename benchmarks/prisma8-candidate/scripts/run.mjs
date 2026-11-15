@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, ftruncateSync, openSync, readFileSync, writeSync } from 'node:fs';
 import { cpus, totalmem } from 'node:os';
 import { join, resolve } from 'node:path';
 import pg from 'pg';
@@ -71,7 +71,15 @@ if (mode === 'catalog') {
   assert.equal(plan.format, 1);
   assert.ok(existsSync(plan.root));
   const reportPath = join(plan.out, 'report.json');
-  assert.ok(!existsSync(reportPath), 'Attempt already has a report; plan a new evidence directory');
+  // Reserve the report exclusively up front; the final write below goes
+  // through this descriptor, never re-looked-up by path.
+  let reportFd;
+  try {
+    reportFd = openSync(reportPath, 'wx+');
+  } catch (error) {
+    if (error.code === 'EEXIST') assert.fail('Attempt already has a report; plan a new evidence directory');
+    throw error;
+  }
   const rounds = Number(options.rounds ?? 30),
     warmup = Number(options.warmup ?? 5);
   assert.ok(
@@ -257,7 +265,12 @@ if (mode === 'catalog') {
   } finally {
     report.status = report.success ? 'passed' : 'failed';
     report.finished = new Date().toISOString();
-    writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+    const reportBytes = Buffer.from(`${JSON.stringify(report, null, 2)}\n`);
+    ftruncateSync(reportFd, 0);
+    let written = 0;
+    while (written < reportBytes.length)
+      written += writeSync(reportFd, reportBytes, written, reportBytes.length - written, written);
+    closeSync(reportFd);
     console.log(
       JSON.stringify({
         report: reportPath,

@@ -1,7 +1,7 @@
 /** Build an independent final expectation from explicit frozen files, never from a run report. */
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, writeFileSync } from 'node:fs';
+import { closeSync, openSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import type { MysqlFinalManifest } from './comparison-results.js';
 import { fileTree, hashFile, installedIdentity, mysqlBenchmarkHashes } from './mysql-comparison-provenance.js';
@@ -28,7 +28,15 @@ const repository = resolve(flags.get('--repository')!),
   benchmark = resolve(flags.get('--benchmark')!);
 const output = resolve(flags.get('--output')!),
   mode = flags.get('--mode')!;
-assert.ok(!existsSync(output), 'refusing to overwrite a final manifest');
+// Reserve the destination exclusively up front; the manifest is written
+// through this descriptor, never re-looked-up by path.
+let outputFd: number;
+try {
+  outputFd = openSync(output, 'wx');
+} catch (error) {
+  if ((error as NodeJS.ErrnoException).code === 'EEXIST') assert.fail('refusing to overwrite a final manifest');
+  throw error;
+}
 assert.ok(['ordinary', 'no-backslash'].includes(mode));
 assert.equal(process.version, 'v24.10.0');
 assert.equal(process.execPath, flags.get('--runtime'));
@@ -75,7 +83,8 @@ const manifest: MysqlFinalManifest = {
     groupRounds: { headline: 200, extended: 100, stream: 15, latency: 25, deep: 150, cold: 100 },
   },
 };
-writeFileSync(output, JSON.stringify(manifest, null, 2) + '\n', { flag: 'wx' });
+writeFileSync(outputFd, JSON.stringify(manifest, null, 2) + '\n');
+closeSync(outputFd);
 console.log(
   JSON.stringify({
     output,

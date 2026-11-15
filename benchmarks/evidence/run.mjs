@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { availableParallelism, cpus, loadavg, platform, release, totalmem } from 'node:os';
+import { availableParallelism, cpus, loadavg, platform, release, tmpdir, totalmem } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { auditNative, openEngine } from './engines.mjs';
@@ -30,7 +30,7 @@ const root = fileURLToPath(new URL('../../', import.meta.url));
 
 function writeResult(path, result) {
   // An interrupted run cannot leave a previous successful result at this path.
-  writeFileSync(`${path}.pending`, `${JSON.stringify(result, null, 2)}\n`, { flag: 'wx' });
+  writeFileSync(`${path}.pending`, `${JSON.stringify(result, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
   renameSync(`${path}.pending`, path);
 }
 
@@ -181,10 +181,10 @@ export async function engineRun(context, config) {
 }
 
 async function main() {
-  const output = resolve(process.argv[2] ?? `/tmp/turbine-evidence-${randomUUID()}.json`);
+  const output = process.argv[2] ? resolve(process.argv[2]) : join(mkdtempSync(join(tmpdir(), 'turbine-evidence-')), 'evidence.json');
   // Refuse reuse before configuration parsing: stale success must never be
   // mistaken for the output of a new invocation that fails before measuring.
-  writeFileSync(output, '{"status":"initializing"}\n', { flag: 'wx' });
+  writeFileSync(output, '{"status":"initializing"}\n', { flag: 'wx', mode: 0o600 });
   const rounds = positiveInteger(process.env.EVIDENCE_ROUNDS ?? '30', 'EVIDENCE_ROUNDS');
   const warmup = positiveInteger(process.env.EVIDENCE_WARMUP ?? '5', 'EVIDENCE_WARMUP');
   const required = requiredEngines(process.env.EVIDENCE_REQUIRE_ENGINES);

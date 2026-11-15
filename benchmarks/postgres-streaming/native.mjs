@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, existsSync, rmSync, openSync, closeSync } from 'node:fs';
+import { fstatSync, mkdirSync, mkdtempSync, readFileSync, readSync, existsSync, rmSync, openSync, closeSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { tmpdir, loadavg, cpus, release } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -23,6 +23,13 @@ const report = { format: FORMAT, status: 'running', signal: null, errors: [], cl
   noise: { before: { loadavg: loadavg(), at: new Date().toISOString() }, cpu: cpus()[0]?.model, cpuCount: cpus().length, os: release(),
     note: 'Serial worker samples only; other host activity is uncontrolled. No global memory bound or performance winner is inferred.' }, cleanup: {} };
 const checkpoint = () => save(reportPath, report);
+// Read the server log through the descriptor the service inherited, by
+// explicit position, so the read never depends on its shared offset.
+const readServerLog = () => {
+  const size = fstatSync(logFd).size; const bytes = Buffer.alloc(size); let read = 0;
+  while (read < size) { const n = readSync(logFd, bytes, read, size - read, read); if (!n) break; read += n; }
+  return bytes.toString('utf8', 0, read);
+};
 checkpoint();
 let service, worker, init, bundler, observer, identity, logFd;
 const interrupt = name => {
@@ -119,7 +126,7 @@ try {
       assert.fail('Independent cleanup audit: worker database or sessions remain');
     }
     assert.deepEqual(worker.record.exit, { code: 0, signal: null }, `Worker exit must succeed: ${sample.errors.map(e => e.message).join('; ')}`);
-    report.serverLog = readFileSync(logPath, 'utf8');
+    report.serverLog = readServerLog();
     validateSample(sample, report.serverLog); worker = null;
   }
   report.status = 'passed';
