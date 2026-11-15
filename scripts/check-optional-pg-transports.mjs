@@ -22,7 +22,7 @@ export async function checkOptionalPg(argv = process.argv.slice(2)) {
     assert.ok(options[key], `Missing value for ${key}`);
   }
   const report = { scope: 'branch tooling against exact installed archive; no hosted/provider certification', runtime: process.version, commands: [], services: [], formats: ['esm', 'cjs'], native: { requested: Boolean(options['--native']), verified: false }, httpNativeVerified: false };
-  const reportPath = resolve(options['--report'] ?? join(tmpdir(), `optional-pg-transports-${process.pid}.json`));
+  const reportPath = options['--report'] ? resolve(options['--report']) : join(mkdtempSync(join(tmpdir(), 'optional-pg-transports-')), 'report.json');
   mkdirSync(dirname(reportPath), { recursive: true });
   let root;
   await runWithShutdown(report, reportPath, async (scope) => {
@@ -110,7 +110,7 @@ function typeOnly(){void turbineNeonWs({pool:new Pool()},schema,options);void tu
     }
     inventoryDir(modules);
     const lock = readFileSync(join(consumer, 'package-lock.json'));
-    writeFileSync(`${reportPath}.package-lock.json`, lock);
+    writeFileSync(`${reportPath}.package-lock.json`, lock, { mode: 0o600 });
     report.installLock = { path: `${reportPath}.package-lock.json`, sha256: sha256(lock) };
     report.installGraphScope = 'Actual complete consumer install with mandatory pg, Neon and ws relay; uncompressed physical package payload, excluding type fixtures. Separate from driver-externalized library bundle bytes.';
     report.installGraph = inventory;

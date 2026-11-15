@@ -29,7 +29,7 @@ const report = {
   cleanup: {},
 };
 let root;
-let reportPath = join(tmpdir(), `turbine-artifact-upgrade-${process.pid}.json`);
+let reportPath = join(mkdtempSync(join(tmpdir(), 'turbine-artifact-upgrade-')), 'report.json');
 let interrupted;
 let finishing;
 const stops = new Set();
@@ -623,7 +623,7 @@ function finish() {
     }
     report.finished = new Date().toISOString();
     mkdirSync(dirname(reportPath), { recursive: true });
-    writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+    writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
     console.log(`Artifact upgrade ${report.passed ? 'passed' : 'failed'}: ${reportPath}`);
   })();
   return finishing;

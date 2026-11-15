@@ -34,7 +34,7 @@ export async function runWithShutdown(report, reportPath, body, cleanup = async 
       report.cleanupErrors = errors;
       try {
         mkdirSync(dirname(reportPath), { recursive: true });
-        writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+        writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
       } catch (error) {
         (report.persistenceErrors ??= []).push(describeReason(error));
         secondary(error);

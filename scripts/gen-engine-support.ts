@@ -354,7 +354,9 @@ export function validate(data: SupportData, ctx: RepoContext): string[] {
 }
 
 function cellText(text: string): string {
-  return text.replace(/\|/g, '\\|').replace(/\n/g, ' ');
+  // Backslash first, so an existing backslash cannot turn the pipe escape
+  // that follows it into a literal pipe again.
+  return text.replace(/\\/g, '\\\\').replace(/\|/g, '\\|').replace(/\n/g, ' ');
 }
 
 function importList(route: Route): string {

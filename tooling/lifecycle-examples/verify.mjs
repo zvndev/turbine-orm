@@ -28,7 +28,7 @@ for (let i = 2; i < process.argv.length; i += 2) {
   assert.ok(process.argv[i + 1] && !process.argv[i + 1].startsWith('--'), `${key} requires a value`);
   args[key.slice(2)] = process.argv[i + 1];
 }
-const reportPath = resolve(args.report ?? join(tmpdir(), `turbine-lifecycle-${process.pid}.json`));
+const reportPath = args.report ? resolve(args.report) : join(mkdtempSync(join(tmpdir(), 'turbine-lifecycle-')), 'report.json');
 const report = {
   formatVersion: 1,
   started: new Date().toISOString(),
@@ -545,7 +545,7 @@ function finish() {
     }
     report.finished = new Date().toISOString();
     mkdirSync(dirname(reportPath), { recursive: true });
-    writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`);
+    writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
     console.log(`Lifecycle verification ${report.passed ? 'passed' : 'failed'}: ${reportPath}`);
   })();
   return finishing;
