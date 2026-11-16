@@ -160,13 +160,13 @@ The other engines synthesize these names by the same rule, in the order the
 `CREATE TABLE` statement declares the keys: SQLite's text, which SQLite's own
 catalog lists in reverse, and the order MySQL numbers its `_ibfk_<n>` names
 in. Before choosing any default they reserve every explicit foreign-key name
-and every other constraint name the table carries. For every statement
-PostgreSQL accepts, that gives PostgreSQL's answer. For one it refuses, such
-as an explicit `CONSTRAINT links_x_y_fkey` on the second of two keys over
-`(x, y)`, which SQLite and MySQL accept, the explicit key keeps its name and
-the unnamed one takes the counter. An explicit name longer than 63 bytes,
-which MySQL (64 characters) and SQL Server (128) accept, is cut to 63 bytes
-of UTF-8 as PostgreSQL stores it, never inside a character.
+and every other constraint name the table carries. Within a table, that
+gives PostgreSQL's answer for every statement PostgreSQL accepts. For one it
+refuses, such as an explicit `CONSTRAINT links_x_y_fkey` on the second of two
+keys over `(x, y)`, which SQLite and MySQL accept, the explicit key keeps its
+name and the unnamed one takes the counter. An explicit name longer than 63
+bytes, which MySQL (64 characters) and SQL Server (128) accept, is cut to 63
+bytes of UTF-8 as PostgreSQL stores it, never inside a character.
 
 A schema declared in different orders on different databases can therefore
 swap two such relation names; pin them with `relationNames`.
@@ -191,10 +191,18 @@ key that shares its target, can still give different names:
 - SQL Server records no declaration order for the keys it named itself, so
   between those the counter goes by child columns, then referenced table and
   columns, then actions.
-- When two tables' default names coincide (`box_items` with `item_id` and
-  `box` with `items_item_id` are both `box_items_item_id_fkey`), PostgreSQL
-  gives the counter to the table created second; the other engines give it in
-  table name order.
+- When two tables' foreign-key names coincide (`box_items` with `item_id` and
+  `box` with `items_item_id` both default to `box_items_item_id_fkey`, or one
+  table's explicit name is another's default), PostgreSQL gives the counter to
+  the table created second; the other engines give it in table name order.
+- A PostgreSQL default also skips a name that another table's CHECK, UNIQUE,
+  PRIMARY KEY or NOT NULL constraint already holds. A
+  `CONSTRAINT links_x_y_fkey CHECK (x > 0)` on a table `aaa` created before
+  `links` moves `links`'s keys to `links_x_y_fkey1` and `links_x_y_fkey2`;
+  created after `links`, it moves nothing. That depends on the order the
+  tables were created in, which no other catalog records, so off PostgreSQL a
+  default avoids only its own table's other constraints, the answer
+  PostgreSQL gives when `aaa` comes later.
 - PostgreSQL keeps the name a key was created with through a later table
   rename or the drop of another key; the other engines name the keys a table
   has now.

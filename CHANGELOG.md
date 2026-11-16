@@ -44,15 +44,17 @@ column is no longer derived. Root `dependencies` is still exactly
     one at a time and refuses a statement in which an unnamed key took a
     later explicit name; these readers reserve every explicit name, and the
     table's CHECK, UNIQUE, PRIMARY KEY and NOT NULL constraint names, before
-    choosing any default, which gives PostgreSQL's answer for every statement
-    PostgreSQL accepts. An explicit name longer than 63 bytes (MySQL allows
-    64 characters, SQL Server 128) is cut to 63 bytes of UTF-8 as PostgreSQL
-    stores it. Such relations are renamed, for example from `returnsIbfk_1`
-    to `returnsTenantIdOrderId`. As on PostgreSQL, declaring two such keys
-    the other way round swaps their names. On SQLite, two unnamed keys over
-    the same columns now take their names in declaration order (SQLite's
-    catalog lists them in reverse), which can also change the order their
-    relations are listed in.
+    choosing any default, which within a table gives PostgreSQL's answer for
+    every statement PostgreSQL accepts. Another table's constraint counts on
+    PostgreSQL only if that table was created first, which no other catalog
+    records, so it is not reserved. An explicit name longer than 63 bytes
+    (MySQL allows 64 characters, SQL Server 128) is cut to 63 bytes of UTF-8
+    as PostgreSQL stores it. Such relations are renamed, for example from
+    `returnsIbfk_1` to `returnsTenantIdOrderId`. As on PostgreSQL, declaring
+    two such keys the other way round swaps their names. On SQLite, two
+    unnamed keys over the same columns now take their names in declaration
+    order (SQLite's catalog lists them in reverse), which can also change the
+    order their relations are listed in.
   - When two foreign keys want one name, the first in source table and
     constraint name order keeps it, on every engine. Before, the order was
     whatever the catalog returned, and declaration order for `defineSchema`.
@@ -97,7 +99,7 @@ column is no longer derived. Root `dependencies` is still exactly
   |---|---|---|
   | `turbine-orm` (whole barrel) | 154.48 kB | 156 kB |
   | `turbine-orm/mssql` | 131.49 kB | 138 kB |
-  | `turbine-orm/libsql/introspect` | 11.02 kB | 12 kB |
+  | `turbine-orm/libsql/introspect` | 11.09 kB | 12 kB |
 
 ## 0.94.0 (2026-11-15)
 

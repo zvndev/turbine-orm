@@ -584,9 +584,9 @@ export default [
     // introspector now hands its catalog facts to the one relation derivation
     // every engine shares, and names a constraint SQL Server generated as
     // PostgreSQL would, after its explicit check and key constraint names:
-    // measured 130632 -> 131489 B (+857) at the branch's final head. This entry is not a
-    // published claim, so it takes the 5% engine headroom the sqlite and mysql
-    // entries already have instead of another 1 kB step.
+    // measured 130632 -> 131485 B (+853) at the branch's final head. This
+    // entry is not a published claim, so it takes the 5% engine headroom the
+    // sqlite and mysql entries already have instead of another 1 kB step.
     limit: '138 kB',
     // mssql is an optional peer loaded via a dynamic import in the factory, so it
     // is never in the static graph, exclude it (and pg) from the footprint.
@@ -682,7 +682,9 @@ export default [
     // `npx size-limit`: 10837 -> 11020 B (+183). Two trims came first (no
     // clipping of table and column names, an unconditional clip); counting
     // UTF-8 bytes with TextEncoder was larger in brotli and was reverted. Not
-    // a published claim, so 5% headroom, rounded up.
+    // a published claim, so 5% headroom, rounded up. 11089 B at the branch's
+    // final head, which also reads foreign-key references in the catalog's
+    // spelling.
     path: 'dist/libsql/introspect.js',
     limit: '12 kB',
     ignore: [...PG, '@libsql/client/node'],
