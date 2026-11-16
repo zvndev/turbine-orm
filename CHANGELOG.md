@@ -78,6 +78,13 @@ column is no longer derived. Root `dependencies` is still exactly
   junction's own `belongsTo` and `hasMany` relations are unchanged, and so is
   an explicitly declared `manyToMany`. This is the only change to
   PostgreSQL's output in this release.
+- **SQLite reads a foreign key whose `REFERENCES` clause spells the table or
+  column in another case.** SQLite compares identifiers without case, but
+  `node:sqlite` and better-sqlite3 introspection compared them exactly, so
+  `REFERENCES PARENTS (ID)` against a table created as `parents (id)` lost the
+  foreign key and its relations, and a reference spelled `(ID)` could keep a
+  unique foreign key's reverse relation to-many. Both drivers now read the
+  reference in the catalog's own spelling, as libSQL and D1 already did.
 - **`schemaDefToMetadata` no longer gives one table's referential actions to
   another.** Two tables whose default constraint names coincide,
   `boxItems.itemId` with `onDelete: 'cascade'` and `box.itemsItemId` (both
