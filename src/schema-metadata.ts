@@ -47,7 +47,7 @@
  */
 
 import { ValidationError } from './errors.js';
-import { deriveRelations, type ForeignKeyEntry } from './introspect.js';
+import { defaultForeignKeyConstraintName, deriveRelations, type ForeignKeyEntry } from './introspect.js';
 import {
   type ColumnMetadata,
   camelToSnake,
@@ -55,7 +55,6 @@ import {
   isDateType,
   pgArrayType,
   pgTypeToTs,
-  type ReferentialAction,
   type RelationDef,
   type SchemaMetadata,
   type TableMetadata,
@@ -338,23 +337,21 @@ export function schemaDefToMetadata(def: SchemaDef, options: { legacyToManyUniqu
   // scalar, and two FKs deriving the same name silently clobbered each other
   //.
   //
-  // Constraint names are synthesized in pg's default `<table>_<column>_fkey`
-  // form; they only feed the referential-action lookup and composite-FK
-  // naming (never hit here, `references:` is single-column by design).
+  // Constraint names follow PostgreSQL's rule for the unnamed keys
+  // `schemaToSQL` emits; they only order the derivation (and name a composite
+  // FK, never declared here: `references:` is single-column by design). The
+  // actions travel on each key, because two tables can produce one name
+  // (`box_items.item_id` and `box.items_item_id`).
   const fkEntries: ForeignKeyEntry[] = [];
-  const fkActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
+  const constraintNames = new Set<string>();
   for (const fk of foreignKeys) {
-    const constraintName = `${fk.sourceTable}_${fk.sourceColumn}_fkey`;
     fkEntries.push({
       sourceTable: fk.sourceTable,
       sourceColumns: [fk.sourceColumn],
       targetTable: fk.targetTable,
       targetColumns: [fk.targetColumn],
-      constraintName,
-    });
-    fkActions.set(constraintName, {
-      onDelete: fk.onDelete ?? 'no action',
-      onUpdate: fk.onUpdate ?? 'no action',
+      constraintName: defaultForeignKeyConstraintName(fk.sourceTable, [fk.sourceColumn], constraintNames),
+      actions: { onDelete: fk.onDelete ?? 'no action', onUpdate: fk.onUpdate ?? 'no action' },
     });
   }
 
@@ -418,7 +415,6 @@ export function schemaDefToMetadata(def: SchemaDef, options: { legacyToManyUniqu
     enums: enumTypes,
     uniqueKeysByTable,
     junctionKeysByTable,
-    fkActions,
     ...(options.legacyToManyUniques ? { legacyToManyUniques: true } : {}),
   };
   const relationsByTable = deriveRelations(facts);

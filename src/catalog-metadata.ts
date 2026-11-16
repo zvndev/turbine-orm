@@ -340,6 +340,12 @@ export interface ForeignKeyEntry {
   targetTable: string;
   targetColumns: string[];
   constraintName: string;
+  /**
+   * This key's ON DELETE / ON UPDATE, read with the key itself so no other key
+   * can supply them. Absent, they are looked up in
+   * {@link RelationCatalogFacts.fkActions}.
+   */
+  actions?: { onDelete: ReferentialAction; onUpdate: ReferentialAction };
 }
 
 /**
@@ -547,25 +553,12 @@ export function buildRelationsFromForeignKeys(
     assignedFor(fk.sourceTable).add(belongsToName);
 
     // Referential actions (omit the 'no action' default to keep metadata lean).
-    // A constraint NAME is only unique per table in Postgres, so the catalog
-    // introspector keys this map "<table>::<constraint>". Callers that
-    // synthesize names from a code-first schema key it by bare name, so both
-    // spellings resolve.
-    //
-    // The bare-name fallback is LIVE, not defensive: `schemaDefToMetadata` keys
-    // its map by the synthesized `<table>_<column>_fkey` alone, so the qualified
-    // lookup always misses there and this second lookup is the ONLY thing that
-    // carries a `defineSchema` relation's onDelete/onUpdate into the metadata.
-    // Deleting it would silently drop referential actions from every code-first
-    // schema (verified: a `references: { onDelete: 'cascade' }` resolves through
-    // this branch and through no other). It is safe for that producer precisely
-    // because the name it synthesizes already embeds the source table, so a bare
-    // hit cannot belong to a different table's constraint. A future producer
-    // emitting TABLE-AGNOSTIC constraint names would break that property and
-    // could mis-attribute one table's ON DELETE to another's relation; such a
-    // producer must key the map "<table>::<constraint>" like the catalog reader.
-    const actions =
-      fkActions?.get(`${fk.sourceTable}::${fk.constraintName}`) ?? fkActions?.get(fk.constraintName) ?? undefined;
+    // Every reader but PostgreSQL's hands them over on the key itself, because
+    // a name does not identify a key there: SQLite accepts one name twice, and
+    // two tables can synthesize one (`box_items.item_id`, `box.items_item_id`),
+    // so a map keyed by name gave one key's ON DELETE to another. PostgreSQL's
+    // reader keys its map "<table>::<constraint>", which is unique there.
+    const actions = fk.actions ?? fkActions?.get(`${fk.sourceTable}::${fk.constraintName}`);
     const actionFields: { onDelete?: ReferentialAction; onUpdate?: ReferentialAction } = {};
     if (actions?.onDelete && actions.onDelete !== 'no action') actionFields.onDelete = actions.onDelete;
     if (actions?.onUpdate && actions.onUpdate !== 'no action') actionFields.onUpdate = actions.onUpdate;
@@ -758,17 +751,16 @@ export function addAutoManyToManyRelations(
 /**
  * The constraint name PostgreSQL gives a foreign key nobody named:
  * `<table>_<column>[_<column>...]_fkey`, truncated the way PostgreSQL truncates
- * an identifier to 63 bytes (the longer of the two parts first), with a counter
- * after `fkey` while the name is in `taken`.
+ * an identifier to 63 bytes (the longer of the two parts first, never inside a
+ * character), with a counter after `fkey` while the name is in `taken`.
  *
  * A relation name reads the constraint name in exactly one shape, a COMPOSITE
  * foreign key that shares its target with another foreign key from the same
  * table. Engines disagree about what an unnamed constraint is called (MySQL
  * `orders_ibfk_1`, SQL Server `FK__orders__tenan__1A2B3C4D` with a random
- * suffix, SQLite nothing at all), so an engine introspector passes this name for
- * a constraint the user did not name, and that shape derives the same relation
- * names as on PostgreSQL (and, on SQL Server, the same names on every database).
- * Pass one `taken` set per introspection so two synthesized names cannot collide.
+ * suffix, SQLite nothing at all), so an engine introspector names its keys with
+ * {@link foreignKeyConstraintNames}, which calls this for each unnamed one, and
+ * that shape derives the same relation names as on PostgreSQL.
  */
 export function defaultForeignKeyConstraintName(table: string, columns: string[], taken?: Set<string>): string {
   const PG_NAME_BYTES = 63;
@@ -815,6 +807,34 @@ export function defaultForeignKeyConstraintName(table: string, columns: string[]
 }
 
 /**
+ * One table's foreign-key constraint names, as PostgreSQL names the same
+ * declarations: an explicit name is the key's own, and each unnamed key, in
+ * declaration order, takes {@link defaultForeignKeyConstraintName}, counting up
+ * while the name is taken. On PostgreSQL these are catalog facts, so declaring
+ * the same two unnamed keys the other way round gives the `1` suffix to the
+ * other one; every engine follows the same rule.
+ *
+ * Every explicit name is reserved before any default is chosen. PostgreSQL
+ * names keys one at a time, but refuses an explicit name that an earlier
+ * default already took, so for every statement it accepts the two agree.
+ * `taken` is one set for the whole schema, because PostgreSQL checks a default
+ * against every constraint name in it. Where two tables' defaults coincide it
+ * gives the counter to the table created second; the catalog readers name
+ * tables in name order, `schemaDefToMetadata` in declaration order.
+ *
+ * @param keys the table's foreign keys in declaration order, `name` undefined
+ *   for an unnamed one
+ */
+export function foreignKeyConstraintNames(
+  table: string,
+  keys: readonly { columns: string[]; name: string | undefined }[],
+  taken: Set<string>,
+): string[] {
+  for (const key of keys) if (key.name !== undefined) taken.add(key.name);
+  return keys.map((key) => key.name ?? defaultForeignKeyConstraintName(table, key.columns, taken));
+}
+
+/**
  * A catalog's ON DELETE / ON UPDATE rule (`CASCADE`, `SET NULL`, SQL Server's
  * `NO_ACTION`, ...) as a {@link ReferentialAction}. Anything else is
  * `no action`, the SQL default.
@@ -856,7 +876,11 @@ export interface RelationCatalogFacts {
   sameKeyComparison?: (fk: ForeignKeyEntry) => boolean;
   /** Two-column UNIQUE keys that stand in for a missing primary key on a junction table. */
   junctionKeysByTable?: Map<string, string[][]>;
-  /** Referential actions keyed `<table>::<constraint>` (or the bare constraint name). */
+  /**
+   * Referential actions keyed `<table>::<constraint>`, for a key that carries
+   * no {@link ForeignKeyEntry.actions}. Only sound where a name is unique per
+   * table, as on PostgreSQL.
+   */
   fkActions?: Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>;
   /**
    * `tableNames` and `foreignKeys` are already in PostgreSQL's catalog order
@@ -878,7 +902,7 @@ export interface RelationCatalogFacts {
  * differing units at or above U+D800 are compared as the code points they
  * encode.
  */
-function compareCatalogNames(a: string, b: string): number {
+export function compareCatalogNames(a: string, b: string): number {
   const length = Math.min(a.length, b.length);
   for (let i = 0; i < length; i++) {
     let x = a.charCodeAt(i);

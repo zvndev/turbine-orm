@@ -19,11 +19,13 @@ export {
   assertSafeCatalogIdentifier,
   assertSafeCatalogSchema,
   buildRelationsFromForeignKeys,
+  compareCatalogNames,
   DEFAULT_EXCLUDED_TABLES,
   defaultExcludedTablesPresent,
   defaultForeignKeyConstraintName,
   deriveRelations,
   type ForeignKeyEntry,
+  foreignKeyConstraintNames,
   isUnknownTsType,
   nullRecord,
   printableCatalogName,
@@ -664,10 +666,9 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
     }
 
     // Referential actions (ON DELETE / ON UPDATE) per constraint. Keyed
-    // "<table>::<constraint>" because the NAME alone is not unique (the same
-    // collision SQL_FOREIGN_KEYS documents); buildRelationsFromForeignKeys
-    // prefers that key and falls back to the bare name for callers that build
-    // the map from a code-first schema, where names are synthesized per table.
+    // "<table>::<constraint>" because the NAME alone is not unique across
+    // tables (the same collision SQL_FOREIGN_KEYS documents); PostgreSQL keeps
+    // it unique within one table.
     const fkActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
     for (const row of fkResult.rows) {
       fkActions.set(`${row.source_table}::${row.constraint_name}`, {

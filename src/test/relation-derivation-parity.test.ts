@@ -128,6 +128,7 @@ const manyToMany = (to: string, table: string, sourceKey: string, targetKey: str
 // ---------------------------------------------------------------------------
 
 const USERS = t('users', [id(), text('name', { notNull: true })]);
+const cascade = (relation: NormRelation): NormRelation => ({ ...relation, onDelete: 'cascade' });
 
 const CASES: Case[] = [
   {
@@ -379,6 +380,22 @@ const CASES: Case[] = [
         originalOrder: belongsTo('orders', ['tenant_id', 'order_id'], ['tenant_id', 'id']),
         replacementOrder: belongsTo('orders', ['tenant_id', 'replacement_id'], ['tenant_id', 'id']),
       },
+    },
+  },
+  {
+    // `box_items.item_id` and `box.items_item_id` both default to
+    // `box_items_item_id_fkey`; PostgreSQL gives the second table's the counter.
+    // Only one of them cascades.
+    name: 'two tables whose default constraint names are the same',
+    tables: [
+      t('items', [id()]),
+      t('box_items', [id(), int('item_id')], { foreignKeys: [fk('item_id', 'items', 'id', { onDelete: 'cascade' })] }),
+      t('box', [id(), int('items_item_id')], { foreignKeys: [fk('items_item_id', 'items')] }),
+    ],
+    expected: {
+      items: { boxItems: cascade(hasMany('box_items', 'item_id')), box: hasMany('box', 'items_item_id') },
+      box_items: { item: cascade(belongsTo('items', 'item_id')) },
+      box: { item: belongsTo('items', 'items_item_id') },
     },
   },
   {
