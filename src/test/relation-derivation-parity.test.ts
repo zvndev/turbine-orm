@@ -31,11 +31,11 @@ import { createRequire } from 'node:module';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { after, before, describe, it } from 'node:test';
 import type { BetterSqlite3Database } from '../better-sqlite3.js';
-import { defaultForeignKeyConstraintName } from '../catalog-metadata.js';
+import { defaultForeignKeyConstraintName, foreignKeyConstraintNames } from '../catalog-metadata.js';
 import { type RelationDef, type SchemaMetadata, snakeToCamel } from '../schema.js';
 import { defineSchema } from '../schema-builder.js';
 import { schemaDefToMetadata } from '../schema-metadata.js';
-import { declaredForeignKeyName, declaredForeignKeyNames } from '../sqlite-constraint-names.js';
+import { declaredForeignKeys, nameSqliteForeignKeys } from '../sqlite-constraint-names.js';
 import { type GatedRunners, skipGate } from './helpers.js';
 
 // ---------------------------------------------------------------------------
@@ -92,6 +92,7 @@ interface Case {
   expected: Relations;
 }
 
+const upperFirst = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 const id = (): ColSpec => ({ name: 'id', type: 'int', notNull: true });
 const int = (name: string, extra: Partial<ColSpec> = {}): ColSpec => ({ name, type: 'int', ...extra });
 const text = (name: string, extra: Partial<ColSpec> = {}): ColSpec => ({ name, type: 'text', ...extra });
@@ -128,6 +129,19 @@ const manyToMany = (to: string, table: string, sourceKey: string, targetKey: str
 // ---------------------------------------------------------------------------
 
 const USERS = t('users', [id(), text('name', { notNull: true })]);
+const ORDERS_AB = t('orders', [int('a', { notNull: true }), int('b', { notNull: true })], { primaryKey: ['a', 'b'] });
+const PARENTS_AB_CD = t('parents', [int('a', { notNull: true }), int('b', { notNull: true }), int('c'), int('d')], {
+  primaryKey: ['a', 'b'],
+  unique: [['c', 'd']],
+});
+const LINKS_XY = (...foreignKeys: FkSpec[]) => t('links', [int('x'), int('y')], { primaryKey: [], foreignKeys });
+const XY = ['x', 'y'];
+const AB = ['a', 'b'];
+const CD = ['c', 'd'];
+const LONG_A = `${'shipment_reference_'.repeat(3)}one`;
+const LONG_B = `${'shipment_reference_'.repeat(3)}two`;
+/** As much of `links_x_<column>` as PostgreSQL keeps when it adds `_fkey`. */
+const LONG_BASE = 'linksXShipmentReferenceShipmentReferenceShipmentRef';
 const cascade = (relation: NormRelation): NormRelation => ({ ...relation, onDelete: 'cascade' });
 
 const CASES: Case[] = [
@@ -379,6 +393,81 @@ const CASES: Case[] = [
       returns: {
         originalOrder: belongsTo('orders', ['tenant_id', 'order_id'], ['tenant_id', 'id']),
         replacementOrder: belongsTo('orders', ['tenant_id', 'replacement_id'], ['tenant_id', 'id']),
+      },
+    },
+  },
+  // The cases below read a composite foreign key's CONSTRAINT name off
+  // PostgreSQL. SQLite keeps names only in its CREATE TABLE text, MySQL and SQL
+  // Server generate their own, so each engine has to arrive at the name
+  // PostgreSQL gives the same declarations.
+  {
+    name: 'two named composite foreign keys over the same columns, to different keys of one target',
+    tables: [
+      PARENTS_AB_CD,
+      LINKS_XY(fk(XY, 'parents', AB, { name: 'fk_one' }), fk(XY, 'parents', CD, { name: 'fk_two' })),
+    ],
+    noCodeFirst: 'defineSchema `references` is single-column',
+    expected: {
+      links: { one: belongsTo('parents', XY, AB), two: belongsTo('parents', XY, CD) },
+      parents: { linksByOne: hasMany('links', XY, AB), linksByTwo: hasMany('links', XY, CD) },
+    },
+  },
+  {
+    name: 'two named composite foreign keys that are otherwise identical',
+    tables: [
+      PARENTS_AB_CD,
+      LINKS_XY(
+        fk(XY, 'parents', AB, { name: 'fk_kept', onDelete: 'cascade' }),
+        fk(XY, 'parents', AB, { name: 'fk_copy' }),
+      ),
+    ],
+    noCodeFirst: 'defineSchema `references` is single-column',
+    expected: {
+      links: { kept: cascade(belongsTo('parents', XY, AB)), copy: belongsTo('parents', XY, AB) },
+      parents: { linksByKept: cascade(hasMany('links', XY, AB)), linksByCopy: hasMany('links', XY, AB) },
+    },
+  },
+  {
+    // Both default to `links_x_y_fkey`; the first declared keeps it and the
+    // second takes `links_x_y_fkey1`. Declared the other way round (next case),
+    // the names change places, on PostgreSQL and so everywhere.
+    name: 'two unnamed composite foreign keys over the same columns',
+    tables: [PARENTS_AB_CD, LINKS_XY(fk(XY, 'parents', AB), fk(XY, 'parents', CD))],
+    noCodeFirst: 'defineSchema `references` is single-column',
+    expected: {
+      links: { linksXY: belongsTo('parents', XY, AB), linksXYFkey1: belongsTo('parents', XY, CD) },
+      parents: { linksByLinksXY: hasMany('links', XY, AB), linksByLinksXYFkey1: hasMany('links', XY, CD) },
+    },
+  },
+  {
+    name: 'two unnamed composite foreign keys over the same columns, declared the other way round',
+    tables: [PARENTS_AB_CD, LINKS_XY(fk(XY, 'parents', CD), fk(XY, 'parents', AB))],
+    noCodeFirst: 'defineSchema `references` is single-column',
+    expected: {
+      links: { linksXY: belongsTo('parents', XY, CD), linksXYFkey1: belongsTo('parents', XY, AB) },
+      parents: { linksByLinksXY: hasMany('links', XY, CD), linksByLinksXYFkey1: hasMany('links', XY, AB) },
+    },
+  },
+  {
+    // `links_x_<50 characters>` is as much of each default as fits in 63 bytes,
+    // so the two collide and the second declared takes the counter.
+    name: 'unnamed composite foreign keys whose default names are cut to the same 63 bytes',
+    tables: [
+      ORDERS_AB,
+      t('links', [int('x'), int(LONG_A), int(LONG_B)], {
+        primaryKey: [],
+        foreignKeys: [fk(['x', LONG_A], 'orders', AB), fk(['x', LONG_B], 'orders', AB)],
+      }),
+    ],
+    noCodeFirst: 'defineSchema `references` is single-column',
+    expected: {
+      links: {
+        [LONG_BASE]: belongsTo('orders', ['x', LONG_A], AB),
+        [`${LONG_BASE.slice(0, -1)}Fkey1`]: belongsTo('orders', ['x', LONG_B], AB),
+      },
+      orders: {
+        [`linksBy${upperFirst(LONG_BASE)}`]: hasMany('links', ['x', LONG_A], AB),
+        [`linksBy${upperFirst(LONG_BASE.slice(0, -1))}Fkey1`]: hasMany('links', ['x', LONG_B], AB),
       },
     },
   },
@@ -933,35 +1022,123 @@ describe('relation derivation parity: constraint names', () => {
     assert.equal(defaultForeignKeyConstraintName('dup', ['a'], taken), 'dup_a_fkey1');
   });
 
-  it('reads SQLite constraint names from the CREATE TABLE text, table- and column-level', () => {
+  it('reads SQLite foreign keys from the CREATE TABLE text, table- and column-level, named or not', () => {
     const ddl = `CREATE TABLE "returns" (
       id INTEGER PRIMARY KEY, -- CONSTRAINT not_this REFERENCES nothing
       note TEXT DEFAULT 'CONSTRAINT x REFERENCES y' CHECK (length(note) > 0),
       code VARCHAR(20) CONSTRAINT Fk_Code REFERENCES "Codes" (code),
-      owner_id INTEGER REFERENCES users (id),
-      tenant_id INTEGER, order_id INTEGER, replacement_id INTEGER,
+      owner_id INTEGER CONSTRAINT owner_nn NOT NULL REFERENCES users (id) REFERENCES people,
+      tenant_id INTEGER, order_id INTEGER, replacement_id INTEGER, label TEXT CONSTRAINT Ñame REFERENCES labels,
       /* a comment, CONSTRAINT nope FOREIGN KEY (x) REFERENCES y */
       CONSTRAINT fk_original_order FOREIGN KEY (tenant_id, order_id) REFERENCES orders (tenant_id, id) ON DELETE CASCADE,
       CONSTRAINT "Fk Replacement" FOREIGN KEY ([tenant_id], \`replacement_id\`) REFERENCES orders,
-      FOREIGN KEY (owner_id) REFERENCES people (id)
+      FOREIGN KEY (owner_id) REFERENCES people (id),
+      CONSTRAINT not_a_key CHECK (id > 0)
     )`;
-    const declared = declaredForeignKeyNames(ddl);
-    assert.deepEqual(declared, [
-      // A bare word folds to lower case, as PostgreSQL stores it; a quoted name keeps its case.
-      { name: 'fk_code', columns: ['code'], table: 'Codes' },
-      { name: 'fk_original_order', columns: ['tenant_id', 'order_id'], table: 'orders' },
-      { name: 'Fk Replacement', columns: ['tenant_id', 'replacement_id'], table: 'orders' },
+    assert.deepEqual(declaredForeignKeys(ddl), [
+      // A bare word folds to lower case (ASCII only, as PostgreSQL folds it in
+      // UTF-8); a quoted name keeps its case.
+      { name: 'fk_code', columns: ['code'], table: 'Codes', references: ['code'] },
+      // `owner_nn` names the NOT NULL, so both references are unnamed.
+      { columns: ['owner_id'], table: 'users', references: ['id'] },
+      { columns: ['owner_id'], table: 'people', references: [] },
+      { name: 'Ñame', columns: ['label'], table: 'labels', references: [] },
+      {
+        name: 'fk_original_order',
+        columns: ['tenant_id', 'order_id'],
+        table: 'orders',
+        references: ['tenant_id', 'id'],
+      },
+      { name: 'Fk Replacement', columns: ['tenant_id', 'replacement_id'], table: 'orders', references: [] },
+      { columns: ['owner_id'], table: 'people', references: ['id'] },
     ]);
-    assert.equal(declaredForeignKeyName(declared, ['TENANT_ID', 'order_id'], 'ORDERS'), 'fk_original_order');
-    assert.equal(declaredForeignKeyName(declared, ['owner_id'], 'users'), undefined);
-    assert.equal(declaredForeignKeyName(declared, ['tenant_id'], 'orders'), undefined);
-    // Two declarations over the same columns and target identify neither.
-    const twice = declaredForeignKeyNames(
-      'CREATE TABLE t (a INT, CONSTRAINT x FOREIGN KEY (a) REFERENCES p, CONSTRAINT y FOREIGN KEY (a) REFERENCES p)',
+    assert.deepEqual(declaredForeignKeys('CREATE TABLE t AS SELECT 1'), []);
+    assert.deepEqual(declaredForeignKeys(''), []);
+  });
+
+  // A key as `PRAGMA foreign_key_list` lists it, `references` empty where the clause names none.
+  const pragmaKey = (columns: string[], table: string, references: string[] = []) => ({
+    sourceTable: 't',
+    sourceColumns: columns,
+    targetTable: table,
+    targetColumns: references,
+    constraintName: '',
+  });
+  // `keys` in declaration order; SQLite's PRAGMA lists them the other way round.
+  const nameKeys = (ddl: string, keys: ReturnType<typeof pragmaKey>[], taken = new Set<string>()) => {
+    nameSqliteForeignKeys('t', ddl, [...keys].reverse(), taken);
+    return keys.map((k) => k.constraintName);
+  };
+
+  it('matches a SQLite declaration by child columns, target and referenced columns', () => {
+    const ddl =
+      'CREATE TABLE t (A INT, b INT, CONSTRAINT one FOREIGN KEY (a, b) REFERENCES P (x, y), ' +
+      'CONSTRAINT two FOREIGN KEY (a, b) REFERENCES p (z, w), FOREIGN KEY (a, b) REFERENCES q)';
+    assert.deepEqual(
+      nameKeys(ddl, [
+        pragmaKey(['A', 'b'], 'P', ['x', 'y']),
+        pragmaKey(['A', 'b'], 'p', ['Z', 'W']),
+        pragmaKey(['A', 'b'], 'q'),
+      ]),
+      ['one', 'two', 't_A_b_fkey'],
     );
-    assert.equal(declaredForeignKeyName(twice, ['a'], 'p'), undefined);
-    assert.deepEqual(declaredForeignKeyNames('CREATE TABLE t AS SELECT 1'), []);
-    assert.deepEqual(declaredForeignKeyNames(''), []);
+    // The referenced columns, not the position, decide: listed in an order
+    // other than SQLite's, each key still takes its own declaration's name.
+    const two = [pragmaKey(['A', 'b'], 'p', ['z', 'w']), pragmaKey(['A', 'b'], 'P', ['x', 'y'])];
+    nameSqliteForeignKeys('t', ddl, [...two, pragmaKey(['A', 'b'], 'q')], new Set());
+    assert.deepEqual(
+      two.map((k) => k.constraintName),
+      ['two', 'one'],
+    );
+    // And a clause the reader misses costs only its own key's name: the
+    // second key here is in table constraints with no comma between them.
+    const missed =
+      'CREATE TABLE t (x INT, y INT, CONSTRAINT fk_one FOREIGN KEY (x, y) REFERENCES p (a, b) ' +
+      'CONSTRAINT fk_two FOREIGN KEY (x, y) REFERENCES p (c, d))';
+    assert.deepEqual(
+      nameKeys(missed, [pragmaKey(['x', 'y'], 'p', ['a', 'b']), pragmaKey(['x', 'y'], 'p', ['c', 'd'])]),
+      ['fk_one', 't_x_y_fkey'],
+    );
+  });
+
+  it('pairs identical SQLite declarations in declaration order, and names none of an identity it cannot read', () => {
+    const twice =
+      'CREATE TABLE t (a INT, CONSTRAINT x FOREIGN KEY (a) REFERENCES p, CONSTRAINT y FOREIGN KEY (a) REFERENCES p)';
+    assert.deepEqual(nameKeys(twice, [pragmaKey(['a'], 'p'), pragmaKey(['a'], 'p')]), ['x', 'y']);
+    // SQLite accepts table constraints with no comma between them, which this
+    // reader does not split: of three keys to `p` it reads two, so neither
+    // declared name can be paired, and both stay reserved.
+    const unread =
+      'CREATE TABLE t (a INT, CONSTRAINT t_a_fkey FOREIGN KEY (a) REFERENCES p, CONSTRAINT y FOREIGN KEY (a) REFERENCES p FOREIGN KEY (a) REFERENCES p)';
+    assert.deepEqual(nameKeys(unread, [pragmaKey(['a'], 'p'), pragmaKey(['a'], 'p'), pragmaKey(['a'], 'p')]), [
+      't_a_fkey1',
+      't_a_fkey2',
+      't_a_fkey3',
+    ]);
+  });
+
+  it('reserves every explicit name before choosing a default, wherever it is declared', () => {
+    // PostgreSQL refuses this statement (the default `t_a_fkey` is taken by the
+    // time the explicit one is added); SQLite and MySQL accept it, and the
+    // explicit key keeps its name.
+    const ddl =
+      'CREATE TABLE t (a INT, b INT, FOREIGN KEY (a) REFERENCES p, CONSTRAINT t_a_fkey FOREIGN KEY (b) REFERENCES p)';
+    assert.deepEqual(nameKeys(ddl, [pragmaKey(['a'], 'p'), pragmaKey(['b'], 'p')]), ['t_a_fkey1', 't_a_fkey']);
+    // One set for the schema: a name another table took is taken here too.
+    const taken = new Set(['t_a_fkey']);
+    assert.deepEqual(nameKeys('CREATE TABLE t (a INT REFERENCES p)', [pragmaKey(['a'], 'p')], taken), ['t_a_fkey1']);
+    assert.deepEqual(
+      foreignKeyConstraintNames(
+        'links',
+        [
+          { columns: ['x', 'y'], name: undefined },
+          { columns: ['x', 'y'], name: 'links_x_y_fkey' },
+          { columns: ['x', 'y'], name: undefined },
+        ],
+        new Set(),
+      ),
+      ['links_x_y_fkey1', 'links_x_y_fkey', 'links_x_y_fkey2'],
+    );
   });
 });
 

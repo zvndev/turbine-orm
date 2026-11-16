@@ -8,6 +8,7 @@ import { generateLibsqlFiles } from '../libsql/generate.js';
 import { introspectLibsql } from '../libsql/introspect.js';
 import type { LibsqlLocalClient } from '../libsql/pool.js';
 import { turbineLibsql } from '../libsql.js';
+import { assertConstraintNameRelations, CONSTRAINT_NAME_DDL } from './fixtures/constraint-name-shapes.js';
 
 // Required native prerequisite: import/open errors fail; there is no skip path.
 const ddl = readFileSync(new URL('./fixtures/libsql-introspection.sql', import.meta.url), 'utf8');
@@ -23,6 +24,16 @@ async function withCatalog(check: (client: ReturnType<typeof createClient>) => P
 }
 const prototypeName = '__proto__';
 const source = (client: LibsqlLocalClient) => ({ client, url: ':memory:' });
+
+test('native local libSQL names composite foreign keys as PostgreSQL names the same declarations', async () => {
+  const client = createClient({ url: ':memory:', intMode: 'bigint', concurrency: 1 });
+  try {
+    for (const statement of CONSTRAINT_NAME_DDL) await client.execute(statement);
+    assertConstraintNameRelations(await introspectLibsql(source(client), { logger: {} }), 'libSQL');
+  } finally {
+    client.close();
+  }
+});
 
 test('kept native prototype column names survive typed writes and row decoding', async () => {
   await withCatalog(async (client) => {

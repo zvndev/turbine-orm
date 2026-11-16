@@ -3,8 +3,8 @@ import {
   applyTableFilters,
   assertDistinctColumnFields,
   assertSafeCatalogSchema,
-  defaultForeignKeyConstraintName,
   deriveRelations,
+  type ForeignKeyEntry,
   nullRecord,
   printableCatalogName,
   referentialActionFromCatalog,
@@ -20,13 +20,12 @@ import {
   type ColumnMetadata,
   type IndexMetadata,
   isDateType,
-  type ReferentialAction,
   type RelationDef,
   type SchemaMetadata,
   snakeToCamel,
   type TableMetadata,
 } from '../schema.js';
-import { declaredForeignKeyName, declaredForeignKeyNames } from '../sqlite-constraint-names.js';
+import { nameSqliteForeignKeys } from '../sqlite-constraint-names.js';
 import { type LibsqlLocalClient, localUrl } from './pool.js';
 import { type LibsqlValue, rows } from './values.js';
 
@@ -195,15 +194,8 @@ async function readCatalog(client: LibsqlLocalClient, options: LibsqlIntrospectO
   const relationUniqueByTable = new Map<string, string[][]>();
   const indexesByTable = new Map<string, IndexMetadata[]>();
 
-  interface FKEntry {
-    sourceTable: string;
-    sourceColumns: string[];
-    targetTable: string;
-    targetColumns: string[];
-    constraintName: string;
-  }
-  const foreignKeys: FKEntry[] = [];
-  const fkActions = new Map<FKEntry, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
+  const foreignKeys: ForeignKeyEntry[] = [];
+  const constraintNames = new Set<string>();
 
   for (const tableName of tableNames) {
     // ----- Columns + primary key -----
@@ -257,7 +249,7 @@ async function readCatalog(client: LibsqlLocalClient, options: LibsqlIntrospectO
     // ----- Foreign keys -----
     const fks = await catalog<PragmaForeignKey>(client, `PRAGMA main.foreign_key_list(${q(tableName)})`);
     // Group by FK id (composite FKs share an id), ordered by seq.
-    const fkById = new Map<number, FKEntry>();
+    const fkById = new Map<number, ForeignKeyEntry>();
     for (const fk of fks.sort((a, b) => a.id - b.id || a.seq - b.seq)) {
       let entry = fkById.get(fk.id);
       if (!entry) {
@@ -266,18 +258,22 @@ async function readCatalog(client: LibsqlLocalClient, options: LibsqlIntrospectO
           sourceColumns: [],
           targetTable: tableNames.find((name) => sqliteName(name) === sqliteName(fk.table)) ?? fk.table,
           targetColumns: [],
-          constraintName: `fk_${tableName}_${fk.id}`,
+          constraintName: '',
+          actions: {
+            onDelete: referentialActionFromCatalog(fk.on_delete),
+            onUpdate: referentialActionFromCatalog(fk.on_update),
+          },
         };
         fkById.set(fk.id, entry);
-        fkActions.set(entry, {
-          onDelete: referentialActionFromCatalog(fk.on_delete),
-          onUpdate: referentialActionFromCatalog(fk.on_update),
-        });
       }
       entry.sourceColumns.push(fk.from);
       // `to` is null when the FK references the target's PK implicitly.
       if (fk.to !== null) entry.targetColumns.push(fk.to);
     }
+    // SQLite's catalog names no constraint, and relation naming reads the name
+    // for a composite FK: take it from the CREATE TABLE text, else the name
+    // PostgreSQL would give it.
+    nameSqliteForeignKeys(tableName, tableDefinitions.get(tableName) ?? '', [...fkById.values()], constraintNames);
     for (const entry of fkById.values()) {
       if (entry.targetColumns.length === 0) {
         // Implicit reference → the target table's primary key.
@@ -354,22 +350,6 @@ async function readCatalog(client: LibsqlLocalClient, options: LibsqlIntrospectO
     fk.sourceColumns = fk.sourceColumns.map((name) => resolve(fk.sourceTable, name));
     fk.targetColumns = fk.targetColumns.map((name) => resolve(fk.targetTable, name));
   }
-  // SQLite's catalog names no constraint, and relation naming reads the name
-  // for a composite FK: take it from the CREATE TABLE text, else the name
-  // PostgreSQL would give it.
-  const constraintNames = new Set<string>();
-  const relationActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
-  for (const fk of foreignKeys) {
-    const actions = fkActions.get(fk)!;
-    const declared = declaredForeignKeyName(
-      declaredForeignKeyNames(tableDefinitions.get(fk.sourceTable) ?? ''),
-      fk.sourceColumns,
-      fk.targetTable,
-    );
-    if (declared !== undefined) constraintNames.add(declared);
-    fk.constraintName = declared ?? defaultForeignKeyConstraintName(fk.sourceTable, fk.sourceColumns, constraintNames);
-    relationActions.set(`${fk.sourceTable}::${fk.constraintName}`, actions);
-  }
 
   // ----- Build relations from foreign keys (belongsTo + hasMany + m2m) -----
   // The ONE relation derivation every engine calls, with SQLite's own facts:
@@ -387,7 +367,6 @@ async function readCatalog(client: LibsqlLocalClient, options: LibsqlIntrospectO
     junctionKeysByTable: new Map(
       Array.from(uniqueByTable, ([table, keys]) => [table, keys.filter((key) => key.length === 2)]),
     ),
-    fkActions: relationActions,
     ...(options.legacyToManyUniques ? { legacyToManyUniques: true } : {}),
     ...(options.logger ? { logger: options.logger } : {}),
   });

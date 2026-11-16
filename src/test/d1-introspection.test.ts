@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { type D1IntrospectOptions, introspectD1 } from '../d1/introspect.js';
 import type { D1DatabaseBinding } from '../d1/types.js';
 import { turbineD1 } from '../d1.js';
+import { assertConstraintNameRelations, CONSTRAINT_NAME_DDL } from './fixtures/constraint-name-shapes.js';
 import { executeDdl, withNative } from './fixtures/d1-introspection/native.js';
 
 const ddl = readFileSync(new URL('./fixtures/d1-introspection/catalog.sql', import.meta.url), 'utf8');
@@ -128,6 +129,13 @@ test('native D1 conservatively refines reverse cardinality and keeps composite r
     const legacy = await introspectD1(binding, { logger: {}, legacyToManyUniques: true });
     assert.equal(legacy.tables.parents!.relations.profiles?.type, 'hasMany');
     assert.equal(legacy.tables.composite_parents!.relations.compositeLinks?.type, 'hasMany');
+  });
+});
+
+test('native D1 names composite foreign keys as PostgreSQL names the same declarations', async () => {
+  await withNative(async (binding) => {
+    await executeDdl(binding, CONSTRAINT_NAME_DDL.join(';'));
+    assertConstraintNameRelations(await introspectD1(binding, { logger: {} }), 'D1');
   });
 });
 

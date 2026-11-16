@@ -108,8 +108,8 @@ import {
   applyTableFilters,
   assertDistinctColumnFields,
   type IntrospectOptions as CatalogIntrospectOptions,
-  defaultForeignKeyConstraintName,
   deriveRelations,
+  type ForeignKeyEntry,
   nullRecord,
   printableCatalogName,
   referentialActionFromCatalog,
@@ -120,14 +120,13 @@ import {
   type ColumnMetadata,
   type IndexMetadata,
   isDateType,
-  type ReferentialAction,
   type RelationDef,
   type SchemaMetadata,
   snakeToCamel,
   type TableMetadata,
 } from './schema.js';
 import { rewritePositionalPlaceholders } from './sql-placeholders.js';
-import { declaredForeignKeyName, declaredForeignKeyNames } from './sqlite-constraint-names.js';
+import { nameSqliteForeignKeys } from './sqlite-constraint-names.js';
 
 export { sqliteTypeToTs } from './d1/sqlite-dialect.js';
 
@@ -1782,16 +1781,8 @@ export function introspectSqliteDatabase(
   const relationUniqueByTable = new Map<string, string[][]>();
   const indexesByTable = new Map<string, IndexMetadata[]>();
 
-  interface FKEntry {
-    sourceTable: string;
-    sourceColumns: string[];
-    targetTable: string;
-    targetColumns: string[];
-    constraintName: string;
-  }
-  const foreignKeys: FKEntry[] = [];
+  const foreignKeys: ForeignKeyEntry[] = [];
   const constraintNames = new Set<string>();
-  const relationActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
 
   for (const tableName of tableNames) {
     const q = (name: string) => `"${name.replace(/"/g, '""')}"`;
@@ -1846,8 +1837,7 @@ export function introspectSqliteDatabase(
     // ----- Foreign keys -----
     const fks = pragma<PragmaForeignKey>(db, `PRAGMA main.foreign_key_list(${q(tableName)})`);
     // Group by FK id (composite FKs share an id), ordered by seq.
-    const fkById = new Map<number, FKEntry>();
-    const fkActions = new Map<number, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
+    const fkById = new Map<number, ForeignKeyEntry>();
     for (const fk of fks.sort((a, b) => a.id - b.id || a.seq - b.seq)) {
       let entry = fkById.get(fk.id);
       if (!entry) {
@@ -1857,27 +1847,22 @@ export function introspectSqliteDatabase(
           targetTable: fk.table,
           targetColumns: [],
           constraintName: '',
+          actions: {
+            onDelete: referentialActionFromCatalog(fk.on_delete),
+            onUpdate: referentialActionFromCatalog(fk.on_update),
+          },
         };
         fkById.set(fk.id, entry);
-        fkActions.set(fk.id, {
-          onDelete: referentialActionFromCatalog(fk.on_delete),
-          onUpdate: referentialActionFromCatalog(fk.on_update),
-        });
       }
       entry.sourceColumns.push(fk.from);
       // `to` is null when the FK references the target's PK implicitly.
       if (fk.to) entry.targetColumns.push(fk.to);
     }
-    const declaredNames = declaredForeignKeyNames(tableDefinitions.get(tableName) ?? '');
-    for (const [fkId, entry] of fkById) {
-      // SQLite's catalog names no constraint, and relation naming reads the
-      // name for a composite FK: take it from the CREATE TABLE text, else the
-      // name PostgreSQL would give it.
-      const declared = declaredForeignKeyName(declaredNames, entry.sourceColumns, entry.targetTable);
-      if (declared !== undefined) constraintNames.add(declared);
-      entry.constraintName =
-        declared ?? defaultForeignKeyConstraintName(tableName, entry.sourceColumns, constraintNames);
-      relationActions.set(`${tableName}::${entry.constraintName}`, fkActions.get(fkId)!);
+    // SQLite's catalog names no constraint, and relation naming reads the
+    // name for a composite FK: take it from the CREATE TABLE text, else the
+    // name PostgreSQL would give it.
+    nameSqliteForeignKeys(tableName, tableDefinitions.get(tableName) ?? '', [...fkById.values()], constraintNames);
+    for (const entry of fkById.values()) {
       if (entry.targetColumns.length === 0) {
         // Implicit reference → the target table's primary key.
         const targetPk = pragma<PragmaColumn>(db, `PRAGMA main.table_xinfo(${q(entry.targetTable)})`)
@@ -1952,7 +1937,6 @@ export function introspectSqliteDatabase(
     junctionKeysByTable: new Map(
       Array.from(uniqueByTable, ([table, keys]) => [table, keys.filter((key) => key.length === 2)]),
     ),
-    fkActions: relationActions,
     ...(options.legacyToManyUniques ? { legacyToManyUniques: true } : {}),
     ...(options.logger ? { logger: options.logger } : {}),
   });
