@@ -76,7 +76,7 @@ Views remain outside this introspector's base-table contract.
 These shapes derive the relations PostgreSQL derives for the same schema
 ([details and the remaining edge cases](relation-names.md#known-differences)):
 
-- A junction with no primary key, `post_tag_links (post_id, tag_id, UNIQUE (post_id, tag_id))`, gets `posts.tags` and `tags.posts` (`manyToMany`).
+- A junction with no primary key, `post_tag_links (post_id, tag_id, UNIQUE (post_id, tag_id))`, gets `posts.tags` and `tags.posts` (`manyToMany`) when both keys reference their targets' primary keys ([why](relation-names.md#junction-keys-to-another-column)).
 - `ON DELETE` and `ON UPDATE` are read from `REFERENTIAL_CONSTRAINTS`: relations carry `onDelete` and `onUpdate`.
 - Two unnamed composite FKs from `returns` to `orders` are named from the name PostgreSQL would generate, not MySQL's `returns_ibfk_1`: `returns.returnsTenantIdOrderId`. A constraint explicitly named `<table>_ibfk_<n>` is read the same way, because the catalog does not say which names MySQL generated.
 - A name two FKs both want goes to the first in source table, then constraint name, order, not MySQL's constraint-name order across all tables.

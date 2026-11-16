@@ -68,7 +68,7 @@ and `'A'` both reference the parent `'a'`. `legacyToManyUniques: true` keeps
 These shapes derive the relations PostgreSQL derives for the same schema
 ([details and the remaining edge cases](relation-names.md#known-differences)):
 
-- A junction with no primary key, `post_tag_links (post_id, tag_id, UNIQUE (post_id, tag_id))`, gets `posts.tags` and `tags.posts` (`manyToMany`).
+- A junction with no primary key, `post_tag_links (post_id, tag_id, UNIQUE (post_id, tag_id))`, gets `posts.tags` and `tags.posts` (`manyToMany`) when both keys reference their targets' primary keys ([why](relation-names.md#junction-keys-to-another-column)).
 - `ON DELETE` and `ON UPDATE` are read from `PRAGMA foreign_key_list`: relations carry `onDelete` and `onUpdate`.
 - Two composite FKs from `returns` to `orders` are named from a declared `CONSTRAINT` name, read from the `CREATE TABLE` text, or else from the name PostgreSQL would generate: `returns.returnsTenantIdOrderId` for an unnamed key.
 - A name two FKs both want goes to the first in source table, then constraint name, order, not `PRAGMA foreign_key_list` order.

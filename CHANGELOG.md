@@ -7,13 +7,17 @@
 - **Relations derive the same on every engine as on PostgreSQL.** One
   derivation now serves PostgreSQL, SQLite (`node:sqlite` and better-sqlite3),
   MySQL, SQL Server, local libSQL, D1 and `defineSchema`, each with its own
-  catalog facts, and a test creates one schema natively on each engine and
-  compares the results. The four cross-engine differences listed for 0.94.0
-  are gone. PostgreSQL's output is unchanged. What changes elsewhere:
+  catalog facts. A parity test creates one schema natively on PostgreSQL,
+  MySQL, `node:sqlite` and better-sqlite3, and as a `defineSchema` schema, and
+  compares the results; SQL Server is covered through catalog fixtures, and
+  libSQL and D1 through their own native tests. The four cross-engine
+  differences listed for 0.94.0 are gone. PostgreSQL's output is unchanged
+  except for the junction correction under Fixed. What changes elsewhere:
   - A junction table with no primary key, keyed by a two-column unique index
     over its two foreign keys (Prisma's implicit many-to-many shape), now gets
-    `manyToMany` on both sides. Before, only a two-column primary key counted
-    off PostgreSQL. `defineSchema` reads a declared two-column
+    `manyToMany` on both sides when both keys reference their targets'
+    primary keys. Before, only a two-column primary key counted off
+    PostgreSQL. `defineSchema` reads a declared two-column
     `indexes: [{ columns, unique: true }]` entry the same way.
   - Relations carry the foreign key's `onDelete` and `onUpdate`, as they
     already did on PostgreSQL and through `schemaDefToMetadata`. This adds
@@ -26,8 +30,14 @@
     with a random suffix) or no name at all now counts as the name PostgreSQL
     would have generated for the same declarations,
     `returns_tenant_id_order_id_fkey`: in declaration order, cut to 63 bytes,
-    counting up (`_fkey1`) while a name is taken, with every explicit name
-    taken first. Such relations are renamed, for example from `returnsIbfk_1`
+    counting up (`_fkey1`) while a name is taken. PostgreSQL names the keys
+    one at a time and refuses a statement in which an unnamed key took a
+    later explicit name; these readers reserve every explicit name, and the
+    table's CHECK, UNIQUE, PRIMARY KEY and NOT NULL constraint names, before
+    choosing any default, which gives PostgreSQL's answer for every statement
+    PostgreSQL accepts. An explicit name longer than 63 bytes (MySQL allows
+    64 characters, SQL Server 128) is cut to 63 bytes of UTF-8 as PostgreSQL
+    stores it. Such relations are renamed, for example from `returnsIbfk_1`
     to `returnsTenantIdOrderId`. As on PostgreSQL, declaring two such keys
     the other way round swaps their names. On SQLite, two unnamed keys over
     the same columns now take their names in declaration order (SQLite's
@@ -45,6 +55,17 @@
 
 ### Fixed
 
+- **No automatic many-to-many through a junction key that references a
+  column other than its target's primary key, on PostgreSQL too.** For
+  `links (post_id REFERENCES posts (id), tag_code REFERENCES tags (code), UNIQUE (post_id, tag_code))`
+  PostgreSQL introspection derived `posts.tags` and `tags.posts`, and
+  `with: { tags: true }` returned tags the junction does not reference: the
+  many-to-many query joins the junction to the target's primary key. No
+  engine and no `defineSchema` schema derives these relations now, so such a
+  query raises E005 (unknown relation) instead of returning those rows. The
+  junction's own `belongsTo` and `hasMany` relations are unchanged, and so is
+  an explicitly declared `manyToMany`. This is the only change to
+  PostgreSQL's output in this release.
 - **`schemaDefToMetadata` no longer gives one table's referential actions to
   another.** Two tables whose default constraint names coincide,
   `boxItems.itemId` with `onDelete: 'cascade'` and `box.itemsItemId` (both
@@ -54,16 +75,19 @@
 
 ### Bundle size
 
-- **Two limits rise.** The main barrel goes from 154 to 156 kB brotli, and
-  `turbine-orm/mssql` from 131 to 138 kB. The shared relation derivation is in
-  both graphs, and SQL Server's introspector now feeds it the catalog facts it
-  needs. No driver code was added. Measured with `npm run size` (brotli,
+- **Three limits rise.** The main barrel goes from 154 to 156 kB brotli,
+  `turbine-orm/mssql` from 131 to 138 kB, and `turbine-orm/libsql/introspect`
+  from 11 to 12 kB. The shared relation derivation is in all three graphs,
+  SQL Server's introspector now feeds it the catalog facts it needs, and the
+  SQLite constraint-name reader (shared by libSQL) reads every named
+  constraint. No driver code was added. Measured with `npm run size` (brotli,
   drivers external):
 
   | Entry | Size | Limit |
   |---|---|---|
-  | `turbine-orm` (whole barrel) | 154.44 kB | 156 kB |
-  | `turbine-orm/mssql` | 131.35 kB | 138 kB |
+  | `turbine-orm` (whole barrel) | 154.48 kB | 156 kB |
+  | `turbine-orm/mssql` | 131.49 kB | 138 kB |
+  | `turbine-orm/libsql/introspect` | 11.02 kB | 12 kB |
 
 ## 0.94.0 (2026-11-15)
 
