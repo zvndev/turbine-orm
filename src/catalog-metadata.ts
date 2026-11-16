@@ -810,7 +810,11 @@ export function postgresIdentifier(name: string): string {
  * {@link foreignKeyConstraintNames}, which calls this for each unnamed one, and
  * that shape derives the same relation names as on PostgreSQL.
  */
-export function defaultForeignKeyConstraintName(table: string, columns: string[], taken?: Set<string>): string {
+export function defaultForeignKeyConstraintName(
+  table: string,
+  columns: string[],
+  taken?: { has(name: string): boolean; add(name: string): unknown },
+): string {
   // ChooseForeignKeyConstraintNameAddition: columns joined by `_`, stopping
   // once the addition reaches NAMEDATALEN.
   let addition = '';
@@ -855,10 +859,16 @@ export function defaultForeignKeyConstraintName(table: string, columns: string[]
  * every statement PostgreSQL accepts, reserving first gives its answer; for one
  * it refuses, the explicit key still keeps its name.
  *
- * `taken` is one set for the whole schema, because PostgreSQL checks a default
- * against every constraint name in it. Where two tables' defaults coincide it
- * gives the counter to the table created second; the catalog readers name
- * tables in name order, `schemaDefToMetadata` in declaration order.
+ * `taken` holds the foreign-key names of the tables named so far: one set for
+ * the whole schema, because PostgreSQL checks a default against every
+ * constraint name in it, and it gives the counter to the table created second
+ * where two tables' names coincide (the catalog readers name tables in name
+ * order, `schemaDefToMetadata` in declaration order). The table's other
+ * constraint names are this table's alone and never enter `taken`: on
+ * PostgreSQL another table's CHECK counts only if that table was created
+ * first, which no other catalog records, and a set shared in name order let a
+ * table created later move an earlier table's names. This table's foreign-key
+ * names, explicit and chosen, are added to `taken`.
  *
  * @param keys the table's foreign keys in declaration order, `name` undefined
  *   for an unnamed one
@@ -871,9 +881,10 @@ export function foreignKeyConstraintNames(
   reserved: Iterable<string> = [],
 ): string[] {
   const names = keys.map((key) => (key.name === undefined ? undefined : postgresIdentifier(key.name)));
-  for (const name of reserved) taken.add(postgresIdentifier(name));
   for (const name of names) if (name !== undefined) taken.add(name);
-  return keys.map((key, i) => names[i] ?? defaultForeignKeyConstraintName(table, key.columns, taken));
+  const own = new Set(Array.from(reserved, postgresIdentifier));
+  const avoid = { has: (name: string) => taken.has(name) || own.has(name), add: (name: string) => taken.add(name) };
+  return keys.map((key, i) => names[i] ?? defaultForeignKeyConstraintName(table, key.columns, avoid));
 }
 
 /**

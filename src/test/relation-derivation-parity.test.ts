@@ -92,8 +92,11 @@ interface Case {
   noCodeFirst?: string;
   /** What PostgreSQL derives, the reference every engine is held to. */
   expected: Relations;
-  /** One engine that derives something else, for a reason docs/relation-names.md states, and what it derives. */
-  differsOn?: { engine: string; expected: Relations };
+  /**
+   * Engines that derive something else, for a reason docs/relation-names.md
+   * states, and what they derive and read instead.
+   */
+  differsOn?: { engines: string[]; expected: Relations; rows?: unknown[] };
   /**
    * Rows to insert (portable INSERT statements) and a read to run through each
    * engine's client: a relation name has to select the same rows everywhere,
@@ -154,6 +157,18 @@ const LONG_B = `${'shipment_reference_'.repeat(3)}two`;
 const LONG_BASE = 'linksXShipmentReferenceShipmentReferenceShipmentRef';
 const TAG_COLUMNS = [...'abcdefghi'].map((c) => `tag_${c}_id`);
 const cascade = (relation: NormRelation): NormRelation => ({ ...relation, onDelete: 'cascade' });
+/** A table with no foreign key whose CHECK is named like `links`'s first default. */
+const AAA_CHECK = t('aaa', [int('x')], { primaryKey: [], constraints: [{ name: 'links_x_y_fkey', check: 'x > 0' }] });
+/** `links`'s two keys over `(x, y)` with nothing holding their defaults. */
+const UNMOVED: Relations = {
+  links: { linksXY: belongsTo('parents', XY, AB), linksXYFkey1: belongsTo('parents', XY, CD) },
+  parents: { linksByLinksXY: hasMany('links', XY, AB), linksByLinksXYFkey1: hasMany('links', XY, CD) },
+};
+const LINKS_QUERY = {
+  insert: ['INSERT INTO parents VALUES (1, 2, 3, 4), (5, 6, 1, 2)', 'INSERT INTO links VALUES (1, 2)'],
+  table: 'links',
+  args: { with: { linksXYFkey1: true } },
+};
 /** 64 bytes, and 65 bytes of two-byte characters: PostgreSQL keeps 63 bytes, never part of a character. */
 const LONG_ASCII_NAME = `fk_${'a'.repeat(61)}`;
 const LONG_UTF8_NAME = `fk_${'é'.repeat(31)}`;
@@ -492,7 +507,7 @@ const CASES: Case[] = [
     // exactly these, so both read as unnamed keys and take PostgreSQL's
     // default names.
     differsOn: {
-      engine: 'mysql',
+      engines: ['mysql'],
       expected: {
         returns: { returnsXY: belongsTo('orders', XY, AB), returnsXZ: belongsTo('orders', ['x', 'z'], AB) },
         orders: {
@@ -617,6 +632,34 @@ const CASES: Case[] = [
       table: 'links',
       args: { with: { linksXYFkey1: true } },
       rows: [{ x: 1, y: 2, linksXYFkey1: { a: 1, b: 2, c: 3, d: 4 } }],
+    },
+  },
+  {
+    // The same CHECK on another table, created after `links`. PostgreSQL names
+    // `links`'s keys before the CHECK exists, so nothing moves. SQLite lists
+    // `aaa` first, and its CHECK must not move `links`'s names either.
+    name: "another table's CHECK named like a foreign key's default, created later",
+    tables: [PARENTS_AB_CD, LINKS_XY(fk(XY, 'parents', AB), fk(XY, 'parents', CD)), AAA_CHECK],
+    noCodeFirst: 'defineSchema `references` is single-column',
+    expected: UNMOVED,
+    query: { ...LINKS_QUERY, rows: [{ x: 1, y: 2, linksXYFkey1: { a: 5, b: 6, c: 1, d: 2 } }] },
+  },
+  {
+    // Created first, the CHECK does move PostgreSQL's names, as one in `links`
+    // would. No other catalog records the order tables were created in, so off
+    // PostgreSQL a default avoids only its own table's other constraints.
+    name: "another table's CHECK named like a foreign key's default, created earlier",
+    tables: [PARENTS_AB_CD, AAA_CHECK, LINKS_XY(fk(XY, 'parents', AB), fk(XY, 'parents', CD))],
+    noCodeFirst: 'defineSchema `references` is single-column',
+    expected: {
+      links: { linksXYFkey1: belongsTo('parents', XY, AB), linksXYFkey2: belongsTo('parents', XY, CD) },
+      parents: { linksByLinksXYFkey1: hasMany('links', XY, AB), linksByLinksXYFkey2: hasMany('links', XY, CD) },
+    },
+    query: { ...LINKS_QUERY, rows: [{ x: 1, y: 2, linksXYFkey1: { a: 1, b: 2, c: 3, d: 4 } }] },
+    differsOn: {
+      engines: ['node:sqlite', 'better-sqlite3', 'mysql'],
+      expected: UNMOVED,
+      rows: [{ x: 1, y: 2, linksXYFkey1: { a: 5, b: 6, c: 1, d: 2 } }],
     },
   },
   {
@@ -1215,16 +1258,21 @@ for (const h of HARNESSES) {
         const { schema, rows } = await h.introspect(c, index);
         const actual = normalize(schema);
         if (process.env.RELATION_PARITY_DUMP) console.log(JSON.stringify({ engine: h.name, case: c.name, actual }));
-        // Rows first: a relation that selects another parent is the failure that matters.
-        if (c.query && rows !== undefined) {
+        const differs = c.differsOn?.engines.includes(h.name) ? c.differsOn : undefined;
+        // Rows first: a relation that selects another parent is the failure
+        // that matters. Every harness but code-first (no database) reads them.
+        if (c.query && h.name !== 'code-first') {
           assert.deepEqual(
-            JSON.parse(JSON.stringify(rows)),
-            c.query.rows,
+            JSON.parse(JSON.stringify(rows ?? null)),
+            differs?.rows ?? c.query.rows,
             `${h.name} reads other rows for "${c.name}"`,
           );
         }
-        const expected = c.differsOn?.engine === h.name ? c.differsOn.expected : c.expected;
-        assert.deepEqual(actual, expected, `${h.name} derives different relations for "${c.name}"`);
+        assert.deepEqual(
+          actual,
+          differs?.expected ?? c.expected,
+          `${h.name} derives different relations for "${c.name}"`,
+        );
       });
     }
   });
@@ -1401,6 +1449,17 @@ describe('relation derivation parity: constraint names', () => {
     const ddl =
       'CREATE TABLE t (a INT, b INT, FOREIGN KEY (a) REFERENCES p, CONSTRAINT t_a_fkey FOREIGN KEY (b) REFERENCES p)';
     assert.deepEqual(nameKeys(ddl, [pragmaKey(['a'], 'p'), pragmaKey(['b'], 'p')]), ['t_a_fkey1', 't_a_fkey']);
+    // Another table's CHECK, UNIQUE and other names stay its own; only
+    // foreign-key names, explicit or chosen, are shared with the next table.
+    const shared = new Set<string>();
+    assert.deepEqual(
+      foreignKeyConstraintNames('aaa', [{ columns: ['x'], name: undefined }], shared, ['links_x_y_fkey']),
+      ['aaa_x_fkey'],
+    );
+    assert.deepEqual([...shared], ['aaa_x_fkey']);
+    assert.deepEqual(foreignKeyConstraintNames('links', [{ columns: ['x', 'y'], name: undefined }], shared), [
+      'links_x_y_fkey',
+    ]);
     // One set for the schema: a name another table took is taken here too.
     const taken = new Set(['t_a_fkey']);
     assert.deepEqual(nameKeys('CREATE TABLE t (a INT REFERENCES p)', [pragmaKey(['a'], 'p')], taken), ['t_a_fkey1']);
