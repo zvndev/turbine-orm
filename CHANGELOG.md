@@ -79,7 +79,8 @@ column is no longer derived. Root `dependencies` is still exactly
   an explicitly declared `manyToMany`. This is the only change to
   PostgreSQL's output in this release.
 - **SQLite reads a foreign key whose `REFERENCES` clause spells the table or
-  column in another case.** SQLite compares identifiers without case, but
+  column with different ASCII letter case.** SQLite treats `A` to `Z` and `a`
+  to `z` in identifiers as equal (other letters stay distinct), but
   `node:sqlite` and better-sqlite3 introspection compared them exactly, so
   `REFERENCES PARENTS (ID)` against a table created as `parents (id)` lost the
   foreign key and its relations, and a reference spelled `(ID)` could keep a
