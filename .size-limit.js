@@ -451,9 +451,12 @@ export default [
     // RAISED 2026-11-15, 154 -> 156 kB, a recorded decision, with the README
     // claim. One relation derivation for every engine and `defineSchema`
     // (catalog-metadata.ts `deriveRelations`), measured with `npm run build`
-    // then `npx size-limit` against 153839 B before it: main 154170 B (+331).
-    // That is the shared derivation and its code-point name comparator (+251)
-    // and `defineSchema` keeping its relations in declaration order (+80).
+    // then `npx size-limit` against 153839 B before it: main 154481 B (+642)
+    // at the branch's final head. That is the shared derivation and its
+    // code-point name comparator, `defineSchema` keeping its relations in
+    // declaration order, and PostgreSQL's constraint-name rules (explicit and
+    // other constraint names reserved first, 63-byte names, the junction
+    // primary-key check).
     // Two trims, a shorter constraint-name function and a plain string
     // comparator, each made one of the two failing entries larger in brotli
     // and were reverted. 156 and not 155: the measured-round-up plus 1 kB policy.
@@ -580,7 +583,8 @@ export default [
     // RAISED 2026-11-15, 131 -> 138 kB, a recorded decision. The SQL Server
     // introspector now hands its catalog facts to the one relation derivation
     // every engine shares, and names a constraint SQL Server generated as
-    // PostgreSQL would: measured 130632 -> 131248 B (+616). This entry is not a
+    // PostgreSQL would, after its explicit check and key constraint names:
+    // measured 130632 -> 131489 B (+857) at the branch's final head. This entry is not a
     // published claim, so it takes the 5% engine headroom the sqlite and mysql
     // entries already have instead of another 1 kB step.
     limit: '138 kB',
@@ -670,8 +674,17 @@ export default [
     // Brotli-q11 9205 B (9189 B after size-limit wrapper adjustment), 17 inputs.
     // pg and the optional native peer stay external. Minimum 1 kB headroom
     // rounds up to 11 kB; every existing entry limit remains unchanged.
+    // RAISED 2026-11-16, 11 -> 12 kB, a recorded decision. The shared SQLite
+    // constraint-name reader now reserves every constraint the CREATE TABLE
+    // text names and cuts explicit names to PostgreSQL's 63 bytes, and an
+    // automatic many-to-many now needs both junction keys to reference their
+    // targets' primary keys. Measured with `npm run build` then
+    // `npx size-limit`: 10837 -> 11020 B (+183). Two trims came first (no
+    // clipping of table and column names, an unconditional clip); counting
+    // UTF-8 bytes with TextEncoder was larger in brotli and was reverted. Not
+    // a published claim, so 5% headroom, rounded up.
     path: 'dist/libsql/introspect.js',
-    limit: '11 kB',
+    limit: '12 kB',
     ignore: [...PG, '@libsql/client/node'],
     modifyEsbuildConfig: nodePlatform,
   },
