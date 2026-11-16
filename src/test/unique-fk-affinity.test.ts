@@ -1,5 +1,5 @@
 /**
- * The SQLite to-one proof (sqliteToOneForeignKey) at its affinity edges:
+ * The SQLite key comparison (sqliteKeyComparison) at its affinity edges:
  * the child's unique key justifies a to-one only when both sides compare
  * the way the join does. INTEGER and NUMERIC are different affinities
  * (a TEXT-stored '01' and 1 problem in reverse), TEXT never compares as
@@ -8,7 +8,7 @@
 
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { sqliteToOneForeignKey } from '../catalog-metadata.js';
+import { sqliteKeyComparison } from '../catalog-metadata.js';
 import type { ColumnMetadata } from '../schema.js';
 import { mockTable } from './helpers.js';
 
@@ -18,12 +18,11 @@ function proof(childType: string, parentType: string, parentDdl = 'CREATE TABLE 
     { name: 'parent_id', field: 'parentId', pgType: childType },
   ]).columns as ColumnMetadata[];
   const parent = mockTable('parents', [{ name: 'id', field: 'id', pgType: parentType }]).columns as ColumnMetadata[];
-  const isToOne = sqliteToOneForeignKey(
+  const isToOne = sqliteKeyComparison(
     new Map([
       ['children', child],
       ['parents', parent],
     ]),
-    new Map([['children', [['parent_id']]]]),
     new Map([['parents', parentDdl]]),
     new Map(),
   );
@@ -36,7 +35,7 @@ function proof(childType: string, parentType: string, parentDdl = 'CREATE TABLE 
   });
 }
 
-describe('sqliteToOneForeignKey affinity rules', () => {
+describe('sqliteKeyComparison affinity rules', () => {
   it('same affinity on both sides proves the to-one', () => {
     assert.equal(proof('INTEGER', 'INTEGER'), true);
     assert.equal(proof('TEXT', 'TEXT'), true);

@@ -63,14 +63,15 @@ and `'A'` both reference the parent `'a'`. `legacyToManyUniques: true` keeps
 `relationNames`, is listed in
 [Relation names across engines](relation-names.md#keeping-the-old-output).
 
-### Known differences from PostgreSQL
+### Shapes that follow PostgreSQL
 
-Left as they are deliberately ([details](relation-names.md#known-differences)):
+These shapes derive the relations PostgreSQL derives for the same schema
+([details and the remaining edge cases](relation-names.md#known-differences)):
 
-- A junction with no primary key, `post_tag_links (post_id, tag_id, UNIQUE (post_id, tag_id))`, gets no `manyToMany`; PostgreSQL derives `posts.tags`.
-- `ON DELETE CASCADE` is not read: relations carry no `onDelete` or `onUpdate`.
-- Two composite FKs from `returns` to `orders` are named from the generated `fk_returns_<id>`, giving `returns.returns_1` where PostgreSQL gives `returns.returnsTenantIdOrderId`. A declared `CONSTRAINT` name is not read.
-- A name two FKs both want goes to the first in `PRAGMA foreign_key_list` order, which numbers the last declared key 0; PostgreSQL orders by constraint name.
+- A junction with no primary key, `post_tag_links (post_id, tag_id, UNIQUE (post_id, tag_id))`, gets `posts.tags` and `tags.posts` (`manyToMany`) when both keys reference their targets' primary keys ([why](relation-names.md#junction-keys-to-another-column)).
+- `ON DELETE` and `ON UPDATE` are read from `PRAGMA foreign_key_list`: relations carry `onDelete` and `onUpdate`.
+- Two composite FKs from `returns` to `orders` are named from a declared `CONSTRAINT` name, read from the `CREATE TABLE` text, or else from the name PostgreSQL would generate: `returns.returnsTenantIdOrderId` for an unnamed key.
+- A name two FKs both want goes to the first in source table, then constraint name, order, not `PRAGMA foreign_key_list` order.
 
 ## E017 inventory
 

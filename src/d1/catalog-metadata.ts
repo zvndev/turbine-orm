@@ -5,10 +5,12 @@ import {
   applyTableFilters,
   assertDistinctColumnFields,
   assertSafeCatalogSchema,
-  deriveEngineRelations,
+  deriveRelations,
+  type ForeignKeyEntry,
   nullRecord,
   printableCatalogName,
-  sqliteToOneForeignKey,
+  referentialActionFromCatalog,
+  sqliteKeyComparison,
 } from '../catalog-metadata.js';
 import { UnsupportedFeatureError, ValidationError } from '../errors.js';
 import {
@@ -20,6 +22,11 @@ import {
   snakeToCamel,
   type TableMetadata,
 } from '../schema.js';
+import {
+  canonicalSqliteForeignKeyColumns,
+  nameSqliteForeignKeys,
+  sqliteCatalogName,
+} from '../sqlite-constraint-names.js';
 import { CATALOG_TABLES, CATALOG_VIEWS, type D1CatalogSnapshot, literal, q } from './catalog.js';
 import type { D1IntrospectOptions } from './introspect.js';
 import { sqliteTypeToTs } from './sqlite-dialect.js';
@@ -29,7 +36,6 @@ function d1ColumnType(declared: string, nullable: boolean): string {
   if (/^(numeric|decimal)/i.test(declared)) return nullable ? 'number | string | null' : 'number | string';
   return sqliteTypeToTs(declared, nullable);
 }
-const sqliteName = (name: string) => name.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
 
 function isSqliteDateType(type: string): boolean {
   return isDateType(type.toLowerCase()) || /(timestamp|datetime|date)/i.test(type);
@@ -50,6 +56,8 @@ interface PragmaForeignKey {
   table: string;
   from: string;
   to: string | null;
+  on_update: string;
+  on_delete: string;
 }
 interface PragmaIndex {
   seq: number;
@@ -90,14 +98,8 @@ export function d1CatalogMetadata(snapshot: D1CatalogSnapshot, options: D1Intros
   const relationUniqueByTable = new Map<string, string[][]>();
   const indexesByTable = new Map<string, IndexMetadata[]>();
 
-  interface FKEntry {
-    sourceTable: string;
-    sourceColumns: string[];
-    targetTable: string;
-    targetColumns: string[];
-    constraintName: string;
-  }
-  const foreignKeys: FKEntry[] = [];
+  const foreignKeys: ForeignKeyEntry[] = [];
+  const constraintNames = new Set<string>();
 
   for (const tableName of tableNames) {
     // ----- Columns + primary key -----
@@ -149,16 +151,20 @@ export function d1CatalogMetadata(snapshot: D1CatalogSnapshot, options: D1Intros
     // ----- Foreign keys -----
     const fks = catalog<PragmaForeignKey>(`PRAGMA main.foreign_key_list(${q(tableName)})`);
     // Group by FK id (composite FKs share an id), ordered by seq.
-    const fkById = new Map<number, FKEntry>();
+    const fkById = new Map<number, ForeignKeyEntry>();
     for (const fk of fks.sort((a, b) => a.id - b.id || a.seq - b.seq)) {
       let entry = fkById.get(fk.id);
       if (!entry) {
         entry = {
           sourceTable: tableName,
           sourceColumns: [],
-          targetTable: tableNames.find((name) => sqliteName(name) === sqliteName(fk.table)) ?? fk.table,
+          targetTable: sqliteCatalogName(tableNames, fk.table) ?? fk.table,
           targetColumns: [],
-          constraintName: `fk_${tableName}_${fk.id}`,
+          constraintName: '',
+          actions: {
+            onDelete: referentialActionFromCatalog(fk.on_delete),
+            onUpdate: referentialActionFromCatalog(fk.on_update),
+          },
         };
         fkById.set(fk.id, entry);
       }
@@ -166,6 +172,10 @@ export function d1CatalogMetadata(snapshot: D1CatalogSnapshot, options: D1Intros
       // `to` is null when the FK references the target's PK implicitly.
       if (fk.to !== null) entry.targetColumns.push(fk.to);
     }
+    // SQLite's catalog names no constraint, and relation naming reads the name
+    // for a composite FK: take it from the CREATE TABLE text, else the name
+    // PostgreSQL would give it.
+    nameSqliteForeignKeys(tableName, tableDefinitions.get(tableName) ?? '', [...fkById.values()], constraintNames);
     for (const entry of fkById.values()) {
       if (!tableSet.has(entry.targetTable)) continue;
       if (entry.targetColumns.length === 0) {
@@ -227,32 +237,29 @@ export function d1CatalogMetadata(snapshot: D1CatalogSnapshot, options: D1Intros
 
   // SQLite resolves FK identifiers with ASCII case folding. Preserve the actual
   // catalog spelling in metadata and refuse unresolved in-scope references.
-  for (const fk of foreignKeys) {
-    const resolve = (table: string, name: string): string => {
-      const column = columnsByTable.get(table)?.find((c) => sqliteName(c.name) === sqliteName(name));
-      if (!column)
-        throw new ValidationError(`Unresolvable D1 foreign key: ${printableCatalogName(fk.constraintName)}.`);
-      return column.name;
-    };
-    fk.sourceColumns = fk.sourceColumns.map((name) => resolve(fk.sourceTable, name));
-    fk.targetColumns = fk.targetColumns.map((name) => resolve(fk.targetTable, name));
-  }
+  const [unresolved] = canonicalSqliteForeignKeyColumns(foreignKeys, (table) => columnsByTable.get(table));
+  if (unresolved)
+    throw new ValidationError(`Unresolvable D1 foreign key: ${printableCatalogName(unresolved.constraintName)}.`);
 
   // ----- Build relations from foreign keys (belongsTo + hasMany + m2m) -----
-  // Reuse the established engine naming, field-collision and conservative
-  // junction policies. A to-one is decided per foreign key before naming, so
-  // it is named as PostgreSQL names it (`users.profile`).
+  // The ONE relation derivation every engine calls, with SQLite's own facts:
+  // its unique keys, and when a foreign key compares the way its key does. A
+  // to-one is decided per foreign key before naming, so it is named as
+  // PostgreSQL names it (`users.profile`).
   for (const [tableName, cols] of columnsByTable) assertDistinctColumnFields(tableName, cols);
-  const relationsByTable = deriveEngineRelations(
+  const relationsByTable = deriveRelations({
     tableNames,
     foreignKeys,
     pkByTable,
     columnsByTable,
-    options.logger,
-    options.legacyToManyUniques
-      ? undefined
-      : sqliteToOneForeignKey(columnsByTable, relationUniqueByTable, tableDefinitions, tableFlags),
-  );
+    uniqueKeysByTable: relationUniqueByTable,
+    sameKeyComparison: sqliteKeyComparison(columnsByTable, tableDefinitions, tableFlags),
+    junctionKeysByTable: new Map(
+      Array.from(uniqueByTable, ([table, keys]) => [table, keys.filter((key) => key.length === 2)]),
+    ),
+    ...(options.legacyToManyUniques ? { legacyToManyUniques: true } : {}),
+    ...(options.logger ? { logger: options.logger } : {}),
+  });
 
   // ----- Assemble TableMetadata -----
   const tables: Record<string, TableMetadata> = nullRecord<TableMetadata>();

@@ -245,18 +245,42 @@ describe('buildRelationsFromForeignKeys, composite FKs', () => {
 });
 
 describe('buildRelationsFromForeignKeys, referential actions', () => {
-  it('threads onDelete/onUpdate from the constraint map, omitting no-action', () => {
-    const relations = buildRelationsFromForeignKeys(
-      [fk('posts', ['user_id'], 'users', ['id'], 'posts_user_id_fkey')],
-      new Map([
-        ['posts', new Set(['id', 'userId'])],
-        ['users', new Set(['id'])],
-      ]),
-      new Map([['posts_user_id_fkey', { onDelete: 'cascade' as const, onUpdate: 'no action' as const }]]),
-    );
-    const rel = relations.get('posts')!.user!;
+  const cascade = { onDelete: 'cascade' as const, onUpdate: 'no action' as const };
+  it('threads onDelete/onUpdate from the "<table>::<constraint>" map, omitting no-action', () => {
+    const fields = new Map([
+      ['posts', new Set(['id', 'userId'])],
+      ['users', new Set(['id'])],
+    ]);
+    const key = fk('posts', ['user_id'], 'users', ['id'], 'posts_user_id_fkey');
+    const rel = buildRelationsFromForeignKeys([key], fields, new Map([['posts::posts_user_id_fkey', cascade]])).get(
+      'posts',
+    )!.user!;
     assert.equal(rel.onDelete, 'cascade');
     assert.equal(rel.onUpdate, undefined);
+    // A bare constraint name identifies no key: it is not read.
+    const bare = buildRelationsFromForeignKeys([key], fields, new Map([['posts_user_id_fkey', cascade]]));
+    assert.equal(bare.get('posts')!.user!.onDelete, undefined);
+  });
+
+  it('takes the actions a key carries, so two keys sharing a name keep their own', () => {
+    // `box_items.item_id` and `box.items_item_id` both default to `box_items_item_id_fkey`.
+    const relations = buildRelationsFromForeignKeys(
+      [
+        { ...fk('box_items', ['item_id'], 'items', ['id'], 'box_items_item_id_fkey'), actions: cascade },
+        {
+          ...fk('box', ['items_item_id'], 'items', ['id'], 'box_items_item_id_fkey'),
+          actions: { onDelete: 'no action', onUpdate: 'no action' },
+        },
+      ],
+      new Map([
+        ['box_items', new Set(['id', 'itemId'])],
+        ['box', new Set(['id', 'itemsItemId'])],
+        ['items', new Set(['id'])],
+      ]),
+      new Map([['box::box_items_item_id_fkey', cascade]]),
+    );
+    assert.equal(relations.get('box_items')!.item!.onDelete, 'cascade');
+    assert.equal(relations.get('box')!.item!.onDelete, undefined);
   });
 });
 
@@ -525,7 +549,11 @@ describe('addAutoManyToManyRelations, column-shadow handling', () => {
       addAutoManyToManyRelations(
         ['users', 'organizations', '_UserOrganizations'],
         fks,
-        new Map(), // no primary keys anywhere
+        // The junction has no primary key; each key references its target's.
+        new Map([
+          ['users', ['id']],
+          ['organizations', ['id']],
+        ]),
         new Map([['_UserOrganizations', ['A', 'B']]]),
         relationsByTable,
         undefined,

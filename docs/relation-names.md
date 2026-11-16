@@ -101,41 +101,144 @@ engine's dialect instead.
 
 ## Known differences
 
-These shapes still give different relations on different engines. None
-involves a unique foreign key, and each behaves exactly as it did before the
-to-one change.
+Every engine introspector and `schemaDefToMetadata` call one derivation, each
+with its own catalog facts, so the shapes that differed across engines in
+0.94.0 now derive as on PostgreSQL:
 
 1. **A junction table with no primary key.**
    `post_tag_links (post_id REFERENCES posts, tag_id REFERENCES tags, UNIQUE (post_id, tag_id))`
-   gives `posts.tags` and `tags.posts` (`manyToMany`) on PostgreSQL only.
-   SQLite, MySQL, SQL Server, libSQL, D1 and `schemaDefToMetadata` give only
-   the `hasMany` relations. A two-column primary key over the two foreign keys
-   gives the `manyToMany` everywhere.
+   gives `posts.tags` and `tags.posts` (`manyToMany`) on every engine. Through
+   `schemaDefToMetadata`, a declared two-column
+   `indexes: [{ columns, unique: true }]` entry counts the same way. Both keys
+   must reference their targets' primary keys; see
+   [the limitation below](#junction-keys-to-another-column).
 2. **Referential actions.** `FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE`
-   gives relations carrying `onDelete: 'cascade'` on PostgreSQL and through
-   `schemaDefToMetadata`. The other engines' relations carry no `onDelete` or
-   `onUpdate`.
+   gives relations carrying `onDelete: 'cascade'` on every engine.
 3. **Two composite foreign keys from one table to the same target** are named
-   from their constraint names, and an unnamed constraint is named differently
-   by each engine. For two unnamed `returns (tenant_id, order_id)` and
-   `returns (tenant_id, replacement_id)` keys to `orders`, the first gives
-   `returns.returnsTenantIdOrderId` on PostgreSQL (from
-   `returns_tenant_id_order_id_fkey`), `returns.returnsIbfk_1` on MySQL (from
-   `returns_ibfk_1`), and `returns.returns_1` on SQLite, libSQL and D1, which
-   store no constraint name. SQL Server names the relation from the constraint
-   name it generated. Naming both constraints in the DDL gives the same names
-   on PostgreSQL and MySQL; SQLite, libSQL and D1 never read them.
+   from their constraint names. SQLite, libSQL and D1 read a declared
+   `CONSTRAINT` name from the `CREATE TABLE` text, matched to its key by the
+   child columns, the target table and the referenced columns. A name the
+   engine generated (MySQL `returns_ibfk_1`, SQL Server `FK__returns__...`
+   with a random suffix), or no name at all, counts as the name PostgreSQL
+   would have generated for the same declarations. For two unnamed
+   `returns (tenant_id, order_id)` and `returns (tenant_id, replacement_id)`
+   keys to `orders`, the first gives `returns.returnsTenantIdOrderId` (from
+   `returns_tenant_id_order_id_fkey`) on every engine.
 4. **Which relation keeps a contested name.** When two foreign keys want one
-   name, the first in catalog order keeps it and the other falls back to
-   another name (`notes.userRel` in the example below). PostgreSQL walks
-   source table, then constraint name; SQLite, libSQL and D1 walk table name,
-   then `PRAGMA foreign_key_list` id, which numbers the last declared key 0;
-   MySQL and SQL Server walk constraint name alone; `schemaDefToMetadata`
-   walks declaration order. For
-   `notes (owner REFERENCES "user", user_id REFERENCES users)` with the
-   constraints named `notes_a_owner` and `notes_z_user`, PostgreSQL and MySQL
-   give `notes.user` to the key to `user`, and SQLite gives it to the key to
+   name, the first in source table, then constraint name, order keeps it and
+   the other falls back to another name, whatever order the catalog returned
+   them in. For `notes (owner REFERENCES "user", user_id REFERENCES users)`
+   with the constraints named `notes_a_owner` and `notes_z_user`, every engine
+   gives `notes.user` to the key to `user` and `notes.userRel` to the key to
    `users`. Pin either name with `relationNames`.
 
-`src/test/relation-unique-fk-parity.test.ts` pins each engine's exact output
-for these four shapes, so a change to any of them fails a test first.
+### Generated constraint names follow declaration order
+
+PostgreSQL names an unnamed foreign key `<table>_<columns>_fkey`, cut to 63
+bytes, and counts up (`_fkey1`, `_fkey2`) while any constraint in the schema
+holds the name. A table's PRIMARY KEY, UNIQUE, CHECK and NOT NULL constraints
+exist before its foreign keys are named, so their names count; the name of a
+plain index does not. The foreign keys are then named one at a time, in
+declaration order, and PostgreSQL refuses the statement if an explicit name
+comes after an unnamed key that already took it as its default. The names
+are facts in its catalog, and they depend on that order:
+
+```sql
+CREATE TABLE parents (a INTEGER, b INTEGER, c INTEGER, d INTEGER, PRIMARY KEY (a, b), UNIQUE (c, d));
+CREATE TABLE links (
+  x INTEGER, y INTEGER,
+  FOREIGN KEY (x, y) REFERENCES parents (a, b),  -- links_x_y_fkey:  links.linksXY
+  FOREIGN KEY (x, y) REFERENCES parents (c, d)   -- links_x_y_fkey1: links.linksXYFkey1
+);
+```
+
+Declare the two keys the other way round and `links.linksXY` references
+`(c, d)` instead. A `CONSTRAINT links_x_y_fkey CHECK (x > 0)` in `links`
+moves both keys up the counter, to `links_x_y_fkey1` and `links_x_y_fkey2`.
+
+The other engines synthesize these names by the same rule, in the order the
+`CREATE TABLE` statement declares the keys: SQLite's text, which SQLite's own
+catalog lists in reverse, and the order MySQL numbers its `_ibfk_<n>` names
+in. Before choosing any default they reserve every explicit foreign-key name
+and every other constraint name the table carries. Within a table, that
+gives PostgreSQL's answer for every statement PostgreSQL accepts. For one it
+refuses, such as an explicit `CONSTRAINT links_x_y_fkey` on the second of two
+keys over `(x, y)`, which SQLite and MySQL accept, the explicit key keeps its
+name and the unnamed one takes the counter. An explicit name longer than 63
+bytes, which MySQL (64 characters) and SQL Server (128) accept, is cut to 63
+bytes of UTF-8 as PostgreSQL stores it, never inside a character.
+
+A schema declared in different orders on different databases can therefore
+swap two such relation names; pin them with `relationNames`.
+
+### What still differs
+
+These edge cases, all in reading the constraint name of a composite foreign
+key that shares its target, can still give different names:
+
+- MySQL stores no flag for a generated name, so an explicit constraint named
+  like one (`CONSTRAINT returns_ibfk_1 FOREIGN KEY (x, y)`) is read as
+  unnamed and takes PostgreSQL's default, `returns_x_y_fkey`: MySQL gives
+  `returns.returnsXY` where PostgreSQL gives `returns.returnsIbfk_1`. To keep
+  PostgreSQL's name, rename it:
+  `relationNames: { returns: { returnsXY: 'returnsIbfk_1' } }`.
+- MySQL keeps an unquoted mixed-case constraint name as written, where
+  PostgreSQL folds it to lower case.
+- MySQL's catalog lists a UNIQUE index exactly as it lists a UNIQUE
+  constraint, so a unique index named like a default is reserved too, where
+  PostgreSQL would not consult an index. And MySQL names every primary key
+  `PRIMARY`, so a primary key named like a default is not seen.
+- SQL Server records no declaration order for the keys it named itself, so
+  between those the counter goes by child columns, then referenced table and
+  columns, then actions.
+- When two tables' foreign-key names coincide (`box_items` with `item_id` and
+  `box` with `items_item_id` both default to `box_items_item_id_fkey`, or one
+  table's explicit name is another's default), PostgreSQL gives the counter to
+  the table created second; the other engines give it in table name order.
+- A PostgreSQL default also skips a name that another table's CHECK, UNIQUE,
+  PRIMARY KEY or NOT NULL constraint already holds. A
+  `CONSTRAINT links_x_y_fkey CHECK (x > 0)` on a table `aaa` created before
+  `links` moves `links`'s keys to `links_x_y_fkey1` and `links_x_y_fkey2`;
+  created after `links`, it moves nothing. That depends on the order the
+  tables were created in, which no other catalog records, so off PostgreSQL a
+  default avoids only its own table's other constraints, the answer
+  PostgreSQL gives when `aaa` comes later.
+- PostgreSQL keeps the name a key was created with through a later table
+  rename or the drop of another key; the other engines name the keys a table
+  has now.
+- SQLite, libSQL and D1 take a declared name from the statement text. A key
+  whose clause the reader cannot follow (SQLite also accepts table
+  constraints with no comma between them) takes the default name, as an
+  unnamed key does.
+
+### Junction keys to another column
+
+An automatic `manyToMany` is derived only when both junction keys reference
+their targets' primary keys. The many-to-many query joins the junction to the
+target's primary key, so through a key to any other unique column it would
+return rows the junction does not reference:
+
+```sql
+CREATE TABLE tags (id INTEGER PRIMARY KEY, code INTEGER UNIQUE);
+CREATE TABLE links (
+  post_id INTEGER REFERENCES posts (id),
+  tag_code INTEGER REFERENCES tags (code),
+  UNIQUE (post_id, tag_code)
+);
+```
+
+This gives `links.post`, `links.tag`, `posts.links` and `tags.links`, and no
+`posts.tags` or `tags.posts`, on every engine and through
+`schemaDefToMetadata`. Before this release PostgreSQL introspection derived
+both, and `with: { tags: true }` returned the tag whose primary key equals
+`tag_code`. Full support for a junction key that references another column
+is a known limitation: read such a junction through its `belongsTo` and
+`hasMany` relations, or reference the primary key. An explicitly declared
+`manyToMany` is not affected.
+
+`src/test/relation-derivation-parity.test.ts` creates each shape natively on
+PostgreSQL, MySQL, `node:sqlite` and better-sqlite3, and as a `defineSchema`
+schema where one can express it, and holds each to PostgreSQL's relations.
+SQL Server is covered through catalog fixtures in
+`src/test/mssql-introspection-metadata.test.ts`, and libSQL and D1 through
+their own native tests.

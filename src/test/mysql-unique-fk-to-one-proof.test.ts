@@ -90,6 +90,8 @@ function recordedCatalog(recorded: Recorded): MysqlRowExecutor {
         CONSTRAINT_NAME: `fk_${fk.table}`,
       }));
     }
+    // Constraint names only reserve names; these single-column keys read none.
+    if (sql.includes('information_schema.TABLE_CONSTRAINTS')) return [];
     assert.match(sql, /information_schema\.STATISTICS/);
     return recorded.indexes;
   };

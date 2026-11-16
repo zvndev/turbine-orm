@@ -135,8 +135,13 @@ import {
   applyTableFilters,
   assertDistinctColumnFields,
   type IntrospectOptions as CatalogIntrospectOptions,
-  deriveEngineRelations,
+  compareCatalogNames,
+  deriveRelations,
+  type ForeignKeyEntry,
+  foreignKeyConstraintNames,
   nullRecord,
+  type RelationCatalogFacts,
+  referentialActionFromCatalog,
 } from './introspect.js';
 import importOptionalPeer from './optional-peer-import.cjs';
 import { orderByEntries } from './query/filters.js';
@@ -1792,14 +1797,6 @@ function buildForJsonManyToMany(dialect: Dialect, ctx: RelationSubqueryContext, 
 /** Async executor that returns plain row objects for a parameterized (`@pN`) query. */
 export type MssqlRowExecutor = (sql: string, params: unknown[]) => Promise<Record<string, unknown>[]>;
 
-interface FKEntry {
-  sourceTable: string;
-  sourceColumns: string[];
-  targetTable: string;
-  targetColumns: string[];
-  constraintName: string;
-}
-
 const num = (v: number | string | null | undefined): number => (typeof v === 'string' ? Number(v) : (v ?? 0));
 
 /**
@@ -1824,22 +1821,14 @@ const num = (v: number | string | null | undefined): number => (typeof v === 'st
 const bitIsTrue = (v: unknown): boolean => v === true || v === 1 || v === '1' || v === 'true';
 
 /**
- * Derive relations from the FK list via the SHARED introspection pipeline
- * (`deriveEngineRelations` → `buildRelationsFromForeignKeys` +
- * `addAutoManyToManyRelations` in introspect.ts), so this engine derives
- * IDENTICAL relation names to `turbine generate` against Postgres for the
- * same logical schema, legacy-first naming, per-column disambiguation, and
- * collision resolution against scalar column fields included.
+ * Derive relations through the ONE relation derivation every engine calls
+ * (`deriveRelations` in catalog-metadata.ts), so this engine derives the
+ * relations `turbine generate` derives against PostgreSQL for the same schema.
+ * SQL Server contributes its own facts: its unique keys, when a key's
+ * comparison semantics match the join's, and its referential actions.
  */
-function buildRelationsFromForeignKeys(
-  tableNames: string[],
-  foreignKeys: FKEntry[],
-  pkByTable: Map<string, string[]>,
-  columnsByTable: Map<string, ColumnMetadata[]>,
-  logger: IntrospectOptions['logger'],
-  isToOne?: (fk: FKEntry) => boolean,
-): Map<string, Record<string, RelationDef>> {
-  return deriveEngineRelations(tableNames, foreignKeys, pkByTable, columnsByTable, logger, isToOne);
+function buildRelationsFromForeignKeys(facts: RelationCatalogFacts): Map<string, Record<string, RelationDef>> {
+  return deriveRelations(facts);
 }
 
 /**
@@ -1979,7 +1968,10 @@ export async function introspectMssqlWith(
             cpt.name AS REFERENCED_COLUMN_NAME,
             fkc.constraint_column_id AS ORDINAL_POSITION,
             s.name AS TABLE_SCHEMA,
-            rs.name AS REFERENCED_TABLE_SCHEMA
+            rs.name AS REFERENCED_TABLE_SCHEMA,
+            fk.delete_referential_action_desc AS DELETE_RULE,
+            fk.update_referential_action_desc AS UPDATE_RULE,
+            fk.is_system_named AS IS_SYSTEM_NAMED
      FROM sys.foreign_keys fk
      JOIN sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id
      JOIN sys.columns cps ON cps.object_id = fkc.parent_object_id AND cps.column_id = fkc.parent_column_id
@@ -1991,7 +1983,7 @@ export async function introspectMssqlWith(
      ORDER BY fk.name, fkc.constraint_column_id`,
     [schema],
   );
-  const fkByConstraint = new Map<string, FKEntry>();
+  const fkByTable = new Map<string, Map<string, { fk: ForeignKeyEntry; systemNamed: boolean }>>();
   for (const r of fkRows.sort((a, b) => Number(a.ORDINAL_POSITION) - Number(b.ORDINAL_POSITION))) {
     const sourceTable = String(r.TABLE_NAME);
     const targetTable = String(r.REFERENCED_TABLE_NAME);
@@ -2003,16 +1995,73 @@ export async function introspectMssqlWith(
     )
       continue;
     const constraintName = String(r.CONSTRAINT_NAME);
-    const key = JSON.stringify([sourceTable, constraintName]);
-    let entry = fkByConstraint.get(key);
-    if (!entry) {
-      entry = { sourceTable, sourceColumns: [], targetTable, targetColumns: [], constraintName };
-      fkByConstraint.set(key, entry);
+    if (!fkByTable.has(sourceTable)) fkByTable.set(sourceTable, new Map());
+    const table = fkByTable.get(sourceTable)!;
+    let key = table.get(constraintName);
+    if (!key) {
+      key = {
+        fk: {
+          sourceTable,
+          sourceColumns: [],
+          targetTable,
+          targetColumns: [],
+          constraintName,
+          actions: {
+            onDelete: referentialActionFromCatalog(r.DELETE_RULE),
+            onUpdate: referentialActionFromCatalog(r.UPDATE_RULE),
+          },
+        },
+        systemNamed: bitIsTrue(r.IS_SYSTEM_NAMED),
+      };
+      table.set(constraintName, key);
     }
-    entry.sourceColumns.push(String(r.COLUMN_NAME));
-    entry.targetColumns.push(String(r.REFERENCED_COLUMN_NAME));
+    key.fk.sourceColumns.push(String(r.COLUMN_NAME));
+    key.fk.targetColumns.push(String(r.REFERENCED_COLUMN_NAME));
   }
-  const foreignKeys = [...fkByConstraint.values()].filter((fk) => tableSet.has(fk.targetTable));
+  // Relation naming reads a composite FK's constraint name. A system-named
+  // constraint (`FK__orders__tenan__1A2B3C4D`, with a random suffix) takes the
+  // name PostgreSQL would have given it, so that relation is named the same on
+  // every database and on every engine; an explicit name is reserved first.
+  // SQL Server records no declaration order, so system-named keys are named in
+  // the order of their columns, what they reference and their actions, never
+  // of the suffix. A default also avoids the table's explicit CHECK, PRIMARY
+  // KEY and UNIQUE constraint names, which PostgreSQL creates first.
+  const reserved = new Map<string, string[]>();
+  for (const r of await exec(
+    `SELECT OBJECT_NAME(k.parent_object_id) AS TABLE_NAME, k.name AS CONSTRAINT_NAME
+     FROM sys.key_constraints k JOIN sys.schemas s ON s.schema_id = k.schema_id
+     WHERE s.name = @p1 AND k.is_system_named = 0
+     UNION ALL
+     SELECT OBJECT_NAME(c.parent_object_id), c.name
+     FROM sys.check_constraints c JOIN sys.schemas s ON s.schema_id = c.schema_id
+     WHERE s.name = @p1 AND c.is_system_named = 0`,
+    [schema],
+  )) {
+    const table = String(r.TABLE_NAME);
+    reserved.set(table, [...(reserved.get(table) ?? []), String(r.CONSTRAINT_NAME)]);
+  }
+  const constraintNames = new Set<string>();
+  const foreignKeys: ForeignKeyEntry[] = [];
+  const identity = ({ fk }: { fk: ForeignKeyEntry }) =>
+    JSON.stringify([fk.sourceColumns, fk.targetTable, fk.targetColumns, fk.actions?.onDelete, fk.actions?.onUpdate]);
+  for (const [table, entries] of [...fkByTable].sort(([a], [b]) => compareCatalogNames(a, b))) {
+    const keys = [...entries.values()].sort(
+      (a, b) => Number(a.systemNamed) - Number(b.systemNamed) || compareCatalogNames(identity(a), identity(b)),
+    );
+    const names = foreignKeyConstraintNames(
+      table,
+      keys.map(({ fk, systemNamed }) => ({
+        columns: fk.sourceColumns,
+        name: systemNamed ? undefined : fk.constraintName,
+      })),
+      constraintNames,
+      reserved.get(table),
+    );
+    keys.forEach(({ fk }, i) => {
+      fk.constraintName = names[i]!;
+      if (tableSet.has(fk.targetTable)) foreignKeys.push(fk);
+    });
+  }
 
   // ----- Indexes + unique constraints -----
   const idxRows = await exec(
@@ -2124,28 +2173,26 @@ export async function introspectMssqlWith(
       (fact) => child[fact] === parent[fact],
     );
   };
-  const relationsByTable = buildRelationsFromForeignKeys(
+  const relationsByTable = buildRelationsFromForeignKeys({
     tableNames,
     foreignKeys,
     pkByTable,
     columnsByTable,
-    options.logger,
-    options.legacyToManyUniques
-      ? undefined
-      : (fk) => {
-          const columns = fk.sourceColumns;
-          if (
-            columns.length !== fk.targetColumns.length ||
-            !columns.every((name, i) => sameComparison(fk.sourceTable, name, fk.targetTable, fk.targetColumns[i]!))
-          )
-            return false;
-          const primary = inactivePrimaryTables.has(fk.sourceTable) ? [] : (pkByTable.get(fk.sourceTable) ?? []);
-          const keys = [primary, ...(uniqueByTable.get(fk.sourceTable) ?? [])];
-          return keys.some(
-            (key) => key.length > 0 && key.length === columns.length && key.every((name) => columns.includes(name)),
-          );
-        },
-  );
+    uniqueKeysByTable: new Map(
+      tableNames.map((table) => [
+        table,
+        [inactivePrimaryTables.has(table) ? [] : (pkByTable.get(table) ?? []), ...(uniqueByTable.get(table) ?? [])],
+      ]),
+    ),
+    sameKeyComparison: (fk) =>
+      fk.sourceColumns.length === fk.targetColumns.length &&
+      fk.sourceColumns.every((name, i) => sameComparison(fk.sourceTable, name, fk.targetTable, fk.targetColumns[i]!)),
+    junctionKeysByTable: new Map(
+      Array.from(uniqueByTable, ([table, keys]) => [table, keys.filter((key) => key.length === 2)]),
+    ),
+    ...(options.legacyToManyUniques ? { legacyToManyUniques: true } : {}),
+    ...(options.logger ? { logger: options.logger } : {}),
+  });
 
   // ----- Assemble TableMetadata -----
   const tables: Record<string, TableMetadata> = nullRecord<TableMetadata>();

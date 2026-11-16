@@ -1,5 +1,114 @@
 # Changelog
 
+## 0.95.0 (2026-11-16)
+
+One relation derivation for every engine. PostgreSQL, SQLite (`node:sqlite`
+and better-sqlite3), MySQL, SQL Server, local libSQL, D1 and `defineSchema`
+now turn a schema into relations through the same function, so the same
+tables give the same relation names, to-one and to-many cardinality,
+many-to-many detection and referential actions everywhere. PostgreSQL's
+output is unchanged except for one wrong-results fix: an automatic
+many-to-many through a junction key that references a non-primary-key
+column is no longer derived. Root `dependencies` is still exactly
+`{ "pg": "^8.15.0" }`.
+
+### Behaviour changes
+
+- **Relations derive the same on every engine as on PostgreSQL.** One
+  derivation now serves PostgreSQL, SQLite (`node:sqlite` and better-sqlite3),
+  MySQL, SQL Server, local libSQL, D1 and `defineSchema`, each with its own
+  catalog facts. A parity test creates one schema natively on PostgreSQL,
+  MySQL, `node:sqlite` and better-sqlite3, and as a `defineSchema` schema, and
+  compares the results; SQL Server is covered through catalog fixtures, and
+  libSQL and D1 through their own native tests. The four cross-engine
+  differences listed for 0.94.0 are gone. PostgreSQL's output is unchanged
+  except for the junction correction under Fixed. What changes elsewhere:
+  - A junction table with no primary key, keyed by a two-column unique index
+    over its two foreign keys (Prisma's implicit many-to-many shape), now gets
+    `manyToMany` on both sides when both keys reference their targets'
+    primary keys. Before, only a two-column primary key counted off
+    PostgreSQL. `defineSchema` reads a declared two-column
+    `indexes: [{ columns, unique: true }]` entry the same way.
+  - Relations carry the foreign key's `onDelete` and `onUpdate`, as they
+    already did on PostgreSQL and through `schemaDefToMetadata`. This adds
+    fields to generated metadata and changes no query.
+  - When two composite foreign keys from one table point at the same target,
+    their names come from the constraint names. SQLite, libSQL and D1 now read
+    a declared `CONSTRAINT` name from the `CREATE TABLE` text, matched to its
+    key by child columns, target table and referenced columns. A name the
+    engine generated (MySQL `returns_ibfk_1`, SQL Server `FK__returns__...`
+    with a random suffix) or no name at all now counts as the name PostgreSQL
+    would have generated for the same declarations,
+    `returns_tenant_id_order_id_fkey`: in declaration order, cut to 63 bytes,
+    counting up (`_fkey1`) while a name is taken. PostgreSQL names the keys
+    one at a time and refuses a statement in which an unnamed key took a
+    later explicit name; these readers reserve every explicit name, and the
+    table's CHECK, UNIQUE, PRIMARY KEY and NOT NULL constraint names, before
+    choosing any default, which within a table gives PostgreSQL's answer for
+    every statement PostgreSQL accepts. Another table's constraint counts on
+    PostgreSQL only if that table was created first, which no other catalog
+    records, so it is not reserved. An explicit name longer than 63 bytes
+    (MySQL allows 64 characters, SQL Server 128) is cut to 63 bytes of UTF-8
+    as PostgreSQL stores it. Such relations are renamed, for example from
+    `returnsIbfk_1` to `returnsTenantIdOrderId`. As on PostgreSQL, declaring
+    two such keys the other way round swaps their names. On SQLite, two
+    unnamed keys over the same columns now take their names in declaration
+    order (SQLite's catalog lists them in reverse), which can also change the
+    order their relations are listed in.
+  - When two foreign keys want one name, the first in source table and
+    constraint name order keeps it, on every engine. Before, the order was
+    whatever the catalog returned, and declaration order for `defineSchema`.
+    Generated files for these engines can list relations in a different order
+    as a result. `defineSchema` takes its names from the same order and still
+    lists each table's relations in declaration order, so its generated files
+    change only where a relation's name or definition did.
+  - Pin any relation name that moved with `relationNames`.
+    [Details, and the edge cases that still differ](docs/relation-names.md#known-differences).
+
+### Fixed
+
+- **No automatic many-to-many through a junction key that references a
+  column other than its target's primary key, on PostgreSQL too.** For
+  `links (post_id REFERENCES posts (id), tag_code REFERENCES tags (code), UNIQUE (post_id, tag_code))`
+  PostgreSQL introspection derived `posts.tags` and `tags.posts`, and
+  `with: { tags: true }` returned tags the junction does not reference: the
+  many-to-many query joins the junction to the target's primary key. No
+  engine and no `defineSchema` schema derives these relations now, so such a
+  query raises E005 (unknown relation) instead of returning those rows. The
+  junction's own `belongsTo` and `hasMany` relations are unchanged, and so is
+  an explicitly declared `manyToMany`. This is the only change to
+  PostgreSQL's output in this release.
+- **SQLite reads a foreign key whose `REFERENCES` clause spells the table or
+  column with different ASCII letter case.** SQLite treats `A` to `Z` and `a`
+  to `z` in identifiers as equal (other letters stay distinct), but
+  `node:sqlite` and better-sqlite3 introspection compared them exactly, so
+  `REFERENCES PARENTS (ID)` against a table created as `parents (id)` lost the
+  foreign key and its relations, and a reference spelled `(ID)` could keep a
+  unique foreign key's reverse relation to-many. Both drivers now read the
+  reference in the catalog's own spelling, as libSQL and D1 already did.
+- **`schemaDefToMetadata` no longer gives one table's referential actions to
+  another.** Two tables whose default constraint names coincide,
+  `boxItems.itemId` with `onDelete: 'cascade'` and `box.itemsItemId` (both
+  `box_items_item_id_fkey`), lost the cascade on `box_items.item`. Actions
+  now travel with each foreign key on every engine, so two keys can share a
+  name without sharing an action.
+
+### Changed
+
+- **Three limits rise.** The main barrel goes from 154 to 156 kB brotli,
+  `turbine-orm/mssql` from 131 to 138 kB, and `turbine-orm/libsql/introspect`
+  from 11 to 12 kB. The shared relation derivation is in all three graphs,
+  SQL Server's introspector now feeds it the catalog facts it needs, and the
+  SQLite constraint-name reader (shared by libSQL) reads every named
+  constraint. No driver code was added. Measured with `npm run size` (brotli,
+  drivers external):
+
+  | Entry | Size | Limit |
+  |---|---|---|
+  | `turbine-orm` (whole barrel) | 154.48 kB | 156 kB |
+  | `turbine-orm/mssql` | 131.49 kB | 138 kB |
+  | `turbine-orm/libsql/introspect` | 11.09 kB | 12 kB |
+
 ## 0.94.0 (2026-11-15)
 
 Five new engines and transports, a CLI project lifecycle for SQLite, MySQL,

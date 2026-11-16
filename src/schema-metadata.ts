@@ -15,10 +15,11 @@
  * names, constraint names, view flags).
  *
  * Parity notes (ground truth = introspect.ts + generate.ts):
- *   - Relations are derived from `references:` exactly like introspection
- *     derives them from foreign keys: a `belongsTo` on the child table and
- *     a `hasMany` on the parent, with the same disambiguation rules when
- *     multiple FKs point at the same target.
+ *   - Relations are derived from `references:` by the same derivation every
+ *     introspector calls: a `belongsTo` on the child table and a `hasMany` on
+ *     the parent (a singular-named `hasOne` when the column is unique, the
+ *     primary key, or a declared unique index), with the same disambiguation
+ *     rules when multiple FKs point at the same target.
  *   - Pure junction tables (2-column composite PK that IS the two
  *     single-column FKs to two distinct tables, no payload columns) get
  *     the same conservative auto-`manyToMany` treatment as introspection.
@@ -46,12 +47,7 @@
  */
 
 import { ValidationError } from './errors.js';
-import {
-  addAutoManyToManyRelations,
-  buildRelationsFromForeignKeys,
-  type ForeignKeyEntry,
-  isUnknownTsType,
-} from './introspect.js';
+import { defaultForeignKeyConstraintName, deriveRelations, type ForeignKeyEntry } from './introspect.js';
 import {
   type ColumnMetadata,
   camelToSnake,
@@ -59,7 +55,6 @@ import {
   isDateType,
   pgArrayType,
   pgTypeToTs,
-  type ReferentialAction,
   type RelationDef,
   type SchemaMetadata,
   type TableMetadata,
@@ -331,8 +326,8 @@ export function schemaDefToMetadata(def: SchemaDef, options: { legacyToManyUniqu
 
   // ----- Pass 3: derive belongsTo / hasMany / hasOne relations (SHARED with introspect)
   //
-  // Delegates to the exact same builder introspection uses
-  // (`buildRelationsFromForeignKeys`), so the same logical schema yields
+  // Delegates to the exact same derivation introspection uses
+  // (`deriveRelations`, Pass 4), so the same logical schema yields
   // IDENTICAL relation names whether it arrives via `defineSchema()` or a live
   // catalog: legacy-first naming, per-column disambiguation for several FKs to
   // the same target, and collision resolution against scalar column fields
@@ -342,98 +337,100 @@ export function schemaDefToMetadata(def: SchemaDef, options: { legacyToManyUniqu
   // scalar, and two FKs deriving the same name silently clobbered each other
   //.
   //
-  // Constraint names are synthesized in pg's default `<table>_<column>_fkey`
-  // form; they only feed the referential-action lookup and composite-FK
-  // naming (never hit here, `references:` is single-column by design).
+  // Constraint names follow PostgreSQL's rule for the unnamed keys
+  // `schemaToSQL` emits; they only order the derivation (and name a composite
+  // FK, never declared here: `references:` is single-column by design). The
+  // actions travel on each key, because two tables can produce one name
+  // (`box_items.item_id` and `box.items_item_id`).
   const fkEntries: ForeignKeyEntry[] = [];
-  const fkActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
+  const constraintNames = new Set<string>();
   for (const fk of foreignKeys) {
-    const constraintName = `${fk.sourceTable}_${fk.sourceColumn}_fkey`;
     fkEntries.push({
       sourceTable: fk.sourceTable,
       sourceColumns: [fk.sourceColumn],
       targetTable: fk.targetTable,
       targetColumns: [fk.targetColumn],
-      constraintName,
-    });
-    fkActions.set(constraintName, {
-      onDelete: fk.onDelete ?? 'no action',
-      onUpdate: fk.onUpdate ?? 'no action',
+      constraintName: defaultForeignKeyConstraintName(fk.sourceTable, [fk.sourceColumn], constraintNames),
+      actions: { onDelete: fk.onDelete ?? 'no action', onUpdate: fk.onUpdate ?? 'no action' },
     });
   }
 
   // Taken-name seeds: every table's camelCase column fields (the SchemaDef
-  // keys ARE the fields) + which of them are json/jsonb (`unknown`-typed).
-  const columnFieldsByTable = new Map<string, Set<string>>();
-  const unknownTypedFieldsByTable = new Map<string, Set<string>>();
-  for (const tableDef of Object.values(def.tables)) {
-    const fields = Object.keys(tableDef.columns);
-    columnFieldsByTable.set(tableDef.name, new Set(fields));
-    // ENUM columns map to concrete union types in the generated layer, so
-    // only genuine json/jsonb (`unknown`-typed) columns qualify as shadows.
-    unknownTypedFieldsByTable.set(
-      tableDef.name,
-      new Set(
-        fields.filter((f) => {
-          const config = tableDef.columns[f]!;
-          if (config.type === 'ENUM') return false;
-          const wire = config.isArray ? `_${udtName(config)}` : udtName(config);
-          return isUnknownTsType(pgTypeToTs(wire, false));
-        }),
-      ),
-    );
-  }
-
-  // The column sets that hold at most one row per value, the same sets
-  // PostgreSQL introspection reads from the pushed schema's catalog: the
-  // primary key, every `unique: true` column and every declared unique index.
-  // A foreign key over exactly one of them has a to-one reverse relation.
-  const uniqueSetsByTable = new Map<string, string[][]>();
-  for (const tableDef of Object.values(def.tables)) {
-    const sets: string[][] = [];
-    if (tableDef.primaryKey && tableDef.primaryKey.length > 0) sets.push(tableDef.primaryKey.map(camelToSnake));
-    for (const [field, config] of Object.entries(tableDef.columns)) {
-      if (config.isPrimaryKey || config.isUnique) sets.push([camelToSnake(field)]);
-    }
-    for (const idx of tableDef.indexes ?? []) {
-      if (idx.unique && !isDocFieldIndexDef(idx)) sets.push(idx.columns.map(camelToSnake));
-    }
-    uniqueSetsByTable.set(tableDef.name, sets);
-  }
-
-  const relationsByTable = buildRelationsFromForeignKeys(
-    fkEntries,
-    columnFieldsByTable,
-    fkActions,
-    unknownTypedFieldsByTable,
-    options.legacyToManyUniques ? undefined : uniqueSetsByTable,
-  );
-
-  // ----- Pass 4: conservative junction auto-m2m (SHARED with introspect) ---
-  // Same shared detector + naming/collision rules as introspection: a table J
-  // is a PURE junction only when its PK is exactly the two single-column FKs
-  // to two DISTINCT tables and it has no payload columns.
+  // keys ARE the fields) with the type each maps to, so a json/jsonb
+  // (`unknown`-typed) column can be told apart. ENUM columns map to concrete
+  // union types in the generated layer, so their types are passed as enums and
+  // are never json shadows.
+  const columnsByTable = new Map<string, Pick<ColumnMetadata, 'name' | 'field' | 'tsType' | 'pgType'>[]>();
+  const enumTypes: Record<string, readonly string[]> = { ...def.enums };
   const pkByTable = new Map<string, string[]>();
-  const columnNamesByTable = new Map<string, string[]>();
+  // Every column set that holds at most one row, the facts introspection reads
+  // from the database this schema creates: the primary key, each `unique`
+  // column and each declared unique index.
+  const uniqueKeysByTable = new Map<string, string[][]>();
+  const junctionKeysByTable = new Map<string, string[][]>();
   for (const tableDef of Object.values(def.tables)) {
+    columnsByTable.set(
+      tableDef.name,
+      Object.entries(tableDef.columns).map(([field, config]) => {
+        const wire = config.isArray ? `_${udtName(config)}` : udtName(config);
+        if (config.type === 'ENUM') enumTypes[wire] ??= [];
+        return { name: camelToSnake(field), field, tsType: pgTypeToTs(wire, false), pgType: wire };
+      }),
+    );
     const pkFields =
       tableDef.primaryKey && tableDef.primaryKey.length > 0
         ? [...tableDef.primaryKey]
         : Object.entries(tableDef.columns)
             .filter(([, c]) => c.isPrimaryKey)
             .map(([f]) => f);
-    pkByTable.set(tableDef.name, pkFields.map(camelToSnake));
-    columnNamesByTable.set(tableDef.name, Object.keys(tableDef.columns).map(camelToSnake));
+    const pk = pkFields.map(camelToSnake);
+    pkByTable.set(tableDef.name, pk);
+    const uniqueIndexes = (tableDef.indexes ?? [])
+      .filter((idx) => !isDocFieldIndexDef(idx) && idx.unique)
+      .map((idx) => (idx as { columns: readonly string[] }).columns.map(camelToSnake));
+    uniqueKeysByTable.set(tableDef.name, [
+      pk,
+      ...Object.entries(tableDef.columns)
+        .filter(([, c]) => c.isUnique)
+        .map(([f]) => [camelToSnake(f)]),
+      ...uniqueIndexes,
+    ]);
+    junctionKeysByTable.set(
+      tableDef.name,
+      uniqueIndexes.filter((key) => key.length === 2),
+    );
   }
-  addAutoManyToManyRelations(
-    Object.values(def.tables).map((t) => t.name),
-    fkEntries,
+
+  // ----- Pass 4: the ONE relation derivation every engine's introspector
+  // also calls, so this schema derives the relations introspection derives
+  // from the database it creates: legacy-first naming, per-column
+  // disambiguation, collision resolution against scalar column fields, a
+  // unique foreign key's to-one reverse relation, and the conservative
+  // pure-junction manyToMany.
+  const facts = {
+    tableNames: Object.values(def.tables).map((t) => t.name),
+    foreignKeys: fkEntries,
     pkByTable,
-    columnNamesByTable,
-    relationsByTable,
-    columnFieldsByTable,
-    unknownTypedFieldsByTable,
-  );
+    columnsByTable,
+    enums: enumTypes,
+    uniqueKeysByTable,
+    junctionKeysByTable,
+    ...(options.legacyToManyUniques ? { legacyToManyUniques: true } : {}),
+  };
+  const relationsByTable = deriveRelations(facts);
+
+  // The names above are the sorted derivation's, so they match introspection.
+  // The ORDER each table lists them in stays declaration order, as it was
+  // before the derivation was shared, so a schema whose relation names did not
+  // change keeps generating the same files. A second, silent derivation that
+  // takes the declarations as given supplies that order; a name it does not
+  // produce (one a contested name moved) follows in the sorted order.
+  const declared = deriveRelations({ ...facts, inCatalogOrder: true, logger: {} });
+  for (const [table, relations] of relationsByTable) {
+    const order = Object.keys(declared.get(table) ?? {}).filter((name) => Object.hasOwn(relations, name));
+    for (const name of Object.keys(relations)) if (!order.includes(name)) order.push(name);
+    relationsByTable.set(table, Object.fromEntries(order.map((name) => [name, relations[name]!])));
+  }
 
   // ----- Pass 5: assemble TableMetadata -----
   const tables: Record<string, TableMetadata> = {};

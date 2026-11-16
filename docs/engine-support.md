@@ -3,7 +3,7 @@
 
 # Engine and version support
 
-As of 2026-11-13. It describes release 0.94.0 and the test evidence wired into its release gates.
+As of 2026-11-16. It describes release 0.95.0 and the test evidence wired into its release gates.
 
 This page says, for every engine and transport the package exposes, what works, on which versions, and how
 that is known. Each claim names its evidence, and each tier is computed from that evidence by the rule
@@ -290,7 +290,7 @@ Not tested:
 - Statements and lock waits are synchronous and block the event loop for their duration.
 - A batch limit on parent rows cannot bound one large BLOB or nested JSON value.
 - numeric reads as a JS number; integers past Number.MAX_SAFE_INTEGER read as strings.
-- Introspected relations differ from PostgreSQL's in four known cases: a junction keyed only by a unique index gets no many-to-many, relations carry no onDelete or onUpdate, two composite foreign keys sharing a target are named from constraint names, which each engine generates differently, and a contested name goes to the first foreign key in this catalog's order. Examples: [Relation names across engines](relation-names.md#known-differences).
+- Introspected relations derive as on PostgreSQL, except edge cases in reading the constraint names of composite foreign keys that share a target: [Relation names across engines](relation-names.md#known-differences).
 - A unique foreign key stays to-many when the child table's or its unique index's DDL contains COLLATE, or the parent's does and the referenced key is not the rowid alias, because column collations are not in the catalog.
 
 <a id="better-sqlite3"></a>
@@ -454,7 +454,7 @@ Not tested:
 
 - create reads the new row back by a key it knows. A server-generated key other than AUTO_INCREMENT refuses with E017 before the insert.
 - An unconstrained numeric is created as DECIMAL(65,30).
-- Introspected relations differ from PostgreSQL's in four known cases: a junction keyed only by a unique index gets no many-to-many, relations carry no onDelete or onUpdate, two composite foreign keys sharing a target are named from constraint names, which each engine generates differently, and a contested name goes to the first foreign key in this catalog's order. Examples: [Relation names across engines](relation-names.md#known-differences).
+- Introspected relations derive as on PostgreSQL, except edge cases in reading the constraint names of composite foreign keys that share a target: [Relation names across engines](relation-names.md#known-differences).
 
 <a id="mariadb"></a>
 
@@ -794,7 +794,7 @@ Not tested:
 ### Known limitations
 
 - Remote URLs and sync settings are refused.
-- Introspected relations differ from PostgreSQL's in four known cases: a junction keyed only by a unique index gets no many-to-many, relations carry no onDelete or onUpdate, two composite foreign keys sharing a target are named from constraint names, which each engine generates differently, and a contested name goes to the first foreign key in this catalog's order. Examples: [Relation names across engines](relation-names.md#known-differences).
+- Introspected relations derive as on PostgreSQL, except edge cases in reading the constraint names of composite foreign keys that share a target: [Relation names across engines](relation-names.md#known-differences).
 - A unique foreign key stays to-many when the child table's or its unique index's DDL contains COLLATE, or the parent's does and the referenced key is not the rowid alias, because column collations are not in the catalog.
 
 <a id="d1"></a>
@@ -869,7 +869,7 @@ Not tested:
 
 - 64-bit integers and decimals come back as JavaScript numbers.
 - D1 service limits apply; a native batch is not split automatically.
-- Introspected relations differ from PostgreSQL's in four known cases: a junction keyed only by a unique index gets no many-to-many, relations carry no onDelete or onUpdate, two composite foreign keys sharing a target are named from constraint names, which each engine generates differently, and a contested name goes to the first foreign key in this catalog's order. Examples: [Relation names across engines](relation-names.md#known-differences).
+- Introspected relations derive as on PostgreSQL, except edge cases in reading the constraint names of composite foreign keys that share a target: [Relation names across engines](relation-names.md#known-differences).
 - A unique foreign key stays to-many when the child table's or its unique index's DDL contains COLLATE, or the parent's does and the referenced key is not the rowid alias, because column collations are not in the catalog.
 
 <a id="mssql"></a>
@@ -937,7 +937,7 @@ Not tested:
 ### Known limitations
 
 - numeric reads as a JS number; UNIQUEIDENTIFIER reads back in upper case.
-- Introspected relations differ from PostgreSQL's in four known cases: a junction keyed only by a unique index gets no many-to-many, relations carry no onDelete or onUpdate, two composite foreign keys sharing a target are named from constraint names, which each engine generates differently, and a contested name goes to the first foreign key in this catalog's order. Examples: [Relation names across engines](relation-names.md#known-differences).
+- Introspected relations derive as on PostgreSQL, except edge cases in reading the constraint names of composite foreign keys that share a target: [Relation names across engines](relation-names.md#known-differences).
 
 <a id="cockroachdb"></a>
 

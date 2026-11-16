@@ -96,6 +96,87 @@ describe('SQL Server catalog metadata fidelity', () => {
     assert.deepEqual(Object.keys(filtered.tables.parents!.relations), []);
   });
 
+  it('names system-named composite keys as PostgreSQL would, after every explicit name, whatever their suffixes', async () => {
+    const XY = ['x', 'y'];
+    const AB = ['a', 'b'];
+    const CD = ['c', 'd'];
+    const system = { IS_SYSTEM_NAMED: true };
+    // `swap` exchanges the random suffixes between keys that differ only in
+    // what they reference, or only in their actions.
+    const read = async (swap: boolean) => {
+      const f = catalogFixture();
+      const tables = ['cn_links', 'cn_ties', 'cn_returns', 'cn_checked'];
+      f.tables.push('cn_parents', ...tables);
+      for (const name of ['a', 'b', 'c', 'd']) f.columns.push(catalogColumn('cn_parents', name));
+      for (const table of tables) for (const name of ['tenant', 'x', 'y']) f.columns.push(catalogColumn(table, name));
+      f.primary.push(
+        { TABLE_NAME: 'cn_parents', COLUMN_NAME: 'a', ORDINAL_POSITION: 1 },
+        { TABLE_NAME: 'cn_parents', COLUMN_NAME: 'b', ORDINAL_POSITION: 2 },
+      );
+      f.indexes.push(...catalogIndex('cn_parents', 'UQ_cn_parents_cd', CD));
+      const fk = (table: string, child: string[], target: string[], name: string, extra: Record<string, unknown>) => {
+        for (const [i, column] of child.entries())
+          f.foreign.push({
+            TABLE_NAME: table,
+            COLUMN_NAME: column,
+            REFERENCED_TABLE_NAME: 'cn_parents',
+            REFERENCED_COLUMN_NAME: target[i],
+            TABLE_SCHEMA: 'app',
+            REFERENCED_TABLE_SCHEMA: 'app',
+            CONSTRAINT_NAME: name,
+            ORDINAL_POSITION: i + 1,
+            ...extra,
+          });
+      };
+      const [first, second] = swap ? ['F00D', '0BAD'] : ['0BAD', 'F00D'];
+      fk('cn_links', XY, CD, `FK__cn_links__x__${first}`, system);
+      fk('cn_links', XY, AB, `FK__cn_links__x__${second}`, system);
+      fk('cn_ties', XY, AB, `FK__cn_ties__x__${first}`, { ...system, DELETE_RULE: 'CASCADE' });
+      fk('cn_ties', XY, AB, `FK__cn_ties__x__${second}`, { ...system, DELETE_RULE: 'NO_ACTION' });
+      // A system-named key whose default an explicit foreign key already holds.
+      fk('cn_returns', ['tenant', 'y'], AB, 'FK__cn_return__tenan__1234', { ...system, DELETE_RULE: 'CASCADE' });
+      fk('cn_returns', ['tenant', 'x'], AB, 'cn_returns_tenant_y_fkey', {});
+      // An explicit CHECK and an explicit UNIQUE constraint hold the first two defaults.
+      fk('cn_checked', XY, CD, `FK__cn_checke__x__${first}`, system);
+      fk('cn_checked', XY, AB, `FK__cn_checke__x__${second}`, system);
+      f.constraints.push(
+        { TABLE_NAME: 'cn_checked', CONSTRAINT_NAME: 'cn_checked_x_y_fkey' },
+        { TABLE_NAME: 'cn_checked', CONSTRAINT_NAME: 'cn_checked_x_y_fkey1' },
+      );
+      // The catalog lists keys by constraint name, so the suffixes order them.
+      f.foreign.sort(
+        (a, b) =>
+          (String(a.CONSTRAINT_NAME) < String(b.CONSTRAINT_NAME) ? -1 : 0) ||
+          (String(a.CONSTRAINT_NAME) > String(b.CONSTRAINT_NAME) ? 1 : 0) ||
+          Number(a.ORDINAL_POSITION) - Number(b.ORDINAL_POSITION),
+      );
+      const schema = await introspectMssqlWith(f.exec, 'app', { logger: {} });
+      return Object.fromEntries(
+        tables.map((table) => [
+          table,
+          Object.fromEntries(
+            Object.entries(schema.tables[table]!.relations).map(([name, r]) => [
+              name,
+              [r.foreignKey, r.referenceKey, r.onDelete ?? null],
+            ]),
+          ),
+        ]),
+      );
+    };
+    const original = await read(false);
+    assert.deepEqual(await read(true), original, 'exchanging generated suffixes changed the relations');
+    assert.deepEqual(original, {
+      // SQL Server records no declaration order: by referenced columns, then actions.
+      cn_links: { cnLinksXY: [XY, AB, null], cnLinksXYFkey1: [XY, CD, null] },
+      cn_ties: { cnTiesXY: [XY, AB, 'cascade'], cnTiesXYFkey1: [XY, AB, null] },
+      cn_returns: {
+        cnReturnsTenantY: [['tenant', 'x'], AB, null],
+        cnReturnsTenantYFkey1: [['tenant', 'y'], AB, 'cascade'],
+      },
+      cn_checked: { cnCheckedXYFkey2: [XY, AB, null], cnCheckedXYFkey3: [XY, CD, null] },
+    });
+  });
+
   it('uses enforced plain unique keys for to-one, named as PostgreSQL names it, and the legacy opt-out', async () => {
     const f = catalogFixture();
     const schema = await introspectMssqlWith(f.exec, 'app', { logger: {} });

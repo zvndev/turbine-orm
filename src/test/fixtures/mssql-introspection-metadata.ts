@@ -62,6 +62,8 @@ export function catalogFixture() {
   const foreign: CatalogRow[] = [];
   const indexes: CatalogRow[] = [];
   const identities: CatalogRow[] = [];
+  /** Explicit CHECK and key constraint names, `{ TABLE_NAME, CONSTRAINT_NAME }`. */
+  const constraints: CatalogRow[] = [];
   const pk = (table: string, names: string[]) =>
     names.forEach((name, i) => {
       primary.push({
@@ -180,7 +182,8 @@ export function catalogFixture() {
     if (sql.includes('INFORMATION_SCHEMA.KEY_COLUMN_USAGE')) return primary;
     if (sql.includes('sys.foreign_keys')) return foreign;
     if (sql.includes('sys.indexes')) return indexes;
+    if (sql.includes('sys.check_constraints')) return constraints;
     assert.fail('Unexpected catalog query');
   };
-  return { exec, tables, columns, primary, foreign, indexes, identities, queries };
+  return { exec, tables, columns, primary, foreign, indexes, identities, constraints, queries };
 }

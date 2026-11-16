@@ -1,15 +1,12 @@
 import {
-  addAutoManyToManyRelations,
   applyRelationRenames,
   applyTableFilters,
   assertDistinctColumnFields,
   assertSafeCatalogSchema,
-  buildRelationsFromForeignKeys,
   DEFAULT_EXCLUDED_TABLES,
   defaultExcludedTablesPresent,
-  deriveEngineRelations,
+  deriveRelations,
   type ForeignKeyEntry,
-  isUnknownTsType,
   nullRecord,
   printableCatalogName,
 } from './catalog-metadata.js';
@@ -22,14 +19,20 @@ export {
   assertSafeCatalogIdentifier,
   assertSafeCatalogSchema,
   buildRelationsFromForeignKeys,
+  compareCatalogNames,
   DEFAULT_EXCLUDED_TABLES,
   defaultExcludedTablesPresent,
-  deriveEngineRelations,
+  defaultForeignKeyConstraintName,
+  deriveRelations,
   type ForeignKeyEntry,
+  foreignKeyConstraintNames,
   isUnknownTsType,
   nullRecord,
   printableCatalogName,
+  type RelationCatalogFacts,
+  referentialActionFromCatalog,
   relationNameFromColumn,
+  sqliteKeyComparison,
   type TableFilterOptions,
 } from './catalog-metadata.js';
 
@@ -663,10 +666,9 @@ export async function introspectPostgresCatalog(options: IntrospectOptions): Pro
     }
 
     // Referential actions (ON DELETE / ON UPDATE) per constraint. Keyed
-    // "<table>::<constraint>" because the NAME alone is not unique (the same
-    // collision SQL_FOREIGN_KEYS documents); buildRelationsFromForeignKeys
-    // prefers that key and falls back to the bare name for callers that build
-    // the map from a code-first schema, where names are synthesized per table.
+    // "<table>::<constraint>" because the NAME alone is not unique across
+    // tables (the same collision SQL_FOREIGN_KEYS documents); PostgreSQL keeps
+    // it unique within one table.
     const fkActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
     for (const row of fkResult.rows) {
       fkActions.set(`${row.source_table}::${row.constraint_name}`, {
@@ -946,44 +948,11 @@ export interface CatalogRelationInputs {
  * losing every auto-m2m relation through a Prisma-style PK-less junction. Adding
  * an argument here reaches both surfaces or neither.
  *
- * The engine introspectors (SQLite / MySQL / MSSQL) keep their own
- * {@link deriveEngineRelations}. Since 0.94 it names a unique foreign key's
- * reverse relation as a to-one too, the way this function does; the remaining
- * differences between the two are listed in docs/relation-names.md.
+ * It is the PostgreSQL catalog's adapter onto {@link deriveRelations}, the one
+ * derivation every engine introspector and `schemaDefToMetadata` also call, so
+ * the same schema derives the same relations on every engine.
  */
 export function deriveCatalogRelations(inputs: CatalogRelationInputs): Map<string, Record<string, RelationDef>> {
-  const { tableNames, foreignKeys, pkByTable, columnsByTable, uniqueByTable, indexesByTable, enums } = inputs;
-
-  const columnFieldsByTable = new Map<string, Set<string>>();
-  const unknownTypedFieldsByTable = new Map<string, Set<string>>();
-  for (const [tbl, cols] of columnsByTable) {
-    columnFieldsByTable.set(tbl, new Set(cols.map((c) => c.field)));
-    // Enum-typed columns also report tsType 'unknown' here, but generate.ts
-    // gives them a concrete union type, so a shadow of one is type-broken and
-    // must NOT be preserved as a historical json/jsonb shadow.
-    unknownTypedFieldsByTable.set(
-      tbl,
-      new Set(cols.filter((c) => isUnknownTsType(c.tsType) && !Object.hasOwn(enums, c.pgType)).map((c) => c.field)),
-    );
-  }
-
-  // Unless the caller opts out, detect child FK column sets that a unique
-  // constraint / plain unique index exactly covers, so the reverse relation is
-  // emitted as a one-to-one (`hasOne`) instead of `hasMany`.
-  const uniqueSetsByTable = inputs.legacyToManyUniques
-    ? undefined
-    : detectUniqueForeignKeySets(pkByTable, uniqueByTable, indexesByTable);
-
-  const logger = inputs.logger ?? consoleLogger;
-  const relationsByTable = buildRelationsFromForeignKeys(
-    foreignKeys,
-    columnFieldsByTable,
-    inputs.fkActions,
-    unknownTypedFieldsByTable,
-    uniqueSetsByTable,
-    logger,
-  );
-
   // Prisma's implicit m2m junctions have no primary key (just a two-column
   // UNIQUE index over the FK columns), so pass the introspected two-column
   // unique indexes as the fallback junction-key source.
@@ -996,27 +965,33 @@ export function deriveCatalogRelations(inputs: CatalogRelationInputs): Map<strin
   // soft-deleted junction, constrains only the rows matching its predicate. A
   // manyToMany derived from either returns duplicate rows. The metadata flags
   // are honoured too, so a caller-supplied `partial: true` still refuses.
-  const uniqueIndexColsByTable = new Map<string, string[][]>();
-  for (const [tbl, idxs] of indexesByTable) {
+  const junctionKeysByTable = new Map<string, string[][]>();
+  for (const [tbl, idxs] of inputs.indexesByTable) {
     const twoColUniques = idxs.flatMap((idx) => {
       const read = indexMetadataFromDefinition(idx.name, idx.definition);
       return idx.unique && !idx.partial && read.unique && !read.partial && read.columns.length === 2
         ? [read.columns]
         : [];
     });
-    if (twoColUniques.length > 0) uniqueIndexColsByTable.set(tbl, twoColUniques);
+    if (twoColUniques.length > 0) junctionKeysByTable.set(tbl, twoColUniques);
   }
 
-  addAutoManyToManyRelations(
-    tableNames,
-    foreignKeys,
-    pkByTable,
-    new Map(Array.from(columnsByTable, ([tbl, cols]) => [tbl, cols.map((c) => c.name)])),
-    relationsByTable,
-    columnFieldsByTable,
-    unknownTypedFieldsByTable,
-    uniqueIndexColsByTable,
-    logger,
-  );
-  return relationsByTable;
+  return deriveRelations({
+    tableNames: inputs.tableNames,
+    foreignKeys: inputs.foreignKeys,
+    pkByTable: inputs.pkByTable,
+    columnsByTable: inputs.columnsByTable,
+    enums: inputs.enums,
+    // A child FK column set that a unique constraint / plain unique index
+    // exactly covers makes the reverse relation a one-to-one (`hasOne`).
+    uniqueKeysByTable: detectUniqueForeignKeySets(inputs.pkByTable, inputs.uniqueByTable, inputs.indexesByTable),
+    junctionKeysByTable,
+    // Both catalog readers (this module and the MCP server) already order
+    // tables and foreign keys (see SQL_FOREIGN_KEYS), and that order is the
+    // reference the other engines sort to.
+    inCatalogOrder: true,
+    ...(inputs.fkActions ? { fkActions: inputs.fkActions } : {}),
+    ...(inputs.legacyToManyUniques ? { legacyToManyUniques: true } : {}),
+    ...(inputs.logger ? { logger: inputs.logger } : {}),
+  });
 }
